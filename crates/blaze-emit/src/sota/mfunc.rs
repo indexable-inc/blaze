@@ -590,6 +590,24 @@ pub enum VecAluOp {
     Ext { imm4: u8 },
     /// `tbl vd.16b, {vn.16b}, vm.16b` (16-byte single-table permute; indices >= 16 yield 0).
     Tbl1,
+    /// `neg vd.T, vn.T` (`elem_size`: `0=16b, 1=8h, 2=4s, 3=2d`).
+    Neg,
+    /// `ushl vd.T, vn.T, vm.T` (unsigned variable shift left; negative lane count shifts right logically).
+    Ushl,
+    /// `sshl vd.T, vn.T, vm.T` (signed variable shift left; negative lane count shifts right arithmetically).
+    Sshl,
+    /// `shl vd.T, vn.T, #shift` (`shift < (8 << elem_size)`).
+    ShlImm { shift: u8 },
+    /// `ushr vd.T, vn.T, #shift` (`1 <= shift <= (8 << elem_size)`).
+    UshrImm { shift: u8 },
+    /// `sshr vd.T, vn.T, #shift` (`1 <= shift <= (8 << elem_size)`).
+    SshrImm { shift: u8 },
+    /// `rev32 vd.T, vn.T` (`elem_size`: `0=16b, 1=8h`).
+    Rev32,
+    /// `rev16 vd.16b, vn.16b`.
+    Rev16,
+    /// `rev64 vd.T, vn.T` (`elem_size`: `0=16b, 1=8h, 2=4s`).
+    Rev64,
 }
 
 /// Typed AArch64 machine instruction enum.
@@ -2072,7 +2090,9 @@ fn verify_vec_alu(
         | VecAluOp::Cmgt
         | VecAluOp::Cmge
         | VecAluOp::Cmhi
-        | VecAluOp::Cmhs => {
+        | VecAluOp::Cmhs
+        | VecAluOp::Ushl
+        | VecAluOp::Sshl => {
             if elem_size > 3 {
                 return Err(MVerifyError::InvalidEncodingOperand { inst });
             }
@@ -2165,6 +2185,45 @@ fn verify_vec_alu(
                 return Err(MVerifyError::InvalidEncodingOperand { inst });
             };
             verify_reg(func, inst, m, OperandRole::Vec128)?;
+        }
+        VecAluOp::Neg => {
+            if elem_size > 3 {
+                return Err(MVerifyError::InvalidEncodingOperand { inst });
+            }
+            verify_reg(func, inst, dst, OperandRole::Vec128)?;
+            verify_reg(func, inst, rn, OperandRole::Vec128)?;
+        }
+        VecAluOp::ShlImm { shift } => {
+            if elem_size > 3 || u32::from(shift) >= (8u32 << u32::from(elem_size)) {
+                return Err(MVerifyError::InvalidEncodingOperand { inst });
+            }
+            verify_reg(func, inst, dst, OperandRole::Vec128)?;
+            verify_reg(func, inst, rn, OperandRole::Vec128)?;
+        }
+        VecAluOp::UshrImm { shift } | VecAluOp::SshrImm { shift } => {
+            if elem_size > 3 || shift == 0 || u32::from(shift) > (8u32 << u32::from(elem_size)) {
+                return Err(MVerifyError::InvalidEncodingOperand { inst });
+            }
+            verify_reg(func, inst, dst, OperandRole::Vec128)?;
+            verify_reg(func, inst, rn, OperandRole::Vec128)?;
+        }
+        VecAluOp::Rev32 => {
+            if elem_size > 1 {
+                return Err(MVerifyError::InvalidEncodingOperand { inst });
+            }
+            verify_reg(func, inst, dst, OperandRole::Vec128)?;
+            verify_reg(func, inst, rn, OperandRole::Vec128)?;
+        }
+        VecAluOp::Rev16 => {
+            verify_reg(func, inst, dst, OperandRole::Vec128)?;
+            verify_reg(func, inst, rn, OperandRole::Vec128)?;
+        }
+        VecAluOp::Rev64 => {
+            if elem_size > 2 {
+                return Err(MVerifyError::InvalidEncodingOperand { inst });
+            }
+            verify_reg(func, inst, dst, OperandRole::Vec128)?;
+            verify_reg(func, inst, rn, OperandRole::Vec128)?;
         }
     }
     Ok(())
@@ -3156,6 +3215,27 @@ fn encode_vec_alu(
             let m = req_vec(inst, rm.ok_or(MEncodeError::InvalidOperand { inst })?)?;
             Ok(enc::tbl1_v(req_vec(inst, dst)?, req_vec(inst, rn)?, m))
         }
+        VecAluOp::Neg => Ok(enc::neg_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?)),
+        VecAluOp::Ushl => {
+            let m = req_vec(inst, rm.ok_or(MEncodeError::InvalidOperand { inst })?)?;
+            Ok(enc::ushl_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?, m))
+        }
+        VecAluOp::Sshl => {
+            let m = req_vec(inst, rm.ok_or(MEncodeError::InvalidOperand { inst })?)?;
+            Ok(enc::sshl_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?, m))
+        }
+        VecAluOp::ShlImm { shift } => {
+            Ok(enc::shl_imm_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?, u8_to_u32(shift)))
+        }
+        VecAluOp::UshrImm { shift } => {
+            Ok(enc::ushr_imm_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?, u8_to_u32(shift)))
+        }
+        VecAluOp::SshrImm { shift } => {
+            Ok(enc::sshr_imm_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?, u8_to_u32(shift)))
+        }
+        VecAluOp::Rev32 => Ok(enc::rev32_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?)),
+        VecAluOp::Rev16 => Ok(enc::rev16_v(req_vec(inst, dst)?, req_vec(inst, rn)?)),
+        VecAluOp::Rev64 => Ok(enc::rev64_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?)),
     }
 }
 

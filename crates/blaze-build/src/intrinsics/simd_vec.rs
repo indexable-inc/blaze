@@ -202,7 +202,6 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         // / "Shifts `lhs` right by `rhs`, shifting in sign bits for signed types."
         SimdOp::Shl | SimdOp::Shr => {
             let l = lanes(s, ty(0)?)?;
-            let vt = vector_ty(which, &l)?;
             let lop = match (op, kind(l.elem)) {
                 (SimdOp::Shl, Kind::Int { .. }) => Op::Shl,
                 (SimdOp::Shr, Kind::Int { signed: true }) => Op::Ashr,
@@ -210,6 +209,18 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 _ => return Err(shape(ints)),
             };
             let (x, y) = (place(0)?, place(1)?);
+            if let Some((vt, chunks)) = super::simd::native_vec128_chunks(&l) {
+                let out = super::simd::temp_vec(s, &l);
+                for c in 0..chunks {
+                    let off = (c * 16) as i32;
+                    let a = super::simd::load_vec128_at(s, &l, vt, x, off);
+                    let b = super::simd::load_vec128_at(s, &l, vt, y, off);
+                    let r = s.b.binary(lop, Flags::IN_RANGE, a, b);
+                    super::simd::store_vec128_at(s, &l, r, out, off);
+                }
+                return Ok(Out::At(out));
+            }
+            let vt = vector_ty(which, &l)?;
             let a = load_vector(s, &l, vt, x);
             let b = load_vector(s, &l, vt, y);
             let r = s.b.binary(lop, Flags::IN_RANGE, a, b);
@@ -365,11 +376,86 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             if r.elem != l.elem {
                 return Err(shape("`V` must be a vector with the same element type as `T`"));
             }
-            let (vt, rt) = (vector_ty(which, &l)?, vector_ty(which, &r)?);
             let count = r.count as usize;
             let (x, y, idx) = (place(0)?, place(1)?, place(2)?);
             let mut mask = [0u32; MOST_LANES];
             shuffle_indices(s, idx, count, 2 * l.count as u32, &mut mask)?;
+            // Split 256-bit / 512-bit shuffles into native 128-bit `Op::Shuffle` chunks whenever
+            // each 16-byte output chunk reads from at most 2 distinct 16-byte source chunks
+            // (covering BLAKE3's `ByBytes` byte-rotations and `transpose` interleave shuffles).
+            if let (Some((vt, in_chunks)), Some((rt, out_chunks))) =
+                (super::simd::native_vec128_chunks(&l), super::simd::native_vec128_chunks(&r))
+                && (in_chunks > 1 || out_chunks > 1)
+                && vt == rt
+            {
+                let chunk_lanes = rt.lanes();
+                let chunk_lanes_usize = chunk_lanes as usize;
+                let mut plan: [(u32, u32, [u32; 16]); 4] = [(0, 0, [0; 16]); 4];
+                let mut can_chunk = out_chunks <= 4 && chunk_lanes_usize <= 16;
+                if can_chunk {
+                    for oc in 0..out_chunks as usize {
+                        let mut c0: Option<u32> = None;
+                        let mut c1: Option<u32> = None;
+                        let mut sub = [0u32; 16];
+                        for k in 0..chunk_lanes_usize {
+                            let src_lane = mask[oc * chunk_lanes_usize + k];
+                            let sc = src_lane / chunk_lanes;
+                            let sl = src_lane % chunk_lanes;
+                            let mapped = if c0 == Some(sc) {
+                                sl
+                            } else if c0.is_none() {
+                                c0 = Some(sc);
+                                sl
+                            } else if c1 == Some(sc) {
+                                chunk_lanes + sl
+                            } else if c1.is_none() {
+                                c1 = Some(sc);
+                                chunk_lanes + sl
+                            } else {
+                                can_chunk = false;
+                                break;
+                            };
+                            sub[k] = mapped;
+                        }
+                        if !can_chunk {
+                            break;
+                        }
+                        let a_chunk = c0.unwrap_or(0);
+                        let b_chunk = c1.unwrap_or(a_chunk);
+                        plan[oc] = (a_chunk, b_chunk, sub);
+                    }
+                }
+                if can_chunk {
+                    let out = super::simd::temp_vec(s, &r);
+                    let in_c = in_chunks as u32;
+                    let mut loaded: [Option<Value>; 8] = [None; 8];
+                    let load_src_chunk = |s: &mut B<'_, '_, '_, '_, LA, S, A>,
+                                          loaded: &mut [Option<Value>; 8],
+                                          sc: u32|
+                     -> Value {
+                        if let Some(v) = loaded[sc as usize] {
+                            return v;
+                        }
+                        let (base, off) = if sc < in_c {
+                            (x, (sc * 16) as i32)
+                        } else {
+                            (y, ((sc - in_c) * 16) as i32)
+                        };
+                        let v = super::simd::load_vec128_at(s, &l, vt, base, off);
+                        loaded[sc as usize] = Some(v);
+                        v
+                    };
+                    for oc in 0..out_chunks as usize {
+                        let (a_chunk, b_chunk, sub) = plan[oc];
+                        let va = load_src_chunk(s, &mut loaded, a_chunk);
+                        let vb = load_src_chunk(s, &mut loaded, b_chunk);
+                        let v = s.b.shuffle(rt, va, vb, &sub[..chunk_lanes_usize]);
+                        super::simd::store_vec128_at(s, &r, v, out, (oc * 16) as i32);
+                    }
+                    return Ok(Out::At(out));
+                }
+            }
+            let (vt, rt) = (vector_ty(which, &l)?, vector_ty(which, &r)?);
             let a = load_vector(s, &l, vt, x);
             let b = load_vector(s, &l, vt, y);
             let v = s.b.shuffle(rt, a, b, &mask[..count]);

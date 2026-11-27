@@ -1266,6 +1266,22 @@ fn try_emit_sota_a64_core<'a>(
         full_v
     };
 
+    // After all mid-end LIR analyses have consumed `Op::Assume` facts, strip `Op::Assume` and
+    // run DCE before machine lowering so pure proof trees (e.g. `core::simd::Mask::from_simd`
+    // and `assert_unchecked` checks) do not compile into dead machine instructions.
+    let no_assume_owned: Option<blaze_lir::Func<Alloc<'a>>> = if (0..emit_v.view().len())
+        .any(|i| emit_v.view().op(i) == Op::Assume)
+        && let Ok(cleaned) = blaze_lir::simplify::dead_strip_assumes(emit_v.view(), alloc)
+    {
+        Some(cleaned)
+    } else {
+        None
+    };
+    let emit_v: Verified<'_> = no_assume_owned
+        .as_ref()
+        .and_then(|f| verify_in(f.view(), alloc).ok())
+        .unwrap_or(emit_v);
+
     let full_view = emit_v.view();
     let effective_preserve_all_cold =
         opts.preserve_all_cold && !opts.internal_fast && is_safe_for_cold_preserve_all(full_view);
@@ -1384,14 +1400,31 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
         || !collect_misel_fast_calls(func.view(), opts.internal_fast_callees, alloc).is_empty();
 
     // 1. If `func` contains non-native vector widths (e.g. `<64 x i8>`, `<32 x i8>`, `<8 x i8>`
-    //    from `core::str::pattern::simd_contains` / `core::simd`) or `f16`/`f128`, legalize it
+    //    from `core::str::pattern::simd_contains` / `core::simd`) or `f16`/`f128`, first prune
+    //    dead const-generic arms (e.g. `match N { 2 => ..., 4 => ..., 8 => ..., 16 => ... }` in
+    //    `blaze_blake3::lanes::rotate_bytes`) via `propagate -> dead` so dead non-native arms do
+    //    not force scalarization of live 128-bit NEON code. If non-native types remain, legalize
     //    BEFORE SOTA mid-end so SROA + GVN + `misel` optimize the scalarized IR cleanly instead
     //    of rejecting the whole function down to stack-spilling `Reference` codegen.
+    let pruned_owned: Option<blaze_lir::Func<Alloc<'a>>> = if !has_fast_abi_req
+        && opts.emit_profile() == EmitProfile::Sota
+        && needs_pre_sota_legalize(&func.view())
+        && let Ok(p) = propagate(func.view(), alloc)
+        && let Ok(d) = dead(p.view(), alloc)
+    {
+        Some(d)
+    } else {
+        None
+    };
+    let work_v = pruned_owned
+        .as_ref()
+        .and_then(|f| verify_in(f.view(), alloc).ok())
+        .unwrap_or(func);
     let mut already_legalized = false;
-    if !has_fast_abi_req && needs_pre_sota_legalize(&func.view()) {
+    if !has_fast_abi_req && needs_pre_sota_legalize(&work_v.view()) {
         already_legalized = true;
         let (legal_owned, legal_called) =
-            crate::routines::legalized(func.view(), routines, alloc).map_err(RecordEmitError::Legalize)?;
+            crate::routines::legalized(work_v.view(), routines, alloc).map_err(RecordEmitError::Legalize)?;
         if let Some(owned) = legal_owned
             && let Ok(legal_v) = verify_in(owned.view(), alloc)
             && let Some((rec, insts, clobbers)) =
@@ -1400,7 +1433,7 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
             return Ok((rec, insts, legal_called, clobbers));
         }
     } else if let Some((rec, insts, clobbers)) =
-        try_emit_sota_a64_core(func, names, opts, traps, alloc)?
+        try_emit_sota_a64_core(work_v, names, opts, traps, alloc)?
     {
         return Ok((rec, insts, Called::NONE, clobbers));
     }

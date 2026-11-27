@@ -214,36 +214,58 @@ fn temp<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(s: &mut B<'_, '_, 
     s.b.slot_addr(slot)
 }
 
-/// Native 128-bit packed LIR vector type (`<16 x i8>`, `<8 x i16>`, `<4 x i32>`, `<2 x i64>`,
-/// `<4 x f32>`, `<2 x f64>`), or `None` for non-128-bit / `f16` / `f128` / pointer / padded vectors.
-fn native_vec128_ty(l: &Lanes) -> Option<Ty> {
-    if l.size != 16 || l.size != l.count * l.stride || !l.count.is_power_of_two() {
+/// Native 128-bit packed LIR vector chunk type and chunk count (`1` for 128-bit, `2` for 256-bit,
+/// `4` for 512-bit packed vectors), or `None` for sub-128-bit / `f16` / `f128` / pointer / padded
+/// vectors. Splitting 256-bit and 512-bit SIMD into 2× / 4× native 128-bit NEON chunks keeps wide
+/// portable SIMD (e.g. `blaze_blake3`'s `Simd<u32, 8>` and `Simd<u32, 16>`) in native NEON
+/// registers instead of scalarizing to 8/16 scalar ops.
+pub(super) fn native_vec128_chunks(l: &Lanes) -> Option<(Ty, u64)> {
+    if !matches!(l.size, 16 | 32 | 64)
+        || l.size != l.count * l.stride
+        || !l.count.is_power_of_two()
+        || l.stride > 8
+    {
         return None;
     }
     if matches!(l.elem, Prim::Ptr | Prim::F16 | Prim::F128) {
         return None;
     }
+    let chunks = l.size / 16;
+    let chunk_lanes = l.count / chunks;
     let lane = lir(l.elem).0.elem();
-    u32::try_from(l.count).ok().and_then(|n| Ty::vector(lane, n))
+    u32::try_from(chunk_lanes).ok().and_then(|n| Ty::vector(lane, n)).map(|vt| (vt, chunks))
 }
 
-fn load_vec128<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
+#[inline]
+fn chunk_mem_attrs(l: &Lanes, off: i32) -> MemAttrs {
+    MemAttrs::aligned(if off == 0 { l.align } else { l.align.min(4) })
+}
+
+pub(super) fn load_vec128_at<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
     s: &mut B<'_, '_, '_, '_, LA, S, A>,
     l: &Lanes,
     ty: Ty,
     at: Value,
+    off: i32,
 ) -> Value {
-    s.b.load(ty, Flags::NONE, at, 0, MemAttrs::aligned(l.align))
+    s.b.load(ty, Flags::NONE, at, off, chunk_mem_attrs(l, off))
 }
 
-fn out_vec128<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
+pub(super) fn store_vec128_at<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
     s: &mut B<'_, '_, '_, '_, LA, S, A>,
     l: &Lanes,
     v: Value,
-) -> Out {
-    let at = temp(s, l);
-    s.b.store(Flags::NONE, v, at, 0, MemAttrs::aligned(l.align));
-    Out::At(at)
+    at: Value,
+    off: i32,
+) {
+    s.b.store(Flags::NONE, v, at, off, chunk_mem_attrs(l, off));
+}
+
+pub(super) fn temp_vec<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
+    s: &mut B<'_, '_, '_, '_, LA, S, A>,
+    l: &Lanes,
+) -> Value {
+    temp(s, l)
 }
 
 /// The lane index `v` as a constant: "`idx` must be `const`" (`simd_extract`'s and
@@ -309,13 +331,18 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 (SimdOp::And | SimdOp::Or | SimdOp::Xor, _) => return Err(shape("`T` must be a vector of integers")),
                 _ => return Err(shape(not_int_or_float)),
             };
-            if let Some(vt) = native_vec128_ty(&l)
+            if let Some((vt, chunks)) = native_vec128_chunks(&l)
                 && !(op == SimdOp::Mul && matches!(kind(l.elem), Kind::Int { .. }) && l.stride > 4)
             {
-                let a = load_vec128(s, &l, vt, x);
-                let b = load_vec128(s, &l, vt, y);
-                let r = s.b.binary(lop, Flags::NONE, a, b);
-                return Ok(out_vec128(s, &l, r));
+                let out = temp(s, &l);
+                for c in 0..chunks {
+                    let off = (c * 16) as i32;
+                    let a = load_vec128_at(s, &l, vt, x, off);
+                    let b = load_vec128_at(s, &l, vt, y, off);
+                    let r = s.b.binary(lop, Flags::NONE, a, b);
+                    store_vec128_at(s, &l, r, out, off);
+                }
+                return Ok(Out::At(out));
             }
             let out = temp(s, &l);
             for i in 0..l.count {
@@ -335,6 +362,18 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 Kind::Float => Op::Fneg,
                 Kind::Ptr => return Err(shape(not_int_or_float)),
             };
+            if matches!(kind(l.elem), Kind::Int { .. })
+                && let Some((vt, chunks)) = native_vec128_chunks(&l)
+            {
+                let out = temp(s, &l);
+                for c in 0..chunks {
+                    let off = (c * 16) as i32;
+                    let a = load_vec128_at(s, &l, vt, x, off);
+                    let r = s.b.unary(lop, Flags::NONE, a);
+                    store_vec128_at(s, &l, r, out, off);
+                }
+                return Ok(Out::At(out));
+            }
             let out = temp(s, &l);
             for i in 0..l.count {
                 let a = load(s, &l, x, i);
@@ -355,7 +394,10 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             }
             let (x, y) = (place(0)?, place(1)?);
             let k = kind(l.elem);
-            if let (Kind::Int { signed }, Some(vt), Some(mt)) = (k, native_vec128_ty(&l), native_vec128_ty(&m)) {
+            if let (Kind::Int { signed }, Some((vt, chunks)), Some((mt, m_chunks))) =
+                (k, native_vec128_chunks(&l), native_vec128_chunks(&m))
+                && chunks == m_chunks
+            {
                 let cond = match (op, signed) {
                     (SimdOp::Eq, _) => IntCond::Eq,
                     (SimdOp::Ne, _) => IntCond::Ne,
@@ -368,11 +410,16 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                     (SimdOp::Ge, true) => IntCond::Sge,
                     (_, _) => IntCond::Uge,
                 };
-                let a = load_vec128(s, &l, vt, x);
-                let b = load_vec128(s, &l, vt, y);
-                let bits = s.b.icmp(cond, a, b);
-                let res = s.b.convert(Op::Sext, Flags::NONE, mt, bits);
-                return Ok(out_vec128(s, &m, res));
+                let out = temp(s, &m);
+                for c in 0..chunks {
+                    let off = (c * 16) as i32;
+                    let a = load_vec128_at(s, &l, vt, x, off);
+                    let b = load_vec128_at(s, &l, vt, y, off);
+                    let bits = s.b.icmp(cond, a, b);
+                    let res = s.b.convert(Op::Sext, Flags::NONE, mt, bits);
+                    store_vec128_at(s, &m, res, out, off);
+                }
+                return Ok(Out::At(out));
             }
             let (mty, _) = lir(m.elem);
             let ones = s.b.iconst(mty, u128::MAX);
@@ -422,9 +469,13 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             if s.b.ty(v) != lir(l.elem).0 {
                 return Err(shape("`T` must be a vector with element type `U`"));
             }
-            if let Some(vt) = native_vec128_ty(&l) {
+            if let Some((vt, chunks)) = native_vec128_chunks(&l) {
                 let r = s.b.convert(Op::Splat, Flags::NONE, vt, v);
-                return Ok(out_vec128(s, &l, r));
+                let out = temp(s, &l);
+                for c in 0..chunks {
+                    store_vec128_at(s, &l, r, out, (c * 16) as i32);
+                }
+                return Ok(Out::At(out));
             }
             let out = temp(s, &l);
             for i in 0..l.count {
@@ -470,15 +521,23 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 return Err(shape("`M` must be an integer vector with the same length as `T`"));
             }
             let (mask, yes, no) = (place(0)?, place(1)?, place(2)?);
-            if let (Some(mt), Some(vt)) = (native_vec128_ty(&m), native_vec128_ty(&l)) {
-                let mv = load_vec128(s, &m, mt, mask);
+            if let (Some((mt, m_chunks)), Some((vt, chunks))) =
+                (native_vec128_chunks(&m), native_vec128_chunks(&l))
+                && chunks == m_chunks
+            {
                 let zero = s.b.iconst(mt.lane(), 0);
                 let zeros = s.b.convert(Op::Splat, Flags::NONE, mt, zero);
-                let bits = s.b.icmp(IntCond::Ne, mv, zeros);
-                let a = load_vec128(s, &l, vt, yes);
-                let b = load_vec128(s, &l, vt, no);
-                let r = s.b.select(Flags::NONE, bits, a, b);
-                return Ok(out_vec128(s, &l, r));
+                let out = temp(s, &l);
+                for c in 0..chunks {
+                    let off = (c * 16) as i32;
+                    let mv = load_vec128_at(s, &m, mt, mask, off);
+                    let bits = s.b.icmp(IntCond::Ne, mv, zeros);
+                    let a = load_vec128_at(s, &l, vt, yes, off);
+                    let b = load_vec128_at(s, &l, vt, no, off);
+                    let r = s.b.select(Flags::NONE, bits, a, b);
+                    store_vec128_at(s, &l, r, out, off);
+                }
+                return Ok(Out::At(out));
             }
             let zero = s.b.iconst(lir(m.elem).0, 0);
             let out = temp(s, &l);

@@ -64,8 +64,8 @@ const PROBE_STEP: u32 = 4096;
 /// Maximum byte length for inline NEON `Memcpy` / `Memset`.
 const INLINE_BULK_MAX: u64 = 256;
 
-/// Maximum byte length for overlap-safe inline `Memmove`.
-const INLINE_MEMMOVE_MAX: u64 = 32;
+/// Maximum byte length for overlap-safe inline `Memmove` (up to 8× Q128 loads before stores).
+const INLINE_MEMMOVE_MAX: u64 = 128;
 
 /// Sentinel `u32` meaning "none / unset".
 const NONE_U32: u32 = u32::MAX;
@@ -510,6 +510,10 @@ fn vec128_alu_op(op: Op, res_ty: Ty) -> Option<(VecAluOp, u8)> {
             Op::Or => Some((VecAluOp::Orr, 0)),
             Op::Xor => Some((VecAluOp::Eor, 0)),
             Op::Not => Some((VecAluOp::Not, 0)),
+            Op::Neg => Some((VecAluOp::Neg, elem_size)),
+            Op::Shl => Some((VecAluOp::Ushl, elem_size)),
+            Op::Lshr => Some((VecAluOp::Ushl, elem_size)),
+            Op::Ashr => Some((VecAluOp::Sshl, elem_size)),
             _ => None,
         },
         SplatKind::Float { elem_size } => match op {
@@ -1329,6 +1333,19 @@ pub(crate) fn check_misel_subset(
                     return Err(refuse(Some(inst), "memcpy/memmove src is not ptr"));
                 }
             }
+            Op::Memcmp => {
+                let a = o.value();
+                let b = o.value();
+                let len = o.value();
+                if view.ty(a) != Ty::PTR
+                    || view.ty(b) != Ty::PTR
+                    || !is_scalar_int_or_ptr(view.ty(len))
+                    || view.ty(len) == Ty::PTR
+                    || res_ty != Ty::I32
+                {
+                    return Err(refuse(Some(inst), "memcmp on unsupported type"));
+                }
+            }
             Op::Fadd
             | Op::Fsub
             | Op::Fmul
@@ -2120,6 +2137,8 @@ struct Selector<'a, 'v> {
     cur_weight: u32,
     /// Next unique virtual flag ID.
     next_vflag: u32,
+    /// Per-block cache of materialized 16-byte vector constants (`(bytes, cur_blk, vreg)`).
+    block_vec16_consts: Vec<([u8; 16], MBlock, VReg), Alloc<'a>>,
     /// Live condition flags in the current `MBlock` (for sharing across contiguous sibling `Select`s).
     live_cmp: Option<LiveCmp>,
     /// Deferred non-fallthrough `Br` edge-split blocks emitted at the end of `block_order`.
@@ -2264,16 +2283,26 @@ impl<'a, 'v> Selector<'a, 'v> {
         MReg::V(v)
     }
 
-    /// Materializes a 16-byte constant vector in a fresh `Vec128` virtual register using
-    /// `movi #0` (all zero), `mov` + `dup.2d` (matching 64-bit halves), or `dup.2d` + `ext.16b #8`.
+    /// Materializes a 16-byte constant vector in a `Vec128` virtual register using `movi #0`
+    /// (all zero), `mov` + `dup.2d` (matching 64-bit halves), or `dup.2d` + `ext.16b #8`,
+    /// reusing an already-materialized constant within the same `MBlock`.
     fn materialize_vec16_bytes(&mut self, bytes: [u8; 16]) -> VReg {
+        if let Some(&(_, _, cached)) = self
+            .block_vec16_consts
+            .iter()
+            .rev()
+            .take(8)
+            .find(|&&(b, blk, _)| blk == self.cur_blk && b == bytes)
+        {
+            return cached;
+        }
         let lo = u64::from_le_bytes([
             bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
         let hi = u64::from_le_bytes([
             bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
         ]);
-        if lo == 0 && hi == 0 {
+        let v = if lo == 0 && hi == 0 {
             let v = self.mfunc.alloc_vreg(VRegClass::Vec128);
             self.push_op(
                 MOp::VecAlu {
@@ -2285,47 +2314,104 @@ impl<'a, 'v> Selector<'a, 'v> {
                 },
                 MInstFlags::REMATERIALIZABLE,
             );
-            return v;
+            v
+        } else {
+            let lo_gpr = self.materialize_int_const(lo, true);
+            let v_lo = self.mfunc.alloc_vreg(VRegClass::Vec128);
+            self.push_op(
+                MOp::VecAlu {
+                    op: VecAluOp::DupGen,
+                    dst: MReg::V(v_lo),
+                    rn: MReg::V(lo_gpr),
+                    rm: None,
+                    elem_size: 3,
+                },
+                MInstFlags::NONE,
+            );
+            if lo == hi {
+                v_lo
+            } else {
+                let hi_gpr = self.materialize_int_const(hi, true);
+                let v_hi = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                self.push_op(
+                    MOp::VecAlu {
+                        op: VecAluOp::DupGen,
+                        dst: MReg::V(v_hi),
+                        rn: MReg::V(hi_gpr),
+                        rm: None,
+                        elem_size: 3,
+                    },
+                    MInstFlags::NONE,
+                );
+                let v = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                self.push_op(
+                    MOp::VecAlu {
+                        op: VecAluOp::Ext { imm4: 8 },
+                        dst: MReg::V(v),
+                        rn: MReg::V(v_lo),
+                        rm: Some(MReg::V(v_hi)),
+                        elem_size: 0,
+                    },
+                    MInstFlags::NONE,
+                );
+                v
+            }
+        };
+        if self.block_vec16_consts.last().is_some_and(|&(_, blk, _)| blk != self.cur_blk) {
+            self.block_vec16_consts.clear();
         }
-        let lo_gpr = self.materialize_int_const(lo, true);
-        let v_lo = self.mfunc.alloc_vreg(VRegClass::Vec128);
-        self.push_op(
-            MOp::VecAlu {
-                op: VecAluOp::DupGen,
-                dst: MReg::V(v_lo),
-                rn: MReg::V(lo_gpr),
-                rm: None,
-                elem_size: 3,
-            },
-            MInstFlags::NONE,
-        );
-        if lo == hi {
-            return v_lo;
+        if self.block_vec16_consts.len() < 16 {
+            self.block_vec16_consts.push((bytes, self.cur_blk, v));
         }
-        let hi_gpr = self.materialize_int_const(hi, true);
-        let v_hi = self.mfunc.alloc_vreg(VRegClass::Vec128);
-        self.push_op(
-            MOp::VecAlu {
-                op: VecAluOp::DupGen,
-                dst: MReg::V(v_hi),
-                rn: MReg::V(hi_gpr),
-                rm: None,
-                elem_size: 3,
-            },
-            MInstFlags::NONE,
-        );
-        let v = self.mfunc.alloc_vreg(VRegClass::Vec128);
-        self.push_op(
-            MOp::VecAlu {
-                op: VecAluOp::Ext { imm4: 8 },
-                dst: MReg::V(v),
-                rn: MReg::V(v_lo),
-                rm: Some(MReg::V(v_hi)),
-                elem_size: 0,
-            },
-            MInstFlags::NONE,
-        );
         v
+    }
+
+    /// Evaluates a compile-time constant uniform integer vector splat (including constant-folded
+    /// `And`/`Or`/`Xor`/`Add`/`Sub`/`Neg` chains like `Simd::rotate_right`'s `Splat(12) & Splat(31)`).
+    fn const_vec_splat_u64(&self, val: Value, elem_bits: u64, depth: u8) -> Option<u64> {
+        if depth > 4 {
+            return None;
+        }
+        let mask = if elem_bits >= 64 { u64::MAX } else { (1u64 << elem_bits) - 1 };
+        let idx = val.index();
+        match self.view.op(idx) {
+            Op::Splat => {
+                let scalar = self.view.operands(idx).value();
+                self.const_u64.get(scalar.index()).copied().flatten().map(|k| k & mask)
+            }
+            Op::Bitcast => {
+                let inner = self.view.operands(idx).value();
+                let ity = self.view.ty(inner);
+                if matches!(ity.form(), blaze_lir::ty::Form::Vector)
+                    && u64::from(ity.elem().bits(64)) == elem_bits
+                {
+                    self.const_vec_splat_u64(inner, elem_bits, depth + 1)
+                } else {
+                    None
+                }
+            }
+            Op::Neg => {
+                let a = self.view.operands(idx).value();
+                self.const_vec_splat_u64(a, elem_bits, depth + 1)
+                    .map(|x| 0u64.wrapping_sub(x) & mask)
+            }
+            Op::And | Op::Or | Op::Xor | Op::Add | Op::Sub => {
+                let mut o = self.view.operands(idx);
+                let a = o.value();
+                let b = o.value();
+                let av = self.const_vec_splat_u64(a, elem_bits, depth + 1)?;
+                let bv = self.const_vec_splat_u64(b, elem_bits, depth + 1)?;
+                let res = match self.view.op(idx) {
+                    Op::And => av & bv,
+                    Op::Or => av | bv,
+                    Op::Xor => av ^ bv,
+                    Op::Add => av.wrapping_add(bv),
+                    _ => av.wrapping_sub(bv),
+                };
+                Some(res & mask)
+            }
+            _ => None,
+        }
     }
 
     /// Allocates (or reuses a forward-preallocated) destination `VReg` for LIR instruction `inst`.
@@ -4597,13 +4683,68 @@ impl<'a, 'v> Selector<'a, 'v> {
             && let Some((vec_op, elem_size)) = vec128_alu_op(op, res_ty)
         {
             let dst = self.alloc_res_vreg(inst, res_ty);
-            if op == Op::Not {
+            if matches!(op, Op::Not | Op::Neg) {
                 let a = o.value();
                 let rn = self.get_val(a, false);
                 self.push_op(
                     MOp::VecAlu { op: vec_op, dst: MReg::V(dst), rn, rm: None, elem_size },
                     MInstFlags::NONE,
                 );
+            } else if matches!(op, Op::Shl | Op::Lshr | Op::Ashr) {
+                let a = o.value();
+                let b = o.value();
+                let rn = self.get_val(a, false);
+                let elem_bits = 8u64 << u32::from(elem_size);
+                // When RHS is a compile-time constant splat (including `Splat(k) & Splat(mask)`
+                // from `Simd::rotate_right`), emit a 1-instruction NEON immediate shift (`shl`/`ushr`/`sshr`).
+                let const_shift = self
+                    .const_vec_splat_u64(b, elem_bits, 0)
+                    .filter(|&k| k < elem_bits);
+                if let Some(k) = const_shift {
+                    let shift = u8::try_from(k).unwrap_or(0);
+                    let imm_op = if shift == 0 {
+                        VecAluOp::Mov
+                    } else {
+                        match op {
+                            Op::Shl => VecAluOp::ShlImm { shift },
+                            Op::Lshr => VecAluOp::UshrImm { shift },
+                            _ => VecAluOp::SshrImm { shift },
+                        }
+                    };
+                    self.push_op(
+                        MOp::VecAlu { op: imm_op, dst: MReg::V(dst), rn, rm: None, elem_size },
+                        MInstFlags::NONE,
+                    );
+                } else {
+                    let rm = self.get_val(b, false);
+                    let shift_reg = if op == Op::Shl {
+                        rm
+                    } else {
+                        // AArch64 `ushl`/`sshl` shift right when the signed lane count is negative.
+                        let neg_rm = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Neg,
+                                dst: MReg::V(neg_rm),
+                                rn: rm,
+                                rm: None,
+                                elem_size,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        MReg::V(neg_rm)
+                    };
+                    self.push_op(
+                        MOp::VecAlu {
+                            op: vec_op,
+                            dst: MReg::V(dst),
+                            rn,
+                            rm: Some(shift_reg),
+                            elem_size,
+                        },
+                        MInstFlags::NONE,
+                    );
+                }
             } else {
                 let a = o.value();
                 let b = o.value();
@@ -5819,34 +5960,68 @@ impl<'a, 'v> Selector<'a, 'v> {
                     let all_a = byte_idx.iter().all(|&v| v < 16);
                     let all_b = byte_idx.iter().all(|&v| v >= 16);
                     let dst = self.alloc_res_vreg(inst, res_ty);
-                    if all_a {
-                        let v_idx = self.materialize_vec16_bytes(byte_idx);
-                        self.push_op(
-                            MOp::VecAlu {
-                                op: VecAluOp::Tbl1,
-                                dst: MReg::V(dst),
-                                rn: ar,
-                                rm: Some(MReg::V(v_idx)),
-                                elem_size: 0,
-                            },
-                            MInstFlags::NONE,
-                        );
-                    } else if all_b {
-                        let mut b_idx = [0u8; 16];
-                        for k in 0..16 {
-                            b_idx[k] = byte_idx[k] - 16;
+                    if all_a || all_b {
+                        let (src_reg, idx_bytes) = if all_a {
+                            (ar, byte_idx)
+                        } else {
+                            let mut b_idx = [0u8; 16];
+                            for k in 0..16 {
+                                b_idx[k] = byte_idx[k] - 16;
+                            }
+                            (br, b_idx)
+                        };
+                        // 1-instruction NEON in-register reverses (zero index register, 1 cycle):
+                        // - `rev32.8h`  (u32 ror16, BLAKE3): [2,3,0,1, 6,7,4,5, 10,11,8,9, 14,15,12,13]
+                        // - `rev32.16b` (u32 bswap):         [3,2,1,0, 7,6,5,4, 11,10,9,8, 15,14,13,12]
+                        // - `rev16.16b` (u16 bswap):         [1,0, 3,2, 5,4, 7,6, 9,8, 11,10, 13,12, 15,14]
+                        // - `rev64.4s`  (u64 swap32):        [4,5,6,7, 0,1,2,3, 12,13,14,15, 8,9,10,11]
+                        // - `rev64.8h`  (u64 rev16):         [6,7,4,5,2,3,0,1, 14,15,12,13,10,11,8,9]
+                        // - `rev64.16b` (u64 bswap):         [7,6,5,4,3,2,1,0, 15,14,13,12,11,10,9,8]
+                        let fast_rev: Option<(VecAluOp, u8)> = match idx_bytes {
+                            [2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13] => {
+                                Some((VecAluOp::Rev32, 1))
+                            }
+                            [3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12] => {
+                                Some((VecAluOp::Rev32, 0))
+                            }
+                            [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14] => {
+                                Some((VecAluOp::Rev16, 0))
+                            }
+                            [4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11] => {
+                                Some((VecAluOp::Rev64, 2))
+                            }
+                            [6, 7, 4, 5, 2, 3, 0, 1, 14, 15, 12, 13, 10, 11, 8, 9] => {
+                                Some((VecAluOp::Rev64, 1))
+                            }
+                            [7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8] => {
+                                Some((VecAluOp::Rev64, 0))
+                            }
+                            _ => None,
+                        };
+                        if let Some((rev_op, rev_sz)) = fast_rev {
+                            self.push_op(
+                                MOp::VecAlu {
+                                    op: rev_op,
+                                    dst: MReg::V(dst),
+                                    rn: src_reg,
+                                    rm: None,
+                                    elem_size: rev_sz,
+                                },
+                                MInstFlags::NONE,
+                            );
+                        } else {
+                            let v_idx = self.materialize_vec16_bytes(idx_bytes);
+                            self.push_op(
+                                MOp::VecAlu {
+                                    op: VecAluOp::Tbl1,
+                                    dst: MReg::V(dst),
+                                    rn: src_reg,
+                                    rm: Some(MReg::V(v_idx)),
+                                    elem_size: 0,
+                                },
+                                MInstFlags::NONE,
+                            );
                         }
-                        let v_idx = self.materialize_vec16_bytes(b_idx);
-                        self.push_op(
-                            MOp::VecAlu {
-                                op: VecAluOp::Tbl1,
-                                dst: MReg::V(dst),
-                                rn: br,
-                                rm: Some(MReg::V(v_idx)),
-                                elem_size: 0,
-                            },
-                            MInstFlags::NONE,
-                        );
                     } else {
                         // General 2-vector shuffle via two independent `tbl1`s (out-of-range
                         // index `0xff` zeroes non-selected bytes) + `orr` — zero consecutive-reg
@@ -5985,6 +6160,25 @@ impl<'a, 'v> Selector<'a, 'v> {
 
             Op::Memcpy | Op::Memmove | Op::Memset => {
                 self.lower_bulk(op, flags, o.value(), o.value(), o.value())?;
+            }
+
+            Op::Memcmp => {
+                let a = o.value();
+                let b = o.value();
+                let len = o.value();
+                let dst = self.alloc_res_vreg(inst, res_ty);
+                if self.const_u64.get(len.index()).copied().flatten() == Some(0) {
+                    self.push_op(
+                        MOp::MovImm { dst: MReg::V(dst), imm: 0, wide: false },
+                        MInstFlags::NONE,
+                    );
+                } else {
+                    self.emit_c_bulk_call("memcmp", a, b, len)?;
+                    self.push_op(
+                        MOp::Mov { dst: MReg::V(dst), src: MReg::p(PReg::X0), wide: false },
+                        MInstFlags::NONE,
+                    );
+                }
             }
 
             Op::Fadd | Op::Fsub | Op::Fmul | Op::Fdiv => {
@@ -8504,12 +8698,13 @@ impl<'a, 'v> Selector<'a, 'v> {
                     // Overlap-safe: load ALL chunks into fresh SSA VRegs BEFORE storing any!
                     let dst_r = self.get_val(dst_val, false);
                     let src_r = self.get_val(src_val, false);
-                    let mut pieces: [(i32, MemSize, VReg); 6] =
-                        [(0, MemSize::B8, VReg(0)); 6];
+                    const MAX_MEMMOVE_PIECES: usize = 11;
+                    let mut pieces: [(i32, MemSize, VReg); MAX_MEMMOVE_PIECES] =
+                        [(0, MemSize::B8, VReg(0)); MAX_MEMMOVE_PIECES];
                     let mut n_pieces = 0usize;
                     let mut off: i32 = 0;
                     let mut rem = n;
-                    while rem >= 16 && n_pieces < 6 {
+                    while rem >= 16 && n_pieces < MAX_MEMMOVE_PIECES {
                         let tmp = self.mfunc.alloc_vreg(VRegClass::Vec128);
                         self.push_op(
                             MOp::Ldr {
@@ -8531,7 +8726,7 @@ impl<'a, 'v> Selector<'a, 'v> {
                         (2, MemSize::H16, VRegClass::Gpr32),
                         (1, MemSize::B8, VRegClass::Gpr32),
                     ] {
-                        if rem >= bytes && n_pieces < 6 {
+                        if rem >= bytes && n_pieces < MAX_MEMMOVE_PIECES {
                             let tmp = self.mfunc.alloc_vreg(cls);
                             self.push_op(
                                 MOp::Ldr {
@@ -9008,7 +9203,7 @@ fn compute_use_counts<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<u32, Alloc<'
                 inc(o.value());
                 inc(o.value());
             }
-            Op::Select | Op::Memcpy | Op::Memmove | Op::Memset | Op::Fma | Op::Fmuladd => {
+            Op::Select | Op::Memcpy | Op::Memmove | Op::Memset | Op::Memcmp | Op::Fma | Op::Fmuladd => {
                 inc(o.value());
                 inc(o.value());
                 inc(o.value());
@@ -10200,6 +10395,7 @@ fn select_mfunc_ssa<'a>(
         cur_lir_blk: 0,
         cur_weight: 1,
         next_vflag: 0,
+        block_vec16_consts: Vec::new_in(alloc),
         live_cmp: None,
         deferred_splits: Vec::new_in(alloc),
         deferred_pairs: Vec::new_in(alloc),
@@ -15595,6 +15791,497 @@ mod tests {
                 a[13] = b'A';
                 c[13] = b'B';
                 assert_eq!(f(a.as_ptr(), c.as_ptr(), b'A', b'B'), (1u16 << 2) | (1u16 << 13));
+            }
+        }
+    }
+
+    #[test]
+    fn vec128_neg_shifts_and_128b_inline_memmove_execute_exact() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let machine = Machine {
+            arch: Arch::Arm64,
+            os: Os::MacOs,
+            features: Machine::LSE | Machine::DOTPROD | Machine::CRC32,
+        };
+
+        // 1. Native 128-bit NEON vector `Neg`, immediate splat `Shl`/`Lshr`/`Ashr`, and dynamic
+        //    vector `Shl`/`Lshr`/`Ashr` on `<4 x i32>` (including BLAKE3's `rotr(x, 12)` pattern).
+        {
+            let v4 = Ty::vector(Scalar::I32, 4).expect("v4i32");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let in_p = b.param(Ty::PTR);
+            let sh_p = b.param(Ty::PTR);
+            let out_p = b.param(Ty::PTR);
+            let x = b.load(v4, Flags::NONE, in_p, 0, MemAttrs::aligned(4));
+            let s = b.load(v4, Flags::NONE, sh_p, 0, MemAttrs::aligned(4));
+            // BLAKE3 immediate rotr 12: `(x >> 12) | (x << 20)`
+            let c12 = b.iconst(Ty::I32, 12);
+            let c20 = b.iconst(Ty::I32, 20);
+            let s12 = b.convert(Op::Splat, Flags::NONE, v4, c12);
+            let s20 = b.convert(Op::Splat, Flags::NONE, v4, c20);
+            let r_shr = b.binary(Op::Lshr, Flags::IN_RANGE, x, s12);
+            let r_shl = b.binary(Op::Shl, Flags::IN_RANGE, x, s20);
+            let rotr12 = b.binary(Op::Or, Flags::NONE, r_shr, r_shl);
+            let c5 = b.iconst(Ty::I32, 5);
+            let s5 = b.convert(Op::Splat, Flags::NONE, v4, c5);
+            let imm_ashr = b.binary(Op::Ashr, Flags::IN_RANGE, x, s5);
+            let neg_x = b.unary(Op::Neg, Flags::NONE, x);
+            let dyn_shl = b.binary(Op::Shl, Flags::IN_RANGE, x, s);
+            let dyn_lshr = b.binary(Op::Lshr, Flags::IN_RANGE, x, s);
+            let dyn_ashr = b.binary(Op::Ashr, Flags::IN_RANGE, x, s);
+            b.store(Flags::NONE, rotr12, out_p, 0, MemAttrs::aligned(4));
+            b.store(Flags::NONE, imm_ashr, out_p, 16, MemAttrs::aligned(4));
+            b.store(Flags::NONE, neg_x, out_p, 32, MemAttrs::aligned(4));
+            b.store(Flags::NONE, dyn_shl, out_p, 48, MemAttrs::aligned(4));
+            b.store(Flags::NONE, dyn_lshr, out_p, 64, MemAttrs::aligned(4));
+            b.store(Flags::NONE, dyn_ashr, out_p, 80, MemAttrs::aligned(4));
+            b.ret(&[]);
+
+            let func = b.finish_checked().expect("vec shift finish");
+            let verified = verify(func.view()).expect("vec shift verify");
+            let (emitted, _clob, _stats) = emit_mfunc_ssa_a64(
+                verified,
+                &NoNames,
+                MIseOpts {
+                    machine,
+                    call_mode: CallMode::DirectBl,
+                    scratch_gpr_order: None,
+                    preserve_all_cold: false,
+                    call_clobbers: &[],
+                    internal_fast: false,
+                    internal_fast_calls: &[],
+                    fast_mode: false,
+                },
+                alloc,
+            )
+            .expect("misel must emit native NEON vec128 shifts and neg");
+            assert!(emitted.relocs.is_empty(), "native NEON shifts must have zero relocs");
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+                // SAFETY: Valid AAPCS64 function matching `(*const u32, *const u32, *mut u32)`.
+                let f: extern "C" fn(*const u32, *const u32, *mut u32) = unsafe { exec.as_fn() };
+                let input: [u32; 4] = [0x8000_1234, 0x7fff_abcd, 0x0000_0001, 0xffff_fffe];
+                let shifts: [u32; 4] = [0, 3, 15, 31];
+                let mut out = [0u32; 24];
+                f(input.as_ptr(), shifts.as_ptr(), out.as_mut_ptr());
+                for i in 0..4 {
+                    assert_eq!(out[i], input[i].rotate_right(12), "rotr12 lane {i}");
+                    assert_eq!(out[4 + i], ((input[i] as i32) >> 5) as u32, "imm_ashr lane {i}");
+                    assert_eq!(out[8 + i], input[i].wrapping_neg(), "neg lane {i}");
+                    assert_eq!(out[12 + i], input[i] << shifts[i], "dyn_shl lane {i}");
+                    assert_eq!(out[16 + i], input[i] >> shifts[i], "dyn_lshr lane {i}");
+                    assert_eq!(out[20 + i], ((input[i] as i32) >> shifts[i]) as u32, "dyn_ashr lane {i}");
+                }
+            }
+        }
+
+        // 2. Overlap-safe inline `Op::Memmove` up to 128 bytes: zero C runtime calls (`relocs.is_empty()`),
+        //    verified on both forward-overlapping (`dst = src + 8`) and backward-overlapping (`dst = src - 8`).
+        for len in [64u64, 128u64] {
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let dst = b.param(Ty::PTR);
+            let src = b.param(Ty::PTR);
+            let n = b.iconst(Ty::I64, u128::from(len));
+            b.bulk(Op::Memmove, Flags::NONE, dst, src, n, MemAttrs::aligned(0));
+            b.ret(&[]);
+
+            let func = b.finish_checked().expect("inline memmove finish");
+            let verified = verify(func.view()).expect("inline memmove verify");
+            let (emitted, _clob, _stats) = emit_mfunc_ssa_a64(
+                verified,
+                &NoNames,
+                MIseOpts {
+                    machine,
+                    call_mode: CallMode::DirectBl,
+                    scratch_gpr_order: None,
+                    preserve_all_cold: false,
+                    call_clobbers: &[],
+                    internal_fast: false,
+                    internal_fast_calls: &[],
+                    fast_mode: false,
+                },
+                alloc,
+            )
+            .expect("misel must inline 64B/128B memmove");
+            assert!(emitted.relocs.is_empty(), "len={len} memmove must be inline with zero relocs");
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+                // SAFETY: Valid AAPCS64 function matching `(*mut u8, *const u8)`.
+                let f: extern "C" fn(*mut u8, *const u8) = unsafe { exec.as_fn() };
+                let n = len as usize;
+                // Forward overlap: dst = buf + 16, src = buf + 8
+                let mut buf = [0u8; 160];
+                for (i, slot) in buf.iter_mut().enumerate() {
+                    *slot = (i as u8).wrapping_mul(7).wrapping_add(3);
+                }
+                let mut expect = buf;
+                expect.copy_within(8..8 + n, 16);
+                // SAFETY: Both ranges lie within `buf`.
+                unsafe { f(buf.as_mut_ptr().add(16), buf.as_ptr().add(8)) };
+                assert_eq!(buf, expect, "forward overlapping {n}B memmove mismatch");
+                // Backward overlap: dst = buf + 8, src = buf + 16
+                let mut expect2 = buf;
+                expect2.copy_within(16..16 + n, 8);
+                // SAFETY: Both ranges lie within `buf`.
+                unsafe { f(buf.as_mut_ptr().add(8), buf.as_ptr().add(16)) };
+                assert_eq!(buf, expect2, "backward overlapping {n}B memmove mismatch");
+            }
+        }
+
+        // 3. Dead const-generic non-native vector arm (`match 4 { 2 => <2 x i32>, 4 => <4 x i32> }`)
+        //    is pruned before `needs_pre_sota_legalize` so the live 128-bit NEON arm stays native.
+        {
+            let v2 = Ty::vector(Scalar::I32, 2).expect("v2i32");
+            let v4 = Ty::vector(Scalar::I32, 4).expect("v4i32");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let [entry, dead_v2, live_v4] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let p_in = b.param(Ty::PTR);
+            let p_out = b.param(Ty::PTR);
+            let c4 = b.iconst(Ty::I64, 4);
+            let c2 = b.iconst(Ty::I64, 2);
+            let is_two = b.icmp(IntCond::Eq, c4, c2);
+            b.br(Flags::NONE, is_two, (dead_v2, &[]), (live_v4, &[]));
+
+            b.begin(dead_v2);
+            let dv = b.load(v2, Flags::NONE, p_in, 0, MemAttrs::aligned(3));
+            let dv2 = b.binary(Op::Add, Flags::NONE, dv, dv);
+            b.store(Flags::NONE, dv2, p_out, 0, MemAttrs::aligned(3));
+            b.ret(&[]);
+
+            b.begin(live_v4);
+            let lv = b.load(v4, Flags::NONE, p_in, 0, MemAttrs::aligned(4));
+            let lv2 = b.binary(Op::Add, Flags::NONE, lv, lv);
+            b.store(Flags::NONE, lv2, p_out, 0, MemAttrs::aligned(4));
+            b.ret(&[]);
+
+            let func = b.finish_checked().expect("dead arm finish");
+            let verified = verify(func.view()).expect("dead arm verify");
+            let mut opts = crate::SotaRecordAbiOpts::for_machine(machine);
+            opts.is_hot = true;
+            let (rec, _insts, called, _clob) = crate::emit_sota_record_for_machine_with_abi(
+                verified,
+                &NoNames,
+                &crate::RoutinePlaces::NONE,
+                opts,
+                &[],
+                alloc,
+            )
+            .expect("dead non-native arm must prune cleanly");
+            assert_eq!(called, crate::Called::NONE);
+            assert!(
+                rec.code.len() <= 64,
+                "expected compact 128-bit NEON code without scalar legalization, got {} bytes",
+                rec.code.len()
+            );
+        }
+    }
+
+    #[test]
+    fn misel_handles_memcmp_with_vec128_and_preserves_vec128_across_calls() {
+        use blaze_lir::Scalar;
+
+        let alloc = test_alloc();
+        let machine = MAC_ARM64;
+
+        // 1. `Op::Memcmp` + `<16 x i8>` in one function (`core::str::pattern::simd_contains` shape):
+        //    `misel` must accept it directly (no fallback to `isel` / scalarization!).
+        {
+            let v16 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I64)],
+                &[Param::of(Ty::I32)],
+            );
+            b.set_signature(sig);
+            let [entry, fallback, done] = [(); 3].map(|_| b.create_block(BlockKind::Normal));
+            b.begin(entry);
+            let a = b.param(Ty::PTR);
+            let bp = b.param(Ty::PTR);
+            let n = b.param(Ty::I64);
+            let va = b.load(v16, Flags::NONE, a, 0, MemAttrs::aligned(0));
+            let vb = b.load(v16, Flags::NONE, bp, 0, MemAttrs::aligned(0));
+            let diff = b.binary(Op::Xor, Flags::NONE, va, vb);
+            let diff_i64 = b.convert(Op::Bitcast, Flags::NONE, Ty::vector(Scalar::I64, 2).expect("v2i64"), diff);
+            let lane0 = b.extract(diff_i64, 0);
+            let z0 = b.iconst(Ty::I64, 0);
+            let hit = b.icmp(IntCond::Eq, lane0, z0);
+            b.br(Flags::NONE, hit, (fallback, &[]), (done, &[]));
+
+            b.begin(fallback);
+            let cmp = b.memcmp(a, bp, n, MemAttrs::aligned(0));
+            b.ret(&[cmp]);
+
+            b.begin(done);
+            let neg1 = b.iconst(Ty::I32, u128::from(u32::MAX));
+            b.ret(&[neg1]);
+
+            let func = b.finish_checked().expect("memcmp+vec128 finish");
+            let verified = verify(func.view()).expect("memcmp+vec128 verify");
+            let (emitted, _clob, _stats) = emit_mfunc_ssa_a64(
+                verified,
+                &NoNames,
+                MIseOpts {
+                    machine,
+                    call_mode: CallMode::DirectBl,
+                    scratch_gpr_order: None,
+                    preserve_all_cold: false,
+                    call_clobbers: &[],
+                    internal_fast: false,
+                    internal_fast_calls: &[],
+                    fast_mode: false,
+                },
+                alloc,
+            )
+            .expect("misel must accept Op::Memcmp alongside 128-bit NEON");
+            assert_eq!(
+                emitted.relocs.len(),
+                1,
+                "Op::Memcmp must emit exactly one C runtime relocation for memcmp"
+            );
+            assert!(
+                emitted.code.len() <= 160,
+                "expected compact NEON + memcmp code, got {} bytes",
+                emitted.code.len()
+            );
+        }
+
+        // 2. AAPCS64 soundness: a `Vec128` live across an external call MUST NOT be assigned to
+        //    `V8..=V15` (whose upper 64 bits are caller-saved under AAPCS64!). Verify live on Apple Silicon
+        //    with a callee that explicitly clobbers the upper 64 bits of `v8..=v15` while preserving `d8..=d15`.
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            extern "C" fn clobber_upper_v8_to_v15() {
+                // SAFETY: Saves/restores the low 64 bits (`d8..=d15`) per AAPCS64 while overwriting
+                // the upper 64 bits of `v8..=v15` with `0xdead_beef_cafe_babe`.
+                unsafe {
+                    core::arch::asm!(
+                        "stp d8, d9, [sp, #-64]!",
+                        "stp d10, d11, [sp, #16]",
+                        "stp d12, d13, [sp, #32]",
+                        "stp d14, d15, [sp, #48]",
+                        "mov x9, #0xbabe",
+                        "movk x9, #0xcafe, lsl #16",
+                        "movk x9, #0xbeef, lsl #32",
+                        "movk x9, #0xdead, lsl #48",
+                        "ins v8.d[1], x9",
+                        "ins v9.d[1], x9",
+                        "ins v10.d[1], x9",
+                        "ins v11.d[1], x9",
+                        "ins v12.d[1], x9",
+                        "ins v13.d[1], x9",
+                        "ins v14.d[1], x9",
+                        "ins v15.d[1], x9",
+                        "ldp d10, d11, [sp, #16]",
+                        "ldp d12, d13, [sp, #32]",
+                        "ldp d14, d15, [sp, #48]",
+                        "ldp d8, d9, [sp], #64",
+                        out("x9") _,
+                    );
+                }
+            }
+
+            let v4 = Ty::vector(Scalar::I32, 4).expect("v4i32");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let callee_sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let src = b.param(Ty::PTR);
+            let dst = b.param(Ty::PTR);
+            let fn_ptr = b.param(Ty::PTR);
+            let mut vecs: Vec<blaze_lir::Value, Alloc<'static>> = Vec::with_capacity_in(4, alloc);
+            for i in 0..4 {
+                vecs.push(b.load(v4, Flags::NONE, src, i * 16, MemAttrs::aligned(4)));
+            }
+            let _ = b.call_indirect(Flags::NONE, fn_ptr, callee_sig, &[]);
+            for (i, &v) in vecs.iter().enumerate() {
+                b.store(Flags::NONE, v, dst, (i as i32) * 16, MemAttrs::aligned(4));
+            }
+            b.ret(&[]);
+
+            let func = b.finish_checked().expect("vec128 across call finish");
+            let verified = verify(func.view()).expect("vec128 across call verify");
+            let (emitted, _clob, _stats) = emit_mfunc_ssa_a64(
+                verified,
+                &NoNames,
+                MIseOpts {
+                    machine,
+                    call_mode: CallMode::DirectBl,
+                    scratch_gpr_order: None,
+                    preserve_all_cold: false,
+                    call_clobbers: &[],
+                    internal_fast: false,
+                    internal_fast_calls: &[],
+                    fast_mode: false,
+                },
+                alloc,
+            )
+            .expect("misel must spill vec128 across calls rather than using v8..=v15");
+            let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+            // SAFETY: Valid AAPCS64 function matching `(*const u32, *mut u32, extern "C" fn())`.
+            let f: extern "C" fn(*const u32, *mut u32, extern "C" fn()) = unsafe { exec.as_fn() };
+            let mut input = [0u32; 16];
+            for (i, slot) in input.iter_mut().enumerate() {
+                *slot = 0x1111_0001u32.wrapping_add((i as u32).wrapping_mul(0x0102_0304));
+            }
+            let mut output = [0u32; 16];
+            f(input.as_ptr(), output.as_mut_ptr(), clobber_upper_v8_to_v15);
+            assert_eq!(output, input, "upper 64 bits of live Vec128 were clobbered across AAPCS64 call!");
+        }
+    }
+
+    #[test]
+    fn sota_strips_dead_assume_tree_and_emits_neon_rev_and_masked_const_shifts() {
+        use blaze_lir::Scalar;
+
+        let alloc = test_alloc();
+        let machine = MAC_ARM64;
+
+        // 1. Dead `Op::Assume` proof tree (exact `core::simd::Mask::from_simd` pattern) must be
+        //    stripped before machine lowering so zero dead NEON/cset instructions are emitted.
+        {
+            let v16 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+            let v2i64 = Ty::vector(Scalar::I64, 2).expect("v2i64");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let src = b.param(Ty::PTR);
+            let dst = b.param(Ty::PTR);
+            let v = b.load(v16, Flags::NONE, src, 0, MemAttrs::aligned(4));
+            // Dead proof tree feeding ONLY `Op::Assume` (including `Op::ReduceAnd`, exact `Mask::from_simd` shape):
+            let z8 = b.iconst(Ty::I8, 0);
+            let ff8 = b.iconst(Ty::I8, 0xff);
+            let vz = b.convert(Op::Splat, Flags::NONE, v16, z8);
+            let vff = b.convert(Op::Splat, Flags::NONE, v16, ff8);
+            let t1 = b.binary(Op::Xor, Flags::NONE, v, vz);
+            let t2 = b.binary(Op::Xor, Flags::NONE, v, vff);
+            let t3 = b.binary(Op::Or, Flags::NONE, t1, t2);
+            let red = b.convert(Op::ReduceAnd, Flags::NONE, Ty::I8, t3);
+            let cond = b.icmp(IntCond::Ne, red, z8);
+            b.assume(cond);
+            b.store(Flags::NONE, v, dst, 0, MemAttrs::aligned(4));
+            b.ret(&[]);
+
+            let func = b.finish_checked().expect("assume strip finish");
+            let verified = verify(func.view()).expect("assume strip verify");
+            let mut opts = crate::SotaRecordAbiOpts::for_machine(machine);
+            opts.is_hot = true;
+            let (rec, _insts, called, _clob) = crate::emit_sota_record_for_machine_with_abi(
+                verified,
+                &NoNames,
+                &crate::RoutinePlaces::NONE,
+                opts,
+                &[],
+                alloc,
+            )
+            .expect("sota emit with assume");
+            assert_eq!(called, crate::Called::NONE);
+            assert!(
+                rec.code.len() <= 24,
+                "dead Op::Assume proof tree should strip down to load+store+ret (<=24B), got {}B",
+                rec.code.len()
+            );
+        }
+
+        // 2. NEON `rev32.8h`, `rev32.16b`, `rev16.16b`, `rev64.4s` + masked constant splat shift
+        //    (`Op::And(Op::Splat(12), Op::Splat(31))` -> `ushr.4s #12`) execute bit-exact on Mac.
+        {
+            let v16 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+            let v4 = Ty::vector(Scalar::I32, 4).expect("v4i32");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let src = b.param(Ty::PTR);
+            let dst = b.param(Ty::PTR);
+            let vb = b.load(v16, Flags::NONE, src, 0, MemAttrs::aligned(4));
+            let r32_8h = b.shuffle(v16, vb, vb, &[2, 3, 0, 1, 6, 7, 4, 5, 10, 11, 8, 9, 14, 15, 12, 13]);
+            let r32_16b = b.shuffle(v16, vb, vb, &[3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12]);
+            let r16_16b = b.shuffle(v16, vb, vb, &[1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14]);
+            let r64_4s = b.shuffle(v16, vb, vb, &[4, 5, 6, 7, 0, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11]);
+            let vw = b.convert(Op::Bitcast, Flags::NONE, v4, vb);
+            let k12 = b.iconst(Ty::I32, 12);
+            let k31 = b.iconst(Ty::I32, 31);
+            let s12 = b.convert(Op::Splat, Flags::NONE, v4, k12);
+            let s31 = b.convert(Op::Splat, Flags::NONE, v4, k31);
+            let masked = b.binary(Op::And, Flags::NONE, s12, s31);
+            let shifted = b.binary(Op::Lshr, Flags::NONE, vw, masked);
+
+            b.store(Flags::NONE, r32_8h, dst, 0, MemAttrs::aligned(4));
+            b.store(Flags::NONE, r32_16b, dst, 16, MemAttrs::aligned(4));
+            b.store(Flags::NONE, r16_16b, dst, 32, MemAttrs::aligned(4));
+            b.store(Flags::NONE, r64_4s, dst, 48, MemAttrs::aligned(4));
+            b.store(Flags::NONE, shifted, dst, 64, MemAttrs::aligned(4));
+            b.ret(&[]);
+
+            let func = b.finish_checked().expect("rev+shift finish");
+            let verified = verify(func.view()).expect("rev+shift verify");
+            let (emitted, _clob, _stats) = emit_mfunc_ssa_a64(
+                verified,
+                &NoNames,
+                MIseOpts {
+                    machine,
+                    call_mode: CallMode::DirectBl,
+                    scratch_gpr_order: None,
+                    preserve_all_cold: false,
+                    call_clobbers: &[],
+                    internal_fast: false,
+                    internal_fast_calls: &[],
+                    fast_mode: false,
+                },
+                alloc,
+            )
+            .expect("misel must lower rev32/rev16/rev64 and masked const shifts");
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+                // SAFETY: Valid AAPCS64 function matching `(*const u32, *mut u32)`.
+                let f: extern "C" fn(*const u32, *mut u32) = unsafe { exec.as_fn() };
+                let input = [0x0102_0304u32, 0x1122_3344, 0xaabb_ccdd, 0xfeed_face];
+                let mut out = [0u32; 20];
+                f(input.as_ptr(), out.as_mut_ptr());
+                for i in 0..4 {
+                    assert_eq!(out[i], input[i].rotate_right(16), "rev32.8h lane {i}");
+                    assert_eq!(out[4 + i], input[i].swap_bytes(), "rev32.16b lane {i}");
+                    let lo = (input[i] as u16).swap_bytes() as u32;
+                    let hi = ((input[i] >> 16) as u16).swap_bytes() as u32;
+                    assert_eq!(out[8 + i], lo | (hi << 16), "rev16.16b lane {i}");
+                    assert_eq!(out[16 + i], input[i] >> 12, "masked const ushr lane {i}");
+                }
+                assert_eq!(&out[12..16], &[input[1], input[0], input[3], input[2]], "rev64.4s");
             }
         }
     }

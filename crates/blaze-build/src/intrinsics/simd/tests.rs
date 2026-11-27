@@ -225,3 +225,114 @@ fn select_bitmask_takes_lane_i_by_bit_i() {
         b.iconst(Ty::I64, 0)
     });
 }
+
+/// Wide 512-bit (`Simd<u32, 16>` / `Simd<u8, 64>`) ops (`add`, `shl`, `shr`, `shuffle`) split
+/// into four native 128-bit LIR vectors (`<4 x i32>` / `<16 x i8>`) so AArch64 NEON keeps them
+/// vectorized with zero >128-bit vector instructions and exact lane results.
+#[test]
+fn wide_512bit_simd_chunks_into_four_native_128bit_vectors() {
+    let mut env = Env::new();
+    let u32_ = env.g.n(PNode::Uint(UintTy::U32));
+    let a_u32x16 = env.g.array(u32_, 16);
+    let u32x16 = env.g.adt(env.vector, &[a_u32x16]);
+    let u8_ = env.g.n(U8);
+    let a_u8x64 = env.g.array(u8_, 64);
+    let u8x64 = env.g.adt(env.vector, &[a_u8x64]);
+    let a_idx64 = env.g.array(u32_, 64);
+    let idx64 = env.g.adt(env.vector, &[a_idx64]);
+
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I32)]);
+    b.set_signature(sig);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+
+    let s_a = b.slot(64, 6, SlotKind::Temp);
+    let s_b = b.slot(64, 6, SlotKind::Temp);
+    let s_sh = b.slot(64, 6, SlotKind::Temp);
+    let pa = b.slot_addr(s_a);
+    let pb = b.slot_addr(s_b);
+    let psh = b.slot_addr(s_sh);
+    for i in 0..16u32 {
+        let va = b.iconst(Ty::I32, u128::from(0x0102_0304u32.wrapping_add(i.wrapping_mul(0x1111_0001))));
+        let vb = b.iconst(Ty::I32, u128::from(i + 1));
+        let vsh = b.iconst(Ty::I32, 4);
+        b.store(Flags::NONE, va, pa, (i * 4) as i32, MemAttrs::aligned(2));
+        b.store(Flags::NONE, vb, pb, (i * 4) as i32, MemAttrs::aligned(2));
+        b.store(Flags::NONE, vsh, psh, (i * 4) as i32, MemAttrs::aligned(2));
+    }
+
+    let add_out = at(env
+        .call(
+            &mut b,
+            &Call {
+                which: Which::Simd(SimdOp::Add),
+                generics: &[GenericArg::Ty(u32x16)],
+                args: &[Arg::Place(pa), Arg::Place(pb)],
+                ret: u32x16,
+                site: None,
+            },
+        )
+        .expect("simd_add u32x16"));
+    let shr_out = at(env
+        .call(
+            &mut b,
+            &Call {
+                which: Which::Simd(SimdOp::Shr),
+                generics: &[GenericArg::Ty(u32x16)],
+                args: &[Arg::Place(add_out), Arg::Place(psh)],
+                ret: u32x16,
+                site: None,
+            },
+        )
+        .expect("simd_shr u32x16"));
+
+    // BLAKE3 `ByBytes::<2>` shuffle across all 64 bytes: each 4-byte word rotates right by 2 bytes.
+    let mut idx_bytes = [0u8; 64 * 4];
+    for k in 0..64u32 {
+        let src = (k / 4) * 4 + ((k % 4) + 2) % 4;
+        idx_bytes[(k as usize) * 4..(k as usize) * 4 + 4].copy_from_slice(&src.to_le_bytes());
+    }
+    let idx_ref = b.data(&idx_bytes, 4, &[]);
+    let idx_ptr = b.data_addr(idx_ref);
+    let shuf_out = at(env
+        .call(
+            &mut b,
+            &Call {
+                which: Which::Simd(SimdOp::Shuffle),
+                generics: &[GenericArg::Ty(u8x64), GenericArg::Ty(idx64), GenericArg::Ty(u8x64)],
+                args: &[Arg::Place(shr_out), Arg::Place(shr_out), Arg::Place(idx_ptr)],
+                ret: u8x64,
+                site: None,
+            },
+        )
+        .expect("simd_shuffle u8x64"));
+
+    // Lane 15 (offset 60) after add -> shr 4 -> byte-rotate-by-2.
+    let lane15 = b.load(Ty::I32, Flags::NONE, shuf_out, 60, MemAttrs::aligned(2));
+    b.ret(&[lane15]);
+
+    let f: Func<Global> = b.finish_checked().expect("512-bit chunked SIMD verifies");
+    // Every vector type in the built LIR must be native 128-bit (zero 256/512-bit vectors).
+    for &raw_ty in f.view().tys {
+        let ty = Ty(raw_ty);
+        if ty.is_vector() {
+            assert_eq!(ty.bits(64), 128, "unexpected non-128-bit vector type {ty}");
+        }
+    }
+    let mut legal = f.view().to_func_in(Alloc::global());
+    struct NoRoutines;
+    impl blaze_lir::legalize::QuadRoutines for NoRoutines {
+        fn routine(&self, _: blaze_lir::legalize::SoftFloat) -> Option<blaze_lir::func::RefId> {
+            None
+        }
+    }
+    blaze_lir::legalize::legalize(&mut legal, &NoRoutines, Alloc::global()).expect("512-bit chunked SIMD legalizes");
+    // The reference evaluator refuses `Flags::IN_RANGE` on shifts; clear promise flags before eval.
+    legal.flags.fill(0);
+    let expect = ((0x0102_0304u32.wrapping_add(15u32.wrapping_mul(0x1111_0001))).wrapping_add(16) >> 4).rotate_right(16);
+    match run_in(legal.view(), &[], 100_000, Global).expect("evaluator runs chunked 512-bit SIMD") {
+        Outcome::Returned(v) => assert_eq!(v.first(), Some(&Val::Int(u128::from(expect)))),
+        other => panic!("unexpected outcome: {other:?}"),
+    }
+}
