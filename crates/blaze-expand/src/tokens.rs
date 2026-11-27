@@ -522,6 +522,18 @@ impl<'a> TokenStream<'a> {
         None
     }
 
+    /// The [`crate::origin_column::TextMark`] projected onto rendered text or body words for a
+    /// token of `ctx`: the innermost non-transparent mark when one exists (preserving `$crate`,
+    /// def-site, and local hygiene), or else the innermost [`Transparency::Transparent`] mark
+    /// (preserving the emitting macro's edition for edition-gated checks such as Rust 2024
+    /// binding modifiers while hygiene consumers treat `Transparent` identically to unmarked).
+    /// Returns `None` at a root context (tokens written in a file or included via `include!`).
+    pub fn text_mark(&self, ctx: Ctx) -> Option<crate::origin_column::TextMark> {
+        self.non_transparent_mark(ctx)
+            .or_else(|| self.node(ctx).map(|node| node.mark))
+            .map(crate::origin_column::TextMark::of)
+    }
+
     /// The index of the delimiter that closes the group opened at `open`.
     pub fn close_of(&self, open: usize) -> Option<usize> {
         let mut depth = 0u32;
@@ -1198,8 +1210,10 @@ pub fn lex_marked<'a>(
         // `$crate` identifier with `ctx` so an inner macro's `$p:path`/`$t:tt`/`$e:expr` keeps
         // the defining crate's root.
         let crate_after = match (token.kind, mark, tokens.get(i + 1), places.get(i + 1)) {
-            (TokenKind::Punct { char: '$', .. }, Some(_), Some(next), Some(&(next_start, _)))
-                if next_start == end && lexed.text_of(next) == "crate" =>
+            (TokenKind::Punct { char: '$', .. }, Some(m), Some(next), Some(&(next_start, _)))
+                if m.transparency != crate::Transparency::Transparent
+                    && next_start == end
+                    && lexed.text_of(next) == "crate" =>
             {
                 match next.kind {
                     TokenKind::Ident { raw: Raw::No, spacing } => Some((spacing, 2usize)),

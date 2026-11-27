@@ -2085,25 +2085,58 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
     let transparent_over_opaque = stream.context(CtxNode { parent: opaque_ctx, mark: transparent_a }).expect("ctx");
 
     assert_eq!(stream.non_transparent_mark(root), None);
+    assert_eq!(stream.text_mark(root), None);
     assert_eq!(stream.node(only_transparent).map(|n| n.mark), Some(transparent_a));
     assert_eq!(stream.hygiene(only_transparent).mark, None);
     assert_eq!(stream.non_transparent_mark(only_transparent), None);
+    assert_eq!(stream.text_mark(only_transparent), Some(blaze_expand::origin_column::TextMark::of(transparent_a)));
     assert_eq!(stream.non_transparent_mark(semi_ctx), Some(semi_b));
+    assert_eq!(stream.text_mark(semi_ctx), Some(blaze_expand::origin_column::TextMark::of(semi_b)));
     assert_eq!(stream.non_transparent_mark(opaque_ctx), Some(opaque_c));
+    assert_eq!(stream.text_mark(opaque_ctx), Some(blaze_expand::origin_column::TextMark::of(opaque_c)));
     assert_eq!(stream.node(transparent_over_semi).map(|n| n.mark), Some(transparent_a));
     assert_eq!(stream.hygiene(transparent_over_semi).mark, Some(semi_b));
     assert_eq!(stream.non_transparent_mark(transparent_over_semi), Some(semi_b));
+    assert_eq!(stream.text_mark(transparent_over_semi), Some(blaze_expand::origin_column::TextMark::of(semi_b)));
     assert_eq!(stream.node(transparent_over_opaque).map(|n| n.mark), Some(transparent_a));
     assert_eq!(stream.hygiene(transparent_over_opaque).mark, Some(opaque_c));
     assert_eq!(stream.non_transparent_mark(transparent_over_opaque), Some(opaque_c));
+    assert_eq!(stream.text_mark(transparent_over_opaque), Some(blaze_expand::origin_column::TextMark::of(opaque_c)));
 
-    // `body_words` also skips `Transparent` marks when computing `BodyWord::mark`.
+    // `body_words` uses `text_mark`: preserves innermost `Transparent` mark (for edition tracking)
+    // while keeping local hygiene at 0 and preferring enclosing non-transparent marks for hygiene.
     stream.ident("$crate", only_transparent).expect("push");
     stream.ident("$crate", transparent_over_semi).expect("push");
     stream.ident("$crate", transparent_over_opaque).expect("push");
     let body = body_words(&stream, ContentId([99; 32]), alloc);
     assert_eq!(body.words.len(), 3);
-    assert_eq!(body.words[0].mark, None);
+    assert_eq!(body.words[0].hygiene, 0);
+    assert_eq!(body.words[0].mark, Some(blaze_expand::origin_column::TextMark::of(transparent_a)));
     assert_eq!(body.words[1].mark.map(|m| (m.site.krate, m.transparency)), Some((krate_b, Transparency::SemiOpaque)));
     assert_eq!(body.words[2].mark.map(|m| (m.site.krate, m.transparency)), Some((krate_c, Transparency::Opaque)));
+}
+
+#[test]
+fn lex_marked_preserves_transparent_edition_without_folding_dollar_crate() {
+    use blaze_expand::{Transparency, origin_column::TextMark};
+    let alloc = Alloc::global();
+    let site = DefSite { krate: CrateItemKey(ContentId([41; 32])), module: None };
+    let transparent_2021 = TextMark { site, transparency: Transparency::Transparent, edition: Edition::E2021 };
+    let semi_2021 = TextMark { site, transparency: Transparency::SemiOpaque, edition: Edition::E2021 };
+
+    let text = "$crate::Foo";
+    // Transparent mark: `$` and `crate` remain two tokens (same as unmarked), while preserving
+    // the transparent mark's edition via `text_mark`.
+    let ts_trans = blaze_expand::lex_marked(text, Edition::E2024, &|_| Some(transparent_2021), alloc).expect("lex transparent");
+    assert_eq!(ts_trans.len(), 5, "transparent `$crate::Foo` stays `$`, `crate`, `:`, `:`, `Foo`");
+    assert!(matches!(ts_trans.tokens()[0].kind, TokenKind::Punct { char: '$', .. }));
+    assert_eq!(ts_trans.text_at(1), "crate");
+    assert_eq!(ts_trans.text_mark(ts_trans.tokens()[0].ctx), Some(transparent_2021));
+    assert_eq!(ts_trans.non_transparent_mark(ts_trans.tokens()[0].ctx), None);
+
+    // Control: SemiOpaque mark folds `$` + `crate` into one `$crate` identifier.
+    let ts_semi = blaze_expand::lex_marked(text, Edition::E2024, &|_| Some(semi_2021), alloc).expect("lex semi");
+    assert_eq!(ts_semi.len(), 4, "semi-opaque `$crate::Foo` folds to `$crate`, `:`, `:`, `Foo`");
+    assert_eq!(ts_semi.text_at(0), "$crate");
+    assert_eq!(ts_semi.text_mark(ts_semi.tokens()[0].ctx), Some(semi_2021));
 }
