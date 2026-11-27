@@ -128,7 +128,7 @@ pub struct RootAttrs {
     /// builtin types are looked up ([`crate::builtin_type_in`]).
     pub arbitrary_ints: bool,
     /// Effective `#![recursion_limit = "N"]` (default [`crate::RECURSION_LIMIT`]).
-    pub recursion_limit: u16,
+    pub recursion_limit: u32,
 }
 
 impl Default for RootAttrs {
@@ -137,7 +137,7 @@ impl Default for RootAttrs {
             no_std: false,
             no_core: false,
             arbitrary_ints: false,
-            recursion_limit: crate::RECURSION_LIMIT,
+            recursion_limit: u32::from(crate::RECURSION_LIMIT),
         }
     }
 }

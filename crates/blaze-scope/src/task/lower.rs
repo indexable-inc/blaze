@@ -573,8 +573,8 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 "no_std" => attrs.no_std = true,
                 "no_core" => attrs.no_core = true,
                 "recursion_limit" => {
-                    if let Some(limit) = parse_recursion_limit(content) {
-                        attrs.recursion_limit = Some(limit);
+                    if !matches!(attrs.recursion_limit, Some(Err(_))) {
+                        attrs.recursion_limit = Some(parse_recursion_limit(content));
                     }
                 }
                 "feature" => {
@@ -810,8 +810,8 @@ pub struct Attrs<'t, 'a> {
     pub no_core: bool,
     /// `#![blaze::arbitrary_ints]` (docs/v2/plan/design/arbitrary-ints.md).
     pub arbitrary_ints: bool,
-    /// `#![recursion_limit = "N"]` (crate-level, capped at [`crate::MAX_RECURSION_LIMIT`]).
-    pub recursion_limit: Option<u16>,
+    /// `#![recursion_limit = "N"]`: `Ok(limit)` when valid, `Err(content)` when malformed.
+    pub recursion_limit: Option<Result<u32, &'t str>>,
     pub tools: AVec<'a, &'t str>,
     /// `#![feature(a, b)]`'s names, as written (a crate root's: the crate root record's
     /// `features`, which a gate of the crate's code reads).
@@ -936,18 +936,32 @@ impl<'a> Attrs<'_, 'a> {
     }
 }
 
-/// Parses the unsigned decimal integer inside `#![recursion_limit = "N"]`, clamped to
-/// [`crate::MAX_RECURSION_LIMIT`]. Malformed or non-numeric values return `None`.
-fn parse_recursion_limit(content: &str) -> Option<u16> {
-    let (Some(raw), None) = attr_string(content) else { return None };
+/// Unquotes a single Rust normal (`"..."`) or raw (`r#"..."#`) string literal, rejecting trailing
+/// tokens or unquoted expressions.
+fn unquote_str(expr: &str) -> Option<&str> {
+    if let Some(inner) = expr.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        return (!inner.contains('"')).then_some(inner);
+    }
+    let rest = expr.strip_prefix('r')?;
+    let hashes = rest.bytes().take_while(|&b| b == b'#').count();
+    let prefix = rest.get(..hashes)?;
+    rest.get(hashes..)?.strip_prefix('"')?.strip_suffix(prefix)?.strip_suffix('"')
+}
+
+/// Parses `#![recursion_limit = "N"]`, preserving the requested limit (up to `u32::MAX`) and
+/// returning `Err(content)` when the attribute or its value is malformed or overflows `usize`.
+fn parse_recursion_limit<'t>(content: &'t str) -> Result<u32, &'t str> {
+    let attr = head(content);
+    let Some(rest) = content.get(attr.len()..) else { return Err(content) };
+    let Some(value) = rest.trim_start().strip_prefix('=').filter(|it| !it.starts_with('=')) else {
+        return Err(content);
+    };
+    let Some(raw) = unquote_str(value.trim()) else { return Err(content) };
     if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+        return Err(content);
     }
-    let mut limit = 0u16;
-    for b in raw.bytes() {
-        limit = limit.saturating_mul(10).saturating_add(u16::from(b - b'0')).min(crate::MAX_RECURSION_LIMIT);
-    }
-    Some(limit)
+    let Ok(parsed) = raw.parse::<usize>() else { return Err(content) };
+    Ok(u32::try_from(parsed).unwrap_or(u32::MAX))
 }
 
 /// An attribute the lowering never takes for an item's attribute macro by its name alone: a
@@ -3399,7 +3413,7 @@ pub fn crate_root<'t, 'a>(
         no_std: attrs.no_std,
         no_core: attrs.no_core,
         arbitrary_ints: attrs.arbitrary_ints,
-        recursion_limit: attrs.recursion_limit.unwrap_or(crate::RECURSION_LIMIT),
+        recursion_limit: attrs.recursion_limit.and_then(Result::ok).unwrap_or(u32::from(crate::RECURSION_LIMIT)),
         prelude,
     };
     let mut cr = CrateRootBuilder::new_in(head, alloc);

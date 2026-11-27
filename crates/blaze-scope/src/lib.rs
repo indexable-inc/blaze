@@ -142,7 +142,7 @@ pub fn cells_count<'a, F: ScopeFacts>(
 }
 pub use group::Group;
 pub use read::{Answer, ExpandRequest, NameAnswer, Read, Reply, Step};
-pub use resolver::{FillStats, MAX_EXPANSIONS, MAX_MODULE_DEPTH, MAX_RECURSION_LIMIT, RECURSION_LIMIT, Resolver};
+pub use resolver::{FillStats, MAX_EXPANSIONS, MAX_MODULE_DEPTH, RECURSION_LIMIT, Resolver};
 pub use scope::{ReadEntry, ReadList, Resolved, Saw};
 
 // The item layer's words and working forms, from their one home.

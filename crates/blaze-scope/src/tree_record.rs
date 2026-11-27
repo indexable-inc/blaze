@@ -86,7 +86,7 @@ pub struct TreeRecord<'r> {
     pub no_std: bool,
     pub no_core: bool,
     pub arbitrary_ints: bool,
-    pub recursion_limit: u16,
+    pub recursion_limit: u32,
     /// The crate root's `CrateRoot` record as the solve read it (before the cells added the
     /// macro-written `extern crate`s and exports).
     pub crate_root: &'r [u8],
@@ -237,7 +237,7 @@ impl<'r> TreeRecord<'r> {
             return Err(TreeRecordError::NotTree);
         }
         let (no_std, no_core, arbitrary_ints) = (flag(&mut r)?, flag(&mut r)?, flag(&mut r)?);
-        let recursion_limit = u16::from_le_bytes(*r.array::<2>().map_err(TreeRecordError::Short)?);
+        let recursion_limit = u32::from_le_bytes(*r.array::<4>().map_err(TreeRecordError::Short)?);
         let n = count(&mut r)?;
         let mut tools = AVec::with_capacity_in(n.min(bytes.len()), alloc);
         for _ in 0..n {

@@ -788,6 +788,9 @@ pub enum NamesError<'a> {
     Cells { krate: &'a str, error: crate::cells::Unwritten },
     /// The module tree record was not written.
     TreeRecord { krate: &'a str, error: crate::tree_record::TreeRecordError },
+    /// The crate root's `#![recursion_limit]` attribute is malformed (not an unsigned decimal
+    /// integer string literal).
+    InvalidRecursionLimit { krate: &'a str, attr: &'a str },
     /// Two items' keys begin with the same 16 bytes (a checker key's, front2 keys.rs
     /// `checker_of`), so [`Names::key_beginning`] could not say which one a checker key names
     /// (rule 21: two values under one key is a refusal; the fix is the key). `first` and
@@ -817,6 +820,9 @@ impl fmt::Display for NamesError<'_> {
             }
             NamesError::Cells { krate, error } => write!(f, "crate `{krate}`: {error}"),
             NamesError::TreeRecord { krate, error } => write!(f, "crate `{krate}`: its module tree record: {error:?}"),
+            NamesError::InvalidRecursionLimit { krate, attr } => {
+                write!(f, "crate `{krate}`: malformed `#![{attr}]`: recursion limit must be an unsigned integer string literal")
+            }
             NamesError::KeyBeginning { first, second } => {
                 write!(f, "items {first:?} and {second:?}: their keys begin with the same 16 bytes, so a checker key cannot name one (rule 21, keys-cover-every-input)")
             }
@@ -2347,13 +2353,14 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     // module's lowering reads to know an item's taker (names-attr-3).
     let root = set.at(root_file as usize);
     let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
+    let recursion_limit = effective_recursion_limit(input.name, &attrs)?;
     let tools = crate_tools(&attrs, alloc);
     let mut low = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, notes, par, opts, None, sources.attr_order(), bump);
     let root_attrs = RootAttrs {
         no_std: attrs.no_std,
         no_core: attrs.no_core,
         arbitrary_ints: attrs.arbitrary_ints,
-        recursion_limit: attrs.recursion_limit.unwrap_or(crate::RECURSION_LIMIT),
+        recursion_limit,
     };
     let macro_exports = core::mem::replace(&mut low.macro_exports, AVec::new_in(alloc));
     let root_bytes = root_record_of(graph, input, id, root.id, &attrs, &tree, &mut low, &macro_exports, built, notes, bump)?;
@@ -2377,11 +2384,12 @@ fn root_record_of<'a>(
     bump: Bump<'a>,
 ) -> Result<&'a [u8], NamesError<'a>> {
     let alloc = bump.alloc();
+    let recursion_limit = effective_recursion_limit(input.name, attrs)?;
     let root_attrs = RootAttrs {
         no_std: attrs.no_std,
         no_core: attrs.no_core,
         arbitrary_ints: attrs.arbitrary_ints,
-        recursion_limit: attrs.recursion_limit.unwrap_or(crate::RECURSION_LIMIT),
+        recursion_limit,
     };
     let plan = root_plan(graph, id, root_attrs, built, notes, bump)?;
     // From 2018 the injected item's name is def-site (rustc's `std_inject`: `ident_span = if
@@ -2522,10 +2530,11 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     let (tools, attrs) = if root_member {
         let root = set.at(tree.modules[0].file as usize);
         let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
-        if attrs.recursion_limit.unwrap_or(crate::RECURSION_LIMIT) != record.recursion_limit {
+        let recursion_limit = effective_recursion_limit(input.name, &attrs)?;
+        if recursion_limit != record.recursion_limit {
             return Ok(None);
         }
-        (crate_tools(&attrs, alloc), Some((root.id, attrs)))
+        (crate_tools(&attrs, alloc), Some((root.id, attrs, recursion_limit)))
     } else {
         (AVec::from_slice_in(&record.tools, alloc), None)
     };
@@ -2561,18 +2570,28 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
             },
             stored,
         ),
-        Some((root_file, attrs)) => {
+        Some((root_file, attrs, recursion_limit)) => {
             let exports: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::from_iter_in(stored_view.macro_exports(), alloc);
             let root_attrs = RootAttrs {
                 no_std: attrs.no_std,
                 no_core: attrs.no_core,
                 arbitrary_ints: attrs.arbitrary_ints,
-                recursion_limit: attrs.recursion_limit.unwrap_or(crate::RECURSION_LIMIT),
+                recursion_limit,
             };
             (root_attrs, root_record_of(graph, input, id, root_file, &attrs, &tree, &mut low, &exports, built, notes, bump)?)
         }
     };
     Ok(Some(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: Some((bytes, record)) }))
+}
+
+/// The crate's effective macro expansion recursion limit from its root file's attributes, or a
+/// typed error when `#![recursion_limit]` is malformed.
+fn effective_recursion_limit<'a>(krate: &'a str, attrs: &Attrs<'a, 'a>) -> Result<u32, NamesError<'a>> {
+    match attrs.recursion_limit {
+        None => Ok(u32::from(crate::RECURSION_LIMIT)),
+        Some(Ok(limit)) => Ok(limit),
+        Some(Err(attr)) => Err(NamesError::InvalidRecursionLimit { krate, attr }),
+    }
 }
 
 /// Whether a member's `mod` lines or `#[macro_export]` macros (its record written and read
@@ -5540,8 +5559,13 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
         if nested.end != blaze_file_items::nested::NestedEnd::Whole || !nested.writes() {
             continue;
         }
-        let max_block_depth = base.root.head.recursion_limit.saturating_add(BLOCK_DEPTH_SLACK);
-        if body.depth >= max_block_depth {
+        let max_block_depth = base
+            .root
+            .head
+            .recursion_limit
+            .max(u32::from(crate::RECURSION_LIMIT))
+            .saturating_add(u32::from(BLOCK_DEPTH_SLACK));
+        if u32::from(body.depth) >= max_block_depth {
             run.note(NamesNote::Made { name: crate::blocks::BLOCK_MODULE, at: body.loc, note: MadeNote::TooMany });
             continue;
         }

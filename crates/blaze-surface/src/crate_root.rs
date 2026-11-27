@@ -23,7 +23,7 @@ use crate::kind::{Edition, MacroShapes};
 mod in_place;
 
 /// rustc's default `#![recursion_limit = "128"]`.
-pub const DEFAULT_RECURSION_LIMIT: u16 = 128;
+pub const DEFAULT_RECURSION_LIMIT: u32 = 128;
 
 /// What a crate's root record says of the crate itself.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -41,7 +41,7 @@ pub struct CrateRootHead {
     /// `#![blaze::arbitrary_ints]`: `u1`..`u127` and `i1`..`i127` are builtin types in it.
     pub arbitrary_ints: bool,
     /// Effective macro expansion recursion limit (`#![recursion_limit = "N"]`, default 128).
-    pub recursion_limit: u16,
+    pub recursion_limit: u32,
     /// The standard prelude module the crate's modules import (`std::prelude::rust_2021`, or
     /// core's under `no_std`), `None` under `#![no_core]`.
     pub prelude: Option<ItemKey>,
@@ -168,8 +168,7 @@ blaze_format::record! {
         pub(crate) no_std: bool,
         pub(crate) no_core: bool,
         pub(crate) arbitrary_ints: bool,
-        pub(crate) recursion_limit: u16,
-        pub(crate) pad: u16,
+        pub(crate) recursion_limit: u32,
     }
 }
 
@@ -264,7 +263,6 @@ impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
             no_core: head.no_core,
             arbitrary_ints: head.arbitrary_ints,
             recursion_limit: head.recursion_limit,
-            pad: 0,
         }))
     }
 }

@@ -291,7 +291,7 @@ impl World {
             no_std: false,
             no_core: false,
             arbitrary_ints: false,
-            recursion_limit: crate::RECURSION_LIMIT,
+            recursion_limit: u32::from(crate::RECURSION_LIMIT),
             prelude: None,
         };
         let mut cr = CrateRootBuilder::new_in(head, Alloc::global());

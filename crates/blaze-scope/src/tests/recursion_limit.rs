@@ -9,10 +9,10 @@ use std::string::String;
 use blaze_surface::{Namespace, ScopeError};
 
 use super::entry::input;
-use crate::crate_scope::{Ready, resolve_by_records};
+use crate::crate_scope::{CrateScopeError, Ready, resolve_by_records};
 use crate::graph::Sysroot;
 use crate::names_record::{NamesRecord, Verified, encode};
-use crate::resolve::{CrateNames, SourceTexts, aligned};
+use crate::resolve::{CrateNames, MadeNote, NamesError, NamesNote, SourceTexts, aligned};
 use crate::task::Serial;
 
 const WAIT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -64,27 +64,33 @@ fn recursion_limit_errors(names: &CrateNames<'_>) -> usize {
         .count()
 }
 
-fn solve_one<'a>(files: &'a [(&'a str, &'a str)], bump: blaze_own::Bump<'a>) -> &'a CrateNames<'a> {
+fn try_solve_one<'a>(
+    files: &'a [(&'a str, &'a str)],
+    bump: blaze_own::Bump<'a>,
+) -> Result<&'a CrateNames<'a>, (usize, CrateScopeError<'a>)> {
     let texts = CrateFiles(files);
     let crates = [input("k", "/k/lib.rs", &[])];
-    let (solved, _) = resolve_by_records(&crates, Sysroot::default(), &texts, &Serial, &Ready::serial(WAIT), bump)
-        .unwrap_or_else(|e| panic!("resolve_by_records failed: {e:?}"));
-    solved[0].names
+    let (solved, _) = resolve_by_records(&crates, Sysroot::default(), &texts, &Serial, &Ready::serial(WAIT), bump)?;
+    Ok(solved[0].names)
+}
+
+fn solve_one<'a>(files: &'a [(&'a str, &'a str)], bump: blaze_own::Bump<'a>) -> &'a CrateNames<'a> {
+    try_solve_one(files, bump).unwrap_or_else(|e| panic!("resolve_by_records failed: {e:?}"))
 }
 
 #[test]
 fn crate_root_recursion_limit_unblocks_deep_macro_chain() {
     let peel = quick_peel_body(135);
-    let default_root = format!("#![no_core]\npub use self::decoder::DecodingError;\nmod decoder;\n");
-    let raised_root = format!("#![no_core]\n#![recursion_limit = \"256\"]\npub use self::decoder::DecodingError;\nmod decoder;\n");
+    let default_root = "#![no_core]\npub use self::decoder::DecodingError;\nmod decoder;\n";
+    let raised_root = "#![no_core]\n#![recursion_limit = \"256\"]\npub use self::decoder::DecodingError;\nmod decoder;\n";
 
     // Default limit (128): depth-135 macro chain fails with RecursionLimit and DecodingError is not emitted.
     let frame_default = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
     let erased_default = blaze_own::Erased::new(&frame_default);
-    let default_files = [("/k/lib.rs", default_root.as_str()), ("/k/decoder.rs", peel.as_str())];
+    let default_files = [("/k/lib.rs", default_root), ("/k/decoder.rs", peel.as_str())];
     let names_default = solve_one(&default_files, erased_default.bump());
-    assert_eq!(names_default.root_attrs.recursion_limit, crate::RECURSION_LIMIT);
-    assert_eq!(names_default.crate_root.head.recursion_limit, crate::RECURSION_LIMIT);
+    assert_eq!(names_default.root_attrs.recursion_limit, u32::from(crate::RECURSION_LIMIT));
+    assert_eq!(names_default.crate_root.head.recursion_limit, u32::from(crate::RECURSION_LIMIT));
     assert!(
         recursion_limit_errors(names_default) >= 1,
         "depth-135 chain must hit RecursionLimit at default 128"
@@ -99,7 +105,7 @@ fn crate_root_recursion_limit_unblocks_deep_macro_chain() {
     let frame_raised = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
     let erased_raised = blaze_own::Erased::new(&frame_raised);
     let bump = erased_raised.bump();
-    let raised_files = [("/k/lib.rs", raised_root.as_str()), ("/k/decoder.rs", peel.as_str())];
+    let raised_files = [("/k/lib.rs", raised_root), ("/k/decoder.rs", peel.as_str())];
     let names_raised = solve_one(&raised_files, bump);
     assert_eq!(names_raised.root_attrs.recursion_limit, 256);
     assert_eq!(names_raised.crate_root.head.recursion_limit, 256);
@@ -137,7 +143,7 @@ fn submodule_recursion_limit_does_not_override_crate_root() {
     let erased1 = blaze_own::Erased::new(&frame1);
     let files1 = [("/k/lib.rs", root_out_of_line), ("/k/decoder.rs", sub_out_of_line.as_str())];
     let names1 = solve_one(&files1, erased1.bump());
-    assert_eq!(names1.root_attrs.recursion_limit, crate::RECURSION_LIMIT);
+    assert_eq!(names1.root_attrs.recursion_limit, u32::from(crate::RECURSION_LIMIT));
     assert!(
         recursion_limit_errors(names1) >= 1,
         "out-of-line submodule #![recursion_limit] must not raise crate limit"
@@ -149,7 +155,7 @@ fn submodule_recursion_limit_does_not_override_crate_root() {
     let erased2 = blaze_own::Erased::new(&frame2);
     let files2 = [("/k/lib.rs", root_inline.as_str())];
     let names2 = solve_one(&files2, erased2.bump());
-    assert_eq!(names2.root_attrs.recursion_limit, crate::RECURSION_LIMIT);
+    assert_eq!(names2.root_attrs.recursion_limit, u32::from(crate::RECURSION_LIMIT));
     assert!(
         recursion_limit_errors(names2) >= 1,
         "inline submodule #![recursion_limit] must not raise crate limit"
@@ -173,47 +179,105 @@ fn cfg_attr_recursion_limit_respects_predicate() {
     let erased_off = blaze_own::Erased::new(&frame_off);
     let files_off = [("/k/lib.rs", root_off.as_str())];
     let names_off = solve_one(&files_off, erased_off.bump());
-    assert_eq!(names_off.root_attrs.recursion_limit, crate::RECURSION_LIMIT);
+    assert_eq!(names_off.root_attrs.recursion_limit, u32::from(crate::RECURSION_LIMIT));
     assert!(recursion_limit_errors(names_off) >= 1, "false cfg_attr must not raise recursion limit");
 }
 
 #[test]
-fn invalid_zero_and_clamped_recursion_limits_behave_safely() {
-    let peel = quick_peel_body(135);
+fn large_recursion_limit_above_4096_is_preserved() {
+    let root = "#![no_core]\n#![recursion_limit = \"5000\"]\npub struct S;\n";
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
+    let files = [("/k/lib.rs", root)];
+    let names = solve_one(&files, bump);
+    assert_eq!(names.root_attrs.recursion_limit, 5000, "limit 5000 must not be clamped to 4096");
+    assert_eq!(names.crate_root.head.recursion_limit, 5000);
 
-    // Invalid / malformed values must not panic and must fall back cleanly to default 128.
+    let encoded = encode(names, bump.alloc()).expect("encode NamesRecord");
+    let verified = Verified::check(aligned(&encoded, bump)).expect("verify NamesRecord");
+    let record = NamesRecord::open(verified);
+    assert_eq!(record.crate_root().head().recursion_limit, 5000);
+}
+
+#[test]
+fn malformed_recursion_limit_is_rejected_with_typed_error() {
     let invalids = [
         "#![recursion_limit = \"abc\"]",
         "#![recursion_limit = \"\"]",
         "#![recursion_limit = \"-5\"]",
+        "#![recursion_limit = \"+256\"]",
+        "#![recursion_limit = \"256 \"]",
+        "#![recursion_limit = \"1_024\"]",
+        "#![recursion_limit = true]",
         "#![recursion_limit = 256]",
         "#![recursion_limit(256)]",
+        "#![recursion_limit]",
+        "#![recursion_limit = \"99999999999999999999999999999\"]",
+        "#![recursion_limit = \"abc\"]\n#![recursion_limit = \"256\"]",
+        "#![cfg_attr(all(), recursion_limit = \"abc\")]",
     ];
     for attr in invalids {
-        let root = format!("#![no_core]\n{attr}\n{peel}");
+        let root = format!("#![no_core]\n{attr}\npub struct S;\n");
         let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
         let erased = blaze_own::Erased::new(&frame);
         let files = [("/k/lib.rs", root.as_str())];
-        let names = solve_one(&files, erased.bump());
-        assert_eq!(names.root_attrs.recursion_limit, crate::RECURSION_LIMIT, "attr `{attr}` must fall back to default");
-        assert!(recursion_limit_errors(names) >= 1, "attr `{attr}` must keep default limit 128");
+        let err = try_solve_one(&files, erased.bump()).expect_err("malformed recursion_limit must fail");
+        assert!(
+            matches!(err, (0, CrateScopeError::Names(NamesError::InvalidRecursionLimit { krate: "k", .. }))),
+            "attr `{attr}` must return NamesError::InvalidRecursionLimit, got {err:?}"
+        );
     }
 
+    // Inactive cfg_attr and attributes after a false `#![cfg(..)]` must NOT error.
+    let inactive_cases = [
+        "#![no_core]\n#![cfg_attr(any(), recursion_limit = \"abc\")]\npub struct S;\n",
+        "#![no_core]\n#![cfg(any())]\n#![recursion_limit = \"abc\"]\npub struct S;\n",
+    ];
+    for root in inactive_cases {
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let files = [("/k/lib.rs", root)];
+        let names = solve_one(&files, erased.bump());
+        assert_eq!(names.root_attrs.recursion_limit, u32::from(crate::RECURSION_LIMIT));
+    }
+}
+
+#[test]
+fn zero_recursion_limit_rejects_macros_but_preserves_lexical_block_depth() {
     // `#![recursion_limit = "0"]` rejects even a depth-0 macro call.
-    let zero_root = "#![no_core]\n#![recursion_limit = \"0\"]\nmacro_rules! id { () => { pub struct S; }; }\nid!();\n";
+    let zero_macro = "#![no_core]\n#![recursion_limit = \"0\"]\nmacro_rules! id { () => { pub struct S; }; }\nid!();\n";
     let frame_zero = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
     let erased_zero = blaze_own::Erased::new(&frame_zero);
-    let files_zero = [("/k/lib.rs", zero_root)];
+    let files_zero = [("/k/lib.rs", zero_macro)];
     let names_zero = solve_one(&files_zero, erased_zero.bump());
     assert_eq!(names_zero.root_attrs.recursion_limit, 0);
     assert_eq!(recursion_limit_errors(names_zero), 1, "limit 0 must reject depth-0 call");
 
-    // Huge numeric value clamps safely to `MAX_RECURSION_LIMIT` without overflow or panic.
-    let huge_root = format!("#![no_core]\n#![recursion_limit = \"999999999\"]\n{peel}");
-    let frame_huge = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
-    let erased_huge = blaze_own::Erased::new(&frame_huge);
-    let files_huge = [("/k/lib.rs", huge_root.as_str())];
-    let names_huge = solve_one(&files_huge, erased_huge.bump());
-    assert_eq!(names_huge.root_attrs.recursion_limit, crate::MAX_RECURSION_LIMIT);
-    assert_eq!(recursion_limit_errors(names_huge), 0);
+    // In a macro-free crate with `#![recursion_limit = "0"]`, lexical block nesting past 64
+    // (here 70 nested `fn` bodies each with a local `struct` + `impl`) must still resolve cleanly
+    // without hitting `MadeNote::TooMany` (lexical block depth floor remains 192).
+    const NESTING: usize = 70;
+    let mut nested_blocks = String::from("#![no_core]\n#![recursion_limit = \"0\"]\n");
+    for i in 0..NESTING {
+        let _ = writeln!(nested_blocks, "fn f{i}() {{ struct S{i}; impl S{i} {{}}");
+    }
+    for _ in 0..NESTING {
+        nested_blocks.push_str("}\n");
+    }
+    let frame_blocks = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased_blocks = blaze_own::Erased::new(&frame_blocks);
+    let files_blocks = [("/k/lib.rs", nested_blocks.as_str())];
+    let names_blocks = solve_one(&files_blocks, erased_blocks.bump());
+    assert_eq!(names_blocks.root_attrs.recursion_limit, 0);
+    assert!(
+        !names_blocks.notes.iter().any(|n| matches!(n, NamesNote::Made { note: MadeNote::TooMany, .. })),
+        "70 nested lexical blocks must not hit MadeNote::TooMany under #![recursion_limit = \"0\"]: {:?}",
+        names_blocks.notes
+    );
+    assert_eq!(
+        names_blocks.tables.impls.len(),
+        NESTING,
+        "all {NESTING} nested block-local impls must be recorded"
+    );
 }

@@ -841,7 +841,7 @@ pub(crate) struct Cells<'a, N> {
     /// language prelude (docs/v2/plan/design/arbitrary-ints.md, "The opt-in").
     arbitrary_ints: bool,
     /// The crate's effective macro expansion recursion limit (`#![recursion_limit = "N"]`).
-    recursion_limit: u16,
+    recursion_limit: u32,
     /// The item each call is written on (`MacroCallDecl::item`), by call: a derive's helper
     /// scope is its item's ([`Cells::derive_helper`]).
     call_on: ABTreeMap<'a, ItemId, u32>,
@@ -1364,7 +1364,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             tools: AVec::new_in(alloc),
             builtin_attrs: AVec::new_in(alloc),
             arbitrary_ints: false,
-            recursion_limit: crate::RECURSION_LIMIT,
+            recursion_limit: u32::from(crate::RECURSION_LIMIT),
             call_on: ABTreeMap::new_in(alloc),
             harness_calls: ABTreeSet::new_in(alloc),
             derives_on: ABTreeMap::new_in(alloc),
@@ -1868,7 +1868,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             Some((u, _)) => self.depth(u).saturating_add(1),
             None => 0,
         };
-        let deep = depth >= self.recursion_limit && self.plant != CellPlant::NoRecursionLimit;
+        let deep = u32::from(depth) >= self.recursion_limit && self.plant != CellPlant::NoRecursionLimit;
         for c in d.calls.iter() {
             // A tool attribute (Reference `attributes.tool`: "The tool attributes are ..
             // `rustfmt` and `clippy`", and `register_tool`'s): inert, no call. The first segment
