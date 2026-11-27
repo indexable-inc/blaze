@@ -132,7 +132,7 @@ fn put_module(home: &Path, app_dir: &Path) {
     let files = blaze_proc_macro::script_unit::script_files_digest(app_dir, "build.rs").expect("script files digest");
     let identity = format!(
         "{}\nname app\nversion 0.1.0\nfeatures \nfiles {files}\n{}\n",
-        blaze_proc_macro::script_unit::MODULE_HEADER,
+        blaze_proc_macro::script_unit::WASM_MODULE_HEADER,
         blaze_proc_macro::script_unit::shim_line()
     );
     std::fs::write(record.join("identity"), identity).expect("the module's identity");
@@ -411,7 +411,7 @@ dependencies = [\"cc\"]
         let files = blaze_proc_macro::script_unit::script_files_digest(&ws, "build.rs").expect("sha3-asm files digest");
         std::fs::write(
             module.join("identity"),
-            format!("{}\nname sha3-asm\nversion 0.1.0\nfeatures \nfiles {files}\ntarget aarch64-apple-darwin\n", blaze_proc_macro::script_unit::MODULE_HEADER),
+            format!("{}\nname sha3-asm\nversion 0.1.0\nfeatures \nfiles {files}\ntarget aarch64-apple-darwin\n", blaze_proc_macro::script_unit::NATIVE_MODULE_HEADER),
         )
         .unwrap();
         let program = module.join("script.bin");

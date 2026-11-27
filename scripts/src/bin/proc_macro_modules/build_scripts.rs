@@ -457,12 +457,12 @@ impl Plan<'_> {
         features.dedup();
         // A wasm module's identity is unchanged (its records stand); a native one names the
         // host target, the linking clang and the SDK instead of the shim and the patches.
-        let runner = match native {
-            None => format!("shim {shim_digest}\npatches {rt_digest}\n"),
-            Some(native) => native.identity()?,
+        let (header, runner) = match native {
+            None => ("blaze build-script module 4", format!("shim {shim_digest}\npatches {rt_digest}\n")),
+            Some(native) => ("blaze build-script module 3", native.identity()?),
         };
         let identity = format!(
-            "blaze build-script module 4\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\n{runner}builder bootstrap\n",
+            "{header}\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\n{runner}builder bootstrap\n",
             wanted.name,
             wanted.version,
             origin.identity_line(),

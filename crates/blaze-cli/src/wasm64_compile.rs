@@ -735,7 +735,7 @@ fn ensure_build_script_unit(
     let id = blaze_toolchain::PINNED;
     let mut identity = std::format!(
         "{}\nname {}\nversion {}\nfeatures {}\n",
-        script_unit::MODULE_HEADER,
+        script_unit::WASM_MODULE_HEADER,
         unit.name.as_str(),
         unit.version.as_str(),
         feats.join(","),
@@ -1320,15 +1320,21 @@ fn compile_unit_to_wasm64(
 /// Whether any unit in `unit_order` needs the toolchain's `bstd` (`blaze-std`) crate on
 /// `wasm64-blaze-wasip1`: either via a blaze-edition implicit `std` (`StdIs::Bstd(_)`, which
 /// excludes `UnitKind::BuildScript | UnitKind::ProcMacro` per `blaze_unit_graph::implicit`), or
-/// via an explicit `bstd` / `blaze_std` crate or dependency name.
+/// because a unit or a resolved dependency target unit has package name `"blaze-std"` (never by a
+/// caller-chosen Cargo dependency rename alias `dep.name`).
 fn unit_closure_needs_bstd(graph: &UnitGraph<'_>, unit_order: &[UnitId]) -> bool {
     unit_order.iter().any(|&uid| {
         let Some(u) = graph.units.get(uid.index()) else {
             return false;
         };
         matches!(implicit(u.edition, &u.kind).std, blaze_unit_graph::StdIs::Bstd(_))
-            || matches!(u.crate_name.as_str(), "bstd" | "blaze_std")
-            || u.deps.iter().any(|dep| matches!(dep.name.as_str(), "bstd" | "blaze_std"))
+            || u.name.as_str() == "blaze-std"
+            || u.deps.iter().any(|dep| {
+                graph
+                    .units
+                    .get(dep.unit.index())
+                    .is_some_and(|du| du.name.as_str() == "blaze-std")
+            })
     })
 }
 
@@ -2749,36 +2755,39 @@ mod tests {
         );
         assert!(unit_closure_needs_bstd(&g_blaze_lib, &[UnitId(0), UnitId(1)]));
 
-        // Explicit dep named "bstd" -> true.
-        let g_dep_bstd = make_graph(
+        // Negative control: renaming an unrelated crate (`package = "my-helper"`) to `dep.name = "bstd"`
+        // or `"blaze_std"` must NOT pull in the toolchain's `bstd`.
+        let g_alias_bstd = make_graph(
             std::vec![
-                make_unit(0, "app", "build_script_build", UnitKind::BuildScript, "2024", &[("bstd", 1)], a),
-                make_unit(1, "other", "other", UnitKind::Lib, "2024", &[], a),
+                make_unit(0, "app", "build_script_build", UnitKind::BuildScript, "2024", &[("bstd", 1), ("blaze_std", 2)], a),
+                make_unit(1, "my-helper", "my_helper", UnitKind::Lib, "2024", &[], a),
+                make_unit(2, "other-helper", "other_helper", UnitKind::Lib, "2024", &[], a),
             ],
             a,
         );
-        assert!(unit_closure_needs_bstd(&g_dep_bstd, &[UnitId(0), UnitId(1)]));
+        assert!(!unit_closure_needs_bstd(&g_alias_bstd, &[UnitId(0), UnitId(1), UnitId(2)]));
 
-        // Explicit dep named "blaze_std" -> true.
+        // Resolved dependency whose target package is `"blaze-std"` (even under a renamed alias) -> true.
         let g_dep_blaze_std = make_graph(
             std::vec![
-                make_unit(0, "app", "build_script_build", UnitKind::BuildScript, "2024", &[("blaze_std", 1)], a),
-                make_unit(1, "other", "other", UnitKind::Lib, "2024", &[], a),
+                make_unit(0, "app", "build_script_build", UnitKind::BuildScript, "2024", &[("my_alias", 1)], a),
+                make_unit(1, "blaze-std", "bstd", UnitKind::Lib, "2024", &[], a),
             ],
             a,
         );
+        assert!(unit_closure_needs_bstd(&g_dep_blaze_std, &[UnitId(0)]));
         assert!(unit_closure_needs_bstd(&g_dep_blaze_std, &[UnitId(0), UnitId(1)]));
 
-        // Unit whose crate_name is "bstd" or "blaze_std" -> true.
+        // Unit whose package name is `"blaze-std"` -> true; unrelated package with `crate_name = "bstd"` -> false.
         let g_named = make_graph(
             std::vec![
-                make_unit(0, "bstd", "bstd", UnitKind::Lib, "2024", &[], a),
-                make_unit(1, "blaze-std", "blaze_std", UnitKind::Lib, "2024", &[], a),
+                make_unit(0, "blaze-std", "bstd", UnitKind::Lib, "2024", &[], a),
+                make_unit(1, "unrelated-bstd", "bstd", UnitKind::Lib, "2024", &[], a),
             ],
             a,
         );
         assert!(unit_closure_needs_bstd(&g_named, &[UnitId(0)]));
-        assert!(unit_closure_needs_bstd(&g_named, &[UnitId(1)]));
+        assert!(!unit_closure_needs_bstd(&g_named, &[UnitId(1)]));
     }
 
     #[test]
