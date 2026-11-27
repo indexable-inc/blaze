@@ -37,7 +37,7 @@ const ROWS_PER_STATEMENT = 5_000;
 const MAX_READ = 4 * 1024 * 1024;
 /** R2 reads in flight per /get; a Worker keeps at most 6 subrequests waiting for headers. */
 const READ_AHEAD = 4;
-/** A location whose object was uploaded longer ago than this is absent: the object is about to expire (docs/remote-cache.md, "GC"). */
+/** A location whose object was uploaded longer ago than this is absent: the object is about to expire (docs/remote-cache.md). */
 export const ROW_TTL = 80 * DAY;
 /** Rows the background sweep deletes per write, at most. */
 const SWEEP_ROWS = 500;

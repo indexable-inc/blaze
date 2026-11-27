@@ -1,5 +1,5 @@
 // The signed index (API.md, "Index"): per-tenant key lists, heads and segments, the checks on
-// every index write, and the refresh inside head writes (docs/remote-cache.md, "GC").
+// every index write, and the refresh inside head writes (docs/remote-cache.md).
 //
 // A tenant's index is readable by public tenants' readers and by its own tokens; to everyone
 // else a private tenant's trust list, heads and segments are the one 404 an absent one is.
@@ -279,7 +279,7 @@ function etagList(header: string): string[] {
     .filter((t) => t !== "");
 }
 
-// ---- the refresh (docs/remote-cache.md, "GC")
+// ---- the refresh (docs/remote-cache.md)
 
 export interface Refreshed {
   /** Segments rewritten. */

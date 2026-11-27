@@ -131,10 +131,11 @@ named by digest (D192). Two executors can answer it:
 | Executor | Runs | Cost | Cannot do |
 | --- | --- | --- | --- |
 | hvbox (hvbox.md, D92), through its synthetic root (`/tools`, `/package`, `/out`, `/sdk`) | the pinned clang and ld, and the base set's sh, make, cmake and perl, as guests with every syscall answered | near native | nothing on the owner's Mac until he says (it panicked the kernel); not built for Linux; Seatbelt (`Level::Inputs`) serves until then |
-| a published record | nothing: the record is fetched by key from the shared cache, filled by CI | a fetch | anything not on the published list; a private patch to a -sys crate builds locally |
+| a published record (an option, off unless chosen) | nothing: the record is fetched by key from the shared cache, filled by CI | a fetch | anything not on the published list; a private patch to a -sys crate builds locally |
 
 The published list starts with every native crate of the inventory's table (they are popular and
-their keys are stable), so a cold tempo build compiles no C at all.
+their keys are stable). Without fetching, a new checkout finds each object a build on the
+machine already made in the machine's own store.
 
 ### 3. The loader (not built)
 

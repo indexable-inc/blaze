@@ -199,9 +199,11 @@ since a lot of people will use bstd"):** the cut list below is accepted as writt
 fix that deletes the attribute: `noalloc`, `nonblocking`, `sans_io`, `capabilities`, the `effects`
 gate, `pure`, the role words, `may_suspend`, `renders_positions`, `holds`, `program_lifetime`,
 `canonical_cbor`; replaced by a library: lock order (`RankedLock`), the narrowed capability,
-`policy` as a mark. Kept: `nopanic` with `diverge` as one two-bit summary per function (the only
-propagation that stays), `linear` and `consumes` checked in one body, `trust` moved to the
-manifest, `theorem`. The earlier decision of one effect row spelled `expect(..)` is withdrawn. The
+`policy` as a mark. Kept: the effect set function types carry, four words (`panic`, `alloc`,
+`block`, `diverge`) spelled `expect(..)`: `EffectSet` in crates/blaze-ty/src/effect_ty.rs, packed
+into `FnHeader`, with the exact-list check (`check_exact_effects`), fn-pointer subtyping
+(`fn_ptr_coerces`) and effect polymorphism (`EffectRow`), built and called only by blaze-ty's
+tests; `linear` and `consumes` checked in one body, `trust` moved to the manifest, `theorem`. The
 three holes the audit found become edition rules, each checked per item with no call graph: no
 global heap under the blaze edition (allocation only through an allocator value), no mutable
 statics, no lock guard or non-`Send` value live across a wait. They are owed, behind tempo: until
@@ -250,14 +252,13 @@ is not in the signature and not local.
 | canonical_cbor | 1 | 0 | 0 | 1: blaze-report |
 
 What blocks a move: **no blaze crate is on the edition** (only harness/v2/smoke/edition and
-harness/v2/versus/bstd-hello are), because cargo builds blaze (D25) and refuses the edition key;
-three crates name bstd as a dependency. bstd itself is trusted code (261 lines naming `unsafe`):
+harness/v2/versus/bstd-hello are); three crates name bstd as a dependency. bstd itself is trusted code (261 lines naming `unsafe`):
 the capability argument binds its *callers*, not its own bodies, so its 988 marks assert facts
 about a trusted implementation that its signatures already give its callers coarsely
 (`Cx::deadline(&self)` takes `&Cx`, so by signature it "may wait"). blaze-sys is below bstd (the
 syscall layer, `core` only): its noalloc is true by construction (it links no `alloc`), its
 nopanic is a real claim. blaze-sim, -graph, -kernel are std test or old-layer crates; -pg, -sql,
--sqlite are `no_std` + alloc libraries that could take bstd's allocator types after D25 ends.
+-sqlite are `no_std` + alloc libraries that could take bstd's allocator types.
 
 ### 6.3 The cut list (proposals; default remove)
 
@@ -271,8 +272,8 @@ nopanic is a real claim. blaze-sim, -graph, -kernel are std test or old-layer cr
 | lock_checked, lock order | LIBRARY | `RankedLock<T, R>` | 0 | delete |
 | may_suspend, guard across a wait | DERIVE + KEEP local | "takes `&Cx`" is the suspend fact; one body check: guard or non-`Send` value live across such a call | 0 | delete |
 | renders_positions | DELETE | item-relative ranges by type | 43 (old front end, gone at the switch) | delete |
-| expect, may | KEEP `expect` for two words only; `may` refused | | 0 | |
-| nopanic, `diverge` | KEEP, propagated | the only two not local and not in the signature: one 2-bit summary per function (crate blaze-effects) | 400 | `nopanic` becomes `expect(diverge)`-style rows later |
+| expect, may | KEEP `expect` with its four words (blaze-ty `EffectSet`); `may` refused | | 0 | |
+| nopanic | RESPELL | an `expect(..)` list without `panic`; `panic` and `diverge` are the two words that need the callees (propagation) | 400 | rewrite as `expect(..)` |
 | linear, consumes | KEEP local | callee signatures + one body (ownership lane) | 17, 32 | none |
 | holds, program_lifetime | DERIVE | reflection (`PhantomData<T>`, no `Drop`, no parameter) | 2, 0 | delete |
 | policy | LIBRARY | a mark read by a library lint | 9 | respell |
@@ -281,9 +282,9 @@ nopanic is a real claim. blaze-sim, -graph, -kernel are std test or old-layer cr
 | theorem, contracts | KEEP | proofs | 16 | none |
 | B, C, D rows (syntax, traits, comptime, codegen) | unaffected | not effects | | |
 
-**Code not on bstd** (every blaze crate while D25 holds, and Rust-edition crates): a DELETE or
+**Code not on bstd** (every blaze crate not yet on the edition, and Rust-edition crates): a DELETE or
 DERIVE attribute there is inert (accepted, recorded, unchecked); the fix that removes it runs when
 the crate moves onto the edition. No interim check. blaze's own crates lose nothing they have:
 nothing has checked these words since blaze-lints and hir-ty-pure's lints were deleted
-(8e87a017ff); they lose the general effect machine that would have checked 2,000 marks, and keep
-only `nopanic`/`diverge` checked, until each crate moves.
+(8e87a017ff). The four-word effect set exists in function types (blaze-ty `effect_ty.rs`); no
+walk checks a body's effects on the item layer yet.

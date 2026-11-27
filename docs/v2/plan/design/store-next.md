@@ -1,13 +1,14 @@
 ---
 status: plan
-summary: blaze's plain store (crates/blaze-cas/src/plain) against Relax's store, row by row, for the two goals bottom.md puts first after the edit loop (a repeat after a restart that reads few pages; records fetched from a static origin by byte range). Where each adopted piece lives (the sealed exit tail and its background pass, the lookup, the startup image, per-worker puts, the machine scan, batches, the per-segment Bloom filter, the D182 block bottom); what was left and why; what is still to build (the scrub in the helper, blaze-run reading the startup image, held descriptors, two writers on one device); the digest decision.
+summary: blaze's plain store (crates/blaze-cas/src/plain) against Relax's store, row by row, for a repeat after a restart that reads few pages, and for records fetched from a static origin by byte range (an option, off unless chosen). Where each adopted piece lives (the sealed exit tail and its background pass, the lookup, the startup image, per-worker puts, the machine scan, batches, the per-segment Bloom filter, the D182 block bottom); what was left and why; what is still to build (the scrub in the helper, blaze-run reading the startup image, held descriptors, two writers on one device); the digest decision.
 date: 2026-11-15
 ---
 # The store, next
 
 The store is `crates/blaze-cas/src/plain` (its module doc is the format). The reference is Relax's
-`compiler/src/store.rs` (MIT, read, not run). Goal order, from bottom.md 1: incremental compile
-(after a restart too), then remote records, then memory, cold compile, disk cleanup, disk.
+`compiler/src/store.rs` (MIT, read, not run). Goal order: incremental compile (after a restart
+too) and lints, then memory, cold compile, disk cleanup, disk. Remote records are supported and not
+in the order; fetching them is an option, off unless chosen.
 
 ## Side by side
 

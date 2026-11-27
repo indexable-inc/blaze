@@ -8,12 +8,11 @@ blaze is held to real crates' own test suites and to itself, not to rustc. No ha
 blaze's output with rustc's or cargo's: that was dropped on 2026-10-30 ("we use other ppl['s]
 test[s] [of] the other crates ... it over-constrains us", Andrew), so how a rule of rustc's is
 proven ported is a crate whose own tests exercise it, or a unit test
-([AGENTS.md](../AGENTS.md), best-long-term-design). Benches may still time cargo as their
-baseline.
+([AGENTS.md](../AGENTS.md), best-long-term-design).
 
 On 2026-11-15 the daemon, `blaze build`, blaze-engine and with them most harness scripts were
 deleted; they stay in git history. What is left is the scripts below and the workspace's unit
-tests, which CI runs with cargo ([CI](#ci)).
+tests, which CI still runs through cargo; a gap ([CI](#ci)).
 
 ## Running them
 
@@ -44,29 +43,13 @@ again, and a change to one is a change to what blaze expects.
 ### Timing
 
 Nothing here gates; a build's profile answers why a build was slow
-([profiling.md](profiling.md)). The bench driver was deleted with `blaze build` on 2026-11-15;
-the scripts that store, compare and draw its results are left. `benchhistory.py` appends a run to `docs/benchmarks/history/` (what the
-site's /bench page charts) and, with `check`, fails when a median moved past its noise band:
-instructions first, with a 1% band, then wall time and memory with theirs, after a summary of
-what regressed and improved. `counters.py` is how every harness counts instructions and cycles
-(Linux's `perf_event_open`, macOS's `proc_pid_rusage`), null with the reason where it cannot
-([benchmarks.md](benchmarks.md#instruction-counts)).
+([profiling.md](profiling.md)). `counters.py` is how every harness counts instructions and cycles
+(Linux's `perf_event_open`, macOS's `proc_pid_rusage`), null with the reason where it cannot.
 `memory.py` is how every harness measures memory: `memory.run` runs a command and returns its
 time with the exact peak of its largest process (`wait4`) and the peak of its whole tree
 (sampled), `memory.Sampler` follows a long-lived process with its children,
-and `memory.in_child` measures a function that runs commands itself
-([benchmarks.md](benchmarks.md#memory-and-disk)); a harness that reports memory uses it rather
-than a way of its own. Every published benchmark is a matrix over the platforms of
-`benchplatforms.py` (macOS arm64, Linux aarch64, Linux x86-64): it names a result's platform from
-its host, files it as `docs/benchmarks/<platform>.json`, and gives the workflows the platforms
-whose runner is registered. `benchreport.py` writes each table from the newest stored result of
-every platform, so one that did not run keeps its last numbers. `benchcharts.py` draws the
-benchmark charts (SVG, a light and a dark version, a bar per platform) from the same results;
-`benchreport.py` regenerates them whenever it writes a table, `--charts` on its own, and
-`--render` every table and chart. With one typed JSON input (`'{}'` for the repository's own
-paths) `benchcharts.py` also draws the trends, blaze against its own past runs, from
-`docs/benchmarks/history` into the README and benchmarks.md
-([benchmarks.md](benchmarks.md#over-time)).
+and `memory.in_child` measures a function that runs commands itself; a harness that reports
+memory uses it rather than a way of its own.
 
 ### Which packages a change touches
 
@@ -227,8 +210,8 @@ build failed) unless it is listed as `*`; each failure names the crate, the test
 of its output. Listed tests the run could not check (their crate did not run, filtered out,
 cached by `blaze test`, or `only` for another profile or OS) are counted, so a
 partial run never reads as clean. `harness/unittests.py` calls it on its log, with every package of
-the workspace asked for; a lane runs it on the crates it touched before saying a failure was
-there before:
+the workspace asked for; the coordinator runs it on the crates a change touched before saying a
+failure was there before:
 
     uv run --frozen harness/failures.py '{"run": {"packages": ["blaze-cas", "blaze-remote"]}}'
     uv run --frozen harness/failures.py '{"results": ["test.log"], "profile": "dev", "os": "macos"}'
@@ -236,8 +219,8 @@ there before:
 The list is written from a run, never by hand: `python3 harness/unittests.py '{"record": true}'`
 runs every test and writes the list again, sorted, each new entry with the first line of its
 failure as its cause and `only` the OS it ran on; the entries of other OSes are kept, and an
-entry that was there keeps its cause. Run it once on each OS the gate tests on (Linux and
-macOS), on the tree to land. `harness/failures.py selftest` holds the
+entry that was there keeps its cause. Run it on the Mac, on the tree to land; its Linux run is
+CI's. `harness/failures.py selftest` holds the
 checked-in list to the form the recorder writes.
 
 A failure joins the list only with an owner and a cause, in the change that explains it.

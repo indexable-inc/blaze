@@ -1,4 +1,4 @@
-//! The Tests stage's core (docs/v2/plan/design/tests-stage.md, plan row E2): a test's result is a
+//! The Tests stage's core (docs/v2/plan/design/test.md, piece 19: built, not wired): a test's result is a
 //! record keyed by the test and valid by its REACH, the cells its process read (each code record
 //! it reached on a first call, each static's datum it was sent, each file and variable the sandbox
 //! let it read), so an edit reruns exactly the tests whose reach holds a moved cell.

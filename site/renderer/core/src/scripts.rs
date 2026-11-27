@@ -1,7 +1,7 @@
 //! The content scripts run in a Flecs world (flecs-opinionated's `flecs_snapshot::World`, which calls
 //! `ecs_script_run`), the build's pre-rendered HTML set on their entities with `World::set`, and the world written as
-//! a snapshot of every root (`World::roots`). Scripts the build generates (gen/bench/: the benchmark history) run
-//! with the content's, after it.
+//! a snapshot of every root (`World::roots`). Scripts the build generates run with the
+//! content's, after it.
 
 use ipld_core::ipld::Ipld;
 use std::collections::BTreeMap;

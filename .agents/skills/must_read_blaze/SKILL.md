@@ -12,8 +12,8 @@ Read this before touching Rust, Cargo, or tooling in this repo. Also check [`age
 ## 1. What `blaze` is
 
 - Vertically integrated Rust stack owning every layer: language, `bstd`, MIR/LIR, ABI, JIT/PGO/AOT, exporter, linter, runtime, and bare-metal/unikernel VMs (kernel too). Design in full: [`docs/v2/plan/design/bottom.md`](../../../docs/v2/plan/design/bottom.md).
-- **Commands**: `blaze check`, `blaze build` (JIT-on-call, PGO by default; `--release` AOT), `blaze run`, `blaze test`. **Never `rustc`** (rules 1, 2). Dogfood `blaze` for inner loops (`blaze test crates/<crate>`), never cold `cargo`.
-- **Storage & incrementality**: Item-grain records keyed from text before work (rule 65), written once, read in place via kernel page cache only; no in-memory dependency graph; restarts re-index nothing.
+- **Commands**: `blaze check`, `blaze build` (JIT-on-call, PGO by default; `--release` AOT), `blaze run`, `blaze test`. **Never `rustc`** (rules 1, 2). blaze builds, checks and tests blaze (`blaze check`, `blaze test -p <crate>`), never `cargo`, and the work runs on the Mac.
+- **Storage & incrementality**: Item-grain records keyed from text before work (rule 65), written once, read in place via kernel page cache only; no in-memory dependency graph; restarts re-index nothing. A new checkout is served by the machine's own content-deduplicated store; fetching published records (`--origin`, `blaze store publish`) is built, off unless chosen.
 
 ## 2. `bstd` (`crates/blaze-std`) & Batteries
 
@@ -47,7 +47,7 @@ Check live item-layer status in [`docs/v2/plan/design/extensions.md`](../../../d
 - **Comptime reflection**: `#![feature(blaze_comptime)]`, `for const f in fields_of::<T>()`, `x.[f]`, `build`, `#[blaze::reflect]`, `#[blaze::mark(M)]`, `const static {}`, `type_of!`, `fn_info` ([`library/core/src/reflect.rs`](../../../library/core/src/reflect.rs), `bstd::comptime`, `bstd::reflect`). Prefer reflection over proc macros or auto traits (rule 56).
 - **Arbitrary-width ints & contracts**: `u1..u128` / `i1..i128` (`#![blaze::arbitrary_ints]`), `where const { COND }`, relational `#[blaze::invariant(..)]`, `requires`/`ensures`.
 - **Structural types & views**: structural records `{ a: T, b: U = 0 }` (`bstd::record_ty`), `#[blaze::args]` + `default_field_values`, anonymous error unions `A | B` (`bstd::union_ty`), `&uniq`, field views `&self.{a}` (`bstd::view`).
-- **Effects, linearity & proofs**: `#![blaze::sans_io]`, `noalloc`/`nonblocking`/`nopanic`/`pure` (under the `bstd` edition, `noalloc`/`nonblocking`/`sans_io`/`pure` derive from signatures while `nopanic`/`diverge` propagate), linear types (`#[blaze::linear]`, `#[blaze::consumes]`), Lean proofs (`#[blaze::theorem]`).
+- **Effects, linearity & proofs**: `#![blaze::sans_io]`, the four effects in function types, `expect(panic, alloc, block, diverge)` ([`crates/blaze-ty/src/effect_ty.rs`](../../../crates/blaze-ty/src/effect_ty.rs)), linear types (`#[blaze::linear]`, `#[blaze::consumes]`), Lean proofs (`#[blaze::theorem]`) as extra evidence on top of a DST, never in place of one (rule 43).
 
 ### Pattern & Refinement Types (`T is PAT`)
 

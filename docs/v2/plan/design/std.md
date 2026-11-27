@@ -18,7 +18,8 @@ without `alloc`, so no global allocator is reachable and every heap is one the c
    `data: Dir<ReadOnly>`, `api: Net`, ...); a whole `Io` cannot be asked for (D104). A function
    can touch only what it is handed, so its signature is the complete list of what it can do.
 2. **Sans-IO.** Every operation is an effect handed to one driver. The same `Io` runs on
-   io_uring, kqueue, IOCP and the deterministic simulation, and code above it cannot tell which.
+   io_uring, kqueue and the deterministic simulation (Windows's IOCP later), and code above it
+   cannot tell which.
 3. **Explicit context and memory.** Every task has a `Cx` that says how long it may run, whether
    it was cancelled, what span it is and where its scratch memory comes from. Nothing allocates
    from a hidden global heap: memory comes from an allocator the code was handed. The same
@@ -124,7 +125,9 @@ network, since it forces a copy.
 | BLAKE3 `hash_many`, Swiss, F14; Bazel, Buck2, Nix; APFS clones | digests of digests; keys at item grain; outputs cloned |
 
 Floor (estimate, rule 67): a repeat with nothing changed is two `pread`s, a journal query and
-mapped packs: under 5 ms on tempo (27.9 to 37 ms today) and under 10 ms on blaze (120 ms).
+mapped packs: under 10 ms on tempo (D168; 27.9 to 37 ms today) and on blaze (120 ms). A one-body
+edit on tempo: a floor of about 30 ms with a live helper, about 130 ms with none (D168), a budget
+of 100 ms (D188).
 
 ### Pieces
 
@@ -212,15 +215,15 @@ Each layer uses only the ones below it.
 |---|---|---|
 | 4 | `bstd::{fs, net, env, clock, rng, task, process, out}` | the capability types people use |
 | 3 | `bstd::io` | `Io`: one handle to the process's driver; turns a call into an effect and parks the caller until its completion |
-| 2 | `bstd::driver` | `Effect`, `Completion`, `Driver`, and the drivers: `Uring`, `Kqueue`, `Iocp`, `Sim` (today's `blaze-core`) |
+| 2 | `bstd::driver` | `Effect`, `Completion`, `Driver`, and the drivers: `Uring`, `Kqueue`, `Sim` (today's `blaze-core`); Windows's later |
 | 1 | `bstd::sys` | raw system calls per target, the only home of `unsafe`; Linux by syscall number with no libc, macOS through libSystem, Windows through ntdll and kernel32 ([sys](sys.md); today the crate `crates/blaze-sys`) |
 | 0 | `core` | the language's own library, unchanged; no `alloc` (D173) |
 
 ## Two builders
 
-While blaze cannot build itself (its item layer is being rebuilt: [bottom](bottom.md)), cargo
-with the pinned nightly builds bstd, and blaze must still read the same source. So bstd is plain
-Rust that both compile, plus what needs blaze's extensions under `cfg(blaze)`, the cfg blaze sets
+blaze builds, checks and tests bstd. CI's `cargo check` and `cargo test` steps still compile
+the crates above it with rustc (still run through cargo; a gap). So bstd is plain Rust that
+both compile, plus what needs blaze's extensions under `cfg(blaze)`, the cfg blaze sets
 for every crate it compiles (Andrew, 2026-11-15: a simplified bstd rustc can use, and blaze's
 bstd that plus the custom parts). Each use of an extension takes the first of:
 
@@ -358,7 +361,7 @@ writes **ops** (open, read, send, connect, set a timer); the host answers with *
 (opened, data, sent, accepted, a datagram, the timer fired). Both are fixed-layout records in two
 rings, exchanged in batches, each op carrying a token its event returns. Nothing else crosses.
 
-The io_uring driver, the kqueue and IOCP drivers, the simulation and a wasm host are all hosts of
+The io_uring and kqueue drivers (a Windows one later), the simulation and a wasm host are all hosts of
 this one boundary, which is why a program cannot tell them apart. It is `blaze-core`'s
 `Effect`/`Completion` made flat, and the shape wasm-host's guest ABI already proved at speed
 (`ix-abi`, `ix-worker`). Taken from there:
@@ -1060,7 +1063,7 @@ types, each with exactly the spec that is valid for it and the operations it rea
 
 | type | made with | the program is | besides running, it can |
 |---|---|---|---|
-| `OsSandbox` | `Dir`s at chosen paths, an `Env`, a net policy, limits | a host process behind the OS's sandbox (Landlock, seccomp and namespaces; a sandbox profile on macOS; AppContainer on Windows) | signal a process, see its resource use |
+| `OsSandbox` | `Dir`s at chosen paths, an `Env`, a net policy, limits | a host process behind the OS's sandbox (Landlock, seccomp and namespaces; a sandbox profile on macOS; AppContainer on Windows, later) | signal a process, see its resource use |
 | `Vm` | an image or a view of the file tree, cores and memory from the host's menu, a lifetime, a net policy | a guest in a micro VM | stop, resume, snapshot, fork |
 | `WasmSandbox` | a module, `Dir`s as preopens, an `Env`, fuel and memory limits | a WASI module in the runtime | call an export, meter fuel |
 
@@ -1186,7 +1189,7 @@ on every target.**
 **Sound is in.** `io.audio()` gives `AudioOut` and, separately, `AudioIn`: a microphone is as
 sensitive as the file system, so listening is its own capability, narrowed to a device.
 
-- A device is a provider (CoreAudio, PipeWire or ALSA, WASAPI, the browser's in a wasm host;
+- A device is a provider (CoreAudio, PipeWire or ALSA, WASAPI later, the browser's in a wasm host;
   silence, a buffer or a file in the simulation), one type each for input and output.
 - The stream is pulled by the device. The callback that fills or reads a buffer must be
   `nonblocking` and `noalloc`, checked, since the audio thread may never wait; it talks to the
@@ -1662,8 +1665,8 @@ map 1) and never within the room; a content map equals the distinct values by id
 inserts and removes; a claimed id that is not the value's is refused and stores nothing; keys
 picked to collide under a known hasher spread under a key.
 
-Cost rows are printed by `cargo test --release -p blaze-hash --lib collections_cost -- --ignored
---nocapture` (insert, hash and lookup, and iteration of a million `u32` ids for `IndexMap`, the
+Cost rows are printed by `blaze test -p blaze-hash -- collections_cost --ignored --nocapture`
+(a release-optimized `blaze test` is not in the CLI yet) (insert, hash and lookup, and iteration of a million `u32` ids for `IndexMap`, the
 `indexmap` crate and `HashMap`; lookup of a million 32-byte hashes for `ByHash` and
 `HashMap<[u8; 32]>`). Not measured yet: no run of it has printed (2026-11-12); the numbers go
 here with the commit and the machine's load when one has.
@@ -1690,11 +1693,11 @@ which no test of the lowering shows it takes: `Kv::get` after `put_synced` reads
 id; `Budget::left` is at most the limit; `Clock::after(wait)` is `now + wait`; a `_synced` call
 leaves `device_waits` higher and an `_unsynced` one does not.
 
-What the generator (`#[blaze::contract_test]`) needs before these are run as property tests: it
+What the contract-test generator (a mode of `blaze test`, contracts.md) needs before these are run as property tests: it
 refuses methods and associated functions (bstd has almost nothing else), so it needs a receiver
 (drawn, or built by a constructor the type names); a `&Cx` and capabilities, made from
 `Io::sim(seed)` with the seed drawn; `&mut` arguments (`Bytes`); and a `Debug` bound it can do
-without for capabilities. The crate-wide `#![blaze::contract_tests]` is also not built.
+without for capabilities.
 
 ### Bytes that come from outside
 
@@ -1711,8 +1714,8 @@ Strings are UTF-8; a path is bytes on Unix and WTF-8 on Windows behind one `Path
 
 ## The checks
 
-Two effects join the existing MIR walk (`crates/hir-ty-pure`, with pure, nopanic, noalloc and
-nonblocking; [effects](effects.md)):
+These join the effect walk, beside its four effects (panic, alloc, block, diverge: the function
+type's `EffectSet`, blaze-ty effect_ty.rs; [effects](effects.md)):
 
 - **`ambient`**: reaches a system call, or Rust `std`'s file, environment, network, clock, random,
   process or thread API, outside the trusted list.
@@ -1721,10 +1724,11 @@ nonblocking; [effects](effects.md)):
 - **`global_state`**: reads or writes a `static` with interior mutability, a `static mut` or a
   thread-local.
 
-Effect attributes on bstd itself. This branch has `#[blaze::pure]`, `nopanic`, `noalloc` and
-`nonblocking` ([effects](effects.md)); bstd marks with those where the mark holds and is
-checked, and the positive form being built (`#[blaze::expect(block, alloc, ..)]`) replaces
-each with the exact list of what a function does, so "only `_synced` and `flush` may block"
+Effect attributes on bstd itself. The effect set is four, `panic`, `alloc`, `block` and
+`diverge`, carried in function types (blaze-ty effect_ty.rs) and written
+`#[blaze::expect(..)]`, the exact list of what a function does ([effects](effects.md)). bstd's
+`#[blaze::pure]`, `nopanic`, `noalloc` and `nonblocking` marks say an effect's absence the old
+way (`blaze::negative_effect` respells them), so "only `_synced` and `flush` may block"
 becomes `expect(block)` on those and its absence everywhere else. Marked today: `Cx::{deadline, name,
 cancelled, check}`, `Budget`'s counting, `Instant::{since_start, since}`, `Durable::unsynced`,
 `How::says`, `Buffered::held`. Not marked, and why: every call that reaches the driver takes
@@ -1736,7 +1740,7 @@ Lints the second rule implies:
 
 | lint | refuses | exists |
 |---|---|---|
-| `blaze::nopanic`, `noalloc`, `nonblocking` | a marked function that reaches the effect | yes |
+| `blaze::undeclared_effect`, `unfulfilled_effect` (the four effects against `#[blaze::expect(..)]`); `blaze::nopanic`, `noalloc`, `nonblocking` | a function that reaches an effect its list or mark does not allow; a listed effect it is proved not to have | registered (blaze-lint-defs lints.rs); the walk that runs them is not on the new layer |
 | `blaze::linear` (the borrow check's `LINEAR`) | a `File<ReadWrite>`, `Buffered`, `Pending`, `Scope`, `Conn` left unfinished | yes |
 | `blaze::implicit_policy` | a public bstd function that reaches a cost its signature does not carry (below) | no: specified here. Not built with `default_policy` because the lints read no effect summary yet (`instance_effects` is the MIR walk's, with no query the lint pass can ask per function), and the `Sync` and `Write` kinds are not rows of `effect_attrs::ROWS` |
 | `blaze::default_policy` | `impl Default`, `#[derive(Default)]`, or a `new()` with no arguments, for a type with a field marked `#[blaze::policy]` (a cost or a guarantee) | no: not on the item layer (`crates/blaze-lint` has no such lint); `Limits`, `SimWorld::limits`, `Wire` and `MemoLimit` are marked |
@@ -1785,8 +1789,7 @@ edition = "blaze-2026.11"
 One spelling. A key cargo could read (`[package.metadata.blaze]`) lost: a package of the
 edition is not a cargo package (its `std` is bstd and its `main` takes parameters), so cargo
 stopping at the edition key, naming it, is the true error, and one that parsed would only fail
-later and worse. blaze's own crates stay on `edition = "2024"` while cargo builds blaze
-(decision D25) and use bstd as a dependency by name. `edition.workspace = true` inherits it.
+later and worse. blaze's own crates are on `edition = "2024"` (decision D25) and use bstd as a dependency by name. `edition.workspace = true` inherits it.
 
 To the front end the manifest value is two things (`edition::BlazeEdition`, the one home of
 every spelling): the Rust edition it fixes (2024, for the parser, name resolution and every
@@ -1880,7 +1883,7 @@ gives and the manifest line; a diagnostic like any other (stored in the crate's 
 `compiler-message` in JSON, allowed or denied in the workspace's lint table or by flag). It
 warns by default from the same day `blaze new` defaults to the edition
 (`ready::EDITION_SHIPS`): until a package of the edition builds wherever blaze runs, telling
-people to move would be a nag. blaze's own workspace allows it while cargo builds blaze (D25).
+people to move would be a nag. blaze's own workspace allows it (D25).
 
 Deferred, a row each below: tests (S5b), the sandbox derived from `main` (S5c), bstd shipped
 with blaze (S5d), `Out` on the driver (S5e), build scripts and proc macros (S5f), the global
@@ -2194,25 +2197,6 @@ contracts (blaze-std; see its row), fn_delegation (blaze-fmt).
 | `read_buf`, `core_io_borrowed_buf` (`Read::read_buf` into a `BorrowedBuf` of `Vec::spare_capacity_mut`) | plain unstable | reading into capacity without zeroing it first | the store's record reads into a frame | use now where the caller sizes the buffer itself; `read_to_end` already reads unzeroed | 64 MB from the page cache: 2.73 ms, `read_to_end` 2.80 (1.022), zero then `read_exact` 3.04 (1.112) (read_buf.rs) |
 
 No probe panicked the compiler; no `rustc-ice-*.txt` was left.
-
-### Flags for building blaze itself
-
-The coordinator runs these on the whole tree; each names what to measure.
-
-- `-Zthreads=N`, the parallel front end: a cold `cargo check` of the workspace at N = 1, 8 and
-  the core count, wall time and peak memory; worth it if the critical-path crates (blaze-own,
-  blaze-hash, the front end) check faster without memory passing the ceiling.
-- `-Zcodegen-backend=cranelift` for test builds: `cargo test --no-run` time against LLVM at
-  `opt-level=0`, and that every test still passes; the tests' own run time is the cost.
-- cargo's checksum freshness (`-Zchecksum-freshness`): the incremental rebuild after a
-  `touch` with no content change, which mtimes rebuild and checksums do not; measure the no-op
-  build time.
-- `-Zprint-type-sizes`: one pass over the tree, sorted by size, the types above 64 bytes that
-  are held per item; each fat type found is a cost example's row.
-- `-Zrandomize-layout` in test builds: any test that starts failing relied on a layout no type
-  promised; the count of failures is the measure.
-- Miri's many-seeds mode (`-Zmiri-many-seeds`): the crates with `unsafe` (blaze-own,
-  blaze-kit, blaze-swiss) under 64 seeds; the measure is seeds that fail.
 
 ### Round 2 (2026-11-16)
 

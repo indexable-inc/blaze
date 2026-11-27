@@ -1,4 +1,4 @@
-//! blaze's transfer packs (docs/remote-cache.md, "Packs"): how records of one machine's store
+//! blaze's transfer packs (docs/remote-cache.md): how records of one machine's store
 //! become another's without being built again, from a file, a directory, a static HTTP
 //! address or a peer on the network, with nothing believed that was not checked.
 //!

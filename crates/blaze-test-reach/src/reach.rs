@@ -21,7 +21,7 @@ pub const MERGE_FLOOR: usize = 64;
 
 pub(crate) const REACH_DOMAIN: &str = "blaze-test-reach reach digest 1";
 
-/// The bytes of one row of the record (record.rs, "Its record" in tests-stage.md): the kind, seven
+/// The bytes of one row of the record (record.rs): the kind, seven
 /// zero bytes, the name, the value.
 pub const ROW: usize = 72;
 

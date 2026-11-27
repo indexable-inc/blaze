@@ -103,15 +103,18 @@ build no table. Every read goes through one recording host.
   index by cell the readers. A reader whose cells did not move is not entered.
 - **Lints and tests are kinds.** One lint task per body (D135): every selected lint in one walk
   over the body's typed record, dispatched by node kind, keyed by the body and the selected lints'
-  code ids (lints-stage.md). A test's reads are the code records its run reached, so a request
-  reruns exactly the tests whose reached code moved (tests-stage.md).
+  code ids (lints-stage.md). A test's result is keyed by [test.md](test.md)'s rule, the one
+  `blaze test` runs; `crates/blaze-test-reach` is built, not wired.
 - **Shared work, never a per-worker cache** (not built). Trait goals in canonical form and generic
   instantiations are request-wide records made once through claims; any hit appends the reads of
   what it returned to the reader's read list, and an audit mode re-makes every hit and compares;
   an impl added enters only the bodies whose recorded trait questions it can answer; facts of the
   toolchain and of registry packages are settled once per (toolchain, lock entry) and checked by
   one digest.
-- **Published records fetched (D132):** in this order: local names fast first; names records small (core's is 83 MB, 48 MB of it expansions kept as text); then R2 for optimized CODE of std and popular crates (dear to compute, small to ship); names records only by byte range, the pages a check touches (remote-read.md); never a whole pack of names (about 160 MB for a 6 s compute).
+- **Published records (D132): built, off unless chosen.** A new checkout is served by the
+  machine's own content-deduplicated store. When chosen: optimized code of std and popular crates
+  from R2 (dear to compute, small to ship); names records only by byte range, the pages a check
+  touches (remote-read.md); never a whole pack of names (about 160 MB for a 6 s compute).
 - **Cold floor.** tempo on an 18-core Mac: under 10 seconds (the owner, 2026-11-17). About 1 ms of
   CPU a body; a stage whose CPU per body passes 1 ms names where it goes before anything else is
   built on it.
@@ -451,9 +454,9 @@ by nothing reached. 55 crates no binary reaches are out of this work.
   (`sans_io_core`, `std_use`, `implicit_allocator`, `process_static`) are implemented and the
   ratchets run in the test round and CI before any crate is called done (T0).
 
-**Decided with it.** Wasmtime stays, behind a thin driver (rule 10 names it). The Windows driver
-and its package go (Windows is out of scope). `Alloc::global()` and `SharedAlloc::global()` go
-everywhere. CPU feature detection goes through blaze-sys. Tools that never ship in the binary
+**Decided with it.** Wasmtime stays, behind a thin driver (rule 10 names it). Windows is out of
+scope now; blaze-sys's `windows/` seam keeps a place for it. `Alloc::global()` and
+`SharedAlloc::global()` go everywhere. CPU feature detection goes through blaze-sys. Tools that never ship in the binary
 (the model checker, the allocation counter, the derive macro) are exempt from C1. Vendored
 cryptography and QUIC are not touched without the owner's word. Code the end state deletes is
 not converted first; its replacement is written to these conventions from the start.
@@ -511,8 +514,8 @@ nothing to remember.
   user; libc calls move behind blaze-sys; objc2 moves out of bstd into the application crate
   that needs it.
 - CODE NOTHING REACHED CALLS: what is plainly dead is deleted (stdx, `Screen`, the legacy
-  `Report`, blaze-protocol's `follow.rs` and its serde CBOR, `HashCons`, blaze-remote's bucket
-  code, blaze-launch-rt's daemon path). What is a capability blaze will want again (the
+  `Report`, blaze-protocol's `follow.rs` and its serde CBOR, `HashCons`, blaze-launch-rt's
+  daemon path). What is a capability blaze will want again (the
   manifest's cargo layer, blaze-resolve, blaze-source: making and updating a lock file) leaves
   the workspace and is recorded in parked.md with what would wire it, on these conventions.
 - ONE HTTP CLIENT: bstd's, as a sans-IO machine over the one `Effect` boundary; blaze-http keeps
@@ -733,10 +736,10 @@ our crates, and each brings a closure:
 | wasmtime | blaze-proc-macro, blaze-wasi | 115 | stays: it runs blaze's wasm64 modules (D175); blaze-wasi goes with the interim builder |
 | sonic-rs | blaze-report | 62 | the legacy report goes; JSON out by blaze's own writer |
 | quinn-proto, rustls, bytes | blaze-http | 62, 51, 1 | LAST: blaze's own TLS 1.3 and HTTP client; until then vendored and pinned (they are vendored today) |
-| ring | blaze-remote | 45 | the remote bucket is parked (goal revision 2026-11-17): the crate leaves the binary |
+| ring | blaze-remote | 45 | the remote is built, off unless chosen; `ring` stays under its `sign` feature and leaves the `blaze` binary |
 | stacker | stdx | 37 | stdx is deleted (D172); deep recursion is a frame with a stated bound |
 | url, serde_json, imbl, rustc-stable-hash | blaze-manifest, blaze-resolve, blaze-source | 36, 15, 10, 1 | the cargo layer is parked (D172); manifests are read by blaze-toml and typed paths |
-| windows-sys | blaze-core, blaze-mem, blaze-check, blaze-profile (blaze-graph named it unused) | 10 | blaze-sys declares the Windows imports itself (`windows/`, `raw-dylib`, no import library); the driver stays (corrected 2026-11-20: Windows is not deleted, see sys.md "Windows") |
+| windows-sys | blaze-core, blaze-mem, blaze-check, blaze-profile (blaze-graph named it unused) | 10 | blaze-sys declares the Windows imports itself (`windows/`, `raw-dylib`, no import library), the seam that keeps Windows's place while it is out of scope (sys.md "Windows") |
 | serde | nine crates | 7 | records are blaze-format and CBOR; the derives go with blaze-serde |
 | libc | nine crates | 1 | blaze-sys is the one home of kernel calls (D170) |
 | tracing | blaze-proc-macro | 4 | spans are bstd's (D178) |
@@ -745,7 +748,7 @@ our crates, and each brings a closure:
   names of third-party packages in our manifests (15), and the same two for the whole graph with
   test edges (274 packages). Each only falls; a new name is refused.
 - **Order**: what is already decided and blocked on nothing but the tree compiling (windows-sys,
-  libc, tracing, stacker with stdx, ring with the remote crate, the cargo layer's four, sonic-rs,
+  libc, tracing, stacker with stdx, ring out of the binary, the cargo layer's four, sonic-rs,
   serde), then TLS.
 - **Meanwhile nothing is fetched to build blaze**: when the count has fallen to what is truly
   left (the TLS and QUIC closure), that remainder is placed in `vendor/` pinned by digest and the
@@ -1010,10 +1013,10 @@ no unit conversion bug inside a program; units exist only at the edges, in named
 and accessors (`Length::mm(2.0)`, `.as_mm()`), and in printing, which picks the unit for people.
 - **Const generics, later.** The general form is one type `Quantity<const D: Dim, K>` whose
   products compute the dimension in the type. That needs arithmetic on const generics, which the
-  pinned nightly has only as an incomplete feature; while cargo also builds blaze, the crate is a
-  closed table of named quantities and their products, written so each name is an alias that the
-  general form can stand behind without changing a caller. When blaze builds blaze, the table
-  becomes the general type (rule 55: own the language).
+  pinned nightly has only as an incomplete feature; so the crate is a closed table of named
+  quantities and their products, written so each name is an alias that the general form can stand
+  behind without changing a caller. When blaze's front end has the arithmetic, the table becomes
+  the general type (rule 55: own the language).
 - **Users from the first day**: the CAD crates (lengths, angles, masses, D183), and the meter
   and telemetry (`Nanos` by kind, `Bytes` by kind, counts by what is counted, D178), whose
   printed lines then cannot put CPU seconds under a wall-time heading.

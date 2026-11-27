@@ -6,8 +6,8 @@ date: 2026-11-26
 # blaze: the plan
 
 blaze is the Rust build system and compiler for coding agents: an edit comes back as running code
-and a structured result in tens of milliseconds, from records any checkout, pull request and CI
-job shares; a command answers and exits ([bottom](plan/design/bottom.md)). This page is the whole plan. Three more things hold the rest:
+and a structured result in tens of milliseconds, from records every checkout on the machine
+shares; a command answers and exits ([bottom](plan/design/bottom.md)). This page is the whole plan. Three more things hold the rest:
 
 - **[plan/objectives.md](plan/objectives.md)**: every objective, the check that decides it, and
   where it stands. Work is picked from there and nowhere else.
@@ -87,9 +87,10 @@ Specs: [bottom](plan/design/bottom.md) (section 13), [columns](plan/design/colum
 `blaze-cas` keeps every result under its key as a record written once and read in place: a
 small one by `pread` into the task's frame, a large plain array mapped read-only. The kernel's
 page cache is the only cache; there is no buffer pool of blaze's own.
-Reads never lock. A commit is one atomic flip. The remote cache is the same
-store off the critical path with the same keys, so a cold build is mostly a download, and a
-second checkout's outputs are clones. Trust is by verification: a sampled share of hits is
+Reads never lock. A commit is one atomic flip. A new checkout is served by the machine's own
+content-deduplicated store, so its outputs are clones. A remote cache is supported and off unless
+chosen: publishing and fetching records with the same keys is built, and nothing is designed
+around it. Trust is by verification: a sampled share of hits is
 recomputed and compared, and a crash simulation drives the real store through power cuts and
 failed syncs.
 Specs: [bottom](plan/design/bottom.md) (section 10), [store-next](plan/design/store-next.md),
@@ -103,7 +104,7 @@ when the producers of what it read have merged; nothing starts over. Equal keys 
 once (single flight); order follows the critical path learned from history.
 Every kernel wait goes through one deadline wait, every lock is a named lock that records who
 waited behind whom, and every core is a sans-IO state machine with a thin driver (io_uring,
-kqueue, IOCP, simulation), which is what makes deterministic simulation tests possible. Every
+kqueue, simulation; Windows later), which is what makes deterministic simulation tests possible. Every
 byte belongs to a running task's frame or is a record; footprint is measured, and nothing admits
 work by memory.
 Specs: [parallel](plan/design/parallel.md), [end-state](plan/design/end-state.md) (D157, D161,
@@ -123,8 +124,8 @@ first tier, not the last: a function the running program shows hot is recompiled
 optimizing tier in the background and patched in the same way, so dev code is fast without any edit waiting for an optimizer. Dependencies are
 compiled optimized once, shared by every checkout through the store, and arrive as one premapped
 image. A release build goes
-through blaze's pinned LLVM with per-function summaries, and blaze's own linker writes ELF,
-Mach-O and COFF in parallel (`blaze build`). blaze never runs rustc; what still does is listed in
+through blaze's pinned LLVM with per-function summaries, and blaze's own linker writes ELF
+and Mach-O in parallel (`blaze build`). blaze never runs rustc; what still does is listed in
 [no-rustc](../no-rustc.md).
 Specs: [backend-next](plan/design/backend-next.md), [codegen](plan/design/codegen.md),
 [icf](plan/design/icf.md), [polymorph](plan/design/polymorph.md),
@@ -167,7 +168,7 @@ Specs: [profiling](../profiling.md), [ix-prof-format](../ix-prof-format.md),
 | an incremental build equals a build from nothing | an oracle, under- and over-invalidation both |
 | output is deterministic | build twice, compare bytes |
 | it is fast enough | the bounds in [bounds.md](plan/bounds.md) |
-| concurrent, durable or crash-recovering code is right | a deterministic simulation test with an invariant oracle and a planted bug |
+| concurrent, durable, crash-recovering, billing or deleting code is right | a deterministic simulation test with an invariant oracle and a planted bug |
 | lock-free code is right | the model checker ([model-checker](plan/design/model-checker.md)) |
 | unsafe code is sound | blaze's own UB checker on the MIR evaluator, and fuzzing ([unsafe](plan/design/unsafe.md)) |
 
@@ -188,15 +189,16 @@ A statement then climbs as far as it needs to, unchanged:
 | tested | a property test generated from the contract or the refinement | no counterexample in N tries |
 | simulated | the same, under the deterministic simulation with faults, crashes and interleavings, and a planted bug | none under adversarial schedules |
 | model-checked | every interleaving to a bound | none up to the bound |
-| proved | Lean, from the same contract and model ([formal-verification](plan/design/formal-verification.md)) | none |
+| proved | Lean, from the same contract and model ([formal-verification](plan/design/formal-verification.md)), on top of the levels below | none |
 
 The model is the object all four share: the simulation runs the real code against it, and it is
 the first thing translated to Lean, where properties of the model are proved; the compiled Lean
 model run against blaze-built code on drawn inputs is one more refinement. Proofs go to the
 sans-IO cores, which the capability rules make provably free of IO, clock and globals; the
-simulation covers the drivers around them and the binary as built. Durable, concurrent and
-crash-recovering code is at least simulated; what must never be wrong (a key's hash, a format's
-round trip) is proved. When two levels disagree, one of them has a bug, and that is a finding.
+simulation covers the drivers around them and the binary as built. Concurrent, durable,
+crash-recovering, billing and deleting code is always simulated; a Lean proof is the top rung of
+extra evidence and never replaces the simulation test. What must never be wrong (a key's hash, a
+format's round trip) is also proved. When two levels disagree, one of them has a bug, and that is a finding.
 
 In the code, a statement is a doc comment opening `/// The invariant:`, `/// The refinement:` or
 `/// The reference model:`. `scripts/src/bin/invariants.rs` collects them, with the level each
@@ -228,7 +230,7 @@ blaze's own crates use each extension as soon as it exists.
 without `alloc`, and no global allocator is reachable. No ambient authority (`main` names each
 capability it uses, such as `out: Out` or `args: Args`, and a function touches only what it is
 handed), sans-IO
-underneath (one `Io` over io_uring, kqueue, IOCP and the simulation of section 6), and the one
+underneath (one `Io` over io_uring, kqueue and the simulation of section 6), and the one
 lock, map, clock, wait and error shape the rules already name. Context and memory are explicit
 too: each task has a `Cx` (deadline, cancellation, span, frame allocator) passed as a parameter,
 and there is no global heap, so running out of memory fails one task and never the process. A program on it is a deterministic
@@ -239,8 +241,8 @@ what `main` hands out. Spec: [std](plan/design/std.md).
 ### 14. Its own edition
 
 `edition = "blaze-2026.11"` is Rust with ten opt-in changes: handles that copy themselves, error
-unions, view types, records and named arguments, contexts (`with`), effects declared at the
-border, values that must be used up, contracts with pattern types, compile-time reflection, and `&uniq` as the spelling of the unique reference.
+unions, view types, records and named arguments, contexts (`with`), effects (panic, alloc, block,
+diverge) declared at the border, values that must be used up, contracts with pattern types, compile-time reflection, and `&uniq` as the spelling of the unique reference.
 It removes lossy `as`, `async`, ambient IO, the global allocator and `static mut`. The lint group
 `blaze::edition` gets a crate ready before the edition exists. Sections 12 and 13 are its parts.
 Spec: [edition](plan/design/edition.md).
@@ -275,9 +277,9 @@ processes exist ([tasks](plan/design/tasks.md)).
    its spec written first, by the same task that then builds it.
 4. **Write.** Workers only write and commit, all in one directory (no worktree per lane). They
    build and run nothing. Use a worker only when the piece is independent and large enough to pay for its
-   context; the coordinator does small pieces itself. Four workers is a lot.
-5. **Integrate once.** The coordinator builds the one tree once and admits what passes: one
-   `blaze check` and one `blaze test`, then each row's check.
+   context; the coordinator does small pieces itself.
+5. **Integrate once.** The coordinator builds the one tree once, on the Mac, and admits what
+   passes: one `blaze check` and one `blaze test`, then each row's check.
 6. **Land** what passes, one pull request per objective, through `land.py`. What fails goes back
    to its worker once with the check's output; a second failure is written into the row as what
    blocks it, and the task stops.
@@ -293,7 +295,7 @@ spec in place. When a section here stops being true, fix it in the same change.
 
 Decided; object with evidence, don't work around.
 
-- No daemon: a command answers and exits; branches, pull requests and CI jobs share records. An
+- No daemon: a command answers and exits; every checkout on the machine shares its records. An
   optional helper (the file-event journal, with an expiry) may live between commands; nothing
   depends on it for correctness.
 - No IDE and no MCP. The agent API is the interface.

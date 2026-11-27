@@ -358,7 +358,7 @@ quoted.
 
 ## 11. Real projects
 
-The newest measurement is in [benchmarks.md](benchmarks.md): `harness/bench.py` on ten
+The newest measurement is in benchmarks.md: `harness/bench.py` on ten
 projects (ripgrep to bevy, and zed), cold builds with an empty and a warm store, six kinds of
 edit, the test suites, the fastest cargo setups (mold, wild, `-Zthreads=8`, cg_clif, `cargo
 check`) and subsecond's hot-patching, every sample kept, and the history the site charts at

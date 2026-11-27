@@ -206,7 +206,8 @@ verifier, a minimal DER reader for its checks) and `driver.rs`.
 
 The owner (2026-11-13): "remote cache should be quic (sans io with state machine, think we
 already have crates for this)". The same core makes plain requests, and blaze-remote reads
-public objects with them.
+public objects with them. The remote cache is built and off unless chosen; no build
+depends on it.
 
 **The core** (`h3/request.rs`, `h3/endpoint/requests.rs`). On a connection opened with
 `Endpoint::connect_requests`, `request(conn, Request)` sends one GET or HEAD:

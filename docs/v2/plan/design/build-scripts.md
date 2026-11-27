@@ -216,7 +216,7 @@ An unknown `cargo::` instruction is a typed warning; an unknown old-style `cargo
 **The key** (`blaze_build_script::key`): a blaze-record base key over the module's digest, the
 whole environment given, the compiler answers' identity (the pinned version text, the probe
 table) and the C mode; the read list is the tracked reads; the answer is the outputs record. So
-a script runs once per configuration, and never again on any machine that fetches the record.
+a script runs once per configuration a machine, its record found by key in the machine's store.
 The environment is whole in the key rather than tracked per variable: wasi-libc copies it at
 start, and the unit's configuration is what it varies with anyway.
 

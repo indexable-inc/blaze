@@ -10,7 +10,7 @@ summary: What `blaze gc` does: the store's byte budget and its two settings, com
 ## The store and the budget
 
 The store is one folder per form, `~/.blaze/v2/store/f<FORMAT>s<SEGMENT>/`: `f6s3` today
-(`FORMAT` and `SEGMENT_FORMAT` in `crates/blaze-cas/src/plain/format.rs`). Every worktree on the
+(`FORMAT` and `SEGMENT_FORMAT` in `crates/blaze-cas/src/plain/format.rs`). Every checkout on the
 machine shares it.
 
 The budget defaults to 12 GiB (`DEFAULT_MAX_STORE_BYTES`). `--max-gb` or `--max-bytes` sets it for
