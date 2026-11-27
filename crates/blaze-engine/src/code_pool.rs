@@ -303,6 +303,7 @@ impl<'a> CodePool<'a> {
             return false;
         }
         self.index.remove(&Probe { key, seed: self.opts.hash_seed });
+        self.rows[id].callers.clear();
         self.rows[id].state = State::Dormant(None);
         true
     }
@@ -575,8 +576,9 @@ impl<'a> CodePool<'a> {
         self.children[child.0].live = false;
         self.children[child.0].pending.clear();
         for key in self.children[child.0].slots.keys() {
-            let id = self.index.get(&Probe { key: *key, seed: self.opts.hash_seed }).expect("a demanded slot has a claim");
-            self.rows[*id].callers.retain(|&c| c != child);
+            if let Some(&id) = self.index.get(&Probe { key: *key, seed: self.opts.hash_seed }) {
+                self.rows[id].callers.retain(|&c| c != child);
+            }
         }
         #[cfg(test)]
         if self.plant == Plant::KeepOrphans {
