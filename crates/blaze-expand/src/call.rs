@@ -2,8 +2,9 @@
 //! re-entered, the answers to the calls in its input.
 
 use crate::{
-    error::{ExpandError, Stream},
-    tokens::{Ctx, Edition, Sink, TokenStream},
+    error::{ExpandError, Stream, StreamError},
+    origin_column::TextMark,
+    tokens::{Ctx, CtxNode, Delim, Edition, Sink, TokenKind, TokenStream},
 };
 
 /// The three kinds of macro call: the schema's one `CallShape`.
@@ -66,6 +67,114 @@ pub struct CallSite {
     /// ([`Call::input`]): the parent of the call-site and mixed-site tokens the expansion
     /// makes.
     pub ctx: Ctx,
+}
+
+impl CallSite {
+    /// A call site with no enclosing expansion context, in `edition`.
+    pub const fn root(edition: Edition) -> CallSite {
+        CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) }
+    }
+
+    /// The call site of the path in `range` of `from`, imported into `input` (so `ctx` is a
+    /// context of `input`, as [`CallSite::ctx`] requires). `edition` and `panic_edition` come
+    /// from the path token (`from.edition_of`), falling back to `fallback_edition` when `range`
+    /// holds no visible token.
+    pub fn from_path(
+        from: &TokenStream<'_>,
+        range: core::ops::Range<usize>,
+        input: &mut TokenStream<'_>,
+        fallback_edition: Edition,
+    ) -> Result<CallSite, StreamError> {
+        let Some(path_ctx) = path_ctx_in(from, range) else {
+            return Ok(CallSite::root(fallback_edition));
+        };
+        let edition = from.edition_of(path_ctx);
+        let ctx = input.import_ctx(from, path_ctx)?;
+        Ok(CallSite { edition, panic_edition: edition, ctx })
+    }
+
+    /// The call site of a function-like macro call whose opening delimiter is at `open` of
+    /// `from` (`path!(...)`, walking backward from the `!` before `open` across `::` and
+    /// invisible groups), imported into `input`.
+    pub fn before_open(
+        from: &TokenStream<'_>,
+        open: usize,
+        input: &mut TokenStream<'_>,
+        fallback_edition: Edition,
+    ) -> Result<CallSite, StreamError> {
+        let Some(path_ctx) = path_ctx_before_open(from, open) else {
+            return Ok(CallSite::root(fallback_edition));
+        };
+        let edition = from.edition_of(path_ctx);
+        let ctx = input.import_ctx(from, path_ctx)?;
+        Ok(CallSite { edition, panic_edition: edition, ctx })
+    }
+
+    /// The call site of a token carrying a rendered [`TextMark`] (e.g. a call written in an
+    /// expansion's text), imported into `input`.
+    pub fn from_text_mark(
+        mark: Option<TextMark>,
+        input: &mut TokenStream<'_>,
+        fallback_edition: Edition,
+    ) -> Result<CallSite, StreamError> {
+        let Some(mark) = mark else {
+            return Ok(CallSite::root(fallback_edition));
+        };
+        let ctx = input.context(CtxNode {
+            parent: Ctx::root(fallback_edition),
+            mark: mark.as_outer_mark(),
+        })?;
+        Ok(CallSite { edition: mark.edition, panic_edition: mark.edition, ctx })
+    }
+}
+
+/// The context of the first identifier (or else first visible token) of the path in `range` of
+/// `stream`.
+pub(crate) fn path_ctx_in(stream: &TokenStream<'_>, range: core::ops::Range<usize>) -> Option<Ctx> {
+    let slice = stream.tokens().get(range)?;
+    if let Some(ident) = slice.iter().find(|t| matches!(t.kind, TokenKind::Ident { .. })) {
+        return Some(ident.ctx);
+    }
+    slice
+        .iter()
+        .find(|t| !matches!(t.kind, TokenKind::Open(Delim::Invisible) | TokenKind::Close(Delim::Invisible)))
+        .map(|t| t.ctx)
+}
+
+/// The context of the first identifier of the macro path before the opening delimiter at `open`
+/// in `stream` (`path!(...)`, skipping invisible groups around `$p:path` fragments).
+fn path_ctx_before_open(stream: &TokenStream<'_>, open: usize) -> Option<Ctx> {
+    let tokens = stream.tokens();
+    let invisible = |i: usize| {
+        matches!(tokens.get(i).map(|t| t.kind), Some(TokenKind::Open(Delim::Invisible) | TokenKind::Close(Delim::Invisible)))
+    };
+    let prev = |mut i: usize| -> Option<usize> {
+        while i > 0 {
+            i -= 1;
+            if !invisible(i) {
+                return Some(i);
+            }
+        }
+        None
+    };
+    let colon = |i: usize| matches!(tokens.get(i).map(|t| t.kind), Some(TokenKind::Punct { char: ':', .. }));
+    let bang = prev(open.min(tokens.len()))?;
+    if !matches!(tokens.get(bang).map(|t| t.kind), Some(TokenKind::Punct { char: '!', .. })) {
+        return None;
+    }
+    let mut at = bang;
+    let mut first = None;
+    while let Some(word) = prev(at) {
+        if !matches!(tokens.get(word).map(|t| t.kind), Some(TokenKind::Ident { .. })) {
+            break;
+        }
+        first = Some(word);
+        match prev(word).and_then(|second| Some((second, prev(second)?))) {
+            Some((second, colon_one)) if colon(second) && colon(colon_one) => at = colon_one,
+            _ => break,
+        }
+    }
+    first.and_then(|i| tokens.get(i)).map(|t| t.ctx)
 }
 
 /// Whether the call is itself inside an eager macro's input.
@@ -154,8 +263,9 @@ impl<'a> Call<'a> {
             .chain(answers)
     }
 
-    /// Refuses a call whose streams do not pair their delimiters or carry an expansion's own
-    /// marks: either would be read wrong. The proof is what code that pairs delimiters takes.
+    /// Refuses a call whose streams do not pair their delimiters, carry an expansion's own
+    /// marks, or name a call-site context that is not of [`Call::input`]: any of these would be
+    /// read wrong. The proof is what code that pairs delimiters takes.
     pub(crate) fn check(&self) -> Result<Checked, ExpandError> {
         for (stream, tokens) in self.streams() {
             if let Some(token) = tokens.unbalanced() {
@@ -164,6 +274,14 @@ impl<'a> Call<'a> {
             if tokens.has_own_marks() {
                 return Err(ExpandError::Unsealed { stream });
             }
+        }
+        if let Some(at) = self.site.ctx.node()
+            && usize::try_from(at).is_ok_and(|at| at >= self.input().contexts().len())
+        {
+            return Err(ExpandError::Stream {
+                stream: Some(Stream::Input),
+                error: StreamError::NoSuchContext { ctx: self.site.ctx.raw() },
+            });
         }
         Ok(Checked(()))
     }

@@ -12,7 +12,7 @@
 //! the answers, to [`EAGER_DEPTH`] deep.
 
 use blaze_expand::{
-    BuiltinDerive, BuiltinFn, Call, CallSite, Ctx, DefAt, DefSite, Delim, DeriveFacts, Eager, ExpandCx, Expanded, Export, Hole, HoleOf, Inside, LitKind, LocalInner,
+    BuiltinDerive, BuiltinFn, Call, CallSite, DefAt, DefSite, Delim, DeriveFacts, Eager, ExpandCx, Expanded, Export, Hole, HoleOf, Inside, LitKind, LocalInner,
     LexError, MacroDefinition, NestedCall, NestedKind, Place, PlaceOf, Prepared, ProcKind, Raw, ReadAnswer, ReadKind, Reads, Spacing, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
 };
 use blaze_ids::ContentId;
@@ -570,11 +570,17 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         }
     }
 
-    /// The tokens inside `call`'s delimiters. A text input is lexed with its words' `marks`
-    /// (blaze-expand `lex_marked`): the call's input as the expansion that wrote the item made
-    /// it, each `$crate` one identifier of its crate (the Reference, "Macros By Example",
-    /// "Hygiene").
-    fn input(&self, input: CallInput<'_>, marks: InputMarks<'_>, edition: Edition) -> Result<TokenStream<'a>, Refused<'a>> {
+    /// The tokens inside `call`'s delimiters and its [`CallSite`] (imported into the returned
+    /// stream so `site.ctx` is a context of `Call::input`). A text input is lexed with its words'
+    /// `marks` (blaze-expand `lex_marked`); an expanded input takes its tokens and path context
+    /// from the outer expansion stream before sealing with that expansion's key.
+    fn input_and_site(
+        &self,
+        input: CallInput<'_>,
+        marks: InputMarks<'_>,
+        at: PathAt,
+        edition: Edition,
+    ) -> Result<(TokenStream<'a>, CallSite), Refused<'a>> {
         match input {
             CallInput::Text(text) => {
                 let lexed = match marks.is_empty() {
@@ -586,34 +592,47 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                 if len < 2 {
                     return Err(Refused::Failed(Failure::NoDelimiters));
                 }
-                lexed.copy_in(1..len - 1, self.alloc).map_err(|e| Refused::Failed(Failure::Stream(e)))
+                let mut stream = lexed.copy_in(1..len - 1, self.alloc).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                let site = CallSite::from_text_mark(at.mark, &mut stream, edition).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                Ok((stream, site))
             }
-            CallInput::Expanded { expansion, start, end } => self.expanded_slice(expansion, start, end, true),
+            CallInput::Expanded { expansion, start, end } => {
+                let (key, tokens) = usize::try_from(expansion)
+                    .ok()
+                    .and_then(|i| self.expansions.get(i))
+                    .ok_or(Refused::Failed(Failure::NoExpansion { expansion }))?;
+                let (s, e) = (
+                    usize::try_from(start).map_err(|_| Refused::Failed(Failure::NoDelimiters))?,
+                    usize::try_from(end).map_err(|_| Refused::Failed(Failure::NoDelimiters))?,
+                );
+                if e < s.saturating_add(2) {
+                    return Err(Refused::Failed(Failure::NoDelimiters));
+                }
+                let mut copy = tokens.copy_in(s + 1..e - 1, self.alloc).map_err(|err| Refused::Failed(Failure::Stream(err)))?;
+                let site = CallSite::before_open(tokens, s, &mut copy, edition).map_err(|err| Refused::Failed(Failure::Stream(err)))?;
+                copy.seal(*key);
+                Ok((copy, site))
+            }
         }
     }
 
     /// One frame on [`ByName::call`]'s explicit eager-expansion stack.
+    #[expect(clippy::too_many_arguments, reason = "eager macro frame inputs, each named")]
     fn call_frame(
         &self,
         path: &str,
         at: PathAt,
         input: TokenStream<'a>,
+        site: CallSite,
         edition: Edition,
         inside: Inside,
         depth: u32,
         locals: &[LocalMacro<'_>],
         written: Option<u32>,
     ) -> Result<CallFrame<'d, 'a>, Refused<'a>> {
-        // `panic!` takes the edition of the code that writes it: a path a macro wrote carries
-        // its definition's mark, whose edition is the defining crate's (the token was read in
-        // it). Gap: rustc's `use_panic_2021` skips macros under
-        // `#[allow_internal_unstable(edition_panic)]` (core's `debug_assert!`) to their caller;
-        // `DefAt` does not record that flag yet, so such a macro's own edition is taken.
         // The written call this one is, or is nested in through eager input: a nested call's
         // own `PathAt` has none (`PathAt::of`), so the outermost's is carried down.
         let written = at.written.map(|range| range.start).or(written);
-        let panic_edition = at.mark.map_or(edition, |mark| mark.edition);
-        let site = CallSite { edition, panic_edition, ctx: Ctx::root(edition) };
         let def_site_only = at.mark.is_some_and(|m| m.transparency == blaze_expand::Transparency::Opaque)
             || crate::mark_site::local_inner_crate(at.mark, path.trim(), 1, false).is_some();
         let resolved = match if def_site_only { None } else { self.local(path, locals, edition) } {
@@ -636,11 +655,13 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
 
     /// Expands `name!(input)`: its key, its expansion's tokens, and whether the macro is defined
     /// in a crate other than the caller's own (`non_local`).
+    #[expect(clippy::too_many_arguments, reason = "body macro call inputs, each named")]
     fn call(
         &mut self,
         path: &str,
         at: PathAt,
         input: TokenStream<'a>,
+        site: CallSite,
         edition: Edition,
         inside: Inside,
         depth: u32,
@@ -649,7 +670,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         written: Option<u32>,
     ) -> Result<(ContentId, TokenStream<'a>, bool), Refused<'a>> {
         let mut parents: AVec<'a, CallFrame<'d, 'a>> = Vec::new_in(self.alloc);
-        let mut current = self.call_frame(path, at, input, edition, inside, depth, locals, written)?;
+        let mut current = self.call_frame(path, at, input, site, edition, inside, depth, locals, written)?;
         loop {
             if let Some(n) = current.pending.pop() {
                 if n.kind != NestedKind::FnLike {
@@ -661,9 +682,11 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                 let inner = n.inner();
                 let inner_start = usize::try_from(inner.start).unwrap_or(0);
                 let inner_end = usize::try_from(inner.end).unwrap_or(0);
-                let args = current
+                let mut args = current
                     .input
                     .copy_in(inner_start..inner_end, self.alloc)
+                    .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                let child_site = CallSite::from_path(&current.input, path_start..path_end, &mut args, edition)
                     .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
                 let child_at = PathAt {
                     written: current.written_range,
@@ -674,6 +697,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                     &child_path,
                     child_at,
                     args,
+                    child_site,
                     edition,
                     Inside::EagerInput,
                     current.depth + 1,
@@ -738,8 +762,10 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                             }
                             let mut next_path = AString::new_in(self.alloc);
                             push_path_text(&tokens, next_call.path.0, next_call.path.1, &mut next_path);
-                            let next_args = tokens
+                            let mut next_args = tokens
                                 .copy_in(next_call.open + 1..next_call.close, self.alloc)
+                                .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
+                            let next_site = CallSite::from_path(&tokens, next_call.path.0..next_call.path.1, &mut next_args, edition)
                                 .map_err(|e| Refused::Failed(Failure::Stream(e)))?;
                             let next_at = PathAt {
                                 written: current.written_range,
@@ -750,6 +776,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                                 &next_path,
                                 next_at,
                                 next_args,
+                                next_site,
                                 edition,
                                 Inside::EagerInput,
                                 current.depth + 1,
@@ -1109,8 +1136,8 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
     ) -> Expansion {
         let at = PathAt { mark: path_mark, written: None, block: None };
         let result = self
-            .input(CallInput::Text(input), input_marks, edition)
-            .and_then(|input| self.call(path, at, input, edition, Inside::Plain, 0, &[], Some(cfg), None));
+            .input_and_site(CallInput::Text(input), input_marks, at, edition)
+            .and_then(|(input, site)| self.call(path, at, input, site, edition, Inside::Plain, 0, &[], Some(cfg), None));
         match result {
             Ok((key, tokens, non_local)) => {
                 out.key = key;
@@ -1149,8 +1176,8 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         }
         let before = self.reads.list().len();
         let result = self
-            .input(call.input, call.input_marks, call.edition)
-            .and_then(|input| self.call(call.path, at, input, call.edition, Inside::Plain, 0, call.locals, Some(cfg), None));
+            .input_and_site(call.input, call.input_marks, at, call.edition)
+            .and_then(|(input, site)| self.call(call.path, at, input, site, call.edition, Inside::Plain, 0, call.locals, Some(cfg), None));
         // Its reads (an eager input's nested calls' included) joined on success and on the
         // call's error alike (`call`): placed at this call.
         self.note_reads(Some(call.range), call.path, blaze_surface::CallShape::FnLike, before);
@@ -1213,7 +1240,16 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
                 &own
             }
         };
-        let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
+        let owned;
+        let (item, site) = match path_mark {
+            Some(mark) => {
+                let mut copy = item.clone_in(self.alloc);
+                let Ok(site) = CallSite::from_text_mark(Some(mark), &mut copy, edition) else { return Expansion::Failed };
+                owned = copy;
+                (&owned, site)
+            }
+            None => (item, CallSite::root(edition)),
+        };
         let call = Call::attr(args, item, site);
         let key = call_key(prepared.def(), &call).0;
         let before = self.reads.list().len();
@@ -1252,7 +1288,16 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
             Ok(Resolved::Prepared(_)) => return Expansion::Failed,
             Err(_) => return Expansion::Unsupported,
         };
-        let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
+        let owned;
+        let (item, site) = match path_mark {
+            Some(mark) => {
+                let mut copy = item.clone_in(self.alloc);
+                let Ok(site) = CallSite::from_text_mark(Some(mark), &mut copy, edition) else { return Expansion::Failed };
+                owned = copy;
+                (&owned, site)
+            }
+            None => (item, CallSite::root(edition)),
+        };
         let call = Call::derive(item, facts, site);
         let key = call_key(&def, &call).0;
         let before = self.reads.list().len();
