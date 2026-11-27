@@ -2071,12 +2071,14 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
         transparency: Transparency::Transparent,
         edition: Edition::E2024,
         site: DefSite { krate: krate_a, module: None },
+        local_inner: false,
     };
     let semi_b = Mark {
         of: MarkOf::Outer(ContentId([21; 32])),
         transparency: Transparency::SemiOpaque,
         edition: Edition::E2024,
         site: DefSite { krate: krate_b, module: None },
+        local_inner: false,
     };
     let semi_b_2021 = Mark {
         of: MarkOf::Outer(ContentId([22; 32])),
@@ -2120,12 +2122,12 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
     // Nested E2021 Transparent over E2024 SemiOpaque keeps SemiOpaque hygiene + E2021 edition.
     assert_eq!(
         stream.text_mark(transparent_over_semi),
-        Some(TextMark { site: semi_b.site, transparency: Transparency::SemiOpaque, edition: Edition::E2021 })
+        Some(TextMark { site: semi_b.site, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false })
     );
     // Reverse nesting: E2024 Transparent over E2021 SemiOpaque keeps SemiOpaque hygiene + E2024 edition.
     assert_eq!(
         stream.text_mark(transparent_2024_over_semi_2021),
-        Some(TextMark { site: semi_b_2021.site, transparency: Transparency::SemiOpaque, edition: Edition::E2024 })
+        Some(TextMark { site: semi_b_2021.site, transparency: Transparency::SemiOpaque, edition: Edition::E2024, local_inner: false })
     );
     // `TextMark::local_hygiene()` depends only on `(site, transparency)`, not `edition`.
     assert_eq!(
@@ -2137,7 +2139,7 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
     assert_eq!(stream.non_transparent_mark(transparent_over_opaque), Some(opaque_c));
     assert_eq!(
         stream.text_mark(transparent_over_opaque),
-        Some(TextMark { site: opaque_c.site, transparency: Transparency::Opaque, edition: Edition::E2021 })
+        Some(TextMark { site: opaque_c.site, transparency: Transparency::Opaque, edition: Edition::E2021, local_inner: false })
     );
 
     // `body_words` uses `text_mark`: preserves innermost `Transparent` edition while keeping
@@ -2224,6 +2226,7 @@ fn include_text_mark_and_body_words_preserve_caller_edition() {
         transparency: Transparency::Transparent,
         edition: Edition::E2021,
         site: DefSite { krate: CrateItemKey(ContentId([0xD1; 32])), module: None },
+        local_inner: false,
     };
     let trans_ctx = trans_input
         .context(CtxNode { parent: Ctx::root(Edition::E2024), mark: proc_mark })
@@ -2250,12 +2253,14 @@ fn include_text_mark_and_body_words_preserve_caller_edition() {
         transparency: Transparency::SemiOpaque,
         edition: Edition::E2021,
         site: DefSite { krate: CrateItemKey(ContentId([0xE1; 32])), module: None },
+        local_inner: false,
     };
     let trans_2024_mark = Mark {
         of: MarkOf::Outer(ContentId([0xE2; 32])),
         transparency: Transparency::Transparent,
         edition: Edition::E2024,
         site: DefSite { krate: CrateItemKey(ContentId([0xE3; 32])), module: None },
+        local_inner: false,
     };
     let semi_ctx = layered_input
         .context(CtxNode { parent: Ctx::root(Edition::E2018), mark: semi_mark })
@@ -2282,8 +2287,8 @@ fn lex_marked_preserves_transparent_edition_without_folding_dollar_crate() {
     use blaze_expand::{Transparency, origin_column::TextMark};
     let alloc = Alloc::global();
     let site = DefSite { krate: CrateItemKey(ContentId([41; 32])), module: None };
-    let transparent_2021 = TextMark { site, transparency: Transparency::Transparent, edition: Edition::E2021 };
-    let semi_2021 = TextMark { site, transparency: Transparency::SemiOpaque, edition: Edition::E2021 };
+    let transparent_2021 = TextMark { site, transparency: Transparency::Transparent, edition: Edition::E2021, local_inner: false };
+    let semi_2021 = TextMark { site, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false };
 
     let text = "$crate::Foo";
     // Transparent mark: `$` and `crate` remain two tokens (same as unmarked), while preserving
@@ -2354,6 +2359,7 @@ fn nested_transparent_proc_macro_over_semi_opaque_call_site_preserves_innermost_
         transparency: Transparency::SemiOpaque,
         edition: Edition::E2024,
         site: DefSite { krate: rules_2024_krate, module: None },
+        local_inner: false,
     };
     let semi_2024_ctx = input_2024
         .context(CtxNode { parent: Ctx::root(Edition::E2024), mark: semi_2024 })
@@ -2361,7 +2367,7 @@ fn nested_transparent_proc_macro_over_semi_opaque_call_site_preserves_innermost_
     let call_1 = Call::fn_like(&input_2024, CallSite { edition: Edition::E2024, panic_edition: Edition::E2024, ctx: semi_2024_ctx });
     let exp_1 = done(expand(&proc_2021, &call_1, &EmitRefMut(Edition::E2021), alloc));
     assert!(exp_1.diagnostics.is_empty(), "{:?}", exp_1.diagnostics);
-    let want_1 = TextMark { site: semi_2024.site, transparency: Transparency::SemiOpaque, edition: Edition::E2021 };
+    let want_1 = TextMark { site: semi_2024.site, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false };
     for i in 0..exp_1.tokens.len() {
         assert_eq!(exp_1.text_mark(i), Some(want_1));
         assert_eq!(exp_1.non_transparent_mark(i), Some(semi_2024));
@@ -2385,6 +2391,7 @@ fn nested_transparent_proc_macro_over_semi_opaque_call_site_preserves_innermost_
         transparency: Transparency::SemiOpaque,
         edition: Edition::E2021,
         site: DefSite { krate: rules_2021_krate, module: None },
+        local_inner: false,
     };
     let semi_2021_ctx = input_2021
         .context(CtxNode { parent: Ctx::root(Edition::E2021), mark: semi_2021 })
@@ -2392,7 +2399,7 @@ fn nested_transparent_proc_macro_over_semi_opaque_call_site_preserves_innermost_
     let call_2 = Call::fn_like(&input_2021, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: semi_2021_ctx });
     let exp_2 = done(expand(&proc_2024, &call_2, &EmitRefMut(Edition::E2024), alloc));
     assert!(exp_2.diagnostics.is_empty(), "{:?}", exp_2.diagnostics);
-    let want_2 = TextMark { site: semi_2021.site, transparency: Transparency::SemiOpaque, edition: Edition::E2024 };
+    let want_2 = TextMark { site: semi_2021.site, transparency: Transparency::SemiOpaque, edition: Edition::E2024, local_inner: false };
     for i in 0..exp_2.tokens.len() {
         assert_eq!(exp_2.text_mark(i), Some(want_2));
         assert_eq!(exp_2.non_transparent_mark(i), Some(semi_2021));
