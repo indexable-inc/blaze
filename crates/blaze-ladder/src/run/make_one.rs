@@ -141,10 +141,19 @@ impl<A: core::alloc::Allocator> BuiltLir<A> {
     }
 }
 
+/// Optional side-car `BLZLIR02` capture during `BuildSink::Entry` so cold `--release` walks
+/// cache pre-LTO LIR across all parallel workers without lowering MIR -> LIR a second time.
+struct EntryLirCapture<'e> {
+    machine: blaze_tier::Machine,
+    shared: blaze_own::SharedAlloc<'static>,
+    out: &'e mut Option<blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>>,
+}
+
 /// Destination for one built instance inside [`build_one`]: either emit an encoded `CodeStore`
-/// entry, or hand back the verified LIR and resolved reference tables for whole-program LTO.
+/// entry (optionally also capturing encoded `BLZLIR02` bytes for release LTO), or hand back the
+/// verified LIR and resolved reference tables directly.
 enum BuildSink<'e, 'a, A: core::alloc::Allocator = Alloc<'a>> {
-    Entry(&'e mut AVec<'a, u8>),
+    Entry { entry: &'e mut AVec<'a, u8>, lir_capture: Option<EntryLirCapture<'e>> },
     Lir { alloc: A, out: &'e mut Option<BuiltLir<A>>, declared: Option<&'e mut crate::body_ids::DeclaredList<'a>> },
 }
 
@@ -1141,7 +1150,27 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     state.core.work.times = MakeTimes::default();
     state.core.work.last_make = None;
     state.core.work.last_make_reportable = false;
-    make_instance_timed(program, typing, state, checks, tabled, name, entry)?;
+    make_instance_timed(program, typing, state, checks, tabled, name, entry, None)?;
+    finish_make_timing(&mut state.core, made_from);
+    Ok(())
+}
+
+fn make_instance_capturing<P: FrontEnd, T: Typing<P>>(
+    program: &mut P,
+    typing: &mut T,
+    state: &mut MakerState,
+    checks: &mut CheckCount,
+    tabled: ItemKey,
+    name: &[u8],
+    entry: &mut AVec<'_, u8>,
+    lir_capture: Option<EntryLirCapture<'_>>,
+) -> Result<(), RunError> {
+    use blaze_core::wait::Clock as _;
+    let made_from = state.core.work.clock.map(|c| c.now());
+    state.core.work.times = MakeTimes::default();
+    state.core.work.last_make = None;
+    state.core.work.last_make_reportable = false;
+    make_instance_timed(program, typing, state, checks, tabled, name, entry, lir_capture)?;
     finish_make_timing(&mut state.core, made_from);
     Ok(())
 }
@@ -1174,12 +1203,13 @@ fn make_instance_timed<'a, P: FrontEnd, T: Typing<P>>(
     tabled: ItemKey,
     name: &[u8],
     entry: &mut AVec<'a, u8>,
+    lir_capture: Option<EntryLirCapture<'_>>,
 ) -> Result<(), RunError> {
     let MakerState { core, fn_frame } = state;
     let fn_guard = ResetOnDrop(fn_frame);
     let fn_erased = blaze_own::Erased::new(&*fn_guard.0);
     let fn_alloc = fn_erased.handle();
-    let mut sink = BuildSink::<Alloc<'a>>::Entry(entry);
+    let mut sink = BuildSink::<Alloc<'a>>::Entry { entry, lir_capture };
     run_instance_loop(program, typing, core, fn_alloc, checks, tabled, name, &mut sink)
 }
 
@@ -2886,6 +2916,61 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
     }
     // Absorb Phase 2's clean read log into `work.reads` (which applies `work.reads.plant`).
     work.reads.absorb(&work.ref_reads);
+    let build_owned_lir = |out_alloc: blaze_own::SharedAlloc<'static>| -> Result<BuiltLir<blaze_own::SharedAlloc<'static>>, RunError> {
+        let mut c_text: blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::new_in(out_alloc);
+        let mut push_c = |s: &str| -> Result<(u32, u32), RunError> {
+            let start = u32::try_from(c_text.len()).map_err(|_| RunError::CodeRecord {
+                function: name(),
+                error: CodeRecordError::Seal(blaze_code::record::RecordError::TooLarge { what: "LTO C symbol table" }),
+            })?;
+            let len = u32::try_from(s.len()).map_err(|_| RunError::CodeRecord {
+                function: name(),
+                error: CodeRecordError::Seal(blaze_code::record::RecordError::TooLarge { what: "LTO C symbol name" }),
+            })?;
+            c_text.extend_from_slice(s.as_bytes());
+            Ok((start, len))
+        };
+        let mut lir_funcs: blaze_own::Vec<BuiltCallee, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(funcs.len(), out_alloc);
+        for &callee in funcs.iter() {
+            match callee {
+                Callee::Symbol(s) => lir_funcs.push(BuiltCallee::Symbol(s)),
+                Callee::C(cname) => {
+                    let (start, len) = push_c(cname)?;
+                    lir_funcs.push(BuiltCallee::C { start, len });
+                }
+            }
+        }
+        let mut lir_c_statics: blaze_own::Vec<BuiltForeignStatic, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(c_statics.len(), out_alloc);
+        for cs in c_statics.iter() {
+            let (start, len) = push_c(cs.name)?;
+            lir_c_statics.push(BuiltForeignStatic { item: cs.item, start, len, weak: cs.weak });
+        }
+        let mut lir_statics: blaze_own::Vec<ItemKey, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(built.statics.len(), out_alloc);
+        lir_statics.extend_from_slice(built.statics);
+        let mut lir_vtables: blaze_own::Vec<blaze_code::record::Symbol, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(vtables.len(), out_alloc);
+        lir_vtables.extend_from_slice(vtables.as_slice());
+        let mut lir_vtable_data: blaze_own::Vec<(blaze_code::record::Symbol, blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>), blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(vtable_data.len(), out_alloc);
+        for (vsym, bytes) in vtable_data.iter() {
+            let mut copied: blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(bytes.len(), out_alloc);
+            copied.extend_from_slice(bytes.as_slice());
+            lir_vtable_data.push((*vsym, copied));
+        }
+        let mut lir_tls: blaze_own::Vec<ItemKey, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(built.thread_locals.len(), out_alloc);
+        lir_tls.extend_from_slice(built.thread_locals);
+        let mut lir_traps: blaze_own::Vec<blaze_code::record::TrapSource, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(built.traps.len(), out_alloc);
+        lir_traps.extend_from_slice(built.traps);
+        Ok(BuiltLir {
+            func: built.func.view().to_func_in(out_alloc),
+            funcs: lir_funcs,
+            statics: lir_statics,
+            c_statics: lir_c_statics,
+            vtables: lir_vtables,
+            vtable_data: lir_vtable_data,
+            tls: lir_tls,
+            traps: lir_traps,
+            c_text,
+        })
+    };
     match sink {
         BuildSink::Lir { alloc, out, declared } => {
             let out_alloc = *alloc;
@@ -2954,8 +3039,33 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
             let _ = built_slot.take();
             return Ok(Phase2::Done);
         }
-        BuildSink::Entry(entry) => {
+        BuildSink::Entry { entry, lir_capture } => {
             use blaze_core::wait::Clock as _;
+            // Capture pre-LTO `BLZLIR02` BEFORE `bound.bind(&mut funcs)` appends soft-float
+            // routines, producing byte-identical bytes to `build_lir_with_reach_in` (Rule 25).
+            if let Some(cap) = lir_capture.as_mut() {
+                let attrs = built.func.view().head.attrs;
+                let is_noreturn = (attrs & blaze_lir::func::FnAttrs::NORETURN) != 0;
+                if !is_noreturn
+                    && let Ok(mut owned) = build_owned_lir(cap.shared)
+                {
+                    let mut decl_rows: blaze_own::Vec<(ItemKey, blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>), blaze_own::SharedAlloc<'static>> =
+                        blaze_own::Vec::with_capacity_in(reach.rows.len(), cap.shared);
+                    for n in 0..reach.rows.len() {
+                        let (decl_tabled, decl_name) = reach.row(n);
+                        let mut copied = blaze_own::Vec::with_capacity_in(decl_name.len(), cap.shared);
+                        copied.extend_from_slice(decl_name);
+                        decl_rows.push((decl_tabled, copied));
+                    }
+                    *cap.out = export_lto::prepare_and_encode_built_lir(
+                        &mut owned,
+                        decl_rows.as_slice(),
+                        cap.machine,
+                        fn_alloc,
+                        cap.shared,
+                    );
+                }
+            }
             let routines = if func_needs_soft_float(&built.func.view()) {
                 let bound = get_or_init_routines(&work.routines, program, &work.ground, work.alloc).map_err(|_| RunError::OneBody {
                     key: instance.item,
@@ -4051,6 +4161,13 @@ pub struct Maker<'n, G: Grant = Fixture, T: Typing<RecordsProgram<'n>> = SecondC
     /// How its builds record their read lists ([`Maker::plant_reads`]): `ReadPlant::None` but
     /// in the planted control.
     plant: ReadPlant,
+    /// Optional side-car `BLZLIR02` capture target for cold `--release` export walks.
+    lto_lir_capture: Option<(blaze_tier::Machine, blaze_own::SharedAlloc<'static>)>,
+    /// Most recently captured encoded `BLZLIR02` payload from [`Self::make_over`].
+    captured_lir: Option<blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>>,
+    /// Cached `compiler_builtins` soft-float routine bindings usable even before `self.made` is
+    /// constructed (e.g. warm export LTO runs with 100% `HomeCodeStore` hits).
+    routines: core::cell::OnceCell<crate::front2::builtins_shim::Bound>,
 }
 
 impl<'n> Maker<'n, Fixture, SecondCheck> {
@@ -4183,7 +4300,21 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             checks: CheckCount::default(),
             watch,
             plant: ReadPlant::None,
+            lto_lir_capture: None,
+            captured_lir: None,
+            routines: core::cell::OnceCell::new(),
         }
+    }
+
+    /// Enables side-car `BLZLIR02` capture during `Order::make` for cold `--release` export walks
+    /// so subsequent whole-program export LTO avoids re-lowering MIR -> LIR.
+    pub fn enable_lto_lir_capture(&mut self, machine: blaze_tier::Machine, shared: blaze_own::SharedAlloc<'static>) {
+        self.lto_lir_capture = Some((machine, shared));
+    }
+
+    /// Takes the most recently captured `BLZLIR02` bytes produced during `Order::make`, if any.
+    pub fn take_captured_lir(&mut self) -> Option<blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>> {
+        self.captured_lir.take()
     }
 
     /// The read-list tests' planted bug (code_reads.rs `ReadPlant`, rule 23): every later build
@@ -4332,11 +4463,17 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
 
     /// The program made on the first call, then the one instance.
     fn make_over(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        self.captured_lir = None;
         self.construct(tabled)?;
         let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::make`)" });
         };
-        make_instance(program, &mut self.typing, state, &mut self.checks, tabled, name, entry)?;
+        let lir_capture = self.lto_lir_capture.map(|(machine, shared)| EntryLirCapture {
+            machine,
+            shared,
+            out: &mut self.captured_lir,
+        });
+        make_instance_capturing(program, &mut self.typing, state, &mut self.checks, tabled, name, entry, lir_capture)?;
         if let (Some(watch), Some(sizes)) = (self.watch, state.report_if_large_or_slow()) {
             (watch.report)(sizes);
         }
@@ -4410,15 +4547,24 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
 
     /// Initializes the `compiler_builtins` soft-float routine table once on the calling thread and
     /// returns a `Copy + Send + Sync` [`BoundRef`] for parallel export LTO workers.
+    ///
+    /// Resolves directly from `self.names.records` + `self.names.lang_crates` even when
+    /// `self.made` is still `None` (warm builds with 100% `HomeCodeStore` hits) so `BLZOLT01`
+    /// Merkle keys are identical across cold and warm runs and `f128` legalization works on
+    /// partial rebuilds without constructing `RecordsProgram`.
     pub fn prepare_routines(&self) -> Result<Option<crate::front2::builtins_shim::BoundRef<'_>>, CodeRecordError> {
-        match self.made.as_ref() {
-            Some((program, state)) => {
-                let bound = get_or_init_routines(&state.core.work.routines, program, &state.core.work.ground, state.core.work.alloc)
-                    .map_err(CodeRecordError::Symbol)?;
-                Ok(Some(bound.as_ref()))
-            }
-            None => Ok(None),
+        if let Some(bound) = self.routines.get() {
+            return Ok(Some(bound.as_ref()));
         }
+        let found = match self.made.as_ref() {
+            Some((program, _)) => program.soft_float_routines(self.alloc),
+            None => crate::front2::builtins_shim::find(self.names.records, self.names.lang_crates, self.alloc),
+        };
+        let ground = PortableTys::new_in(self.alloc);
+        let bound = crate::front2::builtins_shim::Bound::new(found, &ground, self.alloc)
+            .map_err(CodeRecordError::Symbol)?;
+        let _ = self.routines.set(bound);
+        Ok(self.routines.get().map(crate::front2::builtins_shim::Bound::as_ref))
     }
 
     /// Binds compiler_builtins soft-float routines onto `funcs` (after all original + LTO-imported
