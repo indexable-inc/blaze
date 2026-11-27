@@ -194,6 +194,8 @@ fn recursion_limit_accepts_comments_escapes_and_raw_strings() {
         "#![recursion_limit = \"25\\\n    6\"]",
         "#![recursion_limit = r#\"256\"#]",
         "#![recursion_limit = r\"256\"]",
+        "#![recursion_limit = \"+256\"]",
+        "#![recursion_limit = \"\\x2b256\"]",
     ];
     for attr in valid_attrs {
         let root = format!("#![no_core]\n{attr}\npub struct S;\n");
@@ -244,12 +246,36 @@ fn large_recursion_limit_above_4096_is_preserved() {
 }
 
 #[test]
+fn duplicate_recursion_limit_preserves_first_valid_and_rejects_malformed() {
+    // rustc keeps the first active valid `#![recursion_limit]` when duplicated.
+    let peel = quick_peel_body(135);
+    let dup_valid = format!("#![no_core]\n#![recursion_limit = \"256\"]\n#![recursion_limit = \"64\"]\n{peel}");
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let files = [("/k/lib.rs", dup_valid.as_str())];
+    let names = solve_one(&files, erased.bump());
+    assert_eq!(names.root_attrs.recursion_limit, 256, "first valid recursion_limit must win");
+    assert_eq!(names.crate_root.head.recursion_limit, 256);
+    assert_eq!(recursion_limit_errors(names), 0, "depth-135 chain must use first limit 256, not 64");
+
+    // A malformed duplicate after a valid attribute is still rejected with a typed error.
+    let valid_then_bad = "#![no_core]\n#![recursion_limit = \"256\"]\n#![recursion_limit = \"abc\"]\npub struct S;\n";
+    let frame_bad = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased_bad = blaze_own::Erased::new(&frame_bad);
+    let files_bad = [("/k/lib.rs", valid_then_bad)];
+    let err = try_solve_one(&files_bad, erased_bad.bump()).expect_err("valid + malformed duplicate must fail");
+    assert!(matches!(err, (0, CrateScopeError::Names(NamesError::InvalidRecursionLimit { krate: "k", .. }))));
+}
+
+#[test]
 fn malformed_recursion_limit_is_rejected_with_typed_error() {
     let invalids = [
         "#![recursion_limit = \"abc\"]",
         "#![recursion_limit = \"\"]",
         "#![recursion_limit = \"-5\"]",
-        "#![recursion_limit = \"+256\"]",
+        "#![recursion_limit = \"+\"]",
+        "#![recursion_limit = \"++256\"]",
+        "#![recursion_limit = \"+ 256\"]",
         "#![recursion_limit = \"256 \"]",
         "#![recursion_limit = \"1_024\"]",
         "#![recursion_limit = true]",
@@ -323,4 +349,60 @@ fn zero_recursion_limit_rejects_macros_but_preserves_lexical_block_depth() {
         NESTING,
         "all {NESTING} nested block-local impls must be recorded"
     );
+}
+
+#[test]
+fn lowering_depth_propagates_u32_past_u16_max() {
+    use blaze_id::{ContentId, CrateItemKey, ItemKey};
+    use blaze_surface::Edition;
+
+    use crate::task::{AttrOrder, Cfg, Fragment, FragmentTokens, LowerCx, ProcDecls, Tree, Where, lower_in_out};
+
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let bump = erased.bump();
+    let alloc = bump.alloc();
+    let text = "m!(); fn f() { struct S; impl S {} }\n";
+    let outline = blaze_file_items::outline(text, Edition::E2021, alloc);
+    let krate = CrateItemKey(ContentId([1; 32]));
+    let module = ItemKey(ContentId([2; 32]));
+    let cfg = Cfg::from_atoms(&[], alloc);
+    let tree = Tree {
+        modules: blaze_own::AVec::new_in(alloc),
+        by_key: blaze_hash::HashMap::new_in(alloc),
+        notes: blaze_own::AVec::new_in(alloc),
+        missing: blaze_own::AVec::new_in(alloc),
+    };
+    let cx = LowerCx {
+        krate,
+        tools: &[],
+        edition: Edition::E2021,
+        cfg: &cfg,
+        walked: &tree,
+        procs: ProcDecls::Text,
+        entry: false,
+        harness: false,
+        order: AttrOrder::Written,
+    };
+    let depth: u32 = u32::from(u16::MAX) + 5;
+    let fragment = Fragment {
+        marks: None,
+        tokens: FragmentTokens::None,
+        module,
+        owner: module,
+        text,
+        outline: &outline,
+        items: None,
+        at: Where::File(0),
+        depth,
+        made: false,
+        members_of: None,
+        written: "/k/lib.rs",
+        kept: None,
+    };
+    let lowered = lower_in_out(cx, fragment, alloc, alloc, bump);
+    assert_eq!(lowered.calls.len(), 1);
+    assert_eq!(lowered.calls[0].1.depth, depth, "CallSrc::depth must preserve u32 depth >= 65536");
+    assert_eq!(lowered.bodies.len(), 1);
+    assert_eq!(lowered.bodies[0].depth, depth, "BodySrc::depth must preserve u32 depth >= 65536");
 }

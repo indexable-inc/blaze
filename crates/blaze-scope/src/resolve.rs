@@ -3676,7 +3676,7 @@ impl<'r, 'a, 'rp, 'p: 'a, S: SourceTexts<'a>> FillCx<'r, 'a, 'rp, 'p, S> {
                             synthetic_blocks: &synthetic_blocks,
                         };
                         let mut work = |s: Alloc<'_>| {
-                            make_modules(self.base, self.run, src.module, &mods, place, src.depth + 1, &mut bodies, s);
+                            make_modules(self.base, self.run, src.module, &mods, place, src.depth.saturating_add(1), &mut bodies, s);
                         };
                         if (self.scratch)(&mut work) == crate::task::Scratch::Kept {
                             work(home);
@@ -4124,7 +4124,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         outline: &made.outline,
         items: None,
         at: Where::Expansion(src.loc),
-        depth: src.depth + 1,
+        depth: src.depth.saturating_add(1),
         made: false,
         members_of: src.owner,
         written: src.written,
@@ -5331,7 +5331,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
         outline: &made.outline,
         items: None,
         at: Where::Expansion(src.loc),
-        depth: src.depth + 1,
+        depth: src.depth.saturating_add(1),
         made: false,
         members_of: src.owner,
         written,
@@ -5377,7 +5377,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
             tokens: FragmentTokens::LazyDeferBody(&get_tokens),
             synthetic_blocks: &synthetic_blocks,
         };
-        make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
+        make_modules(base, run, src.module, &mods, place, src.depth.saturating_add(1), &mut bodies, alloc);
     }
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(home));
     part(ExpandPart::Tables, mac.name, 0);
@@ -5465,7 +5465,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         outline: &made.outline,
         items: None,
         at: Where::Expansion(src.loc),
-        depth: src.depth + 1,
+        depth: src.depth.saturating_add(1),
         made: false,
         members_of: src.owner,
         written: src.written,
@@ -5493,7 +5493,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
     let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks: None, tokens: FragmentTokens::from_option(kept_tokens), synthetic_blocks: &[] };
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
-    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
+    make_modules(base, run, src.module, &mods, place, src.depth.saturating_add(1), &mut bodies, alloc);
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
     // The harness declares no name: rustc writes `_DECLS` def-site, so no path of the crate
     // reaches it. Its text, key and body are the call's (`add_lowered` below), named by its
@@ -5565,7 +5565,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             .recursion_limit
             .max(u32::from(crate::RECURSION_LIMIT))
             .saturating_add(u32::from(BLOCK_DEPTH_SLACK));
-        if u32::from(body.depth) >= max_block_depth {
+        if body.depth >= max_block_depth {
             run.note(NamesNote::Made { name: crate::blocks::BLOCK_MODULE, at: body.loc, note: MadeNote::TooMany });
             continue;
         }
@@ -5629,7 +5629,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             outline: &made.outline,
             items: None,
             at: Where::Expansion(body.loc),
-            depth: body.depth + 1,
+            depth: body.depth.saturating_add(1),
             made: false,
             members_of: None,
             written: body.written,
@@ -5646,7 +5646,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
                 places.insert(m.key, body.place);
             }
         }
-        make_modules(base, run, body.module, &mods, place, body.depth + 1, &mut work, scratch);
+        make_modules(base, run, body.module, &mods, place, body.depth.saturating_add(1), &mut work, scratch);
         // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
         out.decls = DeclsBuilder::new_in(alloc);
         add_lowered(run, call, At::Expansion(call), out);
@@ -5985,7 +5985,7 @@ fn make_modules<'c, 'a, S: SourceTexts<'a>>(
     parent: ItemKey,
     mods: &[ModMade<'a>],
     made: Made<'c, 'a>,
-    depth: u16,
+    depth: u32,
     // The bodies lowered in the made modules that may write an impl in a block, added.
     bodies: &mut AVec<'_, crate::task::BodySrc<'a>>,
     scratch: Alloc<'_>,
