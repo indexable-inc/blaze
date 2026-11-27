@@ -1055,12 +1055,39 @@ fn inert_attribute(attr: &str) -> bool {
     INERT.contains(&path) || ["rustfmt::", "clippy::", "diagnostic::", "rustc_"].iter().any(|tool| path.starts_with(tool))
 }
 
+/// Whether `item` is a macro call written directly inside an `impl` or `trait` block (which itself
+/// stands in modules only): its `BodyCheck` covers the methods/consts that macro call writes into
+/// the container (`body_types/covered.rs` `written_by`), while the container's `Signature` still
+/// owns their heads (`signature.rs` `covering_entry`).
+fn is_member_macro_call(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item) -> bool {
+    if item.kind() != ItemKind::MacroCall {
+        return false;
+    }
+    let Some(parent) = item.parent else { return false };
+    let up = outline.item(parent);
+    if !matches!(up.kind(), ItemKind::Impl | ItemKind::Trait) {
+        return false;
+    }
+    let mut anc = up.parent;
+    while let Some(at) = anc {
+        let cur = outline.item(at);
+        if cur.kind() != ItemKind::Module {
+            return false;
+        }
+        anc = cur.parent;
+    }
+    true
+}
+
 /// Whether `item` is an entry with no body of its own whose `BodyCheck` covers the bodies
 /// its expansions write (D122: a macro-written item's place is its expansion's): a
-/// module-level macro call, or an item a derive or an attribute takes ([`may_expand`]),
-/// where its `Signature` covers the heads they write (signature.rs `is_signature_entry`).
+/// module-level macro call, a macro call directly inside a module-level `impl` or `trait` block,
+/// or an item a derive or an attribute takes ([`may_expand`]), where its `Signature` (or its
+/// container's `Signature`) covers the heads they write (signature.rs `is_signature_entry`).
 pub(crate) fn expansion_entry(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> bool {
-    checked_body(outline, item).is_none() && crate::signature::is_signature_entry(outline, item) && may_expand(outline, item, text)
+    checked_body(outline, item).is_none()
+        && (crate::signature::is_signature_entry(outline, item) || is_member_macro_call(outline, item))
+        && may_expand(outline, item, text)
 }
 
 /// [`expansion_entry`] over an already-serialized [`blaze_surface::FileItemsView`].
@@ -1077,8 +1104,8 @@ pub(crate) fn expansion_entry_view(view: blaze_surface::FileItemsView<'_>, item:
     };
     let is_sig = if let Some(parent) = item.parent
         && let Some(up) = view.item(parent)
-        && item.kind() == ItemKind::Function
-        && up.item.kind() == ItemKind::Impl
+        && ((item.kind() == ItemKind::Function && up.item.kind() == ItemKind::Impl)
+            || (item.kind() == ItemKind::MacroCall && matches!(up.item.kind(), ItemKind::Impl | ItemKind::Trait)))
     {
         in_modules_only(up.item.parent)
     } else {

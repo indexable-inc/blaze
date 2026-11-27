@@ -153,11 +153,35 @@ fn file_notes(notes: &[std::string::String]) -> std::vec::Vec<&std::string::Stri
     notes.iter().filter(|note| note.contains(FILE_NOTE)).collect()
 }
 
+/// Like [`said`], but with `shown.verbose = true` so cfg-excluded per-file plan notes print.
+fn said_verbose(io: &Io, fresh: bool) -> (std::vec::Vec<std::string::String>, engine_check::Checked) {
+    let before = stdout(io).len();
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
+    let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
+    let out = io.need_out().expect("out");
+    let err = io.need_err().expect("err");
+    let mut phases = boxed(|| Phases::new(io.need_clock().expect("a clock")));
+    let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, View::Person, "/ws", cx.frame());
+    shown.verbose = true;
+    let fs = io.need_fs().expect("files");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let args = io.args();
+    let net = io.net();
+    let checked = engine_check::check(&cx, &fs, &host, &mut rng, args.as_ref(), net.as_ref(), &root, opts(io, 2, fresh), &mut shown, &mut phases, &out, &err)
+        .unwrap_or_else(|error| panic!("verbose engine-check (fresh {fresh}) answers: {error:?}"));
+    let text = stdout(io).split_off(before);
+    let mut lines: std::vec::Vec<std::string::String> = text.lines().map(str::to_owned).collect();
+    lines.pop();
+    (lines, checked)
+}
+
 /// NO UNIT'S BODY IS REFUSED, EACH ROW ONCE: on the fixture, no body is refused (neither class,
-/// no body named ``), `src/gated.rs` is said once as a file no unit holds, the profile counts it
+/// no body named ``), `src/gated.rs` is recorded once as a file no unit holds (silent by default,
+/// printed once under `--verbose` without leaking `(engine_body_plan.rs)`), the profile counts it
 /// and the view rows checked, every Bodies task planned is entered once (a row a body and unit
 /// that reaches it, D191); with nothing changed the request is CERTIFIED and says the note again
-/// from the lines record; after an edit elsewhere the kept note is a fresh run's.
+/// from the lines record under `--verbose`; after an edit elsewhere the kept note is a fresh run's.
 /// CONTROL: before RP1 the same fixture gave the lib's "lists no file" refusal for each body of
 /// `src/tests.rs` and `src/gated.rs`, and "no body ... at this entry" for `inline`.
 #[test]
@@ -175,7 +199,8 @@ fn engine_unit_files_refuse_nothing_and_check_each_body_once() {
     assert_eq!(gated.len(), 1, "one note for the one file no unit holds: {notes:#?}");
     assert!(gated[0].contains("src/gated.rs"), "it names the file: {}", gated[0]);
     assert!(gated[0].contains("by the `mod` in `src/lib.rs`"), "it names the file whose `mod` is cut: {}", gated[0]);
-    assert_eq!(first.iter().filter(|line| line.contains(FILE_NOTE)).count(), 1, "printed once:\n{}", first.join("\n"));
+    assert!(!gated[0].contains("engine_body_plan.rs"), "never leak internal source file names in user notes: {}", gated[0]);
+    assert_eq!(first.iter().filter(|line| line.contains(FILE_NOTE)).count(), 0, "silent by default (non-verbose):\n{}", first.join("\n"));
     assert!(error_lines(&first.join("\n")).is_empty(), "no error: orphan.rs is no module's:\n{}", first.join("\n"));
     // No row with findings lacks its block: the head task of `gated.rs`'s `g` was one (a refused,
     // failed row no printer writes) before it became no unit's (engine_heads.rs `run_items`).
@@ -192,19 +217,23 @@ fn engine_unit_files_refuse_nothing_and_check_each_body_once() {
     // at its view, counted (D191).
     assert!(!line.contains("view rows 0 checked"), "the rows the test unit checks at its view are counted: {line}");
 
-    // Nothing changed: CERTIFIED (the note is no row's finding), the same note from the lines record.
+    // Nothing changed: CERTIFIED (the note is no row's finding), stays silent in default mode,
+    // and replays the note once from the stored lines record under `--verbose`.
     let (_, again, certificate) = said(&io, false);
     assert!(certificate.certified && certificate.entered == 0, "nothing changed: certified, nothing entered; {}", entries(&certificate));
-    assert_eq!(again, first, "the note is said again from the stored lines");
-    assert_eq!(again.iter().filter(|line| line.contains(FILE_NOTE)).count(), 1, "once");
+    assert_eq!(again, first, "default mode stays silent on certificate replay");
+    let (verbose_cert, cert_v) = said_verbose(&io, false);
+    assert!(cert_v.certified && cert_v.entered == 0, "verbose rerun on unchanged tree is certified; {}", entries(&cert_v));
+    assert_eq!(verbose_cert.iter().filter(|line| line.contains(FILE_NOTE)).count(), 1, "printed once under --verbose:\n{}", verbose_cert.join("\n"));
+    assert!(!verbose_cert.iter().any(|line| line.contains("engine_body_plan.rs")), "never leak internal source file names:\n{}", verbose_cert.join("\n"));
 
     // An edit elsewhere (a comment in other/place.rs): the gated file's rows stand, its note is
-    // kept from the last lines record, as a fresh run says it.
+    // kept from the last lines record, as a fresh verbose run says it.
     write(&io, "src/other/place.rs", "// moved\npub fn here() -> u8 {\n    1\n}\n");
-    let (_, kept, _) = said(&io, false);
-    let (_, fresh, _) = said(&io, true);
+    let (kept, _) = said_verbose(&io, false);
+    let (fresh, _) = said_verbose(&io, true);
     let notes_of = |lines: &[std::string::String]| lines.iter().filter(|line| line.contains(FILE_NOTE)).cloned().collect::<std::vec::Vec<_>>();
-    assert_eq!(notes_of(&kept), notes_of(&fresh), "an incremental request says the note a fresh one says");
+    assert_eq!(notes_of(&kept), notes_of(&fresh), "an incremental verbose request says the note a fresh one says");
     assert_eq!(notes_of(&kept).len(), 1, "once");
 }
 
@@ -624,9 +653,13 @@ fn engine_unit_files_a_file_named_twice_is_checked_by_each_holder() {
     let notes = file_notes(&cut_checked.bodies.0);
     assert_eq!(notes.len(), 1, "CONTROL: one note for the one file: {notes:#?}");
     assert!(notes[0].contains("`a/src/config/mod.rs`") && notes[0].contains("the `mod` in `a/src/lib.rs`") && notes[0].contains("the `mod` in `p/src/lib.rs`"), "CONTROL: it names the file and both `mod`s: {}", notes[0]);
-    assert_eq!(cut_lines.iter().filter(|line| line.contains(FILE_NOTE)).count(), 1, "CONTROL: printed once:\n{cut_text}");
+    assert!(!notes[0].contains("engine_body_plan.rs"), "CONTROL: no internal source leak: {}", notes[0]);
+    assert_eq!(cut_lines.iter().filter(|line| line.contains(FILE_NOTE)).count(), 0, "CONTROL: silent by default:\n{cut_text}");
     assert!(error_lines(&cut_text).is_empty(), "CONTROL: nothing checked, no error:\n{cut_text}");
     assert!(profile(&cut).contains("; 1 file(s) no unit holds"), "CONTROL: the profile counts the one file");
+    let (cut_verbose, cut_v_cert) = said_verbose(&cut, false);
+    assert!(cut_v_cert.certified && cut_v_cert.entered == 0, "CONTROL: verbose rerun is certified");
+    assert_eq!(cut_verbose.iter().filter(|line| line.contains(FILE_NOTE)).count(), 1, "CONTROL: printed once under --verbose:\n{}", cut_verbose.join("\n"));
 
     let half = Io::simulated(SimWorld::new(11, Limits::USUAL));
     named_twice(&half, A_SLOT, &format!("{GATED}{P_PATH}"));

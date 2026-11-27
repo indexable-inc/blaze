@@ -405,6 +405,9 @@ struct Flags<'a> {
     /// `--each`: every consequence finding (a task waiting on a failed one, an item not
     /// checked) drawn one by one as well as counted under its cause (print.rs `Shown::each`).
     each: bool,
+    /// `--verbose` / `-v`: print verbose diagnostic notes (including per-file notes for
+    /// cfg-excluded modules, `engine_body_plan.rs`).
+    verbose: bool,
     origin: Option<&'a str>,
     origin_key: Option<&'a str>,
     /// `--grant name=value`, each a capability the program is given (run.md).
@@ -453,6 +456,7 @@ impl<'a> Flags<'a> {
             color: Choice::Auto,
             stats: false,
             each: false,
+            verbose: false,
             origin: None,
             origin_key: None,
             grants: std::vec::Vec::new(),
@@ -584,6 +588,9 @@ pub(crate) fn parse_flags_in<'a>(args: &'a Args, frame: &Frame, mut package: imp
     }
     if parsed.has("each") {
         flags.each = true;
+    }
+    if parsed.has("verbose") {
+        flags.verbose = true;
     }
     if parsed.has("open") {
         flags.open = blaze_run::viewer::OpenExplore::Open;

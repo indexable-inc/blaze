@@ -192,8 +192,11 @@ pub(crate) enum Class {
     /// prints a `BORROWS_NOT_CHECKED` note (print.rs `finding`): one by one under `--each`, or
     /// always once the borrow check is trusted (`BORROWS_ARE_ERRORS`); counted always.
     Borrows = 5,
-    // 6 was `Under`, a body not checked under a shared cause: a noted finding of a
-    // `Kind::Grouped` rule now (module docs, D164), grouped by blaze_report::query.
+    /// A file no unit of its crate holds under its cfg (engine_body_plan.rs `Outside::lines`):
+    /// kept in the lines record and counted in the profile; silent by default so normal cfg-gated
+    /// modules do not spam `blaze check`/`blaze run`, and printed under `--verbose` / `-v` or
+    /// `--each`.
+    Outside = 6,
 }
 
 impl Class {
@@ -205,6 +208,7 @@ impl Class {
             3 => Some(Class::Head),
             4 => Some(Class::Told),
             5 => Some(Class::Borrows),
+            6 => Some(Class::Outside),
             _ => None,
         }
     }
@@ -593,12 +597,13 @@ impl<'m> Last<'m, '_> {
     }
 }
 
-/// Whether `block` holds a [`Class::Told`] note (engine_check.rs `ready_setup`: a target its
-/// features skip has its note in the last record, which the ready path carries).
+/// Whether `block` holds a [`Class::Told`] or [`Class::Outside`] plan note (engine_check.rs
+/// `ready_setup` and `has_outside_notes`: a target its features skip or a cfg-excluded file has
+/// its note in the last record, which the ready path carries).
 pub(crate) fn has_told(block: &[u8]) -> Result<bool, LinesError> {
     let mut reader = Reader { bytes: block, at: 0 };
     while reader.at < block.len() {
-        if let Entry::Note { class: Class::Told, .. } = entry(&mut reader)? {
+        if let Entry::Note { class: Class::Told | Class::Outside, .. } = entry(&mut reader)? {
             return Ok(true);
         }
     }
@@ -1277,6 +1282,11 @@ fn print_with<'f, 'b, O: print::RenderOutput, F: Files<'f, O>, VF: ViewFold>(
                         // Printed grouped by reason (engine_head_notes.rs `print_grouped`).
                         Class::Head => tally.heads += 1,
                         Class::Told => print::note(cx, words, shown, frame, out)?,
+                        Class::Outside => {
+                            if shown.verbose || shown.each {
+                                print::note(cx, words, shown, frame, out)?;
+                            }
+                        }
                         // As the old path's `BORROWS_NOT_CHECKED` (print.rs `finding`): counted;
                         // drawn under `--each`, or always once borrows are errors.
                         Class::Borrows => {

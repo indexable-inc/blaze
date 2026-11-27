@@ -127,6 +127,11 @@ pub enum BodySource {
 /// (rule 3: never a quiet check in its place).
 pub trait KeptBodies {
     fn source(&mut self, key: ItemKey) -> Result<BodySource, TypedGap>;
+
+    /// Called right after `ByKind::check_one` checks a body on a [`BodySource::Run`] miss, so
+    /// implementations may persist deterministic checked records for dependency and toolchain
+    /// bodies into the content-addressed store (rule 51).
+    fn keep_checked(&mut self, _key: ItemKey, _kind: RunChecked, _checked: &Checked<'static>) {}
 }
 
 /// Whether checker key `key` is a fn declared in a body: the inner bit of its library key
