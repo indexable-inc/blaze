@@ -346,8 +346,22 @@ impl<'l, 'a> Resolution<'l, 'a> {
         }
     }
 
-    /// The locked package dependency entry `e` of `id` names.
+    /// The locked package dependency entry `e` of `id` names. A `path` dependency outside the
+    /// layout's folder ([`DepSource::OutsideAnchor`]) whose entry nothing answered is
+    /// [`UnitError::PathOutsideAnchor`]: no source can answer it, so it is never asked for.
     fn locked(&self, id: LockId, package: &Package<'a>, e: usize) -> Result<LockId, UnitError<'a>> {
+        let child = self.locked_entry(id, package, e)?;
+        let dep = &package.deps[e];
+        if let DepSource::OutsideAnchor { path } = &dep.source
+            && matches!(self.answers.get(child.index()), Some(Answer::Pending))
+        {
+            return Err(UnitError::PathOutsideAnchor { package: package.name.clone(), dep: dep.key.clone(), path: path.clone() });
+        }
+        Ok(child)
+    }
+
+    /// The lock entry dependency entry `e` of `id` names, by name, then by source and requirement.
+    fn locked_entry(&self, id: LockId, package: &Package<'a>, e: usize) -> Result<LockId, UnitError<'a>> {
         if let Some(fast) = self.cached_locked.get(id.index()).and_then(|deps| deps.get(e)).copied()
             && fast != u32::MAX
         {
@@ -365,7 +379,7 @@ impl<'l, 'a> Resolution<'l, 'a> {
         if count > 1 {
             // Several of the name: by the kind of source, then by the requirement.
             let kind_fits = |d: LockId, allow_patched_path: bool| match (&dep.source, &self.lock.package(d).source) {
-                (DepSource::Path, source) => core::mem::discriminant(source) == core::mem::discriminant(&me.source),
+                (DepSource::Path | DepSource::OutsideAnchor { .. }, source) => core::mem::discriminant(source) == core::mem::discriminant(&me.source),
                 (DepSource::Registry { .. }, LockSource::Registry { .. }) => true,
                 (DepSource::Registry { .. } | DepSource::Git { .. }, LockSource::Path) => allow_patched_path,
                 (DepSource::Git { url }, LockSource::Git { url: locked, .. }) => url.trim_end_matches(".git") == locked.trim_end_matches(".git"),

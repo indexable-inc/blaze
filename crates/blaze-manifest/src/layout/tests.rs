@@ -410,6 +410,90 @@ missing-dev = { path = \"../../../does-not-exist\" }
     assert!(without.path_packages.is_empty());
 }
 
+/// A workspace of its own nested in another (`crates/shell`, as `crates/blaze-shell` is in
+/// blaze's tree), whose dependencies are `path = "../x"`: cargo finds a path package by the
+/// `path` of the line naming it, from that manifest's folder. Read from an anchor above both
+/// workspaces, `../bgit` (named by the member's manifest) is a path package at `crates/bgit`,
+/// and `b64` (named by bgit's `b64.workspace = true`, the outer root's `crates/b64`) is one
+/// found through bgit's own manifest and its own workspace's inheritance; both anchor-relative
+/// like the member. CONTROL: the same workspace read with the anchor at its own folder (what
+/// `blaze check` in `crates/blaze-shell` does today) leaves `../bgit` as `Source::Outside` and
+/// finds no path package: the anchor is the cause.
+#[test]
+fn path_packages_of_a_nested_workspace_found_through_manifests() {
+    const OUTER: &str = "\
+[workspace]
+members = [\"crates/*\"]
+exclude = [\"crates/shell\"]
+
+[workspace.package]
+version = \"0.0.7\"
+edition = \"2024\"
+
+[workspace.dependencies]
+b64 = { path = \"crates/b64\" }
+";
+    const SHELL: &str = "\
+[workspace]
+
+[package]
+name = \"shell\"
+version = \"0.0.0\"
+edition = \"2024\"
+
+[dependencies]
+bgit = { path = \"../bgit\" }
+";
+    const BGIT: &str = "\
+[package]
+name = \"bgit\"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+b64.workspace = true
+";
+    const B64: &str = "[package]\nname = \"b64\"\nversion.workspace = true\nedition.workspace = true\n";
+    let tree = Tree {
+        files: &[
+            ("Cargo.toml", OUTER),
+            ("crates/shell/Cargo.toml", SHELL),
+            ("crates/shell/src/lib.rs", ""),
+            ("crates/bgit/Cargo.toml", BGIT),
+            ("crates/bgit/src/lib.rs", ""),
+            ("crates/b64/Cargo.toml", B64),
+            ("crates/b64/src/lib.rs", ""),
+        ],
+    };
+    let (units, _) = tree.read_opts("crates/shell", true, true).expect("the nested workspace with its path packages");
+    assert_eq!(units.manifests[units.root.0 as usize].as_str(), "crates/shell/Cargo.toml", "the nested workspace is its own root");
+    let members: std::vec::Vec<&str> = units.members.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(members, ["shell"], "a path package outside the root's folder is no member");
+    match &units.members[0].dependencies[0].source {
+        Source::Path(dir) => assert_eq!(dir.as_str(), "crates/bgit"),
+        _ => panic!("`../bgit` from crates/shell is the path package at crates/bgit"),
+    }
+    let found: std::vec::Vec<(&str, &str, Option<&str>)> =
+        units.path_packages.iter().map(|p| (p.dir.as_str(), p.name.as_str(), p.version.as_ref().map(|v| v.as_str()))).collect();
+    std::println!("path packages: {found:?}");
+    assert_eq!(found, [("crates/b64", "b64", Some("0.0.7")), ("crates/bgit", "bgit", Some("0.0.7"))], "bgit by shell's manifest, b64 through bgit's");
+    let bgit = units.path_packages.iter().find(|p| p.name.as_str() == "bgit").expect("bgit");
+    assert_eq!(bgit.lib.as_ref().map(|lib| lib.root.as_str()), Some("crates/bgit/src/lib.rs"), "anchor-relative, like a member's");
+    match &bgit.dependencies[0].source {
+        Source::Path(dir) => assert_eq!(dir.as_str(), "crates/b64", "inherited from bgit's own workspace root, not shell's"),
+        _ => panic!("bgit's `b64.workspace = true` is the outer root's path package"),
+    }
+
+    // CONTROL: the anchor at the nested workspace's own folder.
+    let own = Tree { files: &[("Cargo.toml", SHELL), ("src/lib.rs", "")] };
+    let (units, _) = own.read_opts("", true, true).expect("the nested workspace alone");
+    match &units.members[0].dependencies[0].source {
+        Source::Outside(path) => assert_eq!(path.as_str(), "../bgit"),
+        _ => panic!("`../bgit` leaves an anchor at crates/shell"),
+    }
+    assert!(units.path_packages.is_empty(), "a path package was found outside the anchor");
+}
+
 #[test]
 fn unused_patch_with_missing_transitive_path_dep_does_not_fail_layout() {
     const ROOT_TOML: &str = r#"[workspace]

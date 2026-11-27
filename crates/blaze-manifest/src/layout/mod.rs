@@ -161,7 +161,10 @@ pub enum Source<'a> {
     Git { url: Text<'a>, reference: GitRef<'a> },
     /// A path dependency whose directory is absolute or leaves the anchor: the path as
     /// written (relative to the manifest's directory, or for an inherited one the root's). The
-    /// reader asks for nothing there and it is never a member; the caller decides what it is.
+    /// reader asks for nothing there and it is never a member nor a path package; the caller
+    /// decides what it is (blaze's toolchain line, else blaze-unit-graph's
+    /// `DepSource::OutsideAnchor`, refused by name when the graph reaches it). The anchor is
+    /// what decides this: one above the workspace's root makes `../x` a path package.
     Outside(Text<'a>),
 }
 

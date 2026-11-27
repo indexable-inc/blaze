@@ -10,9 +10,17 @@
 //! of the record. Nothing is read from cargo's caches and nothing is guessed: a package whose
 //! record the store lacks is [`SourceError::NotFetched`], naming it and its key.
 //!
-//! Workspace members are not asked for here: the caller reads them from the checkout and hands
-//! them to [`Resolution::member`](crate::Resolution::member). A path package that is not a
-//! member is [`SourceError::PathOutsideWorkspace`]: the lock does not say where it is.
+//! Path packages are not asked for here: the lock says no more of one than that it has no
+//! `source`, and where it is is the manifests' to say (cargo's rule: the `path` of the
+//! dependency line that names it, from that manifest's folder). Their one home is
+//! blaze-manifest's layout, which reads each from its members' manifests and on through each
+//! path package's own (`Units::members`, `Units::path_packages`); the caller hands those to
+//! [`Resolution::member`](crate::Resolution::member) and
+//! [`Resolution::package`](crate::Resolution::package). A path dependency the layout could not
+//! read (outside its folder) is the resolution's
+//! [`UnitError::PathOutsideAnchor`](crate::UnitError::PathOutsideAnchor), naming the line's
+//! package, key and path; a path entry asked for here anyway is
+//! [`SourceError::PathNotLaidOut`]: no manifest the layout read names it.
 //!
 //! A git package is found as cargo finds it in a checkout (every `Cargo.toml` of the commit
 //! whose `package.name` is the one asked): first among the members of the layout started at
@@ -62,7 +70,7 @@ const LAYOUT_PASSES: u32 = 64;
 /// How a locked package's sources are found.
 #[derive(Clone, Copy)]
 enum Where {
-    /// A workspace member or another path package: not in the store.
+    /// A workspace member or another path package: not in the store; the layout answers it.
     Path,
     /// The plan's unit at this index.
     Unit(u32),
@@ -111,8 +119,10 @@ pub enum SourceError<'a> {
     Plan { why: Text<'a> },
     /// The record found is refused by the reader.
     Refused { package: Text<'a>, version: Text<'a>, why: PackRefused },
-    /// A path package that is not a workspace member: the lock does not say where it is.
-    PathOutsideWorkspace { package: Text<'a>, version: Text<'a> },
+    /// A path package (a lock entry with no `source`) that neither a member nor a path package
+    /// of the layout answered: no manifest the layout read reaches it by a `path` line (a lock
+    /// written for other manifests, or a `[patch]` path the layout did not read).
+    PathNotLaidOut { package: Text<'a>, version: Text<'a> },
     /// No manifest of the package (that name and version) in its record.
     NoManifest { package: Text<'a>, version: Text<'a> },
     /// Two directories of one git commit hold the package at the lock's version.
@@ -140,9 +150,11 @@ impl fmt::Display for SourceError<'_> {
             SourceError::Refused { package, version, why } => {
                 write!(f, "{package} {version}: its record is refused: {}", blaze_text::Shown(why.clone()))
             }
-            SourceError::PathOutsideWorkspace { package, version } => {
-                write!(f, "{package} {version}: a path package outside the workspace's members (the lock does not say where)")
-            }
+            SourceError::PathNotLaidOut { package, version } => write!(
+                f,
+                "{package} {version}: a path package of Cargo.lock that no manifest blaze read reaches by a `path` line (not a member, not a path package of the layout): \
+                 is Cargo.lock written for these manifests?"
+            ),
             SourceError::NoManifest { package, version } => write!(f, "{package} {version}: no manifest of it in its record"),
             SourceError::TwoInCommit { package, version, first, second } => {
                 write!(f, "{package} {version}: two directories of its git commit hold it: `{first}` and `{second}`")
@@ -271,7 +283,7 @@ fn open_view_inner<'l, 'b, 'a, R: Records<'b>>(
     let p = lock.package(id);
     let version = version_text(lock, id, alloc);
     let at = match place.get(id.index()).copied().unwrap_or(Where::Path) {
-        Where::Path => return Err(SourceError::PathOutsideWorkspace { package: own(p.name.as_str(), alloc), version }),
+        Where::Path => return Err(SourceError::PathNotLaidOut { package: own(p.name.as_str(), alloc), version }),
         Where::Skipped(at) => {
             let why = match plan.skipped.get(usize::try_from(at).unwrap_or(usize::MAX)) {
                 Some(skip) => shown(skip, alloc),
