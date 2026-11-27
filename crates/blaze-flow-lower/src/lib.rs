@@ -1861,7 +1861,7 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
         | PNode::Ref(Mutbl::Not, _) => Some(true),
         PNode::Ref(Mutbl::Mut, _) => Some(false),
         PNode::Param(i) => Some(walk.facts.param_copy(i)),
-        PNode::Alias { .. } => Some(walk.facts.alias_copy(root)),
+        PNode::Alias { .. } | PNode::Opaque(..) => Some(walk.facts.alias_copy(root)),
         PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) if l.len == 0 => Some(true),
         PNode::Tuple(_) | PNode::Record(..) | PNode::Union(_) | PNode::Array(..) | PNode::Pat(..) | PNode::Adt(..) => None,
         PNode::Closure { owner, .. } => match walk.closures {
@@ -1948,7 +1948,7 @@ pub fn pty_is_copy<'a, 'c, F: Facts, A: Allocator + Copy, E>(
                     return set_false();
                 }
             }
-            PNode::Alias { .. } => {
+            PNode::Alias { .. } | PNode::Opaque(..) => {
                 if !walk.facts.alias_copy(t) {
                     return set_false();
                 }

@@ -176,7 +176,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         return Ok(false);
                     }
                 }
-                Expr::Paren(i) => work.push(i),
+                Expr::Paren(i) | Expr::Ref { mutbl: Mutbl::Not, operand: i } => work.push(i),
                 Expr::Path(_) => match self.promote_def(x) {
                     Some(Def::Fn(_)) | Some(Def::Ctor { kind: CtorKind::Tuple, .. }) => {}
                     Some(Def::Const(_)) => {

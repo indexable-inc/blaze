@@ -534,3 +534,58 @@ fn value_based_enum_variant_promotion_and_soundness_controls() {
         assert!(c.promoted.is_empty(), "struct with explicit `impl Drop` must NOT be promoted: {:?}", c.promoted);
     }
 }
+
+/// Nested shared reference to a `const` inside an array/tuple (`&[(3u8, &PARTS)]`, as in
+/// `blaze-body-drops/src/tests.rs:391`) is promoted to `'static`, while a nested shared
+/// reference to a local binding (`&[(3u8, &local)]`) is NOT promoted.
+#[test]
+fn nested_shared_ref_to_const_is_promoted() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Default::default(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let freeze = fx.tr("Freeze", 1, Default::default(), &[]);
+    fx.auto(freeze);
+    fx.lang(LangItem::Freeze, freeze);
+    let u8_ = fx.u8();
+    let arr3 = fx.array(u8_, 3);
+    fx.konst("PARTS", arr3);
+    let ref_arr = fx.r(Mutbl::Not, arr3);
+    let pair = fx.tuple(&[u8_, ref_arr]);
+    let arr1 = fx.array(pair, 1);
+    let ref_arr1 = fx.r(Mutbl::Not, arr1);
+    let f_ok = fx.func("f_ok", 0, &[], ref_arr1, Default::default());
+    let f_local = fx.func("f_local", 0, &[arr3], ref_arr1, Default::default());
+    fx.finish();
+
+    // Positive: `&[(3u8, &PARTS)]` -> both inner `&PARTS` and outer `&[..]` are promoted.
+    {
+        let mut bb = Bb::new();
+        let three = bb.int(None);
+        let parts = bb.path(&["PARTS"]);
+        let r_parts = bb.borrow(Mutbl::Not, parts);
+        let tup = bb.tuple(&[three, r_parts]);
+        let arr = bb.array(&[tup]);
+        let outer = bb.borrow(Mutbl::Not, arr);
+        let root = bb.block(&[], Some(outer));
+        let c = check_body(&fx, &bb, f_ok, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.scan_for(&outer).is_some(), "outer `&[(3, &PARTS)]` must be promoted: {:?}", c.promoted);
+        assert!(c.promoted.scan_for(&r_parts).is_some(), "inner `&PARTS` must be promoted: {:?}", c.promoted);
+    }
+
+    // Negative: `&[(3u8, &local)]` -> NOT promoted.
+    {
+        let mut bb = Bb::new();
+        let local = bb.param("local");
+        let three = bb.int(None);
+        let l = bb.local(local);
+        let r_local = bb.borrow(Mutbl::Not, l);
+        let tup = bb.tuple(&[three, r_local]);
+        let arr = bb.array(&[tup]);
+        let outer = bb.borrow(Mutbl::Not, arr);
+        let root = bb.block(&[], Some(outer));
+        let c = check_body(&fx, &bb, f_local, root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "{:?}", c.diags);
+        assert!(c.promoted.is_empty(), "`&[(3, &local)]` must NOT be promoted: {:?}", c.promoted);
+    }
+}
