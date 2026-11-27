@@ -286,7 +286,7 @@ fn decide<'a, 's, W: World>(
                     }
                     let storage = row.unproved_storage(goal, types, exact, &mut cx, reads, FulfillErrorKind::Ambiguous)?;
                     let source = storage.map_or(row.ty, |(_, field)| field);
-                    if let Some(why) = unavailable_witness(source, row.diag.at, types, exact, reads, alloc)? {
+                    if let Some(why) = unavailable_witness(source, row.diag.at, types, exact, reads, true, alloc)? {
                         return Err(why);
                     }
                     // What it rests on (rule 19): the solver's undecided walk on the same goal,
@@ -307,13 +307,13 @@ fn decide<'a, 's, W: World>(
                 Some((block, field)) => {
                     // The blamed value may be another fn's future read as its superset
                     // (`Exact::coroutine_of`): its `No` does not say what the state stores.
-                    if let Some(why) = unavailable_witness(field, row.diag.at, types, exact, reads, alloc)? {
+                    if let Some(why) = unavailable_witness(field, row.diag.at, types, exact, reads, false, alloc)? {
                         return Err(why);
                     }
                     Some((block, field))
                 }
                 None => {
-                    if let Some(why) = unavailable_witness(row.ty, row.diag.at, types, exact, reads, alloc)? {
+                    if let Some(why) = unavailable_witness(row.ty, row.diag.at, types, exact, reads, false, alloc)? {
                         return Err(why);
                     }
                     if matches!(types.node(row.ty)?, PNode::Future(..))
@@ -365,7 +365,7 @@ impl Stalled {
                 !cx.may_hold(goal, reads)?
             };
             if matches && (kind != FulfillErrorKind::Unsatisfied
-                || unavailable_witness(field, self.diag.at, types, exact, reads, cx.alloc())?.is_none())
+                || unavailable_witness(field, self.diag.at, types, exact, reads, false, cx.alloc())?.is_none())
             {
                 return Ok(Some((block, field)));
             }
@@ -511,8 +511,13 @@ pub(crate) fn ambiguous_interior_goal<W: World, C: TypeCtx>(
 /// An opaque may still lack its defining body; a revealed one, or a nominal coroutine, may
 /// reach another fn's record that is only a superset ([`crate::InteriorIs::Superset`]), which
 /// decides no failure (`EXTERNAL_WITNESS_GAP`). For a local future inspect only stored fields.
+/// When `ambiguous` is false (a definitive solver `No`), an unrevealed opaque cannot have
+/// caused a false `No` (structural auto traits answer `Ambiguous` for unrevealed opaques, and
+/// non-auto traits/projections ignore hidden types in analysis mode), so only its arguments
+/// and any already-revealed superset hidden types are checked.
 fn unavailable_witness<W: World>(
-    ty: PTy, at: crate::ids::Range, types: PTys<'_>, exact: LocalWitnesses<'_, '_>, reads: &mut Reads<'_, '_, W>, alloc: Alloc<'_>,
+    ty: PTy, at: crate::ids::Range, types: PTys<'_>, exact: LocalWitnesses<'_, '_>, reads: &mut Reads<'_, '_, W>,
+    ambiguous: bool, alloc: Alloc<'_>,
 ) -> Result<Option<StalledError>, StalledError> {
     let mut work = Vec::new_in(alloc);
     work.push(ty);
@@ -523,29 +528,33 @@ fn unavailable_witness<W: World>(
             return Err(CheckError::Limit(Limit::Steps).into());
         }
         match types.node(t)? {
-            PNode::Opaque(k, _) => match reads.opaque_record(k)? {
-                None => {
-                    let future = reads.lang_item(crate::LangItem::Future)?;
-                    let bounds = reads.predicates(k)?;
-                    let is_future = bounds.clauses.iter().any(|c| matches!(c,
-                        PClause::Trait { trait_, .. } if Some(*trait_) == future));
-                    // Another fn's future whose hidden type has no record here: that opaque,
-                    // named (rule 19).
-                    let gap = if is_future {
-                        CheckError::ForeignWitness { gap: crate::rules::async_fn::EXTERNAL_WITNESS_GAP, item: k, ordinal: None, at }
-                    } else {
-                        CheckError::FutureWitness { reason: crate::INTERIOR_GAP, at }
-                    };
-                    return Ok(Some(StalledError::Check(gap)));
-                }
-                Some(h) => {
-                    use crate::rules::async_fn::{SupersetFrom, superset_record};
-                    if let Some((item, ordinal)) = superset_record(reads, SupersetFrom::Type(h.ty, h.types), alloc)? {
-                        let gap = crate::rules::async_fn::EXTERNAL_WITNESS_GAP;
-                        return Ok(Some(StalledError::Check(CheckError::ForeignWitness { gap, item, ordinal: Some(ordinal), at })));
+            PNode::Opaque(k, args) => {
+                match reads.opaque_record(k)? {
+                    None if ambiguous => {
+                        let future = reads.lang_item(crate::LangItem::Future)?;
+                        let bounds = reads.predicates(k)?;
+                        let is_future = bounds.clauses.iter().any(|c| matches!(c,
+                            PClause::Trait { trait_, .. } if Some(*trait_) == future));
+                        // Another fn's future whose hidden type has no record here: that opaque,
+                        // named (rule 19).
+                        let gap = if is_future {
+                            CheckError::ForeignWitness { gap: crate::rules::async_fn::EXTERNAL_WITNESS_GAP, item: k, ordinal: None, at }
+                        } else {
+                            CheckError::FutureWitness { reason: crate::INTERIOR_GAP, at }
+                        };
+                        return Ok(Some(StalledError::Check(gap)));
+                    }
+                    None => {}
+                    Some(h) => {
+                        use crate::rules::async_fn::{SupersetFrom, superset_record};
+                        if let Some((item, ordinal)) = superset_record(reads, SupersetFrom::Type(h.ty, h.types), alloc)? {
+                            let gap = crate::rules::async_fn::EXTERNAL_WITNESS_GAP;
+                            return Ok(Some(StalledError::Check(CheckError::ForeignWitness { gap, item, ordinal: Some(ordinal), at })));
+                        }
                     }
                 }
-            },
+                work.extend_from_slice(types.list(args)?);
+            }
             PNode::Coroutine { owner, ordinal, .. } => {
                 use crate::rules::async_fn::{SupersetFrom, superset_record};
                 if let Some((item, first)) = superset_record(reads, SupersetFrom::Record(owner, ordinal), alloc)? {
