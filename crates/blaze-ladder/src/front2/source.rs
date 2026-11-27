@@ -196,6 +196,9 @@ pub trait NamesSource<'n>: Copy {
 
     /// Question 2: the traits method resolution may use in `module`, sorted.
     fn traits_in_scope<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError>;
+    /// The traits exported by `module` for a block's glob import `use module::*;` (without
+    /// `module`'s crate's implicit standard prelude).
+    fn traits_exported<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError>;
 
     /// Question 3: an enum's variants, in declaration order, as the source holds them: read in
     /// place, never copied per question ([`VariantRows`]).
@@ -591,6 +594,10 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
 
     fn traits_in_scope<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
         Names::traits_in_scope(self, module, alloc)
+    }
+
+    fn traits_exported<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        Names::traits_exported(self, module, alloc)
     }
 
     fn variants(self, owner: ItemKey) -> Option<VariantRows<'n>> {
@@ -1476,6 +1483,12 @@ impl<'n> Records<'n> {
         names::traits_in_scope::<&'n str, _>(&logged, module, alloc)
     }
 
+    /// [`NamesSource::traits_exported`] with every cell consulted put in `sink`.
+    pub fn traits_exported_logged<'b>(&'n self, sink: &dyn blaze_scope::names_cells::CellSink, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        let logged = blaze_scope::names_cells::Logged { world: &self.paths, log: sink };
+        names::traits_exported::<&'n str, _>(&logged, module, alloc)
+    }
+
     /// What was opened and decoded so far.
     pub fn opened(&self) -> Opened {
         Opened { names: self.paths.decoded(), items: self.items.decoded(), origins: self.origins_opened.get() }
@@ -1841,6 +1854,10 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
 
     fn traits_in_scope<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
         names::traits_in_scope::<&'n str, _>(&self.paths, module, alloc)
+    }
+
+    fn traits_exported<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        names::traits_exported::<&'n str, _>(&self.paths, module, alloc)
     }
 
     fn variants(self, owner: ItemKey) -> Option<VariantRows<'n>> {

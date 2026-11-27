@@ -2074,13 +2074,16 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
     let transparent_over_opaque = stream.context(CtxNode { parent: opaque_ctx, mark: transparent_a }).expect("ctx");
 
     assert_eq!(stream.non_transparent_mark(root), None);
-    assert_eq!(stream.hygiene(only_transparent).mark, Some(transparent_a));
+    assert_eq!(stream.node(only_transparent).map(|n| n.mark), Some(transparent_a));
+    assert_eq!(stream.hygiene(only_transparent).mark, None);
     assert_eq!(stream.non_transparent_mark(only_transparent), None);
     assert_eq!(stream.non_transparent_mark(semi_ctx), Some(semi_b));
     assert_eq!(stream.non_transparent_mark(opaque_ctx), Some(opaque_c));
-    assert_eq!(stream.hygiene(transparent_over_semi).mark, Some(transparent_a));
+    assert_eq!(stream.node(transparent_over_semi).map(|n| n.mark), Some(transparent_a));
+    assert_eq!(stream.hygiene(transparent_over_semi).mark, Some(semi_b));
     assert_eq!(stream.non_transparent_mark(transparent_over_semi), Some(semi_b));
-    assert_eq!(stream.hygiene(transparent_over_opaque).mark, Some(transparent_a));
+    assert_eq!(stream.node(transparent_over_opaque).map(|n| n.mark), Some(transparent_a));
+    assert_eq!(stream.hygiene(transparent_over_opaque).mark, Some(opaque_c));
     assert_eq!(stream.non_transparent_mark(transparent_over_opaque), Some(opaque_c));
 
     // `body_words` also skips `Transparent` marks when computing `BodyWord::mark`.

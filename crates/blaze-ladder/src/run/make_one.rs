@@ -2129,6 +2129,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     // The coroutines whose states the rows read: laid again below, as the build's lay laid
     // them, before any row is asked.
     let mut roots: AVec<'_, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(fn_alloc);
+    let mut track_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(fn_alloc);
     core.work.needs.clear();
     for row in view.reads() {
         let (bytes, _) = row.map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
@@ -2178,11 +2179,19 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 }
                 continue;
             }
+            ReadKind::TrackCaller => {
+                if program.head_row(item).is_err() {
+                    return Ok(stale);
+                }
+                if let Ok(args) = core.work.ground.view().list(list) {
+                    track_tys.extend_from_slice(args);
+                }
+                continue;
+            }
             // Each answered from the fn's row (lazy front_end.rs: tabled rows only): its row
             // made from its head; the row's answer decides whether it holds.
             ReadKind::Abi
             | ReadKind::Nounwind
-            | ReadKind::TrackCaller
             | ReadKind::CVariadic
             | ReadKind::LegacyConstGenerics
             | ReadKind::ForeignFn
@@ -2249,6 +2258,41 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 }
             }
             Err(_) => return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner }),
+        }
+    }
+    // Ensure opaque definers, closure owners, object tables, and fn heads referenced in any
+    // `TrackCaller` read-list instance arguments so `resolve` inside `track_caller` sees the same
+    // concrete impl / hidden type during `verify_today` as during build (e.g. a trait method
+    // called on an `impl Trait` opaque whose definer has not been checked yet on walk 2).
+    if !track_tys.is_empty() {
+        track_tys.sort_unstable();
+        track_tys.dedup();
+        if let Ok(Held { owners: track_owners, items: track_items, objects: track_objects, missing_opaques }) =
+            held_owners_slice(&*program, core.work.ground.view(), &track_tys, None, tabled, fn_alloc)
+        {
+            for &opaque in missing_opaques.iter() {
+                if matches!(program.opaque_head(opaque), Ok(true))
+                    && let Some(Ok(owner)) = program.opaque_definer(opaque)
+                    && core.ensure(program, typing, owner, checks, fn_alloc).is_err()
+                {
+                    return Ok(Verdict::Stale { kind: ReadKind::TrackCaller, item: tabled });
+                }
+            }
+            for &object in track_objects.iter() {
+                if program.object_table(object).is_err() {
+                    return Ok(Verdict::Stale { kind: ReadKind::TrackCaller, item: tabled });
+                }
+            }
+            for &item in track_items.iter() {
+                if program.head_row(item).is_err() {
+                    return Ok(Verdict::Stale { kind: ReadKind::TrackCaller, item: tabled });
+                }
+            }
+            for &owner in track_owners.iter() {
+                if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                    return Ok(Verdict::Stale { kind: ReadKind::TrackCaller, item: tabled });
+                }
+            }
         }
     }
     // Also include any coroutine held by value in the constant needs' arguments (e.g.

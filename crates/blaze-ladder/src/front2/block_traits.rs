@@ -42,7 +42,7 @@ use blaze_id::ItemKey as LibKey;
 use blaze_own::{AVec, Alloc};
 use blaze_scope::names::{Why as PathWhy, Written};
 use blaze_scope::task::to_path_marked;
-use blaze_surface::{DefKind, Edition, Namespace, PathKind};
+use blaze_surface::{DefKind, Namespace, PathKind};
 use blaze_typeck::ItemKey;
 
 use super::glob_uses::GLOB;
@@ -153,16 +153,6 @@ impl BlockTraits {
     }
 }
 
-/// The rank of an edition's standard prelude: 2015 and 2018 share one, 2021 adds to it, 2024
-/// adds again (the Reference, "Preludes", [names.preludes.std]).
-fn prelude_rank(e: Edition) -> u8 {
-    match e {
-        Edition::E2015 | Edition::E2018 => 0,
-        Edition::E2021 => 1,
-        Edition::E2024 => 2,
-    }
-}
-
 /// Whether `segment` is a path head the names library reads itself.
 fn is_head(segment: &str) -> bool {
     matches!(segment, "self" | "super" | "crate" | "$crate")
@@ -173,8 +163,6 @@ struct Reader<'l, 'n, S> {
     names: S,
     locals: &'l Locals<'n>,
     module: LibKey,
-    /// The body's crate's prelude rank; `None`: its edition is not known.
-    rank: Option<u8>,
 }
 
 impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
@@ -334,14 +322,12 @@ impl<'l, 'n, S: NamesSource<'n>> Reader<'l, 'n, S> {
                 Err(_) => return Err(Self::gap(row, UNRESOLVED)),
             }
         };
-        // The glob's module's prelude must add nothing the body's lacks.
-        let theirs = self.names.crate_of(target).and_then(|k| self.names.edition_of(k)).map(prelude_rank);
-        match (theirs, self.rank) {
-            (Some(t), Some(ours)) if t <= ours => {}
-            (Some(_), Some(_)) => return Err(Self::gap(row, GLOB_LATER_EDITION)),
-            _ => return Err(Self::gap(row, UNRESOLVED)),
-        }
-        let traits = self.names.traits_in_scope(target, alloc).map_err(|_| Self::gap(row, UNRESOLVED))?;
+        // A glob import `use target::*;` imports `target`'s own and glob-re-exported traits,
+        // never `target`'s crate's implicit standard prelude — so an earlier-edition body
+        // glob-importing from a later-edition crate (e.g. an Edition 2018 crate expanding
+        // Edition 2021 `quote!`'s `use $crate::__private::ext::*;`) never leaks `target`'s
+        // edition prelude into the body's scope.
+        let traits = self.names.traits_exported(target, alloc).map_err(|_| Self::gap(row, UNRESOLVED))?;
         for &k in traits.iter() {
             out.push(checker_of(k));
         }
@@ -384,13 +370,13 @@ fn keep_list(keys: &mut AVec<'static, ItemKey>, last: &mut Option<(u32, u32)>, l
 /// The traits in scope at each block of the body `owner` (whose module is `module`, of crate
 /// `krate`) whose list is not `module_traits` (sorted checker keys, the body's `traits`).
 /// Every kept list is in `alloc`; the scratch too.
-pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &Locals<'n>, owner: ItemKey, module: LibKey, krate: usize, module_traits: &[ItemKey], alloc: Alloc<'static>) -> BlockTraits {
+pub fn of<'n, S: NamesSource<'n>>(names: S, locals: &Locals<'n>, owner: ItemKey, module: LibKey, _krate: usize, module_traits: &[ItemKey], alloc: Alloc<'static>) -> BlockTraits {
     let mut out = BlockTraits::module(alloc);
     let body = locals.body(owner);
     if body.is_none() && locals.head(owner).is_none() {
         return out;
     }
-    let reader = Reader { names, locals, module, rank: names.edition_of(krate).map(prelude_rank) };
+    let reader = Reader { names, locals, module };
     // The base: the module's traits and those of the blocks around the body's item, when the
     // body is a local item's (its declaration's block, then each block and item outward).
     let mut base: AVec<'static, ItemKey> = AVec::new_in(alloc);

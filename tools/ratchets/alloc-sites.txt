@@ -18,7 +18,7 @@ blaze-bytes	0	0	0	3
 blaze-cad-out	0	0	0	1
 blaze-cas	10	0	43	62
 blaze-check	54	0	0	37
-blaze-cli	1	0	275	119
+blaze-cli	1	0	275	120
 blaze-columns	0	0	0	3
 blaze-cond	0	0	0	2
 blaze-consteval	0	0	0	4
