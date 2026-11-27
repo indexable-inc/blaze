@@ -397,6 +397,9 @@ pub(crate) fn run<'b>(
         Ok((_key, wasm_sha256)) => {
             let mut made = Made::new_in(name, held);
             made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.as_bytes());
+            if let Some(dep_probes) = listed.dep_probes {
+                made.payload.extend_from_slice(dep_probes.as_str().as_bytes());
+            }
             Ok(Did::Done(made))
         }
         Err(ModuleError::Missing { name: package, version, key }) => {
@@ -406,6 +409,9 @@ pub(crate) fn run<'b>(
                     Ok(wasm_sha256) => {
                         let mut made = Made::new_in(name, held);
                         made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.as_bytes());
+                        if let Some(dep_probes) = listed.dep_probes {
+                            made.payload.extend_from_slice(dep_probes.as_str().as_bytes());
+                        }
                         return Ok(Did::Done(made));
                     }
                     Err(why) => {

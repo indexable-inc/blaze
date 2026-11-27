@@ -1146,6 +1146,71 @@ fn path_pkg_files_digest(
     Some(blaze_proc_macro::module::files_digest(&mut files))
 }
 
+/// Computes the build-script files digest (`Cargo.toml` + `build.rs` root) when `pkg_id` is a
+/// workspace/path member, propagating any I/O error instead of silently downgrading to `None`
+/// (which would change the module lookup class to a source-unqualified registry/git key, Rule 3).
+fn member_script_files_digest<'a>(
+    checkout: &blaze_proc_macro::script_sandbox::RealRoot,
+    members: &[(LockId, &str, blaze_world::PathKind)],
+    pkg_id: LockId,
+    unit_root: &str,
+    unit_name: &str,
+    alloc: Alloc<'a>,
+) -> Result<Option<blaze_own::String<Alloc<'a>>>, SelfCompileError> {
+    let Some((_, dir, _)) = members.iter().find(|(id, _, _)| *id == pkg_id) else {
+        return Ok(None);
+    };
+    let pkg_dir = if dir.is_empty() {
+        checkout.path().to_path_buf()
+    } else {
+        checkout.path().join(dir)
+    };
+    let hex = script_unit::script_files_digest(&pkg_dir, unit_root).map_err(|e| {
+        let mut msg = blaze_own::String::new_in(alloc);
+        let _ = write!(msg, "reading build script files of {unit_name}: {e}");
+        SelfCompileError::Failed(msg.as_str().into())
+    })?;
+    Ok(Some(blaze_own::String::from_str_in(hex.as_str(), alloc)))
+}
+
+/// Looks up an already-compiled build-script module in `store`, propagating both store-lookup
+/// errors and `wasm-sha256` read errors cleanly so compilation runs ONLY on an explicit
+/// `Ok(None)` cache miss (Rule 3).
+fn lookup_cached_build_script_module<'a>(
+    store: &Path,
+    name: &str,
+    version: &str,
+    feats: &[&str],
+    files_digest: Option<&str>,
+    deps_digest: Option<&str>,
+    alloc: Alloc<'a>,
+) -> Result<Option<blaze_own::String<Alloc<'a>>>, SelfCompileError> {
+    match script_unit::module_of_files_and_deps(store, name, version, feats, files_digest, deps_digest) {
+        Ok(Some(record_dir)) => {
+            let digest = std::fs::read_to_string(record_dir.join("wasm-sha256")).map_err(|e| {
+                let mut msg = blaze_own::String::new_in(alloc);
+                let _ = write!(
+                    msg,
+                    "reading wasm-sha256 for cached build-script module {name} {version} in {}: {e}",
+                    record_dir.display()
+                );
+                SelfCompileError::Failed(msg.as_str().into())
+            })?;
+            Ok(Some(blaze_own::String::from_str_in(digest.trim(), alloc)))
+        }
+        Ok(None) => Ok(None),
+        Err(e) => {
+            let mut msg = blaze_own::String::new_in(alloc);
+            let _ = write!(
+                msg,
+                "looking up cached build-script module {name} {version} in {}: {e}",
+                store.display()
+            );
+            Err(SelfCompileError::Failed(msg.as_str().into()))
+        }
+    }
+}
+
 /// Recursively compiles `script_id` (and any build-script dependencies of its build-dependencies)
 /// into `<store>/build-script/modules/<key>` and returns its `wasm-sha256` digest.
 #[expect(clippy::too_many_arguments, reason = "recursive build-script compilation over cx, store, graph, wasm_graph, lock, checkout, members, heap, dep_probes, unit, expected_deps, and depth")]
@@ -1261,17 +1326,18 @@ fn ensure_build_script_unit(
         return Err(SelfCompileError::Failed(msg.as_str().into()));
     }
 
-    // Fast path: already compiled and cached on disk.
-    if let Ok(Some(record_dir)) = script_unit::module_of_files_and_deps(
+    // Fast path: already compiled and cached on disk. Propagate store/digest errors cleanly and
+    // self-compile ONLY on an explicit `Ok(None)` miss (Rule 3).
+    if let Some(digest) = lookup_cached_build_script_module(
         store,
         unit.name.as_str(),
         unit.version.as_str(),
         &feats,
         files_digest.as_deref(),
         deps_digest.as_deref(),
-    ) && let Ok(digest) = std::fs::read_to_string(record_dir.join("wasm-sha256"))
-    {
-        return Ok(digest.trim().to_owned());
+        heap.alloc(),
+    )? {
+        return Ok(digest.as_str().to_owned());
     }
 
     let wasm = compile_unit_to_wasm64(
@@ -1789,17 +1855,14 @@ fn run_dep_build_script(
     let mut table: std::vec::Vec<blaze_build_script::probe::Row> = rows.as_slice().to_vec();
     table.extend_from_slice(tc_feature_rows);
     table.sort_unstable_by_key(|r| r.key);
-    let files_digest = members
-        .iter()
-        .find(|(id, _, _)| *id == unit.package)
-        .and_then(|(_, dir, _)| {
-            let pkg_dir = if dir.is_empty() {
-                checkout.path().to_path_buf()
-            } else {
-                checkout.path().join(dir)
-            };
-            script_unit::script_files_digest(&pkg_dir, unit.root.as_str()).ok()
-        });
+    let files_digest = member_script_files_digest(
+        checkout,
+        members,
+        unit.package,
+        unit.root.as_str(),
+        unit.name.as_str(),
+        alloc,
+    )?;
     let deps_digest = script_unit::script_deps_digest(graph, Some(graph), lock, bs_id, |dep_pkg| {
         path_pkg_files_digest(checkout, members, dep_pkg)
     })
@@ -2026,37 +2089,22 @@ fn locate_root_in_wasm_graph(
         want_root_feats.push(f.as_str());
     }
     want_root_feats.sort_unstable();
-    let root_idx = wasm_graph
-        .units
-        .iter()
-        .enumerate()
-        .position(|(i, u)| {
-            u32::try_from(i).is_ok_and(|uid| {
-                u.package == root.package
-                    && u.kind == want_kind
-                    && wasm_graph.host_unit_side(UnitId(uid)) == want_side
-                    && sorted_features_match(u, want_root_feats.as_slice())
-            })
+    let root_idx = wasm_graph.units.iter().enumerate().position(|(i, u)| {
+        u32::try_from(i).is_ok_and(|uid| {
+            u.package == root.package
+                && u.kind == want_kind
+                && wasm_graph.host_unit_side(UnitId(uid)) == want_side
+                && sorted_features_match(u, want_root_feats.as_slice())
         })
-        .or_else(|| {
-            wasm_graph.units.iter().position(|u| {
-                u.package == root.package
-                    && u.kind == want_kind
-                    && sorted_features_match(u, want_root_feats.as_slice())
-            })
-        })
-        .or_else(|| {
-            wasm_graph
-                .units
-                .iter()
-                .position(|u| u.package == root.package && u.kind == want_kind)
-        });
+    });
     let Some(root_idx) = root_idx else {
         return Err(fail(format_args!(
-            "wasm64 resolution for {} {} produced no matching {:?} unit",
+            "wasm64 resolution for {} {} produced no exact {:?} unit matching side {:?} and features {:?}",
             root.name.as_str(),
             root.version.as_str(),
-            want_kind
+            want_kind,
+            want_side,
+            want_root_feats.as_slice()
         )));
     };
     let root_u32 = u32::try_from(root_idx)
@@ -5238,6 +5286,405 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
                 Err(crate::macros::MacroListFailure::Probes(e)) if e.kind == crate::scripts::ProbeErrorKind::PlannedDrift
             ),
             "drifted live probe identity must be refused with PlannedDrift"
+        );
+    }
+
+    #[test]
+    fn find_wasm_root_unit_rejects_inexact_features_and_host_feature_side() {
+        let frame = Frame::with_reserve(4 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        let make_u = |pkg: u32,
+                      name: &str,
+                      kind: UnitKind<'static>,
+                      for_host: bool,
+                      build_script: Option<u32>,
+                      feats: &[&str]|
+         -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, kind, "2024", &[], a);
+            u.for_host = for_host;
+            u.build_script = build_script.map(UnitId);
+            for &f in feats {
+                u.features.push(Text::from_str_in(f, a));
+            }
+            u
+        };
+
+        // Host graph:
+        // 0: foo BuildScript (features=["std"], served by target Lib -> HostFeatureSide::Target)
+        // 1: foo Lib (for_host=false, build_script=Some(0))
+        // 2: my-macro ProcMacro (features=["macros"])
+        let host_graph = make_graph(
+            std::vec![
+                make_u(1, "foo", UnitKind::BuildScript, true, None, &["std"]),
+                make_u(1, "foo", UnitKind::Lib, false, Some(0), &["std"]),
+                make_u(2, "my-macro", UnitKind::ProcMacro, true, None, &["macros"]),
+            ],
+            a,
+        );
+
+        // Wasm graph 1: same package & kind, WRONG features (missing "std" / wrong feature "other").
+        let wg_wrong_feats = make_graph(
+            std::vec![
+                make_u(1, "foo", UnitKind::BuildScript, true, None, &["other"]),
+                make_u(1, "foo", UnitKind::Lib, false, Some(0), &["other"]),
+                make_u(2, "my-macro", UnitKind::ProcMacro, true, None, &[]),
+            ],
+            a,
+        );
+        let bs_feat_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_feats, UnitId(0), CompileMode::BuildScript, a)
+            .expect_err("inexact BuildScript features in wasm_graph must be refused");
+        assert!(
+            std::format!("{bs_feat_err}").contains("no exact"),
+            "unexpected error: {bs_feat_err}"
+        );
+        let pm_feat_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_feats, UnitId(2), CompileMode::ProcMacro, a)
+            .expect_err("inexact ProcMacro features in wasm_graph must be refused");
+        assert!(
+            std::format!("{pm_feat_err}").contains("no exact"),
+            "unexpected error: {pm_feat_err}"
+        );
+
+        // Wasm graph 2: same package & kind & exact features, WRONG HostFeatureSide
+        // (served only by a for_host=true server -> HostFeatureSide::Host instead of Target).
+        let wg_wrong_side = make_graph(
+            std::vec![
+                make_u(1, "foo", UnitKind::BuildScript, true, None, &["std"]),
+                make_u(1, "foo", UnitKind::Lib, true, Some(0), &["std"]),
+            ],
+            a,
+        );
+        let bs_side_err = locate_root_in_wasm_graph(&host_graph, &wg_wrong_side, UnitId(0), CompileMode::BuildScript, a)
+            .expect_err("wrong HostFeatureSide BuildScript in wasm_graph must be refused");
+        assert!(
+            std::format!("{bs_side_err}").contains("no exact"),
+            "unexpected error: {bs_side_err}"
+        );
+
+        // Exact match on package + kind + side + features succeeds.
+        assert_eq!(
+            locate_root_in_wasm_graph(&host_graph, &host_graph, UnitId(0), CompileMode::BuildScript, a)
+                .expect("exact BuildScript root must match"),
+            UnitId(0)
+        );
+        assert_eq!(
+            locate_root_in_wasm_graph(&host_graph, &host_graph, UnitId(2), CompileMode::ProcMacro, a)
+                .expect("exact ProcMacro root must match"),
+            UnitId(2)
+        );
+    }
+
+    #[test]
+    fn lookup_cached_build_script_module_propagates_store_and_digest_errors() {
+        let base = std::env::temp_dir().join(std::format!(
+            "blaze-wasm64-cache-lookup-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create temp base");
+        let heap = blaze_own::testing::heap();
+
+        // 1. Clean empty store -> explicit Ok(None) cache miss.
+        let empty_store = base.join("empty-store");
+        std::fs::create_dir_all(&empty_store).expect("create empty store");
+        let miss = lookup_cached_build_script_module(
+            &empty_store,
+            "ring",
+            "0.17.14",
+            &["alloc"],
+            None,
+            Some("deadbeef"),
+            heap.alloc(),
+        )
+        .expect("empty store must return Ok(None)");
+        assert!(miss.is_none());
+
+        // 2. Corrupt/unreadable module store (a regular file at `build-script/modules`) -> Err.
+        let corrupt_store = base.join("corrupt-store");
+        std::fs::create_dir_all(corrupt_store.join("build-script")).expect("create corrupt parent");
+        std::fs::write(corrupt_store.join("build-script/modules"), b"not-a-dir").expect("write file");
+        let store_err = lookup_cached_build_script_module(
+            &corrupt_store,
+            "ring",
+            "0.17.14",
+            &["alloc"],
+            None,
+            Some("deadbeef"),
+            heap.alloc(),
+        )
+        .expect_err("unreadable/corrupt build-script module store must propagate Err");
+        assert!(
+            std::format!("{store_err}").contains("looking up cached build-script module"),
+            "unexpected store error: {store_err}"
+        );
+
+        // 3. Cached record dir present with valid identity but missing `wasm-sha256` -> Err (NOT cache miss!).
+        let rec_dir = empty_store.join("build-script/modules/cached-ring-rec");
+        std::fs::create_dir_all(&rec_dir).expect("create record dir");
+        let id = blaze_toolchain::PINNED;
+        let identity = std::format!(
+            "{}\nname ring\nversion 0.17.14\nfeatures alloc\ndeps deadbeef\ntoolchain {id}\nwasm-target {WASM64_TARGET}\n{}\nbuilder blaze-wasm64\n",
+            script_unit::WASM_MODULE_HEADER,
+            script_unit::shim_line(),
+        );
+        std::fs::write(rec_dir.join("identity"), identity).expect("write identity");
+        std::fs::write(rec_dir.join("module.wasm"), b"\0asm\x01\0\0\0").expect("write wasm");
+        let digest_err = lookup_cached_build_script_module(
+            &empty_store,
+            "ring",
+            "0.17.14",
+            &["alloc"],
+            None,
+            Some("deadbeef"),
+            heap.alloc(),
+        )
+        .expect_err("missing wasm-sha256 in existing cached module dir must propagate Err");
+        assert!(
+            std::format!("{digest_err}").contains("reading wasm-sha256"),
+            "unexpected digest error: {digest_err}"
+        );
+
+        // 4. Writing `wasm-sha256` makes lookup return Ok(Some(digest)).
+        std::fs::write(rec_dir.join("wasm-sha256"), "abcd1234\n").expect("write digest");
+        let hit = lookup_cached_build_script_module(
+            &empty_store,
+            "ring",
+            "0.17.14",
+            &["alloc"],
+            None,
+            Some("deadbeef"),
+            heap.alloc(),
+        )
+        .expect("valid cached module must succeed")
+        .expect("valid cached module must hit");
+        assert_eq!(hit.as_str(), "abcd1234");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn member_script_files_digest_propagates_io_errors_instead_of_downgrading_to_none() {
+        let base = std::env::temp_dir().join(std::format!(
+            "blaze-wasm64-member-digest-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("good-member")).expect("create good-member");
+        std::fs::write(
+            base.join("good-member/Cargo.toml"),
+            "[package]\nname = \"good\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::write(base.join("good-member/build.rs"), "fn main() {}\n").expect("write build.rs");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::create_dir_all(base.join("unreadable-member")).expect("create unreadable-member");
+            let unreadable_manifest = base.join("unreadable-member/Cargo.toml");
+            std::fs::write(&unreadable_manifest, "[package]\nname = \"bad\"\nversion = \"0.1.0\"\n")
+                .expect("write unreadable Cargo.toml");
+            std::fs::set_permissions(&unreadable_manifest, std::fs::Permissions::from_mode(0o000))
+                .expect("chmod 000");
+
+            let checkout = blaze_proc_macro::script_sandbox::RealRoot::resolve(&base).expect("open checkout");
+            let members = [
+                (LockId(1), "good-member", blaze_world::PathKind::Member),
+                (LockId(2), "unreadable-member", blaze_world::PathKind::Member),
+            ];
+            let heap = blaze_own::testing::heap();
+
+            // Non-member registry/git package -> Ok(None).
+            let non_member = member_script_files_digest(
+                &checkout,
+                &members,
+                LockId(99),
+                "build.rs",
+                "registry-crate",
+                heap.alloc(),
+            )
+            .expect("non-member must return Ok(None)");
+            assert!(non_member.is_none());
+
+            // Valid workspace member -> Ok(Some(hex)).
+            let good = member_script_files_digest(
+                &checkout,
+                &members,
+                LockId(1),
+                "build.rs",
+                "good",
+                heap.alloc(),
+            )
+            .expect("valid member must return Ok(Some)")
+            .expect("digest present");
+            assert_eq!(good.as_str().len(), 64);
+
+            // Workspace/path member with unreadable Cargo.toml MUST return Err, NOT Ok(None).
+            let err = member_script_files_digest(
+                &checkout,
+                &members,
+                LockId(2),
+                "build.rs",
+                "unreadable-member",
+                heap.alloc(),
+            )
+            .expect_err("member build-script files digest I/O error must propagate");
+            assert!(
+                std::format!("{err}").contains("reading build script files of unreadable-member"),
+                "unexpected member digest error: {err}"
+            );
+
+            let _ = std::fs::set_permissions(&unreadable_manifest, std::fs::Permissions::from_mode(0o644));
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ready_dep_probe_mismatch_detects_changed_probes_on_ready_wake_path() {
+        use blaze_drive::{Kind, Name, Tool};
+        use blaze_engine::{Cause, Gen, Phase, Row, Stage, Tools, pages};
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(53, bstd::io::Limits::USUAL));
+        let cx = io
+            .cx(core::time::Duration::from_secs(10), bstd::mem::TASK_FRAME)
+            .expect("sim cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let lent = home
+            .open_store(&blaze_cas::plain::Settings::default(), crate::store::Facts { boot: Some(1), nonce: 53 }, heap.alloc())
+            .expect("open store");
+        let mut store = crate::store::CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle())
+            .expect("command store");
+        let tools = Tools([Tool(ContentId([0x33; 32])); blaze_drive::key::KINDS]);
+
+        let graph_source = ContentId([0x11; 32]);
+        let hex_a = Hex64(*b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let hex_b = Hex64(*b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+
+        let bs_subj = ContentId([0x21; 32]);
+        let bs_name = crate::script_modules::name(bs_subj);
+        let bs_src_a = crate::engine_scripts::script_module_task_source(
+            graph_source,
+            bs_subj,
+            &[(bs_subj, crate::engine_scripts::PlannedProbe::Digest(hex_a))],
+        );
+
+        let pm_reg_subj = crate::macros::subject_of("sqlx-macros", "0.9.0");
+        let pm_reg_name = Name::new(Kind::MacroModule, pm_reg_subj);
+        let pm_reg_src_a = crate::macros::part_source_with_dep_probes(
+            crate::macros::part_source_with_files(graph_source, crate::macro_files::empty_closure_digest(), pm_reg_subj),
+            hex_a.as_str(),
+        );
+
+        // Workspace/patched proc-macro with a non-empty `closure_digest`: `macros::run` stores the
+        // 64-byte `dep_probes` hex in its `MacroModule` record payload.
+        let pm_ws_subj = crate::macros::subject_of("ws-macros", "0.1.0");
+        let pm_ws_name = Name::new(Kind::MacroModule, pm_ws_subj);
+        let non_empty_files = ContentId([0x77; 32]);
+        let pm_ws_src_a = crate::macros::part_source_with_dep_probes(
+            crate::macros::part_source_with_files(graph_source, non_empty_files, pm_ws_subj),
+            hex_a.as_str(),
+        );
+        let pm_ws_rec_bytes = blaze_drive::record::write_plain(
+            pm_ws_name,
+            pm_ws_src_a,
+            ContentId([0x88; 32]),
+            &[],
+            hex_a.as_str().as_bytes(),
+            erased.handle(),
+        );
+        let pm_ws_rec_key = blaze_drive::key::content_key(&pm_ws_rec_bytes);
+        crate::store::Store::put(&mut store, &cx, pm_ws_rec_key, &pm_ws_rec_bytes).expect("put pm_ws record");
+
+        let mut kept = pages::Kept::new_in(alloc);
+        kept.answer.serial = Gen(1);
+        let phase = Phase::new(Stage::Scripts, 0);
+        for (name, source, rec) in [
+            (bs_name, bs_src_a, None),
+            (pm_reg_name, pm_reg_src_a, None),
+            (pm_ws_name, pm_ws_src_a, Some(pm_ws_rec_key)),
+        ] {
+            kept.answer.by_file.entry(name).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(name);
+            kept.answer.rows.insert(
+                name,
+                Row {
+                    key: tools.key(name, &source),
+                    phase,
+                    file: name,
+                    source,
+                    out: ContentId([0x88; 32]),
+                    serial: Gen(1),
+                    defines: blaze_own::Vec::new_in(alloc),
+                    reads: blaze_own::Vec::new_in(alloc),
+                    by_cell: blaze_own::Vec::new_in(alloc),
+                    findings: 0,
+                    inline: false,
+                    failed: false,
+                },
+            );
+            kept.causes.insert(name, (Gen(1), Cause::New));
+            if let Some(k) = rec {
+                kept.records.insert(name, k);
+            }
+        }
+        let enc = pages::encode_at_bits(&kept, 4, alloc);
+        for (k, b) in enc.puts.iter() {
+            crate::store::Store::put(&mut store, &cx, *k, b).expect("put page");
+        }
+        let dir = crate::engine_answer::open_root(&cx, &mut store, enc.root, alloc)
+            .expect("open root io")
+            .expect("valid root");
+        let snap = store.snapshot_in(alloc).expect("snapshot");
+        let headers = pages::Headers::Absent { since: Gen(1) };
+        let stored = crate::engine_answer::Stored::new(&dir, &snap, &headers, pages::Check::Store, alloc);
+
+        let make_planned = |bs_hex: Hex64, reg_hex: Hex64, ws_hex: Hex64| {
+            let mut p = crate::engine_scripts::PlannedDepProbes::empty(frame);
+            p.script_modules.push((bs_subj, crate::engine_scripts::PlannedProbe::Digest(bs_hex)));
+            p.proc_macros.push((pm_reg_subj, crate::engine_scripts::PlannedProbe::Digest(reg_hex)));
+            p.proc_macros.push((pm_ws_subj, crate::engine_scripts::PlannedProbe::Digest(ws_hex)));
+            p.proc_macros.sort_unstable_by_key(|(s, _)| *s);
+            p
+        };
+
+        // Unchanged probe digest across all 3 tasks -> ready wake admitted (`Ok(None)`).
+        let same = make_planned(hex_a, hex_a, hex_a);
+        assert_eq!(
+            crate::engine_scripts::ready_dep_probe_mismatch(&cx, &mut store, &stored, graph_source, &same)
+                .expect("unchanged probes check"),
+            None
+        );
+
+        // Changed probe digest on build-script MacroModule -> ready wake refused (`Some(bs_name)`).
+        let drift_bs = make_planned(hex_b, hex_a, hex_a);
+        assert_eq!(
+            crate::engine_scripts::ready_dep_probe_mismatch(&cx, &mut store, &stored, graph_source, &drift_bs)
+                .expect("drift bs check"),
+            Some(bs_name)
+        );
+
+        // Changed probe digest on registry proc-macro -> ready wake refused (`Some(pm_reg_name)`).
+        let drift_reg = make_planned(hex_a, hex_b, hex_a);
+        assert_eq!(
+            crate::engine_scripts::ready_dep_probe_mismatch(&cx, &mut store, &stored, graph_source, &drift_reg)
+                .expect("drift reg check"),
+            Some(pm_reg_name)
+        );
+
+        // Changed probe digest on workspace/patched proc-macro -> ready wake refused (`Some(pm_ws_name)`).
+        let drift_ws = make_planned(hex_a, hex_a, hex_b);
+        assert_eq!(
+            crate::engine_scripts::ready_dep_probe_mismatch(&cx, &mut store, &stored, graph_source, &drift_ws)
+                .expect("drift ws check"),
+            Some(pm_ws_name)
         );
     }
 }

@@ -832,12 +832,41 @@ impl<'a> CommandProbes<'a> {
     /// propagating any `CommandPinsError` verbatim (never falling back to `SpawnSetting::off()`).
     pub(crate) fn spawn_setting(&self, cx: &Cx) -> Result<&'a SpawnSetting, ProbeSetupError> {
         let shared = self.env.heap.shared();
+        self.spawn_setting_with(cx, |_cx| open_spawn_setting(self.env, shared))
+    }
+
+    fn spawn_setting_with(
+        &self,
+        cx: &Cx,
+        open: impl FnOnce(&Cx) -> Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>,
+    ) -> Result<&'a SpawnSetting, ProbeSetupError> {
+        let shared = self.env.heap.shared();
+        #[cfg(test)]
+        if matches!(self.inner.plant, ProbeOncePlant::SkipOnce) {
+            // Planted bug: invoke `open(cx)` on every call bypassing `Once` so the DST oracle
+            // immediately catches duplicate initialization.
+            let opened = open(cx);
+            let slot = self
+                .inner
+                .spawn_setting
+                .get_or_make(cx, |_cx| Ok::<_, core::convert::Infallible>(opened))
+                .map_err(|error| {
+                    let mut msg = blaze_own::String::new_in(shared);
+                    let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("opening command spawn pins: {error}"));
+                    ProbeSetupError::new(ProbeErrorKind::SpawnPinsOpen, msg)
+                })?;
+            return match slot {
+                Ok(setting) => Ok(setting),
+                Err(why) => Err(ProbeSetupError::new(
+                    ProbeErrorKind::SpawnPinsOpen,
+                    blaze_own::String::from_str_in(why.as_str(), shared),
+                )),
+            };
+        }
         let slot = self
             .inner
             .spawn_setting
-            .get_or_make(cx, |_cx| {
-                Ok::<_, core::convert::Infallible>(open_spawn_setting(self.env, shared))
-            })
+            .get_or_make(cx, |cx| Ok::<_, core::convert::Infallible>(open(cx)))
             .map_err(|error| {
                 let mut msg = blaze_own::String::new_in(shared);
                 let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("opening command spawn pins: {error}"));
@@ -1736,9 +1765,10 @@ mod shared_command_probes_dst {
     use blaze_proc_macro::probe_clang::CProbeSetting;
     use blaze_proc_macro::spawn_route::{FactPins, SpawnSetting};
     use blaze_sim::{Broke, Config, Tape, check as sim_check, control};
+    use bstd::cx::Cx;
     use bstd::io::{Io, Limits, SimWorld};
 
-    use super::{FetchEnv, ProbeOncePlant, SharedCommandProbes};
+    use super::{FetchEnv, ProbeErrorKind, ProbeOncePlant, SharedCommandProbes};
 
     fn sim_env<'a>(io: &Io) -> FetchEnv<'a> {
         FetchEnv {
@@ -1760,169 +1790,302 @@ mod shared_command_probes_dst {
         }
     }
 
-    /// Published result of a `SharedCommandProbes` lazy slot (`Ok(attempt)` or `Err(attempt)`).
+    /// Operation executed by one simulated caller against the real production `SharedCommandProbes`
+    /// instance under `blaze_sim::Tape` control.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum Published {
-        Ok(u32),
-        Err(u32),
+    enum ProbeOp {
+        CallCProbes,
+        CallSpawnSetting,
+        CallSpawnSnapshot,
+        CallDepIdentity,
+        CancelledIdentity,
     }
 
-    /// State of the lazy single-init slot (`bstd::sync::Once` storing `Result<T, E>`).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum SlotState {
-        Empty,
-        Making(usize),
-        Done(Published),
-    }
-
-    /// Per-actor step state under deterministic tape-driven interleaving (zero OS threads).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum ActorState {
-        Idle,
-        ClaimedInit,
-        MakingYielded { attempt: u32 },
-        Waiting,
-        Done(Published),
-        Cancelled,
-    }
-
-    /// Tape-driven deterministic schedule explorer for `SharedCommandProbes`'s lazy initialization
-    /// protocol (simultaneous callers, mid-init maker cancellation, mid-wait waiter cancellation,
-    /// and injected error publication). Every interleaving is 100% single-threaded and replayable
-    /// from `tape`.
+    /// Tape-driven deterministic schedule explorer that drives the **actual production**
+    /// `SharedCommandProbes` / `CommandProbes` (`c_probes_with`, `spawn_setting_with`,
+    /// `spawn_setting_snapshot_with`, and `dep_probe_identity_from_setting`) on `Io::simulated`
+    /// across interleaved caller sequences, injected spawn-pin errors, and cancelled caller `Cx`s.
+    /// Every interleaving is 100% single-threaded and replayable from `tape`.
     fn probe_init_schedule(tape: &Tape, plant: ProbeOncePlant) -> Result<(), Broke> {
-        let workers = *tape.one_of(&[2usize, 3, 4, 5, 6], "workers");
-        let inject_error = tape.one_in(2, "inject init error");
-        let mut slot = SlotState::Empty;
-        let mut actors = std::vec![ActorState::Idle; workers];
-        let mut started_inits: u32 = 0;
-        let mut completed_inits: u32 = 0;
-        let mut active_makers: u32 = 0;
-        let mut published_seen = false;
-        let mut inits_after_publish: u32 = 0;
+        let seed = *tape.one_of(&[1u64, 7, 19, 42, 99, 137], "sim seed");
+        let callers = *tape.one_of(&[2usize, 3, 4, 5, 6], "callers");
+        let steps = *tape.one_of(&[6usize, 10, 16, 24], "steps");
+        let inject_spawn_error = tape.one_in(2, "inject spawn-pin error");
+        let c_probes_present = tape.one_in(2, "c_probes present");
 
-        for _step in 0..256 {
-            let mut runnable = std::vec::Vec::with_capacity(workers);
-            for (idx, st) in actors.iter().enumerate() {
-                match st {
-                    ActorState::Idle | ActorState::ClaimedInit | ActorState::MakingYielded { .. } => {
-                        runnable.push(idx);
-                    }
-                    ActorState::Waiting => {
-                        // A waiter can either be woken once `slot` is no longer `Making`, or be
-                        // cancelled mid-wait by its own deadline.
-                        if !matches!(slot, SlotState::Making(_)) || tape.one_in(5, "waiter cancel check") {
-                            runnable.push(idx);
-                        }
-                    }
-                    ActorState::Done(_) | ActorState::Cancelled => {}
-                }
-            }
-            if runnable.is_empty() {
-                break;
-            }
-            let actor = *tape.one_of(&runnable, "next actor");
-            match actors[actor] {
-                ActorState::Idle => match plant {
-                    ProbeOncePlant::None => match slot {
-                        SlotState::Done(val) => actors[actor] = ActorState::Done(val),
-                        SlotState::Making(_) => actors[actor] = ActorState::Waiting,
-                        SlotState::Empty => {
-                            slot = SlotState::Making(actor);
-                            active_makers += 1;
-                            actors[actor] = ActorState::ClaimedInit;
-                        }
-                    },
-                    ProbeOncePlant::SkipOnce => {
-                        // Planted bug: bypass single-init gate so racing callers re-initialize.
-                        active_makers += 1;
-                        actors[actor] = ActorState::ClaimedInit;
-                    }
-                },
-                ActorState::ClaimedInit => {
-                    if published_seen {
-                        inits_after_publish += 1;
-                    }
-                    started_inits += 1;
-                    actors[actor] = ActorState::MakingYielded { attempt: started_inits };
-                }
-                ActorState::MakingYielded { attempt } => {
-                    // Tape decides: mid-init cancellation (maker drops claim unpublished) vs
-                    // publishing Ok / injected Err.
-                    let cancel_maker = tape.one_in(4, "cancel maker mid-init");
-                    active_makers = active_makers.saturating_sub(1);
-                    if cancel_maker {
-                        if matches!(slot, SlotState::Making(owner) if owner == actor) {
-                            slot = SlotState::Empty;
-                        }
-                        actors[actor] = ActorState::Cancelled;
-                    } else {
-                        completed_inits += 1;
-                        let out = if inject_error { Published::Err(attempt) } else { Published::Ok(attempt) };
-                        slot = SlotState::Done(out);
-                        published_seen = true;
-                        actors[actor] = ActorState::Done(out);
-                    }
-                }
-                ActorState::Waiting => match slot {
-                    SlotState::Done(val) => actors[actor] = ActorState::Done(val),
-                    SlotState::Empty => {
-                        // Maker cancelled without publishing: waiter retries claim cleanly.
-                        actors[actor] = ActorState::Idle;
-                    }
-                    SlotState::Making(_) => {
-                        // Waiter deadline expired while maker was in flight: stops only waiter.
-                        actors[actor] = ActorState::Cancelled;
-                    }
-                },
-                ActorState::Done(_) | ActorState::Cancelled => {}
-            }
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        let cx = io
+            .cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME)
+            .map_err(|e| Broke::Oracle(std::format!("sim cx failed: {e}")))?;
+        let env = sim_env(&io);
+        let holder = SharedCommandProbes::new_with_plant(plant);
+        let probes = holder.with_env(&env);
 
-            // Safety invariant checked after EVERY single step:
-            if active_makers > 1 {
-                return Err(Broke::Oracle(std::format!(
-                    "duplicate concurrent initialization: {active_makers} active makers simultaneously"
-                )));
-            }
-            if inits_after_publish > 0 {
-                return Err(Broke::Oracle(std::format!(
-                    "duplicate initialization after publish: {inits_after_publish} extra inits"
-                )));
-            }
-        }
+        let c_inits = AtomicU32::new(0);
+        let s_inits = AtomicU32::new(0);
+        let mut first_c_tag: Option<Option<std::string::String>> = None;
+        let mut first_spawn_ok: Option<std::string::String> = None;
+        let mut first_spawn_err: Option<std::string::String> = None;
+        let mut first_dep_hex: Option<crate::wasm64_compile::Hex64> = None;
 
-        // Liveness & agreement oracle at quiescence:
-        let mut first_outcome: Option<Published> = None;
-        for (idx, st) in actors.iter().enumerate() {
-            match *st {
-                ActorState::Done(out) => {
-                    if inject_error && !matches!(out, Published::Err(_)) {
-                        return Err(Broke::Oracle(std::format!("actor {idx} saw Ok under injected error")));
-                    }
-                    if !inject_error && !matches!(out, Published::Ok(_)) {
-                        return Err(Broke::Oracle(std::format!("actor {idx} saw Err without injected error")));
-                    }
-                    if let Some(prev) = first_outcome {
-                        if prev != out {
+        let open_c = |_cx: &Cx| -> Option<CProbeSetting> {
+            let n = c_inits.fetch_add(1, Ordering::SeqCst) + 1;
+            if !c_probes_present {
+                return None;
+            }
+            Some(CProbeSetting::Unavailable(blaze_own::Arc::from_str_in(
+                std::format!("unavail-init-{n}").as_str(),
+                SharedAlloc::global(),
+            )))
+        };
+        let open_s = |_cx: &Cx| -> Result<SpawnSetting, blaze_own::String<SharedAlloc<'static>>> {
+            let n = s_inits.fetch_add(1, Ordering::SeqCst) + 1;
+            if inject_spawn_error {
+                Err(blaze_own::String::from_str_in(
+                    std::format!("injected-pin-err-{n}").as_str(),
+                    SharedAlloc::global(),
+                ))
+            } else {
+                Ok(SpawnSetting::facts_only(blaze_proc_macro::spawn_route::FactPins {
+                    clang_version_text: std::format!("clang version 23.0.{n}"),
+                    macos_product_version: std::string::String::new(),
+                    macos_build_version: std::string::String::new(),
+                }))
+            }
+        };
+
+        let mut c_calls: u32 = 0;
+        let mut s_calls: u32 = 0;
+        let ops = [
+            ProbeOp::CallCProbes,
+            ProbeOp::CallSpawnSetting,
+            ProbeOp::CallSpawnSnapshot,
+            ProbeOp::CallDepIdentity,
+            ProbeOp::CancelledIdentity,
+        ];
+        for step in 0..steps {
+            let _caller = step % callers;
+            let op = *tape.one_of(&ops, "probe op");
+            match op {
+                ProbeOp::CallCProbes => {
+                    c_calls += 1;
+                    let got = probes
+                        .c_probes_with(&cx, &open_c)
+                        .map_err(|e| Broke::Oracle(std::format!("c_probes_with failed: {e}")))?;
+                    let tag = match got {
+                        None => None,
+                        Some(CProbeSetting::Unavailable(reason)) => Some(std::string::String::from(reason.as_ref())),
+                        Some(CProbeSetting::Ready(_)) => Some(std::string::String::from("ready")),
+                    };
+                    if let Some(prev) = &first_c_tag {
+                        if prev != &tag {
                             return Err(Broke::Oracle(std::format!(
-                                "duplicate or divergent outcomes: actor {idx} saw {out:?}, expected {prev:?}"
+                                "duplicate or divergent c_probes outcome: got {tag:?}, expected {prev:?}"
                             )));
                         }
                     } else {
-                        first_outcome = Some(out);
+                        first_c_tag = Some(tag);
                     }
                 }
-                ActorState::Cancelled => {}
-                other => {
-                    return Err(Broke::Oracle(std::format!(
-                        "actor {idx} did not terminate (deadlocked/stuck in {other:?})"
-                    )));
+                ProbeOp::CallSpawnSetting => {
+                    s_calls += 1;
+                    match probes.spawn_setting_with(&cx, &open_s) {
+                        Ok(setting) => {
+                            if inject_spawn_error {
+                                return Err(Broke::Oracle(std::string::String::from(
+                                    "spawn_setting_with returned Ok under injected error",
+                                )));
+                            }
+                            let ver = setting
+                                .pins
+                                .as_ref()
+                                .map(|p| p.clang_version_text.clone())
+                                .unwrap_or_default();
+                            if let Some(prev) = &first_spawn_ok {
+                                if prev != &ver {
+                                    return Err(Broke::Oracle(std::format!(
+                                        "duplicate or divergent spawn_setting: got {ver:?}, expected {prev:?}"
+                                    )));
+                                }
+                            } else {
+                                first_spawn_ok = Some(ver);
+                            }
+                        }
+                        Err(err) => {
+                            if !inject_spawn_error {
+                                return Err(Broke::Oracle(std::format!(
+                                    "unexpected spawn_setting_with error: {err}"
+                                )));
+                            }
+                            if err.kind != ProbeErrorKind::SpawnPinsOpen {
+                                return Err(Broke::Oracle(std::format!(
+                                    "wrong ProbeErrorKind: {:?}",
+                                    err.kind
+                                )));
+                            }
+                            let detail = std::string::String::from(err.detail.as_str());
+                            if let Some(prev) = &first_spawn_err {
+                                if prev != &detail {
+                                    return Err(Broke::Oracle(std::format!(
+                                        "duplicate or divergent spawn error: got {detail:?}, expected {prev:?}"
+                                    )));
+                                }
+                            } else {
+                                first_spawn_err = Some(detail);
+                            }
+                        }
+                    }
+                }
+                ProbeOp::CallSpawnSnapshot => {
+                    s_calls += 1;
+                    match probes.spawn_setting_snapshot_with(&cx, &open_s) {
+                        Ok(setting) => {
+                            if inject_spawn_error {
+                                return Err(Broke::Oracle(std::string::String::from(
+                                    "spawn_setting_snapshot_with returned Ok under injected error",
+                                )));
+                            }
+                            let ver = setting
+                                .pins
+                                .as_ref()
+                                .map(|p| p.clang_version_text.clone())
+                                .unwrap_or_default();
+                            if let Some(prev) = &first_spawn_ok {
+                                if prev != &ver {
+                                    return Err(Broke::Oracle(std::format!(
+                                        "duplicate or divergent spawn snapshot: got {ver:?}, expected {prev:?}"
+                                    )));
+                                }
+                            } else {
+                                first_spawn_ok = Some(ver);
+                            }
+                        }
+                        Err(err) => {
+                            if !inject_spawn_error {
+                                return Err(Broke::Oracle(std::format!(
+                                    "unexpected spawn_setting_snapshot_with error: {err}"
+                                )));
+                            }
+                            let detail = std::string::String::from(err.detail.as_str());
+                            if let Some(prev) = &first_spawn_err {
+                                if prev != &detail {
+                                    return Err(Broke::Oracle(std::format!(
+                                        "duplicate or divergent snapshot error: got {detail:?}, expected {prev:?}"
+                                    )));
+                                }
+                            } else {
+                                first_spawn_err = Some(detail);
+                            }
+                        }
+                    }
+                }
+                ProbeOp::CallDepIdentity => {
+                    c_calls += 1;
+                    s_calls += 1;
+                    let cp = probes
+                        .c_probes_with(&cx, &open_c)
+                        .map_err(|e| Broke::Oracle(std::format!("c_probes_with failed: {e}")))?;
+                    match probes.spawn_setting_snapshot_with(&cx, &open_s) {
+                        Ok(sp) => {
+                            if inject_spawn_error {
+                                return Err(Broke::Oracle(std::string::String::from(
+                                    "dep identity saw Ok spawn setting under injected error",
+                                )));
+                            }
+                            let hex = crate::wasm64_compile::dep_probe_identity_from_setting(
+                                &cx,
+                                crate::graph::TRIPLE,
+                                &sp,
+                                cp.as_ref(),
+                                None,
+                                env.heap.alloc(),
+                                env.heap.shared(),
+                            )
+                            .map_err(|e| Broke::Oracle(std::format!("dep_probe_identity_from_setting failed: {e}")))?;
+                            if let Some(prev) = first_dep_hex {
+                                if prev != hex {
+                                    return Err(Broke::Oracle(std::format!(
+                                        "duplicate or divergent dep_probe_identity: got {}, expected {}",
+                                        hex.as_str(),
+                                        prev.as_str()
+                                    )));
+                                }
+                            } else {
+                                first_dep_hex = Some(hex);
+                            }
+                        }
+                        Err(err) => {
+                            if !inject_spawn_error {
+                                return Err(Broke::Oracle(std::format!(
+                                    "unexpected dep identity spawn error: {err}"
+                                )));
+                            }
+                            let detail = std::string::String::from(err.detail.as_str());
+                            if let Some(prev) = &first_spawn_err {
+                                if prev != &detail {
+                                    return Err(Broke::Oracle(std::format!(
+                                        "duplicate or divergent dep identity spawn error: got {detail:?}, expected {prev:?}"
+                                    )));
+                                }
+                            } else {
+                                first_spawn_err = Some(detail);
+                            }
+                        }
+                    }
+                }
+                ProbeOp::CancelledIdentity => {
+                    let mut cancelled_ok = false;
+                    let _ = cx.scope_with(|scope| {
+                        scope.cancel();
+                        let sp = SpawnSetting::off();
+                        let res = crate::wasm64_compile::dep_probe_identity_from_setting(
+                            scope.cx(),
+                            crate::graph::TRIPLE,
+                            &sp,
+                            None,
+                            None,
+                            env.heap.alloc(),
+                            env.heap.shared(),
+                        );
+                        // With `c_probes = None`, no answerer I/O runs so `dep_probe_identity` is pure.
+                        cancelled_ok = res.is_ok();
+                    });
+                    if !cancelled_ok {
+                        return Err(Broke::Oracle(std::string::String::from(
+                            "pure c_probes=None identity unexpectedly failed under cancelled scope",
+                        )));
+                    }
                 }
             }
+
+            // Safety invariants checked after EVERY single real production call:
+            let c_count = c_inits.load(Ordering::SeqCst);
+            if c_count > 1 {
+                return Err(Broke::Oracle(std::format!(
+                    "duplicate c_probes initialization in SharedCommandProbes: {c_count} inits"
+                )));
+            }
+            let s_count = s_inits.load(Ordering::SeqCst);
+            if s_count > 1 {
+                return Err(Broke::Oracle(std::format!(
+                    "duplicate spawn_setting initialization in SharedCommandProbes: {s_count} inits"
+                )));
+            }
         }
-        if first_outcome.is_some() && completed_inits != 1 {
+
+        // Exact-once quiescence oracle on the real `SharedCommandProbes` slots:
+        let expected_c = u32::from(c_calls > 0);
+        let expected_s = u32::from(s_calls > 0);
+        if c_inits.load(Ordering::SeqCst) != expected_c {
             return Err(Broke::Oracle(std::format!(
-                "duplicate initialization: completed_inits={completed_inits} (expected 1)"
+                "duplicate or missing c_probes init: got {}, expected {expected_c}",
+                c_inits.load(Ordering::SeqCst)
+            )));
+        }
+        if s_inits.load(Ordering::SeqCst) != expected_s {
+            return Err(Broke::Oracle(std::format!(
+                "duplicate or missing spawn_setting init: got {}, expected {expected_s}",
+                s_inits.load(Ordering::SeqCst)
             )));
         }
         Ok(())

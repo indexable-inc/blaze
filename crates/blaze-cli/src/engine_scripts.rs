@@ -683,24 +683,19 @@ impl<'f> PlannedDepProbes<'f> {
     }
 }
 
-/// Computes deterministic dependency-probe task-source tags for planned `MacroModule` tasks
-/// (both proc-macro modules in `graph_pub.made.parts` and `RanAs::Wasm` build-script modules
-/// named by `world.script_module_subjects()`), ONLY for units whose `wasm64-blaze-wasip1`
-/// closure executes dependency build scripts (Rule 21):
+/// Computes deterministic dependency-probe tables for every proc-macro and `RanAs::Wasm`
+/// build-script unit whose `wasm64-blaze-wasip1` closure executes dependency build scripts
+/// (shared between both `ready_preflight` and phase setup in `engine_check.rs`, Rule 21):
 /// - Workspaces with zero proc-macro or `RanAs::Wasm` build-script modules return immediately
 ///   with zero store reads, zero graph decodes, and zero probe I/O.
 /// - Units whose closure has no dependency build scripts never call `dep_probe_identity_hex`.
-/// - Proc-macro `MacroModule` parts in `graph_pub.made.parts` are updated in place via
-///   `macros::part_source_with_dep_probes` so both `preserve_standing_sibling_names` and
-///   `ScriptsStage::plan` share one source of truth.
 /// - Refused stored graphs are propagated cleanly (never downgraded to empty probe tags, Rule 3).
-#[expect(clippy::too_many_arguments, reason = "planning edge over cx, world, store, graph_pub, tools, probes, skip_fixture, and frame")]
-pub(crate) fn plan_dep_probe_tags<'f>(
+#[expect(clippy::too_many_arguments, reason = "planning edge over cx, world, store, graph_key, probes, skip_fixture, and frame")]
+pub(crate) fn plan_dep_probe_tags_at<'f>(
     cx: &Cx,
     world: &crate::names::Names<'_>,
     store: &mut dyn crate::store::Store<'_>,
-    graph_pub: &mut crate::engine_units::Published<'f>,
-    tools: Tools,
+    graph_key: blaze_drive::Key,
     probes: crate::scripts::CommandProbes<'_>,
     skip_fixture: bool,
     frame: &'f Frame,
@@ -709,10 +704,11 @@ pub(crate) fn plan_dep_probe_tags<'f>(
     if skip_fixture {
         return Ok(planned);
     }
-    let Ok(record) = &mut graph_pub.made else {
-        return Ok(planned);
+    let has_proc_macros = {
+        use blaze_world::crate_list::CrateGraph as _;
+        let list = world.list();
+        (0..list.len()).any(|at| list.proc_macro(at))
     };
-    let has_proc_macros = record.parts.iter().any(|p| p.name.kind == Kind::MacroModule);
     let has_wasm_scripts = world
         .script_module_subjects()
         .any(|s| world.script_module(s).is_some_and(|m| m.ran_as == crate::scripts::RanAs::Wasm));
@@ -733,7 +729,6 @@ pub(crate) fn plan_dep_probe_tags<'f>(
     let decode_erased = decode_frame.as_ref().map(blaze_own::Erased::new);
     let decoded_pair = if let Some(erased) = &decode_erased {
         let alloc = erased.handle();
-        let graph_key = tools.key(Name::unit_graph(), &graph_pub.source);
         match crate::engine_units::stored_graph_at(cx, store, graph_key)? {
             Ok((_view, sections)) => {
                 let g = blaze_unit_graph::record::decode(sections.graph, alloc)
@@ -774,17 +769,14 @@ pub(crate) fn plan_dep_probe_tags<'f>(
         }
     };
 
-    // 1. Proc-macro `MacroModule` parts in `graph_pub.made.parts`.
-    for part in record.parts.iter_mut() {
-        let (Kind::MacroModule, Locate::Source(cur_source)) = (part.name.kind, part.locate) else {
-            continue;
-        };
-        let mut entry: Option<PlannedProbe> = None;
+    // 1. Proc-macro `MacroModule` units in `graph` (sorted and deduped by subject).
+    if has_proc_macros {
         for (idx, unit) in graph.units.iter().enumerate() {
             if !matches!(unit.kind, blaze_unit_graph::UnitKind::ProcMacro) {
                 continue;
             }
-            if crate::macros::subject(unit) != part.name.subject {
+            let subj = crate::macros::subject(unit);
+            if planned.proc_macros.iter().any(|(s, _)| *s == subj) {
                 continue;
             }
             let Ok(uid) = u32::try_from(idx) else { continue };
@@ -794,50 +786,130 @@ pub(crate) fn plan_dep_probe_tags<'f>(
                 blaze_unit_graph::UnitId(uid),
                 true,
             ) {
-                Ok(true) => {
-                    entry = Some(get_planned_probe());
-                    break;
-                }
+                Ok(true) => planned.proc_macros.push((subj, get_planned_probe())),
                 Ok(false) => {}
-                Err(error) => {
-                    entry = Some(PlannedProbe::Failed(error));
-                    break;
-                }
+                Err(error) => planned.proc_macros.push((subj, PlannedProbe::Failed(error))),
             }
-        }
-        if let Some(planned_entry) = entry {
-            let tag = planned_entry.source_hex();
-            part.locate = Locate::Source(crate::macros::part_source_with_dep_probes(
-                cur_source,
-                tag.as_str(),
-            ));
-            planned.proc_macros.push((part.name.subject, planned_entry));
         }
     }
 
     // 2. Build-script `MacroModule` tasks (`RanAs::Wasm` subjects).
-    let mut last = None;
-    for subject in world.script_module_subjects() {
-        if last == Some(subject) {
-            continue;
-        }
-        last = Some(subject);
-        let Some(module) = world.script_module(subject) else { continue };
-        if module.ran_as != crate::scripts::RanAs::Wasm {
-            continue;
-        }
-        let Some(script_name) = world.script_of(module.crate_at) else { continue };
-        let Some(run) = world.script_run(script_name.subject) else { continue };
-        let script_unit = blaze_unit_graph::UnitId(run.unit);
-        match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, script_unit, false) {
-            Ok(true) => planned.script_modules.push((subject, get_planned_probe())),
-            Ok(false) => {}
-            Err(error) => planned.script_modules.push((subject, PlannedProbe::Failed(error))),
+    if has_wasm_scripts {
+        let mut last = None;
+        for subject in world.script_module_subjects() {
+            if last == Some(subject) {
+                continue;
+            }
+            last = Some(subject);
+            let Some(module) = world.script_module(subject) else { continue };
+            if module.ran_as != crate::scripts::RanAs::Wasm {
+                continue;
+            }
+            let Some(script_name) = world.script_of(module.crate_at) else { continue };
+            let Some(run) = world.script_run(script_name.subject) else { continue };
+            let script_unit = blaze_unit_graph::UnitId(run.unit);
+            match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, script_unit, false) {
+                Ok(true) => planned.script_modules.push((subject, get_planned_probe())),
+                Ok(false) => {}
+                Err(error) => planned.script_modules.push((subject, PlannedProbe::Failed(error))),
+            }
         }
     }
     planned.proc_macros.sort_unstable_by_key(|(s, _)| *s);
     planned.script_modules.sort_unstable_by_key(|(s, _)| *s);
     Ok(planned)
+}
+
+/// Phase-path wrapper over [`plan_dep_probe_tags_at`]: also updates proc-macro `MacroModule`
+/// parts in `graph_pub.made.parts` in place via `macros::part_source_with_dep_probes` so both
+/// `preserve_standing_sibling_names` and `ScriptsStage::plan` share one source of truth.
+#[expect(clippy::too_many_arguments, reason = "planning edge over cx, world, store, graph_pub, tools, probes, skip_fixture, and frame")]
+pub(crate) fn plan_dep_probe_tags<'f>(
+    cx: &Cx,
+    world: &crate::names::Names<'_>,
+    store: &mut dyn crate::store::Store<'_>,
+    graph_pub: &mut crate::engine_units::Published<'f>,
+    tools: Tools,
+    probes: crate::scripts::CommandProbes<'_>,
+    skip_fixture: bool,
+    frame: &'f Frame,
+) -> Result<PlannedDepProbes<'f>, CliError> {
+    let Ok(record) = &mut graph_pub.made else {
+        return Ok(PlannedDepProbes::empty(frame));
+    };
+    let graph_key = tools.key(Name::unit_graph(), &graph_pub.source);
+    let planned = plan_dep_probe_tags_at(cx, world, store, graph_key, probes, skip_fixture, frame)?;
+    if !planned.proc_macros.is_empty() {
+        for part in record.parts.iter_mut() {
+            let (Kind::MacroModule, Locate::Source(cur_source)) = (part.name.kind, part.locate) else {
+                continue;
+            };
+            if let Ok(at) = planned.proc_macros.binary_search_by_key(&part.name.subject, |(s, _)| *s)
+                && let Some((_, planned_entry)) = planned.proc_macros.get(at)
+            {
+                let tag = planned_entry.source_hex();
+                part.locate = Locate::Source(crate::macros::part_source_with_dep_probes(
+                    cur_source,
+                    tag.as_str(),
+                ));
+            }
+        }
+    }
+    Ok(planned)
+}
+
+/// Checks on the ready-wake path whether any probe-dependent `MacroModule` task's stored row in
+/// `stored` was recorded under a different dependency-probe tag than `planned`:
+/// - Returns `Ok(None)` when every probe-dependent `MacroModule` task matches `planned` (so the
+///   fast ready path may proceed).
+/// - Returns `Ok(Some(name))` for the first `MacroModule` task whose stored source/payload
+///   disagrees with `planned` (or is missing), so `ready_preflight` refuses ready wake with
+///   `ReadyRefused::Kind { name }` and `Driver::Auto` routes to the phase path to re-key and
+///   rerun that `MacroModule` cleanly.
+pub(crate) fn ready_dep_probe_mismatch(
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'_>,
+    stored: &crate::engine_answer::Stored<'_>,
+    graph_source: ContentId,
+    planned: &PlannedDepProbes<'_>,
+) -> Result<Option<Name>, CliError> {
+    use blaze_engine::StoredPages as _;
+    for (subject, _) in planned.script_modules.iter() {
+        let name = crate::script_modules::name(*subject);
+        let today_source = script_module_task_source(graph_source, *subject, planned.script_modules.as_slice());
+        let header = stored.header(name).map_err(crate::engine_answer::page_error)?;
+        if header.is_none_or(|h| h.facts.source != today_source) {
+            return Ok(Some(name));
+        }
+    }
+    let empty_files = crate::macro_files::empty_closure_digest();
+    for (subject, entry) in planned.proc_macros.iter() {
+        let name = Name::new(Kind::MacroModule, *subject);
+        let Some(header) = stored.header(name).map_err(crate::engine_answer::page_error)? else {
+            return Ok(Some(name));
+        };
+        let today_tag = entry.source_hex();
+        let empty_base = crate::macros::part_source_with_files(graph_source, empty_files, *subject);
+        let empty_expected = crate::macros::part_source_with_dep_probes(empty_base, today_tag.as_str());
+        if header.facts.source == empty_expected {
+            continue;
+        }
+        // Workspace or `[patch.*]` path-dep proc-macros fold a non-empty `closure_digest` into
+        // `header.facts.source`; check the stored `MacroModule` record's 64-byte probe payload
+        // written by `macros::run` to verify exact probe-tag agreement without parsing `Cargo.lock`.
+        if let PlannedProbe::Digest(today_hex) = entry
+            && !header.facts.failed
+            && let Some(rec_key) = header.record
+            && let Some(held) = store.get(cx, rec_key)?
+            && let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(held.bytes)
+            && view.name == name
+            && view.payload == today_hex.as_str().as_bytes()
+        {
+            continue;
+        }
+        return Ok(Some(name));
+    }
+    Ok(None)
 }
 
 /// Resolves a build-script `MacroModule` task's source, mixing in any planned dependency-probe

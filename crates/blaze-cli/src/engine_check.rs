@@ -4203,6 +4203,37 @@ fn checking<'f, 's: 'f>(
             discovered.plan.files_read = setup.rows_read;
             discovered.plan.files_total = setup.slots;
             let ReadySetup { rows, names, graph, outlined, deferred, slots, files: file_counts, skipped, places: file_places, rows_read: _ } = setup;
+            if ({
+                use blaze_world::crate_list::CrateGraph as _;
+                names.script_keys().next().is_some()
+                    || (0..names.list().len()).any(|at| names.list().proc_macro(at))
+            }) && let Some(lazy) = lazy_sdk
+            {
+                env.sdk = lazy.resolve_in_home(cx, Some(opened.home.dir()), phases);
+            }
+            let ready_dep_probes = crate::engine_scripts::plan_dep_probe_tags_at(
+                cx,
+                &names,
+                &mut store,
+                graph.at,
+                command_probes.with_env(&env),
+                scripts.has_runner(),
+                frame,
+            )?;
+            if !ready_dep_probes.proc_macros.is_empty() || !ready_dep_probes.script_modules.is_empty() {
+                let Some(graph_header) = last_stored.header(Name::unit_graph()).map_err(crate::engine_answer::page_error)? else {
+                    return Ok(Err(ReadyRefused::NoRow { name: Name::unit_graph() }));
+                };
+                if let Some(stale_module) = crate::engine_scripts::ready_dep_probe_mismatch(
+                    cx,
+                    &mut store,
+                    last_stored,
+                    graph_header.facts.source,
+                    &ready_dep_probes,
+                )? {
+                    return Ok(Err(ReadyRefused::Kind { name: stale_module }));
+                }
+            }
             let names = Some(NamesStage::new(names, frame));
             let graph = Some(graph);
             let plan_list = names.as_ref().and_then(|stage| stage.names.as_ref()).map(|world| world.list());
