@@ -469,10 +469,15 @@ impl<'f> Discovered<'f> {
     }
 }
 
-impl Discovered<'_> {
+impl<'f> Discovered<'f> {
     /// The record of `name`, if it was made.
-    pub(crate) fn get(&self, name: Name) -> Option<&Published<'_>> {
-        self.published.binary_search_by(|one| one.name.cmp(&name)).ok().map(|at| &self.published[at])
+    pub(crate) fn get(&self, name: Name) -> Option<&Published<'f>> {
+        self.published.binary_search_by(|one| one.name.cmp(&name)).ok().and_then(|at| self.published.get(at))
+    }
+
+    /// Mutable reference to the record of `name`, if it was made.
+    pub(crate) fn get_mut(&mut self, name: Name) -> Option<&mut Published<'f>> {
+        self.published.binary_search_by(|one| one.name.cmp(&name)).ok().and_then(|at| self.published.get_mut(at))
     }
 
     /// How the Units task `name`'s result stands: owed to the next command when it failed for a

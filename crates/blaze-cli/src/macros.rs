@@ -44,7 +44,11 @@ const SUBJECT_DOMAIN: &str = "blaze-cli macro crate 1";
 // "5": proc-macro module identity bumped to form 8 (`blaze proc-macro module 8`:
 // wasm64-blaze-wasip1 target-specific dependency resolution), invalidating cached
 // `MacroModule` task records that pointed at pre-v8 proc-macro modules.
-const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 5";
+// "6": `MacroModule` source mixes in per-closure `macro_files::closure_digest`
+// (`part_source_with_files`) so patched path deps reached by registry/git proc-macros
+// invalidate only affected `MacroModule` tasks without polluting `units_source` with unrelated
+// runtime patches.
+const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 6";
 const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";
@@ -141,6 +145,17 @@ pub(crate) fn parts_of_subjects<A: core::alloc::Allocator>(graph_source: Content
     parts.sort_unstable_by_key(|(name, _)| name.subject);
     parts.dedup_by_key(|(name, _)| name.subject);
     parts
+}
+
+/// The `MacroModule` task source for `subject` over `graph_source` and `macro_files_digest`
+/// (`macro_files::rows_digest`): covers both the unit graph and the post-graph `MacroFiles`
+/// rows of `[patch.*]` path deps reached by actual proc-macro crates (rules 21 and 60).
+pub(crate) fn part_source_with_files(graph_source: ContentId, macro_files_digest: ContentId, subject: ContentId) -> ContentId {
+    let mut source = [0u8; 96];
+    source[..32].copy_from_slice(&graph_source.0);
+    source[32..64].copy_from_slice(&macro_files_digest.0);
+    source[64..].copy_from_slice(&subject.0);
+    ContentId::of(SOURCE_DOMAIN, &source)
 }
 
 /// Why the macro crates of a command could not be listed.

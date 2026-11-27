@@ -4297,6 +4297,44 @@ fn checking<'f, 's: 'f>(
                 let back = crate::engine_units::Back::new(&answer_units);
                 crate::engine_units::discover(cx, root, &mut store, &mut laid_here, units, tools, &back, stood, &env, board, frame)?
             };
+            // After `UnitGraph` resolves, we know the exact set of `UnitKind::ProcMacro` crates
+            // (including registry/git proc-macros). Emit `MacroFiles` sweep rows ONLY for checkout
+            // path packages reached in `Cargo.lock` from those actual proc-macro roots, and mix
+            // their digest into each `MacroModule` task's source (rules 21 & 60).
+            let macro_files_digest = if let (Some(lockfile), Some(members), Some(world)) = (
+                laid_here.lock.as_ref(),
+                crate::names::member_dirs(Some(&laid_here)),
+                discovered.names.as_ref(),
+            ) {
+                use blaze_world::crate_list::CrateGraph as _;
+                let list = world.list();
+                let proc_macros = (0..list.len())
+                    .filter(|&at| list.proc_macro(at))
+                    .map(|at| (list.package(at), list.version(at)));
+                let standing = (discovered.cause == crate::engine_units::UnitsCause::ReadBack)
+                    .then(|| followed_kept.as_ref().map(|followed| &followed.now))
+                    .flatten();
+                Some(crate::units::emit_proc_macro_lock_files(
+                    cx, root, &stamps, proc_macros, lockfile.lock, members, standing, &mut rows, frame,
+                )?)
+            } else {
+                None
+            };
+            if let Some(macro_files_digest) = macro_files_digest
+                && let Some(graph_pub) = discovered.get_mut(Name::unit_graph())
+                && let Ok(record) = &mut graph_pub.made
+            {
+                let graph_source = graph_pub.source;
+                for part in record.parts.iter_mut() {
+                    if part.name.kind == Kind::MacroModule {
+                        part.locate = blaze_drive::Locate::Source(crate::macros::part_source_with_files(
+                            graph_source,
+                            macro_files_digest,
+                            part.name.subject,
+                        ));
+                    }
+                }
+            }
             phases.mark_cx(cx, discovered.cause.phase(), frame);
             let kept = Kept { slots: &today_slots, answer: &start, records: &records, stored: stored.as_ref(), tools: &tools, read: core::sync::atomic::AtomicU32::new(0) };
             let mut found_last: SVec<'_, (Name, blaze_engine::pages::FilePlace)> = SVec::new_in(alloc);

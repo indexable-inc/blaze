@@ -31,7 +31,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1323
+blaze-cli	1322
 blaze-cli-spec	117
 blaze-code	94
 blaze-columns	193

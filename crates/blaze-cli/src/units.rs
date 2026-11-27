@@ -384,8 +384,11 @@ fn emit_macro_files<'a>(
                 stack.push(id);
             }
         };
-        // Seed 1: every checkout proc-macro crate (member or external path package) so its full
+        // Seed every checkout proc-macro crate (member or external path package) so its full
         // `Cargo.lock` transitive closure (including dev-deps and registry hops) is pinned.
+        // Registry/git proc-macro roots are NOT known until `UnitGraph` resolves and are handled
+        // surgically by [`emit_proc_macro_lock_files`] so used runtime `[patch.*]` dependencies
+        // never pollute `units_source` (rule 60).
         let mut proc_macro_dirs: blaze_own::BTreeSet<&'a str, &Frame> = blaze_own::BTreeSet::new_in(frame);
         for pkg in units.members.iter().chain(units.path_packages.iter()) {
             if pkg.lib.iter().any(|lib| lib.proc_macro) {
@@ -395,22 +398,6 @@ fn emit_macro_files<'a>(
         for entry in checkout_dirs.iter() {
             if proc_macro_dirs.contains(entry.dir.as_str()) {
                 push_lock(entry.id, &mut seen_lock, &mut lock_stack);
-            }
-        }
-        // Seed 2: every `LockSource::Path` package directly depended on by any registry/git
-        // package in `Cargo.lock` (e.g. `[patch.crates-io]` vendored or patched-member crates).
-        // Any registry/git proc-macro crate reaching a path package in `Cargo.lock` must cross a
-        // non-path -> path edge first; unrelated workspace members are never depended on by
-        // registry/git packages and stay unswept (rule 60).
-        for pkg in lock.packages.iter() {
-            if !matches!(pkg.source, blaze_manifest::lock::LockSource::Path) {
-                for &dep in pkg.deps.iter() {
-                    if let Some(dep_pkg) = lock.packages.get(dep.index())
-                        && matches!(dep_pkg.source, blaze_manifest::lock::LockSource::Path)
-                    {
-                        push_lock(dep, &mut seen_lock, &mut lock_stack);
-                    }
-                }
             }
         }
         while let Some(id) = lock_stack.pop() {
@@ -442,6 +429,90 @@ fn emit_macro_files<'a>(
         }
     }
     Ok(())
+}
+
+/// Emit `LeafKind::MacroFiles` (plus `MacroFile` and `MacroFolder`) sweep rows for any checkout
+/// path package (`PathKind::Member` or `PathKind::External`) reachable in `lock` from the actual
+/// proc-macro crates in `proc_macros` (each `(package_name, version)`) that was not already
+/// emitted during [`lay`] (e.g. `[patch.*]` path dependencies reached by registry or git
+/// proc-macro crates such as `sqlx-macros` / `rasn-derive`).
+///
+/// Unrelated used runtime `[patch.*]` dependencies are never reached from any proc-macro root
+/// and stay out of both `rows` and `units_source` (rule 60). Under a standing read-back
+/// (`standing_followed = Some`), previously tracked rows are copied straight from
+/// `standing_followed` with zero filesystem I/O (rules 74 & 77).
+///
+/// Returns [`crate::macro_files::rows_digest`] over all present `LeafKind::MacroFiles` rows in
+/// `rows` so `Kind::MacroModule` task keys cover every reached path dependency (rule 21).
+#[expect(clippy::too_many_arguments, reason = "post-graph sweep handles, resolved proc-macros, lock, checkout dirs and standing rows")]
+pub(crate) fn emit_proc_macro_lock_files<'a>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    stamps: &impl Stamps,
+    proc_macros: impl Iterator<Item = (&'a str, &'a str)>,
+    lock: &blaze_manifest::lock::Lock<'_>,
+    checkout_dirs: &[crate::graph::CheckoutDir],
+    standing_followed: Option<&Rows<'_>>,
+    rows: &mut Rows<'_>,
+    frame: &Frame,
+) -> Result<ContentId, CliError> {
+    let pkg_count = lock.packages.len();
+    let mut dir_of_lock: Vec<Option<&str>, &Frame> = Vec::with_capacity_in(pkg_count, frame);
+    dir_of_lock.resize(pkg_count, None);
+    for entry in checkout_dirs.iter() {
+        if let Some(slot) = dir_of_lock.get_mut(entry.id.index()) {
+            *slot = Some(entry.dir.as_str());
+        }
+    }
+    let mut seen_lock: Vec<bool, &Frame> = Vec::with_capacity_in(pkg_count, frame);
+    seen_lock.resize(pkg_count, false);
+    let mut lock_stack: Vec<blaze_manifest::lock::LockId, &Frame> = Vec::new_in(frame);
+    let push_lock = |id: blaze_manifest::lock::LockId, seen: &mut [bool], stack: &mut Vec<blaze_manifest::lock::LockId, &Frame>| {
+        if let Some(slot) = seen.get_mut(id.index())
+            && !*slot
+        {
+            *slot = true;
+            stack.push(id);
+        }
+    };
+    let mut ver_buf = blaze_own::String::new_in(frame);
+    for (pkg_name, pkg_version) in proc_macros {
+        // Match `LockedPackages::closure_with`: first lock entry of `(pkg_name, pkg_version)`.
+        let found = lock.named(pkg_name).find(|&id| {
+            let Some(pkg) = lock.packages.get(id.index()) else { return false };
+            ver_buf.clear();
+            let _ = core::fmt::Write::write_fmt(&mut ver_buf, format_args!("{}", pkg.version));
+            ver_buf.as_str() == pkg_version
+        });
+        if let Some(id) = found {
+            push_lock(id, &mut seen_lock, &mut lock_stack);
+        }
+    }
+    let mut needed_dirs: blaze_own::BTreeSet<&str, &Frame> = blaze_own::BTreeSet::new_in(frame);
+    while let Some(id) = lock_stack.pop() {
+        if let Some(Some(dir)) = dir_of_lock.get(id.index()) {
+            needed_dirs.insert(dir);
+        }
+        if let Some(pkg) = lock.packages.get(id.index()) {
+            for &dep in pkg.deps.iter() {
+                push_lock(dep, &mut seen_lock, &mut lock_stack);
+            }
+        }
+    }
+    let mut missing_dirs: Vec<&str, &Frame> = Vec::new_in(frame);
+    for &dir in needed_dirs.iter() {
+        let already = rows.of(sweep::LeafKind::MacroFiles).any(|leaf| !leaf.absent() && rows.path(leaf) == dir);
+        if !already {
+            missing_dirs.push(dir);
+        }
+    }
+    for &dir in missing_dirs.iter() {
+        let copied = standing_followed.is_some_and(|followed| crate::macro_files::copy_standing_rows(followed, dir, rows, frame));
+        if !copied {
+            crate::macro_files::read_row(cx, root, stamps, dir, rows, frame)?;
+        }
+    }
+    Ok(crate::macro_files::rows_digest(rows, frame))
 }
 
 /// Where a refusal is: the manifest's id and the span, when it names one.
@@ -1372,21 +1443,27 @@ version = \"0.1.0\"
 
     /// Registry proc-macro crates (`sqlx-macros`, `rasn-derive`) reaching `[patch.crates-io]`
     /// vendored `PathKind::External` packages (and their transitive path dependencies) or patched
-    /// workspace members in `Cargo.lock` get `LeafKind::MacroFiles` sweep rows so
-    /// `blaze_world::procs::identify` succeeds cleanly instead of failing with
-    /// `ClosureError::Unpinned`, while unrelated workspace members and unused patches stay
-    /// unswept (rule 60). Editing a transitive vendored path dependency moves `units_source` and
-    /// the proc-macro module key (rule 21).
+    /// workspace members in `Cargo.lock` get `LeafKind::MacroFiles` sweep rows via
+    /// [`emit_proc_macro_lock_files`] so `blaze_world::procs::identify` succeeds cleanly instead
+    /// of failing with `ClosureError::Unpinned`.
+    ///
+    /// Crucially, a **used runtime `[patch.crates-io]` dependency** reached only by a regular
+    /// non-proc-macro registry crate (`tokio-rt -> vendor/patched-runtime`) gets NO `MacroFiles`
+    /// row (neither in `lay` nor in `emit_proc_macro_lock_files`), so editing it moves neither
+    /// `units_source` nor `MacroModule` task sources (rule 60), whereas editing a transitive
+    /// vendored path dependency under `sqlx-macros` moves `macro_files_digest`, the `MacroModule`
+    /// source, and the proc-macro module key (rule 21).
     #[test]
     fn registry_proc_macro_patched_lock_deps_get_macro_files_and_identify_succeeds() {
         const ROOT_TOML: &str = "\
 [workspace]
 members = [\"crates/app\", \"crates/unrelated\", \"crates/patched-member\"]
-exclude = [\"vendor/sqlx-postgres\", \"vendor/aws-lc-sys\", \"vendor/unused\"]
+exclude = [\"vendor/sqlx-postgres\", \"vendor/aws-lc-sys\", \"vendor/patched-runtime\", \"vendor/unused\"]
 
 [patch.crates-io]
 sqlx-postgres = { path = \"vendor/sqlx-postgres\" }
 patched-member = { path = \"crates/patched-member\" }
+patched-runtime = { path = \"vendor/patched-runtime\" }
 unused = { path = \"vendor/unused\" }
 ";
         const APP_TOML: &str = "\
@@ -1397,6 +1474,7 @@ edition = \"2024\"
 
 [dependencies]
 sqlx-macros = \"0.9.0\"
+tokio-rt = \"1.0.0\"
 unrelated = { path = \"../unrelated\" }
 ";
         const UNRELATED_TOML: &str = "[package]\nname = \"unrelated\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
@@ -1411,6 +1489,7 @@ edition = \"2021\"
 aws-lc-sys = { path = \"../aws-lc-sys\" }
 ";
         const AWS_LC_TOML: &str = "[package]\nname = \"aws-lc-sys\"\nversion = \"0.30.0\"\nedition = \"2021\"\n";
+        const PATCHED_RT_TOML: &str = "[package]\nname = \"patched-runtime\"\nversion = \"1.0.0\"\nedition = \"2021\"\n";
         const UNUSED_TOML: &str = "[package]\nname = \"unused\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
         const LOCK_TOML: &str = "\
 version = 4
@@ -1418,11 +1497,22 @@ version = 4
 [[package]]
 name = \"app\"
 version = \"0.1.0\"
-dependencies = [\"sqlx-macros\", \"unrelated\"]
+dependencies = [\"sqlx-macros\", \"tokio-rt\", \"unrelated\"]
 
 [[package]]
 name = \"unrelated\"
 version = \"0.1.0\"
+
+[[package]]
+name = \"tokio-rt\"
+version = \"1.0.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"3333333333333333333333333333333333333333333333333333333333333333\"
+dependencies = [\"patched-runtime\"]
+
+[[package]]
+name = \"patched-runtime\"
+version = \"1.0.0\"
 
 [[package]]
 name = \"sqlx-macros\"
@@ -1451,7 +1541,7 @@ version = \"0.30.0\"
 name = \"patched-member\"
 version = \"0.1.0\"
 ";
-        let run_once = |aws_lc_src: &str| {
+        let run_once = |aws_lc_src: &str, runtime_patch_src: &str| {
             let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
             let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
             let frame = cx.frame();
@@ -1471,6 +1561,8 @@ version = \"0.1.0\"
             put("vendor/sqlx-postgres/src/lib.rs", "pub fn pg() {}");
             put("vendor/aws-lc-sys/Cargo.toml", AWS_LC_TOML);
             put("vendor/aws-lc-sys/src/lib.rs", aws_lc_src);
+            put("vendor/patched-runtime/Cargo.toml", PATCHED_RT_TOML);
+            put("vendor/patched-runtime/src/lib.rs", runtime_patch_src);
             put("vendor/unused/Cargo.toml", UNUSED_TOML);
             put("vendor/unused/src/lib.rs", "");
             let erased = blaze_own::Erased::new(frame);
@@ -1478,14 +1570,33 @@ version = \"0.1.0\"
             let heap = blaze_own::testing::heap();
             let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), heap, frame, erased.handle()).expect("laid");
             assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
-            let source = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
+            let units_source = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
+            assert!(
+                rows.of(sweep::LeafKind::MacroFiles).next().is_none(),
+                "lay() must not eagerly sweep non-member registry/runtime patches into units_source (rule 60)"
+            );
+            let lock = laid.lock.as_ref().expect("lock").lock;
+            let parts = laid.parts.as_ref().expect("parts");
+            let proc_macros = [("sqlx-macros", "0.9.0")];
+            let files_digest = emit_proc_macro_lock_files(
+                &cx, &root, &FromMeta { swept_at_ns: 0 }, proc_macros.into_iter(), lock, parts.member_dirs(), None, &mut rows, frame,
+            )
+            .expect("emit proc-macro lock files");
+            // Verify warm read-back copy path yields identical digest with zero extra disk reads.
+            let mut warm_rows = Rows::new_in(frame);
+            let reads_before = io.disk().expect("sim disk").read;
+            let warm_digest = emit_proc_macro_lock_files(
+                &cx, &root, &FromMeta { swept_at_ns: 0 }, proc_macros.into_iter(), lock, parts.member_dirs(), Some(&rows), &mut warm_rows, frame,
+            )
+            .expect("warm copy standing rows");
+            let reads_after = io.disk().expect("sim disk").read;
+            assert_eq!(reads_after, reads_before, "standing read-back must copy MacroFiles rows with zero disk reads");
+            assert_eq!(warm_digest, files_digest, "warm copy digest must match cold read digest (rule 26)");
             let macro_dirs: std::vec::Vec<std::string::String> = rows
                 .of(sweep::LeafKind::MacroFiles)
                 .filter(|leaf| !leaf.absent())
                 .map(|leaf| rows.path(leaf).to_owned())
                 .collect();
-            let lock = laid.lock.as_ref().expect("lock").lock;
-            let parts = laid.parts.as_ref().expect("parts");
             let place = crate::macros::Place { home: None, checkout: "", members: Some(parts.member_dirs()), rows: &rows };
             let locked = blaze_proc_macro::module::LockedPackages::of(lock);
             let pkg_id = lock.named("sqlx-macros").next().expect("sqlx-macros in lock");
@@ -1509,20 +1620,31 @@ version = \"0.1.0\"
                 .expect("identify io")
                 .expect("sqlx-macros must identify cleanly instead of ClosureError::Unpinned");
             let key = identity.with_id(blaze_proc_macro::module::module_key);
-            (source, macro_dirs, key)
+            let part_src = crate::macros::part_source_with_files(units_source, files_digest, crate::macros::subject(&unit));
+            (units_source, files_digest, part_src, macro_dirs, key)
         };
-        let (src_a, macro_dirs, key_a) = run_once("pub fn v1() {}");
+        let (u_a, d_a, p_a, macro_dirs, key_a) = run_once("pub fn v1() {}", "pub fn rt_v1() {}");
         let unique: std::collections::BTreeSet<&str> = macro_dirs.iter().map(std::string::String::as_str).collect();
         assert_eq!(unique.len(), macro_dirs.len(), "no duplicate MacroFiles rows: {macro_dirs:?}");
-        assert!(unique.contains("vendor/sqlx-postgres"), "direct patched dep must have MacroFiles: {macro_dirs:?}");
-        assert!(unique.contains("vendor/aws-lc-sys"), "transitive vendored path dep must have MacroFiles: {macro_dirs:?}");
-        assert!(unique.contains("crates/patched-member"), "patched workspace member must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.contains("vendor/sqlx-postgres"), "direct patched dep under proc-macro must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.contains("vendor/aws-lc-sys"), "transitive vendored path dep under proc-macro must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.contains("crates/patched-member"), "patched workspace member under proc-macro must have MacroFiles: {macro_dirs:?}");
+        assert!(!unique.contains("vendor/patched-runtime"), "used runtime [patch.crates-io] dep must NOT get MacroFiles (rule 60): {macro_dirs:?}");
         assert!(!unique.contains("crates/app"), "regular app member must not be eagerly swept (rule 60): {macro_dirs:?}");
         assert!(!unique.contains("crates/unrelated"), "unrelated workspace member must not be eagerly swept (rule 60): {macro_dirs:?}");
         assert!(!unique.contains("vendor/unused"), "unused patch must not be eagerly swept (rule 60): {macro_dirs:?}");
-        let (src_b, _, key_b) = run_once("pub fn v2() {}");
-        assert_ne!(src_a, src_b, "editing transitive vendored path dep must move units_source (rule 21)");
-        assert_ne!(key_a, key_b, "editing transitive vendored path dep must move proc-macro module key (rule 21)");
+        // Editing the used runtime patch leaves units_source, macro_files_digest, MacroModule source, and key untouched (rule 60).
+        let (u_rt, d_rt, p_rt, _, key_rt) = run_once("pub fn v1() {}", "pub fn rt_v2_edited() {}");
+        assert_eq!(u_a, u_rt, "editing used runtime patch must NOT invalidate units_source (rule 60)");
+        assert_eq!(d_a, d_rt, "editing used runtime patch must NOT move macro_files_digest (rule 60)");
+        assert_eq!(p_a, p_rt, "editing used runtime patch must NOT invalidate MacroModule task source (rule 60)");
+        assert_eq!(key_a, key_rt, "editing used runtime patch must NOT move proc-macro module key");
+        // Editing the transitive vendored path dep under sqlx-macros moves macro_files_digest, MacroModule source, and module key (rule 21).
+        let (u_b, d_b, p_b, _, key_b) = run_once("pub fn v2() {}", "pub fn rt_v1() {}");
+        assert_eq!(u_a, u_b, "registry proc-macro patch dep stays out of units_source");
+        assert_ne!(d_a, d_b, "editing transitive vendored path dep under proc-macro must move macro_files_digest (rule 21)");
+        assert_ne!(p_a, p_b, "editing transitive vendored path dep under proc-macro must invalidate MacroModule task source (rule 21)");
+        assert_ne!(key_a, key_b, "editing transitive vendored path dep under proc-macro must move proc-macro module key (rule 21)");
     }
 
     /// A workspace member proc-macro crate (`unibind`) reaching another workspace member through

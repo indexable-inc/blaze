@@ -253,6 +253,60 @@ pub(crate) fn member_hex(rows: &Rows<'_>, dir: &str) -> Option<String> {
     rows.of(LeafKind::MacroFiles).find(|leaf| !leaf.absent() && rows.path(leaf) == dir).map(|leaf| files_hex(&leaf.id))
 }
 
+const MACRO_FILES_DIGEST_DOMAIN: &str = "blaze-cli macro files digest 1";
+
+/// Copy a proven-unchanged `dir`'s `MacroFiles`, `MacroFile`, and `MacroFolder` rows from
+/// `from` (the sweep's standing `followed.now`) into `to` with zero filesystem I/O (rules 74 &
+/// 77). Returns `false` when `from` holds no present `MacroFiles` row for `dir`.
+pub(crate) fn copy_standing_rows(from: &Rows<'_>, dir: &str, to: &mut Rows<'_>, frame: &Frame) -> bool {
+    if !from.of(LeafKind::MacroFiles).any(|leaf| !leaf.absent() && from.path(leaf) == dir) {
+        return false;
+    }
+    let mut existing: blaze_own::BTreeSet<(LeafKind, &str), &Frame> = blaze_own::BTreeSet::new_in(frame);
+    for leaf in to.rows.iter() {
+        if matches!(leaf.kind, LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder) {
+            existing.insert((leaf.kind, to.path(leaf)));
+        }
+    }
+    let mut pending: Vec<(LeafKind, u8, &str, Option<Stamp>, ContentId), &Frame> = Vec::new_in(frame);
+    for leaf in from.rows.iter() {
+        let path = from.path(leaf);
+        match leaf.kind {
+            LeafKind::MacroFiles if path == dir => {}
+            LeafKind::MacroFile | LeafKind::MacroFolder if beneath(dir, path) => {}
+            _ => continue,
+        }
+        if existing.insert((leaf.kind, path)) {
+            pending.push((leaf.kind, leaf.flags, path, leaf.stamp, leaf.id));
+        }
+    }
+    for (kind, flags, path, stamp, id) in pending.iter().copied() {
+        to.push(kind, flags, path, stamp, id);
+    }
+    true
+}
+
+/// Deterministic digest of all present `LeafKind::MacroFiles` rows in `rows`, sorted by path
+/// and deduplicated (rule 25): mixed into `Kind::MacroModule` task sources so editing a
+/// `[patch.*]` path dependency reached by a registry/git proc-macro invalidates the
+/// `MacroModule` task without polluting `units_source` with unrelated runtime patches (rules 21
+/// and 60).
+pub(crate) fn rows_digest(rows: &Rows<'_>, frame: &Frame) -> ContentId {
+    let mut entries: Vec<(&str, ContentId), &Frame> = Vec::new_in(frame);
+    for leaf in rows.of(LeafKind::MacroFiles) {
+        if !leaf.absent() {
+            entries.push((rows.path(leaf), leaf.id));
+        }
+    }
+    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
+    entries.dedup_by(|a, b| a.0 == b.0);
+    let mut h = blaze_ids::Hasher::new(MACRO_FILES_DIGEST_DOMAIN);
+    for (path, id) in entries.iter() {
+        h.part(path.as_bytes()).update(&id.0);
+    }
+    h.finish()
+}
+
 /// Records `LeafKind::MacroFile` rows for the build-script files of the member/path package at
 /// `dir` (whose package-relative script root is `script_root`, e.g. `build.rs` or `build/main.rs`):
 /// `script_root`, top-level `*.rs` in `dir`, and any `*.rs` under `script_root`'s parent dir when
