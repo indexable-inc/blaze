@@ -4286,9 +4286,10 @@ fn checking<'f, 's: 'f>(
                 // of the checkout's `.cargo/config.toml` reaches every unit's cfg.
                 let target = crate::graph::target_of(cx, &env, &laid_here.rustflags, program, &blaze_unit_graph::UnitKind::Lib, frame)?;
                 let host = crate::graph::target_of(cx, &env, &laid_here.rustflags, program, &blaze_unit_graph::UnitKind::BuildScript, frame)?;
+                let wasm_host = crate::graph::wasm_host_of(cx, &env, frame)?;
                 // PHASE-MEM-DEBT(Units): the unit graph on the process heap (graph.rs `Graph::of`,
                 // `heap: &'static Heap`): the request's; the graph is a record (`discover` puts it).
-                laid_here.graph = Some(crate::graph::Graph::of(parts, lockfile, units, target, host, true, heap, frame));
+                laid_here.graph = Some(crate::graph::Graph::of(parts, lockfile, units, target, host, wasm_host, true, heap, frame));
             }
             phases.mark_cx(cx, "plan (the graph's inputs: the profile's panic, the target's and the host's cfg)", frame);
             let mut discovered = {

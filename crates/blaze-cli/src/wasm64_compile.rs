@@ -55,7 +55,9 @@ use blaze_surface::{Edition, ItemKind, ProcKind};
 use blaze_toolchain::{Role, ToolchainId, ToolchainView, UnitKind as TcUnitKind};
 use blaze_typeck::ItemKey;
 use blaze_unit_graph::{
-    CfgAtom, Records as SourceRecords, StoreSources, Unit, UnitGraph, UnitId, UnitKind, implicit,
+    CfgAtom, HostUnitAsk, HostUnitKind, Package, Pass as GraphPass, Records as SourceRecords,
+    Resolution, StoreSources, TargetDesc, Text as GraphText, Unit, UnitGraph, UnitId, UnitKind,
+    implicit,
 };
 
 /// The target triple every self-compiled build script and proc-macro targets.
@@ -1177,6 +1179,306 @@ fn run_dep_build_script(
     Ok(encoded.as_slice().to_vec())
 }
 
+/// Maximum passes for checkout `Layout` and `wasm64-blaze-wasip1` `Resolution` loops (Rule 18).
+const WASM64_LAYOUT_PASSES: u32 = 64;
+const WASM64_RESOLVE_PASSES: u32 = 256;
+
+/// Lays out a checkout workspace or package directory on disk using `blaze_manifest::layout::Layout`
+/// so workspace inheritance (`*.workspace = true`), `[patch.*]`, `autolib`, and `build.rs`
+/// discovery match `units.rs` exactly.
+fn layout_checkout_dir<'a>(
+    checkout_root: &Path,
+    start: &str,
+    bump: Bump<'a>,
+) -> Result<blaze_manifest::layout::Units<'a>, blaze_own::AString<'a>> {
+    use blaze_manifest::layout::{Entry, Layout, Need, Pass};
+    let alloc = bump.alloc();
+    let fail = |msg: core::fmt::Arguments<'_>| {
+        let mut s = blaze_own::String::new_in(alloc);
+        let _ = s.write_fmt(msg);
+        s
+    };
+    let mut layout = Layout::new(start, alloc)
+        .map_err(|e| fail(format_args!("checkout layout start {start}: {e}")))?
+        .with_path_packages();
+    for _ in 0..WASM64_LAYOUT_PASSES {
+        let needs = match layout
+            .pass()
+            .map_err(|e| fail(format_args!("checkout layout {start}: {e}")))?
+        {
+            Pass::Done(units) => return Ok(units),
+            Pass::Need(needs) => needs,
+        };
+        for need in needs.iter() {
+            match need {
+                Need::Manifest(path) => {
+                    let full = checkout_root.join(path.as_str());
+                    match std::fs::read(&full) {
+                        Ok(bytes) => {
+                            let text = core::str::from_utf8(&bytes).map_err(|_| {
+                                fail(format_args!("checkout manifest {} is not UTF-8", path.as_str()))
+                            })?;
+                            let held = bump.alloc_str(text);
+                            layout
+                                .manifest(path, Some(held))
+                                .map_err(|e| fail(format_args!("manifest {}: {e}", path.as_str())))?;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            layout
+                                .manifest(path, None)
+                                .map_err(|e| fail(format_args!("manifest {}: {e}", path.as_str())))?;
+                        }
+                        Err(e) => {
+                            return Err(fail(format_args!("read checkout manifest {}: {e}", path.as_str())));
+                        }
+                    }
+                }
+                Need::Listing(dir) => {
+                    let full = if dir.is_empty() {
+                        checkout_root.to_path_buf()
+                    } else {
+                        checkout_root.join(dir.as_str())
+                    };
+                    match std::fs::read_dir(&full) {
+                        Ok(iter) => {
+                            let mut entries: AVec<'a, Entry<'a>> = OwnVec::new_in(alloc);
+                            for item in iter {
+                                let entry = item.map_err(|e| {
+                                    fail(format_args!("list checkout dir {}: {e}", dir.as_str()))
+                                })?;
+                                let name_os = entry.file_name();
+                                let Some(name_str) = name_os.to_str() else { continue };
+                                let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+                                entries.push(Entry { name: bump.alloc_str(name_str), is_dir });
+                            }
+                            entries.sort_unstable_by(|a, b| a.name.cmp(b.name));
+                            layout.listing(dir, Some(entries.as_slice()));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            layout.listing(dir, None);
+                        }
+                        Err(e) => {
+                            return Err(fail(format_args!("list checkout dir {}: {e}", dir.as_str())));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err(fail(format_args!("checkout layout {start} exceeded {WASM64_LAYOUT_PASSES} passes")))
+}
+
+/// Converts a laid-out checkout member/path package into `blaze_unit_graph::Package`, stripping
+/// the implicit blaze-edition `bstd`/`blaze-std` line just like `crate::graph::Members::of`.
+fn checkout_package_from_member<'a>(
+    member: &blaze_manifest::layout::Member<'_>,
+    alloc: Alloc<'a>,
+) -> Package<'a> {
+    let mut package = Package::from_member(member, alloc);
+    let blaze = member.edition.blaze.is_some();
+    package
+        .deps
+        .retain(|dep| !crate::graph::toolchain_line(blaze, dep.key.as_str(), dep.package.as_str()));
+    package
+}
+
+/// Resolves `root_unit` (a `BuildScript` or `ProcMacro` from the host `UnitGraph`) and its
+/// transitive dependency closure strictly against `wasm64-blaze-wasip1`'s `TargetDesc`, so
+/// `[target.'cfg(...)'.dependencies]` (including renamed deps like `libc_errno -> errno`, weak
+/// feature activation like `libc?/std`, and newly-included deps with their own `build.rs` like
+/// `libc`) match the actual `wasm64-blaze-wasip1` compilation target.
+#[expect(clippy::too_many_arguments, reason = "resolves one build-script or proc-macro closure against wasm64-blaze-wasip1")]
+fn resolve_wasm64_graph<'r>(
+    store: &Path,
+    host_graph: &UnitGraph<'_>,
+    lock: &'r Lock<'r>,
+    checkout: &blaze_proc_macro::script_sandbox::RealRoot,
+    members: &[(LockId, &str, blaze_world::PathKind)],
+    root_unit: UnitId,
+    mode: CompileMode,
+    resolve_frame: &'r Frame,
+    bump: Bump<'r>,
+) -> Result<(UnitGraph<'r>, UnitId), SelfCompileError> {
+    let alloc = bump.alloc();
+    let fail = |msg: core::fmt::Arguments<'_>| {
+        let mut s = blaze_own::String::new_in(alloc);
+        let _ = s.write_fmt(msg);
+        SelfCompileError::Failed(s.as_str().into())
+    };
+    let Some(root) = host_graph.units.get(root_unit.index()) else {
+        return Err(fail(format_args!("host unit graph missing root unit {}", root_unit.0)));
+    };
+
+    // Open pinned `wasm64-blaze-wasip1` cfg atoms from `<store>/toolchain`.
+    let tc_id = blaze_toolchain::PINNED;
+    let shelf_path = store.join("toolchain");
+    let mut shelf = DirShelf::new(shelf_path.to_string_lossy().into_owned());
+    let manifest_file = blaze_toolchain::shelf::open_manifest(&mut shelf, tc_id)
+        .map_err(|e| fail(format_args!("open toolchain manifest {tc_id}: {e}")))?;
+    let manifest_bytes: &'r [u8] = bump.alloc_slice_copy(manifest_file.as_ref());
+    let tc_view = ToolchainView::open(manifest_bytes, tc_id)
+        .map_err(|e| fail(format_args!("invalid toolchain manifest {tc_id}: {e}")))?;
+    let tc_cfg = tc_view
+        .cfg(WASM64_TARGET)
+        .ok_or_else(|| fail(format_args!("toolchain {tc_id} has no cfg for {WASM64_TARGET}")))?;
+    let mut cfg_atoms: AVec<'r, CfgAtom<'r>> = OwnVec::new_in(alloc);
+    for (name, value) in tc_cfg {
+        cfg_atoms.push(match value {
+            Some(val) => CfgAtom::pair(name, val, alloc),
+            None => CfgAtom::flag(name, alloc),
+        });
+    }
+    let wasm_desc = TargetDesc::new(WASM64_TARGET, cfg_atoms, alloc);
+
+    // Seed the wasm64 host resolution with ALL `BuildScript` and `ProcMacro` units from
+    // `host_graph` (matching `UnitGraphSession` in `unit_graph_task.rs`) so workspace-wide host
+    // feature unification across sibling build scripts and proc macros is preserved before we
+    // select `root_unit`'s dependency closure.
+    let mut roots: AVec<'r, HostUnitAsk<'r>> = OwnVec::new_in(alloc);
+    for unit in host_graph.units.iter() {
+        let kind = match unit.kind {
+            UnitKind::BuildScript => HostUnitKind::BuildScript,
+            UnitKind::ProcMacro => HostUnitKind::ProcMacro,
+            _ => continue,
+        };
+        let mut features: AVec<'r, GraphText<'r>> = OwnVec::with_capacity_in(unit.features.len(), alloc);
+        for feat in unit.features.iter() {
+            features.push(GraphText::from_str_in(feat.as_str(), alloc));
+        }
+        roots.push(HostUnitAsk { package: unit.package, kind, features });
+    }
+    let mut res = Resolution::for_host_units(lock, &wasm_desc, roots, host_graph.resolver, alloc);
+
+    let pack_dir = PackDir { folder: store.join("sources"), frame: resolve_frame };
+    let mut store_sources = StoreSources::new(lock, pack_dir, PackView::open_source_put, alloc)
+        .map_err(|e| fail(format_args!("opening fetched sources store for wasm64 resolution: {e}")))?;
+    let mut root_layout: Option<blaze_manifest::layout::Units<'r>> = None;
+
+    for _ in 0..WASM64_RESOLVE_PASSES {
+        match res.pass().map_err(|e| {
+            fail(format_args!(
+                "resolving {} {} for {WASM64_TARGET}: {e}",
+                root.name.as_str(),
+                root.version.as_str()
+            ))
+        })? {
+            GraphPass::Done(wasm_graph) => {
+                let want_kind = match mode {
+                    CompileMode::BuildScript => UnitKind::BuildScript,
+                    CompileMode::ProcMacro => UnitKind::ProcMacro,
+                };
+                let mut want_root_feats: AVec<'r, &str> = OwnVec::with_capacity_in(root.features.len(), alloc);
+                for f in root.features.iter() {
+                    want_root_feats.push(f.as_str());
+                }
+                want_root_feats.sort_unstable();
+                let root_idx = wasm_graph
+                    .units
+                    .iter()
+                    .position(|u| {
+                        u.package == root.package
+                            && u.kind == want_kind
+                            && sorted_features_match(u, want_root_feats.as_slice())
+                    })
+                    .or_else(|| {
+                        wasm_graph
+                            .units
+                            .iter()
+                            .position(|u| u.package == root.package && u.kind == want_kind)
+                    });
+                let Some(root_idx) = root_idx else {
+                    return Err(fail(format_args!(
+                        "wasm64 resolution for {} {} produced no matching {:?} unit",
+                        root.name.as_str(),
+                        root.version.as_str(),
+                        want_kind
+                    )));
+                };
+                let root_u32 = u32::try_from(root_idx)
+                    .map_err(|_| fail(format_args!("wasm64 unit index overflow: {root_idx}")))?;
+                return Ok((wasm_graph, UnitId(root_u32)));
+            }
+            GraphPass::Partial(partial) => {
+                let mut missing = blaze_own::String::new_in(alloc);
+                for (i, &id) in partial.missing().iter().enumerate() {
+                    let p = lock.package(id);
+                    if i > 0 {
+                        missing.push_str(", ");
+                    }
+                    let _ = write!(missing, "{} {}", p.name.as_str(), p.version);
+                }
+                return Err(fail(format_args!(
+                    "wasm64 resolution for {} {} reached unavailable packages: {}",
+                    root.name.as_str(),
+                    root.version.as_str(),
+                    missing.as_str()
+                )));
+            }
+            GraphPass::Need(needs) => {
+                for &pkg_id in needs.iter() {
+                    if let Some(&(_, dir, _)) = members.iter().find(|(id, _, _)| *id == pkg_id) {
+                        let want_name = lock.package(pkg_id).name.as_str();
+                        if root_layout.is_none() {
+                            let laid = layout_checkout_dir(checkout.path(), "", bump)
+                                .map_err(|e| SelfCompileError::Failed(e.as_str().into()))?;
+                            root_layout = Some(laid);
+                        }
+                        let found = root_layout.as_ref().and_then(|units| {
+                            units
+                                .members
+                                .iter()
+                                .chain(units.path_packages.iter())
+                                .find(|m| m.dir.as_str() == dir && m.name.as_str() == want_name)
+                        });
+                        let pkg = if let Some(member) = found {
+                            checkout_package_from_member(member, alloc)
+                        } else {
+                            let direct = layout_checkout_dir(checkout.path(), dir, bump)
+                                .map_err(|e| SelfCompileError::Failed(e.as_str().into()))?;
+                            let Some(member) = direct
+                                .members
+                                .iter()
+                                .chain(direct.path_packages.iter())
+                                .find(|m| m.dir.as_str() == dir && m.name.as_str() == want_name)
+                                .or_else(|| direct.members.iter().find(|m| m.name.as_str() == want_name))
+                            else {
+                                return Err(fail(format_args!(
+                                    "checkout layout at {dir} has no package {want_name}"
+                                )));
+                            };
+                            checkout_package_from_member(member, alloc)
+                        };
+                        res.package(pkg_id, Some(pkg)).map_err(|e| {
+                            fail(format_args!("adding checkout package {want_name} for wasm64: {e}"))
+                        })?;
+                    } else {
+                        let pkg = store_sources.package(pkg_id).map_err(|e| {
+                            fail(format_args!(
+                                "fetched sources missing for wasm64-target dependency of {} {}: {e}",
+                                root.name.as_str(),
+                                root.version.as_str()
+                            ))
+                        })?;
+                        res.package(pkg_id, Some(pkg)).map_err(|e| {
+                            let p = lock.package(pkg_id);
+                            fail(format_args!(
+                                "adding locked package {} {} for wasm64: {e}",
+                                p.name.as_str(),
+                                p.version
+                            ))
+                        })?;
+                    }
+                }
+            }
+        }
+    }
+    Err(fail(format_args!(
+        "wasm64 resolution for {} {} exceeded {WASM64_RESOLVE_PASSES} passes",
+        root.name.as_str(),
+        root.version.as_str()
+    )))
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "whole-program wasm64 compilation over store, graph, lock, checkout, members, root unit, mode, and recursion depth"
@@ -1192,12 +1494,34 @@ fn compile_unit_to_wasm64(
     mode: CompileMode,
     depth: u8,
 ) -> Result<CompiledWasm64, SelfCompileError> {
-    // Collect `root_unit` + transitive `UnitGraph` dependency closure in deterministic sorted
+    // 0. Resolve `root_unit`'s dependency closure against `wasm64-blaze-wasip1`'s `TargetDesc`
+    //    (not the host `UnitGraph`), so `[target.'cfg(...)'.dependencies]` (e.g. `libc` and
+    //    `libc_errno = { package = "errno" }` under `rustix` on Linux hosts) and any newly-active
+    //    dependency build scripts (e.g. `libc/build.rs`) are accurately included.
+    let resolve_frame = Frame::with_reserve(64 << 20, Tag::Other)
+        .map_err(|_| SelfCompileError::Failed("failed to reserve wasm64 resolve frame".into()))?;
+    let resolve_erased = Erased::new(&resolve_frame);
+    let resolve_alloc = resolve_erased.handle();
+    let (wasm_graph, wasm_root_unit) = resolve_wasm64_graph(
+        store,
+        graph,
+        lock,
+        checkout,
+        members,
+        root_unit,
+        mode,
+        &resolve_frame,
+        resolve_erased.bump(),
+    )?;
+
+    // Collect `wasm_root_unit` + transitive `wasm_graph` dependency closure in deterministic sorted
     // order (Rule 25: independent of workspace unit-index ordering) up front so any dependency
     // proc-macro runtime outlives `compile_unit_in`'s `Frame` (zero leaks).
-    let mut unit_order: std::vec::Vec<UnitId> = std::vec::Vec::new();
-    let mut unit_to_pos: HashMap<UnitId, usize> = HashMap::new();
-    let mut stack = std::vec![root_unit];
+    let mut unit_order: AVec<'_, UnitId> = OwnVec::new_in(resolve_alloc);
+    let mut unit_to_pos: blaze_own::BTreeMap<UnitId, usize, Alloc<'_>> =
+        blaze_own::BTreeMap::new_in(resolve_alloc);
+    let mut stack: AVec<'_, UnitId> = OwnVec::new_in(resolve_alloc);
+    stack.push(wasm_root_unit);
     while let Some(uid) = stack.pop() {
         if unit_to_pos.contains_key(&uid) {
             continue;
@@ -1205,10 +1529,15 @@ fn compile_unit_to_wasm64(
         let pos = unit_order.len();
         unit_to_pos.insert(uid, pos);
         unit_order.push(uid);
-        let u = &graph.units[uid.index()];
-        let mut child_deps: std::vec::Vec<(&str, &str, &str, &str, u8, UnitId)> = std::vec::Vec::new();
+        let Some(u) = wasm_graph.units.get(uid.index()) else {
+            continue;
+        };
+        let mut child_deps: AVec<'_, (&str, &str, &str, &str, u8, UnitId)> =
+            OwnVec::new_in(resolve_alloc);
         for dep in u.deps.iter() {
-            let du = &graph.units[dep.unit.index()];
+            let Some(du) = wasm_graph.units.get(dep.unit.index()) else {
+                continue;
+            };
             if matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro) {
                 let kind_ord = match du.kind {
                     UnitKind::Lib => 0u8,
@@ -1233,21 +1562,24 @@ fn compile_unit_to_wasm64(
 
     // Ensure any dependency proc-macro crates (e.g. `rustversion` used by `encoding_rs/build.rs`)
     // are compiled to `wasm64` and loaded into a per-compile `ProcMacros` runner.
-    let mut dep_pm_records: std::vec::Vec<(
-        UnitId,
-        CrateItemKey,
-        blaze_proc_macro::module::ModuleRecord,
-        std::string::String,
-        std::string::String,
-    )> = std::vec::Vec::new();
-    for &uid in &unit_order {
-        if uid == root_unit {
+    let mut dep_pm_records: AVec<
+        '_,
+        (
+            UnitId,
+            CrateItemKey,
+            blaze_proc_macro::module::ModuleRecord,
+            std::string::String,
+            std::string::String,
+        ),
+    > = OwnVec::new_in(resolve_alloc);
+    for &uid in unit_order.iter() {
+        if uid == wasm_root_unit {
             continue;
         }
-        if graph.units[uid.index()].kind == UnitKind::ProcMacro {
+        if wasm_graph.units.get(uid.index()).is_some_and(|u| u.kind == UnitKind::ProcMacro) {
             let (pm_key, record, pkg, ver) = ensure_proc_macro_unit(
                 store,
-                graph,
+                &wasm_graph,
                 lock,
                 checkout,
                 members,
@@ -1277,7 +1609,8 @@ fn compile_unit_to_wasm64(
         )),
         _ => None,
     };
-    let mut dep_pm_keys_by_unit: HashMap<UnitId, CrateItemKey> = HashMap::new();
+    let mut dep_pm_keys_by_unit: blaze_own::BTreeMap<UnitId, CrateItemKey, Alloc<'_>> =
+        blaze_own::BTreeMap::new_in(resolve_alloc);
     if let Some(ref mut hook) = pm_hook {
         for (uid, pm_key, record, pkg, ver) in dep_pm_records {
             hook.add_crate(pm_key, &pkg, &ver, Ok(record));
@@ -1286,21 +1619,21 @@ fn compile_unit_to_wasm64(
     }
 
     let frame = Frame::with_reserve(COMPILE_FRAME_RESERVE, Tag::Other)
-        .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve wasm64 compile frame")))?;
+        .map_err(|_| SelfCompileError::Failed("failed to reserve wasm64 compile frame".into()))?;
     let infer_frame = Frame::with_reserve(COMPILE_FRAME_RESERVE, Tag::Infer)
-        .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve wasm64 infer frame")))?;
+        .map_err(|_| SelfCompileError::Failed("failed to reserve wasm64 infer frame".into()))?;
     let arena = Arena::new(Tag::Other);
     let erased = Erased::new(&frame);
     let bump = erased.bump();
     let result = compile_unit_in(
         store,
-        graph,
+        &wasm_graph,
         lock,
         checkout,
         members,
         heap,
-        root_unit,
-        &unit_order,
+        wasm_root_unit,
+        unit_order.as_slice(),
         &unit_to_pos,
         pm_hook.as_ref(),
         &dep_pm_keys_by_unit,
@@ -1389,9 +1722,9 @@ fn compile_unit_in<'a>(
     heap: &'static blaze_own::Heap,
     root_unit: UnitId,
     unit_order: &[UnitId],
-    unit_to_pos: &HashMap<UnitId, usize>,
+    unit_to_pos: &blaze_own::BTreeMap<UnitId, usize, Alloc<'_>>,
     pm_hook: Option<&'a blaze_proc_macro::hook::ProcMacros<'a>>,
-    dep_pm_keys_by_unit: &HashMap<UnitId, CrateItemKey>,
+    dep_pm_keys_by_unit: &blaze_own::BTreeMap<UnitId, CrateItemKey, Alloc<'_>>,
     mode: CompileMode,
     depth: u8,
     frame: &'a Frame,
@@ -1503,11 +1836,14 @@ fn compile_unit_in<'a>(
         OwnVec::new_in(alloc)
     };
     let mut dep_script_bytes: HashMap<UnitId, &[u8]> = HashMap::new();
-    for &uid in unit_order {
+    // Run dependency build scripts in reverse DFS order (leaves/dependencies before dependents)
+    // so newly-included wasm64-target deps such as `libc/build.rs` execute cleanly before crates
+    // that depend on them.
+    for &uid in unit_order.iter().rev() {
         if uid == root_unit && mode == CompileMode::BuildScript {
             continue;
         }
-        if let Some(bs_id) = graph.units[uid.index()].build_script {
+        if let Some(bs_id) = graph.units.get(uid.index()).and_then(|u| u.build_script) {
             let encoded = run_dep_build_script(
                 store,
                 graph,
@@ -2946,6 +3282,11 @@ mod tests {
         std::fs::create_dir_all(&store_dir).expect("store dir");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real_shelf, store_dir.join("toolchain")).expect("symlink toolchain");
+        std::fs::write(
+            checkout_dir.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .expect("write Cargo.toml");
         std::fs::write(
             checkout_dir.join("build.rs"),
             "fn main() {\n    println!(\"cargo:rustc-cfg=no_ambient_bstd_ok\");\n}\n",

@@ -144,7 +144,7 @@ use edition::PackageEdition;
 pub use blaze_manifest::layout::{PackageMeta, PackageMetaVars};
 pub use extra::{Extra, ExtraUnit};
 pub use implicit::{Implicit, Prelude, StdIs, Sysroot, ToolchainUnit, implicit};
-pub use input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, Lib, NoResolver, Package, Platform, Resolver, TargetDesc};
+pub use input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, HostUnitAsk, HostUnitKind, Lib, NoResolver, Package, Platform, Resolver, TargetDesc};
 pub use resolve::{Resolution, ignores_profile_panic};
 pub use sources::{ExternalRecords, Open, Records, SourceError, StoreSources};
 

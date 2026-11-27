@@ -267,18 +267,42 @@ impl<'f> Graph<'f> {
     /// [`Graph::new`] for the targets [`target_of`] made: what of their rustflags blaze does not
     /// apply is said on the graph's record, never dropped (rule 3). Under no `--target` the host
     /// takes the target's flags, so the target's are said.
-    pub fn of(parts: Parts, lockfile: &Lockfile<'f>, workspace_read: ContentId, target: Targeted, host: Targeted, tests: bool, heap: &'static blaze_own::Heap, frame: &'f Frame) -> Graph<'f> {
+    #[expect(clippy::too_many_arguments, reason = "graph task constructor taking target, host, and optional wasm64 host descriptions")]
+    pub fn of(
+        parts: Parts,
+        lockfile: &Lockfile<'f>,
+        workspace_read: ContentId,
+        target: Targeted,
+        host: Targeted,
+        wasm_host: Option<TargetDesc<'static>>,
+        tests: bool,
+        heap: &'static blaze_own::Heap,
+        frame: &'f Frame,
+    ) -> Graph<'f> {
         let told = RustflagsTold(&target.flags);
         let told = told.any().then(|| held_str(bstd::mem::format_in!(frame, "{told}").as_str(), frame));
-        let mut graph = Graph::new(parts, lockfile, workspace_read, target.desc, host.desc, tests, heap, frame);
+        let mut graph = Graph::new(parts, lockfile, workspace_read, target.desc, host.desc, wasm_host, tests, heap, frame);
         graph.told = told;
         graph
     }
 
     /// The job of `parts` over `lockfile`, for `target` and, for the host's units (build
-    /// scripts), `host` (both from [`target_of`], each asked for its unit's kind); `workspace_read`
-    /// is the units' source.
-    pub fn new(parts: Parts, lockfile: &Lockfile<'f>, workspace_read: ContentId, target: TargetDesc<'static>, host: TargetDesc<'static>, tests: bool, heap: &'static blaze_own::Heap, frame: &'f Frame) -> Graph<'f> {
+    /// scripts), `host` (both from [`target_of`], each asked for its unit's kind), plus optional
+    /// `wasm_host` (`wasm64-blaze-wasip1`, from [`wasm_host_of`]) so wasm64-only locked deps of
+    /// build scripts and proc macros are fetched during discovery; `workspace_read` is the units'
+    /// source.
+    #[expect(clippy::too_many_arguments, reason = "graph task constructor taking target, host, and optional wasm64 host descriptions")]
+    pub fn new(
+        parts: Parts,
+        lockfile: &Lockfile<'f>,
+        workspace_read: ContentId,
+        target: TargetDesc<'static>,
+        host: TargetDesc<'static>,
+        wasm_host: Option<TargetDesc<'static>>,
+        tests: bool,
+        heap: &'static blaze_own::Heap,
+        frame: &'f Frame,
+    ) -> Graph<'f> {
         let mut roots = Vec::with_capacity_in(parts.members.len(), heap.alloc());
         roots.extend(parts.members.iter().map(|(id, _)| *id));
         let ask = Ask { roots, features: Vec::new_in(heap.alloc()), all_features: false, no_default_features: false, tests };
@@ -286,8 +310,10 @@ impl<'f> Graph<'f> {
         let path_packages: &'f [(LockId, Package<'static>)] = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(parts.path_packages, frame));
         let target: &'f TargetDesc<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(target, frame));
         let host: &'f TargetDesc<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(host, frame));
+        let wasm_host: Option<&'f TargetDesc<'static>> =
+            wasm_host.map(|desc| &*blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(desc, frame)));
         let ask: &'f Ask<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(ask, frame));
-        let inputs = UnitGraphInputs { lock: lockfile.text, workspace_read, members, path_packages, resolver: parts.resolver, target, host, ask };
+        let inputs = UnitGraphInputs { lock: lockfile.text, workspace_read, members, path_packages, resolver: parts.resolver, target, host, wasm_host, ask };
         Graph { source: unit_graph_task::source(&inputs), inputs, mapped: Vec::new_in(frame), dirs: parts.dirs, told: None }
     }
 
@@ -449,6 +475,37 @@ pub fn target_of(
         });
     }
     Ok(Targeted { desc: TargetDesc::new(TRIPLE, cfg, heap), flags })
+}
+
+/// The `wasm64-blaze-wasip1` target description from the pinned toolchain manifest, when cut for
+/// it (`None` for minimal test toolchains without a `wasm64-blaze-wasip1` target). Used during
+/// unit-graph discovery so wasm64-only locked dependencies of build scripts and proc macros (e.g.
+/// `errno` under `rustix` on Linux) are fetched into `<store>/sources/` alongside host deps.
+pub fn wasm_host_of(
+    cx: &Cx,
+    env: &crate::fetch::FetchEnv<'_>,
+    frame: &Frame,
+) -> Result<Option<TargetDesc<'static>>, CliError> {
+    let Some(home) = env.home else {
+        return Ok(None);
+    };
+    let mut shelf = crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(CliError::Shelf)?;
+    let id = env.toolchain;
+    let manifest = blaze_toolchain::shelf::open_manifest(&mut shelf, id).map_err(CliError::Toolchain)?;
+    let view = blaze_toolchain::ToolchainView::open(manifest.as_ref(), id)
+        .map_err(|_| CliError::Text { what: "the pinned toolchain's manifest is refused by its reader" })?;
+    let Some(atoms) = view.cfg(crate::wasm64_compile::WASM64_TARGET) else {
+        return Ok(None);
+    };
+    let heap = env.heap.alloc();
+    let mut cfg = Vec::new_in(heap);
+    for (name, value) in atoms {
+        cfg.push(match value {
+            Some(value) => CfgAtom::pair(name, value, heap),
+            None => CfgAtom::flag(name, heap),
+        });
+    }
+    Ok(Some(TargetDesc::new(crate::wasm64_compile::WASM64_TARGET, cfg, heap)))
 }
 
 /// The note of the rustflags a unit takes that blaze does not apply ([`RUSTFLAGS_NOT_APPLIED`]),

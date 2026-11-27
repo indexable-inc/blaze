@@ -457,3 +457,308 @@ fn tier2_native_build_script_and_unresolved_ffi_fail_with_typed_errors() {
     assert!(!out_nat.contains("toolrun.sh"), "Tier-2 native error must not suggest toolrun.sh:\n{out_nat}");
     let _ = std::fs::remove_dir_all(base_nat);
 }
+
+/// Blocker C4 end-to-end proof: a build script depends on `rustix_like`, whose host-OS
+/// `[target.'cfg(...)'.dependencies]` omits `fake_libc` and renamed `libc_errno` (`fake_errno`),
+/// while on `wasm64-blaze-wasip1` (`target_os = "wasi"`) `rustix_like`'s build.rs emits
+/// `use_libc_backend` and compiles against `fake_libc` (with its own `build.rs` + weak feature
+/// `fake_libc?/std`) and renamed `libc_errno` (`package = "fake_errno"`, with weak feature
+/// `libc_errno?/std` and its own WASI dep on `fake_libc`).
+#[test]
+fn build_script_with_wasi_only_target_specific_renamed_deps_and_dep_build_script_compiles_and_invalidates() {
+    let base = fresh_home("wasm64_wasi_target_deps_e2e", true);
+    let (home, ws) = (base.join("home"), base.join("ws"));
+    let lock = r#"version = 4
+
+[[package]]
+name = "app"
+version = "0.1.0"
+dependencies = [
+ "rustix_like",
+]
+
+[[package]]
+name = "fake_errno"
+version = "0.3.14"
+dependencies = [
+ "fake_libc",
+]
+
+[[package]]
+name = "fake_libc"
+version = "0.2.186"
+
+[[package]]
+name = "host_only_dep"
+version = "0.1.0"
+
+[[package]]
+name = "rustix_like"
+version = "1.1.4"
+dependencies = [
+ "fake_errno",
+ "fake_libc",
+ "host_only_dep",
+]
+"#;
+    let rustix_like_toml = r#"[package]
+name = "rustix_like"
+version = "1.1.4"
+edition = "2021"
+
+[features]
+default = ["std"]
+std = ["fake_libc?/std", "libc_errno?/std"]
+
+[target.'cfg(not(target_os = "wasi"))'.dependencies]
+host_only_dep = { path = "../host_only_dep" }
+fake_libc = { path = "../fake_libc", optional = true, default-features = false }
+libc_errno = { package = "fake_errno", path = "../fake_errno", optional = true, default-features = false }
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+fake_libc = { path = "../fake_libc", default-features = false }
+libc_errno = { package = "fake_errno", path = "../fake_errno", default-features = false }
+"#;
+    let rustix_like_build_rs = r#"fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("wasi") {
+        println!("cargo:rustc-cfg=use_libc_backend");
+    }
+}
+"#;
+    let rustix_like_lib_rs = r#"#[cfg(use_libc_backend)]
+pub fn combined_value() -> u32 {
+    let m: fake_libc::mode_t = fake_libc::mode_val();
+    let e: u32 = libc_errno::errno_val();
+    m + e
+}
+
+#[cfg(not(use_libc_backend))]
+pub fn combined_value() -> u32 {
+    host_only_dep::host_val()
+}
+"#;
+    let fake_libc_toml = r#"[package]
+name = "fake_libc"
+version = "0.2.186"
+edition = "2021"
+
+[features]
+default = ["std"]
+std = []
+"#;
+    let fake_libc_build_rs = r#"fn main() {
+    println!("cargo:rustc-cfg=fake_libc_build_ran");
+}
+"#;
+    let fake_libc_lib_rs = r#"#![cfg_attr(not(feature = "std"), no_std)]
+
+#[cfg(all(fake_libc_build_ran, feature = "std"))]
+#[allow(non_camel_case_types)]
+pub type mode_t = u32;
+
+#[cfg(all(fake_libc_build_ran, feature = "std"))]
+pub fn mode_val() -> mode_t {
+    100
+}
+"#;
+    let fake_errno_toml = r#"[package]
+name = "fake_errno"
+version = "0.3.14"
+edition = "2021"
+
+[features]
+default = ["std"]
+std = ["fake_libc/std"]
+
+[target.'cfg(target_os = "wasi")'.dependencies]
+fake_libc = { path = "../fake_libc", default-features = false }
+"#;
+    let fake_errno_lib_rs = r#"#[cfg(all(target_os = "wasi", feature = "std"))]
+pub fn errno_val() -> u32 {
+    let base: fake_libc::mode_t = fake_libc::mode_val();
+    base + 23
+}
+"#;
+    let app_build_rs = r#"use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+fn main() {
+    let val = rustix_like::combined_value();
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    fs::write(out_dir.join("gen.rs"), format!("pub const WASI_VAL: u32 = {val};\n"))
+        .expect("write gen.rs");
+}
+"#;
+    let app_main_rs = r#"include!(concat!(env!("OUT_DIR"), "/gen.rs"));
+fn main() {
+    println!("WASI_TARGET_DEPS={}", WASI_VAL);
+}
+"#;
+    write_files(
+        &ws,
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = [\"app\", \"rustix_like\", \"host_only_dep\"]\nresolver = \"2\"\n"),
+            ("Cargo.lock", lock),
+            ("host_only_dep/Cargo.toml", "[package]\nname = \"host_only_dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+            ("host_only_dep/src/lib.rs", "pub fn host_val() -> u32 { 9999 }\n"),
+            ("fake_libc/Cargo.toml", fake_libc_toml),
+            ("fake_libc/build.rs", fake_libc_build_rs),
+            ("fake_libc/src/lib.rs", fake_libc_lib_rs),
+            ("fake_errno/Cargo.toml", fake_errno_toml),
+            ("fake_errno/src/lib.rs", fake_errno_lib_rs),
+            ("rustix_like/Cargo.toml", rustix_like_toml),
+            ("rustix_like/build.rs", rustix_like_build_rs),
+            ("rustix_like/src/lib.rs", rustix_like_lib_rs),
+            ("app/Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[build-dependencies]\nrustix_like = { path = \"../rustix_like\" }\n"),
+            ("app/build.rs", app_build_rs),
+            ("app/src/main.rs", app_main_rs),
+        ],
+    );
+
+    // 1. Cold `blaze check` with empty module store and PATH="" self-compiles app/build.rs
+    //    (plus rustix_like/build.rs and fake_libc/build.rs) using wasm64 target-specific deps.
+    let (ok_check, check_out) = run_blaze(&ws, &home, "check1", &["check"]);
+    assert!(
+        ok_check && check_out.contains("0 errors: blaze check") && !check_out.contains("not checked because"),
+        "cold blaze check with wasi-only target-specific renamed deps failed:\n{check_out}"
+    );
+
+    // 2. Running `app` confirms `fake_libc::mode_val()` (100) + `libc_errno::errno_val()` (123) = 223!
+    let (ok_run, run_out) = run_app(&ws, &home, "run1", "app");
+    assert!(ok_run && run_out.contains("WASI_TARGET_DEPS=223"), "blaze run failed:\n{run_out}");
+
+    // 3. Rule 21 cache invalidation: editing `fake_errno/src/lib.rs` (a wasm64-only dep NOT in the
+    //    host Linux UnitGraph!) must invalidate `app/build.rs`'s module key and recompile.
+    std::fs::write(
+        ws.join("fake_errno/src/lib.rs"),
+        "#[cfg(all(target_os = \"wasi\", feature = \"std\"))]\npub fn errno_val() -> u32 {\n    let base: fake_libc::mode_t = fake_libc::mode_val();\n    base + 55\n}\n",
+    )
+    .expect("edit fake_errno");
+    let (ok_run2, run_out2) = run_app(&ws, &home, "run2", "app");
+    assert!(
+        ok_run2 && run_out2.contains("WASI_TARGET_DEPS=255"),
+        "editing wasm64-only dep fake_errno must invalidate build.rs module:\n{run_out2}"
+    );
+
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn build_script_wasm64_preserves_workspace_feature_unification_and_excluded_path_deps() {
+    let base = fresh_home("wasm64_unify_and_excluded_e2e", true);
+    let (home, ws) = (base.join("home"), base.join("ws"));
+
+    // Workspace with two members (`app_a`, `app_b`) sharing `shared_dep`, plus an explicitly
+    // excluded non-member path package (`ext_wasi_dep`) that is a direct WASI-only build-dep of
+    // `app_b`:
+    // - `app_a` depends on `shared_dep` WITHOUT `extra_flag`, but relies on `extra_flag` enabled
+    //   via workspace-wide feature unification from sibling `app_b`!
+    // - `app_b` depends on `shared_dep` WITH `features = ["extra_flag"]` and has a direct
+    //   `[target.'cfg(target_os = "wasi")'.build-dependencies]` on excluded `ext_wasi_dep`
+    //   (testing `.with_path_packages()` in `layout_checkout_dir` AND `script_deps_digest`
+    //   seeding the lock walk from `root.package`!).
+    let lock = r#"# This file is automatically @generated by Cargo.
+version = 4
+
+[[package]]
+name = "app_a"
+version = "0.1.0"
+dependencies = [
+ "shared_dep",
+]
+
+[[package]]
+name = "app_b"
+version = "0.1.0"
+dependencies = [
+ "ext_wasi_dep",
+ "shared_dep",
+]
+
+[[package]]
+name = "ext_wasi_dep"
+version = "0.1.0"
+
+[[package]]
+name = "shared_dep"
+version = "0.1.0"
+"#;
+
+    write_files(
+        &ws,
+        &[
+            (
+                "Cargo.toml",
+                "[workspace]\nmembers = [\"app_a\", \"app_b\", \"shared_dep\"]\nexclude = [\"ext_wasi_dep\"]\nresolver = \"2\"\n",
+            ),
+            ("Cargo.lock", lock),
+            (
+                "shared_dep/Cargo.toml",
+                "[package]\nname = \"shared_dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[features]\ndefault = []\nextra_flag = []\n",
+            ),
+            (
+                "shared_dep/src/lib.rs",
+                "pub fn unified_val() -> u32 {\n    if cfg!(feature = \"extra_flag\") { 77 } else { 11 }\n}\n",
+            ),
+            (
+                "ext_wasi_dep/Cargo.toml",
+                "[package]\nname = \"ext_wasi_dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            ),
+            (
+                "ext_wasi_dep/src/lib.rs",
+                "pub fn ext_val() -> u32 { 314 }\n",
+            ),
+            (
+                "app_a/Cargo.toml",
+                "[package]\nname = \"app_a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[build-dependencies]\nshared_dep = { path = \"../shared_dep\" }\n",
+            ),
+            (
+                "app_a/build.rs",
+                "use std::{env, fs, path::PathBuf};\nfn main() {\n    let v = shared_dep::unified_val();\n    let out = PathBuf::from(env::var(\"OUT_DIR\").expect(\"OUT_DIR\"));\n    fs::write(out.join(\"val.rs\"), format!(\"pub const VAL: u32 = {v};\\n\")).expect(\"write\");\n}\n",
+            ),
+            (
+                "app_a/src/main.rs",
+                "include!(concat!(env!(\"OUT_DIR\"), \"/val.rs\"));\nfn main() { println!(\"UNIFIED={}\", VAL); }\n",
+            ),
+            (
+                "app_b/Cargo.toml",
+                "[package]\nname = \"app_b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[build-dependencies]\nshared_dep = { path = \"../shared_dep\", features = [\"extra_flag\"] }\n\n[target.'cfg(target_os = \"wasi\")'.build-dependencies]\next_wasi_dep = { path = \"../ext_wasi_dep\" }\n",
+            ),
+            (
+                "app_b/build.rs",
+                "use std::{env, fs, path::PathBuf};\nfn main() {\n    #[cfg(target_os = \"wasi\")]\n    let e = ext_wasi_dep::ext_val();\n    #[cfg(not(target_os = \"wasi\"))]\n    let e = 0u32;\n    let v = shared_dep::unified_val() + e;\n    let out = PathBuf::from(env::var(\"OUT_DIR\").expect(\"OUT_DIR\"));\n    fs::write(out.join(\"val.rs\"), format!(\"pub const VAL: u32 = {v};\\n\")).expect(\"write\");\n}\n",
+            ),
+            (
+                "app_b/src/main.rs",
+                "include!(concat!(env!(\"OUT_DIR\"), \"/val.rs\"));\nfn main() { println!(\"EXCLUDED={}\", VAL); }\n",
+            ),
+        ],
+    );
+
+    let (ok_check, check_out) = run_blaze(&ws, &home, "check1", &["check"]);
+    assert!(
+        ok_check && check_out.contains("0 errors: blaze check") && !check_out.contains("not checked because"),
+        "cold blaze check with workspace feature unification & excluded wasi-only dep failed:\n{check_out}"
+    );
+
+    // 1. `app_a` must see `extra_flag` unified from sibling `app_b` (`77`, NOT `11`).
+    let (ok_a, out_a) = run_app(&ws, &home, "run_a", "app_a");
+    assert!(ok_a && out_a.contains("UNIFIED=77"), "expected workspace-unified feature value 77 for app_a:\n{out_a}");
+
+    // 2. `app_b` must resolve excluded `ext_wasi_dep` (`77 + 314 = 391`).
+    let (ok_b, out_b) = run_app(&ws, &home, "run_b1", "app_b");
+    assert!(ok_b && out_b.contains("EXCLUDED=391"), "expected excluded wasi-only dep value 391 for app_b:\n{out_b}");
+
+    // 3. Editing excluded direct WASI-only build-dep `ext_wasi_dep` must invalidate `app_b/build.rs`
+    //    even though `ext_wasi_dep` is absent from the host Linux `UnitGraph` (`77 + 415 = 492`).
+    std::fs::write(ws.join("ext_wasi_dep/src/lib.rs"), "pub fn ext_val() -> u32 { 415 }\n")
+        .expect("edit ext_wasi_dep");
+    let (ok_b2, out_b2) = run_app(&ws, &home, "run_b2", "app_b");
+    assert!(
+        ok_b2 && out_b2.contains("EXCLUDED=492"),
+        "editing excluded direct wasi-only build-dep must invalidate app_b/build.rs:\n{out_b2}"
+    );
+
+    let _ = std::fs::remove_dir_all(base);
+}

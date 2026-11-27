@@ -347,3 +347,20 @@ pub struct Ask<'a> {
     pub no_default_features: bool,
     pub tests: bool,
 }
+
+/// Which host-executed target of a package to resolve for a specific execution platform
+/// (e.g. `wasm64-blaze-wasip1` for self-compiled build scripts and proc macros).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum HostUnitKind {
+    BuildScript,
+    ProcMacro,
+}
+
+/// One host-executed unit seed for [`crate::Resolution::for_host_units`]: the package's lock id,
+/// target kind, and exact resolved feature set.
+#[derive(Clone, Debug)]
+pub struct HostUnitAsk<'a> {
+    pub package: blaze_manifest::lock::LockId,
+    pub kind: HostUnitKind,
+    pub features: AVec<'a, Text<'a>>,
+}

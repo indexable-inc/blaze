@@ -230,11 +230,12 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&blaze_sha256::digest(bytes))
 }
 
-/// Current proc-macro module identity header (`blaze proc-macro module 7`): bumped when
-/// proc-macro compilation semantics, codegen, export synthesis, or sysroot closure change
-/// (form 7: `blaze-build` `bind_let_place` peeled-reference deref fix for `let S { ref a, .. } = self;`
-/// in `clap_derive` et al.) so stale miscompiled form-6 modules map to a distinct key.
-pub const MODULE_HEADER: &str = "blaze proc-macro module 7";
+/// Current proc-macro module identity header (`blaze proc-macro module 8`): bumped when
+/// proc-macro compilation semantics, codegen, export synthesis, target-specific dependency
+/// resolution, or sysroot closure change (form 8: wasm64 self-compilation resolves
+/// `[target.'cfg(...)'.dependencies]` against `wasm64-blaze-wasip1` instead of the host triple)
+/// so stale form-7 modules map to a distinct key.
+pub const MODULE_HEADER: &str = "blaze proc-macro module 8";
 
 /// The crate's identity as text: what the module key is the digest of.
 pub fn identity(id: &CrateId<'_>) -> String {
@@ -264,6 +265,8 @@ pub fn identity(id: &CrateId<'_>) -> String {
         // Form 7 (2026-11-27): `blaze-build` `bind_let_place` uses `adjusted_ty(init)` so
         // `let S { ref a, ref b } = self;` over a reference place dereferences `self` instead of
         // projecting off `self`'s stack slot, invalidating stale form-6 `clap_derive` modules.
+        // Form 8 (2026-11-27): wasm64 self-compilation resolves `[target.'cfg(...)'.dependencies]`
+        // against `wasm64-blaze-wasip1` instead of the host triple, invalidating pre-fix form-7 records.
         "{MODULE_HEADER}\nname {}\nversion {}\n{source}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
         id.name,
         id.version,
@@ -472,7 +475,7 @@ mod header_tests {
     use super::*;
 
     #[test]
-    fn proc_macro_module_identity_uses_form_7_and_misses_stale_form_6_5_and_4_store_entries() {
+    fn proc_macro_module_identity_uses_form_8_and_misses_stale_form_7_6_5_and_4_store_entries() {
         let id = CrateId {
             name: "demo_derive",
             version: "0.1.0",
@@ -480,26 +483,30 @@ mod header_tests {
             deps: "deps-hash",
             features: &["default"],
         };
-        let v7_identity = identity(&id);
-        assert_eq!(MODULE_HEADER, "blaze proc-macro module 7");
-        assert_eq!(v7_identity.lines().next(), Some(MODULE_HEADER));
-        let v6_identity = v7_identity.replacen(MODULE_HEADER, "blaze proc-macro module 6", 1);
-        let v5_identity = v7_identity.replacen(MODULE_HEADER, "blaze proc-macro module 5", 1);
-        let v4_identity = v7_identity.replacen(MODULE_HEADER, "blaze proc-macro module 4", 1);
+        let v8_identity = identity(&id);
+        assert_eq!(MODULE_HEADER, "blaze proc-macro module 8");
+        assert_eq!(v8_identity.lines().next(), Some(MODULE_HEADER));
+        let v7_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 7", 1);
+        let v6_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 6", 1);
+        let v5_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 5", 1);
+        let v4_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 4", 1);
+        let v7_key = sha256_hex(v7_identity.as_bytes());
         let v6_key = sha256_hex(v6_identity.as_bytes());
         let v5_key = sha256_hex(v5_identity.as_bytes());
         let v4_key = sha256_hex(v4_identity.as_bytes());
-        let v7_key = module_key(&id);
-        assert_ne!(v6_key, v7_key, "form 7 key must differ from stale form 6 key");
-        assert_ne!(v5_key, v7_key, "form 7 key must differ from stale form 5 key");
-        assert_ne!(v4_key, v7_key, "form 7 key must differ from stale form 4 key");
+        let v8_key = module_key(&id);
+        assert_ne!(v7_key, v8_key, "form 8 key must differ from stale form 7 key");
+        assert_ne!(v6_key, v8_key, "form 8 key must differ from stale form 6 key");
+        assert_ne!(v5_key, v8_key, "form 8 key must differ from stale form 5 key");
+        assert_ne!(v4_key, v8_key, "form 8 key must differ from stale form 4 key");
 
-        let store = std::env::temp_dir().join(format!("blaze-pm-module-v7-test-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("blaze-pm-module-v8-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         for (stale_key, stale_identity, stale_digest) in [
             (&v4_key, &v4_identity, "deadbeef\n"),
             (&v5_key, &v5_identity, "feedface\n"),
             (&v6_key, &v6_identity, "badc0ffe\n"),
+            (&v7_key, &v7_identity, "01234567\n"),
         ] {
             let stale_dir = store.join("proc-macro/modules").join(stale_key);
             std::fs::create_dir_all(&stale_dir).expect("create stale dir");
@@ -509,23 +516,23 @@ mod header_tests {
             std::fs::write(stale_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write stale decls");
         }
 
-        // Lookup by current form 7 misses stale form 6, 5, and 4 directories cleanly.
-        assert!(matches!(find_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v7_key));
-        assert!(matches!(read_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v7_key));
+        // Lookup by current form 8 misses stale form 7, 6, 5, and 4 directories cleanly.
+        assert!(matches!(find_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v8_key));
+        assert!(matches!(read_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v8_key));
 
-        // Publishing form 7 alongside stale form 6, 5, and 4 resolves uniquely to form 7.
-        let v7_dir = store.join("proc-macro/modules").join(&v7_key);
-        std::fs::create_dir_all(&v7_dir).expect("create v7 dir");
-        std::fs::write(v7_dir.join("identity"), &v7_identity).expect("write v7 identity");
-        std::fs::write(v7_dir.join("wasm-sha256"), "cafebabe\n").expect("write v7 digest");
-        std::fs::write(v7_dir.join("macros"), "0 derive Demo\n").expect("write v7 macros");
-        std::fs::write(v7_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write v7 decls");
+        // Publishing form 8 alongside stale form 7, 6, 5, and 4 resolves uniquely to form 8.
+        let v8_dir = store.join("proc-macro/modules").join(&v8_key);
+        std::fs::create_dir_all(&v8_dir).expect("create v8 dir");
+        std::fs::write(v8_dir.join("identity"), &v8_identity).expect("write v8 identity");
+        std::fs::write(v8_dir.join("wasm-sha256"), "cafebabe\n").expect("write v8 digest");
+        std::fs::write(v8_dir.join("macros"), "0 derive Demo\n").expect("write v8 macros");
+        std::fs::write(v8_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write v8 decls");
 
-        let (found_key, digest) = find_module(&store, &id).expect("find v7 module");
-        assert_eq!(found_key, v7_key);
+        let (found_key, digest) = find_module(&store, &id).expect("find v8 module");
+        assert_eq!(found_key, v8_key);
         assert_eq!(digest, "cafebabe");
-        let rec = read_module(&store, &id).expect("read v7 module");
-        assert_eq!(rec.key, v7_key);
+        let rec = read_module(&store, &id).expect("read v8 module");
+        assert_eq!(rec.key, v8_key);
         assert_eq!(rec.wasm_sha256, "cafebabe");
         assert_eq!(rec.macros.len(), 1);
         assert_eq!(rec.macros[0].name, "Demo");

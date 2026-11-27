@@ -1071,7 +1071,7 @@ version = \"0.1.0\"
                 triple: blaze_unit_graph::Text::from_str_in("aarch64-apple-darwin", heap.alloc()),
                 cfg: blaze_own::Vec::new_in(heap.alloc()),
             };
-            let graph = crate::graph::Graph::new(parts, lock, source, desc(), desc(), false, heap, frame);
+            let graph = crate::graph::Graph::new(parts, lock, source, desc(), desc(), None, false, heap, frame);
             let mut dirs = blaze_own::Vec::new_in(heap.alloc());
             dirs.extend(graph.member_dirs().iter().map(|d| (blaze_own::String::from_str_in(d.dir.as_str(), heap.alloc()), d.kind)));
             struct NoRecords;

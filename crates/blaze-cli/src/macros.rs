@@ -41,7 +41,10 @@ const SUBJECT_DOMAIN: &str = "blaze-cli macro crate 1";
 // "4": proc-macro module identity bumped to form 7 (`blaze proc-macro module 7`) after
 // `blaze-build` `bind_let_place` peeled-reference deref fix, invalidating cached
 // `MacroModule` task records that pointed at stale form-6 proc-macro modules.
-const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 4";
+// "5": proc-macro module identity bumped to form 8 (`blaze proc-macro module 8`:
+// wasm64-blaze-wasip1 target-specific dependency resolution), invalidating cached
+// `MacroModule` task records that pointed at pre-v8 proc-macro modules.
+const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 5";
 const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";

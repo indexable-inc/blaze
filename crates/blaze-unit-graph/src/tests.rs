@@ -15,7 +15,7 @@ use blaze_own::{Alloc, String, Vec};
 use blaze_sim::{Broke, Config, Tape};
 use edition::{Edition, PackageEdition};
 
-use crate::input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, Lib, Package, Platform, Resolver, TargetDesc};
+use crate::input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, HostUnitAsk, HostUnitKind, Lib, Package, Platform, Resolver, TargetDesc};
 use crate::{Extra, LeftOutKind, Pass, Plant, Resolution, UnitError, UnitGraph, UnitKind, record};
 
 /// tempo-primitives and reth-codecs in miniature: dev-dependency unification (src/tests/dev_unify.rs).
@@ -1604,4 +1604,125 @@ fn record_encode_cfg_is_accepts_valid_and_rejects_mutated() {
     graph.units[0].cfg.pop();
     assert!(record::encode(&graph, &target, &host, a()).is_err(), "missing cfg atom rejected");
     graph.units[0].cfg = saved;
+}
+
+/// Blocker C4 regression: `Resolution::for_host_units` resolves a `BuildScript` against
+/// `wasm64-blaze-wasip1` rather than host Linux, activating `[target.'cfg(target_os = "wasi")'.dependencies]`
+/// (including renamed deps `libc_errno = { package = "errno" }`, weak dep features `libc?/std` and
+/// `libc_errno?/std`, and newly-included dep build scripts like `libc/build.rs`), while excluding
+/// Linux-only deps (`linux-raw-sys`) and normal `[dependencies]` of the root package.
+#[test]
+fn host_units_resolves_wasm64_target_specific_renamed_deps_weak_features_and_dep_build_scripts() {
+    let linux_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::flag("unix", a()));
+        cfg.push(CfgAtom::pair("target_os", "linux", a()));
+        cfg.push(CfgAtom::pair("target_arch", "x86_64", a()));
+        TargetDesc::new("x86_64-unknown-linux-gnu", cfg, a())
+    };
+    let wasi_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_family", "wasm", a()));
+        cfg.push(CfgAtom::pair("target_os", "wasi", a()));
+        cfg.push(CfgAtom::pair("target_env", "p1", a()));
+        cfg.push(CfgAtom::pair("target_arch", "wasm64", a()));
+        TargetDesc::new("wasm64-blaze-wasip1", cfg, a())
+    };
+
+    let ps = vec![
+        // 0: app (has normal dep `normal_only` and build-dep `rustix_like`)
+        pkg("app")
+            .member()
+            .build()
+            .dep(dep("normal_only"))
+            .dep(dep("rustix_like").build()),
+        // 1: normal_only (must NEVER be pulled into app's BuildScript wasm64 resolution)
+        pkg("normal_only"),
+        // 2: rustix_like (on Linux: bitflags + linux_raw_sys, optional libc/libc_errno;
+        //    on WASI: bitflags + non-optional libc + renamed libc_errno -> errno; weak std features)
+        pkg("rustix_like")
+            .build()
+            .feature("default", &["std"])
+            .feature("std", &["bitflags/std", "libc?/std", "libc_errno?/std"])
+            .dep(dep("bitflags").no_default())
+            .dep(dep("linux_raw_sys").on("cfg(target_os = \"linux\")"))
+            .dep(dep("libc").on("cfg(target_os = \"linux\")").optional().no_default())
+            .dep(dep("libc_errno").package("errno").on("cfg(target_os = \"linux\")").optional().no_default())
+            .dep(dep("libc").on("cfg(target_os = \"wasi\")").no_default())
+            .dep(dep("libc_errno").package("errno").on("cfg(target_os = \"wasi\")").no_default()),
+        // 3: bitflags
+        pkg("bitflags").feature("std", &[]),
+        // 4: linux_raw_sys
+        pkg("linux_raw_sys"),
+        // 5: libc (has its own build.rs and `std` feature!)
+        pkg("libc").build().feature("default", &["std"]).feature("std", &[]),
+        // 6: errno (depends on libc on WASI, std enables libc/std)
+        pkg("errno")
+            .feature("default", &["std"])
+            .feature("std", &["libc/std"])
+            .dep(dep("libc").on("cfg(target_os = \"wasi\")").no_default()),
+    ];
+    let text = lock_text(&ps);
+    let lock = Lock::read(text.as_bytes(), a()).expect("lock");
+
+    // 1. Host Linux UnitGraph has ONLY bitflags + linux_raw_sys under rustix_like (NO libc, NO errno).
+    let mut ask_roots = Vec::new_in(a());
+    ask_roots.push(LockId(0));
+    let ask = Ask { roots: ask_roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false };
+    let mut host_res = Resolution::new(&lock, &linux_desc, &linux_desc, &ask, Resolver::V2, a());
+    host_res.member(LockId(0), ps[0].facts()).expect("app");
+    for i in 1..ps.len() {
+        host_res.package(LockId(i as u32), Some(ps[i].facts())).expect("pkg");
+    }
+    let host_graph = match host_res.pass().expect("host pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on host"),
+    };
+    let host_rustix = host_graph
+        .units
+        .iter()
+        .find(|u| u.name.as_str() == "rustix_like" && u.kind == UnitKind::Lib)
+        .expect("host rustix_like");
+    let host_dep_names: std::vec::Vec<&str> = host_rustix.deps.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(host_dep_names, ["bitflags", "linux_raw_sys"]);
+    assert!(!host_graph.units.iter().any(|u| u.name.as_str() == "errno" || u.name.as_str() == "libc"));
+
+    // 2. Host-unit resolution for `wasm64-blaze-wasip1` resolves rustix_like -> (bitflags, libc, libc_errno -> errno),
+    //    propagates `std` via `libc?/std` and `libc_errno?/std`, includes `libc`'s BuildScript,
+    //    and omits `linux_raw_sys` and `normal_only`.
+    let mut wasm_roots = Vec::new_in(a());
+    wasm_roots.push(HostUnitAsk { package: LockId(0), kind: HostUnitKind::BuildScript, features: Vec::new_in(a()) });
+    let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V2, a());
+    host_res.move_packages_into(&mut wasm_res).expect("move packages");
+    let wasm_graph = match wasm_res.pass().expect("wasm64 pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on wasm64"),
+    };
+
+    assert!(!wasm_graph.units.iter().any(|u| u.name.as_str() == "normal_only"), "BuildScript must not pull in normal deps");
+    assert!(!wasm_graph.units.iter().any(|u| u.name.as_str() == "linux_raw_sys"), "wasm64 must not pull in Linux-only deps");
+
+    let wasm_rustix = wasm_graph
+        .units
+        .iter()
+        .find(|u| u.name.as_str() == "rustix_like" && u.kind == UnitKind::Lib)
+        .expect("wasm rustix_like");
+    let wasm_dep_names: std::vec::Vec<&str> = wasm_rustix.deps.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(wasm_dep_names, ["bitflags", "libc", "libc_errno"]);
+    assert!(wasm_rustix.build_script.is_some(), "rustix_like build script kept");
+
+    let libc_dep = wasm_rustix.deps.iter().find(|d| d.name.as_str() == "libc").expect("libc dep");
+    let libc_unit = &wasm_graph.units[libc_dep.unit.index()];
+    assert_eq!(libc_unit.name.as_str(), "libc");
+    assert_eq!(libc_unit.features.iter().map(|f| f.as_str()).collect::<std::vec::Vec<_>>(), ["std"]);
+    let libc_bs = libc_unit.build_script.expect("libc must have its own build_script unit");
+    assert_eq!(wasm_graph.units[libc_bs.index()].kind, UnitKind::BuildScript);
+    assert_eq!(wasm_graph.units[libc_bs.index()].name.as_str(), "libc");
+
+    let errno_dep = wasm_rustix.deps.iter().find(|d| d.name.as_str() == "libc_errno").expect("renamed libc_errno dep");
+    let errno_unit = &wasm_graph.units[errno_dep.unit.index()];
+    assert_eq!(errno_unit.name.as_str(), "errno");
+    assert_eq!(errno_unit.features.iter().map(|f| f.as_str()).collect::<std::vec::Vec<_>>(), ["std"]);
+    let errno_deps: std::vec::Vec<&str> = errno_unit.deps.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(errno_deps, ["libc"]);
 }

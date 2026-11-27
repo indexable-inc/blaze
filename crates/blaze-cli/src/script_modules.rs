@@ -31,7 +31,10 @@ const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 4";
 // "3": wasm build-script module lookups require `script_unit::WASM_MODULE_HEADER` (v5) after
 // `blaze-build` `bind_let_place` peeled-reference deref fix, invalidating cached `MacroModule`
 // task records that pointed at stale v4 wasm build-script modules.
-const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 3";
+// "4": wasm build-script module lookups require `script_unit::WASM_MODULE_HEADER` (v6:
+// wasm64-blaze-wasip1 target-specific dependency resolution + lock-closure deps digest),
+// invalidating cached `MacroModule` task records that pointed at pre-v6 modules.
+const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 4";
 const OUT_DOMAIN: &str = "blaze-cli build-script module out 2";
 
 /// The rule a lookup's failure names.
