@@ -115,7 +115,7 @@ blaze-pbr	1	0	0	0	0	0	0	0	0	0
 blaze-pg	9	0	2	140	0	0	0	0	0	0
 blaze-phf	5	0	0	9	0	0	0	0	0	1
 blaze-preview	3	0	0	2	0	0	0	0	0	0
-blaze-proc-macro	471	3	0	325	272	5	6	17	0	1
+blaze-proc-macro	476	3	0	325	272	5	6	17	0	1
 blaze-producers	8	0	0	0	0	0	0	0	0	0
 blaze-profile	197	0	0	443	19	35	47	15	0	3
 blaze-protocol	23	0	0	116	10	0	0	0	0	2

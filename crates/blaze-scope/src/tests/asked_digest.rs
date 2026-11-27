@@ -41,7 +41,7 @@ fn binding(f: impl FnOnce(&mut Binding)) -> Option<Binding> {
 }
 
 fn mac(f: impl FnOnce(&mut MacroSrc<'static>)) -> Option<MacroSrc<'static>> {
-    let mut m = MacroSrc { name: "m", body: MacroBody::Rules("a"), module: k(1), export: false, local_inner: false };
+    let mut m = MacroSrc { name: "m", body: MacroBody::Rules("a"), module: k(1), export: false, local_inner: false, dollar_crate: None };
     f(&mut m);
     Some(m)
 }
@@ -52,13 +52,13 @@ fn facts(f: impl FnOnce(&mut CrateFacts<'static>)) -> CrateFacts<'static> {
     c
 }
 
-/// 54 answers, pairwise distinct; prints (no `std` line added, so libtest's own line):
+/// 56 answers, pairwise distinct; prints (no `std` line added, so libtest's own line):
 /// `test tests::asked_digest::answer_digests_differ_in_every_field_and_every_variant ... ok`.
 #[test]
 fn answer_digests_differ_in_every_field_and_every_variant() {
     let g = Alloc::global();
     let base_reaches: &'static [CrateItemKey] = &[CrateItemKey(ContentId([2; 32])), CrateItemKey(ContentId([3; 32]))];
-    let digests: [ContentId; 54] = [
+    let digests: [ContentId; 56] = [
         // NameAnswer: both variants, and each field of `Found` (each choice of each enum field).
         name_digest(&NameAnswer::Absent),
         name_digest(&found(|_, _, _, _| {})),
@@ -104,6 +104,8 @@ fn answer_digests_differ_in_every_field_and_every_variant() {
         macro_digest(mac(|m| m.module = k(2))),
         macro_digest(mac(|m| m.export = true)),
         macro_digest(mac(|m| m.local_inner = true)),
+        macro_digest(mac(|m| m.dollar_crate = Some(ck(1)))),
+        macro_digest(mac(|m| m.dollar_crate = Some(ck(2)))),
         // Whether a glob source may shadow a name.
         shadow_digest(false),
         shadow_digest(true),

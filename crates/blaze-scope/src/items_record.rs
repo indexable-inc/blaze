@@ -95,7 +95,10 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// sits inside a `#![blaze::sans_io]` crate, module file, or inline `mod { #![blaze::sans_io] }`
 /// block so ADT head freezing reads only `NameCell::Item` and never `NameCell::Whole(Items)`;
 /// a version-16 record is refused the same way.
-const VERSION: u32 = 17;
+/// 18: macro rows keep `dollar_crate` (token-mark-3: 32-byte `CrateItemKey` + `HAS_DOLLAR_CRATE`
+/// flag; `MACRO_ROW` = 104 bytes) so generated `macro_rules!`/`macro` definitions preserve another
+/// crate's `$crate`; a version-17 record is refused the same way.
+const VERSION: u32 = 18;
 const KEY_TAIL: usize = 24;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
@@ -112,7 +115,7 @@ const ROOT_TRAIT: u32 = 1;
 /// The self path's root key is held.
 const ROOT_SELF: u32 = 2;
 const LANG_ROW: usize = 40;
-const MACRO_ROW: usize = 72;
+const MACRO_ROW: usize = 104;
 const MODULE_ROW: usize = 48;
 const ATOM_ROW: usize = 16;
 
@@ -186,6 +189,7 @@ const MOD_SANS_IO: u32 = 1 << 3;
 const EXPORT: u8 = 1;
 const LOCAL_INNER: u8 = 1 << 1;
 const HAS_PARAMS: u8 = 1 << 2;
+const HAS_DOLLAR_CRATE: u8 = 1 << 3;
 const BODY_RULES: u8 = 0;
 const BODY_MACRO2: u8 = 1;
 const BODY_BUILTIN_FN: u8 = 2;
@@ -1478,6 +1482,9 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         if m.local_inner {
             flags |= LOCAL_INNER;
         }
+        if m.dollar_crate.is_some() {
+            flags |= HAS_DOLLAR_CRATE;
+        }
         // (text code, body start, body length), (second start or string, its length), kind, sub.
         let (body, second, kind, sub) = match m.body {
             MacroBody::Rules(body) => (place(at, body), (0, 0), BODY_RULES, 0),
@@ -1507,6 +1514,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             _ => 0,
         };
         put32(&mut macro_rows, outline);
+        macro_rows.extend_from_slice(&m.dollar_crate.map_or([0u8; 32], |k| k.0.0));
     }
 
     // The cfg atoms, in `Cfg::atoms`' own (sorted) order.
@@ -1996,11 +2004,12 @@ pub struct ModuleRow<'a> {
 
 /// A macro definition's body as its row holds it (question 21).
 ///
-/// Row, 72 bytes, sorted by the definition's key: key 32; module u32; name at/len u32; body at,
+/// Row, 104 bytes, sorted by the definition's key: key 32; module u32; name at/len u32; body at,
 /// start, length u32 (a `macro_rules!`' or `macro`'s body in its item's text); a second pair
 /// u32 (a `macro`'s parameters' start and length in the same text; a builtin's name or a proc
 /// macro's helpers in the strings); body kind u8; flags u8 (exported, `local_inner_macros`, has
-/// parameters); sub u8 (a builtin's call shape, a proc macro's kind); pad.
+/// parameters, has `dollar_crate`); sub u8 (a builtin's call shape, a proc macro's kind); pad;
+/// outline item index u32; `dollar_crate` 32 (zeros when flag clear).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MacroBodyAt<'a> {
     Rules(Option<TextSpan>),
@@ -2019,6 +2028,7 @@ pub struct MacroRow<'a> {
     pub module: ItemKey,
     pub export: bool,
     pub local_inner: bool,
+    pub dollar_crate: Option<CrateItemKey>,
     pub body: MacroBodyAt<'a>,
 }
 
@@ -3116,6 +3126,7 @@ impl<'a> ItemsRecord<'a> {
             module: self.module_key(le32(b, r + 32))?,
             export: flags & EXPORT != 0,
             local_inner: flags & LOCAL_INNER != 0,
+            dollar_crate: if flags & HAS_DOLLAR_CRATE != 0 { Some(CrateItemKey(id_at(b, r + 72))) } else { None },
             body,
         }))
     }
@@ -3139,7 +3150,7 @@ impl<'a> ItemsRecord<'a> {
             MacroBodyAt::Proc { kind, helpers } => MacroBody::Proc { kind, helpers },
             MacroBodyAt::BuiltinDerive { helpers } => MacroBody::BuiltinDerive { helpers },
         };
-        Ok(Some(MacroSrc { name: row.name, body, module: row.module, export: row.export, local_inner: row.local_inner }))
+        Ok(Some(MacroSrc { name: row.name, body, module: row.module, export: row.export, local_inner: row.local_inner, dollar_crate: row.dollar_crate }))
     }
 
     /// How many module rows the record has (listed or not).

@@ -1532,9 +1532,12 @@ fn a_macro_definition_reads_back_from_its_records() {
     let derive =
         MacroDefinition::proc_macro(krate, ProcKind::Derive, "Serialize", &["serde", "allow"], at(9), blaze_own::testing::heap().alloc())
             .expect("names fit");
+    let foreign = CrateItemKey(ContentId([42; 32]));
     let defs = [
         rules("($x:expr) => { $x + 1 }", 1),
+        rules("() => { $crate::Item }", 1).with_dollar_crate(Some(foreign)),
         MacroDefinition::macro2(Some(tokens("$x:expr")), tokens("$x * 2"), at(2)),
+        MacroDefinition::macro2(None, tokens("() => { $crate::Item }"), at(2)).with_dollar_crate(Some(foreign)),
         builtin(BuiltinFn::Concat),
         MacroDefinition::builtin_derive(BuiltinDerive::Clone, at(1), blaze_own::testing::heap().alloc()),
         derive,
@@ -1545,19 +1548,27 @@ fn a_macro_definition_reads_back_from_its_records() {
         let records = def.write(item, name, None, blaze_own::testing::heap().alloc()).expect("a small definition");
         let read = read_back(def, &records).expect("the records are one definition");
         assert_eq!(read.content(), def.content());
-        assert_eq!((read.kind(), read.at(), read.transparency()), (def.kind(), def.at(), def.transparency()));
+        assert_eq!(
+            (read.kind(), read.at(), read.dollar_crate(), read.transparency()),
+            (def.kind(), def.at(), def.dollar_crate(), def.transparency())
+        );
         assert!(read.helpers().eq(def.helpers()) && read.proc_name() == def.proc_name());
         // Written again, the records are the same bytes (rule 25).
         let again = read.write(item, name, None, blaze_own::testing::heap().alloc()).expect("a small definition");
         assert_eq!(again.def[..], records.def[..]);
     }
+    // Control: a `dollar_crate` override produces a distinct `MacroContent` hash from `None`.
+    let plain_dollar = rules("() => { $crate::Item }", 1);
+    assert_ne!(plain_dollar.content(), defs[1].content());
+    assert_eq!(plain_dollar.dollar_crate(), None);
+    assert_eq!(defs[1].dollar_crate(), Some(foreign));
     // Control: a body record of another stream is refused by its digest, never read as the body.
     let mut records = defs[0].write(item, "m", None, blaze_own::testing::heap().alloc()).expect("a small definition");
     let other = tokens("() => {}").write_record(blaze_own::testing::heap().alloc());
     records.body = Some((stream_record_id(&other), other));
     assert!(matches!(read_back(&defs[0], &records), Err(DefinitionError::Mismatch { .. })));
     // A proc macro written under a name that is not its export name is refused.
-    let renamed = defs[4].write(item, "Deserialize", None, blaze_own::testing::heap().alloc());
+    let renamed = defs[6].write(item, "Deserialize", None, blaze_own::testing::heap().alloc());
     assert!(matches!(renamed.err(), Some(BuildError::Disagrees { .. })));
 }
 

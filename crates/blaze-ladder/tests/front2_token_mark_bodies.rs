@@ -674,3 +674,161 @@ fn main() {}
     println!("front2_token_mark_bodies records: {over_records}");
     assert!(failed.is_empty(), "bodies that did not check clean: {failed:?}");
 }
+
+/// token-mark-3: a `cfg_aliases!`-shaped macro-generating-macro in a dependency crate invoked
+/// inside `fn main()` generates a local `macro_rules! __cfg_aliases_matcher__` whose arms call
+/// `$crate::cfg_aliases!(@parser ...)` and `$crate::cfg_aliases!(@cfg_is_set $e)`, alongside
+/// `if $crate::cfg_aliases!(...) { emit_line!(stringify!(...)); }` blocks.
+///
+/// Verifies BOTH `blaze-scope` (creating `__blaze_block_x...` modules with zero
+/// `ForeignDollarCrate` notes) AND `front2` lowering/checking over solved `Names` and encoded
+/// `Records` (zero `dependency source not read` or `$crate` mis-attribution).
+#[test]
+fn macro_generated_cfg_aliases_checks_clean_in_front2() {
+    const CORE_STUB: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+
+#[lang = \"sized\"]
+pub trait Sized {}
+
+#[macro_export]
+#[rustc_builtin_macro]
+macro_rules! stringify { () => {} }
+
+#[macro_export]
+macro_rules! emit_line {
+    ($fmt:expr, $arg:expr) => {{
+        let _a: &str = $fmt;
+        let _b: &str = $arg;
+    }};
+}
+";
+    const CFG_ALIASES_DEP: &str = "#![feature(no_core)]
+#![no_core]
+
+#[macro_export]
+macro_rules! cfg_aliases {
+    (@with_dollar[$d:tt] $($alias:ident : { $($config:tt)* }),* $(,)?) => {
+        macro_rules! __cfg_aliases_matcher__ {
+            $(
+                ($alias) => { $crate::cfg_aliases!(@parser $($config)*) };
+            )*
+            ($e:ident) => { $crate::cfg_aliases!(@cfg_is_set $e) };
+        }
+        $(
+            core::emit_line!(\"cargo:rustc-check-cfg=cfg({})\", core::stringify!($alias));
+            if $crate::cfg_aliases!(@parser $($config)*) {
+                core::emit_line!(\"cargo:rustc-cfg={}\", core::stringify!($alias));
+            }
+        )*
+    };
+    (@parser target_os = $v:literal) => { true };
+    (@parser $alias:ident) => { __cfg_aliases_matcher__!($alias) };
+    (@cfg_is_set $e:ident) => {{
+        let _name: &str = core::stringify!($e);
+        true
+    }};
+    ($($tt:tt)*) => {
+        $crate::cfg_aliases!(@with_dollar[$] $($tt)*);
+    };
+}
+";
+    const BUILD_MAIN: &str = "#![feature(no_core)]
+#![no_core]
+#![no_main]
+
+pub fn main() {
+    cfg_aliases::cfg_aliases! {
+        linux: { target_os = \"linux\" },
+        my_alias: { linux },
+    }
+}
+";
+    const MAIN_PATH: &str = "/build_app/src/main.rs";
+    const CFG_PATH: &str = "/cfg_aliases/src/lib.rs";
+    const CORE_PATH: &str = "/core_stub/src/lib.rs";
+
+    struct CfgFiles;
+    impl SourceTexts<'static> for CfgFiles {
+        fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+            match (krate, path) {
+                (0, MAIN_PATH) => Some(BUILD_MAIN),
+                (1, CFG_PATH) => Some(CFG_ALIASES_DEP),
+                (2, CORE_PATH) => Some(CORE_STUB),
+                _ => None,
+            }
+        }
+    }
+
+    let rust = PackageEdition { syntax: edition::Edition::Edition2021, blaze: None };
+    let lib = implicit(rust, &blaze_unit_graph::UnitKind::Lib);
+    const CFG: &[(&str, Option<&str>)] = &[];
+    const APP_DEPS: &[(&str, usize)] = &[("cfg_aliases", 1), ("core", 2)];
+    const CFG_DEPS: &[(&str, usize)] = &[("core", 2)];
+    let crates = [
+        CrateInput {
+            name: "build_app",
+            key: CrateItemKey(ContentId::of("front2_token_mark_bodies cfg_aliases app", b"build_app")),
+            edition: syntax_of(rust),
+            implicit: lib,
+            root: MAIN_PATH,
+            shown_from: "/build_app/",
+            features: &[],
+            deps: APP_DEPS,
+            cfg: CFG,
+            script: None,
+        },
+        CrateInput {
+            name: "cfg_aliases",
+            key: CrateItemKey(ContentId::of("front2_token_mark_bodies cfg_aliases dep", b"cfg_aliases")),
+            edition: syntax_of(rust),
+            implicit: lib,
+            root: CFG_PATH,
+            shown_from: "/cfg_aliases/",
+            features: &[],
+            deps: CFG_DEPS,
+            cfg: CFG,
+            script: None,
+        },
+        CrateInput {
+            name: "core",
+            key: CrateItemKey(ContentId::of("front2_token_mark_bodies cfg_aliases core", b"core")),
+            edition: syntax_of(rust),
+            implicit: lib,
+            root: CORE_PATH,
+            shown_from: "/core_stub/",
+            features: &[],
+            deps: &[],
+            cfg: CFG,
+            script: None,
+        },
+    ];
+    let crate_names: &'static [&'static str] = &["build_app", "cfg_aliases", "core"];
+    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
+    let names = resolve_crates(&crates, Sysroot::default(), &CfgFiles, &Serial, blaze_own::testing::bump())
+        .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    assert!(names.notes(0).is_empty(), "build_app scope notes must be empty: {:?}", names.notes(0));
+
+    let main = Paths { names: &names }
+        .path(names.root(0), false, &["main"], Ns::Value)
+        .unwrap_or_else(|e| panic!("`main` from root: {e:?}"))
+        .key;
+    let fns = [("main", Asked::Free(main))];
+    let mut failed = Vec::new();
+
+    let sources = [SourceFile { path: "src/main.rs", text: BUILD_MAIN }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let solved = {
+        let mut front = Front2::new(&names, &frame, &sources, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+        rows(&names, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &fns, &mut failed)
+    };
+    println!("front2_token_mark_bodies cfg_aliases names: {solved}");
+
+    let (records, frame) = reader(keys, crate_names, kept_of(&names));
+    let mut front = Front2::from_records(records, frame, &[0, 1, 2]).unwrap_or_else(|e| panic!("front2 over records: {e}"));
+    let over_records = rows(records, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &fns, &mut failed);
+    println!("front2_token_mark_bodies cfg_aliases records: {over_records}");
+    let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
+    assert!(errors.is_empty(), "the records filed {errors:?}");
+    assert!(failed.is_empty(), "cfg_aliases bodies that did not check clean: {failed:?}");
+}

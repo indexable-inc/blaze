@@ -737,6 +737,7 @@ impl blaze_wasi::Embed for Host {
 trait HostWidth: Width {
     const SHIM: &'static str;
     const WASI_MODULE: &'static str;
+    const BUILD_SCRIPT_MODULE: &'static str;
     type SignedLen: WasmTy;
     fn len_out(len: usize) -> Self::Ptr;
     fn missing_env() -> Self::SignedLen;
@@ -746,6 +747,7 @@ trait HostWidth: Width {
 impl HostWidth for W32 {
     const SHIM: &'static str = IMPORTS;
     const WASI_MODULE: &'static str = WASI;
+    const BUILD_SCRIPT_MODULE: &'static str = "blaze_build_script";
     type SignedLen = i32;
     fn len_out(len: usize) -> u32 {
         len as u32
@@ -761,6 +763,7 @@ impl HostWidth for W32 {
 impl HostWidth for W64 {
     const SHIM: &'static str = IMPORTS_64;
     const WASI_MODULE: &'static str = WASI_64;
+    const BUILD_SCRIPT_MODULE: &'static str = "blaze_build_script_64";
     type SignedLen = i64;
     fn len_out(len: usize) -> u64 {
         len as u64
@@ -845,7 +848,8 @@ fn imports<W: HostWidth>(l: &mut Linker<Host>) -> wasmtime::Result<()> {
             give::<W>(mem, into, capacity, dir.as_bytes())
         })
     })?;
-    refused_wasi::<W>(l)
+    refused_wasi::<W>(l)?;
+    refused_build_script::<W>(l)
 }
 
 /// The WASI module a 32-bit proc macro imports from (`wasm32-wasip1`).
@@ -933,6 +937,24 @@ fn refused_wasi<W: HostWidth>(l: &mut Linker<Host>) -> wasmtime::Result<()> {
     l.func_wrap(wasi, "path_symlink", move |_: W::Ptr, _: W::Ptr, _: u32, _: W::Ptr, _: W::Ptr| -> i32 { perm })?;
     // (fd, si_data, si_data_len, si_flags, so_datalen)
     l.func_wrap(wasi, "sock_send", move |_: u32, _: W::Ptr, _: W::Ptr, _: u32, _: W::Ptr| -> i32 { perm })?;
+    Ok(())
+}
+
+/// Defines `blaze_build_script` / `blaze_build_script_64` process imports (`found`, `spawn`,
+/// `reply`) for proc-macro modules whose shared `wasm64-blaze-wasip1` `std::process` links them
+/// (e.g. `commonware-macros-impl`, `jsonrpsee-proc-macros`).
+///
+/// The proc-macro sandbox permits no subprocesses (rule 9): `found` answers `0` (`NotFound`,
+/// matching `Command::spawn` on WASI), and `spawn`/`reply` stop with an explicit refusal error.
+fn refused_build_script<W: HostWidth>(l: &mut Linker<Host>) -> wasmtime::Result<()> {
+    let bs = W::BUILD_SCRIPT_MODULE;
+    l.func_wrap(bs, "found", |_: W::Ptr, _: W::Ptr| -> u32 { 0 })?;
+    l.func_wrap(bs, "spawn", |mut c: Caller<'_, Host>, _: W::Ptr, _: W::Ptr| -> wasmtime::Result<W::Ptr> {
+        with(&mut c, |_, _| Err(Stop("proc macros may not spawn subprocesses".to_owned())))
+    })?;
+    l.func_wrap(bs, "reply", |mut c: Caller<'_, Host>, _: W::Ptr| -> wasmtime::Result<()> {
+        with(&mut c, |_, _| Err(Stop("proc macros may not spawn subprocesses".to_owned())))
+    })?;
     Ok(())
 }
 

@@ -571,6 +571,13 @@ pub(crate) fn write_records_opt<'a, 'b>(
             }
             exports_scopes.push(Some(exports.write(alloc)?));
         }
+        for (def, m) in names.tables.macros.iter() {
+            if let Some(dc) = m.dollar_crate
+                && named.contains_key(def)
+            {
+                add_reach(ItemKey(dc.0), &mut exports_reach);
+            }
+        }
         let exports = write_part(names, &modules, &exports_scopes, &exports_reach, &|k| named.contains_key(k), alloc)?;
         return Ok(Records { exports, inner: RecordBytes::new_in(alloc) });
     }
@@ -612,6 +619,15 @@ pub(crate) fn write_records_opt<'a, 'b>(
             }
             exports_scopes.push(None);
             inner_scopes.push(Some(scope.write(alloc)?));
+        }
+    }
+    for (def, m) in names.tables.macros.iter() {
+        if let Some(dc) = m.dollar_crate {
+            if named.contains_key(def) {
+                add_reach(ItemKey(dc.0), &mut exports_reach);
+            } else {
+                add_reach(ItemKey(dc.0), &mut inner_reach);
+            }
         }
     }
     let exports = write_part(names, &modules, &exports_scopes, &exports_reach, &|k| named.contains_key(k), alloc)?;

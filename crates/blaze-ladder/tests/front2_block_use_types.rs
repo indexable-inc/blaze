@@ -122,6 +122,9 @@ mod m {
         pub struct Pair(pub i32, pub i32);
         pub trait Write {}
     }
+    pub mod u32 {
+        pub const MAX: i32 = 7;
+    }
 }
 
 /// The module's own item of a name a row's block imports another item under.
@@ -156,6 +159,17 @@ const ROWS: &[Row] = &[
     use m::Slice as Cell;
     let c: Cell = Cell { n: 3 };
     c.n
+}",
+    },
+    // proptest-derive `parse_weight`'s form: `use std::u32;` in a block, then both `u32::MAX`
+    // (module prefix) and `value as u32` / `: u32` (one-segment type position -> built-in `u32`).
+    Row {
+        name: "block_use_module_same_name_as_primitive",
+        items: "fn f() -> i32 {
+    use crate::m::u32;
+    let max = u32::MAX;
+    let x: u32 = max as u32;
+    x as i32
 }",
     },
     // The block's import shadows the module's item of the same name.
