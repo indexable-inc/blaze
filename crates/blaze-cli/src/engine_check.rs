@@ -4326,10 +4326,14 @@ fn checking<'f, 's: 'f>(
             discovered.plan.files_read = setup.rows_read;
             discovered.plan.files_total = setup.slots;
             let ReadySetup { rows, names, graph, outlined, deferred, slots, files: file_counts, skipped, places: file_places, rows_read: _ } = setup;
+            let scoped = ScopedUnits::of(check_scope, names.list(), heap.alloc());
             if ({
                 use blaze_world::crate_list::CrateGraph as _;
-                names.script_keys().next().is_some()
-                    || (0..names.list().len()).any(|at| names.list().proc_macro(at))
+                let list = names.list();
+                (0..list.len()).any(|at| {
+                    scoped.as_ref().is_none_or(|s| s.allows(at))
+                        && (list.proc_macro(at) || names.script_of(at).is_some())
+                })
             }) && let Some(lazy) = lazy_sdk
             {
                 env.sdk = lazy.resolve_in_home(cx, Some(opened.home.dir()), phases);
@@ -4339,6 +4343,7 @@ fn checking<'f, 's: 'f>(
                 &names,
                 &mut store,
                 graph.at,
+                scoped.as_ref(),
                 command_probes.with_env(&env),
                 scripts.has_runner(),
                 frame,
@@ -4360,7 +4365,6 @@ fn checking<'f, 's: 'f>(
             let names = Some(NamesStage::new(names, frame));
             let graph = Some(graph);
             let plan_list = names.as_ref().and_then(|stage| stage.names.as_ref()).map(|world| world.list());
-            let scoped = plan_list.and_then(|list| ScopedUnits::of(check_scope, list, heap.alloc()));
             let mut found_places: SVec<'_, (Name, blaze_engine::pages::FilePlace)> = SVec::new_in(alloc);
             found_places.extend(last.places.iter().filter(|(_, place)| place.flags & PLACE_FOUND != 0).map(|(file, place)| (*file, *place)));
             found_places.sort_unstable_by_key(|(file, _)| *file);
@@ -4567,8 +4571,11 @@ fn checking<'f, 's: 'f>(
             if let Some(stage) = &names {
                 if stage.names.as_ref().is_some_and(|world| {
                     use blaze_world::crate_list::CrateGraph as _;
-                    world.script_keys().next().is_some()
-                        || (0..world.list().len()).any(|at| world.list().proc_macro(at))
+                    let list = world.list();
+                    (0..list.len()).any(|at| {
+                        scoped.as_ref().is_none_or(|s| s.allows(at))
+                            && (list.proc_macro(at) || world.script_of(at).is_some())
+                    })
                 }) && let Some(lazy) = lazy_sdk
                 {
                     env.sdk = lazy.resolve_in_home(cx, home_dir, phases);
@@ -4580,6 +4587,7 @@ fn checking<'f, 's: 'f>(
                         &mut store,
                         graph_pub,
                         tools,
+                        scoped.as_ref(),
                         command_probes.with_env(&env),
                         scripts.has_runner(),
                         frame,

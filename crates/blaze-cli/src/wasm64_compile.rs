@@ -5716,4 +5716,149 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             Some(pm_ws_name)
         );
     }
+
+    #[test]
+    fn scoped_dep_probe_planning_excludes_out_of_scope_macros_and_scripts_without_probe_init() {
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(76, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let fs = io.need_fs().expect("sim fs");
+        let clock = io.need_clock().expect("sim clock");
+        let heap = blaze_own::testing::heap();
+        let env = crate::fetch::FetchEnv {
+            clock,
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: None,
+            cargo_home: None,
+            start: None,
+            toolchain: blaze_toolchain::PINNED,
+            fs,
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap,
+        };
+        let frame = cx.frame();
+        let erased = Erased::new(frame);
+        let a = erased.handle();
+        let make_u = |pkg: u32, name: &str, kind: UnitKind<'static>, build_script: Option<u32>, deps: &[(&str, u32)]| -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, kind, "2024", deps, a);
+            u.build_script = build_script.map(UnitId);
+            u
+        };
+
+        // Workspace graph with BOTH probe-free (`pm_plain`, `bs_plain`) and probe-dependent
+        // (`pm_dep_ring`, `bs_with_ring`) units.
+        let graph = make_graph(
+            std::vec![
+                make_u(0, "plain_lib", UnitKind::Lib, None, &[]),
+                make_u(1, "ring", UnitKind::BuildScript, None, &[]),
+                make_u(1, "ring", UnitKind::Lib, Some(1), &[]),
+                make_u(2, "bs_plain", UnitKind::BuildScript, None, &[("plain_lib", 0)]),
+                make_u(3, "bs_with_ring", UnitKind::BuildScript, None, &[("ring", 2)]),
+                make_u(4, "pm_plain", UnitKind::ProcMacro, None, &[("plain_lib", 0)]),
+                make_u(5, "pm_dep_ring", UnitKind::ProcMacro, None, &[("ring", 2)]),
+            ],
+            a,
+        );
+        let pm_plain_subj = crate::macros::subject(&graph.units[5]);
+        let pm_dep_ring_subj = crate::macros::subject(&graph.units[6]);
+        let bs_plain_subj = ContentId::of("scoped-dep-probe-test", b"bs_plain");
+        let bs_with_ring_subj = ContentId::of("scoped-dep-probe-test", b"bs_with_ring");
+        let wasm_scripts = [(bs_plain_subj, UnitId(3)), (bs_with_ring_subj, UnitId(4))];
+
+        // 1. Scoped closure excluding ALL macros and scripts -> zero probe init, `leaf_id() == None`.
+        let holder_empty = crate::scripts::SharedCommandProbes::new();
+        let empty_scope = crate::engine_scripts::ScopedModuleSets {
+            script_modules: blaze_own::Vec::new_in(frame),
+            macro_modules: blaze_own::Vec::new_in(frame),
+        };
+        let planned_empty = crate::engine_scripts::classify_dep_probe_tags(
+            &cx,
+            &graph,
+            Some(&graph),
+            false,
+            &wasm_scripts,
+            Some(&empty_scope),
+            holder_empty.with_env(&env),
+            frame,
+        );
+        assert!(planned_empty.proc_macros.is_empty());
+        assert!(planned_empty.script_modules.is_empty());
+        assert_eq!(planned_empty.leaf_id(), None);
+        assert!(!holder_empty.c_probes_initialized());
+        assert!(!holder_empty.spawn_setting_initialized());
+
+        // 2. Scoped closure containing ONLY probe-free `pm_plain` & `bs_plain` (excluding
+        //    `pm_dep_ring` & `bs_with_ring`) -> zero probe init, `leaf_id() == None`.
+        let holder_plain = crate::scripts::SharedCommandProbes::new();
+        let mut plain_macros = blaze_own::Vec::new_in(frame);
+        plain_macros.push(pm_plain_subj);
+        let mut plain_scripts = blaze_own::Vec::new_in(frame);
+        plain_scripts.push(bs_plain_subj);
+        let plain_scope = crate::engine_scripts::ScopedModuleSets {
+            script_modules: plain_scripts,
+            macro_modules: plain_macros,
+        };
+        let planned_plain = crate::engine_scripts::classify_dep_probe_tags(
+            &cx,
+            &graph,
+            Some(&graph),
+            true,
+            &wasm_scripts,
+            Some(&plain_scope),
+            holder_plain.with_env(&env),
+            frame,
+        );
+        assert!(planned_plain.proc_macros.is_empty());
+        assert!(planned_plain.script_modules.is_empty());
+        assert_eq!(planned_plain.leaf_id(), None, "out-of-scope probe-dependent macro/script must not record DepProbes leaf");
+        assert!(!holder_plain.c_probes_initialized(), "out-of-scope macro/script must not initialize c_probes");
+        assert!(!holder_plain.spawn_setting_initialized(), "out-of-scope macro/script must not initialize spawn_setting");
+
+        // 3. Scoped closure including ONLY `pm_dep_ring` -> plans `pm_dep_ring` alone (not `bs_with_ring`),
+        //    initializes probes, and produces `leaf_id().is_some()`.
+        let holder_macro = crate::scripts::SharedCommandProbes::new();
+        let mut macro_only = blaze_own::Vec::new_in(frame);
+        macro_only.push(pm_dep_ring_subj);
+        let macro_scope = crate::engine_scripts::ScopedModuleSets {
+            script_modules: blaze_own::Vec::new_in(frame),
+            macro_modules: macro_only,
+        };
+        let planned_macro = crate::engine_scripts::classify_dep_probe_tags(
+            &cx,
+            &graph,
+            Some(&graph),
+            true,
+            &wasm_scripts,
+            Some(&macro_scope),
+            holder_macro.with_env(&env),
+            frame,
+        );
+        assert_eq!(planned_macro.proc_macros.len(), 1);
+        assert_eq!(planned_macro.proc_macros[0].0, pm_dep_ring_subj);
+        assert!(planned_macro.script_modules.is_empty());
+        assert!(planned_macro.leaf_id().is_some());
+        assert!(holder_macro.spawn_setting_initialized());
+
+        // 4. Whole-workspace (`scoped_sets = None`) -> plans both `pm_dep_ring` and `bs_with_ring`.
+        let holder_whole = crate::scripts::SharedCommandProbes::new();
+        let planned_whole = crate::engine_scripts::classify_dep_probe_tags(
+            &cx,
+            &graph,
+            Some(&graph),
+            true,
+            &wasm_scripts,
+            None,
+            holder_whole.with_env(&env),
+            frame,
+        );
+        assert_eq!(planned_whole.proc_macros.len(), 1);
+        assert_eq!(planned_whole.script_modules.len(), 1);
+        assert_eq!(planned_whole.script_modules[0].0, bs_with_ring_subj);
+        assert!(planned_whole.leaf_id().is_some());
+    }
 }
