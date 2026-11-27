@@ -1587,8 +1587,11 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
         return None;
     }
     let sub = parts.get(1).copied()?;
-    // For `bgit`, only intercept plain `bgit status` / `bgit st` (let `infect`, `mount`, `bench`, etc. run the CLI).
-    if cmd == "bgit" && sub != "status" && sub != "st" {
+    // For `bgit`, intercept rich structured table commands (`status`, `log`, `worktree list`),
+    // letting all other `bgit` subcommands run in-process via `host.rs::try_run_in_process_bgit`.
+    if cmd == "bgit"
+        && !matches!(sub, "status" | "st" | "log" | "worktree" | "wt")
+    {
         return None;
     }
     let rest = &parts[2..];
@@ -1743,6 +1746,96 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
                     blaze_sh::Value::string(bl.summary.as_str(), alloc),
                     blaze_sh::Value::string(email, alloc),
                     blaze_sh::Value::string(bl.full_sha.as_str(), alloc),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
+        "log" => {
+            // Intercept plain `git log` / `bgit log` (and optional `-n N` / `-N`) when backed by
+            // an existing `.bgit` store -> rich interactive commit table with avatars!
+            let mut limit = 30usize;
+            match rest {
+                [] => {}
+                ["-n", n] => limit = n.parse().ok()?,
+                [tok] => {
+                    if let Some(d) = tok.strip_prefix("-n").or_else(|| tok.strip_prefix('-'))
+                        && !d.is_empty()
+                        && d.bytes().all(|b| b.is_ascii_digit())
+                    {
+                        limit = d.parse().ok()?;
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+            let entries = bgit::query_log_entries(Path::new(cwd), "HEAD", limit, alloc).ok()??;
+            if entries.is_empty() {
+                return None;
+            }
+            let mut tbl = blaze_sh::Table::from_col_names(
+                &["commit", "author", "modified", "summary", "email", "sha"],
+                alloc,
+            );
+            tbl.set_col_display("commit", blaze_sh::ColDisplay::GitCommit);
+            tbl.set_col_display("author", blaze_sh::ColDisplay::GitAuthor);
+            tbl.set_col_display("modified", blaze_sh::ColDisplay::HumanTime);
+            tbl.hide_col_by_name("email");
+            tbl.hide_col_by_name("sha");
+            tbl.default_grid = false;
+
+            let gh_repo = crate::git_meta_driver::github_repo_for_dir(Path::new(cwd));
+            let mut warmed: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for e in &entries {
+                if !e.author_email.is_empty()
+                    && warmed.len() < 16
+                    && warmed.insert(e.author_email.clone())
+                {
+                    let _ = crate::git_meta_driver::request_avatar(
+                        &e.author_email,
+                        Some(&e.oid),
+                        gh_repo.as_ref(),
+                    );
+                }
+                let dt_val = if e.timestamp_secs > 0 {
+                    blaze_sh::Value::Date(blaze_sh::DateTime {
+                        utc_ns: e.timestamp_secs.saturating_mul(1_000_000_000),
+                        offset_secs: 0,
+                    })
+                } else {
+                    blaze_sh::Value::Nothing
+                };
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(&e.short_oid, alloc),
+                    blaze_sh::Value::string(&e.author_name, alloc),
+                    dt_val,
+                    blaze_sh::Value::string(&e.subject, alloc),
+                    blaze_sh::Value::string(&e.author_email, alloc),
+                    blaze_sh::Value::string(&e.oid, alloc),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
+        "worktree" | "wt" if matches!(rest, ["list"] | ["ls"]) => {
+            let wts = bgit::query_worktrees(Path::new(cwd), alloc).ok()??;
+            let mut tbl = blaze_sh::Table::from_col_names(
+                &["path", "branch", "tracks", "commit", "mode", "policy"],
+                alloc,
+            );
+            tbl.set_col_display("path", blaze_sh::ColDisplay::FileEntry);
+            tbl.set_col_display("commit", blaze_sh::ColDisplay::GitCommit);
+            tbl.default_grid = false;
+            for wt in &wts {
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(&wt.path, alloc),
+                    blaze_sh::Value::string(&wt.branch, alloc),
+                    blaze_sh::Value::string(&wt.track_branch, alloc),
+                    blaze_sh::Value::string(&wt.head_short, alloc),
+                    blaze_sh::Value::string(if wt.is_vfs { "vfs" } else { "disk" }, alloc),
+                    blaze_sh::Value::string(
+                        if wt.auto_delete_on_merge { "auto-delete" } else { "keep" },
+                        alloc,
+                    ),
                 ]);
             }
             Some(blaze_sh::Value::Table(tbl))

@@ -10,7 +10,8 @@
 //!   downstream worktrees tracking the target branch!
 
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write},
     os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink},
     path::{Path, PathBuf},
     thread,
@@ -35,8 +36,9 @@ use blaze_own::{AVec, Alloc, String as OwnString, Vec as OwnVec};
 use bstd::cli::Matches;
 
 use crate::{
+    IoStreams, WorktreeInfo,
     disk::{BgitDiskStore, infect_repo_on_disk, open_or_infect},
-    print_help,
+    print_help, resolve_bgit_binary, resolve_path,
     vfs_driver::{cmd_unmount_path, spawn_background_mount},
 };
 
@@ -80,19 +82,21 @@ fn save_worktrees<'a>(
 /// Entry point for `bgit worktree` (alias `bgit wt`).
 pub(crate) fn cmd_worktree<'a>(
     matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
     use_color: bool,
     alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
 ) -> io::Result<()> {
     match matches.command_path().get(2).copied() {
         None => {
-            print_help(matches.active_command(), matches.command_path(), use_color, alloc);
+            print_help(matches.active_command(), matches.command_path(), use_color, alloc, io.out);
             Ok(())
         }
-        Some("add") => cmd_wt_add(matches, alloc),
-        Some("list") => cmd_wt_list(matches, alloc),
-        Some("sync") => cmd_wt_sync(matches, alloc),
-        Some("watch") => cmd_wt_watch(matches, alloc),
-        Some("remove") => cmd_wt_remove(matches, alloc),
+        Some("add") => cmd_wt_add(matches, cwd, alloc, io),
+        Some("list") => cmd_wt_list(matches, cwd, alloc, io),
+        Some("sync") => cmd_wt_sync(matches, cwd, alloc, io),
+        Some("watch") => cmd_wt_watch(matches, cwd, alloc, io),
+        Some("remove") => cmd_wt_remove(matches, cwd, alloc, io),
         Some(other) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("unknown worktree subcommand `{other}` (run `bgit worktree --help`)"),
@@ -100,7 +104,36 @@ pub(crate) fn cmd_worktree<'a>(
     }
 }
 
-fn cmd_wt_add<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
+/// Returns registered bgit worktrees for `repo_root` if `.bgit/worktrees.bgwt` exists.
+pub(crate) fn query_worktrees_in_repo<'a>(
+    repo_root: &Path,
+    alloc: Alloc<'a>,
+) -> io::Result<Option<Vec<WorktreeInfo>>> {
+    let bgit_dir = repo_root.join(".bgit");
+    if !bgit_dir.join(WORKTREES_FILE).is_file() {
+        return Ok(None);
+    }
+    let records = load_worktrees(&bgit_dir, alloc)?;
+    let mut out = Vec::with_capacity(records.len());
+    for r in records.iter() {
+        out.push(WorktreeInfo {
+            path: r.path.as_str().to_string(),
+            branch: short_branch_name(r.branch.as_str()).to_string(),
+            track_branch: short_branch_name(r.track_branch.as_str()).to_string(),
+            head_short: format!("{}", ShortOid::from_oid(r.head_commit, 7)),
+            is_vfs: r.is_vfs,
+            auto_delete_on_merge: r.auto_delete_on_merge,
+        });
+    }
+    Ok(Some(out))
+}
+
+fn cmd_wt_add<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
+    alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
+) -> io::Result<()> {
     let from_rev = matches.opt("from");
     let track_rev = matches.opt("track");
     let use_vfs = matches.flag("vfs");
@@ -108,8 +141,8 @@ fn cmd_wt_add<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Res
 
     let pos = matches.positionals();
     let (repo_dir, wt_path_raw, branch_arg) = match pos.len() {
-        2 => (PathBuf::from("."), PathBuf::from(pos[0]), pos[1]),
-        3 => (PathBuf::from(pos[0]), PathBuf::from(pos[1]), pos[2]),
+        2 => (cwd.to_path_buf(), resolve_path(cwd, pos[0]), pos[1]),
+        3 => (resolve_path(cwd, pos[0]), resolve_path(cwd, pos[1]), pos[2]),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -202,17 +235,24 @@ fn cmd_wt_add<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Res
     }
 
     if use_vfs {
-        spawn_background_mount(&canon_repo, &canon_wt, short_branch_name(&branch_ref), false)?;
+        spawn_background_mount(
+            &canon_repo,
+            &canon_wt,
+            short_branch_name(&branch_ref),
+            false,
+            io.out,
+        )?;
     } else {
         let count = checkout_tree_to_dir(&store, head_tree, &canon_wt, alloc)?;
-        println!(
+        writeln!(
+            io.out,
             "Created worktree {} on {} (tracks {}, {} files, auto-delete-on-merge={})",
             canon_wt.display(),
             short_branch_name(&branch_ref),
             short_branch_name(&track_ref),
             count,
             auto_delete
-        );
+        )?;
     }
 
     let name = canon_wt
@@ -248,39 +288,55 @@ impl StrDisplayCompat for blaze_own::AString<'_> {
     }
 }
 
-fn cmd_wt_list<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
-    let repo_dir = PathBuf::from(matches.positional(0).unwrap_or("."));
+fn cmd_wt_list<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
+    alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
+) -> io::Result<()> {
+    let repo_dir = resolve_path(cwd, matches.positional(0).unwrap_or("."));
     let store = open_or_infect(&repo_dir, alloc)?;
     let records = load_worktrees(&store.bgit_dir, alloc)?;
     if records.is_empty() {
-        println!("No registered bgit worktrees in {}", repo_dir.display());
+        writeln!(io.out, "No registered bgit worktrees in {}", repo_dir.display())?;
         return Ok(());
     }
     for r in records.iter() {
         let mode = if r.is_vfs { "vfs" } else { "disk" };
         let del = if r.auto_delete_on_merge { "auto-delete" } else { "keep" };
-        println!(
+        writeln!(
+            io.out,
             "{}\t{}\t-> tracks {}\t({})\t[{mode}, {del}]",
             r.path.as_str(),
             short_branch_name(r.branch.as_str()),
             short_branch_name(r.track_branch.as_str()),
             ShortOid::from_oid(r.head_commit, 7),
-        );
+        )?;
     }
     Ok(())
 }
 
-fn cmd_wt_sync<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
-    let repo_dir = PathBuf::from(matches.positional(0).unwrap_or("."));
+fn cmd_wt_sync<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
+    alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
+) -> io::Result<()> {
+    let repo_dir = resolve_path(cwd, matches.positional(0).unwrap_or("."));
     let dry_run = matches.flag("dry-run");
     let force = matches.flag("force");
     let from_hook = matches.flag("from-hook");
-    sync_all_worktrees(&repo_dir, None, dry_run, force, from_hook, alloc)?;
+    sync_all_worktrees(&repo_dir, None, dry_run, force, from_hook, alloc, io)?;
     Ok(())
 }
 
-fn cmd_wt_watch<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
-    let repo_dir = PathBuf::from(matches.positional(0).unwrap_or("."));
+fn cmd_wt_watch<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
+    alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
+) -> io::Result<()> {
+    let repo_dir = resolve_path(cwd, matches.positional(0).unwrap_or("."));
     let interval_ms = matches
         .opt_parse::<u64>("interval-ms")
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?
@@ -288,33 +344,41 @@ fn cmd_wt_watch<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::R
         .clamp(50, 10_000);
 
     let canon_repo = fs::canonicalize(&repo_dir)?;
-    println!(
+    writeln!(
+        io.out,
         "Watching {} for tracked-branch updates (poll={}ms, auto-merge + auto-delete-on-merge active)...",
         canon_repo.display(),
         interval_ms
-    );
+    )?;
+    let _ = io.out.flush();
 
     let mut last_fp = ref_tree_fingerprint(&canon_repo);
     // Run an initial sync immediately on startup.
-    let _ = sync_all_worktrees(&canon_repo, None, false, false, false, alloc);
+    let _ = sync_all_worktrees(&canon_repo, None, false, false, false, alloc, io);
     loop {
         thread::sleep(Duration::from_millis(interval_ms));
         let fp = ref_tree_fingerprint(&canon_repo);
         if fp != last_fp {
-            if let Err(e) = sync_all_worktrees(&canon_repo, None, false, false, true, alloc) {
-                eprintln!("worktree watch sync error: {e}");
+            if let Err(e) = sync_all_worktrees(&canon_repo, None, false, false, true, alloc, io) {
+                let _ = writeln!(io.err, "worktree watch sync error: {e}");
             }
+            let _ = io.out.flush();
             last_fp = ref_tree_fingerprint(&canon_repo);
         }
     }
 }
 
-fn cmd_wt_remove<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::Result<()> {
+fn cmd_wt_remove<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
+    alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
+) -> io::Result<()> {
     let force = matches.flag("force");
     let pos = matches.positionals();
     let (repo_dir, target) = match pos.len() {
-        1 => (PathBuf::from("."), pos[0]),
-        2 => (PathBuf::from(pos[0]), pos[1]),
+        1 => (cwd.to_path_buf(), pos[0]),
+        2 => (resolve_path(cwd, pos[0]), pos[1]),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -325,7 +389,7 @@ fn cmd_wt_remove<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::
 
     let store = open_or_infect(&repo_dir, alloc)?;
     let records = load_worktrees(&store.bgit_dir, alloc)?;
-    let target_canon = fs::canonicalize(target).ok();
+    let target_canon = fs::canonicalize(resolve_path(cwd, target)).ok();
     let target_ref = canonical_branch_ref(target);
 
     let mut kept: AVec<'a, WorktreeRecord<'a>> = OwnVec::with_capacity_in(records.len(), alloc);
@@ -338,8 +402,13 @@ fn cmd_wt_remove<'a>(matches: &Matches<'_, Alloc<'a>>, alloc: Alloc<'a>) -> io::
             || r.name.as_str() == target;
         let matches_branch = r.branch.as_str() == target_ref || r.branch.as_str() == target;
         if matches_path || matches_branch {
-            remove_worktree_folder(&store, &r, force, alloc)?;
-            println!("Removed worktree {} ({})", r.path.as_str(), short_branch_name(r.branch.as_str()));
+            remove_worktree_folder(&store, &r, force, alloc, io.out)?;
+            writeln!(
+                io.out,
+                "Removed worktree {} ({})",
+                r.path.as_str(),
+                short_branch_name(r.branch.as_str())
+            )?;
             removed_any = true;
         } else {
             kept.push(r);
@@ -364,6 +433,7 @@ pub(crate) fn on_branch_merged<'a>(
     keep_worktree: bool,
     no_sync: bool,
     alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
 ) -> io::Result<()> {
     let bgit_dir = repo_dir.join(".bgit");
     if !bgit_dir.join(WORKTREES_FILE).is_file() {
@@ -379,18 +449,20 @@ pub(crate) fn on_branch_merged<'a>(
 
         for r in records {
             if r.auto_delete_on_merge && r.branch.as_str() == merged_canon {
-                match remove_worktree_folder(&store, &r, false, alloc) {
+                match remove_worktree_folder(&store, &r, false, alloc, io.out) {
                     Ok(()) => {
-                        println!(
+                        writeln!(
+                            io.out,
                             "Auto-deleted merged worktree {} ({} merged into {})",
                             r.path.as_str(),
                             short_branch_name(r.branch.as_str()),
                             into_branch_ref.map_or("target", short_branch_name),
-                        );
+                        )?;
                         changed = true;
                     }
                     Err(e) => {
-                        eprintln!(
+                        let _ = writeln!(
+                            io.err,
                             "warning: kept merged worktree {} ({e})",
                             r.path.as_str()
                         );
@@ -407,7 +479,7 @@ pub(crate) fn on_branch_merged<'a>(
     }
 
     if !no_sync && let Some(target_ref) = into_branch_ref {
-        sync_all_worktrees(repo_dir, Some(target_ref), false, false, false, alloc)?;
+        sync_all_worktrees(repo_dir, Some(target_ref), false, false, false, alloc, io)?;
     }
     Ok(())
 }
@@ -420,6 +492,7 @@ pub(crate) fn sync_all_worktrees<'a>(
     force: bool,
     force_git_refresh: bool,
     alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
 ) -> io::Result<()> {
     // Fast-path: if no worktrees are registered, do zero work (< 0.5 ms in Git hooks!).
     let wt_file = repo_dir.join(".bgit").join(WORKTREES_FILE);
@@ -464,7 +537,8 @@ pub(crate) fn sync_all_worktrees<'a>(
                 updated_records.push(rec);
             }
             WorktreeSyncDecision::MissingBranch => {
-                eprintln!(
+                let _ = writeln!(
+                    io.err,
                     "worktree {}: branch {} no longer exists",
                     rec.path.as_str(),
                     short_branch_name(rec.branch.as_str())
@@ -472,7 +546,8 @@ pub(crate) fn sync_all_worktrees<'a>(
                 updated_records.push(rec);
             }
             WorktreeSyncDecision::MissingTrackedBranch => {
-                eprintln!(
+                let _ = writeln!(
+                    io.err,
                     "worktree {}: tracked branch {} does not exist",
                     rec.path.as_str(),
                     short_branch_name(rec.track_branch.as_str())
@@ -481,26 +556,29 @@ pub(crate) fn sync_all_worktrees<'a>(
             }
             WorktreeSyncDecision::MergedIntoTracked { .. } => {
                 if dry_run {
-                    println!(
+                    writeln!(
+                        io.out,
                         "[dry-run] would auto-delete merged worktree {} ({} merged into {})",
                         rec.path.as_str(),
                         short_branch_name(rec.branch.as_str()),
                         short_branch_name(rec.track_branch.as_str()),
-                    );
+                    )?;
                     updated_records.push(rec);
                 } else {
-                    match remove_worktree_folder(&store, &rec, force, alloc) {
+                    match remove_worktree_folder(&store, &rec, force, alloc, io.out) {
                         Ok(()) => {
-                            println!(
+                            writeln!(
+                                io.out,
                                 "Auto-deleted merged worktree {} ({} merged into {})",
                                 rec.path.as_str(),
                                 short_branch_name(rec.branch.as_str()),
                                 short_branch_name(rec.track_branch.as_str()),
-                            );
+                            )?;
                             manifest_dirty = true;
                         }
                         Err(e) => {
-                            eprintln!(
+                            let _ = writeln!(
+                                io.err,
                                 "warning: kept merged worktree {} ({e})",
                                 rec.path.as_str()
                             );
@@ -522,28 +600,30 @@ pub(crate) fn sync_all_worktrees<'a>(
                 .map_err(|e| io::Error::other(format!("{e}")))?;
 
                 if !plan.is_clean() {
-                    eprintln!(
+                    let _ = writeln!(
+                        io.err,
                         "worktree {} ({}): skipped fast-forward due to {} filesystem conflict(s):",
                         rec.path.as_str(),
                         short_branch_name(rec.branch.as_str()),
                         plan.conflicts.len()
                     );
                     for c in &plan.conflicts {
-                        eprintln!("  FS CONFLICT ({:?}): {}", c.kind, c.path.as_str());
+                        let _ = writeln!(io.err, "  FS CONFLICT ({:?}): {}", c.kind, c.path.as_str());
                     }
                     updated_records.push(rec);
                     continue;
                 }
 
                 if dry_run {
-                    println!(
+                    writeln!(
+                        io.out,
                         "[dry-run] fast-forward {} ({} -> {}, {} fs ops, {} auto-merged dirty files)",
                         rec.path.as_str(),
                         ShortOid::from_oid(old_commit, 7),
                         ShortOid::from_oid(new_commit, 7),
                         plan.actions.len(),
                         plan.auto_merged_files,
-                    );
+                    )?;
                     updated_records.push(rec);
                     continue;
                 }
@@ -568,14 +648,15 @@ pub(crate) fn sync_all_worktrees<'a>(
                 rec.head_commit = new_commit;
                 rec.head_tree = new_tree;
                 manifest_dirty = true;
-                println!(
+                writeln!(
+                    io.out,
                     "Synced worktree {} ({} fast-forwarded to {}, {} fs ops, {} auto-merged dirty files)",
                     rec.path.as_str(),
                     short_branch_name(rec.branch.as_str()),
                     ShortOid::from_oid(new_commit, 7),
                     plan.actions.len(),
                     plan.auto_merged_files,
-                );
+                )?;
                 updated_records.push(rec);
             }
             WorktreeSyncDecision::AutoMerge {
@@ -587,7 +668,8 @@ pub(crate) fn sync_all_worktrees<'a>(
                 conflicts,
             } => {
                 if status != MergeStatus::MergedClean {
-                    eprintln!(
+                    let _ = writeln!(
+                        io.err,
                         "worktree {} ({}): auto-merge from {} had {} tree conflict(s), leaving untouched:",
                         rec.path.as_str(),
                         short_branch_name(rec.branch.as_str()),
@@ -595,7 +677,7 @@ pub(crate) fn sync_all_worktrees<'a>(
                         conflicts.len()
                     );
                     for c in &conflicts {
-                        eprintln!("  TREE CONFLICT ({:?}): {}", c.kind, c.path.as_str());
+                        let _ = writeln!(io.err, "  TREE CONFLICT ({:?}): {}", c.kind, c.path.as_str());
                     }
                     updated_records.push(rec);
                     continue;
@@ -613,27 +695,29 @@ pub(crate) fn sync_all_worktrees<'a>(
                 .map_err(|e| io::Error::other(format!("{e}")))?;
 
                 if !plan.is_clean() {
-                    eprintln!(
+                    let _ = writeln!(
+                        io.err,
                         "worktree {} ({}): auto-merge had {} local filesystem conflict(s), leaving untouched:",
                         rec.path.as_str(),
                         short_branch_name(rec.branch.as_str()),
                         plan.conflicts.len()
                     );
                     for c in &plan.conflicts {
-                        eprintln!("  FS CONFLICT ({:?}): {}", c.kind, c.path.as_str());
+                        let _ = writeln!(io.err, "  FS CONFLICT ({:?}): {}", c.kind, c.path.as_str());
                     }
                     updated_records.push(rec);
                     continue;
                 }
 
                 if dry_run {
-                    println!(
+                    writeln!(
+                        io.out,
                         "[dry-run] auto-merge {} into {} ({} fs ops, {} auto-merged dirty files)",
                         short_branch_name(rec.track_branch.as_str()),
                         rec.path.as_str(),
                         plan.actions.len(),
                         plan.auto_merged_files,
-                    );
+                    )?;
                     updated_records.push(rec);
                     continue;
                 }
@@ -679,7 +763,8 @@ pub(crate) fn sync_all_worktrees<'a>(
                 rec.head_commit = merge_oid;
                 rec.head_tree = merged_tree;
                 manifest_dirty = true;
-                println!(
+                writeln!(
+                    io.out,
                     "Auto-merged {} into worktree {} ({} -> {}, {} fs ops, {} auto-merged dirty files)",
                     short_branch_name(rec.track_branch.as_str()),
                     rec.path.as_str(),
@@ -687,7 +772,7 @@ pub(crate) fn sync_all_worktrees<'a>(
                     ShortOid::from_oid(merge_oid, 7),
                     plan.actions.len(),
                     plan.auto_merged_files,
-                );
+                )?;
                 updated_records.push(rec);
             }
         }
@@ -707,6 +792,7 @@ fn remove_worktree_folder<'a>(
     rec: &WorktreeRecord<'a>,
     force: bool,
     alloc: Alloc<'a>,
+    out: &mut dyn Write,
 ) -> io::Result<()> {
     let wt_path = Path::new(rec.path.as_str());
     if !wt_path.exists() {
@@ -721,7 +807,7 @@ fn remove_worktree_folder<'a>(
         }
     }
     if rec.is_vfs {
-        let _ = cmd_unmount_path(wt_path, force);
+        let _ = cmd_unmount_path(wt_path, force, out);
     }
     if wt_path.exists() {
         fs::remove_dir_all(wt_path)?;
@@ -952,10 +1038,7 @@ pub(crate) fn install_git_worktree_hooks(repo_root: &Path) -> io::Result<()> {
         return Ok(());
     }
 
-    let exe_str = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(str::to_string))
-        .unwrap_or_else(|| "bgit".to_string());
+    let exe_str = resolve_bgit_binary().to_string_lossy().into_owned();
     let escaped_exe = exe_str.replace('\'', "'\\''");
     let canon_root = fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
     let escaped_root = canon_root.to_string_lossy().replace('\'', "'\\''");
@@ -1080,7 +1163,7 @@ fn mirror_ref_to_git(repo_root: &Path, full_ref: &str, oid: Oid) {
 
 /// If a sibling `.git` directory has refs modified more recently than `.bgit/refs.bgref`
 /// (or when invoked from a Git `reference-transaction` hook), refresh `.bgit` automatically.
-fn refresh_bgit_if_git_refs_newer<'a>(
+pub(crate) fn refresh_bgit_if_git_refs_newer<'a>(
     repo_dir: &Path,
     force_refresh: bool,
     alloc: Alloc<'a>,

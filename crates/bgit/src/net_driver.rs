@@ -9,7 +9,7 @@
 //!     talking to `bgit serve --http` or any standard Git Smart HTTP server!
 
 use std::{
-    io::{self, Read as _, Write as _},
+    io::{self, Read as _, Write},
     net::{TcpListener, TcpStream},
     path::Path,
 };
@@ -91,7 +91,18 @@ fn handle_http_conn<'a>(
     if req.target.contains("receive-pack")
         && let Some(repo_dir) = store.bgit_dir.parent()
     {
-        let _ = crate::worktree_driver::sync_all_worktrees(repo_dir, None, false, false, false, alloc);
+        let mut out = io::stdout();
+        let mut err = io::stderr();
+        let mut streams = crate::IoStreams { out: &mut out, err: &mut err };
+        let _ = crate::worktree_driver::sync_all_worktrees(
+            repo_dir,
+            None,
+            false,
+            false,
+            false,
+            alloc,
+            &mut streams,
+        );
     }
     stream.write_all(&resp)?;
     stream.flush()?;
@@ -157,6 +168,9 @@ pub(crate) fn serve_stdio<'a>(service: &str, repo_root: &Path, alloc: Alloc<'a>)
             )
             .map_err(|e| io::Error::other(format!("{e}")))?;
             store.flush()?;
+            let mut out_sink = io::sink();
+            let mut err_sink = io::stderr();
+            let mut streams = crate::IoStreams { out: &mut out_sink, err: &mut err_sink };
             let _ = crate::worktree_driver::sync_all_worktrees(
                 repo_root,
                 None,
@@ -164,6 +178,7 @@ pub(crate) fn serve_stdio<'a>(service: &str, repo_root: &Path, alloc: Alloc<'a>)
                 false,
                 false,
                 alloc,
+                &mut streams,
             );
             stdout.write_all(&resp)?;
             stdout.flush()?;
@@ -299,7 +314,11 @@ fn http_exchange(
 }
 
 /// Lists remote refs over Git Protocol v2 Smart HTTP.
-pub(crate) fn http_ls_remote<'a>(url: &str, alloc: Alloc<'a>) -> io::Result<()> {
+pub(crate) fn http_ls_remote<'a>(
+    url: &str,
+    alloc: Alloc<'a>,
+    out: &mut dyn Write,
+) -> io::Result<()> {
     let parsed = parse_http_url(url)?;
     let info_path = format!("{}/info/refs?service=git-upload-pack", parsed.base_path);
     let advert = http_exchange(parsed.host_port, "GET", &info_path, None, true, b"")?;
@@ -321,8 +340,8 @@ pub(crate) fn http_ls_remote<'a>(url: &str, alloc: Alloc<'a>) -> io::Result<()> 
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
     for r in refs {
         match r.oid {
-            Some(oid) => println!("{oid}\t{}", r.name.as_str()),
-            None => println!("unborn\t{}", r.name.as_str()),
+            Some(oid) => writeln!(out, "{oid}\t{}", r.name.as_str())?,
+            None => writeln!(out, "unborn\t{}", r.name.as_str())?,
         }
     }
     Ok(())
@@ -335,6 +354,7 @@ pub(crate) fn http_clone<'a>(
     dest_dir: &Path,
     checkout: bool,
     alloc: Alloc<'a>,
+    out: &mut dyn Write,
 ) -> io::Result<()> {
     let parsed = parse_http_url(url)?;
     let info_path = format!("{}/info/refs?service=git-upload-pack", parsed.base_path);
@@ -437,14 +457,15 @@ pub(crate) fn http_clone<'a>(
         }
     }
 
-    println!(
+    writeln!(
+        out,
         "cloned {} into {} (objects={}, refs={}, files={})",
         url,
         dest_dir.display(),
         unpacked_count,
         remote_refs.len(),
         checked_out
-    );
+    )?;
     Ok(())
 }
 
@@ -454,6 +475,7 @@ pub(crate) fn http_push<'a>(
     repo_root: &Path,
     ref_name: &str,
     alloc: Alloc<'a>,
+    out: &mut dyn Write,
 ) -> io::Result<()> {
     let store = open_or_infect(repo_root, alloc)?;
     let full_ref = if ref_name.starts_with("refs/") {
@@ -480,7 +502,7 @@ pub(crate) fn http_push<'a>(
         .unwrap_or(ZERO_OID);
 
     if remote_old == local_oid {
-        println!("Everything up-to-date ({full_ref} @ {local_oid})");
+        writeln!(out, "Everything up-to-date ({full_ref} @ {local_oid})")?;
         return Ok(());
     }
 
@@ -518,7 +540,7 @@ pub(crate) fn http_push<'a>(
     }
     for r in &report.refs {
         if r.ok {
-            println!("ok {} ({remote_old} -> {local_oid})", r.name.as_str());
+            writeln!(out, "ok {} ({remote_old} -> {local_oid})", r.name.as_str())?;
         } else {
             return Err(io::Error::other(format!(
                 "remote rejected {}: {}",

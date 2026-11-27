@@ -511,3 +511,69 @@ fn plain_git_merge_auto_updates_tracking_worktree_and_deletes_merged_worktree_wi
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn libbgit_in_process_and_git_compat_routing_work_without_spawning() {
+    let base = std::env::temp_dir().join(format!("bgit-inproc-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    run_git(&repo, &["init", "-b", "main"]);
+    fs::write(repo.join("a.txt"), "hello\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "first commit"]);
+    let first_sha = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    fs::write(repo.join("b.txt"), "world\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "second commit"]);
+    let head_sha = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let alloc = blaze_own::Alloc::global();
+
+    // 1. Un-infected repo: `git status --porcelain` and `git rev-parse --abbrev-ref HEAD` run
+    //    in-process WITHOUT creating `.bgit/` on disk!
+    fs::write(repo.join("untracked.txt"), "draft\n").unwrap();
+    let st = bgit::try_run_git_via_bgit(&["status", "--porcelain"], &repo, false, alloc)
+        .expect("git status --porcelain must run in-process");
+    assert_eq!(st.exit_code, 0);
+    assert_eq!(String::from_utf8_lossy(&st.stdout), "?? untracked.txt\n");
+    let br = bgit::try_run_git_via_bgit(&["rev-parse", "--abbrev-ref", "HEAD"], &repo, false, alloc)
+        .expect("git rev-parse --abbrev-ref HEAD must run in-process");
+    assert_eq!(String::from_utf8_lossy(&br.stdout), "main\n");
+    assert!(!repo.join(".bgit").exists(), "un-infected git queries must not create .bgit/");
+
+    // 2. Infect in-process via `run_bgit_in_process`:
+    let inf = bgit::run_bgit_in_process(&["infect"], &repo, false, alloc);
+    assert_eq!(inf.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&inf.stderr));
+    assert!(repo.join(".bgit/VERSION").is_file());
+
+    // 3. `git rev-parse HEAD`, `git log --oneline -n 2`, `git show-ref --heads`, `git merge-base`,
+    //    and `git -C <repo> ...` all run directly in-process via `libbgit`!
+    let rp = bgit::try_run_git_via_bgit(&["rev-parse", "HEAD"], &repo, false, alloc).unwrap();
+    assert_eq!(String::from_utf8_lossy(&rp.stdout).trim(), head_sha);
+
+    let log_out =
+        bgit::try_run_git_via_bgit(&["-C", repo.to_str().unwrap(), "log", "--oneline", "-n", "2"], &base, false, alloc)
+            .unwrap();
+    assert_eq!(log_out.exit_code, 0);
+    let log_text = String::from_utf8_lossy(&log_out.stdout);
+    assert!(log_text.contains("second commit") && log_text.contains("first commit"), "log: {log_text}");
+
+    let sr = bgit::try_run_git_via_bgit(&["show-ref", "--heads"], &repo, false, alloc).unwrap();
+    assert_eq!(String::from_utf8_lossy(&sr.stdout).trim(), format!("{head_sha} refs/heads/main"));
+
+    let mb = bgit::try_run_git_via_bgit(&["merge-base", &first_sha, &head_sha], &repo, false, alloc).unwrap();
+    assert_eq!(String::from_utf8_lossy(&mb.stdout).trim(), first_sha);
+
+    let entries = bgit::query_log_entries(&repo, "HEAD", 5, alloc).unwrap().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].subject, "second commit");
+    assert_eq!(entries[1].subject, "first commit");
+
+    // 4. Unsupported git subcommands cleanly return None (deferring to external git).
+    assert!(bgit::try_run_git_via_bgit(&["commit", "-m", "x"], &repo, false, alloc).is_none());
+
+    let _ = fs::remove_dir_all(&base);
+}
