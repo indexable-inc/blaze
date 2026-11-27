@@ -1029,28 +1029,44 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             let rows = self.adjust_rows(e);
             for n in 0..rows.len() {
-                if !matches!(self.checked.adjusts.column::<1>()[rows.start + n], AdjustKind::Unsize) {
-                    continue;
+                match self.checked.adjusts.column::<1>().get(rows.start + n).copied() {
+                    Some(AdjustKind::Deref { overloaded: Some(m) }) => {
+                        let self_t = self.ty_before(e, n)?;
+                        let g_self = self.ground_ty(self_t).map_err(|error| Self::ty_err(e, error))?;
+                        if !matches!(self.ground_node(g_self).map_err(|error| Self::ty_err(e, error))?, PNode::Dynamic(_)) {
+                            continue;
+                        }
+                        let Some(item) = self.adts.deref_fn(m) else {
+                            continue;
+                        };
+                        let args = self.ground.intern_list(&[g_self]).map_err(|_| malformed("the ground table is full"))?;
+                        if let Some(DynSlot { principal, slot, .. }) = self.dyn_slot(e, Instance { item, args })? {
+                            out.push(ObjectRead::Call { principal, method: item, slot });
+                        }
+                    }
+                    Some(AdjustKind::Unsize) => {
+                        let UnsizeEnds { from, to, .. } = self.unsize_ends(e, n)?;
+                        let node = |w: &Self, t: PTy| w.ground_node(t).map_err(|error| Self::ty_err(e, error));
+                        if !matches!((node(self, from)?, node(self, to)?), (PNode::Dynamic(_), PNode::Dynamic(_))) {
+                            continue;
+                        }
+                        let (Some((a, _)), Some((b, _))) = (self.principal(e, from)?, self.principal(e, to)?) else {
+                            continue;
+                        };
+                        if a == b {
+                            continue;
+                        }
+                        let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.scratch)
+                            .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
+                        let slot = match shape.upcast(b) {
+                            Some(crate::vtable::Upcast::Prefix) => None,
+                            Some(crate::vtable::Upcast::Load(slot)) => Some(slot),
+                            None => return Err(malformed("an upcast to a trait that is not a supertrait")),
+                        };
+                        out.push(ObjectRead::Upcast { from: a, to: b, slot });
+                    }
+                    _ => continue,
                 }
-                let UnsizeEnds { from, to, .. } = self.unsize_ends(e, n)?;
-                let node = |w: &Self, t: PTy| w.ground_node(t).map_err(|error| Self::ty_err(e, error));
-                if !matches!((node(self, from)?, node(self, to)?), (PNode::Dynamic(_), PNode::Dynamic(_))) {
-                    continue;
-                }
-                let (Some((a, _)), Some((b, _))) = (self.principal(e, from)?, self.principal(e, to)?) else {
-                    continue;
-                };
-                if a == b {
-                    continue;
-                }
-                let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.scratch)
-                    .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
-                let slot = match shape.upcast(b) {
-                    Some(crate::vtable::Upcast::Prefix) => None,
-                    Some(crate::vtable::Upcast::Load(slot)) => Some(slot),
-                    None => return Err(malformed("an upcast to a trait that is not a supertrait")),
-                };
-                out.push(ObjectRead::Upcast { from: a, to: b, slot });
             }
         }
         Ok(())
@@ -5018,14 +5034,45 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             Mutbl::Mut => "deref_mut",
         };
         let item = self.adts.deref_fn(m).ok_or(BuildError::NoLangFn { expr: Some(e), name })?;
-        let g_arg =self.ground.intern(PNode::Ref(m, g_self)).map_err(|_| malformed("the ground table is full"))?;
+        let g_arg = self.ground.intern(PNode::Ref(m, g_self)).map_err(|_| malformed("the ground table is full"))?;
         let g_ret = self.ground.intern(PNode::Ref(m, g_target)).map_err(|_| malformed("the ground table is full"))?;
         let arepr = self.repr(g_arg).map_err(|error| Self::ty_err(e, error))?;
+        // A wide `rrepr` (an aggregate) comes back as `V::Place` of its temporary: the memory
+        // `DerefPlace` keeps as the unsized place (`take_passed`, every aggregate pass).
+        let rrepr = self.repr(g_ret).map_err(|error| Self::ty_err(e, error))?;
+        let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
+        let rpass = self.pass(g_ret, rrepr, abi, Some(item))?;
+        let args = self.ground.intern_list(&[g_self]).map_err(|_| malformed("the ground table is full"))?;
+        let instance = Instance { item, args };
+        // `dyn Deref` or a trait object whose supertrait chain includes `Deref` / `DerefMut`:
+        // dispatch dynamically through the vtable slot with the thin data pointer.
+        if let Some(DynSlot { slot, by_value, .. }) = self.dyn_slot(e, instance)? {
+            self.refuse_tracked_slot(e, instance)?;
+            if by_value {
+                return Err(malformed("a `Deref` or `DerefMut` vtable slot marked by-value"));
+            }
+            let v = self.pop()?;
+            let place = self.place(v, arepr)?;
+            let data = self.load(Repr::Ptr, place);
+            let data = self.scalar(data, Ty::PTR)?;
+            let vt = self.load(Repr::Ptr, (place.0, place.1 + 8));
+            let vt = self.scalar(vt, Ty::PTR)?;
+            self.end_temp_val(v);
+            let thin = self.thin_receiver(e, g_arg)?;
+            let trepr = self.repr(thin).map_err(|error| Self::ty_err(e, error))?;
+            let tpass = self.pass(thin, trepr, abi, Some(item))?;
+            self.push_val(V::Scalar(data), None);
+            let off = 8 * (crate::vtable::HEADER_WORDS + slot);
+            let off = i32::try_from(off).map_err(|_| malformed("a vtable slot past 2^31 bytes"))?;
+            let f = self.b.load(Ty::PTR, Flags::NONE, vt, off, MemAttrs::aligned(3));
+            return self.emit_call(Callee::Pointer(f), &[trepr], &[tpass], rrepr, rpass);
+        }
         // An unsized `Self` (`struct Bytes([u8])` with `impl Deref for Bytes`, winnow's
-        // `SliceLen for &Bytes`): `&Self` is a wide pointer, an aggregate, on top as the place of
-        // its memory (`Task::Ref` of the unsized place, or the loaded pointer of the step
-        // before). It is passed as every aggregate argument is, from the caller's own copy
-        // (`Task::ArgCopy`'s rule), so the callee's parameter is never the place it came from.
+        // `SliceLen for &Bytes`, or `impl Deref for dyn Other`): `&Self` is a wide pointer, an
+        // aggregate, on top as the place of its memory (`Task::Ref` of the unsized place, or the
+        // loaded pointer of the step before). It is passed as every aggregate argument is, from
+        // the caller's own copy (`Task::ArgCopy`'s rule), so the callee's parameter is never the
+        // place it came from.
         match arepr {
             Repr::Ptr => {}
             Repr::Agg(_) => {
@@ -5036,14 +5083,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             _ => return Err(malformed("a reference to a `Deref` `Self` that is neither a thin nor a wide pointer")),
         }
-        // A wide `rrepr` (an aggregate) comes back as `V::Place` of its temporary: the memory
-        // `DerefPlace` keeps as the unsized place (`take_passed`, every aggregate pass).
-        let rrepr = self.repr(g_ret).map_err(|error| Self::ty_err(e, error))?;
-        let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
         let apass = self.pass(g_arg, arepr, abi, Some(item))?;
-        let rpass = self.pass(g_ret, rrepr, abi, Some(item))?;
-        let args = self.ground.intern_list(&[g_self]).map_err(|_| malformed("the ground table is full"))?;
-        self.call_instance(Some(e), Instance { item, args }, &[arepr], &[apass], None, rrepr, rpass)
+        self.call_instance(Some(e), instance, &[arepr], &[apass], None, rrepr, rpass)
     }
 
     /// Applies `e`'s adjustments from its `from`th on, all coercions, to the value on top, in
