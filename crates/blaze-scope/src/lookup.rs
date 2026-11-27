@@ -824,6 +824,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                 for &root in self.macro_use.iter() {
                     match self.layer_name(root, Namespace::Macros, lq.name, Layer::MacroUsePrelude, env, sink) {
                         Res::None => {}
+                        Res::Found(hit) if !matches!(hit.def.kind, DefKind::Macro(s) if s.in_macro_use_prelude()) => {}
                         other => {
                             r = other;
                             break;

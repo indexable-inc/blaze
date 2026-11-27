@@ -1925,3 +1925,191 @@ fn many_mutually_globbed_modules_with_unresolved_calls_converge_quickly() {
         fwd.stats.stalls
     );
 }
+
+/// C2-A: A block module with an unrelated user glob (e.g. `use MyEnum::*;` or `use other::*;`
+/// that does not publicly bind `assert_eq`) still resolves `assert_eq!` through its lexical
+/// parent's named import `use e::other as assert_eq;` without `GlobVsOuter`.
+/// Negative control: when a non-lexical block glob DOES publicly bind `assert_eq`, real
+/// `GlobVsOuter` ambiguity is still reported.
+#[test]
+fn a_blocks_call_with_unrelated_glob_reads_its_modules_named_import_before_the_prelude() {
+    let called = |c: &Cells<'static, N>, call: ItemKey| match c.call_outcome(call) {
+        Some(Outcome::Called(d)) => Some(d.key),
+        _ => None,
+    };
+
+    // Positive 1: unrelated module glob (only binds a struct and a private macro of the same name).
+    {
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let dep = w.root(2, Edition::E2021);
+        let std_assert = w.rules_with(dep, "assert_eq", true);
+        let pretty_assert = w.rules_with(dep, "pretty_assert_eq", true);
+        w.cr(dep).macro_exports.push(("assert_eq", std_assert, crate::MacroShapes::FN_LIKE));
+        w.cr(dep).macro_exports.push(("pretty_assert_eq", pretty_assert, crate::MacroShapes::FN_LIKE));
+        w.dep(root, "e", dep);
+        w.cr(root).macro_use.push(dep);
+        w.use_as(root, "e::pretty_assert_eq", "assert_eq", V::Priv);
+
+        let unrelated = w.module(root, "unrelated", V::Pub);
+        w.item(unrelated, "Something", Namespace::Types, crate::DefKind::Other, V::Pub);
+        w.item(unrelated, "assert_eq", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Priv);
+
+        let block = w.module(root, "__blaze_block_0", V::Priv);
+        w.glob(block, "super", V::Priv);
+        w.glob(block, "crate::unrelated", V::Priv);
+        let call = w.call(block, "assert_eq", crate::CallShape::FnLike);
+
+        let ok = with_dep(&w, root, dep, CellPlant::None);
+        assert_eq!(called(&ok, call), Some(pretty_assert), "unrelated module glob: {:?}", ok.call_outcome(call));
+    }
+
+    // Positive 2: enum glob (`use MyEnum::*;` where enum variants cannot bind macros).
+    {
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let dep = w.root(2, Edition::E2021);
+        let std_assert = w.rules_with(dep, "assert_eq", true);
+        let pretty_assert = w.rules_with(dep, "pretty_assert_eq", true);
+        w.cr(dep).macro_exports.push(("assert_eq", std_assert, crate::MacroShapes::FN_LIKE));
+        w.cr(dep).macro_exports.push(("pretty_assert_eq", pretty_assert, crate::MacroShapes::FN_LIKE));
+        w.dep(root, "e", dep);
+        w.cr(root).macro_use.push(dep);
+        w.use_as(root, "e::pretty_assert_eq", "assert_eq", V::Priv);
+        w.item(root, "MyEnum", Namespace::Types, crate::DefKind::Enum, V::Pub);
+
+        let block = w.module(root, "__blaze_block_0", V::Priv);
+        w.glob(block, "super", V::Priv);
+        w.glob(block, "crate::MyEnum", V::Priv);
+        let call = w.call(block, "assert_eq", crate::CallShape::FnLike);
+
+        let ok = with_dep(&w, root, dep, CellPlant::None);
+        assert_eq!(called(&ok, call), Some(pretty_assert), "enum glob: {:?}", ok.call_outcome(call));
+    }
+
+    // Negative control: block glob `use bar::*;` DOES bind `assert_eq` -> must report GlobVsOuter.
+    {
+        let mut w = World::new();
+        let root = w.root(1, Edition::E2021);
+        let dep = w.root(2, Edition::E2021);
+        let std_assert = w.rules_with(dep, "assert_eq", true);
+        let pretty_assert = w.rules_with(dep, "pretty_assert_eq", true);
+        w.cr(dep).macro_exports.push(("assert_eq", std_assert, crate::MacroShapes::FN_LIKE));
+        w.cr(dep).macro_exports.push(("pretty_assert_eq", pretty_assert, crate::MacroShapes::FN_LIKE));
+        w.dep(root, "e", dep);
+        w.cr(root).macro_use.push(dep);
+
+        let bar = w.module(root, "bar", V::Pub);
+        w.use_as(bar, "e::pretty_assert_eq", "assert_eq", V::Pub);
+
+        let block = w.module(root, "__blaze_block_0", V::Priv);
+        w.glob(block, "super", V::Priv);
+        w.glob(block, "crate::bar", V::Priv);
+        let call = w.call(block, "assert_eq", crate::CallShape::FnLike);
+
+        let res = with_dep(&w, root, dep, CellPlant::None);
+        assert_eq!(
+            res.call_outcome(call),
+            Some(Outcome::Failed(Unresolved::Ambiguous(crate::AmbiguityKind::GlobVsOuter))),
+            "non-lexical glob binding `assert_eq` must still report GlobVsOuter"
+        );
+    }
+}
+
+/// C2-B: Macros 2.0 (`pub macro`) at a `#[macro_use]` crate's root never enter the `#[macro_use]`
+/// prelude, while Macros 2.0 in the standard prelude, legacy `#[macro_export] macro_rules!` at the
+/// crate root, and explicit paths to Macros 2.0 still work.
+#[test]
+fn macro2_at_dep_root_is_excluded_from_macro_use_prelude() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let std_like = w.root(2, Edition::E2021);
+    let other = w.root(3, Edition::E2021);
+
+    // std_like root: Macros 2.0 `assert_matches` (NOT in prelude), legacy `legacy_mac` (at root),
+    // and Macros 2.0 `cfg_select` in `std_like::prelude`.
+    let std_assert_matches = w.item(
+        std_like,
+        "assert_matches",
+        Namespace::Macros,
+        crate::DefKind::Macro(crate::MacroShapes::FN_LIKE.as_macro2()),
+        V::Pub,
+    );
+    let std_legacy = w.rules_with(std_like, "legacy_mac", true);
+    w.cr(std_like).macro_exports.push(("legacy_mac", std_legacy, crate::MacroShapes::FN_LIKE));
+    let std_prelude = w.module(std_like, "prelude", V::Pub);
+    let std_cfg_select = w.item(
+        std_prelude,
+        "cfg_select",
+        Namespace::Macros,
+        crate::DefKind::Macro(crate::MacroShapes::FN_LIKE.as_macro2()),
+        V::Pub,
+    );
+
+    // other crate: legacy `assert_matches` and `legacy_mac`.
+    let other_assert_matches = w.rules_with(other, "assert_matches", true);
+    let other_legacy = w.rules_with(other, "legacy_mac", true);
+    w.cr(other).macro_exports.push(("assert_matches", other_assert_matches, crate::MacroShapes::FN_LIKE));
+    w.cr(other).macro_exports.push(("legacy_mac", other_legacy, crate::MacroShapes::FN_LIKE));
+
+    w.dep(root, "other", other);
+    w.dep(root, "std_like", std_like);
+    w.cr(root).macro_use.push(std_like);
+    w.cr(root).head.prelude = Some(std_prelude);
+
+    let parent = w.module(root, "parent", V::Priv);
+    w.use_(parent, "other::assert_matches", V::Priv);
+    w.use_(parent, "other::legacy_mac", V::Priv);
+    let child = w.module(parent, "child", V::Priv);
+    w.glob(child, "super", V::Priv);
+    let call_assert_matches = w.call(child, "assert_matches", crate::CallShape::FnLike);
+    let call_legacy = w.call(child, "legacy_mac", crate::CallShape::FnLike);
+    let call_cfg_select = w.call(child, "cfg_select", crate::CallShape::FnLike);
+    let call_explicit = w.call(root, "std_like::assert_matches", crate::CallShape::FnLike);
+    w.use_(root, "std_like::assert_matches", V::Priv);
+    let call_imported = w.call(root, "assert_matches", crate::CallShape::FnLike);
+
+    let d_std = SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, std_like, CellPlant::None)), krate: crate::tests::crate_key(2), root: std_like };
+    let d_other = SolvedDep { cells: core::cell::RefCell::new(cells_of(&w, other, CellPlant::None)), krate: crate::tests::crate_key(3), root: other };
+
+    struct TwoDeps(SolvedDep, SolvedDep);
+    impl super::DepNames<N> for TwoDeps {
+        fn has_module(&self, module: ItemKey) -> bool {
+            self.0.has_module(module) || self.1.has_module(module)
+        }
+        fn name_in(&self, module: ItemKey, ns: Namespace, name: N) -> super::DepAnswer {
+            if self.0.has_module(module) {
+                self.0.name_in(module, ns, name)
+            } else {
+                self.1.name_in(module, ns, name)
+            }
+        }
+        fn crate_root(&self, krate: blaze_id::CrateItemKey) -> Option<ItemKey> {
+            self.0.crate_root(krate).or_else(|| self.1.crate_root(krate))
+        }
+        fn has_enum(&self, key: ItemKey) -> bool {
+            self.0.has_enum(key) || self.1.has_enum(key)
+        }
+    }
+    let deps: &'static TwoDeps = std::boxed::Box::leak(std::boxed::Box::new(TwoDeps(d_std, d_other)));
+    w.expanded.borrow_mut().clear();
+    let mut c = Cells::load_with(&w, root, Some(deps), blaze_own::testing::heap().alloc()).expect("load root");
+    let expand = |call: ItemKey, _: crate::Def| {
+        w.expanded.borrow_mut().insert(call);
+    };
+    c.run(&w, &expand, &[]).expect("run root");
+
+    let called = |call: ItemKey| match c.call_outcome(call) {
+        Some(Outcome::Called(d)) => Some(d.key),
+        _ => None,
+    };
+    assert_eq!(called(call_assert_matches), Some(other_assert_matches), "pub macro at std_like root must not enter #[macro_use] prelude: {:?}", c.call_outcome(call_assert_matches));
+    assert_eq!(called(call_cfg_select), Some(std_cfg_select), "pub macro in standard prelude must still resolve: {:?}", c.call_outcome(call_cfg_select));
+    assert_eq!(
+        c.call_outcome(call_legacy),
+        Some(Outcome::Failed(Unresolved::Ambiguous(crate::AmbiguityKind::GlobVsOuter))),
+        "#[macro_export] macro_rules! at std_like root must still trigger GlobVsOuter"
+    );
+    assert_eq!(called(call_explicit), Some(std_assert_matches), "explicit std_like::assert_matches! must still resolve: {:?}", c.call_outcome(call_explicit));
+    assert_eq!(called(call_imported), Some(std_assert_matches), "use std_like::assert_matches; must still resolve: {:?}", c.call_outcome(call_imported));
+}

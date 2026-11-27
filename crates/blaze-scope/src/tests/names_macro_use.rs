@@ -200,3 +200,188 @@ pub type Alias = (Made, crate::Kept);
     let made = Written { kind: PathKind::Plain, segments: &["user", "Made"] };
     assert!(path(&fresh, root, Namespace::Types, made, g).is_ok(), "`user::Made` must expand via inner #![macro_use] in defs.rs");
 }
+
+/// End-to-end C2-A & C2-B integration test over full lowering + `resolve_by_records` + both
+/// fresh `Names` and encoded `RecordNames`:
+/// - C2-B: `pub macro assert_matches` re-exported at `std_like` crate root is excluded from
+///   `#[macro_use] extern crate std_like`, so `use other::assert_matches;` + `use super::*;`
+///   resolves cleanly, while explicit `std_like::assert_matches!()` and `use std_like::assert_matches;`
+///   still work, `pub macro cfg_select` in `std_like::prelude::v1` still resolves via prelude, and
+///   `#[macro_export] macro_rules! legacy_mac` at `std_like` root still enters `#[macro_use]` prelude.
+/// - C2-A: named `use other::assert_eq;` in a module + unrelated enum/module glob in a function
+///   body resolves `assert_eq!()` cleanly without `GlobVsOuter`.
+#[test]
+fn macro2_excluded_from_macro_use_prelude_and_block_glob_c2_end_to_end() {
+    static CORE_LIKE: &str = "#![no_core]
+pub macro assert_matches {
+    () => {}
+}
+pub macro cfg_select($($t:tt)*) {
+    $($t)*
+}
+#[macro_export]
+macro_rules! legacy_mac {
+    () => {}
+}
+#[macro_export]
+macro_rules! assert_eq {
+    () => {}
+}
+pub mod prelude {
+    pub mod v1 {
+        pub use crate::cfg_select;
+    }
+}
+";
+    static STD_LIKE: &str = "#![no_core]
+pub use core_like::{assert_matches, assert_eq, legacy_mac};
+pub mod prelude {
+    pub mod v1 {
+        pub use core_like::prelude::v1::cfg_select;
+    }
+}
+";
+    static OTHER: &str = "#![no_core]
+#[macro_export]
+macro_rules! assert_matches {
+    () => { pub struct FromOtherAssertMatches; }
+}
+#[macro_export]
+macro_rules! assert_eq {
+    () => { pub struct FromOtherAssertEq; }
+}
+#[macro_export]
+macro_rules! legacy_mac {
+    () => {}
+}
+";
+    static USER: &str = "#![no_core]
+#[macro_use]
+extern crate std_like;
+extern crate other;
+
+pub mod parent_ok {
+    use other::assert_matches;
+    pub mod child {
+        use super::*;
+        assert_matches!();
+    }
+}
+
+pub mod explicit_macro2 {
+    use std_like::assert_matches;
+    assert_matches!();
+    pub mod direct {
+        std_like::assert_matches!();
+    }
+}
+
+pub mod via_prelude {
+    use std_like::prelude::v1::*;
+    cfg_select! { pub struct FromCfgSelect; }
+}
+
+pub enum MyEnum {
+    A,
+}
+
+pub mod unrelated {
+    pub struct Unused;
+}
+
+pub mod block_with_glob {
+    use other::assert_eq;
+    pub fn check() {
+        use crate::MyEnum::*;
+        use crate::unrelated::*;
+        assert_eq!();
+    }
+}
+";
+    static USER_CONTROL_LEGACY: &str = "#![no_core]
+#[macro_use]
+extern crate std_like;
+extern crate other;
+
+pub mod parent_bad {
+    use other::legacy_mac;
+    pub mod child {
+        use super::*;
+        legacy_mac!();
+    }
+}
+";
+    static FILES: Texts = Texts(&[
+        &[("/core_like/lib.rs", CORE_LIKE)],
+        &[("/std_like/lib.rs", STD_LIKE)],
+        &[("/other/lib.rs", OTHER)],
+        &[("/user/lib.rs", USER)],
+    ]);
+    static CONTROL_FILES: Texts = Texts(&[
+        &[("/core_like/lib.rs", CORE_LIKE)],
+        &[("/std_like/lib.rs", STD_LIKE)],
+        &[("/other/lib.rs", OTHER)],
+        &[("/user/lib.rs", USER_CONTROL_LEGACY)],
+    ]);
+
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
+    let inputs = [
+        input("core_like", "/core_like/lib.rs", &[]),
+        input("std_like", "/std_like/lib.rs", &[("core_like", 0)]),
+        input("other", "/other/lib.rs", &[]),
+        input("user", "/user/lib.rs", &[("std_like", 1), ("other", 2)]),
+    ];
+    let (solved, _) = resolve_by_records(&inputs, Sysroot::default(), &FILES, &Serial, &Ready::serial(WAIT), bump)
+        .unwrap_or_else(|e| panic!("solve: {e:?}"));
+    let all: Vec<&'static CrateNames<'static>> = solved.iter().map(|s| s.names).collect();
+    for (i, c) in all.iter().enumerate() {
+        assert!(c.notes.is_empty(), "crate {i} had unexpected notes: {:?}", c.notes);
+        for (m, done) in c.done.iter() {
+            assert!(done.scope.errors.is_empty(), "crate {i} module {m:x} had unexpected scope errors: {:?}", done.scope.errors);
+        }
+    }
+
+    let fresh = Names::of_crates(&inputs, Sysroot::default(), &all, g).unwrap_or_else(|e| panic!("names: {e:?}"));
+    let records: Vec<&'static [u8]> = all.iter().map(|n| aligned(&encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")), bump)).collect();
+    let keys: Vec<CrateItemKey> = all.iter().map(|n| n.key).collect();
+    let read = RecordNames::new(&keys, Loaded(records), g);
+    let user_root = fresh.root(3);
+
+    // 1. `assert_matches` at user root is NOT in #[macro_use] prelude (both fresh and records).
+    for (side, got) in ["fresh", "records"].into_iter().zip(macro_at(&fresh, &read, user_root, "assert_matches")) {
+        assert!(not_found(&got), "`assert_matches` (pub macro) must not be in #[macro_use] prelude ({side}): {got:?}");
+    }
+    // 2. `legacy_mac` at user root IS in #[macro_use] prelude (both fresh and records).
+    for (side, got) in ["fresh", "records"].into_iter().zip(macro_at(&fresh, &read, user_root, "legacy_mac")) {
+        assert!(got.is_ok(), "`legacy_mac` (#[macro_export] macro_rules!) must be in #[macro_use] prelude ({side}): {got:?}");
+    }
+    // 3. Explicit path `std_like::assert_matches` resolves cleanly (both fresh and records).
+    let explicit_w = Written { kind: PathKind::Plain, segments: &["std_like", "assert_matches"] };
+    assert!(path(&fresh, user_root, Namespace::Macros, explicit_w, g).is_ok(), "fresh explicit std_like::assert_matches");
+    assert!(path(&read, user_root, Namespace::Macros, explicit_w, g).is_ok(), "records explicit std_like::assert_matches");
+    // 4. Expansion outputs from `parent_ok::child` and `via_prelude` exist.
+    let from_other = Written { kind: PathKind::Plain, segments: &["parent_ok", "child", "FromOtherAssertMatches"] };
+    assert!(path(&fresh, user_root, Namespace::Types, from_other, g).is_ok(), "other::assert_matches expanded in child");
+    let from_cfg = Written { kind: PathKind::Plain, segments: &["via_prelude", "FromCfgSelect"] };
+    assert!(path(&fresh, user_root, Namespace::Types, from_cfg, g).is_ok(), "cfg_select expanded via prelude");
+
+    // 5. Control: `legacy_mac` (legacy #[macro_export]) STILL causes GlobVsOuter in child!
+    let (ctrl_solved, _) = resolve_by_records(&inputs, Sysroot::default(), &CONTROL_FILES, &Serial, &Ready::serial(WAIT), bump)
+        .unwrap_or_else(|e| panic!("control solve: {e:?}"));
+    let has_glob_vs_outer = ctrl_solved[3].names.done.values().any(|done| {
+        done.scope.errors.iter().any(|err| {
+            matches!(
+                err,
+                blaze_surface::ScopeError::Macro {
+                    why: blaze_surface::Unresolved::Ambiguous(blaze_surface::AmbiguityKind::GlobVsOuter),
+                    ..
+                }
+            )
+        })
+    });
+    assert!(
+        has_glob_vs_outer,
+        "control: legacy #[macro_export] macro_rules! in #[macro_use] prelude must still conflict with `use super::*;`"
+    );
+}

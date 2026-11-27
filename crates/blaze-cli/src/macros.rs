@@ -38,7 +38,10 @@ const SUBJECT_DOMAIN: &str = "blaze-cli macro crate 1";
 // "3": proc-macro module identity bumped to form 6 (`blaze proc-macro module 6`) after
 // post-expansion proc-macro `_DECLS` and `macros` export synthesis (#2746), invalidating
 // cached `MacroModule` task records that pointed at pre-v6 proc-macro modules.
-const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 3";
+// "4": proc-macro module identity bumped to form 7 (`blaze proc-macro module 7`) after
+// `blaze-build` `bind_let_place` peeled-reference deref fix, invalidating cached
+// `MacroModule` task records that pointed at stale form-6 proc-macro modules.
+const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 4";
 const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";

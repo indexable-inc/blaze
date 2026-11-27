@@ -183,6 +183,8 @@ fn layout_err(error: LayoutError) -> TyErr {
         Refusal::Recursive => TyErr::Malformed("an aggregate that contains itself by value"),
         Refusal::TooLarge => TyErr::Unsupported("a type larger than `isize::MAX` bytes"),
         Refusal::NoAdt(adt) => TyErr::Other(BuildError::NoAdt { adt }),
+        Refusal::NoClosure { owner, ordinal } => TyErr::Other(BuildError::ClosureOwnerUnchecked { owner, ordinal }),
+        Refusal::NoCoroutine { owner, ordinal } => TyErr::Other(BuildError::CoroutineOwnerUnchecked { owner, ordinal }),
         Refusal::Ground(error) | Refusal::FieldGround { error, .. } => ground_err(error),
         Refusal::Missing(m) => TyErr::Other(BuildError::MissingRecord { item: m.item }),
         // A clean check never holds an extern type by value (it is not `Sized`).
@@ -2336,7 +2338,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// struct or tuple-struct, a slice or a path pattern. The check records such a pattern at
     /// its peeled type (blaze-typeck rules/pat.rs `step_pat`).
     fn peels_refs(&self, p: PatId) -> Result<bool, BuildError> {
-        Ok(matches!(self.pat(p)?, Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Slice { .. } | Pat::Path(_)))
+        Ok(matches!(
+            self.pat(p)?,
+            Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } | Pat::Path(_)
+        ))
     }
 
     /// Binds `v`, a value of ground type `g` (its binder's: a `let` initializer's adjusted
@@ -2369,10 +2374,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     }
                     continue;
                 }
-                Pat::Bind { .. } => {
+                Pat::Bind { sub: None, .. } => {
                     let (home, repr) = self.bind(p)?;
                     let at = self.home(home);
                     self.store(v, repr, at)?;
+                    continue;
+                }
+                Pat::Bind { sub: Some(_), .. } => {
+                    self.bind_irrefutable(p, v)?;
                     continue;
                 }
                 Pat::Tuple { elems, rest } => (elems, rest),
@@ -2479,9 +2488,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     }
                     None => V::None,
                 };
-                // A part whose pattern peels references off it (`let (Foo { a }, n) = (&foo, 1);`)
-                // is bound at the part's own type (`bind_value_of`).
-                if r == Repr::Ptr && self.peels_refs(sub)? {
+                // A part whose pattern peels references off it (`let (Foo { a }, n) = (&foo, 1);`,
+                // including wide references held as `Repr::Agg`) is bound at the part's own type
+                // (`bind_irrefutable_at`).
+                if matches!(r, Repr::Ptr | Repr::Agg(_)) && self.peels_refs(sub)? {
                     let pg = match (repr, node) {
                         (Repr::Agg(l), PNode::Tuple(_)) => match self.layouts[l as usize].shape {
                             Shape::Fields { first, .. } => self.layout_field_tys[first as usize + k],
@@ -2490,8 +2500,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                         (_, PNode::Array(elem, _)) => elem,
                         _ => return Err(malformed("a tuple or array pattern of a type of another shape")),
                     };
-                    self.bind_value_of(sub, part, pg)?;
-                    continue;
+                    if matches!(self.ground_node(pg).map_err(|error| Self::pat_ty_err(sub, error))?, PNode::Ref(..)) {
+                        self.bind_irrefutable_at(sub, part, pg)?;
+                        continue;
+                    }
                 }
                 todo.push((sub, part));
             }
@@ -2791,7 +2803,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     todo.push(inner);
                     continue;
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     todo.extend(fps.iter().rev().map(|fp| fp.pat));
                     continue;
@@ -2831,7 +2843,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     todo.push(inner);
                     continue;
                 }
-                Pat::Struct { fields, .. } => {
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
                     todo.extend(fps.iter().rev().map(|fp| fp.pat));
                     continue;
@@ -3636,7 +3648,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     V::Place(at.0, at.1)
                 };
                 match v {
-                    V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                    V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { sub: None, .. }) => {
                         self.bind_at(p, (at, off))?;
                         self.own_pat(p)?;
                     }
@@ -3659,7 +3671,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.ref_params.push((at, size, align));
             }
             match passed {
-                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { sub: None, .. }) => {
                     self.bind_at(p, (at, off))?;
                     self.own_pat(p)?;
                 }
@@ -3697,7 +3709,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 _ => return Err(malformed("a pointer-sized `VaList` with a non-pointer representation")),
             };
             match v {
-                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => {
+                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { sub: None, .. }) => {
                     self.bind_at(p, (at, off))?;
                     self.own_pat(p)?;
                 }
@@ -4245,13 +4257,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     };
                 let fresh = match (init, v, self.pat(p)?) {
                     _ if borrows_place || borrows_value || prebound_slot.is_some() => None,
-                    (Some(e), V::Place(at, off), Pat::Bind { .. }) if self.live && self.is_fresh(e)? => Some((at, off)),
+                    (Some(e), V::Place(at, off), Pat::Bind { sub: None, .. }) if self.live && self.is_fresh(e)? => Some((at, off)),
                     _ => None,
                 };
                 if !already_in_place {
                     match fresh {
                         Some(at) => self.bind_at(p, at)?,
-                        None if borrows_place => self.bind_let_place(p, v)?,
+                        None if borrows_place => {
+                            let e = init.ok_or(malformed("a `let` place ref binding without an initializer"))?;
+                            self.bind_let_place(p, e, v)?;
+                        }
                         None if borrows_value => {
                             let e = init.ok_or(malformed("a `let` value ref binding without an initializer"))?;
                             self.bind_let_value_ref(p, e, v)?;

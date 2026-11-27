@@ -342,9 +342,7 @@ impl Clones {
             (PNode::FnDef(..) | PNode::FnPtr(..), _) => true,
             (_, None) => false,
             (PNode::Closure { owner, ordinal, args }, Some(copy)) => {
-                let c = facts.closure(owner, ordinal).ok_or(NoteError::Build(BuildError::UnsupportedSig {
-                    what: "a closure whose facts the world did not answer (`LayoutFacts::closure`), met as a builtin `clone`'s `Self`",
-                }))?;
+                let c = facts.closure(owner, ordinal).ok_or(NoteError::Build(BuildError::ClosureOwnerUnchecked { owner, ordinal }))?;
                 let past = |_| NoteError::Build(BuildError::Malformed { what: "a list past the ground table" });
                 let a = blaze_own::Vec::from_slice_in(ground.view().list(args).map_err(past)?, alloc);
                 let env = blaze_build::ground(c.types, c.env, a.as_slice(), ground, alloc, facts).map_err(NoteError::Build)?;

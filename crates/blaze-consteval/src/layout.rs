@@ -69,8 +69,12 @@ fn stop(e: &blaze_build::layout::LayoutError) -> Stop {
         L::Recursive => Refusal::Malformed { what: "a type that holds itself by value" },
         L::TooLarge => Refusal::Unsupported { what: "a type larger than `isize::MAX` bytes" },
         L::NoAdt(item) => Refusal::Missing { what: "ADT definition", item },
+        L::NoClosure { owner, .. } => Refusal::Missing { what: "closure facts", item: owner },
+        L::NoCoroutine { owner, .. } => Refusal::Missing { what: "coroutine facts", item: owner },
         L::Ground(ref error) => match *error {
             blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
+            blaze_build::BuildError::ClosureOwnerUnchecked { owner, .. } => Refusal::Missing { what: "closure facts", item: owner },
+            blaze_build::BuildError::CoroutineOwnerUnchecked { owner, .. } => Refusal::Missing { what: "coroutine facts", item: owner },
             _ => match projection_of(error) {
                 Some((trait_, name)) => Refusal::Projection { trait_, name },
                 None => Refusal::Unsupported { what: "a field type with no ground form" },
@@ -78,6 +82,8 @@ fn stop(e: &blaze_build::layout::LayoutError) -> Stop {
         },
         L::FieldGround { adt, field, name, ref error } => match *error {
             blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
+            blaze_build::BuildError::ClosureOwnerUnchecked { owner, .. } => Refusal::Missing { what: "closure facts", item: owner },
+            blaze_build::BuildError::CoroutineOwnerUnchecked { owner, .. } => Refusal::Missing { what: "coroutine facts", item: owner },
             _ => Refusal::FieldGround { adt, field, name, projection: projection_of(error) },
         },
         L::NoSize(item) => Refusal::NoSize { item },
@@ -250,6 +256,8 @@ pub(crate) fn field_ty(key: ItemKey, adt: &Adt<'_>, field: u32, args: List, grou
     a.extend_from_slice(ground.view().list(args).map_err(|_| bad())?);
     blaze_build::ground(adt.types, f.ty, &a, ground, scratch, facts).map_err(|e| match e {
         blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
+        blaze_build::BuildError::ClosureOwnerUnchecked { owner, .. } => Refusal::Missing { what: "closure facts", item: owner },
+        blaze_build::BuildError::CoroutineOwnerUnchecked { owner, .. } => Refusal::Missing { what: "coroutine facts", item: owner },
         _ => Refusal::FieldGround { adt: key, field, name: f.name, projection: projection_of(&e) },
     })
 }

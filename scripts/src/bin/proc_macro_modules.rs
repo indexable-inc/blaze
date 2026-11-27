@@ -1789,12 +1789,13 @@ impl Plan<'_> {
         features.sort();
         features.dedup();
         let identity = format!(
-            // The same text as crates/blaze-proc-macro/src/module.rs `identity` (form 6:
-            // post-expansion proc-macro `_DECLS` and `macros` export synthesis (#2746); minimal
-            // Rust sysroot without ambient `bstd`; this builder sets `debug-assertions = true`
-            // for the macro crate and its dependencies, `false` for std's own crates
-            // ([`STD_RELEASE`]), and `-Zub-checks=no` for every crate, below).
-            "blaze proc-macro module 6\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
+            // The same text as crates/blaze-proc-macro/src/module.rs `identity` (form 7:
+            // `blaze-build` `bind_let_place` peeled-reference deref fix; post-expansion
+            // proc-macro `_DECLS` and `macros` export synthesis (#2746); minimal Rust sysroot
+            // without ambient `bstd`; this builder sets `debug-assertions = true` for the macro
+            // crate and its dependencies, `false` for std's own crates ([`STD_RELEASE`]), and
+            // `-Zub-checks=no` for every crate, below).
+            "blaze proc-macro module 7\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
             wanted.name,
             wanted.version,
             origin.identity_line(),

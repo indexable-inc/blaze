@@ -212,6 +212,11 @@ impl MacroShapes {
     pub const FN_LIKE: MacroShapes = MacroShapes::of(CallShape::FnLike);
     pub const ATTR: MacroShapes = MacroShapes::of(CallShape::Attr);
     pub const DERIVE: MacroShapes = MacroShapes::of(CallShape::Derive);
+    const SHAPES_MASK: u8 = 0b0111;
+    /// Bit 3: Macros 2.0 (`pub macro`). Unlike `#[macro_export]` `macro_rules!` and procedural
+    /// macros, Macros 2.0 definitions are scoped like normal items and never enter the
+    /// `#[macro_use]` prelude (`#[macro_use] extern crate ...`).
+    const MACRO2_BIT: u8 = 1 << 3;
 
     /// The set of `shape` alone.
     pub const fn of(shape: CallShape) -> MacroShapes {
@@ -223,21 +228,41 @@ impl MacroShapes {
         MacroShapes(self.0 | MacroShapes::of(shape).0)
     }
 
+    /// Marks this macro as a Macros 2.0 (`pub macro`) definition (excluded from the
+    /// `#[macro_use]` prelude).
+    pub const fn as_macro2(self) -> MacroShapes {
+        MacroShapes(self.0 | Self::MACRO2_BIT)
+    }
+
+    /// Whether this macro is a Macros 2.0 (`pub macro`) definition.
+    pub const fn is_macro2(self) -> bool {
+        self.0 & Self::MACRO2_BIT != 0
+    }
+
+    /// Whether a public binding of this macro at a crate's root enters a dependent's
+    /// `#[macro_use]` prelude (`#[macro_use] extern crate ...`).
+    pub const fn in_macro_use_prelude(self) -> bool {
+        !self.is_macro2()
+    }
+
     /// Whether a call of `shape` may name this macro.
     pub const fn accepts(self, shape: CallShape) -> bool {
         self.0 & MacroShapes::of(shape).0 != 0
     }
 
-    /// Its byte, as a record holds it: a bit per shape, `1 << CallShape::byte()`.
+    /// Its byte, as a record holds it: a bit per shape (`1 << CallShape::byte()`), plus bit 3
+    /// for Macros 2.0 ([`MacroShapes::as_macro2`]).
     pub const fn byte(self) -> u8 {
         self.0
     }
 
-    /// The set whose byte is `byte`: one to seven (a non-empty set of the three shapes).
+    /// The set whose byte is `byte`: a non-empty set of the three call shapes in bits `0..3`,
+    /// an optional Macros 2.0 flag in bit `3`, and zero in bits `4..8`.
     pub const fn from_byte(byte: u8) -> Option<MacroShapes> {
-        match byte {
-            1..=7 => Some(MacroShapes(byte)),
-            _ => None,
+        if byte & !(Self::SHAPES_MASK | Self::MACRO2_BIT) == 0 && (byte & Self::SHAPES_MASK) != 0 {
+            Some(MacroShapes(byte))
+        } else {
+            None
         }
     }
 
@@ -268,8 +293,8 @@ unsafe impl Portable for MacroShapes {}
 unsafe impl blaze_format::Record for MacroShapes {
     const SCHEMA: blaze_format::SchemaHash = blaze_format::schema_of(&[
         blaze_format::Part::Str("MacroShapes"),
-        blaze_format::Part::U64(1),
-        blaze_format::Part::Str("bit per CallShape"),
+        blaze_format::Part::U64(2),
+        blaze_format::Part::Str("bit per CallShape + macro2 bit"),
     ]);
 
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {

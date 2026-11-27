@@ -1253,7 +1253,7 @@ impl<'n> Consts<'n> {
                     // `SizedTypeProperties::LAYOUT`): check that fn's body once (recording its
                     // hidden type and any closures in `self.bodies`/`self.closures`) and retry.
                     let no_opaque_owner = match e.refusal {
-                        Refusal::Missing { what: "opaque defining body", item: owner } => Some(owner),
+                        Refusal::Missing { what: "opaque defining body" | "closure facts" | "coroutine facts", item: owner } => Some(owner),
                         _ => None,
                     };
                     // `<T as Trait>::NAME` reached at a ground `T` that the solver selected no

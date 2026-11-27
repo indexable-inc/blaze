@@ -702,6 +702,8 @@ struct RefGaps<'f> {
     first_ask: Option<RunError>,
     missing_objects: AVec<'f, (ItemKey, RunError)>,
     untabled: AVec<'f, (ItemKey, RunError)>,
+    /// Unchecked opaque/closure/coroutine owners discovered while resolving Phase 2 refs/vtables.
+    unchecked_owners: AVec<'f, (Option<ItemKey>, ItemKey, RunError)>,
     /// Generic callees needing a propagated polymorphization summary (`compute_poly_summary`).
     need_poly: AVec<'f, ItemKey>,
 }
@@ -712,6 +714,7 @@ impl<'f> RefGaps<'f> {
             first_ask: None,
             missing_objects: AVec::new_in(alloc),
             untabled: AVec::new_in(alloc),
+            unchecked_owners: AVec::new_in(alloc),
             need_poly: AVec::new_in(alloc),
         }
     }
@@ -720,6 +723,7 @@ impl<'f> RefGaps<'f> {
         self.first_ask.is_none()
             && self.missing_objects.is_empty()
             && self.untabled.is_empty()
+            && self.unchecked_owners.is_empty()
             && self.need_poly.is_empty()
     }
 }
@@ -965,7 +969,7 @@ impl MakerCore {
         let view = done.types.view();
         for n in view.nodes() {
             let owner = match *n {
-                blaze_typeck::PNode::Closure { owner, .. } => owner,
+                blaze_typeck::PNode::Closure { owner, .. } | blaze_typeck::PNode::Coroutine { owner, .. } => owner,
                 // The fn that defines it (an alias's is its `#[define_opaque]` fn); an alias
                 // whose definer is not found is left to the build, which refuses it by name
                 // (front2/coroutines.rs `opaque_hidden`).
@@ -1298,16 +1302,13 @@ fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocato
                     return Err(unchecked_owner(&*program, build_i, owner));
                 }
             }
-            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner }, .. })
+            Err(e)
                 if pull_owners < MOST_HELD_COROUTINES
-                    && (opaque == owner
-                        || match core.asked.get(&owner) {
-                            None => true,
-                            Some(entry) => entry.is_none() && program.fn_index(owner).is_none(),
-                        }) =>
+                    && let Some((opaque, owner)) = unchecked_owner_of(&e)
+                    && owner_needs_check(&*program, core, opaque, owner) =>
             {
                 pull_owners += 1;
-                ensure_opaque_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
+                ensure_unchecked_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
             }
             Err(e) if asks_again(&e) && pulled.allow(&e) => {
                 if !program.make_asked(build_i)? {
@@ -1365,16 +1366,13 @@ fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocato
                                     return Err(unchecked_owner(&*program, build_i, co_owner));
                                 }
                             }
-                            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner: op_owner }, .. })
+                            Err(e)
                                 if pull_owners < MOST_HELD_COROUTINES
-                                    && (opaque == op_owner
-                                        || match core.asked.get(&op_owner) {
-                                            None => true,
-                                            Some(entry) => entry.is_none() && program.fn_index(op_owner).is_none(),
-                                        }) =>
+                                    && let Some((opaque, op_owner)) = unchecked_owner_of(&e)
+                                    && owner_needs_check(&*program, core, opaque, op_owner) =>
                             {
                                 pull_owners += 1;
-                                ensure_opaque_owner(program, typing, core, checks, build_i, opaque, op_owner, fn_alloc)?;
+                                ensure_unchecked_owner(program, typing, core, checks, build_i, opaque, op_owner, fn_alloc)?;
                             }
                             Err(e) if asks_again(&e) && owner_pulled.allow(&e) => {
                                 if !program.make_asked(owner_i)? {
@@ -1392,16 +1390,13 @@ fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocato
                 }
                 return Err(e);
             }
-            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner }, .. })
+            Err(e)
                 if owners < MOST_HELD_COROUTINES
-                    && (opaque == owner
-                        || match core.asked.get(&owner) {
-                            None => true,
-                            Some(entry) => entry.is_none() && program.fn_index(owner).is_none(),
-                        }) =>
+                    && let Some((opaque, owner)) = unchecked_owner_of(&e)
+                    && owner_needs_check(&*program, core, opaque, owner) =>
             {
                 owners += 1;
-                ensure_opaque_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
+                ensure_unchecked_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
             }
             Err(e) if let Some(t) = object_missing(&e) && asked.allow(&e) => {
                 if program.object_table(t)? {
@@ -1472,6 +1467,16 @@ fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocato
                             core.ensure(program, typing, key, checks, fn_alloc)?;
                             made_any = true;
                         }
+                    }
+                }
+                if !gaps.unchecked_owners.is_empty() {
+                    for (opaque, owner, refusal) in gaps.unchecked_owners {
+                        if owners >= MOST_HELD_COROUTINES || !owner_needs_check(&*program, core, opaque, owner) {
+                            return Err(refusal);
+                        }
+                        owners += 1;
+                        ensure_unchecked_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
+                        made_any = true;
                     }
                 }
                 if !gaps.need_poly.is_empty() {
@@ -1678,23 +1683,62 @@ struct Held<'a> {
     missing_opaques: AVec<'a, ItemKey>,
 }
 
-/// Handles `BuildError::OpaqueOwnerUnchecked { opaque, owner }`: when `opaque == owner` and
-/// `program.opaque_of(opaque)` is still `None`, loads the opaque's defining head (and RPITIT
-/// default twin row if applicable) via `FrontEnd::opaque_head`; otherwise ensures `owner`'s
-/// checked body (or head-only row for trait methods without a body).
+/// Unchecked defining/owning fn reported by a [`BuildError`] (opaque type, closure, or coroutine).
+/// Returns `(Some(opaque), owner)` for `OpaqueOwnerUnchecked` and `(None, owner)` for closures/coroutines.
+fn build_error_unchecked_owner(error: &BuildError) -> Option<(Option<ItemKey>, ItemKey)> {
+    match *error {
+        BuildError::OpaqueOwnerUnchecked { opaque, owner } => Some((Some(opaque), owner)),
+        BuildError::ClosureOwnerUnchecked { owner, .. } | BuildError::CoroutineOwnerUnchecked { owner, .. } => Some((None, owner)),
+        _ => None,
+    }
+}
+
+/// Unchecked defining/owning fn reported by a layout [`blaze_build::layout::Refusal`].
+fn layout_refusal_unchecked_owner(why: &blaze_build::layout::Refusal) -> Option<(Option<ItemKey>, ItemKey)> {
+    use blaze_build::layout::Refusal;
+    match why {
+        Refusal::NoClosure { owner, .. } | Refusal::NoCoroutine { owner, .. } => Some((None, *owner)),
+        Refusal::Ground(error) | Refusal::FieldGround { error, .. } => build_error_unchecked_owner(error),
+        _ => None,
+    }
+}
+
+/// Unchecked defining/owning fn carried by a [`RunError`] (build, vtable layout, or vtable build).
+fn unchecked_owner_of(e: &RunError) -> Option<(Option<ItemKey>, ItemKey)> {
+    match e {
+        RunError::Build { error, .. } => build_error_unchecked_owner(error),
+        RunError::Vtable { why: VtableFail::Build(error), .. } => build_error_unchecked_owner(error),
+        RunError::Vtable { why: VtableFail::Layout(error), .. } => layout_refusal_unchecked_owner(&error.why),
+        _ => None,
+    }
+}
+
+/// Whether checking `owner` (or loading `opaque`'s head when `opaque == Some(owner)`) can make progress.
+fn owner_needs_check<P: FrontEnd>(program: &P, core: &MakerCore, opaque: Option<ItemKey>, owner: ItemKey) -> bool {
+    opaque == Some(owner)
+        || match core.asked.get(&owner) {
+            None => true,
+            Some(entry) => entry.is_none() && program.fn_index(owner).is_none(),
+        }
+}
+
+/// Handles `OpaqueOwnerUnchecked`, `ClosureOwnerUnchecked`, and `CoroutineOwnerUnchecked`: when
+/// `opaque == Some(owner)` and `program.opaque_of(owner)` is still `None`, loads the opaque's
+/// defining head (and RPITIT default twin row if applicable) via `FrontEnd::opaque_head`;
+/// otherwise ensures `owner`'s checked body (or head-only row for trait methods without a body).
 #[allow(clippy::too_many_arguments)]
-fn ensure_opaque_owner<P: FrontEnd, T: Typing<P>>(
+fn ensure_unchecked_owner<P: FrontEnd, T: Typing<P>>(
     program: &mut P,
     typing: &mut T,
     core: &mut MakerCore,
     checks: &mut CheckCount,
     build_i: usize,
-    opaque: ItemKey,
+    opaque: Option<ItemKey>,
     owner: ItemKey,
     scratch: Alloc<'_>,
 ) -> Result<(), RunError> {
-    if opaque == owner && program.opaque_of(opaque).is_none() {
-        if !program.opaque_head(opaque)? {
+    if opaque == Some(owner) && program.opaque_of(owner).is_none() {
+        if !program.opaque_head(owner)? {
             let error = BuildError::UnsupportedSig { what: "an `impl Trait` type no fn head of the program made (the seam's `opaque_of`)" };
             return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
         }
@@ -2357,7 +2401,11 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                     }
                     break;
                 }
-                Err(BuildError::OpaqueOwnerUnchecked { owner, .. }) if rounds < crate::front2::check::MOST_ROUNDS => {
+                Err(
+                    BuildError::OpaqueOwnerUnchecked { owner, .. }
+                    | BuildError::ClosureOwnerUnchecked { owner, .. }
+                    | BuildError::CoroutineOwnerUnchecked { owner, .. },
+                ) if rounds < crate::front2::check::MOST_ROUNDS => {
                     rounds += 1;
                     if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
                         return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
@@ -2767,6 +2815,11 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
                     gaps.missing_objects.push((t, e));
                 }
             }
+            Err(e) if let Some((opaque, owner)) = unchecked_owner_of(&e) => {
+                if !gaps.unchecked_owners.iter().any(|&(op, ow, _)| op == opaque && ow == owner) {
+                    gaps.unchecked_owners.push((opaque, owner, e));
+                }
+            }
             Err(e) => return Err(e),
         }
     }
@@ -2796,6 +2849,11 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
             Err(e) if let Some(t) = object_missing(&e) => {
                 if !gaps.missing_objects.iter().any(|(k, _)| *k == t) {
                     gaps.missing_objects.push((t, e));
+                }
+            }
+            Err(e) if let Some((opaque, owner)) = unchecked_owner_of(&e) => {
+                if !gaps.unchecked_owners.iter().any(|&(op, ow, _)| op == opaque && ow == owner) {
+                    gaps.unchecked_owners.push((opaque, owner, e));
                 }
             }
             Err(e) => return Err(e),
@@ -4494,6 +4552,14 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                             continue;
                         }
                         return Err(e);
+                    }
+                    Err(e)
+                        if owners < MOST_HELD_COROUTINES
+                            && let Some((opaque, owner)) = unchecked_owner_of(&e)
+                            && owner_needs_check(&*program, core, opaque, owner) =>
+                    {
+                        owners += 1;
+                        ensure_unchecked_owner(program, &mut self.typing, core, &mut self.checks, 0, opaque, owner, fn_alloc)?;
                     }
                     Err(e) => return Err(e),
                     Ok(()) if !untabled.is_empty() => {
