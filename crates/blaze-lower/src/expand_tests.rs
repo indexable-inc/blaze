@@ -1931,3 +1931,116 @@ fn trait_macro_expansion_preserves_rust_2015_trait_context() {
     assert_eq!(top_cap.clean_anon_self, 0);
     assert_eq!(top_cap.syntax_diag_no_ty, 1);
 }
+
+/// Body-level proc-macro calls emitted by a `macro_rules!` expansion (both nested inside a body
+/// expansion and written in an item-level macro expansion) inherit the enclosing `macro_rules!`'s
+/// `CallSite.ctx`: `Span::call_site()` (`Transparent`) tokens resolve to the `macro_rules!`'s
+/// `let host` binding, whereas `Span::def_site()` (`Opaque`) and `Span::mixed_site()`
+/// (`SemiOpaque`) tokens stay hygienically isolated and do NOT capture `host`.
+#[test]
+fn body_macro_call_inside_macro_rules_inherits_call_site_ctx_hygiene() {
+    use blaze_expand::{
+        HostAsk, HostError, HostWhy, Included, IncludeAs, Place, PlaceOf, ProcCall, ProcKind,
+        Produced, Reads, TokenOrigin, Transparency,
+    };
+    use blaze_own::AVec;
+
+    struct HygieneProcHost;
+    impl ExpandCx for HygieneProcHost {
+        fn env(&self, _: &str) -> Result<Option<&str>, HostError> {
+            Err(HostError { ask: HostAsk::Env, why: HostWhy::Refused })
+        }
+        fn cfg(&self, _: &TokenStream<'_>) -> Result<bool, HostError> {
+            Err(HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })
+        }
+        fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Include, why: HostWhy::Refused })
+        }
+        fn place(&self, _: PlaceOf) -> Result<Place<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused })
+        }
+        fn run_proc_macro<'a>(&self, def: &MacroDefinition<'_>, _: ProcCall<'_>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {
+            let transparency = match def.proc_name() {
+                Some("use_call_site") => Transparency::Transparent,
+                Some("use_mixed_site") => Transparency::SemiOpaque,
+                Some("use_def_site") => Transparency::Opaque,
+                _ => return Err(HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused }),
+            };
+            let tokens = lex("host", Edition::E2021, alloc).expect("lex");
+            let mut origins = AVec::new_in(alloc);
+            origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(transparency)));
+            Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+        }
+    }
+
+    struct HygieneProcs;
+    impl<'d> crate::by_name::MacroNames<'d> for HygieneProcs {
+        fn resolve<'a>(
+            &self,
+            path: &str,
+            _: crate::by_name::PathAt,
+            kind: ProcKind,
+            alloc: Alloc<'a>,
+        ) -> Result<crate::by_name::Resolved<'d, 'a>, crate::by_name::NoMacro<'a>>
+        where
+            'd: 'a,
+        {
+            let name = path.rsplit(':').next().ok_or(crate::by_name::NoMacro::NotAPath)?;
+            let known = kind == ProcKind::FnLike && matches!(name, "use_call_site" | "use_mixed_site" | "use_def_site");
+            let krate = CrateItemKey(ContentId([0x7E; 32]));
+            known
+                .then(|| MacroDefinition::proc_macro(krate, kind, name, &[], at(), alloc).ok())
+                .flatten()
+                .map(crate::by_name::Resolved::Def)
+                .ok_or(crate::by_name::NoMacro::NotListed)
+        }
+    }
+
+    // 1. Body-level `macro_rules!` emitting `let host = 1u32; use_call_site!()` (CallInput::Expanded).
+    let run_body_case = |mac_name: &str| {
+        let body_rule = format!("() => {{{{ let host = 1u32; {mac_name}!() }}}}");
+        let def = MacroDefinition::rules(lex(&body_rule, Edition::E2024, Alloc::global()).expect("lex"), at());
+        let def: &'static MacroDefinition<'static> = Box::leak(Box::new(def));
+        let rules: &'static [(&'static str, Prepared<'static>)] = Box::leak(Box::new([("make_body", prepare(def).expect("prepare"))]));
+        let lists = crate::by_name::Lists { rules, builtin_at: at(), then: Some(&HygieneProcs) };
+        let mut expander = ByName::with_names(&lists, HygieneProcHost, Alloc::global());
+        let l = crate::lower_body_expanding("fn f() -> u32 { make_body!() }", Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global())
+            .expect("body lowers");
+        let v = l.view();
+        assert!(v.diags.is_empty(), "{mac_name}: diags {:?}\n{}", v.diags, dump_of(&l));
+        locals(&v).len()
+    };
+    assert_eq!(run_body_case("use_call_site"), 1, "Span::call_site() inside body macro_rules! must bind to `let host`");
+    assert_eq!(run_body_case("use_mixed_site"), 0, "Span::mixed_site() inside body macro_rules! must NOT capture `let host`");
+    assert_eq!(run_body_case("use_def_site"), 0, "Span::def_site() inside body macro_rules! must NOT capture `let host`");
+
+    // 2. Item-level macro-written body calling a body-level proc-macro (`CallInput::Text` + `ItemMarks`).
+    let run_item_marked_case = |mac_name: &str| {
+        let text = format!("fn f() -> u32 {{ let host = 1u32; {mac_name}!() }}");
+        let host_at = u32::try_from(text.find("host").expect("host")).expect("short");
+        let call_at = u32::try_from(text.find(mac_name).expect("call")).expect("short");
+        let mark = blaze_expand::origin_column::TextMark {
+            site: DefSite { krate: CrateItemKey(ContentId([0x6D; 32])), module: None },
+            transparency: Transparency::SemiOpaque,
+            edition: Edition::E2024,
+            local_inner: false,
+        };
+        let mut col = blaze_expand::origin_column::OriginColumn::new_in(Alloc::global());
+        col.push(host_at as usize, host_at as usize + 4, blaze_expand::origin_column::TextOrigin::Made, Some(mark)).expect("push host");
+        col.push(call_at as usize, call_at as usize + mac_name.len(), blaze_expand::origin_column::TextOrigin::Made, Some(mark)).expect("push call");
+        let mut bytes = AVec::new_in(Alloc::global());
+        col.write(&mut bytes).expect("write");
+        let (origins, _) = blaze_expand::origin_column::OriginsRef::open(&bytes).expect("open");
+        let marks = crate::mark_site::ItemMarks::of(&text, blaze_scope::crate_roots::TextMarks { text: &text, column: origins }).expect("marks");
+        let lists = crate::by_name::Lists { rules: &[], builtin_at: at(), then: Some(&HygieneProcs) };
+        let mut expander = ByName::with_names(&lists, HygieneProcHost, Alloc::global());
+        let l = crate::lower_body_expanding_marked(marks, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global())
+            .expect("marked body lowers");
+        let v = l.view();
+        assert!(v.diags.is_empty(), "{mac_name} (item-marked): diags {:?}\n{}", v.diags, dump_of(&l));
+        locals(&v).len()
+    };
+    assert_eq!(run_item_marked_case("use_call_site"), 1, "Span::call_site() in item-marked body must bind to `let host`");
+    assert_eq!(run_item_marked_case("use_mixed_site"), 0, "Span::mixed_site() in item-marked body must NOT capture `let host`");
+    assert_eq!(run_item_marked_case("use_def_site"), 0, "Span::def_site() in item-marked body must NOT capture `let host`");
+}
