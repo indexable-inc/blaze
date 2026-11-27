@@ -81,7 +81,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 at
             }
         };
-        self.bind_pattern_at(root, At { at: place, g, by_ref: false, copy: false }, true)
+        self.bind_pattern_at(root, At { at: place, g, by_ref: false, copy: false, no_read: false }, true)
     }
 
     /// Binds irrefutable pattern `root` at `at`, by a work list. `owned`: the place is the
@@ -419,7 +419,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             self.own_param(m, (base, off), g);
             self.move_arm(m, p, false);
         }
-        let bound = self.bind_tested(p, At { at: (base, off), g, by_ref: false, copy: false });
+        let bound = self.bind_tested(p, At { at: (base, off), g, by_ref: false, copy: false, no_read: false });
         if drops {
             self.move_arm_end();
         }

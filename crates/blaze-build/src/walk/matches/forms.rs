@@ -70,6 +70,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// compared, which no row here holds.
     pub(super) fn const_test(&mut self, p: PatId, at: At, ok: Block, fail: Block) -> Result<bool, BuildError> {
         let Some(Def::Const(item)) = self.pat_def(p) else { return Ok(false) };
+        if at.no_read {
+            return Err(malformed("a local used before its binding"));
+        }
         let root = self.repr(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
         let node = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
         let structural = matches!(node, PNode::Adt(..));

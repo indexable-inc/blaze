@@ -34,6 +34,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// evaluated and its value dropped at once. Leaves nothing on the value stack.
     pub(super) fn discard(&mut self, init: ExprId) -> Result<(), BuildError> {
         if self.adjust_rows(init).is_empty() && self.is_place_expr(init)? {
+            if self.is_uncaptured_outer_place(init)? {
+                return self.discard_uncaptured_place_effects(init);
+            }
             self.work.push(Task::Discard);
             self.work.push(Task::Place(init));
         } else {

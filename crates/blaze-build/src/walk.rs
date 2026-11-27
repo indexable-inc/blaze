@@ -42,6 +42,7 @@ mod fmt;
 #[cfg(test)]
 pub(crate) use fmt::encode_text as fmt_encode_text_for_tests;
 mod discard;
+mod uncaptured;
 mod index;
 mod lets;
 mod matches;
@@ -423,12 +424,13 @@ enum Task {
     IfElse { expr: ExprId, join: Block, res: Option<SlotId> },
     /// A `let` link of an `if` condition (walk/lets.rs): `let` expression `expr`, its
     /// scrutinee on top; a failed test to `fail`.
-    LetLink { expr: ExprId, fail: Block },
+    LetLink { expr: ExprId, fail: Block, no_read: bool },
     /// A `bool` link of an `if` condition holding a `let`, its value on top; false to the
     /// block given.
     CondLink(Block),
-    /// `let`-`else` statement (walk/lets.rs), its scrutinee on top.
-    LetElse(StmtId),
+    /// `let`-`else` statement (walk/lets.rs), its scrutinee on top (`bool`: non-reading uncaptured
+    /// outer place).
+    LetElse(StmtId, bool),
     /// The end of a `let`-`else`'s diverging block: the statement goes on in the block given,
     /// its entries set aside for the `else` block (`let_else_held` from the index) put back;
     /// the `else` block last.
@@ -436,7 +438,7 @@ enum Task {
     LoopEnd(ExprId),
     Break(ExprId, bool),
     Return(bool),
-    Match(ExprId),
+    Match(ExprId, bool),
     Arm { m: u32, i: u32 },
     Guard { m: u32, i: u32 },
     /// The guard of an arm whose pattern holds or-patterns (walk/matches/alts.rs): a false
@@ -662,6 +664,10 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     /// capture's home ([`Walk::bind_capture_at`]): a binding of an enclosing body, which this
     /// body owns only when `own` says so (a by-value capture of an `FnOnce` body).
     captured: Vec<PatId, A>,
+    /// The closure or `async` block whose body is being built (`None` for a fn body or drop glue),
+    /// and the patterns bound anywhere inside it (walk/uncaptured.rs `mark_owner_bound`).
+    owner_expr: Option<ExprId>,
+    body_bound: blaze_own::Vec<bool, A>,
     /// `Some` while a coroutine's body is built (coroutine.rs `run_coroutine`).
     co: Option<coroutine::Co>,
     /// `Some` while a coroutine's body is built into a state laid from types: the flow's table
@@ -997,6 +1003,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         moves: moves::Moves::new_in(alloc),
         env_places: moves::env_places::EnvPlaces::new_in(alloc),
         captured: Vec::new_in(alloc),
+        owner_expr: None,
+        body_bound: blaze_own::Vec::new_in(alloc),
         co: None,
         names: None,
         cleanup: false,
@@ -4429,17 +4437,17 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let v = self.join_value(repr, res);
                 self.push_val(v, None);
             }
-            Task::LetLink { expr, fail } => {
+            Task::LetLink { expr, fail, no_read } => {
                 self.du_intersect_open_entries();
-                self.let_link(expr, fail)?;
+                self.let_link(expr, fail, no_read)?;
             }
             Task::CondLink(fail) => {
                 self.du_intersect_open_entries();
                 self.cond_link(fail)?;
             }
-            Task::LetElse(s) => {
+            Task::LetElse(s, no_read) => {
                 let pre = self.du_push();
-                self.let_else_test(s)?;
+                self.let_else_test(s, no_read)?;
                 let post_pass = self.du_push();
                 self.du_restore(pre);
                 self.let_else_du.push((pre, post_pass));
@@ -4516,7 +4524,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.dead_block();
                 self.push_val(V::None, None);
             }
-            Task::Match(e) => self.match_dispatch(e)?,
+            Task::Match(e, no_read) => self.match_dispatch(e, no_read)?,
             Task::Arm { m, i } => self.arm(m, i)?,
             Task::Guard { m, i } => {
                 let g = self.pop()?;
@@ -6445,11 +6453,17 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             return Ok(());
         }
         match self.expr(e)? {
-            Expr::Local(p) => {
-                let (home, _) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
-                let at = self.home(home);
-                self.push_val(V::Place(at.0, at.1), None);
-            }
+            Expr::Local(p) => match self.slots.get(p.ix()).copied().flatten() {
+                Some((home, _)) => {
+                    let at = self.home(home);
+                    self.push_val(V::Place(at.0, at.1), None);
+                }
+                None if self.is_outer_local(p)? && self.local_repr(p)? == Repr::None => {
+                    let at = self.uncaptured_zst_place(p)?;
+                    self.push_val(V::Place(at.0, at.1), None);
+                }
+                None => return Err(malformed("a local used before its binding")),
+            },
             Expr::Path(_) if matches!(self.expr_def(e), Some(Def::Static(item, _)) if !self.adts.static_item(item).is_some_and(|s| s.extern_weak)) => {
                 let at = self.static_addr(e)?;
                 self.push_val(V::Place(at, 0), None);
@@ -6494,6 +6508,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.discard(init)?;
             }
             Stmt::Let { pat, init: Some(init), else_: None, .. } => {
+                if self.is_uncaptured_outer_place(init)? {
+                    let t = self.adjusted_ty(init)?;
+                    let g = self.ground_ty(t).map_err(|error| Self::ty_err(init, error))?;
+                    if self.pat_does_not_read(pat, g)? {
+                        return self.discard_uncaptured_place_effects(init);
+                    }
+                }
                 self.work.push(Task::Let(pat, Some(init)));
                 // `let ref x = <place>;`: a `let` initializer is a place expression context
                 // (the Reference, "Place Expressions and Value Expressions"): its place, not its
@@ -6535,15 +6556,20 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         match self.expr(e)? {
             Expr::Missing => return Err(unsupported(e, "a missing expression")),
             Expr::Lit(lit) => self.lit(e, lit)?,
-            Expr::Local(p) => {
-                let (home, repr) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
-                // A use by value: a move, when its type needs drop (its memory is read where
-                // the value lands, before anything else runs that could drop it).
-                self.moved(e, p)?;
-                let at = self.home(home);
-                let v = self.load(repr, at);
-                self.push_val(v, None);
-            }
+            Expr::Local(p) => match self.slots.get(p.ix()).copied().flatten() {
+                Some((home, repr)) => {
+                    // A use by value: a move, when its type needs drop (its memory is read where
+                    // the value lands, before anything else runs that could drop it).
+                    self.moved(e, p)?;
+                    let at = self.home(home);
+                    let v = self.load(repr, at);
+                    self.push_val(v, None);
+                }
+                None if self.is_outer_local(p)? && self.local_repr(p)? == Repr::None => {
+                    self.push_val(V::None, None);
+                }
+                None => return Err(malformed("a local used before its binding")),
+            },
             Expr::Path(_) => {
                 let t = self.expr_ty(e)?;
                 match (self.node_at(e, t)?, self.expr_def(e)) {
@@ -6671,8 +6697,14 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 let v = self.offset_of(e, ty, fields)?;
                 self.push_val(v, None);
             }
-            Expr::Match { scrutinee, .. } => {
-                self.work.push(Task::Match(e));
+            Expr::Match { scrutinee, arms } => {
+                if self.is_uncaptured_outer_place(scrutinee)? && self.match_arms_do_not_read(scrutinee, arms)? {
+                    self.work.push(Task::Match(e, true));
+                    self.work.push(Task::PushNone);
+                    self.discard_uncaptured_place_effects(scrutinee)?;
+                    return Ok(());
+                }
+                self.work.push(Task::Match(e, false));
                 // A local that needs drop is a place expression: matched in place, not moved
                 // (codegen.md, "A `match` by value on an enum that needs drop").
                 let mut s = scrutinee;
@@ -7832,9 +7864,12 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         Ok(moved)
     }
 
-    fn match_dispatch(&mut self, e: ExprId) -> Result<(), BuildError> {
+    fn match_dispatch(&mut self, e: ExprId, no_read: bool) -> Result<(), BuildError> {
         let Expr::Match { scrutinee, arms } = self.expr(e)? else { return Err(malformed("a match task on another expression")) };
         let mut s = self.pop()?;
+        if no_read {
+            return self.match_tested_no_read(e, scrutinee, arms);
+        }
         // An unsized scrutinee's place (`match *w`, pushed as a place by `Expr::Match`) has no
         // repr of its own: it is tested in place by its ground type (`tested_place` takes a
         // `V::Unsized` as the wide pointer's memory, walk/matches.rs reads a slice's elements

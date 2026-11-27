@@ -120,7 +120,7 @@ pub(super) fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::BlockExit(e)
         | Task::LoopEnd(e)
         | Task::Break(e, _)
-        | Task::Match(e)
+        | Task::Match(e, _)
         | Task::Call(e)
         | Task::BecomeCall(e)
         | Task::OpCall(e)
@@ -156,7 +156,7 @@ pub(super) fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::TempEnd
         | Task::PushNone
         | Task::CondLink(_)
-        | Task::LetElse(_)
+        | Task::LetElse(_, _)
         | Task::LetElseEnd(..)
         | Task::Return(_)
         | Task::Arm { .. }

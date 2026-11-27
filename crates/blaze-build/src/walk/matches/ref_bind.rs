@@ -134,7 +134,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             V::Place(p, off) | V::Unsized(p, off) => (p, off),
             _ => return Err(malformed("a `let` initializer built as a place left a value")),
         };
-        self.bind_pattern_at(pat, At { at, g, by_ref: false, copy: false }, false)
+        self.bind_pattern_at(pat, At { at, g, by_ref: false, copy: false, no_read: false }, false)
     }
 
     /// Binds `pat` (which contains a `ref` / `ref mut` binding) to `v`, the evaluated value of
@@ -171,6 +171,6 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 .map_err(|_| malformed("a drop depth past `usize`"))?;
             self.insert_held(pos, scope, depth, Held::Temp { at, l, flag: None });
         }
-        self.bind_pattern_at(pat, At { at, g, by_ref: false, copy: false }, false)
+        self.bind_pattern_at(pat, At { at, g, by_ref: false, copy: false, no_read: false }, false)
     }
 }

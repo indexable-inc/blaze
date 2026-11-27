@@ -816,12 +816,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     }
                 }
                 Task::LetLink { expr, .. } => todo_expr.push(expr),
-                Task::LetElse(s) => {
+                Task::LetElse(s, _) => {
                     if let Some(Stmt::Let { else_: Some(els), .. }) = self.body.stmts.get(s.ix()).copied() {
                         todo_expr.push(els);
                     }
                 }
-                Task::Match(e) => {
+                Task::Match(e, _) => {
                     if let Some(Expr::Match { arms, .. }) = self.body.exprs.get(e.ix()).copied()
                         && let Some(list) = self.body.arms.get(arms.range())
                     {

@@ -1432,3 +1432,148 @@ fn a_reordered_aggregate_is_read_by_declaration_index_in_a_closure() {
         assert_eq!(run(&w, &b, root, &lits), (70402, 1), "form {form}");
     }
 }
+
+/// Negative controls for RFC 2229 uncaptured outer place handling (walk/uncaptured.rs):
+/// 1. A fn body using a local before its `let` declaration (both in `let _ = x;` and by value)
+///    still returns `BuildError::Malformed { what: "a local used before its binding" }`.
+/// 2. A closure body using a binding declared *inside* the closure before its declaration (even
+///    for a ZST `()` binding or inside `let _ = x;`) still returns `"a local used before its
+///    binding"`.
+/// 3. A closure body reading a non-ZST outer local by value when its capture row is missing still
+///    returns `"a local used before its binding"` (never fabricates uninitialized bytes).
+#[test]
+fn malformed_local_before_binding_and_uncaptured_non_zst_read_still_fail() {
+    let w = world();
+    let sig = w.fx.sig_of(w.main).expect("main's signature");
+
+    // Helper: check a well-typed body, then mutate `b` into a malformed use-before-binding order
+    // (swapping the two statements of the block) so typeck succeeds with valid `local_ty`/`expr_ty`
+    // while the builder sees the use before the binding.
+    let build_main_err = |b: &Bb, view: &blaze_typeck::BodyView<'_>, root: ExprId, checked: &blaze_typeck::Checked<'_>, lits: &[(ExprId, u128)]| {
+        let table = PortableTys::new_in(Alloc::global());
+        let progs = [Prog { item: w.main, b, root, lits }];
+        let adts = FxAdts { w: &w, progs: &progs, closures: &[], table: table.view() };
+        let mut ground = PortableTys::new_in(Alloc::global());
+        let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+        crate::build(view, checked, &sig, &mut subst, &adts, Global)
+    };
+
+    // Case 1: fn body using local `x: u64` before its declaration in `let _ = x;`.
+    {
+        let mut b = Bb::new();
+        let mut lits = StdVec::new();
+        let (s_decl, x) = let_u64(&mut b, &mut lits, "x", 5);
+        let wild = b.wild();
+        let use_x = b.local(x);
+        let s_use = b.let_(wild, None, use_x);
+        let ret = lit(&mut b, &mut lits, 0);
+        let root = b.block(&[s_decl, s_use], Some(ret));
+        let view = b.view(w.main, root);
+        let mut ty = InferCtx::new_in(Alloc::global());
+        let checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+            Ok(Outcome::Done(c)) => c,
+            other => panic!("check failed: {:?}", other.err()),
+        };
+        assert!(checked.diags.is_empty());
+        // Reorder statements so `let _ = x;` precedes `let x = 5;`.
+        let Expr::Block { stmts, .. } = b.exprs[root.ix()] else { panic!("block") };
+        let mut bad_stmts = view.stmt_lists.to_vec();
+        bad_stmts[stmts.range()].swap(0, 1);
+        let bad_view = blaze_typeck::BodyView { stmt_lists: &bad_stmts, ..view };
+        let err = match build_main_err(&b, &bad_view, root, &checked, &lits) {
+            Err(err) => err,
+            Ok(_) => panic!("use before binding in fn must fail"),
+        };
+        assert!(matches!(err, crate::BuildError::Malformed { what: "a local used before its binding" }), "got {err}");
+    }
+
+    // Case 2: closure body using a closure-local ZST `x: ()` before its declaration (both in
+    // `let _ = x;` and by value).
+    for by_value in [false, true] {
+        let mut b = Bb::new();
+        let mut lits = StdVec::new();
+        let unit = b.ty(PNode::Tuple(List::EMPTY));
+        let x = b.bind("x");
+        let unit_val = b.tuple(&[]);
+        let s_decl = b.let_(x, Some(unit), unit_val);
+        let use_x = b.local(x);
+        let s_use = if by_value {
+            let y = b.bind("y");
+            b.let_(y, Some(unit), use_x)
+        } else {
+            let wild = b.wild();
+            b.let_(wild, None, use_x)
+        };
+        let tail = lit(&mut b, &mut lits, 1);
+        let cbody = b.block(&[s_decl, s_use], Some(tail));
+        let clo = b.move_closure(&[], cbody);
+        let f = b.bind("f");
+        let sf = b.let_(f, None, clo);
+        let fe = b.local(f);
+        let call = b.call(fe, &[]);
+        let root = b.block(&[sf], Some(call));
+        let view = b.view(w.main, root);
+        let mut ty = InferCtx::new_in(Alloc::global());
+        let checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+            Ok(Outcome::Done(c)) => c,
+            other => panic!("check failed: {:?}", other.err()),
+        };
+        assert!(checked.diags.is_empty());
+        let mut table = PortableTys::new_in(Alloc::global());
+        let (kind, csig, env) = crate::layout::closure_facts(&view, &checked, 0, 0, &mut table, Alloc::global()).expect("closure facts");
+        let Expr::Block { stmts, .. } = b.exprs[cbody.ix()] else { panic!("block") };
+        let mut bad_stmts = view.stmt_lists.to_vec();
+        bad_stmts[stmts.range()].swap(0, 1);
+        let bad_view = blaze_typeck::BodyView { stmt_lists: &bad_stmts, ..view };
+        let progs = [Prog { item: w.main, b: &b, root, lits: &lits }];
+        let rows = [(w.main, 0, kind, csig, env)];
+        let adts = FxAdts { w: &w, progs: &progs, closures: &rows, table: table.view() };
+        let mut ground = PortableTys::new_in(Alloc::global());
+        let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+        let err = match crate::build_closure(&bad_view, &checked, 0, kind, &sig, &mut subst, &adts, Global) {
+            Err(err) => err,
+            Ok(_) => panic!("closure-local ZST use before binding must fail"),
+        };
+        assert!(
+            matches!(err, crate::BuildError::Malformed { what: "a local used before its binding" }),
+            "by_value={by_value}: got {err}"
+        );
+    }
+
+    // Case 3: closure body reading an outer non-ZST `u64` by value when its capture rows were
+    // stripped (corrupt record): must still refuse `"a local used before its binding"`.
+    {
+        let mut b = Bb::new();
+        let mut lits = StdVec::new();
+        let (s_outer, outer) = let_u64(&mut b, &mut lits, "outer", 9);
+        let use_outer = b.local(outer);
+        let clo = b.move_closure(&[], use_outer);
+        let f = b.bind("f");
+        let sf = b.let_(f, None, clo);
+        let fe = b.local(f);
+        let call = b.call(fe, &[]);
+        let root = b.block(&[s_outer, sf], Some(call));
+        let view = b.view(w.main, root);
+        let mut ty = InferCtx::new_in(Alloc::global());
+        let mut checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+            Ok(Outcome::Done(c)) => c,
+            other => panic!("check failed: {:?}", other.err()),
+        };
+        assert!(checked.diags.is_empty());
+        // Strip captures so `outer` is uncaptured while read by value inside the closure.
+        checked.captures.clear();
+        checked.capture_places.clear();
+        let mut table = PortableTys::new_in(Alloc::global());
+        let (kind, csig, env) = crate::layout::closure_facts(&view, &checked, 0, 0, &mut table, Alloc::global()).expect("closure facts");
+        let progs = [Prog { item: w.main, b: &b, root, lits: &lits }];
+        let rows = [(w.main, 0, kind, csig, env)];
+        let adts = FxAdts { w: &w, progs: &progs, closures: &rows, table: table.view() };
+        let mut ground = PortableTys::new_in(Alloc::global());
+        let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+        let err = match crate::build_closure(&view, &checked, 0, kind, &sig, &mut subst, &adts, Global) {
+            Err(err) => err,
+            Ok(_) => panic!("uncaptured non-ZST read by value must fail"),
+        };
+        assert!(matches!(err, crate::BuildError::Malformed { what: "a local used before its binding" }), "got {err}");
+    }
+}

@@ -343,6 +343,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if which > parts.kind {
             return self.run_entry(closure, g, parts, which);
         }
+        self.mark_owner_bound(closure)?;
         let (tuple, output) = self.args_tuple(closure, parts.sig)?;
         let PNode::Tuple(l) = self.ground_node(tuple).map_err(|error| Self::ty_err(closure, error))? else {
             return Err(malformed("a closure's arguments not a tuple"));
