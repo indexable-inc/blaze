@@ -745,6 +745,32 @@ pub(crate) trait Front: Publication {
     fn watch(&self) -> &dyn Watch {
         &Unwatched
     }
+    /// Hints the cold lookup of body-local items via their outermost-first same-crate declarer
+    /// chain; makers defer applying the hint until a `verify_keyed` miss or `make`.
+    fn set_local_enclosers(&self, _maker: &mut Self::Maker, _enclosers: crate::test_drive::suite_cache::LocalEnclosers) {}
+    /// Records a newly compiled keyed entry into the run's persisted `BZTV` verified cache.
+    #[expect(clippy::too_many_arguments, reason = "records a newly made keyed entry into VerifiedCache")]
+    fn record_made(
+        &self,
+        _maker: &mut Self::Maker,
+        _ids: &Self::Ids,
+        _symbol: CodeSymbol,
+        _tabled: ItemKey,
+        _name: &[u8],
+        _entry: &[u8],
+        _under: CodeKey,
+        _builder: &Builder,
+    ) {}
+    /// Proof set of closed entry content keys verified under today's `closed_crates_digest`,
+    /// used by [`ahead_of_closed`] to pre-place closed groups from a prior certificate's start list.
+    fn verified_closed_contents<'a>(&self, alloc: Alloc<'a>) -> crate::test_cache::VerifiedClosedContents<'a> {
+        crate::test_cache::VerifiedClosedContents::empty(alloc)
+    }
+    /// Takes back the run's [`crate::test_cache::VerifiedCache`] at exit so the caller can persist
+    /// any newly verified or compiled entries to `BZTV`.
+    fn take_verified(&mut self, _maker: Option<&mut Self::Maker>) -> Option<crate::test_cache::VerifiedCache> {
+        None
+    }
 }
 
 /// A code record that lands, refused when the run names no personality routine
@@ -779,6 +805,9 @@ pub(crate) struct CommandFront<'h, 'c, 'r> {
     exports: &'c [blaze_id::ItemKey],
     /// What each maker reports its large or slow makes with ([`command_make_watch`]).
     make_watch: MakeWatch<'static>,
+    /// Persisted `BZTV` verified-entry cache (moved into [`VerifiedRunMaker`] on first step,
+    /// returned by [`Front::take_verified`] at exit).
+    verified: Option<crate::test_cache::VerifiedCache>,
 }
 
 /// The line of one large or slow make (make_one.rs [`MakeSizes`], printed only past its
@@ -807,8 +836,9 @@ impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
         watch: &'c dyn Watch,
         exports: &'c [blaze_id::ItemKey],
         make_watch: MakeWatch<'static>,
+        verified: Option<crate::test_cache::VerifiedCache>,
     ) -> CommandFront<'h, 'c, 'r> {
-        CommandFront { names, ids, typed, kept: None, builder, tables, alloc, watch, exports, make_watch }
+        CommandFront { names, ids, typed, kept: None, builder, tables, alloc, watch, exports, make_watch, verified }
     }
 
     fn names(&mut self) -> Result<NamesRecords<'h>, ParentError> {
@@ -829,10 +859,97 @@ impl<'h, 'c, 'r> CommandFront<'h, 'c, 'r> {
 /// line (engine_body_record.rs `StoreTyped`).
 pub(crate) type RunMaker<'h> = Maker<'h, Runnable, ByKind<crate::engine_body_record::StoreTyped<'h>>>;
 
+/// Wraps [`RunMaker`] with persisted `BZTV` [`crate::test_cache::VerifiedCache`] O(1) verification
+/// and recording (shared with `blaze test` and `blaze build`, rule 30), and defers
+/// `prepare_local` until a `verify_keyed` miss or `make` so `BZTV` hits never construct
+/// `RecordsProgram` or trigger `locate`/`ensure_local_index`.
+pub(crate) struct VerifiedRunMaker<'h> {
+    inner: RunMaker<'h>,
+    ids: RunIds<'h>,
+    verified: Option<crate::test_cache::VerifiedCache>,
+    pending_enclosers: crate::test_drive::suite_cache::LocalEnclosers,
+}
+
+impl<'h> VerifiedRunMaker<'h> {
+    pub(crate) fn lowering_counts(&self) -> LoweringCounts {
+        self.inner.lowering_counts()
+    }
+
+    fn instance_shown(&self, tabled: ItemKey, name: &[u8]) -> Option<blaze_ladder::run::make_one::InstanceShown> {
+        self.inner.instance_shown(tabled, name)
+    }
+
+    fn site_shown(&self, item: ItemKey, site: u32) -> Option<(&str, u32, u32)> {
+        self.inner.site_shown(item, site)
+    }
+
+    fn set_enclosers(&mut self, enclosers: crate::test_drive::suite_cache::LocalEnclosers) {
+        self.pending_enclosers = enclosers;
+    }
+
+    fn flush_pending_local(&mut self) {
+        let enclosers = core::mem::take(&mut self.pending_enclosers);
+        if !enclosers.locals().is_empty() && !enclosers.enclosers().is_empty() {
+            self.inner.prepare_local(enclosers.locals(), enclosers.enclosers());
+        }
+    }
+
+    fn take_verified(&mut self) -> Option<crate::test_cache::VerifiedCache> {
+        self.verified.take()
+    }
+}
+
+impl Make for VerifiedRunMaker<'_> {
+    type Error = RunError;
+    type Grant = Runnable;
+
+    fn make(&mut self, grant: &Self::Grant, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+        self.flush_pending_local();
+        self.inner.make(grant, tabled, name, entry)
+    }
+
+    fn make_static(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+        self.flush_pending_local();
+        self.inner.make_static(grant, item, entry)
+    }
+
+    fn make_thread_local(&mut self, grant: &Self::Grant, item: ItemKey, entry: &mut AVec<'_, u8>) -> Result<(), Self::Error> {
+        self.flush_pending_local();
+        self.inner.make_thread_local(grant, item, entry)
+    }
+
+    fn verify(&mut self, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<blaze_ladder::code_records::reads::Verdict>, Self::Error> {
+        self.flush_pending_local();
+        self.inner.verify(tabled, name, entry)
+    }
+
+    fn verify_keyed(
+        &mut self,
+        key: CodeKey,
+        under: CodeKey,
+        tabled: ItemKey,
+        name: &[u8],
+        entry: &[u8],
+    ) -> Result<Option<blaze_ladder::code_records::reads::Verdict>, Self::Error> {
+        if self.verified.as_ref().is_some_and(|v| v.contains(key, under)) {
+            self.pending_enclosers = crate::test_drive::suite_cache::LocalEnclosers::default();
+            return Ok(Some(blaze_ladder::code_records::reads::Verdict::Holds));
+        }
+        self.flush_pending_local();
+        let verdict = self.inner.verify(tabled, name, entry)?;
+        if matches!(verdict, Some(blaze_ladder::code_records::reads::Verdict::Holds))
+            && let Some(verified) = self.verified.as_mut()
+        {
+            verified.record_verified(key, under, tabled, name, entry, &self.ids);
+        }
+        Ok(verdict)
+    }
+}
+
 impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
     type Start = Roots<'r>;
     type Ids = RunIds<'h>;
-    type Maker = RunMaker<'h>;
+    type Maker = VerifiedRunMaker<'h>;
 
     fn start(&mut self) -> Result<Roots<'r>, ParentError> {
         let names = self.names()?;
@@ -844,10 +961,11 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
         (self.ids)()
     }
 
-    fn maker(&mut self, start: &Roots<'r>, ids: &RunIds<'h>) -> Result<RunMaker<'h>, ParentError> {
+    fn maker(&mut self, start: &Roots<'r>, ids: &RunIds<'h>) -> Result<VerifiedRunMaker<'h>, ParentError> {
         let names = self.names()?;
         // `run_roots` start by the rule (`MakerStart::ByRule`): what `Maker::new` did.
-        Ok(Maker::of_roots(names, start.maker_entry(), start, ByKind::new(self.typed.over(*ids)), &self.builder, Some(self.make_watch), self.tables))
+        let inner = Maker::of_roots(names, start.maker_entry(), start, ByKind::new(self.typed.over(*ids)), &self.builder, Some(self.make_watch), self.tables);
+        Ok(VerifiedRunMaker { inner, ids: *ids, verified: self.verified.take(), pending_enclosers: crate::test_drive::suite_cache::LocalEnclosers::default() })
     }
 
     /// From the names records: the checker key's library item (its first 16 bytes,
@@ -858,7 +976,7 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
 
     /// By the lazy program's printer when the maker made it (its key map files every member,
     /// so a fn of an impl is named by the impl's header), else from the records alone.
-    fn named(&mut self, maker: Option<&RunMaker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
+    fn named(&mut self, maker: Option<&VerifiedRunMaker<'h>>, tabled: ItemKey, name: &[u8]) -> crate::run_fault::Named {
         use crate::run_fault::Named;
         if let Some(shown) = maker.and_then(|maker| maker.instance_shown(tabled, name)) {
             return Named::Shown { item: shown.item, args: shown.args };
@@ -870,13 +988,44 @@ impl<'h, 'r> Front for CommandFront<'h, '_, 'r> {
     }
 
     /// By the lazy program the maker made (its key map places members too); none without it.
-    fn site_shown(&mut self, maker: Option<&RunMaker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
+    fn site_shown(&mut self, maker: Option<&VerifiedRunMaker<'h>>, item: ItemKey, site: u32) -> Option<crate::run_fault::SiteShown> {
         let (file, line, column) = maker?.site_shown(item, site)?;
         Some(crate::run_fault::SiteShown { file: Box::from(file), line, column })
     }
 
     fn watch(&self) -> &dyn Watch {
         self.watch
+    }
+
+    fn set_local_enclosers(&self, maker: &mut VerifiedRunMaker<'h>, enclosers: crate::test_drive::suite_cache::LocalEnclosers) {
+        maker.set_enclosers(enclosers);
+    }
+
+    fn record_made(
+        &self,
+        maker: &mut VerifiedRunMaker<'h>,
+        ids: &RunIds<'h>,
+        symbol: CodeSymbol,
+        tabled: ItemKey,
+        name: &[u8],
+        entry: &[u8],
+        under: CodeKey,
+        builder: &Builder,
+    ) {
+        if let Some(verified) = maker.verified.as_mut() {
+            verified.record_made(symbol, tabled, name, entry, under, ids, builder, self.tables);
+        }
+    }
+
+    fn verified_closed_contents<'a>(&self, alloc: Alloc<'a>) -> crate::test_cache::VerifiedClosedContents<'a> {
+        match self.verified.as_ref() {
+            Some(verified) => verified.closed_contents(alloc),
+            None => crate::test_cache::VerifiedClosedContents::empty(alloc),
+        }
+    }
+
+    fn take_verified(&mut self, maker: Option<&mut VerifiedRunMaker<'h>>) -> Option<crate::test_cache::VerifiedCache> {
+        maker.and_then(VerifiedRunMaker::take_verified).or_else(|| self.verified.take())
     }
 }
 
@@ -1339,7 +1488,21 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
         let one = started.walk.finish::<RunError>(pending, entry, &mut *self.store, self.front.form(), MOST_WALKED, &mut started.scratch).map_err(|why| ParentError::Walk { symbol, why })?;
         let stepped = match one.stepped {
             body_ids::Stepped::Found(key) => Stepped::Found(key),
-            body_ids::Stepped::Made(key) => Stepped::Made(Made::Put(key)),
+            body_ids::Stepped::Made(key) => {
+                if let Some(heavy) = started.heavy.as_mut() {
+                    self.front.record_made(
+                        &mut heavy.maker,
+                        &heavy.ids,
+                        CodeSymbol(symbol),
+                        started.walk.tabled(row),
+                        started.walk.name(row),
+                        entry,
+                        key,
+                        &self.builder,
+                    );
+                }
+                Stepped::Made(Made::Put(key))
+            }
             body_ids::Stepped::Unkeyed(unkeyed) => Stepped::Made(Made::Unkeyed(unkeyed)),
         };
         say_how(&self.cx.span(FIRST_CALL_SPAN), &self.front, stepped);
@@ -1415,9 +1578,18 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
 
     pub(crate) fn lowering_counts<'h>(&self) -> LoweringCounts
     where
-        F: Front<Maker = RunMaker<'h>>,
+        F: Front<Maker = VerifiedRunMaker<'h>>,
     {
         self.started.as_ref().and_then(|s| s.heavy.as_ref()).map_or_else(LoweringCounts::default, |heavy| heavy.maker.lowering_counts())
+    }
+
+    pub(crate) fn verified_closed_contents<'v>(&self, alloc: Alloc<'v>) -> crate::test_cache::VerifiedClosedContents<'v> {
+        self.front.verified_closed_contents(alloc)
+    }
+
+    pub(crate) fn take_verified(&mut self) -> Option<crate::test_cache::VerifiedCache> {
+        let maker = self.started.as_mut().and_then(|s| s.heavy.as_mut()).map(|h| &mut h.maker);
+        self.front.take_verified(maker)
     }
 
     /// The bytes of code record `record` into `into`, from where the folder keeps them (a crash
@@ -1561,7 +1733,9 @@ fn step<F: Front>(
     let (WalkRow(row), proof) = cleared.into_parts();
     let symbol = started.walk.symbol(row).0;
     let tabled = started.walk.tabled(row);
+    let enclosers = crate::test_drive::suite_cache::local_enclosers_of(&started.walk, row, tabled);
     let heavy = heavy(front, &mut started.heavy, &started.start)?;
+    front.set_local_enclosers(&mut heavy.maker, enclosers);
     let path = if front.watch().paths() { front.path_of(tabled) } else { None };
     front.watch().see(Step::Resolving { path: path.as_deref() });
     let cx = cx.span(FIRST_CALL_SPAN);
@@ -1590,7 +1764,10 @@ fn step<F: Front>(
     // never waiting.
     let stepped = match one {
         body_ids::Stepped::Found(key) => Stepped::Found(key),
-        body_ids::Stepped::Made(key) => Stepped::Made(Made::Put(key)),
+        body_ids::Stepped::Made(key) => {
+            front.record_made(&mut heavy.maker, &heavy.ids, CodeSymbol(symbol), tabled, started.walk.name(row), started.scratch.made(), key, builder);
+            Stepped::Made(Made::Put(key))
+        }
         body_ids::Stepped::Unkeyed(unkeyed) => Stepped::Made(Made::Unkeyed(unkeyed)),
     };
     say_how(&cx, front, stepped);
@@ -1976,10 +2153,43 @@ pub(crate) fn ahead_of<'b, F: Front, D: Folder, A: Allocator>(
     };
     let head = today.head();
     needs.name_personality(head.personality, out)?;
+    place_groups(today.groups(), lazy, needs, kept, out)?;
+    Ok(head)
+}
+
+/// Like [`ahead_of`], for a start list written under another certificate (`Held::Other`): always
+/// derives today's fresh `StartHead` from `lazy.head()?` (never reusing the prior list's head),
+/// and pre-places ONLY groups whose code content key is in `closed` (proven closed under today's
+/// `closed_crates_digest` with zero workspace items in `tabled`, `name`, `reads`, `statics`,
+/// `thread_locals`, `declared`, or `PositionRow`s). Every workspace function (and any group
+/// whose statics/bytes do not stand) is left out and resolved at its first call.
+pub(crate) fn ahead_of_closed<'b, F: Front, D: Folder, A: Allocator>(
+    symbols: start_list::Symbols<'b>,
+    closed: &crate::test_cache::VerifiedClosedContents<'_>,
+    lazy: &mut Lazy<'_, '_, F, D>,
+    needs: &mut Needs<'_>,
+    kept: &mut AVec<'_, TodayGroup<'b>>,
+    out: &mut std::vec::Vec<u8, A>,
+) -> Result<StartHead, ParentError> {
+    let head = lazy.head()?;
+    needs.name_personality(head.personality, out)?;
+    if !closed.is_empty() {
+        place_groups(symbols.closed_groups(closed), lazy, needs, kept, out)?;
+    }
+    Ok(head)
+}
+
+fn place_groups<'b, F: Front, D: Folder, A: Allocator>(
+    groups: impl Iterator<Item = TodayGroup<'b>>,
+    lazy: &mut Lazy<'_, '_, F, D>,
+    needs: &mut Needs<'_>,
+    kept: &mut AVec<'_, TodayGroup<'b>>,
+    out: &mut std::vec::Vec<u8, A>,
+) -> Result<(), ParentError> {
     let descriptor = blaze_ladder::symbols::tls_desc_symbol().0;
     // The statics the groups kept so far send.
     let mut on: Set<[u8; 32], BuildKeyHasher, Alloc<'_>> = Set::new(SetOpts { hasher: BuildKeyHasher::default(), alloc: lazy.alloc, capacity: None });
-    for group in today.groups() {
+    for group in groups {
         let view = group.view();
         // Its names first: a group that does not stand is left out before any of its bytes
         // is looked for.
@@ -1987,9 +2197,10 @@ pub(crate) fn ahead_of<'b, F: Front, D: Folder, A: Allocator>(
         if !view.named().all(|symbol| stands(&symbol)) {
             continue;
         }
-        // A positioned group's values are today's (the certificate is): nothing to hold. Each
-        // record's bytes are looked for through the folder (its file; or the store, queued to
-        // be sent inline), the code row by its key.
+        // A positioned group's values are invariant (either today's certificate or closed
+        // toolchain/dep items under today's `closed_crates_digest`). Each record's bytes are
+        // looked for through the folder (its file; or the store, queued to be sent inline),
+        // the code row by its key.
         let Lazy { folder, front, store, .. } = &mut *lazy;
         folder.begin();
         let mut whole = true;
@@ -2012,7 +2223,7 @@ pub(crate) fn ahead_of<'b, F: Front, D: Folder, A: Allocator>(
     }
     needs.place_ahead(kept.as_slice(), out)?;
     lazy.placed(kept.as_slice());
-    Ok(head)
+    Ok(())
 }
 
 /// What a symbol is to this run once met (finding 9); a symbol not in [`Needs::met`] is met

@@ -986,6 +986,20 @@ impl<'b> Symbols<'b> {
     pub(crate) fn iter(&self) -> impl Iterator<Item = Symbol> + Clone + 'b {
         self.view.iter().map(|row| row.symbol)
     }
+
+    /// Yields [`TodayGroup`]s from a prior certificate's start list ONLY for groups whose code
+    /// content key is in `closed` (proven closed under today's `closed_crates_digest` with zero
+    /// workspace items in `tabled`, `name`, `reads`, `statics`, `thread_locals`, `declared`, or
+    /// `PositionRow`s). Callers MUST pair these with a fresh `StartHead` from today's roots.
+    pub(crate) fn closed_groups<'s>(
+        &self,
+        closed: &'s crate::test_cache::VerifiedClosedContents<'_>,
+    ) -> impl Iterator<Item = TodayGroup<'b>> + 's
+    where
+        'b: 's,
+    {
+        self.view.groups().filter(move |view| closed.contains(&view.code().key.0.0)).map(|view| TodayGroup { view })
+    }
 }
 
 /// Why the list could not be read from or written to the store, by name.

@@ -109,57 +109,7 @@ pub(crate) struct StepCounts {
     pub unkeyed: usize,
 }
 
-/// Returns `true` iff `item` belongs to a settled non-workspace (`Toolchain` or `Dependency`) crate.
-fn is_closed_item(item: ItemKey, ids: &RunIds<'_>) -> bool {
-    matches!(ids.grain(item), Some(crate::run_ids::Grain::Toolchain | crate::run_ids::Grain::Dependency))
-}
-
-/// Returns `true` iff `(tabled, name, entry)` touches ONLY settled `Toolchain` / `Dependency`
-/// crates (zero `Workspace` items in `tabled`, generic args `name`, or any read-list question in
-/// `entry`), proving its `Verdict::Holds` remains valid across workspace edits whenever
-/// `closed_crates_digest` stands (rule 21).
-fn is_closed_verified_entry(tabled: ItemKey, name: &[u8], entry: &[u8], ids: &RunIds<'_>) -> bool {
-    if !is_closed_item(tabled, ids) {
-        return false;
-    }
-    let mut ok = true;
-    if blaze_ladder::body_ids::each_item(name, |item| {
-        if ok && !is_closed_item(item, ids) {
-            ok = false;
-        }
-    })
-    .is_err()
-        || !ok
-    {
-        return false;
-    }
-    if entry.get(..8).is_some_and(|magic| magic == STATIC_ENTRY_MAGIC) {
-        return StaticEntryView::read(entry).is_ok();
-    }
-    let Ok(view) = EntryView::read(entry) else {
-        return false;
-    };
-    for row in view.reads() {
-        let Ok((question, _)) = row else {
-            return false;
-        };
-        // Read-list question layout (`code_reads.rs::question_head`): 1-byte kind + 8-byte extra + instance name.
-        let Some(q_name) = question.get(9..) else {
-            return false;
-        };
-        if blaze_ladder::body_ids::each_item(q_name, |item| {
-            if ok && !is_closed_item(item, ids) {
-                ok = false;
-            }
-        })
-        .is_err()
-            || !ok
-        {
-            return false;
-        }
-    }
-    true
-}
+use crate::test_cache::is_closed_verified_entry;
 
 /// Lazily-initialized [`Make`] adapter that consults `SuiteCache`'s verified sets in O(1) before
 /// ever constructing the command-thread [`RunMaker`]. On warm `BZTV` hits (including closed

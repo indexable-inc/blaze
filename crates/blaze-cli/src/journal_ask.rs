@@ -263,12 +263,20 @@ fn paired_place(stored: Stored<'_>) -> Option<Place> {
 }
 
 /// Maximum stored leaf-table rows for which a direct batched `getattrlistbulk` sweep
-/// (~0.25–0.5 µs/leaf -> ~1–2 ms at 4096 leaves) is strictly faster than waiting on an
-/// `fseventsd` sync cookie (11–12 ms per warm ask, or 26–160 ms on a cold `FSEventStream`
-/// `HistoryDone`). Covers small and medium/large workspaces (`ripgrep`, `tempo`, `blaze`) with
-/// 100% soundness across renames, creates, deletes, in-place edits, and restarts; above this
-/// count, the journal helper / FSEvents replay beats statting every leaf.
-pub(crate) const SMALL_CHECKOUT_LEAVES: usize = 4096;
+/// (~0.25–0.5 µs/leaf -> ~3–6 ms at 10k leaves) is strictly faster than waiting on an
+/// `fseventsd` sync cookie (11–12 ms per warm ask, or 160–956 ms on a cold `FSEventStream`
+/// `HistoryDone`). Covers small, medium, and large workspaces (`ripgrep`, `tempo`, `blaze` at
+/// ~7k+ source/manifest leaves) with 100% soundness across renames, creates, deletes, in-place
+/// edits, and restarts; above this count, the warm `journal-helper` beats statting every leaf.
+pub(crate) const SMALL_CHECKOUT_LEAVES: usize = 16_384;
+
+/// Maximum stored leaf-table rows for which a direct batched `getattrlistbulk` sweep (~15–30 ms)
+/// beats opening a cold fallback `FSEventStream` `FullHistory` replay (160–956 ms waiting on
+/// `HistoryDone`) when `journal-helper` did not vouch (e.g. cold start, binary rebuild, or
+/// `CannotVouch`). Checkouts in `(SMALL_CHECKOUT_LEAVES..=FALLBACK_DIRECT_SWEEP_LEAVES]` still
+/// use the warm `journal-helper` on steady-state runs while avoiding the 833–956 ms cold
+/// `HistoryDone` cliff whenever the helper restarts.
+pub(crate) const FALLBACK_DIRECT_SWEEP_LEAVES: usize = 65_536;
 
 /// Whether a fallback OS journal replay (`FSEventStream`) should be skipped in favor of a direct
 /// batched stat sweep when the journal helper did not vouch.
@@ -300,7 +308,7 @@ impl ReplayPolicy {
     pub(crate) fn skip_fallback_replay(self, has_stored_cursor: bool, started_helper: bool) -> bool {
         match self {
             ReplayPolicy::Always => false,
-            ReplayPolicy::Auto { stored_leaves: Some(leaves) } => leaves <= SMALL_CHECKOUT_LEAVES,
+            ReplayPolicy::Auto { stored_leaves: Some(leaves) } => leaves <= FALLBACK_DIRECT_SWEEP_LEAVES,
             ReplayPolicy::Auto { stored_leaves: None } => !has_stored_cursor && started_helper,
         }
     }
@@ -808,9 +816,17 @@ mod replay_policy_tests {
         assert!(small.skip_fallback_replay(true, false));
         assert!(small.skip_fallback_replay(false, false));
 
-        let large = ReplayPolicy::Auto { stored_leaves: Some(SMALL_CHECKOUT_LEAVES + 1) };
-        assert!(!large.skip_fallback_replay(true, false));
-        assert!(!large.skip_fallback_replay(false, true));
+        // Medium-large checkouts (> SMALL_CHECKOUT_LEAVES, <= FALLBACK_DIRECT_SWEEP_LEAVES)
+        // still use the warm helper on steady-state runs (`use_direct_sweep() == None`), while
+        // skipping the 160–956 ms cold FSEvents `HistoryDone` replay when the helper did not vouch.
+        let mid = ReplayPolicy::Auto { stored_leaves: Some(FALLBACK_DIRECT_SWEEP_LEAVES) };
+        assert_eq!(mid.use_direct_sweep(), None);
+        assert!(mid.skip_fallback_replay(true, false));
+        assert!(mid.skip_fallback_replay(false, true));
+
+        let huge = ReplayPolicy::Auto { stored_leaves: Some(FALLBACK_DIRECT_SWEEP_LEAVES + 1) };
+        assert!(!huge.skip_fallback_replay(true, false));
+        assert!(!huge.skip_fallback_replay(false, true));
 
         let cold = ReplayPolicy::Auto { stored_leaves: None };
         assert!(cold.skip_fallback_replay(false, true));

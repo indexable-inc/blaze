@@ -29,7 +29,7 @@ use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts, Set};
 use blaze_ids::{ContentId, Hasher};
 use blaze_keyed::kind::{Kind as _, TestIndex, TestPostings, TestRun};
 use blaze_ladder::body_ids::{BodyIds as _, each_item, instance_key};
-use blaze_ladder::code_records::{Builder, PanicStrategy, TierName, triple};
+use blaze_ladder::code_records::{Builder, CodeKey, EntryView, PanicStrategy, TierName, statics::{STATIC_ENTRY_MAGIC, StaticEntryView}, triple};
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::head::{Head, ReadDigest};
 use blaze_run::plan::{Address, Last, NotKept};
@@ -188,31 +188,7 @@ pub(crate) fn compute_suite_digests_with_ctx(
 
     // 1. `closed_crates_digest`: covers toolchain, producers, tools, builder, and every non-member
     // crate in `closure` (Toolchain, Fetched, CheckoutDep). Independent of workspace edits.
-    let mut closed_h = Hasher::new(CLOSED_CRATES_DIGEST_DOMAIN);
-    closed_h.update(&tools_digest);
-    closed_h.update(&ids.toolchain().0);
-    closed_h.id(&ids.producers());
-    hash_builder(&mut closed_h, builder);
-    let mut closed_count = 0u64;
-    for &at in closure.iter() {
-        if list.member(at) {
-            continue;
-        }
-        closed_count = closed_count.saturating_add(1);
-        let key = list.key(at);
-        closed_h.id(&key.0);
-        match ids.crate_row_bytes(key.prefix()) {
-            Some(row) => {
-                closed_h.update(&[1]);
-                closed_h.update(row);
-            }
-            None => {
-                closed_h.update(&[0]);
-            }
-        }
-    }
-    closed_h.update(&closed_count.to_le_bytes());
-    let closed_crates_digest = closed_h.finish().0;
+    let closed_crates_digest = compute_closed_crates_digest(builder, list, closure.as_slice(), ids, tools_digest);
 
     // 2. `suite_cert`: covers `closed_crates_digest`, `unit.key`, all Stage::Units rows (UnitGraph,
     // manifests, Given env!/include_str! data files), and every workspace crate in `closure`
@@ -372,6 +348,390 @@ pub(crate) fn tools_digest(tools: &[blaze_drive::Tool; blaze_drive::key::KINDS])
         h.id(&tool.0);
     }
     h.finish().0
+}
+
+/// Computes the deterministic `closed_crates_digest` over a sorted crate-index closure `closure`
+/// (sorted ascending by `list.key(at).0`): covers tools, toolchain, producers, code builder
+/// settings, and every non-member (`Toolchain`/`Dependency`) crate's key and `RunIds` `CrateRow`.
+/// Independent of all workspace source edits (rules 21, 30).
+pub(crate) fn compute_closed_crates_digest(
+    builder: &Builder,
+    list: &blaze_world::crate_list::CrateList<'_>,
+    closure: &[usize],
+    ids: &RunIds<'_>,
+    tools_digest: [u8; 32],
+) -> [u8; 32] {
+    let mut closed_h = Hasher::new(CLOSED_CRATES_DIGEST_DOMAIN);
+    closed_h.update(&tools_digest);
+    closed_h.update(&ids.toolchain().0);
+    closed_h.id(&ids.producers());
+    hash_builder(&mut closed_h, builder);
+    let mut closed_count = 0u64;
+    for &at in closure.iter() {
+        if list.member(at) {
+            continue;
+        }
+        closed_count = closed_count.saturating_add(1);
+        let key = list.key(at);
+        closed_h.id(&key.0);
+        match ids.crate_row_bytes(key.prefix()) {
+            Some(row) => {
+                closed_h.update(&[1]);
+                closed_h.update(row);
+            }
+            None => {
+                closed_h.update(&[0]);
+            }
+        }
+    }
+    closed_h.update(&closed_count.to_le_bytes());
+    closed_h.finish().0
+}
+
+/// Convenience wrapper for `blaze run` / `blaze build`: computes `closed_crates_digest` from a
+/// crate list's non-member crates (sorted deterministically by `list.key(at).0`).
+pub(crate) fn closed_crates_digest_of_list(
+    builder: &Builder,
+    list: &blaze_world::crate_list::CrateList<'_>,
+    ids: &RunIds<'_>,
+    tools: &[blaze_drive::Tool; blaze_drive::key::KINDS],
+    alloc: Alloc<'_>,
+) -> [u8; 32] {
+    use blaze_world::crate_list::CrateGraph as _;
+    let mut closure: AVec<'_, usize> = Vec::with_capacity_in(list.len(), alloc);
+    for at in 0..list.len() {
+        if !list.member(at) {
+            closure.push(at);
+        }
+    }
+    closure.sort_unstable_by_key(|&at| list.key(at).0);
+    compute_closed_crates_digest(builder, list, closure.as_slice(), ids, tools_digest(tools))
+}
+
+/// Returns `true` iff `item` belongs to a settled non-workspace (`Toolchain` or `Dependency`) crate.
+pub(crate) fn is_closed_item(item: ItemKey, ids: &RunIds<'_>) -> bool {
+    matches!(ids.grain(item), Some(crate::run_ids::Grain::Toolchain | crate::run_ids::Grain::Dependency))
+}
+
+use blaze_ladder::body_ids::is_synthetic_shim_item;
+
+/// Returns `true` iff `(tabled, name, entry)` touches ONLY settled `Toolchain` / `Dependency`
+/// crates (zero `Workspace` items in `tabled`, generic args `name`, read-list questions, declared
+/// callees/statics/thread-locals, or `PositionRow` source items), proving its `Verdict::Holds`,
+/// emitted code/data, and resolved source positions remain 100% invariant across workspace edits
+/// whenever `closed_crates_digest` stands (rules 21, 30, 74).
+pub(crate) fn is_closed_verified_entry(tabled: ItemKey, name: &[u8], entry: &[u8], ids: &RunIds<'_>) -> bool {
+    if !is_synthetic_shim_item(tabled) && !is_closed_item(tabled, ids) {
+        return false;
+    }
+    let mut ok = true;
+    if entry.get(..8).is_some_and(|magic| magic == STATIC_ENTRY_MAGIC) {
+        if !name.is_empty()
+            && (each_item(name, |item| {
+                if ok && !is_closed_item(item, ids) {
+                    ok = false;
+                }
+            })
+            .is_err()
+                || !ok)
+        {
+            return false;
+        }
+        let Ok(view) = StaticEntryView::read(entry) else {
+            return false;
+        };
+        view.each_static(|item| {
+            if ok && !is_closed_item(item, ids) {
+                ok = false;
+            }
+        });
+        if !ok {
+            return false;
+        }
+        let decl_ok = view
+            .each_declared(
+                |d| {
+                    if !is_synthetic_shim_item(d.tabled) && !is_closed_item(d.tabled, ids) {
+                        ok = false;
+                    }
+                    if ok && each_item(d.name, |item| {
+                        if ok && !is_closed_item(item, ids) {
+                            ok = false;
+                        }
+                    })
+                    .is_err()
+                    {
+                        ok = false;
+                    }
+                    Ok::<(), ()>(())
+                },
+                |_| (),
+            )
+            .is_ok();
+        return decl_ok && ok;
+    }
+    if each_item(name, |item| {
+        if ok && !is_closed_item(item, ids) {
+            ok = false;
+        }
+    })
+    .is_err()
+        || !ok
+    {
+        return false;
+    }
+    let Ok(view) = EntryView::read(entry) else {
+        return false;
+    };
+    for idx in 0..view.record.positions() {
+        let pos = view.record.position(idx);
+        if !is_closed_item(ItemKey(pos.item), ids) {
+            return false;
+        }
+    }
+    view.each_static(|item| {
+        if ok && !is_closed_item(item, ids) {
+            ok = false;
+        }
+    });
+    if !ok {
+        return false;
+    }
+    view.each_thread_local(|item| {
+        if ok && !is_closed_item(item, ids) {
+            ok = false;
+        }
+    });
+    if !ok {
+        return false;
+    }
+    let decl_ok = view
+        .each_declared(
+            |d| {
+                if !is_synthetic_shim_item(d.tabled) && !is_closed_item(d.tabled, ids) {
+                    ok = false;
+                }
+                if ok && each_item(d.name, |item| {
+                    if ok && !is_closed_item(item, ids) {
+                        ok = false;
+                    }
+                })
+                .is_err()
+                {
+                    ok = false;
+                }
+                Ok::<(), ()>(())
+            },
+            |_| (),
+        )
+        .is_ok();
+    if !decl_ok || !ok {
+        return false;
+    }
+    let drop_impl_kind = blaze_ladder::code_records::reads::ReadKind::DropImpl as u8;
+    for row in view.reads() {
+        let Ok((question, _)) = row else {
+            return false;
+        };
+        // Read-list question layout (`code_reads.rs::question_head`): 1-byte kind + 8-byte extra + instance name.
+        // `ReadKind::DropImpl` encodes sentinel head `ItemKey(0)` with the queried type in its
+        // argument list (`code_reads.rs`); skip only that sentinel while checking every real item.
+        let is_drop_impl = question.first().copied() == Some(drop_impl_kind);
+        let Some(q_name) = question.get(9..) else {
+            return false;
+        };
+        if each_item(q_name, |item| {
+            if is_drop_impl && item == ItemKey(0) {
+                return;
+            }
+            if ok && !is_closed_item(item, ids) {
+                ok = false;
+            }
+        })
+        .is_err()
+            || !ok
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Shared persisted `BZTV` v2 verified-entry cache for `blaze run`, `blaze build`, and `blaze test`
+/// (Rule 30: one home). Splits verified `(instance_key, content_key)` pairs into:
+/// - `closed`: entries touching only `Toolchain`/`Dependency` crates, surviving all workspace edits
+///   while `closed_crates_digest` stands;
+/// - `workspace`: entries touching workspace items, valid while `cert` stands.
+pub(crate) struct VerifiedCache {
+    pub(crate) closed: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    pub(crate) workspace: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
+    pub(crate) dirty: bool,
+}
+
+impl VerifiedCache {
+    pub(crate) fn new(alloc: Alloc<'static>) -> Self {
+        Self {
+            closed: Set::new(blaze_hash::SetOpts { hasher: FixedState::default(), alloc, capacity: None }),
+            workspace: Set::new(blaze_hash::SetOpts { hasher: FixedState::default(), alloc, capacity: None }),
+            dirty: false,
+        }
+    }
+
+    pub(crate) fn contains(&self, key: CodeKey, under: CodeKey) -> bool {
+        let pair = (key.0.0, under.0.0);
+        self.closed.contains(&pair) || self.workspace.contains(&pair)
+    }
+
+    pub(crate) fn record_verified(
+        &mut self,
+        key: CodeKey,
+        under: CodeKey,
+        tabled: ItemKey,
+        name: &[u8],
+        entry: &[u8],
+        ids: &RunIds<'_>,
+    ) {
+        let pair = (key.0.0, under.0.0);
+        let inserted = if is_closed_verified_entry(tabled, name, entry, ids) {
+            self.closed.insert(pair)
+        } else {
+            self.workspace.insert(pair)
+        };
+        if inserted {
+            self.dirty = true;
+        }
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "records a newly compiled keyed entry into VerifiedCache")]
+    pub(crate) fn record_made(
+        &mut self,
+        symbol: CodeSymbol,
+        tabled: ItemKey,
+        name: &[u8],
+        entry: &[u8],
+        under: CodeKey,
+        ids: &RunIds<'_>,
+        builder: &Builder,
+        alloc: Alloc<'_>,
+    ) {
+        if let Some(ik) = instance_key(symbol, tabled, name, ids, builder, &builder.producer, alloc) {
+            self.record_verified(ik, under, tabled, name, entry, ids);
+        }
+    }
+
+    /// Returns the proof set of verified closed entry content keys (`under`), for O(1) filtering
+    /// of closed groups in `start_list::Symbols::closed_groups`.
+    pub(crate) fn closed_contents<'a>(&self, alloc: Alloc<'a>) -> VerifiedClosedContents<'a> {
+        let mut out = Set::new(blaze_hash::SetOpts {
+            hasher: BuildKeyHasher::default(),
+            alloc,
+            capacity: Some(self.closed.len()),
+        });
+        for &(_, under) in self.closed.iter() {
+            out.insert(under);
+        }
+        VerifiedClosedContents(out)
+    }
+
+    /// Loads `closed` (if `closed_crates_digest` matches) and `workspace` (if `cert` also matches)
+    /// from the store under `id`. Returns `Ok((0, 0))` on genuine cold miss or digest mismatch;
+    /// corrupt payloads or store I/O failures return `Err(CacheError)`.
+    pub(crate) fn load_split<D: Driver>(
+        &mut self,
+        lent: &Lent<D, StoreAlloc>,
+        id: ContentId,
+        cert: [u8; 32],
+        closed_crates_digest: [u8; 32],
+    ) -> Result<(usize, usize), CacheError> {
+        let ptr_key = verified_ptr_key(id);
+        let Some(state_key) = lent.pointed(TestIndex::TAG, &ptr_key).map_err(CacheError::Store)? else {
+            return Ok((0, 0));
+        };
+        let Some(lend) = lent.get(&state_key).map_err(CacheError::Store)? else {
+            return Err(CacheError::Corrupt("verified cache pointer names a missing record"));
+        };
+        if lend.tag != TestIndex::TAG {
+            return Err(CacheError::Corrupt("verified cache record has unexpected store tag"));
+        }
+        match decode_verified_status(lend.bytes, cert, closed_crates_digest, &mut self.closed, &mut self.workspace) {
+            VerifiedDecode::Loaded(closed, ws) => Ok((closed, ws)),
+            VerifiedDecode::StaleCertificate => Ok((0, 0)),
+            VerifiedDecode::Corrupt => Err(CacheError::Corrupt("malformed BZTV verified cache payload")),
+        }
+    }
+
+    /// Persists and pins `closed` + `workspace` under `(id, cert, closed_crates_digest)` when
+    /// `self.dirty` is set and at least one pair is present.
+    pub(crate) fn save_split<D: Driver>(
+        &self,
+        lent: &Lent<D, StoreAlloc>,
+        id: ContentId,
+        cert: [u8; 32],
+        closed_crates_digest: [u8; 32],
+        alloc: Alloc<'_>,
+    ) -> Result<(), CacheError> {
+        if !self.dirty || (self.closed.is_empty() && self.workspace.is_empty()) {
+            return Ok(());
+        }
+        let mut closed_list: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
+        for &pair in self.closed.iter() {
+            if closed_list.len() >= MOST_VERIFIED_PERSISTED {
+                break;
+            }
+            closed_list.push(pair);
+        }
+        let mut ws_list: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
+        for &pair in self.workspace.iter() {
+            if ws_list.len() >= MOST_VERIFIED_PERSISTED {
+                break;
+            }
+            ws_list.push(pair);
+        }
+        closed_list.sort_unstable();
+        closed_list.dedup();
+        ws_list.sort_unstable();
+        ws_list.dedup();
+        let mut vbytes: AVec<'_, u8> = Vec::new_in(alloc);
+        encode_verified(cert, closed_crates_digest, closed_list.as_slice(), ws_list.as_slice(), &mut vbytes);
+        let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
+        let vptr_key = verified_ptr_key(id);
+        lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).map_err(CacheError::Store)?;
+        lent.point(TestIndex::TAG, &vptr_key, &vstate_key).map_err(CacheError::Store)?;
+        roots::keep_test_suite(lent, &id, &[vptr_key, vstate_key]).map_err(CacheError::Root)?;
+        Ok(())
+    }
+}
+
+/// Proof set of `CodeKey` content digests verified under today's `closed_crates_digest` as
+/// touching ONLY settled `Toolchain`/`Dependency` items (`is_closed_verified_entry`), constructed
+/// only from [`VerifiedCache::closed_contents`] (rules 21, 73, 74).
+pub(crate) struct VerifiedClosedContents<'a>(Set<[u8; 32], BuildKeyHasher, Alloc<'a>>);
+
+impl<'a> VerifiedClosedContents<'a> {
+    pub(crate) fn empty(alloc: Alloc<'a>) -> Self {
+        Self(Set::new(blaze_hash::SetOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn contains(&self, under: &[u8; 32]) -> bool {
+        self.0.contains(under)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(keys: &[[u8; 32]], alloc: Alloc<'a>) -> Self {
+        let mut out = Set::new(blaze_hash::SetOpts {
+            hasher: BuildKeyHasher::default(),
+            alloc,
+            capacity: Some(keys.len()),
+        });
+        for &k in keys {
+            out.insert(k);
+        }
+        Self(out)
+    }
 }
 
 /// Typed store error from persisting or reading incremental test cache records (rule 19).
@@ -2339,5 +2699,50 @@ mod tests {
         // Full 152-byte v2 header with 0 fns, 0 results, 0 closed crates.
         raw.extend_from_slice(&[0u8; 32 * 4 + 4 * 4]);
         assert!(decode_suite_state(&raw, alloc).is_none(), "v2 SuiteState must be rejected so v3 rebuilds cleanly");
+    }
+
+    #[test]
+    fn verified_cache_split_preserves_closed_across_cert_edits_and_invalidates_on_closed_digest_change() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let closed_pair = ([0x11; 32], [0x22; 32]);
+        let ws_pair = ([0x33; 32], [0x44; 32]);
+        let cert1 = [0xa1; 32];
+        let cert2 = [0xa2; 32];
+        let closed_digest1 = [0xb1; 32];
+        let closed_digest2 = [0xb2; 32];
+
+        let mut encoded = Vec::new_in(alloc);
+        encode_verified(cert1, closed_digest1, &[closed_pair], &[ws_pair], &mut encoded);
+
+        // 1. Exact cert + closed_digest: loads BOTH closed and workspace pairs.
+        let mut cache_same = VerifiedCache::new(alloc);
+        assert_eq!(
+            decode_verified_status(&encoded, cert1, closed_digest1, &mut cache_same.closed, &mut cache_same.workspace),
+            VerifiedDecode::Loaded(1, 1),
+        );
+        assert!(cache_same.contains(CodeKey(ContentId(closed_pair.0)), CodeKey(ContentId(closed_pair.1))));
+        assert!(cache_same.contains(CodeKey(ContentId(ws_pair.0)), CodeKey(ContentId(ws_pair.1))));
+
+        // 2. Workspace edit (cert changed, closed_digest unchanged): closed pair SURVIVES,
+        // workspace pair is DISCARDED, and closed_contents contains ONLY closed_pair.1.
+        let mut cache_ws_edit = VerifiedCache::new(alloc);
+        assert_eq!(
+            decode_verified_status(&encoded, cert2, closed_digest1, &mut cache_ws_edit.closed, &mut cache_ws_edit.workspace),
+            VerifiedDecode::Loaded(1, 0),
+        );
+        assert!(cache_ws_edit.contains(CodeKey(ContentId(closed_pair.0)), CodeKey(ContentId(closed_pair.1))));
+        assert!(!cache_ws_edit.contains(CodeKey(ContentId(ws_pair.0)), CodeKey(ContentId(ws_pair.1))));
+        let contents = cache_ws_edit.closed_contents(alloc);
+        assert!(contents.contains(&closed_pair.1));
+        assert!(!contents.contains(&ws_pair.1));
+
+        // 3. Invalidation control (closed_digest changed): BOTH closed and workspace are rejected.
+        let mut cache_stale = VerifiedCache::new(alloc);
+        assert_eq!(
+            decode_verified_status(&encoded, cert1, closed_digest2, &mut cache_stale.closed, &mut cache_stale.workspace),
+            VerifiedDecode::StaleCertificate,
+        );
+        assert!(cache_stale.closed.is_empty());
+        assert!(cache_stale.workspace.is_empty());
     }
 }

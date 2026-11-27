@@ -218,6 +218,15 @@ impl core::error::Error for NameError {}
 /// at two arguments is two nodes). The nodes are a flat stream, each a tag, its payload, a
 /// child count and its children's references, so no tree is rebuilt; every reference is
 /// checked to point before its node.
+/// Returns `true` iff `item` is a compiler-synthesized shim head (`REIFY_SHIM_ITEM`,
+/// `VTABLE_SHIM_ITEM`, or `TEST_REPORT_SHIM_ITEM`) that belongs to no user crate; its real
+/// target item(s) live in the instance's `name` bytes.
+pub fn is_synthetic_shim_item(item: ItemKey) -> bool {
+    item == blaze_build::REIFY_SHIM_ITEM
+        || item == blaze_build::VTABLE_SHIM_ITEM
+        || item == blaze_build::TEST_REPORT_SHIM_ITEM
+}
+
 pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameError> {
     let key_at = |at: usize| -> Result<ItemKey, NameError> {
         let bytes = name.get(at..at + 16).ok_or(NameError::Truncated { at })?;
@@ -230,7 +239,7 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     };
     let head = key_at(0)?;
-    if head != blaze_build::REIFY_SHIM_ITEM && head != blaze_build::VTABLE_SHIM_ITEM && head != blaze_build::TEST_REPORT_SHIM_ITEM {
+    if !is_synthetic_shim_item(head) {
         each(head);
     }
     // The item's key (16) and the count of arguments (4); at no argument, nothing more.
@@ -759,7 +768,11 @@ impl fmt::Display for Counts {
             self.longest_name,
             self.most_name_items,
             self.arena
-        )
+        )?;
+        if let Some((tabled, verdict)) = self.first_moved {
+            write!(f, "; first moved: {:#x} ({verdict:?})", tabled.0)?;
+        }
+        Ok(())
     }
 }
 

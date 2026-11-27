@@ -1724,17 +1724,22 @@ impl<'n, K: blaze_ladder::front2::program::lazy::typed::KeptBodies> Typing<Recor
     }
 }
 
-/// Defers `maker.prepare_local(...)` during `Walk::begin` so the coordinator thread never lowers
-/// enclosing bodies on cold misses that are immediately dispatched to workers, while still
-/// preparing locals whenever `Walk::begin` hits a cached entry whose read list needs verification.
-struct LazyVerifyMaker<'m, 'n, 's, 'e> {
+/// Domain separator for persisted `BZTV` verified-entry cache pointers on `blaze build`.
+const EXPORT_VERIFIED_DOMAIN: &str = "blaze build verified cache 1";
+
+/// Defers `maker.prepare_local(...)` during `Walk::begin` / `Walk::one` so the coordinator thread
+/// never lowers enclosing bodies on cold misses that are immediately dispatched to workers, and
+/// checks `VerifiedCache` (`BZTV`) in O(1) before ever running `verify_instance`.
+struct LazyVerifyMaker<'m, 'n, 's, 'e, 'i, 'v> {
     maker: &'m mut Maker<'n, crate::run_ids::Runnable, SharedExportTyping<crate::engine_body_record::StoreTyped<'n>>>,
     shared: &'s SharedLazyFrontHandle,
     enclosers: &'e crate::test_drive::suite_cache::LocalEnclosers,
+    ids: &'i crate::run_ids::RunIds<'i>,
+    verified: &'v mut crate::test_cache::VerifiedCache,
     prepared: bool,
 }
 
-impl<'m, 'n, 's, 'e> LazyVerifyMaker<'m, 'n, 's, 'e> {
+impl<'m, 'n, 's, 'e, 'i, 'v> LazyVerifyMaker<'m, 'n, 's, 'e, 'i, 'v> {
     fn ensure_prepared(&mut self) {
         if !self.prepared {
             self.prepared = true;
@@ -1749,7 +1754,7 @@ impl<'m, 'n, 's, 'e> LazyVerifyMaker<'m, 'n, 's, 'e> {
     }
 }
 
-impl blaze_ladder::body_ids::Make for LazyVerifyMaker<'_, '_, '_, '_> {
+impl blaze_ladder::body_ids::Make for LazyVerifyMaker<'_, '_, '_, '_, '_, '_> {
     type Error = RunError;
     type Grant = crate::run_ids::Runnable;
 
@@ -1774,8 +1779,15 @@ impl blaze_ladder::body_ids::Make for LazyVerifyMaker<'_, '_, '_, '_> {
     }
 
     fn verify_keyed(&mut self, key: CodeKey, under: CodeKey, tabled: ItemKey, name: &[u8], entry: &[u8]) -> Result<Option<blaze_ladder::code_records::reads::Verdict>, Self::Error> {
+        if self.verified.contains(key, under) {
+            return Ok(Some(blaze_ladder::code_records::reads::Verdict::Holds));
+        }
         self.ensure_prepared();
-        self.maker.verify_keyed(key, under, tabled, name, entry)
+        let verdict = self.maker.verify(tabled, name, entry)?;
+        if matches!(verdict, Some(blaze_ladder::code_records::reads::Verdict::Holds)) {
+            self.verified.record_verified(key, under, tabled, name, entry, self.ids);
+        }
+        Ok(verdict)
     }
 }
 
@@ -2211,6 +2223,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
     dep_typed_program: &mut AVec<'a, blaze_cas::Key>,
     dep_typed_toolchain: &mut AVec<'a, blaze_cas::Key>,
     maker: &mut Maker<'n, crate::run_ids::Runnable, SharedExportTyping<crate::engine_body_record::StoreTyped<'n>>>,
+    verified: &mut crate::test_cache::VerifiedCache,
     scratch: &mut Scratch<'a>,
     outcomes: &mut AVec<'a, RowOutcome<'a>>,
     compiled: &mut usize,
@@ -2310,8 +2323,8 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
                     box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled: *compiled, cached: *cached, why }, heap)
                 })?;
                 let enclosers = crate::test_drive::suite_cache::local_enclosers_of(walk, row, tabled);
-                maker.prepare_local(enclosers.locals(), enclosers.enclosers());
-                match walk.one(row, ids, codes, builder, &builder.producer, maker, &proof, &body_ids::EntryForm, MOST_WALKED, scratch) {
+                let mut verify_maker = LazyVerifyMaker { maker, shared: shared_front, enclosers: &enclosers, ids, verified, prepared: false };
+                match walk.one(row, ids, codes, builder, &builder.producer, &mut verify_maker, &proof, &body_ids::EntryForm, MOST_WALKED, scratch) {
                     Ok(one) => match one.stepped {
                         Stepped::Found(key) => {
                             *cached += 1;
@@ -2319,6 +2332,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
                         }
                         Stepped::Made(key) => {
                             *compiled += 1;
+                            verified.record_made(symbol, tabled, walk.name(row), scratch.made(), key, ids, builder, alloc);
                             if let Some(top) = top_stats.as_deref_mut()
                                 && let Some(sizes) = maker.take_last_make()
                             {
@@ -2390,6 +2404,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
                                codes: &mut HomeCodeStore<'_, D>,
                                dep_typed_program: &mut AVec<'a, blaze_cas::Key>,
                                dep_typed_toolchain: &mut AVec<'a, blaze_cas::Key>,
+                               verified: &mut crate::test_cache::VerifiedCache,
                                scratch: &mut Scratch<'a>,
                                pending_rows: &mut AVec<'a, Option<blaze_ladder::body_ids::Pending>>,
                                par_outcomes: &mut AVec<'a, Option<RowOutcome<'a>>>,
@@ -2432,6 +2447,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
                         }
                         Stepped::Made(key) => {
                             *compiled += 1;
+                            verified.record_made(symbol, walk.tabled(row), walk.name(row), entry_bytes.as_slice(), key, ids, builder, alloc);
                             RowOutcome::Keyed(key)
                         }
                         Stepped::Unkeyed(_) => {
@@ -2481,6 +2497,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
                     codes,
                     dep_typed_program,
                     dep_typed_toolchain,
+                    verified,
                     scratch,
                     &mut pending_rows,
                     &mut par_outcomes,
@@ -2513,7 +2530,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
                     box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled: *compiled, cached: *cached, why }, heap)
                 })?;
                 let enclosers = crate::test_drive::suite_cache::local_enclosers_of(walk, row, tabled);
-                let mut verify_maker = LazyVerifyMaker { maker, shared: shared_front, enclosers: &enclosers, prepared: false };
+                let mut verify_maker = LazyVerifyMaker { maker, shared: shared_front, enclosers: &enclosers, ids, verified, prepared: false };
                 match walk.begin(row, ids, codes, builder, &builder.producer, &mut verify_maker, &body_ids::EntryForm, MOST_WALKED, scratch) {
                     Ok(blaze_ladder::body_ids::Begun::Stepped(one)) => match one.stepped {
                         Stepped::Found(key) => {
@@ -2522,6 +2539,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
                         }
                         Stepped::Made(key) => {
                             *compiled += 1;
+                            verified.record_made(symbol, tabled, walk.name(row), scratch.made(), key, ids, builder, alloc);
                             if let Some(top) = top_stats.as_deref_mut()
                                 && let Some(sizes) = maker.take_last_make()
                             {
@@ -2589,6 +2607,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
                             codes,
                             dep_typed_program,
                             dep_typed_toolchain,
+                            verified,
                             scratch,
                             &mut pending_rows,
                             &mut par_outcomes,
@@ -3078,6 +3097,17 @@ fn export_program<'f>(
             ));
         }
     };
+    let closed_crates_digest = crate::test_cache::closed_crates_digest_of_list(&builder, list, &ids, &standing.tools, alloc);
+    let export_verified_id = blaze_ids::ContentId::of(EXPORT_VERIFIED_DOMAIN, &today.name.id().0);
+    let mut verified = crate::test_cache::VerifiedCache::new(heap.alloc());
+    verified
+        .load_split(lent, export_verified_id, *today.certificate.bytes(), closed_crates_digest)
+        .map_err(|why| {
+            box_err(
+                ExportCliError::KeepRoots { class: "verified cache", shown: owned_fmt(format_args!("{why:?}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
     let (mut compiled, mut cached, mut unkeyed, mut stubs) = (0usize, 0usize, 0usize, 0usize);
     let root_count = roots.len();
     let export_workers = usize::try_from(standing.workers.get().min(cx.workers()).saturating_sub(1))
@@ -3115,6 +3145,7 @@ fn export_program<'f>(
                     &mut dep_typed_program,
                     &mut dep_typed_toolchain,
                     &mut maker,
+                    &mut verified,
                     &mut scratch,
                     &mut outcomes,
                     &mut compiled,
@@ -3138,11 +3169,8 @@ fn export_program<'f>(
                 box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
             })?;
             let enclosers = crate::test_drive::suite_cache::local_enclosers_of(&walk, row, tabled);
-            maker.prepare_local(enclosers.locals(), enclosers.enclosers());
-            if let Some(prog) = maker.program() {
-                prog.attach_shared(&shared_front);
-            }
-            match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
+            let mut verify_maker = LazyVerifyMaker { maker: &mut maker, shared: &shared_front, enclosers: &enclosers, ids: &ids, verified: &mut verified, prepared: false };
+            match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut verify_maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
                 Ok(one) => match one.stepped {
                     Stepped::Found(key) => {
                         cached += 1;
@@ -3150,6 +3178,7 @@ fn export_program<'f>(
                     }
                     Stepped::Made(key) => {
                         compiled += 1;
+                        verified.record_made(symbol, tabled, walk.name(row), scratch.made(), key, &ids, &builder, alloc);
                         if let Some(top) = top_stats.as_mut()
                             && let Some(sizes) = maker.take_last_make()
                         {
@@ -3189,6 +3218,14 @@ fn export_program<'f>(
     // Commit and root all compiled `CodeRecord`s and persisted dep/toolchain `Typed` batches
     // BEFORE `wasm64`, LTO, or `blaze_export::export()` runs, so a downstream LTO/linker/output
     // failure never discards compiled work, and unlent store arena chunks are freed before linking.
+    verified
+        .save_split(lent, export_verified_id, *today.certificate.bytes(), closed_crates_digest, alloc)
+        .map_err(|why| {
+            box_err(
+                ExportCliError::KeepRoots { class: "verified cache", shown: owned_fmt(format_args!("{why:?}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
     checkpoint_export_roots(
         lent,
         &today,
