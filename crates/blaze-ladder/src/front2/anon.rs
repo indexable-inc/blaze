@@ -472,6 +472,68 @@ impl Ask {
     }
 }
 
+/// If `text` contains a macro call (`!`), resolves its observable `(line, col)` and shown file
+/// path relative to `item`'s scanned owner text (`offset` is the byte offset of `text` inside
+/// `item`'s scanned owner text: `it.impl_header` for `Impl`, `it.text` otherwise).
+pub(super) fn head_site_of<'n, S: super::source::NamesSource<'n>>(
+    names: S,
+    item: LibKey,
+    offset: u32,
+    text: &str,
+) -> Option<HeadSite<'n>> {
+    if !text.contains('!') {
+        return None;
+    }
+    let header_off = names
+        .seeded_text_of(item)
+        .and_then(|it| it.impl_header.and_then(|hdr| blaze_scope::expansion_origins::offset_in(it.text, hdr)))
+        .unwrap_or(0);
+    blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
+        let scratch = blaze_own::Erased::new(frame);
+        let (krate, file_text, start, by_call) = crate::front2::program::lazy::body_place(names, item, scratch.handle()).ok()?;
+        let at = if by_call { start } else { start.checked_add(header_off)?.checked_add(offset)? };
+        let at = usize::try_from(at).ok()?;
+        let line = blaze_expand::PlaceOf::Line.counted(file_text, at)?;
+        let col = blaze_expand::PlaceOf::Column.counted(file_text, at)?;
+        let file = super::body_host::body_file(names, krate, item).map(|f| f.shown);
+        Some(HeadSite { line, col, file })
+    })
+}
+
+/// Extracts token marks for each `(prefix_in_decl, slice_in_marks)` segment of a synthetic
+/// declaration `decl` (such as `"const _: {ty_text} = {value_text};"` or
+/// `"const _: bool = {body_expr};"`) and files the combined `TextMarks` into `columns` under
+/// `item`. No-op when `marks` is `None` or no segment carries any marks.
+pub(super) fn file_parts_marks<'n>(
+    columns: &mut Columns<'n>,
+    item: ItemKey,
+    decl: &'n str,
+    marks: Option<TextMarks<'_>>,
+    parts: &[(usize, &str)],
+    alloc: Alloc<'_>,
+) -> Result<(), blaze_expand::origin_column::ColumnError> {
+    use blaze_expand::origin_column::{ColumnError, OriginsRef};
+    let Some(marks) = marks else { return Ok(()) };
+    let mut rows: AVec<'_, (u32, TextMark)> = AVec::new_in(alloc);
+    for &(prefix, part) in parts {
+        let prefix_u32 = u32::try_from(prefix).map_err(|_| ColumnError::TooLarge { at: prefix })?;
+        let Ok(slice_marks) = blaze_lower::mark_site::ItemMarks::of(part, marks) else { continue };
+        for (offset, mark) in slice_marks.marked() {
+            let at = prefix_u32.checked_add(offset).ok_or(ColumnError::TooLarge { at: usize::MAX })?;
+            rows.push((at, mark));
+        }
+    }
+    if rows.is_empty() {
+        return Ok(());
+    }
+    rows.sort_unstable_by_key(|&(at, _)| at);
+    let bytes = blaze_lower::mark_site::column_of_copy(decl, &rows, alloc)?;
+    let frame = *columns.allocator();
+    let (column, _) = OriginsRef::open(frame.alloc_slice_copy(&bytes))?;
+    columns.insert(item, TextMarks { text: decl, column });
+    Ok(())
+}
+
 /// Move the expression's marks past the synthetic declaration prefix before passing the
 /// text to the ordinary marked-item lowering.
 fn file_marks<'n>(

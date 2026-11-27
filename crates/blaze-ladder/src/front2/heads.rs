@@ -3574,19 +3574,71 @@ impl<'n> Store<'n> {
         }
     }
 
+    fn where_const_member_name(k: usize, site: Option<super::anon::HeadSite<'_>>, alloc: Alloc<'static>) -> blaze_own::String<Alloc<'static>> {
+        match site {
+            Some(s) => blaze_own::format_in!(alloc, "where const {k} @{}:{}:{}", s.line, s.col, s.file.unwrap_or("")),
+            None => blaze_own::format_in!(alloc, "where const {k}"),
+        }
+    }
+
+    fn field_default_member_name(
+        vi: usize,
+        j: usize,
+        ty_text: &str,
+        value_text: &str,
+        site: Option<super::anon::HeadSite<'_>>,
+        alloc: Alloc<'static>,
+    ) -> blaze_own::String<Alloc<'static>> {
+        match site {
+            Some(s) => blaze_own::format_in!(alloc, "field default {vi}.{j}: {ty_text} = {value_text} @{}:{}:{}", s.line, s.col, s.file.unwrap_or("")),
+            None => blaze_own::format_in!(alloc, "field default {vi}.{j}: {ty_text} = {value_text}"),
+        }
+    }
+
+    fn record_default_member_name(
+        j: usize,
+        ty_text: &str,
+        value_text: &str,
+        site: Option<super::anon::HeadSite<'_>>,
+        alloc: Alloc<'static>,
+    ) -> blaze_own::String<Alloc<'static>> {
+        match site {
+            Some(s) => blaze_own::format_in!(alloc, "record default {j}: {ty_text} = {value_text} @{}:{}:{}", s.line, s.col, s.file.unwrap_or("")),
+            None => blaze_own::format_in!(alloc, "record default {j}: {ty_text} = {value_text}"),
+        }
+    }
+
+    fn owner_item_marks<S: NamesSource<'n>>(&self, names: S, item: LibKey, owner_text: &'n str) -> Option<TextMarks<'n>> {
+        if names.seeded_text_of(item).is_some() {
+            return self.marks(names, item, owner_text).ok().flatten();
+        }
+        let (container, _) = names.member_owner(item)?;
+        let mut found = None;
+        names.each_member(container, &mut |m| {
+            if found.is_none() && m.key == item {
+                found = m.name.map(|name| (name, m.kind, m.text));
+            }
+        });
+        let (name, kind, text) = found?;
+        super::item_site::head_marks(names, container, name, kind, text).ok().flatten()
+    }
+
     /// Lowers every `where const { COND }` collected in `preds.conds` into a `PClause::Const`
     /// clause + synthetic `bool`-returning constant `FnHead` in `fns` so `World::const_holds`
     /// can evaluate the condition at arbitrary ground generic arguments.
     /// Takes individual store fields so callers can invoke it while a `Builder` borrows `self.maps`.
     #[expect(clippy::too_many_arguments, reason = "owner item head context for synthetic const fn")]
-    fn file_where_consts(
+    fn file_where_consts<S: NamesSource<'n>>(
+        names: S,
         tys: &mut PortableTys<'static>,
         locals: &super::locals::Locals<'n>,
+        anon_marks: &mut super::anon::Columns<'n>,
         fns: &Rows<ItemKey, FnHead<'n>>,
         preds_table: &Rows<ItemKey, Preds>,
         owner_ck: ItemKey,
         lib: LibKey,
         owner: Option<(LibKey, &'n str)>,
+        marks: Option<TextMarks<'_>>,
         module: LibKey,
         v: &View<'_>,
         env: &Env<'_>,
@@ -3604,7 +3656,9 @@ impl<'n> Store<'n> {
         let conds = core::mem::replace(&mut preds.conds, blaze_own::Vec::new_in(alloc));
         let mut made: blaze_own::Vec<(ItemKey, &'n str), Alloc<'static>> = blaze_own::Vec::with_capacity_in(conds.len(), alloc);
         let mut anons: blaze_own::Vec<(ItemKey, super::anon::HeadOwner, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
-        let prefix = u32::try_from("const _: bool = ".len()).ok();
+        let prefix_usize = "const _: bool = ".len();
+        let prefix = u32::try_from(prefix_usize).ok();
+        let owner_pair = owner.or_else(|| super::locals::owner_scanned_text(names, lib).map(|t| (lib, t)));
         for (k, &cond) in conds.iter().enumerate() {
             let at = v.const_range(cond)?;
             let r = v.site(at)?;
@@ -3613,15 +3667,20 @@ impl<'n> Store<'n> {
                 Some(rest) => rest.trim_start(),
                 None => written,
             };
-            let member_name = blaze_own::format_in!(alloc, "where const {k}");
+            let located = owner_pair.and_then(|(owner_item, owner_text)| {
+                blaze_scope::expansion_origins::offset_in(owner_text, body_expr).map(|offset| (owner_item, offset))
+            });
+            let site = located.and_then(|(owner_item, offset)| super::anon::head_site_of(names, owner_item, offset, body_expr));
+            let member_name = Self::where_const_member_name(k, site, alloc);
             let cond_key = keys
                 .member(owner_ck, MemberKind::Anon, member_name.as_str())
                 .map_err(|_| Why::Unsupported("duplicate `where const` condition key", r))?;
             let decl = blaze_own::format_in!(alloc, "const _: bool = {body_expr};");
             let text: &'n str = locals.keep_text(decl.as_str());
-            if let (Some((owner_item, owner_text)), Some(prefix)) = (owner, prefix)
+            super::anon::file_parts_marks(anon_marks, cond_key, text, marks, &[(prefix_usize, body_expr)], alloc)
+                .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), r))?;
+            if let (Some((owner_item, offset)), Some(prefix)) = (located, prefix)
                 && blaze_file_items::nested::may_write_block(body_expr)
-                && let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, body_expr)
                 && let Ok(len) = u32::try_from(body_expr.len())
             {
                 anons.push((cond_key, super::anon::HeadOwner { item: owner_item, offset, len }, prefix));
@@ -3760,7 +3819,9 @@ impl<'n> Store<'n> {
                 .unwrap_or(0),
             _ => 0,
         };
-        let prefix = u32::try_from("const _: bool = ".len()).ok();
+        let prefix_usize = "const _: bool = ".len();
+        let prefix = u32::try_from(prefix_usize).ok();
+        let owner_marks = owner_lib.and_then(|oi| self.owner_item_marks(names, oi, text));
         let low = self.lower_alloc_here(names, lib, text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering owner for `where const`", Range::new(0, 0))))?;
         let v = low.view();
         let rows = v.rows(v.list(head::WHERE)).map_err(|b| HeadError::Item(lib, Why::from(b)))?;
@@ -3776,13 +3837,13 @@ impl<'n> Store<'n> {
                 Some(rest) => rest.trim_start(),
                 None => written,
             };
-            let member_name = blaze_own::format_in!(alloc, "where const {k}");
+            let offset = blaze_scope::expansion_origins::offset_in(text, body_expr).and_then(|raw_off| raw_off.checked_sub(header_off));
+            let site = owner_lib.and_then(|owner_item| offset.and_then(|off| super::anon::head_site_of(names, owner_item, off, body_expr)));
+            let member_name = Self::where_const_member_name(k, site, alloc);
             let cond_key = keys.member(owner_ck, MemberKind::Anon, member_name.as_str()).map_err(HeadError::Key)?;
             k += 1;
-            if let (Some(owner_item), Some(prefix)) = (owner_lib, prefix)
+            if let (Some(owner_item), Some(offset), Some(prefix)) = (owner_lib, offset, prefix)
                 && blaze_file_items::nested::may_write_block(body_expr)
-                && let Some(raw_off) = blaze_scope::expansion_origins::offset_in(text, body_expr)
-                && let Some(offset) = raw_off.checked_sub(header_off)
                 && let Ok(len) = u32::try_from(body_expr.len())
             {
                 self.locals.file_head_anon(cond_key, super::anon::HeadOwner { item: owner_item, offset, len }, &[], prefix);
@@ -3792,6 +3853,9 @@ impl<'n> Store<'n> {
             }
             let decl_buf = blaze_own::format_in!(alloc, "const _: bool = {body_expr};");
             let decl: &'n str = self.locals.keep_text(decl_buf.as_str());
+            if let Err(e) = super::anon::file_parts_marks(&mut self.anon_marks, cond_key, decl, owner_marks, &[(prefix_usize, body_expr)], alloc) {
+                return Err(HeadError::Item(lib, Why::Program(format!("{e}").into_boxed_str(), Range::new(0, 0))));
+            }
             let mut cp = Preds::new_in(Scope::new_in(alloc));
             for &cl in &clauses {
                 if !matches!(cl, PClause::Const { cond: x, .. } if x == cond_key) {
@@ -3829,66 +3893,115 @@ impl<'n> Store<'n> {
         Ok(self.fns.contains_key(&cond))
     }
 
-    /// Registers `HeadAnon` alignment for a frozen/seeded inline field default (`text_inline: true`)
-    /// lowered in a fresh store whose `locals.head_anons` was not populated by `Store::adt`.
-    pub(super) fn ensure_field_default_head_anon<S: NamesSource<'n>>(&mut self, names: S, item: LibKey, owner: ItemKey, text: &str) {
-        if self.locals.head_anon(owner).is_some() || self.locals.head(owner).is_some() {
+    /// Registers `HeadAnon` alignment and remapped hygiene `anon_marks` for a frozen/seeded
+    /// inline field default (`text_inline: true`) — both nominal ADT field defaults (keyed under
+    /// `checker_of(item)`) and structural record field defaults (keyed under
+    /// `RecordSchema::defaults_key()`) — when lowered in a fresh store whose `locals.head_anons`
+    /// and `anon_marks` were not populated by `Store::adt` / `Store::register_record_defaults`.
+    pub(super) fn ensure_field_default_site<S: NamesSource<'n>>(&mut self, names: S, item: LibKey, owner: ItemKey, text: &'n str) {
+        if self.locals.head_anon(owner).is_some() || self.locals.head(owner).is_some() || self.anon_marks.contains_key(&owner) {
             return;
         }
         if !self.fns.get(&owner).is_some_and(|h| h.text_inline) {
             return;
         }
-        let Some(field_idx) = self.field_defaults.get(&checker_of(item)).and_then(|ds| ds.iter().position(|d| *d == Some(owner))) else {
+        enum DefaultKind {
+            Nominal(usize),
+            Record(ItemKey, usize),
+        }
+        let item_ck = checker_of(item);
+        let kind = if let Some(field_idx) = self.field_defaults.get(&item_ck).and_then(|ds| ds.iter().position(|d| *d == Some(owner))) {
+            DefaultKind::Nominal(field_idx)
+        } else if let Some((rk, rec_idx)) = self
+            .field_defaults
+            .iter()
+            .find_map(|(&rk, ds)| (rk != item_ck).then(|| ds.iter().position(|d| *d == Some(owner)).map(|j| (rk, j))).flatten())
+        {
+            DefaultKind::Record(rk, rec_idx)
+        } else {
             return;
         };
         let Some(owner_text) = super::locals::owner_scanned_text(names, item) else {
             return;
         };
+        let lower_key = if names.crate_of(item).is_some() { item } else { names.member_owner(item).map_or(item, |(c, _)| c) };
         let alloc = self.tys.alloc();
-        let Ok(low) = self.lower_alloc_here(names, item, owner_text, alloc) else {
+        let Ok(low) = self.lower_alloc_here(names, lower_key, owner_text, alloc) else {
             return;
         };
         let v = low.view();
-        let mut seen = 0usize;
-        let is_enum = matches!(names.detail_of(item), Some(ItemDetail::Enum));
-        let mut found: Option<&str> = None;
-        if is_enum {
-            if let Ok(variants) = v.rows(v.list(head::FIELDS)) {
-                'outer: for &vn in variants {
-                    let Ok(var) = lf::Variant::decode(vn) else { continue };
-                    let Ok(rows) = v.rows(var.fields) else { continue };
-                    for &fn_row in rows {
-                        if seen == field_idx {
-                            if let Ok(f) = lf::Field::decode(fn_row)
-                                && let Some(c) = f.default
-                                && let Ok(at) = v.const_range(c)
-                                && let Ok(val) = v.text_at(at)
-                            {
-                                found = Some(val.trim());
+        let mut found: Option<(&str, &str)> = None;
+        match kind {
+            DefaultKind::Nominal(field_idx) => {
+                let mut seen = 0usize;
+                let is_enum = matches!(names.detail_of(item), Some(ItemDetail::Enum));
+                if is_enum {
+                    if let Ok(variants) = v.rows(v.list(head::FIELDS)) {
+                        'outer: for &vn in variants {
+                            let Ok(var) = lf::Variant::decode(vn) else { continue };
+                            let Ok(rows) = v.rows(var.fields) else { continue };
+                            for &fn_row in rows {
+                                if seen == field_idx {
+                                    if let Ok(f) = lf::Field::decode(fn_row)
+                                        && let Some(c) = f.default
+                                        && let Ok(ty_at) = v.type_range(f.ty)
+                                        && let Ok(ty_s) = v.text_at(ty_at)
+                                        && let Ok(at) = v.const_range(c)
+                                        && let Ok(val) = v.text_at(at)
+                                    {
+                                        found = Some((ty_s.trim(), val.trim()));
+                                    }
+                                    break 'outer;
+                                }
+                                seen += 1;
                             }
-                            break 'outer;
                         }
-                        seen += 1;
+                    }
+                } else if let Ok(rows) = v.rows(v.list(head::FIELDS))
+                    && let Some(&fn_row) = rows.get(field_idx)
+                    && let Ok(f) = lf::Field::decode(fn_row)
+                    && let Some(c) = f.default
+                    && let Ok(ty_at) = v.type_range(f.ty)
+                    && let Ok(ty_s) = v.text_at(ty_at)
+                    && let Ok(at) = v.const_range(c)
+                    && let Ok(val) = v.text_at(at)
+                {
+                    found = Some((ty_s.trim(), val.trim()));
+                }
+            }
+            DefaultKind::Record(rk, rec_idx) => {
+                'records: for i in 0..v.types.len() {
+                    let Ok(ti) = u32::try_from(i) else { break };
+                    let Ok(lf::TypeRef::Record(fields)) = v.ty(lf::TypeId(ti)) else { continue };
+                    let Ok(rows) = v.rows(fields) else { continue };
+                    for &row in rows {
+                        let Ok(f) = lf::Field::decode(row) else { continue };
+                        let Some(c) = f.default else { continue };
+                        let (Ok(ty_at), Ok(val_at)) = (v.type_range(f.ty), v.const_range(c)) else { continue };
+                        let (Ok(ty_s), Ok(val_s)) = (v.text_at(ty_at), v.text_at(val_at)) else { continue };
+                        let (ty_text, value_text) = (ty_s.trim(), val_s.trim());
+                        let site = blaze_scope::expansion_origins::offset_in(owner_text, value_text)
+                            .and_then(|off| super::anon::head_site_of(names, item, off, value_text));
+                        let label = Self::record_default_member_name(rec_idx, ty_text, value_text, site, alloc);
+                        if super::keys::member_key_of(rk, MemberKind::Anon, label.as_str()) == owner {
+                            found = Some((ty_text, value_text));
+                            break 'records;
+                        }
                     }
                 }
             }
-        } else if let Ok(rows) = v.rows(v.list(head::FIELDS))
-            && let Some(&fn_row) = rows.get(field_idx)
-            && let Ok(f) = lf::Field::decode(fn_row)
-            && let Some(c) = f.default
-            && let Ok(at) = v.const_range(c)
-            && let Ok(val) = v.text_at(at)
+        }
+        let Some((ty_text, value_text)) = found else { return };
+        let ty_prefix = "const _: ".len();
+        let val_prefix = ty_prefix + ty_text.len() + " = ".len();
+        if blaze_file_items::nested::may_write_block(value_text)
+            && let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, value_text)
+            && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from(val_prefix))
         {
-            found = Some(val.trim());
-        }
-        let Some(value_text) = found else { return };
-        if !blaze_file_items::nested::may_write_block(value_text) {
-            return;
-        }
-        let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, value_text) else { return };
-        let Some(prefix_usize) = text.len().checked_sub(value_text.len()).and_then(|n| n.checked_sub(1)) else { return };
-        if let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from(prefix_usize)) {
             self.locals.file_head_anon(owner, super::anon::HeadOwner { item, offset, len }, &[], prefix);
+        }
+        if let Some(marks) = self.owner_item_marks(names, item, owner_text) {
+            let _ = super::anon::file_parts_marks(&mut self.anon_marks, owner, text, Some(marks), &[(ty_prefix, ty_text), (val_prefix, value_text)], alloc);
         }
     }
 
@@ -5417,7 +5530,7 @@ impl<'n> Store<'n> {
         // (D148), never `RegionRefusal::NoContainer` for a header that is here. One the record
         // or `trait_head` filed stands.
         self.container_regions.insert_absent(ck, ContainerRegions::of_header(v, None, alloc)?);
-        for (cond_key, head_owner, prefix) in Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, owner, module, v, &env, &bounds, own + 1, keys, &mut preds)? {
+        for (cond_key, head_owner, prefix) in Self::file_where_consts(names, &mut self.tys, &self.locals, &mut self.anon_marks, &self.fns, &self.preds, ck, key, owner, b.marks, module, v, &env, &bounds, own + 1, keys, &mut preds)? {
             self.locals.file_head_anon(cond_key, head_owner, &[], prefix);
         }
         let mut inherited = blaze_own::Vec::with_capacity_in(preds.clauses.len() + 1, alloc);
@@ -5745,18 +5858,26 @@ impl<'n> Store<'n> {
                 field_default_allowed(names, key, kind, ctor, r)?;
                 let ty_text = v.text_at(v.type_range(f.ty)?)?.trim();
                 let value_text = v.text_at(at)?.trim();
-                // Keyed by the ADT, the field's place and the default's text (rule 21: the
-                // text is the value's input; the ADT's generics are its head's).
-                let label = blaze_own::format_in!(alloc, "field default {vi}.{j}: {ty_text} = {value_text}");
+                let owner_pair = owner.or_else(|| super::locals::owner_scanned_text(names, key).map(|t| (key, t)));
+                let located = owner_pair.and_then(|(owner_item, owner_text)| {
+                    blaze_scope::expansion_origins::offset_in(owner_text, value_text).map(|offset| (owner_item, offset))
+                });
+                let site = located.and_then(|(owner_item, offset)| super::anon::head_site_of(names, owner_item, offset, value_text));
+                // Keyed by the ADT, the field's place, the default's text, and (when it calls a
+                // macro) its observable source site (rule 21: the text and site are its inputs).
+                let label = Self::field_default_member_name(vi, j, ty_text, value_text, site, alloc);
                 let dk = keys
                     .member(ck, MemberKind::Anon, label.as_str())
                     .map_err(|c| Why::Program(format!("{c}").into_boxed_str(), r))?;
                 let src = blaze_own::format_in!(alloc, "const _: {ty_text} = {value_text};");
                 let text: &'n str = self.locals.keep_text(src.as_str());
-                if let Some((owner_item, owner_text)) = owner
+                let ty_prefix = "const _: ".len();
+                let val_prefix = ty_prefix + ty_text.len() + " = ".len();
+                super::anon::file_parts_marks(&mut self.anon_marks, dk, text, marks, &[(ty_prefix, ty_text), (val_prefix, value_text)], alloc)
+                    .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), r))?;
+                if let Some((owner_item, offset)) = located
                     && blaze_file_items::nested::may_write_block(value_text)
-                    && let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, value_text)
-                    && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from("const _: ".len() + ty_text.len() + " = ".len()))
+                    && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from(val_prefix))
                 {
                     self.locals.file_head_anon(dk, super::anon::HeadOwner { item: owner_item, offset, len }, &[], prefix);
                 }
@@ -5773,7 +5894,7 @@ impl<'n> Store<'n> {
         let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
-        for (cond_key, head_owner, prefix) in Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, owner, module, v, &env, &bounds, generics, keys, &mut preds)? {
+        for (cond_key, head_owner, prefix) in Self::file_where_consts(names, &mut self.tys, &self.locals, &mut self.anon_marks, &self.fns, &self.preds, ck, key, owner, b.marks, module, v, &env, &bounds, generics, keys, &mut preds)? {
             self.locals.file_head_anon(cond_key, head_owner, &[], prefix);
         }
         // D148: the ADT's regions (its own lifetimes, its clauses' columns, its fields'), filed
@@ -6220,7 +6341,7 @@ impl<'n> Store<'n> {
         let env = Env { self_assoc: &assoc, ..env };
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
-        for (cond_key, head_owner, prefix) in Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, owner, module, v, &env, &bounds, generics, keys, &mut preds)? {
+        for (cond_key, head_owner, prefix) in Self::file_where_consts(names, &mut self.tys, &self.locals, &mut self.anon_marks, &self.fns, &self.preds, ck, key, owner, b.marks, module, v, &env, &bounds, generics, keys, &mut preds)? {
             self.locals.file_head_anon(cond_key, head_owner, &[], prefix);
         }
         let mut consts = blaze_own::Vec::with_capacity_in(const_texts.len(), alloc);
@@ -6672,8 +6793,12 @@ impl<'n> Store<'n> {
                 let r = v.site(at)?;
                 let ty_text = v.text_at(v.type_range(fty)?)?.trim();
                 let value_text = v.text_at(at)?.trim();
-                let mut label = blaze_own::String::new_in(alloc);
-                let _ = core::fmt::Write::write_fmt(&mut label, format_args!("record default {j}: {ty_text} = {value_text}"));
+                let owner_pair = owner.or_else(|| super::locals::owner_scanned_text(names, lib).map(|t| (lib, t)));
+                let located = owner_pair.and_then(|(owner_item, owner_text)| {
+                    blaze_scope::expansion_origins::offset_in(owner_text, value_text).map(|offset| (owner_item, offset))
+                });
+                let site = located.and_then(|(owner_item, offset)| super::anon::head_site_of(names, owner_item, offset, value_text));
+                let label = Self::record_default_member_name(j, ty_text, value_text, site, alloc);
                 let dk = keys
                     .member(rk, MemberKind::Anon, &label)
                     .map_err(|e| {
@@ -6684,10 +6809,13 @@ impl<'n> Store<'n> {
                 let mut src = blaze_own::String::new_in(alloc);
                 let _ = core::fmt::Write::write_fmt(&mut src, format_args!("const _: {ty_text} = {value_text};"));
                 let text: &'n str = self.locals.keep_text(&src);
-                if let Some((owner_item, owner_text)) = owner
+                let ty_prefix = "const _: ".len();
+                let val_prefix = ty_prefix + ty_text.len() + " = ".len();
+                super::anon::file_parts_marks(&mut self.anon_marks, dk, text, marks, &[(ty_prefix, ty_text), (val_prefix, value_text)], alloc)
+                    .map_err(|e| Why::Program(format!("{e}").into_boxed_str(), r))?;
+                if let Some((owner_item, offset)) = located
                     && blaze_file_items::nested::may_write_block(value_text)
-                    && let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, value_text)
-                    && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from("const _: ".len() + ty_text.len() + " = ".len()))
+                    && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from(val_prefix))
                 {
                     self.locals.file_head_anon(dk, super::anon::HeadOwner { item: owner_item, offset, len }, &[], prefix);
                 }
@@ -7153,7 +7281,7 @@ impl<'n> Store<'n> {
         }
         b.predicates(&mut self.tys, &env, v, parent, None, self.sized, &mut preds)?;
         b.impl_bounds(&mut self.tys, &env, v, &anon[..params_end], self.sized, &mut preds)?;
-        let where_anons = Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, key, lib, owner, env.module, v, &env, &bounds, parent + own, keys, &mut preds)?;
+        let where_anons = Self::file_where_consts(names, &mut self.tys, &self.locals, &mut self.anon_marks, &self.fns, &self.preds, key, lib, owner, b.marks, env.module, v, &env, &bounds, parent + own, keys, &mut preds)?;
         // The bounds' E0405s: one per bound path (the parameter-bound walk and the predicates
         // walk each meet it), in text order. One the words cannot be made for (a path not in
         // the fn's own text) stays the head's error, as before.

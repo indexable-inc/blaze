@@ -1481,18 +1481,27 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
     if !store.fns.contains_key(&key) && !store.fn_gaps.contains_key(&key) {
         if let Some(want) = super::heads::member_head_want(names, keys, key) {
             store.ensure(names, keys, want).map_err(|error| BodyError::Head { item: want.key(), error })?;
+        } else if let Some(&want) = store.where_const_owners.get(&key) {
+            store.ensure_where_const_head(names, keys, key).map_err(|error| BodyError::Head { item: want.key(), error })?;
         }
     }
-    let head: &FnHead<'n> = match store.fns.get(&key) {
-        Some(head) => head,
+    let (head_lib, head_text, head_text_inline, head_has_body) = match store.fns.get(&key) {
+        Some(head) => (head.lib, head.text, head.text_inline, head.has_body),
         // A head refused is its `fn_gaps` row (`Store::member_fn_head` files it and lets the
         // container's head go on): that reason, never "no head" (census r16: 455 fns of tempo
         // were `NoHead` whose head had been refused for a reason of its own).
         None => return Err(refused_head(names, keys, store, key)),
     };
-    if !head.has_body {
+    if !head_has_body {
         return Err(BodyError::NoBody(key));
     }
+    if head_text_inline {
+        store.ensure_field_default_site(names, head_lib, key, head_text);
+    }
+    let head: &FnHead<'n> = match store.fns.get(&key) {
+        Some(head) => head,
+        None => return Err(refused_head(names, keys, store, key)),
+    };
     let krate = names.crate_of(head.lib).ok_or(BodyError::NoText(head.lib))?;
     // The marks of the member's text, as its head read them (heads/member_fn.rs, heads.rs
     // `trait_members`): the expansion of the call in the container's body that wrote it, or
@@ -1702,7 +1711,6 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let edition = names.edition_of(krate).ok_or(BodyError::NoText(item))?;
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
-    store.ensure_field_default_head_anon(names, item, owner, text);
     // The body's blocks the names library made modules: a call in one, written by hand or by
     // an expansion, reads its path there (scoped.rs `body_blocks`). Uses `store.locals.body_block_modules`
     // so top-level items/members, local fns/consts/statics whose blocks the names library wrote
@@ -2061,7 +2069,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     if Store::view_has_record_type(&view) {
         let body_env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
         let rec_owner = names.seeded_text_of(item).map(|it| (item, it.text));
-        store.register_record_defaults(names, keys, item, rec_owner, &body_env, None, &view).map_err(|why| BodyError::Record { item, owner, why })?;
+        store.register_record_defaults(names, keys, item, rec_owner, &body_env, text_marks, &view).map_err(|why| BodyError::Record { item, owner, why })?;
     }
 
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;

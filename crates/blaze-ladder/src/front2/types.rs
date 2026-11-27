@@ -831,26 +831,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         }
         let offset = blaze_scope::expansion_origins::offset_in(owner_text, text)?;
         let len = u32::try_from(text.len()).ok()?;
-        let site = if text.contains('!') {
-            let header_off = self
-                .resolver
-                .names
-                .seeded_text_of(item)
-                .and_then(|it| it.impl_header.and_then(|hdr| blaze_scope::expansion_origins::offset_in(it.text, hdr)))
-                .unwrap_or(0);
-            blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
-                let scratch = blaze_own::Erased::new(frame);
-                let (krate, file_text, start, by_call) = crate::front2::program::lazy::body_place(self.resolver.names, item, scratch.handle()).ok()?;
-                let at = if by_call { start } else { start.checked_add(header_off)?.checked_add(offset)? };
-                let at = usize::try_from(at).ok()?;
-                let line = blaze_expand::PlaceOf::Line.counted(file_text, at)?;
-                let col = blaze_expand::PlaceOf::Column.counted(file_text, at)?;
-                let file = super::body_host::body_file(self.resolver.names, krate, item).map(|f| f.shown);
-                Some(super::anon::HeadSite { line, col, file })
-            })
-        } else {
-            None
-        };
+        let site = super::anon::head_site_of(self.resolver.names, item, offset, text);
         Some((super::anon::HeadOwner { item, offset, len }, site))
     }
     /// The portable type of `t`, by a work list (no recursion).
