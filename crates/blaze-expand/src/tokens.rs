@@ -523,15 +523,21 @@ impl<'a> TokenStream<'a> {
     }
 
     /// The [`crate::origin_column::TextMark`] projected onto rendered text or body words for a
-    /// token of `ctx`: the innermost non-transparent mark when one exists (preserving `$crate`,
-    /// def-site, and local hygiene), or else the innermost [`Transparency::Transparent`] mark
-    /// (preserving the emitting macro's edition for edition-gated checks such as Rust 2024
-    /// binding modifiers while hygiene consumers treat `Transparent` identically to unmarked).
-    /// Returns `None` at a root context (tokens written in a file or included via `include!`).
+    /// token of `ctx`: hygiene (`site` and `transparency`) comes from the innermost
+    /// non-transparent mark when one exists (preserving `$crate`, def-site, and local hygiene),
+    /// or else from the innermost [`Transparency::Transparent`] mark (which hygiene consumers
+    /// treat identically to unmarked); `edition` always comes from the innermost mark node so a
+    /// `Transparent` (`Span::call_site()`) proc-macro invoked inside a `SemiOpaque`/`Opaque`
+    /// macro preserves its own defining edition (and vice versa). Returns `None` at a root
+    /// context (tokens written in a file or included via `include!`).
     pub fn text_mark(&self, ctx: Ctx) -> Option<crate::origin_column::TextMark> {
-        self.non_transparent_mark(ctx)
-            .or_else(|| self.node(ctx).map(|node| node.mark))
-            .map(crate::origin_column::TextMark::of)
+        let innermost = self.node(ctx)?.mark;
+        let hygiene = self.non_transparent_mark(ctx).unwrap_or(innermost);
+        Some(crate::origin_column::TextMark {
+            site: hygiene.site,
+            transparency: hygiene.transparency,
+            edition: innermost.edition,
+        })
     }
 
     /// The index of the delimiter that closes the group opened at `open`.

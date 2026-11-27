@@ -74,8 +74,24 @@ impl TextMark {
     /// bindings match across inner calls (`proptest!`) while call-site parameters stay
     /// hygienically separate from def-site template identifiers (`cold!` in `blaze-sys`).
     pub fn as_outer_mark(self) -> crate::tokens::Mark {
+        // Hash only hygiene identity (`site` + `transparency`), not `edition`: when a
+        // `Transparent` proc-macro of one edition is invoked inside a `SemiOpaque`/`Opaque`
+        // macro of another edition, its tokens carry the enclosing macro's `site`/`transparency`
+        // with the proc-macro's `edition` and must still share `local_hygiene` with the enclosing
+        // macro's own tokens.
         let mut hasher = blaze_ids::Hasher::new("blaze v2 text mark expansion 1");
-        hasher.part(&self.to_bytes());
+        hasher.part(&self.site.krate.0.0);
+        match self.site.module {
+            Some(module) => {
+                hasher.part(&1u32.to_le_bytes());
+                hasher.part(&module.0.0);
+            }
+            None => {
+                hasher.part(&0u32.to_le_bytes());
+                hasher.part(&[0u8; 32]);
+            }
+        }
+        hasher.part(&u32::from(self.transparency.byte()).to_le_bytes());
         crate::tokens::Mark {
             of: crate::tokens::MarkOf::Outer(hasher.finish()),
             transparency: self.transparency,
