@@ -9,10 +9,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use blaze_own::Alloc;
+use blaze_own::{Alloc, Share};
 use blaze_sh::builtins::{BUILTIN_SPECS, find_spec};
 use blaze_sh::lex::{HighlightSpan, highlight, is_incomplete};
-use blaze_sh::{Bytes, EngineState};
+use blaze_sh::{Bytes, EngineState, Value};
 use blaze_vim::{
     CursorShape, KeyEvent as VimKeyEvent, Mode as VimMode, Outcome as VimOutcome, ShellObjects,
     TextBuffer, VimMachine, VimOpts,
@@ -1837,7 +1837,18 @@ impl Editor {
             return false;
         }
         let prev_non_ws = before[..token_start].trim_end();
-        if prefix.starts_with('-')
+        let at_expr_start = prev_non_ws.is_empty()
+            || prev_non_ws.ends_with('|')
+            || prev_non_ws.ends_with(';')
+            || prev_non_ws.ends_with('(');
+        let is_dot_subject_path = at_expr_start
+            && prefix.starts_with('.')
+            && !prefix.starts_with("./")
+            && !prefix.starts_with("..");
+        let is_var_dot_path = prefix.starts_with('$') && prefix.contains('.');
+        if is_dot_subject_path
+            || is_var_dot_path
+            || prefix.starts_with('-')
             || prev_non_ws.ends_with('|')
             || (before.ends_with(' ') && expects_column_arg(before))
             || (before.ends_with(' ')
@@ -2321,55 +2332,74 @@ impl Editor {
             || prev_non_ws.ends_with(';')
             || prev_non_ws.ends_with('\n');
 
+        let at_expr_start = at_cmd_pos || prev_non_ws.ends_with('(');
         let mut scored: Vec<(i32, CompletionItem)> = Vec::new();
 
-        if let Some(var_prefix) = prefix.strip_prefix('$') {
-            for (name, detail, doc) in [
-                ("env", "record", "Environment variables record ($env.PATH, $env.HOME)"),
-                ("in", "any", "Value piped from the previous stage"),
-            ] {
-                if let Some((score, mut idxs)) = fuzzy_match_score(name, var_prefix) {
-                    for i in &mut idxs {
-                        *i += 1; // offset past `$`
-                    }
-                    scored.push((
-                        score + 20,
-                        CompletionItem {
-                            label: format!("${name}"),
-                            insert: format!("${name}"),
-                            detail: detail.to_owned(),
-                            doc: doc.to_owned(),
-                            kind: CompletionKind::Variable,
-                            icon: None,
-                            avatar_path: None,
-                            fs_meta: None,
-                            match_indices: idxs,
-                        },
-                    ));
-                }
+        if at_expr_start
+            && prefix.starts_with('.')
+            && !prefix.starts_with("./")
+            && !prefix.starts_with("..")
+        {
+            if let Some(slot) = state.get_var("_") {
+                collect_value_path_completions(&slot.value, "", &prefix[1..], &mut scored);
             }
-            state.vars.for_each(&mut |k, slot| {
-                if let Some((score, mut idxs)) = fuzzy_match_score(k.as_ref(), var_prefix) {
-                    for i in &mut idxs {
-                        *i += 1;
-                    }
-                    let ty = slot.value.type_name().to_owned();
-                    scored.push((
-                        score + 10,
-                        CompletionItem {
-                            label: format!("${}", k.as_ref()),
-                            insert: format!("${}", k.as_ref()),
-                            detail: ty.clone(),
-                            doc: format!("session variable · {ty}"),
-                            kind: CompletionKind::Variable,
-                            icon: None,
-                            avatar_path: None,
-                            fs_meta: None,
-                            match_indices: idxs,
-                        },
-                    ));
+        } else if let Some(var_prefix) = prefix.strip_prefix('$') {
+            if let Some((var_name, rest_after_dot)) = var_prefix.split_once('.') {
+                let base_prefix = format!("${var_name}");
+                if var_name == "env" {
+                    let env_val = Value::Record(state.env_record());
+                    collect_value_path_completions(&env_val, &base_prefix, rest_after_dot, &mut scored);
+                } else if let Some(slot) = state.get_var(var_name) {
+                    collect_value_path_completions(&slot.value, &base_prefix, rest_after_dot, &mut scored);
                 }
-            });
+            } else {
+                for (name, detail, doc) in [
+                    ("env", "record", "Environment variables record ($env.PATH, $env.HOME)"),
+                    ("in", "any", "Value piped from the previous stage"),
+                ] {
+                    if let Some((score, mut idxs)) = fuzzy_match_score(name, var_prefix) {
+                        for i in &mut idxs {
+                            *i += 1; // offset past `$`
+                        }
+                        scored.push((
+                            score + 20,
+                            CompletionItem {
+                                label: format!("${name}"),
+                                insert: format!("${name}"),
+                                detail: detail.to_owned(),
+                                doc: doc.to_owned(),
+                                kind: CompletionKind::Variable,
+                                icon: None,
+                                avatar_path: None,
+                                fs_meta: None,
+                                match_indices: idxs,
+                            },
+                        ));
+                    }
+                }
+                state.vars.for_each(&mut |k, slot| {
+                    if let Some((score, mut idxs)) = fuzzy_match_score(k.as_ref(), var_prefix) {
+                        for i in &mut idxs {
+                            *i += 1;
+                        }
+                        let ty = slot.value.type_name().to_owned();
+                        scored.push((
+                            score + 10,
+                            CompletionItem {
+                                label: format!("${}", k.as_ref()),
+                                insert: format!("${}", k.as_ref()),
+                                detail: ty.clone(),
+                                doc: format!("session variable · {ty}"),
+                                kind: CompletionKind::Variable,
+                                icon: None,
+                                avatar_path: None,
+                                fs_meta: None,
+                                match_indices: idxs,
+                            },
+                        ));
+                    }
+                });
+            }
         } else if prefix.starts_with('-') {
             let stage_start = before.rfind(['|', ';', '\n']).map_or(0, |p| p + 1);
             let stage_prefix = before[stage_start..token_start].trim();
@@ -3313,16 +3343,21 @@ impl Editor {
         self.clamp_cursor();
         let start = clamp_char_boundary(&self.text, self.completion_replace_start).min(self.cursor);
         let mut insert = item.insert;
-        if matches!(
-            item.kind,
-            CompletionKind::Abbrev
-                | CompletionKind::Builtin
-                | CompletionKind::Subcommand
-                | CompletionKind::Def
-                | CompletionKind::Keyword
-                | CompletionKind::External
-                | CompletionKind::Column
-        ) {
+        let is_cell_path_insert = insert.starts_with('.')
+            || insert.ends_with('.')
+            || (insert.starts_with('$') && insert.contains('.'));
+        if !is_cell_path_insert
+            && matches!(
+                item.kind,
+                CompletionKind::Abbrev
+                    | CompletionKind::Builtin
+                    | CompletionKind::Subcommand
+                    | CompletionKind::Def
+                    | CompletionKind::Keyword
+                    | CompletionKind::External
+                    | CompletionKind::Column
+            )
+        {
             let needs_space = !self.text[self.cursor..].starts_with(' ');
             if needs_space {
                 insert.push(' ');
@@ -4708,6 +4743,218 @@ fn nth_char_byte_offset(line: &str, n: usize) -> usize {
     line.char_indices().nth(n).map_or(line.len(), |(idx, _)| idx)
 }
 
+/// Walk already-completed dot segments (`rest_after_first_dot`, e.g. `package.ver` or `pac` or ``)
+/// through a live structured [`Value`] (`$_`, `$lock`, `$env`, …) and emit typed field/column/index
+/// completions with live value previews. Selecting a nested container (`Record`, `Table`, `List`,
+/// `Output`) inserts a trailing `.` so pressing `Tab` immediately drills into the next level!
+fn collect_value_path_completions(
+    root: &Value<'_>,
+    base_prefix: &str,
+    rest_after_first_dot: &str,
+    scored: &mut Vec<(i32, CompletionItem)>,
+) {
+    let parts: Vec<&str> = rest_after_first_dot.split('.').collect();
+    let (done_segs, leaf_prefix) = match parts.split_last() {
+        Some((last, init)) => (init, *last),
+        None => (&[][..], ""),
+    };
+
+    let mut cur = root.share();
+    let mut built_prefix = String::from(base_prefix);
+    for &seg in done_segs {
+        if seg.is_empty() {
+            return;
+        }
+        let clean_seg = seg.trim_end_matches('?');
+        let next = match &cur {
+            Value::Record(r) => r.get(clean_seg).map(Share::share),
+            Value::Table(t) => {
+                if let Ok(idx) = clean_seg.parse::<usize>() {
+                    t.row_record(idx).map(Value::Record)
+                } else {
+                    t.col_index(clean_seg)
+                        .and_then(|ci| t.cols.get(ci))
+                        .map(|c| Value::List(c.share()))
+                }
+            }
+            Value::List(items) => {
+                if let Ok(idx) = clean_seg.parse::<usize>() {
+                    items.get(idx).map(Share::share)
+                } else {
+                    // Record-list projection: inspect first matching record for nested completion
+                    items.iter().find_map(|it| match it {
+                        Value::Record(r) => r.get(clean_seg).map(Share::share),
+                        _ => None,
+                    })
+                }
+            }
+            Value::Output(o) => match clean_seg {
+                "stdout" => Some(o.stdout_value(Alloc::global())),
+                "stderr" => Some(o.stderr_value(Alloc::global())),
+                "exit_code" | "status" => Some(Value::Int(i64::from(o.exit_code))),
+                "duration" => Some(Value::Duration(o.duration)),
+                "events" | "chunks" | "streams" => Some(Value::Table(o.events_table(Alloc::global()))),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(nval) = next else {
+            return;
+        };
+        built_prefix.push('.');
+        built_prefix.push_str(seg);
+        cur = nval;
+    }
+
+    let preview_val = |v: &Value<'_>| -> (String, String, bool) {
+        let is_container = matches!(
+            v,
+            Value::Record(_) | Value::Table(_) | Value::List(_) | Value::Output(_)
+        );
+        match v {
+            Value::Record(r) => {
+                let mut ks = String::new();
+                for (i, (k, _)) in r.iter().take(4).enumerate() {
+                    if i > 0 {
+                        ks.push_str(", ");
+                    }
+                    ks.push_str(k);
+                }
+                if r.len() > 4 {
+                    ks.push_str(&format!(", +{}", r.len() - 4));
+                }
+                (format!("record{{{}}}", r.len()), ks, is_container)
+            }
+            Value::Table(t) => (
+                format!("table[{}]", t.nrows()),
+                format!("{} rows × {} cols", t.nrows(), t.ncols()),
+                is_container,
+            ),
+            Value::List(items) => (
+                format!("list[{}]", items.len()),
+                format!("{} items", items.len()),
+                is_container,
+            ),
+            Value::Output(o) => (
+                "output".to_owned(),
+                format!("exit {} · {} B stdout", o.exit_code, o.stdout_len()),
+                is_container,
+            ),
+            other => {
+                let mut s = blaze_own::AString::new_in(Alloc::global());
+                let _ = other.format_cell(&mut s);
+                let mut preview = s.as_str().to_owned();
+                if preview.chars().count() > 52 {
+                    let cut = preview.char_indices().nth(51).map(|(i, _)| i).unwrap_or(preview.len());
+                    preview.truncate(cut);
+                    preview.push('…');
+                }
+                (other.type_name().to_owned(), preview, false)
+            }
+        }
+    };
+
+    let push_field = |scored: &mut Vec<(i32, CompletionItem)>,
+                      rank_bonus: i32,
+                      key: &str,
+                      detail: String,
+                      doc: String,
+                      is_container: bool| {
+        if let Some((score, idxs)) = fuzzy_match_score(key, leaf_prefix) {
+            let mut insert = String::with_capacity(built_prefix.len() + key.len() + 2);
+            insert.push_str(&built_prefix);
+            insert.push('.');
+            insert.push_str(key);
+            if is_container {
+                insert.push('.');
+            }
+            scored.push((
+                score + 80 + rank_bonus,
+                CompletionItem {
+                    label: key.to_owned(),
+                    insert,
+                    detail,
+                    doc,
+                    kind: CompletionKind::Column,
+                    icon: None,
+                    avatar_path: None,
+                    fs_meta: None,
+                    match_indices: idxs,
+                },
+            ));
+        }
+    };
+
+    match &cur {
+        Value::Record(r) => {
+            let total = r.len();
+            for (idx, (k, v)) in r.iter().enumerate() {
+                let (detail, doc, is_cont) = preview_val(v);
+                let rank = (total.saturating_sub(idx)).min(24) as i32;
+                push_field(scored, rank, k, detail, doc, is_cont);
+            }
+        }
+        Value::Table(t) => {
+            let ncols = t.ncols();
+            for ci in 0..ncols {
+                let cname = t.columns.get(ci).unwrap().as_ref();
+                let sample = t
+                    .cell(0, ci)
+                    .map(|v| {
+                        let (_, doc, _) = preview_val(v);
+                        doc
+                    })
+                    .unwrap_or_default();
+                let doc = if sample.is_empty() {
+                    format!("column · {} rows", t.nrows())
+                } else {
+                    format!("column ({} rows) · e.g. {sample}", t.nrows())
+                };
+                let rank = (ncols.saturating_sub(ci)).min(24) as i32 + 4;
+                push_field(scored, rank, cname, "col".to_owned(), doc, false);
+            }
+            for ri in 0..t.nrows().min(4) {
+                let idx_s = ri.to_string();
+                let doc = format!("row {ri} of {}", t.nrows());
+                push_field(scored, 0, &idx_s, "row".to_owned(), doc, true);
+            }
+        }
+        Value::List(items) => {
+            // If list of records, suggest record keys first!
+            if let Some(Value::Record(first_rec)) = items.iter().find(|it| matches!(it, Value::Record(_))) {
+                let total = first_rec.len();
+                for (idx, (k, v)) in first_rec.iter().enumerate() {
+                    let (detail, doc, _) = preview_val(v);
+                    let rank = (total.saturating_sub(idx)).min(24) as i32 + 6;
+                    push_field(scored, rank, k, detail, doc, false);
+                }
+            }
+            for i in 0..items.len().min(6) {
+                if let Some(v) = items.get(i) {
+                    let (detail, doc, is_cont) = preview_val(v);
+                    let idx_s = i.to_string();
+                    push_field(scored, 0, &idx_s, detail, doc, is_cont);
+                }
+            }
+        }
+        Value::Output(o) => {
+            for (idx, (name, detail, doc)) in [
+                ("stdout", "string", format!("{} bytes stdout", o.stdout_len())),
+                ("stderr", "string", format!("{} bytes stderr", o.stderr_len())),
+                ("exit_code", "int", format!("= {}", o.exit_code)),
+                ("duration", "duration", "command runtime".to_owned()),
+                ("events", "table", "time-interleaved stream chunks".to_owned()),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                push_field(scored, (10 - idx as i32).max(0), name, detail.to_owned(), doc, false);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4939,5 +5186,44 @@ mod tests {
         assert!(ed.completions.is_empty());
         ed.refresh_assist(&state, &[], false);
         assert!(ed.completions.is_empty(), "Esc suppression must keep popup closed on same token");
+    }
+
+    #[test]
+    fn dot_subject_and_var_path_completions_drill_into_previous_output() {
+        let alloc = Alloc::global();
+        let mut state = EngineState::new("/tmp", &[], alloc);
+        let mut pkg = blaze_sh::Record::new(alloc);
+        pkg.insert(blaze_own::Rc::from_str_in("name", alloc), Value::string("hello-world", alloc));
+        pkg.insert(blaze_own::Rc::from_str_in("version", alloc), Value::string("0.1.0", alloc));
+        pkg.insert(blaze_own::Rc::from_str_in("edition", alloc), Value::string("blaze-2026.11", alloc));
+        let mut root = blaze_sh::Record::new(alloc);
+        root.insert(blaze_own::Rc::from_str_in("package", alloc), Value::Record(pkg));
+        state.set_var("_", Value::Record(root.clone()), false);
+        state.set_var("lock", Value::Record(root), false);
+
+        let mut ed = Editor::new();
+
+        // 1. Typing `.pac` auto-opens with `package` selected #1 and drills into `.package.` on Tab!
+        ed.set_text_initial(".pac".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert_eq!(ed.completions.len(), 1);
+        assert_eq!(ed.completions[0].label, "package");
+        assert_eq!(ed.completions[0].insert, ".package.");
+        assert!(ed.apply_selected_completion());
+        assert_eq!(ed.text, ".package.");
+
+        // 2. Refreshing after `.package.` immediately shows `name`, `version`, `edition` with live previews!
+        ed.refresh_assist(&state, &[], false);
+        assert_eq!(ed.completions.len(), 3);
+        let ver = ed.completions.iter().find(|c| c.label == "version").expect("version field");
+        assert_eq!(ver.insert, ".package.version");
+        assert_eq!(ver.doc, "0.1.0");
+
+        // 3. Typing `$lock.package.v` completes `$lock.package.version` without trailing space.
+        ed.set_text_initial("$lock.package.v".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert_eq!(ed.completions[0].label, "version");
+        assert!(ed.apply_selected_completion());
+        assert_eq!(ed.text, "$lock.package.version");
     }
 }

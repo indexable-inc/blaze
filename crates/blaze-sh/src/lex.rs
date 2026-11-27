@@ -2025,6 +2025,47 @@ fn highlight_range<'a>(
                 at_stmt_start = true;
                 in_cmd_args = false;
             }
+            b'.' if expect_cmd && bytes.get(i + 1) != Some(&b'/') => {
+                // Leading `.` / `.package.version` implicit-subject cell path!
+                while i < limit && (bytes[i] == b'.' || (bytes[i] == b'?' && bytes.get(i + 1) == Some(&b'.'))) {
+                    let sep_len = if bytes[i] == b'?' { 2 } else { 1 };
+                    out.push(HighlightSpan {
+                        kind: HighlightKind::Punct,
+                        span: Span::from_usize(i, i + sep_len),
+                    });
+                    i += sep_len;
+                    let seg_start = i;
+                    if i < limit && bytes[i].is_ascii_digit() {
+                        while i < limit && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        out.push(HighlightSpan {
+                            kind: HighlightKind::Number,
+                            span: Span::from_usize(seg_start, i),
+                        });
+                    } else if i < limit && is_ident_start(bytes[i]) {
+                        while i < limit && (is_ident_continue(bytes[i]) || bytes[i] == b'-') {
+                            i += 1;
+                        }
+                        out.push(HighlightSpan {
+                            kind: HighlightKind::Var,
+                            span: Span::from_usize(seg_start, i),
+                        });
+                    } else {
+                        break;
+                    }
+                    if i < limit && bytes[i] == b'?' && bytes.get(i + 1) != Some(&b'.') {
+                        out.push(HighlightSpan {
+                            kind: HighlightKind::Punct,
+                            span: Span::from_usize(i, i + 1),
+                        });
+                        i += 1;
+                    }
+                }
+                expect_cmd = false;
+                at_stmt_start = false;
+                in_cmd_args = false;
+            }
             b'}' | b'[' | b']' | b',' | b':' | b'.' | b'?' => {
                 out.push(HighlightSpan {
                     kind: HighlightKind::Punct,

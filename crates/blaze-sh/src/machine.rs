@@ -850,6 +850,22 @@ impl<'a, 'm> Evaluator<'a, 'm> {
                 Ok(Value::Closure(Rc::new_in(data, alloc)))
             }
             ExprKind::Var(name) => self.eval_var(name.as_ref(), expr.span),
+            ExprKind::DotSubject => {
+                if let Some(row) = &self.row_ctx {
+                    Ok(row.share())
+                } else if !matches!(self.current_input, Value::Nothing) {
+                    Ok(self.current_input.share())
+                } else if let Some(slot) = self.state.get_var("_") {
+                    Ok(slot.value.share())
+                } else {
+                    Err(Control::Error(ShellError::new(
+                        ErrorKind::Undefined,
+                        expr.span,
+                        "no previous output (`$_`) or pipeline input for `.`",
+                        alloc,
+                    )))
+                }
+            }
             ExprKind::CellPath { base, steps } => {
                 let mut cur = self.eval_expr_inner(base, input, false)?;
                 for step in steps.iter() {

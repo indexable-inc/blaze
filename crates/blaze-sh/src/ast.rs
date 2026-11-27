@@ -178,6 +178,10 @@ pub enum ExprKind<'a> {
     },
     /// `$x` or `$in` or `$env` or `$it`.
     Var(ARc<'a, str>),
+    /// Leading `.` implicit subject (`.`, `.package.version`, `.0.name`):
+    /// resolves to the active row (`row_ctx`), piped input (`$in` when non-Nothing),
+    /// or previous command output (`$_`).
+    DotSubject,
     /// Cell-path projection: `base.field.0?.sub`.
     CellPath {
         base: blaze_own::ABox<'a, Expr<'a>>,
