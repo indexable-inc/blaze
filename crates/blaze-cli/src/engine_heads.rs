@@ -1650,7 +1650,9 @@ impl Subject {
 pub(crate) type Subjects = [Subject];
 
 /// The domain of a head cell ([`head_cell`]). 3: the cell holds its unit's crate prefix.
-const HEAD_CELL_DOMAIN: &str = "blaze-cli engine head cell 3";
+/// 4: the cell also holds the item's enclosing module key, so one physical file mounted in
+/// multiple distinct modules of the same unit (`#[path = "..."]`) freezes distinct cells per mount.
+const HEAD_CELL_DOMAIN: &str = "blaze-cli engine head cell 4";
 /// The domain of a head's item, of no unit ([`head_item`]).
 const HEAD_ITEM_DOMAIN: &str = "blaze-cli engine head item 1";
 /// The domain of a head task's source ([`plan_items`]). 2: its payload holds each run's cell
@@ -1696,19 +1698,20 @@ pub(crate) fn no_units_out(name: Name) -> ContentId {
 /// `checker_of`), which a head task's freeze under a unit and a reader in that unit both take
 /// from their own records' want, so a reader's want places the cell of ITS unit, by
 /// construction. Nothing of the machine (rule 25): a crate prefix is a hash of the crate's text.
-pub(crate) fn head_cell(want: Want, item: &str, member: Option<&str>, part: Cell) -> Cell {
-    head_cell_written(want, item, member, None, part)
+pub(crate) fn head_cell(want: Want, module: blaze_id::ItemKey, item: &str, member: Option<&str>, part: Cell) -> Cell {
+    head_cell_written(want, module, item, member, None, part)
 }
 
 /// [`head_cell`] of a head a macro (or a body's block) wrote under its entry: the cell holds
 /// where it was written ([`Written`]), so the heads of two derives at one struct, of two calls of
-/// one macro in an impl block or of two items of one expansion are two cells (rule 21). A file
-/// item's (`written: None`) is [`head_cell`]'s, unchanged: the written part is hashed only when
-/// there is one, after the fixed-size part, so no file item's cell moved and no domain is bumped.
-fn head_cell_written(want: Want, item: &str, member: Option<&str>, written: Option<Written>, part: Cell) -> Cell {
+/// one macro in an impl block or of two items of one expansion are two cells (rule 21). It also
+/// holds the item's enclosing `module` key, so one file mounted in multiple modules of the same
+/// unit (`#[path = "..."]`) gets one distinct cell per module mount while duplicate heads in the
+/// same module still collide and are refused.
+fn head_cell_written(want: Want, module: blaze_id::ItemKey, item: &str, member: Option<&str>, written: Option<Written>, part: Cell) -> Cell {
     let bytes = want_bytes(want);
     let mut h = blaze_ids::Hasher::new(HEAD_CELL_DOMAIN);
-    h.update(&bytes[1..9]).update(&head_item(want, item, member, written, part).0);
+    h.update(&bytes[1..9]).update(&module.0.0).update(&head_item(want, item, member, written, part).0);
     let digest = h.finish();
     let mut cell = [0u8; 16];
     cell.copy_from_slice(&digest.0[..16]);
@@ -2366,7 +2369,7 @@ impl<'s> Owners<'s> {
         let chain = crate::signature::stored_chain(view, cover);
         let entry = subject.signature_file.entry_from_chain(chain);
         let name = NamesSource::name_of(records, row.key).unwrap_or("");
-        let cell = head_cell_written(want, name, None, written, WHOLE);
+        let cell = head_cell_written(want, row.module, name, None, written, WHOLE);
         Some(HeadAt::Cell { cell: CellId { of: entry, cell }, file: subject.slot })
     }
 }
@@ -3336,19 +3339,19 @@ struct Walked<'n> {
 /// is [`file_rows`].
 fn walk_crate<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, k: usize, g: Alloc<'static>) -> Walked<'n> {
     let mut unlisted: Vec<(Name, &'static str), Alloc<'static>> = Vec::new_in(g);
-    let mut keys: Vec<blaze_id::ItemKey, Alloc<'static>> = Vec::new_in(g);
-    NamesSource::each_item(records, k, &mut |key, _| keys.push(key));
+    let mut keys: Vec<(blaze_id::ItemKey, blaze_id::ItemKey), Alloc<'static>> = Vec::new_in(g);
+    NamesSource::each_item(records, k, &mut |key, module| keys.push((key, module)));
     let krate = NamesSource::crate_key(records, k);
-    // (its text, its entry there, want, the item's name, an impl fn's name).
-    let mut wanted: Vec<(At, u32, Want, &'n str, Option<&'n str>), Alloc<'static>> = Vec::new_in(g);
+    // (its text, its entry there, its enclosing module, want, the item's name, an impl fn's name).
+    let mut wanted: Vec<(At, u32, blaze_id::ItemKey, Want, &'n str, Option<&'n str>), Alloc<'static>> = Vec::new_in(g);
     // Each item's and member's block text key, with where its body is written
     // (body_types/covered.rs `BlockHomes`): a key no block has is never asked.
     let mut blocks: Vec<(blaze_id::ItemKey, At, ItemIndex), Alloc<'static>> = Vec::new_in(g);
-    for key in keys.iter().copied() {
+    for (key, module) in keys.iter().copied() {
         let Ok(want) = by_origin::kind_of_lib(records, key).and_then(|kind| by_origin::item_want(records, kind)) else { continue };
         let Some(place) = place_by_row(records, k, key) else { continue };
         let item = NamesSource::name_of(records, key).unwrap_or("");
-        wanted.push((place.at, place.item.0, want, item, None));
+        wanted.push((place.at, place.item.0, module, want, item, None));
         if let Some(krate) = krate {
             blocks.push((crate::body_types::covered::block_key(krate, key), place.at, place.item));
         }
@@ -3363,27 +3366,27 @@ fn walk_crate<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, k: usize
                     blocks.push((crate::body_types::covered::block_key(krate, m.key), text, m.outline));
                 }
                 if let (Want::Impl(_), blaze_surface::ItemKind::Function, Some(name)) = (want, m.kind, m.name) {
-                    wanted.push((text, m.outline.0, Want::MemberFn(lib, member_key_of(checker_of(lib), MemberKind::Fn, name)), item, Some(name)));
+                    wanted.push((text, m.outline.0, module, Want::MemberFn(lib, member_key_of(checker_of(lib), MemberKind::Fn, name)), item, Some(name)));
                 }
             });
         }
     }
     blocks.sort_unstable_by_key(|(block, _, _)| *block);
     blocks.dedup_by_key(|(block, _, _)| *block);
-    // (file, the head placed: the file entry it or its outermost call is at, want, name, impl
-    // fn's name, the walk).
+    // (file, the head placed: the file entry it or its outermost call is at, module, want, name,
+    // impl fn's name, the walk).
     let mut placed: Vec<(u32, listing_record::PlacedHead<'n>), Alloc<'static>> = Vec::with_capacity_in(wanted.len(), g);
-    for &(at, item, want, name, member) in wanted.iter() {
+    for &(at, item, module, want, name, member) in wanted.iter() {
         match at {
-            At::File(file) => placed.push((file, listing_record::PlacedHead { top: item, want, name, member, walk: None })),
+            At::File(file) => placed.push((file, listing_record::PlacedHead { top: item, module, want, name, member, walk: None })),
             At::Expansion(from) => match crate::body_types::covered::written_path(texts, &blocks, from, Some(ItemIndex(item)), &mut |_| {}) {
-                Ok(path) => placed.push((path.top.0, listing_record::PlacedHead { top: path.top.1.0, want, name, member, walk: Some((path.steps, path.by)) })),
+                Ok(path) => placed.push((path.top.0, listing_record::PlacedHead { top: path.top.1.0, module, want, name, member, walk: Some((path.steps, path.by)) })),
                 Err(why) => unlisted.push((head_cell_id(want).of, why)),
             },
         }
     }
     // Every field in the order, so no order of the rows shows in a part's key (rule 25).
-    placed.sort_unstable_by_key(|(file, one)| (*file, one.top, want_bytes(one.want), one.walk.map(|(steps, _)| steps), one.name, one.member, one.walk.map(|(_, by)| by)));
+    placed.sort_unstable_by_key(|(file, one)| (*file, one.top, one.module, want_bytes(one.want), one.walk.map(|(steps, _)| steps), one.name, one.member, one.walk.map(|(_, by)| by)));
     // (file, the call: the file entry its outermost call is at, its key, its directory row).
     let mut calls: Vec<(u32, listing_record::PlacedCall), Alloc<'static>> = Vec::with_capacity_in(texts.len(), g);
     for at in 0..texts.len() {
@@ -3452,7 +3455,7 @@ fn file_rows<'n>(
         }
     }
     {
-        for &(_, listing_record::PlacedHead { top, want, name, member, walk }) in heads.iter() {
+        for &(_, listing_record::PlacedHead { top, module, want, name, member, walk }) in heads.iter() {
             // An entry no outline entry covers stands inside a body (an impl in a fn's body, a
             // body's block a call or `const _` wrote): a body's items have no `Signature` of their
             // own (D114 FACTS (iii)), so the head task of the entry whose body holds it freezes it
@@ -3474,7 +3477,7 @@ fn file_rows<'n>(
                 sig: head_cell_id(want).of,
                 entry,
                 file: subject.slot,
-                cell: head_cell_written(want, name, member, written, WHOLE),
+                cell: head_cell_written(want, module, name, member, written, WHOLE),
                 item: head_item(want, name, member, written, WHOLE),
                 want,
                 body_holds_items: body_holds_items(&outline, ItemIndex(top), cover),

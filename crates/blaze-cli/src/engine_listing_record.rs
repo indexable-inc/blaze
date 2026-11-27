@@ -59,7 +59,9 @@ use crate::engine_tasks::Outlined;
 use crate::names::expansion_texts::ExpansionTexts;
 
 /// The form's version: in both keys' hashes and in the bytes.
-pub(crate) const VERSION: u32 = 1;
+/// 2: `PlacedHead` holds each item's enclosing module key (`head_cell` v4) so a file mounted in
+/// multiple modules of one unit keys and freezes distinct cells per mount.
+pub(crate) const VERSION: u32 = 2;
 
 /// The key domain of a crate's join.
 const JOIN_KEY_DOMAIN: &str = "blaze-cli engine heads: a crate's listing record 1";
@@ -244,11 +246,13 @@ pub(crate) struct JoinKey<'p> {
     pub(crate) files: &'p [FileFacts],
 }
 
-/// A head the crate's walk placed in a file: its top entry there, its want, its item's and an
-/// impl fn's names, and for a written head its walk's steps and innermost macro.
+/// A head the crate's walk placed in a file: its top entry there, its enclosing module key, its
+/// want, its item's and an impl fn's names, and for a written head its walk's steps and innermost
+/// macro.
 #[derive(Clone, Copy)]
 pub(crate) struct PlacedHead<'n> {
     pub(crate) top: u32,
+    pub(crate) module: blaze_id::ItemKey,
     pub(crate) want: Want,
     pub(crate) name: &'n str,
     pub(crate) member: Option<&'n str>,
@@ -312,7 +316,7 @@ pub(crate) fn part_key(parts: &PartKey<'_, '_>) -> Key {
     file_part(&mut h, &parts.file);
     h.update(&u64::try_from(parts.heads.len()).unwrap_or(u64::MAX).to_le_bytes());
     for one in parts.heads {
-        h.update(&one.top.to_le_bytes()).update(&want_bytes(one.want)).part(one.name.as_bytes());
+        h.update(&one.top.to_le_bytes()).update(&one.module.0.0).update(&want_bytes(one.want)).part(one.name.as_bytes());
         match one.member {
             None => h.update(&[0]),
             Some(member) => h.update(&[1]).part(member.as_bytes()),
@@ -859,8 +863,9 @@ mod tests {
         assert!(matches!(open_join(&long, Check::Store, g), Err(ListingRefused::Trailing { left: 1, .. })), "Check::Store still refuses trailing bytes");
         let mut version = AVec::new_in(g);
         version.extend_from_slice(&joined);
-        version[8] = 2;
-        assert_eq!(open_join(&version, Check::Full, g), Err(ListingRefused::Version { found: 2 }), "another form is refused, never read");
+        let wrong_version = VERSION.wrapping_add(1);
+        version[8..12].copy_from_slice(&wrong_version.to_le_bytes());
+        assert_eq!(open_join(&version, Check::Full, g), Err(ListingRefused::Version { found: wrong_version }), "another form is refused, never read");
         let mut counted = AVec::new_in(g);
         counted.extend_from_slice(&part);
         counted[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
@@ -926,12 +931,13 @@ mod tests {
 
     /// The input of `key_of` over a part's parts that does not move it, or `None`.
     fn part_unmoved(key_of: &dyn Fn(&PartKey<'_, '_>) -> Key) -> Option<&'static str> {
-        let head = PlacedHead { top: 3, want: Want::Fn(lib(1)), name: "f", member: None, walk: None };
+        let head = PlacedHead { top: 3, module: lib(10), want: Want::Fn(lib(1)), name: "f", member: None, walk: None };
         let heads = [head];
         let calls = [PlacedCall { top: 2, call: lib(2), row: ContentId([20; 32]) }];
         let base = PartKey { krate: krate(), file: facts(0, 7), heads: &heads, calls: &calls };
         let at = key_of(&base);
         let top = [PlacedHead { top: 4, ..head }];
+        let module = [PlacedHead { module: lib(11), ..head }];
         let want = [PlacedHead { want: Want::Adt(lib(1)), ..head }];
         let named = [PlacedHead { name: "g", ..head }];
         let member = [PlacedHead { member: Some("f"), ..head }];
@@ -939,11 +945,12 @@ mod tests {
         let by = [PlacedHead { walk: Some((ContentId([21; 32]), Some("m"))), ..head }];
         let row = [PlacedCall { row: ContentId([22; 32]), ..calls[0] }];
         let call = [PlacedCall { call: lib(3), ..calls[0] }];
-        let moved: [(&'static str, PartKey<'_, '_>); 12] = [
+        let moved: [(&'static str, PartKey<'_, '_>); 13] = [
             ("the crate", PartKey { krate: CrateFacts { krate: ContentId([16; 32]), ..krate() }, ..base }),
             ("the file's entry facts", PartKey { file: facts(0, 12), ..base }),
             ("the file's index", PartKey { file: facts(1, 7), ..base }),
             ("a head's top entry", PartKey { heads: &top, ..base }),
+            ("a head's module", PartKey { heads: &module, ..base }),
             ("a head's want", PartKey { heads: &want, ..base }),
             ("a head's name", PartKey { heads: &named, ..base }),
             ("a head's member", PartKey { heads: &member, ..base }),
