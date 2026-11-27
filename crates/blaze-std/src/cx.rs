@@ -459,6 +459,17 @@ impl Cx {
         Cx { deadline: Some(deadline), ..self.child() }
     }
 
+    /// Derives a child context bound to a secondary [`Io`] (`Io::beside`) with `deadline` on
+    /// `world`'s clock while preserving this context's cancellation lineage (`self.cancel`), span,
+    /// and plant so parent cancellation stops waits on the secondary `Io` immediately.
+    pub(crate) fn on_beside(&self, world: Io, deadline: Deadline) -> Cx {
+        Cx {
+            deadline: Some(deadline),
+            placed: Placed::on(0, None, Here::Outside, Seat::Root(OnceCell::new()), None, crate::mem::TASK_FRAME, world),
+            ..self.child()
+        }
+    }
+
     /// A child named `name`, inside this one's span: its waits say they are `name`'s, and the
     /// span's opening is recorded.
     ///

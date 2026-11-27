@@ -20,8 +20,8 @@ use std::{
 };
 
 use blaze_core::{
-    DirName, Done, Effect, FileName, Kind as CoreKind, Listing, Mapping, Names, STAMP_MOST, Stamp,
-    Tag,
+    DirName, Done, Driver as _, Effect, FileName, Kind as CoreKind, Listing, Mapping, Names,
+    STAMP_MOST, Stamp, Tag,
 };
 use blaze_git::{
     Detail, FileKind, FileStat, FileStatus, Head, Limits, PromptStatus, RepoState, ShortOid,
@@ -35,7 +35,161 @@ use blaze_git::{
 use blaze_git_fetch::{Kind as ObjectKind, Oid, store::Commit};
 use blaze_own::{AVec, Alloc, String as OwnString, Vec as OwnVec, planted::NoPlant};
 
-use crate::disk::BgitDiskStore;
+use crate::disk::{BgitDiskStore, write_file_atomic};
+
+/// Stateless sparse-directory entry-name cache (`.bgit/dircache.bgdc`).
+///
+/// Caches ONLY `(dir_path -> (mtime_ns, ctime_ns, ino, sorted_child_names))` for sparse
+/// directories (`<= MAX_SPARSE_CHILDREN` entries). On every `bgit status`, each cached directory
+/// and its children are stamped in ONE batched `Effect::Stamp` (`fstatat` across all cores, zero
+/// `open()`/`getattrlistbulk()`/`close()`). Any directory whose `(mtime_ns, ctime_ns, ino)`
+/// changed falls through immediately to `Effect::Entries` (`getattrlistbulk`) and refreshes the
+/// record atomically. Completely independent of `.git/index`, `HEAD`, and `.gitignore`.
+const DIRCACHE_MAGIC: &[u8; 4] = b"BGDC";
+const DIRCACHE_VERSION: u32 = 1;
+const MAX_SPARSE_CHILDREN: usize = 4;
+const RACY_DIR_WINDOW_NS: u64 = 50_000_000;
+
+struct SparseDirEntry {
+    mtime_ns: u64,
+    ctime_ns: u64,
+    ino: u64,
+    children: Vec<String>,
+}
+
+struct DirCache {
+    path: PathBuf,
+    entries: HashMap<String, SparseDirEntry>,
+    dirty: bool,
+}
+
+fn dircache_crc32(data: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &b in data {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+impl DirCache {
+    fn load(bgit_dir: &Path) -> Self {
+        let path = bgit_dir.join("dircache.bgdc");
+        let mut entries = HashMap::new();
+        if let Ok(raw) = fs::read(&path)
+            && raw.len() >= 16
+            && &raw[0..4] == DIRCACHE_MAGIC
+            && u32::from_le_bytes(raw[4..8].try_into().expect("4b")) == DIRCACHE_VERSION
+        {
+            let body_end = raw.len() - 4;
+            let want_crc = u32::from_le_bytes(raw[body_end..].try_into().expect("4b"));
+            if dircache_crc32(&raw[..body_end]) == want_crc {
+                let count = u32::from_le_bytes(raw[8..12].try_into().expect("4b")) as usize;
+                entries.reserve(count);
+                let mut pos = 12usize;
+                let mut ok = true;
+                for _ in 0..count {
+                    if pos + 2 > body_end {
+                        ok = false;
+                        break;
+                    }
+                    let dlen = u16::from_le_bytes([raw[pos], raw[pos + 1]]) as usize;
+                    pos += 2;
+                    if pos + dlen + 25 > body_end {
+                        ok = false;
+                        break;
+                    }
+                    let Ok(dir) = core::str::from_utf8(&raw[pos..pos + dlen]) else {
+                        ok = false;
+                        break;
+                    };
+                    pos += dlen;
+                    let mtime_ns = u64::from_le_bytes(raw[pos..pos + 8].try_into().expect("8b"));
+                    let ctime_ns =
+                        u64::from_le_bytes(raw[pos + 8..pos + 16].try_into().expect("8b"));
+                    let ino = u64::from_le_bytes(raw[pos + 16..pos + 24].try_into().expect("8b"));
+                    let n_children = raw[pos + 24] as usize;
+                    pos += 25;
+                    if n_children > MAX_SPARSE_CHILDREN {
+                        ok = false;
+                        break;
+                    }
+                    let mut children = Vec::with_capacity(n_children);
+                    for _ in 0..n_children {
+                        if pos + 2 > body_end {
+                            ok = false;
+                            break;
+                        }
+                        let clen = u16::from_le_bytes([raw[pos], raw[pos + 1]]) as usize;
+                        pos += 2;
+                        if pos + clen > body_end {
+                            ok = false;
+                            break;
+                        }
+                        let Ok(cname) = core::str::from_utf8(&raw[pos..pos + clen]) else {
+                            ok = false;
+                            break;
+                        };
+                        pos += clen;
+                        children.push(cname.to_owned());
+                    }
+                    if !ok {
+                        break;
+                    }
+                    entries.insert(
+                        dir.to_owned(),
+                        SparseDirEntry { mtime_ns, ctime_ns, ino, children },
+                    );
+                }
+                if !ok {
+                    entries.clear();
+                }
+            }
+        }
+        Self { path, entries, dirty: false }
+    }
+
+    fn flush_if_dirty(&mut self) {
+        if !self.dirty {
+            return;
+        }
+        let mut out = Vec::with_capacity(16 + self.entries.len() * 64);
+        out.extend_from_slice(DIRCACHE_MAGIC);
+        out.extend_from_slice(&DIRCACHE_VERSION.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut written = 0u32;
+        for (dir, e) in &self.entries {
+            let Ok(dlen) = u16::try_from(dir.len()) else {
+                continue;
+            };
+            if e.children.len() > MAX_SPARSE_CHILDREN {
+                continue;
+            }
+            if e.children.iter().any(|c| u16::try_from(c.len()).is_err()) {
+                continue;
+            }
+            out.extend_from_slice(&dlen.to_le_bytes());
+            out.extend_from_slice(dir.as_bytes());
+            out.extend_from_slice(&e.mtime_ns.to_le_bytes());
+            out.extend_from_slice(&e.ctime_ns.to_le_bytes());
+            out.extend_from_slice(&e.ino.to_le_bytes());
+            out.push(e.children.len() as u8);
+            for c in &e.children {
+                out.extend_from_slice(&(c.len() as u16).to_le_bytes());
+                out.extend_from_slice(c.as_bytes());
+            }
+            written += 1;
+        }
+        out[8..12].copy_from_slice(&written.to_le_bytes());
+        let crc = dircache_crc32(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        let _ = write_file_atomic(&self.path, &out);
+        self.dirty = false;
+    }
+}
 
 /// Timing breakdown printed when `bgit status --timing` is requested.
 #[derive(Clone, Copy, Default, Debug)]
@@ -237,6 +391,7 @@ struct NativeGitDriver {
     common_dir: PathBuf,
     bgit_dir: Option<PathBuf>,
     hide_root_bgit: bool,
+    dircache: Option<DirCache>,
 }
 
 impl NativeGitDriver {
@@ -356,31 +511,101 @@ impl NativeGitDriver {
             out.push(None);
         }
 
-        // Submit EVERY worktree directory in one parallel batch of `Effect::Entries`
-        // (`getattrlistbulk` on macOS, `statx` on Linux)!
+        // Partition worktree dirs into:
+        // 1. Cached sparse dirs (<= 4 children in `.bgit/dircache.bgdc`): verify `(dir + children)`
+        //    in ONE batched `Effect::Stamp` (`fstatat` across all cores, zero `open`/`getattrlistbulk`/`close`!).
+        // 2. Dense or uncached dirs: run `Effect::Entries` (`getattrlistbulk`) in parallel alongside
+        //    the `Effect::Stamp` batch!
         if let Some(drv) = &mut self.worktree_io {
+            let hide_root_bgit = self.hide_root_bgit;
+            let wall_ns = drv.wall_ns();
+
+            struct CachedCheck {
+                slot: usize,
+                dir_stamp_idx: usize,
+                child_start: usize,
+                child_count: usize,
+            }
+            let mut cached_checks: Vec<CachedCheck> = Vec::new();
+            let mut stamp_names = Names::with_capacity(0, 0);
             let mut effects = Vec::new();
-            let mut is_root_slot = Vec::new();
+
             for (i, sp) in dirs.iter().enumerate() {
                 if sp.scope != PathScope::Worktree {
                     continue;
                 }
-                let dir_name = if sp.path.is_empty() {
+                let dir_str = sp.path.as_str();
+                if !dir_str.is_empty()
+                    && let Some(dc) = self.dircache.as_ref()
+                    && let Some(entry) = dc.entries.get(dir_str)
+                    && stamp_names.len() + 1 + entry.children.len() <= STAMP_MOST
+                {
+                    let dir_stamp_idx = stamp_names.len();
+                    if stamp_names.push_str(dir_str) {
+                        let child_start = stamp_names.len();
+                        let mut all_pushed = true;
+                        let mut scratch = String::with_capacity(dir_str.len() + 32);
+                        for cname in &entry.children {
+                            scratch.clear();
+                            scratch.push_str(dir_str);
+                            scratch.push('/');
+                            scratch.push_str(cname);
+                            if !stamp_names.push_str(&scratch) {
+                                all_pushed = false;
+                                break;
+                            }
+                        }
+                        if all_pushed {
+                            cached_checks.push(CachedCheck {
+                                slot: i,
+                                dir_stamp_idx,
+                                child_start,
+                                child_count: entry.children.len(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                let dir_name = if dir_str.is_empty() {
                     DirName::Root
-                } else if let Some(fname) = FileName::new(sp.path.as_str()) {
+                } else if let Some(fname) = FileName::new(dir_str) {
                     DirName::from(fname)
                 } else {
                     continue;
                 };
-                is_root_slot.push((i, sp.path.is_empty()));
                 effects.push(Effect::Entries { dir: dir_name, tag: Tag(i as u64) });
             }
-            let hide_root_bgit = self.hide_root_bgit;
+
+            const STAMP_TAG: u64 = u64::MAX;
+            if !cached_checks.is_empty() {
+                effects.push(Effect::Stamp { files: Arc::new(stamp_names), tag: Tag(STAMP_TAG) });
+            }
+
+            let mut stamps_out: Option<Vec<Stamp>> = None;
+            let mut new_sparse_candidates: Vec<(usize, Vec<String>)> = Vec::new();
+            let record_dircache = self.dircache.is_some();
+
             if !effects.is_empty() {
                 blaze_core::run_until_idle(drv, &mut effects, |comp, _| {
+                    if comp.tag.0 == STAMP_TAG {
+                        if let Done::Stamped(stamps) = comp.done {
+                            stamps_out = Some(stamps);
+                        }
+                        return;
+                    }
                     let slot = comp.tag.0 as usize;
                     if let Done::Entries(listing) = comp.done {
                         let is_root = listing.dir().name().is_none();
+                        if record_dircache
+                            && !is_root
+                            && listing.len() <= MAX_SPARSE_CHILDREN
+                        {
+                            let mut names = Vec::with_capacity(listing.len());
+                            for k in 0..listing.len() {
+                                names.push(listing.leaf(k).as_str().to_owned());
+                            }
+                            new_sparse_candidates.push((slot, names));
+                        }
                         out[slot] = Some(listing_to_dir_listing(
                             &listing,
                             is_root && hide_root_bgit,
@@ -389,6 +614,122 @@ impl NativeGitDriver {
                     }
                 })
                 .map_err(io::Error::from)?;
+            }
+
+            // Verify every cached sparse dir's `(mtime_ns, ctime_ns, ino)`!
+            let mut stale_slots: Vec<usize> = Vec::new();
+            if let Some(stamps) = stamps_out {
+                for chk in cached_checks {
+                    let dir_str = dirs[chk.slot].path.as_str();
+                    let dir_st = stamps[chk.dir_stamp_idx];
+                    let entry = self
+                        .dircache
+                        .as_ref()
+                        .and_then(|dc| dc.entries.get(dir_str));
+                    let valid = entry.is_some_and(|e| {
+                        CoreKind::of(&dir_st) == CoreKind::Dir
+                            && dir_st.mtime_ns > 0
+                            && dir_st.mtime_ns == e.mtime_ns
+                            && dir_st.ctime_ns == e.ctime_ns
+                            && dir_st.ino == e.ino
+                    });
+                    if valid {
+                        let e = entry.expect("checked");
+                        let mut dl =
+                            DirListing::with_capacity(chk.child_count, chk.child_count * 16, alloc);
+                        for (k, cname) in e.children.iter().enumerate() {
+                            let cst = stamps[chk.child_start + k];
+                            let kind = CoreKind::of(&cst);
+                            if kind != CoreKind::Gone {
+                                dl.push(cname, stamp_to_file_stat(cst, kind));
+                            }
+                        }
+                        out[chk.slot] = Some(dl);
+                    } else {
+                        stale_slots.push(chk.slot);
+                    }
+                }
+            } else {
+                for chk in cached_checks {
+                    stale_slots.push(chk.slot);
+                }
+            }
+
+            // Re-list any stale directories with `Effect::Entries` (`getattrlistbulk`) and update cache.
+            if !stale_slots.is_empty() {
+                let mut retry_effects = Vec::with_capacity(stale_slots.len());
+                for &slot in &stale_slots {
+                    let dir_str = dirs[slot].path.as_str();
+                    if let Some(dc) = self.dircache.as_mut()
+                        && dc.entries.remove(dir_str).is_some()
+                    {
+                        dc.dirty = true;
+                    }
+                    if let Some(fname) = FileName::new(dir_str) {
+                        retry_effects
+                            .push(Effect::Entries { dir: DirName::from(fname), tag: Tag(slot as u64) });
+                    }
+                }
+                if !retry_effects.is_empty() {
+                    blaze_core::run_until_idle(drv, &mut retry_effects, |comp, _| {
+                        let slot = comp.tag.0 as usize;
+                        if let Done::Entries(listing) = comp.done {
+                            if record_dircache && listing.len() <= MAX_SPARSE_CHILDREN {
+                                let mut names = Vec::with_capacity(listing.len());
+                                for k in 0..listing.len() {
+                                    names.push(listing.leaf(k).as_str().to_owned());
+                                }
+                                new_sparse_candidates.push((slot, names));
+                            }
+                            out[slot] = Some(listing_to_dir_listing(&listing, false, alloc));
+                        }
+                    })
+                    .map_err(io::Error::from)?;
+                }
+            }
+
+            // Stamp any newly discovered sparse dirs ONCE so future runs skip `getattrlistbulk`!
+            if !new_sparse_candidates.is_empty() && self.dircache.is_some() {
+                let mut cand_names = Names::with_capacity(
+                    new_sparse_candidates.len(),
+                    new_sparse_candidates.len() * 24,
+                );
+                let mut accepted: Vec<(usize, Vec<String>)> =
+                    Vec::with_capacity(new_sparse_candidates.len());
+                for (slot, names) in new_sparse_candidates {
+                    if cand_names.push_str(dirs[slot].path.as_str()) {
+                        accepted.push((slot, names));
+                    }
+                }
+                if !accepted.is_empty() {
+                    let mut st_eff =
+                        vec![Effect::Stamp { files: Arc::new(cand_names), tag: Tag(0) }];
+                    let mut cand_stamps: Option<Vec<Stamp>> = None;
+                    let _ = blaze_core::run_until_idle(drv, &mut st_eff, |comp, _| {
+                        if let Done::Stamped(s) = comp.done {
+                            cand_stamps = Some(s);
+                        }
+                    });
+                    if let (Some(stamps), Some(dc)) = (cand_stamps, self.dircache.as_mut()) {
+                        for ((slot, names), st) in accepted.into_iter().zip(stamps) {
+                            if CoreKind::of(&st) == CoreKind::Dir
+                                && st.mtime_ns > 0
+                                && st.mtime_ns.saturating_add(RACY_DIR_WINDOW_NS) < wall_ns
+                            {
+                                dc.entries.insert(
+                                    dirs[slot].path.as_str().to_owned(),
+                                    SparseDirEntry {
+                                        mtime_ns: st.mtime_ns,
+                                        ctime_ns: st.ctime_ns,
+                                        ino: st.ino,
+                                        children: names,
+                                    },
+                                );
+                                dc.dirty = true;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -475,10 +816,10 @@ impl NativeGitDriver {
             }
 
             // Encode sparse `Effect::Stamp` batches with tag >= bulk_dirs.len().
+            // `blaze_core::fs::stamps` already fans out across all CPU cores internally!
             let stamp_base = bulk_dirs.len();
             let mut stamp_batches: Vec<Vec<usize>> = Vec::new();
-            const CHUNK: usize = 256;
-            let chunk_size = CHUNK.min(STAMP_MOST);
+            let chunk_size = STAMP_MOST;
             for chunk in sparse_slots.chunks(chunk_size) {
                 let mut names = Names::with_capacity(chunk.len(), chunk.len() * 32);
                 let mut batch_slots = Vec::with_capacity(chunk.len());
@@ -626,13 +967,36 @@ fn run_git_status<'a>(
     opts: StatusOpts,
     alloc: Alloc<'a>,
 ) -> io::Result<(PromptStatus<'a>, StatusTiming)> {
+    // O(dirty) fast-path when an in-process FSEvents monitor (`blaze-shell` host) is active!
+    if let Some(wt) = worktree.as_deref()
+        && let Some(cached) = crate::fsmonitor::try_cached_status(
+            wt,
+            &git_dir,
+            &common_dir,
+            bgit_dir.as_deref(),
+            opts,
+            alloc,
+        )
+    {
+        return Ok((cached, StatusTiming::default()));
+    }
+    let scan_start_gen = worktree.as_deref().and_then(crate::fsmonitor::begin_full_scan);
+
     let worktree_io = match &worktree {
         Some(wt) => Some(blaze_core::native(wt, default_io_threads())?),
         None => None,
     };
     let hide_root_bgit = bgit_dir.is_some();
-    let mut driver =
-        NativeGitDriver { worktree, worktree_io, git_dir, common_dir, bgit_dir, hide_root_bgit };
+    let dircache = bgit_dir.as_deref().map(DirCache::load);
+    let mut driver = NativeGitDriver {
+        worktree,
+        worktree_io,
+        git_dir,
+        common_dir,
+        bgit_dir,
+        hide_root_bgit,
+        dircache,
+    };
 
     let mut machine = StatusMachine::new(opts, kind, alloc, NoPlant);
     if let Some(global_ignore) = load_global_exclude() {
@@ -645,7 +1009,23 @@ fn run_git_status<'a>(
         let step = machine.poll().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         timing.machine_us += m0.elapsed().as_micros() as u64;
         match step {
-            Step::Done(status) => return Ok((status, timing)),
+            Step::Done(status) => {
+                if let Some(dc) = driver.dircache.as_mut() {
+                    dc.flush_if_dirty();
+                }
+                if let Some(wt) = driver.worktree.as_deref() {
+                    crate::fsmonitor::record_status_baseline(
+                        wt,
+                        &driver.git_dir,
+                        &driver.common_dir,
+                        driver.bgit_dir.as_deref(),
+                        opts,
+                        &status,
+                        scan_start_gen,
+                    );
+                }
+                return Ok((status, timing));
+            }
             Step::Need(want) => {
                 timing.rounds += 1;
                 let io0 = Instant::now();

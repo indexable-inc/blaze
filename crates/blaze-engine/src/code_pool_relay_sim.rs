@@ -345,3 +345,52 @@ fn a_late_ask_is_answered_late_and_withdrawn() {
     assert_eq!(relay.exited(Time(14), Child(0)), Err(RelayError::ExitedChild(Child(0))));
     assert_eq!(relay.wait(), None);
 }
+
+#[test]
+fn idle_entries_evict_fifo_under_most_bytes_and_reask_cleanly() {
+    let a = alloc();
+    let payload = |tag: u8, n: usize| {
+        let mut v = SVec::with_capacity_in(n, a);
+        v.resize(n, tag);
+        v
+    };
+    let opts = Options { alloc: a, hash_seed: 11, children: 2, workers: 1, asks: 8, deadline: DEADLINE, code_wait: 100, most_bytes: 16 };
+    let mut relay: Relay<'static, Order, Refusal> = Relay::new(Time(0), opts).expect("a relay");
+
+    // 1. Key 1 (10 bytes) is made and taken by child 0 -> idle in cache (held = 10).
+    relay.ask(Time(1), Child(0), Some(key_of(1)), one(0, 1, 0)).expect("ask 1");
+    let (w, _, _) = relay.job().expect("job 1");
+    relay.made(Time(2), w, payload(1, 10)).expect("made 1");
+    let got1 = relay.answer(Child(0), |r| matches!(r, Reply::Made(b) if b.len() == 10 && b[0] == 1));
+    assert_eq!(got1, Ok(Some(true)));
+
+    // 2. Key 2 (10 bytes) exceeds 16-byte cap -> evicts idle key 1 (held becomes 10), succeeds.
+    relay.ask(Time(3), Child(0), Some(key_of(2)), one(0, 2, 0)).expect("ask 2");
+    let (w, _, _) = relay.job().expect("job 2");
+    relay.made(Time(4), w, payload(2, 10)).expect("made 2 after evicting key 1");
+    let got2 = relay.answer(Child(0), |r| matches!(r, Reply::Made(b) if b.len() == 10 && b[0] == 2));
+    assert_eq!(got2, Ok(Some(true)));
+
+    // 3. Re-asking evicted key 1 schedules a fresh make cleanly (evicting idle key 2).
+    relay.ask(Time(5), Child(0), Some(key_of(1)), one(0, 1, 1)).expect("re-ask 1");
+    let (w, k, _) = relay.job().expect("re-job 1");
+    assert_eq!(k, key_of(1));
+    relay.made(Time(6), w, payload(9, 10)).expect("re-made 1 after evicting key 2");
+    // Child(0) exiting after key 2 was evicted from its slots must not panic.
+    relay.exited(Time(7), Child(0)).expect("child 0 exits cleanly with evicted slot");
+    // Now Child(1) asks for key 3 (10 bytes), which evicts idle key 1, and leaves it pinned
+    // while another relay tests `RelayError::Full` on pinned entries.
+    relay.ask(Time(8), Child(1), Some(key_of(3)), one(1, 3, 0)).expect("ask 3");
+    let (w, _, _) = relay.job().expect("job 3");
+    relay.made(Time(9), w, payload(3, 10)).expect("made 3 after evicting key 1");
+    relay.exited(Time(10), Child(1)).expect("child 1 exits cleanly");
+
+    let mut relay2: Relay<'static, Order, Refusal> = Relay::new(Time(0), opts).expect("relay 2");
+    relay2.ask(Time(1), Child(0), Some(key_of(1)), one(0, 1, 0)).expect("ask 1");
+    let (w, _, _) = relay2.job().expect("job 1");
+    relay2.made(Time(2), w, payload(1, 10)).expect("made 1");
+    // Leave key 1 untaken (pinned by Child(0)) while Child(1) asks for key 2 (10 bytes) -> Full!
+    relay2.ask(Time(3), Child(1), Some(key_of(2)), one(1, 2, 0)).expect("ask 2");
+    let (w, _, _) = relay2.job().expect("job 2");
+    assert!(matches!(relay2.made(Time(4), w, payload(2, 10)), Err(RelayError::Full { .. })), "pinned entry must not be evicted");
+}

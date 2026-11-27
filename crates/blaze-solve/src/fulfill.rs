@@ -72,6 +72,10 @@ pub struct Fulfill<'a, S: Strategy> {
     vars: Vec<u32, Alloc<'a>>,
     /// Goal evaluations made (for the cost example).
     pub evaluations: u64,
+    /// Obligation indices that transitioned out of `State::Pending` since the caller last cleared
+    /// this list, allowing persistent callers (`InferCtx`) to sync state changes in O(resolved)
+    /// instead of scanning `0..state.len()`.
+    pub resolved: Vec<u32, Alloc<'a>>,
     _s: core::marker::PhantomData<S>,
 }
 
@@ -92,12 +96,31 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
             work: Vec::new_in(alloc),
             vars: Vec::new_in(alloc),
             evaluations: 0,
+            resolved: Vec::new_in(alloc),
             _s: core::marker::PhantomData,
         }
     }
 
     pub fn alloc(&self) -> Alloc<'a> {
         self.alloc
+    }
+
+    /// Resets the queue and wake tables while retaining buffer capacities for reuse across
+    /// `select` calls inside one body's bump frame.
+    pub fn clear(&mut self) {
+        self.goal.clear();
+        self.state.clear();
+        self.stamp.clear();
+        self.ready.clear();
+        self.batch.clear();
+        self.queued.clear();
+        self.wait_head.clear();
+        self.wait_ob.clear();
+        self.wait_next.clear();
+        self.cursor = 0;
+        self.work.clear();
+        self.vars.clear();
+        self.resolved.clear();
     }
 
     /// Adds an obligation; it is evaluated on the next `select`.
@@ -216,6 +239,29 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
         mode: TypingMode,
         reads: &mut Vec<Read, Alloc<'a>>,
     ) -> Result<(), Stop> {
+        self.select_from_opt(solver, tys, src, mode, Some(reads))
+    }
+
+    /// Like [`Fulfill::select_from`], without exporting solver reads into a caller `Vec<Read>`
+    /// (used by typeck where `src` records reads directly and the exported read log is discarded).
+    pub fn select_from_quiet<T: Tys, Src: crate::facts::Source<T>>(
+        &mut self,
+        solver: &mut Solver<'a>,
+        tys: &mut T,
+        src: &mut Src,
+        mode: TypingMode,
+    ) -> Result<(), Stop> {
+        self.select_from_opt(solver, tys, src, mode, None)
+    }
+
+    fn select_from_opt<T: Tys, Src: crate::facts::Source<T>>(
+        &mut self,
+        solver: &mut Solver<'a>,
+        tys: &mut T,
+        src: &mut Src,
+        mode: TypingMode,
+        mut reads: Option<&mut Vec<Read, Alloc<'a>>>,
+    ) -> Result<(), Stop> {
         for _ in 0..MAX_PASSES {
             if S::WAKE {
                 self.wake(&*tys);
@@ -239,8 +285,11 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
                 let g = self.goal[ob as usize];
                 self.evaluations += 1;
                 self.stamp[ob as usize] += 1;
-                let a = solver.evaluate_from(tys, src, mode, g, reads)?;
-                self.state[ob as usize] = match a {
+                let a = match reads.as_deref_mut() {
+                    Some(r) => solver.evaluate_from(tys, src, mode, g, r)?,
+                    None => solver.evaluate_from_quiet(tys, src, mode, g)?,
+                };
+                let next_state = match a {
                     Answer::Yes => State::Holds,
                     Answer::No => State::Fails,
                     Answer::Maybe(c) if c == Certainty::Overflow || c == Certainty::OverflowLimit => State::Overflow,
@@ -252,6 +301,10 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
                         State::Pending
                     }
                 };
+                self.state[ob as usize] = next_state;
+                if next_state != State::Pending {
+                    self.resolved.push(ob);
+                }
             }
             self.batch.clear();
             if !S::WAKE && tys.bindings_len() == before {

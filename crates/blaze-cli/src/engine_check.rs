@@ -620,6 +620,37 @@ impl<'f> LazySdk<'f> {
     ) -> Result<blaze_apple_sdk::Sdk<'f>, blaze_apple_sdk::SdkRefused<'f>> {
         self.resolve_raw(cx, blaze_home, wall_ns).0
     }
+
+    fn sdk_digest(&self, cx: &Cx, blaze_home: Option<&Dir<ReadWrite>>, wall_ns: u64) -> Result<[u8; 32], CliError> {
+        match self.resolve_on_demand(cx, blaze_home, wall_ns) {
+            Ok(sdk) => {
+                let mut hex = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
+                for (i, byte) in sdk.identity().key().iter().enumerate() {
+                    let hi = byte >> 4;
+                    let lo = byte & 15;
+                    if let Some(slot) = hex.get_mut(2 * i) {
+                        *slot = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
+                    }
+                    if let Some(slot) = hex.get_mut(2 * i + 1) {
+                        *slot = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
+                    }
+                }
+                Ok(blaze_build_script::facts::sdk_id_digest(core::str::from_utf8(&hex).unwrap_or("")))
+            }
+            Err(blaze_apple_sdk::SdkRefused::Neither { xcrun: blaze_apple_sdk::XcrunFailed::NotMacos }) => {
+                Ok(blaze_build_script::facts::sdk_id_digest(""))
+            }
+            Err(refused) => {
+                use core::fmt::Write as _;
+                let mut msg = blaze_own::String::new_in(blaze_own::SharedAlloc::global());
+                let _ = write!(
+                    msg,
+                    "cannot resolve active SDK identity while following a saved c-probe read: {refused}"
+                );
+                Err(CliError::Sdk(msg))
+            }
+        }
+    }
 }
 
 /// The command's edge, read once (rule 75): what `check`, `why`, `run` and `test` each take of
@@ -789,6 +820,7 @@ fn edge_at<'l, R>(
     };
     let mut shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
     shown.each = flags.each;
+    shown.verbose = flags.verbose;
     // `check` owns stdout for the request, so a standing answer may transfer its persisted
     // rendered bytes in one write.  The first quiet pass of `--fix` remains ineligible through
     // `Shown::ready_to_replay` and therefore never publishes a view it did not print.
@@ -3241,6 +3273,7 @@ fn checking<'f, 's: 'f>(
     fn open_fallback_base<'m, 'f: 'm, 'a, D: blaze_core::Driver, S: crate::store::Sharing>(
         cx: &Cx,
         store: &mut crate::store::CommandStore<'m, '_, D, S>,
+        lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
         root: &Dir<ReadWrite>,
         check_scope: CheckScope<'_>,
         whole_root: &str,
@@ -3253,15 +3286,26 @@ fn checking<'f, 's: 'f>(
         frame: &'f Frame,
     ) -> Result<Option<(crate::engine_answer::LoadedBase<'m, 'a>, FallbackFrom)>, CliError> {
         if !check_scope.is_whole()
-            && let Some(loaded) = crate::engine_answer::open_named_base(cx, store, whole_root, tools, exclude, require_current_tools, alloc, frame)?
+            && let Some(loaded) = crate::engine_answer::open_named_base(
+                cx,
+                store,
+                lent,
+                whole_root,
+                crate::engine_answer::ReachCheck::Sharded(whole_root),
+                tools,
+                exclude,
+                require_current_tools,
+                alloc,
+                frame,
+            )?
         {
             return Ok(Some((loaded, FallbackFrom::OwnWhole)));
         }
-        if let Some(loaded) = crate::engine_answer::open_base_for_tools(cx, store, root, tools, exclude, require_current_tools, alloc, frame)? {
+        if let Some(loaded) = crate::engine_answer::open_base_for_tools(cx, store, lent, root, tools, exclude, require_current_tools, alloc, frame)? {
             return Ok(Some((loaded, FallbackFrom::OtherWorkspace)));
         }
         if include_tool_base
-            && let Some(loaded) = crate::engine_answer::open_toolchain_base(cx, store, toolchain, tools, alloc, frame)?
+            && let Some(loaded) = crate::engine_answer::open_toolchain_base(cx, store, lent, toolchain, tools, alloc, frame)?
         {
             return Ok(Some((loaded, FallbackFrom::Toolchain)));
         }
@@ -3283,7 +3327,7 @@ fn checking<'f, 's: 'f>(
         if !fresh {
             match recovery {
                 StoredRecovery::SkipOwn { exclude } => {
-                    if let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(exclude), false, false, request_mem_of(request_mem_slot)?.shared(), frame)?
+                    if let Some((loaded, from)) = open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, Some(exclude), false, false, request_mem_of(request_mem_slot)?.shared(), frame)?
                         && from != FallbackFrom::Toolchain
                     {
                         pointer = Some(loaded.pointer);
@@ -3315,7 +3359,7 @@ fn checking<'f, 's: 'f>(
                                 loaded_own_whole = true;
                             }
                             if !loaded_own_whole
-                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
+                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
                             {
                                 pointer = Some(loaded.pointer);
                                 last_lines = Some(loaded.lines);
@@ -3333,7 +3377,7 @@ fn checking<'f, 's: 'f>(
                         Some(Err(why)) => {
                             phases.mark_cx(cx, "stored answer's pointer read", frame);
                             if allow_stale_fallback
-                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
+                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, None, false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
                             {
                                 pointer = Some(loaded.pointer);
                                 last_lines = Some(loaded.lines);
@@ -3361,7 +3405,7 @@ fn checking<'f, 's: 'f>(
                             let mut used_fallback = false;
                             if !own_ptr.certifies_under(&tools)
                                 && allow_stale_fallback
-                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), true, false, request_mem_of(request_mem_slot)?.shared(), frame)?
+                                && let Some((loaded, from)) = open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), true, false, request_mem_of(request_mem_slot)?.shared(), frame)?
                                 && from != FallbackFrom::Toolchain
                             {
                                 pointer = Some(loaded.pointer);
@@ -3380,7 +3424,7 @@ fn checking<'f, 's: 'f>(
                                     }
                                     Err(why) => {
                                         if allow_stale_fallback
-                                            && let Some((loaded, from)) = open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
+                                            && let Some((loaded, from)) = open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, Some(own_ptr.key), false, true, request_mem_of(request_mem_slot)?.shared(), frame)?
                                         {
                                             pointer = Some(loaded.pointer);
                                             last_lines = Some(loaded.lines);
@@ -3485,9 +3529,13 @@ fn checking<'f, 's: 'f>(
             crate::engine_ready_edit::StoredBase::OtherCheckout => None,
             crate::engine_ready_edit::StoredBase::Own | crate::engine_ready_edit::StoredBase::ToolsMoved => journal.marked(&pointer.leaves, frame),
         };
+        let sdk_digest_fn = || match lazy_sdk {
+            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+            None => Ok(blaze_build_script::facts::sdk_id_digest("")),
+        };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (followed, statted) = follow.follow_served(cx, root, Some(opened.home.dir()), &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), frame)?;
+        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         sweep_counts = journal.counts(statted, u32::try_from(pointer.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&pointer.leaves, frame)).with_looks(followed.looks, follow_ns);
         // Set, then borrowed SHARED: `Option::insert` hands back a `&mut`, and `today_slots` below
@@ -3515,7 +3563,9 @@ fn checking<'f, 's: 'f>(
                 && facts.printed.names
                 && facts.printed.bodies_whole
                 && lines.blocks().next().is_none());
-        let own_certifies = base == crate::engine_ready_edit::StoredBase::Own;
+        let cert_reach_root = if own_whole { whole_root.as_str() } else { answer_root.as_str() };
+        let own_certifies = base == crate::engine_ready_edit::StoredBase::Own
+            && crate::engine_answer::reach_roots_live_without_root(&opened.lent, cert_reach_root, frame);
         let other_certifies = base == crate::engine_ready_edit::StoredBase::OtherCheckout
             && check_scope.is_whole()
             && !own_whole
@@ -3595,6 +3645,7 @@ fn checking<'f, 's: 'f>(
         && recovery == StoredRecovery::Normal
         && (own_scoped_moved || base != crate::engine_ready_edit::StoredBase::Own)
         && let Some(Ok(whole_ptr)) = crate::engine_answer::load_pointer(cx, &mut store, whole_root.as_str())?
+        && crate::engine_answer::reach_roots_live_without_root(&opened.lent, whole_root.as_str(), frame)
         && whole_ptr.certifies_under(&tools)
         && whole_ptr.facts.owed == 0
         && whole_ptr.facts.printed.replayable
@@ -3615,9 +3666,13 @@ fn checking<'f, 's: 'f>(
             strategy.changed_since(cx, fs, root, opened.home.dir(), phases.clock(), whole_chosen.places(), frame)?
         };
         let whole_marked = whole_journal.marked(&whole_ptr.leaves, frame);
+        let sdk_digest_fn = || match lazy_sdk {
+            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+            None => Ok(blaze_build_script::facts::sdk_id_digest("")),
+        };
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (whole_followed, whole_statted) = follow.follow_served(cx, root, Some(opened.home.dir()), &whole_ptr.leaves, whole_marked.as_deref(), None, frame)?;
+        let (whole_followed, whole_statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &whole_ptr.leaves, whole_marked.as_deref(), None, Some(&sdk_digest_fn), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         let whole_moved = whole_followed.layout_moved
             || whole_followed.now.rows.iter().zip(whole_followed.was.iter()).any(|(now, was)| now.state() != *was);
@@ -3687,14 +3742,33 @@ fn checking<'f, 's: 'f>(
     let last_dir = if let Some(root_dir) = preopened_root.take() {
         Some(root_dir)
     } else if let Some(ptr) = &pointer {
-        match crate::engine_answer::open_root(cx, &mut store, ptr.root, request)? {
+        let current_root_name = if own_whole { whole_root.as_str() } else { answer_root.as_str() };
+        let opened_root = match crate::engine_answer::open_root(cx, &mut store, ptr.root, request)? {
+            Ok(root_dir) => match crate::engine_answer::verify_reach_roots(&opened.lent, current_root_name, &root_dir, true, request, frame)? {
+                Ok(()) => Ok(root_dir),
+                Err(why) => Err(why),
+            },
+            Err(why) => Err(why),
+        };
+        match opened_root {
             Ok(root_dir) => Some(root_dir),
+            Err(crate::engine_answer::Unreadable::Pages(missing @ blaze_engine::pages::PagesError::Missing { .. }))
+                if driver == crate::engine_ready_edit::Driver::Ready =>
+            {
+                return Err(crate::engine_answer::page_error(missing));
+            }
             Err(why) => {
-                // Own answer's root directory is unreadable (e.g. bumped directory format or
-                // missing root record): fall back to another worktree's compatible base and
-                // re-sweep its leaves instead of rebuilding every task from `no answer`.
+                // Own answer's root directory or CAS reach roots are unreadable (e.g. bumped
+                // directory format, missing root record, or partially evicted reach shard): fall
+                // back to another worktree's compatible intact base and re-sweep its leaves
+                // instead of rebuilding every task from `no answer`.
+                let include_tool_base = !matches!(
+                    why,
+                    crate::engine_answer::Unreadable::Pages(blaze_engine::pages::PagesError::Missing { .. })
+                        | crate::engine_answer::Unreadable::MissingReach { .. }
+                );
                 let fallback = if !other_checkout && allow_stale_fallback {
-                    open_fallback_base(cx, &mut store, root, check_scope, &whole_root, toolchain, &tools, Some(ptr.key), false, true, request, frame)?
+                    open_fallback_base(cx, &mut store, &opened.lent, root, check_scope, &whole_root, toolchain, &tools, Some(ptr.key), false, include_tool_base, request, frame)?
                 } else {
                     None
                 };
@@ -3717,9 +3791,13 @@ fn checking<'f, 's: 'f>(
                         unreadable = Some(why);
                     }
                     if let Some(new_ptr) = &pointer {
+                        let sdk_digest_fn = || match lazy_sdk {
+                            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+                            None => Ok(blaze_build_script::facts::sdk_id_digest("")),
+                        };
                         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
                         let follow_began = phases.clock().now();
-                        let (followed, statted) = follow.follow_served(cx, root, Some(opened.home.dir()), &new_ptr.leaves, None, script_sweep.as_mut(), frame)?;
+                        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &new_ptr.leaves, None, script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
                         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
                         sweep_counts = journal.counts(statted, u32::try_from(new_ptr.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&new_ptr.leaves, frame)).with_looks(followed.looks, follow_ns);
                         followed_kept = Some(followed);

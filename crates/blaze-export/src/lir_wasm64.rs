@@ -49,6 +49,10 @@ pub struct LirWasm64Func<'a> {
     pub view: View<'a>,
 }
 
+/// Sentinel static `place` representing an unresolved `#[linkage = "extern_weak"]` symbol,
+/// which resolves to the null address `0` in `Op::DataAddr`, `DataRec` relocs, and static relocs.
+pub const NULL_STATIC_PLACE: u32 = u32::MAX;
+
 /// Target of an 8-byte relocation inside a [`LirWasm64Static`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LirWasm64RelocTarget {
@@ -449,6 +453,60 @@ fn sub32_smax(scalar: Scalar) -> i32 {
 
 const MAX_COMPOUND_DEPTH: usize = 64;
 
+#[inline]
+fn scalar_slot_count(scalar: Scalar) -> Option<u16> {
+    match scalar {
+        Scalar::None => Some(0),
+        Scalar::I1
+        | Scalar::I8
+        | Scalar::I16
+        | Scalar::I32
+        | Scalar::I64
+        | Scalar::Ptr
+        | Scalar::F32
+        | Scalar::F64 => Some(1),
+        Scalar::I128 => Some(2),
+        Scalar::F16 | Scalar::F128 => None,
+    }
+}
+
+#[inline]
+fn lane_stride(scalar: Scalar) -> u32 {
+    match scalar {
+        Scalar::I128 => 2,
+        _ => 1,
+    }
+}
+
+#[inline]
+fn push_scalar_wasm_types(scalar: Scalar, dst: &mut AVec<'_, ValType>) -> bool {
+    match scalar {
+        Scalar::None => true,
+        Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => {
+            dst.push(ValType::I32);
+            true
+        }
+        Scalar::I64 | Scalar::Ptr => {
+            dst.push(ValType::I64);
+            true
+        }
+        Scalar::F32 => {
+            dst.push(ValType::F32);
+            true
+        }
+        Scalar::F64 => {
+            dst.push(ValType::F64);
+            true
+        }
+        Scalar::I128 => {
+            dst.push(ValType::I64);
+            dst.push(ValType::I64);
+            true
+        }
+        Scalar::F16 | Scalar::F128 => false,
+    }
+}
+
 fn push_ty_wasm_types(
     view: View<'_>,
     ty: Ty,
@@ -467,20 +525,20 @@ fn push_ty_wasm_types(
             continue;
         }
         match cur.form() {
-            Form::Scalar => match cur.elem() {
-                Scalar::None => {}
-                Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => dst.push(ValType::I32),
-                Scalar::I64 | Scalar::Ptr => dst.push(ValType::I64),
-                Scalar::F32 => dst.push(ValType::F32),
-                Scalar::F64 => dst.push(ValType::F64),
-                Scalar::I128 => {
-                    dst.push(ValType::I64);
-                    dst.push(ValType::I64);
-                }
-                Scalar::F16 | Scalar::F128 => {
+            Form::Scalar => {
+                if !push_scalar_wasm_types(cur.elem(), dst) {
                     return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
                 }
-            },
+            }
+            Form::Vector => {
+                let elem = cur.elem();
+                if elem == Scalar::None || scalar_slot_count(elem).is_none() {
+                    return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
+                }
+                for _ in 0..cur.lanes() {
+                    push_scalar_wasm_types(elem, dst);
+                }
+            }
             Form::Compound => {
                 let members = view.members(cur);
                 if top + members.len() > MAX_COMPOUND_DEPTH {
@@ -491,7 +549,7 @@ fn push_ty_wasm_types(
                     top += 1;
                 }
             }
-            Form::Vector | Form::Scalable => {
+            Form::Scalable => {
                 return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
             }
         }
@@ -513,21 +571,21 @@ fn wasm_slot_count(view: View<'_>, ty: Ty, func: u32, inst: usize) -> Result<u16
         }
         match cur.form() {
             Form::Scalar => {
-                let c = match cur.elem() {
-                    Scalar::None => 0u16,
-                    Scalar::I1
-                    | Scalar::I8
-                    | Scalar::I16
-                    | Scalar::I32
-                    | Scalar::I64
-                    | Scalar::Ptr
-                    | Scalar::F32
-                    | Scalar::F64 => 1u16,
-                    Scalar::I128 => 2u16,
-                    Scalar::F16 | Scalar::F128 => {
-                        return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
-                    }
+                let Some(c) = scalar_slot_count(cur.elem()) else {
+                    return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
                 };
+                sum = sum.checked_add(c).ok_or(LirWasm64Error::Overflow { what: "compound slots" })?;
+            }
+            Form::Vector => {
+                let elem = cur.elem();
+                let Some(elem_slots) = scalar_slot_count(elem).filter(|&s| s > 0) else {
+                    return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
+                };
+                let lanes = u16::try_from(cur.lanes())
+                    .map_err(|_| LirWasm64Error::Overflow { what: "vector lanes" })?;
+                let c = lanes
+                    .checked_mul(elem_slots)
+                    .ok_or(LirWasm64Error::Overflow { what: "vector slots" })?;
                 sum = sum.checked_add(c).ok_or(LirWasm64Error::Overflow { what: "compound slots" })?;
             }
             Form::Compound => {
@@ -540,7 +598,7 @@ fn wasm_slot_count(view: View<'_>, ty: Ty, func: u32, inst: usize) -> Result<u16
                     top += 1;
                 }
             }
-            Form::Vector | Form::Scalable => {
+            Form::Scalable => {
                 return Err(LirWasm64Error::UnsupportedType { func, inst, ty: cur });
             }
         }
@@ -661,6 +719,9 @@ impl<'a, 'm> ModuleCtx<'a, 'm> {
     }
 
     fn resolve_static(&self, func: u32, inst: usize, place: u32) -> Result<u64, LirWasm64Error> {
+        if place == NULL_STATIC_PLACE {
+            return Ok(0);
+        }
         for &(p, addr) in self.static_addrs.as_slice() {
             if p == place {
                 return Ok(addr);
@@ -891,6 +952,9 @@ pub fn compile_lir_wasm64<'a>(
     let mut data_bufs: AVec<'a, (u64, AVec<'a, u8>)> = Vec::new_in(alloc);
 
     for st in module.statics {
+        if st.place == NULL_STATIC_PLACE {
+            return Err(LirWasm64Error::Overflow { what: "static place collides with null sentinel" });
+        }
         for &(existing, _) in static_addrs.as_slice() {
             if existing == st.place {
                 return Err(LirWasm64Error::DuplicatePlace { kind: "static", place: st.place });
@@ -1085,11 +1149,14 @@ pub fn compile_lir_wasm64<'a>(
         }
     }
 
-    // 4. Pre-scan all `Op::FuncAddr` across functions so `indirect_table` is finalized before
-    //    lowering any `Op::CallIndirect` (deterministic slot ordering).
+    // 4. Pre-scan all `Op::FuncAddr` (and `Op::DataAddr` targeting `RefKind::Func`, e.g. a
+    //    foreign static resolved to a Rust `#[no_mangle]`/`#[export_name]` function) across
+    //    functions so `indirect_table` is finalized before lowering any `Op::CallIndirect`
+    //    (deterministic slot ordering).
     for f in module.funcs {
         for inst in 0..f.view.len() {
-            if f.view.op(inst) == Op::FuncAddr {
+            let op = f.view.op(inst);
+            if op == Op::FuncAddr || op == Op::DataAddr {
                 let ref_id = f.view.operands(inst).reference();
                 if ref_id.index() >= f.view.refs.len() {
                     return Err(LirWasm64Error::UnsupportedRef {
@@ -1100,16 +1167,21 @@ pub fn compile_lir_wasm64<'a>(
                     });
                 }
                 let rec = f.view.reference(ref_id);
-                if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
-                    return Err(LirWasm64Error::UnsupportedRef {
-                        func: f.place,
-                        inst,
-                        kind: rec.kind,
-                        place: rec.place,
-                    });
+                if op == Op::FuncAddr {
+                    if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
+                        return Err(LirWasm64Error::UnsupportedRef {
+                            func: f.place,
+                            inst,
+                            kind: rec.kind,
+                            place: rec.place,
+                        });
+                    }
+                    let wasm_idx = ctx.resolve_func(f.place, inst, rec.place)?;
+                    ctx.intern_indirect_func(wasm_idx);
+                } else if RefKind::from_word(rec.kind) == Some(RefKind::Func) {
+                    let wasm_idx = ctx.resolve_func(f.place, inst, rec.place)?;
+                    ctx.intern_indirect_func(wasm_idx);
                 }
-                let wasm_idx = ctx.resolve_func(f.place, inst, rec.place)?;
-                ctx.intern_indirect_func(wasm_idx);
             }
         }
     }
@@ -1327,18 +1399,11 @@ fn lower_func<'a, 'm, 'v>(
         code: Vec::new_in(alloc),
     };
 
-    // Function prologue: normalize sub-32-bit entry params + allocate shadow stack frame.
+    // Function prologue: normalize sub-32-bit entry params (scalars, vectors, compounds) +
+    // allocate shadow stack frame.
     for inst in entry_params {
         let ty = view.ty(Value(inst as u32));
-        if ty.is_scalar()
-            && let Some(mask) = sub32_mask(ty.elem())
-        {
-            let loc = em.val_locals[inst].first;
-            em.local_get(loc);
-            em.i32_const(mask as i32);
-            em.op(OP_I32_AND);
-            em.local_set(loc);
-        }
+        em.normalize_param_sub32(ty, em.val_locals[inst].first);
     }
     if let Some(sp) = em.sp_local {
         em.global_get(GLOBAL_STACK_POINTER);
@@ -1583,27 +1648,71 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         }
     }
 
-    /// Push value `v` (any scalar int `<= 64` bits) sign-extended to `i64`.
-    fn push_sext_to_i64(&mut self, v: Value) {
-        let scalar = self.view.ty(v).elem();
+    /// Normalize any sub-32-bit integer locals inside an entry parameter (scalar, vector, or
+    /// compound) so canonical zero-extension holds from function entry.
+    fn normalize_param_sub32(&mut self, ty: Ty, first_loc: u32) {
+        let mut cursor = first_loc;
+        let mut stack = [Ty::NONE; MAX_COMPOUND_DEPTH];
+        let mut top = 0usize;
+        stack[top] = ty;
+        top += 1;
+        while top > 0 {
+            top -= 1;
+            let cur = stack[top];
+            if cur.is_none() {
+                continue;
+            }
+            match cur.form() {
+                Form::Scalar | Form::Vector => {
+                    let elem = cur.elem();
+                    let count = cur.lanes() * lane_stride(elem);
+                    if let Some(mask) = sub32_mask(elem) {
+                        for i in 0..count {
+                            let loc = cursor + i;
+                            self.local_get(loc);
+                            self.i32_const(mask as i32);
+                            self.op(OP_I32_AND);
+                            self.local_set(loc);
+                        }
+                    }
+                    cursor += count;
+                }
+                Form::Compound => {
+                    for &member in self.view.members(cur).iter().rev() {
+                        stack[top] = Ty(member);
+                        top += 1;
+                    }
+                }
+                Form::Scalable => {}
+            }
+        }
+    }
+
+    /// Push scalar int at local `loc` sign-extended to `i64`.
+    fn push_sext_loc_to_i64(&mut self, scalar: Scalar, loc: u32) {
         match scalar {
             Scalar::I1 | Scalar::I8 | Scalar::I16 => {
-                self.local_get(self.loc(v));
+                self.local_get(loc);
                 self.sext_to_i32(scalar);
                 self.op(OP_I64_EXTEND_I32_S);
             }
             Scalar::I32 => {
-                self.local_get(self.loc(v));
+                self.local_get(loc);
                 self.op(OP_I64_EXTEND_I32_S);
             }
             Scalar::I64 | Scalar::Ptr => {
-                self.local_get(self.loc(v));
+                self.local_get(loc);
             }
             Scalar::I128 => {
-                self.local_get(self.loc(v)); // low 64 bits
+                self.local_get(loc); // low 64 bits
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Push value `v` (any scalar int `<= 64` bits) sign-extended to `i64`.
+    fn push_sext_to_i64(&mut self, v: Value) {
+        self.push_sext_loc_to_i64(self.view.ty(v).elem(), self.loc(v));
     }
 
     /// Push value `v` (any scalar int `<= 64` bits) zero-extended to `i64`.
@@ -1674,7 +1783,7 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
     ) -> Result<(), LirWasm64Error> {
         let op = self.view.op(inst);
         let ty = self.view.ty(Value(inst as u32));
-        if ty.is_vector() {
+        if ty.form() == Form::Scalable {
             return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty });
         }
 
@@ -1749,45 +1858,25 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                     _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
                 }
             }
+            Op::Vconst => {
+                self.emit_vconst(inst, ty)?;
+            }
             Op::Null => {
                 self.i64_const(0);
                 self.local_set(self.val_locals[inst].first);
             }
             Op::Uninit => {
                 let vl = self.val_locals[inst];
-                match ty.form() {
-                    Form::Scalar => match ty.elem() {
-                        Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => {
-                            self.i32_const(0);
-                            self.local_set(vl.first);
-                        }
-                        Scalar::I64 | Scalar::Ptr => {
-                            self.i64_const(0);
-                            self.local_set(vl.first);
-                        }
-                        Scalar::F32 => {
-                            self.f32_const_bits(0);
-                            self.local_set(vl.first);
-                        }
-                        Scalar::F64 => {
-                            self.f64_const_bits(0);
-                            self.local_set(vl.first);
-                        }
-                        Scalar::I128 => {
-                            self.i64_const(0);
-                            self.local_set(vl.first);
-                            self.i64_const(0);
-                            self.local_set(vl.first + 1);
-                        }
-                        _ => {
-                            return Err(LirWasm64Error::UnsupportedType {
-                                func: self.place,
-                                inst,
-                                ty,
-                            });
-                        }
-                    },
-                    _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
+                for i in 0..u32::from(vl.count) {
+                    let loc = vl.first + i;
+                    let vt = self.declared_locals[(loc - self.param_local_count) as usize];
+                    match vt {
+                        ValType::I32 => self.i32_const(0),
+                        ValType::I64 => self.i64_const(0),
+                        ValType::F32 => self.f32_const_bits(0),
+                        ValType::F64 => self.f64_const_bits(0),
+                    }
+                    self.local_set(loc);
                 }
             }
 
@@ -1822,7 +1911,7 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 self.emit_int_binary(inst, op, ty, a, b)?;
             }
 
-            // ---- Integer Overflow Ops `{T, i1}` ----
+            // ---- Integer Overflow Ops `{T, i1}` (scalar or vector) ----
             Op::UaddOverflow
             | Op::SaddOverflow
             | Op::UsubOverflow
@@ -1856,16 +1945,32 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
             Op::Select => {
                 let mut o = self.view.operands(inst);
                 let (cond, t_val, f_val) = (o.value(), o.value(), o.value());
+                let cond_ty = self.view.ty(cond);
                 let c_loc = self.loc(cond);
                 let tv = self.val_locals[t_val.index()];
                 let fv = self.val_locals[f_val.index()];
                 let dst = self.val_locals[inst];
-                for i in 0..u32::from(dst.count) {
-                    self.local_get(tv.first + i);
-                    self.local_get(fv.first + i);
-                    self.local_get(c_loc);
-                    self.op(OP_SELECT);
-                    self.local_set(dst.first + i);
+                if cond_ty.is_vector() {
+                    let lanes = ty.lanes();
+                    let stride = lane_stride(ty.elem());
+                    for k in 0..lanes {
+                        for s in 0..stride {
+                            let off = k * stride + s;
+                            self.local_get(tv.first + off);
+                            self.local_get(fv.first + off);
+                            self.local_get(c_loc + k);
+                            self.op(OP_SELECT);
+                            self.local_set(dst.first + off);
+                        }
+                    }
+                } else {
+                    for i in 0..u32::from(dst.count) {
+                        self.local_get(tv.first + i);
+                        self.local_get(fv.first + i);
+                        self.local_get(c_loc);
+                        self.op(OP_SELECT);
+                        self.local_set(dst.first + i);
+                    }
                 }
             }
 
@@ -1884,20 +1989,30 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
             }
             Op::Fpext => {
                 let a = self.view.operands(inst).value();
-                if self.view.ty(a) == Ty::F32 && ty == Ty::F64 {
-                    self.local_get(self.loc(a));
-                    self.op(OP_F64_PROMOTE_F32);
-                    self.local_set(self.val_locals[inst].first);
+                let from_ty = self.view.ty(a);
+                if from_ty.elem() == Scalar::F32 && ty.elem() == Scalar::F64 {
+                    let src = self.loc(a);
+                    let dst = self.val_locals[inst].first;
+                    for k in 0..ty.lanes() {
+                        self.local_get(src + k);
+                        self.op(OP_F64_PROMOTE_F32);
+                        self.local_set(dst + k);
+                    }
                 } else {
                     return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty });
                 }
             }
             Op::Fptrunc => {
                 let a = self.view.operands(inst).value();
-                if self.view.ty(a) == Ty::F64 && ty == Ty::F32 {
-                    self.local_get(self.loc(a));
-                    self.op(OP_F32_DEMOTE_F64);
-                    self.local_set(self.val_locals[inst].first);
+                let from_ty = self.view.ty(a);
+                if from_ty.elem() == Scalar::F64 && ty.elem() == Scalar::F32 {
+                    let src = self.loc(a);
+                    let dst = self.val_locals[inst].first;
+                    for k in 0..ty.lanes() {
+                        self.local_get(src + k);
+                        self.op(OP_F32_DEMOTE_F64);
+                        self.local_set(dst + k);
+                    }
                 } else {
                     return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty });
                 }
@@ -1912,39 +2027,7 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
             }
             Op::Bitcast => {
                 let a = self.view.operands(inst).value();
-                let from_ty = self.view.ty(a);
-                let dst = self.val_locals[inst].first;
-                let src = self.loc(a);
-                match (from_ty.elem(), ty.elem()) {
-                    (Scalar::I32, Scalar::F32) => {
-                        self.local_get(src);
-                        self.op(OP_F32_REINTERPRET_I32);
-                        self.local_set(dst);
-                    }
-                    (Scalar::F32, Scalar::I32) => {
-                        self.local_get(src);
-                        self.op(OP_I32_REINTERPRET_F32);
-                        self.local_set(dst);
-                    }
-                    (Scalar::I64, Scalar::F64) => {
-                        self.local_get(src);
-                        self.op(OP_F64_REINTERPRET_I64);
-                        self.local_set(dst);
-                    }
-                    (Scalar::F64, Scalar::I64) => {
-                        self.local_get(src);
-                        self.op(OP_I64_REINTERPRET_F64);
-                        self.local_set(dst);
-                    }
-                    (x, y) if x == y => {
-                        let count = self.val_locals[inst].count;
-                        for i in 0..u32::from(count) {
-                            self.local_get(src + i);
-                            self.local_set(dst + i);
-                        }
-                    }
-                    _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
-                }
+                self.emit_bitcast(inst, ty, a)?;
             }
 
             // ---- Floating-point Ops ----
@@ -1952,6 +2035,7 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
             | Op::Fsub
             | Op::Fmul
             | Op::Fdiv
+            | Op::Frem
             | Op::Fcopysign
             | Op::FminNum
             | Op::FmaxNum
@@ -1975,36 +2059,41 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
             Op::Fma | Op::Fmuladd => {
                 let mut o = self.view.operands(inst);
                 let (a, b, c) = (o.value(), o.value(), o.value());
+                let (la, lb, lc) = (self.loc(a), self.loc(b), self.loc(c));
                 let dst = self.val_locals[inst].first;
                 match ty.elem() {
                     Scalar::F32 => {
-                        if op == Op::Fma {
-                            // Promote to f64 so a * b has exact intermediate product.
-                            self.local_get(self.loc(a));
-                            self.op(OP_F64_PROMOTE_F32);
-                            self.local_get(self.loc(b));
-                            self.op(OP_F64_PROMOTE_F32);
-                            self.op(OP_F64_MUL);
-                            self.local_get(self.loc(c));
-                            self.op(OP_F64_PROMOTE_F32);
-                            self.op(OP_F64_ADD);
-                            self.op(OP_F32_DEMOTE_F64);
-                        } else {
-                            self.local_get(self.loc(a));
-                            self.local_get(self.loc(b));
-                            self.op(OP_F32_MUL);
-                            self.local_get(self.loc(c));
-                            self.op(OP_F32_ADD);
+                        for k in 0..ty.lanes() {
+                            if op == Op::Fma {
+                                // Promote to f64 so a * b has exact intermediate product.
+                                self.local_get(la + k);
+                                self.op(OP_F64_PROMOTE_F32);
+                                self.local_get(lb + k);
+                                self.op(OP_F64_PROMOTE_F32);
+                                self.op(OP_F64_MUL);
+                                self.local_get(lc + k);
+                                self.op(OP_F64_PROMOTE_F32);
+                                self.op(OP_F64_ADD);
+                                self.op(OP_F32_DEMOTE_F64);
+                            } else {
+                                self.local_get(la + k);
+                                self.local_get(lb + k);
+                                self.op(OP_F32_MUL);
+                                self.local_get(lc + k);
+                                self.op(OP_F32_ADD);
+                            }
+                            self.local_set(dst + k);
                         }
-                        self.local_set(dst);
                     }
                     Scalar::F64 => {
-                        self.local_get(self.loc(a));
-                        self.local_get(self.loc(b));
-                        self.op(OP_F64_MUL);
-                        self.local_get(self.loc(c));
-                        self.op(OP_F64_ADD);
-                        self.local_set(dst);
+                        for k in 0..ty.lanes() {
+                            self.local_get(la + k);
+                            self.local_get(lb + k);
+                            self.op(OP_F64_MUL);
+                            self.local_get(lc + k);
+                            self.op(OP_F64_ADD);
+                            self.local_set(dst + k);
+                        }
                     }
                     _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
                 }
@@ -2025,15 +2114,26 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
             Op::PtrAdd => {
                 let mut o = self.view.operands(inst);
                 let (ptr, offset) = (o.value(), o.value());
-                self.local_get(self.loc(ptr));
-                self.push_sext_to_i64(offset);
-                self.op(OP_I64_ADD);
-                self.local_set(self.val_locals[inst].first);
+                let off_ty = self.view.ty(offset);
+                let off_stride = lane_stride(off_ty.elem());
+                let p_base = self.loc(ptr);
+                let o_base = self.loc(offset);
+                let dst = self.val_locals[inst].first;
+                for k in 0..ty.lanes() {
+                    self.local_get(p_base + k);
+                    self.push_sext_loc_to_i64(off_ty.elem(), o_base + k * off_stride);
+                    self.op(OP_I64_ADD);
+                    self.local_set(dst + k);
+                }
             }
             Op::PtrAddr | Op::Expose | Op::FromExposed => {
                 let a = self.view.operands(inst).value();
-                self.local_get(self.loc(a));
-                self.local_set(self.val_locals[inst].first);
+                let src = self.loc(a);
+                let dst = self.val_locals[inst].first;
+                for k in 0..ty.lanes() {
+                    self.local_get(src + k);
+                    self.local_set(dst + k);
+                }
             }
             Op::PtrWithAddr => {
                 let mut o = self.view.operands(inst);
@@ -2079,6 +2179,10 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                         })?,
                     Some(RefKind::Static | RefKind::Vtable | RefKind::Tls) => {
                         self.ctx.resolve_static(self.place, inst, rec.place)?
+                    }
+                    Some(RefKind::Func) => {
+                        let wasm_idx = self.ctx.resolve_func(self.place, inst, rec.place)?;
+                        u64::from(self.ctx.intern_indirect_func(wasm_idx))
                     }
                     _ => {
                         return Err(LirWasm64Error::UnsupportedRef {
@@ -2181,6 +2285,139 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 self.emit_cmpxchg(inst, ptr, expected, new_val)?;
             }
 
+            // ---- Vector Ops ----
+            Op::Splat => {
+                let x = self.view.operands(inst).value();
+                let src = self.loc(x);
+                let dst = self.val_locals[inst].first;
+                let stride = lane_stride(ty.elem());
+                for k in 0..ty.lanes() {
+                    for s in 0..stride {
+                        self.local_get(src + s);
+                        self.local_set(dst + k * stride + s);
+                    }
+                }
+            }
+            Op::Extract => {
+                let mut o = self.view.operands(inst);
+                let v = o.value();
+                let lane = o.imm();
+                let v_ty = self.view.ty(v);
+                if lane >= v_ty.lanes() {
+                    return Err(LirWasm64Error::InvalidCompound {
+                        func: self.place,
+                        inst,
+                        index: lane,
+                    });
+                }
+                let stride = lane_stride(v_ty.elem());
+                let src = self.loc(v) + lane * stride;
+                let dst = self.val_locals[inst].first;
+                for s in 0..stride {
+                    self.local_get(src + s);
+                    self.local_set(dst + s);
+                }
+            }
+            Op::Insert => {
+                let mut o = self.view.operands(inst);
+                let (v, x, lane) = (o.value(), o.value(), o.imm());
+                let v_ty = self.view.ty(v);
+                if lane >= v_ty.lanes() {
+                    return Err(LirWasm64Error::InvalidCompound {
+                        func: self.place,
+                        inst,
+                        index: lane,
+                    });
+                }
+                let stride = lane_stride(v_ty.elem());
+                let v_base = self.loc(v);
+                let x_base = self.loc(x);
+                let dst = self.val_locals[inst].first;
+                for k in 0..v_ty.lanes() {
+                    let src = if k == lane { x_base } else { v_base + k * stride };
+                    for s in 0..stride {
+                        self.local_get(src + s);
+                        self.local_set(dst + k * stride + s);
+                    }
+                }
+            }
+            Op::Shuffle => {
+                let mut o = self.view.operands(inst);
+                let (a, b) = (o.value(), o.value());
+                let mask = o.mask();
+                let a_ty = self.view.ty(a);
+                let a_lanes = a_ty.lanes();
+                let stride = lane_stride(a_ty.elem());
+                let a_base = self.loc(a);
+                let b_base = self.loc(b);
+                let dst = self.val_locals[inst].first;
+                for (i, &k) in mask.iter().enumerate() {
+                    let src = if k < a_lanes {
+                        a_base + k * stride
+                    } else {
+                        b_base + (k - a_lanes) * stride
+                    };
+                    for s in 0..stride {
+                        self.local_get(src + s);
+                        self.local_set(dst + (i as u32) * stride + s);
+                    }
+                }
+            }
+            Op::Swizzle => {
+                let mut o = self.view.operands(inst);
+                let (a, idx) = (o.value(), o.value());
+                self.emit_swizzle(inst, ty, a, idx)?;
+            }
+            Op::ReduceAdd
+            | Op::ReduceMul
+            | Op::ReduceAnd
+            | Op::ReduceOr
+            | Op::ReduceXor
+            | Op::ReduceUmin
+            | Op::ReduceUmax
+            | Op::ReduceSmin
+            | Op::ReduceSmax => {
+                let v = self.view.operands(inst).value();
+                self.emit_reduce_int(inst, op, ty, v)?;
+            }
+            Op::ReduceFadd | Op::ReduceFmul => {
+                let mut o = self.view.operands(inst);
+                let (start, v) = (o.value(), o.value());
+                self.emit_reduce_float_init(inst, op, ty, start, v)?;
+            }
+            Op::ReduceFmin | Op::ReduceFmax => {
+                let v = self.view.operands(inst).value();
+                self.emit_reduce_float_minmax(inst, op, ty, v)?;
+            }
+            Op::Bitmask => {
+                let v = self.view.operands(inst).value();
+                self.emit_bitmask(inst, ty, v)?;
+            }
+            Op::MaskedLoad => {
+                let mut o = self.view.operands(inst);
+                let (ptr, mask, pass) = (o.value(), o.value(), o.value());
+                let align_hint = self.view.mem_attrs(inst).map_or(0, |a| u32::from(a.align));
+                self.emit_masked_load(inst, ty, ptr, mask, pass, align_hint)?;
+            }
+            Op::MaskedStore => {
+                let mut o = self.view.operands(inst);
+                let (val, ptr, mask) = (o.value(), o.value(), o.value());
+                let align_hint = self.view.mem_attrs(inst).map_or(0, |a| u32::from(a.align));
+                self.emit_masked_store(inst, val, ptr, mask, align_hint)?;
+            }
+            Op::Gather => {
+                let mut o = self.view.operands(inst);
+                let (ptrs, mask, pass) = (o.value(), o.value(), o.value());
+                let align_hint = self.view.mem_attrs(inst).map_or(0, |a| u32::from(a.align));
+                self.emit_gather(inst, ty, ptrs, mask, pass, align_hint)?;
+            }
+            Op::Scatter => {
+                let mut o = self.view.operands(inst);
+                let (val, ptrs, mask) = (o.value(), o.value(), o.value());
+                let align_hint = self.view.mem_attrs(inst).map_or(0, |a| u32::from(a.align));
+                self.emit_scatter(inst, val, ptrs, mask, align_hint)?;
+            }
+
             // ---- Calls & Compound Projection ----
             Op::Call => {
                 let mut o = self.view.operands(inst);
@@ -2233,8 +2470,13 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                     b"llvm.aarch64.isb"
                     | b"llvm.aarch64.dmb"
                     | b"llvm.aarch64.dsb"
-                    | b"llvm.aarch64.hint" => {
-                        // Single-threaded Wasm64: barriers and spin hints are no-ops.
+                    | b"llvm.aarch64.hint"
+                    | b"blaze.prefetch.r1"
+                    | b"blaze.prefetch.w1"
+                    | b"llvm.prefetch"
+                        if ty.is_none() =>
+                    {
+                        // Single-threaded Wasm64: barriers, spin hints, and prefetches are no-ops.
                     }
                     _ => {
                         return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op });
@@ -2650,27 +2892,51 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         a: Value,
         b: Value,
     ) -> Result<(), LirWasm64Error> {
+        let lanes = ty.lanes();
+        let stride = lane_stride(ty.elem());
+        let (a_base, b_base, dst_base) = (self.loc(a), self.loc(b), self.val_locals[inst].first);
+        for k in 0..lanes {
+            self.emit_int_binary_loc(
+                inst,
+                op,
+                ty,
+                a_base + k * stride,
+                b_base + k * stride,
+                dst_base + k * stride,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_int_binary_loc(
+        &mut self,
+        inst: usize,
+        op: Op,
+        ty: Ty,
+        la: u32,
+        lb: u32,
+        dst: u32,
+    ) -> Result<(), LirWasm64Error> {
         let scalar = ty.elem();
         match scalar {
             Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => {
-                self.emit_i32_binary(inst, op, scalar, a, b)
+                self.emit_i32_binary_loc(inst, op, scalar, la, lb, dst)
             }
-            Scalar::I64 => self.emit_i64_binary(inst, op, a, b),
-            Scalar::I128 => self.emit_i128_binary(inst, op, a, b),
+            Scalar::I64 => self.emit_i64_binary_loc(inst, op, la, lb, dst),
+            Scalar::I128 => self.emit_i128_binary_loc(inst, op, la, la + 1, lb, lb + 1, dst, dst + 1),
             _ => Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
         }
     }
 
-    fn emit_i32_binary(
+    fn emit_i32_binary_loc(
         &mut self,
         inst: usize,
         op: Op,
         scalar: Scalar,
-        a: Value,
-        b: Value,
+        la: u32,
+        lb: u32,
+        dst: u32,
     ) -> Result<(), LirWasm64Error> {
-        let dst = self.val_locals[inst].first;
-        let (la, lb) = (self.loc(a), self.loc(b));
         let bits = sub32_bits(scalar);
 
         match op {
@@ -2991,15 +3257,14 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         Ok(())
     }
 
-    fn emit_i64_binary(
+    fn emit_i64_binary_loc(
         &mut self,
         inst: usize,
         op: Op,
-        a: Value,
-        b: Value,
+        la: u32,
+        lb: u32,
+        dst: u32,
     ) -> Result<(), LirWasm64Error> {
-        let dst = self.val_locals[inst].first;
-        let (la, lb) = (self.loc(a), self.loc(b));
         match op {
             Op::Add => {
                 self.local_get(la);
@@ -3273,24 +3538,382 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         self.local_set(out_local);
     }
 
-    fn emit_i128_binary(
+    /// Computes unsigned 256-bit product `(out0, out1, out2, out3) = a * b` (little-endian 64-bit
+    /// limbs). Uses `temps_i64[0..=11]`; `out0..=out3` must not alias `a`, `b`, or `temps_i64[0..=11]`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_wide_umul128(
+        &mut self,
+        a_lo: u32,
+        a_hi: u32,
+        b_lo: u32,
+        b_hi: u32,
+        out0: u32,
+        out1: u32,
+        out2: u32,
+        out3: u32,
+    ) {
+        let p00_hi = self.temp_i64(6);
+        let p01_lo = self.temp_i64(7);
+        let p01_hi = self.temp_i64(8);
+        let p10_lo = self.temp_i64(9);
+        let p10_hi = self.temp_i64(10);
+        let c1 = self.temp_i64(11);
+
+        // 1. All four high 64-bit partial products (each uses temps_i64[0..=5]).
+        self.emit_umulhi64_to(a_lo, b_lo, p00_hi);
+        self.emit_umulhi64_to(a_lo, b_hi, p01_hi);
+        self.emit_umulhi64_to(a_hi, b_lo, p10_hi);
+        self.emit_umulhi64_to(a_hi, b_hi, out3);
+
+        // 2. Low 64-bit partial products (temps_i64[0..=5] are now free).
+        let p11_lo = self.temp_i64(0);
+        let s1a = self.temp_i64(1);
+        let s2a = self.temp_i64(2);
+        let s2b = self.temp_i64(3);
+
+        self.local_get(a_lo);
+        self.local_get(b_hi);
+        self.op(OP_I64_MUL);
+        self.local_set(p01_lo);
+
+        self.local_get(a_hi);
+        self.local_get(b_lo);
+        self.op(OP_I64_MUL);
+        self.local_set(p10_lo);
+
+        self.local_get(a_hi);
+        self.local_get(b_hi);
+        self.op(OP_I64_MUL);
+        self.local_set(p11_lo);
+
+        self.local_get(a_lo);
+        self.local_get(b_lo);
+        self.op(OP_I64_MUL);
+        self.local_set(out0);
+
+        // 3. Column 1 (2^64): out1 = p00_hi + p01_lo + p10_lo, carry c1 in 0..=2.
+        self.local_get(p00_hi);
+        self.local_get(p01_lo);
+        self.op(OP_I64_ADD);
+        self.local_tee(s1a);
+        self.local_get(p00_hi);
+        self.op(OP_I64_LT_U);
+        self.op(OP_I64_EXTEND_I32_U);
+
+        self.local_get(s1a);
+        self.local_get(p10_lo);
+        self.op(OP_I64_ADD);
+        self.local_tee(out1);
+        self.local_get(s1a);
+        self.op(OP_I64_LT_U);
+        self.op(OP_I64_EXTEND_I32_U);
+
+        self.op(OP_I64_ADD);
+        self.local_set(c1);
+
+        // 4. Column 2 (2^128): out2 = p11_lo + p01_hi + p10_hi + c1, carry c2 in 0..=3.
+        self.local_get(p11_lo);
+        self.local_get(p01_hi);
+        self.op(OP_I64_ADD);
+        self.local_tee(s2a);
+        self.local_get(p11_lo);
+        self.op(OP_I64_LT_U);
+        self.op(OP_I64_EXTEND_I32_U);
+
+        self.local_get(s2a);
+        self.local_get(p10_hi);
+        self.op(OP_I64_ADD);
+        self.local_tee(s2b);
+        self.local_get(s2a);
+        self.op(OP_I64_LT_U);
+        self.op(OP_I64_EXTEND_I32_U);
+        self.op(OP_I64_ADD);
+
+        self.local_get(s2b);
+        self.local_get(c1);
+        self.op(OP_I64_ADD);
+        self.local_tee(out2);
+        self.local_get(s2b);
+        self.op(OP_I64_LT_U);
+        self.op(OP_I64_EXTEND_I32_U);
+        self.op(OP_I64_ADD);
+
+        // 5. Column 3 (2^192): out3 += c2.
+        self.local_get(out3);
+        self.op(OP_I64_ADD);
+        self.local_set(out3);
+    }
+
+    /// Adjusts unsigned high 128 bits `(h_lo, h_hi)` to signed high 128 bits of `a * b`:
+    /// `if a <s 0 { h -= b }; if b <s 0 { h -= a }`. Uses `temps_i64[0]`.
+    fn emit_smulhi128_adjust(
+        &mut self,
+        a_lo: u32,
+        a_hi: u32,
+        b_lo: u32,
+        b_hi: u32,
+        h_lo: u32,
+        h_hi: u32,
+    ) {
+        let borrow = self.temp_i64(0);
+        // if a <s 0 { (h_lo, h_hi) -= (b_lo, b_hi) }
+        self.local_get(a_hi);
+        self.i64_const(0);
+        self.op(OP_I64_LT_S);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(h_lo);
+        self.local_get(b_lo);
+        self.op(OP_I64_LT_U);
+        self.op(OP_I64_EXTEND_I32_U);
+        self.local_set(borrow);
+        self.local_get(h_lo);
+        self.local_get(b_lo);
+        self.op(OP_I64_SUB);
+        self.local_set(h_lo);
+        self.local_get(h_hi);
+        self.local_get(b_hi);
+        self.op(OP_I64_SUB);
+        self.local_get(borrow);
+        self.op(OP_I64_SUB);
+        self.local_set(h_hi);
+        self.op(OP_END);
+
+        // if b <s 0 { (h_lo, h_hi) -= (a_lo, a_hi) }
+        self.local_get(b_hi);
+        self.i64_const(0);
+        self.op(OP_I64_LT_S);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(h_lo);
+        self.local_get(a_lo);
+        self.op(OP_I64_LT_U);
+        self.op(OP_I64_EXTEND_I32_U);
+        self.local_set(borrow);
+        self.local_get(h_lo);
+        self.local_get(a_lo);
+        self.op(OP_I64_SUB);
+        self.local_set(h_lo);
+        self.local_get(h_hi);
+        self.local_get(a_hi);
+        self.op(OP_I64_SUB);
+        self.local_get(borrow);
+        self.op(OP_I64_SUB);
+        self.local_set(h_hi);
+        self.op(OP_END);
+    }
+
+    /// Two's-complement negation of 128-bit `(src_lo, src_hi)` into `(dst_lo, dst_hi)`.
+    /// Safe when `dst` aliases `src`. Uses `temps_i64[0]`.
+    fn emit_neg128_to(&mut self, src_lo: u32, src_hi: u32, dst_lo: u32, dst_hi: u32) {
+        let neg_lo = self.temp_i64(0);
+        self.i64_const(0);
+        self.local_get(src_lo);
+        self.op(OP_I64_SUB);
+        self.local_set(neg_lo);
+        self.i64_const(0);
+        self.local_get(src_hi);
+        self.op(OP_I64_SUB);
+        self.local_get(src_lo);
+        self.i64_const(0);
+        self.op(OP_I64_NE);
+        self.op(OP_I64_EXTEND_I32_U);
+        self.op(OP_I64_SUB);
+        self.local_set(dst_hi);
+        self.local_get(neg_lo);
+        self.local_set(dst_lo);
+    }
+
+    /// Unsigned 128-bit division/remainder `(q_lo, q_hi, r_lo, r_hi) = n / d`, trapping if `d == 0`.
+    /// Uses `temps_i64[0..=5]` and `temps_i32[0]`; `q` and `r` must not overlap `temps_i64[0..=5]`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_udivrem128(
+        &mut self,
+        n_lo: u32,
+        n_hi: u32,
+        d_lo: u32,
+        d_hi: u32,
+        q_lo: u32,
+        q_hi: u32,
+        r_lo: u32,
+        r_hi: u32,
+    ) {
+        let a_lo = self.temp_i64(0);
+        let a_hi = self.temp_i64(1);
+        let div_lo = self.temp_i64(2);
+        let div_hi = self.temp_i64(3);
+        let carry_in = self.temp_i64(4);
+        let r_ovf = self.temp_i64(5);
+        let cnt = self.temp_i32(0);
+
+        self.local_get(n_lo);
+        self.local_set(a_lo);
+        self.local_get(n_hi);
+        self.local_set(a_hi);
+        self.local_get(d_lo);
+        self.local_set(div_lo);
+        self.local_get(d_hi);
+        self.local_set(div_hi);
+
+        // Trap if divisor == 0.
+        self.local_get(div_lo);
+        self.local_get(div_hi);
+        self.op(OP_I64_OR);
+        self.op(OP_I64_EQZ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.op(OP_UNREACHABLE);
+        self.op(OP_END);
+
+        // Fast path: both fit in u64.
+        self.local_get(a_hi);
+        self.local_get(div_hi);
+        self.op(OP_I64_OR);
+        self.op(OP_I64_EQZ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(a_lo);
+        self.local_get(div_lo);
+        self.op(OP_I64_DIV_U);
+        self.local_set(q_lo);
+        self.i64_const(0);
+        self.local_set(q_hi);
+        self.local_get(a_lo);
+        self.local_get(div_lo);
+        self.op(OP_I64_REM_U);
+        self.local_set(r_lo);
+        self.i64_const(0);
+        self.local_set(r_hi);
+        self.op(OP_ELSE);
+
+        // General 128-bit restoring binary long division with explicit 129th remainder bit `r_ovf`.
+        self.i64_const(0);
+        self.local_set(q_lo);
+        self.i64_const(0);
+        self.local_set(q_hi);
+        self.i64_const(0);
+        self.local_set(r_lo);
+        self.i64_const(0);
+        self.local_set(r_hi);
+        self.i32_const(128);
+        self.local_set(cnt);
+
+        self.op(OP_LOOP);
+        self.code.push(BLOCKTYPE_VOID);
+
+        // carry_in = a_hi >>_u 63
+        self.local_get(a_hi);
+        self.i64_const(63);
+        self.op(OP_I64_SHR_U);
+        self.local_set(carry_in);
+
+        // a <<= 1
+        self.local_get(a_hi);
+        self.i64_const(1);
+        self.op(OP_I64_SHL);
+        self.local_get(a_lo);
+        self.i64_const(63);
+        self.op(OP_I64_SHR_U);
+        self.op(OP_I64_OR);
+        self.local_set(a_hi);
+        self.local_get(a_lo);
+        self.i64_const(1);
+        self.op(OP_I64_SHL);
+        self.local_set(a_lo);
+
+        // r_ovf = r_hi >>_u 63; r = (r << 1) | carry_in
+        self.local_get(r_hi);
+        self.i64_const(63);
+        self.op(OP_I64_SHR_U);
+        self.local_set(r_ovf);
+        self.local_get(r_hi);
+        self.i64_const(1);
+        self.op(OP_I64_SHL);
+        self.local_get(r_lo);
+        self.i64_const(63);
+        self.op(OP_I64_SHR_U);
+        self.op(OP_I64_OR);
+        self.local_set(r_hi);
+        self.local_get(r_lo);
+        self.i64_const(1);
+        self.op(OP_I64_SHL);
+        self.local_get(carry_in);
+        self.op(OP_I64_OR);
+        self.local_set(r_lo);
+
+        // q <<= 1
+        self.local_get(q_hi);
+        self.i64_const(1);
+        self.op(OP_I64_SHL);
+        self.local_get(q_lo);
+        self.i64_const(63);
+        self.op(OP_I64_SHR_U);
+        self.op(OP_I64_OR);
+        self.local_set(q_hi);
+        self.local_get(q_lo);
+        self.i64_const(1);
+        self.op(OP_I64_SHL);
+        self.local_set(q_lo);
+
+        // if (r_ovf != 0) | (r >=u div) { r -= div; q_lo |= 1; }
+        self.local_get(r_ovf);
+        self.i64_const(0);
+        self.op(OP_I64_NE);
+        self.push_i128_cmp(IntCond::Uge, r_lo, r_hi, div_lo, div_hi);
+        self.op(OP_I32_OR);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        // reuse carry_in as borrow
+        self.local_get(r_lo);
+        self.local_get(div_lo);
+        self.op(OP_I64_LT_U);
+        self.op(OP_I64_EXTEND_I32_U);
+        self.local_set(carry_in);
+        self.local_get(r_lo);
+        self.local_get(div_lo);
+        self.op(OP_I64_SUB);
+        self.local_set(r_lo);
+        self.local_get(r_hi);
+        self.local_get(div_hi);
+        self.op(OP_I64_SUB);
+        self.local_get(carry_in);
+        self.op(OP_I64_SUB);
+        self.local_set(r_hi);
+        self.local_get(q_lo);
+        self.i64_const(1);
+        self.op(OP_I64_OR);
+        self.local_set(q_lo);
+        self.op(OP_END);
+
+        // cnt -= 1; br_if 0 (cnt != 0)
+        self.local_get(cnt);
+        self.i32_const(1);
+        self.op(OP_I32_SUB);
+        self.local_tee(cnt);
+        self.br_if(0);
+        self.op(OP_END); // end loop
+        self.op(OP_END); // end fast-path if/else
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_i128_binary_loc(
         &mut self,
         inst: usize,
         op: Op,
-        a: Value,
-        b: Value,
+        a_lo: u32,
+        a_hi: u32,
+        b_lo: u32,
+        b_hi: u32,
+        d_lo: u32,
+        d_hi: u32,
     ) -> Result<(), LirWasm64Error> {
-        let (a_lo, a_hi) = self.loc_pair(a);
-        let (b_lo, b_hi) = self.loc_pair(b);
-        let d_lo = self.val_locals[inst].first;
-        let d_hi = d_lo + 1;
-
         match op {
             Op::Add => {
+                let sum_lo = self.temp_i64(0);
                 self.local_get(a_lo);
                 self.local_get(b_lo);
                 self.op(OP_I64_ADD);
-                self.local_tee(d_lo);
+                self.local_tee(sum_lo);
                 self.local_get(a_lo);
                 self.op(OP_I64_LT_U);
                 self.op(OP_I64_EXTEND_I32_U);
@@ -3299,12 +3922,15 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 self.op(OP_I64_ADD);
                 self.op(OP_I64_ADD);
                 self.local_set(d_hi);
+                self.local_get(sum_lo);
+                self.local_set(d_lo);
             }
             Op::Sub => {
+                let diff_lo = self.temp_i64(0);
                 self.local_get(a_lo);
                 self.local_get(b_lo);
                 self.op(OP_I64_SUB);
-                self.local_set(d_lo);
+                self.local_set(diff_lo);
                 self.local_get(a_hi);
                 self.local_get(b_hi);
                 self.op(OP_I64_SUB);
@@ -3314,10 +3940,13 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 self.op(OP_I64_EXTEND_I32_U);
                 self.op(OP_I64_SUB);
                 self.local_set(d_hi);
+                self.local_get(diff_lo);
+                self.local_set(d_lo);
             }
             Op::Mul => {
-                self.emit_umulhi64_to(a_lo, b_lo, d_hi);
-                self.local_get(d_hi);
+                let hi = self.temp_i64(6);
+                self.emit_umulhi64_to(a_lo, b_lo, hi);
+                self.local_get(hi);
                 self.local_get(a_lo);
                 self.local_get(b_hi);
                 self.op(OP_I64_MUL);
@@ -3326,11 +3955,115 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 self.local_get(b_lo);
                 self.op(OP_I64_MUL);
                 self.op(OP_I64_ADD);
-                self.local_set(d_hi);
+                self.local_set(hi);
                 self.local_get(a_lo);
                 self.local_get(b_lo);
                 self.op(OP_I64_MUL);
                 self.local_set(d_lo);
+                self.local_get(hi);
+                self.local_set(d_hi);
+            }
+            Op::Umulhi | Op::Smulhi => {
+                let lo0 = self.temp_i64(12);
+                let lo1 = self.temp_i64(13);
+                self.emit_wide_umul128(a_lo, a_hi, b_lo, b_hi, lo0, lo1, d_lo, d_hi);
+                if op == Op::Smulhi {
+                    self.emit_smulhi128_adjust(a_lo, a_hi, b_lo, b_hi, d_lo, d_hi);
+                }
+            }
+            Op::Udiv | Op::Urem => {
+                let t0 = self.temp_i64(6);
+                let t1 = self.temp_i64(7);
+                if op == Op::Udiv {
+                    self.emit_udivrem128(a_lo, a_hi, b_lo, b_hi, d_lo, d_hi, t0, t1);
+                } else {
+                    self.emit_udivrem128(a_lo, a_hi, b_lo, b_hi, t0, t1, d_lo, d_hi);
+                }
+            }
+            Op::Sdiv | Op::Srem => {
+                let un_lo = self.temp_i64(8);
+                let un_hi = self.temp_i64(9);
+                let ud_lo = self.temp_i64(10);
+                let ud_hi = self.temp_i64(11);
+                let uq_lo = self.temp_i64(6);
+                let uq_hi = self.temp_i64(7);
+                let neg_res = self.temp_i32(1);
+
+                // Trap on i128::MIN / -1 for Sdiv (Srem returns 0).
+                if op == Op::Sdiv {
+                    self.local_get(a_lo);
+                    self.op(OP_I64_EQZ);
+                    self.local_get(a_hi);
+                    self.i64_const(i64::MIN);
+                    self.op(OP_I64_EQ);
+                    self.op(OP_I32_AND);
+                    self.local_get(b_lo);
+                    self.i64_const(-1);
+                    self.op(OP_I64_EQ);
+                    self.op(OP_I32_AND);
+                    self.local_get(b_hi);
+                    self.i64_const(-1);
+                    self.op(OP_I64_EQ);
+                    self.op(OP_I32_AND);
+                    self.op(OP_IF);
+                    self.code.push(BLOCKTYPE_VOID);
+                    self.op(OP_UNREACHABLE);
+                    self.op(OP_END);
+                }
+
+                // Result sign flag.
+                if op == Op::Sdiv {
+                    self.local_get(a_hi);
+                    self.local_get(b_hi);
+                    self.op(OP_I64_XOR);
+                    self.i64_const(0);
+                    self.op(OP_I64_LT_S);
+                } else {
+                    self.local_get(a_hi);
+                    self.i64_const(0);
+                    self.op(OP_I64_LT_S);
+                }
+                self.local_set(neg_res);
+
+                // un = abs(a)
+                self.local_get(a_hi);
+                self.i64_const(0);
+                self.op(OP_I64_LT_S);
+                self.op(OP_IF);
+                self.code.push(BLOCKTYPE_VOID);
+                self.emit_neg128_to(a_lo, a_hi, un_lo, un_hi);
+                self.op(OP_ELSE);
+                self.local_get(a_lo);
+                self.local_set(un_lo);
+                self.local_get(a_hi);
+                self.local_set(un_hi);
+                self.op(OP_END);
+
+                // ud = abs(b)
+                self.local_get(b_hi);
+                self.i64_const(0);
+                self.op(OP_I64_LT_S);
+                self.op(OP_IF);
+                self.code.push(BLOCKTYPE_VOID);
+                self.emit_neg128_to(b_lo, b_hi, ud_lo, ud_hi);
+                self.op(OP_ELSE);
+                self.local_get(b_lo);
+                self.local_set(ud_lo);
+                self.local_get(b_hi);
+                self.local_set(ud_hi);
+                self.op(OP_END);
+
+                if op == Op::Sdiv {
+                    self.emit_udivrem128(un_lo, un_hi, ud_lo, ud_hi, d_lo, d_hi, uq_lo, uq_hi);
+                } else {
+                    self.emit_udivrem128(un_lo, un_hi, ud_lo, ud_hi, uq_lo, uq_hi, d_lo, d_hi);
+                }
+
+                self.local_get(neg_res);
+                self.op(OP_IF);
+                self.code.push(BLOCKTYPE_VOID);
+                self.emit_neg128_to(d_lo, d_hi, d_lo, d_hi);
+                self.op(OP_END);
             }
             Op::And | Op::Or | Op::Xor => {
                 let wop = match op {
@@ -3440,6 +4173,99 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 self.op(OP_END);
                 self.op(OP_END);
             }
+            Op::Rotl | Op::Rotr => {
+                // Reduce Rotr(a, k) to Rotl(a, (128 - (k & 127)) & 127).
+                let s = self.temp_i64(0);
+                let s2 = self.temp_i64(1);
+                if op == Op::Rotl {
+                    self.local_get(b_lo);
+                    self.i64_const(127);
+                    self.op(OP_I64_AND);
+                } else {
+                    self.i64_const(128);
+                    self.local_get(b_lo);
+                    self.i64_const(127);
+                    self.op(OP_I64_AND);
+                    self.op(OP_I64_SUB);
+                    self.i64_const(127);
+                    self.op(OP_I64_AND);
+                }
+                self.local_tee(s);
+                self.op(OP_I64_EQZ);
+                self.op(OP_IF);
+                self.code.push(BLOCKTYPE_VOID);
+                self.local_get(a_lo);
+                self.local_set(d_lo);
+                self.local_get(a_hi);
+                self.local_set(d_hi);
+                self.op(OP_ELSE);
+                self.local_get(s);
+                self.i64_const(64);
+                self.op(OP_I64_LT_U);
+                self.op(OP_IF);
+                self.code.push(BLOCKTYPE_VOID);
+                // 1 <= s <= 63
+                self.local_get(a_lo);
+                self.local_get(s);
+                self.op(OP_I64_SHL);
+                self.local_get(a_hi);
+                self.i64_const(64);
+                self.local_get(s);
+                self.op(OP_I64_SUB);
+                self.op(OP_I64_SHR_U);
+                self.op(OP_I64_OR);
+                self.local_set(d_lo);
+                self.local_get(a_hi);
+                self.local_get(s);
+                self.op(OP_I64_SHL);
+                self.local_get(a_lo);
+                self.i64_const(64);
+                self.local_get(s);
+                self.op(OP_I64_SUB);
+                self.op(OP_I64_SHR_U);
+                self.op(OP_I64_OR);
+                self.local_set(d_hi);
+                self.op(OP_ELSE);
+                self.local_get(s);
+                self.i64_const(64);
+                self.op(OP_I64_EQ);
+                self.op(OP_IF);
+                self.code.push(BLOCKTYPE_VOID);
+                // s == 64: swap halves
+                self.local_get(a_hi);
+                self.local_set(d_lo);
+                self.local_get(a_lo);
+                self.local_set(d_hi);
+                self.op(OP_ELSE);
+                // 65 <= s <= 127, s2 = s - 64 in 1..=63
+                self.local_get(s);
+                self.i64_const(64);
+                self.op(OP_I64_SUB);
+                self.local_set(s2);
+                self.local_get(a_hi);
+                self.local_get(s2);
+                self.op(OP_I64_SHL);
+                self.local_get(a_lo);
+                self.i64_const(64);
+                self.local_get(s2);
+                self.op(OP_I64_SUB);
+                self.op(OP_I64_SHR_U);
+                self.op(OP_I64_OR);
+                self.local_set(d_lo);
+                self.local_get(a_lo);
+                self.local_get(s2);
+                self.op(OP_I64_SHL);
+                self.local_get(a_hi);
+                self.i64_const(64);
+                self.local_get(s2);
+                self.op(OP_I64_SUB);
+                self.op(OP_I64_SHR_U);
+                self.op(OP_I64_OR);
+                self.local_set(d_hi);
+                self.op(OP_END);
+                self.op(OP_END);
+                self.op(OP_END);
+            }
             Op::Umin | Op::Umax | Op::Smin | Op::Smax => {
                 let cond = match op {
                     Op::Umin => IntCond::Ult,
@@ -3461,12 +4287,60 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 self.op(OP_SELECT);
                 self.local_set(d_hi);
             }
+            Op::UaddSat => {
+                let ovf = self.temp_i32(0);
+                self.emit_int_overflow_loc(inst, Op::UaddOverflow, Ty::I128, a_lo, b_lo, d_lo, ovf)?;
+                self.local_get(ovf);
+                self.op(OP_IF);
+                self.code.push(BLOCKTYPE_VOID);
+                self.i64_const(-1);
+                self.local_set(d_lo);
+                self.i64_const(-1);
+                self.local_set(d_hi);
+                self.op(OP_END);
+            }
+            Op::UsubSat => {
+                let ovf = self.temp_i32(0);
+                self.emit_int_overflow_loc(inst, Op::UsubOverflow, Ty::I128, a_lo, b_lo, d_lo, ovf)?;
+                self.local_get(ovf);
+                self.op(OP_IF);
+                self.code.push(BLOCKTYPE_VOID);
+                self.i64_const(0);
+                self.local_set(d_lo);
+                self.i64_const(0);
+                self.local_set(d_hi);
+                self.op(OP_END);
+            }
+            Op::SaddSat | Op::SsubSat => {
+                let ovf = self.temp_i32(0);
+                let ovf_op = if op == Op::SaddSat { Op::SaddOverflow } else { Op::SsubOverflow };
+                self.emit_int_overflow_loc(inst, ovf_op, Ty::I128, a_lo, b_lo, d_lo, ovf)?;
+                self.local_get(ovf);
+                self.op(OP_IF);
+                self.code.push(BLOCKTYPE_VOID);
+                self.local_get(a_hi);
+                self.i64_const(0);
+                self.op(OP_I64_LT_S);
+                self.op(OP_IF);
+                self.code.push(BLOCKTYPE_VOID);
+                self.i64_const(0);
+                self.local_set(d_lo);
+                self.i64_const(i64::MIN);
+                self.local_set(d_hi);
+                self.op(OP_ELSE);
+                self.i64_const(-1);
+                self.local_set(d_lo);
+                self.i64_const(i64::MAX);
+                self.local_set(d_hi);
+                self.op(OP_END);
+                self.op(OP_END);
+            }
             _ => return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op }),
         }
         Ok(())
     }
 
-    // ---- Overflow ops `{T, i1}` -------------------------------------------------------------
+    // ---- Overflow ops `{T, i1}` (scalar or vector) ------------------------------------------
 
     fn emit_int_overflow(
         &mut self,
@@ -3476,17 +4350,44 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         b: Value,
     ) -> Result<(), LirWasm64Error> {
         let a_ty = self.view.ty(a);
-        let scalar = a_ty.elem();
+        let lanes = a_ty.lanes();
+        let stride = lane_stride(a_ty.elem());
+        let (a_base, b_base) = (self.loc(a), self.loc(b));
         let dst_first = self.val_locals[inst].first;
+        let ovf_base = dst_first + lanes * stride;
+        for k in 0..lanes {
+            self.emit_int_overflow_loc(
+                inst,
+                op,
+                a_ty,
+                a_base + k * stride,
+                b_base + k * stride,
+                dst_first + k * stride,
+                ovf_base + k,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_int_overflow_loc(
+        &mut self,
+        inst: usize,
+        op: Op,
+        a_ty: Ty,
+        la: u32,
+        lb: u32,
+        res_loc: u32,
+        ovf_loc: u32,
+    ) -> Result<(), LirWasm64Error> {
+        let scalar = a_ty.elem();
 
         match scalar {
             Scalar::I1 | Scalar::I8 | Scalar::I16 => {
-                let (la, lb) = (self.loc(a), self.loc(b));
                 let mask = sub32_mask(scalar).unwrap();
                 let lo = sub32_smin(scalar);
                 let hi = sub32_smax(scalar);
                 let raw = self.temp_i32(0);
-                let (res_loc, ovf_loc) = (dst_first, dst_first + 1);
                 match op {
                     Op::UaddOverflow => {
                         self.local_get(la);
@@ -3553,184 +4454,176 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                     _ => unreachable!(),
                 }
             }
-            Scalar::I32 => {
-                let (la, lb) = (self.loc(a), self.loc(b));
-                let (res_loc, ovf_loc) = (dst_first, dst_first + 1);
-                match op {
-                    Op::UaddOverflow => {
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I32_ADD);
-                        self.local_tee(res_loc);
-                        self.local_get(la);
-                        self.op(OP_I32_LT_U);
-                        self.local_set(ovf_loc);
-                    }
-                    Op::UsubOverflow => {
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I32_SUB);
-                        self.local_set(res_loc);
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I32_LT_U);
-                        self.local_set(ovf_loc);
-                    }
-                    Op::SaddOverflow => {
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I32_ADD);
-                        self.local_set(res_loc);
-                        self.local_get(la);
-                        self.local_get(res_loc);
-                        self.op(OP_I32_XOR);
-                        self.local_get(lb);
-                        self.local_get(res_loc);
-                        self.op(OP_I32_XOR);
-                        self.op(OP_I32_AND);
-                        self.i32_const(0);
-                        self.op(OP_I32_LT_S);
-                        self.local_set(ovf_loc);
-                    }
-                    Op::SsubOverflow => {
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I32_SUB);
-                        self.local_set(res_loc);
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I32_XOR);
-                        self.local_get(la);
-                        self.local_get(res_loc);
-                        self.op(OP_I32_XOR);
-                        self.op(OP_I32_AND);
-                        self.i32_const(0);
-                        self.op(OP_I32_LT_S);
-                        self.local_set(ovf_loc);
-                    }
-                    Op::UmulOverflow => {
-                        let prod = self.temp_i64(0);
-                        self.local_get(la);
-                        self.op(OP_I64_EXTEND_I32_U);
-                        self.local_get(lb);
-                        self.op(OP_I64_EXTEND_I32_U);
-                        self.op(OP_I64_MUL);
-                        self.local_tee(prod);
-                        self.op(OP_I32_WRAP_I64);
-                        self.local_set(res_loc);
-                        self.local_get(prod);
-                        self.i64_const(32);
-                        self.op(OP_I64_SHR_U);
-                        self.i64_const(0);
-                        self.op(OP_I64_NE);
-                        self.local_set(ovf_loc);
-                    }
-                    Op::SmulOverflow => {
-                        let prod = self.temp_i64(0);
-                        self.local_get(la);
-                        self.op(OP_I64_EXTEND_I32_S);
-                        self.local_get(lb);
-                        self.op(OP_I64_EXTEND_I32_S);
-                        self.op(OP_I64_MUL);
-                        self.local_tee(prod);
-                        self.op(OP_I32_WRAP_I64);
-                        self.local_tee(res_loc);
-                        self.op(OP_I64_EXTEND_I32_S);
-                        self.local_get(prod);
-                        self.op(OP_I64_NE);
-                        self.local_set(ovf_loc);
-                    }
-                    _ => unreachable!(),
+            Scalar::I32 => match op {
+                Op::UaddOverflow => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I32_ADD);
+                    self.local_tee(res_loc);
+                    self.local_get(la);
+                    self.op(OP_I32_LT_U);
+                    self.local_set(ovf_loc);
                 }
-            }
-            Scalar::I64 => {
-                let (la, lb) = (self.loc(a), self.loc(b));
-                let (res_loc, ovf_loc) = (dst_first, dst_first + 1);
-                match op {
-                    Op::UaddOverflow => {
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I64_ADD);
-                        self.local_tee(res_loc);
-                        self.local_get(la);
-                        self.op(OP_I64_LT_U);
-                        self.local_set(ovf_loc);
-                    }
-                    Op::UsubOverflow => {
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I64_SUB);
-                        self.local_set(res_loc);
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I64_LT_U);
-                        self.local_set(ovf_loc);
-                    }
-                    Op::SaddOverflow => {
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I64_ADD);
-                        self.local_set(res_loc);
-                        self.local_get(la);
-                        self.local_get(res_loc);
-                        self.op(OP_I64_XOR);
-                        self.local_get(lb);
-                        self.local_get(res_loc);
-                        self.op(OP_I64_XOR);
-                        self.op(OP_I64_AND);
-                        self.i64_const(0);
-                        self.op(OP_I64_LT_S);
-                        self.local_set(ovf_loc);
-                    }
-                    Op::SsubOverflow => {
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I64_SUB);
-                        self.local_set(res_loc);
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I64_XOR);
-                        self.local_get(la);
-                        self.local_get(res_loc);
-                        self.op(OP_I64_XOR);
-                        self.op(OP_I64_AND);
-                        self.i64_const(0);
-                        self.op(OP_I64_LT_S);
-                        self.local_set(ovf_loc);
-                    }
-                    Op::UmulOverflow => {
-                        let hi = self.temp_i64(6);
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I64_MUL);
-                        self.local_set(res_loc);
-                        self.emit_umulhi64_to(la, lb, hi);
-                        self.local_get(hi);
-                        self.i64_const(0);
-                        self.op(OP_I64_NE);
-                        self.local_set(ovf_loc);
-                    }
-                    Op::SmulOverflow => {
-                        let hi = self.temp_i64(6);
-                        self.local_get(la);
-                        self.local_get(lb);
-                        self.op(OP_I64_MUL);
-                        self.local_set(res_loc);
-                        self.emit_smulhi64_to(la, lb, hi);
-                        self.local_get(hi);
-                        self.local_get(res_loc);
-                        self.i64_const(63);
-                        self.op(OP_I64_SHR_S);
-                        self.op(OP_I64_NE);
-                        self.local_set(ovf_loc);
-                    }
-                    _ => unreachable!(),
+                Op::UsubOverflow => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I32_SUB);
+                    self.local_set(res_loc);
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I32_LT_U);
+                    self.local_set(ovf_loc);
                 }
-            }
+                Op::SaddOverflow => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I32_ADD);
+                    self.local_set(res_loc);
+                    self.local_get(la);
+                    self.local_get(res_loc);
+                    self.op(OP_I32_XOR);
+                    self.local_get(lb);
+                    self.local_get(res_loc);
+                    self.op(OP_I32_XOR);
+                    self.op(OP_I32_AND);
+                    self.i32_const(0);
+                    self.op(OP_I32_LT_S);
+                    self.local_set(ovf_loc);
+                }
+                Op::SsubOverflow => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I32_SUB);
+                    self.local_set(res_loc);
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I32_XOR);
+                    self.local_get(la);
+                    self.local_get(res_loc);
+                    self.op(OP_I32_XOR);
+                    self.op(OP_I32_AND);
+                    self.i32_const(0);
+                    self.op(OP_I32_LT_S);
+                    self.local_set(ovf_loc);
+                }
+                Op::UmulOverflow => {
+                    let prod = self.temp_i64(0);
+                    self.local_get(la);
+                    self.op(OP_I64_EXTEND_I32_U);
+                    self.local_get(lb);
+                    self.op(OP_I64_EXTEND_I32_U);
+                    self.op(OP_I64_MUL);
+                    self.local_tee(prod);
+                    self.op(OP_I32_WRAP_I64);
+                    self.local_set(res_loc);
+                    self.local_get(prod);
+                    self.i64_const(32);
+                    self.op(OP_I64_SHR_U);
+                    self.i64_const(0);
+                    self.op(OP_I64_NE);
+                    self.local_set(ovf_loc);
+                }
+                Op::SmulOverflow => {
+                    let prod = self.temp_i64(0);
+                    self.local_get(la);
+                    self.op(OP_I64_EXTEND_I32_S);
+                    self.local_get(lb);
+                    self.op(OP_I64_EXTEND_I32_S);
+                    self.op(OP_I64_MUL);
+                    self.local_tee(prod);
+                    self.op(OP_I32_WRAP_I64);
+                    self.local_tee(res_loc);
+                    self.op(OP_I64_EXTEND_I32_S);
+                    self.local_get(prod);
+                    self.op(OP_I64_NE);
+                    self.local_set(ovf_loc);
+                }
+                _ => unreachable!(),
+            },
+            Scalar::I64 => match op {
+                Op::UaddOverflow => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I64_ADD);
+                    self.local_tee(res_loc);
+                    self.local_get(la);
+                    self.op(OP_I64_LT_U);
+                    self.local_set(ovf_loc);
+                }
+                Op::UsubOverflow => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I64_SUB);
+                    self.local_set(res_loc);
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I64_LT_U);
+                    self.local_set(ovf_loc);
+                }
+                Op::SaddOverflow => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I64_ADD);
+                    self.local_set(res_loc);
+                    self.local_get(la);
+                    self.local_get(res_loc);
+                    self.op(OP_I64_XOR);
+                    self.local_get(lb);
+                    self.local_get(res_loc);
+                    self.op(OP_I64_XOR);
+                    self.op(OP_I64_AND);
+                    self.i64_const(0);
+                    self.op(OP_I64_LT_S);
+                    self.local_set(ovf_loc);
+                }
+                Op::SsubOverflow => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I64_SUB);
+                    self.local_set(res_loc);
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I64_XOR);
+                    self.local_get(la);
+                    self.local_get(res_loc);
+                    self.op(OP_I64_XOR);
+                    self.op(OP_I64_AND);
+                    self.i64_const(0);
+                    self.op(OP_I64_LT_S);
+                    self.local_set(ovf_loc);
+                }
+                Op::UmulOverflow => {
+                    let hi = self.temp_i64(6);
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I64_MUL);
+                    self.local_set(res_loc);
+                    self.emit_umulhi64_to(la, lb, hi);
+                    self.local_get(hi);
+                    self.i64_const(0);
+                    self.op(OP_I64_NE);
+                    self.local_set(ovf_loc);
+                }
+                Op::SmulOverflow => {
+                    let hi = self.temp_i64(6);
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(OP_I64_MUL);
+                    self.local_set(res_loc);
+                    self.emit_smulhi64_to(la, lb, hi);
+                    self.local_get(hi);
+                    self.local_get(res_loc);
+                    self.i64_const(63);
+                    self.op(OP_I64_SHR_S);
+                    self.op(OP_I64_NE);
+                    self.local_set(ovf_loc);
+                }
+                _ => unreachable!(),
+            },
             Scalar::I128 => {
-                let (a_lo, a_hi) = self.loc_pair(a);
-                let (b_lo, b_hi) = self.loc_pair(b);
-                let (r_lo, r_hi, ovf_loc) = (dst_first, dst_first + 1, dst_first + 2);
+                let (a_lo, a_hi) = (la, la + 1);
+                let (b_lo, b_hi) = (lb, lb + 1);
+                let (r_lo, r_hi) = (res_loc, res_loc + 1);
                 match op {
                     Op::UaddOverflow => {
                         let carry = self.temp_i64(0);
@@ -3842,7 +4735,37 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                         self.op(OP_I64_LT_S);
                         self.local_set(ovf_loc);
                     }
-                    _ => return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op }),
+                    Op::UmulOverflow => {
+                        let h0 = self.temp_i64(12);
+                        let h1 = self.temp_i64(13);
+                        self.emit_wide_umul128(a_lo, a_hi, b_lo, b_hi, r_lo, r_hi, h0, h1);
+                        self.local_get(h0);
+                        self.local_get(h1);
+                        self.op(OP_I64_OR);
+                        self.i64_const(0);
+                        self.op(OP_I64_NE);
+                        self.local_set(ovf_loc);
+                    }
+                    Op::SmulOverflow => {
+                        let h0 = self.temp_i64(12);
+                        let h1 = self.temp_i64(13);
+                        let sign = self.temp_i64(0);
+                        self.emit_wide_umul128(a_lo, a_hi, b_lo, b_hi, r_lo, r_hi, h0, h1);
+                        self.emit_smulhi128_adjust(a_lo, a_hi, b_lo, b_hi, h0, h1);
+                        self.local_get(r_hi);
+                        self.i64_const(63);
+                        self.op(OP_I64_SHR_S);
+                        self.local_set(sign);
+                        self.local_get(h0);
+                        self.local_get(sign);
+                        self.op(OP_I64_NE);
+                        self.local_get(h1);
+                        self.local_get(sign);
+                        self.op(OP_I64_NE);
+                        self.op(OP_I32_OR);
+                        self.local_set(ovf_loc);
+                    }
+                    _ => unreachable!(),
                 }
             }
             _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: a_ty }),
@@ -3852,6 +4775,63 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
 
     // ---- Integer unary ops ------------------------------------------------------------------
 
+    /// Pushes byte-swapped 64-bit value of `src` onto the Wasm stack (uses `temps_i64[0]`).
+    fn push_bswap64(&mut self, src: u32) {
+        let t = self.temp_i64(0);
+        self.local_get(src);
+        self.local_set(t);
+        for (mask, shift) in [
+            (0x00FF_00FF_00FF_00FFu64 as i64, 8i64),
+            (0x0000_FFFF_0000_FFFFu64 as i64, 16i64),
+        ] {
+            self.local_get(t);
+            self.i64_const(mask);
+            self.op(OP_I64_AND);
+            self.i64_const(shift);
+            self.op(OP_I64_SHL);
+            self.local_get(t);
+            self.i64_const(shift);
+            self.op(OP_I64_SHR_U);
+            self.i64_const(mask);
+            self.op(OP_I64_AND);
+            self.op(OP_I64_OR);
+            self.local_set(t);
+        }
+        self.local_get(t);
+        self.i64_const(32);
+        self.op(OP_I64_ROTL);
+    }
+
+    /// Pushes bit-reversed 64-bit value of `src` onto the Wasm stack (uses `temps_i64[0]`).
+    fn push_bitrev64(&mut self, src: u32) {
+        let t = self.temp_i64(0);
+        self.local_get(src);
+        self.local_set(t);
+        for (mask, shift) in [
+            (0x5555_5555_5555_5555u64 as i64, 1i64),
+            (0x3333_3333_3333_3333u64 as i64, 2i64),
+            (0x0F0F_0F0F_0F0F_0F0Fu64 as i64, 4i64),
+            (0x00FF_00FF_00FF_00FFu64 as i64, 8i64),
+            (0x0000_FFFF_0000_FFFFu64 as i64, 16i64),
+        ] {
+            self.local_get(t);
+            self.i64_const(mask);
+            self.op(OP_I64_AND);
+            self.i64_const(shift);
+            self.op(OP_I64_SHL);
+            self.local_get(t);
+            self.i64_const(shift);
+            self.op(OP_I64_SHR_U);
+            self.i64_const(mask);
+            self.op(OP_I64_AND);
+            self.op(OP_I64_OR);
+            self.local_set(t);
+        }
+        self.local_get(t);
+        self.i64_const(32);
+        self.op(OP_I64_ROTL);
+    }
+
     fn emit_int_unary(
         &mut self,
         inst: usize,
@@ -3859,12 +4839,26 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         ty: Ty,
         a: Value,
     ) -> Result<(), LirWasm64Error> {
-        let scalar = ty.elem();
-        let dst = self.val_locals[inst].first;
+        let lanes = ty.lanes();
+        let stride = lane_stride(ty.elem());
+        let (a_base, dst_base) = (self.loc(a), self.val_locals[inst].first);
+        for k in 0..lanes {
+            self.emit_int_unary_loc(inst, op, ty, a_base + k * stride, dst_base + k * stride)?;
+        }
+        Ok(())
+    }
 
+    fn emit_int_unary_loc(
+        &mut self,
+        inst: usize,
+        op: Op,
+        ty: Ty,
+        la: u32,
+        dst: u32,
+    ) -> Result<(), LirWasm64Error> {
+        let scalar = ty.elem();
         match scalar {
             Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => {
-                let la = self.loc(a);
                 let bits = sub32_bits(scalar);
                 match op {
                     Op::Neg => {
@@ -3967,7 +4961,6 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 self.local_set(dst);
             }
             Scalar::I64 => {
-                let la = self.loc(a);
                 match op {
                     Op::Neg => {
                         self.i64_const(0);
@@ -3991,81 +4984,18 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                         self.local_get(la);
                         self.op(OP_I64_POPCNT);
                     }
-                    Op::Bswap => {
-                        let t = self.temp_i64(0);
-                        self.local_get(la);
-                        self.local_set(t);
-                        for (mask, shift) in [
-                            (0x00FF_00FF_00FF_00FFu64 as i64, 8i64),
-                            (0x0000_FFFF_0000_FFFFu64 as i64, 16i64),
-                        ] {
-                            self.local_get(t);
-                            self.i64_const(mask);
-                            self.op(OP_I64_AND);
-                            self.i64_const(shift);
-                            self.op(OP_I64_SHL);
-                            self.local_get(t);
-                            self.i64_const(shift);
-                            self.op(OP_I64_SHR_U);
-                            self.i64_const(mask);
-                            self.op(OP_I64_AND);
-                            self.op(OP_I64_OR);
-                            self.local_set(t);
-                        }
-                        self.local_get(t);
-                        self.i64_const(32);
-                        self.op(OP_I64_ROTL);
-                    }
-                    Op::Bitrev => {
-                        let t = self.temp_i64(0);
-                        self.local_get(la);
-                        self.local_set(t);
-                        for (mask, shift) in [
-                            (0x5555_5555_5555_5555u64 as i64, 1i64),
-                            (0x3333_3333_3333_3333u64 as i64, 2i64),
-                            (0x0F0F_0F0F_0F0F_0F0Fu64 as i64, 4i64),
-                            (0x00FF_00FF_00FF_00FFu64 as i64, 8i64),
-                            (0x0000_FFFF_0000_FFFFu64 as i64, 16i64),
-                        ] {
-                            self.local_get(t);
-                            self.i64_const(mask);
-                            self.op(OP_I64_AND);
-                            self.i64_const(shift);
-                            self.op(OP_I64_SHL);
-                            self.local_get(t);
-                            self.i64_const(shift);
-                            self.op(OP_I64_SHR_U);
-                            self.i64_const(mask);
-                            self.op(OP_I64_AND);
-                            self.op(OP_I64_OR);
-                            self.local_set(t);
-                        }
-                        self.local_get(t);
-                        self.i64_const(32);
-                        self.op(OP_I64_ROTL);
-                    }
+                    Op::Bswap => self.push_bswap64(la),
+                    Op::Bitrev => self.push_bitrev64(la),
                     _ => return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op }),
                 }
                 self.local_set(dst);
             }
             Scalar::I128 => {
-                let (a_lo, a_hi) = self.loc_pair(a);
+                let (a_lo, a_hi) = (la, la + 1);
                 let (d_lo, d_hi) = (dst, dst + 1);
                 match op {
                     Op::Neg => {
-                        self.i64_const(0);
-                        self.local_get(a_lo);
-                        self.op(OP_I64_SUB);
-                        self.local_set(d_lo);
-                        self.i64_const(0);
-                        self.local_get(a_hi);
-                        self.op(OP_I64_SUB);
-                        self.local_get(a_lo);
-                        self.i64_const(0);
-                        self.op(OP_I64_NE);
-                        self.op(OP_I64_EXTEND_I32_U);
-                        self.op(OP_I64_SUB);
-                        self.local_set(d_hi);
+                        self.emit_neg128_to(a_lo, a_hi, d_lo, d_hi);
                     }
                     Op::Not => {
                         self.local_get(a_lo);
@@ -4114,6 +5044,24 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                         self.local_set(d_lo);
                         self.i64_const(0);
                         self.local_set(d_hi);
+                    }
+                    Op::Bswap => {
+                        let tmp = self.temp_i64(1);
+                        self.push_bswap64(a_hi);
+                        self.local_set(tmp);
+                        self.push_bswap64(a_lo);
+                        self.local_set(d_hi);
+                        self.local_get(tmp);
+                        self.local_set(d_lo);
+                    }
+                    Op::Bitrev => {
+                        let tmp = self.temp_i64(1);
+                        self.push_bitrev64(a_hi);
+                        self.local_set(tmp);
+                        self.push_bitrev64(a_lo);
+                        self.local_set(d_hi);
+                        self.local_get(tmp);
+                        self.local_set(d_lo);
                     }
                     _ => return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op }),
                 }
@@ -4133,10 +5081,33 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         b: Value,
     ) -> Result<(), LirWasm64Error> {
         let ty = self.view.ty(a);
-        let dst = self.val_locals[inst].first;
+        let lanes = ty.lanes();
+        let stride = lane_stride(ty.elem());
+        let (a_base, b_base, dst_base) = (self.loc(a), self.loc(b), self.val_locals[inst].first);
+        for k in 0..lanes {
+            self.emit_icmp_loc(
+                inst,
+                cond,
+                ty,
+                a_base + k * stride,
+                b_base + k * stride,
+                dst_base + k,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn emit_icmp_loc(
+        &mut self,
+        inst: usize,
+        cond: IntCond,
+        ty: Ty,
+        la: u32,
+        lb: u32,
+        dst: u32,
+    ) -> Result<(), LirWasm64Error> {
         match ty.elem() {
             Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => {
-                let (la, lb) = (self.loc(a), self.loc(b));
                 let signed = matches!(
                     cond,
                     IntCond::Slt | IntCond::Sle | IntCond::Sgt | IntCond::Sge
@@ -4164,7 +5135,6 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 self.local_set(dst);
             }
             Scalar::I64 | Scalar::Ptr => {
-                let (la, lb) = (self.loc(a), self.loc(b));
                 self.local_get(la);
                 self.local_get(lb);
                 self.op(match cond {
@@ -4182,9 +5152,7 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 self.local_set(dst);
             }
             Scalar::I128 => {
-                let (a_lo, a_hi) = self.loc_pair(a);
-                let (b_lo, b_hi) = self.loc_pair(b);
-                self.push_i128_cmp(cond, a_lo, a_hi, b_lo, b_hi);
+                self.push_i128_cmp(cond, la, la + 1, lb, lb + 1);
                 self.local_set(dst);
             }
             _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
@@ -4254,110 +5222,112 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         b: Value,
     ) -> Result<(), LirWasm64Error> {
         let ty = self.view.ty(a);
-        let (la, lb) = (self.loc(a), self.loc(b));
-        let dst = self.val_locals[inst].first;
+        let (a_base, b_base, dst_base) = (self.loc(a), self.loc(b), self.val_locals[inst].first);
         let (eq, ne, lt, gt, le, ge) = match ty.elem() {
             Scalar::F32 => (OP_F32_EQ, OP_F32_NE, OP_F32_LT, OP_F32_GT, OP_F32_LE, OP_F32_GE),
             Scalar::F64 => (OP_F64_EQ, OP_F64_NE, OP_F64_LT, OP_F64_GT, OP_F64_LE, OP_F64_GE),
             _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
         };
 
-        match cond {
-            FloatCond::False => self.i32_const(0),
-            FloatCond::True => self.i32_const(1),
-            FloatCond::Oeq => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(eq);
+        for k in 0..ty.lanes() {
+            let (la, lb, dst) = (a_base + k, b_base + k, dst_base + k);
+            match cond {
+                FloatCond::False => self.i32_const(0),
+                FloatCond::True => self.i32_const(1),
+                FloatCond::Oeq => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(eq);
+                }
+                FloatCond::Ogt => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(gt);
+                }
+                FloatCond::Oge => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(ge);
+                }
+                FloatCond::Olt => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(lt);
+                }
+                FloatCond::Ole => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(le);
+                }
+                FloatCond::One => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(lt);
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(gt);
+                    self.op(OP_I32_OR);
+                }
+                FloatCond::Ord => {
+                    self.local_get(la);
+                    self.local_get(la);
+                    self.op(eq);
+                    self.local_get(lb);
+                    self.local_get(lb);
+                    self.op(eq);
+                    self.op(OP_I32_AND);
+                }
+                FloatCond::Uno => {
+                    self.local_get(la);
+                    self.local_get(la);
+                    self.op(ne);
+                    self.local_get(lb);
+                    self.local_get(lb);
+                    self.op(ne);
+                    self.op(OP_I32_OR);
+                }
+                FloatCond::Ueq => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(lt);
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(gt);
+                    self.op(OP_I32_OR);
+                    self.op(OP_I32_EQZ);
+                }
+                FloatCond::Ugt => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(le);
+                    self.op(OP_I32_EQZ);
+                }
+                FloatCond::Uge => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(lt);
+                    self.op(OP_I32_EQZ);
+                }
+                FloatCond::Ult => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(ge);
+                    self.op(OP_I32_EQZ);
+                }
+                FloatCond::Ule => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(gt);
+                    self.op(OP_I32_EQZ);
+                }
+                FloatCond::Une => {
+                    self.local_get(la);
+                    self.local_get(lb);
+                    self.op(ne);
+                }
             }
-            FloatCond::Ogt => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(gt);
-            }
-            FloatCond::Oge => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(ge);
-            }
-            FloatCond::Olt => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(lt);
-            }
-            FloatCond::Ole => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(le);
-            }
-            FloatCond::One => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(lt);
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(gt);
-                self.op(OP_I32_OR);
-            }
-            FloatCond::Ord => {
-                self.local_get(la);
-                self.local_get(la);
-                self.op(eq);
-                self.local_get(lb);
-                self.local_get(lb);
-                self.op(eq);
-                self.op(OP_I32_AND);
-            }
-            FloatCond::Uno => {
-                self.local_get(la);
-                self.local_get(la);
-                self.op(ne);
-                self.local_get(lb);
-                self.local_get(lb);
-                self.op(ne);
-                self.op(OP_I32_OR);
-            }
-            FloatCond::Ueq => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(lt);
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(gt);
-                self.op(OP_I32_OR);
-                self.op(OP_I32_EQZ);
-            }
-            FloatCond::Ugt => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(le);
-                self.op(OP_I32_EQZ);
-            }
-            FloatCond::Uge => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(lt);
-                self.op(OP_I32_EQZ);
-            }
-            FloatCond::Ult => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(ge);
-                self.op(OP_I32_EQZ);
-            }
-            FloatCond::Ule => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(gt);
-                self.op(OP_I32_EQZ);
-            }
-            FloatCond::Une => {
-                self.local_get(la);
-                self.local_get(lb);
-                self.op(ne);
-            }
+            self.local_set(dst);
         }
-        self.local_set(dst);
         Ok(())
     }
 
@@ -4365,101 +5335,262 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
 
     fn emit_zext(&mut self, inst: usize, to_ty: Ty, a: Value) -> Result<(), LirWasm64Error> {
         let from_ty = self.view.ty(a);
-        let dst = self.val_locals[inst].first;
-        match (from_ty.elem(), to_ty.elem()) {
-            (
-                Scalar::I1 | Scalar::I8 | Scalar::I16,
-                Scalar::I8 | Scalar::I16 | Scalar::I32,
-            ) => {
-                // Already canonically zero-extended in i32.
-                self.local_get(self.loc(a));
-                self.local_set(dst);
+        let in_stride = lane_stride(from_ty.elem());
+        let out_stride = lane_stride(to_ty.elem());
+        let (a_base, dst_base) = (self.loc(a), self.val_locals[inst].first);
+        for k in 0..to_ty.lanes() {
+            let src = a_base + k * in_stride;
+            let dst = dst_base + k * out_stride;
+            match (from_ty.elem(), to_ty.elem()) {
+                (
+                    Scalar::I1 | Scalar::I8 | Scalar::I16,
+                    Scalar::I8 | Scalar::I16 | Scalar::I32,
+                ) => {
+                    // Already canonically zero-extended in i32.
+                    self.local_get(src);
+                    self.local_set(dst);
+                }
+                (Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32, Scalar::I64) => {
+                    self.local_get(src);
+                    self.op(OP_I64_EXTEND_I32_U);
+                    self.local_set(dst);
+                }
+                (Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32, Scalar::I128) => {
+                    self.local_get(src);
+                    self.op(OP_I64_EXTEND_I32_U);
+                    self.local_set(dst);
+                    self.i64_const(0);
+                    self.local_set(dst + 1);
+                }
+                (Scalar::I64, Scalar::I128) => {
+                    self.local_get(src);
+                    self.local_set(dst);
+                    self.i64_const(0);
+                    self.local_set(dst + 1);
+                }
+                _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty }),
             }
-            (Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32, Scalar::I64) => {
-                self.local_get(self.loc(a));
-                self.op(OP_I64_EXTEND_I32_U);
-                self.local_set(dst);
-            }
-            (Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32, Scalar::I128) => {
-                self.local_get(self.loc(a));
-                self.op(OP_I64_EXTEND_I32_U);
-                self.local_set(dst);
-                self.i64_const(0);
-                self.local_set(dst + 1);
-            }
-            (Scalar::I64, Scalar::I128) => {
-                self.local_get(self.loc(a));
-                self.local_set(dst);
-                self.i64_const(0);
-                self.local_set(dst + 1);
-            }
-            _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty }),
         }
         Ok(())
     }
 
     fn emit_sext(&mut self, inst: usize, to_ty: Ty, a: Value) -> Result<(), LirWasm64Error> {
         let from_ty = self.view.ty(a);
-        let dst = self.val_locals[inst].first;
-        match (from_ty.elem(), to_ty.elem()) {
-            (
-                Scalar::I1 | Scalar::I8 | Scalar::I16,
-                Scalar::I8 | Scalar::I16 | Scalar::I32,
-            ) => {
-                self.local_get(self.loc(a));
-                self.sext_to_i32(from_ty.elem());
-                self.mask_sub32(to_ty.elem());
-                self.local_set(dst);
+        let in_stride = lane_stride(from_ty.elem());
+        let out_stride = lane_stride(to_ty.elem());
+        let (a_base, dst_base) = (self.loc(a), self.val_locals[inst].first);
+        for k in 0..to_ty.lanes() {
+            let src = a_base + k * in_stride;
+            let dst = dst_base + k * out_stride;
+            match (from_ty.elem(), to_ty.elem()) {
+                (
+                    Scalar::I1 | Scalar::I8 | Scalar::I16,
+                    Scalar::I8 | Scalar::I16 | Scalar::I32,
+                ) => {
+                    self.local_get(src);
+                    self.sext_to_i32(from_ty.elem());
+                    self.mask_sub32(to_ty.elem());
+                    self.local_set(dst);
+                }
+                (Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32, Scalar::I64) => {
+                    self.local_get(src);
+                    self.sext_to_i32(from_ty.elem());
+                    self.op(OP_I64_EXTEND_I32_S);
+                    self.local_set(dst);
+                }
+                (Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32, Scalar::I128) => {
+                    self.local_get(src);
+                    self.sext_to_i32(from_ty.elem());
+                    self.op(OP_I64_EXTEND_I32_S);
+                    self.local_tee(dst);
+                    self.i64_const(63);
+                    self.op(OP_I64_SHR_S);
+                    self.local_set(dst + 1);
+                }
+                (Scalar::I64, Scalar::I128) => {
+                    self.local_get(src);
+                    self.local_tee(dst);
+                    self.i64_const(63);
+                    self.op(OP_I64_SHR_S);
+                    self.local_set(dst + 1);
+                }
+                _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty }),
             }
-            (Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32, Scalar::I64) => {
-                self.local_get(self.loc(a));
-                self.sext_to_i32(from_ty.elem());
-                self.op(OP_I64_EXTEND_I32_S);
-                self.local_set(dst);
-            }
-            (Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32, Scalar::I128) => {
-                self.local_get(self.loc(a));
-                self.sext_to_i32(from_ty.elem());
-                self.op(OP_I64_EXTEND_I32_S);
-                self.local_tee(dst);
-                self.i64_const(63);
-                self.op(OP_I64_SHR_S);
-                self.local_set(dst + 1);
-            }
-            (Scalar::I64, Scalar::I128) => {
-                self.local_get(self.loc(a));
-                self.local_tee(dst);
-                self.i64_const(63);
-                self.op(OP_I64_SHR_S);
-                self.local_set(dst + 1);
-            }
-            _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty }),
         }
         Ok(())
     }
 
     fn emit_trunc(&mut self, inst: usize, to_ty: Ty, a: Value) -> Result<(), LirWasm64Error> {
         let from_ty = self.view.ty(a);
-        let dst = self.val_locals[inst].first;
-        match (from_ty.elem(), to_ty.elem()) {
-            (Scalar::I8 | Scalar::I16 | Scalar::I32, Scalar::I1 | Scalar::I8 | Scalar::I16) => {
-                self.local_get(self.loc(a));
-                self.mask_sub32(to_ty.elem());
-                self.local_set(dst);
+        let in_stride = lane_stride(from_ty.elem());
+        let out_stride = lane_stride(to_ty.elem());
+        let (a_base, dst_base) = (self.loc(a), self.val_locals[inst].first);
+        for k in 0..to_ty.lanes() {
+            let src = a_base + k * in_stride;
+            let dst = dst_base + k * out_stride;
+            match (from_ty.elem(), to_ty.elem()) {
+                (Scalar::I8 | Scalar::I16 | Scalar::I32, Scalar::I1 | Scalar::I8 | Scalar::I16) => {
+                    self.local_get(src);
+                    self.mask_sub32(to_ty.elem());
+                    self.local_set(dst);
+                }
+                (Scalar::I64 | Scalar::I128, Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32) => {
+                    self.local_get(src); // low 64 bits for I128
+                    self.op(OP_I32_WRAP_I64);
+                    self.mask_sub32(to_ty.elem());
+                    self.local_set(dst);
+                }
+                (Scalar::I128, Scalar::I64) => {
+                    self.local_get(src); // low 64 bits
+                    self.local_set(dst);
+                }
+                _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty }),
             }
-            (Scalar::I64 | Scalar::I128, Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32) => {
-                self.local_get(self.loc(a)); // low 64 bits for I128
-                self.op(OP_I32_WRAP_I64);
-                self.mask_sub32(to_ty.elem());
-                self.local_set(dst);
-            }
-            (Scalar::I128, Scalar::I64) => {
-                self.local_get(self.loc(a)); // low 64 bits
-                self.local_set(dst);
-            }
-            _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty }),
         }
         Ok(())
+    }
+
+    /// Exact saturating IEEE-754 float (`f32` or `f64`) -> `u128`/`i128` conversion (NaN -> 0).
+    /// Uses `temps_i64[0..=3]` and `temps_i32[0]`.
+    fn emit_fp_to_i128_loc(&mut self, from_f64: bool, signed: bool, la: u32, d_lo: u32, d_hi: u32) {
+        let bits = self.temp_i64(0);
+        let abs_bits = self.temp_i64(1);
+        let exp = self.temp_i64(2);
+        let sig = self.temp_i64(3);
+        let neg = self.temp_i32(0);
+
+        self.local_get(la);
+        if !from_f64 {
+            self.op(OP_F64_PROMOTE_F32);
+        }
+        self.op(OP_I64_REINTERPRET_F64);
+        self.local_tee(bits);
+        self.i64_const(0);
+        self.op(OP_I64_LT_S);
+        self.local_set(neg);
+
+        self.local_get(bits);
+        self.i64_const(0x7FFF_FFFF_FFFF_FFFFu64 as i64);
+        self.op(OP_I64_AND);
+        self.local_tee(abs_bits);
+        self.i64_const(52);
+        self.op(OP_I64_SHR_U);
+        self.i64_const(1023);
+        self.op(OP_I64_SUB);
+        self.local_set(exp);
+
+        // NaN or |x| < 1.0 (or negative for unsigned) -> 0
+        self.local_get(abs_bits);
+        self.i64_const(0x7FF0_0000_0000_0000u64 as i64);
+        self.op(OP_I64_GT_U);
+        self.local_get(exp);
+        self.i64_const(0);
+        self.op(OP_I64_LT_S);
+        self.op(OP_I32_OR);
+        if !signed {
+            self.local_get(neg);
+            self.op(OP_I32_OR);
+        }
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.i64_const(0);
+        self.local_set(d_lo);
+        self.i64_const(0);
+        self.local_set(d_hi);
+        self.op(OP_ELSE);
+
+        // Overflow saturation: exp >= 127 (signed) or exp >= 128 (unsigned)
+        self.local_get(exp);
+        self.i64_const(if signed { 127 } else { 128 });
+        self.op(OP_I64_GE_S);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        if signed {
+            self.local_get(neg);
+            self.op(OP_IF);
+            self.code.push(BLOCKTYPE_VOID);
+            self.i64_const(0);
+            self.local_set(d_lo);
+            self.i64_const(i64::MIN);
+            self.local_set(d_hi);
+            self.op(OP_ELSE);
+            self.i64_const(-1);
+            self.local_set(d_lo);
+            self.i64_const(i64::MAX);
+            self.local_set(d_hi);
+            self.op(OP_END);
+        } else {
+            self.i64_const(-1);
+            self.local_set(d_lo);
+            self.i64_const(-1);
+            self.local_set(d_hi);
+        }
+        self.op(OP_ELSE);
+
+        // In-range magnitude: sig = (abs_bits & ((1 << 52) - 1)) | (1 << 52)
+        self.local_get(abs_bits);
+        self.i64_const(0x000F_FFFF_FFFF_FFFFi64);
+        self.op(OP_I64_AND);
+        self.i64_const(0x0010_0000_0000_0000i64);
+        self.op(OP_I64_OR);
+        self.local_set(sig);
+
+        self.local_get(exp);
+        self.i64_const(52);
+        self.op(OP_I64_LE_S);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(sig);
+        self.i64_const(52);
+        self.local_get(exp);
+        self.op(OP_I64_SUB);
+        self.op(OP_I64_SHR_U);
+        self.local_set(d_lo);
+        self.i64_const(0);
+        self.local_set(d_hi);
+        self.op(OP_ELSE);
+        self.local_get(exp);
+        self.i64_const(116);
+        self.op(OP_I64_LT_S);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        // 1 <= sh = exp - 52 <= 63
+        self.local_get(exp);
+        self.i64_const(52);
+        self.op(OP_I64_SUB);
+        self.local_set(exp);
+        self.local_get(sig);
+        self.local_get(exp);
+        self.op(OP_I64_SHL);
+        self.local_set(d_lo);
+        self.local_get(sig);
+        self.i64_const(64);
+        self.local_get(exp);
+        self.op(OP_I64_SUB);
+        self.op(OP_I64_SHR_U);
+        self.local_set(d_hi);
+        self.op(OP_ELSE);
+        // 116 <= exp <= 127 => shift into d_hi by exp - 116 in 0..=11
+        self.i64_const(0);
+        self.local_set(d_lo);
+        self.local_get(sig);
+        self.local_get(exp);
+        self.i64_const(116);
+        self.op(OP_I64_SUB);
+        self.op(OP_I64_SHL);
+        self.local_set(d_hi);
+        self.op(OP_END);
+        self.op(OP_END);
+
+        if signed {
+            self.local_get(neg);
+            self.op(OP_IF);
+            self.code.push(BLOCKTYPE_VOID);
+            self.emit_neg128_to(d_lo, d_hi, d_lo, d_hi);
+            self.op(OP_END);
+        }
+        self.op(OP_END);
+        self.op(OP_END);
     }
 
     fn emit_fp_to_int(
@@ -4470,69 +5601,158 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         a: Value,
     ) -> Result<(), LirWasm64Error> {
         let from_ty = self.view.ty(a);
-        let la = self.loc(a);
-        let dst = self.val_locals[inst].first;
-        match (from_ty.elem(), to_ty.elem()) {
-            (
-                Scalar::F32 | Scalar::F64,
-                Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32,
-            ) => {
-                let sub = match (from_ty.elem(), signed) {
-                    (Scalar::F32, true) => FC_I32_TRUNC_SAT_F32_S,
-                    (Scalar::F32, false) => FC_I32_TRUNC_SAT_F32_U,
-                    (Scalar::F64, true) => FC_I32_TRUNC_SAT_F64_S,
-                    (Scalar::F64, false) => FC_I32_TRUNC_SAT_F64_U,
-                    _ => unreachable!(),
-                };
-                self.local_get(la);
-                self.fc_op(sub);
-                if let Some(mask) = sub32_mask(to_ty.elem()) {
-                    let t = self.temp_i32(0);
-                    self.local_set(t);
-                    if signed {
-                        let lo = sub32_smin(to_ty.elem());
-                        let hi = sub32_smax(to_ty.elem());
-                        self.i32_const(lo);
-                        self.local_get(t);
-                        self.local_get(t);
-                        self.i32_const(lo);
-                        self.op(OP_I32_LT_S);
-                        self.op(OP_SELECT);
+        let out_stride = lane_stride(to_ty.elem());
+        let (a_base, dst_base) = (self.loc(a), self.val_locals[inst].first);
+        for k in 0..to_ty.lanes() {
+            let la = a_base + k;
+            let dst = dst_base + k * out_stride;
+            match (from_ty.elem(), to_ty.elem()) {
+                (
+                    Scalar::F32 | Scalar::F64,
+                    Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32,
+                ) => {
+                    let sub = match (from_ty.elem(), signed) {
+                        (Scalar::F32, true) => FC_I32_TRUNC_SAT_F32_S,
+                        (Scalar::F32, false) => FC_I32_TRUNC_SAT_F32_U,
+                        (Scalar::F64, true) => FC_I32_TRUNC_SAT_F64_S,
+                        (Scalar::F64, false) => FC_I32_TRUNC_SAT_F64_U,
+                        _ => unreachable!(),
+                    };
+                    self.local_get(la);
+                    self.fc_op(sub);
+                    if let Some(mask) = sub32_mask(to_ty.elem()) {
+                        let t = self.temp_i32(0);
                         self.local_set(t);
-                        self.i32_const(hi);
-                        self.local_get(t);
-                        self.local_get(t);
-                        self.i32_const(hi);
-                        self.op(OP_I32_GT_S);
-                        self.op(OP_SELECT);
-                        self.i32_const(mask as i32);
-                        self.op(OP_I32_AND);
-                    } else {
-                        self.i32_const(mask as i32);
-                        self.local_get(t);
-                        self.local_get(t);
-                        self.i32_const(mask as i32);
-                        self.op(OP_I32_GT_U);
-                        self.op(OP_SELECT);
+                        if signed {
+                            let lo = sub32_smin(to_ty.elem());
+                            let hi = sub32_smax(to_ty.elem());
+                            self.i32_const(lo);
+                            self.local_get(t);
+                            self.local_get(t);
+                            self.i32_const(lo);
+                            self.op(OP_I32_LT_S);
+                            self.op(OP_SELECT);
+                            self.local_set(t);
+                            self.i32_const(hi);
+                            self.local_get(t);
+                            self.local_get(t);
+                            self.i32_const(hi);
+                            self.op(OP_I32_GT_S);
+                            self.op(OP_SELECT);
+                            self.i32_const(mask as i32);
+                            self.op(OP_I32_AND);
+                        } else {
+                            self.i32_const(mask as i32);
+                            self.local_get(t);
+                            self.local_get(t);
+                            self.i32_const(mask as i32);
+                            self.op(OP_I32_GT_U);
+                            self.op(OP_SELECT);
+                        }
                     }
+                    self.local_set(dst);
                 }
-                self.local_set(dst);
+                (Scalar::F32 | Scalar::F64, Scalar::I64) => {
+                    let sub = match (from_ty.elem(), signed) {
+                        (Scalar::F32, true) => FC_I64_TRUNC_SAT_F32_S,
+                        (Scalar::F32, false) => FC_I64_TRUNC_SAT_F32_U,
+                        (Scalar::F64, true) => FC_I64_TRUNC_SAT_F64_S,
+                        (Scalar::F64, false) => FC_I64_TRUNC_SAT_F64_U,
+                        _ => unreachable!(),
+                    };
+                    self.local_get(la);
+                    self.fc_op(sub);
+                    self.local_set(dst);
+                }
+                (Scalar::F32 | Scalar::F64, Scalar::I128) => {
+                    self.emit_fp_to_i128_loc(from_ty.elem() == Scalar::F64, signed, la, dst, dst + 1);
+                }
+                _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty }),
             }
-            (Scalar::F32 | Scalar::F64, Scalar::I64) => {
-                let sub = match (from_ty.elem(), signed) {
-                    (Scalar::F32, true) => FC_I64_TRUNC_SAT_F32_S,
-                    (Scalar::F32, false) => FC_I64_TRUNC_SAT_F32_U,
-                    (Scalar::F64, true) => FC_I64_TRUNC_SAT_F64_S,
-                    (Scalar::F64, false) => FC_I64_TRUNC_SAT_F64_U,
-                    _ => unreachable!(),
-                };
-                self.local_get(la);
-                self.fc_op(sub);
-                self.local_set(dst);
-            }
-            _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty }),
         }
         Ok(())
+    }
+
+    /// Exact IEEE-754 round-to-nearest-even `u128` -> `f32`/`f64` (sticky-bit preserving).
+    /// Uses `temps_i64[1..=3]`.
+    fn emit_u128_to_fp_loc(&mut self, to_f64: bool, a_lo: u32, a_hi: u32, dst: u32) {
+        let sh = self.temp_i64(1);
+        let top = self.temp_i64(2);
+        let rsh = self.temp_i64(3);
+
+        self.local_get(a_hi);
+        self.op(OP_I64_EQZ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(a_lo);
+        self.op(if to_f64 { OP_F64_CONVERT_I64_U } else { OP_F32_CONVERT_I64_U });
+        self.local_set(dst);
+        self.op(OP_ELSE);
+        // sh = 64 - clz(a_hi) in 1..=64; rsh = clz(a_hi) in 0..=63
+        self.local_get(a_hi);
+        self.op(OP_I64_CLZ);
+        self.local_tee(rsh);
+        self.op(OP_I64_EQZ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        // sh == 64: top = a_hi | (a_lo != 0)
+        self.i64_const(64);
+        self.local_set(sh);
+        self.local_get(a_hi);
+        self.local_get(a_lo);
+        self.i64_const(0);
+        self.op(OP_I64_NE);
+        self.op(OP_I64_EXTEND_I32_U);
+        self.op(OP_I64_OR);
+        self.local_set(top);
+        self.op(OP_ELSE);
+        // 1 <= sh <= 63, rsh = 64 - sh in 1..=63
+        self.i64_const(64);
+        self.local_get(rsh);
+        self.op(OP_I64_SUB);
+        self.local_set(sh);
+        self.local_get(a_hi);
+        self.local_get(rsh);
+        self.op(OP_I64_SHL);
+        self.local_get(a_lo);
+        self.local_get(sh);
+        self.op(OP_I64_SHR_U);
+        self.op(OP_I64_OR);
+        // sticky bit from dropped low bits: (a_lo << rsh) != 0
+        self.local_get(a_lo);
+        self.local_get(rsh);
+        self.op(OP_I64_SHL);
+        self.i64_const(0);
+        self.op(OP_I64_NE);
+        self.op(OP_I64_EXTEND_I32_U);
+        self.op(OP_I64_OR);
+        self.local_set(top);
+        self.op(OP_END);
+
+        // Convert top (with bit 63 set, bit 0 sticky) once, then scale by 2^sh (exact).
+        self.local_get(top);
+        if to_f64 {
+            self.op(OP_F64_CONVERT_I64_U);
+            self.local_get(sh);
+            self.i64_const(1023);
+            self.op(OP_I64_ADD);
+            self.i64_const(52);
+            self.op(OP_I64_SHL);
+            self.op(OP_F64_REINTERPRET_I64);
+            self.op(OP_F64_MUL);
+        } else {
+            self.op(OP_F32_CONVERT_I64_U);
+            self.local_get(sh);
+            self.op(OP_I32_WRAP_I64);
+            self.i32_const(127);
+            self.op(OP_I32_ADD);
+            self.i32_const(23);
+            self.op(OP_I32_SHL);
+            self.op(OP_F32_REINTERPRET_I32);
+            self.op(OP_F32_MUL);
+        }
+        self.local_set(dst);
+        self.op(OP_END);
     }
 
     fn emit_int_to_fp(
@@ -4543,43 +5763,697 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         a: Value,
     ) -> Result<(), LirWasm64Error> {
         let from_ty = self.view.ty(a);
-        let la = self.loc(a);
-        let dst = self.val_locals[inst].first;
-        match (from_ty.elem(), to_ty.elem()) {
-            (
-                Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32,
-                Scalar::F32 | Scalar::F64,
-            ) => {
-                self.local_get(la);
-                if signed {
-                    self.sext_to_i32(from_ty.elem());
+        let in_stride = lane_stride(from_ty.elem());
+        let (a_base, dst_base) = (self.loc(a), self.val_locals[inst].first);
+        for k in 0..to_ty.lanes() {
+            let la = a_base + k * in_stride;
+            let dst = dst_base + k;
+            match (from_ty.elem(), to_ty.elem()) {
+                (
+                    Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32,
+                    Scalar::F32 | Scalar::F64,
+                ) => {
+                    self.local_get(la);
+                    if signed {
+                        self.sext_to_i32(from_ty.elem());
+                    }
+                    self.op(match (to_ty.elem(), signed) {
+                        (Scalar::F32, true) => OP_F32_CONVERT_I32_S,
+                        (Scalar::F32, false) => OP_F32_CONVERT_I32_U,
+                        (Scalar::F64, true) => OP_F64_CONVERT_I32_S,
+                        (Scalar::F64, false) => OP_F64_CONVERT_I32_U,
+                        _ => unreachable!(),
+                    });
+                    self.local_set(dst);
                 }
-                self.op(match (to_ty.elem(), signed) {
-                    (Scalar::F32, true) => OP_F32_CONVERT_I32_S,
-                    (Scalar::F32, false) => OP_F32_CONVERT_I32_U,
-                    (Scalar::F64, true) => OP_F64_CONVERT_I32_S,
-                    (Scalar::F64, false) => OP_F64_CONVERT_I32_U,
-                    _ => unreachable!(),
-                });
-                self.local_set(dst);
+                (Scalar::I64, Scalar::F32 | Scalar::F64) => {
+                    self.local_get(la);
+                    self.op(match (to_ty.elem(), signed) {
+                        (Scalar::F32, true) => OP_F32_CONVERT_I64_S,
+                        (Scalar::F32, false) => OP_F32_CONVERT_I64_U,
+                        (Scalar::F64, true) => OP_F64_CONVERT_I64_S,
+                        (Scalar::F64, false) => OP_F64_CONVERT_I64_U,
+                        _ => unreachable!(),
+                    });
+                    self.local_set(dst);
+                }
+                (Scalar::I128, Scalar::F32 | Scalar::F64) => {
+                    let to_f64 = to_ty.elem() == Scalar::F64;
+                    if !signed {
+                        self.emit_u128_to_fp_loc(to_f64, la, la + 1, dst);
+                    } else {
+                        let mag_lo = self.temp_i64(4);
+                        let mag_hi = self.temp_i64(5);
+                        self.local_get(la + 1);
+                        self.i64_const(0);
+                        self.op(OP_I64_LT_S);
+                        self.op(OP_IF);
+                        self.code.push(BLOCKTYPE_VOID);
+                        self.emit_neg128_to(la, la + 1, mag_lo, mag_hi);
+                        self.emit_u128_to_fp_loc(to_f64, mag_lo, mag_hi, dst);
+                        self.local_get(dst);
+                        self.op(if to_f64 { OP_F64_NEG } else { OP_F32_NEG });
+                        self.local_set(dst);
+                        self.op(OP_ELSE);
+                        self.emit_u128_to_fp_loc(to_f64, la, la + 1, dst);
+                        self.op(OP_END);
+                    }
+                }
+                _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty }),
             }
-            (Scalar::I64, Scalar::F32 | Scalar::F64) => {
-                self.local_get(la);
-                self.op(match (to_ty.elem(), signed) {
-                    (Scalar::F32, true) => OP_F32_CONVERT_I64_S,
-                    (Scalar::F32, false) => OP_F32_CONVERT_I64_U,
-                    (Scalar::F64, true) => OP_F64_CONVERT_I64_S,
-                    (Scalar::F64, false) => OP_F64_CONVERT_I64_U,
-                    _ => unreachable!(),
-                });
-                self.local_set(dst);
+        }
+        Ok(())
+    }
+
+    /// General bitcast between any scalar/fixed-vector types of equal bit width (`<= 512` bits),
+    /// lane 0 lowest.
+    fn emit_bitcast(&mut self, inst: usize, to_ty: Ty, a: Value) -> Result<(), LirWasm64Error> {
+        let from_ty = self.view.ty(a);
+        let src = self.loc(a);
+        let dst = self.val_locals[inst].first;
+
+        if from_ty == to_ty {
+            let count = self.val_locals[inst].count;
+            for i in 0..u32::from(count) {
+                self.local_get(src + i);
+                self.local_set(dst + i);
             }
-            _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty }),
+            return Ok(());
+        }
+
+        // Fast path: same lane count, matching 32-bit or 64-bit float/int reinterpret.
+        if from_ty.lanes() == to_ty.lanes() {
+            match (from_ty.elem(), to_ty.elem()) {
+                (Scalar::I32, Scalar::F32) => {
+                    for k in 0..to_ty.lanes() {
+                        self.local_get(src + k);
+                        self.op(OP_F32_REINTERPRET_I32);
+                        self.local_set(dst + k);
+                    }
+                    return Ok(());
+                }
+                (Scalar::F32, Scalar::I32) => {
+                    for k in 0..to_ty.lanes() {
+                        self.local_get(src + k);
+                        self.op(OP_I32_REINTERPRET_F32);
+                        self.local_set(dst + k);
+                    }
+                    return Ok(());
+                }
+                (Scalar::I64, Scalar::F64) => {
+                    for k in 0..to_ty.lanes() {
+                        self.local_get(src + k);
+                        self.op(OP_F64_REINTERPRET_I64);
+                        self.local_set(dst + k);
+                    }
+                    return Ok(());
+                }
+                (Scalar::F64, Scalar::I64) => {
+                    for k in 0..to_ty.lanes() {
+                        self.local_get(src + k);
+                        self.op(OP_I64_REINTERPRET_F64);
+                        self.local_set(dst + k);
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        let total_bits = to_ty.bits(64);
+        if total_bits == 0
+            || total_bits != from_ty.bits(64)
+            || total_bits > 512
+            || matches!(from_ty.elem(), Scalar::F16 | Scalar::F128 | Scalar::Ptr | Scalar::None)
+            || matches!(to_ty.elem(), Scalar::F16 | Scalar::F128 | Scalar::Ptr | Scalar::None)
+        {
+            return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty: to_ty });
+        }
+
+        // Pack source lanes into `word_count` 64-bit words in `temps_i64[0..word_count]`.
+        let word_count = total_bits.div_ceil(64) as usize;
+        for w in 0..word_count {
+            let loc = self.temp_i64(w);
+            self.i64_const(0);
+            self.local_set(loc);
+        }
+
+        let src_elem = from_ty.elem();
+        let src_w = src_elem.bits(64);
+        let src_stride = lane_stride(src_elem);
+        for k in 0..from_ty.lanes() {
+            let s_loc = src + k * src_stride;
+            if src_elem == Scalar::I128 {
+                let w0 = self.temp_i64((2 * k) as usize);
+                let w1 = self.temp_i64((2 * k + 1) as usize);
+                self.local_get(s_loc);
+                self.local_set(w0);
+                self.local_get(s_loc + 1);
+                self.local_set(w1);
+                continue;
+            }
+            let bit = k * src_w;
+            let word_loc = self.temp_i64((bit / 64) as usize);
+            let sh = bit % 64;
+            if src_w == 64 {
+                self.local_get(s_loc);
+                if src_elem == Scalar::F64 {
+                    self.op(OP_I64_REINTERPRET_F64);
+                }
+                self.local_set(word_loc);
+            } else {
+                self.local_get(word_loc);
+                self.local_get(s_loc);
+                if src_elem == Scalar::F32 {
+                    self.op(OP_I32_REINTERPRET_F32);
+                }
+                self.op(OP_I64_EXTEND_I32_U);
+                if sh != 0 {
+                    self.i64_const(i64::from(sh));
+                    self.op(OP_I64_SHL);
+                }
+                self.op(OP_I64_OR);
+                self.local_set(word_loc);
+            }
+        }
+
+        // Unpack `temps_i64[0..word_count]` into destination lanes.
+        let dst_elem = to_ty.elem();
+        let dst_w = dst_elem.bits(64);
+        let dst_stride = lane_stride(dst_elem);
+        for k in 0..to_ty.lanes() {
+            let d_loc = dst + k * dst_stride;
+            if dst_elem == Scalar::I128 {
+                let w0 = self.temp_i64((2 * k) as usize);
+                let w1 = self.temp_i64((2 * k + 1) as usize);
+                self.local_get(w0);
+                self.local_set(d_loc);
+                self.local_get(w1);
+                self.local_set(d_loc + 1);
+                continue;
+            }
+            let bit = k * dst_w;
+            let word_loc = self.temp_i64((bit / 64) as usize);
+            let sh = bit % 64;
+            self.local_get(word_loc);
+            if sh != 0 {
+                self.i64_const(i64::from(sh));
+                self.op(OP_I64_SHR_U);
+            }
+            match dst_elem {
+                Scalar::I1 | Scalar::I8 | Scalar::I16 => {
+                    self.op(OP_I32_WRAP_I64);
+                    self.mask_sub32(dst_elem);
+                }
+                Scalar::I32 => {
+                    self.op(OP_I32_WRAP_I64);
+                }
+                Scalar::F32 => {
+                    self.op(OP_I32_WRAP_I64);
+                    self.op(OP_F32_REINTERPRET_I32);
+                }
+                Scalar::I64 => {}
+                Scalar::F64 => {
+                    self.op(OP_F64_REINTERPRET_I64);
+                }
+                _ => unreachable!(),
+            }
+            self.local_set(d_loc);
         }
         Ok(())
     }
 
     // ---- Floating-point ops -----------------------------------------------------------------
+
+    /// Exact IEEE-754 `fmodf(la, lb) -> dst` for `f32` (uses `temps_i32[0..=5]`).
+    fn emit_frem_f32_loc(&mut self, la: u32, lb: u32, dst: u32) {
+        let ux = self.temp_i32(0);
+        let uy = self.temp_i32(1);
+        let sx = self.temp_i32(2);
+        let ex = self.temp_i32(3);
+        let ey = self.temp_i32(4);
+        let lz = self.temp_i32(5);
+
+        self.local_get(la);
+        self.op(OP_I32_REINTERPRET_F32);
+        self.local_tee(ux);
+        self.i32_const(0x8000_0000u32 as i32);
+        self.op(OP_I32_AND);
+        self.local_set(sx);
+
+        self.local_get(ux);
+        self.i32_const(0x7FFF_FFFF);
+        self.op(OP_I32_AND);
+        self.local_set(ux);
+
+        self.local_get(lb);
+        self.op(OP_I32_REINTERPRET_F32);
+        self.i32_const(0x7FFF_FFFF);
+        self.op(OP_I32_AND);
+        self.local_set(uy);
+
+        // NaN if y == 0 || x is Inf/NaN || y is NaN.
+        self.local_get(uy);
+        self.op(OP_I32_EQZ);
+        self.local_get(ux);
+        self.i32_const(0x7F80_0000);
+        self.op(OP_I32_GE_U);
+        self.op(OP_I32_OR);
+        self.local_get(uy);
+        self.i32_const(0x7F80_0000);
+        self.op(OP_I32_GT_U);
+        self.op(OP_I32_OR);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.f32_const_bits(0x7FC0_0000);
+        self.local_set(dst);
+        self.op(OP_ELSE);
+
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I32_LE_U);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I32_EQ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(sx);
+        self.op(OP_F32_REINTERPRET_I32);
+        self.local_set(dst);
+        self.op(OP_ELSE);
+        self.local_get(la);
+        self.local_set(dst);
+        self.op(OP_END);
+        self.op(OP_ELSE);
+
+        // Normalize ux -> (ex, ux) with implicit bit at 23.
+        self.local_get(ux);
+        self.i32_const(23);
+        self.op(OP_I32_SHR_U);
+        self.local_tee(ex);
+        self.op(OP_I32_EQZ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ux);
+        self.op(OP_I32_CLZ);
+        self.i32_const(8);
+        self.op(OP_I32_SUB);
+        self.local_set(lz);
+        self.i32_const(1);
+        self.local_get(lz);
+        self.op(OP_I32_SUB);
+        self.local_set(ex);
+        self.local_get(ux);
+        self.local_get(lz);
+        self.op(OP_I32_SHL);
+        self.local_set(ux);
+        self.op(OP_ELSE);
+        self.local_get(ux);
+        self.i32_const(0x007F_FFFF);
+        self.op(OP_I32_AND);
+        self.i32_const(0x0080_0000);
+        self.op(OP_I32_OR);
+        self.local_set(ux);
+        self.op(OP_END);
+
+        // Normalize uy -> (ey, uy) with implicit bit at 23.
+        self.local_get(uy);
+        self.i32_const(23);
+        self.op(OP_I32_SHR_U);
+        self.local_tee(ey);
+        self.op(OP_I32_EQZ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(uy);
+        self.op(OP_I32_CLZ);
+        self.i32_const(8);
+        self.op(OP_I32_SUB);
+        self.local_set(lz);
+        self.i32_const(1);
+        self.local_get(lz);
+        self.op(OP_I32_SUB);
+        self.local_set(ey);
+        self.local_get(uy);
+        self.local_get(lz);
+        self.op(OP_I32_SHL);
+        self.local_set(uy);
+        self.op(OP_ELSE);
+        self.local_get(uy);
+        self.i32_const(0x007F_FFFF);
+        self.op(OP_I32_AND);
+        self.i32_const(0x0080_0000);
+        self.op(OP_I32_OR);
+        self.local_set(uy);
+        self.op(OP_END);
+
+        // Exponent reduction loop while ex > ey.
+        self.op(OP_BLOCK);
+        self.code.push(BLOCKTYPE_VOID);
+        self.op(OP_LOOP);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ex);
+        self.local_get(ey);
+        self.op(OP_I32_LE_S);
+        self.br_if(1);
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I32_GE_U);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I32_SUB);
+        self.local_set(ux);
+        self.op(OP_END);
+        self.local_get(ux);
+        self.op(OP_I32_EQZ);
+        self.br_if(1);
+        self.local_get(ux);
+        self.i32_const(1);
+        self.op(OP_I32_SHL);
+        self.local_set(ux);
+        self.local_get(ex);
+        self.i32_const(1);
+        self.op(OP_I32_SUB);
+        self.local_set(ex);
+        self.br(0);
+        self.op(OP_END);
+        self.op(OP_END);
+
+        // Final step for ex == ey.
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I32_GE_U);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I32_SUB);
+        self.local_set(ux);
+        self.op(OP_END);
+
+        self.local_get(ux);
+        self.op(OP_I32_EQZ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(sx);
+        self.op(OP_F32_REINTERPRET_I32);
+        self.local_set(dst);
+        self.op(OP_ELSE);
+        self.local_get(ux);
+        self.op(OP_I32_CLZ);
+        self.i32_const(8);
+        self.op(OP_I32_SUB);
+        self.local_set(lz);
+
+        self.local_get(ex);
+        self.local_get(lz);
+        self.op(OP_I32_GT_S);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(sx);
+        self.local_get(ex);
+        self.local_get(lz);
+        self.op(OP_I32_SUB);
+        self.i32_const(23);
+        self.op(OP_I32_SHL);
+        self.op(OP_I32_OR);
+        self.local_get(ux);
+        self.local_get(lz);
+        self.op(OP_I32_SHL);
+        self.i32_const(0x007F_FFFF);
+        self.op(OP_I32_AND);
+        self.op(OP_I32_OR);
+        self.op(OP_F32_REINTERPRET_I32);
+        self.local_set(dst);
+        self.op(OP_ELSE);
+        self.local_get(ex);
+        self.i32_const(1);
+        self.op(OP_I32_GE_S);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ux);
+        self.local_get(ex);
+        self.i32_const(1);
+        self.op(OP_I32_SUB);
+        self.op(OP_I32_SHL);
+        self.local_set(ux);
+        self.op(OP_ELSE);
+        self.local_get(ux);
+        self.i32_const(1);
+        self.local_get(ex);
+        self.op(OP_I32_SUB);
+        self.op(OP_I32_SHR_U);
+        self.local_set(ux);
+        self.op(OP_END);
+        self.local_get(sx);
+        self.local_get(ux);
+        self.op(OP_I32_OR);
+        self.op(OP_F32_REINTERPRET_I32);
+        self.local_set(dst);
+        self.op(OP_END);
+        self.op(OP_END);
+
+        self.op(OP_END);
+        self.op(OP_END);
+    }
+
+    /// Exact IEEE-754 `fmod(la, lb) -> dst` for `f64` (uses `temps_i64[0..=5]`).
+    fn emit_frem_f64_loc(&mut self, la: u32, lb: u32, dst: u32) {
+        let ux = self.temp_i64(0);
+        let uy = self.temp_i64(1);
+        let sx = self.temp_i64(2);
+        let ex = self.temp_i64(3);
+        let ey = self.temp_i64(4);
+        let lz = self.temp_i64(5);
+
+        self.local_get(la);
+        self.op(OP_I64_REINTERPRET_F64);
+        self.local_tee(ux);
+        self.i64_const(0x8000_0000_0000_0000u64 as i64);
+        self.op(OP_I64_AND);
+        self.local_set(sx);
+
+        self.local_get(ux);
+        self.i64_const(0x7FFF_FFFF_FFFF_FFFFi64);
+        self.op(OP_I64_AND);
+        self.local_set(ux);
+
+        self.local_get(lb);
+        self.op(OP_I64_REINTERPRET_F64);
+        self.i64_const(0x7FFF_FFFF_FFFF_FFFFi64);
+        self.op(OP_I64_AND);
+        self.local_set(uy);
+
+        // NaN if y == 0 || x is Inf/NaN || y is NaN.
+        self.local_get(uy);
+        self.op(OP_I64_EQZ);
+        self.local_get(ux);
+        self.i64_const(0x7FF0_0000_0000_0000i64);
+        self.op(OP_I64_GE_U);
+        self.op(OP_I32_OR);
+        self.local_get(uy);
+        self.i64_const(0x7FF0_0000_0000_0000i64);
+        self.op(OP_I64_GT_U);
+        self.op(OP_I32_OR);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.f64_const_bits(0x7FF8_0000_0000_0000);
+        self.local_set(dst);
+        self.op(OP_ELSE);
+
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I64_LE_U);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I64_EQ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(sx);
+        self.op(OP_F64_REINTERPRET_I64);
+        self.local_set(dst);
+        self.op(OP_ELSE);
+        self.local_get(la);
+        self.local_set(dst);
+        self.op(OP_END);
+        self.op(OP_ELSE);
+
+        // Normalize ux -> (ex, ux) with implicit bit at 52.
+        self.local_get(ux);
+        self.i64_const(52);
+        self.op(OP_I64_SHR_U);
+        self.local_tee(ex);
+        self.op(OP_I64_EQZ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ux);
+        self.op(OP_I64_CLZ);
+        self.i64_const(11);
+        self.op(OP_I64_SUB);
+        self.local_set(lz);
+        self.i64_const(1);
+        self.local_get(lz);
+        self.op(OP_I64_SUB);
+        self.local_set(ex);
+        self.local_get(ux);
+        self.local_get(lz);
+        self.op(OP_I64_SHL);
+        self.local_set(ux);
+        self.op(OP_ELSE);
+        self.local_get(ux);
+        self.i64_const(0x000F_FFFF_FFFF_FFFFi64);
+        self.op(OP_I64_AND);
+        self.i64_const(0x0010_0000_0000_0000i64);
+        self.op(OP_I64_OR);
+        self.local_set(ux);
+        self.op(OP_END);
+
+        // Normalize uy -> (ey, uy) with implicit bit at 52.
+        self.local_get(uy);
+        self.i64_const(52);
+        self.op(OP_I64_SHR_U);
+        self.local_tee(ey);
+        self.op(OP_I64_EQZ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(uy);
+        self.op(OP_I64_CLZ);
+        self.i64_const(11);
+        self.op(OP_I64_SUB);
+        self.local_set(lz);
+        self.i64_const(1);
+        self.local_get(lz);
+        self.op(OP_I64_SUB);
+        self.local_set(ey);
+        self.local_get(uy);
+        self.local_get(lz);
+        self.op(OP_I64_SHL);
+        self.local_set(uy);
+        self.op(OP_ELSE);
+        self.local_get(uy);
+        self.i64_const(0x000F_FFFF_FFFF_FFFFi64);
+        self.op(OP_I64_AND);
+        self.i64_const(0x0010_0000_0000_0000i64);
+        self.op(OP_I64_OR);
+        self.local_set(uy);
+        self.op(OP_END);
+
+        // Exponent reduction loop while ex > ey.
+        self.op(OP_BLOCK);
+        self.code.push(BLOCKTYPE_VOID);
+        self.op(OP_LOOP);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ex);
+        self.local_get(ey);
+        self.op(OP_I64_LE_S);
+        self.br_if(1);
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I64_GE_U);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I64_SUB);
+        self.local_set(ux);
+        self.op(OP_END);
+        self.local_get(ux);
+        self.op(OP_I64_EQZ);
+        self.br_if(1);
+        self.local_get(ux);
+        self.i64_const(1);
+        self.op(OP_I64_SHL);
+        self.local_set(ux);
+        self.local_get(ex);
+        self.i64_const(1);
+        self.op(OP_I64_SUB);
+        self.local_set(ex);
+        self.br(0);
+        self.op(OP_END);
+        self.op(OP_END);
+
+        // Final step for ex == ey.
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I64_GE_U);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ux);
+        self.local_get(uy);
+        self.op(OP_I64_SUB);
+        self.local_set(ux);
+        self.op(OP_END);
+
+        self.local_get(ux);
+        self.op(OP_I64_EQZ);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(sx);
+        self.op(OP_F64_REINTERPRET_I64);
+        self.local_set(dst);
+        self.op(OP_ELSE);
+        self.local_get(ux);
+        self.op(OP_I64_CLZ);
+        self.i64_const(11);
+        self.op(OP_I64_SUB);
+        self.local_set(lz);
+
+        self.local_get(ex);
+        self.local_get(lz);
+        self.op(OP_I64_GT_S);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(sx);
+        self.local_get(ex);
+        self.local_get(lz);
+        self.op(OP_I64_SUB);
+        self.i64_const(52);
+        self.op(OP_I64_SHL);
+        self.op(OP_I64_OR);
+        self.local_get(ux);
+        self.local_get(lz);
+        self.op(OP_I64_SHL);
+        self.i64_const(0x000F_FFFF_FFFF_FFFFi64);
+        self.op(OP_I64_AND);
+        self.op(OP_I64_OR);
+        self.op(OP_F64_REINTERPRET_I64);
+        self.local_set(dst);
+        self.op(OP_ELSE);
+        self.local_get(ex);
+        self.i64_const(1);
+        self.op(OP_I64_GE_S);
+        self.op(OP_IF);
+        self.code.push(BLOCKTYPE_VOID);
+        self.local_get(ux);
+        self.local_get(ex);
+        self.i64_const(1);
+        self.op(OP_I64_SUB);
+        self.op(OP_I64_SHL);
+        self.local_set(ux);
+        self.op(OP_ELSE);
+        self.local_get(ux);
+        self.i64_const(1);
+        self.local_get(ex);
+        self.op(OP_I64_SUB);
+        self.op(OP_I64_SHR_U);
+        self.local_set(ux);
+        self.op(OP_END);
+        self.local_get(sx);
+        self.local_get(ux);
+        self.op(OP_I64_OR);
+        self.op(OP_F64_REINTERPRET_I64);
+        self.local_set(dst);
+        self.op(OP_END);
+        self.op(OP_END);
+
+        self.op(OP_END);
+        self.op(OP_END);
+    }
 
     fn emit_float_binary(
         &mut self,
@@ -4589,13 +6463,36 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         a: Value,
         b: Value,
     ) -> Result<(), LirWasm64Error> {
-        let (la, lb) = (self.loc(a), self.loc(b));
-        let dst = self.val_locals[inst].first;
+        let (a_base, b_base, dst_base) = (self.loc(a), self.loc(b), self.val_locals[inst].first);
+        for k in 0..ty.lanes() {
+            self.emit_float_binary_loc(inst, op, ty, a_base + k, b_base + k, dst_base + k)?;
+        }
+        Ok(())
+    }
+
+    fn emit_float_binary_loc(
+        &mut self,
+        inst: usize,
+        op: Op,
+        ty: Ty,
+        la: u32,
+        lb: u32,
+        dst: u32,
+    ) -> Result<(), LirWasm64Error> {
         let is_f64 = match ty.elem() {
             Scalar::F32 => false,
             Scalar::F64 => true,
             _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
         };
+
+        if op == Op::Frem {
+            if is_f64 {
+                self.emit_frem_f64_loc(la, lb, dst);
+            } else {
+                self.emit_frem_f32_loc(la, lb, dst);
+            }
+            return Ok(());
+        }
 
         match op {
             Op::Fadd | Op::Fsub | Op::Fmul | Op::Fdiv | Op::Fcopysign | Op::Fminimum | Op::Fmaximum => {
@@ -4657,86 +6554,226 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         ty: Ty,
         a: Value,
     ) -> Result<(), LirWasm64Error> {
-        let la = self.loc(a);
-        let dst = self.val_locals[inst].first;
+        let (a_base, dst_base) = (self.loc(a), self.val_locals[inst].first);
         let is_f64 = match ty.elem() {
             Scalar::F32 => false,
             Scalar::F64 => true,
             _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
         };
 
-        if op == Op::Fround {
-            // Ties away from zero: t = trunc(a); if abs(a - t) >= 0.5 { t + copysign(1.0, a) } else { t }
-            let t = if is_f64 { self.temp_f64(0) } else { self.temp_f32(0) };
-            self.local_get(la);
-            self.op(if is_f64 { OP_F64_TRUNC } else { OP_F32_TRUNC });
-            self.local_set(t);
+        for k in 0..ty.lanes() {
+            let (la, dst) = (a_base + k, dst_base + k);
+            if op == Op::Fround {
+                // Ties away from zero: t = trunc(a); if abs(a - t) >= 0.5 { t + copysign(1.0, a) } else { t }
+                let t = if is_f64 { self.temp_f64(0) } else { self.temp_f32(0) };
+                self.local_get(la);
+                self.op(if is_f64 { OP_F64_TRUNC } else { OP_F32_TRUNC });
+                self.local_set(t);
 
-            // val1 (if >= 0.5): t + copysign(1.0, a)
-            self.local_get(t);
-            if is_f64 {
-                self.f64_const_bits(1.0f64.to_bits());
-            } else {
-                self.f32_const_bits(1.0f32.to_bits());
+                // val1 (if >= 0.5): t + copysign(1.0, a)
+                self.local_get(t);
+                if is_f64 {
+                    self.f64_const_bits(1.0f64.to_bits());
+                } else {
+                    self.f32_const_bits(1.0f32.to_bits());
+                }
+                self.local_get(la);
+                self.op(if is_f64 { OP_F64_COPYSIGN } else { OP_F32_COPYSIGN });
+                self.op(if is_f64 { OP_F64_ADD } else { OP_F32_ADD });
+
+                // val2: t
+                self.local_get(t);
+
+                // cond: abs(a - t) >= 0.5
+                self.local_get(la);
+                self.local_get(t);
+                self.op(if is_f64 { OP_F64_SUB } else { OP_F32_SUB });
+                self.op(if is_f64 { OP_F64_ABS } else { OP_F32_ABS });
+                if is_f64 {
+                    self.f64_const_bits(0.5f64.to_bits());
+                    self.op(OP_F64_GE);
+                } else {
+                    self.f32_const_bits(0.5f32.to_bits());
+                    self.op(OP_F32_GE);
+                }
+                self.op(OP_SELECT);
+                self.local_set(dst);
+                continue;
             }
-            self.local_get(la);
-            self.op(if is_f64 { OP_F64_COPYSIGN } else { OP_F32_COPYSIGN });
-            self.op(if is_f64 { OP_F64_ADD } else { OP_F32_ADD });
 
-            // val2: t
-            self.local_get(t);
-
-            // cond: abs(a - t) >= 0.5
             self.local_get(la);
-            self.local_get(t);
-            self.op(if is_f64 { OP_F64_SUB } else { OP_F32_SUB });
-            self.op(if is_f64 { OP_F64_ABS } else { OP_F32_ABS });
-            if is_f64 {
-                self.f64_const_bits(0.5f64.to_bits());
-                self.op(OP_F64_GE);
-            } else {
-                self.f32_const_bits(0.5f32.to_bits());
-                self.op(OP_F32_GE);
-            }
-            self.op(OP_SELECT);
+            let wop = match (op, is_f64) {
+                (Op::Fneg, false) => OP_F32_NEG,
+                (Op::Fneg, true) => OP_F64_NEG,
+                (Op::Fabs, false) => OP_F32_ABS,
+                (Op::Fabs, true) => OP_F64_ABS,
+                (Op::Sqrt, false) => OP_F32_SQRT,
+                (Op::Sqrt, true) => OP_F64_SQRT,
+                (Op::Floor, false) => OP_F32_FLOOR,
+                (Op::Floor, true) => OP_F64_FLOOR,
+                (Op::Ceil, false) => OP_F32_CEIL,
+                (Op::Ceil, true) => OP_F64_CEIL,
+                (Op::Ftrunc, false) => OP_F32_TRUNC,
+                (Op::Ftrunc, true) => OP_F64_TRUNC,
+                (Op::Nearest, false) => OP_F32_NEAREST,
+                (Op::Nearest, true) => OP_F64_NEAREST,
+                _ => return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op }),
+            };
+            self.op(wop);
             self.local_set(dst);
-            return Ok(());
         }
-
-        self.local_get(la);
-        let wop = match (op, is_f64) {
-            (Op::Fneg, false) => OP_F32_NEG,
-            (Op::Fneg, true) => OP_F64_NEG,
-            (Op::Fabs, false) => OP_F32_ABS,
-            (Op::Fabs, true) => OP_F64_ABS,
-            (Op::Sqrt, false) => OP_F32_SQRT,
-            (Op::Sqrt, true) => OP_F64_SQRT,
-            (Op::Floor, false) => OP_F32_FLOOR,
-            (Op::Floor, true) => OP_F64_FLOOR,
-            (Op::Ceil, false) => OP_F32_CEIL,
-            (Op::Ceil, true) => OP_F64_CEIL,
-            (Op::Ftrunc, false) => OP_F32_TRUNC,
-            (Op::Ftrunc, true) => OP_F64_TRUNC,
-            (Op::Nearest, false) => OP_F32_NEAREST,
-            (Op::Nearest, true) => OP_F64_NEAREST,
-            _ => return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op }),
-        };
-        self.op(wop);
-        self.local_set(dst);
         Ok(())
     }
 
     // ---- Memory ops -------------------------------------------------------------------------
 
-    fn emit_effective_addr(&mut self, ptr_loc: u32, offset: i32) -> u64 {
-        self.local_get(ptr_loc);
+    /// Computes a `(base_loc, u64_offset)` pair for `ptr_loc + offset` (uses `temps_i64[0]` only
+    /// when `offset < 0`).
+    fn emit_base_addr(&mut self, ptr_loc: u32, offset: i32) -> (u32, u64) {
         if offset >= 0 {
-            offset as u64
+            (ptr_loc, offset as u64)
         } else {
+            let base = self.temp_i64(0);
+            self.local_get(ptr_loc);
             self.i64_const(i64::from(offset));
             self.op(OP_I64_ADD);
-            0
+            self.local_set(base);
+            (base, 0)
         }
+    }
+
+    fn emit_scalar_load_at(
+        &mut self,
+        inst: usize,
+        ty: Ty,
+        scalar: Scalar,
+        base_loc: u32,
+        mem_off: u64,
+        align_hint: u32,
+        dst_first: u32,
+    ) -> Result<(), LirWasm64Error> {
+        match scalar {
+            Scalar::I1 => {
+                self.local_get(base_loc);
+                self.op(OP_I32_LOAD8_U);
+                self.memarg(0, mem_off);
+                self.i32_const(1);
+                self.op(OP_I32_AND);
+                self.local_set(dst_first);
+            }
+            Scalar::I8 => {
+                self.local_get(base_loc);
+                self.op(OP_I32_LOAD8_U);
+                self.memarg(0, mem_off);
+                self.local_set(dst_first);
+            }
+            Scalar::I16 => {
+                self.local_get(base_loc);
+                self.op(OP_I32_LOAD16_U);
+                self.memarg(align_hint.min(1), mem_off);
+                self.local_set(dst_first);
+            }
+            Scalar::I32 => {
+                self.local_get(base_loc);
+                self.op(OP_I32_LOAD);
+                self.memarg(align_hint.min(2), mem_off);
+                self.local_set(dst_first);
+            }
+            Scalar::I64 | Scalar::Ptr => {
+                self.local_get(base_loc);
+                self.op(OP_I64_LOAD);
+                self.memarg(align_hint.min(3), mem_off);
+                self.local_set(dst_first);
+            }
+            Scalar::F32 => {
+                self.local_get(base_loc);
+                self.op(OP_F32_LOAD);
+                self.memarg(align_hint.min(2), mem_off);
+                self.local_set(dst_first);
+            }
+            Scalar::F64 => {
+                self.local_get(base_loc);
+                self.op(OP_F64_LOAD);
+                self.memarg(align_hint.min(3), mem_off);
+                self.local_set(dst_first);
+            }
+            Scalar::I128 => {
+                let align = align_hint.min(3);
+                self.local_get(base_loc);
+                self.op(OP_I64_LOAD);
+                self.memarg(align, mem_off);
+                self.local_set(dst_first);
+                self.local_get(base_loc);
+                self.op(OP_I64_LOAD);
+                self.memarg(align, mem_off + 8);
+                self.local_set(dst_first + 1);
+            }
+            _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
+        }
+        Ok(())
+    }
+
+    fn emit_scalar_store_at(
+        &mut self,
+        inst: usize,
+        ty: Ty,
+        scalar: Scalar,
+        val_first: u32,
+        base_loc: u32,
+        mem_off: u64,
+        align_hint: u32,
+    ) -> Result<(), LirWasm64Error> {
+        match scalar {
+            Scalar::I1 | Scalar::I8 => {
+                self.local_get(base_loc);
+                self.local_get(val_first);
+                self.op(OP_I32_STORE8);
+                self.memarg(0, mem_off);
+            }
+            Scalar::I16 => {
+                self.local_get(base_loc);
+                self.local_get(val_first);
+                self.op(OP_I32_STORE16);
+                self.memarg(align_hint.min(1), mem_off);
+            }
+            Scalar::I32 => {
+                self.local_get(base_loc);
+                self.local_get(val_first);
+                self.op(OP_I32_STORE);
+                self.memarg(align_hint.min(2), mem_off);
+            }
+            Scalar::I64 | Scalar::Ptr => {
+                self.local_get(base_loc);
+                self.local_get(val_first);
+                self.op(OP_I64_STORE);
+                self.memarg(align_hint.min(3), mem_off);
+            }
+            Scalar::F32 => {
+                self.local_get(base_loc);
+                self.local_get(val_first);
+                self.op(OP_F32_STORE);
+                self.memarg(align_hint.min(2), mem_off);
+            }
+            Scalar::F64 => {
+                self.local_get(base_loc);
+                self.local_get(val_first);
+                self.op(OP_F64_STORE);
+                self.memarg(align_hint.min(3), mem_off);
+            }
+            Scalar::I128 => {
+                let align = align_hint.min(3);
+                self.local_get(base_loc);
+                self.local_get(val_first);
+                self.op(OP_I64_STORE);
+                self.memarg(align, mem_off);
+                self.local_get(base_loc);
+                self.local_get(val_first + 1);
+                self.op(OP_I64_STORE);
+                self.memarg(align, mem_off + 8);
+            }
+            _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
+        }
+        Ok(())
     }
 
     fn emit_load(
@@ -4748,82 +6785,50 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         align_hint: u32,
         dst_first: u32,
     ) -> Result<(), LirWasm64Error> {
-        match ty.elem() {
-            Scalar::I1 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.op(OP_I32_LOAD8_U);
-                self.memarg(0, mem_off);
-                self.i32_const(1);
-                self.op(OP_I32_AND);
-                self.local_set(dst_first);
-            }
-            Scalar::I8 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.op(OP_I32_LOAD8_U);
-                self.memarg(0, mem_off);
-                self.local_set(dst_first);
-            }
-            Scalar::I16 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.op(OP_I32_LOAD16_U);
-                self.memarg(align_hint.min(1), mem_off);
-                self.local_set(dst_first);
-            }
-            Scalar::I32 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.op(OP_I32_LOAD);
-                self.memarg(align_hint.min(2), mem_off);
-                self.local_set(dst_first);
-            }
-            Scalar::I64 | Scalar::Ptr => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.op(OP_I64_LOAD);
-                self.memarg(align_hint.min(3), mem_off);
-                self.local_set(dst_first);
-            }
-            Scalar::F32 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.op(OP_F32_LOAD);
-                self.memarg(align_hint.min(2), mem_off);
-                self.local_set(dst_first);
-            }
-            Scalar::F64 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.op(OP_F64_LOAD);
-                self.memarg(align_hint.min(3), mem_off);
-                self.local_set(dst_first);
-            }
-            Scalar::I128 => {
-                let align = align_hint.min(3);
-                if offset >= 0 {
-                    let mem_off = offset as u64;
-                    self.local_get(ptr_loc);
-                    self.op(OP_I64_LOAD);
-                    self.memarg(align, mem_off);
-                    self.local_set(dst_first);
-                    self.local_get(ptr_loc);
-                    self.op(OP_I64_LOAD);
-                    self.memarg(align, mem_off + 8);
-                    self.local_set(dst_first + 1);
-                } else {
-                    let base = self.temp_i64(0);
-                    self.local_get(ptr_loc);
-                    self.i64_const(i64::from(offset));
-                    self.op(OP_I64_ADD);
-                    self.local_set(base);
-                    self.local_get(base);
-                    self.op(OP_I64_LOAD);
-                    self.memarg(align, 0);
-                    self.local_set(dst_first);
-                    self.local_get(base);
-                    self.op(OP_I64_LOAD);
-                    self.memarg(align, 8);
-                    self.local_set(dst_first + 1);
+        let (base_loc, base_off) = self.emit_base_addr(ptr_loc, offset);
+        if ty.form() == Form::Vector {
+            let elem = ty.elem();
+            let lanes = ty.lanes();
+            if elem == Scalar::I1 {
+                let b = self.temp_i32(0);
+                for byte_idx in 0..lanes.div_ceil(8) {
+                    self.local_get(base_loc);
+                    self.op(OP_I32_LOAD8_U);
+                    self.memarg(0, base_off + u64::from(byte_idx));
+                    self.local_set(b);
+                    for bit in 0..8u32 {
+                        let lane = byte_idx * 8 + bit;
+                        if lane >= lanes {
+                            break;
+                        }
+                        self.local_get(b);
+                        if bit != 0 {
+                            self.i32_const(bit as i32);
+                            self.op(OP_I32_SHR_U);
+                        }
+                        self.i32_const(1);
+                        self.op(OP_I32_AND);
+                        self.local_set(dst_first + lane);
+                    }
                 }
+                return Ok(());
             }
-            _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
+            let lane_bytes = u64::from(elem.bits(64) / 8);
+            let stride = lane_stride(elem);
+            for k in 0..lanes {
+                self.emit_scalar_load_at(
+                    inst,
+                    ty,
+                    elem,
+                    base_loc,
+                    base_off + u64::from(k) * lane_bytes,
+                    align_hint,
+                    dst_first + k * stride,
+                )?;
+            }
+            return Ok(());
         }
-        Ok(())
+        self.emit_scalar_load_at(inst, ty, ty.elem(), base_loc, base_off, align_hint, dst_first)
     }
 
     fn emit_store(
@@ -4835,72 +6840,501 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
         offset: i32,
         align_hint: u32,
     ) -> Result<(), LirWasm64Error> {
-        match ty.elem() {
-            Scalar::I1 | Scalar::I8 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.local_get(val_first);
-                self.op(OP_I32_STORE8);
-                self.memarg(0, mem_off);
+        let (base_loc, base_off) = self.emit_base_addr(ptr_loc, offset);
+        if ty.form() == Form::Vector {
+            let elem = ty.elem();
+            let lanes = ty.lanes();
+            if elem == Scalar::I1 {
+                for byte_idx in 0..lanes.div_ceil(8) {
+                    self.local_get(base_loc);
+                    self.i32_const(0);
+                    for bit in 0..8u32 {
+                        let lane = byte_idx * 8 + bit;
+                        if lane >= lanes {
+                            break;
+                        }
+                        self.local_get(val_first + lane);
+                        if bit != 0 {
+                            self.i32_const(bit as i32);
+                            self.op(OP_I32_SHL);
+                        }
+                        self.op(OP_I32_OR);
+                    }
+                    self.op(OP_I32_STORE8);
+                    self.memarg(0, base_off + u64::from(byte_idx));
+                }
+                return Ok(());
             }
-            Scalar::I16 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.local_get(val_first);
-                self.op(OP_I32_STORE16);
-                self.memarg(align_hint.min(1), mem_off);
+            let lane_bytes = u64::from(elem.bits(64) / 8);
+            let stride = lane_stride(elem);
+            for k in 0..lanes {
+                self.emit_scalar_store_at(
+                    inst,
+                    ty,
+                    elem,
+                    val_first + k * stride,
+                    base_loc,
+                    base_off + u64::from(k) * lane_bytes,
+                    align_hint,
+                )?;
             }
-            Scalar::I32 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.local_get(val_first);
-                self.op(OP_I32_STORE);
-                self.memarg(align_hint.min(2), mem_off);
+            return Ok(());
+        }
+        self.emit_scalar_store_at(inst, ty, ty.elem(), val_first, base_loc, base_off, align_hint)
+    }
+
+    // ---- Vector-specific ops ----------------------------------------------------------------
+
+    fn emit_vconst(&mut self, inst: usize, ty: Ty) -> Result<(), LirWasm64Error> {
+        let words = self.view.operands(inst).constant();
+        let elem = ty.elem();
+        let dst = self.val_locals[inst].first;
+        for k in 0..ty.lanes() {
+            match elem {
+                Scalar::I1 => {
+                    let bit = (words[(k / 32) as usize] >> (k % 32)) & 1;
+                    self.i32_const(bit as i32);
+                    self.local_set(dst + k);
+                }
+                Scalar::I8 => {
+                    let byte = (words[(k / 4) as usize] >> ((k % 4) * 8)) & 0xFF;
+                    self.i32_const(byte as i32);
+                    self.local_set(dst + k);
+                }
+                Scalar::I16 => {
+                    let half = (words[(k / 2) as usize] >> ((k % 2) * 16)) & 0xFFFF;
+                    self.i32_const(half as i32);
+                    self.local_set(dst + k);
+                }
+                Scalar::I32 => {
+                    self.i32_const(words[k as usize] as i32);
+                    self.local_set(dst + k);
+                }
+                Scalar::F32 => {
+                    self.f32_const_bits(words[k as usize]);
+                    self.local_set(dst + k);
+                }
+                Scalar::I64 => {
+                    let v = u64::from(words[(2 * k) as usize])
+                        | (u64::from(words[(2 * k + 1) as usize]) << 32);
+                    self.i64_const(v as i64);
+                    self.local_set(dst + k);
+                }
+                Scalar::F64 => {
+                    let bits = u64::from(words[(2 * k) as usize])
+                        | (u64::from(words[(2 * k + 1) as usize]) << 32);
+                    self.f64_const_bits(bits);
+                    self.local_set(dst + k);
+                }
+                Scalar::I128 => {
+                    let base = (4 * k) as usize;
+                    let lo = u64::from(words[base]) | (u64::from(words[base + 1]) << 32);
+                    let hi = u64::from(words[base + 2]) | (u64::from(words[base + 3]) << 32);
+                    self.i64_const(lo as i64);
+                    self.local_set(dst + 2 * k);
+                    self.i64_const(hi as i64);
+                    self.local_set(dst + 2 * k + 1);
+                }
+                _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
             }
-            Scalar::I64 | Scalar::Ptr => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.local_get(val_first);
-                self.op(OP_I64_STORE);
-                self.memarg(align_hint.min(3), mem_off);
-            }
-            Scalar::F32 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.local_get(val_first);
-                self.op(OP_F32_STORE);
-                self.memarg(align_hint.min(2), mem_off);
-            }
-            Scalar::F64 => {
-                let mem_off = self.emit_effective_addr(ptr_loc, offset);
-                self.local_get(val_first);
-                self.op(OP_F64_STORE);
-                self.memarg(align_hint.min(3), mem_off);
-            }
-            Scalar::I128 => {
-                let align = align_hint.min(3);
-                if offset >= 0 {
-                    let mem_off = offset as u64;
-                    self.local_get(ptr_loc);
-                    self.local_get(val_first);
-                    self.op(OP_I64_STORE);
-                    self.memarg(align, mem_off);
-                    self.local_get(ptr_loc);
-                    self.local_get(val_first + 1);
-                    self.op(OP_I64_STORE);
-                    self.memarg(align, mem_off + 8);
-                } else {
-                    let base = self.temp_i64(0);
-                    self.local_get(ptr_loc);
-                    self.i64_const(i64::from(offset));
-                    self.op(OP_I64_ADD);
-                    self.local_set(base);
-                    self.local_get(base);
-                    self.local_get(val_first);
-                    self.op(OP_I64_STORE);
-                    self.memarg(align, 0);
-                    self.local_get(base);
-                    self.local_get(val_first + 1);
-                    self.op(OP_I64_STORE);
-                    self.memarg(align, 8);
+        }
+        Ok(())
+    }
+
+    fn emit_swizzle(
+        &mut self,
+        inst: usize,
+        ty: Ty,
+        a: Value,
+        idx: Value,
+    ) -> Result<(), LirWasm64Error> {
+        let idx_ty = self.view.ty(idx);
+        let lanes = ty.lanes();
+        let elem = ty.elem();
+        let stride = lane_stride(elem);
+        let idx_stride = lane_stride(idx_ty.elem());
+        let a_base = self.loc(a);
+        let idx_base = self.loc(idx);
+        let dst = self.val_locals[inst].first;
+        let k_i32 = self.temp_i32(0);
+
+        for i in 0..lanes {
+            // Normalize lane i's unsigned index into `k_i32`, clamping any out-of-range index to `lanes`.
+            let idx_loc = idx_base + i * idx_stride;
+            match idx_ty.elem() {
+                Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => {
+                    self.local_get(idx_loc);
+                    self.local_set(k_i32);
+                }
+                Scalar::I64 => {
+                    self.local_get(idx_loc);
+                    self.op(OP_I32_WRAP_I64);
+                    self.i32_const(lanes as i32);
+                    self.local_get(idx_loc);
+                    self.i64_const(i64::from(lanes));
+                    self.op(OP_I64_LT_U);
+                    self.op(OP_SELECT);
+                    self.local_set(k_i32);
+                }
+                Scalar::I128 => {
+                    self.local_get(idx_loc);
+                    self.op(OP_I32_WRAP_I64);
+                    self.i32_const(lanes as i32);
+                    self.local_get(idx_loc + 1);
+                    self.op(OP_I64_EQZ);
+                    self.local_get(idx_loc);
+                    self.i64_const(i64::from(lanes));
+                    self.op(OP_I64_LT_U);
+                    self.op(OP_I32_AND);
+                    self.op(OP_SELECT);
+                    self.local_set(k_i32);
+                }
+                _ => {
+                    return Err(LirWasm64Error::UnsupportedType {
+                        func: self.place,
+                        inst,
+                        ty: idx_ty,
+                    });
                 }
             }
+
+            // Initialize output lane `i` to zero bits, then branchless select over `0..lanes`.
+            let out = dst + i * stride;
+            match elem {
+                Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => {
+                    self.i32_const(0);
+                    self.local_set(out);
+                }
+                Scalar::I64 | Scalar::Ptr => {
+                    self.i64_const(0);
+                    self.local_set(out);
+                }
+                Scalar::F32 => {
+                    self.f32_const_bits(0);
+                    self.local_set(out);
+                }
+                Scalar::F64 => {
+                    self.f64_const_bits(0);
+                    self.local_set(out);
+                }
+                Scalar::I128 => {
+                    self.i64_const(0);
+                    self.local_set(out);
+                    self.i64_const(0);
+                    self.local_set(out + 1);
+                }
+                _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
+            }
+
+            for j in 0..lanes {
+                let entry = a_base + j * stride;
+                for s in 0..stride {
+                    self.local_get(entry + s);
+                    self.local_get(out + s);
+                    self.local_get(k_i32);
+                    self.i32_const(j as i32);
+                    self.op(OP_I32_EQ);
+                    self.op(OP_SELECT);
+                    self.local_set(out + s);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_reduce_int(
+        &mut self,
+        inst: usize,
+        op: Op,
+        ty: Ty,
+        v: Value,
+    ) -> Result<(), LirWasm64Error> {
+        let bin_op = match op {
+            Op::ReduceAdd => Op::Add,
+            Op::ReduceMul => Op::Mul,
+            Op::ReduceAnd => Op::And,
+            Op::ReduceOr => Op::Or,
+            Op::ReduceXor => Op::Xor,
+            Op::ReduceUmin => Op::Umin,
+            Op::ReduceUmax => Op::Umax,
+            Op::ReduceSmin => Op::Smin,
+            Op::ReduceSmax => Op::Smax,
+            _ => return Err(LirWasm64Error::UnsupportedOp { func: self.place, inst, op }),
+        };
+        let v_ty = self.view.ty(v);
+        let lanes = v_ty.lanes();
+        let stride = lane_stride(ty.elem());
+        let v_base = self.loc(v);
+        let dst = self.val_locals[inst].first;
+
+        for s in 0..stride {
+            self.local_get(v_base + s);
+            self.local_set(dst + s);
+        }
+        for k in 1..lanes {
+            self.emit_int_binary_loc(inst, bin_op, ty, dst, v_base + k * stride, dst)?;
+        }
+        Ok(())
+    }
+
+    fn emit_reduce_float_init(
+        &mut self,
+        inst: usize,
+        op: Op,
+        ty: Ty,
+        start: Value,
+        v: Value,
+    ) -> Result<(), LirWasm64Error> {
+        let bin_op = if op == Op::ReduceFadd { Op::Fadd } else { Op::Fmul };
+        let v_ty = self.view.ty(v);
+        let v_base = self.loc(v);
+        let dst = self.val_locals[inst].first;
+
+        self.local_get(self.loc(start));
+        self.local_set(dst);
+        for k in 0..v_ty.lanes() {
+            self.emit_float_binary_loc(inst, bin_op, ty, dst, v_base + k, dst)?;
+        }
+        Ok(())
+    }
+
+    fn emit_reduce_float_minmax(
+        &mut self,
+        inst: usize,
+        op: Op,
+        ty: Ty,
+        v: Value,
+    ) -> Result<(), LirWasm64Error> {
+        let bin_op = if op == Op::ReduceFmin { Op::FminNum } else { Op::FmaxNum };
+        let v_ty = self.view.ty(v);
+        let v_base = self.loc(v);
+        let dst = self.val_locals[inst].first;
+
+        self.local_get(v_base);
+        self.local_set(dst);
+        for k in 1..v_ty.lanes() {
+            self.emit_float_binary_loc(inst, bin_op, ty, dst, v_base + k, dst)?;
+        }
+        Ok(())
+    }
+
+    fn emit_bitmask(&mut self, inst: usize, ty: Ty, v: Value) -> Result<(), LirWasm64Error> {
+        let v_ty = self.view.ty(v);
+        let lanes = v_ty.lanes();
+        let v_base = self.loc(v);
+        let dst = self.val_locals[inst].first;
+
+        match ty.elem() {
+            Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 => {
+                self.i32_const(0);
+                for k in 0..lanes {
+                    self.local_get(v_base + k);
+                    if k != 0 {
+                        self.i32_const(k as i32);
+                        self.op(OP_I32_SHL);
+                    }
+                    self.op(OP_I32_OR);
+                }
+                self.mask_sub32(ty.elem());
+                self.local_set(dst);
+            }
+            Scalar::I64 => {
+                self.i64_const(0);
+                for k in 0..lanes {
+                    self.local_get(v_base + k);
+                    self.op(OP_I64_EXTEND_I32_U);
+                    if k != 0 {
+                        self.i64_const(i64::from(k));
+                        self.op(OP_I64_SHL);
+                    }
+                    self.op(OP_I64_OR);
+                }
+                self.local_set(dst);
+            }
+            Scalar::I128 => {
+                self.i64_const(0);
+                for k in 0..lanes.min(64) {
+                    self.local_get(v_base + k);
+                    self.op(OP_I64_EXTEND_I32_U);
+                    if k != 0 {
+                        self.i64_const(i64::from(k));
+                        self.op(OP_I64_SHL);
+                    }
+                    self.op(OP_I64_OR);
+                }
+                self.local_set(dst);
+                self.i64_const(0);
+                for k in 64..lanes {
+                    self.local_get(v_base + k);
+                    self.op(OP_I64_EXTEND_I32_U);
+                    let sh = k - 64;
+                    if sh != 0 {
+                        self.i64_const(i64::from(sh));
+                        self.op(OP_I64_SHL);
+                    }
+                    self.op(OP_I64_OR);
+                }
+                self.local_set(dst + 1);
+            }
             _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
+        }
+        Ok(())
+    }
+
+    fn emit_masked_load(
+        &mut self,
+        inst: usize,
+        ty: Ty,
+        ptr: Value,
+        mask: Value,
+        pass: Value,
+        align_hint: u32,
+    ) -> Result<(), LirWasm64Error> {
+        let elem = ty.elem();
+        if elem == Scalar::I1 {
+            return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty });
+        }
+        let lane_bytes = u64::from(elem.bits(64) / 8);
+        let stride = lane_stride(elem);
+        let ptr_loc = self.loc(ptr);
+        let mask_base = self.loc(mask);
+        let pass_base = self.loc(pass);
+        let dst = self.val_locals[inst].first;
+
+        for k in 0..ty.lanes() {
+            self.local_get(mask_base + k);
+            self.op(OP_IF);
+            self.code.push(BLOCKTYPE_VOID);
+            self.emit_scalar_load_at(
+                inst,
+                ty,
+                elem,
+                ptr_loc,
+                u64::from(k) * lane_bytes,
+                align_hint,
+                dst + k * stride,
+            )?;
+            self.op(OP_ELSE);
+            for s in 0..stride {
+                self.local_get(pass_base + k * stride + s);
+                self.local_set(dst + k * stride + s);
+            }
+            self.op(OP_END);
+        }
+        Ok(())
+    }
+
+    fn emit_masked_store(
+        &mut self,
+        inst: usize,
+        val: Value,
+        ptr: Value,
+        mask: Value,
+        align_hint: u32,
+    ) -> Result<(), LirWasm64Error> {
+        let ty = self.view.ty(val);
+        let elem = ty.elem();
+        if elem == Scalar::I1 {
+            return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty });
+        }
+        let lane_bytes = u64::from(elem.bits(64) / 8);
+        let stride = lane_stride(elem);
+        let val_base = self.loc(val);
+        let ptr_loc = self.loc(ptr);
+        let mask_base = self.loc(mask);
+
+        for k in 0..ty.lanes() {
+            self.local_get(mask_base + k);
+            self.op(OP_IF);
+            self.code.push(BLOCKTYPE_VOID);
+            self.emit_scalar_store_at(
+                inst,
+                ty,
+                elem,
+                val_base + k * stride,
+                ptr_loc,
+                u64::from(k) * lane_bytes,
+                align_hint,
+            )?;
+            self.op(OP_END);
+        }
+        Ok(())
+    }
+
+    fn emit_gather(
+        &mut self,
+        inst: usize,
+        ty: Ty,
+        ptrs: Value,
+        mask: Value,
+        pass: Value,
+        align_hint: u32,
+    ) -> Result<(), LirWasm64Error> {
+        let elem = ty.elem();
+        if elem == Scalar::I1 {
+            return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty });
+        }
+        let stride = lane_stride(elem);
+        let ptrs_base = self.loc(ptrs);
+        let mask_base = self.loc(mask);
+        let pass_base = self.loc(pass);
+        let dst = self.val_locals[inst].first;
+
+        for k in 0..ty.lanes() {
+            self.local_get(mask_base + k);
+            self.op(OP_IF);
+            self.code.push(BLOCKTYPE_VOID);
+            self.emit_scalar_load_at(
+                inst,
+                ty,
+                elem,
+                ptrs_base + k,
+                0,
+                align_hint,
+                dst + k * stride,
+            )?;
+            self.op(OP_ELSE);
+            for s in 0..stride {
+                self.local_get(pass_base + k * stride + s);
+                self.local_set(dst + k * stride + s);
+            }
+            self.op(OP_END);
+        }
+        Ok(())
+    }
+
+    fn emit_scatter(
+        &mut self,
+        inst: usize,
+        val: Value,
+        ptrs: Value,
+        mask: Value,
+        align_hint: u32,
+    ) -> Result<(), LirWasm64Error> {
+        let ty = self.view.ty(val);
+        let elem = ty.elem();
+        if elem == Scalar::I1 {
+            return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty });
+        }
+        let stride = lane_stride(elem);
+        let val_base = self.loc(val);
+        let ptrs_base = self.loc(ptrs);
+        let mask_base = self.loc(mask);
+
+        for k in 0..ty.lanes() {
+            self.local_get(mask_base + k);
+            self.op(OP_IF);
+            self.code.push(BLOCKTYPE_VOID);
+            self.emit_scalar_store_at(
+                inst,
+                ty,
+                elem,
+                val_base + k * stride,
+                ptrs_base + k,
+                0,
+                align_hint,
+            )?;
+            self.op(OP_END);
         }
         Ok(())
     }
@@ -5105,6 +7539,119 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                 }
                 self.local_set(next_loc);
                 self.emit_store(inst, ty, next_loc, ptr_loc, 0, align_hint)?;
+            }
+            Scalar::I128 => {
+                let next_lo = self.temp_i64(1);
+                let next_hi = self.temp_i64(2);
+                match rmw {
+                    AtomicRmw::Xchg => {
+                        self.local_get(op_loc);
+                        self.local_set(next_lo);
+                        self.local_get(op_loc + 1);
+                        self.local_set(next_hi);
+                    }
+                    AtomicRmw::Add => {
+                        self.emit_i128_binary_loc(
+                            inst,
+                            Op::Add,
+                            old_loc,
+                            old_loc + 1,
+                            op_loc,
+                            op_loc + 1,
+                            next_lo,
+                            next_hi,
+                        )?;
+                    }
+                    AtomicRmw::Sub => {
+                        self.emit_i128_binary_loc(
+                            inst,
+                            Op::Sub,
+                            old_loc,
+                            old_loc + 1,
+                            op_loc,
+                            op_loc + 1,
+                            next_lo,
+                            next_hi,
+                        )?;
+                    }
+                    AtomicRmw::And => {
+                        self.emit_i128_binary_loc(
+                            inst,
+                            Op::And,
+                            old_loc,
+                            old_loc + 1,
+                            op_loc,
+                            op_loc + 1,
+                            next_lo,
+                            next_hi,
+                        )?;
+                    }
+                    AtomicRmw::Nand => {
+                        self.local_get(old_loc);
+                        self.local_get(op_loc);
+                        self.op(OP_I64_AND);
+                        self.i64_const(-1);
+                        self.op(OP_I64_XOR);
+                        self.local_set(next_lo);
+                        self.local_get(old_loc + 1);
+                        self.local_get(op_loc + 1);
+                        self.op(OP_I64_AND);
+                        self.i64_const(-1);
+                        self.op(OP_I64_XOR);
+                        self.local_set(next_hi);
+                    }
+                    AtomicRmw::Or => {
+                        self.emit_i128_binary_loc(
+                            inst,
+                            Op::Or,
+                            old_loc,
+                            old_loc + 1,
+                            op_loc,
+                            op_loc + 1,
+                            next_lo,
+                            next_hi,
+                        )?;
+                    }
+                    AtomicRmw::Xor => {
+                        self.emit_i128_binary_loc(
+                            inst,
+                            Op::Xor,
+                            old_loc,
+                            old_loc + 1,
+                            op_loc,
+                            op_loc + 1,
+                            next_lo,
+                            next_hi,
+                        )?;
+                    }
+                    AtomicRmw::Umin | AtomicRmw::Umax | AtomicRmw::Min | AtomicRmw::Max => {
+                        let bin = match rmw {
+                            AtomicRmw::Umin => Op::Umin,
+                            AtomicRmw::Umax => Op::Umax,
+                            AtomicRmw::Min => Op::Smin,
+                            _ => Op::Smax,
+                        };
+                        self.emit_i128_binary_loc(
+                            inst,
+                            bin,
+                            old_loc,
+                            old_loc + 1,
+                            op_loc,
+                            op_loc + 1,
+                            next_lo,
+                            next_hi,
+                        )?;
+                    }
+                }
+                let align = align_hint.min(3);
+                self.local_get(ptr_loc);
+                self.local_get(next_lo);
+                self.op(OP_I64_STORE);
+                self.memarg(align, 0);
+                self.local_get(ptr_loc);
+                self.local_get(next_hi);
+                self.op(OP_I64_STORE);
+                self.memarg(align, 8);
             }
             _ => return Err(LirWasm64Error::UnsupportedType { func: self.place, inst, ty }),
         }
@@ -5864,5 +8411,501 @@ mod tests {
             compile_lir_wasm64(&bad_module, &mut out, Alloc::global()),
             Err(LirWasm64Error::InvalidDataReloc { func: u32::MAX, data_id: 20, offset: 12 })
         );
+    }
+
+    #[test]
+    fn overflow_ops_all_widths_including_i128_edge_cases() {
+        use blaze_lir::eval::{Outcome, Val, run_in};
+
+        // Helper: build `(a: T, b: T) -> (T, i1)` using `op`, verify with `blaze_lir::eval` on
+        // edge cases, and compile to deterministic Wasm64.
+        let build_ovf = |ty: Ty, op: Op| -> Func<Global> {
+            let mut b = new_builder(&[ty, ty], &[ty, Ty::I1]);
+            let a = b.param(ty);
+            let y = b.param(ty);
+            let pair = b.overflow(op, a, y);
+            let res = b.project(pair, 0);
+            let ovf = b.project(pair, 1);
+            b.ret(&[res, ovf]);
+            b.finish_checked().unwrap()
+        };
+
+        let mut built: Vec<Func<Global>, Alloc<'static>> = Vec::new_in(Alloc::global());
+        for ty in [Ty::I8, Ty::I16, Ty::I32, Ty::I64, Ty::I128] {
+            for op in [
+                Op::UaddOverflow,
+                Op::SaddOverflow,
+                Op::UsubOverflow,
+                Op::SsubOverflow,
+                Op::UmulOverflow,
+                Op::SmulOverflow,
+            ] {
+                built.push(build_ovf(ty, op));
+            }
+        }
+
+        // Verify key edge cases in `blaze_lir::eval`:
+        // Indices: 0..6 i8, 6..12 i16, 12..18 i32, 18..24 i64, 24..30 i128
+        // Within each 6: 0=uadd, 1=sadd, 2=usub, 3=ssub, 4=umul, 5=smul
+        let eval_ovf = |f: &Func<Global>, a: u128, b: u128| -> (u128, bool) {
+            match run_in(f.view(), &[Val::Int(a), Val::Int(b)], 100_000, Global).unwrap() {
+                Outcome::Returned(vals) => {
+                    let [Val::Int(r), Val::Int(o)] = vals.as_slice() else { panic!() };
+                    (*r, *o != 0)
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        };
+        // u64::MAX * 2 -> (u64::MAX - 1, true)
+        assert_eq!(eval_ovf(&built[22], u64::MAX as u128, 2), ((u64::MAX.wrapping_mul(2)) as u128, true));
+        // i64::MIN * -1 -> (i64::MIN, true)
+        assert_eq!(
+            eval_ovf(&built[23], (i64::MIN as u64) as u128, (-1i64 as u64) as u128),
+            ((i64::MIN as u64) as u128, true)
+        );
+        // i64::MIN - 1 -> (i64::MAX, true)
+        assert_eq!(
+            eval_ovf(&built[21], (i64::MIN as u64) as u128, 1),
+            ((i64::MAX as u64) as u128, true)
+        );
+        // u128::MAX * 2 -> (u128::MAX - 1, true)
+        assert_eq!(eval_ovf(&built[28], u128::MAX, 2), (u128::MAX.wrapping_mul(2), true));
+        // (1 << 64) * (1 << 63) -> (1 << 127, false) for u128, (1 << 127, true) for i128
+        assert_eq!(eval_ovf(&built[28], 1u128 << 64, 1u128 << 63), (1u128 << 127, false));
+        assert_eq!(eval_ovf(&built[29], 1u128 << 64, 1u128 << 63), (1u128 << 127, true));
+        // i128::MIN * -1 -> (i128::MIN, true); i128::MIN * 1 -> (i128::MIN, false)
+        assert_eq!(eval_ovf(&built[29], i128::MIN as u128, (-1i128) as u128), (i128::MIN as u128, true));
+        assert_eq!(eval_ovf(&built[29], i128::MIN as u128, 1), (i128::MIN as u128, false));
+
+        let mut start_b = new_builder(&[], &[]);
+        start_b.ret(&[]);
+        let start = start_b.finish_checked().unwrap();
+
+        let mut funcs = Vec::with_capacity_in(built.len() + 1, Alloc::global());
+        funcs.push(LirWasm64Func {
+            name: "_start",
+            export_name: Some("_start"),
+            place: 0,
+            view: start.view(),
+        });
+        for (i, f) in built.as_slice().iter().enumerate() {
+            funcs.push(LirWasm64Func {
+                name: "ovf",
+                export_name: None,
+                place: (i + 1) as u32,
+                view: f.view(),
+            });
+        }
+        let module = LirWasm64Module {
+            name: "overflow-all-widths",
+            funcs: funcs.as_slice(),
+            statics: &[],
+            imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
+            opts: Wasm64Opts::DEFAULT,
+            profile_digest: None,
+        };
+        let (_, checked) = compile_and_check_deterministic(&module);
+        assert_eq!(checked.func_count, 31);
+    }
+
+    #[test]
+    fn i128_extended_ops_frem_and_atomic_rmw_compile_deterministically() {
+        use blaze_lir::AtomicRmw;
+
+        // Exercises i128: umulhi, smulhi, uadd_sat, sadd_sat, usub_sat, ssub_sat, rotl, rotr,
+        // udiv, urem, sdiv, srem, bswap, bitrev, fptoui, fptosi, uitofp, sitofp, atomic_rmw,
+        // plus scalar f32/f64 Frem.
+        let mut b = new_builder(&[Ty::I128, Ty::I128, Ty::F64, Ty::F64], &[Ty::I128]);
+        let a = b.param(Ty::I128);
+        let y = b.param(Ty::I128);
+        let fx = b.param(Ty::F64);
+        let fy = b.param(Ty::F64);
+
+        let mut acc = b.binary(Op::Umulhi, Flags::NONE, a, y);
+        for op in [
+            Op::Smulhi,
+            Op::UaddSat,
+            Op::SaddSat,
+            Op::UsubSat,
+            Op::SsubSat,
+            Op::Rotl,
+            Op::Rotr,
+            Op::Udiv,
+            Op::Urem,
+            Op::Sdiv,
+            Op::Srem,
+        ] {
+            let v = b.binary(op, Flags::NONE, a, y);
+            acc = b.binary(Op::Xor, Flags::NONE, acc, v);
+        }
+        let bs = b.unary(Op::Bswap, Flags::NONE, acc);
+        let br = b.unary(Op::Bitrev, Flags::NONE, bs);
+
+        let uf64 = b.convert(Op::UitoFp, Flags::NONE, Ty::F64, br);
+        let sf32 = b.convert(Op::SitoFp, Flags::NONE, Ty::F32, a);
+        let rem64 = b.binary(Op::Frem, Flags::NONE, fx, fy);
+        let rem32 = b.binary(Op::Frem, Flags::NONE, sf32, sf32);
+        let back_u = b.convert(Op::FptoUi, Flags::NONE, Ty::I128, uf64);
+        let back_s = b.convert(Op::FptoSi, Flags::NONE, Ty::I128, rem64);
+        let back_s32 = b.convert(Op::FptoSi, Flags::NONE, Ty::I128, rem32);
+
+        let slot = b.slot(16, 4, SlotKind::Temp);
+        let sp = b.slot_addr(slot);
+        b.store(Flags::NONE, back_u, sp, 0, MemAttrs::aligned(4));
+        let old1 = b.atomic_rmw(AtomicRmw::Add, Flags::NONE, sp, back_s, MemAttrs::aligned(4));
+        let old2 = b.atomic_rmw(AtomicRmw::Umax, Flags::NONE, sp, back_s32, MemAttrs::aligned(4));
+        let out = b.binary(Op::Xor, Flags::NONE, old1, old2);
+        b.ret(&[out]);
+        let func = b.finish_checked().unwrap();
+
+        let funcs = [LirWasm64Func {
+            name: "_start",
+            export_name: Some("_start"),
+            place: 0,
+            view: func.view(),
+        }];
+        let module = LirWasm64Module {
+            name: "i128-and-frem",
+            funcs: &funcs,
+            statics: &[],
+            imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
+            opts: Wasm64Opts::DEFAULT,
+            profile_digest: None,
+        };
+        let (_, checked) = compile_and_check_deterministic(&module);
+        assert_eq!(checked.func_count, 1);
+    }
+
+    #[test]
+    fn fixed_vectors_all_shapes_and_ops_compile_deterministically() {
+        use blaze_lir::Scalar;
+
+        let v4i32 = Ty::vector(Scalar::I32, 4).unwrap();
+        let v16i8 = Ty::vector(Scalar::I8, 16).unwrap();
+        let v8i16 = Ty::vector(Scalar::I16, 8).unwrap();
+        let v2i64 = Ty::vector(Scalar::I64, 2).unwrap();
+        let v4f32 = Ty::vector(Scalar::F32, 4).unwrap();
+        let v2f64 = Ty::vector(Scalar::F64, 2).unwrap();
+        let v8i32 = Ty::vector(Scalar::I32, 8).unwrap();
+        let v4i1 = Ty::vector(Scalar::I1, 4).unwrap();
+        let v2ptr = Ty::vector(Scalar::Ptr, 2).unwrap();
+
+        // Helper taking & returning `<4 x i32>` across ABI boundary!
+        let mut bh = new_builder(&[v4i32], &[v4i32]);
+        let p = bh.param(v4i32);
+        let one = bh.iconst(Ty::I32, 1);
+        let v_one = bh.convert(Op::Splat, Flags::NONE, v4i32, one);
+        let inc = bh.binary(Op::Add, Flags::NONE, p, v_one);
+        bh.ret(&[inc]);
+        let vec_callee = bh.finish_checked().unwrap();
+
+        // Main exercising every vector shape & op.
+        let mut b = Builder::<Global, Full>::new_in(64, Global);
+        let start_sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I32)]);
+        let vec_sig = b.sig(Conv::C, Variadic::No, &[Param::of(v4i32)], &[Param::of(v4i32)]);
+        b.set_signature(start_sig);
+        let callee_ref = b.reference(RefKind::Func, 1);
+        let entry = b.create_block(BlockKind::Normal);
+        let merge = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+
+        // Vconst, Load, Store, Splat, Extract, Insert, Shuffle, Swizzle
+        let vc = b.vconst(v4i32, &[10, 20, 30, 40]);
+        let slot = b.slot(64, 4, SlotKind::Temp);
+        let sp = b.slot_addr(slot);
+        b.store(Flags::NONE, vc, sp, 0, MemAttrs::aligned(4));
+        let loaded = b.load(v4i32, Flags::NONE, sp, 0, MemAttrs::aligned(4));
+        let called = b.call(Flags::NONE, callee_ref, vec_sig, &[loaded]);
+        let lane2 = b.extract(called, 2);
+        let inserted = b.insert(called, lane2, 0);
+        let shuf = b.shuffle(v4i32, inserted, vc, &[0, 5, 2, 7]);
+        let idx_v = b.vconst(v4i32, &[3, 1, 9, 0]);
+        let swiz = b.binary(Op::Swizzle, Flags::NONE, shuf, idx_v);
+
+        // Vector Icmp, Select (both vector mask & scalar mask), Bitmask, Overflow
+        let cmp_mask = b.icmp(IntCond::Sgt, swiz, vc);
+        let bm = b.convert(Op::Bitmask, Flags::NONE, Ty::I32, cmp_mask);
+        let sel_v = b.select(Flags::NONE, cmp_mask, swiz, vc);
+        let ovf_pair = b.overflow(Op::UmulOverflow, sel_v, vc);
+        let ovf_vals = b.project(ovf_pair, 0);
+        let ovf_bits = b.project(ovf_pair, 1);
+        let ovf_bm = b.convert(Op::Bitmask, Flags::NONE, Ty::I32, ovf_bits);
+
+        // Bitcast across <4 x i32> <-> <16 x i8> <-> <8 x i16> <-> <2 x i64> <-> i128 <-> <4 x f32>
+        let as_i8 = b.convert(Op::Bitcast, Flags::NONE, v16i8, ovf_vals);
+        let as_i16 = b.convert(Op::Bitcast, Flags::NONE, v8i16, as_i8);
+        let as_i64 = b.convert(Op::Bitcast, Flags::NONE, v2i64, as_i16);
+        let as_i128 = b.convert(Op::Bitcast, Flags::NONE, Ty::I128, as_i64);
+        let back_v4 = b.convert(Op::Bitcast, Flags::NONE, v4i32, as_i128);
+        let as_f32 = b.convert(Op::Bitcast, Flags::NONE, v4f32, back_v4);
+
+        // Float vector ops + conversions + reductions
+        let f_added = b.binary(Op::Fadd, Flags::NONE, as_f32, as_f32);
+        let f_rem = b.binary(Op::Frem, Flags::NONE, f_added, as_f32);
+        let f_abs = b.unary(Op::Fabs, Flags::NONE, f_rem);
+        let f0 = b.fconst(Ty::F32, 0.0f32.to_bits() as u128);
+        let red_fadd = b.reduce_ordered(Op::ReduceFadd, Flags::NONE, f0, f_abs);
+        let red_fmin = b.convert(Op::ReduceFmin, Flags::NONE, Ty::F32, f_abs);
+        let fsum = b.binary(Op::Fadd, Flags::NONE, red_fadd, red_fmin);
+        let fi = b.convert(Op::FptoSi, Flags::NONE, Ty::I32, fsum);
+
+        // 256-bit vector shuffle (<4 x i32> + <4 x i32> -> <8 x i32>) & reduction & uninit
+        let v8 = b.shuffle(v8i32, back_v4, vc, &[0, 1, 2, 3, 4, 5, 6, 7]);
+        let red_add = b.convert(Op::ReduceAdd, Flags::NONE, Ty::I32, v8);
+        let uninit_v2f64 = b.uninit(v2f64);
+        let f2 = b.extract(uninit_v2f64, 0);
+        let f2i = b.convert(Op::FptoSi, Flags::NONE, Ty::I32, f2);
+
+        // MaskedLoad / MaskedStore / Gather / Scatter + pointer vector PtrAdd
+        b.masked_store(Op::MaskedStore, back_v4, sp, cmp_mask, MemAttrs::aligned(4));
+        let mloaded = b.masked_load(Op::MaskedLoad, v4i32, sp, cmp_mask, vc, MemAttrs::aligned(4));
+        let p_vec = b.convert(Op::Splat, Flags::NONE, v2ptr, sp);
+        let offs = b.vconst(v2i64, &[0, 0, 8, 0]);
+        let ptrs = b.binary(Op::PtrAdd, Flags::NONE, p_vec, offs);
+        let mask2 = b.vconst(Ty::vector(Scalar::I1, 2).unwrap(), &[0b11]);
+        let pass2 = b.vconst(v2i64, &[1, 0, 2, 0]);
+        let gathered = b.masked_load(Op::Gather, v2i64, ptrs, mask2, pass2, MemAttrs::aligned(3));
+        b.masked_store(Op::Scatter, gathered, ptrs, mask2, MemAttrs::aligned(3));
+
+        // Vector block parameter (phi) across jump
+        b.store(Flags::NONE, cmp_mask, sp, 32, MemAttrs::default());
+        let _m_load = b.load(v4i1, Flags::NONE, sp, 32, MemAttrs::default());
+        b.jump((merge, &[mloaded]));
+
+        b.begin(merge);
+        let phi_v = b.param(v4i32);
+        let phi_sum = b.convert(Op::ReduceAdd, Flags::NONE, Ty::I32, phi_v);
+        let t1 = b.binary(Op::Add, Flags::NONE, bm, ovf_bm);
+        let t2 = b.binary(Op::Add, Flags::NONE, t1, red_add);
+        let t3 = b.binary(Op::Add, Flags::NONE, t2, fi);
+        let t4 = b.binary(Op::Add, Flags::NONE, t3, f2i);
+        let out = b.binary(Op::Add, Flags::NONE, t4, phi_sum);
+        b.ret(&[out]);
+        let start = b.finish_checked().unwrap();
+
+        let funcs = [
+            LirWasm64Func {
+                name: "_start",
+                export_name: Some("_start"),
+                place: 0,
+                view: start.view(),
+            },
+            LirWasm64Func {
+                name: "vec_callee",
+                export_name: Some("vec_callee"),
+                place: 1,
+                view: vec_callee.view(),
+            },
+        ];
+        let module = LirWasm64Module {
+            name: "fixed-vectors-all",
+            funcs: &funcs,
+            statics: &[],
+            imports: &[],
+            globals: &[],
+            include_blaze_host_v1: true,
+            opts: Wasm64Opts::DEFAULT,
+            profile_digest: None,
+        };
+        let (_, checked) = compile_and_check_deterministic(&module);
+        assert_eq!(checked.func_count, 2);
+    }
+
+    #[test]
+    fn semantic_oracle_module_all_new_ops_and_vectors() {
+        use blaze_lir::Scalar;
+
+        let make_ovf_128 = |op: Op| -> Func<Global> {
+            let mut b = new_builder(&[Ty::I128, Ty::I128], &[Ty::I128, Ty::I1]);
+            let a = b.param(Ty::I128);
+            let y = b.param(Ty::I128);
+            let pair = b.overflow(op, a, y);
+            let r = b.project(pair, 0);
+            let o = b.project(pair, 1);
+            b.ret(&[r, o]);
+            b.finish_checked().unwrap()
+        };
+        let make_ovf_64 = |op: Op| -> Func<Global> {
+            let mut b = new_builder(&[Ty::I64, Ty::I64], &[Ty::I64, Ty::I1]);
+            let a = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let pair = b.overflow(op, a, y);
+            let r = b.project(pair, 0);
+            let o = b.project(pair, 1);
+            b.ret(&[r, o]);
+            b.finish_checked().unwrap()
+        };
+        let make_bin_128 = |op: Op| -> Func<Global> {
+            let mut b = new_builder(&[Ty::I128, Ty::I128], &[Ty::I128]);
+            let a = b.param(Ty::I128);
+            let y = b.param(Ty::I128);
+            let r = b.binary(op, Flags::NONE, a, y);
+            b.ret(&[r]);
+            b.finish_checked().unwrap()
+        };
+        let make_un_128 = |op: Op| -> Func<Global> {
+            let mut b = new_builder(&[Ty::I128], &[Ty::I128]);
+            let a = b.param(Ty::I128);
+            let r = b.unary(op, Flags::NONE, a);
+            b.ret(&[r]);
+            b.finish_checked().unwrap()
+        };
+        let make_cvt = |op: Op, from: Ty, to: Ty| -> Func<Global> {
+            let mut b = new_builder(&[from], &[to]);
+            let a = b.param(from);
+            let r = b.convert(op, Flags::NONE, to, a);
+            b.ret(&[r]);
+            b.finish_checked().unwrap()
+        };
+        let make_frem = |ty: Ty| -> Func<Global> {
+            let mut b = new_builder(&[ty, ty], &[ty]);
+            let a = b.param(ty);
+            let y = b.param(ty);
+            let r = b.binary(Op::Frem, Flags::NONE, a, y);
+            b.ret(&[r]);
+            b.finish_checked().unwrap()
+        };
+
+        let f_umul_ovf_128 = make_ovf_128(Op::UmulOverflow);
+        let f_smul_ovf_128 = make_ovf_128(Op::SmulOverflow);
+        let f_umul_ovf_64 = make_ovf_64(Op::UmulOverflow);
+        let f_smul_ovf_64 = make_ovf_64(Op::SmulOverflow);
+        let f_ssub_ovf_64 = make_ovf_64(Op::SsubOverflow);
+        let f_umulhi_128 = make_bin_128(Op::Umulhi);
+        let f_smulhi_128 = make_bin_128(Op::Smulhi);
+        let f_udiv_128 = make_bin_128(Op::Udiv);
+        let f_urem_128 = make_bin_128(Op::Urem);
+        let f_sdiv_128 = make_bin_128(Op::Sdiv);
+        let f_srem_128 = make_bin_128(Op::Srem);
+        let f_uadd_sat_128 = make_bin_128(Op::UaddSat);
+        let f_sadd_sat_128 = make_bin_128(Op::SaddSat);
+        let f_usub_sat_128 = make_bin_128(Op::UsubSat);
+        let f_ssub_sat_128 = make_bin_128(Op::SsubSat);
+        let f_rotl_128 = make_bin_128(Op::Rotl);
+        let f_rotr_128 = make_bin_128(Op::Rotr);
+        let f_bswap_128 = make_un_128(Op::Bswap);
+        let f_bitrev_128 = make_un_128(Op::Bitrev);
+        let f_f64_to_u128 = make_cvt(Op::FptoUi, Ty::F64, Ty::I128);
+        let f_f64_to_i128 = make_cvt(Op::FptoSi, Ty::F64, Ty::I128);
+        let f_u128_to_f64 = make_cvt(Op::UitoFp, Ty::I128, Ty::F64);
+        let f_i128_to_f64 = make_cvt(Op::SitoFp, Ty::I128, Ty::F64);
+        let f_u128_to_f32 = make_cvt(Op::UitoFp, Ty::I128, Ty::F32);
+        let f_frem_f64 = make_frem(Ty::F64);
+        let f_frem_f32 = make_frem(Ty::F32);
+
+        // Vector pipeline: (<4 x i32>, <4 x i32>) -> (<4 x i32>, i32 bitmask, i32 reduce_add)
+        let v4i32 = Ty::vector(Scalar::I32, 4).unwrap();
+        let v16i8 = Ty::vector(Scalar::I8, 16).unwrap();
+        let v8i16 = Ty::vector(Scalar::I16, 8).unwrap();
+        let v2i64 = Ty::vector(Scalar::I64, 2).unwrap();
+        let f_vec4_ops = {
+            let mut b = new_builder(&[v4i32, v4i32], &[v4i32, Ty::I32, Ty::I32]);
+            let a = b.param(v4i32);
+            let y = b.param(v4i32);
+            let slot = b.slot(32, 4, SlotKind::Temp);
+            let sp = b.slot_addr(slot);
+            b.store(Flags::NONE, a, sp, 0, MemAttrs::aligned(4));
+            let a_ld = b.load(v4i32, Flags::NONE, sp, 0, MemAttrs::aligned(4));
+            let sum = b.binary(Op::Add, Flags::NONE, a_ld, y);
+            let cmp = b.icmp(IntCond::Sgt, sum, y);
+            let bm = b.convert(Op::Bitmask, Flags::NONE, Ty::I32, cmp);
+            let sel = b.select(Flags::NONE, cmp, sum, a_ld);
+            let two = b.iconst(Ty::I32, 2);
+            let vtwo = b.convert(Op::Splat, Flags::NONE, v4i32, two);
+            let scaled = b.binary(Op::Mul, Flags::NONE, sel, vtwo);
+            let l0 = b.extract(scaled, 0);
+            let ins = b.insert(scaled, l0, 3);
+            let red = b.convert(Op::ReduceAdd, Flags::NONE, Ty::I32, ins);
+            b.ret(&[ins, bm, red]);
+            b.finish_checked().unwrap()
+        };
+
+        // Vector bitcast roundtrip: <4 x i32> -> <16 x i8> -> <8 x i16> -> <2 x i64> -> i128
+        let f_vec4_bitcast = {
+            let mut b = new_builder(&[v4i32], &[Ty::I128]);
+            let a = b.param(v4i32);
+            let a8 = b.convert(Op::Bitcast, Flags::NONE, v16i8, a);
+            let a16 = b.convert(Op::Bitcast, Flags::NONE, v8i16, a8);
+            let a64 = b.convert(Op::Bitcast, Flags::NONE, v2i64, a16);
+            let a128 = b.convert(Op::Bitcast, Flags::NONE, Ty::I128, a64);
+            b.ret(&[a128]);
+            b.finish_checked().unwrap()
+        };
+
+        // Vector swizzle: (<4 x i32> table, <4 x i32> idx) -> <4 x i32>
+        let f_vec4_swizzle = {
+            let mut b = new_builder(&[v4i32, v4i32], &[v4i32]);
+            let a = b.param(v4i32);
+            let idx = b.param(v4i32);
+            let r = b.binary(Op::Swizzle, Flags::NONE, a, idx);
+            b.ret(&[r]);
+            b.finish_checked().unwrap()
+        };
+
+        // Vector masked store/load + gather/scatter
+        let f_vec4_masked = {
+            let v4i1 = Ty::vector(Scalar::I1, 4).unwrap();
+            let mut b = new_builder(&[v4i32, v4i1], &[v4i32]);
+            let vals = b.param(v4i32);
+            let mask = b.param(v4i1);
+            let slot = b.slot(32, 4, SlotKind::Temp);
+            let sp = b.slot_addr(slot);
+            let init = b.vconst(v4i32, &[100, 200, 300, 400]);
+            b.store(Flags::NONE, init, sp, 0, MemAttrs::aligned(4));
+            b.masked_store(Op::MaskedStore, vals, sp, mask, MemAttrs::aligned(4));
+            let pass = b.vconst(v4i32, &[7, 8, 9, 10]);
+            let out = b.masked_load(Op::MaskedLoad, v4i32, sp, mask, pass, MemAttrs::aligned(4));
+            b.ret(&[out]);
+            b.finish_checked().unwrap()
+        };
+
+        let funcs = [
+            LirWasm64Func { name: "umul_ovf_128", export_name: Some("umul_ovf_128"), place: 0, view: f_umul_ovf_128.view() },
+            LirWasm64Func { name: "smul_ovf_128", export_name: Some("smul_ovf_128"), place: 1, view: f_smul_ovf_128.view() },
+            LirWasm64Func { name: "umul_ovf_64", export_name: Some("umul_ovf_64"), place: 2, view: f_umul_ovf_64.view() },
+            LirWasm64Func { name: "smul_ovf_64", export_name: Some("smul_ovf_64"), place: 3, view: f_smul_ovf_64.view() },
+            LirWasm64Func { name: "ssub_ovf_64", export_name: Some("ssub_ovf_64"), place: 4, view: f_ssub_ovf_64.view() },
+            LirWasm64Func { name: "umulhi_128", export_name: Some("umulhi_128"), place: 5, view: f_umulhi_128.view() },
+            LirWasm64Func { name: "smulhi_128", export_name: Some("smulhi_128"), place: 6, view: f_smulhi_128.view() },
+            LirWasm64Func { name: "udiv_128", export_name: Some("udiv_128"), place: 7, view: f_udiv_128.view() },
+            LirWasm64Func { name: "urem_128", export_name: Some("urem_128"), place: 8, view: f_urem_128.view() },
+            LirWasm64Func { name: "sdiv_128", export_name: Some("sdiv_128"), place: 9, view: f_sdiv_128.view() },
+            LirWasm64Func { name: "srem_128", export_name: Some("srem_128"), place: 10, view: f_srem_128.view() },
+            LirWasm64Func { name: "uadd_sat_128", export_name: Some("uadd_sat_128"), place: 11, view: f_uadd_sat_128.view() },
+            LirWasm64Func { name: "sadd_sat_128", export_name: Some("sadd_sat_128"), place: 12, view: f_sadd_sat_128.view() },
+            LirWasm64Func { name: "usub_sat_128", export_name: Some("usub_sat_128"), place: 13, view: f_usub_sat_128.view() },
+            LirWasm64Func { name: "ssub_sat_128", export_name: Some("ssub_sat_128"), place: 14, view: f_ssub_sat_128.view() },
+            LirWasm64Func { name: "rotl_128", export_name: Some("rotl_128"), place: 15, view: f_rotl_128.view() },
+            LirWasm64Func { name: "rotr_128", export_name: Some("rotr_128"), place: 16, view: f_rotr_128.view() },
+            LirWasm64Func { name: "bswap_128", export_name: Some("bswap_128"), place: 17, view: f_bswap_128.view() },
+            LirWasm64Func { name: "bitrev_128", export_name: Some("bitrev_128"), place: 18, view: f_bitrev_128.view() },
+            LirWasm64Func { name: "f64_to_u128", export_name: Some("f64_to_u128"), place: 19, view: f_f64_to_u128.view() },
+            LirWasm64Func { name: "f64_to_i128", export_name: Some("f64_to_i128"), place: 20, view: f_f64_to_i128.view() },
+            LirWasm64Func { name: "u128_to_f64", export_name: Some("u128_to_f64"), place: 21, view: f_u128_to_f64.view() },
+            LirWasm64Func { name: "i128_to_f64", export_name: Some("i128_to_f64"), place: 22, view: f_i128_to_f64.view() },
+            LirWasm64Func { name: "u128_to_f32", export_name: Some("u128_to_f32"), place: 23, view: f_u128_to_f32.view() },
+            LirWasm64Func { name: "frem_f64", export_name: Some("frem_f64"), place: 24, view: f_frem_f64.view() },
+            LirWasm64Func { name: "frem_f32", export_name: Some("frem_f32"), place: 25, view: f_frem_f32.view() },
+            LirWasm64Func { name: "vec4_ops", export_name: Some("vec4_ops"), place: 26, view: f_vec4_ops.view() },
+            LirWasm64Func { name: "vec4_bitcast", export_name: Some("vec4_bitcast"), place: 27, view: f_vec4_bitcast.view() },
+            LirWasm64Func { name: "vec4_swizzle", export_name: Some("vec4_swizzle"), place: 28, view: f_vec4_swizzle.view() },
+            LirWasm64Func { name: "vec4_masked", export_name: Some("vec4_masked"), place: 29, view: f_vec4_masked.view() },
+        ];
+        let module = LirWasm64Module {
+            name: "semantic-oracle",
+            funcs: &funcs,
+            statics: &[],
+            imports: &[],
+            globals: &[],
+            include_blaze_host_v1: false,
+            opts: Wasm64Opts::DEFAULT,
+            profile_digest: None,
+        };
+        let (_, checked) = compile_and_check_deterministic(&module);
+        assert_eq!(checked.func_count, 30);
     }
 }

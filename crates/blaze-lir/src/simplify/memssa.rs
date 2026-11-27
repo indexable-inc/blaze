@@ -2816,7 +2816,7 @@ fn forward_loads_memssa<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(ForwardResult {
         func: Some(func),
         loads_forwarded: forwarded,
@@ -3380,7 +3380,7 @@ fn eliminate_dead_stores_memssa<A: Allocator + Copy>(
             let _ = copy_inst_same_blocks(&view, inst, &val_map, &mut func);
         }
     }
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok((Some(func), killed_count))
 }
 
@@ -3884,7 +3884,7 @@ fn hoist_invariant_loads_ssa<A: Allocator + Copy>(
         let _ = copy_inst_same_blocks(&view, term, &val_map, &mut func);
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok((Some(func), total_hoisted))
 }
 
@@ -4468,7 +4468,7 @@ fn eliminate_temp_bulk_copies_round<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(Some((func, eliminated_count)))
 }
 
@@ -4606,7 +4606,7 @@ pub fn compact_dead_slots<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(Some((func, dead_slots)))
 }
 
@@ -4968,7 +4968,7 @@ pub fn scalarize_small_memops<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(Some(func))
 }
 

@@ -3225,7 +3225,7 @@ fn emit_prefix_scan_loop<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(VectorizeOutput {
         func,
         stats: VectorizeStats { loops_vectorized: 1 },
@@ -3242,6 +3242,37 @@ pub fn auto_vectorize_loops<A: Allocator + Copy>(
     auto_vectorize_loops_with_width(view, 16, alloc)
 }
 
+/// Zero-allocation O(B) pre-filter: returns `true` iff `view` has at least one back-edge
+/// `b -> tb` (`1 <= tb <= b`) targeting a `BlockKind::Normal` block with >= 1 block parameter,
+/// which is a strict prerequisite for both `find_vectorizable_loop` and `find_prefix_scan_loop`.
+fn has_vectorizable_loop_candidate(view: &View<'_>) -> bool {
+    let blocks = view.blocks();
+    if view.head.ptr_bits != 64 || blocks < 2 {
+        return false;
+    }
+    for b in 0..blocks {
+        let b_u32 = to_u32(b);
+        let term = view.terminator(Block(b_u32));
+        let mut found = false;
+        each(view, term, |item| {
+            if !found
+                && let Item::Edge(edge) = item
+                && edge.block >= 1
+                && edge.block <= b_u32
+                && to_idx(edge.block) < blocks
+                && view.block_kind(Block(edge.block)) == BlockKind::Normal
+                && !view.params(Block(edge.block)).is_empty()
+            {
+                found = true;
+            }
+        });
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
 /// Automatically vectorizes eligible countable unit-stride scalar loops into adaptive 4x/2x-unrolled
 /// `vec_bytes`-wide SIMD loops (`16` = 128-bit NEON/SSE2 -> `64 B/iter` at 4x; `32` = 256-bit AVX2).
 pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
@@ -3249,6 +3280,12 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
     vec_bytes: u32,
     alloc: A,
 ) -> Result<VectorizeOutput<A>, SimplifyError> {
+    if !has_vectorizable_loop_candidate(&view) {
+        return Ok(VectorizeOutput {
+            func: view.to_func_in(alloc),
+            stats: VectorizeStats::default(),
+        });
+    }
     let mut vi: Option<ValueInfo<A>> = None;
     let Some(plan) = find_vectorizable_loop(&view, vec_bytes, &mut vi, alloc) else {
         if let Some(scan_plan) = find_prefix_scan_loop(&view, &mut vi, alloc) {
@@ -4267,7 +4304,7 @@ pub fn auto_vectorize_loops_with_width<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(VectorizeOutput {
         func,
         stats: VectorizeStats { loops_vectorized: 1 },
@@ -5350,7 +5387,7 @@ pub fn vectorize_iv_div_loops<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(VectorizeOutput {
         func,
         stats: VectorizeStats { loops_vectorized: 1 },

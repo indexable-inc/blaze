@@ -63,6 +63,7 @@ fn main() {
         limits: RunLimits::STANDARD,
         table,
         probes: None,
+        c_probes: None,
         spawner: None,
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::new(blaze_proc_macro::fact_pins::command_spawn_setting(TARGET, alloc).unwrap_or_else(|e| panic!("{e}"))),

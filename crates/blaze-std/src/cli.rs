@@ -35,9 +35,11 @@ pub struct FlagSpec<'a> {
     /// Canonical long name without leading `--`.
     pub long: &'a str,
     /// Optional single-character short alias (for example `Some('v')`).
-    pub short: Option<char>,
+    pub short: Option<char> = None,
     /// One-line description shown in `--help`.
-    pub help: &'a str,
+    pub help: &'a str = "",
+    /// Hide this flag from `--help` and typo suggestions while still accepting it.
+    pub hidden: bool = false,
 }
 
 /// Specification of a value-taking option (for example `-o <FILE>` / `--output <FILE>`).
@@ -46,17 +48,23 @@ pub struct OptSpec<'a> {
     /// Canonical long name without leading `--`.
     pub long: &'a str,
     /// Optional single-character short alias.
-    pub short: Option<char>,
+    pub short: Option<char> = None,
     /// Placeholder value name shown in `--help` (for example `"FILE"`).
-    pub value_name: &'a str,
+    pub value_name: &'a str = "VALUE",
     /// Whether the option must be supplied when `default` is `None`.
-    pub required: bool,
+    pub required: bool = false,
     /// Whether the option may be repeated (`--opt a --opt b`).
-    pub multiple: bool,
+    pub multiple: bool = false,
     /// Fallback value returned by [`Matches::opt`] when not passed on the command line.
-    pub default: Option<&'a str>,
+    pub default: Option<&'a str> = None,
+    /// Value recorded when the option is passed bare without an attached value (`--opt` or `-o`),
+    /// matching `clap`'s `default_missing_value` without stealing the following positional token
+    /// (explicit values are still passed via `--opt=VAL` or `-oVAL`).
+    pub default_missing_value: Option<&'a str> = None,
     /// One-line description shown in `--help`.
-    pub help: &'a str,
+    pub help: &'a str = "",
+    /// Hide this option from `--help` and typo suggestions while still accepting it.
+    pub hidden: bool = false,
 }
 
 /// Specification of a positional argument.
@@ -65,22 +73,26 @@ pub struct PositionalSpec<'a> {
     /// Display name shown in `Usage:` and `Arguments:`.
     pub name: &'a str,
     /// Whether this positional argument is required.
-    pub required: bool,
+    pub required: bool = false,
     /// Whether this positional accepts arbitrarily many trailing values.
-    pub multiple: bool,
+    pub multiple: bool = false,
     /// One-line description shown in `--help`.
-    pub help: &'a str,
+    pub help: &'a str = "",
 }
 
 /// Specification of a nested subcommand.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SubcommandSpec<'a> {
-    /// Token matched on the command line to dispatch into `spec`.
+    /// Canonical token matched on the command line to dispatch into `spec`.
     pub name: &'a str,
+    /// Alternative short names that resolve to this subcommand (e.g. `&["st"]` for `status`).
+    pub aliases: &'a [&'a str] = &[],
     /// Short description shown in the parent command's `Commands:` table.
-    pub about: &'a str,
+    pub about: &'a str = "",
     /// Command specification active once this subcommand is selected.
     pub spec: &'a CommandSpec<'a>,
+    /// Hide this subcommand from `--help` and typo suggestions while still dispatching it.
+    pub hidden: bool = false,
 }
 
 /// Declarative specification of a command or subcommand.
@@ -89,17 +101,17 @@ pub struct CommandSpec<'a> {
     /// Command name (shown in `Usage:` and recorded in [`Matches::command_path`]).
     pub name: &'a str,
     /// Short summary shown at the top of `--help`.
-    pub about: &'a str,
+    pub about: &'a str = "",
     /// Optional version string enabling `--version` / `-V`.
-    pub version: Option<&'a str>,
+    pub version: Option<&'a str> = None,
     /// Boolean and countable flags accepted by this command.
-    pub flags: &'a [FlagSpec<'a>],
+    pub flags: &'a [FlagSpec<'a>] = &[],
     /// Value-taking options accepted by this command.
-    pub opts: &'a [OptSpec<'a>],
+    pub opts: &'a [OptSpec<'a>] = &[],
     /// Positional arguments accepted by this command.
-    pub positionals: &'a [PositionalSpec<'a>],
+    pub positionals: &'a [PositionalSpec<'a>] = &[],
     /// Nested subcommands dispatched from this command.
-    pub subcommands: &'a [SubcommandSpec<'a>],
+    pub subcommands: &'a [SubcommandSpec<'a>] = &[],
 }
 
 impl<'a> CommandSpec<'a> {
@@ -190,8 +202,8 @@ impl core::error::Error for CliError<'_> {}
 pub enum ParseOutcome<'a, A: Allocator> {
     /// Arguments parsed cleanly into [`Matches`].
     Matched(Matches<'a, A>),
-    /// The caller asked for `--help` / `-h` on `command`.
-    Help { command: &'a CommandSpec<'a> },
+    /// The caller asked for `--help` / `-h` on `command` (with full invoked `path`).
+    Help { command: &'a CommandSpec<'a>, path: Vec<&'a str, A> },
     /// The caller asked for `--version` / `-V`.
     Version { name: &'a str, version: &'a str },
 }
@@ -200,9 +212,11 @@ impl<A: Allocator> fmt::Debug for ParseOutcome<'_, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ParseOutcome::Matched(m) => f.debug_tuple("Matched").field(m).finish(),
-            ParseOutcome::Help { command } => {
-                f.debug_struct("Help").field("command", command).finish()
-            }
+            ParseOutcome::Help { command, path } => f
+                .debug_struct("Help")
+                .field("command", command)
+                .field("path", &path.as_slice())
+                .finish(),
             ParseOutcome::Version { name, version } => f
                 .debug_struct("Version")
                 .field("name", name)
@@ -216,7 +230,10 @@ impl<A: Allocator> PartialEq for ParseOutcome<'_, A> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (ParseOutcome::Matched(a), ParseOutcome::Matched(b)) => a == b,
-            (ParseOutcome::Help { command: a }, ParseOutcome::Help { command: b }) => a == b,
+            (
+                ParseOutcome::Help { command: a, path: pa },
+                ParseOutcome::Help { command: b, path: pb },
+            ) => a == b && pa.as_slice() == pb.as_slice(),
             (
                 ParseOutcome::Version { name: na, version: va },
                 ParseOutcome::Version { name: nb, version: vb },
@@ -433,7 +450,7 @@ fn parse_in_planted<'a, A: Allocator + Copy>(
         }
 
         if arg == "--help" && !has_long(active, "help") {
-            return Ok(ParseOutcome::Help { command: active });
+            return Ok(ParseOutcome::Help { command: active, path: command_path });
         }
 
         if arg == "--version"
@@ -459,13 +476,16 @@ fn parse_in_planted<'a, A: Allocator + Copy>(
             if let Some(opt_spec) = find_long_opt(active, name) {
                 let value = match inline_val {
                     Some(v) => v,
-                    None => {
-                        idx += 1;
-                        match args.get(idx) {
-                            Some(&v) => v,
-                            None => return Err(CliError::MissingValue { opt: opt_spec.long }),
+                    None => match opt_spec.default_missing_value {
+                        Some(dmv) => dmv,
+                        None => {
+                            idx += 1;
+                            match args.get(idx) {
+                                Some(&v) => v,
+                                None => return Err(CliError::MissingValue { opt: opt_spec.long }),
+                            }
                         }
-                    }
+                    },
                 };
                 record_opt(&mut opts, opt_spec, value)?;
                 idx += 1;
@@ -480,7 +500,7 @@ fn parse_in_planted<'a, A: Allocator + Copy>(
         {
             for (byte_pos, ch) in rest.char_indices() {
                 if ch == 'h' && !has_short(active, 'h') {
-                    return Ok(ParseOutcome::Help { command: active });
+                    return Ok(ParseOutcome::Help { command: active, path: command_path });
                 }
                 if ch == 'V'
                     && !has_short(active, 'V')
@@ -497,6 +517,8 @@ fn parse_in_planted<'a, A: Allocator + Copy>(
                     let tail = rest.get(val_start..).unwrap_or("");
                     let value = if !tail.is_empty() {
                         tail
+                    } else if let Some(dmv) = opt_spec.default_missing_value {
+                        dmv
                     } else {
                         idx += 1;
                         match args.get(idx) {
@@ -588,7 +610,7 @@ fn find_short_opt<'a>(spec: &'a CommandSpec<'a>, ch: char) -> Option<&'a OptSpec
 
 fn find_subcommand<'a>(spec: &'a CommandSpec<'a>, name: &str) -> Option<&'a SubcommandSpec<'a>> {
     for sub in spec.subcommands {
-        if sub.name == name {
+        if sub.name == name || sub.aliases.iter().any(|&a| a == name) {
             return Some(sub);
         }
     }
@@ -692,10 +714,14 @@ fn suggest_long_option<'a, A: Allocator + Copy>(
 ) -> Result<Option<&'a str>, CliError<'a>> {
     let mut best: Option<(&'a str, usize)> = None;
     for f in spec.flags {
-        consider_candidate(query, f.long, &mut best, alloc)?;
+        if !f.hidden {
+            consider_candidate(query, f.long, &mut best, alloc)?;
+        }
     }
     for o in spec.opts {
-        consider_candidate(query, o.long, &mut best, alloc)?;
+        if !o.hidden {
+            consider_candidate(query, o.long, &mut best, alloc)?;
+        }
     }
     Ok(best.map(|(name, _)| name))
 }
@@ -707,7 +733,9 @@ fn suggest_subcommand<'a, A: Allocator + Copy>(
 ) -> Result<Option<&'a str>, CliError<'a>> {
     let mut best: Option<(&'a str, usize)> = None;
     for sub in spec.subcommands {
-        consider_candidate(query, sub.name, &mut best, alloc)?;
+        if !sub.hidden {
+            consider_candidate(query, sub.name, &mut best, alloc)?;
+        }
     }
     Ok(best.map(|(name, _)| name))
 }
@@ -715,6 +743,16 @@ fn suggest_subcommand<'a, A: Allocator + Copy>(
 /// Format a `--help` page for `spec` into `out`, with optional ANSI coloring.
 pub fn format_help_into<W: fmt::Write>(
     spec: &CommandSpec<'_>,
+    color: bool,
+    out: &mut W,
+) -> fmt::Result {
+    format_help_with_path_into(spec, &[spec.name], color, out)
+}
+
+/// Format a `--help` page for `spec` using the full invoked command `path` (e.g. `&["bgit", "worktree", "add"]`).
+pub fn format_help_with_path_into<W: fmt::Write>(
+    spec: &CommandSpec<'_>,
+    path: &[&str],
     color: bool,
     out: &mut W,
 ) -> fmt::Result {
@@ -726,13 +764,15 @@ pub fn format_help_into<W: fmt::Write>(
     }
 
     // Usage line.
-    write!(
-        out,
-        "{} {} {}",
-        palette.heading.paint("Usage:"),
-        palette.literal.paint(spec.name),
-        palette.placeholder.paint("[OPTIONS]")
-    )?;
+    write!(out, "{}", palette.heading.paint("Usage:"))?;
+    if path.is_empty() {
+        write!(out, " {}", palette.literal.paint(spec.name))?;
+    } else {
+        for seg in path {
+            write!(out, " {}", palette.literal.paint(*seg))?;
+        }
+    }
+    write!(out, " {}", palette.placeholder.paint("[OPTIONS]"))?;
     for pos in spec.positionals {
         out.write_char(' ')?;
         let (left, right) = if pos.required { ("<", ">") } else { ("[", "]") };
@@ -745,24 +785,45 @@ pub fn format_help_into<W: fmt::Write>(
             write!(out, "{}", palette.placeholder.paint("..."))?;
         }
     }
-    if !spec.subcommands.is_empty() {
+    let has_visible_subcommands = spec.subcommands.iter().any(|s| !s.hidden);
+    if has_visible_subcommands {
         write!(out, " {}", palette.placeholder.paint("<COMMAND>"))?;
     }
     out.write_char('\n')?;
 
     // Subcommands table.
-    if !spec.subcommands.is_empty() {
+    if has_visible_subcommands {
         out.write_char('\n')?;
         writeln!(out, "{}", palette.heading.paint("Commands:"))?;
         let mut max_w = 0usize;
         for sub in spec.subcommands {
-            max_w = max_w.max(sub.name.len());
+            if !sub.hidden {
+                max_w = max_w.max(sub.name.len());
+            }
         }
         for sub in spec.subcommands {
+            if sub.hidden {
+                continue;
+            }
             write!(out, "  {}", palette.literal.paint(sub.name))?;
-            if !sub.about.is_empty() {
+            if !sub.about.is_empty() || !sub.aliases.is_empty() {
                 write_spaces(out, max_w.saturating_sub(sub.name.len()) + 2)?;
-                out.write_str(sub.about)?;
+                if !sub.about.is_empty() {
+                    out.write_str(sub.about)?;
+                }
+                if !sub.aliases.is_empty() {
+                    if !sub.about.is_empty() {
+                        out.write_char(' ')?;
+                    }
+                    write!(out, "{}", palette.dim.paint("[aliases: "))?;
+                    for (i, alias) in sub.aliases.iter().enumerate() {
+                        if i > 0 {
+                            write!(out, "{}", palette.dim.paint(", "))?;
+                        }
+                        write!(out, "{}", palette.dim.paint(*alias))?;
+                    }
+                    write!(out, "{}", palette.dim.paint("]"))?;
+                }
             }
             out.write_char('\n')?;
         }
@@ -804,10 +865,14 @@ pub fn format_help_into<W: fmt::Write>(
 
     let mut max_opt_w = 0usize;
     for f in spec.flags {
-        max_opt_w = max_opt_w.max(option_col_len(f.long, None));
+        if !f.hidden {
+            max_opt_w = max_opt_w.max(option_col_len(f.long, None));
+        }
     }
     for o in spec.opts {
-        max_opt_w = max_opt_w.max(option_col_len(o.long, Some(o.value_name)));
+        if !o.hidden {
+            max_opt_w = max_opt_w.max(option_col_len(o.long, Some(o.value_name)));
+        }
     }
     if show_builtin_help {
         max_opt_w = max_opt_w.max(option_col_len("help", None));
@@ -819,6 +884,9 @@ pub fn format_help_into<W: fmt::Write>(
     out.write_char('\n')?;
     writeln!(out, "{}", palette.heading.paint("Options:"))?;
     for f in spec.flags {
+        if f.hidden {
+            continue;
+        }
         write_option_row(
             out,
             OptionRow {
@@ -834,6 +902,9 @@ pub fn format_help_into<W: fmt::Write>(
         )?;
     }
     for o in spec.opts {
+        if o.hidden {
+            continue;
+        }
         write_option_row(
             out,
             OptionRow {
@@ -888,9 +959,19 @@ pub fn format_help_in<A: Allocator + Copy>(
     color: bool,
     alloc: A,
 ) -> Result<String<A>, AllocFailure> {
+    format_help_with_path_in(spec, &[spec.name], color, alloc)
+}
+
+/// Format a `--help` page for `spec` with full command `path` into a freshly allocated [`String`] in `alloc`.
+pub fn format_help_with_path_in<A: Allocator + Copy>(
+    spec: &CommandSpec<'_>,
+    path: &[&str],
+    color: bool,
+    alloc: A,
+) -> Result<String<A>, AllocFailure> {
     let mut buf = String::new_in(alloc);
     let mut writer = TryStringWriter { buf: &mut buf, err: None };
-    if format_help_into(spec, color, &mut writer).is_err() {
+    if format_help_with_path_into(spec, path, color, &mut writer).is_err() {
         let len = writer.buf.len();
         return Err(writer.err.unwrap_or(AllocFailure::CapacityOverflow {
             what: "bstd::cli::format_help_in",
@@ -1072,42 +1153,38 @@ mod tests {
 
     use super::{
         CliError, CommandSpec, FlagSpec, OptSpec, ParseOutcome, PositionalSpec, SubcommandSpec,
-        format_help_in, parse_in, parse_in_planted,
+        format_help_in, format_help_with_path_in, parse_in, parse_in_planted,
     };
 
     const GC_SPEC: CommandSpec<'static> = CommandSpec {
         name: "gc",
         about: "Reclaim unreferenced cache records",
-        version: None,
         flags: &[
-            FlagSpec { long: "dry-run", short: Some('n'), help: "Show what would be deleted" },
-            FlagSpec { long: "force", short: Some('f'), help: "Skip safety confirmation" },
+            FlagSpec { long: "dry-run", short: Some('n'), help: "Show what would be deleted", .. },
+            FlagSpec { long: "force", short: Some('f'), help: "Skip safety confirmation", .. },
         ],
         opts: &[OptSpec {
             long: "older-than",
             short: Some('t'),
             value_name: "DAYS",
-            required: false,
-            multiple: false,
             default: Some("14"),
             help: "Only collect records older than DAYS",
+            ..
         }],
-        positionals: &[],
-        subcommands: &[],
+        ..
     };
 
     const CACHE_SPEC: CommandSpec<'static> = CommandSpec {
         name: "cache",
         about: "Manage the local record store",
-        version: None,
-        flags: &[FlagSpec { long: "quiet", short: Some('q'), help: "Suppress progress output" }],
-        opts: &[],
-        positionals: &[],
+        flags: &[FlagSpec { long: "quiet", short: Some('q'), help: "Suppress progress output", .. }],
         subcommands: &[SubcommandSpec {
             name: "gc",
             about: "Reclaim unreferenced records",
             spec: &GC_SPEC,
+            ..
         }],
+        ..
     };
 
     const ROOT_SPEC: CommandSpec<'static> = CommandSpec {
@@ -1115,49 +1192,46 @@ mod tests {
         about: "Fast incremental Rust compiler",
         version: Some("0.2.0"),
         flags: &[
-            FlagSpec { long: "verbose", short: Some('v'), help: "Increase verbosity (-vvv)" },
-            FlagSpec { long: "all", short: Some('a'), help: "Include all targets" },
-            FlagSpec { long: "color", short: Some('c'), help: "Enable ANSI colors" },
+            FlagSpec { long: "verbose", short: Some('v'), help: "Increase verbosity (-vvv)", .. },
+            FlagSpec { long: "all", short: Some('a'), help: "Include all targets", .. },
+            FlagSpec { long: "color", short: Some('c'), help: "Enable ANSI colors", .. },
         ],
         opts: &[
             OptSpec {
                 long: "output",
                 short: Some('o'),
                 value_name: "PATH",
-                required: false,
-                multiple: false,
                 default: Some("out.bin"),
                 help: "Output artifact path",
+                ..
             },
             OptSpec {
                 long: "jobs",
                 short: Some('j'),
                 value_name: "N",
-                required: false,
-                multiple: false,
-                default: None,
                 help: "Worker thread count",
+                ..
             },
             OptSpec {
                 long: "include",
                 short: Some('I'),
                 value_name: "DIR",
-                required: false,
                 multiple: true,
-                default: None,
                 help: "Additional include directory",
+                ..
             },
         ],
         positionals: &[PositionalSpec {
             name: "FILES",
-            required: false,
             multiple: true,
             help: "Input source files",
+            ..
         }],
         subcommands: &[SubcommandSpec {
             name: "cache",
             about: "Inspect or prune local cache",
             spec: &CACHE_SPEC,
+            ..
         }],
     };
 
@@ -1165,23 +1239,22 @@ mod tests {
         name: "deploy",
         about: "Deploy a single artifact",
         version: Some("1.0.0"),
-        flags: &[FlagSpec { long: "verbose", short: Some('v'), help: "Verbose logs" }],
+        flags: &[FlagSpec { long: "verbose", short: Some('v'), help: "Verbose logs", .. }],
         opts: &[OptSpec {
             long: "target",
             short: Some('t'),
             value_name: "ENV",
             required: true,
-            multiple: false,
-            default: None,
             help: "Target environment",
+            ..
         }],
         positionals: &[PositionalSpec {
             name: "ARTIFACT",
             required: true,
-            multiple: false,
             help: "Artifact path",
+            ..
         }],
-        subcommands: &[],
+        ..
     };
 
     #[test]
@@ -1273,13 +1346,102 @@ mod tests {
         assert!(sm.flag("force"));
         assert_eq!(sm.opt_parse::<u32>("older-than"), Ok(Some(30)));
 
-        // Help on nested subcommand returns that subcommand's spec.
+        // Help on nested subcommand returns that subcommand's spec and full path.
         let help = parse_in(&ROOT_SPEC, &["cache", "gc", "--help"], h.alloc()).expect("help");
-        assert_eq!(help, ParseOutcome::Help { command: &GC_SPEC });
+        let ParseOutcome::Help { command, path } = help else {
+            panic!("expected Help");
+        };
+        assert_eq!(command, &GC_SPEC);
+        assert_eq!(path.as_slice(), &["blaze", "cache", "gc"]);
+        let rendered = format_help_with_path_in(command, path.as_slice(), false, h.alloc()).expect("help");
+        assert!(rendered.as_str().contains("Usage: blaze cache gc [OPTIONS]"));
 
         // Version at root.
         let ver = parse_in(&ROOT_SPEC, &["-V"], h.alloc()).expect("version");
         assert_eq!(ver, ParseOutcome::Version { name: "blaze", version: "0.2.0" });
+    }
+
+    #[test]
+    fn aliases_hidden_items_and_default_missing_value() {
+        const STATUS_SPEC: CommandSpec<'static> = CommandSpec {
+            name: "status",
+            about: "Show working tree status",
+            flags: &[
+                FlagSpec { long: "short", short: Some('s'), help: "Short format", .. },
+                FlagSpec { long: "from-hook", hidden: true, .. },
+            ],
+            opts: &[
+                OptSpec {
+                    long: "untracked-files",
+                    short: Some('u'),
+                    value_name: "MODE",
+                    default_missing_value: Some("all"),
+                    help: "Untracked mode",
+                    ..
+                },
+                OptSpec {
+                    long: "porcelain",
+                    value_name: "VER",
+                    default_missing_value: Some("v1"),
+                    help: "Machine-readable output",
+                    ..
+                },
+            ],
+            positionals: &[PositionalSpec { name: "DIR", .. }],
+            ..
+        };
+        const INTERNAL_SPEC: CommandSpec<'static> = CommandSpec { name: "__internal", .. };
+        const APP: CommandSpec<'static> = CommandSpec {
+            name: "bgit",
+            about: "Fast VCS",
+            subcommands: &[
+                SubcommandSpec {
+                    name: "status",
+                    aliases: &["st"],
+                    about: "Show status",
+                    spec: &STATUS_SPEC,
+                    ..
+                },
+                SubcommandSpec { name: "__internal", spec: &INTERNAL_SPEC, hidden: true, .. },
+            ],
+            ..
+        };
+
+        let h = heap();
+        // Subcommand alias resolves to canonical command name, and bare `--porcelain` / `-u`
+        // use `default_missing_value` without stealing positional `DIR`.
+        let ParseOutcome::Matched(m) =
+            parse_in(&APP, &["st", "--porcelain", "-u", "repo", "--from-hook"], h.alloc()).expect("ok")
+        else {
+            panic!("expected Matched");
+        };
+        assert_eq!(m.command_path(), &["bgit", "status"]);
+        assert_eq!(m.opt("porcelain"), Some("v1"));
+        assert_eq!(m.opt("untracked-files"), Some("all"));
+        assert_eq!(m.positional(0), Some("repo"));
+        assert!(m.flag("from-hook"));
+
+        // Attached short value `-uno` and `--porcelain=v1` override `default_missing_value`.
+        let ParseOutcome::Matched(m2) =
+            parse_in(&APP, &["status", "-s", "-uno", "--porcelain=v1"], h.alloc()).expect("ok")
+        else {
+            panic!("expected Matched");
+        };
+        assert!(m2.flag("short"));
+        assert_eq!(m2.opt("untracked-files"), Some("no"));
+        assert_eq!(m2.opt("porcelain"), Some("v1"));
+
+        // Hidden subcommand dispatches cleanly, yet never appears in `--help` or suggestions.
+        let ParseOutcome::Matched(mh) = parse_in(&APP, &["__internal"], h.alloc()).expect("hidden") else {
+            panic!("expected Matched");
+        };
+        assert_eq!(mh.subcommand(), Some("__internal"));
+
+        let root_help = format_help_in(&APP, false, h.alloc()).expect("help");
+        assert!(root_help.as_str().contains("[aliases: st]"));
+        assert!(!root_help.as_str().contains("__internal"));
+        let status_help = format_help_in(&STATUS_SPEC, false, h.alloc()).expect("help");
+        assert!(!status_help.as_str().contains("--from-hook"));
     }
 
     #[test]

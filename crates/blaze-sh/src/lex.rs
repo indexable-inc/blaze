@@ -1911,13 +1911,66 @@ fn highlight_range<'a>(
                 at_stmt_start = false;
                 in_cmd_args = false;
             } else if expect_cmd {
-                out.push(HighlightSpan {
-                    kind: HighlightKind::Command,
-                    span: Span::from_usize(id_start, i),
-                });
-                expect_cmd = false;
-                at_stmt_start = false;
-                in_cmd_args = true;
+                // Bare structured data file at stage start (`Cargo.lock`, `blaze.lock`,
+                // `Cargo.toml.package.version`, `data.json[n > 1]`): highlight the filename
+                // as a data-file path (`String`), NEVER as an unknown red command, and highlight
+                // any immediately chained `.field.0` steps cleanly!
+                if let Some(file_end) = scan_structured_data_file_end(&src[..limit], id_start, i) {
+                    out.push(HighlightSpan {
+                        kind: HighlightKind::String,
+                        span: Span::from_usize(id_start, file_end),
+                    });
+                    i = file_end;
+                    while i < limit
+                        && (bytes[i] == b'.'
+                            || (bytes[i] == b'?' && bytes.get(i + 1) == Some(&b'.')))
+                    {
+                        let sep_len = if bytes[i] == b'?' { 2 } else { 1 };
+                        out.push(HighlightSpan {
+                            kind: HighlightKind::Punct,
+                            span: Span::from_usize(i, i + sep_len),
+                        });
+                        i += sep_len;
+                        let seg_start = i;
+                        if i < limit && bytes[i].is_ascii_digit() {
+                            while i < limit && bytes[i].is_ascii_digit() {
+                                i += 1;
+                            }
+                            out.push(HighlightSpan {
+                                kind: HighlightKind::Number,
+                                span: Span::from_usize(seg_start, i),
+                            });
+                        } else if i < limit && is_ident_start(bytes[i]) {
+                            while i < limit && (is_ident_continue(bytes[i]) || bytes[i] == b'-') {
+                                i += 1;
+                            }
+                            out.push(HighlightSpan {
+                                kind: HighlightKind::Var,
+                                span: Span::from_usize(seg_start, i),
+                            });
+                        } else {
+                            break;
+                        }
+                        if i < limit && bytes[i] == b'?' && bytes.get(i + 1) != Some(&b'.') {
+                            out.push(HighlightSpan {
+                                kind: HighlightKind::Punct,
+                                span: Span::from_usize(i, i + 1),
+                            });
+                            i += 1;
+                        }
+                    }
+                    expect_cmd = false;
+                    at_stmt_start = false;
+                    in_cmd_args = false;
+                } else {
+                    out.push(HighlightSpan {
+                        kind: HighlightKind::Command,
+                        span: Span::from_usize(id_start, i),
+                    });
+                    expect_cmd = false;
+                    at_stmt_start = false;
+                    in_cmd_args = true;
+                }
             } else {
                 // Non-keyword bare word (field, subcommand, argument)
                 out.push(HighlightSpan {
@@ -2023,6 +2076,47 @@ fn highlight_range<'a>(
                 i += 1;
                 expect_cmd = true;
                 at_stmt_start = true;
+                in_cmd_args = false;
+            }
+            b'.' if expect_cmd && bytes.get(i + 1) != Some(&b'/') => {
+                // Leading `.` / `.package.version` implicit-subject cell path!
+                while i < limit && (bytes[i] == b'.' || (bytes[i] == b'?' && bytes.get(i + 1) == Some(&b'.'))) {
+                    let sep_len = if bytes[i] == b'?' { 2 } else { 1 };
+                    out.push(HighlightSpan {
+                        kind: HighlightKind::Punct,
+                        span: Span::from_usize(i, i + sep_len),
+                    });
+                    i += sep_len;
+                    let seg_start = i;
+                    if i < limit && bytes[i].is_ascii_digit() {
+                        while i < limit && bytes[i].is_ascii_digit() {
+                            i += 1;
+                        }
+                        out.push(HighlightSpan {
+                            kind: HighlightKind::Number,
+                            span: Span::from_usize(seg_start, i),
+                        });
+                    } else if i < limit && is_ident_start(bytes[i]) {
+                        while i < limit && (is_ident_continue(bytes[i]) || bytes[i] == b'-') {
+                            i += 1;
+                        }
+                        out.push(HighlightSpan {
+                            kind: HighlightKind::Var,
+                            span: Span::from_usize(seg_start, i),
+                        });
+                    } else {
+                        break;
+                    }
+                    if i < limit && bytes[i] == b'?' && bytes.get(i + 1) != Some(&b'.') {
+                        out.push(HighlightSpan {
+                            kind: HighlightKind::Punct,
+                            span: Span::from_usize(i, i + 1),
+                        });
+                        i += 1;
+                    }
+                }
+                expect_cmd = false;
+                at_stmt_start = false;
                 in_cmd_args = false;
             }
             b'}' | b'[' | b']' | b',' | b':' | b'.' | b'?' => {
@@ -2162,4 +2256,47 @@ fn highlight_double_string<'a>(
         span: Span::from_usize(seg_start, limit),
     });
     limit
+}
+
+/// Starting at an identifier `src[start..first_ident_end]` in command position, scan forward
+/// across touching path/dot segments (`Cargo.lock`, `crates/foo/Cargo.toml`, `data.json`) and
+/// return the byte end of the structured data file (stopping right before postfix `.field` or `[`).
+fn scan_structured_data_file_end(src: &str, start: usize, first_ident_end: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut p = first_ident_end;
+    while p < bytes.len() {
+        let c = bytes[p];
+        if c == b'.' {
+            let dot_pos = p;
+            p += 1;
+            let ext_start = p;
+            while p < bytes.len() && is_ident_continue(bytes[p]) {
+                p += 1;
+            }
+            if ext_start < p {
+                let ext = &src[ext_start..p];
+                let is_data_ext = matches!(
+                    ext,
+                    "toml" | "lock" | "json" | "jsonl" | "ndjson" | "csv" | "tsv"
+                        | "TOML" | "LOCK" | "JSON" | "JSONL" | "NDJSON" | "CSV" | "TSV"
+                );
+                if is_data_ext {
+                    // Valid end if EOF, whitespace, postfix `.`/`?.`/`[`, or delimiter (`|`, `;`, `)`, etc.).
+                    let ok = match bytes.get(p) {
+                        None => true,
+                        Some(b' ' | b'\t' | b'\n' | b'\r' | b'.' | b'?' | b'[' | b'|' | b';' | b')' | b']' | b'}' | b',') => true,
+                        _ => false,
+                    };
+                    if ok && start < dot_pos {
+                        return Some(p);
+                    }
+                }
+            }
+        } else if c == b'/' || c == b'-' || is_ident_continue(c) {
+            p += 1;
+        } else {
+            break;
+        }
+    }
+    None
 }

@@ -13,8 +13,9 @@
 //!      `opts.allow_x29_leaf && !has_calls`.
 //!    - FP/NEON scratch: `V16..=V28, V0..=V7, V29` (`V30`/`V31` permanently reserved);
 //!      FP/NEON callee-saved: `V8..=V15`.
-//! 2. **Bounded Backward Liveness + Wimmer–Franz Multi-Range Intervals** (`<= 32` iterations):
-//!    - Exact bitset `live_in`/`live_out` over `VReg`s and `u64` physical-register liveness,
+//! 2. **Sparse Per-Global-`VReg` Backward BFS + Bounded `PReg` Liveness + Wimmer–Franz Multi-Range Intervals**:
+//!    - Exact per-global-`VReg` backward CFG BFS (`O(n_blocks)` scratch, zero `O(n_blocks * n_vregs)`
+//!      dense bitsets) paired with bounded `u64` physical-register dataflow (`<= 32` iterations),
 //!      producing exact disjoint live ranges with lifetime holes so loop-carried `ParallelCopy`
 //!      back-edges coalesce to zero instructions.
 //! 3. **Rematerialization & Cold-Exit Live-Range Splitting**:
@@ -169,14 +170,13 @@ fn swap_remove_fast<T>(v: &mut Vec<T, Alloc<'_>>, idx: usize) {
     }
 }
 
+/// Binary-searches a `orig_inst`-sorted call-clobber table in O(log C).
 #[inline]
-fn lookup_call_clobbers(table: &[(u32, CallClobbers)], orig_inst: u32) -> CallClobbers {
-    for &(idx, clob) in table {
-        if idx == orig_inst {
-            return clob;
-        }
+fn lookup_call_clobbers_sorted(table: &[(u32, CallClobbers)], orig_inst: u32) -> CallClobbers {
+    match table.binary_search_by_key(&orig_inst, |&(idx, _)| idx) {
+        Ok(pos) => table[pos].1,
+        Err(_) => CallClobbers::C_ABI_ARM64,
     }
-    CallClobbers::C_ABI_ARM64
 }
 
 // -----------------------------------------------------------------------------
@@ -198,6 +198,12 @@ pub struct MRaOpts<'a> {
     pub call_clobbers: &'a [(u32, CallClobbers)],
     /// Base byte offset from `SP` where spill slots begin (16-byte aligned).
     pub spill_base_off: u32,
+    /// Fast single-pass linear-scan mode for [`super::EmitProfile::Fast`] cold compilation:
+    /// skips cold-exit splitting, CSR copy-edge graph construction, multi-hop hint propagation,
+    /// `fixed_want` lookahead, and `pending_res` reservations, using an `O(1)` bitmask scan over
+    /// convex-hull intervals while preserving exact liveness, ABI, IPRA `CallClobbers`, and
+    /// `ParallelCopy` lowering.
+    pub fast_mode: bool,
 }
 
 impl Default for MRaOpts<'_> {
@@ -208,6 +214,7 @@ impl Default for MRaOpts<'_> {
             block_weights: &[],
             call_clobbers: &[],
             spill_base_off: 0,
+            fast_mode: false,
         }
     }
 }
@@ -1278,17 +1285,232 @@ fn remap_op_regs(
 // -----------------------------------------------------------------------------
 
 #[inline]
-fn bitset_set(bits: &mut [u64], base: usize, id: u32) {
-    let idx = to_idx(id);
-    if let Some(word) = bits.get_mut(base + (idx >> 6)) {
-        *word |= 1u64 << (idx & 63);
+/// Builds a compact CSR `(offsets, data)` from `(key, value)` pairs for `key in 0..n_keys`.
+fn build_u32_csr<'a>(
+    n_keys: usize,
+    pairs: &[(u32, u32)],
+    alloc: Alloc<'a>,
+) -> Result<(Vec<u32, Alloc<'a>>, Vec<u32, Alloc<'a>>), MRaError> {
+    let mut off: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_keys.saturating_add(1), alloc);
+    for _ in 0..=n_keys {
+        off.push(0);
     }
+    for &(k, _) in pairs {
+        let ki = to_idx(k);
+        if let Some(slot) = off.get_mut(ki.saturating_add(1)) {
+            *slot = slot.checked_add(1).ok_or(MRaError::FunctionTooLarge)?;
+        }
+    }
+    let mut running: u32 = 0;
+    for slot in off.iter_mut() {
+        running = running.checked_add(*slot).ok_or(MRaError::FunctionTooLarge)?;
+        *slot = running;
+    }
+    let total = to_idx(running);
+    let mut data: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(total, alloc);
+    for _ in 0..total {
+        data.push(0);
+    }
+    let mut cursor: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_keys, alloc);
+    for i in 0..n_keys {
+        cursor.push(slice_at(&off, i, 0));
+    }
+    for &(k, v) in pairs {
+        let ki = to_idx(k);
+        if let Some(cur) = cursor.get_mut(ki) {
+            let pos = to_idx(*cur);
+            if pos < data.len() {
+                slice_set(&mut data, pos, v);
+                *cur = cur.saturating_add(1);
+            }
+        }
+    }
+    Ok((off, data))
 }
 
-#[inline]
-fn bitset_test(bits: &[u64], base: usize, id: u32) -> bool {
-    let idx = to_idx(id);
-    bits.get(base + (idx >> 6)).is_some_and(|&w| (w & (1u64 << (idx & 63))) != 0)
+/// Compact outputs of sparse per-global-`VReg` backward CFG BFS liveness.
+struct SparseVRegLiveness<'a> {
+    /// Per-block CSR of `VReg` IDs (`v.0`) that are BOTH `live_out[b]` AND defined in `b`
+    /// (non-empty blocks only). Total entries are bounded by `global_defs.len() <= O(n_insts)`.
+    def_lo_off: Vec<u32, Alloc<'a>>,
+    def_lo_vregs: Vec<u32, Alloc<'a>>,
+    /// Per-global-`VReg` (`g in 0..n_global_vregs`) CSR of sorted, coalesced half-point spans
+    /// `[blk_start_pt, blk_end_pt]` for non-empty pass-through `live_out` blocks (no defs of `g`).
+    pass_through_off: Vec<u32, Alloc<'a>>,
+    pass_through_ranges: Vec<(u32, u32), Alloc<'a>>,
+    /// Per-global-`VReg` flag: `true` iff `g` is `live_in` or `live_out` at at least one hot block.
+    /// Empty when `block_is_hot` is empty (`!has_hot_cold_weights`).
+    vreg_crosses_hot: Vec<bool, Alloc<'a>>,
+}
+
+/// Computes exact `VReg` liveness via unified per-global-`VReg` backward CFG BFS (Appel / Brandner /
+/// regalloc2 style), handling arbitrary multi-def non-SSA `VReg`s and irreducible CFGs using only
+/// `O(n_blocks)` reusable epoch scratch (zero `O(n_blocks * n_global_vregs)` bitsets).
+///
+/// `observe_live(g, blk_id, is_live_out)` is invoked once per newly discovered `(g, blk_id)` live-in
+/// (`false`) or live-out (`true`) fact; production callers pass a no-op closure.
+#[expect(clippy::too_many_arguments, reason = "internal sparse liveness kernel taking pre-linearized slices")]
+fn compute_sparse_vreg_liveness_with<'a>(
+    func: &MFunc<'_>,
+    block_lin_range: &[(u32, u32)],
+    block_ord_pos: &[u32],
+    block_is_hot: &[bool],
+    global_to_vreg: &[u32],
+    upward_uses: &[(u32, u32)],
+    global_defs: &[(u32, u32)],
+    alloc: Alloc<'a>,
+    mut observe_live: impl FnMut(u32, u32, bool),
+) -> Result<SparseVRegLiveness<'a>, MRaError> {
+    let n_blocks = func.block_insts.len();
+    let n_global = global_to_vreg.len();
+    if n_global == 0 {
+        return Ok(SparseVRegLiveness {
+            def_lo_off: Vec::new_in(alloc),
+            def_lo_vregs: Vec::new_in(alloc),
+            pass_through_off: Vec::new_in(alloc),
+            pass_through_ranges: Vec::new_in(alloc),
+            vreg_crosses_hot: Vec::new_in(alloc),
+        });
+    }
+    if u32_of(n_global.saturating_add(1)).is_none() {
+        return Err(MRaError::FunctionTooLarge);
+    }
+
+    let (use_off, use_blocks) = build_u32_csr(n_global, upward_uses, alloc)?;
+    let (def_off, def_blocks) = build_u32_csr(n_global, global_defs, alloc)?;
+
+    // Reusable `O(n_blocks)` epoch scratch (zero per-vreg heap allocations).
+    let mut def_epoch: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_blocks, alloc);
+    let mut live_in_epoch: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_blocks, alloc);
+    let mut live_out_epoch: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_blocks, alloc);
+    for _ in 0..n_blocks {
+        def_epoch.push(0);
+        live_in_epoch.push(0);
+        live_out_epoch.push(0);
+    }
+    let mut bfs_stack: Vec<MBlock, Alloc<'a>> = Vec::new_in(alloc);
+    let mut pass_through_spans: Vec<(u32, u32), Alloc<'a>> = Vec::new_in(alloc);
+
+    let mut def_and_live_out_pairs: Vec<(u32, u32), Alloc<'a>> = Vec::new_in(alloc);
+    let mut pass_through_off: Vec<u32, Alloc<'a>> =
+        Vec::with_capacity_in(n_global.saturating_add(1), alloc);
+    let mut pass_through_ranges: Vec<(u32, u32), Alloc<'a>> = Vec::new_in(alloc);
+
+    let track_hot = !block_is_hot.is_empty();
+    let mut vreg_crosses_hot: Vec<bool, Alloc<'a>> = Vec::new_in(alloc);
+    if track_hot {
+        vreg_crosses_hot.reserve(n_global);
+        for _ in 0..n_global {
+            vreg_crosses_hot.push(false);
+        }
+    }
+
+    for g in 0..n_global {
+        let g_u32 = u32_of(g).ok_or(MRaError::FunctionTooLarge)?;
+        let epoch = g_u32.checked_add(1).ok_or(MRaError::FunctionTooLarge)?;
+        let v_u32 = slice_at(global_to_vreg, g, NONE_U32);
+        pass_through_off
+            .push(u32_of(pass_through_ranges.len()).ok_or(MRaError::FunctionTooLarge)?);
+
+        let ds = to_idx(slice_at(&def_off, g, 0));
+        let de = to_idx(slice_at(&def_off, g + 1, 0));
+        for &db in subslice(&def_blocks, ds, de) {
+            slice_set(&mut def_epoch, to_idx(db), epoch);
+        }
+
+        let mut crosses_hot = false;
+        let us = to_idx(slice_at(&use_off, g, 0));
+        let ue = to_idx(slice_at(&use_off, g + 1, 0));
+        for &ub in subslice(&use_blocks, us, ue) {
+            let bi = to_idx(ub);
+            if bi < n_blocks
+                && slice_at(block_ord_pos, bi, NONE_U32) != NONE_U32
+                && slice_at(&live_in_epoch, bi, 0) != epoch
+            {
+                slice_set(&mut live_in_epoch, bi, epoch);
+                observe_live(g_u32, ub, false);
+                if track_hot && slice_at(block_is_hot, bi, false) {
+                    crosses_hot = true;
+                }
+                bfs_stack.push(MBlock(ub));
+            }
+        }
+
+        // Exact backward BFS: each block is marked `live_in_epoch = epoch` before push, so this
+        // loop pops at most `n_blocks` blocks per global `VReg`.
+        while let Some(blk) = bfs_stack.pop() {
+            for &pred in func.block_preds(blk) {
+                let pb = to_idx(pred.0);
+                if pb >= n_blocks || slice_at(block_ord_pos, pb, NONE_U32) == NONE_U32 {
+                    continue;
+                }
+                if slice_at(&live_out_epoch, pb, 0) != epoch {
+                    slice_set(&mut live_out_epoch, pb, epoch);
+                    observe_live(g_u32, pred.0, true);
+                    if track_hot && slice_at(block_is_hot, pb, false) {
+                        crosses_hot = true;
+                    }
+                    let (ls, le) = slice_at(block_lin_range, pb, (0, 0));
+                    if ls < le {
+                        if slice_at(&def_epoch, pb, 0) == epoch {
+                            if v_u32 != NONE_U32 {
+                                def_and_live_out_pairs.push((pred.0, v_u32));
+                            }
+                        } else {
+                            let blk_start_pt = ls.saturating_mul(2);
+                            let blk_end_pt = (le - 1).saturating_mul(2).saturating_add(1);
+                            pass_through_spans.push((blk_start_pt, blk_end_pt));
+                        }
+                    }
+                }
+                if slice_at(&def_epoch, pb, 0) != epoch
+                    && slice_at(&live_in_epoch, pb, 0) != epoch
+                {
+                    slice_set(&mut live_in_epoch, pb, epoch);
+                    observe_live(g_u32, pred.0, false);
+                    if track_hot && slice_at(block_is_hot, pb, false) {
+                        crosses_hot = true;
+                    }
+                    bfs_stack.push(pred);
+                }
+            }
+        }
+
+        if track_hot && crosses_hot {
+            slice_set(&mut vreg_crosses_hot, g, true);
+        }
+
+        if !pass_through_spans.is_empty() {
+            pass_through_spans.sort_unstable_by_key(|&(s, _)| s);
+            let mut iter = pass_through_spans.iter().copied();
+            if let Some((mut cur_s, mut cur_e)) = iter.next() {
+                for (s, e) in iter {
+                    if s <= cur_e.saturating_add(1) {
+                        if e > cur_e {
+                            cur_e = e;
+                        }
+                    } else {
+                        pass_through_ranges.push((cur_s, cur_e));
+                        cur_s = s;
+                        cur_e = e;
+                    }
+                }
+                pass_through_ranges.push((cur_s, cur_e));
+            }
+            pass_through_spans.clear();
+        }
+    }
+
+    pass_through_off.push(u32_of(pass_through_ranges.len()).ok_or(MRaError::FunctionTooLarge)?);
+    let (def_lo_off, def_lo_vregs) = build_u32_csr(n_blocks, &def_and_live_out_pairs, alloc)?;
+
+    Ok(SparseVRegLiveness {
+        def_lo_off,
+        def_lo_vregs,
+        pass_through_off,
+        pass_through_ranges,
+        vreg_crosses_hot,
+    })
 }
 
 /// Inserts `[s, e]` into the ascending linked list rooted at `*head`, merging overlapping/adjacent
@@ -1417,9 +1639,55 @@ fn range_list_shorten_def(
     range_list_add(head, nodes, def_pt, def_pt);
 }
 
-/// Two-pointer overlap test over two sorted disjoint half-point range slices.
+/// Overlap test over two sorted disjoint half-point range slices.
+///
+/// Uses O(1) bounding-box rejection and O(|small| log |large|) binary search when the two slices
+/// differ sharply in size (the common `VReg` vs `phys_spans` case on large functions), falling into
+/// a linear two-pointer merge when lengths are comparable.
 #[inline]
 fn ranges_overlap(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+    let (Some(&(a0_s, a0_e)), Some(&(b0_s, b0_e))) = (a.first(), b.first()) else {
+        return false;
+    };
+    let a_last_e = a[a.len() - 1].1;
+    let b_last_e = b[b.len() - 1].1;
+    if a_last_e < b0_s || b_last_e < a0_s {
+        return false;
+    }
+    if a.len() == 1 {
+        let j = b.partition_point(|&(_, b_e)| b_e < a0_s);
+        return b.get(j).is_some_and(|&(b_s, _)| b_s <= a0_e);
+    }
+    if b.len() == 1 {
+        let i = a.partition_point(|&(_, a_e)| a_e < b0_s);
+        return a.get(i).is_some_and(|&(a_s, _)| a_s <= b0_e);
+    }
+    if b.len() > a.len().saturating_mul(4) {
+        let mut j = 0usize;
+        for &(a_s, a_e) in a {
+            j += b[j..].partition_point(|&(_, b_e)| b_e < a_s);
+            let Some(&(b_s, _)) = b.get(j) else {
+                return false;
+            };
+            if b_s <= a_e {
+                return true;
+            }
+        }
+        return false;
+    }
+    if a.len() > b.len().saturating_mul(4) {
+        let mut i = 0usize;
+        for &(b_s, b_e) in b {
+            i += a[i..].partition_point(|&(_, a_e)| a_e < b_s);
+            let Some(&(a_s, _)) = a.get(i) else {
+                return false;
+            };
+            if a_s <= b_e {
+                return true;
+            }
+        }
+        return false;
+    }
     let mut i = 0usize;
     let mut j = 0usize;
     while let (Some(&(a_s, a_e)), Some(&(b_s, b_e))) = (a.get(i), b.get(j)) {
@@ -2438,6 +2706,19 @@ pub fn allocate_mfunc<'a>(
     let n_blocks = func.block_insts.len();
     let n_vregs = func.vreg_class.len();
 
+    // Ensure `call_clobbers` is sorted by `orig_inst` once so every per-call lookup across
+    // Phases 1, 2, 3, and 5 is O(log C) instead of O(C). Zero allocation when already sorted.
+    let mut call_clobbers_owned: Vec<(u32, CallClobbers), Alloc<'a>> = Vec::new_in(alloc);
+    let call_clobbers_sorted: &[(u32, CallClobbers)] =
+        if opts.call_clobbers.is_sorted_by_key(|&(idx, _)| idx) {
+            opts.call_clobbers
+        } else {
+            call_clobbers_owned.reserve(opts.call_clobbers.len());
+            call_clobbers_owned.extend_from_slice(opts.call_clobbers);
+            call_clobbers_owned.sort_unstable_by_key(|&(idx, _)| idx);
+            call_clobbers_owned.as_slice()
+        };
+
     // Ensure CSR predecessor/successor tables are populated before dataflow.
     if func.block_succs_off.len() != n_blocks + 1 || func.block_preds_off.len() != n_blocks + 1 {
         func.rebuild_cfg(alloc);
@@ -2457,6 +2738,7 @@ pub fn allocate_mfunc<'a>(
 
     let mut lin_to_orig: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(func.ops.len(), alloc);
     let mut call_sites: Vec<CallSite, Alloc<'a>> = Vec::new_in(alloc);
+    let mut all_call_clobbers: u64 = 0;
     let mut sp_mod_lins: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
     let mut has_calls = false;
     let mut explicitly_uses_fp = false;
@@ -2478,7 +2760,8 @@ pub fn allocate_mfunc<'a>(
             let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             if is_call_op(op, fl) {
                 has_calls = true;
-                let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32);
+                let clob = lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32);
+                all_call_clobbers |= clob.clobbered.0;
                 let def_pt = lin_p
                     .checked_mul(2)
                     .and_then(|x| x.checked_add(1))
@@ -2552,7 +2835,7 @@ pub fn allocate_mfunc<'a>(
             let (_, pdefs) = explicit_phys_masks(op, &func.copy_pairs);
             phys_gen |= pdefs;
             if is_call_op(op, fl) {
-                let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0;
+                let clob = lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32).clobbered.0;
                 phys_gen &= !clob;
                 kill |= clob;
             }
@@ -2609,7 +2892,7 @@ pub fn allocate_mfunc<'a>(
             let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             if is_call_op(op, fl) {
                 slice_set(&mut inst_impl_phys_uses, p, reach & CALL_ARG_PHYS_MASK);
-                let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0;
+                let clob = lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32).clobbered.0;
                 reach &= !clob;
             } else if matches!(*op, MOp::Ret) {
                 slice_set(&mut inst_impl_phys_uses, p, reach & RET_VAL_PHYS_MASK & ret_allowed_mask);
@@ -2619,19 +2902,20 @@ pub fn allocate_mfunc<'a>(
         }
     }
 
-    // Build per-block `use` and `def` bitsets for `VReg`s and `u64` masks for `PReg`s.
-    let words_per_block = n_vregs.div_ceil(64);
-    let total_words = n_blocks.saturating_mul(words_per_block);
-    let mut v_use: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
-    let mut v_def: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
-    let mut v_live_in: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
-    let mut v_live_out: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(total_words, alloc);
-    for _ in 0..total_words {
-        v_use.push(0);
-        v_def.push(0);
-        v_live_in.push(0);
-        v_live_out.push(0);
+    // Prune liveness to upward-exposed (cross-block) `VReg`s and compute per-block `PReg` use/def
+    // masks in one pass. A `VReg` never upward-exposed in any block is strictly block-local and
+    // can never appear in `live_in` or `live_out` of any block.
+    let mut def_stamp: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_vregs, alloc);
+    let mut use_stamp: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_vregs, alloc);
+    let mut vreg_to_global: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(n_vregs, alloc);
+    for _ in 0..n_vregs {
+        def_stamp.push(0);
+        use_stamp.push(0);
+        vreg_to_global.push(NONE_U32);
     }
+    let mut global_to_vreg: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+    // Deduplicated `(g, b_u32)` pairs for upward-exposed uses of global `VReg`s.
+    let mut upward_uses: Vec<(u32, u32), Alloc<'a>> = Vec::new_in(alloc);
 
     let mut p_use: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(n_blocks, alloc);
     let mut p_def: Vec<u64, Alloc<'a>> = Vec::with_capacity_in(n_blocks, alloc);
@@ -2644,9 +2928,10 @@ pub fn allocate_mfunc<'a>(
         p_live_out.push(0);
     }
 
-    for &blk in func.block_order.iter() {
+    for (ord_idx, &blk) in func.block_order.iter().enumerate() {
         let b = to_idx(blk.0);
-        let base = b * words_per_block;
+        let b_u32 = blk.0;
+        let stamp = u32_of(ord_idx.saturating_add(1)).ok_or(MRaError::FunctionTooLarge)?;
         let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
         let mut pu_acc: u64 = 0;
         let mut pd_acc: u64 = 0;
@@ -2658,23 +2943,39 @@ pub fn allocate_mfunc<'a>(
             };
             let fl = slice_at(&func.flags, orig, MInstFlags::NONE);
             visit_op_uses(op, &func.copy_pairs, |r| {
-                if let MReg::V(v) = r
-                    && !bitset_test(&v_def, base, v.0)
-                {
-                    bitset_set(&mut v_use, base, v.0);
+                if let MReg::V(v) = r {
+                    let vi = to_idx(v.0);
+                    if vi < n_vregs
+                        && slice_at(&def_stamp, vi, 0) != stamp
+                        && slice_at(&use_stamp, vi, 0) != stamp
+                    {
+                        slice_set(&mut use_stamp, vi, stamp);
+                        let g = match slice_at(&vreg_to_global, vi, NONE_U32) {
+                            NONE_U32 => {
+                                let ng = u32_of(global_to_vreg.len()).unwrap_or(NONE_U32);
+                                slice_set(&mut vreg_to_global, vi, ng);
+                                global_to_vreg.push(v.0);
+                                ng
+                            }
+                            existing => existing,
+                        };
+                        if g != NONE_U32 {
+                            upward_uses.push((g, b_u32));
+                        }
+                    }
                 }
             });
             let (op_pu, mut op_pd) = explicit_phys_masks(op, &func.copy_pairs);
             let total_pu = op_pu | slice_at(&inst_impl_phys_uses, p, 0);
             pu_acc |= total_pu & !pd_acc;
             if is_call_op(op, fl) {
-                op_pd |= lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0;
+                op_pd |= lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32).clobbered.0;
                 op_pd |= 1u64 << 30; // `bl`/`blr` writes `LR` (`X30`).
             }
             pd_acc |= op_pd;
             visit_op_defs(op, &func.copy_pairs, |r| {
                 if let MReg::V(v) = r {
-                    bitset_set(&mut v_def, base, v.0);
+                    slice_set(&mut def_stamp, to_idx(v.0), stamp);
                 }
             });
         }
@@ -2682,53 +2983,126 @@ pub fn allocate_mfunc<'a>(
         slice_set(&mut p_def, b, pd_acc);
     }
 
-    // Bounded backward liveness fixed point (`<= 32` iterations, reverse `block_order`).
-    let mut live_converged = false;
-    for _ in 0..MAX_DATAFLOW_ITERS {
-        let mut changed = false;
-        for &blk in func.block_order.iter().rev() {
+    // Collect deduplicated `(g, b_u32)` pairs for every block defining a global `VReg`.
+    let mut global_defs: Vec<(u32, u32), Alloc<'a>> = Vec::new_in(alloc);
+    if !global_to_vreg.is_empty() {
+        def_stamp.fill(0);
+        for (ord_idx, &blk) in func.block_order.iter().enumerate() {
             let b = to_idx(blk.0);
-            let base = b * words_per_block;
-            let succs = func.block_succs(blk);
-
-            // Physical register liveness (`u64`).
-            let mut new_po: u64 = 0;
-            for &succ in succs {
-                new_po |= slice_at(&p_live_in, to_idx(succ.0), 0);
+            let b_u32 = blk.0;
+            let stamp = u32_of(ord_idx.saturating_add(1)).ok_or(MRaError::FunctionTooLarge)?;
+            let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
+            for p in to_idx(ls)..to_idx(le) {
+                let orig = to_idx(slice_at(&lin_to_orig, p, 0));
+                let Some(op) = func.ops.get(orig) else {
+                    continue;
+                };
+                visit_op_defs(op, &func.copy_pairs, |r| {
+                    if let MReg::V(v) = r {
+                        let vi = to_idx(v.0);
+                        let g = slice_at(&vreg_to_global, vi, NONE_U32);
+                        if g != NONE_U32 && slice_at(&def_stamp, vi, 0) != stamp {
+                            slice_set(&mut def_stamp, vi, stamp);
+                            global_defs.push((g, b_u32));
+                        }
+                    }
+                });
             }
-            let new_pi = slice_at(&p_use, b, 0) | (new_po & !slice_at(&p_def, b, 0));
-            if new_po != slice_at(&p_live_out, b, 0) || new_pi != slice_at(&p_live_in, b, 0) {
-                slice_set(&mut p_live_out, b, new_po);
-                slice_set(&mut p_live_in, b, new_pi);
-                changed = true;
-            }
+        }
+    }
 
-            // Virtual register liveness (`u64` words).
-            for w in 0..words_per_block {
-                let mut new_out: u64 = 0;
-                for &succ in succs {
-                    let s_base = to_idx(succ.0) * words_per_block;
-                    new_out |= slice_at(&v_live_in, s_base + w, 0);
-                }
-                let idx = base + w;
-                let new_in = slice_at(&v_use, idx, 0) | (new_out & !slice_at(&v_def, idx, 0));
-                if new_out != slice_at(&v_live_out, idx, 0)
-                    || new_in != slice_at(&v_live_in, idx, 0)
+    // Bounded worklist backward `PReg` liveness fixed point (`8 * n_blocks` bytes total, seeded in
+    // reverse `block_order` via stack so acyclic switch trees process each block once).
+    let mut worklist: Vec<MBlock, Alloc<'a>> = Vec::with_capacity_in(func.block_order.len(), alloc);
+    let mut in_worklist: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(n_blocks, alloc);
+    for _ in 0..n_blocks {
+        in_worklist.push(false);
+    }
+    for &blk in func.block_order.iter() {
+        let b = to_idx(blk.0);
+        if b < n_blocks && !slice_at(&in_worklist, b, true) {
+            slice_set(&mut in_worklist, b, true);
+            worklist.push(blk);
+        }
+    }
+    let max_worklist_steps = func
+        .block_order
+        .len()
+        .saturating_mul(MAX_DATAFLOW_ITERS)
+        .saturating_add(1);
+    let mut steps = 0usize;
+    while let Some(blk) = worklist.pop() {
+        if steps >= max_worklist_steps {
+            return Err(MRaError::LivenessDidNotConverge);
+        }
+        steps += 1;
+        let b = to_idx(blk.0);
+        slice_set(&mut in_worklist, b, false);
+        let succs = func.block_succs(blk);
+
+        let mut new_po: u64 = 0;
+        for &succ in succs {
+            new_po |= slice_at(&p_live_in, to_idx(succ.0), 0);
+        }
+        let new_pi = slice_at(&p_use, b, 0) | (new_po & !slice_at(&p_def, b, 0));
+        if new_po != slice_at(&p_live_out, b, 0) {
+            slice_set(&mut p_live_out, b, new_po);
+        }
+        if new_pi != slice_at(&p_live_in, b, 0) {
+            slice_set(&mut p_live_in, b, new_pi);
+            for &pred in func.block_preds(blk) {
+                let pb = to_idx(pred.0);
+                if pb < n_blocks
+                    && slice_at(&block_ord_pos, pb, NONE_U32) != NONE_U32
+                    && !slice_at(&in_worklist, pb, true)
                 {
-                    slice_set(&mut v_live_out, idx, new_out);
-                    slice_set(&mut v_live_in, idx, new_in);
-                    changed = true;
+                    slice_set(&mut in_worklist, pb, true);
+                    worklist.push(pred);
                 }
             }
         }
-        if !changed {
-            live_converged = true;
-            break;
+    }
+
+    let has_hot_cold_weights = !opts.fast_mode && !opts.block_weights.is_empty() && {
+        let mut saw_hot = false;
+        let mut saw_cold = false;
+        for &blk in func.block_order.iter() {
+            let rw = block_raw_weight(opts.block_weights, blk);
+            if rw >= HOT_BLOCK_WEIGHT_MIN {
+                saw_hot = true;
+            }
+            if rw <= COLD_EXIT_WEIGHT_MAX {
+                saw_cold = true;
+            }
+        }
+        saw_hot && saw_cold
+    };
+    let mut block_is_hot: Vec<bool, Alloc<'a>> = Vec::new_in(alloc);
+    if has_hot_cold_weights {
+        block_is_hot.reserve(n_blocks);
+        for _ in 0..n_blocks {
+            block_is_hot.push(false);
+        }
+        for &blk in func.block_order.iter() {
+            if block_raw_weight(opts.block_weights, blk) >= HOT_BLOCK_WEIGHT_MIN {
+                slice_set(&mut block_is_hot, to_idx(blk.0), true);
+            }
         }
     }
-    if !live_converged {
-        return Err(MRaError::LivenessDidNotConverge);
-    }
+
+    // Unified sparse per-global-`VReg` backward CFG BFS (`O(n_blocks)` scratch, zero dense
+    // `n_blocks * n_global_vregs` matrices).
+    let sparse_liveness = compute_sparse_vreg_liveness_with(
+        func,
+        &block_lin_range,
+        &block_ord_pos,
+        &block_is_hot,
+        &global_to_vreg,
+        &upward_uses,
+        &global_defs,
+        alloc,
+        |_, _, _| {},
+    )?;
 
     // -------------------------------------------------------------------------
     // Phase 3: Build Exact Physical Busy Spans + Wimmer–Franz `VReg` Live Ranges
@@ -2743,22 +3117,10 @@ pub fn allocate_mfunc<'a>(
         vreg_range_heads.push(NONE_U32);
     }
     let mut vreg_range_nodes: Vec<RangeNode, Alloc<'a>> = Vec::with_capacity_in(n_vregs * 2, alloc);
-    let mut raw_copy_edges: Vec<(u32, u32, u64), Alloc<'a>> =
-        Vec::with_capacity_in(func.copy_pairs.len().saturating_add(16), alloc);
-
-    let has_hot_cold_weights = !opts.block_weights.is_empty() && {
-        let mut saw_hot = false;
-        let mut saw_cold = false;
-        for &blk in func.block_order.iter() {
-            let rw = block_raw_weight(opts.block_weights, blk);
-            if rw >= HOT_BLOCK_WEIGHT_MIN {
-                saw_hot = true;
-            }
-            if rw <= COLD_EXIT_WEIGHT_MAX {
-                saw_cold = true;
-            }
-        }
-        saw_hot && saw_cold
+    let mut raw_copy_edges: Vec<(u32, u32, u64), Alloc<'a>> = if opts.fast_mode {
+        Vec::new_in(alloc)
+    } else {
+        Vec::with_capacity_in(func.copy_pairs.len().saturating_add(16), alloc)
     };
 
     // Single reverse pass over `block_order` constructs exact multi-range intervals with holes.
@@ -2773,18 +3135,15 @@ pub fn allocate_mfunc<'a>(
         let raw_w = block_raw_weight(opts.block_weights, blk);
         let eff_w = block_eff_weight(opts.block_weights, blk);
         let is_backedge = slice_at(&block_has_backedge, b, false);
-        let base = b * words_per_block;
 
-        // Add full-block span `[blk_start_pt, blk_end_pt]` for every `VReg` in `v_live_out[b]`.
-        for w in 0..words_per_block {
-            let mut bits = slice_at(&v_live_out, base + w, 0);
-            while bits != 0 {
-                let tz = bits.trailing_zeros();
-                bits &= bits - 1;
-                let v_idx = (w << 6) + to_idx(tz);
-                if let Some(head) = vreg_range_heads.get_mut(v_idx) {
-                    range_list_add(head, &mut vreg_range_nodes, blk_start_pt, blk_end_pt);
-                }
+        // Seed `[blk_start_pt, blk_end_pt]` for every `VReg` that is both `live_out[b]` AND
+        // defined in `b` so `range_list_shorten_def` shortens it accurately. Pass-through
+        // `live_out` blocks (no defs of `v`) merge directly during CSR compaction below.
+        let dlo_s = to_idx(slice_at(&sparse_liveness.def_lo_off, b, 0));
+        let dlo_e = to_idx(slice_at(&sparse_liveness.def_lo_off, b + 1, 0));
+        for &v_u32 in subslice(&sparse_liveness.def_lo_vregs, dlo_s, dlo_e) {
+            if let Some(head) = vreg_range_heads.get_mut(to_idx(v_u32)) {
+                range_list_add(head, &mut vreg_range_nodes, blk_start_pt, blk_end_pt);
             }
         }
 
@@ -2807,7 +3166,7 @@ pub fn allocate_mfunc<'a>(
             // 1. Physical busy spans at `def_pt` and `use_pt` (excluding call clobbers handled via `call_sites`).
             let (op_pu, op_pd) = explicit_phys_masks(op, &func.copy_pairs);
             let call_clob = if is_call_op(op, fl) {
-                lookup_call_clobbers(opts.call_clobbers, orig_u32).clobbered.0 | (1u64 << 30)
+                lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32).clobbered.0 | (1u64 << 30)
             } else {
                 0
             };
@@ -2871,38 +3230,42 @@ pub fn allocate_mfunc<'a>(
             });
 
             // 4. Coalescing hints from `Mov`, `FpAlu::Mov`, `VecAlu::Mov`, and `ParallelCopy`.
-            collect_copy_hints(
-                op,
-                &func.copy_pairs,
-                eff_w,
-                is_backedge,
-                &mut vreg_meta,
-                &mut raw_copy_edges,
-            );
+            if !opts.fast_mode {
+                collect_copy_hints(
+                    op,
+                    &func.copy_pairs,
+                    eff_w,
+                    is_backedge,
+                    &mut vreg_meta,
+                    &mut raw_copy_edges,
+                );
+            }
         }
     }
 
     // Soft coalescing hint for single-use narrow-masked entry parameters (`raw -> and/ubfm -> dst`)
     // so sub-32-bit entry args (`u8`/`u16`) stay in their incoming ABI register instead of
     // dirtying a scratch register.
-    for (vi, &meta) in vreg_meta.iter().enumerate() {
-        if meta.def_count == 1 && meta.def_inst != NONE_U32 && meta.def_block != NONE_U32 {
-            let di = to_idx(meta.def_inst);
-            if let Some(
-                &MOp::LogicalImm { dst: MReg::V(vd), rn: MReg::V(vs), .. }
-                | &MOp::Ubfm { dst: MReg::V(vd), rn: MReg::V(vs), .. },
-            ) = func.ops.get(di)
-                && to_idx(vd.0) == vi
-                && vd != vs
-            {
-                let si = to_idx(vs.0);
-                if let Some(&smeta) = vreg_meta.get(si)
-                    && smeta.use_count == 1
-                    && smeta.fixed_hint_reg != NO_REG
-                    && smeta.bank == meta.bank
+    if !opts.fast_mode {
+        for (vi, &meta) in vreg_meta.iter().enumerate() {
+            if meta.def_count == 1 && meta.def_inst != NONE_U32 && meta.def_block != NONE_U32 {
+                let di = to_idx(meta.def_inst);
+                if let Some(
+                    &MOp::LogicalImm { dst: MReg::V(vd), rn: MReg::V(vs), .. }
+                    | &MOp::Ubfm { dst: MReg::V(vd), rn: MReg::V(vs), .. },
+                ) = func.ops.get(di)
+                    && to_idx(vd.0) == vi
+                    && vd != vs
                 {
-                    let w = block_eff_weight(opts.block_weights, MBlock(meta.def_block));
-                    raw_copy_edges.push((vd.0, vs.0, w));
+                    let si = to_idx(vs.0);
+                    if let Some(&smeta) = vreg_meta.get(si)
+                        && smeta.use_count == 1
+                        && smeta.fixed_hint_reg != NO_REG
+                        && smeta.bank == meta.bank
+                    {
+                        let w = block_eff_weight(opts.block_weights, MBlock(meta.def_block));
+                        raw_copy_edges.push((vd.0, vs.0, w));
+                    }
                 }
             }
         }
@@ -2926,20 +3289,66 @@ pub fn allocate_mfunc<'a>(
     }
     slice_set(&mut phys_span_off, 64, u32_of(phys_spans.len()).ok_or(MRaError::FunctionTooLarge)?);
 
-    // Compact `vreg_range_heads` into contiguous CSR `vreg_ranges` and populate `first_start`/`last_end`/
-    // `live_len`/`forbidden_phys` (exact physical spans + crossed `call_sites`), `is_remat`, and `is_cold_split`.
-    let mut vreg_ranges: Vec<(u32, u32), Alloc<'a>> = Vec::with_capacity_in(vreg_range_nodes.len(), alloc);
+    // Compact `vreg_range_heads` merged with pass-through `live_out` spans into contiguous CSR
+    // `vreg_ranges`, and populate `first_start`/`last_end`/`live_len`/`forbidden_phys`, `is_remat`,
+    // and `is_cold_split`.
+    let mut vreg_ranges: Vec<(u32, u32), Alloc<'a>> = Vec::with_capacity_in(
+        vreg_range_nodes.len().saturating_add(sparse_liveness.pass_through_ranges.len()),
+        alloc,
+    );
     for vi in 0..n_vregs {
         let start_idx = u32_of(vreg_ranges.len()).ok_or(MRaError::FunctionTooLarge)?;
-        let mut cur = slice_at(&vreg_range_heads, vi, NONE_U32);
+        let pt_slice = match slice_at(&vreg_to_global, vi, NONE_U32) {
+            NONE_U32 => &[],
+            g => {
+                let gi = to_idx(g);
+                let ps = to_idx(slice_at(&sparse_liveness.pass_through_off, gi, 0));
+                let pe = to_idx(slice_at(&sparse_liveness.pass_through_off, gi + 1, 0));
+                subslice(&sparse_liveness.pass_through_ranges, ps, pe)
+            }
+        };
+        let mut cur_a = slice_at(&vreg_range_heads, vi, NONE_U32);
+        let mut pt_idx = 0usize;
+        let max_steps = vreg_range_nodes.len().saturating_add(pt_slice.len());
         let mut steps = 0usize;
-        while cur != NONE_U32 && steps <= vreg_range_nodes.len() {
-            let Some(&node) = vreg_range_nodes.get(to_idx(cur)) else {
-                break;
-            };
-            vreg_ranges.push((node.start, node.end));
-            cur = node.next;
+        while (cur_a != NONE_U32 || pt_idx < pt_slice.len()) && steps <= max_steps {
             steps += 1;
+            let node_a = if cur_a != NONE_U32 {
+                vreg_range_nodes.get(to_idx(cur_a)).copied()
+            } else {
+                None
+            };
+            let span_b = pt_slice.get(pt_idx).copied();
+            let (s, e) = match (node_a, span_b) {
+                (Some(na), Some((bs, be))) => {
+                    if na.start <= bs {
+                        cur_a = na.next;
+                        (na.start, na.end)
+                    } else {
+                        pt_idx += 1;
+                        (bs, be)
+                    }
+                }
+                (Some(na), None) => {
+                    cur_a = na.next;
+                    (na.start, na.end)
+                }
+                (None, Some((bs, be))) => {
+                    pt_idx += 1;
+                    (bs, be)
+                }
+                (None, None) => break,
+            };
+            if vreg_ranges.len() > to_idx(start_idx)
+                && let Some(last) = vreg_ranges.last_mut()
+                && s <= last.1.saturating_add(1)
+            {
+                if e > last.1 {
+                    last.1 = e;
+                }
+            } else {
+                vreg_ranges.push((s, e));
+            }
         }
         let end_idx = u32_of(vreg_ranges.len()).ok_or(MRaError::FunctionTooLarge)?;
         let len = end_idx.saturating_sub(start_idx);
@@ -2989,14 +3398,20 @@ pub fn allocate_mfunc<'a>(
         //    Uses `def_pt <= re` because a `VReg` live-out past a trailing call in its block
         //    ends at `blk_end_pt == call.def_pt`, whereas a `Blr` target dying at the call ends
         //    at even `use_pt == call.def_pt - 1`.
-        if !call_sites.is_empty() {
+        if !call_sites.is_empty() && (forbid.0 & all_call_clobbers) != all_call_clobbers {
             for &(rs, re) in slice {
+                if (forbid.0 & all_call_clobbers) == all_call_clobbers {
+                    break;
+                }
                 let mut pos = call_sites.partition_point(|c| c.def_pt <= rs);
                 while let Some(&cs) = call_sites.get(pos) {
                     if cs.def_pt > re {
                         break;
                     }
                     forbid = forbid.union(cs.clobbers.clobbered);
+                    if (forbid.0 & all_call_clobbers) == all_call_clobbers {
+                        break;
+                    }
                     pos += 1;
                 }
             }
@@ -3049,19 +3464,12 @@ pub fn allocate_mfunc<'a>(
             if def_w >= HOT_BLOCK_WEIGHT_MIN {
                 continue;
             }
-            let v_u32 = u32_of(vi).unwrap_or(0);
-            let mut crosses_hot_block = false;
-            for &blk in func.block_order.iter() {
-                if block_raw_weight(opts.block_weights, blk) >= HOT_BLOCK_WEIGHT_MIN {
-                    let b_base = to_idx(blk.0) * words_per_block;
-                    if bitset_test(&v_live_in, b_base, v_u32)
-                        || bitset_test(&v_live_out, b_base, v_u32)
-                    {
-                        crosses_hot_block = true;
-                        break;
-                    }
-                }
+            let g_u32 = slice_at(&vreg_to_global, vi, NONE_U32);
+            if g_u32 == NONE_U32 {
+                continue;
             }
+            let crosses_hot_block =
+                slice_at(&sparse_liveness.vreg_crosses_hot, to_idx(g_u32), false);
             if crosses_hot_block {
                 meta.is_cold_split = true;
                 stats.vregs_cold_split = stats.vregs_cold_split.saturating_add(1);
@@ -3079,6 +3487,9 @@ pub fn allocate_mfunc<'a>(
     // -------------------------------------------------------------------------
     // Phase 4: CSR Coalescing Graph, Multi-Hop Hint Propagation, & Linear Scan
     // -------------------------------------------------------------------------
+    if opts.fast_mode {
+        allocate_linear_scan_fast(&vreg_meta, max_half_pt, &pools, &mut alloc_loc, &mut spills, alloc)?;
+    } else {
     // Build deduplicated, non-overlapping CSR coalescing adjacency list (top `MAX_COPY_EDGES_PER_VREG`
     // partners per `VReg` sorted by descending weight).
     let mut write_e = 0usize;
@@ -3860,6 +4271,7 @@ pub fn allocate_mfunc<'a>(
             slice_set(&mut alloc_loc, vi, AllocLoc::Spill { off, size: sz });
         }
     }
+    }
 
     // Tally final per-`VReg` allocation stats accurately (after any retroactive evictions).
     for (vi, &loc) in alloc_loc.iter().enumerate() {
@@ -3911,7 +4323,7 @@ pub fn allocate_mfunc<'a>(
 
             if is_call_op(&op, fl) {
                 let orig_u32 = u32_of(orig).unwrap_or(0);
-                let clob = lookup_call_clobbers(opts.call_clobbers, orig_u32);
+                let clob = lookup_call_clobbers_sorted(call_clobbers_sorted, orig_u32);
                 transitive_call_clobbers = transitive_call_clobbers
                     .union(clob.clobbered)
                     .with(Reg(30));
@@ -4026,6 +4438,180 @@ pub fn allocate_mfunc<'a>(
         spill_bytes,
         stats,
     })
+}
+
+/// Fast single-pass `O(N + V)` bitmask linear-scan register allocator for [`super::EmitProfile::Fast`].
+///
+/// Uses convex-hull intervals `[first_start, last_end]` (a sound superset of multi-range liveness)
+/// so register availability is a single `u64` bitmask test with zero CSR copy-edge graphs, zero
+/// multi-hop hint propagation, zero `fixed_want` lookahead, and zero `pending_res` scans.
+fn allocate_linear_scan_fast<'a>(
+    vreg_meta: &[VRegMeta],
+    max_half_pt: usize,
+    pools: &RegPools,
+    alloc_loc: &mut [AllocLoc],
+    spills: &mut SpillSlots,
+    alloc: Alloc<'a>,
+) -> Result<(), MRaError> {
+    let mut bucket_counts: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(max_half_pt, alloc);
+    for _ in 0..max_half_pt {
+        bucket_counts.push(0);
+    }
+    let mut active_vreg_count = 0usize;
+    for meta in vreg_meta.iter() {
+        if meta.range_len > 0 {
+            let b = to_idx(meta.first_start).min(max_half_pt - 1);
+            if let Some(slot) = bucket_counts.get_mut(b) {
+                *slot = slot.saturating_add(1);
+            }
+            active_vreg_count += 1;
+        }
+    }
+    let mut prefix: u32 = 0;
+    for slot in bucket_counts.iter_mut() {
+        let c = *slot;
+        *slot = prefix;
+        prefix = prefix.saturating_add(c);
+    }
+    let mut sorted_vregs: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(active_vreg_count, alloc);
+    for _ in 0..active_vreg_count {
+        sorted_vregs.push(0);
+    }
+    for (vi, meta) in vreg_meta.iter().enumerate() {
+        if meta.range_len > 0 {
+            let b = to_idx(meta.first_start).min(max_half_pt - 1);
+            let pos = to_idx(slice_at(&bucket_counts, b, u32::MAX));
+            if let Some(slot) = bucket_counts.get_mut(b) {
+                *slot = slot.saturating_add(1);
+            }
+            slice_set(&mut sorted_vregs, pos, u32_of(vi).unwrap_or(0));
+        }
+    }
+
+    let mut active_vreg = [NONE_U32; 64];
+    let mut busy_mask: u64 = 0;
+
+    for &v_u32 in sorted_vregs.iter() {
+        let vi = to_idx(v_u32);
+        let Some(&meta) = vreg_meta.get(vi) else {
+            continue;
+        };
+        let cur_start = meta.first_start;
+
+        // Expire intervals whose convex hull ended strictly before `cur_start`.
+        let mut bm = busy_mask;
+        while bm != 0 {
+            let bit = to_idx(bm.trailing_zeros());
+            bm &= bm - 1;
+            let av = slice_at(&active_vreg, bit, NONE_U32);
+            if av != NONE_U32 && vreg_meta.get(to_idx(av)).is_some_and(|m| m.last_end < cur_start) {
+                slice_set(&mut active_vreg, bit, NONE_U32);
+                busy_mask &= !(1u64 << bit);
+            }
+        }
+
+        let bank_bit_base: u8 = match meta.bank {
+            RegBank::Gpr => 0,
+            RegBank::Fp => 32,
+        };
+        let unavailable = busy_mask | meta.forbidden_phys.0;
+
+        let mut chosen_hw: Option<u8> = None;
+        for &hw in pools.scratch_slice(meta.bank) {
+            let full_bit = bank_bit_base.saturating_add(hw);
+            if full_bit < 64 && (unavailable & (1u64 << full_bit)) == 0 {
+                chosen_hw = Some(hw);
+                break;
+            }
+        }
+        if chosen_hw.is_none() {
+            for &hw in pools.callee_slice(meta.bank) {
+                let full_bit = bank_bit_base.saturating_add(hw);
+                if full_bit < 64 && (unavailable & (1u64 << full_bit)) == 0 {
+                    chosen_hw = Some(hw);
+                    break;
+                }
+            }
+        }
+
+        if let Some(hw) = chosen_hw {
+            let full_bit = usize::from(bank_bit_base.saturating_add(hw));
+            let preg = match meta.bank {
+                RegBank::Gpr => PReg::Gpr(hw),
+                RegBank::Fp => PReg::V(hw),
+            };
+            slice_set(alloc_loc, vi, AllocLoc::Reg(preg));
+            slice_set(&mut active_vreg, full_bit, v_u32);
+            busy_mask |= 1u64 << full_bit;
+            continue;
+        }
+
+        // All allocatable non-forbidden registers in this bank are occupied.
+        if meta.is_remat {
+            slice_set(alloc_loc, vi, AllocLoc::Remat { def_inst: meta.def_inst });
+            continue;
+        }
+
+        // Poletto–Sarkar farthest-end eviction (preferring rematerializable occupants first).
+        let mut best_hw: Option<u8> = None;
+        let mut best_is_remat = false;
+        let mut best_end = meta.last_end;
+
+        let mut scan_evict = |pool: &[u8]| {
+            for &hw in pool {
+                let full_bit = bank_bit_base.saturating_add(hw);
+                if full_bit >= 64 || meta.forbidden_phys.contains(Reg(full_bit)) {
+                    continue;
+                }
+                let av = slice_at(&active_vreg, usize::from(full_bit), NONE_U32);
+                if av == NONE_U32 {
+                    continue;
+                }
+                let Some(&am) = vreg_meta.get(to_idx(av)) else {
+                    continue;
+                };
+                if am.is_remat {
+                    if !best_is_remat || am.last_end > best_end {
+                        best_is_remat = true;
+                        best_end = am.last_end;
+                        best_hw = Some(hw);
+                    }
+                } else if !best_is_remat && am.last_end > best_end {
+                    best_end = am.last_end;
+                    best_hw = Some(hw);
+                }
+            }
+        };
+        scan_evict(pools.scratch_slice(meta.bank));
+        scan_evict(pools.callee_slice(meta.bank));
+
+        if let Some(evict_hw) = best_hw {
+            let full_bit = usize::from(bank_bit_base.saturating_add(evict_hw));
+            let av = slice_at(&active_vreg, full_bit, NONE_U32);
+            if let Some(&am) = vreg_meta.get(to_idx(av)) {
+                if am.is_remat {
+                    slice_set(alloc_loc, to_idx(av), AllocLoc::Remat { def_inst: am.def_inst });
+                } else {
+                    let sz = am.spill_mem_size();
+                    let off = spills.alloc_slot(sz)?;
+                    slice_set(alloc_loc, to_idx(av), AllocLoc::Spill { off, size: sz });
+                }
+            }
+            let preg = match meta.bank {
+                RegBank::Gpr => PReg::Gpr(evict_hw),
+                RegBank::Fp => PReg::V(evict_hw),
+            };
+            slice_set(alloc_loc, vi, AllocLoc::Reg(preg));
+            slice_set(&mut active_vreg, full_bit, v_u32);
+            busy_mask |= 1u64 << full_bit;
+        } else {
+            let sz = meta.spill_mem_size();
+            let off = spills.alloc_slot(sz)?;
+            slice_set(alloc_loc, vi, AllocLoc::Spill { off, size: sz });
+        }
+    }
+
+    Ok(())
 }
 
 /// Records coalescing edges and physical-register hints from copy-like instructions (`Mov`,
@@ -6134,5 +6720,1107 @@ mod tests {
                 assert_eq!(f(n, base, cold_base), expected);
             }
         }
+    }
+
+    #[test]
+    fn ranges_overlap_matches_linear_oracle_across_asymmetric_shapes() {
+        fn oracle(a: &[(u32, u32)], b: &[(u32, u32)]) -> bool {
+            a.iter().any(|&(as_, ae)| b.iter().any(|&(bs, be)| as_ <= be && bs <= ae))
+        }
+        let long: std::vec::Vec<(u32, u32)> = (0..100).map(|i| (i * 10, i * 10 + 3)).collect();
+        let probes: [&[(u32, u32)]; 9] = [
+            &[],
+            &[(4, 9)],
+            &[(990, 990)],
+            &[(994, 1050)],
+            &[(4, 9), (14, 19), (994, 999)],
+            &[(4, 9), (503, 505), (994, 999)],
+            &[(0, 0), (10, 10)],
+            &[(3, 10)],
+            &[(5, 8), (15, 18), (25, 28), (35, 38), (45, 48), (55, 58)],
+        ];
+        for p in probes {
+            assert_eq!(super::ranges_overlap(p, &long), oracle(p, &long), "probe vs long: {p:?}");
+            assert_eq!(super::ranges_overlap(&long, p), oracle(&long, p), "long vs probe: {p:?}");
+            for q in probes {
+                assert_eq!(super::ranges_overlap(p, q), oracle(p, q), "probe vs probe: {p:?} vs {q:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mra_sparse_vreg_liveness_matches_dense_oracle_across_cfgs() {
+        use super::{
+            HOT_BLOCK_WEIGHT_MIN, MAX_DATAFLOW_ITERS, NONE_U32, RangeNode, block_raw_weight,
+            compute_sparse_vreg_liveness_with, range_list_add, range_list_shorten_def, slice_at,
+            slice_set, subslice, to_idx, u32_of, visit_op_defs, visit_op_uses,
+        };
+        use crate::sota::mfunc::MBlock;
+
+        fn dense_bitset_set(bits: &mut [u64], base: usize, id: u32) {
+            let idx = to_idx(id);
+            bits[base + (idx >> 6)] |= 1u64 << (idx & 63);
+        }
+        fn dense_bitset_test(bits: &[u64], base: usize, id: u32) -> bool {
+            let idx = to_idx(id);
+            (bits[base + (idx >> 6)] & (1u64 << (idx & 63))) != 0
+        }
+
+        /// Exact differential verification helper: compares `compute_sparse_vreg_liveness_with`
+        /// bit-for-bit against the reference dense bitset dataflow oracle on:
+        /// 1. `live_in(b, g)` for every block `b` and global VReg `g`,
+        /// 2. `live_out(b, g)` for every block `b` and global VReg `g`,
+        /// 3. `vreg_crosses_hot[g]` for every global VReg `g`,
+        /// 4. exact Wimmer–Franz `vreg_ranges[v]` for every VReg `v` (including holes & redefs).
+        fn assert_sparse_matches_dense_oracle(
+            name: &str,
+            func: &MFunc<'static>,
+            block_weights: &[u32],
+            alloc: Alloc<'static>,
+        ) {
+            let n_blocks = func.block_insts.len();
+            let n_vregs = func.vreg_class.len();
+
+            // Linearize blocks identically to Phase 1.
+            let mut block_lin_range: Vec<(u32, u32), Alloc<'static>> =
+                Vec::with_capacity_in(n_blocks, alloc);
+            let mut block_ord_pos: Vec<u32, Alloc<'static>> =
+                Vec::with_capacity_in(n_blocks, alloc);
+            for _ in 0..n_blocks {
+                block_lin_range.push((0, 0));
+                block_ord_pos.push(NONE_U32);
+            }
+            let mut lin_to_orig: Vec<u32, Alloc<'static>> =
+                Vec::with_capacity_in(func.ops.len(), alloc);
+            for (ord_pos, &blk) in func.block_order.iter().enumerate() {
+                let b = to_idx(blk.0);
+                slice_set(&mut block_ord_pos, b, u32_of(ord_pos).unwrap_or(NONE_U32));
+                let lin_s = u32_of(lin_to_orig.len()).expect("lin_s");
+                let (orig_s, orig_e) = slice_at(&func.block_insts, b, (0, 0));
+                for orig in to_idx(orig_s)..to_idx(orig_e) {
+                    lin_to_orig.push(u32_of(orig).expect("orig"));
+                }
+                let lin_e = u32_of(lin_to_orig.len()).expect("lin_e");
+                slice_set(&mut block_lin_range, b, (lin_s, lin_e));
+            }
+
+            // Collect upward uses & global defs identically to Phase 2.
+            let mut def_stamp: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(n_vregs, alloc);
+            let mut use_stamp: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(n_vregs, alloc);
+            let mut vreg_to_global: Vec<u32, Alloc<'static>> =
+                Vec::with_capacity_in(n_vregs, alloc);
+            for _ in 0..n_vregs {
+                def_stamp.push(0);
+                use_stamp.push(0);
+                vreg_to_global.push(NONE_U32);
+            }
+            let mut global_to_vreg: Vec<u32, Alloc<'static>> = Vec::new_in(alloc);
+            let mut upward_uses: Vec<(u32, u32), Alloc<'static>> = Vec::new_in(alloc);
+            for (ord_idx, &blk) in func.block_order.iter().enumerate() {
+                let b = to_idx(blk.0);
+                let stamp = u32_of(ord_idx + 1).expect("stamp");
+                let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
+                for p in to_idx(ls)..to_idx(le) {
+                    let orig = to_idx(slice_at(&lin_to_orig, p, 0));
+                    let op = &func.ops[orig];
+                    visit_op_uses(op, &func.copy_pairs, |r| {
+                        if let MReg::V(v) = r {
+                            let vi = to_idx(v.0);
+                            if vi < n_vregs && def_stamp[vi] != stamp && use_stamp[vi] != stamp {
+                                use_stamp[vi] = stamp;
+                                let g = match vreg_to_global[vi] {
+                                    NONE_U32 => {
+                                        let ng = u32_of(global_to_vreg.len()).expect("ng");
+                                        vreg_to_global[vi] = ng;
+                                        global_to_vreg.push(v.0);
+                                        ng
+                                    }
+                                    existing => existing,
+                                };
+                                upward_uses.push((g, blk.0));
+                            }
+                        }
+                    });
+                    visit_op_defs(op, &func.copy_pairs, |r| {
+                        if let MReg::V(v) = r {
+                            def_stamp[to_idx(v.0)] = stamp;
+                        }
+                    });
+                }
+            }
+            let mut global_defs: Vec<(u32, u32), Alloc<'static>> = Vec::new_in(alloc);
+            def_stamp.fill(0);
+            for (ord_idx, &blk) in func.block_order.iter().enumerate() {
+                let b = to_idx(blk.0);
+                let stamp = u32_of(ord_idx + 1).expect("stamp");
+                let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
+                for p in to_idx(ls)..to_idx(le) {
+                    let orig = to_idx(slice_at(&lin_to_orig, p, 0));
+                    let op = &func.ops[orig];
+                    visit_op_defs(op, &func.copy_pairs, |r| {
+                        if let MReg::V(v) = r {
+                            let vi = to_idx(v.0);
+                            let g = vreg_to_global[vi];
+                            if g != NONE_U32 && def_stamp[vi] != stamp {
+                                def_stamp[vi] = stamp;
+                                global_defs.push((g, blk.0));
+                            }
+                        }
+                    });
+                }
+            }
+
+            let mut block_is_hot: Vec<bool, Alloc<'static>> = Vec::new_in(alloc);
+            if !block_weights.is_empty() {
+                for _ in 0..n_blocks {
+                    block_is_hot.push(false);
+                }
+                for &blk in func.block_order.iter() {
+                    if block_raw_weight(block_weights, blk) >= HOT_BLOCK_WEIGHT_MIN {
+                        block_is_hot[to_idx(blk.0)] = true;
+                    }
+                }
+            }
+
+            // 1. Dense bitset fixed-point reference oracle.
+            let n_global = global_to_vreg.len();
+            let words_per_block = n_global.div_ceil(64);
+            let total_words = n_blocks * words_per_block;
+            let mut v_use = std::vec![0u64; total_words];
+            let mut v_def = std::vec![0u64; total_words];
+            let mut dense_live_in = std::vec![0u64; total_words];
+            let mut dense_live_out = std::vec![0u64; total_words];
+            if words_per_block > 0 {
+                for &(g, b_u32) in upward_uses.iter() {
+                    dense_bitset_set(&mut v_use, to_idx(b_u32) * words_per_block, g);
+                }
+                for &(g, b_u32) in global_defs.iter() {
+                    dense_bitset_set(&mut v_def, to_idx(b_u32) * words_per_block, g);
+                }
+                for _ in 0..MAX_DATAFLOW_ITERS {
+                    let mut changed = false;
+                    for &blk in func.block_order.iter().rev() {
+                        let b = to_idx(blk.0);
+                        let base = b * words_per_block;
+                        for w in 0..words_per_block {
+                            let mut new_out = 0u64;
+                            for &succ in func.block_succs(blk) {
+                                new_out |= dense_live_in[to_idx(succ.0) * words_per_block + w];
+                            }
+                            let idx = base + w;
+                            let new_in = v_use[idx] | (new_out & !v_def[idx]);
+                            if new_out != dense_live_out[idx] || new_in != dense_live_in[idx] {
+                                dense_live_out[idx] = new_out;
+                                dense_live_in[idx] = new_in;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if !changed {
+                        break;
+                    }
+                }
+            }
+
+            // 2. Run production sparse per-global-VReg backward CFG BFS and record every bit.
+            let mut sparse_live_in = std::vec![0u64; total_words];
+            let mut sparse_live_out = std::vec![0u64; total_words];
+            let sparse = compute_sparse_vreg_liveness_with(
+                func,
+                &block_lin_range,
+                &block_ord_pos,
+                &block_is_hot,
+                &global_to_vreg,
+                &upward_uses,
+                &global_defs,
+                alloc,
+                |g, b_u32, is_live_out| {
+                    let base = to_idx(b_u32) * words_per_block;
+                    if is_live_out {
+                        dense_bitset_set(&mut sparse_live_out, base, g);
+                    } else {
+                        dense_bitset_set(&mut sparse_live_in, base, g);
+                    }
+                },
+            )
+            .expect("sparse BFS must succeed");
+
+            // Assert exact bit-for-bit equality of `live_in` and `live_out`.
+            assert_eq!(sparse_live_in, dense_live_in, "{name}: live_in mismatch");
+            assert_eq!(sparse_live_out, dense_live_out, "{name}: live_out mismatch");
+
+            // Assert exact equality of `vreg_crosses_hot`.
+            if !block_is_hot.is_empty() {
+                for g in 0..n_global {
+                    let g_u32 = u32_of(g).expect("g");
+                    let mut dense_hot = false;
+                    for &blk in func.block_order.iter() {
+                        if block_raw_weight(block_weights, blk) >= HOT_BLOCK_WEIGHT_MIN {
+                            let base = to_idx(blk.0) * words_per_block;
+                            if dense_bitset_test(&dense_live_in, base, g_u32)
+                                || dense_bitset_test(&dense_live_out, base, g_u32)
+                            {
+                                dense_hot = true;
+                                break;
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        sparse.vreg_crosses_hot[g], dense_hot,
+                        "{name}: vreg_crosses_hot mismatch for g={g} (v={})",
+                        global_to_vreg[g]
+                    );
+                }
+            }
+
+            // 3. Assert exact Wimmer–Franz `vreg_ranges` equality (dense Phase 3 vs sparse Phase 3 + merge).
+            let mut dense_heads: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(n_vregs, alloc);
+            let mut sparse_heads: Vec<u32, Alloc<'static>> = Vec::with_capacity_in(n_vregs, alloc);
+            for _ in 0..n_vregs {
+                dense_heads.push(NONE_U32);
+                sparse_heads.push(NONE_U32);
+            }
+            let mut dense_nodes: Vec<RangeNode, Alloc<'static>> = Vec::new_in(alloc);
+            let mut sparse_nodes: Vec<RangeNode, Alloc<'static>> = Vec::new_in(alloc);
+            for &blk in func.block_order.iter().rev() {
+                let b = to_idx(blk.0);
+                let (ls, le) = slice_at(&block_lin_range, b, (0, 0));
+                if ls >= le {
+                    continue;
+                }
+                let blk_start_pt = ls * 2;
+                let blk_end_pt = (le - 1) * 2 + 1;
+                // Dense seeding
+                for w in 0..words_per_block {
+                    let mut bits = dense_live_out[b * words_per_block + w];
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros();
+                        bits &= bits - 1;
+                        let g_idx = (w << 6) + to_idx(tz);
+                        let v_u32 = global_to_vreg[g_idx];
+                        range_list_add(
+                            &mut dense_heads[to_idx(v_u32)],
+                            &mut dense_nodes,
+                            blk_start_pt,
+                            blk_end_pt,
+                        );
+                    }
+                }
+                // Sparse seeding (`def_and_live_out` only)
+                let dlo_s = to_idx(slice_at(&sparse.def_lo_off, b, 0));
+                let dlo_e = to_idx(slice_at(&sparse.def_lo_off, b + 1, 0));
+                for &v_u32 in subslice(&sparse.def_lo_vregs, dlo_s, dlo_e) {
+                    range_list_add(
+                        &mut sparse_heads[to_idx(v_u32)],
+                        &mut sparse_nodes,
+                        blk_start_pt,
+                        blk_end_pt,
+                    );
+                }
+                // Reverse intra-block instruction walk for both
+                let mut p = to_idx(le);
+                while p > to_idx(ls) {
+                    p -= 1;
+                    let orig = to_idx(lin_to_orig[p]);
+                    let op = &func.ops[orig];
+                    let use_pt = u32_of(p).expect("p") * 2;
+                    let def_pt = use_pt + 1;
+                    visit_op_defs(op, &func.copy_pairs, |r| {
+                        if let MReg::V(v) = r {
+                            range_list_shorten_def(
+                                &mut dense_heads[to_idx(v.0)],
+                                &mut dense_nodes,
+                                blk_start_pt,
+                                def_pt,
+                            );
+                            range_list_shorten_def(
+                                &mut sparse_heads[to_idx(v.0)],
+                                &mut sparse_nodes,
+                                blk_start_pt,
+                                def_pt,
+                            );
+                        }
+                    });
+                    visit_op_uses(op, &func.copy_pairs, |r| {
+                        if let MReg::V(v) = r {
+                            range_list_add(
+                                &mut dense_heads[to_idx(v.0)],
+                                &mut dense_nodes,
+                                blk_start_pt,
+                                use_pt,
+                            );
+                            range_list_add(
+                                &mut sparse_heads[to_idx(v.0)],
+                                &mut sparse_nodes,
+                                blk_start_pt,
+                                use_pt,
+                            );
+                        }
+                    });
+                }
+            }
+            for vi in 0..n_vregs {
+                let mut dense_vec = std::vec::Vec::new();
+                let mut cur = dense_heads[vi];
+                while cur != NONE_U32 {
+                    let n = dense_nodes[to_idx(cur)];
+                    dense_vec.push((n.start, n.end));
+                    cur = n.next;
+                }
+                let pt_slice = match vreg_to_global[vi] {
+                    NONE_U32 => &[],
+                    g => {
+                        let gi = to_idx(g);
+                        let ps = to_idx(slice_at(&sparse.pass_through_off, gi, 0));
+                        let pe = to_idx(slice_at(&sparse.pass_through_off, gi + 1, 0));
+                        subslice(&sparse.pass_through_ranges, ps, pe)
+                    }
+                };
+                let mut sparse_vec: std::vec::Vec<(u32, u32)> = std::vec::Vec::new();
+                let mut cur_a = sparse_heads[vi];
+                let mut pt_idx = 0usize;
+                while cur_a != NONE_U32 || pt_idx < pt_slice.len() {
+                    let na = (cur_a != NONE_U32).then(|| sparse_nodes[to_idx(cur_a)]);
+                    let nb = pt_slice.get(pt_idx).copied();
+                    let (s, e) = match (na, nb) {
+                        (Some(a), Some((bs, _be))) if a.start <= bs => {
+                            cur_a = a.next;
+                            (a.start, a.end)
+                        }
+                        (Some(_), Some((bs, be))) => {
+                            pt_idx += 1;
+                            (bs, be)
+                        }
+                        (Some(a), None) => {
+                            cur_a = a.next;
+                            (a.start, a.end)
+                        }
+                        (None, Some((bs, be))) => {
+                            pt_idx += 1;
+                            (bs, be)
+                        }
+                        (None, None) => break,
+                    };
+                    if let Some(last) = sparse_vec.last_mut()
+                        && s <= last.1.saturating_add(1)
+                    {
+                        last.1 = last.1.max(e);
+                    } else {
+                        sparse_vec.push((s, e));
+                    }
+                }
+                assert_eq!(sparse_vec, dense_vec, "{name}: live range mismatch for vreg {vi}");
+            }
+            let _ = MBlock(0);
+        }
+
+        let alloc = test_alloc();
+
+        // Case 1: Diamond + partial redef + same-block use-before-def + redef + trailing dead def.
+        {
+            let mut func = new_ssa(Os::MacOs);
+            let b0 = func.new_block(false);
+            let b1 = func.new_block(false);
+            let b2 = func.new_block(false);
+            let b3 = func.new_block(false);
+            let v_cond = func.alloc_vreg(VRegClass::Gpr64);
+            let v_x = func.alloc_vreg(VRegClass::Gpr64);
+            let v_y = func.alloc_vreg(VRegClass::Gpr64);
+            let v_local = func.alloc_vreg(VRegClass::Gpr64);
+            let v_res = func.alloc_vreg(VRegClass::Gpr64);
+
+            func.begin_block(b0);
+            func.push_parallel_copy(
+                &[
+                    (MReg::V(v_cond), MReg::p(PReg::X0)),
+                    (MReg::V(v_x), MReg::p(PReg::X1)),
+                    (MReg::V(v_y), MReg::p(PReg::X2)),
+                ],
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::Cbz { rt: MReg::V(v_cond), target: b2, wide: true },
+                MInstFlags::TERMINATOR,
+            );
+            func.end_block(b0);
+
+            // b1: use-before-def of v_x, then redef v_x, then use v_x into v_local, then dead redef of v_x!
+            func.begin_block(b1);
+            func.push_inst(
+                MOp::AddImm {
+                    dst: MReg::V(v_x),
+                    rn: MReg::V(v_x),
+                    imm12: 7,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::AddImm {
+                    dst: MReg::V(v_local),
+                    rn: MReg::V(v_x),
+                    imm12: 3,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::V(v_x),
+                    rn: MReg::V(v_local),
+                    rm: MReg::V(v_y),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::B { target: b3 }, MInstFlags::TERMINATOR);
+            func.end_block(b1);
+
+            // b2: pass-through for v_x, redefs v_y, plus a dead def of v_local at end before fallthrough.
+            func.begin_block(b2);
+            func.push_inst(
+                MOp::AddImm {
+                    dst: MReg::V(v_y),
+                    rn: MReg::V(v_y),
+                    imm12: 11,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::MovImm { dst: MReg::V(v_local), imm: 99, wide: true },
+                MInstFlags::NONE,
+            );
+            func.end_block(b2);
+
+            func.begin_block(b3);
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::V(v_res),
+                    rn: MReg::V(v_x),
+                    rm: MReg::V(v_y),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::V(v_res), wide: true },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+            func.end_block(b3);
+
+            func.rebuild_cfg(alloc);
+            assert_sparse_matches_dense_oracle("diamond_redef", &func, &[], alloc);
+            allocate_mfunc(&mut func, MRaOpts::default(), alloc).expect("diamond allocate");
+            assert_eq!(mverify(&func), Ok(()));
+        }
+
+        // Case 2: Nested loops + empty pass-through block + hot/cold weights + cold-exit value.
+        {
+            let mut func = new_ssa(Os::MacOs);
+            let b_entry = func.new_block(false);
+            let b_outer = func.new_block(true);
+            let b_empty_hot = func.new_block(false);
+            let b_inner = func.new_block(true);
+            let b_outer_latch = func.new_block(false);
+            let b_exit = func.new_block(false);
+
+            let v_n = func.alloc_vreg(VRegClass::Gpr64);
+            let v_m = func.alloc_vreg(VRegClass::Gpr64);
+            let v_cold = func.alloc_vreg(VRegClass::Gpr64);
+            let v_acc = func.alloc_vreg(VRegClass::Gpr64);
+            let v_i = func.alloc_vreg(VRegClass::Gpr64);
+            let v_j = func.alloc_vreg(VRegClass::Gpr64);
+
+            func.begin_block(b_entry);
+            func.push_parallel_copy(
+                &[
+                    (MReg::V(v_n), MReg::p(PReg::X0)),
+                    (MReg::V(v_m), MReg::p(PReg::X1)),
+                    (MReg::V(v_cold), MReg::p(PReg::X2)),
+                ],
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::MovImm { dst: MReg::V(v_acc), imm: 0, wide: true }, MInstFlags::NONE);
+            func.push_inst(MOp::Mov { dst: MReg::V(v_i), src: MReg::V(v_n), wide: true }, MInstFlags::NONE);
+            func.push_inst(MOp::Cbz { rt: MReg::V(v_i), target: b_exit, wide: true }, MInstFlags::TERMINATOR);
+            func.end_block(b_entry);
+
+            func.begin_block(b_outer);
+            func.push_inst(MOp::Mov { dst: MReg::V(v_j), src: MReg::V(v_m), wide: true }, MInstFlags::NONE);
+            func.end_block(b_outer);
+
+            // Empty hot pass-through block (0 insts, falls through to b_inner).
+            func.begin_block(b_empty_hot);
+            func.end_block(b_empty_hot);
+
+            func.begin_block(b_inner);
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::V(v_acc),
+                    rn: MReg::V(v_acc),
+                    rm: MReg::V(v_j),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::SubImm {
+                    dst: MReg::V(v_j),
+                    rn: MReg::V(v_j),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::Cbnz { rt: MReg::V(v_j), target: b_inner, wide: true }, MInstFlags::TERMINATOR);
+            func.end_block(b_inner);
+
+            func.begin_block(b_outer_latch);
+            func.push_inst(
+                MOp::SubImm {
+                    dst: MReg::V(v_i),
+                    rn: MReg::V(v_i),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::Cbnz { rt: MReg::V(v_i), target: b_outer, wide: true }, MInstFlags::TERMINATOR);
+            func.end_block(b_outer_latch);
+
+            func.begin_block(b_exit);
+            let v_out = func.alloc_vreg(VRegClass::Gpr64);
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::V(v_out),
+                    rn: MReg::V(v_acc),
+                    rm: MReg::V(v_cold),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::V(v_out), wide: true }, MInstFlags::NONE);
+            func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+            func.end_block(b_exit);
+
+            let weights = [2u32, 16, 32, 64, 16, 1];
+            func.rebuild_cfg(alloc);
+            assert_sparse_matches_dense_oracle("nested_loops_hot_cold", &func, &weights, alloc);
+            let out = allocate_mfunc(
+                &mut func,
+                MRaOpts { block_weights: &weights, ..MRaOpts::default() },
+                alloc,
+            )
+            .expect("nested loops allocate");
+            assert_eq!(out.stats.vregs_cold_split, 1, "v_cold must cold-split across hot nested loop");
+            assert_eq!(mverify(&func), Ok(()));
+        }
+
+        // Case 3: Irreducible two-entry loop (`entry -> A`, `entry -> B`, `A <-> B`, `A/B -> exit`)
+        // plus an unreachable block in `block_order` AND a detached block outside `block_order`.
+        {
+            let mut func = new_ssa(Os::MacOs);
+            let b_entry = func.new_block(false);
+            let b_a = func.new_block(false);
+            let b_b = func.new_block(false);
+            let b_exit = func.new_block(false);
+            let b_unreach_in_order = func.new_block(false);
+            let b_detached = func.new_block(false);
+
+            let v_sel = func.alloc_vreg(VRegClass::Gpr64);
+            let v_p = func.alloc_vreg(VRegClass::Gpr64);
+            let v_q = func.alloc_vreg(VRegClass::Gpr64);
+            let v_cnt = func.alloc_vreg(VRegClass::Gpr64);
+
+            func.begin_block(b_entry);
+            func.push_parallel_copy(
+                &[
+                    (MReg::V(v_sel), MReg::p(PReg::X0)),
+                    (MReg::V(v_p), MReg::p(PReg::X1)),
+                    (MReg::V(v_q), MReg::p(PReg::X2)),
+                    (MReg::V(v_cnt), MReg::p(PReg::X3)),
+                ],
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::Cbz { rt: MReg::V(v_sel), target: b_b, wide: true }, MInstFlags::TERMINATOR);
+            func.end_block(b_entry);
+
+            // A: uses v_p & v_q, redefs v_p, jumps to B or exit.
+            func.begin_block(b_a);
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::V(v_p),
+                    rn: MReg::V(v_p),
+                    rm: MReg::V(v_q),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::SubImm {
+                    dst: MReg::V(v_cnt),
+                    rn: MReg::V(v_cnt),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::Cbz { rt: MReg::V(v_cnt), target: b_exit, wide: true }, MInstFlags::TERMINATOR);
+            func.end_block(b_a);
+
+            // B: uses v_q & v_p, redefs v_q, branches back to A or falls through to exit.
+            func.begin_block(b_b);
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::V(v_q),
+                    rn: MReg::V(v_q),
+                    rm: MReg::V(v_p),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::SubImm {
+                    dst: MReg::V(v_cnt),
+                    rn: MReg::V(v_cnt),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::Cbnz { rt: MReg::V(v_cnt), target: b_a, wide: true }, MInstFlags::TERMINATOR);
+            func.end_block(b_b);
+
+            func.begin_block(b_exit);
+            let v_sum = func.alloc_vreg(VRegClass::Gpr64);
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::V(v_sum),
+                    rn: MReg::V(v_p),
+                    rm: MReg::V(v_q),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::V(v_sum), wide: true }, MInstFlags::NONE);
+            func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+            func.end_block(b_exit);
+
+            // Unreachable block still in `block_order` branching into `b_a`.
+            func.begin_block(b_unreach_in_order);
+            func.push_inst(
+                MOp::AddImm {
+                    dst: MReg::V(v_p),
+                    rn: MReg::V(v_p),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::B { target: b_a }, MInstFlags::TERMINATOR);
+            func.end_block(b_unreach_in_order);
+
+            // Detached block: has insts & an edge into `b_b`, then removed from `block_order`
+            // to verify `block_ord_pos[pb] == NONE_U32` filtering matches dense dataflow!
+            func.begin_block(b_detached);
+            func.push_inst(MOp::B { target: b_b }, MInstFlags::TERMINATOR);
+            func.end_block(b_detached);
+            func.block_order.pop();
+
+            let weights = [2u32, 32, 32, 1, 1, 64];
+            func.rebuild_cfg(alloc);
+            assert_sparse_matches_dense_oracle("irreducible_and_detached", &func, &weights, alloc);
+
+            // Restore `b_detached` in `block_order` so `mverify` accepts the full function for `allocate_mfunc`.
+            func.block_order.push(b_detached);
+            func.rebuild_cfg(alloc);
+            assert_sparse_matches_dense_oracle("irreducible_all_in_order", &func, &weights, alloc);
+            allocate_mfunc(
+                &mut func,
+                MRaOpts { block_weights: &weights, ..MRaOpts::default() },
+                alloc,
+            )
+            .expect("irreducible allocate");
+            assert_eq!(mverify(&func), Ok(()));
+        }
+
+        // Case 4: Single-block self-loop with use-before-def + multi-def + loop-invariant + local VReg.
+        {
+            let mut func = new_ssa(Os::MacOs);
+            let b_entry = func.new_block(false);
+            let b_loop = func.new_block(true);
+            let b_exit = func.new_block(false);
+
+            let v_inv = func.alloc_vreg(VRegClass::Gpr64);
+            let v_acc = func.alloc_vreg(VRegClass::Gpr64);
+            let v_cnt = func.alloc_vreg(VRegClass::Gpr64);
+            let v_tmp = func.alloc_vreg(VRegClass::Gpr64);
+
+            func.begin_block(b_entry);
+            func.push_parallel_copy(
+                &[
+                    (MReg::V(v_inv), MReg::p(PReg::X0)),
+                    (MReg::V(v_acc), MReg::p(PReg::X1)),
+                    (MReg::V(v_cnt), MReg::p(PReg::X2)),
+                ],
+                MInstFlags::NONE,
+            );
+            func.end_block(b_entry);
+
+            // Self-loop: reads v_acc & v_inv, writes v_tmp (block-local), redefs v_acc TWICE,
+            // decrements v_cnt, branches back to b_loop.
+            func.begin_block(b_loop);
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::V(v_tmp),
+                    rn: MReg::V(v_acc),
+                    rm: MReg::V(v_inv),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::AddImm {
+                    dst: MReg::V(v_acc),
+                    rn: MReg::V(v_tmp),
+                    imm12: 3,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::V(v_acc),
+                    rn: MReg::V(v_acc),
+                    rm: MReg::V(v_inv),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::SubImm {
+                    dst: MReg::V(v_cnt),
+                    rn: MReg::V(v_cnt),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.push_inst(
+                MOp::Cbnz { rt: MReg::V(v_cnt), target: b_loop, wide: true },
+                MInstFlags::TERMINATOR,
+            );
+            func.end_block(b_loop);
+
+            func.begin_block(b_exit);
+            func.push_inst(
+                MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::V(v_acc), wide: true },
+                MInstFlags::NONE,
+            );
+            func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+            func.end_block(b_exit);
+
+            let weights = [1u32, 64, 1];
+            func.rebuild_cfg(alloc);
+            assert_sparse_matches_dense_oracle("single_block_self_loop", &func, &weights, alloc);
+            allocate_mfunc(
+                &mut func,
+                MRaOpts { block_weights: &weights, ..MRaOpts::default() },
+                alloc,
+            )
+            .expect("self-loop allocate");
+            assert_eq!(mverify(&func), Ok(()));
+        }
+    }
+
+    #[test]
+    fn mra_mega_function_sparse_liveness_stays_within_tight_memory_budget() {
+        use core::alloc::{AllocError, Allocator, Layout};
+        use core::ptr::NonNull;
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        use blaze_own::Erased;
+        use blaze_own::testing::TestHeap;
+
+        /// Test allocator enforcing a hard live-byte ceiling and tracking exact peak live bytes.
+        struct BudgetAlloc {
+            live: AtomicUsize,
+            peak: AtomicUsize,
+            limit: AtomicUsize,
+        }
+        impl BudgetAlloc {
+            fn new(limit: usize) -> Self {
+                Self {
+                    live: AtomicUsize::new(0),
+                    peak: AtomicUsize::new(0),
+                    limit: AtomicUsize::new(limit),
+                }
+            }
+            fn live_bytes(&self) -> usize {
+                self.live.load(Ordering::Relaxed)
+            }
+            fn peak_bytes(&self) -> usize {
+                self.peak.load(Ordering::Relaxed)
+            }
+            fn reset_peak_and_set_limit(&self, new_limit: usize) {
+                let cur = self.live.load(Ordering::Relaxed);
+                self.peak.store(cur, Ordering::Relaxed);
+                self.limit.store(new_limit, Ordering::Relaxed);
+            }
+            fn reserve_bytes(&self, add: usize) -> Result<(), AllocError> {
+                let mut cur = self.live.load(Ordering::Relaxed);
+                loop {
+                    let next = cur.checked_add(add).ok_or(AllocError)?;
+                    if next > self.limit.load(Ordering::Relaxed) {
+                        return Err(AllocError);
+                    }
+                    match self.live.compare_exchange_weak(
+                        cur,
+                        next,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            let mut p = self.peak.load(Ordering::Relaxed);
+                            while next > p {
+                                match self.peak.compare_exchange_weak(
+                                    p,
+                                    next,
+                                    Ordering::AcqRel,
+                                    Ordering::Relaxed,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(actual) => p = actual,
+                                }
+                            }
+                            return Ok(());
+                        }
+                        Err(actual) => cur = actual,
+                    }
+                }
+            }
+            fn release_bytes(&self, sub: usize) {
+                self.live.fetch_sub(sub, Ordering::AcqRel);
+            }
+        }
+        // SAFETY: Delegates actual allocation to `TestHeap` while atomically tracking live bytes.
+        unsafe impl Allocator for BudgetAlloc {
+            fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+                self.reserve_bytes(layout.size())?;
+                match TestHeap.allocate(layout) {
+                    Ok(ptr) => Ok(ptr),
+                    Err(e) => {
+                        self.release_bytes(layout.size());
+                        Err(e)
+                    }
+                }
+            }
+            fn allocate_zeroed(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+                self.reserve_bytes(layout.size())?;
+                match TestHeap.allocate_zeroed(layout) {
+                    Ok(ptr) => Ok(ptr),
+                    Err(e) => {
+                        self.release_bytes(layout.size());
+                        Err(e)
+                    }
+                }
+            }
+            unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+                // SAFETY: Caller contract matches `TestHeap::deallocate`.
+                unsafe { TestHeap.deallocate(ptr, layout) };
+                self.release_bytes(layout.size());
+            }
+            unsafe fn grow(
+                &self,
+                ptr: NonNull<u8>,
+                old: Layout,
+                new: Layout,
+            ) -> Result<NonNull<[u8]>, AllocError> {
+                let delta = new.size().saturating_sub(old.size());
+                self.reserve_bytes(delta)?;
+                // SAFETY: Caller contract matches `TestHeap::grow`.
+                match unsafe { TestHeap.grow(ptr, old, new) } {
+                    Ok(p) => Ok(p),
+                    Err(e) => {
+                        self.release_bytes(delta);
+                        Err(e)
+                    }
+                }
+            }
+            unsafe fn grow_zeroed(
+                &self,
+                ptr: NonNull<u8>,
+                old: Layout,
+                new: Layout,
+            ) -> Result<NonNull<[u8]>, AllocError> {
+                let delta = new.size().saturating_sub(old.size());
+                self.reserve_bytes(delta)?;
+                // SAFETY: Caller contract matches `TestHeap::grow_zeroed`.
+                match unsafe { TestHeap.grow_zeroed(ptr, old, new) } {
+                    Ok(p) => Ok(p),
+                    Err(e) => {
+                        self.release_bytes(delta);
+                        Err(e)
+                    }
+                }
+            }
+            unsafe fn shrink(
+                &self,
+                ptr: NonNull<u8>,
+                old: Layout,
+                new: Layout,
+            ) -> Result<NonNull<[u8]>, AllocError> {
+                // SAFETY: Caller contract matches `TestHeap::shrink`.
+                let res = unsafe { TestHeap.shrink(ptr, old, new) };
+                if res.is_ok() {
+                    self.release_bytes(old.size().saturating_sub(new.size()));
+                }
+                res
+            }
+        }
+
+        // 16,384 blocks x 16,384 cross-block global VRegs:
+        // 4 dense bitsets (`v_use`, `v_def`, `v_live_in`, `v_live_out`) would require:
+        //   4 * 16_384 * (16_384 / 64) * 8 bytes = 128 MiB!
+        // Plus one global accumulator `v_long` live across ALL 16,384 blocks!
+        const N_BLOCKS: usize = 16_384;
+        const DENSE_BITSET_BYTES: usize = 4 * N_BLOCKS * (N_BLOCKS / 64) * 8;
+        const TIGHT_MRA_BUDGET_BYTES: usize = 12 * 1024 * 1024; // 12 MiB (< 1/10 of 128 MiB!)
+        assert_eq!(DENSE_BITSET_BYTES, 128 * 1024 * 1024);
+
+        let budget = Erased::new(BudgetAlloc::new(usize::MAX));
+        let alloc = budget.handle();
+        let mut func = MFunc::new(MFuncOpts {
+            os: Os::MacOs,
+            is_ssa: true,
+            ret_live_gprs: DEFAULT_RET_LIVE_GPRS,
+            alloc,
+        });
+
+        let mut blocks: Vec<crate::sota::mfunc::MBlock, Alloc<'_>> =
+            Vec::with_capacity_in(N_BLOCKS, alloc);
+        for _ in 0..N_BLOCKS {
+            blocks.push(func.new_block(false));
+        }
+        let v_long = func.alloc_vreg(VRegClass::Gpr64);
+        let mut chain_vregs: Vec<VReg, Alloc<'_>> = Vec::with_capacity_in(N_BLOCKS, alloc);
+        for _ in 0..N_BLOCKS {
+            chain_vregs.push(func.alloc_vreg(VRegClass::Gpr64));
+        }
+
+        // Block 0: defines `v_long` and `chain_vregs[0]`.
+        func.begin_block(blocks[0]);
+        func.push_parallel_copy(
+            &[
+                (MReg::V(v_long), MReg::p(PReg::X0)),
+                (MReg::V(chain_vregs[0]), MReg::p(PReg::X1)),
+            ],
+            MInstFlags::NONE,
+        );
+        func.end_block(blocks[0]);
+
+        // Blocks 1..N_BLOCKS-1: each block uses `chain_vregs[i - 1]` (making it upward-exposed /
+        // global!) and defines `chain_vregs[i]`. `v_long` passes through all 16,384 blocks.
+        for i in 1..(N_BLOCKS - 1) {
+            func.begin_block(blocks[i]);
+            func.push_inst(
+                MOp::AddImm {
+                    dst: MReg::V(chain_vregs[i]),
+                    rn: MReg::V(chain_vregs[i - 1]),
+                    imm12: 1,
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            func.end_block(blocks[i]);
+        }
+
+        // Final block: consumes both `chain_vregs[N_BLOCKS - 2]` and `v_long` (so all 16,384
+        // VRegs are genuinely upward-exposed cross-block globals!).
+        let last = N_BLOCKS - 1;
+        func.begin_block(blocks[last]);
+        func.push_inst(
+            MOp::AddReg {
+                dst: MReg::V(chain_vregs[last]),
+                rn: MReg::V(chain_vregs[last - 1]),
+                rm: MReg::V(v_long),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::Mov { dst: MReg::p(PReg::X0), src: MReg::V(chain_vregs[last]), wide: true },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(blocks[last]);
+        func.rebuild_cfg(alloc);
+
+        // Lock in a tight 24 MiB headroom ceiling above `func`'s own baseline live bytes.
+        let baseline_live = budget.inner().live_bytes();
+        budget
+            .inner()
+            .reset_peak_and_set_limit(baseline_live + TIGHT_MRA_BUDGET_BYTES);
+
+        let t0 = std::time::Instant::now();
+        let out = allocate_mfunc(&mut func, MRaOpts::default(), alloc)
+            .expect("16384x16384 mega-function must allocate cleanly under tight 24 MiB budget");
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let peak_delta = budget.inner().peak_bytes().saturating_sub(baseline_live);
+
+        assert!(!func.is_ssa);
+        assert_eq!(out.stats.spill_slots_used, 0);
+        assert_eq!(mverify(&func), Ok(()));
+        assert!(
+            peak_delta <= TIGHT_MRA_BUDGET_BYTES,
+            "peak MRA allocation delta ({peak_delta} bytes) exceeded budget ({TIGHT_MRA_BUDGET_BYTES} bytes); dense bitsets alone would be {DENSE_BITSET_BYTES} bytes"
+        );
+        std::eprintln!(
+            "mega-function 16384x16384: peak_delta={:.2} MiB (dense bitsets would be 128.00 MiB), elapsed={elapsed_ms:.1} ms",
+            peak_delta as f64 / (1024.0 * 1024.0)
+        );
     }
 }

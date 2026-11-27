@@ -185,9 +185,7 @@ impl<'h> LazyVerifyingMaker<'_, 'h> {
     fn ensure_maker(&mut self) -> Result<&mut RunMaker<'h>, LadderRunError> {
         let want = MakerKind::of(self.entry, self.start);
         let maker = self.maker.get_or_insert_with(|| {
-            let mut maker = Maker::of_start(self.names, self.entry, self.start, ByKind::new(self.typed.over(self.ids)), self.builder, self.tables);
-            maker.watch(self.make_watch);
-            maker
+            Maker::of_start(self.names, self.entry, self.start, ByKind::new(self.typed.over(self.ids)), self.builder, Some(self.make_watch), self.tables)
         });
         if maker.made_for() != want
             || (matches!(self.start, MakerStart::Direct(_)) && !maker.set_direct_entry(self.entry, self.start))
@@ -296,6 +294,52 @@ impl LocalEnclosers {
     pub(crate) fn enclosers(&self) -> &[ItemKey] {
         self.items.get(..self.len).unwrap_or(&[])
     }
+}
+
+/// Collects any body-local keys (`LibKey::INNER` set) in `key` or the encoded generic
+/// arguments of `row`, together with their outermost-first same-crate declarer chain from
+/// `Walk::declarer` (fast-path returns empty in ~20 ns when no key is local).
+pub(crate) fn local_enclosers_of(walk: &Walk<'_>, row: usize, key: ItemKey) -> LocalEnclosers {
+    let mut out = LocalEnclosers::default();
+    let mut push_local = |k: ItemKey| {
+        if blaze_ladder::front2::program::lazy::typed::is_local(k)
+            && !out.locals().contains(&k)
+            && let Some(slot) = out.locals.get_mut(out.locals_len)
+        {
+            *slot = k;
+            out.locals_len += 1;
+        }
+    };
+    push_local(key);
+    let name = walk.name(row);
+    if !name.is_empty() {
+        let _ = blaze_ladder::body_ids::each_item(name, |k| push_local(k));
+    }
+    if out.locals_len == 0 {
+        return out;
+    }
+    let mut cur = row;
+    let mut hops = 0usize;
+    while let Some(parent) = walk.declarer(cur) {
+        hops += 1;
+        if hops > MAX_LOCAL_ENCLOSERS * 2 || out.len >= MAX_LOCAL_ENCLOSERS {
+            break;
+        }
+        let tabled = walk.tabled(parent);
+        let prefix = tabled.0 >> 64;
+        if out.locals().iter().any(|l| (l.0 >> 64) == prefix && *l != tabled)
+            && !out.enclosers().contains(&tabled)
+            && let Some(slot) = out.items.get_mut(out.len)
+        {
+            *slot = tabled;
+            out.len += 1;
+        }
+        cur = parent;
+    }
+    if let Some(slice) = out.items.get_mut(..out.len) {
+        slice.reverse();
+    }
+    out
 }
 
 /// In-flight pooled build for one `Walk` row currently in `How::Making`.
@@ -767,7 +811,7 @@ impl<'h> SuiteCache<'h> {
                         match t.space {
                             Space::Func => declares.push(Symbol(t.symbol.0)),
                             Space::Static | Space::Vtable | Space::Tls => named.push(Symbol(t.symbol.0)),
-                            Space::Outside => {}
+                            Space::Outside | Space::WeakOutside => {}
                         }
                     }
                 }
@@ -937,46 +981,7 @@ impl<'h> SuiteCache<'h> {
     /// arguments of `row`, together with their outermost-first same-crate declarer chain from
     /// `Walk::declarer` (fast-path returns empty in ~20 ns when no key is local).
     fn local_enclosers(&self, row: usize, key: ItemKey) -> LocalEnclosers {
-        let mut out = LocalEnclosers::default();
-        let mut push_local = |k: ItemKey| {
-            if blaze_ladder::front2::program::lazy::typed::is_local(k)
-                && !out.locals().contains(&k)
-                && let Some(slot) = out.locals.get_mut(out.locals_len)
-            {
-                *slot = k;
-                out.locals_len += 1;
-            }
-        };
-        push_local(key);
-        let name = self.walk.name(row);
-        if !name.is_empty() {
-            let _ = blaze_ladder::body_ids::each_item(name, |k| push_local(k));
-        }
-        if out.locals_len == 0 {
-            return out;
-        }
-        let mut cur = row;
-        let mut hops = 0usize;
-        while let Some(parent) = self.walk.declarer(cur) {
-            hops += 1;
-            if hops > MAX_LOCAL_ENCLOSERS * 2 || out.len >= MAX_LOCAL_ENCLOSERS {
-                break;
-            }
-            let tabled = self.walk.tabled(parent);
-            let prefix = tabled.0 >> 64;
-            if out.locals().iter().any(|l| (l.0 >> 64) == prefix && *l != tabled)
-                && !out.enclosers().contains(&tabled)
-                && let Some(slot) = out.items.get_mut(out.len)
-            {
-                *slot = tabled;
-                out.len += 1;
-            }
-            cur = parent;
-        }
-        if let Some(slice) = out.items.get_mut(..out.len) {
-            slice.reverse();
-        }
-        out
+        local_enclosers_of(&self.walk, row, key)
     }
 
     /// Builds a `CodePool` [`Job`] for `need`, copying the row's instance name into `alloc`.

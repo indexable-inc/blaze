@@ -368,7 +368,7 @@ pub fn entry_variant_planted<A: Allocator + Copy>(
         return Err(LoopEntryError::TooLarge);
     }
     if cfg!(debug_assertions) {
-        verify(func.view()).map_err(LoopEntryError::Output)?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(LoopEntryError::Output)?;
     }
     Ok(func)
 }

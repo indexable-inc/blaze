@@ -378,13 +378,27 @@ impl<'a> Terms<'a> {
         let (Some(x), Some(y)) = (self.node(a)?.arg(), self.node(b)?.arg()) else {
             return Err(sort(a.0, Met::List));
         };
+        let snap = self.cx.snapshot();
         let got = match how {
             Relate::Lazy => self.cx.eq(x, y, &mut AllInvariant),
             Relate::Structural => self.cx.unify_structurally(x, y, &mut AllInvariant),
         };
+        let region_conflict = got.is_ok()
+            && self.cx.outlives().iter().any(|o| {
+                matches!(
+                    (self.cx.tys.region_kind(o.longer), self.cx.tys.region_kind(o.shorter)),
+                    (RegionKind::Placeholder(..), RegionKind::Static)
+                )
+            });
         self.goals.clear();
         self.cx.take_goals(&mut self.goals);
         self.cx.clear_outlives();
+        if region_conflict {
+            self.goals.clear();
+            self.cx.rollback_to(snap);
+            return Ok(false);
+        }
+        self.cx.commit(snap);
         match got {
             Ok(_) => {
                 for &g in self.goals.iter() {
@@ -416,10 +430,10 @@ impl<'a> blaze_solve::Tys for Terms<'a> {
         if let Some(r) = n.as_region() {
             return match self.cx.tys.region_kind(r) {
                 RegionKind::EarlyParam(i) => K::ReParam(i),
-                RegionKind::Bound(d, v) => K::Bound(d, v),
+                RegionKind::Bound(d, v) => K::ReBound(d, v),
                 RegionKind::Static => K::ReStatic,
                 RegionKind::Var(v) => svar(VarKind::Region, v),
-                RegionKind::Placeholder(u, v) => K::Placeholder(u.0, v),
+                RegionKind::Placeholder(u, v) => K::RePlaceholder(u.0, v),
                 // Regions are erased in the solver (solve.md, "Not ported").
                 RegionKind::LateParam(..) | RegionKind::Erased => K::ReErased,
                 RegionKind::Error => K::Error,
@@ -621,6 +635,13 @@ impl<'a> blaze_solve::Tys for Terms<'a> {
             K::ReStatic => Region::STATIC.node(),
             K::ReErased => Region::ERASED.node(),
             K::ReParam(i) => self.cx.tys.re_early_param(i).node(),
+            K::ReBound(d, v) => self.cx.tys.re_bound(d, v).node(),
+            K::RePlaceholder(u, v) => {
+                while self.cx.vars.universe().0 < u {
+                    self.cx.vars.create_next_universe();
+                }
+                self.cx.tys.re_placeholder(Universe(u), v).node()
+            }
             K::ConstValue(s::ValTy::Enum(d), v) => {
                 let adt = self.bdef(d);
                 let t = self.cx.tys.adt(adt, List::EMPTY);

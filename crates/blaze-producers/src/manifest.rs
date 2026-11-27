@@ -52,8 +52,12 @@ pub(crate) struct Member<'a> {
     pub name: Text<'a>,
     /// `[package.metadata.blaze] producer`: a bit per [`Row::index`].
     pub producer: u8,
-    /// Each dependency, and whether it is `optional = true`.
-    pub deps: Vec<(Dep<'a>, bool), Alloc<'a>>,
+    /// `[package.metadata.blaze.producer-exclude]`: direct dependency keys explicitly excluded
+    /// from one producer row's closure (e.g. `blaze-ladder` excludes `blaze-export` from
+    /// `code-builder` because `CodeRecord` emission never calls `blaze-export`).
+    pub excludes: Vec<(Row, Text<'a>), Alloc<'a>>,
+    /// Each dependency's manifest key, target, and whether it is `optional = true`.
+    pub deps: Vec<(Text<'a>, Dep<'a>, bool), Alloc<'a>>,
 }
 
 const VALUE_DOMAIN: &str = "blaze producers manifest value 1";
@@ -144,6 +148,7 @@ pub(crate) fn member<'a>(dir: &str, path: &str, source: &str, alloc: Alloc<'a>) 
     };
     let blaze = root.get("package").and_then(|p| p.get("metadata")).and_then(|m| m.get("blaze"));
     let producer = rows(path, blaze.and_then(|b| b.get("producer")), alloc)?;
+    let excludes = row_excludes(path, blaze.and_then(|b| b.get("producer-exclude")), alloc)?;
     // A crate's own files without its closure cover less than the code its producing function
     // runs (rule 21): the list is refused by name, never read as a narrower row.
     if blaze.and_then(|b| b.get("producer-own")).is_some() {
@@ -193,10 +198,51 @@ pub(crate) fn member<'a>(dir: &str, path: &str, source: &str, alloc: Alloc<'a>) 
             };
             // An optional dependency no feature turns on is in no lock: the plan tells it apart.
             let optional = entry.kind() == Kind::Table && entry.get("optional").and_then(|o| o.as_bool()) == Some(true);
-            deps.push((dep, optional));
+            deps.push((text(key, alloc), dep, optional));
         }
     }
-    Ok(Member { name: text(name, alloc), producer, deps })
+    // Every excluded dependency key must match an actual declared dependency of this crate so a
+    // typo or stale exclude is refused immediately (Rule 3, Rule 21).
+    for (_, dep_key) in excludes.iter() {
+        if !deps.iter().any(|(k, _, _)| k.as_str() == dep_key.as_str()) {
+            return Err(Refused::UnknownExclude { path: text(path, alloc), dep: dep_key.clone() });
+        }
+    }
+    Ok(Member { name: text(name, alloc), producer, excludes, deps })
+}
+
+/// `[package.metadata.blaze.producer-exclude]` as `(row, dep_key)` pairs; unknown row names or
+/// `whole` are refused by name.
+fn row_excludes<'a>(
+    path: &str,
+    item: Option<Item<'_, '_, Alloc<'a>>>,
+    alloc: Alloc<'a>,
+) -> Result<Vec<(Row, Text<'a>), Alloc<'a>>, Refused<'a>> {
+    let mut out = Vec::new_in(alloc);
+    let Some(table) = item else { return Ok(out) };
+    if table.kind() != Kind::Table {
+        return Err(Refused::Shape {
+            path: text(path, alloc),
+            what: "`[package.metadata.blaze.producer-exclude]` as a table of row -> dep arrays",
+        });
+    }
+    for entry in table.children() {
+        let row_name = entry.key();
+        let row = match Row::named(row_name) {
+            Some(row) if row != Row::Whole => row,
+            _ => return Err(Refused::UnknownRow { path: text(path, alloc), name: text(row_name, alloc) }),
+        };
+        let dep_keys = strings(
+            path,
+            Some(entry),
+            "`[package.metadata.blaze.producer-exclude]` values as arrays of dependency keys",
+            alloc,
+        )?;
+        for dep_key in dep_keys {
+            out.push((row, dep_key));
+        }
+    }
+    Ok(out)
 }
 
 /// A `producer` list as row bits; a name that is no row, or `whole` (which

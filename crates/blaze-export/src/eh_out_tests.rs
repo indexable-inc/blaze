@@ -272,7 +272,13 @@ fn read_back(laid: &Laid<'_, '_>, eh: &EhSections<'_>) -> AVec<'static, FdeRead>
     let (main_at, main_len) = home(laid, "main");
     let (thrower_at, thrower_len) = home(laid, "thrower");
     let (personality_at, _) = home(laid, "personality");
-    assert_eq!(fdes.len(), 2, "one FDE per function with a frame (personality has none)");
+    let expected_fdes = match eh.platform {
+        // Mach-O encodes non-landing frames directly as COMPACT_FRAME in __unwind_info, so
+        // only landing functions (`main`) need an FDE in __eh_frame.
+        Platform::MacosArm64 => 1,
+        Platform::LinuxArm64 | Platform::Wasm64 => 2,
+    };
+    assert_eq!(fdes.len(), expected_fdes, "expected FDEs for platform {:?}", eh.platform);
     assert_eq!(eh.functions, 2);
     let main = fdes.iter().find(|f| f.pc_begin == main_at).expect("an FDE covers main");
     assert_eq!(main.pc_range, main_len);
@@ -282,8 +288,10 @@ fn read_back(laid: &Laid<'_, '_>, eh: &EhSections<'_>) -> AVec<'static, FdeRead>
     assert!(lsda >= eh.except_tab_at && lsda < except_end, "the LSDA pointer points into except_tab");
     let rows = read_lsda(&eh.except_tab, (lsda - eh.except_tab_at) as usize);
     assert_eq!(&rows[..], &[(MAIN_ROW.start, MAIN_ROW.len, MAIN_ROW.landing, 0)], "the call site equals main's cleanup row");
-    let thrower = fdes.iter().find(|f| f.pc_begin == thrower_at).expect("an FDE covers thrower");
-    assert_eq!((thrower.pc_range, thrower.personality, thrower.lsda), (thrower_len, None, None));
+    if eh.platform != Platform::MacosArm64 {
+        let thrower = fdes.iter().find(|f| f.pc_begin == thrower_at).expect("an FDE covers thrower");
+        assert_eq!((thrower.pc_range, thrower.personality, thrower.lsda), (thrower_len, None, None));
+    }
     fdes
 }
 

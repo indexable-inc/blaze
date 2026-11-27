@@ -84,6 +84,10 @@ pub struct Shown<'f> {
     /// item or a body not checked) drawn one by one, as well as counted under its cause. Off,
     /// they are counted and grouped only, and never placed in their files.
     pub each: bool,
+    /// `--verbose` / `-v`: print verbose diagnostic notes (such as per-file `no unit checks this
+    /// file` plan notes for cfg-excluded modules). Off by default so normal cfg-gated files stay
+    /// quiet while still recorded in the profile.
+    pub verbose: bool,
     /// The items not checked because a task failed (not_checked/waited.rs), as the lines under
     /// the failures counted them, and how many failures' lines counted any: the summary line
     /// counts them beside the items not checked for their own causes (main.rs `close`), so it
@@ -113,6 +117,7 @@ impl<'f> Shown<'f> {
             not_run: Vec::new_in(frame),
             lints: blaze_lint::Step::Rust,
             each: false,
+            verbose: false,
             behind: crate::not_checked::Behind::default(),
         }
     }
@@ -144,7 +149,7 @@ impl<'f> Shown<'f> {
             h.part(self.root.as_bytes());
         }
         h.part(self.lints.name().as_bytes())
-            .update(&[self.view as u8, self.each as u8, self.quiet as u8, caps.form as u8,
+            .update(&[self.view as u8, self.each as u8, self.verbose as u8, self.quiet as u8, caps.form as u8,
                 caps.colour as u8, caps.curly as u8, caps.underline_colour as u8,
                 caps.hyperlinks as u8, caps.unicode as u8, caps.background as u8])
             .update(&caps.width.to_le_bytes()).finish()

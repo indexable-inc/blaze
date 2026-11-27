@@ -16,6 +16,12 @@ repository.workspace = true
 [package.metadata.blaze]
 producer = ["body-checker", "code-builder"]
 
+[package.metadata.blaze.producer-exclude]
+# `blaze-ladder` depends on `blaze-export` only for `natives.rs` (`Kind::Native`, keyed by
+# `Row::Whole`) and `run/wasm64.rs` (`MacroModule`), never for `CodeRecord` emission
+# (`code_records.rs`, `run/make_one.rs`). Guarded by `code_builder_never_calls_blaze_export`.
+code-builder = ["blaze-export"]
+
 [lib]
 doctest = false
 
@@ -119,6 +125,8 @@ blaze-sim.workspace = true
 blaze-std.workspace = true
 # tests/front2_borrows.rs: `blaze_own::testing::heap()`, the test's root allocator.
 blaze-own = { workspace = true, features = ["std", "testing"] }
+# tests/per_fn_bump_frame_allocs.rs: per-function Global heap allocation budget proof.
+blaze-alloc-count.workspace = true
 # tests/toolchain_store/mod.rs: the `names` producer's digest in the prepared std world's key.
 blaze-producers.workspace = true
 

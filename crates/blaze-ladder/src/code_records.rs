@@ -87,7 +87,9 @@ pub mod statics;
 /// distinct type once), never form 1's trees: an entry of 7 is refused by its form, never
 /// listed by `body_ids::each_item` as a forest.
 /// 9: a static's entry carries the datum of each vtable its datum names (`statics`).
-pub const ENTRY_FORM: u32 = 9;
+/// 10: call targets and vtable entries canonicalize polymorphizable generic instances via
+/// `front2::poly_canon`, guarded by `ReadKind::PolyBodyText`.
+pub const ENTRY_FORM: u32 = 10;
 
 /// One vtable a code record names, as the entry carries it (run.md, "Statics in the run": a
 /// vtable is data the child places before the record, as a static's datum is): its symbol
@@ -355,6 +357,15 @@ pub enum Callee<'n> {
     C(&'n str),
 }
 
+/// One foreign (`extern`) static referenced by a function: its item key, its C symbol name, and
+/// whether it carries `#[linkage = "extern_weak"]` (resolves to null when undefined).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ForeignStatic<'n> {
+    pub item: ItemKey,
+    pub name: &'n str,
+    pub weak: bool,
+}
+
 /// The names of what one built instance references, by reference place (blaze-build's
 /// `Built::refs`, `statics`, `vtables`, `thread_locals`): `blaze_emit::Names` over the run's
 /// tables, replacing `Target::Slot` and the `via` table.
@@ -364,10 +375,10 @@ pub struct InstanceNames<'n> {
     /// declared by the entry, so the run's parent can send it before the record.
     pub statics: &'n [ItemKey],
     /// The statics among `statics` an `extern` block declares, each with its C symbol (its
-    /// `#[link_name]`, else its name): its place is that symbol (bound as a foreign fn is,
-    /// blaze-emit record.rs `target_of`), and the entry does not declare it, since it has no
-    /// record of its own (the Reference, "External blocks", "Statics": no initializer).
-    pub c_statics: &'n [(ItemKey, &'n str)],
+    /// `#[link_name]`, else its name) and weak flag: its place is that symbol (bound as a foreign
+    /// fn is, blaze-emit record.rs `target_of`), and the entry does not declare it, since it has
+    /// no record of its own (the Reference, "External blocks", "Statics": no initializer).
+    pub c_statics: &'n [ForeignStatic<'n>],
     pub vtables: &'n [Symbol],
     /// The thread-locals, by item key: each is named by its symbol (symbols.rs `tls_symbol`)
     /// and declared by the entry, so the run's parent can send its template before the record.
@@ -382,8 +393,9 @@ impl Names for InstanceNames<'_> {
                 Callee::Symbol(symbol) => Named::Symbol(symbol),
                 Callee::C(name) => Named::C(name),
             }),
-            Outside::Static(place) => self.statics.get(at(place)).map(|&s| match self.c_statics.iter().find(|(k, _)| *k == s) {
-                Some(&(_, c)) => Named::C(c),
+            Outside::Static(place) => self.statics.get(at(place)).map(|&s| match self.c_statics.iter().find(|cs| cs.item == s) {
+                Some(cs) if cs.weak => Named::WeakC(cs.name),
+                Some(cs) => Named::C(cs.name),
                 None => Named::Symbol(static_symbol(s)),
             }),
             Outside::Vtable(place) => self.vtables.get(at(place)).map(|&s| Named::Symbol(s)),
@@ -511,7 +523,7 @@ pub fn make_entry<'a, 'd>(
     isa: Isa,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
-    make_entry_reading(func, names, routines, declared, &ReadList::empty(), isa, alloc)
+    make_entry_reading(func, names, routines, declared, &ReadList::empty(alloc), isa, alloc)
 }
 
 /// [`make_entry`] with the build's read list `reads` ([`reads::ReadLog::seal`]).
@@ -520,7 +532,7 @@ pub fn make_entry_reading<'a, 'd>(
     names: &InstanceNames<'_>,
     routines: crate::front2::builtins_shim::Routines<'d>,
     declared: &mut AVec<'_, Declared<'d>>,
-    reads: &ReadList,
+    reads: &ReadList<'_>,
     isa: Isa,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
@@ -540,7 +552,7 @@ pub fn make_entry_with_vtables<'a, 'd>(
     vtables: &mut AVec<'_, VtableDatum<'_>>,
     routines: crate::front2::builtins_shim::Routines<'d>,
     declared: &mut AVec<'_, Declared<'d>>,
-    reads: &ReadList,
+    reads: &ReadList<'_>,
     traps: &[TrapSource],
     isa: Isa,
     alloc: Alloc<'a>,
@@ -573,7 +585,7 @@ pub fn make_entry_with_vtables<'a, 'd>(
     }
     // A foreign static has no entry to send (its place is its C symbol): not declared.
     let mut own: AVec<'_, ItemKey> = Vec::with_capacity_in(names.statics.len(), alloc);
-    own.extend(names.statics.iter().copied().filter(|s| !names.c_statics.iter().any(|(k, _)| k == s)));
+    own.extend(names.statics.iter().copied().filter(|s| !names.c_statics.iter().any(|cs| cs.item == *s)));
     put_statics(&own, &mut out, alloc).map_err(|what| CodeRecordError::Seal(RecordError::TooLarge { what }))?;
     // Form 5: the thread-locals, in the same keys form (each one's template is sent before the
     // record, as a static is).
@@ -1174,7 +1186,7 @@ pub fn instance_declares(
             d.instance(row.tabled, row.name).map_err(large)?;
         }
     }
-    for &s in names.statics.iter().filter(|s| !names.c_statics.iter().any(|(k, _)| k == *s)) {
+    for &s in names.statics.iter().filter(|s| !names.c_statics.iter().any(|cs| cs.item == **s)) {
         d.static_item(s).map_err(large)?;
     }
     let mut trees: AVec<'_, u8> = Vec::new_in(alloc);

@@ -29,8 +29,8 @@
 //!
 //! The literal-word form refuses all of it by name: it places no unwind entry.
 
+use alloc::alloc::Allocator;
 use alloc::vec::Vec;
-use alloc::{alloc::Allocator, alloc::Global};
 
 use blaze_code::record::CodeRecord;
 use blaze_code::unwind::{self, Action, Frame, Row};
@@ -121,7 +121,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         };
         rows.cleanup.clear();
         rows.cleanup.resize(blocks, false);
-        let mut todo: Vec<Block, Global> = Vec::new_in(Global);
+        let mut todo: blaze_own::AVec<'_, Block> = blaze_own::AVec::new_in(self.scratch);
         for b in 0..blocks {
             if matches!(view.block_kind(Block(b as u32)), BlockKind::Cleanup | BlockKind::Terminate) {
                 rows.cleanup[b] = true;

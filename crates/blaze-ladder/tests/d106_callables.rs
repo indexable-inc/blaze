@@ -1689,3 +1689,71 @@ pub extern \"C-unwind\" fn main() -> i32 {
         42,
     );
 }
+
+/// Builtin `FnPtr::addr` returning `usize` and `FnPtr::as_ptr` / `FnPtr::from_ptr` roundtrip
+/// (core's `impl<F: FnPtr> PartialEq for F` calls `self.addr() == other.addr()` with no written
+/// `impl FnPtr` item).
+#[test]
+fn fn_ptr_trait_addr_usize_and_roundtrip() {
+    row(
+        "fn_ptr_trait addr usize and roundtrip",
+        "
+#[lang = \"fn_ptr_trait\"]
+trait FnPtr: Copy {
+    fn addr(self) -> usize;
+    fn as_ptr(self) -> *const ();
+    unsafe fn from_ptr(ptr: *const ()) -> Self;
+}
+
+fn eq_fn<F: FnPtr>(a: F, b: F) -> bool {
+    a.addr() == b.addr()
+}
+
+fn roundtrip<F: FnPtr>(f: F) -> F {
+    let p = f.as_ptr();
+    unsafe { F::from_ptr(p) }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let f1: fn(u8) -> u8 = double;
+    let f2: fn(u8) -> u8 = double;
+    let f3: fn(u8) -> u8 = triple;
+    let same = eq_fn(f1, f2);
+    let diff = !eq_fn(f1, f3);
+    let rt = roundtrip(f3);
+    if same && diff && rt(14) == 42 { 42 } else { 1 }
+}
+",
+        42,
+    );
+}
+
+/// Builtin `FnPtr::addr` with the `*const ()` return signature and a default body (verifies
+/// both raw-pointer returns and default-bodied trait methods are intercepted cleanly).
+#[test]
+fn fn_ptr_trait_addr_raw_ptr() {
+    row(
+        "fn_ptr_trait addr raw ptr",
+        "
+#[lang = \"fn_ptr_trait\"]
+trait FnPtr: Copy {
+    fn addr(self) -> *const () {
+        0 as *const ()
+    }
+}
+
+fn eq_ptr<F: FnPtr>(a: F, b: F) -> bool {
+    a.addr() == b.addr()
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    let a: fn(u8) -> u8 = double;
+    let b: fn(u8) -> u8 = triple;
+    if eq_ptr(a, a) && !eq_ptr(a, b) { 42 } else { 2 }
+}
+",
+        42,
+    );
+}

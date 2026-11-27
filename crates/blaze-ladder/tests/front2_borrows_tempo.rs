@@ -1873,6 +1873,126 @@ where
     let _ = cs;
     conv.erased();
 }
+
+// alloy-sol-types `SolCall` pattern: `type Parameters<'a>: SolType<Token<'a> = Self::Token<'a>>`
+// with concrete `impl SolCall for CyTransferCall { type Parameters<'a> = (CySolAddr, CySolU256);
+// type Token<'a> = <Self::Parameters<'a> as CySolTy>::Token<'a>; }`. Normalizing
+// `<CyTransferCall::Parameters<'a> as CySolTy>::Token<'a>` must select the concrete tuple impl
+// rather than falling back to the cyclic trait bound `Parameters<'a>: CySolTy<Token<'a> = Self::Token<'a>>`.
+trait CySolTokSeq<'a> {}
+trait CySolTy {
+    type Token<'a>: CySolTokSeq<'a>;
+}
+struct CySolAddr;
+struct CySolU256;
+struct CySolWord<'a>(core::marker::PhantomData<&'a ()>);
+impl<'a> CySolTokSeq<'a> for CySolWord<'a> {}
+impl<'a, A: CySolTokSeq<'a>, B: CySolTokSeq<'a>> CySolTokSeq<'a> for (A, B) {}
+impl CySolTy for CySolAddr {
+    type Token<'a> = CySolWord<'a>;
+}
+impl CySolTy for CySolU256 {
+    type Token<'a> = CySolWord<'a>;
+}
+impl<A: CySolTy, B: CySolTy> CySolTy for (A, B) {
+    type Token<'a> = (A::Token<'a>, B::Token<'a>);
+}
+trait CySolCall: Sized {
+    type Parameters<'a>: CySolTy<Token<'a> = Self::Token<'a>>;
+    type Token<'a>: CySolTokSeq<'a>;
+}
+struct CyTransferCall;
+impl CySolCall for CyTransferCall {
+    type Parameters<'a> = (CySolAddr, CySolU256);
+    type Token<'a> = <Self::Parameters<'a> as CySolTy>::Token<'a>;
+}
+fn use_cy_sol_call<C: CySolCall>(_c: &C) {}
+fn repro_sol_call_cyclic_assoc_bound() {
+    use_cy_sol_call(&CyTransferCall);
+}
+
+// `TxRequest<'a, 'host, T, Tx>::host: &'a mut T::Host<'host>` and
+// `BlockAssemblerInput<'a, 'b, F, H>::execution_ctx: F::ExecutionCtx<'a>` pattern:
+// GAT-projected ADT fields must keep independent lifetimes (`'a` vs `'host`, `'a` vs `'b`)
+// via `field_slot_via_borrow` without collapsing them into `BorrowInexact` / `ValueInexact`.
+trait GatHostTypes {
+    type Tx;
+    type Host<'h>;
+}
+struct GatEvm<'h>(&'h mut u32);
+impl<'h> GatEvm<'h> {
+    fn spec_id(&self) -> u32 {
+        *self.0
+    }
+    fn bump(&mut self) {
+        *self.0 += 1;
+    }
+}
+struct GatTempoTypes;
+impl GatHostTypes for GatTempoTypes {
+    type Tx = u32;
+    type Host<'h> = GatEvm<'h>;
+}
+struct GatTxRequest<'a, 'host, T: GatHostTypes, Tx> {
+    envelope: &'a T::Tx,
+    tx: &'a Tx,
+    host: &'a mut T::Host<'host>,
+}
+fn repro_gat_field_borrow_request_host<'a, 'host>(
+    request: &mut GatTxRequest<'a, 'host, GatTempoTypes, u32>,
+) -> &'a u32 {
+    let _s = request.host.spec_id();
+    request.host.bump();
+    request.tx
+}
+fn control_gat_field_host_lifetime_escape<'a, 'host>(
+    request: &mut GatTxRequest<'a, 'host, GatTempoTypes, u32>,
+) -> &'static u32 {
+    request.host.0
+}
+
+trait GatExecFactory {
+    type Ctx<'a>;
+}
+struct GatExecCtx<'a>(&'a u32);
+struct GatFactory;
+impl GatExecFactory for GatFactory {
+    type Ctx<'a> = GatExecCtx<'a>;
+}
+struct GatAssemblerInput<'a, 'b, F: GatExecFactory> {
+    ctx: F::Ctx<'a>,
+    parent: &'a u32,
+    output: &'b u32,
+}
+fn repro_gat_field_destructure_assembler<'a, 'b>(
+    input: GatAssemblerInput<'a, 'b, GatFactory>,
+) -> (&'a u32, &'b u32) {
+    let GatAssemblerInput { ctx: GatExecCtx(inner), parent, output } = input;
+    let _ = parent;
+    (inner, output)
+}
+fn control_gat_field_destructure_swap_lifetimes<'a, 'b>(
+    input: GatAssemblerInput<'a, 'b, GatFactory>,
+) -> &'b u32 {
+    let GatAssemblerInput { ctx: GatExecCtx(inner), .. } = input;
+    inner
+}
+
+// `hashbrown::scopeguard::ScopeGuard::into_inner` pattern: `core::mem::ManuallyDrop<T>` has a
+// private field named `value`, so `guard.value` must autoderef past `ManuallyDrop`'s private
+// field to `ScopeGuard::value: T` (instead of producing E0308 `ScopeGuard<T, F>` vs `T`).
+struct ReproScopeGuard<T, F: FnMut(&mut T)> {
+    dropfn: F,
+    value: T,
+}
+fn repro_manually_drop_private_value_autoderef<T, F: FnMut(&mut T)>(guard: ReproScopeGuard<T, F>) -> T {
+    let guard = core::mem::ManuallyDrop::new(guard);
+    unsafe {
+        let value = core::ptr::read(&guard.value);
+        let _ = core::ptr::read(&guard.dropfn);
+        value
+    }
+}
 "#;
     let heap = blaze_own::testing::heap();
     let tc = open_toolchain();

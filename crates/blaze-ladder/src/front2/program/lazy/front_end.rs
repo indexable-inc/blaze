@@ -463,12 +463,18 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// As `Front2Program::code_of`, its text over the source.
     fn code_of(&self, i: usize) -> ContentId {
         let owner = self.rows.key[i];
+        let text = self.item_text(i);
+        crate::front2::consts::item_code_id(owner, text)
+    }
+
+    fn item_text(&self, i: usize) -> Option<&str> {
+        let owner = self.rows.key[i];
         let text = match (self.store.locals.head(owner), self.front.keys.library_in(self.front.names, owner)) {
             (Some(local), _) => Some(local.text),
             (None, Some(lib)) => self.front.names.text_of(lib).map(|t| t.text),
             (None, None) => self.store.fns.get(&owner).map(|h| h.text),
         };
-        crate::front2::consts::item_code_id(owner, text)
+        text.filter(|t| !t.is_empty())
     }
 
     // (2) The body's world.
@@ -745,6 +751,30 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// As `Front2Program::const_at`: the evaluator the program keeps checks any body and makes
     /// any impl row the value needs.
     fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], build: crate::front2::const_at::BuildFacts<'_>) -> Result<DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
+        let shared = self.shared();
+        if let crate::front2::const_at::ConstNeed::Item(item) = need
+            && args.is_empty()
+            && let Some(ref shared) = shared
+            && let Some(cached) = shared.get_pure_const(item)
+        {
+            return Ok(cached);
+        }
+        // Locate cold constants or cold const-block/promoted owners before evaluating so
+        // `self.front.keys` holds their `Origin` even when the caller was read from a cached
+        // typed record.
+        let _ = self.locate(need.item());
+        if let crate::front2::const_at::ConstNeed::Block { .. } | crate::front2::const_at::ConstNeed::Promoted { .. } = need {
+            let owner = need.item();
+            if !self.store.fns.contains_key(&owner) && !self.store.fn_gaps.contains_key(&owner) {
+                if let Some(want) = crate::front2::heads::member_head_want(self.front.names, &self.front.keys, owner) {
+                    let _ = self.store.ensure(self.front.names, &mut self.front.keys, want);
+                } else if self.front.keys.library_in(self.front.names, owner).is_some()
+                    && let Ok(want) = crate::front2::fill::want_of_key(self.front.names, &self.front.keys, owner)
+                {
+                    let _ = self.store.ensure(self.front.names, &mut self.front.keys, want);
+                }
+            }
+        }
         let prepared = self.prepared;
         let alloc = self.store.tys.alloc();
         let mut records = Records {
@@ -767,7 +797,14 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
                 self.consts.body_value(&mut records, prepared, owner, root, key, from, args, Some(build), alloc)
             }
         };
-        made.map(crate::front2::const_at::data_record).map_err(crate::front2::const_at::ConstAtWhy::Eval)
+        let record = made.map(crate::front2::const_at::data_record).map_err(crate::front2::const_at::ConstAtWhy::Eval)?;
+        if let crate::front2::const_at::ConstNeed::Item(item) = need
+            && args.is_empty()
+            && let Some(ref shared) = shared
+        {
+            shared.put_pure_const(item, &record);
+        }
+        Ok(record)
     }
 
     /// As `Front2Program::const_fn_instance`: the record of the evaluator the program keeps
@@ -798,6 +835,14 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// The statics made so far, sorted by key: each one's own data record.
     fn static_records(&self) -> &[(ItemKey, DataRecord<Global>)] {
         &self.statics.values
+    }
+
+    fn shared_front(&self) -> Option<crate::front2::program::lazy::SharedLazyFrontHandle> {
+        self.shared.borrow().clone()
+    }
+
+    fn has_inline_for(&self, i: usize) -> bool {
+        self.live_of(i).is_some_and(|l| !l.made.typeck.inline_fors.is_empty())
     }
 }
 

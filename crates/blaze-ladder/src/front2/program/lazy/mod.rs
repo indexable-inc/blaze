@@ -34,11 +34,14 @@
 mod fill;
 mod front_end;
 mod locate;
+/// Command-scoped shared immutable/sharded front-end cache across parallel workers (Phase 3).
+pub mod shared;
 /// The read side of a body's typed record and its test double (D163 part 2).
 pub mod typed;
 /// The per-fn seam rules both programs answer by (rule 30), `Front2Program`'s calls included.
 pub(in crate::front2::program) mod seam_rules;
 pub use seam_rules::{PositionSource, body_place};
+pub use shared::{SharedLazyFront, SharedLazyFrontStats};
 
 use super::*;
 
@@ -246,6 +249,12 @@ pub struct LazyCounts {
     pub live: u32,
 }
 
+/// Shared handle to a command-scoped [`shared::SharedLazyFront`], cloned once per worker epoch
+/// and dropped deterministically when [`LazyProgram`] drops.
+pub type SharedLazyFrontHandle = std::sync::Arc<shared::SharedLazyFront, blaze_own::SharedAlloc<'static>>;
+
+type SharedFrontSlot = RefCell<Option<SharedLazyFrontHandle>>;
+
 /// The program filled one body at a time (module docs).
 struct LazyConsts<'n, S> {
     names: S,
@@ -261,6 +270,8 @@ struct LazyConsts<'n, S> {
     bucket_index: RefCell<Option<crate::front2::buckets::BucketIndex>>,
     /// Evaluated constant bit patterns reused across frozen heads in this program.
     cached_bits: RefCell<blaze_hash::HashMap<blaze_id::ItemKey, u128, Alloc<'static>>>,
+    /// Optional shared front-end cache attached to the owning [`LazyProgram`].
+    shared: &'n SharedFrontSlot,
 }
 
 struct SharedLazyConsts<'n, S>(&'n RefCell<Option<LazyConsts<'n, S>>>);
@@ -283,6 +294,15 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::head::ConstValues<'n> for Sh
         if cacheable
             && let Some(&bits) = consts.cached_bits.borrow().get(&c)
         {
+            store.maps.file_bits(c, bits);
+            return Ok(());
+        }
+        let shared = consts.shared.borrow().clone();
+        if cacheable
+            && let Some(ref shared) = shared
+            && let Some(bits) = shared.get_const_bit(c)
+        {
+            consts.cached_bits.borrow_mut().insert(c, bits);
             store.maps.file_bits(c, bits);
             return Ok(());
         }
@@ -327,10 +347,18 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::head::ConstValues<'n> for Sh
             && let Some(&bits) = store.maps.const_bits.get(&c)
         {
             consts.cached_bits.borrow_mut().insert(c, bits);
+            if let Some(ref shared) = shared {
+                shared.put_const_bit(c, bits);
+            }
         }
         result
     }
 }
+
+/// Cap on scratch transfers before [`LazySeed`] drops its secondary [`DirectSeedState`] when a
+/// [`SharedLazyFront`] is attached, keeping per-worker scratch memory strictly bounded (Rule 18).
+const DIRECT_SEED_RESET_TRANSFERS: u32 = 256;
+const DIRECT_SEED_RESET_TYS: usize = 32_768;
 
 /// Persistent in-process scratch store for [`LazySeed`], initialized lazily on the first `&Store`
 /// head miss from `BodyWorld::store_want` / `BodyWorld::impl_question`. Keeps lowered transitive
@@ -344,13 +372,123 @@ struct DirectSeedState<'n> {
     buf: blaze_surface::RecordBytes<'static>,
     import_cache: crate::front2::tables::head::FrozenImportCache<'n>,
     failed: blaze_hash::HashSet<[u8; crate::front2::tables::head::WANT_BYTES], Alloc<'static>>,
+    transfers: u32,
+}
+
+/// Imports a single non-body-local `cell` from `shared.heads` into `store` if present, reusing
+/// `import_cache` for member listings and fn-text verification proofs. Returns `true` if `cell`
+/// is now made in `store`.
+pub(super) fn try_import_cell_from_shared<'n, S: NamesSource<'n>>(
+    names: S,
+    shared: &shared::SharedLazyFront,
+    store: &Store<'n>,
+    keys: &crate::front2::keys::Keys,
+    need: crate::front2::heads::Want,
+    import_cache: &crate::front2::tables::head::FrozenImportCache<'n>,
+    scratch: Alloc<'static>,
+) -> bool {
+    use crate::front2::tables::head::{FrozenHead, cell_of, file_frozen_cached, want_bytes};
+    if store.made(need) {
+        return true;
+    }
+    if crate::front2::tables::seeds::of_the_body(store, need) {
+        return false;
+    }
+    let Ok(cell) = cell_of(names, need) else {
+        return false;
+    };
+    if store.made(cell) {
+        return store.made(need);
+    }
+    let key = want_bytes(cell);
+    let Some(bytes) = shared.get_head(&key) else {
+        return false;
+    };
+    let Ok(frozen) = FrozenHead::read(bytes.as_slice()) else {
+        return false;
+    };
+    if file_frozen_cached(names, cell, frozen, store, keys, import_cache, scratch).is_err() {
+        return false;
+    }
+    store.made(need)
+}
+
+/// Imports `need` (along with any parent container/trait heads required for `MemberFn` or
+/// `Members`) from `shared.heads` into `store`. Returns `true` iff `need` is now made in `store`.
+pub(super) fn try_import_need_from_shared<'n, S: NamesSource<'n>>(
+    names: S,
+    shared: &shared::SharedLazyFront,
+    store: &Store<'n>,
+    keys: &crate::front2::keys::Keys,
+    need: crate::front2::heads::Want,
+    import_cache: &crate::front2::tables::head::FrozenImportCache<'n>,
+    scratch: Alloc<'static>,
+) -> bool {
+    use crate::front2::heads::Want;
+    if crate::front2::tables::seeds::of_the_body(store, need) {
+        return false;
+    }
+    match need {
+        Want::MemberFn(container, _) => {
+            let parent = Want::Head(container);
+            if !store.made(parent) && !try_import_cell_from_shared(names, shared, store, keys, parent, import_cache, scratch) {
+                return false;
+            }
+            if let Some(imp) = store.impls.get(&checker_of(container))
+                && let Some(trait_) = imp.trait_
+                && let Some(trait_lib) = keys.library_in(names, trait_)
+            {
+                let members = Want::Members(trait_lib);
+                if !store.made(members) && !try_import_cell_from_shared(names, shared, store, keys, members, import_cache, scratch) {
+                    return false;
+                }
+            }
+        }
+        Want::Members(container) => {
+            let parent = Want::Head(container);
+            if !store.made(parent) && !try_import_cell_from_shared(names, shared, store, keys, parent, import_cache, scratch) {
+                return false;
+            }
+        }
+        _ => {}
+    }
+    try_import_cell_from_shared(names, shared, store, keys, need, import_cache, scratch)
+}
+
+/// Freezes `cell` (already made in `store`) into canonical `BZFZ` bytes and publishes it into
+/// `shared.heads` if absent.
+pub(super) fn publish_cell_to_shared<'n, S: NamesSource<'n>>(
+    names: S,
+    shared: &shared::SharedLazyFront,
+    store: &mut Store<'n>,
+    keys: &crate::front2::keys::Keys,
+    need: crate::front2::heads::Want,
+    scratch: Alloc<'static>,
+) {
+    use crate::front2::tables::head::{Plant, cell_of, export, want_bytes};
+    if crate::front2::tables::seeds::of_the_body(store, need) {
+        return;
+    }
+    let Ok(cell) = cell_of(names, need) else {
+        return;
+    };
+    if !store.made(cell) {
+        return;
+    }
+    let key = want_bytes(cell);
+    if shared.contains_head(&key) {
+        return;
+    }
+    if let Ok(bytes) = export(names, keys, store, cell, Plant::None, scratch) {
+        shared.put_head(key, bytes.as_slice());
+    }
 }
 
 /// On-the-spot head seeder for [`LazyProgram`]: lowers missing heads requested through `&Store`
 /// (`BodyWorld::store_want` and `BodyWorld::impl_question`) in a single persistent scratch store
-/// and transfers each cell directly into `&Store` in place. `Store::ensure_noting` bypasses this
-/// seeder (`store.seed_on_ensure = false`) and lowers directly into `&mut Store`. Any head that
-/// belongs to a body-local item or cannot be transferred falls back cleanly to [`Seeded::Lower`].
+/// and transfers each cell directly into `&Store` in place. When a [`SharedLazyFront`] is
+/// attached, checks its sharded `BZFZ` cache first (avoiding even allocating `DirectSeedState` on
+/// hits) and publishes any newly lowered cell so other workers and future epochs reuse it.
 struct LazySeed<'n, S> {
     names: S,
     sized: Option<LibKey>,
@@ -358,7 +496,9 @@ struct LazySeed<'n, S> {
     frame: &'n blaze_mem::Frame,
     alloc: Alloc<'static>,
     state: RefCell<Option<DirectSeedState<'n>>>,
+    import_cache: RefCell<Option<crate::front2::tables::head::FrozenImportCache<'n>>>,
     consts: &'n RefCell<Option<LazyConsts<'n, S>>>,
+    shared: &'n SharedFrontSlot,
 }
 
 impl<'n, S> LazySeed<'n, S> {
@@ -366,13 +506,23 @@ impl<'n, S> LazySeed<'n, S> {
         if let Ok(mut guard) = self.state.try_borrow_mut() {
             let _ = guard.take();
         }
+        if let Ok(mut guard) = self.import_cache.try_borrow_mut() {
+            let _ = guard.take();
+        }
         if let Ok(mut guard) = self.consts.try_borrow_mut() {
+            let _ = guard.take();
+        }
+        if let Ok(mut guard) = self.shared.try_borrow_mut() {
             let _ = guard.take();
         }
     }
 }
 
 impl<'n, S: NamesSource<'n>> LazySeed<'n, S> {
+    fn shared_handle(&self) -> Option<SharedLazyFrontHandle> {
+        self.shared.borrow().clone()
+    }
+
     fn ensure_in_scratch(
         &self,
         state: &mut DirectSeedState<'n>,
@@ -383,6 +533,11 @@ impl<'n, S: NamesSource<'n>> LazySeed<'n, S> {
         use crate::front2::types::Why;
 
         if state.store.made(cell) {
+            return Ok(());
+        }
+        if let Some(shared) = self.shared_handle()
+            && try_import_cell_from_shared(self.names, &shared, &state.store, &state.keys, cell, &state.import_cache, self.alloc)
+        {
             return Ok(());
         }
         let mut consts_eval = SharedLazyConsts(self.consts);
@@ -425,6 +580,12 @@ impl<'n, S: NamesSource<'n>> LazySeed<'n, S> {
         if store.made(cell) {
             return Ok(());
         }
+        let shared = self.shared_handle();
+        if let Some(ref shared) = shared
+            && try_import_cell_from_shared(self.names, shared, store, keys, cell, &state.import_cache, scratch)
+        {
+            return Ok(());
+        }
         let key = want_bytes(cell);
         if state.failed.contains(&key) {
             return Err(());
@@ -432,6 +593,9 @@ impl<'n, S: NamesSource<'n>> LazySeed<'n, S> {
         if self.ensure_in_scratch(state, cell).is_err() {
             state.failed.insert(key);
             return Err(());
+        }
+        if let Some(ref shared) = shared {
+            publish_cell_to_shared(self.names, shared, &mut state.store, &state.keys, cell, scratch);
         }
         if transfer_cell_in_process(
             self.names,
@@ -450,6 +614,7 @@ impl<'n, S: NamesSource<'n>> LazySeed<'n, S> {
             state.failed.insert(key);
             return Err(());
         }
+        state.transfers = state.transfers.saturating_add(1);
         Ok(())
     }
 }
@@ -469,6 +634,17 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
         if store.made(need) {
             return Ok(Seeded::Filed);
         }
+        let shared = self.shared_handle();
+        // Fast path: hit the command-wide sharded frozen-head cache without allocating a
+        // secondary per-worker `DirectSeedState` store.
+        if let Some(ref shared) = shared
+            && let Ok(mut cache_guard) = self.import_cache.try_borrow_mut()
+        {
+            let import_cache = cache_guard.get_or_insert_with(|| crate::front2::tables::head::FrozenImportCache::new(self.alloc));
+            if try_import_need_from_shared(self.names, shared, store, keys, need, import_cache, scratch) {
+                return Ok(Seeded::Filed);
+            }
+        }
         let Ok(mut guard) = self.state.try_borrow_mut() else {
             return Ok(Seeded::Lower);
         };
@@ -483,6 +659,7 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
                 buf: blaze_surface::RecordBytes::new_in(self.alloc),
                 import_cache: crate::front2::tables::head::FrozenImportCache::new(self.alloc),
                 failed: blaze_hash::HashSet::new_in(self.alloc),
+                transfers: 0,
             }
         });
         state.store.prepared = store.prepared;
@@ -491,6 +668,7 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
         // container's head (`store.impls` / `store.trait_defs`), and `track_caller` for a trait
         // impl method reads the trait's declared member (`keys.filed_member`) and trait head
         // (`store.trait_defs`), so seed parent heads alongside member cells.
+        let mut ok = true;
         match need {
             Want::MemberFn(container, _) => {
                 let parent = Want::Head(container);
@@ -498,9 +676,10 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
                     && !crate::front2::tables::seeds::of_the_body(store, parent)
                     && self.transfer_one(state, store, keys, parent, scratch).is_err()
                 {
-                    return Ok(Seeded::Lower);
+                    ok = false;
                 }
-                if let Some(imp) = store.impls.get(&checker_of(container))
+                if ok
+                    && let Some(imp) = store.impls.get(&checker_of(container))
                     && let Some(trait_) = imp.trait_
                     && let Some(trait_lib) = keys.library_in(self.names, trait_)
                 {
@@ -509,14 +688,15 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
                         && !crate::front2::tables::seeds::of_the_body(store, trait_head)
                         && self.transfer_one(state, store, keys, trait_head, scratch).is_err()
                     {
-                        return Ok(Seeded::Lower);
+                        ok = false;
                     }
                     let members = Want::Members(trait_lib);
-                    if !store.made(members)
+                    if ok
+                        && !store.made(members)
                         && !crate::front2::tables::seeds::of_the_body(store, members)
                         && self.transfer_one(state, store, keys, members, scratch).is_err()
                     {
-                        return Ok(Seeded::Lower);
+                        ok = false;
                     }
                 }
             }
@@ -526,15 +706,25 @@ impl<'n, S: NamesSource<'n>> crate::front2::tables::seeds::HeadSeed<'n> for Lazy
                     && !crate::front2::tables::seeds::of_the_body(store, parent)
                     && self.transfer_one(state, store, keys, parent, scratch).is_err()
                 {
-                    return Ok(Seeded::Lower);
+                    ok = false;
                 }
             }
             _ => {}
         }
-        match self.transfer_one(state, store, keys, need, scratch) {
-            Ok(()) => Ok(Seeded::Filed),
-            Err(()) => Ok(Seeded::Lower),
+        let res = if ok && self.transfer_one(state, store, keys, need, scratch).is_ok() {
+            Seeded::Filed
+        } else {
+            Seeded::Lower
+        };
+        // Bound secondary scratch store memory when backed by `SharedLazyFront`: freshly lowered
+        // cells are already published into `shared.heads`, so dropping `DirectSeedState` frees its
+        // heap tables cleanly.
+        if shared.is_some()
+            && (state.transfers >= DIRECT_SEED_RESET_TRANSFERS || state.store.tys.view().len() >= DIRECT_SEED_RESET_TYS)
+        {
+            let _ = guard.take();
         }
+        Ok(res)
     }
 }
 
@@ -591,6 +781,10 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// falling back to a full crate-wide `member_rows` scan so `core`/`std` lang trait methods
     /// (e.g. `PartialEq::eq` in `assert_eq!`) resolve in O(lang items) with zero `each_item` scan.
     lang_member_rows: Map<usize, locate::MemberIndex<'n>, Alloc<'n>>,
+    /// Per-crate cache of body-local item derivation chains built once on the first unhinted
+    /// `locate_local` miss in a crate (lazy/locate.rs), turning repeated O(crate_fns) lex-scans
+    /// into O(1) lookups.
+    local_rows: Map<usize, locate::LocalIndex<'n>, Alloc<'n>>,
     /// Monomorphized specializations of generic `inline for` functions (`FrontEnd::specialized_row`,
     /// `FrontEnd::specialize_inline_for`), created on demand per `(orig, concrete_args)`.
     inline_for_specs: AVec<'n, crate::front2::inline_for::SpecRow>,
@@ -605,6 +799,12 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// Frame-allocated [`LazySeed`] wired into `self.store.seeds`; cleared on drop so all
     /// heap-backed [`SeededHeads`] buffers are released with the program.
     seed: Option<&'n LazySeed<'n, S>>,
+    /// Frame-allocated cell holding an optional command-wide [`SharedLazyFrontHandle`], shared
+    /// with [`LazySeed`] and [`LazyConsts`] so [`Self::attach_shared`] wires all three at once
+    /// and [`Drop`] deterministically releases the `Arc` refcount.
+    shared: &'n SharedFrontSlot,
+    /// Reusable import cache for [`shared::SharedLazyFront`] frozen-head imports in `make_want`.
+    shared_import_cache: RefCell<Option<crate::front2::tables::head::FrozenImportCache<'n>>>,
     counts: LazyCounts,
     alloc: Alloc<'n>,
 }
@@ -614,6 +814,10 @@ impl<'n, S: NamesSource<'n>> Drop for LazyProgram<'n, S> {
         if let Some(seed) = self.seed.take() {
             seed.clear();
         }
+        if let Ok(mut guard) = self.shared.try_borrow_mut() {
+            let _ = guard.take();
+        }
+        let _ = self.shared_import_cache.get_mut().take();
     }
 }
 
@@ -662,6 +866,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let bump = front.frame.alloc(blaze_own::Erased::new(front.frame)).bump();
         let prepared = Prepares::new_in(bump);
         store.prepared = Some(prepared);
+        let shared_slot: &'n SharedFrontSlot = front.frame.alloc(RefCell::new(None));
         let (seed, buckets) = if seeded_heads {
             let mut scope = AVec::with_capacity_in(front.index.scope().len(), alloc);
             scope.extend_from_slice(front.index.scope());
@@ -672,6 +877,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 prepared,
                 bucket_index: RefCell::new(None),
                 cached_bits: RefCell::new(blaze_hash::HashMap::new_in(alloc)),
+                shared: shared_slot,
             })));
             let seed: &'n LazySeed<'n, S> = front.frame.alloc(LazySeed {
                 names: front.names,
@@ -680,7 +886,9 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 frame: front.frame,
                 alloc,
                 state: RefCell::new(None),
+                import_cache: RefCell::new(None),
                 consts: consts_cell,
+                shared: shared_slot,
             });
             store.seeds = Some(seed);
             store.seed_on_ensure = false;
@@ -718,14 +926,39 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             site_cache: RefCell::new(seam_rules::SiteCache::new_in(alloc)),
             member_rows: Map::new_in(alloc),
             lang_member_rows: Map::new_in(alloc),
+            local_rows: Map::new_in(alloc),
             inline_for_specs: AVec::new_in(alloc),
             fixed_spell: Spelling::fixed(),
             adt_scanned_tys: 0,
             object_scanned_tys: 0,
             seed,
+            shared: shared_slot,
+            shared_import_cache: RefCell::new(None),
             counts: LazyCounts::default(),
             alloc,
         })
+    }
+
+    /// Attaches a command-scoped [`SharedLazyFrontHandle`] cache shared across parallel export
+    /// workers and worker epochs. Idempotent: subsequent calls after the first are no-ops.
+    pub fn attach_shared(&self, shared: &SharedLazyFrontHandle) {
+        let mut slot = self.shared.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(std::sync::Arc::clone(shared));
+        }
+    }
+
+    /// Returns a cloned handle to the attached command-scoped [`shared::SharedLazyFront`], if any.
+    #[inline]
+    pub(super) fn shared(&self) -> Option<SharedLazyFrontHandle> {
+        self.shared.borrow().clone()
+    }
+
+    /// Returns `(live_bodies, store_ty_nodes)` currently retained in this [`LazyProgram`], used by
+    /// parallel export workers to bound per-worker heap RSS via clean epoch resets while
+    /// [`shared::SharedLazyFront`] retains shared heads, constants, member indexes, and typed data.
+    pub fn worker_epoch_load(&self) -> (usize, usize) {
+        (self.counts.live as usize, self.store.tys.view().len())
     }
 
     /// How many statics and object tables (supertraits included) the bodies checked so far

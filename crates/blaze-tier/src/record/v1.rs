@@ -74,7 +74,10 @@ pub fn from_v1<'a>(record: CodeRecord<'a>, alloc: Alloc<'a>) -> Result<Emitted<'
     }
     for i in 0..view.targets() {
         let target = view.target(i);
-        if target.space != Space::Outside {
+        if !target.space.is_outside() {
+            continue;
+        }
+        if e.names.iter().any(|&(s, _, _)| s == target.symbol) {
             continue;
         }
         // The seal refused an outside target with no name (`RecordError::NameMissing`).

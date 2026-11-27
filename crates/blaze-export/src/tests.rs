@@ -708,11 +708,17 @@ fn rust_tls_refusals_are_named() {
     let p = ProgramIn { functions: &fs_plain_ender, data: &collide_data, tls: rt, ..p };
     assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::TwoData { target: desc_target }));
 
-    // 8. Self-relative DataWord (`target: None`) in Space::Tls -> DataTlsTarget.
-    let self_words = [DataWord { at: 0, target: None, addend: 0 }];
-    let self_tls_data = [Data { target: tls_a, bytes: &val, align: 8, words: &self_words, outside: &[], place: DataPlace::ReadOnly }];
+    // 8. `OWN_DATUM` (`target: None`) in Space::Tls (an immutable `'static` sub-allocation
+    //    appended inside the read-only TLS template by `make_template_entry`) rebases cleanly
+    //    into `__DATA_CONST` so every thread's copy shares the immutable pointee.
+    let self_words = [DataWord { at: 0, target: None, addend: 8 }];
+    let mut tls_with_tail = [0u8; 16];
+    tls_with_tail[8..10].copy_from_slice(b"hi");
+    let self_tls_data = [Data { target: tls_a, bytes: &tls_with_tail, align: 8, words: &self_words, outside: &[], place: DataPlace::ReadOnly }];
     let p = ProgramIn { functions: &fs_both, data: &self_tls_data, tls: rt, ..p };
-    assert_eq!(export(&p, Platform::MacosArm64, &mut out, alloc), Err(ExportError::DataTlsTarget { from: tls_a, target: tls_a }));
+    let exported = export(&p, Platform::MacosArm64, &mut out, alloc).expect("TLS template OWN_DATUM tail rebase");
+    assert_eq!(exported.imports, 1, "pthread_key_create");
+    check::macho(&out).expect("Mach-O valid with TLS OWN_DATUM tail rebase");
 
     // 9. Space::Outside import referenced only by a Space::Tls template is gathered and bound.
     let ext_sym = sym("puts");
@@ -1393,4 +1399,393 @@ fn macho_emits_local_n_sect_function_symbols() {
     let blank_names = [(main_sym, ""), (second_sym, "\0\0")];
     let blank = exported(&ProgramIn { symbol_names: &blank_names, ..program(&fs, &[], None) }, Platform::MacosArm64);
     assert_eq!(&baseline[..], &blank[..], "empty/NUL-only symbol_names must be byte-identical to empty");
+}
+
+/// End-to-end `Space::WeakOutside` export test (Rule 23):
+/// 1. ELF emits `(STB_WEAK << 4) | STT_NOTYPE` (`0x20`) for weak-only imports and `GLOBAL_FUNC`
+///    (`0x12`) for strong imports.
+/// 2. Mach-O sets `weak_import = 1` in `DYLD_CHAINED_IMPORT` (bit 8) and `N_WEAK_REF` (`0x0040`)
+///    in `nlist_64::n_desc` for weak-only imports, and clears both for strong imports.
+/// 3. Strong overrides weak in BOTH `lay_out` and `lay_out_records`, across BOTH function orderings
+///    and across Code + Data references!
+#[test]
+fn extern_weak_elf_macho_and_strong_overrides_weak() {
+    let alloc = Alloc::global();
+    let make_load_rec = |strong: &[&str], weak: &[&str]| -> AVec<'static, u8> {
+        let mut r = CodeRecord::new_in(alloc);
+        let mut at = 0u32;
+        for &name in strong {
+            for inst in [ADRP_X0, LDR_X0] {
+                r.code.extend_from_slice(&inst.to_le_bytes());
+            }
+            let idx = r.outside(name);
+            r.sites.push(Site { at, kind: SiteKind::Load, target: idx, addend: 0 });
+            at += 8;
+        }
+        for &name in weak {
+            for inst in [ADRP_X0, LDR_X0] {
+                r.code.extend_from_slice(&inst.to_le_bytes());
+            }
+            let idx = r.weak_outside(name);
+            r.sites.push(Site { at, kind: SiteKind::Load, target: idx, addend: 0 });
+            at += 8;
+        }
+        r.code.extend_from_slice(&RET.to_le_bytes());
+        let mut out = Vec::new_in(alloc);
+        let Ok(sealed) = r.seal() else { panic!("record must seal") };
+        sealed.encode(&mut out);
+        out
+    };
+
+    // Case 1: fn A references `weak_only` (weak) + `shared` (weak);
+    //         fn B references `strong_only` (strong) + `shared` (strong).
+    let fn_a = make_load_rec(&[], &["weak_only", "shared"]);
+    let fn_b = make_load_rec(&["strong_only", "shared"], &[]);
+    let Ok(view_a) = CodeView::read(&fn_a) else { panic!("view_a must decode") };
+    let Ok(view_b) = CodeView::read(&fn_b) else { panic!("view_b must decode") };
+
+    // Verify strong-overrides-weak in BOTH function orders for `lay_out`.
+    for pair in [
+        [
+            Member { symbol: sym("main"), record: view_a, tier: Some(Tier::Fast) },
+            Member { symbol: sym("helper"), record: view_b, tier: Some(Tier::Fast) },
+        ],
+        [
+            Member { symbol: sym("helper"), record: view_b, tier: Some(Tier::Fast) },
+            Member { symbol: sym("main"), record: view_a, tier: Some(Tier::Fast) },
+        ],
+    ] {
+        let Ok(laid) = lay_out(&pair, &[], sym("main"), None, elf::plan(), 0, alloc) else {
+            panic!("lay_out must succeed");
+        };
+        assert_eq!(laid.imports.len(), 3);
+        let is_weak = |name: &str| {
+            let Some(imp) = laid.imports.iter().find(|imp| imp.name == name) else {
+                panic!("missing import {name}");
+            };
+            imp.weak
+        };
+        assert!(is_weak("weak_only"), "weak-only symbol must stay weak");
+        assert!(!is_weak("strong_only"), "strong-only symbol must stay strong");
+        assert!(!is_weak("shared"), "strong reference must override weak reference");
+    }
+
+    // Verify strong-overrides-weak across Code (weak) + Data (strong), and Data (weak) alone.
+    let zero_word = [0u8; 8];
+    let data_sym_strong = sym("data_override");
+    let data_sym_weak = sym("data_weak_only");
+    let fn_c = make_load_rec(&[], &["data_override"]);
+    let Ok(view_c) = CodeView::read(&fn_c) else { panic!("view_c must decode") };
+    let words_strong = [DataWord { at: 0, target: Some(Target { space: Space::Outside, symbol: data_sym_strong }), addend: 0 }];
+    let outside_strong = [(data_sym_strong, "data_override")];
+    let words_weak = [DataWord { at: 0, target: Some(Target { space: Space::WeakOutside, symbol: data_sym_weak }), addend: 0 }];
+    let outside_weak = [(data_sym_weak, "data_weak_only")];
+    let datums = [
+        Data { target: Target { space: Space::Static, symbol: sym("S_STRONG") }, bytes: &zero_word, align: 8, words: &words_strong, outside: &outside_strong, place: DataPlace::ReadOnly },
+        Data { target: Target { space: Space::Static, symbol: sym("S_WEAK") }, bytes: &zero_word, align: 8, words: &words_weak, outside: &outside_weak, place: DataPlace::ReadOnly },
+    ];
+    let members_c = [Member { symbol: sym("main"), record: view_c, tier: Some(Tier::Fast) }];
+    let Ok(laid_data) = lay_out(&members_c, &datums, sym("main"), None, elf::plan(), 0, alloc) else {
+        panic!("lay_out with data must succeed");
+    };
+    let find_weak = |name: &str| laid_data.imports.iter().find(|i| i.name == name).map(|i| i.weak);
+    assert_eq!(find_weak("data_override"), Some(false), "strong data ref overrides weak code ref");
+    assert_eq!(find_weak("data_weak_only"), Some(true), "weak-only data ref stays weak");
+
+    // Verify `optimized::lay_out_records` (bzcode10) also enforces strong-overrides-weak!
+    {
+        use blaze_tier::record::{Declare, DeclaredKind, Declares, read as read_v2};
+        struct EmptyDeclares;
+        impl Declares for EmptyDeclares {
+            fn declared(&self, t: Target) -> Option<Declare<'_>> {
+                match t.space {
+                    Space::Func => Some(Declare { kind: DeclaredKind::Instance, item: 1, name: b"fn" }),
+                    Space::Static => Some(Declare { kind: DeclaredKind::Static, item: 1, name: b"" }),
+                    Space::Vtable => Some(Declare { kind: DeclaredKind::Vtable, item: 1, name: b"vt" }),
+                    Space::Tls => Some(Declare { kind: DeclaredKind::ThreadLocal, item: 1, name: b"" }),
+                    Space::Outside | Space::WeakOutside => None,
+                }
+            }
+        }
+        let mut v2_a = Vec::new_in(alloc);
+        let mut v2_b = Vec::new_in(alloc);
+        assert!(crate::optimized::v1_to_v2(view_a, &EmptyDeclares, &mut v2_a, alloc).is_ok());
+        assert!(crate::optimized::v1_to_v2(view_b, &EmptyDeclares, &mut v2_b, alloc).is_ok());
+        let Ok(rv_a) = read_v2(&v2_a) else { panic!("v2_a must decode") };
+        let Ok(rv_b) = read_v2(&v2_b) else { panic!("v2_b must decode") };
+        let m02 = [
+            crate::optimized::Member02 { symbol: sym("main"), record: rv_a, tier: Some(Tier::Fast) },
+            crate::optimized::Member02 { symbol: sym("helper"), record: rv_b, tier: Some(Tier::Fast) },
+        ];
+        let Ok(laid02) = crate::optimized::lay_out_records(&m02, &[], sym("main"), None, elf::plan(), 0, alloc) else {
+            panic!("lay_out_records must succeed");
+        };
+        let is_weak02 = |name: &str| laid02.imports.iter().find(|i| i.name == name).map(|i| i.weak);
+        assert_eq!(is_weak02("weak_only"), Some(true));
+        assert_eq!(is_weak02("strong_only"), Some(false));
+        assert_eq!(is_weak02("shared"), Some(false));
+    }
+
+    // Export ELF and inspect `.dynsym` `st_info` for each symbol!
+    let fs = [
+        Function { symbol: sym("main"), record: view_a, tier: Tier::Fast },
+        Function { symbol: sym("helper"), record: view_b, tier: Tier::Fast },
+    ];
+    let prog = program(&fs, &[], None);
+    let elf_bytes = exported(&prog, Platform::LinuxArm64);
+    assert!(check::elf(&elf_bytes).is_ok(), "exported ELF with weak imports must validate");
+    let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    let u32_at = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+    let u64_at = |b: &[u8], o: usize| {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&b[o..o + 8]);
+        u64::from_le_bytes(buf)
+    };
+    let e_phoff = usize::try_from(u64_at(&elf_bytes, 32)).unwrap_or(0);
+    let e_phnum = usize::from(u16_at(&elf_bytes, 56));
+    let mut dyn_off = 0usize;
+    let mut dyn_sz = 0usize;
+    let mut meta_vaddr = 0u64;
+    let mut meta_off = 0u64;
+    for i in 0..e_phnum {
+        let p = e_phoff + i * 56;
+        let p_type = u32_at(&elf_bytes, p);
+        let p_off = u64_at(&elf_bytes, p + 8);
+        let p_vaddr = u64_at(&elf_bytes, p + 16);
+        let p_filesz = u64_at(&elf_bytes, p + 32);
+        if p_type == 2 {
+            // PT_DYNAMIC
+            dyn_off = usize::try_from(p_off).unwrap_or(0);
+            dyn_sz = usize::try_from(p_filesz).unwrap_or(0);
+        } else if p_type == 1 {
+            // Last PT_LOAD holds meta (dynsym/dynstr)
+            meta_off = p_off;
+            meta_vaddr = p_vaddr;
+        }
+    }
+    let mut symtab_va = 0u64;
+    let mut strtab_va = 0u64;
+    let mut hash_va = 0u64;
+    let mut cur = dyn_off;
+    while cur + 16 <= dyn_off + dyn_sz {
+        let tag = u64_at(&elf_bytes, cur);
+        let val = u64_at(&elf_bytes, cur + 8);
+        match tag {
+            4 => hash_va = val,   // DT_HASH
+            5 => strtab_va = val, // DT_STRTAB
+            6 => symtab_va = val, // DT_SYMTAB
+            0 => break,
+            _ => {}
+        }
+        cur += 16;
+    }
+    let va_to_off = |va: u64| usize::try_from(va - meta_vaddr + meta_off).unwrap_or(0);
+    let symtab_off = va_to_off(symtab_va);
+    let strtab_off = va_to_off(strtab_va);
+    let nchain = usize::try_from(u32_at(&elf_bytes, va_to_off(hash_va) + 4)).unwrap_or(0);
+    let mut elf_info_weak_only = None;
+    let mut elf_info_strong_only = None;
+    let mut elf_info_shared = None;
+    for i in 1..nchain {
+        let s = symtab_off + i * 24;
+        let st_name = usize::try_from(u32_at(&elf_bytes, s)).unwrap_or(0);
+        let st_info = elf_bytes[s + 4];
+        let start = strtab_off + st_name;
+        let mut end = start;
+        while end < elf_bytes.len() && elf_bytes[end] != 0 {
+            end += 1;
+        }
+        let name = core::str::from_utf8(&elf_bytes[start..end]).unwrap_or("");
+        match name {
+            "weak_only" => elf_info_weak_only = Some(st_info),
+            "strong_only" => elf_info_strong_only = Some(st_info),
+            "shared" => elf_info_shared = Some(st_info),
+            _ => {}
+        }
+    }
+    assert_eq!(elf_info_weak_only, Some(0x20), "weak_only must be (STB_WEAK << 4) | STT_NOTYPE");
+    assert_eq!(elf_info_strong_only, Some(0x12), "strong_only must be GLOBAL_FUNC");
+    assert_eq!(elf_info_shared, Some(0x12), "shared (strong+weak) must be GLOBAL_FUNC");
+
+    // Export Mach-O and inspect BOTH `DYLD_CHAINED_IMPORT` `weak_import` bit AND `nlist_64::n_desc`!
+    let macho_bytes = exported(&prog, Platform::MacosArm64);
+    assert!(check::macho(&macho_bytes).is_ok(), "exported Mach-O with weak imports must validate");
+    let ncmds = usize::try_from(u32_at(&macho_bytes, 16)).unwrap_or(0);
+    let mut off = 32usize;
+    let mut fixups_off = 0usize;
+    let mut symoff = 0usize;
+    let mut nsyms = 0usize;
+    let mut stroff = 0usize;
+    for _ in 0..ncmds {
+        let cmd = u32_at(&macho_bytes, off);
+        let sz = usize::try_from(u32_at(&macho_bytes, off + 4)).unwrap_or(0);
+        if cmd == macho::LC_DYLD_CHAINED_FIXUPS {
+            fixups_off = usize::try_from(u32_at(&macho_bytes, off + 8)).unwrap_or(0);
+        } else if cmd == macho::LC_SYMTAB {
+            symoff = usize::try_from(u32_at(&macho_bytes, off + 8)).unwrap_or(0);
+            nsyms = usize::try_from(u32_at(&macho_bytes, off + 12)).unwrap_or(0);
+            stroff = usize::try_from(u32_at(&macho_bytes, off + 16)).unwrap_or(0);
+        }
+        off += sz;
+    }
+    let imports_off = fixups_off + usize::try_from(u32_at(&macho_bytes, fixups_off + 8)).unwrap_or(0);
+    let symbols_off = fixups_off + usize::try_from(u32_at(&macho_bytes, fixups_off + 12)).unwrap_or(0);
+    let imports_count = usize::try_from(u32_at(&macho_bytes, fixups_off + 16)).unwrap_or(0);
+    assert_eq!(imports_count, 3);
+    let mut chain_weak_only = None;
+    let mut chain_strong_only = None;
+    let mut chain_shared = None;
+    for i in 0..imports_count {
+        let word = u32_at(&macho_bytes, imports_off + i * 4);
+        let weak_bit = ((word >> 8) & 1) != 0;
+        let name_off = usize::try_from(word >> 9).unwrap_or(0);
+        let start = symbols_off + name_off;
+        let mut end = start;
+        while end < macho_bytes.len() && macho_bytes[end] != 0 {
+            end += 1;
+        }
+        let name = core::str::from_utf8(&macho_bytes[start..end]).unwrap_or("");
+        match name {
+            "_weak_only" => chain_weak_only = Some(weak_bit),
+            "_strong_only" => chain_strong_only = Some(weak_bit),
+            "_shared" => chain_shared = Some(weak_bit),
+            _ => {}
+        }
+    }
+    assert_eq!(chain_weak_only, Some(true), "Mach-O chained import weak_only must have weak_import=1");
+    assert_eq!(chain_strong_only, Some(false), "Mach-O chained import strong_only must have weak_import=0");
+    assert_eq!(chain_shared, Some(false), "Mach-O chained import shared must have weak_import=0");
+
+    // Also verify `nlist_64` `N_WEAK_REF` (`0x0040`) matches!
+    let mut nlist_weak_only = None;
+    let mut nlist_strong_only = None;
+    let mut nlist_shared = None;
+    for i in 0..nsyms {
+        let row = symoff + i * 16;
+        let strx = usize::try_from(u32_at(&macho_bytes, row)).unwrap_or(0);
+        let n_desc = u16_at(&macho_bytes, row + 6);
+        let start = stroff + strx;
+        let mut end = start;
+        while end < macho_bytes.len() && macho_bytes[end] != 0 {
+            end += 1;
+        }
+        let name = core::str::from_utf8(&macho_bytes[start..end]).unwrap_or("");
+        let has_weak_ref = (n_desc & 0x0040) != 0;
+        match name {
+            "_weak_only" => nlist_weak_only = Some(has_weak_ref),
+            "_strong_only" => nlist_strong_only = Some(has_weak_ref),
+            "_shared" => nlist_shared = Some(has_weak_ref),
+            _ => {}
+        }
+    }
+    assert_eq!(nlist_weak_only, Some(true));
+    assert_eq!(nlist_strong_only, Some(false));
+    assert_eq!(nlist_shared, Some(false));
+}
+
+#[test]
+fn unused_strong_outside_target_does_not_override_weak_import() {
+    let alloc = Alloc::global();
+    // Build a record with a USED `WeakOutside("opt_sym")` load site and an UNUSED strong
+    // `Outside("opt_sym")` target retained in the target table by `CodeRecord::seal`.
+    let make_rec = |use_strong: bool| {
+        let mut r = CodeRecord::new_in(alloc);
+        let code = if use_strong {
+            &[STP, MOV_FP, ADRP_X0, LDR_X0, ADRP_X16, LDR_X16, LDP, RET][..]
+        } else {
+            &[STP, MOV_FP, ADRP_X0, LDR_X0, LDP, RET][..]
+        };
+        for &inst in code {
+            r.code.extend_from_slice(&inst.to_le_bytes());
+        }
+        let weak_idx = r.weak_outside("opt_sym");
+        let strong_idx = r.outside("opt_sym");
+        r.sites.push(Site { at: 8, kind: SiteKind::Load, target: weak_idx, addend: 0 });
+        if use_strong {
+            r.sites.push(Site { at: 16, kind: SiteKind::Load, target: strong_idx, addend: 0 });
+        }
+        let mut out = Vec::new_in(alloc);
+        r.seal().unwrap().encode(&mut out);
+        out
+    };
+
+    let only_weak_used = make_rec(false);
+    let laid_weak = lay_out(
+        &[Member { symbol: sym("main"), record: CodeView::read(&only_weak_used).unwrap(), tier: Some(Tier::Fast) }],
+        &[],
+        sym("main"),
+        None,
+        elf::plan(),
+        0,
+        alloc,
+    )
+    .expect("layout with unused strong target should succeed");
+    assert_eq!(laid_weak.imports.len(), 1);
+    assert_eq!(laid_weak.imports[0].name, "opt_sym");
+    assert!(
+        laid_weak.imports[0].weak,
+        "unused strong target must not override a referenced weak import",
+    );
+
+    // Control: once a site actually references the strong target, strong overrides weak.
+    let both_used = make_rec(true);
+    let laid_strong = lay_out(
+        &[Member { symbol: sym("main"), record: CodeView::read(&both_used).unwrap(), tier: Some(Tier::Fast) }],
+        &[],
+        sym("main"),
+        None,
+        elf::plan(),
+        0,
+        alloc,
+    )
+    .expect("layout with both strong and weak used should succeed");
+    assert_eq!(laid_strong.imports.len(), 1);
+    assert_eq!(laid_strong.imports[0].name, "opt_sym");
+    assert!(!laid_strong.imports[0].weak, "control: referenced strong target must override weak");
+}
+
+#[test]
+fn macho_refuses_out_of_range_chained_import_index() {
+    let alloc = Alloc::global();
+    let (main, second) = tiny();
+    let members = [
+        Member { symbol: sym("main"), record: CodeView::read(&main).unwrap(), tier: Some(Tier::Fast) },
+        Member { symbol: sym("second"), record: CodeView::read(&second).unwrap(), tier: Some(Tier::Fast) },
+    ];
+    let mut laid = lay_out(&members, &[], sym("main"), None, macho::plan(), 0x1000, alloc).unwrap();
+    let eh = crate::eh_out::eh_sections(&laid, &members, None, Platform::MacosArm64, alloc).unwrap();
+    let mut out = Vec::new_in(alloc);
+    // Control: valid laid-out program writes cleanly.
+    macho::write(&laid, &eh, "valid", &[0u8; 32], &mut out, alloc).expect("valid macho write");
+
+    // Corrupt a Bind fixup to point past `laid.imports.len()`.
+    let bind = laid
+        .fixups
+        .iter_mut()
+        .find(|f| matches!(f.to, FixTo::Bind { .. }))
+        .expect("tiny program must have a Bind fixup");
+    bind.to = FixTo::Bind { import: 99 };
+    out.clear();
+    let err = macho::write(&laid, &eh, "invalid", &[0u8; 32], &mut out, alloc)
+        .expect_err("out-of-range Bind import index must fail with typed ExportError");
+    assert!(
+        matches!(err, ExportError::TooLarge { len: 99, .. }),
+        "expected ExportError::TooLarge for index 99, got {err:?}",
+    );
+
+    // Also test `macho::chained_fixups` directly with an out-of-range `Chain::Bind`.
+    let segs = [macho::ChainSeg { vm: 0x4000, vm_size: 0x4000, fixups: true }];
+    let fixups = [(0x4000u64, macho::Chain::Bind { import: 1 })];
+    let imports = [macho::ChainImport { lead: b"_", name: b"exit", ordinal: 1, weak: false, addend: 0 }];
+    let chain_err = macho::chained_fixups(
+        &fixups,
+        |c: &(u64, macho::Chain)| *c,
+        &segs,
+        macho::ImportRows::Plain,
+        &imports,
+        alloc,
+    )
+    .expect_err("chained_fixups must reject out-of-range bind ordinal");
+    assert_eq!(chain_err.len, 1);
+    assert_eq!(chain_err.at, Some(0x4000));
 }

@@ -78,6 +78,7 @@ const CASES: &[(&str, &[&str])] = &[
         &[
             "a += 1; b <<= 2; f(x, y)[0] .. 'a: loop {} 1.0f32 \"s\" -x",
             "x::<u8>::y && !z || w",
+            "BinaryOperands<XReg> foo::Bar<XReg> &'a mut XReg 0..=10 a+b-c*d",
             "{ a } [ b ] ( c )",
             ";",
         ],

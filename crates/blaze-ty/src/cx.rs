@@ -96,6 +96,13 @@ impl<'a> TyCx<'a> {
         self.tys.ty_var(v)
     }
 
+    /// Whether `t` is an inference type variable that has never been bound to a type or unified
+    /// with any other variable.
+    pub fn is_singleton_ty_var(&self, t: Ty) -> bool {
+        let i = crate::ids::ix(t.0);
+        self.tys.ty.kind(i) == ty::TY_VAR && self.vars.is_singleton(Table::Ty, self.tys.ty.a(i))
+    }
+
     /// A new `{integer}` variable.
     pub fn next_int_var(&mut self) -> Ty {
         let v = self.vars.new_var(Table::Int, Universe::ROOT);

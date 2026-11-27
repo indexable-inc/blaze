@@ -511,3 +511,383 @@ fn plain_git_merge_auto_updates_tracking_worktree_and_deletes_merged_worktree_wi
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn libbgit_in_process_and_git_compat_routing_work_without_spawning() {
+    let base = std::env::temp_dir().join(format!("bgit-inproc-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    run_git(&repo, &["init", "-b", "main"]);
+    fs::write(repo.join("a.txt"), "hello\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "first commit"]);
+    let first_sha = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    fs::write(repo.join("b.txt"), "world\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "second commit"]);
+    let head_sha = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+
+    let alloc = blaze_own::Alloc::global();
+
+    // 1. Un-infected repo: `git status --porcelain` and `git rev-parse --abbrev-ref HEAD` run
+    //    in-process WITHOUT creating `.bgit/` on disk!
+    fs::write(repo.join("untracked.txt"), "draft\n").unwrap();
+    let st = bgit::try_run_git_via_bgit(&["status", "--porcelain"], &repo, false, alloc)
+        .expect("git status --porcelain must run in-process");
+    assert_eq!(st.exit_code, 0);
+    assert_eq!(String::from_utf8_lossy(&st.stdout), "?? untracked.txt\n");
+    let br = bgit::try_run_git_via_bgit(&["rev-parse", "--abbrev-ref", "HEAD"], &repo, false, alloc)
+        .expect("git rev-parse --abbrev-ref HEAD must run in-process");
+    assert_eq!(String::from_utf8_lossy(&br.stdout), "main\n");
+    assert!(!repo.join(".bgit").exists(), "un-infected git queries must not create .bgit/");
+
+    // 2. Infect in-process via `run_bgit_in_process`:
+    let inf = bgit::run_bgit_in_process(&["infect"], &repo, false, alloc);
+    assert_eq!(inf.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&inf.stderr));
+    assert!(repo.join(".bgit/VERSION").is_file());
+
+    // 3. `git rev-parse HEAD`, `git log --oneline -n 2`, `git show-ref --heads`, `git merge-base`,
+    //    and `git -C <repo> ...` all run directly in-process via `libbgit`!
+    let rp = bgit::try_run_git_via_bgit(&["rev-parse", "HEAD"], &repo, false, alloc).unwrap();
+    assert_eq!(String::from_utf8_lossy(&rp.stdout).trim(), head_sha);
+
+    let log_out =
+        bgit::try_run_git_via_bgit(&["-C", repo.to_str().unwrap(), "log", "--oneline", "-n", "2"], &base, false, alloc)
+            .unwrap();
+    assert_eq!(log_out.exit_code, 0);
+    let log_text = String::from_utf8_lossy(&log_out.stdout);
+    assert!(log_text.contains("second commit") && log_text.contains("first commit"), "log: {log_text}");
+
+    let sr = bgit::try_run_git_via_bgit(&["show-ref", "--heads"], &repo, false, alloc).unwrap();
+    assert_eq!(String::from_utf8_lossy(&sr.stdout).trim(), format!("{head_sha} refs/heads/main"));
+
+    let mb = bgit::try_run_git_via_bgit(&["merge-base", &first_sha, &head_sha], &repo, false, alloc).unwrap();
+    assert_eq!(String::from_utf8_lossy(&mb.stdout).trim(), first_sha);
+
+    let entries = bgit::query_log_entries(&repo, "HEAD", 5, alloc).unwrap().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].subject, "second commit");
+    assert_eq!(entries[1].subject, "first commit");
+
+    // 4. Interactive / exotic git flags cleanly return None (deferring to external git).
+    assert!(bgit::try_run_git_via_bgit(&["commit"], &repo, false, alloc).is_none());
+    assert!(bgit::try_run_git_via_bgit(&["add", "-p"], &repo, false, alloc).is_none());
+    assert!(bgit::try_run_git_via_bgit(&["rebase", "-i", "HEAD~1"], &repo, false, alloc).is_none());
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn bgit_porcelain_commands_full_workflow_and_git_interop() {
+    let base = std::env::temp_dir().join(format!("bgit-porcelain-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    let alloc = blaze_own::Alloc::global();
+    let run_ok = |args: &[&str]| -> String {
+        let out = bgit::run_bgit_in_process(args, &repo, false, alloc);
+        assert_eq!(
+            out.exit_code,
+            0,
+            "bgit {:?} failed:\nstdout: {}\nstderr: {}",
+            args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Start from a real `.git` repo and infect it so we prove 100% `.git` <-> `.bgit` dual-sync!
+    run_git(&repo, &["init", "-b", "main"]);
+    fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+    fs::write(repo.join("ignored.log"), "noise\n").unwrap();
+    fs::write(repo.join("hello.txt"), "line1\nline2\n").unwrap();
+    run_git(&repo, &["add", ".gitignore", "hello.txt"]);
+    run_git(&repo, &["commit", "-m", "initial commit"]);
+    let _ = run_ok(&["infect"]);
+
+    // 1. `bgit config` & `bgit remote`
+    let _ = run_ok(&["config", "--local", "user.name", "Blaze Tester"]);
+    let _ = run_ok(&["config", "--local", "user.email", "tester@blaze.dev"]);
+    assert_eq!(run_ok(&["config", "--local", "user.name"]).trim(), "Blaze Tester");
+    let _ = run_ok(&["remote", "add", "origin", "http://127.0.0.1:9999/repo.git"]);
+    assert_eq!(run_ok(&["remote", "get-url", "origin"]).trim(), "http://127.0.0.1:9999/repo.git");
+    assert!(run_ok(&["remote", "-v"]).contains("origin\thttp://127.0.0.1:9999/repo.git"));
+    let _ = run_ok(&["remote", "rename", "origin", "upstream"]);
+    let _ = run_ok(&["remote", "remove", "upstream"]);
+    assert!(run_ok(&["remote"]).trim().is_empty());
+
+    // 2. `bgit add`, `bgit diff`, `bgit diff --staged`, `bgit commit`, `bgit show`
+    fs::write(repo.join("hello.txt"), "line1\nline2-edited\nline3\n").unwrap();
+    fs::write(repo.join("extra.txt"), "extra\n").unwrap();
+    let wt_diff = run_ok(&["diff"]);
+    assert!(wt_diff.contains("-line2") && wt_diff.contains("+line2-edited"), "wt_diff: {wt_diff}");
+    let _ = run_ok(&["add", "."]);
+    let staged_diff = run_ok(&["diff", "--staged", "--name-status"]);
+    assert!(staged_diff.contains("A\textra.txt") && staged_diff.contains("M\thello.txt"), "staged: {staged_diff}");
+    // Verify `.gitignore` kept `ignored.log` out of index!
+    assert!(!staged_diff.contains("ignored.log"));
+    let commit_out = run_ok(&["commit", "-m", "second commit via bgit"]);
+    assert!(commit_out.contains("[main "), "commit_out: {commit_out}");
+    assert!(commit_out.contains("second commit via bgit"));
+
+    // Verify `bgit show` and `bgit show HEAD:hello.txt`
+    let show_out = run_ok(&["show"]);
+    assert!(show_out.contains("second commit via bgit") && show_out.contains("+line3"), "show: {show_out}");
+    assert_eq!(run_ok(&["show", "HEAD:hello.txt"]), "line1\nline2-edited\nline3\n");
+    assert_eq!(run_ok(&["rev-parse", "--abbrev-ref", "HEAD"]).trim(), "main");
+    let head_sha = run_ok(&["rev-parse", "HEAD"]).trim().to_owned();
+    let parent_sha = run_ok(&["rev-parse", "HEAD~1"]).trim().to_owned();
+    assert_ne!(head_sha, parent_sha);
+    assert_eq!(run_ok(&["rev-parse", "--short", "HEAD"]).trim(), &head_sha[..7]);
+
+    // 3. `bgit branch`, `bgit checkout -b`, `bgit switch`, `bgit merge <branch>`
+    let _ = run_ok(&["checkout", "-b", "feature"]);
+    assert_eq!(run_ok(&["branch", "--show-current"]).trim(), "feature");
+    let br_list = run_ok(&["branch", "-v"]);
+    assert!(br_list.contains("* feature") && br_list.contains("  main"), "branches: {br_list}");
+    fs::write(repo.join("feat.txt"), "from feature\n").unwrap();
+    let _ = run_ok(&["add", "feat.txt"]);
+    let _ = run_ok(&["commit", "-m", "feature work"]);
+    let feat_sha = run_ok(&["rev-parse", "HEAD"]).trim().to_owned();
+
+    // Switch back to `main`, verify `feat.txt` disappears cleanly from worktree!
+    let _ = run_ok(&["switch", "main"]);
+    assert!(!repo.join("feat.txt").exists());
+    // Unmerged `-d` must fail!
+    let bad_del = bgit::run_bgit_in_process(&["branch", "-d", "feature"], &repo, false, alloc);
+    assert_ne!(bad_del.exit_code, 0, "deleting unmerged branch with -d must fail");
+
+    // 1-arg ergonomic `bgit merge feature` into `main` (fast-forward) updates worktree + ref!
+    let merge_out = run_ok(&["merge", "feature"]);
+    assert!(merge_out.contains("FastForward"), "merge_out: {merge_out}");
+    assert_eq!(fs::read_to_string(repo.join("feat.txt")).unwrap(), "from feature\n");
+    assert_eq!(run_ok(&["rev-parse", "main"]).trim(), feat_sha);
+
+    // Now `-d feature` succeeds because it's merged!
+    let del_out = run_ok(&["branch", "-d", "feature"]);
+    assert!(del_out.contains("Deleted branch feature"));
+
+    // Rename & rename back
+    let _ = run_ok(&["branch", "-m", "main", "trunk"]);
+    assert_eq!(run_ok(&["branch", "--show-current"]).trim(), "trunk");
+    let _ = run_ok(&["branch", "-m", "main"]);
+    assert_eq!(run_ok(&["branch", "--show-current"]).trim(), "main");
+
+    // 4. `bgit tag` (lightweight + annotated `-a -m` + delete)
+    let _ = run_ok(&["tag", "v0.1.0"]);
+    let _ = run_ok(&["tag", "-a", "v0.2.0", "-m", "Release 0.2.0"]);
+    let tags = run_ok(&["tag"]);
+    assert!(tags.contains("v0.1.0") && tags.contains("v0.2.0"), "tags: {tags}");
+    assert_eq!(run_ok(&["rev-parse", "v0.2.0^{commit}"]).trim(), feat_sha);
+    let _ = run_ok(&["tag", "-d", "v0.1.0"]);
+    assert!(!run_ok(&["tag"]).contains("v0.1.0"));
+
+    // 5. `bgit stash push/list/pop`
+    fs::write(repo.join("hello.txt"), "stashed edit\n").unwrap();
+    let _ = run_ok(&["stash", "push", "-m", "wip hello"]);
+    assert_eq!(fs::read_to_string(repo.join("hello.txt")).unwrap(), "line1\nline2-edited\nline3\n");
+    assert!(run_ok(&["stash", "list"]).contains("wip hello"));
+    let _ = run_ok(&["stash", "pop"]);
+    assert_eq!(fs::read_to_string(repo.join("hello.txt")).unwrap(), "stashed edit\n");
+
+    // 6. `bgit restore` & `bgit reset`
+    let _ = run_ok(&["restore", "hello.txt"]);
+    assert_eq!(fs::read_to_string(repo.join("hello.txt")).unwrap(), "line1\nline2-edited\nline3\n");
+
+    // 7. `bgit mv` & `bgit rm` & `bgit commit -a`
+    let _ = run_ok(&["mv", "extra.txt", "renamed.txt"]);
+    assert!(!repo.join("extra.txt").exists() && repo.join("renamed.txt").exists());
+    let _ = run_ok(&["rm", "feat.txt"]);
+    assert!(!repo.join("feat.txt").exists());
+    let _ = run_ok(&["commit", "-m", "mv and rm"]);
+
+    // 8. `bgit revert` & `bgit cherry-pick`
+    let revert_out = run_ok(&["revert", "HEAD"]);
+    assert!(revert_out.contains("Revert \"mv and rm\""), "revert: {revert_out}");
+    assert!(repo.join("feat.txt").exists() && repo.join("extra.txt").exists());
+
+    // 9. `bgit clean -n` & `bgit clean -f`
+    fs::write(repo.join("junk.tmp"), "delete me\n").unwrap();
+    assert!(run_ok(&["clean", "-n"]).contains("junk.tmp"));
+    assert!(repo.join("junk.tmp").exists());
+    let _ = run_ok(&["clean", "-f"]);
+    assert!(!repo.join("junk.tmp").exists());
+
+    // 10. Real `git` interoperability check (`git fsck --full`, `git status --porcelain`, `git branch`)!
+    let fsck = Command::new("git").args(["fsck", "--full"]).current_dir(&repo).output().unwrap();
+    assert!(
+        fsck.status.success(),
+        "git fsck failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+    let git_st = run_git(&repo, &["status", "--porcelain"]);
+    assert!(git_st.trim().is_empty(), "expected clean working tree in real git, got:\n{git_st}");
+    let git_br = run_git(&repo, &["branch", "--show-current"]);
+    assert_eq!(git_br.trim(), "main");
+
+    // 11. `try_run_git_via_bgit` routes `git branch`, `git tag`, `git show --stat` in-process!
+    let gb = bgit::try_run_git_via_bgit(&["branch", "--show-current"], &repo, false, alloc).unwrap();
+    assert_eq!(gb.exit_code, 0);
+    assert_eq!(String::from_utf8_lossy(&gb.stdout).trim(), "main");
+    let gt = bgit::try_run_git_via_bgit(&["tag"], &repo, false, alloc).unwrap();
+    assert_eq!(gt.exit_code, 0);
+    assert!(String::from_utf8_lossy(&gt.stdout).contains("v0.2.0"));
+
+    // 12. Everyday write commands (`git add`, `git commit -m`, `git switch -c`, `git switch`)
+    //     also run directly in-process via `try_run_git_via_bgit` on `.bgit`-infected repos!
+    fs::write(repo.join("inproc.txt"), "hello in-process git\n").unwrap();
+    let ga = bgit::try_run_git_via_bgit(&["add", "inproc.txt"], &repo, false, alloc).unwrap();
+    assert_eq!(ga.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&ga.stderr));
+    let gc =
+        bgit::try_run_git_via_bgit(&["commit", "-m", "in-process commit"], &repo, false, alloc)
+            .unwrap();
+    assert_eq!(gc.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&gc.stderr));
+    // Interactive `git commit` (no `-m`) and `git add -p` still defer cleanly to external git.
+    assert!(bgit::try_run_git_via_bgit(&["commit"], &repo, false, alloc).is_none());
+    assert!(bgit::try_run_git_via_bgit(&["add", "-p"], &repo, false, alloc).is_none());
+
+    let fsck2 = Command::new("git").args(["fsck", "--full"]).current_dir(&repo).output().unwrap();
+    assert!(fsck2.status.success(), "git fsck2 failed: {}", String::from_utf8_lossy(&fsck2.stderr));
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn fsmonitor_o_dirty_status_diff_and_structured_queries() {
+    let base = std::env::temp_dir().join(format!("bgit-fsmon-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+
+    run_git(&repo, &["init", "-b", "main"]);
+    fs::write(repo.join("a.txt"), "alpha\nbeta\n").unwrap();
+    fs::write(repo.join("b.txt"), "one\ntwo\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "init"]);
+    run_git(&repo, &["branch", "dev"]);
+
+    let alloc = blaze_own::Alloc::global();
+    let inf = bgit::run_bgit_in_process(&["infect"], &repo, false, alloc);
+    assert_eq!(inf.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&inf.stderr));
+
+    // Verify `BGRF` v2 magic/version header on disk.
+    let bgref = fs::read(repo.join(".bgit/refs.bgref")).unwrap();
+    assert_eq!(&bgref[0..4], b"BGRF");
+    assert_eq!(u32::from_le_bytes(bgref[4..8].try_into().unwrap()), 2);
+
+    // Structured `query_branches` reads zero-copy from `BGRF` v2.
+    let branches = bgit::query_branches(&repo, false, false, alloc).unwrap().unwrap();
+    assert_eq!(branches.len(), 2);
+    assert!(branches.iter().any(|b| b.name == "main" && b.is_current && b.subject == "init"));
+    assert!(branches.iter().any(|b| b.name == "dev" && !b.is_current && b.subject == "init"));
+
+    // Start in-process FSEvents monitor (`blaze_core::Native` `Effect::Journal` + `Effect::Flush`).
+    assert!(bgit::ensure_fsmonitor_watching(&repo), "expected FSEvents monitor to start");
+
+    // 1. Prime baselines (clean).
+    let st1 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(st1.exit_code, 0);
+    assert!(String::from_utf8_lossy(&st1.stdout).trim().is_empty());
+    let df1 = bgit::run_bgit_in_process(&["diff", "--stat"], &repo, false, alloc);
+    assert_eq!(df1.exit_code, 0);
+    assert!(String::from_utf8_lossy(&df1.stdout).trim().is_empty());
+
+    // 2. Warm clean cache hit.
+    let st2 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(st2.exit_code, 0);
+    assert!(String::from_utf8_lossy(&st2.stdout).trim().is_empty());
+
+    // 3. Modify a tracked file -> FSEvents O(dirty) path detects it immediately via cookie barrier!
+    fs::write(repo.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    let st3 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(st3.exit_code, 0);
+    assert_eq!(String::from_utf8_lossy(&st3.stdout).trim(), "M a.txt");
+
+    let df3 = bgit::run_bgit_in_process(&["diff", "--stat"], &repo, false, alloc);
+    assert_eq!(df3.exit_code, 0);
+    assert!(
+        String::from_utf8_lossy(&df3.stdout).contains("a.txt"),
+        "expected a.txt in diff --stat: {}",
+        String::from_utf8_lossy(&df3.stdout)
+    );
+
+    // Structured `query_diff_stat` uses the same O(dirty) FSEvents path!
+    let dstat = bgit::query_diff_stat(&repo, false, alloc).unwrap().unwrap();
+    assert_eq!(dstat.len(), 1);
+    assert_eq!(dstat[0].path, "a.txt");
+    assert_eq!(dstat[0].status, 'M');
+    assert_eq!(dstat[0].insertions, 1);
+    assert_eq!(dstat[0].deletions, 0);
+
+    // 4. Revert tracked file -> O(dirty) path clears it back to clean!
+    fs::write(repo.join("a.txt"), "alpha\nbeta\n").unwrap();
+    let st4 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(st4.exit_code, 0);
+    assert!(String::from_utf8_lossy(&st4.stdout).trim().is_empty());
+    let dstat_clean = bgit::query_diff_stat(&repo, false, alloc).unwrap().unwrap();
+    assert!(dstat_clean.is_empty());
+
+    // 5. Create a brand-new untracked file -> monitor detects untracked path & rescans cleanly!
+    fs::write(repo.join("untracked.txt"), "new file\n").unwrap();
+    let st5 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(st5.exit_code, 0);
+    assert_eq!(String::from_utf8_lossy(&st5.stdout).trim(), "?? untracked.txt");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn stateless_dircache_bgdc_detects_adds_deletes_and_edits_in_sparse_dirs() {
+    let base = std::env::temp_dir().join(format!("bgit-dircache-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    fs::create_dir_all(repo.join("sub/nested")).unwrap();
+
+    run_git(&repo, &["init", "-b", "main"]);
+    fs::write(repo.join("sub/nested/only.txt"), "v1\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "init"]);
+
+    let alloc = blaze_own::Alloc::global();
+    let inf = bgit::run_bgit_in_process(&["infect"], &repo, false, alloc);
+    assert_eq!(inf.exit_code, 0);
+
+    // Wait past the 50 ms racy-dir window so `sub` and `sub/nested` are eligible for `.bgit/dircache.bgdc`.
+    std::thread::sleep(std::time::Duration::from_millis(80));
+
+    // Run 1 populates `.bgit/dircache.bgdc`.
+    let st1 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(st1.exit_code, 0);
+    assert!(String::from_utf8_lossy(&st1.stdout).trim().is_empty());
+    assert!(repo.join(".bgit/dircache.bgdc").is_file(), "expected .bgit/dircache.bgdc to be written");
+
+    // Run 2 hits `.bgit/dircache.bgdc` cleanly.
+    let st2 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(st2.exit_code, 0);
+    assert!(String::from_utf8_lossy(&st2.stdout).trim().is_empty());
+
+    // Edit file inside cached sparse dir (parent dir mtime unchanged, child stat changed!).
+    fs::write(repo.join("sub/nested/only.txt"), "v2 edited\n").unwrap();
+    let st3 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(String::from_utf8_lossy(&st3.stdout).trim(), "M sub/nested/only.txt");
+
+    // Add a brand-new untracked file inside cached sparse dir (parent dir mtime bumped -> invalidates!).
+    fs::write(repo.join("sub/nested/extra.txt"), "new\n").unwrap();
+    let st4 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    let out4 = String::from_utf8_lossy(&st4.stdout);
+    assert!(out4.contains("M sub/nested/only.txt") && out4.contains("?? sub/nested/extra.txt"), "got:\n{out4}");
+
+    // Delete tracked file inside cached sparse dir -> detected immediately!
+    fs::remove_file(repo.join("sub/nested/only.txt")).unwrap();
+    let st5 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    let out5 = String::from_utf8_lossy(&st5.stdout);
+    assert!(out5.contains("D sub/nested/only.txt") && out5.contains("?? sub/nested/extra.txt"), "got:\n{out5}");
+
+    let _ = fs::remove_dir_all(&base);
+}

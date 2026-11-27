@@ -17,7 +17,7 @@
 
 use core::cell::{Cell, RefCell};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, HashMap, Map, MapOpts};
 use blaze_own::{Alloc, Vec};
 use blaze_solve::facts::{
     AdtDef, AdtFlags, AssocDef, AssocKind, AssocTy, ConstHolds, Facts, Fetch, FnSigDef, ImplAssoc, ImplFlags, ImplHeader,
@@ -33,6 +33,8 @@ use crate::error::{CheckError, Malformed, Stop};
 use crate::hash::{ContentHash, StableHasher};
 use crate::ids::{FloatTy, IntTy, ItemKey, LangItem, Mutbl, Name, UintTy};
 use crate::portable::{PNode, PTy, PTys};
+use crate::region_facts::HeadRegionRead;
+use crate::regions::{Arity, MOST_REGION_STEPS, Region, region_arity};
 use crate::world::{AdtKind, PClause, Question, Reads, Shape, World};
 
 mod item_bounds;
@@ -112,6 +114,7 @@ struct ImplRow {
     trait_: SDef,
     args: SList,
     wheres: Span,
+    where_bounds: Span,
     assoc: Span,
     por: Por,
     digest: u64,
@@ -182,6 +185,7 @@ struct RoundSnap {
     nodes: usize,
     lists: usize,
     preds: usize,
+    where_bounds: usize,
     assoc_tys: usize,
     impl_assoc: usize,
     fields: usize,
@@ -243,6 +247,7 @@ pub struct FactCache<'a> {
     nodes: Vec<K, Alloc<'a>>,
     lists: Vec<STy, Alloc<'a>>,
     preds: Vec<Pred, Alloc<'a>>,
+    where_bounds: Vec<u32, Alloc<'a>>,
     assoc_tys: Vec<AssocTy, Alloc<'a>>,
     impl_assoc: Vec<ImplAssoc, Alloc<'a>>,
     fields: Vec<STy, Alloc<'a>>,
@@ -254,6 +259,14 @@ pub struct FactCache<'a> {
     /// `impl_columns` and their stride; `WIDTH * stride` bytes.
     impl_cols: HashMap<(u128, SShape), (u32, u32), Alloc<'a>>,
     impl_columns: Vec<u8, Alloc<'a>>,
+    /// Header-only fingerprint columns for `instance::holding_owning` when a bucket has `> 16`
+    /// impls and was not already filled via `fill_one(SQ::Impls)` (reads headers only, never
+    /// predicates). Cleared per body round in `clear_ephemeral`.
+    header_cols: Map<(ItemKey, Shape), (Span, u32, u32), FixedState, Alloc<'a>>,
+    header_impl_defs: Vec<ItemKey, Alloc<'a>>,
+    header_columns: Vec<u8, Alloc<'a>>,
+    /// Scratch survivor indices for `prefilter::filter` (reused across calls).
+    survivor_scratch: Vec<u32, Alloc<'a>>,
     /// One bucket's fingerprints and columns while it is filled (reused).
     fp_scratch: Vec<Fingerprint, Alloc<'a>>,
     col_scratch: Vec<u8, Alloc<'a>>,
@@ -447,6 +460,60 @@ pub fn shape(s: SShape) -> Shape {
     }
 }
 
+/// Inverse of [`shape`] for shapes that have a single `SShape` bucket in `FactCache::impls`.
+fn sshape(s: Shape) -> Option<SShape> {
+    use blaze_solve::term::{FloatTy as SF, IntTy as SI, UintTy as SU};
+    let m = |m: Mutbl| match m {
+        Mutbl::Not => SMutbl::Not,
+        Mutbl::Mut => SMutbl::Mut,
+    };
+    Some(match s {
+        Shape::Bool => SShape::Bool,
+        Shape::Char => SShape::Char,
+        Shape::Int(i) => SShape::Int(match i {
+            IntTy::Isize => SI::Isize,
+            IntTy::I8 => SI::I8,
+            IntTy::I16 => SI::I16,
+            IntTy::I32 => SI::I32,
+            IntTy::I64 => SI::I64,
+            IntTy::I128 => SI::I128,
+        }),
+        Shape::Uint(u) => SShape::Uint(match u {
+            UintTy::Usize => SU::Usize,
+            UintTy::U8 => SU::U8,
+            UintTy::U16 => SU::U16,
+            UintTy::U32 => SU::U32,
+            UintTy::U64 => SU::U64,
+            UintTy::U128 => SU::U128,
+        }),
+        Shape::Float(f) => SShape::Float(match f {
+            FloatTy::F16 => SF::F16,
+            FloatTy::F32 => SF::F32,
+            FloatTy::F64 => SF::F64,
+            FloatTy::F128 => SF::F128,
+        }),
+        Shape::Str => SShape::Str,
+        Shape::Never => SShape::Never,
+        Shape::Tuple(n) => SShape::Tuple(n),
+        Shape::Record(s, n) => SShape::Record(s, n),
+        Shape::Union(n) => SShape::Union(n),
+        Shape::Ref(x) => SShape::Ref(m(x)),
+        Shape::Ptr(x) => SShape::Ptr(m(x)),
+        Shape::Array => SShape::Array,
+        Shape::Slice => SShape::Slice,
+        Shape::Pat => SShape::Pat,
+        Shape::Adt(k) => SShape::Adt(SDef(k.0)),
+        Shape::Foreign(k) => SShape::Foreign(SDef(k.0)),
+        Shape::FnDef(k) => SShape::FnDef(SDef(k.0)),
+        Shape::FnPtr(n) => SShape::FnPtr(n),
+        Shape::Dynamic(d) => SShape::Dynamic(SDef(d.map_or(0, |k| k.0))),
+        Shape::AnyInt => SShape::AnyInt,
+        Shape::AnyFloat => SShape::AnyFloat,
+        Shape::Param => SShape::Blanket,
+        Shape::Closure | Shape::Opaque(_) => return None,
+    })
+}
+
 /// typeck's lang item of the solver's.
 pub fn lang_item(l: Lang) -> LangItem {
     match l {
@@ -545,6 +612,7 @@ impl<'a> FactCache<'a> {
             nodes: Vec::new_in(alloc),
             lists: Vec::new_in(alloc),
             preds: Vec::new_in(alloc),
+            where_bounds: Vec::new_in(alloc),
             assoc_tys: Vec::new_in(alloc),
             impl_assoc: Vec::new_in(alloc),
             fields: Vec::new_in(alloc),
@@ -554,6 +622,10 @@ impl<'a> FactCache<'a> {
             impls: HashMap::new_in(alloc),
             impl_cols: HashMap::new_in(alloc),
             impl_columns: Vec::new_in(alloc),
+            header_cols: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            header_impl_defs: Vec::new_in(alloc),
+            header_columns: Vec::new_in(alloc),
+            survivor_scratch: Vec::new_in(alloc),
             fp_scratch: Vec::new_in(alloc),
             col_scratch: Vec::new_in(alloc),
             headers: HashMap::new_in(alloc),
@@ -629,6 +701,7 @@ impl<'a> FactCache<'a> {
             nodes: self.nodes.len(),
             lists: self.lists.len(),
             preds: self.preds.len(),
+            where_bounds: self.where_bounds.len(),
             assoc_tys: self.assoc_tys.len(),
             impl_assoc: self.impl_assoc.len(),
             fields: self.fields.len(),
@@ -658,6 +731,7 @@ impl<'a> FactCache<'a> {
             self.nodes.truncate(self.round_snap.nodes);
             self.lists.truncate(self.round_snap.lists);
             self.preds.truncate(self.round_snap.preds);
+            self.where_bounds.truncate(self.round_snap.where_bounds);
             self.assoc_tys.truncate(self.round_snap.assoc_tys);
             self.impl_assoc.truncate(self.round_snap.impl_assoc);
             self.fields.truncate(self.round_snap.fields);
@@ -721,6 +795,9 @@ impl<'a> FactCache<'a> {
             self.names.remove(&d);
         }
         self.round_inner_names.clear();
+        self.header_cols.clear();
+        self.header_impl_defs.clear();
+        self.header_columns.clear();
         self.retries = 0;
         self.counted = Converted::default();
     }
@@ -1185,6 +1262,438 @@ impl<'a> FactCache<'a> {
         Ok(())
     }
 
+    /// Whether a slot slice carries any region the trait solver distinguishes from erased
+    /// (`'static`, or a clause-bound `for<'a>` lifetime).
+    fn has_solver_region(slots: &[Region], binders: u32) -> bool {
+        slots.iter().any(|&r| {
+            r == Region::Static || (binders > 0 && matches!(r, Region::Late { binder: 0, var } if var < binders))
+        })
+    }
+
+    /// Converts one region slot to a solver region term at binder depth `depth`.
+    fn region_term(&mut self, r: Region, binders: u32, depth: u32, used_bound: &mut bool) -> STy {
+        match r {
+            Region::Static => {
+                let s = STy(self.nodes.len() as u32);
+                self.nodes.push(K::ReStatic);
+                s
+            }
+            Region::Late { binder: 0, var } if binders > 0 && var < binders => {
+                *used_bound = true;
+                let s = STy(self.nodes.len() as u32);
+                self.nodes.push(K::ReBound(depth, var));
+                s
+            }
+            _ => self.erased(),
+        }
+    }
+
+    /// Converts `root` with its pre-order region column `slots`, preserving `'static` and
+    /// `for<'a>` (`Late { binder: 0, var }`) on `Ref` and `Dynamic` nodes. Falls back to
+    /// `self.ty(c, root)` if no solver-relevant region appears or the column cannot be walked.
+    fn ty_with_regions(
+        &mut self,
+        c: Conv<'_>,
+        root: PTy,
+        slots: &[Region],
+        arity: &dyn Arity,
+        binders: u32,
+        used_bound: &mut bool,
+    ) -> Result<STy, Stop> {
+        if !Self::has_solver_region(slots, binders) {
+            return self.ty(c, root);
+        }
+        let mut pos = 0usize;
+        let mut budget = MOST_REGION_STEPS;
+        let mut local_bound = false;
+        if let Some(s) = self.ty_regions_iter(c, root, slots, &mut pos, arity, binders, &mut budget, &mut local_bound)?
+            && pos == slots.len()
+        {
+            *used_bound |= local_bound;
+            return Ok(s);
+        }
+        self.ty(c, root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ty_regions_iter(
+        &mut self,
+        c: Conv<'_>,
+        root: PTy,
+        slots: &[Region],
+        pos: &mut usize,
+        arity: &dyn Arity,
+        binders: u32,
+        budget: &mut u32,
+        used_bound: &mut bool,
+    ) -> Result<Option<STy>, Stop> {
+        enum RegBuild {
+            Ref(STy, Mutbl),
+            Dynamic(STy, u32),
+            Ptr(Mutbl),
+            Slice,
+            Array(STy),
+            Pat(SList),
+            Tuple(u32),
+            Record(u64, u32),
+            Union(u32),
+            Adt(SDef, u32),
+            FnDef(SDef, u32),
+            FnPtr(crate::ids::FnPtrHeader, u32),
+            Alias(SDef, u32),
+            Opaque(SDef, u32),
+            ExTrait(SDef, u32),
+            ExProj(SDef, u32),
+        }
+        enum RegWork {
+            Visit { t: PTy, depth: u32 },
+            Build(RegBuild),
+        }
+
+        let mut work: Vec<RegWork, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut vals: Vec<STy, Alloc<'a>> = Vec::new_in(self.alloc);
+        let push_list = |work: &mut Vec<RegWork, Alloc<'a>>, l: crate::ids::List, child_depth: u32| -> Result<(), Stop> {
+            for i in l.range().rev() {
+                let Ok(idx) = usize::try_from(i) else {
+                    return Err(CheckError::Malformed(Malformed::NoRecord(c.q)).into());
+                };
+                let p = c.t.list_slot(idx).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+                work.push(RegWork::Visit { t: p, depth: child_depth });
+            }
+            Ok(())
+        };
+        work.push(RegWork::Visit { t: root, depth: 0 });
+
+        while let Some(step) = work.pop() {
+            match step {
+                RegWork::Visit { t, depth } => {
+                    if *budget == 0 || depth > 128 {
+                        return Ok(None);
+                    }
+                    *budget -= 1;
+                    let node = c.t.node(t).map_err(Stop::from)?;
+                    let Ok(own) = region_arity(t, node, arity) else {
+                        return Ok(None);
+                    };
+                    let Ok(own_len) = usize::try_from(own) else {
+                        return Ok(None);
+                    };
+                    let Some(own_slots) = slots.get(*pos..pos.saturating_add(own_len)) else {
+                        return Ok(None);
+                    };
+                    *pos += own_len;
+
+                    match node {
+                        PNode::Ref(m, p) => {
+                            let Some(&r) = own_slots.first() else { return Ok(None) };
+                            let r = self.region_term(r, binders, depth, used_bound);
+                            work.push(RegWork::Build(RegBuild::Ref(r, m)));
+                            work.push(RegWork::Visit { t: p, depth });
+                        }
+                        PNode::Dynamic(l) => {
+                            let Some(&r) = own_slots.first() else { return Ok(None) };
+                            let r = self.region_term(r, binders, depth, used_bound);
+                            work.push(RegWork::Build(RegBuild::Dynamic(r, l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::Ptr(m, p) => {
+                            work.push(RegWork::Build(RegBuild::Ptr(m)));
+                            work.push(RegWork::Visit { t: p, depth });
+                        }
+                        PNode::Slice(e) => {
+                            work.push(RegWork::Build(RegBuild::Slice));
+                            work.push(RegWork::Visit { t: e, depth });
+                        }
+                        PNode::Array(e, n) => {
+                            let n = self.ty(c, n)?;
+                            work.push(RegWork::Build(RegBuild::Array(n)));
+                            work.push(RegWork::Visit { t: e, depth });
+                        }
+                        PNode::Pat(b, l) => {
+                            let l = self.list(c, l)?;
+                            work.push(RegWork::Build(RegBuild::Pat(l)));
+                            work.push(RegWork::Visit { t: b, depth });
+                        }
+                        PNode::Tuple(l) => {
+                            work.push(RegWork::Build(RegBuild::Tuple(l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::Record(schema, l) => {
+                            work.push(RegWork::Build(RegBuild::Record(schema.0, l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::Union(l) => {
+                            work.push(RegWork::Build(RegBuild::Union(l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::Adt(k, l) => {
+                            work.push(RegWork::Build(RegBuild::Adt(SDef(k.0), l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::FnDef(k, l) => {
+                            work.push(RegWork::Build(RegBuild::FnDef(SDef(k.0), l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::FnPtr(l, h) => {
+                            work.push(RegWork::Build(RegBuild::FnPtr(h, l.len)));
+                            push_list(&mut work, l, depth + 1)?;
+                        }
+                        PNode::Alias { trait_, name, args } => {
+                            let d = assoc_def(trait_, name);
+                            if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
+                                self.round_inner_names.push(d);
+                            }
+                            work.push(RegWork::Build(RegBuild::Alias(SDef(d), args.len)));
+                            push_list(&mut work, args, depth)?;
+                        }
+                        PNode::Opaque(k, l) => {
+                            work.push(RegWork::Build(RegBuild::Opaque(SDef(k.0), l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::ExTrait(k, l) => {
+                            work.push(RegWork::Build(RegBuild::ExTrait(SDef(k.0), l.len)));
+                            push_list(&mut work, l, depth + 1)?;
+                        }
+                        PNode::ExProj { trait_, name, args, term } => {
+                            let d = assoc_def(trait_, name);
+                            if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
+                                self.round_inner_names.push(d);
+                            }
+                            work.push(RegWork::Build(RegBuild::ExProj(SDef(d), args.len)));
+                            work.push(RegWork::Visit { t: term, depth: depth + 1 });
+                            push_list(&mut work, args, depth + 1)?;
+                        }
+                        PNode::Bool
+                        | PNode::Char
+                        | PNode::Int(_)
+                        | PNode::Uint(_)
+                        | PNode::Float(_)
+                        | PNode::Str
+                        | PNode::Never
+                        | PNode::Param(_)
+                        | PNode::ConstParam(_)
+                        | PNode::ConstValue { .. }
+                        | PNode::Error
+                        | PNode::ExAuto(_)
+                        | PNode::Foreign(_) => {
+                            vals.push(self.ty(c, t)?);
+                        }
+                        PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } | PNode::Infer => {
+                            return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(c.q)).into());
+                        }
+                    }
+                }
+                RegWork::Build(build) => {
+                    let pop_list = |vals: &mut Vec<STy, Alloc<'a>>, lists: &mut Vec<STy, Alloc<'a>>, len: u32| -> Option<SList> {
+                        let count = usize::try_from(len).ok()?;
+                        let start_idx = vals.len().checked_sub(count)?;
+                        let tail = vals.as_slice().get(start_idx..)?;
+                        let start = u32::try_from(lists.len()).ok()?;
+                        lists.extend_from_slice(tail);
+                        vals.truncate(start_idx);
+                        Some(SList { start, len })
+                    };
+                    let k = match build {
+                        RegBuild::Ref(r, m) => {
+                            let Some(p) = vals.pop() else { return Ok(None) };
+                            K::Ref(r, p, mutbl(m))
+                        }
+                        RegBuild::Dynamic(r, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Dynamic(l, r)
+                        }
+                        RegBuild::Ptr(m) => {
+                            let Some(p) = vals.pop() else { return Ok(None) };
+                            K::RawPtr(p, mutbl(m))
+                        }
+                        RegBuild::Slice => {
+                            let Some(e) = vals.pop() else { return Ok(None) };
+                            K::Slice(e)
+                        }
+                        RegBuild::Array(n) => {
+                            let Some(e) = vals.pop() else { return Ok(None) };
+                            K::Array(e, n)
+                        }
+                        RegBuild::Pat(l) => {
+                            let Some(b) = vals.pop() else { return Ok(None) };
+                            K::Pat(b, l)
+                        }
+                        RegBuild::Tuple(len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Tuple(l)
+                        }
+                        RegBuild::Record(schema, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Record(schema, l)
+                        }
+                        RegBuild::Union(len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Union(l)
+                        }
+                        RegBuild::Adt(d, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Adt(d, l)
+                        }
+                        RegBuild::FnDef(d, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::FnDef(d, l)
+                        }
+                        RegBuild::FnPtr(h, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::FnPtr(l, h)
+                        }
+                        RegBuild::Alias(d, len) => {
+                            let Some(args) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Alias(Rigid::No, SAlias::Projection, d, args)
+                        }
+                        RegBuild::Opaque(d, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Alias(Rigid::No, SAlias::Opaque, d, l)
+                        }
+                        RegBuild::ExTrait(d, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::ExTrait(d, l)
+                        }
+                        RegBuild::ExProj(d, len) => {
+                            let Some(term) = vals.pop() else { return Ok(None) };
+                            let Some(args) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::ExProj(d, args, term)
+                        }
+                    };
+                    let s = STy(self.nodes.len() as u32);
+                    self.nodes.push(k);
+                    vals.push(s);
+                }
+            }
+        }
+        Ok(vals.pop())
+    }
+
+    /// Converts impl where-clauses with their optional `HeadRegionRead`, recording higher-ranked
+    /// binder counts into `self.where_bounds` when any clause emits `ReBound`.
+    fn clauses_with_regions(
+        &mut self,
+        cs: &[PClause],
+        regions: Option<&dyn HeadRegionRead>,
+        c: Conv<'_>,
+    ) -> Result<Span, Stop> {
+        let Some(hr) = regions else {
+            self.clauses(cs, c)?;
+            return Ok(Span::default());
+        };
+        let n_reg = hr.clause_count();
+        let mut any_interesting = false;
+        for i in 0..n_reg {
+            if let Some((_, binders, col)) = hr.clause(i)
+                && Self::has_solver_region(col.as_slice(), binders)
+            {
+                any_interesting = true;
+                break;
+            }
+        }
+        if !any_interesting {
+            self.clauses(cs, c)?;
+            return Ok(Span::default());
+        }
+        let arity = hr.arity();
+        let bounds_start = self.where_bounds.len();
+        let mut any_bound = false;
+        let mut reg_idx = 0usize;
+        for (nth, cl) in cs.iter().enumerate() {
+            let nth32 = nth as u32;
+            while reg_idx < n_reg {
+                match hr.clause(reg_idx) {
+                    Some((r_nth, _, _)) if r_nth < nth32 => reg_idx += 1,
+                    _ => break,
+                }
+            }
+            let clause_reg = match hr.clause(reg_idx) {
+                Some((r_nth, binders, col)) if r_nth == nth32 => Some((binders, col)),
+                _ => None,
+            };
+            let mut used_bound = false;
+            let mut bound = 0u32;
+            let p = match *cl {
+                PClause::Trait { trait_, args } => {
+                    let sargs = match clause_reg {
+                        Some((binders, col)) if Self::has_solver_region(col.as_slice(), binders) => {
+                            let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(args.len as usize, self.alloc);
+                            for (k, i) in args.range().enumerate() {
+                                let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+                                let st = match col.child(k as u32) {
+                                    Some(sl) => self.ty_with_regions(c, p, sl, arity, binders, &mut used_bound)?,
+                                    None => self.ty(c, p)?,
+                                };
+                                terms.push(st);
+                            }
+                            if used_bound {
+                                bound = binders;
+                                any_bound = true;
+                            }
+                            let start = self.lists.len() as u32;
+                            self.lists.extend_from_slice(&terms);
+                            SList { start, len: args.len }
+                        }
+                        _ => self.list(c, args)?,
+                    };
+                    Pred::Trait { trait_: SDef(trait_.0), args: sargs, polarity: Polarity::Positive }
+                }
+                PClause::Projection { trait_, args, name, term } => {
+                    let d = assoc_def(trait_, name);
+                    self.record_name(d, trait_, name);
+                    let (sargs, sterm) = match clause_reg {
+                        Some((binders, col)) if Self::has_solver_region(col.as_slice(), binders) => {
+                            let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(args.len as usize, self.alloc);
+                            for (k, i) in args.range().enumerate() {
+                                let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+                                let st = match col.child(k as u32) {
+                                    Some(sl) => self.ty_with_regions(c, p, sl, arity, binders, &mut used_bound)?,
+                                    None => self.ty(c, p)?,
+                                };
+                                terms.push(st);
+                            }
+                            let sterm = match col.child(args.len) {
+                                Some(sl) => self.ty_with_regions(c, term, sl, arity, binders, &mut used_bound)?,
+                                None => self.ty(c, term)?,
+                            };
+                            if used_bound {
+                                bound = binders;
+                                any_bound = true;
+                            }
+                            let start = self.lists.len() as u32;
+                            self.lists.extend_from_slice(&terms);
+                            (SList { start, len: args.len }, sterm)
+                        }
+                        _ => (self.list(c, args)?, self.ty(c, term)?),
+                    };
+                    let alias = self.nodes.len() as u32;
+                    self.nodes.push(K::Alias(Rigid::No, SAlias::Projection, SDef(d), sargs));
+                    Pred::Projection { alias: STy(alias), term: sterm }
+                }
+                PClause::Const { cond, args } => {
+                    #[cfg(test)]
+                    if self.drop_const_clauses {
+                        continue;
+                    }
+                    Pred::ConstHolds { cond: SDef(cond.0), args: self.list(c, args)? }
+                }
+                PClause::ForFields { container, trait_, args } => Pred::ForFields {
+                    container: self.ty(c, container)?,
+                    trait_: SDef(trait_.0),
+                    args_after_self: self.list(c, args)?,
+                },
+                PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
+            };
+            self.preds.push(p);
+            self.where_bounds.push(bound);
+        }
+        if !any_bound {
+            self.where_bounds.truncate(bounds_start);
+            return Ok(Span::default());
+        }
+        Ok(Span::of(&self.where_bounds, bounds_start))
+    }
+
     /// An answer's portable table is the call's whole converted table (its handles are
     /// absolute): every node an answer reaches was converted into it, once per call.
     fn start(&self) -> Por {
@@ -1426,13 +1935,25 @@ impl<'a> FactCache<'a> {
         }
         let por = self.start();
         let c = self.table(q, h.types);
-        // The trait's arguments, self first: a list of its own.
-        let self_ty = self.ty(c, h.self_ty)?;
+        // The trait's arguments, self first: a list of its own. Preserve `'static` slots from the
+        // impl's head regions so `impl From<&'static str> for T` never satisfies `for<'s> From<&'s str>`.
+        let hdr_regions = h.regions.and_then(|hr| hr.impl_header().map(|cols| (hr.arity(), cols)));
+        let mut dummy_bound = false;
+        let self_ty = match hdr_regions {
+            Some((arity, (self_col, _))) => {
+                self.ty_with_regions(c, h.self_ty, self_col.as_slice(), arity, 0, &mut dummy_bound)?
+            }
+            None => self.ty(c, h.self_ty)?,
+        };
         let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(h.trait_args.list().len as usize + 1, self.alloc);
         terms.push(self_ty);
-        for i in h.trait_args.list().range() {
+        for (idx, i) in h.trait_args.list().range().enumerate() {
             let p = h.types.list_slot(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
-            terms.push(self.ty(c, p)?);
+            let st = match hdr_regions.and_then(|(arity, (_, tc))| tc.and_then(|tc| tc.child(idx as u32 + 1)).map(|sl| (arity, sl))) {
+                Some((arity, sl)) => self.ty_with_regions(c, p, sl, arity, 0, &mut dummy_bound)?,
+                None => self.ty(c, p)?,
+            };
+            terms.push(st);
         }
         let args = SList { start: self.lists.len() as u32, len: terms.len() as u32 };
         self.lists.extend_from_slice(&terms);
@@ -1452,7 +1973,7 @@ impl<'a> FactCache<'a> {
         let assoc = Span::of(&self.impl_assoc, assoc);
         let wcc = self.table(Question::Predicates(k), wc.types);
         let wheres = self.preds.len();
-        self.clauses(wc.clauses, wcc)?;
+        let where_bounds = self.clauses_with_regions(wc.clauses, wc.regions, wcc)?;
         let wheres = Span::of(&self.preds, wheres);
         for c in wc.clauses {
             if let PClause::Const { cond, .. } = *c {
@@ -1470,6 +1991,7 @@ impl<'a> FactCache<'a> {
             trait_: SDef(trait_.0),
             args,
             wheres,
+            where_bounds,
             assoc,
             por: self.end(por),
             digest: digest("blaze-typeck impl", &reads.digest(q)?) ^ digest("blaze-typeck impl where", &reads.digest(Question::Predicates(k))?),
@@ -1988,6 +2510,111 @@ impl<'a> FactCache<'a> {
         Portable { nodes: p.nodes.get(&self.nodes), lists: p.lists.get(&self.lists) }
     }
 
+    /// Prefilters `bucket` (from `reads.impls_of(trait_, shape)`) against `goal_args` using
+    /// SIMD fingerprint columns (`blaze_solve::prefilter`), appending surviving impl keys in
+    /// bucket order into `out`.
+    ///
+    /// - Reuses solver-filled `impl_cols` when already cached (zero extra reads).
+    /// - Keeps direct scan for small buckets (`<= 16` impls).
+    /// - For larger uncached buckets (`> 16`), builds and caches header-only fingerprint columns
+    ///   via `reads.impl_header` (never touching `reads.predicates`).
+    pub(crate) fn prefilter_impls<W: World>(
+        &mut self,
+        trait_: ItemKey,
+        shape: Shape,
+        bucket: &[ItemKey],
+        terms: &crate::infer::Terms<'_>,
+        goal_args: SList,
+        reads: &mut Reads<'_, '_, W>,
+        out: &mut Vec<ItemKey, Alloc<'_>>,
+    ) -> Result<(), crate::instance::ResolveError> {
+        if bucket.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let first_only = self.first_impl_only;
+        #[cfg(not(test))]
+        let first_only = false;
+        let goal_fp = prefilter::fingerprint_goal(terms, goal_args);
+        if !first_only
+            && let Some(ss) = sshape(shape)
+            && let Some(r) = self.impls.get(&(trait_.0, ss))
+            && let Some(&(at, stride)) = self.impl_cols.get(&(trait_.0, ss))
+            && r.span.len as usize == bucket.len()
+        {
+            let impls = r.span.get(&self.impl_defs);
+            let at_usize = usize::try_from(at).unwrap_or(usize::MAX);
+            let col_len = prefilter::WIDTH.saturating_mul(usize::try_from(stride).unwrap_or(usize::MAX));
+            if let Some(bytes) = self.impl_columns.get(at_usize..at_usize.saturating_add(col_len)) {
+                let len = u32::try_from(impls.len()).unwrap_or(u32::MAX);
+                self.survivor_scratch.clear();
+                prefilter::filter(&goal_fp, Columns { bytes, stride, len }, &mut self.survivor_scratch);
+                for &idx in self.survivor_scratch.iter() {
+                    if let Some(&d) = impls.get(idx as usize) {
+                        out.push(ItemKey(d.0));
+                    }
+                }
+                return Ok(());
+            }
+        }
+        if bucket.len() <= crate::machine::NAME_HASH_THRESHOLD {
+            out.extend_from_slice(bucket);
+            return Ok(());
+        }
+        if !self.header_cols.contains_key(&(trait_, shape)) {
+            let def_start = self.header_impl_defs.len();
+            self.fp_scratch.clear();
+            let mut terms_buf: Vec<STy, Alloc<'a>> = Vec::new_in(self.alloc);
+            for &imp in bucket {
+                let q = Question::ImplHeader(imp);
+                let Some(h) = reads.impl_header(imp)? else {
+                    return Err(crate::instance::ResolveError::Missing(q));
+                };
+                if h.trait_ != Some(trait_) || h.polarity != crate::world::ImplPolarity::Positive {
+                    continue;
+                }
+                let por = self.start();
+                let c = self.table(q, h.types);
+                let self_ty = self.ty(c, h.self_ty)?;
+                terms_buf.clear();
+                terms_buf.push(self_ty);
+                for i in h.trait_args.list().range() {
+                    let p = h.types.list_slot(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+                    terms_buf.push(self.ty(c, p)?);
+                }
+                let args = SList { start: self.lists.len() as u32, len: terms_buf.len() as u32 };
+                self.lists.extend_from_slice(&terms_buf);
+                let por = self.end(por);
+                let fp = prefilter::fingerprint_impl(self.portable(por), args);
+                self.header_impl_defs.push(imp);
+                self.fp_scratch.push(fp);
+            }
+            let span = Span::of(&self.header_impl_defs, def_start);
+            let stride = prefilter::columns_of(&self.fp_scratch, &mut self.col_scratch);
+            let at = u32::try_from(self.header_columns.len()).unwrap_or(u32::MAX);
+            self.header_columns.extend_from_slice(&self.col_scratch);
+            self.header_cols.insert((trait_, shape), (span, at, stride));
+        }
+        if let Some(&(span, at, stride)) = self.header_cols.get(&(trait_, shape)) {
+            let impls = span.get(&self.header_impl_defs);
+            let at_usize = usize::try_from(at).unwrap_or(usize::MAX);
+            let col_len = prefilter::WIDTH.saturating_mul(usize::try_from(stride).unwrap_or(usize::MAX));
+            if let Some(bytes) = self.header_columns.get(at_usize..at_usize.saturating_add(col_len)) {
+                let len = u32::try_from(impls.len()).unwrap_or(u32::MAX);
+                self.survivor_scratch.clear();
+                prefilter::filter(&goal_fp, Columns { bytes, stride, len }, &mut self.survivor_scratch);
+                for &idx in self.survivor_scratch.iter() {
+                    if let Some(&imp) = impls.get(idx as usize) {
+                        out.push(imp);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        out.extend_from_slice(bucket);
+        Ok(())
+    }
+
     /// The allocator the cache is in.
     pub fn alloc(&self) -> Alloc<'a> {
         self.alloc
@@ -2041,6 +2668,7 @@ impl Facts for FactCache<'_> {
             trait_: r.trait_,
             args: r.args,
             where_clauses: r.wheres.get(&self.preds),
+            where_clause_bounds: r.where_bounds.get(&self.where_bounds),
             assoc: r.assoc.get(&self.impl_assoc),
             portable: self.portable(r.por),
             digest: r.digest,

@@ -535,8 +535,88 @@ fn find<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, e: Entry) -> Result<
     Ok(Some((constant, ty)))
 }
 
+/// The most need/const-eval steps one waiting impl constant may take when remade after its
+/// waited-on sibling leaf finishes (rule 18).
+const MOST_REMAKE_STEPS: u32 = 64;
+
+/// Ensures `want` for a waiting impl constant being remade, evaluating any constants its head
+/// needs through `eval_const`.
+fn ensure_for_remake<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    want: super::heads::Want,
+    steps: &mut u32,
+    eval_const: &mut dyn FnMut(&mut Records<'_, 'n, S>, LibKey) -> Result<(), ConstFail>,
+) -> Result<(), super::types::Why> {
+    use super::heads::HeadError;
+    use super::types::Why;
+    loop {
+        match r.store.ensure(r.names, r.keys, want) {
+            Ok(()) => return Ok(()),
+            Err(HeadError::Item(_, Why::NeedConst(c, range))) if *steps < MOST_REMAKE_STEPS => {
+                *steps += 1;
+                eval_const(r, c).map_err(|err| Why::ConstPath(std::format!("{err}").into_boxed_str(), range))?;
+            }
+            Err(HeadError::Item(_, why)) => return Err(why),
+            Err(err) => return Err(Why::Program(std::format!("{err}").into_boxed_str(), blaze_surface::Range::new(0, 0))),
+        }
+    }
+}
+
+/// Remakes the impl constants that waited on the leaf `need` (`Store::const_waits`), evaluating
+/// any anonymous or referenced constants (e.g. `[Row; Row::COUNT - 1]` -> `"6usize - 1"`) and
+/// ensuring any heads their types need before filing each constant's `FnHead` or gap.
+fn remake_waiting<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    need: LibKey,
+    eval_const: &mut dyn FnMut(&mut Records<'_, 'n, S>, LibKey) -> Result<(), ConstFail>,
+) {
+    use super::types::Why;
+    let due = r.store.take_const_waits(need);
+    for (mk, w) in due {
+        let mut steps = 0u32;
+        loop {
+            match r.store.remake_const(r.names, w, mk) {
+                Ok(()) => {
+                    r.store.fn_gaps.remove(&mk);
+                    break;
+                }
+                Err(Why::Need(dep)) if steps < MOST_REMAKE_STEPS => {
+                    steps += 1;
+                    match ensure_for_remake(r, super::heads::Want::Head(dep), &mut steps, eval_const) {
+                        Ok(()) => continue,
+                        Err(why) => {
+                            r.store.record_remake_refusal(mk, w, why);
+                            break;
+                        }
+                    }
+                }
+                Err(Why::NeedConst(c, range)) if steps < MOST_REMAKE_STEPS => {
+                    steps += 1;
+                    match eval_const(r, c) {
+                        Ok(()) => continue,
+                        Err(err) => {
+                            let why = Why::ConstPath(std::format!("{err}").into_boxed_str(), range);
+                            r.store.record_remake_refusal(mk, w, why);
+                            break;
+                        }
+                    }
+                }
+                Err(why) => {
+                    r.store.record_remake_refusal(mk, w, why);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Files the outcome of one leaf: its value and type, or its refusal by name.
-fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, need: LibKey, out: Result<Option<(u128, PNode)>, InherentFail>) {
+fn file<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    need: LibKey,
+    out: Result<Option<(u128, PNode)>, InherentFail>,
+    eval_const: &mut dyn FnMut(&mut Records<'_, 'n, S>, LibKey) -> Result<(), ConstFail>,
+) {
     let state = match out {
         Ok(Some((bits, ty))) => {
             r.store.maps.file_bits(need, bits);
@@ -554,8 +634,9 @@ fn file<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, need: LibKey, out: R
     r.store.maps.inherents.borrow_mut().set(need, state);
     // The impl constants whose rows waited on this leaf (heads.rs `ConstWait`: a sibling
     // constant's type named it while it was evaluated) are made now, with its value or its
-    // refusal in the text.
-    r.store.remake_waiting(r.names, need);
+    // refusal in the text, evaluating any anonymous constant expressions (such as
+    // `Row::COUNT - 1`) that substituting the leaf produces.
+    remake_waiting(r, need, eval_const);
 }
 
 /// Answers the leaf under need key `c` and every other asked leaf with no answer yet (one round
@@ -595,7 +676,7 @@ pub fn eval_asked<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, c: LibKey)
         {
             b.clear_provisional();
         }
-        file(r, e.need, out);
+        file(r, e.need, out, &mut |r, need_c| super::check::eval_len(r, need_c));
     }
     true
 }
@@ -623,6 +704,150 @@ pub fn first<'n, S: NamesSource<'n>>(consts: &mut Consts<'n>, r: &mut Records<'_
         Ok(None) => Ok(None),
         Err(e) => Err(e),
     };
-    file(r, c, out);
+    file(r, c, out, &mut |r, need_c| consts.eval_const_need(r, prepared, need_c));
     Some(Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::front2::heads::{Store, Want};
+    use crate::front2::index::Index;
+    use crate::front2::keys::{Keys, MemberKind, checker_of, member_key_of};
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::front2::source::NamesSource;
+    use crate::front2::tables::head::{HeadSource, SeededHeads, SeededHeadsOpts, StoreConsts, file_frozen};
+    use crate::front2::tables::head_tests::{a, world_of};
+    use blaze_id::ItemKey as LibKey;
+    use blaze_lower::scoped::Prepares;
+    use blaze_surface::ItemDetail;
+
+    const ROW_APP: &str = "#![no_std]
+pub enum Row {
+    Expander,
+    Lowering,
+    BodyChecker,
+    Names,
+    CodeBuilder,
+    Whole,
+}
+impl Row {
+    pub const COUNT: usize = 6;
+    pub const ALL: [Row; Row::COUNT] =
+        [Row::Expander, Row::Lowering, Row::BodyChecker, Row::Names, Row::CodeBuilder, Row::Whole];
+    pub const FROM_SOURCE: [Row; Row::COUNT - 1] =
+        [Row::Expander, Row::Lowering, Row::BodyChecker, Row::Names, Row::CodeBuilder];
+}
+pub fn five() -> [Row; 5] { Row::FROM_SOURCE }
+pub fn six() -> [Row; 6] { Row::FROM_SOURCE }
+";
+
+    fn find_impl(names: crate::front2::tables::head_tests::Src) -> LibKey {
+        let mut found = None;
+        NamesSource::each_item(names, 0, &mut |key, _| {
+            if matches!(NamesSource::detail_of(names, key), Some(ItemDetail::Impl)) {
+                found = Some(key);
+            }
+        });
+        found.expect("impl in fixture")
+    }
+
+    fn find_fn(names: crate::front2::tables::head_tests::Src, name: &str) -> LibKey {
+        let mut found = None;
+        NamesSource::each_item(names, 0, &mut |key, _| {
+            if NamesSource::name_of(names, key) == Some(name) {
+                found = Some(key);
+            }
+        });
+        found.unwrap_or_else(|| panic!("fn `{name}` not found"))
+    }
+
+    #[test]
+    fn sibling_const_expr_in_impl_const_type_checks_and_freezes_cleanly() {
+        let (names, sized, frame) = world_of(ROW_APP);
+        let impl_lib = find_impl(names);
+        let impl_ck = checker_of(impl_lib);
+
+        // 1. Direct body checks of all three associated constants + callers.
+        let mut world = ProjectWorld::from_records(names, frame, &[1], a()).expect("project world");
+        for name in ["COUNT", "ALL", "FROM_SOURCE"] {
+            let v = world.check(BodyRef::Member { container: impl_lib, is_trait: false, kind: MemberKind::Const, name }, a());
+            assert!(v.refused.is_none(), "`Row::{name}` was refused: {:?}", v.refused);
+            assert!(v.gaps.is_empty(), "`Row::{name}` had gaps: {:?}", v.gaps);
+            assert!(v.diagnostics.is_empty(), "`Row::{name}` had diags: {:?}", v.diagnostics);
+        }
+        let five = world.check(BodyRef::Free(find_fn(names, "five")), a());
+        assert!(five.refused.is_none() && five.gaps.is_empty() && five.diagnostics.is_empty(), "`five` failed: {:?}", (&five.refused, &five.gaps, &five.diagnostics));
+        // Negative type-check control: `[Row; 5]` vs `[Row; 6]` must report E0308.
+        let six = world.check(BodyRef::Free(find_fn(names, "six")), a());
+        assert!(six.refused.is_none(), "`six` was refused: {:?}", six.refused);
+        assert!(six.diagnostics.iter().any(|d| d.code == "E0308"), "expected E0308 for `six`, got {:?}", six.diagnostics);
+
+        // 2. Seeded freeze + re-import round-trip (the Stage-2 path that hit `NoHead`):
+        // freezing `Want::Impl` must remake `FROM_SOURCE` (`[Row; Row::COUNT - 1]`) and export its
+        // `FnHead` so a fresh seeded store has it in `store.fns` and checks its body cleanly.
+        let index = Index::from_source(names, &[1]).expect("index");
+        let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+        let prepared = Prepares::new_in(bump);
+        let mut store_consts = StoreConsts { names, index: &index, prepared: &prepared };
+        let mut seeded = SeededHeads::new(SeededHeadsOpts {
+            names,
+            sized,
+            pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP,
+            frame,
+            scratch: a(),
+            alloc: a(),
+            consts: Some(&mut store_consts),
+            known: None,
+            owners: None,
+        });
+        let frozen = seeded.frozen(Want::Impl(impl_lib)).expect("freeze `impl Row`");
+        let fresh = Store::new(sized, frame, a());
+        let keys = Keys::new();
+        file_frozen(names, Want::Impl(impl_lib), frozen, &fresh, &keys, a()).expect("import frozen `impl Row`");
+        let from_source_key = member_key_of(impl_ck, MemberKind::Const, "FROM_SOURCE");
+        assert!(fresh.fns.contains_key(&from_source_key), "`Row::FROM_SOURCE` head missing after freeze/import");
+        assert!(fresh.fn_gaps.get(&from_source_key).is_none(), "`Row::FROM_SOURCE` unexpectedly in fn_gaps: {:?}", fresh.fn_gaps.get(&from_source_key));
+    }
+
+    #[test]
+    fn cyclic_sibling_const_preserves_refusal_across_freeze_instead_of_no_head() {
+        const CYCLE_APP: &str = "#![no_std]
+pub struct Bad;
+impl Bad {
+    pub const A: [u8; Bad::B] = [0; 2];
+    pub const B: usize = Bad::A.len();
+}
+";
+        let (names, sized, frame) = world_of(CYCLE_APP);
+        let impl_lib = find_impl(names);
+        let impl_ck = checker_of(impl_lib);
+        let mut world = ProjectWorld::from_records(names, frame, &[1], a()).expect("project world");
+        let v = world.check(BodyRef::Member { container: impl_lib, is_trait: false, kind: MemberKind::Const, name: "A" }, a());
+        assert!(v.refused.is_some(), "cyclic `Bad::A` must be refused, not clean");
+
+        // Freezing `impl Bad` must either refuse the impl or export `Bad::A`'s `FnRefused` gap
+        // so a seeded store never reports a silent `NoHead`.
+        let index = Index::from_source(names, &[1]).expect("index");
+        let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+        let prepared = Prepares::new_in(bump);
+        let mut store_consts = StoreConsts { names, index: &index, prepared: &prepared };
+        let mut seeded = SeededHeads::new(SeededHeadsOpts {
+            names,
+            sized,
+            pointers: crate::front2::receiver::Pointers::NOT_LOOKED_UP,
+            frame,
+            scratch: a(),
+            alloc: a(),
+            consts: Some(&mut store_consts),
+            known: None,
+            owners: None,
+        });
+        if let Ok(frozen) = seeded.frozen(Want::Impl(impl_lib)) {
+            let fresh = Store::new(sized, frame, a());
+            let keys = Keys::new();
+            file_frozen(names, Want::Impl(impl_lib), frozen, &fresh, &keys, a()).expect("import frozen `impl Bad`");
+            let a_key = member_key_of(impl_ck, MemberKind::Const, "A");
+            assert!(fresh.fn_gaps.contains_key(&a_key), "refused `Bad::A` must preserve its fn_gaps entry across freeze, not drop to NoHead");
+        }
+    }
 }

@@ -291,16 +291,26 @@ fn tables<'a>(
     }
 
     // `eh_frame`, its pc-relative fields filled once every table's place is known.
+    // On Mach-O, every framed Rust function without an LSDA uses `COMPACT_FRAME` directly in
+    // `__unwind_info` and never references `__eh_frame` (matching Apple `ld64`/`lld`), so only
+    // landing functions emit a Rust FDE. Skipping dead FDEs keeps `__eh_frame` compact so
+    // DWARF-mode FDE offsets stay within `__unwind_info`'s 24-bit field even on large binaries.
     let mut f: AVec<'a, u8> = Vec::new_in(alloc);
     let mut patches: AVec<'_, (usize, PatchTo)> = Vec::new_in(alloc);
-    let plain_cie = f.len();
-    cie(&mut f, None, &mut patches)?;
+    let plain_cie = match platform {
+        Platform::MacosArm64 => None,
+        Platform::LinuxArm64 | Platform::Wasm64 => {
+            let offset = f.len();
+            cie(&mut f, None, &mut patches)?;
+            Some(offset)
+        }
+    };
     let landing_cie = match (landing, personality_at) {
         (0, _) | (_, None) => plain_cie,
         (_, Some(routine)) => {
             let offset = f.len();
             cie(&mut f, Some(routine), &mut patches)?;
-            offset
+            Some(offset)
         }
     };
     let mut functions = 0u32;
@@ -308,12 +318,18 @@ fn tables<'a>(
         let Some(frame) = c.unwind.frame() else {
             continue;
         };
-        let start = f.len();
-        f.extend_from_slice(&[0; 4]);
-        let cie_at = match given[k].lsda {
+        functions += 1;
+        if platform == Platform::MacosArm64 && given[k].lsda.is_none() {
+            continue;
+        }
+        let Some(cie_at) = (match given[k].lsda {
             Some(_) => landing_cie,
             None => plain_cie,
+        }) else {
+            continue;
         };
+        let start = f.len();
+        f.extend_from_slice(&[0; 4]);
         let back = u32_of((f.len() - cie_at) as u64, "an FDE's CIE pointer")?;
         f.extend_from_slice(&back.to_le_bytes());
         patches.push((f.len(), PatchTo::Image(c.at)));
@@ -330,7 +346,6 @@ fn tables<'a>(
         eh::frame_program(frame, &mut f);
         finish(&mut f, start)?;
         given[k].fde = Some(u32_of(start as u64, "an FDE's offset in eh_frame")?);
-        functions += 1;
     }
     // The native image's CIEs and FDEs, after Rust's, before the one terminator.
     let native_at = f.len();
@@ -397,17 +412,16 @@ fn tables<'a>(
 
 /// The `unwind_info` encoding of one function (the module's doc says which form when).
 fn encoding(c: &Covered<'_>, given: Given) -> Result<u32, ExportError> {
-    let Some(fde) = given.fde else {
+    let Some(frame) = c.unwind.frame() else {
         return Ok(0);
     };
-    let compact_word = match given.lsda {
-        Some(_) => None,
-        None => c.unwind.frame().map(compact),
-    };
-    match compact_word {
-        Some(word) => Ok(word),
-        None if fde & !DWARF_OFFSET == 0 => Ok(COMPACT_DWARF | fde),
-        None => Err(ExportError::TooLarge { what: "an FDE's offset in __unwind_info's DWARF mode (24 bits)", len: u64::from(fde) }),
+    match given.lsda {
+        None => Ok(compact(frame)),
+        Some(_) => match given.fde {
+            Some(fde) if fde & !DWARF_OFFSET == 0 => Ok(COMPACT_DWARF | fde),
+            Some(fde) => Err(ExportError::TooLarge { what: "an FDE's offset in __unwind_info's DWARF mode (24 bits)", len: u64::from(fde) }),
+            None => Ok(0),
+        },
     }
 }
 

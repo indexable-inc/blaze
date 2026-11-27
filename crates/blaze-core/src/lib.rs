@@ -39,6 +39,29 @@ pub mod atomic;
 pub mod boot;
 pub mod busy;
 pub mod chan;
+
+/// Implementation source bytes of linked process spawning, confinement entry, and the async
+/// read/wait driver stack reached by hermetic verification, hashed into content-addressed runner
+/// keys (AGENTS.md rule 69).
+pub const SPAWN_SOURCE: &[&[u8]] = &[
+    include_bytes!("process.rs"),
+    include_bytes!("process/linked.rs"),
+    include_bytes!("process/linked/channel.rs"),
+    include_bytes!("process/linked/run.rs"),
+    include_bytes!("process/spawn.rs"),
+    include_bytes!("process/spawn/streams.rs"),
+    include_bytes!("uring.rs"),
+    include_bytes!("uring/files.rs"),
+    include_bytes!("uring/flight.rs"),
+    include_bytes!("uring/ops.rs"),
+    include_bytes!("threads.rs"),
+    include_bytes!("threads/inline.rs"),
+    include_bytes!("threads/opening.rs"),
+    include_bytes!("wait.rs"),
+    include_bytes!("wait/ring.rs"),
+    include_bytes!("wait/direct.rs"),
+    include_bytes!("wait/retry.rs"),
+];
 /// Safe plain-old-data (`Pod`), `Zeroable`, `CheckedBitPattern`, and `TransparentWrapper`
 /// conversions (`blaze_own::pod`): Blaze's safe replacement for `core::mem::transmute`.
 pub use blaze_own::pod;

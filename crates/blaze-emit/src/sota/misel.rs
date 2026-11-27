@@ -39,7 +39,7 @@ use crate::enc;
 use crate::pass::{BRK_DIV_OVERFLOW, BRK_DIV_ZERO, BRK_UNREACHABLE};
 
 use super::CallMode;
-use super::layout::{BlockLayout, compute_block_layout};
+use super::layout::{BlockLayout, compute_block_layout, compute_fast_block_layout};
 use super::mfunc::{
     AddrMode, DEFAULT_RET_LIVE_GPRS, EncodedMFunc, FpAluOp, LogicalKind, MBlock, MCond,
     MEncodeError, MExt, MFunc, MFuncOpts, MInst, MInstFlags, MNoteKind, MOp, MReg, MShift,
@@ -189,6 +189,11 @@ pub struct MIseOpts<'a> {
     pub internal_fast: bool,
     /// Sorted slice of LIR `Op::Call` instruction indices whose callee uses `InternalFast`.
     pub internal_fast_calls: &'a [u32],
+    /// Fast cold-compilation mode ([`super::EmitProfile::Fast`]): uses `O(V + E)` RPO block
+    /// layout (skipping Ext-TSP), skips pre-RA & post-RA `mopt` and `msched`, and runs single-pass
+    /// bitmask linear-scan `mra`, while preserving exact ABI, IPRA `CallClobbers`, unwind frames,
+    /// call sites, traps, and runtime semantics.
+    pub fast_mode: bool,
 }
 
 /// Aggregate V3 pipeline telemetry returned by [`emit_mfunc_ssa_a64`] (Rule 85).
@@ -215,44 +220,56 @@ pub fn emit_mfunc_ssa_a64<'a>(
     // 1. Strict upfront subset validation (zero silent fallbacks, Rules 3 & 4).
     check_misel_subset(&view, names, opts)?;
 
-    // 2. Ext-TSP block layout & BlockFreq weights.
-    let layout = compute_block_layout(&view, alloc);
+    // 2. Block layout: O(V + E) RPO in fast cold mode; Ext-TSP + BlockFreq in full SOTA mode.
+    let layout = if opts.fast_mode {
+        compute_fast_block_layout(&view, alloc)
+    } else {
+        compute_block_layout(&view, alloc)
+    };
 
     // 3. Pure SSA VReg + explicit VFlag + ParallelCopy instruction selection.
     let mut sel = select_mfunc_ssa(&view, names, &layout, opts, alloc)?;
 
-    // 4. Verify SSA MFunc before pre-RA optimization.
-    mverify(&sel.mfunc).map_err(map_verify_err)?;
-
-    let target_model = TargetModel::from_machine(opts.machine);
-
-    // 5. Pre-RA SSA optimization & loop-recurrence scheduling.
-    let mopt_pre = optimize_mfunc(&mut sel.mfunc, alloc);
-    if !sel.unwind_entries.is_empty() {
-        add_unwind_cfg_edges(&mut sel.mfunc, &sel.unwind_entries, alloc);
-    }
-    mverify(&sel.mfunc).map_err(|_| TierError::Refused {
-        tier: TIER,
-        inst: None,
-        what: "misel internal post-mopt_pre mverify failure",
-    })?;
-    let msched_pre = schedule_mfunc(&mut sel.mfunc, target_model, alloc);
-    mverify(&sel.mfunc).map_err(|_| TierError::Refused {
-        tier: TIER,
-        inst: None,
-        what: "misel internal post-msched_pre mverify failure",
-    })?;
+    // 4 & 5. Pre-RA SSA optimization & loop-recurrence scheduling (skipped in fast cold mode;
+    // unwind CFG edges are still wired before `allocate_mfunc`).
+    let (mopt_pre, msched_pre) = if opts.fast_mode {
+        if !sel.unwind_entries.is_empty() {
+            add_unwind_cfg_edges(&mut sel.mfunc, &sel.unwind_entries, alloc);
+        }
+        (MOptStats::default(), MSchedStats::default())
+    } else {
+        mverify(&sel.mfunc).map_err(map_verify_err)?;
+        let target_model = TargetModel::from_machine(opts.machine);
+        let mopt_pre = optimize_mfunc(&mut sel.mfunc, alloc);
+        if !sel.unwind_entries.is_empty() {
+            add_unwind_cfg_edges(&mut sel.mfunc, &sel.unwind_entries, alloc);
+        }
+        mverify(&sel.mfunc).map_err(|_| TierError::Refused {
+            tier: TIER,
+            inst: None,
+            what: "misel internal post-mopt_pre mverify failure",
+        })?;
+        let msched_pre = schedule_mfunc(&mut sel.mfunc, target_model, alloc);
+        mverify(&sel.mfunc).map_err(|_| TierError::Refused {
+            tier: TIER,
+            inst: None,
+            what: "misel internal post-msched_pre mverify failure",
+        })?;
+        (mopt_pre, msched_pre)
+    };
 
     // 6. Rebind per-call IPRA CallClobbers to post-mopt/msched MFunc instruction indices.
     let mfunc_call_clobbers = bind_call_clobbers(&sel.mfunc, &sel.call_clobbers_seq, alloc)?;
 
-    // 7. Linear-time SSA register allocation (remat, cold-exit split, IPRA, X29 leaf, ParallelCopy).
+    // 7. Linear-time SSA register allocation (fast single-pass bitmask scan in fast cold mode;
+    // remat, cold-exit split, coalescing, IPRA, X29 leaf, ParallelCopy in full SOTA mode).
     let mra_opts = MRaOpts {
         allow_x29_leaf: !sel.has_calls && !sel.uses_fp,
         scratch_gpr_order: opts.scratch_gpr_order,
-        block_weights: &sel.block_weights,
+        block_weights: if opts.fast_mode { &[] } else { &sel.block_weights },
         call_clobbers: &mfunc_call_clobbers,
         spill_base_off: sel.spill_base_off,
+        fast_mode: opts.fast_mode,
     };
     let mra_out = allocate_mfunc(&mut sel.mfunc, mra_opts, alloc).map_err(map_mra_err)?;
 
@@ -269,9 +286,16 @@ pub fn emit_mfunc_ssa_a64<'a>(
         alloc,
     )?;
 
-    // 9. Post-RA optimization (PostIdx + copy/branch cleanup) & macro-op cmp+b.cc scheduling.
-    let mopt_post = optimize_mfunc(&mut sel.mfunc, alloc);
-    let msched_post = schedule_mfunc(&mut sel.mfunc, target_model, alloc);
+    // 9. Post-RA optimization (PostIdx + copy/branch cleanup) & macro-op cmp+b.cc scheduling
+    // (skipped in fast cold mode).
+    let (mopt_post, msched_post) = if opts.fast_mode {
+        (MOptStats::default(), MSchedStats::default())
+    } else {
+        let target_model = TargetModel::from_machine(opts.machine);
+        let mopt_post = optimize_mfunc(&mut sel.mfunc, alloc);
+        let msched_post = schedule_mfunc(&mut sel.mfunc, target_model, alloc);
+        (mopt_post, msched_post)
+    };
 
     // 10. Post-RA structural verification & 1-pass binary encoding with >32KB branch relaxation.
     mverify(&sel.mfunc).map_err(map_verify_err)?;
@@ -976,7 +1000,7 @@ pub(crate) fn check_misel_subset(
                         let outside = Outside::Vtable(ref_rec.place);
                         match names.name(outside) {
                             Some(Named::Symbol(_)) => {}
-                            Some(Named::C(_)) => {
+                            Some(Named::C(_) | Named::WeakC(_)) => {
                                 return Err(refuse(Some(inst), "C name for vtable"));
                             }
                             None => return Err(TierError::NoName { tier: TIER, of: outside }),
@@ -1014,7 +1038,7 @@ pub(crate) fn check_misel_subset(
                                     let outside = Outside::Vtable(target.place);
                                     match names.name(outside) {
                                         Some(Named::Symbol(_)) => {}
-                                        Some(Named::C(_)) => {
+                                        Some(Named::C(_) | Named::WeakC(_)) => {
                                             return Err(refuse(Some(inst), "C name for vtable in data"));
                                         }
                                         None => {
@@ -1249,7 +1273,7 @@ pub(crate) fn check_misel_subset(
                 let call_fast = is_internal_fast_call(opts.internal_fast_calls, inst);
                 match names.name(outside) {
                     None => return Err(TierError::NoName { tier: TIER, of: outside }),
-                    Some(Named::C(_)) if call_fast => {
+                    Some(Named::C(_) | Named::WeakC(_)) if call_fast => {
                         return Err(refuse(Some(inst), "InternalFast on extern C call"));
                     }
                     Some(_) => {}
@@ -1313,7 +1337,7 @@ pub(crate) fn check_misel_subset(
                 let call_fast = is_internal_fast_call(opts.internal_fast_calls, inst);
                 match names.name(outside) {
                     None => return Err(TierError::NoName { tier: TIER, of: outside }),
-                    Some(Named::C(_)) if call_fast => {
+                    Some(Named::C(_) | Named::WeakC(_)) if call_fast => {
                         return Err(refuse(Some(inst), "InternalFast on extern C invoke"));
                     }
                     Some(_) => {}
@@ -1417,6 +1441,10 @@ impl<'a> TargetTable<'a> {
     }
 
     fn intern_c_name(&mut self, c_name: &str) -> Result<u32, TierError> {
+        self.intern_c_name_in_space(c_name, Space::Outside)
+    }
+
+    fn intern_c_name_in_space(&mut self, c_name: &str, space: Space) -> Result<u32, TierError> {
         let sym = Symbol::of_name(c_name);
         let mut have_name = false;
         for &(existing_sym, _, _) in self.names.iter() {
@@ -1435,7 +1463,7 @@ impl<'a> TargetTable<'a> {
             }
             self.names.push((sym, start, len));
         }
-        self.intern_target(Target { space: Space::Outside, symbol: sym })
+        self.intern_target(Target { space, symbol: sym })
     }
 
     fn intern_outside(
@@ -1455,7 +1483,13 @@ impl<'a> TargetTable<'a> {
                 if !allow_c_name {
                     return Err(refuse(Some(inst), "C name for non-func/static"));
                 }
-                self.intern_c_name(c_name)
+                self.intern_c_name_in_space(c_name, Space::Outside)
+            }
+            Named::WeakC(c_name) => {
+                if !allow_c_name {
+                    return Err(refuse(Some(inst), "C name for non-func/static"));
+                }
+                self.intern_c_name_in_space(c_name, Space::WeakOutside)
             }
         }
     }
@@ -1467,7 +1501,8 @@ impl<'a> TargetTable<'a> {
         };
         match named {
             Named::Symbol(sym) => self.intern_target(Target { space: Space::Func, symbol: sym }),
-            Named::C(c_name) => self.intern_c_name(c_name),
+            Named::C(c_name) => self.intern_c_name_in_space(c_name, Space::Outside),
+            Named::WeakC(c_name) => self.intern_c_name_in_space(c_name, Space::WeakOutside),
         }
     }
 }
@@ -1819,10 +1854,8 @@ const fn float_cond_to_mcond(c: FloatCond) -> Option<MCond> {
 }
 
 fn lookup_lir_call_clobbers(table: &[(u32, CallClobbers)], lir_inst: u32) -> CallClobbers {
-    for &(idx, clob) in table {
-        if idx == lir_inst {
-            return clob;
-        }
+    if let Ok(pos) = table.binary_search_by_key(&lir_inst, |&(idx, _)| idx) {
+        return table[pos].1;
     }
     CallClobbers::C_ABI_ARM64
 }
@@ -9782,6 +9815,7 @@ fn bind_call_clobbers<'a>(
             }
         }
     }
+    bound.sort_unstable_by_key(|&(idx, _)| idx);
     Ok(bound)
 }
 
@@ -10773,6 +10807,7 @@ mod tests {
             call_clobbers: &[],
             internal_fast: false,
             internal_fast_calls: &[],
+            fast_mode: false,
         }
     }
 
@@ -12120,6 +12155,7 @@ mod tests {
                 block_weights: &sel.block_weights,
                 call_clobbers: &[],
                 spill_base_off: sel.spill_base_off,
+                fast_mode: false,
             },
             alloc,
         )

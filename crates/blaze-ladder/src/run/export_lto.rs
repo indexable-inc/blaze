@@ -1510,7 +1510,7 @@ struct PreparedBody<'s, 'o, 'm> {
     verified: blaze_lir::Verified<'o>,
     funcs: AVec<'s, Callee<'o>>,
     statics: AVec<'s, ItemKey>,
-    c_statics: AVec<'s, (ItemKey, &'o str)>,
+    c_statics: AVec<'s, crate::code_records::ForeignStatic<'o>>,
     vtables: AVec<'s, Symbol>,
     vtable_data: Vec<(Symbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
     tls: AVec<'s, ItemKey>,
@@ -2155,6 +2155,8 @@ where
     let mut total_scanned = 0usize;
     let mut reserve_scans = 0usize;
     let mut origins: Vec<LtoOrigin, SharedAlloc<'static>> = Vec::with_capacity_in(call_queue.len(), shared);
+    let mut missing_walk_declared: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> = Vec::new_in(shared);
+    let mut missing_walk_syms: AVec<'a, Symbol> = Vec::new_in(alloc);
     let mut call_head = 0usize;
     let mut indirect_head = 0usize;
     while origins.len() < opts.max_bodies && total_scanned < max_scanned {
@@ -2193,9 +2195,20 @@ where
         let Some(grant) = grant_for(tabled) else {
             return Err(ExportLtoError::NotRunnable { symbol: symbol.0, tabled });
         };
+        let mut lto_decl = crate::body_ids::DeclaredList::new_in(alloc);
         let mut built = maker
-            .build_lir_in(&grant, tabled, name, shared)
+            .build_lir_with_reach_in(&grant, tabled, name, Some(&mut lto_decl), shared)
             .map_err(|error| ExportLtoError::BuildLir { symbol: symbol.0, error })?;
+        for idx in 0..lto_decl.len() {
+            let (decl_tabled, decl_name) = lto_decl.row(idx);
+            let decl_sym = crate::symbols::fn_symbol_of_name(decl_name);
+            if walk.row_of(&decl_sym).is_none() && !missing_walk_syms.contains(&decl_sym) {
+                missing_walk_syms.push(decl_sym);
+                let mut copied = Vec::with_capacity_in(decl_name.len(), shared);
+                copied.extend_from_slice(decl_name);
+                missing_walk_declared.push((decl_tabled, copied));
+            }
+        }
         let lowered_libm = lower_ieee_libm_calls(&mut built, opts.machine, alloc);
         if lowered_libm {
             verify(built.func.view())
@@ -2322,16 +2335,16 @@ where
         }
         let mut statics: AVec<'a, ItemKey> = Vec::with_capacity_in(orig.built.statics.len(), alloc);
         statics.extend_from_slice(orig.built.statics.as_slice());
-        let mut c_statics: AVec<'a, (ItemKey, &str)> = Vec::with_capacity_in(orig.built.c_statics.len(), alloc);
-        for &(item, start, len) in orig.built.c_statics.iter() {
-            let Some(cname) = orig.built.c_str(start, len) else {
+        let mut c_statics: AVec<'a, crate::code_records::ForeignStatic<'_>> = Vec::with_capacity_in(orig.built.c_statics.len(), alloc);
+        for cs in orig.built.c_statics.iter() {
+            let Some(cname) = orig.built.c_str(cs.start, cs.len) else {
                 return Err(ExportLtoError::BadRef {
                     symbol: orig.symbol.0,
                     what: "original foreign static name",
                     ref_id: 0,
                 });
             };
-            c_statics.push((item, cname));
+            c_statics.push(crate::code_records::ForeignStatic { item: cs.item, name: cname, weak: cs.weak });
         }
         let mut vtables: AVec<'a, Symbol> = Vec::with_capacity_in(orig.built.vtables.len(), alloc);
         vtables.extend_from_slice(orig.built.vtables.as_slice());
@@ -2401,10 +2414,10 @@ where
                         });
                     };
                     put_at(&mut statics, place, item, orig.symbol.0, "imported static place", imp.caller_ref.0)?;
-                    if let Some(cname) = src_origin.built.foreign_static_name(item)
-                        && !c_statics.iter().any(|(k, _)| *k == item)
+                    if let Some((cname, weak)) = src_origin.built.foreign_static(item)
+                        && !c_statics.iter().any(|cs| cs.item == item)
                     {
-                        c_statics.push((item, cname));
+                        c_statics.push(crate::code_records::ForeignStatic { item, name: cname, weak });
                     }
                 }
                 RefKind::Vtable => {
@@ -2896,6 +2909,10 @@ where
                 inlined_bodies: prep.inlined_bodies,
             });
         }
+    }
+
+    if let Some(first) = out_bodies.first_mut() {
+        first.extra_declared.extend(missing_walk_declared);
     }
 
     Ok(ExportLtoOut {

@@ -94,6 +94,7 @@ pub mod internal_symbol;
 pub mod builtins_shim;
 pub mod panic_entry;
 pub mod pattern_ty;
+pub mod poly_canon;
 pub mod nested_exports;
 pub mod preds;
 pub mod heads_regions;

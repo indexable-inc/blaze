@@ -997,6 +997,7 @@ pub(crate) fn stringified(
     // needed once the group starts, so it is not kept.
     let mut levels: AVec<'_, bool> = Vec::new_in(alloc);
     let mut prev: Option<Printed> = None;
+    let mut prev_joint_dot = false;
     for (at, token) in tokens.iter().enumerate() {
         let next = match token.kind {
             TokenKind::Close(delim) => {
@@ -1009,10 +1010,31 @@ pub(crate) fn stringified(
                     (Delim::Invisible, _) => "",
                 });
                 prev = Some(Printed::Group { delim, joint: token.kind.spacing() != Spacing::Alone });
+                prev_joint_dot = false;
                 continue;
             }
             TokenKind::Open(delim) => Printed::Group { delim, joint: false },
-            TokenKind::Punct { char, spacing } => Printed::Punct { char, joint: spacing != Spacing::Alone },
+            TokenKind::Punct { char, spacing } => {
+                let compound = match char {
+                    '.' => {
+                        prev_joint_dot
+                            || (spacing == Spacing::Joint
+                                && matches!(
+                                    tokens.get(at + 1).map(|t| t.kind),
+                                    Some(TokenKind::Punct { char: '.', .. })
+                                ))
+                    }
+                    '!' => {
+                        spacing == Spacing::Joint
+                            && matches!(
+                                tokens.get(at + 1).map(|t| t.kind),
+                                Some(TokenKind::Punct { char: '=', .. })
+                            )
+                    }
+                    _ => false,
+                };
+                Printed::Punct { char, joint: spacing != Spacing::Alone, compound }
+            }
             TokenKind::Ident { raw, spacing } => Printed::Ident {
                 keyword: raw == Raw::No && KEYWORDS.contains(&stream.text_of(token)),
                 joint: spacing != Spacing::Alone,
@@ -1037,6 +1059,7 @@ pub(crate) fn stringified(
                 });
                 levels.push(spaced);
                 prev = None;
+                prev_joint_dot = false;
                 continue;
             }
             TokenKind::Punct { char, .. } => into.push_char(char),
@@ -1053,6 +1076,7 @@ pub(crate) fn stringified(
             TokenKind::Close(_) => unreachable!("a close is written above"),
         }
         prev = Some(next);
+        prev_joint_dot = matches!(token.kind, TokenKind::Punct { char: '.', spacing: Spacing::Joint });
     }
     Ok(())
 }
@@ -1061,7 +1085,9 @@ pub(crate) fn stringified(
 /// end is joint with what follows (a group's: its closing delimiter's).
 #[derive(Clone, Copy)]
 enum Printed {
-    Punct { char: char, joint: bool },
+    /// `compound` is true when `.` or `!` is part of a multi-character operator (`..`, `..=`,
+    /// `...`, `!=`), so single-punct `space_between` rules do not fire on it.
+    Punct { char: char, joint: bool, compound: bool },
     Ident { keyword: bool, joint: bool },
     Literal { joint: bool },
     Group { delim: Delim, joint: bool },
@@ -1101,10 +1127,15 @@ impl Printed {
         }
         // rustc's `space_between`.
         match (self, next) {
-            _ if self.punct() == Some('.') && next.punct().is_none() => false,
+            (Printed::Punct { char: '.', compound: false, .. }, _) if next.punct().is_none() => false,
             (_, Printed::Ident { .. }) if self.punct() == Some('$') => false,
             // astlog-ignore: expand-hand-extent (stringify's spacing between printed tokens)
-            _ if self.punct().is_none() && matches!(next.punct(), Some(',' | ';' | '.')) => false,
+            (_, Printed::Punct { char: ',' | ';', .. }) if self.punct().is_none() => false,
+            (_, Printed::Punct { char: '.', compound: false, .. }) if self.punct().is_none() => false,
+            (
+                Printed::Ident { keyword: false, .. } | Printed::Group { .. },
+                Printed::Punct { char: '!', compound: false, .. },
+            ) => false,
             (Printed::Ident { keyword, .. }, Printed::Group { delim: Delim::Paren, .. }) => keyword,
             (_, Printed::Group { delim, .. }) if self.punct() == Some('#') => delim != Delim::Bracket,
             _ => true,

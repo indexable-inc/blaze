@@ -23,6 +23,8 @@
 //! - [`draw`]: the draws tests need beyond the tape's own (floats, text, maps, options), built
 //!   only from the tape's public draws, so they replay and shrink with no code of their own.
 //! - [`flight`]: answers in flight, delivered by choice, oldest first when calm, gone at a kill.
+//! - [`scaling`]: empirical complexity scaling oracle over deterministic work units and allocated
+//!   bytes (no wall-clock timing), verifying `O(1)`..`O(N^2)` growth on time and space axes.
 //! - [`text`]: a tape as text, which a failure prints and `BLAZE_SIM_TAPE` gives back.
 
 #![forbid(unsafe_code)]
@@ -65,6 +67,7 @@ pub mod kind;
 #[macro_use]
 pub mod limits;
 pub mod observe;
+pub mod scaling;
 pub mod search;
 pub mod shape;
 pub mod shrink;
@@ -87,6 +90,10 @@ pub use differ::{Answer, Approved, Differ, Pair, Side, differ, differ_all};
 pub use any_in::AnyIn;
 pub use draw::Any;
 pub use flight::{Flight, Nanos};
+pub use scaling::{
+    Axis, ScalingBound, ScalingCheck, ScalingViolation, WorkSample, assert_scaling, check_axis,
+    check_scaling, check_work_scaling, verify_scaling,
+};
 pub use search::{
     Broke, Broken, Config, Ended, Failed, Failure, Given, GivenError, Origin, Passed, Verdict,
 };

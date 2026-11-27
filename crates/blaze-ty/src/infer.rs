@@ -186,6 +186,14 @@ impl<'a> Vars<'a> {
         id
     }
 
+    /// Whether `v` is still an unconstrained singleton variable (never bound to a value and never
+    /// unified with any other variable since it was created).
+    pub(crate) fn is_singleton(&self, table: Table, v: u32) -> bool {
+        let t = &self.t[table.at()];
+        let i = ix(v);
+        t.parent[i] == v && t.rank[i] == 0 && t.value[i] == NONE
+    }
+
     /// How many variables `table` has.
     pub(crate) fn count(&self, table: Table) -> usize {
         self.t[table.at()].parent.len()

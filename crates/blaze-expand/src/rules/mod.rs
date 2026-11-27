@@ -1258,7 +1258,7 @@ pub(crate) fn glued_len(kind_at: impl Fn(u32) -> Option<TokenKind>, at: u32) -> 
     let mut glued: &str = char.encode_utf8(&mut buf);
     let mut last = spacing;
     let mut len = 1u8;
-    while last != Spacing::Alone {
+    while last == Spacing::Joint {
         let Some(TokenKind::Punct { char: next, spacing }) = kind_at(at + u32::from(len)) else {
             break;
         };

@@ -157,9 +157,45 @@ pub static BUILTIN_SPECS: &[BuiltinSpec] = &[
     },
     BuiltinSpec {
         name: "sort-by",
-        signature: "sort-by [-r|--reverse] [-i|--ignore-case] [col|closure]...",
-        summary: "Sort a table or list by column(s), closure, or natural order",
+        signature: "sort-by [-r|--reverse] [-i|--ignore-case] [col|-col|closure]...",
+        summary: "Sort a table or list by column(s) (-col for descending), closure, or natural order",
         flags: &["-r", "--reverse", "-i", "--ignore-case"],
+    },
+    BuiltinSpec {
+        name: "sort",
+        signature: "sort [col|-col]...",
+        summary: "Sort a list or table (prefix column with `-` for descending, e.g. `sort -size`)",
+        flags: &["-r", "--reverse", "-i", "--ignore-case"],
+    },
+    BuiltinSpec {
+        name: "top",
+        signature: "top [n] [col]",
+        summary: "Return the top n rows/items sorted descending (e.g. `ls | top 10 size`)",
+        flags: &[],
+    },
+    BuiltinSpec {
+        name: "freq",
+        signature: "freq [col]",
+        summary: "Ranked frequency table with counts and percentage bars (e.g. `.package.version | freq`)",
+        flags: &[],
+    },
+    BuiltinSpec {
+        name: "find",
+        signature: "find <query>",
+        summary: "Case-insensitive search across every column/field of a table, list, or record",
+        flags: &[],
+    },
+    BuiltinSpec {
+        name: "count",
+        signature: "count",
+        summary: "Count rows, items, fields, or characters (alias of length)",
+        flags: &[],
+    },
+    BuiltinSpec {
+        name: "map",
+        signature: "map <expr | { expr } | {|x| expr }>",
+        summary: "Transform each row or item using `.` (e.g. `map $\"(.name)@(.version)\"`)",
+        flags: &[],
     },
     BuiltinSpec {
         name: "reverse",
@@ -237,6 +273,12 @@ pub static BUILTIN_SPECS: &[BuiltinSpec] = &[
         name: "columns",
         signature: "columns",
         summary: "Return the column names of a table or keys of a record",
+        flags: &[],
+    },
+    BuiltinSpec {
+        name: "keys",
+        signature: "keys",
+        summary: "Return the keys of a record or column names of a table",
         flags: &[],
     },
     BuiltinSpec {
@@ -598,9 +640,15 @@ pub static BUILTIN_SPECS: &[BuiltinSpec] = &[
     },
     // Core / Meta / Session
     BuiltinSpec {
+        name: "schema",
+        signature: "schema [value]",
+        summary: "Inspect the inferred schema, patterns, and distributions of a value (or $_)",
+        flags: &[],
+    },
+    BuiltinSpec {
         name: "describe",
-        signature: "describe",
-        summary: "Describe the type or schema of the pipeline input",
+        signature: "describe [value]",
+        summary: "Inspect the inferred schema, patterns, and distributions of a value (alias of schema)",
         flags: &[],
     },
     BuiltinSpec {
@@ -1536,25 +1584,28 @@ pub(crate) fn dispatch_builtin<'a>(
         "select" => builtin_select(eval, args, input, span)?,
         "reject" => builtin_reject(eval, args, input, span)?,
         "get" => builtin_get(eval, args, input, span)?,
-        "sort-by" => builtin_sort_by(eval, args, input, span)?,
+        "sort-by" | "sort" => builtin_sort_by(eval, args, input, span)?,
+        "top" => builtin_top(eval, args, input, span)?,
+        "freq" => builtin_freq(eval, args, input, span)?,
+        "find" => builtin_find(eval, args, input, span)?,
         "reverse" => builtin_reverse(eval, input, span)?,
         "first" => builtin_first(eval, args, input, span)?,
         "last" => builtin_last(eval, args, input, span)?,
         "skip" => builtin_skip(eval, args, input, span)?,
         "take" => builtin_take(eval, args, input, span)?,
         "uniq" => builtin_uniq(eval, args, input, span)?,
-        "length" => builtin_length(eval, input, span)?,
+        "length" | "count" => builtin_length(eval, input, span)?,
         "compact" => builtin_compact(eval, args, input, span)?,
         "flatten" => builtin_flatten(eval, args, input, span)?,
         "enumerate" => builtin_enumerate(eval, input, span)?,
         "transpose" => builtin_transpose(eval, args, input, span)?,
         "headers" => builtin_headers(eval, input, span)?,
-        "columns" => builtin_columns(eval, input, span)?,
+        "columns" | "keys" => builtin_columns(eval, input, span)?,
         "values" => builtin_values(eval, input, span)?,
         "append" => builtin_append(eval, args, input, span)?,
         "prepend" => builtin_prepend(eval, args, input, span)?,
         "zip" => builtin_zip(eval, args, input, span)?,
-        "each" => builtin_each(eval, args, input, span)?,
+        "each" | "map" => builtin_each(eval, args, input, span)?,
         "filter" => builtin_filter(eval, args, input, span)?,
         "reduce" => builtin_reduce(eval, args, input, span)?,
         "group-by" => builtin_group_by(eval, args, input, span)?,
@@ -1566,7 +1617,7 @@ pub(crate) fn dispatch_builtin<'a>(
         "lines" => builtin_lines(eval, input, span)?,
         "parse" => builtin_parse(eval, args, input, span)?,
         // Core / Meta / Session
-        "describe" => builtin_describe(eval, input),
+        "schema" | "describe" => builtin_schema(eval, &args, input, span)?,
         "echo" => builtin_echo(eval, args),
         "print" => builtin_print(eval, args, input)?,
         "do" => builtin_do(eval, args, input, span)?,
@@ -2054,6 +2105,50 @@ fn builtin_open<'a>(
     match core::str::from_utf8(bytes.as_slice()) {
         Ok(text) => Ok(Value::string(text, alloc)),
         Err(_) => Ok(Value::binary(bytes.as_slice(), alloc)),
+    }
+}
+
+/// Pure `#![no_std]` structured file parser matching `open`'s format sniffer (JSON, JSONL,
+/// TOML / `Cargo.toml` / `Cargo.lock`, CSV, TSV), used for zero-Tab live autocomplete in
+/// pipelines like `open Cargo.lock | .package.version`.
+pub fn parse_open_preview<'a>(path: &str, bytes: &[u8], alloc: Alloc<'a>) -> Option<Value<'a>> {
+    let span = Span::new(0, 0);
+    let sniff = blaze_sniff::sniff_file(path, bytes);
+    match sniff.label {
+        "JSON" | "Node manifest" | "TS config" | "Nix lock" => {
+            from_json_bytes(bytes, span, alloc).ok()
+        }
+        "JSONL" => {
+            let text = core::str::from_utf8(bytes).ok()?;
+            let mut list = PVec::new(alloc);
+            for line in text.lines().take(64) {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if let Ok(val) = from_json_bytes(t.as_bytes(), span, alloc) {
+                    list.push(val);
+                }
+            }
+            if let Some(tbl) = Table::try_from_list(&list, alloc) {
+                Some(Value::Table(tbl))
+            } else if !list.is_empty() {
+                Some(Value::List(list))
+            } else {
+                None
+            }
+        }
+        "TOML" | "Cargo manifest" | "Cargo lock" | "uv lock" | "Blaze lock"
+        | "Clippy config" | "Rustfmt config" | "Python proj" | "Rust pin" => {
+            let text = core::str::from_utf8(bytes).ok()?;
+            from_toml_str(text, span, alloc).ok()
+        }
+        "CSV" | "TSV" => {
+            let text = core::str::from_utf8(bytes).ok()?;
+            let sep = if sniff.label == "TSV" { '\t' } else { ',' };
+            Some(Value::Table(parse_csv(text, false, sep, alloc)))
+        }
+        _ => None,
     }
 }
 
@@ -2829,14 +2924,36 @@ fn builtin_sort_by<'a>(
 
     match input {
         Value::Table(t) => {
-            if args.pos.is_empty() {
-                return Err(arity_err("sort-by", "expected column name or closure for table", span, alloc));
+            // Collect per-column sort specs `(col_index, descending)`:
+            // - positional `col` -> ascending (flipped by `-r`)
+            // - short flag `-col` (not `-r`/`-i`, or matching a column) -> descending!
+            let mut desc_flag_cols: AVec<'a, (usize, bool)> = AVec::new_in(alloc);
+            for (fname, short, fval, _, fspan) in args.flags.iter() {
+                if *short && fval.is_none() && fname.as_ref() != "r" && fname.as_ref() != "i" {
+                    let Some(ci) = t.col_index(fname.as_ref()) else {
+                        let mut msg = AString::from_str_in("table has no column `", alloc);
+                        msg.push_str(fname.as_ref());
+                        msg.push('`');
+                        return Err(Control::Error(ShellError::new(
+                            ErrorKind::MissingColumn,
+                            *fspan,
+                            msg.as_str(),
+                            alloc,
+                        )));
+                    };
+                    desc_flag_cols.push((ci, !reverse));
+                }
+            }
+            if args.pos.is_empty() && desc_flag_cols.is_empty() {
+                return Err(arity_err("sort-by", "expected column name (`col` or `-col`) or closure for table", span, alloc));
             }
             let n = t.nrows();
             let mut keys: AVec<'a, (usize, AVec<'a, Value<'a>>)> = AVec::with_capacity_in(n, alloc);
-            let mut first_sort_col: Option<usize> = None;
-            if let Value::Closure(c) = &args.pos[0].0 {
+            let mut col_dirs: AVec<'a, bool> = AVec::new_in(alloc);
+            let mut first_sort_col: Option<(usize, bool)> = None;
+            if let Some((Value::Closure(c), _)) = args.pos.first() {
                 let c = c.share();
+                col_dirs.push(reverse);
                 for r in 0..n {
                     eval.charge(1, span)?;
                     let rec = Value::Record(t.row_record(r).unwrap());
@@ -2846,12 +2963,16 @@ fn builtin_sort_by<'a>(
                     keys.push((r, kv));
                 }
             } else {
-                let mut col_idxs = AVec::with_capacity_in(args.pos.len(), alloc);
+                let mut col_specs: AVec<'a, (usize, bool)> = AVec::new_in(alloc);
                 for (v, s) in args.pos.iter() {
                     let cname = value_as_col_name(v, *s, alloc).map_err(Control::Error)?;
-                    let Some(ci) = t.col_index(cname.as_str()) else {
+                    let (raw_col, col_desc) = match cname.as_str().strip_prefix('-') {
+                        Some(stripped) if !stripped.is_empty() => (stripped, !reverse),
+                        _ => (cname.as_str(), reverse),
+                    };
+                    let Some(ci) = t.col_index(raw_col) else {
                         let mut msg = AString::from_str_in("table has no column `", alloc);
-                        msg.push_str(cname.as_str());
+                        msg.push_str(raw_col);
                         msg.push('`');
                         return Err(Control::Error(ShellError::new(
                             ErrorKind::MissingColumn,
@@ -2860,15 +2981,19 @@ fn builtin_sort_by<'a>(
                             alloc,
                         )));
                     };
-                    if first_sort_col.is_none() {
-                        first_sort_col = Some(ci);
-                    }
-                    col_idxs.push(ci);
+                    col_specs.push((ci, col_desc));
+                }
+                for &(ci, desc) in desc_flag_cols.iter() {
+                    col_specs.push((ci, desc));
+                }
+                first_sort_col = col_specs.first().copied();
+                for &(_, desc) in col_specs.iter() {
+                    col_dirs.push(desc);
                 }
                 for r in 0..n {
                     eval.charge(1, span)?;
-                    let mut kv = AVec::with_capacity_in(col_idxs.len(), alloc);
-                    for &ci in col_idxs.iter() {
+                    let mut kv = AVec::with_capacity_in(col_specs.len(), alloc);
+                    for &(ci, _) in col_specs.iter() {
                         kv.push(t.cell(r, ci).unwrap().share());
                     }
                     keys.push((r, kv));
@@ -2876,17 +3001,18 @@ fn builtin_sort_by<'a>(
             }
 
             keys.sort_unstable_by(|(ia, ka), (ib, kb)| {
-                for (va, vb) in ka.iter().zip(kb.iter()) {
+                for (idx, (va, vb)) in ka.iter().zip(kb.iter()).enumerate() {
                     let ord = compare_values_for_sort(va, vb, ignore_case, alloc);
                     if ord != Ordering::Equal {
-                        return if reverse { ord.reverse() } else { ord };
+                        let desc = col_dirs.get(idx).copied().unwrap_or(reverse);
+                        return if desc { ord.reverse() } else { ord };
                     }
                 }
                 ia.cmp(ib)
             });
 
             let mut out = t.empty_like();
-            out.initial_sort = first_sort_col.map(|ci| (ci, reverse));
+            out.initial_sort = first_sort_col;
             for (r, _) in keys.iter() {
                 eval.charge(1, span)?;
                 out.push_record(&t.row_record(*r).unwrap());
@@ -3335,6 +3461,14 @@ fn builtin_length<'a>(
     span: Span,
 ) -> Result<Value<'a>, Control<'a>> {
     let alloc = eval.alloc();
+    let input = if matches!(input, Value::Nothing) {
+        eval.state()
+            .get_var("_")
+            .map(|s| s.value.share())
+            .unwrap_or(Value::Nothing)
+    } else {
+        input
+    };
     match input {
         Value::Table(t) => Ok(Value::Int(t.nrows() as i64)),
         Value::List(l) => Ok(Value::Int(l.len() as i64)),
@@ -5397,48 +5531,280 @@ fn builtin_from<'a>(
 // 6. Core / Meta / Session Builtins
 // =============================================================================
 
-fn builtin_describe<'a>(eval: &Evaluator<'a, '_>, input: Value<'a>) -> Value<'a> {
+fn builtin_top<'a>(
+    eval: &mut Evaluator<'a, '_>,
+    args: EvalArgs<'a>,
+    input: Value<'a>,
+    span: Span,
+) -> Result<Value<'a>, Control<'a>> {
     let alloc = eval.alloc();
-    match &input {
+    let input = if matches!(input, Value::Nothing) {
+        eval.state()
+            .get_var("_")
+            .map(|s| s.value.share())
+            .unwrap_or(Value::Nothing)
+    } else {
+        input
+    };
+    let (limit, col_arg): (usize, Option<(&Value<'a>, Span)>) = match args.pos.as_slice() {
+        [] => (10, None),
+        [(Value::Int(n), _)] => ((*n).max(0) as usize, None),
+        [(Value::Int(n), _), (col, cspan), ..] => ((*n).max(0) as usize, Some((col, *cspan))),
+        [(col, cspan), ..] => (10, Some((col, *cspan))),
+    };
+
+    match input {
         Value::Table(t) => {
-            if t.ncols() == 0 {
-                return Value::string("table", alloc);
+            let n = t.nrows();
+            let mut rows_ord: AVec<'a, usize> = AVec::with_capacity_in(n, alloc);
+            for r in 0..n {
+                rows_ord.push(r);
             }
-            let mut out = AString::from_str_in("table<", alloc);
-            for c in 0..t.ncols() {
-                if c > 0 {
-                    out.push_str(", ");
-                }
-                out.push_str(t.columns.get(c).unwrap().as_ref());
-                out.push_str(": ");
-                let ty = if t.nrows() > 0 {
-                    t.cell(0, c).unwrap().type_name()
-                } else {
-                    "any"
+            let mut sort_col = None;
+            if let Some((col_v, cspan)) = col_arg {
+                let cname = value_as_col_name(col_v, cspan, alloc).map_err(Control::Error)?;
+                let Some(ci) = t.col_index(cname.as_str()) else {
+                    let mut msg = AString::from_str_in("table has no column `", alloc);
+                    msg.push_str(cname.as_str());
+                    msg.push('`');
+                    return Err(Control::Error(ShellError::new(
+                        ErrorKind::MissingColumn,
+                        cspan,
+                        msg.as_str(),
+                        alloc,
+                    )));
                 };
-                out.push_str(ty);
+                sort_col = Some(ci);
+                rows_ord.sort_unstable_by(|&a, &b| {
+                    let va = t.cell(a, ci).unwrap();
+                    let vb = t.cell(b, ci).unwrap();
+                    compare_values_for_sort(va, vb, false, alloc)
+                        .reverse()
+                        .then_with(|| a.cmp(&b))
+                });
             }
-            out.push('>');
-            Value::string(out.as_str(), alloc)
+            let mut out = t.empty_like();
+            out.initial_sort = sort_col.map(|ci| (ci, true));
+            for &r in rows_ord.iter().take(limit) {
+                eval.charge(1, span)?;
+                out.push_record(&t.row_record(r).unwrap());
+            }
+            Ok(Value::Table(out))
+        }
+        Value::List(items) => {
+            let n = items.len();
+            let mut keyed: AVec<'a, (usize, Value<'a>)> = AVec::with_capacity_in(n, alloc);
+            for i in 0..n {
+                eval.charge(1, span)?;
+                keyed.push((i, items.get(i).unwrap().share()));
+            }
+            keyed.sort_unstable_by(|(ia, a), (ib, b)| {
+                compare_values_for_sort(a, b, false, alloc)
+                    .reverse()
+                    .then_with(|| ia.cmp(ib))
+            });
+            let mut out = PVec::new(alloc);
+            for (i, _) in keyed.iter().take(limit) {
+                out.push(items.get(*i).unwrap().share());
+            }
+            Ok(Value::List(out))
+        }
+        _ => Err(type_err("`top` expects a table or list", span, alloc)),
+    }
+}
+
+fn builtin_freq<'a>(
+    eval: &mut Evaluator<'a, '_>,
+    args: EvalArgs<'a>,
+    input: Value<'a>,
+    span: Span,
+) -> Result<Value<'a>, Control<'a>> {
+    let alloc = eval.alloc();
+    let input = if matches!(input, Value::Nothing) {
+        eval.state()
+            .get_var("_")
+            .map(|s| s.value.share())
+            .unwrap_or(Value::Nothing)
+    } else {
+        input
+    };
+    let series: PVec<'a, Value<'a>> = match input {
+        Value::List(items) => items,
+        Value::Table(t) => {
+            let Some((col_v, cspan)) = args.pos.first() else {
+                return Err(arity_err("freq", "expected column name for table (e.g. `freq version`)", span, alloc));
+            };
+            let cname = value_as_col_name(col_v, *cspan, alloc).map_err(Control::Error)?;
+            let Some(ci) = t.col_index(cname.as_str()) else {
+                let mut msg = AString::from_str_in("table has no column `", alloc);
+                msg.push_str(cname.as_str());
+                msg.push('`');
+                return Err(Control::Error(ShellError::new(
+                    ErrorKind::MissingColumn,
+                    *cspan,
+                    msg.as_str(),
+                    alloc,
+                )));
+            };
+            t.cols.get(ci).unwrap().share()
+        }
+        _ => return Err(type_err("`freq` expects a list or table", span, alloc)),
+    };
+
+    let total = series.len();
+    let mut counts: AVec<'a, (Value<'a>, AString<'a>, u64)> = AVec::new_in(alloc);
+    for i in 0..total {
+        eval.charge(1, span)?;
+        let v = series.get(i).unwrap();
+        let mut key = AString::new_in(alloc);
+        let _ = v.format_cell(&mut key);
+        if let Some(entry) = counts.iter_mut().find(|(_, k, _)| k.as_str() == key.as_str()) {
+            entry.2 = entry.2.saturating_add(1);
+        } else {
+            counts.push((v.share(), key, 1));
+        }
+    }
+    counts.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.as_str().cmp(b.1.as_str())));
+
+    let mut cols = PVec::new(alloc);
+    cols.push(Rc::from_str_in("value", alloc));
+    cols.push(Rc::from_str_in("count", alloc));
+    cols.push(Rc::from_str_in("pct", alloc));
+    let mut table = Table::new(cols, alloc);
+    table.set_col_display("pct", crate::value::ColDisplay::Percent);
+    table.initial_sort = Some((1, true));
+    let denom = total.max(1) as f64;
+    for (v, _, cnt) in counts.iter() {
+        let pct = (*cnt as f64 * 100.0) / denom;
+        let row = [v.share(), Value::Int(*cnt as i64), Value::Float(pct)];
+        table.push_row_values(&row);
+    }
+    Ok(Value::Table(table))
+}
+
+fn builtin_find<'a>(
+    eval: &mut Evaluator<'a, '_>,
+    args: EvalArgs<'a>,
+    input: Value<'a>,
+    span: Span,
+) -> Result<Value<'a>, Control<'a>> {
+    let alloc = eval.alloc();
+    let Some((qv, qspan)) = args.pos.first() else {
+        return Err(arity_err("find", "expected search query string", span, alloc));
+    };
+    let needle_raw = require_string(qv, "query", *qspan, alloc).map_err(Control::Error)?;
+    let mut needle_lower = AString::with_capacity_in(needle_raw.len(), alloc);
+    for ch in needle_raw.as_str().chars() {
+        for lc in ch.to_lowercase() {
+            needle_lower.push(lc);
+        }
+    }
+    let contains_ci = |hay: &str, needle: &str, alloc: Alloc<'a>| -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        let mut hay_lower = AString::with_capacity_in(hay.len(), alloc);
+        for ch in hay.chars() {
+            for lc in ch.to_lowercase() {
+                hay_lower.push(lc);
+            }
+        }
+        hay_lower.as_str().contains(needle)
+    };
+    let input = if matches!(input, Value::Nothing) {
+        eval.state()
+            .get_var("_")
+            .map(|s| s.value.share())
+            .unwrap_or(Value::Nothing)
+    } else {
+        input
+    };
+    let mut cell_buf = AString::new_in(alloc);
+    match input {
+        Value::Table(t) => {
+            let mut out = t.empty_like();
+            for r in 0..t.nrows() {
+                eval.charge(1, span)?;
+                let mut matched = false;
+                for c in 0..t.ncols() {
+                    cell_buf.clear();
+                    if let Some(v) = t.cell(r, c) {
+                        let _ = v.format_cell(&mut cell_buf);
+                        if contains_ci(cell_buf.as_str(), needle_lower.as_str(), alloc) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+                if matched {
+                    out.push_record(&t.row_record(r).unwrap());
+                }
+            }
+            Ok(Value::Table(out))
+        }
+        Value::List(items) => {
+            let mut out = PVec::new(alloc);
+            for i in 0..items.len() {
+                eval.charge(1, span)?;
+                let v = items.get(i).unwrap();
+                cell_buf.clear();
+                let _ = v.format_cell(&mut cell_buf);
+                if contains_ci(cell_buf.as_str(), needle_lower.as_str(), alloc) {
+                    out.push(v.share());
+                }
+            }
+            Ok(Value::List(out))
         }
         Value::Record(r) => {
-            if r.is_empty() {
-                return Value::string("record", alloc);
-            }
-            let mut out = AString::from_str_in("record<", alloc);
-            for (i, (k, v)) in r.iter().enumerate() {
-                if i > 0 {
-                    out.push_str(", ");
+            let mut out = Record::new(alloc);
+            for (k, v) in r.iter() {
+                eval.charge(1, span)?;
+                cell_buf.clear();
+                let _ = v.format_cell(&mut cell_buf);
+                if contains_ci(k, needle_lower.as_str(), alloc)
+                    || contains_ci(cell_buf.as_str(), needle_lower.as_str(), alloc)
+                {
+                    out.insert(Rc::from_str_in(k, alloc), v.share());
                 }
-                out.push_str(k);
-                out.push_str(": ");
-                out.push_str(v.type_name());
             }
-            out.push('>');
-            Value::string(out.as_str(), alloc)
+            Ok(Value::Record(out))
         }
-        other => Value::string(other.type_name(), alloc),
+        Value::String(s) => {
+            let mut out = PVec::new(alloc);
+            for line in s.as_ref().lines() {
+                eval.charge(1, span)?;
+                if contains_ci(line, needle_lower.as_str(), alloc) {
+                    out.push(Value::string(line, alloc));
+                }
+            }
+            Ok(Value::List(out))
+        }
+        _ => Err(type_err("`find` expects a table, list, record, or string", span, alloc)),
     }
+}
+
+fn builtin_schema<'a>(
+    eval: &Evaluator<'a, '_>,
+    args: &EvalArgs<'a>,
+    input: Value<'a>,
+    span: Span,
+) -> Result<Value<'a>, Control<'a>> {
+    let alloc = eval.alloc();
+    let target = if let Some((first, _)) = args.pos.first() {
+        first.share()
+    } else if !matches!(input, Value::Nothing) {
+        input
+    } else if let Some(slot) = eval.state().get_var("_") {
+        slot.value.share()
+    } else {
+        return Err(Control::Error(ShellError::new(
+            ErrorKind::Undefined,
+            span,
+            "no pipeline input, argument, or previous output (`$_`) to inspect with `schema`",
+            alloc,
+        )));
+    };
+    Ok(crate::schema::infer_schema_value(&target, alloc))
 }
 
 fn builtin_echo<'a>(eval: &Evaluator<'a, '_>, args: EvalArgs<'a>) -> Value<'a> {

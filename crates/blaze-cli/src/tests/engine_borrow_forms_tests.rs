@@ -196,3 +196,88 @@ fn engine_check_without_the_copy_lang_item_checks_no_borrows() {
     assert!(notes.iter().any(|n| n.contains("NoLangItem")), "the missing lang item is named: {notes:?}\n{said}");
     assert!(codes.iter().all(|c| c != "borrows"), "no borrow check ran on `run`: {codes:?}\n{said}");
 }
+
+/// Clap's `value_parser!` autoref specialization (`&Infer<T>: for<'s> From<&'s str>` vs
+/// `Infer<T>: FromStr`) with a type like `alloy_primitives::Bytes` that implements only
+/// `From<&'static str>` + `FromStr`: the higher-ranked bound must reject the `'static`-only
+/// impl so method resolution falls through to `FromStr` (while `impl<'a> From<&'a str>` still
+/// picks the higher-ranked impl), with zero type or borrow errors.
+#[test]
+fn clap_autoref_hrtb_rejects_static_from_impl() {
+    const SRC: &str = r#"
+pub trait MyFrom<T> {
+    fn from_val(v: T) -> Self;
+}
+pub trait MyFromStr: Sized {
+    fn parse(s: &str) -> Self;
+}
+pub struct Bytes;
+impl MyFrom<&'static str> for Bytes {
+    fn from_val(_: &'static str) -> Self { Bytes }
+}
+impl MyFromStr for Bytes {
+    fn parse(_: &str) -> Self { Bytes }
+}
+pub struct Owned;
+impl<'a> MyFrom<&'a str> for Owned {
+    fn from_val(_: &'a str) -> Self { Owned }
+}
+impl MyFromStr for Owned {
+    fn parse(_: &str) -> Self { Owned }
+}
+pub struct Infer<T>(*const T);
+impl<T> Infer<T> {
+    pub fn new() -> Self { Infer(0 as *const T) }
+}
+pub trait ViaRefStr {
+    fn pick(&self) -> u32;
+}
+impl<T: for<'s> MyFrom<&'s str>> ViaRefStr for &Infer<T> {
+    fn pick(&self) -> u32 { 1 }
+}
+pub trait ViaFromStr {
+    fn pick(&self) -> bool;
+}
+impl<T: MyFromStr> ViaFromStr for Infer<T> {
+    fn pick(&self) -> bool { true }
+}
+pub fn check_bytes() -> bool {
+    (&&Infer::<Bytes>::new()).pick()
+}
+pub fn check_owned() -> u32 {
+    (&&Infer::<Owned>::new()).pick()
+}
+pub enum MyOpt<T> {
+    None,
+    Some(T),
+}
+pub trait MyIter {
+    type Item;
+    fn next_item(&mut self) -> MyOpt<Self::Item>;
+}
+pub struct FilterWrap<I, P> {
+    iter: I,
+    pred: P,
+}
+impl<I: MyIter, P> MyIter for FilterWrap<I, P>
+where
+    P: for<'a> MyFrom<&'a I::Item>,
+{
+    type Item = I::Item;
+    fn next_item(&mut self) -> MyOpt<Self::Item> { MyOpt::None }
+}
+pub struct U8Iter;
+impl MyIter for U8Iter {
+    type Item = u8;
+    fn next_item(&mut self) -> MyOpt<u8> { MyOpt::None }
+}
+impl<'a> MyFrom<&'a u8> for Owned {
+    fn from_val(_: &'a u8) -> Self { Owned }
+}
+pub fn check_filter_assoc(mut f: FilterWrap<U8Iter, Owned>) -> MyOpt<u8> {
+    f.next_item()
+}
+"#;
+    let (said, codes, notes) = check_text(SRC);
+    assert!(error_lines(&said).is_empty(), "expected 0 errors (codes={codes:?}, notes={notes:?}):\n{said}");
+}

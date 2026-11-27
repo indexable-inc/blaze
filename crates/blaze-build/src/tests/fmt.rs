@@ -75,6 +75,7 @@ impl World for FmtWorld {
                 assoc_types: &[],
                 types: self.w.types.view(),
                 polarity: blaze_typeck::ImplPolarity::Positive,
+                regions: None,
             }));
         }
         self.w.impl_header(s, item)

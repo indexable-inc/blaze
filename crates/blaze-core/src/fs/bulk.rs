@@ -18,7 +18,32 @@
 //! directory under the mount, where `fstatat` stamps the root of the volume mounted there.
 //! Nothing lists a directory of mount points for its stamps.
 
-use std::{io, path::Path};
+use std::{cell::Cell, io, path::Path};
+
+thread_local! {
+    /// Per-thread reusable `getattrlistbulk` scratch buffer (64 KiB) so walking thousands of
+    /// directories does zero heap alloc/zero-fill/free per directory.
+    static BULK_BUF: Cell<Vec<u8>> = const { Cell::new(Vec::new()) };
+}
+
+struct BulkBufGuard(Vec<u8>);
+
+impl BulkBufGuard {
+    fn take() -> Self {
+        let mut buf = BULK_BUF.with(Cell::take);
+        if buf.len() < BUFFER {
+            buf.resize(BUFFER, 0);
+        }
+        Self(buf)
+    }
+}
+
+impl Drop for BulkBufGuard {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.0);
+        let _ = BULK_BUF.try_with(|slot| slot.set(buf));
+    }
+}
 
 use blaze_own::Share;
 use blaze_sys::{Errno, posix::proc};
@@ -196,10 +221,10 @@ fn each(
     let failed =
         |why: &str| io::Error::other(format!("{}: getattrlistbulk: {why}", dir.display()));
     let fd = super::open_dir(dir)?;
-    // alloc: the listing's one buffer, freed with it.
-    let mut buffer = vec![0_u8; BUFFER];
+    let mut guard = BulkBufGuard::take();
+    let buffer = &mut guard.0[..BUFFER];
     loop {
-        let count = crate::raw::attrs_bulk(fd.as_fd(), COMMON, &mut buffer).map_err(|error| {
+        let count = crate::raw::attrs_bulk(fd.as_fd(), COMMON, buffer).map_err(|error| {
             // alloc: an error path.
             io::Error::new(error.kind(), format!("{}: getattrlistbulk: {error}", dir.display()))
         })?;

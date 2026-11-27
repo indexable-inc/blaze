@@ -1007,11 +1007,13 @@ impl WireClient {
         Ok(out)
     }
 
-    /// Builds a Protocol v2 `fetch` request body for `wants` with optional `haves` and `deepen`.
-    pub fn encode_fetch<'a>(
+    /// Options for Protocol v2 `fetch` requests (`deepen`, partial-clone `filter`, `thin-pack`).
+    pub fn encode_fetch_with_opts<'a>(
         wants: &[Oid],
         haves: &[Oid],
         deepen: Option<u32>,
+        filter: Option<&str>,
+        thin_pack: bool,
         out: &mut AVec<'a, u8>,
     ) -> Result<(), GitError> {
         out.clear();
@@ -1019,8 +1021,16 @@ impl WireClient {
         pkt::line(&[SERVER_AGENT, b"\n"], out).map_err(|_| pkt_err(0))?;
         pkt::data(b"object-format=sha1\n", out).map_err(|_| pkt_err(0))?;
         pkt::delim(out).map_err(|_| pkt_err(0))?;
+        if thin_pack {
+            pkt::data(b"thin-pack\n", out).map_err(|_| pkt_err(0))?;
+        }
         pkt::data(b"ofs-delta\n", out).map_err(|_| pkt_err(0))?;
         pkt::data(b"no-progress\n", out).map_err(|_| pkt_err(0))?;
+        if let Some(spec) = filter
+            && !spec.is_empty()
+        {
+            pkt::line(&[b"filter ", spec.as_bytes(), b"\n"], out).map_err(|_| pkt_err(0))?;
+        }
         for w in wants {
             pkt::line(&[b"want ", &w.hex(), b"\n"], out).map_err(|_| pkt_err(0))?;
         }
@@ -1044,6 +1054,16 @@ impl WireClient {
         pkt::data(b"done\n", out).map_err(|_| pkt_err(0))?;
         pkt::flush(out).map_err(|_| pkt_err(0))?;
         Ok(())
+    }
+
+    /// Builds a Protocol v2 `fetch` request body for `wants` with optional `haves` and `deepen`.
+    pub fn encode_fetch<'a>(
+        wants: &[Oid],
+        haves: &[Oid],
+        deepen: Option<u32>,
+        out: &mut AVec<'a, u8>,
+    ) -> Result<(), GitError> {
+        Self::encode_fetch_with_opts(wants, haves, deepen, None, false, out)
     }
 
     /// Parses a Protocol v2 `fetch` response and unpacks its packfile directly into `store`.

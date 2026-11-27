@@ -150,7 +150,7 @@ pub trait Declares {
 pub fn declare(e: &mut Emitted<'_>, by: &dyn Declares) -> Result<(), FormError> {
     for i in 0..e.targets.len() {
         let target = e.targets[i];
-        if target.space == Space::Outside {
+        if target.space.is_outside() {
             continue;
         }
         let Some(d) = by.declared(target) else {
@@ -328,7 +328,7 @@ pub(super) fn check(
     }
     for t in 0..targets {
         let tg = target(t);
-        if tg.space == Space::Outside {
+        if tg.space.is_outside() {
             continue;
         }
         match row_of(tg.symbol) {

@@ -56,6 +56,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
             return Ok(Flow::Done(self.common.err));
         }
         let (steps, limit) = self.autoderef(base_ty, false)?;
+        let mut first_private: Option<(usize, crate::ids::ItemKey, crate::ty::TyList, usize)> = None;
         for (i, step) in steps.iter().enumerate() {
             let found = match self.view(step.ty) {
                 TyView::Tuple(l) if name.is_none() => {
@@ -79,17 +80,29 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                         let want = name.unwrap_or(Name::of_index(index));
                         let Some(v) = adt.variants.first() else { continue };
                         let fields = adt.fields.get(v.fields.range()).unwrap_or(&[]);
-                        match fields.iter().position(|fl| fl.name == want) {
+                        match self.find_adt_field(k, 0, fields, want).map(|idx| idx as usize) {
                             Some(at) => {
-                                let field = fields[at];
-                                let ty = self.lower(adt.types, field.ty, Lower::Args(args), Cause::Expr(e)).map_err(|err| match err {
-                                    Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site: ParamSite::Lower { at: Some(at) } })) => {
-                                        let site = ParamSite::Field { owner: self.body.owner, expr: e, adt: k, field: field.name, at };
-                                        Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site }))
+                                // Skip inaccessible fields of wrapper structs (e.g.
+                                // `ManuallyDrop<ScopeGuard<T, F>>::value` is private in `core`, so
+                                // autoderef must continue to `ScopeGuard::value: T`). Remember the
+                                // first private match as a fallback if no later deref step has a
+                                // visible field of that name.
+                                if !self.reads.member_visible(k, want)? {
+                                    if first_private.is_none() {
+                                        first_private = Some((i, k, args, at));
                                     }
-                                    other => other,
-                                })?;
-                                Some((ty, 0, at as u32, adt.kind == AdtKind::Union))
+                                    None
+                                } else {
+                                    let field = fields[at];
+                                    let ty = self.lower(adt.types, field.ty, Lower::Args(args), Cause::Expr(e)).map_err(|err| match err {
+                                        Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site: ParamSite::Lower { at: Some(at) } })) => {
+                                            let site = ParamSite::Field { owner: self.body.owner, expr: e, adt: k, field: field.name, at };
+                                            Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site }))
+                                        }
+                                        other => other,
+                                    })?;
+                                    Some((ty, 0, at as u32, adt.kind == AdtKind::Union))
+                                }
                             }
                             None => None,
                         }
@@ -107,6 +120,25 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                 }
                 return Ok(Flow::Done(ty));
             }
+        }
+        if let Some((i, k, args, at)) = first_private
+            && let Some(adt) = self.field_adt(k)?
+            && let Some(v) = adt.variants.first()
+            && let Some(field) = adt.fields.get(v.fields.range()).and_then(|fs| fs.get(at)).copied()
+        {
+            let ty = self.lower(adt.types, field.ty, Lower::Args(args), Cause::Expr(e)).map_err(|err| match err {
+                Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site: ParamSite::Lower { at: Some(at) } })) => {
+                    let site = ParamSite::Field { owner: self.body.owner, expr: e, adt: k, field: field.name, at };
+                    Stop::Error(CheckError::Malformed(Malformed::Param { index, args, site }))
+                }
+                other => other,
+            })?;
+            self.adjust_autoderef(base, &steps, i);
+            self.fields.push((e, 0, at as u32));
+            if adt.kind == AdtKind::Union {
+                self.union_fields.push(e);
+            }
+            return Ok(Flow::Done(ty));
         }
         let primitive = !matches!(self.view(base_ty), TyView::Adt(..) | TyView::Record(..) | TyView::Ref(..) | TyView::Param(_));
         let code = if limit {
@@ -154,18 +186,19 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                 }
                 TyView::Adt(k, args) => match self.field_adt(k)? {
                     Some(adt) if adt.kind == AdtKind::Enum && variant.is_none() => {
-                        if let Some(i) = adt.variants.iter().position(|v| v.name == want) {
-                            variant = Some(i);
+                        if let Some(i) = self.find_adt_variant(k, adt.variants, want) {
+                            variant = Some(i as usize);
                             continue;
                         }
                         None
                     }
                     Some(adt) => {
-                        let fs = match adt.variants.get(variant.unwrap_or(0)) {
+                        let var_idx = variant.unwrap_or(0);
+                        let fs = match adt.variants.get(var_idx) {
                             Some(v) => adt.fields.get(v.fields.range()).unwrap_or(&[]),
                             None => &[],
                         };
-                        match fs.iter().position(|fl| fl.name == want) {
+                        match self.find_adt_field(k, var_idx as u32, fs, want).map(|i| i as usize) {
                             Some(i) => {
                                 variant = None;
                                 Some(self.lower(adt.types, fs[i].ty, Lower::Args(args), Cause::Expr(e))?)

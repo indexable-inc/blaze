@@ -29,7 +29,7 @@
 
 use core::cell::{Cell, RefCell};
 
-use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state_with_flags, may_partial_move_bindings, may_partial_move_temps};
+use blaze_build::coroutine_state::{LaidState, StateName, StateNames, StatePlan, StatePlant, lay_state_with_conflicts, may_partial_move_bindings, may_partial_move_temps};
 use blaze_build::layout::{LayoutCx, Layouts};
 use blaze_build::{CoroutineOf, coroutines_in};
 use blaze_own::AVec;
@@ -41,7 +41,7 @@ use crate::code_records::reads::{ReadLog, ReadPlant, Recorded, laid_answer};
 use crate::front2::coroutine_needs::{HOLDS_ITSELF, OrderError, held_coroutines, layout_order, referenced_coroutines};
 
 /// How a lay ended.
-pub(super) enum Lay {
+pub(super) enum Lay<'a> {
     /// Every state laid and every coroutine built (its three functions in the stash).
     Done,
     /// The walk met a coroutine whose owner fn is not checked yet: check it, lay again.
@@ -49,7 +49,7 @@ pub(super) enum Lay {
     /// One or more coroutines to build need their owner's constants pulled at `owner_args`
     /// (`const_at::needs_of`, plus `plain_needs_of` when `pull_plain`) before `build_laid`
     /// walks their bodies. States laid in this pass have already been forgotten.
-    PullConstants(AVec<'static, (ItemKey, List)>),
+    PullConstants(AVec<'a, (ItemKey, List)>),
 }
 
 /// A coroutine the front end gave no upvars' facts or no state recipe for.
@@ -114,7 +114,7 @@ fn ground_saved(
 /// is not a root). Always inspects `args` and `extra_args` even when the instance has no body
 /// (e.g. `drop_in_place::<Wrapper<C>>`, `vtable_shim`, `fn_shim`, builtin `Clone`/`From`).
 #[expect(clippy::too_many_arguments, reason = "instance grounding tables and optional body walk flag")]
-pub(super) fn roots_of_instance<P: FrontEnd>(
+pub(super) fn roots_of_instance<'a, P: FrontEnd>(
     program: &P,
     bodies: &Bodies<'_>,
     adts: &dyn Adts,
@@ -123,8 +123,8 @@ pub(super) fn roots_of_instance<P: FrontEnd>(
     extra_args: Option<List>,
     include_body: bool,
     ground: &mut PortableTys<'_>,
-    alloc: Alloc<'static>,
-) -> Result<AVec<'static, CoroutineOf>, RunError> {
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, CoroutineOf>, RunError> {
     let name = || program.function(i).named();
     let mut roots: AVec<'_, PTy> = AVec::with_capacity_in(args.len(), alloc);
     roots.extend_from_slice(args);
@@ -173,7 +173,7 @@ pub(super) fn roots_of_instance<P: FrontEnd>(
 }
 
 /// The ground arguments of coroutine `c`'s owner, copied out of the ground table.
-fn args_of(ground: &PortableTys<'_>, c: CoroutineOf, alloc: Alloc<'static>) -> Result<AVec<'static, PTy>, BuildError> {
+fn args_of<'a>(ground: &PortableTys<'_>, c: CoroutineOf, alloc: Alloc<'a>) -> Result<AVec<'a, PTy>, BuildError> {
     let list = ground.view().list(c.owner_args).map_err(|_| BuildError::Malformed { what: "a coroutine's arguments past the ground table" })?;
     let mut v = AVec::with_capacity_in(list.len(), alloc);
     v.extend_from_slice(list);
@@ -197,7 +197,7 @@ type Consts<'a> = &'a [(ItemKey, DataRecord<Global>)];
 /// 2. LAY each in that order, the state recorded (`States::record`).
 /// 3. BUILD each into its laid state.
 #[expect(clippy::too_many_arguments, reason = "run.rs's own per-instance tables, borrowed apart")]
-pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
+pub(super) fn lay_and_build<'a, P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
     consts: Consts<'_>,
     langs: &BackLangs,
@@ -209,8 +209,8 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     asking: usize,
     roots: &[CoroutineOf],
     pull_plain: bool,
-    alloc: Alloc<'static>,
-) -> Result<Lay, RunError> {
+    alloc: Alloc<'a>,
+) -> Result<Lay<'a>, RunError> {
     let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, query_cache, ground, layouts, asking, roots, true, alloc)? {
         Ordered::Laid { all, laid } => (all, laid),
         Ordered::Unchecked(owner) => return Ok(Lay::Unchecked(owner)),
@@ -230,7 +230,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     // by the caller's own `pull_constants`.
     if program.evaluates_at_args() {
         let mut seen: AVec<'_, (ItemKey, List)> = AVec::new_in(alloc);
-        let mut missing: AVec<'static, (ItemKey, List)> = AVec::new_in(alloc);
+        let mut missing: AVec<'a, (ItemKey, List)> = AVec::new_in(alloc);
         let mut needs = crate::front2::const_at::Needs::new_in(alloc);
         for &c in all.iter() {
             let key = (c.owner, c.owner_args);
@@ -298,7 +298,7 @@ pub(super) fn lay_and_build<P: FrontEnd, L: core::alloc::Allocator + Clone>(
 /// body (types only, never building child coroutines' LIR), then pulls constants and builds LIR
 /// for **only `of`** into `stash`. Child coroutines are built lazily on their own first call.
 #[expect(clippy::too_many_arguments, reason = "run/make_one's per-instance tables, borrowed apart")]
-pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
+pub(super) fn lay_and_build_one<'a, P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
     consts: Consts<'_>,
     langs: &BackLangs,
@@ -310,8 +310,8 @@ pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     asking: usize,
     of: CoroutineOf,
     pull_plain: bool,
-    alloc: Alloc<'static>,
-) -> Result<Lay, RunError> {
+    alloc: Alloc<'a>,
+) -> Result<Lay<'a>, RunError> {
     let (all, laid_all) = match order_and_lay(program, consts, langs, bodies, query_cache, ground, layouts, asking, &[of], false, alloc)? {
         Ordered::Laid { all, laid } => (all, laid),
         Ordered::Unchecked(owner) => return Ok(Lay::Unchecked(owner)),
@@ -396,7 +396,7 @@ pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
                 }
                 if needs.iter().any(|(need, a)| bodies.const_at.get(need, a).is_none()) {
                     forget_laid(bodies, &[of], ground.view());
-                    let mut missing: AVec<'static, (ItemKey, List)> = AVec::with_capacity_in(1, alloc);
+                    let mut missing: AVec<'a, (ItemKey, List)> = AVec::with_capacity_in(1, alloc);
                     missing.push((of.owner, of.owner_args));
                     return Ok(Lay::PullConstants(missing));
                 }
@@ -411,11 +411,11 @@ pub(super) fn lay_and_build_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
 }
 
 /// What a verification's lay did ([`relay`]).
-pub(super) enum Relaid {
+pub(super) enum Relaid<'a> {
     /// `recorded`: the states this lay recorded, none built, which the caller forgets once it
     /// has asked ([`forget_laid`]: a later make lays and builds them); `laid`: each root's full
     /// lay, digested as the build digested it (code_reads.rs `laid_answer`).
-    Done { recorded: AVec<'static, CoroutineOf>, laid: AVec<'static, (CoroutineOf, ContentId)> },
+    Done { recorded: AVec<'a, CoroutineOf>, laid: AVec<'a, (CoroutineOf, ContentId)> },
     /// As [`Lay::Unchecked`]: check that owner, lay again.
     Unchecked(ItemKey),
 }
@@ -427,7 +427,7 @@ pub(super) enum Relaid {
 /// a part was built into) and digested. Nothing is built: the build's lay is the one that
 /// builds. Cost: one lay per state the rows name and per state those hold, types only.
 #[expect(clippy::too_many_arguments, reason = "the lay's tables, borrowed apart")]
-pub(super) fn relay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
+pub(super) fn relay<'a, P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
     langs: &BackLangs,
     bodies: &Bodies<'_>,
@@ -436,13 +436,13 @@ pub(super) fn relay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     layouts: &mut Layouts<L>,
     asking: usize,
     roots: &[CoroutineOf],
-    alloc: Alloc<'static>,
-) -> Result<Relaid, RunError> {
+    alloc: Alloc<'a>,
+) -> Result<Relaid<'a>, RunError> {
     let recorded = match order_and_lay(program, &[], langs, bodies, query_cache, ground, layouts, asking, roots, false, alloc)? {
         Ordered::Laid { all, .. } => all,
         Ordered::Unchecked(owner) => return Ok(Relaid::Unchecked(owner)),
     };
-    let mut laid: AVec<'static, (CoroutineOf, ContentId)> = AVec::with_capacity_in(roots.len(), alloc);
+    let mut laid: AVec<'a, (CoroutineOf, ContentId)> = AVec::with_capacity_in(roots.len(), alloc);
     for &c in roots {
         let digest = match program.fn_index(c.owner) {
             Some(ci) if bodies.checked.get(ci).and_then(Option::as_ref).is_some() => {
@@ -463,11 +463,11 @@ pub(super) fn relay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
 }
 
 /// How a types-only lay ended ([`lay_only`]: for constant evaluation before the build).
-pub(super) enum LaidOnly {
+pub(super) enum LaidOnly<'a> {
     /// Every state laid and recorded in `bodies.coroutines.states`; the caller must forget these
     /// states with [`forget_laid_in`] once constant evaluation finishes so the subsequent build
     /// still lays and builds their functions into `stash`.
-    Done(AVec<'static, CoroutineOf>),
+    Done(AVec<'a, CoroutineOf>),
     /// The walk met a coroutine whose owner fn is not checked yet: check it, lay again.
     Unchecked(ItemKey),
 }
@@ -476,7 +476,7 @@ pub(super) enum LaidOnly {
 /// constant evaluation (`const_at::pull`: `<{coroutine} as SizedTypeProperties>::LAYOUT` under
 /// `Box::new` / `Box::pin`) using the exact same `order_and_lay` / `lay_one` as the build.
 #[expect(clippy::too_many_arguments, reason = "the lay's tables, borrowed apart")]
-pub(super) fn lay_only<P: FrontEnd, L: core::alloc::Allocator + Clone>(
+pub(super) fn lay_only<'a, P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
     consts: Consts<'_>,
     langs: &BackLangs,
@@ -486,8 +486,8 @@ pub(super) fn lay_only<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     layouts: &mut Layouts<L>,
     asking: usize,
     roots: &[CoroutineOf],
-    alloc: Alloc<'static>,
-) -> Result<LaidOnly, RunError> {
+    alloc: Alloc<'a>,
+) -> Result<LaidOnly<'a>, RunError> {
     match order_and_lay(program, consts, langs, bodies, query_cache, ground, layouts, asking, roots, false, alloc)? {
         Ordered::Laid { all, .. } => Ok(LaidOnly::Done(all)),
         Ordered::Unchecked(owner) => Ok(LaidOnly::Unchecked(owner)),
@@ -509,16 +509,16 @@ pub(super) fn forget_laid_in(coroutines: &crate::front2::coroutines::Coroutines,
 }
 
 /// Phases 1 and 2 of [`lay_and_build`]'s answer.
-enum Ordered {
+enum Ordered<'a> {
     /// Every state laid, in order, each recorded.
-    Laid { all: AVec<'static, CoroutineOf>, laid: AVec<'static, (LaidState, AVec<'static, StateName>)> },
+    Laid { all: AVec<'a, CoroutineOf>, laid: AVec<'a, (LaidState, AVec<'a, StateName>)> },
     Unchecked(ItemKey),
 }
 
 /// Phases 1 (ORDER) and 2 (LAY) of [`lay_and_build`]. A lay that stops forgets the states it
 /// recorded: one left recorded would be taken as made by the next lay, never built.
 #[expect(clippy::too_many_arguments, reason = "lay_and_build's tables, borrowed apart")]
-fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
+fn order_and_lay<'a, P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
     consts: Consts<'_>,
     langs: &BackLangs,
@@ -529,8 +529,8 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     asking: usize,
     roots: &[CoroutineOf],
     include_uses: bool,
-    alloc: Alloc<'static>,
-) -> Result<Ordered, RunError> {
+    alloc: Alloc<'a>,
+) -> Result<Ordered<'a>, RunError> {
     use crate::front2::coroutine_needs::MOST_HELD;
     let states = &bodies.coroutines.states;
     let unchecked: Cell<Option<ItemKey>> = Cell::new(None);
@@ -548,8 +548,8 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     };
     let asking_name = || program.function(asking).named();
     // 1. ORDER.
-    let mut all: AVec<'static, CoroutineOf> = AVec::new_in(alloc);
-    let mut pending: AVec<'static, CoroutineOf> = AVec::with_capacity_in(roots.len(), alloc);
+    let mut all: AVec<'a, CoroutineOf> = AVec::new_in(alloc);
+    let mut pending: AVec<'a, CoroutineOf> = AVec::with_capacity_in(roots.len(), alloc);
     pending.extend_from_slice(roots);
     let mut rounds = 0usize;
     while !pending.is_empty() {
@@ -559,7 +559,7 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         }
         let order = {
             let all = &all;
-            let mut held_by = |c: CoroutineOf| -> Result<Option<AVec<'static, CoroutineOf>>, BuildError> {
+            let mut held_by = |c: CoroutineOf| -> Result<Option<AVec<'a, CoroutineOf>>, BuildError> {
                 if all.contains(&c) || ground.view().list(c.owner_args).is_ok_and(|a| states.made(c.owner, c.ordinal, a)) {
                     return Ok(None);
                 }
@@ -612,7 +612,7 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         }
     }
     // 2. LAY.
-    let mut laid_all: AVec<'static, (LaidState, AVec<'static, StateName>)> = AVec::with_capacity_in(all.len(), alloc);
+    let mut laid_all: AVec<'a, (LaidState, AVec<'a, StateName>)> = AVec::with_capacity_in(all.len(), alloc);
     for (n, &c) in all.iter().enumerate() {
         let Some(ci) = owner_of(c) else {
             forget_laid(bodies, &all[..n], ground.view());
@@ -639,7 +639,7 @@ fn order_and_lay<P: FrontEnd, L: core::alloc::Allocator + Clone>(
 /// Phase 3 of [`lay_and_build`]: each of `all` built into its laid state, in order, its three
 /// functions pushed to `stash`.
 #[expect(clippy::too_many_arguments, reason = "lay_and_build's tables, borrowed apart")]
-fn build_laid<P: FrontEnd>(
+fn build_laid<'a, P: FrontEnd>(
     program: &P,
     consts: Consts<'_>,
     langs: &BackLangs,
@@ -648,11 +648,11 @@ fn build_laid<P: FrontEnd>(
     ground: &mut PortableTys<'_>,
     stash: &mut Vec<BuiltParts, Global>,
     all: &[CoroutineOf],
-    laid_all: &[(LaidState, AVec<'static, StateName>)],
+    laid_all: &[(LaidState, AVec<'a, StateName>)],
     owner_of: &dyn Fn(CoroutineOf) -> Option<usize>,
     unchecked: &Cell<Option<ItemKey>>,
-    alloc: Alloc<'static>,
-) -> Result<Lay, RunError> {
+    alloc: Alloc<'a>,
+) -> Result<Lay<'a>, RunError> {
     for (&c, (laid, rows)) in all.iter().zip(laid_all.iter()) {
         let Some(ci) = owner_of(c) else {
             return Ok(Lay::Unchecked(unchecked.get().unwrap_or(c.owner)));
@@ -694,15 +694,15 @@ fn build_laid<P: FrontEnd>(
 
 /// The ground types coroutine `c`'s state holds past its tag: its upvars' tuple, then each
 /// saved local of its recipe, at the owner's arguments.
-fn held_types<P: FrontEnd>(
+fn held_types<'a, P: FrontEnd>(
     program: &P,
     bodies: &Bodies<'_>,
     adts: &dyn Adts,
     ci: usize,
     c: CoroutineOf,
     ground: &mut PortableTys<'_>,
-    alloc: Alloc<'static>,
-) -> Result<AVec<'static, PTy>, BuildError> {
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, PTy>, BuildError> {
     let function = program.function(ci);
     let (Some((body, _)), Some(done)) = (function.body, bodies.checked.get(ci).and_then(Option::as_ref)) else {
         return Err(not_answered());
@@ -716,7 +716,7 @@ fn held_types<P: FrontEnd>(
     };
     let mut args: AVec<'_, PTy> = AVec::new_in(alloc);
     args.extend_from_slice(ground.view().list(c.owner_args).map_err(|_| BuildError::Malformed { what: "a coroutine's arguments past the ground table" })?);
-    let mut out: AVec<'static, PTy> = AVec::with_capacity_in(recipe.saved.len() + 1, alloc);
+    let mut out: AVec<'a, PTy> = AVec::with_capacity_in(recipe.saved.len() + 1, alloc);
     out.push(blaze_build::ground(facts.types, facts.env, &args, ground, alloc, adts.facts())?);
     let record = done.types.view();
     for &s in recipe.saved.iter() {
@@ -729,7 +729,7 @@ fn held_types<P: FrontEnd>(
 /// already laid: the order says so) and its drop flags, with its saved locals' table by
 /// identity (blaze-flow-lower identity.rs: what the build names its slots by), sorted.
 #[expect(clippy::too_many_arguments, reason = "the lay's tables, borrowed apart")]
-fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
+fn lay_one<'a, P: FrontEnd, L: core::alloc::Allocator + Clone>(
     program: &P,
     bodies: &Bodies<'_>,
     adts: &dyn Adts,
@@ -737,8 +737,8 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
     c: CoroutineOf,
     ground: &mut PortableTys<'_>,
     layouts: &mut Layouts<L>,
-    alloc: Alloc<'static>,
-) -> Result<(LaidState, AVec<'static, StateName>), BuildError> {
+    alloc: Alloc<'a>,
+) -> Result<(LaidState, AVec<'a, StateName>), BuildError> {
     let types = held_types(program, bodies, adts, ci, c, &mut *ground, alloc)?;
     let recipe = match program.coroutine_recipe(c.owner, c.ordinal) {
         Some(Ok(r)) => r,
@@ -836,9 +836,10 @@ fn lay_one<P: FrontEnd, L: core::alloc::Allocator + Clone>(
         };
         needs_rest.push(want);
     }
-    let laid = lay_state_with_flags(env, saved, &flags, &needs_rest, &upvar_has_flag, &upvar_has_rest, points, alloc, alloc)?;
+    let conflicts = (!recipe.conflicts.is_empty()).then_some(recipe.conflicts.as_slice());
+    let laid = lay_state_with_conflicts(env, saved, conflicts, &flags, &needs_rest, &upvar_has_flag, &upvar_has_rest, points, alloc, alloc)?;
     // Every size fits a u32: the state does (`lay_state` refused past 4 GiB).
-    let mut rows: AVec<'static, StateName> = AVec::with_capacity_in(saved.len() + upvar_ids.len(), alloc);
+    let mut rows: AVec<'a, StateName> = AVec::with_capacity_in(saved.len() + upvar_ids.len(), alloc);
     for (s, (&offset, (&(size, _), (&flag, &rest)))) in recipe
         .saved
         .iter()

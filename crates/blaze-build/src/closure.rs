@@ -35,7 +35,7 @@ pub(crate) use ctor_fn::build_ctor_fn;
 // And the `Clone::clone` it gives a tuple, a closure, a fn item and a fn pointer.
 #[path = "clone_fn.rs"]
 mod clone_fn;
-pub(crate) use clone_fn::{build_builtin_clone, build_builtin_from};
+pub(crate) use clone_fn::{build_builtin_clone, build_builtin_fn_ptr, build_builtin_from};
 
 /// The closures of `body` with their ORDINALS: a closure's position among its owner body's
 /// closures in expression order (typeck.md, "A closure's identity"). The one place the builder
@@ -651,7 +651,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             // return (the Reference, "Closure types", "Drop order").
             if self.needs_drop(g).map_err(|error| Self::ty_err(closure, error))? {
                 let l = self.layout(g).map_err(|error| Self::ty_err(closure, error))?;
-                self.scope_pats.push(Held::Rest { at, l, variant: None, moved: 0 });
+                self.scope_pats.push(Held::Rest { at, l, variant: None, moved: crate::walk::moves::FieldBits::EMPTY });
             }
             let a = self.address(at);
             self.push_val(V::Scalar(a), None);
@@ -1322,5 +1322,6 @@ pub(crate) fn empty_view(owner: ItemKey, types: PTys<'_>) -> BodyView<'_> {
         pat_editions: &[],
         record_expr_schemas: &[],
         closure_param_regions: &[],
+        loop_marks: &[],
     }
 }

@@ -44,7 +44,7 @@ fn held_values_and_subjects_read_back_in_one_form() {
     let one = sealed(&[arm, small, copy], alloc).unwrap();
     let other = sealed(&[copy, arm, small], alloc).unwrap();
     assert_eq!(one[..], other[..], "the order rows were added in leaves no trace (rule 25)");
-    assert_eq!(&one[..8], b"bzcode07");
+    assert_eq!(&one[..8], b"bzcode09");
     let view = CodeView::read(&one).unwrap();
     assert_eq!(view.traps(), 3);
     assert_eq!(view.trap_at(4), Some(copy));

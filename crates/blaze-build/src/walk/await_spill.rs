@@ -337,6 +337,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     let align = u8::try_from(bytes.next_power_of_two().trailing_zeros()).unwrap_or(4).min(4);
                     let p = self.b.slot_addr(slot);
                     let x = self.b.load(ty, Flags::NONE, p, 0, MemAttrs::aligned(align));
+                    self.b.slot_dead(slot);
                     if let Some(dst) = self.vals.get_mut(at) {
                         *dst = match form {
                             Form::Scalar => V::Scalar(x),

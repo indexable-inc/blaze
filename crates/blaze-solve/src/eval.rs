@@ -217,6 +217,9 @@ pub struct Solver<'a, E = NoDerivation> {
     tmp: Vec<u32, Alloc<'a>>,
     frames: Vec<Frame, Alloc<'a>>,
     cands: Vec<Cand, Alloc<'a>>,
+    /// Reusable scratch buffer for `assemble` and `next_cand` so candidate assembly does not
+    /// allocate a fresh `Vec<Cand>` in the body's bump frame on every frame.
+    cands_buf: Vec<Cand, Alloc<'a>>,
     dones: Vec<Done, Alloc<'a>>,
     merge_dones: Vec<Done, Alloc<'a>>,
     goals: Vec<Pending, Alloc<'a>>,
@@ -262,6 +265,9 @@ pub struct Solver<'a, E = NoDerivation> {
     sharing: bool,
     /// The final goals of the root being solved, put when it ends (share.rs `NewGoal`).
     share_new: Vec<NewGoal, Alloc<'a>>,
+    /// Refused final-goal counts buffered during the current root (flushed in `share_after`),
+    /// avoiding pushing refused entries into `share_new`: `[Vars, Local, ConstHolds, Overflow, Scope, Full]`.
+    share_refused_pending: [u64; 6],
     /// The shared goals this solver took, in order (share.rs `GoalHit`): the one read each.
     share_hits: Vec<GoalHit, Alloc<'a>>,
     /// Scratch of the sharing: a key's words, an entry copied out, read ids, reads, a walk.
@@ -607,6 +613,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             tmp: Vec::new_in(alloc),
             frames: Vec::new_in(alloc),
             cands: Vec::new_in(alloc),
+            cands_buf: Vec::new_in(alloc),
             dones: Vec::new_in(alloc),
             merge_dones: Vec::new_in(alloc),
             goals: Vec::new_in(alloc),
@@ -630,6 +637,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             plain: Map::new(MapOpts { hasher: FixedState, alloc: alloc, capacity: None }),
             sharing: false,
             share_new: Vec::new_in(alloc),
+            share_refused_pending: [0; 6],
             share_hits: Vec::new_in(alloc),
             share_key: Vec::new_in(alloc),
             share_got: Taken::new_in(alloc),
@@ -839,6 +847,30 @@ impl<'a, E: Emit> Solver<'a, E> {
         goal: Goal,
         reads: &mut Vec<Read, Alloc<'a>>,
     ) -> Result<Answer, Stop> {
+        self.evaluate_from_opt(tys, src, mode, goal, Some(reads))
+    }
+
+    /// Like [`Solver::evaluate_from`], without exporting the solver's read list into a caller
+    /// `Vec<Read>` (used when the caller records reads through `src` and discards the exported
+    /// log, avoiding growing an unused `Vec<Read>` in the body's bump frame).
+    pub fn evaluate_from_quiet<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        mode: TypingMode,
+        goal: Goal,
+    ) -> Result<Answer, Stop> {
+        self.evaluate_from_opt(tys, src, mode, goal, None)
+    }
+
+    fn evaluate_from_opt<T: Tys, S: FactSource<T>>(
+        &mut self,
+        tys: &mut T,
+        src: &mut S,
+        mode: TypingMode,
+        goal: Goal,
+        reads: Option<&mut Vec<Read, Alloc<'a>>>,
+    ) -> Result<Answer, Stop> {
         // The trace's root row (witness.rs): one test of `None` when off.
         let traced = match &self.trace {
             Some(t) => t.ask().matches(&*tys, goal.pred),
@@ -891,7 +923,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         self.scratch.why_no = true;
         self.why.clear();
         self.why_on = true;
-        let r = self.evaluate_once(tys, src, mode, goal, reads);
+        let r = self.evaluate_once(tys, src, mode, goal, Some(reads));
         self.why_on = false;
         self.scratch.why_no = false;
         self.scratch.off = off;
@@ -923,7 +955,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         self.maybe.clear();
         self.why_on = true;
         self.maybe_on = true;
-        let r = self.evaluate_once(tys, src, mode, goal, reads);
+        let r = self.evaluate_once(tys, src, mode, goal, Some(reads));
         self.why_on = false;
         self.maybe_on = false;
         self.scratch.off = off;
@@ -1058,13 +1090,13 @@ impl<'a, E: Emit> Solver<'a, E> {
         src: &mut S,
         mode: TypingMode,
         goal: Goal,
-        reads: &mut Vec<Read, Alloc<'a>>,
+        mut reads: Option<&mut Vec<Read, Alloc<'a>>>,
     ) -> Result<Answer, Stop> {
         self.scratch.stats.evaluations += 1;
         // A recording solver frames every goal (`with_emit_in`), as `why_no` does.
         if !E::ON
             && !self.why_on
-            && let Some(a) = self.fast_path(tys, mode, goal, reads)
+            && let Some(a) = self.fast_path(tys, mode, goal, reads.as_deref_mut())
         {
             self.scratch.stats.fast_path += 1;
             return Ok(a);
@@ -1078,7 +1110,9 @@ impl<'a, E: Emit> Solver<'a, E> {
                 self.origs.truncate(orig_lo as usize);
                 let answer = answer?;
                 self.remember_marker(tys, mode, goal, answer, reads_lo);
-                self.reads.export(reads_lo, reads);
+                if let Some(reads) = reads {
+                    self.reads.export(reads_lo, reads);
+                }
                 self.reads.seg.truncate(reads_lo);
                 self.resps.truncate_scratch((0, 0));
                 Ok(answer)
@@ -1126,12 +1160,14 @@ impl<'a, E: Emit> Solver<'a, E> {
 
     /// The ground fast path (solve.md (c)): a global ground type's answer for a marker trait,
     /// kept in its `markers` byte, with the reads it was valid by.
-    fn fast_path<T: Tys>(&mut self, tys: &T, mode: TypingMode, goal: Goal, reads: &mut Vec<Read, Alloc<'a>>) -> Option<Answer> {
+    fn fast_path<T: Tys>(&mut self, tys: &T, mode: TypingMode, goal: Goal, reads: Option<&mut Vec<Read, Alloc<'a>>>) -> Option<Answer> {
         let (t, m) = self.marker_of(tys, mode, goal)?;
         let holds = tys.markers(t).get(m)?;
         let &(s, l) = self.marker_reads.get(&(t.0, m as u8))?;
-        for &id in &self.marker_pool[s as usize..(s + l) as usize] {
-            reads.push(self.reads.read(id));
+        if let Some(reads) = reads {
+            for &id in &self.marker_pool[s as usize..(s + l) as usize] {
+                reads.push(self.reads.read(id));
+            }
         }
         Some(if holds { Answer::Yes } else { Answer::No })
     }
@@ -1250,6 +1286,7 @@ impl<'a, E: Emit> Solver<'a, E> {
         }
         self.sharing = src.goals().is_some();
         self.share_new.clear();
+        self.share_refused_pending = [0; 6];
         self.steps_at = self.steps_now();
         let mut snaps: Vec<T::Snapshot, Alloc<'a>> = Vec::new_in(self.alloc);
         let mut probes: Vec<Option<T::Snapshot>, Alloc<'a>> = Vec::new_in(self.alloc);
@@ -1264,6 +1301,7 @@ impl<'a, E: Emit> Solver<'a, E> {
             Err(e) => Err(e),
         };
         self.share_new.clear();
+        self.share_refused_pending = [0; 6];
         match r {
             Ok(ans) => Ok((ans, orig_lo)),
             Err(e) => {
@@ -1541,6 +1579,15 @@ impl<'a, E: Emit> Solver<'a, E> {
     /// audit's comparison when the root was a hit solved again.
     fn share_after<T: Tys, S: FactSource<T>>(&mut self, tys: &T, src: &S, root_ans: Ans, root_lo: usize, goal: Goal, audit: Option<Audit<'a>>) -> Result<(), Stop> {
         let Some(table) = src.goals() else { return Ok(()) };
+        let pending = core::mem::take(&mut self.share_refused_pending);
+        let s = &mut self.scratch.stats;
+        s.shared_refused += pending[0] + pending[1] + pending[2] + pending[3] + pending[4] + pending[5];
+        s.shared_refused_vars += pending[0];
+        s.shared_refused_local += pending[1];
+        s.shared_refused_const_holds += pending[2];
+        s.shared_refused_overflow += pending[3];
+        s.shared_refused_scope += pending[4];
+        s.shared_refused_full += pending[5];
         let news = core::mem::replace(&mut self.share_new, Vec::new_in(self.alloc));
         let mut kw = core::mem::replace(&mut self.share_key, Vec::new_in(self.alloc));
         let mut rs = core::mem::replace(&mut self.share_reads, Vec::new_in(self.alloc));
@@ -1935,39 +1982,44 @@ impl<'a, E: Emit> Solver<'a, E> {
         // `out` holds the candidates of earlier stages: a stage may keep a row there for a
         // later one (alias.rs's stash) and remove it. The rows stay in `cands` until the stage
         // answered, so a pulled stage starts again from them.
-        let (r, out, st) = self.pull(tys, src, top, |s, tys, facts| {
-            let mut out: Vec<Cand, Alloc<'a>> = Vec::new_in(s.alloc);
+        let (r, st) = self.pull(tys, src, top, |s, tys, facts| {
+            let mut out = core::mem::replace(&mut s.cands_buf, Vec::new_in(s.alloc));
+            out.clear();
             out.extend_from_slice(&s.cands[f.cands_lo as usize..]);
             let mut st = f.tstate;
-            let mut cx = s.cx(tys, facts, top);
-            let r = match f.kind {
-                Kind::Trait => trait_goals::assemble(&mut cx, stage, &mut st, &mut out)?,
-                Kind::Alias => crate::alias::assemble(&mut cx, stage, &mut out)?,
-                Kind::WellFormed => {
-                    let Pred::WellFormed(t) = f.goal.pred else { return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred()))) };
-                    crate::structural::assemble_wf(&mut cx, t, &mut out)?;
-                    AStep::Done
-                }
-                Kind::ForFields => assemble_for_fields(&mut cx, stage, &mut st, &mut out)?,
-                Kind::Other => {
-                    let rule = match f.goal.pred {
-                        Pred::TypeOutlives { .. } | Pred::RegionOutlives { .. } => Rule::Outlives,
-                        Pred::Subtype { .. } | Pred::Coerce { .. } => Rule::Relate,
-                        Pred::ConstEvaluatable(_) => Rule::ConstEvaluatable,
-                        Pred::DynCompatible(_) => Rule::DynCompatible,
-                        Pred::ConstArgHasType { .. } => Rule::ConstArgHasType,
-                        Pred::HostEffect { .. } => Rule::HostEffect,
-                        Pred::ConstHolds { .. } => Rule::ConstHolds,
-                        _ => Rule::Eq,
-                    };
-                    out.push(Cand::new(Source::Builtin(crate::assembly::BuiltinSource::Misc), CandRule::Other(rule)));
-                    AStep::Done
+            let res = {
+                let mut cx = s.cx(tys, facts, top);
+                match f.kind {
+                    Kind::Trait => trait_goals::assemble(&mut cx, stage, &mut st, &mut out),
+                    Kind::Alias => crate::alias::assemble(&mut cx, stage, &mut out),
+                    Kind::WellFormed => {
+                        let Pred::WellFormed(t) = f.goal.pred else {
+                            return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
+                        };
+                        crate::structural::assemble_wf(&mut cx, t, &mut out).map(|()| AStep::Done)
+                    }
+                    Kind::ForFields => assemble_for_fields(&mut cx, stage, &mut st, &mut out),
+                    Kind::Other => {
+                        let rule = match f.goal.pred {
+                            Pred::TypeOutlives { .. } | Pred::RegionOutlives { .. } => Rule::Outlives,
+                            Pred::Subtype { .. } | Pred::Coerce { .. } => Rule::Relate,
+                            Pred::ConstEvaluatable(_) => Rule::ConstEvaluatable,
+                            Pred::DynCompatible(_) => Rule::DynCompatible,
+                            Pred::ConstArgHasType { .. } => Rule::ConstArgHasType,
+                            Pred::HostEffect { .. } => Rule::HostEffect,
+                            Pred::ConstHolds { .. } => Rule::ConstHolds,
+                            _ => Rule::Eq,
+                        };
+                        out.push(Cand::new(Source::Builtin(crate::assembly::BuiltinSource::Misc), CandRule::Other(rule)));
+                        Ok(AStep::Done)
+                    }
                 }
             };
-            Ok((r, out, st))
+            s.cands_buf = out;
+            Ok((res?, st))
         })?;
         self.cands.truncate(f.cands_lo as usize);
-        self.cands.extend_from_slice(&out);
+        self.cands.extend_from_slice(&self.cands_buf);
         self.take_added();
         let fr = &mut self.frames[top];
         fr.tstate = st;
@@ -2025,15 +2077,19 @@ impl<'a, E: Emit> Solver<'a, E> {
             let done = &self.dones[f.dones_lo as usize..];
             if trait_goals::wants_impls(f.mode, &f.tstate, &self.resps, done) {
                 let st = f.tstate;
-                let out = self.pull(tys, src, top, |s, tys, facts| {
-                    let mut out: Vec<Cand, Alloc<'a>> = Vec::new_in(s.alloc);
-                    let mut cx = s.cx(tys, facts, top);
-                    trait_goals::assemble_impls(&mut cx, &st, &mut out)?;
-                    Ok(out)
+                self.pull(tys, src, top, |s, tys, facts| {
+                    let mut out = core::mem::replace(&mut s.cands_buf, Vec::new_in(s.alloc));
+                    out.clear();
+                    let res = {
+                        let mut cx = s.cx(tys, facts, top);
+                        trait_goals::assemble_impls(&mut cx, &st, &mut out)
+                    };
+                    s.cands_buf = out;
+                    res
                 })?;
-                self.scratch.stats.impl_candidates += out.iter().filter(|c| matches!(c.source, Source::Impl(_))).count() as u64;
+                self.scratch.stats.impl_candidates += self.cands_buf.iter().filter(|c| matches!(c.source, Source::Impl(_))).count() as u64;
                 self.added.clear();
-                self.cands.extend_from_slice(&out);
+                self.cands.extend_from_slice(&self.cands_buf);
                 return Ok(());
             }
         }
@@ -2638,7 +2694,15 @@ impl<'a, E: Emit> Solver<'a, E> {
             // alone (share.rs). A nested goal's overflow holds only at its depth: not put.
             if let Some(why) = share_why {
                 let why = if why.is_none() && f.overflow && top != 0 { Some(Refuse::Overflow) } else { why };
-                self.share_new.push(NewGoal { input: f.input, entry, overflow: f.overflow, why });
+                match why {
+                    Some(Refuse::Vars) => self.share_refused_pending[0] += 1,
+                    Some(Refuse::Local) => self.share_refused_pending[1] += 1,
+                    Some(Refuse::ConstHolds) => self.share_refused_pending[2] += 1,
+                    Some(Refuse::Overflow) => self.share_refused_pending[3] += 1,
+                    Some(Refuse::Scope) => self.share_refused_pending[4] += 1,
+                    Some(Refuse::Full) => self.share_refused_pending[5] += 1,
+                    None => self.share_new.push(NewGoal { input: f.input, entry, overflow: f.overflow, why: None }),
+                }
             }
         } else if let Some(highest) = heads.highest() {
             self.scratch.stats.provisional += 1;
@@ -3034,7 +3098,7 @@ fn arg_shape<T: Tys>(tys: &T, t: Ty) -> crate::error::ArgShape {
     use crate::error::ArgShape;
     let k = tys.kind(tys.shallow_resolve(t));
     match k {
-        TyKind::ReStatic | TyKind::ReParam(_) | TyKind::ReErased => ArgShape::Region,
+        TyKind::ReStatic | TyKind::ReParam(_) | TyKind::ReErased | TyKind::ReBound(..) | TyKind::RePlaceholder(..) => ArgShape::Region,
         TyKind::Infer(v) if v.kind == VarKind::Region => ArgShape::Region,
         TyKind::Infer(v) if v.kind == VarKind::Const => ArgShape::Const,
         TyKind::ConstValue(..) | TyKind::ConstParam(_) => ArgShape::Const,

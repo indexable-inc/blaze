@@ -12,7 +12,7 @@
 
 use std::{
     env, fs,
-    io::{self, Read as _, Write as _},
+    io::{self, Read as _, Write},
     net::{TcpListener, TcpStream},
     os::unix::fs::MetadataExt as _,
     path::{Path, PathBuf},
@@ -30,8 +30,13 @@ use blaze_git::{
 };
 use blaze_git_fetch::{Kind as ObjectKind, Oid, store::Commit};
 use blaze_own::{Alloc, Vec as OwnVec};
+use bstd::cli::Matches;
 
-use crate::disk::{BgitDiskStore, open_or_infect};
+use crate::{
+    IoStreams,
+    disk::{BgitDiskStore, open_or_infect},
+    resolve_bgit_binary, resolve_path,
+};
 
 /// Parsed mount registry record stored in `~/.bgit/vfs/<id>/mount.info`.
 #[derive(Clone, Debug)]
@@ -176,11 +181,16 @@ pub(crate) fn try_vfs_mount_status<'a>(
 }
 
 /// Public entry point for `bgit mount` (supports background mount, `--foreground`, `--ro`, `--list`).
-pub(crate) fn cmd_mount<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    if args.iter().any(|a| a == "--list" || a == "-l") {
+pub(crate) fn cmd_mount<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
+    alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
+) -> io::Result<()> {
+    if matches.flag("list") {
         let active = list_active_mounts();
         if active.is_empty() {
-            println!("No active bgit VFS mounts.");
+            writeln!(io.out, "No active bgit VFS mounts.")?;
             return Ok(());
         }
         for info in active {
@@ -188,58 +198,36 @@ pub(crate) fn cmd_mount<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()>
                 .ok()
                 .and_then(|b| decode_overlay_status(&b, alloc).ok())
                 .map_or(0, |m| m.entries.len());
-            println!(
+            writeln!(
+                io.out,
                 "{}\t<- {}\t(port={}, pid={}, dirty={})",
                 info.mountpoint.display(),
                 info.repo_dir.display(),
                 info.port,
                 info.pid,
                 dirty
-            );
+            )?;
         }
         return Ok(());
     }
 
-    let mut pos = Vec::new();
-    let mut read_only = false;
-    let mut foreground = false;
-    for a in args {
-        match a.as_str() {
-            "--ro" | "--read-only" => read_only = true,
-            "--foreground" | "-f" => foreground = true,
-            "-h" | "--help" => {
-                println!(
-                    "USAGE:\n\
-                     \tbgit mount <repo> <mountpoint> [rev] [--ro] [--foreground]\n\
-                     \tbgit mount --list"
-                );
-                return Ok(());
-            }
-            other if other.starts_with('-') => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown mount flag: {other}"),
-                ));
-            }
-            other => pos.push(other.to_string()),
-        }
-    }
-
+    let pos = matches.positionals();
     if pos.len() < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "usage: bgit mount <repo> <mountpoint> [rev] [--ro] [--foreground]",
         ));
     }
-
-    let repo_dir = PathBuf::from(&pos[0]);
-    let mountpoint = PathBuf::from(&pos[1]);
-    let rev = pos.get(2).map_or("HEAD", String::as_str);
+    let repo_dir = resolve_path(cwd, pos[0]);
+    let mountpoint = resolve_path(cwd, pos[1]);
+    let rev = pos.get(2).copied().unwrap_or("HEAD");
+    let read_only = matches.flag("ro") || matches.flag("read-only");
+    let foreground = matches.flag("foreground");
 
     if foreground {
         serve_vfs_mount(&repo_dir, &mountpoint, rev, read_only, None, alloc)
     } else {
-        spawn_background_mount(&repo_dir, &mountpoint, rev, read_only)
+        spawn_background_mount(&repo_dir, &mountpoint, rev, read_only, io.out)
     }
 }
 
@@ -249,6 +237,7 @@ pub(crate) fn spawn_background_mount(
     mountpoint: &Path,
     rev: &str,
     read_only: bool,
+    out: &mut dyn Write,
 ) -> io::Result<()> {
     fs::create_dir_all(mountpoint)?;
     let canon_repo = fs::canonicalize(repo_dir)?;
@@ -266,7 +255,7 @@ pub(crate) fn spawn_background_mount(
     let _ = fs::remove_file(&ready_file);
     let _ = fs::remove_file(state_dir.join("stop"));
 
-    let exe = env::current_exe()?;
+    let exe = resolve_bgit_binary();
     let mut cmd = Command::new(exe);
     cmd.arg("__vfs-serve")
         .arg(&canon_repo)
@@ -293,7 +282,8 @@ pub(crate) fn spawn_background_mount(
                 let port = parts.first().copied().unwrap_or("?");
                 let pid = parts.get(1).copied().unwrap_or("?");
                 let head_desc = parts.get(2).copied().unwrap_or("HEAD");
-                println!(
+                writeln!(
+                    out,
                     "Mounted {} ({}) lazily at {} via NFSv3 (127.0.0.1:{}, pid {}, 0 files written to disk)\n  \
                      status:  bgit status {}   (O(dirty), <1ms)\n  \
                      unmount: bgit unmount {}",
@@ -304,7 +294,7 @@ pub(crate) fn spawn_background_mount(
                     pid,
                     canon_mnt.display(),
                     canon_mnt.display(),
-                );
+                )?;
                 return Ok(());
             }
             let msg = text.strip_prefix("err\t").unwrap_or(&text).trim();
@@ -329,62 +319,31 @@ pub(crate) fn spawn_background_mount(
 }
 
 /// Internal entry point (`bgit __vfs-serve`) used by background mounts.
-pub(crate) fn cmd_internal_vfs_serve<'a>(args: &[String], alloc: Alloc<'a>) -> io::Result<()> {
-    if args.len() < 3 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "internal: __vfs-serve <repo> <mountpoint> <rev> [--ro] [--ready-file <path>]",
-        ));
-    }
-    let repo_dir = PathBuf::from(&args[0]);
-    let mountpoint = PathBuf::from(&args[1]);
-    let rev = &args[2];
-    let mut read_only = false;
-    let mut ready_file: Option<PathBuf> = None;
-    let mut i = 3;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--ro" => read_only = true,
-            "--ready-file" => {
-                i += 1;
-                if let Some(p) = args.get(i) {
-                    ready_file = Some(PathBuf::from(p));
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
+pub(crate) fn cmd_internal_vfs_serve<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
+    alloc: Alloc<'a>,
+) -> io::Result<()> {
+    let repo_dir = resolve_path(cwd, matches.positional(0).expect("required REPO"));
+    let mountpoint = resolve_path(cwd, matches.positional(1).expect("required MOUNTPOINT"));
+    let rev = matches.positional(2).expect("required REV");
+    let read_only = matches.flag("ro");
+    let ready_file = matches.opt("ready-file").map(|p| resolve_path(cwd, p));
     serve_vfs_mount(&repo_dir, &mountpoint, rev, read_only, ready_file.as_deref(), alloc)
 }
 
 /// Public entry point for `bgit unmount <mountpoint> [--force]`.
-pub(crate) fn cmd_unmount(args: &[String]) -> io::Result<()> {
-    let mut force = false;
-    let mut target: Option<PathBuf> = None;
-    for a in args {
-        match a.as_str() {
-            "-f" | "--force" => force = true,
-            "-h" | "--help" => {
-                println!("USAGE:\n\tbgit unmount <mountpoint> [--force]");
-                return Ok(());
-            }
-            other if other.starts_with('-') => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("unknown unmount flag: {other}"),
-                ));
-            }
-            other => target = Some(PathBuf::from(other)),
-        }
-    }
-    let Some(mnt) = target else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "usage: bgit unmount <mountpoint> [--force]",
-        ));
-    };
-    let canon_mnt = fs::canonicalize(&mnt).unwrap_or(mnt);
+pub(crate) fn cmd_unmount<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
+    io: &mut IoStreams<'_>,
+) -> io::Result<()> {
+    let mnt = resolve_path(cwd, matches.positional(0).expect("required MOUNTPOINT"));
+    cmd_unmount_path(&mnt, matches.flag("force"), io.out)
+}
+
+pub(crate) fn cmd_unmount_path(mnt: &Path, force: bool, writer: &mut dyn Write) -> io::Result<()> {
+    let canon_mnt = fs::canonicalize(mnt).unwrap_or_else(|_| mnt.to_path_buf());
     let state_dir = vfs_registry_root().join(mount_id_for(&canon_mnt));
 
     let mut cmd = Command::new("/sbin/umount");
@@ -407,7 +366,7 @@ pub(crate) fn cmd_unmount(args: &[String]) -> io::Result<()> {
         let _ = fs::remove_file(state_dir.join("mount.info"));
         let _ = fs::remove_file(state_dir.join("overlay.bgov"));
     }
-    println!("Unmounted {}", canon_mnt.display());
+    writeln!(writer, "Unmounted {}", canon_mnt.display())?;
     Ok(())
 }
 

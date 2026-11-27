@@ -1826,10 +1826,10 @@ fn make_world<'f>(
     let mut script_roots = std::vec::Vec::new_in(Global);
     let mut script_modules = std::vec::Vec::new_in(Global);
     let mut placements = std::vec::Vec::new_in(Global);
-    for (at, script) in script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script) {
-        let ran_as = crate::scripts::placement(Some(home), graph, script, heap);
+    for (at, script_id) in script_units(world.crates.iter().map(|krate| krate.origin), |unit| graph.units[unit.index()].build_script) {
+        let ran_as = crate::scripts::placement(Some(home), graph, script_id, heap);
         placements.push((at, ran_as));
-        let script = &graph.units[script.index()];
+        let script = &graph.units[script_id.index()];
         script_roots.push((at, script.root.as_str()));
         let mut features = std::vec::Vec::new_in(Global);
         features.extend(script.features.iter().map(|feature| feature.as_str()));
@@ -1837,7 +1837,13 @@ fn make_world<'f>(
             .iter()
             .find(|p| p.id == script.package)
             .and_then(|p| crate::macro_files::script_files_digest_in_dir(cx, &reader.root, p.dir, script.root.as_str(), frame));
-        let subject = crate::script_modules::subject(ran_as, script.name.as_str(), script.version.as_str(), &features, files.as_deref());
+        let deps = blaze_proc_macro::script_unit::script_deps_digest(graph, lock, script_id, |dep_pkg| {
+            paths
+                .iter()
+                .find(|p| p.id == dep_pkg)
+                .and_then(|p| crate::macro_files::package_files_digest_in_dir(cx, &reader.root, p.dir, frame))
+        });
+        let subject = crate::script_modules::subject(ran_as, script.name.as_str(), script.version.as_str(), &features, files.as_deref(), deps.as_deref());
         script_modules.push(crate::script_modules::ScriptModule {
             subject,
             crate_at: at,
@@ -1846,6 +1852,7 @@ fn make_world<'f>(
             version: script.version.as_str(),
             features,
             files,
+            deps,
         });
     }
     script_modules.sort_unstable_by_key(|module| (module.subject, module.crate_at));

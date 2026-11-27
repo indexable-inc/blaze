@@ -314,6 +314,7 @@ pub extern "C-unwind" fn main() {
         MakerStart::ByRule,
         SecondCheck,
         &b,
+        None,
         a,
     );
     let opts = Wasm64BuildOpts {
@@ -374,6 +375,7 @@ pub extern "C-unwind" fn main() {
         },
         table: Arc::new(Vec::new()),
         probes: None,
+        c_probes: None,
         spawner: None,
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::new(blaze_proc_macro::spawn_route::SpawnSetting::off()),
@@ -502,6 +504,7 @@ pub extern "C-unwind" fn main() -> u32 {
         MakerStart::ByRule,
         SecondCheck,
         &b,
+        None,
         a,
     );
     let exports = [
@@ -677,7 +680,7 @@ fn main() {
         Some(shim) => Some(shim.main.tabled),
         None => (!roots.is_empty()).then(|| roots.root(0).tabled),
     };
-    let mut build_maker = Maker::of_roots(nr, maker_entry, &roots, SecondCheck, &b, a);
+    let mut build_maker = Maker::of_roots(nr, maker_entry, &roots, SecondCheck, &b, None, a);
     let mut wasm_out: AVec<'static, u8> = OwnVec::new_in(a);
     let out = compile_roots_to_wasm64(
         &roots,
@@ -738,6 +741,7 @@ fn main() {
         },
         table: Arc::new(Vec::new()),
         probes: None,
+        c_probes: None,
         spawner: None,
         step: blaze_ids::ContentId::default(),
         spawn_setting: Arc::new(blaze_proc_macro::spawn_route::SpawnSetting::off()),

@@ -615,3 +615,142 @@ pub extern \"C\" fn main() -> i32 {
     println!("IPC START INNER: {got:?}");
     assert_eq!(got, Ok(11));
 }
+
+#[test]
+fn while_let_await_match_with_guard_and_dropped_arm_binding() {
+    let got = run("
+struct Val(u32);
+impl Drop for Val {
+    fn drop(&mut self) {}
+}
+
+enum Outcome {
+    Valid { tx: Val, extra: Val },
+    Invalid(Val),
+}
+
+enum Out {
+    Ok(Val),
+    Err(Val),
+}
+
+async fn recv(n: &mut u32) -> Option<(u32, u32, Outcome)> {
+    let k = Later { left: 1, value: *n }.await;
+    if k == 0 {
+        None
+    } else {
+        *n = k - 1;
+        Some((k, k % 2, Outcome::Valid { tx: Val(k * 10), extra: Val(1) }))
+    }
+}
+
+fn handle(o: Outcome) -> Out {
+    match o {
+        Outcome::Valid { tx, .. } => Out::Ok(tx),
+        Outcome::Invalid(v) => Out::Err(v),
+    }
+}
+
+async fn run_guarded() -> u32 {
+    let mut sum = 0u32;
+    let mut n = 3u32;
+    let mut slot = Out::Err(Val(0));
+    while let Some((_idx, epoch, outcome)) = recv(&mut n).await {
+        slot = match outcome {
+            Outcome::Valid { tx, .. } if epoch != 0 => {
+                let copy = Val(tx.0 + 1);
+                Out::Err(copy)
+            }
+            outcome => handle(outcome),
+        };
+        match &slot {
+            Out::Ok(v) | Out::Err(v) => sum = sum + v.0,
+        }
+    }
+    sum
+}
+
+async fn run_unguarded() -> u32 {
+    let mut sum = 0u32;
+    let mut n = 2u32;
+    let mut slot = Out::Err(Val(0));
+    while let Some((_idx, _epoch, outcome)) = recv(&mut n).await {
+        slot = match outcome {
+            Outcome::Valid { tx, .. } => {
+                let copy = Val(tx.0 + 2);
+                Out::Err(copy)
+            }
+            Outcome::Invalid(v) => Out::Err(v),
+        };
+        match &slot {
+            Out::Ok(v) | Out::Err(v) => sum = sum + v.0,
+        }
+    }
+    sum
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    // guarded: k=3 (epoch=1 -> 31), k=2 (epoch=0 -> 20), k=1 (epoch=1 -> 11) => 62
+    // unguarded: k=2 (-> 22), k=1 (-> 12) => 34
+    (block_on(run_guarded()) + block_on(run_unguarded())) as i32
+}
+");
+    assert_eq!(got, Ok(96));
+}
+
+/// Regression for `reth_rpc_eth_types::cache::EthStateCacheService::spawn_fetch`: a `Drop` local
+/// captured by value by `async move` blocks in multiple sibling `match` arms, where every use of
+/// the local inside each `async move` body only borrows it (`&self`), must receive a drop flag in
+/// `scan_env_moves` so sibling arms do not hit E0382 ("already moved") and drops run exactly once.
+#[test]
+fn match_arms_async_move_captures_borrowed_drop_local() {
+    let got = run("
+struct Provider {
+    val: u32,
+    drops: *mut u32,
+}
+impl Drop for Provider {
+    fn drop(&mut self) {
+        unsafe { *self.drops = *self.drops + 1; }
+    }
+}
+impl Provider {
+    fn get_block(&self, k: u32) -> u32 { self.val + k }
+    fn get_receipts(&self, k: u32) -> u32 { self.val + k * 2 }
+    fn get_bal(&self, k: u32) -> u32 { self.val + k * 3 }
+}
+
+enum Fetch {
+    Block(u32),
+    Receipts(u32),
+    Bal(u32),
+}
+
+fn spawn_fetch(fetch: Fetch, base: u32, drops: *mut u32) -> u32 {
+    let provider = Provider { val: base, drops };
+    match fetch {
+        Fetch::Block(k) => block_on(async move {
+            provider.get_block(k)
+        }),
+        Fetch::Receipts(k) => block_on(async move {
+            provider.get_receipts(k)
+        }),
+        Fetch::Bal(k) => block_on(async move {
+            provider.get_bal(k)
+        }),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C\" fn main() -> i32 {
+    let mut drops = 0u32;
+    let a = spawn_fetch(Fetch::Block(1), 10, &mut drops as *mut u32);
+    let b = spawn_fetch(Fetch::Receipts(2), 10, &mut drops as *mut u32);
+    let c = spawn_fetch(Fetch::Bal(3), 10, &mut drops as *mut u32);
+    if drops == 3 { (a + b + c) as i32 } else { -1 }
+}
+");
+    // 11 + 14 + 19 = 44, drops == 3 (each Provider dropped once inside its async block)
+    assert_eq!(got, Ok(44));
+}

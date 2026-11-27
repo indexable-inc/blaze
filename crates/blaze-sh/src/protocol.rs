@@ -95,6 +95,9 @@ pub enum Request<'a> {
         env: AVec<'a, (ARc<'a, str>, ARc<'a, str>)>,
         stdin: Option<AVec<'a, u8>>,
         mode: ExternalMode,
+        /// `true` when invoked with an explicit `^cmd` external escape hatch (bypasses host
+        /// in-process tool accelerators like `libbgit`).
+        forced_external: bool,
     },
     /// Execute a live Rust cell (`rust { ... }` or `:rs ...`) via blaze.
     EvalRust {

@@ -286,3 +286,63 @@ fn a_datum_names_a_c_name_by_its_text() {
     assert!(matches!(DatumView::read(&forged), Err(DatumError::Names { .. })), "a section with no C name is refused");
     println!("datum: C names seal, read, fill; 4 refusals");
 }
+
+/// `Space::WeakOutside` targets in a datum seal into `bzdata02`, coexist with strong
+/// `Space::Outside` targets (including both spaces naming the same symbol and arbitrary hash
+/// ordering), resolve every name via `DatumView::name`, and fill cleanly.
+#[test]
+fn datum_weak_and_strong_outside_targets_round_trip_and_fill() {
+    const WEAK_PRESENT_AT: u64 = 0x7_0000_0020;
+    struct WeakRun<'v>(DatumView<'v>);
+    impl Words for WeakRun<'_> {
+        fn word(&mut self, target: Target, _call: bool) -> Result<u64, ImageError> {
+            Err(ImageError::Unbound { target })
+        }
+        fn value(&mut self, target: Target) -> Result<u64, ImageError> {
+            match (target.space, self.0.name(target.symbol)) {
+                (Space::Outside, Some("puts")) => Ok(PUTS_AT),
+                (Space::WeakOutside, Some("puts")) => Ok(PUTS_AT),
+                (Space::WeakOutside, Some("weak_present")) => Ok(WEAK_PRESENT_AT),
+                (Space::WeakOutside, Some("weak_missing")) => Ok(0),
+                _ => Err(ImageError::Unbound { target }),
+            }
+        }
+    }
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut d = Datum::new_in(Place::ReadOnly, 3, alloc);
+    d.bytes.extend_from_slice(&[0; 32]);
+    let t_strong = d.outside("puts");
+    let t_weak_same = d.weak_outside("puts");
+    let t_weak_present = d.weak_outside("weak_present");
+    let t_weak_missing = d.weak_outside("weak_missing");
+    d.words.push(Word { at: 0, target: t_strong, addend: 0 });
+    d.words.push(Word { at: 8, target: t_weak_same, addend: 0 });
+    d.words.push(Word { at: 16, target: t_weak_present, addend: 0 });
+    d.words.push(Word { at: 24, target: t_weak_missing, addend: 0 });
+    let bytes = sealed_bytes(d);
+    assert_eq!(&bytes[..8], b"bzdata02");
+
+    let Ok(view) = DatumView::read(&bytes) else { panic!("mixed strong+weak datum must read") };
+    assert_eq!(view.targets(), 4);
+    assert_eq!(view.name(Symbol::of_name("puts")), Some("puts"));
+    assert_eq!(view.name(Symbol::of_name("weak_present")), Some("weak_present"));
+    assert_eq!(view.name(Symbol::of_name("weak_missing")), Some("weak_missing"));
+    assert_eq!(view.name(Symbol::of_name("other")), None);
+
+    let mut out = [0xAAu8; 32];
+    let filled = fill(&view, Symbol::of_name("weak_table"), 0x4000, &mut WeakRun(view), &mut out);
+    assert!(filled.is_ok(), "fill must succeed: {filled:?}");
+    let word = |i: usize| {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&out[i..i + 8]);
+        u64::from_le_bytes(buf)
+    };
+    assert_eq!((word(0), word(8), word(16), word(24)), (PUTS_AT, PUTS_AT, WEAK_PRESENT_AT, 0));
+
+    // Control: bzdata01 bytes are refused as Magic.
+    let mut old = Vec::new_in(alloc);
+    old.extend_from_slice(&bytes);
+    old[..8].copy_from_slice(b"bzdata01");
+    assert_eq!(DatumView::read(&old).err(), Some(DatumError::Magic));
+}

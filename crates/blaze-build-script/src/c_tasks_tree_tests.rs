@@ -160,8 +160,50 @@ struct Beyond {
 
 const SAME: Beyond = Beyond { compiler: 7, make: 1, os_build: "25B78" };
 
+struct AlwaysPresentArea;
+
+impl crate::c_tasks::Area for AlwaysPresentArea {
+    fn put(&mut self, _bytes: &[u8]) -> Result<crate::c_tasks::FileRef, crate::c_tasks::StoreFailed> {
+        Err(crate::c_tasks::StoreFailed)
+    }
+
+    fn read(&self, _file: crate::c_tasks::FileRef, _into: &mut AVec<'_, u8>) -> Result<(), crate::c_tasks::StoreFailed> {
+        Err(crate::c_tasks::StoreFailed)
+    }
+
+    fn has(&self, _file: crate::c_tasks::FileRef) -> bool {
+        true
+    }
+}
+
+struct EmptyArea;
+
+impl crate::c_tasks::Area for EmptyArea {
+    fn put(&mut self, _bytes: &[u8]) -> Result<crate::c_tasks::FileRef, crate::c_tasks::StoreFailed> {
+        Err(crate::c_tasks::StoreFailed)
+    }
+
+    fn read(&self, _file: crate::c_tasks::FileRef, _into: &mut AVec<'_, u8>) -> Result<(), crate::c_tasks::StoreFailed> {
+        Err(crate::c_tasks::StoreFailed)
+    }
+
+    fn has(&self, _file: crate::c_tasks::FileRef) -> bool {
+        false
+    }
+}
+
 /// One ask: the tree's files and key, or its error in words.
 fn ask(record: &[u8], beyond: Beyond, runner: &mut Fake, store: &mut Store) -> Result<(ContentId, std::vec::Vec<(std::string::String, [u8; 32])>, bool), std::string::String> {
+    ask_in_area(record, beyond, runner, &AlwaysPresentArea, store)
+}
+
+fn ask_in_area(
+    record: &[u8],
+    beyond: Beyond,
+    runner: &mut Fake,
+    area: &dyn crate::c_tasks::Area,
+    store: &mut Store,
+) -> Result<(ContentId, std::vec::Vec<(std::string::String, [u8; 32])>, bool), std::string::String> {
     let alloc = blaze_own::testing::heap().alloc();
     let outputs = OutputsRef::open(record).expect("the record opens");
     let plan = c_tasks::plan(&outputs, &roots(), &[], alloc).expect("the plan");
@@ -173,7 +215,7 @@ fn ask(record: &[u8], beyond: Beyond, runner: &mut Fake, store: &mut Store) -> R
     ];
     let sources = [("/package", [2u8; 32])];
     let inputs = TreeInputs { toolchain: &toolchain, tools: &tools, os_build: beyond.os_build, sources: &sources, runner: "fake 1" };
-    match run_tree(PACKAGE, &outputs, &roots(), &plan.trees, &inputs, runner, store, alloc) {
+    match run_tree(PACKAGE, &outputs, &roots(), &plan.trees, &inputs, runner, area, store, alloc) {
         Ok(done) => Ok((done.key, done.files.iter().map(|f| (f.name.as_str().to_owned(), f.sha256)).collect(), done.ran)),
         Err(error) => Err(error.to_string()),
     }
@@ -336,7 +378,7 @@ fn a_file_holding_a_host_folder_is_named_unless_a_log_or_a_depfile() {
         let plan = c_tasks::plan(&outputs, &roots(), &[], alloc).expect("the plan");
         let toolchain = Toolchain { kind: CompilerKind::ShelfClang, compiler: [7; 32], sdk: b"26.1 25B78", target: "aarch64-apple-darwin" };
         let inputs = TreeInputs { toolchain: &toolchain, tools: &[], os_build: "25B78", sources: &[], runner: "fake 1" };
-        run_tree(PACKAGE, &outputs, &roots(), &plan.trees, &inputs, &mut Leaky { file }, store, alloc).map(|done| done.left_out).map_err(|error| error.to_string())
+        run_tree(PACKAGE, &outputs, &roots(), &plan.trees, &inputs, &mut Leaky { file }, &AlwaysPresentArea, store, alloc).map(|done| done.left_out).map_err(|error| error.to_string())
     };
     for file in ["config.log", "src/arena.d"] {
         let mut store = Store { held: std::vec::Vec::new(), puts: 0 };
@@ -356,4 +398,17 @@ fn a_tree_error_names_the_rule_for_a_cwd_outside() {
     let error = TreeError::CwdOutside { package: PACKAGE, request: 0, cwd: "/package" };
     let words = error.to_string();
     assert!(words.contains(PACKAGE) && words.contains("`/package`") && words.contains("outside its OUT_DIR"), "{words}");
+}
+
+/// If any stored file referenced by a cached tree record was evicted from `Area`, `run_tree`
+/// treats the entry as a cache miss and reruns the tree.
+#[test]
+fn evicted_tree_files_trigger_rerun() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let bytes = record(BASE, alloc);
+    let (mut runner, mut store) = (Fake { ran: 0, fails: None }, Store { held: std::vec::Vec::new(), puts: 0 });
+    let first = ask(&bytes, SAME, &mut runner, &mut store).unwrap_or_else(|e| panic!("{e}"));
+    assert!(first.2 && runner.ran == 1);
+    let evicted = ask_in_area(&bytes, SAME, &mut runner, &EmptyArea, &mut store).unwrap_or_else(|e| panic!("{e}"));
+    assert!(evicted.2 && runner.ran == 2, "evicted tree blob forces rerun");
 }

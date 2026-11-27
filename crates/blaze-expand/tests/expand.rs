@@ -1800,3 +1800,126 @@ fn expr_fragment_keeps_outer_attrs_outside_synthetic_parens() {
         "leaf body after outer attr needs no synthetic parens: {shown}"
     );
 }
+
+/// Helper: expands `stringify!(input_stream)` and returns the unquoted string literal text.
+fn stringify_stream(input: &TokenStream<'_>, cx: &TestCx) -> String {
+    let mut sealed = input.clone();
+    sealed.seal(ContentId([9; 32]));
+    let exp = call_fn_tokens(&builtin(BuiltinFn::Stringify), &sealed, cx);
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert_eq!(exp.tokens.len(), 1, "stringify! emits one string literal");
+    assert!(
+        matches!(exp.tokens.tokens()[0].kind, TokenKind::Literal { kind: LitKind::Str, .. }),
+        "expected Str literal, got {:?}",
+        exp.tokens.tokens()[0].kind
+    );
+    exp.tokens.text_at(0).to_owned()
+}
+
+/// Reproduces `cranelift-codegen-meta/src/pulley.rs:60` (`pulley_interpreter::for_each_op!(define)`):
+/// tokens coming from a `macro_rules!` RHS template never carry `Spacing::JointHidden`, so
+/// `stringify!($field_ty)` produces `"BinaryOperands < XReg >"` and `"UpperRegSet < XReg >"`.
+#[test]
+fn for_each_op_define_stringify_matches_rustc() {
+    let cx = TestCx::new();
+    let alloc = blaze_own::testing::heap().alloc();
+    let for_each_op = rules(
+        "($m:ident) => { $m! { \
+            xadd32 = Xadd32 { operands: BinaryOperands<XReg> }; \
+            xpush = Xpush { regs: UpperRegSet<XReg> }; \
+        } }",
+        1,
+    );
+    let define = rules(
+        "($( $snake:ident = $camel:ident { $( $field:ident : $field_ty:ty ),* }; )*) => { \
+            [ $( $( stringify!($field_ty) ),* ),* ] \
+        }",
+        2,
+    );
+
+    let step1 = call_fn(&for_each_op, "define", &cx);
+    assert!(step1.diagnostics.is_empty(), "{:?}", step1.diagnostics);
+    let calls1 = find_calls(&step1.tokens, alloc).expect("finds `define!` call");
+    assert_eq!(calls1.len(), 1);
+    let mut define_input = step1.tokens.copy_in(calls1[0].inner().to_usize(), alloc).expect("copies");
+    define_input.seal(ContentId([7; 32]));
+
+    let step2 = call_fn_tokens(&define, &define_input, &cx);
+    assert!(step2.diagnostics.is_empty(), "{:?}", step2.diagnostics);
+    let calls2 = find_calls(&step2.tokens, alloc).expect("finds `stringify!` calls");
+    assert_eq!(calls2.len(), 2);
+
+    let results: Vec<String> = calls2
+        .iter()
+        .map(|call| {
+            let arg = step2.tokens.copy_in(call.inner().to_usize(), alloc).expect("copies");
+            stringify_stream(&arg, &cx)
+        })
+        .collect();
+    assert_eq!(results, vec!["BinaryOperands < XReg >", "UpperRegSet < XReg >"]);
+    assert_eq!(results[0].strip_prefix("BinaryOperands <"), Some(" XReg >"));
+}
+
+/// Tokens from a `macro_rules!` RHS template (`TokenOrigin::Def`) drop `Spacing::JointHidden`
+/// (keeping only `Spacing::Joint` on glued punct) and `stringify!` spaces them as rustc does.
+#[test]
+fn macro_rules_rhs_stringify_spacing_matches_rustc() {
+    let cx = TestCx::new();
+    let cases = [
+        ("BinaryOperands<XReg>", "BinaryOperands < XReg >"),
+        ("UpperRegSet<XReg>", "UpperRegSet < XReg >"),
+        ("BinaryOperands<XReg, YReg>", "BinaryOperands < XReg, YReg >"),
+        ("foo::Bar<XReg>", "foo :: Bar < XReg >"),
+        ("$crate::f(1)", "$crate :: f(1)"),
+        ("let x = 1;", "let x = 1;"),
+        ("a.b.c()", "a.b.c()"),
+        ("#[allow(dead_code)] struct S { x: i32 }", "#[allow(dead_code)] struct S { x : i32 }"),
+        ("foo!(a, b)", "foo! (a, b)"),
+        ("1 ! 2", "1 ! 2"),
+        ("if ! ()", "if ! ()"),
+        ("(a)!", "(a)!"),
+        ("foo!=bar", "foo != bar"),
+        ("a[0]", "a [0]"),
+        ("1+2", "1 + 2"),
+        ("&'a mut XReg", "& 'a mut XReg"),
+        ("0..=10", "0 ..= 10"),
+        ("0..10", "0 .. 10"),
+        ("0...10", "0 ... 10"),
+    ];
+    for (rhs, expected) in cases {
+        let def = rules(&format!("() => {{ {rhs} }}"), 1);
+        let exp = call_fn(&def, "", &cx);
+        assert!(exp.diagnostics.is_empty(), "{rhs}: {:?}", exp.diagnostics);
+        let got = stringify_stream(&exp.tokens, &cx);
+        assert_eq!(got, expected, "macro_rules! RHS `{rhs}`");
+    }
+}
+
+/// Direct `stringify!(...)` and tokens forwarded from macro call input (`TokenOrigin::Input`,
+/// e.g. `id_tt!(...)`) preserve `Spacing::JointHidden` so adjacent source tokens stay unspaced.
+#[test]
+fn direct_and_input_forwarded_stringify_spacing_matches_rustc() {
+    let cx = TestCx::new();
+    let id_tt = rules("($($t:tt)*) => { $($t)* }", 1);
+    let cases = [
+        ("BinaryOperands<XReg>", "BinaryOperands<XReg>"),
+        ("foo::Bar<XReg>", "foo::Bar<XReg>"),
+        ("foo::<XReg>", "foo::<XReg>"),
+        ("a+b-c*d", "a+b-c*d"),
+        ("-1", "-1"),
+        ("&'a mut XReg", "&'a mut XReg"),
+        ("BinaryOperands   <   XReg   >", "BinaryOperands < XReg >"),
+        ("foo != bar", "foo != bar"),
+        ("foo!=bar", "foo!=bar"),
+        ("0..=10", "0..=10"),
+    ];
+    for (src, expected) in cases {
+        let direct = stringify_stream(&tokens(src), &cx);
+        assert_eq!(direct, expected, "direct stringify!({src})");
+
+        let forwarded = call_fn(&id_tt, src, &cx);
+        assert!(forwarded.diagnostics.is_empty(), "id_tt!({src}): {:?}", forwarded.diagnostics);
+        let got = stringify_stream(&forwarded.tokens, &cx);
+        assert_eq!(got, expected, "id_tt!({src}) -> stringify!");
+    }
+}

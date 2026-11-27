@@ -37,6 +37,60 @@ mod def_site;
 /// `asm!`'s `target_arch`, read as `cfg` atoms at the `asm!` (INTRINSICS.md P9b).
 mod asm_arch;
 
+/// Parses the parenthesized arguments of `#[blaze::cost(..)]` on a loop expression:
+/// `bounded`, `amortized`, or `reset`, each optionally followed by `= "non-empty reason"`.
+fn parse_loop_cost(args: &str) -> LoopCost {
+    let Some(inner) = args.trim().strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+        return LoopCost::Invalid;
+    };
+    let inner = inner.trim();
+    let kind = match inner.split_once('=') {
+        Some((lhs, rhs)) => {
+            if !is_nonempty_quoted_str(rhs.trim()) {
+                return LoopCost::Invalid;
+            }
+            lhs.trim()
+        }
+        None => inner,
+    };
+    match kind {
+        "bounded" => LoopCost::Bounded,
+        "amortized" => LoopCost::Amortized,
+        "reset" => LoopCost::Reset,
+        _ => LoopCost::Invalid,
+    }
+}
+
+/// Whether `s` is a single Rust double-quoted string literal with non-whitespace content.
+fn is_nonempty_quoted_str(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' {
+        return false;
+    }
+    let mut i = 1usize;
+    let mut has_non_ws = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 1;
+                if i >= bytes.len() {
+                    return false;
+                }
+                has_non_ws = true;
+                i += 1;
+            }
+            b'"' => return i + 1 == bytes.len() && has_non_ws,
+            b => {
+                if !b.is_ascii_whitespace() {
+                    has_non_ws = true;
+                }
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
 /// What an item declared in one of the body's blocks makes `name` at `scope`, for a pattern:
 /// `None` when no such item is in the value namespace there (the module's answer is asked).
 fn local_value(v: &View<'_>, scope: ScopeId, name: NameIdx) -> Option<ValueName> {
@@ -2123,10 +2177,14 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
                 }
             }
             EXPR_STMT => {
+                let stmt_cost = self.loop_cost_attr(f);
                 let e = self.first(f, V::Expr);
                 let semi = self.has_tok(f, SEMICOLON);
                 self.done(f);
                 if let Some(e) = e {
+                    if let Some(cost) = stmt_cost {
+                        self.apply_stmt_loop_cost(ExprId(e.id), cost);
+                    }
                     if semi {
                         let s = self.put_stmt(Stmt::Expr { expr: ExprId(e.id), semi: true });
                         self.push(V::Stmt, s.0, r);
@@ -2398,26 +2456,29 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
                 return;
             }
             LOOP_EXPR => {
+                let cost = self.loop_cost_attr(f).unwrap_or(LoopCost::Normal);
                 let b = self.first(f, V::Expr);
                 self.done(f);
                 let body = b.map_or_else(|| self.put_expr(Expr::Missing, r), |b| ExprId(b.id));
-                let e = self.put_expr(Expr::Loop { body, source: LoopSource::Loop }, r);
+                let e = self.put_expr(Expr::Loop { body, source: LoopSource::Loop, cost }, r);
                 self.loop_target = e.0;
                 self.push(V::Expr, e.0, r);
                 return;
             }
             WHILE_EXPR => {
+                let cost = self.loop_cost_attr(f).unwrap_or(LoopCost::Normal);
                 let cond = self.kid(f, 0, |v| v == V::Expr).map(|v| ExprId(v.id));
                 let body = self.kid(f, 1, |v| v == V::Expr).map(|v| ExprId(v.id));
                 self.done(f);
                 let cond = cond.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
                 let body = body.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
-                let e = self.while_loop(cond, body, r);
+                let e = self.while_loop(cond, body, cost, r);
                 self.loop_target = e.0;
                 self.push(V::Expr, e.0, r);
                 return;
             }
             FOR_EXPR => {
+                let cost = self.loop_cost_attr(f).unwrap_or(LoopCost::Normal);
                 let pat = self.first(f, V::Pat).map(|v| PatId(v.id));
                 let head = self.kid(f, 0, |v| v == V::Expr).map(|v| ExprId(v.id));
                 let body = self.kid(f, 1, |v| v == V::Expr).map(|v| ExprId(v.id));
@@ -2430,7 +2491,7 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
                     self.push(V::Expr, e.0, r);
                     return;
                 }
-                let e = self.for_loop(pat, head, body, r);
+                let e = self.for_loop(pat, head, body, cost, r);
                 if f.flags & F_LOOP != 0 {
                     self.loop_target = e.inner_loop.0;
                 }
@@ -3126,6 +3187,56 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
             }
         }
         self.keep(f, |v| v == V::Row(ROW_ATTR));
+    }
+
+    /// Reads outer `#[blaze::cost(..)]` attributes attached to a loop frame (`LOOP_EXPR`,
+    /// `WHILE_EXPR`, `FOR_EXPR`, or an `EXPR_STMT` wrapping one). Duplicate or malformed cost
+    /// attributes yield `Some(LoopCost::Invalid)` (Rule 3: never silently ignored).
+    fn loop_cost_attr(&self, f: &Frame) -> Option<LoopCost> {
+        let mut found: Option<LoopCost> = None;
+        let text = self.text();
+        for v in &self.vals[f.base as usize..] {
+            if v.v != V::Row(ROW_ATTR) {
+                continue;
+            }
+            let Ok(a) = Attr::decode(v.node, Lens::BUILDING) else { continue };
+            if a.inner {
+                continue;
+            }
+            let path = a.path.raw().of(text).trim();
+            if !path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "cost") {
+                continue;
+            }
+            let parsed = if a.meta == AttrMeta::Tokens {
+                parse_loop_cost(a.args.raw().of(text))
+            } else {
+                LoopCost::Invalid
+            };
+            found = Some(if found.is_some() { LoopCost::Invalid } else { parsed });
+        }
+        found
+    }
+
+    /// Propagates a `#[blaze::cost(..)]` attribute attached to an `EXPR_STMT` onto its wrapped
+    /// `Expr::Loop` (or the `inner_loop` of a desugared `for` loop).
+    fn apply_stmt_loop_cost(&mut self, e: ExprId, cost: LoopCost) {
+        let Some(&node) = self.out.exprs.get(e.0 as usize) else { return };
+        match Expr::decode(node) {
+            Ok(Expr::Loop { body, source, cost: existing }) => {
+                let merged = if existing == LoopCost::Normal { cost } else { LoopCost::Invalid };
+                self.out.exprs[e.0 as usize] = Expr::Loop { body, source, cost: merged }.encode();
+            }
+            Ok(Expr::Match { arms, source: MatchSource::ForLoop, .. }) => {
+                let Some(&arm_node) = self.out.rows.get(arms.start as usize) else { return };
+                let Ok(arm) = Arm::decode(arm_node) else { return };
+                let Some(&lp_node) = self.out.exprs.get(arm.body.0 as usize) else { return };
+                if let Ok(Expr::Loop { body, source, cost: existing }) = Expr::decode(lp_node) {
+                    let merged = if existing == LoopCost::Normal { cost } else { LoopCost::Invalid };
+                    self.out.exprs[arm.body.0 as usize] = Expr::Loop { body, source, cost: merged }.encode();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn first_pred(&self, f: &Frame) -> CfgAnswer {

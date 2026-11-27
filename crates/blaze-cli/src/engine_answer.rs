@@ -651,6 +651,30 @@ pub(crate) fn tools_digest(tools: &Tools) -> ContentId {
     h.finish()
 }
 
+/// Which CAS reach root of a stored answer was missing or expired when validated at load time.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MissingReachRoot {
+    /// `<prefix>.answer` (pins root directory, radix leaf shards, lines, headers).
+    Answer,
+    /// `<prefix>.reach` (flat or single-root page reach index).
+    Reach,
+    /// `<prefix>.reach.<shard:02x>` (sharded radix page reach root).
+    Shard(u16),
+    /// `<prefix>.reach.delta` (sharded radix incremental delta reach root).
+    Delta,
+}
+
+impl fmt::Display for MissingReachRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MissingReachRoot::Answer => f.write_str("its `.answer` root is missing or expired"),
+            MissingReachRoot::Reach => f.write_str("its `.reach` root is missing or expired"),
+            MissingReachRoot::Shard(shard) => write!(f, "its `.reach.{shard:02x}` shard root is missing or expired"),
+            MissingReachRoot::Delta => f.write_str("its `.reach.delta` root is missing or expired"),
+        }
+    }
+}
+
 /// Why the stored answer is not read: the request answers in full and writes it anew.
 #[derive(Debug)]
 pub(crate) enum Unreadable {
@@ -669,6 +693,10 @@ pub(crate) enum Unreadable {
     Headers { tag: u8 },
     /// A page or the answer's root (pages.rs).
     Pages(PagesError),
+    /// One of the stored answer's CAS reach roots is missing or expired (e.g. partially evicted
+    /// during compaction or unrooted after a crash), so its pages' `beside_key` reach indexes can
+    /// no longer be assumed held.
+    MissingReach { what: MissingReachRoot },
 }
 
 impl fmt::Display for Unreadable {
@@ -685,6 +713,7 @@ impl fmt::Display for Unreadable {
             Unreadable::Torn(torn) => write!(f, "{torn}")?,
             Unreadable::Headers { tag } => write!(f, "its producer header index field (tag {tag}) is no state a writer makes (engine_answer.rs `load_pointer`)")?,
             Unreadable::Pages(why) => write!(f, "{why}")?,
+            Unreadable::MissingReach { what } => write!(f, "{what}")?,
         }
         write!(f, "; answering in full and writing it anew")
     }
@@ -2222,7 +2251,7 @@ fn save<'m, D: Driver, S: Sharing>(
             && rekeyed.pages == 0
             && lent.renew_root(reach_name.as_str(), blaze_cas::plain::ROOT_LIFE_NS).is_live())
         {
-            lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+            root_through_reach(lent, reach_name.as_str(), &indexes, Some(&indexed_beside), last_root)?;
         }
         // Retire any stale sharded reach roots left over if this answer previously exceeded the
         // radix threshold and shrank back to unsharded, so certified no-ops never renew them.
@@ -2659,8 +2688,7 @@ pub(crate) fn adopt_certified<'m, D: Driver, S: Sharing>(
                 .map(|p| blaze_cas::plain::beside_key(blaze_cas::Key(p.0))),
         );
         indexes.sort_unstable();
-        lent.root_through(reach_name.as_str(), &indexes, blaze_cas::plain::ROOT_LIFE_NS)
-            .map_err(crate::store::PlaceError::from)?;
+        root_through_reach(lent, reach_name.as_str(), &indexes, None, Some(pointer.root))?;
         unroot_reach_shards(lent, name, 0, true, frame);
     } else {
         if lent.has_root(reach_name.as_str()) {
@@ -2690,8 +2718,7 @@ pub(crate) fn adopt_certified<'m, D: Driver, S: Sharing>(
                 );
             }
             scratch.sort_unstable();
-            lent.root_through(shard_name.as_str(), &scratch, blaze_cas::plain::ROOT_LIFE_NS)
-                .map_err(crate::store::PlaceError::from)?;
+            root_through_reach(lent, shard_name.as_str(), &scratch, None, Some(pointer.root))?;
         }
         let delta_name = bstd::mem::format_in!(frame, "{name}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}");
         lent.root_through(delta_name.as_str(), &[], blaze_cas::plain::ROOT_LIFE_NS)
@@ -2745,14 +2772,167 @@ pub(crate) struct LoadedBase<'m, 'a> {
     pub(crate) aux: BaseAux,
 }
 
+/// How [`open_named_base`] checks that a stored answer's CAS reach roots are still live in the
+/// store manifest before reusing its pages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ReachCheck<'a> {
+    /// Standard answer root (`<prefix>.answer` + either `<prefix>.reach` or sharded
+    /// `<prefix>.reach.00..` + `<prefix>.reach.delta`).
+    Sharded(&'a str),
+    /// Single-root answer (`tool-base.*`: always `<prefix>.answer` + `<prefix>.reach`).
+    Single(&'a str),
+    /// Test-only `BasePlant::OnePointer` (`LATEST_ROOT` carries no separate reach root).
+    #[cfg(test)]
+    None,
+}
+
+/// Zero-I/O manifest check for the certificate fast path (before `open_root`): returns `true`
+/// iff `<prefix>.answer` and either `<prefix>.reach` or a complete, gapless power-of-two set of
+/// sharded reach roots `<prefix>.reach.00..` plus `<prefix>.reach.delta` are all unexpired in
+/// `lent`. Prevents falsely certifying an answer whose reach shards were partially LRU-evicted
+/// or unrooted after a crash.
+pub(crate) fn reach_roots_live_without_root<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    prefix: &str,
+    frame: &Frame,
+) -> bool {
+    let answer_name = bstd::mem::format_in!(frame, "{prefix}.{ANSWER_ROOT}");
+    if lent.root_named(answer_name.as_str()).is_none() {
+        return false;
+    }
+    let reach_name = bstd::mem::format_in!(frame, "{prefix}.{REACH_ROOT}");
+    if lent.root_named(reach_name.as_str()).is_some() {
+        return true;
+    }
+    let delta_name = bstd::mem::format_in!(frame, "{prefix}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}");
+    if lent.root_named(delta_name.as_str()).is_none() {
+        return false;
+    }
+    let mut shard_name = blaze_own::String::new_in(frame);
+    let mut live_prefix = 0usize;
+    let mut seen_missing = false;
+    for shard in 0..REACH_SHARDS_MOST {
+        shard_name.clear();
+        let _ = write!(shard_name, "{prefix}.{REACH_ROOT}.{shard:02x}");
+        if lent.root_named(shard_name.as_str()).is_some() {
+            if seen_missing {
+                return false;
+            }
+            live_prefix += 1;
+        } else {
+            seen_missing = true;
+        }
+    }
+    live_prefix >= 2 && live_prefix.is_power_of_two()
+}
+
+/// Verifies that every CAS reach root pinning `root`'s pages under `prefix` is still live
+/// (unexpired) in `lent`'s manifest.
+///
+/// On the happy path this performs zero disk I/O (manifest root checks only). When a reach root
+/// is missing or expired, it inspects the uncovered pages to surface the exact missing page or
+/// `beside_key` (`Unreadable::Pages(PagesError::Missing { .. })`) if GC already swept it, else
+/// `Unreadable::MissingReach { what }` naming the missing reach root.
+pub(crate) fn verify_reach_roots<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    prefix: &str,
+    root: &Root<'_>,
+    sharded: bool,
+    alloc: SharedAlloc<'_>,
+    frame: &Frame,
+) -> Result<Result<(), Unreadable>, CliError> {
+    let answer_name = bstd::mem::format_in!(frame, "{prefix}.{ANSWER_ROOT}");
+    if lent.root_named(answer_name.as_str()).is_none() {
+        return Ok(Err(Unreadable::MissingReach { what: MissingReachRoot::Answer }));
+    }
+    if !sharded || !root.is_radix() {
+        let reach_name = bstd::mem::format_in!(frame, "{prefix}.{REACH_ROOT}");
+        if lent.root_named(reach_name.as_str()).is_some() {
+            return Ok(Ok(()));
+        }
+        if !root.is_radix() {
+            for (idx, &page_key) in root.pages.iter().enumerate() {
+                if page_key == Key::default() {
+                    continue;
+                }
+                let page = u32::try_from(idx).unwrap_or(u32::MAX);
+                let cas_page = blaze_cas::Key(page_key.0);
+                if lent.get(&cas_page).map_err(crate::store::PlaceError::from)?.is_none() {
+                    return Ok(Err(Unreadable::Pages(PagesError::Missing { page, key: page_key })));
+                }
+                let beside = blaze_cas::plain::beside_key(cas_page);
+                if lent.get(&beside).map_err(crate::store::PlaceError::from)?.is_none() {
+                    return Ok(Err(Unreadable::Pages(PagesError::Missing { page, key: Key(beside.0) })));
+                }
+            }
+        }
+        return Ok(Err(Unreadable::MissingReach { what: MissingReachRoot::Reach }));
+    }
+    let num_shards = root.page_count().div_ceil(REACH_SHARD_PAGES);
+    let leaves_per_reach = REACH_SHARD_PAGES / pages::RADIX_LEAF_PAGES;
+    let mut shard_name = blaze_own::String::new_in(frame);
+    let mut first_missing_shard: Option<u16> = None;
+    for shard in 0..num_shards {
+        shard_name.clear();
+        let _ = write!(shard_name, "{prefix}.{REACH_ROOT}.{shard:02x}");
+        if lent.root_named(shard_name.as_str()).is_some() {
+            continue;
+        }
+        first_missing_shard.get_or_insert(u16::try_from(shard).unwrap_or(u16::MAX));
+        let from_leaf = shard * leaves_per_reach;
+        let to_leaf = (from_leaf + leaves_per_reach).min(root.page_shards.len());
+        for leaf_idx in from_leaf..to_leaf {
+            let shard_key = root.page_shards.get(leaf_idx).copied().unwrap_or_default();
+            if shard_key == Key::default() {
+                continue;
+            }
+            let leaf = match decode_lent_radix_shard(lent, shard_key, leaf_idx, root.bits, alloc) {
+                Ok(leaf) => leaf,
+                Err(_) => {
+                    return Ok(Err(Unreadable::Pages(PagesError::Missing {
+                        page: pages::ROOT_PAGE,
+                        key: shard_key,
+                    })));
+                }
+            };
+            let base = leaf_idx << pages::RADIX_LEAF_BITS;
+            for (slot, &page_key) in leaf.keys.iter().enumerate() {
+                if page_key == Key::default() {
+                    continue;
+                }
+                let page = u32::try_from(base + slot).unwrap_or(u32::MAX);
+                let cas_page = blaze_cas::Key(page_key.0);
+                if lent.get(&cas_page).map_err(crate::store::PlaceError::from)?.is_none() {
+                    return Ok(Err(Unreadable::Pages(PagesError::Missing { page, key: page_key })));
+                }
+                let beside = blaze_cas::plain::beside_key(cas_page);
+                if lent.get(&beside).map_err(crate::store::PlaceError::from)?.is_none() {
+                    return Ok(Err(Unreadable::Pages(PagesError::Missing { page, key: Key(beside.0) })));
+                }
+            }
+        }
+    }
+    if let Some(shard) = first_missing_shard {
+        return Ok(Err(Unreadable::MissingReach { what: MissingReachRoot::Shard(shard) }));
+    }
+    let delta_name = bstd::mem::format_in!(frame, "{prefix}.{REACH_ROOT}.{REACH_DELTA_SUFFIX}");
+    if lent.root_named(delta_name.as_str()).is_none() {
+        return Ok(Err(Unreadable::MissingReach { what: MissingReachRoot::Delta }));
+    }
+    Ok(Ok(()))
+}
+
 /// Opens a named root's pointer, lines record, root directory, and optional `.members`/`.grains`
-/// auxiliary keys, returning `Ok(None)` if the root is absent, unreadable, excluded, or (when
+/// auxiliary keys, verifying that its CAS reach roots (`reach`) are still live. Returns `Ok(None)`
+/// if the root is absent, unreadable, missing reach roots, excluded, or (when
 /// `require_current_tools`) written under other tools.
 #[expect(clippy::too_many_arguments, reason = "base open helper: each argument one handle or constraint")]
 pub(crate) fn open_named_base<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
     name: &str,
+    reach: ReachCheck<'_>,
     tools: &Tools,
     exclude: Option<Key>,
     require_current_tools: bool,
@@ -2768,19 +2948,34 @@ pub(crate) fn open_named_base<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
     }
     let Ok(lines) = load_lines_in(cx, store, pointer.lines, frame, alloc)? else { return Ok(None) };
     let Ok(root) = open_root(cx, store, pointer.root, alloc)? else { return Ok(None) };
+    match reach {
+        ReachCheck::Sharded(prefix) => {
+            if verify_reach_roots(lent, prefix, &root, true, alloc, frame)?.is_err() {
+                return Ok(None);
+            }
+        }
+        ReachCheck::Single(prefix) => {
+            if verify_reach_roots(lent, prefix, &root, false, alloc, frame)?.is_err() {
+                return Ok(None);
+            }
+        }
+        #[cfg(test)]
+        ReachCheck::None => {}
+    }
     let aux = read_base_aux(store, name, frame)?;
     Ok(Some(LoadedBase { pointer, lines, root, aux }))
 }
 
 /// Opens the best readable workspace base from [`BASES_ROOT`] for the checkout at `dir_root`:
 /// iterates [`candidate_bases`] in priority order (same workspace + lock, then same workspace,
-/// else same root manifest; newest first), skipping `exclude` and any unreadable base, and
-/// preferring a base written under `tools` (`certifies_under(tools)`) before falling back to any
-/// readable base when `!require_current_tools`.
+/// else same root manifest; newest first), skipping `exclude` and any unreadable or
+/// partially-evicted base, and preferring a base written under `tools` (`certifies_under(tools)`)
+/// before falling back to any readable base when `!require_current_tools`.
 #[expect(clippy::too_many_arguments, reason = "workspace base open helper: each argument one handle or constraint")]
 pub(crate) fn open_base_for_tools<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
     dir_root: &bstd::fs::Dir<bstd::fs::ReadWrite>,
     tools: &Tools,
     exclude: Option<Key>,
@@ -2790,7 +2985,7 @@ pub(crate) fn open_base_for_tools<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     #[cfg(test)]
     if base_plant() == BasePlant::OnePointer {
-        return open_named_base(cx, store, LATEST_ROOT, tools, exclude, require_current_tools, alloc, frame);
+        return open_named_base(cx, store, lent, LATEST_ROOT, ReachCheck::None, tools, exclude, require_current_tools, alloc, frame);
     }
     let Some(Some(bases)) = read_bases(cx, store, frame)? else { return Ok(None) };
     let read = |name: &str, text: &mut bstd::mem::Bytes<'_>| -> Result<bool, CliError> {
@@ -2828,6 +3023,9 @@ pub(crate) fn open_base_for_tools<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
         let Ok(lines) = load_lines_in(cx, store, pointer.lines, frame, alloc)? else { continue };
         let Ok(root) = open_root(cx, store, pointer.root, alloc)? else { continue };
         let prefix = base_slot_prefix(base.workspace, base.layout, frame);
+        if verify_reach_roots(lent, prefix.as_str(), &root, true, alloc, frame)?.is_err() {
+            continue;
+        }
         let aux = read_base_aux(store, prefix.as_str(), frame)?;
         let loaded = LoadedBase { pointer, lines, root, aux };
         if current {
@@ -2839,17 +3037,36 @@ pub(crate) fn open_base_for_tools<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
 }
 
 /// Opens the pre-warmed toolchain-only fallback base (`tool-base.<PINNED>.<TRIPLE>.<tools>`),
-/// verifying its pointer, lines, and root directory.
+/// verifying its pointer, lines, root directory, reach roots, and non-empty `root.files` (so a
+/// pre-fix `tool-base` written without `by_file` is never loaded to leak stale `CrateScope` rows).
 pub(crate) fn open_toolchain_base<'m, 'f: 'm, 'a, D: Driver, S: Sharing>(
     cx: &Cx,
     store: &mut CommandStore<'m, '_, D, S>,
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
     toolchain: blaze_toolchain::ToolchainId,
     tools: &Tools,
     alloc: SharedAlloc<'a>,
     frame: &'f Frame,
 ) -> Result<Option<LoadedBase<'m, 'a>>, CliError> {
     let name = toolchain_base_root(toolchain, tools, frame);
-    open_named_base(cx, store, name.as_str(), tools, None, false, alloc, frame)
+    let Some(loaded) = open_named_base(
+        cx,
+        store,
+        lent,
+        name.as_str(),
+        ReachCheck::Single(name.as_str()),
+        tools,
+        None,
+        false,
+        alloc,
+        frame,
+    )? else {
+        return Ok(None);
+    };
+    if loaded.root.live_pages > 0 && loaded.root.files.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(loaded))
 }
 
 /// The home-wide toolchain-only answer root: `tool-base.<PINNED>.<TRIPLE>.<tools>`.
@@ -2961,14 +3178,20 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
     };
     // Fast unchanged check: inspect ONLY the pages holding `fresh_names` in place via `Stored`
     // without decoding the entire `tool-base` answer. Only fall through to `pages::decode` +
-    // merge when at least one toolchain row is new or changed.
+    // merge when at least one toolchain row is new or changed, reach roots are missing, or a
+    // pre-fix `tool-base` lacks `root.files` ownership for its rows.
     if let Some((ptr_root, ref ptr_headers)) = existing_ptr
         && let Ok(root) = open_root(cx, store, ptr_root, alloc)?
+        && verify_reach_roots(lent, tc_root.as_str(), &root, false, alloc, frame)?.is_ok()
+        && !root.files.is_empty()
     {
         let snapshot = store.snapshot_in(alloc)?;
         let existing = Stored::new(&root, &snapshot, ptr_headers, pages::Check::Store, alloc);
         let unchanged = fresh_names.iter().all(|name| {
             let Some(new_row) = row_of(name) else { return false };
+            if !new_row.inline && !root.files.contains_key(&new_row.file) {
+                return false;
+            }
             let Ok(Some(page)) = existing.page(*name) else { return false };
             let Some(old_row) = page.row(*name) else { return false };
             !old_row.facts.failed
@@ -3032,14 +3255,25 @@ fn keep_toolchain_base<'m, D: Driver, S: Sharing>(
             tc_kept.causes.insert(name, cause);
         }
     }
-    // Rebuild `cells` and `readers` from all standing toolchain rows so downstream crates
-    // (`alloc` reading `core`, `std` reading `alloc`, `ImplBucket` reading `CrateScope`, etc.)
-    // see every toolchain cell's digest instead of `ABSENT`.
+    // Rebuild `by_file`, `cells`, and `readers` from all standing toolchain rows so:
+    // - every non-inline toolchain row is owned by its `row.file` in `Root.files` (and thus
+    //   cleanly retired by `Edit.files` when another project's world does not plan that crate,
+    //   never lingering as an unowned ghost row whose `READERS` edge wakes `MissingEntry`),
+    // - downstream crates (`alloc` reading `core`, `std` reading `alloc`, `ImplBucket` reading
+    //   `CrateScope`, etc.) see every toolchain cell's digest instead of `ABSENT`.
+    tc_kept.answer.by_file = blaze_engine::Answer::new_in(alloc).by_file;
     tc_kept.answer.cells = blaze_engine::Answer::new_in(alloc).cells;
     for (&name, row) in tc_kept.answer.rows.iter() {
+        if !row.inline {
+            tc_kept.answer.by_file.entry(row.file).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(name);
+        }
         for &(cell, digest) in row.defines.iter() {
             tc_kept.answer.cells.insert(blaze_engine::CellId { of: name, cell }, (digest, row.serial));
         }
+    }
+    for names in tc_kept.answer.by_file.values_mut() {
+        names.sort_unstable();
+        names.dedup();
     }
     tc_kept.answer.readers = blaze_engine::engine::Readers::from_rows(&tc_kept.answer.rows, alloc);
     let mut tc_page_err: Option<CliError> = None;
@@ -3439,6 +3673,35 @@ fn merge_sorted_keys<'h>(carried: &[u8], added: &[blaze_cas::Key], alloc: Shared
     out
 }
 
+/// Publishes an indexed reach root `root_name` over `indexes`. When `lent.root_through` reports
+/// `StoreError::RootNamesUnheld` for a key NOT indexed by this command (`known_beside`), it came
+/// from an unchanged page carried from `last_owner` whose `beside_key` was evicted or expired:
+/// surface a typed [`PagesError::Reach`] instead of misreporting a writer bug.
+fn root_through_reach<D: Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::StoreAlloc>,
+    root_name: &str,
+    indexes: &[blaze_cas::Key],
+    known_beside: Option<&BesideCache<'_>>,
+    last_owner: Option<Key>,
+) -> Result<(), CliError> {
+    match lent.root_through(root_name, indexes, blaze_cas::plain::ROOT_LIFE_NS) {
+        Ok(_) => Ok(()),
+        Err(blaze_cas::plain::LentError::Store {
+            why: blaze_keyed::store::StoreError::RootNamesUnheld { key, .. },
+            ..
+        }) if let Some(owner) = last_owner
+            && !known_beside.is_some_and(|map| map.values().any(|k| k.0 == key)) =>
+        {
+            Err(page_error(PagesError::Reach {
+                owner,
+                index: Key(key),
+                what: "a carried page's reach index is not in the store (its prior reach root was evicted or expired)",
+            }))
+        }
+        Err(error) => Err(crate::store::PlaceError::from(error).into()),
+    }
+}
+
 /// Source of page keys for [`publish_reach_shards_from`]: either a flat slice (unit tests) or a
 /// 2-level radix [`pages::Encoded`] whose leaf shards live in `lent` and whose incremental deltas
 /// avoid scanning all `1 << bits` slots.
@@ -3611,7 +3874,7 @@ fn publish_reach_shards_from<D: Driver>(
             }
         }
         rekeyed_pages = rekeyed_pages.saturating_add(u32::try_from(scratch.len()).unwrap_or(u32::MAX));
-        lent.root_through(shard_name.as_str(), &scratch, blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
+        root_through_reach(lent, shard_name.as_str(), &scratch, known_beside, last_info.map(|(_, key)| key))?;
     }
     lent.root_through(delta_name.as_str(), &[], blaze_cas::plain::ROOT_LIFE_NS).map_err(crate::store::PlaceError::from)?;
     // Unroot any higher-numbered stale shards if the answer shrank to fewer shards.
@@ -4269,7 +4532,7 @@ mod reach_shard_tests {
         assert_eq!(answer_bytes, expected_index.0.0.as_slice(), "empty row_keys reuses base_direct_index");
 
         // Worktree B opens the workspace base from `BASES_ROOT` and recovers `BaseAux`.
-        let loaded = open_base_for_tools(&cx, &mut store, &wt_b_dir, &tools, None, true, alloc, frame)
+        let loaded = open_base_for_tools(&cx, &mut store, &lent, &wt_b_dir, &tools, None, true, alloc, frame)
             .expect("open base")
             .expect("found base for wt_b");
         assert_eq!(loaded.aux, aux, "open_base_for_tools must return standing members/grains keys");
@@ -4365,5 +4628,226 @@ mod reach_shard_tests {
         assert_eq!(stored.asks(), 320 + overflow);
         let after = stored.asked();
         assert!(after.untold >= 17, "asks past per-shard cap must be counted in untold, got {}", after.untold);
+    }
+
+    /// Reproduces the `reach.4a` partial-eviction failure:
+    /// 1. A 65,536-page (`bits = 16`) sharded radix answer commits `{root}`, `{root}.answer`,
+    ///    `{root}.reach.00..7f`, and `{root}.reach.delta`.
+    /// 2. Unrooting `{root}.reach.4a` alone (before compaction) is caught immediately by both
+    ///    `reach_roots_live_without_root` (zero-I/O certificate guard) and `verify_reach_roots`
+    ///    (`Unreadable::MissingReach { what: MissingReachRoot::Shard(0x4a) }`).
+    /// 3. Unrooting `{root}.reach.4a..7f` and `{root}.reach.delta` (exact LRU suffix eviction
+    ///    order) followed by `f6s3` compaction sweeps the pages and `beside_key`s in shards
+    ///    `4a..7f` while `{root}` and `{root}.answer` (including all 256 radix leaf shards) remain
+    ///    live. `verify_reach_roots` detects the swept page/beside_key at load time
+    ///    (`Unreadable::Pages(PagesError::Missing { .. })`), `open_named_base` refuses to reuse
+    ///    the holed answer, and `publish_reach_shards_from` surfaces `PagesError::Reach` instead
+    ///    of misreporting `StoreError::RootNamesUnheld` as a writer bug.
+    #[test]
+    fn partially_evicted_radix_reach_shard_is_rejected_at_load_and_surfaces_reach_error_on_save() {
+        use blaze_cas::plain::LEASE_NS;
+        use blaze_drive::{Kind, Tool};
+        use blaze_engine::{Cause, Gen, Phase, Row, Stage};
+
+        let io = Io::simulated(SimWorld::new(89, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root context");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let err = io.need_err().expect("err");
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let tools = Tools([Tool(ContentId([11; 32])); blaze_drive::key::KINDS]);
+        let phase = Phase::new(Stage::Bodies, 0);
+
+        // Build a `bits = 16` radix answer with a page guaranteed to land in reach shard `0x4a`
+        // (page indices `0x4a * 512 .. 0x4b * 512`, i.e. content pages with high byte in `0x94..0x96`,
+        // wait: content pages are `0..32768`, so reach shards `0x00..0x3f` hold content pages and
+        // `0x40..0x7f` hold readers pages!). Add readers edges so shard `0x4a` has a live page.
+        let lent = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 89 }, heap.alloc()).expect("store");
+        let mut store = CommandStore::new(&cx, &lent, false, 0, None, clock.clone(), &err, erased.handle()).expect("command store");
+        let payload = blaze_drive::key::content_key(b"radix-evict-payload");
+        store.put(&cx, payload, b"radix-evict-payload").expect("put payload");
+        let mut cold = Kept::new_in(alloc);
+        cold.answer.serial = Gen(1);
+        let mut found_4a = false;
+        for i in 0..2048u32 {
+            let file = Name::new(Kind::FileItems, ContentId::of("evict radix file", &(i % 16).to_le_bytes()));
+            let name = Name::new(Kind::BodyCheck, ContentId::of("evict radix task", &i.to_le_bytes()));
+            let src = ContentId::of("evict radix src", &i.to_le_bytes());
+            let cell = blaze_engine::CellId { of: name, cell: crate::engine_tasks::WHOLE };
+            let rpage = pages::readers_page_of(&cell, 16) as usize;
+            if rpage / REACH_SHARD_PAGES == 0x4a {
+                found_4a = true;
+            }
+            cold.answer.by_file.entry(file).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(name);
+            cold.answer.readers.insert(cell, name);
+            let mut reads = blaze_own::Vec::new_in(alloc);
+            reads.push((cell, payload.0));
+            let mut by_cell = blaze_own::Vec::new_in(alloc);
+            by_cell.push(0);
+            cold.answer.rows.insert(name, Row {
+                key: tools.key(name, &src), phase, file, source: src, out: payload.0, serial: Gen(1),
+                defines: blaze_own::Vec::new_in(alloc), reads, by_cell,
+                findings: 0, inline: false, failed: false,
+            });
+            cold.causes.insert(name, (Gen(1), Cause::New));
+            cold.records.insert(name, payload);
+        }
+        assert!(found_4a, "test must place at least one live page in reach shard 0x4a");
+        for names in cold.answer.by_file.values_mut() {
+            names.sort_unstable();
+        }
+
+        let enc = pages::encode_at_bits(&cold, 16, alloc);
+        assert!(enc.is_radix());
+        for (k, b) in enc.puts.iter() {
+            store.put(&cx, *k, b).expect("put radix record");
+        }
+        let mut indexed_beside: BesideCache<'_> = blaze_hash::Map::new(blaze_hash::MapOpts {
+            hasher: blaze_hash::BuildKeyHasher::default(),
+            alloc,
+            capacity: Some(usize::try_from(enc.task_puts).unwrap_or(0)),
+        });
+        for (page, rows) in enc.page_records() {
+            let mut recs = blaze_own::Vec::with_capacity_in(rows.len() + 1, alloc);
+            recs.push(blaze_cas::Key(page.0));
+            for &(_, rec) in rows {
+                recs.push(blaze_cas::Key(rec.0));
+            }
+            recs.sort_unstable();
+            recs.dedup();
+            let beside = lent.index_beside(blaze_cas::Key(page.0), &recs).expect("index beside");
+            indexed_beside.insert(page.0.0, beside);
+        }
+        let (lines_key, lines_bytes) = crate::engine_lines::Lines::new_in(alloc).record();
+        store.put(&cx, lines_key, &lines_bytes).expect("put lines");
+        let empty_rows = Rows::new_in(frame);
+        let leaves = Leaves::bytes_in(&empty_rows, frame).expect("leaves");
+        let mut ptr_bytes: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::with_capacity_in(POINTER_BYTES, frame);
+        ptr_bytes.extend_from_slice(POINTER_MAGIC);
+        ptr_bytes.extend_from_slice(&enc.root.0.0);
+        ptr_bytes.extend_from_slice(&lines_key.0.0);
+        ptr_bytes.extend_from_slice(&enc.files.to_le_bytes());
+        ptr_bytes.push(Printed { names: true, bodies_whole: true, replayable: true }.byte());
+        ptr_bytes.extend_from_slice(&enc.findings.to_le_bytes());
+        ptr_bytes.extend_from_slice(&enc.owed.to_le_bytes());
+        ptr_bytes.extend_from_slice(&tools_digest(&tools).0);
+        ptr_bytes.push(HEADERS_ABSENT);
+        ptr_bytes.extend_from_slice(&1u64.to_le_bytes());
+        ptr_bytes.extend_from_slice(&[0u8; 32 * HeaderPages::COUNT]);
+        crate::journal_sweep::Stored::encode_units(core::iter::empty(), None, &mut ptr_bytes);
+        let sealed = seal::seal(&ptr_bytes, &leaves, frame).expect("seal");
+        let ptr_key = Key(ContentId::of(POINTER_DOMAIN, &sealed));
+        store.put(&cx, ptr_key, &sealed).expect("put pointer");
+
+        let _ = publish_reach_shards_from(
+            &lent, "big", "big.answer", ReachSource::Radix { last: None, encoded: &enc },
+            Rekey::Changed, Some(&indexed_beside), alloc, frame,
+        ).expect("publish cold radix shards");
+        let mut direct = blaze_own::Vec::new_in(alloc);
+        direct.push(blaze_cas::Key(ptr_key.0));
+        direct.push(blaze_cas::Key(enc.root.0));
+        direct.extend(enc.tree_keys().iter().map(|k| blaze_cas::Key(k.0)));
+        direct.push(blaze_cas::Key(lines_key.0));
+        let answer_idx = lent.index_beside(blaze_cas::Key(ptr_key.0), &direct).expect("answer idx");
+        lent.root_through("big.answer", &[answer_idx], blaze_cas::plain::ROOT_LIFE_NS).expect("pin big.answer");
+        store.pin("big", &[ptr_key]).expect("pin big");
+        // Write unpinned dead bytes into the same segment so compaction under `Liveness::Reached`
+        // sees `< 50%` live share and rewrites the segment, sweeping unpinned shards `4a..7f`.
+        let mut junk = blaze_own::Vec::new_in(alloc);
+        junk.resize(8 << 20, 0xA5);
+        let junk_key = Key(ContentId::of("evict radix junk", b"dead-segment-padding"));
+        store.put(&cx, junk_key, &junk).expect("put junk");
+        lent.commit().expect("commit intact radix answer");
+
+        // Intact: both fast certificate check and full root verification succeed.
+        let dir_intact = open_root(&cx, &mut store, enc.root, alloc).expect("store").expect("root");
+        assert!(reach_roots_live_without_root(&lent, "big", frame), "intact radix answer passes zero-I/O check");
+        assert!(verify_reach_roots(&lent, "big", &dir_intact, true, alloc, frame).expect("store").is_ok());
+        assert!(
+            open_named_base(&cx, &mut store, &lent, "big", ReachCheck::Sharded("big"), &tools, None, true, alloc, frame)
+                .expect("open_named_base")
+                .is_some(),
+            "intact radix base opens cleanly"
+        );
+
+        // Case 1: unroot ONLY shard 0x4a (before compaction sweeps any bytes).
+        lent.unroot("big.reach.4a");
+        lent.commit().expect("commit unroot 4a");
+        assert!(!reach_roots_live_without_root(&lent, "big", frame), "gap at shard 0x4a must fail zero-I/O check");
+        let pre_compact = verify_reach_roots(&lent, "big", &dir_intact, true, alloc, frame).expect("store");
+        assert!(
+            matches!(pre_compact, Err(Unreadable::MissingReach { what: MissingReachRoot::Shard(0x4a) })),
+            "missing shard 0x4a before compaction must report MissingReach(Shard(0x4a)), got {pre_compact:?}"
+        );
+
+        // Case 2: exact LRU suffix eviction (`reach.4a..7f` and `reach.delta`) + compaction sweep.
+        for shard in 0x4a..REACH_SHARDS_MOST {
+            let sname = bstd::mem::format_in!(frame, "big.reach.{shard:02x}");
+            if lent.has_root(sname.as_str()) {
+                lent.unroot(sname.as_str());
+            }
+        }
+        lent.unroot("big.reach.delta");
+        lent.release_lease();
+        lent.commit().expect("commit suffix eviction");
+        drop(store);
+        drop(lent);
+
+        io.with_sim(|sim| sim.advance(core::time::Duration::from_nanos(LEASE_NS + 1_000_000))).expect("advance past lease");
+        let cx2 = io.cx(BUDGET, TASK_FRAME).expect("cx2");
+        let frame2 = cx2.frame();
+        let erased2 = blaze_own::Erased::new(frame2);
+        let lent2 = home.open_store(&Settings::default(), crate::store::Facts { boot: Some(1), nonce: 90 }, heap.alloc()).expect("reopen");
+        let _ = lent2.compact_foreground(32).expect("compact swept 4a..7f");
+        lent2.commit().expect("commit compact");
+        let mut store2 = CommandStore::new(&cx2, &lent2, false, 0, None, clock, &err, erased2.handle()).expect("store2");
+
+        // `big` pointer and `big.answer` (with all 256 radix leaf shards) survived compaction,
+        // while shard 0x4a's pages and `beside_key`s were swept!
+        let dir_after = open_root(&cx2, &mut store2, enc.root, alloc).expect("store").expect("root still opens via big.answer");
+        assert!(!reach_roots_live_without_root(&lent2, "big", frame2), "evicted suffix must fail zero-I/O check");
+        let post_compact = verify_reach_roots(&lent2, "big", &dir_after, true, alloc, frame2).expect("store");
+        assert!(
+            matches!(post_compact, Err(Unreadable::Pages(PagesError::Missing { .. }))),
+            "swept shard 0x4a must report PagesError::Missing at load time, got {post_compact:?}"
+        );
+        assert!(
+            open_named_base(&cx2, &mut store2, &lent2, "big", ReachCheck::Sharded("big"), &tools, None, false, alloc, frame2)
+                .expect("open_named_base")
+                .is_none(),
+            "partially evicted base must be rejected by open_named_base"
+        );
+
+        // Save-time guard: publishing a scoped root over carried `enc` shards surfaces
+        // `PagesError::Reach` instead of misreporting `StoreError::RootNamesUnheld` as a writer bug.
+        let carried_err = publish_reach_shards_from(
+            &lent2, "big.s.scoped", "big.s.scoped.answer",
+            ReachSource::Radix { last: Some((enc.page_count(), enc.root)), encoded: &enc },
+            Rekey::Changed, None, alloc, frame2,
+        ).expect_err("carried swept beside_key must be refused");
+        assert!(
+            matches!(
+                carried_err,
+                CliError::EngineCheck(crate::engine_check::EngineCheckError::Engine(
+                    blaze_engine::EngineError::Last { error: blaze_engine::last::LastError::Pages(PagesError::Reach { .. }) }
+                ))
+            ),
+            "carried swept beside_key must surface PagesError::Reach, got: {carried_err}"
+        );
+
+        // Control: on a cold write (`last: None`), an unput beside_key STILL surfaces `RootNamesUnheld`.
+        let cold_err = publish_reach_shards_from(
+            &lent2, "big.s.cold", "big.s.cold.answer",
+            ReachSource::Radix { last: None, encoded: &enc },
+            Rekey::Changed, None, alloc, frame2,
+        ).expect_err("cold unput beside_key must still be refused");
+        assert!(
+            cold_err.to_string().contains("which was never put"),
+            "cold unput beside_key must remain a writer's bug error, got: {cold_err}"
+        );
     }
 }

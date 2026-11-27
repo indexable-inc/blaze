@@ -587,11 +587,17 @@ pub(crate) fn check_record_purity(bytes: &[u8]) -> Result<(), NotKept> {
     };
     for i in 0..view.targets() {
         let target = view.target(i);
-        if target.space == Space::Outside {
-            let Some(name) = view.name(target.symbol) else {
-                return Err(NotKept::Foreign);
-            };
-            classify_outside_symbol(name)?;
+        match target.space {
+            // Weak extern symbol presence depends on the host libc/runtime version, so a test can
+            // branch on whether the weak address is null even for allowlisted names.
+            Space::WeakOutside => return Err(NotKept::Untraced),
+            Space::Outside => {
+                let Some(name) = view.name(target.symbol) else {
+                    return Err(NotKept::Foreign);
+                };
+                classify_outside_symbol(name)?;
+            }
+            _ => {}
         }
     }
     // Check 4-byte-aligned AArch64 instruction words for raw `svc` syscalls or impure `mrs`
@@ -631,11 +637,17 @@ pub(crate) fn check_datum_purity(bytes: &[u8]) -> Result<(), NotKept> {
     };
     for i in 0..view.targets() {
         let target = view.target(i);
-        if target.space == Space::Outside {
-            let Some(name) = view.name(target.symbol) else {
-                return Err(NotKept::Foreign);
-            };
-            classify_outside_symbol(name)?;
+        match target.space {
+            // Weak extern symbol presence depends on the host libc/runtime version, so a test can
+            // branch on whether the weak address is null even for allowlisted names.
+            Space::WeakOutside => return Err(NotKept::Untraced),
+            Space::Outside => {
+                let Some(name) = view.name(target.symbol) else {
+                    return Err(NotKept::Foreign);
+                };
+                classify_outside_symbol(name)?;
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -2251,6 +2263,61 @@ mod tests {
         assert_eq!(check_datum_purity(&build_datum(Some("memcpy"))), Ok(()));
         assert_eq!(check_datum_purity(&build_datum(Some("clock_gettime"))), Err(NotKept::Clock));
         assert_eq!(check_datum_purity(&build_datum(Some("secp256k1_ecdsa_verify"))), Err(NotKept::Foreign));
+    }
+
+    #[test]
+    fn check_purity_rejects_weak_outside_even_when_allowlisted() {
+        let alloc = blaze_own::testing::heap().alloc();
+        // Pure `ret` (0xd65f03c0).
+        let pure_code = 0xD65F_03C0u32.to_le_bytes();
+        let build_record = |name: &str, weak: bool| {
+            let mut rec = blaze_code::record::CodeRecord::new_in(alloc);
+            rec.code.extend_from_slice(&pure_code);
+            if weak {
+                let _ = rec.weak_outside(name);
+            } else {
+                let _ = rec.outside(name);
+            }
+            let sealed = rec.seal().expect("seal synthetic CodeRecord");
+            let mut out = Vec::new_in(alloc);
+            sealed.encode(&mut out);
+            out
+        };
+        let build_datum = |name: &str, weak: bool| {
+            let mut d = blaze_code::datum::Datum::new_in(blaze_code::datum::Place::ReadOnly, 8, alloc);
+            d.bytes.extend_from_slice(&[0u8; 8]);
+            let target = if weak { d.weak_outside(name) } else { d.outside(name) };
+            d.words.push(blaze_code::record::Word { at: 0, target, addend: 0 });
+            let sealed = d.seal().expect("seal synthetic Datum");
+            let mut out = Vec::new_in(alloc);
+            sealed.encode(&mut out);
+            out
+        };
+
+        // Allowlisted symbols remain cacheable under strong `Space::Outside`,
+        // but MUST be rejected as unkeyed (`NotKept::Untraced`) under `Space::WeakOutside`.
+        for name in ["memcpy", "blaze_poll_page", "__cxa_thread_atexit_impl"] {
+            assert_eq!(
+                check_record_purity(&build_record(name, false)),
+                Ok(()),
+                "control: strong allowlisted symbol {name} must stay cacheable in CodeRecord",
+            );
+            assert_eq!(
+                check_record_purity(&build_record(name, true)),
+                Err(NotKept::Untraced),
+                "weak allowlisted symbol {name} must be rejected as unkeyed in CodeRecord",
+            );
+            assert_eq!(
+                check_datum_purity(&build_datum(name, false)),
+                Ok(()),
+                "control: strong allowlisted symbol {name} must stay cacheable in Datum",
+            );
+            assert_eq!(
+                check_datum_purity(&build_datum(name, true)),
+                Err(NotKept::Untraced),
+                "weak allowlisted symbol {name} must be rejected as unkeyed in Datum",
+            );
+        }
     }
 
     #[test]

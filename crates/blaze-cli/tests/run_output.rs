@@ -1,6 +1,8 @@
 //! `blaze run` and `blaze export` as processes:
 //! - `blaze run` on a clean rung: its standard output is byte-equal to the rung's `expected`, its
-//!   standard error is empty, and its status is the program's.
+//!   standard error carries Cargo-style persistent status lines (`Checking`/`Finished`/`Running`,
+//!   plain without ANSI when piped), `-q` / `--quiet` leaves standard error empty, and its status
+//!   is the program's.
 //! - `blaze export` on `no_core`, `std`, multi-threaded `#[thread_local]`/`thread_local!`, and
 //!   multi-package workspaces (`-p`, `--bin`, `-o`, `--workers`, `--stats`): executes the emitted
 //!   standalone native binary directly with `env_clear()` (no `blaze-launcher`) and verifies its
@@ -135,9 +137,20 @@ fn a_clean_run_prints_only_its_program() {
         let mut cmd = blaze_cmd(&dir, &home);
         cmd.arg("run");
         let output = run_with_deadline(cmd, rung, secs(120));
-        assert_eq!(output.status.code(), Some(0), "{rung}: {}", utf8(&output.stderr));
+        let err = utf8(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{rung}: {err}");
         assert_eq!(utf8(&output.stdout), utf8(stdout), "{rung}: standard output");
-        assert_eq!(utf8(&output.stderr), "", "{rung}: a clean run says nothing");
+        assert!(!err.contains('\x1b'), "{rung}: piped stderr must not emit ANSI escapes: {err:?}");
+        assert!(err.contains("    Checking "), "{rung}: expected Checking status line: {err:?}");
+        assert!(err.contains("    Finished "), "{rung}: expected Finished status line: {err:?}");
+        assert!(err.contains("     Running `"), "{rung}: expected Running status line: {err:?}");
+
+        let mut quiet = blaze_cmd(&dir, &home);
+        quiet.args(["run", "-q"]);
+        let quiet_out = run_with_deadline(quiet, rung, secs(120));
+        assert_eq!(quiet_out.status.code(), Some(0), "{rung} -q: {}", utf8(&quiet_out.stderr));
+        assert_eq!(utf8(&quiet_out.stdout), utf8(stdout), "{rung} -q: standard output");
+        assert_eq!(utf8(&quiet_out.stderr), "", "{rung} -q: a quiet run says nothing on stderr");
     }
     assert_eq!(real_shared_listing(), before, "the owner's ~/.blaze/v2/store changed while the test ran (another blaze of the owner's, or this test writing there)");
     assert!(home.join(".blaze/v2/store").is_dir(), "the temporary home's shared store: the run kept its records there");

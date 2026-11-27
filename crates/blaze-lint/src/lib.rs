@@ -304,6 +304,17 @@ pub enum Rule {
     /// single-allocation `blaze_own::Soa` / `blaze_own::soa!` shares one length, capacity, and
     /// backing block. The lint `blaze::parallel_vecs`.
     ParallelVecs = 46,
+    /// Violation of an opt-in `#[blaze::cost(...)]` complexity contract (time, space, or sync):
+    /// a TYPED rule, decided by the body check (blaze-typeck rules/cost.rs), never by this
+    /// crate's token pass ([`Rule::typed`]). Error at every step ([`Step::levels`]) because the
+    /// user explicitly opted in with `#[blaze::cost(..)]`. The lint `blaze::cost_contract`.
+    CostContract = 47,
+    /// A `#[blaze::capability]` type stored (directly or transitively) as a field inside a type
+    /// defined in a `#![blaze::sans_io]` crate or module: a TYPED rule, decided by
+    /// `blaze-typeck` (`rules/capability.rs`), never by this crate's token pass
+    /// ([`Rule::typed`]). Error at every step ([`Step::levels`]). The lint
+    /// `blaze::capability_in_sans_io`.
+    CapabilityInSansIo = 48,
 }
 
 impl Rule {
@@ -358,6 +369,8 @@ impl Rule {
         Rule::UnusedMut,
         Rule::HeapLeak,
         Rule::ParallelVecs,
+        Rule::CostContract,
+        Rule::CapabilityInSansIo,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -428,6 +441,8 @@ impl Rule {
             Rule::UnusedMut => "unused-mut",
             Rule::HeapLeak => "heap-leak",
             Rule::ParallelVecs => "parallel-vecs",
+            Rule::CostContract => "cost-contract",
+            Rule::CapabilityInSansIo => "capability-in-sans-io",
         }
     }
 
@@ -470,6 +485,8 @@ impl Rule {
             Rule::UnusedMut => Some("unused_mut"),
             Rule::HeapLeak => Some("heap_leak"),
             Rule::ParallelVecs => Some("parallel_vecs"),
+            Rule::CostContract => Some("cost_contract"),
+            Rule::CapabilityInSansIo => Some("capability_in_sans_io"),
             _ => None,
         }
     }
@@ -484,7 +501,7 @@ impl Rule {
     /// A typed rule is in no [`RuleSet`] a step makes, so a token record's key never moves with
     /// it; the step turns it on through its level alone ([`Step::levels`]).
     pub const fn typed(self) -> bool {
-        matches!(self, Rule::ArgsInline | Rule::UnsafeOpInUnsafeFn)
+        matches!(self, Rule::ArgsInline | Rule::UnsafeOpInUnsafeFn | Rule::CostContract | Rule::CapabilityInSansIo)
     }
 
     /// The rule configuration names `name` ([`Rule::name`]'s spelling), if any.
@@ -1495,6 +1512,8 @@ impl Step {
             Step::Edition => Level::Advice,
             Step::Strict => Level::Error,
         };
+        levels[Rule::CostContract as usize - 1] = Level::Error;
+        levels[Rule::CapabilityInSansIo as usize - 1] = Level::Error;
         Levels(levels)
     }
 }

@@ -106,6 +106,7 @@ impl BodyBuf {
             pat_editions: &[],
             record_expr_schemas: &[],
             closure_param_regions: &[],
+            loop_marks: &[],
         }
     }
 }
@@ -803,7 +804,7 @@ impl crate::world::World for SigWorld<'_> {
         }))
     }
     fn predicates(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<crate::world::Predicates<'_>> {
-        Ok(crate::world::Predicates { clauses: &[], types: PTys::EMPTY })
+        Ok(crate::world::Predicates { clauses: &[], types: PTys::EMPTY, regions: None })
     }
     fn adt(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<Option<crate::world::Adt<'_>>> {
         Ok(None)
@@ -906,6 +907,7 @@ fn empty_body<'b>(owner: ItemKey, types: PTys<'b>, root: ExprId) -> BodyView<'b>
         pat_editions: &[],
         record_expr_schemas: &[],
         closure_param_regions: &[],
+        loop_marks: &[],
     }
 }
 

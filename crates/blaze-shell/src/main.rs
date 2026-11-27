@@ -91,9 +91,9 @@ mod macos_app {
     use objc2::rc::{Retained, autoreleasepool};
     use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
     use objc2_app_kit::{
-        NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSCursor, NSEvent,
-        NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSPasteboard,
-        NSPasteboardTypeString, NSResponder, NSView, NSWindow, NSWindowStyleMask,
+        NSApplication, NSApplicationActivationPolicy, NSAutoresizingMaskOptions, NSBackingStoreType,
+        NSCursor, NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem,
+        NSPasteboard, NSPasteboardTypeString, NSResponder, NSView, NSWindow, NSWindowStyleMask,
         NSWindowTitleVisibility,
     };
     use objc2_core_graphics::CGColor;
@@ -116,8 +116,9 @@ mod macos_app {
     use blaze_shell::image_atlas::ImageAtlas;
     use blaze_shell::keys;
     use blaze_shell::layout::{
-        LayoutInput, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers,
-        layout_command_palette, layout_fullscreen_terminal_pane, layout_window_top_bar,
+        LayoutInput, SIDEBAR_W, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene,
+        collect_branch_tree, draw_split_dividers, layout_command_palette,
+        layout_fullscreen_terminal_pane, layout_window_top_bar, layout_workspace_sidebar,
     };
     use blaze_shell::prompt::{GitStatusWorker, PromptInfo, try_native_git_command};
     use blaze_shell::pty::{Pty, Read as PtyRead};
@@ -141,11 +142,19 @@ mod macos_app {
     const ZOOM_STEP_POINTS: f64 = 1.5;
     const CURSOR_TRAIL_SECS: f32 = 0.20;
     /// macOS `FullSizeContentView` native window resize border zone (px).
-    const RESIZE_EDGE: f32 = 8.0;
+    /// Matches AppKit's actual ~4pt inner edge band (avoiding a dead inset strip) with a slightly
+    /// wider corner zone so diagonal corner grabs always reach `NSThemeFrame`.
+    const RESIZE_EDGE: f32 = 4.5;
+    const RESIZE_CORNER: f32 = 9.0;
 
     #[inline]
     fn on_resize_edge(x: f32, y: f32, w: f32, h: f32) -> bool {
-        x <= RESIZE_EDGE || x >= w - RESIZE_EDGE || y >= h - RESIZE_EDGE || y <= 4.0
+        if x <= RESIZE_EDGE || x >= w - RESIZE_EDGE || y <= RESIZE_EDGE || y >= h - RESIZE_EDGE {
+            return true;
+        }
+        let corner_x = x <= RESIZE_CORNER || x >= w - RESIZE_CORNER;
+        let corner_y = y <= RESIZE_CORNER || y >= h - RESIZE_CORNER;
+        corner_x && corner_y
     }
 
     struct CliOpts {
@@ -256,11 +265,11 @@ mod macos_app {
         ResizeNS,
     }
 
-    fn apply_cursor(cur: &mut CursorKind, next: CursorKind) {
-        if *cur == next {
+    fn apply_cursor(cur: &mut Option<CursorKind>, next: CursorKind) {
+        if *cur == Some(next) {
             return;
         }
-        *cur = next;
+        *cur = Some(next);
         #[allow(deprecated)]
         let cursor = match next {
             CursorKind::Arrow => NSCursor::arrowCursor(),
@@ -610,13 +619,13 @@ mod macos_app {
     /// Collect all live child PTY and background-job PIDs across every pane & tab so the
     /// folder-process monitor knows which processes belong to which `blaze-shell` pane/TUI.
     fn collect_shell_pane_pids(
-        wm: &TileManager,
+        wm: &TileManager<'_>,
         panes: &std::collections::HashMap<PaneId, ShellApp>,
     ) -> Vec<blaze_sysmon::ShellPanePid> {
         let mut out = Vec::new();
         let mut pane_num = 0u32;
         for tab in wm.tabs() {
-            let mut leaves = Vec::new();
+            let mut leaves = blaze_own::Vec::new_in(blaze_own::Alloc::global());
             tab.root.collect_leaves(&mut leaves);
             for pid in leaves {
                 pane_num += 1;
@@ -789,7 +798,7 @@ mod macos_app {
         /// When an inline PTY is running (`!pty_fullscreen`), whether keyboard & scroll focus is
         /// captured by the inline PTY (`true`) or returned to the shell composer (`false`).
         pty_focused: bool,
-        /// Optional row-count override for the inline PTY box, adjusted with `Cmd+`/`Cmd-`/`Cmd+0`
+        /// Optional row-count override for the inline PTY box, adjusted with `Cmd+Opt+`/`-`/`0`
         /// while focused inside the inline alternate-screen terminal.
         pty_inline_rows_override: Option<u16>,
         active_sysmon: Option<BlockId>,
@@ -914,13 +923,24 @@ mod macos_app {
 
         /// Bind `$_`, `$last`, and `$_<seq>` in `state` so any subsequent command can pipe or
         /// inspect previous outputs with zero copying (O(1) CoW persistent values!).
+        /// For `__blaze_schema` meta-cards (e.g. `open Cargo.lock | schema` or `schema $lock`),
+        /// binds `$_` and `$last` to the inspected subject value (`__blaze_schema_subject`) so
+        /// immediately clicking or typing `.package.source` queries the inspected data!
         fn bind_output_refs(&mut self, state: &mut EngineState<'static>, val: &Value<'static>) {
             if matches!(val, Value::Nothing | Value::Error(_)) {
                 return;
             }
             self.output_seq += 1;
-            state.set_var("_", val.clone(), false);
-            state.set_var("last", val.clone(), false);
+            let effective_subject = match val {
+                Value::Record(r) if blaze_shell::schema_view::is_schema_record(r) => {
+                    r.get(blaze_sh::schema::SCHEMA_SUBJECT_KEY).cloned()
+                }
+                _ => Some(val.clone()),
+            };
+            if let Some(subj) = effective_subject {
+                state.set_var("_", subj.clone(), false);
+                state.set_var("last", subj, false);
+            }
             let numbered = format!("_{}", self.output_seq);
             state.set_var(&numbered, val.clone(), false);
         }
@@ -1537,9 +1557,10 @@ mod macos_app {
             let (cols, rows) = if self.pty_fullscreen {
                 (cols, rows)
             } else {
+                let max_inline = rows.saturating_sub(3).max(12);
                 (
                     cols.saturating_sub(4).max(20),
-                    (rows.saturating_mul(65) / 100).clamp(18, 34),
+                    (rows.saturating_mul(65) / 100).max(12).min(max_inline),
                 )
             };
             let px = (
@@ -1831,12 +1852,12 @@ mod macos_app {
 
     fn sync_pty_sizes(
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
-        tile_layout: &TileLayout,
+        tile_layout: &TileLayout<'_>,
         fonts: &Fonts,
         scale: f64,
     ) {
         for pl in &tile_layout.panes {
-            let content_rect = pl.rect;
+            let content_rect: HitRect = pl.rect.into();
             if let Some(pane) = panes.get_mut(&pl.pane)
                 && let Some(ap) = &pane.active_pty
             {
@@ -1845,7 +1866,7 @@ mod macos_app {
                     (raw_cols, raw_rows)
                 } else {
                     let max_inline = raw_rows.saturating_sub(3).max(12);
-                    let default_rows = (raw_rows.saturating_mul(65) / 100).clamp(18, 34).min(max_inline);
+                    let default_rows = (raw_rows.saturating_mul(65) / 100).max(12).min(max_inline);
                     let target_rows = pane
                         .pty_inline_rows_override
                         .map_or(default_rows, |r| r.clamp(8, max_inline));
@@ -1867,7 +1888,7 @@ mod macos_app {
 
     #[allow(clippy::too_many_arguments)]
     fn build_window_scene(
-        wm: &TileManager,
+        wm: &TileManager<'static>,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
         vw: f32,
         vh: f32,
@@ -1884,9 +1905,15 @@ mod macos_app {
         output_nav: Option<OutputNav>,
         dragging_split: Option<SplitHandle>,
         command_palette: Option<&CommandPalette>,
-    ) -> (Scene, TileLayout) {
-        let work_area = HitRect::new(0.0, TOP_BAR_H, vw, vh.max(TOP_BAR_H + 60.0));
-        let tile_layout = wm.layout(work_area, TILE_GAP);
+        sidebar_open: bool,
+    ) -> (Scene, TileLayout<'static>) {
+        let sidebar_w = if sidebar_open {
+            SIDEBAR_W.min(vw * 0.34).max(180.0)
+        } else {
+            0.0
+        };
+        let work_area = HitRect::new(sidebar_w, TOP_BAR_H, vw, vh.max(TOP_BAR_H + 60.0));
+        let tile_layout = wm.layout(work_area.into(), TILE_GAP);
         let mut master = Scene::new();
         let is_split = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
 
@@ -1895,7 +1922,7 @@ mod macos_app {
             let Some(pane) = panes.get_mut(&pl.pane) else {
                 continue;
             };
-            let content_rect = pl.rect;
+            let content_rect: HitRect = pl.rect.into();
             let pw = (content_rect.x1 - content_rect.x0).max(120.0);
             let ph = (content_rect.y1 - content_rect.y0).max(80.0);
             let sub_vh = ph + TOP_BAR_H;
@@ -2095,6 +2122,7 @@ mod macos_app {
                 });
                 let symbol = p.and_then(|s| s.prompt.project_symbol.as_deref());
                 let process_tag = p.and_then(|s| s.process_tag());
+                let branches = p.map_or_else(Vec::new, |s| collect_branch_tree(&s.store));
                 TabBarItem {
                     id: tab.id,
                     slot: i + 1,
@@ -2104,9 +2132,13 @@ mod macos_app {
                     pane_count: tab.root.leaf_count(),
                     zoomed: tab.zoomed,
                     process_tag,
+                    branches,
                 }
             })
             .collect();
+        if sidebar_open {
+            layout_workspace_sidebar(&mut master, &tab_items, sidebar_w, vh, metrics, mouse_pos);
+        }
         if let Some(focused) = panes.get(&focused_id) {
             layout_window_top_bar(
                 &mut master,
@@ -2120,6 +2152,7 @@ mod macos_app {
                 metrics,
                 zoom_pct,
                 inline_titlebar,
+                sidebar_open,
             );
         }
 
@@ -2168,7 +2201,7 @@ mod macos_app {
         (master, tile_layout)
     }
 
-    fn auto_split_axis(tile_layout: &TileLayout) -> SplitAxis {
+    fn auto_split_axis(tile_layout: &TileLayout<'_>) -> SplitAxis {
         tile_layout
             .panes
             .iter()
@@ -2185,12 +2218,13 @@ mod macos_app {
     #[allow(clippy::too_many_arguments)]
     fn run_palette_action(
         action: PaletteAction,
-        wm: &mut TileManager,
-        tile_layout: &TileLayout,
+        wm: &mut TileManager<'static>,
+        tile_layout: &TileLayout<'_>,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
         font_points: &mut f64,
         zoom_changed: &mut bool,
         pty_sizes_dirty: &mut bool,
+        sidebar_open: &mut bool,
         quit: &mut bool,
     ) {
         let cwd = panes
@@ -2201,6 +2235,10 @@ mod macos_app {
             PaletteAction::NewTab => {
                 let (_, new_pid) = wm.new_tab();
                 panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                *pty_sizes_dirty = true;
+            }
+            PaletteAction::ToggleSidebar => {
+                *sidebar_open = !*sidebar_open;
                 *pty_sizes_dirty = true;
             }
             PaletteAction::NewTiledPane => {
@@ -2481,7 +2519,7 @@ mod macos_app {
         window: &NSWindow,
         layer: &CAMetalLayer,
         renderer: &Renderer,
-        wm: &TileManager,
+        wm: &TileManager<'static>,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
         fonts: &mut Fonts,
         icon_atlas: &mut IconAtlas,
@@ -2491,11 +2529,12 @@ mod macos_app {
         font_points: f64,
         anim_epoch: Instant,
         has_animated_images: &mut bool,
-        tile_layout: &mut TileLayout,
+        tile_layout: &mut TileLayout<'static>,
         composite_scene: &mut Scene,
         pty_sizes_dirty: &mut bool,
         dirty: &mut bool,
         last_pty_sync: &mut Instant,
+        sidebar_open: bool,
     ) {
         match ev {
             ResizeEvent::WillStartLiveResize => {
@@ -2551,6 +2590,7 @@ mod macos_app {
                     None,
                     None,
                     None,
+                    sidebar_open,
                 );
                 *tile_layout = next_tl;
 
@@ -2683,7 +2723,12 @@ mod macos_app {
             use objc2_app_kit::NSAppearanceCustomization as _;
             window.setAppearance(Some(&app_dark));
         }
+        window.setMinSize(NSSize::new(420.0, 260.0));
         let view = BlazeMetalView::new(mtm, NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(init_w, init_h)));
+        view.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
         window.setContentView(Some(&view));
 
         let renderer = Renderer::new(MTLCreateSystemDefaultDevice().expect("no Metal GPU device"));
@@ -2728,7 +2773,7 @@ mod macos_app {
         let term_server = blaze_shell::term_server::start_global(&term_home);
         let mut last_term_rev = term_server.revision();
 
-        let (mut wm, _, first_pane_id) = TileManager::new();
+        let (mut wm, _, first_pane_id) = TileManager::new(blaze_own::Alloc::global());
         let mut panes: std::collections::HashMap<PaneId, ShellApp> = std::collections::HashMap::new();
         let mut first_pane = ShellApp::new_in(cli.cwd.as_deref());
         let (init_cols, init_rows) = grid_for(size, &fonts, scale);
@@ -2811,6 +2856,7 @@ mod macos_app {
                 None,
                 None,
                 None,
+                false,
             );
             let vh = size.height as f32;
             let glyphs = fonts.rasterize_runs(&scene.text_runs, scale, vh);
@@ -2862,7 +2908,7 @@ mod macos_app {
         let mut was_key_window = window.isKeyWindow();
         let mut pty_sizes_dirty = false;
         let mut composite_scene = Scene::new();
-        let mut tile_layout = TileLayout::default();
+        let mut tile_layout = TileLayout::empty(blaze_own::Alloc::global());
         let mut dragging_split: Option<SplitHandle> = None;
         let mut dragging_agent_sidebar = false;
         let mut dragging_table_col: Option<(BlockId, usize, f32)> = None;
@@ -2892,11 +2938,12 @@ mod macos_app {
         let mut active_popover: Option<ActivePopover> = None;
         let mut popup_engaged = false;
         let mut zoom_changed = false;
-        let mut cur_cursor = CursorKind::Arrow;
+        let mut cur_cursor: Option<CursorKind> = None;
         let mut last_mouse: Option<(f32, f32)> = None;
         let mut last_hovered_link: Option<String> = None;
         let mut was_hidden = false;
         let mut last_pty_sync = Instant::now();
+        let mut sidebar_open = false;
 
         loop {
             let mut quit = false;
@@ -2927,6 +2974,7 @@ mod macos_app {
                             &mut pty_sizes_dirty,
                             &mut dirty,
                             &mut last_pty_sync,
+                            sidebar_open,
                         );
                     };
                     with_resize_hook(&mut on_resize, || {
@@ -3185,6 +3233,7 @@ mod macos_app {
                                             &mut font_points,
                                             &mut zoom_changed,
                                             &mut pty_sizes_dirty,
+                                            &mut sidebar_open,
                                             &mut quit,
                                         );
                                     } else {
@@ -3244,7 +3293,15 @@ mod macos_app {
                                     }
                                     continue;
                                 }
-                                // 2. `Cmd+T`: new workspace tab inheriting focused pane's cwd.
+                                // 2. `Cmd+S`: toggle collapsible left workspace & fork-hierarchy sidebar.
+                                if (key == Key::KeyS || lower == "s") && !ctrl && !alt && !shift {
+                                    sidebar_open = !sidebar_open;
+                                    active_popover = None;
+                                    pty_sizes_dirty = true;
+                                    dirty = true;
+                                    continue;
+                                }
+                                // 2b. `Cmd+T`: new workspace tab inheriting focused pane's cwd.
                                 if key == Key::KeyT && !ctrl && !alt {
                                     let cwd = panes
                                         .get(&wm.focused_pane())
@@ -3363,7 +3420,7 @@ mod macos_app {
                                             size.width as f32,
                                             size.height as f32,
                                         );
-                                        if wm.focus_direction(d, area, TILE_GAP).is_some() {
+                                        if wm.focus_direction(d, area.into(), TILE_GAP).is_some() {
                                             active_popover = None;
                                             output_selection = None;
                                             output_nav = None;
@@ -3420,10 +3477,9 @@ mod macos_app {
                                     continue;
                                 }
 
-                                // Context-aware resize / zoom (`Cmd+=`/`Cmd++`, `Cmd+-`, `Cmd+0`):
-                                // - Inside a focused inline alternate-screen PTY: enlarge / shrink / reset that TUI box.
-                                // - Inside a multi-pane split tab: enlarge / shrink / equalize the focused pane.
-                                // - Otherwise (or anytime with `Cmd+Opt+/-/0`): zoom global font size.
+                                // Font zoom (`Cmd+=`/`Cmd++`, `Cmd+-`, `Cmd+0`) ALWAYS zooms text size
+                                // (including inside an inline alternate-screen PTY and in split tabs).
+                                // Optional box/pane resize lives on `Cmd+Opt+=`/`-`/`0`.
                                 let resize_dir: Option<i8> = if matches!(lower.as_str(), "=" | "+")
                                     || matches!(key, Key::Equal | Key::NumpadAdd)
                                 {
@@ -3437,21 +3493,21 @@ mod macos_app {
                                 };
                                 if let Some(dir) = resize_dir {
                                     let focused_pid = wm.focused_pane();
-                                    let inline_pty_focused = !alt
+                                    let inline_pty_resize = alt
                                         && panes.get(&focused_pid).is_some_and(|p| {
                                             p.active_pty.is_some() && !p.pty_fullscreen && p.pty_focused
                                         });
-                                    let split_pane_active = !alt
+                                    let split_pane_resize = alt
                                         && wm.active_tab().root.leaf_count() > 1
                                         && !wm.active_tab().zoomed;
 
-                                    if inline_pty_focused {
+                                    if inline_pty_resize {
                                         if let Some(pane) = panes.get_mut(&focused_pid) {
-                                            let pane_rect = tile_layout
+                                            let pane_rect: HitRect = tile_layout
                                                 .panes
                                                 .iter()
                                                 .find(|pl| pl.pane == focused_pid)
-                                                .map(|pl| pl.rect)
+                                                .map(|pl| pl.rect.into())
                                                 .unwrap_or_else(|| {
                                                     HitRect::new(
                                                         0.0,
@@ -3463,7 +3519,7 @@ mod macos_app {
                                             let (_, raw_rows) = grid_for_rect(pane_rect, &fonts, scale);
                                             let max_inline = raw_rows.saturating_sub(3).max(12);
                                             let default_rows =
-                                                (raw_rows.saturating_mul(65) / 100).clamp(18, 34).min(max_inline);
+                                                (raw_rows.saturating_mul(65) / 100).max(12).min(max_inline);
                                             let cur = pane.pty_inline_rows_override.unwrap_or(default_rows);
                                             pane.pty_inline_rows_override = match dir {
                                                 1 => Some(cur.saturating_add(5).min(max_inline)),
@@ -3473,7 +3529,7 @@ mod macos_app {
                                             pty_sizes_dirty = true;
                                             dirty = true;
                                         }
-                                    } else if split_pane_active {
+                                    } else if split_pane_resize {
                                         match dir {
                                             1 => {
                                                 wm.resize_focused_pane(0.06);
@@ -4323,7 +4379,7 @@ mod macos_app {
                                     }
                                     Key::BracketLeft => {
                                         if !shell.editor.completions.is_empty() {
-                                            shell.editor.dismiss_completions();
+                                            shell.editor.suppress_completions();
                                             popup_engaged = false;
                                         } else {
                                             shell.editor.feed_vim_key(VimKeyEvent::key(VimKeyCode::Escape));
@@ -4416,34 +4472,40 @@ mod macos_app {
                                             popup_engaged = !shell.editor.completions.is_empty();
                                             if shift && popup_engaged {
                                                 shell.editor.move_up();
+                                            } else if !popup_engaged {
+                                                // Auto-completed uniquely or by common prefix (e.g. `/Vo` -> `/Volumes/`):
+                                                // refresh inline Fish ghost immediately for the next segment!
+                                                shell.refresh_editor_assist(false);
                                             }
                                         }
                                     }
                                     Key::Escape => {
                                         if !shell.editor.completions.is_empty() {
-                                            shell.editor.dismiss_completions();
+                                            shell.editor.suppress_completions();
                                             popup_engaged = false;
                                         } else {
                                             shell.editor.feed_vim_key(VimKeyEvent::key(VimKeyCode::Escape));
                                         }
                                     }
                                     Key::Backspace => {
+                                        let keep_open = !shell.editor.completions.is_empty();
                                         if alt {
                                             shell.editor.kill_word_back();
                                         } else {
                                             shell.editor.backspace();
                                         }
                                         popup_engaged = false;
-                                        shell.refresh_editor_assist(false);
+                                        shell.refresh_editor_assist(keep_open);
                                     }
                                     Key::Delete => {
+                                        let keep_open = !shell.editor.completions.is_empty();
                                         if alt {
                                             shell.editor.kill_word_forward();
                                         } else {
                                             shell.editor.delete_forward();
                                         }
                                         popup_engaged = false;
-                                        shell.refresh_editor_assist(false);
+                                        shell.refresh_editor_assist(keep_open);
                                     }
                                     Key::ArrowLeft => {
                                         if alt {
@@ -4508,6 +4570,7 @@ mod macos_app {
                                     }
                                     _ => {
                                         if !text.is_empty() {
+                                            let keep_open = !shell.editor.completions.is_empty() && text != " ";
                                             if text == " " {
                                                 // Fish/Nushell inline abbreviation expansion on Space!
                                                 shell.editor.try_expand_abbreviation();
@@ -4515,8 +4578,9 @@ mod macos_app {
                                             shell.editor.insert_typed(&text);
                                             popup_engaged = false;
                                             shell.auto_scroll_bottom = true;
-                                            // Keep Fish ghost autosuggestions live, never auto-pop noisy menu!
-                                            shell.refresh_editor_assist(false);
+                                            // Keep Fish ghost autosuggestions live; if the popup is
+                                            // already open, narrow it live as the user keeps typing!
+                                            shell.refresh_editor_assist(keep_open);
                                         }
                                     }
                                 }
@@ -4630,8 +4694,8 @@ mod macos_app {
                                     // Send true SGR / X10 mouse wheel events (`\x1b[<64;col;rowM`)
                                     // whenever the TUI (e.g. Claude Code, vim, htop) enabled mouse
                                     // reporting — never falling back to arrow keys!
-                                    let pane_rect = hovered_pl
-                                        .map(|p| p.rect)
+                                    let pane_rect: HitRect = hovered_pl
+                                        .map(|p| p.rect.into())
                                         .unwrap_or_else(|| {
                                             HitRect::new(0.0, TOP_BAR_H, size.width as f32, size.height as f32)
                                         });
@@ -4730,22 +4794,25 @@ mod macos_app {
                             let pt = ev.locationInWindow();
                             let x = pt.x as f32;
                             let y = (size.height - pt.y) as f32;
+                            // Always yield native window resize edges/corners (and traffic lights
+                            // on unfocused windows) directly to AppKit via `with_resize_hook` below.
+                            let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
+                            let yield_to_appkit = on_resize_edge(x, y, size.width as f32, size.height as f32)
+                                || (!window.isKeyWindow() && in_traffic_lights);
+                            if yield_to_appkit {
+                                cur_cursor = None;
+                            }
                             // Clicking an unfocused window activates it AND immediately focuses the
                             // clicked pane, tab, button, or text cursor in a single click (never
-                            // requiring two clicks!). Traffic lights still go straight to AppKit.
-                            if !window.isKeyWindow() {
-                                let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
-                                if in_traffic_lights {
-                                    app.sendEvent(&ev);
-                                    continue;
-                                }
+                            // requiring two clicks!).
+                            if !yield_to_appkit && !window.isKeyWindow() {
                                 #[allow(deprecated)]
                                 app.activateIgnoringOtherApps(true);
                                 window.makeKeyAndOrderFront(None);
                                 dirty = true;
                             }
                             // 0. If the Command Palette is open, handle row clicks or backdrop dismiss!
-                            if let Some(pal) = &command_palette {
+                            if !yield_to_appkit && let Some(pal) = &command_palette {
                                 if let Some(HitAction::SelectPalette(idx)) = composite_scene.hit_test(x, y)
                                     && let Some(act) = pal.action_at(idx)
                                 {
@@ -4758,6 +4825,7 @@ mod macos_app {
                                         &mut font_points,
                                         &mut zoom_changed,
                                         &mut pty_sizes_dirty,
+                                        &mut sidebar_open,
                                         &mut quit,
                                     );
                                     dirty = true;
@@ -4768,7 +4836,7 @@ mod macos_app {
                                 continue;
                             }
                             // Let macOS AppKit handle native window edge/corner resize drags directly!
-                            if !on_resize_edge(x, y, size.width as f32, size.height as f32) {
+                            if !yield_to_appkit {
                                 // 1. Grabbing a tiled split divider starts live drag resize!
                                 if y >= TOP_BAR_H
                                     && let Some(&sh) = tile_layout
@@ -4796,6 +4864,11 @@ mod macos_app {
                                         output_nav = None;
                                         active_popover = None;
                                         match action {
+                                            HitAction::ToggleSidebar => {
+                                                sidebar_open = !sidebar_open;
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                            }
                                             HitAction::SwitchTab(tid) => {
                                                 if wm.select_tab_by_id(tid).is_some() {
                                                     pty_sizes_dirty = true;
@@ -4887,11 +4960,89 @@ mod macos_app {
                                     }
                                 }
 
-                                // 3. Clicking inside any tiled pane focuses it immediately & checks
-                                //    pane header chrome buttons (Close `×`, Zoom, Focus).
+                                // 3. Clicking inside the workspace sidebar or tiled panes handles
+                                //    sidebar tab/fork switches, pane chrome buttons, and focus.
                                 if y >= TOP_BAR_H {
                                     if let Some(action) = composite_scene.hit_test(x, y) {
                                         match action {
+                                            HitAction::ToggleSidebar => {
+                                                sidebar_open = !sidebar_open;
+                                                active_popover = None;
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                                continue;
+                                            }
+                                            HitAction::SwitchTab(tid) => {
+                                                if wm.select_tab_by_id(tid).is_some() {
+                                                    active_popover = None;
+                                                    output_selection = None;
+                                                    output_nav = None;
+                                                    pty_sizes_dirty = true;
+                                                    dirty = true;
+                                                }
+                                                continue;
+                                            }
+                                            HitAction::SwitchTabBranch { tab, branch } => {
+                                                let _ = wm.select_tab_by_id(tab);
+                                                if let Some(shell) = panes.get_mut(&wm.focused_pane())
+                                                    && shell.store.switch_branch(branch)
+                                                {
+                                                    shell.yazi = None;
+                                                    shell.agent_hub = None;
+                                                    shell.scroll_y = 0.0;
+                                                    shell.auto_scroll_bottom = true;
+                                                    shell.refresh_prompt(0, 0);
+                                                }
+                                                active_popover = None;
+                                                output_selection = None;
+                                                output_nav = None;
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                                continue;
+                                            }
+                                            HitAction::NewTab => {
+                                                let cwd = panes
+                                                    .get(&wm.focused_pane())
+                                                    .map(|p| p.cwd().to_owned())
+                                                    .unwrap_or_else(|| "/".to_owned());
+                                                let (_, new_pid) = wm.new_tab();
+                                                panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                                                active_popover = None;
+                                                output_selection = None;
+                                                output_nav = None;
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                                continue;
+                                            }
+                                            HitAction::CloseTab(tid) => {
+                                                if let CloseOutcome::TabClosed { closed_panes, .. } =
+                                                    wm.close_tab(tid)
+                                                {
+                                                    for pid in closed_panes {
+                                                        if let Some(mut p) = panes.remove(&pid)
+                                                            && let Some(ap) = p.active_pty.take()
+                                                        {
+                                                            ap.pty.hangup();
+                                                        }
+                                                    }
+                                                    active_popover = None;
+                                                    output_selection = None;
+                                                    pty_sizes_dirty = true;
+                                                    dirty = true;
+                                                }
+                                                continue;
+                                            }
+                                            HitAction::ForkActiveBranch => {
+                                                if let Some(shell) = panes.get_mut(&wm.focused_pane()) {
+                                                    let _ = shell.store.fork_active_branch(None);
+                                                    shell.refresh_prompt(
+                                                        shell.prompt.last_exit,
+                                                        shell.prompt.last_duration_ms,
+                                                    );
+                                                    dirty = true;
+                                                }
+                                                continue;
+                                            }
                                             HitAction::ClosePane(pid) => {
                                                 match wm.close_pane(pid) {
                                                     CloseOutcome::PaneClosed { closed, .. } => {
@@ -4955,6 +5106,13 @@ mod macos_app {
                                             _ => {}
                                         }
                                     }
+                                    if sidebar_open
+                                        && x < SIDEBAR_W.min(size.width as f32 * 0.34).max(180.0)
+                                    {
+                                        active_popover = None;
+                                        dirty = true;
+                                        continue;
+                                    }
                                     if let Some(pl) =
                                         tile_layout.panes.iter().find(|p| p.rect.contains(x, y))
                                     {
@@ -4976,7 +5134,7 @@ mod macos_app {
                             let shell = panes
                                 .get_mut(&wm.focused_pane())
                                 .expect("focused pane must exist");
-                            if !on_resize_edge(x, y, size.width as f32, size.height as f32)
+                            if !yield_to_appkit
                                 && shell.agent_hub.is_some()
                             {
                                 if let Some(action) = composite_scene.hit_test(x, y) {
@@ -5058,7 +5216,7 @@ mod macos_app {
                                 }
                                 continue;
                             }
-                            if !on_resize_edge(x, y, size.width as f32, size.height as f32)
+                            if !yield_to_appkit
                                 && !(shell.pty_fullscreen && shell.store.is_alternate_screen())
                                 && shell.yazi.is_none()
                                 && shell.agent_hub.is_none()
@@ -5408,6 +5566,25 @@ mod macos_app {
                                             shell.refresh_editor_assist(false);
                                             dirty = true;
                                         }
+                                        HitAction::InsertLiveHint { replace_start, insert } => {
+                                            active_popover = None;
+                                            shell.editor.enter_vim_insert();
+                                            shell.editor.apply_live_hint(replace_start, &insert);
+                                            popup_engaged = false;
+                                            shell.auto_scroll_bottom = true;
+                                            shell.refresh_editor_assist(false);
+                                            dirty = true;
+                                        }
+                                        HitAction::RunCommand(cmd) => {
+                                            active_popover = None;
+                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let cpx = (
+                                                fonts.metrics.cell_w as u32,
+                                                fonts.metrics.cell_h as u32,
+                                            );
+                                            shell.submit_command(&cmd, cols, rows, cpx, true);
+                                            dirty = true;
+                                        }
                                         HitAction::CopyText(txt) => {
                                             copy_to_pasteboard(&txt);
                                         }
@@ -5489,6 +5666,8 @@ mod macos_app {
                                             }
                                         }
                                         HitAction::SwitchTab(_)
+                                        | HitAction::SwitchTabBranch { .. }
+                                        | HitAction::ToggleSidebar
                                         | HitAction::NewTab
                                         | HitAction::CloseTab(_)
                                         | HitAction::SplitPane(_)
@@ -5710,6 +5889,12 @@ mod macos_app {
                                     dirty = true;
                                 }
 
+                                if sidebar_open
+                                    && y >= TOP_BAR_H
+                                    && x < SIDEBAR_W.min(size.width as f32 * 0.34).max(180.0)
+                                {
+                                    dirty = true;
+                                }
                                 let hovered_link = match composite_scene.hit_test(x, y) {
                                     Some(HitAction::OpenLink { href, .. }) => Some(href),
                                     _ => None,
@@ -5719,6 +5904,10 @@ mod macos_app {
                                     dirty = true;
                                 }
 
+                                // Keep AppKit's `NSThemeFrame` tracking areas in sync on every
+                                // `MouseMoved` so native resize-border cursors never linger inset
+                                // inside the window, then apply our content cursor on top.
+                                app.sendEvent(&ev);
                                 let next = cursor_for_point(
                                     &composite_scene,
                                     &tile_layout.handles,
@@ -5733,18 +5922,29 @@ mod macos_app {
                                 );
                                 apply_cursor(&mut cur_cursor, next);
                                 continue;
-                            } else if active_popover.as_ref().is_some_and(|p| !p.pinned) {
-                                active_popover = None;
-                                dirty = true;
                             }
                             if active_popover.as_ref().is_some_and(|p| !p.pinned) {
                                 active_popover = None;
                                 dirty = true;
                             }
-                            // Only reset to Arrow when strictly outside resize edges (otherwise let AppKit show resize arrows!).
-                            if !near_resize_edge {
+                            if near_resize_edge || !in_window {
+                                // Yield cursor ownership completely to AppKit on the resize border
+                                // and outside the window so the first pixel back inside resets it.
+                                cur_cursor = None;
+                                if !in_window {
+                                    last_mouse = None;
+                                }
+                            } else {
+                                // Over traffic lights (inside window, not on resize edge): let
+                                // AppKit highlight the buttons and ensure the cursor resets to Arrow.
+                                app.sendEvent(&ev);
                                 apply_cursor(&mut cur_cursor, CursorKind::Arrow);
+                                continue;
                             }
+                        }
+                        NSEventType::MouseExited => {
+                            cur_cursor = None;
+                            last_mouse = None;
                         }
                         NSEventType::LeftMouseDragged if window.isKeyWindow() => {
                             let pt = ev.locationInWindow();
@@ -5786,11 +5986,11 @@ mod macos_app {
                                 continue;
                             }
                             if dragging_agent_sidebar {
-                                let pane_rect = tile_layout
+                                let pane_rect: HitRect = tile_layout
                                     .panes
                                     .iter()
                                     .find(|p| p.focused)
-                                    .map(|p| p.rect)
+                                    .map(|p| p.rect.into())
                                     .unwrap_or_else(|| {
                                         HitRect::new(0.0, 0.0, size.width as f32, size.height as f32)
                                     });
@@ -6004,6 +6204,7 @@ mod macos_app {
                             &mut pty_sizes_dirty,
                             &mut dirty,
                             &mut last_pty_sync,
+                            sidebar_open,
                         );
                     };
                     with_resize_hook(&mut on_resize, || {
@@ -6031,6 +6232,7 @@ mod macos_app {
                         &mut pty_sizes_dirty,
                         &mut dirty,
                         &mut last_pty_sync,
+                        sidebar_open,
                     );
                 };
                 with_resize_hook(&mut on_resize, || {
@@ -6207,7 +6409,7 @@ mod macos_app {
                     .panes
                     .iter()
                     .find(|pl| pl.pane == pid)
-                    .map(|pl| grid_for_rect(pl.rect, &fonts, scale))
+                    .map(|pl| grid_for_rect(pl.rect.into(), &fonts, scale))
                     .unwrap_or_else(|| grid_for(size, &fonts, scale));
                 if pane.poll_async_jobs(cols, rows, cpx) {
                     dirty = true;
@@ -6339,8 +6541,13 @@ mod macos_app {
                 dirty = true;
             }
             if pty_sizes_dirty {
-                let area = HitRect::new(0.0, TOP_BAR_H, size.width as f32, size.height as f32);
-                let next_tl = wm.layout(area, TILE_GAP);
+                let sw = if sidebar_open {
+                    SIDEBAR_W.min(size.width as f32 * 0.34).max(180.0)
+                } else {
+                    0.0
+                };
+                let area = HitRect::new(sw, TOP_BAR_H, size.width as f32, size.height as f32);
+                let next_tl = wm.layout(area.into(), TILE_GAP);
                 sync_pty_sizes(&mut panes, &next_tl, &fonts, scale);
                 pty_sizes_dirty = false;
             }
@@ -6362,6 +6569,10 @@ mod macos_app {
             let now_key_window = window.isKeyWindow();
             if now_key_window != was_key_window {
                 was_key_window = now_key_window;
+                if !now_key_window {
+                    cur_cursor = None;
+                    last_mouse = None;
+                }
                 if let Some(pane) = panes.get_mut(&wm.focused_pane())
                     && pane.pty_accepts_input()
                 {
@@ -6406,6 +6617,7 @@ mod macos_app {
                     output_nav,
                     dragging_split,
                     command_palette.as_ref(),
+                    sidebar_open,
                 );
                 tile_layout = next_tl;
 
@@ -6454,6 +6666,7 @@ mod macos_app {
                                     output_nav,
                                     dragging_split,
                                     command_palette.as_ref(),
+                                    sidebar_open,
                                 );
                                 blaze_shell::layout::apply_find_overlay(
                                     &mut rescene,
@@ -6536,7 +6749,13 @@ mod macos_app {
                 scene.overlay_text.clear();
                 composite_scene = scene;
                 if let Some((mx, my)) = last_mouse
+                    && cur_cursor.is_some()
                     && window.isKeyWindow()
+                    && mx >= 0.0
+                    && my >= 0.0
+                    && mx <= size.width as f32
+                    && my <= size.height as f32
+                    && !(my < TOP_BAR_H && mx < 76.0)
                     && !on_resize_edge(mx, my, size.width as f32, size.height as f32)
                 {
                     let alt_scr = panes

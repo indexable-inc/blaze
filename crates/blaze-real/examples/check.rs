@@ -876,7 +876,7 @@ impl World for Empty {
         Ok(None)
     }
     fn predicates(&self, _: Seal, _: ItemKey) -> Fetch<Predicates<'_>> {
-        Ok(Predicates { clauses: &[], types: blaze_typeck::PTys::EMPTY })
+        Ok(Predicates { clauses: &[], types: blaze_typeck::PTys::EMPTY, regions: None })
     }
     fn adt(&self, _: Seal, _: ItemKey) -> Fetch<Option<blaze_typeck::Adt<'_>>> {
         Ok(None)

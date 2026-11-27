@@ -893,16 +893,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// captured by value). An unknown type (`Copy` may hold) is not a move; with no `Copy`
     /// lang item in the world no type is known `Copy`-free, so nothing moves.
     pub(super) fn moved_out(&mut self, x: ExprId) -> Result<bool, Stop> {
-        let exprs = self.adjust.column::<0>();
         let kinds = self.adjust.column::<1>();
-        if exprs.iter().zip(kinds).any(|(&e, k)| e == x && matches!(k, crate::columns::AdjustKind::Borrow { .. })) {
+        if self.adjust.rows_rev(x).any(|i| matches!(kinds[i], crate::columns::AdjustKind::Borrow { .. })) {
             return Ok(false);
         }
         // A by-value method may autoderef to a Copy receiver. The value taken
         // is that adjusted value, while the pointer used to reach it stays put.
-        let t = exprs.iter().zip(self.adjust.column::<2>()).rev()
-            .find_map(|(&e, &t)| (e == x).then_some(t))
-            .unwrap_or(self.expr_ty[x.ix()]);
+        let t = self.adjust.last_ty(x).unwrap_or(self.expr_ty[x.ix()]);
         // Without `Copy` nothing can be told copied: the finding names the lang item (the body
         // is tainted), and the use counts as a move, the Reference's case for a non-`Copy` place.
         let Some(copy) = self.need_lang(LangItem::Copy, At::Expr(x))? else { return Ok(true) };
@@ -914,7 +911,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// A wildcard does not read a local place. A call or a coercion in the
     /// discarded expression still evaluates its operands.
     pub(super) fn discarded_local(&self, e: ExprId) -> Result<bool, Stop> {
-        Ok(matches!(self.body.expr(e)?, Expr::Local(_)) && !self.adjust.column::<0>().contains(&e))
+        Ok(matches!(self.body.expr(e)?, Expr::Local(_)) && !self.adjust.has(e))
     }
 
     /// Calls on a concrete closure use its inferred kind without an overloaded
@@ -939,9 +936,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// An autoref uses its borrow mode. A by-value receiver consumes or copies the place.
     fn receiver_usage(&self, receiver: ExprId) -> u8 {
-        self.adjust.column::<0>().iter().zip(self.adjust.column::<1>()).rev()
-            .find_map(|(&e, k)| match k {
-                crate::columns::AdjustKind::Borrow { mutbl, .. } if e == receiver => Some(u8::from(*mutbl == Mutbl::Mut)),
+        let kinds = self.adjust.column::<1>();
+        self.adjust
+            .rows_rev(receiver)
+            .find_map(|i| match kinds[i] {
+                crate::columns::AdjustKind::Borrow { mutbl, .. } => Some(u8::from(mutbl == Mutbl::Mut)),
                 _ => None,
             })
             .unwrap_or(USE_MOVE)

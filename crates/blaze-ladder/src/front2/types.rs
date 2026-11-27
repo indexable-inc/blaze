@@ -1262,7 +1262,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                             // SPEC_ID` of its block; read at the module alone, it was
                             // "cannot find type `SPEC_ID`".
                             let local = match env.body {
-                                Some(body) => super::const_open::local_arg(body.locals, body.owner, self.heads, v, t, name, ar),
+                                Some(body) => super::const_open::local_arg(&self.resolver, self.marks, body.locals, body.owner, body.module, self.heads, v, t, name, ar),
                                 None => Ok(None),
                             };
                             // The name resolves where its token's mark says, as the
@@ -1515,7 +1515,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let usize_ty = intern(tys, PNode::Uint(tc::UintTy::Usize))?;
                 let n = match usize_literal(text, lr)? {
                     Some(bits) => intern(tys, PNode::ConstValue { ty: usize_ty, bits })?,
-                    None => match body_const_len(self.heads, env, v, t, text, lr)? {
+                    None => match body_const_len(&self.resolver, self.marks, self.heads, env, v, t, text, lr)? {
                         Some(bits) => intern(tys, PNode::ConstValue { ty: usize_ty, bits })?,
                         None => self.const_term(tys, env, text, lr, &|_| Ok(usize_ty))?,
                     },
@@ -2229,7 +2229,17 @@ fn type_scope(v: &View<'_>, t: lf::TypeId) -> Result<Option<lf::ScopeId>, Why> {
     Ok(None)
 }
 
-fn body_const_len<H: Heads + ?Sized>(heads: &H, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, text: &str, r: Range) -> Result<Option<u128>, Why> {
+#[expect(clippy::too_many_arguments, reason = "one lookup of a body-local array type length")]
+fn body_const_len<'n, H: Heads + ?Sized, S: NamesSource<'n>>(
+    resolver: &Paths<S>,
+    marks: Option<blaze_scope::crate_roots::TextMarks<'_>>,
+    heads: &H,
+    env: &Env<'_>,
+    v: &View<'_>,
+    t: lf::TypeId,
+    text: &str,
+    r: Range,
+) -> Result<Option<u128>, Why> {
     let Some(body) = env.body else { return Ok(None) };
     let mut name = text.trim();
     if let Some(inner) = name.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
@@ -2239,17 +2249,23 @@ fn body_const_len<H: Heads + ?Sized>(heads: &H, env: &Env<'_>, v: &View<'_>, t: 
     if !ident {
         return Ok(None);
     }
-    let Some(scope) = type_scope(v, t)? else { return Ok(None) };
-    let Some(row) = body.locals.find(body.owner, Some(scope.0), name, super::locals::LocalNs::Value) else { return Ok(None) };
-    match row.kind {
-        super::locals::LocalKind::Const => match heads.const_bits(row.key) {
-            Some(bits) if bits > u128::from(u64::MAX) => Err(Why::Unsupported("an array length past `usize` (a constant declared in the body)", r)),
-            Some(bits) => Ok(Some(bits)),
-            None => Err(Why::NeedConst(row.key, r)),
-        },
-        super::locals::LocalKind::Use => Err(Why::Unsupported("an array length named through a `use` declared in the body", r)),
-        _ => Err(Why::Unsupported("an array length naming an item of the body that is not a constant", r)),
-    }
+    let Some((owner, scope)) = body.locals.scope_or_declared(body.owner, type_scope(v, t)?.map(|s| s.0)) else {
+        return Ok(None);
+    };
+    super::const_open::local_const_in_scope(
+        resolver,
+        marks,
+        body.locals,
+        owner,
+        body.module,
+        heads,
+        v,
+        scope,
+        None,
+        name,
+        r,
+        super::const_open::ArrayLenSite::Type,
+    )
 }
 
 /// The types `t` is made of, in order; `None` past the table.

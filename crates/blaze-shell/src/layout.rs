@@ -16,10 +16,10 @@ use blaze_vt::page::Wide;
 use blaze_vt::style::{Color as VtColor, Rgb as VtRgb, Underline as VtUnderline};
 use blaze_vt::terminal::{Mode as VtMode, Terminal};
 
-use crate::blocks::{Block, BlockBody, BlockId, BlockStore, TABLE_FOLD_ROWS};
+use crate::blocks::{Block, BlockBody, BlockId, BlockStore, BranchId, TABLE_FOLD_ROWS};
 use crate::editor::{
     COMPLETION_VISIBLE_ROWS, CommandPalette, CompletionKind, Editor, HISTORY_VISIBLE_ROWS,
-    PALETTE_VISIBLE_ROWS,
+    LiveHint, PALETTE_VISIBLE_ROWS,
 };
 use crate::icons::{Icon, draw_icon, icon_for_record_key};
 use crate::prompt::{GitFileStatus, PromptInfo};
@@ -35,6 +35,7 @@ use crate::view::{
 };
 
 pub const TOP_BAR_H: f32 = 34.0;
+pub const SIDEBAR_W: f32 = 240.0;
 pub const TILE_GAP: f32 = 2.0;
 const TRAFFIC_LIGHTS_PAD: f32 = 80.0;
 const OUTER_PAD_X: f32 = 16.0;
@@ -379,9 +380,34 @@ fn build_scene_inner(input: &LayoutInput<'_>, draw_top_bar: bool) -> Scene {
     if let Some(rs) = &input.editor.reverse_search {
         layout_reverse_search_overlay(&mut scene, rs, vw, vh, m, input.now_ns);
     } else if !input.editor.completions.is_empty() {
-        layout_completion_popup(&mut scene, input.editor, col_x0, prompt_y0, prompt_y1, vh, col_x1, m);
+        layout_completion_popup(
+            &mut scene,
+            input.editor,
+            col_x0,
+            prompt_y0,
+            prompt_y1,
+            vh,
+            col_x1,
+            m,
+            input.now_ns,
+        );
     } else if let Some(pop) = input.active_popover {
-        layout_active_popover(&mut scene, pop, vw, vh, m, input.mouse_pos);
+        layout_active_popover(&mut scene, pop, vw, vh, m, input.mouse_pos, input.now_ns);
+    } else if !input.pty_focused
+        && let Some(hint) = input.editor.live_inline_hint()
+    {
+        layout_live_hint_strip(
+            &mut scene,
+            &hint,
+            input.editor,
+            col_x0,
+            prompt_y0,
+            prompt_y1,
+            vh,
+            col_x1,
+            m,
+            input.mouse_pos,
+        );
     }
     if let Some(drag) = input.drag {
         layout_drag_overlay(&mut scene, drag, m);
@@ -542,6 +568,126 @@ pub(crate) fn layout_top_bar(
 }
 
 /// Summary descriptor for one workspace tab pill in the unified window titlebar.
+/// One node in a workspace's CoW session fork tree (`BlockStore::branches()`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarBranchNode {
+    pub id: BranchId,
+    pub name: String,
+    /// Tree nesting depth (`0` = root `main`, `1` = forked from `main`, `2` = forked from fork, ...).
+    pub depth: usize,
+    /// True when this node is the last child of its parent branch.
+    pub is_last: bool,
+    /// Bit `d` is set when the ancestor at depth `d` has further siblings below this node.
+    pub ancestor_cont_mask: u32,
+    pub active: bool,
+    pub block_count: usize,
+    /// Short preview of the command at `parent_block` where this fork originated.
+    pub fork_cmd: Option<String>,
+}
+
+/// Build an ordered DFS hierarchy tree of a pane's CoW session branches (`parent_branch` links).
+pub fn collect_branch_tree(store: &BlockStore) -> Vec<SidebarBranchNode> {
+    let branches = store.branches();
+    if branches.is_empty() {
+        return Vec::new();
+    }
+    let active_id = store.active_branch_id();
+    let mut visited = vec![false; branches.len()];
+    let mut out = Vec::with_capacity(branches.len());
+
+    #[allow(clippy::too_many_arguments)]
+    fn dfs(
+        store: &BlockStore,
+        branches: &[crate::blocks::Branch],
+        idx: usize,
+        depth: usize,
+        is_last: bool,
+        ancestor_cont_mask: u32,
+        active_id: BranchId,
+        visited: &mut [bool],
+        out: &mut Vec<SidebarBranchNode>,
+    ) {
+        if visited[idx] || depth > 16 {
+            return;
+        }
+        visited[idx] = true;
+        let br = &branches[idx];
+        let fork_cmd = br
+            .parent_block
+            .and_then(|bid| store.block(bid))
+            .map(|blk| blk.source.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        out.push(SidebarBranchNode {
+            id: br.id,
+            name: br.name.clone(),
+            depth,
+            is_last,
+            ancestor_cont_mask,
+            active: br.id == active_id,
+            block_count: br.blocks.len(),
+            fork_cmd,
+        });
+        let child_indices: Vec<usize> = branches
+            .iter()
+            .enumerate()
+            .filter(|&(ci, cand)| !visited[ci] && cand.parent_branch == Some(br.id))
+            .map(|(ci, _)| ci)
+            .collect();
+        let next_mask = if depth > 0 && !is_last && depth < 31 {
+            ancestor_cont_mask | (1u32 << (depth - 1))
+        } else {
+            ancestor_cont_mask
+        };
+        let n_children = child_indices.len();
+        for (pos, ci) in child_indices.into_iter().enumerate() {
+            dfs(
+                store,
+                branches,
+                ci,
+                depth + 1,
+                pos + 1 == n_children,
+                next_mask,
+                active_id,
+                visited,
+                out,
+            );
+        }
+    }
+
+    // Visit root branches first (`parent_branch` absent or pointing to a missing branch).
+    let roots: Vec<usize> = branches
+        .iter()
+        .enumerate()
+        .filter(|(_, br)| {
+            br.parent_branch
+                .is_none_or(|pid| !branches.iter().any(|b| b.id == pid))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let n_roots = roots.len();
+    for (pos, ri) in roots.into_iter().enumerate() {
+        dfs(
+            store,
+            branches,
+            ri,
+            0,
+            pos + 1 == n_roots,
+            0,
+            active_id,
+            &mut visited,
+            &mut out,
+        );
+    }
+    // Safety net: append any remaining unvisited cycle nodes at root depth.
+    for i in 0..branches.len() {
+        if !visited[i] {
+            dfs(store, branches, i, 0, true, 0, active_id, &mut visited, &mut out);
+        }
+    }
+    out
+}
+
 pub struct TabBarItem<'a> {
     pub id: TabId,
     /// 1-based workspace number (`Cmd+1..9`).
@@ -552,11 +698,13 @@ pub struct TabBarItem<'a> {
     pub pane_count: usize,
     pub zoomed: bool,
     pub process_tag: Option<&'a str>,
+    /// CoW session fork hierarchy for this workspace's focused pane.
+    pub branches: Vec<SidebarBranchNode>,
 }
 
-/// Render the SOTA window-level tiling titlebar: workspace tabs (`Cmd+1..9`), `+` (`Cmd+T`),
-/// zoomed badge (`Cmd+Shift+↵`), focused pane cwd/git status, and split/window controls
-/// (`Cmd+D`, `Cmd+Shift+D`, `Cmd+N`, `Cmd+B`).
+/// Render the streamlined window-level titlebar: sidebar toggle (`Cmd+S`), compact active
+/// workspace indicator (tabs live in the collapsible sidebar), `+` (`Cmd+T`), zoomed badge,
+/// and split/window/fork controls (`Cmd+D`, `Cmd+Shift+D`, `Cmd+Shift+N`, `Cmd+B`).
 #[allow(clippy::too_many_arguments)]
 pub fn layout_window_top_bar(
     scene: &mut Scene,
@@ -570,6 +718,7 @@ pub fn layout_window_top_bar(
     m: CellMetrics,
     zoom_pct: u16,
     inline_titlebar: bool,
+    sidebar_open: bool,
 ) {
     scene.round_rect(0.0, 0.0, vw, TOP_BAR_H, 0.0, theme::BG_TOPBAR, 0.0, [0.0; 4], 0);
     scene.line(0.0, TOP_BAR_H - 0.5, vw, TOP_BAR_H - 0.5, 1.0, theme::LINE, 0);
@@ -583,7 +732,7 @@ pub fn layout_window_top_bar(
     let btn_y1 = TOP_BAR_H - 6.0;
     let mut x = if inline_titlebar { TRAFFIC_LIGHTS_PAD } else { OUTER_PAD_X };
 
-    // Right-aligned tiling & window controls: Fork (Cmd+B), New Window (Cmd+N), Split H, Split V.
+    // Right-aligned tiling & window controls: Fork (Cmd+B), New Window (Cmd+Shift+N), Split H, Split V.
     let mut rx = vw - 12.0;
     let btn_w = 24.0;
     let btn_gap = 5.0;
@@ -691,117 +840,132 @@ pub fn layout_window_top_bar(
         }
     }
 
-    // De-duplicated window-level top bar: keep cwd/git strictly in the focused pane header &
-    // prompt capsule so workspace tabs enjoy clean, fixed native macOS SF Pro typography!
-    let tabs_limit = rx - 10.0;
+    let left_limit = rx - 10.0;
     let _ = prompt;
 
-    // Left: Workspace tabs (`1..N` via Cmd+1..9) + `+` button (`Cmd+T`) + CoW branch pills if >1 branch.
-    let plus_w = 24.0;
-    let tabs_end = (tabs_limit - plus_w - 6.0).max(x);
-    for tab in tabs {
-        let slot_str = format!("{} ", tab.slot);
-        let title_str = truncate_chars(tab.title, 22);
-        let badge_str = if tab.zoomed && tab.pane_count > 1 {
-            format!(" · Z{}", tab.pane_count)
-        } else if tab.pane_count > 1 {
-            format!(" · {}", tab.pane_count)
-        } else if let Some(proc_tag) = tab.process_tag {
-            format!(" · {proc_tag}")
+    // 1. Sidebar toggle button (`Cmd+S`): opens/hides the workspace & fork hierarchy tree.
+    let sb_w = 26.0;
+    if x + sb_w <= left_limit {
+        let rect = HitRect::new(x, btn_y0, x + sb_w, btn_y1);
+        let (bg, border, ic_col) = if sidebar_open {
+            (theme::rgb(0x21, 0x21, 0x27), theme::LINE_STRONG, theme::INK_1)
         } else {
+            (theme::BG_CHIP, theme::LINE, theme::INK_3)
+        };
+        scene.round_rect(x, btn_y0, x + sb_w, btn_y1, 5.5, bg, 1.0, border, 0);
+        draw_icon(scene, Icon::Sidebar, x + (sb_w - 13.0) * 0.5, (TOP_BAR_H - 13.0) * 0.5, 13.0, ic_col, 0);
+        scene.push_hit(rect, HitAction::ToggleSidebar);
+        scene.push_hover_clipped(
+            rect,
+            0,
+            HoverKind::Tooltip {
+                title: if sidebar_open {
+                    "Hide workspace sidebar".to_owned()
+                } else {
+                    "Show workspace & fork sidebar".to_owned()
+                },
+                subtitle: Some(format!(
+                    "Cmd+S · {} workspace{}",
+                    tabs.len(),
+                    if tabs.len() == 1 { "" } else { "s" }
+                )),
+            },
+        );
+        x += sb_w + 6.0;
+    }
+
+    // 2. Compact active workspace summary pill (clicking toggles the sidebar so tabs stay clean!).
+    if let Some(active_tab) = tabs.iter().find(|t| t.active).or_else(|| tabs.first()) {
+        let title_str = truncate_chars(active_tab.title, 26);
+        let fork_count = store.branches().len();
+        let active_branch_name = store
+            .branches()
+            .iter()
+            .find(|b| b.id == store.active_branch_id())
+            .map(|b| b.name.as_str());
+        let mut meta_parts: Vec<String> = Vec::new();
+        if let Some(bn) = active_branch_name
+            && fork_count > 1
+        {
+            meta_parts.push(bn.to_owned());
+        }
+        if tabs.len() > 1 {
+            meta_parts.push(format!("{}/{}", active_tab.slot, tabs.len()));
+        } else if active_tab.pane_count > 1 {
+            meta_parts.push(format!("{} panes", active_tab.pane_count));
+        }
+        let meta_str = if meta_parts.is_empty() {
             String::new()
+        } else {
+            format!("  ·  {}", meta_parts.join(" · "))
         };
         let pad_x = 9.0;
         let sym_h = 13.0f32;
-        let sym_w = tab
+        let sym_w = active_tab
             .symbol
             .map(|s| symbol_display_width(s, sym_h) + if title_str.is_empty() { 0.0 } else { 5.0 })
             .unwrap_or(0.0);
-        let slot_w = m.measure(&slot_str, TextFace::Chrome) + 1.0;
         let title_w = if title_str.is_empty() {
             0.0
         } else {
             m.measure(&title_str, TextFace::Chrome) + 2.0
         };
-        let badge_w = if badge_str.is_empty() {
+        let meta_w = if meta_str.is_empty() {
             0.0
         } else {
-            m.measure(&badge_str, TextFace::Chrome) + 2.0
+            m.measure(&meta_str, TextFace::Chrome) + 2.0
         };
-        let tab_w = pad_x * 2.0 + slot_w + sym_w + title_w + badge_w;
-        if x + tab_w > tabs_end {
-            break;
-        }
-        if tab.active {
+        let pill_w = (pad_x * 2.0 + sym_w + title_w + meta_w).min((left_limit - x - 32.0).max(0.0));
+        if pill_w >= 44.0 {
+            let rect = HitRect::new(x, btn_y0, x + pill_w, btn_y1);
             scene.round_rect(
                 x,
                 btn_y0,
-                x + tab_w,
+                x + pill_w,
                 btn_y1,
                 6.0,
-                theme::rgb(0x1b, 0x1b, 0x1f),
+                theme::rgba(0x18, 0x18, 0x1c, 0.85),
                 1.0,
-                theme::rgb(0x2d, 0x2d, 0x33),
+                theme::rgba(0x28, 0x28, 0x2e, 0.85),
                 0,
             );
-        } else {
-            scene.round_rect(
-                x,
-                btn_y0,
-                x + tab_w,
-                btn_y1,
-                6.0,
-                theme::rgba(0x16, 0x16, 0x19, 0.55),
-                1.0,
-                theme::rgba(0x24, 0x24, 0x28, 0.6),
+            let mut tx = x + pad_x;
+            if let Some(sym) = active_tab.symbol {
+                let sw = draw_symbol_or_emoji(
+                    scene,
+                    tx,
+                    btn_y0 + ((btn_y1 - btn_y0) - sym_h) * 0.5,
+                    sym_h,
+                    sym,
+                    Some(theme::INK_1),
+                    1.0,
+                    0,
+                );
+                tx += sw + if title_str.is_empty() { 0.0 } else { 5.0 };
+            }
+            if !title_str.is_empty() {
+                scene.chrome_text(tx, mid_y, &title_str, theme::INK_1, true, 0);
+                tx += title_w;
+            }
+            if !meta_str.is_empty() && tx + meta_w <= x + pill_w - 4.0 {
+                scene.chrome_text(tx, mid_y, &meta_str, theme::INK_3, false, 0);
+            }
+            scene.push_hit(rect, HitAction::ToggleSidebar);
+            scene.push_hover_clipped(
+                rect,
                 0,
+                HoverKind::Tooltip {
+                    title: format!("Workspace {} · {}", active_tab.slot, active_tab.title),
+                    subtitle: Some("Click or Cmd+S to view tabs & fork hierarchy".to_owned()),
+                },
             );
+            x += pill_w + 6.0;
         }
-        let mut tx = x + pad_x;
-        let slot_col = if tab.active { theme::INK_3 } else { theme::INK_4 };
-        let title_col = if tab.active { theme::INK_1 } else { theme::INK_3 };
-        let badge_col = if tab.active { theme::INK_3 } else { theme::INK_4 };
-        scene.chrome_text(tx, mid_y, &slot_str, slot_col, false, 0);
-        tx += slot_w;
-        if let Some(sym) = tab.symbol {
-            let sw = draw_symbol_or_emoji(
-                scene,
-                tx,
-                btn_y0 + ((btn_y1 - btn_y0) - sym_h) * 0.5,
-                sym_h,
-                sym,
-                Some(title_col),
-                if tab.active { 1.0 } else { 0.72 },
-                0,
-            );
-            tx += sw + if title_str.is_empty() { 0.0 } else { 5.0 };
-        }
-        if !title_str.is_empty() {
-            scene.chrome_text(tx, mid_y, &title_str, title_col, tab.active, 0);
-            tx += title_w;
-        }
-        if !badge_str.is_empty() {
-            scene.chrome_text(tx, mid_y, &badge_str, badge_col, false, 0);
-        }
-        let rect = HitRect::new(x, btn_y0, x + tab_w, btn_y1);
-        scene.push_hit(rect, HitAction::SwitchTab(tab.id));
-        scene.push_hover_clipped(
-            rect,
-            0,
-            HoverKind::Tooltip {
-                title: format!("Workspace {}", tab.slot),
-                subtitle: Some(if tab.slot <= 9 {
-                    format!("Cmd+{} · {} pane(s)", tab.slot, tab.pane_count)
-                } else {
-                    format!("{} pane(s)", tab.pane_count)
-                }),
-            },
-        );
-        x += tab_w + 6.0;
     }
 
-    // Crisp `+` new workspace tab button (`Cmd+T`).
-    if x + plus_w <= tabs_limit {
+    // 3. Crisp `+` new workspace tab button (`Cmd+T`).
+    let plus_w = 24.0;
+    if x + plus_w <= left_limit {
         let rect = HitRect::new(x, btn_y0, x + plus_w, btn_y1);
         scene.round_rect(x, btn_y0, x + plus_w, btn_y1, 5.5, theme::BG_CHIP, 1.0, theme::LINE, 0);
         draw_icon(scene, Icon::Plus, x + (plus_w - 10.5) * 0.5, (TOP_BAR_H - 10.5) * 0.5, 10.5, theme::INK_3, 0);
@@ -814,35 +978,395 @@ pub fn layout_window_top_bar(
                 subtitle: Some("Cmd+T".to_owned()),
             },
         );
-        x += plus_w + 8.0;
     }
+}
 
-    // If the focused pane has >1 CoW session branch (`Cmd+B`), show compact fixed-chrome branch pills too.
-    if store.branches().len() > 1 {
-        let active_bid = store.active_branch_id();
-        for branch in store.branches() {
-            let is_active = branch.id == active_bid;
-            let name = branch.name.as_str();
-            let bw = 16.0 + icon_s + 4.0 + m.measure(name, TextFace::Chrome);
-            if x + bw > tabs_limit {
-                break;
-            }
-            if is_active {
-                scene.round_rect(x, btn_y0, x + bw, btn_y1, 5.5, theme::BG_CHIP, 1.0, theme::LINE_STRONG, 0);
-            }
-            draw_icon(scene, Icon::Branch, x + 6.0, icon_y, icon_s, if is_active { theme::INK_2 } else { theme::INK_4 }, 0);
-            scene.chrome_text(
-                x + 6.0 + icon_s + 4.0,
-                mid_y,
-                name,
-                if is_active { theme::INK_2 } else { theme::INK_4 },
-                is_active,
-                0,
+/// Render the collapsible left Workspace & Fork Hierarchy sidebar (`Cmd+S`), showing every
+/// workspace tab and its nested CoW session fork tree (`main` → `fork-1` → `fork-2`) with
+/// GPU vector tree rails, fork-origin commands, live process badges, and one-click switching.
+#[allow(clippy::too_many_arguments)]
+pub fn layout_workspace_sidebar(
+    scene: &mut Scene,
+    tabs: &[TabBarItem<'_>],
+    sidebar_w: f32,
+    vh: f32,
+    m: CellMetrics,
+    mouse_pos: Option<[f32; 2]>,
+) {
+    let y0 = TOP_BAR_H;
+    let y1 = vh.max(y0 + 80.0);
+    let clip_id = scene.push_clip(0.0, y0, sidebar_w, y1, 0.0);
+
+    // Subtle recessed sidebar surface with crisp 1px right divider.
+    scene.round_rect(0.0, y0, sidebar_w, y1, 0.0, theme::rgb(0x12, 0x12, 0x15), 0.0, [0.0; 4], clip_id);
+    scene.line(sidebar_w - 0.5, y0, sidebar_w - 0.5, y1, 1.0, theme::LINE, 0);
+
+    let is_hovered = |r: HitRect| -> bool {
+        mouse_pos.is_some_and(|[mx, my]| r.contains(mx, my))
+    };
+
+    let pad_x = 10.0;
+    let chrome_ch = m.line_h(TextFace::Chrome);
+    let small_ch = m.line_h(TextFace::UiSmall);
+
+    // Header row: `WORKSPACES` + `+` button (`Cmd+T`).
+    let hdr_h = 30.0;
+    let hdr_ty = y0 + (hdr_h - small_ch) * 0.5;
+    scene.ui_small(pad_x, hdr_ty, "WORKSPACES", theme::INK_4, true, false, clip_id);
+
+    let plus_s = 20.0;
+    let plus_x0 = sidebar_w - pad_x - plus_s;
+    let plus_y0 = y0 + (hdr_h - plus_s) * 0.5;
+    let plus_rect = HitRect::new(plus_x0, plus_y0, plus_x0 + plus_s, plus_y0 + plus_s);
+    scene.round_rect(
+        plus_rect.x0,
+        plus_rect.y0,
+        plus_rect.x1,
+        plus_rect.y1,
+        5.0,
+        if is_hovered(plus_rect) { theme::rgb(0x22, 0x22, 0x28) } else { theme::BG_CHIP },
+        1.0,
+        theme::LINE,
+        clip_id,
+    );
+    draw_icon(
+        scene,
+        Icon::Plus,
+        plus_x0 + (plus_s - 9.5) * 0.5,
+        plus_y0 + (plus_s - 9.5) * 0.5,
+        9.5,
+        theme::INK_2,
+        clip_id,
+    );
+    scene.push_hit_clipped(plus_rect, clip_id, HitAction::NewTab);
+    scene.push_hover_clipped(
+        plus_rect,
+        clip_id,
+        HoverKind::Tooltip {
+            title: "New workspace".to_owned(),
+            subtitle: Some("Cmd+T".to_owned()),
+        },
+    );
+
+    let footer_h = 26.0;
+    let list_bottom = (y1 - footer_h - 4.0).max(y0 + hdr_h + 24.0);
+    let mut cur_y = y0 + hdr_h + 2.0;
+
+    let tab_row_h = 28.0;
+    let branch_row_h = 23.0;
+    let can_close = tabs.len() > 1;
+
+    for tab in tabs {
+        if cur_y + tab_row_h > list_bottom {
+            break;
+        }
+        let row_rect = HitRect::new(6.0, cur_y, sidebar_w - 6.0, cur_y + tab_row_h);
+        let hovered = is_hovered(row_rect);
+        if tab.active {
+            scene.round_rect(
+                row_rect.x0,
+                row_rect.y0,
+                row_rect.x1,
+                row_rect.y1,
+                6.0,
+                theme::rgb(0x1b, 0x1b, 0x21),
+                1.0,
+                theme::rgb(0x2c, 0x2c, 0x34),
+                clip_id,
             );
-            scene.push_hit(HitRect::new(x, btn_y0, x + bw, btn_y1), HitAction::SwitchBranch(branch.id));
-            x += bw + 5.0;
+            // Subtle emerald active indicator bar on the left edge of the workspace pill.
+            scene.round_rect(
+                row_rect.x0 + 1.5,
+                row_rect.y0 + 5.0,
+                row_rect.x0 + 4.0,
+                row_rect.y1 - 5.0,
+                1.25,
+                theme::OK,
+                0.0,
+                [0.0; 4],
+                clip_id,
+            );
+        } else if hovered {
+            scene.round_rect(
+                row_rect.x0,
+                row_rect.y0,
+                row_rect.x1,
+                row_rect.y1,
+                6.0,
+                theme::rgba(0x1a, 0x1a, 0x20, 0.8),
+                0.0,
+                [0.0; 4],
+                clip_id,
+            );
+        }
+
+        let ty = cur_y + (tab_row_h - chrome_ch) * 0.5;
+        let mut rx = row_rect.x1 - 7.0;
+
+        // Hover close button `×` when >1 workspace tab exists.
+        let mut close_hit: Option<HitRect> = None;
+        if can_close && hovered {
+            let cs = 16.0;
+            let cx0 = rx - cs;
+            let cy0 = cur_y + (tab_row_h - cs) * 0.5;
+            let cr = HitRect::new(cx0, cy0, cx0 + cs, cy0 + cs);
+            if is_hovered(cr) {
+                scene.round_rect(cr.x0, cr.y0, cr.x1, cr.y1, 4.0, theme::rgba(0xff, 0x71, 0x68, 0.20), 0.0, [0.0; 4], clip_id);
+            }
+            draw_icon(
+                scene,
+                Icon::Close,
+                cx0 + (cs - 8.5) * 0.5,
+                cy0 + (cs - 8.5) * 0.5,
+                8.5,
+                if is_hovered(cr) { theme::DANGER } else { theme::INK_3 },
+                clip_id,
+            );
+            close_hit = Some(cr);
+            rx = cx0 - 4.0;
+        } else if let Some(proc_tag) = tab.process_tag {
+            let tag = truncate_chars(proc_tag, 10);
+            let tw = m.measure(&tag, TextFace::UiSmall);
+            let dot_w = 8.0;
+            rx -= tw;
+            scene.ui_small(rx, cur_y + (tab_row_h - small_ch) * 0.5, &tag, theme::rgb(0x7c, 0xd4, 0xa8), false, false, clip_id);
+            scene.over_circle(rx - 4.5, cur_y + tab_row_h * 0.5, 2.3, theme::OK, clip_id);
+            rx -= dot_w + 4.0;
+        } else if tab.pane_count > 1 {
+            let tag = format!("{}p", tab.pane_count);
+            let tw = m.measure(&tag, TextFace::UiSmall);
+            rx -= tw;
+            scene.ui_small(rx, cur_y + (tab_row_h - small_ch) * 0.5, &tag, theme::INK_4, false, false, clip_id);
+            rx -= 5.0;
+        }
+
+        let mut tx = row_rect.x0 + 9.0;
+        let slot_str = format!("{}", tab.slot);
+        let slot_w = m.measure(&slot_str, TextFace::UiSmall);
+        scene.ui_small(
+            tx,
+            cur_y + (tab_row_h - small_ch) * 0.5,
+            &slot_str,
+            if tab.active { theme::INK_3 } else { theme::INK_4 },
+            false,
+            false,
+            clip_id,
+        );
+        tx += slot_w.max(9.0) + 6.0;
+
+        let sym_h = 13.0f32;
+        if let Some(sym) = tab.symbol {
+            let sw = draw_symbol_or_emoji(
+                scene,
+                tx,
+                cur_y + (tab_row_h - sym_h) * 0.5,
+                sym_h,
+                sym,
+                Some(if tab.active { theme::INK_1 } else { theme::INK_2 }),
+                if tab.active { 1.0 } else { 0.78 },
+                clip_id,
+            );
+            tx += sw + 5.0;
+        } else {
+            scene.svg_icon_alpha(
+                tx,
+                cur_y + (tab_row_h - sym_h) * 0.5,
+                sym_h,
+                "folder_macos",
+                if tab.active { 1.0 } else { 0.72 },
+                clip_id,
+            );
+            tx += sym_h + 5.0;
+        }
+
+        let avail_w = (rx - tx - 2.0).max(20.0);
+        let max_ch = (avail_w / m.measure("n", TextFace::Chrome).max(5.5)).floor().max(4.0) as usize;
+        let shown = truncate_chars(tab.title, max_ch);
+        scene.chrome_text(
+            tx,
+            ty,
+            &shown,
+            if tab.active { theme::INK_1 } else { theme::INK_2 },
+            tab.active,
+            clip_id,
+        );
+
+        // Push tab hit first, then close hit on top (hit_test resolves last-pushed first!).
+        scene.push_hit_clipped(row_rect, clip_id, HitAction::SwitchTab(tab.id));
+        if let Some(cr) = close_hit {
+            scene.push_hit_clipped(cr, clip_id, HitAction::CloseTab(tab.id));
+        }
+        cur_y += tab_row_h + 2.0;
+
+        // Render the workspace's CoW fork hierarchy tree when it has forks (or for the active tab
+        // so the fork tree & quick-fork affordance are immediately discoverable!).
+        let show_tree = tab.branches.len() > 1 || (tab.active && !tab.branches.is_empty());
+        if show_tree {
+            let indent_step = 13.0f32;
+            let tree_base_x = 18.0f32;
+            for node in &tab.branches {
+                if cur_y + branch_row_h > list_bottom {
+                    break;
+                }
+                let b_rect = HitRect::new(10.0, cur_y, sidebar_w - 6.0, cur_y + branch_row_h);
+                let b_hov = is_hovered(b_rect);
+                let is_active_node = tab.active && node.active;
+                if is_active_node {
+                    scene.round_rect(
+                        b_rect.x0,
+                        b_rect.y0,
+                        b_rect.x1,
+                        b_rect.y1,
+                        5.0,
+                        theme::rgba(0x4c, 0xc2, 0x7a, 0.09),
+                        0.0,
+                        [0.0; 4],
+                        clip_id,
+                    );
+                } else if b_hov {
+                    scene.round_rect(
+                        b_rect.x0,
+                        b_rect.y0,
+                        b_rect.x1,
+                        b_rect.y1,
+                        5.0,
+                        theme::rgba(0x20, 0x20, 0x26, 0.85),
+                        0.0,
+                        [0.0; 4],
+                        clip_id,
+                    );
+                }
+
+                let cy = cur_y + branch_row_h * 0.5;
+                let b_ty = cur_y + (branch_row_h - small_ch) * 0.5;
+                let rail_col = theme::LINE_STRONG;
+
+                // Continuous vertical ancestor continuation rails.
+                for anc_d in 0..node.depth.saturating_sub(1).min(8) {
+                    if (node.ancestor_cont_mask & (1u32 << anc_d)) != 0 {
+                        let ax = tree_base_x + anc_d as f32 * indent_step + 4.0;
+                        scene.line(ax, cur_y, ax, cur_y + branch_row_h, 1.15, rail_col, clip_id);
+                    }
+                }
+                // L / T vector connector from parent rail into this fork node.
+                if node.depth > 0 {
+                    let parent_x = tree_base_x + (node.depth - 1).min(8) as f32 * indent_step + 4.0;
+                    let target_x = tree_base_x + node.depth.min(8) as f32 * indent_step;
+                    let y_end = if node.is_last { cy } else { cur_y + branch_row_h };
+                    scene.line(parent_x, cur_y, parent_x, y_end, 1.15, rail_col, clip_id);
+                    scene.line(parent_x, cy, target_x - 2.0, cy, 1.15, rail_col, clip_id);
+                }
+
+                let nx = tree_base_x + node.depth.min(8) as f32 * indent_step;
+                if node.depth == 0 {
+                    // Root branch dot (`main`).
+                    scene.over_circle(
+                        nx + 4.0,
+                        cy,
+                        if is_active_node { 3.1 } else { 2.4 },
+                        if is_active_node { theme::OK } else { theme::INK_4 },
+                        clip_id,
+                    );
+                } else {
+                    // Fork branch glyph (`Icon::Branch`).
+                    let bs = 10.5;
+                    draw_icon(
+                        scene,
+                        Icon::Branch,
+                        nx,
+                        cy - bs * 0.5,
+                        bs,
+                        if is_active_node { theme::OK } else { theme::rgb(0x74, 0xb9, 0xff) },
+                        clip_id,
+                    );
+                }
+
+                // Right-aligned block count (or subtle hover `fork` button on active single-branch root).
+                let mut br_rx = b_rect.x1 - 7.0;
+                let mut fork_hit: Option<HitRect> = None;
+                if is_active_node && b_hov {
+                    let fl = "+fork";
+                    let fw = m.measure(fl, TextFace::UiSmall) + 8.0;
+                    let fr = HitRect::new(br_rx - fw, cur_y + 3.0, br_rx, cur_y + branch_row_h - 3.0);
+                    scene.round_rect(
+                        fr.x0,
+                        fr.y0,
+                        fr.x1,
+                        fr.y1,
+                        3.5,
+                        theme::rgba(0x4c, 0xc2, 0x7a, 0.16),
+                        0.0,
+                        [0.0; 4],
+                        clip_id,
+                    );
+                    scene.ui_small(fr.x0 + 4.0, b_ty, fl, theme::OK, true, false, clip_id);
+                    fork_hit = Some(fr);
+                    br_rx = fr.x0 - 4.0;
+                } else if node.block_count > 0 {
+                    let cnt = format!("{}", node.block_count);
+                    let cw = m.measure(&cnt, TextFace::UiSmall);
+                    br_rx -= cw;
+                    scene.ui_small(br_rx, b_ty, &cnt, theme::INK_4, false, false, clip_id);
+                    br_rx -= 5.0;
+                }
+
+                let name_x = nx + 13.0;
+                let avail_name_w = (br_rx - name_x).max(16.0);
+                let name_col = if is_active_node {
+                    theme::INK_1
+                } else if node.active {
+                    theme::INK_2
+                } else {
+                    theme::INK_3
+                };
+                let max_name_c = (avail_name_w / m.measure("n", TextFace::UiSmall).max(5.0))
+                    .floor()
+                    .max(4.0) as usize;
+                let shown_name = truncate_chars(&node.name, max_name_c);
+                scene.ui_small(name_x, b_ty, &shown_name, name_col, is_active_node, false, clip_id);
+
+                // Subtle fork-origin command hint right after the fork name when space permits.
+                if let Some(cmd) = &node.fork_cmd {
+                    let nw = m.measure(&shown_name, TextFace::UiSmall);
+                    let cmd_x = name_x + nw + 5.0;
+                    let rem_w = br_rx - cmd_x;
+                    if rem_w >= 28.0 {
+                        let rem_c = (rem_w / m.measure("n", TextFace::UiSmall).max(5.0)).floor() as usize;
+                        if rem_c >= 4 {
+                            let hint = truncate_chars(cmd, rem_c);
+                            scene.ui_small(cmd_x, b_ty, &hint, theme::INK_4, false, true, clip_id);
+                        }
+                    }
+                }
+
+                scene.push_hit_clipped(
+                    b_rect,
+                    clip_id,
+                    HitAction::SwitchTabBranch { tab: tab.id, branch: node.id },
+                );
+                if let Some(fr) = fork_hit {
+                    scene.push_hit_clipped(fr, clip_id, HitAction::ForkActiveBranch);
+                }
+                cur_y += branch_row_h;
+            }
+            cur_y += 4.0;
+        } else {
+            cur_y += 2.0;
         }
     }
+
+    // Compact footer bar with keyboard shortcut hints.
+    let fy0 = y1 - footer_h;
+    scene.line(0.0, fy0, sidebar_w - 1.0, fy0, 1.0, theme::LINE_FAINT, clip_id);
+    scene.ui_small(
+        pad_x,
+        fy0 + (footer_h - small_ch) * 0.5,
+        "⌘T new   ⌘B fork   ⌘S hide",
+        theme::INK_4,
+        false,
+        false,
+        clip_id,
+    );
 }
 
 /// Draw crisp 1px hairline split dividers between tiled panes (highlighted while actively dragged).
@@ -1031,7 +1555,7 @@ fn layout_starship_line(
         && !badge.is_empty()
     {
         cx += 6.0;
-        let bw = m.measure(badge, TextFace::UiSmall) + 10.0;
+        let bw = m.measure(badge, TextFace::MonoSmall) + 10.0;
         let bh = m.ch - 2.0;
         let by = ty + 1.0;
         let bc = prompt.project_color.unwrap_or(theme::SERIES_BLUE);
@@ -1046,7 +1570,7 @@ fn layout_starship_line(
             [bc[0], bc[1], bc[2], 0.42],
             clip_id,
         );
-        scene.ui_small(cx + 5.0, ty + 1.0, badge, bc, true, false, clip_id);
+        scene.mono_small(cx + 5.0, ty + 1.0, badge, bc, true, false, clip_id);
         cx += bw;
     }
     if !prompt.cwd.is_empty() {
@@ -1068,19 +1592,77 @@ fn layout_starship_line(
         draw_icon(scene, Icon::Branch, cx, ty + (m.ch - branch_s) * 0.5, branch_s, branch_icon_col, clip_id);
         cx += branch_s + 5.0;
 
-        let branch_lbl = if prompt.git_detached {
-            format!("@{branch}")
+        if prompt.git_detached {
+            let branch_lbl = format!("@{branch}");
+            scene.text(cx, ty, &branch_lbl, branch_col, false, false, clip_id);
+            cx += branch_lbl.chars().count() as f32 * m.cw;
         } else {
-            branch.clone()
-        };
-        scene.text(cx, ty, &branch_lbl, branch_col, false, false, clip_id);
-        cx += branch_lbl.chars().count() as f32 * m.cw;
+            cx += draw_styled_branch_name(scene, cx, ty, branch, is_live, false, m, clip_id);
+        }
 
         if let Some(st) = &prompt.git_status {
             if let Some(state_lbl) = &st.state_label {
                 cx += 6.0;
                 scene.text(cx, ty, state_lbl, theme::FIRE, true, false, clip_id);
                 cx += state_lbl.chars().count() as f32 * m.cw;
+            }
+            // Compact inline divergence indicator + mini visual bar vs `main` / `origin/main`
+            // right on the branch segment (hovering opens the full visual commit graph popover!).
+            if is_live
+                && let Some(rel) = &st.branch_relation
+                && (rel.ahead > 0 || rel.behind > 0)
+            {
+                cx += 7.0;
+                let a_col = theme::rgb(0x57, 0xc7, 0x85);
+                let b_col = if rel.behind >= 10 {
+                    theme::rgb(0xf0, 0x71, 0x78)
+                } else {
+                    theme::rgb(0xe8, 0xa8, 0x48)
+                };
+                if rel.ahead > 0 {
+                    let s = format!("↑{}", rel.ahead);
+                    scene.text(cx, ty, &s, a_col, false, false, clip_id);
+                    cx += s.chars().count() as f32 * m.cw;
+                    if rel.behind > 0 {
+                        cx += 4.0;
+                    }
+                }
+                if rel.behind > 0 {
+                    let s = format!("↓{}", rel.behind);
+                    scene.text(cx, ty, &s, b_col, rel.behind >= 10, false, clip_id);
+                    cx += s.chars().count() as f32 * m.cw;
+                }
+                // Proportional mini ahead/behind bar (`20px × 3.5px`) so divergence reads at a glance.
+                cx += 5.0;
+                let bar_w = 20.0f32;
+                let bar_h = 3.5f32;
+                let bar_y0 = ty + (m.ch - bar_h) * 0.5;
+                scene.round_rect(
+                    cx,
+                    bar_y0,
+                    cx + bar_w,
+                    bar_y0 + bar_h,
+                    1.75,
+                    theme::BG_TRACK,
+                    0.0,
+                    [0.0; 4],
+                    clip_id,
+                );
+                let total_d = (rel.ahead + rel.behind) as f32;
+                let fill_scale = ((total_d + 1.0).ln() / 20.0f32.ln()).clamp(0.28, 1.0);
+                let fill_w = (bar_w * fill_scale).max(4.0);
+                if rel.ahead > 0 && rel.behind > 0 {
+                    let gap = 1.0;
+                    let avail = (fill_w - gap).max(3.0);
+                    let aw = ((rel.ahead as f32 / total_d) * avail).clamp(2.0, avail - 2.0);
+                    scene.round_rect(cx, bar_y0, cx + aw, bar_y0 + bar_h, 1.5, a_col, 0.0, [0.0; 4], clip_id);
+                    scene.round_rect(cx + aw + gap, bar_y0, cx + fill_w, bar_y0 + bar_h, 1.5, b_col, 0.0, [0.0; 4], clip_id);
+                } else if rel.ahead > 0 {
+                    scene.round_rect(cx, bar_y0, cx + fill_w, bar_y0 + bar_h, 1.5, a_col, 0.0, [0.0; 4], clip_id);
+                } else {
+                    scene.round_rect(cx, bar_y0, cx + fill_w, bar_y0 + bar_h, 1.5, b_col, 0.0, [0.0; 4], clip_id);
+                }
+                cx += bar_w;
             }
         }
         let branch_rect = HitRect::new(seg2_x0, y, cx + 4.0, y + cap_h);
@@ -1090,10 +1672,14 @@ fn layout_starship_line(
             .map(|s| s.branches.clone())
             .filter(|b| !b.is_empty())
             .unwrap_or_else(|| vec![branch.clone()]);
+        let relation = prompt
+            .git_status
+            .as_ref()
+            .and_then(|s| s.branch_relation.clone());
         scene.push_hover_clipped(
             branch_rect,
             clip_id,
-            HoverKind::GitBranch { current: branch.clone(), branches },
+            HoverKind::GitBranch { current: branch.clone(), branches, relation },
         );
         scene.push_hit_clipped(branch_rect, clip_id, HitAction::OpenBranchPicker);
 
@@ -1160,14 +1746,19 @@ fn layout_starship_line(
                 );
             }
 
-            // Segment 4: Ahead/behind & stash count (hover over `≡ 3` inspects actual git stashes!).
-            if st.ahead > 0 || st.behind > 0 || st.stashed > 0 {
+            // Segment 4: Upstream ahead/behind (only when distinct from Segment 2's base relation) & stash count.
+            let show_upstream_ab = (st.ahead > 0 || st.behind > 0)
+                && !st
+                    .branch_relation
+                    .as_ref()
+                    .is_some_and(|r| is_live && r.ahead == st.ahead && r.behind == st.behind);
+            if show_upstream_ab || st.stashed > 0 {
                 cx += sep_pad;
                 draw_divider(scene, cx);
                 cx += sep_pad;
 
                 let mut need_gap = false;
-                if st.ahead > 0 || st.behind > 0 {
+                if show_upstream_ab {
                     let ab_x0 = cx - 4.0;
                     if st.ahead > 0 {
                         let s = format!("↑{}", st.ahead);
@@ -1219,7 +1810,7 @@ fn layout_starship_line(
     }
 
     // Segment 5: Detected project toolchain SVG icons (hover explains detected markers!).
-    if !prompt.project_icons.is_empty() {
+    if !prompt.hide_toolchains && !prompt.project_icons.is_empty() {
         cx += sep_pad;
         draw_divider(scene, cx);
         cx += sep_pad;
@@ -1241,8 +1832,8 @@ fn layout_starship_line(
         }
     }
 
-    // Segment 6: Live Folder Processes & Hot Indicator (cwd + subfolders + grandchildren/descendants).
-    // Hover lists every process with CPU/GPU/MEM & subfolder; click jumps to its pane/TUI or inspects in `top`!
+    // Segment 6: Live Folder Processes & Hot Indicator — compact bundle of distinct process icons + count
+    // (mirrors Segment 3 uncommitted file icons; hover reveals full CPU/MEM/ancestry/Kill details!).
     if is_live && !prompt.folder_procs.items.is_empty() {
         let fp = &prompt.folder_procs;
         let count = fp.items.len();
@@ -1250,26 +1841,6 @@ fn layout_starship_line(
         draw_divider(scene, cx);
         cx += sep_pad;
         let seg6_x0 = cx - 4.0;
-        let primary = truncate_chars(
-            if fp.primary_name.is_empty() { "proc" } else { fp.primary_name.as_str() },
-            14,
-        );
-        let label = if fp.is_hot {
-            let hot_pct = fp.total_cpu_pct.max(fp.total_gpu_pct).round() as u32;
-            if count > 1 {
-                format!("{hot_pct}% · {primary} +{}", count - 1)
-            } else {
-                format!("{hot_pct}% · {primary}")
-            }
-        } else if count > 1 {
-            format!("{primary} +{}", count - 1)
-        } else if let Some(first) = fp.items.first()
-            && first.uptime_secs > 0
-        {
-            format!("{primary} · {}", crate::sysmon_view::format_uptime(first.uptime_secs))
-        } else {
-            primary
-        };
         let pill_fg = if fp.is_hot {
             theme::rgb(0xff, 0xa8, 0x5c)
         } else {
@@ -1280,19 +1851,34 @@ fn layout_starship_line(
         } else {
             theme::OK
         };
-        let primary_icon = fp.items.first().and_then(|first| {
-            first
-                .app_icon_path
-                .as_deref()
-                .or(first.origin_app_icon_path.as_deref())
-        });
-        if fp.is_hot {
-            let icon_extra = if primary_icon.is_some() { 16.0 } else { 0.0 };
-            let approx_w = 12.0 + icon_extra + m.measure(&label, TextFace::UiSmall) + 8.0;
+
+        // Collect up to 4 distinct process icons in priority order (macOS app icons + SVG runtime badges).
+        let mut distinct_icons: Vec<ProcBadgeIcon<'_>> = Vec::with_capacity(4);
+        for item in &fp.items {
+            let ic = proc_badge_icon(item);
+            if !distinct_icons.contains(&ic) {
+                distinct_icons.push(ic);
+                if distinct_icons.len() >= 4 {
+                    break;
+                }
+            }
+        }
+        let proc_s = file_s;
+        let cnt_lbl = if fp.is_hot {
+            let hot_pct = fp.total_cpu_pct.max(fp.total_gpu_pct).round() as u32;
+            format!("{hot_pct}% · {count}")
+        } else {
+            format!("{count}")
+        };
+        let cnt_w = cnt_lbl.chars().count() as f32 * m.cw;
+
+        // Reserve pill background first, then patch its exact right edge after laying out icons, bar & count!
+        let hot_pill_idx = if fp.is_hot {
+            let idx = scene.rects.len();
             scene.round_rect(
                 seg6_x0 + 1.0,
                 y + 2.5,
-                (cx + approx_w).min(x0 + max_w - pad_x),
+                cx + 40.0,
                 y + cap_h - 2.5,
                 (cap_h - 5.0) * 0.5,
                 theme::rgba(0xe8, 0x6a, 0x35, 0.16),
@@ -1300,27 +1886,52 @@ fn layout_starship_line(
                 theme::rgba(0xff, 0x8a, 0x4c, 0.48),
                 clip_id,
             );
-        }
-        if fp.is_hot {
+            cx += 3.0;
             scene.text(cx, ty, "🔥", pill_fg, true, false, clip_id);
             cx += m.cw + 5.0;
+            Some(idx)
         } else {
             scene.over_circle(cx + 3.0, ty + m.ch * 0.5, 2.7, dot_col, clip_id);
             cx += 9.5;
+            None
+        };
+
+        let p_iy = ty + (m.ch - proc_s) * 0.5;
+        for ic in &distinct_icons {
+            match *ic {
+                ProcBadgeIcon::Image(path) => {
+                    scene.image(cx, p_iy, proc_s, proc_s, path.to_owned(), clip_id);
+                }
+                ProcBadgeIcon::Svg(name) => {
+                    scene.svg_icon_alpha(cx, p_iy, proc_s, name, icon_alpha, clip_id);
+                }
+            }
+            cx += proc_s + 3.0;
         }
-        if let Some(icon_path) = primary_icon {
-            scene.image(
-                cx,
-                y + (cap_h - 13.0) * 0.5,
-                13.0,
-                13.0,
-                icon_path.to_owned(),
-                clip_id,
-            );
-            cx += 16.0;
+        // Compact inline CPU heat bar (`24px × 4px`) when active/hot so load reads visually at a glance!
+        let peak_pct = fp.total_cpu_pct.max(fp.total_gpu_pct);
+        if fp.is_hot || peak_pct >= 2.0 {
+            let bar_w = 24.0f32;
+            let bar_h = 4.0f32;
+            let bar_y0 = ty + (m.ch - bar_h) * 0.5;
+            let frac = (peak_pct / 100.0).clamp(0.08, 1.0);
+            let bar_col = if peak_pct >= 60.0 {
+                theme::rgb(0xff, 0x6b, 0x4a)
+            } else if peak_pct >= 20.0 {
+                theme::rgb(0xe8, 0xa8, 0x48)
+            } else {
+                theme::OK
+            };
+            scene.round_rect(cx, bar_y0, cx + bar_w, bar_y0 + bar_h, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
+            scene.round_rect(cx, bar_y0, cx + (bar_w * frac).max(3.0), bar_y0 + bar_h, 2.0, bar_col, 0.0, [0.0; 4], clip_id);
+            cx += bar_w + 5.0;
         }
-        scene.ui_small(cx, ty, &label, pill_fg, fp.is_hot, false, clip_id);
-        cx += m.measure(&label, TextFace::UiSmall) + 2.0;
+        scene.text(cx, ty, &cnt_lbl, pill_fg, fp.is_hot, false, clip_id);
+        cx += cnt_w + 2.0;
+        if let Some(idx) = hot_pill_idx {
+            cx += 3.0;
+            scene.rects[idx].rect[2] = cx.min(x0 + max_w - pad_x + 4.0);
+        }
         scene.push_hover_clipped(
             HitRect::new(seg6_x0, y, cx + 4.0, y + cap_h),
             clip_id,
@@ -1552,6 +2163,8 @@ fn layout_block(
         &spans,
         None,
         None,
+        None,
+        false,
         cmd_x,
         cur_y,
         cmd_max_x,
@@ -1649,7 +2262,9 @@ fn layout_highlighted_source(
     source: &str,
     spans: &[HighlightSpan],
     abbrevs: Option<&std::collections::BTreeMap<String, String>>,
+    cwd: Option<&str>,
     live_cursor: Option<usize>,
+    has_live_completions: bool,
     x0: f32,
     y0: f32,
     x1: f32,
@@ -1672,11 +2287,18 @@ fn layout_highlighted_source(
                 crate::editor::CommandHighlightKind::Builtin => theme::CMD_BUILTIN,
                 crate::editor::CommandHighlightKind::Abbrev => theme::CMD_ABBREV,
                 crate::editor::CommandHighlightKind::External => theme::CMD_EXTERNAL,
+                crate::editor::CommandHighlightKind::DataFile => {
+                    theme::highlight_color(blaze_sh::lex::HighlightKind::String)
+                }
                 crate::editor::CommandHighlightKind::Unknown => {
-                    // While actively typing a valid command prefix at the cursor, stay neutral
-                    // instead of flashing red mid-word (e.g. `cla` -> `claude`).
+                    // While actively typing a token at the cursor that has live completions
+                    // or matches a known command/data-file prefix, keep it clean neutral ink
+                    // instead of screaming red mid-word (e.g. `Car` -> `Cargo.lock` / `cargo`).
                     let editing_here = live_cursor.is_some_and(|c| c >= s && c <= e);
-                    if editing_here && crate::editor::is_known_command_prefix(tok, abbrevs) {
+                    if editing_here
+                        && (has_live_completions
+                            || crate::editor::is_known_command_prefix(tok, cwd, abbrevs))
+                    {
                         theme::INK_1
                     } else {
                         theme::CMD_UNKNOWN
@@ -1835,6 +2457,9 @@ fn layout_value(
                 layout_table(scene, block, t, x0, y0, width, m, clip_id, depth, now_ns)
             }
         }
+        Value::Record(r) if depth == 0 && crate::schema_view::is_schema_record(r) => {
+            crate::schema_view::layout_schema_card(scene, r, x0, y0, width, m, clip_id)
+        }
         Value::Record(r) => layout_record(scene, block, r, x0, y0, width, m, clip_id, depth, now_ns),
         Value::List(items) => layout_list(scene, block, items, x0, y0, width, m, clip_id, depth, now_ns),
         Value::Error(err) => {
@@ -1885,7 +2510,9 @@ fn layout_value(
                 .max(m.ch)
             })
         }
-        Value::Output(out) => layout_command_output(scene, out, x0, y0, width, m, clip_id),
+        Value::Output(out) => {
+            layout_command_output(scene, block.id.0, &block.source, out, x0, y0, width, m, clip_id)
+        }
         scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
     }
 }
@@ -2269,7 +2896,7 @@ fn layout_file_grid(
                 let mut end_x = cx + drawn_icon_w + icon_gap + txt_w;
                 if let Some((tag, tag_col)) = badge {
                     let bx = end_x + (m.cw * 0.45).max(3.5);
-                    scene.ui_small(bx, ty + 1.0, tag, tag_col, true, false, clip_id);
+                    scene.mono_small(bx, ty + 1.0, tag, tag_col, true, false, clip_id);
                     end_x = bx + m.cw;
                 } else if tracked_dot {
                     let dx = end_x + (m.cw * 0.55).max(4.5);
@@ -2822,8 +3449,8 @@ fn layout_table(
 
     let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
 
-    // Clickable sortable column headers in crisp Apple SF Pro (`UiSmall`) + hairline underneath.
-    scene.ui_small(x0, y0, "#", theme::INK_4, false, false, clip_id);
+    // Clickable sortable column headers in crisp compact monospace (`MonoSmall`) + hairline underneath.
+    scene.mono_small(x0, y0, "#", theme::INK_4, false, false, clip_id);
     let mut cx = x0 + idx_w;
     for c in 0..ncols {
         if !col_visible[c] {
@@ -2847,20 +3474,20 @@ fn layout_table(
             let ls = m.icon_sm();
             draw_icon(scene, Icon::Lock, cx + 2.0, y0 + (m.ch - ls) * 0.5, ls, hdr_col, clip_id);
             if !suffix.is_empty() {
-                scene.ui_small(cx + ls + 4.0, y0, suffix.trim(), hdr_col, true, false, clip_id);
+                scene.mono_small(cx + ls + 4.0, y0, suffix.trim(), hdr_col, true, false, clip_id);
             }
         } else {
-            let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+            let avg_cw = m.measure("n", TextFace::MonoSmall).max(4.5);
             let max_ch = (content_w / avg_cw).floor().max(2.0) as usize;
             let hdr_base = truncate_chars(col_raw, max_ch.saturating_sub(suffix.chars().count()).max(1));
             let hdr = format!("{hdr_base}{suffix}");
-            let hdr_w = m.measure(&hdr, TextFace::UiSmall);
+            let hdr_w = m.measure(&hdr, TextFace::MonoSmall);
             let tx = if col_right_align[c] {
                 cx + content_w - hdr_w
             } else {
                 cx
             };
-            scene.ui_small(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
+            scene.mono_small(tx, y0, hdr, hdr_col, active_sort.is_some(), false, clip_id);
         }
         if depth <= 1 {
             let resize_x = cx + cw - col_gap * 0.5;
@@ -2899,7 +3526,7 @@ fn layout_table(
     }
 
     if show_ls_commit_col {
-        scene.ui_small(cx, y0, "commit", theme::INK_3, false, false, clip_id);
+        scene.mono_small(cx, y0, "commit", theme::INK_3, false, false, clip_id);
         let resize_x = cx + ls_commit_col_w - col_gap * 0.5;
         scene.line(resize_x, y0 + 2.0, resize_x, y0 + m.ch - 1.0, 1.0, theme::LINE_FAINT, clip_id);
         scene.push_hit_clipped(
@@ -2928,7 +3555,7 @@ fn layout_table(
         } else {
             format!("+{n_hid} cols")
         };
-        let pw = m.measure(&pill_lbl, TextFace::UiSmall) + 12.0;
+        let pw = m.measure(&pill_lbl, TextFace::MonoSmall) + 12.0;
         let px0 = (x1 - pw).max(cx - 8.0);
         let py0 = y0 - 1.0;
         let py1 = y0 + m.ch + 1.0;
@@ -2943,7 +3570,7 @@ fn layout_table(
             theme::LINE_FAINT,
             clip_id,
         );
-        scene.ui_small(
+        scene.mono_small(
             px0 + 6.0,
             y0,
             pill_lbl,
@@ -3345,7 +3972,7 @@ fn layout_table(
                                 );
                                 if let Some((tag, tag_col)) = badge {
                                     let gx = (bx0 + chip_w + 6.0).min(rx + content_w - m.cw);
-                                    scene.ui_small(gx, ty + 1.0, tag, tag_col, true, false, clip_id);
+                                    scene.mono_small(gx, ty + 1.0, tag, tag_col, true, false, clip_id);
                                 } else if tracked_dot {
                                     let gx = rx + drawn_icon_pad + txt_w + (m.cw * 0.55).max(4.5);
                                     scene.over_circle(
@@ -3425,6 +4052,7 @@ fn layout_table(
                                     &author,
                                     email,
                                     av.image_path.as_deref(),
+                                    m,
                                     clip_id,
                                 );
                                 let max_ch = ((content_w - av_pad) / m.cw).floor().max(2.0) as usize;
@@ -3557,7 +4185,7 @@ fn layout_table(
                                         let max_ch = ((content_w - 14.0) / m.cw).floor().max(2.0) as usize;
                                         let txt = truncate_chars(&raw, max_ch);
                                         let col = if is_ok { theme::INK_2 } else { theme::INK_3 };
-                                        scene.ui_small(rx + 13.0, ty, txt, col, false, false, clip_id);
+                                        scene.mono_small(rx + 13.0, ty, txt, col, false, false, clip_id);
                                     }
                                 }
                             }
@@ -3783,6 +4411,7 @@ fn layout_table(
                         &cm.author_name,
                         &cm.author_email,
                         av.image_path.as_deref(),
+                        m,
                         clip_id,
                     );
                     let sha_x = rx + av_pad;
@@ -4188,9 +4817,42 @@ fn draw_shaded_filename(
 /// `stdout` and `stderr` streams, full ANSI SGR color rendering (16 / 256 / 24-bit TrueColor,
 /// bold/dim/italic, backgrounds), subtle coral gutter rail on `stderr` lines, exact per-line
 /// arrival timestamp hover tooltips, and explicit `exit N · out · err` metadata pills.
+fn with_cached_help_doc<R>(
+    block_id: u64,
+    cmd_source: &str,
+    stdout_len: usize,
+    stderr_len: usize,
+    lines: &[&str],
+    f: impl FnOnce(Option<&crate::help_view::HelpDoc<'static>>) -> R,
+) -> R {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static CACHE: RefCell<HashMap<(u64, usize, usize), Option<crate::help_view::HelpDoc<'static>>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    let key = (block_id, stdout_len, stderr_len);
+    CACHE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if !map.contains_key(&key) {
+            if map.len() > 48 {
+                map.clear();
+            }
+            let parsed =
+                crate::help_view::parse_help_doc_in(cmd_source, lines, blaze_own::Alloc::global());
+            map.insert(key, parsed);
+        }
+        f(map.get(&key).and_then(Option::as_ref))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn layout_command_output(
     scene: &mut Scene,
+    block_id: u64,
+    cmd_source: &str,
     out: &blaze_sh::CommandOutput<'_>,
     x0: f32,
     y0: f32,
@@ -4204,8 +4866,8 @@ fn layout_command_output(
     let out_b = crate::dust_driver::format_bytes_compact(stdout_len as u64);
     let err_b = crate::dust_driver::format_bytes_compact(stderr_len as u64);
 
-    // Always surface explicit `exit N`, `out`, and `err` metadata for every external command!
-    let exit_lbl = format!("exit {}", out.exit_code);
+    // Surface compact stream metadata (`err 552 B`, `out 1.2 KiB · err 552 B`) without repeating
+    // the `exit N` badge that already appears in the block header above.
     let streams_lbl = if stderr_len > 0 && stdout_len > 0 {
         format!("out {out_b} · err {err_b}")
     } else if stderr_len > 0 {
@@ -4213,15 +4875,15 @@ fn layout_command_output(
     } else if stdout_len > 0 {
         format!("out {out_b}")
     } else {
-        "empty".to_owned()
+        format!("exit {}", out.exit_code)
     };
-    let pill_lbl = format!("{exit_lbl} · {streams_lbl}");
-    let pill_w = m.measure(&pill_lbl, TextFace::UiSmall) + 18.0;
+    let pill_lbl = streams_lbl;
+    let pill_w = m.measure(&pill_lbl, TextFace::MonoSmall) + 16.0;
     let bx0 = (x0 + width - pill_w).max(x0 + 80.0);
     let (pill_bg, pill_border, pill_fg) = if out.exit_code != 0 {
         (
             theme::rgba(0xe0, 0x6c, 0x75, 0.14),
-            theme::rgba(0xe0, 0x6c, 0x75, 0.65),
+            theme::rgba(0xe0, 0x6c, 0x75, 0.55),
             theme::DANGER,
         )
     } else if stderr_len > 0 {
@@ -4237,26 +4899,30 @@ fn layout_command_output(
             theme::rgb(0x7c, 0xd4, 0xa8),
         )
     };
-    scene.round_rect(
-        bx0,
-        y0 - 1.0,
-        x0 + width,
-        y0 + m.ch + 1.0,
-        (m.ch + 2.0) * 0.5,
-        pill_bg,
-        1.0,
-        pill_border,
-        clip_id,
-    );
-    scene.ui_small(bx0 + 9.0, y0, &pill_lbl, pill_fg, out.exit_code != 0, false, clip_id);
-    scene.push_hover_clipped(
-        HitRect::new(bx0, y0 - 2.0, x0 + width, y0 + m.ch + 2.0),
-        clip_id,
-        HoverKind::Tooltip {
-            title: format!("exit {} · {dur_s} · {out_b} stdout · {err_b} stderr", out.exit_code),
-            subtitle: Some("fields: .stdout · .stderr · .exit_code · .duration · .events".to_owned()),
-        },
-    );
+    let draw_meta_pill = |scene: &mut Scene, pill_y: f32, inset_right: f32| {
+        let px1 = x0 + width - inset_right;
+        let px0 = (px1 - pill_w).max(x0 + 80.0);
+        scene.round_rect(
+            px0,
+            pill_y,
+            px1,
+            pill_y + m.ch - 1.0,
+            (m.ch - 1.0) * 0.5,
+            pill_bg,
+            1.0,
+            pill_border,
+            clip_id,
+        );
+        scene.mono_small(px0 + 8.0, pill_y, &pill_lbl, pill_fg, out.exit_code != 0, false, clip_id);
+        scene.push_hover_clipped(
+            HitRect::new(px0, pill_y - 2.0, px1, pill_y + m.ch + 1.0),
+            clip_id,
+            HoverKind::Tooltip {
+                title: format!("exit {} · {dur_s} · {out_b} stdout · {err_b} stderr", out.exit_code),
+                subtitle: Some("fields: .stdout · .stderr · .exit_code · .duration · .events".to_owned()),
+            },
+        );
+    };
 
     // Flatten time-ordered chunks into display lines tagged with `(arrival_ns, stream)`,
     // preserving ANSI SGR codes so external CLIs (`rg`, `cargo`, `git`, `gh`, `bun`, `pytest`)
@@ -4291,6 +4957,7 @@ fn layout_command_output(
     }
 
     if lines.is_empty() {
+        draw_meta_pill(scene, y0, 0.0);
         let empty_msg = if out.exit_code != 0 {
             format!("(exited with code {}, no stdout/stderr)", out.exit_code)
         } else {
@@ -4299,6 +4966,54 @@ fn layout_command_output(
         scene.text(x0, y0, &empty_msg, theme::INK_4, false, true, clip_id);
         return m.ch;
     }
+
+    // Structured interactive CLI Help / Man-Page rendering (`git --help`, `rg --help`,
+    // `blaze --help`, `man ...`, etc.) with syntax-highlighted Usage, runnable Examples,
+    // categorized subcommand/flag tables, inline Markdown chips, and one-click drill-down.
+    if lines.len() <= 500 {
+        let all_refs: Vec<&str> = lines.iter().map(|(_, _, s)| s.as_str()).collect();
+        let help_h = with_cached_help_doc(
+            block_id,
+            cmd_source,
+            stdout_len,
+            stderr_len,
+            &all_refs,
+            |doc| {
+                doc.map(|d| {
+                    let h = crate::help_view::layout_help_doc(
+                        scene,
+                        d,
+                        x0,
+                        y0,
+                        width,
+                        pill_w + 18.0,
+                        m,
+                        clip_id,
+                    );
+                    draw_meta_pill(scene, y0 + 7.5, 14.0);
+                    h
+                })
+            },
+        );
+        if let Some(h) = help_h {
+            return h;
+        }
+    }
+
+    let first_is_diag_card = lines.first().is_some_and(|(_, s, l)| {
+        if l.contains('\x1b') {
+            return false;
+        }
+        if *s == blaze_sh::OutputStream::Stderr {
+            return true;
+        }
+        let first_stdout_group: Vec<(i64, &str)> = lines
+            .iter()
+            .take_while(|(_, st, ln)| *st == blaze_sh::OutputStream::Stdout && !ln.contains('\x1b'))
+            .map(|(at, _, ln)| (*at, ln.as_str()))
+            .collect();
+        crate::diag_view::looks_like_diagnostic_output(&first_stdout_group, out.exit_code)
+    });
 
     let text_w_first = (bx0 - x0 - 12.0).max(m.cw * 16.0);
     let full_cols = ((width - 10.0) / m.cw).floor().max(16.0) as usize;
@@ -4310,8 +5025,50 @@ fn layout_command_output(
     let mut stdout_style = AnsiStyle::default();
     let mut stderr_style = AnsiStyle::default();
 
-    for (at_ns, stream, raw_line) in lines.iter().take(max_display_lines) {
+    let display_lines = &lines[..lines.len().min(max_display_lines)];
+    let mut li = 0usize;
+    while li < display_lines.len() {
+        let (at_ns, stream, raw_line) = &display_lines[li];
         let is_err = *stream == blaze_sh::OutputStream::Stderr;
+
+        // Contiguous uncolored `stderr` lines — and diagnostic `stdout` groups (such as
+        // `blaze check`, `rustc`, `clippy` emitting `note:`, `warning[...]`, `error[...]`,
+        // `fix:`, `--> loc`) — render as crisp monospace diagnostic cards with clickable
+        // inline Markdown `` `code` `` chips and clean word-boundary wrapping!
+        if !raw_line.contains('\x1b') {
+            let group_start = li;
+            let mut end = li;
+            let mut group: Vec<(i64, &str)> = Vec::new();
+            while end < display_lines.len()
+                && display_lines[end].1 == *stream
+                && !display_lines[end].2.contains('\x1b')
+            {
+                group.push((display_lines[end].0, display_lines[end].2.as_str()));
+                end += 1;
+            }
+            if is_err || crate::diag_view::looks_like_diagnostic_output(&group, out.exit_code) {
+                li = end;
+                let right_reserve = if row_idx == 0 { pill_w + 14.0 } else { 0.0 };
+                let card_y0 = cur_y;
+                let h = crate::diag_view::layout_stderr_diagnostic_group(
+                    scene,
+                    &group,
+                    out.exit_code,
+                    x0,
+                    cur_y,
+                    width,
+                    right_reserve,
+                    m,
+                    clip_id,
+                );
+                cur_y += h + 4.0;
+                row_idx += li - group_start;
+                let at_lbl = format_duration_ns((*at_ns).max(0) as u64);
+                let _ = (card_y0, at_lbl);
+                continue;
+            }
+        }
+
         let default_fg = if is_err {
             theme::rgb(0xec, 0x9b, 0x82)
         } else {
@@ -4334,26 +5091,45 @@ fn layout_command_output(
                     fg[3] *= 0.65;
                 }
                 let bg = sp.style.bg;
-                let mut chars = sp.text.chars().peekable();
-                while chars.peek().is_some() {
+                let mut rest = sp.text.as_str();
+                while !rest.is_empty() {
                     if col >= max_cols {
                         cur_y += step_y;
                         row_idx += 1;
                         col = 0;
                         max_cols = full_cols;
-                    }
-                    let take = max_cols - col;
-                    let mut seg = String::new();
-                    let mut taken = 0usize;
-                    while taken < take {
-                        if let Some(ch) = chars.next() {
-                            seg.push(ch);
-                            taken += 1;
-                        } else {
+                        rest = rest.trim_start_matches(' ');
+                        if rest.is_empty() {
                             break;
                         }
                     }
-                    if !seg.is_empty() {
+                    let take = max_cols - col;
+                    let total_chars = rest.chars().count();
+                    let (chunk, next_rest) = if total_chars <= take {
+                        (rest, "")
+                    } else {
+                        // Prefer breaking at the last space within `take` so words never split mid-word!
+                        let mut cut_b = rest.len();
+                        let mut last_space_b = None;
+                        for (ci, (bi, ch)) in rest.char_indices().enumerate() {
+                            if ci >= take {
+                                cut_b = bi;
+                                break;
+                            }
+                            if ch == ' ' {
+                                last_space_b = Some(bi);
+                            }
+                        }
+                        if let Some(sb) = last_space_b
+                            && sb > 0
+                        {
+                            (&rest[..sb], rest[sb + 1..].trim_start_matches(' '))
+                        } else {
+                            (&rest[..cut_b], &rest[cut_b..])
+                        }
+                    };
+                    let taken = chunk.chars().count();
+                    if taken > 0 {
                         let rx = line_x + col as f32 * m.cw;
                         let rw = taken as f32 * m.cw;
                         if let Some(bg_col) = bg {
@@ -4369,8 +5145,15 @@ fn layout_command_output(
                                 clip_id,
                             );
                         }
-                        scene.text(rx, cur_y, &seg, fg, sp.style.bold, sp.style.italic, clip_id);
+                        scene.text(rx, cur_y, chunk, fg, sp.style.bold, sp.style.italic, clip_id);
                         col += taken;
+                    }
+                    rest = next_rest;
+                    if !rest.is_empty() {
+                        cur_y += step_y;
+                        row_idx += 1;
+                        col = 0;
+                        max_cols = full_cols;
                     }
                 }
             }
@@ -4399,6 +5182,7 @@ fn layout_command_output(
                 subtitle: None,
             },
         );
+        li += 1;
     }
     if lines.len() > max_display_lines {
         scene.text(
@@ -4411,6 +5195,13 @@ fn layout_command_output(
             clip_id,
         );
         cur_y += step_y;
+    }
+
+    // Paint stream metadata pill AFTER cards so it sits crisply on top of the first card's header!
+    if first_is_diag_card {
+        draw_meta_pill(scene, y0 + 7.5, 10.0);
+    } else {
+        draw_meta_pill(scene, y0, 0.0);
     }
 
     (cur_y - y0).max(m.ch)
@@ -4609,6 +5400,7 @@ fn draw_git_avatar(
     author_name: &str,
     author_email: &str,
     image_path: Option<&str>,
+    m: CellMetrics,
     clip_id: u32,
 ) {
     let cx = x + size * 0.5;
@@ -4625,13 +5417,14 @@ fn draw_git_avatar(
         scene.over_circle(cx, cy, r, bg, clip_id);
         scene.over_ring(cx, cy, r, 0.85, theme::rgba(cr, cg, cb, 0.45), clip_id);
         let (init_bytes, len) = blaze_git_meta::author_initials(author_name);
-        // Fit cleanly inside the 15-16px circle: 1 centered bold letter looks crisp & balanced.
+        // Fit cleanly inside the circular badge: measure exact `UiSmall` bold advance horizontally
+        // and compensate for `UiSmall`'s mono-baseline vertical nudge (`baseline - cap_h/2 ≈ 0.565 * ch`).
         if len >= 1
             && let Ok(init_str) = core::str::from_utf8(&init_bytes[..1])
         {
-            let tw = 6.2;
+            let tw = m.measure_styled(init_str, TextFace::UiSmall, true);
             let tx = cx - tw * 0.5;
-            let ty = cy - 6.8;
+            let ty = cy - m.ch * 0.565;
             scene.ui_small(tx, ty, init_str, fg, true, false, clip_id);
         }
     }
@@ -4916,24 +5709,37 @@ fn layout_list(
         scene.text(x0, y0, "[]", theme::INK_4, false, false, clip_id);
         return m.ch;
     }
-    let show = if depth == 0 && block.folded && items.len() > TABLE_FOLD_ROWS {
+    let total_items = items.len();
+    let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
+    let is_scrollable = depth <= 1 && block.folded && total_items > TABLE_FOLD_ROWS;
+    let visible_items = if is_scrollable {
         TABLE_FOLD_ROWS
     } else {
-        items.len()
+        total_items
     };
-    let idx_w = (items.len().to_string().len().max(2) as f32 * m.cw + 16.0).max(32.0);
-    let val_x = x0 + idx_w;
-    let max_val_cols = ((width - idx_w) / m.cw).floor().max(12.0) as usize;
+    let max_first_item = total_items.saturating_sub(visible_items);
+    let max_scroll_y = max_first_item as f32 * row_h;
+    let first_item = if is_scrollable {
+        ((block.table_scroll_y.clamp(0.0, max_scroll_y) / row_h).round() as usize)
+            .min(max_first_item)
+    } else {
+        0
+    };
 
-    let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
+    let sb_reserve = if is_scrollable && max_first_item > 0 { 14.0 } else { 0.0 };
+    let content_w = (width - sb_reserve).max(80.0);
+    let idx_w = (total_items.to_string().len().max(2) as f32 * m.cw + 16.0).max(32.0);
+    let val_x = x0 + idx_w;
+    let max_val_cols = ((content_w - idx_w) / m.cw).floor().max(12.0) as usize;
+
     let mut cur_y = y0;
-    for i in 0..show {
+    for i in first_item..(first_item + visible_items) {
         scene.text(x0, cur_y + TABLE_ROW_PAD_Y, i.to_string(), theme::INK_4, false, false, clip_id);
         if let Some(val) = items.get(i) {
             let raw = format_value_cell_at(val, Some(now_ns));
             let txt = truncate_chars(&raw, max_val_cols);
             scene.text(val_x, cur_y + TABLE_ROW_PAD_Y, &txt, theme::value_color(val), false, false, clip_id);
-            let cell_rect = HitRect::new(val_x, cur_y, x0 + width, cur_y + row_h);
+            let cell_rect = HitRect::new(val_x, cur_y, x0 + content_w, cur_y + row_h);
             if !push_exact_value_hover(scene, cell_rect, val, now_ns, clip_id) && txt != raw {
                 scene.push_hover_clipped(
                     cell_rect,
@@ -4947,12 +5753,56 @@ fn layout_list(
         }
         cur_y += row_h;
     }
-    if depth == 0 && items.len() > TABLE_FOLD_ROWS {
+
+    // Crisp macOS-style minimal scrollbar track + thumb when scrolling a folded list in place.
+    if is_scrollable && max_first_item > 0 {
+        let track_h = (cur_y - y0).max(24.0);
+        let sb_x0 = x0 + content_w + 5.0;
+        let sb_w = 3.5;
+        scene.round_rect(
+            sb_x0,
+            y0,
+            sb_x0 + sb_w,
+            y0 + track_h,
+            1.75,
+            theme::BG_TRACK,
+            0.0,
+            [0.0; 4],
+            clip_id,
+        );
+        let frac = (visible_items as f32 / total_items as f32).clamp(0.12, 1.0);
+        let thumb_h = (track_h * frac).max(18.0);
+        let pos_frac = first_item as f32 / max_first_item as f32;
+        let thumb_y0 = y0 + (track_h - thumb_h) * pos_frac;
+        scene.over_round_rect(
+            sb_x0,
+            thumb_y0,
+            sb_x0 + sb_w,
+            thumb_y0 + thumb_h,
+            1.75,
+            theme::INK_4,
+            clip_id,
+        );
+        scene.push_scroll_region(
+            HitRect::new(x0, y0, x0 + width, cur_y),
+            clip_id,
+            block.id,
+            max_scroll_y,
+            0.0,
+        );
+    }
+
+    if depth <= 1 && total_items > TABLE_FOLD_ROWS {
         cur_y += 4.0;
         let lbl = if block.folded {
-            format!("+ {} more items", items.len() - TABLE_FOLD_ROWS)
+            format!(
+                "items {}–{} of {} · scroll or show all",
+                first_item + 1,
+                first_item + visible_items,
+                total_items
+            )
         } else {
-            format!("− collapse to {TABLE_FOLD_ROWS} items")
+            format!("− collapse to {TABLE_FOLD_ROWS}-item scrollable view")
         };
         let pw = lbl.chars().count() as f32 * m.cw + 8.0;
         scene.text(val_x, cur_y, lbl, theme::INK_3, false, false, clip_id);
@@ -5098,16 +5948,36 @@ fn layout_error_panel(
     draw_icon(scene, Icon::Error, px, cur_y + (m.ch - icon_s) * 0.5, icon_s, theme::DANGER, clip_id);
     let kind_x = px + icon_s + 7.0;
     let kind_lbl = err.kind.as_str();
-    scene.text(kind_x, cur_y, kind_lbl, theme::DANGER, true, false, clip_id);
+    let kind_bw = m.measure(kind_lbl, TextFace::MonoSmall) + 12.0;
+    let kind_bh = m.ch - 1.0;
+    scene.round_rect(
+        kind_x,
+        cur_y + 0.5,
+        kind_x + kind_bw,
+        cur_y + 0.5 + kind_bh,
+        kind_bh * 0.5,
+        theme::rgba(0xe0, 0x6c, 0x75, 0.18),
+        1.0,
+        theme::rgba(0xe0, 0x6c, 0x75, 0.45),
+        clip_id,
+    );
+    scene.mono_small(kind_x + 6.0, cur_y + 0.5, kind_lbl, theme::DANGER, true, false, clip_id);
 
-    let msg_x = kind_x + (kind_lbl.len() as f32 + 2.0) * m.cw;
-    let msg_cols = ((x1 - 12.0 - msg_x) / m.cw).floor().max(14.0) as usize;
-    let msg_lines = wrap_lines(err.message.as_str(), msg_cols);
-    for (i, line) in msg_lines.iter().enumerate() {
-        let tx = if i == 0 { msg_x } else { px };
-        scene.text(tx, cur_y, line, theme::INK_1, false, false, clip_id);
-        cur_y += m.ch + 3.0;
-    }
+    let inner_w = (x1 - 12.0 - px).max(100.0);
+    let msg_indent = (kind_x - px) + kind_bw + 8.0;
+    let msg_h = crate::diag_view::layout_inline_markdown(
+        scene,
+        err.message.as_str(),
+        px,
+        cur_y,
+        inner_w,
+        msg_indent,
+        0.0,
+        theme::INK_1,
+        m,
+        clip_id,
+    );
+    cur_y += msg_h + 4.0;
 
     if !source.is_empty() {
         cur_y += 3.0;
@@ -5132,14 +6002,33 @@ fn layout_error_panel(
     }
 
     if let Some(help) = &err.help {
-        let help_lbl = "help  ";
-        scene.text(px, cur_y, help_lbl, theme::INK_3, false, false, clip_id);
-        let hx = px + help_lbl.len() as f32 * m.cw;
-        let h_cols = ((x1 - 12.0 - hx) / m.cw).floor().max(16.0) as usize;
-        for (i, line) in wrap_lines(help.as_str(), h_cols).iter().enumerate() {
-            scene.text(if i == 0 { hx } else { px }, cur_y, line, theme::INK_2, false, false, clip_id);
-            cur_y += m.ch + 2.0;
-        }
+        let help_bw = m.measure("help", TextFace::MonoSmall) + 10.0;
+        let help_bh = m.ch - 2.0;
+        scene.round_rect(
+            px,
+            cur_y + 1.0,
+            px + help_bw,
+            cur_y + 1.0 + help_bh,
+            help_bh * 0.5,
+            theme::rgba(0x4c, 0xc3, 0x8a, 0.16),
+            1.0,
+            theme::rgba(0x4c, 0xc3, 0x8a, 0.36),
+            clip_id,
+        );
+        scene.mono_small(px + 5.0, cur_y + 1.0, "help", theme::OK, true, false, clip_id);
+        let help_h = crate::diag_view::layout_inline_markdown(
+            scene,
+            help.as_str(),
+            px,
+            cur_y,
+            inner_w,
+            help_bw + 8.0,
+            0.0,
+            theme::INK_2,
+            m,
+            clip_id,
+        );
+        cur_y += help_h + 3.0;
     }
 
     cur_y += 6.0;
@@ -5950,7 +6839,9 @@ fn layout_inline_prompt(
             &editor.text,
             &spans,
             Some(&editor.abbreviations),
+            Some(prompt.cwd.as_str()),
             Some(editor.cursor),
+            !editor.completions.is_empty(),
             text_x,
             input_y,
             x1,
@@ -6154,6 +7045,183 @@ fn layout_ghostty_cursor_trail(
     }
 }
 
+/// Non-modal, zero-Tab live inline hint strip rendered directly beneath the active prompt line
+/// as the user types:
+/// - `LiveHint::Signature`: 1-line IDE signature (`MonoSmall`) + calm description (SF Pro `UiSmall`)
+///   + clickable flag chips + quiet `Tab` cue.
+/// - `LiveHint::Candidates`: 1–5 row calm preview card of matching subcommands/flags + descriptions
+///   (clickable, never hijacking `Enter`, `↑`/`↓`, or `→` Fish ghost text).
+#[allow(clippy::too_many_arguments)]
+fn layout_live_hint_strip(
+    scene: &mut Scene,
+    hint: &LiveHint,
+    editor: &Editor,
+    x0: f32,
+    prompt_y0: f32,
+    prompt_y1: f32,
+    vh: f32,
+    x1: f32,
+    m: CellMetrics,
+    mouse_pos: Option<[f32; 2]>,
+) {
+    let max_avail_w = (x1 - x0).max(160.0);
+    let glass_bg = theme::rgba(0x16, 0x16, 0x1a, 0.94);
+
+    match hint {
+        LiveHint::Signature { anchor_byte: _, signature, about, flags } => {
+            let card_h = m.ch + 10.0;
+            let pad_x = 10.0;
+            let sig_w = m.measure(signature, TextFace::MonoSmall);
+            let tab_lbl = "Tab";
+            let tab_w = m.measure(tab_lbl, TextFace::MonoSmall) + 10.0;
+            let sep_w = m.measure(" · ", TextFace::UiSmall);
+            let about_full_w = if about.is_empty() { 0.0 } else { m.measure(about, TextFace::UiSmall) };
+
+            // Measure compact clickable flag chips so the bar hugs its content cleanly.
+            let mut chips_total_w = 0.0f32;
+            let mut chip_specs: Vec<(&str, &str, f32)> = Vec::with_capacity(flags.len().min(4));
+            for (flag, short_doc) in flags.iter().take(4) {
+                let fw = m.measure(flag, TextFace::MonoSmall);
+                let dw = if short_doc.is_empty() {
+                    0.0
+                } else {
+                    4.0 + m.measure(short_doc, TextFace::UiSmall)
+                };
+                let w = fw + dw + 10.0;
+                chip_specs.push((flag.as_str(), short_doc.as_str(), w));
+                chips_total_w += w + 5.0;
+            }
+            if !chip_specs.is_empty() {
+                chips_total_w += 6.0;
+            }
+
+            let desired_w = (pad_x * 2.0
+                + sig_w
+                + if about.is_empty() { 0.0 } else { sep_w + about_full_w }
+                + chips_total_w
+                + 8.0
+                + tab_w)
+                .clamp(220.0, max_avail_w);
+            let px0 = scene.composer_text_origin[0].clamp(x0, (x1 - desired_w).max(x0));
+            let px1 = (px0 + desired_w).min(x1);
+            let below_y0 = prompt_y1 + 5.0;
+            let py0 = if below_y0 + card_h <= vh - 10.0 {
+                below_y0.max(TOP_BAR_H + 8.0)
+            } else {
+                (prompt_y0 - 6.0 - card_h).max(TOP_BAR_H + 8.0)
+            };
+            let py1 = py0 + card_h;
+
+            scene.overlay_shadow(px0, py0 + 3.0, px1, py1 + 3.0, 6.0, 12.0, theme::SHADOW_SOFT, 0);
+            scene.overlay_round_rect(px0, py0, px1, py1, 6.0, glass_bg, 1.0, theme::LINE, 0);
+
+            let ty = py0 + (card_h - m.ch) * 0.5;
+            let mut cx = px0 + pad_x;
+
+            // Right-reserved `Tab` badge (only when there's comfortable room).
+            let show_tab = px1 - px0 >= 280.0;
+            let right_limit = if show_tab { px1 - pad_x - tab_w - 6.0 } else { px1 - pad_x };
+
+            // 1. Monospace usage signature.
+            let max_sig_chars = (((right_limit - cx).max(40.0)) / (m.cw * 0.84)).floor() as usize;
+            let sig_txt = truncate_chars(signature, max_sig_chars.max(8));
+            let sig_draw_w = m.measure(&sig_txt, TextFace::MonoSmall);
+            scene.overlay_mono_small(cx, ty, sig_txt, theme::INK_1, true, false, 0);
+            cx += sig_draw_w;
+
+            // 2. Calm SF Pro 1-line description (reserve room for at least 1 flag chip if present).
+            let min_chip_reserve = chip_specs.first().map(|c| c.2 + 12.0).unwrap_or(0.0);
+            if !about.is_empty() && cx + sep_w + 48.0 < right_limit - min_chip_reserve {
+                scene.overlay_ui_small(cx, ty, " · ", theme::INK_4, false, false, 0);
+                cx += sep_w;
+                let about_budget = (right_limit - min_chip_reserve - cx).max(40.0);
+                let max_about_chars = (about_budget / (m.cw * 0.62)).floor() as usize;
+                let about_txt = truncate_chars(about, max_about_chars.max(10));
+                let about_draw_w = m.measure(&about_txt, TextFace::UiSmall);
+                scene.overlay_ui_small(cx, ty, about_txt, theme::INK_2, false, false, 0);
+                cx += about_draw_w;
+            }
+
+            // 3. Clickable compact flag chips (`MonoSmall` flag + optional short `UiSmall` gloss).
+            if !chip_specs.is_empty() {
+                cx += 10.0;
+                let chip_y0 = py0 + 3.0;
+                let chip_y1 = py1 - 3.0;
+                for (flag, short_doc, full_chip_w) in chip_specs {
+                    let flag_only_w = m.measure(flag, TextFace::MonoSmall) + 10.0;
+                    let (chip_w, show_short) = if cx + full_chip_w <= right_limit {
+                        (full_chip_w, !short_doc.is_empty())
+                    } else if cx + flag_only_w <= right_limit {
+                        (flag_only_w, false)
+                    } else {
+                        break;
+                    };
+                    let rect = HitRect::new(cx, chip_y0, cx + chip_w, chip_y1);
+                    let hovered = mouse_pos.is_some_and(|p| rect.contains(p[0], p[1]));
+                    scene.overlay_round_rect(
+                        rect.x0,
+                        rect.y0,
+                        rect.x1,
+                        rect.y1,
+                        4.0,
+                        if hovered { theme::COMPLETION_SEL_BG } else { theme::BG_CHIP },
+                        1.0,
+                        if hovered { theme::LINE_STRONG } else { theme::LINE },
+                        0,
+                    );
+                    let fx = cx + 5.0;
+                    scene.overlay_mono_small(
+                        fx,
+                        ty,
+                        flag,
+                        if hovered { theme::INK_1 } else { theme::CMD_BUILTIN },
+                        false,
+                        false,
+                        0,
+                    );
+                    if show_short {
+                        let fw = m.measure(flag, TextFace::MonoSmall);
+                        scene.overlay_ui_small(
+                            fx + fw + 4.0,
+                            ty,
+                            short_doc,
+                            theme::INK_3,
+                            false,
+                            false,
+                            0,
+                        );
+                    }
+                    scene.push_hit(
+                        rect,
+                        HitAction::InsertLiveHint {
+                            replace_start: editor.cursor,
+                            insert: flag.to_owned(),
+                        },
+                    );
+                    cx += chip_w + 5.0;
+                }
+            }
+
+            // 4. Quiet right-aligned `Tab` hint pill.
+            if show_tab {
+                let tx0 = px1 - pad_x - tab_w;
+                scene.overlay_round_rect(
+                    tx0,
+                    py0 + 4.0,
+                    px1 - pad_x,
+                    py1 - 4.0,
+                    3.5,
+                    theme::rgba(0xff, 0xff, 0xff, 0.04),
+                    1.0,
+                    theme::LINE,
+                    0,
+                );
+                scene.overlay_mono_small(tx0 + 5.0, ty, tab_lbl, theme::INK_4, false, false, 0);
+            }
+        }
+    }
+}
+
 /// IntelliJ-style live autocomplete popup anchored directly below the inline prompt
 /// (or flipped above it automatically when the prompt is near the bottom of the viewport).
 #[allow(clippy::too_many_arguments)]
@@ -6166,6 +7234,7 @@ fn layout_completion_popup(
     vh: f32,
     x1: f32,
     m: CellMetrics,
+    now_ns: i64,
 ) {
     let total = editor.completions.len();
     if total == 0 {
@@ -6179,11 +7248,146 @@ fn layout_completion_popup(
     let row_h = m.ch + 8.0;
     let doc_h = m.ch + 12.0;
     let popup_h = show as f32 * row_h + doc_h + 10.0;
-    let popup_w = (x1 - x0).min(560.0);
 
-    // Anchor horizontally near the active cursor token (clamped inside `[x0, x1 - popup_w]`).
-    let (_, ccol) = editor.cursor_line_col();
-    let desired_x = scene.composer_text_origin[0] + (ccol as f32 * m.cw) - 36.0;
+    // Precompute live filesystem recency (`mtime_ns` + recursive `blaze-dust` `max_mtime_ns`),
+    // progressive byte sizes, and unified right-hand column widths so every row's recency age,
+    // size bar, and size label snap to crisp vertical columns!
+    struct RowFsVisual {
+        bytes: Option<u64>,
+        bytes_done: bool,
+        detail_txt: String,
+        age_txt: Option<String>,
+        heat: Option<([f32; 4], f32)>,
+    }
+    let format_compact_age = |age_secs: u64| -> String {
+        if age_secs < 60 {
+            format!("{}s", age_secs.max(1))
+        } else if age_secs < 3_600 {
+            format!("{}m", age_secs / 60)
+        } else if age_secs < 86_400 {
+            format!("{}h", age_secs / 3_600)
+        } else if age_secs < 86_400 * 30 {
+            format!("{}d", age_secs / 86_400)
+        } else if age_secs < 86_400 * 365 {
+            format!("{}mo", age_secs / (86_400 * 30))
+        } else {
+            format!("{}y", age_secs / (86_400 * 365))
+        }
+    };
+    let mut row_vis: Vec<RowFsVisual> = Vec::with_capacity(show);
+    let mut max_bytes: u64 = 0;
+    let mut any_size_bar = false;
+    let mut any_age = false;
+    let mut max_detail_w = 0.0f32;
+    for offset in 0..show {
+        let item = &editor.completions[win_start + offset];
+        let mut bytes = item.fs_meta.as_ref().and_then(|f| f.size_bytes);
+        let mut bytes_done = true;
+        let mut bytes_capped = false;
+        let mut mtime_ns = item.fs_meta.as_ref().and_then(|f| f.mtime_ns);
+        if item.kind == CompletionKind::Dir
+            && let Some(fs) = item.fs_meta.as_ref()
+            && let Some(prog) = crate::dust_driver::request_dir_size(std::path::Path::new(&fs.path))
+        {
+            if prog.bytes > 0 {
+                bytes = Some(prog.bytes);
+                bytes_done = prog.done;
+                bytes_capped = prog.capped;
+            }
+            if prog.max_mtime_ns > 0 {
+                mtime_ns = Some(mtime_ns.unwrap_or(0).max(prog.max_mtime_ns));
+            }
+        }
+        if let Some(b) = bytes
+            && b > 0
+        {
+            max_bytes = max_bytes.max(b);
+            any_size_bar = true;
+        }
+        let detail_raw = if item.kind == CompletionKind::Dir
+            && let Some(b) = bytes
+            && b > 0
+        {
+            let compact = crate::dust_driver::format_bytes_compact(b);
+            let sz_s = if !bytes_done {
+                format!("~{compact}")
+            } else if bytes_capped {
+                format!("{compact}+")
+            } else {
+                compact
+            };
+            if matches!(item.detail.as_str(), "dir" | "git dir" | "recent") {
+                sz_s
+            } else {
+                format!("{sz_s} · {}", item.detail)
+            }
+        } else {
+            item.detail.clone()
+        };
+        let detail_txt = truncate_chars(&detail_raw, 28);
+        max_detail_w = max_detail_w.max(m.measure(&detail_txt, TextFace::UiSmall));
+
+        let (age_txt, heat) = if let Some(mt) = mtime_ns
+            && mt > 0
+            && now_ns > 0
+        {
+            let age_secs = now_ns.saturating_sub(mt).max(0) as u64 / 1_000_000_000;
+            let hcol = theme::recency_heat_color(age_secs);
+            let blend = if age_secs < 600 {
+                0.42
+            } else if age_secs < 7_200 {
+                0.28
+            } else if age_secs < 86_400 {
+                0.15
+            } else {
+                0.0
+            };
+            any_age = true;
+            (Some(format_compact_age(age_secs)), Some((hcol, blend)))
+        } else {
+            (None, None)
+        };
+
+        row_vis.push(RowFsVisual { bytes, bytes_done, detail_txt, age_txt, heat });
+    }
+    const COMP_SIZE_BAR_W: f32 = 44.0;
+    const COMP_AGE_COL_W: f32 = 28.0;
+    let inline_doc_mode = !any_size_bar && !any_age;
+    let detail_col_w = if any_size_bar {
+        max_detail_w.clamp(58.0, 96.0)
+    } else if inline_doc_mode {
+        0.0
+    } else {
+        max_detail_w.min(180.0)
+    };
+    let icon_s = m.icon_md();
+    let max_inline_label_w = if inline_doc_mode {
+        (0..show)
+            .map(|offset| editor.completions[win_start + offset].label.chars().count() as f32 * m.cw)
+            .fold(0.0f32, f32::max)
+            .clamp(76.0, 210.0)
+    } else {
+        0.0
+    };
+    let popup_w = if inline_doc_mode {
+        let max_doc_w = (0..show)
+            .map(|offset| m.measure(&editor.completions[win_start + offset].doc, TextFace::UiSmall))
+            .fold(0.0f32, f32::max)
+            .min(340.0);
+        (13.0 + icon_s + 9.0 + max_inline_label_w + 18.0 + max_doc_w + 18.0 + sb_pad)
+            .clamp(340.0, (x1 - x0).min(640.0))
+    } else {
+        (x1 - x0).min(if any_size_bar { 640.0 } else { 560.0 })
+    };
+
+    // Anchor horizontally to the start of the active token being completed (rock-steady while typing).
+    let tok_start = editor.completion_replace_start.min(editor.text.len());
+    let anchor_col = editor.text[..tok_start]
+        .rsplit('\n')
+        .next()
+        .map(|line| line.chars().count())
+        .unwrap_or(0);
+    let desired_x = scene.composer_text_origin[0] + (anchor_col as f32 * m.cw) - (13.0 + icon_s + 9.0);
     let px0 = desired_x.clamp(x0, (x1 - popup_w).max(x0));
     let px1 = px0 + popup_w;
 
@@ -6209,7 +7413,6 @@ fn layout_completion_popup(
         0,
     );
 
-    let icon_s = m.icon_md();
     let list_y0 = py0 + 5.0;
     let mut ry = list_y0;
     for offset in 0..show {
@@ -6353,33 +7556,161 @@ fn layout_completion_popup(
                 ),
             };
             scene.overlay_round_rect(ix, iy, ix + icon_s, iy + icon_s, radius, fill_col, 1.0, border_col, 0);
-            let gx = ix + (icon_s - m.cw) * 0.5;
-            scene.overlay_text_run(gx, ty, glyph, fg_col, true, false, 0);
+            // Optically center the badge glyph inside `[ix..ix+icon_s, iy..iy+icon_s]` using
+            // `UiSmall` bold (sized to breathe cleanly inside the `icon_s` badge) and exact
+            // compensation for `UiSmall`'s mono-baseline `y_nudge_px`.
+            let cx = ix + icon_s * 0.5;
+            let cy = iy + icon_s * 0.5;
+            let gw = m.measure_styled(glyph, TextFace::UiSmall, true);
+            let gx = cx - gw * 0.5;
+            let baseline_offset = match glyph {
+                "s" | "v" => 0.625,
+                "-" | "·" => 0.645,
+                _ => 0.565,
+            };
+            let gy = cy - m.ch * baseline_offset;
+            scene.overlay_ui_small(gx, gy, glyph, fg_col, true, false, 0);
         }
 
-        // Right-aligned type / expansion / value-hint detail in crisp SF Pro (`UiSmall`).
-        let detail_txt = truncate_chars(&item.detail, 34);
-        let detail_w = m.measure(&detail_txt, TextFace::UiSmall);
-        let detail_x = px1 - 12.0 - sb_pad - detail_w;
-        scene.overlay_ui_small(
-            detail_x,
-            ty,
-            &detail_txt,
-            if is_sel { theme::INK_2 } else { theme::INK_4 },
-            false,
-            false,
-            0,
-        );
-
-        // Label with IntelliJ-style vivid blue matched-character highlighting (`#589DF6`).
+        // Fixed right-hand tabular columns (all baseline-aligned cleanly with the primary label):
+        // - In filesystem mode (`any_size_bar || any_age`): `[label] [age] [==== size bar] [size/detail]`
+        // - In unified subcommand/flag mode (`inline_doc_mode`): `[label] [inline 1-line description]`
+        // Note: `UiSmall` already carries `y_nudge_px = mono_baseline - ui_small_baseline` in
+        // `Fonts::rasterize_runs`, so passing `ty` aligns its baseline pixel-for-pixel with `Mono`!
+        let vis = &row_vis[offset];
+        let ty_small = ty;
+        let right_edge = px1 - 14.0 - sb_pad;
         let label_x = ix + icon_s + 9.0;
-        let max_label_ch = ((detail_x - 14.0 - label_x) / m.cw).floor().max(6.0) as usize;
+        let mut col_left;
+        if inline_doc_mode {
+            let doc_x = label_x + max_inline_label_w + 14.0;
+            let show_detail_tag = !vis.detail_txt.is_empty()
+                && !matches!(
+                    vis.detail_txt.as_str(),
+                    "git" | "bgit" | "blaze" | "flag" | "builtin" | "cmd" | "subcommand" | "custom"
+                )
+                && item.doc != vis.detail_txt;
+            let mut doc_right = right_edge;
+            if show_detail_tag {
+                let dw = m.measure(&vis.detail_txt, TextFace::UiSmall);
+                if doc_right - dw > doc_x + 48.0 {
+                    scene.overlay_ui_small(
+                        doc_right - dw,
+                        ty_small,
+                        &vis.detail_txt,
+                        if is_sel { theme::INK_2 } else { theme::INK_4 },
+                        false,
+                        false,
+                        0,
+                    );
+                    doc_right -= dw + 10.0;
+                }
+            }
+            if !item.doc.is_empty() && doc_x + 36.0 < doc_right {
+                let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+                let max_doc_ch = ((doc_right - doc_x) / avg_cw).floor().max(8.0) as usize;
+                let doc_txt = truncate_chars(&item.doc, max_doc_ch);
+                scene.overlay_ui_small(
+                    doc_x,
+                    ty_small,
+                    doc_txt,
+                    if is_sel { theme::INK_2 } else { theme::INK_3 },
+                    false,
+                    false,
+                    0,
+                );
+            }
+            col_left = doc_x - 10.0;
+        } else {
+            let detail_w = m.measure(&vis.detail_txt, TextFace::UiSmall);
+            let detail_x = right_edge - detail_w;
+            scene.overlay_ui_small(
+                detail_x,
+                ty_small,
+                &vis.detail_txt,
+                if is_sel { theme::INK_2 } else { theme::INK_4 },
+                false,
+                false,
+                0,
+            );
+
+            col_left = right_edge - detail_col_w - 10.0;
+            if any_size_bar {
+                let bar_x0 = col_left - COMP_SIZE_BAR_W;
+                col_left = bar_x0 - 12.0;
+                if let Some(b) = vis.bytes
+                    && b > 0
+                    && max_bytes > 0
+                {
+                    let frac = blaze_dust::bar_fraction(b, max_bytes);
+                    let by0 = ry + row_h * 0.5 - 2.0;
+                    let by1 = by0 + 4.0;
+                    scene.overlay_round_rect(
+                        bar_x0,
+                        by0,
+                        bar_x0 + COMP_SIZE_BAR_W,
+                        by1,
+                        2.0,
+                        theme::BG_TRACK,
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                    let fill_w = (COMP_SIZE_BAR_W * frac).max(3.0);
+                    let fill_col = if !vis.bytes_done {
+                        theme::rgba(0xe5, 0xb5, 0x67, 0.50)
+                    } else {
+                        match blaze_dust::size_tier(b) {
+                            blaze_dust::SizeTier::Bytes => theme::rgba(0x88, 0x90, 0x9e, 0.55),
+                            blaze_dust::SizeTier::KiB => theme::rgb(0x58, 0x9d, 0xf6),
+                            blaze_dust::SizeTier::MiB => theme::rgb(0xe5, 0xb5, 0x67),
+                            blaze_dust::SizeTier::GiB => theme::rgb(0xe8, 0x6a, 0x45),
+                        }
+                    };
+                    scene.overlay_round_rect(
+                        bar_x0,
+                        by0,
+                        bar_x0 + fill_w,
+                        by1,
+                        2.0,
+                        fill_col,
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+                }
+            }
+
+            if any_age {
+                if let Some(age_s) = vis.age_txt.as_deref()
+                    && let Some((heat_col, _)) = vis.heat
+                {
+                    let aw = m.measure(age_s, TextFace::UiSmall);
+                    scene.overlay_ui_small(col_left - aw, ty_small, age_s, heat_col, false, false, 0);
+                }
+                col_left -= COMP_AGE_COL_W + 10.0;
+            }
+        }
+
+        // Label with IntelliJ-style vivid blue matched-character highlighting (`#589DF6`)
+        // blended with `ls`-matching recency heat warmth when recently modified.
+        let max_label_ch = ((col_left - label_x) / m.cw).floor().max(6.0) as usize;
         let label_txt = truncate_chars(&item.label, max_label_ch);
-        let base_col = match item.kind {
+        let mut base_col = match item.kind {
             CompletionKind::Keyword if !is_sel => theme::rgb(0xd8, 0xa8, 0x8c),
             _ if is_sel => theme::INK_1,
             _ => theme::INK_2,
         };
+        if let Some((heat, blend)) = vis.heat
+            && blend > 0.0
+        {
+            base_col = [
+                base_col[0] + (heat[0] - base_col[0]) * blend,
+                base_col[1] + (heat[1] - base_col[1]) * blend,
+                base_col[2] + (heat[2] - base_col[2]) * blend,
+                base_col[3],
+            ];
+        }
 
         if item.match_indices.is_empty() {
             scene.overlay_text_run(label_x, ty, &label_txt, base_col, is_sel, false, 0);
@@ -6434,23 +7765,29 @@ fn layout_completion_popup(
         draw_overlay_scrollbar(scene, px1 - 8.0, list_y0 + 2.0, ry - 2.0, win_start, max_scroll, show, total);
     }
 
-    // Bottom Quick-Doc strip in SF Pro + scroll count indicator.
+    // Bottom status / Quick-Doc strip in SF Pro + scroll count indicator.
     let div_y = py1 - doc_h;
     scene.overlay_line(px0 + 1.0, div_y, px1 - 1.0, div_y, 1.0, theme::LINE, 0);
     let doc_ty = div_y + (doc_h - m.ch) * 0.5;
     let hint = if has_sb {
-        format!("{}/{}  ·  ↑↓ scroll  tab", editor.completion_selected + 1, total)
+        format!("{}/{}  ·  tab complete  ·  ↑↓  ·  esc", editor.completion_selected + 1, total)
     } else {
-        "↑↓  tab  esc".to_owned()
+        "tab complete  ·  ↑↓  ·  esc".to_owned()
     };
     let hint_w = m.measure(&hint, TextFace::UiSmall);
     scene.overlay_ui_small(px1 - 12.0 - hint_w, doc_ty, &hint, theme::INK_4, false, false, 0);
 
-    if let Some(sel) = editor.completions.get(editor.completion_selected) {
-        let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
-        let max_doc = ((px1 - 24.0 - hint_w - (px0 + 13.0)) / avg_cw).floor().max(8.0) as usize;
-        let doc_txt = truncate_chars(&sel.doc, max_doc);
-        scene.overlay_ui_small(px0 + 13.0, doc_ty, doc_txt, theme::INK_3, false, false, 0);
+    if !inline_doc_mode {
+        if let Some(sel) = editor.completions.get(editor.completion_selected) {
+            let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
+            let max_doc = ((px1 - 24.0 - hint_w - (px0 + 13.0)) / avg_cw).floor().max(8.0) as usize;
+            let doc_txt = truncate_chars(&sel.doc, max_doc);
+            scene.overlay_ui_small(px0 + 13.0, doc_ty, doc_txt, theme::INK_3, false, false, 0);
+        }
+    } else if has_sb {
+        let rem = total.saturating_sub(show);
+        let more_txt = format!("+{rem} more");
+        scene.overlay_ui_small(px0 + 13.0, doc_ty, more_txt, theme::INK_4, false, false, 0);
     }
 }
 
@@ -6812,6 +8149,26 @@ fn layout_reverse_search_overlay(
     }
 }
 
+/// Count visible rows inside the visual branch commit graph card so popover sizing and
+/// rendering stay in exact sync.
+fn branch_graph_row_count(rel: &crate::prompt::BranchRelation) -> usize {
+    if rel.ahead == 0 && rel.behind == 0 {
+        let recent = rel.recent_commits.len().min(3);
+        if recent > 0 {
+            recent
+        } else {
+            usize::from(!rel.merge_base_short.is_empty())
+        }
+    } else {
+        let shown_ahead = rel.ahead_commits.len().min(5);
+        let more_ahead = usize::from(rel.ahead as usize > shown_ahead);
+        let shown_behind = rel.behind_commits.len().min(3);
+        let more_behind = usize::from(rel.behind as usize > shown_behind);
+        let has_mb = usize::from(!rel.merge_base_short.is_empty());
+        shown_ahead + more_ahead + shown_behind + more_behind + has_mb
+    }
+}
+
 /// Floating native Metal popover rendered when hovering or clicking any prompt capsule segment
 /// (branch switcher, uncommitted files, stashes, directory breadcrumbs, toolchains) or icon button.
 fn layout_active_popover(
@@ -6821,6 +8178,7 @@ fn layout_active_popover(
     vh: f32,
     m: CellMetrics,
     mouse_pos: Option<[f32; 2]>,
+    now_ns: i64,
 ) {
     let pad_x = 11.0;
     let pad_y = 8.0;
@@ -6845,19 +8203,47 @@ fn layout_active_popover(
             let h = pad_y * 2.0 + m.ch + if subtitle.is_some() { m.ch + 2.0 } else { 0.0 };
             (w, h)
         }
-        HoverKind::GitBranch { branches, .. } => {
-            let shown = branches.len().clamp(1, 10);
-            let max_c = branches
-                .iter()
-                .take(shown)
-                .map(|b| b.chars().count())
-                .max()
-                .unwrap_or(10)
-                .max(24)
-                .min(42);
-            let w = (max_c as f32 * m.cw + pad_x * 2.0 + 36.0).clamp(220.0, 380.0);
-            let h = hdr_h + shown as f32 * row_h + pad_y;
-            (w, h)
+        HoverKind::GitBranch { branches, relation, .. } => {
+            if let Some(rel) = relation {
+                let commit_row_h = m.ch + 6.0;
+                let graph_rows = branch_graph_row_count(rel);
+                let graph_hdr_h = m.ch + 10.0;
+                let card_h = if graph_rows > 0 {
+                    graph_hdr_h + graph_rows as f32 * commit_row_h + 10.0
+                } else {
+                    m.ch + 16.0
+                };
+                let max_branches = if graph_rows > 0 { 6 } else { 10 };
+                let shown = branches.len().clamp(1, max_branches);
+                let w = if graph_rows > 0 {
+                    (vw - 32.0).min(540.0).max(410.0)
+                } else {
+                    let max_br = branches
+                        .iter()
+                        .take(shown)
+                        .map(|b| b.chars().count())
+                        .max()
+                        .unwrap_or(10)
+                        .max(24)
+                        .min(48);
+                    (max_br as f32 * m.cw + pad_x * 2.0 + 36.0).clamp(300.0, 450.0)
+                };
+                let h = (hdr_h + card_h + 8.0 + shown as f32 * row_h + pad_y).min(vh - 36.0);
+                (w, h)
+            } else {
+                let shown = branches.len().clamp(1, 10);
+                let max_c = branches
+                    .iter()
+                    .take(shown)
+                    .map(|b| b.chars().count())
+                    .max()
+                    .unwrap_or(10)
+                    .max(24)
+                    .min(42);
+                let w = (max_c as f32 * m.cw + pad_x * 2.0 + 36.0).clamp(220.0, 380.0);
+                let h = hdr_h + shown as f32 * row_h + pad_y;
+                (w, h)
+            }
         }
         HoverKind::GitStashes { stashes, entries, .. } => {
             if !entries.is_empty() {
@@ -6917,15 +8303,20 @@ fn layout_active_popover(
         }
         HoverKind::Directory { cwd } => {
             let parts = parent_breadcrumbs(cwd);
-            let shown = parts.len().clamp(1, 8);
-            let max_c = parts
+            let shown = parts.len().clamp(1, 7);
+            let indent_step = 14.0f32;
+            let max_row_w = parts
                 .iter()
-                .map(|(lbl, _)| lbl.chars().count())
-                .max()
-                .unwrap_or(16)
-                .max(24)
-                .min(50);
-            let w = (max_c as f32 * m.cw + pad_x * 2.0 + icon_s + 16.0).clamp(240.0, 460.0);
+                .take(shown)
+                .enumerate()
+                .map(|(i, (lbl, _))| {
+                    let indent = i as f32 * indent_step;
+                    let right_tag_w = if i + 1 == shown { 9.0 * m.cw } else { 5.0 * m.cw };
+                    indent + icon_s + 8.0 + lbl.chars().count().min(36) as f32 * m.cw + right_tag_w
+                })
+                .fold(0.0f32, f32::max);
+            let hdr_min_w = ("directory".len() + "click to cd".len() + 6) as f32 * m.cw;
+            let w = (max_row_w.max(hdr_min_w) + pad_x * 2.0 + 8.0).clamp(240.0, 440.0);
             let h = hdr_h + shown as f32 * row_h + pad_y;
             (w, h)
         }
@@ -7170,12 +8561,485 @@ fn layout_active_popover(
                 );
             }
         }
-        HoverKind::GitBranch { current, branches } => {
+        HoverKind::GitBranch { current, branches, relation } => {
             let mut ry = draw_header(scene, "git branches", "click to switch");
-            let max_c = ((pop_w - pad_x * 2.0 - 28.0) / m.cw).floor().max(8.0) as usize;
-            for br in branches.iter().take(10) {
+            let mut max_branches = 10usize;
+            if let Some(rel) = relation {
+                let commit_row_h = m.ch + 6.0;
+                let graph_rows = branch_graph_row_count(rel);
+                if graph_rows > 0 {
+                    max_branches = 6;
+                }
+                let graph_hdr_h = m.ch + 10.0;
+                let card_x0 = x0 + 8.0;
+                let card_x1 = x1 - 8.0;
+                let card_bg = theme::rgb(0x14, 0x14, 0x19);
+                let card_h = if graph_rows > 0 {
+                    graph_hdr_h + graph_rows as f32 * commit_row_h + 10.0
+                } else {
+                    m.ch + 16.0
+                };
+                scene.overlay_round_rect(
+                    card_x0,
+                    ry,
+                    card_x1,
+                    ry + card_h,
+                    6.0,
+                    card_bg,
+                    1.0,
+                    theme::LINE,
+                    0,
+                );
+
+                let add_col = theme::rgb(0x57, 0xc7, 0x85);
+                let del_col = theme::rgb(0xf0, 0x71, 0x78);
+                let behind_col = theme::rgb(0xe8, 0xa8, 0x48);
+                let sha_col = theme::rgb(0x74, 0xb9, 0xff);
+
+                // Card header: `vs <base_ref>` on the left + total `+A -D` & ahead/behind pills on the right.
+                let inner_x0 = card_x0 + 9.0;
+                let inner_x1 = card_x1 - 9.0;
+                let row1_y = ry + 6.0;
+                let pill_h = m.ch + 2.0;
+                let pill_y0 = row1_y - 1.0;
+
+                let mut rx = inner_x1;
+                let draw_badge = |scene: &mut Scene,
+                                  rx: &mut f32,
+                                  label: &str,
+                                  fg: [f32; 4],
+                                  bg: [f32; 4]| {
+                    let bw = label.chars().count() as f32 * m.cw + 10.0;
+                    let bx0 = *rx - bw;
+                    scene.overlay_round_rect(bx0, pill_y0, *rx, pill_y0 + pill_h, 4.0, bg, 0.0, [0.0; 4], 0);
+                    scene.overlay_text_run(bx0 + 5.0, row1_y, label, fg, true, false, 0);
+                    *rx = bx0 - 5.0;
+                };
+
+                if rel.ahead == 0 && rel.behind == 0 {
+                    draw_badge(
+                        scene,
+                        &mut rx,
+                        "up to date",
+                        theme::OK,
+                        theme::rgba(0x46, 0xc9, 0x7a, 0.14),
+                    );
+                } else {
+                    if rel.behind > 0 {
+                        let lbl = if rel.ahead == 0 {
+                            format!("↓{} behind", rel.behind)
+                        } else {
+                            format!("↓{}", rel.behind)
+                        };
+                        draw_badge(
+                            scene,
+                            &mut rx,
+                            &lbl,
+                            behind_col,
+                            theme::rgba(0xe5, 0x9b, 0x45, 0.15),
+                        );
+                    }
+                    if rel.ahead > 0 {
+                        let lbl = if rel.behind == 0 {
+                            format!("↑{} ahead", rel.ahead)
+                        } else {
+                            format!("↑{}", rel.ahead)
+                        };
+                        draw_badge(
+                            scene,
+                            &mut rx,
+                            &lbl,
+                            theme::OK,
+                            theme::rgba(0x46, 0xc9, 0x7a, 0.15),
+                        );
+                    }
+                }
+
+                // Aggregate branch diff `+total_added -total_deleted` right beside the divergence badge.
+                if rel.total_deleted > 0 {
+                    let s = format!("-{}", rel.total_deleted);
+                    let sw = s.len() as f32 * m.cw;
+                    rx -= sw + 2.0;
+                    scene.overlay_text_run(rx, row1_y, &s, del_col, false, false, 0);
+                    rx -= 4.0;
+                }
+                if rel.total_added > 0 {
+                    let s = format!("+{}", rel.total_added);
+                    let sw = s.len() as f32 * m.cw;
+                    rx -= sw;
+                    scene.overlay_text_run(rx, row1_y, &s, add_col, false, false, 0);
+                    rx -= 8.0;
+                }
+
+                scene.overlay_text_run(inner_x0, row1_y, "vs ", theme::INK_4, false, false, 0);
+                let base_x = inner_x0 + 3.0 * m.cw;
+                let max_base_c = ((rx - base_x - 4.0) / m.cw).floor().max(6.0) as usize;
+                scene.overlay_text_run(
+                    base_x,
+                    row1_y,
+                    truncate_chars(&rel.base_ref, max_base_c),
+                    theme::INK_1,
+                    true,
+                    false,
+                    0,
+                );
+
+                // Visual GPU vector commit DAG inside the card.
+                if graph_rows > 0 {
+                    let sep_y = ry + graph_hdr_h;
+                    scene.overlay_round_rect(
+                        card_x0 + 1.0,
+                        sep_y,
+                        card_x1 - 1.0,
+                        sep_y + 1.0,
+                        0.0,
+                        theme::LINE_FAINT,
+                        0.0,
+                        [0.0; 4],
+                        0,
+                    );
+
+                    let g_top = sep_y + 5.0;
+                    let draw_diff_stats = |scene: &mut Scene,
+                                           right_x: f32,
+                                           ty: f32,
+                                           cy: f32,
+                                           added: u32,
+                                           deleted: u32| -> f32 {
+                        let mut cur_rx = right_x;
+                        if added == 0 && deleted == 0 {
+                            return cur_rx;
+                        }
+                        // Compact 2-color proportional `+/-` bar (`20px × 3.5px`).
+                        let bar_w = 20.0f32;
+                        let bar_h = 3.5f32;
+                        let bar_x0 = cur_rx - bar_w;
+                        let bar_y0 = cy - bar_h * 0.5;
+                        let total = (added + deleted) as f32;
+                        if added > 0 && deleted > 0 {
+                            let gap = 1.0;
+                            let avail = bar_w - gap;
+                            let aw = ((added as f32 / total) * avail).clamp(2.5, avail - 2.5);
+                            scene.overlay_round_rect(bar_x0, bar_y0, bar_x0 + aw, bar_y0 + bar_h, 1.5, add_col, 0.0, [0.0; 4], 0);
+                            scene.overlay_round_rect(bar_x0 + aw + gap, bar_y0, cur_rx, bar_y0 + bar_h, 1.5, del_col, 0.0, [0.0; 4], 0);
+                        } else if added > 0 {
+                            scene.overlay_round_rect(bar_x0, bar_y0, cur_rx, bar_y0 + bar_h, 1.5, add_col, 0.0, [0.0; 4], 0);
+                        } else {
+                            scene.overlay_round_rect(bar_x0, bar_y0, cur_rx, bar_y0 + bar_h, 1.5, del_col, 0.0, [0.0; 4], 0);
+                        }
+                        cur_rx = bar_x0 - 6.0;
+
+                        if deleted > 0 {
+                            let ds = format!("-{deleted}");
+                            let dw = ds.len() as f32 * m.cw;
+                            cur_rx -= dw;
+                            scene.overlay_text_run(cur_rx, ty, &ds, del_col, false, false, 0);
+                            cur_rx -= 5.0;
+                        }
+                        if added > 0 {
+                            let as_ = format!("+{added}");
+                            let aw = as_.len() as f32 * m.cw;
+                            cur_rx -= aw;
+                            scene.overlay_text_run(cur_rx, ty, &as_, add_col, false, false, 0);
+                            cur_rx -= 6.0;
+                        }
+                        cur_rx
+                    };
+
+                    let draw_sha_chip = |scene: &mut Scene,
+                                         sx: f32,
+                                         ty: f32,
+                                         sha: &str,
+                                         accent: [f32; 4]| -> f32 {
+                        let short: String = sha.chars().take(7).collect();
+                        let sw = short.chars().count() as f32 * m.cw;
+                        let r = HitRect::new(sx - 2.0, ty - 1.0, sx + sw + 2.0, ty + m.ch + 1.0);
+                        let bg = if is_hovered(r) {
+                            [accent[0], accent[1], accent[2], 0.24]
+                        } else {
+                            [accent[0], accent[1], accent[2], 0.10]
+                        };
+                        scene.overlay_round_rect(r.x0, r.y0, r.x1, r.y1, 3.0, bg, 0.0, [0.0; 4], 0);
+                        scene.overlay_text_run(sx, ty, &short, accent, false, false, 0);
+                        scene.push_hit(r, HitAction::CopyText(sha.to_owned()));
+                        sx + sw + 7.0
+                    };
+
+                    let draw_dot = |scene: &mut Scene,
+                                    cx: f32,
+                                    cy: f32,
+                                    r: f32,
+                                    fill: [f32; 4],
+                                    border_w: f32,
+                                    border: [f32; 4]| {
+                        scene.overlay_round_rect(
+                            cx - r,
+                            cy - r,
+                            cx + r,
+                            cy + r,
+                            r,
+                            fill,
+                            border_w,
+                            border,
+                            0,
+                        );
+                    };
+
+                    if rel.ahead == 0 && rel.behind == 0 {
+                        // Single-trunk recent commits (HEAD == base).
+                        let lx0 = inner_x0 + 6.0;
+                        let text_x0 = lx0 + 13.0;
+                        let count = rel.recent_commits.len().min(3);
+                        if count > 0 {
+                            if count > 1 {
+                                let y_start = g_top + commit_row_h * 0.5;
+                                let y_end = g_top + (count - 1) as f32 * commit_row_h + commit_row_h * 0.5;
+                                scene.overlay_line(lx0, y_start, lx0, y_end, 1.5, theme::LINE_STRONG, 0);
+                            }
+                            for (idx, c) in rel.recent_commits.iter().take(count).enumerate() {
+                                let row_y = g_top + idx as f32 * commit_row_h;
+                                let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                                let cy = row_y + commit_row_h * 0.5;
+                                if idx == 0 {
+                                    draw_dot(scene, lx0, cy, 5.2, theme::rgba(0x4c, 0xc2, 0x7a, 0.24), 0.0, [0.0; 4]);
+                                    draw_dot(scene, lx0, cy, 3.1, theme::OK, 0.0, [0.0; 4]);
+                                } else {
+                                    draw_dot(scene, lx0, cy, 2.7, theme::INK_3, 1.0, card_bg);
+                                }
+                                let sx = draw_sha_chip(
+                                    scene,
+                                    text_x0,
+                                    ty,
+                                    &c.short_sha,
+                                    if idx == 0 { theme::OK } else { sha_col },
+                                );
+                                let right_limit = draw_diff_stats(scene, inner_x1, ty, cy, c.added_lines, c.deleted_lines);
+                                let rem_c = ((right_limit - sx - 2.0) / m.cw).floor().max(0.0) as usize;
+                                if rem_c >= 3 {
+                                    scene.overlay_text_run(
+                                        sx,
+                                        ty,
+                                        truncate_chars(&c.subject, rem_c),
+                                        if idx == 0 { theme::INK_1 } else { theme::INK_3 },
+                                        idx == 0,
+                                        false,
+                                        0,
+                                    );
+                                }
+                            }
+                        } else if !rel.merge_base_short.is_empty() {
+                            let row_y = g_top;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            draw_dot(scene, lx0, cy, 3.4, card_bg, 1.8, sha_col);
+                            let sx = draw_sha_chip(scene, text_x0, ty, &rel.merge_base_short, sha_col);
+                            let rem_c = ((inner_x1 - sx) / m.cw).floor().max(0.0) as usize;
+                            if rem_c >= 3 {
+                                scene.overlay_text_run(sx, ty, truncate_chars(&rel.merge_base_subject, rem_c), theme::INK_3, false, false, 0);
+                            }
+                        }
+                    } else {
+                        // Diverged or ahead/behind vector DAG:
+                        // Lane 0 (`lx0`): base branch (`main`/`master`)
+                        // Lane 1 (`lx1`): current `HEAD` branch (when `ahead > 0`)
+                        let two_lanes = rel.ahead > 0;
+                        let lx0 = inner_x0 + 6.0;
+                        let lx1 = if two_lanes { lx0 + 13.0 } else { lx0 };
+                        let text_x0 = lx1 + 12.0;
+
+                        let shown_ahead = rel.ahead_commits.len().min(5);
+                        let more_ahead = rel.ahead.saturating_sub(shown_ahead as u32);
+                        let ahead_rows = shown_ahead + usize::from(more_ahead > 0);
+
+                        let shown_behind = rel.behind_commits.len().min(3);
+                        let more_behind = rel.behind.saturating_sub(shown_behind as u32);
+                        let behind_rows = shown_behind + usize::from(more_behind > 0);
+
+                        let has_mb = !rel.merge_base_short.is_empty();
+                        let mb_idx = ahead_rows + behind_rows;
+                        let row_cy = |i: usize| g_top + i as f32 * commit_row_h + commit_row_h * 0.5;
+
+                        // 1. Draw vector rails first so circular commit dots render crisply on top.
+                        if two_lanes && ahead_rows > 0 {
+                            let y_first = row_cy(0);
+                            let y_last_branch = row_cy(ahead_rows + behind_rows - 1);
+                            if ahead_rows + behind_rows > 1 {
+                                scene.overlay_line(lx1, y_first, lx1, y_last_branch, 1.75, theme::OK, 0);
+                            }
+                            if has_mb {
+                                // Smooth diagonal fork edge from Lane 1 (HEAD) into Lane 0 (merge-base).
+                                scene.overlay_line(lx1, y_last_branch, lx0, row_cy(mb_idx), 1.75, theme::OK, 0);
+                            }
+                        }
+                        if behind_rows > 0 {
+                            let y_b0 = row_cy(ahead_rows);
+                            let y_b_end = if has_mb {
+                                row_cy(mb_idx)
+                            } else {
+                                row_cy(ahead_rows + behind_rows - 1)
+                            };
+                            if y_b_end > y_b0 {
+                                scene.overlay_line(lx0, y_b0, lx0, y_b_end, 1.75, behind_col, 0);
+                            }
+                        }
+
+                        // 2. Render `ahead` commits on Lane 1 (`HEAD`, emerald).
+                        let mut cur_row = 0usize;
+                        for (idx, c) in rel.ahead_commits.iter().take(shown_ahead).enumerate() {
+                            let row_y = g_top + cur_row as f32 * commit_row_h;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            if idx == 0 {
+                                draw_dot(scene, lx1, cy, 5.2, theme::rgba(0x4c, 0xc2, 0x7a, 0.25), 0.0, [0.0; 4]);
+                                draw_dot(scene, lx1, cy, 3.2, theme::OK, 0.0, [0.0; 4]);
+                            } else {
+                                draw_dot(scene, lx1, cy, 2.9, theme::OK, 1.0, card_bg);
+                            }
+                            let sx = draw_sha_chip(scene, text_x0, ty, &c.short_sha, theme::OK);
+                            let right_limit = draw_diff_stats(scene, inner_x1, ty, cy, c.added_lines, c.deleted_lines);
+                            let rem_c = ((right_limit - sx - 2.0) / m.cw).floor().max(0.0) as usize;
+                            if rem_c >= 3 {
+                                scene.overlay_text_run(
+                                    sx,
+                                    ty,
+                                    truncate_chars(&c.subject, rem_c),
+                                    if idx == 0 { theme::INK_1 } else { theme::INK_2 },
+                                    idx == 0,
+                                    false,
+                                    0,
+                                );
+                            }
+                            cur_row += 1;
+                        }
+                        if more_ahead > 0 {
+                            let row_y = g_top + cur_row as f32 * commit_row_h;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            draw_dot(scene, lx1, cy, 2.5, card_bg, 1.3, theme::OK);
+                            let more_lbl = if more_ahead == 1 {
+                                "+1 more commit on HEAD".to_owned()
+                            } else {
+                                format!("+{more_ahead} more commits on HEAD")
+                            };
+                            scene.overlay_text_run(text_x0, ty, &more_lbl, theme::INK_4, false, true, 0);
+                            cur_row += 1;
+                        }
+
+                        // 3. Render `behind` commits on Lane 0 (`<base_ref>`, amber).
+                        for (idx, c) in rel.behind_commits.iter().take(shown_behind).enumerate() {
+                            let row_y = g_top + cur_row as f32 * commit_row_h;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            if idx == 0 {
+                                draw_dot(scene, lx0, cy, 5.0, theme::rgba(0xe8, 0xa8, 0x48, 0.24), 0.0, [0.0; 4]);
+                                draw_dot(scene, lx0, cy, 3.1, behind_col, 0.0, [0.0; 4]);
+                            } else {
+                                draw_dot(scene, lx0, cy, 2.8, behind_col, 1.0, card_bg);
+                            }
+                            let sx = draw_sha_chip(scene, text_x0, ty, &c.short_sha, behind_col);
+                            let right_limit = draw_diff_stats(scene, inner_x1, ty, cy, c.added_lines, c.deleted_lines);
+                            let rem_c = ((right_limit - sx - 2.0) / m.cw).floor().max(0.0) as usize;
+                            if rem_c >= 3 {
+                                scene.overlay_text_run(
+                                    sx,
+                                    ty,
+                                    truncate_chars(&c.subject, rem_c),
+                                    theme::INK_3,
+                                    false,
+                                    false,
+                                    0,
+                                );
+                            }
+                            cur_row += 1;
+                        }
+                        if more_behind > 0 {
+                            let row_y = g_top + cur_row as f32 * commit_row_h;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            draw_dot(scene, lx0, cy, 2.5, card_bg, 1.3, behind_col);
+                            let more_lbl = if more_behind == 1 {
+                                format!("+1 more commit on {}", rel.base_ref)
+                            } else {
+                                format!("+{more_behind} more commits on {}", rel.base_ref)
+                            };
+                            scene.overlay_text_run(text_x0, ty, &more_lbl, theme::INK_4, false, true, 0);
+                            cur_row += 1;
+                        }
+
+                        // 4. Render common ancestor (`merge-base`) anchor node on Lane 0.
+                        if has_mb {
+                            let row_y = g_top + cur_row as f32 * commit_row_h;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            let (node_col, tag_lbl) = if rel.ahead == 0 {
+                                (theme::OK, "HEAD")
+                            } else if rel.behind == 0 {
+                                (sha_col, rel.base_ref.as_str())
+                            } else {
+                                (sha_col, "base")
+                            };
+                            draw_dot(scene, lx0, cy, 3.6, card_bg, 1.8, node_col);
+
+                            // Right-aligned anchor pill (`[main]` / `[base]` / `[HEAD]`).
+                            let tag_shown = truncate_chars(tag_lbl, 14);
+                            let tag_w = tag_shown.chars().count() as f32 * m.cw + 8.0;
+                            let tag_x0 = inner_x1 - tag_w;
+                            scene.overlay_round_rect(
+                                tag_x0,
+                                ty - 1.0,
+                                inner_x1,
+                                ty + m.ch + 1.0,
+                                3.5,
+                                [node_col[0], node_col[1], node_col[2], 0.14],
+                                0.0,
+                                [0.0; 4],
+                                0,
+                            );
+                            scene.overlay_text_run(tag_x0 + 4.0, ty, &tag_shown, node_col, true, false, 0);
+
+                            let mut cx = draw_sha_chip(scene, text_x0, ty, &rel.merge_base_short, sha_col);
+                            if rel.merge_base_time_secs > 0 && now_ns > 0 {
+                                let mut age = String::new();
+                                let _ = format_relative_time(
+                                    DateTime {
+                                        utc_ns: rel.merge_base_time_secs.saturating_mul(1_000_000_000),
+                                        offset_secs: 0,
+                                    },
+                                    now_ns,
+                                    &mut age,
+                                );
+                                let age_lbl = format!("{age} · ");
+                                let age_w = age_lbl.chars().count() as f32 * m.cw;
+                                if cx + age_w + 6.0 * m.cw < tag_x0 {
+                                    scene.overlay_text_run(cx, ty, &age_lbl, theme::INK_4, false, false, 0);
+                                    cx += age_w;
+                                }
+                            }
+                            let rem_c = ((tag_x0 - cx - 6.0) / m.cw).floor().max(0.0) as usize;
+                            if rem_c >= 3 && !rel.merge_base_subject.is_empty() {
+                                scene.overlay_text_run(
+                                    cx,
+                                    ty,
+                                    truncate_chars(&rel.merge_base_subject, rem_c),
+                                    theme::INK_3,
+                                    false,
+                                    false,
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                ry += card_h + 8.0;
+            }
+            for br in branches.iter().take(max_branches) {
+                if ry + row_h > y1 - 4.0 {
+                    break;
+                }
                 let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
                 let is_cur = br == current;
+                let is_base = !is_cur && relation.as_ref().is_some_and(|r| r.base_ref == *br);
                 if is_hovered(row_rect) {
                     scene.overlay_round_rect(
                         row_rect.x0,
@@ -7203,13 +9067,24 @@ fn layout_active_popover(
                         0,
                     );
                 }
-                let col = if is_cur { theme::INK_1 } else { theme::INK_2 };
-                scene.overlay_text_run(x0 + pad_x + 14.0, ty, truncate_chars(br, max_c), col, is_cur, false, 0);
-                if is_cur {
-                    let tag = "current";
+                let right_tag = if is_cur {
+                    Some("current")
+                } else if is_base {
+                    Some("base")
+                } else {
+                    None
+                };
+                let right_reserve = right_tag.map_or(0.0, |t| (t.len() as f32 + 2.0) * m.cw);
+                let max_c = ((pop_w - pad_x * 2.0 - 18.0 - right_reserve) / m.cw)
+                    .floor()
+                    .max(8.0) as usize;
+                let shown_br = truncate_chars(br, max_c);
+                draw_styled_branch_name(scene, x0 + pad_x + 14.0, ty, &shown_br, is_cur, true, m, 0);
+                if let Some(tag) = right_tag {
                     let tw = tag.len() as f32 * m.cw;
                     scene.overlay_text_run(x1 - pad_x - tw, ty, tag, theme::INK_4, false, false, 0);
-                } else {
+                }
+                if !is_cur {
                     scene.push_hit(row_rect, HitAction::SwitchGitBranch(br.clone()));
                 }
                 ry += row_h;
@@ -7526,11 +9401,12 @@ fn layout_active_popover(
         HoverKind::Directory { cwd } => {
             let mut ry = draw_header(scene, "directory", "click to cd");
             let parts = parent_breadcrumbs(cwd);
-            let max_c = ((pop_w - pad_x * 2.0 - icon_s - 10.0) / m.cw).floor().max(8.0) as usize;
+            let total = parts.len();
+            let indent_step = 14.0f32;
             for (i, (label, full_path)) in parts.iter().enumerate() {
-                let is_cur = i + 1 == parts.len();
+                let is_cur = i + 1 == total;
                 let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
-                if is_hovered(row_rect) && !is_cur {
+                if is_hovered(row_rect) {
                     scene.overlay_round_rect(
                         row_rect.x0,
                         row_rect.y0,
@@ -7544,10 +9420,32 @@ fn layout_active_popover(
                     );
                 }
                 let ty = ry + (row_h - m.ch) * 0.5;
-                scene.overlay_svg_icon(x0 + pad_x, ty + (m.ch - icon_s) * 0.5, icon_s, "folder_macos", 0);
+                let cy = ry + row_h * 0.5;
+                let ix = x0 + pad_x + i as f32 * indent_step;
+
+                // Subtle GPU vector L-connector linking each nested folder to its parent icon.
+                if i > 0 {
+                    let parent_cx = x0 + pad_x + (i - 1) as f32 * indent_step + icon_s * 0.5;
+                    let top_y = ry - row_h * 0.5 + icon_s * 0.5 + 1.0;
+                    scene.overlay_line(parent_cx, top_y, parent_cx, cy, 1.25, theme::LINE_STRONG, 0);
+                    scene.overlay_line(parent_cx, cy, ix - 3.0, cy, 1.25, theme::LINE_STRONG, 0);
+                }
+
+                scene.overlay_svg_icon(ix, ty + (m.ch - icon_s) * 0.5, icon_s, "folder_macos", 0);
+                let depth_up = total.saturating_sub(1 + i);
+                let right_tag = if is_cur {
+                    "copy".to_owned()
+                } else if depth_up == 1 {
+                    "..".to_owned()
+                } else {
+                    format!("↑{depth_up}")
+                };
+                let tag_w = right_tag.chars().count() as f32 * m.cw;
+                let tx = ix + icon_s + 7.0;
+                let max_c = ((x1 - pad_x - tag_w - 10.0 - tx) / m.cw).floor().max(6.0) as usize;
                 let col = if is_cur { theme::INK_1 } else { theme::INK_2 };
                 scene.overlay_text_run(
-                    x0 + pad_x + icon_s + 7.0,
+                    tx,
                     ty,
                     truncate_chars(label, max_c),
                     col,
@@ -7555,7 +9453,15 @@ fn layout_active_popover(
                     false,
                     0,
                 );
-                if !is_cur {
+                let tag_col = if is_cur && is_hovered(row_rect) {
+                    theme::INK_2
+                } else {
+                    theme::INK_4
+                };
+                scene.overlay_text_run(x1 - pad_x - tag_w, ty, &right_tag, tag_col, false, false, 0);
+                if is_cur {
+                    scene.push_hit(row_rect, HitAction::CopyText(full_path.clone()));
+                } else {
                     scene.push_hit(row_rect, HitAction::ChangeDir(full_path.clone()));
                 }
                 ry += row_h;
@@ -7885,11 +9791,36 @@ fn layout_active_popover(
                 scene.overlay_ui_small(act_x0 + 6.0, ty1, &act_lbl, act_fg, item.shell_pane.is_some(), false, 0);
 
                 let mut rx = act_x0 - 8.0;
+                let max_mem = summary
+                    .items
+                    .iter()
+                    .map(|p| p.mem_bytes)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let bar_h = 4.0f32;
+                let bar_y0 = ty1 + (m.ch - bar_h) * 0.5;
+
+                // Fixed-width Memory column: right-aligned label + proportional blue/cyan bar.
+                let mem_col_w = 50.0f32;
                 let mem_s = crate::sysmon_view::format_iec_bytes(item.mem_bytes);
                 let mem_w = m.measure(&mem_s, TextFace::UiSmall);
-                rx -= mem_w;
-                scene.overlay_ui_small(rx, ty1, &mem_s, theme::INK_2, false, false, 0);
-                rx -= 10.0;
+                scene.overlay_ui_small(rx - mem_w, ty1, &mem_s, theme::INK_2, false, false, 0);
+                rx -= mem_col_w + 4.0;
+                let mem_bar_w = 30.0f32;
+                let mem_bx0 = rx - mem_bar_w;
+                let mem_frac = (item.mem_bytes as f32 / max_mem as f32).clamp(0.0, 1.0);
+                scene.overlay_round_rect(mem_bx0, bar_y0, rx, bar_y0 + bar_h, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], 0);
+                if item.mem_bytes > 0 {
+                    let mw = (mem_bar_w * mem_frac).max(2.5);
+                    let m_col = if mem_frac >= 0.65 {
+                        theme::rgb(0x6e, 0xb5, 0xff)
+                    } else {
+                        theme::rgba(0x6e, 0xb5, 0xff, 0.65)
+                    };
+                    scene.overlay_round_rect(mem_bx0, bar_y0, mem_bx0 + mw, bar_y0 + bar_h, 2.0, m_col, 0.0, [0.0; 4], 0);
+                }
+                rx = mem_bx0 - 10.0;
 
                 if item.gpu_pct >= 0.5 {
                     let gpu_s = format!("G:{:.0}%", item.gpu_pct);
@@ -7899,22 +9830,34 @@ fn layout_active_popover(
                     rx -= 8.0;
                 }
 
+                // Fixed-width CPU column: right-aligned % + heat-colored proportional CPU bar.
+                let cpu_col_w = 36.0f32;
                 let cpu_s = if item.is_hot {
-                    format!("🔥{:.0}%", item.cpu_pct)
+                    format!("{:.0}%", item.cpu_pct)
                 } else {
                     format!("{:.1}%", item.cpu_pct)
                 };
                 let cpu_col = if item.is_hot {
-                    theme::rgb(0xff, 0x8a, 0x4c)
-                } else if item.cpu_pct >= 5.0 {
-                    theme::rgb(0xe5, 0xc0, 0x7b)
+                    theme::rgb(0xff, 0x7c, 0x4c)
+                } else if item.cpu_pct >= 15.0 {
+                    theme::rgb(0xe8, 0xa8, 0x48)
+                } else if item.cpu_pct >= 2.0 {
+                    theme::OK
                 } else {
                     theme::INK_3
                 };
                 let cpu_w = m.measure(&cpu_s, TextFace::UiSmall);
-                rx -= cpu_w;
-                scene.overlay_ui_small(rx, ty1, &cpu_s, cpu_col, item.is_hot, false, 0);
-                rx -= 10.0;
+                scene.overlay_ui_small(rx - cpu_w, ty1, &cpu_s, cpu_col, item.is_hot, false, 0);
+                rx -= cpu_col_w + 4.0;
+                let cpu_bar_w = 30.0f32;
+                let cpu_bx0 = rx - cpu_bar_w;
+                let cpu_frac = (item.cpu_pct / 100.0).clamp(0.0, 1.0);
+                scene.overlay_round_rect(cpu_bx0, bar_y0, rx, bar_y0 + bar_h, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], 0);
+                if item.cpu_pct >= 0.5 {
+                    let cw = (cpu_bar_w * cpu_frac).max(2.5);
+                    scene.overlay_round_rect(cpu_bx0, bar_y0, cpu_bx0 + cw, bar_y0 + bar_h, 2.0, cpu_col, 0.0, [0.0; 4], 0);
+                }
+                rx = cpu_bx0 - 10.0;
 
                 if item.uptime_secs > 0 {
                     let up_s = format!("up {}", crate::sysmon_view::format_uptime(item.uptime_secs));
@@ -8423,6 +10366,104 @@ fn is_shell_name(name: &str) -> bool {
     )
 }
 
+/// Render a git branch name with subtle semantic syntax highlighting on `<prefix>/` namespaces
+/// (`feat/`, `fix/`, `perf/`, `refactor/`, `chore/`, `docs/`) so the important leaf name after
+/// the slash stands out cleanly in bright primary ink. Returns logical width consumed.
+#[allow(clippy::too_many_arguments)]
+fn draw_styled_branch_name(
+    scene: &mut Scene,
+    x: f32,
+    y: f32,
+    branch: &str,
+    live: bool,
+    overlay: bool,
+    m: CellMetrics,
+    clip_id: u32,
+) -> f32 {
+    let mut emit = |cx: f32, txt: &str, col: [f32; 4], bold: bool| {
+        if overlay {
+            scene.overlay_text_run(cx, y, txt, col, bold, false, clip_id);
+        } else {
+            scene.text(cx, y, txt, col, bold, false, clip_id);
+        }
+    };
+    if let Some(slash) = branch.rfind('/')
+        && slash > 0
+        && slash + 1 < branch.len()
+    {
+        let prefix = &branch[..slash];
+        let leaf = &branch[slash + 1..];
+        let head = prefix.split('/').next().unwrap_or(prefix);
+        let prefix_col = if !live {
+            theme::INK_4
+        } else if head.eq_ignore_ascii_case("feat") || head.eq_ignore_ascii_case("feature") {
+            theme::rgb(0x58, 0xb9, 0x80)
+        } else if head.eq_ignore_ascii_case("fix")
+            || head.eq_ignore_ascii_case("hotfix")
+            || head.eq_ignore_ascii_case("bugfix")
+        {
+            theme::rgb(0xe0, 0x75, 0x7c)
+        } else if head.eq_ignore_ascii_case("perf") || head.eq_ignore_ascii_case("bench") {
+            theme::rgb(0xe2, 0xa8, 0x52)
+        } else if head.eq_ignore_ascii_case("refactor")
+            || head.eq_ignore_ascii_case("chore")
+            || head.eq_ignore_ascii_case("ci")
+            || head.eq_ignore_ascii_case("docs")
+            || head.eq_ignore_ascii_case("test")
+        {
+            theme::rgb(0x7f, 0xa8, 0xe8)
+        } else {
+            theme::INK_3
+        };
+        let slash_col = theme::INK_4;
+        let leaf_col = if live { theme::INK_1 } else { theme::INK_3 };
+        let pw = prefix.chars().count() as f32 * m.cw;
+        let lw = leaf.chars().count() as f32 * m.cw;
+        emit(x, prefix, prefix_col, false);
+        emit(x + pw, "/", slash_col, false);
+        emit(x + pw + m.cw, leaf, leaf_col, false);
+        return pw + m.cw + lw;
+    }
+    let col = if live { theme::INK_1 } else { theme::INK_3 };
+    emit(x, branch, col, false);
+    branch.chars().count() as f32 * m.cw
+}
+
+/// Resolved icon source for a running folder process (native macOS app icon or semantic SVG badge).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProcBadgeIcon<'a> {
+    Image(&'a str),
+    Svg(&'static str),
+}
+
+fn proc_badge_icon(item: &crate::sysmon_driver::FolderProcItem) -> ProcBadgeIcon<'_> {
+    if let Some(app_ic) = item.app_icon_path.as_deref() {
+        return ProcBadgeIcon::Image(app_ic);
+    }
+    if is_shell_name(&item.name)
+        && let Some(orig_ic) = item.origin_app_icon_path.as_deref()
+    {
+        return ProcBadgeIcon::Image(orig_ic);
+    }
+    let lc = item.name.to_ascii_lowercase();
+    let svg = if lc.contains("rust") || lc.contains("cargo") || lc.contains("blaze") {
+        if lc == "blaze-shell" { "shell_dark" } else { "rust_dark" }
+    } else if lc.contains("node") || lc.contains("bun") || lc.contains("deno") {
+        "javaScript_dark"
+    } else if lc.contains("python") || lc == "pytest" || lc == "uv" {
+        "python_dark"
+    } else if lc == "go" || lc == "gopls" {
+        "go_dark"
+    } else if lc.contains("docker") || lc == "containerd" || lc == "orbstack" {
+        "docker_dark"
+    } else if lc.starts_with("swift") || lc == "sourcekit-lsp" {
+        "swiftLang_dark"
+    } else {
+        "shell_dark"
+    };
+    ProcBadgeIcon::Svg(svg)
+}
+
 fn parent_breadcrumbs(cwd: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let trimmed = cwd.trim_end_matches('/');
@@ -8434,10 +10475,18 @@ fn parent_breadcrumbs(cwd: &str) -> Vec<(String, String)> {
     for seg in trimmed.split('/').filter(|s| !s.is_empty()) {
         acc.push('/');
         acc.push_str(seg);
-        out.push((acc.clone(), acc.clone()));
+        let label = if out.is_empty() {
+            format!("/{seg}")
+        } else {
+            seg.to_owned()
+        };
+        out.push((label, acc.clone()));
     }
     if out.len() > 6 {
         out = out.split_off(out.len() - 6);
+        if let Some((first_lbl, _)) = out.first_mut() {
+            *first_lbl = format!("…/{}", first_lbl.trim_start_matches('/'));
+        }
     }
     out
 }

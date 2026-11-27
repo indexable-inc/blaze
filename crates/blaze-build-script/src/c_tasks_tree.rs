@@ -36,7 +36,7 @@
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AString, AVec, Alloc, String, Vec};
 
-use crate::c_tasks::{CStore, FORM, GuestRoot, GuestRoots, LayError, Refused, Toolchain};
+use crate::c_tasks::{Area, CStore, FORM, FileRef, GuestRoot, GuestRoots, LayError, Refused, Toolchain};
 use crate::key::HostToolKey;
 use crate::outputs::{CTreeRef, FileMode, OutFileRef, OutputsRef, Snap, StoredFile};
 
@@ -406,6 +406,7 @@ pub fn run_tree<'a, 'b>(
     trees: &[u32],
     inputs: &TreeInputs<'_>,
     runner: &mut dyn TreeRunner,
+    area: &dyn Area,
     store: &mut dyn CStore,
     alloc: Alloc<'a>,
 ) -> Result<TreeDone<'a>, TreeError<'a, 'b>> {
@@ -415,7 +416,9 @@ pub fn run_tree<'a, 'b>(
     let mut held: AVec<'_, u8> = Vec::new_in(alloc);
     if store.get(key, &mut held).map_err(|_| TreeError::Store { package })? {
         let files = decode_tree(&held, alloc).ok_or(TreeError::Damaged { package, key })?;
-        return Ok(TreeDone { key, files, ran: false, left_out: 0 });
+        if files.iter().all(|f| area.verify(FileRef { sha256: f.sha256, len: f.len }).is_some()) {
+            return Ok(TreeDone { key, files, ran: false, left_out: 0 });
+        }
     }
     let (mut files, left_out) = match runner.run(&job, outputs, key, alloc) {
         Ok(TreeRan::Made { files, left_out }) => (files, left_out),

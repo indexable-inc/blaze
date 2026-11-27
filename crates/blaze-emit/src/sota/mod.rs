@@ -48,7 +48,7 @@ pub use module::{CompiledModuleFn, ModuleFn, SotaModuleOpts, SotaModuleOut, comp
 #[cfg(test)]
 mod tests;
 
-use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, TrapRow, TrapSource, Word};
+use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, Space, TrapRow, TrapSource, Word};
 use blaze_lir::{
     Block, BlockKind, Op, Verified,
     amac::{AmacOpts, interleave_amac_loops},
@@ -74,12 +74,34 @@ use blaze_lir::{
     unroll::{rotate_loops, unroll_scalar_loops},
     unswitch::unswitch_loops,
     vectorize::{auto_vectorize_loops_with_width, vectorize_iv_div_loops},
-    verify,
+    verify_in,
 };
 use blaze_own::Alloc;
 use blaze_tier::{Arch, CallClobbers, Emitted, Machine, Names, RelocKind, Tier, TierError, TierName};
 
 use crate::{BULK_INLINE_MOST, Called, Isa, RecordEmitError, Reference, RoutinePlaces, record::emit_record_sourced};
+
+/// Explicit compilation effort profile for AArch64 `Sota` / `misel` emission (Rule 3: never a
+/// silent fallback; callers and PGO select the tier explicitly).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EmitProfile {
+    /// **Fast-tier (default for cold / unprofiled functions, `docs/v2/plan/design/bottom.md`):**
+    /// Skips all expensive LIR mid-end optimization passes (SROA/jump-threading, fixed-point
+    /// `aegraph` GVN/LICM/strength-reduction, auto-vectorization, GEMM/AMAC/SLP, unrolling,
+    /// modulo scheduling, mach-egraph, superopt, DAG scheduling, cold splitting), uses `O(V + E)`
+    /// RPO block layout (skipping Ext-TSP), skips pre-RA & post-RA `mopt` and `msched`, and runs
+    /// single-pass bitmask linear-scan `mra`.
+    ///
+    /// Preserves **100% identical runtime semantics**, AAPCS64 / `InternalFast` /
+    /// `ColdPreserveAll` ABI, IPRA `CallClobbers`, unwind frames, call/import sites, trap rows,
+    /// and source positions.
+    Fast,
+    /// **SOTA optimizing tier (for PGO-hot / loop-bearing / release-export hot functions):**
+    /// Runs the full LIR mid-end (`sota_optimize_fixpoint` + loop/vector/GEMM/SIMD/AMAC/SLP/
+    /// mach-egraph/superopt/DAG-sched/cold-split), Ext-TSP block layout, pre-RA & post-RA
+    /// `mopt` + `msched`, and full coalescing/remat/cold-exit-splitting `mra`.
+    Sota,
+}
 
 /// How `Sota` lowers direct `Op::Call` sites.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -108,6 +130,18 @@ pub struct Sota<F = Reference> {
 }
 
 impl Sota<Reference> {
+    /// Fast cold-tier standalone configuration (`EmitProfile::Fast`): skips mid-end optimization
+    /// and uses fast linear-scan codegen while keeping exact runtime semantics and ABI.
+    pub const fn fast() -> Self {
+        Self {
+            fallback: None,
+            max_rounds: 0,
+            call_mode: CallMode::GotSlot,
+            superopt: None,
+            auto_vectorize: false,
+        }
+    }
+
     /// Standalone SOTA tier (JIT `GotSlot` mode): compiles directly to fused AArch64/x86-64
     /// machine code with Memory LICM/DSE + 128-bit SIMD auto-vectorization.
     pub const fn standalone() -> Self {
@@ -146,6 +180,18 @@ impl Sota<Reference> {
 }
 
 impl<F: Tier> Sota<F> {
+    /// Full-coverage fast cold-tier configuration (`EmitProfile::Fast`) with explicit fallback
+    /// for exotic ops outside the direct emitter subset.
+    pub const fn fast_with_fallback(fallback: F) -> Self {
+        Self {
+            fallback: Some(fallback),
+            max_rounds: 0,
+            call_mode: CallMode::GotSlot,
+            superopt: None,
+            auto_vectorize: false,
+        }
+    }
+
     /// Full-coverage SOTA tier: runs `sota_optimize_fixpoint` + Memory LICM/DSE + SIMD vectorization
     /// on every function, emits fused AArch64/x86-64 directly whenever possible, and delegates exotic
     /// ops (already optimized!) to `fallback`.
@@ -229,7 +275,7 @@ fn run_sroa_thread_cleanup<'a>(
     if let Ok(Some(rpo)) = reorder_blocks_rpo(v, alloc) {
         cur = Some(rpo.func);
     }
-    cur.filter(|f| verify(f.view()).is_ok())
+    cur.filter(|f| verify_in(f.view(), alloc).is_ok())
 }
 
 /// Shared Stage 1a–1g loop, vectorization, dispatch tail-duplication, superoptimization,
@@ -648,26 +694,48 @@ impl<F: Tier> Tier for Sota<F> {
         machine: Machine,
         alloc: Alloc<'a>,
     ) -> Result<Emitted<'a>, TierError> {
-        let final_func = optimize_sota_midend(
-            func.view(),
-            machine,
-            self.max_rounds,
-            self.auto_vectorize,
-            self.superopt,
-            alloc,
-        )?;
-        let opt_verified = verify(final_func.view()).map_err(|_| TierError::Refused {
-            tier: Self::NAME,
-            inst: None,
-            what: "SOTA optimized LIR failed verify",
-        })?;
+        let fast_mode = self.max_rounds == 0 && !self.auto_vectorize && self.superopt.is_none();
+        let opt_owned;
+        let opt_verified = if fast_mode {
+            func
+        } else {
+            opt_owned = optimize_sota_midend(
+                func.view(),
+                machine,
+                self.max_rounds,
+                self.auto_vectorize,
+                self.superopt,
+                alloc,
+            )?;
+            verify_in(opt_owned.view(), alloc).map_err(|_| TierError::Refused {
+                tier: Self::NAME,
+                inst: None,
+                what: "SOTA optimized LIR failed verify",
+            })?
+        };
 
-        // Stage 2 + 3: Loop-weighted Chordal-SSA regalloc + ISLE-style fused AArch64 or x86-64 emission
-        // using all enabled target-CPU hardware intrinsics (`LSE`/`CSSC` on AArch64; `BMI2`/`FMA`/`AVX2` on x86-64).
+        // Stage 2 + 3: Register allocation + AArch64 or x86-64 emission using all enabled
+        // target-CPU hardware intrinsics (`LSE`/`CSSC` on AArch64; `BMI2`/`FMA`/`AVX2` on x86-64).
         let emit_res = match machine.arch {
             Arch::Arm64 => {
                 let is_macos = machine.os == blaze_tier::Os::MacOs;
-                isel::emit_sota_a64(opt_verified.view(), names, self.call_mode, machine.features, is_macos, alloc)
+                if fast_mode {
+                    isel::emit_sota_a64_with_abi_profile(
+                        opt_verified.view(),
+                        names,
+                        self.call_mode,
+                        machine.features,
+                        is_macos,
+                        |_| CallClobbers::C_ABI_ARM64,
+                        None,
+                        false,
+                        true,
+                        alloc,
+                    )
+                    .map(|(emitted, _)| emitted)
+                } else {
+                    isel::emit_sota_a64(opt_verified.view(), names, self.call_mode, machine.features, is_macos, alloc)
+                }
             }
             Arch::X86_64 => {
                 x86_64::emit_sota_x64(opt_verified.view(), names, self.call_mode, machine.features, alloc)
@@ -721,11 +789,13 @@ fn emitted_to_code_record<'a>(
     let mut target_remap: blaze_own::Vec<u32, Alloc<'a>> =
         blaze_own::Vec::with_capacity_in(emitted.targets.len(), alloc);
     for t in emitted.targets.iter() {
-        if let Some(&(_, start, len)) = emitted.names.iter().find(|(sym, _, _)| *sym == t.symbol) {
+        if t.space.is_outside() {
+            let &(_, start, len) = emitted.names.iter().find(|(sym, _, _)| *sym == t.symbol)?;
             let start_idx = usize::try_from(start).ok()?;
             let end_idx = usize::try_from(start.checked_add(len)?).ok()?;
             let s = core::str::from_utf8(emitted.text.get(start_idx..end_idx)?).ok()?;
-            target_remap.push(rec.outside(s));
+            let idx = if t.space == Space::WeakOutside { rec.weak_outside(s) } else { rec.outside(s) };
+            target_remap.push(idx);
         } else {
             let idx = u32::try_from(rec.targets.len()).ok()?;
             rec.targets.push(*t);
@@ -816,9 +886,14 @@ impl ScratchOrder {
 pub struct SotaRecordAbiOpts<'a> {
     /// Target host machine architecture, OS, and ISA feature flags.
     pub machine: Machine,
-    /// 2-tier hot/cold classification: hot bodies run bounded AArch64 e-graph superoptimization
-    /// (`SuperoptOpts::apple_silicon()`) with 3 fixed-point rounds; cold 0-loop straight-line
-    /// bodies skip `superopt_a64` and use 2 fixed-point rounds.
+    /// 2-tier hot/cold classification:
+    /// - `true` ([`EmitProfile::Sota`]): runs the full LIR mid-end (`sota_optimize_fixpoint` +
+    ///   loop/vector/GEMM/AMAC/SLP/mach-egraph/superopt/DAG-sched/cold-split), Ext-TSP block
+    ///   layout, pre/post-RA `mopt` + `msched`, and full coalescing `mra`.
+    /// - `false` ([`EmitProfile::Fast`]): skips all LIR mid-end optimization passes, uses
+    ///   `O(V + E)` RPO block layout, skips `mopt` + `msched`, and runs single-pass bitmask
+    ///   linear-scan `mra` while keeping identical runtime semantics, ABI, unwind frames, traps,
+    ///   and IPRA `CallClobbers`.
     pub is_hot: bool,
     /// Optional interprocedural caller-avoidance register allocation order.
     pub scratch_order: Option<ScratchOrder>,
@@ -839,8 +914,8 @@ pub struct SotaRecordAbiOpts<'a> {
 }
 
 impl SotaRecordAbiOpts<'static> {
-    /// Conservative hot defaults matching [`emit_sota_record_for_machine`]: C ABI clobbers,
-    /// default scratch order, no `ColdPreserveAll`, full hot superopt tier.
+    /// Full optimizing SOTA defaults matching [`emit_sota_record_for_machine`]: C ABI clobbers,
+    /// default scratch order, no `ColdPreserveAll`, full hot SOTA tier (`EmitProfile::Sota`).
     pub const fn for_machine(machine: Machine) -> Self {
         Self {
             machine,
@@ -851,6 +926,28 @@ impl SotaRecordAbiOpts<'static> {
             internal_fast: false,
             internal_fast_callees: &[],
         }
+    }
+
+    /// Fast cold/unprofiled defaults (`EmitProfile::Fast`): C ABI clobbers, default scratch order,
+    /// no `ColdPreserveAll`, skipping mid-end SOTA passes + `mopt`/`msched` + Ext-TSP.
+    pub const fn for_machine_fast(machine: Machine) -> Self {
+        Self {
+            machine,
+            is_hot: false,
+            scratch_order: None,
+            preserve_all_cold: false,
+            callee_clobbers: &[],
+            internal_fast: false,
+            internal_fast_callees: &[],
+        }
+    }
+}
+
+impl SotaRecordAbiOpts<'_> {
+    /// Returns the explicit [`EmitProfile`] selected by `self.is_hot`.
+    #[inline]
+    pub const fn emit_profile(&self) -> EmitProfile {
+        if self.is_hot { EmitProfile::Sota } else { EmitProfile::Fast }
     }
 }
 
@@ -886,6 +983,7 @@ pub fn can_use_internal_fast_a64(
             call_clobbers: &[],
             internal_fast: role == InternalFastRole::Callee,
             internal_fast_calls: &[],
+            fast_mode: false,
         },
     )
     .is_ok()
@@ -1003,6 +1101,7 @@ fn misel_subset_ok(
             call_clobbers: &[],
             internal_fast: opts.internal_fast,
             internal_fast_calls: fast_calls,
+            fast_mode: false,
         },
     )
     .is_ok()
@@ -1027,14 +1126,17 @@ fn map_internal_fast_tier_err(err: TierError) -> RecordEmitError {
     }
 }
 
-/// Explicit-`Machine` + Zero-ABI / IPRA / 2-tier hot-cold AArch64 optimizing record emitter for
-/// `blaze export` (and [`emit_sota_record_for_machine`]): runs SROA + fixed-point Aegraph/
-/// Reassociation/Strength-Reduction/LICM/DCE + SOTA loop/vector/GEMM/mach-egraph passes (gating
-/// multi-round `superopt_a64` and fixed-point rounds on `opts.is_hot`), emits native fused AArch64
-/// `Sota` code via `misel` / `isel::emit_sota_a64_with_abi` with interprocedural `ScratchOrder`,
-/// `InternalFast`, `ColdPreserveAll` (guarded strictly to non-unwinding/leaf bodies), and bottom-up
-/// IPRA `callee_clobbers`, and returns the emitted function's exact [`CallClobbers`] summary
-/// alongside `(CodeRecord, insts, Called)`.
+/// Explicit-`Machine` + Zero-ABI / IPRA / 2-tier hot-cold AArch64 record emitter:
+/// - Under [`EmitProfile::Fast`] (`!opts.is_hot`, or mega-functions past the mid-end bound):
+///   skips all LIR mid-end SOTA passes (SROA/jump-threading, `aegraph` GVN/LICM/strength
+///   reduction, auto-vectorization, GEMM/AMAC/SLP, unrolling, modulo scheduling, mach-egraph,
+///   superopt, DAG scheduling, cold splitting) and emits directly through `misel` / `isel` in
+///   fast mode (`O(V + E)` RPO layout, zero `mopt`/`msched`, single-pass bitmask `mra`).
+/// - Under [`EmitProfile::Sota`] (`opts.is_hot` below the mega-function bound): runs the full
+///   SOTA LIR mid-end + full `misel` / `isel` backend (`mopt`, `msched`, coalescing `mra`).
+///
+/// Both profiles preserve 100% identical runtime semantics, AAPCS64 / `InternalFast` /
+/// `ColdPreserveAll` ABI, IPRA `CallClobbers`, unwind frames, import sites, and trap rows.
 pub fn emit_sota_record_for_machine_with_abi<'a>(
     func: Verified<'_>,
     names: &dyn Names,
@@ -1051,37 +1153,55 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
             blaze_tier::Os::Linux => crate::Os::Linux,
         },
     };
-    let max_rounds = if opts.is_hot { 3 } else { 2 };
-    let superopt = if opts.is_hot { Some(SuperoptOpts::apple_silicon()) } else { None };
 
-    let scalarized_mem = scalarize_small_memops(func.view(), alloc).ok().flatten();
+    // Mega-function mid-end bound (rule 18, matching `value_info::MAX_BLOCKS` and
+    // `layout::EXACT_LOOP_MAX_BLOCKS`): above this size (e.g. generated `cranelift-isle` decision
+    // trees or huge functions with 10k+ blocks), use `EmitProfile::Fast` so compilation stays
+    // strictly linear end-to-end.
+    const SOTA_MIDEND_MAX_BLOCKS: usize = 4096;
+    const SOTA_MIDEND_MAX_INSTS: usize = 65_536;
+    let is_mega_fn =
+        func.view().blocks() > SOTA_MIDEND_MAX_BLOCKS || func.view().len() > SOTA_MIDEND_MAX_INSTS;
+    let effective_profile = if is_mega_fn { EmitProfile::Fast } else { opts.emit_profile() };
+    let fast_mode = effective_profile == EmitProfile::Fast;
+
+    let run_midend = !fast_mode;
+    let max_rounds = 3;
+    let superopt = Some(SuperoptOpts::apple_silicon());
+
+    let scalarized_mem =
+        run_midend.then(|| scalarize_small_memops(func.view(), alloc).ok().flatten()).flatten();
     let stage0_in = scalarized_mem.as_ref().map_or(func.view(), |f| f.view());
-    let pre_clean = run_sroa_thread_cleanup(stage0_in, alloc);
+    let pre_clean = run_midend.then(|| run_sroa_thread_cleanup(stage0_in, alloc)).flatten();
     let mid_in = match &pre_clean {
         Some(f) => f.view(),
         None => stage0_in,
     };
-    let sota_opt = sota_optimize_fixpoint(mid_in, RegBudget::AARCH64, max_rounds, |_| 1, alloc).ok();
-    let chosen_opt = sota_opt.as_ref().and_then(|res| verify(res.func.view()).ok());
+    let sota_opt = run_midend
+        .then(|| sota_optimize_fixpoint(mid_in, RegBudget::AARCH64, max_rounds, |_| 1, alloc).ok())
+        .flatten();
+    let chosen_opt = sota_opt.as_ref().and_then(|res| verify_in(res.func.view(), alloc).ok());
     let has_fast_abi_req = opts.internal_fast
         || !collect_misel_fast_calls(func.view(), opts.internal_fast_callees, alloc).is_empty();
 
-    if let Some(opt_v) = chosen_opt.or_else(|| has_fast_abi_req.then_some(func)) {
-        let late_func = run_sota_loop_and_late_passes(
-            opt_v.view(),
-            machine,
-            RegBudget::AARCH64,
-            true,
-            superopt,
-            alloc,
-        );
-        let full_v = match verify(late_func.view()) {
-            Ok(v) => v,
-            Err(_) => opt_v,
+    if let Some(opt_v) = chosen_opt.or_else(|| (has_fast_abi_req || fast_mode).then_some(func)) {
+        let late_func = run_midend.then(|| {
+            run_sota_loop_and_late_passes(
+                opt_v.view(),
+                machine,
+                RegBudget::AARCH64,
+                true,
+                superopt,
+                alloc,
+            )
+        });
+        let full_v = match late_func.as_ref().map(|f| verify_in(f.view(), alloc)) {
+            Some(Ok(v)) => v,
+            _ => opt_v,
         };
         let is_macos = machine.os == blaze_tier::Os::MacOs;
         let initial_fast_calls = collect_misel_fast_calls(full_v.view(), opts.internal_fast_callees, alloc);
-        let need_misel_retry = opts.internal_fast || !initial_fast_calls.is_empty();
+        let need_misel_retry = run_midend && (opts.internal_fast || !initial_fast_calls.is_empty());
         let late_no_vec: Option<blaze_lir::Func<Alloc<'a>>>;
         let emit_v: Verified<'_> = if need_misel_retry
             && !misel_subset_ok(full_v.view(), names, opts, initial_fast_calls.as_slice())
@@ -1098,7 +1218,7 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
                 superopt,
                 alloc,
             ));
-            if let Some(nv) = late_no_vec.as_ref().and_then(|f| verify(f.view()).ok())
+            if let Some(nv) = late_no_vec.as_ref().and_then(|f| verify_in(f.view(), alloc).ok())
                 && {
                     let nv_fast = collect_misel_fast_calls(nv.view(), opts.internal_fast_callees, alloc);
                     misel_subset_ok(nv.view(), names, opts, nv_fast.as_slice())
@@ -1124,8 +1244,8 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
         let lookup_clobbers = |inst: usize| -> Option<CallClobbers> {
             lookup_direct_callee_clobbers(full_view, inst, opts.callee_clobbers)
         };
-        // Primary V3 SOTA AArch64 pure-SSA `MFunc` pipeline (`misel -> mopt -> msched -> mra ->
-        // prologue/epilogue -> mopt -> msched -> mencode`).
+        // Primary V3 AArch64 pure-SSA `MFunc` pipeline (`fast_mode` skips Ext-TSP, `mopt`,
+        // `msched`, and multi-pass coalescing; SOTA runs the full backend optimization stack).
         let mut misel_call_clobs: blaze_own::Vec<(u32, CallClobbers), Alloc<'a>> =
             blaze_own::Vec::new_in(alloc);
         if !opts.callee_clobbers.is_empty() {
@@ -1150,6 +1270,7 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
                 call_clobbers: misel_call_clobs.as_slice(),
                 internal_fast: opts.internal_fast,
                 internal_fast_calls: misel_fast_calls.as_slice(),
+                fast_mode,
             },
             alloc,
         )
@@ -1157,7 +1278,7 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
         let emit_result = match misel_result {
             Ok(pair) => Ok(pair),
             Err(err) if must_use_misel => return Err(map_internal_fast_tier_err(err)),
-            Err(_) => isel::emit_sota_a64_with_abi(
+            Err(_) => isel::emit_sota_a64_with_abi_profile(
                 full_view,
                 names,
                 CallMode::GotSlot,
@@ -1166,6 +1287,7 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
                 |inst| lookup_clobbers(inst).unwrap_or(CallClobbers::C_ABI_ARM64),
                 ra_order.as_ref(),
                 effective_preserve_all_cold,
+                fast_mode,
                 alloc,
             ),
         };
@@ -1203,7 +1325,8 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
         // `emit_record_sourced` indexes `form.unreachables` by `TrapSource::ordinal`; if `opt_v`
         // changed the `Op::Unreachable` count while traps are present, delegate `func` so ordinals
         // stay intact on the baseline path.
-        let fallback_v = if traps.is_empty()
+        let fallback_v = if fast_mode
+            || traps.is_empty()
             || opt_v.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count()
                 == func.view().ops.iter().filter(|&&op| Op::from_byte(op) == Some(Op::Unreachable)).count()
         {
@@ -1220,9 +1343,33 @@ pub fn emit_sota_record_for_machine_with_abi<'a>(
     Ok((rec, insts, called, CallClobbers::C_ABI_ARM64))
 }
 
-/// Explicit-`Machine` AArch64 optimizing record emitter for `blaze run`, `blaze test`, and
-/// `blaze export`: delegates to [`emit_sota_record_for_machine_with_abi`] with conservative hot
-/// defaults (`is_hot: true`, C ABI clobbers, default scratch order, no `ColdPreserveAll`).
+/// Explicit-`Machine` + explicit-[`EmitProfile`] AArch64 code record emitter.
+pub fn emit_sota_record_with_profile<'a>(
+    func: Verified<'_>,
+    names: &dyn Names,
+    routines: &RoutinePlaces,
+    machine: Machine,
+    profile: EmitProfile,
+    traps: &[TrapSource],
+    alloc: Alloc<'a>,
+) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
+    let opts = match profile {
+        EmitProfile::Fast => SotaRecordAbiOpts::for_machine_fast(machine),
+        EmitProfile::Sota => SotaRecordAbiOpts::for_machine(machine),
+    };
+    let (rec, insts, called, _clobbers) = emit_sota_record_for_machine_with_abi(
+        func,
+        names,
+        routines,
+        opts,
+        traps,
+        alloc,
+    )?;
+    Ok((rec, insts, called))
+}
+
+/// Explicit-`Machine` AArch64 optimizing record emitter for `blaze export`: delegates to
+/// [`emit_sota_record_with_profile`] with [`EmitProfile::Sota`].
 pub fn emit_sota_record_for_machine<'a>(
     func: Verified<'_>,
     names: &dyn Names,
@@ -1231,21 +1378,13 @@ pub fn emit_sota_record_for_machine<'a>(
     traps: &[TrapSource],
     alloc: Alloc<'a>,
 ) -> Result<(CodeRecord<'a>, u32, Called), RecordEmitError> {
-    let (rec, insts, called, _clobbers) = emit_sota_record_for_machine_with_abi(
-        func,
-        names,
-        routines,
-        SotaRecordAbiOpts::for_machine(machine),
-        traps,
-        alloc,
-    )?;
-    Ok((rec, insts, called))
+    emit_sota_record_with_profile(func, names, routines, machine, EmitProfile::Sota, traps, alloc)
 }
 
-/// Default AArch64 optimizing record emitter for `blaze-ladder` (`blaze run` / `blaze test`):
-/// derives the target [`Machine`] from `isa` (enabling `Machine::LSE` when advertised and
-/// `Machine::DOTPROD | Machine::CRC32` on Apple Silicon macOS) and delegates to
-/// [`emit_sota_record_for_machine`].
+/// Default AArch64 cold/unprofiled record emitter for `blaze-ladder` (`blaze build` / `blaze run` /
+/// `blaze test`): derives the target [`Machine`] from `isa` and emits via [`EmitProfile::Fast`]
+/// (per `docs/v2/plan/design/bottom.md`, "Tiers": first code is fast-tier; PGO-hot and release
+/// export functions explicitly opt into [`EmitProfile::Sota`]).
 pub fn emit_sota_record_measured<'a>(
     func: Verified<'_>,
     names: &dyn Names,
@@ -1261,5 +1400,5 @@ pub fn emit_sota_record_measured<'a>(
         crate::Os::Linux => blaze_tier::Os::Linux,
     };
     let machine = Machine { arch: Arch::Arm64, os, features };
-    emit_sota_record_for_machine(func, names, routines, machine, traps, alloc)
+    emit_sota_record_with_profile(func, names, routines, machine, EmitProfile::Fast, traps, alloc)
 }

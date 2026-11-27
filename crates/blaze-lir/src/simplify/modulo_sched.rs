@@ -1841,7 +1841,7 @@ fn pipeline_one_loop<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     let stats = ModuloSchedStats {
         loops_pipelined: 1,
         loads_hoisted: to_u32(plan.stage0_loads.len()),

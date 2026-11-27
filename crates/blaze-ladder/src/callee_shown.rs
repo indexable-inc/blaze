@@ -235,6 +235,9 @@ pub fn args_shown(v: PTys<'_>, args: List, name: &dyn Fn(ItemKey) -> Option<Box<
             PNode::Char => out.push_str("char"),
             PNode::Str => out.push_str("str"),
             PNode::Never => out.push('!'),
+            PNode::Foreign(k) if k == crate::front2::poly_canon::OPAQUE_THIN_FOREIGN_KEY => {
+                out.push_str("poly::OpaqueThin");
+            }
             // Every other form (an integer or float type, a pointer to a fn, a `dyn`, a
             // pattern type, a projection, a constant) by the table's own words for it.
             other => {

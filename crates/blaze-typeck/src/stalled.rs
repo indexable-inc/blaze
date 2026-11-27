@@ -31,7 +31,7 @@ use crate::columns::Checked;
 use crate::diag::{Diag, PendingWhyStep, UnmetGoal, Why, WhyDef, WhyReached, WhyStep};
 use crate::error::{CheckError, Limit, Malformed, Stop};
 use crate::ids::{ExprId, ItemKey};
-use crate::infer::InferCtx;
+use crate::infer::{InferCtx, InferCtxIn};
 use crate::instance::{Asked, ClosureSource, Keep, NoClosures, export_list_as, import, import_list};
 use crate::portable::{PNode, PTy, PTys, PortableTys};
 use crate::ty::{Cause, FulfillErrorKind, Goal, Obligation, Ty, TyView, TypeCtx};
@@ -153,7 +153,7 @@ pub fn decide_stalled_listed<'a, W: World>(
     world: &W,
     alloc: Alloc<'a>,
 ) -> Result<(Vec<Diag, Alloc<'a>>, ReadList<'a>), StalledError> {
-    checked.decide_rows(body, types, exact, None, world, alloc, |_, _, _| {})
+    checked.decide_rows(body, types, exact, None, world, alloc, alloc, |_, _, _| {})
 }
 
 /// What [`Checked::decide_stalled_with_storage`] decided: the findings, the read list, and each
@@ -183,22 +183,34 @@ impl Checked<'_> {
         &self, body: &BodyView<'_>, types: &'a PortableTys<'a>, exact: &[(ExprId, PTy)],
         world: &W, alloc: Alloc<'a>, failed_field: impl FnMut(Diag, ExprId, PTy),
     ) -> Result<StalledDecision<'a>, StalledError> {
-        let mut table = PortableTys::over(types, alloc)?;
-        let mut why = Vec::new_in(alloc);
+        self.decide_stalled_with_storage_in(body, types, exact, world, alloc, alloc, failed_field)
+    }
+
+    /// As [`Self::decide_stalled_with_storage`], placing the per-round `InferCtx`, `Reads` and
+    /// witness-walk scratch in `scratch` while allocating only the final [`StalledDecision`] in
+    /// `out_alloc`, so retry rounds (`Need`, `OpaqueHiddenUnknown`) reclaim 100% of their solver
+    /// memory when `scratch` resets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_stalled_with_storage_in<'a, 's, W: World>(
+        &self, body: &BodyView<'_>, types: &'a PortableTys<'a>, exact: &[(ExprId, PTy)],
+        world: &W, scratch: Alloc<'s>, out_alloc: Alloc<'a>, failed_field: impl FnMut(Diag, ExprId, PTy),
+    ) -> Result<StalledDecision<'a>, StalledError> {
+        let mut table = PortableTys::over(types, out_alloc)?;
+        let mut why = Vec::new_in(out_alloc);
         let chains = Chains { table: &mut table, why: &mut why };
-        let (found, reads) = self.decide_rows(body, types.view(), exact, Some(chains), world, alloc, failed_field)?;
+        let (found, reads) = self.decide_rows(body, types.view(), exact, Some(chains), world, scratch, out_alloc, failed_field)?;
         Ok(StalledDecision { found, reads, why, types: table })
     }
 
     /// The decision, with the findings' chains into `chains` when given.
     #[allow(clippy::too_many_arguments)]
-    fn decide_rows<'a, W: World>(
+    fn decide_rows<'a, 's, W: World>(
         &self, body: &BodyView<'_>, types: PTys<'_>, exact: &[(ExprId, PTy)], chains: Option<Chains<'_, '_, 'a>>,
-        world: &W, alloc: Alloc<'a>, mut failed_field: impl FnMut(Diag, ExprId, PTy),
+        world: &W, scratch: Alloc<'s>, out_alloc: Alloc<'a>, mut failed_field: impl FnMut(Diag, ExprId, PTy),
     ) -> Result<(Vec<Diag, Alloc<'a>>, ReadList<'a>), StalledError> {
-        let mut reads = Reads::new_in(world, alloc);
-        let mut fields = Vec::new_in(alloc);
-        let result = decide(body, self, types, exact, &mut reads, alloc, &mut fields, chains);
+        let mut reads = Reads::new_in(world, scratch);
+        let mut fields = Vec::new_in(scratch);
+        let result = decide(body, self, types, exact, &mut reads, scratch, out_alloc, &mut fields, chains);
         // Reads supplies stand-ins while a round runs. Its first missing answer
         // takes precedence over *every* decision made from those stand-ins.
         if let Some(question) = reads.first_hole() {
@@ -208,7 +220,7 @@ impl Checked<'_> {
         for (diag, block, field) in fields {
             failed_field(diag, block, field);
         }
-        Ok((found, reads.finish(alloc).0))
+        Ok((found, reads.finish(out_alloc).0))
     }
 }
 
@@ -220,12 +232,12 @@ struct Chains<'c, 't, 'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decide<'a, W: World>(
+fn decide<'a, 's, W: World>(
     body: &BodyView<'_>, checked: &Checked<'_>, types: PTys<'_>, exact: &[(ExprId, PTy)],
-    reads: &mut Reads<'_, '_, W>, alloc: Alloc<'a>, fields: &mut Vec<(Diag, ExprId, PTy), Alloc<'a>>,
+    reads: &mut Reads<'_, '_, W>, alloc: Alloc<'s>, out_alloc: Alloc<'a>, fields: &mut Vec<(Diag, ExprId, PTy), Alloc<'s>>,
     mut chains: Option<Chains<'_, '_, 'a>>,
 ) -> Result<Vec<Diag, Alloc<'a>>, StalledError> {
-    let mut out: Vec<Diag, Alloc<'a>> = Vec::new_in(alloc);
+    let mut out: Vec<Diag, Alloc<'a>> = Vec::new_in(out_alloc);
     if checked.stalled.is_empty() {
         return Ok(out);
     }
@@ -636,7 +648,7 @@ struct Exact<'s, 'r, 'w, 'a, 'b, 'c, 'p, W: World> {
 impl<W: World> ClosureSource for Exact<'_, '_, '_, '_, '_, '_, '_, W> {
     type Error = StalledError;
 
-    fn closure_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, StalledError> {
+    fn closure_of(&mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, StalledError> {
         if owner != self.body.owner {
             return self.asked.closure_of(cx, owner, ordinal, args, depth).map_err(Into::into);
         }
@@ -673,7 +685,7 @@ impl<W: World> ClosureSource for Exact<'_, '_, '_, '_, '_, '_, '_, W> {
         Ok(cx.imported_closure(owner, ordinal, args, sig, kind, upvars)?)
     }
 
-    fn future_of(&mut self, cx: &mut InferCtx<'_>, types: PTys<'_>, e: ExprId, output: PTy, stored: PTy, subst: &[Ty], depth: u32) -> Result<Ty, StalledError> {
+    fn future_of(&mut self, cx: &mut InferCtxIn<'_, '_>, types: PTys<'_>, e: ExprId, output: PTy, stored: PTy, subst: &[Ty], depth: u32) -> Result<Ty, StalledError> {
         let interior = self.exact.interior(e, stored, self.body.expr_range(e))?;
         let o = import(cx, self, types, output, subst, depth)?;
         let interior_types = self.types;
@@ -690,7 +702,7 @@ impl<W: World> ClosureSource for Exact<'_, '_, '_, '_, '_, '_, '_, W> {
     /// row and on the stored field `decide` blames). Nested coroutines inside it are read
     /// exact only, through the world ([`Asked`]). The record is read through `Reads`, so its
     /// digest, superset tag included, is in this body's read list (rule 21).
-    fn coroutine_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, StalledError> {
+    fn coroutine_of(&mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, StalledError> {
         let q = Question::Coroutine(owner, ordinal);
         let facts = self.asked.reads.coroutine_record(owner, ordinal)?.ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
         let n = cx.list_len(args);

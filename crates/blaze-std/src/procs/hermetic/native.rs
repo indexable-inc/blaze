@@ -59,9 +59,13 @@ pub(super) fn streams_of(spec: &HermeticSpec<'_>) -> Streams {
 /// The run spec every backend starts with: its own group (one kill reaches what it starts) and
 /// the strongest end at this process's death.
 pub(super) fn run_spec<'r>(program: &'r str, args: &'r [&'r str], start: &'r StartView<'r>, streams: Streams) -> RunSpec<'r> {
+    #[cfg(target_os = "linux")]
+    let arg0 = start.spec.arg0();
+    #[cfg(not(target_os = "linux"))]
+    let arg0 = None;
     RunSpec {
         program,
-        arg0: None,
+        arg0,
         args,
         env: start.env,
         dir: start.spec.cwd(),

@@ -199,7 +199,12 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 40: ADT `field_regions` lay `PNode::Alias` fields in pre-order again; normalized alias fields
 /// are guarded per body in `borrows.rs` (`suppressed_alias_fields`). Same format, new content for
 /// the same key (rule 21).
-pub const VERSION: u32 = 40;
+/// 41: ADTs carry per-field visibility bytes (`AdtRow::field_vis`) so `World::member_visible`
+/// checks struct/union field visibility during field-access autoderef.
+/// 42: `FnHead::cost` carries opt-in `#[blaze::cost(..)]` complexity contracts.
+/// 43: `AdtRow` carries `capability` (`#[blaze::capability]`) and `sans_io` (`#![blaze::sans_io]`
+/// scope) flags after `args`.
+pub const VERSION: u32 = 43;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -1321,6 +1326,7 @@ fn encode_into_scratch<'b>(
             o.flag(head.has_body);
             o.flag(head.c_variadic);
             o.byte(head.qualifiers.byte());
+            o.body.extend_from_slice(&head.cost.bits().to_le_bytes());
             o.count(head.legacy_const_generics.len(), "a fn's legacy const generic positions")?;
             for &k in &head.legacy_const_generics {
                 o.u32(k);
@@ -1374,6 +1380,10 @@ fn encode_into_scratch<'b>(
                 o.name(f.name);
                 o.ty(f.ty)?;
             }
+            o.count(row.field_vis.len(), "an ADT's field visibilities")?;
+            for &vis in &row.field_vis {
+                o.byte(vis.byte());
+            }
             o.repr(row.repr);
             o.opt(row.valid.start, |o, s| {
                 o.body.extend_from_slice(&s.to_le_bytes());
@@ -1384,6 +1394,8 @@ fn encode_into_scratch<'b>(
                 Ok(())
             })?;
             o.flag(row.args);
+            o.flag(row.capability);
+            o.flag(row.sans_io);
             o.coherence_marks(row.marks);
             o.u32(row.lifetimes);
             o.field_regions(row)?;
@@ -3477,6 +3489,8 @@ impl<'r> In<'r, '_, '_, '_> {
         let c_variadic = self.flag("a fn's C-variadic flag")?;
         let byte = self.u8("a fn's qualifiers")?;
         let qualifiers = super::heads::FnQualifiers::from_byte(byte).ok_or(E::Byte { what: "a fn's qualifiers", byte })?;
+        let cost_bits = u16::from_le_bytes(self.array("a fn's cost contract")?);
+        let cost = tc::CostContract::from_bits(cost_bits).ok_or(E::Shape { what: "a fn's cost contract" })?;
         let legacy_const_generics = self.own("a fn's legacy const generic positions", |r| r.u32("a legacy const generic position"))?;
         let module = self.lib("a fn's module")?;
         let (params, consts, bounds, self_) = self.scope_own()?;
@@ -3496,6 +3510,7 @@ impl<'r> In<'r, '_, '_, '_> {
                 header,
                 c_variadic,
                 qualifiers,
+                cost,
                 legacy_const_generics,
                 inputs,
                 output,
@@ -3554,12 +3569,18 @@ impl<'r> In<'r, '_, '_, '_> {
             Ok(tc::Variant { key, name, ctor, fields: List { start, len } })
         })?;
         let fields = self.own("an ADT's fields", |r| Ok(tc::Field { name: r.name("a field's name")?, ty: r.ty("a field's type")? }))?;
+        let field_vis = self.own("an ADT's field visibilities", |r| {
+            let byte = r.u8("an ADT's field visibility")?;
+            MemberVis::of_byte(byte).ok_or(E::Byte { what: "an ADT's field visibility", byte })
+        })?;
         let repr = self.repr()?;
         let valid = blaze_build::layout::ValidRange {
             start: self.opt("an ADT's valid range start", |r| r.u128("a valid range start"))?,
             end: self.opt("an ADT's valid range end", |r| r.u128("a valid range end"))?,
         };
         let args = self.flag("an ADT's `#[blaze::args]` mark")?;
+        let capability = self.flag("an ADT's `#[blaze::capability]` mark")?;
+        let sans_io = self.flag("an ADT's `#![blaze::sans_io]` scope mark")?;
         let marks = self.coherence_marks()?;
         let lifetimes = self.u32("an ADT's declared lifetime arity")?;
         let mut field_region_at = Vec::with_capacity_in(fields.len(), self.alloc);
@@ -3599,7 +3620,10 @@ impl<'r> In<'r, '_, '_, '_> {
         })?;
         let fieldless = self.opt("a fieldless enum's variant count", |r| r.u32("a fieldless enum's variant count"))?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.alloc);
-        let row = AdtRow { kind, generics, variants, fields, repr, valid, discrs, args, marks, lifetimes, field_regions };
+        let row = AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, capability, sans_io, marks, lifetimes, field_regions };
+        if row.field_vis.len() != row.fields.len() {
+            return Err(E::Shape { what: "an ADT's field visibilities are not one per field" });
+        }
         for v in &row.variants {
             let end = v.fields.start.checked_add(v.fields.len);
             if end.and_then(|e| usize::try_from(e).ok()).is_none_or(|e| e > row.fields.len()) {
@@ -3913,6 +3937,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(h1.has_body == h2.has_body, "a fn's body flag");
             need!(h1.c_variadic == h2.c_variadic, "a fn's C-variadic flag");
             need!(h1.qualifiers == h2.qualifiers, "a fn's typing attributes, const qualifier and std-internal binding");
+            need!(h1.cost == h2.cost, "a fn's cost contract");
             need!(h1.legacy_const_generics[..] == h2.legacy_const_generics[..], "a fn's legacy const generic positions");
             need!(h1.module == h2.module, "a fn's module");
             need!(h1.params[..] == h2.params[..], "a fn's parameters in scope");
@@ -3939,8 +3964,11 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(r1.kind == r2.kind && r1.generics == r2.generics, "an ADT's kind or generics");
             need!(r1.variants[..] == r2.variants[..], "an ADT's variants");
             need!(r1.fields[..] == r2.fields[..], "an ADT's fields");
+            need!(r1.field_vis[..] == r2.field_vis[..], "an ADT's field visibilities");
             need!(r1.repr == r2.repr && r1.valid == r2.valid, "an ADT's repr");
             need!(r1.args == r2.args, "an ADT's `#[blaze::args]` mark");
+            need!(r1.capability == r2.capability, "an ADT's `#[blaze::capability]` mark");
+            need!(r1.sans_io == r2.sans_io, "an ADT's `#![blaze::sans_io]` scope mark");
             need!(r1.marks == r2.marks, "an ADT's coherence marks");
             need!(r1.lifetimes == r2.lifetimes, "an ADT's declared lifetime arity");
             need!(r1.field_regions.at[..] == r2.field_regions.at[..] && r1.field_regions.list[..] == r2.field_regions.list[..], "an ADT's field region positions");
@@ -4177,6 +4205,24 @@ impl FiledRegions {
     /// under one of its columns counts by these, never by what the store has made since.
     pub fn arity(&self) -> &dyn Arity {
         &self.parts.arity
+    }
+}
+
+impl blaze_typeck::region_facts::HeadRegionRead for FiledRegions {
+    fn arity(&self) -> &dyn Arity {
+        FiledRegions::arity(self)
+    }
+
+    fn impl_header(&self) -> Option<(ColView<'_>, Option<ColView<'_>>)> {
+        self.regions().impl_header.as_ref().map(|(s, t)| (ColView::of(s), t.as_ref().map(ColView::of)))
+    }
+
+    fn clause_count(&self) -> usize {
+        self.regions().clauses.len()
+    }
+
+    fn clause(&self, idx: usize) -> Option<(u32, u32, ColView<'_>)> {
+        self.regions().clauses.get(idx).map(|c| (c.nth, c.binders, ColView::of(&c.col)))
     }
 }
 

@@ -533,6 +533,22 @@ pub trait FrontEnd {
     fn ctor_of(&self, key: ItemKey) -> Option<(ItemKey, u32)>;
     /// The fn's code identity: what its instances' keys are made from.
     fn code_of(&self, i: usize) -> ContentId;
+    /// Source item text of fn row `i`, available even when the row was opened via `head_row` or
+    /// `check_one_typed` without re-lowering from source. Returns `None` for synthetic/textless rows.
+    fn item_text(&self, i: usize) -> Option<&str> {
+        let t = self.function(i).text;
+        (!t.is_empty()).then_some(t)
+    }
+    /// Optional command-scoped shared lazy front-end cache (for sharing converged polymorphization
+    /// summaries across parallel export workers and worker epoch resets).
+    fn shared_front(&self) -> Option<crate::front2::program::lazy::SharedLazyFrontHandle> {
+        None
+    }
+    /// Returns `true` iff row `i`'s live body contains any `inline for` loops (which reflect on
+    /// concrete generic type parameters and must remain concrete under polymorphization).
+    fn has_inline_for(&self, _i: usize) -> bool {
+        false
+    }
 }
 
 /// The old front end: every answer is the inherent one of the same name, unchanged.

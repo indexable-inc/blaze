@@ -335,6 +335,9 @@ pub(crate) struct ScriptQueue<'s> {
     width: usize,
     native_running: usize,
     proc_running: bool,
+    /// Proc-macro `MacroModule` tasks admitted to `Stage::Scripts` that have not yet been filed
+    /// in `ScriptsStage::finish` (so `names.mark` has not yet recorded their `out`).
+    proc_unfiled: usize,
     macro_inputs: Option<MacroInputs<'s>>,
     compile_inputs: Option<crate::wasm64_compile::CompileInputs<'s>>,
     order: BTreeMap<(bool, Name), EngineTask, &'s Frame>,
@@ -357,7 +360,7 @@ impl<'s> ScriptQueue<'s> {
             scope, jobs, waiter: jobs.alloc(blaze_core::wait::Parker::new()),
             slots: jobs.alloc(PoolSlots { width, used: core::cell::Cell::new(0) }),
             width, native_running: 0,
-            proc_running: false, macro_inputs: None, compile_inputs: None,
+            proc_running: false, proc_unfiled: 0, macro_inputs: None, compile_inputs: None,
             order: BTreeMap::new_in(jobs), waiting: BTreeMap::new_in(jobs), running: BTreeMap::new_in(jobs),
             answered: BTreeMap::new_in(jobs),
             joined_later: Vec::new_in(jobs), clock: &handles.env.clock,
@@ -418,11 +421,14 @@ impl<'s> ScriptQueue<'s> {
         self.order.is_empty()
     }
 
-    /// True when any proc-macro `MacroModule` lookup/self-compile is still waiting or running.
-    /// `Stage::Names` must wait for these so no `CrateScope` task invokes `ProcRunner` before a
-    /// self-compiled proc-macro module is published to disk.
+    /// True when any proc-macro `MacroModule` lookup/self-compile is still waiting, running, or
+    /// awaiting filing in `ScriptsStage::finish`. `Stage::Names` must wait for these so no
+    /// `CrateScope` task invokes `ProcRunner` before a self-compiled proc-macro module is
+    /// published to disk and marked on `NamesStage`.
     pub(crate) fn has_pending_proc_macro_module(&self) -> bool {
-        self.proc_running || self.waiting.keys().any(|(lane, _, _)| *lane == ScriptLane::ProcLookup)
+        self.proc_unfiled > 0
+            || self.proc_running
+            || self.waiting.keys().any(|(lane, _, _)| *lane == ScriptLane::ProcLookup)
     }
 
     /// True when every queued script task is an instantaneously-answered `Given` cell (zero
@@ -1103,6 +1109,7 @@ impl<'f> ScriptsStage<'f> {
             let lane = if run.is_some_and(|run| run.native) {
                 ScriptLane::Native
             } else if name.kind == Kind::MacroModule && names.names.as_ref().is_some_and(|world| world.script_module(name.subject).is_none()) {
+                queue.proc_unfiled += 1;
                 ScriptLane::ProcLookup
             } else {
                 ScriptLane::Other
@@ -1318,6 +1325,9 @@ impl<'f> ScriptsStage<'f> {
         if queue.order.remove(&(false, name)).is_none() && queue.order.remove(&(true, name)).is_none() {
             return Err(EngineCheckError::MissingEntry { task: name, table: Table::ScriptsOrder, key: name }.into());
         }
+        if name.kind == Kind::MacroModule && names.names.as_ref().is_some_and(|world| world.script_module(name.subject).is_none()) {
+            queue.proc_unfiled = queue.proc_unfiled.saturating_sub(1);
+        }
         if name.kind == Kind::Given {
             let at = self.given.binary_search_by_key(&name, |(name, _, _)| *name)
                 .map_err(|_| EngineCheckError::MissingEntry { task: name, table: Table::ScriptsGiven, key: name })?;
@@ -1354,6 +1364,9 @@ impl<'f> ScriptsStage<'f> {
                     let mut defines = SVec::new_in(alloc);
                     defines.push((WHOLE, record.out));
                     self.mark(name, Some((task.key, record.out)));
+                    if name.kind == Kind::MacroModule {
+                        names.mark(name, Some((task.key, record.out)));
+                    }
                     if name.kind == Kind::Script {
                         names.mark(name, Some((task.key, record.out)));
                         // Entered again with a stored row: counted, and when it made its stored
@@ -1414,7 +1427,7 @@ impl<'f> ScriptsStage<'f> {
                 }
                 Err(_) => {
                     self.mark(name, None);
-                    if name.kind == Kind::Script {
+                    if name.kind == Kind::Script || name.kind == Kind::MacroModule {
                         names.mark(name, None);
                     }
                     if owed {
@@ -1469,6 +1482,7 @@ impl<'f> ScriptsStage<'f> {
                 ran_as: module.ran_as, package: module.package, version: module.version,
                 features: queue.jobs.alloc_slice_copy(&module.features),
                 files: module.files.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
+                deps: module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
             };
             let compile = if wanted.ran_as == crate::scripts::RanAs::Wasm {
                 queue.ensure_compile_inputs(cx, store, graph_key, handles)?

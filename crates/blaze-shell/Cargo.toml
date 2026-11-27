@@ -20,6 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 blaze-own = { path = "../blaze-own", features = ["std"] }
+bgit = { path = "../bgit" }
 blaze-base64 = { path = "../blaze-base64" }
 blaze-git = { path = "../blaze-git" }
 blaze-html = { path = "../blaze-html" }
@@ -33,11 +34,13 @@ blaze-ui = { path = "../blaze-ui" }
 blaze-json = { path = "../blaze-json" }
 blaze-shell-config = { path = "../blaze-shell-config" }
 blaze-cli-spec = { path = "../blaze-cli-spec" }
+blaze-diag-parse = { path = "../blaze-diag-parse" }
 blaze-dust = { path = "../blaze-dust" }
 blaze-git-meta = { path = "../blaze-git-meta" }
 blaze-sys = { path = "../blaze-sys" }
 blaze-sysmon = { path = "../blaze-sysmon" }
 blaze-term-api = { path = "../blaze-term-api" }
+blaze-tiling = { path = "../blaze-tiling" }
 blaze-data = { path = "../blaze-data" }
 
 [target.'cfg(target_os = "macos")'.dependencies]

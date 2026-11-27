@@ -47,8 +47,9 @@
 //!   joiner that runs a task itself): a **caller** cell, leased from the `Workers` at the
 //!   task's first `on_worker` and given back when the task's placement drops. A caller cell is
 //!   a worker cell like any other, registered the same way, its slots made the same way: it is
-//!   not a fallback, it is the seat of a thread that is not a worker. The leases are a bitmap
-//!   of at most [`Limits::callers`] (at most 64); one more is refused, naming the limit.
+//!   not a fallback, it is the seat of a thread that is not a worker. Caller cells are tracked
+//!   by a nonblocking multi-word bitmap of at most [`Limits::callers`] (at most [`MOST_CALLERS`],
+//!   512); one more is refused, naming the limit.
 //! - In a simulated world: one of the world's `models` simulated workers, the task's model
 //!   worker modulo their count. A task moves between simulated workers across waits (the
 //!   placement's model worker changes at the resume, `Cx::resumed`, under
@@ -171,8 +172,17 @@ mod tests;
 /// is at most this.
 pub const MOST_SLOTS: u32 = 64;
 
+/// How many 64-bit words hold the caller lease bitmap.
+const CALLER_WORDS: usize = 8;
+
+/// Bit-index base of each word in the caller lease bitmap.
+const WORD_BASES: [u32; CALLER_WORDS] = [0, 64, 128, 192, 256, 320, 384, 448];
+
+/// Bounded retry cap (rule 18) for nonblocking caller-cell reservation and bitmap claim passes.
+pub(crate) const MOST_LEASE_ATTEMPTS: u32 = 4096;
+
 /// The most caller cells any `Workers` holds: the width of its lease bitmap.
-pub const MOST_CALLERS: u32 = 64;
+pub const MOST_CALLERS: u32 = 512;
 
 /// The most bytes one cell of a slot takes, padded: a value bigger than this keeps its bulk in
 /// the allocator its slot names.
@@ -216,9 +226,9 @@ pub struct Limits {
 
 impl Limits {
     /// What blaze ships: 512 pool workers (the largest machine's cores, 128, four times over),
-    /// 64 callers (the entry's thread, the IO thread, the threads a test starts over one
-    /// world: the bitmap's width), 64 slots.
-    pub const SHIPPED: Limits = Limits { most_workers: 512, callers: 64, most_slots: 64 };
+    /// 512 callers (the entry's thread, the IO thread, host callbacks from pool workers, and the
+    /// threads a test starts over one world: the bitmap's width), 64 slots.
+    pub const SHIPPED: Limits = Limits { most_workers: 512, callers: 512, most_slots: 64 };
 
     /// The smallest legal limits: one of each.
     pub const SMALLEST: Limits = Limits { most_workers: 1, callers: 1, most_slots: 1 };
@@ -259,6 +269,8 @@ pub enum WorkersError {
     MakerTooLarge { slot: &'static str, bytes: usize, align: usize },
     /// Every caller cell is leased.
     CallersTaken { most: u32 },
+    /// Nonblocking caller lease did not settle within its bounded attempt cap under contention.
+    CallersContended { attempts: u32 },
     /// The reservation for the cells was refused, or its size overflows.
     Reserve(MemError),
 }
@@ -287,6 +299,9 @@ impl core::fmt::Display for WorkersError {
             WorkersError::CallersTaken { most } => {
                 write!(f, "bstd::workers: all {most} caller cells are leased (Limits::callers): a thread outside the pool found none")
             }
+            WorkersError::CallersContended { attempts } => {
+                write!(f, "bstd::workers: caller cell lease did not settle within {attempts} attempts (contention)")
+            }
             WorkersError::Reserve(error) => write!(f, "bstd::workers: the cells' reservation was refused: {error}"),
         }
     }
@@ -312,6 +327,17 @@ pub(crate) enum WorkersPlant {
     SlotIndexReused,
     /// A wait returns without charging its time ([`charge_wait`]).
     WaitUncharged,
+    /// Multi-word caller lease skips the final-word mask and capacity cap, handing out bits past
+    /// [`Limits::callers`].
+    CallerFinalMaskSkipped,
+    /// Multi-word caller lease drops by clearing word 0 instead of its own word, aliasing a live
+    /// caller in word 0 and leaking the bit in its own word.
+    CallerDropWrongWord,
+    /// Multi-word caller lease forgets to clear its bitmap bit on drop, leaking the slot.
+    CallerBitLeaked,
+    /// Multi-word caller lease treats every bitmap word as busy so Step B hits
+    /// [`MOST_LEASE_ATTEMPTS`] and exercises reservation rollback + [`WorkersError::CallersContended`].
+    CallerScanContended,
 }
 
 /// A wait of `ns` on `on` (`id`) ended: charged to the worker `w` the task is on as the wait
@@ -478,8 +504,10 @@ struct Core {
     cells: u32,
     /// Slots registered; sealed by [`Workers::new`].
     slots: u32,
-    /// The caller cells leased, one bit each.
-    callers: AtomicU64,
+    /// Caller cells currently reserved/leased (`<= setup.limits.callers`).
+    leased: AtomicU32,
+    /// The caller cells leased, one bit each (`MOST_CALLERS` bits across `CALLER_WORDS` words).
+    callers: [AtomicU64; CALLER_WORDS],
     /// Each worker's telemetry cell is made at this level in this allocator; `None`: no cells.
     telemetry: Option<(crate::telemetry::Level, SharedAlloc<'static>)>,
     columns: [MaybeUninit<Column>; MOST_SLOTS as usize],
@@ -494,6 +522,7 @@ const fn round_up(bytes: usize, to: usize) -> usize {
 
 const _: () = assert!(align_of::<Core>() <= LINE && align_of::<OwnCell>() <= LINE);
 const _: () = assert!(CELL_MOST % LINE == 0);
+const _: () = assert!(CALLER_WORDS * 64 == 512 && MOST_CALLERS == 512);
 
 impl Core {
     fn base(&self) -> NonNull<u8> {
@@ -636,7 +665,8 @@ impl WorkersOpts {
             setup,
             cells,
             slots: 0,
-            callers: AtomicU64::new(0),
+            leased: AtomicU32::new(0),
+            callers: [const { AtomicU64::new(0) }; CALLER_WORDS],
             telemetry: None,
             columns: [const { MaybeUninit::uninit() }; MOST_SLOTS as usize],
         };
@@ -804,22 +834,85 @@ impl Workers {
 
     /// A caller cell for a thread outside the pool, given back when the lease drops.
     pub(crate) fn lease(&self) -> Result<Lease, WorkersError> {
+        self.lease_planted(NoPlant)
+    }
+
+    /// [`Workers::lease`] with a plant (C6): [`NoPlant`] in shipped code.
+    pub(crate) fn lease_planted(&self, plant: impl Planted<WorkersPlant>) -> Result<Lease, WorkersError> {
         let core = self.core();
         let callers = core.setup.limits.callers;
-        let mask = if callers == 64 { u64::MAX } else { (1u64 << callers) - 1 };
-        let mut seen = core.callers.load(Ordering::Relaxed);
-        loop {
-            let free = !seen & mask;
-            if free == 0 {
+        let skip_mask = plant.has(WorkersPlant::CallerFinalMaskSkipped);
+        let scan_contended = plant.has(WorkersPlant::CallerScanContended);
+
+        // Step A: reserve capacity atomically with a strict retry bound (rule 18).
+        let mut cur = core.leased.load(Ordering::Acquire);
+        let mut reserved = false;
+        for _ in 0..MOST_LEASE_ATTEMPTS {
+            if !skip_mask && cur >= callers {
                 return Err(WorkersError::CallersTaken { most: callers });
             }
-            let bit = free.trailing_zeros();
-            match core.callers.compare_exchange_weak(seen, seen | 1 << bit, Ordering::Acquire, Ordering::Relaxed) {
-                // clone: the lease keeps the cells alive until it is given back.
-                Ok(_) => return Ok(Lease { workers: self.clone(), bit, id: WorkerId(core.first_caller() + bit) }),
-                Err(now) => seen = now,
+            match core.leased.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => {
+                    reserved = true;
+                    break;
+                }
+                Err(now) => cur = now,
             }
         }
+        if !reserved {
+            return Err(WorkersError::CallersContended { attempts: MOST_LEASE_ATTEMPTS });
+        }
+
+        // Step B: claim a free bit across the bitmap words (bounded passes, rotating starting
+        // word after pass 0 so backward-moving free bits do not starve a scanner). If the bound is
+        // exhausted, roll back the reservation and report `CallersContended` (never `CallersTaken`).
+        let mut start = 0usize;
+        for _ in 0..MOST_LEASE_ATTEMPTS {
+            for step in 0..CALLER_WORDS {
+                let word_index = (start + step) % CALLER_WORDS;
+                let Some(&base) = WORD_BASES.get(word_index) else {
+                    continue;
+                };
+                let remaining = callers.saturating_sub(base);
+                if remaining == 0 {
+                    continue;
+                }
+                let Some(word) = core.callers.get(word_index) else {
+                    continue;
+                };
+                let mask = if skip_mask || remaining >= 64 { u64::MAX } else { (1u64 << remaining) - 1 };
+                let mut seen = word.load(Ordering::Relaxed);
+                for _ in 0..64 {
+                    let free = if scan_contended { 0 } else { !seen & mask };
+                    if free == 0 {
+                        break;
+                    }
+                    let offset = free.trailing_zeros();
+                    match word.compare_exchange_weak(seen, seen | (1u64 << offset), Ordering::Acquire, Ordering::Relaxed) {
+                        Ok(_) => {
+                            let clear_word = if plant.has(WorkersPlant::CallerBitLeaked) {
+                                CALLER_WORDS
+                            } else if plant.has(WorkersPlant::CallerDropWrongWord) {
+                                0
+                            } else {
+                                word_index
+                            };
+                            return Ok(Lease {
+                                workers: self.share(),
+                                word: clear_word,
+                                offset,
+                                id: WorkerId(core.first_caller() + base + offset),
+                            });
+                        }
+                        Err(now) => seen = now,
+                    }
+                }
+            }
+            start = (start + 1) % CALLER_WORDS;
+            core::hint::spin_loop();
+        }
+        core.leased.fetch_sub(1, Ordering::Release);
+        Err(WorkersError::CallersContended { attempts: MOST_LEASE_ATTEMPTS })
     }
 
     /// Holds worker `id`'s cell, making it first if this is its first use.
@@ -922,10 +1015,17 @@ fn refused(busy: Busy) -> ! {
     }
 }
 
-impl Clone for Workers {
-    fn clone(&self) -> Workers {
+impl Workers {
+    /// Another handle to the same cells: an O(1) reference-count increment.
+    fn share(&self) -> Workers {
         self.core().refs.fetch_add(1, Ordering::Relaxed);
         Workers { core: self.core }
+    }
+}
+
+impl Clone for Workers {
+    fn clone(&self) -> Workers {
+        self.share()
     }
 }
 
@@ -951,7 +1051,8 @@ impl core::fmt::Debug for Workers {
 /// A caller cell leased by a thread outside the pool: given back when dropped.
 pub(crate) struct Lease {
     workers: Workers,
-    bit: u32,
+    word: usize,
+    offset: u32,
     id: WorkerId,
 }
 
@@ -963,7 +1064,13 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.workers.core().callers.fetch_and(!(1u64 << self.bit), Ordering::Release);
+        // Wait-free release (no loops, no locks): clear the bitmap bit before releasing the
+        // capacity count so any subsequent `AcqRel` reservation observes the freed bit.
+        let core = self.workers.core();
+        if let Some(word) = core.callers.get(self.word) {
+            word.fetch_and(!(1u64 << self.offset), Ordering::Release);
+        }
+        core.leased.fetch_sub(1, Ordering::Release);
     }
 }
 

@@ -164,7 +164,8 @@ pub fn assemble_impls<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, st: &State, o
     };
     let set = cx.impls(g.trait_, shape)?;
     let fp = crate::prefilter::fingerprint_goal(&*cx.tys, g.args);
-    let mut keep: Vec<u32, Alloc<'_>> = Vec::new_in(cx.alloc);
+    let mut keep = core::mem::replace(&mut cx.scratch.impl_keep, Vec::new_in(cx.alloc));
+    keep.clear();
     if set.columns.len as usize == set.impls.len() {
         crate::prefilter::filter(&fp, set.columns, &mut keep);
     } else {
@@ -173,12 +174,18 @@ pub fn assemble_impls<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, st: &State, o
             keep.push(i as u32);
         }
     }
+    let mut push_err = Ok(());
     for &i in keep.iter() {
-        let Some(&d) = set.impls.get(i as usize) else { return Err(malformed()) };
+        let Some(&d) = set.impls.get(i as usize) else {
+            push_err = Err(malformed());
+            break;
+        };
         let mut c = Cand::new(Source::Impl(d), crate::assembly::Rule::Trait(Rule::Impl));
         c.d = d;
         out.push(c);
     }
+    cx.scratch.impl_keep = keep;
+    push_err?;
     let def = cx.trait_def(g.trait_)?;
     crate::builtin::assemble_object(cx, g, def, out)
 }
@@ -272,8 +279,11 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, impl_: Def) -> Result<
     // The header against the goal in place, before importing it: a rigid head that differs at
     // any depth fails the relation below anyway.
     if !cx.scratch.off.prematch {
-        let mut work: Vec<(Ty, Ty), Alloc<'_>> = Vec::new_in(cx.alloc);
-        if !crate::prefilter::header_may_match(&*cx.tys, gargs, h.portable, h.args, &mut work)? {
+        let mut work = core::mem::replace(&mut cx.scratch.prematch_work, Vec::new_in(cx.alloc));
+        work.clear();
+        let matched = crate::prefilter::header_may_match(&*cx.tys, gargs, h.portable, h.args, &mut work);
+        cx.scratch.prematch_work = work;
+        if !matched? {
             cx.scratch.stats.impl_prematch_rejected += 1;
             return Ok(Step::No);
         }
@@ -286,7 +296,8 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, impl_: Def) -> Result<
     }
     for (i, &w) in h.where_clauses.iter().enumerate() {
         let p = cx.import_pred(h.portable, w, args)?;
-        cx.add_from(GoalSource::ImplWhereBound, p, crate::why_no::Reach::Clause(i as u32));
+        let bound = h.where_clause_bounds.get(i).copied().unwrap_or(0);
+        cx.add_bound_from(GoalSource::ImplWhereBound, p, bound, crate::why_no::Reach::Clause(i as u32));
     }
     Ok(Step::Done(max))
 }

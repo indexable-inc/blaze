@@ -99,7 +99,7 @@ struct Body {
     func: VerifiedFunc<Alloc<'static>>,
     funcs: AVec<'static, Owned>,
     statics: AVec<'static, ItemKey>,
-    c_statics: AVec<'static, (ItemKey, AString<'static>)>,
+    c_statics: AVec<'static, (ItemKey, AString<'static>, bool)>,
     vtables: AVec<'static, Symbol>,
     tls: AVec<'static, ItemKey>,
     /// The soft-float routines bound after its references, as the walk bound them.
@@ -120,9 +120,9 @@ impl Body {
                 Owned::C(name) => Callee::C(name.as_str()),
             });
         }
-        let mut c_statics: AVec<'_, (ItemKey, &str)> = Vec::with_capacity_in(self.c_statics.len(), a);
-        for (key, name) in self.c_statics.iter() {
-            c_statics.push((*key, name.as_str()));
+        let mut c_statics: AVec<'_, blaze_ladder::code_records::ForeignStatic<'_>> = Vec::with_capacity_in(self.c_statics.len(), a);
+        for (key, name, weak) in self.c_statics.iter() {
+            c_statics.push(blaze_ladder::code_records::ForeignStatic { item: *key, name: name.as_str(), weak: *weak });
         }
         let names = InstanceNames { funcs: &callees, statics: &self.statics, c_statics: &c_statics, vtables: &self.vtables, tls: &self.tls };
         f(&Routed { names: &names, routines: self.routines })
@@ -153,8 +153,8 @@ impl LirSeen for Collect {
             });
         }
         let mut c_statics = Vec::with_capacity_in(names.c_statics.len(), a);
-        for &(key, name) in names.c_statics {
-            c_statics.push((key, AString::from_str_in(name, a)));
+        for cs in names.c_statics {
+            c_statics.push((cs.item, AString::from_str_in(cs.name, a), cs.weak));
         }
         self.bodies.push(Body {
             function: AString::from_str_in(function, a),
@@ -408,11 +408,15 @@ fn linked(bodies: &[Id<'_>], records: &[AVec<'static, u8>]) -> Result<Linked, AS
                     Ok(j) => Value::Code(by_symbol[j].1),
                     Err(_) => return Err(format_in!(a, "not linked: a function target the walk built no body for ({:?})", target.symbol)),
                 },
-                Space::Outside => {
+                Space::Outside | Space::WeakOutside => {
                     let name = view.name(target.symbol).ok_or_else(|| format_in!(a, "not linked: an outside target with no name kept"))?;
                     match name == POLL_PAGE {
                         true => Value::Poll,
-                        false => Value::At(c_address(name).ok_or_else(|| format_in!(a, "not linked: the C name `{name}` is not in this process"))?),
+                        false => match c_address(name) {
+                            Some(addr) => Value::At(addr),
+                            None if target.space == Space::WeakOutside => Value::At(0),
+                            None => return Err(format_in!(a, "not linked: the C name `{name}` is not in this process")),
+                        },
                     }
                 }
                 other => {

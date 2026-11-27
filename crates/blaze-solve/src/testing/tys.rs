@@ -62,7 +62,7 @@ impl TestTys {
             }
             TyKind::Param(_) | TyKind::ConstParam(_) => f |= Flags::HAS_PARAM,
             TyKind::ReParam(_) => f |= Flags::HAS_FREE_REGION,
-            TyKind::Placeholder(..) => f |= Flags::HAS_PLACEHOLDER,
+            TyKind::Placeholder(..) | TyKind::RePlaceholder(..) => f |= Flags::HAS_PLACEHOLDER,
             TyKind::Alias(r, a, ..) => {
                 f |= Flags::HAS_ALIAS;
                 if a == crate::term::AliasKind::Opaque {
@@ -72,7 +72,7 @@ impl TestTys {
                     f |= Flags::HAS_NON_RIGID_ALIAS;
                 }
             }
-            TyKind::Bound(..) => f |= Flags::HAS_BOUND,
+            TyKind::Bound(..) | TyKind::ReBound(..) => f |= Flags::HAS_BOUND,
             TyKind::Error => f |= Flags::HAS_ERROR,
             TyKind::Canonical(_) => f |= Flags::HAS_CANONICAL,
             _ => {}
@@ -195,7 +195,10 @@ fn same_head(a: TyKind, b: TyKind) -> bool {
         (Dynamic(x, _), Dynamic(y, _)) => x.len == y.len,
         (Array(..), Array(..)) | (Slice(_), Slice(_)) => true,
         (Param(i), Param(j)) | (ConstParam(i), ConstParam(j)) => i == j,
-        (Placeholder(u, i), Placeholder(v, j)) | (Bound(u, i), Bound(v, j)) => u == v && i == j,
+        (Placeholder(u, i), Placeholder(v, j))
+        | (Bound(u, i), Bound(v, j))
+        | (RePlaceholder(u, i), RePlaceholder(v, j))
+        | (ReBound(u, i), ReBound(v, j)) => u == v && i == j,
         (ConstValue(a, x), ConstValue(b, y)) => a == b && x == y,
         (Canonical(i), Canonical(j)) => i == j,
         _ => core::mem::discriminant(&a) == core::mem::discriminant(&b) && children_free(a),
@@ -311,6 +314,13 @@ impl Tys for TestTys {
                 continue;
             }
             let (kx, ky) = (self.nodes[x.0 as usize], self.nodes[y.0 as usize]);
+            if matches!(
+                (kx, ky),
+                (TyKind::RePlaceholder(..), TyKind::ReStatic) | (TyKind::ReStatic, TyKind::RePlaceholder(..))
+            ) {
+                fail(self, deferred);
+                return Ok(false);
+            }
             if is_region(kx) || is_region(ky) {
                 continue;
             }

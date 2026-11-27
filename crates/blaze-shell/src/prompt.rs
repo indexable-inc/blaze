@@ -81,6 +81,46 @@ pub struct ChangedFileDetail {
     pub deleted_lines: Option<u32>,
 }
 
+/// Compact commit entry with diff churn (`+added` / `-deleted`) for the visual branch commit graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchCommit {
+    pub short_sha: String,
+    pub time_secs: i64,
+    pub subject: String,
+    pub added_lines: u32,
+    pub deleted_lines: u32,
+    pub files_changed: u32,
+}
+
+/// Relation of the current HEAD to the repository's base branch (`main`/`master`/`origin/...`),
+/// including ahead/behind commit counts, total branch diff churn, per-commit graph entries,
+/// and common ancestor (`git merge-base`) commit summary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchRelation {
+    /// Short display name of the comparison ref (e.g. `"main"`, `"master"`, `"origin/main"`).
+    pub base_ref: String,
+    /// Commits reachable from `HEAD` but not from `base_ref`.
+    pub ahead: u32,
+    /// Commits reachable from `base_ref` but not from `HEAD`.
+    pub behind: u32,
+    /// Aggregate diff stats across `base_ref...HEAD` (`git diff --shortstat`).
+    pub total_added: u32,
+    pub total_deleted: u32,
+    pub total_files: u32,
+    /// Abbreviated SHA of the common ancestor (`git merge-base <base_ref> HEAD`).
+    pub merge_base_short: String,
+    /// Unix timestamp (seconds) of the common ancestor commit.
+    pub merge_base_time_secs: i64,
+    /// Single-line subject of the common ancestor commit.
+    pub merge_base_subject: String,
+    /// Up to 5 newest commits on `HEAD` ahead of `base_ref` (newest first).
+    pub ahead_commits: Vec<BranchCommit>,
+    /// Up to 3 newest commits on `base_ref` behind `HEAD` (newest first).
+    pub behind_commits: Vec<BranchCommit>,
+    /// Up to 3 newest commits at `HEAD` when `ahead == 0 && behind == 0` (up to date).
+    pub recent_commits: Vec<BranchCommit>,
+}
+
 /// Full Starship-class Git prompt summary produced by `blaze-git`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitStatusSummary {
@@ -105,6 +145,9 @@ pub struct GitStatusSummary {
     pub stash_entries: Vec<GitStashEntry>,
     /// Local git branches read directly from `refs/heads` + `packed-refs` (current first, max 16).
     pub branches: Vec<String>,
+    /// Relation of current HEAD to the repo's default/base branch (`main`/`master`/`origin/...`)
+    /// and their common ancestor commit, cached by `(head_oid, base_oid)`.
+    pub branch_relation: Option<BranchRelation>,
     pub dirty: bool,
     pub conflicted: u32,
     pub staged: u32,
@@ -152,6 +195,8 @@ pub struct PromptInfo {
     pub project_icons: Vec<&'static str>,
     /// Detailed project markers `(icon_name, toolchain_name, marker_file)` for hover inspection.
     pub project_details: Vec<(&'static str, &'static str, &'static str)>,
+    /// True when `[prompt] show_toolchains = false` in `~/.config/blaze-shell/config.toml`.
+    pub hide_toolchains: bool,
     /// Live processes running in `cwd`, subfolders, and descendants (updated asynchronously).
     pub folder_procs: crate::sysmon_driver::FolderProcSnapshot,
     pub last_exit: i32,
@@ -225,6 +270,7 @@ impl PromptInfo {
             in_rust_project,
             project_icons,
             project_details,
+            hide_toolchains: false,
             folder_procs: crate::sysmon_driver::FolderProcSnapshot::default(),
             last_exit,
             last_duration_ms,
@@ -250,6 +296,7 @@ impl PromptInfo {
             self.project_symbol = None;
             self.project_label_override = None;
         }
+        self.hide_toolchains = !cfg.show_toolchains;
         self.project_color = None;
         self.project_badge = None;
         self.project_entity_id = None;
@@ -555,6 +602,7 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     read_git_stash_entries(&head.common_dir, &head.work_tree, &stashes, 6)
                 };
                 let branches = read_local_branches(&head.common_dir, &branch, 16);
+                let branch_relation = read_branch_relation(&head, &branch, detached);
 
                 let dirty = c.conflicted > 0
                     || staged > 0
@@ -575,6 +623,7 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     stashes,
                     stash_entries,
                     branches,
+                    branch_relation,
                     dirty,
                     conflicted: c.conflicted,
                     staged,
@@ -644,24 +693,13 @@ fn classify_changed_file_kind(abs: &Path, leaf: &str) -> &'static str {
     res.label
 }
 
-/// Parse `git diff --numstat` lines (`<added>\t<deleted>\t<path>`) into `path -> (added, deleted)`.
-/// Binary entries (`-\t-\t<path>`) are omitted so callers leave line counts `None`.
+/// Parse `git diff --numstat` lines (`<added>\t<deleted>\t<path>`) into `path -> (added, deleted)`
+/// via the pure `#![no_std]` parser in `blaze-git-meta`.
 fn parse_git_diff_numstat(stdout: &str) -> std::collections::HashMap<String, (u32, u32)> {
-    let mut map = std::collections::HashMap::new();
-    for line in stdout.lines().take(256) {
-        let mut parts = line.splitn(3, '\t');
-        let (Some(a_s), Some(d_s), Some(raw_path)) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        let path = raw_path.trim_end_matches('\r');
-        if path.is_empty() || a_s == "-" || d_s == "-" {
-            continue;
-        }
-        if let (Ok(added), Ok(deleted)) = (a_s.parse::<u32>(), d_s.parse::<u32>()) {
-            map.insert(path.to_owned(), (added, deleted));
-        }
-    }
-    map
+    blaze_git_meta::parse_git_diff_numstat_in(stdout, Alloc::global())
+        .into_iter()
+        .map(|(path, added, deleted)| (path.as_str().to_owned(), (added, deleted)))
+        .collect()
 }
 
 /// Run one fast bounded `git -C <work_tree> diff --numstat HEAD` for up to 32 tracked paths.
@@ -722,15 +760,8 @@ fn read_git_stashes(common_dir: &Path, limit: usize) -> Vec<String> {
 
 /// Split `"WIP on main: c54fc93e6 Merge..."` or `"On main: pre-pull-backup"` into `(branch, summary)`.
 fn parse_stash_header(raw: &str) -> (String, String) {
-    let trimmed = raw.trim();
-    if let Some(rest) = trimmed
-        .strip_prefix("WIP on ")
-        .or_else(|| trimmed.strip_prefix("On "))
-        && let Some((br, msg)) = rest.split_once(':')
-    {
-        return (br.trim().to_owned(), msg.trim().to_owned());
-    }
-    (String::new(), trimmed.to_owned())
+    let (br, msg) = blaze_git_meta::parse_stash_header(raw);
+    (br.to_owned(), msg.to_owned())
 }
 
 /// Read rich per-stash file diff stats (`+added` / `-removed`), cached by `(common_dir, reflog mtime, len)`.
@@ -900,6 +931,312 @@ fn read_local_branches(common_dir: &Path, current: &str, limit: usize) -> Vec<St
     });
     names.truncate(limit);
     names
+}
+
+/// Resolve a git ref (such as `"HEAD"`, `"refs/heads/main"`, `"refs/remotes/origin/main"`)
+/// directly from loose ref files and `packed-refs` with zero subprocesses.
+fn resolve_git_ref_oid(git_dir: &Path, common_dir: &Path, refname: &str) -> Option<String> {
+    let mut current = refname.to_owned();
+    for _ in 0..5 {
+        let loose = if current == "HEAD" {
+            git_dir.join("HEAD")
+        } else {
+            common_dir.join(&current)
+        };
+        if let Ok(raw) = fs::read_to_string(&loose) {
+            let line = raw.lines().next().unwrap_or("").trim();
+            if let Some(target) = line.strip_prefix("ref:") {
+                let next = target.trim();
+                if next.is_empty() {
+                    return None;
+                }
+                current = next.to_owned();
+                continue;
+            }
+            if is_git_oid_hex(line) {
+                return Some(line.to_owned());
+            }
+            return None;
+        }
+        // Loose ref absent: fall back to `packed-refs` in `common_dir`.
+        let packed = fs::read_to_string(common_dir.join("packed-refs")).ok()?;
+        for line in packed.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            if let Some((oid, name)) = line.split_once(' ')
+                && name == current
+                && is_git_oid_hex(oid)
+            {
+                return Some(oid.to_owned());
+            }
+        }
+        return None;
+    }
+    None
+}
+
+#[inline]
+fn is_git_oid_hex(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Read the remote default branch name from `refs/remotes/origin/HEAD` (e.g. `"main"` or `"master"`).
+fn read_origin_default_branch(common_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(common_dir.join("refs/remotes/origin/HEAD")).ok()?;
+    let line = raw.lines().next()?.trim();
+    let target = line.strip_prefix("ref:")?.trim();
+    let name = target.strip_prefix("refs/remotes/origin/")?;
+    if name.is_empty() { None } else { Some(name.to_owned()) }
+}
+
+/// Pick the best comparison base ref for `current_branch`, returning `(display_name, full_ref, oid)`.
+///
+/// - On a feature branch or detached HEAD: prefers the repo's default branch (`origin/HEAD` target,
+///   then `main`, `origin/main`, `master`, `origin/master`).
+/// - On the default branch itself (`main`/`master`): compares against `origin/<current>` when present.
+fn pick_base_branch_ref(
+    common_dir: &Path,
+    current_branch: &str,
+    detached: bool,
+) -> Option<(String, String, String)> {
+    let origin_def = read_origin_default_branch(common_dir);
+    let on_default = !detached
+        && (current_branch == "main"
+            || current_branch == "master"
+            || origin_def.as_deref() == Some(current_branch));
+
+    let mut candidates: Vec<(String, String)> = Vec::with_capacity(8);
+    if on_default {
+        candidates.push((
+            format!("origin/{current_branch}"),
+            format!("refs/remotes/origin/{current_branch}"),
+        ));
+    } else {
+        if let Some(def) = &origin_def {
+            candidates.push((def.clone(), format!("refs/heads/{def}")));
+            candidates.push((format!("origin/{def}"), format!("refs/remotes/origin/{def}")));
+        }
+        candidates.push(("main".to_owned(), "refs/heads/main".to_owned()));
+        candidates.push(("origin/main".to_owned(), "refs/remotes/origin/main".to_owned()));
+        candidates.push(("master".to_owned(), "refs/heads/master".to_owned()));
+        candidates.push(("origin/master".to_owned(), "refs/remotes/origin/master".to_owned()));
+    }
+
+    let mut seen: Vec<String> = Vec::with_capacity(candidates.len());
+    for (display, full_ref) in candidates {
+        if (!detached && display == current_branch) || seen.contains(&full_ref) {
+            continue;
+        }
+        seen.push(full_ref.clone());
+        if let Some(oid) = resolve_git_ref_oid(common_dir, common_dir, &full_ref) {
+            return Some((display, full_ref, oid));
+        }
+    }
+    None
+}
+
+/// Compute ahead/behind divergence and common ancestor (`git merge-base`) against the repository's
+/// base branch (`main`/`master`/`origin/...`), cached in-process by `(work_tree, head_oid, base_oid)`.
+fn read_branch_relation(
+    head: &GitHead,
+    current_branch: &str,
+    detached: bool,
+) -> Option<BranchRelation> {
+    use std::collections::HashMap;
+    use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
+
+    struct CachedBranchRel {
+        head_oid: String,
+        base_ref: String,
+        base_oid: String,
+        relation: Option<BranchRelation>,
+    }
+    static BRANCH_REL_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedBranchRel>>> = OnceLock::new();
+
+    let head_oid = resolve_git_ref_oid(&head.git_dir, &head.common_dir, "HEAD")?;
+    let (base_ref, full_ref, base_oid) =
+        pick_base_branch_ref(&head.common_dir, current_branch, detached)?;
+
+    let cache = BRANCH_REL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock()
+        && let Some(hit) = guard.get(&head.work_tree)
+        && hit.head_oid == head_oid
+        && hit.base_ref == base_ref
+        && hit.base_oid == base_oid
+    {
+        return hit.relation.clone();
+    }
+
+    let (ahead, behind, merge_base_oid) = if head_oid == base_oid {
+        (0u32, 0u32, Some(head_oid.clone()))
+    } else {
+        let range = format!("{full_ref}...HEAD");
+        let count_out = Command::new("git")
+            .arg("-C")
+            .arg(&head.work_tree)
+            .args(["rev-list", "--left-right", "--count", &range])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !count_out.status.success() {
+            return None;
+        }
+        let count_str = String::from_utf8_lossy(&count_out.stdout);
+        let mut parts = count_str.split_whitespace();
+        let behind = parts.next()?.parse::<u32>().ok()?;
+        let ahead = parts.next()?.parse::<u32>().ok()?;
+
+        let mb_oid = Command::new("git")
+            .arg("-C")
+            .arg(&head.work_tree)
+            .args(["merge-base", &full_ref, "HEAD"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+            .filter(|s| !s.is_empty());
+
+        (ahead, behind, mb_oid)
+    };
+
+    let (merge_base_short, merge_base_time_secs, merge_base_subject) =
+        if let Some(mb) = merge_base_oid {
+            Command::new("git")
+                .arg("-C")
+                .arg(&head.work_tree)
+                .args(["show", "-s", "--format=%h\x1f%ct\x1f%s", &mb])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    let mut it = s.trim_end_matches(['\r', '\n']).splitn(3, '\x1f');
+                    let short = it.next()?.trim().to_owned();
+                    let ts = it.next()?.trim().parse::<i64>().unwrap_or(0);
+                    let subj = it.next().unwrap_or("").trim().to_owned();
+                    Some((short, ts, subj))
+                })
+                .unwrap_or_else(|| (mb.chars().take(7).collect(), 0, String::new()))
+        } else {
+            (String::new(), 0, String::new())
+        };
+
+    let (total_files, total_added, total_deleted) = if ahead > 0 {
+        let range = format!("{full_ref}...HEAD");
+        Command::new("git")
+            .arg("-C")
+            .arg(&head.work_tree)
+            .args(["diff", "--shortstat", &range])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| parse_git_shortstat(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or((0, 0, 0))
+    } else {
+        (0, 0, 0)
+    };
+
+    let ahead_commits = if ahead > 0 {
+        read_git_log_commits(&head.work_tree, &format!("{full_ref}..HEAD"), 5)
+    } else {
+        Vec::new()
+    };
+    let behind_commits = if behind > 0 {
+        read_git_log_commits(&head.work_tree, &format!("HEAD..{full_ref}"), 3)
+    } else {
+        Vec::new()
+    };
+    let recent_commits = if ahead == 0 && behind == 0 {
+        read_git_log_commits(&head.work_tree, "HEAD", 3)
+    } else {
+        Vec::new()
+    };
+
+    let rel = Some(BranchRelation {
+        base_ref: base_ref.clone(),
+        ahead,
+        behind,
+        total_added,
+        total_deleted,
+        total_files,
+        merge_base_short,
+        merge_base_time_secs,
+        merge_base_subject,
+        ahead_commits,
+        behind_commits,
+        recent_commits,
+    });
+
+    if let Ok(mut guard) = cache.lock() {
+        if guard.len() > 16 {
+            guard.clear();
+        }
+        guard.insert(
+            head.work_tree.clone(),
+            CachedBranchRel {
+                head_oid,
+                base_ref,
+                base_oid,
+                relation: rel.clone(),
+            },
+        );
+    }
+    rel
+}
+
+/// Parse one `git diff --shortstat` / `git log --shortstat` summary line into
+/// `(files_changed, added_lines, deleted_lines)` via `blaze-git-meta`.
+fn parse_git_shortstat(line: &str) -> (u32, u32, u32) {
+    let stat = blaze_git_meta::parse_git_shortstat(line);
+    (stat.files_changed, stat.added_lines, stat.deleted_lines)
+}
+
+/// Fetch up to `limit` commits for `rev_range` with compact `--shortstat` `+`/`-` churn.
+fn read_git_log_commits(work_tree: &Path, rev_range: &str, limit: usize) -> Vec<BranchCommit> {
+    use std::process::{Command, Stdio};
+
+    let max_flag = format!("-n{limit}");
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(work_tree)
+        .args([
+            "log",
+            &max_flag,
+            "--shortstat",
+            "--format=\x1e%h\x1f%ct%x1f%s",
+            rev_range,
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    blaze_git_meta::parse_git_log_commits_in(&text, limit, Alloc::global())
+        .into_iter()
+        .map(|c| BranchCommit {
+            short_sha: c.short_sha.as_str().to_owned(),
+            time_secs: c.time_secs,
+            subject: c.subject.as_str().to_owned(),
+            added_lines: c.stat.added_lines,
+            deleted_lines: c.stat.deleted_lines,
+            files_changed: c.stat.files_changed,
+        })
+        .collect()
 }
 
 fn resolve_scoped(head: &GitHead, sp: &ScopedPath<'_>) -> PathBuf {
@@ -1188,8 +1525,11 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
         return None;
     }
     let sub = parts.get(1).copied()?;
-    // For `bgit`, only intercept plain `bgit status` / `bgit st` (let `infect`, `mount`, `bench`, etc. run the CLI).
-    if cmd == "bgit" && sub != "status" && sub != "st" {
+    // For `bgit`, intercept rich structured table commands (`status`, `log`, `worktree list`),
+    // letting all other `bgit` subcommands run in-process via `host.rs::try_run_in_process_bgit`.
+    if cmd == "bgit"
+        && !matches!(sub, "status" | "st" | "log" | "worktree" | "wt")
+    {
         return None;
     }
     let rest = &parts[2..];
@@ -1344,6 +1684,179 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
                     blaze_sh::Value::string(bl.summary.as_str(), alloc),
                     blaze_sh::Value::string(email, alloc),
                     blaze_sh::Value::string(bl.full_sha.as_str(), alloc),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
+        "log" => {
+            // Intercept plain `git log` / `bgit log` (and optional `-n N` / `-N`) when backed by
+            // an existing `.bgit` store -> rich interactive commit table with avatars!
+            let mut limit = 30usize;
+            match rest {
+                [] => {}
+                ["-n", n] => limit = n.parse().ok()?,
+                [tok] => {
+                    if let Some(d) = tok.strip_prefix("-n").or_else(|| tok.strip_prefix('-'))
+                        && !d.is_empty()
+                        && d.bytes().all(|b| b.is_ascii_digit())
+                    {
+                        limit = d.parse().ok()?;
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            }
+            let entries = bgit::query_log_entries(Path::new(cwd), "HEAD", limit, alloc).ok()??;
+            if entries.is_empty() {
+                return None;
+            }
+            let mut tbl = blaze_sh::Table::from_col_names(
+                &["commit", "author", "modified", "summary", "email", "sha"],
+                alloc,
+            );
+            tbl.set_col_display("commit", blaze_sh::ColDisplay::GitCommit);
+            tbl.set_col_display("author", blaze_sh::ColDisplay::GitAuthor);
+            tbl.set_col_display("modified", blaze_sh::ColDisplay::HumanTime);
+            tbl.hide_col_by_name("email");
+            tbl.hide_col_by_name("sha");
+            tbl.default_grid = false;
+
+            let gh_repo = crate::git_meta_driver::github_repo_for_dir(Path::new(cwd));
+            let mut warmed: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for e in &entries {
+                if !e.author_email.is_empty()
+                    && warmed.len() < 16
+                    && warmed.insert(e.author_email.clone())
+                {
+                    let _ = crate::git_meta_driver::request_avatar(
+                        &e.author_email,
+                        Some(&e.oid),
+                        gh_repo.as_ref(),
+                    );
+                }
+                let dt_val = if e.timestamp_secs > 0 {
+                    blaze_sh::Value::Date(blaze_sh::DateTime {
+                        utc_ns: e.timestamp_secs.saturating_mul(1_000_000_000),
+                        offset_secs: 0,
+                    })
+                } else {
+                    blaze_sh::Value::Nothing
+                };
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(&e.short_oid, alloc),
+                    blaze_sh::Value::string(&e.author_name, alloc),
+                    dt_val,
+                    blaze_sh::Value::string(&e.subject, alloc),
+                    blaze_sh::Value::string(&e.author_email, alloc),
+                    blaze_sh::Value::string(&e.oid, alloc),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
+        "worktree" | "wt" if matches!(rest, ["list"] | ["ls"]) => {
+            let wts = bgit::query_worktrees(Path::new(cwd), alloc).ok()??;
+            let mut tbl = blaze_sh::Table::from_col_names(
+                &["path", "branch", "tracks", "commit", "mode", "policy"],
+                alloc,
+            );
+            tbl.set_col_display("path", blaze_sh::ColDisplay::FileEntry);
+            tbl.set_col_display("commit", blaze_sh::ColDisplay::GitCommit);
+            tbl.default_grid = false;
+            for wt in &wts {
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(&wt.path, alloc),
+                    blaze_sh::Value::string(&wt.branch, alloc),
+                    blaze_sh::Value::string(&wt.track_branch, alloc),
+                    blaze_sh::Value::string(&wt.head_short, alloc),
+                    blaze_sh::Value::string(if wt.is_vfs { "vfs" } else { "disk" }, alloc),
+                    blaze_sh::Value::string(
+                        if wt.auto_delete_on_merge { "auto-delete" } else { "keep" },
+                        alloc,
+                    ),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
+        "branch" | "br"
+            if matches!(
+                rest,
+                [] | ["-v"]
+                    | ["-vv"]
+                    | ["--verbose"]
+                    | ["-a"]
+                    | ["--all"]
+                    | ["-r"]
+                    | ["--remotes"]
+                    | ["-av"]
+                    | ["-va"]
+                    | ["-rv"]
+                    | ["-vr"]
+            ) =>
+        {
+            let include_all = rest.iter().any(|&a| matches!(a, "-a" | "--all" | "-av" | "-va"));
+            let remotes_only =
+                rest.iter().any(|&a| matches!(a, "-r" | "--remotes" | "-rv" | "-vr"));
+            let branches =
+                bgit::query_branches(Path::new(cwd), include_all, remotes_only, alloc).ok()??;
+            if branches.is_empty() {
+                return None;
+            }
+            let mut tbl = blaze_sh::Table::from_col_names(
+                &["active", "branch", "commit", "summary", "sha"],
+                alloc,
+            );
+            tbl.set_col_display("commit", blaze_sh::ColDisplay::GitCommit);
+            tbl.hide_col_by_name("sha");
+            tbl.default_grid = false;
+            for br in &branches {
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(if br.is_current { "*" } else { "" }, alloc),
+                    blaze_sh::Value::string(&br.name, alloc),
+                    blaze_sh::Value::string(&br.short_oid, alloc),
+                    blaze_sh::Value::string(&br.subject, alloc),
+                    blaze_sh::Value::string(&br.oid, alloc),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
+        "diff" | "df"
+            if matches!(
+                rest,
+                ["--stat"]
+                    | ["--staged", "--stat"]
+                    | ["--cached", "--stat"]
+                    | ["--stat", "--staged"]
+                    | ["--stat", "--cached"]
+            ) =>
+        {
+            let cwd_path = Path::new(cwd);
+            let _ = bgit::ensure_fsmonitor_watching(cwd_path);
+            let staged = rest.iter().any(|&a| matches!(a, "--staged" | "--cached"));
+            let rows = bgit::query_diff_stat(cwd_path, staged, alloc).ok()??;
+            if rows.is_empty() {
+                return None;
+            }
+            let mut tbl = blaze_sh::Table::from_col_names(
+                &["status", "path", "added", "removed", "changes"],
+                alloc,
+            );
+            tbl.set_col_display("path", blaze_sh::ColDisplay::FileEntry);
+            tbl.default_grid = false;
+            for r in &rows {
+                let st_buf = [r.status as u8];
+                let st_str = core::str::from_utf8(&st_buf).unwrap_or("M");
+                let total = r.insertions + r.deletions;
+                let scale = if total > 24 { 24.0 / total as f32 } else { 1.0 };
+                let plus_n = ((r.insertions as f32 * scale).round() as usize).min(24);
+                let minus_n = ((r.deletions as f32 * scale).round() as usize).min(24 - plus_n);
+                let bar = format!("{}{}", "+".repeat(plus_n), "-".repeat(minus_n));
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(st_str, alloc),
+                    blaze_sh::Value::string(&r.path, alloc),
+                    blaze_sh::Value::Int(r.insertions as i64),
+                    blaze_sh::Value::Int(r.deletions as i64),
+                    blaze_sh::Value::string(&bar, alloc),
                 ]);
             }
             Some(blaze_sh::Value::Table(tbl))
@@ -1806,6 +2319,82 @@ mod tests {
             classify_changed_file_kind(&dir.join("deleted_noext"), "deleted_noext"),
             "File"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branch_relation_reports_divergence_and_common_ancestor() {
+        use std::process::Command;
+
+        let dir = std::env::temp_dir().join(format!(
+            "blaze_shell_branch_rel_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp repo");
+
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "Blaze")
+                .env("GIT_AUTHOR_EMAIL", "blaze@example.com")
+                .env("GIT_COMMITTER_NAME", "Blaze")
+                .env("GIT_COMMITTER_EMAIL", "blaze@example.com")
+                .args(args)
+                .status()
+                .expect("spawn git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+
+        run_git(&["init", "-q", "-b", "main"]);
+        fs::write(dir.join("a.txt"), "base\n").expect("write base");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "common base commit"]);
+
+        // Create feature branch with 2 commits ahead of common base.
+        run_git(&["switch", "-q", "-c", "feat/demo"]);
+        fs::write(dir.join("feat1.txt"), "1\n2\n3\n").expect("write feat1");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "feat commit one"]);
+        fs::write(dir.join("a.txt"), "updated\nmore\n").expect("modify a");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "feat commit two"]);
+
+        // Advance `main` by 1 commit so `feat/demo` is 2 ahead, 1 behind `main`.
+        run_git(&["switch", "-q", "main"]);
+        fs::write(dir.join("main2.txt"), "m\n").expect("write main2");
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "main moved ahead"]);
+
+        // Switch back to `feat/demo` and verify `query_blaze_git_status` populates `branch_relation`.
+        run_git(&["switch", "-q", "feat/demo"]);
+        let st = query_blaze_git_status(dir.to_str().unwrap()).expect("git status");
+        let rel = st.branch_relation.expect("expected branch relation vs main");
+        assert_eq!(rel.base_ref, "main");
+        assert_eq!(rel.ahead, 2);
+        assert_eq!(rel.behind, 1);
+        assert_eq!(rel.total_added, 5);
+        assert_eq!(rel.total_deleted, 1);
+        assert_eq!(rel.total_files, 2);
+        assert!(!rel.merge_base_short.is_empty());
+        assert!(rel.merge_base_time_secs > 0);
+        assert_eq!(rel.merge_base_subject, "common base commit");
+        assert_eq!(rel.ahead_commits.len(), 2);
+        assert_eq!(rel.ahead_commits[0].subject, "feat commit two");
+        assert_eq!(rel.ahead_commits[0].added_lines, 2);
+        assert_eq!(rel.ahead_commits[0].deleted_lines, 1);
+        assert_eq!(rel.ahead_commits[1].subject, "feat commit one");
+        assert_eq!(rel.ahead_commits[1].added_lines, 3);
+        assert_eq!(rel.ahead_commits[1].deleted_lines, 0);
+        assert_eq!(rel.behind_commits.len(), 1);
+        assert_eq!(rel.behind_commits[0].subject, "main moved ahead");
+        assert_eq!(rel.behind_commits[0].added_lines, 1);
+        assert_eq!(rel.behind_commits[0].deleted_lines, 0);
+
+        // Second call hits the in-process OID cache and returns the exact same relation.
+        let st2 = query_blaze_git_status(dir.to_str().unwrap()).expect("cached git status");
+        assert_eq!(st2.branch_relation, Some(rel));
 
         let _ = fs::remove_dir_all(&dir);
     }

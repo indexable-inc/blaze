@@ -280,18 +280,20 @@ pub(super) fn reached_after<A: Allocator + Copy>(body: &Body<'_, A>, alloc: &A) 
     out
 }
 
-/// The kept slots in a laid state, and per slot its offset (`NONE`: not kept): every named slot
-/// kept at its name's offset; every other slot not kept, unless the pass's rule keeps it
-/// (`lir_kept`) and code after a suspension reaches it, which is refused by name. Refused
-/// too: a name of no slot or of one slot twice, a name outside the region or misaligned for
-/// its slot, two named slots sharing bytes.
+/// The kept slots in a laid state, per slot its offset (`NONE`: not kept), and the LIR conflict
+/// matrix: every named slot kept at its name's offset; every other slot not kept, unless the
+/// pass's rule keeps it (`lir_kept`) and code after a suspension reaches it, which is refused by
+/// name. Refused too: a name of no slot or of one slot twice, a name outside the region or
+/// misaligned for its slot, and two overlapping named slots whose LIR storage lifetimes conflict.
 pub(super) fn kept_by_name<A: Allocator + Copy>(
     body: &Body<'_, A>,
+    live: &super::overlap::Addressed<A>,
     lir_kept: &[bool],
     region: Region,
     names: &[SlotName],
+    plant: Plant,
     alloc: &A,
-) -> Result<(Vec<bool, A>, Vec<u32, A>), CoroutineError> {
+) -> Result<(Vec<bool, A>, Vec<u32, A>, Vec<u64, A>), CoroutineError> {
     let view = &body.view;
     let slots = view.slots.len();
     let mut kept = filled(slots, false, alloc);
@@ -310,14 +312,33 @@ pub(super) fn kept_by_name<A: Allocator + Copy>(
         at[i] = n.offset;
         kept[i] = true;
     }
-    // Two named slots sharing bytes: by offset, each must end before the next begins.
+    let conflicts = super::overlap::conflicts(body, live, &kept, plant, alloc);
+    let mut ordinal = filled(slots, NONE, alloc);
+    let mut n_kept = 0usize;
+    for (slot, &keep) in kept.iter().enumerate() {
+        if keep {
+            ordinal[slot] = n_kept as u32;
+            n_kept += 1;
+        }
+    }
+    let rw = n_kept.div_ceil(64);
+    // Two named slots sharing bytes are allowed only when their LIR storage lifetimes never
+    // overlap (`conflicts` bit clear); conflicting slots sharing bytes are refused by name.
     let mut by_offset: Vec<(u32, u32), A> = Vec::with_capacity_in(names.len(), *alloc);
-    by_offset.extend(names.iter().map(|n| (n.offset, n.slot.0)));
+    by_offset.extend(names.iter().filter(|n| view.slots[n.slot.index()].size > 0).map(|n| (n.offset, n.slot.0)));
     by_offset.sort_unstable();
-    for w in by_offset.windows(2) {
-        let end = u64::from(w[0].0) + u64::from(view.slots[w[0].1 as usize].size);
-        if end > u64::from(w[1].0) {
-            return Err(CoroutineError::NamesOverlap { a: w[0].1, b: w[1].1 });
+    for i in 0..by_offset.len() {
+        let (off_a, slot_a) = by_offset[i];
+        let end_a = u64::from(off_a) + u64::from(view.slots[slot_a as usize].size);
+        let ord_a = ordinal[slot_a as usize] as usize;
+        for &(off_b, slot_b) in &by_offset[i + 1..] {
+            if u64::from(off_b) >= end_a {
+                break;
+            }
+            let ord_b = ordinal[slot_b as usize] as usize;
+            if conflicts[ord_a * rw + ord_b / 64] & (1u64 << (ord_b % 64)) != 0 {
+                return Err(CoroutineError::NamesOverlap { a: slot_a, b: slot_b });
+            }
         }
     }
     let reached = reached_after(body, alloc);
@@ -326,7 +347,7 @@ pub(super) fn kept_by_name<A: Allocator + Copy>(
             return Err(CoroutineError::UnnamedAcrossSuspend { slot: i as u32 });
         }
     }
-    Ok((kept, at))
+    Ok((kept, at, conflicts))
 }
 
 /// The offsets of the kept slots in slot order (what `overlap::offsets` gives without a region).

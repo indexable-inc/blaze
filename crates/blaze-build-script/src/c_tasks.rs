@@ -1020,6 +1020,41 @@ pub struct FileRef {
     pub len: u64,
 }
 
+/// Proof that a [`FileRef`] was verified present in an [`Area`] with its expected byte length
+/// (rule 74: verify once and carry the proof type; prevents returning LRU-evicted blobs when
+/// auxiliary GC evicts `v2/build-script/files` independently of the KV store).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VerifiedFileRef(FileRef);
+
+impl VerifiedFileRef {
+    pub const fn file(self) -> FileRef {
+        self.0
+    }
+
+    pub const fn sha256(self) -> [u8; 32] {
+        self.0.sha256
+    }
+
+    pub const fn len(self) -> u64 {
+        self.0.len
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0.len == 0
+    }
+}
+
+/// Result of decoding a stored `BCOB1` file record and verifying its backing blob in [`Area`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerifiedRecord {
+    /// Record decoded and its backing blob is present in [`Area`] with the recorded byte length.
+    Present(VerifiedFileRef),
+    /// Record decoded cleanly, but its backing blob was evicted from [`Area`] (treat as a miss).
+    Evicted,
+    /// Stored bytes do not match `BCOB1` (`FILE_RECORD_MAGIC` + 40 bytes).
+    Damaged,
+}
+
 /// An object's or archive's record: `BCOB1`, the file's sha256 and length.
 pub const FILE_RECORD_MAGIC: &[u8; 5] = b"BCOB1";
 
@@ -1037,6 +1072,17 @@ pub fn decode_file_record(bytes: &[u8]) -> Option<FileRef> {
         return None;
     }
     Some(FileRef { sha256: rest[..32].try_into().ok()?, len: u64::from_le_bytes(rest[32..].try_into().ok()?) })
+}
+
+/// Decodes a `BCOB1` record and verifies its backing blob exists in `area` in one step.
+pub fn decode_verified_file_record(bytes: &[u8], area: &dyn Area) -> VerifiedRecord {
+    match decode_file_record(bytes) {
+        None => VerifiedRecord::Damaged,
+        Some(file) => match area.verify(file) {
+            Some(verified) => VerifiedRecord::Present(verified),
+            None => VerifiedRecord::Evicted,
+        },
+    }
 }
 
 /// The archive's key: its name and, in order, each member's name in the archive (its file
@@ -1166,6 +1212,21 @@ pub struct StoreFailed;
 pub trait Area {
     fn put(&mut self, bytes: &[u8]) -> Result<FileRef, StoreFailed>;
     fn read(&self, file: FileRef, into: &mut AVec<'_, u8>) -> Result<(), StoreFailed>;
+    /// Whether `file` is still present in the area with its expected byte length.
+    /// Auxiliary GC (`v2/build-script/files`) can evict blobs independently of the key-value
+    /// store, so a store hit is only valid while its referenced file still exists in the area.
+    fn has(&self, file: FileRef) -> bool;
+
+    /// Verifies that `file` is still present in this area with its expected byte length,
+    /// returning a [`VerifiedFileRef`] proof token on hit or `None` if evicted.
+    fn verify(&self, file: FileRef) -> Option<VerifiedFileRef> {
+        self.has(file).then_some(VerifiedFileRef(file))
+    }
+
+    /// Stores `bytes` into this area and returns its [`VerifiedFileRef`] proof token.
+    fn put_verified(&mut self, bytes: &[u8]) -> Result<VerifiedFileRef, StoreFailed> {
+        self.put(bytes).map(VerifiedFileRef)
+    }
 }
 
 /// Why one crate's C tasks gave no archives. Each names the crate (rule 19); a failed compile
@@ -1188,17 +1249,26 @@ pub enum TaskError<'a, 'b> {
     Damaged { package: &'b str, key: ContentId },
 }
 
-/// One unit looked up: found by its key, or to compile (with the slot its new path set takes
-/// if the compile reads a set no slot holds).
+/// One unit looked up: found by its key (with [`VerifiedFileRef`] proof that its blob is still
+/// present in [`Area`]), or to compile (with the slot its new path set takes if the compile reads
+/// a set no slot holds).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Looked {
-    Hit(FileRef),
+    Hit(VerifiedFileRef),
     Miss { pre: ContentId, free_slot: u32 },
 }
 
 /// Looks `unit` up: its pre key from today's source, then each recorded path set in slot
-/// order, the first whose object key today holds an object.
-pub fn look<'a, 'b>(package: &'b str, unit: &Compile<'_, 'b>, toolchain: &Toolchain<'_>, today: &dyn Today, store: &mut dyn CStore, alloc: Alloc<'_>) -> Result<Looked, TaskError<'a, 'b>> {
+/// order, the first whose object key today holds an object still present in `area`.
+pub fn look<'a, 'b>(
+    package: &'b str,
+    unit: &Compile<'_, 'b>,
+    toolchain: &Toolchain<'_>,
+    today: &dyn Today,
+    area: &dyn Area,
+    store: &mut dyn CStore,
+    alloc: Alloc<'_>,
+) -> Result<Looked, TaskError<'a, 'b>> {
     let source = match today.file(unit.source) {
         Ok(Some(digest)) => digest,
         Ok(None) => return Err(TaskError::NoSource { package, source: unit.source }),
@@ -1207,6 +1277,7 @@ pub fn look<'a, 'b>(package: &'b str, unit: &Compile<'_, 'b>, toolchain: &Toolch
     let pre = pre_key(unit, source, toolchain);
     let mut held = Vec::new_in(alloc);
     let mut object = Vec::new_in(alloc);
+    let mut saw_evicted = false;
     for slot in 0..PATH_SETS {
         let set_key = path_set_key(pre, slot);
         if !store.get(set_key, &mut held).map_err(|_| TaskError::Store { package, what: "a path set" })? {
@@ -1215,8 +1286,19 @@ pub fn look<'a, 'b>(package: &'b str, unit: &Compile<'_, 'b>, toolchain: &Toolch
         let Some(set) = PathSet::open(&held) else { return Err(TaskError::Damaged { package, key: set_key }) };
         let key = object_key(pre, &set, today).map_err(|error| TaskError::Fact { package, path: unit.source, error })?;
         if store.get(key, &mut object).map_err(|_| TaskError::Store { package, what: "an object" })? {
-            return decode_file_record(&object).map(Looked::Hit).ok_or(TaskError::Damaged { package, key });
+            match decode_verified_file_record(&object, area) {
+                VerifiedRecord::Present(file) => return Ok(Looked::Hit(file)),
+                VerifiedRecord::Evicted => saw_evicted = true,
+                VerifiedRecord::Damaged => return Err(TaskError::Damaged { package, key }),
+            }
         }
+    }
+    if saw_evicted {
+        // Every path-set slot is already occupied, and at least one matched an evicted blob.
+        // Hand `free_slot = PATH_SETS` to `admit`: it scans `0..PATH_SETS` for an equal path set
+        // (reusing the existing slot without overwriting any slot) and refuses only if the
+        // recompile reads a genuinely new path set.
+        return Ok(Looked::Miss { pre, free_slot: PATH_SETS });
     }
     Err(TaskError::PathSets { package, source: unit.source })
 }
@@ -1310,8 +1392,11 @@ pub fn archive<'a, 'b>(
     let key = archive_key(plan.name, &members);
     let mut held = Vec::new_in(alloc);
     if store.get(key, &mut held).map_err(|_| TaskError::Store { package, what: "an archive" })? {
-        let file = decode_file_record(&held).ok_or(TaskError::Damaged { package, key })?;
-        return Ok((Made { name: plan.name, file }, false));
+        match decode_verified_file_record(&held, area) {
+            VerifiedRecord::Present(file) => return Ok((Made { name: plan.name, file: file.file() }, false)),
+            VerifiedRecord::Evicted => {}
+            VerifiedRecord::Damaged => return Err(TaskError::Damaged { package, key }),
+        }
     }
     let mut bodies: AVec<'_, AVec<'_, u8>> = Vec::with_capacity_in(members.len(), alloc);
     for (_, file) in members.iter() {
@@ -1471,8 +1556,8 @@ pub fn run_crate<'a, 'b, C: CCompiler>(
     for (at, unit) in plan.units.iter().enumerate() {
         let assumed = at as u32 >= plan.planned;
         let today = todays.of(unit.state);
-        let file = match look(package, unit, toolchain, today, store, alloc)? {
-            Looked::Hit(file) => file,
+        let file = match look(package, unit, toolchain, today, area, store, alloc)? {
+            Looked::Hit(file) => file.file(),
             Looked::Miss { pre, free_slot } => {
                 objects_ran += 1;
                 match compiler.compile(unit, alloc) {

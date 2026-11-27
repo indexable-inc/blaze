@@ -1459,7 +1459,7 @@ impl<A: Allocator + Clone> Builder<A, Full> {
             Check::ByProof => false,
         };
         if verify_now {
-            verify::verify(self.func.view()).map_err(BuildError::Verify)?;
+            verify::verify_in(self.func.view(), self.func.allocator()).map_err(BuildError::Verify)?;
         }
         Ok(self.func)
     }

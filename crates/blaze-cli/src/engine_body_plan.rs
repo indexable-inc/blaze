@@ -1131,7 +1131,7 @@ impl Outside {
             let Some(one) = outlined.get(at as usize) else { continue };
             let name = note_name(&one.path);
             if any && files.binary_search(&at).is_ok() {
-                lines.note(name, crate::engine_lines::Class::Told, std::format!("{}", FileWords { outlined, file: at }).as_bytes());
+                lines.note(name, crate::engine_lines::Class::Outside, std::format!("{}", FileWords { outlined, file: at }).as_bytes());
             } else if (!any || (!all && none_held))
                 && let Some(block) = last.and_then(|last| last.block(name))
             {
@@ -1243,7 +1243,7 @@ impl fmt::Display for FileWords<'_, '_> {
         }
         write!(
             f,
-            ") has it in its items record, which is so when a `#[cfg]` on that `mod` or in the file is false in the unit (a feature off, `test`, another target), or when the `mod` is in a macro call whose expansion did not write it; its {count} body(ies) are no unit's: not checked, and not counted among the items blaze could not check ({RULE})"
+            ") has it in its items record, which is so when a `#[cfg]` on that `mod` or in the file is false in the unit (a feature off, `test`, another target), or when the `mod` is in a macro call whose expansion did not write it; its {count} body(ies) are no unit's: not checked, and not counted among the items blaze could not check"
         )
     }
 }

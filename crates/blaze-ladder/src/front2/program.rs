@@ -374,7 +374,7 @@ struct Made<'n> {
 /// each looked up once in [`Front2Program::make`], a refusal stopping the program by the item's
 /// name there, so those answers never meet a lookup that fails. `Clone`: its `clone`, the
 /// builtin clone's (blaze-ladder clone_shim.rs).
-const SEAM_LANGS: [LangItem; 10] = [
+const SEAM_LANGS: [LangItem; 11] = [
     LangItem::Drop,
     LangItem::Deref,
     LangItem::DerefMut,
@@ -385,6 +385,7 @@ const SEAM_LANGS: [LangItem; 10] = [
     LangItem::IndexMut,
     LangItem::Clone,
     LangItem::From,
+    LangItem::FnPtrTrait,
 ];
 
 fn lang_of(front: &Front2<'_>, item: LangItem) -> Result<Option<ItemKey>, crate::seam::LangRefusal> {
@@ -547,38 +548,38 @@ fn dyn_principals<'v>(views: impl Iterator<Item = PTys<'v>>) -> Vec<ItemKey, Glo
 }
 
 /// Each trait of `asked` not yet in `tables`, with every supertrait under it, made into
-/// Why ensuring a trait's head or members for [`object_tables`] failed.
-enum TraitWantError {
+/// Why ensuring a head [`super::heads::Want`] failed.
+pub(super) enum WantError {
     Const { key: LibKey, error: super::consts::ConstFail },
     Head(super::heads::HeadError),
 }
 
-impl core::fmt::Display for TraitWantError {
+impl core::fmt::Display for WantError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            TraitWantError::Const { key, error } => write!(f, "the constant {key:x} its head names: {error:?}"),
-            TraitWantError::Head(e) => write!(f, "{e:?}"),
+            WantError::Const { key, error } => write!(f, "the constant {key:x} its head names: {error:?}"),
+            WantError::Head(e) => write!(f, "{e:?}"),
         }
     }
 }
 
-/// Ensures a trait head or member table (`Want::Head` or `Want::Members`), evaluating any
-/// constants its signature types name (`Why::NeedConst`, e.g. array lengths or const generic
-/// arguments in method signatures such as `BlobStore::get_cells`) up to [`MOST_ADT_LENS`] times.
-fn ensure_trait_want<'n, S: super::source::NamesSource<'n>>(
+/// Ensures `want` in `r.store`, evaluating any constants its signature types name
+/// (`Why::NeedConst`, e.g. array lengths or const generic arguments) up to [`MOST_ADT_LENS`]
+/// times: the ONE shared want-ensuring loop across object tables, lazy head loading, and statics.
+pub(super) fn ensure_want<'n, S: super::source::NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
     want: super::heads::Want,
-) -> Result<(), TraitWantError> {
+) -> Result<(), WantError> {
     let mut lens = 0;
     loop {
         match r.store.ensure(r.names, r.keys, want) {
             Err(super::heads::HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
                 lens += 1;
                 if let Err(error) = super::check::eval_len(r, c) {
-                    return Err(TraitWantError::Const { key: c, error });
+                    return Err(WantError::Const { key: c, error });
                 }
             }
-            Err(e) => return Err(TraitWantError::Head(e)),
+            Err(e) => return Err(WantError::Head(e)),
             Ok(()) => return Ok(()),
         }
     }
@@ -605,8 +606,16 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
                 return Err(String::from("more traits under its objects than the most one program's objects reach"));
             }
             let lib = r.keys.library_in(r.names, k).ok_or_else(|| String::from("no library key"))?;
-            ensure_trait_want(r, super::heads::Want::Head(lib)).map_err(|e| format!("its head: {e}"))?;
-            ensure_trait_want(r, super::heads::Want::Members(lib)).map_err(|e| format!("its members: {e}"))?;
+            if let Err(e) = ensure_want(r, super::heads::Want::Head(lib)) {
+                let mut s = blaze_own::String::new_in(r.store.work_alloc());
+                let _ = core::fmt::write(&mut s, format_args!("its head: {e}"));
+                return Err(s.as_str().into());
+            }
+            if let Err(e) = ensure_want(r, super::heads::Want::Members(lib)) {
+                let mut s = blaze_own::String::new_in(r.store.work_alloc());
+                let _ = core::fmt::write(&mut s, format_args!("its members: {e}"));
+                return Err(s.as_str().into());
+            }
             let head = r.store.maps.traits.get(&lib).ok_or_else(|| String::from("made, but no head filed under its key"))?;
             let supers_written = r.store.maps.supers.get(&lib).ok_or_else(|| String::from("made, but no supertraits filed under its key"))?;
             let view = r.store.tys.view();
@@ -1557,6 +1566,8 @@ struct Symbols {
     track_caller: bool,
     /// `#[inline]`, `#[inline(always)]`, `#[inline(never)]`, `#[cold]`.
     fn_attrs: blaze_lir::func::FnAttrs,
+    /// `#[linkage = "extern_weak"]`: only supported on foreign statics (refused on functions).
+    extern_weak: bool,
 }
 
 /// The identifier a signature's lowering declares, `r#` dropped: the symbol `#[no_mangle]`
@@ -1583,7 +1594,7 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
     // `sig::HAS_BODY`), as the frozen fn head's qualifiers read by const_fn_fact.rs.
     let has_body = v.head[head::FLAGS] & blaze_lower::machine::sig::HAS_BODY != 0;
     let intrinsic_declared = super::intrinsic_rule::Declared { has_body, must_be_overridden: false };
-    let mut out = Symbols { export: None, link_name: None, intrinsic: false, intrinsic_declared, nounwind: false, track_caller: false, fn_attrs: blaze_lir::func::FnAttrs::default() };
+    let mut out = Symbols { export: None, link_name: None, intrinsic: false, intrinsic_declared, nounwind: false, track_caller: false, fn_attrs: blaze_lir::func::FnAttrs::default(), extern_weak: false };
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
         let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
         // The cooked string, as the native image reads it (links.rs `symbol_of`): escapes
@@ -1611,6 +1622,12 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
             "rustc_nounwind" => out.nounwind = true,
             "track_caller" => out.track_caller = true,
             "cold" => out.fn_attrs.0 |= blaze_lir::func::FnAttrs::COLD,
+            "linkage" => {
+                let t = v.text_at(a.args).map_err(|e| refuse(format!("{e:?}")))?;
+                if t.trim().trim_start_matches('=').trim().trim_matches('"') == "extern_weak" {
+                    out.extern_weak = true;
+                }
+            }
             "inline" => {
                 let args = v.text_at(a.args).map_or("", str::trim);
                 let inner = args.strip_prefix('(').and_then(|s| s.strip_suffix(')')).unwrap_or(args).trim();

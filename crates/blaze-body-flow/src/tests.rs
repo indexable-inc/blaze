@@ -736,6 +736,7 @@ mod d119_oracle_parity {
             pat_editions: &[],
             record_expr_schemas: &[],
             closure_param_regions: &[],
+            loop_marks: &[],
         }
     }
 

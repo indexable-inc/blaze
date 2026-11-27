@@ -676,6 +676,138 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
             text.push_str(&super::check::unsafe_op_shown(r, op));
             text.push_str(" is unsafe and requires unsafe block (the body of an `unsafe fn` is no unsafe block in edition 2024)");
         }
+        blaze_typeck::TypedFinding::Cost { violation, declared, actual, declared_sync, actual_sync, loop_depth, callee, .. } => {
+            use core::fmt::Write as _;
+            use blaze_typeck::CostViolation as V;
+            let callee_shown = |text: &mut AString<'a>, k: blaze_typeck::ItemKey| {
+                let shown = super::item_shown::ItemShown::of(r.names, &*r.keys, k);
+                text.push_str("`");
+                match shown.path() {
+                    Some(path) => text.push_str(path),
+                    None => text.push_str(&shown.boxed()),
+                }
+                text.push_str("`");
+            };
+            match violation {
+                V::MalformedContract => {
+                    text.push_str(
+                        "malformed or duplicate `#[blaze::cost(..)]` contract: expected a complexity class \
+                         (`O(1)`, `amortized O(1)`, `O(log n)`, `O(n)`, `O(n log n)`, `O(n^2)`), optional \
+                         `space = <class>`, optional sync mark (`lock_free` | `atomic` | `locks`), and optional \
+                         `trusted = \"<reason>\"`",
+                    );
+                }
+                V::MalformedLoopMark => {
+                    text.push_str(
+                        "malformed or duplicate `#[blaze::cost(..)]` loop mark: expected `bounded`, `amortized`, \
+                         or `reset` (each optionally with `= \"<reason>\"`)",
+                    );
+                }
+                V::LoopExceedsBudget => {
+                    let _ = write!(
+                        text,
+                        "loop at depth {loop_depth} has time cost {}, exceeding declared `#[blaze::cost({})]`; \
+                         mark the loop `#[blaze::cost(bounded)]` or `#[blaze::cost(amortized)]`, or widen the contract",
+                        actual.name(),
+                        declared.name(),
+                    );
+                }
+                V::CallExceedsBudget => {
+                    text.push_str("call to ");
+                    match callee {
+                        Some(k) => callee_shown(&mut text, k),
+                        None => text.push_str("callee"),
+                    }
+                    let _ = write!(
+                        text,
+                        " at loop depth {loop_depth} has effective time cost {}, exceeding declared `#[blaze::cost({})]`; \
+                         mark the loop `#[blaze::cost(bounded)]` or `#[blaze::cost(amortized)]`, replace the callee, or widen the contract",
+                        actual.name(),
+                        declared.name(),
+                    );
+                }
+                V::DirectRecursion => {
+                    text.push_str("direct recursive call to ");
+                    match callee {
+                        Some(k) => callee_shown(&mut text, k),
+                        None => text.push_str("self"),
+                    }
+                    let _ = write!(
+                        text,
+                        " is not proven within declared `#[blaze::cost({})]`; \
+                         convert to a bounded loop, widen the contract, or annotate `trusted = \"<reason>\"`",
+                        declared.name(),
+                    );
+                }
+                V::SpaceExceedsBudget => {
+                    text.push_str("call to ");
+                    match callee {
+                        Some(k) => callee_shown(&mut text, k),
+                        None => text.push_str("callee"),
+                    }
+                    let _ = write!(
+                        text,
+                        " at space-loop depth {loop_depth} has effective space cost {}, exceeding declared `space = {}`; \
+                         mark the loop `#[blaze::cost(reset)]` or `#[blaze::cost(bounded)]`, replace the callee, or widen the space bound",
+                        actual.name(),
+                        declared.name(),
+                    );
+                }
+                V::SyncExceedsBudget => {
+                    text.push_str("call to ");
+                    match callee {
+                        Some(k) => callee_shown(&mut text, k),
+                        None => text.push_str("callee"),
+                    }
+                    let _ = write!(
+                        text,
+                        " has synchronization cost `{}`, exceeding declared `{}`; \
+                         replace the callee with a `{}` operation or widen the sync contract",
+                        actual_sync.name(),
+                        declared_sync.name(),
+                        declared_sync.name(),
+                    );
+                }
+                V::LockInLoop => {
+                    text.push_str("call to ");
+                    match callee {
+                        Some(k) => callee_shown(&mut text, k),
+                        None => text.push_str("callee"),
+                    }
+                    let _ = write!(
+                        text,
+                        " acquires a lock (`{}`) inside a loop at depth {loop_depth}; \
+                         hoist the lock outside the loop, mark the loop `#[blaze::cost(bounded)]`, or declare `locks` on this function",
+                        actual_sync.name(),
+                    );
+                }
+            }
+        }
+        blaze_typeck::TypedFinding::CapabilityInSansIo { adt, capability, via_adt, borrowed, .. } => {
+            let show_item = |text: &mut AString<'a>, k: blaze_typeck::ItemKey| {
+                let shown = super::item_shown::ItemShown::of(r.names, &*r.keys, k);
+                text.push_str("`");
+                match shown.path() {
+                    Some(path) => text.push_str(path),
+                    None => text.push_str(&shown.boxed()),
+                }
+                text.push_str("`");
+            };
+            show_item(&mut text, adt);
+            text.push_str(" is defined in `#![blaze::sans_io]` and ");
+            if borrowed {
+                text.push_str("borrows");
+            } else {
+                text.push_str("stores");
+            }
+            text.push_str(" `#[blaze::capability]` type ");
+            show_item(&mut text, capability);
+            if let Some(via) = via_adt {
+                text.push_str(" transitively through ");
+                show_item(&mut text, via);
+            }
+            text.push_str(": pass capabilities as method arguments instead of storing them in sans-IO data");
+        }
     }
     BodyLintFinding { lint: f.lint(), text, start: at.start, end: at.end }
 }

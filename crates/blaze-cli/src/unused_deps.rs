@@ -567,6 +567,150 @@ fn scan_file_cached(
     Ok(true)
 }
 
+/// Opens one `ExpansionRecord` from `bytes` (raw or zstd-compressed), marks any matching crate
+/// identifiers from `targets` in `used`, and returns `Some(encoded_bud1)` on success (or `None` if
+/// `bytes` is not a valid expansion record).
+fn scan_expansion_bytes<'f>(
+    bytes: &[u8],
+    targets: &[&str],
+    used: &mut [bool],
+    frame: &'f Frame,
+) -> Option<Option<Vec<u8, &'f Frame>>> {
+    let erased = blaze_own::Erased::new(frame);
+    let record = blaze_scope::expansion_records::ExpansionRecord::open_in(bytes, erased.bump()).ok()?;
+    if let Some(idents) = extract_file_refs(record.text, frame) {
+        for &ident in idents.iter() {
+            if all_used(used) {
+                break;
+            }
+            mark_if_target(ident, targets, used);
+        }
+        Some(encode_file_refs(&idents, frame))
+    } else {
+        scan_used_crates(record.text, targets, used);
+        Some(None)
+    }
+}
+
+/// Scans one macro expansion record (`Key(rec_id)`) for `targets`, hitting the per-content-digest
+/// `BUD1` CAS cache when present so unchanged expansions skip opening/decompression/lexing.
+/// Returns `Ok(true)` if scanned cleanly, or `Ok(false)` if the record was missing or unreadable.
+fn scan_expansion_record_cached(
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'_>,
+    rec_id: ContentId,
+    targets: &[&str],
+    used: &mut [bool],
+    kept_keys: &mut blaze_engine::SVec<'_, Key>,
+    scratch: &mut Option<Frame>,
+) -> Result<bool, CliError> {
+    let cache_key = file_refs_key(rec_id);
+    if let Some(held) = store.get(cx, cache_key)?
+        && match_file_refs(held.bytes, targets, used)
+    {
+        kept_keys.push(cache_key);
+        return Ok(true);
+    }
+    let frame: &Frame = match scratch {
+        Some(frame) => {
+            frame.reset();
+            frame
+        }
+        None => {
+            let made = Frame::with_reserve(SCAN_FRAME, bstd::mem::Tag::Other)
+                .map_err(|_| CliError::Text { what: "unused_deps: could not reserve scan frame" })?;
+            scratch.insert(made)
+        }
+    };
+    let encoded: Option<Vec<u8, &Frame>> = {
+        let Some(held_exp) = store.get(cx, Key(rec_id))? else {
+            return Ok(false);
+        };
+        let Some(encoded) = scan_expansion_bytes(held_exp.bytes, targets, used, frame) else {
+            return Ok(false);
+        };
+        encoded
+    };
+    if let Some(encoded) = encoded {
+        store.put(cx, cache_key, &encoded)?;
+        kept_keys.push(cache_key);
+    }
+    Ok(true)
+}
+
+/// Scans macro expansion texts recorded in every `CrateScope` of `package` for `targets` (catching
+/// crate references introduced by proc macros such as `serde_derive` expanding
+/// `extern crate serde as _serde;`, declarative macros, or `include!()` generated sources).
+/// Only called when raw `.rs` scanning left at least one candidate dependency unmarked.
+#[expect(clippy::too_many_arguments, reason = "macro-expansion dep scan helper: each argument one input handle")]
+fn scan_member_expansions(
+    cx: &Cx,
+    store: &mut dyn crate::store::Store<'_>,
+    names: &NamesStage<'_>,
+    package: &str,
+    targets: &[&str],
+    used: &mut [bool],
+    kept_keys: &mut blaze_engine::SVec<'_, Key>,
+    scratch: &mut Option<Frame>,
+    frame: &Frame,
+) -> Result<bool, CliError> {
+    let Some(world) = names.names.as_ref() else {
+        return Ok(false);
+    };
+    let list = world.list();
+    let count = blaze_world::crate_list::CrateGraph::len(list);
+    let inputs = crate::engine_names::NamesInputs::ran(names);
+    let mut record_ids: Vec<ContentId, &Frame> = Vec::new_in(frame);
+    let mut complete = true;
+    for r in 0..count {
+        if !list.member(r) || list.package(r) != package {
+            continue;
+        }
+        let scope_name = blaze_drive::key::crate_scope_name(&list.key(r));
+        let Some(input) = inputs.input_of(scope_name) else {
+            complete = false;
+            continue;
+        };
+        let Some(held_scope) = store.get(cx, input.at)? else {
+            complete = false;
+            continue;
+        };
+        let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(held_scope.bytes) else {
+            complete = false;
+            continue;
+        };
+        let Ok(parts) = crate::names::sections::sections(view.payload) else {
+            complete = false;
+            continue;
+        };
+        if parts.expansions.is_empty() {
+            continue;
+        }
+        let Ok(dir) = blaze_scope::expansion_records::Directory::open(parts.expansions) else {
+            complete = false;
+            continue;
+        };
+        for i in 0..dir.len() {
+            let Ok(entry) = dir.entry_at(i) else {
+                complete = false;
+                break;
+            };
+            record_ids.push(entry.record);
+        }
+    }
+    record_ids.sort_unstable();
+    record_ids.dedup();
+    for rec_id in record_ids.iter().copied() {
+        if all_used(used) {
+            break;
+        }
+        if !scan_expansion_record_cached(cx, store, rec_id, targets, used, kept_keys, scratch)? {
+            complete = false;
+        }
+    }
+    Ok(complete)
+}
+
 /// Check whether a member's targets in the engine answer completed cleanly enough to report
 /// unused dependencies without false positives.
 fn member_checked_completely(
@@ -781,6 +925,15 @@ pub(crate) fn collect(
                 if !scan_file_cached(cx, root, store, dev_path, file_id, &code_idents, &mut code_used, kept_keys, &mut scratch)? {
                     dev_scan_complete = false;
                 }
+            }
+            // If any dependency still looks unused in raw source text, scan macro expansion texts
+            // recorded in this member's `CrateScope` records (e.g. `#[derive(serde_derive::Deserialize)]`
+            // expanding `extern crate serde as _serde;`, declarative macros, or `include!()`).
+            if !all_used(&code_used)
+                && !scan_member_expansions(cx, store, names, member.package, &code_idents, &mut code_used, kept_keys, &mut scratch, frame)?
+            {
+                code_scan_complete = false;
+                dev_scan_complete = false;
             }
         }
 
@@ -1007,5 +1160,53 @@ mod tests {
         assert_eq!(index.get("src/mod_remapped.rs").copied(), None, "AT_MOD_RS slots excluded");
         assert_eq!(index.get("src/absent.rs").copied(), None, "absent slots excluded");
         assert_eq!(index.get("Cargo.toml").copied(), None, "non-Slot leaves excluded");
+    }
+
+    #[test]
+    fn expansion_record_scan_detects_macro_expanded_serde_and_keeps_unused_unmarked() {
+        let frame = Frame::with_reserve(2 << 20, bstd::mem::Tag::Other).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        // Simulate `#[derive(serde_derive::Deserialize)]` expansion output (large enough to also
+        // exercise zstd-compressed `ExpansionRecord::write` alongside raw `write_raw`).
+        let expanded = r#"
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals, unused_attributes, unused_qualifications)]
+            const _: () = {
+                #[allow(unused_extern_crates, clippy::useless_attribute)]
+                extern crate serde as _serde;
+                #[automatically_derived]
+                impl<'de> _serde::Deserialize<'de> for Message {
+                    fn deserialize<__D>(__deserializer: __D) -> _serde::__private::Result<Self, __D::Error>
+                    where
+                        __D: _serde::Deserializer<'de>,
+                    {
+                        ::core::result::Result::Ok(Message::Empty)
+                    }
+                }
+            };
+        "#;
+
+        let mut raw_rec = blaze_own::AVec::new_in(erased.handle());
+        blaze_scope::expansion_records::ExpansionRecord::write_raw(expanded, &[], &mut raw_rec).expect("raw record");
+        let mut comp_rec = blaze_own::AVec::new_in(erased.handle());
+        blaze_scope::expansion_records::ExpansionRecord::write(expanded, &[], &mut comp_rec).expect("compressed record");
+
+        let targets = ["serde", "ghost"];
+        for (label, bytes) in [("raw", raw_rec.as_slice()), ("compressed", comp_rec.as_slice())] {
+            let mut used = [false; 2];
+            let bud1 = scan_expansion_bytes(bytes, &targets, &mut used, &frame)
+                .unwrap_or_else(|| panic!("{label} expansion record should decode"))
+                .expect("encoded BUD1");
+            assert!(used[0], "{label}: macro-expanded `extern crate serde as _serde` must mark `serde` used");
+            assert!(!used[1], "{label}: genuinely unused `ghost` must stay unmarked");
+
+            let mut cached = [false; 2];
+            assert!(match_file_refs(&bud1, &targets, &mut cached));
+            assert_eq!(cached, [true, false], "{label}: cached BUD1 replay must match");
+        }
+
+        // Corrupt bytes return None so callers mark scan incomplete instead of emitting false positives.
+        let mut bad_used = [false; 2];
+        assert!(scan_expansion_bytes(b"corrupt", &targets, &mut bad_used, &frame).is_none());
     }
 }

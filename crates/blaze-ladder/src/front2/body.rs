@@ -411,6 +411,14 @@ struct BodyTypes<'b, S> {
     /// Enclosing container `Self` regions, impl trait regions, and container + fn parameter bounds
     /// handed to `RegionSink::set_given` when laying closure parameter annotations (`&Self`, `P::Cx`).
     self_given: SelfGiven<'b>,
+    /// Heads requested via `Why::Need` by [`Self::closure_param_regions`]'s `Builder::ty_regions`
+    /// (e.g. a type named inside an omitted defaulted type argument whose pre-built `PTy` let
+    /// `BodyTypes::ty` succeed on a seeded `Head::Adt` without loading that head). Ensured by
+    /// `lower_at` before accepting the round so `closure_param_regions` never silently drops
+    /// shared elided regions.
+    region_needs: blaze_own::Vec<LibKey, Alloc<'static>>,
+    /// A const evaluation (`Why::NeedConst`) requested by [`Self::closure_param_regions`].
+    region_need_const: Option<Why>,
 }
 
 /// A fn's `#[rustc_legacy_const_generics(..)]` positions, by its key: what
@@ -626,7 +634,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         let usize_node = blaze_typeck::PNode::Uint(blaze_typeck::UintTy::Usize);
         // A `const` item declared in the body comes first (`const MOST: usize = ..; [x; MOST]`:
         // front2/const_open.rs `local_const`): a block's item shadows the module's name.
-        let made = match super::const_open::local_const(self.locals, self.owner, self.builder.heads, view, len, text, range) {
+        let made = match super::const_open::local_const(&self.builder.resolver, self.builder.marks, self.locals, self.owner, self.env.module, self.builder.heads, view, len, text, range) {
             Ok(Some(bits)) => match super::types::intern(tys, usize_node) {
                 Ok(ty) => super::types::intern(tys, blaze_typeck::PNode::ConstValue { ty, bits }),
                 Err(why) => Err(why),
@@ -671,7 +679,7 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         let range = view.site(view.type_range(t)?)?;
         // Its refusal (a local constant not evaluated yet, a local value that is no constant)
         // stands only once the name is known to be no type.
-        let local = super::const_open::local_arg(self.locals, self.owner, self.builder.heads, view, t, name, range);
+        let local = super::const_open::local_arg(&self.builder.resolver, self.builder.marks, self.locals, self.owner, self.env.module, self.builder.heads, view, t, name, range);
         if matches!(local, Ok(Some(LocalArg::Type))) {
             return Types::ty(self, view, t, tys).map(ConstTerm::Is);
         }
@@ -747,8 +755,21 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         }
         let mut sink = super::types::RegionSink::new_in(self.mark_alloc);
         sink.set_given(self.self_given);
-        let Ok(made) = self.builder.ty_regions(tys, &env, view, t, &mut sink) else {
-            return false;
+        let made = match self.builder.ty_regions(tys, &env, view, t, &mut sink) {
+            Ok(made) => made,
+            Err(Why::Need(k)) => {
+                if !self.region_needs.iter().any(|&seen| seen == k) {
+                    self.region_needs.push(k);
+                }
+                return false;
+            }
+            Err(why @ Why::NeedConst(..)) => {
+                if self.region_need_const.is_none() {
+                    self.region_need_const = Some(why);
+                }
+                return false;
+            }
+            Err(_) => return false,
         };
         if sink.refused().is_some() {
             return false;
@@ -1653,12 +1674,11 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
     // The body's blocks the names library made modules: a call in one, written by hand or by
-    // an expansion, reads its path there (scoped.rs `body_blocks`). Only for a text that is the
-    // library's item's or member's own (a local item's body, an anonymous constant's
-    // rendering: none).
-    // A member by its key, never by its text's slice (locals.rs `library_item_or_member`: a
-    // method's blocks had no modules before).
-    let blocks = match (super::locals::library_item_or_member(names, keys, item, owner, text), names.crate_key(krate)) {
+    // an expansion, reads its path there (scoped.rs `body_blocks`). Uses `store.locals.library_body`
+    // so both top-level items/members AND local fns/consts/statics whose blocks the names library
+    // wrote (`Locals::library_twin`, e.g. `std::sys::process::unix::<impl Command>::posix_spawn::get_posix_spawn_addchdir`)
+    // resolve block-local macro imports like `use crate::sys::weak::weak; weak!(...);`.
+    let blocks = match (store.locals.library_body(names, keys, item, owner, text), names.crate_key(krate)) {
         (Some(body), Some(crate_key)) => super::scoped::body_blocks(crate_key, body, text, alloc),
         _ => None,
     };
@@ -1884,6 +1904,8 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             async_ret,
             legacy: &store.fns,
             self_given,
+            region_needs: blaze_own::Vec::new_in(alloc),
+            region_need_const: None,
         };
         // Each round converts into a fresh overlay of the records' table (read in place, never
         // copied): a refused round's types are dropped with it, none reaches `store.tys`, and
@@ -1936,35 +1958,68 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
                 (converted, kept)
             }
         };
+        let BodyTypes { failed, expanded_type, misses, region_needs, region_need_const, .. } = types;
+        let want_of = |store: &Store<'n>, k: LibKey| match (Paths { names }).detail(k) {
+            Some(blaze_surface::ItemDetail::Fn { .. }) => Want::Fn(k),
+            _ => store.need(k),
+        };
         match converted {
             Ok(b) => {
+                if let Some(&first) = region_needs.first() {
+                    if again_now {
+                        return Err(BodyError::Convert {
+                            item,
+                            refused: Refused::Form { what: "a closure parameter's regions", range: Range::new(0, 0) },
+                            why: Some(Why::Need(first)),
+                            expanded_type: None,
+                        });
+                    }
+                    for &k in region_needs.iter() {
+                        last = k;
+                        let need = want_of(store, k);
+                        store.ensure(names, keys, need).map_err(|error| BodyError::Head { item, error })?;
+                    }
+                    continue;
+                }
+                if let Some(why @ Why::NeedConst(_, range)) = region_need_const {
+                    return Err(BodyError::Convert {
+                        item,
+                        refused: Refused::Form { what: "a closure parameter's regions", range },
+                        why: Some(why),
+                        expanded_type: None,
+                    });
+                }
                 // Lowered into another table (`lower_again`): the body keeps no types of its own.
                 let kept = match kept {
                     Some(k) => k,
                     None => OwnTys::none(alloc),
                 };
-                typeck = Some((b, kept, core::mem::replace(&mut types.misses, blaze_own::Vec::new_in(alloc))));
+                typeck = Some((b, kept, misses));
                 break;
             }
             // A fn whose text has no body (an intrinsic's or a foreign fn's declaration, met
             // before its head was made): the table's to say how it is called, never a lowering.
             Err(Refused::NoBody) => return Err(BodyError::NoBody(owner)),
-            Err(refused) => match types.failed.take() {
+            Err(refused) => match failed {
                 // Lowered again into a finished table: a head it lacks cannot be added there.
                 Some(why @ Why::Need(_)) if again_now => return Err(BodyError::Convert { item, refused, why: Some(why), expanded_type: None }),
                 Some(Why::Need(k)) => {
                     last = k;
                     // A free fn's head (its const parameters, which type a const argument
                     // written on a path to it: `BodyTypes::arg_param`) is its `Want::Fn`.
-                    let need = match (Paths { names }).detail(k) {
-                        Some(blaze_surface::ItemDetail::Fn { .. }) => Want::Fn(k),
-                        _ => store.need(k),
-                    };
+                    let need = want_of(store, k);
                     store.ensure(names, keys, need).map_err(|error| BodyError::Head { item, error })?;
+                    for &rk in region_needs.iter() {
+                        if rk != k {
+                            last = rk;
+                            let rneed = want_of(store, rk);
+                            store.ensure(names, keys, rneed).map_err(|error| BodyError::Head { item, error })?;
+                        }
+                    }
                 }
                 why => {
                     // Own the spelling in `Box<str>` so it outlives the lowering and store.
-                    let expanded_type = types.expanded_type.map(|at| view.text_at(at).map(Box::<str>::from));
+                    let expanded_type = expanded_type.map(|at| view.text_at(at).map(Box::<str>::from));
                     return Err(BodyError::Convert { item, refused, why, expanded_type });
                 }
             },
@@ -2667,6 +2722,100 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: Pool<'a>> Machine<'w, 'l, 'g, 't, 'wk, 'a, W> {
                 (0, step(root, 0), 4, WrittenRegion::Named),
                 (0, step(root, 0), 5, WrittenRegion::Named),
                 (1, step(root, 0), 0, WrittenRegion::Named),
+            ]
+        );
+    }
+
+    /// Frozen `Head::Adt` records (seeded `blaze check` via `Store::file_heads`) restore
+    /// `Records<'r, 'n, S = &'n Names<'n>>` into `store.maps.generics` with its pre-built
+    /// default `PTy(&Names)` WITHOUT restoring `Names` into `store.maps.generics`.
+    /// When a body (like `front2::program::make_from`) writes `|r: &Records<'_, '_>|` and never
+    /// names `Names` directly as a written type in the body, `BodyTypes::ty` succeeds on round 1
+    /// using the pre-built default `PTy`, while `BodyTypes::closure_param_regions` calls
+    /// `Builder::ty_regions` -> `lay_default_arg` -> `def_builder.ty_regions(&'n Names<'n>)`,
+    /// which returns `Err(Why::Need(Names))`. `closure_param_regions` must propagate `Why::Need`
+    /// so `lower_at` ensures `Names` and retries, instead of silently falling back to syntactic
+    /// `record_closure_param_regions` and dropping the shared `WrittenRegion::Elided(2)` slots.
+    #[test]
+    fn front2_closure_param_regions_seeded_default_arg_missing_head() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub struct Names<'n>(pub &'n u8);
+pub struct Records<'r, 'n, S = &'n Names<'n>> {
+    pub r: &'r u8,
+    pub s: S,
+}
+pub fn make_from() {
+    let _ = |r: &Records<'_, '_>| { let _ = r; };
+}
+"#;
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let bump = erased.bump();
+        let store_heap = blaze_own::testing::heap();
+        let store_alloc = store_heap.alloc();
+        let input = CrateInput {
+            name: "seeded_defarg_test",
+            key: CrateItemKey(ContentId::of("closure_param_regions_seeded_defarg_test", b"seeded_defarg_test")),
+            root: "/fnptr/src/lib.rs",
+            shown_from: "/fnptr/",
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let names = resolve_crates(&[input], Sysroot::default(), &OneFile(src), &Serial, bump).expect("resolve");
+        let front_frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("front frame");
+        let files = [SourceFile { path: "src/lib.rs", text: src }];
+        let mut front = Front2::new(&names, &front_frame, &files, store_alloc).expect("front2");
+        let prepared = Prepares::new_in(bump);
+        let mut store = Store::new(front.index.lang("sized"), front.frame, store_alloc);
+
+        let mut names_key = None;
+        let mut records_key = None;
+        let mut fn_key = None;
+        for (item, _, _) in names.items(0) {
+            match super::NamesSource::name_of(&names, item) {
+                Some("Names") => names_key = Some(item),
+                Some("Records") => records_key = Some(item),
+                Some("make_from") => fn_key = Some(item),
+                _ => {}
+            }
+        }
+        let names_key = names_key.expect("Names");
+        let records_key = records_key.expect("Records");
+        let fn_key = fn_key.expect("make_from");
+
+        // Ensure `Records` and `make_from`'s head, then evict `Names` from `store.maps.generics`
+        // and `store.adts` to match a seeded store whose frozen `Head::Adt(Records)` restored
+        // `Records`'s pre-built default `PTy(&Names)` without loading `Names`'s head.
+        store.ensure(&names, &mut front.keys, super::Want::Adt(records_key)).expect("Records head");
+        store.ensure(&names, &mut front.keys, super::Want::Fn(fn_key)).expect("make_from head");
+        store.maps.generics.remove(&names_key);
+        store.adts.remove(&super::checker_of(names_key));
+        assert!(!store.maps.generics.contains_key(&names_key));
+
+        let body = lower_fn(&names, &prepared, &mut front.keys, &mut store, fn_key).expect("lower_fn");
+        assert!(store.maps.generics.contains_key(&names_key), "lower_at must ensure Names for closure_param_regions");
+        let mut out = blaze_own::Vec::new_in(alloc);
+        for r in body.typeck.closure_param_regions.iter() {
+            out.push((r.param, r.path, r.own, r.kind));
+        }
+
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+        let p_rec = step(root, 0);
+        let p_s_ref = step(p_rec, 0);
+        let p_names = step(p_s_ref, 0);
+        assert_eq!(
+            &out[..],
+            &[
+                (0, p_rec, 1, WrittenRegion::Elided(1)),
+                (0, p_s_ref, 0, WrittenRegion::Elided(1)),
+                (0, p_names, 0, WrittenRegion::Elided(1)),
             ]
         );
     }

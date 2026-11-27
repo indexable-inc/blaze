@@ -147,6 +147,7 @@ impl<P: Producer> fmt::Debug for ProducerId<P> {
 }
 
 const BUILD_DOMAIN: &str = "blaze producer of the build";
+const SOURCE_DOMAIN: &str = "blaze producer of sources 1";
 const TEST_DOMAIN: &str = "blaze producer for a test";
 const TABLE_DOMAIN: &str = "blaze producer table";
 
@@ -159,10 +160,23 @@ pub struct Producers {
 impl Producers {
     /// Every row from the running binary's build id (bstd's `Host::build_id`), each under its
     /// row's name. A rebuilt blaze has new ids for every producer, so nothing is stale and nothing
-    /// is shared between builds. The one constructor outside tests while every producing function
-    /// is in the entry crate (blaze-cli `producers.rs` says why the source rows of piece 2 went).
+    /// is shared between builds.
     pub fn of_build(build_id: &[u8]) -> Producers {
         Producers { rows: Row::ALL.map(|row| row_digest(BUILD_DOMAIN, row, build_id)) }
+    }
+
+    /// Every row from `build_id`, except each `(row, source_digest)` override whose producing
+    /// function lives inside a crate dependency closure covered by `source_digest` (D105,
+    /// `docs/v2/plan/design/producer-id.md`). [`Row::Whole`] is never overridden and stays keyed
+    /// by `build_id`.
+    pub fn of_build_with_sources(build_id: &[u8], sources: &[(Row, [u8; 32])]) -> Producers {
+        let mut rows = Row::ALL.map(|row| row_digest(BUILD_DOMAIN, row, build_id));
+        for &(row, digest) in sources {
+            if row != Row::Whole {
+                rows[row.index()] = row_digest(SOURCE_DOMAIN, row, &digest);
+            }
+        }
+        Producers { rows }
     }
 
     /// A fixed table for a test: every row from `seed`. Two tests with one seed agree; nothing
@@ -240,5 +254,22 @@ mod tests {
         }
         assert_eq!(Producers::of_build(b"one"), one);
         std::println!("producers: typed ids hold; another build moves all {} rows", Row::COUNT);
+    }
+
+    /// Source-keyed rows stay identical across different binary build ids and move when their
+    /// source digest moves; `Row::Whole` and non-overridden rows always follow `build_id`.
+    #[test]
+    fn source_override_decouples_row_from_build_id() {
+        let src_a = [0x11u8; 32];
+        let src_b = [0x22u8; 32];
+        let one = Producers::of_build_with_sources(b"build-1", &[(Row::CodeBuilder, src_a), (Row::Whole, src_a)]);
+        let two = Producers::of_build_with_sources(b"build-2", &[(Row::CodeBuilder, src_a), (Row::Whole, src_a)]);
+        let moved = Producers::of_build_with_sources(b"build-1", &[(Row::CodeBuilder, src_b)]);
+
+        assert_eq!(one.get::<CodeBuilder>(), two.get::<CodeBuilder>(), "same source keeps CodeBuilder across builds");
+        assert_ne!(one.get::<CodeBuilder>(), moved.get::<CodeBuilder>(), "changed source moves CodeBuilder");
+        assert_ne!(one.get::<Whole>(), two.get::<Whole>(), "Whole always follows build_id");
+        assert_ne!(one.get::<Names>(), two.get::<Names>(), "non-overridden rows follow build_id");
+        assert_ne!(one.get::<CodeBuilder>().id(), Producers::of_build(b"build-1").get::<CodeBuilder>().id());
     }
 }

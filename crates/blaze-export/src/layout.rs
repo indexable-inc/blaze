@@ -92,6 +92,17 @@ pub struct Import<'r> {
     pub symbol: Symbol,
     /// The name as the C library spells it, without a platform's prefix.
     pub name: &'r str,
+    /// True iff every reference to this symbol is `Space::WeakOutside` (strong overrides weak).
+    pub weak: bool,
+}
+
+/// Sorts `imports` by `symbol` and merges duplicates: an import stays `weak: true` ONLY if every
+/// reference to that symbol is weak (any strong reference overrides weak).
+pub(crate) fn dedup_imports(imports: &mut AVec<'_, Import<'_>>) {
+    // `false < true`, so any strong import sorts before weak imports of the same symbol and is
+    // kept by `dedup_by`.
+    imports.sort_unstable_by(|a, b| a.symbol.cmp(&b.symbol).then_with(|| a.weak.cmp(&b.weak)));
+    imports.dedup_by(|later, kept| later.symbol == kept.symbol);
 }
 
 /// The program laid out: each region's bytes at its image offset, and what the loader fixes.
@@ -289,7 +300,7 @@ pub(crate) fn target_home<M: LayoutMember>(
             }
             find_data(data, by_target, t).map(|d| data_home[d])
         }
-        Space::Tls | Space::Outside => None,
+        Space::Tls | Space::Outside | Space::WeakOutside => None,
     }
 }
 
@@ -432,7 +443,7 @@ pub(crate) fn lay_out_const_and_data<'a, M: LayoutMember>(
         let in_const = match datum.target.space {
             Space::Tls => !matches!(datum.place, DataPlace::Zeroed { .. }) && !datum.bytes.is_empty(),
             Space::Static | Space::Vtable => datum.place == DataPlace::ReadOnly,
-            Space::Func | Space::Outside => false,
+            Space::Func | Space::Outside | Space::WeakOutside => false,
         };
         if in_const {
             if konst.len() == post_tables {
@@ -627,8 +638,8 @@ impl<'a> ConstAndData<'a> {
                                 slot.copy_from_slice(&value.to_le_bytes());
                                 continue;
                             }
-                            Space::Outside if word.addend != 0 => return Err(ExportError::OutsideAddend { from: symbol, target: t }),
-                            Space::Outside => match import_of(t.symbol) {
+                            Space::Outside | Space::WeakOutside if word.addend != 0 => return Err(ExportError::OutsideAddend { from: symbol, target: t }),
+                            Space::Outside | Space::WeakOutside => match import_of(t.symbol) {
                                 Some(import) => FixTo::Bind { import: import as u32 },
                                 None => unreachable!("every outside target of a placed record was gathered above"),
                             },
@@ -648,11 +659,16 @@ impl<'a> ConstAndData<'a> {
             for w in datum.words {
                 let at = base + u64::from(w.at);
                 let to = match w.target {
-                    None if datum.target.space == Space::Tls => return Err(ExportError::DataTlsTarget { from: datum.target, target: datum.target }),
+                    // `OWN_DATUM` (`target: None`) inside a `Space::Tls` template points to an
+                    // immutable `'static` sub-allocation packed in the read-only template tail
+                    // (`make_template_entry` already refuses self-pointers into the TLS slot).
                     None => rebase_target(datum.target.symbol, at, base as i64 + w.addend, end)?,
                     Some(t) => match (t.space, import_of(t.symbol)) {
                         (Space::Tls, _) => return Err(ExportError::DataTlsTarget { from: datum.target, target: t }),
-                        (Space::Outside, Some(import)) if w.addend == 0 => FixTo::Bind { import: import as u32 },
+                        (Space::Outside | Space::WeakOutside, Some(import)) if w.addend == 0 => {
+                            let import = u32::try_from(import).map_err(|_| ExportError::TooLarge { what: "a datum bind import index", len: u64::MAX })?;
+                            FixTo::Bind { import }
+                        }
                         (Space::Func | Space::Static | Space::Vtable, _) => match home_of(t) {
                             Some(to) => rebase_target(datum.target.symbol, at, to as i64 + w.addend, end)?,
                             None => return Err(ExportError::DataOutOfReach { from: datum.target, target: t }),
@@ -1569,14 +1585,30 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
     }
     let text_end = plan.text_at + text.len() as u64;
 
-    // Every target a placed record names: C names gathered, thread-locals checked for runtime.
+    // Every target a placed record actually references in its sites or relro words: C names
+    // gathered, thread-locals checked for runtime. Unreferenced targets kept by `CodeRecord::seal`
+    // are ignored (matching `optimized.rs`), so dead strong entries cannot override a used weak
+    // reference to the same symbol.
     let mut imports: AVec<'a, Import<'r>> = Vec::new_in(alloc);
     for (pos, &i) in order.iter().enumerate() {
         if rep[pos] as usize != pos {
             continue;
         }
         let m = &members[i as usize];
-        for k in 0..m.record.targets() {
+        let site_targets = (0..m.record.sites())
+            .map(|s| m.record.site(s))
+            .filter(|s| s.kind != SiteKind::Relro)
+            .map(|s| s.target);
+        let word_targets = (0..m.record.words())
+            .map(|w| m.record.word(w).target)
+            .filter(|&target| target != OWN_CODE && target != OWN_RELRO);
+        for target_idx in site_targets.chain(word_targets) {
+            let Ok(k) = usize::try_from(target_idx) else {
+                continue;
+            };
+            if k >= m.record.targets() {
+                continue;
+            }
             let t = m.record.target(k);
             match t.space {
                 Space::Tls => {
@@ -1587,11 +1619,11 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
                         return Err(ExportError::OutOfReach { from: m.symbol, target: t });
                     }
                 }
-                Space::Outside => {
+                Space::Outside | Space::WeakOutside => {
                     let Some(name) = m.record.name(t.symbol) else {
                         return Err(ExportError::OutsideNameMissing { from: m.symbol, target: t });
                     };
-                    imports.push(Import { symbol: t.symbol, name });
+                    imports.push(Import { symbol: t.symbol, name, weak: t.space == Space::WeakOutside });
                 }
                 Space::Func | Space::Static | Space::Vtable => {}
             }
@@ -1603,15 +1635,14 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
         };
         for w in datum.words {
             if let Some(t) = w.target
-                && t.space == Space::Outside
+                && t.space.is_outside()
                 && let Some(&(_, name)) = datum.outside.iter().find(|&&(sym, _)| sym == t.symbol)
             {
-                imports.push(Import { symbol: t.symbol, name });
+                imports.push(Import { symbol: t.symbol, name, weak: t.space == Space::WeakOutside });
             }
         }
     }
-    imports.sort_unstable_by(|a, b| a.symbol.cmp(&b.symbol));
-    imports.dedup_by(|a, b| a.symbol == b.symbol);
+    dedup_imports(&mut imports);
     let import_of = |symbol: Symbol| imports.binary_search_by(|it| it.symbol.cmp(&symbol)).ok();
 
     let regions = lay_out_const_and_data(members, &order, &rep, data, &by_target, imports.len(), tls_plan, text_end, plan, tail, alloc)?;
@@ -1655,7 +1686,7 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
                     write32(&mut text, x, adrp(first, pc, word, symbol)?);
                     write32(&mut text, x + 4, ldr_lo12(second, word));
                 }
-                Space::Outside => {
+                Space::Outside | Space::WeakOutside => {
                     let Some(index) = import_of(t.symbol) else {
                         unreachable!("every outside target of a placed record was gathered above");
                     };
@@ -1672,9 +1703,16 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
                             return Err(ExportError::CallOfData { from: symbol, at: site.at });
                         }
                         SiteKind::Call => {
-                            write32(&mut text, x, NOP);
-                            write32(&mut text, x + 4, NOP);
-                            write32(&mut text, x + 8, bl(pc + 8, to, symbol)?);
+                            if let Ok(branch) = bl(pc + 8, to, symbol) {
+                                write32(&mut text, x, NOP);
+                                write32(&mut text, x + 4, NOP);
+                                write32(&mut text, x + 8, branch);
+                            } else {
+                                // Target is past ARM64 `bl`'s ±128 MiB reach: materialize `to` via
+                                // `adrp + add` (±4 GiB reach) into the existing `blr` at `x + 8`.
+                                write32(&mut text, x, adrp(first, pc, to, symbol)?);
+                                write32(&mut text, x + 4, add_lo12(second, to));
+                            }
                         }
                         _ => {
                             write32(&mut text, x, adrp(first, pc, to, symbol)?);
@@ -1738,7 +1776,7 @@ mod bolt_tests {
                 Space::Static => Some(Declare { kind: DeclaredKind::Static, item: 1, name: b"" }),
                 Space::Vtable => Some(Declare { kind: DeclaredKind::Vtable, item: 1, name: b"vt" }),
                 Space::Tls => Some(Declare { kind: DeclaredKind::ThreadLocal, item: 1, name: b"" }),
-                Space::Outside => None,
+                Space::Outside | Space::WeakOutside => None,
             }
         }
     }

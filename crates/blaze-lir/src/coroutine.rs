@@ -350,21 +350,23 @@ fn split_inner<A: Allocator + Clone>(
     region: Option<(Region, &[SlotName])>,
     alloc: A,
 ) -> Result<Split<A>, CoroutineError> {
-    verify(view).map_err(CoroutineError::Verify)?;
+    crate::verify::verify_in(view, &alloc).map_err(CoroutineError::Verify)?;
     let scratch = &alloc;
     let body = read(view, shape, panics, &scratch)?;
     let live = overlap::addressed(&body, &scratch);
     let lir_kept = kept_slots(&body, &live, plant, &scratch);
     // In a laid state the names decide what is kept, and an unnamed slot the pass would keep
     // that code after a suspension reaches is refused (coroutine_region.rs `kept_by_name`).
-    let (kept, at) = match region {
+    let (kept, at, conflicts) = match region {
         Some((r, names)) => {
-            let (kept, at) = region::kept_by_name(&body, &lir_kept, r, names, &scratch)?;
-            (kept, Some((r, at)))
+            let (kept, at, conflicts) = region::kept_by_name(&body, &live, &lir_kept, r, names, plant, &scratch)?;
+            (kept, Some((r, at)), conflicts)
         }
-        None => (lir_kept, None),
+        None => {
+            let conflicts = overlap::conflicts(&body, &live, &lir_kept, plant, &scratch);
+            (lir_kept, None, conflicts)
+        }
     };
-    let conflicts = overlap::conflicts(&body, &live, &kept, plant, &scratch);
     let crossing = crossing_values(&body, &scratch);
     let plan = plan(&body, &kept, &conflicts, &crossing, at.as_ref().map(|(r, at)| (*r, &at[..])), &scratch, alloc.clone())?;
     let poll = emit(&body, &plan, Which::Poll, plant, &scratch, alloc.clone())?;
@@ -1471,7 +1473,7 @@ fn emit<S: Allocator + Copy, A: Allocator + Clone>(
     }
     // As the builder does: the output is checked in debug builds.
     if cfg!(debug_assertions) {
-        verify(func.view()).map_err(|error| CoroutineError::Output(which, error))?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(|error| CoroutineError::Output(which, error))?;
     }
     Ok(func)
 }

@@ -15,7 +15,7 @@ use super::{
     AUX_EXPIRY_NS, AuxCaps, AuxLimits, AuxSweepPlant, CACHE_EXPIRY_NS, DEFAULT_BUDGET, GcError, GcOpts,
     ORPHAN_GRACE_NS, PidProbe, PidState, VIEWER_DEAD_GRACE_NS, parse_args, parse_budget_values,
     parse_hex_32, parse_meta_pid, parse_native_work_pid, parse_pid_prefix, run_with, should_sweep_run,
-    sweep_aux_with, sweep_aux_with_caps, sweep_aux_with_limits, sweep_toolchain_packs, try_acquire_gc_lock,
+    sweep_aux_for_budget, sweep_aux_with, sweep_aux_with_caps, sweep_aux_with_limits, sweep_toolchain_packs, try_acquire_gc_lock,
 };
 use crate::CliError;
 use crate::store::plain_place::{Facts, STORE_DIR, STORE_ROOT};
@@ -672,4 +672,33 @@ fn gc_aux_bounded_work_cap_limits_removals_and_converges_cleanly() {
     let bounded = sweep_aux_with_limits(&cx, home.dir(), now_ns, tiny_visit, &probe, false, AuxSweepPlant::None);
     assert!(usize::try_from(bounded.files).unwrap_or(usize::MAX) <= tiny_visit.max_ops);
     assert!(home.dir().stat(&cx, &Path::new(live_work.as_str()).expect("p")).expect("s").is_some(), "live PID entry preserved under tiny caps/visits");
+}
+
+#[test]
+fn unlimited_budget_preserves_unexpired_build_script_files() {
+    let io = Io::simulated(SimWorld::new(77, Limits::USUAL));
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let clock = io.need_clock().expect("clock");
+    let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+
+    let put = |rel: &str, bytes: &[u8]| {
+        home.dir().publish(&cx, &Path::new(rel).expect("path"), Content::bytes(bytes), Durable::No).expect("publish");
+    };
+    put("v2/build-script/files/fresh-lib.a", &[7u8; 256]);
+    put("v2/sources/fresh-src.bin", &[8u8; 256]);
+    put("v2/proc-macro/compiled/fresh-pm.cwasm", &[9u8; 256]);
+
+    let now_ns = clock.wall().as_ns();
+    let probe = FixedPids(&[]);
+    // `cap_bytes == u64::MAX` (`BLAZE_STORE_MAX_GB=0`): no byte-cap eviction of unexpired files.
+    let res = sweep_aux_for_budget(&cx, home.dir(), now_ns, u64::MAX, &probe, false, AuxSweepPlant::None);
+    assert_eq!(res.files, 0, "unlimited budget must not evict unexpired aux cache files: {res:?}");
+    for kept in [
+        "v2/build-script/files/fresh-lib.a",
+        "v2/sources/fresh-src.bin",
+        "v2/proc-macro/compiled/fresh-pm.cwasm",
+    ] {
+        assert!(home.dir().stat(&cx, &Path::new(kept).expect("p")).expect("s").is_some(), "kept: {kept}");
+    }
 }

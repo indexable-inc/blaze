@@ -69,7 +69,7 @@ pub const NATIVE_TOOLS: &[&str] = &["gmake", "make", "perl"];
 /// [`NATIVE_TOOLS`] one, or a shell running a `configure` script (tikv-jemalloc-sys).
 pub fn is_deferred_tool(program: &str, args: &[&str]) -> bool {
     let name = program.rsplit('/').next().unwrap_or(program);
-    is_c_tool(name)
+    (is_c_tool(name) && !crate::c_tasks_probe::is_probe(program, args))
         || NATIVE_TOOLS.contains(&name)
         || (matches!(name, "sh" | "bash") && args.first().is_some_and(|script| script.rsplit('/').next() == Some("configure")))
 }

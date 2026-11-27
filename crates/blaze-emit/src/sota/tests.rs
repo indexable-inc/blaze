@@ -2327,6 +2327,87 @@ mod std_readiness_tests {
         assert_eq!(unsafe { exec.as_fn::<extern "C" fn(u64) -> u64>() }(5), 45);
     }
 
+    /// Regression test for the O(S^3) hang in `pack_slots` (Wave 7 Lane 2):
+    /// 1. 2,048 mutually-live slots must pack disjointly without quadratic re-scanning.
+    /// 2. Non-monotone conflicting intervals with gaps and mixed alignments must still
+    ///    receive exact deterministic first-fit offsets.
+    #[test]
+    fn pack_slots_2048_mutually_live_and_gap_reuse() {
+        let alloc = test_alloc();
+        // 1. 2,048 mutually-live 8-byte slots (no `SlotDead`).
+        let n_slots: usize = 2048;
+        let func_big = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let zero = b.iconst(Ty::I64, 0);
+            let mut ptrs = blaze_own::Vec::with_capacity_in(n_slots, alloc);
+            for _ in 0..n_slots {
+                let s = b.slot(8, 3, SlotKind::Named);
+                let p = b.slot_addr(s);
+                b.store(Flags::NONE, zero, p, 0, MemAttrs::aligned(3));
+                ptrs.push(p);
+            }
+            let mut acc = zero;
+            for &p in ptrs.iter() {
+                let v = b.load(Ty::I64, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                acc = b.binary(Op::Add, Flags::NONE, acc, v);
+            }
+            b.ret(&[acc]);
+            b.finish_checked().unwrap()
+        };
+
+        let packed_big = crate::pass::frame::pack_slots(func_big.view(), 0, alloc).expect("packs 2048 slots");
+        assert_eq!(packed_big.end, (n_slots as u64) * 8);
+        let mut seen = blaze_own::Vec::with_capacity_in(n_slots, alloc);
+        for &off in packed_big.slot_at.iter() {
+            seen.push(off);
+        }
+        seen.sort_unstable();
+        for (i, &off) in seen.iter().enumerate() {
+            assert_eq!(off, (i as u32) * 8, "every mutually-live slot must get a unique 8-byte offset");
+        }
+
+        // 2. Non-monotone conflicting intervals & gap reuse:
+        //    - s0 (64 B, align 16): live first, then dead -> placed at 0..64.
+        //    - s1 (64 B, align 16): live overlapping s0 -> placed at 64..128.
+        //    - s2 (32 B, align 16): live after s0 is dead, overlapping s1 -> placed at 0..32 (before s1!).
+        //    - s3 (16 B, align 16): live overlapping BOTH s1 (64..128) and s2 (0..32) ->
+        //      conflicting intervals arrive out of order (s1 at 64, s2 at 0), sorted to [0..32, 64..128],
+        //      so first-fit MUST place s3 in the gap at 32..48!
+        let func_gap = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let s0 = b.slot(64, 4, SlotKind::Temp);
+            let s1 = b.slot(64, 4, SlotKind::Temp);
+            let s2 = b.slot(32, 4, SlotKind::Temp);
+            let s3 = b.slot(16, 4, SlotKind::Temp);
+            let zero = b.iconst(Ty::I64, 0);
+            b.slot_live(s0);
+            b.slot_live(s1);
+            b.slot_dead(s0);
+            b.slot_live(s2);
+            b.slot_live(s3);
+            b.slot_dead(s3);
+            b.slot_dead(s2);
+            b.slot_dead(s1);
+            b.ret(&[zero]);
+            b.finish_checked().unwrap()
+        };
+
+        let packed_gap = crate::pass::frame::pack_slots(func_gap.view(), 0, alloc).expect("packs gap");
+        assert_eq!(packed_gap.slot_at[0], 0);
+        assert_eq!(packed_gap.slot_at[1], 64);
+        assert_eq!(packed_gap.slot_at[2], 0);
+        assert_eq!(packed_gap.slot_at[3], 32, "s3 must first-fit into the 32..64 gap between s2 and s1");
+        assert_eq!(packed_gap.end, 128);
+    }
+
     /// Regression test for the `crypto_bigint::Uint::<4>::from_be_slice` infinite loop:
     /// when `thread_jumps` folds a loop entry directly into a higher-indexed body block,
     /// the resulting CFG is valid SSA but non-RPO (`header > latch`). Both the full SOTA
@@ -2734,5 +2815,372 @@ block4 normal:
             .emit(verify(indirect_fn.view()).unwrap(), &NoNames, linux_x64, alloc)
             .expect("Sota x86-64 emits Op::TailCallIndirect");
         assert!(!x64_ind.code.is_empty());
+    }
+
+    /// Builds a realistic multi-block LIR function with `n_stages` chained loop/diamond stages
+    /// (arithmetic, branches, stack slots, high register pressure, and loop-carried phis) for
+    /// fast-vs-SOTA semantic equivalence and compile-time benchmarking.
+    fn build_large_bench_fn(n_stages: usize, alloc: Alloc<'static>) -> blaze_lir::Func<Alloc<'static>> {
+        let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+        let slot = b.slot(64, 3, blaze_lir::func::SlotKind::Named);
+
+        let entry = b.create_block(BlockKind::Normal);
+        let mut stage_blocks = std::vec::Vec::with_capacity(n_stages);
+        for _ in 0..n_stages {
+            let hdr = b.create_block(BlockKind::Normal);
+            let then_b = b.create_block(BlockKind::Normal);
+            let else_b = b.create_block(BlockKind::Normal);
+            let merge = b.create_block(BlockKind::Normal);
+            stage_blocks.push((hdr, then_b, else_b, merge));
+        }
+        let exit = b.create_block(BlockKind::Normal);
+
+        b.begin(entry);
+        let p0 = b.param(Ty::I64);
+        let p1 = b.param(Ty::I64);
+        let base = b.slot_addr(slot);
+        for k in 0..6i32 {
+            let init_v = if k % 2 == 0 { p0 } else { p1 };
+            b.store(Flags::NONE, init_v, base, k * 8, MemAttrs::aligned(3));
+        }
+        b.jump((stage_blocks[0].0, &[p0, p1]));
+
+        for s in 0..n_stages {
+            let (hdr, then_b, else_b, merge) = stage_blocks[s];
+            let next_target = if s + 1 < n_stages { stage_blocks[s + 1].0 } else { exit };
+
+            b.begin(hdr);
+            let x = b.param(Ty::I64);
+            let y = b.param(Ty::I64);
+            let c1 = b.iconst(Ty::I64, u128::from((s as u64).wrapping_mul(0x9e37_79b9) | 1));
+            let c3 = b.iconst(Ty::I64, 3);
+            let c7 = b.iconst(Ty::I64, 7);
+            let c13 = b.iconst(Ty::I64, 13);
+            let k_mask = b.iconst(Ty::I64, 1);
+            let v0 = b.binary(Op::Add, Flags::NONE, x, c1);
+            let v1 = b.binary(Op::Xor, Flags::NONE, y, v0);
+            let v2 = b.binary(Op::Mul, Flags::NONE, v1, c3);
+            let v3 = b.binary(Op::Add, Flags::NONE, v2, c7);
+            let v4 = b.binary(Op::Sub, Flags::NONE, v3, x);
+            let v5 = b.binary(Op::Or, Flags::NONE, v4, c13);
+            let v6 = b.binary(Op::Add, Flags::NONE, v0, v5);
+            let v7 = b.binary(Op::Xor, Flags::NONE, v1, v6);
+            let off = ((s % 6) * 8) as i32;
+            let loaded = b.load(Ty::I64, Flags::NONE, base, off, MemAttrs::aligned(3));
+            let mix = b.binary(Op::Add, Flags::NONE, v7, loaded);
+            b.store(Flags::NONE, mix, base, off, MemAttrs::aligned(3));
+            let bit = b.binary(Op::And, Flags::NONE, mix, k_mask);
+            let zero = b.iconst(Ty::I64, 0);
+            let cond = b.icmp(IntCond::Ne, bit, zero);
+            b.br(Flags::NONE, cond, (then_b, &[mix, v6]), (else_b, &[v5, v4]));
+
+            b.begin(then_b);
+            let ta = b.param(Ty::I64);
+            let tb = b.param(Ty::I64);
+            let tk = b.iconst(Ty::I64, 5);
+            let tr0 = b.binary(Op::Add, Flags::NONE, ta, tb);
+            let tr1 = b.binary(Op::Xor, Flags::NONE, tr0, tk);
+            b.jump((merge, &[tr1, ta]));
+
+            b.begin(else_b);
+            let ea = b.param(Ty::I64);
+            let eb = b.param(Ty::I64);
+            let ek = b.iconst(Ty::I64, 11);
+            let er0 = b.binary(Op::Sub, Flags::NONE, ea, eb);
+            let er1 = b.binary(Op::Add, Flags::NONE, er0, ek);
+            b.jump((merge, &[er1, eb]));
+
+            b.begin(merge);
+            let ma = b.param(Ty::I64);
+            let mb = b.param(Ty::I64);
+            let msum = b.binary(Op::Xor, Flags::NONE, ma, mb);
+            b.jump((next_target, &[msum, ma]));
+        }
+
+        b.begin(exit);
+        let rx = b.param(Ty::I64);
+        let ry = b.param(Ty::I64);
+        let final_load = b.load(Ty::I64, Flags::NONE, base, 0, MemAttrs::aligned(3));
+        let r0 = b.binary(Op::Add, Flags::NONE, rx, ry);
+        let r1 = b.binary(Op::Xor, Flags::NONE, r0, final_load);
+        b.ret(&[r1]);
+        b.finish_checked().unwrap()
+    }
+
+    #[test]
+    fn fast_tier_matches_sota_semantics_and_skips_opt_passes() {
+        let alloc = test_alloc();
+
+        // Build a function with a counted loop, branch diamond, stack slot, and high register pressure.
+        let func = {
+            let mut b = Builder::<Alloc<'static>, Full>::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::I64), Param::of(Ty::I64)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let slot = b.slot(16, 3, blaze_lir::func::SlotKind::Named);
+            let entry = b.create_block(BlockKind::Normal);
+            let hdr = b.create_block(BlockKind::Normal);
+            let body = b.create_block(BlockKind::Normal);
+            let exit = b.create_block(BlockKind::Normal);
+
+            b.begin(entry);
+            let n = b.param(Ty::I64);
+            let seed = b.param(Ty::I64);
+            let sp = b.slot_addr(slot);
+            b.store(Flags::NONE, seed, sp, 0, MemAttrs::aligned(3));
+            let z = b.iconst(Ty::I64, 0);
+            b.jump((hdr, &[z, seed]));
+
+            b.begin(hdr);
+            let i = b.param(Ty::I64);
+            let acc = b.param(Ty::I64);
+            let cont = b.icmp(IntCond::Ult, i, n);
+            b.br(Flags::NONE, cont, (body, &[]), (exit, &[acc]));
+
+            b.begin(body);
+            let one = b.iconst(Ty::I64, 1);
+            let k3 = b.iconst(Ty::I64, 3);
+            let k5 = b.iconst(Ty::I64, 5);
+            let k7 = b.iconst(Ty::I64, 7);
+            let a0 = b.binary(Op::Add, Flags::NONE, acc, i);
+            let a1 = b.binary(Op::Mul, Flags::NONE, a0, k3);
+            let a2 = b.binary(Op::Xor, Flags::NONE, a1, k5);
+            let a3 = b.binary(Op::Add, Flags::NONE, a2, k7);
+            let prev = b.load(Ty::I64, Flags::NONE, sp, 0, MemAttrs::aligned(3));
+            let a4 = b.binary(Op::Add, Flags::NONE, a3, prev);
+            b.store(Flags::NONE, a4, sp, 0, MemAttrs::aligned(3));
+            let ov = b.overflow(Op::UaddOverflow, a4, a1);
+            let sum = b.project(ov, 0);
+            let carry = b.project(ov, 1);
+            let carry64 = b.convert(Op::Zext, Flags::NONE, Ty::I64, carry);
+            let next_acc = b.binary(Op::Xor, Flags::NONE, sum, carry64);
+            let next_i = b.binary(Op::Add, Flags::NONE, i, one);
+            b.jump((hdr, &[next_i, next_acc]));
+
+            b.begin(exit);
+            let out_v = b.param(Ty::I64);
+            b.ret(&[out_v]);
+            b.finish_checked().unwrap()
+        };
+
+        let verified = verify(func.view()).unwrap();
+
+        // 1. Direct `misel` fast mode skips all mopt/msched passes and executes identically to SOTA.
+        let (em_fast, clob_fast, stats_fast) = super::super::misel::emit_mfunc_ssa_a64(
+            verified,
+            &NoNames,
+            super::super::misel::MIseOpts {
+                machine: MAC_ARM64,
+                call_mode: crate::CallMode::DirectBl,
+                scratch_gpr_order: None,
+                preserve_all_cold: false,
+                call_clobbers: &[],
+                internal_fast: false,
+                internal_fast_calls: &[],
+                fast_mode: true,
+            },
+            alloc,
+        )
+        .expect("misel fast_mode emit must succeed");
+        assert_eq!(stats_fast.mopt_pre, Default::default());
+        assert_eq!(stats_fast.msched_pre, Default::default());
+        assert_eq!(stats_fast.mopt_post, Default::default());
+        assert_eq!(stats_fast.msched_post, Default::default());
+        assert_ne!(
+            blaze_tier::CallClobbers::C_ABI_ARM64.clobbered.0 & !clob_fast.clobbered.0,
+            0,
+            "fast_mode leaf must still report narrowed IPRA CallClobbers"
+        );
+
+        let (em_sota, _clob_sota, _stats_sota) = super::super::misel::emit_mfunc_ssa_a64(
+            verified,
+            &NoNames,
+            super::super::misel::MIseOpts {
+                machine: MAC_ARM64,
+                call_mode: crate::CallMode::DirectBl,
+                scratch_gpr_order: None,
+                preserve_all_cold: false,
+                call_clobbers: &[],
+                internal_fast: false,
+                internal_fast_calls: &[],
+                fast_mode: false,
+            },
+            alloc,
+        )
+        .expect("misel full SOTA emit must succeed");
+
+        let em_isel_fast = Sota::fast()
+            .emit(verified, &NoNames, MAC_ARM64, alloc)
+            .expect("Sota::fast() Tier emit must succeed");
+
+        let (ex_fast, _) = load_exec(em_fast);
+        let (ex_sota, _) = load_exec(em_sota);
+        let (ex_isel_fast, _) = load_exec(em_isel_fast);
+        let f_fast: extern "C" fn(u64, u64) -> u64 = unsafe { ex_fast.as_fn() };
+        let f_sota: extern "C" fn(u64, u64) -> u64 = unsafe { ex_sota.as_fn() };
+        let f_isel_fast: extern "C" fn(u64, u64) -> u64 = unsafe { ex_isel_fast.as_fn() };
+
+        for &(n, seed) in &[(0u64, 0u64), (1, 42), (7, 12345), (50, 0xdead_beef_cafe_0001u64)] {
+            let expected = f_sota(n, seed);
+            assert_eq!(f_fast(n, seed), expected, "misel fast_mode mismatch for ({n}, {seed})");
+            assert_eq!(f_isel_fast(n, seed), expected, "Sota::fast() mismatch for ({n}, {seed})");
+        }
+
+        // 2. Both `EmitProfile::Fast` and `EmitProfile::Sota` seal valid `CodeRecord`s.
+        let (rec_fast, _, _) = crate::emit_sota_record_with_profile(
+            verified,
+            &NoNames,
+            &RoutinePlaces::NONE,
+            MAC_ARM64,
+            crate::EmitProfile::Fast,
+            &[],
+            alloc,
+        )
+        .expect("EmitProfile::Fast record emit must succeed");
+        let (rec_sota, _, _) = crate::emit_sota_record_with_profile(
+            verified,
+            &NoNames,
+            &RoutinePlaces::NONE,
+            MAC_ARM64,
+            crate::EmitProfile::Sota,
+            &[],
+            alloc,
+        )
+        .expect("EmitProfile::Sota record emit must succeed");
+        assert!(rec_fast.seal().is_ok());
+        assert!(rec_sota.seal().is_ok());
+    }
+
+    #[test]
+    fn fast_tier_cold_emit_benchmark_large_functions() {
+        let alloc = test_alloc();
+        for &(stages, label, run_full_record) in &[
+            (100usize, "medium_3.8k_insts", true),
+            (500usize, "large_19k_insts", true),
+            (2000usize, "mega_76k_insts", false),
+        ] {
+            let func = build_large_bench_fn(stages, alloc);
+            let verified = verify(func.view()).unwrap();
+            let inst_count = func.view().len();
+            let block_count = func.view().blocks();
+
+            if run_full_record {
+                let t_sota = std::time::Instant::now();
+                let (rec_sota, _, _) = crate::emit_sota_record_with_profile(
+                    verified,
+                    &NoNames,
+                    &RoutinePlaces::NONE,
+                    MAC_ARM64,
+                    crate::EmitProfile::Sota,
+                    &[],
+                    alloc,
+                )
+                .expect("Sota profile emit must succeed");
+                let sota_us = t_sota.elapsed().as_micros();
+
+                let t_fast = std::time::Instant::now();
+                let (rec_fast, _, _) = crate::emit_sota_record_with_profile(
+                    verified,
+                    &NoNames,
+                    &RoutinePlaces::NONE,
+                    MAC_ARM64,
+                    crate::EmitProfile::Fast,
+                    &[],
+                    alloc,
+                )
+                .expect("Fast profile emit must succeed");
+                let fast_us = t_fast.elapsed().as_micros();
+
+                let speedup = (sota_us as f64) / (fast_us.max(1) as f64);
+                std::eprintln!(
+                    "[bench:record:{label}] insts={inst_count} blocks={block_count} sota={sota_us}us fast={fast_us}us speedup={speedup:.2}x code_sota={}B code_fast={}B",
+                    rec_sota.code.len(),
+                    rec_fast.code.len(),
+                );
+                assert!(rec_fast.seal().is_ok());
+                assert!(rec_sota.seal().is_ok());
+            } else {
+                // Mega-function past `SOTA_MIDEND_MAX_INSTS` (65_536) / `SOTA_MIDEND_MAX_BLOCKS`
+                // (4_096): both profiles route through fast-tier emit cleanly in linear time.
+                let t_fast = std::time::Instant::now();
+                let (rec_fast, _, _) = crate::emit_sota_record_with_profile(
+                    verified,
+                    &NoNames,
+                    &RoutinePlaces::NONE,
+                    MAC_ARM64,
+                    crate::EmitProfile::Fast,
+                    &[],
+                    alloc,
+                )
+                .expect("Mega-fn Fast profile emit must succeed");
+                let fast_us = t_fast.elapsed().as_micros();
+                std::eprintln!(
+                    "[bench:record:{label}] insts={inst_count} blocks={block_count} fast={fast_us}us code_fast={}B",
+                    rec_fast.code.len(),
+                );
+                assert!(rec_fast.seal().is_ok());
+            }
+
+            // Measure backend-only `misel` (full vs fast_mode) AND verify identical native ARM64 execution.
+            let t_msota = std::time::Instant::now();
+            let (em_sota, _, _) = super::super::misel::emit_mfunc_ssa_a64(
+                verified,
+                &NoNames,
+                super::super::misel::MIseOpts {
+                    machine: MAC_ARM64,
+                    call_mode: crate::CallMode::DirectBl,
+                    scratch_gpr_order: None,
+                    preserve_all_cold: false,
+                    call_clobbers: &[],
+                    internal_fast: false,
+                    internal_fast_calls: &[],
+                    fast_mode: false,
+                },
+                alloc,
+            )
+            .expect("misel sota emit on large fn");
+            let msota_us = t_msota.elapsed().as_micros();
+
+            let t_mfast = std::time::Instant::now();
+            let (em_fast, _, _) = super::super::misel::emit_mfunc_ssa_a64(
+                verified,
+                &NoNames,
+                super::super::misel::MIseOpts {
+                    machine: MAC_ARM64,
+                    call_mode: crate::CallMode::DirectBl,
+                    scratch_gpr_order: None,
+                    preserve_all_cold: false,
+                    call_clobbers: &[],
+                    internal_fast: false,
+                    internal_fast_calls: &[],
+                    fast_mode: true,
+                },
+                alloc,
+            )
+            .expect("misel fast emit on large fn");
+            let mfast_us = t_mfast.elapsed().as_micros();
+
+            let mspeedup = (msota_us as f64) / (mfast_us.max(1) as f64);
+            std::eprintln!(
+                "[bench:misel:{label}] insts={inst_count} blocks={block_count} misel_sota={msota_us}us misel_fast={mfast_us}us speedup={mspeedup:.2}x"
+            );
+
+            let (ex_f, _) = load_exec(em_fast);
+            let (ex_s, _) = load_exec(em_sota);
+            let f_f: extern "C" fn(u64, u64) -> u64 = unsafe { ex_f.as_fn() };
+            let f_s: extern "C" fn(u64, u64) -> u64 = unsafe { ex_s.as_fn() };
+            assert_eq!(f_f(17, 99), f_s(17, 99), "large bench runtime mismatch on {label}");
+        }
     }
 }

@@ -201,13 +201,17 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 name = "bgit"
 version = "0.0.0"
 dependencies = [
+ "blaze-base64",
  "blaze-core",
  "blaze-deflate",
  "blaze-git",
  "blaze-git-fetch",
+ "blaze-h2",
  "blaze-hash",
  "blaze-own",
+ "blaze-std",
  "blaze-zstd",
+ "rustls",
 ]
 
 [[package]]
@@ -692,6 +696,7 @@ dependencies = [
  "blaze-native",
  "blaze-own",
  "blaze-proc-macro",
+ "blaze-producers",
  "blaze-remote",
  "blaze-report",
  "blaze-run",
@@ -864,6 +869,13 @@ dependencies = [
  "blaze-own",
  "blaze-sim",
  "miniz_oxide",
+]
+
+[[package]]
+name = "blaze-diag-parse"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]
@@ -1360,6 +1372,7 @@ dependencies = [
 name = "blaze-ladder"
 version = "0.0.0"
 dependencies = [
+ "blaze-alloc-count",
  "blaze-ask",
  "blaze-body",
  "blaze-body-build",
@@ -2413,6 +2426,13 @@ dependencies = [
  "blaze-own",
  "blaze-run",
  "target-features",
+]
+
+[[package]]
+name = "blaze-tiling"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]

@@ -514,6 +514,7 @@ blaze-apple-sdk = { path = "crates/blaze-apple-sdk" } # The macOS SDK's one home
 blaze-c = { path = "crates/blaze-c" } # C in blaze (docs/v2/plan/design/c.md, D174): the declaration model and record, the import's key, the `CFrontEnd` seam, the rendering to Rust.
 # blaze's own data formats, on blaze-own and core only, in place of base64, serde_json,
 # toml/toml_edit and semver (docs/v2/plan/third-party.md).
+bgit = { path = "crates/bgit" }
 blaze-base64 = { path = "crates/blaze-base64" }
 # The profile's columns, its Parquet files and its Arrow IPC frames, in place of arrow-* and
 # parquet (docs/v2/plan/third-party.md, "The profile's file").
@@ -523,23 +524,31 @@ blaze-arrow-ipc = { path = "crates/blaze-arrow-ipc" }
 # `TextSize` and `TextRange`, in place of text-size.
 blaze-text-size = { path = "crates/blaze-text-size" }
 blaze-cbor = { path = "crates/blaze-cbor" } # Deterministic CBOR (RFC 8949 4.2.1): the one home; blaze-pack and blaze-watch take it from here.
+blaze-cli-spec = { path = "crates/blaze-cli-spec" }
 blaze-ctx = { path = "crates/blaze-ctx" } # Hierarchical 3-level repo context engine and hybrid search emitting compact blaze-tab over BLAKE3/CBOR.
 # Compile-time code on blaze's own execution path (D175): grants, the protocol's two machines, the equality harness.
 blaze-comptime = { path = "crates/blaze-comptime" }
 # The C-name table a compile-time child's code is bound to, and its system layer (D175).
 blaze-comptime-sys = { path = "crates/blaze-comptime-sys" }
 blaze-data = { path = "crates/blaze-data" } # The one format-neutral value (CBOR, JSON, TOML, TAB) and `value!`.
+blaze-diag-parse = { path = "crates/blaze-diag-parse" }
+blaze-dust = { path = "crates/blaze-dust" }
 blaze-ecs = { path = "crates/blaze-ecs" } # Pure no_std, zero-unsafe, sans-IO relational ECS + Explorer API & WASM/WebGPU UI engine.
 blaze-ecs-wasm = { path = "crates/blaze-ecs-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-ecs::ui.
+blaze-git-meta = { path = "crates/blaze-git-meta" }
 blaze-json = { path = "crates/blaze-json" }
 blaze-preview = { path = "crates/blaze-preview" } # Pure no_std, sans-IO syntax highlighting, Markdown, and structured file previews.
 blaze-semver = { path = "crates/blaze-semver" }
 blaze-sh = { path = "crates/blaze-sh" } # bstd::sh: a sans-IO nushell-like structured shell core with O(1) CoW forkable state (docs/v2/plan/design/sh.md).
+blaze-shell-config = { path = "crates/blaze-shell-config" }
 blaze-site = { path = "crates/blaze-site" } # Pure no_std, zero-unsafe, sans-IO Blaze website engine over blaze-ecs + blaze-ui + den Slug GPU text.
 blaze-site-wasm = { path = "crates/blaze-site-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-site + generated WebGPU Slug/SDF shaders.
 blaze-sniff = { path = "crates/blaze-sniff" } # Pure no_std, sans-IO file/directory content and metadata sniffer.
 blaze-ssh = { path = "crates/blaze-ssh" } # Pure no_std, sans-IO SSH config, known_hosts, and session protocol parser.
+blaze-sysmon = { path = "crates/blaze-sysmon" }
 blaze-tab = { path = "crates/blaze-tab" } # Blaze's LLM-first tabular data format inspired by NUON (sparse schemas, lossless Value).
+blaze-term-api = { path = "crates/blaze-term-api" }
+blaze-tiling = { path = "crates/blaze-tiling" }
 blaze-toml = { path = "crates/blaze-toml" }
 blaze-ui = { path = "crates/blaze-ui" } # Pure no_std, zero-unsafe, sans-IO relational ECS UI library + Rust->WGSL/MSL WebGPU renderer.
 blaze-ui-wasm = { path = "crates/blaze-ui-wasm" } # Zero-import no_std wasm32 C-ABI cdylib over blaze-ui + generated WebGPU shaders.

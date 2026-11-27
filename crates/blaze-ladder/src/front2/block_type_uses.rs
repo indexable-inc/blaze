@@ -74,7 +74,7 @@ fn same(a: &Row<'_>, b: &Row<'_>) -> bool {
 /// name first: then the type is refused by name ([`TYPE_THROUGH_GLOB`]), as the builder reads
 /// no glob. The walk is glob_uses.rs `before`'s: out of a local item's body into the blocks
 /// around its declaration.
-fn glob_nearer(locals: &Locals<'_>, owner: ItemKey, scope: u32, named: &Row<'_>) -> Result<(), &'static str> {
+pub(super) fn glob_nearer(locals: &Locals<'_>, owner: ItemKey, scope: u32, named: &Row<'_>) -> Result<(), &'static str> {
     let mut body = owner;
     let mut at = Some(scope);
     for _ in 0..MAX_STEPS {

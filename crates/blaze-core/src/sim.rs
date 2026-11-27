@@ -2434,7 +2434,12 @@ impl Sim {
                 Err(why) => Done::Failed(why),
             },
             Effect::Read { file, at, len, .. } => match self.read(&file, at, len) {
-                Ok(bytes) => {
+                Ok(mut bytes) => {
+                    if bytes.len() > 1 && Sim::drawn(&mut self.rng, &self.short_reads, &file) {
+                        let span = u64::try_from(bytes.len() - 1).unwrap_or(1);
+                        let short = usize::try_from(self.rng.below(span)).unwrap_or(0) + 1;
+                        bytes.truncate(short);
+                    }
                     self.bytes_read += bytes.len() as u64;
                     Done::Read(bytes)
                 }

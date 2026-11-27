@@ -765,3 +765,189 @@ fn tree_builtin_builds_hierarchical_dataframe() {
     assert_eq!(pipe_sort.exit_code, 0, "got {:?}", pipe_sort.value);
     assert_eq!(pipe_sort.value, Value::string("big.bin", alloc()));
 }
+
+#[test]
+fn dot_subject_queries_previous_output_pipeline_and_rows() {
+    use blaze_own::Share as _;
+    let mut host = FakeHost::new();
+    let mut st = EngineState::new("/work", &[], alloc());
+
+    // 1. Seed `$_` with a Cargo.toml-like nested record and query `.package.version` directly!
+    let r0 = host.run(
+        r#"{ package: { name: "hello-world", version: "0.1.0", edition: "blaze-2026.11" } }"#,
+        st.fork(),
+    );
+    assert_eq!(r0.exit_code, 0);
+    st.set_var("_", r0.value.share(), false);
+
+    let r1 = host.run(".package.version", st.fork());
+    assert_eq!(r1.exit_code, 0, "got {:?}", r1.value);
+    assert_eq!(r1.value, Value::string("0.1.0", alloc()));
+
+    let r2 = host.run(".package | keys | length", st.fork());
+    assert_eq!(r2.exit_code, 0, "got {:?}", r2.value);
+    assert_eq!(r2.value, Value::Int(3));
+
+    let r3 = host.run(".", st.fork());
+    assert_eq!(r3.exit_code, 0);
+    assert_eq!(r3.value, r0.value);
+
+    // 2. Works inside pipelines (`| .package.name`) and expressions (`.package.name ++ "@" ++ .package.version`).
+    let r4 = host.run(r#"{ package: { name: "blaze", version: "2.0.0" } } | .package.name"#, st.fork());
+    assert_eq!(r4.exit_code, 0, "got {:?}", r4.value);
+    assert_eq!(r4.value, Value::string("blaze", alloc()));
+
+    let r5 = host.run(r#".package.name ++ "@" ++ .package.version"#, st.fork());
+    assert_eq!(r5.exit_code, 0, "got {:?}", r5.value);
+    assert_eq!(r5.value, Value::string("hello-world@0.1.0", alloc()));
+
+    // 3. Works inside `where` predicates (`.v > 10`) and optional access (`?.missing?`).
+    let r6 = host.run("[{v: 5}, {v: 20}, {v: 30}] | where .v > 10 | length", st.fork());
+    assert_eq!(r6.exit_code, 0, "got {:?}", r6.value);
+    assert_eq!(r6.value, Value::Int(2));
+
+    let r7 = host.run(".package?.missing?", st.fork());
+    assert_eq!(r7.exit_code, 0, "got {:?}", r7.value);
+    assert_eq!(r7.value, Value::Nothing);
+}
+
+#[test]
+fn schema_infers_nested_lockfile_types_patterns_and_histograms() {
+    use blaze_own::Share as _;
+    let mut host = FakeHost::new();
+    let mut st = EngineState::new("/work", &[], alloc());
+
+    let lock_expr = r#"{
+        version: 4,
+        package: [
+            { name: "adler2", version: "2.0.1", source: "registry+https://github.com/rust-lang/crates.io-index", size: 10 },
+            { name: "ahash", version: "0.8.12", source: "registry+https://github.com/rust-lang/crates.io-index", size: 25 },
+            { name: "blaze-core", version: "0.0.0", source: null, size: 100 },
+            { name: "blaze-sh", version: "0.0.0", source: null, size: 200 }
+        ]
+    }"#;
+    let seed = host.run(lock_expr, st.fork());
+    assert_eq!(seed.exit_code, 0, "got {:?}", seed.value);
+    st.set_var("_", seed.value.share(), false);
+
+    // Bare `schema` inspects `$_` automatically!
+    let res = host.run("schema", st.fork());
+    assert_eq!(res.exit_code, 0, "got {:?}", res.value);
+    let Value::Record(rec) = res.value else {
+        panic!("expected schema record, got {:?}", res.value);
+    };
+    assert_eq!(rec.get(crate::schema::SCHEMA_MARKER_KEY), Some(&Value::Bool(true)));
+    assert_eq!(rec.get("kind").and_then(Value::as_str), Some("record"));
+
+    let Some(Value::Table(fields)) = rec.get("fields") else {
+        panic!("expected fields table");
+    };
+    let find_row = |path: &str| -> usize {
+        (0..fields.nrows())
+            .find(|&i| fields.get_by_name(i, "path").and_then(Value::as_str) == Some(path))
+            .unwrap_or_else(|| panic!("missing schema path {path}"))
+    };
+    let v_row = find_row(".package.version");
+    assert_eq!(fields.get_by_name(v_row, "pattern").and_then(Value::as_str), Some("x.y.z"));
+    let src_row = find_row(".package.source");
+    assert_eq!(fields.get_by_name(src_row, "type").and_then(Value::as_str), Some("string?"));
+    assert_eq!(fields.get_by_name(src_row, "present"), Some(&Value::Int(2)));
+    assert_eq!(fields.get_by_name(src_row, "total"), Some(&Value::Int(4)));
+    let sz_row = find_row(".package.size");
+    assert!(
+        fields
+            .get_by_name(sz_row, "hist")
+            .and_then(Value::as_str)
+            .is_some_and(|h| h.starts_with("num:")),
+        "numeric column must emit histogram"
+    );
+
+    // `describe` alias works identically via pipe.
+    let res2 = host.run("$_ | describe | .kind", st.fork());
+    assert_eq!(res2.exit_code, 0, "got {:?}", res2.value);
+    assert_eq!(res2.value, Value::string("record", alloc()));
+}
+
+#[test]
+fn modern_data_shell_syntax_leading_pipe_brackets_projection_files_and_verbs() {
+    use blaze_own::Share as _;
+    let mut host = FakeHost::new();
+    host.files.insert(
+        "/work/Cargo.lock".into(),
+        b"version = 4\n\n[[package]]\nname = \"adler2\"\nversion = \"2.0.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n[[package]]\nname = \"blaze-sh\"\nversion = \"0.0.0\"\ndependencies = [\"cfg-if\", \"once_cell\"]\n\n[[package]]\nname = \"blaze-core\"\nversion = \"0.0.0\"\ndependencies = [\"cfg-if\", \"libc\"]\n".to_vec(),
+    );
+    let mut st = EngineState::new("/work", &[], alloc());
+
+    // 1. Bare structured data file + flatten+skip-nulls `[]` + `uniq` + `sort` + `count`!
+    let deps = host.run("Cargo.lock.package.dependencies[] | uniq | sort", st.fork());
+    assert_eq!(deps.exit_code, 0, "got {:?}", deps.value);
+    match &deps.value {
+        Value::List(l) => {
+            assert_eq!(l.len(), 3);
+            assert_eq!(l.get(0), Some(&Value::string("cfg-if", alloc())));
+            assert_eq!(l.get(1), Some(&Value::string("libc", alloc())));
+            assert_eq!(l.get(2), Some(&Value::string("once_cell", alloc())));
+        }
+        other => panic!("expected flattened deduped list, got {other:?}"),
+    }
+
+    // 2. Bare standalone data file (`Cargo.lock`, `(Cargo.toml)`) & chained `Cargo.toml.package.version`!
+    let bare_lock = host.run("Cargo.lock", st.fork());
+    assert_eq!(bare_lock.exit_code, 0, "got {:?}", bare_lock.value);
+    assert!(matches!(bare_lock.value, Value::Record(_)), "expected Record, got {:?}", bare_lock.value);
+
+    let bare_paren = host.run("(Cargo.toml).package.version", st.fork());
+    assert_eq!(bare_paren.exit_code, 0, "got {:?}", bare_paren.value);
+    assert_eq!(bare_paren.value, Value::string("0.1.0", alloc()));
+
+    let ver = host.run("Cargo.toml.package.version", st.fork());
+    assert_eq!(ver.exit_code, 0, "got {:?}", ver.value);
+    assert_eq!(ver.value, Value::string("0.1.0", alloc()));
+
+    // 3. Inline filter `[source == null]` + projection `.{name, v: .version}` + negative index `[-1]` + slice `[..2]`!
+    let proj = host.run("Cargo.lock.package[source == null].{name, v: .version} | sort -name", st.fork());
+    assert_eq!(proj.exit_code, 0, "got {:?}", proj.value);
+    let Value::Table(tbl) = &proj.value else {
+        panic!("expected projected table, got {:?}", proj.value);
+    };
+    assert_eq!(tbl.nrows(), 2);
+    assert_eq!(tbl.get_by_name(0, "name").and_then(Value::as_str), Some("blaze-sh"));
+    assert_eq!(tbl.get_by_name(0, "v").and_then(Value::as_str), Some("0.0.0"));
+    assert_eq!(tbl.get_by_name(1, "name").and_then(Value::as_str), Some("blaze-core"));
+
+    let last_pkg = host.run("Cargo.lock.package[-1].name", st.fork());
+    assert_eq!(last_pkg.exit_code, 0, "got {:?}", last_pkg.value);
+    assert_eq!(last_pkg.value, Value::string("blaze-core", alloc()));
+
+    // `..` is inclusive (`0..=2` -> 3 items) and `..<` is exclusive (`0..2` -> 2 items).
+    let first_two = host.run("Cargo.lock.package[..<2] | count", st.fork());
+    assert_eq!(first_two.exit_code, 0, "got {:?}", first_two.value);
+    assert_eq!(first_two.value, Value::Int(2));
+
+    let first_three = host.run("Cargo.lock.package[..2] | count", st.fork());
+    assert_eq!(first_three.exit_code, 0, "got {:?}", first_three.value);
+    assert_eq!(first_three.value, Value::Int(3));
+
+    // 4. Leading `|` continues from `$_`!
+    st.set_var("_", proj.value.share(), false);
+    let lead = host.run("| find \"core\" | count", st.fork());
+    assert_eq!(lead.exit_code, 0, "got {:?}", lead.value);
+    assert_eq!(lead.value, Value::Int(1));
+
+    // 5. `freq`, `top`, and zero-param `map`!
+    let freq = host.run("Cargo.lock.package.version | freq", st.fork());
+    assert_eq!(freq.exit_code, 0, "got {:?}", freq.value);
+    let Value::Table(ftbl) = &freq.value else {
+        panic!("expected freq table, got {:?}", freq.value);
+    };
+    assert_eq!(ftbl.get_by_name(0, "value").and_then(Value::as_str), Some("0.0.0"));
+    assert_eq!(ftbl.get_by_name(0, "count"), Some(&Value::Int(2)));
+
+    let top = host.run("data.json | top 1 n | .0.name", st.fork());
+    assert_eq!(top.exit_code, 0, "got {:?}", top.value);
+    assert_eq!(top.value, Value::string("beta", alloc()));
+
+    let mapped = host.run(r#"Cargo.lock.package | map $"(.name)@(.version)" | .0"#, st.fork());
+    assert_eq!(mapped.exit_code, 0, "got {:?}", mapped.value);
+    assert_eq!(mapped.value, Value::string("adler2@2.0.1", alloc()));
+}

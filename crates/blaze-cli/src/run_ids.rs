@@ -127,6 +127,7 @@ const DRIVE_CELL_FACT_DOMAIN: &str = "blaze-cli run ids drive cell read 1";
 const PRODUCERS_DOMAIN: &str = "blaze-cli run ids check producers 1";
 const BODY_PROOF_FACT_DOMAIN: &str = "blaze-cli run ids body proof fact 1";
 const BODY_PROOF_DIGEST_DOMAIN: &str = "blaze-cli run ids body proof digest 1";
+const DEP_TYPED_DOMAIN: &str = "blaze-cli dep typed body key 1";
 
 /// The kinds whose producers a body's check runs: the checker, the heads it reads, the names it
 /// resolves through, the macros it expands and the proc-macro modules it calls. A toolchain or
@@ -2018,13 +2019,18 @@ fn read_at(b: &[u8]) -> Read {
 }
 
 /// Read-only `Send + Sync` projection of [`RunIds`] holding only the immutable crate/body byte
-/// tables needed by off-thread code workers (`engine_body_record.rs` `SnapshotTyped`) to resolve
-/// a body's grain and `BodyCheck` name without touching `OnceCell` proof slots.
+/// tables and coarse digests needed by off-thread code workers (`engine_body_record.rs`
+/// `SnapshotTyped`) to resolve a body's grain, workspace `BodyCheck` name, and deterministic
+/// dependency/toolchain typed-body CAS key without touching `OnceCell` proof slots.
 #[derive(Clone, Copy)]
 pub(crate) struct IdsLookup<'a> {
+    toolchain: ToolchainId,
+    toolchain_read: Read,
+    producers: ContentId,
     crates: &'a [u8],
     grains: &'a [GrainTag],
     bodies: &'a [u8],
+    today: &'a [Read],
 }
 
 const _: fn() = || {
@@ -2033,19 +2039,67 @@ const _: fn() = || {
 };
 
 impl IdsLookup<'_> {
-    /// The grain `item`'s body is keyed at; `None`: its key's prefix is of no crate of the list.
-    pub(crate) fn grain(&self, item: ItemKey) -> Option<Grain> {
+    fn crate_of(&self, item: ItemKey) -> Option<CrateRow> {
         let prefix = prefix_of(item);
         let n = self.crates.len() / CRATE_ROW;
         let at = search(n, |i| {
             let row = self.crates.get(i * CRATE_ROW..i * CRATE_ROW + 8).unwrap_or(&[]);
             row.cmp(&prefix[..])
         })?;
-        Some(match *self.grains.get(at)? {
-            GrainTag::Toolchain => Grain::Toolchain,
-            GrainTag::Locked => Grain::Dependency,
-            GrainTag::Workspace | GrainTag::WorkspaceNone => Grain::Workspace,
+        let slice = self.crates.get(at * CRATE_ROW..(at + 1) * CRATE_ROW)?;
+        Some(crate_row(slice, *self.grains.get(at)?))
+    }
+
+    fn today_row(&self, fact: &[u8; 32]) -> Option<&Read> {
+        self.today.binary_search_by_key(fact, |read| read.fact).ok().map(|at| &self.today[at])
+    }
+
+    /// The grain `item`'s body is keyed at; `None`: its key's prefix is of no crate of the list.
+    pub(crate) fn grain(&self, item: ItemKey) -> Option<Grain> {
+        Some(match self.crate_of(item)?.grain {
+            CrateGrain::Toolchain => Grain::Toolchain,
+            CrateGrain::Locked(_) => Grain::Dependency,
+            CrateGrain::Workspace(_) => Grain::Workspace,
         })
+    }
+
+    /// Deterministic, input-complete CAS key (rule 21) and root [`CodeClass`] for a non-local
+    /// `Toolchain` or `Dependency` (`Locked`) body's persisted `Checked` record.
+    ///
+    /// Covers:
+    /// - `CHECKED_RECORD_MAGIC` (format version)
+    /// - `self.producers` (all front-end `CHECK_KINDS` tools)
+    /// - `self.toolchain` (pinned toolchain manifest id)
+    /// - `row.key` (`CrateItemKey`: features, cfg, edition, root, direct deps' keys, corrections, checksum)
+    /// - grain tag + coarse closure digest (`toolchain_read.digest` for `Toolchain`; for `Locked`,
+    ///   `today_row(&read.fact)?.digest`, which is the transitive Merkle closure digest from
+    ///   `locked_digests` over every transitive `Fetched`/`CheckoutDep`/`Toolchain` dependency)
+    /// - `item` (`ItemKey`)
+    ///
+    /// Returns `None` for `Grain::Workspace`, body-local items (`is_local(item)`), unknown crates,
+    /// or a locked crate whose fact is absent from `today`.
+    pub(crate) fn dep_typed_key(&self, item: ItemKey) -> Option<(Key, CodeClass)> {
+        if blaze_ladder::front2::program::lazy::typed::is_local(item) {
+            return None;
+        }
+        let row = self.crate_of(item)?;
+        let (grain_tag, digest, class) = match row.grain {
+            CrateGrain::Toolchain => (0u8, self.toolchain_read.digest, CodeClass::Toolchain),
+            CrateGrain::Locked(read) => {
+                let today = self.today_row(&read.fact)?;
+                (1u8, today.digest, CodeClass::Program)
+            }
+            CrateGrain::Workspace(_) => return None,
+        };
+        let mut h = Hasher::new(DEP_TYPED_DOMAIN);
+        h.update(&blaze_typeck::checked_record::CHECKED_RECORD_MAGIC)
+            .id(&self.producers)
+            .update(&self.toolchain.0)
+            .id(&row.key.0)
+            .update(&[grain_tag])
+            .update(&digest)
+            .update(&item.0.to_be_bytes());
+        Some((Key(h.finish()), class))
     }
 
     /// The `BodyCheck` (or `Signature`) task of the workspace body `item`'s row; `None`: no row.
@@ -2680,7 +2734,15 @@ impl<'a> RunIds<'a> {
     /// Read-only `Send + Sync` view over this table's immutable crate/body lookup slices for
     /// parallel code workers (`engine_body_record.rs` `SnapshotTyped`).
     pub(crate) fn lookup(&self) -> IdsLookup<'a> {
-        IdsLookup { crates: self.crates, grains: self.grains, bodies: self.bodies }
+        IdsLookup {
+            toolchain: self.toolchain,
+            toolchain_read: self.toolchain_read,
+            producers: self.producers,
+            crates: self.crates,
+            grains: self.grains,
+            bodies: self.bodies,
+            today: self.today,
+        }
     }
 
     /// The grain `item`'s body is keyed at; `None`: its key's prefix is of no crate of the list.
@@ -3440,5 +3502,98 @@ mod delta_tests {
         assert_eq!(asked.bodies(), 2);
         assert_eq!(armed.today(&first_read.fact), Some(first_read.digest));
         assert_eq!(asked.bodies(), 2, "already-settled slot must not be double-counted after `all` builds");
+    }
+
+    #[test]
+    fn dep_typed_key_is_deterministic_input_complete_and_excludes_workspace_and_locals() {
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(10, bstd::io::Limits::USUAL));
+        let Ok(cx) = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME) else { panic!("root context") };
+        let alloc = blaze_own::testing::heap().alloc();
+        let dep2_byte = 0x22u8;
+        let make_crates = |dep_files: [u8; 32], dep2_files: [u8; 32]| {
+            [
+                CrateDef { byte: CORE_B, name: "core", place: Place::Toolchain, deps: &[] },
+                CrateDef { byte: DEP_B, name: "dep", place: Place::Fetched { source: ContentId([DEP_B; 32]), files: dep_files }, deps: &[0] },
+                CrateDef { byte: dep2_byte, name: "dep2", place: Place::Fetched { source: ContentId([dep2_byte; 32]), files: dep2_files }, deps: &[1, 0] },
+                CrateDef { byte: CRATE_A, name: "crate_a", place: Place::Checkout, deps: &[2, 1, 0] },
+            ]
+        };
+        let build_ids = |toolchain: ToolchainId, tools: &[Tool; blaze_drive::key::KINDS], crates: &[CrateDef]| {
+            let mut ans = SpyAnswer::new(alloc);
+            let table = MemCrates(crates);
+            RunIds::new_scoped(&cx, toolchain, &table, None, tools, &[], &[], &mut ans, None, Most::USUAL, blaze_own::testing::bump())
+                .unwrap_or_else(|e| panic!("RunIds::new_scoped failed: {e}"))
+        };
+
+        let tc1 = ToolchainId([0xaa; 32]);
+        let tc2 = ToolchainId([0xab; 32]);
+        let tools1 = test_tools();
+        let mut tools2 = tools1;
+        tools2[Kind::BodyCheck.index()] = Tool(ContentId([0xf9; 32]));
+
+        let base_crates = make_crates([0xee; 32], [0xdd; 32]);
+        let ids1 = build_ids(tc1, &tools1, &base_crates);
+        let ids1_repeat = build_ids(tc1, &tools1, &base_crates);
+        let ids_tc2 = build_ids(tc2, &tools1, &base_crates);
+        let ids_tools2 = build_ids(tc1, &tools2, &base_crates);
+        let moved_dep_crates = make_crates([0xef; 32], [0xdd; 32]);
+        let ids_dep_moved = build_ids(tc1, &tools1, &moved_dep_crates);
+
+        let tc_item_1 = item_key(CORE_B, 1);
+        let tc_item_2 = item_key(CORE_B, 2);
+        let dep_item_1 = item_key(DEP_B, 1);
+        let dep_item_2 = item_key(DEP_B, 2);
+        let dep2_item_1 = item_key(dep2_byte, 1);
+        let ws_item = item_key(CRATE_A, 1);
+        let unknown_item = item_key(0x99, 1);
+        let local_bit = u64::from(blaze_id::ItemKey::INNER) << 56;
+        let tc_local = item_key(CORE_B, 1 | local_bit);
+        let dep_local = item_key(DEP_B, 1 | local_bit);
+        assert!(blaze_ladder::front2::program::lazy::typed::is_local(tc_local));
+        assert!(blaze_ladder::front2::program::lazy::typed::is_local(dep_local));
+
+        let lookup1 = ids1.lookup();
+        let lookup1_repeat = ids1_repeat.lookup();
+        let lookup_tc2 = ids_tc2.lookup();
+        let lookup_tools2 = ids_tools2.lookup();
+        let lookup_dep_moved = ids_dep_moved.lookup();
+
+        // Excluded kinds return None.
+        assert_eq!(lookup1.dep_typed_key(ws_item), None, "workspace item must return None");
+        assert_eq!(lookup1.dep_typed_key(unknown_item), None, "unknown crate item must return None");
+        assert_eq!(lookup1.dep_typed_key(tc_local), None, "toolchain local item must return None");
+        assert_eq!(lookup1.dep_typed_key(dep_local), None, "dependency local item must return None");
+
+        // Determinism and exact CodeClass assignment.
+        let (k_tc_1, c_tc_1) = lookup1.dep_typed_key(tc_item_1).expect("toolchain key");
+        assert_eq!(c_tc_1, CodeClass::Toolchain);
+        assert_eq!(lookup1_repeat.dep_typed_key(tc_item_1), Some((k_tc_1, CodeClass::Toolchain)));
+
+        let (k_dep_1, c_dep_1) = lookup1.dep_typed_key(dep_item_1).expect("dep key");
+        assert_eq!(c_dep_1, CodeClass::Program);
+        assert_eq!(lookup1_repeat.dep_typed_key(dep_item_1), Some((k_dep_1, CodeClass::Program)));
+
+        let (k_dep2_1, c_dep2_1) = lookup1.dep_typed_key(dep2_item_1).expect("dep2 key");
+        assert_eq!(c_dep2_1, CodeClass::Program);
+
+        // Distinct across items and crates.
+        assert_ne!(k_tc_1, lookup1.dep_typed_key(tc_item_2).expect("tc item 2").0);
+        assert_ne!(k_dep_1, lookup1.dep_typed_key(dep_item_2).expect("dep item 2").0);
+        assert_ne!(k_tc_1, k_dep_1);
+        assert_ne!(k_dep_1, k_dep2_1);
+
+        // Distinct across toolchain id (affects toolchain AND deps whose Merkle closure depends on toolchain).
+        assert_ne!(k_tc_1, lookup_tc2.dep_typed_key(tc_item_1).expect("tc2 key").0);
+        assert_ne!(k_dep_1, lookup_tc2.dep_typed_key(dep_item_1).expect("dep under tc2").0);
+
+        // Distinct across producer tool digests.
+        assert_ne!(k_tc_1, lookup_tools2.dep_typed_key(tc_item_1).expect("tc under tools2").0);
+        assert_ne!(k_dep_1, lookup_tools2.dep_typed_key(dep_item_1).expect("dep under tools2").0);
+
+        // Distinct when locked crate files digest changes — propagates transitively to `dep2`
+        // while leaving `core` (toolchain) unchanged!
+        assert_eq!(k_tc_1, lookup_dep_moved.dep_typed_key(tc_item_1).expect("tc unchanged").0);
+        assert_ne!(k_dep_1, lookup_dep_moved.dep_typed_key(dep_item_1).expect("dep moved").0);
+        assert_ne!(k_dep2_1, lookup_dep_moved.dep_typed_key(dep2_item_1).expect("transitive dep2 moved").0);
     }
 }

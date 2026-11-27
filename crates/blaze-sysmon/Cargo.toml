@@ -13,7 +13,7 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-blaze-own = { path = "../blaze-own" }
+blaze-own.workspace = true
 
 [lints]
 workspace = true

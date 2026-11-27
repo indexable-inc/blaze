@@ -132,10 +132,12 @@ struct Row {
 const ROWS: &[Row] = &[
     Row { mnemonic: "b", encode: branch },                 // 000101 imm26
     Row { mnemonic: "b.cond", encode: branch_cond },       // 01010100 imm19 0 cond
+    Row { mnemonic: "br", encode: br_reg },                // 1101011 0000 11111 000000 Rn 00000
     Row { mnemonic: "cbz", encode: |o| compare_branch(o, false) },  // sf 011010 0 imm19 Rt
     Row { mnemonic: "cbnz", encode: |o| compare_branch(o, true) },  // sf 011010 1 imm19 Rt
     Row { mnemonic: "tbz", encode: |o| test_branch(o, false) },     // b5 011011 0 b40 imm14 Rt
     Row { mnemonic: "tbnz", encode: |o| test_branch(o, true) },     // b5 011011 1 b40 imm14 Rt
+    Row { mnemonic: "mov", encode: mov_reg },              // orr (non-sp) or add #0 (with sp)
     Row { mnemonic: "sub", encode: |o| arithmetic_imm(o, enc::sub_imm) }, // sf 1 0 100010 0 imm12 Rn Rd
     Row { mnemonic: "add", encode: |o| arithmetic_imm(o, enc::add_imm) }, // sf 0 0 100010 0 imm12 Rn Rd
     // Exclusive accesses: size 001000 0 L pair Rs ordered Rt2 Rn Rt.
@@ -146,6 +148,7 @@ const ROWS: &[Row] = &[
     Row { mnemonic: "ldxp", encode: load_pair },                    // L=1 pair=1 Rs=31 ordered=0
     Row { mnemonic: "stxp", encode: store_pair },                   // L=0 pair=1 ordered=0
     Row { mnemonic: "nop", encode: nop },
+    Row { mnemonic: "xpaclri", encode: xpaclri },          // HINT #7 (0xd503_20ff)
     Row { mnemonic: "isb", encode: isb },
     Row { mnemonic: "dsb", encode: dsb },
     Row { mnemonic: "dmb", encode: dmb },
@@ -560,6 +563,38 @@ fn nop(ops: &Ops<'_>) -> Fit {
     match ops.args() {
         [] => Fit::Word(enc::nop()),
         _ => Fit::No,
+    }
+}
+
+fn xpaclri(ops: &Ops<'_>) -> Fit {
+    match ops.args() {
+        [] => Fit::Word(0xd503_20ff),
+        _ => Fit::No,
+    }
+}
+
+fn br_reg(ops: &Ops<'_>) -> Fit {
+    let [Arg::Gpr { reg, wide: true, sp: false }] = *ops.args() else { return Fit::No };
+    Fit::Word(enc::br(reg))
+}
+
+fn mov_reg(ops: &Ops<'_>) -> Fit {
+    let [Arg::Gpr { reg: rd, wide, sp: rd_sp }, Arg::Gpr { reg: rm, wide: rm_wide, sp: rm_sp }] = *ops.args() else {
+        return Fit::No;
+    };
+    if wide != rm_wide {
+        return Fit::No;
+    }
+    if rd_sp || rm_sp {
+        if rd == ZR && !rd_sp {
+            return Fit::Bad { why: "the zero register in `mov` with `sp` (register 31 is `sp` in `add #0`)", at: 0 };
+        }
+        if rm == ZR && !rm_sp {
+            return Fit::Bad { why: "the zero register in `mov` with `sp` (register 31 is `sp` in `add #0`)", at: 1 };
+        }
+        Fit::Word(enc::sf(wide, enc::add_imm(rd, rm, 0, false)))
+    } else {
+        Fit::Word(enc::sf(wide, enc::mov(rd, rm)))
     }
 }
 

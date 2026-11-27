@@ -10,6 +10,7 @@ ast-merge-langs	4	0	52
 astlog	1	0	58
 astlog-core	1	1	58
 astlog-engine	0	0	16
+bgit	1	0	109
 blaze-algebra	0	0	1
 blaze-answer	0	0	86
 blaze-arrow-ipc	0	0	1
@@ -42,6 +43,7 @@ blaze-cc	0	0	109
 blaze-cert	0	0	1
 blaze-check	1	0	1
 blaze-cli	0	0	228
+blaze-cli-spec	0	0	1
 blaze-code	0	0	8
 blaze-columns	0	0	1
 blaze-comptime	0	0	1
@@ -49,11 +51,14 @@ blaze-comptime-sys	0	0	1
 blaze-cond	0	0	1
 blaze-consteval	0	0	86
 blaze-core	1	0	1
+blaze-ctx	0	0	1
 blaze-cunit	0	0	8
 blaze-data	0	0	1
 blaze-dbsp	0	0	8
 blaze-deflate	0	1	1
+blaze-diag-parse	0	0	1
 blaze-drive	0	0	86
+blaze-dust	0	0	1
 blaze-ecs	0	0	1
 blaze-ecs-wasm	0	0	1
 blaze-ed25519	0	1	1
@@ -73,6 +78,7 @@ blaze-format-tiers	1	0	40
 blaze-fuzz	0	0	8
 blaze-git	0	0	1
 blaze-git-fetch	0	0	1
+blaze-git-meta	0	0	1
 blaze-glob	0	0	1
 blaze-graph	5	0	64
 blaze-h1	0	0	1
@@ -131,6 +137,7 @@ blaze-screen	1	1	62
 blaze-script	1	0	16
 blaze-semver	0	0	1
 blaze-sh	0	0	1
+blaze-shell-config	0	0	1
 blaze-sim	0	0	1
 blaze-site	0	0	1
 blaze-site-wasm	0	0	1
@@ -148,11 +155,14 @@ blaze-store-check	0	0	8
 blaze-surface	0	0	8
 blaze-swiss	0	0	1
 blaze-sys	0	1	0
+blaze-sysmon	0	0	1
 blaze-tab	0	0	1
 blaze-tar	0	1	1
+blaze-term-api	0	0	1
 blaze-test-reach	0	0	1
 blaze-text	0	0	1
 blaze-tier	0	0	8
+blaze-tiling	0	0	1
 blaze-tokens	0	0	41
 blaze-toml	0	0	1
 blaze-toolchain	0	0	86

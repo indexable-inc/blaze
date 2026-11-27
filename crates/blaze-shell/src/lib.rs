@@ -8,6 +8,8 @@ pub mod agent_probe;
 pub mod blocks;
 pub mod cli_spec_driver;
 pub mod config;
+pub mod diag_view;
+pub mod help_view;
 pub mod dust_driver;
 pub mod editor;
 pub mod find;
@@ -19,6 +21,7 @@ pub mod layout;
 pub mod prompt;
 pub mod remote_driver;
 pub mod rust_cell;
+pub mod schema_view;
 pub mod svg_icons;
 pub mod sysmon_driver;
 pub mod sysmon_view;
@@ -1111,7 +1114,7 @@ mod tests {
         use crate::tiling::{CloseOutcome, FocusDir, SplitAxis, TileManager};
         use crate::view::{HitRect, Scene};
 
-        let (mut wm, t1, p1) = TileManager::new();
+        let (mut wm, t1, p1) = TileManager::new(Alloc::global());
         assert_eq!(wm.focused_pane(), p1);
         assert_eq!(wm.tabs()[0].id, t1);
 
@@ -1119,22 +1122,22 @@ mod tests {
         let p2 = wm.split_focused(SplitAxis::Vertical);
         let _p3 = wm.split_focused(SplitAxis::Horizontal);
         let area = HitRect::new(0.0, TOP_BAR_H, 1200.0, 800.0);
-        let tl = wm.layout(area, 2.0);
+        let tl = wm.layout(area.into(), 2.0);
         assert_eq!(tl.panes.len(), 3);
         assert_eq!(tl.handles.len(), 2);
 
         // Spatial navigation: from p3 (bottom-right) -> Up -> p2 (top-right) -> Left -> p1 (left).
-        assert_eq!(wm.focus_direction(FocusDir::Up, area, 2.0), Some(p2));
-        assert_eq!(wm.focus_direction(FocusDir::Left, area, 2.0), Some(p1));
-        assert_eq!(wm.focus_direction(FocusDir::Right, area, 2.0), Some(p2));
+        assert_eq!(wm.focus_direction(FocusDir::Up, area.into(), 2.0), Some(p2));
+        assert_eq!(wm.focus_direction(FocusDir::Left, area.into(), 2.0), Some(p1));
+        assert_eq!(wm.focus_direction(FocusDir::Right, area.into(), 2.0), Some(p2));
 
         // Zoom collapses layout to 1 full-area pane, then unzoom restores all 3.
         assert!(wm.toggle_zoom());
-        let zoomed = wm.layout(area, 2.0);
+        let zoomed = wm.layout(area.into(), 2.0);
         assert_eq!(zoomed.panes.len(), 1);
         assert!(zoomed.is_zoomed);
         assert!(wm.toggle_zoom());
-        assert_eq!(wm.layout(area, 2.0).panes.len(), 3);
+        assert_eq!(wm.layout(area.into(), 2.0).panes.len(), 3);
 
         // Workspace tabs: Cmd+T, Cmd+1..9, Cmd+W.
         let (t2, p4) = wm.new_tab();
@@ -1170,7 +1173,7 @@ mod tests {
                 4 => {
                     let dir = [FocusDir::Left, FocusDir::Right, FocusDir::Up, FocusDir::Down]
                         [(next_u32() % 4) as usize];
-                    let _ = wm.focus_direction(dir, area, 2.0);
+                    let _ = wm.focus_direction(dir, area.into(), 2.0);
                 }
                 5 => {
                     let _ = wm.toggle_zoom();
@@ -1194,7 +1197,7 @@ mod tests {
             assert!(wm.active_tab().root.contains(focused), "focused pane must exist in tree");
             for &(w, h) in &[(320.0f32, 240.0f32), (1200.0, 800.0)] {
                 let a = HitRect::new(0.0, TOP_BAR_H, w, h);
-                let l = wm.layout(a, 2.0);
+                let l = wm.layout(a.into(), 2.0);
                 for (i, pa) in l.panes.iter().enumerate() {
                     assert!(pa.rect.x1 > pa.rect.x0 && pa.rect.y1 > pa.rect.y0);
                     for pb in &l.panes[i + 1..] {
@@ -1212,10 +1215,10 @@ mod tests {
         let store = BlockStore::new(state.fork());
         let prompt = PromptInfo::from_cwd("/tmp", "/tmp", 0, 0);
         let editor = Editor::new();
-        let l = wm.layout(area, 2.0);
+        let l = wm.layout(area.into(), 2.0);
         let mut master = Scene::new();
         for pl in &l.panes {
-            let content = pl.rect;
+            let content: HitRect = pl.rect.into();
             let sub = build_pane_scene(&LayoutInput {
                 store: &store,
                 editor: &editor,
@@ -1248,6 +1251,7 @@ mod tests {
             pane_count: l.pane_count_in_tab,
             zoomed: l.is_zoomed,
             process_tag: None,
+            branches: crate::layout::collect_branch_tree(&store),
         }];
         layout_window_top_bar(
             &mut master,
@@ -1261,7 +1265,9 @@ mod tests {
             CellMetrics::default(),
             100,
             true,
+            false,
         );
+        assert!(master.hit_regions.iter().any(|h| h.action == HitAction::ToggleSidebar));
         assert!(master.hit_regions.iter().any(|h| h.action == HitAction::NewTab));
         assert!(master.hit_regions.iter().any(|h| h.action == HitAction::NewWindow));
         assert!(
@@ -1270,6 +1276,54 @@ mod tests {
                 .iter()
                 .any(|h| h.action == HitAction::SplitPane(SplitAxis::Vertical))
         );
+
+        // Verify collapsible workspace sidebar renders nested fork hierarchy with SwitchTabBranch hits.
+        let st0 = EngineState::new("/tmp", &[], Alloc::global());
+        let mut forked_store = BlockStore::new(st0.fork());
+        let b1 = forked_store.record_block(
+            "ls -l".to_owned(),
+            prompt.clone(),
+            st0.fork(),
+            st0.fork(),
+            1,
+            0,
+            0,
+            BlockBody::Value(Value::Nothing),
+        );
+        let f1 = forked_store.fork_from_block(b1, Some("fork-1")).expect("fork-1");
+        let b2 = forked_store.record_block(
+            "blaze check".to_owned(),
+            prompt.clone(),
+            st0.fork(),
+            st0.fork(),
+            2,
+            0,
+            0,
+            BlockBody::Value(Value::Nothing),
+        );
+        let f2 = forked_store.fork_from_block(b2, Some("fork-2")).expect("fork-2");
+        let tree = crate::layout::collect_branch_tree(&forked_store);
+        assert_eq!(tree.len(), 3);
+        assert_eq!((tree[0].depth, tree[1].depth, tree[2].depth), (0, 1, 2));
+        assert_eq!(tree[1].id, f1);
+        assert_eq!(tree[1].fork_cmd.as_deref(), Some("ls -l"));
+        assert_eq!(tree[2].id, f2);
+        assert_eq!(tree[2].fork_cmd.as_deref(), Some("blaze check"));
+        let sb_tabs = [TabBarItem {
+            id: wm.active_tab().id,
+            slot: 1,
+            symbol: None,
+            title: "tmp",
+            active: true,
+            pane_count: 1,
+            zoomed: false,
+            process_tag: None,
+            branches: tree,
+        }];
+        let mut sb_scene = Scene::new();
+        crate::layout::layout_workspace_sidebar(&mut sb_scene, &sb_tabs, 240.0, 800.0, CellMetrics::default(), None);
+        assert!(sb_scene.hit_regions.iter().any(|h| h.action == HitAction::SwitchTab(wm.active_tab().id)));
+        assert!(sb_scene.hit_regions.iter().any(|h| h.action == HitAction::SwitchTabBranch { tab: wm.active_tab().id, branch: f2 }));
     }
 
     #[test]
@@ -1294,6 +1348,7 @@ mod tests {
                 kind: crate::editor::CompletionKind::File,
                 icon: None,
                 avatar_path: None,
+                fs_meta: None,
                 match_indices: Vec::new(),
             });
         }

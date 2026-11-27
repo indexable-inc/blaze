@@ -355,6 +355,7 @@ pub use blaze_solve::facts::ConstHolds;
 pub struct Predicates<'w> {
     pub clauses: &'w [PClause],
     pub types: PTys<'w>,
+    pub regions: Option<&'w dyn crate::region_facts::HeadRegionRead>,
 }
 
 /// What kind of ADT.
@@ -421,6 +422,8 @@ pub struct ImplHeader<'w> {
     /// keeps an auto trait from being proven by the type's parts. `#[rustc_reservation_impl]`
     /// is a reservation. The solver's own type: one home for the concept.
     pub polarity: ImplPolarity,
+    /// Optional head region columns (`'static` / higher-ranked binders) for trait selection.
+    pub regions: Option<&'w dyn crate::region_facts::HeadRegionRead>,
 }
 
 pub use blaze_solve::facts::ImplPolarity;
@@ -577,6 +580,38 @@ impl TypeAttrs {
     /// Blaze edition: transparent all-`pub` struct eligible for automatic `Copy`/`Clone`
     /// (`blaze_solve::facts::AdtFlags::AUTO_COPY_PUB`). Bit 12.
     pub const AUTO_COPY_PUB: u32 = 1 << 12;
+    /// Bits 13..=21: opt-in complexity cost contract ([`CostContract`], 9 bits); 0 is `NONE`.
+    const COST_SHIFT: u32 = 13;
+    const COST_MASK: u32 = 0x01ff << Self::COST_SHIFT;
+    /// `#[blaze::capability]` on a struct/enum/union: a host/runtime capability (e.g. `Alloc`,
+    /// `Fs`, `Net`, `Clock`, `Mutex`) that cannot be stored as a field (directly or transitively)
+    /// inside any type defined in a `#![blaze::sans_io]` crate or module (rules/capability.rs).
+    /// Bit 22.
+    pub const CAPABILITY: u32 = 1 << 22;
+    /// ADT defined inside a `#![blaze::sans_io]` crate or module (or marked `#[blaze::sans_io]`):
+    /// checked by `capability-in-sans-io` (rules/capability.rs) to store no `#[blaze::capability]`
+    /// field directly or transitively. Bit 23.
+    pub const SANS_IO: u32 = 1 << 23;
+
+    /// Whether this item carries `#[blaze::capability]`.
+    pub const fn is_capability(self) -> bool {
+        (self.0 & Self::CAPABILITY) != 0
+    }
+
+    /// Whether this ADT is defined in a `#![blaze::sans_io]` crate/module or marked `#[blaze::sans_io]`.
+    pub const fn is_sans_io(self) -> bool {
+        (self.0 & Self::SANS_IO) != 0
+    }
+
+    /// These attributes with a complexity cost contract set.
+    pub const fn with_cost(self, c: CostContract) -> Self {
+        TypeAttrs((self.0 & !Self::COST_MASK) | ((c.bits() as u32 & 0x01ff) << Self::COST_SHIFT))
+    }
+
+    /// The complexity cost contract carried by this item (`CostContract::NONE` when unannotated).
+    pub const fn cost(self) -> CostContract {
+        CostContract(((self.0 & Self::COST_MASK) >> Self::COST_SHIFT) as u16)
+    }
 
     /// These attributes with an enum's discriminant type set.
     pub const fn with_discr(self, d: DiscrRepr) -> Self {
@@ -597,6 +632,171 @@ impl TypeAttrs {
             c @ 7..=12 => DiscrRepr::Uint(U[c as usize - 7]),
             _ => DiscrRepr::Unread,
         }
+    }
+}
+
+/// Asymptotic time or space complexity class declared by `#[blaze::cost(...)]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum CostClass {
+    /// Unannotated (opt-in: not checked unless declared).
+    None = 0,
+    /// `O(1)`.
+    O1 = 1,
+    /// `amortized O(1)`.
+    AmortizedO1 = 2,
+    /// `O(log n)` (also spelled `O(log)`).
+    OLogN = 3,
+    /// `O(n)`.
+    ON = 4,
+    /// `O(n log n)`.
+    ONLogN = 5,
+    /// `O(n^2)`.
+    ON2 = 6,
+    /// Malformed or duplicate `#[blaze::cost(..)]` argument (Rule 3: never silently ignored).
+    Invalid = 7,
+}
+
+impl CostClass {
+    /// Human-readable spelling of this complexity class.
+    pub const fn name(self) -> &'static str {
+        match self {
+            CostClass::None => "unannotated",
+            CostClass::O1 => "O(1)",
+            CostClass::AmortizedO1 => "amortized O(1)",
+            CostClass::OLogN => "O(log n)",
+            CostClass::ON => "O(n)",
+            CostClass::ONLogN => "O(n log n)",
+            CostClass::ON2 => "O(n^2)",
+            CostClass::Invalid => "<invalid>",
+        }
+    }
+
+    /// Decodes a 3-bit discriminant into a [`CostClass`].
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => CostClass::None,
+            1 => CostClass::O1,
+            2 => CostClass::AmortizedO1,
+            3 => CostClass::OLogN,
+            4 => CostClass::ON,
+            5 => CostClass::ONLogN,
+            6 => CostClass::ON2,
+            7 => CostClass::Invalid,
+            _ => return None,
+        })
+    }
+}
+
+/// Concurrency / synchronization cost class declared by `#[blaze::cost(...)]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum SyncCost {
+    /// Unspecified (default; ordinary Rust).
+    None = 0,
+    /// Thread-local / lock-free / no cross-thread synchronization (`lock_free` or `sync = local`).
+    Local = 1,
+    /// Shared atomic RMW / cross-core coherence traffic (`atomic` or `sync = atomic`).
+    Atomic = 2,
+    /// Acquires a lock, blocks, or synchronizes across threads (`locks` or `sync = lock`).
+    Lock = 3,
+}
+
+impl SyncCost {
+    /// Human-readable spelling of this synchronization cost class.
+    pub const fn name(self) -> &'static str {
+        match self {
+            SyncCost::None => "unspecified",
+            SyncCost::Local => "lock_free",
+            SyncCost::Atomic => "atomic",
+            SyncCost::Lock => "locks",
+        }
+    }
+
+    /// Decodes a 2-bit discriminant into a [`SyncCost`].
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => SyncCost::None,
+            1 => SyncCost::Local,
+            2 => SyncCost::Atomic,
+            3 => SyncCost::Lock,
+            _ => return None,
+        })
+    }
+}
+
+/// Compact 9-bit complexity contract carried on a function head and [`TypeAttrs`]:
+/// - bits `0..=2`: `time` ([`CostClass`])
+/// - bit `3`: `trusted` (`bool`)
+/// - bits `4..=6`: `space` ([`CostClass`])
+/// - bits `7..=8`: `sync` ([`SyncCost`])
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct CostContract(pub u16);
+
+impl CostContract {
+    /// No cost contract declared.
+    pub const NONE: Self = Self(0);
+
+    /// Malformed or duplicate `#[blaze::cost(..)]` contract.
+    pub const INVALID: Self = Self(CostClass::Invalid as u16);
+
+    /// Builds a cost contract from its components.
+    pub const fn new(time: CostClass, space: CostClass, sync: SyncCost, trusted: bool) -> Self {
+        Self((time as u16) | ((trusted as u16) << 3) | ((space as u16) << 4) | ((sync as u16) << 7))
+    }
+
+    /// Builds a time-only cost contract (`space` defaults to `time`, `sync` is `None`).
+    pub const fn time_only(time: CostClass, trusted: bool) -> Self {
+        Self::new(time, time, SyncCost::None, trusted)
+    }
+
+    /// Declared asymptotic time class (`CostClass::None` if omitted).
+    pub const fn time(self) -> CostClass {
+        match CostClass::from_u8((self.0 & 0x7) as u8) {
+            Some(c) => c,
+            None => CostClass::Invalid,
+        }
+    }
+
+    /// Declared asymptotic space class (`CostClass::None` if omitted).
+    pub const fn space(self) -> CostClass {
+        match CostClass::from_u8(((self.0 >> 4) & 0x7) as u8) {
+            Some(c) => c,
+            None => CostClass::Invalid,
+        }
+    }
+
+    /// Declared concurrency / synchronization class (`SyncCost::None` if unspecified).
+    pub const fn sync(self) -> SyncCost {
+        match SyncCost::from_u8(((self.0 >> 7) & 0x3) as u8) {
+            Some(s) => s,
+            None => SyncCost::None,
+        }
+    }
+
+    /// Whether the contract was marked `trusted = "..."` (body skipped; callers trust the claim).
+    pub const fn trusted(self) -> bool {
+        self.0 & 0x8 != 0
+    }
+
+    /// True when no cost contract is declared at all.
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    /// True when the contract attribute was malformed or duplicated.
+    pub const fn is_invalid(self) -> bool {
+        matches!(self.time(), CostClass::Invalid) || matches!(self.space(), CostClass::Invalid)
+    }
+
+    /// Decodes a persisted 16-bit representation, rejecting any non-zero reserved bits.
+    pub const fn from_bits(bits: u16) -> Option<Self> {
+        if bits & !0x01ff == 0 { Some(Self(bits)) } else { None }
+    }
+
+    /// Encodes this contract as a 16-bit integer (only bits `0..=8` may be set).
+    pub const fn bits(self) -> u16 {
+        self.0
     }
 }
 
@@ -941,7 +1141,7 @@ impl<T> Holed for &[T] {
 
 impl Holed for Predicates<'_> {
     fn hole() -> Self {
-        Predicates { clauses: &[], types: PTys::EMPTY }
+        Predicates { clauses: &[], types: PTys::EMPTY, regions: None }
     }
 }
 
@@ -1002,6 +1202,14 @@ pub struct Reads<'w, 'a, W: World> {
     /// world that records them mutes the second. A hole is not in it (the next ask may be
     /// answered, by reads the hole's did not make).
     heard: blaze_hash::HashSet<Question, Alloc<'a>>,
+    /// Per-run `(Question -> recorded digest)` memo: once a question has been answered `Ok` and
+    /// hashed into `entries`, repeat reads in the same `Reads` run skip re-running `StableHasher`
+    /// (`Hashes::rooted` / `hash_of`), skip duplicate `entries` pushes, and answer `recorded(q)`
+    /// in O(1) instead of scanning `entries`.
+    digests: HashMap<Question, Option<u64>, Alloc<'a>>,
+    /// Impl items whose header arity against `trait_def(trait_)` was already validated in this
+    /// run, skipping redundant `trait_def` asks on repeat `impl_header` reads.
+    impl_arity_ok: blaze_hash::HashSet<ItemKey, Alloc<'a>>,
 }
 
 /// A run's memo of term digests: a record table's node (the table's number, its index) to
@@ -1276,6 +1484,41 @@ impl Tabled for FnSig<'_> {
     }
 }
 
+fn hash_pred_regions(regions: Option<&dyn crate::region_facts::HeadRegionRead>, h: &mut StableHasher) {
+    let Some(hr) = regions else { return };
+    let n = hr.clause_count();
+    let mut any = false;
+    for i in 0..n {
+        if let Some((_, binders, col)) = hr.clause(i)
+            && (binders > 0 || col.as_slice().contains(&Region::Static))
+        {
+            any = true;
+            break;
+        }
+    }
+    if any {
+        h.tag(1);
+        for i in 0..n {
+            if let Some((nth, binders, col)) = hr.clause(i)
+                && (binders > 0 || col.as_slice().contains(&Region::Static))
+            {
+                h.u32(nth);
+                h.u32(binders);
+                for &r in col.as_slice() {
+                    match r {
+                        Region::Static => h.tag(1),
+                        Region::Late { binder: 0, var } if binders > 0 => {
+                            h.tag(2);
+                            h.u32(var);
+                        }
+                        _ => h.tag(0),
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Tabled for Predicates<'_> {
     fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
         clause_roots(self.clauses, roots);
@@ -1283,6 +1526,7 @@ impl Tabled for Predicates<'_> {
     }
     fn hash_shape(&self, h: &mut StableHasher) {
         clauses_shape(self.clauses, h);
+        hash_pred_regions(self.regions, h);
     }
 }
 
@@ -1321,6 +1565,24 @@ impl Tabled for ImplHeader<'_> {
             ImplPolarity::Negative => 1,
             ImplPolarity::Reservation => 2,
         });
+        if let Some(hr) = self.regions
+            && let Some((self_col, trait_col)) = hr.impl_header()
+        {
+            let has_static = self_col.as_slice().contains(&Region::Static)
+                || trait_col.is_some_and(|c| c.as_slice().contains(&Region::Static));
+            if has_static {
+                h.tag(1);
+                for &r in self_col.as_slice() {
+                    h.tag(u8::from(r == Region::Static));
+                }
+                if let Some(tc) = trait_col {
+                    h.tag(2);
+                    for &r in tc.as_slice() {
+                        h.tag(u8::from(r == Region::Static));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1512,6 +1774,8 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
             tally,
             hashes: Hashes::new_in(alloc),
             heard: blaze_hash::HashSet::new_in(alloc),
+            digests: HashMap::new_in(alloc),
+            impl_arity_ok: blaze_hash::HashSet::new_in(alloc),
         }
     }
 
@@ -1632,7 +1896,14 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// The read-list digest of this run's latest answer to `q`, `None` when no answer to it
     /// entered the list (never asked, a hole, or an opaque seen as itself: [`Reads::opaque_record`]).
     pub(crate) fn recorded(&self, q: Question) -> Option<u64> {
-        self.entries.iter().rev().find(|e| e.0 == q).map(|e| e.1)
+        if let Some(&d) = self.digests.get(&q) {
+            return d;
+        }
+        #[cfg(test)]
+        if self.hole_plant == HolePlant::KeepEarlierReads {
+            return self.entries.iter().rev().find(|e| e.0 == q).map(|e| e.1);
+        }
+        None
     }
 
     /// `record` for an answer with a table: its digest covers only the terms it reaches.
@@ -1669,8 +1940,12 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         }
         match got {
             Ok(v) => {
-                if let Some(d) = digest(&mut self.hashes, &v)? {
-                    self.entries.push((q, d));
+                if !self.digests.contains_key(&q) {
+                    let d = digest(&mut self.hashes, &v)?;
+                    self.digests.insert(q, d);
+                    if let Some(d) = d {
+                        self.entries.push((q, d));
+                    }
                 }
                 self.count(q, false, asked_at, answered_at);
                 Ok(v)
@@ -1808,7 +2083,9 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         let asked_at = self.ask(Question::ImplHeader(item));
                 let got = self.world.impl_header(Self::seal(), item);
         let h = self.record_tabled(Question::ImplHeader(item), got, asked_at)?;
-        if let Some(ImplHeader { trait_: Some(trait_), trait_args, .. }) = h {
+        if let Some(ImplHeader { trait_: Some(trait_), trait_args, .. }) = h
+            && !self.impl_arity_ok.contains(&item)
+        {
             let holes = self.holes.len();
             let Some(def) = self.trait_def(trait_)? else {
                 if self.holes.len() > holes {
@@ -1821,6 +2098,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
             if trait_args.list().len != expected {
                 return Err(CheckError::ImplTraitArity { impl_: item, trait_, expected, got: trait_args.list().len }.into());
             }
+            self.impl_arity_ok.insert(item);
         }
         Ok(h)
     }
@@ -2004,7 +2282,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     }
 
     /// The read list and the needs of the run, sorted and deduplicated (rule 25).
-    pub(crate) fn finish(mut self, alloc: Alloc<'a>) -> (ReadList<'a>, Needs<'a>) {
+    pub(crate) fn finish<'b>(mut self, alloc: Alloc<'b>) -> (ReadList<'b>, Needs<'b>) {
         let recorded = self.entries.len() as u64;
         self.entries.sort_unstable();
         self.entries.dedup();
@@ -2115,6 +2393,39 @@ impl ContentHash for Predicates<'_> {
     fn hash_into(&self, h: &mut StableHasher) {
         self.clauses.hash_into(h);
         self.types.hash_into(h);
+        if let Some(hr) = self.regions {
+            let n = hr.clause_count();
+            let mut any = false;
+            for i in 0..n {
+                if let Some((_, binders, col)) = hr.clause(i)
+                    && (binders > 0 || col.as_slice().contains(&Region::Static))
+                {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                h.tag(1);
+                for i in 0..n {
+                    if let Some((nth, binders, col)) = hr.clause(i)
+                        && (binders > 0 || col.as_slice().contains(&Region::Static))
+                    {
+                        h.u32(nth);
+                        h.u32(binders);
+                        for &r in col.as_slice() {
+                            match r {
+                                Region::Static => h.tag(1),
+                                Region::Late { binder: 0, var } if binders > 0 => {
+                                    h.tag(2);
+                                    h.u32(var);
+                                }
+                                _ => h.tag(0),
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2186,6 +2497,24 @@ impl ContentHash for ImplHeader<'_> {
             ImplPolarity::Negative => 1,
             ImplPolarity::Reservation => 2,
         });
+        if let Some(hr) = self.regions
+            && let Some((self_col, trait_col)) = hr.impl_header()
+        {
+            let has_static = self_col.as_slice().contains(&Region::Static)
+                || trait_col.is_some_and(|c| c.as_slice().contains(&Region::Static));
+            if has_static {
+                h.tag(1);
+                for &r in self_col.as_slice() {
+                    h.tag(u8::from(r == Region::Static));
+                }
+                if let Some(tc) = trait_col {
+                    h.tag(2);
+                    for &r in tc.as_slice() {
+                        h.tag(u8::from(r == Region::Static));
+                    }
+                }
+            }
+        }
     }
 }
 

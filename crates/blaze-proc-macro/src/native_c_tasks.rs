@@ -210,7 +210,8 @@ pub fn run_tasks<'a, 'b>(
             keyed.extend(sources.iter().filter(|laid| laid.guest != roots.out).map(|laid| (laid.guest, laid.digest)));
             let inputs = c_tasks_tree::TreeInputs { toolchain, tools: trees.keys, os_build: trees.os_build, sources: &keyed, runner: TREE_RUNNER };
             let mut runner = ShelfTree { setting, sources, roots, tools: trees, demand };
-            let done = c_tasks_tree::run_tree(package, outputs, &roots, &tree_requests, &inputs, &mut runner, store, alloc).map_err(TasksError::Tree)?;
+            let area = FileArea { folder: setting.area };
+            let done = c_tasks_tree::run_tree(package, outputs, &roots, &tree_requests, &inputs, &mut runner, &area, store, alloc).map_err(TasksError::Tree)?;
             done.files
         }
     };
@@ -222,9 +223,10 @@ pub fn run_tasks<'a, 'b>(
     let facts = DiskFacts::new(alloc);
     let today = GuestToday { laid: sources, facts: &facts };
     let state_today = |state: u32| c_tasks::StateToday { outputs, state, rest: &today };
+    let area_ro = FileArea { folder: setting.area };
     let mut looked: AVec<'a, Looked> = Vec::with_capacity_in(units.len(), alloc);
     for unit in units.iter() {
-        looked.push(c_tasks::look(package, unit, toolchain, &state_today(unit.state), store, alloc).map_err(TasksError::Task)?);
+        looked.push(c_tasks::look(package, unit, toolchain, &state_today(unit.state), &area_ro, store, alloc).map_err(TasksError::Task)?);
     }
     let mut jobs: Vec<Job<'b>, SharedAlloc<'static>> = Vec::new_in(setting.heap.shared());
     for (at, one) in looked.iter().enumerate() {
@@ -286,7 +288,7 @@ pub fn run_tasks<'a, 'b>(
         let (pre, free_slot) = match looked[at] {
             Looked::Hit(file) => {
                 report.found += 1;
-                objects.push(file);
+                objects.push(file.file());
                 continue;
             }
             Looked::Miss { pre, free_slot } => (pre, free_slot),

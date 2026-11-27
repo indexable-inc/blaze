@@ -51,7 +51,7 @@ impl RunLimits {
     /// The design's limits (build-scripts.md): fuel tens of times the largest generator's,
     /// 1 GiB of memory, `OUT_DIR` 64 MiB in 4096 files, 16 MiB of output, 256 KiB a line.
     pub const STANDARD: RunLimits =
-        RunLimits { fuel: 1 << 36, memory: 1 << 30, out_dir_bytes: 64 << 20, out_dir_files: 4096, output: 16 << 20, line: 256 << 10 };
+        RunLimits { fuel: 1 << 39, memory: 1 << 30, out_dir_bytes: 64 << 20, out_dir_files: 4096, output: 16 << 20, line: 256 << 10 };
 }
 
 /// What the base key is made of.
@@ -109,7 +109,9 @@ impl<'k> HostToolKey<'k> {
 /// its spawn's folder when recorded (c_tasks.rs `rooted`): a `bzbsout6` record of run 2 holds
 /// them as spawned, which the C tasks refuse as host paths, so none is found again. 4: a
 /// `--param` value is no longer taken for a path (`rooted` made it `/package/ssp-buffer-size=4`).
-pub const DOMAIN: &str = "blaze v2 build-script run 4";
+/// 5: compiler probes (`cc-probe`) are recorded per probe in the script's read list instead of
+/// hashing the whole `pins/answers/clang.json` table into every script's base key.
+pub const DOMAIN: &str = "blaze v2 build-script run 5";
 
 /// The base key.
 pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> ContentId {
@@ -129,10 +131,12 @@ pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> Co
         .update(&l.out_dir_files.to_le_bytes())
         .update(&l.output.to_le_bytes())
         .update(&l.line.to_le_bytes());
+    #[cfg(not(target_os = "linux"))]
     if let RunnerKey::Wasm = inputs.runner {
-        // A wasm script's compiler probes are answered from this table (c_tasks_probe): a
-        // changed answer re-runs the scripts, and no probe is in a read list. A native script
-        // runs its compiler, so the table is not in its key.
+        // On non-Linux hosts, wasm compiler probes still use the pinned table in
+        // `pins/answers/clang.json` (preserving main's exact behavior until a descriptor-bound
+        // macOS execution backend lands). On Linux, probes execute hermetically and record
+        // per-probe `cc-probe` read subjects instead of hashing the whole table into every key.
         hasher.part(b"clang answers").id(&crate::c_tasks_probe::table_id(blaze_pins::CLANG_ANSWERS_JSON.as_bytes()));
     }
     if let RunnerKey::Native { compiler, target, sysroot, host_tools } = inputs.runner {

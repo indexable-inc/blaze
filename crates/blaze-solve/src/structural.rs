@@ -196,10 +196,30 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
 /// `ImplWhereBound` goals. A cycle through them is coinductive (auto traits are), which the
 /// search graph answers.
 fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<Step, Stop> {
-    let mut tys: Vec<Ty, Alloc<'_>> = Vec::new_in(cx.alloc);
-    // What each constituent is of the self type (why_no.rs `Reach`), beside `tys`: a field's
-    // index, a tuple's element; one per type, pushed where the type is.
-    let mut reach: Vec<Reach, Alloc<'_>> = Vec::new_in(cx.alloc);
+    let mut tys = core::mem::replace(&mut cx.scratch.auto_tys, Vec::new_in(cx.alloc));
+    let mut reach = core::mem::replace(&mut cx.scratch.auto_reach, Vec::new_in(cx.alloc));
+    let mut params = core::mem::replace(&mut cx.scratch.auto_params, Vec::new_in(cx.alloc));
+    let mut opaque = core::mem::replace(&mut cx.scratch.auto_opaque, Vec::new_in(cx.alloc));
+    tys.clear();
+    reach.clear();
+    params.clear();
+    opaque.clear();
+    let res = step_auto_in(cx, cand, &mut tys, &mut reach, &mut params, &mut opaque);
+    cx.scratch.auto_tys = tys;
+    cx.scratch.auto_reach = reach;
+    cx.scratch.auto_params = params;
+    cx.scratch.auto_opaque = opaque;
+    res
+}
+
+fn step_auto_in<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    cand: &Cand,
+    tys: &mut Vec<Ty, Alloc<'_>>,
+    reach: &mut Vec<Reach, Alloc<'_>>,
+    params: &mut Vec<u32, Alloc<'_>>,
+    opaque: &mut Vec<u32, Alloc<'_>>,
+) -> Result<Step, Stop> {
     match cx.kind(cand.a) {
         TyKind::Uint(_)
         | TyKind::Int(_)
@@ -223,8 +243,8 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
             reach.push(Reach::Pointee);
         }
         TyKind::Tuple(l) | TyKind::Record(_, l) | TyKind::Union(l) => {
-            tys.extend_from_slice(&cx.list_small(l));
             for i in 0..l.len {
+                tys.push(cx.arg(l, i));
                 reach.push(Reach::Element(i));
             }
         }
@@ -253,8 +273,6 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
             } else if let Some(row) = adt_summary(cx, d, cand.d)? {
                 // The fields by the ADT's summary (auto_summary.rs): its parameters' goals,
                 // and the goals of the fields it does not see through.
-                let mut params: Vec<u32, Alloc<'_>> = Vec::new_in(cx.alloc);
-                let mut opaque: Vec<u32, Alloc<'_>> = Vec::new_in(cx.alloc);
                 {
                     let s = cx.scratch.auto.get(row);
                     params.extend_from_slice(s.params);
@@ -276,7 +294,7 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
             } else {
                 // Every field, in the ADT's order (`adt_fields`).
                 let lo = tys.len();
-                adt_fields(cx, d, args, &mut tys)?;
+                adt_fields(cx, d, args, tys)?;
                 for j in 0..(tys.len() - lo) {
                     reach.push(Reach::Field(j as u32));
                 }
@@ -353,9 +371,23 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
     if matches!(k, TyKind::Infer(Var { kind: VarKind::Ty | VarKind::Int | VarKind::Float | VarKind::Const, .. })) {
         return Ok(Step::Done(Certainty::Ambiguous));
     }
-    let mut preds: Vec<Pred, Alloc<'_>> = Vec::new_in(cx.alloc);
-    // The children whose well-formedness is required (wf.rs `super_visit_with`, one level).
-    let mut kids: Vec<Ty, Alloc<'_>> = Vec::new_in(cx.alloc);
+    let mut preds = core::mem::replace(&mut cx.scratch.wf_preds, Vec::new_in(cx.alloc));
+    let mut kids = core::mem::replace(&mut cx.scratch.wf_kids, Vec::new_in(cx.alloc));
+    preds.clear();
+    kids.clear();
+    let res = step_wf_in(cx, t, k, &mut preds, &mut kids);
+    cx.scratch.wf_preds = preds;
+    cx.scratch.wf_kids = kids;
+    res
+}
+
+fn step_wf_in<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    t: Ty,
+    k: TyKind,
+    preds: &mut Vec<Pred, Alloc<'_>>,
+    kids: &mut Vec<Ty, Alloc<'_>>,
+) -> Result<Step, Stop> {
     match k {
         _ if is_wf_leaf(k) => {}
         // wf.rs: "ty::Slice(subty) => self.require_sized(subty, SliceOrArrayElem)".

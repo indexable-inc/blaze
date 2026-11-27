@@ -530,4 +530,48 @@ mod runs {
 
         println!("both forms run equal: a loop 5050, a static and data 147 then 149, 4 calls, a function's address, a memcpy of 200 bytes");
     }
+
+    #[test]
+    fn weak_c_static_emits_weak_outside_target() {
+        use blaze_code::record::{CodeView, Symbol, Target};
+        use blaze_own::{AVec, Alloc};
+        use crate::{Named, Names, Outside, emit_record};
+
+        struct MixedC;
+        impl Names for MixedC {
+            fn name(&self, of: Outside) -> Option<Named<'_>> {
+                match of {
+                    Outside::Static(0) => Some(Named::WeakC("weak_sym")),
+                    Outside::Static(1) => Some(Named::C("strong_sym")),
+                    _ => None,
+                }
+            }
+            fn routines(&self) -> blaze_tier::RoutinePlaces {
+                blaze_tier::RoutinePlaces::NONE
+            }
+        }
+        let func = one(&[], Ty::PTR, |b, _| {
+            let w = b.reference(RefKind::Static, 0);
+            let s = b.reference(RefKind::Static, 1);
+            let a = b.data_addr(w);
+            let _ = b.data_addr(s);
+            a
+        });
+        let alloc = Alloc::global();
+        let Ok(verified) = blaze_lir::verify(func.view()) else { panic!("func verifies") };
+        let Ok((rec, _)) = emit_record(verified, &MixedC, &blaze_tier::RoutinePlaces::NONE, crate::Isa { lse: true, os: crate::Os::Linux }, alloc) else {
+            panic!("emit_record must accept Named::WeakC and Named::C");
+        };
+        let Ok(sealed) = rec.seal() else { panic!("record must seal") };
+        let mut bytes: AVec<'_, u8> = blaze_own::Vec::new_in(alloc);
+        sealed.encode(&mut bytes);
+        let Ok(view) = CodeView::read(&bytes) else { panic!("record must decode") };
+        let weak_sym = Symbol::of_name("weak_sym");
+        let strong_sym = Symbol::of_name("strong_sym");
+        assert_eq!(view.targets(), 2);
+        assert_eq!(view.target(0), Target { space: Space::Outside, symbol: strong_sym });
+        assert_eq!(view.target(1), Target { space: Space::WeakOutside, symbol: weak_sym });
+        assert_eq!(view.name(weak_sym), Some("weak_sym"));
+        assert_eq!(view.name(strong_sym), Some("strong_sym"));
+    }
 }

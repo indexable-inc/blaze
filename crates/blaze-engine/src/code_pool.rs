@@ -224,7 +224,7 @@ struct ChildState<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WorkerState {
-    Unavailable,
+    Unavailable { warm: bool },
     Free,
     Busy { row: RowId, speculative: bool },
 }
@@ -256,7 +256,7 @@ impl<'a> CodePool<'a> {
         children.resize_with(opts.children, || ChildState { live: true, slots: SMap::new_in(a), pending: VecDeque::new_in(a) });
         Ok(Self {
             opts, index: Table::new_in(a), rows: SVec::new_in(a), children,
-            workers: SVec::from_elem_in(WorkerState::Unavailable, opts.workers, a),
+            workers: SVec::from_elem_in(WorkerState::Unavailable { warm: false }, opts.workers, a),
             idle: VecDeque::new_in(a),
             queue: SSet::new_in(a), frontier: SSet::new_in(a),
             background: 0, demands: 0, spec_claims: 0,
@@ -291,6 +291,23 @@ impl<'a> CodePool<'a> {
         self.index.get(&Probe { key, seed: self.opts.hash_seed }).copied()
     }
 
+    /// Removes a settled `Ready` entry from the lookup index so the relay can evict its cached
+    /// bytes under `most_bytes` pressure. Returns `false` if not `Ready` or still pending on a
+    /// live child.
+    fn evict_ready(&mut self, key: CodeKey) -> bool {
+        let Some(id) = self.find(key) else { return false };
+        if !matches!(self.rows[id].state, State::Ready { .. }) {
+            return false;
+        }
+        if self.children.iter().any(|c| c.live && c.pending.iter().any(|&(row, _)| row == id)) {
+            return false;
+        }
+        self.index.remove(&Probe { key, seed: self.opts.hash_seed });
+        self.rows[id].callers.clear();
+        self.rows[id].state = State::Dormant(None);
+        true
+    }
+
     fn claim(&mut self, key: CodeKey, out: &mut SVec<'_, Action>) -> RowId {
         let id = self.rows.len();
         let a = self.opts.alloc;
@@ -317,9 +334,17 @@ impl<'a> CodePool<'a> {
             Event::Demand { child, thread, key } => self.demand(child, thread, key, out)?,
             Event::Exited(child) => self.exit(child, out)?,
             Event::Free(worker) => match self.workers.get_mut(worker.0) {
-                Some(state @ WorkerState::Unavailable) => {
+                Some(state @ WorkerState::Unavailable { .. }) => {
+                    let warm = matches!(*state, WorkerState::Unavailable { warm: true });
                     *state = WorkerState::Free;
-                    self.idle.push_back(worker);
+                    // Prefer most-recently-warm workers (MRU) so serial JIT demands reuse
+                    // already-hydrated `LazyProgram`/body caches instead of cold-starting every
+                    // worker in round-robin order; cold workers stay at the back in id order.
+                    if warm {
+                        self.idle.push_front(worker);
+                    } else {
+                        self.idle.push_back(worker);
+                    }
                 }
                 _ => return Err(Error::WorkerNotAvailable(worker)),
             },
@@ -351,7 +376,7 @@ impl<'a> CodePool<'a> {
                         }
                     }
                 }
-                self.workers[worker.0] = WorkerState::Unavailable;
+                self.workers[worker.0] = WorkerState::Unavailable { warm: true };
                 self.background -= usize::from(speculative);
             }
             Event::Produced { key, producer, result } => {
@@ -551,8 +576,9 @@ impl<'a> CodePool<'a> {
         self.children[child.0].live = false;
         self.children[child.0].pending.clear();
         for key in self.children[child.0].slots.keys() {
-            let id = self.index.get(&Probe { key: *key, seed: self.opts.hash_seed }).expect("a demanded slot has a claim");
-            self.rows[*id].callers.retain(|&c| c != child);
+            if let Some(&id) = self.index.get(&Probe { key: *key, seed: self.opts.hash_seed }) {
+                self.rows[id].callers.retain(|&c| c != child);
+            }
         }
         #[cfg(test)]
         if self.plant == Plant::KeepOrphans {

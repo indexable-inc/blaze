@@ -450,7 +450,7 @@ fn batteries_are_exposed_and_work_in_a_frame() {
         name: "app",
         about: "demo",
         version: Some("1.0"),
-        flags: &[crate::cli::FlagSpec { long: "verbose", short: Some('v'), help: "verbose" }],
+        flags: &[crate::cli::FlagSpec { long: "verbose", short: Some('v'), help: "verbose", .. }],
         opts: &[],
         positionals: &[],
         subcommands: &[],

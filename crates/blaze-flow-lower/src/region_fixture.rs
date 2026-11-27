@@ -667,6 +667,7 @@ pub(crate) struct Run {
     pub(crate) lines: vec::Vec<String>,
     pub(crate) stats: Stats,
     pub(crate) flow: String,
+    pub(crate) coarse: Option<Refusal>,
 }
 
 /// `view` checked by the real type checker, which must find it clean.
@@ -708,7 +709,7 @@ pub(crate) fn lower<F: Facts>(fx: &Fx, view: &BodyView<'_>, c: &mut Checked<'sta
     for f in rec.borrows.iter() {
         lines.push(format!("borrow {f:?}"));
     }
-    Ok(Run { lines, stats: lowered.stats, flow })
+    Ok(Run { lines, stats: lowered.stats, flow, coarse: lowered.coarse })
 }
 
 /// `view` checked, lowered under `facts` and `decls`' heads, and its flow checked ([`lower`]).

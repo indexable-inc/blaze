@@ -812,7 +812,7 @@ mod tests {
             homes.push(Home { symbol, at, len: 4, tier: None, folded: false });
         }
         let mut imports = Vec::new_in(a);
-        imports.push(crate::layout::Import { symbol: Symbol::of_name("exit"), name: "exit" });
+        imports.push(crate::layout::Import { symbol: Symbol::of_name("exit"), name: "exit", weak: false });
         Laid {
             page: PAGE,
             text_at: START,
@@ -907,7 +907,7 @@ mod tests {
         let img = image(false);
         let with = |name: &'static str| {
             let mut program = laid(&[(Symbol::of_name("rust_six"), 0x5000)]);
-            program.imports.push(crate::layout::Import { symbol: Symbol::of_name(name), name });
+            program.imports.push(crate::layout::Import { symbol: Symbol::of_name(name), name, weak: false });
             let libs = super::libraries(&img, alloc()).unwrap();
             let m = merge(&program, &img, &exports(), libs, alloc()).unwrap();
             let first = m.fixups.iter().find(|f| f.0 == 0x8000 + SHIFT).map(|f| f.1);

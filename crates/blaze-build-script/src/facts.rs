@@ -339,6 +339,91 @@ pub fn answer<'a>(fact: &Fact<'_>, pins: &Pins<'_>, alloc: Alloc<'a>) -> Result<
     }
 }
 
+/// The head of a per-probe compiler read subject:
+/// `cc-probe\n<answerer 64-hex>\n<clang pin 64-hex>\n<probe key 64-hex>`.
+pub const CC_PROBE_HEAD: &str = "cc-probe";
+
+fn hex_nibble(n: u8) -> char {
+    match n & 15 {
+        d @ 0..=9 => char::from(b'0' + d),
+        d => char::from(b'a' + (d - 10)),
+    }
+}
+
+fn push_hex32(bytes: &[u8; 32], out: &mut AString<'_>) {
+    for byte in bytes {
+        out.push(hex_nibble(byte >> 4));
+        out.push(hex_nibble(byte & 15));
+    }
+}
+
+fn parse_hex32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()?;
+    }
+    Some(bytes)
+}
+
+/// Stable 32-byte digest of a probe's SDK / sysroot identity (empty string on Linux with no
+/// sysroot, or the macOS SDK identity hex).
+pub fn sdk_id_digest(sdk_id: &str) -> [u8; 32] {
+    blaze_ids::ContentId::of("blaze c-probe sdk id 1", sdk_id.as_bytes()).0
+}
+
+/// Parsed fields of a `cc-probe\n<answerer 64-hex>\n<clang 64-hex>\n<sdk 64-hex>\n<key 64-hex>`
+/// read subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CcProbeSubject {
+    pub answerer: blaze_ids::ContentId,
+    pub clang: [u8; 32],
+    pub sdk: [u8; 32],
+    pub key: crate::c_tasks_probe::ProbeKey,
+}
+
+/// The read subject for a resolved compiler probe, binding the active answerer strategy, pinned
+/// clang archive SHA-256, active SDK identity digest, and canonical [`crate::c_tasks_probe::ProbeKey`].
+pub fn cc_probe_subject<'a>(
+    answerer: &blaze_ids::ContentId,
+    clang: &[u8; 32],
+    sdk: &[u8; 32],
+    key: &crate::c_tasks_probe::ProbeKey,
+    alloc: Alloc<'a>,
+) -> AString<'a> {
+    let mut out = String::from_str_in(CC_PROBE_HEAD, alloc);
+    out.push('\n');
+    push_hex32(&answerer.0, &mut out);
+    out.push('\n');
+    push_hex32(clang, &mut out);
+    out.push('\n');
+    push_hex32(sdk, &mut out);
+    out.push('\n');
+    push_hex32(&key.0.0, &mut out);
+    out
+}
+
+/// Parses a `cc-probe\n<answerer 64-hex>\n<clang 64-hex>\n<sdk 64-hex>\n<key 64-hex>` read subject.
+pub fn parse_cc_probe_subject(subject: &str) -> Option<CcProbeSubject> {
+    let rest = subject.strip_prefix(CC_PROBE_HEAD)?.strip_prefix('\n')?;
+    let mut parts = rest.split('\n');
+    let answerer_hex = parts.next()?;
+    let clang_hex = parts.next()?;
+    let sdk_hex = parts.next()?;
+    let key_hex = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(CcProbeSubject {
+        answerer: blaze_ids::ContentId(parse_hex32(answerer_hex)?),
+        clang: parse_hex32(clang_hex)?,
+        sdk: parse_hex32(sdk_hex)?,
+        key: crate::c_tasks_probe::ProbeKey(blaze_ids::ContentId(parse_hex32(key_hex)?)),
+    })
+}
+
 /// The fact's record subject for the script's read list (as D54's `git:` subjects): the whole
 /// question, one field per line. `pkgconf` is recorded as `pkg-config`: both are answered alike.
 pub fn subject<'a>(fact: &Fact<'_>, alloc: Alloc<'a>) -> AString<'a> {

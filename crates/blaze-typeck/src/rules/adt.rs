@@ -23,7 +23,7 @@ use crate::body::Segment;
 use crate::diag::{About, At, DiagCode};
 use crate::error::{CheckError, Stop};
 use crate::ids::{ExprId, ItemKey, List, Name, PathIdx, RecordSchema};
-use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
+use crate::machine::{Expectation, FieldNameSet, Flow, Frame, Lower, Machine, Then};
 use crate::portable::PTy;
 use crate::ty::{Ty, TyList, TyView, TypeCtx};
 use crate::world::{AdtKind, Def, PathRes, World};
@@ -314,7 +314,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// an enum before its associated types).
     fn names_variant(&mut self, k: ItemKey, name: Name) -> Result<bool, Stop> {
         Ok(match self.reads.adt(k)? {
-            Some(adt) => adt.kind == AdtKind::Enum && adt.variants.iter().any(|v| v.name == name),
+            Some(adt) => adt.kind == AdtKind::Enum && self.find_adt_variant(k, adt.variants, name).is_some(),
             None => false,
         })
     }
@@ -387,7 +387,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(None);
         };
         let found = match adt.kind {
-            AdtKind::Enum => adt.variants.iter().enumerate().find(|(_, v)| v.name == seg.name).map(|(i, v)| (i as u32, v.ctor)),
+            AdtKind::Enum => self.find_adt_variant(k, adt.variants, seg.name).map(|i| (i, adt.variants[i as usize].ctor)),
             AdtKind::Struct | AdtKind::Union => None,
         };
         let Some((i, ctor)) = found else {
@@ -530,8 +530,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             && if let TyView::Record(exp_schema, _) = self.view(rec_ty)
                                 && let Some(exp_names) = self.record_names(exp_schema)
                             {
-                                inits.len() > exp_names.len()
-                                    && exp_names.iter().all(|&en| inits.iter().any(|w| w.name == en))
+                                if inits.len() > exp_names.len() {
+                                    let init_set = FieldNameSet::new(inits, self.alloc);
+                                    exp_names.iter().all(|&en| init_set.contains(en))
+                                } else {
+                                    false
+                                }
                             } else {
                                 false
                             };
@@ -610,8 +614,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     let n = self.ty.list_len(field_tys);
                     let mut unwritten: blaze_own::Vec<u32, Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
                     if let Some(names) = self.record_names(schema) {
+                        let init_set = FieldNameSet::new(inits, self.alloc);
                         for (i, &nm) in names.iter().enumerate() {
-                            if !inits.iter().any(|w| w.name == nm)
+                            if !init_set.contains(nm)
                                 && let Ok(idx) = u32::try_from(i)
                             {
                                 unwritten.push(idx);
@@ -625,8 +630,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         }
                     }
                 } else {
+                    let init_set = FieldNameSet::new(inits, self.alloc);
                     let has_omitted = self.record_names(schema).is_some_and(|names| {
-                        names.iter().any(|&nm| !inits.iter().any(|w| w.name == nm))
+                        names.iter().any(|&nm| !init_set.contains(nm))
                     });
                     if has_omitted {
                         let n = self.ty.list_len(field_tys);
@@ -636,7 +642,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             let defaults = self.reads.field_defaults(schema.defaults_key())?;
                             if let Some(names) = self.record_names(schema) {
                                 for (i, &nm) in names.iter().enumerate() {
-                                    if inits.iter().any(|w| w.name == nm) {
+                                    if init_set.contains(nm) {
                                         continue;
                                     }
                                     match defaults.get(i).copied().flatten() {
@@ -715,19 +721,20 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             self.register_record_schema(RecordSchema::EMPTY, &[])?;
             return Ok(RecordSchema::EMPTY);
         }
+        let init_set = FieldNameSet::new(inits, self.alloc);
         for &(schema, list) in self.record_schemas.iter() {
             let Some(names) = self.record_names.get(list.range()) else { continue };
-            if names.len() == inits.len() && names.iter().all(|&nm| inits.iter().any(|w| w.name == nm)) {
+            if names.len() == inits.len() && names.iter().all(|&nm| init_set.contains(nm)) {
                 return Ok(schema);
             }
         }
+        drop(init_set);
         let mut names: blaze_own::Vec<Name, Alloc<'a>> = blaze_own::Vec::with_capacity_in(inits.len(), self.alloc);
         for init in inits {
-            if !names.contains(&init.name) {
-                names.push(init.name);
-            }
+            names.push(init.name);
         }
         names.sort_unstable();
+        names.dedup();
         let schema = RecordSchema::of_sorted_names(&names);
         self.register_record_schema(schema, &names)?;
         Ok(schema)
@@ -748,8 +755,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let Some(v) = adt.variants.first() else { return Ok(()) };
         let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
+        let init_set = FieldNameSet::new(inits, self.alloc);
         for (i, d) in declared.iter().enumerate() {
-            if inits.iter().any(|w| w.name == d.name) {
+            if init_set.contains(d.name) {
                 continue;
             }
             let t = self.lower(adt.types, d.ty, Lower::Args(args), crate::ty::Cause::Expr(e))?;
@@ -771,7 +779,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let Some(adt) = self.reads.adt(k)? else { return Ok(None) };
         let Some(v) = adt.variants.get(variant as usize) else { return Ok(None) };
         let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
-        match declared.iter().find(|d| d.name == name) {
+        match self.find_adt_field(k, variant, declared, name).and_then(|i| declared.get(i as usize)) {
             Some(d) => Ok(Some(self.lower(adt.types, d.ty, Lower::Args(args), cause)?)),
             None => Ok(None),
         }
@@ -794,8 +802,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let range = v.fields.range();
         let first = range.start;
         let declared = adt.fields.get(range).unwrap_or(&[]);
+        let init_set = FieldNameSet::new(inits, self.alloc);
         for (i, d) in declared.iter().enumerate() {
-            if inits.iter().any(|w| w.name == d.name) {
+            if init_set.contains(d.name) {
                 continue;
             }
             match defaults.get(first + i).copied().flatten() {
@@ -815,13 +824,141 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let TyView::Adt(k, _) = self.view(adt_ty) else { return Ok(()) };
         let Some(adt) = self.reads.adt(k)? else { return Ok(()) };
         let Some(v) = adt.variants.get(variant as usize) else { return Ok(()) };
-        let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
-        let missing = declared.iter().find(|d| !inits.iter().any(|i| i.name == d.name));
         if adt.kind != AdtKind::Union {
-            if let Some(d) = missing {
+            let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
+            let init_set = FieldNameSet::new(inits, self.alloc);
+            if let Some(d) = declared.iter().find(|d| !init_set.contains(d.name)) {
                 self.diag(DiagCode::MissingFields, At::Expr(e), About::found_named(adt_ty, d.name));
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
+
+    use blaze_own::Alloc;
+
+    use crate::body::{Expr, IntSuffix};
+    use crate::diag::DiagCode;
+    use crate::fixture::{Bb, Fx};
+    use crate::ids::{ExprId, ItemKey, Name, UintTy};
+    use crate::infer::InferCtx;
+    use crate::portable::PNode;
+
+    fn run_check(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId) -> crate::Checked<'static> {
+        let alloc = Alloc::global();
+        let mut cx = InferCtx::new_in(alloc);
+        match crate::check_with(&b.view(owner, root), fx, &mut cx, &crate::world::Needs::new_in(alloc), crate::machine::Plant::None, alloc).expect("check") {
+            crate::Outcome::Done(c) => c,
+            crate::Outcome::Need(n) => panic!("unexpected need: {n:?}"),
+        }
+    }
+
+    #[test]
+    fn large_struct_literal_200_fields_fru_and_accesses_are_exact_and_deterministic() {
+        const N: usize = 200;
+        let names: Vec<String> = (0..N).map(|i| format!("f{i}")).collect();
+        let mut fx = Fx::new();
+        let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+        let u16_ = fx.ty(PNode::Uint(UintTy::U16));
+        let u32_ = fx.ty(PNode::Uint(UintTy::U32));
+        let unit = fx.unit();
+        let field_defs: Vec<(&str, crate::portable::PTy)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), match i % 3 { 0 => u8_, 1 => u16_, _ => u32_ }))
+            .collect();
+        fx.strukt("Big", 0, &field_defs);
+        let main = fx.func("main", 0, &[], unit, Vec::new());
+        let missing_fn = fx.func("missing_fn", 0, &[], unit, Vec::new());
+        fx.finish();
+
+        // Body 1: construct 200-field struct in reverse order, update half via `..s`, and read all 200 fields.
+        let mut b = Bb::new();
+        let mut inits: Vec<(&str, ExprId)> = Vec::with_capacity(N);
+        for i in (0..N).rev() {
+            let v = match i % 3 {
+                0 => b.int(Some(IntSuffix::Uint(UintTy::U8))),
+                1 => b.int(Some(IntSuffix::Uint(UintTy::U16))),
+                _ => b.int(Some(IntSuffix::Uint(UintTy::U32))),
+            };
+            inits.push((names[i].as_str(), v));
+        }
+        let lit = b.struct_lit(&["Big"], &inits, None);
+        let s_pat = b.bind("s");
+        let mut stmts = Vec::with_capacity(N + 2);
+        stmts.push(b.let_(s_pat, None, lit));
+
+        let mut fru_inits: Vec<(&str, ExprId)> = Vec::with_capacity(N / 2);
+        for i in (0..N).step_by(2) {
+            let v = match i % 3 {
+                0 => b.int(Some(IntSuffix::Uint(UintTy::U8))),
+                1 => b.int(Some(IntSuffix::Uint(UintTy::U16))),
+                _ => b.int(Some(IntSuffix::Uint(UintTy::U32))),
+            };
+            fru_inits.push((names[i].as_str(), v));
+        }
+        let s_base = b.local(s_pat);
+        let fru_expr = b.struct_lit(&["Big"], &fru_inits, Some(s_base));
+        let s2_pat = b.bind("s2");
+        stmts.push(b.let_(s2_pat, None, fru_expr));
+
+        let mut field_exprs = Vec::with_capacity(N);
+        for name in &names {
+            let recv = b.local(s2_pat);
+            let fe = b.e(Expr::Field { base: recv, name: Name::of(name.as_str()) });
+            field_exprs.push(fe);
+            stmts.push(b.semi(fe));
+        }
+        let root = b.block(&stmts, None);
+
+        let c1 = run_check(&fx, &b, main, root);
+        let c2 = run_check(&fx, &b, main, root);
+        assert!(c1.diags.is_empty(), "expected no diags, got {:?}", c1.diags);
+        // Every odd field index (1, 3, ..., 199) must be recorded in declaration order as an FRU field.
+        assert_eq!(c1.fru_fields.len(), N / 2);
+        for (k, &idx) in c1.fru_fields.column::<1>().iter().enumerate() {
+            assert_eq!(idx, (k * 2 + 1) as u32);
+        }
+        // Every field access resolves to its exact declared type.
+        let view = c1.types.view();
+        for (i, &fe) in field_exprs.iter().enumerate() {
+            let want = match i % 3 {
+                0 => PNode::Uint(UintTy::U8),
+                1 => PNode::Uint(UintTy::U16),
+                _ => PNode::Uint(UintTy::U32),
+            };
+            assert_eq!(view.node(c1.expr_ty[fe.ix()]), Ok(want));
+        }
+        // Deterministic across independent runs.
+        assert_eq!(c1.fields.column::<2>(), c2.fields.column::<2>());
+        assert_eq!(c1.fru_fields.column::<1>(), c2.fru_fields.column::<1>());
+
+        // Body 2: omit field `f137` and verify `MissingFields` names `f137` deterministically.
+        let mut b2 = Bb::new();
+        let mut partial: Vec<(&str, ExprId)> = Vec::with_capacity(N - 1);
+        for i in 0..N {
+            if i == 137 {
+                continue;
+            }
+            let v = match i % 3 {
+                0 => b2.int(Some(IntSuffix::Uint(UintTy::U8))),
+                1 => b2.int(Some(IntSuffix::Uint(UintTy::U16))),
+                _ => b2.int(Some(IntSuffix::Uint(UintTy::U32))),
+            };
+            partial.push((names[i].as_str(), v));
+        }
+        let bad_lit = b2.struct_lit(&["Big"], &partial, None);
+        let st = b2.semi(bad_lit);
+        let root2 = b2.block(&[st], None);
+        let c_missing = run_check(&fx, &b2, missing_fn, root2);
+        assert_eq!(c_missing.diags.len(), 1);
+        assert_eq!(c_missing.diags[0].code, DiagCode::MissingFields);
+        assert_eq!(c_missing.diags[0].name, Some(Name::of("f137")));
     }
 }

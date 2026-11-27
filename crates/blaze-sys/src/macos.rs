@@ -382,6 +382,8 @@ pub mod cold {
         fn mach_timebase_info(info: *mut c_void) -> c_int;
         /// sys/stat.h.
         fn mkdir(path: *const c_char, mode: u16) -> c_int;
+        /// sys/stat.h.
+        fn mkdirat(dir: c_int, path: *const c_char, mode: u16) -> c_int;
         /// unistd.h.
         fn pread(fd: c_int, into: *mut c_void, len: usize, at: i64) -> isize;
         /// libproc.h; `buffer` is an array of `pid_t` (`i32`), `buffersize` in bytes; returns

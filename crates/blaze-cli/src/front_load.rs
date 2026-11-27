@@ -332,6 +332,7 @@ enum CachedPackFileItems {
     },
     Owned {
         edition: u8,
+        text_digest: ContentId,
         surface: ContentId,
         /// Backing allocation sized `len + 15` (never reallocated), storing the 16-aligned `FileItems` bytes at `offset`.
         buf: Vec<u8, SharedAlloc<'static>>,
@@ -344,6 +345,12 @@ impl CachedPackFileItems {
     fn edition(&self) -> u8 {
         match self {
             CachedPackFileItems::Snapshot { edition, .. } | CachedPackFileItems::Owned { edition, .. } => *edition,
+        }
+    }
+
+    fn text_digest(&self) -> ContentId {
+        match self {
+            CachedPackFileItems::Snapshot { text_digest, .. } | CachedPackFileItems::Owned { text_digest, .. } => *text_digest,
         }
     }
 
@@ -388,11 +395,6 @@ struct OpenedCrate<'r> {
     /// Shared lock-free per-module verification bitmap for lazy `names_proof`, populated once per
     /// accessed module across all workers of the request.
     module_cache: VerifiedModules<'r, SharedAlloc<'static>>,
-    /// Number of file slots in `records.items_proof`; backing `pack_files` vector is allocated
-    /// lazily on first `cached_pack_file_items` ask so crates whose files are never queried
-    /// allocate zero file slots.
-    nfiles: usize,
-    pack_files: OnceLock<blaze_own::Vec<OnceLock<CachedPackFileItems>, blaze_own::SharedAlloc<'static>>>,
 }
 
 pub(crate) struct ScopeRecords<'r> {
@@ -402,6 +404,10 @@ pub(crate) struct ScopeRecords<'r> {
     /// Allocated lazily on first `records()` ask so unused `ScopeRecords` (e.g. `groups` setup
     /// when no dependency crate is opened) perform zero heap allocations.
     slots: OnceLock<blaze_own::Vec<OnceLock<Result<OpenedCrate<'r>, &'static str>>, blaze_own::SharedAlloc<'static>>>,
+    /// Shared per-`(world_at, file)` `FileItems` outline cache across all workers and epochs,
+    /// covering both packed dependency/toolchain crates and checkout crates when planned file
+    /// outlines are absent (e.g. `blaze build` / `blaze test` codegen workers). Allocated lazily.
+    file_caches: OnceLock<blaze_own::Vec<OnceLock<blaze_own::Vec<OnceLock<CachedPackFileItems>, blaze_own::SharedAlloc<'static>>>, blaze_own::SharedAlloc<'static>>>,
     /// Hot counters isolated onto separate 128-byte cache lines ([`CachePadded`], rule 86) so
     /// 128 workers opening scope crates never false-share `asks`/`opened`/`bytes` with `slots`.
     asks: CachePadded<core::sync::atomic::AtomicU64>,
@@ -425,29 +431,39 @@ impl<'r> ScopeRecords<'r> {
             heap,
             crates,
             slots: OnceLock::new(),
+            file_caches: OnceLock::new(),
             asks: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
             opened: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
             bytes: CachePadded::new(core::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    /// Build or fetch cached `CurrentFile` for an immutable pack (non-checkout) file at `(world_at, file)`.
-    /// Checks the committed CAS snapshot first (zero-copy `FileItemsView` without re-outlining or
-    /// re-hashing) before falling back to outlining once in a task frame.
+    /// Build or fetch cached `CurrentFile` for file `(world_at, file)` (sized by `nfiles`).
+    /// Checks the committed CAS snapshot first (zero-copy `FileItemsView` without re-outlining)
+    /// before outlining once in a task frame and sharing across all workers and epochs.
+    /// When `verify_digest` is `true` (checkout `/0/` files), validates the cached entry's
+    /// `text_digest` against `text` so a concurrent edit never reuses a stale outline.
     pub(crate) fn cached_pack_file_items<'s>(
         &'s self,
         world_at: usize,
+        nfiles: usize,
         file: u32,
         edition: blaze_surface::Edition,
         text: &'s str,
+        verify_digest: bool,
     ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
-        let opened = self.slots.get()?.get(world_at)?.get()?.as_ref().ok()?;
-        let pack_files = opened
-            .pack_files
-            .get_or_init(|| blaze_own::Vec::from_iter_in((0..opened.nfiles).map(|_| OnceLock::new()), self.heap.shared()));
-        let cell = pack_files.get(usize::try_from(file).ok()?)?;
+        let caches = self
+            .file_caches
+            .get_or_init(|| blaze_own::Vec::from_iter_in((0..self.crates).map(|_| OnceLock::new()), self.heap.shared()));
+        let crate_files = caches
+            .get(world_at)?
+            .get_or_init(|| blaze_own::Vec::from_iter_in((0..nfiles).map(|_| OnceLock::new()), self.heap.shared()));
+        let cell = crate_files.get(usize::try_from(file).ok()?)?;
         if let Some(entry) = cell.get() {
             if entry.edition() != edition.byte() {
+                return None;
+            }
+            if verify_digest && entry.text_digest() != ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()) {
                 return None;
             }
             return entry.open(self.snapshot, file, text);
@@ -500,9 +516,12 @@ impl<'r> ScopeRecords<'r> {
         if let Err(why) = blaze_surface::FileItemsView::read(check_slice) {
             return Some(Err(ItemsRecordError::FileItemsRead { file, why }));
         }
-        let _ = cell.set(CachedPackFileItems::Owned { edition: edition.byte(), surface, buf, offset, len });
+        let _ = cell.set(CachedPackFileItems::Owned { edition: edition.byte(), text_digest: digest, surface, buf, offset, len });
         let entry = cell.get()?;
         if entry.edition() != edition.byte() {
+            return None;
+        }
+        if verify_digest && entry.text_digest() != digest {
             return None;
         }
         entry.open(self.snapshot, file, text)
@@ -532,8 +551,7 @@ impl<'r> ScopeRecords<'r> {
             self.bytes.fetch_add(counts.bytes, Relaxed);
             read.map(|records| {
                 let module_cache = records.names_proof.new_module_cache(self.heap.shared());
-                let nfiles = records.items_proof.files();
-                OpenedCrate { records, module_cache, nfiles, pack_files: OnceLock::new() }
+                OpenedCrate { records, module_cache }
             })
             .map_err(|why| crate::engine_head_notes::leak(self.heap.alloc(), format_args!("{why}")))
         });
@@ -591,14 +609,17 @@ impl core::fmt::Display for ByNeedError {
 pub(crate) trait OpenByNeed: Sync {
     fn open<'s>(&'s self, one: &Unopened) -> Result<CrateRecords<'s>, &'static str>;
 
-    /// Cached `FileItems` view for immutable pack (non-checkout) files, keyed by
-    /// `(world_at, file_index)`. Returns `None` if no shared cache slot is available.
+    /// Cached `FileItems` view keyed by `(world_at, file)` (sized by `nfiles`). When
+    /// `verify_digest` is `true`, validates the cached entry's `text_digest` against `text`.
+    /// Returns `None` if no shared cache slot is available.
     fn pack_file_items<'s>(
         &'s self,
         _world_at: usize,
+        _nfiles: usize,
         _file: u32,
         _edition: blaze_surface::Edition,
         _text: &'s str,
+        _verify_digest: bool,
     ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
         None
     }
@@ -612,11 +633,13 @@ impl OpenByNeed for ScopeRecords<'_> {
     fn pack_file_items<'s>(
         &'s self,
         world_at: usize,
+        nfiles: usize,
         file: u32,
         edition: blaze_surface::Edition,
         text: &'s str,
+        verify_digest: bool,
     ) -> Option<Result<CurrentFile<'s>, ItemsRecordError>> {
-        self.cached_pack_file_items(world_at, file, edition, text)
+        self.cached_pack_file_items(world_at, nfiles, file, edition, text, verify_digest)
     }
 }
 
@@ -629,7 +652,7 @@ impl OpenByNeed for ScopeRecords<'_> {
 #[derive(Clone, Copy)]
 pub(crate) enum CratesFrom<'n> {
     Opened(&'n [CrateRecords<'n>]),
-    ByNeed { own: CrateRecords<'n>, rest: &'n [Unopened], records: &'n dyn OpenByNeed },
+    ByNeed { own: CrateRecords<'n>, own_world_at: usize, rest: &'n [Unopened], records: &'n dyn OpenByNeed },
 }
 
 impl<'n> CratesFrom<'n> {
@@ -656,7 +679,7 @@ impl<'n> CratesFrom<'n> {
     pub(crate) fn records(&self, k: usize) -> Option<Result<CrateRecords<'n>, &'static str>> {
         match self {
             CratesFrom::Opened(crates) => crates.get(k).copied().map(Ok),
-            CratesFrom::ByNeed { own, rest, records } => match k {
+            CratesFrom::ByNeed { own, rest, records, .. } => match k {
                 0 => Some(Ok(*own)),
                 k => rest.get(k - 1).map(|one| records.open(one)),
             },
@@ -780,11 +803,11 @@ impl<'n> StoreLoad<'n> {
     ) -> Self {
         let (texts, digests) = texts.split();
         let crates = match crates {
-            CratesFrom::ByNeed { mut own, rest, records } => {
+            CratesFrom::ByNeed { mut own, own_world_at, rest, records } => {
                 if own.names_proof.needs_module_cache() {
                     own.names_proof = own.names_proof.bind_bump_cache(bump);
                 }
-                CratesFrom::ByNeed { own, rest, records }
+                CratesFrom::ByNeed { own, own_world_at, rest, records }
             }
             CratesFrom::Opened(list) if list.iter().any(|one| one.names_proof.needs_module_cache()) => {
                 let mut bound = Vec::with_capacity_in(list.len(), bump);
@@ -889,12 +912,20 @@ impl<'n> Load<'n> for StoreLoad<'n> {
         // The outline planner covers checkout sources. The packed libraries and the
         // text-only driver supply immutable texts from which the view is made once.
         let (Some(outlines), Some(real)) = (self.outlines, full.strip_prefix("/0/")) else {
-            if !full.starts_with("/0/")
-                && let CratesFrom::ByNeed { rest, records, .. } = self.crates
-                && let Some(one) = krate.checked_sub(1).and_then(|i| rest.get(i))
-                && let Some(res) = records.pack_file_items(one.world_at, index, edition, text)
-            {
-                return res.map(Some);
+            if let CratesFrom::ByNeed { own, own_world_at, rest, records } = self.crates {
+                let target = if krate == 0 {
+                    Some((own_world_at, own.items_proof.files()))
+                } else {
+                    krate.checked_sub(1).and_then(|i| rest.get(i)).and_then(|one| {
+                        let nfiles = self.crates.records(krate)?.ok()?.items_proof.files();
+                        Some((one.world_at, nfiles))
+                    })
+                };
+                if let Some((world_at, nfiles)) = target
+                    && let Some(res) = records.pack_file_items(world_at, nfiles, index, edition, text, full.starts_with("/0/"))
+                {
+                    return res.map(Some);
+                }
             }
             return CurrentFile::from_text(index, text, edition, bump).map(Some);
         };

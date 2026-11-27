@@ -1274,6 +1274,7 @@ impl Facts for World {
             trait_: r.trait_,
             args: r.args,
             where_clauses: &r.wheres,
+            where_clause_bounds: &[],
             assoc: &r.assoc,
             portable: self.portable(),
             digest: r.digest,

@@ -69,8 +69,9 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
     // and `blaze::lock_without_reason` (D179), `blaze::raw_sync`, and `blaze::anon_tuple_return`.
     // (The refinement gate, `blaze::refinement`, is the one more; plus `blaze::magic_slice_len`,
     // `blaze::bool_as_int`, `blaze::manual_slice_idioms`, `blaze::test_ambient_leak`,
-    // and `blaze::mut_for_uniq_borrow`.)
-    assert_eq!(blaze_lints().len(), 263);
+    // `blaze::mut_for_uniq_borrow`, `blaze::parallel_vecs`, `blaze::cost_contract`, and
+    // `blaze::capability_in_sans_io`.)
+    assert_eq!(blaze_lints().len(), 266);
     assert!(!lint.is_externally_loaded);
     // The compiler's own and the release build's; blaze-lints loads every other.
     let built: Vec<&str> =
@@ -133,6 +134,8 @@ fn blaze_is_a_tool_with_its_lints_and_group() {
         "blaze::program_lifetime",
         "blaze::unreachable",
         "blaze::refinement",
+        "blaze::cost_contract",
+        "blaze::capability_in_sans_io",
         // A dependency doing what the workspace did not grant it.
         "blaze::dependency_capability",
         "blaze::dependency_unsafe",

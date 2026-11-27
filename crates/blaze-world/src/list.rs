@@ -191,7 +191,12 @@ pub fn crate_list<'w, P: Packages<'w>>(
 /// (a dependency's names the target's). The toolchain crates' needs are their rows' edges
 /// (blaze-scope units.rs `toolchain_crates` seeds the same: `rust_std`, `blaze`).
 pub fn needs(list: &UnitCrates<'_>) -> Needs {
-    let mut n = Needs { std: false, bstd: false, proc_macro: false };
+    let mut n = Needs {
+        std: false,
+        bstd: false,
+        proc_macro: false,
+        test: list.crates[..list.toolchain].iter().any(|c| c.name == "test"),
+    };
     for c in list.crates.iter().filter(|c| matches!(c.origin, ListOrigin::Unit(_))) {
         n.std |= matches!(c.implicit.std, StdIs::Rust);
         n.bstd |= matches!(c.implicit.std, StdIs::Bstd(_));

@@ -147,7 +147,7 @@ pub fn at(view: &CodeView<'_>, offset: u64) -> Option<TrapAt> {
         let site = view.site(i);
         if site.kind == SiteKind::Call && u64::from(site.at) + u64::from(SiteKind::Call.len()) == offset {
             let target = view.target(site.target as usize);
-            if target.space == Space::Func || target.space == Space::Outside {
+            if target.space == Space::Func || target.space.is_outside() {
                 after_call = Some(target.symbol);
             }
             break;

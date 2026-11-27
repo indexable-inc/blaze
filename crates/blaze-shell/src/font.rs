@@ -70,11 +70,14 @@ pub struct Slot {
 
 pub struct Fonts {
     mono: [CFRetained<CTFont>; 4],
+    mono_small: [CFRetained<CTFont>; 2],
     ui: [CFRetained<CTFont>; 2],
     ui_small: [CFRetained<CTFont>; 2],
     heading: CFRetained<CTFont>,
     chrome: [CFRetained<CTFont>; 2],
     pub metrics: Metrics,
+    mono_small_m: FaceMetrics,
+    mono_small_cell_w: usize,
     ui_m: FaceMetrics,
     ui_small_m: FaceMetrics,
     heading_m: FaceMetrics,
@@ -235,7 +238,23 @@ impl Fonts {
         let baseline = (ascent + leading / 2.0).round();
         let metrics = Metrics { cell_w, cell_h, baseline };
 
-        // Native Apple SF Pro faces for UI chrome, table headers, badges, & rendered Markdown!
+        // Compact `0.84×` monospace of the exact same primary font family for scrollback table
+        // headers, badges, and metadata pills (keeps the scrollback canvas 100% unified monospace!).
+        let mono_small_px = px * 0.84;
+        // SAFETY: `post_script_name` is a plain getter on a live, retained `CTFont`.
+        let mono_small_reg_name = unsafe { mono[0].post_script_name() }.to_string();
+        // SAFETY: `post_script_name` is a plain getter on a live, retained `CTFont`.
+        let mono_small_bold_name = unsafe { mono[1].post_script_name() }.to_string();
+        let mono_small = [
+            pick_font(&[mono_small_reg_name.as_str(), "SFMono-Regular", "Menlo-Regular"], mono_small_px),
+            pick_font(&[mono_small_bold_name.as_str(), "SFMono-Bold", "Menlo-Bold"], mono_small_px),
+        ];
+        let mono_small_m = measure_face_metrics(&mono_small[0], cell_h, baseline);
+        let mono_small_cell_w = glyph_of(&mono_small[0], 'M')
+            .map(|gm| advance_of(&mono_small[0], gm).round().max(1.0) as usize)
+            .unwrap_or_else(|| ((cell_w as f64) * 0.84).round().max(1.0) as usize);
+
+        // Native Apple SF Pro faces strictly for floating overlays, popovers, & window chrome!
         let ui = [pick_ui_font(px * 0.94, false), pick_ui_font(px * 0.94, true)];
         let ui_small = [pick_ui_font(px * 0.84, false), pick_ui_font(px * 0.84, true)];
         let heading = pick_ui_font(px * 1.18, true);
@@ -270,11 +289,14 @@ impl Fonts {
 
         Fonts {
             mono,
+            mono_small,
             ui,
             ui_small,
             heading,
             chrome,
             metrics,
+            mono_small_m,
+            mono_small_cell_w,
             ui_m,
             ui_small_m,
             heading_m,
@@ -394,6 +416,10 @@ impl Fonts {
             let mut x = run.x;
             let (space_adv, y_nudge) = match run.face {
                 TextFace::Mono => (cw, 0.0),
+                TextFace::MonoSmall => (
+                    self.mono_small_cell_w as f32 * inv_scale,
+                    self.mono_small_m.y_nudge_px * inv_scale,
+                ),
                 TextFace::Ui => (self.ui_m.space_adv * inv_scale, self.ui_m.y_nudge_px * inv_scale),
                 TextFace::UiSmall => (
                     self.ui_small_m.space_adv * inv_scale,
@@ -535,6 +561,11 @@ impl Fonts {
                 let f = &self.mono[usize::from(key.bold) | (usize::from(key.italic) << 1)];
                 (f.clone(), self.metrics.cell_h, self.metrics.baseline)
             }
+            TextFace::MonoSmall => (
+                self.mono_small[usize::from(key.bold)].clone(),
+                self.mono_small_m.h,
+                self.mono_small_m.baseline,
+            ),
             TextFace::Ui => (
                 self.ui[usize::from(key.bold)].clone(),
                 self.ui_m.h,
@@ -568,6 +599,9 @@ impl Fonts {
 
         let (w, advance, pad_l) = if key.face == TextFace::Mono {
             let cw = if key.wide { self.metrics.cell_w * 2 } else { self.metrics.cell_w };
+            (cw, cw as f32, 0.0f64)
+        } else if key.face == TextFace::MonoSmall {
+            let cw = if key.wide { self.mono_small_cell_w * 2 } else { self.mono_small_cell_w };
             (cw, cw as f32, 0.0f64)
         } else {
             let adv = advance_of(&font, glyph);

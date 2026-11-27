@@ -442,7 +442,7 @@ struct Bodies<'a> {
     panic: blaze_build::Panic,
     /// The build's allocator, handed down from its caller: the scratch of [`FrontAdts`]'s
     /// answers (an opaque type's hidden type, a promoted fn's key).
-    alloc: Alloc<'static>,
+    alloc: Alloc<'a>,
 }
 
 /// One built coroutine instance, its three functions kept until each one's slot is reached
@@ -594,6 +594,7 @@ fn language_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, mut called: Instanc
         .or_else(|| crate::fn_shim::fn_shim_owner(program, adts, called, ground, caller))
         .or_else(|| blaze_build::reify_shim_of(called, ground.view()).and_then(|t| program.fn_index(t.item)))
         .or_else(|| crate::clone_shim::language_from(program, called, ground).and_then(|f| program.fn_index(f.from)))
+        .or_else(|| crate::clone_shim::language_fn_ptr(program, called, ground).and_then(|f| program.fn_index(f.item)))
         .or_else(|| shims.iter().take(n).rev().flatten().find_map(|&item| program.fn_index(item)))
 }
 
@@ -2677,6 +2678,12 @@ fn build_from<P: FrontEnd>(
             None if clone_row.is_none() => crate::clone_shim::language_from(&*program, instance, &ground),
             _ => None,
         };
+        // Builtin `FnPtr` methods (`addr`, `as_ptr`, `from_ptr`) for fn pointers.
+        let fn_ptr_row = if is_own_instance && clone_row.is_none() && from_row.is_none() {
+            crate::clone_shim::language_fn_ptr(&*program, instance, &ground)
+        } else {
+            None
+        };
         let is_test_report = blaze_build::test_report_shim_of(instance, ground.view()).is_some();
         let is_vtable_shim = !is_own_instance && blaze_build::vtable_shim_of(instance, ground.view()).is_some();
         let is_reify_shim = !is_own_instance && blaze_build::reify_shim_of(instance, ground.view()).is_some();
@@ -2686,6 +2693,7 @@ fn build_from<P: FrontEnd>(
             _ if ctor_row.is_some()
                 || clone_row.is_some()
                 || from_row.is_some()
+                || fn_ptr_row.is_some()
                 || is_test_report
                 || is_vtable_shim
                 || is_reify_shim
@@ -2802,6 +2810,7 @@ fn build_from<P: FrontEnd>(
             && ctor_row.is_none()
             && clone_row.is_none()
             && from_row.is_none()
+            && fn_ptr_row.is_none()
             && !is_vtable_shim
             && !is_reify_shim
             && !is_test_report
@@ -3043,7 +3052,7 @@ fn build_from<P: FrontEnd>(
         // state not laid. A coroutine's own function was built with its coroutine; a shim has
         // no body of its own.
         if from_coroutine.is_none() {
-            let include_body = shim.is_none() && vtable_shim.is_none() && test_report.is_none() && clone_row.is_none() && from_row.is_none();
+            let include_body = shim.is_none() && vtable_shim.is_none() && test_report.is_none() && clone_row.is_none() && from_row.is_none() && fn_ptr_row.is_none();
             let extra_args = (instance.args != owner_args).then_some(instance.args);
             let roots = {
                 let adts = FrontAdts(&*program_mut, i, &consts, &langs, &checked_bodies);
@@ -3109,7 +3118,7 @@ fn build_from<P: FrontEnd>(
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, world, Global),
                 None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, world, Global),
             }
-        } else if vtable_shim.is_some() || reify.is_some() || test_report.is_some() || clone_row.is_some() || from_row.is_some() {
+        } else if vtable_shim.is_some() || reify.is_some() || test_report.is_some() || clone_row.is_some() || from_row.is_some() || fn_ptr_row.is_some() {
             let g = Global;
             if let Some(plan) = vtable_shim {
                 let sig = plan.needs_sig.then(|| program.sig(i));
@@ -3130,6 +3139,8 @@ fn build_from<P: FrontEnd>(
                 }
             } else if let Some(f) = from_row {
                 blaze_build::build_builtin_from(f.from, &mut subst, world, g)
+            } else if let Some(fp) = fn_ptr_row {
+                blaze_build::build_builtin_fn_ptr(fp.item, &program.sig(i), &mut subst, world, g)
             } else {
                 Err(BuildError::Malformed { what: "unreachable builtin row" })
             }
@@ -3513,10 +3524,11 @@ fn build_from<P: FrontEnd>(
             // The soft-float routines after the instance's own references, as run/make_one.rs
             // binds them: `make_entry` declares those the emitter says the record calls.
             let routines = bound.bind(&mut funcs).map_err(fail)?;
-            let mut c_statics: Vec<(ItemKey, &str), Global> = Vec::new_in(Global);
+            let mut c_statics: blaze_own::Vec<crate::code_records::ForeignStatic<'_>, _> = blaze_own::Vec::new_in(alloc);
             for &s in built.statics.iter() {
                 if let Some(c) = program.foreign_static(s) {
-                    c_statics.push((s, c));
+                    let weak = program.static_item(s).is_some_and(|st| st.extern_weak);
+                    c_statics.push(crate::code_records::ForeignStatic { item: s, name: c, weak });
                 }
             }
             let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };

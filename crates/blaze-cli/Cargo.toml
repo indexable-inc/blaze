@@ -80,7 +80,7 @@ blaze-ladder.workspace = true
 # ELF PIE on Linux), pure `#![no_std]` with zero third-party deps.
 blaze-export.workspace = true
 # Declarative CLI schema, argv parser, and help/usage renderer (single source of truth, rule 30).
-blaze-cli-spec = { path = "../blaze-cli-spec" }
+blaze-cli-spec.workspace = true
 # The run parent (run_parent.rs): the run wire to the launcher's run mode, the records' ISA, and
 # the BLAKE3 a record's file is named by (blaze-launch-rt `run_mode::Folder`).
 blaze-launch.workspace = true
@@ -157,7 +157,14 @@ sandbox = ["blaze-proc-macro/runtime"]
 # default: a developer's blaze refuses `blaze store publish` by name and writes only `LOCAL`.
 publish = ["blaze-remote/sign"]
 
+[build-dependencies]
+blaze-ids.workspace = true
+blaze-own = { workspace = true, features = ["std"] }
+blaze-producers.workspace = true
+
 [dev-dependencies]
+# producers.rs: verifies compile-time `CODE_BUILDER_SOURCE` matches live workspace walk.
+blaze-producers.workspace = true
 # `blaze_meter::testing::stop`: the meter's readers off, for the on/off byte-equality test.
 blaze-meter = { workspace = true, features = ["testing"] }
 # The names fixture runs a real worker pool over its simulated filesystem.

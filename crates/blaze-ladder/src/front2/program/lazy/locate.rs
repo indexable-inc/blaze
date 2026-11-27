@@ -57,6 +57,24 @@ pub(super) struct MemberIndex<'n> {
     pub containers: u32,
 }
 
+/// One body-local item derivation entry in [`LocalIndex`]: optional enclosing trait/impl member
+/// row to file first, plus the outermost-first lowering chain.
+#[derive(Clone)]
+pub(super) struct LocalEntry<'n> {
+    pub member: Option<(ItemKey, MemberRow<'n>)>,
+    pub chain: Chain,
+}
+
+/// Per-crate cache of body-local item derivation chains built once on the first unhinted
+/// `locate_local` miss in a crate, eliminating repeated O(crate_fns) lex scans.
+pub(super) struct LocalIndex<'n> {
+    pub by_key: Map<ItemKey, LocalEntry<'n>, Alloc<'n>>,
+    pub after_call: Vec<LocalEntry<'n>, Global>,
+    pub after_call_next: usize,
+    pub nested_queue: Vec<Chain, Global>,
+    pub read: usize,
+}
+
 /// Narrow sans-IO seam for indexing crate members without reading member source text
 /// (`MemberWant::NameOnly`), directly testable with a counting spy.
 trait MemberCatalog<'n>: Copy {
@@ -184,6 +202,86 @@ fn build_crate_member_index<'n, C: MemberCatalog<'n>>(
     Some(MemberIndex { rows, containers: u32::try_from(containers.len()).unwrap_or(u32::MAX) })
 }
 
+/// Builds a shared [`super::shared::SharedMemberIndex`] over `krate`'s `#[lang]` containers alone.
+fn build_shared_lang_member_index<'n, C: MemberCatalog<'n>>(
+    catalog: C,
+    krate: usize,
+    scratch: Alloc<'n>,
+    shared: blaze_own::SharedAlloc<'static>,
+) -> super::shared::SharedMemberIndex {
+    let mut containers: AVec<'n, (LibKey, ItemKind)> = AVec::new_in(scratch);
+    catalog.catalog_each_lang(krate, &mut |_name, lib| match catalog.catalog_kind_of_item(lib) {
+        Some(kind @ (ItemKind::Trait | ItemKind::Impl)) => containers.push((lib, kind)),
+        Some(ItemKind::Struct) if catalog.catalog_is_ctor(lib) => containers.push((lib, ItemKind::Struct)),
+        _ => {}
+    });
+    let mut ix = super::shared::SharedMemberIndex::new_in(u32::try_from(containers.len()).unwrap_or(u32::MAX), shared);
+    for &(container, kind) in containers.iter() {
+        let ck = checker_of(container);
+        if kind == ItemKind::Struct {
+            ix.put(member_key_of(ck, MemberKind::Ctor, ""), container, MemberKind::Ctor, "");
+            continue;
+        }
+        catalog.catalog_each_member_matching(
+            container,
+            &mut |mkind, mname| {
+                if mname.is_some() && member_kind(mkind).is_some() {
+                    crate::front2::source::MemberWant::NameOnly
+                } else {
+                    crate::front2::source::MemberWant::Skip
+                }
+            },
+            &mut |m| {
+                let (Some(name), Some(mk)) = (m.name, member_kind(m.kind)) else { return };
+                ix.put(member_key_of(ck, mk, name), container, mk, name);
+            },
+        );
+    }
+    ix
+}
+
+/// Builds the full crate-wide shared [`super::shared::SharedMemberIndex`] for `krate` using
+/// `MemberWant::NameOnly` (zero source file opens / zero outlines).
+fn build_shared_crate_member_index<'n, C: MemberCatalog<'n>>(
+    catalog: C,
+    krate: usize,
+    scratch: Alloc<'n>,
+    shared: blaze_own::SharedAlloc<'static>,
+) -> Option<super::shared::SharedMemberIndex> {
+    let mut containers: AVec<'n, (LibKey, ItemKind)> = AVec::new_in(scratch);
+    let listed = catalog.catalog_each_item(krate, &mut |lib, _module| match catalog.catalog_kind_of_item(lib) {
+        Some(kind @ (ItemKind::Trait | ItemKind::Impl)) => containers.push((lib, kind)),
+        Some(ItemKind::Struct) if catalog.catalog_is_ctor(lib) => containers.push((lib, ItemKind::Struct)),
+        _ => {}
+    });
+    if !listed {
+        return None;
+    }
+    let mut ix = super::shared::SharedMemberIndex::new_in(u32::try_from(containers.len()).unwrap_or(u32::MAX), shared);
+    for &(container, kind) in containers.iter() {
+        let ck = checker_of(container);
+        if kind == ItemKind::Struct {
+            ix.put(member_key_of(ck, MemberKind::Ctor, ""), container, MemberKind::Ctor, "");
+            continue;
+        }
+        catalog.catalog_each_member_matching(
+            container,
+            &mut |mkind, mname| {
+                if mname.is_some() && member_kind(mkind).is_some() {
+                    crate::front2::source::MemberWant::NameOnly
+                } else {
+                    crate::front2::source::MemberWant::Skip
+                }
+            },
+            &mut |m| {
+                let (Some(name), Some(mk)) = (m.name, member_kind(m.kind)) else { return };
+                ix.put(member_key_of(ck, mk, name), container, mk, name);
+            },
+        );
+    }
+    Some(ix)
+}
+
 /// Probes a single trait/impl container for `target` using `MemberWant::NameOnly`.
 fn probe_container_member<'n, C: MemberCatalog<'n>>(
     catalog: C,
@@ -279,6 +377,58 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let Some(krate) = names.crate_of(LibKey(blaze_ids::ContentId(whole))) else {
             return Err(LazyRefusal::NotFound { key, krate: Box::from("no crate of the program"), searched: Box::from("its key's crate prefix is no crate's of the program") });
         };
+        // Fast path: when a command-wide `SharedLazyFront` is attached, consult its crate-wide
+        // and lang-container member indexes shared across all workers (built at most once per
+        // crate across all 128 workers and worker epochs).
+        if let Some(shared) = self.shared()
+            && let Some(crate_key) = names.crate_key(krate)
+        {
+            if let Some(shared_ix) = shared.get_crate_members(crate_key) {
+                if let Some(found) = shared_ix.get(key) {
+                    let Some((container, kind, name)) = found else {
+                        return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: Box::from("two members of its crate are keyed alike (rule 21)") });
+                    };
+                    return self.file_member_parts(key, container, kind, name);
+                }
+                let rows = format!("its item, module and variant rows; the {} members' keys of its {} traits, impls and tuple or unit structs", shared_ix.len(), shared_ix.containers);
+                let inner = key.0.to_be_bytes()[8] & LibKey::INNER != 0;
+                if !inner {
+                    return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: format!("{rows}; not an item declared in a body (its key's inner bit is clear)").into_boxed_str() });
+                }
+                return self.locate_local(key, krate, &rows);
+            }
+            let lang_ix = match shared.get_lang_members(crate_key) {
+                Some(ix) => ix,
+                None => {
+                    let built = build_shared_lang_member_index(names, krate, self.alloc, shared.alloc());
+                    shared.put_lang_members(crate_key, built)
+                }
+            };
+            if let Some(found) = lang_ix.get(key) {
+                let Some((container, kind, name)) = found else {
+                    return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: Box::from("two members of its crate are keyed alike (rule 21)") });
+                };
+                return self.file_member_parts(key, container, kind, name);
+            }
+            if let Some(row) = self.probe_loaded_containers(key) {
+                return self.file_member(key, row);
+            }
+            let Some(shared_ix) = self.shared_crate_member_index(krate)? else {
+                return Err(LazyRefusal::Unanswered { question: "each_item", item: self.crate_shown(krate) });
+            };
+            if let Some(found) = shared_ix.get(key) {
+                let Some((container, kind, name)) = found else {
+                    return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: Box::from("two members of its crate are keyed alike (rule 21)") });
+                };
+                return self.file_member_parts(key, container, kind, name);
+            }
+            let rows = format!("its item, module and variant rows; the {} members' keys of its {} traits, impls and tuple or unit structs", shared_ix.len(), shared_ix.containers);
+            let inner = key.0.to_be_bytes()[8] & LibKey::INNER != 0;
+            if !inner {
+                return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: format!("{rows}; not an item declared in a body (its key's inner bit is clear)").into_boxed_str() });
+            }
+            return self.locate_local(key, krate, &rows);
+        }
         // Fast path: if the full crate index is already cached, check it; otherwise probe `#[lang]`
         // containers and already-loaded store containers (with `MemberWant::NameOnly`, zero file
         // text reads and zero `each_item` scan) before falling back to a crate-wide member index.
@@ -312,6 +462,51 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         self.locate_local(key, krate, &rows)
     }
 
+    /// Returns the shared crate-wide [`super::shared::SharedMemberIndex`] for `krate` when a
+    /// [`super::shared::SharedLazyFront`] is attached, building and publishing it once on miss.
+    pub(super) fn shared_crate_member_index(
+        &mut self,
+        krate: usize,
+    ) -> Result<Option<std::sync::Arc<super::shared::SharedMemberIndex, blaze_own::SharedAlloc<'static>>>, LazyRefusal> {
+        let Some(shared) = self.shared() else {
+            return Ok(None);
+        };
+        let Some(crate_key) = self.front.names.crate_key(krate) else {
+            return Ok(None);
+        };
+        if let Some(ix) = shared.get_crate_members(crate_key) {
+            return Ok(Some(ix));
+        }
+        let Some(built) = build_shared_crate_member_index(self.front.names, krate, self.alloc, shared.alloc()) else {
+            return Err(LazyRefusal::Unanswered { question: "each_item", item: self.crate_shown(krate) });
+        };
+        Ok(Some(shared.put_crate_members(crate_key, built)))
+    }
+
+    /// Probes already-loaded `store.maps.traits` / `store.impls` matching `key`'s crate prefix.
+    fn probe_loaded_containers(&self, key: ItemKey) -> Option<MemberRow<'n>> {
+        let names = self.front.names;
+        let key_bytes = key.0.to_be_bytes();
+        let prefix = key_bytes.get(..8)?;
+        for (&trait_lib, _) in self.store.maps.traits.iter() {
+            if trait_lib.0.0.get(..8) == Some(prefix)
+                && let Some(row) = probe_container_member(names, trait_lib, key)
+            {
+                return Some(row);
+            }
+        }
+        for (&impl_ck, _) in self.store.impls.iter() {
+            let impl_bytes = impl_ck.0.to_be_bytes();
+            if impl_bytes.get(..8) == Some(prefix)
+                && let Some(impl_lib) = self.front.keys.library_in(names, impl_ck)
+                && let Some(row) = probe_container_member(names, impl_lib, key)
+            {
+                return Some(row);
+            }
+        }
+        None
+    }
+
     /// Probes targeted containers in `krate` (`#[lang]` items cached once per crate, plus already
     /// loaded `store.maps.traits` / `store.impls` matching `key`'s crate prefix) using
     /// `MemberWant::NameOnly` so common `core`/`std` members like `PartialEq::eq` resolve without
@@ -325,25 +520,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         if let Some(found) = self.lang_member_rows.get(&krate).and_then(|ix| ix.rows.get(&key).copied()) {
             return Some(found);
         }
-        let key_bytes = key.0.to_be_bytes();
-        let prefix = key_bytes.get(..8)?;
-        for (&trait_lib, _) in self.store.maps.traits.iter() {
-            if trait_lib.0.0.get(..8) == Some(prefix)
-                && let Some(row) = probe_container_member(names, trait_lib, key)
-            {
-                return Some(Some(row));
-            }
-        }
-        for (&impl_ck, _) in self.store.impls.iter() {
-            let impl_bytes = impl_ck.0.to_be_bytes();
-            if impl_bytes.get(..8) == Some(prefix)
-                && let Some(impl_lib) = self.front.keys.library_in(names, impl_ck)
-                && let Some(row) = probe_container_member(names, impl_lib, key)
-            {
-                return Some(Some(row));
-            }
-        }
-        None
+        self.probe_loaded_containers(key).map(Some)
     }
 
     /// Crate `krate` as a refusal shows it: its index and its key.
@@ -373,29 +550,29 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
 
     /// Files the member `row` asked for as `key`: its container as an item, then the member.
     fn file_member(&mut self, key: ItemKey, row: MemberRow<'n>) -> Result<(), LazyRefusal> {
-        let clash = |c: crate::front2::keys::KeyClash| LazyRefusal::Head { item: format!("{:x}", row.container).into_boxed_str(), why: format!("{c}").into_boxed_str() };
-        let container = self.front.keys.item(row.container).map_err(clash)?;
-        let filed = self.front.keys.member(container, row.kind, row.name).map_err(clash)?;
+        self.file_member_parts(key, row.container, row.kind, row.name)
+    }
+
+    fn file_member_parts(&mut self, key: ItemKey, container_lib: LibKey, kind: MemberKind, name: &str) -> Result<(), LazyRefusal> {
+        let clash = |c: crate::front2::keys::KeyClash| LazyRefusal::Head { item: format!("{container_lib:x}").into_boxed_str(), why: format!("{c}").into_boxed_str() };
+        let container = self.front.keys.item(container_lib).map_err(clash)?;
+        let filed = self.front.keys.member(container, kind, name).map_err(clash)?;
         if filed != key {
             return Err(LazyRefusal::NotFound { key, krate: self.refused_shown(container), searched: Box::from("its member index row filed under another key (keys.rs `member_key_of` and `Keys::member` disagree)") });
         }
         Ok(())
     }
 
-    /// An item declared in a body: the start's chain, else the crate's fns that hold items, by
-    /// text, else by lowering a body whose keys the text cannot give (module docs).
-    fn locate_local(&mut self, key: ItemKey, krate: usize, rows: &str) -> Result<(), LazyRefusal> {
+    /// Builds `krate`'s [`LocalIndex`] once on the first unhinted `locate_local` miss: scans
+    /// every fn in `krate` with `body_holds_items == true`, derives every text-keyable local item's
+    /// lowering chain into `by_key`, and records any `Unkeyed::AfterCall` chains for one-time
+    /// demand lowering.
+    fn ensure_local_index(&mut self, key: ItemKey, krate: usize, rows: &str) -> Result<(), LazyRefusal> {
+        if self.local_rows.contains_key(&krate) {
+            return Ok(());
+        }
         let names = self.front.names;
         let alloc = self.alloc;
-        // The process's start, declared in a body: its chain by the start rule.
-        if let Some(Entry2::Hosted(lib) | Entry2::CMain(lib)) = self.start
-            && checker_of(lib) == key
-        {
-            let chain = crate::front2::nested_exports::enclosing_bodies(names, alloc, lib).map_err(|r| LazyRefusal::Row { function: self.refused_shown(key), refusal: Box::new(r) })?;
-            let mut targets: Chain = Vec::new_in(Global);
-            targets.extend(chain.iter().map(|&k| LowerTarget::Free(k)));
-            return self.lower_chain(key, &targets).and_then(|()| self.filed_local(key, krate, "the start rule's chain of the bodies around the process's exported start"));
-        }
         let (Some(crate_key), Some(edition), Some(atoms)) = (names.crate_key(krate), names.edition_of(krate), names.cfg_atoms(krate)) else {
             return Err(LazyRefusal::Unanswered { question: "crate_key, edition_of, cfg_atoms", item: self.crate_shown(krate) });
         };
@@ -403,8 +580,6 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let mut tops: AVec<'n, Searched<'n>> = AVec::new_in(alloc);
         let mut containers: AVec<'n, LibKey> = AVec::new_in(alloc);
         let mut unread = 0u32;
-        // The kind first: only a fn's detail is asked (the records answer a fn's from its row's
-        // body-holds-items flag; another kind's detail is the file's outline, not read here).
         let listed = names.each_item(krate, &mut |lib, _module| match names.kind_of_item(lib) {
             Some(ItemKind::Function) => {
                 if let Some(ItemDetail::Fn { body_holds_items: true }) = names.detail_of(lib) {
@@ -423,8 +598,6 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let mut matching_names: AVec<'n, &'n str> = AVec::new_in(alloc);
         for &container in containers.iter() {
             matching_names.clear();
-            // Pre-scan with `NameOnly` so containers whose methods have `body_holds_items == false`
-            // (the overwhelming majority in `core`/`std`) never read or outline member source text.
             names.each_member_matching(
                 container,
                 &mut |kind, mname| {
@@ -471,9 +644,9 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         if unread > 0 {
             return Err(LazyRefusal::Unanswered { question: "text_of", item: format!("{unread} fns of {} whose bodies hold items", self.crate_shown(krate)).into_boxed_str() });
         }
-        // By text: the first body whose derived keys hold `key` gives its chain.
         let reading = Reading { edition, atoms, alloc };
-        let mut lowered_later: Vec<Chain, Global> = Vec::new_in(Global);
+        let mut by_key: Map<ItemKey, LocalEntry<'n>, Alloc<'n>> = Map::new_in(alloc);
+        let mut after_call: Vec<LocalEntry<'n>, Global> = Vec::new_in(Global);
         let mut read = 0usize;
         for &Searched { lib, member, text, name } in tops.iter() {
             read += 1;
@@ -486,6 +659,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 Some((_, mk)) => LowerTarget::Member(mk),
                 None => LowerTarget::Free(lib),
             };
+            let member_row = member.map(|(container, mk)| (mk, MemberRow { container, kind: MemberKind::Fn, name }));
             let chain_of = |within: u32| -> Option<Chain> {
                 let keys = walked.chain_to(within, alloc).ok()?.ok()?;
                 let mut c: Chain = Vec::new_in(Global);
@@ -493,52 +667,101 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 c.extend(keys.iter().skip(1).map(|&k| LowerTarget::Free(k)));
                 Some(c)
             };
-            if let Some(l) = walked.locals.iter().find(|l| matches!(l.key, Ok(k) if checker_of(k) == key)) {
-                let Some(chain) = chain_of(l.within) else { continue };
-                if let Some((container, mk)) = member {
-                    self.file_member(mk, MemberRow { container, kind: MemberKind::Fn, name })?;
-                }
-                return self.lower_chain(key, &chain).and_then(|()| self.filed_local(key, krate, "the chain its body's text derives"));
-            }
-            // A body whose locals' keys the text cannot give: lowered below, if no text gives
-            // the key.
             for l in walked.locals.iter() {
-                if l.key == Err(Unkeyed::AfterCall)
-                    && let Some(chain) = chain_of(l.within)
-                    && !lowered_later.iter().any(|c| *c == chain)
-                {
-                    if let Some((container, mk)) = member {
-                        self.file_member(mk, MemberRow { container, kind: MemberKind::Fn, name })?;
+                match l.key {
+                    Ok(k) => {
+                        let ck = checker_of(k);
+                        if !by_key.contains_key(&ck)
+                            && let Some(chain) = chain_of(l.within)
+                        {
+                            by_key.insert(ck, LocalEntry { member: member_row, chain });
+                        }
                     }
-                    lowered_later.push(chain);
+                    Err(Unkeyed::AfterCall) => {
+                        if let Some(chain) = chain_of(l.within)
+                            && !after_call.iter().any(|e| e.chain == chain)
+                        {
+                            after_call.push(LocalEntry { member: member_row, chain });
+                        }
+                    }
+                    Err(_) => {}
                 }
             }
         }
-        // By lowering: each such body (its chain first), then the bodies its lowering kept.
+        self.local_rows.insert(krate, LocalIndex { by_key, after_call, after_call_next: 0, nested_queue: Vec::new_in(Global), read });
+        Ok(())
+    }
+
+    /// An item declared in a body: the start's chain, else the crate's cached [`LocalIndex`]
+    /// (built once per crate), by text, else by lowering any unlowered `AfterCall` bodies.
+    fn locate_local(&mut self, key: ItemKey, krate: usize, rows: &str) -> Result<(), LazyRefusal> {
+        let names = self.front.names;
+        let alloc = self.alloc;
+        // The process's start, declared in a body: its chain by the start rule.
+        if let Some(Entry2::Hosted(lib) | Entry2::CMain(lib)) = self.start
+            && checker_of(lib) == key
+        {
+            let chain = crate::front2::nested_exports::enclosing_bodies(names, alloc, lib).map_err(|r| LazyRefusal::Row { function: self.refused_shown(key), refusal: Box::new(r) })?;
+            let mut targets: Chain = Vec::new_in(Global);
+            targets.extend(chain.iter().map(|&k| LowerTarget::Free(k)));
+            return self.lower_chain(key, &targets).and_then(|()| self.filed_local(key, krate, "the start rule's chain of the bodies around the process's exported start"));
+        }
+        self.ensure_local_index(key, krate, rows)?;
+        if let Some(entry) = self.local_rows.get(&krate).and_then(|ix| ix.by_key.get(&key)).cloned() {
+            if let Some((mk, mrow)) = entry.member {
+                self.file_member(mk, mrow)?;
+            }
+            return self.lower_chain(key, &entry.chain).and_then(|()| self.filed_local(key, krate, "the chain its body's text derives"));
+        }
+        if self.front.keys.local_kind(key).is_some() {
+            return Ok(());
+        }
+        // By lowering: advance through any not-yet-lowered `AfterCall` chains in `krate`, then
+        // any nested local fn chains they produce; each chain is lowered at most once per crate.
         let mut lowered = 0usize;
-        let mut queue = lowered_later;
-        while let Some(chain) = queue.pop() {
+        let read = self.local_rows.get(&krate).map_or(0, |ix| ix.read);
+        loop {
+            let next_work: Option<(Option<(ItemKey, MemberRow<'n>)>, Chain)> = {
+                let Some(ix) = self.local_rows.get_mut(&krate) else { break };
+                if let Some(chain) = ix.nested_queue.pop() {
+                    Some((None, chain))
+                } else if ix.after_call_next < ix.after_call.len() {
+                    let entry = ix.after_call[ix.after_call_next].clone();
+                    ix.after_call_next += 1;
+                    Some((entry.member, entry.chain))
+                } else {
+                    None
+                }
+            };
+            let Some((member_row, chain)) = next_work else { break };
             lowered += chain.len();
             if lowered > MOST_SEARCHED {
                 return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: format!("{rows}; more bodies than the most one search lowers ({MOST_SEARCHED})").into_boxed_str() });
             }
+            if let Some((mk, mrow)) = member_row {
+                self.file_member(mk, mrow)?;
+            }
             if self.lower_chain(key, &chain).is_err() {
                 continue;
             }
+            // The fns its lowering kept that hold items of their own: queue for later if needed.
+            if let Some(&last) = chain.last() {
+                let owner = match last {
+                    LowerTarget::Free(k) => checker_of(k),
+                    LowerTarget::Member(k) => k,
+                };
+                if let Some(body) = self.store.locals.body(owner)
+                    && let Some(ix) = self.local_rows.get_mut(&krate)
+                {
+                    for row in body.rows.iter().filter(|r| r.kind == crate::front2::locals::LocalKind::Fn) {
+                        let mut next = chain.clone();
+                        next.push(LowerTarget::Free(row.key));
+                        ix.nested_queue.push(next);
+                    }
+                }
+            }
             if self.front.keys.local_kind(key).is_some() {
                 return Ok(());
-            }
-            // The fns its lowering kept that hold items of their own: each read by text in turn.
-            let Some(&last) = chain.last() else { continue };
-            let owner = match last {
-                LowerTarget::Free(k) => checker_of(k),
-                LowerTarget::Member(k) => k,
-            };
-            let Some(body) = self.store.locals.body(owner) else { continue };
-            for row in body.rows.iter().filter(|r| r.kind == crate::front2::locals::LocalKind::Fn) {
-                let mut next = chain.clone();
-                next.push(LowerTarget::Free(row.key));
-                queue.push(next);
             }
         }
         Err(LazyRefusal::NotFound {

@@ -702,7 +702,16 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
 
     /// Parse a pipeline `stage1 | stage2 | ...` (allowing newlines after `|`).
     fn parse_pipeline(&mut self) -> Result<Expr<'a>, ShellError<'a>> {
-        let first = self.parse_stage()?;
+        // Leading `|` continues directly from the previous command's output (`$_` via `DotSubject`):
+        // e.g. `| compact | uniq` or `| where size > 1kb | sort -size`.
+        let first = if matches!(self.peek(), Some(Token { kind: TokKind::Pipe, .. })) {
+            Expr {
+                kind: ExprKind::DotSubject,
+                span: self.cur_span(),
+            }
+        } else {
+            self.parse_stage()?
+        };
         if !matches!(self.peek(), Some(Token { kind: TokKind::Pipe, .. })) {
             return Ok(first);
         }
@@ -784,26 +793,41 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
                     }
                 }
 
-                // `./foo` is a command path.
+                // `./foo` is a command path (unless `./data.json` with a structured data extension);
+                // `.` / `.field.0` / `?.field` is an implicit-subject expression operating on `$in` / `$_`.
                 TokKind::Dot => {
                     let touches_slash = matches!(
                         p.peek_at(1),
                         Some(Token { kind: TokKind::Slash, span: s, .. }) if s.start == tok.span.end
                     );
                     if touches_slash {
-                        p.parse_call(false)
+                        if let Some(res) = p.try_parse_implicit_data_file() {
+                            res
+                        } else {
+                            p.parse_call(false)
+                        }
                     } else {
-                        Err(p.err(tok.span, "unexpected `.` at start of expression"))
+                        p.parse_expr()
+                    }
+                }
+                TokKind::QuestionDot => p.parse_expr(),
+
+                // `/bin/ls` or `~/bin/tool` (or implicit structured data file `/path/to/data.json`)
+                TokKind::Slash | TokKind::Tilde => {
+                    if let Some(res) = p.try_parse_implicit_data_file() {
+                        res
+                    } else {
+                        p.parse_call(false)
                     }
                 }
 
-                // `/bin/ls` or `~/bin/tool`
-                TokKind::Slash | TokKind::Tilde => p.parse_call(false),
-
-                // Bare word (`nothing` standalone vs command call)
+                // Bare word (`nothing` standalone, implicit structured file `Cargo.lock` / `Cargo.toml.package`,
+                // or command call)
                 TokKind::Ident(s) => {
                     if s.as_ref() == "nothing" && p.next_is_expr_continuation_or_end() {
                         p.parse_expr()
+                    } else if let Some(res) = p.try_parse_implicit_data_file() {
+                        res
                     } else {
                         p.parse_call(false)
                     }
@@ -875,14 +899,79 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
             });
         }
 
+        // Special `map` ergonomics: `map $"(.name)@(.version)"` or `map . * 2` or `map { .name }`
+        // wraps an inline expression (or 0-param `{ ... }` block) into a 0-param closure where
+        // `.` and bare fields resolve to each row/item!
+        if !forced_external
+            && head.as_ref() == "map"
+            && !self.is_stage_end()
+            && !self.is_closure_start()
+        {
+            let body_expr = if matches!(self.peek(), Some(Token { kind: TokKind::LBrace, .. })) {
+                let open = self.bump().unwrap().span;
+                let mut body = self.with_flags(ParseFlags::DEFAULT, |p| p.parse_block(true))?;
+                let close = self.expect_rbrace()?;
+                let cspan = open.merge(close);
+                body.span = cspan;
+                Expr {
+                    kind: ExprKind::Closure {
+                        params: AVec::new_in(self.alloc),
+                        body: Rc::new_in(body, self.alloc),
+                    },
+                    span: cspan,
+                }
+            } else {
+                let expr = self.with_flags(
+                    ParseFlags {
+                        bare_path_mode: true,
+                        stop_at_lbrace: self.flags.stop_at_lbrace,
+                        stop_at_comma: self.flags.stop_at_comma,
+                        list_bare_words: false,
+                        in_list: false,
+                    },
+                    |p| p.parse_expr(),
+                )?;
+                let espan = expr.span;
+                let mut stmts = AVec::new_in(self.alloc);
+                stmts.push(Stmt::Expr(expr));
+                Expr {
+                    kind: ExprKind::Closure {
+                        params: AVec::new_in(self.alloc),
+                        body: Rc::new_in(Block { stmts, span: espan }, self.alloc),
+                    },
+                    span: espan,
+                }
+            };
+            let span = start.merge(body_expr.span);
+            let mut args = AVec::new_in(self.alloc);
+            args.push(CallArg::Positional(body_expr));
+            return Ok(Expr {
+                kind: ExprKind::Call(CallExpr { head, head_span, forced_external, args }),
+                span,
+            });
+        }
+
         let mut args = AVec::new_in(self.alloc);
         let mut end = head_span;
+        let accepts_zero_param_block = !forced_external
+            && matches!(head.as_ref(), "each" | "filter" | "any" | "all" | "sort-by");
 
         while !self.is_stage_end() {
             if args.len() >= MAX_CALL_ARGS {
                 return Err(self.err_budget(self.cur_span(), "command argument limit exceeded"));
             }
-            let arg = self.parse_call_arg()?;
+            let mut arg = self.parse_call_arg()?;
+            if accepts_zero_param_block
+                && let CallArg::Positional(Expr { kind: ExprKind::Block(body), span: bspan }) = arg
+            {
+                arg = CallArg::Positional(Expr {
+                    kind: ExprKind::Closure {
+                        params: AVec::new_in(self.alloc),
+                        body: Rc::new_in(body, self.alloc),
+                    },
+                    span: bspan,
+                });
+            }
             end = call_arg_span(&arg);
             args.push(arg);
         }
@@ -1588,56 +1677,293 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
         self.parse_postfix(primary)
     }
 
-    /// Postfix cell-path projection: `.field`, `.0`, `?.field`, `?.0`, and trailing `?`.
+    /// Postfix cell-path, projection, flatten, slice, and inline filter:
+    /// - `.field`, `.0`, `?.field`, `?.0`, trailing `?`
+    /// - `.{name, ver: .version}` (inline column/field pick & reshape)
+    /// - `[]` (flatten one level and skip nulls)
+    /// - `[0]`, `[-1]`, `[0..10]`, `["key"]` (index / negative index / range slice)
+    /// - `[source == null]` (inline row/item filter predicate)
     fn parse_postfix(&mut self, mut base: Expr<'a>) -> Result<Expr<'a>, ShellError<'a>> {
-        let mut steps = AVec::new_in(self.alloc);
-        let mut end = base.span;
+        let mut total_ops = 0usize;
 
         while let Some(tok) = self.peek() {
-            let optional = match tok.kind {
-                TokKind::Dot => false,
-                TokKind::QuestionDot => true,
-                _ => break,
-            };
-            if steps.len() >= MAX_PATH_STEPS {
-                return Err(self.err_budget(tok.span, "cell path exceeds maximum step count"));
+            if total_ops >= MAX_PATH_STEPS {
+                return Err(self.err_budget(tok.span, "postfix chain exceeds maximum step count"));
             }
-            let dot_span = tok.span;
+
+            // 1. `.{ name, ver: .version }` inline projection
+            if matches!(tok.kind, TokKind::Dot)
+                && matches!(
+                    self.peek_at(1),
+                    Some(Token { kind: TokKind::LBrace, span: bspan, .. }) if bspan.start == tok.span.end
+                )
+            {
+                let _dot_span = tok.span;
+                self.pos += 2; // consume `.` and `{`
+                let fields_res = self.parse_project_fields();
+                let (fields, close_span) = fields_res?;
+                let span = base.span.merge(close_span);
+                base = Expr {
+                    kind: ExprKind::Project {
+                        base: Box::new_in(base, self.alloc),
+                        fields,
+                    },
+                    span,
+                };
+                total_ops += 1;
+                continue;
+            }
+
+            // 2. `.field`, `.0`, `?.field`, `?.0`
+            if matches!(tok.kind, TokKind::Dot | TokKind::QuestionDot) {
+                let optional = matches!(tok.kind, TokKind::QuestionDot);
+                let dot_span = tok.span;
+                self.pos += 1;
+                let Some(step) = self.try_parse_path_step(dot_span, optional) else {
+                    return Err(self.err(
+                        self.cur_span(),
+                        "expected field name or integer index in cell path",
+                    ));
+                };
+                let span = base.span.merge(step.span);
+                match &mut base.kind {
+                    ExprKind::BarePath(existing) => {
+                        existing.push(step);
+                        base.span = span;
+                    }
+                    ExprKind::CellPath { steps: existing, .. } => {
+                        existing.push(step);
+                        base.span = span;
+                    }
+                    _ => {
+                        let mut steps = AVec::new_in(self.alloc);
+                        steps.push(step);
+                        base = Expr {
+                            kind: ExprKind::CellPath {
+                                base: Box::new_in(base, self.alloc),
+                                steps,
+                            },
+                            span,
+                        };
+                    }
+                }
+                total_ops += 1;
+                continue;
+            }
+
+            // 3. Touching `[...]`: `[]` flatten+skip-nulls, `[idx]`/`[a..b]` slice, or `[pred]` filter
+            if matches!(tok.kind, TokKind::LBracket) && tok.span.start == base.span.end {
+                let open = tok.span;
+                self.pos += 1; // consume `[`
+                self.skip_newlines();
+                if matches!(self.peek(), Some(Token { kind: TokKind::RBracket, .. })) {
+                    let close = self.bump().unwrap().span;
+                    let span = base.span.merge(close);
+                    base = Expr {
+                        kind: ExprKind::Flatten {
+                            base: Box::new_in(base, self.alloc),
+                        },
+                        span,
+                    };
+                    total_ops += 1;
+                    continue;
+                }
+                let inner = self.nested(open, |p| {
+                    p.with_flags(
+                        ParseFlags {
+                            bare_path_mode: true,
+                            stop_at_lbrace: false,
+                            stop_at_comma: false,
+                            list_bare_words: false,
+                            in_list: false,
+                        },
+                        |p| p.parse_expr(),
+                    )
+                })?;
+                self.skip_newlines();
+                let Some(close) = self.peek().and_then(|t| matches!(t.kind, TokKind::RBracket).then_some(t.span)) else {
+                    return Err(self.err(self.cur_span(), "expected `]` to close postfix `[...]`"));
+                };
+                self.pos += 1;
+                let span = base.span.merge(close);
+                if is_filter_expr(&inner) {
+                    base = Expr {
+                        kind: ExprKind::Filter {
+                            base: Box::new_in(base, self.alloc),
+                            pred: Box::new_in(inner, self.alloc),
+                        },
+                        span,
+                    };
+                } else {
+                    base = Expr {
+                        kind: ExprKind::IndexSlice {
+                            base: Box::new_in(base, self.alloc),
+                            index: Box::new_in(inner, self.alloc),
+                        },
+                        span,
+                    };
+                }
+                total_ops += 1;
+                continue;
+            }
+
+            break;
+        }
+
+        Ok(base)
+    }
+
+    /// Parse `.{ name, ver: .version }` projection field list up to closing `}`.
+    fn parse_project_fields(
+        &mut self,
+    ) -> Result<(AVec<'a, (ARc<'a, str>, Option<Expr<'a>>)>, Span), ShellError<'a>> {
+        let mut fields = AVec::new_in(self.alloc);
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Some(Token { kind: TokKind::RBrace, .. })) {
+                let close = self.bump().unwrap().span;
+                return Ok((fields, close));
+            }
+            if self.is_eof() {
+                return Err(self.err(self.cur_span(), "unterminated `.{...}` projection"));
+            }
+            if fields.len() >= MAX_CONTAINER_ITEMS {
+                return Err(self.err_budget(self.cur_span(), "projection field limit exceeded"));
+            }
+            let Some(ktok) = self.peek() else {
+                return Err(self.err(self.cur_span(), "expected field name in `.{...}`"));
+            };
+            let key = match &ktok.kind {
+                TokKind::Ident(s) | TokKind::Str(s) => s.share(),
+                TokKind::Kw(kw) => Rc::from_str_in(kw.as_str(), self.alloc),
+                _ => return Err(self.err(ktok.span, "expected field name in `.{...}`")),
+            };
             self.pos += 1;
-            let Some(step) = self.try_parse_path_step(dot_span, optional) else {
-                return Err(self.err(
-                    self.cur_span(),
-                    "expected field name or integer index in cell path",
-                ));
+            let expr = if matches!(self.peek(), Some(Token { kind: TokKind::Colon, .. })) {
+                self.pos += 1;
+                self.skip_newlines();
+                let val = self.with_flags(
+                    ParseFlags {
+                        bare_path_mode: true,
+                        stop_at_lbrace: false,
+                        stop_at_comma: true,
+                        list_bare_words: false,
+                        in_list: false,
+                    },
+                    |p| p.parse_expr(),
+                )?;
+                Some(val)
+            } else {
+                None
             };
-            end = step.span;
-            steps.push(step);
-        }
-
-        if steps.is_empty() {
-            return Ok(base);
-        }
-
-        let span = base.span.merge(end);
-        // Merge directly into `BarePath` if the base is already a `BarePath` (e.g. `where a.b.0 > 5`).
-        if let ExprKind::BarePath(ref mut existing) = base.kind {
-            if existing.len() + steps.len() > MAX_PATH_STEPS {
-                return Err(self.err_budget(span, "cell path exceeds maximum step count"));
+            fields.push((key, expr));
+            self.skip_newlines();
+            if matches!(self.peek(), Some(Token { kind: TokKind::Comma, .. })) {
+                self.pos += 1;
             }
-            for step in steps {
-                existing.push(step);
+        }
+    }
+
+    /// Detect a bare structured data file at stage start (`Cargo.lock`, `Cargo.toml.package.version`,
+    /// `data.json[n > 10]`, `./items.csv | schema`) and desugar it into an implicit `open "<path>"`
+    /// expression with full postfix & binary-expression support!
+    fn try_parse_implicit_data_file(&mut self) -> Option<Result<Expr<'a>, ShellError<'a>>> {
+        let start_pos = self.pos;
+        let first_span = self.peek()?.span;
+        let mut idx = start_pos;
+        let mut last_end = first_span.start;
+        let mut raw = AString::new_in(self.alloc);
+        let mut data_ext_end: Option<(usize, usize, Span)> = None;
+
+        while let Some(tok) = self.tokens.get(idx) {
+            if idx > start_pos && tok.span.start != last_end {
+                break;
             }
-            base.span = span;
-            return Ok(base);
+            let piece_end = tok.span.end;
+            match &tok.kind {
+                TokKind::Ident(s) => {
+                    let s_ref = s.as_ref();
+                    // Did we just finish `.toml` / `.lock` / `.json` / `.csv` / `.tsv`?
+                    if raw.ends_with('.') && is_structured_data_ext(s_ref) {
+                        raw.push_str(s_ref);
+                        data_ext_end = Some((idx + 1, raw.len(), first_span.merge(tok.span)));
+                        // Stop at the FIRST structured extension so `Cargo.toml.package.version`
+                        // splits cleanly into file `"Cargo.toml"` + postfix `.package.version`!
+                        break;
+                    }
+                    raw.push_str(s_ref);
+                }
+                TokKind::Kw(kw) => raw.push_str(kw.as_str()),
+                TokKind::Int(n) => {
+                    use core::fmt::Write as _;
+                    let _ = write!(raw, "{n}");
+                }
+                TokKind::Slash => raw.push('/'),
+                TokKind::Dot => raw.push('.'),
+                TokKind::DotDot => raw.push_str(".."),
+                TokKind::Tilde => raw.push('~'),
+                TokKind::Minus => raw.push('-'),
+                _ => break,
+            }
+            last_end = piece_end;
+            idx += 1;
         }
 
-        Ok(Expr {
-            kind: ExprKind::CellPath {
-                base: Box::new_in(base, self.alloc),
-                steps,
-            },
-            span,
-        })
+        let (end_idx, str_len, file_span) = data_ext_end?;
+        // Ensure what follows is NOT a whitespace-separated command argument (only postfix `.`/`[`
+        // touching the filename, or EOF / delimiters / stage or binary-expression continuations).
+        let after = self.tokens.get(end_idx);
+        let valid_after = match after {
+            None | Some(Token { kind: TokKind::Eof, .. }) => true,
+            Some(t)
+                if matches!(
+                    t.kind,
+                    TokKind::Pipe
+                        | TokKind::Semi
+                        | TokKind::Newline
+                        | TokKind::RParen
+                        | TokKind::RBracket
+                        | TokKind::RBrace
+                        | TokKind::Comma
+                        | TokKind::EqEq
+                        | TokKind::BangEq
+                        | TokKind::Lt
+                        | TokKind::LtEq
+                        | TokKind::Gt
+                        | TokKind::GtEq
+                        | TokKind::Plus
+                        | TokKind::PlusPlus
+                        | TokKind::Kw(Keyword::And | Keyword::Or | Keyword::In | Keyword::NotIn)
+                ) =>
+            {
+                true
+            }
+            Some(t) if t.span.start == file_span.end => {
+                matches!(t.kind, TokKind::Dot | TokKind::QuestionDot | TokKind::LBracket)
+            }
+            Some(_) => false,
+        };
+        if !valid_after {
+            return None;
+        }
+
+        self.pos = end_idx;
+        let path_str = Rc::from_str_in(&raw.as_str()[..str_len], self.alloc);
+        let mut args = AVec::new_in(self.alloc);
+        args.push(CallArg::Positional(Expr {
+            kind: ExprKind::String(path_str),
+            span: file_span,
+        }));
+        let open_call = Expr {
+            kind: ExprKind::Call(CallExpr {
+                head: Rc::from_str_in("open", self.alloc),
+                head_span: file_span,
+                forced_external: false,
+                args,
+            }),
+            span: file_span,
+        };
+        Some(self.parse_postfix(open_call))
     }
 
     fn try_parse_path_step(&mut self, dot_span: Span, mut optional: bool) -> Option<PathStep<'a>> {
@@ -1712,6 +2038,53 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
                 let name = name.share();
                 self.pos += 1;
                 Ok(Expr { kind: ExprKind::Var(name), span })
+            }
+            // Implicit-subject leading `.` / `.field.0` / `?.field` / `.{a, b}` (operates on row, `$in`, or `$_`).
+            TokKind::Dot | TokKind::QuestionDot => {
+                let optional = matches!(tok.kind, TokKind::QuestionDot);
+                self.pos += 1;
+                let base = Expr { kind: ExprKind::DotSubject, span };
+                // Leading `.{name, ver: .version}` projection directly on `$_` / `$in`
+                if !optional
+                    && matches!(
+                        self.peek(),
+                        Some(Token { kind: TokKind::LBrace, span: bspan, .. }) if bspan.start == span.end
+                    )
+                {
+                    self.pos += 1; // consume `{`
+                    let (fields, close) = self.parse_project_fields()?;
+                    return Ok(Expr {
+                        kind: ExprKind::Project {
+                            base: Box::new_in(base, self.alloc),
+                            fields,
+                        },
+                        span: span.merge(close),
+                    });
+                }
+                let touches_step = self
+                    .peek()
+                    .is_some_and(|next| next.span.start == span.end);
+                if optional || touches_step {
+                    if let Some(step) = self.try_parse_path_step(span, optional) {
+                        let full_span = span.merge(step.span);
+                        let mut steps = AVec::new_in(self.alloc);
+                        steps.push(step);
+                        return Ok(Expr {
+                            kind: ExprKind::CellPath {
+                                base: Box::new_in(base, self.alloc),
+                                steps,
+                            },
+                            span: full_span,
+                        });
+                    }
+                    if optional {
+                        return Err(self.err(
+                            self.cur_span(),
+                            "expected field name or integer index after `?.`",
+                        ));
+                    }
+                }
+                Ok(base)
             }
             // Bare cell-path literal `$.a.b` or `$?.a`
             TokKind::Dollar => {
@@ -2492,5 +2865,52 @@ fn call_arg_span(arg: &CallArg<'_>) -> Span {
     match arg {
         CallArg::Positional(e) => e.span,
         CallArg::Flag { span, .. } => *span,
+    }
+}
+
+fn is_structured_data_ext(ext: &str) -> bool {
+    ext.eq_ignore_ascii_case("toml")
+        || ext.eq_ignore_ascii_case("lock")
+        || ext.eq_ignore_ascii_case("json")
+        || ext.eq_ignore_ascii_case("jsonl")
+        || ext.eq_ignore_ascii_case("ndjson")
+        || ext.eq_ignore_ascii_case("csv")
+        || ext.eq_ignore_ascii_case("tsv")
+}
+
+/// Distinguish an inline row-filter predicate (`[source == null]`, `[size > 1mb]`, `[.active]`)
+/// from an index/slice expression (`[0]`, `[-1]`, `[0..10]`, `["key"]`, `[$i]`).
+fn is_filter_expr(expr: &Expr<'_>) -> bool {
+    match &expr.kind {
+        ExprKind::BarePath(_) | ExprKind::DotSubject => true,
+        ExprKind::Unary { op: UnaryOp::Not, .. } => true,
+        ExprKind::Unary { expr: inner, .. } => is_filter_expr(inner),
+        ExprKind::Binary { op, left, right } => {
+            matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::RegexMatch
+                    | BinaryOp::RegexNotMatch
+                    | BinaryOp::StartsWith
+                    | BinaryOp::EndsWith
+                    | BinaryOp::In
+                    | BinaryOp::NotIn
+                    | BinaryOp::And
+                    | BinaryOp::Or
+                    | BinaryOp::Xor
+            ) || is_filter_expr(left)
+                || is_filter_expr(right)
+        }
+        ExprKind::CellPath { base, .. }
+        | ExprKind::Flatten { base }
+        | ExprKind::IndexSlice { base, .. }
+        | ExprKind::Filter { base, .. }
+        | ExprKind::Project { base, .. } => is_filter_expr(base),
+        _ => false,
     }
 }

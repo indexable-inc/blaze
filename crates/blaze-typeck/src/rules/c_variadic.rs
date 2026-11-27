@@ -106,10 +106,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         } else {
             let Some(ct) = self
                 .adjust
-                .iter()
-                .rev()
-                .find(|(ex, _, _)| **ex == callee)
-                .map(|(_, _, &t)| t)
+                .last_ty(callee)
                 .or_else(|| self.expr_ty.get(callee.ix()).copied())
             else {
                 return Ok(());

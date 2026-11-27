@@ -105,6 +105,23 @@ pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bod
             refused.push((k, format!("more than {MOST_STATICS} statics reached (the work list's bound)").into_boxed_str()));
             break;
         }
+        if let Err(err) = ensure_static_head(r, k) {
+            let mut msg = blaze_own::String::new_in(r.store.work_alloc());
+            match err {
+                StaticHeadError::Want(e) => {
+                    let _ = core::fmt::write(&mut msg, format_args!("{e}"));
+                }
+                StaticHeadError::Ensure(want, super::program::WantError::Const { key: c, error: e }) => {
+                    let _ = core::fmt::write(&mut msg, format_args!("static head asked {want:?}: the constant {c:x} its head names: {e:?}"));
+                }
+                StaticHeadError::Ensure(want, super::program::WantError::Head(e)) => {
+                    let shown = super::item_shown::head_error_shown(r.names, &e);
+                    let _ = core::fmt::write(&mut msg, format_args!("static head asked {want:?}: {shown}"));
+                }
+            }
+            refused.push((k, msg.as_str().into()));
+            continue;
+        }
         match super::program::foreign_static_symbol(r.names, &*r.keys, &*r.store, k) {
             Ok(Some(symbol)) => {
                 match foreign_kind(r, k) {
@@ -145,6 +162,22 @@ pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bod
     (Statics { values, kinds, foreign }, refused)
 }
 
+enum StaticHeadError {
+    Want(super::fill::FillError),
+    Ensure(super::heads::Want, super::program::WantError),
+}
+
+/// Ensures static `k`'s head is filed in `r.store.fns` and `r.store.statics` (including for
+/// cold cached-`Typed` runs and transitive `DataTarget::Static` relocations pointing to foreign
+/// statics whose heads were never loaded by `check_body`), via the shared [`super::program::ensure_want`].
+fn ensure_static_head<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: ItemKey) -> Result<(), StaticHeadError> {
+    if r.store.fns.contains_key(&k) && r.store.statics.contains_key(&k) {
+        return Ok(());
+    }
+    let want = super::fill::want_of_key(r.names, &*r.keys, k).map_err(StaticHeadError::Want)?;
+    super::program::ensure_want(r, want).map_err(|e| StaticHeadError::Ensure(want, e))
+}
+
 /// Static `k`'s record (copied out of the evaluator's arena) and its kind. The run's static
 /// rows (lazy/fill.rs `static_value`) ask one static by this, the work list above many.
 pub(crate) fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: ItemKey) -> Result<(DataRecord<Global>, StaticItem), Box<str>> {
@@ -173,7 +206,10 @@ pub(crate) fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: 
     let Some(&m) = r.store.statics.get(&k) else {
         return Err(Box::from("no static head in the store (heads.rs `Store::statics`)"));
     };
-    let (thread_local, _, single_threaded_wasm) = static_attrs_of(r, k)?;
+    let (thread_local, extern_weak, single_threaded_wasm) = static_attrs_of(r, k)?;
+    if extern_weak {
+        return Err("`#[linkage = \"extern_weak\"]` is only supported on foreign statics".into());
+    }
     Ok((record, StaticItem { thread_local: thread_local && !single_threaded_wasm, mutable: matches!(m, tc::Mutbl::Mut), extern_weak: false }))
 }
 

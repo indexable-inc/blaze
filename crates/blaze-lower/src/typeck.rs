@@ -434,6 +434,9 @@ pub struct TypeckBody<'a> {
     /// Explicit written non-elided lifetimes in closure parameter type annotations
     /// (`|lock: &'static str|`, `|t: Typed<'c>|`), sorted ascending by `(closure, param, slot)`.
     pub closure_param_regions: AVec<'a, tc::ClosureParamRegion>,
+    /// Loop cost marks (`#[blaze::cost(bounded | amortized | reset)]`) on `Expr::Loop` nodes,
+    /// ascending by [`ExprId`] (`BodyView::loop_marks`, blaze-typeck rules/cost.rs).
+    pub loop_marks: AVec<'a, (ExprId, tc::LoopCost)>,
     /// Unexpanded `inline for pat in iter { body }` sites lowered in this body (ascending by
     /// [`ExprId`]); `front2` uses each site's checked `iter` type to unroll the body before
     /// final checking and codegen.
@@ -503,6 +506,7 @@ impl<'a> TypeckBody<'a> {
             pat_editions: &self.pat_editions,
             record_expr_schemas: &self.record_expr_schemas,
             closure_param_regions: &self.closure_param_regions,
+            loop_marks: &self.loop_marks,
         }
     }
 }
@@ -1400,7 +1404,12 @@ impl Conv<'_, '_, '_, '_, '_> {
                 }
                 tc::Expr::Match { scrutinee, arms: List { start, len: arms.len } }
             }
-            Expr::Loop { body, .. } => tc::Expr::Loop { body },
+            Expr::Loop { body, cost, .. } => {
+                if cost != tc::LoopCost::Normal {
+                    self.out.loop_marks.push((e, cost));
+                }
+                tc::Expr::Loop { body }
+            }
             Expr::Break { value, target: Some(target) } => tc::Expr::Break { value, target },
             Expr::Break { target: None, .. } => return self.refuse("a break with no target", r),
             Expr::Continue { target: Some(target) } => tc::Expr::Continue { target },
@@ -1761,6 +1770,7 @@ pub fn to_typeck<'a>(
         const_gaps: Vec::new_in(alloc),
         record_expr_schemas: Vec::new_in(alloc),
         closure_param_regions: Vec::new_in(alloc),
+        loop_marks: Vec::new_in(alloc),
         inline_fors: Vec::new_in(alloc),
     };
     let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);

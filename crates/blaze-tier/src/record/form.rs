@@ -84,8 +84,9 @@ use super::declared::{self, Declared, DeclaredKind, DeclaredRow};
 use super::{Emitted, InlineFrame, Live, LoopHeader, OUTERMOST, Place, Poll, Position, Reloc, RelocKind};
 use crate::Reg;
 
-/// The first eight bytes of every encoded record of this form: the ONE place its number is.
-pub const MAGIC: [u8; 8] = *b"bzcode08";
+/// The first eight bytes of every encoded record of this form: the ONE place its number is
+/// (`bzcode10` adds [`Space::WeakOutside`], skipping `09` which belongs to `blaze-code`).
+pub const MAGIC: [u8; 8] = *b"bzcode10";
 
 /// [`MAGIC`]'s number, for [`FormError::OtherForm`].
 const FORM_NUMBER: u8 = (MAGIC[6] - b'0') * 10 + (MAGIC[7] - b'0');
@@ -101,7 +102,7 @@ const RESERVED_AT: usize = ALIGNS_AT + 4;
 
 /// The digest that ends every record: its bytes and its hash domain.
 const DIGEST: usize = 32;
-const DIGEST_DOMAIN: &str = "blaze-tier code record bzcode08 digest";
+const DIGEST_DOMAIN: &str = "blaze-tier code record bzcode10 digest";
 
 const CODE: usize = 0;
 const RELRO: usize = 1;
@@ -529,8 +530,9 @@ pub fn seal<'a>(e: Emitted<'a>) -> Result<Sealed<'a>, FormError> {
     names.sort_unstable_by_key(|n| n.0);
     names.dedup_by_key(|n| n.0);
     for &(symbol, start, len) in names.iter() {
-        let outside = Target { space: Space::Outside, symbol };
-        if e.targets.binary_search(&outside).is_err() {
+        let used = e.targets.binary_search(&Target { space: Space::Outside, symbol }).is_ok()
+            || e.targets.binary_search(&Target { space: Space::WeakOutside, symbol }).is_ok();
+        if !used {
             continue;
         }
         let Some(bytes) = text.get(start as usize..start as usize + len as usize) else {
@@ -883,14 +885,7 @@ fn kind_of(kind: u8, scale: u8) -> Option<RelocKind> {
 }
 
 fn space_of(byte: u8) -> Option<Space> {
-    match byte {
-        0 => Some(Space::Func),
-        1 => Some(Space::Static),
-        2 => Some(Space::Vtable),
-        3 => Some(Space::Tls),
-        4 => Some(Space::Outside),
-        _ => None,
-    }
+    Space::from_byte(byte)
 }
 
 /// The bytes a relocation's kind completes.
@@ -1687,7 +1682,7 @@ fn check(r: &impl Rows) -> Result<(), FormError> {
                 if target.space == Space::Tls && !import && x.kind != RelocKind::Abs64 {
                     return Err(FormError::RelocTlsAddress { at: x.at });
                 }
-                if target.space == Space::Outside && x.addend != 0 {
+                if target.space.is_outside() && x.addend != 0 {
                     return Err(FormError::OutsideAddend { at: x.at });
                 }
             }
@@ -1709,7 +1704,7 @@ fn check(r: &impl Rows) -> Result<(), FormError> {
         }
         if w.target != OWN_CODE && w.target != OWN_RELRO {
             let target = target_of(w.at, w.target)?;
-            if target.space == Space::Outside && w.addend != 0 {
+            if target.space.is_outside() && w.addend != 0 {
                 return Err(FormError::OutsideAddend { at: w.at });
             }
         }
@@ -1962,13 +1957,15 @@ fn check_names(r: &impl Rows) -> Result<(), FormError> {
         if core::str::from_utf8(bytes).is_err() {
             return Err(FormError::NameText { symbol });
         }
-        if search(r.targets(), |t| r.target(t), &Target { space: Space::Outside, symbol }).is_none() {
+        let used = search(r.targets(), |t| r.target(t), &Target { space: Space::Outside, symbol }).is_some()
+            || search(r.targets(), |t| r.target(t), &Target { space: Space::WeakOutside, symbol }).is_some();
+        if !used {
             return Err(FormError::NameUnused { symbol });
         }
     }
     for t in 0..r.targets() {
         let target = r.target(t);
-        if target.space == Space::Outside && search(r.names(), |n| r.name_row(n).0, &target.symbol).is_none() {
+        if target.space.is_outside() && search(r.names(), |n| r.name_row(n).0, &target.symbol).is_none() {
             return Err(FormError::NameMissing { symbol: target.symbol });
         }
     }

@@ -488,12 +488,24 @@ pub(super) fn written_name<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Opt
     names.name_of(lib)
 }
 
+/// Whether `container` is a trait: already filed in `store.trait_defs`, or a library trait whose
+/// `Want::Members` has not been loaded yet (e.g. a cold cached-`Typed` run reading `T::CONST`
+/// before any body check touched the trait).
+fn is_trait_container<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'_>, container: ItemKey) -> bool {
+    store.trait_defs.contains_key(&container)
+        || keys.library_in(names, container).is_some_and(|lib| names.kind_of_item(lib) == Some(blaze_surface::ItemKind::Trait))
+}
+
 impl<'n, S: NamesSource<'n>> ConstsWorld<'_, 'n, S> {
     /// `item` as an associated constant DECLARED by a trait (`Specifier::BITS`): the trait and
     /// the constant's name; `None` for any other item (an impl's constant, a free one).
     fn trait_const(&self, item: ItemKey) -> Option<(ItemKey, tc::Name)> {
         match self.keys.origin(item)? {
-            super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, name } if self.store.trait_defs.contains_key(container) => Some((*container, tc::Name::of(name))),
+            super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, name }
+                if is_trait_container(self.names, self.keys, self.store, *container) =>
+            {
+                Some((*container, tc::Name::of(name)))
+            }
             _ => None,
         }
     }
@@ -917,7 +929,11 @@ impl<'n> Consts<'n> {
     /// ([`ConstsWorld::trait_const`], over the records as they are now).
     fn trait_of_const<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, item: ItemKey) -> Option<ItemKey> {
         match r.keys.origin(item)? {
-            super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, .. } if r.store.trait_defs.contains_key(container) => Some(*container),
+            super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, .. }
+                if is_trait_container(r.names, r.keys, r.store, *container) =>
+            {
+                Some(*container)
+            }
             _ => None,
         }
     }
@@ -1018,6 +1034,52 @@ impl<'n> Consts<'n> {
         self.records.iter().find(|x| x.record.key == key).map(|x| &x.record).ok_or(ConstFail::MissingRecord { item, key })
     }
 
+    /// Evaluates `c` (and any constants it needs first, via `const_open::needed_first`) using
+    /// this evaluator and files its value in `r.store.maps`, as `check::eval_len` does. Called
+    /// when remaking waiting impl constants inside [`super::const_inherent::first`], where
+    /// `r.consts` is currently taken by this evaluator.
+    pub(super) fn eval_const_need<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, c: LibKey) -> Result<(), ConstFail> {
+        let active_before = r.store.active_consts_len();
+        let mut firsts: Vec<LibKey, Global> = Vec::new_in(Global);
+        firsts.push(c);
+        r.store.push_active_const(c);
+        let mut rounds = 0u32;
+        let result = loop {
+            let Some(&top) = firsts.last() else { break Ok(()) };
+            match self.first(r, prepared, top) {
+                Ok(()) => {
+                    if let Some(done_c) = firsts.pop() {
+                        r.store.pop_active_const(done_c);
+                        if r.store.clear_provisional_for(done_c)
+                            && let Some(b) = r.buckets.as_ref()
+                        {
+                            b.clear_provisional();
+                        }
+                    }
+                }
+                Err(e) => {
+                    let Some(next) = super::const_open::needed_first(&e) else { break Err(e) };
+                    let fileable = !r.store.maps.qpaths.borrow().is_leaf(next);
+                    if rounds >= super::const_open::MOST_FIRSTS || firsts.contains(&next) || !fileable {
+                        break Err(e);
+                    }
+                    rounds += 1;
+                    firsts.push(next);
+                    r.store.push_active_const(next);
+                }
+            }
+        };
+        r.store.truncate_active_consts(active_before);
+        let mut cleared = false;
+        while let Some(done_c) = firsts.pop() {
+            cleared |= r.store.clear_provisional_for(done_c);
+        }
+        if cleared && let Some(b) = r.buckets.as_ref() {
+            b.clear_provisional();
+        }
+        result
+    }
+
     /// Evaluates the constant `c` a head or a body's conversion needs before an evaluation
     /// can go on ([`Consts::value_at`]'s work list) and files it exactly as `check::eval_len`
     /// files the one it is asked: its bits in `Maps::const_bits` (and `const_lens` when they
@@ -1110,10 +1172,7 @@ impl<'n> Consts<'n> {
             }
             // A trait's constant has `Self` among its parameters: a need for it with no
             // arguments has no impl to select ([`ConstFail::TraitConstNoSelf`]).
-            let of_a_trait = matches!(
-                r.keys.origin(n.item),
-                Some(super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, .. }) if r.store.trait_defs.contains_key(container)
-            );
+            let of_a_trait = self.trait_of_const(&*r, n.item).is_some();
             if of_a_trait && ground.view().list(n.args).map_or(true, |l| l.is_empty()) {
                 out = Err(ConstFail::TraitConstNoSelf { item, constant: n.item });
                 break;

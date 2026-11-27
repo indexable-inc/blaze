@@ -400,3 +400,40 @@ fn from_v1_carries_the_columns_and_places_slots_alike() {
     assert!(matches!(misaligned, Err(blaze_code::place::PlaceError::Misaligned { align: 32, .. })), "code off its 32-byte alignment is refused");
     println!("bzcode08: from_v1 carries the alignments, trap rows and slots; the slots place as bzcode07's");
 }
+
+/// `Space::WeakOutside` round-trips through `bzcode10` and `from_v1`, skips `DeclaredRow`,
+/// refuses nonzero addends, and refuses `bzcode08` as `OtherForm { got: 8, want: 10 }`.
+#[test]
+fn weak_outside_round_trips_through_bzcode10_and_from_v1() {
+    let alloc = Alloc::global();
+    let mut v1 = CodeRecord::new_in(alloc);
+    for inst in [0x9000_0000u32, 0xF940_0000, 0xD65F_03C0] {
+        v1.code.extend_from_slice(&inst.to_le_bytes());
+    }
+    let w_idx = v1.weak_outside("posix_spawn_file_actions_addchdir");
+    v1.sites.push(Site { at: 0, kind: SiteKind::Load, target: w_idx, addend: 0 });
+    let Ok(mut emitted) = from_v1(v1, alloc) else { panic!("from_v1 must preserve Space::WeakOutside") };
+    assert!(declare(&mut emitted, &BySymbol).is_ok(), "declare must skip Space::WeakOutside");
+    let Ok(sealed) = seal(emitted) else { panic!("bzcode10 must seal Space::WeakOutside") };
+    let mut bytes: AVec<'static, u8> = Vec::new_in(alloc);
+    encode(&sealed, &mut bytes);
+    assert_eq!(&bytes[..8], b"bzcode10");
+
+    let Ok(view) = read(&bytes) else { panic!("bzcode10 must read back") };
+    let sym = Symbol::of_name("posix_spawn_file_actions_addchdir");
+    assert_eq!(view.targets(), 1);
+    assert_eq!(view.target(0), Target { space: Space::WeakOutside, symbol: sym });
+    assert_eq!(view.name(sym), Some("posix_spawn_file_actions_addchdir"));
+
+    // Older bzcode08 is refused as OtherForm { got: 8, want: 10 }.
+    let mut old: AVec<'static, u8> = Vec::new_in(alloc);
+    old.extend_from_slice(&bytes);
+    old[..8].copy_from_slice(b"bzcode08");
+    assert_eq!(read(&old).err(), Some(FormError::OtherForm { found: 8, reads: 10 }));
+
+    // Control: nonzero addend on Space::WeakOutside is refused.
+    let mut bad = view.to_emitted(alloc);
+    bad.relro.resize(8, 0);
+    bad.words.push(Word { at: 0, target: 0, addend: 4 });
+    assert_eq!(seal(bad).err(), Some(FormError::OutsideAddend { at: 0 }));
+}

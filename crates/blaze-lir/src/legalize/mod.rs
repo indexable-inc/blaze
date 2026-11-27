@@ -125,7 +125,7 @@ pub fn legalize<'a>(
         out.finish()?
     };
     let (new, stats) = made;
-    verify(new.view()).map_err(LegalizeError::Verify)?;
+    crate::verify::verify_in(new.view(), new.allocator()).map_err(LegalizeError::Verify)?;
     *func = new;
     Ok(stats)
 }

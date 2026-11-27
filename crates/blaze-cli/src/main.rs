@@ -196,6 +196,9 @@ pub enum CliError {
     Leaves(WireError),
     /// A file the outline cannot read: not UTF-8, or past 4 GiB.
     Text { what: &'static str },
+    /// SDK resolution failed while following a saved `cc-probe` read, preserving the full
+    /// `SdkRefused` diagnostic (path, xcrun status, or underlying I/O error).
+    Sdk(blaze_own::String<blaze_own::SharedAlloc<'static>>),
     /// The program did not run: the stage and the function it stopped at (program.rs's form;
     /// the request names the command in [`CliError::Ran`]).
     /// Its one form: the program's manifest refused ([`ManifestRefused`]); every constructor is
@@ -327,6 +330,7 @@ impl fmt::Display for CliError {
             CliError::MacroFiles(error) => write!(f, "{error}"),
             CliError::Leaves(error) => write!(f, "the checkout's leaf table (in a pointer of .blaze/v2/at), of this build's form, is malformed: {error}"),
             CliError::Text { what } => write!(f, "{what}"),
+            CliError::Sdk(why) => write!(f, "{why}"),
             CliError::Program(error) => write!(f, "the program: {error}"),
             CliError::Ran { command, error } => write!(f, "blaze {command}: {error}"),
             CliError::OwnProcess(error) => write!(f, "{error}"),
@@ -401,6 +405,9 @@ struct Flags<'a> {
     /// `--each`: every consequence finding (a task waiting on a failed one, an item not
     /// checked) drawn one by one as well as counted under its cause (print.rs `Shown::each`).
     each: bool,
+    /// `--verbose` / `-v`: print verbose diagnostic notes (including per-file notes for
+    /// cfg-excluded modules, `engine_body_plan.rs`).
+    verbose: bool,
     origin: Option<&'a str>,
     origin_key: Option<&'a str>,
     /// `--grant name=value`, each a capability the program is given (run.md).
@@ -421,6 +428,8 @@ struct Flags<'a> {
     select: run_package::Select<'a>,
     /// `--open`: opt-in to opening the Explore web page in the browser on `blaze run` (default: off).
     open: blaze_run::viewer::OpenExplore,
+    /// `-q` / `--quiet`: suppress `blaze run`'s persistent status lines and live TUI on stderr.
+    quiet: bool,
     /// `-o <path>` / `--output <path>`: where `blaze build` writes the standalone executable.
     output: Option<&'a str>,
     /// `--target <triple>`: target backend for `blaze build` (`native` or `wasm64`).
@@ -447,6 +456,7 @@ impl<'a> Flags<'a> {
             color: Choice::Auto,
             stats: false,
             each: false,
+            verbose: false,
             origin: None,
             origin_key: None,
             grants: std::vec::Vec::new(),
@@ -455,6 +465,7 @@ impl<'a> Flags<'a> {
             status_every: None,
             select: run_package::Select::NONE,
             open: blaze_run::viewer::OpenExplore::No,
+            quiet: false,
             output: None,
             target: None,
             names_oracle: engine_names::NamesOracle::Off,
@@ -578,8 +589,14 @@ pub(crate) fn parse_flags_in<'a>(args: &'a Args, frame: &Frame, mut package: imp
     if parsed.has("each") {
         flags.each = true;
     }
+    if parsed.has("verbose") {
+        flags.verbose = true;
+    }
     if parsed.has("open") {
         flags.open = blaze_run::viewer::OpenExplore::Open;
+    }
+    if parsed.has("quiet") {
+        flags.quiet = true;
     }
     if parsed.has("names-oracle") {
         flags.names_oracle = engine_names::NamesOracle::On;
