@@ -180,6 +180,15 @@ impl<'n> RunProcs<'n, '_> {
         let names = crate::names::world(cx, self.root, sections.graph, sections.wasm_graph, Some(lockfile.lock), members, env)
             .map_err(|error| said(format_args!("no proc-macro runner: the names world: {error}")))?;
         let world = names.made().ok_or_else(|| said(format_args!("no proc-macro runner: the names world was made and not kept (names.rs `world`)")))?;
+        if let Some(checkout_dirs) = members {
+            use blaze_world::crate_list::CrateGraph as _;
+            let list = names.list();
+            let proc_macros = (0..list.len())
+                .filter(|&at| list.proc_macro(at))
+                .map(|at| (list.package(at), list.version(at)));
+            crate::units::emit_proc_macro_lock_files(cx, self.root, &stamps, proc_macros, lockfile.lock, checkout_dirs, None, &mut rows, frame)
+                .map_err(|error| said(format_args!("no proc-macro runner: macro files: {error}")))?;
+        }
         let side = crate::proc_runner::MacroSide { lock: lockfile, place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows }, heap: env.heap };
         crate::proc_runner::make(world, *names.list(), &side).map_err(|error| said(format_args!("no proc-macro runner: {error} (proc_runner.rs `make`)")))
     }

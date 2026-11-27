@@ -175,6 +175,7 @@ pub fn lay<'f, 'l>(
     let mut member_deps: Vec<crate::unused_deps::MemberDeps<'f>, &'f Frame> = Vec::new_in(frame);
     let mut root_made = Made::new_in(Name::units(), frame);
     let mut facts = None;
+    let mut laid_units: Option<layout::Units<'l>> = None;
     match laid {
         Ok(units) => {
             member_deps = crate::unused_deps::extract_from_layout(&units, &paths, frame);
@@ -206,101 +207,19 @@ pub fn lay<'f, 'l>(
                 listed[k] = Some((made.name, member_source(&made)));
                 made_of[k] = Some(made);
             }
-            // Collect all workspace members and path packages whose whole file tree enters a
-            // proc-macro or build-script module key (rule 21): every proc-macro crate, every
-            // transitive path dependency of a proc-macro crate, and every transitive path
-            // build-dependency of a crate with a build script.
-            let mut whole_dirs: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-            let mut dep_stack: Vec<(bool, usize), &Frame> = Vec::new_in(frame);
-            let mut seen_pkgs: std::collections::BTreeSet<(bool, usize)> = std::collections::BTreeSet::new();
-            let push_pkg = |is_path: bool, idx: usize, seen: &mut std::collections::BTreeSet<(bool, usize)>, stack: &mut Vec<(bool, usize), &Frame>| {
-                if seen.insert((is_path, idx)) {
-                    stack.push((is_path, idx));
-                }
-            };
-            let push_dep_target = |dep: &blaze_manifest::layout::Dependency<'_>, units: &layout::Units<'_>, seen: &mut std::collections::BTreeSet<(bool, usize)>, stack: &mut Vec<(bool, usize), &Frame>| {
-                match &dep.source {
-                    blaze_manifest::layout::Source::Member(idx) => push_pkg(false, *idx, seen, stack),
-                    blaze_manifest::layout::Source::Path(dir) => {
-                        if let Some(idx) = units.path_packages.iter().position(|p| p.dir.as_str() == dir.as_str()) {
-                            push_pkg(true, idx, seen, stack);
-                        } else if let Some(idx) = units.members.iter().position(|m| m.dir.as_str() == dir.as_str()) {
-                            push_pkg(false, idx, seen, stack);
-                        }
-                    }
-                    _ => {}
-                }
-            };
-            for (idx, m) in units.members.iter().enumerate() {
-                if m.lib.iter().any(|lib| lib.proc_macro) {
-                    push_pkg(false, idx, &mut seen_pkgs, &mut dep_stack);
-                }
-                if m.build.is_some() {
-                    for dep in m.dependencies.iter() {
-                        if dep.kind == blaze_manifest::layout::DepKind::Build {
-                            push_dep_target(dep, &units, &mut seen_pkgs, &mut dep_stack);
-                        }
-                    }
-                }
-            }
-            for (idx, p) in units.path_packages.iter().enumerate() {
-                if p.lib.iter().any(|lib| lib.proc_macro) {
-                    push_pkg(true, idx, &mut seen_pkgs, &mut dep_stack);
-                }
-                if p.build.is_some() {
-                    for dep in p.dependencies.iter() {
-                        if dep.kind == blaze_manifest::layout::DepKind::Build {
-                            push_dep_target(dep, &units, &mut seen_pkgs, &mut dep_stack);
-                        }
-                    }
-                }
-            }
-            while let Some((is_path, idx)) = dep_stack.pop() {
-                let pkg = if is_path { &units.path_packages[idx] } else { &units.members[idx] };
-                whole_dirs.insert(pkg.dir.as_str());
-                for dep in pkg.dependencies.iter() {
-                    if matches!(dep.kind, blaze_manifest::layout::DepKind::Normal | blaze_manifest::layout::DepKind::Build) {
-                        push_dep_target(dep, &units, &mut seen_pkgs, &mut dep_stack);
-                    }
-                }
-            }
-            for (member, made) in units.members.iter().zip(made_of.iter_mut()) {
+            for made in made_of.iter_mut() {
                 let Some(made) = made.take() else { return Err(CliError::Text { what: "a member's units were not made in the layout's dependency order (units.rs `deps_first`)" }) };
                 root_made.parts.push(Part { name: made.name, locate: Locate::Source(member_source(&made)), place: 0 });
                 members.push((made.name, made));
-                // A member proc-macro crate (or transitive path dep of a proc-macro or build
-                // script): its files enter the module key (macro_files.rs, rule 21), each file
-                // and folder with its stamp, so the next sweep proves it unchanged by stats alone.
-                if whole_dirs.contains(member.dir.as_str()) {
-                    crate::macro_files::read_row(&cx, root, stamps, member.dir.as_str(), rows, frame)?;
-                } else if let Some(build) = &member.build {
-                    let rel = if member.dir.is_empty() {
-                        build.root.as_str()
-                    } else {
-                        build.root.as_str().strip_prefix(member.dir.as_str()).and_then(|s| s.strip_prefix('/')).unwrap_or(build.root.as_str())
-                    };
-                    crate::macro_files::read_script_files(&cx, root, stamps, member.dir.as_str(), rel, rows, frame)?;
-                }
             }
-            // Non-member path packages: keep each target root's edition for the file walk and
-            // track proc-macro, transitive path dep, and build-script source trees in the sweep
-            // leaf table (rule 21).
+            // Non-member path packages: keep each target root's edition for the file walk.
             for pkg in units.path_packages.iter() {
                 let edition = syntax_of(pkg.edition.syntax).byte();
                 for target in pkg.lib.iter().chain(pkg.bins.iter()).chain(pkg.build.iter()) {
                     path_roots.push((frame.alloc_str(target.root.as_str()), edition));
                 }
-                if whole_dirs.contains(pkg.dir.as_str()) {
-                    crate::macro_files::read_row(&cx, root, stamps, pkg.dir.as_str(), rows, frame)?;
-                } else if let Some(build) = &pkg.build {
-                    let rel = if pkg.dir.is_empty() {
-                        build.root.as_str()
-                    } else {
-                        build.root.as_str().strip_prefix(pkg.dir.as_str()).and_then(|s| s.strip_prefix('/')).unwrap_or(build.root.as_str())
-                    };
-                    crate::macro_files::read_script_files(&cx, root, stamps, pkg.dir.as_str(), rel, rows, frame)?;
-                }
             }
+            laid_units = Some(units);
         }
         // A refusal is a finding on the line it names: the root's, or a member's whose own
         // units then hold it.
@@ -358,6 +277,9 @@ pub fn lay<'f, 'l>(
         },
         _ => None,
     };
+    if let Some(units) = &laid_units {
+        emit_macro_files(&cx, root, stamps, units, lock.as_ref(), parts.as_ref(), rows, frame)?;
+    }
     // The cargo config's rustflags: its files are the layout's reads, so an edit to one moves the
     // units' source and lays the graph again (rule 21).
     let rustflags = crate::graph::rustflags_config(&cx, root, stamps, rows, heap, frame)?;
@@ -365,6 +287,259 @@ pub fn lay<'f, 'l>(
     root_made.parts.dedup_by_key(|part| part.name);
     root_made.out = parts_out(&root_made.parts);
     Ok(Laid { root: root_made, members, path_roots, lock, parts, graph: None, rustflags, member_deps })
+}
+
+/// Emit `LeafKind::MacroFiles` (whole-package files digest) and `LeafKind::MacroFile`
+/// (build-script file) sweep rows for workspace members and checkout path packages whose files
+/// enter a proc-macro or build-script module key (rule 21), without eagerly sweeping unrelated
+/// regular workspace members (rule 60).
+#[expect(clippy::too_many_arguments, reason = "layout sweep handles, resolved layout, lock and parts")]
+fn emit_macro_files<'a>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    stamps: &impl Stamps,
+    units: &'a layout::Units<'_>,
+    lock: Option<&'a crate::fetch::Lockfile<'_>>,
+    parts: Option<&'a crate::graph::Parts>,
+    rows: &mut Rows<'_>,
+    frame: &Frame,
+) -> Result<(), CliError> {
+    let mut whole_dirs: blaze_own::BTreeSet<&'a str, &Frame> = blaze_own::BTreeSet::new_in(frame);
+    let mut dep_stack: Vec<(bool, usize), &Frame> = Vec::new_in(frame);
+    let mut seen_pkgs: blaze_own::BTreeSet<(bool, usize), &Frame> = blaze_own::BTreeSet::new_in(frame);
+    let push_pkg = |is_path: bool, idx: usize, seen: &mut blaze_own::BTreeSet<(bool, usize), &Frame>, stack: &mut Vec<(bool, usize), &Frame>| {
+        if seen.insert((is_path, idx)) {
+            stack.push((is_path, idx));
+        }
+    };
+    let push_dep_target = |dep: &blaze_manifest::layout::Dependency<'_>, units: &layout::Units<'_>, seen: &mut blaze_own::BTreeSet<(bool, usize), &Frame>, stack: &mut Vec<(bool, usize), &Frame>| {
+        match &dep.source {
+            blaze_manifest::layout::Source::Member(idx) => push_pkg(false, *idx, seen, stack),
+            blaze_manifest::layout::Source::Path(dir) => {
+                if let Some(idx) = units.path_packages.iter().position(|p| p.dir.as_str() == dir.as_str()) {
+                    push_pkg(true, idx, seen, stack);
+                } else if let Some(idx) = units.members.iter().position(|m| m.dir.as_str() == dir.as_str()) {
+                    push_pkg(false, idx, seen, stack);
+                }
+            }
+            _ => {}
+        }
+    };
+    for (idx, m) in units.members.iter().enumerate() {
+        if m.lib.iter().any(|lib| lib.proc_macro) {
+            push_pkg(false, idx, &mut seen_pkgs, &mut dep_stack);
+        }
+        if m.build.is_some() {
+            for dep in m.dependencies.iter() {
+                if dep.kind == blaze_manifest::layout::DepKind::Build {
+                    push_dep_target(dep, units, &mut seen_pkgs, &mut dep_stack);
+                }
+            }
+        }
+    }
+    for (idx, p) in units.path_packages.iter().enumerate() {
+        if p.lib.iter().any(|lib| lib.proc_macro) {
+            push_pkg(true, idx, &mut seen_pkgs, &mut dep_stack);
+        }
+        if p.build.is_some() {
+            for dep in p.dependencies.iter() {
+                if dep.kind == blaze_manifest::layout::DepKind::Build {
+                    push_dep_target(dep, units, &mut seen_pkgs, &mut dep_stack);
+                }
+            }
+        }
+    }
+    while let Some((is_path, idx)) = dep_stack.pop() {
+        let pkg = if is_path { &units.path_packages[idx] } else { &units.members[idx] };
+        whole_dirs.insert(pkg.dir.as_str());
+        for dep in pkg.dependencies.iter() {
+            if matches!(dep.kind, blaze_manifest::layout::DepKind::Normal | blaze_manifest::layout::DepKind::Build) {
+                push_dep_target(dep, units, &mut seen_pkgs, &mut dep_stack);
+            }
+        }
+    }
+    // Augment `whole_dirs` from the resolved `Cargo.lock` dependency graph:
+    // `LockedPackages::closure_with` walks the full `Cargo.lock` `dependencies` closure
+    // (including dev-deps and registry-to-path `[patch.*]` hops) of every proc-macro crate and
+    // asks `Place::member_files(LockId)` for every reached `LockSource::Path` package.
+    if let (Some(lockfile), Some(parts)) = (lock, parts) {
+        let lock = lockfile.lock;
+        let checkout_dirs = parts.member_dirs();
+        let pkg_count = lock.packages.len();
+        let mut dir_of_lock: Vec<Option<&'a str>, &Frame> = Vec::with_capacity_in(pkg_count, frame);
+        dir_of_lock.resize(pkg_count, None);
+        for entry in checkout_dirs.iter() {
+            if let Some(slot) = dir_of_lock.get_mut(entry.id.index()) {
+                *slot = Some(entry.dir.as_str());
+            }
+        }
+        let mut seen_lock: Vec<bool, &Frame> = Vec::with_capacity_in(pkg_count, frame);
+        seen_lock.resize(pkg_count, false);
+        let mut lock_stack: Vec<blaze_manifest::lock::LockId, &Frame> = Vec::new_in(frame);
+        let push_lock = |id: blaze_manifest::lock::LockId, seen: &mut [bool], stack: &mut Vec<blaze_manifest::lock::LockId, &Frame>| {
+            if let Some(slot) = seen.get_mut(id.index())
+                && !*slot
+            {
+                *slot = true;
+                stack.push(id);
+            }
+        };
+        // Seed every checkout proc-macro crate (member or external path package) so its full
+        // `Cargo.lock` transitive closure (including dev-deps and registry hops) is pinned.
+        // Registry/git proc-macro roots are NOT known until `UnitGraph` resolves and are handled
+        // surgically by [`emit_proc_macro_lock_files`] so used runtime `[patch.*]` dependencies
+        // never pollute `units_source` (rule 60).
+        let mut proc_macro_dirs: blaze_own::BTreeSet<&'a str, &Frame> = blaze_own::BTreeSet::new_in(frame);
+        for pkg in units.members.iter().chain(units.path_packages.iter()) {
+            if pkg.lib.iter().any(|lib| lib.proc_macro) {
+                proc_macro_dirs.insert(pkg.dir.as_str());
+            }
+        }
+        for entry in checkout_dirs.iter() {
+            if proc_macro_dirs.contains(entry.dir.as_str()) {
+                push_lock(entry.id, &mut seen_lock, &mut lock_stack);
+            }
+        }
+        while let Some(id) = lock_stack.pop() {
+            if let Some(Some(dir)) = dir_of_lock.get(id.index()) {
+                whole_dirs.insert(dir);
+            }
+            if let Some(pkg) = lock.packages.get(id.index()) {
+                for &dep in pkg.deps.iter() {
+                    push_lock(dep, &mut seen_lock, &mut lock_stack);
+                }
+            }
+        }
+    }
+    let mut emitted_dirs: blaze_own::BTreeSet<&'a str, &Frame> = blaze_own::BTreeSet::new_in(frame);
+    for pkg in units.members.iter().chain(units.path_packages.iter()) {
+        let dir = pkg.dir.as_str();
+        if !emitted_dirs.insert(dir) {
+            continue;
+        }
+        if whole_dirs.contains(dir) {
+            crate::macro_files::read_row(cx, root, stamps, dir, rows, frame)?;
+        } else if let Some(build) = &pkg.build {
+            let rel = if dir.is_empty() {
+                build.root.as_str()
+            } else {
+                build.root.as_str().strip_prefix(dir).and_then(|s| s.strip_prefix('/')).unwrap_or(build.root.as_str())
+            };
+            crate::macro_files::read_script_files(cx, root, stamps, dir, rel, rows, frame)?;
+        }
+    }
+    Ok(())
+}
+
+/// Emit `LeafKind::MacroFiles` (plus `MacroFile` and `MacroFolder`) sweep rows for any checkout
+/// path package (`PathKind::Member` or `PathKind::External`) reachable in `lock` from the actual
+/// proc-macro crates in `proc_macros` (each `(package_name, version)`) that was not already
+/// emitted during [`lay`] (e.g. `[patch.*]` path dependencies reached by registry or git
+/// proc-macro crates such as `sqlx-macros` / `rasn-derive`).
+///
+/// Newly emitted rows are tagged with [`crate::sweep::POST_GRAPH_MACRO`] so they stay out of
+/// `units_source` and do not set `layout_moved` (preserving `Stood` graph read-back when a
+/// patched path dep under a registry/git proc-macro is edited, rule 60). Unrelated used runtime
+/// `[patch.*]` dependencies are never reached from any proc-macro root and stay out of both
+/// `rows` and `units_source`. Under a standing read-back (`standing_followed = Some`), each
+/// unchanged directory's rows are copied straight from `standing_followed` with zero filesystem
+/// I/O while any edited directory is re-read fresh (rules 74 & 77).
+///
+/// Returns `(subject, closure_digest)` sorted by proc-macro `subject` so each `Kind::MacroModule`
+/// task key covers ONLY its own proc-macro closure's path dependencies (rules 21 & 60).
+#[expect(clippy::too_many_arguments, reason = "post-graph sweep handles, resolved proc-macros, lock, checkout dirs and standing rows")]
+pub(crate) fn emit_proc_macro_lock_files<'a, 'f>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    stamps: &impl Stamps,
+    proc_macros: impl Iterator<Item = (&'a str, &'a str)>,
+    lock: &blaze_manifest::lock::Lock<'_>,
+    checkout_dirs: &[crate::graph::CheckoutDir],
+    standing_followed: Option<&crate::sweep::Followed<'_>>,
+    rows: &mut Rows<'_>,
+    frame: &'f Frame,
+) -> Result<Vec<(ContentId, ContentId), &'f Frame>, CliError> {
+    let pkg_count = lock.packages.len();
+    let mut dir_of_lock: Vec<Option<&str>, &Frame> = Vec::with_capacity_in(pkg_count, frame);
+    dir_of_lock.resize(pkg_count, None);
+    for entry in checkout_dirs.iter() {
+        if let Some(slot) = dir_of_lock.get_mut(entry.id.index()) {
+            *slot = Some(entry.dir.as_str());
+        }
+    }
+    let mut seen_gen: Vec<u32, &Frame> = Vec::with_capacity_in(pkg_count, frame);
+    seen_gen.resize(pkg_count, 0);
+    let mut epoch = 0u32;
+    let mut lock_stack: Vec<blaze_manifest::lock::LockId, &Frame> = Vec::new_in(frame);
+    let mut ver_buf = blaze_own::String::new_in(frame);
+    let mut seen_subjects: blaze_own::BTreeSet<ContentId, &Frame> = blaze_own::BTreeSet::new_in(frame);
+    let mut needed_dirs: blaze_own::BTreeSet<&str, &Frame> = blaze_own::BTreeSet::new_in(frame);
+    let mut per_macro: Vec<(ContentId, Vec<&str, &Frame>), &Frame> = Vec::new_in(frame);
+    for (pkg_name, pkg_version) in proc_macros {
+        let subject = crate::macros::subject_of(pkg_name, pkg_version);
+        if !seen_subjects.insert(subject) {
+            continue;
+        }
+        // Match `LockedPackages::closure_with`: first lock entry of `(pkg_name, pkg_version)`.
+        let found = lock.named(pkg_name).find(|&id| {
+            let Some(pkg) = lock.packages.get(id.index()) else { return false };
+            ver_buf.clear();
+            let _ = core::fmt::Write::write_fmt(&mut ver_buf, format_args!("{}", pkg.version));
+            ver_buf.as_str() == pkg_version
+        });
+        let mut closure_dirs: Vec<&str, &Frame> = Vec::new_in(frame);
+        if let Some(root_id) = found {
+            epoch = epoch.wrapping_add(1);
+            if epoch == 0 {
+                seen_gen.fill(0);
+                epoch = 1;
+            }
+            lock_stack.clear();
+            if let Some(slot) = seen_gen.get_mut(root_id.index()) {
+                *slot = epoch;
+                lock_stack.push(root_id);
+            }
+            while let Some(id) = lock_stack.pop() {
+                if let Some(Some(dir)) = dir_of_lock.get(id.index()) {
+                    closure_dirs.push(dir);
+                    needed_dirs.insert(dir);
+                }
+                if let Some(pkg) = lock.packages.get(id.index()) {
+                    for &dep in pkg.deps.iter() {
+                        if let Some(slot) = seen_gen.get_mut(dep.index())
+                            && *slot != epoch
+                        {
+                            *slot = epoch;
+                            lock_stack.push(dep);
+                        }
+                    }
+                }
+            }
+            closure_dirs.sort_unstable();
+            closure_dirs.dedup();
+        }
+        per_macro.push((subject, closure_dirs));
+    }
+    let mut missing_dirs: Vec<&str, &Frame> = Vec::new_in(frame);
+    for &dir in needed_dirs.iter() {
+        let already = rows.of(sweep::LeafKind::MacroFiles).any(|leaf| !leaf.absent() && rows.path(leaf) == dir);
+        if !already {
+            missing_dirs.push(dir);
+        }
+    }
+    for &dir in missing_dirs.iter() {
+        let copied = standing_followed.is_some_and(|followed| crate::macro_files::copy_standing_rows(followed, dir, rows, frame));
+        if !copied {
+            crate::macro_files::read_row_with_flags(cx, root, stamps, dir, sweep::POST_GRAPH_MACRO, rows, frame)?;
+        }
+    }
+    let present = crate::macro_files::present_macro_files(rows, frame);
+    let mut digests: Vec<(ContentId, ContentId), &'f Frame> = Vec::with_capacity_in(per_macro.len(), frame);
+    for (subject, closure_dirs) in per_macro.iter() {
+        digests.push((*subject, crate::macro_files::closure_digest(&present, closure_dirs)));
+    }
+    digests.sort_unstable_by_key(|(subject, _)| *subject);
+    Ok(digests)
 }
 
 /// Where a refusal is: the manifest's id and the span, when it names one.
@@ -1291,5 +1466,432 @@ version = \"0.1.0\"
         assert!(headline.as_str().contains("bstd"), "headline: {}", headline.as_str());
         assert!(label.as_str().contains("blaze-2026.11"), "label: {}", label.as_str());
         assert!(label.as_str().contains("[workspace.package]"), "label: {}", label.as_str());
+    }
+
+    /// Registry proc-macro crates (`sqlx-macros`, `rasn-derive`) reaching disjoint
+    /// `[patch.crates-io]` vendored `PathKind::External` packages (and their transitive path
+    /// dependencies) or patched workspace members in `Cargo.lock` get `LeafKind::MacroFiles`
+    /// sweep rows via [`emit_proc_macro_lock_files`] so `blaze_world::procs::identify` succeeds
+    /// cleanly instead of failing with `ClosureError::Unpinned`.
+    ///
+    /// Proves all four incremental invariants (rules 21, 26, 60):
+    /// 1. A **used runtime `[patch.crates-io]` dependency** reached only by a non-proc-macro
+    ///    registry crate (`tokio-rt -> vendor/patched-runtime`) gets NO `MacroFiles` row and
+    ///    editing it moves neither `units_source` nor any `MacroModule` task source.
+    /// 2. **Per-closure scoping**: editing `vendor/aws-lc-sys` (used only by `sqlx-macros`)
+    ///    changes `sqlx-macros`'s closure digest, `MacroModule` task source, and module key
+    ///    while leaving unrelated `rasn-derive`'s closure digest, `MacroModule` task source,
+    ///    and module key 100% unchanged.
+    /// 3. **Layout proof preservation**: post-graph `POST_GRAPH_MACRO` rows stay out of
+    ///    `units_source` and `layout_moved`, so editing `vendor/aws-lc-sys` keeps
+    ///    `!followed.layout_moved` and `Stood::of(&followed).is_some()` (graph read-back
+    ///    stands!), while still appearing in `changed_leaves` so the phase path updates the
+    ///    affected `MacroModule` task.
+    /// 4. **Zero-I/O standing reuse**: under `Stood`, `emit_proc_macro_lock_files` copies
+    ///    unchanged post-graph closures (`vendor/sqlx-postgres`, `vendor/rasn-derive-impl`) with
+    ///    zero disk reads while re-reading only the edited directory (`vendor/aws-lc-sys`).
+    #[test]
+    fn registry_proc_macro_patched_lock_deps_get_macro_files_and_identify_succeeds() {
+        const ROOT_TOML: &str = "\
+[workspace]
+members = [\"crates/app\", \"crates/unrelated\", \"crates/patched-member\"]
+exclude = [\"vendor/sqlx-postgres\", \"vendor/aws-lc-sys\", \"vendor/rasn-derive-impl\", \"vendor/patched-runtime\", \"vendor/unused\"]
+
+[patch.crates-io]
+sqlx-postgres = { path = \"vendor/sqlx-postgres\" }
+rasn-derive-impl = { path = \"vendor/rasn-derive-impl\" }
+patched-member = { path = \"crates/patched-member\" }
+patched-runtime = { path = \"vendor/patched-runtime\" }
+unused = { path = \"vendor/unused\" }
+";
+        const APP_TOML: &str = "\
+[package]
+name = \"app\"
+version = \"0.1.0\"
+edition = \"2024\"
+
+[dependencies]
+sqlx-macros = \"0.9.0\"
+rasn-derive = \"0.29.0\"
+tokio-rt = \"1.0.0\"
+unrelated = { path = \"../unrelated\" }
+";
+        const UNRELATED_TOML: &str = "[package]\nname = \"unrelated\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        const PATCHED_MEMBER_TOML: &str = "[package]\nname = \"patched-member\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        const SQLX_PG_TOML: &str = "\
+[package]
+name = \"sqlx-postgres\"
+version = \"0.9.0\"
+edition = \"2021\"
+
+[dependencies]
+aws-lc-sys = { path = \"../aws-lc-sys\" }
+";
+        const AWS_LC_TOML: &str = "[package]\nname = \"aws-lc-sys\"\nversion = \"0.30.0\"\nedition = \"2021\"\n";
+        const RASN_IMPL_TOML: &str = "[package]\nname = \"rasn-derive-impl\"\nversion = \"0.29.0\"\nedition = \"2021\"\n";
+        const PATCHED_RT_TOML: &str = "[package]\nname = \"patched-runtime\"\nversion = \"1.0.0\"\nedition = \"2021\"\n";
+        const UNUSED_TOML: &str = "[package]\nname = \"unused\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+        const LOCK_TOML: &str = "\
+version = 4
+
+[[package]]
+name = \"app\"
+version = \"0.1.0\"
+dependencies = [\"rasn-derive\", \"sqlx-macros\", \"tokio-rt\", \"unrelated\"]
+
+[[package]]
+name = \"unrelated\"
+version = \"0.1.0\"
+
+[[package]]
+name = \"tokio-rt\"
+version = \"1.0.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"3333333333333333333333333333333333333333333333333333333333333333\"
+dependencies = [\"patched-runtime\"]
+
+[[package]]
+name = \"patched-runtime\"
+version = \"1.0.0\"
+
+[[package]]
+name = \"sqlx-macros\"
+version = \"0.9.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"1111111111111111111111111111111111111111111111111111111111111111\"
+dependencies = [\"sqlx-core\"]
+
+[[package]]
+name = \"sqlx-core\"
+version = \"0.9.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"2222222222222222222222222222222222222222222222222222222222222222\"
+dependencies = [\"sqlx-postgres\", \"patched-member\"]
+
+[[package]]
+name = \"sqlx-postgres\"
+version = \"0.9.0\"
+dependencies = [\"aws-lc-sys\"]
+
+[[package]]
+name = \"aws-lc-sys\"
+version = \"0.30.0\"
+
+[[package]]
+name = \"patched-member\"
+version = \"0.1.0\"
+
+[[package]]
+name = \"rasn-derive\"
+version = \"0.29.0\"
+source = \"registry+https://github.com/rust-lang/crates.io-index\"
+checksum = \"4444444444444444444444444444444444444444444444444444444444444444\"
+dependencies = [\"rasn-derive-impl\"]
+
+[[package]]
+name = \"rasn-derive-impl\"
+version = \"0.29.0\"
+";
+        let make_unit = |lock: &blaze_manifest::lock::Lock<'_>, name: &str, version: &str, crate_name: &str, heap: &'static blaze_own::Heap| {
+            let pkg_id = lock.named(name).next().expect("proc-macro in lock");
+            blaze_unit_graph::Unit {
+                package: pkg_id,
+                name: blaze_unit_graph::Text::from_str_in(name, heap.alloc()),
+                version: blaze_unit_graph::Text::from_str_in(version, heap.alloc()),
+                kind: UnitKind::ProcMacro,
+                for_host: true,
+                edition: edition::PackageEdition::DEFAULT,
+                crate_name: blaze_unit_graph::Text::from_str_in(crate_name, heap.alloc()),
+                root: blaze_unit_graph::Text::from_str_in("src/lib.rs", heap.alloc()),
+                features: blaze_own::Vec::new_in(heap.alloc()),
+                cfg: blaze_own::Vec::new_in(heap.alloc()),
+                deps: blaze_own::Vec::new_in(heap.alloc()),
+                build_script: None,
+                links: None,
+            }
+        };
+        let digest_of = |digests: &[(ContentId, ContentId)], subject: ContentId| -> ContentId {
+            digests
+                .binary_search_by_key(&subject, |(s, _)| *s)
+                .ok()
+                .map(|at| digests[at].1)
+                .expect("closure digest for proc-macro subject")
+        };
+        let run_once = |aws_lc_src: &str, runtime_patch_src: &str| {
+            let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
+            let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+            let frame = cx.frame();
+            let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
+            let put = |path: &str, text: &str| {
+                root.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(text.as_bytes()), Durable::No).expect("write");
+            };
+            put("Cargo.toml", ROOT_TOML);
+            put("Cargo.lock", LOCK_TOML);
+            put("crates/app/Cargo.toml", APP_TOML);
+            put("crates/app/src/lib.rs", "pub fn app() {}");
+            put("crates/unrelated/Cargo.toml", UNRELATED_TOML);
+            put("crates/unrelated/src/lib.rs", "pub fn unrelated() {}");
+            put("crates/patched-member/Cargo.toml", PATCHED_MEMBER_TOML);
+            put("crates/patched-member/src/lib.rs", "pub fn pm() {}");
+            put("vendor/sqlx-postgres/Cargo.toml", SQLX_PG_TOML);
+            put("vendor/sqlx-postgres/src/lib.rs", "pub fn pg() {}");
+            put("vendor/aws-lc-sys/Cargo.toml", AWS_LC_TOML);
+            put("vendor/aws-lc-sys/src/lib.rs", aws_lc_src);
+            put("vendor/rasn-derive-impl/Cargo.toml", RASN_IMPL_TOML);
+            put("vendor/rasn-derive-impl/src/lib.rs", "pub fn rasn() {}");
+            put("vendor/patched-runtime/Cargo.toml", PATCHED_RT_TOML);
+            put("vendor/patched-runtime/src/lib.rs", runtime_patch_src);
+            put("vendor/unused/Cargo.toml", UNUSED_TOML);
+            put("vendor/unused/src/lib.rs", "");
+            let erased = blaze_own::Erased::new(frame);
+            let mut rows = Rows::new_in(frame);
+            let heap = blaze_own::testing::heap();
+            let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), heap, frame, erased.handle()).expect("laid");
+            assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
+            let units_source = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
+            assert!(
+                rows.of(sweep::LeafKind::MacroFiles).next().is_none(),
+                "lay() must not eagerly sweep non-member registry/runtime patches into units_source (rule 60)"
+            );
+            let lock = laid.lock.as_ref().expect("lock").lock;
+            let parts = laid.parts.as_ref().expect("parts");
+            let proc_macros = [("sqlx-macros", "0.9.0"), ("rasn-derive", "0.29.0")];
+            let digests = emit_proc_macro_lock_files(
+                &cx, &root, &FromMeta { swept_at_ns: 0 }, proc_macros.into_iter(), lock, parts.member_dirs(), None, &mut rows, frame,
+            )
+            .expect("emit proc-macro lock files");
+            // Post-graph rows must NOT change `units_source` even if recomputed over `rows`.
+            let units_source_after = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
+            assert_eq!(units_source, units_source_after, "POST_GRAPH_MACRO rows must stay excluded from units_source");
+            let macro_dirs: std::vec::Vec<std::string::String> = rows
+                .of(sweep::LeafKind::MacroFiles)
+                .filter(|leaf| !leaf.absent())
+                .map(|leaf| rows.path(leaf).to_owned())
+                .collect();
+            let place = crate::macros::Place { home: None, checkout: "", members: Some(parts.member_dirs()), rows: &rows };
+            let locked = blaze_proc_macro::module::LockedPackages::of(lock);
+            let empty_git = std::collections::BTreeMap::new();
+            let sqlx_unit = make_unit(lock, "sqlx-macros", "0.9.0", "sqlx_macros", heap);
+            let rasn_unit = make_unit(lock, "rasn-derive", "0.29.0", "rasn_derive", heap);
+            let sqlx_key = blaze_world::procs::identify(lock, &locked, &empty_git, &sqlx_unit, |id| Ok(place.member_files(id)))
+                .expect("identify sqlx io")
+                .expect("sqlx-macros must identify cleanly instead of ClosureError::Unpinned")
+                .with_id(blaze_proc_macro::module::module_key);
+            let rasn_key = blaze_world::procs::identify(lock, &locked, &empty_git, &rasn_unit, |id| Ok(place.member_files(id)))
+                .expect("identify rasn io")
+                .expect("rasn-derive must identify cleanly instead of ClosureError::Unpinned")
+                .with_id(blaze_proc_macro::module::module_key);
+            let sqlx_sub = crate::macros::subject(&sqlx_unit);
+            let rasn_sub = crate::macros::subject(&rasn_unit);
+            let sqlx_digest = digest_of(&digests, sqlx_sub);
+            let rasn_digest = digest_of(&digests, rasn_sub);
+            let sqlx_part = crate::macros::part_source_with_files(units_source, sqlx_digest, sqlx_sub);
+            let rasn_part = crate::macros::part_source_with_files(units_source, rasn_digest, rasn_sub);
+            (units_source, (sqlx_digest, sqlx_part, sqlx_key), (rasn_digest, rasn_part, rasn_key), macro_dirs)
+        };
+        let (u_a, (sd_a, sp_a, sk_a), (rd_a, rp_a, rk_a), macro_dirs) = run_once("pub fn v1() {}", "pub fn rt_v1() {}");
+        let unique: std::collections::BTreeSet<&str> = macro_dirs.iter().map(std::string::String::as_str).collect();
+        assert_eq!(unique.len(), macro_dirs.len(), "no duplicate MacroFiles rows: {macro_dirs:?}");
+        assert!(unique.contains("vendor/sqlx-postgres"), "direct patched dep under sqlx-macros must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.contains("vendor/aws-lc-sys"), "transitive vendored path dep under sqlx-macros must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.contains("crates/patched-member"), "patched workspace member under sqlx-macros must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.contains("vendor/rasn-derive-impl"), "patched dep under rasn-derive must have MacroFiles: {macro_dirs:?}");
+        assert!(!unique.contains("vendor/patched-runtime"), "used runtime [patch.crates-io] dep must NOT get MacroFiles (rule 60): {macro_dirs:?}");
+        assert!(!unique.contains("crates/app"), "regular app member must not be eagerly swept (rule 60): {macro_dirs:?}");
+        assert!(!unique.contains("crates/unrelated"), "unrelated workspace member must not be eagerly swept (rule 60): {macro_dirs:?}");
+        assert!(!unique.contains("vendor/unused"), "unused patch must not be eagerly swept (rule 60): {macro_dirs:?}");
+        // Editing the used runtime patch leaves units_source and BOTH proc-macros untouched (rule 60).
+        let (u_rt, (sd_rt, sp_rt, sk_rt), (rd_rt, rp_rt, rk_rt), _) = run_once("pub fn v1() {}", "pub fn rt_v2_edited() {}");
+        assert_eq!(u_a, u_rt, "editing used runtime patch must NOT invalidate units_source (rule 60)");
+        assert_eq!((sd_a, sp_a, sk_a.as_str()), (sd_rt, sp_rt, sk_rt.as_str()), "editing used runtime patch must NOT move sqlx-macros");
+        assert_eq!((rd_a, rp_a, rk_a.as_str()), (rd_rt, rp_rt, rk_rt.as_str()), "editing used runtime patch must NOT move rasn-derive");
+        // Per-closure scoping: editing vendor/aws-lc-sys moves ONLY sqlx-macros, NOT rasn-derive!
+        let (u_b, (sd_b, sp_b, sk_b), (rd_b, rp_b, rk_b), _) = run_once("pub fn v2() {}", "pub fn rt_v1() {}");
+        assert_eq!(u_a, u_b, "registry proc-macro patch dep stays out of units_source");
+        assert_ne!(sd_a, sd_b, "editing aws-lc-sys must move sqlx-macros closure digest (rule 21)");
+        assert_ne!(sp_a, sp_b, "editing aws-lc-sys must invalidate sqlx-macros MacroModule task source (rule 21)");
+        assert_ne!(sk_a, sk_b, "editing aws-lc-sys must move sqlx-macros module key (rule 21)");
+        assert_eq!(rd_a, rd_b, "editing aws-lc-sys must NOT change unrelated rasn-derive closure digest (rule 60)");
+        assert_eq!(rp_a, rp_b, "editing aws-lc-sys must NOT invalidate unrelated rasn-derive MacroModule task source (rule 60)");
+        assert_eq!(rk_a, rk_b, "editing aws-lc-sys must NOT change unrelated rasn-derive module key");
+
+        // Sweep & layout-proof test: editing vendor/aws-lc-sys preserves `Stood` graph read-back
+        // (`!followed.layout_moved`) while still waking phases via `changed_leaves`, copying
+        // unchanged `rasn-derive-impl` / `sqlx-postgres` with 0 extra disk reads and re-reading
+        // only `vendor/aws-lc-sys`!
+        let io = Io::simulated(SimWorld::new(2, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let frame = cx.frame();
+        let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
+        let put = |path: &str, text: &str| {
+            root.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(text.as_bytes()), Durable::No).expect("write");
+        };
+        put("Cargo.toml", ROOT_TOML);
+        put("Cargo.lock", LOCK_TOML);
+        put("crates/app/Cargo.toml", APP_TOML);
+        put("crates/app/src/lib.rs", "pub fn app() {}");
+        put("crates/unrelated/Cargo.toml", UNRELATED_TOML);
+        put("crates/unrelated/src/lib.rs", "pub fn unrelated() {}");
+        put("crates/patched-member/Cargo.toml", PATCHED_MEMBER_TOML);
+        put("crates/patched-member/src/lib.rs", "pub fn pm() {}");
+        put("vendor/sqlx-postgres/Cargo.toml", SQLX_PG_TOML);
+        put("vendor/sqlx-postgres/src/lib.rs", "pub fn pg() {}");
+        put("vendor/aws-lc-sys/Cargo.toml", AWS_LC_TOML);
+        put("vendor/aws-lc-sys/src/lib.rs", "pub fn v1() {}");
+        put("vendor/rasn-derive-impl/Cargo.toml", RASN_IMPL_TOML);
+        put("vendor/rasn-derive-impl/src/lib.rs", "pub fn rasn() {}");
+        put("vendor/patched-runtime/Cargo.toml", PATCHED_RT_TOML);
+        put("vendor/patched-runtime/src/lib.rs", "pub fn rt_v1() {}");
+        put("vendor/unused/Cargo.toml", UNUSED_TOML);
+        put("vendor/unused/src/lib.rs", "");
+        let erased = blaze_own::Erased::new(frame);
+        let heap = blaze_own::testing::heap();
+        let mut rows1 = Rows::new_in(frame);
+        let laid1 = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows1, blaze_toolchain::ToolchainId([0; 32]), heap, frame, erased.handle()).expect("laid1");
+        let lock1 = laid1.lock.as_ref().expect("lock1").lock;
+        let parts1 = laid1.parts.as_ref().expect("parts1");
+        let proc_macros = [("sqlx-macros", "0.9.0"), ("rasn-derive", "0.29.0")];
+        let digests1 = emit_proc_macro_lock_files(
+            &cx, &root, &FromMeta { swept_at_ns: 0 }, proc_macros.into_iter(), lock1, parts1.member_dirs(), None, &mut rows1, frame,
+        )
+        .expect("emit1");
+        let table = sweep::Leaves::bytes_in(&rows1, frame).expect("leaf table").to_vec();
+        // Edit ONLY vendor/aws-lc-sys/src/lib.rs, then follow the saved leaf table.
+        put("vendor/aws-lc-sys/src/lib.rs", "pub fn v2_edited_in_place() {}");
+        let (last_leaves, older) = sweep::Leaves::of(&table).expect("parse leaves");
+        assert!(older.is_none());
+        let followed = sweep::Follow { stamps: FromMeta { swept_at_ns: 1_000_000_000 }, plant: sweep::Plant::None }
+            .follow(&cx, &root, None, &last_leaves, frame)
+            .expect("follow");
+        assert!(
+            !followed.layout_moved,
+            "editing a post-graph registry proc-macro path dep must NOT set layout_moved (rule 60)"
+        );
+        assert!(
+            crate::engine_units::Stood::of(&followed).is_some(),
+            "editing a post-graph registry proc-macro path dep must preserve Stood graph read-back (rule 60)"
+        );
+        let changed = crate::engine_ready_edit::changed_leaves(&followed, heap.shared());
+        assert!(
+            changed.iter().any(|one| matches!(one.kind, sweep::LeafKind::MacroFiles | sweep::LeafKind::MacroFile)),
+            "edited post-graph macro dep must still appear in changed_leaves to wake MacroModule: {changed:?}"
+        );
+        // Under Stood read-back, emit_proc_macro_lock_files reuses unchanged dirs from `followed`
+        // and re-reads edited `vendor/aws-lc-sys`, updating ONLY `sqlx-macros`.
+        let mut rows2 = Rows::new_in(frame);
+        let digests2 = emit_proc_macro_lock_files(
+            &cx, &root, &FromMeta { swept_at_ns: 1_000_000_000 }, proc_macros.into_iter(), lock1, parts1.member_dirs(), Some(&followed), &mut rows2, frame,
+        )
+        .expect("emit2 under Stood");
+        let sqlx_sub = crate::macros::subject_of("sqlx-macros", "0.9.0");
+        let rasn_sub = crate::macros::subject_of("rasn-derive", "0.29.0");
+        assert_ne!(digest_of(&digests1, sqlx_sub), digest_of(&digests2, sqlx_sub), "edited aws-lc-sys must refresh sqlx-macros under Stood");
+        assert_eq!(digest_of(&digests1, rasn_sub), digest_of(&digests2, rasn_sub), "unchanged rasn-derive must stand under Stood");
+        assert!(
+            rows2.of(sweep::LeafKind::MacroFiles).all(|leaf| leaf.post_graph_macro()),
+            "copied and re-read post-graph rows must retain POST_GRAPH_MACRO flag"
+        );
+    }
+
+    /// A workspace member proc-macro crate (`unibind`) reaching another workspace member through
+    /// a `[dev-dependencies]` edge in `Cargo.lock` (`unibind` -> `unibind-backend` ->
+    /// `unibind-test-support`) emits `LeafKind::MacroFiles` rows for its full lock closure so
+    /// `blaze_world::procs::identify` succeeds cleanly instead of failing with
+    /// `ClosureError::Unpinned`, while an unrelated non-proc-macro workspace member stays unswept
+    /// (rule 60).
+    #[test]
+    fn member_proc_macro_lock_dev_dep_closure_gets_macro_files_and_identify_succeeds() {
+        const ROOT_TOML: &str = "\
+[workspace]
+members = [\"crates/unibind\", \"crates/unibind-backend\", \"crates/unibind-test-support\", \"crates/unrelated\"]
+";
+        const UNIBIND_TOML: &str = "\
+[package]
+name = \"unibind\"
+version = \"0.1.0\"
+edition = \"2024\"
+
+[lib]
+proc-macro = true
+
+[dev-dependencies]
+unibind-backend = { path = \"../unibind-backend\" }
+";
+        const BACKEND_TOML: &str = "\
+[package]
+name = \"unibind-backend\"
+version = \"0.1.0\"
+edition = \"2024\"
+
+[dependencies]
+unibind-test-support = { path = \"../unibind-test-support\" }
+";
+        const SUPPORT_TOML: &str = "[package]\nname = \"unibind-test-support\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        const UNRELATED_TOML: &str = "[package]\nname = \"unrelated\"\nversion = \"0.1.0\"\nedition = \"2024\"\n";
+        let run_once = |support_src: &str| {
+            let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
+            let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+            let frame = cx.frame();
+            let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("data").expect("a path")).expect("open");
+            let put = |path: &str, text: &str| {
+                root.publish(&cx, &Path::new(path).expect("a path"), Content::bytes(text.as_bytes()), Durable::No).expect("write");
+            };
+            put("Cargo.toml", ROOT_TOML);
+            put("crates/unibind/Cargo.toml", UNIBIND_TOML);
+            put("crates/unibind/src/lib.rs", "");
+            put("crates/unibind-backend/Cargo.toml", BACKEND_TOML);
+            put("crates/unibind-backend/src/lib.rs", "");
+            put("crates/unibind-test-support/Cargo.toml", SUPPORT_TOML);
+            put("crates/unibind-test-support/src/lib.rs", support_src);
+            put("crates/unrelated/Cargo.toml", UNRELATED_TOML);
+            put("crates/unrelated/src/lib.rs", "");
+            let erased = blaze_own::Erased::new(frame);
+            let mut rows = Rows::new_in(frame);
+            let heap = blaze_own::testing::heap();
+            let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), heap, frame, erased.handle()).expect("laid");
+            assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
+            let source = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
+            let macro_dirs: std::vec::Vec<std::string::String> = rows
+                .of(sweep::LeafKind::MacroFiles)
+                .filter(|leaf| !leaf.absent())
+                .map(|leaf| rows.path(leaf).to_owned())
+                .collect();
+            let lock = laid.lock.as_ref().expect("members lock").lock;
+            let parts = laid.parts.as_ref().expect("parts");
+            let place = crate::macros::Place { home: None, checkout: "", members: Some(parts.member_dirs()), rows: &rows };
+            let locked = blaze_proc_macro::module::LockedPackages::of(lock);
+            let pkg_id = lock.named("unibind").next().expect("unibind in lock");
+            let unit = blaze_unit_graph::Unit {
+                package: pkg_id,
+                name: blaze_unit_graph::Text::from_str_in("unibind", heap.alloc()),
+                version: blaze_unit_graph::Text::from_str_in("0.1.0", heap.alloc()),
+                kind: UnitKind::ProcMacro,
+                for_host: true,
+                edition: edition::PackageEdition::DEFAULT,
+                crate_name: blaze_unit_graph::Text::from_str_in("unibind", heap.alloc()),
+                root: blaze_unit_graph::Text::from_str_in("src/lib.rs", heap.alloc()),
+                features: blaze_own::Vec::new_in(heap.alloc()),
+                cfg: blaze_own::Vec::new_in(heap.alloc()),
+                deps: blaze_own::Vec::new_in(heap.alloc()),
+                build_script: None,
+                links: None,
+            };
+            let empty_git = std::collections::BTreeMap::new();
+            let identity = blaze_world::procs::identify(lock, &locked, &empty_git, &unit, |id| Ok(place.member_files(id)))
+                .expect("identify io")
+                .expect("unibind must identify cleanly across dev-dep lock closure");
+            let key = identity.with_id(blaze_proc_macro::module::module_key);
+            (source, macro_dirs, key)
+        };
+        let (src_a, macro_dirs, key_a) = run_once("pub fn s1() {}");
+        let unique: std::collections::BTreeSet<&str> = macro_dirs.iter().map(std::string::String::as_str).collect();
+        assert_eq!(unique.len(), macro_dirs.len(), "no duplicate MacroFiles rows: {macro_dirs:?}");
+        assert!(unique.contains("crates/unibind"), "member proc-macro must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.contains("crates/unibind-backend"), "dev-dep member must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.contains("crates/unibind-test-support"), "transitive dev-dep member must have MacroFiles: {macro_dirs:?}");
+        assert!(!unique.contains("crates/unrelated"), "unrelated workspace member must not be eagerly swept (rule 60): {macro_dirs:?}");
+        let (src_b, _, key_b) = run_once("pub fn s2() {}");
+        assert_ne!(src_a, src_b, "editing transitive dev-dep member must move units_source (rule 21)");
+        assert_ne!(key_a, key_b, "editing transitive dev-dep member must move proc-macro module key (rule 21)");
     }
 }
