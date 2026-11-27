@@ -276,7 +276,7 @@ fn clone_rows<C: CloneColumns, A: Allocator, B: Allocator>(src: &Soa<C, A>, out:
             // SAFETY: column `field` of `src` holds `len` values; `out`'s has room for them and
             // is empty, in another block. Each field's clone is its bitwise copy
             // (`TrivialClone`, which `trivial` says of every field).
-            unsafe { ptr::copy_nonoverlapping(src.cols.starts[field], out.cols.starts[field], info.size * src.len) };
+            unsafe { ptr::copy_nonoverlapping(src.col_start(field), out.col_start(field), info.size * src.len) };
         }
         out.len = src.len;
     } else {
@@ -459,18 +459,29 @@ tuple_columns!(0 T0, 1 T1, 2 T2, 3 T3, 4 T4, 5 T5, 6 T6, 7 T7, 8 T8, 9 T9, 10 T1
 /// # Invariants
 ///
 /// `base` is a block of `alloc` for `Soa::layout(cap)` when `cap != 0` and rows are not sized
-/// 0, else dangling aligned to `C::ALIGN`; `cols` are the columns' starts in it for `cap`; rows
-/// `0..len` of every column hold values; `len <= cap`; `cap` is `usize::MAX` when rows are
-/// sized 0.
+/// 0, else dangling aligned to `C::ALIGN`; column `field` starts at
+/// `base + C::PREFIX[field] * cap`; rows `0..len` of every column hold values; `len <= cap`;
+/// `cap` is `usize::MAX` when rows are sized 0.
 pub struct Soa<C: Columns, A: Allocator> {
     base: NonNull<u8>,
-    cols: Cols,
     len: usize,
     cap: usize,
     alloc: A,
     /// Owns `C`s, for drop check and for `Send`/`Sync`.
     _owns: PhantomData<C>,
 }
+
+#[cfg(all(target_pointer_width = "64", any(test, feature = "std")))]
+const _: () = {
+    assert!(core::mem::size_of::<Soa<(u32, u64), std::alloc::Global>>() == 24);
+    assert!(core::mem::size_of::<Option<Soa<(u32, u64), std::alloc::Global>>>() == 24);
+};
+
+#[cfg(target_pointer_width = "64")]
+const _: () = {
+    assert!(core::mem::size_of::<Soa<(u32, u64), crate::Alloc<'_>>>() == 32);
+    assert!(core::mem::size_of::<Option<Soa<(u32, u64), crate::Alloc<'_>>>>() == 32);
+};
 
 // SAFETY: as `Vec<C, A>`'s: the vector owns its rows and its block, nothing shared.
 unsafe impl<C: Columns + Send, A: Allocator + Send> Send for Soa<C, A> {}
@@ -489,21 +500,36 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         Layout::from_size_align(size, C::ALIGN).ok()
     }
 
+    #[inline(always)]
+    fn col_start_in(base: NonNull<u8>, cap: usize, field: usize) -> *mut u8 {
+        // A row of fields sized 0 has every prefix 0, so its capacity of `usize::MAX` multiplies
+        // to 0; otherwise `prefix * cap <= row_size * cap`, the block's size.
+        base.as_ptr().wrapping_add(C::PREFIX[field].wrapping_mul(cap))
+    }
+
+    #[inline(always)]
+    fn col_start(&self, field: usize) -> *mut u8 {
+        Soa::<C, A>::col_start_in(self.base, self.cap, field)
+    }
+
+    #[inline(always)]
     fn starts(base: NonNull<u8>, cap: usize) -> Cols {
         let mut starts = [ptr::null_mut(); MOST_FIELDS];
         for (field, start) in starts.iter_mut().enumerate().take(C::FIELDS.len()) {
-            // A row of fields sized 0 has every prefix 0, so its capacity of `usize::MAX`
-            // multiplies to 0; otherwise `prefix * cap <= row_size * cap`, the block's size.
-            let offset = C::PREFIX[field].wrapping_mul(cap);
-            *start = base.as_ptr().wrapping_add(offset);
+            *start = Soa::<C, A>::col_start_in(base, cap, field);
         }
         Cols { starts }
+    }
+
+    #[inline(always)]
+    fn cols(&self) -> Cols {
+        Soa::<C, A>::starts(self.base, self.cap)
     }
 
     pub fn new_in(alloc: A) -> Soa<C, A> {
         let base = Soa::<C, A>::dangling();
         let cap = if C::ROW_SIZE == 0 { usize::MAX } else { 0 };
-        Soa { base, cols: Soa::<C, A>::starts(base, cap), len: 0, cap, alloc, _owns: PhantomData }
+        Soa { base, len: 0, cap, alloc, _owns: PhantomData }
     }
 
     pub fn with_capacity_in(capacity: usize, alloc: A) -> Soa<C, A> {
@@ -564,7 +590,6 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         let layout = Soa::<C, A>::layout(new_cap).ok_or(overflow)?;
         let block = self.alloc.allocate(layout).map_err(|_| AllocFailure::Refused { what, layout })?;
         let base = block.cast::<u8>();
-        let cols = Soa::<C, A>::starts(base, new_cap);
         for (field, info) in C::FIELDS.iter().enumerate() {
             #[cfg(test)]
             if plant::on(Plant::SoaGrowSkipsColumn) && field + 1 == C::FIELDS.len() {
@@ -573,7 +598,13 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
             // SAFETY: the old column holds `len` values of `info.size` bytes; the new one has
             // room for `new_cap >= len`; distinct blocks. The bytes move: the old block is freed
             // below without a drop.
-            unsafe { ptr::copy_nonoverlapping(self.cols.starts[field], cols.starts[field], info.size * self.len) };
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    self.col_start(field),
+                    Soa::<C, A>::col_start_in(base, new_cap, field),
+                    info.size * self.len,
+                )
+            };
         }
         if self.cap != 0 {
             let Some(old) = Soa::<C, A>::layout(self.cap) else { unreachable!("the block was made with it") };
@@ -581,21 +612,22 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
             unsafe { self.alloc.deallocate(self.base, old) };
         }
         self.base = base;
-        self.cols = cols;
         self.cap = new_cap;
         Ok(())
     }
 
+    #[blaze::cost(amortized O(1))]
     pub fn push(&mut self, row: C) {
         if self.len == self.cap {
             self.reserve(1);
         }
         // SAFETY: `len < cap`: row `len` of every column is in the block and empty.
-        unsafe { row.write(self.cols, self.len) };
+        unsafe { row.write(self.cols(), self.len) };
         self.len += 1;
     }
 
     /// [`Soa::push`], or the row back with the [`AllocFailure`].
+    #[blaze::cost(amortized O(1))]
     pub fn try_push(&mut self, row: C) -> Result<(), Refused<C>> {
         if self.len == self.cap
             && let Err(why) = self.try_reserve(1)
@@ -603,34 +635,37 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
             return Err(Refused { value: row, why });
         }
         // SAFETY: as `push`.
-        unsafe { row.write(self.cols, self.len) };
+        unsafe { row.write(self.cols(), self.len) };
         self.len += 1;
         Ok(())
     }
 
+    #[blaze::cost(O(1))]
     pub fn pop(&mut self) -> Option<C> {
         if self.len == 0 {
             return None;
         }
         self.len -= 1;
         // SAFETY: the last row held values the length no longer counts.
-        Some(unsafe { C::read(self.cols, self.len) })
+        Some(unsafe { C::read(self.cols(), self.len) })
     }
 
+    #[blaze::cost(O(1))]
     pub fn get(&self, row: usize) -> Option<C::Ref<'_>> {
         if row >= self.len {
             return None;
         }
         // SAFETY: `row < len` holds values; `&self` keeps them unwritten.
-        Some(unsafe { C::get(self.cols, row) })
+        Some(unsafe { C::get(self.cols(), row) })
     }
 
+    #[blaze::cost(O(1))]
     pub fn get_mut(&mut self, row: usize) -> Option<C::Mut<'_>> {
         if row >= self.len {
             return None;
         }
         // SAFETY: as `get`, `&mut self` the only access.
-        Some(unsafe { C::get_mut(self.cols, row) })
+        Some(unsafe { C::get_mut(self.cols(), row) })
     }
 
     /// Puts `new` at `row` and gives the row that was there.
@@ -639,11 +674,12 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         if row >= self.len {
             out_of_bounds("Soa::replace", row, self.len);
         }
+        let cols = self.cols();
         // SAFETY: `row < len` holds values: read out, then the emptied slots written, nothing
         // that can panic between.
         unsafe {
-            let old = C::read(self.cols, row);
-            new.write(self.cols, row);
+            let old = C::read(cols, row);
+            new.write(cols, row);
             old
         }
     }
@@ -661,12 +697,13 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
             out_of_bounds("Soa::remove_swap", row, self.len);
         }
         let last = self.len - 1;
+        let cols = self.cols();
         // SAFETY: `row` and `last` hold values. `row` is read out; when they differ, the last
         // row moves into the emptied slots; the length then stops counting `last`.
         unsafe {
-            let taken = C::read(self.cols, row);
+            let taken = C::read(cols, row);
             if row != last {
-                C::read(self.cols, last).write(self.cols, row);
+                C::read(cols, last).write(cols, row);
             }
             self.len = last;
             taken
@@ -682,7 +719,7 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         // The length goes first: a panicking drop leaves only rows not cut.
         self.len = len;
         // SAFETY: rows `len..old` held values the length no longer counts.
-        unsafe { C::drop_rows(self.cols, len, old) };
+        unsafe { C::drop_rows(self.cols(), len, old) };
     }
 
     pub fn clear(&mut self) {
@@ -698,11 +735,12 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         if self.len == self.cap {
             self.reserve(1);
         }
+        let cols = self.cols();
         // SAFETY: `len < cap`: rows `row..len` move to `row + 1..len + 1`, in the capacity; row
         // `row` is then empty and written.
         unsafe {
-            shift::<C>(self.cols, row, row + 1, self.len - row);
-            new.write(self.cols, row);
+            shift::<C>(cols, row, row + 1, self.len - row);
+            new.write(cols, row);
         }
         self.len += 1;
     }
@@ -713,11 +751,12 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         if row >= self.len {
             out_of_bounds("Soa::remove_shift", row, self.len);
         }
+        let cols = self.cols();
         // SAFETY: row `row` holds values, read out once; rows `row + 1..len` then move into its
         // place and the length stops counting the last.
         unsafe {
-            let taken = C::read(self.cols, row);
-            shift::<C>(self.cols, row + 1, row, self.len - row - 1);
+            let taken = C::read(cols, row);
+            shift::<C>(cols, row + 1, row, self.len - row - 1);
             self.len -= 1;
             taken
         }
@@ -738,7 +777,7 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         if kept.iter().all(|&k| k) {
             return;
         }
-        let cols = self.cols;
+        let cols = self.cols();
         // Nothing counts as in the vector while it is compacted; the guard sets the length.
         self.len = 0;
         let compact = Compact::<C> { len: &mut self.len, cols, read: 0, write: 0, total: len, _rows: PhantomData };
@@ -769,7 +808,7 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
     {
         // SAFETY: column `I` holds `len` values of its type from its start, aligned (the
         // layout); `&self` keeps them unwritten.
-        unsafe { slice::from_raw_parts(self.cols.starts[I].cast::<<C as ColumnAt<I>>::T>(), self.len) }
+        unsafe { slice::from_raw_parts(self.col_start(I).cast::<<C as ColumnAt<I>>::T>(), self.len) }
     }
 
     pub fn column_mut<const I: usize>(&mut self) -> &mut [<C as ColumnAt<I>>::T]
@@ -777,12 +816,12 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         C: ColumnAt<I>,
     {
         // SAFETY: as `column`, `&mut self` the only access.
-        unsafe { slice::from_raw_parts_mut(self.cols.starts[I].cast::<<C as ColumnAt<I>>::T>(), self.len) }
+        unsafe { slice::from_raw_parts_mut(self.col_start(I).cast::<<C as ColumnAt<I>>::T>(), self.len) }
     }
 
     /// The rows by reference, in order.
     pub fn iter(&self) -> Iter<'_, C> {
-        Iter { cols: self.cols, at: 0, end: self.len, _rows: PhantomData }
+        Iter { cols: self.cols(), at: 0, end: self.len, _rows: PhantomData }
     }
 
     /// Sorts the rows by `key(self, row)`, stable, moving every column once by one permutation.
@@ -825,7 +864,7 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         // SAFETY: `order` is a permutation of `0..len` (each row once, sorted), rows `0..len`
         // hold values, and the scratch is sized and aligned as `permute` asks. The writes go
         // through the block's pointers, no reference to a row being alive.
-        unsafe { C::permute(this.cols, &order, scratch.as_ptr()) };
+        unsafe { C::permute(this.cols(), &order, scratch.as_ptr()) };
     }
 }
 
@@ -833,7 +872,7 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
 // nothing else of them.
 unsafe impl<#[may_dangle] C: Columns, A: Allocator> Drop for Soa<C, A> {
     fn drop(&mut self) {
-        let (base, cap, len, cols) = (self.base, self.cap, self.len, self.cols);
+        let (base, cap, len, cols) = (self.base, self.cap, self.len, self.cols());
         // The block is freed after the rows, a panicking drop among the ways.
         let _free = DropGuard::new(&self.alloc, move |alloc: &A| {
             if C::ROW_SIZE != 0 && cap != 0 {
