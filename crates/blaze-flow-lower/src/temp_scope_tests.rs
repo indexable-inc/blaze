@@ -32,7 +32,7 @@ use std::string::String;
 use std::vec;
 
 use blaze_typeck::fixture::{Bb, Fx};
-use blaze_typeck::{Edition, ExprId, ItemKey, Mutbl, Name};
+use blaze_typeck::{BinOp, Edition, Expr, ExprId, ItemKey, Mutbl, Name, PNode, UnOp};
 
 use crate::region_fixture::{Decls, FnHead};
 use crate::{AdtFacts, CalleeFacts, Facts, Plant, Refusal, Region, Variance};
@@ -613,4 +613,297 @@ fn a_constant_initializers_temporary_is_static() {
     std::println!("const initializer: {constant:?}\nfn body (twin): {twin:?}");
     assert_eq!(constant, Ok(vec::Vec::new()), "a constant initializer's extending borrow is 'static");
     assert!(matches!(twin, Ok(ref lines) if !lines.is_empty()), "TWIN: a fn's temporary dies under its returned borrow: {twin:?}");
+}
+
+/// Every non-`let` boolean operand in an `if`/`while` condition, `match` guard, or lazy `&&`/`||`
+/// is its own temporary scope (the Reference, "Temporary scopes"): its temporaries drop right
+/// after that operand (before entering either outgoing edge), while `Expr::Let` scrutinee
+/// temporaries stay in the `IfThenRescope` / enclosing scope through the `then` block.
+#[test]
+fn branch_operand_temporaries_drop_before_outgoing_edges() {
+    struct BranchWorld {
+        g: ItemKey,
+        opt: ItemKey,
+    }
+    const CO1: [Variance; 1] = [Variance::Co];
+    impl Facts for BranchWorld {
+        fn regions(&self) -> &dyn crate::RegionFacts {
+            &crate::NoRegions
+        }
+        fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> {
+            None
+        }
+        fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> {
+            None
+        }
+        fn constant_initializer(&self) -> bool {
+            false
+        }
+        fn fn_binders(&self) -> bool {
+            true
+        }
+        fn closure_bodies_checked(&self) -> bool {
+            false
+        }
+        fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] {
+            &[]
+        }
+        fn async_bodies_checked(&self) -> bool {
+            false
+        }
+        fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> {
+            None
+        }
+        fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> {
+            None
+        }
+        fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> {
+            None
+        }
+        fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> {
+            None
+        }
+        fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> {
+            None
+        }
+        fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> {
+            None
+        }
+        fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> {
+            None
+        }
+        fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> {
+            None
+        }
+        fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> {
+            None
+        }
+        fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> {
+            None
+        }
+        fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> {
+            None
+        }
+        fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+            let is_g = k == self.g;
+            let is_opt = k == self.opt;
+            Some(AdtFacts {
+                copy: is_opt,
+                drop_impl: is_g,
+                needs_drop: is_g,
+                lifetimes: u32::from(is_g),
+                union: false,
+                is_enum: is_opt,
+                is_box: false,
+            })
+        }
+        fn adt_variances(&self, adt: ItemKey) -> Option<&[Variance]> {
+            if adt == self.g { Some(&CO1) } else { None }
+        }
+        fn callee(&self, _: ItemKey) -> Option<CalleeFacts> {
+            Some(CalleeFacts { writes_lifetimes: false, self_ref: false, c_variadic: false })
+        }
+        fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> {
+            None
+        }
+        fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> {
+            None
+        }
+        fn param_copy(&self, _: u32) -> bool {
+            false
+        }
+    }
+
+    let mut fx = Fx::new();
+    let v_k = fx.strukt("V", 0, &[]);
+    let vt = fx.adt(v_k, &[]);
+    let rv = fx.r(Mutbl::Not, vt);
+    let rmv = fx.r(Mutbl::Mut, vt);
+    let g_k = fx.strukt("G", 0, &[]);
+    let gt = fx.adt(g_k, &[]);
+    let rg = fx.r(Mutbl::Not, gt);
+    let u32_t = fx.u32();
+    let (opt_k, _) = fx.enum_("Opt", 0, &[("None", &[]), ("Some", &[u32_t])]);
+    let opt_t = fx.adt(opt_k, &[]);
+    let unit = fx.unit();
+    let bool_t = fx.ty(PNode::Bool);
+    let guard_fn = fx.func("guard", 0, &[rv], gt, vec![]);
+    let check_fn = fx.func("check", 0, &[rg], bool_t, vec![]);
+    let push_fn = fx.func("push", 0, &[rmv, u32_t], unit, vec![]);
+    let use_g_fn = fx.func("use_g", 0, &[rg], unit, vec![]);
+    let f_fn = fx.func("f", 0, &[vt, opt_t], unit, vec![]);
+    fx.finish();
+
+    let mut heads = Decls::new();
+    heads.adt(g_k, 1);
+    let (p0, p1) = (Region::Param(0), Region::Param(1));
+    heads.func(guard_fn, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rv], output: gt, slots: &[p0, p0] });
+    heads.func(check_fn, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[rg], output: bool_t, slots: &[p0, p1] });
+    heads.func(push_fn, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rmv, u32_t], output: unit, slots: &[p0] });
+    heads.func(use_g_fn, FnHead { lifetimes: 2, late: &[0, 1], outlives: &[], inputs: &[rg], output: unit, slots: &[p0, p1] });
+    heads.func(f_fn, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[vt, opt_t], output: unit, slots: &[] });
+
+    let facts = BranchWorld { g: g_k, opt: opt_k };
+
+    // Helper: `check(&guard(&v))`.
+    let guard_check = |b: &mut Bb, pv: blaze_typeck::PatId| {
+        let lv = b.local(pv);
+        let bor_v = b.borrow(Mutbl::Not, lv);
+        let gf = b.path(&["guard"]);
+        let g = b.call(gf, &[bor_v]);
+        let bor_g = b.borrow(Mutbl::Not, g);
+        let cf = b.path(&["check"]);
+        b.call(cf, &[bor_g])
+    };
+    let not_e = |b: &mut Bb, operand: ExprId| {
+        let slot = b.bool();
+        b.exprs[slot.ix()] = Expr::Unary { op: UnOp::Not, operand };
+        slot
+    };
+    let bin_e = |b: &mut Bb, op: BinOp, lhs: ExprId, rhs: ExprId| {
+        let slot = b.bool();
+        b.exprs[slot.ix()] = Expr::Binary { op, lhs, rhs };
+        slot
+    };
+    let let_e = |b: &mut Bb, pat: blaze_typeck::PatId, init: ExprId| {
+        let slot = b.bool();
+        b.exprs[slot.ix()] = Expr::Let { pat, init };
+        slot
+    };
+    let if_e = |b: &mut Bb, cond: ExprId, then: ExprId, else_: Option<ExprId>| {
+        let slot = b.bool();
+        b.exprs[slot.ix()] = Expr::If { cond, then, else_ };
+        slot
+    };
+    let push_zero = |b: &mut Bb, pv: blaze_typeck::PatId| {
+        let z = b.int(None);
+        let lv = b.local(pv);
+        let rm = b.borrow(Mutbl::Mut, lv);
+        let pf = b.path(&["push"]);
+        let c = b.call(pf, &[rm, z]);
+        b.semi(c)
+    };
+    let check_case = |b: &Bb, root: ExprId, edition: Edition| {
+        let mut view = b.view(f_fn, root);
+        view.edition = edition;
+        crate::region_fixture::run(&fx, &view, &facts, &heads, Plant::None).map(|r| r.lines)
+    };
+
+    for edition in [Edition::E2024, Edition::E2021] {
+        // 1. Positive: `if let x = opt && !check(&guard(&v)) { push(&mut v, 0); }`
+        {
+            let mut b = Bb::new();
+            let pv = b.param_mut("v");
+            let po = b.param("opt");
+            let px = b.bind("x");
+            let lo = b.local(po);
+            let let_cond = let_e(&mut b, px, lo);
+            let gc = guard_check(&mut b, pv);
+            let neg = not_e(&mut b, gc);
+            let cond = bin_e(&mut b, BinOp::And, let_cond, neg);
+            let st = push_zero(&mut b, pv);
+            let then = b.block(&[st], None);
+            let root = if_e(&mut b, cond, then, None);
+            let got = check_case(&b, root, edition);
+            assert!(!found(&got), "if-let && !guard ({edition:?}): {got:?}");
+        }
+
+        // 2. Positive: `if check(&guard(&v)) && let x = opt { push(&mut v, 0); }`
+        {
+            let mut b = Bb::new();
+            let pv = b.param_mut("v");
+            let po = b.param("opt");
+            let gc = guard_check(&mut b, pv);
+            let px = b.bind("x");
+            let lo = b.local(po);
+            let let_cond = let_e(&mut b, px, lo);
+            let cond = bin_e(&mut b, BinOp::And, gc, let_cond);
+            let st = push_zero(&mut b, pv);
+            let then = b.block(&[st], None);
+            let root = if_e(&mut b, cond, then, None);
+            let got = check_case(&b, root, edition);
+            assert!(!found(&got), "if guard && let ({edition:?}): {got:?}");
+        }
+
+        // 3. Positive: `match opt { _ if !check(&guard(&v)) => { push(&mut v, 0); }, _ => {} }`
+        {
+            let mut b = Bb::new();
+            let pv = b.param_mut("v");
+            let po = b.param("opt");
+            let scrut = b.local(po);
+            let w1 = b.wild();
+            let gc = guard_check(&mut b, pv);
+            let neg = not_e(&mut b, gc);
+            let st = push_zero(&mut b, pv);
+            let body1 = b.block(&[st], None);
+            let w2 = b.wild();
+            let body2 = b.block(&[], None);
+            let root = b.match_guarded(scrut, &[(w1, Some(neg), body1), (w2, None, body2)]);
+            let got = check_case(&b, root, edition);
+            assert!(!found(&got), "match guard !guard ({edition:?}): {got:?}");
+        }
+
+        // 4. Positive: `if let x = opt && (check(&guard(&v)) || check(&guard(&v))) { push(&mut v, 0); }`
+        {
+            let mut b = Bb::new();
+            let pv = b.param_mut("v");
+            let po = b.param("opt");
+            let px = b.bind("x");
+            let lo = b.local(po);
+            let let_cond = let_e(&mut b, px, lo);
+            let g1 = guard_check(&mut b, pv);
+            let g2 = guard_check(&mut b, pv);
+            let or_cond = bin_e(&mut b, BinOp::Or, g1, g2);
+            let cond = bin_e(&mut b, BinOp::And, let_cond, or_cond);
+            let st = push_zero(&mut b, pv);
+            let then = b.block(&[st], None);
+            let root = if_e(&mut b, cond, then, None);
+            let got = check_case(&b, root, edition);
+            assert!(!found(&got), "if-let && (guard || guard) ({edition:?}): {got:?}");
+        }
+
+        // 5. Negative control 1: `if let r = guard(&v) { push(&mut v, 0); use_g(&r); }` MUST FAIL!
+        {
+            let mut b = Bb::new();
+            let pv = b.param_mut("v");
+            let _po = b.param("opt");
+            let lv = b.local(pv);
+            let bor_v = b.borrow(Mutbl::Not, lv);
+            let gf = b.path(&["guard"]);
+            let init = b.call(gf, &[bor_v]);
+            let pr = b.bind("r");
+            let let_cond = let_e(&mut b, pr, init);
+            let s1 = push_zero(&mut b, pv);
+            let lr = b.local(pr);
+            let bor_r = b.borrow(Mutbl::Not, lr);
+            let uf = b.path(&["use_g"]);
+            let uc = b.call(uf, &[bor_r]);
+            let s2 = b.semi(uc);
+            let then = b.block(&[s1, s2], None);
+            let root = if_e(&mut b, let_cond, then, None);
+            let got = check_case(&b, root, edition);
+            assert!(found(&got), "NEGATIVE CONTROL: `let` scrutinee temporary must stay live through `then` ({edition:?}): {got:?}");
+        }
+
+        // 6. Negative control 2: `if let x = opt { let _g = guard(&v); push(&mut v, 0); }` MUST FAIL!
+        {
+            let mut b = Bb::new();
+            let pv = b.param_mut("v");
+            let po = b.param("opt");
+            let px = b.bind("x");
+            let lo = b.local(po);
+            let let_cond = let_e(&mut b, px, lo);
+            let lv = b.local(pv);
+            let bor_v = b.borrow(Mutbl::Not, lv);
+            let gf = b.path(&["guard"]);
+            let g = b.call(gf, &[bor_v]);
+            let pg = b.bind("_g");
+            let s1 = b.let_(pg, None, g);
+            let s2 = push_zero(&mut b, pv);
+            let then = b.block(&[s1, s2], None);
+            let root = if_e(&mut b, let_cond, then, None);
+            let got = check_case(&b, root, edition);
+            assert!(found(&got), "NEGATIVE CONTROL: local guard in `then` must stay live across push ({edition:?}): {got:?}");
+        }
+    }
 }

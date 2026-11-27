@@ -5279,8 +5279,36 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Task::Branch(e, t, f) => self.branch(e, t, f),
             Task::BranchOn(e, t, f) => {
                 let v = self.pop(e)?;
-                let p = self.as_place(v, e)?;
-                self.b.switch(p, &[t, f], self.span(e));
+                let Some(mark) = self.temp_marks.pop() else { return self.refuse(Form::Malformed, e) };
+                let Ok(mark) = usize::try_from(mark) else { return self.refuse(Form::Malformed, e) };
+                if mark > self.temps.len() {
+                    return self.refuse(Form::Malformed, e);
+                }
+                if self.temps.len() == mark {
+                    let p = self.as_place(v, e)?;
+                    self.b.switch(p, &[t, f], self.span(e));
+                    return Ok(());
+                }
+                // Copy the boolean result out before dropping this operand's temporaries so a
+                // place projected from one of them (e.g. `guard(&v).flag` or `*guard(&v)`) is
+                // read while still live; then end the copy's storage on each outgoing edge.
+                let span = self.span(e);
+                let c = self.new_local_with(v.ty, false, None, e)?;
+                self.b.stmt(StmtKind::StorageLive(c), span);
+                let cp = self.place_of(c);
+                self.assign_val(cp, v.ty, v, e)?;
+                while self.temps.len() > mark {
+                    let Some(l) = self.temps.pop() else { break };
+                    self.drop_local(l, e)?;
+                }
+                let (te, fe) = (self.b.block(), self.b.block());
+                self.b.switch(cp, &[te, fe], span);
+                self.b.start(te);
+                self.drop_local(c, e)?;
+                self.b.goto(t, span);
+                self.b.start(fe);
+                self.drop_local(c, e)?;
+                self.b.goto(f, span);
                 Ok(())
             }
             Task::LetBranch(pat, e, t, f) => {
@@ -9972,8 +10000,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 self.tasks.push(Task::Eval(init, false));
             }
             _ => {
+                // Every non-`let` boolean operand in an `if`/`while` condition, `match` guard, or
+                // lazy `&&`/`||` is its own temporary scope (the Reference, "Temporary scopes"):
+                // drop its temporaries in `Task::BranchOn` before entering either outgoing edge,
+                // while `Expr::Let` scrutinee temporaries remain in the enclosing (`IfThenRescope`
+                // or statement) scope.
                 self.tasks.push(Task::BranchOn(e, t, f));
                 self.tasks.push(Task::Eval(e, false));
+                self.tasks.push(Task::OpenTemps);
             }
         }
         Ok(())

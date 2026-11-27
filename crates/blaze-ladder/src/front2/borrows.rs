@@ -6182,4 +6182,336 @@ fn main() {}
             assert!(!bad.findings.is_empty(), "{name} must report borrow error: {bad:?}");
         }
     }
+
+    #[test]
+    fn branch_operand_temp_scope_and_controls() {
+        const SOURCE_2024: &str = r#"
+use std::ops::Deref;
+
+pub struct Guard<'a> {
+    v: &'a Vec<i32>,
+    flag: bool,
+}
+
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {}
+}
+
+impl Deref for Guard<'_> {
+    type Target = bool;
+    fn deref(&self) -> &bool {
+        &self.flag
+    }
+}
+
+impl Guard<'_> {
+    pub fn check(&self) -> bool {
+        !self.v.is_empty()
+    }
+    pub fn try_check(&self) -> Result<bool, ()> {
+        Ok(!self.v.is_empty())
+    }
+}
+
+pub fn guard(v: &Vec<i32>) -> Guard<'_> {
+    Guard { v, flag: !v.is_empty() }
+}
+
+pub struct Holder<'a>(&'a Vec<i32>);
+
+impl Drop for Holder<'_> {
+    fn drop(&mut self) {}
+}
+
+impl<'a> Holder<'a> {
+    pub fn opt(&self) -> Option<&i32> {
+        self.0.first()
+    }
+}
+
+pub fn make_holder(v: &Vec<i32>) -> Holder<'_> {
+    Holder(v)
+}
+
+pub fn use_ref(_r: &i32) {}
+
+pub struct Cred {
+    pub bindings: Vec<i32>,
+    pub additional: Vec<i32>,
+}
+
+impl Cred {
+    pub fn host_bindings(&self) -> impl Iterator<Item = &i32> {
+        self.bindings.iter()
+    }
+}
+
+// Positive 1: `if let` + `!guard(&v).check()` (Drop temporary in non-`let` boolean operand)
+pub fn if_let_and_not_guard_ok(mut v: Vec<i32>, opt: Option<i32>) {
+    if let Some(x) = opt && !guard(&v).check() {
+        v.push(x);
+    }
+}
+
+// Positive 2: exact `codex-rs` `credential_broker.rs:515` pattern (opaque `impl Iterator` + `.any`)
+pub fn if_let_and_not_opaque_iter_any_ok(mut cred: Cred, opt: Option<i32>) {
+    if let Some(x) = opt && !cred.host_bindings().any(|b| *b == x) {
+        cred.additional.push(x);
+    }
+}
+
+// Positive 3: `if guard(&v).check() && let Some(x) = opt`
+pub fn if_guard_and_let_ok(mut v: Vec<i32>, opt: Option<i32>) {
+    if guard(&v).check() && let Some(x) = opt {
+        v.push(x);
+    }
+}
+
+// Positive 4: `match` arm guard `!guard(&v).check()`
+pub fn match_guard_not_ok(mut v: Vec<i32>, opt: Option<i32>) {
+    match opt {
+        Some(x) if !guard(&v).check() => v.push(x),
+        _ => {}
+    }
+}
+
+// Positive 5: `if let` + `(guard || guard)`
+pub fn if_let_and_or_ok(mut v: Vec<i32>, opt: Option<i32>) {
+    if let Some(x) = opt && (guard(&v).check() || guard(&v).check()) {
+        v.push(x);
+    }
+}
+
+// Positive 6: `while let Some(x) = opt && !guard(&v).check()`
+pub fn while_let_and_not_guard_ok(mut v: Vec<i32>, opt: Option<i32>) {
+    while let Some(x) = opt && !guard(&v).check() {
+        v.push(x);
+        break;
+    }
+}
+
+// Positive 7: early `?` exit inside boolean operand
+pub fn if_let_and_try_ok(mut v: Vec<i32>, opt: Option<i32>) -> Result<(), ()> {
+    if let Some(x) = opt && !guard(&v).try_check()? {
+        v.push(x);
+    }
+    Ok(())
+}
+
+// Positive 8: place projected from boolean operand temporary (`*guard(&v)` via `Deref`)
+pub fn if_let_and_deref_bool_ok(mut v: Vec<i32>, opt: Option<i32>) {
+    if let Some(x) = opt && !*guard(&v) {
+        v.push(x);
+    }
+}
+
+// Positive 9: standalone lazy `&&` operand temp scope
+pub fn lazy_and_mut_ok(mut v: Vec<i32>) -> bool {
+    guard(&v).check() && { v.push(1); true }
+}
+
+// Negative control 1: `Expr::Let` scrutinee temporary MUST stay live through `then` (E0502)
+pub fn if_let_scrutinee_temp_bad(mut v: Vec<i32>) {
+    if let Some(r) = make_holder(&v).opt() {
+        v.push(1);
+        use_ref(r);
+    }
+}
+
+// Negative control 2: `Expr::Let` Drop scrutinee temporary stays live through `then` in Edition 2024
+pub fn if_let_scrutinee_drop_temp_bad(mut v: Vec<i32>) {
+    if let Some(_) = make_holder(&v).opt() {
+        v.push(1);
+    }
+}
+
+// Negative control 3: local binding inside `then` MUST still be rejected
+pub fn if_let_local_guard_in_then_bad(mut v: Vec<i32>, opt: Option<&i32>) {
+    if let Some(r) = opt {
+        let _g = guard(&v);
+        v.push(*r);
+    }
+}
+
+fn main() {}
+"#;
+
+        const SOURCE_2021: &str = r#"
+pub struct Guard<'a>(&'a Vec<i32>);
+
+impl Drop for Guard<'_> {
+    fn drop(&mut self) {}
+}
+
+impl Guard<'_> {
+    pub fn check(&self) -> bool {
+        !self.0.is_empty()
+    }
+}
+
+pub fn guard(v: &Vec<i32>) -> Guard<'_> {
+    Guard(v)
+}
+
+pub struct Holder<'a>(&'a Vec<i32>);
+
+impl Drop for Holder<'_> {
+    fn drop(&mut self) {}
+}
+
+impl<'a> Holder<'a> {
+    pub fn opt(&self) -> Option<&i32> {
+        self.0.first()
+    }
+}
+
+pub fn make_holder(v: &Vec<i32>) -> Holder<'_> {
+    Holder(v)
+}
+
+pub fn use_ref(_r: &i32) {}
+
+pub struct Cred {
+    pub bindings: Vec<i32>,
+    pub additional: Vec<i32>,
+}
+
+impl Cred {
+    pub fn host_bindings(&self) -> impl Iterator<Item = &i32> {
+        self.bindings.iter()
+    }
+}
+
+// Positive (Edition 2021): match guard `!guard(&v).check()`
+pub fn match_guard_not_ok_2021(mut v: Vec<i32>, opt: Option<i32>) {
+    match opt {
+        Some(x) if !guard(&v).check() => v.push(x),
+        _ => {}
+    }
+}
+
+// Positive (Edition 2021): match guard with opaque `impl Iterator` + `.any`
+pub fn match_guard_opaque_iter_ok_2021(mut cred: Cred, opt: Option<i32>) {
+    match opt {
+        Some(x) if !cred.host_bindings().any(|b| *b == x) => cred.additional.push(x),
+        _ => {}
+    }
+}
+
+// Positive (Edition 2021): `if !guard(&v).check() && { v.push(1); true }`
+pub fn if_and_mut_ok_2021(mut v: Vec<i32>) {
+    if !guard(&v).check() && { v.push(1); true } {
+        v.push(2);
+    }
+}
+
+// Positive (Edition 2021): standalone `||` operand temp scope
+pub fn lazy_or_mut_ok_2021(mut v: Vec<i32>) -> bool {
+    guard(&v).check() || { v.push(1); true }
+}
+
+// Negative control (Edition 2021): `if let` scrutinee temporary stays live through `then`
+pub fn if_let_scrutinee_temp_bad_2021(mut v: Vec<i32>) {
+    if let Some(r) = make_holder(&v).opt() {
+        v.push(1);
+        use_ref(r);
+    }
+}
+
+// Negative control (Edition 2021): local guard inside `then` MUST still be rejected
+pub fn if_let_local_guard_in_then_bad_2021(mut v: Vec<i32>, opt: Option<&i32>) {
+    if let Some(r) = opt {
+        let _g = guard(&v);
+        v.push(*r);
+    }
+}
+
+fn main() {}
+"#;
+
+        let check_crate = |crate_name: &str, ed_str: &str, source: &str, positives: &[&str], negatives: &[&str]| {
+            let heap = blaze_own::testing::heap();
+            let alloc = heap.alloc();
+            let home = std::env::var("HOME").expect("HOME is set");
+            let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+            let root_path = std::format!("/{crate_name}/src/main.rs");
+            let dir_path = std::format!("/{crate_name}/");
+            let files = [(root_path.clone(), source.to_string())];
+            let edition = edition::PackageEdition::of_manifest(ed_str).expect("valid edition");
+            let user = UserCrate {
+                name: crate_name,
+                dir: &dir_path,
+                root: &root_path,
+                files: &files,
+                edition,
+                panic: blaze_build::Panic::Unwind,
+            };
+            let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+            let erased = blaze_own::Erased::new(&frame);
+            let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+            let crates = inputs.crates();
+            let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+            let sources = [SourceFile { path: "src/main.rs", text: source }];
+            let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+            let bodies = world.bodies(alloc);
+            let free = |name: &str| {
+                bodies
+                    .iter()
+                    .find_map(|&(body, _)| {
+                        let BodyRef::Free(key) = body else { return None };
+                        (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                    })
+                    .unwrap_or_else(|| panic!("missing fixture body {name}"))
+            };
+
+            for &name in positives {
+                let (types, borrows) = world.check_borrows(free(name), alloc);
+                assert!(types.is_clean(), "{name} types: {types:?}");
+                assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+            }
+            for &name in negatives {
+                let (types, bad) = world.check_borrows(free(name), alloc);
+                assert!(types.is_clean(), "{name} types: {types:?}");
+                assert!(bad.refused.is_none(), "{name} refused: {bad:?}");
+                assert!(!bad.findings.is_empty(), "{name} must report borrow error: {bad:?}");
+            }
+        };
+
+        check_crate(
+            "branch_temps_2024",
+            "2024",
+            SOURCE_2024,
+            &[
+                "if_let_and_not_guard_ok",
+                "if_let_and_not_opaque_iter_any_ok",
+                "if_guard_and_let_ok",
+                "match_guard_not_ok",
+                "if_let_and_or_ok",
+                "while_let_and_not_guard_ok",
+                "if_let_and_try_ok",
+                "if_let_and_deref_bool_ok",
+                "lazy_and_mut_ok",
+            ],
+            &[
+                "if_let_scrutinee_temp_bad",
+                "if_let_scrutinee_drop_temp_bad",
+                "if_let_local_guard_in_then_bad",
+            ],
+        );
+        check_crate(
+            "branch_temps_2021",
+            "2021",
+            SOURCE_2021,
+            &[
+                "match_guard_not_ok_2021",
+                "match_guard_opaque_iter_ok_2021",
+                "if_and_mut_ok_2021",
+                "lazy_or_mut_ok_2021",
+            ],
+            &[
+                "if_let_scrutinee_temp_bad_2021",
+                "if_let_local_guard_in_then_bad_2021",
+            ],
+        );
+    }
 }
