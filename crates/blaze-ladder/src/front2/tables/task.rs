@@ -472,6 +472,9 @@ impl<'n> NamesSource<'n> for DecodeLangSource<'n> {
     fn traits_in_scope<'b>(self, module: ItemKey, _alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, blaze_scope::names::PathError> {
         Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
     }
+    fn traits_exported<'b>(self, module: ItemKey, _alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, blaze_scope::names::PathError> {
+        Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
+    }
     fn variants(self, _owner: ItemKey) -> Option<super::super::source::VariantRows<'n>> { None }
     fn variant_of(self, _variant: ItemKey) -> Option<(ItemKey, u32)> { None }
     fn has_text(self, _key: ItemKey) -> bool { false }
