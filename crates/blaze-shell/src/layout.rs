@@ -2163,6 +2163,8 @@ fn layout_block(
         &spans,
         None,
         None,
+        None,
+        false,
         cmd_x,
         cur_y,
         cmd_max_x,
@@ -2260,7 +2262,9 @@ fn layout_highlighted_source(
     source: &str,
     spans: &[HighlightSpan],
     abbrevs: Option<&std::collections::BTreeMap<String, String>>,
+    cwd: Option<&str>,
     live_cursor: Option<usize>,
+    has_live_completions: bool,
     x0: f32,
     y0: f32,
     x1: f32,
@@ -2283,11 +2287,18 @@ fn layout_highlighted_source(
                 crate::editor::CommandHighlightKind::Builtin => theme::CMD_BUILTIN,
                 crate::editor::CommandHighlightKind::Abbrev => theme::CMD_ABBREV,
                 crate::editor::CommandHighlightKind::External => theme::CMD_EXTERNAL,
+                crate::editor::CommandHighlightKind::DataFile => {
+                    theme::highlight_color(blaze_sh::lex::HighlightKind::String)
+                }
                 crate::editor::CommandHighlightKind::Unknown => {
-                    // While actively typing a valid command prefix at the cursor, stay neutral
-                    // instead of flashing red mid-word (e.g. `cla` -> `claude`).
+                    // While actively typing a token at the cursor that has live completions
+                    // or matches a known command/data-file prefix, keep it clean neutral ink
+                    // instead of screaming red mid-word (e.g. `Car` -> `Cargo.lock` / `cargo`).
                     let editing_here = live_cursor.is_some_and(|c| c >= s && c <= e);
-                    if editing_here && crate::editor::is_known_command_prefix(tok, abbrevs) {
+                    if editing_here
+                        && (has_live_completions
+                            || crate::editor::is_known_command_prefix(tok, cwd, abbrevs))
+                    {
                         theme::INK_1
                     } else {
                         theme::CMD_UNKNOWN
@@ -6828,7 +6839,9 @@ fn layout_inline_prompt(
             &editor.text,
             &spans,
             Some(&editor.abbreviations),
+            Some(prompt.cwd.as_str()),
             Some(editor.cursor),
+            !editor.completions.is_empty(),
             text_x,
             input_y,
             x1,
