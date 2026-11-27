@@ -67,6 +67,7 @@ mod fn_traits;
 mod gat;
 mod holes;
 mod impl_const_params;
+mod index_arg_coerce;
 mod instance_holes;
 mod infer_const_arg;
 mod legacy_const;
