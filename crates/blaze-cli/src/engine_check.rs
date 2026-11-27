@@ -846,6 +846,7 @@ fn edge_at<'l, R>(
     let opts = || Opts {
         status,
         tools,
+        producers,
         workers,
         toolchain: blaze_toolchain::PINNED,
         heap,
@@ -2928,6 +2929,9 @@ impl<'f> Place<'f> {
 pub(crate) struct Opts<'f> {
     /// Each kind's tool in the engine's form (engine_store.rs `tools`): in every task's key.
     pub(crate) tools: blaze_engine::Tools,
+    /// This binary's per-row producer identities (Rule 21, Rule 52): keys on-disk caches such as
+    /// `<store>/wasm64-sysroot-v2/<dir>/` so format bumps miss cleanly.
+    pub(crate) producers: blaze_ids::producer::Producers,
     pub(crate) place: Place<'f>,
     /// At most this many tasks at once.
     pub(crate) workers: NonZeroU32,
@@ -3441,7 +3445,7 @@ fn checking<'f, 's: 'f>(
 ) -> Result<BoxedChecked, CliError> {
     #[cfg(test)]
     stack_probe::at("checking");
-    let &Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, scope: check_scope } = opts;
+    let &Opts { tools, producers, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, scope: check_scope } = opts;
     // The oracle compares every crate's names, so every crate is entered: no stored answer read.
     let fresh = fresh || recovery == StoredRecovery::Fresh || names_oracle.on();
     let erased = blaze_own::Erased::new(frame);
@@ -4735,6 +4739,7 @@ fn checking<'f, 's: 'f>(
         lock: laid_now.and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock),
         members,
         env: &env,
+        producers,
         side: side.as_ref(),
         outlined: &outlined,
         workers,
