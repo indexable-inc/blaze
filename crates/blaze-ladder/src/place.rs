@@ -355,6 +355,12 @@ fn routine_library(routine: Routine) -> &'static str {
 
 /// The address of `name` in this process.
 fn symbol(name: &str) -> Option<u64> {
+    if name == "__dso_handle" {
+        // Hidden linker symbol in ELF objects (`crtbeginS.o`), never exported to `dlsym`.
+        // Matches `blaze-launch-rt`'s `LauncherOwn` / `signals` interception.
+        static DSO_HANDLE: u8 = 0;
+        return Some(&raw const DSO_HANDLE as u64);
+    }
     let name = CString::new(name).ok()?;
     // SAFETY: `dlsym` reads a live NUL-terminated name and returns an address or null; the
     // handle `RTLD_DEFAULT` searches every image loaded, as a static link of the program

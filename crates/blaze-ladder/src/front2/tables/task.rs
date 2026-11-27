@@ -5710,19 +5710,17 @@ mod keeps_typed_tests {
     use crate::refusal::SourceFile;
 
     const SOURCE: &str = r#"
-macro_rules! byte {
-    () => {
-        u8
-    };
+fn stub<'a>(a: &'a u8, _b: &'a u8) -> &'a u8 {
+    a
 }
 
-fn m(x: &u8, _y: byte!()) -> &u8 {
+fn m(x: &u8, _y: fn(&u8, &u8) -> &u8) -> &u8 {
     x
 }
 
 fn calls_soft_refused() {
     let a = 1u8;
-    let r = m(&a, 2);
+    let r = m(&a, stub);
     let _ = *r;
 }
 

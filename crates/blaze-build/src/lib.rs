@@ -593,9 +593,9 @@ pub trait Adts {
     /// caller ask this one question and agree. `None`: not said; then no location is passed,
     /// and a `caller_location` or a forwarded location that depends on the answer is refused
     /// by name ([`BuildError::TrackCaller`]), never given a wrong place.
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         let _ = (instance, ground);
-        None
+        Ok(None)
     }
 
     /// Where expression `expr` of the body of `owner` is, in the form a code record may hold

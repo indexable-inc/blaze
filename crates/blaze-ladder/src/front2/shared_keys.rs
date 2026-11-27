@@ -309,14 +309,19 @@ pub enum Look<'v, V> {
 }
 
 /// The first read of `filed` that `today` does not answer alike, as a [`Look`]; `None` when all do.
-fn moved<'v, V>(filed: &SharedReads<'_>, today: &SharedReads<'_>) -> Option<Look<'v, V>> {
+/// For a fact that `today`'s check did not happen to ask (e.g. a post-typeck pass skipped after an
+/// error), `replay` may answer whether `filed`'s fact still holds in today's world.
+fn moved<'v, V>(filed: &SharedReads<'_>, today: &SharedReads<'_>, replay: &mut impl FnMut(&Read) -> bool) -> Option<Look<'v, V>> {
     if filed.cfg != today.cfg {
         let at = filed.cfg.iter().zip(today.cfg.iter()).position(|(a, b)| a != b).unwrap_or(filed.cfg.len().min(today.cfg.len()));
         let atom = filed.cfg.get(at).or(today.cfg.get(at)).map_or(0, |c| c.atom);
         return Some(Look::CfgMoved { atom });
     }
     for r in filed.facts.iter() {
-        let same = today.facts.binary_search_by(|t| t.fact.cmp(&r.fact)).is_ok_and(|at| today.facts[at].answer == r.answer);
+        let same = match today.facts.binary_search_by(|t| t.fact.cmp(&r.fact)) {
+            Ok(at) => today.facts[at].answer == r.answer,
+            Err(_) => replay(r),
+        };
         if !same {
             return Some(Look::FactMoved { fact: r.fact });
         }
@@ -346,13 +351,20 @@ impl<'a, V> SharedRecords<'a, V> {
     /// answers filed facts in today's world, `today` is the read list of today's own check, so
     /// this proves WHICH records may be shared, not yet the saving).
     pub fn look(&self, key: ContentId, today: &SharedReads<'_>) -> Look<'_, V> {
+        self.look_with(key, today, |_| false)
+    }
+
+    /// [`Self::look`], falling back to `replay` for any filed fact not present in `today.facts`
+    /// (for example when `today`'s check had a type error and skipped a post-typeck pass that
+    /// `filed`'s clean check ran).
+    pub fn look_with(&self, key: ContentId, today: &SharedReads<'_>, mut replay: impl FnMut(&Read) -> bool) -> Look<'_, V> {
         let start = self.rows.partition_point(|(k, _, _)| k.0 < key.0);
         let mut first: Option<Look<'_, V>> = None;
         for (k, reads, value) in self.rows[start..].iter() {
             if k.0 != key.0 {
                 break;
             }
-            match moved(reads, today) {
+            match moved(reads, today, &mut replay) {
                 None => return Look::Found(value),
                 Some(why) => {
                     if first.is_none() {

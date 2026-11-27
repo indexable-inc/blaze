@@ -509,7 +509,7 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
     /// Materializes a `&'static Location<'static>` for `site_item`'s definition site when `callee`
     /// is `#[track_caller]`.
     fn def_site_caller_arg(&mut self, callee: Instance, site_item: ItemKey) -> Result<Option<Value>, BuildError> {
-        if self.adts.track_caller(callee, self.subst.ground) != Some(true) {
+        if self.adts.track_caller(callee, self.subst.ground).map_err(|e| BuildError::Facts { stmt: None, error: e })? != Some(true) {
             return Ok(None);
         }
         let loc_adt = self.adts.location_adt().ok_or(self.malformed("`#[track_caller]` shim without `panic_location` lang item"))?;

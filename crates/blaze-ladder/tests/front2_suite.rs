@@ -22,7 +22,8 @@ use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::front2::program::Front2Program;
 use blaze_ladder::front2::program::suite::{Reach, Suite, SuiteEntry};
 use blaze_ladder::front2::project::{BodyRef, BodyVerdict, ProjectWorld};
-use blaze_ladder::front2::shared_keys::{ByPlace, Look, SharedReads, SharedRecords, UnitBase, atom_digest, cfg_reads, relative_reads, shared_key};
+use blaze_ladder::front2::reads::FactKind;
+use blaze_ladder::front2::shared_keys::{ByPlace, Look, Relative, SharedReads, SharedRecords, UnitBase, atom_digest, cfg_reads, relative_reads, shared_key};
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::seam::FrontEnd;
 use blaze_own::{AVec, Alloc};
@@ -306,7 +307,6 @@ fn check_items(names: &Names<'_>, cfg: &[(&str, Option<&str>)], sources: &[Sourc
 fn lib_and_test_units_share_what_reads_no_test() {
     let tc = toolchain();
     let lib = with_unit(&tc, LIB, false, check_items);
-    let test = with_unit(&tc, LIB, true, check_items);
     let g = Alloc::global();
     let mut records: SharedRecords<'static, Verdict> = SharedRecords::new_in(g);
     let mut planted: SharedRecords<'static, Verdict> = SharedRecords::new_in(g);
@@ -315,49 +315,86 @@ fn lib_and_test_units_share_what_reads_no_test() {
         planted.file(b.key, b.planted, b.verdict.clone());
         records.file(b.key, b.reads, b.verdict);
     }
-    let add_test = test.iter().find(|b| b.name == "add").expect("add").checker;
-    println!("SHARED add: lib key {add_lib:#034x}, test key {add_test:#034x} (prefix and low bits differ)");
-    assert!(add_lib >> 64 != add_test >> 64, "the units' crate prefixes are equal");
-    assert!(
-        add_lib as u64 != add_test as u64,
-        "`add`'s low 64 bits are equal in both units: blaze-scope `key_of` no longer hashes the parent's prefix; switch UnitBase to PrefixSwap"
-    );
+    with_unit(&tc, LIB, true, |names, cfg, sources| {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+        let mut world = ProjectWorld::new(names, &frame, sources, g).unwrap_or_else(|e| panic!("front2: {e}"));
+        let bodies = world.bodies(g);
+        let base = UnitBase { source: source(), relative: ByPlace::of_names(names, 0, g), cfg, edition: Edition::E2024 };
+        let test_atom = atom_digest("test", None);
+        let mut test = Vec::new();
+        for name in ITEMS {
+            let (body, lib_key) = bodies
+                .iter()
+                .find_map(|(b, _)| match b {
+                    BodyRef::Free(k) if names.item_text(*k).and_then(|t| t.name) == Some(name) => Some((*b, *k)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("`{name}` is not listed"));
+            let text = names.item_text(lib_key).expect("its text").text;
+            let verdict = world.check(body, g);
+            let facts = verdict.facts.as_ref().unwrap_or_else(|e| panic!("`{name}`'s read list: {e:?}"));
+            let cfg_read = cfg_reads(text, Edition::E2024, cfg, g).unwrap_or_else(|e| panic!("`{name}`'s cfg reads: {e:?}"));
+            let mut kept = AVec::new_in(g);
+            for c in cfg_read.iter().filter(|c| c.atom != test_atom) {
+                kept.push(*c);
+            }
+            let reads = relative_reads(&base, cfg_read, &facts.rows, g);
+            let planted_reads = relative_reads(&base, kept, &facts.rows, g);
+            let checker = checker_of(lib_key).0;
+            test.push(Body { name, checker, key: shared_key(&base, checker, text), reads, planted: planted_reads, verdict: verdict_of(&verdict) });
+        }
+        let add_test = test.iter().find(|b| b.name == "add").expect("add").checker;
+        println!("SHARED add: lib key {add_lib:#034x}, test key {add_test:#034x} (prefix and low bits differ)");
+        assert!(add_lib >> 64 != add_test >> 64, "the units' crate prefixes are equal");
+        assert!(
+            add_lib as u64 != add_test as u64,
+            "`add`'s low 64 bits are equal in both units: blaze-scope `key_of` no longer hashes the parent's prefix; switch UnitBase to PrefixSwap"
+        );
 
-    let test_atom = atom_digest("test", None);
-    let mut found = Vec::new();
-    let mut recomputed = Vec::new();
-    for b in &test {
-        match records.look(b.key, &b.reads) {
+        let mut found = Vec::new();
+        let mut recomputed = Vec::new();
+        for b in &test {
+            match records.look(b.key, &b.reads) {
+                Look::Found(filed) => {
+                    println!("SHARED {}: found", b.name);
+                    assert_eq!(filed, &b.verdict, "`{}` was found with a verdict today's check does not give", b.name);
+                    found.push(b.name);
+                }
+                Look::NoRecord => panic!("`{}`: no record under its shared key: the key holds something of the unit", b.name),
+                Look::CfgMoved { atom } => {
+                    let shown = if atom == test_atom { "test" } else { "another" };
+                    println!("SHARED {}: recomputed (cfg atom {shown} moved)", b.name);
+                    recomputed.push((b.name, "cfg"));
+                }
+                Look::FactMoved { fact } => {
+                    println!("SHARED {}: recomputed (fact moved: {fact:?})", b.name);
+                    recomputed.push((b.name, "fact"));
+                }
+            }
+        }
+        println!("SHARED found {}, recomputed {}", found.len(), recomputed.len());
+        assert_eq!(found, ["add"], "found");
+        assert_eq!(recomputed, [("width", "cfg"), ("bump", "fact")], "recomputed");
+
+        let width = test.iter().find(|b| b.name == "width").expect("width");
+        let width_rel = base.relative.relative(width.checker);
+        // Replay `Attrs(width)` against today's world: `lib`'s clean check ran `cost_contract`
+        // (recording `Question::Attrs(width)`), while `test`'s erroring check skipped it; in
+        // today's world `width`'s `TypeAttrs` are unchanged, so with the `test` cfg atom dropped
+        // a real replay wrongly reuses `lib`'s clean verdict.
+        match planted.look_with(width.key, &width.planted, |r| {
+            r.fact.kind == FactKind::Attrs
+                && r.fact.key == width_rel
+                && r.answer.is_some_and(|ans| world.attrs_holds(blaze_typeck::ItemKey(width.checker), ans, g))
+        }) {
             Look::Found(filed) => {
-                println!("SHARED {}: found", b.name);
-                assert_eq!(filed, &b.verdict, "`{}` was found with a verdict today's check does not give", b.name);
-                found.push(b.name);
+                let caught = filed != &width.verdict;
+                println!("SHARED planted bug (test atom dropped): width found with {filed:?}, today {:?}: {}", width.verdict, if caught { "caught" } else { "NOT caught" });
+                assert!(caught, "the planted bug gave the library's verdict and today's alike: the fixture no longer tells the units apart");
             }
-            Look::NoRecord => panic!("`{}`: no record under its shared key: the key holds something of the unit", b.name),
-            Look::CfgMoved { atom } => {
-                let shown = if atom == test_atom { "test" } else { "another" };
-                println!("SHARED {}: recomputed (cfg atom {shown} moved)", b.name);
-                recomputed.push((b.name, "cfg"));
-            }
-            Look::FactMoved { fact } => {
-                println!("SHARED {}: recomputed (fact moved: {fact:?})", b.name);
-                recomputed.push((b.name, "fact"));
-            }
+            other => panic!("with the `test` atom dropped, `width` should be wrongly found; it was {other:?}"),
         }
-    }
-    println!("SHARED found {}, recomputed {}", found.len(), recomputed.len());
-    assert_eq!(found, ["add"], "found");
-    assert_eq!(recomputed, [("width", "cfg"), ("bump", "fact")], "recomputed");
-
-    let width = test.iter().find(|b| b.name == "width").expect("width");
-    match planted.look(width.key, &width.planted) {
-        Look::Found(filed) => {
-            let caught = filed != &width.verdict;
-            println!("SHARED planted bug (test atom dropped): width found with {filed:?}, today {:?}: {}", width.verdict, if caught { "caught" } else { "NOT caught" });
-            assert!(caught, "the planted bug gave the library's verdict and today's alike: the fixture no longer tells the units apart");
-        }
-        other => panic!("with the `test` atom dropped, `width` should be wrongly found; it was {other:?}"),
-    }
+    });
 }
 
 /// The own crate's names in a reach (last path segment, sorted) and how many fns outside it.

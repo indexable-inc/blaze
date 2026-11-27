@@ -536,7 +536,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         let block = self.b.create_block(BlockKind::Cold);
         self.b.begin(block);
         let inst = Instance { item, args: List::EMPTY };
-        let loc = if self.adts.track_caller(inst, self.subst.ground) == Some(true) {
+        let loc = if self.adts.track_caller(inst, self.subst.ground).map_err(|e| self.facts(e))? == Some(true) {
             self.stmt = Some(self.v.entry());
             let loc = self.caller_arg(inst, name)?;
             self.stmt = None;
