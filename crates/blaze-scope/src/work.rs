@@ -993,7 +993,7 @@ impl<'a, N: Name> Work<'a, N> {
         let expanded = facts.expansion(key).map_err(|error| ResolveError::Surface { module, error })?;
         let Some(expanded) = expanded else { return Ok(false) };
         r.expansions += 1;
-        if r.expansions > MAX_EXPANSIONS {
+        if r.expansions > r.expansion_budget() {
             return Err(ResolveError::TooManyExpansions { module });
         }
         let at = r.calls[c as usize].at;

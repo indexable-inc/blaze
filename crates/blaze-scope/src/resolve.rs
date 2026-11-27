@@ -5520,12 +5520,9 @@ enum KeepAs {
 /// What [`ExpandNote`]s and part marks name a proc-macro harness's expansion by.
 const HARNESS_NAME: &str = "proc-macro harness";
 
-/// Extra block-in-block nesting headroom above the crate's effective `recursion_limit`:
-/// `body.depth` accumulates both macro-expansion depth (e.g. `pin_project!` peeling 90+
-/// doc-comment attributes on `tokio::time::Sleep` before emitting `const _: () = { impl Sleep .. }`)
-/// and block-in-block nesting, so a block written at expansion depth `< recursion_limit` must still
-/// be allowed to make its block module (rule 18).
-const BLOCK_DEPTH_SLACK: u16 = 64;
+/// The most nested lexical block-local item bodies [`make_blocks`] descends into from any
+/// starting body, kept independent of macro expansion depth (rule 18).
+const MAX_BLOCK_DEPTH: u32 = 192;
 
 /// Makes the modules of the blocks of `bodies` that hold an `impl` ([`crate::blocks`]): each
 /// body's text is scanned once by syntax; one that writes an impl in a block gets a fragment
@@ -5546,8 +5543,9 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
 
     let alloc = base.alloc;
     let bump = base.bump;
-    let mut work: AVec<'_, crate::task::BodySrc<'a>> = AVec::from_slice_in(bodies, scratch);
-    while let Some(body) = work.pop() {
+    let mut work: AVec<'_, (crate::task::BodySrc<'a>, u32)> = AVec::with_capacity_in(bodies.len(), scratch);
+    work.extend(bodies.iter().map(|&b| (b, 0u32)));
+    while let Some((body, block_depth)) = work.pop() {
         let nested = blaze_file_items::nested::scan(body.text, scratch);
         // An unbalanced body is the parser's error to report; nothing is read from it.
         // A block is a module when it holds an item that makes one (its head is made in the
@@ -5559,13 +5557,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
         if nested.end != blaze_file_items::nested::NestedEnd::Whole || !nested.writes() {
             continue;
         }
-        let max_block_depth = base
-            .root
-            .head
-            .recursion_limit
-            .max(u32::from(crate::RECURSION_LIMIT))
-            .saturating_add(u32::from(BLOCK_DEPTH_SLACK));
-        if body.depth >= max_block_depth {
+        if block_depth >= MAX_BLOCK_DEPTH {
             run.note(NamesNote::Made { name: crate::blocks::BLOCK_MODULE, at: body.loc, note: MadeNote::TooMany });
             continue;
         }
@@ -5629,7 +5621,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             outline: &made.outline,
             items: None,
             at: Where::Expansion(body.loc),
-            depth: body.depth.saturating_add(1),
+            depth: body.depth,
             made: false,
             members_of: None,
             written: body.written,
@@ -5646,7 +5638,10 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
                 places.insert(m.key, body.place);
             }
         }
-        make_modules(base, run, body.module, &mods, place, body.depth.saturating_add(1), &mut work, scratch);
+        let mut child_bodies: AVec<'_, crate::task::BodySrc<'a>> = AVec::new_in(scratch);
+        make_modules(base, run, body.module, &mods, place, body.depth, &mut child_bodies, scratch);
+        let next_block_depth = block_depth.saturating_add(1);
+        work.extend(child_bodies.into_iter().map(|b| (b, next_block_depth)));
         // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
         out.decls = DeclsBuilder::new_in(alloc);
         add_lowered(run, call, At::Expansion(call), out);

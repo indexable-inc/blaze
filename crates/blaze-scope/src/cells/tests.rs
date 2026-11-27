@@ -1388,6 +1388,34 @@ fn u32_depth_does_not_saturate_at_u16_max() {
     assert_eq!(r.calls.last().expect("resolver call").state, crate::resolver::CallState::Pending);
 }
 
+/// `Work::expand` scales the per-module expansion budget with the crate's accepted
+/// `recursion_limit`, so a `#![recursion_limit = "65537"]` chain is not cut off at the default
+/// `MAX_EXPANSIONS = 65_536` bound.
+#[test]
+fn resolver_expansion_budget_scales_with_recursion_limit() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.cr(root).head.recursion_limit = 65_537;
+    w.rules(root, "m");
+    let c1 = w.call(root, "m", crate::CallShape::FnLike);
+    let c2 = w.call(root, "m", crate::CallShape::FnLike);
+
+    let mut r = crate::Resolver::new_in(root, &w, Alloc::global()).expect("resolver");
+    assert_eq!(r.expansion_budget(), 65_537);
+    // Simulate 65,536 prior expansions already taken in this module.
+    r.expansions = crate::MAX_EXPANSIONS;
+    // Step 1: resolve both calls and request their expansions.
+    assert!(matches!(r.step(&w, &[]).expect("resolve calls"), crate::Step::Expand(_)));
+    // Give c1's expansion (65,537th total): must succeed under recursion_limit = 65_537.
+    w.expanded.borrow_mut().insert(c1);
+    assert!(matches!(r.step(&w, &[]).expect("65,537th expansion must succeed"), crate::Step::Expand(_)));
+    assert_eq!(r.expansions, 65_537);
+    // Give c2's expansion (65,538th total): exceeds scaled budget 65,537 -> TooManyExpansions.
+    w.expanded.borrow_mut().insert(c2);
+    let err = r.step(&w, &[]).expect_err("65,538th expansion must hit budget");
+    assert!(matches!(err, crate::ResolveError::TooManyExpansions { module } if module == root));
+}
+
 /// mach2 0.5.0 on tempo's graph (edition 2015; c10-g3: "differ 153, cells failed 153, stalls 1").
 /// The Reference, `items.use.path.edition2018`: "In the 2015 edition, `use` paths are relative to
 /// the crate root." and "The 2015 edition does not allow use declarations to reference the extern

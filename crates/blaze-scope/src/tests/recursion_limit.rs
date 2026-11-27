@@ -408,3 +408,47 @@ fn lowering_depth_propagates_u32_past_u16_max() {
     assert_eq!(lowered.bodies.len(), 1);
     assert_eq!(lowered.bodies[0].depth, depth, "BodySrc::depth must preserve u32 depth >= 65536");
 }
+
+#[test]
+fn macro_chain_at_high_depth_emitting_many_nested_blocks_resolves_all() {
+    // A 250-step macro chain under `#![recursion_limit = "256"]` emitting 70 nested item-containing
+    // blocks (combined depth 250 + 70 = 320 > 256 + 64) must resolve every block-local impl cleanly
+    // because lexical block depth is bounded independently of macro expansion depth.
+    const MACRO_STEPS: usize = 250;
+    const BLOCK_NESTING: usize = 70;
+
+    let mut nested = String::new();
+    for i in 0..BLOCK_NESTING {
+        let _ = writeln!(nested, "fn b{i}() {{ struct B{i}; impl B{i} {{}}");
+    }
+    for _ in 0..BLOCK_NESTING {
+        nested.push_str("}\n");
+    }
+
+    let mut src = String::from("#![no_core]\n#![recursion_limit = \"256\"]\nmacro_rules! deep_blocks {\n");
+    src.push_str("\t($head:tt $($rest:tt)+) => { deep_blocks!($($rest)+); };\n");
+    src.push_str("\t($last:tt) => {\n");
+    src.push_str(&nested);
+    src.push_str("\t};\n}\ndeep_blocks!(");
+    for _ in 0..MACRO_STEPS {
+        src.push_str(" x");
+    }
+    src.push_str(" );\n");
+
+    let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let files = [("/k/lib.rs", src.as_str())];
+    let names = solve_one(&files, erased.bump());
+    assert_eq!(names.root_attrs.recursion_limit, 256);
+    assert_eq!(recursion_limit_errors(names), 0, "250-step chain must succeed under limit 256");
+    assert!(
+        !names.notes.iter().any(|n| matches!(n, NamesNote::Made { note: MadeNote::TooMany, .. })),
+        "70 nested lexical blocks emitted at macro depth 250 must not hit MadeNote::TooMany: {:?}",
+        names.notes
+    );
+    assert_eq!(
+        names.tables.impls.len(),
+        BLOCK_NESTING,
+        "all {BLOCK_NESTING} block-local impls emitted at macro depth 250 must be recorded"
+    );
+}

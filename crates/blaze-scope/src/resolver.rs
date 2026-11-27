@@ -856,6 +856,12 @@ impl<'a, N: Name> Resolver<'a, N> {
         resolved
     }
 
+    /// Maximum expansions this module may take in: at least [`MAX_EXPANSIONS`], scaled up to
+    /// accommodate the crate's accepted `#![recursion_limit]`.
+    pub(crate) fn expansion_budget(&self) -> usize {
+        MAX_EXPANSIONS.max(usize::try_from(self.recursion_limit).unwrap_or(usize::MAX))
+    }
+
     /// Adds one fragment (the module's text or a call's expansion), returning its index.
     pub(crate) fn add_fragment(
         &mut self,
