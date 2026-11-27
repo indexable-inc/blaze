@@ -34,7 +34,7 @@ use core::fmt::{self, Write as _};
 
 use blaze_expand::origin_column::TextMark;
 use blaze_expand::{
-    Call, CallKind, CallSite, Ctx, Delim, Eager, ExpandCx, ExpandError, Expanded, Failed, Inside, LexError, LitKind, NestedKind, ReadAnswer,
+    Call, CallKind, CallSite, Delim, Eager, ExpandCx, ExpandError, Expanded, Failed, Inside, LexError, LitKind, NestedKind, ReadAnswer,
     ReadKind, StreamError, TokenKind, TokenStream, attr_literal, call_key, expand, lex, write_token, write_tokens,
 };
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
@@ -733,8 +733,9 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
                     return Err(self.refused(ValueWhy::Definition { mac, note }));
                 }
             };
-            let args = cur_stream.copy_in(cur_at.open + 1..cur_at.close, alloc).map_err(|error| self.refused(ValueWhy::Stream { mac, error }))?;
-            let site = CallSite { edition: self.edition, panic_edition: self.edition, ctx: Ctx::root(self.edition) };
+            let mut args = cur_stream.copy_in(cur_at.open + 1..cur_at.close, alloc).map_err(|error| self.refused(ValueWhy::Stream { mac, error }))?;
+            let site = CallSite::from_path(cur_stream, cur_at.path.0..cur_at.path.1, &mut args, self.edition)
+                .map_err(|error| self.refused(ValueWhy::Stream { mac, error }))?;
             let call = Call { kind: CallKind::FnLike { args: &args }, site, eager: Eager { inside: Inside::EagerInput, answers: &[] } };
             let failed = |error| ValueWhy::Expand { mac, error };
             let (mut expansion, mut key, mut finished_mac) = match expand(&definition, &call, self.cx, alloc).map_err(|error| self.refused(failed(error)))? {

@@ -2581,3 +2581,202 @@ fn local_inner_mark_stamps_def_tokens_and_survives_metavar_forwarding_and_record
     let ic_word = bw.words.iter().find(|w| &bw.text[w.text.0 as usize..w.text.1 as usize] == "inner_code").expect("inner_code word");
     assert_eq!(ic_word.mark.map(|m| (m.site.krate, m.local_inner)), Some((dep_krate, true)));
 }
+
+#[test]
+fn call_site_ctx_from_derive_attr_fn_like_and_call_key_hygiene() {
+    use blaze_expand::{
+        ItemAttrs, NextAttr, ProcCall, ProcKind, Produced, Reads, Transparency, body_words,
+        call_key, local_hygiene,
+    };
+    use blaze_own::AVec;
+
+    struct EmitHost(Transparency);
+    impl ExpandCx for EmitHost {
+        fn cfg(&self, _: &TokenStream<'_>) -> Result<bool, HostError> {
+            Err(HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })
+        }
+        fn env(&self, _: &str) -> Result<Option<&str>, HostError> {
+            Err(HostError { ask: HostAsk::Env, why: HostWhy::Refused })
+        }
+        fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Include, why: HostWhy::Refused })
+        }
+        fn place(&self, _: PlaceOf) -> Result<Place<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused })
+        }
+        fn run_proc_macro<'a>(
+            &self,
+            _: &MacroDefinition<'_>,
+            call: ProcCall<'_>,
+            alloc: Alloc<'a>,
+        ) -> Result<Produced<'a>, HostError> {
+            // Find `host` in input to echo as `TokenOrigin::Input`, and synthesize a second
+            // `host` with `self.0` (`Transparent` = call_site, `SemiOpaque` = mixed_site,
+            // `Opaque` = def_site).
+            let host_at = (0..call.input.len())
+                .find(|&i| call.input.text_at(i) == "host")
+                .map(|i| u32::try_from(i).expect("short"));
+            let mut out = TokenStream::new_in(alloc);
+            let mut origins = AVec::new_in(alloc);
+            if let Some(at) = host_at {
+                out.ident("host", Ctx::root(Edition::E2021)).expect("push");
+                origins.push(TokenOrigin::Input(at));
+            }
+            out.ident("host", Ctx::root(Edition::E2021)).expect("push");
+            origins.push(TokenOrigin::Made(self.0));
+            Ok(Produced {
+                tokens: out,
+                origins,
+                reads: Reads::new_in(alloc),
+                diagnostics: AVec::new_in(alloc),
+                text: AVec::new_in(alloc),
+            })
+        }
+    }
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let outer_krate = CrateItemKey(ContentId([0xA1; 32]));
+    let inner_krate = CrateItemKey(ContentId([0xA2; 32]));
+    let proc_krate = CrateItemKey(ContentId([0xA3; 32]));
+
+    // 1. Nested `outer!()` -> `inner!()` -> `#[derive(Snafu)] enum E { A { host: u32 } }`:
+    //    `Derives::call_site` imports the full parent chain into `derives.input`, so a
+    //    `Transparent` (`Span::call_site()`) token emitted by the derive matches `local_hygiene`
+    //    and `text_mark` of the input `host` token, while `Opaque` (`def_site`) and `SemiOpaque`
+    //    (`mixed_site`) stay hygienically isolated!
+    let inner_def = MacroDefinition::rules(
+        lex("() => { #[derive(Snafu)] enum E { A { host: u32 } } };", Edition::E2024, alloc).expect("lex"),
+        DefAt { site: DefSite { krate: inner_krate, module: None }, edition: Edition::E2024, ..at(0xA2) },
+    );
+    let outer_def = MacroDefinition::rules(
+        lex("() => { inner!(); };", Edition::E2021, alloc).expect("lex"),
+        DefAt { site: DefSite { krate: outer_krate, module: None }, edition: Edition::E2021, ..at(0xA1) },
+    );
+    let outer_exp = done(expand(&outer_def, &Call::fn_like(&TokenStream::new_in(alloc), CallSite::root(Edition::E2024)), &TestCx::new(), alloc));
+    let mut outer_sealed = outer_exp.tokens.clone_in(alloc);
+    let outer_key = ContentId([0xB1; 32]);
+    outer_sealed.seal(outer_key);
+
+    // Extract `inner!()` call site via `CallSite::before_open`.
+    let open = (0..outer_sealed.len()).find(|&i| matches!(outer_sealed.tokens()[i].kind, TokenKind::Open(Delim::Paren))).expect("open");
+    let close = outer_sealed.close_of(open).expect("close");
+    let mut inner_args = outer_sealed.copy_in(open + 1..close, alloc).expect("copy args");
+    let inner_site = CallSite::before_open(&outer_sealed, open, &mut inner_args, Edition::E2024).expect("before_open");
+    assert_eq!(inner_site.edition, Edition::E2021, "fn-like call site takes path token's edition");
+    assert_eq!(inner_args.non_transparent_mark(inner_site.ctx).map(|m| m.site.krate), Some(outer_krate));
+
+    let inner_exp = done(expand(&inner_def, &Call::fn_like(&inner_args, inner_site), &TestCx::new(), alloc));
+    let mut inner_sealed = inner_exp.tokens.clone_in(alloc);
+    let inner_key = ContentId([0xB2; 32]);
+    inner_sealed.seal(inner_key);
+
+    let mut derives = ItemAttrs::new(inner_sealed)
+        .derives(&mut |_, _| Ok::<bool, ()>(true))
+        .expect("derives")
+        .expect("item stays");
+    let derive_site = derives.call_site(0, Edition::E2021).expect("derive call_site");
+    assert_eq!(derive_site.edition, Edition::E2024, "derive call site takes derive path token's edition");
+    assert_eq!(derives.input.non_transparent_mark(derive_site.ctx).map(|m| m.site.krate), Some(inner_krate));
+
+    let derive_def = MacroDefinition::proc_macro(
+        proc_krate,
+        ProcKind::Derive,
+        "Snafu",
+        &[],
+        DefAt { site: DefSite { krate: proc_krate, module: None }, edition: Edition::E2021, ..at(0xA3) },
+        alloc,
+    )
+    .expect("proc derive");
+
+    let call_call_site = Call::derive(&derives.input, DeriveFacts::PLAIN, derive_site);
+    let this_key = ContentId([0xB3; 32]);
+
+    // Transparent (`Span::call_site()`): matches `Input` `host` in both `local_hygiene` and `TextMark::local_hygiene`!
+    let exp_trans = done(expand(&derive_def, &call_call_site, &EmitHost(Transparency::Transparent), alloc));
+    let h_input = local_hygiene(&exp_trans.tokens, exp_trans.tokens.tokens()[0].ctx, this_key);
+    let h_made = local_hygiene(&exp_trans.tokens, exp_trans.tokens.tokens()[1].ctx, this_key);
+    assert_ne!(h_input, 0);
+    assert_eq!(h_made, h_input, "Span::call_site() must share local_hygiene with enclosing macro_rules! input token");
+    assert_eq!(
+        exp_trans.text_mark(1).expect("made mark").local_hygiene(),
+        exp_trans.text_mark(0).expect("input mark").local_hygiene(),
+        "Span::call_site() TextMark::local_hygiene must match enclosing macro_rules! input token"
+    );
+    let bw = body_words(&exp_trans.tokens, this_key, alloc);
+    assert_eq!(bw.words[0].hygiene, bw.words[1].hygiene);
+
+    // Negative controls: `Opaque` (`def_site`) and `SemiOpaque` (`mixed_site`) MUST NOT match!
+    for neg in [Transparency::Opaque, Transparency::SemiOpaque] {
+        let exp_neg = done(expand(&derive_def, &call_call_site, &EmitHost(neg), alloc));
+        let h_in = local_hygiene(&exp_neg.tokens, exp_neg.tokens.tokens()[0].ctx, this_key);
+        let h_out = local_hygiene(&exp_neg.tokens, exp_neg.tokens.tokens()[1].ctx, this_key);
+        assert_ne!(h_out, h_in, "{neg:?} proc-macro token must stay hygienically isolated from input `host`");
+        assert_ne!(
+            exp_neg.text_mark(1).expect("neg mark").local_hygiene(),
+            exp_neg.text_mark(0).expect("input mark").local_hygiene(),
+            "{neg:?} TextMark::local_hygiene must stay isolated from input `host`"
+        );
+    }
+
+    // 2. Attribute macro (`ItemAttrs::attr_call`): imports attribute path ctx into `made.item`.
+    let attr_emitter = MacroDefinition::rules(
+        lex("() => { #[my_attr] fn f() { let host = 1; } };", Edition::E2021, alloc).expect("lex"),
+        DefAt { site: DefSite { krate: inner_krate, module: None }, edition: Edition::E2021, ..at(0xA2) },
+    );
+    let attr_exp = done(expand(&attr_emitter, &Call::fn_like(&TokenStream::new_in(alloc), CallSite::root(Edition::E2024)), &TestCx::new(), alloc));
+    let mut attr_sealed = attr_exp.tokens.clone_in(alloc);
+    attr_sealed.seal(ContentId([0xB4; 32]));
+    let mut walk = ItemAttrs::new(attr_sealed);
+    let NextAttr::Call { attr, .. } = walk.next(&mut |_, _| Ok::<bool, ()>(true)).expect("next") else {
+        panic!("expected attr call");
+    };
+    let made = walk.attr_call(attr).expect("attr_call");
+    let attr_site = made.call_site(Edition::E2024);
+    assert_eq!(attr_site.edition, Edition::E2021);
+    assert_eq!(made.item.non_transparent_mark(attr_site.ctx).map(|m| m.site.krate), Some(inner_krate));
+
+    // 3. Key hygiene (Rule 21): two calls with identical token text & input stream but different
+    //    `CallSite.ctx` produce distinct `call_key`s!
+    let mut shared_input = lex("host", Edition::E2021, alloc).expect("lex");
+    let mark_a = blaze_expand::Mark {
+        of: MarkOf::Outer(ContentId([0xC1; 32])),
+        transparency: Transparency::SemiOpaque,
+        edition: Edition::E2021,
+        site: DefSite { krate: outer_krate, module: None },
+        local_inner: false,
+    };
+    let mark_b = blaze_expand::Mark {
+        of: MarkOf::Outer(ContentId([0xC2; 32])),
+        transparency: Transparency::SemiOpaque,
+        edition: Edition::E2021,
+        site: DefSite { krate: inner_krate, module: None },
+        local_inner: false,
+    };
+    let ctx_a = shared_input.context(blaze_expand::CtxNode { parent: Ctx::root(Edition::E2021), mark: mark_a }).expect("ctx_a");
+    let ctx_b = shared_input.context(blaze_expand::CtxNode { parent: Ctx::root(Edition::E2021), mark: mark_b }).expect("ctx_b");
+    let fn_proc = MacroDefinition::proc_macro(
+        proc_krate,
+        ProcKind::FnLike,
+        "emit",
+        &[],
+        DefAt { site: DefSite { krate: proc_krate, module: None }, edition: Edition::E2021, ..at(0xA3) },
+        alloc,
+    )
+    .expect("fn proc");
+    let key_root = call_key(&fn_proc, &Call::fn_like(&shared_input, CallSite::root(Edition::E2021)));
+    let key_a = call_key(&fn_proc, &Call::fn_like(&shared_input, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: ctx_a }));
+    let key_b = call_key(&fn_proc, &Call::fn_like(&shared_input, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: ctx_b }));
+    assert_ne!(key_root, key_a, "root CallSite.ctx vs outer mark A must yield distinct call_key");
+    assert_ne!(key_a, key_b, "outer mark A vs outer mark B must yield distinct call_key");
+
+    // 4. `Call::check` (Rule 74): refuses a `CallSite.ctx` that does not belong to `Call::input()`.
+    let empty_input = TokenStream::new_in(alloc);
+    let bad_call = Call::fn_like(&empty_input, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: ctx_a });
+    assert!(
+        matches!(
+            expand(&fn_proc, &bad_call, &EmitHost(Transparency::Transparent), alloc),
+            Err(blaze_expand::ExpandError::Stream { stream: Some(blaze_expand::Stream::Input), error: blaze_expand::StreamError::NoSuchContext { .. } })
+        ),
+        "Call::check must refuse a CallSite.ctx not in Call::input()"
+    );
+}

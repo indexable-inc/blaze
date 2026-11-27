@@ -3794,7 +3794,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         },
     };
 
-    let input = match src.tokens {
+    let mut input = match src.tokens {
         crate::nested_input::CallTokens::Expansion(tokens) => match tokens.copy_in(alloc) {
             Ok(stream) => stream,
             Err(error) => {
@@ -3816,18 +3816,30 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         },
     };
 
-    let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
     let cfg_atom = |name: &str, value: Option<&str>| base.cfg.atoms().binary_search(&(name, value)).is_ok();
     let atom = &mut |name: &str, value: Option<&str>| Ok::<bool, Infallible>(cfg_atom(name, value));
     let (args, item): (Option<TokenStream<'_>>, TokenStream<'_>);
     let derive_facts;
     let call_of = match src.kind {
-        CallShape::FnLike => Call::fn_like(&input, site),
+        CallShape::FnLike => {
+            let site = match src.tokens {
+                crate::nested_input::CallTokens::Expansion(tokens) => match tokens.start.checked_sub(1).and_then(|open| usize::try_from(open).ok()) {
+                    Some(open) => match CallSite::before_open(tokens.of.stream, open, &mut input, edition) {
+                        Ok(site) => site,
+                        Err(error) => return fail_with(ExpandNote::Expand { macro_name: mac.name, error: ExpandError::Stream { stream: None, error } }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+                    },
+                    None => CallSite::root(edition),
+                },
+                crate::nested_input::CallTokens::Text | crate::nested_input::CallTokens::Refused(_) => CallSite::root(edition),
+            };
+            Call::fn_like(&input, site)
+        }
         CallShape::Attr if src.implicit => {
             let made = match ItemAttrs::new(input).implicit_call(atom) {
                 Ok(made) => made,
                 Err(error) => return fail_with(ExpandNote::ItemAttrs { macro_name: mac.name, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
             };
+            let site = made.call_site(edition);
             (args, item) = (made.args, made.item);
             Call::attr(args.as_ref(), &item, site)
         }
@@ -3858,11 +3870,12 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
                 Ok(made) => made,
                 Err(error) => return fail_with(ExpandNote::ItemAttrs { macro_name: mac.name, error: ItemAttrsError::Stream(error) }, &mut notes, &mut last, eager_checked_cell.into_inner()),
             };
+            let site = made.call_site(edition);
             (args, item) = (made.args, made.item);
             Call::attr(args.as_ref(), &item, site)
         }
         CallShape::Derive => {
-            let derives = match ItemAttrs::new(input).derives(atom) {
+            let mut derives = match ItemAttrs::new(input).derives(atom) {
                 Ok(Some(derives)) => derives,
                 Ok(None) => return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: true },
                 Err(error) => return fail_with(ExpandNote::ItemAttrs { macro_name: mac.name, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
@@ -3871,13 +3884,17 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
                 Ok(stream) => stream,
                 Err(error) => return fail_with(ExpandNote::Lex { macro_name: mac.name, what: Lexed::Path, error }, &mut notes, &mut last, eager_checked_cell.into_inner()),
             };
-            let Some(used) = derives.uses.iter().find(|u| match attr_plant {
+            let Some((used_at, used)) = derives.uses.iter().enumerate().find(|(_, u)| match attr_plant {
                 AttrPlant::None => blaze_expand::same_path(&u.tokens, 0..u.tokens.len(), &named, 0..named.len()),
                 AttrPlant::Spelling => same_spelling(&u.path, src.name),
             }) else {
                 return fail_with(ExpandNote::AttrNotFound { name: src.name }, &mut notes, &mut last, eager_checked_cell.into_inner());
             };
             derive_facts = derives.facts(used);
+            let site = match derives.call_site(used_at, edition) {
+                Ok(site) => site,
+                Err(error) => return fail_with(ExpandNote::ItemAttrs { macro_name: mac.name, error: ItemAttrsError::Stream(error) }, &mut notes, &mut last, eager_checked_cell.into_inner()),
+            };
             item = derives.input;
             Call::derive(&item, derive_facts, site)
         }
@@ -4771,7 +4788,6 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     // builtin or a proc macro has nothing to compile and is built for its call's shape.
     let declarative = matches!(mac.body, MacroBody::Rules(_) | MacroBody::Macro2 { .. });
     seen(def_key, src.input);
-    let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
     let file = held(base_files(run), "files").at(src.loc.file as usize);
     // The file the call is written in ([`CallSrc::written`]): where its `include!` reads from.
     let calling: &'a str = src.written;
@@ -4859,7 +4875,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     // is the item, lexed as text of its own. A call written in an expansion takes its input as
     // that expansion's sealed tokens (crate::nested_input): each keeps its context, so a
     // `$crate` or a definition-site name passed down keeps its mark, and the key holds them.
-    let input = match src.tokens {
+    let mut input = match src.tokens {
         crate::nested_input::CallTokens::Expansion(tokens) => match tokens.copy_in(alloc) {
             Ok(stream) => stream,
             Err(error) => {
@@ -4900,7 +4916,22 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     let (args, item): (Option<TokenStream<'_>>, TokenStream<'_>);
     let derive_facts;
     let call_of = match src.kind {
-        CallShape::FnLike => Call::fn_like(&input, site),
+        CallShape::FnLike => {
+            let site = match src.tokens {
+                crate::nested_input::CallTokens::Expansion(tokens) => match tokens.start.checked_sub(1).and_then(|open| usize::try_from(open).ok()) {
+                    Some(open) => match CallSite::before_open(tokens.of.stream, open, &mut input, edition) {
+                        Ok(site) => site,
+                        Err(error) => {
+                            note(ExpandNote::Expand { macro_name: mac.name, error: ExpandError::Stream { stream: None, error } });
+                            return None;
+                        }
+                    },
+                    None => CallSite::root(edition),
+                },
+                crate::nested_input::CallTokens::Text | crate::nested_input::CallTokens::Refused(_) => CallSite::root(edition),
+            };
+            Call::fn_like(&input, site)
+        }
         CallShape::Attr if src.implicit => {
             // D104: no attribute names the call; it stands outermost, so the item is all of
             // the input, each `#[cfg_attr]` applied (blaze-expand `ItemAttrs::implicit_call`).
@@ -4911,6 +4942,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
                     return None;
                 }
             };
+            let site = made.call_site(edition);
             (args, item) = (made.args, made.item);
             Call::attr(args.as_ref(), &item, site)
         }
@@ -4952,11 +4984,12 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
                     return None;
                 }
             };
+            let site = made.call_site(edition);
             (args, item) = (made.args, made.item);
             Call::attr(args.as_ref(), &item, site)
         }
         CallShape::Derive => {
-            let derives = match ItemAttrs::new(input).derives(atom) {
+            let mut derives = match ItemAttrs::new(input).derives(atom) {
                 Ok(Some(derives)) => derives,
                 // The item's cfg is false: nothing of it is derived.
                 Ok(None) => return Some((DeclsBuilder::new_in(home), None)),
@@ -4968,7 +5001,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
             // Found by the path's words, as an attribute call is (the arm above).
             let plant = base.sources.attr_plant();
             let named = lexed(src.name, Lexed::Path)?;
-            let Some(used) = derives.uses.iter().find(|u| match plant {
+            let Some((used_at, used)) = derives.uses.iter().enumerate().find(|(_, u)| match plant {
                 AttrPlant::None => blaze_expand::same_path(&u.tokens, 0..u.tokens.len(), &named, 0..named.len()),
                 AttrPlant::Spelling => same_spelling(&u.path, src.name),
             }) else {
@@ -4976,6 +5009,13 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
                 return None;
             };
             derive_facts = derives.facts(used);
+            let site = match derives.call_site(used_at, edition) {
+                Ok(site) => site,
+                Err(error) => {
+                    item_note(ItemAttrsError::Stream(error));
+                    return None;
+                }
+            };
             item = derives.input;
             Call::derive(&item, derive_facts, site)
         }
@@ -5689,6 +5729,7 @@ struct EagerFrame<'a> {
     def: MacroDefinition<'a>,
     name: &'static str,
     input: TokenStream<'a>,
+    site: CallSite,
     nested: Option<AVec<'a, NestedCall>>,
     answers: AVec<'a, TokenStream<'a>>,
 }
@@ -5730,7 +5771,7 @@ impl<'a, 'w> EagerDriver<'_, 'a, 'w> {
                 let (key, result) = {
                     let mut refs: AVec<'_, &TokenStream<'_>> = AVec::with_capacity_in(top.answers.len(), alloc);
                     refs.extend(top.answers.iter());
-                    let call = Call { kind: CallKind::FnLike { args: &top.input }, site, eager: blaze_expand::Eager { inside: Inside::EagerInput, answers: &refs } };
+                    let call = Call { kind: CallKind::FnLike { args: &top.input }, site: top.site, eager: blaze_expand::Eager { inside: Inside::EagerInput, answers: &refs } };
                     (call_key(&top.def, &call).0, expand(&top.def, &call, cx, alloc))
                 };
                 let name = top.name;
@@ -5795,11 +5836,17 @@ impl<'a, 'w> EagerDriver<'_, 'a, 'w> {
                 (Some(_), true) => return Err(self.refused(&path, EagerRefusal::Shadowed)),
             };
             let inner = call.inner();
-            let Ok(args) = input.copy_in(inner.start as usize..inner.end as usize, alloc) else {
+            let Ok(mut args) = input.copy_in(inner.start as usize..inner.end as usize, alloc) else {
+                return Err(self.refused(&path, EagerRefusal::Stream));
+            };
+            let Some((path_start, path_end)) = usize::try_from(call.path.start).ok().zip(usize::try_from(call.path.end).ok()) else {
+                return Err(self.refused(&path, EagerRefusal::Stream));
+            };
+            let Ok(child_site) = CallSite::from_path(input, path_start..path_end, &mut args, site.edition) else {
                 return Err(self.refused(&path, EagerRefusal::Stream));
             };
             let def = MacroDefinition::builtin_fn(which, self.def_at, alloc);
-            stack.push(EagerFrame { def, name: which.name(), input: args, nested: None, answers: AVec::new_in(alloc) });
+            stack.push(EagerFrame { def, name: which.name(), input: args, site: child_site, nested: None, answers: AVec::new_in(alloc) });
         }
     }
 }
