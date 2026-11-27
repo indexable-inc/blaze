@@ -768,8 +768,10 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                     out.push(kind, text.as_str(), ctx).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
                 }
                 (Place::Text(value), false) => {
+                    use core::fmt::Write;
+                    // `TokenStream` stores the unquoted body of `LitKind::Str` and wraps it in
+                    // `"` quotes on print (matching `blaze_expand::builtin::push_str_literal`).
                     let mut text = AString::new_in(self.alloc);
-                    text.push('"');
                     for ch in value.chars() {
                         match ch {
                             '\\' => text.push_str("\\\\"),
@@ -778,10 +780,12 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                             '\r' => text.push_str("\\r"),
                             '\t' => text.push_str("\\t"),
                             '\0' => text.push_str("\\0"),
+                            c if c.is_control() => {
+                                let _ = write!(text, "\\u{{{:x}}}", u32::from(c));
+                            }
                             c => text.push(c),
                         }
                     }
-                    text.push('"');
                     let kind = TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
                     out.push(kind, text.as_str(), ctx).map_err(|e| Refused::Failed(Failure::Stream(e)))?;
                 }

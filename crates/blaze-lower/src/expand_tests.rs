@@ -1627,3 +1627,34 @@ fn item_macro_call_site_param_does_not_shadow_def_site_call() {
         .collect();
     assert_eq!(local_names, vec!["found", "name"], "expected `found` then `name` locals:\n{dump}");
 }
+
+/// `file!()` and `module_path!()` filled via `ByName::fill_holes` must emit single-quoted valid
+/// string literals (never double-quoted `""...""`), matching `blaze_expand::builtin::push_str_literal`.
+#[test]
+fn fill_holes_file_and_module_path_are_single_quoted_string_literals() {
+    let wrap = ("wrap", "() => { (file!(), module_path!()) }");
+    let l = expanding(&[wrap], "fn f() { let _ = wrap!(); }");
+    let v = l.view();
+    let mut lits = StdVec::new();
+    for i in 0..v.exprs.len() as u32 {
+        let id = ExprId(i);
+        if matches!(v.expr(id), Ok(Expr::Lit(_))) {
+            let r = v.expr_range(id).expect("expr range");
+            lits.push(v.text_at(r).expect("literal text"));
+        }
+    }
+    assert_eq!(lits.len(), 2, "expected file!() and module_path!() literals, got {lits:?}");
+    for lit in &lits {
+        let inner = lit.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or_else(|| panic!("not quoted: {lit:?}"));
+        assert!(!inner.starts_with('"') && !inner.ends_with('"'), "double-quoted hole literal: {lit:?}");
+        let mut ok = true;
+        parser::unescape::unescape_str(inner, |_, unit| {
+            if let Err(e) = unit
+                && e.is_fatal()
+            {
+                ok = false;
+            }
+        });
+        assert!(ok, "literal failed rustc unescape_str: {lit:?}");
+    }
+}
