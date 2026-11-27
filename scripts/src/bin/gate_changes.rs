@@ -50,12 +50,11 @@ const CODE: &[&str] = &[
     "pins/",
     // The gate's jobs, and the actions they use.
     ".github/workflows/blaze.yaml",
-    ".github/actions/toolchain/",
-    ".github/actions/rustup/",
     // The check job's built scripts (`changed`): their cache key and their build, and the release
     // of blaze that builds them (.github/actions/blaze).
     ".github/actions/script/",
     ".github/actions/blaze/",
+    ".github/blaze-cli-version",
     ".github/blaze-version",
     // The package of the repository's scripts (scripts/src/bin/<name>.rs), a workspace member;
     // their library is crates/blaze-script, under crates/ above.

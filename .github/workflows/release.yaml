@@ -20,11 +20,6 @@ on:
         required: false
         default: true
         type: boolean
-      bootstrap_seed:
-        description: "Temporary one-time seed build via pins/toolchain to cut the first self-contained v2 release (delete after v0.20261127.0)"
-        required: false
-        default: false
-        type: boolean
 
 concurrency:
   group: release-${{ github.ref }}
@@ -45,31 +40,26 @@ jobs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
       promote_stable: ${{ steps.meta.outputs.promote_stable }}
-      bootstrap_seed: ${{ steps.meta.outputs.bootstrap_seed }}
     steps:
       - uses: actions/checkout@v7
       - id: meta
         env:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_STABLE: ${{ inputs.promote_stable }}
-          INPUT_SEED: ${{ inputs.bootstrap_seed }}
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
         run: |
           if [ "$REF_TYPE" = "tag" ]; then
             TAG="$REF_NAME"
             PROMOTE="true"
-            SEED="false"
           else
             TAG="$INPUT_TAG"
             PROMOTE="${INPUT_STABLE:-true}"
-            SEED="${INPUT_SEED:-false}"
           fi
           VER="${TAG#v}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "promote_stable=$PROMOTE" >> "$GITHUB_OUTPUT"
-          echo "bootstrap_seed=$SEED" >> "$GITHUB_OUTPUT"
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: '0.13.5'
@@ -129,11 +119,7 @@ jobs:
           name: toolchain-shelf
           path: ${{ runner.temp }}/toolchain-shelf
       - uses: ./.github/actions/blaze
-        if: needs.prepare.outputs.bootstrap_seed != 'true'
-        with:
-          require-launcher: "false"
       - name: Build release blaze, blaze-launcher, and blaze-fact-shim with blaze
-        if: needs.prepare.outputs.bootstrap_seed != 'true'
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: |
@@ -152,33 +138,6 @@ jobs:
           run_bounded 1800 blaze build --release -p blaze-cli --bin blaze -o target/release/blaze
           run_bounded 1800 blaze build --release -p blaze-cli --bin blaze-fact-shim -o target/release/blaze-fact-shim
           run_bounded 1800 blaze build --release -p blaze-launcher --bin blaze-launcher -o target/release/blaze-launcher
-      - uses: ./.github/actions/toolchain
-        if: needs.prepare.outputs.bootstrap_seed == 'true'
-      - name: Temporary seed build (v0.20261127.0 bootstrap only)
-        if: needs.prepare.outputs.bootstrap_seed == 'true'
-        env:
-          MACOSX_DEPLOYMENT_TARGET: "13.0"
-        run: |
-          set -euo pipefail
-          run_bounded() {
-            local secs=$1; shift
-            if command -v timeout >/dev/null 2>&1; then
-              timeout -k 30 "$secs" "$@"
-            elif command -v gtimeout >/dev/null 2>&1; then
-              gtimeout -k 30 "$secs" "$@"
-            else
-              "$@"
-            fi
-          }
-          tc="$(cat pins/toolchain)"
-          run_bounded 1800 cargo +"$tc" build --locked --release -p blaze-cli --bin blaze --bin blaze-fact-shim -p blaze-launcher --bin blaze-launcher
-          out_dir="${CARGO_TARGET_DIR:-target}/release"
-          mkdir -p target/release
-          if [ "$(cd "$out_dir" && pwd -P)" != "$(cd target/release && pwd -P)" ]; then
-            cp "$out_dir/blaze" target/release/blaze
-            cp "$out_dir/blaze-launcher" target/release/blaze-launcher
-            cp "$out_dir/blaze-fact-shim" target/release/blaze-fact-shim
-          fi
       - name: Archive and checksum
         run: |
           set -euo pipefail

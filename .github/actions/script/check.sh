@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# `check.sh DIR KEY`: DIR, restored from the cache under KEY, is what build.sh made under that key:
-# DIR/KEY says KEY and every script of scripts/src/bin has its binary. A miss names what is
-# wrong and stops; nothing is rebuilt in its place (AGENTS.md no-fallback).
+# `check.sh DIR KEY JOB`: verifies DIR, restored from the cache under KEY, holds KEY and every
+# binary `bins.sh JOB` requires. A miss names what is wrong and stops; nothing is rebuilt in its
+# place (AGENTS.md no-fallback).
 set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd -P)
 die() { echo "::error::$*" >&2; echo "check.sh: $*" >&2; exit 1; }
-[ $# = 2 ] || die "takes DIR and KEY, not: $*"
-dir=$1 key=$2
+[ $# = 3 ] || die "takes DIR, KEY, and JOB, not: $*"
+dir=$1 key=$2 job=$3
 [ -f "$dir/KEY" ] || die "the built scripts restored at $dir have no KEY file"
 [ "$(cat "$dir/KEY")" = "$key" ] || die "the built scripts at $dir are of key $(cat "$dir/KEY"), not $key"
-for src in scripts/src/bin/*.rs; do
-  name=$(basename "$src" .rs)
-  [ -x "$dir/$name" ] || die "the built scripts at $dir (key $key) have no $name, which scripts/src/bin has"
-done
+bins=$("$here/bins.sh" "$job")
+while IFS= read -r name; do
+  [ -n "$name" ] || continue
+  [ -x "$dir/$name" ] || die "the built scripts at $dir (key $key, job $job) have no $name"
+done <<< "$bins"

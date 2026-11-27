@@ -84,30 +84,31 @@ job of the gate runs on Linux AArch64 on an ix runner ([ix runners](#ix-runners)
 
 | Workflow | Event | What runs |
 |---|---|---|
-| `blaze.yaml` (`changes`) | pull request, merge-queue entry, push to main | a path filter in the job's shell: whether the change touches a file the `cargo` job reads (below) |
+| `blaze.yaml` (`changes`) | pull request, merge-queue entry, push to main | a path filter in the job's shell: whether the change touches a file the `blaze` job reads (below) |
 | `blaze.yaml` (`scripts`) | every change | `scripts/src/bin/gate.rs` over every row of `tools/gate.txt` (as `just lint`), no Python: the agent rules, the docs, `rustcsites`, `changed`, the invariants, the Lean sources, the lint table, the hash domains, and the ratchets of `tools/ratchets` and of persisted layouts |
 | `blaze.yaml` (`lean`) | every change | the Lean proofs (`scripts/src/bin/lean_gate.rs`, [v2/plan/proofs.md](v2/plan/proofs.md)): `lake build` of `lean/` and `lean/analysis` with the pinned Lean, no `sorry`, and each theorem of `lean/theorems.json` held to Lean's three axioms by `#print axioms` |
 | `blaze.yaml` (`workflows`) | every change | actionlint over `.github/workflows` (below) |
-| `blaze.yaml` (`cargo`) | a change of code | on a 64-vCPU ix runner, with cargo and the pinned nightly (`pins/toolchain`): the toolchain shelf cut (`toolchain_cut`), `cargo check --locked --workspace --exclude blaze-std --all-targets`, the tests (`scripts/src/bin/ci_test.rs`), then blaze-sys's imports per target (`sys_imports`) |
+| `blaze.yaml` (`blaze`) | a change of code | on a 64-vCPU ix runner, with pinned v2 `blaze` (`.github/blaze-cli-version`, `.github/actions/blaze`, persistent `$HOME/.blaze/v2`): `blaze check . --stats` and `blaze test . --stats` |
 | `blaze.yaml` (`ci`) | always | whether every job the tier expected ran and succeeded: the one check the branch rules require |
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file |
 | `llvm.yaml` | a change of its recipe, by hand | the pinned LLVM (`pins/llvm.json`) built for each target by `.github/scripts/llvm.py` on hosted runners, and put into R2 (`.github/scripts/r2.py`) |
-| `release.yaml` | a `v0.*` tag, by hand | `blaze` built per target and published to R2 (`blaze-releases`) and GitHub Releases |
+| `release.yaml` | a `v0.*` tag, by hand | `blaze`, `blaze-launcher`, `blaze-fact-shim`, and the pinned v2 toolchain shelf built per AArch64 target with `blaze build --release` and published to R2 (`blaze-releases`) and GitHub Releases |
 | `site.yaml` | a change of the site, by hand | builds and checks `site/`; a push to main deploys it |
 
-The `cargo` job runs only for a change that touches a file it reads; any other change runs the
+The `blaze` job runs only for a change that touches a file it reads; any other change runs the
 rest alone. The `changes` job's filter in `blaze.yaml` names those files: `crates/`, `vendor/`,
 `library/`, `pins/`, `scripts/`, `tools/astlog/`, `.cargo/`, `.github/`, `Cargo.toml`,
 `Cargo.lock`, `.rustfmt.toml` and `.clippy.toml`. It names what is code rather than what is not,
 so a new directory of documents, benches or harnesses runs no build; a change with no base (a run
-by hand) or whose file list GitHub refuses counts as code. When the `cargo` job starts reading a
+by hand) or whose file list GitHub refuses counts as code. When the `blaze` job starts reading a
 new file, add it there.
 
-Every job that runs a script (`scripts`, `lean` and `cargo`) takes the built
-scripts from `.github/actions/script`: binaries kept in the Actions cache under a key of every
-input of their build (`key.sh` says why it covers them all). A hit builds nothing and takes
-seconds; a miss builds `cargo build --locked -p scripts --bins` with the pinned nightly
-(`build.sh`) and saves them. `local.sh CACHE` runs the same steps outside Actions, with a
+Every job that runs a script (`scripts`, `lean`, and `release`) takes its job-scoped built
+scripts (`bins.sh <job>`) from `.github/actions/script`: standalone binaries kept in the Actions
+cache under a key covering every input of their build (`key.sh` hashes every unchecksummed
+package in `scripts`'s `Cargo.lock` closure). A hit builds nothing and takes seconds; a miss
+builds only that job's binaries with `blaze build --standalone -p scripts --bin <name>`
+(`build.sh`) and saves them. `local.sh CACHE [JOB]` runs the same steps outside Actions, with a
 directory for the cache.
 
 A change reaches main through a **pull request** alone
@@ -142,7 +143,7 @@ architecture it has no node for, and an `x64` job then waits a day), so every Li
 **TODO(x86-64): blaze's x86-64 tests are missing.** No job runs blaze's tests on Linux x86-64
 until ix has x86-64 capacity.
 
-- The `cargo` job runs on `[ix, arm64, ix-cpu-64, blaze]`: 64 vCPUs, and memory that
+- The `blaze` job runs on `[ix, arm64, ix-cpu-64, blaze]`: 64 vCPUs, and memory that
   grows on demand up to 256 GiB, where a hosted runner has 4 vCPUs and 16 GB.
 - The small jobs (`changes`, `scripts`, `lean`, `workflows`, `ci`, llvm.yaml's `publish`) run on
   `[ix, arm64]`, ix's default size.
@@ -152,11 +153,11 @@ until ix has x86-64 capacity.
   site (Cloudflare's).
 
 Every warm ix runner is a fork of the snapshot of the last green job on main with the same
-labels, its disk included: the checkout, cargo's target directory and `~/.rustup`. No swap is
+labels, its disk included: the checkout and `$HOME/.blaze/v2` (store, toolchain shelf, and sources). No swap is
 made on ix: its scrub
 refuses to snapshot a machine with swap on. The image is Ubuntu 24.04 with build-essential, git,
 gh, jq, python3 and Nix, and lacks some of what a hosted image has: `.github/actions/rustup`
-installs rustup when there is none, and an `apt-get install` first fetches the package lists the image does
+installs rustup when there is none (for `site.yaml`'s wasm32 renderer), and an `apt-get install` first fetches the package lists the image does
 not ship.
 
 A run off main never becomes a snapshot, and before every snapshot ix's scrub removes what a job
