@@ -878,7 +878,7 @@ const MEM_PARTS: usize = 23;
 
 /// The first representative of each retained recorder cell, before row placement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct KeptKinds([u32; 24]);
+struct KeptKinds([u32; 25]);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TopKept {
@@ -887,9 +887,9 @@ pub(crate) struct TopKept {
 }
 
 impl KeptKinds {
-    const NAMES: [&'static str; 24] = [
+    const NAMES: [&'static str; 25] = [
         "Binding", "Module", "Root", "Variants", "Item", "Members", "Expansion", "MemberOf",
-        "VariantOf", "Beginning", "Lang", "Incoherent", "InternalSymbols", "Links", "ImplRows", "Files", "Extensions", "CfgAtoms", "Textual", "Whole", "Signature", "Text", "Head", "Impls",
+        "VariantOf", "Beginning", "Lang", "Incoherent", "InternalSymbols", "Links", "ImplRows", "Files", "Extensions", "CfgAtoms", "Exports", "Textual", "Whole", "Signature", "Text", "Head", "Impls",
     ];
 
     fn add(&mut self, key: TableRead) {
@@ -900,12 +900,12 @@ impl KeptKinds {
                 Item { .. } => 4, Members { .. } => 5, Expansion { .. } => 6, MemberOf { .. } => 7,
                 VariantOf { .. } => 8, Beginning { .. } => 9, Lang { .. } => 10, Incoherent { .. } => 11,
                 InternalSymbols { .. } => 12, Links { .. } => 13, ImplRows { .. } => 14, Files { .. } => 15,
-                Extensions { .. } => 16, CfgAtoms { .. } => 17, Textual { .. } => 18, Whole { .. } => 19,
+                Extensions { .. } => 16, CfgAtoms { .. } => 17, Exports { .. } => 18, Textual { .. } => 19, Whole { .. } => 20,
             },
-            TableRead::Signature { .. } => 20,
-            TableRead::Text { .. } => 21,
-            TableRead::Head { .. } => 22,
-            TableRead::Impls { .. } => 23,
+            TableRead::Signature { .. } => 21,
+            TableRead::Text { .. } => 22,
+            TableRead::Head { .. } => 23,
+            TableRead::Impls { .. } => 24,
         };
         self.0[at] += 1;
     }

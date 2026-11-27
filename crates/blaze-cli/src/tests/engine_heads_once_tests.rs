@@ -390,6 +390,7 @@ impl HeadRows {
         part(NameCell::Files { krate }, "Files".into());
         part(NameCell::Extensions { krate }, "Extensions".into());
         part(NameCell::CfgAtoms { krate }, "CfgAtoms".into());
+        part(NameCell::Exports { krate }, "Exports".into());
         part(NameCell::Module { module }, "Module(crate root)".into());
         part(NameCell::Item { key: module }, "Item(crate root)".into());
         part(NameCell::Textual { module }, "Textual(crate root)".into());
