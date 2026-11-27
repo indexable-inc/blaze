@@ -246,11 +246,17 @@ fn read_file(folder: &str, name: &str) -> Result<std::vec::Vec<u8>, NativeUnitEr
     Ok(bytes.as_slice().to_vec())
 }
 
+/// Deadline for staging or cleaning a native build-script work tree (`fresh_folder`,
+/// `remove_tree_under`). Large C crates like `aws-lc-sys` write thousands of source files
+/// concurrently with other workers, so 60s can trip under load; 300s remains a hard bound
+/// against hangs (rule 18).
+const WORK_TREE_DEADLINE: Duration = Duration::from_secs(300);
+
 /// Removes `<work>/<rel>` (files, then nested directories deepest-first, then `<rel>` itself)
 /// through `bstd`, never touching ambient `std::fs`.
 fn remove_tree_under(work: &str, rel: &str, alloc: Alloc<'_>) {
     let Ok((io, root)) = native_world(Path::new(work)) else { return };
-    let Ok(cx) = io.cx(Duration::from_secs(60), TASK_FRAME) else { return };
+    let Ok(cx) = io.cx(WORK_TREE_DEADLINE, TASK_FRAME) else { return };
     let full = blaze_own::format_in!(alloc, "{work}/{rel}");
     if let Some((dirs, files)) = walk_tree(full.as_str(), alloc) {
         for file in files.iter() {
@@ -324,7 +330,7 @@ pub(crate) fn fresh_folder(work: &str, rel: &str, files: &[(String, std::vec::Ve
         remove_tree_under(work, rel, alloc);
     }
     let (io, root) = native_world(Path::new(work)).map_err(|e| failed(e.to_string()))?;
-    let cx = io.cx(Duration::from_secs(60), TASK_FRAME).map_err(|_| failed("its world stopped".to_owned()))?;
+    let cx = io.cx(WORK_TREE_DEADLINE, TASK_FRAME).map_err(|_| failed("its world stopped".to_owned()))?;
     let marker = ".blaze-made";
     let made: [(String, std::vec::Vec<u8>); 1] = [(marker.to_owned(), std::vec::Vec::new())];
     let all = if files.is_empty() { &made[..] } else { files };
