@@ -929,7 +929,26 @@ impl<W: World> ClosureSource for Exact<'_, '_, '_, '_, '_, '_, '_, '_, W> {
 
     fn closure_of(&mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, StalledError> {
         if self.in_foreign || owner != self.body.owner {
-            return self.asked.closure_of(cx, owner, ordinal, args, depth).map_err(Into::into);
+            let Some((facts, env)) = self.asked.reads.closure(owner, ordinal)? else {
+                return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(Question::Closure(owner, ordinal))).into());
+            };
+            let n = cx.list_len(args);
+            let cap = usize::try_from(n).map_err(|_| CheckError::Limit(Limit::Steps))?;
+            let mut subst: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(cap, cx.alloc());
+            for i in 0..n {
+                subst.push(cx.list_get(args, i));
+            }
+            let prev_foreign = self.in_foreign;
+            self.in_foreign = true;
+            let sig = import(cx, self, facts.types, facts.sig, &subst, depth);
+            let env = match sig {
+                Ok(_) => env.map(|p| import(cx, self, facts.types, p, &subst, depth)).transpose(),
+                Err(e) => Err(e),
+            };
+            self.in_foreign = prev_foreign;
+            let sig = sig?;
+            let env = env?;
+            return Ok(cx.imported_closure(owner, ordinal, args, sig, facts.kind, env)?);
         }
         // The `ordinal`-th closure expression of this body (rules/writeback.rs
         // `closure_ordinal`), and its row of `Checked::closures`.

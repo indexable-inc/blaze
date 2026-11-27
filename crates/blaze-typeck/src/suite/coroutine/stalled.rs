@@ -1155,3 +1155,142 @@ fn impl_where_clause_projected_coroutine_superset_returns_gap_or_e0277() {
     assert_eq!(got_bad.len(), 1, "{got_bad:?}");
     assert_eq!(got_bad[0].code, DiagCode::Unsatisfied, "{got_bad:?}");
 }
+
+/// Regression (Codex PR #2770 R4 P2): a foreign closure in a generalized stalled goal's arguments
+/// must import its signature and capture environment recursively through `Exact` (not `Asked`) so
+/// any foreign `Superset` coroutine it names participates in two-pass verification instead of
+/// aborting import with `EXTERNAL_WITNESS_GAP`.
+///
+/// - When `U` is unconstrained (`impl<F: SendWrap, U> Wrapper<U> for F`), a now-`Send` local
+///   future MUST pass even though `U` captures/returns a foreign `Superset` coroutine holding `Rc`.
+/// - When `U: Send` IS required (`impl<F: SendWrap, U: Send> SendWrapper<U> for F`), replay
+///   returns `EXTERNAL_WITNESS_GAP` when `U`'s captured `Superset` coroutine holds `Rc`, and
+///   passes when its `Superset` interior satisfies `Send` (`(Ready,)`).
+#[test]
+fn foreign_closure_capturing_superset_coroutine_participates_in_two_pass_replay() {
+    use crate::ids::FnPtrHeader;
+    use crate::ty::ClosureKind;
+    let alloc = blaze_own::testing::heap().alloc();
+    let (mut fx, it) = world();
+    let (p0, p1, unit) = (fx.param(0), fx.param(1), fx.unit());
+    let send = fx.key_of("Send");
+    let rc_t = fx.adt(fx.key_of("Rc"), &[]);
+    let ready_t = fx.adt(fx.key_of("Ready"), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let p0_send = fx.bound(send, &[p0]);
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
+
+    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, Vec::new());
+    let cor_t = fx.ty(PNode::Coroutine { owner: foreign_fn, ordinal: 0, args: crate::ids::List::EMPTY });
+    let exact_foreign = fx.tuple(&[ready_t]);
+    let superset_bad = fx.tuple(&[rc_t]);
+    fx.coroutines.push((foreign_fn, 0, unit, exact_foreign));
+
+    let closure_owner = fx.func("closure_owner", 0, &[], unit, Vec::new());
+    let closure_io = fx.list(&[cor_t]);
+    let closure_sig = fx.ty(PNode::FnPtr(closure_io, FnPtrHeader::RUST));
+    let closure_env = fx.tuple(&[cor_t]);
+    fx.closures.push((closure_owner, 0, ClosureKind::FnOnce, closure_sig));
+    fx.closure_capture = Some((closure_owner, 0, closure_env));
+    let foreign_closure_t = fx.ty(PNode::Closure { owner: closure_owner, ordinal: 0, args: crate::ids::List::EMPTY });
+
+    // `impl<F: SendWrap, U> Wrapper<U> for F` (U unconstrained).
+    let wrapper = fx.tr("Wrapper", 2, Vec::new(), &[]);
+    let p0_wrap = fx.bound(send_wrap, &[p0]);
+    fx.imp("impl<F: SendWrap, U> Wrapper<U> for F", 2, p0, Some((wrapper, &[p1])), &[], std::vec![p0_wrap]);
+    let wrap_u = fx.bound(wrapper, &[p0, foreign_closure_t]);
+    fx.func("check_unconstrained", 1, &[p0], unit, std::vec![wrap_u]);
+
+    // `impl<F: SendWrap, U: Send> SendWrapper<U> for F` (U must be Send).
+    let send_wrapper = fx.tr("SendWrapper", 2, Vec::new(), &[]);
+    let p1_send = fx.bound(send, &[p1]);
+    fx.imp(
+        "impl<F: SendWrap, U: Send> SendWrapper<U> for F",
+        2,
+        p0,
+        Some((send_wrapper, &[p1])),
+        &[],
+        std::vec![p0_wrap, p1_send],
+    );
+    let send_wrap_u = fx.bound(send_wrapper, &[p0, foreign_closure_t]);
+    fx.func("check_constrained", 1, &[p0], unit, std::vec![send_wrap_u]);
+    fx.finish();
+
+    // Body 1: unconstrained `Wrapper<ForeignClosure> for LocalFuture`.
+    let mut b1 = Bb::new();
+    let body1 = rc_before_await(&mut b1);
+    let block1 = b1.async_block(body1, Capture::Ref);
+    let callee1 = b1.path(&["check_unconstrained"]);
+    let call1 = b1.call(callee1, &[block1]);
+    let s1 = b1.semi(call1);
+    let root1 = b1.block(&[s1], None);
+
+    let mut cx1 = InferCtx::new_in(alloc);
+    let c1 = match check_deferring(&b1.view(it.c_sync, root1), &fx, &mut cx1, &Needs::new_in(alloc), alloc) {
+        Ok(crate::Outcome::Done(c)) => c,
+        Ok(crate::Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
+        Err(e) => panic!("check_deferring refused: {e:?}"),
+    };
+    assert!(c1.diags.is_empty(), "{:?}", c1.diags);
+    assert_eq!(c1.stalled.len(), 1, "{:?}", c1.stalled);
+
+    // Body 2: constrained `SendWrapper<ForeignClosure> for LocalFuture`.
+    let mut b2 = Bb::new();
+    let body2 = rc_before_await(&mut b2);
+    let block2 = b2.async_block(body2, Capture::Ref);
+    let callee2 = b2.path(&["check_constrained"]);
+    let call2 = b2.call(callee2, &[block2]);
+    let s2 = b2.semi(call2);
+    let root2 = b2.block(&[s2], None);
+
+    let mut cx2 = InferCtx::new_in(alloc);
+    let c2 = match check_deferring(&b2.view(it.c_sync, root2), &fx, &mut cx2, &Needs::new_in(alloc), alloc) {
+        Ok(crate::Outcome::Done(c)) => c,
+        Ok(crate::Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
+        Err(e) => panic!("check_deferring refused: {e:?}"),
+    };
+    assert!(c2.diags.is_empty(), "{:?}", c2.diags);
+    assert_eq!(c2.stalled.len(), 1, "{:?}", c2.stalled);
+
+    // Flip `foreign_fn #0` (captured and returned by the foreign closure) to `Superset (Rc,)`.
+    fx.coroutines[0].3 = superset_bad;
+    fx.provisional_coroutines.push((foreign_fn, 0));
+
+    let mut out1 = c1.types.fork_in(alloc).expect("fork");
+    let none1 = out1.intern_list(&[]).expect("list");
+    let ready1 = out1.intern(PNode::Adt(fx.key_of("Ready"), none1)).expect("Ready");
+    let ok_list1 = out1.intern_list(&[ready1]).expect("list");
+    let exact_ok1 = out1.intern(PNode::Tuple(ok_list1)).expect("tuple");
+
+    // Unconstrained `U`: `Wrapper<U> for F` MUST PASS (not EXTERNAL_WITNESS_GAP).
+    let got1 = decide_stalled(&b1.view(it.c_sync, root1), &c1, out1.view(), &[(block1, exact_ok1)], &fx, alloc)
+        .expect("unconstrained foreign closure capturing Superset coroutine must not fail import");
+    assert!(got1.is_empty(), "expected pass for unconstrained U, got {got1:?}");
+
+    let mut out2 = c2.types.fork_in(alloc).expect("fork");
+    let none2 = out2.intern_list(&[]).expect("list");
+    let ready2 = out2.intern(PNode::Adt(fx.key_of("Ready"), none2)).expect("Ready");
+    let ok_list2 = out2.intern_list(&[ready2]).expect("list");
+    let exact_ok2 = out2.intern(PNode::Tuple(ok_list2)).expect("tuple");
+
+    // Constrained `U: Send` with `Superset (Rc,)`: MUST return `EXTERNAL_WITNESS_GAP`.
+    let got2_gap = decide_stalled(&b2.view(it.c_sync, root2), &c2, out2.view(), &[(block2, exact_ok2)], &fx, alloc);
+    assert!(
+        matches!(
+            got2_gap,
+            Err(StalledError::Check(crate::error::CheckError::ForeignWitness {
+                gap,
+                item,
+                ordinal: Some(0),
+                ..
+            })) if gap == crate::EXTERNAL_WITNESS_GAP && item == foreign_fn
+        ),
+        "expected EXTERNAL_WITNESS_GAP naming foreign_fn #0 via foreign closure capture, got {got2_gap:?}"
+    );
+
+    // Constrained `U: Send` with `Superset (Ready,)`: Pass 1 proves `U: Send` over superset -> PASS.
+    fx.coroutines[0].3 = exact_foreign;
+    let got2_ok = decide_stalled(&b2.view(it.c_sync, root2), &c2, out2.view(), &[(block2, exact_ok2)], &fx, alloc)
+        .expect("Superset (Ready,) satisfies U: Send in Pass 1");
+    assert!(got2_ok.is_empty(), "expected pass when Superset satisfies Send, got {got2_ok:?}");
+}
