@@ -577,6 +577,19 @@ impl TypeAttrs {
     /// Blaze edition: transparent all-`pub` struct eligible for automatic `Copy`/`Clone`
     /// (`blaze_solve::facts::AdtFlags::AUTO_COPY_PUB`). Bit 12.
     pub const AUTO_COPY_PUB: u32 = 1 << 12;
+    /// Bits 13..=21: opt-in complexity cost contract ([`CostContract`], 9 bits); 0 is `NONE`.
+    const COST_SHIFT: u32 = 13;
+    const COST_MASK: u32 = 0x01ff << Self::COST_SHIFT;
+
+    /// These attributes with a complexity cost contract set.
+    pub const fn with_cost(self, c: CostContract) -> Self {
+        TypeAttrs((self.0 & !Self::COST_MASK) | ((c.bits() as u32 & 0x01ff) << Self::COST_SHIFT))
+    }
+
+    /// The complexity cost contract carried by this item (`CostContract::NONE` when unannotated).
+    pub const fn cost(self) -> CostContract {
+        CostContract(((self.0 & Self::COST_MASK) >> Self::COST_SHIFT) as u16)
+    }
 
     /// These attributes with an enum's discriminant type set.
     pub const fn with_discr(self, d: DiscrRepr) -> Self {
@@ -597,6 +610,171 @@ impl TypeAttrs {
             c @ 7..=12 => DiscrRepr::Uint(U[c as usize - 7]),
             _ => DiscrRepr::Unread,
         }
+    }
+}
+
+/// Asymptotic time or space complexity class declared by `#[blaze::cost(...)]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum CostClass {
+    /// Unannotated (opt-in: not checked unless declared).
+    None = 0,
+    /// `O(1)`.
+    O1 = 1,
+    /// `amortized O(1)`.
+    AmortizedO1 = 2,
+    /// `O(log n)` (also spelled `O(log)`).
+    OLogN = 3,
+    /// `O(n)`.
+    ON = 4,
+    /// `O(n log n)`.
+    ONLogN = 5,
+    /// `O(n^2)`.
+    ON2 = 6,
+    /// Malformed or duplicate `#[blaze::cost(..)]` argument (Rule 3: never silently ignored).
+    Invalid = 7,
+}
+
+impl CostClass {
+    /// Human-readable spelling of this complexity class.
+    pub const fn name(self) -> &'static str {
+        match self {
+            CostClass::None => "unannotated",
+            CostClass::O1 => "O(1)",
+            CostClass::AmortizedO1 => "amortized O(1)",
+            CostClass::OLogN => "O(log n)",
+            CostClass::ON => "O(n)",
+            CostClass::ONLogN => "O(n log n)",
+            CostClass::ON2 => "O(n^2)",
+            CostClass::Invalid => "<invalid>",
+        }
+    }
+
+    /// Decodes a 3-bit discriminant into a [`CostClass`].
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => CostClass::None,
+            1 => CostClass::O1,
+            2 => CostClass::AmortizedO1,
+            3 => CostClass::OLogN,
+            4 => CostClass::ON,
+            5 => CostClass::ONLogN,
+            6 => CostClass::ON2,
+            7 => CostClass::Invalid,
+            _ => return None,
+        })
+    }
+}
+
+/// Concurrency / synchronization cost class declared by `#[blaze::cost(...)]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
+pub enum SyncCost {
+    /// Unspecified (default; ordinary Rust).
+    None = 0,
+    /// Thread-local / lock-free / no cross-thread synchronization (`lock_free` or `sync = local`).
+    Local = 1,
+    /// Shared atomic RMW / cross-core coherence traffic (`atomic` or `sync = atomic`).
+    Atomic = 2,
+    /// Acquires a lock, blocks, or synchronizes across threads (`locks` or `sync = lock`).
+    Lock = 3,
+}
+
+impl SyncCost {
+    /// Human-readable spelling of this synchronization cost class.
+    pub const fn name(self) -> &'static str {
+        match self {
+            SyncCost::None => "unspecified",
+            SyncCost::Local => "lock_free",
+            SyncCost::Atomic => "atomic",
+            SyncCost::Lock => "locks",
+        }
+    }
+
+    /// Decodes a 2-bit discriminant into a [`SyncCost`].
+    pub const fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => SyncCost::None,
+            1 => SyncCost::Local,
+            2 => SyncCost::Atomic,
+            3 => SyncCost::Lock,
+            _ => return None,
+        })
+    }
+}
+
+/// Compact 9-bit complexity contract carried on a function head and [`TypeAttrs`]:
+/// - bits `0..=2`: `time` ([`CostClass`])
+/// - bit `3`: `trusted` (`bool`)
+/// - bits `4..=6`: `space` ([`CostClass`])
+/// - bits `7..=8`: `sync` ([`SyncCost`])
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct CostContract(pub u16);
+
+impl CostContract {
+    /// No cost contract declared.
+    pub const NONE: Self = Self(0);
+
+    /// Malformed or duplicate `#[blaze::cost(..)]` contract.
+    pub const INVALID: Self = Self(CostClass::Invalid as u16);
+
+    /// Builds a cost contract from its components.
+    pub const fn new(time: CostClass, space: CostClass, sync: SyncCost, trusted: bool) -> Self {
+        Self((time as u16) | ((trusted as u16) << 3) | ((space as u16) << 4) | ((sync as u16) << 7))
+    }
+
+    /// Builds a time-only cost contract (`space` defaults to `time`, `sync` is `None`).
+    pub const fn time_only(time: CostClass, trusted: bool) -> Self {
+        Self::new(time, time, SyncCost::None, trusted)
+    }
+
+    /// Declared asymptotic time class (`CostClass::None` if omitted).
+    pub const fn time(self) -> CostClass {
+        match CostClass::from_u8((self.0 & 0x7) as u8) {
+            Some(c) => c,
+            None => CostClass::Invalid,
+        }
+    }
+
+    /// Declared asymptotic space class (`CostClass::None` if omitted).
+    pub const fn space(self) -> CostClass {
+        match CostClass::from_u8(((self.0 >> 4) & 0x7) as u8) {
+            Some(c) => c,
+            None => CostClass::Invalid,
+        }
+    }
+
+    /// Declared concurrency / synchronization class (`SyncCost::None` if unspecified).
+    pub const fn sync(self) -> SyncCost {
+        match SyncCost::from_u8(((self.0 >> 7) & 0x3) as u8) {
+            Some(s) => s,
+            None => SyncCost::None,
+        }
+    }
+
+    /// Whether the contract was marked `trusted = "..."` (body skipped; callers trust the claim).
+    pub const fn trusted(self) -> bool {
+        self.0 & 0x8 != 0
+    }
+
+    /// True when no cost contract is declared at all.
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    /// True when the contract attribute was malformed or duplicated.
+    pub const fn is_invalid(self) -> bool {
+        matches!(self.time(), CostClass::Invalid) || matches!(self.space(), CostClass::Invalid)
+    }
+
+    /// Decodes a persisted 16-bit representation, rejecting any non-zero reserved bits.
+    pub const fn from_bits(bits: u16) -> Option<Self> {
+        if bits & !0x01ff == 0 { Some(Self(bits)) } else { None }
+    }
+
+    /// Encodes this contract as a 16-bit integer (only bits `0..=8` may be set).
+    pub const fn bits(self) -> u16 {
+        self.0
     }
 }
 

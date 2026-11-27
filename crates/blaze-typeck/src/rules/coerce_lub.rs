@@ -129,11 +129,11 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         // Every earlier source of this site had the merged type with no adjustment of its own
         // (a `!` source keeps its `NeverToAny` and is not listed: rustc's `apply_adjustments`
         // keeps a `NeverToAny`); each now reifies to the pointer.
-        for i in 0..self.coerce_sources.len() {
-            let (s, src) = self.coerce_sources[i];
-            if s == site {
-                self.adjust.push((src, ka, pa));
-            }
+        let mut cur = self.coerce_many[site as usize].first_source;
+        while cur != u32::MAX {
+            let (src, next) = self.coerce_sources[cur as usize];
+            self.adjust.push((src, ka, pa));
+            cur = next;
         }
         self.adjust.push((e, kb, pa));
         Ok(FnLub::Merged(pa))
@@ -186,13 +186,8 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
 
     /// The first source of site `site` that is listed (not `!`), if any.
     fn first_source(&self, site: u32) -> Option<ExprId> {
-        for i in 0..self.coerce_sources.len() {
-            let (s, src) = self.coerce_sources[i];
-            if s == site {
-                return Some(src);
-            }
-        }
-        None
+        let head = self.coerce_many[site as usize].first_source;
+        (head != u32::MAX).then(|| self.coerce_sources[head as usize].0)
     }
 
     /// Whether the `unsafe` fn pointer `gated` would unify with `other` were it safe (asked in a
@@ -204,19 +199,15 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     }
 
     /// Earlier source `src`'s adjustments so far (the module doc): none, a noop reborrow (its
-    /// two rows), or any other. One scan of the rows, off the common path.
+    /// two rows), or any other. O(1) via `AdjustLog::rows_rev`.
     fn earlier_adjust(&mut self, src: ExprId) -> Result<Earlier, Stop> {
-        let mut rows = [0usize; 2];
+        let mut rev_rows = [0usize; 2];
         let mut n = 0usize;
-        let es = self.adjust.column::<0>();
-        for i in 0..es.len() {
-            if es[i] != src {
-                continue;
-            }
+        for i in self.adjust.rows_rev(src) {
             if n == 2 {
                 return Ok(Earlier::Other);
             }
-            rows[n] = i;
+            rev_rows[n] = i;
             n += 1;
         }
         match n {
@@ -224,13 +215,16 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             2 => {}
             _ => return Ok(Earlier::Other),
         }
+        // `rows_rev` yields most recent first, so `rev_rows[1]` is the earlier row (Deref)
+        // and `rev_rows[0]` is the later row (Borrow).
+        let (r0, r1) = (rev_rows[1], rev_rows[0]);
         let ks = self.adjust.column::<1>();
-        let (k0, k1) = (ks[rows[0]], ks[rows[1]]);
+        let (k0, k1) = (ks[r0], ks[r1]);
         let AdjustKind::Deref { overloaded: None } = k0 else { return Ok(Earlier::Other) };
         let AdjustKind::Borrow { mutbl, raw: false, .. } = k1 else { return Ok(Earlier::Other) };
         let own = self.ty.shallow_resolve(self.expr_ty[src.ix()]);
         Ok(match self.view(own) {
-            TyView::Ref(m, _) if m == mutbl => Earlier::Reborrow(rows[0], rows[1]),
+            TyView::Ref(m, _) if m == mutbl => Earlier::Reborrow(r0, r1),
             _ => Earlier::Other,
         })
     }
@@ -250,11 +244,9 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         let reborrow_on = true;
         let mut first = None;
         let mut reborrows = false;
-        for i in 0..self.coerce_sources.len() {
-            let (s, src) = self.coerce_sources[i];
-            if s != site {
-                continue;
-            }
+        let mut cur = self.coerce_many[site as usize].first_source;
+        while cur != u32::MAX {
+            let (src, next) = self.coerce_sources[cur as usize];
             match self.earlier_adjust(src)? {
                 Earlier::Plain => {}
                 Earlier::Reborrow(..) if reborrow_on => reborrows = true,
@@ -263,6 +255,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             if first.is_none() {
                 first = Some(src);
             }
+            cur = next;
         }
         let Some(first) = first else { return Ok(None) };
         if self.is_err(merged) || self.is_never(merged) || self.is_ty_var(merged) || self.is_ty_var(ty) {
@@ -287,26 +280,23 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             return Ok(None);
         }
         let n = self.adj_scratch.len();
-        for i in 0..self.coerce_sources.len() {
-            let (s, src) = self.coerce_sources[i];
-            if s != site {
-                continue;
-            }
+        let mut cur = self.coerce_many[site as usize].first_source;
+        while cur != u32::MAX {
+            let (src, next) = self.coerce_sources[cur as usize];
             let mut from = 0;
             if let Earlier::Reborrow(d, b) = self.earlier_adjust(src)? {
                 // The two rows are overwritten in place (the module doc says why that is sound).
                 let (k0, t0) = self.adj_scratch[0];
                 let (k1, t1) = self.adj_scratch[1];
-                self.adjust.column_mut::<1>()[d] = k0;
-                self.adjust.column_mut::<2>()[d] = t0;
-                self.adjust.column_mut::<1>()[b] = k1;
-                self.adjust.column_mut::<2>()[b] = t1;
+                self.adjust.set_kind_ty(d, k0, t0);
+                self.adjust.set_kind_ty(b, k1, t1);
                 from = 2;
             }
             for j in from..n {
                 let (kind, target) = self.adj_scratch[j];
                 self.adjust.push((src, kind, target));
             }
+            cur = next;
         }
         self.adj_scratch.clear();
         Ok(Some(ty))
@@ -317,5 +307,131 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             Side::Item(..) => AdjustKind::ReifyFnPointer,
             Side::Closure(_) => AdjustKind::ClosureFnPointer,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::vec::Vec;
+
+    use blaze_own::Alloc;
+
+    use crate::columns::AdjustKind;
+    use crate::fixture::{Bb, Fx, show};
+    use crate::ids::{ExprId, FnPtrHeader, ItemKey, Mutbl, UintTy};
+    use crate::infer::InferCtx;
+    use crate::portable::PNode;
+
+    fn run_check(fx: &Fx, b: &Bb, owner: ItemKey, root: ExprId) -> crate::Checked<'static> {
+        let alloc = Alloc::global();
+        let mut cx = InferCtx::new_in(alloc);
+        match crate::check_with(&b.view(owner, root), fx, &mut cx, &crate::world::Needs::new_in(alloc), crate::machine::Plant::None, alloc).expect("check") {
+            crate::Outcome::Done(c) => c,
+            crate::Outcome::Need(n) => panic!("unexpected need: {n:?}"),
+        }
+    }
+
+    #[test]
+    fn large_match_and_array_200_coercible_arms_are_deterministic() {
+        const ARMS: usize = 200;
+        let mut fx = Fx::new();
+        let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+        let usize_ = fx.ty(PNode::Uint(UintTy::Usize));
+        let unit = fx.unit();
+        let fn_io = fx.list(&[u8_, u8_]);
+        let fn_ptr = fx.ty(PNode::FnPtr(fn_io, FnPtrHeader::RUST));
+        let four = fx.ty(PNode::ConstValue { ty: usize_, bits: 4 });
+        let arr = fx.ty(PNode::Array(u8_, four));
+        let slice = fx.ty(PNode::Slice(u8_));
+        let r_arr = fx.r(Mutbl::Mut, arr);
+        let r_slice = fx.r(Mutbl::Mut, slice);
+        fx.func("f_a", 0, &[u8_], u8_, Vec::new());
+        fx.func("f_b", 0, &[u8_], u8_, Vec::new());
+        let main = fx.func("main", 0, &[fn_ptr, r_arr, r_slice], unit, Vec::new());
+        fx.finish();
+
+        let mut b = Bb::new();
+        let p_fn = b.param("p_fn");
+        let p_arr = b.param("p_arr");
+        let p_slice = b.param("p_slice");
+
+        // 1. 200-arm match: 199 arms of `f_a`, last arm `f_b` -> all 200 reify via `fn_lub`.
+        let scr1 = b.bool();
+        let mut match_arms = Vec::with_capacity(ARMS);
+        let mut match_exprs = Vec::with_capacity(ARMS);
+        for i in 0..ARMS {
+            let pat = b.wild();
+            let arm = b.path(&[if i + 1 < ARMS { "f_a" } else { "f_b" }]);
+            match_arms.push((pat, arm));
+            match_exprs.push(arm);
+        }
+        let m1 = b.match_(scr1, &match_arms);
+        let f1 = b.bind("f1");
+        let s1 = b.let_(f1, None, m1);
+
+        // 2. 200-element array: 199 elements of `f_a`, last element `p_fn: fn(u8) -> u8`
+        //    -> all 199 earlier elements reify via `lub_earlier_to_new`.
+        let mut arr_elems = Vec::with_capacity(ARMS);
+        for i in 0..ARMS {
+            arr_elems.push(if i + 1 < ARMS { b.path(&["f_a"]) } else { b.local(p_fn) });
+        }
+        let arr_expr = b.array(&arr_elems);
+        let f2 = b.bind("f2");
+        let s2 = b.let_(f2, None, arr_expr);
+
+        // 3. 200-arm match: 199 arms of `p_arr: &mut [u8; 4]` (accumulating noop reborrows
+        //    on arms 1..199), last arm `p_slice: &mut [u8]` -> earlier reborrows overwritten
+        //    in place and unsized via `lub_earlier_to_new` + `AdjustLog`.
+        let scr2 = b.bool();
+        let mut reborrow_arms = Vec::with_capacity(ARMS);
+        let mut reborrow_exprs = Vec::with_capacity(ARMS);
+        for i in 0..ARMS {
+            let pat = b.wild();
+            let arm = b.local(if i + 1 < ARMS { p_arr } else { p_slice });
+            reborrow_arms.push((pat, arm));
+            reborrow_exprs.push(arm);
+        }
+        let m2 = b.match_(scr2, &reborrow_arms);
+        let f3 = b.bind("f3");
+        let s3 = b.let_(f3, None, m2);
+
+        let root = b.block(&[s1, s2, s3], None);
+        let c1 = run_check(&fx, &b, main, root);
+        let c2 = run_check(&fx, &b, main, root);
+        assert!(c1.diags.is_empty(), "expected no diags, got {:?}", c1.diags);
+        assert_eq!(show(&fx, c1.types.view(), c1.local_ty[f1.ix()]), "fn(u8) -> u8");
+        assert_eq!(show(&fx, c1.types.view(), c1.local_ty[f3.ix()]), "&mut [u8]");
+
+        // Every arm in `m1` has exactly one `ReifyFnPointer` adjustment.
+        let mut m1_reified = 0usize;
+        for i in 0..c1.adjusts.len() {
+            let e = c1.adjusts.column::<0>()[i];
+            let k = c1.adjusts.column::<1>()[i];
+            if match_exprs.contains(&e) && k == AdjustKind::ReifyFnPointer {
+                m1_reified += 1;
+            }
+        }
+        assert_eq!(m1_reified, ARMS);
+
+        // Every earlier arm in `m2` (0..199) has exactly 3 adjustments: Deref, Borrow(Mut), Unsize
+        // (noop reborrows replaced in place, never stacked).
+        for &arm in &reborrow_exprs[..ARMS - 1] {
+            let kinds: Vec<AdjustKind> = (0..c1.adjusts.len())
+                .filter(|&i| c1.adjusts.column::<0>()[i] == arm)
+                .map(|i| c1.adjusts.column::<1>()[i])
+                .collect();
+            assert_eq!(
+                kinds,
+                std::vec![
+                    AdjustKind::Deref { overloaded: None },
+                    AdjustKind::Borrow { mutbl: Mutbl::Mut, two_phase: false, raw: false },
+                    AdjustKind::Unsize,
+                ],
+            );
+        }
+
+        // Exact determinism across independent runs.
+        assert_eq!(c1.adjusts.column::<0>(), c2.adjusts.column::<0>());
+        assert_eq!(c1.adjusts.column::<1>(), c2.adjusts.column::<1>());
     }
 }

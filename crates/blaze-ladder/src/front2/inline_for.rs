@@ -2310,6 +2310,7 @@ fn check_for_fields_generic_bodies<'n, S: NamesSource<'n>>(
             header: orig_head.header,
             c_variadic: orig_head.c_variadic,
             qualifiers: orig_head.qualifiers,
+            cost: orig_head.cost,
             legacy_const_generics: OwnVec::with_capacity_in(orig_head.legacy_const_generics.len(), head_alloc),
             inputs: OwnVec::with_capacity_in(orig_head.inputs.len(), head_alloc),
             output: orig_head.output,
@@ -2838,7 +2839,7 @@ fn install_spec_head<'n, S: NamesSource<'n>>(
             })?;
         return Ok(lib);
     }
-    let (lib, text, text_prefix, container, self_param, header, c_variadic, qualifiers, module, raw_inputs, raw_output, raw_self) = {
+    let (lib, text, text_prefix, container, self_param, header, c_variadic, qualifiers, cost, module, raw_inputs, raw_output, raw_self) = {
         let Some(orig) = r.store.fns.get(&orig_key) else {
             return Err(CheckFail::InlineFor {
                 owner: orig_key,
@@ -2858,6 +2859,7 @@ fn install_spec_head<'n, S: NamesSource<'n>>(
             orig.header,
             orig.c_variadic,
             orig.qualifiers,
+            orig.cost,
             orig.module,
             raw_inputs,
             orig.output,
@@ -2877,6 +2879,7 @@ fn install_spec_head<'n, S: NamesSource<'n>>(
         header,
         c_variadic,
         qualifiers,
+        cost,
         legacy_const_generics: OwnVec::new_in(alloc),
         inputs: OwnVec::with_capacity_in(raw_inputs.len(), alloc),
         output: raw_output,

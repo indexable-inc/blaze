@@ -542,22 +542,24 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         }
         let mut pairs: blaze_own::Vec<(Ty, Ty), _> =
             blaze_own::Vec::with_capacity_in(usize::try_from(dst_len).unwrap_or(0), self.alloc);
+        let Some(src_name_len) = self.record_names(src_schema).map(|ns| ns.len()) else { return Ok(None) };
+        let Some(dst_name_len) = self.record_names(dst_schema).map(|ns| ns.len()) else { return Ok(None) };
+        if src_name_len != usize::try_from(src_len).unwrap_or(usize::MAX)
+            || dst_name_len != usize::try_from(dst_len).unwrap_or(usize::MAX)
         {
-            let Some(src_names) = self.record_names(src_schema) else { return Ok(None) };
-            let Some(dst_names) = self.record_names(dst_schema) else { return Ok(None) };
-            if src_names.len() != usize::try_from(src_len).unwrap_or(usize::MAX)
-                || dst_names.len() != usize::try_from(dst_len).unwrap_or(usize::MAX)
-            {
+            return Ok(None);
+        }
+        let mut dst_copy: blaze_own::Vec<crate::ids::Name, _> =
+            blaze_own::Vec::with_capacity_in(dst_name_len, self.alloc);
+        if let Some(dst_names) = self.record_names(dst_schema) {
+            dst_copy.extend_from_slice(dst_names);
+        }
+        for (di, &nm) in dst_copy.iter().enumerate() {
+            let Some(si_u32) = self.record_field_index(src_schema, nm) else {
                 return Ok(None);
-            }
-            for (di, &nm) in dst_names.iter().enumerate() {
-                let Some(si) = src_names.iter().position(|&sn| sn == nm) else {
-                    return Ok(None);
-                };
-                let Ok(si_u32) = u32::try_from(si) else { return Ok(None) };
-                let Ok(di_u32) = u32::try_from(di) else { return Ok(None) };
-                pairs.push((self.ty.list_get(src_tys, si_u32), self.ty.list_get(dst_tys, di_u32)));
-            }
+            };
+            let Ok(di_u32) = u32::try_from(di) else { return Ok(None) };
+            pairs.push((self.ty.list_get(src_tys, si_u32), self.ty.list_get(dst_tys, di_u32)));
         }
         let projected = self.commit_if(|m| -> Result<Option<()>, Stop> {
             for &(st, dt) in pairs.iter() {

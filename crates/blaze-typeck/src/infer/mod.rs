@@ -29,7 +29,7 @@ pub use facts::{FactCache, assoc_def};
 pub use terms::{Terms, def_of, item_key, var_index, var_of_index};
 pub use crate::ty::TyFlags;
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, HashMap, Map, MapOpts};
 use blaze_own::{Alloc, Vec};
 use blaze_solve::eval::Answer;
 use blaze_solve::fulfill::{Fulfill, State, Wake};
@@ -47,6 +47,36 @@ use crate::world::{Reads, World};
 /// nothing mid-step (`stop_for_facts`) takes a round; the pull answers every question in place.
 const MAX_FILLS: u32 = 1 << 16;
 
+/// Per-trait stack-maintained index of 2-arg `Goal::Trait`/`Goal::Projection` obligation indices,
+/// enabling O(1) amortized `closure_hint` lookups.
+struct TraitObs<'a> {
+    indices: Vec<u32, Alloc<'a>>,
+    /// Prefix cursor: entries in `indices[..first_active]` were either no longer `State::Pending`
+    /// or had a non-`Infer` self type under `epoch`.
+    first_active: usize,
+    epoch: u64,
+}
+
+/// Incremental cache of obligations whose resolved self type is a local `TyView::Closure(e, _)`,
+/// enabling O(1) per-closure `closure_used_only_once` lookups during `analyze_closures`.
+struct ClosureObsCache<'a> {
+    valid: bool,
+    scanned: usize,
+    by_closure: Map<ExprId, Vec<ItemKey, Alloc<'a>>, FixedState, Alloc<'a>>,
+    unresolved: Vec<u32, Alloc<'a>>,
+}
+
+impl<'a> ClosureObsCache<'a> {
+    fn new_in(alloc: Alloc<'a>) -> Self {
+        ClosureObsCache {
+            valid: false,
+            scanned: 0,
+            by_closure: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            unresolved: Vec::new_in(alloc),
+        }
+    }
+}
+
 /// The real type context of one body's check, with an independent lifetime `'f` for its
 /// [`FactCache<'f>`] so a stretch-reused fact cache can outlive a per-round scratch frame `'a`.
 pub struct InferCtxIn<'a, 'f> {
@@ -60,6 +90,13 @@ pub struct InferCtxIn<'a, 'f> {
     obs: Vec<Obligation, Alloc<'a>>,
     preds: Vec<Pred, Alloc<'a>>,
     state: Vec<State, Alloc<'a>>,
+    /// Stack-maintained index of 2-arg `Trait`/`Projection` obligations by trait, for `closure_hint`.
+    obs_2arg_by_trait: Map<ItemKey, TraitObs<'a>, FixedState, Alloc<'a>>,
+    /// Incremented on rollbacks that undo state changes or unification bindings, invalidating
+    /// `TraitObs::first_active` cursors in O(1).
+    obs_rollback_epoch: u64,
+    /// Incremental cache of closure self-type trait obligations, for `closure_used_only_once`.
+    closure_obs: ClosureObsCache<'a>,
     /// `(obligation, previous state)` for every state change, for rollback.
     undo: Vec<(u32, State), Alloc<'a>>,
     errors: Vec<FulfillError, Alloc<'a>>,
@@ -710,6 +747,9 @@ impl<'a, 'f> InferCtxIn<'a, 'f> {
             obs: Vec::new_in(alloc),
             preds: Vec::new_in(alloc),
             state: Vec::new_in(alloc),
+            obs_2arg_by_trait: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            obs_rollback_epoch: 0,
+            closure_obs: ClosureObsCache::new_in(alloc),
             undo: Vec::new_in(alloc),
             errors: Vec::new_in(alloc),
             error_at: 0,
@@ -1828,6 +1868,38 @@ impl<'a, 'f> InferCtxIn<'a, 'f> {
         Err(CheckError::Limit(crate::error::Limit::Solver).into())
     }
 
+    pub(crate) fn prefilter_impls<W: World>(
+        &mut self,
+        trait_: ItemKey,
+        shape: crate::world::Shape,
+        bucket: &[ItemKey],
+        goal_args: TyList,
+        reads: &mut Reads<'_, '_, W>,
+        out: &mut Vec<ItemKey, Alloc<'_>>,
+    ) -> Result<(), crate::instance::ResolveError> {
+        let s_args = self.slist(goal_args);
+        self.facts.prefilter_impls(trait_, shape, bucket, &self.terms, s_args, reads, out)
+    }
+
+    fn push_ob(&mut self, ob: Obligation, pred: Pred) {
+        let idx = self.obs.len() as u32;
+        if let Goal::Trait { trait_, args } | Goal::Projection { trait_, args, .. } = ob.goal
+            && self.list_len(args) == 2
+        {
+            let alloc = self.alloc;
+            let epoch = self.obs_rollback_epoch;
+            let entry = self.obs_2arg_by_trait.entry(trait_).or_insert_with(|| TraitObs {
+                indices: Vec::new_in(alloc),
+                first_active: 0,
+                epoch,
+            });
+            entry.indices.push(idx);
+        }
+        self.obs.push(ob);
+        self.preds.push(pred);
+        self.state.push(State::Pending);
+    }
+
     /// Registers the projection goals relating emitted, each an obligation of `cause` (the
     /// place whose check related the types: [`TypeCtx::unify_at`]).
     fn defer(&mut self, pairs: &[(STy, STy)], cause: crate::ty::Cause) {
@@ -1841,9 +1913,7 @@ impl<'a, 'f> InferCtxIn<'a, 'f> {
                 // Const and opaque aliases have no associated-type name in a typeck goal.
                 Goal::WellFormed(ty)
             };
-            self.obs.push(Obligation { goal, cause });
-            self.preds.push(Pred::Projection { alias, term });
-            self.state.push(State::Pending);
+            self.push_ob(Obligation { goal, cause }, Pred::Projection { alias, term });
         }
     }
 }
@@ -2208,12 +2278,34 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
     }
 
     fn rollback_to(&mut self, s: InferSnapshot) {
+        let bindings_before = self.terms.bindings_len();
         self.terms.cx.rollback_to(s.cx);
+        let state_undone = self.undo.len() > s.undo;
         while self.undo.len() > s.undo {
             let Some((i, old)) = self.undo.pop() else { break };
             if (i as usize) < self.state.len() {
                 self.state[i as usize] = old;
             }
+        }
+        let obs_truncated = self.obs.len() > s.obs;
+        if obs_truncated {
+            for i in (s.obs..self.obs.len()).rev() {
+                if let Goal::Trait { trait_, args } | Goal::Projection { trait_, args, .. } = self.obs[i].goal
+                    && self.list_len(args) == 2
+                    && let Some(entry) = self.obs_2arg_by_trait.get_mut(&trait_)
+                {
+                    entry.indices.pop();
+                    if entry.first_active > entry.indices.len() {
+                        entry.first_active = entry.indices.len();
+                    }
+                }
+            }
+        }
+        if state_undone || self.terms.bindings_len() < bindings_before {
+            self.obs_rollback_epoch = self.obs_rollback_epoch.wrapping_add(1);
+        }
+        if self.closure_obs.valid && (obs_truncated || self.terms.bindings_len() < bindings_before) {
+            self.closure_obs.valid = false;
         }
         self.obs.truncate(s.obs);
         self.preds.truncate(s.obs);
@@ -2245,9 +2337,7 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
 
     fn register(&mut self, ob: Obligation) -> Result<(), CheckError> {
         let p = self.pred(ob.goal);
-        self.obs.push(ob);
-        self.preds.push(p);
-        self.state.push(State::Pending);
+        self.push_ob(ob, p);
         Ok(())
     }
 
@@ -2373,7 +2463,10 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
 
     fn settle_closure(&mut self, closure: ExprId, kind: crate::ty::ClosureKind, upvars: Option<Ty>) -> Result<(), CheckError> {
         use blaze_solve::term::{CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE};
-        let Some((&id, &row)) = self.rows.closures.iter().find(|(_, r)| r.expr == closure) else {
+        let mut h = crate::hash::StableHasher::new("blaze-typeck closure def");
+        h.u32(closure.0);
+        let id = u128::from(h.finish());
+        let Some(&row) = self.rows.closures.get(&id) else {
             return Err(CheckError::Malformed(crate::error::Malformed::ClosureNotMade(closure)));
         };
         let v = match kind {
@@ -2404,24 +2497,69 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
 
     fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Result<Option<((TyList, crate::ty::Cause), Option<(Ty, crate::ty::Cause)>)>, CheckError> {
         let v = self.shallow_resolve(var);
-        let mut found = None;
-        for i in 0..self.obs.len() {
-            if self.state[i] == State::Pending
-                && let Goal::Trait { trait_, args } = self.obs[i].goal
-                && fn_traits.contains(&trait_)
-                && self.list_len(args) == 2
-                && self.shallow_resolve(self.list_get(args, 0)) == v
-            {
-                let tuple = self.shallow_resolve(self.list_get(args, 1));
-                if let TyView::Tuple(l) = self.view(tuple) {
-                    // Where the expectation came from (D148): the obligation's cause, a
-                    // clause of a use (`Cause::Clause`) when a declared bound filed it.
-                    found = Some((l, self.obs[i].cause));
+        let v_is_infer = matches!(self.view(v), TyView::Infer(_));
+        let epoch = self.obs_rollback_epoch;
+        let mut best: Option<(usize, TyList, crate::ty::Cause)> = None;
+        for (ti, &want_trait) in fn_traits.iter().enumerate() {
+            if fn_traits[..ti].contains(&want_trait) {
+                continue;
+            }
+            let Some(len) = self.obs_2arg_by_trait.get(&want_trait).map(|e| e.indices.len()) else {
+                continue;
+            };
+            let start = if v_is_infer {
+                let Some(entry) = self.obs_2arg_by_trait.get_mut(&want_trait) else { continue };
+                if entry.epoch != epoch {
+                    entry.first_active = 0;
+                    entry.epoch = epoch;
+                }
+                entry.first_active
+            } else {
+                0
+            };
+            let mut new_active = start;
+            let mut prefix_dead = v_is_infer;
+            for pos in start..len {
+                let i = self.obs_2arg_by_trait[&want_trait].indices[pos] as usize;
+                if let Some((best_i, _, _)) = best
+                    && i >= best_i
+                {
                     break;
                 }
+                if self.state[i] != State::Pending {
+                    if prefix_dead {
+                        new_active = pos + 1;
+                    }
+                    continue;
+                }
+                let (is_trait, args) = match self.obs[i].goal {
+                    Goal::Trait { args, .. } => (true, args),
+                    Goal::Projection { args, .. } => (false, args),
+                    _ => continue,
+                };
+                let self_ty = self.shallow_resolve(self.list_get(args, 0));
+                if prefix_dead && !matches!(self.view(self_ty), TyView::Infer(_)) {
+                    new_active = pos + 1;
+                    continue;
+                }
+                prefix_dead = false;
+                if is_trait && self_ty == v {
+                    let tuple = self.shallow_resolve(self.list_get(args, 1));
+                    if let TyView::Tuple(l) = self.view(tuple) {
+                        // Where the expectation came from (D148): the obligation's cause, a
+                        // clause of a use (`Cause::Clause`) when a declared bound filed it.
+                        best = Some((i, l, self.obs[i].cause));
+                        break;
+                    }
+                }
+            }
+            if v_is_infer && new_active > start
+                && let Some(entry) = self.obs_2arg_by_trait.get_mut(&want_trait)
+            {
+                entry.first_active = new_active;
             }
         }
-        let Some((inputs, cause)) = found else { return Ok(None) };
+        let Some((_, inputs, cause)) = best else { return Ok(None) };
         // Output belongs to the Once supertrait at these same arguments. Another bound on
         // this variable may project a different Output, and may precede the callable bound:
         // a projection whose `Args` cannot equal the inputs is another bound's. "Can equal",
@@ -2432,27 +2570,42 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
         // in the projection. Compared as lists, the output was lost there and the closure's
         // return type was left to its body: tempo's crates/zones/node/tests/it/utils.rs:2658.
         let inputs_tuple = self.mk(TyView::Tuple(inputs))?;
-        for i in 0..self.obs.len() {
-            if self.state[i] == State::Pending
-                && let Goal::Projection { trait_, args, name, term } = self.obs[i].goal
-                && trait_ == fn_traits[2] && name == output && self.list_len(args) == 2
-                && self.shallow_resolve(self.list_get(args, 0)) == v
-            {
-                let tuple = self.shallow_resolve(self.list_get(args, 1));
-                let TyView::Tuple(l) = self.view(tuple) else { continue };
-                let same = if l == inputs {
-                    true
-                } else if self.list_len(l) != self.list_len(inputs) {
-                    false
-                } else {
-                    let s = self.snapshot();
-                    let can = self.unify(tuple, inputs_tuple);
-                    self.rollback_to(s);
-                    can?
-                };
-                if same {
-                    let ob_cause = self.obs[i].cause;
-                    return Ok(Some(((inputs, cause), Some((term, ob_cause)))));
+        let once_trait = fn_traits[2];
+        if let Some(len) = self.obs_2arg_by_trait.get(&once_trait).map(|e| e.indices.len()) {
+            let start = if v_is_infer {
+                let entry = self.obs_2arg_by_trait.get_mut(&once_trait).unwrap();
+                if entry.epoch != epoch {
+                    entry.first_active = 0;
+                    entry.epoch = epoch;
+                }
+                entry.first_active
+            } else {
+                0
+            };
+            for pos in start..len {
+                let i = self.obs_2arg_by_trait[&once_trait].indices[pos] as usize;
+                if self.state[i] == State::Pending
+                    && let Goal::Projection { trait_, args, name, term } = self.obs[i].goal
+                    && trait_ == once_trait
+                    && name == output
+                    && self.shallow_resolve(self.list_get(args, 0)) == v
+                {
+                    let tuple = self.shallow_resolve(self.list_get(args, 1));
+                    let TyView::Tuple(l) = self.view(tuple) else { continue };
+                    let same = if l == inputs {
+                        true
+                    } else if self.list_len(l) != self.list_len(inputs) {
+                        false
+                    } else {
+                        let s = self.snapshot();
+                        let can = self.unify(tuple, inputs_tuple);
+                        self.rollback_to(s);
+                        can?
+                    };
+                    if same {
+                        let ob_cause = self.obs[i].cause;
+                        return Ok(Some(((inputs, cause), Some((term, ob_cause)))));
+                    }
                 }
             }
         }
@@ -2465,9 +2618,16 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
         once_traits: [Option<ItemKey>; 2],
         ref_traits: [Option<ItemKey>; 4],
     ) -> bool {
-        let mut saw_once = false;
-        let mut saw_ref = false;
-        for i in 0..self.obs.len() {
+        if !self.closure_obs.valid {
+            self.closure_obs.by_closure.clear();
+            self.closure_obs.unresolved.clear();
+            self.closure_obs.scanned = 0;
+            self.closure_obs.valid = true;
+        }
+        let alloc = self.alloc;
+        let obs_len = self.obs.len();
+        let scanned = self.closure_obs.scanned;
+        for i in scanned..obs_len {
             let (trait_, args) = match self.obs[i].goal {
                 Goal::Trait { trait_, args } | Goal::Projection { trait_, args, .. } => (trait_, args),
                 _ => continue,
@@ -2476,9 +2636,49 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
                 continue;
             }
             let self_ty = self.shallow_resolve(self.list_get(args, 0));
-            if !matches!(self.view(self_ty), TyView::Closure(e, _) if e == closure) {
-                continue;
+            match self.view(self_ty) {
+                TyView::Closure(e, _) => {
+                    let list = self.closure_obs.by_closure.entry(e).or_insert_with(|| Vec::new_in(alloc));
+                    if list.scan_for(&trait_).is_none() {
+                        list.push(trait_);
+                    }
+                }
+                TyView::Infer(_) => self.closure_obs.unresolved.push(i as u32),
+                _ => {}
             }
+        }
+        self.closure_obs.scanned = obs_len;
+        let mut keep = 0usize;
+        let unresolved_len = self.closure_obs.unresolved.len();
+        for pos in 0..unresolved_len {
+            let idx = self.closure_obs.unresolved[pos];
+            let i = idx as usize;
+            let (trait_, args) = match self.obs[i].goal {
+                Goal::Trait { trait_, args } | Goal::Projection { trait_, args, .. } => (trait_, args),
+                _ => continue,
+            };
+            let self_ty = self.shallow_resolve(self.list_get(args, 0));
+            match self.view(self_ty) {
+                TyView::Closure(e, _) => {
+                    let list = self.closure_obs.by_closure.entry(e).or_insert_with(|| Vec::new_in(alloc));
+                    if list.scan_for(&trait_).is_none() {
+                        list.push(trait_);
+                    }
+                }
+                TyView::Infer(_) => {
+                    self.closure_obs.unresolved[keep] = idx;
+                    keep += 1;
+                }
+                _ => {}
+            }
+        }
+        self.closure_obs.unresolved.truncate(keep);
+        let Some(traits) = self.closure_obs.by_closure.get(&closure) else {
+            return false;
+        };
+        let mut saw_once = false;
+        let mut saw_ref = false;
+        for &trait_ in traits.iter() {
             if ref_traits.contains(&Some(trait_)) {
                 saw_ref = true;
             } else if once_traits.contains(&Some(trait_)) {

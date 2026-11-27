@@ -170,7 +170,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             let args = self.mk_list(&[source])?;
             if self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
                 self.register_trait(tr, args, Cause::Expr(e))?;
-                self.adjust.column_mut::<1>()[i] = AdjustKind::Deref { overloaded: Some(Mutbl::Mut) };
+                self.adjust.set_kind(i, AdjustKind::Deref { overloaded: Some(Mutbl::Mut) });
             }
         }
         Ok(last)

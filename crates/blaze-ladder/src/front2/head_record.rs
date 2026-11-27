@@ -201,7 +201,7 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// the same key (rule 21).
 /// 41: ADTs carry per-field visibility bytes (`AdtRow::field_vis`) so `World::member_visible`
 /// checks struct/union field visibility during field-access autoderef.
-pub const VERSION: u32 = 41;
+pub const VERSION: u32 = 42;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -1323,6 +1323,7 @@ fn encode_into_scratch<'b>(
             o.flag(head.has_body);
             o.flag(head.c_variadic);
             o.byte(head.qualifiers.byte());
+            o.body.extend_from_slice(&head.cost.bits().to_le_bytes());
             o.count(head.legacy_const_generics.len(), "a fn's legacy const generic positions")?;
             for &k in &head.legacy_const_generics {
                 o.u32(k);
@@ -3483,6 +3484,8 @@ impl<'r> In<'r, '_, '_, '_> {
         let c_variadic = self.flag("a fn's C-variadic flag")?;
         let byte = self.u8("a fn's qualifiers")?;
         let qualifiers = super::heads::FnQualifiers::from_byte(byte).ok_or(E::Byte { what: "a fn's qualifiers", byte })?;
+        let cost_bits = u16::from_le_bytes(self.array("a fn's cost contract")?);
+        let cost = tc::CostContract::from_bits(cost_bits).ok_or(E::Shape { what: "a fn's cost contract" })?;
         let legacy_const_generics = self.own("a fn's legacy const generic positions", |r| r.u32("a legacy const generic position"))?;
         let module = self.lib("a fn's module")?;
         let (params, consts, bounds, self_) = self.scope_own()?;
@@ -3502,6 +3505,7 @@ impl<'r> In<'r, '_, '_, '_> {
                 header,
                 c_variadic,
                 qualifiers,
+                cost,
                 legacy_const_generics,
                 inputs,
                 output,
@@ -3926,6 +3930,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(h1.has_body == h2.has_body, "a fn's body flag");
             need!(h1.c_variadic == h2.c_variadic, "a fn's C-variadic flag");
             need!(h1.qualifiers == h2.qualifiers, "a fn's typing attributes, const qualifier and std-internal binding");
+            need!(h1.cost == h2.cost, "a fn's cost contract");
             need!(h1.legacy_const_generics[..] == h2.legacy_const_generics[..], "a fn's legacy const generic positions");
             need!(h1.module == h2.module, "a fn's module");
             need!(h1.params[..] == h2.params[..], "a fn's parameters in scope");

@@ -434,6 +434,26 @@ pub struct BodyView<'b> {
     /// (`|lock: &'static str|`, `|t: Typed<'c>|`, `|buf: &mut Vec<(A, B), Alloc<'a>>|`), sorted
     /// ascending by `(closure, param, path, own)`.
     pub closure_param_regions: &'b [ClosureParamRegion],
+    /// Loop cost marks (`#[blaze::cost(bounded | amortized | reset)]`) on `Expr::Loop` nodes,
+    /// sorted ascending by [`ExprId`] (rules/cost.rs). Unlisted loops are [`LoopCost::Normal`].
+    pub loop_marks: &'b [(ExprId, LoopCost)],
+}
+
+/// Cost mark on a loop expression (`#[blaze::cost(..)]`), controlling how the loop compounds
+/// enclosing time and space loop depths (rules/cost.rs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum LoopCost {
+    /// Unmarked loop: compounds both time and space depth (`time + 1`, `space + 1`).
+    Normal = 0,
+    /// `#[blaze::cost(bounded)]` (or `bounded = ".."`): constant trip count (`+0` time, `+0` space).
+    Bounded = 1,
+    /// `#[blaze::cost(amortized)]` (or `amortized = ".."`): amortized across enclosing loop (`max(1)` time and space).
+    Amortized = 2,
+    /// `#[blaze::cost(reset)]` (or `reset = ".."`): scratch/frame reset per iteration (`time + 1`, `space + 0`).
+    Reset = 3,
+    /// Malformed or duplicate `#[blaze::cost(..)]` on a loop (Rule 3: never silently ignored).
+    Invalid = 4,
 }
 
 /// What kind of explicit non-elided lifetime a closure parameter type wrote at a region slot.
@@ -619,6 +639,14 @@ impl<'b> BodyView<'b> {
     /// Whether the block `e` is written `unsafe` ([`BodyView::unsafe_blocks`]).
     pub(crate) fn is_unsafe_block(&self, e: ExprId) -> bool {
         self.unsafe_blocks.binary_search(&e).is_ok()
+    }
+
+    /// The cost mark of loop `e` ([`BodyView::loop_marks`]), or [`LoopCost::Normal`] when unmarked.
+    pub(crate) fn loop_cost(&self, e: ExprId) -> LoopCost {
+        match self.loop_marks.binary_search_by_key(&e, |&(x, _)| x) {
+            Ok(i) => self.loop_marks[i].1,
+            Err(_) => LoopCost::Normal,
+        }
     }
 
     /// The edition the expression `e`'s first word was written in ([`BodyView::expr_editions`]):

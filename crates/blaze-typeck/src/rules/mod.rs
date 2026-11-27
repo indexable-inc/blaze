@@ -33,6 +33,7 @@ pub(crate) mod coerce_nested;
 pub(crate) mod coerce_interior;
 pub(crate) mod control;
 pub(crate) mod coroutine;
+pub(crate) mod cost;
 pub(crate) mod expect_inputs;
 pub(crate) mod fallback;
 pub(crate) mod field;

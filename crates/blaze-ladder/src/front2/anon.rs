@@ -514,6 +514,7 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
                 header,
                 c_variadic: false,
                 qualifiers: FnQualifiers::CONST.note_lifetimes(text),
+                cost: tc::CostContract::NONE,
                 legacy_const_generics: AVec::new_in(alloc),
                 inputs: AVec::new_in(alloc),
                 output,

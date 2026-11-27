@@ -74,6 +74,18 @@ pub enum TypedFinding {
     /// `unsafe-op-in-unsafe-fn` (rustc's `unsafe_op_in_unsafe_fn`): `op`, in an `unsafe fn`'s
     /// body of edition 2024 outside any `unsafe` block (rules/unsafety.rs).
     UnsafeOpInUnsafeFn { op: crate::diag::UnsafeOp, at: Range },
+    /// `cost-contract`: violation of an opt-in `#[blaze::cost(..)]` time, space, or sync contract
+    /// (rules/cost.rs).
+    Cost {
+        violation: crate::rules::cost::CostViolation,
+        declared: crate::world::CostClass,
+        actual: crate::rules::cost::EffectiveCost,
+        declared_sync: crate::world::SyncCost,
+        actual_sync: crate::world::SyncCost,
+        loop_depth: u8,
+        callee: Option<ItemKey>,
+        at: Range,
+    },
 }
 
 impl TypedFinding {
@@ -82,13 +94,16 @@ impl TypedFinding {
         match self {
             TypedFinding::ArgsInline { .. } => "args-inline",
             TypedFinding::UnsafeOpInUnsafeFn { .. } => "unsafe-op-in-unsafe-fn",
+            TypedFinding::Cost { .. } => "cost-contract",
         }
     }
 
     /// Its item-relative range.
     pub const fn at(&self) -> Range {
         match *self {
-            TypedFinding::ArgsInline { at, .. } | TypedFinding::UnsafeOpInUnsafeFn { at, .. } => at,
+            TypedFinding::ArgsInline { at, .. }
+            | TypedFinding::UnsafeOpInUnsafeFn { at, .. }
+            | TypedFinding::Cost { at, .. } => at,
         }
     }
 
@@ -98,6 +113,7 @@ impl TypedFinding {
         match *self {
             TypedFinding::ArgsInline { misuse, at, .. } => (at.start, at.end, 0, misuse as u8),
             TypedFinding::UnsafeOpInUnsafeFn { at, .. } => (at.start, at.end, 1, 0),
+            TypedFinding::Cost { violation, at, .. } => (at.start, at.end, 2, violation as u8),
         }
     }
 }

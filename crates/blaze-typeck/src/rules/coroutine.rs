@@ -286,7 +286,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             let Expr::Local(arg) = self.body.expr(init)? else { return Ok(None) };
                             if !self.body.params.contains(&arg)
                                 || !matches!(self.body.pat(pat)?, Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none())
-                                || self.adjust.column::<0>().contains(&init)
+                                || self.adjust.has(init)
                             {
                                 return Ok(None);
                             }
@@ -307,8 +307,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         Expr::MethodCall { receiver, args, .. } if matches!(self.body.expr(receiver)?, Expr::Local(_)) => {
                             // Borrowing a local receiver needs no backing temporary.
                             // An arbitrary receiver adjustment can create one.
-                            let mut adjustments = self.adjust.column::<0>().iter().zip(self.adjust.column::<1>())
-                                .filter_map(|(&e, &kind)| (e == receiver).then_some(kind));
+                            let kinds = self.adjust.column::<1>();
+                            let mut adjustments = self.adjust.rows_rev(receiver).map(|i| kinds[i]);
                             if !matches!(adjustments.next(), None | Some(crate::columns::AdjustKind::Borrow { raw: false, .. }))
                                 || adjustments.next().is_some()
                             {
@@ -319,13 +319,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         _ => return Ok(None),
                     };
                     for &arg in args {
-                        if self.adjust.column::<0>().contains(&arg) {
+                        if self.adjust.has(arg) {
                             return Ok(None);
                         }
                         match self.body.expr(arg)? {
                             Expr::Local(_) | Expr::Lit(_) | Expr::Path(_) => {}
                             Expr::Ref { operand, .. }
-                                if matches!(self.body.expr(operand)?, Expr::Local(_)) && !self.adjust.column::<0>().contains(&operand) => {}
+                                if matches!(self.body.expr(operand)?, Expr::Local(_)) && !self.adjust.has(operand) => {}
                             _ => return Ok(None),
                         }
                     }
@@ -502,9 +502,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 place = match self.body.expr(place)? {
                     Expr::Paren(inner) | Expr::Unary { op: crate::body::UnOp::Deref, operand: inner } => inner,
                     Expr::Field { base, .. } | Expr::TupleField { base, .. }
-                        if self.adjust.column::<0>().iter().zip(self.adjust.column::<1>()).any(|(&at, kind)| {
-                            at == base && matches!(kind, crate::columns::AdjustKind::Deref { .. })
-                        }) => base,
+                        if {
+                            let kinds = self.adjust.column::<1>();
+                            self.adjust.rows_rev(base).any(|i| matches!(kinds[i], crate::columns::AdjustKind::Deref { .. }))
+                        } => base,
                     _ => break,
                 };
             }
@@ -524,12 +525,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // Calling Deref on a smart pointer borrows the pointer itself. Box
         // has a special place projection in the Reference and needs its own
         // precision proof. Builtin reborrows through references do too.
-        let mut steps = self.adjust.column::<0>().iter().zip(self.adjust.column::<1>())
-            .filter_map(|(&at, &kind)| (at == value).then_some(kind));
-        if matches!(steps.next(), Some(crate::columns::AdjustKind::Deref { overloaded: Some(Mutbl::Not) }))
-            && matches!(steps.last(), Some(crate::columns::AdjustKind::Borrow { raw: false, mutbl: Mutbl::Not, .. }))
-            && borrow.is_none()
-        {
+        let is_deref_borrow = {
+            let kinds = self.adjust.column::<1>();
+            let mut rev_steps = self.adjust.rows_rev(value).map(|idx| kinds[idx]);
+            matches!(rev_steps.next(), Some(crate::columns::AdjustKind::Borrow { raw: false, mutbl: Mutbl::Not, .. }))
+                && matches!(rev_steps.last(), Some(crate::columns::AdjustKind::Deref { overloaded: Some(Mutbl::Not) }))
+        };
+        if is_deref_borrow && borrow.is_none() {
             let ty = self.ty.shallow_resolve(self.local_ty[p.ix()]);
             if let TyView::Adt(adt, _) = self.view(ty)
                 && self.lang(LangItem::OwnedBox)? != Some(adt)
@@ -539,10 +541,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             return Ok(());
         }
-        for (&at, &adjustment) in self.adjust.column::<0>().iter().zip(self.adjust.column::<1>()) {
-            if at != value {
-                continue;
-            }
+        let kinds = self.adjust.column::<1>();
+        for idx in self.adjust.rows_rev(value) {
+            let adjustment = kinds[idx];
             // Borrowing the unprojected receiver still uses the entire binding. An
             // autoderef, unsizing, or other coercion needs the adjusted place instead.
             match adjustment {

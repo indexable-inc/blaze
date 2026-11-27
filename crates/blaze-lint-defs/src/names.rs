@@ -76,6 +76,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::capabilities",
             "blaze::unreachable",
             "blaze::refinement",
+            "blaze::cost_contract",
             "blaze::todo",
             "blaze::undeclared_effect",
             "blaze::unfulfilled_effect",
@@ -308,6 +309,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::workspace_unsafe",
             "blaze::raw_sync",
             "blaze::anon_tuple_return",
+            "blaze::parallel_vecs",
         ],
     ),
     // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in

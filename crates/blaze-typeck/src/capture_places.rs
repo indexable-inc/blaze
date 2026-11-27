@@ -1340,9 +1340,17 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                         self.borrow(cp, place, PlaceMode::ImmBorrow);
                     }
                     let (adt, variant, args) = self.pat_variant(cp, p, t)?;
+                    let adt_key = match self.view(t) {
+                        TyView::Adt(k, _) => Some(k),
+                        _ => None,
+                    };
                     let declared = adt.fields.get(adt.variants[variant as usize].fields.range()).unwrap_or(&[]);
                     for fp in self.body.field_pat_list(fields)?.iter().rev() {
-                        let Some(at) = declared.iter().position(|d| d.name == fp.name) else {
+                        let at = match adt_key {
+                            Some(k) => self.find_adt_field(k, variant, declared, fp.name).map(|i| i as usize),
+                            None => declared.iter().position(|d| d.name == fp.name),
+                        };
+                        let Some(at) = at else {
                             return Err(gap(At::Pat(fp.pat), CaptureGapKind::PatternField));
                         };
                         let ty = self.variant_field_ty(adt, variant, at, args, fp.pat)?;

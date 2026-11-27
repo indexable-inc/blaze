@@ -52,6 +52,7 @@ mod const_path_args;
 mod const_terms;
 mod coroutine;
 mod coroutine_id;
+mod cost;
 mod deferred_place;
 mod discriminant;
 mod dyn_objects;
