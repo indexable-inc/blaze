@@ -255,6 +255,10 @@ pub enum ChainError<'n> {
     /// Two bodies of one file have one chain (rule 21, keys-cover-every-input): the chain
     /// misses what tells them apart.
     Collision { file: u32, chain: ContentId, first: BodyRef<'n>, second: BodyRef<'n> },
+    /// A singular lookup by `(file, chain)` matched multiple distinct bodies at the same outline
+    /// entry (one physical file mounted into multiple modules via `#[path = "..."]`): callers
+    /// that handle multi-mounted files must use [`ByChain::all`].
+    Ambiguous { file: u32, chain: ContentId, first: BodyRef<'n>, second: BodyRef<'n> },
 }
 
 impl core::fmt::Display for ChainError<'_> {
@@ -265,6 +269,9 @@ impl core::fmt::Display for ChainError<'_> {
             ChainError::NotItsKind { file, entry, found, body } => write!(f, "file {file} of the program's crate: entry {entry} of its outline is {found:?}, not the item of the body {body:?}"),
             ChainError::Collision { file, chain, first, second } => {
                 write!(f, "file {file} of the program's crate: the bodies {first:?} and {second:?} have one item chain {chain:?} (rule keys-cover-every-input)")
+            }
+            ChainError::Ambiguous { file, chain, first, second } => {
+                write!(f, "file {file} of the program's crate: item chain {chain:?} matches multiple mounted bodies ({first:?} and {second:?}); use `ByChain::all`")
             }
         }
     }
@@ -281,14 +288,27 @@ pub struct ByChain<'n> {
 }
 
 impl<'n> ByChain<'n> {
-    /// The body of file `file` (its index in the program's own crate) whose outline entry has
-    /// the chain `chain`.
-    pub fn get(&self, file: u32, chain: ContentId) -> Option<BodyRef<'n>> {
-        let at = self.rows.binary_search_by(|row| (row.0, &row.1.0).cmp(&(file, &chain.0))).ok()?;
-        Some(self.rows[at].2)
+    /// The unique body of file `file` (its index in the program's own crate) whose outline entry
+    /// has the chain `chain`. Returns `Err(ChainError::Ambiguous { .. })` when multiple module
+    /// mounts of `file` (`#[path = "..."]`) share that entry; use [`ByChain::all`] to visit every
+    /// mount's body.
+    pub fn get(&self, file: u32, chain: ContentId) -> Result<Option<BodyRef<'n>>, ChainError<'n>> {
+        let mut iter = self.all(file, chain);
+        let Some(first) = iter.next() else { return Ok(None) };
+        if let Some(second) = iter.next() {
+            return Err(ChainError::Ambiguous { file, chain, first, second });
+        }
+        Ok(Some(first))
     }
 
-    /// Every indexed body with its file and chain, sorted by (file, chain).
+    /// Every body of file `file` (its index in the program's own crate) whose outline entry has
+    /// the chain `chain`, in sorted [`BodyRef`] order.
+    pub fn all(&self, file: u32, chain: ContentId) -> impl Iterator<Item = BodyRef<'n>> + '_ {
+        let from = self.rows.partition_point(|row| (row.0, &row.1.0) < (file, &chain.0));
+        self.rows.iter().skip(from).take_while(move |row| row.0 == file && row.1 == chain).map(|row| row.2)
+    }
+
+    /// Every indexed body with its file and chain, sorted by (file, chain, body).
     pub fn rows(&self) -> &[(u32, ContentId, BodyRef<'n>)] {
         &self.rows
     }
@@ -313,7 +333,7 @@ pub fn index_by_chain<'n, S: BodySource<'n>>(names: S, listed: &[Listed<'n>], ch
         }
     }
     placed.sort_unstable();
-    let mut rows: AVec<'n, (u32, ContentId, BodyRef<'n>)> = AVec::new_in(alloc);
+    let mut rows: AVec<'n, (u32, ContentId, u32, BodyRef<'n>)> = AVec::new_in(alloc);
     let mut from = 0;
     while from < placed.len() {
         let file = placed[from].0;
@@ -336,7 +356,7 @@ pub fn index_by_chain<'n, S: BodySource<'n>>(names: S, listed: &[Listed<'n>], ch
         }
         from = to;
     }
-    by_chain_of(rows, unplaced)
+    by_chain_of(rows, unplaced, alloc)
 }
 
 /// [`index_by_chain`] of the bodies of one file, `file`, whose text `text` and outline `outline`
@@ -361,9 +381,9 @@ pub fn index_outlined_by_chain<'n>(
         }
     }
     placed.sort_unstable();
-    let mut rows: AVec<'n, (u32, ContentId, BodyRef<'n>)> = AVec::with_capacity_in(placed.len(), alloc);
+    let mut rows: AVec<'n, (u32, ContentId, u32, BodyRef<'n>)> = AVec::with_capacity_in(placed.len(), alloc);
     chain_rows(file, placed.iter().copied(), text, outline, chain, &mut rows)?;
-    by_chain_of(rows, 0)
+    by_chain_of(rows, 0, alloc)
 }
 
 /// [`index_outlined_by_chain`] over an already-serialized [`FileItemsView`], avoiding re-lexing
@@ -389,7 +409,7 @@ pub fn index_view_by_chain<'n>(
     }
     placed.sort_unstable();
     let cap = only_entries.map_or(placed.len(), |wanted| wanted.len().min(placed.len()));
-    let mut rows: AVec<'n, (u32, ContentId, BodyRef<'n>)> = AVec::with_capacity_in(cap, alloc);
+    let mut rows: AVec<'n, (u32, ContentId, u32, BodyRef<'n>)> = AVec::with_capacity_in(cap, alloc);
     for &(entry, body) in placed.iter() {
         let idx = ItemIndex(entry);
         let Some(found) = view.item(idx) else {
@@ -400,10 +420,10 @@ pub fn index_view_by_chain<'n>(
             return Err(ChainError::NotItsKind { file, entry, found: kind, body });
         }
         if only_entries.is_none_or(|wanted| wanted.binary_search(&entry).is_ok()) {
-            rows.push((file, chain(view, idx), body));
+            rows.push((file, chain(view, idx), entry, body));
         }
     }
-    by_chain_of(rows, 0)
+    by_chain_of(rows, 0, alloc)
 }
 
 fn body_fits_kind(body: BodyRef<'_>, kind: ItemKind) -> bool {
@@ -423,7 +443,7 @@ fn chain_rows<'n>(
     text: &str,
     outline: &Outline<'_>,
     chain: ChainOf<'_>,
-    rows: &mut AVec<'n, (u32, ContentId, BodyRef<'n>)>,
+    rows: &mut AVec<'n, (u32, ContentId, u32, BodyRef<'n>)>,
 ) -> Result<(), ChainError<'n>> {
     for (entry, body) in run {
         let Some(item) = usize::try_from(entry).ok().and_then(|at| outline.items().get(at)) else {
@@ -432,18 +452,77 @@ fn chain_rows<'n>(
         if !body_fits_kind(body, item.kind()) {
             return Err(ChainError::NotItsKind { file, entry, found: item.kind(), body });
         }
-        rows.push((file, chain(outline, item, text), body));
+        rows.push((file, chain(outline, item, text), entry, body));
     }
     Ok(())
 }
 
-/// The rows sorted by (file, chain), refused at the first two of one (file, chain) (rule 21).
-fn by_chain_of<'n>(mut rows: AVec<'n, (u32, ContentId, BodyRef<'n>)>, unplaced: u32) -> Result<ByChain<'n>, ChainError<'n>> {
-    rows.sort_unstable_by(|a, b| (a.0, &a.1.0, a.2).cmp(&(b.0, &b.1.0, b.2)));
+/// The rows sorted by `(file, chain, body)`. Two distinct outline entries in the same file sharing
+/// one `(file, chain)` (a chain key bug, rule 21), or two identical `(file, chain, body)` rows,
+/// are refused with [`ChainError::Collision`]. Multiple distinct `BodyRef`s at the exact same
+/// `(file, chain, entry)` — produced when one physical file is mounted in multiple modules of the
+/// same crate via `#[path = "..."]` — are all preserved in deterministic `BodyRef` order.
+fn by_chain_of<'n>(mut rows: AVec<'n, (u32, ContentId, u32, BodyRef<'n>)>, unplaced: u32, alloc: Alloc<'n>) -> Result<ByChain<'n>, ChainError<'n>> {
+    rows.sort_unstable_by(|a, b| (a.0, &a.1.0, a.3, a.2).cmp(&(b.0, &b.1.0, b.3, b.2)));
     for pair in rows.windows(2) {
-        if pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 {
-            return Err(ChainError::Collision { file: pair[0].0, chain: pair[0].1, first: pair[0].2, second: pair[1].2 });
+        if pair[0].0 == pair[1].0 && pair[0].1 == pair[1].1 && (pair[0].2 != pair[1].2 || pair[0].3 == pair[1].3) {
+            return Err(ChainError::Collision { file: pair[0].0, chain: pair[0].1, first: pair[0].3, second: pair[1].3 });
         }
     }
-    Ok(ByChain { rows, unplaced })
+    let mut kept: AVec<'n, (u32, ContentId, BodyRef<'n>)> = AVec::with_capacity_in(rows.len(), alloc);
+    kept.extend(rows.iter().map(|&(file, chain, _, body)| (file, chain, body)));
+    Ok(ByChain { rows: kept, unplaced })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(byte: u8) -> LibKey {
+        LibKey(ContentId([byte; 32]))
+    }
+
+    #[test]
+    fn by_chain_preserves_multi_mounted_same_entry_and_refuses_collisions() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let chain = ContentId([7u8; 32]);
+        let body_a = BodyRef::Free(key(1));
+        let body_b = BodyRef::Free(key(2));
+
+        // Positive: two distinct BodyRefs at the exact same (file, chain, entry) — two mounts of
+        // one physical file via `#[path = "..."]` — are both preserved.
+        let mut multi = AVec::new_in(alloc);
+        multi.push((0, chain, 5, body_b));
+        multi.push((0, chain, 5, body_a));
+        let by = by_chain_of(multi, 0, alloc).expect("multi-mounted same entry must succeed");
+        let got: AVec<'_, BodyRef<'_>> = {
+            let mut out = AVec::new_in(alloc);
+            out.extend(by.all(0, chain));
+            out
+        };
+        assert_eq!(got.as_slice(), &[body_a, body_b]);
+        // Negative control: singular lookup on multi-mounted `(file, chain)` must reject ambiguity.
+        assert_eq!(by.get(0, chain), Err(ChainError::Ambiguous { file: 0, chain, first: body_a, second: body_b }));
+
+        // Positive: singular lookup on unique `(file, chain)` succeeds.
+        let unique_chain = ContentId([8u8; 32]);
+        let mut single = AVec::new_in(alloc);
+        single.push((0, unique_chain, 2, body_a));
+        let by_single = by_chain_of(single, 0, alloc).expect("unique entry must succeed");
+        assert_eq!(by_single.get(0, unique_chain), Ok(Some(body_a)));
+        assert_eq!(by_single.get(0, chain), Ok(None));
+
+        // Negative 1: two DIFFERENT outline entries sharing one (file, chain) must collide.
+        let mut diff_entry = AVec::new_in(alloc);
+        diff_entry.push((0, chain, 4, body_a));
+        diff_entry.push((0, chain, 6, body_b));
+        assert!(matches!(by_chain_of(diff_entry, 0, alloc), Err(ChainError::Collision { file: 0, .. })));
+
+        // Negative 2: duplicate identical (file, chain, entry, body) must collide.
+        let mut dup_body = AVec::new_in(alloc);
+        dup_body.push((0, chain, 5, body_a));
+        dup_body.push((0, chain, 5, body_a));
+        assert!(matches!(by_chain_of(dup_body, 0, alloc), Err(ChainError::Collision { file: 0, .. })));
+    }
 }

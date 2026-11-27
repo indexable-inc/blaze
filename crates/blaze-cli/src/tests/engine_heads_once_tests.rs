@@ -428,7 +428,7 @@ impl HeadRows {
                 }
                 kind => panic!("unexpected fixture signature {kind:?} at {path}::{word}"),
             };
-            let cell = crate::engine_heads::head_cell(want, word, None, crate::engine_tasks::WHOLE);
+            let cell = crate::engine_heads::head_cell(want, module, word, None, crate::engine_tasks::WHOLE);
             self.head_units.insert(CellId { of: name, cell }, krate);
             for (cell, kind) in [
                 (NameCell::Item { key }, "Item"), (NameCell::Members { owner: key }, "Members"),

@@ -72,9 +72,18 @@ fn index(i: usize) -> ItemIndex {
     ItemIndex(u32::try_from(i).expect("an outline of a small text"))
 }
 
-/// Every head of `TEXT` under `unit`, its task named by `name_of` (the rule or the plant).
-fn heads<'a>(outline: &Outline<'_>, unit: [u8; 8], name_of: NameOf, alloc: Alloc<'a>) -> blaze_own::Vec<Modelled<'a>, Alloc<'a>> {
+/// Enclosing module key for `mount` in `unit`: distinct across modules of the same unit.
+fn module_of(unit: [u8; 8], mount: u32) -> blaze_id::ItemKey {
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&unit);
+    bytes[12..16].copy_from_slice(&mount.to_le_bytes());
+    blaze_id::ItemKey(ContentId(bytes))
+}
+
+/// Every head of `TEXT` under `(unit, mount)`, its task named by `name_of` (the rule or the plant).
+fn heads_in<'a>(outline: &Outline<'_>, unit: [u8; 8], mount: u32, name_of: NameOf, alloc: Alloc<'a>) -> blaze_own::Vec<Modelled<'a>, Alloc<'a>> {
     let file = file_subject("m/src/lib.rs");
+    let module = module_of(unit, mount);
     let mut heads = blaze_own::Vec::new_in(alloc);
     for (i, item) in outline.items().iter().enumerate() {
         let at = index(i);
@@ -101,9 +110,14 @@ fn heads<'a>(outline: &Outline<'_>, unit: [u8; 8], name_of: NameOf, alloc: Alloc
             Some(member) => blaze_own::text::format(alloc, format_args!("{:?} `{item_name}::{member}` at entry {}", item.kind(), at.0)),
             None => blaze_own::text::format(alloc, format_args!("{:?} `{item_name}` at entry {}", item.kind(), at.0)),
         };
-        heads.push(Modelled { entry: cover, task: name_of(file, outline, outline.item(cover), TEXT), cell: head_cell(want, item_name, member, WHOLE), words });
+        heads.push(Modelled { entry: cover, task: name_of(file, outline, outline.item(cover), TEXT), cell: head_cell(want, module, item_name, member, WHOLE), words });
     }
     heads
+}
+
+/// Every head of `TEXT` under `unit` (mount 0), its task named by `name_of` (the rule or the plant).
+fn heads<'a>(outline: &Outline<'_>, unit: [u8; 8], name_of: NameOf, alloc: Alloc<'a>) -> blaze_own::Vec<Modelled<'a>, Alloc<'a>> {
+    heads_in(outline, unit, 0, name_of, alloc)
 }
 
 /// Each pair of heads under one (task, cell) in `heads`, in words: two heads of two entries
@@ -186,6 +200,29 @@ fn engine_head_cells_are_one_a_head_and_entries_one_a_task() {
         assert_ne!(one.cell, other.cell, "{}: one head's cells in two units differ", one.words);
         assert!(one.task == other.task, "{}: one entry is one task in both units", one.words);
     }
+
+    // Two distinct module mounts of the same file within ONE unit (`#[path = "shared.rs"] mod a;`
+    // and `#[path = "shared.rs"] mod b;`) share every task name yet get distinct cells per mount.
+    let mount_b = heads_in(&outline, UNITS[0], 1, signature_name, alloc);
+    assert_eq!(lib.len(), mount_b.len(), "both module mounts list every head");
+    let mut combined = blaze_own::Vec::with_capacity_in(lib.len() + mount_b.len(), alloc);
+    for (one, other) in lib.iter().zip(mount_b.iter()) {
+        assert_eq!(one.words, other.words, "both mounts list heads in one order");
+        assert!(one.task == other.task, "{}: one entry is one task across mounts", one.words);
+        assert_ne!(one.cell, other.cell, "{}: two mounts in one unit get distinct cells", one.words);
+        combined.push(Modelled { entry: one.entry, task: one.task, cell: one.cell, words: blaze_own::text::format(alloc, format_args!("a::{}", one.words)) });
+        combined.push(Modelled { entry: other.entry, task: other.task, cell: other.cell, words: blaze_own::text::format(alloc, format_args!("b::{}", other.words)) });
+    }
+    let cross_mount_collided = under_one_cell(&combined, alloc);
+    assert!(cross_mount_collided.is_empty(), "two mounts of one file in one unit never collide: {:?}", cross_mount_collided);
+
+    // Negative control: two duplicate heads with the SAME (module, want_kind, name) under one entry
+    // still fall under one cell.
+    let dup_a = head_cell(Want::Fn(key_of(UNITS[0], index(0))), module_of(UNITS[0], 0), "dup", None, WHOLE);
+    let dup_b = head_cell(Want::Fn(key_of(UNITS[0], index(1))), module_of(UNITS[0], 0), "dup", None, WHOLE);
+    assert_eq!(dup_a, dup_b, "same module + kind + name still collides onto one cell");
+    let dup_other_mod = head_cell(Want::Fn(key_of(UNITS[0], index(1))), module_of(UNITS[0], 1), "dup", None, WHOLE);
+    assert_ne!(dup_a, dup_other_mod, "distinct module in same unit produces distinct cell");
 
     // CONTROL: the old task name.
     let before = entries_under_one_name(&outline, signature_name_before, alloc);

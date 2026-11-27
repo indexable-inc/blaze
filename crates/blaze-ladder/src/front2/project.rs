@@ -430,12 +430,13 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         Ok(self.by_chain.insert(index))
     }
 
-    /// The body the command names by its file (the file's index in the program's own crate:
+    /// The unique body the command names by its file (the file's index in the program's own crate:
     /// an `At::File`'s, the items record's file row) and the chain of its outline entry
     /// (`blaze_file_items::item_chain(&outline, item, text)`): one binary search in
     /// [`ProjectWorld::chains`]. `Ok(None)`: no body of that file has that chain.
+    /// `Err(ChainError::Ambiguous { .. })`: multiple module mounts share that `(file, chain)`.
     pub fn body_by_chain(&mut self, file: u32, chain: ContentId) -> Result<Option<BodyRef<'n>>, ChainError<'n>> {
-        Ok(self.chains()?.get(file, chain))
+        self.chains()?.get(file, chain)
     }
 
     /// The body that declared a local item, when `key` is a body-local checker key. The
