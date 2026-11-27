@@ -19,7 +19,7 @@ use core::{fmt, time::Duration};
 use blaze_own::Alloc;
 use blaze_sim::{Broken, Config, NoPlant, Tape, check, controls};
 
-use super::{Held, Limits, Slot, SlotOpts, WorkerId, Workers, WorkersOpts, WorkersPlant, WorkersSetup, charge_wait};
+use super::{Held, Limits, MOST_CALLERS, Slot, SlotOpts, WorkerId, Workers, WorkersError, WorkersOpts, WorkersPlant, WorkersSetup, charge_wait};
 use crate::io::{Io, Limits as IoLimits, SimWorld};
 
 /// A cell of the stand-in: whose it is and what was last written.
@@ -310,4 +310,95 @@ fn the_shipped_charge_charges() {
     let mut w = held.worker();
     charge_wait(&mut w, "test.wait", Some(9), 41_800, NoPlant);
     assert_eq!(w.meter().waits().total(), (1, 41_800));
+}
+
+#[test]
+fn caller_leases_span_multi_word_bitmap_and_reclaim_freed_bits() {
+    let workers = Workers::bare(WorkersSetup {
+        limits: Limits { most_workers: 4, callers: 130, most_slots: 0 },
+        seed: None,
+        models: 2,
+    })
+    .expect("130 callers across 3 bitmap words");
+    let first = 4 + 2;
+    let mut leases: StdVec<_> = (0..130)
+        .map(|i| {
+            let lease = workers.lease().expect("caller cell within 130");
+            assert_eq!(lease.id().index(), first + i, "leases hand out caller indices in order");
+            // Prove the leased caller cell can actually be held and used.
+            let _held = workers.hold(lease.id()).expect("leased caller cell is holdable");
+            lease
+        })
+        .collect();
+    match workers.lease() {
+        Err(WorkersError::CallersTaken { most: 130 }) => {}
+        Ok(extra) => panic!("131st caller lease must fail, got {:?}", extra.id()),
+        Err(other) => panic!("expected CallersTaken {{ most: 130 }}, got {other}"),
+    }
+
+    // Drop one lease in each of word 0 (bit 5), word 1 (bit 70), and word 2 (bit 129).
+    let freed = [5usize, 70, 129];
+    for &idx in freed.iter().rev() {
+        let removed = leases.remove(idx);
+        assert_eq!(removed.id().index(), first + u32::try_from(idx).unwrap());
+        drop(removed);
+    }
+
+    // Re-leasing returns the three freed bits in ascending bitmap order.
+    let mut reclaimed = StdVec::new();
+    for &idx in &freed {
+        let lease = workers.lease().expect("freed caller cell is re-leasable");
+        assert_eq!(lease.id().index(), first + u32::try_from(idx).unwrap());
+        reclaimed.push(lease);
+    }
+    assert!(matches!(workers.lease(), Err(WorkersError::CallersTaken { most: 130 })));
+    drop(reclaimed);
+    drop(leases);
+}
+
+#[test]
+fn caller_lease_boundaries_and_limit_checks() {
+    assert_eq!(MOST_CALLERS, 512);
+    assert_eq!(Limits::SHIPPED.callers, MOST_CALLERS);
+
+    // Zero callers is refused.
+    assert!(matches!(
+        WorkersOpts::new(WorkersSetup { limits: Limits { most_workers: 1, callers: 0, most_slots: 0 }, seed: None, models: 0 }),
+        Err(WorkersError::LimitZero { limit: "Limits::callers" })
+    ));
+
+    // MOST_CALLERS + 1 is refused.
+    assert!(matches!(
+        WorkersOpts::new(WorkersSetup {
+            limits: Limits { most_workers: 1, callers: MOST_CALLERS + 1, most_slots: 0 },
+            seed: None,
+            models: 0,
+        }),
+        Err(WorkersError::LimitTooLarge { limit: "callers", wanted: 513, most: 512 })
+    ));
+
+    // Boundary counts: 1 (single bit), 64 (exact 1 word), 65 (crosses into word 1), 512 (exact 8 words).
+    for &count in &[1u32, 64, 65, MOST_CALLERS] {
+        let workers = Workers::bare(WorkersSetup {
+            limits: Limits { most_workers: 2, callers: count, most_slots: 0 },
+            seed: None,
+            models: 0,
+        })
+        .expect("valid caller count");
+        let mut leases = StdVec::with_capacity(usize::try_from(count).unwrap());
+        for i in 0..count {
+            let lease = workers.lease().expect("lease within count");
+            assert_eq!(lease.id().index(), 2 + i);
+            leases.push(lease);
+        }
+        assert!(matches!(workers.lease(), Err(WorkersError::CallersTaken { most }) if most == count));
+
+        // Drop the last lease (highest bit in the final word) and re-lease it.
+        let last = leases.pop().expect("at least one lease");
+        let last_id = last.id();
+        drop(last);
+        let again = workers.lease().expect("re-lease highest bit");
+        assert_eq!(again.id(), last_id);
+        assert!(matches!(workers.lease(), Err(WorkersError::CallersTaken { most }) if most == count));
+    }
 }
