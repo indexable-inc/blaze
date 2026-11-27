@@ -20,7 +20,7 @@ blaze-body-flow	24
 blaze-body-lower	22
 blaze-borrow	43
 blaze-bstd-convert	9
-blaze-build	725
+blaze-build	724
 blaze-build-script	109
 blaze-c	4
 blaze-cad	105
@@ -58,7 +58,7 @@ blaze-facts	12
 blaze-fetch	183
 blaze-file-items	104
 blaze-flow	238
-blaze-flow-lower	358
+blaze-flow-lower	353
 blaze-fmt	62
 blaze-format	44
 blaze-format-core	95
@@ -105,7 +105,7 @@ blaze-remote	238
 blaze-report	137
 blaze-rng	3
 blaze-run	110
-blaze-scope	931
+blaze-scope	930
 blaze-screen	13
 blaze-script	11
 blaze-sh	145

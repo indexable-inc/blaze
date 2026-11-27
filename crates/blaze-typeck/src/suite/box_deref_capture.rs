@@ -7,7 +7,7 @@
 
 use std::vec::Vec;
 
-use super::check_body;
+use super::{check_body, clauses};
 use crate::body::{Expr, IntSuffix};
 use crate::columns::CaptureKind;
 use crate::env_fields::CaptureProj;
@@ -29,19 +29,19 @@ struct BoxWorld {
 
 fn box_world() -> BoxWorld {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
-    let copy = fx.tr("Copy", 1, Vec::new(), &[]);
+    let copy = fx.tr("Copy", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Copy, copy);
-    let drop = fx.tr("Drop", 1, Vec::new(), &[]);
+    let drop = fx.tr("Drop", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Drop, drop);
 
     let p0 = fx.param(0);
     let u8_ = fx.u8();
     let unit = fx.unit();
-    fx.imp("impl Copy for u8", 0, u8_, Some((copy, &[])), &[], Vec::new());
+    fx.imp("impl Copy for u8", 0, u8_, Some((copy, &[])), &[], clauses(&[]));
 
-    let deref = fx.tr("Deref", 1, Vec::new(), &["Target"]);
+    let deref = fx.tr("Deref", 1, clauses(&[]), &["Target"]);
     fx.lang(LangItem::Deref, deref);
     let ref_self = fx.r(Mutbl::Not, p0);
     let target = fx.alias(deref, "Target", &[p0]);
@@ -49,7 +49,7 @@ fn box_world() -> BoxWorld {
     fx.trait_fn(deref, "deref", true, &[ref_self], ref_target);
 
     let deref_bound = fx.bound(deref, &[p0]);
-    let deref_mut = fx.tr("DerefMut", 1, std::vec![deref_bound], &[]);
+    let deref_mut = fx.tr("DerefMut", 1, clauses(&[deref_bound]), &[]);
     fx.lang(LangItem::DerefMut, deref_mut);
     let mut_self = fx.r(Mutbl::Mut, p0);
     let mut_target = fx.r(Mutbl::Mut, target);
@@ -58,8 +58,8 @@ fn box_world() -> BoxWorld {
     let owned_box = fx.strukt("Box", 1, &[("ptr", p0)]);
     fx.lang(LangItem::OwnedBox, owned_box);
     let box_p0 = fx.adt(owned_box, &[p0]);
-    fx.imp("impl Deref for Box", 1, box_p0, Some((deref, &[])), &[("Target", p0)], Vec::new());
-    fx.imp("impl DerefMut for Box", 1, box_p0, Some((deref_mut, &[])), &[], Vec::new());
+    fx.imp("impl Deref for Box", 1, box_p0, Some((deref, &[])), &[("Target", p0)], clauses(&[]));
+    fx.imp("impl DerefMut for Box", 1, box_p0, Some((deref_mut, &[])), &[], clauses(&[]));
 
     let owned = fx.strukt("Owned", 0, &[("v", u8_)]);
     let owned_ty = fx.adt(owned, &[]);
@@ -74,15 +74,15 @@ fn box_world() -> BoxWorld {
 
     let dropped = fx.strukt("Dropped", 0, &[("command", box_cmd), ("limit", u8_)]);
     let dropped_ty = fx.adt(dropped, &[]);
-    fx.imp("impl Drop for Dropped", 0, dropped_ty, Some((drop, &[])), &[], Vec::new());
+    fx.imp("impl Drop for Dropped", 0, dropped_ty, Some((drop, &[])), &[], clauses(&[]));
 
-    let read_field = fx.func("read_field", 0, &[started_ty], unit, Vec::new());
-    let mut_field = fx.func("mut_field", 0, &[started_ty], unit, Vec::new());
-    let root_box = fx.func("root_box", 0, &[box_cmd], unit, Vec::new());
-    let move_box = fx.func("move_box", 0, &[box_cmd], unit, Vec::new());
-    let move_non_copy_field = fx.func("move_non_copy_field", 0, &[box_cmd], unit, Vec::new());
-    let nested_box = fx.func("nested_box", 0, &[box_box_cmd], unit, Vec::new());
-    let move_drop_struct = fx.func("move_drop_struct", 0, &[dropped_ty], unit, Vec::new());
+    let read_field = fx.func("read_field", 0, &[started_ty], unit, clauses(&[]));
+    let mut_field = fx.func("mut_field", 0, &[started_ty], unit, clauses(&[]));
+    let root_box = fx.func("root_box", 0, &[box_cmd], unit, clauses(&[]));
+    let move_box = fx.func("move_box", 0, &[box_cmd], unit, clauses(&[]));
+    let move_non_copy_field = fx.func("move_non_copy_field", 0, &[box_cmd], unit, clauses(&[]));
+    let nested_box = fx.func("nested_box", 0, &[box_box_cmd], unit, clauses(&[]));
+    let move_drop_struct = fx.func("move_drop_struct", 0, &[dropped_ty], unit, clauses(&[]));
     fx.finish();
     BoxWorld { fx, read_field, mut_field, root_box, move_box, move_non_copy_field, nested_box, move_drop_struct }
 }

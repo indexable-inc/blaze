@@ -19,8 +19,6 @@
 //!   `local_inner_macros` macro resolves in the caller crate, never `$crate::CallerTy` /
 //!   `$crate::CALLER_VAL`.
 
-use std::collections::HashMap;
-
 use blaze_drive::key::{ABSENT, Key, Kind, Name};
 use blaze_engine::{CellId, Made, Phase, Planned, SVec, Stage, Task};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
@@ -30,7 +28,7 @@ use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, Records};
 use blaze_ladder::front2::tables::recorder::{Recorder, RecorderOpts};
 use blaze_ladder::front2::tables::task::{BodyFrame, BodyOut, Make, MakeRefused, SaidWhat, check_body};
 use blaze_ladder::front2::tables::view::{Tables, TablesOpts};
-use blaze_own::Alloc;
+use blaze_own::{AString, AVec, Alloc};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, Names, SourceTexts, aligned, resolve_crates};
 use blaze_scope::task::Serial;
@@ -290,12 +288,12 @@ fn input(name: &'static str, root: &'static str, deps: &'static [(&'static str, 
 }
 
 struct Kept {
-    names: Vec<&'static [u8]>,
-    items: Vec<&'static [u8]>,
-    files: Vec<HashMap<String, &'static str>>,
-    expansions: Vec<HashMap<ItemKey, (&'static str, Option<&'static [u8]>)>>,
-    keys: Vec<CrateItemKey>,
-    crate_names: Vec<&'static str>,
+    names: AVec<'static, &'static [u8]>,
+    items: AVec<'static, &'static [u8]>,
+    files: AVec<'static, AVec<'static, (&'static str, &'static str)>>,
+    expansions: AVec<'static, AVec<'static, (ItemKey, (&'static str, Option<&'static [u8]>))>>,
+    keys: AVec<'static, CrateItemKey>,
+    crate_names: AVec<'static, &'static str>,
 }
 
 impl Load<'static> for Kept {
@@ -308,11 +306,11 @@ impl Load<'static> for Kept {
     }
 
     fn file(&self, krate: usize, path: blaze_scope::package_path::PackagePath<'_>) -> Option<&'static str> {
-        self.files.get(krate)?.get(path.as_str()).copied()
+        self.files.get(krate)?.iter().find(|(p, _)| *p == path.as_str()).map(|(_, t)| *t)
     }
 
     fn expansion(&self, krate: usize, call: ItemKey) -> Option<LoadedExpansion<'static>> {
-        let &(text, origins) = self.expansions.get(krate)?.get(&call)?;
+        let &(_, (text, origins)) = self.expansions.get(krate)?.iter().find(|(k, _)| *k == call)?;
         let origins = origins.and_then(|b| blaze_scope::expansion_origins::split(b).ok());
         Some(LoadedExpansion { text, origins })
     }
@@ -325,41 +323,45 @@ fn build_records() -> (&'static Names<'static>, &'static Records<'static>) {
         input("core", "/core/lib.rs", &[]),
     ];
     let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, proc_macro: None, bstd: None };
-    let names: &'static Names<'static> = Box::leak(Box::new(
-        resolve_crates(&crates, sysroot, &Texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}")),
-    ));
+    let bump = blaze_own::testing::bump();
+    let names: &'static Names<'static> = bump.alloc_val(
+        resolve_crates(&crates, sysroot, &Texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}")),
+    );
     let g = a();
     let mut kept = Kept {
-        names: Vec::new(),
-        items: Vec::new(),
-        files: Vec::new(),
-        expansions: Vec::new(),
-        keys: Vec::new(),
-        crate_names: Vec::new(),
+        names: AVec::new_in(g),
+        items: AVec::new_in(g),
+        files: AVec::new_in(g),
+        expansions: AVec::new_in(g),
+        keys: AVec::new_in(g),
+        crate_names: AVec::new_in(g),
     };
     for c in names.crates().iter() {
-        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
-        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("items record of `{}`: {e:?}", c.name)), blaze_own::testing::bump()));
-        kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), f.text)).collect());
-        kept.expansions.push(
-            c.expansions
-                .iter()
-                .filter_map(|(call, e)| {
-                    e.made.map(|m| {
-                        let text: &'static str = Box::leak(m.text.to_string().into_boxed_str());
-                        let origins = m.origins.ok().map(|b| &*Box::leak(b.to_vec().into_boxed_slice()));
-                        (*call, (text, origins))
-                    })
-                })
-                .collect(),
-        );
+        kept.names.push(aligned(&names_record::encode(c, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.name)), bump));
+        kept.items.push(aligned(&items_record::encode(c, g).unwrap_or_else(|e| panic!("items record of `{}`: {e:?}", c.name)), bump));
+        let mut files = AVec::new_in(g);
+        for f in c.files.iter() {
+            files.push((&*bump.alloc_str(f.package.as_str()), f.text));
+        }
+        kept.files.push(files);
+        let mut exps = AVec::new_in(g);
+        for (call, e) in c.expansions.iter() {
+            if let Some(m) = e.made {
+                let text: &'static str = bump.alloc_str(m.text);
+                let origins = m.origins.ok().map(|b| &*bump.alloc_slice_copy(b));
+                exps.push((*call, (text, origins)));
+            }
+        }
+        kept.expansions.push(exps);
         kept.keys.push(c.key);
         kept.crate_names.push(c.name);
     }
-    let kept: &'static Kept = Box::leak(Box::new(kept));
-    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame")));
-    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(Vec::leak(kept.crate_names.clone()), g)));
-    let records: &'static Records<'static> = Box::leak(Box::new(Records::new(Vec::leak(kept.keys.clone()), kept, log, frame, g)));
+    let crate_names: &'static [&'static str] = bump.alloc_slice_copy(&kept.crate_names);
+    let keys: &'static [CrateItemKey] = bump.alloc_slice_copy(&kept.keys);
+    let kept: &'static Kept = bump.alloc_val(kept);
+    let frame: &'static blaze_mem::Frame = bump.alloc_val(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame"));
+    let log: &'static Log<'static> = bump.alloc_val(Log::new(crate_names, g));
+    let records: &'static Records<'static> = bump.alloc_val(Records::new(keys, kept, log, frame, g));
     (names, records)
 }
 
@@ -367,7 +369,8 @@ struct NoEdit;
 
 impl<'a> Make<'a> for NoEdit {
     fn make(&self, want: &CellId, _made: &mut SVec<'a, Made<'a>>) -> Result<ContentId, MakeRefused> {
-        Ok(ContentId::of("blaze-ladder local_inner cell", format!("{want:?}").as_bytes()))
+        let text = blaze_own::format_in!(a(), "{want:?}");
+        Ok(ContentId::of("blaze-ladder local_inner cell", text.as_bytes()))
     }
 }
 
@@ -375,7 +378,7 @@ fn run_body(records: &'static Records<'static>, key: ItemKey) -> BodyOut<'static
     let g = a();
     let unused = Recorder::new(RecorderOpts { alloc: g });
     let tables = Tables::new(TablesOpts { records, impls: None, lang_crates: LANG, reads: &unused });
-    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("body frame")));
+    let frame: &'static blaze_mem::Frame = blaze_own::testing::bump().alloc_val(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("body frame"));
     let body = BodyFrame {
         frame,
         alloc: a(),
@@ -407,11 +410,13 @@ fn fn_key(names: &'static Names<'static>, records: &'static Records<'static>, na
     panic!("function `{name}` not found in app");
 }
 
-fn issues(out: &BodyOut<'_>) -> Vec<String> {
-    out.said
-        .iter()
-        .map(|s| format!("{:?}: {}", s.what, s.words.as_str()))
-        .collect()
+fn issues(out: &BodyOut<'_>) -> AVec<'static, AString<'static>> {
+    let g = a();
+    let mut rows = AVec::new_in(g);
+    for s in out.said.iter() {
+        rows.push(blaze_own::format_in!(g, "{:?}: {}", s.what, s.words.as_str()));
+    }
+    rows
 }
 
 struct NoCfg;
@@ -495,15 +500,15 @@ fn local_inner_macros_token_hygiene_positives_and_negative_controls() {
             .unwrap_or_else(|e| panic!("neg2_stringify lower: {e:?}"));
         assert!(expand.findings().is_empty(), "neg2_stringify findings: {:?}", expand.findings());
         let view = lowered.view();
-        let mut lits = Vec::new();
+        let mut lits = AVec::new_in(alloc);
         for i in 0..u32::try_from(view.exprs.len()).expect("exprs fit u32") {
             let id = blaze_lower::ExprId(i);
             if matches!(view.expr(id), Ok(blaze_lower::Expr::Lit(blaze_lower::Lit::Str))) {
                 let r = view.expr_range(id).expect("expr range");
-                lits.push(view.text_at(r).expect("str lit text").to_string());
+                lits.push(view.text_at(r).expect("str lit text"));
             }
         }
-        assert_eq!(lits, vec!["\"opts! (1)\""], "stringify! must yield \"opts! (1)\" (not $crate::opts!(1) or crate::opts!(1))");
+        assert_eq!(lits.as_slice(), ["\"opts! (1)\""], "stringify! must yield \"opts! (1)\" (not $crate::opts!(1) or crate::opts!(1))");
     }
 
     // Negative control 2b: caller argument `dep::pass_arg!(caller_mac!())` resolves `caller_mac!`

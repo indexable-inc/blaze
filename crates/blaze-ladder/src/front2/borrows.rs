@@ -6177,7 +6177,8 @@ fn main() {}
         let heap = blaze_own::testing::heap();
         let alloc = heap.alloc();
         let home = std::env::var("HOME").expect("HOME is set");
-        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let shelf = blaze_own::format_in!(alloc, "{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.as_str().into())).expect("installed toolchain");
         let files = [("/w6sound/src/main.rs".to_string(), SOURCE.to_string())];
         let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
         let user = UserCrate { name: "w6sound", dir: "/w6sound/", root: "/w6sound/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -7014,7 +7015,8 @@ fn main() {}
         let heap = blaze_own::testing::heap();
         let alloc = heap.alloc();
         let home = std::env::var("HOME").expect("HOME is set");
-        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let shelf = blaze_own::format_in!(alloc, "{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.as_str().into())).expect("installed toolchain");
         let files = [("/rfc1156_dyn/src/main.rs".to_string(), SOURCE.to_string())];
         let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
         let user = UserCrate {

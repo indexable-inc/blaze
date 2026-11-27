@@ -104,6 +104,7 @@ crates/blaze-engine/src/pages/headers.rs	MAGIC	none
 crates/blaze-expand/src/kept_set.rs	MAGIC	none
 crates/blaze-expand/src/kept_set.rs	MAGIC_V1	none
 crates/blaze-expand/src/kept_set.rs	MAGIC_V2	none
+crates/blaze-expand/src/kept_set.rs	MAGIC_V3	none
 crates/blaze-expand/src/record.rs	EXPANSION_SCHEMA	none
 crates/blaze-expand/src/record.rs	STREAM_SCHEMA	none
 crates/blaze-export/src/macho.rs	LC_BUILD_VERSION	none

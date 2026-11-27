@@ -2169,7 +2169,7 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
 #[test]
 fn include_text_mark_and_body_words_preserve_caller_edition() {
     use blaze_expand::{CtxNode, Mark, Transparency, body_words, origin_column::TextMark};
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let cx = TestCx {
         files: &[("inc.rs", b"match self { Self::A(ref mut x) => *x }")],
         ..TestCx::new()
@@ -2285,7 +2285,7 @@ fn include_text_mark_and_body_words_preserve_caller_edition() {
 #[test]
 fn lex_marked_preserves_transparent_edition_without_folding_dollar_crate() {
     use blaze_expand::{Transparency, origin_column::TextMark};
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let site = DefSite { krate: CrateItemKey(ContentId([41; 32])), module: None };
     let transparent_2021 = TextMark { site, transparency: Transparency::Transparent, edition: Edition::E2021, local_inner: false };
     let semi_2021 = TextMark { site, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false };
@@ -2337,7 +2337,7 @@ fn nested_transparent_proc_macro_over_semi_opaque_call_site_preserves_innermost_
         }
     }
 
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let rules_2024_krate = CrateItemKey(ContentId([0x41; 32]));
     let rules_2021_krate = CrateItemKey(ContentId([0x42; 32]));
     let proc_2021_krate = CrateItemKey(ContentId([0x43; 32]));
@@ -2438,7 +2438,7 @@ fn transparent_edition_drives_parser_words_keyword_classification() {
         }
     }
 
-    let alloc = Alloc::global();
+    let alloc = blaze_own::testing::heap().alloc();
     let empty_2024 = TokenStream::new_in(alloc);
     let call_2024 = Call::fn_like(&empty_2024, CallSite { edition: Edition::E2024, panic_edition: Edition::E2024, ctx: Ctx::root(Edition::E2024) });
     let empty_2015 = TokenStream::new_in(alloc);

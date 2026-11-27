@@ -1098,6 +1098,20 @@ enum WantCallable {
     FnPtr(PTy, u32),
 }
 
+/// Continuation frame for [`Lower::trace_container_callable_root`]'s explicit worklist.
+enum TraceCallableFrame<'r> {
+    AfterReceiver {
+        args: List,
+        depth: u8,
+    },
+    AfterArg {
+        args: List,
+        next_idx: usize,
+        depth: u8,
+        found: Option<(PTy, &'r [Region], bool)>,
+    },
+}
+
 /// Counts the census reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -9301,186 +9315,248 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         heads: &blaze_borrow::Columns<'_>,
         e: ExprId,
     ) -> Result<Option<(PTy, &'b [Region], bool)>, Refusal> {
+        const MAX_DEPTH: u8 = 16;
+        const MAX_STEPS: usize = 128;
+
         let facts: &'b F = self.facts;
-        let mut cur = start;
-        for _ in 0..24 {
-            match self.expr(cur)? {
-                Expr::Paren(i)
-                | Expr::Unary { op: UnOp::Deref, operand: i }
-                | Expr::Ref { operand: i, .. }
-                | Expr::Cast { operand: i, .. }
-                | Expr::Block { tail: Some(i), .. } => cur = i,
-                Expr::Call { callee: call_callee, args: call_args } => {
-                    if let Some((callee, _)) = self.callee_of(cur)
-                        && let Ok(sig) = facts.sig(callee)
-                        && let Some(out_slots) = sig.output()
-                        && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
-                        && let Some((ty, sl)) = self.extract_callable_from_head(out_ty, out_slots, heads, want, e)?
-                    {
-                        return Ok(Some((ty, sl, false)));
-                    }
-                    // Desugared `for pat in head`:
-                    //   match IntoIterator::into_iter(head) { mut iter => loop { match Iterator::next(&mut iter) { ... } } }
-                    // Trace `Iterator::next(&mut iter)` -> `IntoIterator::into_iter(head)` -> `head`
-                    // when `iter` is never reassigned and only mutably borrowed at this `next` call.
-                    if let Some(&[only]) = self.body.expr_lists.get(call_args.range()) {
-                        match self.expr_lang(call_callee) {
-                            Some(blaze_typeck::LangItem::IntoIterIntoIter) => {
-                                cur = only;
-                                continue;
+        let mut frames: Vec<TraceCallableFrame<'b>, A> = Vec::new_in(self.alloc);
+        let mut active: Option<(ExprId, u8)> = Some((start, 0));
+        let mut last_result: Option<(PTy, &'b [Region], bool)> = None;
+        let mut steps = 0usize;
+
+        loop {
+            if let Some((mut cur, depth)) = active.take() {
+                if depth >= MAX_DEPTH || steps >= MAX_STEPS {
+                    last_result = None;
+                } else {
+                    let mut pushed_child = false;
+                    let mut result: Option<(PTy, &'b [Region], bool)> = None;
+                    for _ in 0..24 {
+                        steps += 1;
+                        if steps > MAX_STEPS {
+                            break;
+                        }
+                        match self.expr(cur)? {
+                            Expr::Paren(i)
+                            | Expr::Unary { op: UnOp::Deref, operand: i }
+                            | Expr::Ref { operand: i, .. }
+                            | Expr::Cast { operand: i, .. }
+                            | Expr::Block { tail: Some(i), .. } => cur = i,
+                            Expr::Call { callee: call_callee, args: call_args } => {
+                                if let Some((callee, _)) = self.callee_of(cur)
+                                    && let Ok(sig) = facts.sig(callee)
+                                    && let Some(out_slots) = sig.output()
+                                    && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                                    && let Some((ty, sl)) = self.extract_callable_from_head(out_ty, out_slots, heads, want, e)?
+                                {
+                                    result = Some((ty, sl, false));
+                                    break;
+                                }
+                                // Desugared `for pat in head`:
+                                //   match IntoIterator::into_iter(head) { mut iter => loop { match Iterator::next(&mut iter) { ... } } }
+                                // Trace `Iterator::next(&mut iter)` -> `IntoIterator::into_iter(head)` -> `head`
+                                // when `iter` is never reassigned and only mutably borrowed at this `next` call.
+                                if let Some(&[only]) = self.body.expr_lists.get(call_args.range()) {
+                                    match self.expr_lang(call_callee) {
+                                        Some(blaze_typeck::LangItem::IntoIterIntoIter) => {
+                                            cur = only;
+                                            continue;
+                                        }
+                                        Some(blaze_typeck::LangItem::IteratorNext) => {
+                                            if let Some(head) = self.for_loop_iter_head(only)? {
+                                                cur = head;
+                                                continue;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                break;
                             }
-                            Some(blaze_typeck::LangItem::IteratorNext) => {
-                                if let Some(head) = self.for_loop_iter_head(only)? {
-                                    cur = head;
+                            Expr::MethodCall { receiver, args: call_args, .. } => {
+                                if let Some((callee, _)) = self.callee_of(cur)
+                                    && let Ok(sig) = facts.sig(callee)
+                                    && let Some(out_slots) = sig.output()
+                                    && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                                    && let Some((ty, sl)) = self.extract_callable_from_head(out_ty, out_slots, heads, want, e)?
+                                {
+                                    result = Some((ty, sl, false));
+                                    break;
+                                }
+                                // Try tracing through the receiver first; if that yields no callable root
+                                // (e.g. `["hash", ...].into_iter().zip(entries)` where the callable array is
+                                // in `args[0]`), try each argument and accept only when a unique one matches.
+                                frames.push(TraceCallableFrame::AfterReceiver { args: call_args, depth: depth.saturating_add(1) });
+                                active = Some((receiver, depth.saturating_add(1)));
+                                pushed_child = true;
+                                break;
+                            }
+                            Expr::Index { base, .. } => cur = base,
+                            Expr::Path(_) => match self.expr_def(cur) {
+                                Some(Def::Static(item, _) | Def::Const(item)) => {
+                                    if let Ok(sig) = facts.sig(item)
+                                        && let Some(out_slots) = sig.output()
+                                        && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                                        && let Some((ty, sl)) = self.extract_callable_from_head(out_ty, out_slots, heads, want, e)?
+                                    {
+                                        result = Some((ty, sl, false));
+                                    }
+                                    break;
+                                }
+                                _ => break,
+                            },
+                            Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                                let field_idx = match self.expr(cur)? {
+                                    Expr::Field { .. } => self.field_of(cur),
+                                    Expr::TupleField { index, .. } => Some(index),
+                                    _ => None,
+                                };
+                                if let Some(fi) = field_idx
+                                    && let Some(adt) = self.peel_field_adt(base, e)?
+                                    && let Ok(col) = facts.regions().field(adt, 0, fi)
+                                    && let Some((ty, sl)) = self.extract_callable_from_head(col.ty(), col.as_slice(), heads, want, e)?
+                                {
+                                    result = Some((ty, sl, false));
+                                    break;
+                                }
+                                cur = base;
+                            }
+                            Expr::Match { scrutinee, arms } => {
+                                let Some(arm_list) = self.body.arms.get(arms.range()) else { break };
+                                let mut live_arm: Option<&blaze_typeck::Arm> = None;
+                                let mut multiple = false;
+                                for arm in arm_list.iter() {
+                                    if let Ok(bt) = self.expr_ty(arm.body)
+                                        && matches!(self.node(bt, e), Ok(PNode::Never))
+                                    {
+                                        continue;
+                                    }
+                                    if live_arm.is_some() {
+                                        multiple = true;
+                                        break;
+                                    }
+                                    live_arm = Some(arm);
+                                }
+                                if multiple {
+                                    break;
+                                }
+                                let Some(arm) = live_arm else { break };
+                                // `?` desugaring (`match Try::branch(x) { Continue(v) => v, Break(r) => return .. }`):
+                                // unwrap directly to `x` when `scrutinee` is `Try::branch(x)` (its declared
+                                // output carries no callable of its own and `x`'s ADT args contain `v`'s type).
+                                if let Expr::Local(v) = self.expr(arm.body)?
+                                    && self.pat_contains(arm.pat, v)?
+                                    && let Expr::Call { args, .. } = self.expr(scrutinee)?
+                                    && let Some(&[only]) = self.body.expr_lists.get(args.range())
+                                {
+                                    if let Some((callee, _)) = self.callee_of(scrutinee)
+                                        && let Ok(sig) = facts.sig(callee)
+                                        && let Some(out_slots) = sig.output()
+                                        && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
+                                        && let Some((ty, sl)) = self.extract_callable_from_head(out_ty, out_slots, heads, want, e)?
+                                    {
+                                        result = Some((ty, sl, false));
+                                        break;
+                                    }
+                                    if let (Ok(only_ty), Ok(arm_ty)) = (self.adjusted_ty(only), self.expr_ty(arm.body))
+                                        && let Ok(PNode::Adt(_, adt_args)) = self.node(only_ty, e)
+                                        && self.list(adt_args, e)?.contains(&arm_ty)
+                                    {
+                                        cur = only;
+                                        continue;
+                                    }
+                                }
+                                cur = arm.body;
+                            }
+                            Expr::Local(p) => {
+                                if let Some((adt, variant, field)) = self.pat_field_source(p)?
+                                    && let Ok(col) = facts.regions().field(adt, variant, field)
+                                    && let Some((ty, sl)) = self.extract_callable_from_head(col.ty(), col.as_slice(), heads, want, e)?
+                                {
+                                    result = Some((ty, sl, false));
+                                    break;
+                                }
+                                if let Some(param) = self.body.params.iter().position(|x| *x == p)
+                                    && let Ok(param32) = u32::try_from(param)
+                                    && let Ok(own_sig) = facts.sig(self.body.owner)
+                                    && let Some(in_slots) = own_sig.input(param32)
+                                    && let Ok(in_ty) = self.sig_declared(own_sig, param32, e)
+                                    && let Some((ty, sl)) = self.extract_callable_from_head(in_ty, in_slots, heads, want, e)?
+                                {
+                                    result = Some((ty, sl, true));
+                                    break;
+                                }
+                                if let Some(i) = self.local_binding_init(p)? {
+                                    cur = i;
                                     continue;
                                 }
-                            }
-                            _ => {}
-                        }
-                    }
-                    return Ok(None);
-                }
-                Expr::MethodCall { receiver, args: call_args, .. } => {
-                    if let Some((callee, _)) = self.callee_of(cur)
-                        && let Ok(sig) = facts.sig(callee)
-                        && let Some(out_slots) = sig.output()
-                        && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
-                        && let Some((ty, sl)) = self.extract_callable_from_head(out_ty, out_slots, heads, want, e)?
-                    {
-                        return Ok(Some((ty, sl, false)));
-                    }
-                    // Try tracing through the receiver first; if that yields no callable root
-                    // (e.g. `["hash", ...].into_iter().zip(entries)` where the callable array is
-                    // in `args[0]`), try each argument and accept only when a unique one matches.
-                    if let Some(found) = self.trace_container_callable_root(receiver, want, heads, e)? {
-                        return Ok(Some(found));
-                    }
-                    if let Some(alist) = self.body.expr_lists.get(call_args.range()) {
-                        let mut arg_found: Option<(PTy, &'b [Region], bool)> = None;
-                        for &a in alist {
-                            if let Some(cand) = self.trace_container_callable_root(a, want, heads, e)? {
-                                match arg_found {
-                                    None => arg_found = Some(cand),
-                                    Some((_, prev_sl, _)) if fn_ptr_slots_alpha_eq(prev_sl, cand.1, self.alloc) => {}
-                                    Some(_) => return Ok(None),
+                                // Parameter of a closure passed to a fn/method call whose declared signature
+                                // or `Fn*` clause gives the parameter's callable type (e.g.
+                                // `written(|put| ours.write(id, &mut |s| put(s)))`).
+                                if self.in_nested
+                                    && let Some((ty, sl)) = self.closure_param_callee_sig(p, want, heads, e)?
+                                {
+                                    result = Some((ty, sl, false));
+                                    break;
                                 }
+                                // Parameter of a closure passed to a method call (e.g. `opt.and_then(|d| d(x))`).
+                                if self.in_nested
+                                    && let Some(next) = self.closure_param_call_receiver(p)?
+                                {
+                                    cur = next;
+                                    continue;
+                                }
+                                break;
+                            }
+                            _ => break,
+                        }
+                    }
+                    if pushed_child {
+                        continue;
+                    }
+                    last_result = result;
+                }
+            }
+
+            let Some(frame) = frames.pop() else {
+                return Ok(last_result);
+            };
+            match frame {
+                TraceCallableFrame::AfterReceiver { args, depth } => {
+                    if last_result.is_some() {
+                        continue;
+                    }
+                    if let Some(alist) = self.body.expr_lists.get(args.range())
+                        && let Some(&first_arg) = alist.first()
+                    {
+                        frames.push(TraceCallableFrame::AfterArg { args, next_idx: 1, depth, found: None });
+                        active = Some((first_arg, depth));
+                    } else {
+                        last_result = None;
+                    }
+                }
+                TraceCallableFrame::AfterArg { args, next_idx, depth, mut found } => {
+                    if let Some(cand) = last_result {
+                        match found {
+                            None => found = Some(cand),
+                            Some((_, prev_sl, _)) if fn_ptr_slots_alpha_eq(prev_sl, cand.1, self.alloc) => {}
+                            Some(_) => {
+                                last_result = None;
+                                continue;
                             }
                         }
-                        return Ok(arg_found);
                     }
-                    return Ok(None);
+                    if let Some(alist) = self.body.expr_lists.get(args.range())
+                        && let Some(&next_arg) = alist.get(next_idx)
+                    {
+                        frames.push(TraceCallableFrame::AfterArg { args, next_idx: next_idx + 1, depth, found });
+                        active = Some((next_arg, depth));
+                    } else {
+                        last_result = found;
+                    }
                 }
-                Expr::Index { base, .. } => cur = base,
-                Expr::Path(_) => match self.expr_def(cur) {
-                    Some(Def::Static(item, _) | Def::Const(item)) => {
-                        if let Ok(sig) = facts.sig(item)
-                            && let Some(out_slots) = sig.output()
-                            && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
-                            && let Some((ty, sl)) = self.extract_callable_from_head(out_ty, out_slots, heads, want, e)?
-                        {
-                            return Ok(Some((ty, sl, false)));
-                        }
-                        return Ok(None);
-                    }
-                    _ => return Ok(None),
-                },
-                Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
-                    let field_idx = match self.expr(cur)? {
-                        Expr::Field { .. } => self.field_of(cur),
-                        Expr::TupleField { index, .. } => Some(index),
-                        _ => None,
-                    };
-                    if let Some(fi) = field_idx
-                        && let Some(adt) = self.peel_field_adt(base, e)?
-                        && let Ok(col) = facts.regions().field(adt, 0, fi)
-                        && let Some((ty, sl)) = self.extract_callable_from_head(col.ty(), col.as_slice(), heads, want, e)?
-                    {
-                        return Ok(Some((ty, sl, false)));
-                    }
-                    cur = base;
-                }
-                Expr::Match { scrutinee, arms } => {
-                    let Some(arm_list) = self.body.arms.get(arms.range()) else { return Ok(None) };
-                    let mut live_arm: Option<&blaze_typeck::Arm> = None;
-                    for arm in arm_list.iter() {
-                        if let Ok(bt) = self.expr_ty(arm.body)
-                            && matches!(self.node(bt, e), Ok(PNode::Never))
-                        {
-                            continue;
-                        }
-                        if live_arm.is_some() {
-                            return Ok(None);
-                        }
-                        live_arm = Some(arm);
-                    }
-                    let Some(arm) = live_arm else { return Ok(None) };
-                    // `?` desugaring (`match Try::branch(x) { Continue(v) => v, Break(r) => return .. }`):
-                    // unwrap directly to `x` when `scrutinee` is `Try::branch(x)` (its declared
-                    // output carries no callable of its own and `x`'s ADT args contain `v`'s type).
-                    if let Expr::Local(v) = self.expr(arm.body)?
-                        && self.pat_contains(arm.pat, v)?
-                        && let Expr::Call { args, .. } = self.expr(scrutinee)?
-                        && let Some(&[only]) = self.body.expr_lists.get(args.range())
-                    {
-                        if let Some((callee, _)) = self.callee_of(scrutinee)
-                            && let Ok(sig) = facts.sig(callee)
-                            && let Some(out_slots) = sig.output()
-                            && let Ok(out_ty) = self.sig_declared(sig, sig.inputs(), e)
-                            && let Some((ty, sl)) = self.extract_callable_from_head(out_ty, out_slots, heads, want, e)?
-                        {
-                            return Ok(Some((ty, sl, false)));
-                        }
-                        if let (Ok(only_ty), Ok(arm_ty)) = (self.adjusted_ty(only), self.expr_ty(arm.body))
-                            && let Ok(PNode::Adt(_, adt_args)) = self.node(only_ty, e)
-                            && self.list(adt_args, e)?.contains(&arm_ty)
-                        {
-                            cur = only;
-                            continue;
-                        }
-                    }
-                    cur = arm.body;
-                }
-                Expr::Local(p) => {
-                    if let Some((adt, variant, field)) = self.pat_field_source(p)?
-                        && let Ok(col) = facts.regions().field(adt, variant, field)
-                        && let Some((ty, sl)) = self.extract_callable_from_head(col.ty(), col.as_slice(), heads, want, e)?
-                    {
-                        return Ok(Some((ty, sl, false)));
-                    }
-                    if let Some(param) = self.body.params.iter().position(|x| *x == p)
-                        && let Ok(param32) = u32::try_from(param)
-                        && let Ok(own_sig) = facts.sig(self.body.owner)
-                        && let Some(in_slots) = own_sig.input(param32)
-                        && let Ok(in_ty) = self.sig_declared(own_sig, param32, e)
-                        && let Some((ty, sl)) = self.extract_callable_from_head(in_ty, in_slots, heads, want, e)?
-                    {
-                        return Ok(Some((ty, sl, true)));
-                    }
-                    if let Some(i) = self.local_binding_init(p)? {
-                        cur = i;
-                        continue;
-                    }
-                    // Parameter of a closure passed to a fn/method call whose declared signature
-                    // or `Fn*` clause gives the parameter's callable type (e.g.
-                    // `written(|put| ours.write(id, &mut |s| put(s)))`).
-                    if self.in_nested
-                        && let Some((ty, sl)) = self.closure_param_callee_sig(p, want, heads, e)?
-                    {
-                        return Ok(Some((ty, sl, false)));
-                    }
-                    // Parameter of a closure passed to a method call (e.g. `opt.and_then(|d| d(x))`).
-                    if self.in_nested
-                        && let Some(next) = self.closure_param_call_receiver(p)?
-                    {
-                        cur = next;
-                        continue;
-                    }
-                    return Ok(None);
-                }
-                _ => return Ok(None),
             }
         }
-        Ok(None)
     }
 
     /// Whether pattern `root` contains binding `target` anywhere inside it.

@@ -26,6 +26,7 @@ use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::project::{BodyRef, ProjectWorld};
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::{FrontChoice, NewFront, run_with};
+use blaze_own::{AString, AVec};
 
 const BORROW_SOURCE: &str = r#"
 pub struct Channel {
@@ -136,11 +137,11 @@ fn main() {}
 struct Verdict {
     name: &'static str,
     types_clean: bool,
-    borrow_codes: Vec<&'static str>,
+    borrow_codes: AVec<'static, &'static str>,
     stopped: bool,
 }
 
-fn check_borrow_cases(wanted: &[&'static str]) -> Vec<Verdict> {
+fn check_borrow_cases(wanted: &[&'static str]) -> AVec<'static, Verdict> {
     let alloc = blaze_own::testing::heap().alloc();
     let home = std::env::var("HOME").expect("HOME");
     let tc = Toolchain::open(&mut DirShelf::new(format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
@@ -160,17 +161,19 @@ fn check_borrow_cases(wanted: &[&'static str]) -> Vec<Verdict> {
     let sources = [SourceFile { path: "src/main.rs", text: BORROW_SOURCE }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
     let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("body checker");
-    let mut out = Vec::new();
+    let mut out = AVec::new_in(alloc);
     for &name in wanted {
         let key = names
             .items(0)
             .find_map(|(key, _, _)| (names.item_text(key)?.name == Some(name)).then_some(key))
             .expect(name);
         let (v, b) = world.check_borrows(BodyRef::Free(key), alloc);
+        let mut borrow_codes = AVec::new_in(alloc);
+        borrow_codes.extend(b.findings.iter().map(|d| d.code));
         let verdict = Verdict {
             name,
             types_clean: v.is_clean() && v.reads.is_some(),
-            borrow_codes: b.findings.iter().map(|d| d.code).collect(),
+            borrow_codes,
             stopped: !(v.gaps.is_empty() && v.undecided.is_empty() && v.refused.is_none()) || b.refused.is_some(),
         };
         println!(
@@ -225,8 +228,8 @@ fn borrowck_disjoint_box_deref_captures_and_negative_controls() {
 const NEW: NewFront<'static> =
     NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
 
-const PRELUDE: &str = include_str!("../../blaze-cli/tests/ladder/front2/x0-async-01/src/prelude.rs");
-const FUTURE: &str = include_str!("../../blaze-cli/tests/ladder/front2/x0-async-01/src/future.rs");
+const PRELUDE: &str = include_str!("../../../blaze-cli/tests/ladder/front2/x0-async-01/src/prelude.rs");
+const FUTURE: &str = include_str!("../../../blaze-cli/tests/ladder/front2/x0-async-01/src/future.rs");
 
 const RUN_HEAD: &str = r#"#![feature(no_core, lang_items, intrinsics, rustc_attrs, unboxed_closures, arbitrary_self_types)]
 #![no_core]
@@ -320,15 +323,16 @@ fn poll_once<F: future::Future>(mut f: F) -> F::Output {
 }
 "#;
 
-fn run(body: &str) -> Result<u8, String> {
-    let text = [RUN_HEAD, body].concat();
+fn run(body: &str) -> Result<u8, AString<'static>> {
+    let alloc = blaze_own::testing::heap().alloc();
+    let text = blaze_own::format_in!(alloc, "{RUN_HEAD}{body}");
     let files = [
         SourceFile { path: "src/main.rs", text: &text },
         SourceFile { path: "src/prelude.rs", text: PRELUDE },
         SourceFile { path: "src/future.rs", text: FUTURE },
     ];
     run_with(&files, "src/main.rs", None, FrontChoice::New(NEW), blaze_own::testing::heap().shared())
-        .map_err(|e| format!("{e}").replace('\n', " "))
+        .map_err(|e| blaze_own::format_in!(alloc, "{e}"))
 }
 
 /// Codegen + run: closure and async block capture `&(*p).a` and `&mut (*p).a` through `Box` deref
