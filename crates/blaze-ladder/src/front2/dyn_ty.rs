@@ -249,7 +249,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             at += 1;
             kids.get(at - 1).copied().ok_or_else(|| Why::Program("a trait object's argument types are not all made".into(), r))
         };
-        let mut preds = Vec::new_in(Global);
+        let mut preds: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(tys.alloc());
         let mut principal: Option<(LibKey, List)> = None;
         for &b in v.rows(bounds)? {
             let Some((p, seg)) = dyn_bound(v, lf::Bound::decode(b)?, r)? else { continue };
@@ -261,81 +261,241 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 return Err(Why::Unsupported("an associated type bound in a trait object (`dyn Tr<Assoc: Bound>`)", r));
             }
             let (abs, texts, _, pr) = path_texts_of(v, p, true)?;
-            // The traits this bound names (`Self` erased) and its `Name = T` projections (the
-            // owner's checker key, its arguments `Self` first): one trait and its bindings, or
-            // what a trait alias stands for (the unstable book, `trait_alias`: `dyn Alias` is
-            // the object of its right-hand side, each trait's dyn-compatibility its own).
-            let mut traits: Vec<(LibKey, List), Global> = Vec::new_in(Global);
-            let mut projs: Vec<(ItemKey, Name, List, PTy), Global> = Vec::new_in(Global);
-            match self.bound_target(env, v, p, abs, &texts, pr)? {
-                Bounded::Trait(key) => {
-                    let (key, args) = self.trait_args(tys, key, pr, erased, &given)?;
-                    if !binds.is_empty() && self.heads.trait_auto(key).ok_or(Why::Need(key))? {
-                        return Err(Why::Program("an auto trait in a trait object takes no arguments".into(), pr));
-                    }
-                    let shown = v.text_at(v.path_range(p)?)?;
-                    for (name, term) in binds {
-                        let (owner, oargs) = self.assoc_owner(tys, key, args, name, pr, shown)?.ok_or_else(|| Why::AssocNotFound(shown.into(), pr))?;
-                        projs.push((self.heads.checker(owner), name, oargs, term));
-                    }
-                    traits.push((key, args));
-                }
-                Bounded::Alias(alias) => {
-                    if !binds.is_empty() {
-                        return Err(Why::Unsupported("an associated type binding on a trait alias (`dyn Alias<Name = T>`)", pr));
-                    }
-                    let mut clauses = Vec::new_in(Global);
-                    self.alias_clauses(tys, alias, pr, erased, &given, &mut clauses)?;
-                    let head = self.heads.trait_alias(alias).ok_or(Why::Need(alias))?;
-                    let mut sargs = Vec::with_capacity_in(given.len() + 1, Global);
-                    sargs.push(erased);
-                    sargs.extend_from_slice(&given);
-                    for &(k, l) in &head.traits {
-                        let PClause::Trait { args, .. } = subst_clause(tys, PClause::Trait { trait_: self.heads.checker(k), args: l }, &sargs)? else { continue };
-                        traits.push((k, args));
-                    }
-                    for c in clauses {
-                        let (args, proj) = match c {
-                            PClause::Trait { args, .. } => (args, None),
-                            PClause::Projection { trait_, args, name, term } => (args, Some((trait_, name, term))),
-                            PClause::Const { .. } => return Err(Why::Unsupported("a trait alias with `where const` in a trait object", pr)),
-                            PClause::TypeOutlives { .. } => return Err(Why::Unsupported("a trait alias with a type outlives bound (`T: 'a`) in a trait object", pr)),
-                            PClause::RegionOutlives { .. } => return Err(Why::Unsupported("a trait alias with a lifetime outlives bound (`'a: 'b`) in a trait object", pr)),
-                            PClause::ForFields { .. } => return Err(Why::Unsupported("a trait alias with `for<F in fields(..)>` in a trait object", pr)),
-                        };
-                        let first = tys.view().list(args).map_err(|_| Why::Program("a list outside the table".into(), pr))?.first().copied();
-                        if first != Some(erased) {
-                            return Err(Why::Unsupported("a trait alias in a trait object whose clauses bound a type other than `Self`", pr));
-                        }
-                        if let Some((owner, name, term)) = proj {
-                            projs.push((owner, name, args, term));
-                        }
-                    }
-                }
-            }
-            for (key, args) in traits {
-                if self.heads.trait_auto(key).ok_or(Why::Need(key))? {
-                    if tys.view().list(args).map_err(|_| Why::Program("a list outside the table".into(), pr))?.len() != 1 {
-                        return Err(Why::Program("an auto trait in a trait object takes no arguments".into(), pr));
-                    }
-                    preds.push(intern(tys, PNode::ExAuto(self.heads.checker(key)))?);
-                    continue;
-                }
-                if let Some((prev, _)) = principal {
-                    return Err(Why::TwoPrincipals(prev, key, r));
-                }
-                principal = Some((key, args));
-                let rest = after_self(tys, args, erased, pr)?;
-                preds.push(intern(tys, PNode::ExTrait(self.heads.checker(key), rest))?);
-            }
-            for (owner, name, oargs, term) in projs {
-                let rest = after_self(tys, oargs, erased, pr)?;
-                preds.push(intern(tys, PNode::ExProj { trait_: owner, name, args: rest, term })?);
-            }
+            let target = self.bound_target(env, v, p, abs, &texts, pr)?;
+            let shown = v.text_at(v.path_range(p)?)?;
+            self.add_dyn_bound(tys, target, &given, &binds, erased, pr, shown, r, &mut principal, &mut preds)?;
         }
         if at != kids.len() {
             return Err(Why::Program("a trait object's argument types are not all read".into(), r));
         }
+        self.finish_dyn(tys, principal, &mut preds, erased, r)
+    }
+
+    /// A Rust 2015/2018 bare trait object written as a single path without `dyn` (`&Error`,
+    /// `Box<Iterator<Item = u8>>`, `&Fn(u8) -> u8`): lowered through the same bound and
+    /// supertrait-projection machinery as [`Self::dyn_ty`].
+    #[expect(clippy::too_many_arguments, reason = "one bare trait object path, its segments, target, and lowered arguments")]
+    pub(super) fn bare_dyn_ty(
+        &self,
+        tys: &mut PortableTys<'_>,
+        v: &View<'_>,
+        p: PathIdx,
+        segs: &[lf::Segment],
+        found_key: LibKey,
+        is_alias: bool,
+        args: &[PTy],
+        r: Range,
+    ) -> Result<PTy, Why> {
+        self.bare_dyn_ty_with_extra(tys, v, p, segs, found_key, is_alias, args, &[], r)
+    }
+
+    /// Like [`Self::bare_dyn_ty`], appending `extra_given` (shadow params for omitted defaulted
+    /// trait type arguments) after the written positional arguments so `bare_dyn_regions` can
+    /// place defaulted arguments' region slots in one pass.
+    #[expect(clippy::too_many_arguments, reason = "one bare trait object path, its segments, target, written args, and extra default args")]
+    pub(super) fn bare_dyn_ty_with_extra(
+        &self,
+        tys: &mut PortableTys<'_>,
+        v: &View<'_>,
+        p: PathIdx,
+        segs: &[lf::Segment],
+        found_key: LibKey,
+        is_alias: bool,
+        args: &[PTy],
+        extra_given: &[PTy],
+        r: Range,
+    ) -> Result<PTy, Why> {
+        let Some((last, before)) = segs.split_last() else {
+            return Err(Why::Program("a bare trait object path with no segments".into(), r));
+        };
+        if before.iter().any(|s| s.has_args || s.parenthesized) {
+            return Err(Why::Unsupported("generic arguments before a trait object's last segment", r));
+        }
+        if last.return_notation {
+            return Err(Why::Unsupported("return type notation (`Tr(..)`)", r));
+        }
+        let alloc = tys.alloc();
+        let mut given: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+        let mut binds: blaze_own::Vec<(Name, PTy), Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+        let mut at = 0usize;
+        if last.parenthesized {
+            let mut inputs: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+            for &row in v.rows(last.args)? {
+                match lf::GenericArg::decode(row)? {
+                    lf::GenericArg::Type(_) => {
+                        let ty = args.get(at).copied().ok_or_else(|| Why::Program("a trait object's argument types are not all made".into(), r))?;
+                        inputs.push(ty);
+                        at += 1;
+                    }
+                    _ => return Err(Why::Program("a parenthesized argument that is no type".into(), r)),
+                }
+            }
+            let l = intern_list(tys, &inputs)?;
+            given.push(intern(tys, PNode::Tuple(l))?);
+            let output = match last.ty {
+                Some(_) => {
+                    let ty = args.get(at).copied().ok_or_else(|| Why::Program("a trait object's return type is not made".into(), r))?;
+                    at += 1;
+                    ty
+                }
+                None => intern(tys, PNode::Tuple(List::EMPTY))?,
+            };
+            binds.push((Name::of("Output"), output));
+        } else if last.has_args {
+            for &row in v.rows(last.args)? {
+                match lf::GenericArg::decode(row)? {
+                    lf::GenericArg::Type(_) | lf::GenericArg::Const(_) => {
+                        let ty = args.get(at).copied().ok_or_else(|| Why::Program("a trait object's argument types are not all made".into(), r))?;
+                        given.push(ty);
+                        at += 1;
+                    }
+                    lf::GenericArg::AssocType { name, args: a_args, .. } if a_args.len == 0 => {
+                        let ty = args.get(at).copied().ok_or_else(|| Why::Program("a trait object's associated type binding is not made".into(), r))?;
+                        binds.push((Name(v.name(name)?), ty));
+                        at += 1;
+                    }
+                    lf::GenericArg::Lifetime(_) => {}
+                    lf::GenericArg::AssocBound { .. } => {
+                        return Err(Why::Unsupported("an associated type bound in a trait object (`dyn Tr<Assoc: Bound>`)", r));
+                    }
+                    _ => return Err(Why::Unsupported("this generic argument in a trait object type", r)),
+                }
+            }
+        }
+        if at != args.len() {
+            return Err(Why::Program("a trait object's argument types are not all read".into(), r));
+        }
+        given.extend_from_slice(extra_given);
+        let erased = intern(tys, PNode::Param(u32::MAX))?;
+        let target = if is_alias { Bounded::Alias(found_key) } else { Bounded::Trait(found_key) };
+        let shown = v.text_at(v.path_range(p)?)?;
+        let mut principal: Option<(LibKey, List)> = None;
+        let mut preds: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+        self.add_dyn_bound(tys, target, &given, &binds, erased, r, shown, r, &mut principal, &mut preds)?;
+        self.finish_dyn(tys, principal, &mut preds, erased, r)
+    }
+
+    /// Processes one resolved bound (`Bounded::Trait` or `Bounded::Alias`) of a trait object
+    /// (`dyn` or Rust 2015/2018 bare trait object), updating `principal` and appending its
+    /// existential predicates to `preds`.
+    #[expect(clippy::too_many_arguments, reason = "one trait object bound: target, arguments, bindings, erased Self, sites, and outputs")]
+    fn add_dyn_bound<A: core::alloc::Allocator>(
+        &self,
+        tys: &mut PortableTys<'_>,
+        target: Bounded,
+        given: &[PTy],
+        binds: &[(Name, PTy)],
+        erased: PTy,
+        pr: Range,
+        shown: &str,
+        r: Range,
+        principal: &mut Option<(LibKey, List)>,
+        preds: &mut blaze_own::Vec<PTy, A>,
+    ) -> Result<(), Why> {
+        let alloc = tys.alloc();
+        // The traits this bound names (`Self` erased) and its `Name = T` projections (the
+        // owner's checker key, its arguments `Self` first): one trait and its bindings, or
+        // what a trait alias stands for (the unstable book, `trait_alias`: `dyn Alias` is
+        // the object of its right-hand side, each trait's dyn-compatibility its own).
+        let mut traits: blaze_own::Vec<(LibKey, List), Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+        let mut projs: blaze_own::Vec<(ItemKey, Name, List, PTy), Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+        match target {
+            Bounded::Trait(key) => {
+                let (key, args) = self.trait_args(tys, key, pr, erased, given)?;
+                if !binds.is_empty() && self.heads.trait_auto(key).ok_or(Why::Need(key))? {
+                    return Err(Why::Program("an auto trait in a trait object takes no arguments".into(), pr));
+                }
+                for &(name, term) in binds {
+                    let (owner, oargs) = self.assoc_owner(tys, key, args, name, pr, shown)?.ok_or_else(|| Why::AssocNotFound(shown.into(), pr))?;
+                    projs.push((self.heads.checker(owner), name, oargs, term));
+                }
+                traits.push((key, args));
+            }
+            Bounded::Alias(alias) => {
+                let filled = self.alias_args_with_defaults(tys, alias, given, erased, pr)?;
+                let mut clauses: blaze_own::Vec<PClause, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+                self.alias_clauses(tys, alias, pr, erased, &filled, &mut clauses)?;
+                let head = self.heads.trait_alias(alias).ok_or(Why::Need(alias))?;
+                let mut sargs: blaze_own::Vec<PTy, Alloc<'_>> = blaze_own::Vec::with_capacity_in(filled.len() + 1, alloc);
+                sargs.push(erased);
+                sargs.extend_from_slice(&filled);
+                for &(k, l) in &head.traits {
+                    let PClause::Trait { args, .. } = subst_clause(tys, PClause::Trait { trait_: self.heads.checker(k), args: l }, &sargs)? else { continue };
+                    traits.push((k, args));
+                }
+                for c in clauses {
+                    let (args, proj) = match c {
+                        PClause::Trait { args, .. } => (args, None),
+                        PClause::Projection { trait_, args, name, term } => (args, Some((trait_, name, term))),
+                        // `trait Alias<'a> = Tr + 'a`: `Self: 'a` is an object-lifetime bound
+                        // erased from `PNode::Dynamic` and laid by the region walk.
+                        PClause::TypeOutlives { ty, .. } if ty == erased => continue,
+                        PClause::Const { .. } => return Err(Why::Unsupported("a trait alias with `where const` in a trait object", pr)),
+                        PClause::TypeOutlives { .. } => return Err(Why::Unsupported("a trait alias with a type outlives bound (`T: 'a`) in a trait object", pr)),
+                        PClause::RegionOutlives { .. } => return Err(Why::Unsupported("a trait alias with a lifetime outlives bound (`'a: 'b`) in a trait object", pr)),
+                        PClause::ForFields { .. } => return Err(Why::Unsupported("a trait alias with `for<F in fields(..)>` in a trait object", pr)),
+                    };
+                    let first = tys.view().list(args).map_err(|_| Why::Program("a list outside the table".into(), pr))?.first().copied();
+                    if first != Some(erased) {
+                        return Err(Why::Unsupported("a trait alias in a trait object whose clauses bound a type other than `Self`", pr));
+                    }
+                    if let Some((owner, name, term)) = proj {
+                        projs.push((owner, name, args, term));
+                    }
+                }
+                if !binds.is_empty() {
+                    let mut alias_principal: Option<(LibKey, List)> = None;
+                    for &(k, args) in &traits {
+                        if self.heads.trait_auto(k).ok_or(Why::Need(k))? {
+                            continue;
+                        }
+                        if let Some((prev, _)) = alias_principal {
+                            return Err(Why::TwoPrincipals(prev, k, r));
+                        }
+                        alias_principal = Some((k, args));
+                    }
+                    let Some((p_key, p_args)) = alias_principal else {
+                        return Err(Why::AssocNotFound(shown.into(), pr));
+                    };
+                    for &(name, term) in binds {
+                        let (owner, oargs) = self.assoc_owner(tys, p_key, p_args, name, pr, shown)?.ok_or_else(|| Why::AssocNotFound(shown.into(), pr))?;
+                        projs.push((self.heads.checker(owner), name, oargs, term));
+                    }
+                }
+            }
+        }
+        for (key, args) in traits {
+            if self.heads.trait_auto(key).ok_or(Why::Need(key))? {
+                if tys.view().list(args).map_err(|_| Why::Program("a list outside the table".into(), pr))?.len() != 1 {
+                    return Err(Why::Program("an auto trait in a trait object takes no arguments".into(), pr));
+                }
+                preds.push(intern(tys, PNode::ExAuto(self.heads.checker(key)))?);
+                continue;
+            }
+            if let Some((prev, _)) = *principal {
+                return Err(Why::TwoPrincipals(prev, key, r));
+            }
+            *principal = Some((key, args));
+            let rest = after_self(tys, args, erased, pr)?;
+            preds.push(intern(tys, PNode::ExTrait(self.heads.checker(key), rest))?);
+        }
+        for (owner, name, oargs, term) in projs {
+            let rest = after_self(tys, oargs, erased, pr)?;
+            preds.push(intern(tys, PNode::ExProj { trait_: owner, name, args: rest, term })?);
+        }
+        Ok(())
+    }
+
+    /// Materializes associated-type equalities implied by `principal`'s supertraits and interns
+    /// the resulting `PNode::Dynamic` type.
+    fn finish_dyn<A: core::alloc::Allocator>(
+        &self,
+        tys: &mut PortableTys<'_>,
+        principal: Option<(LibKey, List)>,
+        preds: &mut blaze_own::Vec<PTy, A>,
+        erased: PTy,
+        r: Range,
+    ) -> Result<PTy, Why> {
         // Materialize associated-type equalities implied by the principal's supertraits
         // (`trait IterTrait<'a, T>: Iterator<Item = &'a T>`, `trait Transport: Service<..,
         // Response = ..>`): rustc's `lower_trait_object_ty` includes these in `ty::Dynamic`'s
@@ -395,7 +555,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 return Err(Why::Unsupported("a supertrait tree past 256 traits", r));
             }
         }
-        tys.dynamic(&preds).map_err(|e| Why::Program(format!("the trait object's rows: {e:?}").into_boxed_str(), r))
+        tys.dynamic(preds).map_err(|e| Why::Program(format!("the trait object's rows: {e:?}").into_boxed_str(), r))
     }
 
 }
