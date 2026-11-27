@@ -53,7 +53,7 @@ blaze-lint	6
 blaze-lint-defs	1
 blaze-lir	29
 blaze-lower	20
-blaze-manifest	243
+blaze-manifest	242
 blaze-mem	5
 blaze-memo	4
 blaze-memo-macros	51

@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
 use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ids::radix;
@@ -962,14 +962,26 @@ impl<F: Files> Config<F> {
             ("{workspace-root}", utf8(root, "workspace root")?),
             ("{cargo-cache-home}", utf8(&self.home, "cargo home")?),
         ];
-        if val.raw_value().contains("{workspace-path-hash}") {
-            // cargo's hash of the path is its `StableHasher` over `Path`'s `Hash`, not ported yet.
-            let definition = val.value().definition.clone();
-            return Err(ConfigError::new(ConfigWhat::BuildDirHash { definition }));
-        }
+        // Where the value was defined, copied only on the paths that refuse it.
+        let defined_at = || val.value().definition.clone();
         let mut value = val.raw_value().to_owned();
         for (from, to) in &replacements {
             value = value.replace(from, to);
+        }
+        let workspace_path_hash = "{workspace-path-hash}";
+        if value.contains(workspace_path_hash) {
+            // Cargo hashes the path as given when it cannot canonicalize the manifest. blaze
+            // refuses: a path through `..` or a symlink would pick another directory than its
+            // canonical form does.
+            let canonical = self.files.canonicalize(workspace_manifest_path).map_err(|error| {
+                let manifest = workspace_manifest_path.to_path_buf();
+                let what = ConfigWhat::BuildDirManifestPath { manifest, definition: defined_at() };
+                ConfigError::io(what, error)
+            })?;
+            let mut hash_path = blaze_source::short_hash(canonical.as_path());
+            // The hex hash's first two characters name a directory that holds the rest.
+            hash_path.insert(2, MAIN_SEPARATOR);
+            value = value.replace(workspace_path_hash, &hash_path);
         }
         if let (Some(open), Some(close)) = (value.find('{'), value.rfind('}'))
             && open < close
@@ -1006,8 +1018,7 @@ impl<F: Files> Config<F> {
             return Err(ConfigError::new(ConfigWhat::BuildDirClose { value }));
         }
         if val.raw_value().is_empty() {
-            let definition = val.value().definition.clone();
-            return Err(ConfigError::new(ConfigWhat::BuildDirEmpty { definition }));
+            return Err(ConfigError::new(ConfigWhat::BuildDirEmpty { definition: defined_at() }));
         }
         Ok(Some(val.value().definition.root(&self.cwd).join(value)))
     }
