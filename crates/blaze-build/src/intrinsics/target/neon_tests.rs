@@ -125,19 +125,53 @@ fn every_neon_name_round_trips() {
         }
         seen += 1;
     }
-    assert_eq!(seen, 46);
+    assert_eq!(seen, 56);
     let tbl = call("llvm.aarch64.neon.tbl1.v16i8");
     assert_eq!((tbl.func(), tbl.shape()), (NeonFn::Tbl1, IntShape::V16I8));
     let tbx = call("llvm.aarch64.neon.tbx1.v16i8");
     assert_eq!((tbx.func(), tbx.shape()), (NeonFn::Tbx1, IntShape::V16I8));
     let tbl2 = call("llvm.aarch64.neon.tbl2.v16i8");
     assert_eq!((tbl2.func(), tbl2.shape()), (NeonFn::Tbl2, IntShape::V16I8));
+    let tbl3 = call("llvm.aarch64.neon.tbl3.v16i8");
+    assert_eq!((tbl3.func(), tbl3.shape()), (NeonFn::Tbl3, IntShape::V16I8));
+    let tbl4 = call("llvm.aarch64.neon.tbl4.v16i8");
+    assert_eq!((tbl4.func(), tbl4.shape()), (NeonFn::Tbl4, IntShape::V16I8));
+    let tbx4 = call("llvm.aarch64.neon.tbx4.v16i8");
+    assert_eq!((tbx4.func(), tbx4.shape()), (NeonFn::Tbx4, IntShape::V16I8));
     let ushl = call("llvm.aarch64.neon.ushl.v2i64");
     assert_eq!((ushl.func(), ushl.shape(), ushl.shape().lanes(), ushl.shape().width()), (NeonFn::Ushl, IntShape::V2I64, 2, 64));
     let refused = named("llvm.aarch64.neon.tbl1.v4i16").expect_err("tbl1 is declared at v8i8 and v16i8 only");
     assert_eq!(refused.to_string(), "`llvm.aarch64.neon.tbl1.v4i16` is not a target intrinsic blaze knows");
-    assert!(named("llvm.aarch64.neon.tbl3.v16i8").is_err(), "a three-register table is not in the set");
+    assert!(named("llvm.aarch64.neon.tbl5.v16i8").is_err(), "A64 has no five-register table lookup");
     println!("{seen} NEON names, each its own; llvm.aarch64.neon.tbl1.v4i16 refused");
+}
+
+#[test]
+fn tbl3_tbl4_and_tbx2_to_tbx4_lookup_every_slice_and_boundary() {
+    let t0: [u8; 16] = core::array::from_fn(|i| 10 + i as u8);
+    let t1: [u8; 16] = core::array::from_fn(|i| 30 + i as u8);
+    let t2: [u8; 16] = core::array::from_fn(|i| 50 + i as u8);
+    let t3: [u8; 16] = core::array::from_fn(|i| 70 + i as u8);
+    let def: [u8; 16] = [0xAA; 16];
+    let idx: [u8; 16] = [0, 15, 16, 31, 32, 47, 48, 63, 64, 65, 128, 200, 240, 254, 255, 5];
+
+    let got_tbl3 = run_ops(call("llvm.aarch64.neon.tbl3.v16i8"), &[t0, t1, t2, idx]);
+    assert_eq!(got_tbl3, [10, 25, 30, 45, 50, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15]);
+
+    let got_tbl4 = run_ops(call("llvm.aarch64.neon.tbl4.v16i8"), &[t0, t1, t2, t3, idx]);
+    assert_eq!(got_tbl4, [10, 25, 30, 45, 50, 65, 70, 85, 0, 0, 0, 0, 0, 0, 0, 15]);
+
+    let got_tbx2 = run_ops(call("llvm.aarch64.neon.tbx2.v16i8"), &[def, t0, t1, idx]);
+    assert_eq!(got_tbx2, [10, 25, 30, 45, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 15]);
+
+    let got_tbx3 = run_ops(call("llvm.aarch64.neon.tbx3.v16i8"), &[def, t0, t1, t2, idx]);
+    assert_eq!(got_tbx3, [10, 25, 30, 45, 50, 65, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 15]);
+
+    let got_tbx4 = run_ops(call("llvm.aarch64.neon.tbx4.v16i8"), &[def, t0, t1, t2, t3, idx]);
+    assert_eq!(got_tbx4, [10, 25, 30, 45, 50, 65, 70, 85, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 15]);
+
+    let got_tbl4_8 = run_ops(call("llvm.aarch64.neon.tbl4.v8i8"), &[t0, t1, t2, t3, idx]);
+    assert_eq!(got_tbl4_8, [10, 25, 30, 45, 50, 65, 70, 85, 0, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 /// `tbl1` gives 0 for indices 16, 255 and 128 (a build that masks the index to the table, as

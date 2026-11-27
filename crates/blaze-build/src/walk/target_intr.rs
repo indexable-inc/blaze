@@ -233,7 +233,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(refuse(spec.arity_why));
         }
         let base = self.vals.len().checked_sub(n).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
-        let mut loaded = [Value(0); 3];
+        let mut loaded = [Value(0); 6];
         for (i, (&a, &shape)) in list.iter().zip(spec.operands).enumerate() {
             let v = self.vals[base + i];
             let at = self.adjusted_ty(a)?;
