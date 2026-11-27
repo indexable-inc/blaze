@@ -1911,32 +1911,37 @@ impl<'s, 't, 'a> Parser<'s, 't, 'a> {
 
         let (end_idx, str_len, file_span) = data_ext_end?;
         // Ensure what follows is NOT a whitespace-separated command argument (only postfix `.`/`[`
-        // or stage/expr continuations like `|`, `;`, EOF, binary ops).
+        // touching the filename, or EOF / delimiters / stage or binary-expression continuations).
         let after = self.tokens.get(end_idx);
         let valid_after = match after {
-            None => true,
+            None | Some(Token { kind: TokKind::Eof, .. }) => true,
+            Some(t)
+                if matches!(
+                    t.kind,
+                    TokKind::Pipe
+                        | TokKind::Semi
+                        | TokKind::Newline
+                        | TokKind::RParen
+                        | TokKind::RBracket
+                        | TokKind::RBrace
+                        | TokKind::Comma
+                        | TokKind::EqEq
+                        | TokKind::BangEq
+                        | TokKind::Lt
+                        | TokKind::LtEq
+                        | TokKind::Gt
+                        | TokKind::GtEq
+                        | TokKind::Plus
+                        | TokKind::PlusPlus
+                        | TokKind::Kw(Keyword::And | Keyword::Or | Keyword::In | Keyword::NotIn)
+                ) =>
+            {
+                true
+            }
             Some(t) if t.span.start == file_span.end => {
                 matches!(t.kind, TokKind::Dot | TokKind::QuestionDot | TokKind::LBracket)
             }
-            Some(t) => matches!(
-                t.kind,
-                TokKind::Pipe
-                    | TokKind::Semi
-                    | TokKind::Newline
-                    | TokKind::RParen
-                    | TokKind::RBracket
-                    | TokKind::RBrace
-                    | TokKind::Comma
-                    | TokKind::EqEq
-                    | TokKind::BangEq
-                    | TokKind::Lt
-                    | TokKind::LtEq
-                    | TokKind::Gt
-                    | TokKind::GtEq
-                    | TokKind::Plus
-                    | TokKind::PlusPlus
-                    | TokKind::Kw(Keyword::And | Keyword::Or | Keyword::In | Keyword::NotIn)
-            ),
+            Some(_) => false,
         };
         if !valid_after {
             return None;
