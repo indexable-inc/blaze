@@ -125,8 +125,12 @@ pub fn layout_schema_card(
     let hint_w = m.measure(hint_txt, TextFace::UiSmall);
     let show_hint = card_w >= 460.0;
     let sum_right = if show_hint { x1 - pad_x - hint_w - 14.0 } else { x1 - pad_x };
-    let sum_max_ch = ((sum_right - sum_x).max(40.0) / m.measure("n", TextFace::Ui).max(5.0)).floor() as usize;
-    let sum_txt = truncate_chars(summary, sum_max_ch.max(8));
+    // Strip redundant leading `<kind> · ` prefix from `summary` since the kind pill already shows it!
+    let clean_summary = summary
+        .strip_prefix(kind)
+        .and_then(|s| s.strip_prefix(" · "))
+        .unwrap_or(summary);
+    let sum_txt = fit_ui_text(clean_summary, (sum_right - sum_x).max(40.0), m, TextFace::Ui, true);
     scene.ui_text(sum_x, hdr_ty, sum_txt, theme::INK_1, true, false, clip_id);
     if show_hint {
         scene.ui_small(x1 - pad_x - hint_w, hdr_ty, hint_txt, theme::INK_4, false, false, clip_id);
@@ -299,12 +303,10 @@ pub fn layout_schema_card(
             draw_dist_spark(scene, row.hist, col_dist_x, ry + 3.0, dist_col_w - 4.0, row_h - 7.0, clip_id);
         }
 
-        // Overview / sample column
+        // Overview / sample column (measured cleanly against exact `UiSmall` advances so it never clips!)
         if !row.sample.is_empty() && col_sample_x + 40.0 < inner_x1 {
-            let avail_w = inner_x1 - col_sample_x;
-            let avg_cw = m.measure("n", TextFace::UiSmall).max(4.5);
-            let max_s_ch = (avail_w / avg_cw).floor().max(8.0) as usize;
-            let s_txt = truncate_chars(row.sample, max_s_ch);
+            let avail_w = (inner_x1 - col_sample_x - 4.0).max(20.0);
+            let s_txt = fit_ui_text(row.sample, avail_w, m, TextFace::UiSmall, false);
             scene.ui_small(
                 col_sample_x,
                 ty,
@@ -452,6 +454,28 @@ fn type_badge_colors(ty: &str) -> ([f32; 4], [f32; 4], [f32; 4]) {
     } else {
         (theme::INK_3, theme::BG_CHIP, theme::LINE)
     }
+}
+
+fn fit_ui_text(s: &str, max_w: f32, m: CellMetrics, face: TextFace, bold: bool) -> String {
+    if m.measure_styled(s, face, bold) <= max_w {
+        return s.to_owned();
+    }
+    let ell_w = m.measure_styled("…", face, bold);
+    let budget = (max_w - ell_w).max(0.0);
+    let mut out = String::new();
+    let mut cur_w = 0.0f32;
+    let mut buf = [0u8; 4];
+    for ch in s.chars() {
+        let cs = ch.encode_utf8(&mut buf);
+        let cw = m.measure_styled(cs, face, bold);
+        if cur_w + cw > budget {
+            break;
+        }
+        out.push(ch);
+        cur_w += cw;
+    }
+    out.push('…');
+    out
 }
 
 fn pattern_badge_colors(pat: &str) -> ([f32; 4], [f32; 4], [f32; 4]) {

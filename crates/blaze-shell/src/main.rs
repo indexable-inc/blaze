@@ -923,20 +923,23 @@ mod macos_app {
 
         /// Bind `$_`, `$last`, and `$_<seq>` in `state` so any subsequent command can pipe or
         /// inspect previous outputs with zero copying (O(1) CoW persistent values!).
-        /// Skips overwriting `$_`/`$last` for `__blaze_schema` meta-cards so `open Cargo.lock`
-        /// followed by `schema` followed by `.package.version` seamlessly queries the underlying data!
+        /// For `__blaze_schema` meta-cards (e.g. `open Cargo.lock | schema` or `schema $lock`),
+        /// binds `$_` and `$last` to the inspected subject value (`__blaze_schema_subject`) so
+        /// immediately clicking or typing `.package.source` queries the inspected data!
         fn bind_output_refs(&mut self, state: &mut EngineState<'static>, val: &Value<'static>) {
             if matches!(val, Value::Nothing | Value::Error(_)) {
                 return;
             }
             self.output_seq += 1;
-            let is_schema_meta = matches!(
-                val,
-                Value::Record(r) if blaze_shell::schema_view::is_schema_record(r)
-            );
-            if !is_schema_meta {
-                state.set_var("_", val.clone(), false);
-                state.set_var("last", val.clone(), false);
+            let effective_subject = match val {
+                Value::Record(r) if blaze_shell::schema_view::is_schema_record(r) => {
+                    r.get(blaze_sh::schema::SCHEMA_SUBJECT_KEY).cloned()
+                }
+                _ => Some(val.clone()),
+            };
+            if let Some(subj) = effective_subject {
+                state.set_var("_", subj.clone(), false);
+                state.set_var("last", subj, false);
             }
             let numbered = format!("_{}", self.output_seq);
             state.set_var(&numbered, val.clone(), false);

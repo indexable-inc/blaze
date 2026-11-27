@@ -2340,7 +2340,14 @@ impl Editor {
             && !prefix.starts_with("./")
             && !prefix.starts_with("..")
         {
-            if let Some(slot) = state.get_var("_") {
+            if prev_non_ws.ends_with('|') {
+                let before_pipe = &prev_non_ws[..prev_non_ws.len() - 1];
+                if let Some(piped_val) = resolve_piped_value_for_dot(before_pipe, state) {
+                    collect_value_path_completions(&piped_val, "", &prefix[1..], &mut scored);
+                } else {
+                    collect_piped_command_schema_dot_completions(before_pipe, &prefix[1..], &mut scored);
+                }
+            } else if let Some(slot) = state.get_var("_") {
                 collect_value_path_completions(&slot.value, "", &prefix[1..], &mut scored);
             }
         } else if let Some(var_prefix) = prefix.strip_prefix('$') {
@@ -4743,6 +4750,314 @@ fn nth_char_byte_offset(line: &str, n: usize) -> usize {
     line.char_indices().nth(n).map_or(line.len(), |(idx, _)| idx)
 }
 
+/// Resolve the structured [`Value`] produced by pipeline stage(s) preceding `|` so typing
+/// `open Cargo.lock | .pack`, `$lock | .pack`, or `open Cargo.lock | .package | .ver` gives
+/// instant zero-Tab field/column completions with live value previews!
+fn resolve_piped_value_for_dot(
+    before_pipe: &str,
+    state: &EngineState<'_>,
+) -> Option<Value<'static>> {
+    let stmt_start = before_pipe.rfind([';', '\n']).map_or(0, |p| p + 1);
+    let stages: Vec<&str> = before_pipe[stmt_start..]
+        .split('|')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let first = *stages.first()?;
+
+    let mut cur = resolve_stage0_value(first, state)?;
+    for &stage in &stages[1..] {
+        if let Some(rest) = stage.strip_prefix('.') {
+            cur = walk_dot_steps(&cur, rest)?;
+        } else {
+            let mut parts = stage.split_whitespace();
+            let head = parts.next().unwrap_or("");
+            match head {
+                "first" => {
+                    cur = match &cur {
+                        Value::Table(t) => t.row_record(0).map(Value::Record)?,
+                        Value::List(l) => l.get(0).map(Share::share)?,
+                        _ => return None,
+                    };
+                }
+                "last" => {
+                    cur = match &cur {
+                        Value::Table(t) => {
+                            let idx = t.nrows().checked_sub(1)?;
+                            t.row_record(idx).map(Value::Record)?
+                        }
+                        Value::List(l) => {
+                            let idx = l.len().checked_sub(1)?;
+                            l.get(idx).map(Share::share)?
+                        }
+                        _ => return None,
+                    };
+                }
+                "get" => {
+                    let key = parts.next()?.trim_start_matches('.').trim_matches(['"', '\'']);
+                    cur = walk_dot_steps(&cur, key)?;
+                }
+                "schema" | "describe" => {
+                    cur = blaze_sh::schema::infer_schema_value(&cur, Alloc::global());
+                }
+                "where" | "sort-by" | "reverse" | "skip" | "uniq" => {
+                    // Preserves table/list schema unchanged!
+                }
+                _ => return None,
+            }
+        }
+    }
+    Some(cur)
+}
+
+fn resolve_stage0_value(stage: &str, state: &EngineState<'_>) -> Option<Value<'static>> {
+    if stage == "." {
+        return state.get_var("_").map(|s| clone_value_global(&s.value));
+    }
+    if let Some(rest) = stage.strip_prefix('.')
+        && !stage.starts_with("./")
+        && !stage.starts_with("..")
+    {
+        let root = state.get_var("_")?;
+        let owned = clone_value_global(&root.value);
+        return walk_dot_steps(&owned, rest);
+    }
+    if let Some(var_rest) = stage.strip_prefix('$') {
+        let (var_name, dot_steps) = match var_rest.split_once('.') {
+            Some((v, r)) => (v, Some(r)),
+            None => (var_rest, None),
+        };
+        let base = if var_name == "env" {
+            Value::Record(state.env_record())
+        } else {
+            state.get_var(var_name)?.value.share()
+        };
+        let owned = clone_value_global(&base);
+        return match dot_steps {
+            Some(steps) => walk_dot_steps(&owned, steps),
+            None => Some(owned),
+        };
+    }
+
+    // `open <file>` -> parse structured file with mtime-keyed thread-local cache (<10us on hits!).
+    let mut toks = stage.split_whitespace();
+    let head = toks.next()?;
+    if head == "open" {
+        let mut raw_path: Option<&str> = None;
+        for tok in toks {
+            if tok == "-r" || tok == "--raw" {
+                return None;
+            }
+            if !tok.starts_with('-') {
+                raw_path = Some(tok.trim_matches(['"', '\'']));
+                break;
+            }
+        }
+        let rel = raw_path?;
+        let abs = resolve_preview_path(state.cwd.as_ref(), rel, state.get_env("HOME"));
+        return load_cached_open_preview(&abs);
+    }
+    None
+}
+
+fn clone_value_global(val: &Value<'_>) -> Value<'static> {
+    let alloc = Alloc::global();
+    match val {
+        Value::Nothing => Value::Nothing,
+        Value::Bool(b) => Value::Bool(*b),
+        Value::Int(n) => Value::Int(*n),
+        Value::Float(f) => Value::Float(*f),
+        Value::Size(b) => Value::Size(*b),
+        Value::Duration(d) => Value::Duration(*d),
+        Value::Date(d) => Value::Date(*d),
+        Value::String(s) => Value::string(s.as_ref(), alloc),
+        Value::Binary(b) => Value::binary(b.as_ref(), alloc),
+        Value::Record(r) => {
+            let mut out = blaze_sh::Record::new(alloc);
+            for (k, v) in r.iter() {
+                out.insert(blaze_own::Rc::from_str_in(k, alloc), clone_value_global(v));
+            }
+            Value::Record(out)
+        }
+        Value::List(items) => {
+            let mut out = blaze_sh::PVec::new(alloc);
+            for it in items.iter().take(256) {
+                out.push(clone_value_global(it));
+            }
+            Value::List(out)
+        }
+        Value::Table(t) => {
+            let mut cols = blaze_sh::PVec::new(alloc);
+            for ci in 0..t.ncols() {
+                cols.push(blaze_own::Rc::from_str_in(t.columns.get(ci).unwrap().as_ref(), alloc));
+            }
+            let mut out = blaze_sh::Table::new(cols, alloc);
+            let limit = t.nrows().min(128);
+            for ri in 0..limit {
+                let mut row_vals = Vec::with_capacity(t.ncols());
+                for ci in 0..t.ncols() {
+                    let cell = t.cell(ri, ci).map(clone_value_global).unwrap_or(Value::Nothing);
+                    row_vals.push(cell);
+                }
+                out.push_row_values(&row_vals);
+            }
+            Value::Table(out)
+        }
+        _ => Value::Nothing,
+    }
+}
+
+fn walk_dot_steps(root: &Value<'static>, dotted: &str) -> Option<Value<'static>> {
+    let mut cur = root.share();
+    for seg in dotted.split('.') {
+        if seg.is_empty() {
+            continue;
+        }
+        let clean = seg.trim_end_matches('?');
+        let next = match &cur {
+            Value::Record(r) => r.get(clean).map(Share::share),
+            Value::Table(t) => {
+                if let Ok(idx) = clean.parse::<usize>() {
+                    t.row_record(idx).map(Value::Record)
+                } else {
+                    t.col_index(clean)
+                        .and_then(|ci| t.cols.get(ci))
+                        .map(|c| Value::List(c.share()))
+                }
+            }
+            Value::List(items) => {
+                if let Ok(idx) = clean.parse::<usize>() {
+                    items.get(idx).map(Share::share)
+                } else {
+                    items.iter().find_map(|it| match it {
+                        Value::Record(r) => r.get(clean).map(Share::share),
+                        _ => None,
+                    })
+                }
+            }
+            Value::Output(o) => match clean {
+                "stdout" => Some(o.stdout_value(Alloc::global())),
+                "stderr" => Some(o.stderr_value(Alloc::global())),
+                "exit_code" | "status" => Some(Value::Int(i64::from(o.exit_code))),
+                "duration" => Some(Value::Duration(o.duration)),
+                "events" | "chunks" | "streams" => Some(Value::Table(o.events_table(Alloc::global()))),
+                _ => None,
+            },
+            _ => None,
+        };
+        cur = next?;
+    }
+    Some(cur)
+}
+
+fn resolve_preview_path(cwd: &str, raw: &str, home: Option<&str>) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(h) = home
+    {
+        return PathBuf::from(h).join(rest);
+    }
+    let p = Path::new(raw);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        Path::new(cwd).join(p)
+    }
+}
+
+fn load_cached_open_preview(abs: &Path) -> Option<Value<'static>> {
+    use std::cell::RefCell;
+    use std::time::UNIX_EPOCH;
+
+    const MAX_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;
+    let meta = fs::metadata(abs).ok()?;
+    if !meta.is_file() || meta.len() > MAX_PREVIEW_BYTES {
+        return None;
+    }
+    let mtime_ns = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let key = (abs.to_string_lossy().into_owned(), mtime_ns, meta.len());
+
+    thread_local! {
+        static CACHE: RefCell<Vec<((String, u128, u64), Option<Value<'static>>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+
+    CACHE.with(|cell| {
+        let mut entries = cell.borrow_mut();
+        if let Some((_, cached)) = entries.iter().find(|(k, _)| *k == key) {
+            return cached.as_ref().map(Share::share);
+        }
+        let bytes = fs::read(abs).ok()?;
+        let parsed = blaze_sh::builtins::parse_open_preview(&key.0, &bytes, Alloc::global());
+        if entries.len() >= 16 {
+            entries.remove(0);
+        }
+        let out = parsed.as_ref().map(Share::share);
+        entries.push((key, parsed));
+        out
+    })
+}
+
+/// Fallback schema completions for `ls | .` / `ps | .` / `tree | .` when the upstream command
+/// hasn't been executed yet.
+fn collect_piped_command_schema_dot_completions(
+    before_pipe: &str,
+    leaf_prefix: &str,
+    scored: &mut Vec<(i32, CompletionItem)>,
+) {
+    if leaf_prefix.contains('.') {
+        return;
+    }
+    let last_stage = before_pipe.rsplit(['|', ';', '\n']).next().unwrap_or("").trim();
+    let head = last_stage.split_whitespace().next().unwrap_or("");
+    let cols: &[(&str, &str, &str)] = match head {
+        "ls" | "ll" | "la" => &[
+            ("name", "string", "entry filename"),
+            ("type", "string", "file / dir / symlink"),
+            ("size", "size", "byte size"),
+            ("modified", "date", "last modified timestamp"),
+            ("git_status", "string", "git working-tree status"),
+        ],
+        "tree" => &[
+            ("name", "string", "entry name"),
+            ("size", "size", "byte size"),
+            ("modified", "date", "last modified timestamp"),
+            ("path", "string", "relative path"),
+            ("depth", "int", "tree nesting depth"),
+        ],
+        "ps" => &[
+            ("pid", "int", "process id"),
+            ("name", "string", "process name"),
+            ("cpu", "float", "CPU usage %"),
+            ("mem", "size", "resident memory"),
+            ("status", "string", "process state"),
+        ],
+        _ => return,
+    };
+    for (idx, &(name, ty, doc)) in cols.iter().enumerate() {
+        if let Some((score, idxs)) = fuzzy_match_score(name, leaf_prefix) {
+            scored.push((
+                score + 80 + (cols.len() - idx) as i32,
+                CompletionItem {
+                    label: name.to_owned(),
+                    insert: format!(".{name}"),
+                    detail: ty.to_owned(),
+                    doc: doc.to_owned(),
+                    kind: CompletionKind::Column,
+                    icon: None,
+                    avatar_path: None,
+                    fs_meta: None,
+                    match_indices: idxs,
+                },
+            ));
+        }
+    }
+}
+
 /// Walk already-completed dot segments (`rest_after_first_dot`, e.g. `package.ver` or `pac` or ``)
 /// through a live structured [`Value`] (`$_`, `$lock`, `$env`, …) and emit typed field/column/index
 /// completions with live value previews. Selecting a nested container (`Record`, `Table`, `List`,
@@ -5225,5 +5540,37 @@ mod tests {
         assert_eq!(ed.completions[0].label, "version");
         assert!(ed.apply_selected_completion());
         assert_eq!(ed.text, "$lock.package.version");
+
+        // 4. Piped `open Cargo.lock | .pack` parses the file on-the-fly (cached by mtime)
+        // and auto-completes `.package.` -> `name`, `version`, `source`!
+        let tmp_dir = std::env::temp_dir().join(format!("blaze-pipe-dot-{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let lock_path = tmp_dir.join("Cargo.lock");
+        fs::write(
+            &lock_path,
+            "version = 4\n\n[[package]]\nname = \"adler2\"\nversion = \"2.0.1\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        )
+        .unwrap();
+        let tmp_state = EngineState::new(&tmp_dir.to_string_lossy(), &[], alloc);
+        ed.set_text_initial("open Cargo.lock | .pack".to_owned());
+        ed.refresh_assist(&tmp_state, &[], false);
+        assert_eq!(ed.completions.len(), 1);
+        assert_eq!(ed.completions[0].label, "package");
+        assert_eq!(ed.completions[0].insert, ".package.");
+        assert!(ed.apply_selected_completion());
+        assert_eq!(ed.text, "open Cargo.lock | .package.");
+
+        ed.refresh_assist(&tmp_state, &[], false);
+        assert!(ed.completions.iter().any(|c| c.label == "name"));
+        assert!(ed.completions.iter().any(|c| c.label == "version"));
+        assert!(ed.completions.iter().any(|c| c.label == "source"));
+
+        // 5. Also supports `$lock | .pack` and `open Cargo.lock | .package | .ver`!
+        ed.set_text_initial("open Cargo.lock | .package | .ver".to_owned());
+        ed.refresh_assist(&tmp_state, &[], false);
+        assert_eq!(ed.completions[0].label, "version");
+        assert_eq!(ed.completions[0].insert, ".version");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
