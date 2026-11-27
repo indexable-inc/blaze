@@ -820,18 +820,18 @@ pub struct Builder<'b, H: Heads, S> {
 
 impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// If `text` is an unmodified subslice of `self.owner`'s scanned text and may declare items or
-    /// invoke macros, returns its [`super::anon::HeadOwner`] coordinates. When `text` contains a
-    /// macro call (`!`), also records its observable source `(line, col)` (and the underlying
-    /// file read via `body_place`) so inserting a blank line above the enclosing item invalidates
-    /// cached head constants.
-    fn head_owner_of(&self, text: &str) -> Option<super::anon::HeadOwner> {
+    /// invoke macros, returns its [`super::anon::HeadOwner`] coordinates and, when `text` contains
+    /// a macro call (`!`), its observable [`super::anon::HeadSite`] (`(line, col)` and shown file
+    /// path via `body_place`/`body_file`) so inserting a blank line or moving a module across
+    /// `#[path]` files invalidates cached head constants.
+    fn head_owner_of(&self, text: &str) -> Option<(super::anon::HeadOwner, Option<super::anon::HeadSite<'n>>)> {
         let (item, owner_text) = self.owner?;
         if !blaze_file_items::nested::may_write_block(text) {
             return None;
         }
         let offset = blaze_scope::expansion_origins::offset_in(owner_text, text)?;
         let len = u32::try_from(text.len()).ok()?;
-        let site_pos = if text.contains('!') {
+        let site = if text.contains('!') {
             let header_off = self
                 .resolver
                 .names
@@ -840,17 +840,18 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 .unwrap_or(0);
             blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
                 let scratch = blaze_own::Erased::new(frame);
-                let (_, file_text, start, by_call) = crate::front2::program::lazy::body_place(self.resolver.names, item, scratch.handle()).ok()?;
+                let (krate, file_text, start, by_call) = crate::front2::program::lazy::body_place(self.resolver.names, item, scratch.handle()).ok()?;
                 let at = if by_call { start } else { start.checked_add(header_off)?.checked_add(offset)? };
                 let at = usize::try_from(at).ok()?;
                 let line = blaze_expand::PlaceOf::Line.counted(file_text, at)?;
                 let col = blaze_expand::PlaceOf::Column.counted(file_text, at)?;
-                Some((line, col))
+                let file = super::body_host::body_file(self.resolver.names, krate, item).map(|f| f.shown);
+                Some(super::anon::HeadSite { line, col, file })
             })
         } else {
             None
         };
-        Some(super::anon::HeadOwner { item, offset, len, site_pos })
+        Some((super::anon::HeadOwner { item, offset, len }, site))
     }
     /// The portable type of `t`, by a work list (no recursion).
     pub fn ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId) -> Result<PTy, Why> {
@@ -964,7 +965,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         text: &str,
         r: Range,
         ty: Option<PNode>,
-        carried_owner: Option<(super::anon::HeadOwner, blaze_own::AVec<'static, super::anon::TextEdit>)>,
+        carried_owner: Option<(super::anon::HeadOwner, Option<super::anon::HeadSite<'n>>, blaze_own::AVec<'static, super::anon::TextEdit>)>,
     ) -> Result<u128, Why> {
         let text = text.trim();
         let other = || Why::ConstPath(Box::from(text), r);
@@ -992,9 +993,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // refused there refuses this head, naming the leaf and the reason.
         let resolve_ty = |abs: bool, segs: &[&str]| self.resolver.path(env.module, abs, segs, Ns::Type);
         let owner_and_edits = match carried_owner {
-            Some(pair) => Some(pair),
+            Some(triple) => Some(triple),
             None => match (self.head_owner_of(text), self.heads.mark_alloc()) {
-                (Some(owner), Some(alloc)) => Some((owner, blaze_own::AVec::new_in(alloc))),
+                (Some((owner, site)), Some(alloc)) => Some((owner, site, blaze_own::AVec::new_in(alloc))),
                 _ => None,
             },
         };
@@ -1036,7 +1037,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             }
         }
         let Some(mut ask) = ty.and_then(|ty| super::anon::Ask::of(env.module, ty, text)) else { return Err(other()) };
-        if let (Some((owner, first_edits)), Some(alloc)) = (owner_and_edits, self.heads.mark_alloc()) {
+        if let (Some((owner, site, first_edits)), Some(alloc)) = (owner_and_edits, self.heads.mark_alloc()) {
             let final_edits = match qpath_edits {
                 Some(second_edits) if with_values.is_some() && !second_edits.is_empty() => {
                     if first_edits.is_empty() {
@@ -1049,7 +1050,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 _ => Some(first_edits),
             };
             if let Some(edits) = final_edits {
-                ask = ask.in_head_item(owner, edits, alloc);
+                ask = ask.in_head_item(owner, site, edits, alloc);
             }
         }
         // A macro-written head's expression is lowered with its tokens' marks (anon.rs
@@ -1167,7 +1168,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // with its type left to the checker: anon.rs `written_ty`).
         let node = tys.view().get(ty).copied();
         let carried_owner = match (orig_owner, inherent_edits) {
-            (Some(owner), Some(edits)) => Some((owner, edits)),
+            (Some((owner, site)), Some(edits)) => Some((owner, site, edits)),
             _ => None,
         };
         // An expression that names `Self` where `Self` is a ground type has a value here

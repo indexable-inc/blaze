@@ -808,3 +808,285 @@ fn main() {}
     expect("before blank line", &check_fns(BEFORE, &["at_3", "at_4"]), &[true, false]);
     expect("after blank line", &check_fns(AFTER, &["at_3", "at_4"]), &[false, true]);
 }
+
+/// Round 3 P1 #1: moving an unchanged module across `#[path = "..."]` files keeps the enclosing
+/// `impl` item key AND its `(line, col)` identical, so `HeadSite::file` MUST be hashed into the
+/// anonymous constant key so `file!().len()` produces distinct keys, bits, and frozen meanings.
+#[test]
+fn moving_module_across_path_files_invalidates_file_macro_head_const_key() {
+    use blaze_ladder::front2::body_host::BodySources;
+    use blaze_ladder::front2::consts::ConstFail;
+    use blaze_ladder::front2::heads::Want;
+    use blaze_ladder::front2::keys::Keys;
+    use blaze_ladder::front2::source::NamesSource;
+    use blaze_ladder::front2::tables::head::{ConstValues, HeadCells, SeededHeads, SeededHeadsOpts, StoreConsts};
+
+    struct ShownFileSources;
+    impl BodySources for ShownFileSources {
+        fn read(&self, _: usize, _: &str) -> Option<&str> { None }
+        fn read_data(&self, _: usize, _: &str, _: &str) -> Option<&[u8]> { None }
+        fn env(&self, _: usize, _: &str) -> Result<Option<&str>, blaze_expand::HostError> { Ok(None) }
+        fn folder(&self, _: usize) -> Option<&str> { None }
+        fn shown_file<'b>(&self, _: usize, path: &str, alloc: Alloc<'b>) -> Option<blaze_own::AString<'b>> {
+            Some(blaze_own::AString::from_str_in(path, alloc))
+        }
+        fn script_file(&self, _: usize, _: &str) -> Option<Result<Option<&[u8]>, blaze_expand::HostError>> { None }
+        fn run_proc_macro<'b>(&self, _: usize, _: &blaze_expand::MacroDefinition<'_>, _: blaze_expand::ProcCall<'_>, _: Alloc<'b>) -> Result<blaze_expand::Produced<'b>, blaze_expand::HostError> {
+            Err(blaze_expand::HostError { ask: blaze_expand::HostAsk::ProcMacro, why: blaze_expand::HostWhy::Refused })
+        }
+        fn file_left_reads(&self, _: usize, _: blaze_scope::left_reads::CallAt<'_>, _: &blaze_expand::Reads<'_>, _: core::ops::Range<usize>, _: Alloc<'_>) -> u32 { 0 }
+        fn left_package(&self, _: usize, _: blaze_scope::include_place::LeftPackage<'_>) {}
+    }
+    struct SourcedEval<'r, 'n, S> {
+        inner: StoreConsts<'r, 'n, S>,
+        sources: &'n dyn BodySources,
+    }
+    impl<'n, S: NamesSource<'n>> ConstValues<'n> for SourcedEval<'_, 'n, S> {
+        fn eval(&mut self, store: &mut Store<'n>, keys: &mut Keys, c: blaze_id::ItemKey) -> Result<(), ConstFail> {
+            let prev = store.sources;
+            store.sources = Some(self.sources);
+            let res = self.inner.eval(store, keys, c);
+            store.sources = prev;
+            res
+        }
+    }
+    static SHOWN_SOURCES: ShownFileSources = ShownFileSources;
+
+    const MOD_TEXT: &str = "pub trait Check<const N: usize> {}
+pub struct S;
+impl Check<{ file!().len() }> for S {}
+";
+
+    let freeze_in_file = |mod_file: &str| {
+        let alloc = Alloc::global();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = format!("{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let root_text = format!("#[path = \"{mod_file}\"]\nmod m;\nfn main() {{}}\n");
+        let files = [
+            ("/hello-world/src/main.rs".to_string(), root_text.clone()),
+            (format!("/hello-world/src/{mod_file}"), MOD_TEXT.to_string()),
+        ];
+        let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+        let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let mod_path = format!("src/{mod_file}");
+        let sources = [
+            SourceFile { path: "src/main.rs", text: root_text.as_str() },
+            SourceFile { path: mod_path.as_str(), text: MOD_TEXT },
+        ];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+        let impl_key = names
+            .krate(0)
+            .tables
+            .impls
+            .iter()
+            .find(|i| i.header.contains("file!().len()"))
+            .expect("impl Check<{ file!().len() }> for S")
+            .key;
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
+        let mut evaluator = SourcedEval {
+            inner: StoreConsts { names: &names, index: &front.index, prepared },
+            sources: &SHOWN_SOURCES,
+        };
+        let sized = front.index.lang("sized");
+        let mut source = SeededHeads::new(SeededHeadsOpts {
+            names: &names,
+            sized,
+            pointers: blaze_ladder::front2::receiver::Pointers::NOT_LOOKED_UP,
+            frame: &frame,
+            scratch: alloc,
+            alloc,
+            consts: Some(&mut evaluator),
+            known: None,
+            owners: None,
+        });
+        let (frozen, read) = source.cell(Want::Impl(impl_key)).unwrap_or_else(|e| panic!("freeze impl: {e}"));
+        (impl_key, frozen.meaning(), read.consts.to_vec())
+    };
+
+    let (key_short, meaning_short, consts_short) = freeze_in_file("a.rs");
+    let (key_long, meaning_long, consts_long) = freeze_in_file("much_longer_file.rs");
+    assert_eq!(key_short, key_long, "enclosing impl key is identical across #[path] rename");
+    assert_eq!(consts_short.len(), 1, "short: {consts_short:?}");
+    assert_eq!(consts_long.len(), 1, "long: {consts_long:?}");
+    assert_ne!(consts_short[0].0, consts_long[0].0, "different shown filenames must produce distinct head anon const keys");
+    assert_eq!(
+        consts_long[0].1 - consts_short[0].1,
+        ("much_longer_file.rs".len() - "a.rs".len()) as u128,
+        "evaluated file!().len() must reflect the exact filename length delta"
+    );
+    assert_ne!(meaning_short, meaning_long, "frozen impl head meaning must reflect the new file!().len()");
+}
+
+/// Round 3 P1 #2: associated `fn`, `const`, and `type` members inside both `trait` and `impl`
+/// containers keep their member `LibKey` as `Builder::owner`, so item-declaring const blocks in
+/// member signatures and associated types resolve to the member's `blaze-scope` block modules.
+#[test]
+fn associated_fn_const_and_type_heads_map_const_blocks_to_member_block_modules() {
+    const TEXT: &str = "
+trait Check<const N: usize> {}
+impl Check<2> for () {}
+
+trait MemberTrait {
+    type AssocTy;
+    const TRAIT_CONST: [u8; {
+        #[repr(u16)]
+        enum TraitConstEnum { A = 0, B = 1 }
+        core::mem::size_of::<TraitConstEnum>()
+    }];
+    fn trait_fn()
+    where
+        (): Check<{
+            #[repr(u16)]
+            enum TraitFnEnum { A = 0, B = 1 }
+            core::mem::size_of::<TraitFnEnum>()
+        }>;
+}
+
+struct S;
+impl MemberTrait for S {
+    type AssocTy = [u8; {
+        #[repr(u16)]
+        enum ImplTyEnum { A = 0, B = 1 }
+        core::mem::size_of::<ImplTyEnum>()
+    }];
+    const TRAIT_CONST: [u8; {
+        #[repr(u16)]
+        enum ImplConstEnum { A = 0, B = 1 }
+        core::mem::size_of::<ImplConstEnum>()
+    }] = [0u8; 2];
+    fn trait_fn()
+    where
+        (): Check<{
+            #[repr(u16)]
+            enum ImplFnEnum { A = 0, B = 1 }
+            core::mem::size_of::<ImplFnEnum>()
+        }>,
+    {}
+}
+
+impl S {
+    const INHERENT_C: [u8; {
+        #[repr(u16)]
+        enum InherentConstEnum { A = 0, B = 1 }
+        core::mem::size_of::<InherentConstEnum>()
+    }] = [0u8; 2];
+    fn inherent_fn()
+    where
+        (): Check<{
+            #[repr(u16)]
+            enum InherentFnEnum { A = 0, B = 1 }
+            core::mem::size_of::<InherentFnEnum>()
+        }>,
+    {}
+}
+
+fn check_assoc_ty_ok(x: <S as MemberTrait>::AssocTy) -> [u8; 2] { x }
+fn check_assoc_ty_bad(x: <S as MemberTrait>::AssocTy) -> [u8; 3] { x }
+fn check_trait_const_ok() -> [u8; 2] { <S as MemberTrait>::TRAIT_CONST }
+fn check_trait_const_bad() -> [u8; 3] { <S as MemberTrait>::TRAIT_CONST }
+fn check_trait_fn_ok() { <S as MemberTrait>::trait_fn() }
+fn check_inherent_const_ok() -> [u8; 2] { S::INHERENT_C }
+fn check_inherent_const_bad() -> [u8; 3] { S::INHERENT_C }
+fn check_inherent_fn_ok() { S::inherent_fn() }
+fn main() {}
+";
+    let got = check_fns(
+        TEXT,
+        &[
+            "check_assoc_ty_ok",
+            "check_assoc_ty_bad",
+            "check_trait_const_ok",
+            "check_trait_const_bad",
+            "check_trait_fn_ok",
+            "check_inherent_const_ok",
+            "check_inherent_const_bad",
+            "check_inherent_fn_ok",
+        ],
+    );
+    expect("associated member const blocks", &got, &[true, false, true, false, true, true, false, true]);
+}
+
+/// Round 3 P1 #3: head-level item-declaring const blocks in `type` aliases, tuple/record
+/// `struct`s, `enum` discriminants, and `trait` `where` clauses all emit `blaze-scope` block
+/// modules and evaluate cleanly in `front2`.
+#[test]
+fn type_alias_struct_enum_and_trait_heads_with_const_blocks_evaluate_cleanly() {
+    const TEXT: &str = "
+trait Check<const N: usize> {}
+impl Check<2> for () {}
+
+type AliasBuf = [u8; {
+    #[repr(u16)]
+    enum AliasE { A = 0, B = 1 }
+    core::mem::size_of::<AliasE>()
+}];
+
+struct TupleBuf([u8; {
+    #[repr(u16)]
+    enum TupleE { A = 0, B = 1 }
+    core::mem::size_of::<TupleE>()
+}]);
+
+struct RecordBuf {
+    data: [u8; {
+        #[repr(u16)]
+        enum RecordE { A = 0, B = 1 }
+        core::mem::size_of::<RecordE>()
+    }],
+}
+
+#[repr(u16)]
+enum DiscEnum {
+    V = {
+        #[repr(u16)]
+        enum DiscTag { A = 0, B = 1 }
+        core::mem::size_of::<DiscTag>() as u16
+    },
+}
+
+trait BoundedTrait
+where
+    (): Check<{
+        #[repr(u16)]
+        enum TraitE { A = 0, B = 1 }
+        core::mem::size_of::<TraitE>()
+    }>,
+{
+    fn ping(&self) {}
+}
+
+struct S;
+impl BoundedTrait for S {}
+
+fn alias_ok(x: AliasBuf) -> [u8; 2] { x }
+fn alias_bad(x: AliasBuf) -> [u8; 3] { x }
+fn tuple_ok(x: TupleBuf) -> [u8; 2] { x.0 }
+fn tuple_bad(x: TupleBuf) -> [u8; 3] { x.0 }
+fn record_ok(x: RecordBuf) -> [u8; 2] { x.data }
+fn record_bad(x: RecordBuf) -> [u8; 3] { x.data }
+fn disc_ok() -> [u8; DiscEnum::V as usize] { [0u8; 2] }
+fn disc_bad() -> [u8; DiscEnum::V as usize] { [0u8; 3] }
+fn trait_ok(s: &S) { s.ping() }
+fn main() {}
+";
+    let got = check_fns(
+        TEXT,
+        &[
+            "alias_ok",
+            "alias_bad",
+            "tuple_ok",
+            "tuple_bad",
+            "record_ok",
+            "record_bad",
+            "disc_ok",
+            "disc_bad",
+            "trait_ok",
+        ],
+    );
+    expect("type/struct/enum/trait head const blocks", &got, &[true, false, true, false, true, false, true, false, true]);
+}

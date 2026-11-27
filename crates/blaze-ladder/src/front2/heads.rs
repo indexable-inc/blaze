@@ -4232,14 +4232,14 @@ impl<'n> Store<'n> {
             (Want::Fn(_), ItemDetail::Fn { .. } | ItemDetail::Const { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks, false)
+                self.fn_head(names, keys, key, key, ck, None, &env, 0, &[], &v, text, detail, marks, false)
             }
             // A static's head is its type, as a const's, and its mutability (the Reference,
             // "Static items": "Mutable statics", `static mut`).
             (Want::Fn(_), ItemDetail::Static { .. }) => {
                 let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
                 let marks = self.marks(names, key, text).map_err(|why| HeadError::Item(key, why))?;
-                let made = self.fn_head(names, keys, key, ck, None, &env, 0, &[], &v, text, detail, marks, false);
+                let made = self.fn_head(names, keys, key, key, ck, None, &env, 0, &[], &v, text, detail, marks, false);
                 if made.is_ok() {
                     let m = if v.head[head::FLAGS] & sig::MUT != 0 { tc::Mutbl::Mut } else { tc::Mutbl::Not };
                     self.statics.insert(ck, m);
@@ -4757,6 +4757,38 @@ impl<'n> Store<'n> {
         self.file_container(ck, &life_names, Some((None, self_ty))).map_err(|what| HeadError::Filed { want, at, what })
     }
 
+    /// The `(LibKey, scanned_text)` head owner for a top-level library item whose head or body
+    /// may hold item- or macro-bearing const blocks (`blaze_scope::task::lower::BodySrc::of`).
+    fn head_owner_item<S: NamesSource<'n>>(names: S, key: LibKey) -> Option<(LibKey, &'n str)> {
+        let it = names.seeded_text_of(key)?;
+        match names.detail_of(key)? {
+            ItemDetail::Impl => it.impl_header.filter(|h| blaze_file_items::nested::has_writing_block(h)).map(|h| (key, h)),
+            ItemDetail::Trait => {
+                let head = blaze_file_items::nested::trait_head(it.text);
+                blaze_file_items::nested::has_writing_block(head).then_some((key, head))
+            }
+            ItemDetail::TraitAlias | ItemDetail::TypeAlias => blaze_file_items::nested::has_writing_block(it.text).then_some((key, it.text)),
+            ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union => blaze_file_items::nested::adt_has_writing_block(it.text).then_some((key, it.text)),
+            ItemDetail::Fn { body_holds_items } | ItemDetail::Const { body_holds_items } | ItemDetail::Static { body_holds_items } => {
+                (body_holds_items || blaze_file_items::nested::has_writing_block(it.text)).then_some((key, it.text))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `(member_lib, member_text)` head owner for an associated `fn`, `const`, or `type`
+    /// member (or free `fn`/`const`/`static`) whose head or body may hold item- or macro-bearing
+    /// const blocks.
+    fn head_owner_member(member_lib: LibKey, detail: ItemDetail, text: &'n str) -> Option<(LibKey, &'n str)> {
+        match detail {
+            ItemDetail::TypeAlias => blaze_file_items::nested::has_writing_block(text).then_some((member_lib, text)),
+            ItemDetail::Fn { body_holds_items } | ItemDetail::Const { body_holds_items } | ItemDetail::Static { body_holds_items } => {
+                (body_holds_items || blaze_file_items::nested::has_writing_block(text)).then_some((member_lib, text))
+            }
+            _ => None,
+        }
+    }
+
     /// A trait alias's head (`trait A<T> = B<T> + C where ..;`): its generics (`Self` first)
     /// and the clauses it stands for, read in its own module as a trait's supertraits and where
     /// clauses are, with `Self` = `Param(0)`. An alias named in them is made first
@@ -4768,7 +4800,8 @@ impl<'n> Store<'n> {
         let mut ps = blaze_own::Vec::new_in(alloc);
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         let me = intern(&mut self.tys, PNode::Param(0))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(me, None), self_assoc: &[], anon: &[], consts: &cs, body: None };
@@ -4803,7 +4836,8 @@ impl<'n> Store<'n> {
         let mut ps = blaze_own::Vec::new_in(a);
         let mut cs = blaze_own::Vec::new_in(a);
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         // A free `type T;` with no type is an extern type (the Reference, "Type aliases": a
         // free alias without a type is an error, so the only accepted form is a foreign item:
@@ -4867,7 +4901,8 @@ impl<'n> Store<'n> {
         let mut ps = blaze_own::Vec::new_in(alloc);
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
         let g = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };
         let mut defaults = blaze_own::Vec::new_in(alloc);
@@ -4957,7 +4992,8 @@ impl<'n> Store<'n> {
         let mut ps = blaze_own::Vec::new_in(alloc);
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         // The trait's bounds are lowered after its head (they may name the trait): a default
         // written with `T::X` is refused as not yet readable, never as not found.
@@ -5085,11 +5121,12 @@ impl<'n> Store<'n> {
             cs.extend_from_slice(existing);
         }
         let Ok(marks) = self.marks(names, key, v.item()) else { return };
+        let trait_owner = Self::head_owner_item(names, key);
         let mut bounds: blaze_own::Vec<super::types::ParamBound, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         for _ in 0..16u32 {
             bounds.clear();
             let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
-            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: trait_owner };
             match b.param_bounds_in(&mut self.tys, &env, &v, 1, &mut bounds) {
                 Ok(()) => break,
                 Err(Why::Need(dep)) => {
@@ -5128,7 +5165,8 @@ impl<'n> Store<'n> {
                     let base = own + 1;
                     let mut idx = base;
                     let cenv = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[], body: None };
-                    let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks, owner: None };
+                    let m_owner = Self::head_owner_member(m.lib, m.detail, m.text);
+                    let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks, owner: m_owner };
                     for &n in rows {
                         match lf::GenericParam::decode(n) {
                             Ok(lf::GenericParam::Lifetime { .. }) => {}
@@ -5195,7 +5233,8 @@ impl<'n> Store<'n> {
                 let Ok(ap_scope) = Scope::item(&mv, Some(&scope), scope.params(), alloc) else { break };
                 let mut ap = Preds::new_in(ap_scope);
                 let own_env = Env { module, params: &own_ps, bounds: Bounds::Done(&bounds), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &own_cs, body: None };
-                let b = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks, owner: None };
+                let m_owner = Self::head_owner_member(m.lib, m.detail, m.text);
+                let b = Builder { resolver: Paths { names }, heads: &self.maps, marks: m_marks, owner: m_owner };
                 match b.assoc_ty_bounds(&mut self.tys, &own_env, &mv, alias, self.sized, &mut ap) {
                     Ok(()) => {
                         let laid = match lay_listed(&b, &mut self.tys, &own_env, &mv, (&ap, &[]), SelfGiven::NONE, Captures::NONE, alloc) {
@@ -5249,7 +5288,8 @@ impl<'n> Store<'n> {
         cs.extend_from_slice(self.maps.const_params.get(&key).ok_or(Why::Need(key))?);
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs, body: None };
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
         let mut bounds = blaze_own::Vec::new_in(alloc);
         b.param_bounds_in(&mut self.tys, &env, v, 1, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -5401,7 +5441,8 @@ impl<'n> Store<'n> {
                     ItemDetail::TypeAlias => {
                         let item = keys.member(ck, MemberKind::Type, m.name).map_err(&why_key)?;
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
-                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+                        let owner = Self::head_owner_member(m.lib, m.detail, m.text);
+                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
                         let default = match mv.head_opt(head::TY) {
                             Some(t) => Some(b.ty(&mut self.tys, &env, mv, lf::TypeId(t))?),
                             None => None,
@@ -5465,7 +5506,8 @@ impl<'n> Store<'n> {
                         let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
                         consts.push((Name::of(m.name), mk));
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
-                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+                        let owner = Self::head_owner_member(m.lib, m.detail, m.text);
+                        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
                         let mut cp = Preds::new_in(scope.clone_in(alloc));
                         cp.inherit(&inherited);
                         let ra = self.tys.alloc();
@@ -5539,7 +5581,8 @@ impl<'n> Store<'n> {
         let self_ty = intern(&mut self.tys, PNode::Adt(ck, pl))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(self_ty, None), self_assoc: &[], anon: &[], consts: &cs, body: None };
         let marks = self.marks(names, key, v.item())?;
-        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+        let owner = Self::head_owner_item(names, key);
+        let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
         let mut bounds = blaze_own::Vec::new_in(alloc);
         b.param_bounds_in(&mut self.tys, &env, v, 0, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -5889,11 +5932,7 @@ impl<'n> Store<'n> {
         let mut ps = blaze_own::Vec::new_in(alloc);
         let mut cs = blaze_own::Vec::new_in(alloc);
         let marks = self.marks(names, key, v.item())?;
-        let owner = names
-            .seeded_text_of(key)
-            .and_then(|it| it.impl_header)
-            .filter(|h| h.contains('{') && blaze_file_items::nested::may_write_block(h))
-            .map(|h| (key, h));
+        let owner = Self::head_owner_item(names, key);
         let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs, body: None };
@@ -6005,7 +6044,7 @@ impl<'n> Store<'n> {
         // impl type parameter's lifetime-carrying bound (e.g. `impl<'de, A: ?Sized +
         // SeqAccess<'de>> SeqAccess<'de> for &mut A { type Error = A::Error; }`) receive
         // `impl_given.param_bounds` instead of `&[]`.
-        let mut assoc_to_lay: blaze_own::Vec<(Name, &'n str, Option<LibKey>, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let mut assoc_to_lay: blaze_own::Vec<(Name, LibKey, &'n str, Option<LibKey>, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         // For a trait impl, `Self::X` in where-clauses and members lowers to `<SelfTy as Trait>::X`
         // (types.rs `self_assoc_path`), never reading `env.self_assoc`. When an associated type's
         // value needs a constant (`Why::NeedConst`), we still lower the impl's header, where-clauses
@@ -6035,7 +6074,8 @@ impl<'n> Store<'n> {
                     ItemDetail::TypeAlias => {
                         let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
                         let marks = super::item_site::member_marks(names, key, m.written_by, m.text).map_err(MarksLost::why)?;
-                        let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+                        let owner = Self::head_owner_member(m.lib, m.detail, m.text);
+                        let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
                         let written_t = lf::TypeId(t);
                         let lowered_assoc = if mv.rows(mv.list(head::GENERICS))?.is_empty() {
                             mb.ty(&mut self.tys, &env, mv, written_t)
@@ -6063,11 +6103,11 @@ impl<'n> Store<'n> {
                         super::gat::member_where(mv, m.name)?;
                         let assoc_name = Name::of(m.name);
                         assoc.push((assoc_name, value));
-                        assoc_to_lay.push((assoc_name, m.text, m.written_by, value));
+                        assoc_to_lay.push((assoc_name, m.lib, m.text, m.written_by, value));
                     }
                     ItemDetail::Const { .. } => {
                         let mk = keys.member(ck, MemberKind::Const, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
-                        const_texts.push((Name::of(m.name), mk, m.text, m.written_by));
+                        const_texts.push((Name::of(m.name), mk, m.lib, m.detail, m.text, m.written_by));
                     }
                     d => return Err(Why::Unsupported(crate::front::detail_name(d), whole)),
                 }
@@ -6085,8 +6125,8 @@ impl<'n> Store<'n> {
         lifetime_names(v, &mut life_names)?;
         if let Some((waiting_const, need_const)) = first_assoc_const {
             self.container_scopes.insert(ck, Scope::container(&life_names, scope.params(), alloc).map_err(Why::Regions)?);
-            for &(name, mk, text, written_by) in &const_texts {
-                if self.impl_const(names, key, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics).is_ok() {
+            for &(name, mk, m_lib, m_detail, text, written_by) in &const_texts {
+                if self.impl_const(names, key, m_lib, m_detail, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics).is_ok() {
                     self.fn_gaps.remove(&mk);
                     consts.push((name, mk));
                 }
@@ -6122,11 +6162,12 @@ impl<'n> Store<'n> {
             if !assoc_to_lay.is_empty() {
                 let mut scratch = self.take_parse_scratch();
                 let res: Result<(), Why> = (|| {
-                    for &(assoc_name, m_text, m_written_by, value) in &assoc_to_lay {
+                    for &(assoc_name, m_lib, m_text, m_written_by, value) in &assoc_to_lay {
                         with_lowered_in(&mut scratch, names, key, m_text, |mv| -> Result<(), Why> {
                             let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated type with no type", whole))?;
                             let marks = super::item_site::member_marks(names, key, m_written_by, m_text).map_err(MarksLost::why)?;
-                            let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+                            let owner = Self::head_owner_member(m_lib, ItemDetail::TypeAlias, m_text);
+                            let mb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
                             let written_t = lf::TypeId(t);
                             let mut own_lifetimes = false;
                             for &row in mv.rows(mv.list(head::GENERICS))? {
@@ -6209,8 +6250,8 @@ impl<'n> Store<'n> {
         // Every constant's name and key, for the waits below (`ConstWait`).
         let mut declared_consts = blaze_own::Vec::with_capacity_in(const_texts.len(), alloc);
         declared_consts.extend(const_texts.iter().map(|&(name, mk, ..)| (name, mk)));
-        for &(name, mk, text, written_by) in &const_texts {
-            match self.impl_const(names, key, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics) {
+        for &(name, mk, m_lib, m_detail, text, written_by) in &const_texts {
+            match self.impl_const(names, key, m_lib, m_detail, ck, mk, text, written_by, &env, (&preds.scope, preds.clauses.as_slice()), &bounds, generics) {
                 Ok(()) => {
                     self.fn_gaps.remove(&mk);
                 }
@@ -6251,14 +6292,15 @@ impl<'n> Store<'n> {
     /// with its impl's head ([`Store::impl_`]), or after it when it waited on a leaf
     /// ([`Store::remake_waiting`]): one maker, so both rows are the same.
     #[expect(clippy::too_many_arguments, reason = "one constant's text and its impl's frame")]
-    fn impl_const<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, ck: ItemKey, mk: ItemKey, text: &'n str, written_by: Option<LibKey>, env: &Env<'_>, (scope, clauses): (&Scope, &[PClause]), bounds: &[ParamBound], generics: u32) -> Result<(), Why> {
+    fn impl_const<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, member_lib: LibKey, member_detail: ItemDetail, ck: ItemKey, mk: ItemKey, text: &'n str, written_by: Option<LibKey>, env: &Env<'_>, (scope, clauses): (&Scope, &[PClause]), bounds: &[ParamBound], generics: u32) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let mut scratch = self.take_parse_scratch();
         let res = with_lowered_in(&mut scratch, names, key, text, |cv| -> Result<(), Why> {
             let at = Range::new(0, text.len() as u32);
             let t = cv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
             let marks = super::item_site::member_marks(names, key, written_by, text).map_err(MarksLost::why)?;
-            let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+            let owner = Self::head_owner_member(member_lib, member_detail, text);
+            let cb = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
             // An associated constant has no generics of its own: the impl's lifetimes.
             let mut cp = Preds::new_in(scope.clone_in(scope.alloc()));
             cp.inherit(clauses);
@@ -6345,7 +6387,7 @@ impl<'n> Store<'n> {
             if low.view().cfg_out() {
                 continue;
             }
-            return self.impl_const(names, w.impl_, ck, mk, m.text, m.written_by, &env, (&scope, inherited.as_slice()), &bounds, generics);
+            return self.impl_const(names, w.impl_, m.lib, m.detail, ck, mk, m.text, m.written_by, &env, (&scope, inherited.as_slice()), &bounds, generics);
         }
         Err(lost("its impl holds no constant of its name that its crate's cfg keeps"))
     }
@@ -6371,7 +6413,7 @@ impl<'n> Store<'n> {
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
     fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, member: &Member<'n>, marks: Option<TextMarks<'n>>, container_const: bool) -> Result<(), Why> {
         names.read_member_signature(member.lib, member.written_by);
-        match self.fn_head(names, keys, lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks, container_const) {
+        match self.fn_head(names, keys, lib, member.lib, key, container, outer, parent, inherited, v, member.text, member.detail, marks, container_const) {
             Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
             Err(why) => {
                 self.fn_gaps.insert(key, why);
@@ -6438,7 +6480,8 @@ impl<'n> Store<'n> {
             if !has_default && !has_spread {
                 continue;
             }
-            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner: None };
+            let owner = Self::head_owner_item(names, lib);
+            let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
             let mut merged: blaze_own::Vec<(&str, Name, DefaultEntry), Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
             let mut inherited_any = false;
             let mut spread_ok = true;
@@ -6577,22 +6620,13 @@ impl<'n> Store<'n> {
     /// `inherited` its container's clauses, `v` its own text's, `marks` its text's tokens'
     /// (front2 item_site.rs).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>, container_const: bool) -> Result<(), Why> {
+    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, keys: &Keys, lib: LibKey, owner_lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str, detail: ItemDetail, marks: Option<TextMarks<'n>>, container_const: bool) -> Result<(), Why> {
         let alloc = self.tys.alloc();
         let mut ps = blaze_own::Vec::with_capacity_in(outer.params.len(), alloc);
         ps.extend_from_slice(outer.params);
         let mut cs = blaze_own::Vec::with_capacity_in(outer.consts.len(), alloc);
         cs.extend_from_slice(outer.consts);
-        let owner = (container.is_none()
-            && self.locals.head(key).is_none()
-            && matches!(detail, ItemDetail::Fn { .. } | ItemDetail::Const { .. } | ItemDetail::Static { .. })
-            && (matches!(
-                detail,
-                ItemDetail::Fn { body_holds_items: true }
-                    | ItemDetail::Const { body_holds_items: true }
-                    | ItemDetail::Static { body_holds_items: true }
-            ) || (text.contains('{') && blaze_file_items::nested::may_write_block(text))))
-        .then_some((lib, text));
+        let owner = self.locals.head(key).is_none().then(|| Self::head_owner_member(owner_lib, detail, text)).flatten();
         let declared = {
             let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
             own_generics(&b, &mut self.tys, outer.module, v, parent, &mut ps, &mut cs)?

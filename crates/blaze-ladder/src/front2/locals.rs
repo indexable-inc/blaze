@@ -406,6 +406,29 @@ pub(super) fn library_item_or_member<'n, S: NamesSource<'n>>(names: S, keys: &Ke
     found
 }
 
+/// The exact text `blaze-scope::blocks` scanned for `owner_item` (top-level item or associated
+/// member): `impl_header` for `Impl`, `trait_head` for `Trait`, whole text for all other items
+/// and associated members (`NamesSource::member_owner`).
+pub(super) fn owner_scanned_text<'n, S: NamesSource<'n>>(names: S, owner_item: LibKey) -> Option<&'n str> {
+    if let Some(it) = names.seeded_text_of(owner_item) {
+        return Some(if let Some(header) = it.impl_header {
+            header
+        } else if matches!(names.detail_of(owner_item), Some(ItemDetail::Trait)) {
+            blaze_file_items::nested::trait_head(it.text)
+        } else {
+            it.text
+        });
+    }
+    let (container, _) = names.member_owner(owner_item)?;
+    let mut found = None;
+    names.each_member(container, &mut |m| {
+        if found.is_none() && m.key == owner_item {
+            found = Some(m.text);
+        }
+    });
+    found
+}
+
 /// Enclosing library item and byte alignment for a head-level anonymous constant
 /// (`"const _: TY = { <expr> };"`), used to map its blocks back to the enclosing item's
 /// `blaze-scope` block modules.
@@ -852,10 +875,9 @@ impl<'n> Locals<'n> {
         let Some(ha) = self.head_anons.get(&owner).copied() else {
             return (None, None);
         };
-        let Some(it) = names.seeded_text_of(ha.owner_item) else {
+        let Some(owner_text) = owner_scanned_text(names, ha.owner_item) else {
             return (None, None);
         };
-        let owner_text = it.impl_header.unwrap_or(it.text);
         let owner_nested = blaze_file_items::nested::scan(owner_text, alloc);
         if owner_nested.end != blaze_file_items::nested::NestedEnd::Whole {
             return (None, None);

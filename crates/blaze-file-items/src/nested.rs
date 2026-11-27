@@ -303,6 +303,125 @@ pub fn may_write_block(text: &str) -> bool {
     text.contains('!') || WORDS.into_iter().any(|word| text.contains(word))
 }
 
+/// Whether `text` contains any brace block `{ ... }` whose interior passes [`may_write_block`].
+/// Unlike calling [`may_write_block`] on an entire item (which always matches the item's own
+/// leading `struct`/`enum`/`union`/`type`/`trait`/`impl` keyword), this inspects only the text
+/// inside brace groups so ordinary headers without item- or macro-bearing const blocks return
+/// `false`.
+pub fn has_writing_block(text: &str) -> bool {
+    if !text.contains('{') {
+        return false;
+    }
+    let mut at = 0usize;
+    let mut depth = 0u32;
+    let mut start = 0usize;
+    for tok in tokenize(text, FrontmatterAllowed::No, Cpu::BASELINE) {
+        let Ok(len) = usize::try_from(tok.len) else {
+            return false;
+        };
+        match tok.kind {
+            TokenKind::OpenBrace => {
+                if depth == 0 {
+                    start = at + len;
+                }
+                depth = depth.saturating_add(1);
+            }
+            TokenKind::CloseBrace if depth > 0 => {
+                depth -= 1;
+                if depth == 0 && text.get(start..at).is_some_and(may_write_block) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        at += len;
+    }
+    depth > 0 && text.get(start..).is_some_and(may_write_block)
+}
+
+/// Byte offsets `(open, close)` of the first `{ ... }` group at depth 0 outside `(...)`,
+/// `[...]`, and `<...>` (ignoring `->` and `=>`), i.e. the container body of a `trait`,
+/// `struct`, `enum`, or `union`. `None` for tuple/unit structs, trait aliases, and bodyless items.
+fn outer_brace_span(text: &str) -> Option<(usize, usize)> {
+    if !text.contains('{') {
+        return None;
+    }
+    let mut at = 0usize;
+    let mut brace = 0u32;
+    let mut group = 0u32;
+    let mut angle = 0u32;
+    let mut prev_arrow = false;
+    let mut open: Option<usize> = None;
+    for tok in tokenize(text, FrontmatterAllowed::No, Cpu::BASELINE) {
+        let Ok(len) = usize::try_from(tok.len) else {
+            return None;
+        };
+        let kind = tok.kind;
+        if let Some(open_pos) = open {
+            match kind {
+                TokenKind::OpenBrace => brace = brace.saturating_add(1),
+                TokenKind::CloseBrace => {
+                    brace = brace.saturating_sub(1);
+                    if brace == 0 {
+                        return Some((open_pos, at));
+                    }
+                }
+                _ => {}
+            }
+            at += len;
+            continue;
+        }
+        match kind {
+            TokenKind::OpenParen | TokenKind::OpenBracket => group = group.saturating_add(1),
+            TokenKind::CloseParen | TokenKind::CloseBracket => group = group.saturating_sub(1),
+            TokenKind::OpenBrace => {
+                if brace == 0 && group == 0 && angle == 0 {
+                    open = Some(at);
+                    brace = 1;
+                } else {
+                    brace = brace.saturating_add(1);
+                }
+            }
+            TokenKind::CloseBrace => brace = brace.saturating_sub(1),
+            TokenKind::Lt if brace == 0 && group == 0 => angle = angle.saturating_add(1),
+            TokenKind::Gt if brace == 0 && group == 0 && !prev_arrow => angle = angle.saturating_sub(1),
+            _ => {}
+        }
+        if !matches!(kind, TokenKind::Whitespace | TokenKind::LineComment { .. } | TokenKind::BlockComment { .. }) {
+            prev_arrow = matches!(kind, TokenKind::Minus | TokenKind::Eq);
+        }
+        at += len;
+    }
+    None
+}
+
+/// The header of a `trait` item before its `{ ... }` associated-item body (generics, supertraits,
+/// and `where` clause), shared by `names_digest`, `blaze-scope`, and `front2` so const blocks in
+/// the trait header are scanned without treating the associated-item list as a code block.
+pub fn trait_head(text: &str) -> &str {
+    match outer_brace_span(text) {
+        Some((open, _)) => text.get(..open).unwrap_or(text).trim_end(),
+        None => text,
+    }
+}
+
+/// Whether a `struct`, `enum`, or `union` item contains a head-level const block whose interior
+/// passes [`may_write_block`] (in its generics/`where` clause, tuple fields, record field types
+/// or defaults, or enum discriminants), without counting the item's own `{ fields/variants }`
+/// braces or plain struct-variant braces.
+pub fn adt_has_writing_block(text: &str) -> bool {
+    if !text.contains('{') {
+        return false;
+    }
+    match outer_brace_span(text) {
+        Some((open, close)) => {
+            text.get(..open).is_some_and(has_writing_block)
+                || text.get(open + 1..close).is_some_and(has_writing_block)
+        }
+        None => has_writing_block(text),
+    }
+}
+
 /// Bare, unqualified standard-library expression macros that never expand to module-level
 /// items (only expressions/statements), sorted lexicographically for binary search.
 ///

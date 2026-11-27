@@ -991,3 +991,84 @@ fn body_free_fn_where_const_block_creates_block_module() {
         .unwrap_or_else(|e| panic!("`E` in `f`'s where-clause block module: {e}"));
     assert_eq!(e.def.kind, DefKind::Enum);
 }
+
+const ALL_ITEM_HEADS_CONST_BLOCKS: &str = r#"#![no_core]
+pub trait Tr<const N: usize> {}
+
+pub type AliasWithBlock = [u8; {
+    enum AliasEnum { A = 0 }
+    1
+}];
+
+pub struct TupleWithBlock([u8; {
+    enum TupleEnum { A = 0 }
+    1
+}]);
+
+pub struct RecordWithBlock {
+    pub x: [u8; {
+        enum RecordEnum { A = 0 }
+        1
+    }],
+}
+
+pub enum EnumWithBlock {
+    V = {
+        enum DiscEnum { A = 0 }
+        1
+    },
+}
+
+pub trait TraitWithBlock
+where
+    (): Tr<{
+        enum TraitHeadEnum { A = 0 }
+        1
+    }>,
+{
+    fn body_method() {
+        struct InMethodBody;
+    }
+}
+"#;
+
+static ALL_ITEM_HEADS_CONST_BLOCKS_TEXTS: Texts = Texts(&[&[("/user/lib.rs", ALL_ITEM_HEADS_CONST_BLOCKS)]]);
+
+/// Every item form (`type`, tuple/record `struct`, `enum`, `trait` header) with an item-declaring
+/// const block creates its `blaze-scope` block module cleanly, and `trait` scans only its header
+/// before `{ ... }` so assoc-item bodies are not treated as code blocks of the trait key.
+#[test]
+fn all_item_heads_with_const_blocks_create_block_modules() {
+    use blaze_surface::DefKind;
+    let alloc = Alloc::global();
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &ALL_ITEM_HEADS_CONST_BLOCKS_TEXTS);
+    let root = names.root(0);
+    let check = |item_name: &str, needle: &str, enum_name: &str, is_trait: bool| {
+        let item = names
+            .item_at(root, Namespace::Types, Written { kind: PathKind::Plain, segments: &[item_name] }, alloc)
+            .unwrap_or_else(|e| panic!("`{item_name}`: {e}"));
+        let at = ALL_ITEM_HEADS_CONST_BLOCKS.find(needle).unwrap_or_else(|| panic!("missing `{needle}`"));
+        let rest = &ALL_ITEM_HEADS_CONST_BLOCKS[at..];
+        let end = rest.find("\n\n").unwrap_or(rest.len());
+        let slice = &rest[..end];
+        let scan_text = if is_trait { blaze_file_items::nested::trait_head(slice) } else { slice };
+        let nested = blaze_file_items::nested::scan(scan_text, alloc);
+        let mods = crate::blocks::block_modules(names.krate(0).key, item.def.key, &nested, alloc);
+        let found = mods
+            .iter()
+            .copied()
+            .flatten()
+            .any(|m| {
+                names
+                    .item_at(m, Namespace::Types, Written { kind: PathKind::Plain, segments: &[enum_name] }, alloc)
+                    .is_ok_and(|res| res.def.kind == DefKind::Enum)
+            });
+        assert!(found, "`{enum_name}` must resolve in a block module of `{item_name}`");
+    };
+    check("AliasWithBlock", "pub type AliasWithBlock", "AliasEnum", false);
+    check("TupleWithBlock", "pub struct TupleWithBlock", "TupleEnum", false);
+    check("RecordWithBlock", "pub struct RecordWithBlock", "RecordEnum", false);
+    check("EnumWithBlock", "pub enum EnumWithBlock", "DiscEnum", false);
+    check("TraitWithBlock", "pub trait TraitWithBlock", "TraitHeadEnum", true);
+}

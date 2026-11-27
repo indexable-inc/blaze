@@ -195,22 +195,49 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
             // `Outline::surface()` stable; shadowed macro definitions are guarded in
             // `engine_names.rs` (`has_shadowed_expr_macro`).
             let sig = item.text(text, item.signature);
-            let head_blocks = sig.contains('{') && crate::nested::may_write_block(sig);
-            if body_holds_items || head_blocks {
+            if body_holds_items || crate::nested::has_writing_block(sig) {
                 whole |= crate::nested::digest_body_blocks(item.range.of(text), &mut |bytes| {
                     sink.part(bytes);
                 });
             }
         }
-        ItemDetail::Struct | ItemDetail::Variant { discriminant: _ } => {
+        ItemDetail::Struct => {
+            sink.part(&form(text, item));
+            let body = item.range.of(text);
+            if crate::nested::adt_has_writing_block(body) {
+                whole |= crate::nested::digest_body_blocks(body, &mut |bytes| {
+                    sink.part(bytes);
+                });
+            }
+        }
+        ItemDetail::Variant { discriminant: _ } => {
             sink.part(&form(text, item));
         }
-        ItemDetail::Enum
-        | ItemDetail::Union
-        | ItemDetail::Trait
-        | ItemDetail::TraitAlias
-        | ItemDetail::TypeAlias
-        | ItemDetail::Field { ty: _, default: _ } => {}
+        ItemDetail::Enum | ItemDetail::Union => {
+            let body = item.range.of(text);
+            if crate::nested::adt_has_writing_block(body) {
+                whole |= crate::nested::digest_body_blocks(body, &mut |bytes| {
+                    sink.part(bytes);
+                });
+            }
+        }
+        ItemDetail::Trait => {
+            let head = crate::nested::trait_head(item.range.of(text));
+            if crate::nested::has_writing_block(head) {
+                whole |= crate::nested::digest_body_blocks(head, &mut |bytes| {
+                    sink.part(bytes);
+                });
+            }
+        }
+        ItemDetail::TraitAlias | ItemDetail::TypeAlias => {
+            let body = item.range.of(text);
+            if crate::nested::has_writing_block(body) {
+                whole |= crate::nested::digest_body_blocks(body, &mut |bytes| {
+                    sink.part(bytes);
+                });
+            }
+        }
+        ItemDetail::Field { ty: _, default: _ } => {}
         ItemDetail::Impl => {
             // `Lower::impl_header`: the header, every byte of it, is read for the impl's trait,
             // self type and parameters.

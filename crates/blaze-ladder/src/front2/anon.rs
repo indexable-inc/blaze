@@ -124,21 +124,26 @@ pub(super) fn compose_edits(first: &[TextEdit], second: &[TextEdit], out: &mut A
     Some(())
 }
 
+/// Observable source position of a macro-bearing head anonymous constant (`line!()`, `column!()`,
+/// `file!()`, or a macro expanding to them), hashed into the anonymous constant key so inserting a
+/// blank line or moving a module between `#[path]` files invalidates cached values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadSite<'a> {
+    pub line: u32,
+    pub col: u32,
+    pub file: Option<&'a str>,
+}
+
 /// The enclosing library item whose scanned text (`blaze_scope::blocks`) owns the block modules
 /// of a head-level anonymous constant expression (`where (): Trait<{ pub enum Tag .. }>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadOwner {
     pub item: LibKey,
     /// Byte offset of the original unmodified expression inside `item`'s scanned text
-    /// (`impl_header` for an impl, whole text for a fn/const/static).
+    /// (`impl_header` for an impl, `trait_head` for a trait, whole text for other items/members).
     pub offset: u32,
     /// Byte length of the original unmodified expression inside `item`'s scanned text.
     pub len: u32,
-    /// 1-based `(line, col)` of the expression's start in the source file (or the outermost
-    /// macro invocation's `(line, col)` for a macro-written item) when the expression contains
-    /// a macro call (`!`) and may observe `line!()`/`column!()`: hashed into the anonymous
-    /// constant key so inserting a blank line above the enclosing item invalidates cached bits.
-    pub site_pos: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -393,16 +398,25 @@ impl Ask {
         Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty), body: None, head_owner: None, marked: None })
     }
 
-    pub(super) fn in_head_item(mut self, owner: HeadOwner, edits: AVec<'static, TextEdit>, alloc: Alloc<'static>) -> Self {
+    pub(super) fn in_head_item(mut self, owner: HeadOwner, site: Option<HeadSite<'_>>, edits: AVec<'static, TextEdit>, alloc: Alloc<'static>) -> Self {
         let mut hash = blaze_ids::Hasher::new("blaze-ladder head item anonymous constant 1");
         hash.part(self.member_name().as_bytes());
         hash.update(&owner.item.0.0);
         hash.update(&owner.offset.to_le_bytes());
-        match owner.site_pos {
-            Some((line, col)) => {
+        match site {
+            Some(s) => {
                 hash.update(&[1]);
-                hash.update(&line.to_le_bytes());
-                hash.update(&col.to_le_bytes());
+                hash.update(&s.line.to_le_bytes());
+                hash.update(&s.col.to_le_bytes());
+                match s.file {
+                    Some(f) => {
+                        hash.update(&[1]);
+                        hash.part(f.as_bytes());
+                    }
+                    None => {
+                        hash.update(&[0]);
+                    }
+                }
             }
             None => {
                 hash.update(&[0]);
@@ -484,14 +498,14 @@ pub fn self_value<H: super::types::Heads + ?Sized>(
     self_ty: tc::PTy,
     self_node: PNode,
     marks: Option<TextMarks<'_>>,
-    head_owner: Option<(HeadOwner, AVec<'static, TextEdit>)>,
+    head_owner: Option<(HeadOwner, Option<HeadSite<'_>>, AVec<'static, TextEdit>)>,
     r: blaze_surface::Range,
 ) -> Result<u128, Why> {
     let source = text.trim();
     let Some(mut ask) = ty.and_then(|ty| Ask::of_self(module, ty, source, self_ty, self_node)) else { return Err(Why::ConstPath(Box::from(source), r)) };
     if let Some(alloc) = heads.mark_alloc() {
-        if let Some((owner, edits)) = head_owner {
-            ask = ask.in_head_item(owner, edits, alloc);
+        if let Some((owner, site, edits)) = head_owner {
+            ask = ask.in_head_item(owner, site, edits, alloc);
         }
         if let Some(marks) = marks {
             match head_marks(marks, source, None, alloc, r)? {
@@ -741,19 +755,21 @@ mod tests {
         let base = Ask::of(module, PNode::Uint(tc::UintTy::Usize), expr).expect("usize anon const");
         let item_a = LibKey(ContentId([2; 32]));
         let item_b = LibKey(ContentId([3; 32]));
-        let owner = |item, offset, site_pos| HeadOwner { item, offset, len: expr.len() as u32, site_pos };
+        let owner = |item, offset| HeadOwner { item, offset, len: expr.len() as u32 };
         let empty = || blaze_own::AVec::new_in(alloc);
-        let a_at_10 = base.clone().in_head_item(owner(item_a, 10, None), empty(), alloc);
-        let a_at_10_again = base.clone().in_head_item(owner(item_a, 10, None), empty(), alloc);
-        let a_at_20 = base.clone().in_head_item(owner(item_a, 20, None), empty(), alloc);
-        let b_at_10 = base.clone().in_head_item(owner(item_b, 10, None), empty(), alloc);
-        let a_line_3 = base.clone().in_head_item(owner(item_a, 10, Some((3, 5))), empty(), alloc);
-        let a_line_4 = base.clone().in_head_item(owner(item_a, 10, Some((4, 5))), empty(), alloc);
+        let a_at_10 = base.clone().in_head_item(owner(item_a, 10), None, empty(), alloc);
+        let a_at_10_again = base.clone().in_head_item(owner(item_a, 10), None, empty(), alloc);
+        let a_at_20 = base.clone().in_head_item(owner(item_a, 20), None, empty(), alloc);
+        let b_at_10 = base.clone().in_head_item(owner(item_b, 10), None, empty(), alloc);
+        let a_line_3 = base.clone().in_head_item(owner(item_a, 10), Some(HeadSite { line: 3, col: 5, file: Some("src/a.rs") }), empty(), alloc);
+        let a_line_4 = base.clone().in_head_item(owner(item_a, 10), Some(HeadSite { line: 4, col: 5, file: Some("src/a.rs") }), empty(), alloc);
+        let a_file_b = base.clone().in_head_item(owner(item_a, 10), Some(HeadSite { line: 3, col: 5, file: Some("src/b.rs") }), empty(), alloc);
         assert_eq!(a_at_10.need, a_at_10_again.need, "identical head owner and offset share one key");
         assert_ne!(a_at_10.need, base.need, "head-owned anon const differs from unowned");
         assert_ne!(a_at_10.need, a_at_20.need, "different offsets in the same item get distinct keys");
         assert_ne!(a_at_10.need, b_at_10.need, "different enclosing items get distinct keys");
         assert_ne!(a_line_3.need, a_line_4.need, "shifting an enclosing item's line invalidates the cached key");
+        assert_ne!(a_line_3.need, a_file_b.need, "changing the enclosing item's shown file invalidates the cached key");
         assert_ne!(a_line_3.need, a_at_10.need, "positioned key differs from unpositioned key");
         // Marks compose with head owner without dropping owner identity.
         let mark = TextMark {
