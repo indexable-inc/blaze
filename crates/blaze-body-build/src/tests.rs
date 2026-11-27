@@ -1168,6 +1168,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         closure_env: PTy,
         panic: Panic,
         tracked_drop: bool,
+        has_drop_in_place: bool,
     }
 
     impl LayoutFacts for ShimWorld {
@@ -1204,7 +1205,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
         fn lang_fn(&self, name: &str) -> Option<ItemKey> {
             match name {
-                "drop_in_place" => Some(DROP_IN_PLACE),
+                "drop_in_place" => self.has_drop_in_place.then_some(DROP_IN_PLACE),
                 "panic_cannot_unwind" => Some(PANIC_CANT_UNWIND),
                 _ => None,
             }
@@ -1266,6 +1267,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         closure_env,
         panic: Panic::Unwind,
         tracked_drop: false,
+        has_drop_in_place: true,
     };
 
     // 1. `build_drop_glue`: struct with two droppable fields (unwind ladder), enum, slice, and plain ZST/Copy.
@@ -1286,13 +1288,23 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
 
         w_unwind.tracked_drop = true;
         let b_tracked_drop = build_drop_glue(&mut Subst { args: &[g_drop], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
-        w_unwind.tracked_drop = false;
         assert!(b_tracked_drop.refs.iter().any(|r| r.item == DROP_IMPL_FN), "tracked ADT_DROP glue must call Drop::drop");
         let lir_tracked_drop = printed(&b_tracked_drop);
         assert!(
             !b_tracked_drop.func.view().datas.is_empty() && lir_tracked_drop.contains("(ptr, ptr)"),
             "tracked Drop::drop glue must materialize Location and pass (ptr, ptr):\n{lir_tracked_drop}"
         );
+
+        w_unwind.has_drop_in_place = false;
+        let Err(missing_dip_err) = build_drop_glue(&mut Subst { args: &[g_drop], ground: &mut g, scratch: heap() }, &w_unwind, heap()) else {
+            panic!("tracked Drop::drop glue without `drop_in_place` lang fn must fail instead of falling back");
+        };
+        assert!(
+            format!("{missing_dip_err}").contains("drop_in_place"),
+            "missing drop_in_place error should name `drop_in_place`: {missing_dip_err}"
+        );
+        w_unwind.has_drop_in_place = true;
+        w_unwind.tracked_drop = false;
 
         let b_wrap = build_drop_glue(&mut Subst { args: &[g_wrap], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
         let lir_wrap = printed(&b_wrap);

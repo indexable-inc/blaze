@@ -512,6 +512,11 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
         if self.adts.track_caller(callee, self.subst.ground).map_err(|e| BuildError::Facts { stmt: None, error: e })? != Some(true) {
             return Ok(None);
         }
+        self.def_site_location(site_item).map(Some)
+    }
+
+    /// Materializes a `&'static Location<'static>` for `site_item`'s definition site.
+    fn def_site_location(&mut self, site_item: ItemKey) -> Result<Value, BuildError> {
         let loc_adt = self.adts.location_adt().ok_or(self.malformed("`#[track_caller]` shim without `panic_location` lang item"))?;
         let loc_ty = self.subst.ground.intern(PNode::Adt(loc_adt, List::EMPTY)).map_err(|_| self.malformed("the ground table is full"))?;
         let ret = self.subst.ground.intern(PNode::Ref(Mutbl::Not, loc_ty)).map_err(|_| self.malformed("the ground table is full"))?;
@@ -533,7 +538,7 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
         }
         .map_err(|_| self.malformed("failed to materialize `Location` in shim"))?;
         match out {
-            Out::Scalar(v) => Ok(Some(v)),
+            Out::Scalar(v) => Ok(v),
             _ => Err(self.malformed("a `Location` row whose address is not one pointer")),
         }
     }
@@ -938,8 +943,20 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
     fn emit_one_step(&mut self, step: DropStep, unwinding: bool) -> Result<Option<blaze_lir::Block>, BuildError> {
         match step {
             DropStep::DropImpl { instance, p, meta, may_unwind } => {
-                let site_item = self.adts.lang_fn("drop_in_place").unwrap_or(instance.item);
-                let loc = self.def_site_caller_arg(instance, site_item)?;
+                let loc = if self
+                    .adts
+                    .track_caller(instance, self.subst.ground)
+                    .map_err(|e| BuildError::Facts { stmt: None, error: e })?
+                    == Some(true)
+                {
+                    let site_item = self
+                        .adts
+                        .lang_fn("drop_in_place")
+                        .ok_or(self.malformed("program declares no `drop_in_place` lang fn for `#[track_caller]` `Drop::drop` caller site"))?;
+                    Some(self.def_site_location(site_item)?)
+                } else {
+                    None
+                };
                 let r = self.func_ref(instance);
                 match (meta, loc) {
                     (None, None) => {
