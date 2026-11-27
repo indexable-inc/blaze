@@ -185,7 +185,7 @@ pub fn layout_inline_markdown(
     }
 
     enum Atom {
-        Word { text: String, face: TextFace, color: [f32; 4], bold: bool, italic: bool, underline: bool, copy: Option<String> },
+        Word { text: String, color: [f32; 4], bold: bool, italic: bool, underline: bool, copy: Option<String> },
         CodeChip { text: String, is_path: bool },
         Space,
     }
@@ -221,7 +221,6 @@ pub fn layout_inline_markdown(
                 if !cur.is_empty() {
                     out.push(Atom::Word {
                         text: std::mem::take(&mut cur),
-                        face: TextFace::Ui,
                         color,
                         bold,
                         italic,
@@ -239,7 +238,6 @@ pub fn layout_inline_markdown(
         if !cur.is_empty() {
             out.push(Atom::Word {
                 text: cur,
-                face: TextFace::Ui,
                 color,
                 bold,
                 italic,
@@ -250,7 +248,7 @@ pub fn layout_inline_markdown(
     }
 
     let line_h = m.ch + 4.0;
-    let space_w = m.measure(" ", TextFace::Ui).max(4.0);
+    let space_w = m.cw;
     let chip_pad_x = 4.5f32;
 
     let mut line_idx = 0usize;
@@ -321,14 +319,14 @@ pub fn layout_inline_markdown(
                 cur_x += chip_w;
                 at_line_start = false;
             }
-            Atom::Word { text, face, color, bold, italic, underline, copy } => {
+            Atom::Word { text, color, bold, italic, underline, copy } => {
                 // Keep short trailing punctuation (`:`, `,`, `;`, `)`, `.`) attached to the
                 // preceding code chip without awkwardly stranding it at the start of a new line!
                 let is_attached_punct = text.len() <= 2
                     && text
                         .chars()
                         .all(|c| matches!(c, ':' | ',' | ';' | '.' | ')' | ']' | '!' | '?'));
-                let w = m.measure_styled(&text, face, bold);
+                let w = text.chars().count() as f32 * m.cw;
                 if !at_line_start && !is_attached_punct && cur_x + w > line_limit(line_idx) {
                     line_idx += 1;
                     cur_y += line_h;
@@ -339,24 +337,16 @@ pub fn layout_inline_markdown(
                 if w > max_line_w && w > (max_w - 8.0).max(40.0) {
                     let mut rest = text.as_str();
                     while !rest.is_empty() {
-                        let avail = (line_limit(line_idx) - cur_x).max(40.0);
-                        let mut take_b = 0usize;
-                        let mut acc_w = 0.0f32;
-                        for (bi, ch) in rest.char_indices() {
-                            let mut buf = [0u8; 4];
-                            let cw = m.measure_styled(ch.encode_utf8(&mut buf), face, bold);
-                            if take_b > 0 && acc_w + cw > avail {
-                                break;
-                            }
-                            acc_w += cw;
-                            take_b = bi + ch.len_utf8();
-                        }
-                        if take_b == 0 {
-                            take_b = rest.chars().next().map_or(0, char::len_utf8);
-                        }
+                        let avail_cols = ((line_limit(line_idx) - cur_x).max(40.0) / m.cw)
+                            .floor()
+                            .max(1.0) as usize;
+                        let take_b = rest
+                            .char_indices()
+                            .nth(avail_cols)
+                            .map_or(rest.len(), |(bi, _)| bi);
                         let chunk = &rest[..take_b];
-                        let cw = m.measure_styled(chunk, face, bold);
-                        scene.ui_text(cur_x, cur_y, chunk, color, bold, italic, clip_id);
+                        let cw = chunk.chars().count() as f32 * m.cw;
+                        scene.text(cur_x, cur_y, chunk, color, bold, italic, clip_id);
                         cur_x += cw;
                         rest = &rest[take_b..];
                         if !rest.is_empty() {
@@ -366,7 +356,7 @@ pub fn layout_inline_markdown(
                         }
                     }
                 } else {
-                    scene.ui_text(cur_x, cur_y, &text, color, bold, italic, clip_id);
+                    scene.text(cur_x, cur_y, &text, color, bold, italic, clip_id);
                     if underline {
                         scene.over_round_rect(
                             cur_x,
@@ -407,6 +397,8 @@ pub enum DiagSeverity {
     Warning,
     Note,
     Help,
+    /// Unstructured informational stderr on a zero-exit command (e.g. `git pull` ref updates).
+    Info,
 }
 
 impl DiagSeverity {
@@ -436,6 +428,12 @@ impl DiagSeverity {
                 theme::OK,
                 theme::rgba(0x4c, 0xc3, 0x8a, 0.16),
                 theme::OK,
+            ),
+            DiagSeverity::Info => (
+                theme::rgba(0x9a, 0xa0, 0xaa, 0.05),
+                theme::INK_4,
+                theme::rgba(0x9a, 0xa0, 0xaa, 0.14),
+                theme::INK_2,
             ),
         }
     }
@@ -619,10 +617,18 @@ pub fn layout_stderr_diagnostic_group(
     }
     enum CardEntry<'a> {
         Prose(&'a str),
+        /// Verbatim monospace line preserving indentation and column alignment (e.g. `git pull` ref table).
+        Verbatim(&'a str),
         SubNote { severity: DiagSeverity, badge: &'a str, body: &'a str },
         Location(&'a str),
         CodeFrame(&'a str),
     }
+
+    let has_inline_md = |s: &str| {
+        parse_inline_markdown(s)
+            .iter()
+            .any(|sp| !matches!(sp, MdInline::Text(_)))
+    };
 
     let mut cards: Vec<Card<'_>> = Vec::new();
     for &(_, raw) in lines {
@@ -671,13 +677,19 @@ pub fn layout_stderr_diagnostic_group(
                 }
             }
             ClassifiedLine::Plain(txt) => {
+                let is_structured_card = cards.last().is_some_and(|c| c.badge.is_some());
+                let entry = if is_structured_card || has_inline_md(txt) {
+                    CardEntry::Prose(txt)
+                } else {
+                    CardEntry::Verbatim(txt)
+                };
                 if let Some(last) = cards.last_mut() {
-                    last.entries.push(CardEntry::Prose(txt));
+                    last.entries.push(entry);
                 } else {
                     cards.push(Card {
-                        severity: if exit_code != 0 { DiagSeverity::Error } else { DiagSeverity::Warning },
+                        severity: if exit_code != 0 { DiagSeverity::Error } else { DiagSeverity::Info },
                         badge: None,
-                        entries: vec![CardEntry::Prose(txt)],
+                        entries: vec![entry],
                     });
                 }
             }
@@ -730,12 +742,21 @@ pub fn layout_stderr_diagnostic_group(
             DiagSeverity::Warning => theme::rgb(0xef, 0xd8, 0xb0),
             DiagSeverity::Note => theme::INK_2,
             DiagSeverity::Help => theme::rgb(0xc6, 0xe6, 0xd4),
+            DiagSeverity::Info => theme::INK_2,
         };
 
         for (ei, entry) in card.entries.iter().enumerate() {
             let indent = if ei == 0 { badge_indent } else { 0.0 };
             let reserve = if ei == 0 { right_reserve } else { 0.0 };
             match *entry {
+                CardEntry::Verbatim(raw) => {
+                    let avail_w = (inner_w - reserve).max(80.0);
+                    let max_cols = (avail_w / m.cw).floor().max(16.0) as usize;
+                    for seg in crate::view::wrap_lines(raw, max_cols) {
+                        scene.text(inner_x, cur_y, seg, body_color, false, false, clip_id);
+                        cur_y += m.ch + 2.0;
+                    }
+                }
                 CardEntry::Prose(txt) => {
                     let (main_txt, src_tag) = split_trailing_source_tag(txt);
                     let h = layout_inline_markdown(
@@ -953,5 +974,38 @@ mod tests {
         assert!(copy_hits.contains(&"mod"));
         assert!(copy_hits.contains(&"#[cfg]"));
         assert!(copy_hits.contains(&"engine_body_plan.rs"));
+        // All diagnostic body text should render in monospace.
+        assert!(
+            scene
+                .text_runs
+                .iter()
+                .filter(|r| r.text == "ripgrep" || r.text == "unit")
+                .all(|r| r.face == TextFace::Mono)
+        );
+    }
+
+    #[test]
+    fn plain_cli_stderr_preserves_monospace_column_alignment() {
+        let mut scene = Scene::new();
+        let line = " - [deleted]         (none)     -> origin/feat/branch-hover-commit-graph";
+        let lines = [(1i64, "From https://github.com/indexable-inc/blaze"), (2i64, line)];
+        let h = layout_stderr_diagnostic_group(
+            &mut scene,
+            &lines,
+            0,
+            16.0,
+            20.0,
+            900.0,
+            0.0,
+            CellMetrics::default(),
+            0,
+        );
+        assert!(h > 20.0);
+        assert!(
+            scene
+                .text_runs
+                .iter()
+                .any(|r| r.face == TextFace::Mono && r.text == line)
+        );
     }
 }
