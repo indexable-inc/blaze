@@ -140,7 +140,7 @@ fn verdicts() -> Vec<(&'static str, Option<usize>)> {
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let mut crates: Vec<CrateInput<'_>> = inputs.crates();
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(i as u32));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), proc_macro: at("proc_macro"), bstd: at("bstd") };
     assert!(sysroot.core.is_some(), "the toolchain at {shelf} has a `core` unit");
     let first = crates.len();
     let user_deps: &'static [(&'static str, usize)] = Box::leak(vec![("t", first), ("t24", first + 1)].into_boxed_slice());

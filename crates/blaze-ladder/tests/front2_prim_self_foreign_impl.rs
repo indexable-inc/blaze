@@ -159,7 +159,7 @@ fn a() -> Alloc<'static> {
 }
 
 fn sysroot() -> Sysroot {
-    Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None }
+    Sysroot { core: Some(CrateId(CORE_AT as u32)), ..Sysroot::default() }
 }
 
 fn input(name: &'static str, root: &'static str, deps: &'static [(&'static str, usize)]) -> CrateInput<'static> {

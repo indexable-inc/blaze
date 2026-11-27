@@ -145,7 +145,7 @@ fn written_types_across_crates() {
     let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
     let mut crates: Vec<CrateInput<'_>> = inputs.crates();
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(i as u32));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), proc_macro: at("proc_macro"), bstd: at("bstd") };
     assert!(sysroot.core.is_some() && sysroot.bstd.is_some(), "the toolchain at {shelf} has `core` and `bstd` units");
     let dep = crates.len();
     let user_deps: &'static [(&'static str, usize)] = Box::leak(vec![("tails", dep)].into_boxed_slice());

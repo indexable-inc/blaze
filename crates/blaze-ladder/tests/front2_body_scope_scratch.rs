@@ -135,7 +135,7 @@ fn up_with(modules: usize, file_mods: usize) -> Up {
     let inputs: &'static Inputs<'static> = Box::leak(Box::new(Inputs::new(up, tc).unwrap_or_else(|e| panic!("the crates: {e}"))));
     let crates: &'static [CrateInput<'static>] = Vec::leak(inputs.crates());
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), proc_macro: at("proc_macro"), bstd: at("bstd") };
     let (_, bump) = home();
     let bodies = Bodies::new();
     let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, &inputs.texts, &bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));

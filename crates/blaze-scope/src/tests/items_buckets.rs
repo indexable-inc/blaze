@@ -270,7 +270,7 @@ fn a_builtin_self_outside_core_is_filed_at_the_builtin() {
     let bump = super::SyncFrame::leaked();
     let g = bump.alloc();
     let inputs = [prim_input("core", "/core/lib.rs", &[]), prim_input("dep", "/dep/lib.rs", &[]), prim_input("user", "/user/lib.rs", PRIM_DEPS)];
-    let sys = Sysroot { core: Some(CrateId(0)), alloc: None, std: None, bstd: None };
+    let sys = Sysroot { core: Some(CrateId(0)), ..Sysroot::default() };
     let (solved, _) = resolve_by_records(&inputs, sys, &PRIM_TEXTS, &Serial, &Ready::serial(WAIT), bump).unwrap_or_else(|e| panic!("solve: {e:?}"));
     let a = encode(solved[2].names, g).unwrap_or_else(|e| panic!("encode: {e:?}"));
     let bytes: &'static [u8] = aligned(&a, bump);

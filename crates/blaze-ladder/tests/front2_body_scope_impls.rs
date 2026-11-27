@@ -108,7 +108,7 @@ fn the_impl_table_is_the_same_under_both_strategies() {
     let inputs: &'static Inputs<'static> = Box::leak(Box::new(Inputs::new(user, tc).unwrap_or_else(|e| panic!("the crates: {e}"))));
     let crates: &'static [CrateInput<'static>] = Vec::leak(inputs.crates());
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), proc_macro: at("proc_macro"), bstd: at("bstd") };
     let texts = &inputs.texts;
     let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
     let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));
@@ -298,7 +298,7 @@ fn both_strategies(text: &'static str) -> (&'static [CrateInput<'static>], &'sta
     let inputs: &'static Inputs<'static> = Box::leak(Box::new(Inputs::new(user, tc).unwrap_or_else(|e| panic!("the crates: {e}"))));
     let crates: &'static [CrateInput<'static>] = Vec::leak(inputs.crates());
     let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
-    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), proc_macro: at("proc_macro"), bstd: at("bstd") };
     let texts = &inputs.texts;
     let modules: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates under Modules: {e}"))));
     let bodies: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, texts, &Bodies, bump).unwrap_or_else(|e| panic!("resolve_crates under Bodies: {e}"))));

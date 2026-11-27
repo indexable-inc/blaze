@@ -647,7 +647,7 @@ fn plan_of(set: &str, hello_dir: &std::path::Path, target: &Target) -> Plan {
         notes.push(format!("left out: {name} ({why})"));
     }
     let id = |p: Option<usize>| p.map(|p| CrateId(u32::try_from(index[&p]).expect("a set's crates are counted in u32")));
-    let sysroot = Sysroot { core: id(Some(core)), alloc: id(alloc), std: id(std), bstd: id(bstd) };
+    let sysroot = Sysroot { core: id(Some(core)), alloc: id(alloc), std: id(std), proc_macro: None, bstd: id(bstd) };
     Plan { packages, sysroot, notes }
 }
 

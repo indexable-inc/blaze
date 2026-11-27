@@ -89,7 +89,7 @@ pub(crate) fn closure<'s>(list: &CrateList<'_>, root: usize, handed: &[[u8; 32]]
         }
         seen[r] = true;
         stack.push((r, true));
-        let sysroot = if list.toolchain(r) { [None; 4] } else { list.sysroot() };
+        let sysroot = if list.toolchain(r) { [None; 5] } else { list.sysroot() };
         let reached = sysroot.into_iter().flatten().filter(|s| handed.binary_search(&list.key(*s).0.0).is_ok());
         for d in list.deps(r).chain(reached) {
             if !seen[d] && linked(list, d) {

@@ -8089,7 +8089,7 @@ pub fn use_named<'a>(a: NamedActor<'a>) -> &'a str { a.name }
             cfg: &[],
             script: None,
         }];
-        let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+        let sysroot = Sysroot::default();
         let solved = resolve_crates(&crates, sysroot, &SrcText(SRC), &Serial, bump).expect("resolve_crates");
         let names = &solved;
         let find = |wanted: &str| -> LibKey {

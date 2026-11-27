@@ -305,7 +305,7 @@ fn kept(dep: &'static str) -> &'static Kept {
         input("dep2", "/dep2/lib.rs", &[("core", CORE_AT), ("dep", DEP_AT)]),
         input("core", "/core/lib.rs", &[]),
     ];
-    let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
+    let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), ..Sysroot::default() };
     let g = a();
     let bump = blaze_own::testing::bump();
     let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(&crates, sysroot, &Texts { dep }, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));

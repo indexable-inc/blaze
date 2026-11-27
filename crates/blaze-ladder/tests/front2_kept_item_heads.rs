@@ -182,7 +182,7 @@ fn names() -> &'static Names<'static> {
         input("dep", "/dep/lib.rs", &[("core", CORE_AT), ("macros", MACROS_AT)], false),
         input("macros", "/macros/lib.rs", &[], true),
     ];
-    let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
+    let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), ..Sysroot::default() };
     let names = resolve_crates(&crates, sysroot, &Texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     Box::leak(Box::new(names))
 }
