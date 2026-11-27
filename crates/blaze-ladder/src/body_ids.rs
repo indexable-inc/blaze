@@ -930,7 +930,7 @@ impl<'a> Walk<'a> {
     /// extra callee discovered during export LTO) so [`local_enclosers_of`] can still trace the
     /// declarer chain for body-local functions.
     pub fn root_from<E>(&mut self, declarer: usize, entry: (ItemKey, &[u8]), most: usize) -> Result<usize, WalkError<E>> {
-        let by = u32::try_from(declarer).ok().filter(|&d| (d as usize) < self.symbols.len()).unwrap_or(NO_ROW);
+        let by = (declarer < self.symbols.len()).then(|| u32::try_from(declarer).ok()).flatten().unwrap_or(NO_ROW);
         self.reach(entry.0, entry.1, RowKind::Instance, most, by)
     }
 
@@ -1689,13 +1689,20 @@ mod tests {
             let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
             name_of(MAIN, None, &mut entry);
             walk.run((ItemKey(MAIN), &entry), ids, store, &builder(), &producer, &mut model, &Toy, 64).expect("the statics model walks");
-            let kinds: std::vec::Vec<(RowKind, Symbol)> = (0..walk.len()).map(|r| (walk.kind(r), walk.symbol(r))).collect();
-            (walk.counts(), model.fns, model.statics.iter().map(|k| k.0).collect::<std::vec::Vec<_>>(), kinds)
+            let mut kinds = Vec::new_in(alloc);
+            for r in 0..walk.len() {
+                kinds.push((walk.kind(r), walk.symbol(r)));
+            }
+            let mut statics = Vec::new_in(alloc);
+            for k in model.statics.iter() {
+                statics.push(k.0);
+            }
+            (walk.counts(), model.fns, statics, kinds)
         };
         let mut ids = StaticIds { text: [(MAIN, 0), (S, 0), (T, 0)] };
         let (first, fns, statics, kinds) = run(&ids, &mut store);
         assert_eq!((first.reached, first.made, fns), (3, 3, 1), "{first:?}");
-        assert_eq!(statics, [S, T], "each static made once, in the walk's order");
+        assert_eq!(statics.as_slice(), [S, T], "each static made once, in the walk's order");
         assert_eq!(kinds[1], (RowKind::Static, static_symbol(ItemKey(S))), "S's row is a static's, by its symbol");
         assert_eq!(kinds[2], (RowKind::Static, static_symbol(ItemKey(T))));
         assert_ne!(kinds[1].1, fn_symbol_of_name(&static_name(ItemKey(S))), "a static's symbol is not its row name's fn symbol");
@@ -1704,11 +1711,11 @@ mod tests {
         ids.text[1].1 = 1;
         let (edited, fns, statics, _) = run(&ids, &mut store);
         assert_eq!((edited.found, edited.made, fns), (2, 1, 0), "{edited:?}");
-        assert_eq!(statics, [S], "S's initializer edited: S's datum alone is made");
+        assert_eq!(statics.as_slice(), [S], "S's initializer edited: S's datum alone is made");
         ids.text[0].1 = 1;
         let (control, fns, statics, _) = run(&ids, &mut store);
         assert_eq!((control.found, control.made, fns, statics.len()), (2, 1, 1, 0), "main edited: main alone");
-        std::println!("d106 statics: first made 1+2; second found 3; S edited made S; main edited made main");
+        println!("d106 statics: first made 1+2; second found 3; S edited made S; main edited made main");
     }
 
     /// The crate of a model item: `app`'s keys start 0xA0, `lib`'s 0xB0.
@@ -1819,7 +1826,7 @@ mod tests {
         let mut dropped = Ids::new([0, 0]);
         dropped.recorded = false;
         let (control, control_calls) = run_once(&dropped, &mut store, alloc);
-        std::println!(
+        println!(
             "d106 twice: first found {} made {} calls {}; second found {} made {} calls {}; control found {} unkeyed {} calls {}",
             first.found,
             first.made,
@@ -1857,7 +1864,7 @@ mod tests {
         let mut moved = Ids::new([0, 1]);
         moved.text[4].1 = 1;
         let (head, head_calls) = run_once(&moved, &mut store, alloc);
-        std::println!("d106 edit: body edit found {} made {} calls {}; head edit found {} made {} calls {}", body.found, body.made, body_calls, head.found, head.made, head_calls);
+        println!("d106 edit: body edit found {} made {} calls {}; head edit found {} made {} calls {}", body.found, body.made, body_calls, head.found, head.made, head_calls);
         assert_eq!((body.found, body.made, body_calls), (4, 1, 1));
         assert_eq!((head.found, head.made, head_calls), (1, 4, 4));
     }
@@ -1879,7 +1886,7 @@ mod tests {
         let mut ids = Ids::new([0, 1]);
         ids.reads[3] = old.reads[3];
         let (counts, calls) = run_once(&ids, &mut store, alloc);
-        std::println!("d106 stale: found {} made {} stale {} puts +{}", counts.found, counts.made, counts.stale, store.puts - before);
+        println!("d106 stale: found {} made {} stale {} puts +{}", counts.found, counts.made, counts.stale, store.puts - before);
         assert_eq!((counts.found, counts.made, counts.stale, calls), (1, 3, 1, 4));
         assert_eq!(store.puts - before, 3);
     }
@@ -2000,7 +2007,7 @@ mod tests {
         let (ran, rows) = walk_to(None, 129);
         assert!(ran.is_ok(), "control: a recursion that ends at depth 128 walks whole: {ran:?}");
         assert_eq!(rows, 129);
-        std::println!("names: r::<(T,)> recursion refused at depth 129 of limit 128, 201 of 200; ends at 128 whole");
+        println!("names: r::<(T,)> recursion refused at depth 129 of limit 128, 201 of 200; ends at 128 whole");
     }
 
     fn model_producer() -> ProducerId<CodeBuilder> {

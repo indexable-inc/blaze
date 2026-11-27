@@ -344,7 +344,7 @@ mod with_sandbox {
                 continue;
             }
             let unit = &graph.units[unit.0 as usize];
-            let identity = identify(side.lock.lock, &locked, &folders, graph, unit, |id| Ok(side.place.member_files(id))).map_err(|e| MakeError::Store(e.to_string()))?;
+            let identity = identify(side.lock.lock, &locked, &folders, graph, unit, |id| Ok(side.place.member_files(id)), side.heap.alloc()).map_err(|e| MakeError::Store(e.to_string()))?;
             // No identity: the `MacroModule` task's failure names the crate; it gets no key.
             let Ok(identity) = identity else { continue };
             let identity = match names.wasm_graph() {

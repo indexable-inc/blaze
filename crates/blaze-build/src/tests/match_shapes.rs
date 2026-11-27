@@ -355,35 +355,41 @@ fn slice_and_ref_constant_patterns_compare_pointees() {
     let ref_u32 = PNode::Ref(Mutbl::Not, u32_ty);
 
     let make_slice_rec = |data: &[u8], len: u64, align: u8| -> DataRecord<Global> {
-        let mut root_bytes = std::vec::Vec::new();
+        let mut root_bytes = Vec::new_in(Global);
         root_bytes.extend_from_slice(&0u64.to_le_bytes());
         root_bytes.extend_from_slice(&len.to_le_bytes());
-        let mut relocs = std::vec::Vec::new();
-        let mut allocs = std::vec::Vec::new();
+        let mut relocs = Vec::new_in(Global);
+        let mut allocs = Vec::new_in(Global);
         if len > 0 {
             relocs.push(DataReloc { offset: 0, target: DataTarget::Local(1) });
             allocs.push(DataAlloc { bytes: root_bytes, align: 3, mutable: false, relocs });
-            let mut elem_bytes = std::vec::Vec::new();
+            let mut elem_bytes = Vec::new_in(Global);
             elem_bytes.extend_from_slice(data);
-            allocs.push(DataAlloc { bytes: elem_bytes, align, mutable: false, relocs: std::vec::Vec::new() });
+            allocs.push(DataAlloc { bytes: elem_bytes, align, mutable: false, relocs: Vec::new_in(Global) });
         } else {
             allocs.push(DataAlloc { bytes: root_bytes, align: 3, mutable: false, relocs });
         }
         DataRecord { allocs }
     };
     let make_ref_rec = |data: &[u8], align: u8| -> DataRecord<Global> {
-        let mut root_bytes = std::vec::Vec::new();
+        let mut root_bytes = Vec::new_in(Global);
         root_bytes.extend_from_slice(&0u64.to_le_bytes());
-        let mut relocs = std::vec::Vec::new();
+        let mut relocs = Vec::new_in(Global);
         relocs.push(DataReloc { offset: 0, target: DataTarget::Local(1) });
-        let mut elem_bytes = std::vec::Vec::new();
+        let mut elem_bytes = Vec::new_in(Global);
         elem_bytes.extend_from_slice(data);
-        let mut allocs = std::vec::Vec::new();
+        let mut allocs = Vec::new_in(Global);
         allocs.push(DataAlloc { bytes: root_bytes, align: 3, mutable: false, relocs });
-        allocs.push(DataAlloc { bytes: elem_bytes, align, mutable: false, relocs: std::vec::Vec::new() });
+        allocs.push(DataAlloc { bytes: elem_bytes, align, mutable: false, relocs: Vec::new_in(Global) });
         DataRecord { allocs }
     };
-    let usizes = |xs: &[u64]| -> std::vec::Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    let usizes = |xs: &[u64]| -> Vec<u8, Global> {
+        let mut out = Vec::with_capacity_in(xs.len() * 8, Global);
+        for x in xs {
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out
+    };
     w.func(200, "CLIENT_AUTH", &[], ref_slice_usize);
     w.consts.push((ItemKey(200), Some(make_slice_rec(&usizes(&[1, 3, 6, 1]), 4, 3))));
     w.func(201, "SERVER_AUTH", &[], ref_slice_usize);

@@ -502,7 +502,8 @@ mod tests {
         let clock = Monotonic::new();
         let soon = || Deadline::after(clock.now(), Duration::from_millis(50));
         let (mut parent, child) = pair().expect("a pair");
-        let mut inbox = blaze_own::Vec::new_in(std::alloc::Global);
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut inbox = blaze_own::Vec::new_in(alloc);
         raw_write(&child, b"\0\0\0\x03a");
         assert_eq!(parent.recv_message(&mut inbox, 16, soon(), &clock).expect("a wait"), Message::Deadline);
         assert_eq!(&inbox[..], b"\0\0\0\x03a", "the half stays for the next call");
@@ -521,7 +522,7 @@ mod tests {
         let (mut parent, child) = pair().expect("a pair");
         raw_write(&child, b"\0\0\0\x40");
         assert_eq!(
-            parent.recv_message(&mut blaze_own::Vec::new_in(std::alloc::Global), 16, soon(), &clock),
+            parent.recv_message(&mut blaze_own::Vec::new_in(alloc), 16, soon(), &clock),
             Err(ChannelError::TooLong { len: 64, most: 16 })
         );
         println!("channel: split frame joined, deadline kept the half, torn named, hangup named");

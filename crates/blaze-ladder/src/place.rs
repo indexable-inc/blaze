@@ -554,16 +554,16 @@ fn write_statics(
     // this image, never freed, and no Rust reference to it is alive (the placed code has not
     // run: the commit comes after this); `fill` writes exactly `image.bytes.len()` of them.
     let out = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, image.bytes.len()) };
-    let mut missing: Option<Box<str, Global>> = None;
+    let mut missing: Option<&str> = None;
     let fn_at = |key: InstanceKey| {
         let at = fns.binary_search_by_key(&key, |f| f.0).ok()?;
-        match &fns[at].1 {
+        match &fns.get(at)?.1 {
             StaticFnPlace::Slot(slot) => place.thunk(Slot(*slot)),
             StaticFnPlace::Symbol(name) => match symbol(name) {
                 Some(addr) => Some(addr),
                 None => {
                     if missing.is_none() {
-                        missing = Some(name.clone());
+                        missing = Some(name);
                     }
                     None
                 }
@@ -578,7 +578,7 @@ fn write_statics(
     match image.fill(base, out, fn_at, vtable_at) {
         Ok(()) => Ok(()),
         Err(error) => Err(match missing {
-            Some(name) => PlaceError::NoSymbol { name },
+            Some(name) => PlaceError::NoSymbol { name: name.into() },
             None => PlaceError::Statics(error),
         }),
     }

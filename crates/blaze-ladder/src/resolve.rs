@@ -118,7 +118,7 @@ impl<'n, S: NamesSource<'n>> Paths<S> {
         if let (Some(k), false, Some(&"crate")) = (dollar, abs, segments.first()) {
             kind = blaze_surface::PathKind::DollarCrate(k);
         }
-        let w = Written { kind, segments: &segments[skip..] };
+        let w = Written { kind, segments: segments.get(skip..).unwrap_or(&[]) };
         // The segments `to_path` read as the path's head (`crate`, `self`, `super`): counted in
         // the path as WRITTEN, in a refusal's segment as in `consumed` below, so `at` indexes
         // `segments`. (The library's `at` indexes what follows the head: `crate::a::f` with no
@@ -179,7 +179,8 @@ impl<'n, S: NamesSource<'n>> Paths<S> {
         if let (Some(k), false, Some(&"crate")) = (dollar, abs, segments.first()) {
             kind = blaze_surface::PathKind::DollarCrate(k);
         }
-        let w = Written { kind, segments: &segments[skip..] };
+        let Some(rest) = segments.get(skip..) else { return false };
+        let w = Written { kind, segments: rest };
         let space = match ns {
             Ns::Type => Namespace::Types,
             Ns::Value => Namespace::Values,

@@ -6778,7 +6778,7 @@ mod macos_app {
             if !alt_screen_entered.is_empty() {
                 let home = panes
                     .get(&alt_screen_entered[0])
-                    .map(|p| p.home.clone())
+                    .map(|p| p.home.as_str().to_owned())
                     .unwrap_or_default();
                 let cfg = blaze_shell::config::load_cached(&home);
                 for origin in alt_screen_entered.drain(..) {

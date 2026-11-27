@@ -162,27 +162,36 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
             .any(|row| !inits.iter().any(|f| f.name == row.0));
         if any_taken {
             let src = self.place_any(v)?;
-            for row in bfirst..bfirst + blen {
-                let (name, soff, srepr) = self.layout_fields[row as usize];
+            let f_start = usize::try_from(first).map_err(|_| malformed("a field offset past `usize`"))?;
+            let f_len = usize::try_from(len).map_err(|_| malformed("a field count past `usize`"))?;
+            let f_end = f_start.checked_add(f_len).ok_or(malformed("a field range overflow"))?;
+            let b_end = bf.checked_add(bl_len).ok_or(malformed("a base field range overflow"))?;
+            for (row_idx, row) in (bf..b_end).zip(bfirst..bfirst + blen) {
+                let &(name, soff, srepr) = self.layout_fields.get(row_idx).ok_or(malformed("a struct update's base field past `layout_fields`"))?;
                 if inits.iter().any(|f| f.name == name) {
                     continue;
                 }
-                let to = (first..first + len)
-                    .find(|&i| self.layout_fields[i as usize].0 == name)
+                let &(_, doff, drepr) = self
+                    .layout_fields
+                    .get(f_start..f_end)
+                    .ok_or(malformed("a struct update's result fields past `layout_fields`"))?
+                    .iter()
+                    .find(|f| f.0 == name)
                     .ok_or(malformed("a struct update's base with a field its result lacks"))?;
-                let (_, doff, drepr) = self.layout_fields[to as usize];
                 if srepr != drepr {
                     return Err(malformed("a struct update taking a field held differently in its base and its result"));
                 }
-                let g = self.layout_field_tys[row as usize];
+                let g = *self.layout_field_tys.get(row_idx).ok_or(malformed("a struct update's base field type past `layout_field_tys`"))?;
                 if self.needs_drop(g).map_err(|error| Self::ty_err(base, error))? {
                     if srepr == Repr::None {
                         return Err(unsupported(e, "a struct update taking a zero-sized field that needs drop"));
                     }
                     self.take_field(e, base, bl, row, src)?;
                 }
-                let v = self.load(srepr, (src.0, src.1 + soff as i32));
-                self.store(v, drepr, (p, at + doff as i32))?;
+                let soff_i32 = i32::try_from(soff).map_err(|_| malformed("a struct update's base field offset past `i32`"))?;
+                let doff_i32 = i32::try_from(doff).map_err(|_| malformed("a struct update's result field offset past `i32`"))?;
+                let v = self.load(srepr, (src.0, src.1 + soff_i32));
+                self.store(v, drepr, (p, at + doff_i32))?;
             }
         }
         // Whole now: owned as one value (walk/val_stack.rs).

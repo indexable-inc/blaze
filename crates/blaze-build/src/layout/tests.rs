@@ -651,8 +651,9 @@ fn pointer_width_32_lays_out_usize_isize_and_pointers_at_4_bytes() {
     let slice = g.n(PNode::Slice(u8_));
     let wide = g.r(slice);
 
-    let mut ls32 = Layouts::with_ptr_bytes_in(4, std::alloc::Global);
-    let mut ls64 = Layouts::new_in(std::alloc::Global);
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut ls32 = Layouts::with_ptr_bytes_in(4, alloc);
+    let mut ls64 = Layouts::new_in(alloc);
     for (ty, want32, want64) in [
         (usize_, (4u64, 2u8), (8u64, 3u8)),
         (isize_, (4, 2), (8, 3)),

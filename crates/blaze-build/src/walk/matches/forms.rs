@@ -51,8 +51,9 @@ struct ConstPart {
 /// Reads `n` little-endian bytes (`n <= 16`) at `off` from allocation `alloc` of `record`.
 fn const_word<B: Allocator>(record: &crate::data::DataRecord<B>, alloc: usize, off: u32, n: u32) -> Result<u128, BuildError> {
     let bytes = &record.allocs.get(alloc).ok_or(malformed("a const's allocation index past its record"))?.bytes[..];
-    let start = off as usize;
-    let end = start.checked_add(n as usize).ok_or(malformed("a const's offset overflow"))?;
+    let start = usize::try_from(off).map_err(|_| malformed("a const's offset past `usize`"))?;
+    let width = usize::try_from(n).map_err(|_| malformed("a const's width past `usize`"))?;
+    let end = start.checked_add(width).ok_or(malformed("a const's offset overflow"))?;
     let part = bytes.get(start..end).ok_or(malformed("a const's bytes shorter than its type"))?;
     Ok(part.iter().enumerate().fold(0u128, |v, (i, &byte)| v | (u128::from(byte) << (8 * i))))
 }
@@ -66,7 +67,7 @@ fn local_pointee<B: Allocator>(p: PatId, record: &crate::data::DataRecord<B>, al
     let crate::data::DataTarget::Local(n) = reloc.target else {
         return Err(BuildError::UnsupportedPat { pat: p, what: "a constant holding a reference pointing outside its own record (a static's bytes) as a pattern" });
     };
-    let idx = n as usize;
+    let idx = usize::try_from(n).map_err(|_| malformed("a reference constant's relocation past `usize`"))?;
     if idx >= record.allocs.len() {
         return Err(malformed("a reference constant's relocation past its record's allocations"));
     }
@@ -113,8 +114,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 let inner_node = self.ground_node(inner).map_err(|error| Self::pat_ty_err(p, error))?;
                 match inner_node {
                     PNode::Str => {
-                        let addend = const_word(record, alloc, const_off, 8)? as u64;
-                        let len = const_word(record, alloc, const_off + 8, 8)? as u64;
+                        let addend = u64::try_from(const_word(record, alloc, const_off, 8)?).map_err(|_| malformed("a `&str` constant's addend past u64"))?;
+                        let len = u64::try_from(const_word(record, alloc, const_off + 8, 8)?).map_err(|_| malformed("a `&str` constant's length past u64"))?;
                         if len == 0 {
                             let rt_len = self.b.load(Ty::I64, Flags::NONE, rt_base, rt_off + 8, MemAttrs::aligned(3));
                             let zero = self.b.iconst(Ty::I64, 0);
@@ -131,9 +132,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                             .ok()
                             .and_then(|l| start.checked_add(l))
                             .ok_or(malformed("a `&str` constant's length past a usize"))?;
-                        let bytes = record.allocs[target]
-                            .bytes
-                            .get(start..end)
+                        let bytes = record
+                            .allocs
+                            .get(target)
+                            .and_then(|a| a.bytes.get(start..end))
                             .ok_or(malformed("a `&str` constant's bytes past its allocation"))?;
                         if let Some(c) = all.take() {
                             let mid = self.create();
@@ -147,8 +149,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         continue;
                     }
                     PNode::Slice(elem_ty) => {
-                        let addend = const_word(record, alloc, const_off, 8)? as u64;
-                        let len = const_word(record, alloc, const_off + 8, 8)? as u64;
+                        let addend = u64::try_from(const_word(record, alloc, const_off, 8)?).map_err(|_| malformed("a `&[T]` constant's addend past u64"))?;
+                        let len = u64::try_from(const_word(record, alloc, const_off + 8, 8)?).map_err(|_| malformed("a `&[T]` constant's length past u64"))?;
                         if len == 0 {
                             let rt_len = self.b.load(Ty::I64, Flags::NONE, rt_base, rt_off + 8, MemAttrs::aligned(3));
                             let zero = self.b.iconst(Ty::I64, 0);
@@ -178,9 +180,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                                 .ok()
                                 .and_then(|l| start.checked_add(l))
                                 .ok_or(malformed("a `&[u8]` constant's length past a usize"))?;
-                            let bytes = record.allocs[target]
-                                .bytes
-                                .get(start..end)
+                            let bytes = record
+                                .allocs
+                                .get(target)
+                                .and_then(|a| a.bytes.get(start..end))
                                 .ok_or(malformed("a `&[u8]` constant's bytes past its allocation"))?;
                             if let Some(c) = all.take() {
                                 let mid = self.create();
@@ -212,7 +215,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                             return Err(refuse("a slice constant pattern with more elements than the limit"));
                         }
                         for i in (0..count).rev() {
-                            let byte_off = (i as u64).checked_mul(stride).ok_or(refuse("a slice constant pattern past an `i32` offset"))?;
+                            let i_u64 = u64::try_from(i).map_err(|_| refuse("a slice constant pattern past a u64 index"))?;
+                            let byte_off = i_u64.checked_mul(stride).ok_or(refuse("a slice constant pattern past an `i32` offset"))?;
                             let elem_rt_off = i32::try_from(byte_off).map_err(|_| refuse("a slice constant pattern past an `i32` offset"))?;
                             let elem_const_off = addend
                                 .checked_add(byte_off)
@@ -232,7 +236,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                             continue;
                         }
                         let target = local_pointee(p, record, alloc, const_off)?;
-                        let addend = const_word(record, alloc, const_off, 8)? as u64;
+                        let addend = u64::try_from(const_word(record, alloc, const_off, 8)?).map_err(|_| malformed("a reference constant's addend past u64"))?;
                         let inner_const_off = u32::try_from(addend).map_err(|_| malformed("a reference constant's addend past a u32"))?;
                         if let Some(c) = all.take() {
                             let mid = self.create();
@@ -290,9 +294,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     }
                     match self.layouts[l as usize].shape {
                         Shape::Fields { first, len } => {
-                            for i in (first..first + len).rev() {
-                                let (_, at_off, _) = self.layout_fields[i as usize];
-                                let field_ty = self.layout_field_tys[i as usize];
+                            let start = usize::try_from(first).map_err(|_| malformed("field range start past `usize`"))?;
+                            let count = usize::try_from(len).map_err(|_| malformed("field range len past `usize`"))?;
+                            let end = start.checked_add(count).ok_or(malformed("field range overflow"))?;
+                            for i in (start..end).rev() {
+                                let &(_, at_off, _) = self.layout_fields.get(i).ok_or(malformed("a constant pattern field past `layout_fields`"))?;
+                                let &field_ty = self.layout_field_tys.get(i).ok_or(malformed("a constant pattern field type past `layout_field_tys`"))?;
                                 let next_rt = i32::try_from(at_off)
                                     .ok()
                                     .and_then(|o| rt_off.checked_add(o))
@@ -340,9 +347,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                                 all = Some(self.b.icmp(IntCond::Eq, d, k));
                             }
                             let (first, len, _) = self.variant_rows(l, variant)?;
-                            for i in (first..first + len).rev() {
-                                let (_, at_off, _) = self.layout_fields[i as usize];
-                                let field_ty = self.layout_field_tys[i as usize];
+                            let start = usize::try_from(first).map_err(|_| malformed("variant field start past `usize`"))?;
+                            let count = usize::try_from(len).map_err(|_| malformed("variant field len past `usize`"))?;
+                            let end = start.checked_add(count).ok_or(malformed("variant field range overflow"))?;
+                            for i in (start..end).rev() {
+                                let &(_, at_off, _) = self.layout_fields.get(i).ok_or(malformed("a variant pattern field past `layout_fields`"))?;
+                                let &field_ty = self.layout_field_tys.get(i).ok_or(malformed("a variant pattern field type past `layout_field_tys`"))?;
                                 let next_rt = i32::try_from(at_off)
                                     .ok()
                                     .and_then(|o| rt_off.checked_add(o))

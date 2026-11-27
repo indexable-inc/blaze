@@ -1624,8 +1624,8 @@ fn layout_starship_line(
                         HitRect::new(seg3_x0, y, cx + 4.0, y + cap_h),
                         clip_id,
                         HoverKind::GitChanges {
-                            files: st.changed_files.clone(),
-                            details: st.changed_details.clone(),
+                            files: st.changed_files.to_vec(),
+                            details: st.changed_details.to_vec(),
                             total: total_dirty,
                         },
                     );

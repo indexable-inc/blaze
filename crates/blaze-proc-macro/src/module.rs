@@ -126,70 +126,130 @@ impl<'l, 'a> LockedPackages<'l, 'a> {
         let lock = self.lock;
         let Some(root) = lock
             .named(name)
-            .find(|id| lock.package(*id).version.to_string() == version)
+            .find(|id| display_eq(&lock.package(*id).version, version))
         else {
             return Ok(Err(ClosureError::NotLocked { name: name.to_owned(), version: version.to_owned() }));
         };
-        let mut seen = vec![false; lock.packages.len()];
-        seen[root.index()] = true;
-        let mut stack = vec![root];
+        let alloc = std::alloc::Global;
+        let mut seen = blaze_own::Vec::with_capacity_in(lock.packages.len(), alloc);
+        seen.resize(lock.packages.len(), false);
+        if let Some(slot) = seen.get_mut(root.index()) {
+            *slot = true;
+        }
+        let mut stack = blaze_own::Vec::new_in(alloc);
+        stack.push(root);
         while let Some(at) = stack.pop() {
             for dep in lock.package(at).deps.iter() {
-                if !seen[dep.index()] {
-                    seen[dep.index()] = true;
+                if let Some(slot) = seen.get_mut(dep.index())
+                    && !*slot
+                {
+                    *slot = true;
                     stack.push(*dep);
                 }
             }
         }
-        let deps = seen.iter().enumerate().filter_map(|(at, &hit)| hit.then_some(blaze_manifest::lock::LockId(at as u32)));
-        self.closure_of_packages(root, deps, path_pin)
+        let deps = seen
+            .iter()
+            .enumerate()
+            .filter_map(|(at, &hit)| hit.then(|| u32::try_from(at).ok().map(blaze_manifest::lock::LockId)).flatten());
+        match self.closure_of_packages(root, deps, path_pin, alloc)? {
+            Ok(hex) => Ok(Ok(hex.as_str().to_owned())),
+            Err(err) => Ok(Err(err)),
+        }
     }
 
     /// Like [`Self::closure_with`], but hashes only the explicitly supplied dependency packages
     /// (`dep_packages`, excluding `root`) rather than walking `Cargo.lock`'s `dependencies` lists
     /// (which include `dev-dependencies` and inactive optional/target dependencies of workspace
     /// path packages).
-    pub fn closure_of_packages<D: AsRef<str>, E>(
+    pub fn closure_of_packages<D: AsRef<str>, E, A: core::alloc::Allocator + Copy>(
         &self,
         root: blaze_manifest::lock::LockId,
         dep_packages: impl IntoIterator<Item = blaze_manifest::lock::LockId>,
         mut path_pin: impl FnMut(blaze_manifest::lock::LockId) -> Result<Option<D>, E>,
-    ) -> Result<Result<String, ClosureError>, E> {
+        alloc: A,
+    ) -> Result<Result<blaze_own::String<A>, ClosureError>, E> {
+        use core::fmt::Write as _;
         let lock = self.lock;
-        let mut seen = vec![false; lock.packages.len()];
+        let mut seen = blaze_own::Vec::with_capacity_in(lock.packages.len(), alloc);
+        seen.resize(lock.packages.len(), false);
         for dep in dep_packages {
-            if dep.index() < seen.len() {
-                seen[dep.index()] = true;
+            if let Some(slot) = seen.get_mut(dep.index()) {
+                *slot = true;
             }
         }
-        let mut lines = Vec::new();
+        let mut lines = blaze_own::Vec::<blaze_own::String<A>, A>::new_in(alloc);
+        let mut version = blaze_own::String::new_in(alloc);
+        let mut owned_path_pin = blaze_own::String::new_in(alloc);
         for (at, package) in lock.packages.iter().enumerate() {
-            if !seen[at] || at == root.index() {
+            if !seen.get(at).copied().unwrap_or(false) || at == root.index() {
                 continue;
             }
             // The version as the lock writes it: a parsed semver prints as its text (no
             // leading zero, nothing dropped), so the line is the text the old reader cut out.
-            let version = package.version.to_string();
-            let owned_path_pin: String;
+            version.clear();
+            let _ = write!(version, "{}", package.version);
             let pin: &str = match (&package.checksum, &package.source) {
                 (Checksum::Sha256(sum), _) => sum.as_str(),
-                (Checksum::Absent, LockSource::Path) => match path_pin(blaze_manifest::lock::LockId(at as u32))? {
-                    Some(files_sha256) => {
-                        owned_path_pin = format!("files:{}", files_sha256.as_ref());
-                        owned_path_pin.as_str()
+                (Checksum::Absent, LockSource::Path) => {
+                    let Some(id) = u32::try_from(at).ok().map(blaze_manifest::lock::LockId) else { continue };
+                    match path_pin(id)? {
+                        Some(files_sha256) => {
+                            owned_path_pin.clear();
+                            let _ = write!(owned_path_pin, "files:{}", files_sha256.as_ref());
+                            owned_path_pin.as_str()
+                        }
+                        None => {
+                            return Ok(Err(ClosureError::Unpinned {
+                                name: package.name.as_str().to_owned(),
+                                version: version.as_str().to_owned(),
+                            }));
+                        }
                     }
-                    None => {
-                        return Ok(Err(ClosureError::Unpinned { name: package.name.as_str().to_owned(), version }));
-                    }
-                },
+                }
                 (Checksum::Absent, LockSource::Registry { .. } | LockSource::Git { .. }) => package.source_text.as_str(),
             };
-            let pin = self.corrections.pin(package.name.as_str(), &version, pin);
-            lines.push(format!("{} {version} {pin}", package.name));
+            let pin = self.corrections.pin(package.name.as_str(), version.as_str(), pin);
+            let mut line = blaze_own::String::new_in(alloc);
+            let _ = write!(line, "{} {} {pin}", package.name, version.as_str());
+            lines.push(line);
         }
-        lines.sort();
-        Ok(Ok(sha256_hex(lines.join("\n").as_bytes())))
+        lines.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut joined = blaze_own::String::new_in(alloc);
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                joined.push('\n');
+            }
+            joined.push_str(line.as_str());
+        }
+        let digest = blaze_sha256::digest(joined.as_bytes());
+        let mut out = blaze_own::String::with_capacity_in(digest.len() * 2, alloc);
+        for byte in digest {
+            let _ = write!(out, "{byte:02x}");
+        }
+        Ok(Ok(out))
     }
+}
+
+fn display_eq(value: &impl core::fmt::Display, expected: &str) -> bool {
+    struct EqWriter<'a> {
+        rest: &'a [u8],
+        ok: bool,
+    }
+    impl core::fmt::Write for EqWriter<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            let bytes = s.as_bytes();
+            if self.ok && let Some(tail) = self.rest.strip_prefix(bytes) {
+                self.rest = tail;
+            } else {
+                self.ok = false;
+            }
+            Ok(())
+        }
+    }
+    use core::fmt::Write as _;
+    let mut writer = EqWriter { rest: expected.as_bytes(), ok: true };
+    write!(writer, "{value}").is_ok() && writer.ok && writer.rest.is_empty()
 }
 
 /// The digest a path package's sources are pinned by: SHA-256 over its files, in the byte
@@ -238,7 +298,7 @@ pub fn package_files(dir: &Path) -> Result<Vec<(String, Vec<u8>)>, ModuleError> 
 }
 
 fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
+    use core::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         let _ = write!(out, "{byte:02x}");
@@ -520,8 +580,8 @@ pub enum ModuleError {
     Macros { key: String, line: String },
 }
 
-impl std::fmt::Display for ModuleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ModuleError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ModuleError::Missing { name, version, key } => write!(
                 f,
@@ -536,7 +596,7 @@ impl std::fmt::Display for ModuleError {
     }
 }
 
-impl std::error::Error for ModuleError {}
+impl core::error::Error for ModuleError {}
 
 fn native_dylib_filename() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -669,6 +729,17 @@ mod header_tests {
 
         let store = std::env::temp_dir().join(format!("blaze-pm-module-v9-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
+        let write_entry = |dir: &Path, id_text: &str, digest: &str, macros: &str| {
+            std::fs::create_dir_all(dir).expect("create module dir");
+            for (name, body) in [
+                ("identity", id_text),
+                ("wasm-sha256", digest),
+                ("macros", macros),
+                ("decls", "__rustc_proc_macro_decls_blaze__\n"),
+            ] {
+                std::fs::write(dir.join(name), body).expect(name);
+            }
+        };
         for (stale_key, stale_identity, stale_digest) in [
             (&v4_key, &v4_identity, "deadbeef\n"),
             (&v5_key, &v5_identity, "feedface\n"),
@@ -677,12 +748,7 @@ mod header_tests {
             (&v7_w32_key, &v7_w32_identity, "76543210\n"),
             (&v8_w64_key, &v8_w64_identity, "89abcdef\n"),
         ] {
-            let stale_dir = store.join("proc-macro/modules").join(stale_key);
-            std::fs::create_dir_all(&stale_dir).expect("create stale dir");
-            std::fs::write(stale_dir.join("identity"), stale_identity).expect("write stale identity");
-            std::fs::write(stale_dir.join("wasm-sha256"), stale_digest).expect("write stale digest");
-            std::fs::write(stale_dir.join("macros"), "").expect("write stale macros");
-            std::fs::write(stale_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write stale decls");
+            write_entry(&store.join("proc-macro/modules").join(stale_key), stale_identity, stale_digest, "");
         }
 
         // Lookup by current wasm64 form 9 misses stale wasm64 form 8, wasm32 form 7, and form 7..4 directories cleanly.
@@ -691,11 +757,7 @@ mod header_tests {
 
         // Publishing form 9 alongside stale form 8, 7, 6, 5, and 4 resolves uniquely to form 9.
         let v9_dir = store.join("proc-macro/modules").join(&v9_key);
-        std::fs::create_dir_all(&v9_dir).expect("create v9 dir");
-        std::fs::write(v9_dir.join("identity"), &v9_identity).expect("write v9 identity");
-        std::fs::write(v9_dir.join("wasm-sha256"), "cafebabe\n").expect("write v9 digest");
-        std::fs::write(v9_dir.join("macros"), "0 derive Demo\n").expect("write v9 macros");
-        std::fs::write(v9_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write v9 decls");
+        write_entry(&v9_dir, &v9_identity, "cafebabe\n", "0 derive Demo\n");
 
         let (found_key, digest) = find_module(&store, &id).expect("find v9 module");
         assert_eq!(found_key, v9_key);
@@ -764,8 +826,8 @@ mod header_tests {
 
         let wg_on = mk_wasm_graph(&["extra_wasi"]);
         let wg_off = mk_wasm_graph(&[]);
-        let d_on = deps_with_wasm_features("same-lock-closure", &lock, &wg_on, LockId(0), &[] as &[&str], |_| None::<&str>, std::alloc::Global);
-        let d_off = deps_with_wasm_features("same-lock-closure", &lock, &wg_off, LockId(0), &[] as &[&str], |_| None::<&str>, std::alloc::Global);
+        let d_on = deps_with_wasm_features("same-lock-closure", &lock, &wg_on, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
+        let d_off = deps_with_wasm_features("same-lock-closure", &lock, &wg_off, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
         assert_ne!(d_on.as_str(), d_off.as_str(), "proc-macro deps digest must change when a WASI-only dep feature toggles");
     }
 
@@ -847,8 +909,8 @@ mod header_tests {
 
         let wg_ab = mk_wasm_graph(&["feat_a"], &["feat_b"]);
         let wg_ba = mk_wasm_graph(&["feat_b"], &["feat_a"]);
-        let d_ab = deps_with_wasm_features("same-lock-closure", &lock, &wg_ab, LockId(0), &[] as &[&str], |_| None::<&str>, std::alloc::Global);
-        let d_ba = deps_with_wasm_features("same-lock-closure", &lock, &wg_ba, LockId(0), &[] as &[&str], |_| None::<&str>, std::alloc::Global);
+        let d_ab = deps_with_wasm_features("same-lock-closure", &lock, &wg_ab, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
+        let d_ba = deps_with_wasm_features("same-lock-closure", &lock, &wg_ba, LockId(0), &[] as &[&str], |_| None::<&str>, alloc);
         assert_ne!(
             d_ab.as_str(),
             d_ba.as_str(),

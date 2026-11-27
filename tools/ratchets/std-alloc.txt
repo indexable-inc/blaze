@@ -24,14 +24,13 @@ blaze-cad-out	1	0	0	2
 blaze-cad-picture	1	0	0	0
 blaze-cas	85	1	4	392
 blaze-cbor	0	0	1	0
-blaze-cc	0	0	4	3
 blaze-check	72	1	0	107
-blaze-cli	716	1	0	478
+blaze-cli	687	1	0	473
 blaze-columns	29	0	1	23
 blaze-comptime/rungs/derive-hello	0	1	0	0
 blaze-cond	1	0	0	11
 blaze-consteval	30	0	4	64
-blaze-core	891	1	19	1201
+blaze-core	891	1	19	1200
 blaze-ctx	6	0	0	42
 blaze-data	1	0	1	0
 blaze-dbsp	0	0	6	0
@@ -61,7 +60,7 @@ blaze-inproc-rt	0	1	0	0
 blaze-json	0	0	2	0
 blaze-keyed	0	0	13	291
 blaze-kit	12	0	13	30
-blaze-ladder	310	1	2	1495
+blaze-ladder	310	1	2	1493
 blaze-launch	0	0	15	58
 blaze-launch-rt	91	1	1	159
 blaze-launcher	59	1	0	18
@@ -81,7 +80,7 @@ blaze-own	67	0	29	38
 blaze-parquet	0	0	2	0
 blaze-pg	0	0	7	39
 blaze-preview	0	0	0	1
-blaze-proc-macro	521	1	0	1004
+blaze-proc-macro	520	1	0	1000
 blaze-protocol	27	1	1	157
 blaze-queue	0	0	3	0
 blaze-radix	2	1	1	23
@@ -105,7 +104,7 @@ blaze-spin	2	1	0	0
 blaze-sql	0	0	15	115
 blaze-sqlite	4	1	0	14
 blaze-squeeze	21	0	2	67
-blaze-std	44	0	148	500
+blaze-std	44	0	148	491
 blaze-store-check	17	1	1	11
 blaze-surface	2	0	0	1
 blaze-swiss	2	0	0	5

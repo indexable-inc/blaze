@@ -350,7 +350,9 @@ fn emit_macro_files<'a>(
         }
     }
     while let Some((is_path, idx)) = dep_stack.pop() {
-        let pkg = if is_path { &units.path_packages[idx] } else { &units.members[idx] };
+        let Some(pkg) = (if is_path { units.path_packages.get(idx) } else { units.members.get(idx) }) else {
+            continue;
+        };
         whole_dirs.insert(pkg.dir.as_str());
         for dep in pkg.dependencies.iter() {
             if matches!(dep.kind, blaze_manifest::layout::DepKind::Normal | blaze_manifest::layout::DepKind::Build) {
@@ -1663,14 +1665,13 @@ version = \"0.29.0\"
             // Post-graph rows must NOT change `units_source` even if recomputed over `rows`.
             let units_source_after = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
             assert_eq!(units_source, units_source_after, "POST_GRAPH_MACRO rows must stay excluded from units_source");
-            let macro_dirs: std::vec::Vec<std::string::String> = rows
-                .of(sweep::LeafKind::MacroFiles)
-                .filter(|leaf| !leaf.absent())
-                .map(|leaf| rows.path(leaf).to_owned())
-                .collect();
+            let mut macro_dirs = blaze_own::Vec::new_in(heap.alloc());
+            for leaf in rows.of(sweep::LeafKind::MacroFiles).filter(|leaf| !leaf.absent()) {
+                macro_dirs.push(blaze_own::AString::from_str_in(rows.path(leaf), heap.alloc()));
+            }
             let place = crate::macros::Place { home: None, checkout: "", members: Some(parts.member_dirs()), rows: &rows };
             let locked = blaze_proc_macro::module::LockedPackages::of(lock);
-            let empty_git = std::collections::BTreeMap::new();
+            let empty_git = Default::default();
             let sqlx_unit = make_unit(lock, "sqlx-macros", "0.9.0", "sqlx_macros", heap);
             let rasn_unit = make_unit(lock, "rasn-derive", "0.29.0", "rasn_derive", heap);
             let empty_graph = blaze_unit_graph::UnitGraph {
@@ -1679,11 +1680,11 @@ version = \"0.29.0\"
                 meta: blaze_own::Vec::new_in(heap.alloc()),
                 left_out: blaze_own::Vec::new_in(heap.alloc()),
             };
-            let sqlx_key = blaze_world::procs::identify(lock, &locked, &empty_git, &empty_graph, &sqlx_unit, |id| Ok(place.member_files(id)))
+            let sqlx_key = blaze_world::procs::identify(lock, &locked, &empty_git, &empty_graph, &sqlx_unit, |id| Ok(place.member_files(id)), heap.alloc())
                 .expect("identify sqlx io")
                 .expect("sqlx-macros must identify cleanly instead of ClosureError::Unpinned")
                 .with_id(blaze_proc_macro::module::module_key);
-            let rasn_key = blaze_world::procs::identify(lock, &locked, &empty_git, &empty_graph, &rasn_unit, |id| Ok(place.member_files(id)))
+            let rasn_key = blaze_world::procs::identify(lock, &locked, &empty_git, &empty_graph, &rasn_unit, |id| Ok(place.member_files(id)), heap.alloc())
                 .expect("identify rasn io")
                 .expect("rasn-derive must identify cleanly instead of ClosureError::Unpinned")
                 .with_id(blaze_proc_macro::module::module_key);
@@ -1696,16 +1697,21 @@ version = \"0.29.0\"
             (units_source, (sqlx_digest, sqlx_part, sqlx_key), (rasn_digest, rasn_part, rasn_key), macro_dirs)
         };
         let (u_a, (sd_a, sp_a, sk_a), (rd_a, rp_a, rk_a), macro_dirs) = run_once("pub fn v1() {}", "pub fn rt_v1() {}");
-        let unique: std::collections::BTreeSet<&str> = macro_dirs.iter().map(std::string::String::as_str).collect();
+        let mut unique = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
+        for d in macro_dirs.iter() {
+            unique.push(d.as_str());
+        }
+        unique.sort_unstable();
+        unique.dedup();
         assert_eq!(unique.len(), macro_dirs.len(), "no duplicate MacroFiles rows: {macro_dirs:?}");
-        assert!(unique.contains("vendor/sqlx-postgres"), "direct patched dep under sqlx-macros must have MacroFiles: {macro_dirs:?}");
-        assert!(unique.contains("vendor/aws-lc-sys"), "transitive vendored path dep under sqlx-macros must have MacroFiles: {macro_dirs:?}");
-        assert!(unique.contains("crates/patched-member"), "patched workspace member under sqlx-macros must have MacroFiles: {macro_dirs:?}");
-        assert!(unique.contains("vendor/rasn-derive-impl"), "patched dep under rasn-derive must have MacroFiles: {macro_dirs:?}");
-        assert!(!unique.contains("vendor/patched-runtime"), "used runtime [patch.crates-io] dep must NOT get MacroFiles (rule 60): {macro_dirs:?}");
-        assert!(!unique.contains("crates/app"), "regular app member must not be eagerly swept (rule 60): {macro_dirs:?}");
-        assert!(!unique.contains("crates/unrelated"), "unrelated workspace member must not be eagerly swept (rule 60): {macro_dirs:?}");
-        assert!(!unique.contains("vendor/unused"), "unused patch must not be eagerly swept (rule 60): {macro_dirs:?}");
+        assert!(unique.scan_for(&"vendor/sqlx-postgres").is_some(), "direct patched dep under sqlx-macros must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.scan_for(&"vendor/aws-lc-sys").is_some(), "transitive vendored path dep under sqlx-macros must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.scan_for(&"crates/patched-member").is_some(), "patched workspace member under sqlx-macros must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.scan_for(&"vendor/rasn-derive-impl").is_some(), "patched dep under rasn-derive must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.scan_for(&"vendor/patched-runtime").is_none(), "used runtime [patch.crates-io] dep must NOT get MacroFiles (rule 60): {macro_dirs:?}");
+        assert!(unique.scan_for(&"crates/app").is_none(), "regular app member must not be eagerly swept (rule 60): {macro_dirs:?}");
+        assert!(unique.scan_for(&"crates/unrelated").is_none(), "unrelated workspace member must not be eagerly swept (rule 60): {macro_dirs:?}");
+        assert!(unique.scan_for(&"vendor/unused").is_none(), "unused patch must not be eagerly swept (rule 60): {macro_dirs:?}");
         // Editing the used runtime patch leaves units_source and BOTH proc-macros untouched (rule 60).
         let (u_rt, (sd_rt, sp_rt, sk_rt), (rd_rt, rp_rt, rk_rt), _) = run_once("pub fn v1() {}", "pub fn rt_v2_edited() {}");
         assert_eq!(u_a, u_rt, "editing used runtime patch must NOT invalidate units_source (rule 60)");
@@ -1857,11 +1863,10 @@ unibind-test-support = { path = \"../unibind-test-support\" }
             let laid = lay(&cx, &root, &FromMeta { swept_at_ns: 0 }, &mut rows, blaze_toolchain::ToolchainId([0; 32]), heap, frame, erased.handle()).expect("laid");
             assert!(laid.root.findings.is_empty(), "{:?}", core::str::from_utf8(&laid.root.messages));
             let source = sweep::units_source(rows.rows.iter().map(|leaf| (rows.path(leaf), leaf)), frame);
-            let macro_dirs: std::vec::Vec<std::string::String> = rows
-                .of(sweep::LeafKind::MacroFiles)
-                .filter(|leaf| !leaf.absent())
-                .map(|leaf| rows.path(leaf).to_owned())
-                .collect();
+            let mut macro_dirs = blaze_own::Vec::new_in(heap.alloc());
+            for leaf in rows.of(sweep::LeafKind::MacroFiles).filter(|leaf| !leaf.absent()) {
+                macro_dirs.push(blaze_own::AString::from_str_in(rows.path(leaf), heap.alloc()));
+            }
             let lock = laid.lock.as_ref().expect("members lock").lock;
             let parts = laid.parts.as_ref().expect("parts");
             let place = crate::macros::Place { home: None, checkout: "", members: Some(parts.member_dirs()), rows: &rows };
@@ -1882,26 +1887,31 @@ unibind-test-support = { path = \"../unibind-test-support\" }
                 build_script: None,
                 links: None,
             };
-            let empty_git = std::collections::BTreeMap::new();
+            let empty_git = Default::default();
             let empty_graph = blaze_unit_graph::UnitGraph {
                 units: blaze_own::Vec::new_in(heap.alloc()),
                 resolver: blaze_unit_graph::Resolver::V2,
                 meta: blaze_own::Vec::new_in(heap.alloc()),
                 left_out: blaze_own::Vec::new_in(heap.alloc()),
             };
-            let identity = blaze_world::procs::identify(lock, &locked, &empty_git, &empty_graph, &unit, |id| Ok(place.member_files(id)))
+            let identity = blaze_world::procs::identify(lock, &locked, &empty_git, &empty_graph, &unit, |id| Ok(place.member_files(id)), heap.alloc())
                 .expect("identify io")
                 .expect("unibind must identify cleanly across dev-dep lock closure");
             let key = identity.with_id(blaze_proc_macro::module::module_key);
             (source, macro_dirs, key)
         };
         let (src_a, macro_dirs, key_a) = run_once("pub fn s1() {}");
-        let unique: std::collections::BTreeSet<&str> = macro_dirs.iter().map(std::string::String::as_str).collect();
+        let mut unique = blaze_own::Vec::new_in(blaze_own::testing::heap().alloc());
+        for d in macro_dirs.iter() {
+            unique.push(d.as_str());
+        }
+        unique.sort_unstable();
+        unique.dedup();
         assert_eq!(unique.len(), macro_dirs.len(), "no duplicate MacroFiles rows: {macro_dirs:?}");
-        assert!(unique.contains("crates/unibind"), "member proc-macro must have MacroFiles: {macro_dirs:?}");
-        assert!(unique.contains("crates/unibind-backend"), "dev-dep member must have MacroFiles: {macro_dirs:?}");
-        assert!(unique.contains("crates/unibind-test-support"), "transitive dev-dep member must have MacroFiles: {macro_dirs:?}");
-        assert!(!unique.contains("crates/unrelated"), "unrelated workspace member must not be eagerly swept (rule 60): {macro_dirs:?}");
+        assert!(unique.contains(&"crates/unibind"), "member proc-macro must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.contains(&"crates/unibind-backend"), "dev-dep member must have MacroFiles: {macro_dirs:?}");
+        assert!(unique.contains(&"crates/unibind-test-support"), "transitive dev-dep member must have MacroFiles: {macro_dirs:?}");
+        assert!(!unique.contains(&"crates/unrelated"), "unrelated workspace member must not be eagerly swept (rule 60): {macro_dirs:?}");
         let (src_b, _, key_b) = run_once("pub fn s2() {}");
         assert_ne!(src_a, src_b, "editing transitive dev-dep member must move units_source (rule 21)");
         assert_eq!(key_a, key_b, "editing uncompiled dev-dep member must not invalidate UnitGraph-scoped path proc-macro key");

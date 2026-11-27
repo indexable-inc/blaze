@@ -29,7 +29,7 @@ use super::source::NamesSource;
 /// `PositionGap::NoFile`).
 pub const MOST_LEVELS: u32 = 4096;
 
-const _: () = assert!(MOST_LEVELS >= blaze_scope::RECURSION_LIMIT as u32 + 64);
+const _: () = assert!(MOST_LEVELS >= 4096 && 4096u16 >= blaze_scope::RECURSION_LIMIT + 64);
 
 /// A call's origins, as a names source answers them: the column and call read in place, and
 /// the calling text as it is today.

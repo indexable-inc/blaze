@@ -10,7 +10,7 @@ blaze-build-script	0	1	0	0	0
 blaze-cas	1	2	0	0	0
 blaze-cbor	0	1	0	0	0
 blaze-check	19	0	0	0	0
-blaze-cli	17	76	0	0	6
+blaze-cli	15	76	0	0	6
 blaze-core	8	1	0	0	0
 blaze-emit	0	8	0	0	0
 blaze-fmt	1	7	0	0	0

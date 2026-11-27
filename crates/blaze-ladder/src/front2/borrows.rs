@@ -6476,18 +6476,23 @@ fn main() {}
 "#;
 
         let check_crate = |crate_name: &str, ed_str: &str, source: &str, positives: &[&str], negatives: &[&str]| {
+            use core::fmt::Write as _;
             let heap = blaze_own::testing::heap();
             let alloc = heap.alloc();
             let home = std::env::var("HOME").expect("HOME is set");
-            let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
-            let root_path = std::format!("/{crate_name}/src/main.rs");
-            let dir_path = std::format!("/{crate_name}/");
-            let files = [(root_path.clone(), source.to_string())];
+            let mut tc_path = blaze_own::AString::new_in(alloc);
+            let _ = write!(tc_path, "{home}/.blaze/v2/toolchain");
+            let tc = Toolchain::open(&mut DirShelf::new(tc_path.as_str().into())).expect("installed toolchain");
+            let mut root_path = blaze_own::AString::new_in(alloc);
+            let _ = write!(root_path, "/{crate_name}/src/main.rs");
+            let mut dir_path = blaze_own::AString::new_in(alloc);
+            let _ = write!(dir_path, "/{crate_name}/");
+            let files = [(root_path.as_str().into(), source.into())];
             let edition = edition::PackageEdition::of_manifest(ed_str).expect("valid edition");
             let user = UserCrate {
                 name: crate_name,
-                dir: &dir_path,
-                root: &root_path,
+                dir: dir_path.as_str(),
+                root: root_path.as_str(),
                 files: &files,
                 edition,
                 panic: blaze_build::Panic::Unwind,

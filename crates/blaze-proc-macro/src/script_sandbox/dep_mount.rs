@@ -29,6 +29,8 @@
 //! the trees and `OUT_DIR` files are shared (`Arc`) with the producers' runs.
 
 use core::fmt;
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blaze_build_script::Outputs;
@@ -183,7 +185,7 @@ pub struct DepViews {
     content: Option<ContentId>,
     /// Home build-script file area (`<store>/build-script/files`) for serving `Served::Stored`
     /// `OUT_DIR` files read-only to dependent wasm64 build scripts.
-    file_area: Option<std::path::PathBuf>,
+    file_area: Option<PathBuf>,
 }
 
 impl DepViews {
@@ -298,7 +300,7 @@ pub fn view<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMe
 /// them read-only to dependent wasm64 build scripts.
 pub fn view_with_area<'a>(
     reader: &Tree,
-    file_area: Option<&std::path::Path>,
+    file_area: Option<&Path>,
     producers: &[(&str, &DepProducer)],
     deps: &[DepMetadata<'_>],
     alloc: Alloc<'a>,
@@ -314,7 +316,7 @@ pub fn view_with_stored<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], d
 
 fn view_inner<'a>(
     reader: &Tree,
-    file_area: Option<&std::path::Path>,
+    file_area: Option<&Path>,
     producers: &[(&str, &DepProducer)],
     deps: &[DepMetadata<'_>],
     allow_stored: bool,
@@ -323,13 +325,13 @@ fn view_inner<'a>(
     let resolved = resolve(Sight::Wasm, producers, deps, alloc)?;
     let mut mounts: Vec<Mounted> = Vec::new();
     for &(mount, producer) in resolved.serve.iter() {
-        mounts.push(mounted(mount, producer, reader, allow_stored)?);
+        mounts.push(mounted(mount, producer, reader, allow_stored, alloc)?);
     }
     mounts.sort_by(|a, b| a.parts.cmp(&b.parts));
     // One mount serves every pair under it (two pairs under one `OUT_DIR`, say).
     mounts.dedup_by(|a, b| a.parts == b.parts);
     let content = (!mounts.is_empty()).then(|| content_id(&mounts));
-    Ok(Viewed { values: resolved.values, views: DepViews { mounts, content, file_area: file_area.map(std::path::Path::to_path_buf) } })
+    Ok(Viewed { values: resolved.values, views: DepViews { mounts, content, file_area: file_area.map(Path::to_path_buf) } })
 }
 
 /// A reader's `links` values resolved for a run of one [`Sight`], and the trees they are under.
@@ -387,74 +389,74 @@ pub(crate) fn resolve<'p, 'a>(sight: Sight<'_>, producers: &[(&'p str, &'p DepPr
 /// `dir` (workspace root), refuses any symlink escaping `root/dir`, skips `.git`/`target`,
 /// bounds total files/bytes (Rule 18), and returns paths sorted under `"{dir}/{rel}"` so every
 /// file read is covered by `DepViews::key` (Rule 21, Rule 25).
-fn snapshot_member_dir(root: &RealRoot, dir: &str, links: &str) -> Result<Arc<Vec<(String, Vec<u8>)>>, DepViewError> {
+fn snapshot_member_dir(root: &RealRoot, dir: &str, links: &str, alloc: Alloc<'_>) -> Result<Served, DepViewError> {
+    let other = || DepViewError::OtherWorkspace { links: links.to_owned() };
     if dir.is_empty() {
-        return Err(DepViewError::OtherWorkspace { links: links.to_owned() });
+        return Err(other());
     }
-    let raw_base = root.path().join(dir);
-    let base = std::fs::canonicalize(&raw_base)
-        .map_err(|_| DepViewError::OtherWorkspace { links: links.to_owned() })?;
-    if !base.starts_with(root.path()) || base == root.path() {
-        return Err(DepViewError::OtherWorkspace { links: links.to_owned() });
+    let base = RealRoot::resolve(&root.path().join(dir)).map_err(|_| other())?;
+    if !base.path().starts_with(root.path()) || base.path() == root.path() {
+        return Err(other());
     }
+    let tree = Tree::Dir(base);
     let mut files: Vec<(String, Vec<u8>)> = Vec::new();
     let mut total_bytes: usize = 0;
-    let mut stack: Vec<(std::path::PathBuf, String)> = vec![(base.clone(), String::new())];
-    while let Some((cur_dir, rel_dir)) = stack.pop() {
-        let entries = std::fs::read_dir(&cur_dir)
-            .map_err(|_| DepViewError::OtherWorkspace { links: links.to_owned() })?;
-        for entry in entries {
-            let entry = entry.map_err(|_| DepViewError::OtherWorkspace { links: links.to_owned() })?;
-            let os_name = entry.file_name();
-            let Some(name) = os_name.to_str() else { continue };
+    let mut stack = AVec::new_in(alloc);
+    stack.push(AString::new_in(alloc));
+    let outside = |rel: &str| DepViewError::Outside {
+        links: links.to_owned(),
+        key: "tree".into(),
+        path: format!("{dir}/{rel}"),
+    };
+    while let Some(rel_dir) = stack.pop() {
+        let Some(Node::Folder(entries)) = tree.node(rel_dir.as_str()).map_err(|why| match why {
+            super::TreeFault::Outside(_) => outside(rel_dir.as_str()),
+            _ => other(),
+        })?
+        else {
+            continue;
+        };
+        for (raw_name, kind) in entries {
+            let Ok(name) = core::str::from_utf8(&raw_name) else { continue };
             if name == ".git" || name == "target" {
                 continue;
             }
-            let path = entry.path();
-            let meta = std::fs::symlink_metadata(&path)
-                .map_err(|_| DepViewError::OtherWorkspace { links: links.to_owned() })?;
-            let target = if meta.file_type().is_symlink() {
-                let resolved = std::fs::canonicalize(&path).map_err(|_| DepViewError::Outside {
-                    links: links.to_owned(),
-                    key: "tree".to_owned(),
-                    path: format!("{dir}/{rel_dir}{name}"),
-                })?;
-                if !resolved.starts_with(&base) {
-                    return Err(DepViewError::Outside {
-                        links: links.to_owned(),
-                        key: "tree".to_owned(),
-                        path: format!("{dir}/{rel_dir}{name}"),
-                    });
-                }
-                resolved
-            } else {
-                path
-            };
-            let target_meta = std::fs::metadata(&target)
-                .map_err(|_| DepViewError::OtherWorkspace { links: links.to_owned() })?;
-            let rel = if rel_dir.is_empty() { name.to_owned() } else { format!("{rel_dir}/{name}") };
-            if target_meta.is_dir() {
-                stack.push((target, rel));
-            } else if target_meta.is_file() {
+            let mut rel = AString::new_in(alloc);
+            if !rel_dir.is_empty() {
+                rel.push_str(rel_dir.as_str());
+                rel.push('/');
+            }
+            rel.push_str(name);
+            if kind == Filetype::Directory {
+                stack.push(rel);
+            } else if kind == Filetype::RegularFile {
                 if files.len() >= MAX_MEMBER_MOUNT_FILES {
-                    return Err(DepViewError::OtherWorkspace { links: links.to_owned() });
+                    return Err(other());
                 }
-                let bytes = std::fs::read(&target)
-                    .map_err(|_| DepViewError::OtherWorkspace { links: links.to_owned() })?;
+                let node = tree.node(rel.as_str()).map_err(|why| match why {
+                    super::TreeFault::Outside(_) => outside(rel.as_str()),
+                    _ => other(),
+                })?;
+                let Some(Node::File(bytes)) = node else { continue };
+                let bytes = bytes.into_owned();
                 total_bytes = total_bytes.saturating_add(bytes.len());
                 if total_bytes > MAX_MEMBER_MOUNT_BYTES {
-                    return Err(DepViewError::OtherWorkspace { links: links.to_owned() });
+                    return Err(other());
                 }
-                files.push((format!("{dir}/{rel}"), bytes));
+                let mut full = AString::new_in(alloc);
+                full.push_str(dir);
+                full.push('/');
+                full.push_str(rel.as_str());
+                files.push((full.as_str().into(), bytes));
             }
         }
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(Arc::new(files))
+    Ok(Served::Keyed { files: Arc::new(files), submodules: Arc::from([]) })
 }
 
 /// The mount `mount` of a plan made against `producer`, as `reader`'s sandbox serves it.
-fn mounted(mount: DepMount<'_>, producer: &DepProducer, reader: &Tree, allow_stored: bool) -> Result<Mounted, DepViewError> {
+fn mounted(mount: DepMount<'_>, producer: &DepProducer, reader: &Tree, allow_stored: bool, alloc: Alloc<'_>) -> Result<Mounted, DepViewError> {
     let (links, at, served) = match mount {
         DepMount::Out { links, at } => {
             if let Some(file) = producer.stored.first() {
@@ -471,10 +473,7 @@ fn mounted(mount: DepMount<'_>, producer: &DepProducer, reader: &Tree, allow_sto
                 (Tree::Mem { files, submodules, .. }, _) => Served::Keyed { files: Arc::clone(files), submodules: Arc::clone(submodules) },
                 (Tree::Dir(theirs), Tree::Dir(ours)) if theirs == ours => Served::ReaderTree,
                 (Tree::Dir(theirs), _) => match producer.root.seen() {
-                    SeenRoot::Member { dir } if !dir.is_empty() => {
-                        let files = snapshot_member_dir(theirs, dir, links)?;
-                        Served::Keyed { files, submodules: Arc::from([]) }
-                    }
+                    SeenRoot::Member { dir } if !dir.is_empty() => snapshot_member_dir(theirs, dir, links, alloc)?,
                     _ => return Err(DepViewError::OtherWorkspace { links: links.to_owned() }),
                 },
             };
@@ -556,8 +555,8 @@ impl ScriptSandbox {
         let script = Arc::clone(&self.script);
         let (files, subs) = match &script.deps.mounts[mount].served {
             Served::Keyed { files, submodules } => (files, Some(submodules)),
-            Served::Stored { inline, stored } => {
-                return self.dep_stored_node(mount, inline, stored, script.deps.file_area.as_deref(), &rel);
+            Served::Stored { .. } => {
+                return self.dep_stored_node(mount, &rel);
             }
             Served::ReaderTree => {
                 let found = match script.tree.node(&rel) {
@@ -576,17 +575,15 @@ impl ScriptSandbox {
         }
     }
 
-    fn dep_stored_node(
-        &mut self,
-        mount: usize,
-        inline: &[(String, Vec<u8>)],
-        stored: &[(String, [u8; 32])],
-        file_area: Option<&std::path::Path>,
-        rel: &str,
-    ) -> Result<Option<Node<'static>>, Stop> {
+    fn dep_stored_node(&mut self, mount: usize, rel: &str) -> Result<Option<Node<'static>>, Stop> {
+        let script = Arc::clone(&self.script);
+        let Served::Stored { inline, stored } = &script.deps.mounts[mount].served else {
+            return Ok(None);
+        };
+        let file_area = script.deps.file_area.as_deref();
         if !rel.is_empty() {
             if let Ok(i) = inline.binary_search_by(|(p, _)| p.as_str().cmp(rel)) {
-                return Ok(Some(Node::File(std::borrow::Cow::Owned(inline[i].1.clone()))));
+                return Ok(Some(Node::File(Cow::Owned(inline[i].1.to_vec()))));
             }
             if let Ok(i) = stored.binary_search_by(|(p, _)| p.as_str().cmp(rel)) {
                 let Some(area) = file_area else {
@@ -595,29 +592,42 @@ impl ScriptSandbox {
                         "a `links = \"{links}\"` OUT_DIR stored file `{rel}` was read with no file area configured"
                     ))));
                 };
-                let mut hex = String::with_capacity(64);
-                for byte in stored[i].1 {
-                    use core::fmt::Write as _;
-                    let _ = write!(hex, "{byte:02x}");
-                }
-                let path = area.join(&hex);
-                let bytes = match std::fs::read(&path) {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
-                        let links = &self.script.deps.mounts[mount].links;
-                        return Err(self.refuse(Refusal::Path(format!(
-                            "reading `links = \"{links}\"` stored OUT_DIR file `{rel}` ({}): {err}",
-                            path.display()
-                        ))));
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let mut hex_buf = [0u8; 64];
+                if let Some((_, digest)) = stored.get(i) {
+                    for (&byte, dst) in digest.iter().zip(hex_buf.chunks_exact_mut(2)) {
+                        if let [hi, lo] = dst {
+                            *hi = HEX.get(usize::from(byte >> 4)).copied().unwrap_or(b'0');
+                            *lo = HEX.get(usize::from(byte & 0x0f)).copied().unwrap_or(b'0');
+                        }
                     }
+                }
+                let hex = core::str::from_utf8(&hex_buf).unwrap_or("");
+                let read_err = |msg: &dyn fmt::Display| {
+                    let links = &script.deps.mounts[mount].links;
+                    Refusal::Path(format!(
+                        "reading `links = \"{links}\"` stored OUT_DIR file `{rel}` ({}): {msg}",
+                        area.join(hex).display()
+                    ))
                 };
-                return Ok(Some(Node::File(std::borrow::Cow::Owned(bytes))));
+                let area_root = RealRoot::resolve(area).map_err(|err| self.refuse(read_err(&err)))?;
+                let bytes = match Tree::Dir(area_root).node(hex) {
+                    Ok(Some(Node::File(bytes))) => bytes.into_owned(),
+                    Ok(_) => return Err(self.refuse(read_err(&"not found"))),
+                    Err(err) => return Err(self.refuse(read_err(&err))),
+                };
+                return Ok(Some(Node::File(Cow::Owned(bytes))));
             }
         }
-        let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };
         let mut entries: Vec<(Vec<u8>, Filetype)> = Vec::new();
         for path in inline.iter().map(|(p, _)| p.as_str()).chain(stored.iter().map(|(p, _)| p.as_str())) {
-            let Some(rest) = path.strip_prefix(prefix.as_str()) else { continue };
+            let Some(rest) = (if rel.is_empty() {
+                Some(path)
+            } else {
+                path.strip_prefix(rel).and_then(|s| s.strip_prefix('/'))
+            }) else {
+                continue;
+            };
             if rest.is_empty() {
                 continue;
             }

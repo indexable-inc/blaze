@@ -629,7 +629,7 @@ fn spawn_probe_accepts_out_dir_subdir_and_refuses_escapes() {
     let out_dir = "/target/debug/build/aws-lc-sys-0123456789abcdef/out";
     let host = "x86_64-unknown-linux-gnu";
     let clang_pin = blaze_build_script::toolchain::clang_pin(blaze_pins::CLANG_JSON, host).expect("linux x64 clang pin");
-    let shared = SharedAlloc::global();
+    let shared = blaze_own::testing::heap().shared();
     let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> = OwnArc::new_in(StubProbeAnswerer, shared);
     let records: OwnArc<dyn CProbeStore, SharedAlloc<'static>> = OwnArc::new_in(MemCProbeStore::default(), shared);
     let c_probes = CProbeSetting::Ready(CScriptProbes {

@@ -595,7 +595,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// Where the per-expansion pending slices for the next guarded or-pattern arm start.
     pub(super) fn alt_ranges_mark(&self) -> u32 {
-        self.moves.alt_ranges.len() as u32
+        u32::try_from(self.moves.alt_ranges.len()).unwrap_or(u32::MAX)
     }
 
     /// Records the `(start, end)` pending move slice for one expansion of a guarded or-pattern.
@@ -636,36 +636,43 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(malformed("an arm's held moves past the list"));
         }
         let common_from = if let Some(AltMoves { word, ranges_start, n, common_from }) = alts {
-            let rs = ranges_start as usize;
-            let re = rs.checked_add(n as usize).ok_or(malformed("alt move ranges overflow"))?;
-            if re > self.moves.alt_ranges.len() || (common_from as usize) > self.moves.pending.len() {
+            let rs = usize::try_from(ranges_start).map_err(|_| malformed("alt move ranges start past `usize`"))?;
+            let n_usize = usize::try_from(n).map_err(|_| malformed("alt move range count past `usize`"))?;
+            let re = rs.checked_add(n_usize).ok_or(malformed("alt move ranges overflow"))?;
+            let cf = usize::try_from(common_from).map_err(|_| malformed("alt move common_from past `usize`"))?;
+            let Some(ranges) = self.moves.alt_ranges.get(rs..re) else {
+                return Err(malformed("an arm's alt move ranges past the list"));
+            };
+            if cf > self.moves.pending.len() {
                 return Err(malformed("an arm's alt move ranges past the list"));
             }
-            let any_alt_move = (rs..re).any(|idx| {
-                let (s, e) = self.moves.alt_ranges[idx];
-                s < e
-            });
-            if any_alt_move && n > 0 {
+            let any_alt_move = ranges.iter().any(|&(s, e)| s < e);
+            if any_alt_move && n_usize > 0 {
                 let live = self.live;
                 let a = self.b.slot_addr(word);
                 let attrs = self.mem(Repr::Int { ty: Ty::I32, signed: false });
                 let k = self.b.load(Ty::I32, Flags::NONE, a, 0, attrs);
                 let join = self.create();
-                let mut blocks: Vec<blaze_lir::Block, A> = Vec::with_capacity_in(n as usize, self.alloc);
-                for _ in 0..n {
+                let mut blocks: blaze_own::Vec<blaze_lir::Block, A> = blaze_own::Vec::with_capacity_in(n_usize, self.alloc);
+                for _ in 0..n_usize {
                     blocks.push(self.create());
                 }
-                let mut cases: Vec<(u128, blaze_lir::Block), A> = Vec::with_capacity_in(n as usize - 1, self.alloc);
-                for j in 0..n - 1 {
-                    cases.push((u128::from(j), blocks[j as usize]));
+                let mut cases: blaze_own::Vec<(u128, blaze_lir::Block), A> = blaze_own::Vec::with_capacity_in(n_usize - 1, self.alloc);
+                if let Some((&default_blk, rest)) = blocks.split_last() {
+                    for (j, &blk) in rest.iter().enumerate() {
+                        let key = u128::try_from(j).map_err(|_| malformed("alt move case key overflow"))?;
+                        cases.push((key, blk));
+                    }
+                    self.switch(k, default_blk, &cases);
                 }
-                self.switch(k, blocks[n as usize - 1], &cases);
-                for j in 0..n as usize {
-                    let (s, e) = self.moves.alt_ranges[rs + j];
-                    self.begin(blocks[j]);
+                for (j, &blk) in blocks.iter().enumerate() {
+                    let &(s, e) = self.moves.alt_ranges.get(rs + j).ok_or(malformed("alt move range missing"))?;
+                    self.begin(blk);
                     self.live = live;
-                    for i in s as usize..e as usize {
-                        let eff = self.moves.pending[i];
+                    let s_usize = usize::try_from(s).map_err(|_| malformed("alt move start past `usize`"))?;
+                    let e_usize = usize::try_from(e).map_err(|_| malformed("alt move end past `usize`"))?;
+                    for i in s_usize..e_usize {
+                        let eff = *self.moves.pending.get(i).ok_or(malformed("alt move pending missing"))?;
                         self.arm_effect(eff, false)?;
                     }
                     self.jump(join, &[]);
@@ -674,7 +681,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 self.live = live;
             }
             self.moves.alt_ranges.truncate(rs);
-            common_from as usize
+            cf
         } else {
             from
         };

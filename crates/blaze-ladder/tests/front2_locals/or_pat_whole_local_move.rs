@@ -17,7 +17,7 @@ use blaze_ladder::run::{FrontChoice, NewFront, run_with};
 
 const NEW: NewFront<'static> = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: blaze_build::OverflowChecks::On };
 
-const PRELUDE: &str = include_str!("../../blaze-cli/tests/ladder/front2/x0-async-01/src/prelude.rs");
+const PRELUDE: &str = include_str!("../../../blaze-cli/tests/ladder/front2/x0-async-01/src/prelude.rs");
 
 const HEAD: &str = r#"#![feature(no_core, lang_items, intrinsics, rustc_attrs)]
 #![no_core]

@@ -520,9 +520,13 @@ pub fn symbol_cluster_count(s: &str) -> usize {
 mod tests {
     use super::*;
 
+    fn test_alloc() -> Alloc<'static> {
+        Alloc::global()
+    }
+
     #[test]
     fn parses_host_project_abbreviations_and_completions_no_std() {
-        let alloc = Alloc::global();
+        let alloc = test_alloc();
         let cfg = UserConfig::parse_in(
             r#"
 [host]
@@ -574,7 +578,7 @@ cl = "claude --dangerously-skip-permissions"
 
     #[test]
     fn terminal_alt_screen_defaults_to_pane_and_names_a_bad_value() {
-        let alloc = Alloc::global();
+        let alloc = test_alloc();
         let cfg = UserConfig::parse_in("", alloc);
         assert_eq!(cfg.alt_screen, AltScreenPlacement::Pane);
         assert_eq!(cfg.alt_screen_rejected, None);

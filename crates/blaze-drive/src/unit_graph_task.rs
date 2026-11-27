@@ -838,11 +838,11 @@ mod session_tests {
     /// 130-deep cold WASI-only dependency chain completes cleanly within `MOST_PASSES` (256).
     #[test]
     fn stateful_session_cold_fetch_handoffs_do_not_consume_resolution_passes() {
-        use std::fmt::Write as _;
+        use core::fmt::Write as _;
         const CHAIN_LEN: usize = 130;
         let alloc = blaze_own::testing::heap().alloc();
 
-        let mut lock_text = std::string::String::from("version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"shim\"]\n\n");
+        let mut lock_text = blaze_own::AString::from_str_in("version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"shim\"]\n\n", alloc);
         let _ = writeln!(
             lock_text,
             "[[package]]\nname = \"shim\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{:064x}\"\ndependencies = [\"w0\"]\n",
@@ -902,18 +902,19 @@ mod session_tests {
             ],
             alloc,
         );
-        let mut all_packs: std::vec::Vec<(ContentId, AVec<'_, u8>)> = std::vec::Vec::with_capacity(CHAIN_LEN + 1);
+        let mut all_packs: AVec<'_, (ContentId, AVec<'_, u8>)> = AVec::with_capacity_in(CHAIN_LEN + 1, alloc);
         all_packs.push((shim_key, shim_pack));
         for i in 0..CHAIN_LEN {
             let mut sha = [0u8; 32];
             sha[24..].copy_from_slice(&((i + 1) as u64).to_be_bytes());
-            let name = std::format!("w{i}");
-            let key = SourceId::Crate { name: &name, version: "0.1.0", sha256: sha }.key();
-            let toml = if i + 1 < CHAIN_LEN {
-                std::format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nw{} = \"0.1\"\n", i + 1)
-            } else {
-                std::format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
-            };
+            let mut name = blaze_own::AString::new_in(alloc);
+            let _ = write!(name, "w{i}");
+            let key = SourceId::Crate { name: name.as_str(), version: "0.1.0", sha256: sha }.key();
+            let mut toml = blaze_own::AString::new_in(alloc);
+            let _ = writeln!(toml, "[package]\nname = \"{}\"\nversion = \"0.1.0\"\nedition = \"2021\"", name.as_str());
+            if i + 1 < CHAIN_LEN {
+                let _ = writeln!(toml, "[dependencies]\nw{} = \"0.1\"", i + 1);
+            }
             let pack = make_pack(sha, &[("Cargo.toml", toml.as_bytes()), ("src/lib.rs", b"pub fn f() {}\n")], alloc);
             all_packs.push((key, pack));
         }
