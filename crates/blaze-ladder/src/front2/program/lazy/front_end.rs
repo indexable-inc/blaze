@@ -147,17 +147,28 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// names bound (the reach walk also visits fns used as values, fn pointers included).
     fn check_one_by(&mut self, key: ItemKey, typer: super::fill::Typer<'_>) -> Result<Option<(usize, Checked<'static>)>, crate::run::RunError> {
         use crate::run::RunError;
+        let checked_here = matches!(typer, super::fill::Typer::Check);
         let body = self.check_one_key_by(key, typer).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
-        if let Some((_, checked)) = &body {
+        let bound = if let Some((_, checked)) = &body {
             let values = checked.expr_defs.column::<1>().iter().filter_map(|d| match *d {
                 tc::Def::Fn(k) => Some(k),
                 _ => None,
             });
-            for callee in checked.callees.column::<1>().iter().copied().chain(values) {
-                self.bind_internal(key, callee).map_err(RunError::Front2)?;
-            }
+            checked
+                .callees
+                .column::<1>()
+                .iter()
+                .copied()
+                .chain(values)
+                .try_for_each(|callee| self.bind_internal(key, callee).map(|_| ()))
         } else {
-            self.bind_internal(key, key).map_err(RunError::Front2)?;
+            self.bind_internal(key, key).map(|_| ())
+        };
+        if let Err(err) = bound {
+            if let Some((i, _)) = body {
+                self.rollback_checked_row(i, checked_here);
+            }
+            return Err(RunError::Front2(err));
         }
         Ok(body)
     }
@@ -423,8 +434,16 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
             tc::Def::Fn(k) => Some(k),
             _ => None,
         });
-        for callee in checked.callees.column::<1>().iter().copied().chain(values) {
-            self.bind_internal(orig_key, callee).map_err(crate::run::RunError::Front2)?;
+        let bound = checked
+            .callees
+            .column::<1>()
+            .iter()
+            .copied()
+            .chain(values)
+            .try_for_each(|callee| self.bind_internal(orig_key, callee).map(|_| ()));
+        if let Err(err) = bound {
+            self.rollback_specialized_row(spec_row);
+            return Err(crate::run::RunError::Front2(err));
         }
         Ok(Some((spec_row, Some(checked))))
     }
