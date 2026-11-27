@@ -55,6 +55,7 @@ mod coroutine;
 mod coroutine_id;
 mod cost;
 mod deferred_place;
+mod deprecated_safe;
 mod discriminant;
 mod dyn_objects;
 mod expect_inputs;

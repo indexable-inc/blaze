@@ -51,7 +51,7 @@ use crate::machine::Machine;
 use crate::rules::args_inline::TypedFinding;
 use crate::rules::target_feature::Gate;
 use crate::ty::{Ty, TyView, TypeCtx};
-use crate::world::{AdtKind, Def, World};
+use crate::world::{AdtKind, Def, TypeAttrs, World};
 
 /// What the unsafety pass could not decide in a body: no error and no pass, filed as "not
 /// checked" by the command that prints the body's verdict (rule 3: never quietly a pass).
@@ -268,9 +268,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
-    /// A call `e` of the fn item `k`: E0133 when `k` is `unsafe` or a safe `#[target_feature]`
-    /// fn in a body that enables none of its features, outside `unsafe`; [`Undecided`] when the
-    /// body has features of its own and the outcome would be a finding.
+    /// A call `e` of the fn item `k`: E0133 when `k` is `unsafe` (except a direct call in an
+    /// edition before 2024 to a fn marked `#[rustc_deprecated_safe_2024]` / `#[deprecated_safe]`)
+    /// or a safe `#[target_feature]` fn in a body that enables none of its features, outside
+    /// `unsafe`; [`Undecided`] when the body has features of its own and the outcome would be a
+    /// finding.
     fn unsafe_call(&mut self, e: ExprId, k: ItemKey, ctx: Ctx) -> Result<(), Stop> {
         // Before 2024 nothing in an `unsafe fn`'s body is filed ([`Ctx::UnsafeFn`]).
         let files = match ctx {
@@ -282,12 +284,23 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(());
         }
         let Some(sig) = self.reads.fn_sig(k)? else { return Ok(()) };
-        if sig.header.safety == Safety::Unsafe {
-            self.refuse(ctx, At::Expr(e), UnsafeOp::Call(Some(k)));
-            return Ok(());
-        }
-        let attrs = self.reads.attrs(k)?;
-        match self.feature_gate(attrs, sig.header.safety)? {
+        let attrs = if sig.header.safety == Safety::Unsafe {
+            if self.body.expr_edition(e) < Edition::E2024 {
+                let attrs = self.reads.attrs(k)?;
+                if attrs.0 & TypeAttrs::DEPRECATED_SAFE_2024 != 0 {
+                    attrs
+                } else {
+                    self.refuse(ctx, At::Expr(e), UnsafeOp::Call(Some(k)));
+                    return Ok(());
+                }
+            } else {
+                self.refuse(ctx, At::Expr(e), UnsafeOp::Call(Some(k)));
+                return Ok(());
+            }
+        } else {
+            self.reads.attrs(k)?
+        };
+        match self.feature_gate(attrs, Safety::Safe)? {
             Gate::Open => {}
             Gate::Unsafe => self.refuse(ctx, At::Expr(e), UnsafeOp::TargetFeatureCall(k)),
             Gate::FeatureBody => {

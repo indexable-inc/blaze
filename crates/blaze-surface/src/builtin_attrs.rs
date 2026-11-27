@@ -20,7 +20,7 @@ pub const BUILTIN_ATTRS: &[&str] = &[
     "align", "allow", "allow_internal_unsafe", "allow_internal_unstable", "automatically_derived",
     "cfg", "cfg_attr", "clippy", "cold", "collapse_debuginfo", "const_continue", "const_trait",
     "coroutine", "coverage", "crate_name", "crate_type", "custom_mir", "debugger_visualizer", "deny",
-    "deprecated", "diagnostic", "do_not_recommend", "doc", "expect", "export_name", "feature",
+    "deprecated", "deprecated_safe", "diagnostic", "do_not_recommend", "doc", "expect", "export_name", "feature",
     "ffi_const", "ffi_pure", "forbid", "fundamental", "ignore", "inline", "instruction_set", "lang",
     "link", "link_name", "link_ordinal", "link_section", "linkage", "loop_match", "macro_escape",
     "macro_export", "macro_use", "marker", "may_dangle", "must_not_suspend", "must_use", "naked",

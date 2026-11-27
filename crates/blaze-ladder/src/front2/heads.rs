@@ -1286,9 +1286,11 @@ impl FnQualifiers {
     // Bit zero is free in the function subset of TypeAttrs.
     pub const CONST: Self = Self(1);
     const ATTRS: u32 = tc::TypeAttrs::PROMOTABLE | tc::TypeAttrs::INTRINSIC | tc::TypeAttrs::TARGET_FEATURE;
+    const ATTRS_BYTE: u8 = Self::ATTRS.to_le_bytes()[0];
     const INTERNAL_SYMBOL: u8 = 1 << 1;
     const RENAMED_INTERNAL: u8 = 1 << 3;
     const WRITES_LIFETIMES: u8 = 1 << 6;
+    const DEPRECATED_SAFE_2024: u8 = 1 << 7;
 
     fn of_flags(flags: u32) -> Self {
         Self(u8::from(flags & sig::CONST != 0))
@@ -1310,11 +1312,12 @@ impl FnQualifiers {
     }
 
     fn attribute(&mut self, path: &str) {
-        use super::fn_attrs::{COMPTIME, INTRINSIC, PROMOTABLE, TARGET_FEATURE};
+        use super::fn_attrs::{COMPTIME, DEPRECATED_SAFE, INTRINSIC, PROMOTABLE, RUSTC_DEPRECATED_SAFE_2024, TARGET_FEATURE};
         self.0 |= match path {
             PROMOTABLE => tc::TypeAttrs::PROMOTABLE as u8,
             INTRINSIC => tc::TypeAttrs::INTRINSIC as u8,
             TARGET_FEATURE => tc::TypeAttrs::TARGET_FEATURE as u8,
+            RUSTC_DEPRECATED_SAFE_2024 | DEPRECATED_SAFE => Self::DEPRECATED_SAFE_2024,
             COMPTIME => Self::CONST.0,
             super::internal_symbol::ATTR => Self::INTERNAL_SYMBOL,
             _ => 0,
@@ -1330,7 +1333,8 @@ impl FnQualifiers {
     }
 
     pub(super) fn from_byte(byte: u8) -> Option<Self> {
-        let allowed = Self::CONST.0 | Self::ATTRS as u8 | Self::INTERNAL_SYMBOL | Self::RENAMED_INTERNAL | Self::WRITES_LIFETIMES;
+        const { assert!(Self::ATTRS == (Self::ATTRS & 0xff)) };
+        let allowed = Self::CONST.0 | Self::ATTRS_BYTE | Self::INTERNAL_SYMBOL | Self::RENAMED_INTERNAL | Self::WRITES_LIFETIMES | Self::DEPRECATED_SAFE_2024;
         let valid_rename = byte & Self::RENAMED_INTERNAL == 0 || byte & Self::INTERNAL_SYMBOL != 0;
         (byte & !allowed == 0 && valid_rename).then_some(Self(byte))
     }
@@ -1340,7 +1344,8 @@ impl FnQualifiers {
     }
 
     pub fn typing(self) -> tc::TypeAttrs {
-        tc::TypeAttrs(u32::from(self.0) & Self::ATTRS)
+        let deprecated_safe = if self.0 & Self::DEPRECATED_SAFE_2024 != 0 { tc::TypeAttrs::DEPRECATED_SAFE_2024 } else { 0 };
+        tc::TypeAttrs((u32::from(self.0) & Self::ATTRS) | deprecated_safe)
     }
 
     pub fn internal_symbol(self) -> bool {

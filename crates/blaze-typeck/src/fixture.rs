@@ -1240,6 +1240,12 @@ impl Bb {
         self.pat_editions = edition_runs(&self.pat_marks, self.edition, |p| PatId(p.0 + 1));
     }
 
+    /// Clears the implicit `unsafe` block marks `Bb::e` adds so unsafety rules (E0133) run on
+    /// this body as a safe context.
+    pub fn clear_unsafe_blocks(&mut self) {
+        self.unsafe_blocks.clear();
+    }
+
     /// An integer literal written as a call's argument, whose value `value` the lowering
     /// hands over (`BodyView::call_arg_ints`).
     pub fn int_valued(&mut self, suffix: Option<IntSuffix>, value: u128) -> ExprId {

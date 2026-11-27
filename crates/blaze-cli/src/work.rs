@@ -1044,8 +1044,8 @@ fn may_expand_attrs(mut attrs: impl Iterator<Item = blaze_surface::Attr>, item: 
 /// that no macro answers (the Reference, "Attributes", built-in attributes index): one that
 /// writes no item. `derive`, `test` and every path the crate resolves to a macro are not.
 fn inert_attribute(attr: &str) -> bool {
-    const INERT: [&str; 30] = [
-        "allow", "warn", "deny", "forbid", "expect", "deprecated", "must_use", "inline", "cold", "track_caller", "no_mangle", "export_name", "link_section", "link_name", "link",
+    const INERT: [&str; 31] = [
+        "allow", "warn", "deny", "forbid", "expect", "deprecated", "deprecated_safe", "must_use", "inline", "cold", "track_caller", "no_mangle", "export_name", "link_section", "link_name", "link",
         "used", "repr", "non_exhaustive", "automatically_derived", "macro_use", "doc", "path", "ignore", "should_panic", "target_feature", "naked", "no_link", "unsafe", "coverage",
         "debugger_visualizer",
     ];

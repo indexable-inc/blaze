@@ -59,6 +59,16 @@ pub const TARGET_FEATURE: &str = "target_feature";
 /// as a `const fn` (`FnQualifiers::CONST`).
 pub const COMPTIME: &str = "rustc_comptime";
 
+/// The stdlib attribute marking an `unsafe fn` that remains safe to call directly in editions
+/// before 2024 (`std::env::set_var`, `std::env::remove_var`, `CommandExt::before_exec`;
+/// [`TypeAttrs::DEPRECATED_SAFE_2024`]).
+pub const RUSTC_DEPRECATED_SAFE_2024: &str = "rustc_deprecated_safe_2024";
+
+/// The unstable attribute marking an `unsafe fn` that remains safe to call directly in editions
+/// before 2024 (`#[deprecated_safe(since = "..", note = "..")]`;
+/// [`TypeAttrs::DEPRECATED_SAFE_2024`]).
+pub const DEPRECATED_SAFE: &str = "deprecated_safe";
+
 /// Whether an attribute's path, as written, is `blaze::cost` (spaces around `::` allowed).
 pub fn is_cost_attr(path: &str) -> bool {
     path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "cost")

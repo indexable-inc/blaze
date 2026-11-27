@@ -1102,7 +1102,7 @@ fn scan_at<'a>(text: &str, depth: u16, alloc: Alloc<'a>) -> Nested<'a> {
 /// `macro_export`, `no_mangle`, `export_name`, `used`, `link_section`, `lang`,
 /// `panic_handler` and `global_allocator` name the item outside the body, `unsafe(..)` wraps
 /// one of those, and an unknown one is not known to do nothing.
-const INERT_ATTRS: [&str; 18] = [
+const INERT_ATTRS: [&str; 19] = [
     "cfg",
     "doc",
     "allow",
@@ -1114,6 +1114,7 @@ const INERT_ATTRS: [&str; 18] = [
     "cold",
     "must_use",
     "deprecated",
+    "deprecated_safe",
     "track_caller",
     "repr",
     "non_exhaustive",

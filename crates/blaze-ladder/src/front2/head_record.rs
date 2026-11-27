@@ -204,7 +204,10 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 42: `FnHead::cost` carries opt-in `#[blaze::cost(..)]` complexity contracts.
 /// 43: `AdtRow` carries `capability` (`#[blaze::capability]`) and `sans_io` (`#![blaze::sans_io]`
 /// scope) flags after `args`.
-pub const VERSION: u32 = 43;
+/// 44: `FnQualifiers` bit 7 carries `DEPRECATED_SAFE_2024` (`#[rustc_deprecated_safe_2024]` /
+/// `#[deprecated_safe]`), so pre-2024 editions allow direct calls without `unsafe` while 2024+
+/// still requires `unsafe` (E0133).
+pub const VERSION: u32 = 44;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";

@@ -86,3 +86,20 @@ fn rustc_comptime_fn_is_const_callable() {
     assert_eq!(ordinary, FnKind::NotConst);
     assert_ne!(comptime_digest, runtime_digest);
 }
+
+#[test]
+fn frozen_deprecated_safe_2024_round_trips() {
+    let (rustc_attr, _, d_rustc) = facts("#![no_std]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")] pub unsafe fn f() {}");
+    let (user_attr, _, d_user) = facts("#![no_std]\n#![feature(deprecated_safe)]\n#[deprecated_safe(since = \"1.82.0\", note = \"use unsafe\")] pub unsafe fn f() {}");
+    let (cfg_on, _, d_cfg_on) = facts("#![no_std]\n#![feature(rustc_attrs)]\n#[cfg_attr(all(), rustc_deprecated_safe_2024(audit_that = \"ok\"))] pub unsafe fn f() {}");
+    let (cfg_off, _, d_cfg_off) = facts("#![no_std]\n#![feature(rustc_attrs)]\n#[cfg_attr(any(), rustc_deprecated_safe_2024(audit_that = \"off\"))] pub unsafe fn f() {}");
+    let (plain, _, d_plain) = facts("#![no_std]\n#![feature(rustc_attrs)]\npub unsafe fn f() {}");
+    assert_eq!(rustc_attr.typing(), TypeAttrs(TypeAttrs::DEPRECATED_SAFE_2024));
+    assert_eq!(user_attr.typing(), TypeAttrs(TypeAttrs::DEPRECATED_SAFE_2024));
+    assert_eq!(cfg_on.typing(), TypeAttrs(TypeAttrs::DEPRECATED_SAFE_2024));
+    assert_eq!(cfg_off.typing(), TypeAttrs(0));
+    assert_eq!(plain.typing(), TypeAttrs(0));
+    assert_ne!(d_rustc, d_plain, "enabling rustc_deprecated_safe_2024 must change the reader digest");
+    assert_ne!(d_user, d_plain, "enabling deprecated_safe must change the reader digest");
+    assert_ne!(d_cfg_on, d_cfg_off, "cfg_attr toggling deprecated_safe_2024 must change the reader digest");
+}

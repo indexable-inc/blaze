@@ -592,6 +592,11 @@ impl TypeAttrs {
     /// checked by `capability-in-sans-io` (rules/capability.rs) to store no `#[blaze::capability]`
     /// field directly or transitively. Bit 23.
     pub const SANS_IO: u32 = 1 << 23;
+    /// `#[rustc_deprecated_safe_2024(..)]` or `#[deprecated_safe(..)]` on an `unsafe fn`
+    /// (RFC 3458; std's `env::set_var`, `env::remove_var`, `CommandExt::before_exec`): a
+    /// direct call to this fn item is safe in editions before 2024 and requires `unsafe` from
+    /// edition 2024 (rules/unsafety.rs). Coercing to a fn pointer keeps `unsafe fn`. Bit 24.
+    pub const DEPRECATED_SAFE_2024: u32 = 1 << 24;
 
     /// Whether this item carries `#[blaze::capability]`.
     pub const fn is_capability(self) -> bool {

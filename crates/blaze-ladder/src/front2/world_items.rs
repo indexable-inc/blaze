@@ -1203,7 +1203,8 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// type, blaze-typeck asm.rs), from the same made repr (`ReprAttrs::simd`).
     /// A fn item's (the callee of a borrowed call, blaze-typeck rules/promote.rs): read from
     /// its made head's text ([`super::fn_attrs::fn_type_attrs`], `#[rustc_promotable]`,
-    /// `#[rustc_intrinsic]`, `#[target_feature]`); a ctor fn carries none. A fn's key is never
+    /// `#[rustc_intrinsic]`, `#[target_feature]`, `#[rustc_deprecated_safe_2024]`,
+    /// `#[deprecated_safe]`); a ctor fn carries none. A fn's key is never
     /// asked for as an ADT (rung x0-drop-11-zst-temporary: "a fn (asked for as an ADT)").
     fn attrs_once(&self, item: ItemKey) -> Fetch<TypeAttrs> {
         if let Some(a) = self.store.adts.get(&item) {

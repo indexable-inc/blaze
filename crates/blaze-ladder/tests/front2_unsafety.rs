@@ -32,7 +32,7 @@ use blaze_surface::{Namespace, PathKind};
 
 /// The lang items as tests/front2_body_const_paths.rs models them, `Copy` for the values the
 /// cases read, and the items the cases use.
-const PRELUDE: &str = r#"#![feature(no_core, lang_items, intrinsics)]
+const PRELUDE: &str = r#"#![feature(no_core, lang_items, intrinsics, rustc_attrs, deprecated_safe)]
 #![no_core]
 #![no_main]
 
@@ -319,6 +319,96 @@ fn before_2024_the_words_name_the_unsafe_fn() {
             ("call_2021".to_string(), "E0133 call to unsafe function `uf` is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)".to_string()),
             ("call_2021_ok".to_string(), "clean".to_string()),
             ("in_unsafe_fn_2021".to_string(), "clean".to_string()),
+        ]
+    );
+}
+
+/// `#[rustc_deprecated_safe_2024]` and `#[deprecated_safe]` functions (e.g. `std::env::set_var`,
+/// `std::env::remove_var`, `CommandExt::before_exec`) are safe to call directly in Edition < 2024
+/// and require `unsafe` (E0133) starting in Edition 2024. Controls verify plain `unsafe fn`,
+/// fn-pointer coercion, and `#[target_feature]` still require `unsafe` in Edition 2021.
+#[test]
+fn deprecated_safe_2024_by_edition() {
+    let text = r#"
+#[rustc_deprecated_safe_2024(audit_that = "single-threaded")]
+unsafe fn set_var_like() {}
+
+#[deprecated_safe(since = "1.82.0", note = "use unsafe")]
+unsafe fn dep_safe_like() {}
+
+#[rustc_deprecated_safe_2024(audit_that = "single-threaded")]
+#[target_feature(enable = "neon")]
+unsafe fn dep_safe_tf() {}
+
+struct Cmd;
+impl Cmd {
+    #[rustc_deprecated_safe_2024(audit_that = "async-signal-safe")]
+    unsafe fn inherent_dep(&self) {}
+}
+
+trait CmdExt {
+    #[rustc_deprecated_safe_2024(audit_that = "async-signal-safe")]
+    unsafe fn before_exec_like(&self);
+}
+
+impl CmdExt for Cmd {
+    unsafe fn before_exec_like(&self) {}
+}
+
+fn call_rustc_dep() { set_var_like() }
+fn call_rustc_dep_unsafe() { unsafe { set_var_like() } }
+fn call_dep_safe() { dep_safe_like() }
+fn call_dep_safe_unsafe() { unsafe { dep_safe_like() } }
+fn call_inherent_dep(c: &Cmd) { c.inherent_dep() }
+fn call_trait_dep(c: &Cmd) { c.before_exec_like() }
+fn call_plain_unsafe() { uf() }
+fn call_dep_via_ptr() {
+    let f: unsafe fn() = set_var_like;
+    f()
+}
+fn call_dep_tf() { dep_safe_tf() }
+"#;
+    let names = [
+        "call_rustc_dep",
+        "call_rustc_dep_unsafe",
+        "call_dep_safe",
+        "call_dep_safe_unsafe",
+        "call_inherent_dep",
+        "call_trait_dep",
+        "call_plain_unsafe",
+        "call_dep_via_ptr",
+        "call_dep_tf",
+    ];
+
+    let got_2021 = check_fns("2021", text, &names);
+    assert_eq!(
+        got_2021,
+        vec![
+            ("call_rustc_dep".to_string(), "clean".to_string()),
+            ("call_rustc_dep_unsafe".to_string(), "clean".to_string()),
+            ("call_dep_safe".to_string(), "clean".to_string()),
+            ("call_dep_safe_unsafe".to_string(), "clean".to_string()),
+            ("call_inherent_dep".to_string(), "clean".to_string()),
+            ("call_trait_dep".to_string(), "clean".to_string()),
+            ("call_plain_unsafe".to_string(), "E0133 call to unsafe function `uf` is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)".to_string()),
+            ("call_dep_via_ptr".to_string(), "E0133 call to unsafe function is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)".to_string()),
+            ("call_dep_tf".to_string(), "E0133 call to function `dep_safe_tf` with `#[target_feature]` is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)".to_string()),
+        ]
+    );
+
+    let got_2024 = check_fns("2024", text, &names);
+    assert_eq!(
+        got_2024,
+        vec![
+            ("call_rustc_dep".to_string(), "E0133 call to unsafe function `set_var_like` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
+            ("call_rustc_dep_unsafe".to_string(), "clean".to_string()),
+            ("call_dep_safe".to_string(), "E0133 call to unsafe function `dep_safe_like` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
+            ("call_dep_safe_unsafe".to_string(), "clean".to_string()),
+            ("call_inherent_dep".to_string(), "E0133 call to unsafe function `inherent_dep` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
+            ("call_trait_dep".to_string(), "E0133 call to unsafe function `before_exec_like` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
+            ("call_plain_unsafe".to_string(), "E0133 call to unsafe function `uf` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
+            ("call_dep_via_ptr".to_string(), "E0133 call to unsafe function is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
+            ("call_dep_tf".to_string(), "E0133 call to unsafe function `dep_safe_tf` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
         ]
     );
 }

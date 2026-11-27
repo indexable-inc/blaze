@@ -392,7 +392,7 @@ const ALLOCATOR_SYMBOLS: [&str; 4] = ["__rust_alloc", "__rust_dealloc", "__rust_
 
 /// The builtin attributes that write nothing (rustc's `BUILTIN_ATTRIBUTES` that are no macro).
 const INERT: &[&str] = &[
-    "doc", "cfg", "allow", "warn", "deny", "forbid", "expect", "deprecated", "must_use", "inline", "cold",
+    "doc", "cfg", "allow", "warn", "deny", "forbid", "expect", "deprecated", "deprecated_safe", "must_use", "inline", "cold",
     "track_caller", "repr", "non_exhaustive", "automatically_derived", "no_mangle", "export_name", "link_name",
     "link_section", "link", "link_ordinal", "used", "path", "stable", "unstable", "allow_internal_unstable",
     "allow_internal_unsafe", "target_feature", "naked", "optimize", "coverage", "instruction_set", "fundamental",
