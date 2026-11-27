@@ -50,7 +50,7 @@ use core::cell::{Cell, OnceCell, RefCell};
 
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::{ABox, ARc, AVec, Alloc, Box, Bump, Rc};
+use blaze_own::{ABTreeMap, ABox, ARc, AVec, Alloc, Box, Bump, Rc};
 use blaze_surface::{CallShape, Edition, FileItemsView, ImplFlags, ItemDetail, ItemIndex, ItemKind, ProcKind, RecordBytes};
 
 use crate::package_path::{NotPackagePath, PackagePath};
@@ -353,12 +353,43 @@ pub(crate) mod plant {
 /// are written in sorted order, so the order is a function of the solve's answers).
 struct Strings<'b, 's> {
     bytes: RecordBytes<'b>,
-    seen: HashMap<&'s str, (u32, u32), Alloc<'b>>,
+    /// Fixed-node B-tree mapping each unique string to its deterministic first-use `(offset, len)`:
+    /// duplicates allocate 0 bytes and growth never reallocates or abandons a backing array on
+    /// the bump allocator.
+    seen: ABTreeMap<'b, &'s str, (u32, u32)>,
+    total_bytes: usize,
 }
 
 impl<'b, 's> Strings<'b, 's> {
     fn new(alloc: Alloc<'b>) -> Strings<'b, 's> {
-        Strings { bytes: RecordBytes::new_in(alloc), seen: HashMap::new_in(alloc) }
+        Strings {
+            bytes: RecordBytes::new_in(alloc),
+            seen: ABTreeMap::new_in(alloc),
+            total_bytes: 0,
+        }
+    }
+
+    fn plan(&mut self, s: &'s str) -> Result<(), ItemsRecordError> {
+        if self.seen.contains_key(s) {
+            return Ok(());
+        }
+        let at = (u32_of(self.total_bytes, "items strings")?, u32_of(s.len(), "a string")?);
+        self.total_bytes = self.total_bytes.saturating_add(s.len());
+        self.seen.insert(s, at);
+        Ok(())
+    }
+
+    fn materialize(&mut self) {
+        let alloc = *self.bytes.allocator();
+        let mut bytes = RecordBytes::with_capacity_in(self.total_bytes, alloc);
+        bytes.resize(self.total_bytes, 0);
+        for (&s, &(at, _)) in self.seen.iter() {
+            let start = usize::try_from(at).unwrap_or(0);
+            if let Some(dst) = bytes.get_mut(start..start.saturating_add(s.len())) {
+                dst.copy_from_slice(s.as_bytes());
+            }
+        }
+        self.bytes = bytes;
     }
 
     fn put(&mut self, s: &'s str) -> Result<(u32, u32), ItemsRecordError> {
@@ -367,6 +398,7 @@ impl<'b, 's> Strings<'b, 's> {
         }
         let at = (u32_of(self.bytes.len(), "items strings")?, u32_of(s.len(), "a string")?);
         self.bytes.extend_from_slice(s.as_bytes());
+        self.total_bytes = self.bytes.len();
         self.seen.insert(s, at);
         Ok(at)
     }
@@ -646,51 +678,17 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
 }
 
 pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, heads: &H, include_grain: bool, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
-    let mut strings: Strings<'b, 'n> = Strings::new(alloc);
     let tables = &names.tables;
-
-    // Files, by index; expansions that made a text, by call key. A file row keeps its
-    // surface digest and paths. Its whole digest and length are supplied by FileItems when
-    // a reader asks for the file.
-    let mut file_rows = RecordBytes::new_in(alloc);
-    for f in names.files.iter() {
-        let (path, shown) = (strings.put(f.package.as_str())?, strings.put(f.shown)?);
-        file_rows.extend_from_slice(&f.outline.surface().0);
-        for n in [path.0, path.1, shown.0, shown.1] {
-            put32(&mut file_rows, n);
-        }
-    }
     if names.files.len() >= EXPANSION as usize {
         return Err(ItemsRecordError::TooBig { what: "a crate's files" });
     }
-    let mut calls = AVec::new_in(alloc);
+    let made_calls = names.expansions.values().filter(|e| e.made.is_some()).count();
+    let mut calls = AVec::with_capacity_in(made_calls, alloc);
     calls.extend(names.expansions.iter().filter_map(|(k, e)| e.made.map(|m| (*k, m))));
     calls.sort_unstable_by_key(|c| c.0);
     if calls.len() >= EXPANSION as usize {
         return Err(ItemsRecordError::TooBig { what: "a crate's expansions" });
     }
-    let mut expansion_rows = RecordBytes::new_in(alloc);
-    for (call, made) in calls.iter() {
-        expansion_rows.extend_from_slice(&call.0.0);
-        expansion_rows.extend_from_slice(&made.id.0);
-        put32(&mut expansion_rows, u32_of(made.text.len(), "an expansion's text")?);
-        put32(&mut expansion_rows, 0);
-    }
-    // A text's code in a row and its bytes, when the record has a row for it.
-    let text_of = |at: At| -> Option<(u32, &'n str)> {
-        match at {
-            At::File(i) => names.files.get(i as usize).map(|f| (i, f.text)),
-            At::Expansion(call) => calls.binary_search_by_key(&call, |c| c.0).ok().map(|i| (EXPANSION | i as u32, calls[i].1.text)),
-        }
-    };
-    // Where `part` is: its text's code, start and length; all `NONE`/0 when it is in no text
-    // the record has a row for (a reader is refused by name: `NoPlace`).
-    let place = |at: Option<At>, part: &str| -> (u32, u32, u32) {
-        match at {
-            Some(At::File(file)) => (file, 0, 0),
-            _ => at.and_then(text_of).and_then(|(code, base)| span_in(base, part).map(|(start, len)| (code, start, len))).unwrap_or((NONE, 0, 0)),
-        }
-    };
 
     // The impls, read from their headers and sorted by what the index files them by.
     let mut impls: AVec<'b, ImplOut<'n>> = AVec::with_capacity_in(tables.impls.len(), alloc);
@@ -708,7 +706,16 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
 
     // The modules: those `Names::modules` lists (walked, then made), and any other key a row
     // names as a module (a parent, an item's home), unlisted.
-    let mut modules: AVec<'b, ItemKey> = AVec::new_in(alloc);
+    let modules_cap = names
+        .tree
+        .modules
+        .len()
+        .saturating_mul(2)
+        .saturating_add(names.made.len().saturating_mul(2))
+        .saturating_add(tables.texts.len())
+        .saturating_add(tables.macros.len())
+        .saturating_add(impls.len());
+    let mut modules: AVec<'b, ItemKey> = AVec::with_capacity_in(modules_cap, alloc);
     for m in names.tree.modules.iter() {
         modules.push(m.key);
         modules.extend(m.parent.map(|p| names.tree.modules[p].key));
@@ -726,7 +733,130 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         modules.binary_search(&m).map(|i| i as u32).map_err(|_| ItemsRecordError::NotListed { module: m })
     };
     u32_of(modules.len(), "a crate's modules")?;
-    let mut module_rows = RecordBytes::new_in(alloc);
+
+    // Collect and sort all remaining table keys up front so `Strings` can pre-intern every string
+    // in exact deterministic first-use order and materialize `strings.bytes` once at its exact
+    // deduplicated byte length before any row buffer sits above it on the bump allocator.
+    let mut items: AVec<'b, ItemKey> = AVec::from_iter_in(tables.texts.keys().copied(), alloc);
+    items.sort_unstable();
+    let mut owners: AVec<'b, ItemKey> = AVec::from_iter_in(tables.members.keys().copied(), alloc);
+    owners.sort_unstable();
+    let total_members: usize = tables.members.values().map(|list| list.len()).sum();
+    let mut langs: AVec<'b, (&'n str, ItemKey)> = AVec::from_iter_in(tables.langs.iter().map(|l| (l.name, l.key)), alloc);
+    langs.sort_unstable_by(|a, b| (a.0.as_bytes(), a.1).cmp(&(b.0.as_bytes(), b.1)));
+    langs.dedup();
+    let mut macros: AVec<'b, ItemKey> = AVec::from_iter_in(tables.macros.keys().copied(), alloc);
+    macros.sort_unstable();
+    let atoms = names.cfg.atoms();
+
+    let mut strings: Strings<'b, 'n> = Strings::new(alloc);
+    for f in names.files.iter() {
+        strings.plan(f.package.as_str())?;
+        strings.plan(f.shown)?;
+    }
+    for m in modules.iter() {
+        if let Some(p) = names.path_of(*m) {
+            strings.plan(p)?;
+        }
+    }
+    for i in impls.iter() {
+        strings.plan(i.trait_path)?;
+        strings.plan(i.self_path)?;
+    }
+    for key in items.iter() {
+        if let Some((it, at)) = tables.texts.get(key) {
+            let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
+            let entry = usize::try_from(it.item.0)
+                .ok()
+                .and_then(|idx| outline.items().get(idx))
+                .ok_or(ItemsRecordError::NoOutline { item: *key })?;
+            let foreign = foreign_abi(whole, outline, entry, *key, names.key)?;
+            if let Some(n) = it.name {
+                strings.plan(n)?;
+            }
+            if let Some(abi) = foreign {
+                strings.plan(abi)?;
+            }
+        }
+    }
+    #[cfg(test)]
+    let mut plan_cut = plant::is(plant::Plant::ShortMembers);
+    for owner in owners.iter() {
+        let Some(list) = tables.members.get(owner) else { continue };
+        let list = list.as_slice();
+        #[cfg(test)]
+        let list = if plan_cut && !list.is_empty() {
+            plan_cut = false;
+            &list[..list.len() - 1]
+        } else {
+            list
+        };
+        for m in list.iter() {
+            if let Some(n) = m.name {
+                strings.plan(n)?;
+            }
+        }
+    }
+    for (name, _) in langs.iter() {
+        strings.plan(*name)?;
+    }
+    for key in macros.iter() {
+        if let Some(m) = tables.macros.get(key) {
+            strings.plan(m.name)?;
+            match m.body {
+                MacroBody::BuiltinFn(name) => strings.plan(name)?,
+                MacroBody::Proc { helpers, .. } | MacroBody::BuiltinDerive { helpers } => strings.plan(helpers)?,
+                MacroBody::Rules(_) | MacroBody::Macro2 { .. } | MacroBody::BuiltinOther(_) => {}
+            }
+        }
+    }
+    for (name, value) in atoms.iter() {
+        strings.plan(*name)?;
+        if let Some(v) = value {
+            strings.plan(*v)?;
+        }
+    }
+    strings.plan(names.name)?;
+    strings.materialize();
+
+    // Files, by index; expansions that made a text, by call key. A file row keeps its
+    // surface digest and paths. Its whole digest and length are supplied by FileItems when
+    // a reader asks for the file.
+    let mut file_rows = RecordBytes::with_capacity_in(names.files.len().saturating_mul(FILE_ROW).next_multiple_of(ALIGN), alloc);
+    for f in names.files.iter() {
+        let (path, shown) = (strings.put(f.package.as_str())?, strings.put(f.shown)?);
+        file_rows.extend_from_slice(&f.outline.surface().0);
+        for n in [path.0, path.1, shown.0, shown.1] {
+            put32(&mut file_rows, n);
+        }
+    }
+    let mut expansion_rows = RecordBytes::with_capacity_in(calls.len().saturating_mul(EXPANSION_ROW).next_multiple_of(ALIGN), alloc);
+    for (call, made) in calls.iter() {
+        expansion_rows.extend_from_slice(&call.0.0);
+        expansion_rows.extend_from_slice(&made.id.0);
+        put32(&mut expansion_rows, u32_of(made.text.len(), "an expansion's text")?);
+        put32(&mut expansion_rows, 0);
+    }
+    // A text's code in a row and its bytes, when the record has a row for it.
+    let text_of = |at: At| -> Option<(u32, &'n str)> {
+        match at {
+            At::File(i) => usize::try_from(i).ok().and_then(|idx| names.files.get(idx)).map(|f| (i, f.text)),
+            At::Expansion(call) => calls
+                .binary_search_by_key(&call, |c| c.0)
+                .ok()
+                .and_then(|i| Some((EXPANSION | u32::try_from(i).ok()?, calls.get(i)?.1.text))),
+        }
+    };
+    // Where `part` is: its text's code, start and length; all `NONE`/0 when it is in no text
+    // the record has a row for (a reader is refused by name: `NoPlace`).
+    let place = |at: Option<At>, part: &str| -> (u32, u32, u32) {
+        match at {
+            Some(At::File(file)) => (file, 0, 0),
+            _ => at.and_then(text_of).and_then(|(code, base)| span_in(base, part).map(|(start, len)| (code, start, len))).unwrap_or((NONE, 0, 0)),
+        }
+    };
+
+    let mut module_rows = RecordBytes::with_capacity_in(modules.len().saturating_mul(MODULE_ROW).next_multiple_of(ALIGN), alloc);
     for m in modules.iter() {
         let walked = names.tree.by_key.get(m).map(|i| &names.tree.modules[*i]);
         let made = names.made.get(m);
@@ -760,9 +890,28 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     }
 
     // The impl rows (columnar, single-allocation SoA buffer), and each impl's row by its key.
-    let mut col_scratch: AVec<'b, u8> = AVec::new_in(alloc);
-    let mut impl_rows = RecordBytes::new_in(alloc);
-    let mut impl_row_of: HashMap<ItemKey, u32, Alloc<'b>> = HashMap::new_in(alloc);
+    let has_trait_roots = impls.iter().any(|i| i.trait_root.is_some());
+    let has_self_roots = impls.iter().any(|i| i.self_root.is_some());
+    let col_scratch_cap = if has_trait_roots || has_self_roots {
+        cols::id_col_bound(impls.len())
+    } else {
+        cols::int_col_bound(impls.len())
+    }
+    .max(cols::int_col_bound(tables.texts.len()))
+    .max(cols::int_col_bound(total_members));
+    let mut col_scratch: AVec<'b, u8> = AVec::with_capacity_in(col_scratch_cap, alloc);
+    let impl_rows_cap = if impls.is_empty() {
+        0
+    } else {
+        let id_cols = usize::from(has_trait_roots).saturating_add(usize::from(has_self_roots));
+        (9 * 4usize)
+            .saturating_add(impls.len().saturating_mul(KEY_TAIL))
+            .saturating_add(cols::int_col_bound(impls.len()).saturating_mul(7))
+            .saturating_add(cols::id_col_bound(impls.len()).saturating_mul(id_cols))
+            .next_multiple_of(ALIGN)
+    };
+    let mut impl_rows = RecordBytes::with_capacity_in(impl_rows_cap, alloc);
+    let mut impl_row_of: HashMap<ItemKey, u32, Alloc<'b>> = HashMap::with_capacity_in(impls.len(), alloc);
     if !impls.is_empty() {
         let dir_at = impl_rows.len();
         for _ in 0..9 {
@@ -801,9 +950,22 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     }
 
     // The items, by key (columnar, single-allocation SoA buffer).
-    let mut items: AVec<'b, ItemKey> = AVec::from_iter_in(tables.texts.keys().copied(), alloc);
-    items.sort_unstable();
-    let mut item_rows = RecordBytes::new_in(alloc);
+    let item_rows_cap = if items.is_empty() {
+        0
+    } else {
+        let csr_bytes = if names.files.is_empty() {
+            0
+        } else {
+            names.files.len().saturating_add(1).saturating_add(items.len()).saturating_mul(4)
+        };
+        (13 * 4usize)
+            .saturating_add(items.len().saturating_mul(KEY_TAIL))
+            .saturating_add(cols::int_col_bound(items.len()).saturating_mul(12))
+            .saturating_add(csr_bytes)
+            .next_multiple_of(ALIGN)
+    };
+    let mut item_rows = RecordBytes::with_capacity_in(item_rows_cap, alloc);
+    let mut expansion_items = 0usize;
     if !items.is_empty() {
         let dir_at = item_rows.len();
         for _ in 0..13 {
@@ -814,6 +976,9 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         file_counts.resize(names.files.len(), 0);
         for key in items.iter() {
             let (it, at) = &tables.texts[key];
+            if matches!(at, At::Expansion(_)) {
+                expansion_items = expansion_items.saturating_add(1);
+            }
             let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
             let entry = outline.items().get(it.item.0 as usize).ok_or(ItemsRecordError::NoOutline { item: *key })?;
             let detail = entry.detail;
@@ -926,15 +1091,27 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     }
 
     // Each trait's and impl's members, in declaration order (columnar, single-allocation SoA buffer).
-    let mut owners: AVec<'b, ItemKey> = AVec::from_iter_in(tables.members.keys().copied(), alloc);
-    owners.sort_unstable();
-    let mut owner_rows = RecordBytes::new_in(alloc);
-    let mut member_keys = RecordBytes::new_in(alloc);
-    let mut member_buf = cols::MemberColsBuf::new_in(alloc);
+    let mut owner_rows = RecordBytes::with_capacity_in(owners.len().saturating_mul(OWNER_ROW).next_multiple_of(ALIGN), alloc);
+    let member_rows_cap = if total_members == 0 {
+        0
+    } else {
+        (6 * 4usize)
+            .saturating_add(total_members.saturating_mul(KEY_TAIL))
+            .saturating_add(cols::int_col_bound(total_members).saturating_mul(6))
+            .next_multiple_of(ALIGN)
+    };
+    let mut member_rows = RecordBytes::with_capacity_in(member_rows_cap, alloc);
+    let member_dir_at = member_rows.len();
+    if total_members > 0 {
+        for _ in 0..6 {
+            put32(&mut member_rows, 0);
+        }
+    }
+    let mut member_buf = cols::MemberColsBuf::with_capacity_in(total_members, alloc);
     let mut members = 0usize;
     // Each named member's key, its owner's row and its own row: the member owners section
     // ([`owners`]), written after everything else.
-    let mut owned: AVec<'b, (ItemKey, u32, u32)> = AVec::new_in(alloc);
+    let mut owned: AVec<'b, (ItemKey, u32, u32)> = AVec::with_capacity_in(total_members, alloc);
     #[cfg(test)]
     let mut cut = plant::is(plant::Plant::ShortMembers);
     for (owner_idx, owner) in owners.iter().enumerate() {
@@ -970,7 +1147,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             let name_len = u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "a member's name" })?;
             let lifetimes = lifetimes_field(m.key, m.detail, m.text, names.edition)?;
             debug_assert_eq!(m.key.0.0[..8], names.key.prefix());
-            member_keys.extend_from_slice(&m.key.0.0[8..]);
+            member_rows.extend_from_slice(&m.key.0.0[8..]);
             member_buf.push(cols::MemberCol {
                 code: u64::from(code),
                 outline: u64::from(m.item.0),
@@ -988,27 +1165,20 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             members += 1;
         }
     }
-    let mut member_rows = RecordBytes::new_in(alloc);
     if members > 0 {
-        let dir_at = member_rows.len();
-        for _ in 0..6 {
-            put32(&mut member_rows, 0);
-        }
-        member_rows.extend_from_slice(&member_keys);
         let l0 = cols::encode_opt_u64(member_buf.codes(), 0, "member text codes", alloc, &mut col_scratch, &mut member_rows)?;
         let l1 = cols::encode_opt_u64(member_buf.outlines(), 0, "member outlines", alloc, &mut col_scratch, &mut member_rows)?;
         let l2 = cols::encode_opt_u64(member_buf.name_ats(), 0, "member name offsets", alloc, &mut col_scratch, &mut member_rows)?;
         let l3 = cols::encode_opt_u64(member_buf.metas(), 0, "member meta", alloc, &mut col_scratch, &mut member_rows)?;
         let l4 = cols::encode_opt_u64(member_buf.starts(), 0, "member text starts", alloc, &mut col_scratch, &mut member_rows)?;
         let l5 = cols::encode_opt_u64(member_buf.lens(), 0, "member text lengths", alloc, &mut col_scratch, &mut member_rows)?;
-        cols::patch_dir(&mut member_rows, dir_at, [l0, l1, l2, l3, l4, l5]);
+        cols::patch_dir(&mut member_rows, member_dir_at, [l0, l1, l2, l3, l4, l5]);
+    } else {
+        member_rows.clear();
     }
 
     // Lang items by (name, key).
-    let mut langs: AVec<'b, (&'n str, ItemKey)> = AVec::from_iter_in(tables.langs.iter().map(|l| (l.name, l.key)), alloc);
-    langs.sort_unstable_by(|a, b| (a.0.as_bytes(), a.1).cmp(&(b.0.as_bytes(), b.1)));
-    langs.dedup();
-    let mut lang_rows = RecordBytes::new_in(alloc);
+    let mut lang_rows = RecordBytes::with_capacity_in(langs.len().saturating_mul(LANG_ROW).next_multiple_of(ALIGN), alloc);
     for (name, key) in langs.iter() {
         let name = strings.put(*name)?;
         lang_rows.extend_from_slice(&key.0.0);
@@ -1017,9 +1187,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     }
 
     // Macro definitions by key: where the body is, never its bytes.
-    let mut macros: AVec<'b, ItemKey> = AVec::from_iter_in(tables.macros.keys().copied(), alloc);
-    macros.sort_unstable();
-    let mut macro_rows = RecordBytes::new_in(alloc);
+    let mut macro_rows = RecordBytes::with_capacity_in(macros.len().saturating_mul(MACRO_ROW).next_multiple_of(ALIGN), alloc);
     for key in macros.iter() {
         let m = &tables.macros[key];
         let at = tables.texts.get(key).map(|t| t.1);
@@ -1063,8 +1231,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     }
 
     // The cfg atoms, in `Cfg::atoms`' own (sorted) order.
-    let atoms = names.cfg.atoms();
-    let mut atom_rows = RecordBytes::new_in(alloc);
+    let mut atom_rows = RecordBytes::with_capacity_in(atoms.len().saturating_mul(ATOM_ROW).next_multiple_of(ALIGN), alloc);
     for (name, value) in atoms.iter() {
         let name = strings.put(*name)?;
         let value = match value {
@@ -1098,7 +1265,31 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     if names.proc_key.is_some() {
         flags |= CRATE_PROC_KEY;
     }
-    let mut out = RecordBytes::with_capacity_in(at + strings.bytes.len(), alloc);
+    // Pre-size `out` to cover the fixed sections, strings, AND all five appended tail sections
+    // (`grain`, `owners`, `variants`, `buckets`, `values`) so `out` never reallocates on a bump
+    // allocator while tail-section helpers hold temporary scratch allocations above it.
+    let grain_cap = if include_grain {
+        ALIGN
+            .saturating_add(items.len().saturating_mul(36))
+            .saturating_add(expansion_items.saturating_mul(32))
+    } else {
+        0
+    };
+    let owners_cap = ALIGN.saturating_add(owned.len().saturating_mul(owners::OWNED_ROW));
+    let total_variants: usize = tables.enums.values().map(|v| v.len()).sum();
+    let variants_cap = variants::encoded_len_bound(total_variants);
+    let filed_impls = impls.iter().filter(|i| matches!(i.filing, buckets::Filing::At(_))).count();
+    let unfiled_impls = impls.len().saturating_sub(filed_impls);
+    let buckets_cap = buckets::encoded_len_bound(filed_impls, unfiled_impls);
+    let values_cap = values::encoded_len_bound(&names.values);
+    let out_cap = at
+        .saturating_add(strings.bytes.len())
+        .saturating_add(grain_cap)
+        .saturating_add(owners_cap)
+        .saturating_add(variants_cap)
+        .saturating_add(buckets_cap)
+        .saturating_add(values_cap);
+    let mut out = RecordBytes::with_capacity_in(out_cap, alloc);
     out.extend_from_slice(&MAGIC);
     put32(&mut out, VERSION);
     put32(&mut out, flags);
@@ -3130,5 +3321,343 @@ mod twins {
         let mut v15 = bytes.to_vec();
         v15[4..8].copy_from_slice(&15u32.to_le_bytes());
         assert!(matches!(super::ItemsRecord::open(aligned(&v15, bump), g), Err(super::ItemsRecordError::NotThisRecord)));
+    }
+
+    /// Regression test for massive crates (e.g. `aws_sdk_ec2`) whose Section 3 (`items`) record
+    /// panicked a worker `Frame` when `out` doubled past its initial `at + strings` capacity
+    /// while intermediate section buffers (`member_buf`, `owned`, `item_rows`, `strings`) had
+    /// already abandoned 2x-3x bump bytes. Pre-sizing every table buffer and covering all tail
+    /// sections (`grain`, `owners`, `variants`, `buckets`, `values`) in `out`'s initial capacity
+    /// keeps abandoned bump bytes well below the encoded record length and succeeds inside a
+    /// tight frame.
+    #[test]
+    fn large_items_record_presizes_output_and_avoids_bump_doubling() {
+        use core::fmt::Write as _;
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+        use crate::crate_scope::{Ready, resolve_by_records};
+        use crate::graph::Sysroot;
+        use crate::resolve::{CrateInput, SourceTexts, aligned};
+        use crate::task::Serial;
+
+        struct OneFile<'a>(&'a str, &'a str);
+        impl<'a> SourceTexts<'a> for OneFile<'a> {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                (krate == 0 && path == self.0).then_some(self.1)
+            }
+        }
+
+        let mut src = std::string::String::with_capacity(256 << 10);
+        src.push_str("#![no_core]\nmacro_rules! sym_name { ($s:literal) => { $s }; }\npub trait Op { fn name(&self) -> u32; }\n");
+        const STRUCTS: usize = 300;
+        const METHODS: usize = 10;
+        const ENUMS: usize = 120;
+        const VARIANTS: usize = 6;
+        const LONG_ATTRS: usize = 16;
+        let long_prefix = "very_long_generated_abi_symbol_prefix_".repeat(7);
+        assert!(long_prefix.len() > 240);
+        for i in 0..LONG_ATTRS {
+            let _ = writeln!(src, "#[export_name = sym_name!(\"{long_prefix}exp_{i}\")]\npub extern \"C\" fn exported_{i}() {{}}");
+        }
+        // Also exercise a long (>240-byte) refused attr value so `ByteCounter` in `values::encoded_len_bound` is covered.
+        let _ = writeln!(src, "#[export_name = missing_macro!(\"{long_prefix}refused\")]\npub extern \"C\" fn exported_refused() {{}}");
+        src.push_str("extern \"C\" {\n");
+        for i in 0..LONG_ATTRS {
+            let _ = writeln!(src, "    #[link_name = sym_name!(\"{long_prefix}lnk_{i}\")]\n    fn linked_{i}();");
+        }
+        src.push_str("}\n");
+        for i in 0..STRUCTS {
+            let _ = writeln!(src, "pub struct S{i}(pub u32);");
+            let _ = writeln!(src, "impl S{i} {{");
+            for m in 0..METHODS {
+                let _ = writeln!(src, "    pub fn m{m}(&self) -> u32 {{ self.0 }}");
+            }
+            src.push_str("}\n");
+            let _ = writeln!(src, "impl Op for S{i} {{ fn name(&self) -> u32 {{ {i} }} }}");
+        }
+        for e in 0..ENUMS {
+            let _ = write!(src, "pub enum E{e} {{");
+            for v in 0..VARIANTS {
+                let _ = write!(src, " V{v},");
+            }
+            src.push_str(" }\n");
+        }
+        let texts = OneFile("/big/lib.rs", src.as_str());
+        let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let input = CrateInput {
+            name: "big_items_crate",
+            key: blaze_id::CrateItemKey(ContentId::of("blaze-scope large items test", b"big_items_crate")),
+            edition: Edition::E2021,
+            implicit,
+            root: "/big/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let solve_frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("solve frame");
+        let solve_erased = blaze_own::Erased::new(&solve_frame);
+        let solve_bump = solve_erased.bump();
+        let (solved, _) = resolve_by_records(&[input], Sysroot::default(), &texts, &Serial, &Ready::serial(std::time::Duration::from_secs(60)), solve_bump)
+            .expect("solve large crate");
+        let krate = solved.first().expect("one solved crate").names;
+        assert_eq!(krate.values.len(), LONG_ATTRS * 2 + 1, "all long macro-expanded export_name/link_name attrs recorded");
+
+        for include_grain in [false, true] {
+            let enc_frame = blaze_mem::Frame::with_reserve(16 << 20, blaze_mem::Tag::Nameres).expect("encode frame");
+            let enc_erased = blaze_own::Erased::new(&enc_frame);
+            let enc_bump = enc_erased.bump();
+            let enc_alloc = enc_bump.alloc();
+            let bytes = super::encode_for(krate, include_grain, enc_alloc).expect("encode large items record");
+            let abandoned = enc_frame.abandoned().bytes;
+            let len = bytes.len();
+            assert!(len > 100_000, "synthetic crate should produce a substantial items record (got {len} bytes)");
+            assert!(
+                abandoned < u64::try_from(len).unwrap_or(u64::MAX),
+                "pre-sized encode_for(include_grain={include_grain}) abandoned {abandoned} bytes for a {len}-byte record (peak {})",
+                enc_frame.peak()
+            );
+            let record = super::ItemsRecord::open(aligned(&bytes, enc_bump), enc_alloc).expect("open large items record");
+            assert!(record.items() >= STRUCTS * 3 + ENUMS, "items count");
+            assert_eq!(record.impls(), STRUCTS * 2, "impls count");
+            assert_eq!(record.owned_members(), STRUCTS * (METHODS + 1) + 1, "owned members count");
+            assert_eq!(record.variant_rows(), ENUMS * VARIANTS, "variants count");
+            let mut ok_long = 0usize;
+            let mut err_long = 0usize;
+            for row in krate.values.iter() {
+                match record.attr_value(row.item, row.attr).expect("read attr value").expect("present") {
+                    Ok(s) if s.len() > 240 => ok_long += 1,
+                    Err(w) if w.len() > 240 => err_long += 1,
+                    other => panic!("unexpected attr value round-trip: {other:?}"),
+                }
+            }
+            assert_eq!(ok_long, LONG_ATTRS * 2, "all resolved >240-byte export_name/link_name values must round-trip");
+            assert_eq!(err_long, 1, "refused >240-byte attr value must round-trip");
+        }
+
+        // Also verify `names_record::encode` keeps bump abandonment low on the same large crate.
+        let names_frame = blaze_mem::Frame::with_reserve(16 << 20, blaze_mem::Tag::Nameres).expect("names encode frame");
+        let names_erased = blaze_own::Erased::new(&names_frame);
+        let names_bump = names_erased.bump();
+        let names_bytes = crate::names_record::encode(krate, names_bump.alloc()).expect("encode large names record");
+        let names_abandoned = names_frame.abandoned().bytes;
+        assert!(
+            names_abandoned < u64::try_from(names_bytes.len()).unwrap_or(u64::MAX).saturating_mul(2),
+            "names_record::encode abandoned {names_abandoned} bytes for a {}-byte record",
+            names_bytes.len()
+        );
+        let proof = crate::names_record::Verified::check(aligned(&names_bytes, names_bump)).expect("verify large names record");
+        assert_eq!(proof.key(), input.key);
+    }
+
+    /// Crates with many distinct long (>160-byte) item, member, macro, and cfg-atom strings must
+    /// neither rehash `Strings::seen` nor reallocate `Strings::bytes` after row buffers are placed
+    /// above them on the bump allocator.
+    #[test]
+    fn many_distinct_long_strings_do_not_reallocate_string_table() {
+        use core::fmt::Write as _;
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+        use crate::crate_scope::{Ready, resolve_by_records};
+        use crate::graph::Sysroot;
+        use crate::resolve::{CrateInput, SourceTexts, aligned};
+        use crate::task::Serial;
+
+        // Direct test of `Strings` pre-intern + materialize: 1,000 distinct 256-byte strings
+        // produce zero abandoned bump bytes and zero reallocation on subsequent `put` lookups.
+        {
+            const N: usize = 1_000;
+            let frame = blaze_mem::Frame::with_reserve(4 << 20, blaze_mem::Tag::Nameres).expect("strings frame");
+            let erased = blaze_own::Erased::new(&frame);
+            let alloc = erased.bump().alloc();
+            let prefix = "long_distinct_string_".repeat(12);
+            assert!(prefix.len() > 240);
+            let owned_strs: StdVec<std::string::String> = (0..N).map(|i| std::format!("{prefix}{i}")).collect();
+            let mut strings = super::Strings::new(alloc);
+            for s in owned_strs.iter() {
+                strings.plan(s.as_str()).expect("plan");
+            }
+            strings.materialize();
+            let bytes_ptr = strings.bytes.as_ptr();
+            let bytes_cap = strings.bytes.capacity();
+            let abandoned_after_mat = frame.abandoned().bytes;
+            // Allocate something above `strings` (just as row buffers sit above `strings`).
+            let _above = blaze_own::AVec::<u8>::with_capacity_in(4096, alloc);
+            for s in owned_strs.iter() {
+                let (at, len) = strings.put(s.as_str()).expect("put");
+                let start = usize::try_from(at).expect("fits");
+                let end = start + usize::try_from(len).expect("fits");
+                assert_eq!(&strings.bytes[start..end], s.as_bytes());
+            }
+            assert_eq!(strings.bytes.as_ptr(), bytes_ptr, "strings.bytes must not reallocate");
+            assert_eq!(strings.bytes.capacity(), bytes_cap, "strings.bytes capacity must stay exact");
+            assert_eq!(abandoned_after_mat, 0, "pre-interning + materialize must abandon 0 bump bytes");
+            assert_eq!(frame.abandoned().bytes, 0, "subsequent puts must abandon 0 bump bytes");
+        }
+
+        // End-to-end crate with many distinct long item, member, macro, and cfg-atom strings.
+        struct OneFile<'a>(&'a str, &'a str);
+        impl<'a> SourceTexts<'a> for OneFile<'a> {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                (krate == 0 && path == self.0).then_some(self.1)
+            }
+        }
+        let long_prefix = "very_long_distinct_identifier_".repeat(6);
+        assert!(long_prefix.len() > 160);
+        let mut src = std::string::String::with_capacity(256 << 10);
+        src.push_str("#![no_core]\n");
+        const COUNT: usize = 80;
+        for i in 0..COUNT {
+            let _ = writeln!(src, "pub struct {long_prefix}Struct_{i};");
+            let _ = writeln!(src, "impl {long_prefix}Struct_{i} {{");
+            let _ = writeln!(src, "    pub fn {long_prefix}method_{i}(&self) {{}}");
+            src.push_str("}\n");
+        }
+        for m in 0..20usize {
+            let _ = writeln!(src, "macro_rules! {long_prefix}macro_{m} {{ () => {{}} }}");
+        }
+        let cfg_keys: StdVec<std::string::String> = (0..30usize).map(|i| std::format!("{long_prefix}cfg_k_{i}")).collect();
+        let cfg_vals: StdVec<std::string::String> = (0..30usize).map(|i| std::format!("{long_prefix}cfg_v_{i}")).collect();
+        let cfg_pairs: StdVec<(&str, Option<&str>)> = cfg_keys
+            .iter()
+            .zip(cfg_vals.iter())
+            .map(|(k, v)| (k.as_str(), Some(v.as_str())))
+            .collect();
+        let texts = OneFile("/long_strings/lib.rs", src.as_str());
+        let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let input = CrateInput {
+            name: "long_strings_crate",
+            key: blaze_id::CrateItemKey(ContentId::of("blaze-scope long strings test", b"long_strings_crate")),
+            edition: Edition::E2021,
+            implicit,
+            root: "/long_strings/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &cfg_pairs,
+            script: None,
+        };
+        let solve_frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("solve frame");
+        let solve_erased = blaze_own::Erased::new(&solve_frame);
+        let (solved, _) = resolve_by_records(&[input], Sysroot::default(), &texts, &Serial, &Ready::serial(std::time::Duration::from_secs(60)), solve_erased.bump())
+            .expect("solve long strings crate");
+        let krate = solved.first().expect("solved crate").names;
+
+        let enc_frame = blaze_mem::Frame::with_reserve(16 << 20, blaze_mem::Tag::Nameres).expect("encode frame");
+        let enc_erased = blaze_own::Erased::new(&enc_frame);
+        let enc_bump = enc_erased.bump();
+        let bytes = super::encode_for(krate, false, enc_bump.alloc()).expect("encode long strings items record");
+        assert!(
+            enc_frame.abandoned().bytes < u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            "long-strings items encode abandoned {} bytes for a {}-byte record",
+            enc_frame.abandoned().bytes,
+            bytes.len()
+        );
+        let record = super::ItemsRecord::open(aligned(&bytes, enc_bump), enc_bump.alloc()).expect("open long strings items record");
+        assert_eq!(record.impls(), COUNT);
+        assert_eq!(record.owned_members(), COUNT);
+        assert_eq!(record.macros(), 20);
+        assert!(record.cfg_atoms().expect("cfg atoms").len() >= 30);
+    }
+
+    /// Heavily repeated names and unnamed members must reserve `Strings::seen` for the exact
+    /// unique string count (not total row count), preserve exact first-use byte order, and
+    /// never reallocate `Strings::bytes` or `Strings::seen` during subsequent `put` lookups.
+    #[test]
+    fn repeated_and_unnamed_strings_reserve_only_unique_entries() {
+        use core::fmt::Write as _;
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+        use crate::crate_scope::{Ready, resolve_by_records};
+        use crate::graph::Sysroot;
+        use crate::resolve::{CrateInput, SourceTexts, aligned};
+        use crate::task::Serial;
+
+        // Direct test: 50,000 occurrences across only 6 unique strings must use strictly
+        // O(unique) bump bytes (never proportional to 50,000 occurrences) and abandon 0 bytes.
+        {
+            const UNIQUE: [&str; 6] = ["zeta", "alpha", "build", "set_id", "clone", "default"];
+            let frame = blaze_mem::Frame::with_reserve(2 << 20, blaze_mem::Tag::Nameres).expect("frame");
+            let erased = blaze_own::Erased::new(&frame);
+            let alloc = erased.bump().alloc();
+            let mut strings = super::Strings::new(alloc);
+            for i in 0..50_000usize {
+                strings.plan(UNIQUE[i % UNIQUE.len()]).expect("plan");
+            }
+            strings.materialize();
+            assert_eq!(strings.seen.len(), UNIQUE.len());
+            assert!(
+                frame.used() < 4096,
+                "50,000 duplicate occurrences of 6 unique strings must use O(unique) frame bytes (<4 KiB), used {}",
+                frame.used()
+            );
+            let expected_bytes: std::string::String = UNIQUE.iter().copied().collect();
+            assert_eq!(strings.bytes.as_slice(), expected_bytes.as_bytes(), "first-use order must be preserved");
+            assert_eq!(strings.bytes.capacity(), expected_bytes.len(), "bytes capacity must be exact");
+            let bytes_ptr = strings.bytes.as_ptr();
+            let _above = blaze_own::AVec::<u8>::with_capacity_in(4096, alloc);
+            for s in UNIQUE {
+                let (at, len) = strings.put(s).expect("put");
+                let start = usize::try_from(at).expect("fits");
+                let end = start + usize::try_from(len).expect("fits");
+                assert_eq!(&strings.bytes[start..end], s.as_bytes());
+            }
+            assert_eq!(strings.bytes.as_ptr(), bytes_ptr, "bytes must not reallocate");
+            assert_eq!(frame.abandoned().bytes, 0, "zero bump bytes abandoned");
+        }
+
+        // End-to-end crate: many impls with unnamed macro-call members + heavily repeated method names.
+        struct OneFile<'a>(&'a str, &'a str);
+        impl<'a> SourceTexts<'a> for OneFile<'a> {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                (krate == 0 && path == self.0).then_some(self.1)
+            }
+        }
+        let mut src = std::string::String::with_capacity(64 << 10);
+        src.push_str("#![no_core]\nmacro_rules! noop_member { () => {}; }\n");
+        const OWNERS: usize = 120;
+        for i in 0..OWNERS {
+            let _ = writeln!(src, "pub struct R{i};");
+            let _ = writeln!(src, "impl R{i} {{");
+            src.push_str("    noop_member!();\n");
+            src.push_str("    noop_member!();\n");
+            src.push_str("    pub fn build(&self) {}\n");
+            src.push_str("    pub fn clone_it(&self) {}\n");
+            src.push_str("    pub fn get(&self) {}\n");
+            src.push_str("}\n");
+        }
+        let texts = OneFile("/rep/lib.rs", src.as_str());
+        let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let input = CrateInput {
+            name: "repeated_strings_crate",
+            key: blaze_id::CrateItemKey(ContentId::of("blaze-scope repeated strings test", b"repeated_strings_crate")),
+            edition: Edition::E2021,
+            implicit,
+            root: "/rep/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let solve_frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("solve frame");
+        let solve_erased = blaze_own::Erased::new(&solve_frame);
+        let (solved, _) = resolve_by_records(&[input], Sysroot::default(), &texts, &Serial, &Ready::serial(std::time::Duration::from_secs(60)), solve_erased.bump())
+            .expect("solve repeated strings crate");
+        let krate = solved.first().expect("solved crate").names;
+        let enc_frame = blaze_mem::Frame::with_reserve(8 << 20, blaze_mem::Tag::Nameres).expect("encode frame");
+        let enc_erased = blaze_own::Erased::new(&enc_frame);
+        let enc_bump = enc_erased.bump();
+        let bytes = super::encode_for(krate, false, enc_bump.alloc()).expect("encode repeated strings items record");
+        assert!(
+            enc_frame.abandoned().bytes < u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            "repeated-strings encode abandoned {} bytes for a {}-byte record",
+            enc_frame.abandoned().bytes,
+            bytes.len()
+        );
+        let record = super::ItemsRecord::open(aligned(&bytes, enc_bump), enc_bump.alloc()).expect("open repeated strings items record");
+        assert_eq!(record.impls(), OWNERS);
+        assert_eq!(record.owned_members(), OWNERS * 3);
     }
 }

@@ -597,9 +597,17 @@ fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope:
 
 #[expect(clippy::too_many_arguments, reason = "section encoder inputs, each named")]
 fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, member: bool, has_surface: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, metered: &metered::Metered<'_>, kept: blaze_own::SharedAlloc<'static>, force_par: bool) -> Result<ScopeRecord, Unwritten> {
+    // Match the serial path's `CALL_SCRATCH` ceiling (4 GiB): `Frame::with_reserve` only sets a
+    // logical byte limit (zero VA/RSS committed until used, and every chunk/span is trimmed cold
+    // back to 0 immediately after copying the section out), so giant generated crates such as
+    // `aws_sdk_ec2` never hit an artificial 256 MiB cap in parallel section workers.
+    scope_record_with_scratch(cx, workers, done, crate_name, member, has_surface, waits, metered, kept, force_par, scope::CALL_SCRATCH)
+}
+
+#[expect(clippy::too_many_arguments, reason = "section encoder inputs, each named")]
+fn scope_record_with_scratch<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, member: bool, has_surface: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, metered: &metered::Metered<'_>, kept: blaze_own::SharedAlloc<'static>, force_par: bool, worker_scratch: usize) -> Result<ScopeRecord, Unwritten> {
     const ALIGN: usize = 16;
     const PLACES: usize = 16;
-    const WORKER_SCRATCH: usize = 256 << 20;
     let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
     let par_workers = usize::try_from(workers.get().min(cx.workers())).unwrap_or(1);
     let mut findings = PathFindings::new_in(kept);
@@ -615,7 +623,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
         // copying out), while the calling thread computes `unresolved` findings and Section 5
         // (`expansions` + inner parallel zstd).
         let sec2_job = scope.may_overlap("names: encode section 2 (names)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "names", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -629,7 +637,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
             result
         });
         let sec3_job = scope.may_overlap("names: encode section 3 (items)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "items", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -643,7 +651,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
             result
         });
         let sec4_job = scope.may_overlap("names: encode section 4 (tests)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "tests", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -654,7 +662,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
             result
         });
         let sec6_job = scope.may_overlap("names: encode section 6 (links)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "link table", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -2138,6 +2146,141 @@ mod unresolved_tests {
         for ((pk, pb), (sk, sb)) in parallel.expansions.records.iter().zip(serial.expansions.records.iter()) {
             assert_eq!(pk, sk, "expansion record key order must match");
             assert_eq!(pb.as_slice(), sb.as_slice(), "expansion record bytes must match");
+        }
+    }
+
+    #[test]
+    fn large_crate_parallel_scope_record_matches_serial() {
+        use core::fmt::Write as _;
+        use blaze_id::CrateItemKey;
+        use blaze_mem::{Frame, Tag};
+        use blaze_own::Erased;
+        use blaze_scope::crate_scope::resolve_crate_verified_with;
+        use blaze_scope::graph::Sysroot;
+        use blaze_scope::prepares::Prepares;
+        use blaze_scope::resolve::{CrateInput, ResolveOpts, SourceTexts};
+        use blaze_scope::task::Serial;
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+        struct OwnedSources<'a>(&'a [(&'a str, &'a str)]);
+
+        impl<'a> SourceTexts<'a> for OwnedSources<'a> {
+            fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
+                self.0.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)
+            }
+        }
+
+        let mut lib = std::string::String::with_capacity(128 << 10);
+        lib.push_str("#![no_core]\npub trait Builder { fn build(self) -> u32; }\n");
+        for i in 0..200usize {
+            let _ = writeln!(lib, "pub struct Op{i}(pub u32);");
+            let _ = writeln!(lib, "impl Op{i} {{");
+            for m in 0..8usize {
+                let _ = writeln!(lib, "    pub fn set_{m}(self, v: u32) -> Self {{ Self(v) }}");
+            }
+            lib.push_str("}\n");
+            let _ = writeln!(lib, "impl Builder for Op{i} {{ fn build(self) -> u32 {{ self.0 }} }}");
+        }
+        for e in 0..60usize {
+            let _ = writeln!(lib, "pub enum Mode{e} {{ A, B, C, D }}");
+        }
+        let files = [("/pkg/src/lib.rs", lib.as_str())];
+        let sources = OwnedSources(&files);
+        let input = CrateInput {
+            name: "large_par_scope_demo",
+            key: CrateItemKey(super::ContentId::of("large scope_record par test", b"demo")),
+            edition: Edition::E2021,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false },
+            root: "/pkg/src/lib.rs",
+            shown_from: "/pkg",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let kept_static = blaze_own::testing::heap().shared();
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(79, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("root context");
+        let solve_frame = Frame::new(Tag::Nameres).expect("solve frame");
+        let erased = Erased::new(&solve_frame);
+        let bump = erased.bump();
+        let prepares = Prepares::new_in(bump);
+        let done = resolve_crate_verified_with(
+            &input,
+            &[],
+            Sysroot::default(),
+            &sources,
+            0,
+            &Serial,
+            prepares,
+            ResolveOpts { write_inner: false, ..ResolveOpts::default() },
+            bump,
+        )
+        .expect("resolve large crate");
+        let waits = blaze_scope::waits_on::WaitsOn::of(done.names, &[], bump.alloc());
+
+        // Causal control (rule 23): a tight worker scratch cap below this crate's Section 3
+        // (`items`) bump need fails cleanly via `panics-fail-one-job` (reproducing the former cap
+        // failure), while the raised `CALL_SCRATCH` cap succeeds and matches the serial path.
+        let Ok(tight_err) = crate::work::unwinding(|| {
+            let scratch = Frame::with_reserve(64 << 20, Tag::Expand).expect("scratch");
+            let solve_scratch = Frame::with_reserve(64 << 20, Tag::Nameres).expect("solve scratch");
+            let metered = super::metered::Metered::new(&solve_frame, scratch, solve_scratch, super::metered::CallScratch::Reset);
+            super::scope_record_with_scratch(
+                &cx,
+                core::num::NonZeroU32::new(4).expect("non-zero workers"),
+                &done,
+                input.name,
+                false,
+                false,
+                &waits,
+                &metered,
+                kept_static,
+                true,
+                256 << 10,
+            )
+        }) else {
+            panic!("worker scratch refusal must fail only the worker job, not unwind the caller");
+        };
+        let err = tight_err.err().expect("256 KiB worker scratch must refuse this crate's large section encode");
+        assert!(
+            err.section == "items" || err.section == "names",
+            "expected items or names section refusal under tight worker scratch, got `{}`: {}",
+            err.section,
+            err.why
+        );
+        assert!(
+            err.why.contains("refused") || err.why.contains("panicked"),
+            "expected frame refusal diagnostic, got: {}",
+            err.why
+        );
+
+        for has_surface in [false, true] {
+            let run_once = |w: u32, force_par: bool| {
+                let scratch = Frame::with_reserve(64 << 20, Tag::Expand).expect("scratch");
+                let solve_scratch = Frame::with_reserve(64 << 20, Tag::Nameres).expect("solve scratch");
+                let metered = super::metered::Metered::new(&solve_frame, scratch, solve_scratch, super::metered::CallScratch::Reset);
+                super::scope_record_mode(
+                    &cx,
+                    core::num::NonZeroU32::new(w).expect("non-zero workers"),
+                    &done,
+                    input.name,
+                    has_surface,
+                    has_surface,
+                    &waits,
+                    &metered,
+                    kept_static,
+                    force_par,
+                )
+                .expect("scope_record")
+            };
+            let serial = run_once(1, false);
+            let parallel = run_once(4, true);
+            assert_eq!(parallel.payload.as_slice(), serial.payload.as_slice(), "has_surface={has_surface}: payload mismatch");
+            assert_eq!(parallel.names_out, serial.names_out, "has_surface={has_surface}: names_out mismatch");
+            assert_eq!(parallel.items_out, serial.items_out, "has_surface={has_surface}: items_out mismatch");
+            assert_eq!(parallel.expansions_out, serial.expansions_out, "has_surface={has_surface}: expansions_out mismatch");
         }
     }
 }

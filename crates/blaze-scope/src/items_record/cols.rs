@@ -15,6 +15,35 @@ use super::{ItemsRecordError, u32_of};
 
 static ZERO_ID: [u8; 32] = [0u8; 32];
 
+/// Proven worst-case byte length written by [`encode_opt_u64`] (`IntPolicy::CONSTANT`,
+/// `DictUse::Never`): 5-byte header + 24-byte directory entry per 1,024-row block + at most
+/// 8 bytes per row (`Scheme::For` at 64-bit width, which the chooser never exceeds) + 8-byte
+/// trailing pad (`blaze_columns::enc::ints`).
+pub(super) fn int_col_bound(rows: usize) -> usize {
+    if rows == 0 {
+        return 0;
+    }
+    const BLOCK: usize = 1024;
+    const ENTRY: usize = 24;
+    const PAD: usize = 8;
+    5usize
+        .saturating_add(rows.div_ceil(BLOCK).saturating_mul(ENTRY))
+        .saturating_add(rows.saturating_mul(8))
+        .saturating_add(PAD)
+}
+
+/// Proven worst-case byte length written by [`encode_opt_id`]: 6-byte header (`KIND_IDS`, width
+/// 32, distinct count) + at most `32 * rows` bytes for the ID table (when every row is distinct)
+/// + [`int_col_bound`] for the encoded codes column (`blaze_columns::enc::ids`).
+pub(super) fn id_col_bound(rows: usize) -> usize {
+    if rows == 0 {
+        return 0;
+    }
+    6usize
+        .saturating_add(rows.saturating_mul(32))
+        .saturating_add(int_col_bound(rows))
+}
+
 blaze_own::soa! {
     /// Columnar write buffer for `ItemsRecord`'s item metadata (12 fields, 1 allocation).
     pub(super) struct ItemCol, ItemColsBuf, ItemColRef {
