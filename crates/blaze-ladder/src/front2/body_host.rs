@@ -191,6 +191,10 @@ pub(super) struct BodyAt {
     pub lib: LibKey,
     /// Where the body's text starts in `lib`'s text (`fixed`: where every call in it is).
     pub off: u32,
+    /// Synthetic prefix bytes prepended to the body's text (a head anonymous constant's
+    /// `"const _: {prim} = { "` wrapper): subtracted from each call's byte offset before
+    /// adding to `lib`'s file start + `off`. Zero for every other body.
+    pub sub: u32,
     /// The body's text is a copy of an expansion's (a local a macro call in the enclosing body
     /// wrote): every call in it is placed at that call, written at `off` (core `line!`: "the
     /// first macro invocation leading up to the expansion"), not at its own byte in the copy.
@@ -205,6 +209,9 @@ pub struct Placed<'h> {
     pub text: &'h str,
     /// The byte of `text` the body's text starts at (`fixed`: every call's).
     pub start: u32,
+    /// Synthetic prefix bytes prepended to the body's text (`BodyAt::sub`): subtracted from
+    /// `call` before adding to `start`.
+    pub sub: u32,
     pub fixed: bool,
 }
 
@@ -223,9 +230,9 @@ impl<'h> Placed<'h> {
             return None;
         }
         if by_call {
-            return Some(Placed { text, start, fixed: true });
+            return Some(Placed { text, start, sub: 0, fixed: true });
         }
-        Some(Placed { text, start: start.checked_add(at.off)?, fixed: at.fixed })
+        Some(Placed { text, start: start.checked_add(at.off)?, sub: at.sub, fixed: at.fixed })
     }
 }
 
@@ -249,7 +256,7 @@ impl<'h> BodyHost<'h> {
     /// the crate at `krate`; `sources` is the run's ([`super::heads::Store::sources`]): `None`
     /// refuses every env read, include and proc macro by name.
     pub fn of<S: NamesSource<'h>>(names: S, sources: Option<&'h dyn BodySources>, krate: usize, item: LibKey, module: LibKey, alloc: Alloc<'h>) -> impl ExpandCx {
-        Self::of_body(names, sources, krate, item, Some(BodyAt { lib: item, off: 0, fixed: false }), module, alloc)
+        Self::of_body(names, sources, krate, item, Some(BodyAt { lib: item, off: 0, sub: 0, fixed: false }), module, alloc)
     }
 
     /// [`Self::of`] for a body the lowering placed ([`BodyAt`]: a local item's is its
@@ -272,7 +279,7 @@ impl<'h> BodyHost<'h> {
             module,
             alloc,
             move || body_file(names, krate, item).or_else(|| names.place_of(item).and_then(|place| matches!(place.at, At::Expansion(_)).then_some(file))),
-            move || Placed::of(names, krate, BodyAt { lib: item, off: 0, fixed: false }, alloc),
+            move || Placed::of(names, krate, BodyAt { lib: item, off: 0, sub: 0, fixed: false }, alloc),
         )
     }
 
@@ -293,7 +300,7 @@ impl<'h> BodyHost<'h> {
 
     #[cfg(test)]
     pub(super) fn planted_solved_file<S: NamesSource<'h>>(names: S, sources: &'h dyn BodySources, krate: usize, item: LibKey, module: LibKey, alloc: Alloc<'h>) -> impl ExpandCx {
-        Self::from_file_lookup(names, Some(sources), krate, module, alloc, move || body_file(names.solved()?, krate, item), move || Placed::of(names, krate, BodyAt { lib: item, off: 0, fixed: false }, alloc))
+        Self::from_file_lookup(names, Some(sources), krate, module, alloc, move || body_file(names.solved()?, krate, item), move || Placed::of(names, krate, BodyAt { lib: item, off: 0, sub: 0, fixed: false }, alloc))
     }
 }
 
@@ -366,9 +373,14 @@ impl<'h, F: FnOnce() -> Option<FilePaths<'h>>, G: FnOnce() -> Option<Placed<'h>>
     fn place_of_call(&self, what: PlaceOf, call: u32) -> Result<Place<'_>, HostError> {
         match what {
             PlaceOf::Line | PlaceOf::Column => {
-                let Placed { text, start, fixed } = (*self.placed).ok_or(refused(HostAsk::Place))?;
+                let Placed { text, start, sub, fixed } = (*self.placed).ok_or(refused(HostAsk::Place))?;
                 let unreadable = HostError { ask: HostAsk::Place, why: HostWhy::Unreadable };
-                let at = if fixed { start } else { start.checked_add(call).ok_or(unreadable)? };
+                let at = if fixed {
+                    start
+                } else {
+                    let rel = call.checked_sub(sub).ok_or(unreadable)?;
+                    start.checked_add(rel).ok_or(unreadable)?
+                };
                 what.counted(text, at as usize).map(Place::Number).ok_or(unreadable)
             }
             PlaceOf::File | PlaceOf::ModulePath => self.place(what),
@@ -436,7 +448,7 @@ mod tests {
     const TEXT: &str = "fn a() {}\nfn b() {\n    tracing::info!(\"x\");\n}\n";
 
     fn host(sources: Option<&'static dyn BodySources>) -> BodyHost<'static> {
-        host_with(sources, || Some(Placed { text: TEXT, start: 10, fixed: false }))
+        host_with(sources, || Some(Placed { text: TEXT, start: 10, sub: 0, fixed: false }))
     }
 
     /// [`host`] whose body is placed by `placed` ([`super::Placed::of`]'s answer).
@@ -528,11 +540,15 @@ mod tests {
     #[test]
     fn a_call_in_a_local_a_macro_wrote_is_placed_at_the_outermost_call() {
         static SOURCES: One = One;
-        let copy = host_with(Some(&SOURCES), || Some(Placed { text: TEXT, start: 23, fixed: true }));
+        let copy = host_with(Some(&SOURCES), || Some(Placed { text: TEXT, start: 23, sub: 0, fixed: true }));
         assert_eq!((copy.place_of_call(PlaceOf::Line, 0), copy.place_of_call(PlaceOf::Column, 0)), (Ok(Place::Number(3)), Ok(Place::Number(5))));
         assert_eq!((copy.place_of_call(PlaceOf::Line, 400), copy.place_of_call(PlaceOf::Column, 400)), (Ok(Place::Number(3)), Ok(Place::Number(5))), "any byte of the copy: the call's place");
-        let written = host_with(Some(&SOURCES), || Some(Placed { text: TEXT, start: 23, fixed: false }));
+        let written = host_with(Some(&SOURCES), || Some(Placed { text: TEXT, start: 23, sub: 0, fixed: false }));
         assert_eq!((written.place_of_call(PlaceOf::Line, 0), written.place_of_call(PlaceOf::Column, 5)), (Ok(Place::Number(3)), Ok(Place::Number(10))), "twin: a written local counts its own byte");
+        let prefixed = host_with(Some(&SOURCES), || Some(Placed { text: TEXT, start: 10, sub: 18, fixed: false }));
+        assert_eq!((prefixed.place_of_call(PlaceOf::Line, 18), prefixed.place_of_call(PlaceOf::Column, 18)), (Ok(Place::Number(2)), Ok(Place::Number(1))), "prefix byte maps to expression start");
+        assert_eq!((prefixed.place_of_call(PlaceOf::Line, 31), prefixed.place_of_call(PlaceOf::Column, 31)), (Ok(Place::Number(3)), Ok(Place::Number(5))), "prefix-shifted call preserves line and column");
+        assert_eq!(prefixed.place_of_call(PlaceOf::Line, 17), Err(HostError { ask: HostAsk::Place, why: HostWhy::Unreadable }), "call inside synthetic prefix is unreadable");
         assert_eq!(copy.place(PlaceOf::Line), Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused }), "control: no call told");
     }
 }

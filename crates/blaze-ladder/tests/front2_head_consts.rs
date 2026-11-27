@@ -565,3 +565,57 @@ fn main() {}
         "`{name}` must refuse the genuinely unplaced macro enum explicitly, got: {outcome}"
     );
 }
+
+/// A multi-line head-level anonymous constant calling `line!()` on two different lines and
+/// `column!()` at two different columns (including inside a local `const` declared in the same
+/// block) must subtract the synthetic declaration prefix rather than fixing every call at the
+/// expression's start, so each call reports its exact 1-based source line and column.
+#[test]
+fn a_multiline_head_anon_const_preserves_distinct_line_and_column_offsets() {
+    // Line 1: empty (after opening quote newline)
+    // Line 2: trait Check<const N: u32> {}
+    // Line 3: trait LocalCheck<const N: u32> {}
+    // Line 4: struct S;
+    // Line 5: impl Check<{
+    // Line 6:     let l1 = line!();            -> line 6, col 14
+    // Line 7:     let l2 = line!();            -> line 7, col 14
+    // Line 8:     let c1 = column!();          -> line 8, col 14
+    // Line 9:         let c2 = column!();      -> line 9, col 18
+    // Line 10:    l1 * 1_000_000 + l2 * 10_000 + c1 * 100 + c2
+    // Line 11: }> for S {}
+    // Exact: 6_071_418; if fixed at expression start (line 6 col 5): 6_060_505.
+    // Line 12: impl LocalCheck<{
+    // Line 13:     const A: u32 = line!();     -> line 13, col 20
+    // Line 14:         const B: u32 = column!(); -> line 14, col 24
+    // Line 15:     A * 100 + B
+    // Line 16: }> for S {}
+    // Exact: 1324; if fixed at expression start (line 13 col 5): 1305.
+    const TEXT: &str = "
+trait Check<const N: u32> {}
+trait LocalCheck<const N: u32> {}
+struct S;
+impl Check<{
+    let l1 = line!();
+    let l2 = line!();
+    let c1 = column!();
+        let c2 = column!();
+    l1 * 1_000_000 + l2 * 10_000 + c1 * 100 + c2
+}> for S {}
+impl LocalCheck<{
+    const A: u32 = line!();
+        const B: u32 = column!();
+    A * 100 + B
+}> for S {}
+fn need_exact<T: Check<6_071_418>>() {}
+fn need_fixed<T: Check<6_060_505>>() {}
+fn need_local_exact<T: LocalCheck<1324>>() {}
+fn need_local_fixed<T: LocalCheck<1305>>() {}
+fn exact_ok() { need_exact::<S>() }
+fn fixed_wrong() { need_fixed::<S>() }
+fn local_exact_ok() { need_local_exact::<S>() }
+fn local_fixed_wrong() { need_local_fixed::<S>() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["exact_ok", "fixed_wrong", "local_exact_ok", "local_fixed_wrong"]);
+    expect("multiline head anon line/column", &got, &[true, false, true, false]);
+}

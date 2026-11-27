@@ -1633,7 +1633,16 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
                     .seeded_text_of(ha.owner_item)
                     .and_then(|it| it.impl_header.and_then(|hdr| blaze_scope::expansion_origins::offset_in(it.text, hdr)))
                     .unwrap_or(0);
-                return Some(super::body_host::BodyAt { lib: ha.owner_item, off: header_off.saturating_add(ha.expr_offset), fixed: true });
+                let base = header_off.checked_add(ha.expr_offset)?;
+                if fixed {
+                    let rel = off.checked_sub(ha.prefix)?;
+                    return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base.checked_add(rel)?, sub: 0, fixed: true });
+                }
+                if let Some(rel) = off.checked_sub(ha.prefix) {
+                    return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base.checked_add(rel)?, sub: 0, fixed: false });
+                }
+                let sub = ha.prefix.checked_sub(off)?;
+                return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base, sub, fixed: false });
             }
             // A library body: the lowered body itself (a free fn: its item; a member: the member
             // whose text it is, never its container, whose first byte is not the member's), or
@@ -1658,7 +1667,7 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
                     }
                 }
             };
-            return Some(super::body_host::BodyAt { lib, off, fixed });
+            return Some(super::body_host::BodyAt { lib, off, sub: 0, fixed });
         };
         if h.copied {
             off = h.range.start;
