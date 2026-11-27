@@ -183,19 +183,21 @@ impl<'d, 't, A: Allocator, B: Allocator + Clone> Edit<'d, 't, A, B> {
             Origin::Inline => {
                 // After the last value written in it: before a trailing comma, a comment or
                 // a newline the table closes with, so the text stays TOML whichever it has.
+                // An empty one becomes `{ k = v }`; one that holds only a comment keeps it,
+                // the entry going just after its `{`.
                 let last = self.value_end_before(table.id, span.end);
-                let at = last.unwrap_or(span.start);
-                text.push_str(if last.is_none() { "{ " } else { ", " });
+                let bare = self.doc.text()[span.start + 1..span.end - 1].trim().is_empty();
+                let (at, end, lead, tail) = match last {
+                    Some(at) => (at, at, ", ", ""),
+                    None if bare => (span.start, span.end, "{ ", " }"),
+                    None => (span.start + 1, span.start + 1, " ", ""),
+                };
+                text.push_str(lead);
                 write_key(key, &mut text);
                 text.push_str(" = ");
                 write_inline(value, &mut text).map_err(|error| EditError { at, what: EditWhat::Value(error) })?;
-                match last {
-                    None => {
-                        text.push_str(" }");
-                        self.splice(span.start, span.end, text);
-                    }
-                    Some(at) => self.splice(at, at, text),
-                }
+                text.push_str(tail);
+                self.splice(at, end, text);
             }
             origin => return Err(EditError { at: span.start, what: EditWhat::NotEditable { origin } }),
         }
@@ -350,9 +352,17 @@ impl<'d, 't, A: Allocator, B: Allocator + Clone> Edit<'d, 't, A, B> {
             text.push_str(kept);
             self.splice(comma, end, text);
         } else {
-            text.push_str("{}");
+            // The only one: `{}` in the table's place, unless a comment stands in it too.
             let span = table.span();
-            self.splice(span.start, span.end, text);
+            let source = self.doc.text();
+            let alone = source[span.start + 1..start].trim().is_empty() && source[end..span.end - 1].trim().is_empty();
+            match alone {
+                true => {
+                    text.push_str("{}");
+                    self.splice(span.start, span.end, text);
+                }
+                false => self.splice(start, end, text),
+            }
         }
     }
 

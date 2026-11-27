@@ -211,6 +211,10 @@ fn edits_keep_a_toml_1_1_inline_table() {
         (set("a = {\n  x = 1, # one\n  y = 2,\n}\n"), "a = {\n  x = 1, # one\n  y = 2, k = 3,\n}\n"),
         (set("a = { x = 1 # c\n}\n"), "a = { x = 1, k = 3 # c\n}\n"),
         (set("a = {\n}\n"), "a = { k = 3 }\n"),
+        // A comment in a table with no entry, or beside its only one, is kept.
+        (set("a = {\n  # note\n}\n"), "a = { k = 3\n  # note\n}\n"),
+        (removed("a = { # note\n  x = 1\n}\n", "x"), "a = { # note\n  \n}\n"),
+        (removed("a = { x = 1 # note\n}\n", "x"), "a = {  # note\n}\n"),
     ];
     for (edited, want) in cases {
         assert_eq!(edited, want);
