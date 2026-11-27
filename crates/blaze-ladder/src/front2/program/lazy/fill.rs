@@ -530,6 +530,11 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             self.make_want(Want::Members(trait_lib), trait_, "row (trait members for impl method)")?;
         }
         let Some(head) = self.store.fns.get(&key) else {
+            if let Some(why) = self.store.fn_gaps.get(&key) {
+                let mut text = blaze_own::String::new_in(self.alloc);
+                let _ = core::fmt::write(&mut text, format_args!("row (lazy/fill.rs): {why:?}"));
+                return Err(LazyRefusal::Head { item: self.refused_shown(key), why: text.as_str().into() });
+            }
             return Err(refuse(Front2Refusal::NoHead { function: Box::from(path.as_str()) }));
         };
         let (lib, text, in_container, has_body) = (head.lib, head.text, head.container.is_some(), head.has_body);
