@@ -137,10 +137,29 @@ pub(crate) struct WrittenBy<'n> {
 
 /// The key whose place says where a listed body is written: a free fn's own, a member's
 /// container's (an impl or trait a macro wrote writes its members).
-fn placed_by(body: BodyRef<'_>) -> ItemKey {
+/// Where `body` is written: a free item's own `text_at`; a member of an impl or trait uses its
+/// `written_by` macro call (`At::Expansion(call)`) when a macro call inside the container wrote it
+/// (matching `engine_heads.rs`), else its container's `text_at`.
+fn body_text_at<'n>(records: &'n Records<'n>, body: BodyRef<'n>) -> Option<At> {
     match body {
-        BodyRef::Free(key) => key,
-        BodyRef::Member { container, .. } => container,
+        BodyRef::Free(key) => records.text_at(key),
+        BodyRef::Member { container, kind, name, .. } => {
+            let want = match kind {
+                blaze_ladder::front2::keys::MemberKind::Fn => Some(ItemKind::Function),
+                blaze_ladder::front2::keys::MemberKind::Const => Some(ItemKind::Const),
+                _ => None,
+            };
+            let mut written_by = None;
+            records.each_member_row(container, &mut |m| {
+                if want.is_none_or(|w| m.kind == w) && m.name == Some(name) && m.written_by.is_some() {
+                    written_by = m.written_by;
+                }
+            });
+            match written_by {
+                Some(call) => Some(At::Expansion(call)),
+                None => records.text_at(container),
+            }
+        }
     }
 }
 
@@ -292,14 +311,12 @@ pub(crate) fn written_path<'n>(
     Err("a written item's walk names its calls and blocks in a loop (body_types/covered.rs `written_path`)")
 }
 
-/// Every listed body of crate 0 a macro wrote at module level, each with the entry its call is
-/// at ([`WrittenBy`]): by call, each call's chain walked once ([`walk_up`]), innermost macro
-/// first. A body whose walk stops at a listed body's block ([`block_stops`]) is that block's
-/// and [`in_blocks`]'s alone: not here. A fn of an impl written in a file that a macro call
-/// inside the impl block wrote is not here (its container's place is the file): NAMED, not
-/// covered yet (heads.rs says the same of its head). With no crate key there is no stop list:
-/// [`in_blocks`] is then refused (`NoCrateKey`), and every entry with it (engine_bodies.rs
-/// `groups`), so no body is checked twice.
+/// Every listed body of crate 0 a macro wrote at module level (or inside a module-level `impl` or
+/// `trait` block via a macro call), each with the entry its call is at ([`WrittenBy`]): by call,
+/// each call's chain walked once ([`walk_up`]), innermost macro first. A body whose walk stops at
+/// a listed body's block ([`block_stops`]) is that block's and [`in_blocks`]'s alone: not here.
+/// With no crate key there is no stop list: [`in_blocks`] is then refused (`NoCrateKey`), and
+/// every entry with it (engine_bodies.rs `groups`), so no body is checked twice.
 pub(crate) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, listed: &[Listed<'n>], alloc: Alloc<'n>) -> AVec<'n, WrittenBy<'n>> {
     let blocks = match NamesSource::crate_key(records, 0) {
         Some(krate) => block_stops(records, krate, listed, alloc),
@@ -308,11 +325,12 @@ pub(crate) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n
     let stop = |at: ItemKey| blocks.binary_search_by(|b| b.0.cmp(&at)).is_ok();
     let mut calls: AVec<'n, (ItemKey, Listed<'n>)> = AVec::new_in(alloc);
     for l in listed.iter().filter(|l| l.entry.is_none()) {
-        // From the items row alone (front2 source.rs `Records::text_at`): `place_of` reads the
+        // From the items row alone (front2 source.rs `Records::text_at`, plus `m.written_by` for a
+        // member written by a macro call inside an `impl`/`trait` block): `place_of` reads the
         // text first, and a body whose expansion record is missing then dropped out of its
         // call's task, which passed clean with nothing checked; its check now reads the text
         // and is refused naming the record.
-        if let Some(At::Expansion(call)) = records.text_at(placed_by(l.body)) {
+        if let Some(At::Expansion(call)) = body_text_at(records, l.body) {
             calls.push((call, *l));
         }
     }
@@ -468,7 +486,7 @@ pub(crate) fn in_blocks<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>
     // any duplicate finding already reported via `each_from`.
     let mut links: AVec<'n, (ItemKey, ItemKey, Listed<'n>, bool, bool, bool)> = AVec::new_in(alloc);
     for l in listed.iter().filter(|l| l.entry.is_none()) {
-        let Some(At::Expansion(call)) = records.text_at(placed_by(l.body)) else { continue };
+        let Some(At::Expansion(call)) = body_text_at(records, l.body) else { continue };
         let Ok(Up::Stopped(block)) = walk_up(texts, call, &mut |_, _| {}, &stop) else { continue };
         let Ok(at) = blocks.binary_search_by(|b| b.0.cmp(&block)) else { continue };
         let Some(&(_, owner_of_block)) = blocks.get(at) else { continue };

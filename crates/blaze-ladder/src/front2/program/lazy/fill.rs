@@ -131,11 +131,13 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         // path). Over a checked body each step finds its item already filed and does nothing.
         // The ADT heads first: a callee that is a ctor is filed by its ADT's head.
         self.adt_rows(checked)?;
-        // Each fn the body names as a value: filed (lazy/locate.rs), so `bind_internal` and
-        // the walk's `check_one` of it read a key the map knows.
+        // Each fn the body names as a value: filed AND its head row made (`callee_row`), so
+        // `bind_internal`, fn-pointer coercion (`Adts::fn_abi`), and the walk's `check_one` all
+        // see its ABI and signature even when the body was read from a cached `Typed` record
+        // without running `check_body`.
         for &def in checked.expr_defs.column::<1>() {
             if let tc::Def::Fn(k) = def {
-                self.locate(k)?;
+                self.callee_row(k)?;
             }
         }
         // Each fn the body calls: its head row (the build reads a call's ABI and signature
@@ -144,15 +146,22 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         for &callee in checked.callees.column::<1>() {
             self.callee_row(callee)?;
         }
-        // Any opaque type named by the body's checked types (including RPITIT default twins
-        // `rpitit::default_key` or opaques whose owner was not a direct callee when the body
-        // was read from a typed record): ensure its defining head and RPITIT default row exist.
+        // Any opaque type or `FnDef` item named by the body's checked types (including RPITIT
+        // default twins `rpitit::default_key`, opaques, or `extern "C"` fn-item types whose owner
+        // was not a direct callee when the body was read from a typed record): ensure its defining
+        // head / callee row exists.
         for n in checked.types.view().nodes() {
-            if let tc::PNode::Opaque(k, _) = *n {
-                let filed = crate::front2::rpitit::filed_as(&self.store, k);
-                if !self.store.opaques.contains_key(&filed) {
-                    self.ensure_opaque(k)?;
+            match *n {
+                tc::PNode::Opaque(k, _) => {
+                    let filed = crate::front2::rpitit::filed_as(&self.store, k);
+                    if !self.store.opaques.contains_key(&filed) {
+                        self.ensure_opaque(k)?;
+                    }
                 }
+                tc::PNode::FnDef(k, _) => {
+                    self.callee_row(k)?;
+                }
+                _ => {}
             }
         }
         self.async_rows(&made)?;

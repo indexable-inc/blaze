@@ -859,11 +859,13 @@ fn mem_base_vreg(op: &MOp) -> Option<u32> {
 // 3. Exact Loop-Carried Recurrence Analysis (Both `VReg`s and `PReg`s)
 // -----------------------------------------------------------------------------
 
-/// Hybrid physical (`u32` GPR + `u32` FP) + virtual (`[u64; vwords]`) register set.
+/// Hybrid physical (`u32` GPR + `u32` FP) + virtual (`[u64; vwords]`) register set with
+/// O(touched) `clear()` via `dirty_words` so per-block resets never scan empty megabyte bitsets.
 struct HybridRegSet<'a> {
     gpr: u32,
     fp: u32,
     vwords: Vec<u64, Alloc<'a>>,
+    dirty_words: Vec<usize, Alloc<'a>>,
 }
 
 impl<'a> HybridRegSet<'a> {
@@ -872,6 +874,7 @@ impl<'a> HybridRegSet<'a> {
             gpr: 0,
             fp: 0,
             vwords: vec_filled(num_vwords, 0u64, alloc),
+            dirty_words: Vec::new_in(alloc),
         }
     }
 
@@ -879,9 +882,12 @@ impl<'a> HybridRegSet<'a> {
     fn clear(&mut self) {
         self.gpr = 0;
         self.fp = 0;
-        for w in self.vwords.iter_mut() {
-            *w = 0;
+        for &w in self.dirty_words.iter() {
+            if let Some(slot) = self.vwords.get_mut(w) {
+                *slot = 0;
+            }
         }
+        self.dirty_words.clear();
     }
 
     #[inline]
@@ -918,6 +924,9 @@ impl<'a> HybridRegSet<'a> {
     fn insert_vreg(&mut self, id: u32) {
         let w = to_idx(id >> 6);
         if let Some(slot) = self.vwords.get_mut(w) {
+            if *slot == 0 {
+                self.dirty_words.push(w);
+            }
             *slot |= 1u64 << (id & 63);
         }
     }
@@ -1180,10 +1189,13 @@ fn analyze_loop_recurrences<'a>(
         return LoopAnalysis { is_recurrence, in_loop_block };
     }
 
-    let num_vwords = func.vreg_class.len().div_ceil(64);
+    let num_vregs = func.vreg_class.len();
+    let num_vwords = num_vregs.div_ceil(64);
     let has_preds_csr = !func.block_preds_off.is_empty();
 
-    // Reusable per-loop scratch buffers.
+    // Reusable per-loop scratch buffers hoisted outside `headers` so mega-functions with
+    // hundreds of loop headers never accumulate bump-arena allocations or scan all function
+    // vregs per loop.
     let mut block_to_slot = vec_filled(n_blocks, usize::MAX, alloc);
     let mut loop_blocks: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
     let mut worklist: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
@@ -1191,6 +1203,20 @@ fn analyze_loop_recurrences<'a>(
     let mut consumed_later = HybridRegSet::new(num_vwords, alloc);
     let mut copy_add_srcs: Vec<MReg, Alloc<'a>> = Vec::new_in(alloc);
     let mut copy_kill_dsts: Vec<MReg, Alloc<'a>> = Vec::new_in(alloc);
+    let mut def_stamp = vec_filled(num_vregs, 0u32, alloc);
+    let mut vreg_to_local = vec_filled(num_vregs, u32::MAX, alloc);
+    let mut local_to_vreg: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+    let mut cur_stamp = 0u32;
+
+    let mut up_gpr: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+    let mut up_fp: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+    let mut def_gpr: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+    let mut def_fp: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+    let mut live_in_gpr: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+    let mut live_in_fp: Vec<u32, Alloc<'a>> = Vec::new_in(alloc);
+    let mut up_v: Vec<u64, Alloc<'a>> = Vec::new_in(alloc);
+    let mut def_v: Vec<u64, Alloc<'a>> = Vec::new_in(alloc);
+    let mut live_in_v: Vec<u64, Alloc<'a>> = Vec::new_in(alloc);
 
     for &h in headers.iter() {
         let h_pos = at(&order_pos, h, usize::MAX);
@@ -1253,46 +1279,208 @@ fn analyze_loop_recurrences<'a>(
         }
 
         let k_len = loop_blocks.len();
-        let total_vwords = k_len.saturating_mul(num_vwords);
 
-        let mut up_gpr = vec_filled(k_len, 0u32, alloc);
-        let mut up_fp = vec_filled(k_len, 0u32, alloc);
-        let mut up_v = vec_filled(total_vwords, 0u64, alloc);
-        let mut def_gpr = vec_filled(k_len, 0u32, alloc);
-        let mut def_fp = vec_filled(k_len, 0u32, alloc);
-        let mut def_v = vec_filled(total_vwords, 0u64, alloc);
+        // 2b. Compact loop-candidate `VReg`s: only vregs upward-exposed in at least one block of
+        //     this loop can ever enter `live_in` of any block in the loop. Block-local SSA vregs
+        //     are excluded without changing the recurrence solution.
+        local_to_vreg.clear();
+        if num_vregs > 0 {
+            for &b_idx in loop_blocks.iter() {
+                if cur_stamp == u32::MAX {
+                    for s in def_stamp.iter_mut() {
+                        *s = 0;
+                    }
+                    cur_stamp = 1;
+                } else {
+                    cur_stamp += 1;
+                }
+                let stamp = cur_stamp;
+                let range = func.block_inst_range(MBlock(u32_of(b_idx)));
+                let end = range.end.min(n_ops);
+                for i in range.start..end {
+                    if let Some(&MOp::ParallelCopy { start, len }) = func.ops.get(i) {
+                        let cs = to_idx(start);
+                        let ce = cs.saturating_add(usize::from(len)).min(func.copy_pairs.len());
+                        let copy_slice = func.copy_pairs.get(cs..ce).unwrap_or(&[]);
+                        for &(_, src) in copy_slice {
+                            if let MReg::V(v) = src {
+                                let vi = to_idx(v.0);
+                                if vi < num_vregs
+                                    && at(&def_stamp, vi, 0u32) != stamp
+                                    && at(&vreg_to_local, vi, u32::MAX) == u32::MAX
+                                {
+                                    let lid = u32_of(local_to_vreg.len());
+                                    set(&mut vreg_to_local, vi, lid);
+                                    local_to_vreg.push(v.0);
+                                }
+                            }
+                        }
+                        for &(dst, _) in copy_slice {
+                            if let MReg::V(v) = dst {
+                                let vi = to_idx(v.0);
+                                if vi < num_vregs {
+                                    set(&mut def_stamp, vi, stamp);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    let info = classify_inst(func, i, target);
+                    for &v in info.vreg_uses_slice() {
+                        let vi = to_idx(v);
+                        if vi < num_vregs
+                            && at(&def_stamp, vi, 0u32) != stamp
+                            && at(&vreg_to_local, vi, u32::MAX) == u32::MAX
+                        {
+                            let lid = u32_of(local_to_vreg.len());
+                            set(&mut vreg_to_local, vi, lid);
+                            local_to_vreg.push(v);
+                        }
+                    }
+                    for &v in info.vreg_defs_slice() {
+                        let vi = to_idx(v);
+                        if vi < num_vregs {
+                            set(&mut def_stamp, vi, stamp);
+                        }
+                    }
+                }
+            }
+        }
+
+        let loop_vwords = local_to_vreg.len().div_ceil(64);
+        let raw_total_vwords = k_len.saturating_mul(loop_vwords);
+        let active_vwords = if raw_total_vwords <= MAX_SSA_LIVENESS_WORDS {
+            loop_vwords
+        } else {
+            0
+        };
+        let total_vwords = k_len.saturating_mul(active_vwords);
+
+        up_gpr.clear();
+        up_gpr.resize(k_len, 0u32);
+        up_fp.clear();
+        up_fp.resize(k_len, 0u32);
+        def_gpr.clear();
+        def_gpr.resize(k_len, 0u32);
+        def_fp.clear();
+        def_fp.resize(k_len, 0u32);
+        up_v.clear();
+        up_v.resize(total_vwords, 0u64);
+        def_v.clear();
+        def_v.resize(total_vwords, 0u64);
 
         for (slot, &b_idx) in loop_blocks.iter().enumerate() {
-            compute_block_use_def(
-                func,
-                b_idx,
-                slot,
-                num_vwords,
-                target,
-                &mut up_gpr,
-                &mut up_fp,
-                &mut up_v,
-                &mut def_gpr,
-                &mut def_fp,
-                &mut def_v,
-            );
+            let range = func.block_inst_range(MBlock(u32_of(b_idx)));
+            let end = range.end.min(n_ops);
+            let vbase = slot * active_vwords;
+            let mut d_gpr = 0u32;
+            let mut d_fp = 0u32;
+            let mut u_gpr = 0u32;
+            let mut u_fp = 0u32;
+
+            for i in range.start..end {
+                if let Some(&MOp::ParallelCopy { start, len }) = func.ops.get(i) {
+                    let cs = to_idx(start);
+                    let ce = cs.saturating_add(usize::from(len)).min(func.copy_pairs.len());
+                    let copy_slice = func.copy_pairs.get(cs..ce).unwrap_or(&[]);
+                    for &(_, src) in copy_slice {
+                        match src {
+                            MReg::P(PReg::Gpr(r)) if r <= 30 => {
+                                let bit = 1u32 << r;
+                                if (d_gpr & bit) == 0 {
+                                    u_gpr |= bit;
+                                }
+                            }
+                            MReg::P(PReg::V(r)) if r <= 31 => {
+                                let bit = 1u32 << r;
+                                if (d_fp & bit) == 0 {
+                                    u_fp |= bit;
+                                }
+                            }
+                            MReg::V(v) if active_vwords > 0 => {
+                                let lid = at(&vreg_to_local, to_idx(v.0), u32::MAX);
+                                if lid != u32::MAX {
+                                    let w = to_idx(lid >> 6);
+                                    let bit = 1u64 << (lid & 63);
+                                    if w < active_vwords && (at(&def_v, vbase + w, 0u64) & bit) == 0 {
+                                        bitor_at(&mut up_v, vbase + w, bit);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    for &(dst, _) in copy_slice {
+                        match dst {
+                            MReg::P(PReg::Gpr(r)) if r <= 30 => d_gpr |= 1u32 << r,
+                            MReg::P(PReg::V(r)) if r <= 31 => d_fp |= 1u32 << r,
+                            MReg::V(v) if active_vwords > 0 => {
+                                let lid = at(&vreg_to_local, to_idx(v.0), u32::MAX);
+                                if lid != u32::MAX {
+                                    let w = to_idx(lid >> 6);
+                                    if w < active_vwords {
+                                        bitor_at(&mut def_v, vbase + w, 1u64 << (lid & 63));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
+
+                let info = classify_inst(func, i, target);
+                let ug = info.phys_gpr_uses & 0x7fff_ffff;
+                let uf = info.phys_fp_uses;
+                u_gpr |= ug & !d_gpr;
+                u_fp |= uf & !d_fp;
+                if active_vwords > 0 {
+                    for &v in info.vreg_uses_slice() {
+                        let lid = at(&vreg_to_local, to_idx(v), u32::MAX);
+                        if lid != u32::MAX {
+                            let w = to_idx(lid >> 6);
+                            let bit = 1u64 << (lid & 63);
+                            if w < active_vwords && (at(&def_v, vbase + w, 0u64) & bit) == 0 {
+                                bitor_at(&mut up_v, vbase + w, bit);
+                            }
+                        }
+                    }
+                }
+                d_gpr |= info.phys_gpr_defs & 0x7fff_ffff;
+                d_fp |= info.phys_fp_defs;
+                if active_vwords > 0 {
+                    for &v in info.vreg_defs_slice() {
+                        let lid = at(&vreg_to_local, to_idx(v), u32::MAX);
+                        if lid != u32::MAX {
+                            let w = to_idx(lid >> 6);
+                            if w < active_vwords {
+                                bitor_at(&mut def_v, vbase + w, 1u64 << (lid & 63));
+                            }
+                        }
+                    }
+                }
+            }
+
+            set(&mut up_gpr, slot, u_gpr);
+            set(&mut up_fp, slot, u_fp);
+            set(&mut def_gpr, slot, d_gpr);
+            set(&mut def_fp, slot, d_fp);
         }
 
         // 3. Bounded backward liveness inside the natural loop body (`live_in[0]` = header `h` live-in).
-        let mut live_in_gpr = vec_filled(k_len, 0u32, alloc);
-        let mut live_in_fp = vec_filled(k_len, 0u32, alloc);
-        let mut live_in_v = vec_filled(total_vwords, 0u64, alloc);
-
-        live_in_gpr.copy_from_slice(&up_gpr);
-        live_in_fp.copy_from_slice(&up_fp);
-        live_in_v.copy_from_slice(&up_v);
+        live_in_gpr.clear();
+        live_in_gpr.extend_from_slice(&up_gpr);
+        live_in_fp.clear();
+        live_in_fp.extend_from_slice(&up_fp);
+        live_in_v.clear();
+        live_in_v.extend_from_slice(&up_v);
 
         if k_len > 1 {
             for _ in 0..MAX_LOOP_LIVENESS_ITERS {
                 let mut changed = false;
                 for slot in (0..k_len).rev() {
                     let b_idx = at(&loop_blocks, slot, 0usize);
-                    let vbase = slot * num_vwords;
+                    let vbase = slot * active_vwords;
                     let mut out_gpr = 0u32;
                     let mut out_fp = 0u32;
 
@@ -1303,8 +1491,8 @@ fn analyze_loop_recurrences<'a>(
                             if s_slot != usize::MAX {
                                 out_gpr |= at(&live_in_gpr, s_slot, 0u32);
                                 out_fp |= at(&live_in_fp, s_slot, 0u32);
-                                let svbase = s_slot * num_vwords;
-                                for w in 0..num_vwords {
+                                let svbase = s_slot * active_vwords;
+                                for w in 0..active_vwords {
                                     let add = at(&live_in_v, svbase + w, 0u64)
                                         & !at(&def_v, vbase + w, 0u64);
                                     if let Some(cell) = live_in_v.get_mut(vbase + w) {
@@ -1352,13 +1540,17 @@ fn analyze_loop_recurrences<'a>(
                     if s_slot != usize::MAX {
                         needed.gpr |= at(&live_in_gpr, s_slot, 0u32) & hdr_live_gpr;
                         needed.fp |= at(&live_in_fp, s_slot, 0u32) & hdr_live_fp;
-                        let svbase = s_slot * num_vwords;
-                        for w in 0..num_vwords {
-                            bitor_at(
-                                &mut needed.vwords,
-                                w,
-                                at(&live_in_v, svbase + w, 0u64) & at(&live_in_v, w, 0u64),
-                            );
+                        let svbase = s_slot * active_vwords;
+                        for w in 0..active_vwords {
+                            let mut bits =
+                                at(&live_in_v, svbase + w, 0u64) & at(&live_in_v, w, 0u64);
+                            while bits != 0 {
+                                let tz = bits.trailing_zeros() as usize;
+                                bits &= bits - 1;
+                                if let Some(&orig_v) = local_to_vreg.get(w * 64 + tz) {
+                                    needed.insert_vreg(orig_v);
+                                }
+                            }
                         }
                     }
                 }
@@ -1444,7 +1636,11 @@ fn analyze_loop_recurrences<'a>(
             }
         }
 
-        // Clear `block_to_slot` entries for next header.
+        // Clear `vreg_to_local` and `block_to_slot` entries for next header.
+        for &v in local_to_vreg.iter() {
+            set(&mut vreg_to_local, to_idx(v), u32::MAX);
+        }
+        local_to_vreg.clear();
         for &b_idx in loop_blocks.iter() {
             set(&mut block_to_slot, b_idx, usize::MAX);
         }

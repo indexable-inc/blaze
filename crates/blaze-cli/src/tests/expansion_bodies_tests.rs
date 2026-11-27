@@ -107,3 +107,19 @@ fn an_edit_of_the_macro_in_another_file_reruns_its_calls_check() {
     assert!(after.contains("{the expansion of `write_f!`}::f"), "the finding is the call's, naming the expansion's item:\n{after}");
     std::println!("macro edited in another file: errors {errors:?}");
 }
+
+/// A `macro_rules!` called INSIDE an `impl` block written directly in a file (like
+/// `blaze-hash/src/blake3.rs`'s `fixed_width_writes!()` inside `impl Hasher for Blake3Hasher`):
+/// `body_text_at` reads `m.written_by` (`At::Expansion(call)`), and `work::expansion_entry`
+/// gives the member-position `MacroCall` a `BodyCheck` part covering the generated methods:
+/// `(0, 1, 0)`. CONTROL: without `m.written_by` in `covered.rs` or member `MacroCall` in
+/// `work.rs`, nothing checks `get` (`(0, 0, 0)`) and `blaze build` refuses it with `NoRow`.
+#[test]
+fn a_method_written_by_a_macro_inside_an_impl_block_is_checked_at_its_call() {
+    let good = "pub struct S(pub u8);\nmacro_rules! write_get {\n    () => {\n        pub fn get(&self) -> u8 { self.0 }\n    };\n}\nimpl S {\n    write_get!();\n}\n";
+    let bad = "pub struct S(pub u8);\nmacro_rules! write_get {\n    () => {\n        pub fn get(&self) -> u16 { self.0 }\n    };\n}\nimpl S {\n    write_get!();\n}\n";
+    let (errors, after) = three_checks(64, good, bad);
+    assert_eq!(errors, (0, 1, 0), "a method written by a macro inside an impl block must be type checked:\n{after}");
+    assert!(after.contains("\"types\""), "the error is the body's type error:\n{after}");
+    assert!(after.contains("{the expansion of `write_get!`}::get"), "the finding names the expansion's item:\n{after}");
+}
