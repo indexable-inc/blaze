@@ -12,11 +12,21 @@
 //! held is refused), a value written by worker `i` is read back by `i`, and every task's work and
 //! waits sum to its time on the clock (no wait returns uncharged).
 
-use std::{format, vec::Vec as StdVec};
+use std::{
+    collections::BTreeSet,
+    format,
+    sync::{
+        Barrier,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    vec::Vec as StdVec,
+};
 
 use core::{fmt, time::Duration};
 
 use blaze_own::Alloc;
+use blaze_rng::SplitMix64;
 use blaze_sim::{Broken, Config, NoPlant, Tape, check, controls};
 
 use super::{Held, Limits, MOST_CALLERS, Slot, SlotOpts, WorkerId, Workers, WorkersError, WorkersOpts, WorkersPlant, WorkersSetup, charge_wait};
@@ -400,5 +410,400 @@ fn caller_lease_boundaries_and_limit_checks() {
         let again = workers.lease().expect("re-lease highest bit");
         assert_eq!(again.id(), last_id);
         assert!(matches!(workers.lease(), Err(WorkersError::CallersTaken { most }) if most == count));
+    }
+}
+
+/// The invariants the multi-word caller lease DST checks against its reference oracle.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum LeaseBroken {
+    /// Two live leases held the same caller [`WorkerId`].
+    Duplicate { id: u32 },
+    /// A lease returned a [`WorkerId`] outside `[first_caller, first_caller + callers)`.
+    OutOfBounds { id: u32, first: u32, callers: u32 },
+    /// `lease` succeeded even though `callers` leases were already live.
+    MissedBound { callers: u32, live: usize },
+    /// `lease` returned `CallersTaken` even though fewer than `callers` leases were live (or after
+    /// all leases were dropped, indicating a leak).
+    SpuriousFull { callers: u32, live: usize },
+    /// `CallersTaken` reported the wrong limit.
+    WrongBound { want: u32, got: u32 },
+}
+
+impl fmt::Display for LeaseBroken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LeaseBroken::Duplicate { id } => write!(f, "caller cell {id} was leased twice while still live"),
+            LeaseBroken::OutOfBounds { id, first, callers } => {
+                write!(f, "caller cell {id} is outside [{first}, {})", first + callers)
+            }
+            LeaseBroken::MissedBound { callers, live } => {
+                write!(f, "lease succeeded with {live} already live (bound {callers})")
+            }
+            LeaseBroken::SpuriousFull { callers, live } => {
+                write!(f, "CallersTaken returned with only {live}/{callers} leases live")
+            }
+            LeaseBroken::WrongBound { want, got } => {
+                write!(f, "CallersTaken reported bound {got}, expected {want}")
+            }
+        }
+    }
+}
+
+blaze_sim::plants! {
+    /// Planted bugs in the multi-word caller lease bitmap, each caught by its oracle invariant.
+    enum LeasePlant breaks LeaseBroken {
+        /// The multi-word lease bitmap as shipped.
+        None,
+        /// Final-word mask and capacity check are skipped: hands out bits past `Limits::callers`.
+        FinalMaskSkipped => LeaseBroken::OutOfBounds { .. } | LeaseBroken::MissedBound { .. },
+        /// Dropping a lease clears word 0 instead of its own word: duplicates a live word-0 ID or
+        /// leaks the higher-word bit.
+        DropWrongWord => LeaseBroken::Duplicate { .. } | LeaseBroken::SpuriousFull { .. },
+        /// Dropping a lease forgets to clear its bitmap bit: leaks slots until `SpuriousFull`.
+        BitLeaked => LeaseBroken::SpuriousFull { .. },
+    }
+}
+
+fn to_workers_plant(plant: LeasePlant) -> WorkersPlant {
+    match plant {
+        LeasePlant::None => WorkersPlant::None,
+        LeasePlant::FinalMaskSkipped => WorkersPlant::CallerFinalMaskSkipped,
+        LeasePlant::DropWrongWord => WorkersPlant::CallerDropWrongWord,
+        LeasePlant::BitLeaked => WorkersPlant::CallerBitLeaked,
+    }
+}
+
+/// Deterministic simulation of interleaved multi-word caller `lease` / `drop` operations against
+/// an exact allocation/release oracle (`BTreeSet<u32>` + live count).
+fn lease_sim(tape: &Tape, plant: LeasePlant) -> Result<(), Broken<LeaseBroken>> {
+    let callers = match tape.below(4, "caller shape") {
+        0 => 65,
+        1 => 130,
+        2 => 192,
+        _ => 65 + u32::try_from(tape.below(u64::from(MOST_CALLERS - 64), "callers")).unwrap_or(0),
+    };
+    let most_workers = 1 + u32::try_from(tape.below(8, "most_workers")).unwrap_or(0);
+    let models = u32::try_from(tape.below(4, "models")).unwrap_or(0);
+    let first = most_workers + models;
+    let workers = Workers::bare(WorkersSetup {
+        limits: Limits { most_workers, callers, most_slots: 0 },
+        seed: None,
+        models,
+    })
+    .map_err(|error| Broken::Harness(format!("workers setup: {error}")))?;
+
+    let wp = to_workers_plant(plant);
+    let mut held = StdVec::new();
+    let mut live = BTreeSet::new();
+
+    let acquire_one = |held: &mut StdVec<super::Lease>, live: &mut BTreeSet<u32>| -> Result<(), Broken<LeaseBroken>> {
+        match workers.lease_planted(wp) {
+            Ok(lease) => {
+                let id = lease.id().index();
+                if id < first || id >= first + callers {
+                    return Err(Broken::Oracle(LeaseBroken::OutOfBounds { id, first, callers }));
+                }
+                if live.len() >= usize::try_from(callers).unwrap_or(usize::MAX) {
+                    return Err(Broken::Oracle(LeaseBroken::MissedBound { callers, live: live.len() }));
+                }
+                if !live.insert(id) {
+                    return Err(Broken::Oracle(LeaseBroken::Duplicate { id }));
+                }
+                let _ = workers.hold(lease.id()).map_err(|busy| Broken::Harness(format!("hold {id}: {busy:?}")))?;
+                held.push(lease);
+                Ok(())
+            }
+            Err(WorkersError::CallersTaken { most }) => {
+                if most != callers {
+                    return Err(Broken::Oracle(LeaseBroken::WrongBound { want: callers, got: most }));
+                }
+                if live.len() < usize::try_from(callers).unwrap_or(usize::MAX) {
+                    return Err(Broken::Oracle(LeaseBroken::SpuriousFull { callers, live: live.len() }));
+                }
+                Ok(())
+            }
+            Err(other) => Err(Broken::Harness(format!("unexpected lease error: {other}"))),
+        }
+    };
+
+    // Drive interleaved multi-word acquire/release steps: start with a burst past word 0 so
+    // multiple words are populated, then alternate random acquires and drops, including probing
+    // past the configured bound.
+    let initial = 65usize.min(usize::try_from(callers).unwrap_or(65));
+    for _ in 0..initial {
+        acquire_one(&mut held, &mut live)?;
+    }
+
+    let steps = 32 + tape.index(160, "steps");
+    for _ in 0..steps {
+        let do_acquire = held.is_empty() || tape.below(3, "op") != 0;
+        if do_acquire {
+            acquire_one(&mut held, &mut live)?;
+        } else {
+            let at = tape.index(held.len(), "drop index");
+            let lease = held.swap_remove(at);
+            live.remove(&lease.id().index());
+            drop(lease);
+        }
+    }
+
+    // Saturate to the exact bound, probe one past it, then drop everything and prove zero leaks
+    // by re-leasing all `callers` slots cleanly.
+    while live.len() < usize::try_from(callers).unwrap_or(usize::MAX) {
+        acquire_one(&mut held, &mut live)?;
+    }
+    acquire_one(&mut held, &mut live)?;
+
+    held.clear();
+    live.clear();
+
+    for _ in 0..callers {
+        acquire_one(&mut held, &mut live)?;
+    }
+    acquire_one(&mut held, &mut live)?;
+    Ok(())
+}
+
+#[test]
+fn multiword_caller_leases_match_oracle() {
+    check(Config::cases(128), |tape| lease_sim(tape, LeasePlant::None));
+}
+
+#[test]
+fn every_lease_plant_is_caught_by_its_invariant() {
+    controls(Config::cases(128), lease_sim);
+}
+
+/// Runs real concurrent multi-threaded `compare_exchange_weak` / `fetch_and` contention across
+/// multiple 64-bit words with a lock-free atomic ownership oracle:
+/// - Phase A (under/at exact bound): total quota across all threads == `callers`, so `CallersTaken`
+///   must NEVER be returned spuriously even under cross-word drop/acquire races.
+/// - Phase B (over bound): threads contest beyond `callers`, verifying no duplicate live IDs, no
+///   out-of-bounds IDs, and exact `CallersTaken { most: callers }`.
+/// - Phase C (reclaim): after all threads drop, every one of `callers` slots is re-leasable once
+///   and the `(callers + 1)`th returns `CallersTaken { most: callers }`.
+fn run_concurrent_lease_contention(seed: u64, callers: u32, plant: LeasePlant) -> Result<(), LeaseBroken> {
+    const THREADS: usize = 8;
+    const FIRST: u32 = 4;
+    let workers = Workers::bare(WorkersSetup {
+        limits: Limits { most_workers: FIRST, callers, most_slots: 0 },
+        seed: None,
+        models: 0,
+    })
+    .expect("workers setup");
+    let wp = to_workers_plant(plant);
+    let callers_usize = usize::try_from(callers).unwrap();
+    let oracle: StdVec<AtomicBool> = (0..callers_usize).map(|_| AtomicBool::new(false)).collect();
+    let failed = AtomicBool::new(false);
+
+    // Phase A: exact-capacity contention (sum of thread quotas == callers).
+    let barrier_a = Barrier::new(THREADS);
+    let phase_a_err: StdVec<Option<LeaseBroken>> = thread::scope(|scope| {
+        let mut handles = StdVec::with_capacity(THREADS);
+        for tid in 0..THREADS {
+            let workers = &workers;
+            let oracle = &oracle;
+            let barrier = &barrier_a;
+            let failed = &failed;
+            let base_quota = callers_usize / THREADS;
+            let extra = usize::from(tid < (callers_usize % THREADS));
+            let quota = base_quota + extra;
+            handles.push(scope.spawn(move || {
+                let mut rng = SplitMix64::new(seed ^ (u64::try_from(tid).unwrap().wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+                let mut held: StdVec<super::Lease> = StdVec::with_capacity(quota);
+                let mut broken: Option<LeaseBroken> = None;
+                barrier.wait();
+                for _ in 0..160 {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let want_acquire = held.is_empty() || (held.len() < quota && (rng.next_u64() & 1) == 0);
+                    if want_acquire {
+                        match workers.lease_planted(wp) {
+                            Ok(lease) => {
+                                let id = lease.id().index();
+                                if id < FIRST || id >= FIRST + callers {
+                                    broken = Some(LeaseBroken::OutOfBounds { id, first: FIRST, callers });
+                                    failed.store(true, Ordering::Relaxed);
+                                    drop(lease);
+                                    break;
+                                }
+                                let slot = usize::try_from(id - FIRST).unwrap();
+                                if oracle[slot].swap(true, Ordering::AcqRel) {
+                                    broken = Some(LeaseBroken::Duplicate { id });
+                                    failed.store(true, Ordering::Relaxed);
+                                    drop(lease);
+                                    break;
+                                }
+                                held.push(lease);
+                            }
+                            Err(WorkersError::CallersTaken { most }) => {
+                                broken = if most != callers {
+                                    Some(LeaseBroken::WrongBound { want: callers, got: most })
+                                } else {
+                                    Some(LeaseBroken::SpuriousFull { callers, live: held.len() })
+                                };
+                                failed.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            Err(other) => panic!("unexpected lease error: {other}"),
+                        }
+                    } else {
+                        let pick = usize::try_from(rng.next_u64()).unwrap() % held.len();
+                        let lease = held.swap_remove(pick);
+                        let slot = usize::try_from(lease.id().index() - FIRST).unwrap();
+                        // Release oracle slot before dropping lease (synchronized by Lease::drop's
+                        // Release fetch_and -> next lease's Acquire CAS).
+                        oracle[slot].store(false, Ordering::Release);
+                        drop(lease);
+                    }
+                }
+                for lease in held {
+                    let slot = usize::try_from(lease.id().index() - FIRST).unwrap();
+                    oracle[slot].store(false, Ordering::Release);
+                    drop(lease);
+                }
+                broken
+            }));
+        }
+        handles.into_iter().map(|h| h.join().expect("phase A worker panicked")).collect()
+    });
+    if let Some(err) = phase_a_err.into_iter().flatten().next() {
+        return Err(err);
+    }
+
+    // Phase B: over-bound contention (each thread tries to hold up to callers / 2 + 16 leases).
+    let barrier_b = Barrier::new(THREADS);
+    let over_quota = (callers_usize / 2) + 16;
+    let phase_b_err: StdVec<Option<LeaseBroken>> = thread::scope(|scope| {
+        let mut handles = StdVec::with_capacity(THREADS);
+        for tid in 0..THREADS {
+            let workers = &workers;
+            let oracle = &oracle;
+            let barrier = &barrier_b;
+            let failed = &failed;
+            handles.push(scope.spawn(move || {
+                let mut rng = SplitMix64::new(seed.wrapping_add(1) ^ (u64::try_from(tid).unwrap().wrapping_mul(0xBF58_476D_1CE4_E5B9)));
+                let mut held: StdVec<super::Lease> = StdVec::with_capacity(over_quota);
+                let mut broken: Option<LeaseBroken> = None;
+                barrier.wait();
+                for _ in 0..160 {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let want_acquire = held.is_empty() || (held.len() < over_quota && (rng.next_u64() % 3) != 0);
+                    if want_acquire {
+                        match workers.lease_planted(wp) {
+                            Ok(lease) => {
+                                let id = lease.id().index();
+                                if id < FIRST || id >= FIRST + callers {
+                                    broken = Some(LeaseBroken::OutOfBounds { id, first: FIRST, callers });
+                                    failed.store(true, Ordering::Relaxed);
+                                    drop(lease);
+                                    break;
+                                }
+                                let slot = usize::try_from(id - FIRST).unwrap();
+                                if oracle[slot].swap(true, Ordering::AcqRel) {
+                                    broken = Some(LeaseBroken::Duplicate { id });
+                                    failed.store(true, Ordering::Relaxed);
+                                    drop(lease);
+                                    break;
+                                }
+                                held.push(lease);
+                            }
+                            Err(WorkersError::CallersTaken { most }) => {
+                                if most != callers {
+                                    broken = Some(LeaseBroken::WrongBound { want: callers, got: most });
+                                    failed.store(true, Ordering::Relaxed);
+                                    break;
+                                }
+                            }
+                            Err(other) => panic!("unexpected lease error: {other}"),
+                        }
+                    } else {
+                        let pick = usize::try_from(rng.next_u64()).unwrap() % held.len();
+                        let lease = held.swap_remove(pick);
+                        let slot = usize::try_from(lease.id().index() - FIRST).unwrap();
+                        oracle[slot].store(false, Ordering::Release);
+                        drop(lease);
+                    }
+                }
+                for lease in held {
+                    let slot = usize::try_from(lease.id().index() - FIRST).unwrap();
+                    oracle[slot].store(false, Ordering::Release);
+                    drop(lease);
+                }
+                broken
+            }));
+        }
+        handles.into_iter().map(|h| h.join().expect("phase B worker panicked")).collect()
+    });
+    if let Some(err) = phase_b_err.into_iter().flatten().next() {
+        return Err(err);
+    }
+
+    // Phase C: zero leaks after concurrent contention — every single slot is re-leasable once,
+    // and one more returns `CallersTaken { most: callers }`.
+    let mut reclaimed = StdVec::with_capacity(callers_usize);
+    let mut seen = BTreeSet::new();
+    for _ in 0..callers {
+        match workers.lease_planted(wp) {
+            Ok(lease) => {
+                let id = lease.id().index();
+                if id < FIRST || id >= FIRST + callers {
+                    return Err(LeaseBroken::OutOfBounds { id, first: FIRST, callers });
+                }
+                if !seen.insert(id) {
+                    return Err(LeaseBroken::Duplicate { id });
+                }
+                reclaimed.push(lease);
+            }
+            Err(WorkersError::CallersTaken { most }) => {
+                return Err(if most != callers {
+                    LeaseBroken::WrongBound { want: callers, got: most }
+                } else {
+                    LeaseBroken::SpuriousFull { callers, live: reclaimed.len() }
+                });
+            }
+            Err(other) => panic!("unexpected lease error during reclaim: {other}"),
+        }
+    }
+    match workers.lease_planted(wp) {
+        Ok(extra) => {
+            let id = extra.id().index();
+            if id < FIRST || id >= FIRST + callers {
+                return Err(LeaseBroken::OutOfBounds { id, first: FIRST, callers });
+            }
+            return Err(LeaseBroken::MissedBound { callers, live: reclaimed.len() });
+        }
+        Err(WorkersError::CallersTaken { most }) if most == callers => {}
+        Err(WorkersError::CallersTaken { most }) => {
+            return Err(LeaseBroken::WrongBound { want: callers, got: most });
+        }
+        Err(other) => panic!("unexpected lease error at bound: {other}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn concurrent_multiword_leases_never_duplicate_leak_or_spuriously_exhaust() {
+    let bounds = [65u32, 130, 192, MOST_CALLERS];
+    for seed in 0u64..16 {
+        let callers = bounds[usize::try_from(seed).unwrap() % bounds.len()];
+        if let Err(broken) = run_concurrent_lease_contention(seed.wrapping_add(1), callers, LeasePlant::None) {
+            panic!("seed {seed}, callers {callers}: {broken}");
+        }
+    }
+}
+
+#[test]
+fn concurrent_multiword_lease_harness_catches_every_planted_bug() {
+    for &(plant, callers) in &[
+        (LeasePlant::FinalMaskSkipped, 65u32),
+        (LeasePlant::DropWrongWord, 130u32),
+        (LeasePlant::BitLeaked, 130u32),
+    ] {
+        let caught = (1u64..=8).any(|seed| run_concurrent_lease_contention(seed, callers, plant).is_err());
+        assert!(caught, "concurrent harness failed to catch planted bug {plant:?}");
     }
 }
