@@ -4406,7 +4406,7 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
     // A `$crate` no expansion wrote (tokio's `doc! { macro_rules! try_join { .. $crate .. } }`:
     // in the call's own tokens) names the crate whose text holds it, the one expanding.
     // Returns the crate a written `crate` / `$crate` stands for (its row's root), `None` for none.
-    let mut crate_of = |out: &mut AString<'_>, krate: Option<CrateItemKey>, in_def: bool, seen: &mut Option<CrateItemKey>| -> Result<Option<CrateItemKey>, crate::crate_roots::ForeignDollarCrate> {
+    let crate_of = |out: &mut AString<'_>, krate: Option<CrateItemKey>, in_def: bool, seen: &mut Option<CrateItemKey>| -> Result<Option<CrateItemKey>, crate::crate_roots::ForeignDollarCrate> {
         if in_def {
             out.push_str("$crate");
             if let Some(eff) = krate.or(here) {

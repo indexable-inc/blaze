@@ -276,7 +276,8 @@ impl<'a> MacroDefinition<'a> {
             at,
             alloc,
         )
-        .map_err(|_| mismatch("names past the name table's u32::MAX bytes"))?;
+        .map_err(|_| mismatch("names past the name table's u32::MAX bytes"))?
+        .with_dollar_crate(head.dollar_crate);
         if def.transparency != head.transparency {
             return Err(mismatch("a transparency that is not the written one or the kind's"));
         }
@@ -367,6 +368,7 @@ impl<'a> MacroDefinition<'a> {
             place,
             kind: self.kind,
             site: self.at.site,
+            dollar_crate: self.dollar_crate,
             edition: self.at.edition,
             exported: self.at.export == Export::Exported,
             local_inner: self.at.local_inner == LocalInner::Yes,
