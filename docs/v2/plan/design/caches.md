@@ -44,7 +44,7 @@ or overwritten: a changed input makes another key.
 | `c-units` | unit | compiled C translation units and local C symbols (`blaze-cunit`) | by key | yes | store | none found |
 | `lint-records` | file | lint rule sets, per-file/unit lint tasks, and finding IDs (`blaze-lint`, `blaze-cli`) | by key | yes | store | none found |
 | `store` | none | the store's own keys, values, chunks, dictionaries, pins (`blaze-cas`, `blaze-format`) | the collector | yes | budget | pins not covering every record family: storegc; seal groups naming every row of a broken group: sealgroups |
-| `remote` | none | transport of records between machines (`blaze-remote`, `blaze-pack`) | n/a | n/a | n/a | †not audited |
+| `remote` | none | transport of records between machines, built, off unless chosen; no build depends on it (`blaze-remote`, `blaze-pack`) | n/a | n/a | n/a | †not audited |
 | `flights` | none | single-flight keys: concurrent askers of one download, layout or compile share it | ends with the flight | no | n/a | not a cache |
 | `identity` | none | content IDs of inputs (a file's text, a crate's settings, the code of blaze itself): parts of other rows' keys | n/a | n/a | n/a | n/a |
 | `not-keys` | none | literals of the domain form that key nothing: messages, test tools, models, proofs | n/a | n/a | n/a | n/a |

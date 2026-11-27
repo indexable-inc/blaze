@@ -3,10 +3,8 @@
  * Nothing here is native: the modules are platform-independent build outputs (`uv run --script renderer/build.py`, or fetched with renderer/fetch.py).
  *
  * 1. Runs content/*.flecs under Flecs (flecs/flecs-doc.wasm, gen/tree.ts) to bake what the renderer leaves to TS:
- *    highlighted code (highlight.js) and lessons' glyphs (gen/glyphs.ts), by entity path; and to write the scripts the content asks for: a BenchHistory
- *    names a directory of benchmark history, which gen/bench/ turns into charts under it, as Flecs script.
- * 2. site-snapshot.wasm runs the same scripts, then the generated ones, with the baked HTML set, and returns the
- *    snapshot.
+ *    highlighted code (highlight.js) and lessons' glyphs (gen/glyphs.ts), by entity path.
+ * 2. site-snapshot.wasm runs the same scripts with the baked HTML set, and returns the snapshot.
  * 3. site.wasm loads it and renders every page into dist/.
  * 4. Bundles client/*.ts, concatenates styles/, copies static/ and builds the code graph page (graph/build.ts:
  *    dist/graph.html and dist/graph/). For the worker, under .gen/:
@@ -29,8 +27,6 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statS
 import path from 'node:path';
 import { buildExplorePage } from '../explore/build';
 import { buildGraphPage } from '../graph/build';
-import { benchScript } from './bench';
-import { raceScript } from './bench/race';
 import { glyphSvg } from './glyphs';
 import { highlight } from './highlight';
 import { Site, snapshot, type Page, type SnapshotInput } from './site-wasm';
@@ -51,27 +47,6 @@ function scripts(): string[] {
 
 /** The page's entity path: `/rfcs/capabilities` is `site.rfcs.capabilities`, `/` is `site.index`. */
 const entityOf = (p: Page) => (p.url === '/' ? 'site.index' : `site${p.url.replaceAll('/', '.')}`);
-
-/**
- * The scripts the content asks the build to write, run after it: for each `BenchHistory {dir}`, the charts of the
- * benchmark history in `dir` (from the repo root, or BENCH_HISTORY when set) under that entity (gen/bench/); for each
- * `Race`, the two times it asks that history for, as its `Raced` (gen/bench/race.ts).
- */
-function generated(all: Map<string, Node>): { name: string; code: string }[] {
-	const out: { name: string; code: string }[] = [];
-	const historyDir = (dir: unknown) => (process.env.BENCH_HISTORY ? path.resolve(process.env.BENCH_HISTORY) : path.join(root, '..', String(dir ?? '')));
-	for (const n of all.values()) {
-		const h = n.values.get('BenchHistory');
-		if (h) out.push({ name: `${n.path} (generated)`, code: benchScript(historyDir(h.dir), n.path) });
-		// A Race's two times, from the same history: the latest run that timed its edit under blaze and cargo.
-		const r = n.values.get('Race');
-		if (r) {
-			const ask = { dir: String(r.dir ?? ''), platform: String(r.platform ?? ''), project: String(r.project ?? ''), edit: String(r.edit ?? '') };
-			out.push({ name: `${n.path} (generated)`, code: raceScript(historyDir(r.dir), n.path, ask) });
-		}
-	}
-	return out;
-}
 
 const STYLES = ['fonts.css', 'tokens.css', 'doc-code.css', 'base.css', 'site.css', 'shell.css', 'art.css', 'learn.css', 'intro.css'];
 
@@ -171,7 +146,7 @@ async function build() {
 	const files = scripts();
 	const tree = await load(content, files.map((f) => path.join(content, f)), ['site', 'refs', 'nav']);
 	const input: SnapshotInput = {
-		scripts: [...files.map((name) => ({ name, code: readFileSync(path.join(content, name), 'utf8') })), ...generated(tree)],
+		scripts: files.map((name) => ({ name, code: readFileSync(path.join(content, name), 'utf8') })),
 		bakes: bake(tree),
 	};
 	const snap = snapshot(wasmModule('site-snapshot.wasm'), input);

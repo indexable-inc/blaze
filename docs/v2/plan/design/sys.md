@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The bottom of bstd (ledger row S4). One crate, blaze-sys, is the only home of system calls (Linux by raw call with no libc, macOS through libSystem, Windows through ntdll and kernel32; all three modules exist); the runtime pieces Rust's std provided each get an owner in `bstd::rt` (not built: bstd's rt.rs still takes them from std); blaze-core moves onto blaze-sys call by call behind a ban list, harness/v2/nostd.json, that is the progress meter; wave 4 puts the users' std on blaze-sys.
+summary: The bottom of bstd (ledger row S4). One crate, blaze-sys, is the only home of system calls (Linux by raw call with no libc, macOS through libSystem, Windows through ntdll and kernel32; all three modules exist, Windows's keeping the seam's place while Windows is out of scope); the runtime pieces Rust's std provided each get an owner in `bstd::rt` (not built: bstd's rt.rs still takes them from std); blaze-core moves onto blaze-sys call by call behind a ban list, harness/v2/nostd.json, that is the progress meter; wave 4 puts the users' std on blaze-sys.
 date: 2026-11-10
 ---
 # blaze-sys and the runtime under bstd
@@ -107,6 +107,9 @@ target }`, a refusal naming itself (`macos::UNBUILT` lists them).
 
 ## Windows: ntdll and kernel32
 
+Windows is out of scope now (AGENTS.md, "Not now"); this module keeps its place in the seam, and
+nothing below is planned now.
+
 Imports are declared directly, with no `windows-sys` (D180). `blaze_sys::windows` holds every
 Win32 item the tree uses, under its Win32 name, by area (`foundation`, `fs`, `io`, `memory`,
 `net`, `security`, `threading`), each linked `kind = "raw-dylib"` so a build needs no import
@@ -114,11 +117,11 @@ library and no SDK. A handle is a `Handle`, a `BOOL` a `Bool`, a socket a `Socke
 are a `WinError` (the last error, or an `NTSTATUS` mapped by `RtlNtStatusToDosError`).
 `windows.rs` keeps sys.md's typed operations as refusals (`UNBUILT`) beside them.
 
-What a Windows build still lacks, by reading the tree on 2026-11-20 (none of it run):
+What a Windows build would lack, by reading the tree on 2026-11-20 (none of it run):
 
-- bstd's driver. blaze-core's IOCP driver (`iocp.rs` and `iocp/`, the USN journal reader, the
-  waits in `wait/windows.rs`) is written against these declarations; bstd's sans-IO effects
-  have no Windows driver turning them into the calls, and the typed operations above are
+- bstd's driver. blaze-core's IOCP code (`iocp.rs` and `iocp/`, the USN journal reader, the
+  waits in `wait/windows.rs`) is written against these declarations and never run; bstd's
+  sans-IO effects have no Windows driver turning them into the calls, and the typed operations above are
   refusals.
 - The launcher. blaze-launch-rt's fault report and thread-local paths have Linux and macOS
   bodies only (`run_mode/fault_report.rs` returns no stack bounds elsewhere); nothing maps or
@@ -177,7 +180,7 @@ the one trusted crate; until then the script finds uses by text.
 | 1 (built) | blaze-sys for Linux; the `threads` driver's Read, Append, Sync, Truncate and WriteAt (`crates/blaze-core/src/fs/linux.rs`); the direct wait driver's kernel as a patch against all-1110 (`crates/blaze-core/patches/wait-direct-on-blaze-sys.patch`); bstd `#![no_std]` with `rt.rs` its one std module | five effects' calls; `wait/direct.rs` when the patch applies; every bstd module but `rt.rs` |
 | 2 | the rest of Linux: Write and Rename (and all-1110's `WriteUnsynced`, `RenameUnsynced`, `WriteBack` on `sync_file_range`), List, Stat, Clone; sockets; spawn and reap; the ring's calls; inotify and fanotify | `fs`, `net`, `process`, `raw`, `uring`, `watch`, `fanotify`, `wait/ring`, `wait/linux` |
 | 3 | macOS: the typed layer on the declared symbols (declared: `crates/blaze-sys/src/macos.rs`), then `kqueue`, `fsevents`, `wait/macos` | those |
-| 4 | Windows: the imports, then `iocp` | `iocp/*` |
+| 4 | Windows, later (out of scope now): the imports, then `iocp` | `iocp/*` |
 | 5 | `bstd::rt`: entry, panic handler, threads, unwinding, the vDSO clock; `threads`, `signal`, `cores`, `busy` move; bstd's `rt.rs` is deleted | the rest of blaze-core and bstd |
 | S3 | every other crate, onto capabilities | the crate rows |
 

@@ -208,8 +208,9 @@ named `last`. The pointer is a hint for the forward walk: one per (tool, request
 own; two worktrees share every record (no path in a key). A missing pointer costs a walk.
 
 **Fresh clone.** The certificate key is the tool, the request and every (path, content id): a
-clone of a commit CI checked hashes its files (tempo's 409,322 lines, ~15 MB, ~2 ms on 8 cores)
-and asks the bucket once. Hit: the answer, no task. Miss: one batched round trip for what the
+clone hashes its files (tempo's 409,322 lines, ~15 MB, ~2 ms on 8 cores) and finds what the
+machine's own content-deduplicated store holds. Fetching from the bucket is an option, off unless
+chosen; chosen, a clone of a commit CI checked asks the bucket once. Hit: the answer, no task. Miss: one batched round trip for what the
 walk names; public crates from the bucket, the workspace's only where the organisation opts in.
 
 **Against the best.** Salsa and rust-analyzer: early cutoff by out digest is matched;

@@ -40,7 +40,7 @@ replay: BLAZE_SIM_SEED=41 blaze test -p ledger ledger::tests::keeps -- --exact
 - The attribute and the unwind of a power cut: `crates/blaze-std/src/simtest.rs` (a
   `macro_rules!` attribute rule, no proc macro), the grants by type in `simtest/granted.rs`, drawn
   inputs in `simtest/drawn.rs`; tests in `crates/blaze-std/src/tests/simtest.rs`.
-  **Still to do: `blaze test -p blaze-std simtest` on the build VM.**
+  **Still to do: `blaze test -p blaze-std simtest` on the Mac.**
 
 `seeds` is to become a client of blaze-sim's tape engine ([sim.md](sim.md), "Order").
 

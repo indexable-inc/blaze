@@ -32,8 +32,7 @@ name where each piece lived.
 ## What it is
 
 - **The macro.** `blaze::unreachable!()` names `core::blaze::unreachable`, a builtin macro
-  (`library/core/src/blaze.rs`), as `#[blaze::contract_test]` names `core::blaze::contract_test`:
-  a path `blaze::unreachable` that names nothing else resolves there
+  (`library/core/src/blaze.rs`): a path `blaze::unreachable` that names nothing else resolves there
   (a crate's own `blaze::unreachable` wins, so no Rust program changes). It expands to `core::panicking::panic("entered
   blaze::unreachable!()")`: at run time it is a panic, never undefined behaviour, so a build
   that skipped the check is still sound. A proved site is dead code the optimizer may delete

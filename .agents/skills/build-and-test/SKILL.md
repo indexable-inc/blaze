@@ -297,23 +297,24 @@ From [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wo
 - All lanes write in one directory (how-to `H12`), with no worktree per lane, in new files or
   one area's files, with the edit tools or `ast-grep` only; a lane writes and commits and runs
   nothing else, and the main agent builds once and admits; never `git stash`.
-- Linux work runs on `blaze-vm` through `/root/loop.sh` (`work-in-ix-vms`); no lane makes a VM.
+- Builds, tests, smokes and benchmarks run on the Mac (rule 34); Linux-only work runs in CI.
 - Every command has a timeout (`every-command-has-a-timeout`): `timeout --kill-after=10s <s> <cmd>`
   in a shell, the Bash tool's `timeout`, `timeout=` in Python. On expiry take a stack sample
   (`sample <pid>`) before the kill and quote it.
-- The main agent compiles each piece as it is reported, while cargo builds blaze (rule 2):
-  `cargo +<pins/toolchain> check -p <crate> --all-targets`, then
-  `cargo +<pins/toolchain> check --workspace --all-targets` with the piece applied alone onto
-  the last green head; the head moves only if that passes. Errors go back to the lane at once.
-- Rounds on the green head: the one VM builds the whole tree once and runs everything,
-  keep-going, every failure handed back with the tree, command and
+- The main agent checks each piece as it is reported, with blaze (rule 2): `blaze check` in the
+  checkout's root, then `blaze test -p <crate>`, with the piece applied alone onto the last
+  green head; the head moves only if that passes. Errors go back to the lane at once.
+- Rounds on the green head: the Mac checks the whole tree once and runs everything
+  (`blaze test`), keep-going, every failure handed back with the tree, command and
   error.
 - Before a merge: the hello-world smoke of a release blaze built from the exact merge commit
   (`proof-before-merge`, the `landing` skill).
 - Checking a change fast, per commit
   ([docs/contributing.md#checking-a-change-fast](../../../docs/contributing.md#checking-a-change-fast)):
-  `cargo +<pins/toolchain> check $(blaze run -q -p scripts --bin changed -- '{"base": "<the commit before>", "print": "args"}') --lib --tests`.
-  `changed` prints the packages the commit touched and their dependents in the order to check;
+  `blaze check`, then
+  `blaze test $(blaze run -q -p scripts --bin changed -- '{"base": "<the commit before>", "print": "args"}')`.
+  `changed` prints `-p <name>` for the packages the commit touched and their dependents, in the
+  order to test (`--workspace` when everything moved: then `blaze test` alone);
   hand the first error back to the agent that wrote the code. Never let thousands of lines pile
   up unchecked behind an hour-long build.
 - A lane script, a harness and your own loop check every command's exit status and stop at the
@@ -321,6 +322,5 @@ From [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wo
   that does not exist (`blaze daemon stop`) fails and a script that goes on measures nothing true
   ([docs/contributing.md#scripts-that-run-commands](../../../docs/contributing.md#scripts-that-run-commands)).
 - Run harnesses with `RUST_BACKTRACE=0`.
-- Done (`clean-up-lane`): the lane's `/root/wt/<lane>/` and homes on `blaze-vm`, any blaze
-  process it left running, and any worktree (`blaze clean` in it, `git worktree remove <dir>`)
-  and merged branch (`git branch -D <branch>`).
+- Done (`clean-up-lane`): any blaze process the lane left running, any home it made, and its
+  merged branch (`git branch -D <branch>`).

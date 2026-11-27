@@ -1,6 +1,6 @@
-// Lesson 5: sharing work. The local store (docs/gc.md, "The store and the budget"), remotes and push/pull ("The remote"),
-// content addressing and signing ("Trust and signing"). CI doesn't fill a shared cache yet, and remote execution is
-// neither built nor planned (docs/remote-cache.md, "Non-goals").
+// Lesson 5: sharing work. The local store (docs/gc.md, "The store and the budget"); the remote, its push/pull and its
+// signing (docs/remote-cache.md, an option off unless chosen). CI doesn't fill a shared cache yet, and remote execution
+// is neither built nor planned.
 site {
   learn {
     sharing : Page {

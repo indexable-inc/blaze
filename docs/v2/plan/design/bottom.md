@@ -21,19 +21,10 @@ Each decision is stated once, in its final form; detail lives in
 
 ## 1. Goal order
 
-The statement the design is judged by, Andrew, 2026-11-15 19:53: "assume you want best
-performance on 128 core machines (say graviton 5 or epyc) but a lot of people will be using on
-typical macs too. we want to have fast incremental compilation for realistic huge rust monorepos
-with millions of lines of code. needs to work with enormous crates. SoTa at least, structure of
-arrays etc. incremental comp being short (including on large crates and large files in crates
-even after restart computer so nothing running etc) = lints being fast > being able to get cached
-stuff remote (r2/peer to peer etc) > memory usage > cold comp > disk gc being good/not locking >
-disk usage. also need incremental test (only rerun ones that changed)".
-
-The order, the earlier winning when two trade: (1) incremental compile short, large crates and
-files and after a restart included, with lints as fast; (2) records from remote; (3) memory;
-(4) cold compile; (5) disk cleanup that never blocks; (6) disk use. Replaced: the five-item order
-of the first quote, because the later statements add remote as second. What each clause asks:
+The order the design is judged by, the earlier winning when two trade: (1) incremental compile short, large crates and
+files and after a restart included, with lints as fast; (2) memory; (3) cold compile; (4) disk
+cleanup that never blocks; (5) disk use. The remote cache is supported and is not in the order:
+nothing is designed around it or traded against these. What each clause asks:
 
 - **128 cores, and typical Macs**: no global lock or single-threaded stage on a hot path:
   interners read without a lock, caches sharded, a task's scratch memory its own, the first
@@ -56,10 +47,11 @@ of the first quote, because the later statements add remote as second. What each
   sweep is by stat; no source is re-hashed that a stat proves unchanged (sections 9, 10). **SoTA,
   structure of arrays**: columns everywhere (section 13).
 - **Lints**: a task keyed from the facts it reads of one item; none walks a crate (section 12).
-- **Remote**: a record holds nothing of the machine, so any builder's record is any reader's;
-  never a request per item: a pack's index once, then byte ranges in parallel (section 10).
+- **Remote** (not ranked): a record holds nothing of the machine, so any builder's record is any
+  reader's (section 10).
 - **Memory**: records read in place; a task holds only what it pulled; the page cache is the only
-  cache. **Cold**: std and public dependencies arrive as CI's records. **Cleanup, disk**:
+  cache. **Cold**: a new checkout is served by the machine's own content-deduplicated store.
+  **Cleanup, disk**:
   immutable records; collection is compaction and unlink, never a lock.
 
 ## 2. Principles
@@ -388,15 +380,16 @@ read-only), the page cache the only cache; how a restart opens it is [store-next
 - **Verified once.** A segment this process wrote is trusted; one from an earlier boot is checked
   once and the check recorded; a read of a record in a verified segment checks nothing (rule 74;
   end-state.md D163).
-- **Remote**: a pack's index once, then byte ranges in parallel; one format
-  for R2 and a peer.
-- **Trust.** A key names inputs, not a value, so only a statement signed by a trusted builder (CI,
-  later the remote workers) binds a key to a digest; the signature, digest and size limits are
-  checked before a byte is mapped. A developer's machine never writes a shared namespace; private
-  code, read lists and names never leave their organisation's namespace.
-- **std's records** are built by CI, per toolchain, target, std features and profile settings,
-  and published as a signed bundle. Offline, or with no bundle for the target, std is filled
-  locally like any dependency, and the command says so by name (rule 3: said, not quiet).
+- **Remote** (blaze-remote; built, off unless chosen): a pack's index once, then byte ranges in
+  parallel; one format for R2 and a peer.
+- **Trust** (when the remote is chosen). A key names inputs, not a value, so only a statement
+  signed by a trusted builder (CI, later the remote workers) binds a key to a digest; the
+  signature, digest and size limits are checked before a byte is mapped. A developer's machine
+  never writes a shared namespace; private code, read lists and names never leave their
+  organisation's namespace.
+- **std's records** are made locally like any dependency's and kept in the machine's
+  content-deduplicated store. A CI-built signed std bundle (per toolchain, target, std features
+  and profile settings) is an option, off unless chosen.
 
 ## 11. Commands
 
@@ -422,7 +415,7 @@ Detail: [run.md](run.md).
   command, and a run that ends first waits for the check before it reports success: a test's
   pass is not printed as a pass until then. The cost is in proportion to the edit: findings
   are records, an unchanged item's are replayed, and on a fresh clone the proofs come from
-  the shared cache, so only the diff is checked. `--reached` is the opt-out for the middle of
+  the machine's own store, so only the diff is checked. `--reached` is the opt-out for the middle of
   a refactor (check only what runs), and it says so in its verdict. The plain alternative,
   one flag away, is to finish the check before the program starts.
 - **One check covers every configuration** (Andrew, 2026-11-15 20:49: "check will test all
@@ -447,7 +440,7 @@ Detail: [run.md](run.md).
   (default: the three hosts in scope); (2) an item whose reads would fork past a cap
   (64 conditions) is a typed finding naming the item and its atoms, never a silent sample;
   (3) a build script can set cfgs, so it runs per target and its outputs are reads;
-  (4) another target's `std` is needed as records, from the shared cache; (5) layout
+  (4) another target's `std` is needed as records, made locally like the host's; (5) layout
   differs by target, so constant evaluation that reads a size reads the target; (6) this is
   a check: code is made and tests run only for the host. `blaze run`'s gate covers the
   configuration being run by default and every configuration with `check`; whether the gate
@@ -546,7 +539,7 @@ bstd's entry installs the global allocator. Nightly features are allowed for it:
 `dropck_eyepatch`, `min_specialization`. Known cost: the compiler's own `Box` moves out with `*b`;
 ours uses a method.
 
-The interim, replaced crate by crate: under D25 (2026-11-11), while cargo builds blaze a new crate
+The interim, replaced crate by crate: under D25 (2026-11-11), a new crate
 may sit on `core` and `alloc` and says so in its header (blaze-id, blaze-scope, blaze-impls and
 blaze-run name `alloc::vec::Vec` today; they move to blaze-own); blaze-surface is on `std` because
 blaze-format's `record!` names `::std::vec::Vec`, blaze-file-items because the parser is on `std`,
@@ -768,8 +761,8 @@ Not started: each waits for the piece it serves.
 
 ## 18. Superseded and disagreeing docs
 
-- Disagreeing with this page, to fix in their own changes: AGENTS.md rule 60 (no remote in its
-  order) and rule 12 (names papaya and crossbeam); `blaze_id::CrateItemKey`'s doc (cfg in the
+- Disagreeing with this page, to fix in their own changes: AGENTS.md rule 12 (names papaya and
+  crossbeam); `blaze_id::CrateItemKey`'s doc (cfg in the
   crate key); `CrateGraph` is defined in blaze-scope and blaze-world, and `Edition` in crates/edition, blaze-surface, blaze-typeck,
   blaze-manifest and blaze-fmt (rule 30).
 - Old section names that code cites: "Also decided on 2026-11-15" is now sections 13 and 14; "The

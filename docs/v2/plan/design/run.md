@@ -14,9 +14,9 @@ later: an edit applied to a program while it runs
 ## End state (D113, 2026-11-16 evening: the whole run, redone)
 
 Andrew, 19:30, after a hello world run took 15.9 s ("thought that libraries were cached? it should be sub
-second"): "completely redesign blaze run to be sota": incremental time first (large crates and files, after a
-restart, nothing running), then the remote cache, memory, cold time, disk cleanup that never blocks, disk use;
-128 cores best, a typical Mac good; shared across worktrees with no setting; only changed tests rerun.
+second"): "completely redesign blaze run to be sota". The order: incremental time and lints first (large crates
+and files, after a restart, nothing running), then memory, cold time, disk cleanup that never blocks, disk use (a
+remote cache is supported and not ranked); 128 cores best, a typical Mac good; shared across worktrees with no setting; only changed tests rerun.
 
 **The fault being removed.** Measured 18:12 on hello world: 16.2 s of 16.3 s is library work redone on every
 run (names of core, alloc and std 5.1 s; 18,900 library bodies checked and lowered 9.3 s; instances built
@@ -132,9 +132,11 @@ machine (blaze-drive), not a second mechanism (rule 30); the last three are the 
 A body's check costs 0.35 ms mean in the run path's walk and 1.56 ms in the drive (both measured, on different
 paths); its floor is not known until the checker has spans by phase (drive.md, D114 point 6).
 
-The cold row is why std and the dependencies come built from the shared cache (remote-read): then cold is
-the workspace's own bodies. The first run on a machine pulls by key; after `git pull`, a certificate for the
-same inputs if CI made one, else records by key in batches, signed statements checked before bytes are mapped.
+A new checkout on a machine that built std and the dependencies once finds them in the machine's own
+content-deduplicated store: then cold is the workspace's own bodies. Fetching them from the shared cache
+(remote-read) is an option, off unless chosen; chosen, the first run on a machine pulls by key, and after
+`git pull` a certificate for the same inputs if CI made one, else records by key in batches, signed
+statements checked before bytes are mapped.
 
 **Unknowns this design rests on, each owed a measurement**: a slot call's cost in call-bound code (below:
 "about 1%, up to 5%"); the bulk directory read's cost after a restart with a cold cache; how many first calls
@@ -594,7 +596,7 @@ Pieces left, one writer each:
 5. Thread-locals (`__thread_vars` and `tlv_get_addr`; `PT_TLS`), and C names from libraries
    other than libSystem and libc (`#[link]`), and RELR for ELF's relative words.
 6. Range-extension thunks when the code passes `bl`'s 128 MiB (refused today by name).
-7. The Linux run test on blaze-vm (the facts elf.rs marks "to verify").
+7. The Linux run test, in CI (the facts elf.rs marks "to verify").
 
 ### The export command
 

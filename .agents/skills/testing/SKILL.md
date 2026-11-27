@@ -126,7 +126,8 @@ Write few tests, each where it pays:
   deletion, a key's coverage, a codec): a unit or property test beside the code. If the
   signature is still moving, don't write one yet; prove it end to end and come back.
 - **Concurrent, durable, crash-recovering, billing or data-deleting code**: a deterministic
-  simulation test (DST), below. This is the requirement of `dst-not-review`, not an option.
+  simulation test (DST), below. This is the requirement of `dst-not-review`, not an option. A
+  Lean proof is extra evidence on top of the DST and never replaces it.
 - **A bug found in a real crate**: that crate's own tests under `blaze test`
   (`verify-on-real-projects`); an edit-loop bug: a step in the edit harness
   ([docs/harness.md](../../../docs/harness.md#adding-a-test)).
@@ -134,8 +135,8 @@ Write few tests, each where it pays:
   test that runs in seconds, named for the property it breaks. That one is always allowed.
 - **Parsers of hostile bytes**: fuzzing (`crates/blaze-fuzz`).
 
-No big suites, no tests of code whose shape is still changing, no red/green ritual on a dev
-host: push and let CI and the harnesses catch breakage.
+No big suites, no tests of code whose shape is still changing, no red/green ritual on the
+Mac: push and let CI and the harnesses catch breakage.
 
 ## Property tests and simulations: `blaze-sim`
 
@@ -312,7 +313,7 @@ seccomp filter, marked as the sandbox launcher marks one, with a bound: list the
 tests cover every public wait of `blaze_core::wait`, blaze-graph's `pool.rs` the workers' park), and
 match on `Ended`, where a wait that does not end is `Ended::Hung` naming the case, never a hung
 test. Its control is the same case not marked, which has to fail naming `io_uring_setup`. Linux
-only: macOS's sandbox filters no system call by number and has one wait driver.
+only, so it runs in CI: macOS's sandbox filters no system call by number and has one wait driver.
 
 ## Persisted state and causes
 

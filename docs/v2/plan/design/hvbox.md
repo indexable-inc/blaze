@@ -113,8 +113,8 @@ For when the owner allows a run; nothing below happens before he says so.
 
 1. The owner saves his work and closes what matters: a mistake here can panic and reboot the Mac.
    No other heavy job runs.
-2. The agent builds (`cd crates/blaze-hvbox && CARGO_TARGET_DIR=<notes>/target timeout 300 nice
-   -n 10 cargo +nightly-2026-10-27 build --offline -j 4`) and the core's tests pass.
+2. The agent builds with blaze (`timeout 300 nice -n 10 blaze build -p blaze-hvbox`) and the
+   core's tests pass (`blaze test -p blaze-hvbox`).
 3. The owner creates, by hand, `/Volumes/Projects/blaze-int-1112-notes/port27/hvbox-1116/OWNER-ALLOWS-HYPERVISOR-RUN`
    holding exactly the line `I, the owner of this Mac, allow blaze-hvbox to call
    Hypervisor.framework.` Without it the helper exits 121 before any framework call.

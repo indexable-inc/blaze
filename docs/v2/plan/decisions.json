@@ -1618,6 +1618,118 @@
    "recommended": "The store writer builds it with the non-durable rooted-history simulation un-ignored and a planted control that keeps a holed root.",
    "why": "No cost on the edit path; a store is a cache; the alternative (a barrier per root-setting commit) costs milliseconds on Linux before every answer.",
    "state": "decided 2026-11-21 22:03; being built"
+  },
+  {
+   "id": "D201",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: when two goals trade, the order is incremental time with lints as fast, then memory, then cold compile, then cleanup that never blocks, then disk. The remote cache is supported and is not in the order: nothing is designed around it or traded against the ranked goals. This keeps D130's order and replaces the order in D132's recommendation, which put fetching published records second.",
+   "recommended": "AGENTS.md's tradeoff line (from scripts/src/bin/rules.rs) and every doc state this order, with no remote cache in it.",
+   "why": "AGENTS.md and docs still ranked the remote cache second, against D130.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D202",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: publishing and fetching precompiled records (the R2 bucket, the toolchain's std records, `blaze store publish`, a named `--origin`) is an option that is off unless chosen. A new checkout is served by the machine's own content-deduplicated store; nothing depends on fetched records, and a cold build is not a download. What is built of it (blaze-remote's read path and published set, D136 to D138) stays, off unless chosen. This reverses D132 (what blaze publishes is fetched by a command that misses it) and narrows D68 (the shared cache in R2) and the bucket parts of D36 to that option.",
+   "recommended": "docs/remote-cache.md says what crates/blaze-remote does today and its settings; every doc that names the fetch says built, off unless chosen.",
+   "why": "Docs said a cold build is mostly a download and that blaze depends on fetched records.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D203",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: blaze builds, checks and tests blaze, and cargo is not a route for any of them. A command line the tree's own tooling still runs through cargo (the smoke harness, land.py, the CI workflows, the gate) is a gap to close, not an allowed route. This reverses D20 (cargo with the pinned nightly in the dev loop, a cargo-built blaze as stage 0) and ends the premise of D25 (while cargo builds blaze).",
+   "recommended": "Docs drop every sentence that allows or prescribes cargo for blaze and name each remaining cargo command line in the tooling once as a gap.",
+   "why": "Docs and the build-and-test skill still prescribed cargo in the dev loop.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D204",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: agent work (build, test, smoke, bench) runs on the Mac. No VM: no blaze-vm, no ix VM per lane or per job, no AWS host. CI's own runners are CI's; Linux-only work the Mac cannot do runs in CI. This reverses D1 (lanes with their own ix VM), D14 (retries by the VM scripts), D15 (one ix VM per heavy job), D16 (a branch verified on a VM) and point 3 of D110 (blaze-vm as a second build machine).",
+   "recommended": "Docs and skills name the Mac for agent work and CI for Linux-only work, and no VM.",
+   "why": "Docs still sent builds, tests and smokes to blaze-vm, per-lane ix VMs or AWS hosts.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D205",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: lanes write in one directory, with no worktree per lane, and only write and commit; a lane builds, checks, tests and asks nothing. The coordinator builds the one tree once and admits what passes. There is no cap on the number of lanes. This reverses D129 (a directory per lane), the lane's ask of the build queue and the worktree for a tree-wide rewrite in D127, and the lanes' own builds in D1; it keeps point 1 of D67 and D26.",
+   "recommended": "The plan's 'How the work is run' and the build-and-test skill say this, with no lane count.",
+   "why": "Docs disagreed on directories per lane, lanes asking a queue, and a cap of four or eight lanes.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D206",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: concurrent, durable, crash-recovering, billing and deleting code is proven by a deterministic simulation test with an invariant oracle and a planted bug (rule 43). A Lean proof is extra evidence on top and never replaces the simulation test; no test is deleted because a proof exists. This reverses D40 (for sans-IO code a Lean proof takes the place of the simulation test, which is then deleted).",
+   "recommended": "The plan's ladder of evidence puts Lean as the top rung above the simulation, never in its place.",
+   "why": "Docs said a proof replaces the simulation test, against rule 43.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D207",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: Windows is out of scope now (D36's 'Not now'), and the blaze-sys seam keeps a place for it. No doc presents IOCP or a Windows driver as existing or planned now; a design that lists drivers says Windows is later. This keeps D36 and D170 (the Windows driver goes).",
+   "recommended": "Driver lists in the plan and the designs read io_uring, kqueue and the simulation, Windows later.",
+   "why": "Docs listed IOCP beside io_uring and kqueue as one of the drivers.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D208",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: the effect set is the four that function types carry (panic, alloc, block, diverge: `EffectSet` in crates/blaze-ty/src/effect_ty.rs). A sentence saying only nopanic or diverge survived is wrong.",
+   "recommended": "The plan's edition section and the effect designs name the four.",
+   "why": "Docs disagreed on which effects exist.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D209",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: a kept test result is keyed by test.md's rule, the one `blaze test` runs (D81). docs/v2/plan/design/tests-stage.md is deleted; crates/blaze-test-reach is built and not wired. This keeps D81 and the last sentence of D39.",
+   "recommended": "Docs that key test results point at test.md.",
+   "why": "tests-stage.md described a second key for test results.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D210",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: a one-body edit on tempo has a budget of 100 ms (D188), over a floor of about 30 ms with a live helper and about 130 ms with none (D168). 300 ms and 'under one second' are not targets; measured numbers in record docs stay. This reverses the edit floor of 300 ms in D153.",
+   "recommended": "Docs that state the tempo edit target say 100 ms.",
+   "why": "Docs and notes gave three targets for one edit: 100 ms, 300 ms and under one second.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D211",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: a contract test is a mode of `blaze test`, not an attribute. This reverses the `#[blaze::contract_test]` attribute named in D37.",
+   "recommended": "Docs describe contract tests as a mode of `blaze test`.",
+   "why": "Docs described both an attribute and a mode.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D212",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: blaze keeps no changelog. The commit and the pull request are the record.",
+   "recommended": "No doc points at a changelog.",
+   "why": "Docs pointed at a changelog the plan's 'Docs stay small' already ruled out.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D213",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: the October 2026 benchmark numbers (the daemon-era blaze) are removed wherever they are presented as blaze's speed. No replacement numbers are written; a doc points at the smoke's measured times only where it already quotes them from a run.",
+   "recommended": "Docs drop the October numbers and the scripts that present them.",
+   "why": "The numbers measured the daemon-era blaze and were shown as today's speed.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D214",
+   "date": "2026-11-27",
+   "decision": "Rows reversed by a later row that does not say so, listed so a reader of the earlier row finds the later one (the earlier rows are left as written): D1 (lanes with their own ix VM build their own work) by D127 (a lane builds nothing of its own); D25 (a new crate on core and alloc) by D173 (no alloc); D29 (the daemon stays) and D33 (a run with nothing changed answered with no daemon, the daemon kept otherwise) by D35 (no daemon); D35's remote executor, the bucket parts of D36 and D68 (the shared cache in R2) by D130 (no records shared between machines); point 1 of D67 (lanes in one directory) by D129 (a directory per lane); D153's edit under 300 ms by D188 (edit to 100 ms); D170 and D172 (Wasmtime stays behind a driver) by D193 (Wasmtime goes).",
+   "recommended": "Read an earlier row with this list; D201 to D213 name what they reverse themselves.",
+   "why": "A reader of an earlier row had no way to find the row that reversed it.",
+   "state": "recorded 2026-11-27"
   }
  ]
 }

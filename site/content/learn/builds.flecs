@@ -59,9 +59,7 @@ site {
       }
 
       Step same("Same commands") {
-        P commands("You still type cargo's commands, with `blaze` in place of `cargo`: `blaze build`, `blaze run`, `blaze test`. None of them runs `rustc` or cargo: blaze compiles the code itself.")
-        Dim number("On a 200-crate workspace, an edit in the crate everything uses took 6.33 s with cargo and 0.60 s with blaze (measured once, by hand; [more runs](/bench)).")
-      }
+        P commands("You still type cargo's commands, with `blaze` in place of `cargo`: `blaze build`, `blaze run`, `blaze test`. None of them runs `rustc` or cargo: blaze compiles the code itself.")      }
 
       Step save("What happens on save?") {
         Quiz q(prompt: "You save an edit to one function. What does blaze do?") {

@@ -14,10 +14,6 @@ docs/brand/fire/gen.py
 docs/brand/fire/icon.py
 harness/answers.py
 harness/appruns.py
-harness/benchcharts.py
-harness/benchhistory.py
-harness/benchplatforms.py
-harness/benchreport.py
 harness/bunprep.py
 harness/counters.py
 harness/failures.py

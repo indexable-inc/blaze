@@ -23,8 +23,8 @@ blaze's home (docs/v2/plan/design/bottom.md, "The commands"). No `cargo build` a
 
 The others: `ci` (the checks with structured reporting), `inspect` (a file, lines or an item
 with inline types and docs), `why` (why a file or item was rechecked), `explain` (a diagnostic,
-lint or exit code), `clean`, `gc`, `peer`, `toolchain`, `warm-toolchain`, `store publish` and
-`version`. Their source is `crates/blaze-cli-spec/src/blaze_app.rs`.
+lint or exit code), `clean`, `gc`, `peer`, `toolchain`, `warm-toolchain`, `store publish` (built, off unless
+chosen: [remote-cache.md](remote-cache.md)) and `version`. Their source is `crates/blaze-cli-spec/src/blaze_app.rs`.
 
 `blaze help <command>` lists the flags each command takes. A build blaze can't do fails with
 the reason and is not handed to cargo. Each is a bug

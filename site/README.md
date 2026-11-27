@@ -8,7 +8,7 @@ the browser scripts.
 ## Architecture: Rust core, TS host
 
 ```
-content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js; generated: bench charts ──┐
+content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js ───────────────────────────┐
                  └──────────────────────────────────────────── site-snapshot.wasm ◀────────────────┘
                                                             │ snapshot (.gen/site.cbor)
                                                             ▼
@@ -19,8 +19,7 @@ content/*.flecs ─┬─ gen/tree.ts (flecs-doc.wasm) ── bake: highlight.js
   `site.wasm` (the renderer) and `site-snapshot.wasm` (the content scripts run in Flecs, compiled in, to the snapshot;
   build time only). Both are platform-independent build outputs, never checked in.
 - `gen/build.ts`: the build, under Bun, with no native code. It runs the scripts under `flecs/flecs-doc.wasm` to bake
-  what the renderer leaves to TS (highlighted code) and to write the scripts the content asks for (the benchmark
-  charts, `gen/bench/`), gets the snapshot from `site-snapshot.wasm`,
+  what the renderer leaves to TS (highlighted code), gets the snapshot from `site-snapshot.wasm`,
   renders every page with `site.wasm` into `dist/`, bundles `client/*.ts`, concatenates `styles/` and copies `static/`.
   Each build empties `dist/` and `.gen/` first. For the worker it writes `.gen/site.json` (where the site is served)
   and `.gen/build.json` (`assets`, a hash of the client scripts and styles); `.gen/site.cbor` is the snapshot, for
@@ -113,23 +112,6 @@ ask for HTML, so `curl -fsSL https://ix.dev/blaze | sh` installs). To move the s
 ## RFCs
 
 An RFC is a file in `content/rfcs/`: an instance of the `Rfc` prefab under `site.rfcs`.
-
-## Benchmark history (`/bench`)
-
-Built from `docs/benchmarks/history/*.jsonl` at the repo root, one line per benchmark run, appended by CI with
-`harness/benchhistory.py` (its docstring describes a line). `content/bench.flecs` names the directory with
-`BenchHistory history(dir: ...)`; at build time `gen/bench/` reads it and writes a Flecs script of Sections, Pickers
-and charts (`RowChart`, `LineChart`, `Charts`, schema in `content/schema.flecs`) under that entity, which runs after the
-content. The renderer draws them in `renderer/core/src/chart.rs`, coloured by `--series-N` (`styles/tokens.css`), each
-with its numbers in a table under it. A row chart is one row per project or edit with its values written beside it: bars
-on a linear axis from zero, or dots on a shared log axis (1-2-5 ticks) when the values span orders of magnitude, with the
-speedup over the baseline. A line chart is inline SVG on a linear or log axis; with one run so far it shows that run as
-numbers instead of a lone dot. `client/chart.ts` adds only the line charts' hover tooltip, and the pickers (platform,
-backend, project, machine) are labelled radio buttons that work without JS. A new line shows after the next deploy; the `site` workflow deploys on a change under
-`docs/benchmarks/`. Lines are grouped by machine, and the charts over time keep each machine's last 60 runs.
-
-To look at the page with other data, point `BENCH_HISTORY` at a directory of `.jsonl` files:
-`BENCH_HISTORY=/tmp/history bun run build`.
 
 ## Worker (`worker/`)
 

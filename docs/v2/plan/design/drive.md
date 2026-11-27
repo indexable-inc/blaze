@@ -146,8 +146,8 @@ insert and remove is constant time on average.
 
 The edit path's floors are D168's. The numbers the command is held to (D114):
 
-**Held to** (wall, a quiet machine; W = the workspace's own bodies; dependencies and std are never checked
-on this machine: their records come by key from the shared cache, and until that cache exists their first
+**Held to** (wall, a quiet machine; W = the workspace's own bodies; dependencies and std are checked once a
+machine: their records are found by key in the machine's own content-deduplicated store, so their first
 check is the one cold cost):
 
 | Case | Any size | Today (measured 2026-11-16) |
@@ -181,7 +181,7 @@ before the names that read it (`crates/blaze-cli/src/engine_scripts.rs`).
   digest, never the module listing whole.
 - FAILURE: a finding naming the script, its package and the line it failed on; the unit that
   needs it is "not checked: its build script failed", and the rest of the answer goes on.
-- A dependency's script output comes from the shared cache by key like any record; only a workspace
+- A dependency's script output comes from the machine's store by key like any record; only a workspace
   member's script, or one whose inputs changed, runs here.
 
 ## The store under the command (not built)
@@ -192,7 +192,8 @@ The command reads records through blaze-cli's `PackStore`. The design:
    worktree; the store writes nothing in a checkout. No home is a typed refusal naming `HOME`.
 2. A NAMESPACE, NOT A PLACE. `Sharing::place` becomes the record's namespace: `PUBLIC` when every name in it
    is public AND this machine may write it (a trusted builder); else `LOCAL`. On a developer's machine
-   everything computed is `LOCAL`; `PUBLIC` records arrive only verified, from an origin. `Place`, `Layered`'s
+   everything computed is `LOCAL`; `PUBLIC` records arrive only verified, from an origin, and only when
+   fetching them is chosen (built, off unless chosen). `Place`, `Layered`'s
    three stores and `Machine::Off` go.
 3. Only the leaf table is about a checkout: it and the last answer's key for each request shape
    hang from one named root a checkout, named by a digest of the checkout's path. Certificates,

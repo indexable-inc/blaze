@@ -19,9 +19,8 @@ again: it builds only what the edit changed, from the records the last run kept.
 
 ## What you need
 
-- **macOS on Apple silicon, or Linux on x86-64 or ARM64.** Windows has no release build and
-  the installer refuses it; v2 has not been run there (v1's port:
-  [platforms.md](platforms.md#windows-x86-64-msvc)). Intel Macs are not supported.
+- **macOS on Apple silicon, or Linux on x86-64 or ARM64.** Windows is out of scope for now,
+  and the installer refuses it. Intel Macs are not supported.
 - **On Linux, glibc 2.34 or newer**: RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Each
   is checked by installing there in a container with no Rust. Alpine and other musl systems are
   not supported; the installer says so.
@@ -64,22 +63,8 @@ Over a blaze from before 2026-10-28 it removes the programs with their old names
 
 ## With Nix
 
-```sh
-nix profile install github:indexable-inc/blaze
-```
-
-Or try it without installing anything: in a project, `nix run github:indexable-inc/blaze -- build`
-is `blaze build`. In a flake, take the package from the input:
-
-```nix
-{
-  inputs.blaze.url = "github:indexable-inc/blaze";
-  # ... then use blaze.packages.${system}.default in a dev shell or a profile.
-}
-```
-
-The package is `flake.nix`'s `dist` wrapped with the pinned Rust and DuckDB on `PATH`. `dist`
-runs .github/scripts/build_release.py, which is not in the tree, so this build fails today.
+Not today: `flake.nix`'s package builds `dist`, which runs .github/scripts/build_release.py, a
+script not in the tree. Use the installer.
 
 ## The old names
 

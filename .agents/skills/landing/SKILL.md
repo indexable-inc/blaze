@@ -81,9 +81,10 @@ What `proof-before-merge` asks, step by step:
 1. Make the exact tree: `git merge origin/main` into the branch and commit, so its head contains
    the main it joins (a `--no-ff` merge of it then has the head's tree). `land.py` refuses a head
    that does not contain origin/main.
-2. On the Mac or build VM, build the release CLI and launcher in that checkout with
+2. On the Mac, build the release CLI and launcher in that checkout with
    `cargo +$(cat pins/toolchain) build --locked --release -p blaze-cli -p blaze-launcher`.
-   Keep both binaries together in the release directory.
+   Keep both binaries together in the release directory. This build and the next step are
+   still run through cargo; a gap.
 3. Run `cargo +$(cat pins/toolchain) run --locked -q -p scripts --bin smoke -- '{"blaze":
    "<absolute path to release/blaze>", "work": "<an empty directory>"}' > smoke.txt` in the
    same checkout. Each step has a deadline. The harness exits 0 only for `verdict ok`.

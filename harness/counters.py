@@ -2,8 +2,7 @@
 
 The one helper the benchmarks count instructions with (bench.py, abbench.py, v2/budgets.py); a
 harness that counts them imports this rather than reading counters itself, as memory.py is the
-one way memory is measured. What it counts, and how far off it can be, is docs/benchmarks.md,
-"Instruction counts". In short:
+one way memory is measured. What it counts, and how far off it can be:
 
 - Retired instructions move far less than wall time on a busy or noisy machine (rustc-perf's
   primary metric for the same reason), so a 1% change of a step is visible where its time is

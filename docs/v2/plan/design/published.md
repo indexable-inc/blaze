@@ -1,13 +1,14 @@
 ---
 status: plan
-summary: "Row H0 of runtime.md: what blaze publishes (the settled classes only, by one predicate on a record's lifetime class and namespace), the origin's layout (a directory of digest-named immutable objects and one signed prefix that a reader over-asks in one read), the trust chain every byte passes before it is parsed, the reader's three round-trip waves, the publish job that lays a set out the same bytes whatever order it is given, and what stays out of this piece."
+summary: "Row H0 of runtime.md, an option that is off unless chosen (a new checkout is served by the machine's own content-deduplicated store, and no build depends on a fetched record): what blaze publishes (the settled classes only, by one predicate on a record's lifetime class and namespace), the origin's layout (a directory of digest-named immutable objects and one signed prefix that a reader over-asks in one read), the trust chain every byte passes before it is parsed, the reader's three round-trip waves, the publish job that lays a set out the same bytes whatever order it is given, and what stays out of this piece."
 date: 2026-11-17
 ---
 # Published records
 
-The owner's revision of 2026-11-17: published records (std, popular registry crates) are fetched; a
-project's records stay on its machine; only CI writes the shared cache; a fresh home does not rebuild
-std. The hosted object store is parked; the origin here is a directory with the layout a store would
+Publishing and fetching records is an option, off unless chosen: without it a new checkout is served
+by the machine's own content-deduplicated store, and no build depends on a fetched record. Chosen,
+published records (std, popular registry crates) are fetched and a fresh home does not rebuild std; a
+project's records stay on its machine; only CI writes the shared cache. The hosted object store is parked; the origin here is a directory with the layout a store would
 serve, read by byte range. Everything below builds on blaze-remote's read path (remote-read.md),
 which since D130/D132 is exactly the path for records blaze publishes: one home (rule 30), no second
 reader. New: the predicate and the layout job (`crates/blaze-remote/src/published.rs`), the prefix

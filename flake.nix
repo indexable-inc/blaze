@@ -27,7 +27,7 @@
           extensions = [ "rust-src" ];
         };
         # The same nightly with rustc_codegen_cranelift, for the setups bench.py compares with
-        # (`--setups`, docs/benchmarks.md).
+        # (`--setups`).
         nightly = pkgs.rust-bin.nightly.${pin}.default.override {
           extensions = [ "rustc-codegen-cranelift-preview" ];
         };
@@ -65,7 +65,7 @@
           UV_PYTHON = "${pkgs.python313}/bin/python3";
           UV_PYTHON_DOWNLOADS = "never";
         };
-        # What harness/bench.py runs in on the benchmark machine (docs/benchmarks.md): the
+        # What harness/bench.py runs in on the benchmark machine: the
         # pinned toolchain, the LLVM 23 blaze links, and the C side the projects' build
         # scripts use. Nothing here wraps rustc (no sccache) or replaces the default linker:
         # mold and wild are on PATH for the setups that ask for them with `-fuse-ld`. Every

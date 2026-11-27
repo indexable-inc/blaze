@@ -71,7 +71,8 @@ repository, and keep rust-analyzer's crate names. Edit them, build and test from
 commit like any other file. A plain clone builds:
 
     git clone https://github.com/indexable-inc/blaze && cd blaze
-    cargo +"$(cat pins/toolchain)" build -p blaze-cli --release   # cargo +nightly-2026-10-27
+    sh site/install.sh --version "$(cat .github/blaze-version)"   # the stage-0 blaze
+    blaze build --release --locked -p blaze-cli
 
 `crates/rustc_abi` is rustc's `rustc_abi` at the pinned nightly's commit, patched in for
 crates.io's `ra-ap-rustc_abi`, the same way. The fork repositories
@@ -203,8 +204,8 @@ What it leaves to a person, and prints at the end:
    `rustc_abi`'s renamed layout calls, vectors of at most 128 bits passed in registers on
    x86-64 and AArch64, Windows x64's rule for zero-sized types, the `f16b` and `ppcf128`
    layouts, libtest's new entry `test_main_env_args` and the intrinsic `abort_immediate`.
-3. `uv run --frozen python harness/toolchain_bump.py checks '{"stage0": "/path/to/blaze"}'` in an
-   ix VM, with a blaze that builds the tree as stage 0. It builds blaze with that blaze (never cargo) and runs, in parallel,
+3. `uv run --frozen python harness/toolchain_bump.py checks '{"stage0": "/path/to/blaze"}'` on
+   the Mac, with a blaze that builds the tree as stage 0. It builds blaze with that blaze (never cargo) and runs, in parallel,
    `toolchain_pins.py` and the gate's quick parts.
 4. The full tier re-measured at the new commit: the crates' own test suites.
 5. One commit for the bump, landed like any other change.
@@ -228,7 +229,7 @@ match by the whole version line.
    a fix. Find what the case is an instance of.
 
 Style follows rust-analyzer's guide
-([style.md](https://github.com/rust-lang/rust-analyzer/blob/master/docs/book/src/contributing/style.md)): `cargo fmt`, no new
+([style.md](https://github.com/rust-lang/rust-analyzer/blob/master/docs/book/src/contributing/style.md)): `blaze fmt`, no new
 dependencies without a reason, small focused changes. Comments say what the code is for and
 why, not what was changed. Messages printed to the user say what happened and what blaze
 did about it in one line.
@@ -248,8 +249,10 @@ records, how to read it and the method.
   catches ([Tests](#tests)). A review does not stand in for it.
 - The gate, on the platform you have. Say which platforms
   you did not run. CI's merge gate (`.github/workflows/blaze.yaml`, ix runners, Linux arm64) is the gate
-  checks (`tools/gate.txt`), the Lean proofs, actionlint, and `cargo check --workspace
-  --all-targets`, `cargo test --workspace` and the blaze-sys import audit. The gate letting a
+  checks (`tools/gate.txt`), the Lean proofs, actionlint, and, for a change to code, `cargo check
+  --workspace --exclude blaze-std --all-targets`, the workspace's tests without blaze-std
+  (`scripts/src/bin/ci_test.rs`) and the blaze-sys import audit (still run through cargo, as is
+  the smoke's command below; a gap). Its `ci` job is the one required check. The gate letting a
   change through is not the harnesses passing on it.
 - blaze builds blaze, never cargo or rustc: with the release `.github/blaze-version` names as
   stage 0 (`sh site/install.sh --version "$(cat .github/blaze-version)"`, as
@@ -257,7 +260,7 @@ records, how to read it and the method.
 - `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
   pull request's diff should be its change), and
   `blaze test --release --locked -p blaze-engine -p parser -p syntax` from the root (or
-  `python3 harness/unittests.py`, what CI runs: every test of the workspace, with the failures it expects).
+  `python3 harness/unittests.py`: every test of the workspace, with the failures it expects).
   A test that fails is new unless `harness/known-failures.toml` lists it:
   `uv run --frozen harness/failures.py '{"run": {"packages": [...]}}'` runs the
   crates you touched and says which failures are new ([harness.md](harness.md#ci)).
@@ -281,8 +284,8 @@ cause.
 
     blaze check $(blaze run -q -p scripts --bin changed -- '{"base": "origin/main", "print": "args"}') --lib --tests
 
-- The session that integrates agents' work (rule fan-out-write-only) runs that in the lane's
-  VM after each commit it takes, with `"base"` the commit before, in parallel with the build:
+- The session that integrates agents' work (rule fan-out-write-only) runs that on the Mac
+  after each commit it takes, with `"base"` the commit before, in parallel with the build:
   the check of a few packages does not wait for the build of all of them, and an error goes
   back to the agent that wrote the code while it still has it in mind. `"dependents": false`
   checks the touched packages alone, for a first answer; the dependents follow.
@@ -334,11 +337,9 @@ main with all the others, so:
 - **Work comes from the ledger.** A lane is one task: an objective of
   [v2/plan/objectives.md](v2/plan/objectives.md), done when its check passes. How a session
   picks, briefs, integrates and lands is [the plan's loop](v2/plan.md#how-the-work-is-run).
-- **Linux work runs on the one build VM, `blaze-vm`**, through its one queue
-  (`ix shell blaze-vm --noninteractive -- /root/loop.sh <branch> <command...>`; how-to `H12`
-  under `agents/howto/`); nobody makes a VM per lane, and nothing runs on AWS. The Mac is for
-  what only macOS can show, one build at a time. Where neither can do something, stop and say
-  what is missing (rule `work-in-ix-vms`).
+- **Work runs on the Mac**: builds, tests, smokes and benches, at most three heavy builds at
+  once; no VM and no AWS host. Linux-only work runs in CI. Where neither can do something, stop
+  and say what is missing (rule `work-on-the-mac`).
 - **Every command has a timeout** sized to its expected time, and on expiry the status or
   stall line (`--status-every`, SIGINFO or SIGUSR1) is taken and quoted; a hang is a bug to
   report, never waited out (rule `every-command-has-a-timeout`).
@@ -347,23 +348,22 @@ main with all the others, so:
   never a heredoc, `sed` or a script (rule `edit-rust-by-syntax`), and commits its own piece;
   it builds nothing. A rewrite gets a fresh core in new crates beside the old code. The main
   agent builds once and admits each piece alone onto the last green head; no new wave of lanes starts while the tree does not compile (rules
-  `fan-out-write-only`, `worktree-per-lane`, `agents-are-a-cost`). A worktree is the exception,
-  for two lanes that must change one file or a variant tree.
-- **Never `git stash`.** The stash is one stack for every worktree of the repository, so a pop
+  `fan-out-write-only`, `one-directory-for-lanes`, `agents-are-a-cost`). There is no worktree
+  per lane and no cap on the number of lanes.
+- **Never `git stash`.** It takes every lane's uncommitted changes in the directory, so a pop
   can take another lane's changes.
 - **Run harnesses with `RUST_BACKTRACE=0`**, so a test that panics prints its message and
   not a backtrace into what the harness compares.
 - **Land small and often, through a pull request** ([below](#landing-a-change)), each merge
   after the smoke run of its exact merge commit.
-- **Clean up when done:** the lane's `/root/wt/<lane>/` and homes on `blaze-vm`, any blaze
-  process it left running, any worktree (`blaze clean` in it, then `git worktree remove`) and
-  the merged branch (rule `clean-up-lane`).
+- **Clean up when done:** the lane's scratch homes and directories, any blaze process it left
+  running and the merged branch (rule `clean-up-lane`).
 
 ## Landing a change
 
 Main moves only through pull requests: nobody pushes to it or merges into it by hand. Nothing
 merges, by `land.py` or by an admin, until a release blaze built from the exact merge commit (the
-branch merged into the main it joins) has run the hello-world smoke on the Mac or build VM (a cold run, a
+branch merged into the main it joins) has run the hello-world smoke on the Mac (a cold run, a
 no-op, a body edit and a comment edit, each under a timeout, each counted only with exit 0 and the
 program's own line, then `blaze check` and `blaze test` with one executed passing assertion) and the result is quoted in the pull request; a compile check is not evidence
 that the binary runs (rule `proof-before-merge`; the `landing` skill has the steps). To make the
@@ -387,14 +387,14 @@ passes, the waiting asks `smoke` again about the body's quote and the head GitHu
 the branch with a merge commit pinned to that head, as `git merge --no-ff` would. The branch
 must contain main, since the quote is of the tree that becomes main: when main has moved past
 the head, the waiting refuses, and the branch gets `git merge origin/main`, a new build and a new
-smoke. There is no merge queue. `land.py` waits for the merge and prints the commit, or says why
+smoke. The workflow also runs on `merge_group`, so a merge queue would get the same gate, but
+`land.py` uses none: it merges with `gh pr merge --merge --match-head-commit <head>` itself. `land.py` waits for the merge and prints the commit, or says why
 the pull request did not merge; then fix the branch and run it again. The waiting runs in a
 process of its own that outlives `land.py`, its terminal and a tool that ends its process group,
 writing to `.git/land/pr-N.log` in the main checkout; `land.py '{"follow": true}'` (or
 `'{"follow": N}'`) follows it again, as does running `land.py` again on the branch, so nobody
 polls GitHub by hand. Once it has merged, GitHub deletes the branch on origin;
-remove the worktree and the local branch
-(`git worktree remove <dir> && git branch -D <branch>`).
+remove the local branch (`git branch -D <branch>`).
 
 ## The build that ships
 

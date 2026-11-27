@@ -225,14 +225,14 @@ decided once; able to carry the facts; no heavy new dependency.
    thread before. *Settled by:* the `llvm compile` span before and after on nushell's release
    build. A context of a few hundred bytes made per function that compiles in milliseconds
    should not show.
-6. **Windows unwinding** moves from the builder into the stencil glue (the guarded call).
-   *Settled by:* `harness/unwinds.py` and `harness/unwindsplice.py` on a Windows ix VM, mixing
-   stencil and LLVM frames in one unwind.
+6. **Windows unwinding** (later: Windows is out of scope now) moves from the builder into the
+   stencil glue (the guarded call). *Settled by:* a run mixing stencil and LLVM frames in one
+   unwind, once Windows is in scope.
 
 Gate for the LLVM path:
 
-- **The real-project harness passes** on `-Z lir` for every project, debug and release, on
-   macOS AArch64, Linux x86-64 and Windows x86-64 (ix VMs).
+- **The real-project harness passes** on the LIR path for every project, debug and release, on
+   macOS AArch64 (the Mac) and Linux x86-64 (in CI).
 
 ## Related
 

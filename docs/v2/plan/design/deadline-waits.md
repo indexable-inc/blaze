@@ -27,8 +27,8 @@ restarts on every retry, and signals sent at blaze's own threads.
    (`IORING_ENTER_EXT_ARG_REG | ABS_TIMER`; a retry rewrites only the region's time) and a signal mask that blocks every asynchronous signal but the stop signals
    (SIGINT, SIGTERM, SIGHUP, SIGQUIT) during the wait. A process-directed signal goes to a
    thread that does not block it; a stop signal still interrupts, and `wait` retries with the
-   time left. kqueue and IOCP (`GetQueuedCompletionStatusEx`) take their relative timeouts from
-   `wait` the same way.
+   time left. kqueue, and later IOCP (`GetQueuedCompletionStatusEx`; Windows is out of scope
+   now), take their relative timeouts from `wait` the same way.
 4. **The ban.** `.clippy.toml` bans direct kernel waits outside `crates/blaze-core/src/wait*`,
    each with its replacement in `blaze_core::wait`: `libc::{poll, ppoll, select, pselect,
    epoll_wait, epoll_pwait, kevent, kevent64, nanosleep, clock_nanosleep, usleep, sleep}` and
@@ -59,7 +59,7 @@ restarts on every retry, and signals sent at blaze's own threads.
      than the log's oldest entry reads span 0 and is counted in the dump's sampler line.
    - macOS: `thread_suspend` + `thread_get_state` + `thread_resume`; it reads the same
      per-thread slot (innermost span, job, fiber) directly while the thread is stopped.
-   - Windows: `SuspendThread` + `GetThreadContext` + `ResumeThread`, the macOS shape (not built).
+   - Windows (later): `SuspendThread` + `GetThreadContext` + `ResumeThread`, the macOS shape.
    - Where perf cannot be opened (`perf_event_paranoid` above 2 without `CAP_PERFMON`, a seccomp
      filter), the sampler is off and every dump says why: no fallback to a signal.
 
@@ -123,7 +123,7 @@ direct calls.
 
 - The wait: `crates/blaze-core/src/wait.rs` and `wait/` (`retry.rs`: `Deadline`, `Waited`, the
   retry core; `unix.rs`: `readable`; `sleep_until` per system); `Driver::poll` takes a
-  `Deadline` (blaze-core lib.rs, kqueue.rs, iocp.rs).
+  `Deadline` (blaze-core lib.rs, kqueue.rs).
 - Linux: a per-thread wait ring (`wait/ring.rs`: `SINGLE_ISSUER | DEFER_TASKRUN`, a registered
   wait region holding the absolute deadline and the signal mask); `wait::Parker`
   (`wait/parking.rs`) on `IORING_OP_FUTEX_WAIT`/`WAKE` for the pool's idle park; child exits on
@@ -143,7 +143,7 @@ direct calls.
 - The bans on `waitpid`, `waitid`, `wait4` and raw `syscall(SYS_futex)` outside `wait`.
 - `pool::block_until`'s client park and the pool's stopper, still on `thread::park`.
 - The uring driver's pidfd `POLL_ADD` moved onto `OP_WAITID`.
-- Windows: the `WaitOnAddress` park and the sampler.
+- Windows (later, out of scope now): the `WaitOnAddress` park and the sampler.
 
 ## How it is proven
 
@@ -176,4 +176,4 @@ scoped waiter within a bound, and the planted worker that ends silently leaves i
 (`the_oracle_catches_a_worker_that_ends_silently`).
 
 The sampler: the existing `a_busy_thread_is_sampled_and_named` test, plus one that a sample
-names the span and fiber it was taken in on Linux (the property perf lacked), run in an ix VM.
+names the span and fiber it was taken in on Linux (the property perf lacked), run in CI.

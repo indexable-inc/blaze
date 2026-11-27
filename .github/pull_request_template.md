@@ -8,4 +8,3 @@
 
 - [ ] A reduced case that fails before and passes after
 - [ ] `blaze fmt --all --check`
-- [ ] A line under `## [Unreleased]` in docs/CHANGELOG.md, if a user would notice

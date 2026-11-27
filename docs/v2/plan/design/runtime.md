@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: "The runtime's end state (the owner, 2026-11-17: \"make a plan for the sota runtime\"), under end-state.md where they differ. One page over the engine (end-state.md D157), the store, names, heads, bodies, lints, tests, run and the remote read: what must hold (incremental after a restart first, with lints as fast; then remote records, memory, cold time, cleanup, disk), the floor of each number, the ten design points with their evidence, the answer's stored form (crates/blaze-answer), the ideas past the surveyed state of the art, and the pieces by the ids code cites."
+summary: "The runtime's end state (the owner, 2026-11-17: \"make a plan for the sota runtime\"), under end-state.md where they differ. One page over the engine (end-state.md D157), the store, names, heads, bodies, lints, tests, run and the remote read: what must hold (incremental after a restart first, with lints as fast; then memory, cold time, cleanup, disk; a remote cache supported and not ranked), the floor of each number, the ten design points with their evidence, the answer's stored form (crates/blaze-answer), the ideas past the surveyed state of the art, and the pieces by the ids code cites."
 date: 2026-11-17
 ---
 # The runtime: the end state
@@ -15,13 +15,13 @@ The owner, 2026-11-17 18:05, in his order of importance:
 
 1. Incremental compiles are short: on realistic huge Rust monorepos (millions of lines), on enormous crates and
    large files, and after the computer restarted with nothing running. Lints are as fast as the check.
-2. Cached results can come from elsewhere (R2, peers).
-3. Memory use is small.
-4. A cold compile is fast.
-5. Disk cleanup is good and never locks.
-6. Disk use is small.
+2. Memory use is small.
+3. A cold compile is fast.
+4. Disk cleanup is good and never locks.
+5. Disk use is small.
 
-And: a restart re-indexes nothing; no daemon (a command answers and exits; an optional helper holds nothing
+A remote cache (R2, peers) is supported and is not in this order: nothing is designed around it or traded
+against these. And: a restart re-indexes nothing; no daemon (a command answers and exits; an optional helper holds nothing
 correctness needs); caches are shared across the worktrees of
 a machine with no setup; best on 128 cores, good on a typical Mac; data-oriented throughout (structures of
 arrays, 32-bit ids, records read in place); tests are incremental.
@@ -57,7 +57,7 @@ test asserts. Where a row is a target and not yet a derived floor it says so.
 | A dependency's names a small program needs | the groups it reaches: 66 of 17,260 |
 | Lints | one walk a body; each lint's cost printed |
 | Tests after one body edit | the tests whose reach holds that body |
-| First check on a fresh machine | the settled classes read by byte range: bytes, round-trip waves (at most 3, by a prefetch list in the head) and seconds |
+| First check on a fresh machine, fetching chosen (off unless chosen) | the settled classes read by byte range: bytes, round-trip waves (at most 3, by a prefetch list in the head) and seconds |
 | Cleanup | the longest wait of any command on compaction is 0 at 128 workers; disk after 1,000 edits at most twice the live bytes |
 
 ## The end state
@@ -173,7 +173,8 @@ test asserts. Where a row is a target and not yet a derived floor it says so.
    moves little (the Cranelift back end: 5 to 12% end to end on a large Rust project, with a per-function
    cache as its own next goal); Zig's in-place patching reaches 30 to 70 ms rebuilds.
 
-9. **Published records are fetched, yours stay.** What is published is exactly the settled classes; a
+9. **Published records, when chosen, are fetched; yours stay.** Fetching is an option, off unless chosen; without
+   it a new checkout is served by the machine's own content-deduplicated store. What is published is exactly the settled classes; a
    published head carries a prefetch list so a fresh home needs few round trips; a project's records leave
    its machine only when its organisation opts in. A peer is another origin of the same form.
 
@@ -276,7 +277,7 @@ Each piece is admitted on its check, measured in a real run (rules 35, 82).
 | F1 | The std hello world prints through `run` | exit 0 twice |
 | F2 | `run` and the census on the engine | hello world; the census equals the last one |
 | G0 | Fixtures and the scaling harness: a 5,000-module crate, a 100,000-line file, a `--workers` sweep | the huge-input rows and the speedup row print |
-| H0 | The remote contract: the published set is the settled classes; a publish job; a fresh home reads by range from a directory origin (the owner parked the R2 service itself at 11:29; this needs none) | bytes, round-trip waves and seconds for a small project |
+| H0 | The remote contract (H0 and H1: an option, off unless chosen): the published set is the settled classes; a publish job; a fresh home reads by range from a directory origin (the owner parked the R2 service itself at 11:29; this needs none) | bytes, round-trip waves and seconds for a small project |
 | H1 | Code records fetched | a fresh home's first `run` |
 | V1 | A body's result as a checkable certificate (X2): validate without inference when a read moved; a fetched certificate needs no trust | validate against infer time on the 58 real bodies; the share of moved-read bodies that still validate |
 | K1 | One code record per generic fn at the first tier (X3): size, alignment and trait tables passed in; specialised when hot | code records and build seconds of the 1,100-crate census; its tests' run time |

@@ -112,7 +112,7 @@ Symmetric, Target and Trait need the `FLECS_CONSTRAINT_TRAITS` addon.
 
 - **Pages are scripts.** `site/content/schema.flecs` defines the element types (structs such as `P`, `Li`, `Code`,
   `Section`, `Issue`; container tags `Ul`, `Ol`, `Table`, `Tr`; widget tags `RfcIndex`, `References`, `Course`,
-  `UpdateLog`, `BenchHistory`), the relationships (`Status`, `Cites`, `DependsOn`, and the course graph's `Requires`
+  `UpdateLog`), the relationships (`Status`, `Cites`, `DependsOn`, and the course graph's `Requires`
   and `InTheme`) and the page prefabs (`Page`, `Rfc : Page`). `refs.flecs` holds `Ref` entities. Every
   other file adds pages under `site { ... }`; entity paths are URLs (`site.rfcs.capabilities` is `/rfcs/capabilities`,
   `site.index` is `/`).
@@ -121,7 +121,7 @@ Symmetric, Target and Trait need the `FLECS_CONSTRAINT_TRAITS` addon.
 - **The build runtime** is `site-snapshot.wasm` (`site/renderer/snapshot`): Flecs's C compiled in through
   flecs-opinionated's `flecs-c` (wasm32-unknown-unknown, no WASI). `gen/build.ts` runs each script once with
   `ecs_script_run` (unmanaged: no reactivity, no async) and gets a DAG-CBOR snapshot (`.gen/site.cbor`) of every entity
-  under the roots. Rust modules are built on a dev host or in CI and fetched with `renderer/fetch.py`; see
+  under the roots. Rust modules are built on the Mac or in CI and fetched with `renderer/fetch.py`; see
   `site/renderer/README.md`.
 - **The renderer** is `site.wasm` (`site/renderer/core`, Rust, no Flecs inside): `world.rs` is the entity store loaded
   from the snapshot (prefab values merged, nearest wins), `render.rs` maps each element type to HTML and builds the

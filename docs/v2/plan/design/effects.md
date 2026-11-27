@@ -41,24 +41,24 @@ assembly, a function pointer taken as a parameter, a call of an unlisted method 
 `#[blaze::expect(panic, alloc, block, diverge)]`, "anything", admits it, or a callee taken at
 its word (`trusted`, below). `pure` needs no word either: see "Purity" below.
 
-They are checked on the one walk that `#[blaze::pure]` uses ([Purity](#purity)): one
-memoized summary per monomorphized instance, carrying an `EffectSet` (one bit per kind of
-effect, `hir_ty_pure::effects::Rule`) with a witness of each. Each word has an `EffectDef`
-(`effect_attrs::of_word`: `NOPANIC`, `NOALLOC`, `NONBLOCKING`, `TERMINATES`), a mask over those
-kinds; a list without the word asks for it, and checking one reads the root's summary.
+They are to be checked on the one walk that `#[blaze::pure]` uses ([Purity](#purity)): one
+memoized summary per monomorphized instance, carrying the kinds of effect it finds (below) with
+a witness of each. Each word is a mask over those kinds; a list without the word asks for it,
+and checking one reads the root's summary.
 
-Code: `crates/hir-def/src/attrs.rs` (the attributes: `ExpectWord`, `ExpectAttr`,
-`AttrFlags::EXPECT` bit 101, `BLAZE_EFFECTS` bit 102; the old spellings' `EffectWord`, bits 97
-to 99), `crates/hir-ty-pure/src/expect.rs` (the one home of what is declared: `declared`,
-`Marks` with `exact`, `allowed`, `unfulfilled`, `verdict`), `effect_attrs.rs` (the
-definitions, the site rules and the tables), `loops.rs` (which loops end),
-`crates/blaze-lints/src/blaze/expect.rs` (the lints of the list and of the deleted spelling)
-and `effects.rs` (the old spellings' lints).
+Code: the four words are `EffectSet` in `crates/blaze-ty/src/effect_ty.rs`, packed into
+`FnHeader` (`with_effects`, `declared_effects`), with `check_exact_effects` (the exact-list
+rule), `fn_ptr_coerces` (fewer words coerce to more) and `EffectRow` (a list polymorphic in a
+callee's `expect(e)`); built, called only by blaze-ty's tests. The attributes are known to
+`crates/blaze-surface/src/tool_attrs.rs` (`Stage::Effects`) and the fixtures are
+crates/blaze-real/extensions/a_expect.rs, a_nopanic.rs, a_noalloc.rs, a_nonblocking.rs and
+a_effects_gate.rs. No walk checks a body's effects on the item layer yet: the walk below is the
+design.
 
 ## What is declared, and where it comes from
 
 A function's *allowance* is the set of words it may have. The first of these that is written
-holds, alone; nothing is merged (`hir_ty_pure::expect::allowed`):
+holds, alone; nothing is merged:
 
 1. **Its own list**, `#[blaze::expect(..)]` on the function. What is written on the function is
    what holds: it replaces a default around it entirely, so `#[blaze::expect(alloc)]` in a module
@@ -116,8 +116,7 @@ renamed: naming it is reported as a removed lint.
 
 **`trusted`.** `#[blaze::expect(alloc, trusted = "why")]` is a list taken at its word: the function
 is not checked, and every call of it has exactly the listed effects (on a trait: every impl's
-method, and every call through `dyn` of it). The reason is recorded in the proof
-(`EffectProof::trusted`) so a reviewer reads every promise made by hand. A module's default
+method, and every call through `dyn` of it). The reason is recorded in the proof so a reviewer reads every promise made by hand. A module's default
 takes no `trusted`.
 
 **Calls the check can't resolve.**
@@ -129,8 +128,8 @@ takes no `trusted`.
   caller made, which the walk of the function never saw. Taking it is not refused: a call
   through it is, when nothing says what the object's method may do. The walk records each call
   through a `dyn` of a method whose list (or whose trait's trust) does not leave the word out,
-  each call through a `dyn Fn`, and each drop of a value that owns a `dyn` (`Rule::Dyn`, kept
-  for every word); a function that takes a `dyn` and reaches one, in its own body or in
+  each call through a `dyn Fn`, and each drop of a value that owns a `dyn` (kept for every
+  word); a function that takes a `dyn` and reaches one, in its own body or in
   anything it calls, is refused as code the check can't see, naming the method and the `dyn`.
   A callee `trusted` for the word does not hide it: it answers for its own code, not for the
   object it is handed. So a function that stores the `dyn`, compares it or hands it on to code
@@ -143,10 +142,9 @@ takes no `trusted`.
   the body is different: what it points to was walked where it was made (the walk is
   closed-world), so its panics, allocations and waits are already counted, and the call adds
   only `diverge`, since the pointer may lead back to the caller. Effects in function pointer
-  types (`fn(u32) -> u32 expect(panic)`) would lift both: the type would carry the list, a
-  coercion of a function to it would check the function's list against it, and a call through
-  it would have the type's list. That needs the list in the type system (a part of `FnSig`,
-  with subtyping from fewer words to more), not an attribute.
+  types (`fn(u32) -> u32 expect(panic)`) lift both: the type carries the list, a coercion of a
+  function to it checks the function's list against it, and a call through it has the type's
+  list. blaze-ty has this (`FnHeader`'s effect bits, `fn_ptr_coerces`); nothing reads it yet.
 
 ## The old spellings
 
@@ -154,8 +152,7 @@ takes no `trusted`.
 `(trusted = "why")`, on a function, a foreign function or a trait) stay accepted in every crate
 and mean exactly what they meant: a promise of the absence of one effect, held by their own
 lints (`blaze::nopanic`, `blaze::noalloc`, `blaze::nonblocking`). Internally there is one
-representation, the allowance: an old spelling lowers to "every word but this one"
-(`expect::declared`), so a function with one is not held to a default around it for the others.
+representation, the allowance: an old spelling lowers to "every word but this one", so a function with one is not held to a default around it for the others.
 Where effects are declared (under a module's default or the gate), `blaze::negative_effect`
 (`warn`) asks for the positive form, and its fix writes it: every word the old spellings do not
 take off that the function is not proved free of. A function with `nopanic` and `nonblocking`
@@ -163,10 +160,8 @@ that allocates and has a loop not known to end becomes `#[blaze::expect(alloc, d
 function with both spellings is refused. `diverge` has no negative spelling: there never was a
 `#[blaze::terminates]`.
 
-`AttrFlags::effect_attr(db, owner, EffectWord)` reads an old spelling's argument (one bit test
-for an item without one); `AttrFlags::expect_attr(db, owner)` reads a list (`ExpectAttr`: the
-words, `trusted`, or the text of one that is malformed). The deleted `#[blaze::may(..)]` sets
-no bit and is read by nothing but the lint that refuses it. No codegen key or signature reads the bits:
+The attributes are known by name (blaze-surface `tool_attrs.rs`); the deleted
+`#[blaze::may(..)]` is to be read by nothing but the lint that refuses it. No codegen key reads them:
 a function without an attribute builds byte for byte as before, and so does one with it.
 
 ## Purity
@@ -188,8 +183,8 @@ refused naming the text. No code key reads the attribute: a function without it 
 byte as before.
 
 **Allowed:** allocating and freeing (recorded, not refused, while nothing observes the address);
-panic and overflow (the job fails, nothing is kept); diverging (`through_never`: under a callee
-returning `!` no kind counts for purity); mutating memory it owns or was given `&mut`, `Cell`,
+panic and overflow (the job fails, nothing is kept); diverging (under a callee returning `!`
+no kind counts for purity); mutating memory it owns or was given `&mut`, `Cell`,
 `RefCell` and atomics on that memory included; formatting, hashing with a fixed seed and sorting;
 foreign functions known to be deterministic (the allocator shims, `memcpy memmove memset memcmp
 bcmp strlen`, libm, LLVM intrinsics other than the machine-state ones); trusted functions
@@ -249,7 +244,7 @@ by panicking", and `#[blaze::expect()]` is total: it returns. A wait is not its 
 the function returns whenever every wait it makes does, and leaving out `block` says there is
 none.
 
-What the walk records (`Rule`), all refused by a list without `diverge`:
+What the walk is to record, all refused by a list without `diverge`:
 
 - `Loop`: a loop of the body not known to end, at the loop's line.
 - `Recursion`: the instance can call itself again, through any calls. The refusal names the
@@ -260,11 +255,11 @@ What the walk records (`Rule`), all refused by a list without `diverge`:
   method whose list leaves `diverge` out is not one.
 - and, as for every word, what the check can't see (`ForeignUnknown`, `Unchecked`).
 
-**Loops** (`crates/hir-ty-pure/src/loops.rs`). A loop is a strongly connected component of the
+**Loops.** A loop is a strongly connected component of the
 body's control flow graph; a block that goes to itself counts. A component ends when some block
 of it, a *bounding block*, can run only finitely often while control stays in the component,
 and what is left without that block ends too. The bounding rules are data for that one
-algorithm (`loops::Bounding`). This slice has one, sound from the MIR alone:
+algorithm. The first, sound from the MIR alone:
 
 - **A counted `while`.** `while i < n { ..; i += c; }` (and `<=`, and the mirror with `>`,
   `>=` and `-=`), where `i` is a local integer, the limit is a constant or a local the loop
@@ -282,9 +277,7 @@ algorithm (`loops::Bounding`). This slice has one, sound from the MIR alone:
 **Everything else is refused**, naming the loop's line, until a rule for it exists:
 
 - `for`. A `for` over a range or a slice ends (the iterator's `next` is finite and its `None`
-  edge leaves the loop), and that rule is the next one; it is not in this slice because the
-  test toolchain's `Range::next` is `loop {}`, so it could not be proved by a test here, and an
-  untested rule is not shipped.
+  edge leaves the loop), and that rule is the next one.
 - `while i < v.len()` (the limit is computed in the loop), `while let Some(x) = stack.pop()`,
   `loop { .. break .. }`, iterator adaptors, and every loop inside std that these rules do not
   cover. A callee proven by hand is marked `#[blaze::expect(.., trusted = "why")]`.
@@ -429,16 +422,16 @@ that use a frame also call the database, which allocates its memos from the glob
 
 ## Tests
 
-Per effect, one crate that passes and one per kind of refusal, named for the property
-(`crates/blaze-lints/src/blaze/effects_tests.rs` for the old spellings, `expect_tests.rs` for
-the list: each word's under-declaration with its witness, the counted `while` and its near
+blaze-ty's `effect_ty.rs` tests cover the set, the exact-list check and fn-pointer coercion. Owed
+on the item layer: per effect, one crate that passes and one per kind of refusal, named for the
+property (the old spellings, and the list: each word's under-declaration with its witness, the counted `while` and its near
 misses, recursion, function pointers and `dyn`, an impl within its trait's list, a module's
 default and a function's own list, an unfulfilled word refused on a private and a public
 function with its fix (control: the old private-only rule lets the public one through), the
 bounds that pass with an unneeded word (a trait method's, an inherited one, a default, a
 `trusted` one), an impl method's own list held exact, the deleted `#[blaze::may(..)]` refused
-and respelled, the rewrite of the old spellings, and a crate that declares nothing), plus `an_effect_attribute_changes_no_signature` in hir-def: a
-function's signature and flags other than the effect bits are the same with the attributes
+and respelled, the rewrite of the old spellings, and a crate that declares nothing), plus a test
+that a function's signature and flags other than the effect bits are the same with the attributes
 and without, so an unmarked crate builds byte for byte the same.
 
 Two invariants are stated and tested with blaze-sim, each with planted-bug controls:

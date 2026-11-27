@@ -2,7 +2,7 @@
 // The whole site is one course. Its front door, /, is the intro: the wordmark dropping in and catching fire, one line
 // and the way in. Lesson 1 is /start (what blaze is, installing it, the first build), the course map is /learn
 // (learn.flecs), the other lessons are in learn/, the updates in updates.flecs and updates/.
-// Reference pages (install details, benchmarks, the charter, RFCs) sit beside it in the sidebar (nav.flecs).
+// Reference pages (install details, the charter, RFCs) sit beside it in the sidebar (nav.flecs).
 site {
   OrderedChildren
   // https://ix.dev/blaze/ (the worker answers there).
@@ -14,7 +14,7 @@ site {
   learn {}
   updates {}
 
-  // The front door: the wordmark, live (client/intro.ts), then what blaze is in one line, the proof of it, and the way
+  // The front door: the wordmark, live (client/intro.ts), then what blaze is in one line and the way
   // into the course, and as little text as that takes (Andrew, 2026-11-12: "less text and more clear it is an
   // alternative to cargo build"). No sidebar here, so the last line is the way to the course map and the reference pages.
   index : Page {
@@ -22,16 +22,6 @@ site {
     Title: {"blaze"}
     Tab: {"blaze: Rust that rebuilds in milliseconds"}
     Description: {"blaze is a faster cargo build: the same Rust projects and commands, with an edit rebuilt in milliseconds."}
-
-    // The numbers are not written here: the build reads them from docs/benchmarks/history (gen/bench/race.ts), the
-    // latest Linux x86-64 run that timed this edit under both. On 2026-11-12 that is linux-x86-64.jsonl's run of
-    // 2026-10-22 (commit 2cf189feb6, AWS c7a.48xlarge pinned to 16 cores, median of 5 edits): helix 25.07.1 with
-    // LLVM, `body` (edit one function, then build), blaze 0.110 s, cargo 3.084 s. helix because its wait is long enough
-    // to see in real time (Andrew, 2026-11-12: ripgrep's 69 ms against 787 ms was "too fast to really see"); LLVM
-    // because it is cargo's default. Across that run's nine projects the same edit is 6x to 34x faster under blaze on
-    // eight, and slower on one, bevy (11.2 s against 3.8 s), which /bench shows. docs/benchmarks.md says every
-    // published number is blaze v1's, so `of` says v1; it and the run's day are in the figure's title.
-    Race race(dir: "docs/benchmarks/history", platform: "Linux x86-64", project: "helix/llvm", edit: "body", of: "blaze v1", more: "/bench")
 
     Go start(label: "Start the course", href: "/start")
 
@@ -55,7 +45,7 @@ site {
     Step why("Why it is fast") {
       Art race(piece: "race", label: "Two lanes over time. cargo: a rustc for each affected crate, each starting by reloading its saved state, then the whole program linked. blaze: one function, then done.")
       P cargo("`rustc` is incremental, but cargo still starts one per affected crate, each reloading its saved state, then links everything again.")
-      P blaze("blaze keeps your workspace in memory and redoes only **the functions you changed**.")
+      P blaze("blaze keeps what it compiled on disk and redoes only **the functions you changed**.")
     }
 
     Step install("Install it") {
@@ -66,14 +56,14 @@ site {
     Step first("Your first build") {
       Code run(lang: "bash", text: "blaze run")
       Art held(piece: "daemon", label: "Your workspace as a block of cells. The first build fills every cell; after that each save changes a single cell.")
-      P daemon("The first build loads everything into a background **daemon**. After that, each save rebuilds one piece:")
+      P stored("The first build compiles everything and keeps the results; the command answers and exits. After that, each save rebuilds one piece:")
       Code finished(lang: "", text: `Finished \`dev\` profile [blaze] target(s) in 0.02s`)
     }
 
-    Step daemon_q("Check") {
+    Step rebuild_q("Check") {
       Quiz q(prompt: "Why is the second `blaze run` so much faster?") {
         Choice cache("It downloaded a prebuilt copy.", "Nothing is downloaded: your code is compiled on your machine.")
-        Choice held("The daemon kept everything in memory and redid only the edit.", "Right: load once, then only what changed.") {
+        Choice held("blaze kept the first build's results and redid only the edit.", "Right: compile once, then only what changed.") {
           Right
         }
         Choice skip("It skipped type checking.", "Types are checked on every build.")
@@ -82,9 +72,9 @@ site {
 
     Step commands("The commands") {
       Table cmds {
-        Tr build { Td a("`blaze build` `run` `test` `check` `bench`"); Td b("cargo's commands and flags") }
-        Tr status { Td a("`blaze status`"); Td b("what the daemon holds") }
-        Tr stop { Td a("`blaze stop`"); Td b("save its state and stop") }
+        Tr build { Td a("`blaze build` `run` `test` `check`"); Td b("cargo's main commands") }
+        Tr why { Td a("`blaze why <file>`"); Td b("why a file was rechecked") }
+        Tr clean { Td a("`blaze clean`"); Td b("remove this checkout's state") }
       }
       Dim watch("Rebuild on save with any watcher: `watchexec -e rs -- blaze build`.")
     }

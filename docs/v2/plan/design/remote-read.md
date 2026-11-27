@@ -1,11 +1,12 @@
 ---
 status: plan
-summary: The shared cache's read path (crates/blaze-remote/src/read, blaze-cli's store.rs). A command that misses a record locally reads it by byte range from an origin that lists and writes nothing. It checks each byte against a digest chain that starts at a signed head, writes the record through, and computes nothing the origin holds. Covers the sans-IO reader, the trust steps, what an origin must give, the first numbers, and what is not built.
+summary: The shared cache's read path (crates/blaze-remote/src/read, blaze-cli's store.rs), built, off unless chosen; without it a new checkout is served by the machine's own content-deduplicated store. A command that misses a record locally reads it by byte range from an origin that lists and writes nothing. It checks each byte against a digest chain that starts at a signed head, writes the record through, and computes nothing the origin holds. Covers the sans-IO reader, the trust steps, what an origin must give, the first numbers, and what is not built.
 date: 2026-11-16
 ---
 # Reading records from an origin
 
-Scope since 2026-11-17 (decisions D130, then D132 the same day): the origin serves the records blaze itself
+Reading from an origin is an option, off unless chosen: no build depends on a fetched record, and a new
+checkout is served by the machine's own content-deduplicated store. Scope (decisions D130, D132): the origin serves the records blaze itself
 publishes (the toolchain's crates: std, core, alloc, per platform and toolchain, written by CI). A project's own
 records are not shared between machines. Built after `check` runs on the new engine.
 
@@ -568,23 +569,23 @@ form change moves the producer. The `FORMATS` chain in home.rs `tool` goes.
 | `Test` | the runner and its wire: [blaze-run] |
 | the toolchain's records | not a stage: they are `CrateScope` (and its shapes) records of public crates, keyed by that stage; the pinned toolchain is in their source by its files' content ids, and in `stage` by blaze-toolchain's `PINNED` file |
 
-**(a) Today, cargo builds blaze.** `stage(kind)` is a digest of source text, computed before
-cargo runs by a build-time script (tools/stage-ids, piece 2), never by blaze at run time: over
-the cargo closure of the kind's root packages (normal and build dependencies, every platform,
-from `cargo metadata --locked --offline`, the only cargo run, at build time), each workspace or
+**(a) Before the new layer has code ids.** `stage(kind)` is a digest of source text, computed
+before the build by a build-time script (tools/stage-ids, piece 2), never by blaze at run time:
+over the closure of the kind's root packages (normal and build dependencies, every platform, from
+the lock and manifests by blaze-unit-graph), each workspace or
 vendored package by every regular file under its directory sorted by relative path (target/
 and nested packages excluded), each registry package by (name, version, source, checksum), plus
-the toolchain pin cargo builds blaze with. `drive` is the same over blaze-drive. The ids reach
+the toolchain pin. `drive` is the same over blaze-drive. The ids reach
 the binary through one compile-time variable, `BLAZE_STAGE_IDS`, read by `option_env!` in a new
-tiny crate (piece 3); rustc records the variable in dep-info, so cargo rebuilds that crate when
+tiny crate (piece 3); the variable is in that crate's key, so the build remakes it when
 it moves. `bits` are `cfg!(debug_assertions)` and `cfg!(overflow_checks)` in that crate.
 
-A build without the variable (plain `cargo build` in the shared directory) is UNSTAMPED: every
+A build without the variable is UNSTAMPED: every
 producer is `H(build id, kind)`, as today, and the profile says `identity: whole binary
 (unstamped)`. This is chosen at compile time, never at run time on a failure, so it is a mode,
 not a fallback (rule 3). Only the build entry (piece 4) sets the variable, and it computes the
 ids from a SNAPSHOT it builds (rule 80), never from the directory thirty lanes write in: ids
-computed from the tree while a lane writes could describe text cargo did not compile.
+computed from the tree while a lane writes could describe text the build did not compile.
 
 Why the closure is complete: a file enters a crate only through an edit of a file already in
 it (`mod`, `#[path]`, `include_bytes!` are in the includer; a new dependency is in a
@@ -599,7 +600,7 @@ release, and the shared cache would hold one copy of the toolchain per release (
 **Hashing blaze's sources in const eval or at start:** tens of MB per build or per command
 (estimate), and a check at start compares to the disk now, not to what was compiled.
 
-**(b) When blaze builds blaze.** `stage(kind)` is `core::reflect::fn_info(root).code_id`, the
+**(b) With code ids on the new layer.** `stage(kind)` is `core::reflect::fn_info(root).code_id`, the
 behaviour identity (bottom.md section 3) of one root function per kind that calls both the stage's
 run and its record's decoder; `drive` the same over the envelope and read-list writers. The
 compiler computes it while compiling the binary, so it describes exactly the code linked, at
@@ -713,7 +714,7 @@ names and scopes across its rebuilds) and across builders of one commit; the flo
 | 9 | per-record last use | none (this doc, "Shared across worktrees": owed) | `used` log |
 | 10 | collection by producer, use and cap | compact.rs `compaction` (pack count, duplicate share); store.rs `merge` drops only duplicates | collector, helper, DST |
 | 11 | records equal across hosts, checked | not found by search | CI comparison of public records |
-| 12 | code ids on the new layer (world b) | bottom.md section 3's `fn_info(f).code_id` is the old layer's (hir-ty-identity) | port when blaze builds blaze |
+| 12 | code ids on the new layer (world b) | bottom.md section 3's `fn_info(f).code_id` is the old layer's (hir-ty-identity) | port to the new layer |
 
 ### 6. Pieces (one writer each, none compiles)
 
@@ -735,8 +736,8 @@ names and scopes across its rebuilds) and across builders of one commit; the flo
    id; home.rs `tool` deleted with a `.clippy.toml` ban; profile row `identity`. Test: `test
    tests::a_stamp_parses_into_one_producer_per_kind ... ok`. CROSS-CRATE (blaze-cli main.rs).
 4. **BUILD ENTRY** (after 2, 3). NEW tools/stage-ids/build.ts: sync the tree into a fixed slot
-   snapshot (unchanged files keep their mtimes, so cargo stays incremental), ids from the
-   snapshot, `cargo build` there with the variable; refuses when the variable is already set;
+   snapshot (unchanged files keep their mtimes, so the build stays incremental), ids from the
+   snapshot, `blaze build` there with the variable; refuses when the variable is already set;
    CI's release job and the install scripts call it. Test: one commit in two slots prints
    `build: ids equal across 2 slots`. Not: Rust.
 5. **TASK INTERFACE CRATE** (after 1). NEW crates/blaze-task: `Did`, `Made`, `held_str` and the
@@ -764,7 +765,7 @@ names and scopes across its rebuilds) and across builders of one commit; the flo
     store::collect_tests::a_collection_crashed_anywhere_keeps_live_records ... ok`, and one
     `the_collect_oracle_catches_<plant> ... ok` line for each of the three planted bugs. Not: the
     drive.
-11. **WORLD (b)** (when blaze builds blaze and the new layer has code ids). A root per kind, its
+11. **WORLD (b)** (when the new layer has code ids). A root per kind, its
     `fn_info(root).code_id` into `Producers`; delete 2 to 4. Test: each root's id equal for the
     three targets, and an edit of one reached function moves exactly its stages.
 
