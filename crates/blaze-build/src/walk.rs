@@ -5532,6 +5532,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let after = self.checked.adjusts.column::<2>()[self.adjust_rows(e).start + n];
         let gb = self.ground_ty(before).map_err(|error| Self::ty_err(e, error))?;
         let ga = self.ground_ty(after).map_err(|error| Self::ty_err(e, error))?;
+        if gb == ga {
+            return Ok(UnsizeEnds { from: gb, to: ga });
+        }
         let unsize_nested::UnsizeWalk { from, to, .. } = self.unsize_walk(e, gb, ga, None)?;
         Ok(UnsizeEnds { from, to })
     }
