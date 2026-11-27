@@ -33,7 +33,9 @@ use crate::store::Store;
 use crate::work::{Did, Made, held_str};
 
 const SUBJECT_DOMAIN: &str = "blaze-cli macro crate 1";
-const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 1";
+// "2": proc-macro module identity bumped to form 5 (`blaze proc-macro module 5`), invalidating
+// cached `MacroModule` task records that pointed at pre-v5 proc-macro modules.
+const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 2";
 const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";

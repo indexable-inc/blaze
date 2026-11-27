@@ -734,7 +734,8 @@ fn ensure_build_script_unit(
 
     let id = blaze_toolchain::PINNED;
     let mut identity = std::format!(
-        "blaze build-script module 3\nname {}\nversion {}\nfeatures {}\n",
+        "{}\nname {}\nversion {}\nfeatures {}\n",
+        script_unit::WASM_MODULE_HEADER,
         unit.name.as_str(),
         unit.version.as_str(),
         feats.join(","),
@@ -1316,6 +1317,65 @@ fn compile_unit_to_wasm64(
     Ok(result)
 }
 
+/// Whether any unit in `unit_order` needs the toolchain's `bstd` (`blaze-std`) crate on
+/// `wasm64-blaze-wasip1`: either via a blaze-edition implicit `std` (`StdIs::Bstd(_)`, which
+/// excludes `UnitKind::BuildScript | UnitKind::ProcMacro` per `blaze_unit_graph::implicit`), or
+/// because a unit or a resolved dependency target unit has package name `"blaze-std"` (never by a
+/// caller-chosen Cargo dependency rename alias `dep.name`).
+fn unit_closure_needs_bstd(graph: &UnitGraph<'_>, unit_order: &[UnitId]) -> bool {
+    unit_order.iter().any(|&uid| {
+        let Some(u) = graph.units.get(uid.index()) else {
+            return false;
+        };
+        matches!(implicit(u.edition, &u.kind).std, blaze_unit_graph::StdIs::Bstd(_))
+            || u.name.as_str() == "blaze-std"
+            || u.deps.iter().any(|dep| {
+                graph
+                    .units
+                    .get(dep.unit.index())
+                    .is_some_and(|du| du.name.as_str() == "blaze-std")
+            })
+    })
+}
+
+/// Marks the transitive `wasm64-blaze-wasip1` toolchain sysroot closure needed by a compile in
+/// `keep_tc`. Always starts from `core`, `alloc`, `std`, and `proc_macro`; only seeds `bstd`
+/// when `needs_bstd` is true so ordinary Rust build scripts and proc macros never pull in
+/// `blaze-std` (80+ crates including `sonic-rs`) into `Records` or `wasm64-sysroot-v1`.
+fn mark_wasm64_sysroot<'a>(
+    all_tc: &[blaze_toolchain::UnitRow<'_>],
+    sys: blaze_unit_graph::Sysroot,
+    needs_bstd: bool,
+    keep_tc: &mut [bool],
+    alloc: Alloc<'a>,
+) {
+    let mut tc_todo: AVec<'a, usize> = OwnVec::new_in(alloc);
+    for id in [sys.core.0, sys.alloc.0, sys.std.0, sys.proc_macro.0] {
+        if let Ok(idx) = usize::try_from(id) {
+            tc_todo.push(idx);
+        }
+    }
+    if needs_bstd
+        && let Ok(idx) = usize::try_from(sys.bstd.0)
+    {
+        tc_todo.push(idx);
+    }
+    while let Some(u) = tc_todo.pop() {
+        let Some(slot) = keep_tc.get_mut(u) else {
+            continue;
+        };
+        if *slot {
+            continue;
+        }
+        *slot = true;
+        if let Some(row) = all_tc.get(u)
+            && row.kind != TcUnitKind::ProcMacro
+        {
+            tc_todo.extend(row.deps().filter_map(|(_, d)| usize::try_from(d).ok()));
+        }
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "whole-program wasm64 compilation over arena-backed frames"
@@ -1357,30 +1417,9 @@ fn compile_unit_in<'a>(
         .ok_or_else(|| std::format!("toolchain {tc_id} has no units for `{WASM64_TARGET}`"))?
         .collect();
 
-    let needs_bstd = unit_order.iter().any(|&uid| {
-        let u = &graph.units[uid.index()];
-        u.edition.blaze.is_some()
-            || u.deps.iter().any(|d| d.name.as_str() == "bstd" || d.name.as_str() == "blaze_std")
-    });
+    let needs_bstd = unit_closure_needs_bstd(graph, unit_order);
     let mut keep_tc = std::vec![false; all_tc.len()];
-    let mut tc_todo = std::vec![
-        sys.core.0 as usize,
-        sys.alloc.0 as usize,
-        sys.std.0 as usize,
-        sys.proc_macro.0 as usize,
-    ];
-    if needs_bstd {
-        tc_todo.push(sys.bstd.0 as usize);
-    }
-    while let Some(u) = tc_todo.pop() {
-        if keep_tc[u] {
-            continue;
-        }
-        keep_tc[u] = true;
-        if all_tc[u].kind != TcUnitKind::ProcMacro {
-            tc_todo.extend(all_tc[u].deps().map(|(_, d)| d as usize));
-        }
-    }
+    mark_wasm64_sysroot(&all_tc, sys, needs_bstd, &mut keep_tc, alloc);
 
     let tc_cfg_owned: std::vec::Vec<(std::string::String, Option<std::string::String>)> = tc_view
         .cfg(WASM64_TARGET)
@@ -1526,7 +1565,6 @@ fn compile_unit_in<'a>(
     for (pos, &uid) in unit_order.iter().enumerate() {
         let u = &graph.units[uid.index()];
         let krate_idx = unit_base + pos;
-        let is_root = uid == root_unit;
         let (origin, prefix_str, seen_root) =
             if let Some((_, dir, _)) = members.iter().find(|(id, _, _)| *id == u.package) {
                 let pfx: &'a str = if dir.is_empty() {
@@ -1591,11 +1629,7 @@ fn compile_unit_in<'a>(
             deps.push(("proc_macro", pm_idx));
         }
 
-        let unit_implicit = if is_root && mode == CompileMode::BuildScript {
-            implicit(u.edition, &UnitKind::Lib).binary()
-        } else {
-            implicit(u.edition, &u.kind)
-        };
+        let unit_implicit = implicit(u.edition, &u.kind);
 
         // Workspace-independent deterministic crate key (Rule 25): never hashes host `UnitId(uid.0)`,
         // so compiling the same build script or proc-macro from any workspace emits byte-identical
@@ -2620,5 +2654,366 @@ mod wasm64_probe_table_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blaze_unit_graph::{Resolver, Text, UnitDep};
+
+    fn make_unit<'a>(
+        pkg: u32,
+        name: &str,
+        crate_name: &str,
+        kind: UnitKind<'a>,
+        edition_str: &str,
+        deps: &[(&str, u32)],
+        alloc: Alloc<'a>,
+    ) -> Unit<'a> {
+        let mut dep_vec = OwnVec::new_in(alloc);
+        for &(dep_name, target) in deps {
+            dep_vec.push(UnitDep {
+                name: Text::from_str_in(dep_name, alloc),
+                unit: UnitId(target),
+            });
+        }
+        Unit {
+            package: LockId(pkg),
+            name: Text::from_str_in(name, alloc),
+            version: Text::from_str_in("0.1.0", alloc),
+            kind,
+            for_host: true,
+            edition: edition::PackageEdition::of_manifest(edition_str).expect("valid edition"),
+            crate_name: Text::from_str_in(crate_name, alloc),
+            root: Text::from_str_in("build.rs", alloc),
+            features: OwnVec::new_in(alloc),
+            cfg: OwnVec::new_in(alloc),
+            deps: dep_vec,
+            build_script: None,
+            links: None,
+        }
+    }
+
+    fn make_graph<'a>(units: std::vec::Vec<Unit<'a>>, alloc: Alloc<'a>) -> UnitGraph<'a> {
+        let mut all = OwnVec::with_capacity_in(units.len(), alloc);
+        for u in units {
+            all.push(u);
+        }
+        UnitGraph {
+            units: all,
+            resolver: Resolver::V3,
+            meta: OwnVec::new_in(alloc),
+            left_out: OwnVec::new_in(alloc),
+        }
+    }
+
+    #[test]
+    fn wasm64_unit_closure_needs_bstd_only_when_referenced() {
+        let frame = Frame::with_reserve(4 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        // Standard Rust build script + Rust lib dep -> false.
+        let g_bs = make_graph(
+            std::vec![
+                make_unit(0, "ring", "build_script_build", UnitKind::BuildScript, "2024", &[("cc", 1)], a),
+                make_unit(1, "cc", "cc", UnitKind::Lib, "2021", &[], a),
+            ],
+            a,
+        );
+        assert!(!unit_closure_needs_bstd(&g_bs, &[UnitId(0), UnitId(1)]));
+
+        // Standard Rust proc macro + Rust lib dep -> false.
+        let g_pm = make_graph(
+            std::vec![
+                make_unit(0, "serde_derive", "serde_derive", UnitKind::ProcMacro, "2021", &[("syn", 1)], a),
+                make_unit(1, "syn", "syn", UnitKind::Lib, "2021", &[], a),
+            ],
+            a,
+        );
+        assert!(!unit_closure_needs_bstd(&g_pm, &[UnitId(0), UnitId(1)]));
+
+        // Blaze-edition package's own BuildScript / ProcMacro are Rust units -> false.
+        let g_blaze_host = make_graph(
+            std::vec![
+                make_unit(0, "blaze_pkg", "build_script_build", UnitKind::BuildScript, "blaze-2026.11", &[], a),
+                make_unit(1, "blaze_pm", "blaze_pm", UnitKind::ProcMacro, "blaze-2026.11", &[], a),
+            ],
+            a,
+        );
+        assert!(!unit_closure_needs_bstd(&g_blaze_host, &[UnitId(0)]));
+        assert!(!unit_closure_needs_bstd(&g_blaze_host, &[UnitId(1)]));
+
+        // Build script with a blaze-edition Lib dependency -> true.
+        let g_blaze_lib = make_graph(
+            std::vec![
+                make_unit(0, "app", "build_script_build", UnitKind::BuildScript, "2024", &[("helper", 1)], a),
+                make_unit(1, "helper", "helper", UnitKind::Lib, "blaze-2026.11", &[], a),
+            ],
+            a,
+        );
+        assert!(unit_closure_needs_bstd(&g_blaze_lib, &[UnitId(0), UnitId(1)]));
+
+        // Negative control: renaming an unrelated crate (`package = "my-helper"`) to `dep.name = "bstd"`
+        // or `"blaze_std"` must NOT pull in the toolchain's `bstd`.
+        let g_alias_bstd = make_graph(
+            std::vec![
+                make_unit(0, "app", "build_script_build", UnitKind::BuildScript, "2024", &[("bstd", 1), ("blaze_std", 2)], a),
+                make_unit(1, "my-helper", "my_helper", UnitKind::Lib, "2024", &[], a),
+                make_unit(2, "other-helper", "other_helper", UnitKind::Lib, "2024", &[], a),
+            ],
+            a,
+        );
+        assert!(!unit_closure_needs_bstd(&g_alias_bstd, &[UnitId(0), UnitId(1), UnitId(2)]));
+
+        // Resolved dependency whose target package is `"blaze-std"` (even under a renamed alias) -> true.
+        let g_dep_blaze_std = make_graph(
+            std::vec![
+                make_unit(0, "app", "build_script_build", UnitKind::BuildScript, "2024", &[("my_alias", 1)], a),
+                make_unit(1, "blaze-std", "bstd", UnitKind::Lib, "2024", &[], a),
+            ],
+            a,
+        );
+        assert!(unit_closure_needs_bstd(&g_dep_blaze_std, &[UnitId(0)]));
+        assert!(unit_closure_needs_bstd(&g_dep_blaze_std, &[UnitId(0), UnitId(1)]));
+
+        // Unit whose package name is `"blaze-std"` -> true; unrelated package with `crate_name = "bstd"` -> false.
+        let g_named = make_graph(
+            std::vec![
+                make_unit(0, "blaze-std", "bstd", UnitKind::Lib, "2024", &[], a),
+                make_unit(1, "unrelated-bstd", "bstd", UnitKind::Lib, "2024", &[], a),
+            ],
+            a,
+        );
+        assert!(unit_closure_needs_bstd(&g_named, &[UnitId(0)]));
+        assert!(!unit_closure_needs_bstd(&g_named, &[UnitId(1)]));
+    }
+
+    #[test]
+    fn wasm64_sysroot_mark_excludes_bstd_and_transitive_deps_hermetic() {
+        use blaze_toolchain::implied::ImplicitSysroot;
+        use blaze_toolchain::record::{CrateIn, TargetIn, UnitIn, write};
+
+        let frame = Frame::with_reserve(4 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        let mk_crate = |name: &'static str, role: Role| CrateIn {
+            name,
+            version: "0.0.0",
+            edition: "2024",
+            lib: name,
+            root: "src/lib.rs",
+            dir: "",
+            role,
+            pack_kind: 3,
+            pack_len: 0,
+            pack: [0; 32],
+        };
+        let crates = [
+            mk_crate("core", Role::Core),
+            mk_crate("alloc", Role::Alloc),
+            mk_crate("compiler_builtins", Role::Library),
+            mk_crate("std", Role::Std),
+            mk_crate("proc_macro", Role::ProcMacro),
+            mk_crate("sonic_rs", Role::Registry),
+            mk_crate("ref_cast_impl", Role::Registry),
+            mk_crate("blaze_data", Role::Blaze),
+            mk_crate("bstd", Role::Bstd),
+        ];
+        let units = [
+            UnitIn { krate: 0, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[], sysroot: ImplicitSysroot::None },
+            UnitIn { krate: 1, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0)], sysroot: ImplicitSysroot::Core },
+            UnitIn { krate: 2, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0)], sysroot: ImplicitSysroot::Core },
+            UnitIn { krate: 3, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0), ("alloc", 1), ("compiler_builtins", 2)], sysroot: ImplicitSysroot::Core },
+            UnitIn { krate: 4, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0), ("std", 3)], sysroot: ImplicitSysroot::Std },
+            UnitIn { krate: 5, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0), ("std", 3), ("ref_cast_impl", 6)], sysroot: ImplicitSysroot::Std },
+            UnitIn { krate: 6, kind: TcUnitKind::ProcMacro, for_host: true, root: "src/lib.rs", features: &[], deps: &[], sysroot: ImplicitSysroot::Std },
+            UnitIn { krate: 7, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0), ("std", 3), ("sonic_rs", 5)], sysroot: ImplicitSysroot::Std },
+            UnitIn { krate: 8, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0), ("alloc", 1), ("std", 3), ("blaze_data", 7)], sysroot: ImplicitSysroot::Std },
+        ];
+        let targets = [TargetIn { triple: WASM64_TARGET, units: &units, cfg: &[] }];
+        let bytes = write(&crates, &targets, a).expect("encode synthetic toolchain");
+        let tc_id = ToolchainView::id_of_bytes(bytes.as_slice());
+        let tc_view = ToolchainView::open(bytes.as_slice(), tc_id).expect("open synthetic view");
+        let sys = blaze_toolchain::sysroot(&tc_view, WASM64_TARGET, false).expect("synthetic sysroot");
+        let all_tc: std::vec::Vec<_> = tc_view.units(WASM64_TARGET).expect("synthetic units").collect();
+
+        let kept_names = |needs_bstd: bool| -> std::vec::Vec<&str> {
+            let mut keep = std::vec![false; all_tc.len()];
+            mark_wasm64_sysroot(&all_tc, sys, needs_bstd, &mut keep, a);
+            let mut names: std::vec::Vec<&str> = all_tc
+                .iter()
+                .enumerate()
+                .filter(|(u, row)| keep[*u] && (row.kind == TcUnitKind::ProcMacro || (row.kind == TcUnitKind::Lib && !row.for_host)))
+                .map(|(_, row)| tc_view.krate(row.krate).lib)
+                .collect();
+            names.sort_unstable();
+            names
+        };
+
+        assert_eq!(
+            kept_names(false),
+            ["alloc", "compiler_builtins", "core", "proc_macro", "std"],
+            "needs_bstd=false must keep only core/alloc/std/proc_macro closure and exclude bstd/blaze_data/sonic_rs/ref_cast_impl"
+        );
+        assert_eq!(
+            kept_names(true),
+            ["alloc", "blaze_data", "bstd", "compiler_builtins", "core", "proc_macro", "ref_cast_impl", "sonic_rs", "std"],
+            "needs_bstd=true must include bstd and its transitive closure"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs installed pinned toolchain under $HOME/.blaze/v2/toolchain"]
+    fn wasm64_sysroot_closure_excludes_bstd_and_sonic_rs_without_needs_bstd() {
+        let home = std::env::var("HOME").expect("HOME must be set for installed toolchain test");
+        let shelf_dir = PathBuf::from(home).join(".blaze/v2/toolchain");
+        let tc_id = blaze_toolchain::PINNED;
+        assert!(
+            shelf_dir.join(tc_id.to_string()).exists(),
+            "pinned toolchain {tc_id} missing under {}",
+            shelf_dir.display()
+        );
+        let mut shelf = DirShelf::new(shelf_dir.to_string_lossy().into_owned());
+        let manifest_file = blaze_toolchain::shelf::open_manifest(&mut shelf, tc_id).expect("open manifest");
+        let tc_view = ToolchainView::open(manifest_file.as_ref(), tc_id).expect("open view");
+        let sys = blaze_toolchain::sysroot(&tc_view, WASM64_TARGET, false).expect("wasm64 sysroot");
+        let all_tc: std::vec::Vec<_> = tc_view.units(WASM64_TARGET).expect("wasm64 units").collect();
+
+        let frame = Frame::with_reserve(4 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        let kept_names = |needs_bstd: bool| -> std::vec::Vec<std::string::String> {
+            let mut keep = std::vec![false; all_tc.len()];
+            mark_wasm64_sysroot(&all_tc, sys, needs_bstd, &mut keep, a);
+            all_tc
+                .iter()
+                .enumerate()
+                .filter(|(u, row)| keep[*u] && (row.kind == TcUnitKind::ProcMacro || (row.kind == TcUnitKind::Lib && !row.for_host)))
+                .map(|(_, row)| tc_view.krate(row.krate).lib.to_owned())
+                .collect()
+        };
+
+        let rust_only = kept_names(false);
+        let with_bstd = kept_names(true);
+
+        for required in ["core", "alloc", "std", "proc_macro"] {
+            assert!(
+                rust_only.iter().any(|n| n == required),
+                "minimal wasm64 sysroot must contain `{required}`, got {rust_only:?}"
+            );
+        }
+        for forbidden in ["bstd", "blaze_std", "blaze_data", "sonic_rs"] {
+            assert!(
+                !rust_only.iter().any(|n| n == forbidden),
+                "minimal wasm64 sysroot must NOT contain `{forbidden}`, got {rust_only:?}"
+            );
+        }
+        assert!(
+            with_bstd.len() > rust_only.len() + 30,
+            "expected bstd closure ({}) to be much larger than minimal Rust sysroot ({})",
+            with_bstd.len(),
+            rust_only.len()
+        );
+        assert!(
+            with_bstd.iter().any(|n| n == "bstd" || n == "blaze_std"),
+            "with_bstd closure should contain bstd/blaze_std, got {with_bstd:?}"
+        );
+        eprintln!(
+            "wasm64 sysroot counts: minimal_rust={} ({:?}), with_bstd={}",
+            rust_only.len(),
+            rust_only,
+            with_bstd.len()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs installed pinned toolchain under $HOME/.blaze/v2/toolchain"]
+    fn wasm64_compile_build_script_with_real_toolchain_excludes_bstd_and_emits_valid_wasm64() {
+        let home = std::env::var("HOME").expect("HOME must be set for installed toolchain test");
+        let real_shelf = PathBuf::from(home).join(".blaze/v2/toolchain");
+        let tc_id = blaze_toolchain::PINNED;
+        assert!(
+            real_shelf.join(tc_id.to_string()).exists(),
+            "pinned toolchain {tc_id} missing under {}",
+            real_shelf.display()
+        );
+
+        let tmp = std::env::temp_dir().join(std::format!(
+            "blaze-wasm64-no-ambient-bstd-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let checkout_dir = tmp.join("checkout");
+        let store_dir = tmp.join("store");
+        std::fs::create_dir_all(&checkout_dir).expect("checkout dir");
+        std::fs::create_dir_all(&store_dir).expect("store dir");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_shelf, store_dir.join("toolchain")).expect("symlink toolchain");
+        std::fs::write(
+            checkout_dir.join("build.rs"),
+            "fn main() {\n    println!(\"cargo:rustc-cfg=no_ambient_bstd_ok\");\n}\n",
+        )
+        .expect("write build.rs");
+
+        let frame = Frame::with_reserve(16 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        let lock_text = "version = 4\n\n[[package]]\nname = \"demo\"\nversion = \"0.1.0\"\n";
+        let lock = Lock::read(lock_text.as_bytes(), a).expect("parse lock");
+        let graph = make_graph(
+            std::vec![make_unit(
+                0,
+                "demo",
+                "build_script_build",
+                UnitKind::BuildScript,
+                "2024",
+                &[],
+                a,
+            )],
+            a,
+        );
+        let checkout = blaze_proc_macro::script_sandbox::RealRoot::of_start(
+            &checkout_dir,
+            blaze_own::planted::NoPlant,
+        )
+        .expect("open checkout");
+        let members = [(LockId(0), "", blaze_world::PathKind::Member)];
+        let heap = blaze_own::testing::heap();
+
+        let compiled = compile_unit_to_wasm64(
+            &store_dir,
+            &graph,
+            &lock,
+            &checkout,
+            &members,
+            heap,
+            UnitId(0),
+            CompileMode::BuildScript,
+            0,
+        )
+        .expect("build.rs compiles cleanly to wasm64 without bstd");
+
+        let checked = check_wasm64(&compiled.wasm).expect("valid wasm64");
+        assert!(checked.memory64, "emitted module must use memory64");
+
+        // Verify the persisted sysroot cache contains ONLY the minimal Rust sysroot closure
+        // (never bstd / sonic-rs).
+        let sysroot_dir = store_dir.join("wasm64-sysroot-v1").join(tc_id.to_string());
+        let cached_count = std::fs::read_dir(&sysroot_dir)
+            .expect("read wasm64-sysroot-v1")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .count();
+        assert!(
+            (4..30).contains(&cached_count),
+            "expected minimal Rust sysroot cache (~15 crates, zero bstd/sonic-rs), got {cached_count}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

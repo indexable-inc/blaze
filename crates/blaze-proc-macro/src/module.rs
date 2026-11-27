@@ -230,6 +230,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&blaze_sha256::digest(bytes))
 }
 
+/// Current proc-macro module identity header (`blaze proc-macro module 5`): bumped when
+/// proc-macro compilation semantics or sysroot closure change (form 5: minimal Rust sysroot
+/// without ambient `bstd` unless referenced) so stale form-4 modules map to a distinct key.
+pub const MODULE_HEADER: &str = "blaze proc-macro module 5";
+
 /// The crate's identity as text: what the module key is the digest of.
 pub fn identity(id: &CrateId<'_>) -> String {
     let mut features: Vec<&str> = id.features.to_vec();
@@ -250,13 +255,9 @@ pub fn identity(id: &CrateId<'_>) -> String {
         // the module emits UB checks (`-Zub-checks=no`); the macro crate and its dependencies
         // keep `cfg(debug_assertions)`. Form 3's std carried both into every call. The builder
         // (scripts proc_macro_modules.rs) writes the same text.
-        // History (2026-11-20): form 4 was first admitted at 21:20 before any module store held
-        // it, and every macro of tempo then had "no compiled module in the store" (5,688 errors
-        // on the acceptance project); the reader was held at form 3 until the store was rebuilt
-        // (81 modules, notes port27/tempo-deps/module-store-f4, 22:00) and measured on tempo at
-        // 22:55 (Names 28.3 s to 23.5 s wall, 69.5 s to 54.7 s cpu; the same 14,623 bodies
-        // checked). A form of this text moves only together with a store that holds it.
-        "blaze proc-macro module 4\nname {}\nversion {}\n{source}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
+        // Form 5 (2026-11-27): wasm64 self-compilation no longer pulls ambient `bstd` (and its
+        // transitive closure) into proc-macro sysroot records unless the unit closure references it.
+        "{MODULE_HEADER}\nname {}\nversion {}\n{source}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
         id.name,
         id.version,
         id.deps,
@@ -458,3 +459,55 @@ pub fn read_module_by_key(store: &Path, key: String, name: &str, version: &str) 
 #[cfg(test)]
 #[path = "module_lock_tests.rs"]
 mod lock_tests;
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn proc_macro_module_identity_uses_form_5_and_misses_stale_form_4_store_entry() {
+        let id = CrateId {
+            name: "demo_derive",
+            version: "0.1.0",
+            source: Source::Registry { checksum: "a0" },
+            deps: "deps-hash",
+            features: &["default"],
+        };
+        let v5_identity = identity(&id);
+        assert_eq!(v5_identity.lines().next(), Some(MODULE_HEADER));
+        let v4_identity = v5_identity.replacen(MODULE_HEADER, "blaze proc-macro module 4", 1);
+        let v4_key = sha256_hex(v4_identity.as_bytes());
+        let v5_key = module_key(&id);
+        assert_ne!(v4_key, v5_key, "form 5 key must differ from stale form 4 key");
+
+        let store = std::env::temp_dir().join(format!("blaze-pm-module-v5-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let v4_dir = store.join("proc-macro/modules").join(&v4_key);
+        std::fs::create_dir_all(&v4_dir).expect("create v4 dir");
+        std::fs::write(v4_dir.join("identity"), &v4_identity).expect("write v4 identity");
+        std::fs::write(v4_dir.join("wasm-sha256"), "deadbeef\n").expect("write v4 digest");
+        std::fs::write(v4_dir.join("macros"), "0 derive Demo\n").expect("write v4 macros");
+        std::fs::write(v4_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write v4 decls");
+
+        // Lookup by current form 5 misses the stale form 4 directory cleanly.
+        assert!(matches!(find_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v5_key));
+        assert!(matches!(read_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v5_key));
+
+        // Publishing form 5 alongside stale form 4 resolves uniquely to form 5.
+        let v5_dir = store.join("proc-macro/modules").join(&v5_key);
+        std::fs::create_dir_all(&v5_dir).expect("create v5 dir");
+        std::fs::write(v5_dir.join("identity"), &v5_identity).expect("write v5 identity");
+        std::fs::write(v5_dir.join("wasm-sha256"), "cafebabe\n").expect("write v5 digest");
+        std::fs::write(v5_dir.join("macros"), "0 derive Demo\n").expect("write v5 macros");
+        std::fs::write(v5_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write v5 decls");
+
+        let (found_key, digest) = find_module(&store, &id).expect("find v5 module");
+        assert_eq!(found_key, v5_key);
+        assert_eq!(digest, "cafebabe");
+        let rec = read_module(&store, &id).expect("read v5 module");
+        assert_eq!(rec.key, v5_key);
+        assert_eq!(rec.wasm_sha256, "cafebabe");
+
+        let _ = std::fs::remove_dir_all(&store);
+    }
+}

@@ -32,7 +32,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1327
+blaze-cli	1322
 blaze-cli-spec	117
 blaze-code	94
 blaze-columns	193
@@ -89,7 +89,7 @@ blaze-lex	63
 blaze-lint	273
 blaze-lint-defs	109
 blaze-lir	1414
-blaze-lower	325
+blaze-lower	323
 blaze-macro-run	4
 blaze-malloc	65
 blaze-manifest	150
