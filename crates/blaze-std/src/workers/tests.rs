@@ -450,26 +450,25 @@ impl fmt::Display for LeaseBroken {
 }
 
 blaze_sim::plants! {
-    /// Planted bugs in the multi-word caller lease bitmap, each caught by its oracle invariant.
+    /// Planted bugs in the lock-free caller free-list stack, each caught by its oracle invariant.
     enum LeasePlant breaks LeaseBroken {
-        /// The multi-word lease bitmap as shipped.
+        /// The lock-free caller free list as shipped.
         None,
-        /// Final-word mask and capacity check are skipped: hands out bits past `Limits::callers`.
-        FinalMaskSkipped => LeaseBroken::OutOfBounds { .. } | LeaseBroken::MissedBound { .. },
-        /// Dropping a lease clears word 0 instead of its own word: duplicates a live word-0 ID or
-        /// leaks the higher-word bit.
-        DropWrongWord => LeaseBroken::Duplicate { .. } | LeaseBroken::SpuriousFull { .. },
-        /// Dropping a lease forgets to clear its bitmap bit: leaks slots until `SpuriousFull`.
-        BitLeaked => LeaseBroken::SpuriousFull { .. },
+        /// Ignores the empty-list sentinel and hands out an out-of-bounds index past `Limits::callers`.
+        BoundOffByOne => LeaseBroken::OutOfBounds { .. } | LeaseBroken::MissedBound { .. },
+        /// Returns the head index without popping `caller_head`, duplicating a live caller ID.
+        FreeListSkipsPop => LeaseBroken::Duplicate { .. },
+        /// Drops a lease without pushing its index back onto `caller_head`, leaking the slot.
+        DropLeaksSlot => LeaseBroken::SpuriousFull { .. },
     }
 }
 
 fn to_workers_plant(plant: LeasePlant) -> WorkersPlant {
     match plant {
         LeasePlant::None => WorkersPlant::None,
-        LeasePlant::FinalMaskSkipped => WorkersPlant::CallerFinalMaskSkipped,
-        LeasePlant::DropWrongWord => WorkersPlant::CallerDropWrongWord,
-        LeasePlant::BitLeaked => WorkersPlant::CallerBitLeaked,
+        LeasePlant::BoundOffByOne => WorkersPlant::CallerBoundOffByOne,
+        LeasePlant::FreeListSkipsPop => WorkersPlant::CallerFreeListSkipsPop,
+        LeasePlant::DropLeaksSlot => WorkersPlant::CallerDropLeaksSlot,
     }
 }
 
@@ -653,7 +652,7 @@ fn run_concurrent_lease_contention(seed: u64, callers: u32, plant: LeasePlant) -
                         let lease = held.swap_remove(pick);
                         let slot = usize::try_from(lease.id().index() - FIRST).unwrap();
                         // Release oracle slot before dropping lease (synchronized by Lease::drop's
-                        // lock release -> next lease's lock acquire).
+                        // Release CAS push -> next lease's Acquire/AcqRel CAS pop).
                         oracle[slot].store(false, Ordering::Release);
                         drop(lease);
                     }
@@ -799,9 +798,9 @@ fn concurrent_multiword_leases_never_duplicate_leak_or_spuriously_exhaust() {
 #[test]
 fn concurrent_multiword_lease_harness_catches_every_planted_bug() {
     for &(plant, callers) in &[
-        (LeasePlant::FinalMaskSkipped, 65u32),
-        (LeasePlant::DropWrongWord, 130u32),
-        (LeasePlant::BitLeaked, 130u32),
+        (LeasePlant::BoundOffByOne, 65u32),
+        (LeasePlant::FreeListSkipsPop, 130u32),
+        (LeasePlant::DropLeaksSlot, 130u32),
     ] {
         let caught = (1u64..=8).any(|seed| run_concurrent_lease_contention(seed, callers, plant).is_err());
         assert!(caught, "concurrent harness failed to catch planted bug {plant:?}");
