@@ -362,15 +362,13 @@ fn path_of(v: &View<'_>, t: lf::TypeId) -> Result<PathIdx, Why> {
 /// dropped; `None` for what is no such literal.
 pub fn int_value(text: &str) -> Option<u128> {
     let text = text.trim().trim_start_matches('-').trim();
-    if let Some(quoted) = text.strip_prefix("b'").or_else(|| text.strip_prefix('\'')) {
+    if let Some(quoted) = text.strip_prefix("b'") {
         let inner = quoted.strip_suffix('\'')?;
-        let mut out = Vec::new_in(Global);
-        unescape(inner, &mut out)?;
-        if text.starts_with('b') {
-            return out.first().map(|&b| u128::from(b));
-        }
-        let c = core::str::from_utf8(&out).ok()?.chars().next()?;
-        return Some(u128::from(u32::from(c)));
+        return parser::unescape::unescape_byte(inner).ok().map(u128::from);
+    }
+    if let Some(quoted) = text.strip_prefix('\'') {
+        let inner = quoted.strip_suffix('\'')?;
+        return parser::unescape::unescape_char(inner).ok().map(|c| u128::from(u32::from(c)));
     }
     const SUFFIXES: [&str; 12] = ["i128", "isize", "i16", "i32", "i64", "i8", "u128", "usize", "u16", "u32", "u64", "u8"];
     let (radix, digits) = match text.get(..2) {
@@ -398,67 +396,86 @@ pub fn int_value(text: &str) -> Option<u128> {
     any.then_some(value)
 }
 
-/// A quoted literal's contents unescaped into `out`; `None` for an escape outside the subset.
-fn unescape(inner: &str, out: &mut Vec<u8, Global>) -> Option<()> {
-    let mut chars = inner.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            let mut buf = [0u8; 4];
-            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            continue;
-        }
-        match chars.next()? {
-            'n' => out.push(b'\n'),
-            'r' => out.push(b'\r'),
-            't' => out.push(b'\t'),
-            '0' => out.push(0),
-            '\\' => out.push(b'\\'),
-            '\'' => out.push(b'\''),
-            '"' => out.push(b'"'),
-            'x' => {
-                let hi = chars.next()?.to_digit(16)?;
-                let lo = chars.next()?.to_digit(16)?;
-                out.push((hi * 16 + lo) as u8);
-            }
-            // `\u{7FFF}`: up to six hex digits (underscores allowed), a scalar value, as UTF-8.
-            'u' => {
-                if chars.next()? != '{' {
-                    return None;
-                }
-                let mut v = 0u32;
-                loop {
-                    match chars.next()? {
-                        '}' => break,
-                        '_' => {}
-                        d => v = v.checked_mul(16)?.checked_add(d.to_digit(16)?)?,
-                    }
-                }
-                let mut buf = [0u8; 4];
-                out.extend_from_slice(char::from_u32(v)?.encode_utf8(&mut buf).as_bytes());
-            }
-            '\n' => {
-                while chars.peek().is_some_and(|c| c.is_whitespace()) {
-                    chars.next();
-                }
-            }
-            _ => return None,
-        }
+/// Strips the `#` delimiters and enclosing quotes from the text after `r` in a raw literal
+/// (`"a"`, `#"a"#`, `##"a"##`).
+fn strip_raw_quotes(raw: &str) -> Option<&str> {
+    let hashes = raw.bytes().take_while(|&b| b == b'#').count();
+    let tail = raw.len().checked_sub(hashes)?;
+    if !raw.as_bytes().get(tail..)?.iter().all(|&b| b == b'#') {
+        return None;
     }
-    Some(())
+    raw.get(hashes..tail)?.strip_prefix('"')?.strip_suffix('"')
 }
 
-/// The bytes of a string or byte string literal's text (`"a\n"`, `b"a"`, `r#"a"#`).
+/// The bytes of a string, byte string or C string literal's text (`"a\n"`, `b"a"`, `r#"a"#`,
+/// `br#"a"#`, `c"a"`, `cr#"a"#`), without a C string's trailing NUL.
+///
+/// Decodes via `parser::unescape` (rustc's exact rules): `\<LF>` and `\<CR><LF>` line
+/// continuations, `<CR><LF>` normalized to `<LF>` in quoted and raw literals, bare `<CR>` and
+/// invalid escapes refused; continuation whitespace warnings are not fatal.
 pub(crate) fn string_bytes(text: &str) -> Option<Vec<u8, Global>> {
-    let t = text.strip_prefix('b').unwrap_or(text);
-    let mut out = Vec::new_in(Global);
-    if let Some(raw) = t.strip_prefix('r') {
-        let hashes = raw.len() - raw.trim_start_matches('#').len();
-        let inner = raw.get(hashes + 1..raw.len().checked_sub(hashes + 1)?)?;
-        out.extend_from_slice(inner.as_bytes());
-        return Some(out);
+    use parser::unescape::{
+        MixedUnit, check_raw_byte_str, check_raw_c_str, check_raw_str, unescape_byte_str,
+        unescape_c_str, unescape_str,
+    };
+
+    fn push_char<A: core::alloc::Allocator>(out: &mut Vec<u8, A>, c: char) {
+        let mut buf = [0u8; 4];
+        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
     }
-    unescape(t.strip_prefix('"')?.strip_suffix('"')?, &mut out)?;
-    Some(out)
+
+    enum Kind {
+        Str,
+        Byte,
+        C,
+    }
+    let (kind, rest) = if let Some(r) = text.strip_prefix('b') {
+        (Kind::Byte, r)
+    } else if let Some(r) = text.strip_prefix('c') {
+        (Kind::C, r)
+    } else {
+        (Kind::Str, text)
+    };
+    let mut out = Vec::new_in(Global);
+    let mut ok = true;
+    if let Some(raw) = rest.strip_prefix('r') {
+        let inner = strip_raw_quotes(raw)?;
+        match kind {
+            Kind::Str => check_raw_str(inner, |_, unit| match unit {
+                Ok(c) => push_char(&mut out, c),
+                Err(_) => ok = false,
+            }),
+            Kind::Byte => check_raw_byte_str(inner, |_, unit| match unit {
+                Ok(b) => out.push(b),
+                Err(_) => ok = false,
+            }),
+            Kind::C => check_raw_c_str(inner, |_, unit| match unit {
+                Ok(c) => push_char(&mut out, c.get()),
+                Err(_) => ok = false,
+            }),
+        }
+        return ok.then_some(out);
+    }
+    let inner = rest.strip_prefix('"')?.strip_suffix('"')?;
+    match kind {
+        Kind::Str => unescape_str(inner, |_, unit| match unit {
+            Ok(c) => push_char(&mut out, c),
+            Err(e) if e.is_fatal() => ok = false,
+            Err(_) => {}
+        }),
+        Kind::Byte => unescape_byte_str(inner, |_, unit| match unit {
+            Ok(b) => out.push(b),
+            Err(e) if e.is_fatal() => ok = false,
+            Err(_) => {}
+        }),
+        Kind::C => unescape_c_str(inner, |_, unit| match unit {
+            Ok(MixedUnit::Char(c)) => push_char(&mut out, c.get()),
+            Ok(MixedUnit::HighByte(b)) => out.push(b.get()),
+            Err(e) if e.is_fatal() => ok = false,
+            Err(_) => {}
+        }),
+    }
+    ok.then_some(out)
 }
 
 impl Names {
@@ -2919,7 +2936,7 @@ impl World for FrontWorld<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use super::int_value;
+    use super::{int_value, string_bytes};
 
     #[test]
     fn literal_values() {
@@ -2929,8 +2946,79 @@ mod tests {
         assert_eq!(int_value("1_000i64"), Some(1000));
         assert_eq!(int_value("b'*'"), Some(42));
         assert_eq!(int_value("b'\\n'"), Some(10));
+        assert_eq!(int_value("b'\\x80'"), Some(0x80));
+        assert_eq!(int_value("'\\u{1F600}'"), Some(0x1F600));
         assert_eq!(int_value("- 7"), Some(7));
         assert_eq!(int_value("x"), None);
+        assert_eq!(int_value("'\\x80'"), None);
+        assert_eq!(int_value("b'\\u{41}'"), None);
+        assert_eq!(int_value("'ab'"), None);
+        assert_eq!(int_value("''"), None);
+    }
+
+    #[test]
+    fn string_bytes_continuations_crlf_and_escapes() {
+        let sb = |s| string_bytes(s).map(|v| v.to_vec());
+
+        // Exact vcpkg-0.2.15 `find_vcpkg_root` pattern (`\<CR><LF>` + indentation).
+        let vcpkg = "\"No vcpkg installation found. Set the VCPKG_ROOT environment \\\r\n             variable or run 'vcpkg integrate install'\"";
+        assert_eq!(
+            sb(vcpkg).as_deref(),
+            Some(b"No vcpkg installation found. Set the VCPKG_ROOT environment variable or run 'vcpkg integrate install'".as_slice())
+        );
+
+        // LF and CRLF continuations with spaces, tabs, and multiple blank lines (warnings are not fatal).
+        assert_eq!(sb("\"a\\\n   \t b\"").as_deref(), Some(b"ab".as_slice()));
+        assert_eq!(sb("\"a\\\n\n   b\"").as_deref(), Some(b"ab".as_slice()));
+        assert_eq!(sb("\"a\\\r\n\r\n\t b\"").as_deref(), Some(b"ab".as_slice()));
+        assert_eq!(sb("b\"a\\\r\n   b\"").as_deref(), Some(b"ab".as_slice()));
+        assert_eq!(sb("c\"a\\\r\n   b\"").as_deref(), Some(b"ab".as_slice()));
+
+        // CRLF normalization (`\r\n` -> `\n`) across all 6 string literal kinds.
+        assert_eq!(sb("\"a\r\nb\"").as_deref(), Some(b"a\nb".as_slice()));
+        assert_eq!(sb("b\"a\r\nb\"").as_deref(), Some(b"a\nb".as_slice()));
+        assert_eq!(sb("r\"a\r\nb\"").as_deref(), Some(b"a\nb".as_slice()));
+        assert_eq!(sb("r#\"a\r\nb\"#").as_deref(), Some(b"a\nb".as_slice()));
+        assert_eq!(sb("br\"a\r\nb\"").as_deref(), Some(b"a\nb".as_slice()));
+        assert_eq!(sb("br#\"a\r\nb\"#").as_deref(), Some(b"a\nb".as_slice()));
+        assert_eq!(sb("c\"a\r\nb\"").as_deref(), Some(b"a\nb".as_slice()));
+        assert_eq!(sb("cr\"a\r\nb\"").as_deref(), Some(b"a\nb".as_slice()));
+        assert_eq!(sb("cr#\"a\r\nb\"#").as_deref(), Some(b"a\nb".as_slice()));
+
+        // Escaped `\r` stays `\r`, and `\x` / `\u` follow kind-specific Rust rules.
+        assert_eq!(sb("\"a\\rb\\x7f\\u{41}\\u{1_F600}\"").as_deref(), Some("a\rb\x7fA\u{1F600}".as_bytes()));
+        assert_eq!(sb("b\"\\x00\\x80\\xff\"").as_deref(), Some(b"\x00\x80\xff".as_slice()));
+        assert_eq!(sb("c\"\\x01\\x7f\\x80\\xff\\u{41}\"").as_deref(), Some(b"\x01\x7f\x80\xffA".as_slice()));
+
+        // Negative controls: invalid escapes, bare `\r`, out-of-range hex, bad unicode, NUL in CStr, non-ASCII in ByteStr.
+        assert_eq!(sb("\"\\q\""), None);
+        assert_eq!(sb("b\"\\q\""), None);
+        assert_eq!(sb("c\"\\q\""), None);
+        assert_eq!(sb("\"\\\""), None);
+        assert_eq!(sb("\"a\rb\""), None);
+        assert_eq!(sb("\"a\\\rb\""), None);
+        assert_eq!(sb("b\"a\rb\""), None);
+        assert_eq!(sb("c\"a\rb\""), None);
+        assert_eq!(sb("r\"a\rb\""), None);
+        assert_eq!(sb("r#\"a\rb\"#"), None);
+        assert_eq!(sb("br#\"a\rb\"#"), None);
+        assert_eq!(sb("cr#\"a\rb\"#"), None);
+        assert_eq!(sb("\"\\x80\""), None);
+        assert_eq!(sb("b\"\\u{41}\""), None);
+        assert_eq!(sb("b\"é\""), None);
+        assert_eq!(sb("br\"é\""), None);
+        assert_eq!(sb("c\"\\0\""), None);
+        assert_eq!(sb("c\"\\x00\""), None);
+        assert_eq!(sb("c\"\\u{0}\""), None);
+        assert_eq!(sb("cr\"a\0b\""), None);
+        assert_eq!(sb("\"\\u{}\""), None);
+        assert_eq!(sb("\"\\u{_41}\""), None);
+        assert_eq!(sb("\"\\u{0000001}\""), None);
+        assert_eq!(sb("\"\\u{D800}\""), None);
+        assert_eq!(sb("\"\\u{110000}\""), None);
+        assert_eq!(sb("r#\"a\"##"), None);
+        assert_eq!(sb("r##\"a\"#"), None);
+        assert_eq!(sb("rb\"a\""), None);
     }
 
     /// `repr(Rust)` is the default written out and sets nothing; core's `Unaligned` writes it
