@@ -109,7 +109,7 @@ mod macos_app {
     };
     use blaze_shell::blocks::{BlockBody, BlockId, BlockStore};
     use blaze_shell::editor::{CommandPalette, Editor, HistoryEntry, PaletteAction};
-    use blaze_shell::font::Fonts;
+    use blaze_shell::font::{FontBook, Metrics};
     use blaze_shell::host::{
         InteractiveSpawn, RustCellMeta, run_command_line, run_command_line_with_pid,
     };
@@ -134,7 +134,9 @@ mod macos_app {
         OutputNav, OutputVisualMode, Scene, TextFace, TextSelection, compute_text_selection,
         extract_visual_lines, output_nav_geometry, select_at_point,
     };
-    use blaze_shell::yazi::{YaziAction, YaziState, layout_yazi_pane, load_hover_preview};
+    use blaze_shell::yazi::{
+        YaziAction, YaziState, layout_yazi_pane, load_change_preview, load_hover_preview,
+    };
 
     const FONT_POINTS: f64 = 13.0;
     const MIN_FONT_POINTS: f64 = 8.5;
@@ -820,6 +822,8 @@ mod macos_app {
         /// Optional row-count override for the inline PTY box, adjusted with `Cmd+Opt+`/`-`/`0`
         /// while focused inside the inline alternate-screen terminal.
         pty_inline_rows_override: Option<u16>,
+        /// This pane's text size in points; `Cmd+=`/`Cmd+-`/`Cmd+0` change it for this pane only.
+        font_points: f64,
         /// `Some(origin)` when this pane exists only for one alternate-screen program moved here
         /// from pane `origin` (`[terminal] alt_screen = "pane"`): it is never moved again and it
         /// closes when the program exits, handing focus back to `origin`.
@@ -882,6 +886,7 @@ mod macos_app {
                 pty_fullscreen: false,
                 pty_focused: false,
                 pty_inline_rows_override: None,
+                font_points: FONT_POINTS,
                 dedicated_tui: None,
                 alt_screen_settled: None,
                 active_sysmon: None,
@@ -1869,8 +1874,7 @@ mod macos_app {
             .unwrap_or(0)
     }
 
-    fn grid_for(size: NSSize, fonts: &Fonts, scale: f64) -> (u16, u16) {
-        let m = fonts.metrics;
+    fn grid_for(size: NSSize, m: Metrics, scale: f64) -> (u16, u16) {
         // Account for horizontal padding + unified `TOP_BAR_H` so full-screen TUIs (`claude`, `vim`)
         // never clip below the bottom edge or collide with session tabs!
         let w = ((size.width - 28.0) * scale / m.cell_w as f64)
@@ -1882,8 +1886,42 @@ mod macos_app {
         (w as u16, h as u16)
     }
 
-    fn grid_for_rect(rect: HitRect, fonts: &Fonts, scale: f64) -> (u16, u16) {
-        let m = fonts.metrics;
+    /// Device pixels of one text cell, as a PTY's window size reports them.
+    fn cell_px_of(m: Metrics) -> (u32, u32) {
+        (m.cell_w as u32, m.cell_h as u32)
+    }
+
+    fn zoom_pct_of(font_points: f64) -> u16 {
+        ((font_points / FONT_POINTS) * 100.0).round() as u16
+    }
+
+    /// A pane's text size after one zoom step: `1` larger, `-1` smaller, anything else the default.
+    fn zoomed_font_points(font_points: f64, dir: i8) -> f64 {
+        match dir {
+            1 => (font_points + ZOOM_STEP_POINTS).min(MAX_FONT_POINTS),
+            -1 => (font_points - ZOOM_STEP_POINTS).max(MIN_FONT_POINTS),
+            _ => FONT_POINTS,
+        }
+    }
+
+    /// The focused pane's text size: what key and pointer handling measure its text with.
+    fn focused_font_points(
+        wm: &TileManager<'static>,
+        panes: &std::collections::HashMap<PaneId, ShellApp>,
+    ) -> f64 {
+        panes
+            .get(&wm.focused_pane())
+            .expect("focused pane must exist")
+            .font_points
+    }
+
+    /// The icon atlas resolution that keeps the most zoomed pane's icons sharp.
+    fn icon_atlas_scale(panes: &std::collections::HashMap<PaneId, ShellApp>, scale: f64) -> f64 {
+        let largest = panes.values().map(|p| p.font_points).fold(FONT_POINTS, f64::max);
+        scale * (largest / FONT_POINTS)
+    }
+
+    fn grid_for_rect(rect: HitRect, m: Metrics, scale: f64) -> (u16, u16) {
         let rw = f64::from((rect.x1 - rect.x0).max(100.0));
         let rh = f64::from((rect.y1 - rect.y0).max(80.0));
         let w = ((rw - 24.0) * scale / m.cell_w as f64).floor().max(20.0);
@@ -1894,7 +1932,7 @@ mod macos_app {
     fn sync_pty_sizes(
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
         tile_layout: &TileLayout<'_>,
-        fonts: &Fonts,
+        fonts: &mut FontBook,
         scale: f64,
     ) {
         for pl in &tile_layout.panes {
@@ -1902,7 +1940,8 @@ mod macos_app {
             if let Some(pane) = panes.get_mut(&pl.pane)
                 && let Some(ap) = &pane.active_pty
             {
-                let (raw_cols, raw_rows) = grid_for_rect(content_rect, fonts, scale);
+                let m = fonts.metrics(pane.font_points);
+                let (raw_cols, raw_rows) = grid_for_rect(content_rect, m, scale);
                 let (cols, rows) = if pane.pty_fullscreen {
                     (raw_cols, raw_rows)
                 } else {
@@ -1914,8 +1953,8 @@ mod macos_app {
                     (raw_cols.saturating_sub(4).max(20), target_rows)
                 };
                 let px = (
-                    cols.saturating_mul(fonts.metrics.cell_w as u16),
-                    rows.saturating_mul(fonts.metrics.cell_h as u16),
+                    cols.saturating_mul(m.cell_w as u16),
+                    rows.saturating_mul(m.cell_h as u16),
                 );
                 ap.pty.resize(cols, rows, px);
                 if let Some(blk) = pane.store.block_mut(ap.block_id)
@@ -1927,16 +1966,45 @@ mod macos_app {
         }
     }
 
+    /// Draw the find bar and its match highlights over the focused pane, measured and set in that
+    /// pane's text size (`font_points`) so highlights sit on the text they match.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_find_overlay_at(
+        scene: &mut Scene,
+        fb: &mut blaze_shell::find::FindBar,
+        size: NSSize,
+        fonts: &mut FontBook,
+        font_points: f64,
+        cursor_vis: bool,
+        mouse_pt: Option<[f32; 2]>,
+    ) -> Option<blaze_shell::find::FindMatch> {
+        let font_set = fonts.set_id(font_points);
+        let first_new_run = scene.overlay_text.len();
+        let active_hit = blaze_shell::layout::apply_find_overlay(
+            scene,
+            fb,
+            size.width as f32,
+            TOP_BAR_H,
+            size.height as f32,
+            fonts.cell_metrics(font_points),
+            cursor_vis,
+            mouse_pt,
+        );
+        for run in &mut scene.overlay_text[first_new_run..] {
+            run.font = font_set;
+        }
+        active_hit
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_window_scene(
         wm: &TileManager<'static>,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
         vw: f32,
         vh: f32,
-        metrics: blaze_shell::view::CellMetrics,
+        fonts: &mut FontBook,
         cursor_vis: bool,
         frame_now: i64,
-        zoom_pct: u16,
         active_drag: Option<&ActiveDrag>,
         active_trail: Option<CursorTrail>,
         output_selection: Option<TextSelection>,
@@ -1952,7 +2020,6 @@ mod macos_app {
         let card_radius = chrome.card_radius();
         let tile_layout = wm.layout(work_area.into(), TILE_GAP);
         let mut master = Scene::new();
-        let is_split = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
 
         // The opaque content card; around it (and through the sidebar) the window's blurred
         // backdrop shows.
@@ -1979,6 +2046,10 @@ mod macos_app {
             let ph = (content_rect.y1 - content_rect.y0).max(80.0);
             let sub_vh = ph + TOP_BAR_H;
             let pane_cursor_vis = cursor_vis && pl.focused;
+            // Each pane is laid out and drawn at its own text size.
+            let font_set = fonts.set_id(pane.font_points);
+            let metrics = fonts.cell_metrics(pane.font_points);
+            let zoom_pct = zoom_pct_of(pane.font_points);
 
             // Translate active window-space popover & mouse pos into pane-local space for the focused pane.
             let local_dx = content_rect.x0;
@@ -2136,20 +2207,7 @@ mod macos_app {
             pane.last_scene.total_content_height = sub.total_content_height;
             pane.last_scene.scroll_viewport_height = sub.scroll_viewport_height;
 
-            master.composite_pane(sub, content_rect, TOP_BAR_H, pl.focused, vw, vh, visible, card_radius);
-
-            // Subtle Ghostty-style dim veil on unfocused tiled panes so focus is unmistakable.
-            if is_split && !pl.focused {
-                master.over_round_rect(
-                    pl.rect.x0,
-                    pl.rect.y0,
-                    pl.rect.x1,
-                    pl.rect.y1,
-                    card_radius,
-                    theme::rgba(0x08, 0x08, 0x0a, 0.22),
-                    card_clip,
-                );
-            }
+            master.composite_pane(sub, font_set, content_rect, TOP_BAR_H, pl.focused, vw, vh, visible, card_radius);
         }
 
         // 2. Crisp hairline split dividers between tiled panes.
@@ -2160,6 +2218,9 @@ mod macos_app {
         // 3. Unified window-level titlebar with workspace tabs (`Cmd+1..9`), `+` (`Cmd+T`),
         //    zoomed badge, split buttons (`Cmd+D` / `Cmd+Shift+D`), and new window (`Cmd+N`).
         let focused_id = wm.focused_pane();
+        // Window chrome keeps the default size; the zoom pill reports the focused pane's.
+        let metrics = fonts.cell_metrics(FONT_POINTS);
+        let zoom_pct = panes.get(&focused_id).map_or(100, |p| zoom_pct_of(p.font_points));
         let tab_items: Vec<TabBarItem<'_>> = wm
             .tabs()
             .iter()
@@ -2235,6 +2296,7 @@ mod macos_app {
                 0,
             );
             master.overlay_text.push(blaze_shell::view::TextRun {
+                font: blaze_shell::view::FontSetId::WINDOW,
                 x: px0 + 9.0,
                 y: py0 + 4.0,
                 text: shown,
@@ -2345,6 +2407,8 @@ mod macos_app {
         src.auto_scroll_bottom = true;
 
         let mut dst = ShellApp::new_in(Some(&cwd));
+        // The program keeps the text size it was started at.
+        dst.font_points = src.font_points;
         let new_block = dst.store.adopt_terminal(handoff);
         dst.active_pty = Some(ActivePty {
             block_id: new_block,
@@ -2431,7 +2495,6 @@ mod macos_app {
         wm: &mut TileManager<'static>,
         tile_layout: &TileLayout<'_>,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
-        font_points: &mut f64,
         zoom_changed: &mut bool,
         pty_sizes_dirty: &mut bool,
         sidebar: &mut SidebarMotion,
@@ -2535,17 +2598,16 @@ mod macos_app {
                     p.scroll_y = 0.0;
                 }
             }
-            PaletteAction::ZoomIn => {
-                *font_points = (*font_points + ZOOM_STEP_POINTS).min(MAX_FONT_POINTS);
-                *zoom_changed = true;
-            }
-            PaletteAction::ZoomOut => {
-                *font_points = (*font_points - ZOOM_STEP_POINTS).max(MIN_FONT_POINTS);
-                *zoom_changed = true;
-            }
-            PaletteAction::ResetZoom => {
-                *font_points = FONT_POINTS;
-                *zoom_changed = true;
+            PaletteAction::ZoomIn | PaletteAction::ZoomOut | PaletteAction::ResetZoom => {
+                let dir = match action {
+                    PaletteAction::ZoomIn => 1,
+                    PaletteAction::ZoomOut => -1,
+                    _ => 0,
+                };
+                if let Some(p) = panes.get_mut(&wm.focused_pane()) {
+                    p.font_points = zoomed_font_points(p.font_points, dir);
+                    *zoom_changed = true;
+                }
             }
         }
     }
@@ -2735,12 +2797,11 @@ mod macos_app {
         renderer: &Renderer,
         wm: &TileManager<'static>,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
-        fonts: &mut Fonts,
+        fonts: &mut FontBook,
         icon_atlas: &mut IconAtlas,
         image_atlas: &mut ImageAtlas,
         size: &mut NSSize,
         scale: &mut f64,
-        font_points: f64,
         anim_epoch: Instant,
         has_animated_images: &mut bool,
         tile_layout: &mut TileLayout<'static>,
@@ -2766,8 +2827,8 @@ mod macos_app {
                 let new_scale = window.backingScaleFactor().max(1.0);
                 if (new_scale - *scale).abs() > f64::EPSILON {
                     *scale = new_scale;
-                    *fonts = Fonts::new(font_points, *scale);
-                    *icon_atlas = IconAtlas::new(*scale * (font_points / FONT_POINTS));
+                    *fonts = FontBook::new(FONT_POINTS, *scale);
+                    *icon_atlas = IconAtlas::new(icon_atlas_scale(panes, *scale));
                     image_atlas.set_scale(*scale);
                 }
                 *size = new_size;
@@ -2783,18 +2844,15 @@ mod macos_app {
                     layer.setPresentsWithTransaction(true);
                 }
 
-                let metrics = fonts.cell_metrics(*scale);
                 let cursor_vis = window.isKeyWindow();
-                let zoom_pct = ((font_points / FONT_POINTS) * 100.0).round() as u16;
                 let (mut scene, next_tl) = build_window_scene(
                     wm,
                     panes,
                     size.width as f32,
                     size.height as f32,
-                    metrics,
+                    fonts,
                     cursor_vis,
                     now_ns(),
-                    zoom_pct,
                     None,
                     None,
                     None,
@@ -2816,11 +2874,9 @@ mod macos_app {
                 }
 
                 let vh = size.height as f32;
-                let glyphs = fonts.rasterize_runs(&scene.text_runs, *scale, vh);
-                let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, *scale, vh);
-                for (slot, bytes) in fonts.pending.drain(..) {
-                    renderer.upload(slot, &bytes);
-                }
+                let glyphs = fonts.rasterize_runs(&scene.text_runs, vh);
+                let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, vh);
+                fonts.drain_pending_into(|slot, texels| renderer.upload(slot, texels));
                 let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
                 icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
                 icon_atlas.rasterize_custom_symbol_quads_into(&scene.custom_symbols, &mut icons);
@@ -2875,7 +2931,37 @@ mod macos_app {
         }
     }
 
+    /// Where a window's startup time goes: with `BLAZE_SHELL_STARTUP_TRACE` set, each phase's own
+    /// milliseconds and the running total (from the entry of `run`, so after dyld) go to stderr.
+    struct StartupTrace {
+        on: bool,
+        start: Instant,
+        last: Instant,
+    }
+
+    impl StartupTrace {
+        fn begin() -> Self {
+            let now = Instant::now();
+            Self { on: std::env::var_os("BLAZE_SHELL_STARTUP_TRACE").is_some(), start: now, last: now }
+        }
+
+        /// The phase named `phase` ended now.
+        fn mark(&mut self, phase: &str) {
+            if !self.on {
+                return;
+            }
+            let now = Instant::now();
+            eprintln!(
+                "blaze-shell startup: {phase:<22} {:>7.2} ms  (at {:>7.2} ms)",
+                now.duration_since(self.last).as_secs_f64() * 1e3,
+                now.duration_since(self.start).as_secs_f64() * 1e3,
+            );
+            self.last = now;
+        }
+    }
+
     pub fn run() {
+        let mut startup = StartupTrace::begin();
         let cli = parse_cli();
 
         // SAFETY: single-threaded startup before any worker thread is spawned.
@@ -2897,6 +2983,7 @@ mod macos_app {
             install_macos_menu(&app, mtm);
         }
         app.finishLaunching();
+        startup.mark("appkit launch");
 
         let init_w = 1140.0;
         let init_h = 820.0;
@@ -2954,7 +3041,9 @@ mod macos_app {
         backdrop.addSubview(&view);
         window.makeFirstResponder(Some(&view));
 
+        startup.mark("window and view");
         let renderer = Renderer::new(MTLCreateSystemDefaultDevice().expect("no Metal GPU device"));
+        startup.mark("metal renderer");
         let layer = CAMetalLayer::new();
         layer.setDevice(Some(renderer.device()));
         layer.setPixelFormat(PIXEL_FORMAT);
@@ -2980,11 +3069,12 @@ mod macos_app {
             app.activateIgnoringOtherApps(true);
         }
 
+        startup.mark("show window");
         let mut scale = window.backingScaleFactor().max(1.0);
-        let mut font_points: f64 = FONT_POINTS;
-        let mut fonts = Fonts::new(font_points, scale);
+        let mut fonts = FontBook::new(FONT_POINTS, scale);
         let mut icon_atlas = IconAtlas::new(scale);
         let mut image_atlas = ImageAtlas::new(scale);
+        startup.mark("fonts and atlases");
         let mut size = view.bounds().size;
         layer.setContentsScale(scale);
         layer.setDrawableSize(NSSize::new(size.width * scale, size.height * scale));
@@ -2992,12 +3082,15 @@ mod macos_app {
         let term_home = std::env::var("HOME").unwrap_or_else(|_| "/".to_owned());
         let term_server = blaze_shell::term_server::start_global(&term_home);
         let mut last_term_rev = term_server.revision();
+        startup.mark("term server");
 
         let (mut wm, _, first_pane_id) = TileManager::new(blaze_own::Alloc::global());
         let mut panes: std::collections::HashMap<PaneId, ShellApp> = std::collections::HashMap::new();
         let mut first_pane = ShellApp::new_in(cli.cwd.as_deref());
-        let (init_cols, init_rows) = grid_for(size, &fonts, scale);
-        let cell_px = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);
+        startup.mark("first pane");
+        let first_metrics = fonts.metrics(first_pane.font_points);
+        let (init_cols, init_rows) = grid_for(size, first_metrics, scale);
+        let cell_px = cell_px_of(first_metrics);
         let mut demo_popover: Option<ActivePopover> = None;
         if cli.demo {
             first_pane.populate_demo(
@@ -3055,18 +3148,15 @@ mod macos_app {
 
         // Offscreen deterministic screenshot mode: render 1 frame (warming atlases) and exit.
         if let Some(shot_path) = cli.screenshot {
-            let metrics = fonts.cell_metrics(scale);
             let frame_now = now_ns();
-            let zoom_pct = ((font_points / FONT_POINTS) * 100.0).round() as u16;
             let (scene, _) = build_window_scene(
                 &wm,
                 &mut panes,
                 size.width as f32,
                 size.height as f32,
-                metrics,
+                &mut fonts,
                 true,
                 frame_now,
-                zoom_pct,
                 None,
                 None,
                 None,
@@ -3082,11 +3172,9 @@ mod macos_app {
                 },
             );
             let vh = size.height as f32;
-            let glyphs = fonts.rasterize_runs(&scene.text_runs, scale, vh);
-            let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale, vh);
-            for (slot, bytes) in fonts.pending.drain(..) {
-                renderer.upload(slot, &bytes);
-            }
+            let glyphs = fonts.rasterize_runs(&scene.text_runs, vh);
+            let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, vh);
+            fonts.drain_pending_into(|slot, texels| renderer.upload(slot, texels));
             let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
             icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
             icon_atlas.rasterize_custom_symbol_quads_into(&scene.custom_symbols, &mut icons);
@@ -3166,6 +3254,10 @@ mod macos_app {
         let mut last_hovered_link: Option<String> = None;
         let mut was_hidden = false;
         let mut last_pty_sync = Instant::now();
+        // Trackpad travel over a terminal pane not yet sent to its program as a wheel step:
+        // `(pane, logical pixels)`, positive when scrolling up.
+        let mut pty_wheel_px: Option<(PaneId, f32)> = None;
+        let mut first_frame_drawn = false;
         let mut sidebar = if cli.sidebar {
             SidebarMotion::docked_at_rest()
         } else {
@@ -3208,7 +3300,6 @@ mod macos_app {
                             &mut image_atlas,
                             &mut size,
                             &mut scale,
-                            font_points,
                             anim_epoch,
                             &mut has_animated_images,
                             &mut tile_layout,
@@ -3302,7 +3393,7 @@ mod macos_app {
                                         };
                                         let (_, txt) = compute_text_selection(
                                             &composite_scene.text_runs,
-                                            fonts.cell_metrics(scale),
+                                            fonts.cell_metrics(focused_font_points(&wm, &panes)),
                                             screen_sel,
                                             TOP_BAR_H,
                                         );
@@ -3334,7 +3425,7 @@ mod macos_app {
                                         };
                                         let (_, txt) = compute_text_selection(
                                             &composite_scene.text_runs,
-                                            fonts.cell_metrics(scale),
+                                            fonts.cell_metrics(focused_font_points(&wm, &panes)),
                                             screen_sel,
                                             TOP_BAR_H,
                                         );
@@ -3472,7 +3563,6 @@ mod macos_app {
                                             &mut wm,
                                             &tile_layout,
                                             &mut panes,
-                                            &mut font_points,
                                             &mut zoom_changed,
                                             &mut pty_sizes_dirty,
                                             &mut sidebar,
@@ -3764,7 +3854,7 @@ mod macos_app {
                                                         size.height as f32,
                                                     )
                                                 });
-                                            let (_, raw_rows) = grid_for_rect(pane_rect, &fonts, scale);
+                                            let (_, raw_rows) = grid_for_rect(pane_rect, fonts.metrics(pane.font_points), scale);
                                             let max_inline = raw_rows.saturating_sub(3).max(12);
                                             let default_rows =
                                                 (raw_rows.saturating_mul(65) / 100).max(12).min(max_inline);
@@ -3792,19 +3882,11 @@ mod macos_app {
                                         pty_sizes_dirty = true;
                                         dirty = true;
                                     } else {
-                                        match dir {
-                                            1 => {
-                                                font_points =
-                                                    (font_points + ZOOM_STEP_POINTS).min(MAX_FONT_POINTS);
-                                            }
-                                            -1 => {
-                                                font_points =
-                                                    (font_points - ZOOM_STEP_POINTS).max(MIN_FONT_POINTS);
-                                            }
-                                            _ => {
-                                                font_points = FONT_POINTS;
-                                            }
-                                        }
+                                        // Zoom only the focused pane's text.
+                                        let pane = panes
+                                            .get_mut(&wm.focused_pane())
+                                            .expect("focused pane must exist");
+                                        pane.font_points = zoomed_font_points(pane.font_points, dir);
                                         zoom_changed = true;
                                         dirty = true;
                                     }
@@ -3930,7 +4012,7 @@ mod macos_app {
                                             };
                                             let (_, selected) = compute_text_selection(
                                                 &composite_scene.text_runs,
-                                                fonts.cell_metrics(scale),
+                                                fonts.cell_metrics(shell.font_points),
                                                 screen_sel,
                                                 TOP_BAR_H,
                                             );
@@ -4233,10 +4315,10 @@ mod macos_app {
                                             } else {
                                                 format!("cd {dir_s}")
                                             };
-                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                             let cpx = (
-                                                fonts.metrics.cell_w as u32,
-                                                fonts.metrics.cell_h as u32,
+                                                fonts.metrics(shell.font_points).cell_w as u32,
+                                                fonts.metrics(shell.font_points).cell_h as u32,
                                             );
                                             shell.submit_command(&cmd, cols, rows, cpx, false);
                                         }
@@ -4279,10 +4361,10 @@ mod macos_app {
                                         ..
                                     } => {
                                         shell.agent_hub = None;
-                                        let (cols, rows) = grid_for(size, &fonts, scale);
+                                        let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                         let cpx = (
-                                            fonts.metrics.cell_w as u32,
-                                            fonts.metrics.cell_h as u32,
+                                            fonts.metrics(shell.font_points).cell_w as u32,
+                                            fonts.metrics(shell.font_points).cell_h as u32,
                                         );
                                         shell.launch_agent_session(
                                             &host, is_remote, &cwd, prompt, cols, rows, cpx,
@@ -4296,7 +4378,7 @@ mod macos_app {
                             // 0c. Vim Scrollback / Output Navigation Mode (`h`/`j`/`k`/`l`, `v`/`V`, `y` over outputs!).
                             if let Some(mut nav) = output_nav {
                                 let text = keys::text_of(&ev);
-                                let m = fonts.cell_metrics(scale);
+                                let m = fonts.cell_metrics(shell.font_points);
                                 let vlines = extract_visual_lines(
                                     &composite_scene.text_runs,
                                     m,
@@ -4466,10 +4548,10 @@ mod macos_app {
                                     if shell.editor.accept_reverse_search() {
                                         let cmd = shell.editor.take_submitted();
                                         popup_engaged = false;
-                                        let (cols, rows) = grid_for(size, &fonts, scale);
+                                        let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                         let cpx = (
-                                            fonts.metrics.cell_w as u32,
-                                            fonts.metrics.cell_h as u32,
+                                            fonts.metrics(shell.font_points).cell_w as u32,
+                                            fonts.metrics(shell.font_points).cell_h as u32,
                                         );
                                         shell.submit_command(&cmd, cols, rows, cpx, true);
                                     }
@@ -4537,7 +4619,7 @@ mod macos_app {
                                         || (!ctrl && !alt && text == "k")
                                         || (ctrl && key == Key::KeyG))
                                 {
-                                    let m = fonts.cell_metrics(scale);
+                                    let m = fonts.cell_metrics(shell.font_points);
                                     let max_y = (composite_scene.input_top_y - 2.0).max(TOP_BAR_H);
                                     let vlines = extract_visual_lines(
                                         &composite_scene.text_runs,
@@ -4570,10 +4652,10 @@ mod macos_app {
                                             shell.editor.try_expand_abbreviation();
                                             let cmd = shell.editor.take_submitted();
                                             popup_engaged = false;
-                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                             let cpx = (
-                                                fonts.metrics.cell_w as u32,
-                                                fonts.metrics.cell_h as u32,
+                                                fonts.metrics(shell.font_points).cell_w as u32,
+                                                fonts.metrics(shell.font_points).cell_h as u32,
                                             );
                                             shell.submit_command(&cmd, cols, rows, cpx, true);
                                         }
@@ -4692,10 +4774,10 @@ mod macos_app {
                                             let cmd = shell.editor.take_submitted();
                                             popup_engaged = false;
                                             active_popover = None;
-                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                             let cpx = (
-                                                fonts.metrics.cell_w as u32,
-                                                fonts.metrics.cell_h as u32,
+                                                fonts.metrics(shell.font_points).cell_w as u32,
+                                                fonts.metrics(shell.font_points).cell_h as u32,
                                             );
                                             shell.submit_command(&cmd, cols, rows, cpx, true);
                                         }
@@ -4931,14 +5013,41 @@ mod macos_app {
                                         && composite_scene
                                             .inline_pty_rect
                                             .is_some_and(|r| r.contains(mx, my))))
-                                && dy.abs() > 0.5
                                 && let Some(blk) = shell.store.block(ap.block_id)
                                 && let BlockBody::Terminal { term, .. } = &blk.body
                                 && (term.flags().mouse_event != blaze_vt::terminal::MouseEvents::None
                                     || shell.store.is_alternate_screen())
                             {
-                                let up = dy > 0.0;
-                                if term.flags().mouse_event != blaze_vt::terminal::MouseEvents::None {
+                                // One wheel step per text row of travel. A trackpad sends a few
+                                // pixels many times a second, so its travel is summed and the part
+                                // of a row left over is carried to the next event; a wheel mouse
+                                // sends whole lines, at least one a notch.
+                                let pane_m = fonts.metrics(shell.font_points);
+                                let cw = (pane_m.cell_w as f32 / scale as f32).max(1.0);
+                                let ch = (pane_m.cell_h as f32 / scale as f32).max(1.0);
+                                let steps = if ev.hasPreciseScrollingDeltas() {
+                                    let carried = match pty_wheel_px {
+                                        Some((pid, px)) if pid == scroll_pid && (px > 0.0) == (dy > 0.0) => px,
+                                        _ => 0.0,
+                                    };
+                                    let travelled = carried + dy as f32;
+                                    let whole = (travelled / ch).trunc();
+                                    pty_wheel_px = Some((scroll_pid, travelled - whole * ch));
+                                    whole as i32
+                                } else if dy > 0.0 {
+                                    (dy.round() as i32).max(1)
+                                } else if dy < 0.0 {
+                                    (dy.round() as i32).min(-1)
+                                } else {
+                                    0
+                                };
+                                // No single event scrolls further than one screen.
+                                let max_steps = term.screen().rows().clamp(1, 1000) as i32;
+                                let steps = steps.clamp(-max_steps, max_steps);
+                                let up = steps > 0;
+                                if steps == 0 {
+                                    // Less than a row so far: nothing to send yet.
+                                } else if term.flags().mouse_event != blaze_vt::terminal::MouseEvents::None {
                                     // Send true SGR / X10 mouse wheel events (`\x1b[<64;col;rowM`)
                                     // whenever the TUI (e.g. Claude Code, vim, htop) enabled mouse
                                     // reporting — never falling back to arrow keys!
@@ -4952,8 +5061,6 @@ mod macos_app {
                                     } else {
                                         pane_rect
                                     };
-                                    let cw = (fonts.metrics.cell_w as f32 / scale as f32).max(1.0);
-                                    let ch = (fonts.metrics.cell_h as f32 / scale as f32).max(1.0);
                                     let rel_x = (mx - target_rect.x0 - 10.0).max(0.0);
                                     let rel_y = (my - target_rect.y0 - 6.0).max(0.0);
                                     let cols = term.screen().cols() as u32;
@@ -4988,7 +5095,9 @@ mod macos_app {
                                         blaze_vt::input::mouse::encode(&mev, &mopts, None, &mut buf)
                                         && !encoded.is_empty()
                                     {
-                                        ap.pty.write_all(encoded);
+                                        for _ in 0..steps.unsigned_abs() {
+                                            ap.pty.write_all(encoded);
+                                        }
                                     }
                                 } else if shell.store.is_alternate_screen()
                                     && term.mode(blaze_vt::terminal::Mode::MouseAlternateScroll)
@@ -5001,7 +5110,9 @@ mod macos_app {
                                     } else {
                                         b"\x1b[B"
                                     };
-                                    ap.pty.write_all(seq);
+                                    for _ in 0..steps.unsigned_abs() {
+                                        ap.pty.write_all(seq);
+                                    }
                                 }
                             } else {
                                 let step_y = if ev.hasPreciseScrollingDeltas() {
@@ -5045,8 +5156,15 @@ mod macos_app {
                             // Always yield native window resize edges/corners (and traffic lights
                             // on unfocused windows) directly to AppKit via `with_resize_hook` below.
                             let in_traffic_lights = chrome.in_traffic_lights(x, y);
+                            // Ctrl+Cmd+drag is macOS's move-the-window-from-anywhere gesture
+                            // (`NSWindowShouldDragOnGesture`); `NSWindow` runs it from `sendEvent`,
+                            // so the shell must not take the click first.
+                            let window_drag_gesture = ev
+                                .modifierFlags()
+                                .contains(NSEventModifierFlags::Command | NSEventModifierFlags::Control);
                             let yield_to_appkit = on_resize_edge(x, y, size.width as f32, size.height as f32)
-                                || (!window.isKeyWindow() && in_traffic_lights);
+                                || (!window.isKeyWindow() && in_traffic_lights)
+                                || window_drag_gesture;
                             if yield_to_appkit {
                                 cur_cursor = None;
                             }
@@ -5070,7 +5188,6 @@ mod macos_app {
                                         &mut wm,
                                         &tile_layout,
                                         &mut panes,
-                                        &mut font_points,
                                         &mut zoom_changed,
                                         &mut pty_sizes_dirty,
                                         &mut sidebar,
@@ -5197,7 +5314,10 @@ mod macos_app {
                                                 }
                                             }
                                             HitAction::ResetZoom => {
-                                                font_points = FONT_POINTS;
+                                                panes
+                                                    .get_mut(&wm.focused_pane())
+                                                    .expect("focused pane must exist")
+                                                    .font_points = FONT_POINTS;
                                                 zoom_changed = true;
                                                 dirty = true;
                                             }
@@ -5424,10 +5544,10 @@ mod macos_app {
                                                 .and_then(|hub| hub.attach_selected_action())
                                             {
                                                 shell.agent_hub = None;
-                                                let (cols, rows) = grid_for(size, &fonts, scale);
+                                                let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                                 let cpx = (
-                                                    fonts.metrics.cell_w as u32,
-                                                    fonts.metrics.cell_h as u32,
+                                                    fonts.metrics(shell.font_points).cell_w as u32,
+                                                    fonts.metrics(shell.font_points).cell_h as u32,
                                                 );
                                                 shell.launch_agent_session(
                                                     &host, is_remote, &cwd, prompt, cols, rows,
@@ -5759,7 +5879,7 @@ mod macos_app {
                                             dirty = true;
                                         }
                                         HitAction::ResetZoom => {
-                                            font_points = FONT_POINTS;
+                                            shell.font_points = FONT_POINTS;
                                             zoom_changed = true;
                                             dirty = true;
                                         }
@@ -5782,10 +5902,10 @@ mod macos_app {
                                         }
                                         HitAction::SwitchGitBranch(branch) => {
                                             active_popover = None;
-                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                             let cpx = (
-                                                fonts.metrics.cell_w as u32,
-                                                fonts.metrics.cell_h as u32,
+                                                fonts.metrics(shell.font_points).cell_w as u32,
+                                                fonts.metrics(shell.font_points).cell_h as u32,
                                             );
                                             let cmd = format!("git switch {branch}");
                                             shell.submit_command(&cmd, cols, rows, cpx, true);
@@ -5793,10 +5913,10 @@ mod macos_app {
                                         }
                                         HitAction::ChangeDir(dir) => {
                                             active_popover = None;
-                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                             let cpx = (
-                                                fonts.metrics.cell_w as u32,
-                                                fonts.metrics.cell_h as u32,
+                                                fonts.metrics(shell.font_points).cell_w as u32,
+                                                fonts.metrics(shell.font_points).cell_h as u32,
                                             );
                                             let cmd = if dir.contains(' ') {
                                                 format!("cd \"{dir}\"")
@@ -5826,10 +5946,10 @@ mod macos_app {
                                         }
                                         HitAction::RunCommand(cmd) => {
                                             active_popover = None;
-                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                             let cpx = (
-                                                fonts.metrics.cell_w as u32,
-                                                fonts.metrics.cell_h as u32,
+                                                fonts.metrics(shell.font_points).cell_w as u32,
+                                                fonts.metrics(shell.font_points).cell_h as u32,
                                             );
                                             shell.submit_command(&cmd, cols, rows, cpx, true);
                                             dirty = true;
@@ -5905,10 +6025,10 @@ mod macos_app {
                                                 } else {
                                                     format!("open {quoted}")
                                                 };
-                                                let (cols, rows) = grid_for(size, &fonts, scale);
+                                                let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                                 let cpx = (
-                                                    fonts.metrics.cell_w as u32,
-                                                    fonts.metrics.cell_h as u32,
+                                                    fonts.metrics(shell.font_points).cell_w as u32,
+                                                    fonts.metrics(shell.font_points).cell_h as u32,
                                                 );
                                                 shell.submit_command(&cmd, cols, rows, cpx, false);
                                                 dirty = true;
@@ -5953,7 +6073,7 @@ mod macos_app {
                                 if composite_scene.composer_rect.contains(x, y) {
                                     output_selection = None;
                                     shell.editor.enter_vim_insert();
-                                    let m = fonts.cell_metrics(scale);
+                                    let m = fonts.cell_metrics(shell.font_points);
                                     let [ox, oy] = composite_scene.composer_text_origin;
                                     let line_step = (m.ch + 2.0).max(1.0);
                                     let line = ((y - oy).max(0.0) / line_step).floor() as usize;
@@ -5991,7 +6111,7 @@ mod macos_app {
                                 // Drag-select (or double/triple click) any rendered block/terminal output text!
                                 if !chrome.sidebar_contains(x, y, size.height as f32) {
                                     shell.editor.selection_anchor = None;
-                                    let m = fonts.cell_metrics(scale);
+                                    let m = fonts.cell_metrics(shell.font_points);
                                     let clicks = ev.clickCount();
                                     if clicks >= 2 {
                                         if let Some(sel) = select_at_point(
@@ -6109,13 +6229,13 @@ mod macos_app {
                                 {
                                     if active_popover.as_ref().is_none_or(|cur| cur.anchor != reg.rect) {
                                         let hydrated_kind = match &reg.kind {
-                                            HoverKind::FileEntry { full_path, name, icon, .. } => {
-                                                Some(load_hover_preview(
-                                                    std::path::Path::new(full_path),
-                                                    name,
-                                                    *icon,
-                                                    16,
-                                                ))
+                                            HoverKind::FileEntry { full_path, name, icon, git_change, .. } => {
+                                                let load = if *git_change {
+                                                    load_change_preview
+                                                } else {
+                                                    load_hover_preview
+                                                };
+                                                Some(load(std::path::Path::new(full_path), name, *icon, 16))
                                             }
                                             HoverKind::CommandToken { source, token_start, token_end } => {
                                                 let path_env = shell
@@ -6281,7 +6401,7 @@ mod macos_app {
                                 continue;
                             }
                             if selecting_composer {
-                                let m = fonts.cell_metrics(scale);
+                                let m = fonts.cell_metrics(shell.font_points);
                                 let [ox, oy] = composite_scene.composer_text_origin;
                                 let line_step = (m.ch + 2.0).max(1.0);
                                 let line = ((y - oy).max(0.0) / line_step).floor() as usize;
@@ -6371,10 +6491,10 @@ mod macos_app {
                                         } else {
                                             format!("open {quoted}")
                                         };
-                                        let (cols, rows) = grid_for(size, &fonts, scale);
+                                        let (cols, rows) = grid_for(size, fonts.metrics(shell.font_points), scale);
                                         let cpx = (
-                                            fonts.metrics.cell_w as u32,
-                                            fonts.metrics.cell_h as u32,
+                                            fonts.metrics(shell.font_points).cell_w as u32,
+                                            fonts.metrics(shell.font_points).cell_h as u32,
                                         );
                                         active_popover = None;
                                         shell.submit_command(&cmd, cols, rows, cpx, true);
@@ -6453,7 +6573,6 @@ mod macos_app {
                             &mut image_atlas,
                             &mut size,
                             &mut scale,
-                            font_points,
                             anim_epoch,
                             &mut has_animated_images,
                             &mut tile_layout,
@@ -6481,7 +6600,6 @@ mod macos_app {
                         &mut image_atlas,
                         &mut size,
                         &mut scale,
-                        font_points,
                         anim_epoch,
                         &mut has_animated_images,
                         &mut tile_layout,
@@ -6646,7 +6764,6 @@ mod macos_app {
                 }
             }
             let focused_pid = wm.focused_pane();
-            let cpx = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);
             let mut any_running_jobs = false;
             let mut alt_screen_entered: Vec<PaneId> = Vec::new();
             for (&pid, pane) in panes.iter_mut() {
@@ -6663,13 +6780,14 @@ mod macos_app {
                     dirty = true;
                 }
 
+                let pane_m = fonts.metrics(pane.font_points);
                 let (cols, rows) = tile_layout
                     .panes
                     .iter()
                     .find(|pl| pl.pane == pid)
-                    .map(|pl| grid_for_rect(pl.rect.into(), &fonts, scale))
-                    .unwrap_or_else(|| grid_for(size, &fonts, scale));
-                if pane.poll_async_jobs(cols, rows, cpx) {
+                    .map(|pl| grid_for_rect(pl.rect.into(), pane_m, scale))
+                    .unwrap_or_else(|| grid_for(size, pane_m, scale));
+                if pane.poll_async_jobs(cols, rows, cell_px_of(pane_m)) {
                     dirty = true;
                 }
                 if pane.running_jobs > 0 {
@@ -6849,8 +6967,9 @@ mod macos_app {
             if new_size != size || (new_scale - scale).abs() > f64::EPSILON || zoom_changed {
                 if (new_scale - scale).abs() > f64::EPSILON || zoom_changed {
                     scale = new_scale;
-                    fonts = Fonts::new(font_points, scale);
-                    icon_atlas = IconAtlas::new(scale * (font_points / FONT_POINTS));
+                    // A new book holds only the sizes panes use now.
+                    fonts = FontBook::new(FONT_POINTS, scale);
+                    icon_atlas = IconAtlas::new(icon_atlas_scale(&panes, scale));
                     image_atlas.set_scale(scale);
                     layer.setContentsScale(scale);
                     zoom_changed = false;
@@ -6867,7 +6986,7 @@ mod macos_app {
                     .settled_chrome(size.width as f32)
                     .content(size.width as f32, size.height as f32);
                 let next_tl = wm.layout(area.into(), TILE_GAP);
-                sync_pty_sizes(&mut panes, &next_tl, &fonts, scale);
+                sync_pty_sizes(&mut panes, &next_tl, &mut fonts, scale);
                 pty_sizes_dirty = false;
             }
 
@@ -6900,10 +7019,8 @@ mod macos_app {
                 dirty = true;
             }
             if dirty && !is_hidden_or_min {
-                let metrics = fonts.cell_metrics(scale);
                 // Steady non-blinking cursor (matches Ghostty `cursor-style-blink = false`).
                 let cursor_vis = window.isKeyWindow();
-                let zoom_pct = ((font_points / FONT_POINTS) * 100.0).round() as u16;
                 let active_drag = pending_drag.as_ref().and_then(|d| {
                     if d.active {
                         Some(ActiveDrag {
@@ -6923,10 +7040,9 @@ mod macos_app {
                     &mut panes,
                     size.width as f32,
                     size.height as f32,
-                    metrics,
+                    &mut fonts,
                     cursor_vis,
                     frame_now,
-                    zoom_pct,
                     active_drag.as_ref(),
                     active_trail,
                     output_selection,
@@ -6940,13 +7056,13 @@ mod macos_app {
                 tile_layout = next_tl;
 
                 if let Some(fb) = &mut find_bar {
-                    let active_hit = blaze_shell::layout::apply_find_overlay(
+                    let find_points = focused_font_points(&wm, &panes);
+                    let active_hit = apply_find_overlay_at(
                         &mut scene,
                         fb,
-                        size.width as f32,
-                        TOP_BAR_H,
-                        size.height as f32,
-                        metrics,
+                        size,
+                        &mut fonts,
+                        find_points,
                         cursor_vis,
                         mouse_pt,
                     );
@@ -6971,10 +7087,9 @@ mod macos_app {
                                     &mut panes,
                                     size.width as f32,
                                     size.height as f32,
-                                    metrics,
+                                    &mut fonts,
                                     cursor_vis,
                                     frame_now,
-                                    zoom_pct,
                                     active_drag.as_ref(),
                                     active_trail,
                                     output_selection,
@@ -6985,13 +7100,12 @@ mod macos_app {
                                     command_palette.as_ref(),
                                     chrome,
                                 );
-                                blaze_shell::layout::apply_find_overlay(
+                                apply_find_overlay_at(
                                     &mut rescene,
                                     fb,
-                                    size.width as f32,
-                                    TOP_BAR_H,
-                                    size.height as f32,
-                                    metrics,
+                                    size,
+                                    &mut fonts,
+                                    find_points,
                                     cursor_vis,
                                     mouse_pt,
                                 );
@@ -7014,11 +7128,9 @@ mod macos_app {
                 last_cursor_rect = scene.cursor_rect;
 
                 let vh = size.height as f32;
-                let glyphs = fonts.rasterize_runs(&scene.text_runs, scale, vh);
-                let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, scale, vh);
-                for (slot, bytes) in fonts.pending.drain(..) {
-                    renderer.upload(slot, &bytes);
-                }
+                let glyphs = fonts.rasterize_runs(&scene.text_runs, vh);
+                let overlay_glyphs = fonts.rasterize_runs(&scene.overlay_text, vh);
+                fonts.drain_pending_into(|slot, texels| renderer.upload(slot, texels));
                 let mut icons = icon_atlas.rasterize_quads(&scene.icon_quads);
                 icon_atlas.rasterize_emoji_quads_into(&scene.emoji_quads, &mut icons);
                 icon_atlas.rasterize_custom_symbol_quads_into(&scene.custom_symbols, &mut icons);
@@ -7052,6 +7164,10 @@ mod macos_app {
                     overlay_glyphs: &overlay_glyphs,
                 };
                 renderer.draw(&layer, &frame);
+                if !first_frame_drawn {
+                    first_frame_drawn = true;
+                    startup.mark("first frame");
+                }
                 // Keep `text_runs`, hit regions, drag sources & composer geometry in `composite_scene`
                 // for instant mouse hover, output text selection, and `Cmd+C` extraction!
                 scene.rects.clear();

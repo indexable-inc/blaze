@@ -719,6 +719,48 @@ fn read_git_diff_numstat(
     parse_git_diff_numstat(&text)
 }
 
+/// `tree_rel` (a path below `work_tree`) as it is typed from `cwd`, the way `git status` prints
+/// it: `src/a.rs` below `cwd`, `../b.rs` beside it. A `cwd` outside `work_tree` gets the absolute
+/// path.
+fn path_from_cwd(work_tree: &Path, cwd: &Path, tree_rel: &str) -> PathBuf {
+    let Ok(cwd_rel) = cwd.strip_prefix(work_tree) else {
+        return work_tree.join(tree_rel);
+    };
+    let cwd_parts: Vec<&std::ffi::OsStr> = cwd_rel.iter().collect();
+    let parts: Vec<&str> = tree_rel.split('/').collect();
+    // The last part names the entry itself, so it is never a folder shared with `cwd`.
+    let shared = cwd_parts
+        .iter()
+        .zip(&parts[..parts.len() - 1])
+        .take_while(|(dir, part)| dir.to_str() == Some(**part))
+        .count();
+    let mut out = "../".repeat(cwd_parts.len() - shared);
+    out.push_str(&parts[shared..].join("/"));
+    if out.is_empty() {
+        // `tree_rel` is `cwd` itself (an untracked folder listed as `dir/`).
+        out.push_str("./");
+    }
+    PathBuf::from(out)
+}
+
+/// `git diff` of one file against `HEAD` (staged and unstaged together, one line of context
+/// round each change so a hover shows more of the change), not yet run. Its output is empty when
+/// the file is unchanged or untracked, and it fails outside a repository or before a first commit.
+pub fn git_file_diff_command(path: &Path) -> Option<std::process::Command> {
+    use std::process::{Command, Stdio};
+
+    let (dir, name) = (path.parent()?, path.file_name()?);
+    let mut cmd = Command::new("git");
+    cmd.arg("--literal-pathspecs")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "core.quotepath=false", "diff", "--no-color", "--no-ext-diff", "-U1", "HEAD", "--"])
+        .arg(name)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    Some(cmd)
+}
+
 /// Read local git branch names for `cwd` with zero subprocesses (for prompt popover & `git` tab completion).
 pub fn read_local_branches_for_cwd(cwd: &str, limit: usize) -> Vec<String> {
     let Some(head) = read_git_head(cwd) else {
@@ -1402,9 +1444,12 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
                     }
                     Err(_) => (blaze_sh::Value::Nothing, blaze_sh::Value::Nothing),
                 };
+                // Named as typed from `cwd`, like `git status` itself, so hovering, dragging and
+                // opening a row from a subfolder reach the file.
+                let shown_path = path_from_cwd(&head.work_tree, Path::new(cwd), rel_path);
                 tbl.push_row_values(&[
                     blaze_sh::Value::string(status_label, alloc),
-                    blaze_sh::Value::string(rel_path, alloc),
+                    blaze_sh::Value::string(&shown_path.to_string_lossy(), alloc),
                     size_val,
                     mod_val,
                 ]);
@@ -2013,6 +2058,21 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn status_paths_are_named_from_the_current_folder() {
+        let tree = Path::new("/repo");
+        let from = |cwd: &str, rel: &str| path_from_cwd(tree, Path::new(cwd), rel);
+        let shown = |cwd: &str, rel: &str| from(cwd, rel).to_string_lossy().into_owned();
+        assert_eq!(shown("/repo", "crates/shell/src/view.rs"), "crates/shell/src/view.rs");
+        assert_eq!(shown("/repo/crates/shell", "crates/shell/src/view.rs"), "src/view.rs");
+        assert_eq!(shown("/repo/crates/shell", "crates/sh/src/lib.rs"), "../sh/src/lib.rs");
+        assert_eq!(shown("/repo/crates/shell", "README.md"), "../../README.md");
+        // A file named like the folder it sits beside is not that folder.
+        assert_eq!(shown("/repo/crates", "crates"), "../crates");
+        assert_eq!(shown("/repo/crates/new", "crates/new/"), "./");
+        assert_eq!(shown("/elsewhere", "a.rs"), "/repo/a.rs");
+    }
 
     fn make_temp_repo(tag: &str) -> PathBuf {
         let nanos = SystemTime::now()

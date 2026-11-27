@@ -2821,6 +2821,7 @@ fn layout_file_grid(
                         name: item.label.clone(),
                         icon: Some(item.icon),
                         is_dir: item.is_dir,
+                        git_change: false,
                     },
                 );
             }
@@ -3691,6 +3692,7 @@ fn layout_table(
                                 name: path.clone(),
                                 icon: Some(icon_name),
                                 is_dir: true,
+                                git_change: false,
                             },
                         );
                         cur_y += row_h;
@@ -3882,6 +3884,7 @@ fn layout_table(
                                         name: display_name,
                                         icon: Some(icon_name),
                                         is_dir,
+                                        git_change: false,
                                     },
                                 );
                             }
@@ -4044,6 +4047,7 @@ fn layout_table(
                                         name: display_name,
                                         icon: Some(icon_name),
                                         is_dir,
+                                        git_change: has_status_col,
                                     },
                                 );
                             }

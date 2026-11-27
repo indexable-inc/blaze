@@ -1240,7 +1240,7 @@ mod tests {
                 mouse_pos: None,
                 output_nav: None,
             });
-            master.composite_pane(sub, content, TOP_BAR_H, pl.focused, 1200.0, 800.0, content, 0.0);
+            master.composite_pane(sub, crate::view::FontSetId::WINDOW, content, TOP_BAR_H, pl.focused, 1200.0, 800.0, content, 0.0);
         }
         draw_split_dividers(&mut master, &l.handles, None, 0);
         let tabs = [TabBarItem {
