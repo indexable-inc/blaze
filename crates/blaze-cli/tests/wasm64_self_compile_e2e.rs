@@ -925,3 +925,176 @@ macro_rules! triple {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 5. End-to-end proof for `getrandom 0.3` / `0.4` custom backend on `wasm64-blaze-wasip1`:
+///    - `cfg(getrandom_backend = "custom")` is active on `wasm64-blaze-wasip1` via the single
+///      canonical `blaze_toolchain::target_cfg` source of truth;
+///    - an `extern "Rust"` declaration of `__getrandom_v03_custom` returning `Result<(), Error>`
+///      with a newtype wrapper (`struct Error(NonZeroU32)` as in `getrandom 0.3.4` and
+///      `struct ErrorI32(NonZeroI32)` as in `library/wasi_rt/src/rt/random.rs`) lowers and links
+///      cleanly against `wasi_rt::rt::random::__getrandom_v03_custom` with zero `CallSigMismatch`,
+///      `UnresolvedImport`, or ABI mismatch;
+///    - executing the emitted `memory64` module under `ScriptRuntime` (`blaze-wasi`) invokes
+///      `wasi_snapshot_preview1_64::random_get` and fills entropy cleanly.
+#[test]
+fn getrandom_v03_custom_backend_compiles_links_wasi_rt_and_runs_in_script_runtime() {
+    const GETRANDOM_SCRIPT: &str = r#"#[cfg(not(getrandom_backend = "custom"))]
+compile_error!("wasm64-blaze-wasip1 must set getrandom_backend=\"custom\"");
+
+use core::num::{NonZeroI32, NonZeroU32};
+
+#[derive(Copy, Clone, Debug)]
+struct ErrorU32(NonZeroU32);
+
+#[derive(Copy, Clone, Debug)]
+struct ErrorI32(NonZeroI32);
+
+unsafe extern "Rust" {
+    fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), ErrorU32>;
+    #[link_name = "__getrandom_v03_custom"]
+    fn getrandom_v03_custom_i32(dest: *mut u8, len: usize) -> Result<(), ErrorI32>;
+}
+
+fn main() {
+    // Initialize with non-zero sentinels so we prove `wasi_rt::__getrandom_v03_custom` ->
+    // `wasip1::random_get` -> `blaze-wasi` (`script_sandbox::random`, deterministic zero-fill)
+    // actually executed and overwrote guest linear memory for both Error newtypes.
+    let mut buf1 = [0xAAu8; 32];
+    unsafe { __getrandom_v03_custom(buf1.as_mut_ptr(), buf1.len()) }
+        .expect("__getrandom_v03_custom (ErrorU32) failed");
+    let mut buf2 = [0x55u8; 32];
+    unsafe { getrandom_v03_custom_i32(buf2.as_mut_ptr(), buf2.len()) }
+        .expect("__getrandom_v03_custom (ErrorI32) failed");
+    unsafe { __getrandom_v03_custom(buf1.as_mut_ptr(), 0) }
+        .expect("zero-length __getrandom_v03_custom failed");
+    assert!(buf1.iter().all(|&b| b == 0), "random_get must overwrite all 32 sentinel bytes of buf1");
+    assert!(buf2.iter().all(|&b| b == 0), "random_get must overwrite all 32 sentinel bytes of buf2");
+    println!("cargo:rustc-cfg=getrandom_custom_wasm64_ok");
+    println!("cargo:rustc-env=GETRANDOM_BYTES={}", buf1.len() + buf2.len());
+}
+"#;
+    let home = std::env::var("HOME").expect("HOME");
+    let shelf_dir = std::path::PathBuf::from(&home).join(".blaze/v2/toolchain");
+    if !shelf_dir.join(blaze_toolchain::PINNED.to_string()).exists() {
+        eprintln!("skipping getrandom_v03_custom_backend test: pinned toolchain {} not on shelf", blaze_toolchain::PINNED);
+        return;
+    }
+    let a = alloc();
+    let edition = edition::PackageEdition::of_manifest("2024").expect("2024");
+    let root = "/wasm64_cli_e2e/build.rs";
+    let files = vec![(String::from(root), String::from(GETRANDOM_SCRIPT))];
+    let user = UserCrate {
+        name: "getrandom_custom_build_rs",
+        dir: DIR,
+        root,
+        files: &files,
+        edition,
+        panic: blaze_ladder::run::Panic::Abort,
+    };
+    let id = blaze_toolchain::PINNED;
+    let mut shelf = blaze_ladder::crates::DirShelf::new(shelf_dir.to_string_lossy().into_owned());
+    let tc = Toolchain::open_target(&mut shelf, id, blaze_toolchain::WASM64_TARGET)
+        .expect("open wasm64 toolchain");
+    let inputs = Inputs::new(&user, &tc).expect("inputs");
+    let crates = inputs.crates();
+    let keys: &'static [CrateItemKey] = Vec::leak(crates.iter().map(|c| c.key).collect());
+    let crate_names: &'static [&'static str] = Vec::leak(crates.iter().map(|c| leak(c.name)).collect());
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).expect("resolve");
+    assert!(names.notes(0).is_empty(), "expected zero scope notes, got {:?}", names.notes(0));
+    let mut kept = Kept::default();
+    for c in names.crates().iter() {
+        kept.names.push(aligned(&names_record::encode(c, a).expect("names record"), blaze_own::testing::bump()));
+        kept.items.push(aligned(&items_record::encode_with(c, &names, a).expect("items record"), blaze_own::testing::bump()));
+        kept.files.push(c.files.iter().map(|f| (f.package.as_str().to_string(), leak(f.text))).collect());
+        kept.expansions.push(c.expansions.iter().filter_map(|(call, e)| e.made.map(|m| (*call, leak(m.text)))).collect());
+        kept.origins.push(c.expansions.iter().filter_map(|(call, e)| e.made.as_ref().map(|m| (*call, made_origins(*call, &m.origins)))).collect());
+    }
+    let f = Fixture { kept, keys, crate_names };
+    let pos = |name: &str| crate_names.iter().position(|&n| n == name);
+    let lang_crates: &'static [usize] = Vec::leak(
+        [Some(0), pos("core"), pos("alloc"), pos("std"), pos("panic_abort")]
+            .into_iter()
+            .flatten()
+            .collect(),
+    );
+    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame")));
+    let log: &'static Log<'static> = Box::leak(Box::new(Log::new(f.crate_names, a)));
+    let load: &'static Kept = Box::leak(Box::new(f.kept.clone()));
+    let records: &'static Records<'static> = Box::leak(Box::new(Records::new(f.keys, load, log, frame, a)));
+    let nr = NamesRecords { records, frame, lang_crates, body_sources: None };
+
+    let mut b = builder();
+    b.settings = Settings::baseline(OverflowChecks::Off, blaze_ladder::run::Panic::Abort);
+    b.toolchain = id;
+
+    let roots = blaze_ladder::run::special::run_roots(nr.records, nr.lang_crates, b.settings.panic, &[], nr.frame, a, a).expect("run_roots");
+    let maker_entry = match roots.shim() {
+        Some(shim) => Some(shim.main.tabled),
+        None => (!roots.is_empty()).then(|| roots.root(0).tabled),
+    };
+    let mut build_maker = Maker::of_roots(nr, maker_entry, &roots, SecondCheck, &b, None, a);
+    let mut wasm_out: AVec<'static, u8> = OwnVec::new_in(a);
+    let out = compile_roots_to_wasm64(
+        &roots,
+        |_| Some(TestGrant),
+        &mut build_maker,
+        &Wasm64BuildOpts {
+            module_name: "getrandom_custom_build_rs",
+            start_symbol: Some(roots.entry),
+            exports: &[],
+            export_globals: &[],
+            include_blaze_host_v1: false,
+            opts: Wasm64Opts::USER_PROGRAM,
+        },
+        default_wasm64_import,
+        &mut wasm_out,
+        a,
+    )
+    .expect("compile_roots_to_wasm64 must link __getrandom_v03_custom against wasi_rt");
+    assert!(out.func_count > 50);
+    let checked = check_wasm64(wasm_out.as_slice()).expect("valid wasm64");
+    assert!(checked.memory64);
+
+    let dir = std::env::temp_dir().join(format!("blaze-wasm64-getrandom-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let rt = ScriptRuntime::new(&dir).expect("ScriptRuntime");
+    let loaded = rt.load("getrandom_custom_build_rs", wasm_out.as_slice()).expect("ScriptRuntime loads wasm64");
+    let env = Env { vars: OwnVec::new_in(a) };
+    let script = Arc::new(Script {
+        package: "getrandom_custom_pkg".to_owned(),
+        tree: Tree::Mem { files: Arc::new(Vec::new()), submodules: Arc::from([]), git: None },
+        root: ScriptRoot::package(),
+        env: Vec::new(),
+        target: blaze_toolchain::WASM64_TARGET.to_owned(),
+        host: "x86_64-unknown-linux-gnu".to_owned(),
+        c_mode: CMode::Deferred,
+        limits: RunLimits {
+            fuel: 1 << 28,
+            memory: 64 << 20,
+            out_dir_bytes: 1 << 20,
+            out_dir_files: 16,
+            output: 1 << 20,
+            line: 256 << 10,
+        },
+        table: Arc::new(Vec::new()),
+        probes: None,
+        c_probes: None,
+        spawner: None,
+        step: blaze_ids::ContentId::default(),
+        spawn_setting: Arc::new(blaze_proc_macro::spawn_route::SpawnSetting::off()),
+        deps: Arc::new(blaze_proc_macro::script_sandbox::dep_mount::DepViews::none()),
+    });
+    let ran = rt.run(&loaded, script, &env, a).expect("run getrandom custom build.rs in Wasmtime memory64");
+    assert!(
+        ran.outputs.cfgs.iter().any(|(n, v)| n.as_str() == "getrandom_custom_wasm64_ok" && v.is_none()),
+        "expected getrandom_custom_wasm64_ok cfg, got {:?}",
+        ran.outputs.cfgs
+    );
+    assert!(
+        ran.outputs.env.iter().any(|(n, v)| n.as_str() == "GETRANDOM_BYTES" && v.as_str() == "64"),
+        "expected GETRANDOM_BYTES=64, got {:?}",
+        ran.outputs.env
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

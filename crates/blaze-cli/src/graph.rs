@@ -504,18 +504,7 @@ pub fn wasm_host_of(
     let manifest = blaze_toolchain::shelf::open_manifest(&mut shelf, id).map_err(CliError::Toolchain)?;
     let view = blaze_toolchain::ToolchainView::open(manifest.as_ref(), id)
         .map_err(|_| CliError::Text { what: "the pinned toolchain's manifest is refused by its reader" })?;
-    let Some(atoms) = view.cfg(crate::wasm64_compile::WASM64_TARGET) else {
-        return Ok(None);
-    };
-    let heap = env.heap.alloc();
-    let mut cfg = Vec::new_in(heap);
-    for (name, value) in atoms {
-        cfg.push(match value {
-            Some(value) => CfgAtom::pair(name, value, heap),
-            None => CfgAtom::flag(name, heap),
-        });
-    }
-    Ok(Some(TargetDesc::new(crate::wasm64_compile::WASM64_TARGET, cfg, heap)))
+    Ok(blaze_toolchain::target_desc(&view, crate::wasm64_compile::WASM64_TARGET, env.heap.alloc()))
 }
 
 /// The note of the rustflags a unit takes that blaze does not apply ([`RUSTFLAGS_NOT_APPLIED`]),

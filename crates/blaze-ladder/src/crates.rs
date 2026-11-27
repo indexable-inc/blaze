@@ -255,7 +255,12 @@ impl Toolchain {
                 dep.1 = kept;
             }
         }
-        let cfg = view.cfg(triple).ok_or(CratesError::NoTarget)?.map(|(n, v)| (n.to_owned(), v.map(str::to_owned))).collect();
+        let mut cfg: Vec<(String, Option<String>)> = blaze_toolchain::target_cfg(&view, triple)
+            .ok_or(CratesError::NoTarget)?
+            .map(|(n, v)| (n.to_owned(), v.map(str::to_owned)))
+            .collect();
+        cfg.sort_unstable();
+        cfg.dedup();
         Ok(Toolchain { units, cfg, arena: Arena::new(Tag::Other) })
     }
 }

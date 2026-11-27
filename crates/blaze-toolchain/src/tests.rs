@@ -184,3 +184,71 @@ fn a_shelf_refuses_a_changed_pack_before_and_after_reading() {
     shelf.0.insert(id.hex().as_str().to_string(), other);
     assert!(matches!(shelf::open_manifest(&mut shelf, id).expect_err("not a manifest").why, Why::Record(_)));
 }
+
+#[test]
+fn wasm64_target_cfg_and_desc_append_getrandom_custom_without_duplicates() {
+    let alloc = blaze_own::testing::heap().alloc();
+
+    // 1. Target record lacking `getrandom_backend="custom"` receives it once via `target_cfg` and `target_desc`.
+    let base_wasm_cfg = [("panic", Some("abort")), ("target_arch", Some("wasm64")), ("target_os", Some("wasi"))];
+    let host_cfg = [("panic", Some("unwind")), ("target_os", Some("macos")), ("unix", None)];
+    let targets = [
+        TargetIn { triple: crate::WASM64_TARGET, units: &[], cfg: &base_wasm_cfg },
+        TargetIn { triple: "aarch64-apple-darwin", units: &[], cfg: &host_cfg },
+    ];
+    let bytes = record::write(&[], &targets, alloc).expect("record");
+    let view = ToolchainView::open(bytes.as_slice(), ToolchainView::id_of_bytes(bytes.as_slice())).expect("view");
+
+    let wasm_atoms: std::vec::Vec<_> = crate::target_cfg(&view, crate::WASM64_TARGET).expect("wasm64 cfg").collect();
+    assert_eq!(
+        wasm_atoms.iter().filter(|&&a| a == ("getrandom_backend", Some("custom"))).count(),
+        1,
+        "wasm64 target_cfg must include getrandom_backend=\"custom\" once: {wasm_atoms:?}"
+    );
+    let wasm_desc = crate::target_desc(&view, crate::WASM64_TARGET, alloc).expect("wasm64 TargetDesc");
+    assert_eq!(
+        wasm_desc
+            .cfg
+            .iter()
+            .filter(|a| a.name.as_str() == "getrandom_backend" && a.value.as_deref() == Some("custom"))
+            .count(),
+        1,
+        "wasm64 TargetDesc must include getrandom_backend=\"custom\" once"
+    );
+
+    // Negative control: non-wasm64 targets must NOT receive wasm64 extra cfgs.
+    let host_atoms: std::vec::Vec<_> = crate::target_cfg(&view, "aarch64-apple-darwin").expect("host cfg").collect();
+    assert!(
+        !host_atoms.iter().any(|&(k, _)| k == "getrandom_backend"),
+        "non-wasm64 target must not get getrandom_backend: {host_atoms:?}"
+    );
+    let host_desc = crate::target_desc(&view, "aarch64-apple-darwin", alloc).expect("host TargetDesc");
+    assert!(!host_desc.cfg.iter().any(|a| a.name.as_str() == "getrandom_backend"));
+
+    // 2. Future toolchain cut that already records `getrandom_backend="custom"` must NOT duplicate it.
+    let already_cfg = [
+        ("getrandom_backend", Some("custom")),
+        ("panic", Some("abort")),
+        ("target_arch", Some("wasm64")),
+        ("target_os", Some("wasi")),
+    ];
+    let targets_dedup = [TargetIn { triple: crate::WASM64_TARGET, units: &[], cfg: &already_cfg }];
+    let bytes_dedup = record::write(&[], &targets_dedup, alloc).expect("record dedup");
+    let view_dedup = ToolchainView::open(bytes_dedup.as_slice(), ToolchainView::id_of_bytes(bytes_dedup.as_slice())).expect("view dedup");
+    let dedup_atoms: std::vec::Vec<_> = crate::target_cfg(&view_dedup, crate::WASM64_TARGET).expect("dedup cfg").collect();
+    assert_eq!(
+        dedup_atoms.iter().filter(|&&a| a == ("getrandom_backend", Some("custom"))).count(),
+        1,
+        "pre-existing getrandom_backend=\"custom\" must not be duplicated: {dedup_atoms:?}"
+    );
+    let dedup_desc = crate::target_desc(&view_dedup, crate::WASM64_TARGET, alloc).expect("dedup TargetDesc");
+    assert_eq!(
+        dedup_desc
+            .cfg
+            .iter()
+            .filter(|a| a.name.as_str() == "getrandom_backend" && a.value.as_deref() == Some("custom"))
+            .count(),
+        1,
+        "dedup TargetDesc must not duplicate getrandom_backend=\"custom\""
+    );
+}
