@@ -439,15 +439,19 @@ impl DiagSeverity {
     }
 }
 
-/// Parsed structure of one uncolored `stderr` line.
+/// Parsed structure of one uncolored diagnostic output line (`stderr` or diagnostic `stdout`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClassifiedLine<'a> {
     Header {
         severity: DiagSeverity,
         badge: &'a str,
+        /// Optional short fix/diagnostic id (e.g. `u7eys` in `blaze check` output).
+        id: Option<&'a str>,
+        /// Optional inline source location (e.g. `Cargo.toml:69:1`).
+        location: Option<&'a str>,
         body: &'a str,
     },
-    /// Indented `= note: ...` or `= help: ...` sub-annotation inside an existing diagnostic card.
+    /// Indented `= note:`, `= help:`, `fix:`, `note:`, `help:` sub-annotation inside an existing card.
     SubNote {
         severity: DiagSeverity,
         badge: &'a str,
@@ -457,6 +461,12 @@ pub enum ClassifiedLine<'a> {
     Location(&'a str),
     /// Compiler code frame line (`42 | let x = ...` or `   | ^^^`).
     CodeFrame(&'a str),
+    /// Build/check summary line (e.g. `0 errors, 1 warning, 1 fix: blaze check --fix u7eys`).
+    Summary {
+        has_errors: bool,
+        summary: &'a str,
+        command: Option<&'a str>,
+    },
     /// Plain line (body continuation or unstructured stderr).
     Plain(&'a str),
 }
@@ -466,6 +476,126 @@ fn is_short_tool_prefix(s: &str) -> bool {
         && s.len() <= 24
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
         && s.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+fn is_blaze_diag_id(s: &str) -> bool {
+    (3..=12).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && s.bytes().any(|b| b.is_ascii_alphabetic())
+        && !s.contains('.')
+        && !s.contains(':')
+}
+
+/// True when a token looks like `path/file.rs:42:1` or `Cargo.toml:69:1`.
+fn looks_like_inline_location(tok: &str) -> bool {
+    let mut parts = tok.split(':');
+    let Some(file) = parts.next() else { return false };
+    let Some(line) = parts.next() else { return false };
+    if line.is_empty() || !line.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    if let Some(col) = parts.next()
+        && (col.is_empty() || !col.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return false;
+    }
+    if parts.next().is_some() {
+        return false;
+    }
+    looks_like_file_path(file)
+}
+
+fn parse_severity_token(tok: &str) -> Option<DiagSeverity> {
+    let lower = tok.to_ascii_lowercase();
+    if lower == "error" || (lower.starts_with("error[") && lower.ends_with(']')) {
+        Some(DiagSeverity::Error)
+    } else if lower == "warning" || (lower.starts_with("warning[") && lower.ends_with(']')) {
+        Some(DiagSeverity::Warning)
+    } else {
+        None
+    }
+}
+
+/// Parse blaze-style diagnostic header lines such as:
+/// `u7eys  warning[unused-dependency]  Cargo.toml:69:1  dependency \`serde\` ...`
+/// or `warning[unused-dependency]  Cargo.toml:69:1  dependency \`serde\` ...`
+fn parse_blaze_diag_header(trimmed: &str) -> Option<ClassifiedLine<'_>> {
+    let mut rest = trimmed;
+    let first_end = rest.find(char::is_whitespace)?;
+    let first = &rest[..first_end];
+    rest = rest[first_end..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+
+    let (id, severity, badge, after_sev) = if let Some(sev) = parse_severity_token(first) {
+        // Must have bracketed code (e.g. `warning[foo]`) or inline location so we don't match prose!
+        if !first.contains('[') {
+            return None;
+        }
+        (None, sev, first, rest)
+    } else if is_blaze_diag_id(first) {
+        let sev_end = rest.find(char::is_whitespace)?;
+        let sev_tok = &rest[..sev_end];
+        let sev = parse_severity_token(sev_tok)?;
+        let after = rest[sev_end..].trim_start();
+        if after.is_empty() {
+            return None;
+        }
+        (Some(first), sev, sev_tok, after)
+    } else {
+        return None;
+    };
+
+    // Optional inline `file:line:col` location token right after the severity badge.
+    let (location, body) = if let Some(loc_end) = after_sev.find(char::is_whitespace) {
+        let cand = &after_sev[..loc_end];
+        if looks_like_inline_location(cand) {
+            (Some(cand), after_sev[loc_end..].trim_start())
+        } else {
+            (None, after_sev)
+        }
+    } else if looks_like_inline_location(after_sev) {
+        (Some(after_sev), "")
+    } else {
+        (None, after_sev)
+    };
+
+    Some(ClassifiedLine::Header {
+        severity,
+        badge,
+        id,
+        location,
+        body,
+    })
+}
+
+/// Parse a compact compiler/check summary line like:
+/// `0 errors, 1 warning, 1 fix: blaze check --fix u7eys`
+fn parse_summary_line(trimmed: &str) -> Option<ClassifiedLine<'_>> {
+    let num_end = trimmed.find(|c: char| !c.is_ascii_digit())?;
+    if num_end == 0 {
+        return None;
+    }
+    let err_count = trimmed[..num_end].parse::<u32>().ok()?;
+    let after_num = trimmed[num_end..].trim_start();
+    if !(after_num.starts_with("error") && after_num.contains("warning")) {
+        return None;
+    }
+    if let Some((left, right)) = trimmed.split_once(": ")
+        && !right.trim().is_empty()
+    {
+        return Some(ClassifiedLine::Summary {
+            has_errors: err_count > 0,
+            summary: left.trim(),
+            command: Some(right.trim()),
+        });
+    }
+    Some(ClassifiedLine::Summary {
+        has_errors: err_count > 0,
+        summary: trimmed,
+        command: None,
+    })
 }
 
 fn looks_like_code_frame(raw: &str) -> bool {
@@ -482,7 +612,7 @@ fn looks_like_code_frame(raw: &str) -> bool {
     false
 }
 
-/// Classify an uncolored `stderr` line into a structured diagnostic element.
+/// Classify an uncolored `stderr` / diagnostic `stdout` line into a structured diagnostic element.
 pub fn classify_stderr_line(raw: &str, exit_code: i32) -> ClassifiedLine<'_> {
     let trimmed = raw.trim_start();
     let indent = raw.len() - trimmed.len();
@@ -509,11 +639,40 @@ pub fn classify_stderr_line(raw: &str, exit_code: i32) -> ClassifiedLine<'_> {
             };
         }
     }
+    if indent > 0 {
+        if let Some(body) = trimmed.strip_prefix("fix:") {
+            return ClassifiedLine::SubNote {
+                severity: DiagSeverity::Help,
+                badge: "fix",
+                body: body.trim_start(),
+            };
+        }
+        if let Some(body) = trimmed.strip_prefix("help:").or_else(|| trimmed.strip_prefix("hint:")) {
+            return ClassifiedLine::SubNote {
+                severity: DiagSeverity::Help,
+                badge: "help",
+                body: body.trim_start(),
+            };
+        }
+        if let Some(body) = trimmed.strip_prefix("note:") {
+            return ClassifiedLine::SubNote {
+                severity: DiagSeverity::Note,
+                badge: "note",
+                body: body.trim_start(),
+            };
+        }
+    }
     if looks_like_code_frame(raw) {
         return ClassifiedLine::CodeFrame(raw);
     }
 
     if indent == 0 {
+        if let Some(summary) = parse_summary_line(trimmed) {
+            return summary;
+        }
+        if let Some(blaze_hdr) = parse_blaze_diag_header(trimmed) {
+            return blaze_hdr;
+        }
         // Explicit `error[E0308]: ...`, `error: ...`, `fatal: ...`
         if let Some(colon) = trimmed.find(':') {
             let head = &trimmed[..colon];
@@ -528,6 +687,8 @@ pub fn classify_stderr_line(raw: &str, exit_code: i32) -> ClassifiedLine<'_> {
                     return ClassifiedLine::Header {
                         severity: DiagSeverity::Error,
                         badge: head,
+                        id: None,
+                        location: None,
                         body,
                     };
                 }
@@ -538,6 +699,8 @@ pub fn classify_stderr_line(raw: &str, exit_code: i32) -> ClassifiedLine<'_> {
                     return ClassifiedLine::Header {
                         severity: DiagSeverity::Warning,
                         badge: head,
+                        id: None,
+                        location: None,
                         body,
                     };
                 }
@@ -545,6 +708,8 @@ pub fn classify_stderr_line(raw: &str, exit_code: i32) -> ClassifiedLine<'_> {
                     return ClassifiedLine::Header {
                         severity: DiagSeverity::Note,
                         badge: head,
+                        id: None,
+                        location: None,
                         body,
                     };
                 }
@@ -552,6 +717,8 @@ pub fn classify_stderr_line(raw: &str, exit_code: i32) -> ClassifiedLine<'_> {
                     return ClassifiedLine::Header {
                         severity: DiagSeverity::Help,
                         badge: head,
+                        id: None,
+                        location: None,
                         body,
                     };
                 }
@@ -560,6 +727,8 @@ pub fn classify_stderr_line(raw: &str, exit_code: i32) -> ClassifiedLine<'_> {
                     return ClassifiedLine::Header {
                         severity: DiagSeverity::Error,
                         badge: head,
+                        id: None,
+                        location: None,
                         body,
                     };
                 }
@@ -569,12 +738,28 @@ pub fn classify_stderr_line(raw: &str, exit_code: i32) -> ClassifiedLine<'_> {
             return ClassifiedLine::Header {
                 severity: DiagSeverity::Error,
                 badge: "panic",
+                id: None,
+                location: None,
                 body: trimmed,
             };
         }
     }
 
     ClassifiedLine::Plain(raw)
+}
+
+/// True when a group of uncolored `stdout` lines contains structured compiler/linter diagnostics
+/// (e.g. `blaze check`, `rustc`, `clippy`) and should be rendered with rich diagnostic cards.
+pub fn looks_like_diagnostic_output(lines: &[(i64, &str)], exit_code: i32) -> bool {
+    lines.iter().any(|&(_, raw)| {
+        if raw.trim().is_empty() {
+            return false;
+        }
+        matches!(
+            classify_stderr_line(raw, exit_code),
+            ClassifiedLine::Header { .. } | ClassifiedLine::Location(_)
+        )
+    })
 }
 
 /// Split an optional trailing parenthetical source hint like `(engine_body_plan.rs)` off the end
@@ -613,6 +798,8 @@ pub fn layout_stderr_diagnostic_group(
     struct Card<'a> {
         severity: DiagSeverity,
         badge: Option<&'a str>,
+        id: Option<&'a str>,
+        header_loc: Option<&'a str>,
         entries: Vec<CardEntry<'a>>,
     }
     enum CardEntry<'a> {
@@ -622,6 +809,7 @@ pub fn layout_stderr_diagnostic_group(
         SubNote { severity: DiagSeverity, badge: &'a str, body: &'a str },
         Location(&'a str),
         CodeFrame(&'a str),
+        Summary { summary: &'a str, command: Option<&'a str> },
     }
 
     let has_inline_md = |s: &str| {
@@ -636,11 +824,17 @@ pub fn layout_stderr_diagnostic_group(
             continue;
         }
         match classify_stderr_line(raw, exit_code) {
-            ClassifiedLine::Header { severity, badge, body } => {
+            ClassifiedLine::Header { severity, badge, id, location, body } => {
+                let mut entries = Vec::new();
+                if !body.is_empty() {
+                    entries.push(CardEntry::Prose(body));
+                }
                 cards.push(Card {
                     severity,
                     badge: Some(badge),
-                    entries: vec![CardEntry::Prose(body)],
+                    id,
+                    header_loc: location,
+                    entries,
                 });
             }
             ClassifiedLine::SubNote { severity, badge, body } => {
@@ -650,6 +844,8 @@ pub fn layout_stderr_diagnostic_group(
                     cards.push(Card {
                         severity,
                         badge: Some(badge),
+                        id: None,
+                        header_loc: None,
                         entries: vec![CardEntry::Prose(body)],
                     });
                 }
@@ -661,6 +857,8 @@ pub fn layout_stderr_diagnostic_group(
                     cards.push(Card {
                         severity: if exit_code != 0 { DiagSeverity::Error } else { DiagSeverity::Note },
                         badge: None,
+                        id: None,
+                        header_loc: None,
                         entries: vec![CardEntry::Location(loc)],
                     });
                 }
@@ -672,9 +870,20 @@ pub fn layout_stderr_diagnostic_group(
                     cards.push(Card {
                         severity: if exit_code != 0 { DiagSeverity::Error } else { DiagSeverity::Note },
                         badge: None,
+                        id: None,
+                        header_loc: None,
                         entries: vec![CardEntry::CodeFrame(frame)],
                     });
                 }
+            }
+            ClassifiedLine::Summary { has_errors, summary, command } => {
+                cards.push(Card {
+                    severity: if has_errors { DiagSeverity::Error } else { DiagSeverity::Help },
+                    badge: None,
+                    id: None,
+                    header_loc: None,
+                    entries: vec![CardEntry::Summary { summary, command }],
+                });
             }
             ClassifiedLine::Plain(txt) => {
                 let is_structured_card = cards.last().is_some_and(|c| c.badge.is_some());
@@ -689,6 +898,8 @@ pub fn layout_stderr_diagnostic_group(
                     cards.push(Card {
                         severity: if exit_code != 0 { DiagSeverity::Error } else { DiagSeverity::Info },
                         badge: None,
+                        id: None,
+                        header_loc: None,
                         entries: vec![entry],
                     });
                 }
@@ -734,7 +945,59 @@ pub fn layout_stderr_diagnostic_group(
                 clip_id,
             );
             scene.ui_small(inner_x + 6.0, cur_y + 0.5, badge, badge_fg, true, false, clip_id);
-            badge_indent = bw + 8.0;
+            let mut hx = inner_x + bw + 8.0;
+
+            if let Some(id) = card.id {
+                let id_w = id.chars().count() as f32 * m.cw + 10.0;
+                scene.round_rect(
+                    hx,
+                    cur_y + 0.5,
+                    hx + id_w,
+                    cur_y + 0.5 + bh,
+                    4.0,
+                    theme::BG_CHIP,
+                    1.0,
+                    theme::LINE,
+                    clip_id,
+                );
+                scene.text(hx + 5.0, cur_y, id, theme::INK_2, false, false, clip_id);
+                let hit = HitRect::new(hx, cur_y, hx + id_w, cur_y + m.ch);
+                scene.push_hit_clipped(hit, clip_id, HitAction::CopyText(id.to_owned()));
+                scene.push_hover_clipped(
+                    hit,
+                    clip_id,
+                    HoverKind::Tooltip {
+                        title: id.to_owned(),
+                        subtitle: Some("click to copy fix id".to_owned()),
+                    },
+                );
+                hx += id_w + 8.0;
+            }
+
+            if let Some(loc) = card.header_loc {
+                let avail = (x1 - 12.0 - right_reserve - hx).max(40.0);
+                let max_ch = (avail / m.cw).floor().max(8.0) as usize;
+                let shown = crate::view::truncate_middle(loc, max_ch);
+                let lw = shown.chars().count() as f32 * m.cw;
+                scene.text(hx, cur_y, &shown, theme::SERIES_BLUE, false, false, clip_id);
+                let hit = HitRect::new(hx, cur_y, hx + lw, cur_y + m.ch);
+                scene.push_hit_clipped(hit, clip_id, HitAction::CopyText(loc.to_owned()));
+                scene.push_hover_clipped(
+                    hit,
+                    clip_id,
+                    HoverKind::Tooltip {
+                        title: loc.to_owned(),
+                        subtitle: Some("click to copy location".to_owned()),
+                    },
+                );
+            }
+
+            if card.id.is_some() || card.header_loc.is_some() {
+                // Dedicated header row when diagnostic carries a fix id or inline source location.
+                cur_y += m.ch + 5.0;
+            } else {
+                badge_indent = bw + 8.0;
+            }
         }
 
         let body_color = match card.severity {
@@ -747,8 +1010,47 @@ pub fn layout_stderr_diagnostic_group(
 
         for (ei, entry) in card.entries.iter().enumerate() {
             let indent = if ei == 0 { badge_indent } else { 0.0 };
-            let reserve = if ei == 0 { right_reserve } else { 0.0 };
+            let reserve = if ei == 0 && card.id.is_none() && card.header_loc.is_none() {
+                right_reserve
+            } else {
+                0.0
+            };
             match *entry {
+                CardEntry::Summary { summary, command } => {
+                    let mut sx = inner_x;
+                    scene.text(sx, cur_y, summary, body_color, true, false, clip_id);
+                    sx += summary.chars().count() as f32 * m.cw;
+                    if let Some(cmd) = command {
+                        sx += 10.0;
+                        let avail = (x1 - 12.0 - reserve - sx - 10.0).max(40.0);
+                        let max_ch = (avail / m.cw).floor().max(8.0) as usize;
+                        let shown = crate::view::truncate_middle(cmd, max_ch);
+                        let cw = shown.chars().count() as f32 * m.cw + 10.0;
+                        scene.round_rect(
+                            sx,
+                            cur_y - 1.0,
+                            sx + cw,
+                            cur_y + m.ch + 1.0,
+                            4.0,
+                            theme::BG_CHIP,
+                            1.0,
+                            theme::LINE,
+                            clip_id,
+                        );
+                        scene.text(sx + 5.0, cur_y, &shown, theme::INK_1, false, false, clip_id);
+                        let hit = HitRect::new(sx, cur_y - 1.0, sx + cw, cur_y + m.ch + 1.0);
+                        scene.push_hit_clipped(hit, clip_id, HitAction::CopyText(cmd.to_owned()));
+                        scene.push_hover_clipped(
+                            hit,
+                            clip_id,
+                            HoverKind::Tooltip {
+                                title: cmd.to_owned(),
+                                subtitle: Some("click to copy command".to_owned()),
+                            },
+                        );
+                    }
+                    cur_y += m.ch + 3.0;
+                }
                 CardEntry::Verbatim(raw) => {
                     let avail_w = (inner_w - reserve).max(80.0);
                     let max_cols = (avail_w / m.cw).floor().max(16.0) as usize;
@@ -910,6 +1212,8 @@ mod tests {
             ClassifiedLine::Header {
                 severity: DiagSeverity::Error,
                 badge: "rg",
+                id: None,
+                location: None,
                 body: "ripgrep requires at least one pattern",
             }
         );
@@ -918,6 +1222,8 @@ mod tests {
             ClassifiedLine::Header {
                 severity: DiagSeverity::Note,
                 badge: "note",
+                id: None,
+                location: None,
                 body: "`crates/globset/src/serde_impl.rs`: no unit checks this file",
             }
         );
@@ -926,7 +1232,41 @@ mod tests {
             ClassifiedLine::Header {
                 severity: DiagSeverity::Error,
                 badge: "error[E0308]",
+                id: None,
+                location: None,
                 body: "mismatched types",
+            }
+        );
+        assert_eq!(
+            classify_stderr_line(
+                "u7eys  warning[unused-dependency]  Cargo.toml:69:1  dependency `serde` is declared",
+                0,
+            ),
+            ClassifiedLine::Header {
+                severity: DiagSeverity::Warning,
+                badge: "warning[unused-dependency]",
+                id: Some("u7eys"),
+                location: Some("Cargo.toml:69:1"),
+                body: "dependency `serde` is declared",
+            }
+        );
+        assert_eq!(
+            classify_stderr_line(
+                "  fix: delete `serde = \"1.0.77\"` (69:1-70:1): remove unused dependency `serde`",
+                0,
+            ),
+            ClassifiedLine::SubNote {
+                severity: DiagSeverity::Help,
+                badge: "fix",
+                body: "delete `serde = \"1.0.77\"` (69:1-70:1): remove unused dependency `serde`",
+            }
+        );
+        assert_eq!(
+            classify_stderr_line("0 errors, 1 warning, 1 fix: blaze check --fix u7eys", 0),
+            ClassifiedLine::Summary {
+                has_errors: false,
+                summary: "0 errors, 1 warning, 1 fix",
+                command: Some("blaze check --fix u7eys"),
             }
         );
         assert_eq!(
@@ -937,6 +1277,23 @@ mod tests {
             classify_stderr_line("42 | let x: u32 = \"hi\";", 1),
             ClassifiedLine::CodeFrame("42 | let x: u32 = \"hi\";")
         );
+    }
+
+    #[test]
+    fn looks_like_diagnostic_output_detects_blaze_check_stdout_and_ignores_plain_output() {
+        let blaze_stdout = [
+            (1i64, "note: `crates/globset/src/serde_impl.rs`: no unit checks this file"),
+            (2i64, "u7eys  warning[unused-dependency]  Cargo.toml:69:1  dependency `serde` is declared"),
+            (3i64, "  fix: delete `serde = \"1.0.77\"`"),
+            (4i64, "0 errors, 1 warning, 1 fix: blaze check --fix u7eys"),
+        ];
+        assert!(looks_like_diagnostic_output(&blaze_stdout, 0));
+
+        let normal_stdout = [
+            (1i64, "hello world"),
+            (2i64, "total 42"),
+        ];
+        assert!(!looks_like_diagnostic_output(&normal_stdout, 0));
     }
 
     #[test]

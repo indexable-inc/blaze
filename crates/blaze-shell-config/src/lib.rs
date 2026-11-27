@@ -47,6 +47,10 @@ pub const STARTER_CONFIG: &str = r#"# blaze-shell configuration (~/.config/blaze
 # [projects]
 # "/Volumes/Projects/tmp/hello-world" = "👋🌎"
 
+# Prompt display options:
+# [prompt]
+# show_toolchains = true
+
 # Custom command-position abbreviations (expanded inline on Space/Enter):
 # [abbreviations]
 # cl = "claude --dangerously-skip-permissions"
@@ -110,6 +114,9 @@ pub struct UserConfig<'a> {
     pub abbreviations: AVec<'a, NamedDesc<'a>>,
     /// Manual CLI flag/subcommand overrides (`[completions.<cmd>]`).
     pub completions: AVec<'a, CompletionSpecOverride<'a>>,
+    /// Whether to display detected project toolchain/language badges (Rust, Python, Nix, etc.)
+    /// in the prompt capsule (`[prompt] show_toolchains = true|false`, default `true`).
+    pub show_toolchains: bool,
 }
 
 impl<'a> UserConfig<'a> {
@@ -121,6 +128,7 @@ impl<'a> UserConfig<'a> {
             projects: Vec::new_in(alloc),
             abbreviations: Vec::new_in(alloc),
             completions: Vec::new_in(alloc),
+            show_toolchains: true,
         }
     }
 
@@ -173,6 +181,17 @@ impl<'a> UserConfig<'a> {
                                         desc: String::from_str_in(val_s, alloc),
                                     });
                                 }
+                            }
+                        }
+                    }
+                }
+                "prompt" => {
+                    if let DataValue::Map(m) = v {
+                        for (pk, pv) in m.iter() {
+                            if matches!(pk, "show_toolchains" | "toolchains")
+                                && let DataValue::Bool(b) = *pv
+                            {
+                                cfg.show_toolchains = b;
                             }
                         }
                     }

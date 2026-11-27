@@ -1233,7 +1233,7 @@ fn layout_starship_line(
     }
 
     // Segment 5: Detected project toolchain SVG icons (hover explains detected markers!).
-    if !prompt.project_icons.is_empty() {
+    if !prompt.hide_toolchains && !prompt.project_icons.is_empty() {
         cx += sep_pad;
         draw_divider(scene, cx);
         cx += sep_pad;
@@ -4319,9 +4319,20 @@ fn layout_command_output(
         return m.ch;
     }
 
-    let first_is_diag_card = lines
-        .first()
-        .is_some_and(|(_, s, l)| *s == blaze_sh::OutputStream::Stderr && !l.contains('\x1b'));
+    let first_is_diag_card = lines.first().is_some_and(|(_, s, l)| {
+        if l.contains('\x1b') {
+            return false;
+        }
+        if *s == blaze_sh::OutputStream::Stderr {
+            return true;
+        }
+        let first_stdout_group: Vec<(i64, &str)> = lines
+            .iter()
+            .take_while(|(_, st, ln)| *st == blaze_sh::OutputStream::Stdout && !ln.contains('\x1b'))
+            .map(|(at, _, ln)| (*at, ln.as_str()))
+            .collect();
+        crate::diag_view::looks_like_diagnostic_output(&first_stdout_group, out.exit_code)
+    });
 
     let text_w_first = (bx0 - x0 - 12.0).max(m.cw * 16.0);
     let full_cols = ((width - 10.0) / m.cw).floor().max(16.0) as usize;
@@ -4339,37 +4350,42 @@ fn layout_command_output(
         let (at_ns, stream, raw_line) = &display_lines[li];
         let is_err = *stream == blaze_sh::OutputStream::Stderr;
 
-        // Contiguous uncolored `stderr` lines render as crisp structured diagnostic cards
-        // (`error`, `warning`, `note`, `help`, `<tool>`, `--> loc`, code frames) with inline
-        // Markdown `` `code` `` chips and clean word-boundary wrapping!
-        if is_err && !raw_line.contains('\x1b') {
+        // Contiguous uncolored `stderr` lines — and diagnostic `stdout` groups (such as
+        // `blaze check`, `rustc`, `clippy` emitting `note:`, `warning[...]`, `error[...]`,
+        // `fix:`, `--> loc`) — render as crisp monospace diagnostic cards with clickable
+        // inline Markdown `` `code` `` chips and clean word-boundary wrapping!
+        if !raw_line.contains('\x1b') {
             let group_start = li;
+            let mut end = li;
             let mut group: Vec<(i64, &str)> = Vec::new();
-            while li < display_lines.len()
-                && display_lines[li].1 == blaze_sh::OutputStream::Stderr
-                && !display_lines[li].2.contains('\x1b')
+            while end < display_lines.len()
+                && display_lines[end].1 == *stream
+                && !display_lines[end].2.contains('\x1b')
             {
-                group.push((display_lines[li].0, display_lines[li].2.as_str()));
-                li += 1;
+                group.push((display_lines[end].0, display_lines[end].2.as_str()));
+                end += 1;
             }
-            let right_reserve = if row_idx == 0 { pill_w + 14.0 } else { 0.0 };
-            let card_y0 = cur_y;
-            let h = crate::diag_view::layout_stderr_diagnostic_group(
-                scene,
-                &group,
-                out.exit_code,
-                x0,
-                cur_y,
-                width,
-                right_reserve,
-                m,
-                clip_id,
-            );
-            cur_y += h + 4.0;
-            row_idx += li - group_start;
-            let at_lbl = format_duration_ns((*at_ns).max(0) as u64);
-            let _ = (card_y0, at_lbl);
-            continue;
+            if is_err || crate::diag_view::looks_like_diagnostic_output(&group, out.exit_code) {
+                li = end;
+                let right_reserve = if row_idx == 0 { pill_w + 14.0 } else { 0.0 };
+                let card_y0 = cur_y;
+                let h = crate::diag_view::layout_stderr_diagnostic_group(
+                    scene,
+                    &group,
+                    out.exit_code,
+                    x0,
+                    cur_y,
+                    width,
+                    right_reserve,
+                    m,
+                    clip_id,
+                );
+                cur_y += h + 4.0;
+                row_idx += li - group_start;
+                let at_lbl = format_duration_ns((*at_ns).max(0) as u64);
+                let _ = (card_y0, at_lbl);
+                continue;
+            }
         }
 
         let default_fg = if is_err {
@@ -7280,15 +7296,20 @@ fn layout_active_popover(
         }
         HoverKind::Directory { cwd } => {
             let parts = parent_breadcrumbs(cwd);
-            let shown = parts.len().clamp(1, 8);
-            let max_c = parts
+            let shown = parts.len().clamp(1, 7);
+            let indent_step = 14.0f32;
+            let max_row_w = parts
                 .iter()
-                .map(|(lbl, _)| lbl.chars().count())
-                .max()
-                .unwrap_or(16)
-                .max(24)
-                .min(50);
-            let w = (max_c as f32 * m.cw + pad_x * 2.0 + icon_s + 16.0).clamp(240.0, 460.0);
+                .take(shown)
+                .enumerate()
+                .map(|(i, (lbl, _))| {
+                    let indent = i as f32 * indent_step;
+                    let right_tag_w = if i + 1 == shown { 9.0 * m.cw } else { 5.0 * m.cw };
+                    indent + icon_s + 8.0 + lbl.chars().count().min(36) as f32 * m.cw + right_tag_w
+                })
+                .fold(0.0f32, f32::max);
+            let hdr_min_w = ("directory".len() + "click to cd".len() + 6) as f32 * m.cw;
+            let w = (max_row_w.max(hdr_min_w) + pad_x * 2.0 + 8.0).clamp(240.0, 440.0);
             let h = hdr_h + shown as f32 * row_h + pad_y;
             (w, h)
         }
@@ -8373,11 +8394,12 @@ fn layout_active_popover(
         HoverKind::Directory { cwd } => {
             let mut ry = draw_header(scene, "directory", "click to cd");
             let parts = parent_breadcrumbs(cwd);
-            let max_c = ((pop_w - pad_x * 2.0 - icon_s - 10.0) / m.cw).floor().max(8.0) as usize;
+            let total = parts.len();
+            let indent_step = 14.0f32;
             for (i, (label, full_path)) in parts.iter().enumerate() {
-                let is_cur = i + 1 == parts.len();
+                let is_cur = i + 1 == total;
                 let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
-                if is_hovered(row_rect) && !is_cur {
+                if is_hovered(row_rect) {
                     scene.overlay_round_rect(
                         row_rect.x0,
                         row_rect.y0,
@@ -8391,10 +8413,32 @@ fn layout_active_popover(
                     );
                 }
                 let ty = ry + (row_h - m.ch) * 0.5;
-                scene.overlay_svg_icon(x0 + pad_x, ty + (m.ch - icon_s) * 0.5, icon_s, "folder_macos", 0);
+                let cy = ry + row_h * 0.5;
+                let ix = x0 + pad_x + i as f32 * indent_step;
+
+                // Subtle GPU vector L-connector linking each nested folder to its parent icon.
+                if i > 0 {
+                    let parent_cx = x0 + pad_x + (i - 1) as f32 * indent_step + icon_s * 0.5;
+                    let top_y = ry - row_h * 0.5 + icon_s * 0.5 + 1.0;
+                    scene.overlay_line(parent_cx, top_y, parent_cx, cy, 1.25, theme::LINE_STRONG, 0);
+                    scene.overlay_line(parent_cx, cy, ix - 3.0, cy, 1.25, theme::LINE_STRONG, 0);
+                }
+
+                scene.overlay_svg_icon(ix, ty + (m.ch - icon_s) * 0.5, icon_s, "folder_macos", 0);
+                let depth_up = total.saturating_sub(1 + i);
+                let right_tag = if is_cur {
+                    "copy".to_owned()
+                } else if depth_up == 1 {
+                    "..".to_owned()
+                } else {
+                    format!("↑{depth_up}")
+                };
+                let tag_w = right_tag.chars().count() as f32 * m.cw;
+                let tx = ix + icon_s + 7.0;
+                let max_c = ((x1 - pad_x - tag_w - 10.0 - tx) / m.cw).floor().max(6.0) as usize;
                 let col = if is_cur { theme::INK_1 } else { theme::INK_2 };
                 scene.overlay_text_run(
-                    x0 + pad_x + icon_s + 7.0,
+                    tx,
                     ty,
                     truncate_chars(label, max_c),
                     col,
@@ -8402,7 +8446,15 @@ fn layout_active_popover(
                     false,
                     0,
                 );
-                if !is_cur {
+                let tag_col = if is_cur && is_hovered(row_rect) {
+                    theme::INK_2
+                } else {
+                    theme::INK_4
+                };
+                scene.overlay_text_run(x1 - pad_x - tag_w, ty, &right_tag, tag_col, false, false, 0);
+                if is_cur {
+                    scene.push_hit(row_rect, HitAction::CopyText(full_path.clone()));
+                } else {
                     scene.push_hit(row_rect, HitAction::ChangeDir(full_path.clone()));
                 }
                 ry += row_h;
@@ -9281,10 +9333,18 @@ fn parent_breadcrumbs(cwd: &str) -> Vec<(String, String)> {
     for seg in trimmed.split('/').filter(|s| !s.is_empty()) {
         acc.push('/');
         acc.push_str(seg);
-        out.push((acc.clone(), acc.clone()));
+        let label = if out.is_empty() {
+            format!("/{seg}")
+        } else {
+            seg.to_owned()
+        };
+        out.push((label, acc.clone()));
     }
     if out.len() > 6 {
         out = out.split_off(out.len() - 6);
+        if let Some((first_lbl, _)) = out.first_mut() {
+            *first_lbl = format!("…/{}", first_lbl.trim_start_matches('/'));
+        }
     }
     out
 }
