@@ -3098,7 +3098,7 @@ fn arg_shape<T: Tys>(tys: &T, t: Ty) -> crate::error::ArgShape {
     use crate::error::ArgShape;
     let k = tys.kind(tys.shallow_resolve(t));
     match k {
-        TyKind::ReStatic | TyKind::ReParam(_) | TyKind::ReErased => ArgShape::Region,
+        TyKind::ReStatic | TyKind::ReParam(_) | TyKind::ReErased | TyKind::ReBound(..) | TyKind::RePlaceholder(..) => ArgShape::Region,
         TyKind::Infer(v) if v.kind == VarKind::Region => ArgShape::Region,
         TyKind::Infer(v) if v.kind == VarKind::Const => ArgShape::Const,
         TyKind::ConstValue(..) | TyKind::ConstParam(_) => ArgShape::Const,

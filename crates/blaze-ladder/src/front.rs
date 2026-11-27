@@ -2749,7 +2749,7 @@ impl World for FrontWorld<'_, '_> {
         } else {
             &[]
         };
-        Ok(Predicates { clauses, types: self.front.tys.view() })
+        Ok(Predicates { clauses, types: self.front.tys.view(), regions: None })
     }
 
     fn adt(&self, _: Seal, item: ItemKey) -> Fetch<Option<tc::Adt<'_>>> {
@@ -2772,6 +2772,7 @@ impl World for FrontWorld<'_, '_> {
                     assoc_types: &i.assoc,
                     types: self.front.tys.view(),
                     polarity: blaze_typeck::ImplPolarity::Positive,
+                    regions: None,
                 }))
     }
 

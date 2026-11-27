@@ -733,11 +733,15 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
         // The default of a provided trait fn's `impl Trait` (super::rpitit `Twin`): its
         // source's bounds with itself as `Self`, filed with its trait's rows.
         if let Some(twin) = self.store.rpitit_defaults.get(&item) {
-            return Ok(Predicates { clauses: &twin.clauses, types: self.types() });
+            return Ok(Predicates { clauses: &twin.clauses, types: self.types(), regions: None });
         }
         match self.store.preds.get(&item) {
             Some(p) if !p.conds.is_empty() => self.gap(Gap::WhereConst(item)),
-            Some(p) => Ok(Predicates { clauses: &p.clauses, types: self.types() }),
+            Some(p) => Ok(Predicates {
+                clauses: &p.clauses,
+                types: self.types(),
+                regions: self.store.regions.made(item).map(|r| r as &dyn tc::region_facts::HeadRegionRead),
+            }),
             // A trait's associated type whose bounds were refused (`Store::trait_members`
             // files the refusal under the type's own key): the gap names it and why.
             None if self.store.fn_gaps.contains_key(&item) => {
@@ -980,6 +984,7 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 assoc_types,
                 types: self.types(),
                 polarity: i.polarity,
+                regions: self.store.regions.made(item).map(|r| r as &dyn tc::region_facts::HeadRegionRead),
             }));
         }
         match self.detail(item) {

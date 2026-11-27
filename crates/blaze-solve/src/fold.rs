@@ -428,6 +428,21 @@ fn import_zero_arity<T: Tys>(
         },
         // Removing the enclosing binder moves variables bound farther out one level closer.
         TyKind::Bound(d, x) if d > depth && !inst.bound.is_empty() => tys.mk(TyKind::Bound(d - 1, x)),
+        TyKind::ReBound(d, x) if d == depth && !inst.bound.is_empty() => match inst.bound.get(x as usize) {
+            Some(&b) => match tys.kind(b) {
+                TyKind::Placeholder(u, i) => tys.mk(TyKind::RePlaceholder(u, i)),
+                TyKind::Infer(_) => tys.mk(TyKind::ReErased),
+                _ => land(tys, s, b, depth),
+            },
+            None => Err(SolveError::Malformed(Malformed::Param {
+                index: x,
+                args: inst.bound.len() as u32,
+                at,
+                goal: None,
+                head: None,
+            })),
+        },
+        TyKind::ReBound(d, x) if d > depth && !inst.bound.is_empty() => tys.mk(TyKind::ReBound(d - 1, x)),
         _ => tys.mk(k),
     }
 }
@@ -671,6 +686,21 @@ pub(crate) fn instantiate_bound<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, root: 
                 Ok(Some(land(tys, s, arg, depth)?))
             }
             TyKind::Bound(d, i) if d > depth => Ok(Some(tys.reindex_bound(t, d - 1, i)?)),
+            TyKind::ReBound(d, i) if d == depth => {
+                if i >= with.len {
+                    return Err(SolveError::Malformed(Malformed::Param {
+                        index: i, args: with.len, at, goal: None, head: None,
+                    }));
+                }
+                let arg = tys.list_get(with, i);
+                let out = match tys.kind(arg) {
+                    TyKind::Placeholder(u, v) => tys.mk(TyKind::RePlaceholder(u, v))?,
+                    TyKind::Infer(_) => tys.mk(TyKind::ReErased)?,
+                    _ => land(tys, s, arg, depth)?,
+                };
+                Ok(Some(out))
+            }
+            TyKind::ReBound(d, i) if d > depth => Ok(Some(tys.mk(TyKind::ReBound(d - 1, i))?)),
             _ => Ok(None),
         }
     })

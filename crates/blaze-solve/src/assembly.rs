@@ -616,6 +616,11 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
         self.added.push(Added { source, pred, bound: 0, via_only: false, reach });
     }
 
+    /// [`Cx::add_from`] under `bound` higher-ranked bound variables (`for<'a, ..>`).
+    pub fn add_bound_from(&mut self, source: GoalSource, pred: Pred, bound: u32, reach: Reach) {
+        self.added.push(Added { source, pred, bound, via_only: false, reach });
+    }
+
     /// Adds a nested goal under `bound` bound variables.
     pub fn add_bound(&mut self, source: GoalSource, pred: Pred, bound: u32) {
         let reach = Reach::Nth(self.added.len() as u32);

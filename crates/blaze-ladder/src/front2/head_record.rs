@@ -4199,6 +4199,24 @@ impl FiledRegions {
     }
 }
 
+impl blaze_typeck::region_facts::HeadRegionRead for FiledRegions {
+    fn arity(&self) -> &dyn Arity {
+        FiledRegions::arity(self)
+    }
+
+    fn impl_header(&self) -> Option<(ColView<'_>, Option<ColView<'_>>)> {
+        self.regions().impl_header.as_ref().map(|(s, t)| (ColView::of(s), t.as_ref().map(ColView::of)))
+    }
+
+    fn clause_count(&self) -> usize {
+        self.regions().clauses.len()
+    }
+
+    fn clause(&self, idx: usize) -> Option<(u32, u32, ColView<'_>)> {
+        self.regions().clauses.get(idx).map(|c| (c.nth, c.binders, ColView::of(&c.col)))
+    }
+}
+
 /// `(k, n)` into the key-sorted `v`; whether `k` was there with another count.
 fn note(v: &mut Vec<(ItemKey, u32), Mem>, k: ItemKey, n: u32) -> bool {
     match v.binary_search_by(|e| e.0.cmp(&k)) {

@@ -222,6 +222,9 @@ pub struct ImplHeader<'w> {
     /// The trait's arguments, the self type first.
     pub args: List,
     pub where_clauses: &'w [Pred],
+    /// Number of bound regions (`for<'a, ..>`) on each corresponding clause of `where_clauses`
+    /// (empty when all clauses have 0 binders).
+    pub where_clause_bounds: &'w [u32],
     pub assoc: &'w [ImplAssoc],
     pub portable: Portable<'w>,
     pub digest: u64,

@@ -74,6 +74,21 @@ pub trait RegionFacts {
     fn impl_assoc(&self, impl_: ItemKey, name: crate::ids::Name) -> Result<ColView<'_>, RegionsUnread> { let _ = name; Err(RegionsUnread { item: impl_, why: UnreadWhy::NoHead }) }
 }
 
+/// Borrowed read of a head's region columns and the [`crate::regions::Arity`] table they were laid
+/// by, for trait-solver higher-ranked (`for<'a>`) and `'static` region checks.
+pub trait HeadRegionRead {
+    fn arity(&self) -> &dyn crate::regions::Arity;
+    fn impl_header(&self) -> Option<(ColView<'_>, Option<ColView<'_>>)>;
+    fn clause_count(&self) -> usize;
+    fn clause(&self, idx: usize) -> Option<(u32, u32, ColView<'_>)>;
+}
+
+impl core::fmt::Debug for dyn HeadRegionRead + '_ {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("HeadRegionRead").field("clauses", &self.clause_count()).finish()
+    }
+}
+
 /// A fn's signature regions, borrowed: its lifetime parameters, the column laid over
 /// `FnPtr(inputs.., output)`, and an async fn's written output.
 #[derive(Clone, Copy, Debug)]

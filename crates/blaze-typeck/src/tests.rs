@@ -804,7 +804,7 @@ impl crate::world::World for SigWorld<'_> {
         }))
     }
     fn predicates(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<crate::world::Predicates<'_>> {
-        Ok(crate::world::Predicates { clauses: &[], types: PTys::EMPTY })
+        Ok(crate::world::Predicates { clauses: &[], types: PTys::EMPTY, regions: None })
     }
     fn adt(&self, _: crate::world::Seal, _: ItemKey) -> crate::world::Fetch<Option<crate::world::Adt<'_>>> {
         Ok(None)
