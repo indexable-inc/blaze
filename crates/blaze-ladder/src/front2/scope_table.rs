@@ -247,6 +247,37 @@ pub(super) fn written<'n, S: super::source::NamesSource<'n>>(
     ns: crate::resolve::Ns,
     at: blaze_surface::Range,
 ) -> Result<Option<crate::resolve::Target>, super::types::Why> {
+    let found = written_raw(resolver, marks, body, view, path, absolute, segments, ns, at)?;
+    let Some(target) = found else { return Ok(None) };
+    // Mirror `blaze_scope::names` (names.rs): a whole one-segment path in the type namespace
+    // bound in a block to a module (e.g. `use std::u32;` then `value as u32` in proptest-derive)
+    // resolves to the built-in primitive type, since a module is never a type. As a prefix
+    // (`u32::MAX`) the module stands.
+    if !absolute
+        && segments.len() == 1
+        && ns == crate::resolve::Ns::Type
+        && target.kind == crate::resolve::Kind::Module
+        && let Some(&first) = segments.first()
+        && let Some(def) = blaze_scope::builtin_type(first)
+        && let Some(blaze_scope::Builtin::Named(name)) = blaze_scope::builtin_of(def.key)
+    {
+        return Ok(Some(crate::resolve::Target { key: def.key, kind: crate::resolve::Kind::Builtin(name), consumed: 1 }));
+    }
+    Ok(Some(target))
+}
+
+#[expect(clippy::too_many_arguments, reason = "mirrors written")]
+fn written_raw<'n, S: super::source::NamesSource<'n>>(
+    resolver: &crate::resolve::Paths<S>,
+    marks: Option<blaze_scope::crate_roots::TextMarks<'_>>,
+    body: &super::block_type_uses::BodyScope<'_>,
+    view: &View<'_>,
+    path: blaze_typeck::PathIdx,
+    absolute: bool,
+    segments: &[&str],
+    ns: crate::resolve::Ns,
+    at: blaze_surface::Range,
+) -> Result<Option<crate::resolve::Target>, super::types::Why> {
     use super::locals::{LocalKind, LocalNs};
     use super::types::Why;
 
