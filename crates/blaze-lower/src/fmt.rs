@@ -254,23 +254,43 @@ impl Machine<'_, '_, '_, '_> {
                     let spec = Range::new(at(spec_v.start), at(spec_v.end));
                     let spec_text = &text[spec_v.clone()];
                     // `name$` and `n$` in the spec name arguments; `.*` takes a positional
-                    // before the value's own.
-                    for (d, _) in spec_text.match_indices('$') {
-                        let before = &spec_text[..d];
-                        let start = before
-                            .char_indices()
-                            .rev()
-                            .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
-                            .last()
-                            .map_or(d, |(s, _)| s);
-                        let word = &before[start..];
-                        if word.chars().next().is_some_and(|c| !c.is_ascii_digit()) {
-                            let (ws, we) = (spec_v.start + start, spec_v.start + d);
-                            self.fmt_named(&written, &mut captured, &text[ws..we], Range::new(at(ws), at(we)));
+                    // before the value's own. Parse with `typeck::fmt_spec` (one concept, one
+                    // home) so zero-pad flags (`:0full$x`), alignment fills (`:0<full$`), and
+                    // precision names (`:.prec$`) extract the exact identifier span.
+                    if let Some(parsed) = crate::typeck::fmt_spec(spec_text) {
+                        for count in [parsed.width, parsed.precision].into_iter().flatten() {
+                            match count {
+                                crate::typeck::Count::Name(word) => {
+                                    let start = word.as_ptr().addr() - spec_text.as_ptr().addr();
+                                    let (ws, we) = (spec_v.start + start, spec_v.start + start + word.len());
+                                    if let Some(name) = text.get(ws..we) {
+                                        self.fmt_named(&written, &mut captured, name, Range::new(at(ws), at(we)));
+                                    }
+                                }
+                                crate::typeck::Count::Star => next += 1,
+                                crate::typeck::Count::Index(_) => {}
+                            }
                         }
-                    }
-                    if spec_text.contains(".*") {
-                        next += 1;
+                    } else {
+                        for (d, _) in spec_text.match_indices('$') {
+                            let Some(before) = spec_text.get(..d) else { continue };
+                            let start = before
+                                .char_indices()
+                                .rev()
+                                .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+                                .last()
+                                .map_or(d, |(s, _)| s);
+                            let Some(word) = before.get(start..) else { continue };
+                            if word.chars().next().is_some_and(|c| !c.is_ascii_digit()) {
+                                let (ws, we) = (spec_v.start + start, spec_v.start + d);
+                                if let Some(name) = text.get(ws..we) {
+                                    self.fmt_named(&written, &mut captured, name, Range::new(at(ws), at(we)));
+                                }
+                            }
+                        }
+                        if spec_text.contains(".*") {
+                            next += 1;
+                        }
                     }
                     let arg_text = arg.trim();
                     let positional = |index: u32| (index as usize) < written.len();

@@ -568,8 +568,9 @@ fn push_u32(out: &mut AString<'_>, mut n: u32) {
 }
 
 /// The key of what a unit given `implicit` reaches of the toolchain without naming it: its
-/// std (Rust's `std` or `bstd`, whose key holds `alloc`'s and `core`'s) and, for a proc-macro
-/// unit, `proc_macro`. A toolchain change moves it, so it moves every unit's key.
+/// std (Rust's `std` or `bstd`, whose key holds `alloc`'s and `core`'s) and `proc_macro`
+/// (in the extern prelude of a proc-macro unit, and nameable by `extern crate proc_macro;`
+/// on any Rust-edition unit). A toolchain change moves it, so it moves every unit's key.
 pub fn implicit_key<'w, B: AsRef<[u8]>>(toolchain: &Toolchain<'w, B>, implicit: blaze_unit_graph::Implicit) -> Result<CrateItemKey, WorldError<'w>> {
     let (std, role) = match implicit.std {
         blaze_unit_graph::StdIs::Rust => (toolchain.std(), "std"),
@@ -578,10 +579,13 @@ pub fn implicit_key<'w, B: AsRef<[u8]>>(toolchain: &Toolchain<'w, B>, implicit: 
     let std = std.ok_or(WorldError::NoToolchainCrate { role })?;
     let mut bytes = [0u8; 65];
     bytes[..32].copy_from_slice(&toolchain.crates()[std].key.0.0);
-    if implicit.proc_macro {
-        let pm = toolchain.proc_macro().ok_or(WorldError::NoToolchainCrate { role: "proc_macro" })?;
-        bytes[32..64].copy_from_slice(&toolchain.crates()[pm].key.0.0);
-        bytes[64] = 1;
+    if matches!(implicit.std, blaze_unit_graph::StdIs::Rust) || implicit.proc_macro {
+        let pm = toolchain
+            .proc_macro()
+            .and_then(|pm| toolchain.crates().get(pm))
+            .ok_or(WorldError::NoToolchainCrate { role: "proc_macro" })?;
+        bytes[32..64].copy_from_slice(&pm.key.0.0);
+        bytes[64] = u8::from(implicit.proc_macro);
     }
-    Ok(CrateItemKey(ContentId::of("blaze world implicit 1", &bytes)))
+    Ok(CrateItemKey(ContentId::of("blaze world implicit 2", &bytes)))
 }

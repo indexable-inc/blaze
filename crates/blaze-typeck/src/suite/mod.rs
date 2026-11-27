@@ -133,6 +133,10 @@ mod diag_node;
 mod undecided_origin;
 mod fn_ptr_fn_traits;
 
+pub(crate) fn clauses(cs: &[PClause]) -> Vec<PClause> {
+    cs.to_vec()
+}
+
 /// The keys of the world's items the cases name.
 struct Items {
     deref: ItemKey,

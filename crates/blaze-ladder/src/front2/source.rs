@@ -467,6 +467,12 @@ pub trait NamesSource<'n>: Copy {
     /// run path's reach, a census), never for one body.
     fn each_item(self, krate: usize, each: &mut dyn FnMut(ItemKey, ItemKey)) -> bool;
 
+    /// Question 25: each non-extern function item of crate `krate` whose signature head mentions
+    /// `no_mangle` or `export_name`, in key order, passing `(key, name, has_no_mangle, has_export_name)`.
+    /// Over records this scans only the `meta` column of `ItemsRecord` (zero file reads); under a
+    /// read recorder (`Tables`) it records `NameCell::Exports { krate }`.
+    fn each_export_candidate(self, krate: usize, alloc: Alloc<'_>, each: &mut dyn FnMut(ItemKey, Option<&'n str>, bool, bool)) -> bool;
+
     /// A block's direct binding, before globs. The outer option says whether the scope was read.
     fn block_binding(self, module: ItemKey, ns: Namespace, name: &str) -> Option<Option<blaze_surface::Binding>>;
 
@@ -704,11 +710,10 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>> {
         // An item with no place is declared by no block: as `program::placed` answered.
         let Some(Place { krate, at, item }) = self.place(key) else { return Some(None) };
-        let Some((text, outline)) = self.outline_at(krate, at) else { return Some(None) };
+        let krate = *self.crates().get(krate)?;
         // The one reading of a block's ABI, the items record writer's (`foreign_abi`): an ABI
         // it cannot read is not answered (`None`), as over records the record is not written.
-        let crate_key = self.crates().get(krate)?.key;
-        blaze_scope::items_record::foreign_abi(text, outline, outline.item(item), key, crate_key).ok()
+        blaze_scope::items_record::foreign_abi(krate, at, item, key).ok()
     }
 
     fn attr_value(self, key: ItemKey, attr: &'static str) -> Option<Option<RowValue<'n>>> {
@@ -831,6 +836,38 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         rows.sort_unstable_by_key(|&(key, _)| key);
         for &(key, module) in rows.iter() {
             each(key, module);
+        }
+        true
+    }
+
+    fn each_export_candidate(self, krate: usize, alloc: Alloc<'_>, each: &mut dyn FnMut(ItemKey, Option<&'n str>, bool, bool)) -> bool {
+        let Some(c) = self.crates().get(krate).copied() else {
+            return false;
+        };
+        if c.implicit.proc_macro {
+            return true;
+        }
+        let mut rows: AVec<'_, (ItemKey, Option<&'n str>, bool, bool)> = AVec::new_in(alloc);
+        for (key, _, _) in self.items(krate) {
+            if self.kind_of_item(key) != Some(ItemKind::Function) {
+                continue;
+            }
+            if self.extern_abi(key) != Some(None) {
+                continue;
+            }
+            let Some(text) = self.text_of(key) else {
+                continue;
+            };
+            let head = blaze_scope::names_cells::module_head(text.text);
+            let no_mangle = head.contains("no_mangle");
+            let export_name = head.contains("export_name");
+            if no_mangle || export_name {
+                rows.push((key, self.name_of(key), no_mangle, export_name));
+            }
+        }
+        rows.sort_unstable_by_key(|&(key, ..)| key);
+        for &(key, name, no_mangle, export_name) in rows.iter() {
+            each(key, name, no_mangle, export_name);
         }
         true
     }
@@ -2413,6 +2450,14 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         true
     }
 
+    fn each_export_candidate(self, krate: usize, _alloc: Alloc<'_>, each: &mut dyn FnMut(ItemKey, Option<&'n str>, bool, bool)) -> bool {
+        let Some(record) = self.items_of(krate) else { return false };
+        if record.proc_macro() {
+            return true;
+        }
+        self.read(krate, record.each_export_candidate(each)).is_some()
+    }
+
     fn block_binding(self, module: ItemKey, ns: Namespace, name: &str) -> Option<Option<blaze_surface::Binding>> {
         Some(self.names_of(self.crate_of(module)?)?.scope(module)?.get(ns, name))
     }
@@ -2572,7 +2617,7 @@ mod tests {
                 script: None,
             },
         ];
-        let solved = resolve_crates(&inputs, Sysroot { core: None, alloc: None, std: None, bstd: None }, &MemTexts, &blaze_scope::task::Serial, bump)
+        let solved = resolve_crates(&inputs, Sysroot::default(), &MemTexts, &blaze_scope::task::Serial, bump)
             .expect("solve test crates");
         let n0 = aligned(&names_record::encode(&solved.crates()[0], g).expect("encode n0"), bump);
         let n1 = aligned(&names_record::encode(&solved.crates()[1], g).expect("encode n1"), bump);

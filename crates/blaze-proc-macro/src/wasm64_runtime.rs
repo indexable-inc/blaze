@@ -579,6 +579,8 @@ impl Wasm64Instance {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use blaze_export::{
         lir_wasm64::{
             LirWasm64Func, LirWasm64Import, LirWasm64Module, LirWasm64Static, compile_lir_wasm64,
@@ -1574,7 +1576,8 @@ mod tests {
 
         // Call host_log from LIR and assert host captured the exact UTF-8 string from memory64.
         assert_eq!(inst.call_i32_0("emit_log").expect("emit_log runs"), 1);
-        let logs: std::vec::Vec<_> = inst.logs().collect();
+        let mut logs = AVec::new_in(test_alloc());
+        logs.extend(inst.logs());
         assert_eq!(logs, [(2, "hello from wasm64 lir!")]);
 
         // Inspect guest memory64 directly via `read_memory`.
@@ -1796,7 +1799,6 @@ mod tests {
 
     #[test]
     fn wasm64_build_script_runs_end_to_end_through_script_runtime() {
-        use std::sync::Arc;
         use blaze_build_script::{Env, key::{CMode, RunLimits}};
         use blaze_export::{
             lir_wasm64::{LirWasm64Global, LirWasm64GlobalValue},
@@ -1919,7 +1921,7 @@ mod tests {
         let rt = ScriptRuntime::new(&dir).expect("ScriptRuntime initializes");
         let loaded = rt.load("wasm64-demo 0.1.0", &wasm).expect("ScriptRuntime loads wasm64 module");
 
-        let vars = vec![("OUT_DIR".to_owned(), "/out".to_owned())];
+        let vars = [("OUT_DIR".to_owned(), "/out".to_owned())].into();
         let mut env_vars = blaze_own::Vec::new_in(alloc);
         env_vars.push((blaze_own::String::from_str_in("OUT_DIR", alloc), blaze_own::String::from_str_in("/out", alloc)));
         let env = Env { vars: env_vars };
@@ -1960,7 +1962,6 @@ mod tests {
 
     #[test]
     fn wasm64_proc_macro_runs_end_to_end_through_host_runtime() {
-        use std::sync::Arc;
         use blaze_expand::{Edition, ProcCall, ProcKind, lex};
         use blaze_export::{
             lir_wasm64::{LirWasm64Global, LirWasm64GlobalValue, LirWasm64RelocTarget, LirWasm64StaticReloc},
@@ -2151,10 +2152,11 @@ mod tests {
             name: "wasm64-pm-demo".to_owned(),
             version: "0.1.0".to_owned(),
             wasm_sha256: digest,
-            macros: vec![
-                Exported { index: 0, kind: ProcKind::FnLike, name: "demo".to_owned(), helpers: Vec::new() },
-                Exported { index: 1, kind: ProcKind::FnLike, name: "missing".to_owned(), helpers: Vec::new() },
-            ],
+            macros: [
+                Exported { index: 0, kind: ProcKind::FnLike, name: "demo".to_owned(), helpers: [].into() },
+                Exported { index: 1, kind: ProcKind::FnLike, name: "missing".to_owned(), helpers: [].into() },
+            ]
+            .into(),
             decls: "__rustc_proc_macro_decls_wasm64__".to_owned(),
             dir: dir.clone(),
             compiled: dir.join("compiled"),
@@ -2163,7 +2165,7 @@ mod tests {
 
         let rt = Runtime::new(blaze_own::testing::heap()).expect("Runtime initializes");
         let loaded = rt.load(&record).expect("Runtime loads wasm64 proc-macro reactor");
-        let env = PackageEnv::set_only(vec![("FOO".to_owned(), "bar64".to_owned())]).expect("PackageEnv");
+        let env = PackageEnv::set_only([("FOO".to_owned(), "bar64".to_owned())].into()).expect("PackageEnv");
         let pkg = Arc::new(Package::new(Files::Folder(pkg_dir), env).expect("Package"));
 
         let input = lex("struct Demo;", Edition::E2024, alloc).expect("lex");

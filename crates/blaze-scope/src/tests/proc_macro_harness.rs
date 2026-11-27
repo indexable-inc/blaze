@@ -184,7 +184,7 @@ pub fn most_traits() {}
     let zc_base = input("zerocopy_derive", "/zerocopy_derive/lib.rs", &[("core", 0)]);
     let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
     let crates = [core_in, CrateInput { implicit, ..zc_base }];
-    let sysroot = Sysroot { core: Some(CrateId(0)), alloc: None, std: None, bstd: None };
+    let sysroot = Sysroot { core: Some(CrateId(0)), ..Sysroot::default() };
     let names = resolve_crates(&crates, sysroot, &ZC_TEXTS, &Serial, super::SyncFrame::leaked())
         .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
 

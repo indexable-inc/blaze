@@ -3996,18 +3996,61 @@ fn ptrs_provably_disjoint(
     }
 }
 
+fn resolve_slot_root_any(view: &View<'_>, mut ptr: u32) -> Option<u32> {
+    for _ in 0..8 {
+        let pi = to_idx(ptr);
+        match view.op(pi) {
+            Op::SlotAddr => return Some(at_u32(view.data, pi)),
+            Op::PtrAdd => {
+                let at = to_idx(at_u32(view.data, pi));
+                ptr = at_u32(view.extra, at);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn blocks_temp_copy_elision(
     view: &View<'_>,
+    slot_escaped: &[bool],
     inst: usize,
     temp_slot: u32,
     src_origin: PtrOrigin,
+    src_root_slot: Option<u32>,
 ) -> bool {
     match view.op(inst) {
-        Op::Store
-        | Op::Memcpy
-        | Op::Memmove
-        | Op::Memset
-        | Op::MaskedStore
+        Op::Store => {
+            if Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE) {
+                return true;
+            }
+            let at = to_idx(at_u32(view.data, inst));
+            let dst = at_u32(view.extra, at.saturating_add(1));
+            if let Some(w_slot) = resolve_slot_root_any(view, dst)
+                && w_slot != temp_slot
+                && src_root_slot != Some(w_slot)
+                && !at_bool(slot_escaped, to_idx(w_slot))
+            {
+                return false;
+            }
+            true
+        }
+        Op::Memcpy | Op::Memmove | Op::Memset => {
+            if Flags(at_u8(view.flags, inst)).contains(Flags::VOLATILE) {
+                return true;
+            }
+            let at = to_idx(at_u32(view.data, inst));
+            let dst = at_u32(view.extra, at);
+            if let Some(w_slot) = resolve_slot_root_any(view, dst)
+                && w_slot != temp_slot
+                && src_root_slot != Some(w_slot)
+                && !at_bool(slot_escaped, to_idx(w_slot))
+            {
+                return false;
+            }
+            true
+        }
+        Op::MaskedStore
         | Op::Scatter
         | Op::Call
         | Op::CallIndirect
@@ -4033,7 +4076,7 @@ fn blocks_temp_copy_elision(
                 match src_origin {
                     PtrOrigin::Slot { slot: s_slot, .. } => k_slot == s_slot,
                     PtrOrigin::EntryParam | PtrOrigin::Data => false,
-                    PtrOrigin::Unknown => true,
+                    PtrOrigin::Unknown => src_root_slot.is_none_or(|s| k_slot == s),
                 }
             }
         }
@@ -4051,16 +4094,16 @@ fn eliminate_temp_bulk_copies_round<A: Allocator + Copy>(
         return Ok(None);
     }
 
-    let mut has_bulk_copy = false;
+    let mut has_bulk = false;
     for inst in 0..len {
-        if matches!(view.op(inst), Op::Memcpy | Op::Memmove)
+        if matches!(view.op(inst), Op::Memcpy | Op::Memmove | Op::Memset)
             && Flags(at_u8(view.flags, inst)).0 == 0
         {
-            has_bulk_copy = true;
+            has_bulk = true;
             break;
         }
     }
-    if !has_bulk_copy {
+    if !has_bulk {
         return Ok(None);
     }
 
@@ -4068,6 +4111,55 @@ fn eliminate_temp_bulk_copies_round<A: Allocator + Copy>(
     for inst in 0..len {
         if view.op(inst) == Op::SlotAddr {
             set_at(&mut slot_addr_of, inst, at_u32(view.data, inst));
+        }
+    }
+
+    // Track whether any `Op::SlotAddr` (or `Op::PtrAdd` derived from it) escapes beyond direct
+    // memory-op address operands. Writes to a non-escaping slot cannot alias any pointer that does
+    // not derive from that same slot.
+    let mut slot_escaped = filled(nslots, false, &alloc);
+    for inst in 0..len {
+        match view.op(inst) {
+            Op::SlotAddr | Op::SlotLive | Op::SlotDead | Op::PtrAdd | Op::Load => {}
+            Op::Store => {
+                let at = to_idx(at_u32(view.data, inst));
+                let val = at_u32(view.extra, at);
+                if let Some(s) = resolve_slot_root_any(&view, val) {
+                    set_at(&mut slot_escaped, to_idx(s), true);
+                }
+            }
+            Op::Memcpy | Op::Memmove | Op::Memset | Op::Memcmp => {
+                let at = to_idx(at_u32(view.data, inst));
+                let len_val = at_u32(view.extra, at.saturating_add(2));
+                if let Some(s) = resolve_slot_root_any(&view, len_val) {
+                    set_at(&mut slot_escaped, to_idx(s), true);
+                }
+                if view.op(inst) == Op::Memset {
+                    let byte_val = at_u32(view.extra, at.saturating_add(1));
+                    if let Some(s) = resolve_slot_root_any(&view, byte_val) {
+                        set_at(&mut slot_escaped, to_idx(s), true);
+                    }
+                }
+            }
+            _ => {
+                each(&view, inst, |item| match item {
+                    Item::Value(v) => {
+                        if let Some(s) = resolve_slot_root_any(&view, v) {
+                            set_at(&mut slot_escaped, to_idx(s), true);
+                        }
+                    }
+                    Item::Edge(edge) => {
+                        if let Some((arg_start, arg_len)) = edge.args {
+                            for k in 0..arg_len {
+                                let v = at_u32(view.extra, arg_start.saturating_add(k));
+                                if let Some(s) = resolve_slot_root_any(&view, v) {
+                                    set_at(&mut slot_escaped, to_idx(s), true);
+                                }
+                            }
+                        }
+                    }
+                });
+            }
         }
     }
 
@@ -4211,9 +4303,6 @@ fn eliminate_temp_bulk_copies_round<A: Allocator + Copy>(
         }
     }
 
-    if readers.is_empty() {
-        return Ok(None);
-    }
     readers.sort_unstable_by_key(|r| (r.slot, r.inst));
 
     let mut rewrites = filled(len, TempCopyRewrite::Keep, &alloc);
@@ -4236,6 +4325,39 @@ fn eliminate_temp_bulk_copies_round<A: Allocator + Copy>(
         let r_len = r_rest.partition_point(|r| r.slot == s32);
         let slot_readers = r_rest.get(..r_len).unwrap_or(&[]);
         if slot_readers.is_empty() {
+            // Dead write-only temp slot (never read, never escapes): delete the write whenever
+            // it is provably trap-free (`Memset` to in-bounds local slot, or `Copy` from static
+            // `DataAddr` or an in-bounds local stack slot).
+            match writer {
+                TempWriterKind::None => {}
+                TempWriterKind::Memset { inst: w_u32, .. } => {
+                    let w_inst = to_idx(w_u32);
+                    if !at_bool(&inst_touched, w_inst) {
+                        set_at(&mut inst_touched, w_inst, true);
+                        set_at(&mut rewrites, w_inst, TempCopyRewrite::Delete);
+                        set_at(&mut slot_eliminated, s, true);
+                        eliminated_count = eliminated_count.saturating_add(1);
+                    }
+                }
+                TempWriterKind::Copy { inst: w_u32, src: w_src, len: w_len, .. } => {
+                    let w_inst = to_idx(w_u32);
+                    if !at_bool(&inst_touched, w_inst) {
+                        let src_origin = resolve_ptr_origin(&view, &block_of, w_src);
+                        let trap_free_read = matches!(src_origin, PtrOrigin::Data)
+                            || matches!(
+                                src_origin,
+                                PtrOrigin::Slot { slot: src_s, off: Some(o) }
+                                    if slot_range_in_bounds(&view, src_s, o, w_len)
+                            );
+                        if trap_free_read {
+                            set_at(&mut inst_touched, w_inst, true);
+                            set_at(&mut rewrites, w_inst, TempCopyRewrite::Delete);
+                            set_at(&mut slot_eliminated, s, true);
+                            eliminated_count = eliminated_count.saturating_add(1);
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -4318,9 +4440,17 @@ fn eliminate_temp_bulk_copies_round<A: Allocator + Copy>(
                 }
 
                 let src_origin = resolve_ptr_origin(&view, &block_of, w_src);
+                let src_root_slot = resolve_slot_root_any(&view, w_src);
                 let mut blocked = false;
                 for k in w_inst.saturating_add(1)..r_inst {
-                    if blocks_temp_copy_elision(&view, k, s32, src_origin) {
+                    if blocks_temp_copy_elision(
+                        &view,
+                        &slot_escaped,
+                        k,
+                        s32,
+                        src_origin,
+                        src_root_slot,
+                    ) {
                         blocked = true;
                         break;
                     }
@@ -4615,7 +4745,7 @@ pub fn compact_dead_slots<A: Allocator + Copy>(
 // ============================================================================
 
 const MAX_SMALL_COPY_CHUNKS: usize = 8;
-const MAX_SMALL_SLOT_COPY_BYTES: u64 = 32;
+const MAX_SMALL_SLOT_COPY_BYTES: u64 = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct CopyChunk {
@@ -4699,6 +4829,12 @@ fn bulk_small_memop(view: &View<'_>, inst: usize) -> Option<BulkMemop> {
 
 #[inline]
 fn field_copy_ty_bytes(ty: Ty, ptr_bits: u32) -> Option<i64> {
+    if matches!(ty.form(), crate::ty::Form::Vector)
+        && ty.bits(64) == 128
+        && !matches!(ty.elem(), crate::Scalar::F16 | crate::Scalar::F128 | crate::Scalar::Ptr | crate::Scalar::I1)
+    {
+        return Some(16);
+    }
     if !ty.is_scalar() {
         return None;
     }
@@ -4754,6 +4890,46 @@ fn collect_slot_fields<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> SlotFi
     }
     accesses.sort_unstable();
     accesses.dedup();
+    // Collapse same-(slot, off) native 128-bit vector type puns (e.g. `<4 x i32>` + `<16 x i8>`)
+    // into canonical `<16 x i8>` so `match_slot_fields` matches across `to_ne_bytes`/`from_ne_bytes`.
+    if let Some(canon_v16) = Ty::vector(crate::Scalar::I8, 16) {
+        let mut read = 0usize;
+        let mut write = 0usize;
+        while let Some(&first) = accesses.get(read) {
+            let mut end = read + 1;
+            while let Some(next) = accesses.get(end)
+                && next.slot == first.slot
+                && next.off == first.off
+            {
+                end += 1;
+            }
+            let collapse = end - read >= 2
+                && accesses.get(read..end).is_some_and(|group| {
+                    group.iter().all(|acc| {
+                        acc.size == 16
+                            && matches!(acc.ty.form(), crate::ty::Form::Vector)
+                            && acc.ty.bits(64) == 128
+                    })
+                });
+            if collapse {
+                if let Some(dst) = accesses.get_mut(write) {
+                    *dst = SlotAccess { slot: first.slot, off: first.off, size: 16, ty: canon_v16 };
+                    write += 1;
+                }
+            } else {
+                for i in read..end {
+                    if let Some(&src) = accesses.get(i)
+                        && let Some(dst) = accesses.get_mut(write)
+                    {
+                        *dst = src;
+                        write += 1;
+                    }
+                }
+            }
+            read = end;
+        }
+        accesses.truncate(write);
+    }
     SlotFields { accesses }
 }
 

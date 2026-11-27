@@ -522,7 +522,7 @@ impl BlockStore {
             BlockBody::StreamAndValue { lines: vec![note.to_owned()], value: Value::Nothing },
         );
         Some(HandedOffTerminal {
-            source: blk.source.clone(),
+            source: blk.source.as_str().to_owned(),
             prompt_snapshot: blk.prompt_snapshot.clone(),
             state_before: blk.state_before.fork(),
             state_after: blk.state_after.fork(),

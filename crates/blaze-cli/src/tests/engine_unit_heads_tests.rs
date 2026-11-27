@@ -265,3 +265,181 @@ fn a_head_edit_and_a_cfg_move_each_unit_s_readers() {
     assert!(cfg.stages[blaze_engine::Stage::Bodies.index()].entered >= 1, "`user` entered for the lib unit's cell gone: {}", entries(&cfg));
     assert_eq!(cfg.seeds.not_put.member, 0, "`f` under cfg(test): no member head frozen by a body:\n{}", heads_lines(&cfg));
 }
+
+/// Multi-mounted `#[path = "shared.rs"]` modules within the SAME crate unit: `a` and `b` both
+/// mount `shared.rs` (which defines `pub struct Rig`, `impl Rig { pub fn f(&self) -> usize }`,
+/// `pub const N: usize = 1;`, and `pub fn sid() -> usize { N }`). Both mounts freeze distinct
+/// head cells under the same unit, index all bodies in `ByChain` without `ChainError::Collision`,
+/// and check cleanly on both cold runs and warm single-body edits (`place_direct_file`).
+#[test]
+fn multi_mounted_path_modules_freeze_distinct_cells_and_check_clean() {
+    const SHARED: &str = r#"pub struct Rig {
+    pub v: usize,
+}
+
+impl Rig {
+    pub fn f(&self) -> usize {
+        self.v + N
+    }
+}
+
+pub const N: usize = 1;
+
+pub fn sid() -> usize {
+    N
+}
+"#;
+    const LIB: &str = r#"#[lang = "sized"]
+pub trait Sized {}
+#[lang = "copy"]
+pub trait Copy {}
+
+#[path = "shared.rs"]
+pub mod a;
+#[path = "shared.rs"]
+pub mod b;
+
+pub fn use_both() -> usize {
+    let ra = a::Rig { v: a::sid() };
+    let rb = b::Rig { v: b::sid() };
+    ra.f() + rb.f() + a::N + b::N
+}
+
+#[cfg(test)]
+mod tests {
+    pub fn check_both() -> usize {
+        let ra = crate::a::Rig { v: crate::a::sid() };
+        let rb = crate::b::Rig { v: crate::b::sid() };
+        ra.f() + rb.f() + super::use_both()
+    }
+}
+"#;
+    const LIB_EDIT: &str = r#"#[lang = "sized"]
+pub trait Sized {}
+#[lang = "copy"]
+pub trait Copy {}
+
+#[path = "shared.rs"]
+pub mod a;
+#[path = "shared.rs"]
+pub mod b;
+
+pub fn use_both() -> usize {
+    let ra = a::Rig { v: a::sid() + 1 };
+    let rb = b::Rig { v: b::sid() + 2 };
+    ra.f() + rb.f() + a::N + b::N
+}
+
+#[cfg(test)]
+mod tests {
+    pub fn check_both() -> usize {
+        let ra = crate::a::Rig { v: crate::a::sid() };
+        let rb = crate::b::Rig { v: crate::b::sid() };
+        ra.f() + rb.f() + super::use_both()
+    }
+}
+"#;
+    let io = Io::simulated(SimWorld::new(37, Limits::USUAL));
+    write(&io, "Cargo.toml", "[package]\nname = \"multi\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(&io, "src/lib.rs", LIB);
+    write(&io, "src/shared.rs", SHARED);
+
+    let (_, cold_text, cold) = run(&io, 1, false, HeadUnits::Each);
+    all_clean("multi_mounted_path_cold", &cold_text, &cold, 1);
+    // Both module mounts (`a::*` and `b::*`) in each unit must be counted separately in
+    // `UnitCounts::frozen` and `UnitCounts::items` (matching `once.frozen` cell-for-cell:
+    // 5 heads in shared.rs * 2 mounts * 2 units = 20, plus lib.rs's Sized/Copy/use_both/check_both).
+    assert_eq!(
+        cold.seeds.units.frozen,
+        cold.seeds.once.frozen,
+        "UnitCounts::frozen must count every frozen cell across all module mounts:\n{}",
+        heads_lines(&cold)
+    );
+    assert!(
+        cold.seeds.units.items >= 12 && cold.seeds.units.frozen >= 23,
+        "expected both mounts' items and cells counted separately (frozen={}, items={}):\n{}",
+        cold.seeds.units.frozen,
+        cold.seeds.units.items,
+        heads_lines(&cold)
+    );
+    let (bad, _) = head_reads_of_bodies(&io);
+    assert!(bad.is_empty(), "cold: every body head read is defined by its head task: {bad:?}");
+
+    // Warm single-body edit exercises O(1) `place_direct_file` with `row.module`.
+    write(&io, "src/lib.rs", LIB_EDIT);
+    let (_, warm_text, warm) = run(&io, 1, false, HeadUnits::Each);
+    assert!(warm.bodies.0.is_empty(), "warm edit: every body checked clean: {:?}\n{warm_text}", warm.bodies.0);
+    assert!(error_lines(&warm_text).is_empty(), "warm edit: no errors:\n{warm_text}");
+    assert_eq!(warm.seeds.bodies.refused, 0, "warm edit: no body refused at a seed:\n{}", heads_lines(&warm));
+    assert_eq!(warm.seeds.not_put.member, 0, "warm edit: every member head taken from table:\n{}", heads_lines(&warm));
+    let (bad, _) = head_reads_of_bodies(&io);
+    assert!(bad.is_empty(), "warm edit: every body head read is defined by its head task: {bad:?}");
+}
+
+/// When two `#[path = "shared.rs"]` module mounts emit the exact same diagnostic on one shared
+/// body, `dup_exact` deduplicates the displayed finding and reconciles `Outcome::made`'s
+/// `findings` count so the stored row's `findings` equals the displayed error count (1, not 2).
+#[test]
+fn multi_mounted_path_deduped_finding_count_matches_displayed() {
+    let io = Io::simulated(SimWorld::new(41, Limits::USUAL));
+    write(&io, "Cargo.toml", "[package]\nname = \"multi_diag\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io,
+        "src/lib.rs",
+        "#[path = \"shared.rs\"]\npub mod a;\n#[path = \"shared.rs\"]\npub mod b;\n",
+    );
+    write(&io, "src/shared.rs", "pub fn bad() -> u8 {\n    \"wrong\"\n}\n");
+
+    let (ids, text, _) = run(&io, 1, false, HeadUnits::Each);
+    let errors = error_lines(&text);
+    assert_eq!(errors.len(), 1, "two identical mounts must display 1 deduplicated error:\n{text}");
+    assert_eq!(ids.len(), 1, "displayed finding ids must match: {ids:?}");
+
+    // Inspect the stored `BodyCheck` rows to confirm `Done::findings` matches the retained count.
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let root = fs.open_dir(&cx, &Path::new("ws").expect("ws")).expect("open ws");
+    let err = io.need_err().expect("err");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("clock")));
+    let body_findings = crate::engine_why::with_kept(&cx, &fs, &host, &mut rng, &root, &opts(&io, 1, false), &mut phases, &err, |kept| {
+        kept.answer
+            .rows
+            .iter()
+            .filter(|(name, _)| name.kind == blaze_drive::Kind::BodyCheck)
+            .map(|(_, row)| row.findings)
+            .collect::<std::vec::Vec<_>>()
+    })
+    .expect("with_kept")
+    .expect("stored answer");
+    assert!(!body_findings.is_empty(), "expected at least one stored BodyCheck row");
+    let nonzero: std::vec::Vec<u32> = body_findings.into_iter().filter(|&n| n > 0).collect();
+    assert!(!nonzero.is_empty(), "expected non-zero findings row for `bad`");
+    assert!(
+        nonzero.iter().all(|&n| n == 1),
+        "each stored BodyCheck row for deduplicated `bad` must record findings == 1 (matching displayed count), got {nonzero:?}"
+    );
+}
+
+/// Negative control: two duplicate items with identical `(module, want_kind, name)` under one
+/// covering entry in the SAME module (here two `fn dup();` declarations in one `extern "C"` block)
+/// must still collide onto one cell and trigger the `two heads of its entry fall under one cell`
+/// refusal.
+#[test]
+fn same_module_duplicate_heads_under_one_entry_still_collide() {
+    let io = Io::simulated(SimWorld::new(39, Limits::USUAL));
+    write(&io, "Cargo.toml", "[package]\nname = \"dup_cell\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io,
+        "src/lib.rs",
+        "unsafe extern \"C\" {\n    fn dup();\n    fn dup();\n}\n\npub fn caller() {\n    unsafe { dup(); }\n}\n",
+    );
+    let (_, text, checked) = run(&io, 1, false, HeadUnits::Each);
+    assert!(
+        text.contains("two heads of its entry fall under one cell")
+            || checked.bodies.0.iter().any(|note| note.contains("two heads of its entry fall under one cell")),
+        "expected same-module collision refusal in output or body notes:\n{text}\nnotes: {:?}",
+        checked.bodies.0
+    );
+}

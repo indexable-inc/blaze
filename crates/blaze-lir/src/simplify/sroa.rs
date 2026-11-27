@@ -197,9 +197,30 @@ fn constant(view: &View<'_>, value: u32) -> Option<i128> {
     Some(((bits << shift) as i128) >> shift)
 }
 
-/// The bytes a scalar of `ty` takes.
+/// The bytes a scalar or fixed-width vector of `ty` takes.
 fn bytes(ty: Ty, ptr_bits: u32) -> i128 {
     i128::from(ty.bits(ptr_bits).div_ceil(8))
+}
+
+/// True for fixed-width native 128-bit SIMD vectors (`<16 x i8>`, `<8 x i16>`, `<4 x i32>`,
+/// `<2 x i64>`, `<4 x f32>`, `<2 x f64>`) that AArch64/x86-64 lower directly in vector registers.
+#[inline]
+const fn is_native_vec128(ty: Ty) -> bool {
+    matches!(ty.form(), crate::ty::Form::Vector)
+        && ty.bits(64) == 128
+        && !matches!(ty.elem(), crate::Scalar::F16 | crate::Scalar::F128 | crate::Scalar::Ptr | crate::Scalar::I1)
+}
+
+/// True for types SROA can promote from stack slots into SSA values and block parameters.
+#[inline]
+const fn is_sroa_ty(ty: Ty) -> bool {
+    ty.is_scalar() || is_native_vec128(ty)
+}
+
+/// True for SROA field types that can be synthesized from an all-zero `memset`.
+#[inline]
+const fn is_zeroable_ty(ty: Ty) -> bool {
+    (ty.is_scalar() && (ty.is_int() || ty.is_ptr() || ty.is_float())) || is_native_vec128(ty)
 }
 
 /// The function's block graph: edges both ways, reverse postorder, dominators and the
@@ -639,7 +660,7 @@ fn promote_slot_addr_phis_round<A: Allocator + Copy>(
                     (Op::Load, 0) if non_volatile => {
                         let ty = Ty(at_u16(view.tys, at));
                         let off = i128::from(at_u32(view.extra, to_idx(at_u32(view.data, at)) + 1).cast_signed());
-                        ty.is_scalar()
+                        is_sroa_ty(ty)
                             && base
                                 .checked_add(off)
                                 .is_some_and(|total| total >= 0 && total + bytes(ty, ptr_bits) <= slot_size)
@@ -649,7 +670,7 @@ fn promote_slot_addr_phis_round<A: Allocator + Copy>(
                         let stored = at_u32(view.extra, extra_at);
                         let ty = Ty(at_u16(view.tys, to_idx(stored)));
                         let off = i128::from(at_u32(view.extra, extra_at + 2).cast_signed());
-                        ty.is_scalar()
+                        is_sroa_ty(ty)
                             && base
                                 .checked_add(off)
                                 .is_some_and(|total| total >= 0 && total + bytes(ty, ptr_bits) <= slot_size)
@@ -843,7 +864,7 @@ fn promote_slot_addr_phis_round<A: Allocator + Copy>(
                                 let load_ty = Ty(at_u16(view.tys, inst));
                                 let extra_at = to_idx(at_u32(view.data, inst));
                                 let load_off = i128::from(at_u32(view.extra, extra_at + 1).cast_signed());
-                                if !load_ty.is_scalar() || load_ty.is_none() || load_off < 0 {
+                                if !is_sroa_ty(load_ty) || load_ty.is_none() || load_off < 0 {
                                     uses_ok = false;
                                 } else if let Some(total_off) = base_off.checked_add(load_off) {
                                     if total_off >= 0 && i32::try_from(total_off).is_ok() {
@@ -969,7 +990,7 @@ fn promote_slot_addr_phis_round<A: Allocator + Copy>(
                                         at_u32(view.extra, to_idx(at_u32(view.data, inst)) + 1).cast_signed(),
                                     );
                                     if let Some(total) = base.checked_add(off) {
-                                        if ty.is_scalar()
+                                        if is_sroa_ty(ty)
                                             && total >= 0
                                             && total + bytes(ty, ptr_bits) <= slot_size
                                         {
@@ -987,7 +1008,7 @@ fn promote_slot_addr_phis_round<A: Allocator + Copy>(
                                     let ty = Ty(at_u16(view.tys, to_idx(stored)));
                                     let off = i128::from(at_u32(view.extra, extra_at + 2).cast_signed());
                                     if let Some(total) = base.checked_add(off) {
-                                        if ty.is_scalar()
+                                        if is_sroa_ty(ty)
                                             && total >= 0
                                             && total + bytes(ty, ptr_bits) <= slot_size
                                         {
@@ -1187,7 +1208,7 @@ fn promote_slot_addr_phis_round<A: Allocator + Copy>(
                         let ty = Ty(f_ty_raw);
                         let f_end = f_off + bytes(ty, ptr_bits);
                         if f_off < z_end && f_end > z_start {
-                            let zeroable = ty.is_int() || ty == Ty::PTR || ty.is_float();
+                            let zeroable = is_zeroable_ty(ty);
                             if f_off < z_start || f_end > z_end || !zeroable {
                                 slots_ok = false;
                                 break;
@@ -1481,7 +1502,7 @@ impl<A: Allocator + Copy> Walk<'_, A> {
             (Op::Load, 0) if non_volatile => {
                 o.value();
                 let ty = Ty(view.tys[at]);
-                match (ty.is_scalar(), base.checked_add(i128::from(o.offset()))) {
+                match (is_sroa_ty(ty), base.checked_add(i128::from(o.offset()))) {
                     (true, Some(offset)) => {
                         self.access(at, slot, offset, ty, Kind::Load);
                         true
@@ -1493,7 +1514,7 @@ impl<A: Allocator + Copy> Walk<'_, A> {
                 let stored = o.value().0;
                 o.value();
                 let ty = Ty(view.tys[stored as usize]);
-                match (ty.is_scalar(), base.checked_add(i128::from(o.offset()))) {
+                match (is_sroa_ty(ty), base.checked_add(i128::from(o.offset()))) {
                     (true, Some(offset)) => {
                         self.access(at, slot, offset, ty, Kind::Store { value: stored, inst: to_u32(at) });
                         true
@@ -1606,11 +1627,12 @@ fn propagate_kept_copies(kept: &mut [bool], accesses: &[Access]) {
     }
 }
 
-/// Collapses any `(slot, offset)` group in sorted, deduplicated `cand` whose only candidate
-/// types are `Ty::PTR` and the pointer-sized integer `ptr_int` into the single canonical field
-/// `(slot, offset, Ty::PTR)`.
+/// Collapses any `(slot, offset)` group in sorted, deduplicated `cand` whose candidate types are:
+/// - `Ty::PTR` and the pointer-sized integer `ptr_int` -> canonical `Ty::PTR`, OR
+/// - all fixed native 128-bit vectors (e.g. `<4 x i32>` and `<16 x i8>`, as in
+///   `Simd::to_ne_bytes`/`from_ne_bytes`) -> canonical `<16 x i8>` (zero-cost `Op::Bitcast`).
 fn coalesce_ptr_pun_candidates<A: Allocator>(cand: &mut Vec<(u32, i128, u16), A>, ptr_int: Option<Ty>) {
-    let Some(pi) = ptr_int else { return };
+    let canonical_v16i8 = Ty::vector(crate::Scalar::I8, 16).map_or(0, |t| t.0);
     let len = cand.len();
     let mut read = 0usize;
     let mut write = 0usize;
@@ -1623,7 +1645,9 @@ fn coalesce_ptr_pun_candidates<A: Allocator>(cand: &mut Vec<(u32, i128, u16), A>
             }
             end += 1;
         }
-        if end - read == 2 {
+        if end - read == 2
+            && let Some(pi) = ptr_int
+        {
             let second_ty = cand.get(read + 1).map_or(0, |t| t.2);
             let is_pair = (first_ty == Ty::PTR.0 && second_ty == pi.0)
                 || (first_ty == pi.0 && second_ty == Ty::PTR.0);
@@ -1633,6 +1657,15 @@ fn coalesce_ptr_pun_candidates<A: Allocator>(cand: &mut Vec<(u32, i128, u16), A>
                 read = end;
                 continue;
             }
+        }
+        if end - read >= 2
+            && canonical_v16i8 != 0
+            && (read..end).all(|idx| cand.get(idx).is_some_and(|t| is_native_vec128(Ty(t.2))))
+        {
+            set_at(cand, write, (slot, offset, canonical_v16i8));
+            write += 1;
+            read = end;
+            continue;
         }
         for idx in read..end {
             if let Some(&item) = cand.get(idx) {
@@ -1646,7 +1679,8 @@ fn coalesce_ptr_pun_candidates<A: Allocator>(cand: &mut Vec<(u32, i128, u16), A>
 }
 
 /// Finds the field index of `slot` at exact byte `offset` compatible with `ty`
-/// (exact match, or pointer-sized integer accessing a canonical `Ty::PTR` field).
+/// (exact match, pointer-sized integer accessing canonical `Ty::PTR`, or native 128-bit vector
+/// bitcast-compatible with another native 128-bit vector).
 fn find_field_compat(
     fields: &[FieldRec],
     slot_fields: &[(u32, u32)],
@@ -1658,7 +1692,11 @@ fn find_field_compat(
     let (first, count) = slot_fields.get(to_idx(slot)).copied()?;
     let slice = fields.get(to_idx(first)..to_idx(first.saturating_add(count)))?;
     for (idx, rec) in slice.iter().enumerate() {
-        if rec.offset == offset && (rec.ty == ty || (rec.ty == Ty::PTR && Some(ty) == ptr_int)) {
+        if rec.offset == offset
+            && (rec.ty == ty
+                || (rec.ty == Ty::PTR && Some(ty) == ptr_int)
+                || (is_native_vec128(rec.ty) && is_native_vec128(ty)))
+        {
             return Some(first.saturating_add(to_u32(idx)));
         }
     }
@@ -1864,7 +1902,7 @@ fn find<A: Allocator + Copy>(view: &View<'_>, cfg: &Cfg<A>, alloc: &A) -> Result
                 let ty = Ty(f_ty_raw);
                 let f_end = f_off + bytes(ty, view.head.ptr_bits);
                 if f_off < z_end && f_end > z_start {
-                    let zeroable = ty.is_int() || ty == Ty::PTR || ty.is_float();
+                    let zeroable = is_zeroable_ty(ty);
                     if f_off < z_start || f_end > z_end || !zeroable {
                         if let Some(flag) = kept.get_mut(to_idx(slot)) {
                             *flag = true;
@@ -2265,28 +2303,28 @@ impl<A: Allocator + Copy> Out<A> {
         at
     }
 
-    /// A value of `ty` whose bits nothing wrote, made once per block: `iconst 0` for an
-    /// integer (the evaluator runs it), `uninit` otherwise.
+    /// A value of `ty` whose bits nothing wrote, made once per block: `iconst 0` for a
+    /// scalar integer (the evaluator runs it), `uninit` otherwise.
     fn undef<B: Allocator>(&mut self, cache: &mut Vec<(u16, u32), B>, ty: Ty, loc: u32) -> u32 {
         if let Some(&(_, at)) = cache.iter().find(|it| it.0 == ty.0) {
             return at;
         }
-        let op = if ty.is_int() { Op::Iconst } else { Op::Uninit };
+        let op = if ty.is_scalar() && ty.is_int() { Op::Iconst } else { Op::Uninit };
         let at = self.raw(op, 0, ty.0, 0, 0, loc);
         cache.push((ty.0, at));
         at
     }
 
-    /// A zero-byte scalar of `ty` (from `memset(_, 0, _)`), made once per block.
-    fn zero<B: Allocator>(&mut self, cache: &mut Vec<(u16, u32), B>, ty: Ty, loc: u32) -> u32 {
+    /// A zero-byte scalar of `ty`, made once per block.
+    fn zero_scalar<B: Allocator>(&mut self, cache: &mut Vec<(u16, u32), B>, ty: Ty, loc: u32) -> u32 {
         if let Some(&(_, at)) = cache.iter().find(|it| it.0 == ty.0) {
             return at;
         }
-        let at = if ty.is_int() {
+        let at = if ty.is_scalar() && ty.is_int() {
             self.raw(Op::Iconst, 0, ty.0, 0, 0, loc)
         } else if ty == Ty::PTR {
             self.raw(Op::Null, 0, ty.0, 0, 0, loc)
-        } else if ty.is_float() {
+        } else if ty.is_scalar() && ty.is_float() {
             let bits = ty.bits(self.func.head.ptr_bits);
             if bits <= 32 {
                 self.raw(Op::Fconst, 0, ty.0, 0, 0, loc)
@@ -2302,6 +2340,20 @@ impl<A: Allocator + Copy> Out<A> {
         };
         cache.push((ty.0, at));
         at
+    }
+
+    /// A zero-byte scalar or native 128-bit vector of `ty` (from `memset(_, 0, _)`), made once per block.
+    fn zero<B: Allocator>(&mut self, cache: &mut Vec<(u16, u32), B>, ty: Ty, loc: u32) -> u32 {
+        if let Some(&(_, at)) = cache.iter().find(|it| it.0 == ty.0) {
+            return at;
+        }
+        if is_native_vec128(ty) {
+            let lane_zero = self.zero_scalar(cache, ty.lane(), loc);
+            let at = self.raw(Op::Splat, 0, ty.0, lane_zero, 0, loc);
+            cache.push((ty.0, at));
+            return at;
+        }
+        self.zero_scalar(cache, ty, loc)
     }
 
     /// A value word of input instruction `inst`, appended to `extra` and fixed up later.
@@ -2674,7 +2726,12 @@ fn emit<A: Allocator + Copy>(
                                         if access.ty == field_ty {
                                             set_at(&mut redirect, at, value);
                                         } else {
-                                            let conv = out.raw(Op::PtrAddr, 0, at_u16(view.tys, at), value, 0, loc);
+                                            let conv_op = if is_native_vec128(access.ty) {
+                                                Op::Bitcast
+                                            } else {
+                                                Op::PtrAddr
+                                            };
+                                            let conv = out.raw(conv_op, 0, at_u16(view.tys, at), value, 0, loc);
                                             out.fixups.push((conv, true, to_u32(at)));
                                             set_at(&mut map, at, conv);
                                         }
@@ -2684,7 +2741,12 @@ fn emit<A: Allocator + Copy>(
                                         if access.ty == field_ty {
                                             set_at(&mut redirect, at, phi_id);
                                         } else {
-                                            let conv = out.raw(Op::PtrAddr, 0, at_u16(view.tys, at), phi_id, 0, loc);
+                                            let conv_op = if is_native_vec128(access.ty) {
+                                                Op::Bitcast
+                                            } else {
+                                                Op::PtrAddr
+                                            };
+                                            let conv = out.raw(conv_op, 0, at_u16(view.tys, at), phi_id, 0, loc);
                                             out.fixups.push((conv, true, to_u32(at)));
                                             set_at(&mut map, at, conv);
                                         }
@@ -2700,7 +2762,11 @@ fn emit<A: Allocator + Copy>(
                                 }
                             }
                             Kind::Store { value, .. } if access.ty != field_ty => {
-                                let conv = if constant(view, value) == Some(0) {
+                                let conv = if is_native_vec128(field_ty) {
+                                    let c = out.raw(Op::Bitcast, 0, field_ty.0, value, 0, loc);
+                                    out.fixups.push((c, true, to_u32(at)));
+                                    c
+                                } else if constant(view, value) == Some(0) {
                                     out.raw(Op::Null, 0, Ty::PTR.0, 0, 0, loc)
                                 } else {
                                     let c = out.raw(Op::FromExposed, 0, Ty::PTR.0, value, 0, loc);
@@ -3103,6 +3169,225 @@ mod copy_tests {
             let before = run_in(func.view(), &vals, FUEL, alloc).expect("eval input");
             let after = run_in(out.view(), &vals, FUEL, alloc).expect("eval output");
             assert_eq!(before, after, "mismatch for args {args:?}");
+        }
+    }
+
+    #[test]
+    fn promotes_native_vec128_slots_through_64b_memmove_and_zeroset() {
+        use crate::Scalar;
+        use crate::simplify::memopt::scalarize_small_memops;
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let v4i32 = Ty::vector(Scalar::I32, 4).expect("v4i32");
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I32)],
+            &[],
+        );
+        b.set_signature(sig);
+        let [entry, take_zero, take_copy, join] = [(); 4].map(|_| b.create_block(BlockKind::Normal));
+
+        b.begin(entry);
+        let src_ptr = b.param(Ty::PTR);
+        let dst_ptr = b.param(Ty::PTR);
+        let flag = b.param(Ty::I32);
+        let s_work = b.slot(64, 6, SlotKind::Temp);
+        let s_copy = b.slot(64, 6, SlotKind::Temp);
+        let p_work = b.slot_addr(s_work);
+        let p_copy = b.slot_addr(s_copy);
+        let zero_i32 = b.iconst(Ty::I32, 0);
+        let is_zero = b.icmp(IntCond::Eq, flag, zero_i32);
+        b.br(Flags::NONE, is_zero, (take_zero, &[]), (take_copy, &[]));
+
+        b.begin(take_zero);
+        let zero_b = b.iconst(Ty::I8, 0);
+        let len64_a = b.iconst(Ty::I64, 64);
+        b.bulk(Op::Memset, Flags::NONE, p_work, zero_b, len64_a, MemAttrs::aligned(6));
+        b.jump((join, &[]));
+
+        b.begin(take_copy);
+        let len64_b = b.iconst(Ty::I64, 64);
+        b.bulk(Op::Memmove, Flags::NONE, p_copy, src_ptr, len64_b, MemAttrs::aligned(4));
+        let len64_c = b.iconst(Ty::I64, 64);
+        b.bulk(Op::Memmove, Flags::NONE, p_work, p_copy, len64_c, MemAttrs::aligned(6));
+        b.jump((join, &[]));
+
+        b.begin(join);
+        let one = b.iconst(Ty::I32, 1);
+        let ones = b.convert(Op::Splat, Flags::NONE, v4i32, one);
+        for c in 0..4 {
+            let off = c * 16;
+            let loaded = b.load(v4i32, Flags::NONE, p_work, off, MemAttrs::aligned(4));
+            let bumped = b.binary(Op::Add, Flags::NONE, loaded, ones);
+            b.store(Flags::NONE, bumped, dst_ptr, off, MemAttrs::aligned(4));
+        }
+        b.ret(&[]);
+
+        let func = b.finish_checked().expect("valid input");
+        let after_mem = scalarize_small_memops(func.view(), alloc)
+            .expect("scalarize_small_memops succeeds")
+            .expect("64B vec128 slot copy must scalarize");
+        let out = scalar_replace(after_mem.view(), alloc).expect("sroa succeeds");
+        verify(out.view()).expect("output verifies");
+        assert_eq!(
+            out.slots.len(),
+            0,
+            "both 64B native-vec128 slots must promote completely:\n{}",
+            print(out.view())
+        );
+        for inst in 0..out.view().len() {
+            let op = out.view().op(inst);
+            assert!(
+                !matches!(op, Op::Memcpy | Op::Memmove | Op::Memset | Op::SlotAddr),
+                "unexpected bulk/slot op {}:\n{}",
+                op.name(),
+                print(out.view())
+            );
+        }
+    }
+
+    #[test]
+    fn promotes_native_vec128_slot_type_pun_v4i32_to_v16i8_via_bitcast() {
+        use crate::Scalar;
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let v4i32 = Ty::vector(Scalar::I32, 4).expect("v4i32");
+        let v16i8 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+        b.set_signature(sig);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let src_ptr = b.param(Ty::PTR);
+        let dst_ptr = b.param(Ty::PTR);
+        let s_words = b.slot(64, 6, SlotKind::Temp);
+        let s_bytes = b.slot(64, 6, SlotKind::Temp);
+        let p_words = b.slot_addr(s_words);
+        let p_bytes = b.slot_addr(s_bytes);
+        // BLAKE3 `rotate_bytes` pattern: write `<4 x i32>`, copy 64B via `Op::Memcpy`,
+        // read as `<16 x i8>`, XOR with a byte mask, write `<16 x i8>`, copy back, read `<4 x i32>`.
+        for c in 0..4 {
+            let off = c * 16;
+            let w = b.load(v4i32, Flags::NONE, src_ptr, off, MemAttrs::aligned(4));
+            b.store(Flags::NONE, w, p_words, off, MemAttrs::aligned(4));
+        }
+        let len64_a = b.iconst(Ty::I64, 64);
+        b.bulk(Op::Memcpy, Flags::NONE, p_bytes, p_words, len64_a, MemAttrs::aligned(6));
+        let kff = b.iconst(Ty::I8, 0x5a);
+        let mask = b.convert(Op::Splat, Flags::NONE, v16i8, kff);
+        for c in 0..4 {
+            let off = c * 16;
+            let bytes = b.load(v16i8, Flags::NONE, p_bytes, off, MemAttrs::aligned(4));
+            let xored = b.binary(Op::Xor, Flags::NONE, bytes, mask);
+            b.store(Flags::NONE, xored, p_bytes, off, MemAttrs::aligned(4));
+        }
+        let len64_b = b.iconst(Ty::I64, 64);
+        b.bulk(Op::Memcpy, Flags::NONE, p_words, p_bytes, len64_b, MemAttrs::aligned(6));
+        for c in 0..4 {
+            let off = c * 16;
+            let out_w = b.load(v4i32, Flags::NONE, p_words, off, MemAttrs::aligned(4));
+            b.store(Flags::NONE, out_w, dst_ptr, off, MemAttrs::aligned(4));
+        }
+        b.ret(&[]);
+
+        let func = b.finish_checked().expect("valid input");
+        // Slot-to-slot `Op::Memcpy(64)` between `<4 x i32>` and `<16 x i8>` slots is handled
+        // directly by `scalar_replace` via cross-slot field propagation + `Op::Bitcast` pun coalescing.
+        let out = scalar_replace(func.view(), alloc).expect("sroa succeeds");
+        verify(out.view()).expect("output verifies");
+        assert_eq!(
+            out.slots.len(),
+            0,
+            "type-punned <4 x i32>/<16 x i8> slots must promote cleanly:\n{}",
+            print(out.view())
+        );
+        let mut saw_bitcast = false;
+        for inst in 0..out.view().len() {
+            let op = out.view().op(inst);
+            assert!(
+                !matches!(op, Op::Memcpy | Op::Memmove | Op::SlotAddr),
+                "unexpected bulk/slot op {}:\n{}",
+                op.name(),
+                print(out.view())
+            );
+            if op == Op::Bitcast {
+                saw_bitcast = true;
+            }
+        }
+        assert!(saw_bitcast, "expected zero-cost Op::Bitcast for vec128 type pun:\n{}", print(out.view()));
+    }
+
+    #[test]
+    fn elides_interleaved_temp_memcpys_and_dead_rodata_copy() {
+        use crate::Scalar;
+        use crate::simplify::memopt::scalarize_small_memops;
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let v16 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+            &[],
+        );
+        b.set_signature(sig);
+        let ro_ref = b.data(&[0u8; 64], 4, &[]);
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let p0 = b.param(Ty::PTR);
+        let p1 = b.param(Ty::PTR);
+        let dst = b.param(Ty::PTR);
+        let a1 = b.slot(16, 4, SlotKind::Temp);
+        let a2 = b.slot(16, 4, SlotKind::Temp);
+        let b1 = b.slot(16, 4, SlotKind::Temp);
+        let b2 = b.slot(16, 4, SlotKind::Temp);
+        let dead_slot = b.slot(64, 6, SlotKind::Temp);
+
+        let pa1 = b.slot_addr(a1);
+        let pa2 = b.slot_addr(a2);
+        let pb1 = b.slot_addr(b1);
+        let pb2 = b.slot_addr(b2);
+        let pdead = b.slot_addr(dead_slot);
+        let ro = b.data_addr(ro_ref);
+        let k16 = b.iconst(Ty::I64, 16);
+        let k64 = b.iconst(Ty::I64, 64);
+
+        // Interleaved temp copies (`simd_contains` shape) + dead rodata copy (`blake3` shape).
+        b.bulk(Op::Memcpy, Flags::NONE, pdead, ro, k64, MemAttrs::aligned(4));
+        b.bulk(Op::Memcpy, Flags::NONE, pa1, p0, k16, MemAttrs::aligned(0));
+        b.bulk(Op::Memcpy, Flags::NONE, pa2, p1, k16, MemAttrs::aligned(0));
+        b.bulk(Op::Memcpy, Flags::NONE, pb1, pa1, k16, MemAttrs::aligned(4));
+        b.bulk(Op::Memcpy, Flags::NONE, pb2, pa2, k16, MemAttrs::aligned(4));
+
+        let v0 = b.load(v16, Flags::NONE, pb1, 0, MemAttrs::aligned(4));
+        let v1 = b.load(v16, Flags::NONE, pb2, 0, MemAttrs::aligned(4));
+        let xored = b.binary(Op::Xor, Flags::NONE, v0, v1);
+        b.store(Flags::NONE, xored, dst, 0, MemAttrs::aligned(0));
+        b.ret(&[]);
+
+        let func = b.finish_checked().expect("valid input");
+        let after_mem = scalarize_small_memops(func.view(), alloc)
+            .expect("scalarize_small_memops succeeds")
+            .expect("interleaved temp copies and dead rodata copy must simplify");
+        let out = scalar_replace(after_mem.view(), alloc).expect("sroa succeeds");
+        verify(out.view()).expect("output verifies");
+        assert_eq!(
+            out.slots.len(),
+            0,
+            "all interleaved temp and dead rodata slots must vanish:\n{}",
+            print(out.view())
+        );
+        for inst in 0..out.view().len() {
+            let op = out.view().op(inst);
+            assert!(
+                !matches!(op, Op::Memcpy | Op::Memmove | Op::SlotAddr),
+                "unexpected bulk/slot op {}:\n{}",
+                op.name(),
+                print(out.view())
+            );
         }
     }
 }

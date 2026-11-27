@@ -74,7 +74,34 @@ const COMPILE_FRAME_RESERVE: usize = 2 << 30;
 /// Atomic counter for unique staging directory names during atomic module publication.
 static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Single-flight guard used ONLY when `<store>/wasm64-sysroot-v2/<tc_id>/` has missing sysroot
+/// Hash domain for the `<store>/wasm64-sysroot-v2/<dir>/` cache directory name (Rule 21, Rule 52):
+/// covers the pinned toolchain id and every producer row whose serialized record format or
+/// resolution semantics live inside that directory (`exports.bin`, `inner.bin`, `read.bin`,
+/// `names.bin`, `items.bin`, `expansions.bin`), so any compiler or record-format upgrade misses
+/// cleanly instead of reading stale bytes (`NotThisRecord`).
+const WASM64_SYSROOT_DIR_DOMAIN: &str = "blaze-cli wasm64 sysroot dir 1";
+
+/// Computes the content-addressed directory name under `<store>/wasm64-sysroot-v2/` covering
+/// `tc_id` and all producer rows that produce or decode sysroot records stored there.
+fn wasm64_sysroot_dir_name<'a>(
+    tc_id: ToolchainId,
+    producers: &Producers,
+    alloc: Alloc<'a>,
+) -> blaze_own::AString<'a> {
+    let mut h = blaze_ids::Hasher::new(WASM64_SYSROOT_DIR_DOMAIN);
+    h.part(&tc_id.0);
+    h.id(producers.get::<blaze_ids::producer::Names>().id());
+    h.id(producers.get::<blaze_ids::producer::Expander>().id());
+    h.id(producers.get::<blaze_ids::producer::Lowering>().id());
+    h.id(producers.get::<blaze_ids::producer::CodeBuilder>().id());
+    h.id(producers.get::<blaze_ids::producer::Whole>().id());
+    let key = h.finish();
+    let hex_buf = hex_bytes_buf(&key.0);
+    let hex = core::str::from_utf8(&hex_buf).unwrap_or("");
+    bstd::mem::format_in!(alloc, "{tc_id}-{hex}")
+}
+
+/// Single-flight guard used ONLY when `<store>/wasm64-sysroot-v2/<dir>/` has missing sysroot
 /// crate records on a completely cold store, preventing N parallel build-script/proc-macro
 /// workers from simultaneously re-parsing `core`/`alloc`/`std` (~3.5x peak RSS reduction).
 static SYSROOT_INIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -93,6 +120,9 @@ pub(crate) struct CompileInputs<'a> {
     pub checkout: Option<&'a blaze_proc_macro::script_sandbox::RealRoot>,
     /// Workspace members and external path packages by lock id.
     pub members: &'a [(LockId, &'a str, blaze_world::PathKind)],
+    /// Running binary's producer identities (Rule 21, Rule 52): keys `<store>/wasm64-sysroot-v2/`
+    /// and the internal LIR/wasm64 builder.
+    pub producers: Producers,
     /// Process heap for `Maker` tables (reclaimed when `Maker` drops).
     pub heap: &'static blaze_own::Heap,
 }
@@ -555,9 +585,8 @@ fn tc_edition(written: &str) -> Result<Edition, std::string::String> {
     }
 }
 
-fn wasm64_builder(id: ToolchainId) -> Builder {
-    let producer: ProducerId<CodeBuilder> =
-        Producers::for_tests(b"blaze-cli wasm64 self-compile 1").get::<CodeBuilder>();
+fn wasm64_builder(id: ToolchainId, producers: &Producers) -> Builder {
+    let producer: ProducerId<CodeBuilder> = producers.get::<CodeBuilder>();
     Builder {
         isa: Isa { lse: true, os: Os::MacOs },
         tier: TierName::Reference,
@@ -590,6 +619,10 @@ pub(crate) enum SelfCompileError {
         symbol: std::string::String,
         detail: std::string::String,
     },
+    /// On-disk store or cached sysroot record read error (`NotThisRecord`, corrupt/truncated cache
+    /// file): outside the task's key and reads, so callers return `Did::Hole` and never persist it
+    /// as a cached `MacroModule` failure.
+    StoreError(std::string::String),
     /// Any non-Tier-2 compilation, resolution, linking, validation, or publication failure.
     Failed(std::string::String),
 }
@@ -597,6 +630,10 @@ pub(crate) enum SelfCompileError {
 impl SelfCompileError {
     pub(crate) fn is_tier2(&self) -> bool {
         matches!(self, SelfCompileError::Tier2Unsupported { .. })
+    }
+
+    pub(crate) fn is_hole(&self) -> bool {
+        matches!(self, SelfCompileError::StoreError(_))
     }
 }
 
@@ -616,7 +653,7 @@ impl core::fmt::Display for SelfCompileError {
                     )
                 }
             }
-            SelfCompileError::Failed(msg) => f.write_str(msg),
+            SelfCompileError::StoreError(msg) | SelfCompileError::Failed(msg) => f.write_str(msg),
         }
     }
 }
@@ -722,6 +759,7 @@ pub(crate) fn compile_build_script(
         &lock,
         checkout,
         inputs.members,
+        &inputs.producers,
         inputs.heap,
         script_id,
         expected_deps,
@@ -754,6 +792,7 @@ fn ensure_build_script_unit(
     lock: &Lock<'_>,
     checkout: &blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
+    producers: &Producers,
     heap: &'static blaze_own::Heap,
     script_id: UnitId,
     expected_deps: Option<&str>,
@@ -824,6 +863,7 @@ fn ensure_build_script_unit(
         lock,
         checkout,
         members,
+        producers,
         heap,
         script_id,
         CompileMode::BuildScript,
@@ -852,7 +892,8 @@ fn ensure_build_script_unit(
     );
     let key = sha256_hex(identity.as_bytes());
     let wasm_sha256 = sha256_hex(&wasm);
-    publish_build_script_module(store, &key, &identity, &wasm, &wasm_sha256)?;
+    publish_build_script_module(store, &key, &identity, &wasm, &wasm_sha256)
+        .map_err(|e| std::format!("{e}"))?;
     Ok(wasm_sha256)
 }
 
@@ -866,6 +907,7 @@ fn ensure_proc_macro_unit(
     lock: &Lock<'_>,
     checkout: &blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
+    producers: &Producers,
     heap: &'static blaze_own::Heap,
     pm_id: UnitId,
     depth: u8,
@@ -891,7 +933,7 @@ fn ensure_proc_macro_unit(
         let mut files = blaze_proc_macro::module::package_files(&pkg_dir)
             .map_err(|e| blaze_world::procs::ProcsError::Files { at: pkg_dir, error: e })?;
         Ok(Some(blaze_proc_macro::module::files_digest(&mut files)))
-    })
+    }, heap.alloc())
     .map_err(|e| std::format!("identifying proc-macro dep {} {}: {e}", unit.name.as_str(), unit.version.as_str()))?
     .map_err(|e| std::format!("proc-macro dep {} {} not identified: {e}", unit.name.as_str(), unit.version.as_str()))?
     .with_wasm_features(lock, graph, unit.package, |dep_id| path_pkg_files_digest(checkout, members, dep_id), heap.alloc());
@@ -914,6 +956,7 @@ fn ensure_proc_macro_unit(
                 lock,
                 checkout,
                 members,
+                producers,
                 heap,
                 pm_id,
                 CompileMode::ProcMacro,
@@ -928,7 +971,8 @@ fn ensure_proc_macro_unit(
                 &wasm_sha256,
                 &built.macros,
                 PROC_MACRO_DECLS_GLOBAL,
-            )?;
+            )
+            .map_err(|e| std::format!("{e}"))?;
             identity
                 .with_id(|id| blaze_proc_macro::module::read_module(store, id))
                 .map_err(|e| {
@@ -995,7 +1039,7 @@ pub(crate) fn compile_proc_macro(
             want_refs.join(",")
         )));
     };
-    let pm_id = UnitId(unit_idx as u32);
+    let pm_id = UnitId(u32::try_from(unit_idx).unwrap_or(u32::MAX));
     let built = compile_unit_to_wasm64(
         store,
         &decoded.graph,
@@ -1003,6 +1047,7 @@ pub(crate) fn compile_proc_macro(
         &lock,
         checkout,
         inputs.members,
+        &inputs.producers,
         inputs.heap,
         pm_id,
         CompileMode::ProcMacro,
@@ -1021,7 +1066,8 @@ pub(crate) fn compile_proc_macro(
         &wasm_sha256,
         &built.macros,
         PROC_MACRO_DECLS_GLOBAL,
-    )?;
+    )
+    .map_err(|e| std::format!("{e}"))?;
     Ok(wasm_sha256)
 }
 
@@ -1162,6 +1208,7 @@ fn run_dep_build_script(
     lock: &Lock<'_>,
     checkout: &blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
+    producers: &Producers,
     heap: &'static blaze_own::Heap,
     bs_id: UnitId,
     tc_cfg: &[(std::string::String, Option<std::string::String>)],
@@ -1170,7 +1217,7 @@ fn run_dep_build_script(
     depth: u8,
 ) -> Result<std::vec::Vec<u8>, SelfCompileError> {
     // Ensure the build script's own wasm64 module exists first (`graph` here is already `wasm_graph`).
-    let _ = ensure_build_script_unit(store, graph, Some(graph), lock, checkout, members, heap, bs_id, None, depth + 1)?;
+    let _ = ensure_build_script_unit(store, graph, Some(graph), lock, checkout, members, producers, heap, bs_id, None, depth + 1)?;
     let frame = Frame::with_reserve(128 << 20, Tag::Other)
         .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve dep build-script frame")))?;
     let erased = Erased::new(&frame);
@@ -1639,6 +1686,7 @@ fn compile_unit_to_wasm64(
     lock: &Lock<'_>,
     checkout: &blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
+    producers: &Producers,
     heap: &'static blaze_own::Heap,
     root_unit: UnitId,
     mode: CompileMode,
@@ -1746,6 +1794,7 @@ fn compile_unit_to_wasm64(
                 lock,
                 checkout,
                 members,
+                producers,
                 heap,
                 uid,
                 depth + 1,
@@ -1794,6 +1843,7 @@ fn compile_unit_to_wasm64(
         lock,
         checkout,
         members,
+        producers,
         heap,
         wasm_root_unit,
         unit_order.as_slice(),
@@ -1882,6 +1932,7 @@ fn compile_unit_in<'a>(
     lock: &'a Lock<'a>,
     checkout: &'a blaze_proc_macro::script_sandbox::RealRoot,
     members: &[(LockId, &str, blaze_world::PathKind)],
+    producers: &Producers,
     heap: &'static blaze_own::Heap,
     root_unit: UnitId,
     unit_order: &[UnitId],
@@ -2013,6 +2064,7 @@ fn compile_unit_in<'a>(
                 lock,
                 checkout,
                 members,
+                producers,
                 heap,
                 bs_id,
                 &tc_cfg_owned,
@@ -2277,20 +2329,23 @@ fn compile_unit_in<'a>(
     let role_id = |r: Role| {
         tc_units
             .iter()
-            .position(|u| u.role == r)
-            .map(|i| CrateId((tc_base + i) as u32))
+            .position(|u| u.role == r && !u.proc_macro)
+            .and_then(|i| u32::try_from(tc_base + i).ok())
+            .map(CrateId)
     };
     let sysroot = Sysroot {
         core: role_id(Role::Core),
         alloc: role_id(Role::Alloc),
         std: role_id(Role::Std),
+        proc_macro: role_id(Role::ProcMacro),
         bstd: role_id(Role::Bstd),
     };
 
     // 5. Resolve all crates together with `blaze-scope`, reusing persisted disk records for
     //    `wasm64-blaze-wasip1` sysroot crates (`krate >= tc_base`) under
-    //    `<store>/wasm64-sysroot-v2/<tc_id>/` (Rule 51: content-addressed records on disk, page
-    //    cache only, zero in-memory cross-command cache).
+    //    `<store>/wasm64-sysroot-v2/<tc_id>-<producers_hash>/` (Rule 21 & Rule 51: content-addressed
+    //    records on disk keyed by toolchain + producer/format identity, page cache only, zero
+    //    in-memory cross-command cache).
     let sources: &'a Wasm64Sources<'a, 'a> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(
         Wasm64Sources {
             origins,
@@ -2305,7 +2360,7 @@ fn compile_unit_in<'a>(
     let par = CompilePar::new();
     let sysroot_dir = store
         .join("wasm64-sysroot-v2")
-        .join(bstd::mem::format_in!(frame, "{tc_id}").as_str());
+        .join(wasm64_sysroot_dir_name(tc_id, producers, alloc).as_str());
     let mut sysroot_kept = Wasm64SysrootKept::open(&sysroot_dir, tc_base, crates.as_slice(), bump);
     let sysroot_guard = if sysroot_kept.has_missing() {
         let guard = SYSROOT_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -2316,7 +2371,10 @@ fn compile_unit_in<'a>(
     };
     let ready = Ready::serial(core::time::Duration::from_secs(120));
     let (solved, _) = resolve_kept(crates.as_slice(), sysroot, sources, &par, &ready, &sysroot_kept, bump)
-        .map_err(|(at, e)| std::format!("blaze-scope resolve failed on `{}`: {e:?}", crates[at].name))?;
+        .map_err(|(at, e)| {
+            let name = crates.get(at).map_or("<unknown>", |c| c.name);
+            classify_scope_resolve_error(name, &e)
+        })?;
 
     // Extract proc-macro exports in exact `_DECLS` order (including macro-generated
     // `#[proc_macro*]` items such as `derive_more-impl`'s `create_derive!`) if in ProcMacro mode.
@@ -2333,7 +2391,7 @@ fn compile_unit_in<'a>(
                 .map(str::to_owned)
                 .collect();
             exported_macros.push(Exported {
-                index: idx as u32,
+                index: u32::try_from(idx).unwrap_or(u32::MAX),
                 kind: match entry.kind {
                     blaze_surface::ProcKind::Derive => ProcKind::Derive,
                     blaze_surface::ProcKind::Attr => ProcKind::Attr,
@@ -2395,15 +2453,19 @@ fn compile_unit_in<'a>(
                     && let Some(fresh) = fresh_sysroot.get(&krate)
                 {
                     let exp_bytes = encode_expansions_table(&e_map, &o_map);
-                    let key_hex = hex_content_id(crates[krate].key.0);
-                    let _ = publish_sysroot_crate(&sysroot_dir, &key_hex, fresh, &exp_bytes);
+                    let key_hex_buf = hex_bytes_buf(&crates[krate].key.0.0);
+                    let key_hex = core::str::from_utf8(&key_hex_buf).unwrap_or("");
+                    let _ = publish_sysroot_crate(&sysroot_dir, key_hex, fresh, &exp_bytes);
                 }
                 kept.expansions.push(e_map);
                 kept.origins.push(o_map);
             }
             Solved::Found { .. } => {
                 let cached = sysroot_kept.loaded_at(krate).ok_or_else(|| {
-                    std::format!("cached sysroot crate `{}` missing loaded records", crates[krate].name)
+                    let name = crates.get(krate).map_or("<unknown>", |c| c.name);
+                    SelfCompileError::StoreError(std::format!(
+                        "cached sysroot crate `{name}` missing loaded records"
+                    ))
                 })?;
                 kept.names.push(cached.names);
                 kept.items.push(cached.items);
@@ -2411,7 +2473,8 @@ fn compile_unit_in<'a>(
                 kept.files.push(blaze_own::BTreeMap::new_in(alloc));
                 let mut e_map = blaze_own::BTreeMap::new_in(alloc);
                 let mut o_map = blaze_own::BTreeMap::new_in(alloc);
-                decode_expansions_table(cached.expansions, &mut e_map, &mut o_map)?;
+                decode_expansions_table(cached.expansions, &mut e_map, &mut o_map)
+                    .map_err(SelfCompileError::StoreError)?;
                 kept.expansions.push(e_map);
                 kept.origins.push(o_map);
             }
@@ -2470,6 +2533,7 @@ fn compile_unit_in<'a>(
         lang_crates,
         body_sources,
         tc_id,
+        producers,
         mode,
         shim_idx,
         module_name,
@@ -2502,6 +2566,7 @@ fn emit_wasm64_from_records<'n>(
     lang_crates: &'n [usize],
     body_sources: &'n dyn BodySources,
     tc_id: ToolchainId,
+    producers: &Producers,
     mode: CompileMode,
     shim_idx: Option<usize>,
     module_name: &str,
@@ -2510,7 +2575,7 @@ fn emit_wasm64_from_records<'n>(
     heap_alloc: Alloc<'static>,
 ) -> Result<std::vec::Vec<u8>, SelfCompileError> {
     let nr = NamesRecords { records, frame: infer_frame, lang_crates, body_sources: Some(body_sources) };
-    let builder = wasm64_builder(tc_id);
+    let builder = wasm64_builder(tc_id, producers);
 
     // 7. Single-pass LIR -> Wasm64 compilation! Use `heap_alloc` for the growing worklist,
     //    `Vec<OwnedFunc>`, and emitted wasm buffer so reallocations free old backing storage
@@ -2626,19 +2691,44 @@ fn emit_wasm64_from_records<'n>(
     Ok(wasm_out.as_slice().to_vec())
 }
 
-fn publish_build_script_module(
+#[derive(Debug)]
+enum PublishModuleOp {
+    CreateDir(std::path::PathBuf),
+    WriteFile(&'static str),
+    Publish(std::path::PathBuf),
+}
+
+#[derive(Debug)]
+struct PublishModuleError {
+    op: PublishModuleOp,
+    source: std::io::Error,
+}
+
+impl core::fmt::Display for PublishModuleError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match &self.op {
+            PublishModuleOp::CreateDir(path) => write!(f, "create {}: {}", path.display(), self.source),
+            PublishModuleOp::WriteFile(name) => write!(f, "write {name}: {}", self.source),
+            PublishModuleOp::Publish(path) => write!(f, "publish {}: {}", path.display(), self.source),
+        }
+    }
+}
+
+fn ensure_module_dir(path: std::path::PathBuf) -> Result<std::path::PathBuf, PublishModuleError> {
+    match std::fs::create_dir_all(&path) {
+        Ok(()) => Ok(path),
+        Err(source) => Err(PublishModuleError { op: PublishModuleOp::CreateDir(path), source }),
+    }
+}
+
+fn publish_staged_module(
     store: &Path,
+    subdir: &str,
     key: &str,
-    identity: &str,
-    wasm: &[u8],
-    wasm_sha256: &str,
-) -> Result<(), std::string::String> {
-    let base = store.join("build-script/modules");
-    let stage_root = store.join("build-script/.stage");
-    std::fs::create_dir_all(&base)
-        .map_err(|e| std::format!("create {}: {e}", base.display()))?;
-    std::fs::create_dir_all(&stage_root)
-        .map_err(|e| std::format!("create {}: {e}", stage_root.display()))?;
+    files: &[(&'static str, &[u8])],
+) -> Result<(), PublishModuleError> {
+    let base = ensure_module_dir(store.join(subdir).join("modules"))?;
+    let stage_root = ensure_module_dir(store.join(subdir).join(".stage"))?;
     let final_dir = base.join(key);
     if final_dir.join("wasm-sha256").is_file() {
         return Ok(());
@@ -2646,23 +2736,40 @@ fn publish_build_script_module(
     let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
     let stage = stage_root.join(std::format!("{key}.{}.{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage)
-        .map_err(|e| std::format!("create {}: {e}", stage.display()))?;
-    std::fs::write(stage.join("identity"), identity)
-        .map_err(|e| std::format!("write identity: {e}"))?;
-    std::fs::write(stage.join("module.wasm"), wasm)
-        .map_err(|e| std::format!("write module.wasm: {e}"))?;
-    std::fs::write(stage.join("wasm-sha256"), std::format!("{wasm_sha256}\n"))
-        .map_err(|e| std::format!("write wasm-sha256: {e}"))?;
-    if let Err(err) = std::fs::rename(&stage, &final_dir) {
-        if final_dir.join("wasm-sha256").is_file() {
-            let _ = std::fs::remove_dir_all(&stage);
+    let stage = ensure_module_dir(stage)?;
+    for &(name, bytes) in files {
+        std::fs::write(stage.join(name), bytes)
+            .map_err(|source| PublishModuleError { op: PublishModuleOp::WriteFile(name), source })?;
+    }
+    if let Err(source) = std::fs::rename(&stage, &final_dir) {
+        let published = final_dir.join("wasm-sha256").is_file();
+        let _ = std::fs::remove_dir_all(&stage);
+        if published {
             return Ok(());
         }
-        let _ = std::fs::remove_dir_all(&stage);
-        return Err(std::format!("publish {}: {err}", final_dir.display()));
+        return Err(PublishModuleError { op: PublishModuleOp::Publish(final_dir), source });
     }
     Ok(())
+}
+
+fn publish_build_script_module(
+    store: &Path,
+    key: &str,
+    identity: &str,
+    wasm: &[u8],
+    wasm_sha256: &str,
+) -> Result<(), PublishModuleError> {
+    let digest_line = std::format!("{wasm_sha256}\n");
+    publish_staged_module(
+        store,
+        "build-script",
+        key,
+        &[
+            ("identity", identity.as_bytes()),
+            ("module.wasm", wasm),
+            ("wasm-sha256", digest_line.as_bytes()),
+        ],
+    )
 }
 
 fn publish_proc_macro_module(
@@ -2673,22 +2780,7 @@ fn publish_proc_macro_module(
     wasm_sha256: &str,
     macros: &[Exported],
     decls_global: &str,
-) -> Result<(), std::string::String> {
-    let base = store.join("proc-macro/modules");
-    let stage_root = store.join("proc-macro/.stage");
-    std::fs::create_dir_all(&base)
-        .map_err(|e| std::format!("create {}: {e}", base.display()))?;
-    std::fs::create_dir_all(&stage_root)
-        .map_err(|e| std::format!("create {}: {e}", stage_root.display()))?;
-    let final_dir = base.join(key);
-    if final_dir.join("wasm-sha256").is_file() {
-        return Ok(());
-    }
-    let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let stage = stage_root.join(std::format!("{key}.{}.{seq}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&stage)
-        .map_err(|e| std::format!("create {}: {e}", stage.display()))?;
+) -> Result<(), PublishModuleError> {
     let mut macros_text = std::string::String::new();
     for m in macros {
         let kind_word = match m.kind {
@@ -2708,25 +2800,20 @@ fn publish_proc_macro_module(
             );
         }
     }
-    std::fs::write(stage.join("identity"), identity)
-        .map_err(|e| std::format!("write identity: {e}"))?;
-    std::fs::write(stage.join("module.wasm"), wasm)
-        .map_err(|e| std::format!("write module.wasm: {e}"))?;
-    std::fs::write(stage.join("wasm-sha256"), std::format!("{wasm_sha256}\n"))
-        .map_err(|e| std::format!("write wasm-sha256: {e}"))?;
-    std::fs::write(stage.join("macros"), macros_text)
-        .map_err(|e| std::format!("write macros: {e}"))?;
-    std::fs::write(stage.join("decls"), std::format!("{decls_global}\n"))
-        .map_err(|e| std::format!("write decls: {e}"))?;
-    if let Err(err) = std::fs::rename(&stage, &final_dir) {
-        if final_dir.join("wasm-sha256").is_file() {
-            let _ = std::fs::remove_dir_all(&stage);
-            return Ok(());
-        }
-        let _ = std::fs::remove_dir_all(&stage);
-        return Err(std::format!("publish {}: {err}", final_dir.display()));
-    }
-    Ok(())
+    let digest_line = std::format!("{wasm_sha256}\n");
+    let decls_line = std::format!("{decls_global}\n");
+    publish_staged_module(
+        store,
+        "proc-macro",
+        key,
+        &[
+            ("identity", identity.as_bytes()),
+            ("module.wasm", wasm),
+            ("wasm-sha256", digest_line.as_bytes()),
+            ("macros", macros_text.as_bytes()),
+            ("decls", decls_line.as_bytes()),
+        ],
+    )
 }
 
 struct CachedSysrootCrate<'a> {
@@ -2748,9 +2835,10 @@ struct FreshSysrootCrate {
 }
 
 /// Persisted disk record store for resolved `wasm64-blaze-wasip1` sysroot crates
-/// (`<store>/wasm64-sysroot-v2/<tc_id>/<crate_key_hex>/`). Follows Rule 51: content-addressed
-/// records written once via atomic staging-dir rename, read in place via the kernel page cache,
-/// and verified by `resolve_kept`'s read-list check (`blaze_scope::asked::check`).
+/// (`<store>/wasm64-sysroot-v2/<tc_id>-<producers_hash>/<crate_key_hex>/`). Follows Rule 21 &
+/// Rule 51: content-addressed records written once via atomic staging-dir rename, read in place
+/// via the kernel page cache, and verified by `resolve_kept`'s read-list check
+/// (`blaze_scope::asked::check`).
 struct Wasm64SysrootKept<'a> {
     tc_base: usize,
     loaded: std::vec::Vec<Option<CachedSysrootCrate<'a>>>,
@@ -2765,7 +2853,8 @@ impl<'a> Wasm64SysrootKept<'a> {
                 loaded.push(None);
                 continue;
             }
-            let dir = sysroot_dir.join(hex_content_id(input.key.0));
+            let key_hex_buf = hex_bytes_buf(&input.key.0.0);
+            let dir = sysroot_dir.join(core::str::from_utf8(&key_hex_buf).unwrap_or(""));
             let rec = (|| -> Option<CachedSysrootCrate<'a>> {
                 let exports = std::fs::read(dir.join("exports.bin")).ok()?;
                 let inner = std::fs::read(dir.join("inner.bin")).ok()?;
@@ -2843,12 +2932,37 @@ impl Kept for Wasm64SysrootKept<'_> {
     }
 }
 
-fn hex_content_id(id: ContentId) -> std::string::String {
-    let mut s = std::string::String::with_capacity(64);
-    for b in id.0 {
-        let _ = write!(s, "{b:02x}");
+fn classify_scope_resolve_error(
+    krate: &str,
+    err: &blaze_scope::crate_scope::CrateScopeError<'_>,
+) -> SelfCompileError {
+    let msg = std::format!("blaze-scope resolve failed on `{krate}`: {err:?}");
+    if matches!(
+        err,
+        blaze_scope::crate_scope::CrateScopeError::OwnRecord {
+            error: blaze_scope::crate_scope::RecordRead::NotThisRecord,
+            ..
+        } | blaze_scope::crate_scope::CrateScopeError::ReadList {
+            error: blaze_scope::asked::ReadListError::NotThisRecord,
+            ..
+        }
+    ) {
+        SelfCompileError::StoreError(msg)
+    } else {
+        SelfCompileError::Failed(msg)
     }
-    s
+}
+
+fn hex_bytes_buf(bytes: &[u8; 32]) -> [u8; 64] {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (b, slot) in bytes.iter().zip(out.chunks_exact_mut(2)) {
+        if let [hi, lo] = slot {
+            *hi = HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0');
+            *lo = HEX.get(usize::from(b & 0x0f)).copied().unwrap_or(b'0');
+        }
+    }
+    out
 }
 
 fn encode_expansions_table(
@@ -2856,13 +2970,13 @@ fn encode_expansions_table(
     origins: &blaze_own::BTreeMap<LibKey, &[u8], Alloc<'_>>,
 ) -> std::vec::Vec<u8> {
     let mut out = std::vec::Vec::new();
-    let count = expansions.len() as u32;
+    let count = u32::try_from(expansions.len()).unwrap_or(u32::MAX);
     out.extend_from_slice(&count.to_le_bytes());
     for (&call, &text) in expansions.iter() {
         let orig = origins.get(&call).copied().unwrap_or(&[]);
         out.extend_from_slice(&call.0.0);
-        out.extend_from_slice(&(text.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(orig.len() as u32).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(text.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&u32::try_from(orig.len()).unwrap_or(u32::MAX).to_le_bytes());
         out.extend_from_slice(text.as_bytes());
         out.extend_from_slice(orig);
     }
@@ -2877,7 +2991,7 @@ fn decode_expansions_table<'a>(
     if bytes.len() < 4 {
         return Err(std::string::String::from("truncated wasm64 sysroot expansions table"));
     }
-    let count = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let count = usize::try_from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).unwrap_or(0);
     let mut at = 4usize;
     for _ in 0..count {
         if at + 40 > bytes.len() {
@@ -2886,8 +3000,8 @@ fn decode_expansions_table<'a>(
         let mut id = [0u8; 32];
         id.copy_from_slice(&bytes[at..at + 32]);
         let key = LibKey(ContentId(id));
-        let tlen = u32::from_le_bytes([bytes[at + 32], bytes[at + 33], bytes[at + 34], bytes[at + 35]]) as usize;
-        let olen = u32::from_le_bytes([bytes[at + 36], bytes[at + 37], bytes[at + 38], bytes[at + 39]]) as usize;
+        let tlen = usize::try_from(u32::from_le_bytes([bytes[at + 32], bytes[at + 33], bytes[at + 34], bytes[at + 35]])).unwrap_or(0);
+        let olen = usize::try_from(u32::from_le_bytes([bytes[at + 36], bytes[at + 37], bytes[at + 38], bytes[at + 39]])).unwrap_or(0);
         at += 40;
         if at + tlen + olen > bytes.len() {
             return Err(std::string::String::from("truncated wasm64 sysroot expansion entry payload"));
@@ -3066,11 +3180,15 @@ mod wasm64_probe_table_tests {
                 let sys = blaze_toolchain::sysroot(&view, WASM64_TARGET, false).expect("real sysroot");
                 let all: std::vec::Vec<_> = view.units(WASM64_TARGET).expect("real units").collect();
                 let mut keep = std::vec![false; all.len()];
-                let mut todo = std::vec![sys.core.0 as usize, sys.alloc.0 as usize, sys.std.0 as usize];
+                let mut todo = std::vec![
+                    usize::try_from(sys.core.0).unwrap_or(0),
+                    usize::try_from(sys.alloc.0).unwrap_or(0),
+                    usize::try_from(sys.std.0).unwrap_or(0),
+                ];
                 while let Some(u) = todo.pop() {
                     if keep[u] { continue; }
                     keep[u] = true;
-                    todo.extend(all[u].deps().map(|(_, d)| d as usize));
+                    todo.extend(all[u].deps().filter_map(|(_, d)| usize::try_from(d).ok()));
                 }
                 let real_cfg: std::vec::Vec<_> = view
                     .cfg(WASM64_TARGET)
@@ -3482,6 +3600,7 @@ mod tests {
         )
         .expect("open checkout");
         let members = [(LockId(0), "", blaze_world::PathKind::Member)];
+        let producers = Producers::for_tests(b"wasm64-compile-test");
         let heap = blaze_own::testing::heap();
 
         let compiled = compile_unit_to_wasm64(
@@ -3491,6 +3610,7 @@ mod tests {
             &lock,
             &checkout,
             &members,
+            &producers,
             heap,
             UnitId(0),
             CompileMode::BuildScript,
@@ -3502,8 +3622,10 @@ mod tests {
         assert!(checked.memory64, "emitted module must use memory64");
 
         // Verify the persisted sysroot cache contains ONLY the minimal Rust sysroot closure
-        // (never bstd / sonic-rs).
-        let sysroot_dir = store_dir.join("wasm64-sysroot-v2").join(tc_id.to_string());
+        // (never bstd / sonic-rs) under its producer-keyed directory.
+        let sysroot_dir = store_dir
+            .join("wasm64-sysroot-v2")
+            .join(super::wasm64_sysroot_dir_name(tc_id, &producers, heap.alloc()).as_str());
         let cached_count = std::fs::read_dir(&sysroot_dir)
             .expect("read wasm64-sysroot-v2")
             .filter_map(Result::ok)
@@ -3515,6 +3637,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn wasm64_sysroot_dir_key_moves_on_each_producer_row_and_toolchain() {
+        use blaze_ids::producer::Row;
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let tc_a = blaze_toolchain::PINNED;
+        let tc_b = blaze_toolchain::ToolchainId([0x5a; 32]);
+        let base = Producers::for_tests(b"sysroot-key-base");
+        let base_dir = super::wasm64_sysroot_dir_name(tc_a, &base, alloc);
+
+        // Deterministic for identical inputs.
+        assert_eq!(base_dir, super::wasm64_sysroot_dir_name(tc_a, &base, alloc));
+        assert!(base_dir.starts_with(bstd::mem::format_in!(alloc, "{tc_a}-").as_str()));
+
+        // Changing the toolchain id moves the directory key.
+        assert_ne!(
+            base_dir,
+            super::wasm64_sysroot_dir_name(tc_b, &base, alloc),
+            "toolchain id must change wasm64-sysroot-v2 key"
+        );
+
+        // Moving each producer row whose record format or semantics live in `wasm64-sysroot-v2`
+        // (Names, Expander, Lowering, CodeBuilder, Whole) MUST produce a distinct directory key
+        // so format bumps miss cleanly instead of reading stale `NotThisRecord` bytes (Rule 21).
+        for row in [Row::Names, Row::Expander, Row::Lowering, Row::CodeBuilder, Row::Whole] {
+            let moved = base.planted_for_tests(row, b"sysroot-key-bumped");
+            let moved_dir = super::wasm64_sysroot_dir_name(tc_a, &moved, alloc);
+            assert_ne!(
+                base_dir, moved_dir,
+                "moving producer row {row:?} must change wasm64-sysroot-v2 key"
+            );
+        }
+    }
+
+    #[test]
+    fn wasm64_sysroot_not_this_record_is_hole_and_not_cached_failure() {
+        let own_rec_err = blaze_scope::crate_scope::CrateScopeError::OwnRecord {
+            krate: "core",
+            error: blaze_scope::crate_scope::RecordRead::NotThisRecord,
+        };
+        let mapped = super::classify_scope_resolve_error("core", &own_rec_err);
+        assert!(
+            mapped.is_hole(),
+            "OwnRecord::NotThisRecord must map to StoreError (Did::Hole, never cached failure), got {mapped:?}"
+        );
+        assert!(!mapped.is_tier2());
+
+        let read_list_err = blaze_scope::crate_scope::CrateScopeError::ReadList {
+            krate: "core",
+            error: blaze_scope::asked::ReadListError::NotThisRecord,
+        };
+        let mapped_rl = super::classify_scope_resolve_error("core", &read_list_err);
+        assert!(
+            mapped_rl.is_hole(),
+            "ReadList::NotThisRecord must map to StoreError (Did::Hole, never cached failure), got {mapped_rl:?}"
+        );
     }
 
     #[test]

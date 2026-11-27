@@ -1440,8 +1440,8 @@ struct HomeLtoCache<'m, 'w, 'o, 'i, 'p, 'f, D: blaze_core::Driver> {
     began: bstd::clock::Instant,
     frame: &'f Frame,
     heap: &'static blaze_own::Heap,
-    touched_program: core::cell::RefCell<std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>>,
-    touched_toolchain: core::cell::RefCell<std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>>,
+    touched_program: core::cell::RefCell<blaze_own::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>>,
+    touched_toolchain: core::cell::RefCell<blaze_own::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>>,
     io_error: core::cell::RefCell<Option<AString<'static>>>,
 }
 
@@ -1468,8 +1468,8 @@ impl<'m, 'w, 'o, 'i, 'p, 'f, D: blaze_core::Driver> HomeLtoCache<'m, 'w, 'o, 'i,
             began,
             frame,
             heap,
-            touched_program: core::cell::RefCell::new(std::vec::Vec::new_in(*lent.alloc())),
-            touched_toolchain: core::cell::RefCell::new(std::vec::Vec::new_in(*lent.alloc())),
+            touched_program: core::cell::RefCell::new(blaze_own::Vec::new_in(*lent.alloc())),
+            touched_toolchain: core::cell::RefCell::new(blaze_own::Vec::new_in(*lent.alloc())),
             io_error: core::cell::RefCell::new(None),
         }
     }
@@ -1481,8 +1481,8 @@ impl<'m, 'w, 'o, 'i, 'p, 'f, D: blaze_core::Driver> HomeLtoCache<'m, 'w, 'o, 'i,
     fn into_touched_keys(
         self,
     ) -> (
-        std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>,
-        std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>,
+        blaze_own::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>,
+        blaze_own::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>,
     ) {
         (self.touched_program.into_inner(), self.touched_toolchain.into_inner())
     }
@@ -1700,7 +1700,9 @@ impl ExportLirBuilder for CliExportLirBuilder<'_, '_, '_, '_, '_, '_, '_> {
         jobs.sort_unstable_by_key(|j| (j.tabled, j.pos));
 
         let active_workers = self.worker_count.min(jobs.len());
-        let worker_nz = core::num::NonZeroUsize::new(active_workers).expect("non-zero worker count");
+        let Some(worker_nz) = core::num::NonZeroUsize::new(active_workers) else {
+            return Ok(Vec::new_in(shared));
+        };
         let procs_asked = bstd::sync::chan::owned::<usize, _>("blaze build: LTO LIR procs asks", worker_nz, shared);
         let mut procs_answers: Vec<bstd::sync::chan::OwnedChan<ExportProcsAnswer, SharedAlloc<'static>>, SharedAlloc<'static>> =
             Vec::with_capacity_in(active_workers, shared);
@@ -1745,8 +1747,7 @@ impl ExportLirBuilder for CliExportLirBuilder<'_, '_, '_, '_, '_, '_, '_> {
 
         let scope = self.cx.scope();
         let mut handles = Vec::with_capacity_in(active_workers, shared);
-        for worker_id in 0..active_workers {
-            let answer_ref = &answers_slice[worker_id];
+        for (worker_id, answer_ref) in answers_slice.iter().enumerate() {
             handles.push(scope.may_overlap(
                 "export: LTO LIR worker",
                 EXPORT_WORKER_SCRATCH,
@@ -1810,7 +1811,7 @@ impl ExportLirBuilder for CliExportLirBuilder<'_, '_, '_, '_, '_, '_, '_> {
                             };
                             let mut epoch_reset = false;
                             for j_idx in j_start..j_end {
-                                let job = &jobs_slice[j_idx];
+                                let Some(job) = jobs_slice.get(j_idx) else { continue };
                                 scratch_frame.reset();
                                 let sc_erased = Erased::new(&scratch_frame);
                                 let sc_alloc = sc_erased.handle();
@@ -1970,9 +1971,9 @@ impl ExportLirBuilder for CliExportLirBuilder<'_, '_, '_, '_, '_, '_, '_> {
         let mut out = Vec::with_capacity_in(rows.len(), shared);
         for (pos, slot) in slots.into_iter().enumerate() {
             let Some(pair) = slot else {
-                let row = rows[pos];
+                let symbol = rows.get(pos).map_or([0u8; 32], |&row| self.walk.symbol(row).0);
                 return Err(ExportLtoError::BadRef {
-                    symbol: self.walk.symbol(row).0,
+                    symbol,
                     what: "parallel LTO LIR worker missed row",
                     ref_id: u32::try_from(pos).unwrap_or(u32::MAX),
                 });
@@ -2930,7 +2931,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
             match done.result {
                 Ok(entry_bytes) => {
                     let one = walk
-                        .finish::<RunError>(pend, entry_bytes.as_slice(), codes, &body_ids::EntryForm, MOST_WALKED, scratch)
+                        .finish::<RunError>(pend, entry_bytes.as_slice(), ids, codes, &body_ids::EntryForm, MOST_WALKED, scratch)
                         .map_err(|why| {
                             box_err(
                                 ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },

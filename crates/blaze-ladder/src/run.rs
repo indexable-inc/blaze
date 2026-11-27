@@ -1404,7 +1404,7 @@ pub struct Built {
     reached: u32,
     /// Each fn instance a static points at, sorted by key, and its slot ([`static_fn_slots`]):
     /// placement writes the slot's thunk into the static's word.
-    static_fns: Vec<(InstanceKey, u32), Global>,
+    static_fns: blaze_own::Vec<(InstanceKey, place::StaticFnPlace), Global>,
     /// Each vtable a static points at, sorted by key, and its table index in `vtables`:
     /// placement writes the table's address into the static's word.
     static_vtables: blaze_own::Vec<(VtableKey, u32), Global>,
@@ -2515,6 +2515,7 @@ fn build_from<P: FrontEnd>(
     // is the evaluator's key, so resolve it to the instance and normalize it exactly as the
     // build's own slot key before placement. A missing descriptor or untabled body remains a
     // static-fn stub and keeps the named first-call refusal in [`static_fn_slots`].
+    let mut foreign_static_fns: blaze_own::Vec<(InstanceKey, blaze_own::String<Alloc<'_>>), Alloc<'_>> = blaze_own::Vec::new_in(alloc);
     if survey.stubs.is_some()
         && let Some(image) = image.as_mut()
     {
@@ -2536,11 +2537,19 @@ fn build_from<P: FrontEnd>(
                     }
                     let tabled = make_one::static_fn_tabled(program, instance, ground.view());
                     let Some(c) = program.fn_index(tabled) else { continue };
-                    let facts = FrontAdts(program, c, &consts, &langs, &checked_bodies);
-                    let normalized = key_of(program, c, instance, &mut ground, &facts)?;
-                    reached.slot(instance, c, normalized)?;
-                    canonical.insert(key, normalized);
-                    normalized
+                    if program.function(c).kind == FnKind::Foreign {
+                        if let Err(at) = foreign_static_fns.binary_search_by_key(&key, |f| f.0) {
+                            foreign_static_fns.insert_shift(at, (key, blaze_own::String::from_str_in(program.function(c).symbol, alloc)));
+                        }
+                        canonical.insert(key, key);
+                        key
+                    } else {
+                        let facts = FrontAdts(program, c, &consts, &langs, &checked_bodies);
+                        let normalized = key_of(program, c, instance, &mut ground, &facts)?;
+                        reached.slot(instance, c, normalized)?;
+                        canonical.insert(key, normalized);
+                        normalized
+                    }
                 }
             };
             reloc.target = ImageTarget::Fn(reached_key);
@@ -3720,8 +3729,8 @@ fn build_from<P: FrontEnd>(
     // A build that runs: each fn a static points at gets its slot (a stub's when the walk did
     // not reach it), before the getter's slot.
     let static_fns = match (image.as_ref(), survey.stubs.as_mut()) {
-        (Some(image), Some(stubs)) => static_fn_slots(image, &reached.keys, stubs, &mut bodies)?,
-        _ => Vec::new_in(Global),
+        (Some(image), Some(stubs)) => static_fn_slots(image, &reached.keys, &foreign_static_fns, stubs, &mut bodies, alloc, Global)?,
+        _ => blaze_own::Vec::new_in(Global),
     };
     // The thread-locals' getter and ender (THREADS.md D2), once each, in the two slots after
     // every instance; each calls its imports directly. The ender is the key's destructor:
@@ -3782,8 +3791,16 @@ fn build_from<P: FrontEnd>(
 /// slot: the slot the walk built it in (`keys` by slot), else a slot of its own at the end of
 /// `bodies` holding a stub with [`RunError::StaticFn`] (the image names it by key alone, so the
 /// walk cannot build it: it stops the program only if called through the static).
-fn static_fn_slots(image: &StaticImage<Global>, keys: &[Option<InstanceKey>], stubs: &mut Stubs, bodies: &mut Vec<Body, Global>) -> Result<Vec<(InstanceKey, u32), Global>, RunError> {
-    let mut by_key: Vec<(InstanceKey, u32), Global> = Vec::with_capacity_in(keys.len(), Global);
+fn static_fn_slots<A: core::alloc::Allocator + Copy>(
+    image: &StaticImage<A>,
+    keys: &[Option<InstanceKey>],
+    foreign_fns: &[(InstanceKey, blaze_own::String<Alloc<'_>>)],
+    stubs: &mut Stubs,
+    bodies: &mut Vec<Body, Global>,
+    tmp: Alloc<'_>,
+    out_alloc: A,
+) -> Result<blaze_own::Vec<(InstanceKey, place::StaticFnPlace), A>, RunError> {
+    let mut by_key: blaze_own::Vec<(InstanceKey, u32), Alloc<'_>> = blaze_own::Vec::with_capacity_in(keys.len(), tmp);
     for (slot, key) in keys.iter().enumerate() {
         if let Some(key) = key {
             by_key.push((*key, u32::try_from(slot).map_err(|_| RunError::TooManyInstances)?));
@@ -3792,23 +3809,28 @@ fn static_fn_slots(image: &StaticImage<Global>, keys: &[Option<InstanceKey>], st
     // The first slot of a key, as `Reached::slot` gives it.
     by_key.sort_by_key(|k| k.0);
     by_key.dedup_by_key(|k| k.0);
-    let mut out: Vec<(InstanceKey, u32), Global> = Vec::new_in(Global);
+    let mut out: blaze_own::Vec<(InstanceKey, place::StaticFnPlace), A> = blaze_own::Vec::new_in(out_alloc);
     for r in image.relocs.iter() {
         let ImageTarget::Fn(key) = r.target else { continue };
         let Err(at) = out.binary_search_by_key(&key, |f| f.0) else { continue };
-        let slot = match by_key.binary_search_by_key(&key, |k| k.0) {
-            Ok(found) => by_key[found].1,
-            Err(_) => {
-                let slot = bodies.len();
-                // The static whose bytes hold the word: the last whose first byte is at or before it.
-                let static_ = image.statics.iter().filter(|s| s.1 <= r.at).max_by_key(|s| s.1).map(|s| s.0);
-                stubs.slot = slot;
-                stubs.keep(RunError::StaticFn { static_, key });
-                bodies.push(stubs.body(slot).ok_or(RunError::TooManyInstances)?);
-                u32::try_from(slot).map_err(|_| RunError::TooManyInstances)?
-            }
+        let dest = if let Some((_, sym)) = foreign_fns.binary_search_by_key(&key, |f| f.0).ok().and_then(|fi| foreign_fns.get(fi)) {
+            place::StaticFnPlace::Symbol(sym.as_str().into())
+        } else {
+            let slot = match by_key.binary_search_by_key(&key, |k| k.0) {
+                Ok(found) => by_key.get(found).map(|k| k.1).ok_or(RunError::TooManyInstances)?,
+                Err(_) => {
+                    let slot = bodies.len();
+                    // The static whose bytes hold the word: the last whose first byte is at or before it.
+                    let static_ = image.statics.iter().filter(|s| s.1 <= r.at).max_by_key(|s| s.1).map(|s| s.0);
+                    stubs.slot = slot;
+                    stubs.keep(RunError::StaticFn { static_, key });
+                    bodies.push(stubs.body(slot).ok_or(RunError::TooManyInstances)?);
+                    u32::try_from(slot).map_err(|_| RunError::TooManyInstances)?
+                }
+            };
+            place::StaticFnPlace::Slot(slot)
         };
-        out.insert(at, (key, slot));
+        out.insert_shift(at, (key, dest));
     }
     Ok(out)
 }

@@ -146,9 +146,20 @@ impl CellMetrics {
     }
 }
 
+/// Which font size set of the window's `FontBook` a [`TextRun`] is drawn in. A pane's layout
+/// writes [`FontSetId::WINDOW`]; [`Scene::composite_pane`] stamps the pane's own id on its runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FontSetId(pub u8);
+
+impl FontSetId {
+    /// The window's own size: sidebar, command palette and anything drawn outside a pane.
+    pub const WINDOW: Self = Self(0);
+}
+
 /// A styled text span positioned in logical pixels to be turned into [`blaze_ui::shaders::GlyphInst`]s.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TextRun {
+    pub font: FontSetId,
     pub x: f32,
     pub y: f32,
     pub text: String,
@@ -394,7 +405,14 @@ pub enum HoverKind {
     },
     Toolchains { items: Vec<(&'static str, &'static str, &'static str)> },
     /// Hovering a file entry in `ls` grid or table; lazily hydrated into `FilePreview` / `DirPreview`.
-    FileEntry { full_path: String, name: String, icon: Option<&'static str>, is_dir: bool },
+    /// `git_change` marks a `git status` row, whose preview is the file's diff.
+    FileEntry {
+        full_path: String,
+        name: String,
+        icon: Option<&'static str>,
+        is_dir: bool,
+        git_change: bool,
+    },
     /// Hydrated rich syntax-highlighted / tabular / markdown preview popover rendered in dark glass.
     FilePreview {
         full_path: String,
@@ -1340,7 +1358,7 @@ impl Scene {
     ) {
         let s = text.into();
         if !s.is_empty() {
-            self.text_runs.push(TextRun { x, y, text: s, color, bold, italic, face, clip_id });
+            self.text_runs.push(TextRun { font: FontSetId::WINDOW, x, y, text: s, color, bold, italic, face, clip_id });
         }
     }
 
@@ -1414,7 +1432,7 @@ impl Scene {
     ) {
         let s = text.into();
         if !s.is_empty() {
-            self.overlay_text.push(TextRun { x, y, text: s, color, bold, italic, face, clip_id });
+            self.overlay_text.push(TextRun { font: FontSetId::WINDOW, x, y, text: s, color, bold, italic, face, clip_id });
         }
     }
 
@@ -1545,7 +1563,8 @@ impl Scene {
     }
 
     /// Composite a full pane sub-scene (rendered for `[0..pane_w, top_offset..top_offset+pane_h]`)
-    /// cleanly into `pane_rect` inside the window's master [`Scene`].
+    /// cleanly into `pane_rect` inside the window's master [`Scene`]. Its text is drawn in `font`,
+    /// the set of the size the pane was laid out with.
     ///
     /// Base layers are tightly clipped to `pane_rect` (zero bleed between tiled panes); floating
     /// overlays from the focused pane (`Ctrl+R`, hover previews, completions) float freely above
@@ -1553,6 +1572,7 @@ impl Scene {
     pub fn composite_pane(
         &mut self,
         sub: Scene,
+        font: FontSetId,
         pane_rect: HitRect,
         top_offset: f32,
         is_focused: bool,
@@ -1627,6 +1647,7 @@ impl Scene {
             self.rects.push(xlat_rect(r, cid));
         }
         for mut t in sub.text_runs {
+            t.font = font;
             t.x += dx;
             t.y += dy;
             t.clip_id = map_clip(t.clip_id);
@@ -1708,6 +1729,7 @@ impl Scene {
                 self.overlay_images.push(img);
             }
             for mut t in sub.overlay_text {
+                t.font = font;
                 t.x += dx;
                 t.y += dy;
                 t.clip_id = map_ov_clip(t.clip_id);

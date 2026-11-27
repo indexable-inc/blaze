@@ -327,7 +327,7 @@ fn an_owner_sees_one_side() {
     assert_eq!(w.crates[pm_cores[0]].side, Side::Macro, "pm's core is the macro side's");
     // CONTROL: the rule before crate-list-one-home-3 and this, for `pm`.
     let mut old: StdVec<usize> = StdVec::from([pm]);
-    old.extend([w.sysroot.core, w.sysroot.alloc, w.sysroot.std, w.sysroot.bstd].into_iter().flatten().map(|id| id.0 as usize).filter(|at| *at != pm));
+    old.extend(w.sysroot.all().into_iter().flatten().map(|id| id.0 as usize).filter(|at| *at != pm));
     let mut next = 0;
     while next < old.len() {
         let at = old[next];
@@ -715,12 +715,13 @@ fn an_old_crate_list_is_refused_by_name() {
     // the planners' tables (end-state.md D157): a version-5 list is refused, never read (D160).
     // Version 7: each tree row carries its pack kind.
     // Version 8: each row carries its package binaries (`CARGO_BIN_EXE_<name>`).
-    assert_eq!(VERSION, 8);
+    // Version 9: the header's sysroot array holds `proc_macro` (5 entries, HEADER_LEN = 64).
+    assert_eq!(VERSION, 9);
     bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
     let refused = CrateList::open(&bytes).err().expect("a version-2 list is refused");
     assert_eq!(refused, ListError::Version { found: 2 });
     let words = std::format!("{refused}");
-    assert!(words.contains("version 2, not 8"), "{words}");
+    assert!(words.contains("version 2, not 9"), "{words}");
     for old in 1..VERSION {
         bytes[4..6].copy_from_slice(&old.to_le_bytes());
         assert_eq!(CrateList::open(&bytes).err(), Some(ListError::Version { found: old }), "a version-{old} list is refused by name");

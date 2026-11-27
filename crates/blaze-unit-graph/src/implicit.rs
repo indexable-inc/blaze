@@ -119,11 +119,13 @@ impl Implicit {
     }
 
     /// The toolchain crate `extern crate <name>;` names beyond the extern prelude: `alloc`,
-    /// and `proc_macro` (which any crate may name so, as rustc allows).
+    /// and `proc_macro` (for Rust-edition units and proc-macro targets; a blaze-edition unit
+    /// has no Rust `std` or `proc_macro`, so its resolution never depends on whether another
+    /// crate in the workspace uses Rust's toolchain).
     pub fn extern_crate(&self, name: &str, sysroot: &Sysroot) -> Option<ToolchainUnit> {
         match name {
             "alloc" => Some(sysroot.alloc),
-            "proc_macro" => Some(sysroot.proc_macro),
+            "proc_macro" => (matches!(self.std, StdIs::Rust) || self.proc_macro).then_some(sysroot.proc_macro),
             _ => self.externs(sysroot).find(|(it, _)| *it == name).map(|(_, unit)| unit),
         }
     }
@@ -161,6 +163,7 @@ mod tests {
                 assert_ne!(it.extern_crate(name, &SYSROOT), Some(SYSROOT.std), "{name}");
             }
             assert_eq!(it.extern_crate("bstd", &SYSROOT), None);
+            assert_eq!(it.extern_crate("proc_macro", &SYSROOT), None);
             assert_eq!(it.extern_crate("alloc", &SYSROOT), Some(SYSROOT.alloc));
         }
     }
@@ -194,7 +197,9 @@ mod tests {
         for (written, module) in [("2015", "rust_2015"), ("2018", "rust_2018"), ("2021", "rust_2021"), ("2024", "rust_2024")] {
             assert_eq!(externs(written, &UnitKind::Lib), [("core", 0), ("std", 2)]);
             let edition = PackageEdition::of_manifest(written).expect("an edition");
-            assert_eq!(implicit(edition, &UnitKind::Lib).prelude.module(), module);
+            let it = implicit(edition, &UnitKind::Lib);
+            assert_eq!(it.prelude.module(), module);
+            assert_eq!(it.extern_crate("proc_macro", &SYSROOT), Some(SYSROOT.proc_macro));
         }
     }
 }

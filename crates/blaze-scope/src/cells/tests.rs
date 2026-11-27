@@ -1319,7 +1319,8 @@ fn a_call_at_the_recursion_limit_is_an_error() {
     w.cr(root).head.recursion_limit = 256;
     assert_eq!(written_errors(&w, root, CellPlant::None), "[]", "raised crate recursion_limit = 256");
     w.expanded.borrow_mut().clear();
-    let mut c = Cells::load_planted(&w, root, None, CellPlant::None, Alloc::global()).expect("load");
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut c = Cells::load_planted(&w, root, None, CellPlant::None, alloc).expect("load");
     let expand = |call: ItemKey, _: crate::Def| {
         w.expanded.borrow_mut().insert(call);
     };
@@ -1331,6 +1332,7 @@ fn a_call_at_the_recursion_limit_is_an_error() {
 /// `>= 65_536` are enforced consistently in both `Cells` and `Resolver`.
 #[test]
 fn u32_depth_does_not_saturate_at_u16_max() {
+    let alloc = blaze_own::testing::heap().alloc();
     let mut w = World::new();
     let root = w.root(1, Edition::E2021);
     w.cr(root).head.recursion_limit = 65_536;
@@ -1338,7 +1340,7 @@ fn u32_depth_does_not_saturate_at_u16_max() {
     // Cells: build a 65,536-link fragment parent chain (depth 0..=65_536) and verify `depth`
     // reaches 65,536 without saturating at 65,535, and `read_fragment` marks a call at depth
     // 65,536 `deep = true` under limit 65,536 and `deep = false` under limit 65,537.
-    let mut c = Cells::load_planted(&w, root, None, CellPlant::None, Alloc::global()).expect("load");
+    let mut c = Cells::load_planted(&w, root, None, CellPlant::None, alloc).expect("load");
     let mut parent = c.modules[c.root as usize].text;
     assert_eq!(c.depth(parent), 0);
     for _ in 0..65_535u32 {
@@ -1346,21 +1348,21 @@ fn u32_depth_does_not_saturate_at_u16_max() {
         c.frags.push(super::Frag {
             module: c.root,
             up: Some((parent, 0)),
-            slots: blaze_own::AVec::new_in(Alloc::global()),
-            prev_live: blaze_own::AVec::new_in(Alloc::global()),
+            slots: blaze_own::AVec::new_in(alloc),
+            prev_live: blaze_own::AVec::new_in(alloc),
             textual_empty: true,
             guess_skip_epoch: 0,
-            guess_prev_live: blaze_own::AVec::new_in(Alloc::global()),
+            guess_prev_live: blaze_own::AVec::new_in(alloc),
         });
         parent = fid;
     }
     assert_eq!(c.depth(parent), 65_535);
 
-    let mut decls = crate::DeclsBuilder::new_in(Alloc::global());
+    let mut decls = crate::DeclsBuilder::new_in(alloc);
     let call_key = ItemKey(blaze_id::ContentId([9; 32]));
     decls.calls.push(crate::MacroCallDecl {
         call: call_key,
-        path: crate::Path { kind: crate::PathKind::Plain, segments: blaze_own::AVec::from_slice_in(&["m"], Alloc::global()) },
+        path: crate::Path { kind: crate::PathKind::Plain, segments: blaze_own::AVec::from_slice_in(&["m"], alloc) },
         kind: crate::CallShape::FnLike,
         role: blaze_surface::CallRole::Call,
         item: None,
@@ -1379,7 +1381,7 @@ fn u32_depth_does_not_saturate_at_u16_max() {
     assert!(!c.items.last().expect("call pushed").deep, "depth 65_536 must be allowed under limit 65_537");
 
     // Resolver: `add_fragment` accepts `u32` expansion depth 65_536 and enforces 65_536 vs 65_537.
-    let mut r = crate::Resolver::new_in(root, &w, Alloc::global()).expect("resolver");
+    let mut r = crate::Resolver::new_in(root, &w, alloc).expect("resolver");
     assert_eq!(r.recursion_limit, 65_536);
     r.add_fragment(&decls, None, 65_536, None).expect("resolver add_fragment at 65536");
     assert_eq!(r.calls.last().expect("resolver call").state, crate::resolver::CallState::TooDeep);
@@ -1400,7 +1402,7 @@ fn resolver_expansion_budget_scales_with_recursion_limit() {
     let c1 = w.call(root, "m", crate::CallShape::FnLike);
     let c2 = w.call(root, "m", crate::CallShape::FnLike);
 
-    let mut r = crate::Resolver::new_in(root, &w, Alloc::global()).expect("resolver");
+    let mut r = crate::Resolver::new_in(root, &w, blaze_own::testing::heap().alloc()).expect("resolver");
     assert_eq!(r.expansion_budget(), 65_537);
     // Simulate 65,536 prior expansions already taken in this module.
     r.expansions = crate::MAX_EXPANSIONS;
@@ -2192,9 +2194,9 @@ fn macro2_at_dep_root_is_excluded_from_macro_use_prelude() {
             self.0.has_enum(key) || self.1.has_enum(key)
         }
     }
-    let deps: &'static TwoDeps = std::boxed::Box::leak(std::boxed::Box::new(TwoDeps(d_std, d_other)));
+    let deps = TwoDeps(d_std, d_other);
     w.expanded.borrow_mut().clear();
-    let mut c = Cells::load_with(&w, root, Some(deps), blaze_own::testing::heap().alloc()).expect("load root");
+    let mut c = Cells::load_with(&w, root, Some(&deps), blaze_own::testing::heap().alloc()).expect("load root");
     let expand = |call: ItemKey, _: crate::Def| {
         w.expanded.borrow_mut().insert(call);
     };

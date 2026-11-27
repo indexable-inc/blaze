@@ -400,7 +400,7 @@ fn kept() -> &'static Kept {
 }
 
 fn kept_of(crates: &[CrateInput<'static>]) -> &'static Kept {
-    let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
+    let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), ..Sysroot::default() };
     let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(crates, sysroot, &Texts, &Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"))));
     let g = a();
     let mut kept = Kept { names: Vec::new(), items: Vec::new(), files: Vec::new(), expansions: Vec::new(), keys: Vec::new(), crate_names: Vec::new() };

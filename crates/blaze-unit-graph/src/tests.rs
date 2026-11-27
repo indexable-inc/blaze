@@ -1473,6 +1473,109 @@ version = \"0.1.0\"
     assert!(partial.missing().contains(&foo1_id), "missing should include foo 1.0.0: {:?}", partial.missing());
 }
 
+/// A reached `path` dependency the layout could not read (blaze-manifest `Source::Outside`:
+/// crates/blaze-shell's `bgit = { path = "../bgit" }` with the anchor at its own folder) is
+/// [`UnitError::PathOutsideAnchor`] on the first pass, naming the package, the key and the path
+/// as written; it is never a `Need` for the store, which cannot answer a path entry. Prints
+/// the error. CONTROL: the same line once the layout found the package (an anchor above both)
+/// and answered it with `Resolution::package` resolves, and a `[target.'cfg(windows)']` line of
+/// the same kind on macOS is not reached and refuses nothing.
+#[test]
+fn a_path_dependency_outside_the_anchor_is_named_when_reached() {
+    let lock_text = "\
+version = 4
+
+[[package]]
+name = \"bgit\"
+version = \"0.0.0\"
+
+[[package]]
+name = \"shell\"
+version = \"0.0.0\"
+dependencies = [
+ \"bgit\",
+ \"winonly\",
+]
+
+[[package]]
+name = \"winonly\"
+version = \"0.0.0\"
+";
+    let lock = Lock::read(lock_text.as_bytes(), a()).expect("lock");
+    let shell_id = lock.named("shell").next().expect("shell");
+    let bgit_id = lock.named("bgit").next().expect("bgit");
+    let pkg = |name: &str, deps: StdVec<Dep<'static>>| -> Package<'static> {
+        let mut d = Vec::new_in(a());
+        for dep in deps {
+            d.push(dep);
+        }
+        Package {
+            name: t(name),
+            edition: PackageEdition { syntax: Edition::Edition2021, blaze: None },
+            lib: Some(Lib { crate_name: t(name), root: t("src/lib.rs"), proc_macro: false }),
+            bins: Vec::new_in(a()),
+            extras: Vec::new_in(a()),
+            build: None,
+            links: None,
+            features: Vec::new_in(a()),
+            deps: d,
+            meta: crate::PackageMeta::unstated(a()),
+            patched_from: Vec::new_in(a()),
+        }
+    };
+    let line = |key: &str, platform: Option<&str>, source: DepSource<'static>| Dep {
+        key: t(key),
+        package: t(key),
+        kind: DepKind::Normal,
+        platform: platform.map(|p| Platform::parse(p, a())),
+        optional: false,
+        default_features: true,
+        features: Vec::new_in(a()),
+        source,
+    };
+    let shell = |bgit: DepSource<'static>| {
+        pkg(
+            "shell",
+            vec![line("bgit", None, bgit), line("winonly", Some("cfg(windows)"), DepSource::OutsideAnchor { path: t("../winonly") })],
+        )
+    };
+    let target = mac();
+    let ask = || {
+        let mut roots = Vec::new_in(a());
+        roots.push(shell_id);
+        Ask { roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false }
+    };
+
+    let asked = ask();
+    let mut res = Resolution::new(&lock, &target, &target, &asked, Resolver::V2, a());
+    res.member(shell_id, shell(DepSource::OutsideAnchor { path: t("../bgit") })).expect("member shell");
+    let error = match res.pass() {
+        Err(error) => error,
+        Ok(Pass::Need(ids)) => panic!("asked the store for {} package(s): a path entry it cannot answer", ids.len()),
+        Ok(Pass::Done(_) | Pass::Partial(_)) => panic!("a graph without the unread path package"),
+    };
+    match &error {
+        UnitError::PathOutsideAnchor { package, dep, path } => {
+            assert_eq!((package.as_str(), dep.as_str(), path.as_str()), ("shell", "bgit", "../bgit"));
+        }
+        other => panic!("expected PathOutsideAnchor, got {other}"),
+    }
+
+    // CONTROL: the layout found bgit (Source::Path) and answered it.
+    let asked = ask();
+    let mut res = Resolution::new(&lock, &target, &target, &asked, Resolver::V2, a());
+    res.member(shell_id, shell(DepSource::Path)).expect("member shell");
+    res.package(bgit_id, Some(pkg("bgit", vec![]))).expect("path package bgit");
+    let graph = match res.pass().expect("pass") {
+        Pass::Done(graph) => graph,
+        Pass::Need(ids) => panic!("asked for {} package(s) with every reached package answered", ids.len()),
+        Pass::Partial(_) => panic!("partial with every reached package answered"),
+    };
+    let names: StdVec<&str> = graph.units.iter().map(|u| u.name.as_str()).collect();
+    assert!(names.contains(&"bgit"), "bgit is a unit: {names:?}");
+    assert!(!names.contains(&"winonly"), "a cfg(windows) line was reached on macOS: {names:?}");
+}
+
 #[test]
 fn disambiguates_same_name_git_deps_patched_to_different_paths() {
     const LOCK: &str = r#"version = 4
@@ -1683,8 +1786,9 @@ fn host_units_resolves_wasm64_target_specific_renamed_deps_weak_features_and_dep
         .iter()
         .find(|u| u.name.as_str() == "rustix_like" && u.kind == UnitKind::Lib)
         .expect("host rustix_like");
-    let host_dep_names: std::vec::Vec<&str> = host_rustix.deps.iter().map(|d| d.name.as_str()).collect();
-    assert_eq!(host_dep_names, ["bitflags", "linux_raw_sys"]);
+    let mut host_dep_names = Vec::new_in(a());
+    host_dep_names.extend(host_rustix.deps.iter().map(|d| d.name.as_str()));
+    assert_eq!(host_dep_names.as_slice(), ["bitflags", "linux_raw_sys"]);
     assert!(!host_graph.units.iter().any(|u| u.name.as_str() == "errno" || u.name.as_str() == "libc"));
 
     // 2. Host-unit resolution for `wasm64-blaze-wasip1` resolves rustix_like -> (bitflags, libc, libc_errno -> errno),
@@ -1707,14 +1811,15 @@ fn host_units_resolves_wasm64_target_specific_renamed_deps_weak_features_and_dep
         .iter()
         .find(|u| u.name.as_str() == "rustix_like" && u.kind == UnitKind::Lib)
         .expect("wasm rustix_like");
-    let wasm_dep_names: std::vec::Vec<&str> = wasm_rustix.deps.iter().map(|d| d.name.as_str()).collect();
-    assert_eq!(wasm_dep_names, ["bitflags", "libc", "libc_errno"]);
+    let mut wasm_dep_names = Vec::new_in(a());
+    wasm_dep_names.extend(wasm_rustix.deps.iter().map(|d| d.name.as_str()));
+    assert_eq!(wasm_dep_names.as_slice(), ["bitflags", "libc", "libc_errno"]);
     assert!(wasm_rustix.build_script.is_some(), "rustix_like build script kept");
 
     let libc_dep = wasm_rustix.deps.iter().find(|d| d.name.as_str() == "libc").expect("libc dep");
     let libc_unit = &wasm_graph.units[libc_dep.unit.index()];
     assert_eq!(libc_unit.name.as_str(), "libc");
-    assert_eq!(libc_unit.features.iter().map(|f| f.as_str()).collect::<std::vec::Vec<_>>(), ["std"]);
+    assert!(libc_unit.features.iter().map(|f| f.as_str()).eq(["std"]));
     let libc_bs = libc_unit.build_script.expect("libc must have its own build_script unit");
     assert_eq!(wasm_graph.units[libc_bs.index()].kind, UnitKind::BuildScript);
     assert_eq!(wasm_graph.units[libc_bs.index()].name.as_str(), "libc");
@@ -1722,9 +1827,10 @@ fn host_units_resolves_wasm64_target_specific_renamed_deps_weak_features_and_dep
     let errno_dep = wasm_rustix.deps.iter().find(|d| d.name.as_str() == "libc_errno").expect("renamed libc_errno dep");
     let errno_unit = &wasm_graph.units[errno_dep.unit.index()];
     assert_eq!(errno_unit.name.as_str(), "errno");
-    assert_eq!(errno_unit.features.iter().map(|f| f.as_str()).collect::<std::vec::Vec<_>>(), ["std"]);
-    let errno_deps: std::vec::Vec<&str> = errno_unit.deps.iter().map(|d| d.name.as_str()).collect();
-    assert_eq!(errno_deps, ["libc"]);
+    assert!(errno_unit.features.iter().map(|f| f.as_str()).eq(["std"]));
+    let mut errno_deps = Vec::new_in(a());
+    errno_deps.extend(errno_unit.deps.iter().map(|d| d.name.as_str()));
+    assert_eq!(errno_deps.as_slice(), ["libc"]);
 }
 
 /// Under resolver 2/3, a package built for BOTH target (feature `feat_a`) and host (feature
@@ -1787,8 +1893,8 @@ fn host_units_preserves_target_and_host_build_script_feature_namespaces_distinct
             features,
         });
     }
-    let shared_asks: std::vec::Vec<_> = wasm_roots.iter().filter(|r| r.package == LockId(1)).collect();
-    assert_eq!(shared_asks.len(), 2, "host graph must produce 2 distinct BuildScript units for shared");
+    let shared_asks = wasm_roots.iter().filter(|r| r.package == LockId(1)).count();
+    assert_eq!(shared_asks, 2, "host graph must produce 2 distinct BuildScript units for shared");
 
     let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V2, a());
     host_res.move_packages_into(&mut wasm_res).expect("move packages");
@@ -1797,18 +1903,16 @@ fn host_units_preserves_target_and_host_build_script_feature_namespaces_distinct
         _ => panic!("expected Done on wasm64"),
     };
 
-    let mut shared_bs_feats: std::vec::Vec<std::vec::Vec<&str>> = wasm_graph
-        .units
-        .iter()
-        .filter(|u| u.name.as_str() == "shared" && u.kind == UnitKind::BuildScript)
-        .map(|u| u.features.iter().map(|f| f.as_str()).collect())
-        .collect();
-    shared_bs_feats.sort();
-    assert_eq!(
-        shared_bs_feats,
-        vec![vec!["feat_a"], vec!["feat_b"]],
-        "target-side and host-side build scripts for `shared` must stay separate with zero feature bleed"
-    );
+    let mut shared_bs_feats = Vec::new_in(a());
+    for u in wasm_graph.units.iter().filter(|u| u.name.as_str() == "shared" && u.kind == UnitKind::BuildScript) {
+        let mut fs = Vec::new_in(a());
+        fs.extend(u.features.iter().map(|f| f.as_str()));
+        shared_bs_feats.push(fs);
+    }
+    shared_bs_feats.sort_by(|x, y| x.as_slice().cmp(y.as_slice()));
+    assert_eq!(shared_bs_feats.len(), 2);
+    assert_eq!(shared_bs_feats[0].as_slice(), ["feat_a"]);
+    assert_eq!(shared_bs_feats[1].as_slice(), ["feat_b"]);
 }
 
 /// Under resolver 1, target-specific dependency feature requests unify across all targets (even
@@ -1866,7 +1970,8 @@ fn host_units_resolver_v1_unifies_features_from_inactive_linux_and_active_wasi_b
         .iter()
         .find(|u| u.name.as_str() == "shared" && u.kind == UnitKind::Lib)
         .expect("shared lib unit");
-    let mut feats: std::vec::Vec<&str> = shared_unit.features.iter().map(|f| f.as_str()).collect();
+    let mut feats = Vec::new_in(a());
+    feats.extend(shared_unit.features.iter().map(|f| f.as_str()));
     feats.sort();
-    assert_eq!(feats, ["feat_a", "feat_b"], "resolver 1 must unify inactive Linux `feat_a` with active WASI `feat_b`");
+    assert_eq!(feats.as_slice(), ["feat_a", "feat_b"], "resolver 1 must unify inactive Linux `feat_a` with active WASI `feat_b`");
 }

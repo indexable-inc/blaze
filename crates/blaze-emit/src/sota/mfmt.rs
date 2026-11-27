@@ -634,6 +634,10 @@ fn format_annotations<W: fmt::Write>(
                 write_sep(&mut has_any, out)?;
                 write!(out, "table(#{table_id})")?;
             }
+            MNoteKind::CallClobbers { mask } => {
+                write_sep(&mut has_any, out)?;
+                write!(out, "clobbers({mask:#x})")?;
+            }
         }
         cur = note.next;
     }
@@ -1377,6 +1381,53 @@ fn format_vec_alu<W: fmt::Write>(
             write_vec_reg(func, rn, "16b", out)?;
             out.write_str("}, ")?;
             write_opt_vec_reg(func, rm, "16b", out)
+        }
+        VecAluOp::Neg => {
+            out.write_str("neg ")?;
+            write_vec_reg(func, dst, arr, out)?;
+            out.write_str(", ")?;
+            write_vec_reg(func, rn, arr, out)
+        }
+        VecAluOp::Ushl => format_vec_bin(func, "ushl", dst, rn, rm, arr, out),
+        VecAluOp::Sshl => format_vec_bin(func, "sshl", dst, rn, rm, arr, out),
+        VecAluOp::ShlImm { shift } => {
+            out.write_str("shl ")?;
+            write_vec_reg(func, dst, arr, out)?;
+            out.write_str(", ")?;
+            write_vec_reg(func, rn, arr, out)?;
+            write!(out, ", #{shift}")
+        }
+        VecAluOp::UshrImm { shift } => {
+            out.write_str("ushr ")?;
+            write_vec_reg(func, dst, arr, out)?;
+            out.write_str(", ")?;
+            write_vec_reg(func, rn, arr, out)?;
+            write!(out, ", #{shift}")
+        }
+        VecAluOp::SshrImm { shift } => {
+            out.write_str("sshr ")?;
+            write_vec_reg(func, dst, arr, out)?;
+            out.write_str(", ")?;
+            write_vec_reg(func, rn, arr, out)?;
+            write!(out, ", #{shift}")
+        }
+        VecAluOp::Rev32 => {
+            out.write_str("rev32 ")?;
+            write_vec_reg(func, dst, arr, out)?;
+            out.write_str(", ")?;
+            write_vec_reg(func, rn, arr, out)
+        }
+        VecAluOp::Rev16 => {
+            out.write_str("rev16 ")?;
+            write_vec_reg(func, dst, "16b", out)?;
+            out.write_str(", ")?;
+            write_vec_reg(func, rn, "16b", out)
+        }
+        VecAluOp::Rev64 => {
+            out.write_str("rev64 ")?;
+            write_vec_reg(func, dst, arr, out)?;
+            out.write_str(", ")?;
+            write_vec_reg(func, rn, arr, out)
         }
     }
 }

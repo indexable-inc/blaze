@@ -600,6 +600,13 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.each_item(krate, each)
     }
 
+    fn each_export_candidate(self, krate: usize, alloc: Alloc<'_>, each: &mut dyn FnMut(ItemKey, Option<&'n str>, bool, bool)) -> bool {
+        if let Some(prefix) = self.prefix(krate) {
+            self.cell(NameCell::Exports { krate: prefix });
+        }
+        self.records.each_export_candidate(krate, alloc, each)
+    }
+
     fn block_binding(self, module: ItemKey, ns: Namespace, name: &str) -> Option<Option<blaze_surface::Binding>> {
         self.cell(NameCell::Module { module });
         blaze_scope::names_cells::CellSink::put_binding(&NamesInto(self.reads), module, ns, name);

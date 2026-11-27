@@ -282,8 +282,8 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
     let checked: StdVec<_> = views
         .iter()
         .map(|view| {
-            let mut ty = InferCtx::new_in(Alloc::global());
-            let c = match blaze_typeck::check(view, &w.fx, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+            let mut ty = InferCtx::new_in(blaze_own::testing::heap().alloc());
+            let c = match blaze_typeck::check(view, &w.fx, &mut ty, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
                 Ok(Outcome::Done(c)) => c,
                 Ok(Outcome::Need(n)) => panic!("the check needed {:?}", n.questions),
                 Err(error) => panic!("the check failed: {error:?}"),
@@ -292,20 +292,20 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
             c
         })
         .collect();
-    let mut table = PortableTys::new_in(Alloc::global());
+    let mut table = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let mut rows = StdVec::new();
     for ((p, c), view) in progs.iter().zip(checked.iter()).zip(views.iter()) {
         let s = w.fx.sig_of(p.item).expect("the fn's signature");
         for ordinal in 0..c.closures.len() as u32 {
-            let (kind, sig, env) = crate::layout::closure_facts(view, c, ordinal, s.parent_count + s.own_count, &mut table, Alloc::global())
+            let (kind, sig, env) = crate::layout::closure_facts(view, c, ordinal, s.parent_count + s.own_count, &mut table, blaze_own::testing::heap().alloc())
                 .unwrap_or_else(|e| panic!("closure {ordinal}'s facts: {e}"));
             rows.push((p.item, ordinal, kind, sig, env));
         }
     }
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let adts = FxAdts { w, progs, closures: &rows, table: table.view() };
     let sig = w.fx.sig_of(w.main).expect("main's signature");
-    let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
     let main = crate::build(&views[0], &checked[0], &sig, &mut subst, &adts, Global).unwrap_or_else(|e| panic!("the build of main failed: {e}"));
     super::emits(&main, &[]);
     let mut bodies: StdVec<(ItemKey, List, Built<Global>)> = StdVec::new();
@@ -315,8 +315,8 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
     gb.param("p");
     let groot = gb.block(&[], None);
     let gview = gb.view(w.dip, groot);
-    let mut gty = InferCtx::new_in(Alloc::global());
-    let gchecked = match blaze_typeck::check(&gview, &w.fx, &mut gty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+    let mut gty = InferCtx::new_in(blaze_own::testing::heap().alloc());
+    let gchecked = match blaze_typeck::check(&gview, &w.fx, &mut gty, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
         Ok(Outcome::Done(c)) => c,
         other => panic!("the check of `drop_in_place` did not finish: {:?}", other.err()),
     };
@@ -324,7 +324,7 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
     // An instance is built once per KEY (instance.rs `instance_key`, as the store names it), not
     // per argument list: two instances whose keys collide would share one body here too.
     let key = |ground: &PortableTys<'_>, item: ItemKey, args: List| {
-        crate::instance_key(blaze_ids::ContentId::of("test code", &item.0.to_le_bytes()), args, ground.view(), Alloc::global()).expect("an instance key")
+        crate::instance_key(blaze_ids::ContentId::of("test code", &item.0.to_le_bytes()), args, ground.view(), blaze_own::testing::heap().alloc()).expect("an instance key")
     };
     let mut keys: StdVec<crate::InstanceKey> = StdVec::new();
     while let Some((item, args)) = todo.pop() {
@@ -340,7 +340,7 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
                 let at = progs.iter().position(|p| p.item == c.owner).expect("the closure's owner among the bodies");
                 let oargs = ground.view().list(c.owner_args).expect("the owner's arguments").to_vec();
                 let sig = w.fx.sig_of(c.owner).expect("the owner's signature");
-                let mut subst = Subst { args: &oargs, ground: &mut ground, scratch: Alloc::global() };
+                let mut subst = Subst { args: &oargs, ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
                 crate::build_closure(&views[at], &checked[at], c.ordinal, which, &sig, &mut subst, &adts, Global)
                     .unwrap_or_else(|e| panic!("the closure's {which:?} method failed: {e}"))
             } else {
@@ -349,19 +349,19 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
                     PNode::FnDef(f, fa) => (w.fx.sig_of(f), ground.view().list(fa).expect("the fn item's arguments").to_vec()),
                     _ => (None, StdVec::new()),
                 };
-                let mut subst = Subst { args: &fargs, ground: &mut ground, scratch: Alloc::global() };
+                let mut subst = Subst { args: &fargs, ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
                 crate::build_fn_shim(all[0], all[1], which, sig.as_ref(), &mut subst, &adts, Global)
                     .unwrap_or_else(|e| panic!("the fn shim's {which:?} method failed: {e}"))
             }
         } else if item == w.dip {
             let gargs = ground.view().list(args).expect("the glue's argument").to_vec();
             let sig = w.fx.sig_of(w.dip).expect("`drop_in_place`'s signature");
-            let mut subst = Subst { args: &gargs, ground: &mut ground, scratch: Alloc::global() };
+            let mut subst = Subst { args: &gargs, ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
             crate::build_drop_glue(&gview, &gchecked, &sig, &mut subst, &adts, Global).unwrap_or_else(|e| panic!("the glue at {gargs:?} failed: {e}"))
         } else if let Some(at) = progs.iter().position(|p| p.item == item) {
             let gargs = ground.view().list(args).expect("the instance's arguments").to_vec();
             let sig = w.fx.sig_of(item).expect("the fn's signature");
-            let mut subst = Subst { args: &gargs, ground: &mut ground, scratch: Alloc::global() };
+            let mut subst = Subst { args: &gargs, ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
             crate::build(&views[at], &checked[at], &sig, &mut subst, &adts, Global).unwrap_or_else(|e| panic!("the build of {item:?} failed: {e}"))
         } else {
             continue;
@@ -1357,13 +1357,13 @@ fn weigh(b: &mut Bb, lits: &mut StdVec<(ExprId, u128)>, x: ExprId, y: ExprId, z:
 
 /// The offsets of `S`'s fields `a`, `b`, `c` as the builder's `Layouts` places them.
 fn s_offsets(w: &World) -> [usize; 3] {
-    let table = PortableTys::new_in(Alloc::global());
+    let table = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let adts = FxAdts { w, progs: &[], closures: &[], table: table.view() };
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let none = ground.intern_list(&[]).expect("the empty list");
     let st = ground.intern(PNode::Adt(w.s, none)).expect("`S`");
     let mut ls = Layouts::new_in(Global);
-    let id = ls.of(st, &mut LayoutCx { ground: &mut ground, facts: &adts, scratch: Alloc::global() }).unwrap_or_else(|e| panic!("`S` has no layout: {e}"));
+    let id = ls.of(st, &mut LayoutCx { ground: &mut ground, facts: &adts, scratch: blaze_own::testing::heap().alloc() }).unwrap_or_else(|e| panic!("`S` has no layout: {e}"));
     let at = |j: u32| usize::try_from(ls.field_offset(id, j).expect("`S`'s field has an offset")).expect("an offset");
     [at(0), at(1), at(2)]
 }
@@ -1450,11 +1450,11 @@ fn malformed_local_before_binding_and_uncaptured_non_zst_read_still_fail() {
     // (swapping the two statements of the block) so typeck succeeds with valid `local_ty`/`expr_ty`
     // while the builder sees the use before the binding.
     let build_main_err = |b: &Bb, view: &blaze_typeck::BodyView<'_>, root: ExprId, checked: &blaze_typeck::Checked<'_>, lits: &[(ExprId, u128)]| {
-        let table = PortableTys::new_in(Alloc::global());
+        let table = PortableTys::new_in(blaze_own::testing::heap().alloc());
         let progs = [Prog { item: w.main, b, root, lits }];
         let adts = FxAdts { w: &w, progs: &progs, closures: &[], table: table.view() };
-        let mut ground = PortableTys::new_in(Alloc::global());
-        let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+        let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
+        let mut subst = Subst { args: &[], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
         crate::build(view, checked, &sig, &mut subst, &adts, Global)
     };
 
@@ -1469,8 +1469,8 @@ fn malformed_local_before_binding_and_uncaptured_non_zst_read_still_fail() {
         let ret = lit(&mut b, &mut lits, 0);
         let root = b.block(&[s_decl, s_use], Some(ret));
         let view = b.view(w.main, root);
-        let mut ty = InferCtx::new_in(Alloc::global());
-        let checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        let mut ty = InferCtx::new_in(blaze_own::testing::heap().alloc());
+        let checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
             Ok(Outcome::Done(c)) => c,
             other => panic!("check failed: {:?}", other.err()),
         };
@@ -1513,14 +1513,14 @@ fn malformed_local_before_binding_and_uncaptured_non_zst_read_still_fail() {
         let call = b.call(fe, &[]);
         let root = b.block(&[sf], Some(call));
         let view = b.view(w.main, root);
-        let mut ty = InferCtx::new_in(Alloc::global());
-        let checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        let mut ty = InferCtx::new_in(blaze_own::testing::heap().alloc());
+        let checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
             Ok(Outcome::Done(c)) => c,
             other => panic!("check failed: {:?}", other.err()),
         };
         assert!(checked.diags.is_empty());
-        let mut table = PortableTys::new_in(Alloc::global());
-        let (kind, csig, env) = crate::layout::closure_facts(&view, &checked, 0, 0, &mut table, Alloc::global()).expect("closure facts");
+        let mut table = PortableTys::new_in(blaze_own::testing::heap().alloc());
+        let (kind, csig, env) = crate::layout::closure_facts(&view, &checked, 0, 0, &mut table, blaze_own::testing::heap().alloc()).expect("closure facts");
         let Expr::Block { stmts, .. } = b.exprs[cbody.ix()] else { panic!("block") };
         let mut bad_stmts = view.stmt_lists.to_vec();
         bad_stmts[stmts.range()].swap(0, 1);
@@ -1528,8 +1528,8 @@ fn malformed_local_before_binding_and_uncaptured_non_zst_read_still_fail() {
         let progs = [Prog { item: w.main, b: &b, root, lits: &lits }];
         let rows = [(w.main, 0, kind, csig, env)];
         let adts = FxAdts { w: &w, progs: &progs, closures: &rows, table: table.view() };
-        let mut ground = PortableTys::new_in(Alloc::global());
-        let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+        let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
+        let mut subst = Subst { args: &[], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
         let err = match crate::build_closure(&bad_view, &checked, 0, kind, &sig, &mut subst, &adts, Global) {
             Err(err) => err,
             Ok(_) => panic!("closure-local ZST use before binding must fail"),
@@ -1554,8 +1554,8 @@ fn malformed_local_before_binding_and_uncaptured_non_zst_read_still_fail() {
         let call = b.call(fe, &[]);
         let root = b.block(&[s_outer, sf], Some(call));
         let view = b.view(w.main, root);
-        let mut ty = InferCtx::new_in(Alloc::global());
-        let mut checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        let mut ty = InferCtx::new_in(blaze_own::testing::heap().alloc());
+        let mut checked = match blaze_typeck::check(&view, &w.fx, &mut ty, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
             Ok(Outcome::Done(c)) => c,
             other => panic!("check failed: {:?}", other.err()),
         };
@@ -1563,13 +1563,13 @@ fn malformed_local_before_binding_and_uncaptured_non_zst_read_still_fail() {
         // Strip captures so `outer` is uncaptured while read by value inside the closure.
         checked.captures.clear();
         checked.capture_places.clear();
-        let mut table = PortableTys::new_in(Alloc::global());
-        let (kind, csig, env) = crate::layout::closure_facts(&view, &checked, 0, 0, &mut table, Alloc::global()).expect("closure facts");
+        let mut table = PortableTys::new_in(blaze_own::testing::heap().alloc());
+        let (kind, csig, env) = crate::layout::closure_facts(&view, &checked, 0, 0, &mut table, blaze_own::testing::heap().alloc()).expect("closure facts");
         let progs = [Prog { item: w.main, b: &b, root, lits: &lits }];
         let rows = [(w.main, 0, kind, csig, env)];
         let adts = FxAdts { w: &w, progs: &progs, closures: &rows, table: table.view() };
-        let mut ground = PortableTys::new_in(Alloc::global());
-        let mut subst = Subst { args: &[], ground: &mut ground, scratch: Alloc::global() };
+        let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
+        let mut subst = Subst { args: &[], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
         let err = match crate::build_closure(&view, &checked, 0, kind, &sig, &mut subst, &adts, Global) {
             Err(err) => err,
             Ok(_) => panic!("uncaptured non-ZST read by value must fail"),

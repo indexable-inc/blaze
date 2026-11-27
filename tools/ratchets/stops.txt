@@ -16,7 +16,7 @@ blaze-base64	24
 blaze-blake3	413
 blaze-borrow	6
 blaze-bstd-convert	109
-blaze-build	540
+blaze-build	533
 blaze-build-script	249
 blaze-bytes	3
 blaze-c	325
@@ -31,7 +31,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1315
+blaze-cli	1308
 blaze-cli-spec	117
 blaze-code	94
 blaze-columns	193
@@ -50,14 +50,14 @@ blaze-diag-parse	33
 blaze-drive	157
 blaze-dust	1
 blaze-ed25519	58
-blaze-emit	449
+blaze-emit	445
 blaze-engine	203
 blaze-expand	471
 blaze-export	381
 blaze-fetch	170
 blaze-file-items	289
 blaze-flow	475
-blaze-flow-lower	230
+blaze-flow-lower	228
 blaze-fmt	352
 blaze-format	24
 blaze-format-core	103
@@ -79,7 +79,7 @@ blaze-int	41
 blaze-json	32
 blaze-keyed	588
 blaze-kit	167
-blaze-ladder	1306
+blaze-ladder	1299
 blaze-launch	83
 blaze-launch-rt	215
 blaze-launcher	9
@@ -87,7 +87,7 @@ blaze-lex	63
 blaze-lint	273
 blaze-lint-defs	109
 blaze-lir	1414
-blaze-lower	323
+blaze-lower	319
 blaze-macro-run	4
 blaze-manifest	150
 blaze-math	42
@@ -105,7 +105,7 @@ blaze-pg	10
 blaze-phf	40
 blaze-pins	1
 blaze-preview	30
-blaze-proc-macro	505
+blaze-proc-macro	499
 blaze-producers	25
 blaze-protocol	134
 blaze-queue	9
@@ -119,7 +119,7 @@ blaze-rng	3
 blaze-roots	24
 blaze-run	273
 blaze-rungs	2
-blaze-scope	1671
+blaze-scope	1669
 blaze-screen	30
 blaze-script	91
 blaze-semver	9
@@ -161,7 +161,7 @@ blaze-vim	49
 blaze-vt	263
 blaze-wasi	10
 blaze-watch	120
-blaze-world	343
+blaze-world	342
 const-ast	65
 edition	1
 gpu	64

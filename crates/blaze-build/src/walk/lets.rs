@@ -137,7 +137,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// the arm's deferred moves (`Task::ArmMoves { from }`), evaluates `body`, drops the guard's
     /// bindings and scrutinee temporaries (`Task::ScopeEnd(body)` + `Task::TempScopeEnd(g)`), and
     /// then drops the arm's own bindings.
-    pub(super) fn let_guard(&mut self, g: ExprId, body: ExprId, fail: Block, from: u32) -> Result<(), BuildError> {
+    pub(super) fn let_guard(&mut self, g: ExprId, body: ExprId, fail: Block, from: u32, alts: Option<super::moves::AltMoves>) -> Result<(), BuildError> {
         let links = self.links_of(g)?;
         let temps = self.if_let_open(g, g, links.len())?;
         if temps {
@@ -145,7 +145,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         self.work.push(Task::ScopeEnd { expr: body, adjusted: true });
         self.work.push(Task::Eval(body));
-        self.work.push(Task::ArmMoves { from });
+        self.work.push(Task::ArmMoves { from, alts });
         self.push_links(&links, fail)
     }
 

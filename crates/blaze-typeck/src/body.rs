@@ -471,6 +471,10 @@ pub enum WrittenRegion {
     /// (e.g. `|v: Value<_>|`): any lifetime introduced by inferring `_` is an existential owner
     /// region (`SigSlot::Owner`), never a higher-ranked late-bound region.
     Inferred,
+    /// A shared late-bound lifetime group within a closure parameter's inner binder (for example
+    /// `|pick: fn(&Pair) -> &Item|` or `|f: for<'a> fn(&'a T) -> &'a U|`, where input and output
+    /// share `SlotKind::Late { binder: 0, var }`).
+    Late(u32),
 }
 
 /// One explicit non-elided lifetime written in a closure parameter type annotation, located by

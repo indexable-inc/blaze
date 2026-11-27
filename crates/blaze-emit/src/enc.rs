@@ -621,7 +621,7 @@ pub(crate) const fn stp_pre(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
 
 /// `ldp xt, xt2, [rn, #off]!`, `off` a multiple of 8 in -512..=504.
 pub(crate) const fn ldp_pre(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
-    0xa9c0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+    0xa9c0_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
 /// `ldp xt, xt2, [rn], #off`, `off` a multiple of 8 in -512..=504.
@@ -641,7 +641,7 @@ pub(crate) const fn stp_pre_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
 
 /// `ldp dt, dt2, [rn, #off]!` (C7.2.155, SIMD&FP 64-bit pre-index), `off` a multiple of 8 in -512..=504.
 pub(crate) const fn ldp_pre_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
-    0x6dc0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+    0x6dc0_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
 /// `ldp dt, dt2, [rn], #off` (C7.2.155, SIMD&FP 64-bit post-index), `off` a multiple of 8 in -512..=504.
@@ -1798,6 +1798,54 @@ pub(crate) const fn ushr_2d_imm(rd: Reg, rn: Reg, shift: u32) -> u32 {
 /// `shl vd.2d, vn.2d, #shift` (`shift` in `0..=63`, C7.2.266).
 pub(crate) const fn shl_2d_imm(rd: Reg, rn: Reg, shift: u32) -> u32 {
     0x4f40_5400 | ((shift & 63) << 16) | (rn << 5) | rd
+}
+
+/// `neg vd.<T>, vn.<T>` (`size`: `0=16b, 1=8h, 2=4s, 3=2d`, C7.2.212).
+pub(crate) const fn neg_v(size: u32, rd: Reg, rn: Reg) -> u32 {
+    0x6e20_b800 | ((size & 3) << 22) | (rn << 5) | rd
+}
+
+/// `ushl vd.<T>, vn.<T>, vm.<T>` (`size`: `0=16b, 1=8h, 2=4s, 3=2d`, C7.2.374).
+pub(crate) const fn ushl_v(size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x6e20_4400 | ((size & 3) << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `sshl vd.<T>, vn.<T>, vm.<T>` (`size`: `0=16b, 1=8h, 2=4s, 3=2d`, C7.2.299).
+pub(crate) const fn sshl_v(size: u32, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x4e20_4400 | ((size & 3) << 22) | (rm << 16) | (rn << 5) | rd
+}
+
+/// `shl vd.<T>, vn.<T>, #shift` (`size`: `0=16b, 1=8h, 2=4s, 3=2d`, `shift < (8 << size)`, C7.2.266).
+pub(crate) const fn shl_imm_v(size: u32, rd: Reg, rn: Reg, shift: u32) -> u32 {
+    let imm = ((8u32 << (size & 3)) + shift) & 0x7f;
+    0x4f00_5400 | (imm << 16) | (rn << 5) | rd
+}
+
+/// `ushr vd.<T>, vn.<T>, #shift` (`size`: `0=16b, 1=8h, 2=4s, 3=2d`, `1 <= shift <= (8 << size)`, C7.2.376).
+pub(crate) const fn ushr_imm_v(size: u32, rd: Reg, rn: Reg, shift: u32) -> u32 {
+    let imm = ((16u32 << (size & 3)).saturating_sub(shift)) & 0x7f;
+    0x6f00_0400 | (imm << 16) | (rn << 5) | rd
+}
+
+/// `sshr vd.<T>, vn.<T>, #shift` (`size`: `0=16b, 1=8h, 2=4s, 3=2d`, `1 <= shift <= (8 << size)`, C7.2.301).
+pub(crate) const fn sshr_imm_v(size: u32, rd: Reg, rn: Reg, shift: u32) -> u32 {
+    let imm = ((16u32 << (size & 3)).saturating_sub(shift)) & 0x7f;
+    0x4f00_0400 | (imm << 16) | (rn << 5) | rd
+}
+
+/// `rev32 vd.<T>, vn.<T>` (`size`: `0=16b, 1=8h`, C7.2.238).
+pub(crate) const fn rev32_v(size: u32, rd: Reg, rn: Reg) -> u32 {
+    0x6e20_0800 | ((size & 3) << 22) | (rn << 5) | rd
+}
+
+/// `rev16 vd.16b, vn.16b` (C7.2.237).
+pub(crate) const fn rev16_v(rd: Reg, rn: Reg) -> u32 {
+    0x4e20_1800 | (rn << 5) | rd
+}
+
+/// `rev64 vd.<T>, vn.<T>` (`size`: `0=16b, 1=8h, 2=4s`, C7.2.239).
+pub(crate) const fn rev64_v(size: u32, rd: Reg, rn: Reg) -> u32 {
+    0x4e20_0800 | ((size & 3) << 22) | (rn << 5) | rd
 }
 
 #[cfg(test)]

@@ -1,5 +1,5 @@
 {
-  "comment": "D65/D69: the pinned C toolchain native build scripts run with (clang, libclang, llvm-ar), the LLVM project's own release of the LLVM version llvm.json pins (23.1.4) until our fork's archive carries a clang (.github/scripts/llvm.py). Read by blaze_build_script::native::pin. `sysroots`: the C library headers per target; macOS takes the machine's SDK by version and the headers read (D69), Linux a pinned glibc sysroot: none pinned yet (null).",
+  "comment": "D65/D69: the pinned C toolchain native build scripts run with (clang, libclang, llvm-ar), the LLVM project's own release of the LLVM version llvm.json pins (23.1.4) until our fork's archive carries a clang (.github/scripts/llvm.py). Read by blaze_build_script::native::pin. `sysroots`: the C library headers per target; macOS takes the machine's SDK by version and the headers read (D69), Linux ARM64 uses the host `/usr` sysroot (`linux-host`, keyed by `include/features.h`) until a standalone glibc sysroot archive is pinned, Linux x86_64 has none pinned yet (null).",
   "version": "23.1.4",
   "version_text_comment": "Brief P: what the pinned clang prints as its first `--version` line is `clang version <version> (<repository> <revision>)`; both read from the macOS archive's bin/clang-23 (its baked VCS repository and revision). Read by blaze_build_script::fact_pins.",
   "repository": "https://github.com/llvm/llvm-project",
@@ -24,7 +24,7 @@
   },
   "sysroots": {
     "aarch64-apple-darwin": "macos-sdk",
-    "aarch64-unknown-linux-gnu": null,
+    "aarch64-unknown-linux-gnu": "linux-host",
     "x86_64-unknown-linux-gnu": null
   },
   "shelf_programs_comment": "shelf-pins: each program placed on a host's shelf, pinned one by one beside the archive's digest: per program row, `member` is its path in the archive and `sha256` the member's own SHA-256; its place on the shelf is the member without the archive's top folder (one of blaze_build_script::toolchain::SHELF_MEMBERS). The step that places a program checks the extracted member against its row and refuses it by name when no row pins it or the digest differs (blaze_build_script::shelf_pins::place_member). A host tool's `shelf` names one of these rows. `names` is sorted and each row's last field.",

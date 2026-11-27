@@ -483,6 +483,65 @@ struct CallSel<'s, F: Facts> {
     tys: PTys<'s>,
 }
 
+/// Encodes a closure's laid [`crate::closure::SigSlot`]s into `out` as [`Region`]s for
+/// `Owner::closure_sig`, returning `(nsig, rstart, rlen)`.
+///
+/// All closure-level late-bound lifetimes (`SigSlot::Late`) are canonicalized into binder `0`
+/// (preserving equality between slots sharing `(binder, var)`), and inner higher-ranked binders
+/// (`SigSlot::InnerBound`) are mapped to `1..u32::MAX` so no slot ever collides with `blaze-borrow`'s
+/// `Region::Late { binder: u32::MAX, .. }` GAT-lifetime sentinel.
+fn push_closure_sig_regs<A: Allocator + Copy>(
+    sslots: &[crate::closure::SigSlot],
+    out: &mut Vec<Region, A>,
+    alloc: A,
+) -> (u32, u32, u32) {
+    let mut nsig = 0u32;
+    for &s in sslots.iter() {
+        if let crate::closure::SigSlot::Owner(j) = s {
+            nsig = nsig.max(j + 1);
+        }
+    }
+    let rstart = u32::try_from(out.len()).unwrap_or(u32::MAX);
+    let mut late_map: Vec<((u32, u32), u32), A> = Vec::new_in(alloc);
+    let mut inner_map: Vec<u32, A> = Vec::new_in(alloc);
+    let mut next_late = 0u32;
+    for &s in sslots.iter() {
+        out.push(match s {
+            crate::closure::SigSlot::Owner(j) => Region::Param(j),
+            crate::closure::SigSlot::Static => Region::Static,
+            crate::closure::SigSlot::Late(Some(key)) => {
+                let var = match late_map.iter().find(|&&(k, _)| k == key) {
+                    Some(&(_, v)) => v,
+                    None => {
+                        let v = next_late;
+                        next_late += 1;
+                        late_map.push((key, v));
+                        v
+                    }
+                };
+                Region::Late { binder: 0, var }
+            }
+            crate::closure::SigSlot::Late(None) => {
+                let var = next_late;
+                next_late += 1;
+                Region::Late { binder: 0, var }
+            }
+            crate::closure::SigSlot::InnerBound(b, var) => {
+                let binder = match inner_map.iter().position(|&x| x == b) {
+                    Some(pos) => u32::try_from(pos).unwrap_or(u32::MAX - 2).saturating_add(1),
+                    None => {
+                        inner_map.push(b);
+                        u32::try_from(inner_map.len()).unwrap_or(u32::MAX - 1)
+                    }
+                };
+                Region::Late { binder, var }
+            }
+        });
+    }
+    let rlen = u32::try_from(sslots.len()).unwrap_or(u32::MAX);
+    (nsig, rstart, rlen)
+}
+
 /// Whether two recorded row selections name the same source: two `Selected::Impl` rows for the
 /// same `imp` (e.g. filed before and after alias normalization with different `List` IDs) select
 /// the exact same impl and are not conflicting sources.
@@ -1233,31 +1292,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                 && self.sig_slots(ordinal as usize, e, &mut sc.sslots).is_ok()
                 && caller.count(sig_ty) == Ok(SlotCount::new(sc.sslots.len() as u32))
             {
-                let mut nsig = 0u32;
-                let mut max_late = 0u32;
-                for &s in sc.sslots.iter() {
-                    match s {
-                        crate::closure::SigSlot::Owner(j) => nsig = nsig.max(j + 1),
-                        crate::closure::SigSlot::Late(Some((0, v))) => max_late = max_late.max(v + 1),
-                        _ => {}
-                    }
-                }
+                let (nsig, rstart, rlen) = push_closure_sig_regs(&sc.sslots, &mut sc.closure_regs, self.alloc);
                 if let Some(ncap) = total_slots.get().checked_sub(nsig) {
-                    let rstart = u32::try_from(sc.closure_regs.len()).unwrap_or(u32::MAX);
-                    let mut next_late = max_late;
-                    for &s in sc.sslots.iter() {
-                        sc.closure_regs.push(match s {
-                            crate::closure::SigSlot::Owner(j) => Region::Param(j),
-                            crate::closure::SigSlot::Static => Region::Static,
-                            crate::closure::SigSlot::Late(Some((binder, var))) | crate::closure::SigSlot::InnerBound(binder, var) => Region::Late { binder, var },
-                            crate::closure::SigSlot::Late(None) => {
-                                let var = next_late;
-                                next_late += 1;
-                                Region::Late { binder: 0, var }
-                            }
-                        });
-                    }
-                    let rlen = sc.sslots.len() as u32;
                     sc.closure_rows.push((ordinal, sig_ty, ncap, nsig, rstart, rlen));
                 }
             }
@@ -1649,33 +1685,8 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                         && self.sig_slots(ordinal as usize, e, &mut sc.sslots).is_ok()
                         && caller_base.count(sig_ty) == Ok(SlotCount::new(sc.sslots.len() as u32))
                     {
-                        let mut nsig = 0u32;
-                        let mut max_late = 0u32;
-                        for &sl in sc.sslots.iter() {
-                            match sl {
-                                crate::closure::SigSlot::Owner(j) => nsig = nsig.max(j + 1),
-                                crate::closure::SigSlot::Late(Some((0, v))) => max_late = max_late.max(v + 1),
-                                _ => {}
-                            }
-                        }
+                        let (nsig, rstart, rlen) = push_closure_sig_regs(&sc.sslots, &mut sc.closure_regs, self.alloc);
                         if let Some(ncap) = total_slots.get().checked_sub(nsig) {
-                            let rstart = u32::try_from(sc.closure_regs.len()).unwrap_or(u32::MAX);
-                            let mut next_late = max_late;
-                            for &sl in sc.sslots.iter() {
-                                sc.closure_regs.push(match sl {
-                                    crate::closure::SigSlot::Owner(j) => Region::Param(j),
-                                    crate::closure::SigSlot::Static => Region::Static,
-                                    crate::closure::SigSlot::Late(Some((binder, var))) | crate::closure::SigSlot::InnerBound(binder, var) => {
-                                        Region::Late { binder, var }
-                                    }
-                                    crate::closure::SigSlot::Late(None) => {
-                                        let var = next_late;
-                                        next_late += 1;
-                                        Region::Late { binder: 0, var }
-                                    }
-                                });
-                            }
-                            let rlen = sc.sslots.len() as u32;
                             sc.closure_rows.push((ordinal, sig_ty, ncap, nsig, rstart, rlen));
                             laid = true;
                         }
@@ -2578,6 +2589,37 @@ mod keyed {
         assert!(matches!(p, Selection::Not(NotSelected::GenericSelf(SelfHead::Param))), "keyed at `P0`: {p:?}");
         let twin = ask(&r, &Unkeyed);
         assert!(matches!(twin, Selection::Not(NotSelected::TwoSources)), "unkeyed, two answers: {twin:?}");
+    }
+
+    /// `push_closure_sig_regs` canonicalizes `SigSlot::Late(Some((u32::MAX, 0)))` (produced by
+    /// `lay_written_param` for `param == 0` elided lifetimes like `|input: ParseStream<'_>|`)
+    /// into binder `0` so it never collides with `blaze-borrow`'s `Region::Late { binder: u32::MAX, .. }`
+    /// GAT-lifetime sentinel (which previously caused `Bad::LifetimePast`).
+    #[test]
+    fn push_closure_sig_regs_avoids_gat_sentinel_binder() {
+        use super::{Region, Vec, push_closure_sig_regs};
+        let alloc = crate::region_fixture::alloc();
+        let sslots = [
+            crate::closure::SigSlot::Late(Some((u32::MAX, 0))),
+            crate::closure::SigSlot::Late(Some((u32::MAX, 0))),
+            crate::closure::SigSlot::Owner(0),
+            crate::closure::SigSlot::Static,
+            crate::closure::SigSlot::InnerBound(u32::MAX - 1, 2),
+        ];
+        let mut regs: Vec<Region, _> = Vec::new_in(alloc);
+        let (nsig, rstart, rlen) = push_closure_sig_regs(&sslots, &mut regs, alloc);
+        assert_eq!((nsig, rstart, rlen), (1, 0, 5));
+        assert_eq!(
+            regs.as_slice(),
+            &[
+                Region::Late { binder: 0, var: 0 },
+                Region::Late { binder: 0, var: 0 },
+                Region::Param(0),
+                Region::Static,
+                Region::Late { binder: 1, var: 2 },
+            ]
+        );
+        assert!(regs.iter().all(|r| !matches!(r, Region::Late { binder: u32::MAX, .. })));
     }
 
     /// AGREEING ROWS ARE ONE ANSWER: two rows with one selection are not two sources, and a

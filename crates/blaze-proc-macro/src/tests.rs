@@ -60,7 +60,9 @@ fn folder(name: &str) -> PathBuf {
 
 /// Code: the bytes of a function body's instructions.
 mod op {
-    pub fn uleb(mut value: u64, out: &mut Vec<u8>) {
+    use blaze_own::AVec;
+
+    pub fn uleb(mut value: u64, out: &mut AVec<'static, u8>) {
         loop {
             let byte = (value & 0x7f) as u8;
             value >>= 7;
@@ -72,7 +74,7 @@ mod op {
         }
     }
 
-    pub fn sleb(mut value: i64, out: &mut Vec<u8>) {
+    pub fn sleb(mut value: i64, out: &mut AVec<'static, u8>) {
         loop {
             let byte = (value & 0x7f) as u8;
             value >>= 7;
@@ -84,20 +86,23 @@ mod op {
         }
     }
 
-    pub fn i32(value: i64) -> Vec<u8> {
-        let mut out = vec![0x41];
+    pub fn i32(value: i64) -> AVec<'static, u8> {
+        let mut out = AVec::new_in(blaze_own::testing::heap().alloc());
+        out.push(0x41);
         sleb(value, &mut out);
         out
     }
 
-    pub fn i64(value: i64) -> Vec<u8> {
-        let mut out = vec![0x42];
+    pub fn i64(value: i64) -> AVec<'static, u8> {
+        let mut out = AVec::new_in(blaze_own::testing::heap().alloc());
+        out.push(0x42);
         sleb(value, &mut out);
         out
     }
 
-    pub fn call(index: u32) -> Vec<u8> {
-        let mut out = vec![0x10];
+    pub fn call(index: u32) -> AVec<'static, u8> {
+        let mut out = AVec::new_in(blaze_own::testing::heap().alloc());
+        out.push(0x10);
         uleb(u64::from(index), &mut out);
         out
     }
@@ -124,13 +129,13 @@ const PATH_OPEN: u32 = 2;
 /// The first of [`wasm_importing`]'s extra imports.
 const FIRST_EXTRA: u32 = 3;
 
-fn section(id: u8, body: &[u8], out: &mut Vec<u8>) {
+fn section(id: u8, body: &[u8], out: &mut blaze_own::AVec<'static, u8>) {
     out.push(id);
     op::uleb(body.len() as u64, out);
     out.extend_from_slice(body);
 }
 
-fn name(text: &str, out: &mut Vec<u8>) {
+fn name(text: &str, out: &mut blaze_own::AVec<'static, u8>) {
     op::uleb(text.len() as u64, out);
     out.extend_from_slice(text.as_bytes());
 }
@@ -139,24 +144,28 @@ fn name(text: &str, out: &mut Vec<u8>) {
 /// global `ran`, index 1, starts at 0) and then gives the empty stream: `Ok(None)`, bytes 0 and
 /// 1 at address 16. The names to open sit at 32 (`FOO`), 48 (`BAR`), 64 (`package/a.txt`),
 /// 96 (`package/b.txt`) and 128 (`etc/passwd`).
-fn wasm(body: &[u8]) -> Vec<u8> {
+fn wasm(body: &[u8]) -> blaze_own::AVec<'static, u8> {
     wasm_importing(body, &[])
 }
 
 /// [`wasm`] with more `wasi_snapshot_preview1` imports after `path_open`, each `(i32 x3) ->
 /// i32` (`path_unlink_file`'s type): the first is function 3 ([`FIRST_EXTRA`]), and the
 /// module's own functions come after them.
-fn wasm_importing(body: &[u8], extra: &[&str]) -> Vec<u8> {
-    let typed: Vec<(&str, &str, u8)> = extra.iter().map(|field| ("wasi_snapshot_preview1", *field, 5)).collect();
+fn wasm_importing(body: &[u8], extra: &[&str]) -> blaze_own::AVec<'static, u8> {
+    let mut typed = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+    for field in extra {
+        typed.push(("wasi_snapshot_preview1", *field, 5));
+    }
     wasm_importing_typed(body, &typed)
 }
 
 /// [`wasm`] with arbitrary extra imports `(module, field, type_index)` (types: 0 `(i32, i32) -> ()`,
 /// 4 `(i32) -> i32`, 5 `(i32, i32, i32) -> i32`, 6 `(i32, i32) -> i32`, 7 `(i32) -> ()`).
-fn wasm_importing_typed(body: &[u8], extra: &[(&str, &str, u8)]) -> Vec<u8> {
+fn wasm_importing_typed(body: &[u8], extra: &[(&str, &str, u8)]) -> blaze_own::AVec<'static, u8> {
     const I32: u8 = 0x7f;
     const I64: u8 = 0x7e;
-    let mut out = b"\0asm\x01\0\0\0".to_vec();
+    let mut out = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+    out.extend_from_slice(b"\0asm\x01\0\0\0");
     // Types: 0 output (i32 i32), 1 env_var and expand (i32 x4) -> i32, 2 path_open,
     // 3 () -> (), 4 (i32) -> i32, 5 (i32 x3) -> i32, 6 (i32, i32) -> i32, 7 (i32) -> ().
     let types: [(&[u8], &[u8]); 8] = [
@@ -169,7 +178,8 @@ fn wasm_importing_typed(body: &[u8], extra: &[(&str, &str, u8)]) -> Vec<u8> {
         (&[I32, I32], &[I32]),
         (&[I32], &[]),
     ];
-    let mut s = vec![types.len() as u8];
+    let mut s = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+    s.push(types.len() as u8);
     for (params, results) in types {
         s.push(0x60);
         s.push(params.len() as u8);
@@ -179,7 +189,8 @@ fn wasm_importing_typed(body: &[u8], extra: &[(&str, &str, u8)]) -> Vec<u8> {
     }
     section(1, &s, &mut out);
     let imports = [("blaze_proc_macro", "output", 0), ("blaze_proc_macro", "env_var", 1), ("wasi_snapshot_preview1", "path_open", 2)];
-    let mut s = vec![(imports.len() + extra.len()) as u8];
+    s.clear();
+    s.push((imports.len() + extra.len()) as u8);
     for (module, field, ty) in imports.into_iter().chain(extra.iter().copied()) {
         name(module, &mut s);
         name(field, &mut s);
@@ -193,30 +204,37 @@ fn wasm_importing_typed(body: &[u8], extra: &[(&str, &str, u8)]) -> Vec<u8> {
     section(5, &[1, 0x00, 1], &mut out);
     // Globals: 0 `decls` = 0; 1 `ran`, mutable, = 0.
     section(6, &[2, I32, 0, 0x41, 0, op::END, I32, 1, 0x41, 0, op::END], &mut out);
-    let mut s = vec![5];
+    s.clear();
+    s.push(5);
     for (field, kind, index) in [("memory", 2u8, 0u8), ("decls", 3, 0), ("_initialize", 0, own), ("blaze_proc_macro_alloc", 0, own + 1), ("blaze_proc_macro_expand", 0, own + 2)] {
         name(field, &mut s);
         s.extend_from_slice(&[kind, index]);
     }
     section(7, &s, &mut out);
-    let mut expand = body.to_vec();
+    let mut expand = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+    expand.extend_from_slice(body);
     expand.extend(op::i32(16));
     expand.extend(op::i32(2));
     expand.extend(op::call(OUTPUT));
     expand.extend(op::i32(0));
-    let mut alloc = op::i32(1024);
-    alloc.push(op::END);
+    let mut alloc_fn = op::i32(1024);
+    alloc_fn.push(op::END);
     expand.push(op::END);
-    let mut s = vec![3];
-    for code in [vec![op::END], alloc, expand] {
-        let mut f = vec![0];
-        f.extend(code);
+    let mut init_fn = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+    init_fn.push(op::END);
+    s.clear();
+    s.push(3);
+    for code in [init_fn.as_slice(), alloc_fn.as_slice(), expand.as_slice()] {
+        let mut f = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+        f.push(0);
+        f.extend_from_slice(code);
         op::uleb(f.len() as u64, &mut s);
-        s.extend(f);
+        s.extend_from_slice(&f);
     }
     section(10, &s, &mut out);
     let data: [(i64, &[u8]); 6] = [(16, b"\x00\x01"), (32, b"FOO"), (48, b"BAR"), (64, b"package/a.txt"), (96, b"package/b.txt"), (128, b"etc/passwd")];
-    let mut s = vec![data.len() as u8];
+    s.clear();
+    s.push(data.len() as u8);
     for (at, bytes) in data {
         s.push(0);
         s.extend(op::i32(at));
@@ -229,8 +247,8 @@ fn wasm_importing_typed(body: &[u8], extra: &[(&str, &str, u8)]) -> Vec<u8> {
 }
 
 /// Opens the `len`-byte name at `at` for reading, from the root (fd 3).
-fn open(at: i64, len: i64) -> Vec<u8> {
-    let mut out = Vec::new();
+fn open(at: i64, len: i64) -> blaze_own::AVec<'static, u8> {
+    let mut out = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
     for arg in [3, 0, at, len, 0] {
         out.extend(op::i32(arg));
     }
@@ -244,8 +262,8 @@ fn open(at: i64, len: i64) -> Vec<u8> {
 }
 
 /// Reads the variable of the `len`-byte name at `at`.
-fn env(at: i64, len: i64) -> Vec<u8> {
-    let mut out = Vec::new();
+fn env(at: i64, len: i64) -> blaze_own::AVec<'static, u8> {
+    let mut out = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
     for arg in [at, len, 256, 64] {
         out.extend(op::i32(arg));
     }
@@ -255,17 +273,18 @@ fn env(at: i64, len: i64) -> Vec<u8> {
 }
 
 /// `then` when the call's index is `index`.
-fn when(index: i64, then: Vec<u8>) -> Vec<u8> {
-    let mut out = op::INDEX.to_vec();
+fn when(index: i64, then: impl AsRef<[u8]>) -> blaze_own::AVec<'static, u8> {
+    let mut out = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
+    out.extend_from_slice(&op::INDEX);
     out.extend(op::i32(index));
     out.push(op::EQ);
     out.extend(op::IF);
-    out.extend(then);
+    out.extend_from_slice(then.as_ref());
     out.push(op::END);
     out
 }
 
-fn module(wasm: Vec<u8>, macros: u32) -> ModuleRecord {
+fn module(wasm: impl AsRef<[u8]>, macros: u32) -> ModuleRecord {
     module_in(&folder("module"), wasm, macros)
 }
 
@@ -274,15 +293,16 @@ mod lazy_wasm;
 
 /// A module record in `dir`: its wasm kept there as `module.wasm`, where a compile reads it
 /// (module.rs `ModuleRecord::wasm`: the record holds none).
-fn module_in(dir: &Path, wasm: Vec<u8>, macros: u32) -> ModuleRecord {
-    let digest = sha256_hex(&wasm);
-    std::fs::write(dir.join("module.wasm"), &wasm).expect("the module's wasm in its folder");
+fn module_in(dir: &Path, wasm: impl AsRef<[u8]>, macros: u32) -> ModuleRecord {
+    let wasm = wasm.as_ref();
+    let digest = sha256_hex(wasm);
+    std::fs::write(dir.join("module.wasm"), wasm).expect("the module's wasm in its folder");
     ModuleRecord {
         key: digest.clone(),
         name: "test-macros".to_owned(),
         version: "0.0.0".to_owned(),
         wasm_sha256: digest,
-        macros: (0..macros).map(|index| Exported { index, kind: ProcKind::FnLike, name: format!("m{index}"), helpers: Vec::new() }).collect(),
+        macros: (0..macros).map(|index| Exported { index, kind: ProcKind::FnLike, name: format!("m{index}"), helpers: [].into() }).collect(),
         decls: "decls".to_owned(),
         dir: dir.to_owned(),
         compiled: dir.join("compiled"),
@@ -459,7 +479,7 @@ fn invalidation(setup: &Setup, tape: &Tape, plant: Plant) -> Result<(), Broke> {
     Ok(())
 }
 
-fn reader_body() -> Vec<u8> {
+fn reader_body() -> blaze_own::AVec<'static, u8> {
     let mut body = when(0, env(32, 3));
     body.extend(when(1, env(48, 3)));
     body.extend(when(2, open(64, 13)));
@@ -772,17 +792,18 @@ fn a_module_importing_build_script_process_loads_and_refuses_spawn() {
     let run = |name: &str, body: &[u8]| -> Result<(), String> {
         let module = module_in(&folder(name), wasm_importing_typed(body, &extra), 1);
         let loaded = runtime.load(&module).map_err(|e| format!("load: {e}"))?;
-        let input = lex("struct A;", EDITION, Alloc::global()).expect("the input lexes");
+        let alloc = blaze_own::testing::heap().alloc();
+        let input = lex("struct A;", EDITION, alloc).expect("the input lexes");
         let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
         runtime
-            .expand(&loaded, &module.macros[0], &call, EDITION, package(&folder(&format!("{name}-pkg")), &[]), Limits::STANDARD, Alloc::global())
+            .expand(&loaded, &module.macros[0], &call, EDITION, package(&folder(&format!("{name}-pkg")), &[]), Limits::STANDARD, alloc)
             .map(drop)
             .map_err(|e| format!("call: {e}"))
     };
     // Linked, never called.
     assert_eq!(run("bs-linked", &[]), Ok(()));
     // `found(32, 3)` must return 0 (trap if non-zero).
-    let mut call_found = Vec::new();
+    let mut call_found = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
     call_found.extend(op::i32(32));
     call_found.extend(op::i32(3));
     call_found.extend(op::call(FIRST_EXTRA));
@@ -791,7 +812,7 @@ fn a_module_importing_build_script_process_loads_and_refuses_spawn() {
     call_found.push(op::END);
     assert_eq!(run("bs-found", &call_found), Ok(()));
     // `spawn(32, 3)` must be refused.
-    let mut call_spawn = Vec::new();
+    let mut call_spawn = blaze_own::AVec::new_in(blaze_own::testing::heap().alloc());
     call_spawn.extend(op::i32(32));
     call_spawn.extend(op::i32(3));
     call_spawn.extend(op::call(FIRST_EXTRA + 1));

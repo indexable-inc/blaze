@@ -24,68 +24,69 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, StaticItem, Subst
 
 /// A body under construction, with the literal values its form does not hold.
 struct BodyBuf {
-    exprs: Vec<Expr, Global>,
-    expr_ranges: Vec<Range, Global>,
-    pats: Vec<Pat, Global>,
-    pat_ranges: Vec<Range, Global>,
-    pat_lists: Vec<PatId, Global>,
-    stmts: Vec<Stmt, Global>,
-    expr_lists: Vec<ExprId, Global>,
-    stmt_lists: Vec<StmtId, Global>,
-    arms: Vec<Arm, Global>,
-    field_inits: Vec<FieldInit, Global>,
-    paths: Vec<BodyPath, Global>,
-    segments: Vec<Segment, Global>,
-    params: Vec<PatId, Global>,
+    exprs: blaze_own::AVec<'static, Expr>,
+    expr_ranges: blaze_own::AVec<'static, Range>,
+    pats: blaze_own::AVec<'static, Pat>,
+    pat_ranges: blaze_own::AVec<'static, Range>,
+    pat_lists: blaze_own::AVec<'static, PatId>,
+    stmts: blaze_own::AVec<'static, Stmt>,
+    expr_lists: blaze_own::AVec<'static, ExprId>,
+    stmt_lists: blaze_own::AVec<'static, StmtId>,
+    arms: blaze_own::AVec<'static, Arm>,
+    field_inits: blaze_own::AVec<'static, FieldInit>,
+    paths: blaze_own::AVec<'static, BodyPath>,
+    segments: blaze_own::AVec<'static, Segment>,
+    params: blaze_own::AVec<'static, PatId>,
     types: PortableTys<'static>,
-    lits: Vec<(ExprId, u128), Global>,
-    pat_lits: Vec<(PatId, u128), Global>,
-    strs: Vec<(ExprId, &'static str), Global>,
+    lits: blaze_own::AVec<'static, (ExprId, u128)>,
+    pat_lits: blaze_own::AVec<'static, (PatId, u128)>,
+    strs: blaze_own::AVec<'static, (ExprId, &'static str)>,
     /// String literal patterns' texts (`Adts::str_pat`).
-    pat_strs: Vec<(PatId, &'static str), Global>,
+    pat_strs: blaze_own::AVec<'static, (PatId, &'static str)>,
     /// Struct patterns' `name: pat` fields (`BodyView::field_pats`).
-    field_pats: Vec<FieldPat, Global>,
+    field_pats: blaze_own::AVec<'static, FieldPat>,
     /// `asm!`s' template pieces, operands and text (`BodyView::asm_*`; tests/asm.rs).
-    asm_pieces: Vec<blaze_typeck::AsmPiece, Global>,
-    asm_operands: Vec<blaze_typeck::AsmOperand, Global>,
+    asm_pieces: blaze_own::AVec<'static, blaze_typeck::AsmPiece>,
+    asm_operands: blaze_own::AVec<'static, blaze_typeck::AsmOperand>,
     asm_text: &'static str,
     /// Call arguments' literal values for `#[rustc_legacy_const_generics]` (`BodyView::call_arg_ints`).
-    call_arg_ints: Vec<(ExprId, u128), Global>,
+    call_arg_ints: blaze_own::AVec<'static, (ExprId, u128)>,
     /// Every expression made, as `BodyView::unsafe_blocks`: a test body is checked as written
     /// inside `unsafe`, so its intrinsic calls and `asm!`s need no block (the unsafety check's
     /// own tests are blaze-ladder's tests/front2_unsafety.rs).
-    unsafe_blocks: Vec<ExprId, Global>,
+    unsafe_blocks: blaze_own::AVec<'static, ExprId>,
     /// The body's Rust edition (`BodyView::edition`, default 2024).
     edition: Edition,
 }
 
 impl BodyBuf {
     fn new() -> BodyBuf {
+        let alloc = blaze_own::testing::heap().alloc();
         BodyBuf {
-            exprs: Vec::new_in(Global),
-            expr_ranges: Vec::new_in(Global),
-            pats: Vec::new_in(Global),
-            pat_ranges: Vec::new_in(Global),
-            pat_lists: Vec::new_in(Global),
-            stmts: Vec::new_in(Global),
-            expr_lists: Vec::new_in(Global),
-            stmt_lists: Vec::new_in(Global),
-            arms: Vec::new_in(Global),
-            field_inits: Vec::new_in(Global),
-            paths: Vec::new_in(Global),
-            segments: Vec::new_in(Global),
-            params: Vec::new_in(Global),
-            types: PortableTys::new_in(Alloc::global()),
-            lits: Vec::new_in(Global),
-            pat_lits: Vec::new_in(Global),
-            strs: Vec::new_in(Global),
-            pat_strs: Vec::new_in(Global),
-            field_pats: Vec::new_in(Global),
-            asm_pieces: Vec::new_in(Global),
-            asm_operands: Vec::new_in(Global),
+            exprs: blaze_own::AVec::new_in(alloc),
+            expr_ranges: blaze_own::AVec::new_in(alloc),
+            pats: blaze_own::AVec::new_in(alloc),
+            pat_ranges: blaze_own::AVec::new_in(alloc),
+            pat_lists: blaze_own::AVec::new_in(alloc),
+            stmts: blaze_own::AVec::new_in(alloc),
+            expr_lists: blaze_own::AVec::new_in(alloc),
+            stmt_lists: blaze_own::AVec::new_in(alloc),
+            arms: blaze_own::AVec::new_in(alloc),
+            field_inits: blaze_own::AVec::new_in(alloc),
+            paths: blaze_own::AVec::new_in(alloc),
+            segments: blaze_own::AVec::new_in(alloc),
+            params: blaze_own::AVec::new_in(alloc),
+            types: PortableTys::new_in(alloc),
+            lits: blaze_own::AVec::new_in(alloc),
+            pat_lits: blaze_own::AVec::new_in(alloc),
+            strs: blaze_own::AVec::new_in(alloc),
+            pat_strs: blaze_own::AVec::new_in(alloc),
+            field_pats: blaze_own::AVec::new_in(alloc),
+            asm_pieces: blaze_own::AVec::new_in(alloc),
+            asm_operands: blaze_own::AVec::new_in(alloc),
             asm_text: "",
-            call_arg_ints: Vec::new_in(Global),
-            unsafe_blocks: Vec::new_in(Global),
+            call_arg_ints: blaze_own::AVec::new_in(alloc),
+            unsafe_blocks: blaze_own::AVec::new_in(alloc),
             edition: Edition::E2024,
         }
     }
@@ -285,13 +286,13 @@ struct TestWorld {
     overflow: crate::OverflowChecks,
     /// What [`Adts::ub_checks`] answers.
     ub: crate::UbChecks,
-    fns: Vec<Fun, Global>,
-    structs: Vec<Struct, Global>,
+    fns: blaze_own::AVec<'static, Fun>,
+    structs: blaze_own::AVec<'static, Struct>,
     /// The fns declared `extern "C"`; every other is of the Rust ABI.
-    c_abi: Vec<ItemKey, Global>,
+    c_abi: blaze_own::AVec<'static, ItemKey>,
     /// The fns declared `extern "rust-call"` (to the builder only: the checker sees them as
     /// Rust fns, which types their bodies and calls the same).
-    rust_call: Vec<ItemKey, Global>,
+    rust_call: blaze_own::AVec<'static, ItemKey>,
     /// The `panic_bounds_check` lang item fn, if declared.
     bounds: Option<ItemKey>,
     /// The `drop_in_place` lang item fn, if declared.
@@ -299,13 +300,13 @@ struct TestWorld {
     /// The `panic_cannot_unwind` lang item fn, if declared (tests/nounwind.rs).
     cannot_unwind: Option<ItemKey>,
     /// Per struct with a `Drop` impl: the struct, and the `Drop::drop` fn its drop calls.
-    drops: Vec<(ItemKey, ItemKey), Global>,
+    drops: blaze_own::AVec<'static, (ItemKey, ItemKey)>,
     /// The fns declared `#[rustc_intrinsic]`, and which intrinsic each is.
-    intrinsics: Vec<(ItemKey, Intrinsic), Global>,
+    intrinsics: blaze_own::AVec<'static, (ItemKey, Intrinsic)>,
     /// The ADTs with `repr` attributes; every other is `repr(Rust)`.
-    reprs: Vec<(ItemKey, ReprAttrs), Global>,
+    reprs: blaze_own::AVec<'static, (ItemKey, ReprAttrs)>,
     /// The `static` items a path may name.
-    statics: Vec<(ItemKey, StaticItem), Global>,
+    statics: blaze_own::AVec<'static, (ItemKey, StaticItem)>,
     /// The `const` items and their evaluated values (`None`: the evaluator gave none).
     consts: Vec<(ItemKey, Option<DataRecord<Global>>), Global>,
     /// The promoted borrows and their evaluated values (`None`: the evaluator gave none).
@@ -313,17 +314,17 @@ struct TestWorld {
     /// Every item's const generic parameters (`World::const_params`), by index, their types of
     /// this world's table, and the one-segment names that resolve to them as `Def::TyParam`
     /// (tests/const_paths.rs).
-    const_params: Vec<(u32, PTy), Global>,
-    param_names: Vec<(Name, u32), Global>,
+    const_params: blaze_own::AVec<'static, (u32, PTy)>,
+    param_names: blaze_own::AVec<'static, (Name, u32)>,
     /// What `Adts::const_fn_instance` answers: the instance a constant's fn relocation names.
-    const_fns: Vec<(crate::InstanceKey, Instance), Global>,
+    const_fns: blaze_own::AVec<'static, (crate::InstanceKey, Instance)>,
     /// `#[lang = "deref"] trait Deref { type Target; }` (`DEREF`) and its one impl (`DEREF_IMPL`):
     /// `impl Deref for <self> { type Target = <target>; }`, both types of this world's table.
     deref: Option<(PTy, PTy)>,
     deref_generics: u32,
     /// The trait's associated type, and the impl's `Target`.
-    deref_defs: Vec<blaze_typeck::AssocTyDef, Global>,
-    deref_assoc: Vec<(Name, PTy), Global>,
+    deref_defs: blaze_own::AVec<'static, blaze_typeck::AssocTyDef>,
+    deref_assoc: blaze_own::AVec<'static, (Name, PTy)>,
     /// What `Adts::deref_fn(Not)` answers: the fn a call at `[Self]` runs.
     deref_fn: Option<ItemKey>,
     /// The ADT `Adts::lang_adt(ManuallyDrop)` answers.
@@ -332,7 +333,7 @@ struct TestWorld {
     owned_box: Option<ItemKey>,
     /// The fixture solver of `LayoutFacts::normalize`: `<self_ as Deref>::Target = target`,
     /// both types of this world's table (tests/projections.rs).
-    projs: Vec<(PTy, PTy), Global>,
+    projs: blaze_own::AVec<'static, (PTy, PTy)>,
     /// A fn's where-clauses (`T: Deref`), their types of this world's table.
     where_clauses: Vec<(ItemKey, Vec<PClause, Global>), Global>,
     /// `#[lang = "index"] trait Index<Idx> { type Output; }` (`INDEX`) and its one impl
@@ -340,8 +341,8 @@ struct TestWorld {
     /// the trait's arguments after `Self` (`[idx]`), of this world's table (tests/index.rs).
     index: Option<(PTy, blaze_typeck::ArgsAfterSelf)>,
     /// The trait's associated type, and the impl's `Output`.
-    index_defs: Vec<blaze_typeck::AssocTyDef, Global>,
-    index_assoc: Vec<(Name, PTy), Global>,
+    index_defs: blaze_own::AVec<'static, blaze_typeck::AssocTyDef>,
+    index_assoc: blaze_own::AVec<'static, (Name, PTy)>,
     /// What `Adts::index_fn(Not)` answers: the fn a call at `[Self, Idx]` runs.
     index_fn: Option<ItemKey>,
     /// `#[lang = "index_mut"] trait IndexMut<Idx>: Index<Idx> {}` (`INDEX_MUT`) and its one
@@ -350,11 +351,11 @@ struct TestWorld {
     index_mut_fn: Option<ItemKey>,
     /// Inherent methods `impl <ADT> { fn <name>(&mut self, ..) }` (`TestWorld::method`): the
     /// ADT's shape, the name, the item as `inherent` answers it, and the impl's self type.
-    methods: Vec<(Shape, Name, AssocItem, PTy), Global>,
+    methods: blaze_own::AVec<'static, (Shape, Name, AssocItem, PTy)>,
     /// The bug a control plants in the walk (`Adts::planted`).
     planted: crate::Planted,
     /// The fns declared `#[track_caller]` (`Adts::track_caller`; tests/track_caller.rs).
-    tracked: Vec<ItemKey, Global>,
+    tracked: blaze_own::AVec<'static, ItemKey>,
     /// What `Adts::location_adt` answers; when set, `Adts::caller_site` answers
     /// [`TRACK_SITE`] for every expression.
     location: Option<ItemKey>,
@@ -364,7 +365,7 @@ struct TestWorld {
     /// What `Adts::def_site` answers for every item (tests/track_caller.rs).
     def_site: Option<crate::CallerSite<'static>>,
     /// The fns declared `#[unsafe(naked)]` (`Adts::fn_attrs`; tests/asm.rs).
-    naked: Vec<ItemKey, Global>,
+    naked: blaze_own::AVec<'static, ItemKey>,
 }
 
 /// Where every expression is, to `Adts::caller_site` (tests/track_caller.rs).
@@ -383,51 +384,52 @@ const PANIC_CONST: ItemKey = ItemKey(96);
 
 impl TestWorld {
     fn new() -> TestWorld {
+        let alloc = blaze_own::testing::heap().alloc();
         TestWorld {
-            types: PortableTys::new_in(Alloc::global()),
+            types: PortableTys::new_in(alloc),
             panic: crate::Panic::Abort,
             // The fixture's bodies were written for wrapping arithmetic (the release setting).
             overflow: crate::OverflowChecks::Off,
             // As the record path's baseline settings (blaze-ladder code_records.rs), no debug
             // assertions.
             ub: crate::UbChecks::Off,
-            fns: Vec::new_in(Global),
-            structs: Vec::new_in(Global),
-            c_abi: Vec::new_in(Global),
-            rust_call: Vec::new_in(Global),
+            fns: blaze_own::AVec::new_in(alloc),
+            structs: blaze_own::AVec::new_in(alloc),
+            c_abi: blaze_own::AVec::new_in(alloc),
+            rust_call: blaze_own::AVec::new_in(alloc),
             bounds: None,
             drop_in_place: None,
             cannot_unwind: None,
-            drops: Vec::new_in(Global),
-            intrinsics: Vec::new_in(Global),
-            reprs: Vec::new_in(Global),
-            statics: Vec::new_in(Global),
+            drops: blaze_own::AVec::new_in(alloc),
+            intrinsics: blaze_own::AVec::new_in(alloc),
+            reprs: blaze_own::AVec::new_in(alloc),
+            statics: blaze_own::AVec::new_in(alloc),
             consts: Vec::new_in(Global),
             promoted: Vec::new_in(Global),
-            const_params: Vec::new_in(Global),
-            param_names: Vec::new_in(Global),
-            const_fns: Vec::new_in(Global),
+            const_params: blaze_own::AVec::new_in(alloc),
+            param_names: blaze_own::AVec::new_in(alloc),
+            const_fns: blaze_own::AVec::new_in(alloc),
             deref: None,
             deref_generics: 0,
-            deref_defs: Vec::new_in(Global),
-            deref_assoc: Vec::new_in(Global),
+            deref_defs: blaze_own::AVec::new_in(alloc),
+            deref_assoc: blaze_own::AVec::new_in(alloc),
             deref_fn: None,
             manually_drop: None,
             owned_box: None,
-            projs: Vec::new_in(Global),
+            projs: blaze_own::AVec::new_in(alloc),
             where_clauses: Vec::new_in(Global),
             index: None,
-            index_defs: Vec::new_in(Global),
-            index_assoc: Vec::new_in(Global),
+            index_defs: blaze_own::AVec::new_in(alloc),
+            index_assoc: blaze_own::AVec::new_in(alloc),
             index_fn: None,
             index_mut_fn: None,
-            methods: Vec::new_in(Global),
+            methods: blaze_own::AVec::new_in(alloc),
             planted: crate::Planted::Nothing,
-            tracked: Vec::new_in(Global),
+            tracked: blaze_own::AVec::new_in(alloc),
             location: None,
             fn_trait_method: None,
             def_site: None,
-            naked: Vec::new_in(Global),
+            naked: blaze_own::AVec::new_in(alloc),
         }
     }
 
@@ -828,8 +830,8 @@ impl LayoutFacts for TestWorld {
             return Err(refused);
         }
         for &(self_, target) in self.projs.iter() {
-            if crate::ground(self.types.view(), self_, &[], ground, Alloc::global(), self)? == args[0] {
-                return crate::ground(self.types.view(), target, &[], ground, Alloc::global(), self);
+            if crate::ground(self.types.view(), self_, &[], ground, blaze_own::testing::heap().alloc(), self)? == args[0] {
+                return crate::ground(self.types.view(), target, &[], ground, blaze_own::testing::heap().alloc(), self);
             }
         }
         Err(refused)
@@ -1012,7 +1014,7 @@ const MAIN: ItemKey = ItemKey(1);
 
 /// Checks and builds `body` of `MAIN`, a non-generic fn: the instance with no arguments.
 fn build(world: &TestWorld, body: &BodyBuf, root: ExprId) -> Result<Built<Global>, String> {
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     build_instance(world, body, MAIN, root, &[], &mut ground)
 }
 
@@ -1041,8 +1043,8 @@ fn build_instance_refusing(
     refused: &[blaze_lir::Op],
 ) -> Result<Built<Global>, String> {
     let view = body.view(owner, root);
-    let mut ty = InferCtx::new_in(Alloc::global());
-    let checked = match blaze_typeck::check(&view, world, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+    let mut ty = InferCtx::new_in(blaze_own::testing::heap().alloc());
+    let checked = match blaze_typeck::check(&view, world, &mut ty, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
         Ok(Outcome::Done(c)) => c,
         Ok(Outcome::Need(n)) => return Err(format!("the check needed {:?}", n.questions)),
         Err(error) => return Err(format!("the check failed: {error:?}")),
@@ -1051,7 +1053,7 @@ fn build_instance_refusing(
         return Err(format!("diagnostics: {:?}", checked.diags));
     }
     let sig = world.sig(owner).ok_or_else(|| String::from("no signature for the owner"))?;
-    let mut subst = Subst { args, ground, scratch: Alloc::global() };
+    let mut subst = Subst { args, ground, scratch: blaze_own::testing::heap().alloc() };
     let built = crate::build(&view, &checked, &sig, &mut subst, &TestAdts { world, body }, Global)
         .map_err(|error| format!("the build failed: {error}"))?;
     blaze_lir::verify(built.func.view()).map_err(|error| format!("does not verify: {error}"))?;
@@ -1290,7 +1292,7 @@ fn a_legacy_const_generic_argument_is_not_passed() {
     b.call_arg_ints.push((lane, 3));
     let args = b.exprs_list(&[v, lane]);
     let root = b.e(Expr::Call { callee, args });
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let built = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
     let [callee_instance] = built.refs.as_slice() else { panic!("one callee, not {:?}", built.refs) };
     assert_eq!(callee_instance.item, VGET);
@@ -1345,7 +1347,7 @@ fn pick(w: &mut TestWorld) -> (BodyBuf, ExprId) {
 fn a_generic_fn_is_built_once_per_instance() {
     let mut w = TestWorld::new();
     let (b, root) = pick(&mut w);
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let i32_ = g.intern(I32).expect("a type interns");
     let u8_ = g.intern(U8).expect("a type interns");
     let at_i32 = build_instance(&w, &b, PICK, root, &[i32_], &mut g).unwrap_or_else(|e| panic!("{e}"));
@@ -1396,7 +1398,7 @@ fn a_generic_struct_is_laid_out_at_its_arguments() {
         ],
         Some(qa),
     );
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let u8_ = g.intern(U8).expect("a type interns");
     let i64_ = g.intern(PNode::Int(IntTy::I64)).expect("a type interns");
     let at_u8 = build_instance(&w, &b, ItemKey(3), root, &[u8_], &mut g).unwrap_or_else(|e| panic!("{e}"));
@@ -1427,7 +1429,7 @@ fn two_calls_of_one_instance_share_one_ref() {
     let first = call(&mut b, true, 1, 2);
     let second = call(&mut b, false, 3, 4);
     let root = b.bin(BinOp::Add, first, second);
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let built = build_instance(&w, &b, MAIN, root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     let u8_ = g.intern(U8).expect("a type interns");
     let args = g.intern_list(&[u8_]).expect("a list interns");
@@ -1589,7 +1591,7 @@ fn a_struct_is_returned_through_the_result_pointer() {
     let a_e = callee.local(a);
     let b_e = callee.local(bb);
     let root = p_lit(&mut callee, a_e, b_e);
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let mk = build_instance(&w, &callee, ItemKey(3), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(mk.func.view());
     assert_eq!(own_sig(&mk), (vec_of(&[Ty::PTR, Ty::I32, Ty::I8]), vec_of(&[])), "{text}");
@@ -1645,7 +1647,7 @@ fn a_tuple_is_passed_and_returned_by_pointer() {
     let t0 = callee.local(t);
     let t0 = callee.tfield(t0, 0);
     let root = callee.tuple(&[t1, t0]);
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let swap = build_instance(&w, &callee, ItemKey(4), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(swap.func.view());
     assert_eq!(own_sig(&swap), (vec_of(&[Ty::PTR, Ty::PTR]), vec_of(&[])), "{text}");
@@ -1861,7 +1863,7 @@ fn a_write_through_a_mutable_reference_is_seen() {
     let ra = callee.field(r_e, "a");
     let v_e = callee.local(v);
     let root = callee.e(Expr::Assign { lhs: ra, rhs: v_e });
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let set = build_instance(&w, &callee, ItemKey(6), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(set.func.view());
     assert_eq!(own_sig(&set), (vec_of(&[Ty::PTR, Ty::I32]), vec_of(&[])), "{text}");
@@ -1882,7 +1884,7 @@ fn a_fn_returning_never_loops() {
     let body = b.block(&[], None);
     b.set(lp, Expr::Loop { body });
     let root = b.block(&[], Some(lp));
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let built = build_instance(&w, &b, ItemKey(5), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(own_sig(&built), (vec_of(&[Ty::I64, Ty::I64]), vec_of(&[])));
     let ran = run(&built, &[Val::Int(1), Val::Int(0)]).expect_err("it never returns");
@@ -1912,7 +1914,7 @@ fn a_c_struct_of_8_bytes_is_returned_in_one_register() {
     let a_e = callee.local(a);
     let b_e = callee.local(bb);
     let root = p_lit(&mut callee, a_e, b_e);
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let mk = build_instance(&w, &callee, ItemKey(3), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(mk.func.view());
     assert_eq!(own_sig(&mk), (vec_of(&[Ty::I32, Ty::I8]), vec_of(&[Ty::I64])), "{text}");
@@ -1949,7 +1951,7 @@ fn c_composites_go_in_words_byval_and_sret() {
     let bp = callee.bind("big");
     callee.params.extend_from_slice(&[qp, bp]);
     let root = callee.local(bp);
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let take = build_instance(&w, &callee, ItemKey(3), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(take.func.view());
     assert_eq!(own_sig(&take), (vec_of(&[Ty::PTR, Ty::I64, Ty::I64, Ty::PTR]), vec_of(&[])), "{text}");
@@ -1972,19 +1974,19 @@ fn instance_keys_follow_the_arguments_not_the_table() {
     use blaze_typeck::{ItemKey, PNode, PortableTys, UintTy, IntTy};
     let pair = ItemKey(7);
     let code = blaze_ids::ContentId::of("test code", b"fn second");
-    let mut first = PortableTys::new_in(Alloc::global());
+    let mut first = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let u8_ = first.intern(PNode::Uint(UintTy::U8)).expect("intern");
     let inner = first.intern_list(&[u8_]).expect("intern");
     let adt = first.intern(PNode::Adt(pair, inner)).expect("intern");
     let a = first.intern_list(&[adt, u8_]).expect("intern");
-    let mut second = PortableTys::new_in(Alloc::global());
+    let mut second = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let _unrelated = second.intern(PNode::Int(IntTy::I64)).expect("intern");
     let u8_2 = second.intern(PNode::Uint(UintTy::U8)).expect("intern");
     let inner2 = second.intern_list(&[u8_2]).expect("intern");
     let adt2 = second.intern(PNode::Adt(pair, inner2)).expect("intern");
     let b = second.intern_list(&[adt2, u8_2]).expect("intern");
     let other = second.intern_list(&[u8_2, adt2]).expect("intern");
-    let key = |table: &PortableTys<'_>, args, code| crate::instance_key(code, args, table.view(), Alloc::global()).expect("a key");
+    let key = |table: &PortableTys<'_>, args, code| crate::instance_key(code, args, table.view(), blaze_own::testing::heap().alloc()).expect("a key");
     assert_eq!(key(&first, a, code), key(&second, b, code));
     assert_ne!(key(&second, b, code), key(&second, other, code));
     assert_ne!(key(&first, a, code), key(&first, a, blaze_ids::ContentId::of("test code", b"fn second2")));
@@ -2091,15 +2093,15 @@ fn drop_glue_runs_the_impl_then_the_fields_in_order() {
     b.params.push(p);
     let root = b.block(&[], None);
     let view = b.view(DROP_IN_PLACE, root);
-    let mut cx = InferCtx::new_in(Alloc::global());
-    let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+    let mut cx = InferCtx::new_in(blaze_own::testing::heap().alloc());
+    let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
         Ok(Outcome::Done(c)) => c,
         other => panic!("the check did not finish: {:?}", other.err()),
     };
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let h = ground.intern(PNode::Adt(ItemKey(10), List::EMPTY)).expect("intern");
     let sig = w.sig(DROP_IN_PLACE).expect("a signature");
-    let mut subst = Subst { args: &[h], ground: &mut ground, scratch: Alloc::global() };
+    let mut subst = Subst { args: &[h], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
     let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &b }, Global)
         .unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(built.func.view());
@@ -2601,7 +2603,7 @@ fn a_c_variadic_fn_pointer_reads_signature_from_ground_table() {
 
     // Pre-populate `ground` with extra lists so the grounded `FnPtr`'s `sig_list` offset is
     // strictly past `checked.types.lists.len()`.
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let g_i32 = ground.intern(I32).expect("intern i32");
     for n in 1..=16usize {
         let mut dummy: Vec<PTy, Global> = Vec::new_in(Global);
@@ -2646,7 +2648,7 @@ fn a_fn_item_reified_is_called_through_its_address() {
     callee.params.push(x);
     let x_e = callee.local(x);
     let root = callee.block(&[], Some(x_e));
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let id = build_instance(&w, &callee, ItemKey(3), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     #[cfg(target_arch = "aarch64")]
     assert_eq!(run_native(&[(ItemKey(3), &id), (MAIN, &built)]) as u32, 5);
@@ -2693,7 +2695,7 @@ fn a_rust_call_fn_takes_its_tuples_fields_as_parameters() {
     let s = f.bin(BinOp::Add, s, t0);
     let s = f.bin(BinOp::Add, s, a_e);
     let root = f.block(&[], Some(s));
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let fb = build_instance(&w, &f, ItemKey(3), root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(fb.func.view());
     assert_eq!(own_sig(&fb), (vec_of(&[Ty::I32, Ty::I32, Ty::I32, Ty::PTR]), vec_of(&[Ty::I32])), "{text}");
@@ -3051,7 +3053,7 @@ fn an_overloaded_deref_calls_deref_with_the_place() {
     let inner = callee.field(p_e, "inner");
     let r = callee.e(Expr::Ref { mutbl: Mutbl::Not, operand: inner });
     let root = callee.block(&[], Some(r));
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let deref = build_instance(&w, &callee, ItemKey(12), root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
 
     let mut b = BodyBuf::new();
@@ -3089,7 +3091,7 @@ fn an_overloaded_deref_calls_deref_with_the_place() {
         ],
         Some(sum),
     );
-    let mut g = PortableTys::new_in(Alloc::global());
+    let mut g = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let built = build_instance(&w, &b, MAIN, root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(built.func.view());
     // The LIR: one reference, to `deref` at `[Wrap]`, called three times with a pointer.
@@ -3163,7 +3165,7 @@ fn four_locals_drop_in_reverse_order_when_run() {
         ],
         None,
     );
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let main = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
 
     let mut gb = BodyBuf::new();
@@ -3171,8 +3173,8 @@ fn four_locals_drop_in_reverse_order_when_run() {
     gb.params.push(p);
     let groot = gb.block(&[], None);
     let view = gb.view(DROP_IN_PLACE, groot);
-    let mut cx = InferCtx::new_in(Alloc::global());
-    let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+    let mut cx = InferCtx::new_in(blaze_own::testing::heap().alloc());
+    let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
         Ok(Outcome::Done(c)) => c,
         other => panic!("the check did not finish: {:?}", other.err()),
     };
@@ -3180,7 +3182,7 @@ fn four_locals_drop_in_reverse_order_when_run() {
     let mut glue = |t: PNode| -> (List, Built<Global>) {
         let ty = ground.intern(t).expect("intern");
         let args = ground.intern_list(&[ty]).expect("intern");
-        let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: Alloc::global() };
+        let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
         let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, Global)
             .unwrap_or_else(|e| panic!("{e}"));
         (args, built)
@@ -3253,7 +3255,7 @@ fn a_match_through_a_reference_binds_by_reference() {
         ],
         Some(sum),
     );
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let main = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(main.func.view());
     // Two drops, a's and b's (O3 needs drop as a type), and no others.
@@ -3268,8 +3270,8 @@ fn a_match_through_a_reference_binds_by_reference() {
         gb.params.push(p);
         let groot = gb.block(&[], None);
         let view = gb.view(DROP_IN_PLACE, groot);
-        let mut cx = InferCtx::new_in(Alloc::global());
-        let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        let mut cx = InferCtx::new_in(blaze_own::testing::heap().alloc());
+        let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
             Ok(Outcome::Done(c)) => c,
             other => panic!("the check did not finish: {:?}", other.err()),
         };
@@ -3277,7 +3279,7 @@ fn a_match_through_a_reference_binds_by_reference() {
         let mut glue = |t: PNode| -> (List, Built<Global>) {
             let ty = ground.intern(t).expect("intern");
             let args = ground.intern_list(&[ty]).expect("intern");
-            let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: Alloc::global() };
+            let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
             let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, Global)
                 .unwrap_or_else(|e| panic!("{e}"));
             (args, built)
@@ -3322,7 +3324,7 @@ fn a_manually_drop_field_is_never_dropped() {
             ],
             None,
         );
-        let mut ground = PortableTys::new_in(Alloc::global());
+        let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
         let main = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
         main.refs.iter().enumerate().filter(|(_, r)| r.item == DROP_IN_PLACE).map(|(i, _)| calls_of(&main, i)).sum::<usize>()
     };
@@ -3464,7 +3466,7 @@ fn enum_glue_drops_the_live_variant() {
         ],
         None,
     );
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let main = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
     let text = blaze_lir::print(main.func.view());
     // a, c and s are dropped (their glue called); n, o and u are not: E2 and O need drop as
@@ -3479,8 +3481,8 @@ fn enum_glue_drops_the_live_variant() {
     gb.params.push(p);
     let groot = gb.block(&[], None);
     let view = gb.view(DROP_IN_PLACE, groot);
-    let mut cx = InferCtx::new_in(Alloc::global());
-    let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+    let mut cx = InferCtx::new_in(blaze_own::testing::heap().alloc());
+    let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
         Ok(Outcome::Done(c)) => c,
         other => panic!("the check did not finish: {:?}", other.err()),
     };
@@ -3488,7 +3490,7 @@ fn enum_glue_drops_the_live_variant() {
     let mut glue = |t: PNode| -> (List, Built<Global>) {
         let ty = ground.intern(t).expect("intern");
         let args = ground.intern_list(&[ty]).expect("intern");
-        let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: Alloc::global() };
+        let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
         let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, Global)
             .unwrap_or_else(|e| panic!("{e}"));
         emits(&built, &[]);
@@ -3564,7 +3566,7 @@ enum Scrut {
 #[derive(Clone, Copy, Debug)]
 enum Arms {
     Or,
-    OrGuard,
+    OrGuard(bool),
     Each,
     Whole,
     Wild,
@@ -3611,7 +3613,7 @@ fn arm_list(b: &mut BodyBuf, arms: Arms) -> List {
         list.push(Arm { pat, guard: None, body });
     };
     match arms {
-        Arms::Or | Arms::OrGuard => {
+        Arms::Or | Arms::OrGuard(_) => {
             let (w0, s) = (b.pat(Pat::Wild), b.bind("s"));
             let pa = variant_pat(b, "A", &[w0, s]);
             let s2 = b.bind("s");
@@ -3621,8 +3623,8 @@ fn arm_list(b: &mut BodyBuf, arms: Arms) -> List {
             push(b, or, false);
             let w1 = b.pat(Pat::Wild);
             push(b, w1, false);
-            if let Arms::OrGuard = arms {
-                let (one, other) = (b.int(1, None), b.int(1, None));
+            if let Arms::OrGuard(pass) = arms {
+                let (one, other) = (b.int(1, None), b.int(if pass { 1 } else { 2 }, None));
                 list[0].guard = Some(b.bin(BinOp::Eq, one, other));
             }
         }
@@ -3714,7 +3716,7 @@ fn match_drops(s: Scrut, arms: Arms, temp: bool) -> Result<Vec<i32, Global>, Str
 /// the drop glue of `types` (`G`, `N`, `E`): the order the `G`s were dropped in (each `G`'s
 /// `x`). Off aarch64: built only, and nothing seen.
 fn g_drops(w: &TestWorld, b: &BodyBuf, root: ExprId, types: [PNode; 3]) -> Result<Vec<i32, Global>, String> {
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let main = build_instance(w, b, MAIN, root, &[], &mut ground)?;
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -3730,8 +3732,8 @@ fn g_drops(w: &TestWorld, b: &BodyBuf, root: ExprId, types: [PNode; 3]) -> Resul
         gb.params.push(p);
         let groot = gb.block(&[], None);
         let view = gb.view(DROP_IN_PLACE, groot);
-        let mut cx = InferCtx::new_in(Alloc::global());
-        let checked = match blaze_typeck::check(&view, w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        let mut cx = InferCtx::new_in(blaze_own::testing::heap().alloc());
+        let checked = match blaze_typeck::check(&view, w, &mut cx, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
             Ok(Outcome::Done(c)) => c,
             other => panic!("the check did not finish: {:?}", other.err()),
         };
@@ -3753,7 +3755,7 @@ fn g_drops(w: &TestWorld, b: &BodyBuf, root: ExprId, types: [PNode; 3]) -> Resul
         let mut glue = |t: PNode| -> (List, Built<Global>) {
             let ty = ground.intern(t).expect("intern");
             let args = ground.intern_list(&[ty]).expect("intern");
-            let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: Alloc::global() };
+            let mut subst = Subst { args: &[ty], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
             let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: w, body: &gb }, Global)
                 .unwrap_or_else(|e| panic!("{e}"));
             (args, built)
@@ -3851,7 +3853,7 @@ fn a_match_by_value_refuses_drop_impl_enums_and_handles_wide_enums() {
         let xe = b.local(x);
         let m = b.e(Expr::Match { scrutinee: xe, arms: List { start, len: 2 } });
         let root = b.block(&[Stmt::Let { pat: x, ty: Some(e_ty), init: Some(value), else_: None }, Stmt::Expr { expr: m, semi: true }], None);
-        let mut ground = PortableTys::new_in(Alloc::global());
+        let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
         match build_instance(w, b, MAIN, root, &[], &mut ground) {
             Err(e) => e,
             Ok(_) => panic!("the move is refused"),
@@ -3903,7 +3905,7 @@ fn a_match_by_value_refuses_drop_impl_enums_and_handles_wide_enums() {
     let xe = b.local(x);
     let m = b.e(Expr::Match { scrutinee: xe, arms: List { start, len: 2 } });
     let root = b.block(&[Stmt::Let { pat: x, ty: Some(v_ty), init: Some(value), else_: None }, Stmt::Expr { expr: m, semi: true }], None);
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let main = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("65-field enum move failed: {e}"));
     #[cfg(target_arch = "aarch64")]
     {
@@ -3912,15 +3914,15 @@ fn a_match_by_value_refuses_drop_impl_enums_and_handles_wide_enums() {
         gb.params.push(gp);
         let groot = gb.block(&[], None);
         let view = gb.view(DROP_IN_PLACE, groot);
-        let mut cx = InferCtx::new_in(Alloc::global());
-        let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        let mut cx = InferCtx::new_in(blaze_own::testing::heap().alloc());
+        let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
             Ok(Outcome::Done(c)) => c,
             other => panic!("drop_in_place check failed: {:?}", other.err()),
         };
         let sig = w.sig(DROP_IN_PLACE).expect("sig");
         let gg = ground.intern(PNode::Adt(ItemKey(9), List::EMPTY)).expect("intern G");
         let g_args = ground.intern_list(&[gg]).expect("intern [G]");
-        let mut subst = Subst { args: &[gg], ground: &mut ground, scratch: Alloc::global() };
+        let mut subst = Subst { args: &[gg], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
         let g_glue = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, Global)
             .unwrap_or_else(|e| panic!("G glue: {e}"));
         DROPPED.with(|d| d.borrow_mut().clear());
@@ -3964,7 +3966,7 @@ fn a_match_by_value_refuses_drop_impl_enums_and_handles_wide_enums() {
     let xe = b.local(x);
     let m = b.e(Expr::Match { scrutinee: xe, arms: List { start, len: 2 } });
     let root = b.block(&[Stmt::Let { pat: x, ty: Some(we_ty), init: Some(value), else_: None }, Stmt::Expr { expr: m, semi: true }], None);
-    let mut ground = PortableTys::new_in(Alloc::global());
+    let mut ground = PortableTys::new_in(blaze_own::testing::heap().alloc());
     let main = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("80-field multi-variant enum failed: {e}"));
     #[cfg(target_arch = "aarch64")]
     {
@@ -3973,15 +3975,15 @@ fn a_match_by_value_refuses_drop_impl_enums_and_handles_wide_enums() {
         gb.params.push(gp);
         let groot = gb.block(&[], None);
         let view = gb.view(DROP_IN_PLACE, groot);
-        let mut cx = InferCtx::new_in(Alloc::global());
-        let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        let mut cx = InferCtx::new_in(blaze_own::testing::heap().alloc());
+        let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(blaze_own::testing::heap().alloc()), blaze_own::testing::heap().alloc()) {
             Ok(Outcome::Done(c)) => c,
             other => panic!("drop_in_place check failed: {:?}", other.err()),
         };
         let sig = w.sig(DROP_IN_PLACE).expect("sig");
         let gg = ground.intern(PNode::Adt(ItemKey(9), List::EMPTY)).expect("intern G");
         let g_args = ground.intern_list(&[gg]).expect("intern [G]");
-        let mut subst = Subst { args: &[gg], ground: &mut ground, scratch: Alloc::global() };
+        let mut subst = Subst { args: &[gg], ground: &mut ground, scratch: blaze_own::testing::heap().alloc() };
         let g_glue = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, Global)
             .unwrap_or_else(|e| panic!("G glue: {e}"));
         DROPPED.with(|d| d.borrow_mut().clear());

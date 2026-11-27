@@ -414,7 +414,9 @@ impl<'s, 'a> Words<'s, 'a> {
                             return Err(ExtentError { what: prefix.extent(), why: ExtentWhy::Refused, token: index(self.token_at(word)) });
                         };
                         let past = index(nodes.len());
-                        let node = &mut nodes[node as usize];
+                        let Some(node) = usize::try_from(node).ok().and_then(|i| nodes.get_mut(i)) else {
+                            return Err(ExtentError { what: prefix.extent(), why: ExtentWhy::Refused, token: index(self.token_at(word)) });
+                        };
                         (node.end, node.past) = (index(word), past);
                     }
                 }

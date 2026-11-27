@@ -54,6 +54,11 @@ pub const STARTER_CONFIG: &str = r#"# blaze-shell configuration (~/.config/blaze
 # show_toolchains = true   # project toolchain icons (Rust, Nix, ...), off by default
 # show_processes = true    # live processes running in this directory, off by default
 
+# Line editor options:
+# [editor]
+# auto_popup = true        # open the completion popup as you type; by default it opens on
+#                          # Tab / Ctrl+Space and then filters as you keep typing
+
 # Terminal options:
 # [terminal]
 # alt_screen = "pane"      # full-screen programs (vim, htop, less, claude) open in a new tiled
@@ -140,6 +145,9 @@ pub struct UserConfig<'a> {
     /// Whether to display the live processes running in the working directory in the prompt
     /// capsule (`[prompt] show_processes = true|false`, default `false`).
     pub show_processes: bool,
+    /// Whether the completion popup opens by itself as you type (`[editor] auto_popup =
+    /// true|false`, default `false`: it opens on `Tab` / `Ctrl+Space` and then filters live).
+    pub auto_popup: bool,
     /// Where alternate-screen programs are shown (`[terminal] alt_screen`, default `"pane"`).
     pub alt_screen: AltScreenPlacement,
     /// The `[terminal] alt_screen` value when it was neither `"pane"` nor `"inline"` (a string
@@ -159,6 +167,7 @@ impl<'a> UserConfig<'a> {
             completions: Vec::new_in(alloc),
             show_toolchains: false,
             show_processes: false,
+            auto_popup: false,
             alt_screen: AltScreenPlacement::Pane,
             alt_screen_rejected: None,
         }
@@ -229,6 +238,17 @@ impl<'a> UserConfig<'a> {
                                 && let DataValue::Bool(b) = *pv
                             {
                                 cfg.show_processes = b;
+                            }
+                        }
+                    }
+                }
+                "editor" => {
+                    if let DataValue::Map(m) = v {
+                        for (ek, ev) in m.iter() {
+                            if ek == "auto_popup"
+                                && let DataValue::Bool(b) = *ev
+                            {
+                                cfg.auto_popup = b;
                             }
                         }
                     }
@@ -520,9 +540,13 @@ pub fn symbol_cluster_count(s: &str) -> usize {
 mod tests {
     use super::*;
 
+    fn test_alloc() -> Alloc<'static> {
+        Alloc::global()
+    }
+
     #[test]
     fn parses_host_project_abbreviations_and_completions_no_std() {
-        let alloc = Alloc::global();
+        let alloc = test_alloc();
         let cfg = UserConfig::parse_in(
             r#"
 [host]
@@ -574,7 +598,7 @@ cl = "claude --dangerously-skip-permissions"
 
     #[test]
     fn terminal_alt_screen_defaults_to_pane_and_names_a_bad_value() {
-        let alloc = Alloc::global();
+        let alloc = test_alloc();
         let cfg = UserConfig::parse_in("", alloc);
         assert_eq!(cfg.alt_screen, AltScreenPlacement::Pane);
         assert_eq!(cfg.alt_screen_rejected, None);

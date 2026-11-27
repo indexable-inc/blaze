@@ -202,7 +202,6 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         // / "Shifts `lhs` right by `rhs`, shifting in sign bits for signed types."
         SimdOp::Shl | SimdOp::Shr => {
             let l = lanes(s, ty(0)?)?;
-            let vt = vector_ty(which, &l)?;
             let lop = match (op, kind(l.elem)) {
                 (SimdOp::Shl, Kind::Int { .. }) => Op::Shl,
                 (SimdOp::Shr, Kind::Int { signed: true }) => Op::Ashr,
@@ -210,6 +209,18 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 _ => return Err(shape(ints)),
             };
             let (x, y) = (place(0)?, place(1)?);
+            if let Some((vt, chunks)) = super::simd::native_vec128_chunks(&l) {
+                let out = super::simd::temp_vec(s, &l);
+                for c in 0..chunks {
+                    let off = super::simd::chunk_off(c);
+                    let a = super::simd::load_vec128_at(s, &l, vt, x, off);
+                    let b = super::simd::load_vec128_at(s, &l, vt, y, off);
+                    let r = s.b.binary(lop, Flags::IN_RANGE, a, b);
+                    super::simd::store_vec128_at(s, &l, r, out, off);
+                }
+                return Ok(Out::At(out));
+            }
+            let vt = vector_ty(which, &l)?;
             let a = load_vector(s, &l, vt, x);
             let b = load_vector(s, &l, vt, y);
             let r = s.b.binary(lop, Flags::IN_RANGE, a, b);
@@ -315,25 +326,49 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             if l.count != m.count {
                 return Err(shape("`T` and `U` must have the same length"));
             }
-            let (from, to) = (vector_ty(which, &l)?, vector_ty(which, &m)?);
             let x = place(0)?;
-            let a = load_vector(s, &l, from, x);
             let (fb, tb) = (l.stride, m.stride);
             let unchecked = if op == SimdOp::Cast { Flags::IN_RANGE } else { Flags::NONE };
-            let r = match (kind(l.elem), kind(m.elem)) {
-                (Kind::Int { .. }, Kind::Int { .. }) if fb == tb => a,
-                (Kind::Int { signed }, Kind::Int { .. }) if fb < tb => s.b.convert(if signed { Op::Sext } else { Op::Zext }, Flags::NONE, to, a),
-                (Kind::Int { .. }, Kind::Int { .. }) => s.b.convert(Op::Trunc, Flags::NONE, to, a),
-                (Kind::Float, Kind::Float) if fb == tb => a,
-                (Kind::Float, Kind::Float) if fb < tb => s.b.convert(Op::Fpext, Flags::NONE, to, a),
-                (Kind::Float, Kind::Float) => s.b.convert(Op::Fptrunc, Flags::NONE, to, a),
-                (Kind::Int { signed: true }, Kind::Float) => s.b.convert(Op::SitoFp, Flags::NONE, to, a),
-                (Kind::Int { signed: false }, Kind::Float) => s.b.convert(Op::UitoFp, Flags::NONE, to, a),
-                (Kind::Float, Kind::Int { signed: true }) => s.b.convert(Op::FptoSi, unchecked, to, a),
-                (Kind::Float, Kind::Int { signed: false }) => s.b.convert(Op::FptoUi, unchecked, to, a),
-                _ => return Err(shape("`T` and `U` must be vectors of integers or floats")),
+            let (fk, mk) = (kind(l.elem), kind(m.elem));
+            if matches!(fk, Kind::Ptr) || matches!(mk, Kind::Ptr) {
+                return Err(shape("`T` and `U` must be vectors of integers or floats"));
+            }
+            let convert_val = |s: &mut B<'_, '_, '_, '_, LA, S, A>, dst_ty: Ty, a: Value| -> Result<Value, IntrinsicError> {
+                Ok(match (fk, mk) {
+                    (Kind::Int { .. }, Kind::Int { .. }) if fb == tb => a,
+                    (Kind::Int { signed }, Kind::Int { .. }) if fb < tb => s.b.convert(if signed { Op::Sext } else { Op::Zext }, Flags::NONE, dst_ty, a),
+                    (Kind::Int { .. }, Kind::Int { .. }) => s.b.convert(Op::Trunc, Flags::NONE, dst_ty, a),
+                    (Kind::Float, Kind::Float) if fb == tb => a,
+                    (Kind::Float, Kind::Float) if fb < tb => s.b.convert(Op::Fpext, Flags::NONE, dst_ty, a),
+                    (Kind::Float, Kind::Float) => s.b.convert(Op::Fptrunc, Flags::NONE, dst_ty, a),
+                    (Kind::Int { signed: true }, Kind::Float) => s.b.convert(Op::SitoFp, Flags::NONE, dst_ty, a),
+                    (Kind::Int { signed: false }, Kind::Float) => s.b.convert(Op::UitoFp, Flags::NONE, dst_ty, a),
+                    (Kind::Float, Kind::Int { signed: true }) => s.b.convert(Op::FptoSi, unchecked, dst_ty, a),
+                    (Kind::Float, Kind::Int { signed: false }) => s.b.convert(Op::FptoUi, unchecked, dst_ty, a),
+                    _ => return Err(shape("`T` and `U` must be vectors of integers or floats")),
+                })
             };
-            out_vector(s, &m, r)
+            if let (Ok(from), Ok(to)) = (vector_ty(which, &l), vector_ty(which, &m)) {
+                let a = load_vector(s, &l, from, x);
+                let r = convert_val(s, to, a)?;
+                out_vector(s, &m, r)
+            } else {
+                // Vector wider than 512 bits or non-power-of-two lane count (e.g. `Simd<u16, 32>`
+                // cast to `Simd<u32, 32>`): lower lane-by-lane with scalar conversions.
+                let from_lane = lir(l.elem).0;
+                let to_lane = lir(m.elem).0;
+                let size = u32::try_from(m.size).map_err(|_| shape("vector too large"))?;
+                let slot = s.b.slot(size, m.align, SlotKind::Temp);
+                let dst = s.b.slot_addr(slot);
+                for i in 0..l.count {
+                    let src_off = i32::try_from(i * l.stride).map_err(|_| shape("vector offset overflow"))?;
+                    let dst_off = i32::try_from(i * m.stride).map_err(|_| shape("vector offset overflow"))?;
+                    let a = s.b.load(from_lane, Flags::NONE, x, src_off, MemAttrs::aligned(l.elem.align()));
+                    let r = convert_val(s, to_lane, a)?;
+                    s.b.store(Flags::NONE, r, dst, dst_off, MemAttrs::aligned(m.elem.align()));
+                }
+                Out::At(dst)
+            }
         }
         // "Returns a new vector such that element `i` is selected from `xy[idx[i]]`, where `xy`
         // is the concatenation of `x` and `y`." "`V` must be a vector with the same element
@@ -344,11 +379,98 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             if r.elem != l.elem {
                 return Err(shape("`V` must be a vector with the same element type as `T`"));
             }
-            let (vt, rt) = (vector_ty(which, &l)?, vector_ty(which, &r)?);
             let count = r.count as usize;
             let (x, y, idx) = (place(0)?, place(1)?, place(2)?);
             let mut mask = [0u32; MOST_LANES];
             shuffle_indices(s, idx, count, 2 * l.count as u32, &mut mask)?;
+            // Split 256-bit / 512-bit shuffles into native 128-bit `Op::Shuffle` chunks whenever
+            // each 16-byte output chunk reads from at most 2 distinct 16-byte source chunks
+            // (covering BLAKE3's `ByBytes` byte-rotations and `transpose` interleave shuffles).
+            if let (Some((vt, in_chunks)), Some((rt, out_chunks))) =
+                (super::simd::native_vec128_chunks(&l), super::simd::native_vec128_chunks(&r))
+                && (in_chunks > 1 || out_chunks > 1)
+                && vt == rt
+                && let (Ok(chunk_lanes_usize), Ok(out_chunks_usize), Ok(in_c)) =
+                    (usize::try_from(rt.lanes()), usize::try_from(out_chunks), u32::try_from(in_chunks))
+            {
+                let chunk_lanes = rt.lanes();
+                let mut plan: [(u32, u32, [u32; 16]); 4] = [(0, 0, [0; 16]); 4];
+                let mut can_chunk = out_chunks_usize <= 4 && chunk_lanes_usize <= 16;
+                if can_chunk {
+                    for oc in 0..out_chunks_usize {
+                        let mut c0: Option<u32> = None;
+                        let mut c1: Option<u32> = None;
+                        let mut sub = [0u32; 16];
+                        for k in 0..chunk_lanes_usize {
+                            let Some(&src_lane) = mask.get(oc * chunk_lanes_usize + k) else {
+                                can_chunk = false;
+                                break;
+                            };
+                            let sc = src_lane / chunk_lanes;
+                            let sl = src_lane % chunk_lanes;
+                            let mapped = if c0 == Some(sc) {
+                                sl
+                            } else if c0.is_none() {
+                                c0 = Some(sc);
+                                sl
+                            } else if c1 == Some(sc) {
+                                chunk_lanes + sl
+                            } else if c1.is_none() {
+                                c1 = Some(sc);
+                                chunk_lanes + sl
+                            } else {
+                                can_chunk = false;
+                                break;
+                            };
+                            if let Some(slot) = sub.get_mut(k) {
+                                *slot = mapped;
+                            }
+                        }
+                        if !can_chunk {
+                            break;
+                        }
+                        let a_chunk = c0.unwrap_or(0);
+                        let b_chunk = c1.unwrap_or(a_chunk);
+                        if let Some(slot) = plan.get_mut(oc) {
+                            *slot = (a_chunk, b_chunk, sub);
+                        }
+                    }
+                }
+                if can_chunk {
+                    let out = super::simd::temp_vec(s, &r);
+                    let mut loaded: [Option<Value>; 8] = [None; 8];
+                    let load_src_chunk = |s: &mut B<'_, '_, '_, '_, LA, S, A>,
+                                          loaded: &mut [Option<Value>; 8],
+                                          sc: u32|
+                     -> Value {
+                        let sc_ix = usize::try_from(sc).ok();
+                        if let Some(Some(v)) = sc_ix.and_then(|i| loaded.get(i).copied()) {
+                            return v;
+                        }
+                        let (base, off) = if sc < in_c {
+                            (x, super::simd::chunk_off(u64::from(sc)))
+                        } else {
+                            (y, super::simd::chunk_off(u64::from(sc - in_c)))
+                        };
+                        let v = super::simd::load_vec128_at(s, &l, vt, base, off);
+                        if let Some(slot) = sc_ix.and_then(|i| loaded.get_mut(i)) {
+                            *slot = Some(v);
+                        }
+                        v
+                    };
+                    for (oc, &(a_chunk, b_chunk, sub)) in plan.iter().take(out_chunks_usize).enumerate() {
+                        let va = load_src_chunk(s, &mut loaded, a_chunk);
+                        let vb = load_src_chunk(s, &mut loaded, b_chunk);
+                        if let Some(sub_slice) = sub.get(..chunk_lanes_usize) {
+                            let v = s.b.shuffle(rt, va, vb, sub_slice);
+                            let off = u64::try_from(oc).map_or(0, super::simd::chunk_off);
+                            super::simd::store_vec128_at(s, &r, v, out, off);
+                        }
+                    }
+                    return Ok(Out::At(out));
+                }
+            }
+            let (vt, rt) = (vector_ty(which, &l)?, vector_ty(which, &r)?);
             let a = load_vector(s, &l, vt, x);
             let b = load_vector(s, &l, vt, y);
             let v = s.b.shuffle(rt, a, b, &mask[..count]);
@@ -359,43 +481,72 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         // from the identity). An integer sum or product wraps, so its order is unseen.
         SimdOp::ReduceAddOrdered | SimdOp::ReduceAddUnordered | SimdOp::ReduceMulOrdered | SimdOp::ReduceMulUnordered => {
             let l = lanes(s, ty(0)?)?;
-            let vt = vector_ty(which, &l)?;
-            let lane = vt.lane();
+            let lane = lir(l.elem).0;
             if s.scalar(c.ret)?.0 != lane {
                 return Err(shape("`U` must be the element type of `T`"));
             }
             let x = place(0)?;
             let ordered = matches!(op, SimdOp::ReduceAddOrdered | SimdOp::ReduceMulOrdered);
             let mul = matches!(op, SimdOp::ReduceMulOrdered | SimdOp::ReduceMulUnordered);
-            let a = load_vector(s, &l, vt, x);
-            let r = match kind(l.elem) {
-                Kind::Int { .. } => {
-                    let all = s.b.convert(if mul { Op::ReduceMul } else { Op::ReduceAdd }, Flags::NONE, lane, a);
-                    match ordered {
-                        true => {
-                            let start = scalar(1)?;
-                            s.b.binary(if mul { Op::Mul } else { Op::Add }, Flags::NONE, start, all)
+            if let Ok(vt) = vector_ty(which, &l) {
+                let a = load_vector(s, &l, vt, x);
+                let r = match kind(l.elem) {
+                    Kind::Int { .. } => {
+                        let all = s.b.convert(if mul { Op::ReduceMul } else { Op::ReduceAdd }, Flags::NONE, lane, a);
+                        match ordered {
+                            true => {
+                                let start = scalar(1)?;
+                                s.b.binary(if mul { Op::Mul } else { Op::Add }, Flags::NONE, start, all)
+                            }
+                            false => all,
                         }
-                        false => all,
                     }
-                }
-                Kind::Float => {
-                    let lop = if mul { Op::ReduceFmul } else { Op::ReduceFadd };
-                    match ordered {
-                        true => {
-                            let start = scalar(1)?;
-                            s.b.reduce_ordered(lop, Flags::NONE, start, a)
+                    Kind::Float => {
+                        let lop = if mul { Op::ReduceFmul } else { Op::ReduceFadd };
+                        match ordered {
+                            true => {
+                                let start = scalar(1)?;
+                                s.b.reduce_ordered(lop, Flags::NONE, start, a)
+                            }
+                            false => {
+                                let bits = float_identity(lane.elem(), mul).ok_or(shape(ints_or_floats))?;
+                                let start = s.b.fconst(lane, bits);
+                                s.b.reduce_ordered(lop, Flags::REASSOC, start, a)
+                            }
                         }
-                        false => {
+                    }
+                    Kind::Ptr => return Err(shape(ints_or_floats)),
+                };
+                Out::Scalar(r)
+            } else {
+                // Vector wider than 512 bits or non-power-of-two lane count (e.g.
+                // `Simd<u32, 32>::reduce_sum`): fold lane-by-lane in order.
+                let (binop, flags) = match kind(l.elem) {
+                    Kind::Int { .. } => (if mul { Op::Mul } else { Op::Add }, Flags::NONE),
+                    Kind::Float => (if mul { Op::Fmul } else { Op::Fadd }, if ordered { Flags::NONE } else { Flags::REASSOC }),
+                    Kind::Ptr => return Err(shape(ints_or_floats)),
+                };
+                let (mut acc, first_lane) = if ordered {
+                    (scalar(1)?, 0u64)
+                } else if l.count == 0 {
+                    match kind(l.elem) {
+                        Kind::Int { .. } => (s.b.iconst(lane, u128::from(mul)), 0u64),
+                        Kind::Float => {
                             let bits = float_identity(lane.elem(), mul).ok_or(shape(ints_or_floats))?;
-                            let start = s.b.fconst(lane, bits);
-                            s.b.reduce_ordered(lop, Flags::REASSOC, start, a)
+                            (s.b.fconst(lane, bits), 0u64)
                         }
+                        Kind::Ptr => return Err(shape(ints_or_floats)),
                     }
+                } else {
+                    (s.b.load(lane, Flags::NONE, x, 0, MemAttrs::aligned(l.elem.align())), 1u64)
+                };
+                for i in first_lane..l.count {
+                    let off = i32::try_from(i * l.stride).map_err(|_| shape("vector offset overflow"))?;
+                    let v = s.b.load(lane, Flags::NONE, x, off, MemAttrs::aligned(l.elem.align()));
+                    acc = s.b.binary(binop, flags, acc, v);
                 }
-                Kind::Ptr => return Err(shape(ints_or_floats)),
-            };
-            Out::Scalar(r)
+                Out::Scalar(acc)
+            }
         }
         // "Returns the maximum element of a vector." / "the minimum": by the lanes' signedness;
         // a float vector (core_arch's `vmaxvq_f32`) as `fmax_num`/`fmin_num`.

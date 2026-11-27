@@ -221,6 +221,9 @@ fn naked_fn_emits_bare_instructions_and_sym_call_site() {
                 _ => None,
             }
         }
+        fn routines(&self) -> crate::RoutinePlaces {
+            crate::RoutinePlaces::NONE
+        }
     }
 
     let heap = blaze_own::testing::heap();

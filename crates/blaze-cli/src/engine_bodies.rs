@@ -878,7 +878,7 @@ const MEM_PARTS: usize = 23;
 
 /// The first representative of each retained recorder cell, before row placement.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct KeptKinds([u32; 25]);
+struct KeptKinds([u32; 26]);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TopKept {
@@ -887,9 +887,9 @@ pub(crate) struct TopKept {
 }
 
 impl KeptKinds {
-    const NAMES: [&'static str; 25] = [
+    const NAMES: [&'static str; 26] = [
         "Binding", "Module", "Root", "Variants", "Item", "Members", "Expansion", "MemberOf",
-        "VariantOf", "Beginning", "Lang", "Incoherent", "InternalSymbols", "Links", "ImplRows", "Files", "Extensions", "CfgAtoms", "Textual", "Whole", "Signature", "Text", "Head", "Impls", "File",
+        "VariantOf", "Beginning", "Lang", "Incoherent", "InternalSymbols", "Links", "ImplRows", "Files", "Extensions", "CfgAtoms", "Exports", "Textual", "Whole", "Signature", "Text", "Head", "Impls", "File",
     ];
 
     fn add(&mut self, key: TableRead) {
@@ -900,13 +900,13 @@ impl KeptKinds {
                 Item { .. } => 4, Members { .. } => 5, Expansion { .. } => 6, MemberOf { .. } => 7,
                 VariantOf { .. } => 8, Beginning { .. } => 9, Lang { .. } => 10, Incoherent { .. } => 11,
                 InternalSymbols { .. } => 12, Links { .. } => 13, ImplRows { .. } => 14, Files { .. } => 15,
-                Extensions { .. } => 16, CfgAtoms { .. } => 17, Textual { .. } => 18, Whole { .. } => 19,
+                Extensions { .. } => 16, CfgAtoms { .. } => 17, Exports { .. } => 18, Textual { .. } => 19, Whole { .. } => 20,
             },
-            TableRead::Signature { .. } => 20,
-            TableRead::Text { .. } => 21,
-            TableRead::Head { .. } => 22,
-            TableRead::Impls { .. } => 23,
-            TableRead::File { .. } => 24,
+            TableRead::Signature { .. } => 21,
+            TableRead::Text { .. } => 22,
+            TableRead::Head { .. } => 23,
+            TableRead::Impls { .. } => 24,
+            TableRead::File { .. } => 25,
         };
         self.0[at] += 1;
     }
@@ -6306,10 +6306,11 @@ impl<'f> BodiesStage<'f> {
                                       name: Name,
                                       chain: ContentId,
                                       text: &str,
-                                      own_key: Result<Option<ItemKey>, &'static str>,
+                                      own_keys: Result<&[ItemKey], &'static str>,
                                       max_steps: usize,
                                       parent_item: &dyn Fn(blaze_surface::ItemIndex) -> Option<blaze_surface::Item>,
                                       item_len: &dyn Fn(blaze_surface::ItemIndex) -> u32,
+                                      file_cfg: Option<(u32, bool)>,
                                       eval_attrs: &dyn Fn(&blaze_surface::Item, blaze_own::Alloc<'static>) -> Option<(u32, bool)>| {
                     // The bodies an expansion at this entry wrote: the entry's task checks
                     // each (one task an entry, planned from text; covered.rs).
@@ -6340,11 +6341,13 @@ impl<'f> BodiesStage<'f> {
                     // COVERAGE (body_types/covered.rs, the reference): every body of the entry
                     // is in its task's list, or the entry is refused by name; an entry is left
                     // to no unit (`ENTRY_ABSENT`) only when its `cfg` is false for this unit.
-                    let own = match own_key {
+                    let own = match own_keys {
                         Err(why) => Err(why),
-                        Ok(own_body_key) => 'own: {
-                            // 1. The entry's own body, listed at its chain.
-                            if let Some(key) = own_body_key {
+                        Ok(own_body_keys) => 'own: {
+                            // 1. The entry's own body (or bodies, when one physical file is mounted
+                            // in multiple modules of the same crate via `#[path = "..."]`), listed
+                            // at its chain.
+                            for &key in own_body_keys.iter() {
                                 keys.push(key);
                                 labels.push(None);
                             }
@@ -6393,7 +6396,7 @@ impl<'f> BodiesStage<'f> {
                                 taken
                             };
                             if body && keys.is_empty() && !taken_above {
-                                match absent_entry_with(records, item, text, root_file, max_steps, parent_item, eval_attrs, g) {
+                                match absent_entry_with(records, item, text, root_file, max_steps, parent_item, file_cfg, eval_attrs, g) {
                                     Ok(key) => {
                                         keys.push(key);
                                         labels.push(Some(Unplaced { label: REPLACED_MAIN, words: crate::body_types::covered::WRITTEN_UNPLACED }));
@@ -6426,7 +6429,7 @@ impl<'f> BodiesStage<'f> {
                             // The entry's own body is the outline's item; every other key
                             // is read from the items record's rows, no text read.
                             for (k, key) in keys.iter().enumerate() {
-                                let own_body = k == 0 && labels.first().is_some_and(Option::is_none);
+                                let own_body = labels.get(k).copied().flatten().is_none();
                                 costs.push(if own_body { item.range.len().max(MIN_BODY_BYTES) } else { text_bytes(&items, &mut member_lens, item_len, file, *key, g) });
                             }
                             Ok((at, &*keys.leak_static()))
@@ -6587,6 +6590,19 @@ impl<'f> BodiesStage<'f> {
                             let parent_item = |p: blaze_surface::ItemIndex| view.item(p).map(|e| e.item);
                             let item_len = |idx: blaze_surface::ItemIndex| view.item(idx).map_or(0, |e| e.item.range.len());
                             let cfg_ref = cfg.as_ref();
+                            let file_cfg = cfg_ref.map(|cfg| {
+                                let mut attrs = blaze_scope::task::Attrs::new_in(g);
+                                let mut stack = blaze_own::AVec::new_in(g);
+                                for attr in view.file_attrs() {
+                                    if attr.kind == blaze_surface::AttrKind::Doc {
+                                        continue;
+                                    }
+                                    if let Some(written) = text.get(attr.range.to_usize()) {
+                                        cfg.attr(&mut attrs, blaze_scope::task::strip_attr(written), &mut stack);
+                                    }
+                                }
+                                (attrs.cfg_unread, attrs.cfg_ok)
+                            });
                             let eval_attrs = |entry_item: &blaze_surface::Item, alloc: blaze_own::Alloc<'static>| {
                                 let cfg = cfg_ref?;
                                 let mut attrs = blaze_scope::task::Attrs::new_in(alloc);
@@ -6599,18 +6615,32 @@ impl<'f> BodiesStage<'f> {
                                 }
                                 Some((attrs.cfg_unread, attrs.cfg_ok))
                             };
+                            let mut own_keys_buf: Vec<ItemKey, blaze_own::Alloc<'static>> = Vec::new_in(g);
                             for &(entry_u32, ref item, body, name, chain) in matched.iter() {
-                                let own_key = match &chains {
+                                own_keys_buf.clear();
+                                let own_keys = match &chains {
                                     Err(_) => Err("its file's bodies could not be indexed by their outline entries (front2 project_records.rs `index_outlined_by_chain`)"),
-                                    Ok(by) => match if body { by.get(file, chain) } else { None } {
-                                        None => Ok(None),
-                                        Some(listed) => match crate::body_types::covered::body_key(records, listed) {
-                                            Some(key) => Ok(Some(key)),
-                                            None => Err("a member the records list has no key of its own"),
-                                        },
-                                    },
+                                    Ok(by) => {
+                                        let mut missing = false;
+                                        if body {
+                                            for listed in by.all(file, chain) {
+                                                match crate::body_types::covered::body_key(records, listed) {
+                                                    Some(key) => own_keys_buf.push(key),
+                                                    None => {
+                                                        missing = true;
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if missing {
+                                            Err("a member the records list has no key of its own")
+                                        } else {
+                                            Ok(own_keys_buf.as_slice())
+                                        }
+                                    }
                                 };
-                                push_entry(entry_u32, item, body, name, chain, text, own_key, view.len(), &parent_item, &item_len, &eval_attrs);
+                                push_entry(entry_u32, item, body, name, chain, text, own_keys, view.len(), &parent_item, &item_len, file_cfg, &eval_attrs);
                             }
                             true
                         } else {
@@ -6624,11 +6654,16 @@ impl<'f> BodiesStage<'f> {
                                 let parent_item = |p: blaze_surface::ItemIndex| usize::try_from(p.0).ok().and_then(|i| outline.items().get(i)).copied();
                                 let item_len = |idx: blaze_surface::ItemIndex| usize::try_from(idx.0).ok().and_then(|i| outline.items().get(i)).map_or(0, |e| e.range.len());
                                 let cfg_ref = cfg.as_ref();
+                                let file_cfg = cfg_ref.map(|cfg| {
+                                    let attrs = blaze_scope::task::file_attrs(cfg, outline, text, g);
+                                    (attrs.cfg_unread, attrs.cfg_ok)
+                                });
                                 let eval_attrs = |entry_item: &blaze_surface::Item, alloc: blaze_own::Alloc<'static>| {
                                     let cfg = cfg_ref?;
                                     let attrs = blaze_scope::task::item_attrs(cfg, outline, entry_item, text, alloc);
                                     Some((attrs.cfg_unread, attrs.cfg_ok))
                                 };
+                                let mut own_keys_buf: Vec<ItemKey, blaze_own::Alloc<'static>> = Vec::new_in(g);
                                 for (entry, item) in outline.items().iter().enumerate() {
                                     let body = work::checked_body(outline, item).is_some();
                                     if !body && !work::expansion_entry(outline, item, text) {
@@ -6649,17 +6684,30 @@ impl<'f> BodiesStage<'f> {
                                     if entered.binary_search(&at_view(name, own_view)).is_err() {
                                         continue;
                                     }
-                                    let own_key = match &chains {
+                                    own_keys_buf.clear();
+                                    let own_keys = match &chains {
                                         Err(_) => Err("its file's bodies could not be indexed by their outline entries (front2 project_records.rs `index_outlined_by_chain`)"),
-                                        Ok(by) => match if body { by.get(file, chain) } else { None } {
-                                            None => Ok(None),
-                                            Some(listed) => match crate::body_types::covered::body_key(records, listed) {
-                                                Some(key) => Ok(Some(key)),
-                                                None => Err("a member the records list has no key of its own"),
-                                            },
-                                        },
+                                        Ok(by) => {
+                                            let mut missing = false;
+                                            if body {
+                                                for listed in by.all(file, chain) {
+                                                    match crate::body_types::covered::body_key(records, listed) {
+                                                        Some(key) => own_keys_buf.push(key),
+                                                        None => {
+                                                            missing = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if missing {
+                                                Err("a member the records list has no key of its own")
+                                            } else {
+                                                Ok(own_keys_buf.as_slice())
+                                            }
+                                        }
                                     };
-                                    push_entry(u32::try_from(entry).unwrap_or(u32::MAX), item, body, name, chain, text, own_key, outline.items().len(), &parent_item, &item_len, &eval_attrs);
+                                    push_entry(u32::try_from(entry).unwrap_or(u32::MAX), item, body, name, chain, text, own_keys, outline.items().len(), &parent_item, &item_len, file_cfg, &eval_attrs);
                                 }
                             })
                         }
@@ -8894,8 +8942,12 @@ fn run_stretch_with<'d, 's, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
                                                 })
                                             })
                                     });
-                                    if !dup_block {
+                                    let dup_exact = one.items.len() > 1
+                                        && found.iter().any(|prev| prev.rule == one_found.rule && prev.at == one_found.at && prev.message == one_found.message);
+                                    if !dup_block && !dup_exact {
                                         found.push(one_found);
+                                    } else {
+                                        findings = findings.saturating_sub(1);
                                     }
                                 }
                                 Ok(None) => {}
@@ -9586,10 +9638,23 @@ fn absent_entry_with<'n>(
     root_file: bool,
     max_steps: usize,
     parent_item: impl Fn(blaze_surface::ItemIndex) -> Option<blaze_surface::Item>,
+    file_cfg: Option<(u32, bool)>,
     eval_attrs: impl Fn(&blaze_surface::Item, blaze_own::Alloc<'static>) -> Option<(u32, bool)>,
     g: blaze_own::Alloc<'static>,
 ) -> Result<ItemKey, &'static str> {
     if planted_silent_absent() {
+        return Err(crate::engine_body_plan::ENTRY_ABSENT);
+    }
+    // Check file-level inner `#![cfg(...)]` attributes first (e.g. `#![cfg(target_os = "linux")]`
+    // in `symbols.rs` declared via an unconditional `pub mod symbols;`): a false file-level cfg
+    // cuts every entry in the file cleanly as `ENTRY_ABSENT`.
+    let Some((file_unread, file_ok)) = file_cfg else {
+        return Err(CFG_ATOMS_UNREAD);
+    };
+    if file_unread > 0 {
+        return Err(CFG_UNREAD);
+    }
+    if !file_ok {
         return Err(crate::engine_body_plan::ENTRY_ABSENT);
     }
     // Up the parents, bounded by the outline's length (rule 18).

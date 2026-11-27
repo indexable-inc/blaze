@@ -50,6 +50,12 @@ runs:
         export PATH="$bin:$PATH"
         echo "$bin" >> "$GITHUB_PATH"
         version="$(tr -d '[:space:]' < .github/blaze-cli-version)"
+        blaze_home="${BLAZE_HOME:-$HOME/.blaze}"
+        export BLAZE_HOME="$blaze_home"
+        pinned_toolchain=""
+        if [ -f crates/blaze-toolchain/PINNED ]; then
+          pinned_toolchain="$(tr -d '[:space:]' < crates/blaze-toolchain/PINNED)"
+        fi
 
         have=""
         if [ -x "$bin/blaze" ]; then
@@ -59,6 +65,8 @@ runs:
         if [ "$have" != "$version" ]; then
           need_install=true
         elif [ "$REQUIRE_LAUNCHER" = "true" ] && [ ! -x "$bin/blaze-launcher" ]; then
+          need_install=true
+        elif [ -n "$pinned_toolchain" ] && [ ! -f "$blaze_home/v2/toolchain/$pinned_toolchain" ]; then
           need_install=true
         fi
         if [ "$need_install" = "true" ]; then
@@ -79,13 +87,46 @@ runs:
         blaze --version
 
         # Persistent v2 home store on warm ix runners (snapshot preserves $HOME/.blaze/v2 across jobs).
-        echo "BLAZE_HOME=$HOME/.blaze" >> "$GITHUB_ENV"
+        echo "BLAZE_HOME=$blaze_home" >> "$GITHUB_ENV"
         if [ "${RUNNER_ENVIRONMENT:-}" = self-hosted ]; then
           echo "BLAZE_STORE_MAX_GB=200" >> "$GITHUB_ENV"
         else
           echo "BLAZE_STORE_MAX_GB=0" >> "$GITHUB_ENV"
         fi
-        mkdir -p "$HOME/.blaze/v2"
+        mkdir -p "$blaze_home/v2"
+
+    # Pinned clang-23 shelf for Linux ARM64 deferred C tasks and clang probes (pins/clang.json).
+    # Cached under $BLAZE_HOME/v2/toolchain/clang/<sha256> across warm ix runner snapshots.
+    - name: ensure Linux ARM64 clang shelf (pins/clang.json)
+      if: runner.os == 'Linux' && runner.arch == 'ARM64'
+      shell: bash
+      run: |
+        set -euo pipefail
+        shelf_sha="9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91"
+        shelf_root="${BLAZE_HOME:-$HOME/.blaze}/v2/toolchain/clang"
+        shelf_dir="$shelf_root/$shelf_sha"
+        if [ ! -x "$shelf_dir/bin/clang-23" ] || [ ! -d "$shelf_dir/lib/clang/23" ]; then
+          mkdir -p "$shelf_root"
+          archive="$shelf_root/$shelf_sha.tar.xz"
+          timeout -k 30 600 curl --proto '=https' --tlsv1.2 -fsSL --retry 3 \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/LLVM-23.1.4-Linux-ARM64.tar.xz" \
+            -o "$archive.part"
+          echo "$shelf_sha  $archive.part" | sha256sum -c -
+          mv -f "$archive.part" "$archive"
+          stage="$shelf_dir.stage.$$"
+          rm -rf "$stage" && mkdir -p "$stage"
+          timeout -k 30 300 tar -xJf "$archive" -C "$stage" --strip-components=1 \
+            LLVM-23.1.4-Linux-ARM64/bin/clang \
+            LLVM-23.1.4-Linux-ARM64/bin/clang++ \
+            LLVM-23.1.4-Linux-ARM64/bin/clang-23 \
+            LLVM-23.1.4-Linux-ARM64/bin/lld \
+            LLVM-23.1.4-Linux-ARM64/bin/ld.lld \
+            LLVM-23.1.4-Linux-ARM64/bin/llvm-ar \
+            LLVM-23.1.4-Linux-ARM64/bin/llvm-nm \
+            LLVM-23.1.4-Linux-ARM64/lib/clang
+          rm -rf "$shelf_dir" && mv "$stage" "$shelf_dir"
+          rm -f "$archive"
+        fi
 
     - name: warm toolchain records
       if: inputs.warm-toolchain == 'true'

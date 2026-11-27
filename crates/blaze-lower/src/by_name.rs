@@ -13,7 +13,7 @@
 
 use blaze_expand::{
     BuiltinDerive, BuiltinFn, Call, CallSite, Ctx, DefAt, DefSite, Delim, DeriveFacts, Eager, ExpandCx, Expanded, Export, Hole, HoleOf, Inside, LitKind, LocalInner,
-    LexError, MacroDefinition, NestedCall, NestedKind, PathScope, Place, PlaceOf, Prepared, ProcKind, Raw, ReadAnswer, ReadKind, Reads, Spacing, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
+    LexError, MacroDefinition, NestedCall, NestedKind, Place, PlaceOf, Prepared, ProcKind, Raw, ReadAnswer, ReadKind, Reads, Spacing, StreamError, TokenKind, TokenStream, call_key, expand, expand_prepared, lex, prepare,
 };
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Vec};
@@ -63,15 +63,19 @@ pub trait MacroNames<'d> {
 /// Whether a call's `path` (as written, or an expansion's words with spaces) is read at the
 /// call site by the Reference's rules ("Macros By Example", "Hygiene": `macro_rules!` "have
 /// mixed-site hygiene ... other symbols are looked up at the macro invocation site"). It is
-/// read there unless it starts at a root (`::`, `crate`, `$crate`, `self`, `super`, `Self`) or
-/// its first word has an opaque (def-site) mark.
+/// read there unless it starts at a root (`::`, `crate`, `$crate`, `self`, `super`, `Self`),
+/// its first word has an opaque (def-site) mark, or it is a single-segment bare call carrying
+/// a `#[macro_export(local_inner_macros)]` mark.
 pub fn call_site_path(path: &str, mark: Option<crate::mark_site::TextMark>) -> bool {
     let absolute = path.trim_start().starts_with(':');
-    let first = path.split(|c: char| c == ':' || c.is_whitespace()).find(|s| !s.is_empty()).unwrap_or("");
+    let mut parts = path.split(|c: char| c == ':' || c.is_whitespace()).filter(|s| !s.is_empty());
+    let first = parts.next().unwrap_or("");
+    let segment_count = if first.is_empty() { 0 } else { 1 + parts.count() };
     !absolute
         && !first.is_empty()
         && !matches!(first, "$crate" | "crate" | "self" | "super" | "Self" | "{{root}}" | "<qualified>")
         && !mark.is_some_and(|m| m.transparency == blaze_expand::Transparency::Opaque)
+        && crate::mark_site::local_inner_crate(mark, first, segment_count, absolute).is_none()
 }
 
 /// Why a call's path names no macro.
@@ -610,7 +614,9 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         let written = at.written.map(|range| range.start).or(written);
         let panic_edition = at.mark.map_or(edition, |mark| mark.edition);
         let site = CallSite { edition, panic_edition, ctx: Ctx::root(edition) };
-        let resolved = match self.local(path, locals, edition) {
+        let def_site_only = at.mark.is_some_and(|m| m.transparency == blaze_expand::Transparency::Opaque)
+            || crate::mark_site::local_inner_crate(at.mark, path.trim(), 1, false).is_some();
+        let resolved = match if def_site_only { None } else { self.local(path, locals, edition) } {
             Some(def) => Resolved::Def(def?),
             None => self.resolve(path, at, ProcKind::FnLike).map_err(Refused::Unknown)?,
         };
@@ -730,14 +736,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                             if current.depth >= EAGER_DEPTH {
                                 return Err(Refused::Failed(Failure::EagerAgain { depth: current.depth }));
                             }
-                            let def_crate = exp.nested.iter().any(|c| {
-                                c.scope == PathScope::DefCrate
-                                    && usize::try_from(c.path.start).ok() == Some(next_call.path.0)
-                            });
                             let mut next_path = AString::new_in(self.alloc);
-                            if def_crate {
-                                next_path.push_str("$crate::");
-                            }
                             push_path_text(&tokens, next_call.path.0, next_call.path.1, &mut next_path);
                             let next_args = tokens
                                 .copy_in(next_call.open + 1..next_call.close, self.alloc)
@@ -1131,7 +1130,8 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         // block around it, which may be a block that expansion wrote (`PathAt::block`).
         // A body's own `macro_rules!` of a one-word path is in textual scope first (`call`'s
         // `local`), and no block is read for it.
-        let local = call.locals.iter().any(|l| l.name == call.path.trim());
+        let local = !at.mark.is_some_and(|m| m.local_inner || m.transparency == blaze_expand::Transparency::Opaque)
+            && call.locals.iter().any(|l| l.name == call.path.trim());
         if !local && call.range.start >= call.expansions.item_len && call_site_path(call.path, at.mark) {
             let block = match &self.names {
                 Names::Lists(_) => Ok(None),

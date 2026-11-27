@@ -3357,6 +3357,8 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
     }
     let mut walk: AVec<'a, tc::PTy> = AVec::new_in(alloc);
     let mut found: AVec<'a, u128> = AVec::new_in(alloc);
+    let mut traits_found: AVec<'a, u128> = AVec::new_in(alloc);
+    let mut traits_seen: AVec<'a, u128> = AVec::new_in(alloc);
     while let Some(k) = todo.pop() {
         let key = tc::ItemKey(k);
         let mut unmade = AdtUnmade::NoRow;
@@ -3371,6 +3373,7 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
             }
         }
         found.clear();
+        traits_found.clear();
         {
             let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(key) else {
                 if let Ok(at) = seen.binary_search_by_key(&k, |&(s, _)| s) {
@@ -3378,8 +3381,10 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
                 }
                 continue;
             };
-            // A lang ADT's variances are fixed: its fields are not read.
-            if lang_of(key) != AdtLang::Plain {
+            // A lang ADT's variances are fixed, and a 0-parameter ADT has empty variances
+            // and can induce no outlives requirement on any caller parameter: neither walks
+            // its fields.
+            if lang_of(key) != AdtLang::Plain || (row.lifetimes == 0 && row.generics == 0) {
                 continue;
             }
             let tys = r.store.tys.view();
@@ -3393,8 +3398,12 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
                     }
                     budget -= 1;
                     let Ok(node) = tys.node(t) else { continue };
-                    if let tc::PNode::Adt(a, _) = node {
-                        found.push(a.0);
+                    match node {
+                        tc::PNode::Adt(a, _) => found.push(a.0),
+                        tc::PNode::ExTrait(tr, _) | tc::PNode::ExProj { trait_: tr, .. } | tc::PNode::Alias { trait_: tr, .. } => {
+                            traits_found.push(tr.0);
+                        }
+                        _ => {}
                     }
                     // A type the walk cannot read is the lay's refusal, by name, below.
                     if let Ok((list, last)) = children(tys, t, node) {
@@ -3403,6 +3412,17 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
                             walk.push(c);
                         }
                     }
+                }
+            }
+        }
+        for &tr in traits_found.iter() {
+            if let Err(at) = traits_seen.binary_search(&tr) {
+                traits_seen.insert(at, tr);
+                let tr_key = tc::ItemKey(tr);
+                if !r.store.maps.trait_lifetimes.contains_key(&tr_key)
+                    && let Some(lib) = r.keys.library_in(r.names, tr_key)
+                {
+                    let _ = ensure_why(r, Want::Head(lib));
                 }
             }
         }
@@ -3432,7 +3452,7 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
         };
         let lang = lang_of(key);
         input.adt(k, lang, row.lifetimes, row.generics);
-        if lang != AdtLang::Plain {
+        if lang != AdtLang::Plain || (row.lifetimes == 0 && row.generics == 0) {
             continue;
         }
         for (vi, v) in row.variants.iter().enumerate() {
@@ -6157,7 +6177,8 @@ fn main() {}
         let heap = blaze_own::testing::heap();
         let alloc = heap.alloc();
         let home = std::env::var("HOME").expect("HOME is set");
-        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let shelf = blaze_own::format_in!(alloc, "{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.as_str().into())).expect("installed toolchain");
         let files = [("/w6sound/src/main.rs".to_string(), SOURCE.to_string())];
         let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
         let user = UserCrate { name: "w6sound", dir: "/w6sound/", root: "/w6sound/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
@@ -6476,18 +6497,23 @@ fn main() {}
 "#;
 
         let check_crate = |crate_name: &str, ed_str: &str, source: &str, positives: &[&str], negatives: &[&str]| {
+            use core::fmt::Write as _;
             let heap = blaze_own::testing::heap();
             let alloc = heap.alloc();
             let home = std::env::var("HOME").expect("HOME is set");
-            let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
-            let root_path = std::format!("/{crate_name}/src/main.rs");
-            let dir_path = std::format!("/{crate_name}/");
-            let files = [(root_path.clone(), source.to_string())];
+            let mut tc_path = blaze_own::AString::new_in(alloc);
+            let _ = write!(tc_path, "{home}/.blaze/v2/toolchain");
+            let tc = Toolchain::open(&mut DirShelf::new(tc_path.as_str().into())).expect("installed toolchain");
+            let mut root_path = blaze_own::AString::new_in(alloc);
+            let _ = write!(root_path, "/{crate_name}/src/main.rs");
+            let mut dir_path = blaze_own::AString::new_in(alloc);
+            let _ = write!(dir_path, "/{crate_name}/");
+            let files = [(root_path.as_str().into(), source.into())];
             let edition = edition::PackageEdition::of_manifest(ed_str).expect("valid edition");
             let user = UserCrate {
                 name: crate_name,
-                dir: &dir_path,
-                root: &root_path,
+                dir: dir_path.as_str(),
+                root: root_path.as_str(),
                 files: &files,
                 edition,
                 panic: blaze_build::Panic::Unwind,
@@ -6559,5 +6585,503 @@ fn main() {}
                 "if_let_local_guard_in_then_bad_2021",
             ],
         );
+    }
+}
+
+/// End-to-end `front2` + `blaze-flow-lower` + `blaze-flow::check` regression & soundness tests
+/// for the workspace `CalleeValueUnknown` shapes:
+/// 1. `scripts/src/bin/ambient/{heap,reach}.rs`: `|pick: fn(&(Vec<u32>, Vec<u32>)) -> &Vec<u32>|`
+///    (shared `WrittenRegion::Late(0)` on input 0 & output), with a borrow-conflict negative.
+/// 2. `crates/blaze-emit/src/sota/isel.rs`: `|make: fn(&mut Builder<Alloc<'static>, Full>, u32) -> u32|`
+///    (`WrittenRegion::Static` on nested ADT lifetime), with a local-borrow negative.
+/// 3. `crates/blaze-own/src/tests/shapes.rs`: `written(|put| write_with(&mut |s| put(s)))`
+///    (unannotated closure param recovering `&mut dyn FnMut(&str)` from `written`'s `FnOnce` clause).
+/// 4. `crates/blaze-ids/src/crc32c.rs`: `for (_name, path) in paths() { path(0, b"123"); }`
+///    (desugared `for`-loop tracing `Iterator::next(&mut iter)` -> `IntoIterator::into_iter(paths())`).
+#[cfg(test)]
+mod callee_value_end_to_end_tests {
+    use blaze_id::{ContentId, CrateItemKey};
+    use blaze_scope::graph::Sysroot;
+    use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+    use blaze_scope::task::Serial;
+    use blaze_surface::Edition;
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"#![no_core]
+
+#[lang = "sized"]
+pub trait Sized {}
+#[lang = "copy"]
+pub trait Copy {}
+#[lang = "pointee_sized"]
+pub trait PointeeSized {}
+#[lang = "meta_sized"]
+pub trait MetaSized: PointeeSized {}
+#[lang = "unsize"]
+pub trait Unsize<T: ?Sized> {}
+#[lang = "coerce_unsized"]
+pub trait CoerceUnsized<T: ?Sized> {}
+impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a mut U> for &'a mut T {}
+impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'a T {}
+#[lang = "fn_once"]
+pub trait FnOnce<Args: Tuple> {
+    #[lang = "fn_once_output"]
+    type Output;
+    extern "rust-call" fn call_once(self, args: Args) -> Self::Output;
+}
+#[lang = "fn_mut"]
+pub trait FnMut<Args: Tuple>: FnOnce<Args> {
+    extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;
+}
+#[lang = "fn"]
+pub trait Fn<Args: Tuple>: FnMut<Args> {
+    extern "rust-call" fn call(&self, args: Args) -> Self::Output;
+}
+#[lang = "tuple_trait"]
+pub trait Tuple {}
+#[lang = "Option"]
+pub enum Option<T> {
+    #[lang = "None"]
+    None,
+    #[lang = "Some"]
+    Some(T),
+}
+pub trait Iterator {
+    type Item;
+    #[lang = "next"]
+    fn next(&mut self) -> Option<Self::Item>;
+}
+pub trait IntoIterator {
+    type Item;
+    type IntoIter: Iterator<Item = Self::Item>;
+    #[lang = "into_iter"]
+    fn into_iter(self) -> Self::IntoIter;
+}
+pub struct List<T>(T);
+pub struct ListIter<T>(Option<T>);
+impl<T> Iterator for ListIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        Option::None
+    }
+}
+impl<T> IntoIterator for List<T> {
+    type Item = T;
+    type IntoIter = ListIter<T>;
+    fn into_iter(self) -> ListIter<T> {
+        ListIter(Option::Some(self.0))
+    }
+}
+
+struct Bag(u32);
+struct Alloc<'a>(&'a u8);
+struct Full;
+struct Builder<A, M>(A, M);
+
+fn tally(b: &Bag) -> u32 {
+    b.0
+}
+
+fn mutate(b: &mut Bag) {
+    b.0 = 9;
+}
+
+fn ambient_pick_ok(pair: &(Bag, Bag)) -> u32 {
+    let totals = |pick: fn(&(Bag, Bag)) -> &Bag| -> u32 {
+        tally(pick(pair))
+    };
+    totals(|p| &p.0)
+}
+
+fn ambient_pick_conflict_bad() -> u32 {
+    let run = |pick: fn(&(Bag, Bag)) -> &Bag| -> u32 {
+        let mut pair = (Bag(1), Bag(2));
+        let r = pick(&pair);
+        mutate(&mut pair.0);
+        tally(r)
+    };
+    run(|p| &p.0)
+}
+
+fn isel_static_arg_ok(b: &mut Builder<Alloc<'static>, Full>) -> u32 {
+    let run = |make: fn(&mut Builder<Alloc<'static>, Full>, u32) -> u32| -> u32 {
+        make(b, 7)
+    };
+    run(|_b, v| v)
+}
+
+fn isel_static_arg_local_bad() -> u32 {
+    let local = 5u8;
+    let mut b = Builder(Alloc(&local), Full);
+    let run = |make: fn(&mut Builder<Alloc<'static>, Full>, u32) -> u32| -> u32 {
+        make(&mut b, 7)
+    };
+    run(|_b, v| v)
+}
+
+fn written(write: impl FnOnce(&mut dyn FnMut(&str))) {
+    let _ = write;
+}
+
+fn write_with(sink: &mut dyn FnMut(&str)) {
+    sink("ok");
+}
+
+fn shapes_written_ok() {
+    written(|put| write_with(&mut |s| put(s)));
+}
+
+fn step_a(acc: u32, _bytes: &[u8]) -> u32 {
+    acc
+}
+
+fn paths() -> List<(&'static str, fn(u32, &[u8]) -> u32)> {
+    List(("a", step_a))
+}
+
+fn crc_for_loop_ok() -> u32 {
+    let mut total = 0u32;
+    for (_name, path) in paths() {
+        total = path(total, b"123456789");
+    }
+    total
+}
+"#;
+
+    struct OneFile<'a>(&'a str);
+    impl<'a> SourceTexts<'a> for OneFile<'a> {
+        fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+            (krate == 0 && path == "/cval/src/lib.rs").then_some(self.0)
+        }
+    }
+
+    #[test]
+    fn callee_value_workspace_patterns_end_to_end() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let input = CrateInput {
+            name: "cval",
+            key: CrateItemKey(ContentId::of("callee_value_e2e_test", b"cval")),
+            root: "/cval/src/lib.rs",
+            shown_from: "/cval/",
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let names = resolve_crates(&[input], Sysroot::default(), &OneFile(SOURCE), &Serial, erased.bump()).expect("resolve");
+        let sources = [SourceFile { path: "src/lib.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let item = |fn_name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(fn_name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture fn {fn_name}"))
+        };
+
+        for name in ["ambient_pick_ok", "isel_static_arg_ok", "shapes_written_ok", "crc_for_loop_ok"] {
+            let (types, borrows) = world.check_borrows(item(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        for bad in ["ambient_pick_conflict_bad", "isel_static_arg_local_bad"] {
+            let (types, borrows) = world.check_borrows(item(bad), alloc);
+            assert!(types.is_clean(), "{bad} types: {types:?}");
+            assert!(borrows.refused.is_none(), "{bad} must not refuse: {borrows:?}");
+            assert!(!borrows.findings.is_empty(), "{bad} must report a borrow/lifetime error: {borrows:?}");
+        }
+    }
+}
+
+/// RFC 1156 ("Default trait object lifetimes"): parameterized `Self: 'a` superbounds (direct,
+/// `where Self: 'a`, and transitive through supertraits) decide `dyn Trait<'a>`'s default object
+/// lifetime instead of falling back to `'static` (bare) or the enclosing reference lifetime.
+#[cfg(test)]
+mod rfc1156_dyn_lifetime_default_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::borrows::BorrowRefused;
+    use crate::front2::head_record::Unlaid;
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+#![feature(trait_alias)]
+
+trait AnyLt<'a>: 'a {
+    fn tag(&self) -> u8;
+}
+
+impl<'a> dyn AnyLt<'a> {
+    fn downcast_ref(&self) -> &() {
+        &()
+    }
+    fn as_lt(&self) -> &'a () {
+        &()
+    }
+}
+
+struct S<'a, 'e> {
+    extra: &'a dyn AnyLt<'e>,
+}
+
+fn pos1_downcast<'a, 'e>(s: &S<'a, 'e>) -> &'a () {
+    s.extra.downcast_ref()
+}
+
+fn pos1_as_lt<'a, 'e>(s: &S<'a, 'e>) -> &'e () {
+    s.extra.as_lt()
+}
+
+trait Sub<'x>: AnyLt<'x> {}
+impl<'x> dyn Sub<'x> {
+    fn probe(&self) -> &'x () {
+        &()
+    }
+}
+
+fn pos2_sub<'a, 'x>(s: &'a dyn Sub<'x>) -> &'x () {
+    s.probe()
+}
+
+trait Mid<'x, 'y>: AnyLt<'y> {}
+trait Leaf<'z>: Mid<'static, 'z> {}
+impl<'z> dyn Leaf<'z> {
+    fn leaf_probe(&self) -> &'z () {
+        &()
+    }
+}
+
+fn pos2_leaf<'a, 'z>(s: &'a dyn Leaf<'z>) -> &'z () {
+    s.leaf_probe()
+}
+
+trait WhereLt<'a>
+where
+    Self: 'a,
+{
+    fn ping(&self) -> u8;
+}
+
+impl<'a> dyn WhereLt<'a> {
+    fn check(&self) -> &'a () {
+        &()
+    }
+}
+
+fn pos3_where_self<'a, 'e>(x: &'a dyn WhereLt<'e>) -> &'e () {
+    x.check()
+}
+
+trait A<'a>: 'a {}
+trait B<'a>: 'a {}
+trait BothSame<'a>: A<'a> + B<'a> + 'a {}
+impl<'a> dyn BothSame<'a> {
+    fn ok(&self) -> &'a () {
+        &()
+    }
+}
+
+fn pos4_same_bound<'a, 'e>(x: &'a dyn BothSame<'e>) -> &'e () {
+    x.ok()
+}
+
+fn pos4_explicit_static<'a>(x: &'a (dyn A<'static> + 'static)) -> &'static () {
+    let _ = x;
+    &()
+}
+
+trait Plain<'a> {}
+impl<'a> dyn Plain<'a> {
+    fn f(&self) {}
+}
+
+fn neg1_plain_requires_static<'a, 'b>(x: &'b dyn Plain<'a>) {
+    x.f();
+}
+
+trait Two<'a, 'b>: 'a + 'b {}
+
+fn neg2_ambiguous<'a, 'b>(x: &'a dyn Two<'a, 'b>) {
+    let _ = x;
+}
+
+fn pos5_two_explicit<'a, 'b>(x: &'a (dyn Two<'a, 'b> + 'static)) {
+    let _ = x;
+}
+
+trait TwoTrans<'a, 'b>: A<'a> + B<'b> {}
+
+fn neg3_transitive_ambiguous<'a, 'b>(x: &'a dyn TwoTrans<'a, 'b>) {
+    let _ = x;
+}
+
+// Positive 6: Per the Rust Reference, any derived `'static` bound takes precedence over other
+// lifetime bounds regardless of order (including absorbing otherwise-ambiguous supertrait bounds).
+trait StaticAndLt<'a>: 'static + 'a {}
+trait LtAndStatic<'a>: 'a + 'static {}
+trait StaticSuper: 'static {}
+trait StaticSub<'a, 'b>: A<'a> + B<'b> + 'static {}
+trait TransStaticLast<'a, 'b>: A<'a> + B<'b> + StaticSuper {}
+
+fn take_static_and_lt<'a, 'r>(_: &'r (dyn StaticAndLt<'a> + 'static)) {}
+fn take_lt_and_static<'a, 'r>(_: &'r (dyn LtAndStatic<'a> + 'static)) {}
+fn take_static_sub<'a, 'b, 'r>(_: &'r (dyn StaticSub<'a, 'b> + 'static)) {}
+fn take_trans_static_last<'a, 'b, 'r>(_: &'r (dyn TransStaticLast<'a, 'b> + 'static)) {}
+
+fn pos6_static_precedence<'a, 'b, 'r>(
+    x: &'r dyn StaticAndLt<'a>,
+    y: &'r dyn LtAndStatic<'a>,
+    z: &'r dyn StaticSub<'a, 'b>,
+    w: &'r dyn TransStaticLast<'a, 'b>,
+) {
+    take_static_and_lt(x);
+    take_lt_and_static(y);
+    take_static_sub(z);
+    take_trans_static_last(w);
+}
+
+// Positive 7: Parameterized trait aliases (direct, swapped params, and chained) preserve lifetime
+// substitutions through supertraits.
+trait AliasLt<'a> = AnyLt<'a>;
+trait SubAlias<'e>: AliasLt<'e> {}
+impl<'e> dyn SubAlias<'e> {
+    fn alias_probe(&self) -> &'e () {
+        &()
+    }
+}
+
+trait Flip<'x, 'y> = AnyLt<'y>;
+trait SubFlip<'a, 'b>: Flip<'a, 'b> {}
+impl<'a, 'b> dyn SubFlip<'a, 'b> {
+    fn flip_probe(&self) -> &'b () {
+        &()
+    }
+}
+
+trait Chained<'z> = Flip<'static, 'z>;
+trait SubChained<'e>: Chained<'e> {}
+impl<'e> dyn SubChained<'e> {
+    fn chained_probe(&self) -> &'e () {
+        &()
+    }
+}
+
+fn pos7_trait_alias<'a, 'e>(x: &'a dyn SubAlias<'e>) -> &'e () {
+    x.alias_probe()
+}
+
+fn pos7_trait_alias_flip<'r, 'a, 'b>(x: &'r dyn SubFlip<'a, 'b>) -> &'b () {
+    x.flip_probe()
+}
+
+fn pos7_trait_alias_chained<'r, 'e>(x: &'r dyn SubChained<'e>) -> &'e () {
+    x.chained_probe()
+}
+
+// Positive 8: Direct trait alias as the object bound (`&'r dyn AliasLt<'e>`, `&'r dyn Flip<'a, 'b>`,
+// `impl<'a> dyn AliasLt<'a>`).
+impl<'a> dyn AliasLt<'a> {
+    fn direct_alias_method(&self) -> &'a () {
+        &()
+    }
+}
+
+fn pos8_direct_alias<'r, 'e>(x: &'r dyn AliasLt<'e>) -> &'e () {
+    let _ = x.as_lt();
+    x.direct_alias_method()
+}
+
+fn pos8_direct_flip<'r, 'a, 'b>(x: &'r dyn Flip<'a, 'b>) -> &'b () {
+    x.as_lt()
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn rfc1156_default_trait_object_lifetimes_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = blaze_own::format_in!(alloc, "{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.as_str().into())).expect("installed toolchain");
+        let files = [("/rfc1156_dyn/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate {
+            name: "rfc1156_dyn",
+            dir: "/rfc1156_dyn/",
+            root: "/rfc1156_dyn/src/main.rs",
+            files: &files,
+            edition,
+            panic: blaze_build::Panic::Unwind,
+        };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let free = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        for name in [
+            "pos1_downcast",
+            "pos1_as_lt",
+            "pos2_sub",
+            "pos2_leaf",
+            "pos3_where_self",
+            "pos4_same_bound",
+            "pos4_explicit_static",
+            "pos5_two_explicit",
+            "pos6_static_precedence",
+            "pos7_trait_alias",
+            "pos7_trait_alias_flip",
+            "pos7_trait_alias_chained",
+            "pos8_direct_alias",
+            "pos8_direct_flip",
+        ] {
+            let (types, borrows) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // Negative 1: `Plain<'a>` has no `: 'a` bound, so `impl<'a> dyn Plain<'a>` still defaults
+        // to `+ 'static` and `x: &'b dyn Plain<'a>` fails with a lifetime/borrow error.
+        let (types, bad) = world.check_borrows(free("neg1_plain_requires_static"), alloc);
+        assert!(types.is_clean(), "neg1_plain_requires_static types: {types:?}");
+        assert!(bad.refused.is_none(), "neg1_plain_requires_static refused: {bad:?}");
+        assert!(!bad.findings.is_empty(), "neg1_plain_requires_static must fail borrowck: {bad:?}");
+
+        // Negative 2 & 3: multiple distinct `Self: 'a + 'b` bounds without an explicit object
+        // lifetime are refused as `Unlaid::ObjectDefault` (ambiguous object lifetime default).
+        for name in ["neg2_ambiguous", "neg3_transitive_ambiguous"] {
+            let (types, bad) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(
+                matches!(bad.refused, Some(BorrowRefused::RegionsUnread { unlaid: Some(Unlaid::ObjectDefault), .. })),
+                "{name} must refuse with Unlaid::ObjectDefault, got: {bad:?}"
+            );
+        }
     }
 }

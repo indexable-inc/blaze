@@ -414,13 +414,13 @@ pub fn is_made(world: ContentId, alloc: Alloc<'static>) -> Result<bool, TestStor
 /// by the crates' names: `Inputs` keeps its own private (TS1.md: `Inputs::sysroot` wanted).
 fn sysroot_of(crates: &[CrateInput<'_>]) -> Sysroot {
     let at = |name: &str| crates.iter().skip(1).position(|c| c.name == name).map(|i| CrateId(i as u32 + 1));
-    Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd").or_else(|| at("blaze_std")) }
+    Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), proc_macro: at("proc_macro"), bstd: at("bstd").or_else(|| at("blaze_std")) }
 }
 
 /// The same sysroot over the toolchain's crates alone (crate 0 dropped).
 fn without_program(sysroot: Sysroot) -> Sysroot {
     let down = |id: Option<CrateId>| id.map(|CrateId(i)| CrateId(i - 1));
-    Sysroot { core: down(sysroot.core), alloc: down(sysroot.alloc), std: down(sysroot.std), bstd: down(sysroot.bstd) }
+    Sysroot { core: down(sysroot.core), alloc: down(sysroot.alloc), std: down(sysroot.std), proc_macro: down(sysroot.proc_macro), bstd: down(sysroot.bstd) }
 }
 
 /// The toolchain's crates alone, crate 0 (the program) dropped and each dependency's index

@@ -163,6 +163,11 @@ pub enum NameCell {
     /// and `NamesSource::cfg_atoms` depend on besides the item's own cfg predicates. Absent when
     /// the crate has no cfg atoms, so adding or editing items in any file never moves it.
     CfgAtoms { krate: [u8; 8] },
+    /// The crate's non-extern function items whose signature head mentions `no_mangle` or
+    /// `export_name` (by key, name, text, `export_name` macro value, and crate cfg atoms): what
+    /// `export_shim::record_search` reads of every crate in scope. Absent for proc-macro crates
+    /// and every crate with no exported functions, so edits in unrelated crates wake no callers.
+    Exports { krate: [u8; 8] },
     /// A module's `macro_rules!` sequence and its `mod` lines' marks in it: what a textual
     /// macro lookup reads of the module, and no other walk; absent for a module the record does
     /// not hold a scope of.
@@ -206,6 +211,7 @@ impl NameCell {
             NameCell::Files { krate } => h.update(&[18]).update(&krate),
             NameCell::Extensions { krate } => h.update(&[19]).update(&krate),
             NameCell::CfgAtoms { krate } => h.update(&[20]).update(&krate),
+            NameCell::Exports { krate } => h.update(&[21]).update(&krate),
         };
         let mut key = [0; 16];
         key.copy_from_slice(&h.finish().0[..16]);
@@ -225,7 +231,8 @@ impl NameCell {
             | NameCell::ImplRows { krate }
             | NameCell::Files { krate }
             | NameCell::Extensions { krate }
-            | NameCell::CfgAtoms { krate } => krate,
+            | NameCell::CfgAtoms { krate }
+            | NameCell::Exports { krate } => krate,
             NameCell::Variants { owner } | NameCell::Members { owner } => owner.crate_prefix(),
             NameCell::Item { key } => key.crate_prefix(),
             NameCell::Expansion { call } => call.crate_prefix(),
@@ -611,6 +618,53 @@ fn cfg_atoms_digest(items: &ItemsRecord<'_>) -> Result<Option<ContentId>, ItemsR
             None => h.update(&[0]),
         };
     }
+    Ok(Some(h.finish()))
+}
+
+/// What `Exports(krate)` holds: `None` (absent) for proc-macro crates and crates with no
+/// non-extern function item whose signature head mentions `no_mangle` or `export_name`; otherwise
+/// the digest of every such function's key, name, text, `export_name` macro value (when present),
+/// and the crate's cfg atoms (covering `#[cfg_attr(..., no_mangle)]`).
+fn exports_digest<'a>(items: &ItemsRecord<'a>, read: ReadText<'_, 'a>) -> Result<Option<ContentId>, ItemsRecordError> {
+    if items.proc_macro() {
+        return Ok(None);
+    }
+    let mut h = Hasher::of(&DIGESTS);
+    h.update(&[21]);
+    let mut count = 0u64;
+    for i in 0..items.items() {
+        let Some(id) = items.identity_at(i)? else { continue };
+        if id.kind != ItemKind::Function || id.foreign.is_some() || !(id.export_no_mangle || id.export_name) {
+            continue;
+        }
+        let Some(row) = items.item_at(i)? else { continue };
+        let Some(span) = row.text else { continue };
+        let text = items.slice(span, read)?;
+        h.id(&row.key.0).std(&row.name).part(text.as_bytes());
+        if let Some(answer) = items.attr_value(row.key, "export_name")? {
+            let (state, val) = match answer {
+                Ok(v) => (0u8, v),
+                Err(w) => (1u8, w),
+            };
+            h.update(&[1, state]).part(val.as_bytes());
+        } else {
+            h.update(&[0]);
+        }
+        count = count.saturating_add(1);
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    let atoms = items.cfg_atoms()?;
+    h.update(&u64::try_from(atoms.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for &(name, value) in atoms {
+        h.part(name.as_bytes());
+        match value {
+            Some(v) => h.update(&[1]).part(v.as_bytes()),
+            None => h.update(&[0]),
+        };
+    }
+    h.update(&count.to_le_bytes());
     Ok(Some(h.finish()))
 }
 
@@ -1000,6 +1054,9 @@ pub fn table<'a, 'b>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<'a>, 
         if let Some(digest) = cfg_atoms_digest(items).map_err(CellsError::Items)? {
             rows.push((NameCell::CfgAtoms { krate }.key(), cell_digest(digest)));
         }
+        if let Some(digest) = exports_digest(items, read).map_err(CellsError::Items)? {
+            rows.push((NameCell::Exports { krate }.key(), cell_digest(digest)));
+        }
     }
     for module in record.modules() {
         if let Some(digest) = module_digest(record, module) {
@@ -1308,6 +1365,8 @@ pub fn seen_by_record<'a>(record: &NamesRecord<'_>, items: Option<(&ItemsRecord<
         NameCell::Extensions { .. } => None,
         NameCell::CfgAtoms { krate } if krate == record.key().prefix() => cfg_atoms_digest(items_of()?).map_err(CellsError::Items)?,
         NameCell::CfgAtoms { .. } => None,
+        NameCell::Exports { krate } if krate == record.key().prefix() => exports_digest(items_of()?, read_of()?).map_err(CellsError::Items)?,
+        NameCell::Exports { .. } => None,
     };
     Ok(out.map(norm_digest))
 }

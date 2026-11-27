@@ -9,9 +9,8 @@
 //! point, where each variant stores the data needed to resume from its corresponding point"
 //! ("Async blocks"): its captures and the values live across an `.await`.
 
-use std::vec::Vec;
-
 use super::{Items, rc_across_await, rc_before_await, world};
+use crate::suite::clauses;
 use crate::body::Capture;
 use crate::diag::{Diag, DiagCode};
 use crate::fixture::{Bb, Fx};
@@ -60,7 +59,7 @@ fn exact(k: &Case, rc: bool) -> (PortableTys<'static>, PTy) {
     let mut out = k.c.types.fork_in(alloc).expect("fork the record's table");
     let none = out.intern_list(&[]).expect("list");
     let ready = out.intern(PNode::Adt(k.fx.key_of("Ready"), none)).expect("Ready");
-    let mut elems: Vec<PTy> = Vec::new();
+    let mut elems = blaze_own::Vec::new_in(alloc);
     if rc {
         elems.push(out.intern(PNode::Adt(k.fx.key_of("Rc"), none)).expect("Rc"));
     }
@@ -70,10 +69,12 @@ fn exact(k: &Case, rc: bool) -> (PortableTys<'static>, PTy) {
     (out, t)
 }
 
-fn decide(k: &Case, out: &PortableTys<'_>, rows: &[(ExprId, PTy)]) -> Result<Vec<Diag>, StalledError> {
+fn decide(k: &Case, out: &PortableTys<'_>, rows: &[(ExprId, PTy)]) -> Result<blaze_own::AVec<'static, Diag>, StalledError> {
     let alloc = blaze_own::testing::heap().alloc();
     let got = decide_stalled(&k.b.view(k.owner, k.root), &k.c, out.view(), rows, &k.fx, alloc)?;
-    Ok(got.iter().copied().collect())
+    let mut out = blaze_own::Vec::with_capacity_in(got.len(), alloc);
+    out.extend_from_slice(&got);
+    Ok(out)
 }
 
 /// `async { let r = make_rc(); ready().await; use_rc(r) }` passed to `spawn<F: Send>`: `r` is
@@ -168,19 +169,24 @@ fn a_stalled_finding_chains_on_the_exact_interior() {
     let w = got.found[0].why.expect("the stalled finding carries its chain");
     let steps = got.why.get(w.start as usize..(w.start + w.len) as usize).expect("the chain's rows in the decision's column");
     let tys = got.types.view();
-    let said: Vec<std::string::String> = steps
-        .iter()
-        .map(|s| match s.goal {
+    let mut said = blaze_own::Vec::with_capacity_in(steps.len(), alloc);
+    for s in steps {
+        use core::fmt::Write as _;
+        let mut line = blaze_own::String::new_in(alloc);
+        match s.goal {
             Some(UnmetGoal::Trait { trait_, args }) => {
-                std::format!("{}: {}", crate::fixture::show(&k.fx, tys, tys.list(args).expect("args")[0]), k.fx.name_of(trait_))
+                let _ = write!(line, "{}: {}", crate::fixture::show(&k.fx, tys, tys.list(args).expect("args")[0]), k.fx.name_of(trait_));
             }
-            other => std::format!("{other:?}"),
-        })
-        .collect();
+            other => {
+                let _ = write!(line, "{other:?}");
+            }
+        }
+        said.push(line);
+    }
     assert_eq!(steps.len(), 3, "{said:?}");
     assert_eq!(steps[0].reached, WhyReached::Root, "{said:?}");
     assert_eq!(steps[1].reached, WhyReached::CoroutineSlot { coroutine: WhyDef::Expr(k.block), slot: 0 }, "{said:?}");
-    assert_eq!(said[1], "Rc: Send", "{said:?}");
+    assert_eq!(said[1].as_str(), "Rc: Send", "{said:?}");
     let imp = k.fx.key_of("impl Send for Rc where Rc: Never");
     assert_eq!(steps[2].reached, WhyReached::ImplClause { impl_: imp, clause: 0 }, "{said:?}");
     assert_eq!(said[2], "Rc: Never", "{said:?}");
@@ -241,10 +247,10 @@ fn stalled_projection_mismatch_emits_e0271_on_exact_replay() {
         fx.unit(),
     );
     let send = fx.key_of("Send");
-    let inner = fx.tr("Inner", 1, Vec::new(), &["Out"]);
+    let inner = fx.tr("Inner", 1, clauses(&[]), &["Out"]);
     let is_send = fx.bound(send, &[p0]);
-    fx.imp("impl<F: Send> Inner for F", 1, p0, Some((inner, &[])), &[("Out", u32_)], std::vec![is_send]);
-    let outer = fx.tr("Outer", 1, Vec::new(), &["Assoc"]);
+    fx.imp("impl<F: Send> Inner for F", 1, p0, Some((inner, &[])), &[("Out", u32_)], clauses(&[is_send]));
+    let outer = fx.tr("Outer", 1, clauses(&[]), &["Assoc"]);
     let wrap = fx.strukt("Wrap", 1, &[("v", p0)]);
     let wrap_p0 = fx.adt(wrap, &[p0]);
     let is_inner = fx.bound(inner, &[p0]);
@@ -255,13 +261,13 @@ fn stalled_projection_mismatch_emits_e0271_on_exact_replay() {
         wrap_p0,
         Some((outer, &[])),
         &[("Assoc", inner_out)],
-        std::vec![is_inner],
+        clauses(&[is_inner]),
     );
-    let wrap_fn = fx.func("wrap", 1, &[p0], wrap_p0, Vec::new());
+    let wrap_fn = fx.func("wrap", 1, &[p0], wrap_p0, clauses(&[]));
     let _ = wrap_fn;
     let is_outer = fx.bound(outer, &[p0]);
     let assoc_is_u64 = fx.proj(outer, &[p0], "Assoc", u64_);
-    fx.func("need_u64", 1, &[p0], unit, std::vec![is_outer, assoc_is_u64]);
+    fx.func("need_u64", 1, &[p0], unit, clauses(&[is_outer, assoc_is_u64]));
     fx.finish();
 
     let mut b = Bb::new();
@@ -300,8 +306,8 @@ fn stalled_projection_mismatch_emits_e0271_on_exact_replay() {
     assert_eq!(d.code, DiagCode::ProjectionMismatch, "expected E0271, got {d:?}");
     assert_eq!(d.name, Some(Name::of("Assoc")), "{d:?}");
     let tys = decided.types.view();
-    assert_eq!(d.found.map(|t| crate::fixture::show(&fx, tys, t)), Some(std::string::String::from("u32")), "{d:?}");
-    assert_eq!(d.expected.map(|t| crate::fixture::show(&fx, tys, t)), Some(std::string::String::from("u64")), "{d:?}");
+    assert_eq!(d.found.map(|t| crate::fixture::show(&fx, tys, t)).as_deref(), Some("u32"), "{d:?}");
+    assert_eq!(d.expected.map(|t| crate::fixture::show(&fx, tys, t)).as_deref(), Some("u64"), "{d:?}");
 
     // Negative twin: exact interior with Rc -> `F: Send` fails, so BOTH `Wrap<F>: Outer` and
     // `<Wrap<F> as Outer>::Assoc == u64` fail as E0277 at the same site; `drop_implied_projections`
@@ -336,22 +342,22 @@ fn non_self_foreign_superset_witness_returns_gap_not_e0277() {
     let sized = fx.key_of("Sized");
     let send = fx.key_of("Send");
     let rc_t = fx.adt(fx.key_of("Rc"), &[]);
-    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, clauses(&[]), &[]);
     let p0_send = fx.bound(send, &[p0]);
-    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], clauses(&[p0_send]));
     // `trait Pair<R> { type Out; }` with `impl<R: SendWrap> Pair<R> for u8 { type Out = u8; }`:
     // `Self` is plain `u8`, while `args[1]` (`R`) carries `(LocalFuture, ForeignFut)`.
-    let pair = fx.tr("Pair", 2, Vec::new(), &["Out"]);
+    let pair = fx.tr("Pair", 2, clauses(&[]), &["Out"]);
     let p1_wrap = fx.bound(send_wrap, &[p1]);
-    fx.imp("impl<R: SendWrap> Pair<R> for u8", 2, u8_, Some((pair, &[p1])), &[("Out", u8_)], std::vec![p1_wrap]);
-    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, Vec::new());
+    fx.imp("impl<R: SendWrap> Pair<R> for u8", 2, u8_, Some((pair, &[p1])), &[("Out", u8_)], clauses(&[p1_wrap]));
+    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, clauses(&[]));
     let foreign_op = fx.opaque_key("ForeignFut");
     let foreign_op_t = fx.ty(PNode::Opaque(foreign_op, crate::ids::List::EMPTY));
     let foreign_sized = fx.bound(sized, &[foreign_op_t]);
-    fx.set_opaque_bounds(foreign_op, std::vec![foreign_sized]);
-    fx.func("make_foreign", 0, &[], foreign_op_t, Vec::new());
+    fx.set_opaque_bounds(foreign_op, clauses(&[foreign_sized]));
+    fx.func("make_foreign", 0, &[], foreign_op_t, clauses(&[]));
     let pair_proj = fx.proj(pair, &[p0, p1], "Out", u8_);
-    fx.func("check_pair", 2, &[p0, p1], unit, std::vec![pair_proj]);
+    fx.func("check_pair", 2, &[p0, p1], unit, clauses(&[pair_proj]));
     fx.finish();
 
     let mut b = Bb::new();
@@ -410,20 +416,20 @@ fn non_self_foreign_superset_witness_returns_gap_not_e0277() {
     let send = fx2.key_of("Send");
     let rc_t = fx2.adt(fx2.key_of("Rc"), &[]);
     let ready_t = fx2.adt(fx2.key_of("Ready"), &[]);
-    let send_wrap = fx2.tr("SendWrap", 1, Vec::new(), &[]);
+    let send_wrap = fx2.tr("SendWrap", 1, clauses(&[]), &[]);
     let p0_send = fx2.bound(send, &[p0]);
-    fx2.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
-    let pair = fx2.tr("Pair", 2, Vec::new(), &[]);
+    fx2.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], clauses(&[p0_send]));
+    let pair = fx2.tr("Pair", 2, clauses(&[]), &[]);
     let p1_wrap = fx2.bound(send_wrap, &[p1]);
-    fx2.imp("impl<R: SendWrap> Pair<R> for u8", 2, u8_, Some((pair, &[p1])), &[], std::vec![p1_wrap]);
-    let foreign_fn2 = fx2.func("foreign_fn2", 0, &[], unit, Vec::new());
+    fx2.imp("impl<R: SendWrap> Pair<R> for u8", 2, u8_, Some((pair, &[p1])), &[], clauses(&[p1_wrap]));
+    let foreign_fn2 = fx2.func("foreign_fn2", 0, &[], unit, clauses(&[]));
     let cor2_t = fx2.ty(PNode::Coroutine { owner: foreign_fn2, ordinal: 0, args: crate::ids::List::EMPTY });
     let exact_foreign = fx2.tuple(&[ready_t]);
     let superset_foreign = fx2.tuple(&[rc_t]);
     fx2.coroutines.push((foreign_fn2, 0, unit, exact_foreign));
-    fx2.func("make_foreign_cor", 0, &[], cor2_t, Vec::new());
+    fx2.func("make_foreign_cor", 0, &[], cor2_t, clauses(&[]));
     let pair_bound = fx2.bound(pair, &[p0, p1]);
-    fx2.func("check_pair2", 2, &[p0, p1], unit, std::vec![pair_bound]);
+    fx2.func("check_pair2", 2, &[p0, p1], unit, clauses(&[pair_bound]));
     fx2.finish();
 
     let mut b2 = Bb::new();
@@ -483,22 +489,22 @@ fn ordinary_two_arg_trait_with_dyn_send_does_not_run_unsize_storage() {
     let (mut fx, it) = world();
     let (p0, p1, unit) = (fx.param(0), fx.param(1), fx.unit());
     let send = fx.key_of("Send");
-    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, clauses(&[]), &[]);
     let p0_send = fx.bound(send, &[p0]);
-    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], clauses(&[p0_send]));
     let holder = fx.strukt("Holder", 1, &[("f", p0)]);
     let holder_p0 = fx.adt(holder, &[p0]);
-    let outer2 = fx.tr("Outer2", 2, Vec::new(), &[]);
+    let outer2 = fx.tr("Outer2", 2, clauses(&[]), &[]);
     let p0_wrap = fx.bound(send_wrap, &[p0]);
-    fx.imp("impl<F: SendWrap, T> Outer2<T> for Holder<F>", 2, holder_p0, Some((outer2, &[p1])), &[], std::vec![p0_wrap]);
-    fx.func("hold", 1, &[p0], holder_p0, Vec::new());
+    fx.imp("impl<F: SendWrap, T> Outer2<T> for Holder<F>", 2, holder_p0, Some((outer2, &[p1])), &[], clauses(&[p0_wrap]));
+    fx.func("hold", 1, &[p0], holder_p0, clauses(&[]));
     let ex_send = fx.ty(PNode::ExAuto(send));
     let dyn_rows = fx.list(&[ex_send]);
     let dyn_send = fx.ty(PNode::Dynamic(dyn_rows));
     let ref_dyn_send = fx.ty(PNode::Ref(crate::ids::Mutbl::Not, dyn_send));
-    fx.func("make_dyn_send", 0, &[], ref_dyn_send, Vec::new());
+    fx.func("make_dyn_send", 0, &[], ref_dyn_send, clauses(&[]));
     let outer2_bound = fx.bound(outer2, &[p0, p1]);
-    fx.func("check_outer2", 2, &[p0, p1], unit, std::vec![outer2_bound]);
+    fx.func("check_outer2", 2, &[p0, p1], unit, clauses(&[outer2_bound]));
     fx.finish();
 
     let mut b = Bb::new();
@@ -552,29 +558,29 @@ fn non_send_future_returning_foreign_superset_emits_e0277() {
     let sized = fx.key_of("Sized");
     let send = fx.key_of("Send");
     let rc_t = fx.adt(fx.key_of("Rc"), &[]);
-    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, clauses(&[]), &[]);
     let p0_send = fx.bound(send, &[p0]);
-    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], clauses(&[p0_send]));
     let holder = fx.strukt("Holder", 1, &[("f", p0)]);
     let holder_p0 = fx.adt(holder, &[p0]);
-    let outer = fx.tr("Outer", 1, Vec::new(), &[]);
+    let outer = fx.tr("Outer", 1, clauses(&[]), &[]);
     let p0_wrap = fx.bound(send_wrap, &[p0]);
-    fx.imp("impl<F: SendWrap> Outer for Holder<F>", 1, holder_p0, Some((outer, &[])), &[], std::vec![p0_wrap]);
-    fx.func("hold", 1, &[p0], holder_p0, Vec::new());
+    fx.imp("impl<F: SendWrap> Outer for Holder<F>", 1, holder_p0, Some((outer, &[])), &[], clauses(&[p0_wrap]));
+    fx.func("hold", 1, &[p0], holder_p0, clauses(&[]));
     let outer_bound = fx.bound(outer, &[p0]);
-    fx.func("check_outer", 1, &[p0], unit, std::vec![outer_bound]);
-    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, Vec::new());
+    fx.func("check_outer", 1, &[p0], unit, clauses(&[outer_bound]));
+    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, clauses(&[]));
     let foreign_op = fx.opaque_key("ForeignOut");
     let foreign_op_t = fx.ty(PNode::Opaque(foreign_op, crate::ids::List::EMPTY));
     let foreign_sized = fx.bound(sized, &[foreign_op_t]);
-    fx.set_opaque_bounds(foreign_op, std::vec![foreign_sized]);
+    fx.set_opaque_bounds(foreign_op, clauses(&[foreign_sized]));
     let cor_t = fx.ty(PNode::Coroutine { owner: foreign_fn, ordinal: 0, args: crate::ids::List::EMPTY });
     let ready_t = fx.adt(fx.key_of("Ready"), &[]);
     let exact_foreign = fx.tuple(&[ready_t]);
     let superset_interior = fx.tuple(&[rc_t]);
     fx.hidden.push((foreign_op, cor_t));
     fx.coroutines.push((foreign_fn, 0, unit, exact_foreign));
-    fx.func("make_foreign", 0, &[], foreign_op_t, Vec::new());
+    fx.func("make_foreign", 0, &[], foreign_op_t, clauses(&[]));
     fx.finish();
 
     // `async { let r = make_rc(); ready().await; use_rc(r); make_foreign() }`
@@ -641,26 +647,26 @@ fn fn_ptr_signature_foreign_superset_witness_returns_gap() {
     let send = fx.key_of("Send");
     let rc_t = fx.adt(fx.key_of("Rc"), &[]);
     let ready_t = fx.adt(fx.key_of("Ready"), &[]);
-    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, clauses(&[]), &[]);
     let p0_send = fx.bound(send, &[p0]);
-    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
-    let output_send = fx.tr("OutputSend", 1, Vec::new(), &[]);
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], clauses(&[p0_send]));
+    let output_send = fx.tr("OutputSend", 1, clauses(&[]), &[]);
     let fn_io = fx.list(&[p0]);
     let fn_ptr_p0 = fx.ty(PNode::FnPtr(fn_io, FnPtrHeader::RUST));
     let p0_wrap = fx.bound(send_wrap, &[p0]);
-    fx.imp("impl<F: SendWrap> OutputSend for fn() -> F", 1, fn_ptr_p0, Some((output_send, &[])), &[], std::vec![p0_wrap]);
-    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, Vec::new());
+    fx.imp("impl<F: SendWrap> OutputSend for fn() -> F", 1, fn_ptr_p0, Some((output_send, &[])), &[], clauses(&[p0_wrap]));
+    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, clauses(&[]));
     let cor_t = fx.ty(PNode::Coroutine { owner: foreign_fn, ordinal: 0, args: crate::ids::List::EMPTY });
     let exact_foreign = fx.tuple(&[ready_t]);
     let superset_foreign = fx.tuple(&[rc_t]);
     fx.coroutines.push((foreign_fn, 0, unit, exact_foreign));
-    fx.func("make_foreign_cor", 0, &[], cor_t, Vec::new());
+    fx.func("make_foreign_cor", 0, &[], cor_t, clauses(&[]));
     let ret_tuple = fx.tuple(&[p0, cor_t]);
     let ret_io = fx.list(&[ret_tuple]);
     let ret_fn_ptr = fx.ty(PNode::FnPtr(ret_io, FnPtrHeader::RUST));
-    fx.func("as_fn_ptr", 1, &[p0], ret_fn_ptr, Vec::new());
+    fx.func("as_fn_ptr", 1, &[p0], ret_fn_ptr, clauses(&[]));
     let out_send_bound = fx.bound(output_send, &[p0]);
-    fx.func("check_out_send", 1, &[p0], unit, std::vec![out_send_bound]);
+    fx.func("check_out_send", 1, &[p0], unit, clauses(&[out_send_bound]));
     fx.finish();
 
     let mut b = Bb::new();
@@ -718,21 +724,21 @@ fn rigid_composite_self_projection_mismatch_emits_e0271() {
     let (p0, p1, u64_, unit) = (fx.param(0), fx.param(1), fx.ty(PNode::Uint(UintTy::U64)), fx.unit());
     let sized = fx.key_of("Sized");
     let send = fx.key_of("Send");
-    let ext = fx.tr("Ext", 1, Vec::new(), &["Out"]);
+    let ext = fx.tr("Ext", 1, clauses(&[]), &["Out"]);
     let ext_out_p0 = fx.alias(ext, "Out", &[p0]);
     let ext_out_sized = fx.bound(sized, &[ext_out_p0]);
-    fx.set_assoc_bounds(ext, "Out", std::vec![ext_out_sized]);
+    fx.set_assoc_bounds(ext, "Out", clauses(&[ext_out_sized]));
     let ref_p0 = fx.ty(PNode::Ref(Mutbl::Not, p0));
     let ref_p0_ext = fx.bound(ext, &[ref_p0]);
     let ref_p0_out = fx.alias(ext, "Out", &[ref_p0]);
     // `trait Inner<U> { type Out; }  impl<F: Send, U> Inner<U> for F { type Out = U; }`
-    let inner = fx.tr("Inner", 2, Vec::new(), &["Out"]);
+    let inner = fx.tr("Inner", 2, clauses(&[]), &["Out"]);
     let p0_send = fx.bound(send, &[p0]);
-    fx.imp("impl<F: Send, U> Inner<U> for F", 2, p0, Some((inner, &[p1])), &[("Out", p1)], std::vec![p0_send]);
+    fx.imp("impl<F: Send, U> Inner<U> for F", 2, p0, Some((inner, &[p1])), &[("Out", p1)], clauses(&[p0_send]));
     // `struct Wrap<F, U>(F, U);  trait Outer { type Assoc; }  impl<F: Inner<U>, U> Outer for Wrap<F, U> { type Assoc = <F as Inner<U>>::Out; }`
     let wrap = fx.strukt("Wrap", 2, &[("f", p0), ("u", p1)]);
     let wrap_p0_p1 = fx.adt(wrap, &[p0, p1]);
-    let outer = fx.tr("Outer", 1, Vec::new(), &["Assoc"]);
+    let outer = fx.tr("Outer", 1, clauses(&[]), &["Assoc"]);
     let p0_inner_p1 = fx.bound(inner, &[p0, p1]);
     let inner_out = fx.alias(inner, "Out", &[p0, p1]);
     fx.imp(
@@ -741,15 +747,15 @@ fn rigid_composite_self_projection_mismatch_emits_e0271() {
         wrap_p0_p1,
         Some((outer, &[])),
         &[("Assoc", inner_out)],
-        std::vec![p0_inner_p1],
+        clauses(&[p0_inner_p1]),
     );
-    let mk_wrap = fx.func("mk_wrap", 2, &[p0, p1], wrap_p0_p1, Vec::new());
+    let mk_wrap = fx.func("mk_wrap", 2, &[p0, p1], wrap_p0_p1, clauses(&[]));
     let _ = mk_wrap;
     let is_outer = fx.bound(outer, &[p0]);
     let assoc_is_u64 = fx.proj(outer, &[p0], "Assoc", u64_);
-    fx.func("need_u64", 1, &[p0], unit, std::vec![is_outer, assoc_is_u64]);
+    fx.func("need_u64", 1, &[p0], unit, clauses(&[is_outer, assoc_is_u64]));
     // Owner: `fn generic_owner<T>(x: <&T as Ext>::Out) where &T: Ext`
-    let owner = fx.func("generic_owner", 1, &[ref_p0_out], unit, std::vec![ref_p0_ext]);
+    let owner = fx.func("generic_owner", 1, &[ref_p0_out], unit, clauses(&[ref_p0_ext]));
     fx.finish();
 
     let mut b = Bb::new();
@@ -784,7 +790,7 @@ fn rigid_composite_self_projection_mismatch_emits_e0271() {
     assert_eq!(d.code, DiagCode::ProjectionMismatch, "expected E0271 for rigid <&T as Ext>::Out != u64, got {d:?}");
     assert_eq!(d.name, Some(Name::of("Assoc")), "{d:?}");
     let tys = decided.types.view();
-    assert_eq!(d.expected.map(|t| crate::fixture::show(&fx, tys, t)), Some(std::string::String::from("u64")), "{d:?}");
+    assert_eq!(d.expected.map(|t| crate::fixture::show(&fx, tys, t)).as_deref(), Some("u64"), "{d:?}");
     assert!(d.found.is_some(), "found type should be exported: {d:?}");
 }
 
@@ -800,20 +806,20 @@ fn unrelated_projection_term_foreign_superset_emits_e0277() {
     let send = fx.key_of("Send");
     let rc_t = fx.adt(fx.key_of("Rc"), &[]);
     let ready_t = fx.adt(fx.key_of("Ready"), &[]);
-    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, clauses(&[]), &[]);
     let p0_send = fx.bound(send, &[p0]);
-    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
-    let assoc = fx.tr("Assoc", 1, Vec::new(), &["Out"]);
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], clauses(&[p0_send]));
+    let assoc = fx.tr("Assoc", 1, clauses(&[]), &["Out"]);
     let p0_wrap = fx.bound(send_wrap, &[p0]);
-    fx.imp("impl<F: SendWrap> Assoc for F", 1, p0, Some((assoc, &[])), &[("Out", u8_)], std::vec![p0_wrap]);
-    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, Vec::new());
+    fx.imp("impl<F: SendWrap> Assoc for F", 1, p0, Some((assoc, &[])), &[("Out", u8_)], clauses(&[p0_wrap]));
+    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, clauses(&[]));
     let cor_t = fx.ty(PNode::Coroutine { owner: foreign_fn, ordinal: 0, args: crate::ids::List::EMPTY });
     let exact_foreign = fx.tuple(&[ready_t]);
     let superset_foreign = fx.tuple(&[rc_t]);
     fx.coroutines.push((foreign_fn, 0, unit, exact_foreign));
     // Bound is only `<F as Assoc>::Out == ForeignCor` so the stalled row is the projection itself.
     let proj_is_cor = fx.proj(assoc, &[p0], "Out", cor_t);
-    fx.func("need_assoc_proj", 1, &[p0], unit, std::vec![proj_is_cor]);
+    fx.func("need_assoc_proj", 1, &[p0], unit, clauses(&[proj_is_cor]));
     fx.finish();
 
     let mut b = Bb::new();
@@ -862,16 +868,16 @@ fn non_auto_trait_constraining_future_output_foreign_superset_returns_gap() {
     let future = fx.key_of("Future");
     let rc_t = fx.adt(fx.key_of("Rc"), &[]);
     let ready_t = fx.adt(fx.key_of("Ready"), &[]);
-    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, clauses(&[]), &[]);
     let p0_send = fx.bound(send, &[p0]);
-    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
-    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, Vec::new());
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], clauses(&[p0_send]));
+    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, clauses(&[]));
     let cor_t = fx.ty(PNode::Coroutine { owner: foreign_fn, ordinal: 0, args: crate::ids::List::EMPTY });
     let exact_foreign = fx.tuple(&[ready_t]);
     let superset_foreign = fx.tuple(&[rc_t]);
     fx.coroutines.push((foreign_fn, 0, unit, exact_foreign));
-    fx.func("make_foreign_cor", 0, &[], cor_t, Vec::new());
-    let wrapper = fx.tr("Wrapper", 1, Vec::new(), &[]);
+    fx.func("make_foreign_cor", 0, &[], cor_t, clauses(&[]));
+    let wrapper = fx.tr("Wrapper", 1, clauses(&[]), &[]);
     let f_fut = fx.bound(future, &[p0]);
     let f_out = fx.proj(future, &[p0], "Output", p1);
     let f_wrap = fx.bound(send_wrap, &[p0]);
@@ -882,10 +888,10 @@ fn non_auto_trait_constraining_future_output_foreign_superset_returns_gap() {
         p0,
         Some((wrapper, &[])),
         &[],
-        std::vec![f_fut, f_out, f_wrap, o_send],
+        clauses(&[f_fut, f_out, f_wrap, o_send]),
     );
     let w_bound = fx.bound(wrapper, &[p0]);
-    fx.func("check_wrapper", 1, &[p0], unit, std::vec![w_bound]);
+    fx.func("check_wrapper", 1, &[p0], unit, clauses(&[w_bound]));
     fx.finish();
 
     // `async { let r = make_rc(); use_rc(r); ready().await; make_foreign_cor() }`
@@ -970,10 +976,10 @@ fn impl_where_clause_projected_opaque_superset_returns_gap_or_e0277() {
     let send = fx.key_of("Send");
     let rc_t = fx.adt(fx.key_of("Rc"), &[]);
     let ready_t = fx.adt(fx.key_of("Ready"), &[]);
-    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, clauses(&[]), &[]);
     let p0_send = fx.bound(send, &[p0]);
-    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
-    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, Vec::new());
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], clauses(&[p0_send]));
+    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, clauses(&[]));
     let cor_t = fx.ty(PNode::Coroutine { owner: foreign_fn, ordinal: 0, args: crate::ids::List::EMPTY });
     let exact_foreign = fx.tuple(&[ready_t]);
     let superset_foreign = fx.tuple(&[rc_t]);
@@ -981,16 +987,16 @@ fn impl_where_clause_projected_opaque_superset_returns_gap_or_e0277() {
     let foreign_opaque = fx.opaque_key("ForeignOut");
     let foreign_opaque_t = fx.ty(PNode::Opaque(foreign_opaque, crate::ids::List::EMPTY));
     let op_sized = fx.bound(sized, &[foreign_opaque_t]);
-    fx.set_opaque_bounds(foreign_opaque, std::vec![op_sized]);
+    fx.set_opaque_bounds(foreign_opaque, clauses(&[op_sized]));
     fx.hidden.push((foreign_opaque, cor_t));
-    let make = fx.tr("Make", 1, Vec::new(), &["Out"]);
+    let make = fx.tr("Make", 1, clauses(&[]), &["Out"]);
     let make_out_p0 = fx.alias(make, "Out", &[p0]);
     let make_out_sized = fx.bound(sized, &[make_out_p0]);
-    fx.set_assoc_bounds(make, "Out", std::vec![make_out_sized]);
+    fx.set_assoc_bounds(make, "Out", clauses(&[make_out_sized]));
     let maker = fx.strukt("Maker", 0, &[]);
     let maker_t = fx.adt(maker, &[]);
-    fx.imp("impl Make for Maker", 0, maker_t, Some((make, &[])), &[("Out", foreign_opaque_t)], Vec::new());
-    let wrap = fx.tr("Wrap", 2, Vec::new(), &[]);
+    fx.imp("impl Make for Maker", 0, maker_t, Some((make, &[])), &[("Out", foreign_opaque_t)], clauses(&[]));
+    let wrap = fx.tr("Wrap", 2, clauses(&[]), &[]);
     let p0_wrap = fx.bound(send_wrap, &[p0]);
     let p1_make = fx.bound(make, &[p1]);
     let p1_out = fx.alias(make, "Out", &[p1]);
@@ -1001,10 +1007,10 @@ fn impl_where_clause_projected_opaque_superset_returns_gap_or_e0277() {
         p0,
         Some((wrap, &[p1])),
         &[],
-        std::vec![p0_wrap, p1_make, p1_out_send],
+        clauses(&[p0_wrap, p1_make, p1_out_send]),
     );
     let wrap_maker = fx.bound(wrap, &[p0, maker_t]);
-    fx.func("check_wrap", 1, &[p0], unit, std::vec![wrap_maker]);
+    fx.func("check_wrap", 1, &[p0], unit, clauses(&[wrap_maker]));
     fx.finish();
 
     let mut b = Bb::new();
@@ -1071,23 +1077,23 @@ fn impl_where_clause_projected_coroutine_superset_returns_gap_or_e0277() {
     let send = fx.key_of("Send");
     let rc_t = fx.adt(fx.key_of("Rc"), &[]);
     let ready_t = fx.adt(fx.key_of("Ready"), &[]);
-    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, clauses(&[]), &[]);
     let p0_send = fx.bound(send, &[p0]);
-    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
-    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, Vec::new());
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], clauses(&[p0_send]));
+    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, clauses(&[]));
     let cor_t = fx.ty(PNode::Coroutine { owner: foreign_fn, ordinal: 0, args: crate::ids::List::EMPTY });
     let exact_foreign = fx.tuple(&[ready_t]);
     let superset_foreign = fx.tuple(&[rc_t]);
     fx.coroutines.push((foreign_fn, 0, unit, exact_foreign));
-    let make = fx.tr("Make", 1, Vec::new(), &["Out"]);
+    let make = fx.tr("Make", 1, clauses(&[]), &["Out"]);
     let make_out_p0 = fx.alias(make, "Out", &[p0]);
     let make_out_sized = fx.bound(sized, &[make_out_p0]);
-    fx.set_assoc_bounds(make, "Out", std::vec![make_out_sized]);
+    fx.set_assoc_bounds(make, "Out", clauses(&[make_out_sized]));
     let maker = fx.strukt("Maker", 1, &[("x", p0)]);
     let maker_p0 = fx.adt(maker, &[p0]);
-    fx.imp("impl<X> Make for Maker<X>", 1, maker_p0, Some((make, &[])), &[("Out", p0)], Vec::new());
+    fx.imp("impl<X> Make for Maker<X>", 1, maker_p0, Some((make, &[])), &[("Out", p0)], clauses(&[]));
     let maker_cor = fx.adt(maker, &[cor_t]);
-    let wrap = fx.tr("Wrap", 2, Vec::new(), &[]);
+    let wrap = fx.tr("Wrap", 2, clauses(&[]), &[]);
     let p0_wrap = fx.bound(send_wrap, &[p0]);
     let p1_make = fx.bound(make, &[p1]);
     let p1_out = fx.alias(make, "Out", &[p1]);
@@ -1098,10 +1104,10 @@ fn impl_where_clause_projected_coroutine_superset_returns_gap_or_e0277() {
         p0,
         Some((wrap, &[p1])),
         &[],
-        std::vec![p0_wrap, p1_make, p1_out_send],
+        clauses(&[p0_wrap, p1_make, p1_out_send]),
     );
     let wrap_maker = fx.bound(wrap, &[p0, maker_cor]);
-    fx.func("check_wrap", 1, &[p0], unit, std::vec![wrap_maker]);
+    fx.func("check_wrap", 1, &[p0], unit, clauses(&[wrap_maker]));
     fx.finish();
 
     let mut b = Bb::new();
@@ -1176,17 +1182,17 @@ fn foreign_closure_capturing_superset_coroutine_participates_in_two_pass_replay(
     let send = fx.key_of("Send");
     let rc_t = fx.adt(fx.key_of("Rc"), &[]);
     let ready_t = fx.adt(fx.key_of("Ready"), &[]);
-    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, clauses(&[]), &[]);
     let p0_send = fx.bound(send, &[p0]);
-    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], clauses(&[p0_send]));
 
-    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, Vec::new());
+    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, clauses(&[]));
     let cor_t = fx.ty(PNode::Coroutine { owner: foreign_fn, ordinal: 0, args: crate::ids::List::EMPTY });
     let exact_foreign = fx.tuple(&[ready_t]);
     let superset_bad = fx.tuple(&[rc_t]);
     fx.coroutines.push((foreign_fn, 0, unit, exact_foreign));
 
-    let closure_owner = fx.func("closure_owner", 0, &[], unit, Vec::new());
+    let closure_owner = fx.func("closure_owner", 0, &[], unit, clauses(&[]));
     let closure_io = fx.list(&[cor_t]);
     let closure_sig = fx.ty(PNode::FnPtr(closure_io, FnPtrHeader::RUST));
     let closure_env = fx.tuple(&[cor_t]);
@@ -1195,14 +1201,14 @@ fn foreign_closure_capturing_superset_coroutine_participates_in_two_pass_replay(
     let foreign_closure_t = fx.ty(PNode::Closure { owner: closure_owner, ordinal: 0, args: crate::ids::List::EMPTY });
 
     // `impl<F: SendWrap, U> Wrapper<U> for F` (U unconstrained).
-    let wrapper = fx.tr("Wrapper", 2, Vec::new(), &[]);
+    let wrapper = fx.tr("Wrapper", 2, clauses(&[]), &[]);
     let p0_wrap = fx.bound(send_wrap, &[p0]);
-    fx.imp("impl<F: SendWrap, U> Wrapper<U> for F", 2, p0, Some((wrapper, &[p1])), &[], std::vec![p0_wrap]);
+    fx.imp("impl<F: SendWrap, U> Wrapper<U> for F", 2, p0, Some((wrapper, &[p1])), &[], clauses(&[p0_wrap]));
     let wrap_u = fx.bound(wrapper, &[p0, foreign_closure_t]);
-    fx.func("check_unconstrained", 1, &[p0], unit, std::vec![wrap_u]);
+    fx.func("check_unconstrained", 1, &[p0], unit, clauses(&[wrap_u]));
 
     // `impl<F: SendWrap, U: Send> SendWrapper<U> for F` (U must be Send).
-    let send_wrapper = fx.tr("SendWrapper", 2, Vec::new(), &[]);
+    let send_wrapper = fx.tr("SendWrapper", 2, clauses(&[]), &[]);
     let p1_send = fx.bound(send, &[p1]);
     fx.imp(
         "impl<F: SendWrap, U: Send> SendWrapper<U> for F",
@@ -1210,10 +1216,10 @@ fn foreign_closure_capturing_superset_coroutine_participates_in_two_pass_replay(
         p0,
         Some((send_wrapper, &[p1])),
         &[],
-        std::vec![p0_wrap, p1_send],
+        clauses(&[p0_wrap, p1_send]),
     );
     let send_wrap_u = fx.bound(send_wrapper, &[p0, foreign_closure_t]);
-    fx.func("check_constrained", 1, &[p0], unit, std::vec![send_wrap_u]);
+    fx.func("check_constrained", 1, &[p0], unit, clauses(&[send_wrap_u]));
     fx.finish();
 
     // Body 1: unconstrained `Wrapper<ForeignClosure> for LocalFuture`.

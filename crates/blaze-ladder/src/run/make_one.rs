@@ -927,13 +927,19 @@ impl MakerCore {
         carried_vtables: &[VtableDatum<'_>],
         out_alloc: Alloc<'a>,
     ) -> Result<AVec<'a, u8>, crate::code_records::statics::StaticRecordError> {
-        use crate::code_records::statics::{make_static_entry_with_targets, make_template_entry_with_targets};
+        use crate::code_records::statics::{StaticFnTarget, make_static_entry_with_targets, make_template_entry_with_targets};
 
         let ground = &mut self.work.ground;
         let fn_target = |key| {
             let Some(mut instance) = program.const_fn_instance(key, ground, out_alloc) else {
                 return Ok(None);
             };
+            if let Some(fi) = program.fn_index(instance.item) {
+                let f = program.function(fi);
+                if f.kind == FnKind::Foreign {
+                    return Ok(Some(StaticFnTarget::Foreign { symbol: f.symbol, weak: false }));
+                }
+            }
             if program.track_caller(instance.item) == Some(true) {
                 instance = blaze_build::reify_shim_instance(instance, ground).map_err(|_| crate::symbols::SymbolError::TableFull)?;
             }
@@ -941,7 +947,7 @@ impl MakerCore {
             let tabled = static_fn_tabled(program, instance, view);
             let mut name = blaze_own::Vec::new_in(out_alloc);
             encode_instance(instance.item, instance.args, view, out_alloc, &mut name)?;
-            Ok(Some((tabled, name)))
+            Ok(Some(StaticFnTarget::Instance { tabled, name }))
         };
         let vtable_target = |key| Ok(vtable_syms.iter().find(|&&(k, _)| k == key).map(|&(_, sym)| sym));
         let foreign_static = |k| {
@@ -4705,16 +4711,31 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         core.work.last_make_reportable = false;
         let kind = program.make_static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
         let mut vtable_keys: AVec<'_, blaze_build::vtable::VtableKey> = blaze_own::Vec::new_in(fn_alloc);
+        let mut fn_keys: AVec<'_, blaze_build::InstanceKey> = blaze_own::Vec::new_in(fn_alloc);
         {
             let value = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
             for a in value.allocs.iter() {
                 for r in a.relocs.iter() {
-                    if let blaze_build::data::DataTarget::Vtable(key) = r.target
-                        && vtable_keys.scan_for(&key).is_none()
-                    {
-                        vtable_keys.push(key);
+                    match r.target {
+                        blaze_build::data::DataTarget::Vtable(key) if vtable_keys.scan_for(&key).is_none() => {
+                            vtable_keys.push(key);
+                        }
+                        blaze_build::data::DataTarget::Fn(key) if fn_keys.scan_for(&key).is_none() => {
+                            fn_keys.push(key);
+                        }
+                        _ => {}
                     }
                 }
+            }
+        }
+        // Populate head rows for non-generic function targets in the static so foreign (`extern`)
+        // functions are recognized as outside symbols rather than declared as internal Rust bodies.
+        for key in fn_keys {
+            if let Some(instance) = program.const_fn_instance(key, &mut core.work.ground, fn_alloc)
+                && core.work.ground.view().list(instance.args).is_ok_and(|a| a.is_empty())
+                && program.fn_index(instance.item).is_none()
+            {
+                program.head_row(instance.item)?;
             }
         }
         if vtable_keys.is_empty() {

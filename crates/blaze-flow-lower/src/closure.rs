@@ -785,6 +785,10 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         type OutPart<'s> = Option<(&'s [Region], Option<PTy>)>;
         let mut outer_binder = 0u32;
         let mut static_as_static = false;
+        let call_expr = match from {
+            SigFrom::Clause { expr, .. } => Some(expr),
+            _ => None,
+        };
         let (ins, outs): (InPart<'_>, OutPart<'_>) = match from {
             SigFrom::Clause { expr, nth, output } => {
                 let item = self.clause_owner(expr, nth, e)?;
@@ -836,25 +840,39 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         if from == SigFrom::FnPtr
             && ins.is_none()
             && outs.is_none()
-            && nin == 1
-            && nout > 0
-            && ck
-                .closures
-                .column::<0>()
-                .get(row)
-                .copied()
-                .is_some_and(|ce| self.local_closure_fn_ptr_elided(ce))
+            && let Some(ce) = ck.closures.column::<0>().get(row).copied()
         {
-            // A closure coerced to an elided `fn(&T) -> &U` parameter of a local closure
-            // (`let count = |pick: fn(&Tally) -> &AtomicU64| ..; count(|t| &t.field)`): Rust's
-            // lifetime elision binds the single elided input lifetime and every elided output
-            // lifetime to the same `for<'a>` late-bound region.
-            let tied = SigSlot::Late(Some((u32::MAX, 0)));
-            out.push(tied);
-            for _ in 0..nout {
-                out.push(tied);
+            if self.body.closure_param_regions.iter().any(|r| r.closure == ce && r.param == u32::MAX) {
+                // `let f: fn(..) -> .. = |..| ..;`: `blaze-lower` recorded the written `let`
+                // fn-pointer type's regions under `(ce, u32::MAX)` with inputs at `step(ROOT, i)`
+                // and output at `step(ROOT, inputs.len())`, preserving exact elided `for<'a>`
+                // ties, explicit `'static`, and named enclosing lifetimes.
+                for (pi, &t) in inputs.iter().enumerate() {
+                    if let Some(root_path) = blaze_typeck::ClosureParamRegion::push_step(blaze_typeck::ClosureParamRegion::ROOT, to_u32(pi)) {
+                        self.lay_let_fn_ptr_part(ce, root_path, t, false, &mut owner, out, e)?;
+                    } else {
+                        return self.refuse(Form::Bound, e);
+                    }
+                }
+                if let Some(ret_path) = blaze_typeck::ClosureParamRegion::push_step(blaze_typeck::ClosureParamRegion::ROOT, to_u32(inputs.len())) {
+                    self.lay_let_fn_ptr_part(ce, ret_path, output, true, &mut owner, out, e)?;
+                } else {
+                    return self.refuse(Form::Bound, e);
+                }
+                return Ok(());
             }
-            return Ok(());
+            if nin == 1 && nout > 0 && self.local_closure_fn_ptr_elided(ce) {
+                // A closure coerced to an elided `fn(&T) -> &U` parameter of a local closure
+                // (`let count = |pick: fn(&Tally) -> &AtomicU64| ..; count(|t| &t.field)`): Rust's
+                // lifetime elision binds the single elided input lifetime and every elided output
+                // lifetime to the same `for<'a>` late-bound region.
+                let tied = SigSlot::Late(Some((u32::MAX, 0)));
+                out.push(tied);
+                for _ in 0..nout {
+                    out.push(tied);
+                }
+                return Ok(());
+            }
         }
         let mut pairs: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
         match ins {
@@ -877,7 +895,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                         pairs.push((dk, ik));
                     }
                 }
-                self.lay_sig_part(s, nin, 0, outer_binder, static_as_static, &pairs, &heads, &mut owner, out, e)?
+                self.lay_sig_part(s, nin, 0, outer_binder, static_as_static, call_expr, &pairs, &heads, &mut owner, out, e)?
             }
             None => {
                 let ce = ck.closures.column::<0>().get(row).copied();
@@ -897,7 +915,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 if let Some(d) = declared {
                     pairs.push((d, output));
                 }
-                self.lay_sig_part(s, nout, 1, outer_binder, static_as_static, &pairs, &heads, &mut owner, out, e)?
+                self.lay_sig_part(s, nout, 1, outer_binder, static_as_static, call_expr, &pairs, &heads, &mut owner, out, e)?
             }
             None => {
                 for _ in 0..nout {
@@ -1391,6 +1409,103 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         binders
     }
 
+    /// Lays `SigSlot`s for one input or output part of a closure directly initialized into a
+    /// `let f: fn(..) -> .. = |..| ..;` binding, reading the written `fn`-pointer's regions
+    /// recorded under `(ce, u32::MAX)` at `root_path`.
+    fn lay_let_fn_ptr_part(
+        &self,
+        ce: ExprId,
+        root_path: u64,
+        root: PTy,
+        is_output: bool,
+        owner: &mut u32,
+        out: &mut Vec<SigSlot, A>,
+        e: ExprId,
+    ) -> Result<(), Refusal> {
+        let push_default = |n: u32, owner: &mut u32, out: &mut Vec<SigSlot, A>| {
+            for _ in 0..n {
+                if is_output {
+                    out.push(SigSlot::Owner(*owner));
+                    *owner += 1;
+                } else {
+                    out.push(SigSlot::Late(None));
+                }
+            }
+        };
+        let push_written = |path: u64, own: u32, owner: &mut u32, out: &mut Vec<SigSlot, A>| {
+            match self.body.closure_param_region(ce, u32::MAX, path, own) {
+                Some(blaze_typeck::WrittenRegion::Static) => out.push(SigSlot::Static),
+                Some(blaze_typeck::WrittenRegion::Named | blaze_typeck::WrittenRegion::Inferred) => {
+                    out.push(SigSlot::Owner(*owner));
+                    *owner += 1;
+                }
+                Some(blaze_typeck::WrittenRegion::Late(var)) => {
+                    out.push(SigSlot::Late(Some((0, var))));
+                }
+                Some(blaze_typeck::WrittenRegion::Elided(id)) => {
+                    out.push(SigSlot::Late(Some((u32::MAX - 1, id))));
+                }
+                None if is_output => {
+                    out.push(SigSlot::Owner(*owner));
+                    *owner += 1;
+                }
+                None => out.push(SigSlot::Late(None)),
+            }
+        };
+        let mut stack: Vec<(PTy, Option<u64>), A> = Vec::new_in(self.alloc);
+        stack.push((root, Some(root_path)));
+        let mut steps = 0u32;
+        while let Some((t, path)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            let Some(p) = path else {
+                push_default(self.npos(t, e)?, owner, out);
+                continue;
+            };
+            match self.node(t, e)? {
+                PNode::Ref(_, inner) => {
+                    push_written(p, 0, owner, out);
+                    stack.push((inner, blaze_typeck::ClosureParamRegion::push_step(p, 0)));
+                }
+                PNode::Ptr(_, inner) | PNode::Slice(inner) | PNode::Array(inner, _) | PNode::Pat(inner, _) => {
+                    stack.push((inner, blaze_typeck::ClosureParamRegion::push_step(p, 0)));
+                }
+                PNode::Tuple(l) => {
+                    for (ci, &child) in self.list(l, e)?.iter().enumerate().rev() {
+                        stack.push((child, blaze_typeck::ClosureParamRegion::push_step(p, to_u32(ci))));
+                    }
+                }
+                PNode::Adt(k, l) => {
+                    let nl = self.adt_facts(k, e)?.lifetimes;
+                    for lt in 0..nl {
+                        push_written(p, lt, owner, out);
+                    }
+                    for (ci, &child) in self.list(l, e)?.iter().enumerate().rev() {
+                        stack.push((child, blaze_typeck::ClosureParamRegion::push_step(p, to_u32(ci))));
+                    }
+                }
+                PNode::Alias { trait_, name, args } if <R::Grain as crate::grain::Grain>::SLOTS => {
+                    if let Some(nl) = self.facts.alias_lifetimes(trait_, name) {
+                        for lt in 0..nl {
+                            push_written(p, lt, owner, out);
+                        }
+                        for (ci, &child) in self.list(args, e)?.iter().enumerate().rev() {
+                            stack.push((child, blaze_typeck::ClosureParamRegion::push_step(p, to_u32(ci))));
+                        }
+                    } else {
+                        push_default(self.npos(t, e)?, owner, out);
+                    }
+                }
+                _ => {
+                    push_default(self.npos(t, e)?, owner, out);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Lays `SigSlot`s for one closure parameter `root` when no expecting clause supplies its
     /// signature regions, walking `root` in exact `npos` pre-order while tracking the structural
     /// child-index path to look up explicitly written `'static` and named enclosing lifetimes in
@@ -1429,6 +1544,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 Some(blaze_typeck::WrittenRegion::Elided(id)) => {
                     out.push(SigSlot::Late(Some((u32::MAX - param, id))));
                 }
+                Some(blaze_typeck::WrittenRegion::Late(_)) => out.push(SigSlot::Late(None)),
                 None if inferred_unannotated => {
                     out.push(SigSlot::Owner(*owner));
                     *owner += 1;
@@ -1547,7 +1663,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     /// One part (`part` 0 the inputs, 1 the output) of `Lower::sig_slots` from the clause's
     /// slots `s` over the part's `n` positions; `pairs`: the part's declared types (the
     /// clause's, in `heads`' table) beside the closure's own (the body's), when read.
-    #[expect(clippy::too_many_arguments, reason = "the part, its declared and actual types, outer binder, static flag, and the owner count")]
+    #[expect(clippy::too_many_arguments, reason = "the part, its declared and actual types, outer binder, static flag, call expr, and the owner count")]
     fn lay_sig_part(
         &self,
         s: &[Region],
@@ -1555,6 +1671,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         part: u32,
         outer_binder: u32,
         static_as_static: bool,
+        call_expr: Option<ExprId>,
         pairs: &[(PTy, PTy)],
         heads: &blaze_borrow::Columns<'_>,
         owner: &mut u32,
@@ -1576,12 +1693,242 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             // Pool<'a>>::Cx = ()` drops 1 slot while `L = &ScaleLast` adds 1 position so total
             // `s.len() == n` despite shifted slots). Laid by walking the declared part beside
             // the closure's own; never guessed.
-            return self.lay_sig_typed(s, n, part, outer_binder, static_as_static, pairs, heads, owner, out, e);
+            return self.lay_sig_typed(s, n, part, outer_binder, static_as_static, call_expr, pairs, heads, owner, out, e);
         }
         for &r in s {
             out.push(Self::region_sig_slot(r, outer_binder, static_as_static, owner));
         }
         Ok(())
+    }
+
+    /// Normalizes a declared GAT/associated-type projection `d` (`PNode::Alias { trait_, name, .. }`)
+    /// carrying `Late` region slots `under` at `call_expr`, using the impl selected by typeck and
+    /// its filed `impl_assoc` region column. Appends the normalized column's substituted regions to
+    /// `slot_buf` and returns `Some((assoc_ty, new_lo, new_hi, impl_args))`.
+    #[expect(clippy::too_many_arguments, reason = "projection node, its slots, call site, env args, slot buffer, heads, and expr")]
+    fn normalize_sig_alias(
+        &self,
+        d: PTy,
+        dt: ItemKey,
+        dn_name: blaze_typeck::Name,
+        under: &[Region],
+        call_expr: ExprId,
+        env_args: Option<blaze_typeck::List>,
+        slot_buf: &mut Vec<Region, A>,
+        heads: &blaze_borrow::Columns<'_>,
+        e: ExprId,
+    ) -> Result<Option<(PTy, usize, usize, blaze_typeck::List)>, Refusal> {
+        use blaze_borrow::{Kids, RegionTypes};
+        let Ok(Kids::List(d_kids)) = heads.kids(d) else { return Ok(None) };
+        let Some(&d_self) = d_kids.first() else { return Ok(None) };
+        let facts: &'b F = self.facts;
+        let own = heads.own(d).ok().map(|c| c.get()).unwrap_or(0);
+        let trait_lts = facts.trait_lifetimes(dt).unwrap_or(0);
+        if own < trait_lts || to_usize(own) > under.len() {
+            return Ok(None);
+        }
+        let Some(gat_lts) = under.get(to_usize(trait_lts)..to_usize(own)) else { return Ok(None) };
+        // Find the selected impl for `(dt, d_self)` at `call_expr` (or body-wide `ck.selected`).
+        let mut selected_impl: Option<(ItemKey, blaze_typeck::List, bool)> = None;
+        let mut ambiguous = false;
+        for rows in [self.ck.call_selections(call_expr), self.ck.selected.as_slice()] {
+            for row in rows {
+                if row.trait_ != dt {
+                    continue;
+                }
+                let exact_name = row.name == Some(dn_name);
+                if !exact_name && row.name.is_some() {
+                    continue;
+                }
+                let blaze_typeck::Selected::Impl { imp, args: impl_args } = row.selected else { continue };
+                let Some(&row_self) = self.list(row.args, e)?.first() else { continue };
+                if !self.head_matches_body_erased(d_self, env_args, row_self, heads, e)? {
+                    continue;
+                }
+                match selected_impl {
+                    None => selected_impl = Some((imp, impl_args, exact_name)),
+                    Some((prev_imp, _, prev_exact)) if prev_imp == imp => {
+                        if exact_name && !prev_exact {
+                            selected_impl = Some((imp, impl_args, true));
+                        }
+                    }
+                    Some((_, _, prev_exact)) if exact_name && !prev_exact => {
+                        selected_impl = Some((imp, impl_args, true));
+                        ambiguous = false;
+                    }
+                    Some((_, _, prev_exact)) if !exact_name && prev_exact => {}
+                    Some(_) => ambiguous = true,
+                }
+            }
+            if selected_impl.is_some() || ambiguous {
+                break;
+            }
+        }
+        if ambiguous {
+            return Ok(None);
+        }
+        let Some((imp, impl_args, _)) = selected_impl else { return Ok(None) };
+        let Ok(assoc_col) = facts.regions().impl_assoc(imp, dn_name) else { return Ok(None) };
+        // Build `Param(p) -> Region` substitution for the impl's own lifetime parameters from
+        // `impl_header(imp)` matched against `under` (in case a `Late` region sits in a trait
+        // lifetime or Self type argument).
+        let mut param_map: Vec<(u32, Region), A> = Vec::new_in(self.alloc);
+        let mut param_conflict = false;
+        if let Ok((self_col, trait_col)) = facts.regions().impl_header(imp) {
+            let self_under = under.get(to_usize(own)..).unwrap_or(&[]);
+            let d_self_cnt = heads.count(d_self).ok().map(|c| c.len()).unwrap_or(0);
+            if let Some(self_slice) = self_under.get(..d_self_cnt)
+                && self_col.as_slice().len() == d_self_cnt
+            {
+                for (&impl_r, &arg_r) in self_col.as_slice().iter().zip(self_slice.iter()) {
+                    if let Region::Param(p) = impl_r {
+                        match param_map.iter().find(|&&(k, _)| k == p) {
+                            Some(&(_, prev)) if prev != arg_r => param_conflict = true,
+                            Some(_) => {}
+                            None => param_map.push((p, arg_r)),
+                        }
+                    }
+                }
+            }
+            if let Some(tcol) = trait_col
+                && let (Some(tcol_slice), Some(under_slice)) = (tcol.as_slice().get(..to_usize(trait_lts)), under.get(..to_usize(trait_lts)))
+            {
+                for (&impl_r, &arg_r) in tcol_slice.iter().zip(under_slice.iter()) {
+                    if let Region::Param(p) = impl_r {
+                        match param_map.iter().find(|&&(k, _)| k == p) {
+                            Some(&(_, prev)) if prev != arg_r => param_conflict = true,
+                            Some(_) => {}
+                            None => param_map.push((p, arg_r)),
+                        }
+                    }
+                }
+            }
+        }
+        let non_gat_has_late = under.get(..to_usize(trait_lts)).is_some_and(|sl| sl.iter().any(is_late))
+            || under.get(to_usize(own)..).is_some_and(|sl| sl.iter().any(is_late));
+        if non_gat_has_late && param_conflict {
+            return Ok(None);
+        }
+        let new_lo = slot_buf.len();
+        for &r in assoc_col.as_slice() {
+            let mapped = match r {
+                Region::Late { binder: u32::MAX, var } => {
+                    let Some(&sub) = gat_lts.get(to_usize(var)) else {
+                        slot_buf.truncate(new_lo);
+                        return Ok(None);
+                    };
+                    sub
+                }
+                Region::Param(p) => match param_map.iter().find(|&&(k, _)| k == p) {
+                    Some(&(_, sub)) => sub,
+                    None if non_gat_has_late => {
+                        slot_buf.truncate(new_lo);
+                        return Ok(None);
+                    }
+                    None => r,
+                },
+                other => other,
+            };
+            slot_buf.push(mapped);
+        }
+        let new_hi = slot_buf.len();
+        Ok(Some((assoc_col.ty(), new_lo, new_hi, impl_args)))
+    }
+
+    /// Whether head-table type `h` (with `PNode::Param(p)` substituted via `env_args` in `self.tys`)
+    /// structurally matches body-table type `b` with regions erased.
+    fn head_matches_body_erased(
+        &self,
+        h: PTy,
+        env_args: Option<blaze_typeck::List>,
+        b: PTy,
+        heads: &blaze_borrow::Columns<'_>,
+        e: ExprId,
+    ) -> Result<bool, Refusal> {
+        use blaze_borrow::{Kids, RegionTypes};
+        let mut stack: Vec<(PTy, PTy, bool), A> = Vec::new_in(self.alloc);
+        stack.push((h, b, true));
+        let mut steps = 0u32;
+        while let Some((x, y, x_in_heads)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return Ok(false);
+            }
+            let xn = if x_in_heads {
+                match heads.node(x) {
+                    Ok(n) => n,
+                    Err(_) => return Ok(false),
+                }
+            } else {
+                self.node(x, e)?
+            };
+            if x_in_heads && let PNode::Param(p) = xn {
+                let Some(args) = env_args else { return Ok(false) };
+                let Some(&inst) = self.list(args, e)?.get(to_usize(p)) else { return Ok(false) };
+                stack.push((inst, y, false));
+                continue;
+            }
+            if !x_in_heads && x == y {
+                continue;
+            }
+            let yn = self.node(y, e)?;
+            match (xn, yn) {
+                (PNode::Bool, PNode::Bool)
+                | (PNode::Char, PNode::Char)
+                | (PNode::Str, PNode::Str)
+                | (PNode::Never, PNode::Never) => {}
+                (PNode::Int(a), PNode::Int(b)) if a == b => {}
+                (PNode::Uint(a), PNode::Uint(b)) if a == b => {}
+                (PNode::Float(a), PNode::Float(b)) if a == b => {}
+                (PNode::Param(a), PNode::Param(b)) if !x_in_heads && a == b => {}
+                (PNode::Ref(am, ai), PNode::Ref(bm, bi)) if am == bm => stack.push((ai, bi, x_in_heads)),
+                (PNode::Ptr(am, ai), PNode::Ptr(bm, bi)) if am == bm => stack.push((ai, bi, x_in_heads)),
+                (PNode::Slice(ai), PNode::Slice(bi)) => stack.push((ai, bi, x_in_heads)),
+                (PNode::Array(ai, al), PNode::Array(bi, bl)) if al == bl => stack.push((ai, bi, x_in_heads)),
+                (PNode::Tuple(_), PNode::Tuple(bl)) => {
+                    let bs = self.list(bl, e)?;
+                    if x_in_heads {
+                        let Ok(Kids::List(xs)) = heads.kids(x) else { return Ok(false) };
+                        if xs.len() != bs.len() {
+                            return Ok(false);
+                        }
+                        for (&xk, &bk) in xs.iter().zip(bs.iter()) {
+                            stack.push((xk, bk, true));
+                        }
+                    } else if let PNode::Tuple(xl) = xn {
+                        let xs = self.list(xl, e)?;
+                        if xs.len() != bs.len() {
+                            return Ok(false);
+                        }
+                        for (&xk, &bk) in xs.iter().zip(bs.iter()) {
+                            stack.push((xk, bk, false));
+                        }
+                    }
+                }
+                (PNode::Adt(ak, _), PNode::Adt(bk, bl)) if ak == bk => {
+                    let bs = self.list(bl, e)?;
+                    if x_in_heads {
+                        let Ok(Kids::List(xs)) = heads.kids(x) else { return Ok(false) };
+                        if xs.len() != bs.len() {
+                            return Ok(false);
+                        }
+                        for (&xk, &bk) in xs.iter().zip(bs.iter()) {
+                            stack.push((xk, bk, true));
+                        }
+                    } else if let PNode::Adt(_, xl) = xn {
+                        let xs = self.list(xl, e)?;
+                        if xs.len() != bs.len() {
+                            return Ok(false);
+                        }
+                        for (&xk, &bk) in xs.iter().zip(bs.iter()) {
+                            stack.push((xk, bk, false));
+                        }
+                    }
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     /// A clause part whose slots are not one per position (`Lower::lay_sig_part`): its
@@ -1594,8 +1941,11 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     /// instance or its normalization: no binder of the clause reaches into it, the Reference,
     /// "Higher-ranked trait bounds": the binder binds lifetimes the bound writes), so every
     /// position under it is the owner's, and its own slots (a projection's trait lifetimes)
-    /// must hold no binder region. Anything else, or two types that do not walk in step:
-    /// refused by name (`ClosureSigUnaligned`), never guessed.
+    /// must hold no binder region. When a projection carries a binder lifetime (e.g. a GAT
+    /// `Q::Item<'w>` or `T::Of<'a>`), either both sides are the same projection (walked in step)
+    /// or the selected impl's `impl_assoc` normalizes it with the binder lifetime substituted.
+    /// Anything else, or two types that do not walk in step: refused by name
+    /// (`ClosureSigUnaligned`), never guessed.
     #[expect(clippy::too_many_arguments, reason = "lay_sig_part's parts")]
     fn lay_sig_typed(
         &self,
@@ -1604,6 +1954,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
         part: u32,
         outer_binder: u32,
         static_as_static: bool,
+        call_expr: Option<ExprId>,
         pairs: &[(PTy, PTy)],
         heads: &blaze_borrow::Columns<'_>,
         owner: &mut u32,
@@ -1616,20 +1967,30 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             return self.refuse(unaligned(ClosureSigWhy::NoDeclared), e);
         }
         let first = out.len();
-        let mut at = 0usize;
-        let mut stack: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
-        for &p in pairs.iter().rev() {
-            stack.push(p);
+        let mut slot_buf: Vec<Region, A> = Vec::new_in(self.alloc);
+        slot_buf.extend_from_slice(s);
+        let root_env = call_expr.and_then(|ce| self.callee_of(ce).map(|(_, g)| g));
+        // Split `s` across top-level `pairs` by `heads.count(d)`.
+        let mut init_frames: Vec<(PTy, PTy, usize, usize, Option<blaze_typeck::List>), A> = Vec::new_in(self.alloc);
+        let mut cursor = 0usize;
+        for &(d, a) in pairs {
+            let Ok(c) = heads.count(d) else { return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e) };
+            let next = cursor + c.len();
+            if next > s.len() {
+                return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+            }
+            init_frames.push((d, a, cursor, next, root_env));
+            cursor = next;
         }
-        // One own slot of the declared type, as the position of the closure's at the same place.
-        let take = |at: &mut usize, owner: &mut u32, out: &mut Vec<SigSlot, A>| -> bool {
-            let Some(&r) = s.get(*at) else { return false };
-            *at += 1;
-            out.push(Self::region_sig_slot(r, outer_binder, static_as_static, owner));
-            true
-        };
+        if cursor != s.len() {
+            return self.refuse(unaligned(ClosureSigWhy::CountsDiffer), e);
+        }
+        let mut stack: Vec<(PTy, PTy, usize, usize, Option<blaze_typeck::List>), A> = Vec::new_in(self.alloc);
+        for &frame in init_frames.iter().rev() {
+            stack.push(frame);
+        }
         let mut steps = 0u32;
-        while let Some((d, a)) = stack.pop() {
+        while let Some((d, a, s_lo, s_hi, env_args)) = stack.pop() {
             steps += 1;
             if steps > MOST_POSITIONS {
                 return self.refuse(Form::Bound, e);
@@ -1637,13 +1998,73 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             let Ok(dn) = heads.node(d) else { return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e) };
             let an = self.node(a, e)?;
             match (dn, an) {
-                (PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..), _) => {
-                    let Ok(c) = heads.count(d) else { return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e) };
-                    let Some(under) = s.get(at..at + c.len()) else { return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e) };
-                    if under.iter().any(is_late) {
+                (PNode::Alias { trait_: dt, name: dn_name, .. }, PNode::Alias { trait_: at_, name: an_name, args: al })
+                    if dt == at_ && dn_name == an_name =>
+                {
+                    let (Ok(own), Ok(Kids::List(ds))) = (heads.own(d), heads.kids(d)) else {
+                        return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e);
+                    };
+                    let as_ = self.list(al, e)?;
+                    if ds.len() != as_.len() || self.facts.alias_lifetimes(at_, an_name) != Some(own.get()) {
+                        return self.refuse(unaligned(ClosureSigWhy::AdtDiffers), e);
+                    }
+                    let own_end = s_lo + own.len();
+                    let Some(own_slice) = slot_buf.get(s_lo..own_end) else {
+                        return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                    };
+                    if own_end > s_hi {
+                        return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                    }
+                    for &r in own_slice {
+                        out.push(Self::region_sig_slot(r, outer_binder, static_as_static, owner));
+                    }
+                    let mut child_frames: Vec<(PTy, PTy, usize, usize), A> = Vec::new_in(self.alloc);
+                    let mut pos = own_end;
+                    for (&dk, &ak) in ds.iter().zip(as_.iter()) {
+                        let Ok(kc) = heads.count(dk) else { return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e) };
+                        let next = pos + kc.len();
+                        if next > s_hi {
+                            return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                        }
+                        child_frames.push((dk, ak, pos, next));
+                        pos = next;
+                    }
+                    if pos != s_hi {
+                        return self.refuse(unaligned(ClosureSigWhy::CountsDiffer), e);
+                    }
+                    for &(dk, ak, lo, hi) in child_frames.iter().rev() {
+                        stack.push((dk, ak, lo, hi, env_args));
+                    }
+                }
+                (PNode::Alias { trait_: dt, name: dn_name, .. }, _) => {
+                    let Some(under_slice) = slot_buf.get(s_lo..s_hi) else {
+                        return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                    };
+                    let has_late = under_slice.iter().any(is_late);
+                    if has_late {
+                        let mut under_copy: Vec<Region, A> = Vec::new_in(self.alloc);
+                        under_copy.extend_from_slice(under_slice);
+                        if let Some(ce) = call_expr
+                            && let Some((norm_d, new_lo, new_hi, impl_args)) =
+                                self.normalize_sig_alias(d, dt, dn_name, &under_copy, ce, env_args, &mut slot_buf, heads, e)?
+                        {
+                            stack.push((norm_d, a, new_lo, new_hi, Some(impl_args)));
+                            continue;
+                        }
                         return self.refuse(unaligned(ClosureSigWhy::BinderHidden), e);
                     }
-                    at += c.len();
+                    for _ in 0..self.npos(a, e)? {
+                        out.push(SigSlot::Owner(*owner));
+                        *owner += 1;
+                    }
+                }
+                (PNode::Param(_) | PNode::Opaque(..), _) => {
+                    let Some(under_slice) = slot_buf.get(s_lo..s_hi) else {
+                        return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                    };
+                    if under_slice.iter().any(is_late) {
+                        return self.refuse(unaligned(ClosureSigWhy::BinderHidden), e);
+                    }
                     for _ in 0..self.npos(a, e)? {
                         out.push(SigSlot::Owner(*owner));
                         *owner += 1;
@@ -1653,46 +2074,48 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 // predicates' slots match `heads.count(d)` one-to-one; under `grain::Positions`,
                 // only the object lifetime has a position in the flow.
                 (PNode::Dynamic(_), PNode::Dynamic(_)) => {
-                    let Ok(c) = heads.count(d) else { return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e) };
-                    let Some(under) = s.get(at..at + c.len()) else { return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e) };
-                    let Some((_, predicates)) = under.split_first() else { return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e) };
+                    let Some(under) = slot_buf.get(s_lo..s_hi) else {
+                        return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                    };
+                    let Some((&obj_r, predicates)) = under.split_first() else {
+                        return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                    };
                     let an = self.npos(a, e)?;
-                    if to_usize(an) == c.len() {
-                        for _ in 0..c.len() {
-                            if !take(&mut at, &mut *owner, &mut *out) {
-                                return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
-                            }
+                    if to_usize(an) == under.len() {
+                        for &r in under {
+                            out.push(Self::region_sig_slot(r, outer_binder, static_as_static, owner));
                         }
                     } else {
                         if predicates.iter().any(|r| matches!(r, Region::Late { binder, .. } if *binder == outer_binder)) {
                             return self.refuse(unaligned(ClosureSigWhy::BinderHidden), e);
                         }
-                        if !take(&mut at, &mut *owner, &mut *out) {
-                            return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
-                        }
-                        at += predicates.len();
+                        out.push(Self::region_sig_slot(obj_r, outer_binder, static_as_static, owner));
                     }
                 }
                 (PNode::Ref(dm, di), PNode::Ref(am, ai)) if dm == am => {
-                    if !take(&mut at, &mut *owner, &mut *out) {
+                    let Some(&r) = slot_buf.get(s_lo) else {
+                        return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                    };
+                    if s_lo + 1 > s_hi {
                         return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
                     }
-                    stack.push((di, ai));
+                    out.push(Self::region_sig_slot(r, outer_binder, static_as_static, owner));
+                    stack.push((di, ai, s_lo + 1, s_hi, env_args));
                 }
-                (PNode::Ptr(dm, di), PNode::Ptr(am, ai)) if dm == am => stack.push((di, ai)),
+                (PNode::Ptr(dm, di), PNode::Ptr(am, ai)) if dm == am => stack.push((di, ai, s_lo, s_hi, env_args)),
                 (PNode::Slice(di), PNode::Slice(ai)) | (PNode::Array(di, _), PNode::Array(ai, _)) | (PNode::Pat(di, _), PNode::Pat(ai, _)) => {
-                    stack.push((di, ai));
+                    stack.push((di, ai, s_lo, s_hi, env_args));
                 }
                 (PNode::FnPtr(..), PNode::FnPtr(..)) => {
-                    let Ok(c) = heads.count(d) else { return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e) };
                     let an = self.npos(a, e)?;
-                    if to_usize(an) != c.len() {
+                    let Some(fn_slice) = slot_buf.get(s_lo..s_hi) else {
+                        return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                    };
+                    if to_usize(an) != fn_slice.len() {
                         return self.refuse(unaligned(ClosureSigWhy::CountsDiffer), e);
                     }
-                    for _ in 0..c.len() {
-                        if !take(&mut at, &mut *owner, &mut *out) {
-                            return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
-                        }
+                    for &r in fn_slice {
+                        out.push(Self::region_sig_slot(r, outer_binder, static_as_static, owner));
                     }
                 }
                 (PNode::Tuple(_), PNode::Tuple(al))
@@ -1709,7 +2132,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     {
                         return self.refuse(unaligned(ClosureSigWhy::AdtDiffers), e);
                     }
-                    let (Ok(own), Ok(Kids::List(ds))) = (heads.own(d), heads.kids(d)) else { return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e) };
+                    let (Ok(own), Ok(Kids::List(ds))) = (heads.own(d), heads.kids(d)) else {
+                        return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e);
+                    };
                     let as_ = self.list(al, e)?;
                     if ds.len() != as_.len() {
                         return self.refuse(unaligned(ClosureSigWhy::AdtDiffers), e);
@@ -1719,13 +2144,32 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     {
                         return self.refuse(unaligned(ClosureSigWhy::AdtDiffers), e);
                     }
-                    for _ in 0..own.get() {
-                        if !take(&mut at, &mut *owner, &mut *out) {
+                    let own_end = s_lo + own.len();
+                    let Some(own_slice) = slot_buf.get(s_lo..own_end) else {
+                        return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                    };
+                    if own_end > s_hi {
+                        return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                    }
+                    for &r in own_slice {
+                        out.push(Self::region_sig_slot(r, outer_binder, static_as_static, owner));
+                    }
+                    let mut child_frames: Vec<(PTy, PTy, usize, usize), A> = Vec::new_in(self.alloc);
+                    let mut pos = own_end;
+                    for (&dk, &ak) in ds.iter().zip(as_.iter()) {
+                        let Ok(kc) = heads.count(dk) else { return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e) };
+                        let next = pos + kc.len();
+                        if next > s_hi {
                             return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
                         }
+                        child_frames.push((dk, ak, pos, next));
+                        pos = next;
                     }
-                    for k in (0..ds.len()).rev() {
-                        stack.push((ds[k], as_[k]));
+                    if pos != s_hi {
+                        return self.refuse(unaligned(ClosureSigWhy::CountsDiffer), e);
+                    }
+                    for &(dk, ak, lo, hi) in child_frames.iter().rev() {
+                        stack.push((dk, ak, lo, hi, env_args));
                     }
                 }
                 (
@@ -1739,7 +2183,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 _ => return self.refuse(unaligned(ClosureSigWhy::Shape { declared: node_kind(dn), closure: node_kind(an) }), e),
             }
         }
-        if at != s.len() || to_u32(out.len() - first) != n {
+        if to_u32(out.len() - first) != n {
             return self.refuse(unaligned(ClosureSigWhy::CountsDiffer), e);
         }
         Ok(())
@@ -1774,7 +2218,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
     /// Whether closure row `row`'s body needs a relation on one of its owner signature
     /// positions (a requirement with a [`Need::Sig`] end): it holds only where every call
     /// binds those positions to the value's.
-    fn sig_needs(&self, row: usize, e: ExprId) -> Result<bool, Refusal> {
+    pub(crate) fn sig_needs(&self, row: usize, e: ExprId) -> Result<bool, Refusal> {
         let Some(&ce) = self.ck.closures.column::<0>().get(row) else { return self.refuse(Form::Malformed, e) };
         let facts: &'b F = self.facts;
         Ok(facts.closure_requirements(ce).iter().any(|r| r.from.is_sig() || r.into.is_sig()))

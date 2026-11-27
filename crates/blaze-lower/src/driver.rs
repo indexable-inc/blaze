@@ -493,10 +493,10 @@ impl<'a> ExpansionWords<'a> {
         (starts, bytes)
     }
 
-    /// Whether any word carries a mark: when none does, every path in the text is as written
-    /// in a file and the driver reads no marks.
+    /// Whether any word carries a non-transparent mark: when none does, every path in the text
+    /// resolves at the call site and the driver skips building an attribute/derive probe.
     fn any_marked(&self) -> bool {
-        self.marks.iter().any(Option::is_some)
+        self.marks.iter().any(|m| m.is_some_and(|m| m.transparency != blaze_expand::Transparency::Transparent))
     }
 
     /// The tokens of `text` (this words' text) as blaze-expand lexes them, each in a context
@@ -515,7 +515,7 @@ impl<'a> ExpansionWords<'a> {
             let ctx = match self.mark_at(start) {
                 None => t.ctx,
                 Some(m) => {
-                    let mark = blaze_expand::Mark { of: blaze_expand::MarkOf::This, transparency: m.transparency, edition: m.edition, site: m.site };
+                    let mark = blaze_expand::Mark { of: blaze_expand::MarkOf::This, transparency: m.transparency, edition: m.edition, site: m.site, local_inner: m.local_inner };
                     probe.context(blaze_expand::CtxNode { parent: t.ctx, mark }).ok()?
                 }
             };

@@ -221,7 +221,7 @@ pub(crate) fn world_of(app: &'static str) -> (Src, Option<LibKey>, &'static blaz
     let frame: &'static blaze_mem::Frame = blaze_own::Box::leak_static(blaze_own::Box::new_in(frame, g));
     let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
     let crates = [input("app", "/app/lib.rs", &[("core", CORE_AT)]), input("core", "/core/lib.rs", &[])];
-    let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), alloc: None, std: None, bstd: None };
+    let sysroot = Sysroot { core: Some(CrateId(CORE_AT as u32)), ..Sysroot::default() };
     let solved = resolve_crates(&crates, sysroot, &Texts { app }, &Serial, bump).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let solved: &'static Names<'static> = blaze_own::Box::leak_static(blaze_own::Box::new_in(solved, g));
     let mut kept = Kept { names: AVec::new_in(g), items: AVec::new_in(g), files: AVec::new_in(g), expansions: AVec::new_in(g) };
@@ -1303,4 +1303,42 @@ pub trait Isa: Super {
             seeded.frozen(want).unwrap_or_else(|e| panic!("order {order:?} failed on {want:?}: {e}"));
         }
     }
+}
+
+/// Changing a trait's `Self: 'a` bound (`trait T<'a, 'b>: 'a` -> `: 'b`) or supertrait lifetime
+/// argument (`trait Sub<'a, 'b>: Sup<'a>` -> `Sup<'b>`) keeps the frozen erased digest
+/// (`FrozenHead::meaning()`) identical while moving its `regions` digest.
+#[test]
+fn trait_self_outlives_edit_keeps_erased_digest_and_moves_regions_digest() {
+    let digests_of = |app: &'static str, target: &str| {
+        let (names, sized, frame) = world_of(app);
+        let mut found = None;
+        NamesSource::each_item(names, APP_AT, &mut |key, _| {
+            if NamesSource::name_of(names, key) == Some(target) {
+                found = Some(key);
+            }
+        });
+        let lib = found.unwrap_or_else(|| panic!("`{target}` in fixture"));
+        let w = Want::Members(lib);
+        let f = freeze(names, sized, crate::front2::receiver::Pointers::NOT_LOOKED_UP, w, frame, a(), a())
+            .unwrap_or_else(|e| panic!("freeze `{target}`: {e}"));
+        let frozen = FrozenHead::read(&f.bytes).unwrap_or_else(|e| panic!("read `{target}`: {e}"));
+        let entry = frozen
+            .heads()
+            .find(|e| e.at == HeadAt::Trait(lib))
+            .unwrap_or_else(|| panic!("missing Trait entry for `{target}`"));
+        (frozen.meaning(), entry.meaning, entry.regions)
+    };
+
+    let (m_a, e_a, r_a) = digests_of("pub trait T<'a, 'b>: 'a {}\n", "T");
+    let (m_b, e_b, r_b) = digests_of("pub trait T<'a, 'b>: 'b {}\n", "T");
+    assert_eq!(e_a, e_b, "`trait T<'a, 'b>: 'a` -> `: 'b` must keep erased reader digest identical");
+    assert_eq!(m_a, m_b, "`trait T<'a, 'b>: 'a` -> `: 'b` must keep frozen meaning identical");
+    assert_ne!(r_a, r_b, "`trait T<'a, 'b>: 'a` -> `: 'b` must move regions digest");
+
+    let (sm_a, se_a, sr_a) = digests_of("pub trait Sup<'x>: 'x {}\npub trait Sub<'a, 'b>: Sup<'a> {}\n", "Sub");
+    let (sm_b, se_b, sr_b) = digests_of("pub trait Sup<'x>: 'x {}\npub trait Sub<'a, 'b>: Sup<'b> {}\n", "Sub");
+    assert_eq!(se_a, se_b, "`trait Sub<'a, 'b>: Sup<'a>` -> `Sup<'b>` must keep erased reader digest identical");
+    assert_eq!(sm_a, sm_b, "`trait Sub<'a, 'b>: Sup<'a>` -> `Sup<'b>` must keep frozen meaning identical");
+    assert_ne!(sr_a, sr_b, "`trait Sub<'a, 'b>: Sup<'a>` -> `Sup<'b>` must move regions digest");
 }

@@ -20,7 +20,6 @@
 //! "CARGO_PKG_AUTHORS=`A <a@x>:B` in crate `tempo_xtask`; NOT_A_CARGO_VAR unset;
 //! CARGO_TARGET_TMPDIR refused by name; an authors edit re-enters, a description edit does not".
 
-use std::string::String;
 use std::sync::Arc;
 
 use blaze_proc_macro::package_env::EnvRefused;
@@ -72,24 +71,28 @@ fn a_macro_reads_cargo_pkg_authors_as_env_does_and_an_unknown_name_is_refused_by
     assert_eq!(env.get("CARGO_PKG_HOMEPAGE"), Ok(Some("")), "an unstated key is cargo's empty value");
     let mut sandbox = Sandbox::new(Arc::new(unit_package(&env, member()).unwrap_or_else(|e| panic!("{e:?}"))));
     let authors = sandbox.var("CARGO_PKG_AUTHORS");
-    assert_eq!(authors, Ok(Some(String::from("A <a@x>:B"))), "the derive of clap::Parser reads the manifest's authors");
-    assert_eq!(sandbox.var("CARGO_PKG_DESCRIPTION"), Ok(Some(String::from("the xtask"))));
-    assert_eq!(sandbox.var("CARGO_PKG_RUST_VERSION"), Ok(Some(String::from("1.88"))));
-    assert_eq!(sandbox.var("CARGO_PRIMARY_PACKAGE"), Ok(Some(String::from("1"))), "a member's crate");
+    assert_eq!(authors.as_ref().map(|v| v.as_deref()), Ok(Some("A <a@x>:B")), "the derive of clap::Parser reads the manifest's authors");
+    assert_eq!(sandbox.var("CARGO_PKG_DESCRIPTION").as_ref().map(|v| v.as_deref()), Ok(Some("the xtask")));
+    assert_eq!(sandbox.var("CARGO_PKG_RUST_VERSION").as_ref().map(|v| v.as_deref()), Ok(Some("1.88")));
+    assert_eq!(sandbox.var("CARGO_PRIMARY_PACKAGE").as_ref().map(|v| v.as_deref()), Ok(Some("1")), "a member's crate");
     // A name cargo never sets is unset, not refused: no ambient environment (rule 75).
     assert_eq!(sandbox.var("NOT_A_CARGO_VAR"), Ok(None));
-    // A name cargo sets whose value this build does not know is refused by name.
+    // Integration test/bench gets the deterministic guest scratch dir.
     let mut test = Sandbox::new(Arc::new(unit_package(&xtask(WRITTEN, true), member()).unwrap_or_else(|e| panic!("{e:?}"))));
+    assert_eq!(test.var("CARGO_TARGET_TMPDIR").as_ref().map(|v| v.as_deref()), Ok(Some("/target/tmp")));
+    // A name cargo sets whose value this build does not know is refused by name.
+    let unjoined = CrateEnv::of(EnvFacts { build_script: true, script: None, ..env.facts() }, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("{e}"));
+    let mut unjoined_box = Sandbox::new(Arc::new(unit_package(&unjoined, member()).unwrap_or_else(|e| panic!("{e:?}"))));
     assert_eq!(
-        test.var("CARGO_TARGET_TMPDIR"),
-        Err(EnvRefused { name: String::from("CARGO_TARGET_TMPDIR"), krate: Some(String::from("tempo_xtask")) })
+        unjoined_box.var("OUT_DIR"),
+        Err(EnvRefused { name: "OUT_DIR".into(), krate: Some("tempo_xtask".into()) })
     );
     // CONTROL: the graph carrying no metadata leaves the old refusal in place, named.
     let unknown = CrateEnv::of(EnvFacts { meta: None, ..env.facts() }, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("{e}"));
     let mut old = Sandbox::new(Arc::new(unit_package(&unknown, member()).unwrap_or_else(|e| panic!("{e:?}"))));
-    assert_eq!(old.var("CARGO_PKG_AUTHORS"), Err(EnvRefused { name: String::from("CARGO_PKG_AUTHORS"), krate: Some(String::from("tempo_xtask")) }));
+    assert_eq!(old.var("CARGO_PKG_AUTHORS"), Err(EnvRefused { name: "CARGO_PKG_AUTHORS".into(), krate: Some("tempo_xtask".into()) }));
     println!(
-        "CARGO_PKG_AUTHORS=`{}` in crate `tempo_xtask`; NOT_A_CARGO_VAR unset; CARGO_TARGET_TMPDIR refused by name",
+        "CARGO_PKG_AUTHORS=`{}` in crate `tempo_xtask`; NOT_A_CARGO_VAR unset; OUT_DIR refused by name",
         authors.ok().flatten().unwrap_or_default()
     );
 }

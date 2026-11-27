@@ -47,26 +47,37 @@ pub const NO_MARK: u32 = u32::MAX;
 /// The column's head: its row count and mark count.
 const HEAD: usize = 8;
 
+/// Flag bit packed into the 4-byte transparency word (`bytes[68..72]`) for
+/// `#[macro_export(local_inner_macros)]` token hygiene, keeping [`MARK`] at 76 bytes.
+const LOCAL_INNER_BIT: u32 = 1 << 8;
+
 /// A token's mark as the column keeps it: the innermost mark of its context (blaze-expand
-/// `TokenStream::hygiene`): where the macro is defined, how it resolves names, and the edition
-/// the token is read in.
+/// `TokenStream::hygiene`): where the macro is defined, how it resolves names, the edition
+/// the token is read in, and whether it came from a `#[macro_export(local_inner_macros)]` body.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TextMark {
     pub site: DefSite,
     pub transparency: Transparency,
     pub edition: Edition,
+    pub local_inner: bool,
 }
 
 impl TextMark {
     /// The column's form of an expansion's mark.
     pub fn of(mark: crate::tokens::Mark) -> TextMark {
-        TextMark { site: mark.site, transparency: mark.transparency, edition: mark.edition }
+        TextMark {
+            site: mark.site,
+            transparency: mark.transparency,
+            edition: mark.edition,
+            local_inner: mark.local_inner,
+        }
     }
 
     /// The stream mark a token of a text keeps when the text is lexed again
-    /// ([`crate::tokens::lex_marked`]): this mark's site, transparency and edition, of an earlier
-    /// expansion ([`crate::MarkOf::Outer`], never `This`: a call's input holds no mark of the
-    /// call's own, `ExpandError::Unsealed`), named by a key hashed from the mark's bytes.
+    /// ([`crate::tokens::lex_marked`]): this mark's site, transparency, edition and
+    /// `local_inner` flag, of an earlier expansion ([`crate::MarkOf::Outer`], never `This`: a
+    /// call's input holds no mark of the call's own, `ExpandError::Unsealed`), named by a key
+    /// hashed from the mark's bytes.
     ///
     /// Keeping `self.transparency` pairs with [`Self::local_hygiene`] in `blaze-lower`
     /// (`Machine::hygiene_at`): both the item's own tokens and any token re-lexed into an inner
@@ -74,13 +85,30 @@ impl TextMark {
     /// bindings match across inner calls (`proptest!`) while call-site parameters stay
     /// hygienically separate from def-site template identifiers (`cold!` in `blaze-sys`).
     pub fn as_outer_mark(self) -> crate::tokens::Mark {
+        // Hash only hygiene identity (`site` + `transparency`), not `edition`: when a
+        // `Transparent` proc-macro of one edition is invoked inside a `SemiOpaque`/`Opaque`
+        // macro of another edition, its tokens carry the enclosing macro's `site`/`transparency`
+        // with the proc-macro's `edition` and must still share `local_hygiene` with the enclosing
+        // macro's own tokens.
         let mut hasher = blaze_ids::Hasher::new("blaze v2 text mark expansion 1");
-        hasher.part(&self.to_bytes());
+        hasher.part(&self.site.krate.0.0);
+        match self.site.module {
+            Some(module) => {
+                hasher.part(&1u32.to_le_bytes());
+                hasher.part(&module.0.0);
+            }
+            None => {
+                hasher.part(&0u32.to_le_bytes());
+                hasher.part(&[0u8; 32]);
+            }
+        }
+        hasher.part(&u32::from(self.transparency.byte()).to_le_bytes());
         crate::tokens::Mark {
             of: crate::tokens::MarkOf::Outer(hasher.finish()),
             transparency: self.transparency,
             edition: self.edition,
             site: self.site,
+            local_inner: self.local_inner,
         }
     }
 
@@ -105,9 +133,9 @@ impl TextMark {
     }
 
     /// The mark's [`MARK`] bytes, little-endian: the crate key (32), the module flag u32 (0 none,
-    /// 1 some), the module key (32, zero for none), the transparency byte as u32, the edition
-    /// byte as u32. One mark has one form: the column's table and the lowered body's marks
-    /// (blaze-lower) both keep these bytes.
+    /// 1 some), the module key (32, zero for none), the transparency byte plus `LOCAL_INNER_BIT`
+    /// as u32, the edition byte as u32. One mark has one form: the column's table and the lowered
+    /// body's marks (blaze-lower) both keep these bytes.
     pub fn to_bytes(self) -> [u8; MARK] {
         let mut out = [0u8; MARK];
         out[..32].copy_from_slice(&self.site.krate.0.0);
@@ -115,14 +143,15 @@ impl TextMark {
             out[32..36].copy_from_slice(&1u32.to_le_bytes());
             out[36..68].copy_from_slice(&module.0.0);
         }
-        out[68..72].copy_from_slice(&u32::from(self.transparency.byte()).to_le_bytes());
+        let flags = u32::from(self.transparency.byte()) | if self.local_inner { LOCAL_INNER_BIT } else { 0 };
+        out[68..72].copy_from_slice(&flags.to_le_bytes());
         out[72..76].copy_from_slice(&u32::from(self.edition.byte()).to_le_bytes());
         out
     }
 
     /// The mark [`to_bytes`](TextMark::to_bytes) wrote, or `None` for bytes no mark writes: a
     /// length other than [`MARK`], a flag other than 0 or 1, a nonzero module key under flag 0,
-    /// or a transparency or edition no byte names.
+    /// unknown flag bits, or a transparency or edition no byte names.
     pub fn from_bytes(bytes: &[u8]) -> Option<TextMark> {
         if bytes.len() != MARK {
             return None;
@@ -137,9 +166,14 @@ impl TextMark {
             1 => Some(ItemKey(key(36))),
             _ => return None,
         };
-        let transparency = Transparency::from_byte(u8::try_from(u32_at(bytes, 68)).ok()?)?;
+        let flags = u32_at(bytes, 68);
+        if (flags & !(0xff | LOCAL_INNER_BIT)) != 0 {
+            return None;
+        }
+        let transparency = Transparency::from_byte(u8::try_from(flags & 0xff).ok()?)?;
+        let local_inner = (flags & LOCAL_INNER_BIT) != 0;
         let edition = Edition::from_byte(u8::try_from(u32_at(bytes, 72)).ok()?)?;
-        Some(TextMark { site: DefSite { krate: CrateItemKey(key(0)), module }, transparency, edition })
+        Some(TextMark { site: DefSite { krate: CrateItemKey(key(0)), module }, transparency, edition, local_inner })
     }
 }
 
@@ -320,7 +354,9 @@ impl<'a> OriginColumn<'a> {
 
     /// The identity column of a text that IS a call's input as written: `places` are its tokens'
     /// bytes ([`input_places`], token `i` at entry `i`), every row `TextOrigin::Input` of its
-    /// token with no mark. The lexer gives several tokens ONE place (blaze-expand tokens.rs
+    /// token with the mark `mark_at(start)` returns (for a kept item written by a parent macro
+    /// expansion, the parent column's mark at that token's offset; `|_| None` for a file-written
+    /// item). The lexer gives several tokens ONE place (blaze-expand tokens.rs
     /// `place_new`): a doc comment's `# [ doc = ".." ]` stand at the comment's bytes, a
     /// lifetime's `'` and name at the lifetime's, the groups one closer closes at that closer,
     /// the groups a text leaves open at its end. Such a run is one row, the run's FIRST token's
@@ -328,7 +364,11 @@ impl<'a> OriginColumn<'a> {
     /// the same bytes). So the column is sorted and each place once by construction, for any
     /// text the lexer reads (tempo census g051231: 70 rows "row 1 (0..39) is out of order after
     /// one ending at 39", a kept item `/// doc` + `#[derive(..)] #[serde(..)] enum CallKind`).
-    pub fn input_identity(places: &[(u32, u32)], alloc: Alloc<'a>) -> Result<OriginColumn<'a>, ColumnError> {
+    pub fn input_identity(
+        places: &[(u32, u32)],
+        mut mark_at: impl FnMut(u32) -> Option<TextMark>,
+        alloc: Alloc<'a>,
+    ) -> Result<OriginColumn<'a>, ColumnError> {
         let mut column = OriginColumn::new_in(alloc);
         let mut previous: Option<(u32, u32)> = None;
         for (i, &(start, end)) in places.iter().enumerate() {
@@ -336,7 +376,7 @@ impl<'a> OriginColumn<'a> {
                 continue;
             }
             previous = Some((start, end));
-            column.push(start as usize, end as usize, TextOrigin::Input(place32(i)?), None)?;
+            column.push(start as usize, end as usize, TextOrigin::Input(place32(i)?), mark_at(start))?;
         }
         Ok(column)
     }

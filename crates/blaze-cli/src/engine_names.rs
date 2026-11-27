@@ -283,6 +283,7 @@ pub(crate) struct Handles<'h, 'f> {
     pub(crate) lock: Option<&'f blaze_manifest::lock::Lock<'static>>,
     pub(crate) members: Option<&'h [crate::graph::CheckoutDir]>,
     pub(crate) env: &'h FetchEnv<'h>,
+    pub(crate) producers: blaze_ids::producer::Producers,
     pub(crate) side: Option<&'h crate::proc_runner::MacroSide<'h, 'h, 'h>>,
     pub(crate) outlined: &'h [Outlined<'h>],
     pub(crate) workers: core::num::NonZeroU32,
@@ -2278,9 +2279,9 @@ impl Job<'_, '_> {
         for &(alias, g) in input.deps {
             own_deps.push((alias, place(g)?));
         }
-        let all = [self.all.core, self.all.alloc, self.all.std, self.all.bstd];
+        let all = self.all.all();
         let given = crate::names::sysroot_given(matches!(krate.origin, blaze_world::Origin::Toolchain(_)), self.at, all.map(|id| id.map(CrateId::index)), input.deps);
-        let mut ids = [None; 4];
+        let mut ids = [None; 5];
         for ((slot, id), give) in ids.iter_mut().zip(all).zip(given) {
             if let Some(id) = id {
                 if give { *slot = Some(CrateId(place(id.index())? as u32)); }
@@ -2288,7 +2289,7 @@ impl Job<'_, '_> {
             }
         }
         for dep in self.deps { place(dep.index)?; }
-        let sysroot = Sysroot { core: ids[0], alloc: ids[1], std: ids[2], bstd: ids[3] };
+        let sysroot = Sysroot { core: ids[0], alloc: ids[1], std: ids[2], proc_macro: ids[3], bstd: ids[4] };
         let mut exports = Vec::with_capacity_in(order.len(), local);
         for (dep, maybe_proof) in order.iter().zip(order_proofs.iter().copied()) {
             let proof = match maybe_proof {
@@ -3262,7 +3263,7 @@ fn edges_listed<'l>(list: &'l blaze_world::crate_list::CrateList<'static>, at: u
 
 fn edges_of<'w>(krate: &blaze_world::Crate<'w>, all: Sysroot, at: usize) -> impl Iterator<Item = usize> + use<'w> {
     let toolchain = matches!(krate.origin, blaze_world::Origin::Toolchain(_));
-    let sysroot = [all.core, all.alloc, all.std, all.bstd].into_iter().flatten()
+    let sysroot = all.all().into_iter().flatten()
         .map(|id| id.index()).filter(move |&g| !toolchain && g != at);
     krate.input.deps.iter().map(|&(_, g)| g).chain(sysroot)
 }

@@ -365,6 +365,20 @@ impl<'a> Make<'a> for Kept<'_> {
                 };
                 return Ok(blaze_scope::names_cells::seen_by_record(&record, Some((&items_rec, &read)), &[], syms).expect("internal symbols cell").unwrap_or(ABSENT));
             }
+            let exports = NameCell::Exports { krate: c.key.prefix() };
+            if want.of == blaze_drive::key::crate_scope_name(&c.key) && want.cell.0 == exports.key() {
+                let record = blaze_scope::names_record::NamesRecord::open(blaze_scope::names_record::Verified::check(c.names).expect("names record"));
+                let text = c.text;
+                let items_rec = blaze_scope::items_record::ItemsRecord::open_with_files(c.items, blaze_own::testing::heap().alloc(), move |index, _, _, edition| {
+                    if index != 0 { return Ok(None); }
+                    blaze_scope::items_record::CurrentFile::from_text(index, text, edition, blaze_own::testing::bump()).map(Some)
+                }).expect("items record");
+                let read = |of: blaze_scope::items_record::TextOf<'_>| match of {
+                    blaze_scope::items_record::TextOf::File { index: 0, .. } => Some(text),
+                    _ => None,
+                };
+                return Ok(blaze_scope::names_cells::seen_by_record(&record, Some((&items_rec, &read)), &[], exports).expect("exports cell").unwrap_or(ABSENT));
+            }
         }
         Ok(ContentId::of("internal binding fixture cell", &want.cell.0))
     }
@@ -970,4 +984,192 @@ fn pure_initializers_place_their_calls_without_a_runtime_function_row() {
     };
     assert_eq!(inspect("", 0), inspect("\n\n\n", 3));
     println!("const and static initializer calls move by three lines with identical stored sites");
+}
+
+#[test]
+fn same_program_no_mangle_and_export_name_bind_equally_and_external_c_falls_through() {
+    on_checker_stack(|| {
+        let caller: &'static str = r#"#![feature(no_core)]
+#![no_core]
+unsafe extern "C" {
+    fn rt_no_mangle() -> i32;
+    #[link_name = "rt_custom_sym"]
+    fn rt_aliased() -> i32;
+    fn external_libc_fn() -> i32;
+    fn weak_fallback_fn() -> i32;
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    unsafe { rt_no_mangle() + rt_aliased() + external_libc_fn() + weak_fallback_fn() }
+}
+"#;
+        let provider: &'static str = r#"#![feature(no_core, linkage)]
+#![no_core]
+mod inner {
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn rt_no_mangle() -> i32 { 7 }
+
+    #[unsafe(no_mangle)]
+    #[unsafe(export_name = "rt_custom_sym")]
+    pub unsafe extern "C" fn impl_custom() -> i32 { 11 }
+
+    #[unsafe(no_mangle)]
+    #[linkage = "weak"]
+    pub unsafe extern "C" fn weak_fallback_fn() -> i32 { 0 }
+}
+"#;
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let a = blaze_own::testing::heap().alloc();
+        let files = [SourceFile { path: ROOT, text: caller }];
+        let tc = Toolchain::none(a);
+        let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: OverflowChecks::Off };
+        let texts = ProgramTexts::new(&files, ROOT, new, &tc, Panic::Unwind).expect("fixture texts");
+        let user = texts.user();
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let app = inputs.crates()[0];
+        let crates = [
+            CrateInput { deps: &[("provider", 1)], ..app },
+            CrateInput {
+                name: "provider",
+                key: CrateItemKey(ContentId::of("export binding fixture crate", b"provider")),
+                implicit: blaze_unit_graph::implicit(user.edition, &blaze_unit_graph::UnitKind::Lib),
+                root: "/provider/src/lib.rs",
+                shown_from: "/provider",
+                deps: &[],
+                ..app
+            },
+        ];
+        let roots = [(app.root, caller), (crates[1].root, provider)];
+        let names = resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, blaze_own::testing::bump()).expect("fixture names");
+        let lib = |krate, name| names.items(krate).map(|(k, _, _)| k).find(|&k| names.name_of(k) == Some(name)).expect("named item");
+        let main = lib(0, "main");
+        let entry = checker_of(main);
+        let decl_nm = checker_of(lib(0, "rt_no_mangle"));
+        let decl_alias = checker_of(lib(0, "rt_aliased"));
+        let decl_ext = checker_of(lib(0, "external_libc_fn"));
+        let decl_weak = checker_of(lib(0, "weak_fallback_fn"));
+        let def_nm = checker_of(lib(1, "rt_no_mangle"));
+        let def_custom = checker_of(lib(1, "impl_custom"));
+
+        let whole = Front2Program::new(&names, &frame, &files, a).expect("whole program");
+        let log = frame.alloc(Log::new(&["ladder", "provider"], a));
+        let kept = keep(&names, &frame, a);
+        let records = frame.alloc(Records::new(frame.alloc_slice_copy(&[crates[0].key, crates[1].key]), kept, log, &frame, a));
+        let mut lazy = LazyProgram::from_records(records, &frame, &[0], Some(entry), a).expect("lazy program");
+        lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("exported main");
+        let (li, _) = lazy.check_one(entry).expect("lazy check main").expect("main has a body");
+        let wi = whole.entry().expect("whole main");
+
+        let mut ground = PortableTys::new_in(a);
+        // Strong Rust exports resolve identically in whole and lazy to their Rust definitions and become FnKind::Free.
+        assert_eq!(whole.resolve(wi, decl_nm, List::EMPTY, &mut ground).expect("whole no_mangle"), (def_nm, List::EMPTY));
+        assert_eq!(lazy.resolve(li, decl_nm, List::EMPTY, &mut ground).expect("lazy no_mangle"), (def_nm, List::EMPTY));
+        assert_eq!(whole.resolve(wi, decl_alias, List::EMPTY, &mut ground).expect("whole export_name"), (def_custom, List::EMPTY));
+        assert_eq!(lazy.resolve(li, decl_alias, List::EMPTY, &mut ground).expect("lazy export_name"), (def_custom, List::EMPTY));
+
+        let check_row = |front: &dyn FrontEnd, key, want_kind, want_sym: &str| {
+            let idx = front.fn_index(key).expect("tabled fn");
+            let f = front.function(idx);
+            assert_eq!((f.kind, f.symbol), (want_kind, want_sym));
+        };
+        check_row(&whole, decl_nm, FnKind::Free, "");
+        check_row(&lazy, decl_nm, FnKind::Free, "");
+        check_row(&whole, decl_alias, FnKind::Free, "");
+        check_row(&lazy, decl_alias, FnKind::Free, "");
+
+        // External C symbol and weak-only Rust definition fall through to FnKind::Foreign.
+        check_row(&whole, decl_ext, FnKind::Foreign, "external_libc_fn");
+        check_row(&lazy, decl_ext, FnKind::Foreign, "external_libc_fn");
+        check_row(&whole, decl_weak, FnKind::Foreign, "weak_fallback_fn");
+        check_row(&lazy, decl_weak, FnKind::Foreign, "weak_fallback_fn");
+
+        // BodyCheck and LazyProgram both record NameCell::Exports for every crate in scope (Rule 21).
+        let recorder = Recorder::new(RecorderOpts { alloc: a });
+        let view = Tables::new(TablesOpts { records, impls: None, lang_crates: &[0], reads: &recorder });
+        let planned = Planned {
+            name: Name::new(Kind::BodyCheck, main.0),
+            phase: Phase::new(Stage::Bodies, 0),
+            source: ABSENT,
+            file: Name::new(Kind::FileItems, ABSENT),
+        };
+        let body = BodyFrame {
+            frame: &frame, alloc: a, plant_drop: None, cost: None, needs: blaze_ladder::front2::heads::NeedsMet::All,
+            heads: None, sources: None, goals: None, prepared: None, front: None,
+        };
+        let filed = check_body(view, &Task { planned, key: Key(ABSENT) }, &body, kept, blaze_own::testing::heap().shared())
+            .expect("caller BodyCheck read list");
+        for c in crates {
+            let exports = TableRead::Names(NameCell::Exports { krate: c.key.prefix() });
+            assert!(lazy.export_binding_reads(entry).contains(&exports), "lazy main must record Exports read in {}", c.name);
+            assert!(filed.reads.scan_for(&exports).is_some(), "BodyCheck must retain Exports read of {}", c.name);
+        }
+        assert!(records.errors().is_empty(), "record reads: {:?}", records.errors());
+    });
+}
+
+#[test]
+fn duplicate_exported_symbol_is_refused_deterministically_in_whole_and_lazy() {
+    on_checker_stack(|| {
+        let caller: &'static str = r#"#![feature(no_core)]
+#![no_core]
+unsafe extern "C" {
+    fn dup_sym() -> i32;
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    unsafe { dup_sym() }
+}
+"#;
+        let provider: &'static str = r#"#![feature(no_core)]
+#![no_core]
+mod a { #[unsafe(no_mangle)] pub unsafe extern "C" fn dup_sym() -> i32 { 1 } }
+mod b { #[unsafe(export_name = "dup_sym")] pub unsafe extern "C" fn other() -> i32 { 2 } }
+"#;
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let a = blaze_own::testing::heap().alloc();
+        let files = [SourceFile { path: ROOT, text: caller }];
+        let tc = Toolchain::none(a);
+        let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: OverflowChecks::Off };
+        let texts = ProgramTexts::new(&files, ROOT, new, &tc, Panic::Unwind).expect("fixture texts");
+        let user = texts.user();
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let app = inputs.crates()[0];
+        let crates = [
+            CrateInput { deps: &[("provider", 1)], ..app },
+            CrateInput {
+                name: "provider",
+                key: CrateItemKey(ContentId::of("dup export fixture crate", b"provider")),
+                implicit: blaze_unit_graph::implicit(user.edition, &blaze_unit_graph::UnitKind::Lib),
+                root: "/provider/src/lib.rs",
+                shown_from: "/provider",
+                deps: &[],
+                ..app
+            },
+        ];
+        let roots = [(app.root, caller), (crates[1].root, provider)];
+        let names = resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, blaze_own::testing::bump()).expect("fixture names");
+        let main = names.items(0).map(|(k, _, _)| k).find(|&k| names.name_of(k) == Some("main")).expect("main");
+        let entry = checker_of(main);
+
+        let whole = Front2Program::new(&names, &frame, &files, a);
+        let log = frame.alloc(Log::new(&["ladder", "provider"], a));
+        let kept = keep(&names, &frame, a);
+        let records = frame.alloc(Records::new(frame.alloc_slice_copy(&[crates[0].key, crates[1].key]), kept, log, &frame, a));
+        let mut lazy = LazyProgram::from_records(records, &frame, &[0], Some(entry), a).expect("lazy program");
+        lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("exported main");
+        let checked = lazy.check_one(entry);
+
+        let Err(Front2Refusal::Unchecked { class: wc, first: wd, .. }) = whole else {
+            panic!("whole front must refuse duplicate exported symbol");
+        };
+        let Err(RunError::Front2(Front2Refusal::Lazy(blaze_ladder::front2::program::lazy::LazyRefusal::Row { refusal, .. }))) = checked else {
+            panic!("lazy front must refuse duplicate exported symbol: got {checked:?}");
+        };
+        let Front2Refusal::Unchecked { class: lc, first: ld, .. } = *refusal else {
+            panic!("lazy refusal must carry Unchecked payload: got {refusal:?}");
+        };
+        assert_eq!(wc, lc);
+        assert_eq!(wd, ld);
+        assert!(wd.contains("dup_sym") && wd.contains("defined twice"), "unexpected refusal detail: {wd}");
+    });
 }

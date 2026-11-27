@@ -390,6 +390,7 @@ impl HeadRows {
         part(NameCell::Files { krate }, "Files".into());
         part(NameCell::Extensions { krate }, "Extensions".into());
         part(NameCell::CfgAtoms { krate }, "CfgAtoms".into());
+        part(NameCell::Exports { krate }, "Exports".into());
         part(NameCell::Module { module }, "Module(crate root)".into());
         part(NameCell::Item { key: module }, "Item(crate root)".into());
         part(NameCell::Textual { module }, "Textual(crate root)".into());
@@ -428,7 +429,7 @@ impl HeadRows {
                 }
                 kind => panic!("unexpected fixture signature {kind:?} at {path}::{word}"),
             };
-            let cell = crate::engine_heads::head_cell(want, word, None, crate::engine_tasks::WHOLE);
+            let cell = crate::engine_heads::head_cell(want, module, word, None, crate::engine_tasks::WHOLE);
             self.head_units.insert(CellId { of: name, cell }, krate);
             for (cell, kind) in [
                 (NameCell::Item { key }, "Item"), (NameCell::Members { owner: key }, "Members"),

@@ -153,17 +153,37 @@ pub fn write<'a>(
 /// attributes keep, `#[derive(..)] #[helper(..)] struct S { .. }`), in `alloc`. The text IS the
 /// call's input as written (a slice of the calling text), so its column is the identity: token
 /// `i`, lexed as every reader lexes a call's input (blaze-expand `input_places`, the whole
-/// item), is input token `i` (tokens sharing one place: one row, the first's), with no mark (the lowering reads the kept text with none:
-/// resolve.rs `keep_item`, `Fragment::marks`). Its call part names the entry the call is at,
-/// the item itself: a reader of a head the kept item declares walks to that file entry and its
-/// `Signature` (blaze-cli body_types/covered.rs `callers`), and a finding in the text maps to
-/// the user's own tokens. A function of the text alone (rules 25, 71).
-pub fn kept<'a>(call: ItemKey, place: Option<CallInText>, text: &str, macro_name: &str, edition: Edition, alloc: Bump<'a>) -> Result<&'a [u8], OriginsError> {
+/// item), is input token `i` (tokens sharing one place: one row, the first's). When the kept
+/// item was written by a parent expansion (`parent = Some(marks)`), each token carries the mark
+/// it had in `parent` (so `$crate` rendered as `crate` with [`crate::crate_roots::root_mark`]
+/// and def-site marks survive `KEEP_ITEM`); for a file-written item (`parent = None`), rows keep
+/// no mark. Its call part names the entry the call is at, the item itself: a reader of a head
+/// the kept item declares walks to that file entry and its `Signature` (blaze-cli
+/// body_types/covered.rs `callers`), and a finding in the text maps to the user's own tokens.
+/// A function of the text and parent marks alone (rules 25, 71).
+pub fn kept<'a>(
+    call: ItemKey,
+    place: Option<CallInText>,
+    text: &str,
+    macro_name: &str,
+    edition: Edition,
+    parent: Option<crate::crate_roots::TextMarks<'_>>,
+    alloc: Bump<'a>,
+) -> Result<&'a [u8], OriginsError> {
     let a = alloc.alloc();
     let places = input_places(text, InputShape::Whole, edition, a).map_err(|_| OriginsError::KeptLex { call })?;
+    let parent_offset = match parent {
+        Some(marks) => Some((marks, offset_in(marks.text, text).ok_or(OriginsError::InputNotInText { call })?)),
+        None => None,
+    };
     // One row a PLACE, not a token: a doc comment's tokens, a lifetime's two and the groups one
     // closer closes share one (blaze-expand `OriginColumn::input_identity`).
-    let column = OriginColumn::input_identity(&places, a).map_err(|error| OriginsError::Column { call: Some(call), error })?;
+    let column = OriginColumn::input_identity(
+        &places,
+        |start| parent_offset.and_then(|(marks, base)| marks.mark_at(base.checked_add(start)?)),
+        a,
+    )
+    .map_err(|error| OriginsError::Column { call: Some(call), error })?;
     write(call, place, InputShape::Whole, macro_name, false, &column, alloc)
 }
 
@@ -178,8 +198,8 @@ pub fn column_of<'a>(
     roots: &[(u32, blaze_id::CrateItemKey)],
     origins: &[blaze_expand::TokenOrigin],
     input: blaze_expand::origin_column::InputIndex<'_>,
-    // Each token's innermost mark (drive.md, "A token keeps its mark": the same column):
-    // `|at| expansion.hygiene(at).mark.map(TextMark::of)`.
+    // Each token's projected text mark (drive.md, "A token keeps its mark": the same column):
+    // `|at| expansion.text_mark(at)`.
     marks: &dyn Fn(usize) -> Option<blaze_expand::origin_column::TextMark>,
     alloc: Alloc<'a>,
 ) -> Result<OriginColumn<'a>, OriginsError> {

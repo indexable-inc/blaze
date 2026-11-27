@@ -360,6 +360,10 @@ fn encode_name_cell<A: core::alloc::Allocator>(cell: NameCell, out: &mut blaze_o
             out.push(20);
             out.extend_from_slice(&krate);
         }
+        NameCell::Exports { krate } => {
+            out.push(21);
+            out.extend_from_slice(&krate);
+        }
     }
 }
 
@@ -396,6 +400,7 @@ fn decode_name_cell(r: &mut BsfReader<'_>) -> Result<NameCell, StretchFrontError
         18 => Ok(NameCell::Files { krate: r.take_array::<8>()? }),
         19 => Ok(NameCell::Extensions { krate: r.take_array::<8>()? }),
         20 => Ok(NameCell::CfgAtoms { krate: r.take_array::<8>()? }),
+        21 => Ok(NameCell::Exports { krate: r.take_array::<8>()? }),
         tag => Err(StretchFrontError::NameCellTag { tag }),
     }
 }
@@ -530,6 +535,7 @@ impl<'n> NamesSource<'n> for DecodeLangSource<'n> {
         None
     }
     fn each_item(self, _krate: usize, _each: &mut dyn FnMut(ItemKey, ItemKey)) -> bool { false }
+    fn each_export_candidate(self, _krate: usize, _alloc: Alloc<'_>, _each: &mut dyn FnMut(ItemKey, Option<&'n str>, bool, bool)) -> bool { false }
     fn block_binding(self, _module: ItemKey, _ns: blaze_surface::Namespace, _name: &str) -> Option<Option<blaze_surface::Binding>> { None }
     fn binds(self, _module: ItemKey, _ns: blaze_surface::Namespace, _name: &'n str) -> bool { false }
     fn key_beginning(self, _first: [u8; 16]) -> Option<ItemKey> { None }
@@ -1958,9 +1964,10 @@ fn collect_body_reads<'v, 'n, 'w>(
         recorder.checking(Some("the verdict's dependency facts"));
         let (verdict, borrows) = &one.got;
         let facts = verdict.facts.as_ref().map_err(|e| TaskError::Facts(*e))?;
-        // An internal-symbol declaration the body named was bound by searching crates' items:
-        // that search is the body's read (front2 internal_symbol.rs `record_search`).
+        // An internal-symbol or same-program exported-symbol declaration the body named was bound
+        // by searching crates' items: record those covering cells in the body's read list.
         super::super::internal_symbol::record_search(view, &world.store, facts);
+        super::super::export_shim::record_search(view, &world.store, facts);
         for row in facts.rows.iter() {
             if !fact_kind_has_read(row.fact.kind) || row.fact.key == 0 {
                 continue;
@@ -5622,6 +5629,7 @@ pub fn entry(x: u8) -> u8 {
             TableRead::Names(NameCell::Files { krate: c8(17) }),
             TableRead::Names(NameCell::Extensions { krate: c8(18) }),
             TableRead::Names(NameCell::CfgAtoms { krate: c8(19) }),
+            TableRead::Names(NameCell::Exports { krate: c8(29) }),
             TableRead::Names(NameCell::Textual { module: k(20) }),
             TableRead::Names(NameCell::Whole { krate: c8(21), section: Section::Names }),
             TableRead::Names(NameCell::Whole { krate: c8(22), section: Section::Items }),

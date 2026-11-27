@@ -131,22 +131,34 @@ pub fn clang_pin<'t>(text: &'t str, target: &'t str) -> Result<ClangPin<'t>, Pin
     Ok(ClangPin { target, release, name, size, sha256 })
 }
 
+/// The Linux host sysroot root directory when `pins/clang.json` specifies `"linux-host"`.
+pub const LINUX_HOST_SYSROOT_DIR: &str = "/usr";
+
+/// Marker header under a Linux host sysroot whose bytes identify the host C library headers.
+pub const LINUX_HOST_SYSROOT_MARKER: &str = "include/features.h";
+
 /// Where a target's C library headers come from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Sysroot {
     /// The machine's installed macOS SDK, granted read-only, keyed by its version and the
     /// headers read (Apple's SDK cannot be redistributed).
     MacosSdk,
-    /// A sysroot fetched by its SHA-256 (the Linux row's shape; none is pinned yet).
+    /// The Linux host's `/usr` sysroot (`/usr/include` and `/usr/include/<multiarch>`), granted
+    /// read-only and keyed by [`LINUX_HOST_SYSROOT_MARKER`] until a standalone glibc sysroot
+    /// archive is pinned.
+    LinuxHost,
+    /// A sysroot fetched by its SHA-256 (the pinned Linux row's shape; none is pinned yet).
     Pinned { sha256: [u8; 32] },
 }
 
-/// `target`'s sysroot row: `"macos-sdk"`, a 64-hex digest, or `null` ([`PinError::NoSysroot`]).
+/// `target`'s sysroot row: `"macos-sdk"`, `"linux-host"`, a 64-hex digest, or `null`
+/// ([`PinError::NoSysroot`]).
 pub fn sysroot<'t>(text: &'t str, target: &'t str) -> Result<Sysroot, PinError<'t>> {
     let (rows, _) = object(text, "sysroots", 0).ok_or(PinError::NoSysroot { target })?;
     match scalar(rows, target) {
         None | Some("null") => Err(PinError::NoSysroot { target }),
         Some("macos-sdk") => Ok(Sysroot::MacosSdk),
+        Some("linux-host") => Ok(Sysroot::LinuxHost),
         Some(hex) => hex32(hex).map(|sha256| Sysroot::Pinned { sha256 }).ok_or(PinError::Malformed { target, field: "sysroots" }),
     }
 }
@@ -201,11 +213,30 @@ impl<'s> Shelf<'s> {
 pub const SHELF_MEMBERS: [&str; 9] =
     ["bin/clang", "bin/clang++", "bin/clang-23", "bin/ld64.lld", "bin/lld", "bin/llvm-ar", "bin/llvm-nm", "lib/clang", "lib/libclang.dylib"];
 
+/// What a Linux shelf holds of the pinned archive (`LLVM-23.1.4-Linux-ARM64/`), sorted: the
+/// compilers, `lld`, `llvm-ar`, `llvm-nm`, and clang's builtin headers (`lib/clang`). Linux
+/// shelves carry no macOS-only `bin/ld64.lld` or `lib/libclang.dylib`.
+pub const SHELF_MEMBERS_LINUX: [&str; 7] =
+    ["bin/clang", "bin/clang++", "bin/clang-23", "bin/lld", "bin/llvm-ar", "bin/llvm-nm", "lib/clang"];
+
+/// The shelf members required for `sysroot`.
+pub const fn shelf_members_for(sysroot: Sysroot) -> &'static [&'static str] {
+    match sysroot {
+        Sysroot::MacosSdk => &SHELF_MEMBERS,
+        Sysroot::LinuxHost | Sysroot::Pinned { .. } => &SHELF_MEMBERS_LINUX,
+    }
+}
+
 /// The first of [`SHELF_MEMBERS`] that `present` (the caller's look at `<shelf>/<member>`) says
 /// the shelf lacks, by name: a shelf unpacked before a member was added is refused naming it,
 /// never run without it. `None` when every member is there. Sans-IO.
 pub fn shelf_missing(mut present: impl FnMut(&str) -> bool) -> Option<&'static str> {
     SHELF_MEMBERS.into_iter().find(|member| !present(*member))
+}
+
+/// The first shelf member required for `sysroot` that `present` says the shelf lacks. Sans-IO.
+pub fn shelf_missing_for(sysroot: Sysroot, mut present: impl FnMut(&str) -> bool) -> Option<&'static str> {
+    shelf_members_for(sysroot).iter().copied().find(|member| !present(*member))
 }
 
 /// What a native script's C environment is made from.

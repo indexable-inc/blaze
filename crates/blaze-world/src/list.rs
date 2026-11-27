@@ -198,9 +198,10 @@ pub fn needs(list: &UnitCrates<'_>) -> Needs {
         test: list.crates[..list.toolchain].iter().any(|c| c.name == "test"),
     };
     for c in list.crates.iter().filter(|c| matches!(c.origin, ListOrigin::Unit(_))) {
-        n.std |= matches!(c.implicit.std, StdIs::Rust);
+        let rust_std = matches!(c.implicit.std, StdIs::Rust);
+        n.std |= rust_std;
         n.bstd |= matches!(c.implicit.std, StdIs::Bstd(_));
-        n.proc_macro |= c.implicit.proc_macro;
+        n.proc_macro |= rust_std || c.implicit.proc_macro;
     }
     n
 }
@@ -672,7 +673,13 @@ fn world_inner<'w, P: Packages<'w>, B: AsRef<[u8]>>(
     }
     refused.sort_unstable_by_key(|r| r.krate);
     let role = |i: Option<usize>| i.map(|i| CrateId(i as u32));
-    let sysroot = Sysroot { core: role(toolchain.core()), alloc: role(toolchain.alloc()), std: role(toolchain.std()), bstd: role(toolchain.bstd()) };
+    let sysroot = Sysroot {
+        core: role(toolchain.core()),
+        alloc: role(toolchain.alloc()),
+        std: role(toolchain.std()),
+        proc_macro: role(toolchain.proc_macro()),
+        bstd: role(toolchain.bstd()),
+    };
     Ok(World { crates, texts: Texts { checkout, packs, origins, corrected, envs, bump }, sysroot, toolchain_crates: t, crate_of_unit, corrections: used, refused })
 }
 
@@ -835,7 +842,13 @@ pub fn script_world<'w, B: AsRef<[u8]>>(
     }
 
     let role = |i: Option<usize>| i.and_then(|i| u32::try_from(i).ok()).map(CrateId);
-    let sysroot = Sysroot { core: role(toolchain.core()), alloc: role(toolchain.alloc()), std: role(toolchain.std()), bstd: role(toolchain.bstd()) };
+    let sysroot = Sysroot {
+        core: role(toolchain.core()),
+        alloc: role(toolchain.alloc()),
+        std: role(toolchain.std()),
+        proc_macro: role(toolchain.proc_macro()),
+        bstd: role(toolchain.bstd()),
+    };
     let world = World {
         crates,
         texts: Texts { checkout, packs, origins, corrected: AVec::new_in(alloc), envs, bump },

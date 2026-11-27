@@ -33,7 +33,7 @@ use super::keys::{KeyClash, Keys, MemberKind, checker_of};
 use super::preds::Preds;
 use super::source::NamesSource;
 use super::type_miss::{HeadMiss, MissOf, TypeMiss};
-use super::types::{AliasGap, AliasRegions, AliasSlot, Bounds, Builder, Captures, ContainerParamBound, Env, Heads, HeadsArity, NotLaidWhy, ParamBound, RegionRefusal, RegionSink, SelfGiven, SigPart, SelfTy, Slot, SlotKind, TraitAliasHead, Used, Why, intern, intern_list, used_lifetimes};
+use super::types::{AliasGap, AliasRegions, AliasSlot, Bounds, Builder, Captures, ContainerParamBound, Env, Heads, HeadsArity, NotLaidWhy, ParamBound, RegionRefusal, RegionSink, SelfGiven, SigPart, SelfTy, Slot, SlotKind, SuperLifetime, SuperLifetimes, TraitAliasHead, Used, Why, intern, intern_list, used_lifetimes};
 use blaze_typeck::region_facts::HeadRegions;
 use blaze_typeck::regions::{LifetimeParams, Numbering, Region, RegionCol};
 
@@ -161,11 +161,193 @@ pub struct TraitHead {
     /// Its members' dyn-compatibility facts, handed to the checker as `TraitDef.members`
     /// (the checker decides: `blaze_typeck::dyn_compat`).
     pub members: blaze_own::Vec<tc::dyn_compat::MemberFacts, Alloc<'static>>,
+    /// Declared lifetime parameter indices `i` (`0..declared_lifetimes`) for which the trait
+    /// directly declares `Self: 'lt_i` (in its supertrait bounds or `where Self: 'lt_i`), sorted.
+    pub self_outlives_params: blaze_own::Vec<u32, Alloc<'static>>,
 }
 
 /// Whether every parameter after a trait's implicit `Self` defaults to `Self`.
 pub(crate) fn all_self_defaults(defaults: &[Option<PTy>], tys: tc::PTys<'_>) -> bool {
     defaults.iter().all(|d| d.is_some_and(|p| matches!(tys.get(p), Some(PNode::Param(0)))))
+}
+
+/// Records region columns for every `ExProj` clause on `Self` (`Param(0)`) of trait `sub_ck`
+/// into `maps.super_proj_regions`, so `dyn SubTrait<..>` can lay supertrait-materialized
+/// associated-type equalities (`trait IterTrait<'a, T>: Iterator<Item = &'a T>`).
+fn record_super_proj_regions_from_reader(
+    maps: &Maps,
+    regions: &super::head_record::RegionTable,
+    tys: tc::PTys<'_>,
+    sub_ck: ItemKey,
+) {
+    use tc::region_facts::RegionFacts;
+    let reader = regions.reader(maps.alloc);
+    let Ok(clauses) = reader.clauses(sub_ck) else { return };
+    for cv in clauses {
+        if let Ok(PNode::ExProj { trait_: sup_tr, name, args, .. }) = tys.node(cv.col.ty())
+            && let Ok(list) = tys.list(args)
+            && matches!(list.first().and_then(|&t| tys.get(t)), Some(PNode::Param(0)))
+        {
+            let mut copy = blaze_own::Vec::with_capacity_in(cv.col.as_slice().len(), maps.alloc);
+            copy.extend_from_slice(cv.col.as_slice());
+            maps.super_proj_regions.insert((sub_ck, sup_tr, name), copy);
+        }
+    }
+}
+
+/// Whether `binder` (a `for<..>` list) declares a lifetime whose name hash is `target`.
+fn binder_has_name(v: &View<'_>, binder: lf::List, target: u64) -> Result<bool, Why> {
+    for &row in v.rows(binder)? {
+        if let lf::GenericParam::Lifetime { name, .. } = lf::GenericParam::decode(row)?
+            && v.name(name)? == target
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Whether `ty` is the bare `Self` path (no leading `::`, no arguments, not parenthesized).
+fn is_self_ty_path(v: &View<'_>, ty: lf::TypeId) -> Result<bool, Why> {
+    let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(false) };
+    let path = v.path(p)?;
+    if path.absolute {
+        return Ok(false);
+    }
+    let [only] = v.segments(path)? else { return Ok(false) };
+    let seg = lf::Segment::decode(*only)?;
+    Ok(seg.kind == lf::SegKind::SelfTy && !seg.has_args && !seg.parenthesized)
+}
+
+/// Extracts direct `Self: Super<'a, ..>` supertrait lifetime edges from `head::BOUNDS` and
+/// `head::WHERE` (on `Self`) for RFC 1156 default trait object lifetime resolution.
+/// When `collect_self_outlives` is `true` (for a trait alias), direct `Self: 'r` bounds are also
+/// recorded in `alias_outlives`; nested trait aliases have their written lifetime arguments
+/// substituted into each expanded edge and `alias_outlives` entry.
+fn extract_super_lifetimes<'n, S: NamesSource<'n>>(
+    b: &Builder<'_, Maps, S>,
+    env: &Env<'_>,
+    v: &View<'_>,
+    collect_self_outlives: bool,
+    alloc: Alloc<'static>,
+) -> Result<SuperLifetimes, Why> {
+    let mut trait_lts: blaze_own::Vec<Name, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    for &row in v.rows(v.list(head::GENERICS))? {
+        if let lf::GenericParam::Lifetime { name, .. } = lf::GenericParam::decode(row)? {
+            trait_lts.push(Name(v.name(name)?));
+        }
+    }
+    let mut edges: blaze_own::Vec<(LibKey, u32, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    let mut args: blaze_own::Vec<SuperLifetime, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    let mut alias_outlives: blaze_own::Vec<SuperLifetime, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    let read_lt = |nm: lf::NameIdx, inner_binder: Option<lf::List>, outer_binder: Option<lf::List>| -> Result<SuperLifetime, Why> {
+        if v.name_text(nm)? == "'static" {
+            return Ok(SuperLifetime::Static);
+        }
+        let h = v.name(nm)?;
+        let shadowed_inner = match inner_binder {
+            Some(ib) => binder_has_name(v, ib, h)?,
+            None => false,
+        };
+        let shadowed_outer = match outer_binder {
+            Some(ob) => binder_has_name(v, ob, h)?,
+            None => false,
+        };
+        if shadowed_inner || shadowed_outer {
+            Ok(SuperLifetime::Other)
+        } else if let Some(idx) = trait_lts.iter().position(|&x| x == Name(h)).and_then(|i| u32::try_from(i).ok()) {
+            Ok(SuperLifetime::Param(idx))
+        } else {
+            Ok(SuperLifetime::Other)
+        }
+    };
+    let map_sl = |ea: SuperLifetime, call_args: &[SuperLifetime]| -> SuperLifetime {
+        match ea {
+            SuperLifetime::Static => SuperLifetime::Static,
+            SuperLifetime::Param(pi) => usize::try_from(pi)
+                .ok()
+                .and_then(|i| call_args.get(i).copied())
+                .unwrap_or(SuperLifetime::Other),
+            SuperLifetime::Other => SuperLifetime::Other,
+        }
+    };
+    let mut call_args: blaze_own::Vec<SuperLifetime, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    let mut visit_bound = |raw: lf::Node, outer_binder: Option<lf::List>| -> Result<(), Why> {
+        let bound = lf::Bound::decode(raw)?;
+        if let lf::Bound::Lifetime(nm) = bound {
+            if collect_self_outlives {
+                let sl = read_lt(nm, None, outer_binder)?;
+                if !matches!(sl, SuperLifetime::Other) && alias_outlives.scan_for(&sl).is_none() {
+                    alias_outlives.push(sl);
+                }
+            }
+            return Ok(());
+        }
+        let lf::Bound::Trait { ty, binder: inner_binder, mods } = bound else {
+            return Ok(());
+        };
+        if mods.maybe || mods.negative || mods.asyncness {
+            return Ok(());
+        }
+        let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(()) };
+        let (abs, texts, segs, pr) = super::types::path_texts_of(v, p, true)?;
+        let target = b.bound_target(env, v, p, abs, &texts, pr)?;
+        call_args.clear();
+        if let Some(last) = segs.last()
+            && last.has_args
+            && !last.parenthesized
+        {
+            for &row in v.rows(last.args)? {
+                if let lf::GenericArg::Lifetime(nm) = lf::GenericArg::decode(row)? {
+                    call_args.push(read_lt(nm, Some(inner_binder), outer_binder)?);
+                }
+            }
+        }
+        match target {
+            super::types::Bounded::Trait(super_key) => {
+                let start = u32::try_from(args.len()).map_err(|_| Why::Unsupported("more than 2^32 supertrait lifetime arguments", pr))?;
+                args.extend_from_slice(&call_args);
+                let end = u32::try_from(args.len()).map_err(|_| Why::Unsupported("more than 2^32 supertrait lifetime arguments", pr))?;
+                edges.push((super_key, start, end));
+            }
+            super::types::Bounded::Alias(alias) => {
+                if let Some(ah) = b.heads.trait_alias(alias) {
+                    for &(k, e_start, e_end) in ah.super_lifetimes.edges.iter() {
+                        let start = u32::try_from(args.len()).map_err(|_| Why::Unsupported("more than 2^32 supertrait lifetime arguments", pr))?;
+                        if let (Ok(es), Ok(ee)) = (usize::try_from(e_start), usize::try_from(e_end))
+                            && let Some(edge_args) = ah.super_lifetimes.args.get(es..ee)
+                        {
+                            for &ea in edge_args {
+                                args.push(map_sl(ea, &call_args));
+                            }
+                        }
+                        let end = u32::try_from(args.len()).map_err(|_| Why::Unsupported("more than 2^32 supertrait lifetime arguments", pr))?;
+                        edges.push((k, start, end));
+                    }
+                    for &ao in ah.super_lifetimes.alias_outlives.iter() {
+                        let mapped = map_sl(ao, &call_args);
+                        if !matches!(mapped, SuperLifetime::Other) && alias_outlives.scan_for(&mapped).is_none() {
+                            alias_outlives.push(mapped);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    for &raw in v.rows(v.list(head::BOUNDS))? {
+        visit_bound(raw, None)?;
+    }
+    for &w in v.rows(v.list(head::WHERE))? {
+        let lf::WherePred::Type { binder, ty, bounds } = lf::WherePred::decode(w)? else { continue };
+        if !is_self_ty_path(v, ty)? {
+            continue;
+        }
+        for &raw in v.rows(bounds)? {
+            visit_bound(raw, Some(binder))?;
+        }
+    }
+    Ok(SuperLifetimes { edges, args, alias_outlives })
 }
 
 /// Supertrait associated-type equalities on `Self` (`<Param(0) as Tr<..>>::Name == Term`)
@@ -214,6 +396,14 @@ pub struct Maps {
     /// [`Heads::trait_super_projs`]), filed with `supers` and restored from
     /// [`TraitExtra::supertraits`].
     pub super_projs: Rows<LibKey, blaze_own::Vec<super::types::SuperProj, Alloc<'static>>>,
+    /// Region columns of each trait's supertrait associated-type equalities on `Self`
+    /// (`(sub_trait_key, sup_trait_key, assoc_name)` -> `ExProj` region slice over `sub_trait`'s
+    /// lifetime parameters).
+    pub super_proj_regions: Rows<(ItemKey, ItemKey, Name), blaze_own::Vec<Region, Alloc<'static>>>,
+    /// Each trait's direct `Self: Super<'a, ..>` supertrait lifetime edges (see
+    /// [`Heads::trait_super_lifetimes`]), filed alongside `supers` for RFC 1156 default trait
+    /// object lifetime resolution.
+    pub super_lifetimes: Rows<LibKey, SuperLifetimes>,
     /// Traits whose full members (`Want::Members`, Layer 3 — including `assoc_consts`) have been
     /// filed, distinguishing Layer 2 (`supers_only`) from complete member loading.
     pub trait_members_made: Rows<LibKey, ()>,
@@ -309,6 +499,8 @@ impl Maps {
             assoc_consts: Rows::new_in(alloc),
             supers: Rows::new_in(alloc),
             super_projs: Rows::new_in(alloc),
+            super_proj_regions: Rows::new_in(alloc),
+            super_lifetimes: Rows::new_in(alloc),
             trait_members_made: Rows::new_in(alloc),
             aliases: Rows::new_in(alloc),
             alias_defaults: Rows::new_in(alloc),
@@ -346,6 +538,8 @@ impl Maps {
             assoc_consts,
             supers,
             super_projs,
+            super_proj_regions,
+            super_lifetimes,
             trait_members_made,
             aliases,
             alias_defaults,
@@ -377,6 +571,8 @@ impl Maps {
         assoc_consts.clear();
         supers.clear();
         super_projs.clear();
+        super_proj_regions.clear();
+        super_lifetimes.clear();
         trait_members_made.clear();
         aliases.clear();
         alias_defaults.clear();
@@ -596,6 +792,9 @@ impl Heads for Maps {
     fn trait_super_projs(&self, trait_: LibKey) -> Option<&[super::types::SuperProj]> {
         self.super_projs.get(&trait_).map(|s| &s[..])
     }
+    fn trait_super_proj_regions(&self, sub_trait: ItemKey, sup_trait: ItemKey, name: Name) -> Option<&[Region]> {
+        self.super_proj_regions.get(&(sub_trait, sup_trait, name)).map(|s| &s[..])
+    }
     fn trait_members_made(&self, trait_: LibKey) -> bool {
         self.trait_members_made.contains_key(&trait_)
     }
@@ -613,6 +812,12 @@ impl Heads for Maps {
     }
     fn trait_self_static(&self, trait_: LibKey) -> Option<bool> {
         self.traits.get(&trait_).map(|t| t.flags.has(tc::TraitFlags::SELF_STATIC))
+    }
+    fn trait_self_outlives_params(&self, trait_: LibKey) -> Option<&[u32]> {
+        self.traits.get(&trait_).map(|t| &t.self_outlives_params[..])
+    }
+    fn trait_super_lifetimes(&self, trait_: LibKey) -> Option<&SuperLifetimes> {
+        self.super_lifetimes.get(&trait_)
     }
     fn checker(&self, key: LibKey) -> ItemKey {
         checker_of(key)
@@ -4621,7 +4826,7 @@ impl<'n> Store<'n> {
                     }
                     self.ctors.insert(key, sig);
                 }
-                Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life, regions } => {
+                Head::Trait { key, head, extra, supers, super_lifetimes, const_params, preds, assoc_side, life, regions } => {
                     let ck = checker_of(key);
                     // Its declared counts are the names' (D155, types.rs `declared_lifetimes`):
                     // the record carries none and nothing is filed for them.
@@ -4716,7 +4921,13 @@ impl<'n> Store<'n> {
                             Some(x) => extract_super_projs(self.tys.view(), &x.supertraits, self.maps.alloc),
                             None => blaze_own::Vec::new_in(self.maps.alloc),
                         };
+                        if !super_projs.is_empty() {
+                            record_super_proj_regions_from_reader(&self.maps, &self.regions, self.tys.view(), ck);
+                        }
                         self.maps.super_projs.insert(key, super_projs);
+                    }
+                    if let Some(sl) = super_lifetimes {
+                        self.maps.super_lifetimes.insert(key, sl);
                     }
                     if let Some(x) = extra {
                         self.trait_defs.insert(ck, x);
@@ -5027,7 +5238,8 @@ impl<'n> Store<'n> {
                 traits.push((lib, args));
             }
         }
-        self.maps.trait_aliases.insert(key, TraitAliasHead { generics: own + 1, clauses: preds.clauses, traits });
+        let super_lifetimes = extract_super_lifetimes(&b, &env, v, true, self.maps.alloc)?;
+        self.maps.trait_aliases.insert(key, TraitAliasHead { generics: own + 1, clauses: preds.clauses, traits, super_lifetimes });
         self.maps.const_params.insert(key, cs);
         Ok(())
     }
@@ -5147,7 +5359,7 @@ impl<'n> Store<'n> {
         }
         // Its members' fns number the trait's lifetimes first (`regions::Numbering`'s
         // container group); `Self` is a type parameter and has no region position.
-        self.container_regions.insert(checker_of(key), ContainerRegions::of_header(v, None, self.tys.alloc())?);
+        let container = ContainerRegions::of_header(v, None, self.tys.alloc())?;
         // The same names as its members' clauses read them (D148; heads_regions.rs `Scope`).
         self.container_scopes.insert(checker_of(key), Scope::item(v, None, 0, self.tys.alloc()).map_err(Why::Regions)?);
         if written & sig::AUTO != 0 {
@@ -5156,30 +5368,45 @@ impl<'n> Store<'n> {
         if written & sig::UNSAFE != 0 {
             flags |= tc::TraitFlags::UNSAFE;
         }
-        // The Reference, "Default trait object lifetimes": a trait with a `Self: 'static` bound
-        // (such as `core::any::Any`) gives `dyn Trait` a `'static` default even behind `&`.
-        for &b in v.rows(v.list(head::BOUNDS))? {
-            if let lf::Bound::Lifetime(nm) = lf::Bound::decode(b)?
-                && v.name_text(nm)? == "'static"
-            {
+        // RFC 1156 ("Default trait object lifetimes"): record direct `Self: 'static` and
+        // `Self: 'lt_i` bounds from both supertrait bounds and `where Self: ..` clauses.
+        let mut self_outlives_params: blaze_own::Vec<u32, Alloc<'static>> = blaze_own::Vec::new_in(self.tys.alloc());
+        let mut record_self_lt = |nm: lf::NameIdx, binder: Option<lf::List>| -> Result<(), Why> {
+            if v.name_text(nm)? == "'static" {
                 flags |= tc::TraitFlags::SELF_STATIC;
+                return Ok(());
+            }
+            let h = v.name(nm)?;
+            if let Some(b) = binder
+                && binder_has_name(v, b, h)?
+            {
+                return Ok(());
+            }
+            if let Some(Region::Param(idx)) = container.named(Name(h))
+                && self_outlives_params.scan_for(&idx).is_none()
+            {
+                self_outlives_params.push(idx);
+            }
+            Ok(())
+        };
+        for &b in v.rows(v.list(head::BOUNDS))? {
+            if let lf::Bound::Lifetime(nm) = lf::Bound::decode(b)? {
+                record_self_lt(nm, None)?;
             }
         }
         for &w in v.rows(v.list(head::WHERE))? {
-            let lf::WherePred::Type { ty, bounds, .. } = lf::WherePred::decode(w)? else { continue };
-            let lf::TypeRef::Path(p) = v.ty(ty)? else { continue };
-            let (abs, texts, _, _) = super::types::path_texts(v, p)?;
-            if abs || texts.as_slice() != ["Self"] {
+            let lf::WherePred::Type { binder, ty, bounds } = lf::WherePred::decode(w)? else { continue };
+            if !is_self_ty_path(v, ty)? {
                 continue;
             }
             for &b in v.rows(bounds)? {
-                if let lf::Bound::Lifetime(nm) = lf::Bound::decode(b)?
-                    && v.name_text(nm)? == "'static"
-                {
-                    flags |= tc::TraitFlags::SELF_STATIC;
+                if let lf::Bound::Lifetime(nm) = lf::Bound::decode(b)? {
+                    record_self_lt(nm, Some(binder))?;
                 }
             }
         }
+        self_outlives_params.sort_unstable();
+        self.container_regions.insert(checker_of(key), container);
         // `#[rustc_coinductive]` (core's `Sized`, `MetaSized`, `PointeeSized`): a cycle through
         // the trait's own steps holds (library/core/src/marker.rs: "`Sized` being coinductive,
         // despite having supertraits, is okay as there are no user-written impls").
@@ -5276,7 +5503,7 @@ impl<'n> Store<'n> {
             }
         }
         let all_self_defaults = all_self_defaults(&defaults, self.tys.view());
-        self.maps.traits.insert(key, TraitHead { generics: own + 1, all_self_defaults, defaults, assoc, fns, flags: tc::TraitFlags(flags), members, marks: coherence });
+        self.maps.traits.insert(key, TraitHead { generics: own + 1, all_self_defaults, defaults, assoc, fns, flags: tc::TraitFlags(flags), members, marks: coherence, self_outlives_params });
         self.maps.const_params.insert(key, cs);
         Ok(())
     }
@@ -5517,10 +5744,33 @@ impl<'n> Store<'n> {
                 supers.push((lib, args));
             }
         }
+        let super_lifetimes = extract_super_lifetimes(&b, &env, v, false, self.maps.alloc)?;
         if supers_only {
             let super_projs = extract_super_projs(self.tys.view(), &supertraits, self.maps.alloc);
+            if !super_projs.is_empty() {
+                let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
+                if let Ok(own_bounds) = with_own_param_bounds(&b, &mut self.tys, &self.regions, &arity, &env, v, &preds, &scope, SelfGiven::NONE, Captures::NONE, alloc)
+                    && let Ok(laid) = lay_listed(&b, &mut self.tys, &env, v, (&preds, &[]), SelfGiven { param_bounds: &own_bounds, ..SelfGiven::NONE }, Captures::NONE, alloc)
+                {
+                    let cx = hreg::Cx { v, facts: &arity, written: &laid, scope: &scope, made: &[], alloc };
+                    if let Ok(h) = hreg::clause_regions(&cx, &mut self.tys, &preds, scope.params(), None) {
+                        let view = self.tys.view();
+                        for cv in h.clauses.iter() {
+                            if let Ok(PNode::ExProj { trait_: sup_tr, name, args, .. }) = view.node(cv.col.ty())
+                                && let Ok(list) = view.list(args)
+                                && matches!(list.first().and_then(|&t| view.get(t)), Some(PNode::Param(0)))
+                            {
+                                let mut copy = blaze_own::Vec::with_capacity_in(cv.col.as_slice().len(), self.maps.alloc);
+                                copy.extend_from_slice(cv.col.as_slice());
+                                self.maps.super_proj_regions.insert((ck, sup_tr, name), copy);
+                            }
+                        }
+                    }
+                }
+            }
             self.maps.supers.insert(key, supers);
             self.maps.super_projs.insert(key, super_projs);
+            self.maps.super_lifetimes.insert(key, super_lifetimes);
             return Ok(());
         }
         self.container_scopes.insert(ck, scope.clone_in(alloc));
@@ -5592,8 +5842,12 @@ impl<'n> Store<'n> {
         }
         file_regions(self, ck, trait_regions.0);
         let super_projs = extract_super_projs(self.tys.view(), &supertraits, self.maps.alloc);
+        if !super_projs.is_empty() {
+            record_super_proj_regions_from_reader(&self.maps, &self.regions, self.tys.view(), ck);
+        }
         self.maps.supers.insert(key, supers);
         self.maps.super_projs.insert(key, super_projs);
+        self.maps.super_lifetimes.insert(key, super_lifetimes);
         let mut assoc = blaze_own::Vec::new_in(alloc);
         let mut consts: blaze_own::Vec<(Name, ItemKey), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         // Each associated type's own const parameters (own position, type): filed after the
@@ -8322,7 +8576,7 @@ pub fn use_named<'a>(a: NamedActor<'a>) -> &'a str { a.name }
             cfg: &[],
             script: None,
         }];
-        let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+        let sysroot = Sysroot::default();
         let solved = resolve_crates(&crates, sysroot, &SrcText(SRC), &Serial, bump).expect("resolve_crates");
         let names = &solved;
         let find = |wanted: &str| -> LibKey {

@@ -1031,7 +1031,7 @@ mod tests {
 
     pub(super) fn solved() -> Names<'static> {
         let inputs = [input("app", "/0/app/lib.rs", &[("lib", 1)]), input("lib", "/1/lib/lib.rs", &[])];
-        let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+        let sysroot = Sysroot::default();
         let names = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &Files, &blaze_scope::task::Serial, blaze_own::testing::bump());
         names.unwrap_or_else(|e| panic!("the two crates' names: {e:?}"))
     }
@@ -1304,7 +1304,7 @@ mod tests {
     #[test]
     fn a_prelude_through_two_crates_globs_resolves_over_the_store() {
         let inputs = [input("app", "/0/app/lib.rs", &[]), input("std", "/1/std/lib.rs", &[("core", 2)]), input("core", "/2/core/lib.rs", &[])];
-        let sysroot = Sysroot { core: Some(blaze_scope::graph::CrateId(2)), alloc: None, std: Some(blaze_scope::graph::CrateId(1)), bstd: None };
+        let sysroot = Sysroot { core: Some(blaze_scope::graph::CrateId(2)), std: Some(blaze_scope::graph::CrateId(1)), ..Sysroot::default() };
         let b = blaze_own::testing::bump();
         let names = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &PreludeFiles, &blaze_scope::task::Serial, b)
             .unwrap_or_else(|e| panic!("the three crates' names: {e:?}"));

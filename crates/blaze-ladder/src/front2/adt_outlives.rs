@@ -123,6 +123,11 @@ pub fn declared(laid: &[LaidNode], col: &[Region], region: Region, out: &mut Out
 /// ADT `adt`'s requirements at node `at`, instantiated with its slots and arguments there.
 fn apply(laid: &[LaidNode], col: &[Region], at: usize, adt: u128, mode: Mode, req: &dyn Required, out: &mut OutlivesBuf<'_>) -> Result<(), OutlivesRefusal> {
     let Some(n) = laid.get(at) else { return Ok(()) };
+    // A 0-parameter ADT takes no lifetime or type arguments, so it can induce no outlives
+    // requirement on any caller parameter.
+    if n.own == 0 && n.kids == 0 {
+        return Ok(());
+    }
     let r = req.required(adt)?;
     if r.params.is_empty() && r.regions.is_empty() {
         return Ok(());

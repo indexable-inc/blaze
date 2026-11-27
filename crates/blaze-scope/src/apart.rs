@@ -108,7 +108,7 @@ impl<'a> Apart<'a> {
             return Err(ApartError::NoSuchCrate { apart, crates: crates.len() });
         };
         let is = |role: Option<CrateId>| role.is_some_and(|id| id.index() == apart);
-        if is(sysroot.core) || is(sysroot.alloc) || is(sysroot.std) || is(sysroot.bstd) {
+        if sysroot.all().into_iter().any(is) {
             return Err(ApartError::IsSysroot { apart: stand_in.name });
         }
         for c in crates {

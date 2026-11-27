@@ -59,7 +59,7 @@ pub use coro_opt::{
     CoroFramePlan, CoroFrameSlot, CoroFrameStats, CoroFuseOutput, CoroFuseStats, fuse_nested_coroutines,
     pack_coroutine_frame_colored,
 };
-pub use dce::{coalesce_cfg, dead};
+pub use dce::{coalesce_cfg, dead, dead_strip_assumes};
 pub use devirt::{DevirtOutput, DevirtStats, IndirectTarget, speculative_devirt};
 pub use egraph::{
     AegraphOutput, AegraphStats, LoopSummary, OpportunisticInlineSite, RegBudget, SotaFeedbackOutput, SsaRegPlan,

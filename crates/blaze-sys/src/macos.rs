@@ -98,12 +98,13 @@ pub const SYMBOLS: &[Symbol] = &[
     public(c"getentropy", "the seed of `Io::rng` and of the maps' hasher"),
     public(c"__error", "the thread's `errno`, read after a call that returned -1"),
     public(c"dlsym", "the symbol test itself, and optional symbols by name"),
+    public(c"dlopen", "opening already-loaded libSystem for the cold symbol table in both AOT and JIT"),
 ];
 
 /// The private symbols of the [`cold`] table, each with why it and not a public call (rule
 /// macos-private-apis). They are not in [`SYMBOLS`]: `every_declared_symbol_exists` looks up
 /// with `RTLD_DEFAULT`, which finds the cold table's own definition first; `every_cold_symbol_exists`
-/// looks each up past it (`RTLD_NEXT`), and `every_private_symbol_says_why` reads this list too.
+/// looks each up directly in `libSystem.B.dylib`, and `every_private_symbol_says_why` reads this list too.
 pub const COLD_PRIVATE: &[Symbol] = &[private(
     c"thread_selfcounts",
     "the meter (blaze-meter, D169): this thread's instructions, cycles and user and system time \
@@ -173,6 +174,7 @@ pub(crate) mod ffi {
         pub(crate) fn mach_continuous_time() -> u64;
         pub(crate) fn getentropy(into: *mut c_void, len: usize) -> c_int;
         pub(crate) fn __error() -> *mut c_int;
+        pub(crate) fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
         pub(crate) fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     }
 }
@@ -187,18 +189,20 @@ pub(crate) mod ffi {
 /// (`#[unsafe(no_mangle)]`): the static linker resolves every reference in the program to it
 /// (blaze's own `libc::` calls and Rust std's alike: std's file, thread and socket calls are
 /// most of the table), so the executable imports none of them. Its first call finds libSystem's
-/// symbol (`dlsym(RTLD_NEXT, name)`: the images after this one, so never this definition) and
-/// keeps its address; later calls load that and call it. A symbol this macOS lacks stops the
+/// symbol directly via `dlopen("/usr/lib/libSystem.B.dylib", RTLD_LAZY | RTLD_NOLOAD)` + `dlsym`
+/// (never this definition, and works identically in JIT-mapped memory where `dyld`'s `RTLD_NEXT`
+/// cannot map the caller's return address to a Mach-O image) and keeps its address; later calls
+/// load that and call it. A symbol this macOS lacks stops the
 /// program naming it (rule 3), and `every_cold_symbol_exists` looks each up, so that is found
 /// on the first macOS that lacks one, by a test. Linking a sub-library of libSystem directly to
 /// skip the search is not done: those are private install names.
 ///
 /// What it rests on, each stated where it matters: (1) a definition in the executable wins over
 /// a dylib's for the executable's own references, and only those: libSystem's calls between its
-/// own libraries are two-level and never reach these. (2) A first call runs `dlsym`, which is
-/// not async-signal-safe: no entry may be first called in a signal handler or between a `fork`
-/// and an `exec`; blaze spawns with `posix_spawn` and its handlers call none of them. (3) The
-/// signature of each entry is its header's (named per entry), with a struct passed as
+/// own libraries are two-level and never reach these. (2) A first call runs `dlopen`/`dlsym`,
+/// which is not async-signal-safe: no entry may be first called in a signal handler or between a
+/// `fork` and an `exec`; blaze spawns with `posix_spawn` and its handlers call none of them. (3)
+/// The signature of each entry is its header's (named per entry), with a struct passed as
 /// `*mut c_void`.
 ///
 /// Every entry is the arm64 symbol. On x86-64 macOS, not a host blaze supports, the stat calls
@@ -210,9 +214,33 @@ pub mod cold {
         sync::atomic::{AtomicPtr, Ordering},
     };
 
-    /// `RTLD_NEXT` (dlfcn.h): the images loaded after the caller's: libSystem's definition of a
-    /// name, never this file's.
-    const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
+    /// `RTLD_LAZY` (`<dlfcn.h>`): standard lazy binding flag for `dlopen`.
+    const RTLD_LAZY: c_int = 0x1;
+    /// `RTLD_NOLOAD` (`<dlfcn.h>`): return the handle of an already-loaded image without loading.
+    const RTLD_NOLOAD: c_int = 0x10;
+    /// Public umbrella library always loaded in every macOS process.
+    const LIBSYSTEM_PATH: &CStr = c"/usr/lib/libSystem.B.dylib";
+
+    /// Look up `/usr/lib/libSystem.B.dylib` (already loaded in every macOS process). Using
+    /// libSystem's handle directly skips this file's `#[unsafe(no_mangle)]` definitions in AOT
+    /// executables AND works when `resolve_cold` executes from JIT-mapped memory (where macOS
+    /// `dyld`'s `RTLD_NEXT` fails because the caller's return address is not inside any loaded
+    /// Mach-O image). Only called from cold first-use symbol resolution.
+    fn libsystem() -> *mut c_void {
+        // SAFETY: `LIBSYSTEM_PATH` is a live NUL-terminated path; `RTLD_LAZY | RTLD_NOLOAD`
+        // queries the already-loaded dyld image without loading new libraries.
+        let handle = unsafe { super::ffi::dlopen(LIBSYSTEM_PATH.as_ptr(), RTLD_LAZY | RTLD_NOLOAD) };
+        if handle.is_null() {
+            missing(LIBSYSTEM_PATH);
+        }
+        handle
+    }
+
+    /// Look up `name` directly in `libSystem.B.dylib`, bypassing this table's own definitions.
+    pub(crate) fn lookup(name: &CStr) -> *mut c_void {
+        // SAFETY: `libsystem()` is a live dyld handle and `name` is a live NUL-terminated C string.
+        unsafe { super::ffi::dlsym(libsystem(), name.as_ptr()) }
+    }
 
     /// The address of `name`, found on the first call: `slot` keeps it. `Relaxed` suffices:
     /// the address is of code dyld mapped before `main`, and two first calls that race each
@@ -229,8 +257,7 @@ pub mod cold {
     #[cold]
     #[inline(never)]
     fn resolve_cold(slot: &AtomicPtr<c_void>, name: &'static CStr) -> *mut c_void {
-        // SAFETY: `dlsym` reads a live NUL-terminated name and returns an address or null.
-        let found = unsafe { super::ffi::dlsym(RTLD_NEXT, name.as_ptr()) };
+        let found = lookup(name);
         if found.is_null() {
             missing(name);
         }
@@ -745,15 +772,11 @@ mod tests {
         }
     }
 
-    /// `RTLD_NEXT`: the images after this one, where libSystem's definitions are.
-    const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
-
     /// Every entry of the cold table is a symbol this macOS's libSystem exports.
     #[test]
     fn every_cold_symbol_exists() {
         for name in cold::SYMBOLS {
-            // SAFETY: as above.
-            let found = unsafe { ffi::dlsym(RTLD_NEXT, name.as_ptr()) };
+            let found = cold::lookup(name);
             assert!(!found.is_null(), "libSystem has no `{}` on this macOS", name.to_string_lossy());
         }
         assert!(cold::SYMBOLS.len() >= 70);
@@ -767,8 +790,7 @@ mod tests {
         let ours = cold::geteuid as unsafe extern "C" fn() -> u32 as *mut c_void;
         // SAFETY: as above.
         let first = unsafe { ffi::dlsym(RTLD_DEFAULT, c"geteuid".as_ptr()) };
-        // SAFETY: as above.
-        let system = unsafe { ffi::dlsym(RTLD_NEXT, c"geteuid".as_ptr()) };
+        let system = cold::lookup(c"geteuid");
         assert_eq!(first, ours, "the executable's `geteuid` is the table's");
         assert_ne!(system, ours);
         // SAFETY: libSystem's `geteuid`, `uid_t geteuid(void)`.
@@ -842,8 +864,7 @@ mod tests {
     /// answers): `thread_selfcounts` past this file's definition, and the layouts are libc's.
     #[test]
     fn the_meters_calls_exist_and_answer() {
-        // SAFETY: as above.
-        let found = unsafe { ffi::dlsym(RTLD_NEXT, c"thread_selfcounts".as_ptr()) };
+        let found = cold::lookup(c"thread_selfcounts");
         assert!(!found.is_null(), "libSystem has no `thread_selfcounts` on this macOS");
         let before = thread_counts().expect("THSC_TIME_CPI answers on this Mac");
         let mut spin = 0u64;

@@ -300,18 +300,19 @@ mod tests {
         let rsl = g.intern(PNode::Ref(Mutbl::Not, sl)).unwrap();
         let unit = g.intern(PNode::Tuple(List::EMPTY)).unwrap();
         let args = g.intern_list(&[ra, rsl, unit]).unwrap();
-        let name = |k: ItemKey| -> Option<Box<str>> {
-            match k.0 {
-                1 => Some(Box::from("bstd::io::World")),
-                2 => Some(Box::from("bstd::lock::Lock")),
-                3 => Some(Box::from("alloc::sync::Arc")),
-                _ => None,
-            }
+        let name = |k: ItemKey| {
+            let s = match k.0 {
+                1 => "bstd::io::World",
+                2 => "bstd::lock::Lock",
+                3 => "alloc::sync::Arc",
+                _ => return None,
+            };
+            Some(s.into())
         };
         let shown = args_shown(g.view(), args, &name);
         assert_eq!(&*shown, "[&alloc::sync::Arc<bstd::lock::Lock<bstd::io::World>>, &[&str], ()]");
         // The control: no path for the ADT, so its whole key is shown, and `usize` by its form.
-        let none = |_: ItemKey| -> Option<Box<str>> { None };
+        let none = |_: ItemKey| None;
         let one = g.intern(PNode::Adt(ItemKey(0x2980e808e42ac8c994174814ade98748), List::EMPTY)).unwrap();
         let args = g.intern_list(&[one, us]).unwrap();
         let shown = args_shown(g.view(), args, &none);

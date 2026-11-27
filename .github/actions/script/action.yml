@@ -1,11 +1,13 @@
-# The repository's scripts (scripts/src/bin/<name>.rs), built and cached as BLAZE_SCRIPTS:
-# a step runs one as `"$BLAZE_SCRIPTS/<name>" '<json>'`. Cache hits cost only key hashing and
-# restore; misses build with the pinned Rust toolchain (pins/toolchain) and cache the outputs.
+# The repository's scripts (scripts/src/bin/<name>.rs), job-scoped and built standalone with
+# pinned v2 `blaze` (.github/blaze-cli-version) and cached as BLAZE_SCRIPTS: a step runs one as
+# `"$BLAZE_SCRIPTS/<name>" '<json>'`. Cache hits cost only key hashing and restore; misses build
+# only the binaries `bins.sh <job>` needs with `blaze build --standalone` (zero cargo, zero rustc,
+# zero rustup) and cache the outputs.
 name: script
-description: the repository's built scripts, from the Actions cache or built with the pinned toolchain
+description: the repository's job-scoped built scripts, from the Actions cache or built with pinned v2 blaze
 inputs:
   job:
-    description: caller job name
+    description: caller job name (scripts, lean, or release)
     required: true
 runs:
   using: composite
@@ -13,7 +15,7 @@ runs:
     - id: key
       shell: bash
       run: |
-        echo "key=$("$GITHUB_ACTION_PATH/key.sh")" >> "$GITHUB_OUTPUT"
+        echo "key=$("$GITHUB_ACTION_PATH/key.sh" "${{ inputs.job }}")" >> "$GITHUB_OUTPUT"
         echo "dir=$RUNNER_TEMP/blaze-scripts" >> "$GITHUB_OUTPUT"
     - id: restore
       uses: actions/cache/restore@v6
@@ -22,19 +24,16 @@ runs:
         key: ${{ steps.key.outputs.key }}
     - if: steps.restore.outputs.cache-hit == 'true'
       shell: bash
-      run: '"$GITHUB_ACTION_PATH/check.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'
-    - id: need
-      if: steps.restore.outputs.cache-hit != 'true'
+      run: '"$GITHUB_ACTION_PATH/check.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}" "${{ inputs.job }}"'
+    - if: steps.restore.outputs.cache-hit != 'true'
       shell: bash
       run: |
         if [ "$(git config --bool core.sparseCheckout || echo false)" = true ]; then git sparse-checkout disable; fi
-        tc=$(cat pins/toolchain)
-        echo "install=$(cargo +"$tc" --version >/dev/null 2>&1 && echo false || echo true)" >> "$GITHUB_OUTPUT"
-    - if: steps.need.outputs.install == 'true'
-      uses: ./.github/actions/toolchain
+    - if: steps.restore.outputs.cache-hit != 'true'
+      uses: ./.github/actions/blaze
     - if: steps.restore.outputs.cache-hit != 'true'
       shell: bash
-      run: '"$GITHUB_ACTION_PATH/build.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}"'
+      run: '"$GITHUB_ACTION_PATH/build.sh" "${{ steps.key.outputs.dir }}" "${{ steps.key.outputs.key }}" "${{ inputs.job }}"'
     - if: steps.restore.outputs.cache-hit != 'true'
       uses: actions/cache/save@v6
       with:

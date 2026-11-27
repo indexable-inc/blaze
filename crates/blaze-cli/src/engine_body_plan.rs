@@ -459,20 +459,71 @@ pub(crate) fn reached(outlined: &[Outlined<'_>], root: Name, g: blaze_own::Alloc
 /// walked from as the root is (each its own `#![cfg]` read, then its file parts): the files its
 /// names read that no `mod` the walk follows names. In `g`.
 pub(crate) fn reached_under(outlined: &[Outlined<'_>], cuts: &PlanCuts<'_, '_, '_>, root: Name, test: Tri, found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Result<Vec<Name, blaze_own::Alloc<'static>>, Unoutlined> {
+    let mut ignored = Vec::new_in(g);
+    reached_under_tracking_test_cuts(outlined, cuts, root, test, found, &mut ignored, g)
+}
+
+/// Like [`reached_under`], also recording into `test_cut` every file (and its transitive file
+/// parts) skipped specifically because a `test`-dependent cfg (`Cut::cuts_by_test`, e.g.
+/// `#[cfg(test)] mod resolve_tests;` inside an example target compiled only with `test = No`)
+/// cut it.
+fn reached_under_tracking_test_cuts(
+    outlined: &[Outlined<'_>],
+    cuts: &PlanCuts<'_, '_, '_>,
+    root: Name,
+    test: Tri,
+    found: &[FoundEdge],
+    test_cut: &mut Vec<Name, blaze_own::Alloc<'static>>,
+    g: blaze_own::Alloc<'static>,
+) -> Result<Vec<Name, blaze_own::Alloc<'static>>, Unoutlined> {
     let mut seen: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
     let mut next: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
+    let mut cut_next: Vec<Name, blaze_own::Alloc<'static>> = Vec::new_in(g);
     next.push(root);
     next.extend(found.iter().map(|edge| edge.file));
     while let Some(name) = next.pop() {
         let Err(slot) = seen.binary_search(&name) else { continue };
         let at = outlined.binary_search_by(|one| one.name.cmp(&name)).map_err(|_| Unoutlined { file: name, root })?;
         let file = cuts.file(at);
-        if file.is_some_and(|file| file.own.cuts(test)) {
+        if let Some(f) = file
+            && f.own.cuts(test)
+        {
+            if f.own.cuts_by_test(test) {
+                cut_next.push(name);
+            }
             continue;
         }
         seen.insert_shift(slot, name);
         if let Ok(record) = &outlined[at].made {
-            next.extend(record.parts.iter().filter(|part| matches!(part.locate, Locate::File { edition } if !crate::data_include::is_data(edition)) && !crate::engine_plan_cfg::part_cut(file, part).cuts(test)).map(|part| part.name));
+            for part in record.parts.iter() {
+                if !matches!(part.locate, Locate::File { edition } if !crate::data_include::is_data(edition)) {
+                    continue;
+                }
+                let cut = crate::engine_plan_cfg::part_cut(file, part);
+                if cut.cuts(test) {
+                    if cut.cuts_by_test(test) {
+                        cut_next.push(part.name);
+                    }
+                } else {
+                    next.push(part.name);
+                }
+            }
+        }
+    }
+    // Expand transitive children of `test`-cut modules so nested submodules under a
+    // `#[cfg(test)] mod tests;` in an example target are also recorded as `test`-cut.
+    while let Some(name) = cut_next.pop() {
+        let Err(slot) = test_cut.binary_search(&name) else { continue };
+        test_cut.insert_shift(slot, name);
+        let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&name)) else { continue };
+        if let Some(one) = outlined.get(at)
+            && let Ok(record) = &one.made
+        {
+            for part in record.parts.iter() {
+                if matches!(part.locate, Locate::File { edition } if !crate::data_include::is_data(edition)) {
+                    cut_next.push(part.name);
+                }
+            }
         }
     }
     Ok(seen)
@@ -712,6 +763,9 @@ pub(crate) struct Reach {
     /// The member units' found files ([`FoundEdge`]), sorted: what the walk took them from, and
     /// what the Bodies setup's walk of a unit takes ([`Reach::found_of`], engine_bodies.rs `groups`).
     found: AVec<'static, FoundEdge>,
+    /// Files skipped in `Reach::walk` specifically by a `test`-dependent cfg (`#[cfg(test)]` in a
+    /// non-test target like an example, `Cut::cuts_by_test`), sorted.
+    test_cut: AVec<'static, Name>,
 }
 
 impl Reach {
@@ -730,7 +784,7 @@ impl Reach {
         units
     }
 
-    fn of(ranked: &[(usize, Reacher)], mut files: AVec<'static, (Name, u32)>, names: AVec<'static, u8>, found: &[FoundEdge], g: blaze_own::Alloc<'static>) -> Reach {
+    fn of(ranked: &[(usize, Reacher)], mut files: AVec<'static, (Name, u32)>, names: AVec<'static, u8>, found: &[FoundEdge], mut test_cut: AVec<'static, Name>, g: blaze_own::Alloc<'static>) -> Reach {
         files.sort_unstable();
         files.dedup();
         let mut units: AVec<'static, Reacher> = Vec::with_capacity_in(ranked.len(), g);
@@ -739,7 +793,15 @@ impl Reach {
         kept.extend_from_slice(found);
         kept.sort_unstable();
         kept.dedup();
-        Reach { units, files: ReachFiles::Flat(files), names, found: kept }
+        test_cut.sort_unstable();
+        test_cut.dedup();
+        Reach { units, files: ReachFiles::Flat(files), names, found: kept, test_cut }
+    }
+
+    /// Whether `file` was skipped during `Reach::walk` specifically by a `test`-dependent cfg
+    /// (`#[cfg(test)]` in a non-test target like an example).
+    pub(crate) fn is_test_cut(&self, file: Name) -> bool {
+        self.test_cut.binary_search(&file).is_ok()
     }
 
     /// The found files of the member unit whose `CrateScope` task is `unit` ([`FoundEdge`]): what
@@ -773,6 +835,7 @@ impl Reach {
         }
         by_root.sort_unstable();
         let mut files: AVec<'static, (Name, u32)> = Vec::new_in(g);
+        let mut test_cut: AVec<'static, Name> = Vec::new_in(g);
         let cuts = PlanCuts::of(outlined, g);
         let mut seeds: AVec<'static, FoundEdge> = Vec::new_in(g);
         for group in by_root.chunk_by(|a, b| (a.0, a.1) == (b.0, b.1)) {
@@ -785,7 +848,7 @@ impl Reach {
                 own.len() == first.len() && own.iter().zip(first.iter()).all(|(a, b)| a.file == b.file)
             });
             if same {
-                let tree = reached_under(outlined, &cuts, group[0].0, test, first, g)?;
+                let tree = reached_under_tracking_test_cuts(outlined, &cuts, group[0].0, test, first, &mut test_cut, g)?;
                 for (_, _, rank) in group.iter() {
                     files.extend(tree.iter().map(|file| (*file, *rank)));
                 }
@@ -794,11 +857,11 @@ impl Reach {
             for (_, _, rank) in group.iter() {
                 seeds.clear();
                 seeds.extend_from_slice(unit_of(*rank).map_or(&[][..], found_of));
-                let tree = reached_under(outlined, &cuts, group[0].0, test, &seeds, g)?;
+                let tree = reached_under_tracking_test_cuts(outlined, &cuts, group[0].0, test, &seeds, &mut test_cut, g)?;
                 files.extend(tree.iter().map(|file| (*file, *rank)));
             }
         }
-        Ok(Reach::of(&ranked, files, names, &sorted, g))
+        Ok(Reach::of(&ranked, files, names, &sorted, test_cut, g))
     }
 
     /// The ready path's: each member's held and reached-not-held files as the last members
@@ -827,7 +890,7 @@ impl Reach {
             }
             files.extend(kept.not_held.iter().map(|file| (*file, rank)));
         }
-        Ok(Reach::of(&ranked, files, names, found, g))
+        Ok(Reach::of(&ranked, files, names, found, Vec::new_in(g), g))
     }
 
     /// On-demand version of [`Reach::of_members`] sharing the already-opened `BLZMEMB` view:
@@ -869,6 +932,7 @@ impl Reach {
             }),
             names,
             found: kept,
+            test_cut: Vec::new_in(g),
         })
     }
 

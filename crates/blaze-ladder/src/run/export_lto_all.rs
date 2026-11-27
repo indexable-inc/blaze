@@ -632,7 +632,9 @@ fn decode_inline_body(bytes: &[u8], alloc: SharedAlloc<'static>) -> Option<Inlin
     // Safe byte copy into aligned `u128` storage without `unsafe`: pack 16-byte chunks via LE.
     for (wi, chunk) in func_slice.chunks(16).enumerate() {
         let mut buf = [0u8; 16];
-        buf[..chunk.len()].copy_from_slice(chunk);
+        if let Some(dst) = buf.get_mut(..chunk.len()) {
+            dst.copy_from_slice(chunk);
+        }
         if let Some(slot) = aligned.get_mut(wi) {
             *slot = u128::from_le_bytes(buf);
         }
@@ -878,9 +880,9 @@ fn hash_policy_and_opts(
     };
     h.update(&[arch_byte, os_byte]);
     h.update(&opts.machine.features.to_le_bytes());
-    h.update(&(opts.max_callee_insts as u64).to_le_bytes());
-    h.update(&(opts.max_always_inline_insts as u64).to_le_bytes());
-    h.update(&(opts.max_caller_insts as u64).to_le_bytes());
+    h.update(&u64::try_from(opts.max_callee_insts).unwrap_or(u64::MAX).to_le_bytes());
+    h.update(&u64::try_from(opts.max_always_inline_insts).unwrap_or(u64::MAX).to_le_bytes());
+    h.update(&u64::try_from(opts.max_caller_insts).unwrap_or(u64::MAX).to_le_bytes());
     let p = opts.policy;
     h.update(&p.cost_threshold.to_le_bytes());
     h.update(&p.max_callee_insts.to_le_bytes());
@@ -981,7 +983,7 @@ fn compute_scc_lto_keys<'a>(
 
         let mut h = blaze_ids::Hasher::new(EXPORT_LTO_SCC_KEY_DOMAIN);
         h.update(&base_digest);
-        h.update(&(members.len() as u64).to_le_bytes());
+        h.update(&u64::try_from(members.len()).unwrap_or(u64::MAX).to_le_bytes());
         for &(sym, lk, is_ws, _) in members.iter() {
             h.update(&sym.0);
             h.update(&lk);
@@ -993,21 +995,21 @@ fn compute_scc_lto_keys<'a>(
                     let sites = pgo.site_entries();
                     let start = sites.partition_point(|s| s.caller < bid);
                     let mut end = start;
-                    while end < sites.len() && sites[end].caller == bid {
+                    while sites.get(end).is_some_and(|s| s.caller == bid) {
                         end += 1;
                     }
-                    (bw, &sites[start..end])
+                    (bw, sites.get(start..end).unwrap_or(&[]))
                 }
                 None => (0u64, &[][..]),
             };
             h.update(&bw.to_le_bytes());
-            h.update(&(sites_slice.len() as u64).to_le_bytes());
+            h.update(&u64::try_from(sites_slice.len()).unwrap_or(u64::MAX).to_le_bytes());
             for s in sites_slice {
                 h.update(&s.site_inst.to_le_bytes());
                 h.update(&s.weight.to_le_bytes());
             }
         }
-        h.update(&(ext_callees.len() as u64).to_le_bytes());
+        h.update(&u64::try_from(ext_callees.len()).unwrap_or(u64::MAX).to_le_bytes());
         for &(csym, ck) in ext_callees.iter() {
             h.update(&csym.0);
             h.update(&ck);
@@ -1359,13 +1361,15 @@ fn build_batch_pgo_par<R: LtoRunner>(
     let all_sites = persisted.site_entries();
     let all_bodies = persisted.body_entries();
     for mb in mod_bodies.iter() {
-        if let Ok(bi) = all_bodies.binary_search_by_key(&mb.id, |b| b.body) {
-            sub_bodies.push(all_bodies[bi]);
+        if let Ok(bi) = all_bodies.binary_search_by_key(&mb.id, |b| b.body)
+            && let Some(&entry) = all_bodies.get(bi)
+        {
+            sub_bodies.push(entry);
         }
         let start = all_sites.partition_point(|s| s.caller < mb.id);
         let mut i = start;
-        while i < all_sites.len() && all_sites[i].caller == mb.id {
-            sub_sites.push(all_sites[i]);
+        while let Some(&entry) = all_sites.get(i).filter(|s| s.caller == mb.id) {
+            sub_sites.push(entry);
             i += 1;
         }
     }
@@ -1481,12 +1485,12 @@ fn compute_streaming_profile_digest(
 ) -> [u8; 32] {
     pgo_weights.sort_unstable_by(|a, b| a.0.0.cmp(&b.0.0));
     let mut h = blaze_ids::Hasher::new(EXPORT_PGO_PROFILE_DOMAIN);
-    h.update(&(pgo_weights.len() as u64).to_le_bytes());
+    h.update(&u64::try_from(pgo_weights.len()).unwrap_or(u64::MAX).to_le_bytes());
     for &(sym, w) in pgo_weights.iter() {
         h.update(&sym.0);
         h.update(&w.to_le_bytes());
     }
-    h.update(&(hot_symbols.len() as u64).to_le_bytes());
+    h.update(&u64::try_from(hot_symbols.len()).unwrap_or(u64::MAX).to_le_bytes());
     for sym in hot_symbols.iter() {
         h.update(&sym.0);
     }
@@ -1557,9 +1561,10 @@ where
     let arch = opts.machine.arch;
     let per_node_edges: Vec<Vec<u32, SharedAlloc<'static>>, SharedAlloc<'static>> = runner
         .par_map(num_nodes, shared, |u, scratch| {
-            let row = eligible_rows[u];
             let mut local: AVec<'_, u32> = Vec::new_in(scratch);
-            if let Some(rec_bytes) = code_record_of(row) {
+            if let Some(&row) = eligible_rows.get(u)
+                && let Some(rec_bytes) = code_record_of(row)
+            {
                 extract_direct_calls(rec_bytes, arch, node_by_sym_ref, &mut local);
             }
             let mut out = Vec::with_capacity_in(local.len(), shared);
@@ -1649,7 +1654,9 @@ where
     }
     level_offsets.push(acc);
     let mut level_cursor: AVec<'a, usize> = Vec::with_capacity_in(num_levels, alloc);
-    level_cursor.extend_from_slice(&level_offsets[..num_levels]);
+    if let Some(prefix) = level_offsets.get(..num_levels) {
+        level_cursor.extend_from_slice(prefix);
+    }
     let mut level_sccs: AVec<'a, usize> = Vec::with_capacity_in(num_sccs, alloc);
     level_sccs.resize(num_sccs, 0);
     for (scc_idx, &lvl) in scc_level.iter().enumerate() {
@@ -1774,10 +1781,10 @@ where
             // All members of this SCC hit `BLZOLT01`: absorb headers zero-copy!
             for &node_u32 in comp {
                 let Ok(u) = usize::try_from(node_u32) else { continue };
-                let row = eligible_rows[u];
-                let sym = node_symbols[u];
-                let is_ws = node_is_workspace[u];
-                let is_tc = node_is_toolchain[u];
+                let Some(&row) = eligible_rows.get(u) else { continue };
+                let Some(&sym) = node_symbols.get(u) else { continue };
+                let is_ws = node_is_workspace.get(u).copied().unwrap_or(false);
+                let is_tc = node_is_toolchain.get(u).copied().unwrap_or(false);
                 let Some(Some(lto_key)) = node_lto_keys.get(u).copied() else { continue };
                 cache.touch_with_class(is_tc, lto_key);
                 times.emit_hits = times.emit_hits.saturating_add(1);
@@ -1788,8 +1795,12 @@ where
                         hit_err = Some(ExportLtoError::CorruptCache { what: "BLZOLT01", key: lto_key });
                         return;
                     };
-                    known_clobbers[u] = hdr.clobbers;
-                    node_has_inline_body[u] = hdr.has_inline_body;
+                    if let Some(slot) = known_clobbers.get_mut(u) {
+                        *slot = hdr.clobbers;
+                    }
+                    if let Some(slot) = node_has_inline_body.get_mut(u) {
+                        *slot = hdr.has_inline_body;
+                    }
                     if hdr.status == CachedLtoStatus::Skipped {
                         return;
                     }
@@ -1865,8 +1876,7 @@ where
         while ms_cursor < missed_sccs.len() {
             batch_nodes.clear();
             batch_sccs.clear();
-            while ms_cursor < missed_sccs.len() {
-                let scc_idx = missed_sccs[ms_cursor];
+            while let Some(&scc_idx) = missed_sccs.get(ms_cursor) {
                 let comp = sccs.component(scc_idx);
                 if !batch_nodes.is_empty()
                     && batch_nodes.len().saturating_add(comp.len()) > WAVEFRONT_BATCH_BODIES
@@ -1896,9 +1906,12 @@ where
             let mut missing_rows: AVec<'a, usize> = Vec::new_in(alloc);
 
             for (pos, &u) in batch_nodes.iter().enumerate() {
-                let row = eligible_rows[u];
-                let is_tc = node_is_toolchain[u];
-                let lir_key = node_lir_keys[u];
+                let Some(&row) = eligible_rows.get(u) else {
+                    fetched.push(None);
+                    continue;
+                };
+                let is_tc = node_is_toolchain.get(u).copied().unwrap_or(false);
+                let lir_key = node_lir_keys.get(u).copied().flatten();
                 let mut loaded = None;
                 if let Some(key) = lir_key {
                     let mut dec_res = None;
@@ -1930,11 +1943,12 @@ where
                 let built_batch =
                     lir_builder.build_lir_batch(missing_rows.as_slice(), machine, shared, alloc)?;
                 for (&pos, (built, declared)) in missing_pos.iter().zip(built_batch.into_iter()) {
-                    let u = batch_nodes[pos];
-                    if let Some(key) = node_lir_keys[u]
+                    if let Some(&u) = batch_nodes.get(pos)
+                        && let Some(key) = node_lir_keys.get(u).copied().flatten()
                         && let Some(encoded) = encode_built_lir(&built, declared.as_slice(), shared)
                     {
-                        cache.put_with_class(node_is_toolchain[u], key, encoded.as_slice());
+                        let is_tc = node_is_toolchain.get(u).copied().unwrap_or(false);
+                        cache.put_with_class(is_tc, key, encoded.as_slice());
                     }
                     if let Some(slot) = fetched.get_mut(pos) {
                         *slot = Some((built, declared));
@@ -1955,12 +1969,12 @@ where
 
             for (pos, pair_opt) in fetched.into_iter().enumerate() {
                 let Some((built, declared)) = pair_opt else { continue };
-                let u = batch_nodes[pos];
-                let row = eligible_rows[u];
-                let sym = node_symbols[u];
-                let is_ws = node_is_workspace[u];
-                let is_tc = node_is_toolchain[u];
-                let lto_key = node_lto_keys[u];
+                let Some(&u) = batch_nodes.get(pos) else { continue };
+                let Some(&row) = eligible_rows.get(u) else { continue };
+                let Some(&sym) = node_symbols.get(u) else { continue };
+                let is_ws = node_is_workspace.get(u).copied().unwrap_or(false);
+                let is_tc = node_is_toolchain.get(u).copied().unwrap_or(false);
+                let lto_key = node_lto_keys.get(u).copied().flatten();
 
                 let view = built.func.view();
                 let keep = if is_ws {
@@ -1971,8 +1985,12 @@ where
                     should_keep_non_seed(view.head.attrs, view.len(), false, 24, &opts)
                 };
                 if !keep {
-                    known_clobbers[u] = CallClobbers::C_ABI_ARM64;
-                    node_has_inline_body[u] = false;
+                    if let Some(slot) = known_clobbers.get_mut(u) {
+                        *slot = CallClobbers::C_ABI_ARM64;
+                    }
+                    if let Some(slot) = node_has_inline_body.get_mut(u) {
+                        *slot = false;
+                    }
                     times.emit_misses = times.emit_misses.saturating_add(1);
                     if let Some(key) = lto_key {
                         let tomb = encode_lto_scc_skipped(shared);
@@ -2102,9 +2120,13 @@ where
 
             let emit_results = runner
                 .par_map(bn, shared, |b_idx, fn_alloc| -> Result<BatchEmitItem, ParLtoErr> {
-                    let orig = &origins_slice[b_idx];
-                    let opt = &lto_slice[b_idx];
-                    let my_scc = node_scc_slice[orig.node_idx];
+                    let Some(orig) = origins_slice.get(b_idx) else {
+                        return Err(ParLtoErr::BadRef { symbol: [0u8; 32], what: "LTO batch origin index", ref_id: u32::try_from(b_idx).unwrap_or(u32::MAX) });
+                    };
+                    let Some(opt) = lto_slice.get(b_idx) else {
+                        return Err(ParLtoErr::BadRef { symbol: orig.symbol.0, what: "LTO batch body index", ref_id: u32::try_from(b_idx).unwrap_or(u32::MAX) });
+                    };
+                    let my_scc = node_scc_slice.get(orig.node_idx).copied().unwrap_or(u32::MAX);
 
                     let mut funcs_owned: Vec<BuiltCallee, SharedAlloc<'static>> =
                         Vec::with_capacity_in(orig.funcs.len() + opt.imported_refs.len(), shared);
@@ -2468,10 +2490,11 @@ where
                         for (place, callee) in funcs_ref.iter().enumerate() {
                             if let &Callee::Symbol(csym) = callee
                                 && let Some(c_node) = find_body_idx(node_by_sym_ref, csym.0)
-                                && node_scc_slice[c_node] != my_scc
+                                && node_scc_slice.get(c_node).copied() != Some(my_scc)
+                                && let Some(&clob) = known_clobbers_slice.get(c_node)
                                 && let Ok(place_u32) = u32::try_from(place)
                             {
-                                callee_clobbers_buf.push((place_u32, known_clobbers_slice[c_node]));
+                                callee_clobbers_buf.push((place_u32, clob));
                             }
                         }
                     }
@@ -2681,12 +2704,12 @@ where
                 if comp.len() > 1 {
                     let mut scc_union = CallClobbers::EMPTY;
                     for item in items.iter() {
-                        if usize::try_from(node_scc[item.node_idx]).unwrap_or(usize::MAX) == scc_idx {
+                        if node_scc.get(item.node_idx).and_then(|&s| usize::try_from(s).ok()) == Some(scc_idx) {
                             scc_union.clobbered = scc_union.clobbered.union(item.clobbers.clobbered);
                         }
                     }
                     for item in items.iter_mut() {
-                        if usize::try_from(node_scc[item.node_idx]).unwrap_or(usize::MAX) == scc_idx {
+                        if node_scc.get(item.node_idx).and_then(|&s| usize::try_from(s).ok()) == Some(scc_idx) {
                             item.clobbers = scc_union;
                         }
                     }
@@ -2700,9 +2723,13 @@ where
                 times.emit_misses = times.emit_misses.saturating_add(1);
                 optimized_bodies = optimized_bodies.saturating_add(1);
                 total_inlined = total_inlined.saturating_add(item.inlined_bodies);
-                known_clobbers[u] = item.clobbers;
+                if let Some(slot) = known_clobbers.get_mut(u) {
+                    *slot = item.clobbers;
+                }
                 let has_ib = item.inline_body.is_some();
-                node_has_inline_body[u] = has_ib;
+                if let Some(slot) = node_has_inline_body.get_mut(u) {
+                    *slot = has_ib;
+                }
                 body_heats.push(item.heat);
                 pgo_weight_rows.push((item.symbol, item.pgo_body_weight));
                 for &csym in item.hot_callees.iter() {
@@ -2778,10 +2805,12 @@ where
                                 return Err(ExportLtoError::MissingDeclared { from: item.symbol.0, target: t });
                             };
                             seen_extra_inst.insert(t.symbol);
-                            let name_slice = item.target_func_decls[di].1.as_slice();
-                            let mut copied = Vec::with_capacity_in(name_slice.len(), shared);
-                            copied.extend_from_slice(name_slice);
-                            extra_walk_instances.push((item.row, tabled, copied));
+                            if let Some((_, name_vec)) = item.target_func_decls.get(di) {
+                                let name_slice = name_vec.as_slice();
+                                let mut copied = Vec::with_capacity_in(name_slice.len(), shared);
+                                copied.extend_from_slice(name_slice);
+                                extra_walk_instances.push((item.row, tabled, copied));
+                            }
                             Ok(())
                         }
                         Space::Static => {
@@ -2890,12 +2919,13 @@ where
                     .unwrap_or(start);
                 for &callee_u32 in adj.get(start..end).unwrap_or(&[]) {
                     let Ok(v) = usize::try_from(callee_u32) else { continue };
-                    if usize::try_from(node_scc[v]).unwrap_or(0) != scc_idx
+                    if node_scc.get(v).and_then(|&s| usize::try_from(s).ok()) != Some(scc_idx)
                         && let Some(rc) = remaining_callers.get_mut(v)
                     {
                         *rc = rc.saturating_sub(1);
                         if *rc == 0
-                            && let Some(evicted) = frontier.remove(&node_symbols[v].0)
+                            && let Some(sym) = node_symbols.get(v)
+                            && let Some(evicted) = frontier.remove(&sym.0)
                         {
                             frontier_bytes = frontier_bytes.saturating_sub(evicted.approx_bytes);
                         }
@@ -3292,7 +3322,7 @@ mod tests {
             sym_leaf: Symbol,
             main_bump: u128,
             leaf_addend: u128,
-            built_rows: std::vec::Vec<usize>,
+            built_rows: AVec<'a, usize>,
             build_caller: &'a dyn Fn(Symbol, ItemKey, &[u8], u128) -> (BuiltLir<SharedAlloc<'static>>, Vec<DeclaredRow, SharedAlloc<'static>>),
             build_leaf: &'a dyn Fn(u128) -> (BuiltLir<SharedAlloc<'static>>, Vec<DeclaredRow, SharedAlloc<'static>>),
         }
@@ -3324,7 +3354,8 @@ mod tests {
 
         struct MemCache {
             lir_keys: RefCell<[Option<[u8; 32]>; 4]>,
-            store: RefCell<std::collections::HashMap<[u8; 32], std::vec::Vec<u8>>>,
+            store: RefCell<Map<[u8; 32], Vec<u8, SharedAlloc<'static>>, FixedState, SharedAlloc<'static>>>,
+            shared: SharedAlloc<'static>,
         }
         impl ExportLtoCache for MemCache {
             fn producer_digest(&self) -> Option<[u8; 32]> { Some([0x55; 32]) }
@@ -3337,7 +3368,9 @@ mod tests {
                 Some(out)
             }
             fn put(&self, key: [u8; 32], bytes: &[u8]) {
-                self.store.borrow_mut().insert(key, bytes.to_vec());
+                let mut v = Vec::with_capacity_in(bytes.len(), self.shared);
+                v.extend_from_slice(bytes);
+                self.store.borrow_mut().insert(key, v);
             }
             fn now_ns(&self) -> u64 { 0 }
         }
@@ -3352,7 +3385,8 @@ mod tests {
 
         let cache = MemCache {
             lir_keys: RefCell::new([Some([1; 32]), Some([2; 32]), Some([3; 32]), Some([4; 32])]),
-            store: RefCell::new(std::collections::HashMap::new()),
+            store: RefCell::new(Map::new(MapOpts { hasher: FixedState, alloc: shared, capacity: None })),
+            shared,
         };
         let mut opts = ExportLtoOpts::for_export(blaze_emit::Isa { lse: true, os: blaze_emit::Os::MacOs });
         opts.machine = arm64_machine();
@@ -3363,7 +3397,7 @@ mod tests {
             sym_leaf,
             main_bump: 1,
             leaf_addend: 7,
-            built_rows: std::vec::Vec::new(),
+            built_rows: Vec::new_in(alloc),
             build_caller: &build_caller_lir,
             build_leaf: &build_leaf_lir,
         };
@@ -3395,7 +3429,7 @@ mod tests {
             sym_leaf,
             main_bump: 1,
             leaf_addend: 7,
-            built_rows: std::vec::Vec::new(),
+            built_rows: Vec::new_in(alloc),
             build_caller: &build_caller_lir,
             build_leaf: &build_leaf_lir,
         };
@@ -3427,7 +3461,7 @@ mod tests {
             sym_leaf,
             main_bump: 42,
             leaf_addend: 7,
-            built_rows: std::vec::Vec::new(),
+            built_rows: Vec::new_in(alloc),
             build_caller: &build_caller_lir,
             build_leaf: &build_leaf_lir,
         };
@@ -3458,7 +3492,7 @@ mod tests {
             sym_leaf,
             main_bump: 42,
             leaf_addend: 13,
-            built_rows: std::vec::Vec::new(),
+            built_rows: Vec::new_in(alloc),
             build_caller: &build_caller_lir,
             build_leaf: &build_leaf_lir,
         };

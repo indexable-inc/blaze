@@ -85,7 +85,7 @@ struct Stored {
 fn stored() -> std::vec::Vec<Stored> {
     let g = blaze_own::testing::heap().alloc();
     let inputs = [input("app", "/0/app/lib.rs", &[("lib", 1)]), input("lib", "/1/lib/lib.rs", &[("base", 2)]), input("base", "/2/base/lib.rs", &[])];
-    let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+    let sysroot = Sysroot::default();
     let names: Names<'static> = blaze_scope::resolve::resolve_crates(&inputs, sysroot, &Files, &blaze_scope::task::Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("the three crates' names: {e:?}"));
     let mut out = std::vec::Vec::new();
     for c in names.crates().iter() {

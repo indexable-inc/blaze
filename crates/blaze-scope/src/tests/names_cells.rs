@@ -543,6 +543,86 @@ fn a_foreign_items_block_abi_is_in_its_row() {
     std::println!("FOREIGN ROWS: abs {abs:?} (expansion), environ {environ:?} (nested expansion), sys {sys:?} then {sys_after:?}, own {own:?}; sys key same across the edit: {}", sys_key == sys_key_after);
 }
 
+/// Editing the ABI string of an `extern` block that encloses a macro invocation (`extern "C" {
+/// inner!(c_fn); }` -> `extern "system" { inner!(c_fn); }`) updates `ItemRow::foreign` and moves
+/// the expanded item's `Item` cell while leaving unrelated items untouched.
+#[test]
+fn macro_inside_extern_block_keeps_foreign_abi_and_moves_cell_on_abi_edit() {
+    const BEFORE: &str = "\
+#![no_core]
+macro_rules! inner {
+    ($name:ident) => { #[link_name = \"sym_v1\"] fn $name(); };
+}
+macro_rules! outer {
+    ($name:ident) => { inner!($name); };
+}
+extern \"C\" {
+    inner!(c_fn);
+}
+extern \"C-unwind\" {
+    outer!(unwind_fn);
+}
+pub fn own() {}
+";
+    const AFTER: &str = "\
+#![no_core]
+macro_rules! inner {
+    ($name:ident) => { #[link_name = \"sym_v1\"] fn $name(); };
+}
+macro_rules! outer {
+    ($name:ident) => { inner!($name); };
+}
+extern \"system\" {
+    inner!(c_fn);
+}
+extern \"C-unwind\" {
+    outer!(unwind_fn);
+}
+pub fn own() {}
+";
+    static T_BEFORE: Texts = Texts(&[&[("/k0/lib.rs", BEFORE)]]);
+    static T_AFTER: Texts = Texts(&[&[("/k0/lib.rs", AFTER)]]);
+
+    let g = super::SyncFrame::leaked();
+    let (names_before, items_before) = foreign_side(&T_BEFORE);
+    let (names_after, items_after) = foreign_side(&T_AFTER);
+    let before = super::items_record::one_file(items_before, BEFORE, g);
+    let after = super::items_record::one_file(items_after, AFTER, g);
+    let rows_before = foreign_rows(&before);
+    let rows_after = foreign_rows(&after);
+    let find = |rows: &[(&'static str, ItemKey, bool, Option<&'static str>)], name: &str| {
+        rows.iter().find(|r| r.0 == name).map(|r| (r.1, r.2, r.3)).unwrap_or_else(|| panic!("no item row `{name}` in {rows:?}"))
+    };
+
+    let (c_key_before, c_in_exp, c_abi_before) = find(&rows_before, "c_fn");
+    assert!(c_in_exp, "`c_fn` must live in `inner!`'s expansion");
+    assert_eq!(c_abi_before, Some("C"), "`c_fn` inherits enclosing `extern \"C\"`");
+
+    let (_, unwind_in_exp, unwind_abi) = find(&rows_before, "unwind_fn");
+    assert!(unwind_in_exp, "`unwind_fn` must live in nested `outer! -> inner!`'s expansion");
+    assert_eq!(unwind_abi, Some("C-unwind"), "`unwind_fn` inherits enclosing `extern \"C-unwind\"` across nested macros");
+
+    let (own_key_before, _, own_abi) = find(&rows_before, "own");
+    assert_eq!(own_abi, None, "`own` is not inside an `extern` block");
+
+    let (c_key_after, _, c_abi_after) = find(&rows_after, "c_fn");
+    assert_eq!(c_abi_after, Some("system"), "editing enclosing `extern` block ABI updates `c_fn`'s row");
+    let (own_key_after, ..) = find(&rows_after, "own");
+
+    let digest = |names: &'static [u8], items_bytes: &'static [u8], text: &'static str, key: ItemKey| -> Option<ContentId> {
+        let items = super::items_record::one_file(items_bytes, text, g);
+        let record = NamesRecord::open(Verified::check(names).unwrap_or_else(|e| panic!("a record does not check: {e:?}")));
+        let read = move |of: TextOf<'_>| -> Option<&'static str> { matches!(of, TextOf::File { index: 0, .. }).then_some(text) };
+        let wholes = [(Section::Items, items_bytes)];
+        seen_by_record(&record, Some((&items, &read)), &wholes, NameCell::Item { key }).unwrap_or_else(|e| panic!("the `Item` cell of {key:?}: {e:?}"))
+    };
+    let c_was = digest(names_before, items_before, BEFORE, c_key_before);
+    let c_now = digest(names_after, items_after, AFTER, c_key_after);
+    assert!(c_was.is_some() && c_now.is_some(), "`c_fn` must have an `Item` cell");
+    assert_ne!(c_was, c_now, "editing the enclosing `extern` block's ABI must move `c_fn`'s `Item` cell");
+    assert_eq!(digest(names_before, items_before, BEFORE, own_key_before), digest(names_after, items_after, AFTER, own_key_after));
+}
+
 #[test]
 fn impl_rows_and_files_cells_stand_on_private_fn_and_move_on_own_change() {
     const BASE: &str = "#![no_core]\npub struct S;\nimpl S { pub fn a() {} }\n";
@@ -633,4 +713,45 @@ fn extensions_and_cfg_atoms_cells_stand_on_private_fn_and_move_on_own_change() {
     assert!(uniq_ext.is_some(), "#![blaze::uniq] defines Extensions cell");
     let both_ext = lookup(WITH_UNIQ_RECORDS, &|krate| NameCell::Extensions { krate });
     assert!(both_ext.is_some() && both_ext != uniq_ext, "adding #![blaze::records] moves Extensions cell");
+}
+
+#[test]
+fn exports_cell_is_absent_without_exports_and_moves_only_on_exported_fns() {
+    const BASE: &str = "#![no_core]\npub fn a() {}\nunsafe extern \"C\" { fn ext(); }\n";
+    const WITH_PRIV: &str = "#![no_core]\npub fn a() {}\nfn priv_helper() {}\nunsafe extern \"C\" { fn ext(); }\n";
+    const WITH_NO_MANGLE: &str = "#![no_core]\n#[unsafe(no_mangle)] pub unsafe extern \"C\" fn f() {}\n";
+    const WITH_NO_MANGLE_AND_PRIV: &str = "#![no_core]\n#[unsafe(no_mangle)] pub unsafe extern \"C\" fn f() {}\nfn unrelated() {}\n";
+    const WITH_EXPORT_NAME: &str = "#![no_core]\n#[unsafe(export_name = \"f\")] pub unsafe extern \"C\" fn impl_f() {}\n";
+
+    let lookup = |src: &'static str| -> Option<ContentId> {
+        let solved = super::items_record::solve_one(src, None);
+        let bump = super::SyncFrame::leaked();
+        let g = bump.alloc();
+        let names_bytes = aligned(&encode(solved, g).expect("encode names"), bump);
+        let items_bytes = aligned(&items_encode(solved, g).expect("encode items"), bump);
+        let wholes = [(Section::Items, items_bytes)];
+        let tbl = crate::names_cells::crate_table(solved, names_bytes, items_bytes, &wholes, bump).expect("crate_table");
+        let cell = NameCell::Exports { krate: solved.key.prefix() };
+        let table_val = seen_in(&tbl, cell.key()).expect("seen_in");
+        let record = NamesRecord::open(Verified::check(names_bytes).expect("verify names"));
+        let mut items = crate::items_record::ItemsRecord::open(items_bytes, g).expect("open items");
+        items.use_solved_texts(solved, bump);
+        let read = |of: TextOf<'_>| -> Option<&str> {
+            match of {
+                TextOf::File { index: 0, .. } => Some(src),
+                _ => None,
+            }
+        };
+        let rec_val = seen_by_record(&record, Some((&items, &read)), &wholes, cell).expect("seen_by_record");
+        assert_eq!(table_val, rec_val, "crate_table and seen_by_record disagree on Exports");
+        table_val
+    };
+
+    assert_eq!(lookup(BASE), None, "crate with only extern decl has absent Exports cell");
+    assert_eq!(lookup(WITH_PRIV), None, "adding private fn keeps Exports cell absent");
+    let d1 = lookup(WITH_NO_MANGLE);
+    assert!(d1.is_some(), "#[unsafe(no_mangle)] fn defines Exports cell");
+    assert_eq!(lookup(WITH_NO_MANGLE_AND_PRIV), d1, "adding unrelated private fn must not move Exports cell");
+    let d2 = lookup(WITH_EXPORT_NAME);
+    assert!(d2.is_some() && d2 != d1, "changing exported fn to #[export_name] must move Exports cell");
 }

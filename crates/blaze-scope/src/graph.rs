@@ -18,7 +18,8 @@
 //!   `std` unless `#![no_std]` (under a blaze edition `std` is bstd); `alloc` only by an
 //!   `extern crate alloc;` at the root, which the resolver adds from the root's own items;
 //! - the crates an `extern crate` may name: the extern prelude and the sysroot's (`core`,
-//!   `alloc`, `std`; under a blaze edition `std` is bstd and Rust's `std` has no name);
+//!   `alloc`, `std`, `proc_macro`; under a blaze edition `std` is bstd and Rust's `std` has no
+//!   name);
 //! - the injected `#[macro_use] extern crate`: `std` (bstd), or `core` under `#![no_std]`;
 //! - the standard prelude: `std::prelude::rust_20xx`, `core::prelude::rust_20xx` under
 //!   `#![no_std]`, or bstd's `prelude::<the blaze edition's module>`.
@@ -84,27 +85,29 @@ pub struct Sysroot {
     pub alloc: Option<CrateId>,
     /// Rust's `std`.
     pub std: Option<CrateId>,
+    /// Rust's `proc_macro`: nameable by `extern crate proc_macro;` on any crate, and in the
+    /// extern prelude of proc-macro crates.
+    pub proc_macro: Option<CrateId>,
     /// bstd: `std` under a blaze edition.
     pub bstd: Option<CrateId>,
 }
 
 impl Sysroot {
-    /// `core`, `alloc`, `std`, bstd, in that order.
-    pub fn all(self) -> [Option<CrateId>; 4] {
-        [self.core, self.alloc, self.std, self.bstd]
+    /// `core`, `alloc`, `std`, `proc_macro`, bstd, in that order.
+    pub fn all(self) -> [Option<CrateId>; 5] {
+        [self.core, self.alloc, self.std, self.proc_macro, self.bstd]
     }
 
     /// As blaze-unit-graph's sysroot, so its rule ([`Implicit::externs`]) answers in this
-    /// graph's crates: a crate's index is its `ToolchainUnit`, and a crate the graph lacks (and
-    /// `proc_macro`, which no graph here holds) is [`ABSENT`], read back as `None` by
-    /// [`Sysroot::crate_of`].
+    /// graph's crates: a crate's index is its `ToolchainUnit`, and a crate the graph lacks is
+    /// [`ABSENT`], read back as `None` by [`Sysroot::crate_of`].
     fn units(self) -> blaze_unit_graph::Sysroot {
         let unit = |c: Option<CrateId>| c.map_or(ABSENT, |c| ToolchainUnit(c.0));
         blaze_unit_graph::Sysroot {
             core: unit(self.core),
             alloc: unit(self.alloc),
             std: unit(self.std),
-            proc_macro: ABSENT,
+            proc_macro: unit(self.proc_macro),
             bstd: unit(self.bstd),
         }
     }
@@ -419,9 +422,9 @@ impl<'a, N: Name> CrateGraph<'a, N> {
                 add(&mut prelude, word(name), kept);
             }
         }
-        // What `extern crate` may name besides: the rule's `core`, `alloc` and `std`.
+        // What `extern crate` may name besides: the rule's `core`, `alloc`, `std` and `proc_macro`.
         let mut deps = prelude.clone_in(self.alloc);
-        for name in ["core", "alloc", "std"] {
+        for name in ["core", "alloc", "std", "proc_macro"] {
             add(&mut deps, word(name), not_self(implicit.extern_crate(name, &units).and_then(Sysroot::crate_of)));
         }
         prelude.sort_unstable_by(|a, b| a.name.cmp(&b.name));
@@ -532,7 +535,7 @@ mod tests {
         GraphCrate { name, edition: Edition::E2024, implicit, features: AVec::new_in(a()), cfg: AVec::new_in(a()), deps: d }
     }
 
-    fn graph(crates: std::vec::Vec<GraphCrate<'static, &'static str>>, sys: Sysroot) -> Result<CrateGraph<'static, &'static str>, GraphError<'static, &'static str>> {
+    fn graph(crates: impl IntoIterator<Item = GraphCrate<'static, &'static str>>, sys: Sysroot) -> Result<CrateGraph<'static, &'static str>, GraphError<'static, &'static str>> {
         let mut v = AVec::new_in(a());
         v.extend(crates);
         CrateGraph::new_in(v, sys, a())
@@ -576,10 +579,11 @@ mod tests {
     }
 
     /// Rust's injection: a std crate has `core` and `std`; a `#![no_std]` one `core` only and
-    /// core's prelude; `#![no_core]` nothing; `alloc` is only nameable by `extern crate`.
+    /// core's prelude; `#![no_core]` nothing; `alloc` and `proc_macro` are only nameable by
+    /// `extern crate` (not in the extern prelude of a non-proc-macro crate).
     #[test]
     fn externs_follow_rusts_injection() {
-        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), bstd: None };
+        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), proc_macro: None, bstd: None };
         let g = graph(
             std::vec![
                 krate("core", &[], rust()),
@@ -605,6 +609,49 @@ mod tests {
         assert!(e.prelude.is_empty() && e.macro_use.is_none() && e.std_prelude.is_none());
     }
 
+    /// A non-`proc-macro` Rust library (such as `proc_macro2` with `feature = "proc-macro"`) has
+    /// `proc_macro` in `Externs::deps` (for `extern crate proc_macro;`), NEVER in `Externs::prelude`,
+    /// while a `proc-macro` crate has `proc_macro` in BOTH `prelude` and `deps` with nothing dropped.
+    #[test]
+    fn target_lib_gets_proc_macro_in_deps_only_not_prelude() {
+        let pm_implicit = blaze_unit_graph::implicit(edition::PackageEdition::of_manifest("2024").expect("an edition"), &blaze_unit_graph::UnitKind::ProcMacro);
+        let sys = Sysroot {
+            core: Some(CrateId(0)),
+            alloc: Some(CrateId(1)),
+            std: Some(CrateId(2)),
+            proc_macro: Some(CrateId(3)),
+            bstd: None,
+        };
+        let g = graph(
+            [
+                krate("core", &[], rust()),
+                krate("alloc", &[("core", 0)], rust()),
+                krate("std", &[("alloc", 1), ("core", 0)], rust()),
+                krate("proc_macro", &[("core", 0), ("std", 2)], rust()),
+                krate("proc_macro2", &[], rust()),
+                krate("my_macro", &[], pm_implicit),
+            ],
+            sys,
+        )
+        .expect("no cycle");
+        let lib = g.externs(CrateId(4), RootAttrs::default());
+        assert_eq!(names(&lib.prelude).as_slice(), [("core", 0), ("std", 2)], "non-proc-macro lib must NOT have `proc_macro` in extern prelude");
+        assert_eq!(names(&lib.deps).as_slice(), [("alloc", 1), ("core", 0), ("proc_macro", 3), ("std", 2)], "non-proc-macro lib must have `proc_macro` in deps for `extern crate proc_macro;`");
+        assert!(lib.dropped.is_empty(), "{:?}", lib.dropped);
+        // `#![no_std]` non-proc-macro lib also gets `proc_macro` in deps (not prelude).
+        let lib_no_std = g.externs(CrateId(4), RootAttrs { no_std: true, ..RootAttrs::default() });
+        assert_eq!(names(&lib_no_std.prelude).as_slice(), [("core", 0)]);
+        assert_eq!(names(&lib_no_std.deps).as_slice(), [("alloc", 1), ("core", 0), ("proc_macro", 3), ("std", 2)]);
+        // A proc-macro crate gets `proc_macro` in BOTH prelude and deps.
+        let pm = g.externs(CrateId(5), RootAttrs::default());
+        assert_eq!(names(&pm.prelude).as_slice(), [("core", 0), ("proc_macro", 3), ("std", 2)]);
+        assert_eq!(names(&pm.deps).as_slice(), [("alloc", 1), ("core", 0), ("proc_macro", 3), ("std", 2)]);
+        assert!(pm.dropped.is_empty(), "{:?}", pm.dropped);
+        // `std` (built into `proc_macro`) does not name `proc_macro` (no cycle).
+        let std_ext = g.externs(CrateId(2), RootAttrs { no_std: true, ..RootAttrs::default() });
+        assert!(std_ext.deps.iter().all(|d| d.name != "proc_macro"), "std must not see proc_macro: {:?}", names(&std_ext.deps));
+    }
+
     /// Expected line: `test graph::tests::the_injected_crate_is_the_extern_preludes ... ok`.
     ///
     /// The injected `#[macro_use] extern crate` and the standard prelude name their crate by the
@@ -618,7 +665,7 @@ mod tests {
     /// sysroot's.
     #[test]
     fn the_injected_crate_is_the_extern_preludes() {
-        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), bstd: None };
+        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), proc_macro: None, bstd: None };
         let g = graph(
             std::vec![
                 krate("core", &[], rust()),
@@ -649,7 +696,7 @@ mod tests {
     /// name it, nor bstd; no implicit edge makes a cycle.
     #[test]
     fn graph_orders_the_sysroot_before_its_users() {
-        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), bstd: Some(CrateId(4)) };
+        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), proc_macro: None, bstd: Some(CrateId(4)) };
         let g = graph(
             std::vec![
                 krate("core", &[], rust()),
@@ -674,24 +721,26 @@ mod tests {
     }
 
     /// Under a blaze edition `std` names bstd and the prelude is bstd's edition module;
-    /// Rust's `std` has no name.
+    /// Rust's `std` and `proc_macro` have no name even when present in the graph's sysroot.
     #[test]
     fn externs_under_a_blaze_edition_name_bstd() {
-        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), bstd: Some(CrateId(3)) };
+        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), proc_macro: Some(CrateId(4)), bstd: Some(CrateId(3)) };
         let g = graph(
             std::vec![
                 krate("core", &[], rust()),
                 krate("alloc", &[], rust()),
                 krate("std", &[], rust()),
                 krate("bstd", &[], rust()),
+                krate("proc_macro", &[("core", 0), ("std", 2)], rust()),
                 krate("hello", &[], blaze()),
             ],
             sys,
         )
         .expect("no cycle");
-        let e = g.externs(CrateId(4), RootAttrs::default());
+        let e = g.externs(CrateId(5), RootAttrs::default());
         assert_eq!(names(&e.prelude), std::vec![("core", 0), ("std", 3)]);
         assert!(e.deps.iter().all(|d| d.krate != CrateId(2)), "Rust's std is nameable: {:?}", names(&e.deps));
+        assert!(e.deps.iter().all(|d| d.krate != CrateId(4) && d.name != "proc_macro"), "Rust's proc_macro is nameable on a blaze-edition crate: {:?}", names(&e.deps));
         assert_eq!(e.macro_use, Some(CrateId(3)));
         assert_eq!(e.std_prelude, Some(PreludePath { krate: CrateId(3), path: ["prelude", "blaze_2026_11"] }));
         assert!(e.dropped.is_empty(), "{:?}", e.dropped);
@@ -704,7 +753,7 @@ mod tests {
     /// nothing; a crate std is built from cannot name std, and says so.
     #[test]
     fn a_dropped_implicit_crate_is_named() {
-        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: None, bstd: Some(CrateId(2)) };
+        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: None, proc_macro: None, bstd: Some(CrateId(2)) };
         let g = graph(
             std::vec![
                 krate("core", &[], rust()),
@@ -720,7 +769,7 @@ mod tests {
         assert_eq!(&mem.dropped[..], &[DroppedExtern { name: "std", why: ExternGone::NotInGraph }]);
         let bare = g.externs(CrateId(3), RootAttrs { no_std: true, ..RootAttrs::default() });
         assert!(bare.dropped.is_empty(), "{:?}", bare.dropped);
-        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), bstd: None };
+        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), proc_macro: None, bstd: None };
         let g = graph(
             std::vec![krate("core", &[], rust()), krate("alloc", &[("core", 0)], rust()), krate("std", &[("libc", 3)], rust()), krate("libc", &[], rust())],
             sys,

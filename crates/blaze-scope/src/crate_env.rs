@@ -114,6 +114,11 @@ pub fn bin_exe<'b>(package: &str, name: &str, alloc: Alloc<'b>) -> AString<'b> {
 /// The guest folder under which [`bin_exe`] places each package's binaries.
 pub const BIN_EXE_ROOT: &str = "/target/debug/bin/";
 
+/// Where an integration test or a bench is told its scratch directory is (`CARGO_TARGET_TMPDIR`):
+/// the guest path `/target/tmp` (Cargo's `<target-dir>/tmp`, D96: a constant of the build, never
+/// the host checkout or home, so keys hold nothing of the machine, rule 25).
+pub const TARGET_TMPDIR: &str = "/target/tmp";
+
 /// The names of a package's binaries, sorted, each once, joined by `\n` (empty: none): what an
 /// integration test or a bench of it is given a `CARGO_BIN_EXE_<name>` for. Made only by
 /// [`BinNames::new`], which checks the form, so every reader may split it.
@@ -301,6 +306,7 @@ impl<'a> CrateEnv<'a> {
         }
         // A toolchain crate (no package) has no test or bench of a package to be given these.
         if let (true, Some((package, _))) = (facts.test_or_bench, facts.package) {
+            put(&mut given, "CARGO_TARGET_TMPDIR", TARGET_TMPDIR);
             for name in facts.bin_exes.names() {
                 let mut var = AString::with_capacity_in("CARGO_BIN_EXE_".len() + name.len(), alloc);
                 var.push_str("CARGO_BIN_EXE_");
@@ -837,6 +843,7 @@ mod tests {
         assert_eq!(copy.get("CARGO_MANIFEST_DIR"), Ok(Some("/workspace/crates/node")));
         assert_eq!(copy.get("CARGO_PKG_VERSION_MINOR"), Ok(Some("2")));
         assert_eq!(copy.get("CARGO_BIN_EXE_node"), Ok(Some("/target/debug/bin/tempo-node/node")));
+        assert_eq!(copy.get("CARGO_TARGET_TMPDIR"), Ok(Some("/target/tmp")));
         assert_eq!(copy.shown_file("src/lib.rs", alloc).as_ref().map(|s| s.as_str()), Some("crates/node/src/lib.rs"));
         assert_eq!(copy.read_folder(), "/7/");
     }

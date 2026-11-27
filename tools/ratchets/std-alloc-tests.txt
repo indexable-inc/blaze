@@ -26,7 +26,7 @@ blaze-body-flow	6	1	0	7	0	0	0	0	0	0
 blaze-body-lower	13	0	0	24	0	0	0	0	0	0
 blaze-borrow	5	0	0	7	0	0	0	0	0	0
 blaze-bstd-convert	13	0	0	9	8	0	0	0	0	0
-blaze-build	143	2	2	462	0	0	6	3	0	0
+blaze-build	141	2	2	409	0	0	6	3	0	0
 blaze-build-script	145	0	0	118	3	0	0	0	0	0
 blaze-bytes	9	0	0	20	0	0	1	0	0	0
 blaze-c	2	0	0	0	0	0	0	0	0	0
@@ -41,7 +41,7 @@ blaze-cbor	3	0	0	0	0	0	1	0	0	0
 blaze-cc	6	0	0	1	0	0	0	0	0	0
 blaze-cert	7	0	0	2	0	0	0	0	0	2
 blaze-check	7	0	0	31	0	0	48	0	0	0
-blaze-cli	1335	31	3	771	300	96	3	12	0	3
+blaze-cli	1330	31	3	763	299	96	3	12	0	3
 blaze-cli-spec	1	0	0	0	0	0	0	0	0	0
 blaze-code	1	0	0	1	0	0	0	0	0	0
 blaze-columns	27	0	0	35	0	0	0	0	0	0
@@ -49,7 +49,7 @@ blaze-comptime	2	0	0	26	0	0	0	0	0	0
 blaze-comptime-sys	2	0	0	15	0	0	0	0	0	0
 blaze-cond	1	0	0	0	0	0	0	0	0	0
 blaze-consteval	85	0	0	14	0	0	0	0	0	0
-blaze-core	693	0	3	967	402	103	34	5	0	0
+blaze-core	693	0	3	964	402	103	34	5	0	0
 blaze-ctx	4	0	0	2	0	0	0	0	0	0
 blaze-cunit	2	0	0	0	0	0	0	0	0	0
 blaze-data	7	0	0	3	0	0	2	0	0	0
@@ -66,7 +66,7 @@ blaze-export	45	5	0	14	12	8	2	1	0	0
 blaze-fetch	96	0	7	98	0	0	0	0	0	0
 blaze-file-items	53	5	0	86	6	0	0	0	0	0
 blaze-flow	50	0	1	50	0	1	2	0	0	0
-blaze-flow-lower	301	0	0	90	2	0	0	0	0	0
+blaze-flow-lower	300	0	0	90	2	0	0	0	0	0
 blaze-fmt	5	1	0	16	2	0	0	0	0	0
 blaze-format	6	0	0	46	0	0	0	0	0	0
 blaze-format-core	15	0	0	45	0	0	0	0	0	0
@@ -88,7 +88,7 @@ blaze-int	4	0	0	1	0	0	0	0	0	0
 blaze-json	3	0	0	0	0	0	1	0	0	0
 blaze-keyed	6	0	1	124	0	0	0	0	0	0
 blaze-kit	2	0	0	0	0	0	0	0	0	0
-blaze-ladder	785	288	0	2392	62	55	12	262	0	98
+blaze-ladder	776	288	0	2386	62	55	12	262	0	98
 blaze-launch	19	0	0	158	0	0	0	0	0	1
 blaze-launch-rt	118	2	0	101	8	7	19	1	0	0
 blaze-launcher	20	1	0	17	8	0	0	1	0	0
@@ -111,7 +111,7 @@ blaze-pbr	1	0	0	0	0	0	0	0	0	0
 blaze-pg	9	0	2	140	0	0	0	0	0	0
 blaze-phf	5	0	0	9	0	0	0	0	0	1
 blaze-preview	3	0	0	2	0	0	0	0	0	0
-blaze-proc-macro	476	3	0	325	272	5	6	17	0	1
+blaze-proc-macro	476	3	0	324	272	5	6	17	0	1
 blaze-producers	8	0	0	0	0	0	0	0	0	0
 blaze-protocol	23	0	0	116	10	0	0	0	0	2
 blaze-queue	3	0	0	26	0	0	4	0	0	0
@@ -125,7 +125,7 @@ blaze-rng	3	1	0	8	0	0	0	0	0	0
 blaze-roots	6	0	0	9	0	0	0	0	0	0
 blaze-run	15	0	0	217	0	0	0	0	0	0
 blaze-rung-tiers	4	1	0	2	0	0	0	0	0	0
-blaze-scope	123	1	0	78	3	0	1	1	0	0
+blaze-scope	122	1	0	77	3	0	1	1	0	0
 blaze-screen	3	3	0	57	1	0	0	0	0	0
 blaze-script	17	0	0	39	12	7	0	0	0	0
 blaze-semver	2	0	0	0	0	0	0	0	0	0
@@ -158,7 +158,7 @@ blaze-toml	3	0	0	0	0	0	1	0	0	0
 blaze-toolchain	21	0	0	15	0	0	0	0	0	0
 blaze-trace	3	0	1	9	0	0	3	0	0	0
 blaze-ty	2	0	0	39	0	0	0	0	0	0
-blaze-typeck	542	0	0	1107	0	0	0	0	0	0
+blaze-typeck	496	0	0	1055	0	0	0	0	0	0
 blaze-unicode	3	0	0	9	0	0	0	0	0	0
 blaze-unit-graph	15	0	0	4	0	0	0	0	0	0
 blaze-units	2	0	0	0	0	0	0	0	0	0

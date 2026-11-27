@@ -30,7 +30,7 @@ use blaze_own::Alloc;
 use blaze_surface::Range;
 use blaze_typeck::{ExprId, ItemKey, Name, OwnTys, PTy, PortableTys};
 
-use super::check::{BodyScope, MOST_ROUNDS};
+use super::check::{BodyScope, MOST_PROGRESS_ROUNDS, MOST_ROUNDS};
 use super::heads::{CrateCfg, FnHead, HeadError, Maps, Store, Want};
 use super::keys::{Keys, MemberKind, Origin, checker_of};
 use super::scoped::ScopedBy;
@@ -419,6 +419,14 @@ struct BodyTypes<'b, S> {
     region_needs: blaze_own::Vec<LibKey, Alloc<'static>>,
     /// A const evaluation (`Why::NeedConst`) requested by [`Self::closure_param_regions`].
     region_need_const: Option<Why>,
+    /// Heads requested via `Why::Need` by [`Self::ty`] during a round that can ensure heads
+    /// (`batch_needs == true`): collected across the whole body in one pass instead of aborting
+    /// at the first missing head (so large generated bodies naming hundreds of distinct types,
+    /// like `syntax/tests/view/accessors.rs::check`, convert in ~2 rounds instead of O(N) rounds).
+    head_needs: blaze_own::Vec<LibKey, Alloc<'static>>,
+    /// Whether [`Self::ty`] may record `Why::Need` in `head_needs` and continue scanning the body.
+    /// False on `lower_again` (`into.is_some()`), where missing heads cannot be added to the table.
+    batch_needs: bool,
 }
 
 /// A fn's `#[rustc_legacy_const_generics(..)]` positions, by its key: what
@@ -456,6 +464,12 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
         }
         match self.builder.ty(tys, &env, view, t) {
             Ok(ty) => Ok(ty),
+            Err(Why::Need(k)) if self.batch_needs => {
+                if !self.head_needs.iter().any(|&seen| seen == k) {
+                    self.head_needs.push(k);
+                }
+                tys.intern(blaze_typeck::PNode::Error).map_err(Refused::from)
+            }
             Err(why) => {
                 // A type the body's module does not resolve, in a body with a glob import in
                 // a block: the name may be the glob's to give, which the type builder (it
@@ -795,6 +809,23 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
                 if slots.iter().filter(|s| matches!(s.kind, super::types::SlotKind::Elided(k) if k == id)).count() > 1 =>
             {
                 Some(blaze_typeck::WrittenRegion::Elided(id))
+            }
+            super::types::SlotKind::Late { binder: 0, var }
+            | super::types::SlotKind::Given(blaze_typeck::regions::Region::Late { binder: 0, var })
+                if slots
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            s.kind,
+                            super::types::SlotKind::Late { binder: 0, var: v }
+                                | super::types::SlotKind::Given(blaze_typeck::regions::Region::Late { binder: 0, var: v })
+                                if v == var
+                        )
+                    })
+                    .count()
+                    > 1 =>
+            {
+                Some(blaze_typeck::WrittenRegion::Late(var))
             }
             _ => None,
         };
@@ -1835,7 +1866,8 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let mut last = item;
     let mut typeck = None;
     let mut given_param_bounds: blaze_own::Vec<ContainerParamBound, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
-    for _ in 0..MOST_ROUNDS {
+    let mut seen_needs: blaze_own::Vec<LibKey, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+    for round in 0..MOST_PROGRESS_ROUNDS {
         let mut given_self: Option<blaze_own::Vec<blaze_typeck::regions::Region, Alloc<'static>>> = None;
         let mut given_impl_trait: Option<blaze_own::Vec<blaze_typeck::regions::Region, Alloc<'static>>> = None;
         given_param_bounds.clear();
@@ -1945,6 +1977,8 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
             self_given,
             region_needs: blaze_own::Vec::new_in(alloc),
             region_need_const: None,
+            head_needs: blaze_own::Vec::new_in(alloc),
+            batch_needs: into.is_none(),
         };
         // Each round converts into a fresh overlay of the records' table (read in place, never
         // copied): a refused round's types are dropped with it, none reaches `store.tys`, and
@@ -1997,15 +2031,29 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
                 (converted, kept)
             }
         };
-        let BodyTypes { failed, expanded_type, misses, region_needs, region_need_const, .. } = types;
+        let BodyTypes { failed, expanded_type, misses, region_needs, region_need_const, head_needs, .. } = types;
         let want_of = |store: &Store<'n>, k: LibKey| match (Paths { names }).detail(k) {
             Some(blaze_surface::ItemDetail::Fn { .. }) => Want::Fn(k),
             _ => store.need(k),
         };
+        let mut ensure_batch = |store: &mut Store<'n>, extra: Option<LibKey>, last: &mut LibKey| -> Result<bool, BodyError> {
+            let mut any_new = false;
+            for k in extra.into_iter().chain(head_needs.iter().copied()).chain(region_needs.iter().copied()) {
+                *last = k;
+                if !seen_needs.iter().any(|&s| s == k) {
+                    seen_needs.push(k);
+                    any_new = true;
+                }
+                let need = want_of(store, k);
+                store.ensure(names, keys, need).map_err(|error| BodyError::Head { item, error })?;
+            }
+            Ok(any_new)
+        };
         match converted {
             Ok(b) => {
-                if let Some(&first) = region_needs.first() {
+                if !head_needs.is_empty() || !region_needs.is_empty() {
                     if again_now {
+                        let first = head_needs.first().or_else(|| region_needs.first()).copied().unwrap_or(item);
                         return Err(BodyError::Convert {
                             item,
                             refused: Refused::Form { what: "a closure parameter's regions", range: Range::new(0, 0) },
@@ -2013,10 +2061,9 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
                             expanded_type: None,
                         });
                     }
-                    for &k in region_needs.iter() {
-                        last = k;
-                        let need = want_of(store, k);
-                        store.ensure(names, keys, need).map_err(|error| BodyError::Head { item, error })?;
+                    let any_new = ensure_batch(store, None, &mut last)?;
+                    if round + 1 >= MOST_ROUNDS && !any_new {
+                        break;
                     }
                     continue;
                 }
@@ -2043,17 +2090,17 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
                 // Lowered again into a finished table: a head it lacks cannot be added there.
                 Some(why @ Why::Need(_)) if again_now => return Err(BodyError::Convert { item, refused, why: Some(why), expanded_type: None }),
                 Some(Why::Need(k)) => {
-                    last = k;
-                    // A free fn's head (its const parameters, which type a const argument
-                    // written on a path to it: `BodyTypes::arg_param`) is its `Want::Fn`.
-                    let need = want_of(store, k);
-                    store.ensure(names, keys, need).map_err(|error| BodyError::Head { item, error })?;
-                    for &rk in region_needs.iter() {
-                        if rk != k {
-                            last = rk;
-                            let rneed = want_of(store, rk);
-                            store.ensure(names, keys, rneed).map_err(|error| BodyError::Head { item, error })?;
-                        }
+                    let any_new = ensure_batch(store, Some(k), &mut last)?;
+                    if round + 1 >= MOST_ROUNDS && !any_new {
+                        break;
+                    }
+                }
+                _ if !again_now && !head_needs.is_empty() => {
+                    // Earlier types in this round saw missing heads (`PNode::Error` placeholders);
+                    // ensure all discovered heads and re-convert cleanly before reporting any error.
+                    let any_new = ensure_batch(store, None, &mut last)?;
+                    if round + 1 >= MOST_ROUNDS && !any_new {
+                        break;
                     }
                 }
                 why => {
@@ -2569,7 +2616,9 @@ pub fn hrtb_alias_and_tuple<'a>() {
         assert_eq!(
             &lower_regions(src, "hrtb_alias_and_tuple", alloc)[..],
             &[
+                (0, step(root, 0), 0, WrittenRegion::Late(0)),
                 (0, step(root, 1), 0, WrittenRegion::Named),
+                (0, step(root, 2), 0, WrittenRegion::Late(0)),
                 (1, step(root, 1), 0, WrittenRegion::Named),
                 (1, step(root, 2), 0, WrittenRegion::Static),
                 (2, step(root, 1), 0, WrittenRegion::Named),
@@ -2646,6 +2695,32 @@ pub fn use_dyn<'a>() {
                 (1, step(root, 0), 0, WrittenRegion::Static),
                 (2, root, 0, WrittenRegion::Elided(0)),
                 (2, step(root, 0), 0, WrittenRegion::Elided(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn closure_param_regions_records_fn_ptr_shared_late_and_static() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub struct Wrap<'a>(&'a u8);
+pub fn use_pick() {
+    let _c = |pick: fn(&(u8, u8)) -> &u8, f: for<'a, 'b> fn(&'a u8, &'b u8) -> &'a u8, g: fn(&mut Wrap<'static>, u8) -> u8| {
+        let _ = (pick, f, g);
+    };
+}
+"#;
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+        assert_eq!(
+            &lower_regions(src, "use_pick", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Late(0)),
+                (0, step(root, 1), 0, WrittenRegion::Late(0)),
+                (1, step(root, 0), 0, WrittenRegion::Late(0)),
+                (1, step(root, 2), 0, WrittenRegion::Late(0)),
+                (2, step(step(root, 0), 0), 0, WrittenRegion::Static),
             ]
         );
     }

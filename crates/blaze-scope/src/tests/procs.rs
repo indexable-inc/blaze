@@ -255,3 +255,105 @@ fn a_proc_macro_without_a_runner_resolves_and_is_not_run() {
         "every proc-macro path resolves: {errors:?}"
     );
 }
+
+/// Regression test for `wasmtime`'s `#[versioned_link]` inside `unsafe extern "C" { ... }` (both
+/// direct and nested inside an outer macro like `cfg_select!`): an attribute proc-macro applied
+/// to a foreign fn rewrites it into a top-level `#[link_name = "..."] fn ...;` without wrapping
+/// it in another `extern` block. Both `items_record::foreign_abi`, `items_record::call_foreign_abi`,
+/// and the encoded `ItemsRecord` must record `Some("C")`.
+#[test]
+fn attr_proc_macro_inside_extern_block_keeps_foreign_abi() {
+    const PM: &str = "\
+#[proc_macro_attribute]
+pub fn versioned_link(_attr: TokenStream, item: TokenStream) -> TokenStream { item }
+";
+    const USER_SRC: &str = "\
+#![no_core]
+macro_rules! wrap { ($($t:tt)*) => { $($t)* }; }
+unsafe extern \"C\" {
+    #[macros::versioned_link]
+    fn wasmtime_libunwind();
+}
+wrap! {
+    unsafe extern \"C\" {
+        #[macros::versioned_link]
+        fn wasmtime_libunwind_nested();
+    }
+}
+pub fn own() {}
+";
+
+    struct VersionedRunner(&'static [&'static [(&'static str, &'static str)]]);
+    impl SourceTexts<'static> for VersionedRunner {
+        fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
+            self.0.get(krate)?.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)
+        }
+        fn proc_macro_key(&self, krate: usize) -> Option<CrateItemKey> {
+            (krate == 1).then_some(RUNNER)
+        }
+        fn run_proc_macro<'b>(&self, _: usize, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError> {
+            let refused = HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused };
+            let has_ident = |needle: &str| (0..call.input.tokens().len()).any(|i| call.input.text_at(i) == needle);
+            let text = match (call.kind, def.proc_name()) {
+                (ProcKind::Attr, Some("versioned_link")) if has_ident("wasmtime_libunwind_nested") => {
+                    "#[link_name = \"wasmtime_libunwind_nested_50_0_1\"] fn wasmtime_libunwind_nested();"
+                }
+                (ProcKind::Attr, Some("versioned_link")) => {
+                    "#[link_name = \"wasmtime_libunwind_50_0_1\"] fn wasmtime_libunwind();"
+                }
+                _ => return Err(refused),
+            };
+            let tokens = lex(text, Edition::E2021, alloc).map_err(|_| refused)?;
+            let mut origins = AVec::new_in(alloc);
+            origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(Transparency::Transparent)));
+            Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+        }
+    }
+
+    static RUNNER_FILES: VersionedRunner = VersionedRunner(&[&[("/user/lib.rs", USER_SRC)], &[("/macros/lib.rs", PM)]]);
+    let macros = input("macros", "/macros/lib.rs", &[]);
+    let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
+    let inputs = [
+        input("user", "/user/lib.rs", &[("macros", 1)]),
+        CrateInput { implicit, ..macros },
+    ];
+    let names = resolved(&inputs, &RUNNER_FILES);
+    let user = names.krate(0);
+    assert!(names.notes(0).is_empty(), "unexpected notes: {:?}", names.notes(0));
+    for target in ["wasmtime_libunwind", "wasmtime_libunwind_nested"] {
+        let (key, (it, at)) = user
+            .tables
+            .texts
+            .iter()
+            .find(|(_, (it, _))| it.name == Some(target))
+            .unwrap_or_else(|| panic!("`{target}` must be present in lowered texts"));
+        let crate::resolve::At::Expansion(call) = *at else {
+            panic!("`{target}` must come from expansion");
+        };
+        assert_eq!(
+            crate::items_record::foreign_abi(user, *at, it.item, *key).expect("foreign_abi"),
+            Some("C"),
+            "`foreign_abi` for `{target}` must inherit enclosing `extern \"C\"`"
+        );
+        assert_eq!(
+            crate::items_record::call_foreign_abi(user, call).expect("call_foreign_abi"),
+            Some("C"),
+            "`call_foreign_abi` for `{target}`'s expansion call must inherit enclosing `extern \"C\"`"
+        );
+    }
+
+    let g = super::SyncFrame::leaked();
+    let encoded = crate::items_record::encode(user, g.alloc()).expect("items encode");
+    let aligned = crate::resolve::aligned(&encoded, g);
+    let record = super::items_record::one_file(aligned, USER_SRC, g);
+    for target in ["wasmtime_libunwind", "wasmtime_libunwind_nested"] {
+        let mut found_foreign = None;
+        for i in 0..record.items() {
+            let row = record.item_at(i).expect("item row").expect("present");
+            if row.name == Some(target) {
+                found_foreign = Some(row.foreign);
+            }
+        }
+        assert_eq!(found_foreign, Some(Some("C")), "`ItemRow::foreign` for `{target}` must record `Some(\"C\")`");
+    }
+}

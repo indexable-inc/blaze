@@ -98,7 +98,11 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// 18: macro rows keep `dollar_crate` (token-mark-3: 32-byte `CrateItemKey` + `HAS_DOLLAR_CRATE`
 /// flag; `MACRO_ROW` = 104 bytes) so generated `macro_rules!`/`macro` definitions preserve another
 /// crate's `$crate`; a version-17 record is refused the same way.
-const VERSION: u32 = 18;
+/// 19: item flags keep `EXPORT_NO_MANGLE` (`1 << 5`) and `EXPORT_NAME` (`1 << 6`) for non-extern
+/// function items whose signature head mentions `no_mangle` or `export_name` so `NameCell::Exports`
+/// and `export_shim` scan only the in-memory `meta` column without opening unrelated files; a
+/// version-18 record is refused the same way.
+const VERSION: u32 = 19;
 const KEY_TAIL: usize = 24;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
@@ -166,6 +170,10 @@ const CTOR_OR_WRITTEN_BY: u8 = 1 << 2;
 const FOREIGN: u8 = 1 << 3;
 /// Item only: defined inside a `#![blaze::sans_io]` crate, module file, or inline `mod` block.
 const SANS_IO: u8 = 1 << 4;
+/// Item only: function outside an `extern` block whose signature head mentions `no_mangle`.
+const EXPORT_NO_MANGLE: u8 = 1 << 5;
+/// Item only: function outside an `extern` block whose signature head mentions `export_name`.
+const EXPORT_NAME: u8 = 1 << 6;
 
 // Impl marks.
 const HAS_TRAIT: u8 = 1;
@@ -426,20 +434,16 @@ fn span_in(base: &str, part: &str) -> Option<(u32, u32)> {
     Some((u32::try_from(start).ok()?, u32::try_from(part.len()).ok()?))
 }
 
-/// The ABI of the `extern` block that declares `entry` of `outline` (the outline of `text`, a
-/// file's or a macro call's expansion's): the block's string unquoted as written, `"C"` for a
-/// bare `extern` (the Reference, [items.extern.abi.default]); `None` when no block declares it
-/// (its parent is no `extern` block, or it has none). The fact of the item the names task
-/// writes into its row ([`ItemRow::foreign`]), so no reader outlines a text again to ask it.
+/// The ABI of the `extern` block that directly encloses `entry` in `outline` (the outline of
+/// `text`, a file's or a macro call's expansion's): the block's string unquoted as written,
+/// `"C"` for a bare `extern` (the Reference, [items.extern.abi.default]); `None` when `entry`'s
+/// direct parent in `outline` is no `extern` block (or it has none).
 ///
 /// The outline's ABI range is the block's `Abi` node, `extern "abi"` (blaze-file-items
 /// walk/rows.rs `(EXTERN_BLOCK, ABI)`), relative to the block's start (rule 71). A range outside
 /// the text is [`ItemsRecordError::Range`]; a written ABI that is not one quoted string (a raw
 /// string, an escape) is [`ItemsRecordError::ForeignAbi`], never read as "C" (rule 3).
-///
-/// The one home of the reading (rule 30): the solved names' `extern_abi` (blaze-ladder
-/// front2/source.rs) calls it on the same outline, so the two sources answer alike.
-pub fn foreign_abi<'t>(text: &'t str, outline: &blaze_file_items::Outline<'_>, entry: &blaze_surface::Item, item: ItemKey, krate: CrateItemKey) -> Result<Option<&'t str>, ItemsRecordError> {
+fn foreign_abi_in_outline<'t>(text: &'t str, outline: &blaze_file_items::Outline<'_>, entry: &blaze_surface::Item, item: ItemKey, krate: CrateItemKey) -> Result<Option<&'t str>, ItemsRecordError> {
     let Some(parent) = entry.parent else { return Ok(None) };
     let block = outline.item(parent);
     let ItemDetail::ExternBlock { abi } = block.detail else { return Ok(None) };
@@ -455,6 +459,63 @@ pub fn foreign_abi<'t>(text: &'t str, outline: &blaze_file_items::Outline<'_>, e
         Some(abi) if !abi.contains(['"', '\\']) => Ok(Some(abi)),
         _ => Err(ItemsRecordError::ForeignAbi { item }),
     }
+}
+
+/// The ABI of the `extern` block that declares `item` (at `at`, outline entry `idx`) in `names`:
+/// the block's string unquoted as written, `"C"` for a bare `extern` (the Reference,
+/// [items.extern.abi.default]); `None` when no `extern` block declares it. The fact of the item
+/// the names task writes into its row ([`ItemRow::foreign`]), so no reader outlines a text again
+/// to ask it.
+///
+/// Checks `entry`'s direct parent in its own outline first, then — when `entry` is a top-level
+/// item of a macro expansion (`entry.parent.is_none()`, `At::Expansion(call)`) — walks out
+/// through enclosing macro calls (`CallSrc::place`) so items emitted by function-like or
+/// attribute macros inside an `extern` block (e.g. `ring`'s `extern "C" { prefixed_item! { ... } }`,
+/// arbitrarily nested) inherit their enclosing block's ABI.
+///
+/// The one home of the reading (rule 30): the solved names' `extern_abi` (blaze-ladder
+/// front2/source.rs) calls it too, so in-memory `Names` and serialized `Records` answer alike.
+pub fn foreign_abi<'t>(names: &CrateNames<'t>, mut at: At, mut idx: ItemIndex, item: ItemKey) -> Result<Option<&'t str>, ItemsRecordError> {
+    // Bounded by expansion count + 1 so even a malformed cycle cannot loop forever (rule 18).
+    for _ in 0..=names.expansions.len() {
+        let (whole, outline) = names.outline_at(at).ok_or(ItemsRecordError::NoOutline { item })?;
+        let entry = usize::try_from(idx.0)
+            .ok()
+            .and_then(|i| outline.items().get(i))
+            .ok_or(ItemsRecordError::NoOutline { item })?;
+        if let Some(abi) = foreign_abi_in_outline(whole, outline, entry, item, names.key)? {
+            return Ok(Some(abi));
+        }
+        if entry.parent.is_some() {
+            return Ok(None);
+        }
+        let At::Expansion(call) = at else {
+            return Ok(None);
+        };
+        let Some(place) = names.tables.calls.get(&call).and_then(|src| src.place) else {
+            return Ok(None);
+        };
+        let Some(parent_at) = place.text else {
+            return Ok(None);
+        };
+        at = parent_at;
+        idx = place.item;
+    }
+    Ok(None)
+}
+
+/// The ABI of the `extern` block enclosing macro call `call` in `names`, if any (walking out
+/// through enclosing macro calls via `CallSrc::place`). Used by `blaze-ladder`'s native-link
+/// collector (`front2/links.rs`) when walking attribute-macro expansions whose input item was
+/// skipped inside an `extern` block (e.g. `wasmtime`'s `#[versioned_link]`).
+pub fn call_foreign_abi<'t>(names: &CrateNames<'t>, call: ItemKey) -> Result<Option<&'t str>, ItemsRecordError> {
+    let Some(place) = names.tables.calls.get(&call).and_then(|src| src.place) else {
+        return Ok(None);
+    };
+    let Some(parent_at) = place.text else {
+        return Ok(None);
+    };
+    foreign_abi(names, parent_at, place.item, call)
 }
 
 fn body_holds_items(detail: ItemDetail) -> bool {
@@ -1038,12 +1099,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     }
     for key in items.iter() {
         if let Some((it, at)) = tables.texts.get(key) {
-            let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
-            let entry = usize::try_from(it.item.0)
-                .ok()
-                .and_then(|idx| outline.items().get(idx))
-                .ok_or(ItemsRecordError::NoOutline { item: *key })?;
-            let foreign = foreign_abi(whole, outline, entry, *key, names.key)?;
+            let foreign = foreign_abi(names, *at, it.item, *key)?;
             if let Some(n) = it.name {
                 strings.plan(n)?;
             }
@@ -1259,12 +1315,12 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             if matches!(at, At::Expansion(_)) {
                 expansion_items = expansion_items.saturating_add(1);
             }
-            let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
+            let (_, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
             let entry = outline.items().get(it.item.0 as usize).ok_or(ItemsRecordError::NoOutline { item: *key })?;
             let detail = entry.detail;
             // The block's ABI, a fact of the item, from the outline the solve made of its text
-            // (a file's, or an expansion's: the names task outlines each expansion once).
-            let foreign = foreign_abi(whole, outline, entry, *key, names.key)?;
+            // (and enclosing macro calls when expanded inside an `extern` block).
+            let foreign = foreign_abi(names, *at, it.item, *key)?;
             let (code, start, len) = place(Some(*at), it.text);
             if code < EXPANSION
                 && let Ok(file_idx) = usize::try_from(code)
@@ -1284,6 +1340,15 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             }
             if any_file_mentions_sans_io && item_in_sans_io_scope(names, *key, it.module) {
                 flags |= SANS_IO;
+            }
+            if detail.kind() == ItemKind::Function && foreign.is_none() {
+                let sig_head = crate::names_cells::module_head(it.text);
+                if sig_head.contains("no_mangle") {
+                    flags |= EXPORT_NO_MANGLE;
+                }
+                if sig_head.contains("export_name") {
+                    flags |= EXPORT_NAME;
+                }
             }
             let abi = match foreign {
                 Some(abi) => {
@@ -1913,6 +1978,10 @@ pub struct ItemIdentity<'a> {
     /// Whether this item sits inside a `#![blaze::sans_io]` crate, module file, or inline `mod`
     /// block (computed once during solve, covered by `NameCell::Item`, zero whole-crate reads).
     pub sans_io: bool,
+    /// Whether this item is a non-extern function whose signature head mentions `no_mangle`.
+    pub export_no_mangle: bool,
+    /// Whether this item is a non-extern function whose signature head mentions `export_name`.
+    pub export_name: bool,
 }
 
 /// A member of a trait or an impl.
@@ -2932,7 +3001,31 @@ impl<'a> ItemsRecord<'a> {
             foreign: if flags & FOREIGN != 0 { Some(self.str_at("an item's block ABI", c.abi_at.get_u32(i), c.abi_len.get_u32(i))?) } else { None },
             lifetimes: lifetimes_of(lifetimes),
             sans_io: flags & SANS_IO != 0,
+            export_no_mangle: flags & EXPORT_NO_MANGLE != 0,
+            export_name: flags & EXPORT_NAME != 0,
         }))
+    }
+
+    /// Visits every function item outside an `extern` block whose signature head mentions
+    /// `no_mangle` or `export_name`, scanning only the in-memory `meta` column (zero file reads).
+    pub fn each_export_candidate(&self, each: &mut dyn FnMut(ItemKey, Option<&'a str>, bool, bool)) -> Result<(), ItemsRecordError> {
+        let c = self.item_cols;
+        let mask = u64::from(EXPORT_NO_MANGLE | EXPORT_NAME) << 24;
+        for i in 0..self.items() {
+            let meta = c.meta.get(i);
+            if meta & mask == 0 {
+                continue;
+            }
+            let flags = u8::try_from((meta >> 24) & 0xff).unwrap_or(0);
+            let name_len = u32::try_from(meta & 0xffff).unwrap_or(0);
+            let name = if flags & NAMED != 0 {
+                Some(self.str_at("an item's name", c.name_at.get_u32(i), name_len)?)
+            } else {
+                None
+            };
+            each(self.item_key(i), name, flags & EXPORT_NO_MANGLE != 0, flags & EXPORT_NAME != 0);
+        }
+        Ok(())
     }
 
     pub fn identity(&self, key: ItemKey) -> Result<Option<ItemIdentity<'a>>, ItemsRecordError> {

@@ -131,7 +131,7 @@ impl Fixture {
             input("dep", FILES[1].0, &[("core", 2)]),
             input("core", FILES[2].0, &[]),
         ];
-        let sysroot = Sysroot { core: Some(CrateId(2)), alloc: None, std: None, bstd: None };
+        let sysroot = Sysroot { core: Some(CrateId(2)), ..Sysroot::default() };
         let names: &'static Names<'static> = Box::leak(Box::new(resolve_crates(&crates, sysroot, &Texts { dep }, &Serial, blaze_own::testing::bump()).expect("fixture names")));
         let frame: &'static Frame = Box::leak(Box::new(Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame")));
         let mut kept = Kept { names: Vec::new(), items: Vec::new(), dep };

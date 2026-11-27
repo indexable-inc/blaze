@@ -252,13 +252,12 @@ records, how to read it and the method.
   catches ([Tests](#tests)). A review does not stand in for it.
 - The gate, on the platform you have. Say which platforms
   you did not run. CI's merge gate (`.github/workflows/blaze.yaml`, ix runners, Linux arm64) is the gate
-  checks (`tools/gate.txt`), the Lean proofs, actionlint, and, for a change to code, `cargo check
-  --workspace --exclude blaze-std --all-targets`, the workspace's tests without blaze-std
-  (`scripts/src/bin/ci_test.rs`) and the blaze-sys import audit (still run through cargo, as is
-  the smoke's command below; a gap). Its `ci` job is the one required check. The gate letting a
-  change through is not the harnesses passing on it.
-- blaze builds blaze, never cargo or rustc: with the release `.github/blaze-version` names as
-  stage 0 (`sh site/install.sh --version "$(cat .github/blaze-version)"`, as
+  checks (`tools/gate.txt`), the Lean proofs, actionlint, and, for a change to code, incremental
+  `blaze check . --stats` and `blaze test . --stats` with pinned v2 `blaze`
+  (`.github/blaze-cli-version`, `.github/actions/blaze`). Its `ci` job is the one required check.
+  The gate letting a change through is not the harnesses passing on it.
+- blaze builds blaze, never cargo or rustc: with the release `.github/blaze-cli-version` names as
+  stage 0 (`sh site/install.sh --version "$(cat .github/blaze-cli-version)"`, as
   `.github/actions/blaze` installs it), `blaze build --release -p blaze-cli`.
 - Formatting: `fmt.yaml` runs the pinned release's `blaze fmt --all` on main after each merge and
   commits what it changes; the CLI built from this tree has no `fmt` command yet

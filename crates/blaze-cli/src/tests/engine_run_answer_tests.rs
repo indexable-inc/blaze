@@ -484,3 +484,98 @@ fn a_file_a_lib_and_a_bin_both_mod_has_a_row_under_each() {
         assert_eq!(held, 1, "planted: under the old rule one of the lib and the bin has a row of `word`: {old_rows:?}");
     });
 }
+
+/// An answer that withholds `BodyFacts` for one specific check (`hide`), used as the planted
+/// control to prove `workspace_of` still refuses a missing row for an uncut body (`NotWalked`).
+struct HidingBody<'x, A: Answer + ?Sized> {
+    inner: &'x mut A,
+    hide: Name,
+}
+
+impl<A: Answer + ?Sized> Today for HidingBody<'_, A> {
+    fn out(&self, name: Name) -> Option<ContentId> {
+        if name == self.hide { None } else { self.inner.out(name) }
+    }
+    fn cell(&self, name: Name, cell: blaze_drive::Cell) -> Option<ContentId> {
+        self.inner.cell(name, cell)
+    }
+}
+
+impl<A: Answer + ?Sized> Answer for HidingBody<'_, A> {
+    fn open(
+        &mut self,
+        cx: &bstd::Cx,
+        name: Name,
+        seen: &mut dyn FnMut(crate::run_ids::Seen<'_>) -> Result<(), crate::run_ids::RunIdsError<'static>>,
+    ) -> Result<bool, crate::run_ids::RunIdsError<'static>> {
+        self.inner.open(cx, name, seen)
+    }
+    fn skipped(&self, file: Name) -> bool {
+        self.inner.skipped(file)
+    }
+    fn body(
+        &mut self,
+        cx: &bstd::Cx,
+        check: Name,
+        tool: Tool,
+        known: Option<(ContentId, Name)>,
+        out: &mut BodyScratch<'_>,
+    ) -> Result<Option<crate::run_ids::BodyFacts>, crate::run_ids::RunIdsError<'static>> {
+        if check == self.hide {
+            out.clear();
+            return Ok(None);
+        }
+        self.inner.body(cx, check, tool, known, out)
+    }
+}
+
+const CFG_CUT_LIB: &str = "pub fn alive() -> u8 {\n    1\n}\n\n#[cfg(any())]\npub fn dead_any() -> u8 {\n    2\n}\n\n#[cfg(test)]\nmod tests;\n";
+const CFG_CUT_TESTS: &str = "#[test]\nfn live_test() {\n    let _ = super::alive();\n}\n\n#[cfg(not(test))]\nfn dead_in_test_mod() -> u8 {\n    3\n}\n";
+const CFG_CUT_EXAMPLE: &str = "fn main() {\n    let _ = one::alive();\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn example_test() {\n        let _ = one::alive();\n    }\n}\n";
+
+/// (h) Plan-time cfg-cut bodies in whole-workspace walks (`engine_bodies.rs::plan_views` plans
+/// zero rows when every unit reaching a file cuts an entry: `#[cfg(any())]` anywhere,
+/// `#[cfg(test)]` inside a non-test example target, or `#[cfg(not(test))]` inside a
+/// `#[cfg(test)] mod tests;` submodule). `workspace_of` verifies the cut via `engine_plan_cfg`
+/// and omits those bodies without failing `NotWalked`. PLANTED: withholding a row for an uncut
+/// body (`alive`) still fails closed with `RunIdsError::NotWalked { name: alive }`.
+#[test]
+fn a_plan_time_cfg_cut_body_is_omitted_while_an_uncut_missing_row_fails() {
+    let io = Io::simulated(SimWorld::new(11, Limits::USUAL));
+    write(&io, "Cargo.toml", MANIFEST);
+    write(&io, "src/lib.rs", CFG_CUT_LIB);
+    write(&io, "src/tests.rs", CFG_CUT_TESTS);
+    write(&io, "examples/demo.rs", CFG_CUT_EXAMPLE);
+    let _ = super::engine_check_tests::engine_from(&io, 2, true);
+    let alive = body_of(b"src/lib.rs", CFG_CUT_LIB, "alive");
+    let dead_any = body_of(b"src/lib.rs", CFG_CUT_LIB, "dead_any");
+    let live_test = body_of(b"src/tests.rs", CFG_CUT_TESTS, "live_test");
+    let dead_in_test_mod = body_of(b"src/tests.rs", CFG_CUT_TESTS, "dead_in_test_mod");
+    let example_main = body_of(b"examples/demo.rs", CFG_CUT_EXAMPLE, "main");
+    let example_test = body_of(b"examples/demo.rs", CFG_CUT_EXAMPLE, "example_test");
+    asked_with_units(&io, |cx, answer, units| {
+        assert!(answer.out(alive).is_some(), "control: `alive` has a row");
+        assert!(answer.out(live_test).is_some(), "control: `live_test` has a row");
+        assert!(answer.out(example_main).is_some(), "control: `examples/demo.rs::main` has a row");
+        assert_eq!(answer.out(dead_any), None, "cause: `#[cfg(any())]` body has no planned row");
+        assert_eq!(answer.out(dead_in_test_mod), None, "cause: `#[cfg(not(test))]` in `#[cfg(test)] mod` has no planned row");
+        assert_eq!(answer.out(example_test), None, "cause: `#[cfg(test)]` in example has no planned row");
+
+        let units_only: std::vec::Vec<UnitRoot> = units.iter().map(|(unit, _)| *unit).collect();
+        let heap = blaze_own::testing::heap();
+        let walk = workspace_of(cx, &mut *answer, TOOL, &units_only, None, heap.alloc()).unwrap_or_else(|e| panic!("plan-time cfg-cut bodies stopped whole-workspace walk: {e}"));
+        assert!(walk.bodies.iter().any(|row| row.check == alive), "walk includes `alive`");
+        assert!(walk.bodies.iter().any(|row| row.check == live_test), "walk includes `live_test`");
+        assert!(walk.bodies.iter().any(|row| row.check == example_main), "walk includes `examples/demo.rs::main`");
+        for cut_body in [dead_any, dead_in_test_mod, example_test] {
+            assert!(walk.bodies.iter().all(|row| row.check != cut_body), "cfg-cut body {cut_body} must not have a row");
+        }
+
+        // PLANTED: hiding an uncut body's row must still fail closed with `NotWalked`.
+        match workspace_of(cx, &mut HidingBody { inner: &mut *answer, hide: alive }, TOOL, &units_only, None, heap.alloc()) {
+            Err(crate::run_ids::RunIdsError::NotWalked { name }) => assert_eq!(name, alive, "the refusal names the uncut body with no row"),
+            Err(other) => panic!("refused otherwise: {other}"),
+            Ok(_) => panic!("planted: an uncut body with no row was silently skipped"),
+        }
+    });
+}

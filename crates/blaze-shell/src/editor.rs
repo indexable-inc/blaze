@@ -610,6 +610,9 @@ pub struct Editor {
     /// When the user explicitly presses `Esc` to dismiss auto-opened completions on a token,
     /// remember that token's start offset so we don't immediately re-open until they move on.
     completions_suppressed_token_start: Option<usize>,
+    /// Whether the popup opens by itself as you type (`[editor] auto_popup`, default `false`).
+    /// When `false` it opens only on `Tab` / `Ctrl+Space`, then keeps filtering while open.
+    pub auto_popup: bool,
     /// Byte offset right after an auto-inserted trailing `.` from Tab-drilling into a nested
     /// container (e.g. `Cargo.lock.package.`). If the user immediately pivots to `Enter`, ` `,
     /// `|`, or `[`, the dangling auto-dot is cleanly removed; if they type `.`, it overtypes
@@ -750,6 +753,7 @@ impl Editor {
             completion_scroll: 0,
             completion_replace_start: 0,
             completions_suppressed_token_start: None,
+            auto_popup: false,
             auto_dot_pos: None,
             ghost: None,
             vim: VimMachine::new(
@@ -2234,7 +2238,12 @@ impl Editor {
         }
         let is_suppressed = self.completions_suppressed_token_start == Some(token_start);
 
-        let auto_open = !is_suppressed && self.should_auto_open_completions(before, token_start, &prefix);
+        // An explicitly opened popup stays live while it is open; it only opens by itself when
+        // `auto_popup` is on.
+        let open_popup = open_popup || !self.completions.is_empty();
+        let auto_open = self.auto_popup
+            && !is_suppressed
+            && self.should_auto_open_completions(before, token_start, &prefix);
         if !open_popup && !auto_open {
             if !self.completions.is_empty() {
                 self.dismiss_completions();
@@ -6292,6 +6301,7 @@ mod tests {
     fn unified_zero_tab_completions_select_most_likely_and_sync_ghost() {
         let state = EngineState::new("/tmp", &[], blaze_own::Alloc::global());
         let mut ed = Editor::new();
+        ed.auto_popup = true;
 
         // 1. `git ` -> unified completion popup auto-opens (zero Tab!) with `status` selected #1.
         ed.set_text_initial("git ".to_owned());
@@ -6385,6 +6395,7 @@ mod tests {
         state.set_var("lock", Value::Record(root), false);
 
         let mut ed = Editor::new();
+        ed.auto_popup = true;
 
         // 1. Typing `.pac` auto-opens with `package` selected #1 and drills into `.package.` on Tab!
         ed.set_text_initial(".pac".to_owned());
@@ -6477,6 +6488,7 @@ mod tests {
         let tmp_cwd = tmp_dir.to_string_lossy().into_owned();
         let state = EngineState::new(&tmp_cwd, &[], alloc);
         let mut ed = Editor::new();
+        ed.auto_popup = true;
 
         // 1. Typing `Car` auto-opens BY DEFAULT (open_popup = false!) with `Cargo.lock` & `Cargo.toml`
         //    ranked above lowercase `$PATH` binaries, exact-case ghost, and NEVER red!

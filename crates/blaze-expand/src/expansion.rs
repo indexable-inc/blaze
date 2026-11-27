@@ -509,6 +509,14 @@ impl<'a> Expansion<'a> {
         self.tokens.tokens().get(at).and_then(|token| self.tokens.non_transparent_mark(token.ctx))
     }
 
+    /// The [`crate::origin_column::TextMark`] of token `at` ([`TokenStream::text_mark`]):
+    /// preserves the innermost non-transparent mark for hygiene, or else the innermost
+    /// [`Transparency::Transparent`] mark so edition-gated checks read the emitting macro's
+    /// edition.
+    pub fn text_mark(&self, at: usize) -> Option<crate::origin_column::TextMark> {
+        self.tokens.tokens().get(at).and_then(|token| self.tokens.text_mark(token.ctx))
+    }
+
     /// The expansion's canonical bytes: equal expansions, and only they, give equal bytes.
     pub fn encode<S: Sink>(&self, out: &mut S) {
         out.put(b"blaze v2 expansion 1");

@@ -186,8 +186,17 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
             (index.rows().to_vec(), index.unplaced())
         };
         for (file, chain, body) in rows.iter() {
-            let found = world.body_by_chain(*file, *chain).unwrap_or_else(|e| panic!("{label}: {e}"));
-            assert_eq!(found, Some(*body), "{label}: the body at file {file} chain {chain:?} over the solved names");
+            let found: Vec<_> = world.chains().unwrap_or_else(|e| panic!("{label}: {e}")).all(*file, *chain).collect();
+            assert!(found.contains(body), "{label}: the body at file {file} chain {chain:?} over the solved names: got {found:?}");
+            let singular = world.body_by_chain(*file, *chain);
+            if found.len() == 1 {
+                assert_eq!(singular, Ok(Some(*body)), "{label}: unique body at file {file} chain {chain:?} over solved names");
+            } else {
+                assert!(
+                    matches!(singular, Err(ChainError::Ambiguous { file: f, chain: c, .. }) if f == *file && c == *chain),
+                    "{label}: ambiguous multi-mount singular lookup must return ChainError::Ambiguous over solved names: got {singular:?}"
+                );
+            }
         }
         assert_eq!(rows.len() + unplaced as usize, listed.len(), "{label}: every listed body is indexed or counted unplaced");
         // The unplaced bodies by name and place: a body with no outline entry must be one a macro
@@ -265,8 +274,17 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
     let shown: Vec<String> = rows.iter().map(|(file, chain, body)| format!("{file} {chain:?} {body:?}")).collect();
     assert_eq!(shown, solved_rows, "{label}: the bodies by (file, chain) over records");
     for (file, chain, body) in rows.iter() {
-        let found = world.body_by_chain(*file, *chain).unwrap_or_else(|e| panic!("{label}: {e}"));
-        assert_eq!(found, Some(*body), "{label}: the body at file {file} chain {chain:?} over records");
+        let found: Vec<_> = world.chains().unwrap_or_else(|e| panic!("{label}: {e}")).all(*file, *chain).collect();
+        assert!(found.contains(body), "{label}: the body at file {file} chain {chain:?} over records: got {found:?}");
+        let singular = world.body_by_chain(*file, *chain);
+        if found.len() == 1 {
+            assert_eq!(singular, Ok(Some(*body)), "{label}: unique body at file {file} chain {chain:?} over records");
+        } else {
+            assert!(
+                matches!(singular, Err(ChainError::Ambiguous { file: f, chain: c, .. }) if f == *file && c == *chain),
+                "{label}: ambiguous multi-mount singular lookup must return ChainError::Ambiguous over records: got {singular:?}"
+            );
+        }
     }
     let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
     assert!(errors.is_empty(), "{label}: the records filed {errors:?}");
@@ -294,6 +312,65 @@ fn a_world_over_records_checks_every_body_as_the_solved_names_do() {
     let planted = got.planted.expect("the planted bug (a chain without its impl's part) was not caught: `A::get` and `B::get` did not collide");
     assert!(planted.contains("have one item chain"), "the refusal names the collision: {planted}");
     println!("PLANT caught: a chain without its impl's part: {planted}");
+}
+
+#[test]
+fn multi_mounted_path_file_indexes_all_module_bodies_without_collision() {
+    const MAIN_MULTI: &str = r#"#[path = "shared.rs"]
+pub mod a;
+#[path = "shared.rs"]
+pub mod b;
+
+fn main(cx: &Cx, out: Out) -> Result<(), Error> {
+    let ra = a::Rig { v: a::sid() };
+    let rb = b::Rig { v: b::sid() };
+    if ra.f() + rb.f() == 4 {
+        out.line(cx, "ok")?;
+    }
+    Ok(())
+}
+
+struct A;
+struct B;
+
+impl A {
+    fn get(&self) -> u8 {
+        1
+    }
+}
+
+impl B {
+    fn get(&self) -> u8 {
+        2
+    }
+}
+"#;
+    const SHARED: &str = r#"pub struct Rig {
+    pub v: usize,
+}
+
+impl Rig {
+    pub fn f(&self) -> usize {
+        self.v + N
+    }
+}
+
+pub const N: usize = 1;
+
+pub fn sid() -> usize {
+    N
+}
+"#;
+    let files = [
+        ("src/main.rs".to_string(), MAIN_MULTI.to_string()),
+        ("src/shared.rs".to_string(), SHARED.to_string()),
+    ];
+    let got = compare("multi_mounted_path", &files);
+    // `a::Rig::f`, `b::Rig::f`, `a::sid`, `b::sid`, `A::get`, `B::get` (6 file-written fns).
+    assert_eq!(got.bodies - got.unplaced as usize, 6, "six file-written fns across both mounts of shared.rs plus A::get and B::get");
+    // Negative control: broken chain without enclosing impl still refuses `A::get` vs `B::get`.
+    let planted = got.planted.expect("the planted bug (a chain without its impl's part) must still collide `A::get` and `B::get`");
+    assert!(planted.contains("have one item chain"), "the refusal names the collision: {planted}");
 }
 
 #[test]

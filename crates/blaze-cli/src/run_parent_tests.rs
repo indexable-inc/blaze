@@ -1702,7 +1702,7 @@ fn resolve_pooled(
         assert!(lane.step(cx, clock, makers, &mut scratch, heap).expect("the worker's turn"), "the relay handed the worker no make");
         code.pump().expect("the relay takes the made entry back");
         let came = code
-            .answer(child, |reply| match reply {
+            .answer(child, |_producer, reply| match reply {
                 Reply::Made(entry) => lazy.made(entry),
                 Reply::Refused(why) => Err(lazy.refused(why.for_asker())),
                 Reply::Late { .. } => panic!("the one child's ask was late"),
@@ -2213,4 +2213,113 @@ fn ahead_of_closed_places_only_verified_closed_groups_with_fresh_head() {
     let mut out3 = std::vec::Vec::new();
     let _ = ahead_of_closed(symbols, &empty_closed, &mut lazy3, &mut needs3, &mut kept3, &mut out3).expect("empty closed");
     assert!(kept3.is_empty(), "empty VerifiedClosedContents must place zero groups");
+}
+
+/// Regression test for cross-suite `CodeRelay` deduplication: when two suites ask the relay for
+/// the same keyed `CodeKey`, the relay attributes the shared entry to the producing suite (`SuiteId(0)`)
+/// for every asker (both racing and post-completion kept hits), so `SuiteId(1)` knows it must
+/// verify the foreign entry before accepting it; when `SuiteId(1)` retries privately (`key = None`),
+/// the relay runs `SuiteId(1)`'s own job and reports `producer = None`.
+#[test]
+fn code_relay_reports_producer_suite_and_supports_suite_private_retry() {
+    use core::cell::RefCell;
+
+    use blaze_engine::SVec;
+    use blaze_engine::code_pool::relay::Reply;
+    use blaze_engine::code_pool::{Child, Worker};
+    use blaze_ladder::body_ids::{Order, RowKind};
+    use blaze_ladder::code_records::CodeKey;
+    use blaze_run::Nanos;
+
+    use crate::run_ids::Checked;
+    use crate::run_parent::CodeRefusal;
+    use crate::test_drive::{CodeRelay, CodeWorkers, Job, OneError};
+    use crate::test_loop::SuiteId;
+
+    struct EchoSuiteWorkers {
+        done: RefCell<std::vec::Vec<(Worker, Result<SVec<'static, u8>, CodeRefusal>)>>,
+        alloc: blaze_own::SharedAlloc<'static>,
+    }
+
+    impl CodeWorkers<'static> for EchoSuiteWorkers {
+        fn count(&self) -> usize {
+            1
+        }
+        fn give(&self, worker: Worker, job: Job<'static>) -> Result<(), OneError> {
+            let mut bytes = SVec::with_capacity_in(4, self.alloc);
+            bytes.extend_from_slice(&job.suite.0.to_le_bytes());
+            self.done.borrow_mut().push((worker, Ok(bytes)));
+            Ok(())
+        }
+        fn finished(&self) -> Result<Option<(Worker, Result<SVec<'static, u8>, CodeRefusal>)>, OneError> {
+            Ok(self.done.borrow_mut().pop())
+        }
+    }
+
+    let heap = blaze_own::testing::heap();
+    let workers = EchoSuiteWorkers { done: RefCell::new(std::vec::Vec::new()), alloc: heap.shared() };
+    let now = || Nanos(1_000);
+    let relay = CodeRelay::new(3, &workers, &now, heap.shared(), 42).expect("relay");
+    let shared_key = CodeKey(blaze_ids::ContentId::of("test shared key", b"alloc::alloc::alloc"));
+    let proof = Checked::Clean.runs(ItemKey(1)).expect("a clean body is runnable");
+
+    let make_job = |suite: SuiteId| Job {
+        suite,
+        order: Order { tabled: ItemKey(1), kind: RowKind::Instance },
+        name: SVec::new_in(heap.shared()),
+        proof,
+        entry: None,
+        start: blaze_ladder::run::special::MakerStart::ByRule,
+        enclosers: crate::test_drive::suite_cache::LocalEnclosers::default(),
+    };
+
+    // Child 0 (SuiteId(0)) and Child 1 (SuiteId(1)) ask for the same shared key concurrently.
+    relay.ask(Child(0), Some(shared_key), make_job(SuiteId(0))).expect("child 0 ask");
+    relay.ask(Child(1), Some(shared_key), make_job(SuiteId(1))).expect("child 1 ask");
+    relay.pump().expect("pump");
+
+    let (p0, b0) = relay
+        .answer(Child(0), |producer, reply| match reply {
+            Reply::Made(bytes) => (producer, bytes.to_vec()),
+            _ => panic!("expected Made for child 0"),
+        })
+        .expect("answer 0")
+        .expect("child 0 answered");
+    assert_eq!(p0, Some(SuiteId(0)));
+    assert_eq!(b0, 0u32.to_le_bytes());
+
+    let (p1, b1) = relay
+        .answer(Child(1), |producer, reply| match reply {
+            Reply::Made(bytes) => (producer, bytes.to_vec()),
+            _ => panic!("expected Made for child 1"),
+        })
+        .expect("answer 1")
+        .expect("child 1 answered");
+    assert_eq!(p1, Some(SuiteId(0)), "child 1 must see that SuiteId(0) produced the shared entry");
+    assert_eq!(b1, 0u32.to_le_bytes());
+
+    // Child 2 (SuiteId(1)) arrives after completion (served from kept entries): still attributed to SuiteId(0).
+    relay.ask(Child(2), Some(shared_key), make_job(SuiteId(1))).expect("child 2 ask");
+    let (p2, b2) = relay
+        .answer(Child(2), |producer, reply| match reply {
+            Reply::Made(bytes) => (producer, bytes.to_vec()),
+            _ => panic!("expected Made for child 2"),
+        })
+        .expect("answer 2")
+        .expect("child 2 answered");
+    assert_eq!(p2, Some(SuiteId(0)), "post-completion kept hit must still report producing SuiteId(0)");
+    assert_eq!(b2, 0u32.to_le_bytes());
+
+    // Child 1 retries privately (`key = None`) after rejecting SuiteId(0)'s entry: runs SuiteId(1)'s job.
+    relay.ask(Child(1), None, make_job(SuiteId(1))).expect("child 1 private retry");
+    relay.pump().expect("pump retry");
+    let (p1_retry, b1_retry) = relay
+        .answer(Child(1), |producer, reply| match reply {
+            Reply::Made(bytes) => (producer, bytes.to_vec()),
+            _ => panic!("expected Made for child 1 private retry"),
+        })
+        .expect("answer 1 retry")
+        .expect("child 1 retry answered");
+    assert_eq!(p1_retry, None, "unkeyed suite-private retry has no cross-suite producer");
+    assert_eq!(b1_retry, 1u32.to_le_bytes(), "private retry must run SuiteId(1)'s own job");
 }

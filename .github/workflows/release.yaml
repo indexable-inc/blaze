@@ -1,6 +1,7 @@
 name: release
 
-# Builds and publishes `blaze` (`blaze-cli`) and `blaze-launcher` for macOS ARM64, Linux x86-64,
+# Builds and publishes self-contained v2 `blaze` (`blaze-cli`), `blaze-launcher`, `blaze-fact-shim`,
+# and the pinned v2 toolchain shelf (`crates/blaze-toolchain/PINNED` + source packs) for macOS ARM64
 # and Linux ARM64 using pinned v2 `blaze` (zero cargo, zero rustc).
 # Uploads all release assets + SHA256SUMS + B3SUMS + library archive to Cloudflare R2
 # (`blaze-releases`, served at https://blaze-releases.ix.dev) and GitHub Releases, and updates
@@ -11,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to build and publish (e.g. v0.20261122.0)"
+        description: "Release tag to build and publish (e.g. v0.20261127.0)"
         required: true
         type: string
       promote_stable:
@@ -34,7 +35,7 @@ jobs:
   prepare:
     name: prepare release
     runs-on: [ix, arm64]
-    timeout-minutes: 10
+    timeout-minutes: 20
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
@@ -71,6 +72,31 @@ jobs:
           name: library
           path: ${{ runner.temp }}/library/library-*.tar.xz
           if-no-files-found: error
+      - uses: ./.github/actions/script
+        with:
+          job: release
+      - name: Cut pinned v2 toolchain shelf
+        run: |
+          set -euo pipefail
+          pinned="$(tr -d '[:space:]' < crates/blaze-toolchain/PINNED)"
+          shelf="$RUNNER_TEMP/toolchain-shelf"
+          mkdir -p "$shelf" "$RUNNER_TEMP/crate-cache"
+          sources=""
+          if [ -d "$HOME/.blaze/v2/sources" ]; then
+            sources="$HOME/.blaze/v2/sources"
+          fi
+          timeout -k 30 300 "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", \"wasm64-blaze-wasip1\"], \"registry\": \"$RUNNER_TEMP/crate-cache\", \"sources\": \"$sources\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": false, \"macro_side\": true, \"fetch\": true}"
+          if [ ! -f "$shelf/$pinned" ]; then
+            echo "::error::crates/blaze-toolchain/PINNED ($pinned) does not match toolchain_cut output in $shelf" >&2
+            exit 1
+          fi
+          ls -lh "$shelf/$pinned"
+          du -sh "$shelf"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: toolchain-shelf
+          path: ${{ runner.temp }}/toolchain-shelf
+          if-no-files-found: error
 
   build:
     name: ${{ matrix.target }}
@@ -81,18 +107,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { target: aarch64-apple-darwin, os: macos-15 }
-          - { target: x86_64-unknown-linux-gnu, os: ubuntu-22.04 }
-          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm }
+          - { target: aarch64-apple-darwin, os: [macos-15] }
+          - { target: aarch64-unknown-linux-gnu, os: [ix, arm64, ix-cpu-64, blaze] }
     env:
       NAME: blaze-v${{ needs.prepare.outputs.version }}-${{ matrix.target }}
       BLAZE_RELEASE: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/blaze
+      - uses: actions/download-artifact@v8
         with:
-          require-launcher: "false"
-      - name: Build release blaze and blaze-launcher binaries
+          name: toolchain-shelf
+          path: ${{ runner.temp }}/toolchain-shelf
+      - uses: ./.github/actions/blaze
+      - name: Build release blaze, blaze-launcher, and blaze-fact-shim with blaze
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: |
@@ -109,17 +136,30 @@ jobs:
             fi
           }
           run_bounded 1800 blaze build --release -p blaze-cli --bin blaze -o target/release/blaze
+          run_bounded 1800 blaze build --release -p blaze-cli --bin blaze-fact-shim -o target/release/blaze-fact-shim
           run_bounded 1800 blaze build --release -p blaze-launcher --bin blaze-launcher -o target/release/blaze-launcher
       - name: Archive and checksum
         run: |
+          set -euo pipefail
           mkdir -p "$NAME"
           cp LICENSE-APACHE LICENSE-MIT README.md "$NAME/"
           cp target/release/blaze "$NAME/blaze"
           cp target/release/blaze-launcher "$NAME/blaze-launcher"
-          chmod 755 "$NAME/blaze" "$NAME/blaze-launcher"
+          cp target/release/blaze-fact-shim "$NAME/blaze-fact-shim"
+          chmod 755 "$NAME/blaze" "$NAME/blaze-launcher" "$NAME/blaze-fact-shim"
+          cp -R "$RUNNER_TEMP/toolchain-shelf" "$NAME/toolchain"
+          chmod 644 "$NAME/toolchain/"*
+          pinned="$(tr -d '[:space:]' < crates/blaze-toolchain/PINNED)"
+          [ -f "$NAME/toolchain/$pinned" ] || { echo "::error::bundled toolchain shelf missing pinned manifest $pinned" >&2; exit 1; }
           "$NAME/blaze" --version
           "$NAME/blaze" toolchain
-          command -v xz >/dev/null || brew install xz
+          if ! command -v xz >/dev/null 2>&1; then
+            if command -v brew >/dev/null 2>&1; then
+              brew install xz
+            else
+              sudo apt-get update && sudo apt-get install -y xz-utils
+            fi
+          fi
           tar cf - "$NAME" | xz -9e -T0 > "$NAME.tar.xz"
           tar czf "$NAME.tar.gz" "$NAME"
           if command -v sha256sum >/dev/null 2>&1; then
@@ -157,8 +197,13 @@ jobs:
           enable-cache: false
       - uses: actions/download-artifact@v8
         with:
+          pattern: blaze-*
           path: out
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          name: library
+          path: out
       - name: Generate SHA256SUMS and B3SUMS
         run: |
           uv run --frozen python - <<'EOF'
@@ -179,17 +224,13 @@ jobs:
           EOF
           cat out/SHA256SUMS
           cat out/B3SUMS
-      - name: Plan R2 release upload
-        id: r2
-        run: |
-          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py "{\"kind\": \"release\", \"tag\": \"$TAG\", \"dir\": \"out\"}"; echo R2; } >> "$GITHUB_OUTPUT"
       - name: Upload release assets to R2
-        uses: cloudflare/wrangler-action@v4
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: |
-            ${{ steps.r2.outputs.r2 }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          python3 -I .github/scripts/r2.py "{\"kind\": \"release\", \"tag\": \"$TAG\", \"dir\": \"out\", \"run\": true, \"s3\": true}"
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -212,7 +253,6 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "${FLAGS[@]}" "${ASSETS[@]}"
           fi
       - name: Update stable and canary channel pointers
-        id: channels
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -224,11 +264,10 @@ jobs:
             curl -fsSL https://blaze-releases.ix.dev/channels/stable > channels/stable
           fi
           gh release upload channels --repo "$GITHUB_REPOSITORY" --clobber channels/stable channels/canary
-          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py '{"kind": "channels", "dir": "channels"}'; echo R2; } >> "$GITHUB_OUTPUT"
       - name: Upload channel pointers to R2
-        uses: cloudflare/wrangler-action@v4
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: |
-            ${{ steps.channels.outputs.r2 }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          python3 -I .github/scripts/r2.py '{"kind": "channels", "dir": "channels", "run": true, "s3": true}'

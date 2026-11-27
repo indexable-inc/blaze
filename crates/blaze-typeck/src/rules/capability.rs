@@ -199,7 +199,8 @@ fn walk_pty<'a, 't, W: World>(
                     PNode::Param(ix) => {
                         if let Some(s_idx) = subst
                             && let Some(&s) = substs.get(s_idx)
-                            && let Some(&arg_ty) = s.args.get(ix as usize)
+                            && let Ok(arg_ix) = usize::try_from(ix)
+                            && let Some(&arg_ty) = s.args.get(arg_ix)
                         {
                             work.push(WalkStep::Visit {
                                 types: s.caller_types,

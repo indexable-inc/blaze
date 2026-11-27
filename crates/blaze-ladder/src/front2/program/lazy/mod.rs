@@ -770,6 +770,12 @@ pub struct LazyProgram<'n, S: NamesSource<'n> = &'n Names<'n>> {
     /// Each internal-symbol declaration bound to its definition once (front_end.rs
     /// `InternalBindings`; the rule is seam_rules.rs's, shared with the whole program).
     internal_bindings: RefCell<front_end::InternalBindings<'n>>,
+    /// Root crate indices defining this program's link closure for same-program export binding
+    /// (`front.index.scope()` over solved names; `{0} ∪ lang_crates` over per-program records).
+    export_roots: AVec<'n, usize>,
+    /// Each foreign declaration bound to a same-program Rust export (or cached as external C
+    /// `None`) once per program (front_end.rs `ExportBindings`).
+    export_bindings: RefCell<front_end::ExportBindings<'n>>,
     /// Per-program memoization cache for `caller_site`, `def_site`, and macro expansion
     /// placement (seam_rules.rs `SiteCache`).
     site_cache: RefCell<seam_rules::SiteCache<'n>>,
@@ -902,6 +908,13 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             let found = super::super::langs::find(&front.index, front.resolver, item).map_err(|why| Front2Refusal::Lang { item, why })?;
             *slot = (item, found.map(checker_of));
         }
+        let mut export_roots = AVec::with_capacity_in(front.index.scope().len().saturating_add(1), alloc);
+        export_roots.extend_from_slice(front.index.scope());
+        if seeded_heads && front.names.crate_count() > 0 && export_roots.scan_for(&0).is_none() {
+            export_roots.push(0);
+        }
+        export_roots.sort_unstable();
+        export_roots.dedup();
         Ok(LazyProgram {
             front,
             store,
@@ -923,6 +936,8 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             asked_gaps: RefCell::new(Vec::new_in(Global)),
             definers: crate::front2::tait::Definers::new_in(alloc),
             internal_bindings: RefCell::new(front_end::InternalBindings::new_in(alloc)),
+            export_roots,
+            export_bindings: RefCell::new(front_end::ExportBindings::new_in(alloc)),
             site_cache: RefCell::new(seam_rules::SiteCache::new_in(alloc)),
             member_rows: Map::new_in(alloc),
             lang_member_rows: Map::new_in(alloc),

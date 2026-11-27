@@ -549,7 +549,7 @@ fn hash_mark(h: &mut Hasher, mark: Mark) {
         MarkOf::This => h.update(&[0]),
         MarkOf::Outer(key) => h.update(&[1]).id(&key),
     };
-    h.update(&[mark.transparency.byte(), mark.edition.byte()]);
+    h.update(&[mark.transparency.byte(), mark.edition.byte(), u8::from(mark.local_inner)]);
     h.id(&mark.site.krate.0);
     match mark.site.module {
         None => h.update(&[0]),

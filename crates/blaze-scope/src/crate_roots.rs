@@ -40,10 +40,10 @@ mod tests {
     #[test]
     fn a_root_by_its_mark() {
         let dep = CrateItemKey(ContentId([7; 32]));
-        let rules = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::SemiOpaque, edition: Edition::E2021 };
-        let transparent = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::Transparent, edition: Edition::E2024 };
+        let rules = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false };
+        let transparent = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::Transparent, edition: Edition::E2024, local_inner: false };
         assert_eq!(root_by_mark("$crate", Some(rules)), Root::Crate(dep));
-        let transparent = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::Transparent, edition: Edition::E2021 };
+        let transparent = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::Transparent, edition: Edition::E2021, local_inner: false };
         assert_eq!(root_by_mark("$crate", Some(transparent)), Root::Here);
         assert_eq!(root_by_mark("crate", Some(rules)), Root::Here);
         assert_eq!(root_by_mark("crate", Some(root_mark(dep, Edition::E2021))), Root::Crate(dep));
@@ -57,7 +57,7 @@ mod tests {
 /// The mark of a `crate` keyword written for the `$crate` of `krate` (read in `edition`): the
 /// definition crate's root, opaque, so [`root_by_mark`] reads it as `krate`.
 pub fn root_mark(krate: CrateItemKey, edition: Edition) -> TextMark {
-    TextMark { site: DefSite { krate, module: None }, transparency: Transparency::Opaque, edition }
+    TextMark { site: DefSite { krate, module: None }, transparency: Transparency::Opaque, edition, local_inner: false }
 }
 
 /// What a path's first segment says of its crate root, by its mark.
@@ -128,18 +128,16 @@ impl core::fmt::Display for MarkMiss {
 }
 
 impl<'t> TextMarks<'t> {
-    /// The mark of the token that starts where `segment` (a slice of the text) starts; `None`
-    /// when no row starts there (a token as written at the call keeps none).
-    pub fn mark_of(&self, segment: &str) -> Result<Option<TextMark>, MarkMiss> {
-        let len = u32::try_from(segment.len()).unwrap_or(u32::MAX);
-        let start = crate::expansion_origins::offset_in(self.text, segment).ok_or(MarkMiss::NotInText { len })?;
+    /// The mark of the token that starts at byte `start` of `self.text`; `None` when no row starts
+    /// there (a token as written at the call keeps none).
+    pub fn mark_at(&self, start: u32) -> Option<TextMark> {
         // Rows are sorted by start and do not overlap (blaze-expand `OriginsRef::open` checked).
         let (mut lo, mut hi) = (0usize, self.column.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let row = self.column.row(mid);
             if row.start == start {
-                return Ok(row.mark);
+                return row.mark;
             }
             if row.start < start {
                 lo = mid + 1;
@@ -147,7 +145,15 @@ impl<'t> TextMarks<'t> {
                 hi = mid;
             }
         }
-        Ok(None)
+        None
+    }
+
+    /// The mark of the token that starts where `segment` (a slice of the text) starts; `None`
+    /// when no row starts there (a token as written at the call keeps none).
+    pub fn mark_of(&self, segment: &str) -> Result<Option<TextMark>, MarkMiss> {
+        let len = u32::try_from(segment.len()).unwrap_or(u32::MAX);
+        let start = crate::expansion_origins::offset_in(self.text, segment).ok_or(MarkMiss::NotInText { len })?;
+        Ok(self.mark_at(start))
     }
 
     /// The uniform foreign crate that every `$crate` token across `slices` (each a slice of

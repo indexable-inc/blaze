@@ -100,14 +100,14 @@ pub(crate) enum Resolution {
     Need(std::vec::Vec<CrateItemKey, Global>),
 }
 
-/// Which of the sysroot crates `all` (core, alloc, std, bstd, by world index) the crate at
-/// `at`, whose own dependencies are `own`, is given. A toolchain crate (`toolchain`): those its
-/// shelf row names, which are its edges (the cutter writes the sysroot crates a root names as
-/// real dependencies: blaze_toolchain::implied), read here and nowhere else. A crate of the
-/// program: every one the world holds (which `std` it names is its `Implicit`'s; what its
+/// Which of the sysroot crates `all` (core, alloc, std, proc_macro, bstd, by world index) the
+/// crate at `at`, whose own dependencies are `own`, is given. A toolchain crate (`toolchain`):
+/// those its shelf row names, which are its edges (the cutter writes the sysroot crates a root
+/// names as real dependencies: blaze_toolchain::implied), read here and nowhere else. A crate of
+/// the program: every one the world holds (which `std` it names is its `Implicit`'s; what its
 /// root's `#![no_std]` drops is blaze-scope graph.rs `externs`'). Never the crate itself.
-pub(crate) fn sysroot_given(toolchain: bool, at: usize, all: [Option<usize>; 4], own: &[(&str, usize)]) -> [bool; 4] {
-    let mut given = [false; 4];
+pub(crate) fn sysroot_given(toolchain: bool, at: usize, all: [Option<usize>; 5], own: &[(&str, usize)]) -> [bool; 5] {
+    let mut given = [false; 5];
     for (slot, s) in given.iter_mut().zip(all) {
         let Some(s) = s else { continue };
         *slot = s != at && (!toolchain || own.iter().any(|(_, d)| *d == s));
@@ -1048,24 +1048,26 @@ mod tests {
     /// `sysroot given: bstd [true, true, true, false], blaze_ids [true, false, true, false], app [true, true, true, true]`.
     #[test]
     fn a_toolchain_crate_is_given_what_its_row_names() {
-        // World indexes: 0 core, 1 alloc, 2 std, 3 bstd, 4 blaze_ids, 5 app (a program crate).
-        let deps: [&[(&str, usize)]; 6] = [
+        // World indexes: 0 core, 1 alloc, 2 std, 3 proc_macro, 4 bstd, 5 blaze_ids, 6 app (a program crate).
+        let deps: [&[(&str, usize)]; 7] = [
             &[],
             &[("core", 0)],
             &[("alloc", 1), ("core", 0)],
-            &[("alloc", 1), ("blaze_ids", 4), ("core", 0), ("std", 2)],
+            &[("core", 0), ("std", 2)],
+            &[("alloc", 1), ("blaze_ids", 5), ("core", 0), ("std", 2)],
             &[("core", 0), ("std", 2)],
             &[],
         ];
-        let all = [Some(0), Some(1), Some(2), Some(3)];
-        let given = |at: usize| sysroot_given(at != 5, at, all, deps[at]);
-        assert_eq!(given(0), [false, false, false, false], "core");
-        assert_eq!(given(1), [true, false, false, false], "alloc");
-        assert_eq!(given(2), [true, true, false, false], "std: never itself");
-        assert_eq!(given(3), [true, true, true, false], "bstd: its row names std, for `extern crate std;` in `mod rt`");
-        assert_eq!(given(4), [true, false, true, false], "blaze_ids: its row names std");
-        assert_eq!(given(5), [true, true, true, true], "a program crate: every sysroot crate");
-        println!("sysroot given: bstd {:?}, blaze_ids {:?}, app {:?}", given(3), given(4), given(5));
+        let all = [Some(0), Some(1), Some(2), Some(3), Some(4)];
+        let given = |at: usize| sysroot_given(at != 6, at, all, deps[at]);
+        assert_eq!(given(0), [false, false, false, false, false], "core");
+        assert_eq!(given(1), [true, false, false, false, false], "alloc");
+        assert_eq!(given(2), [true, true, false, false, false], "std: never itself");
+        assert_eq!(given(3), [true, false, true, false, false], "proc_macro: never itself");
+        assert_eq!(given(4), [true, true, true, false, false], "bstd: its row names std, for `extern crate std;` in `mod rt`");
+        assert_eq!(given(5), [true, false, true, false, false], "blaze_ids: its row names std");
+        assert_eq!(given(6), [true, true, true, true, true], "a program crate: every sysroot crate");
+        println!("sysroot given: bstd {:?}, blaze_ids {:?}, app {:?}", given(4), given(5), given(6));
     }
 
     /// A crate's payload larger than its task's frame is handed to its record, not copied: the

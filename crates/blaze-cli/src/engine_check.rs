@@ -846,6 +846,7 @@ fn edge_at<'l, R>(
     let opts = || Opts {
         status,
         tools,
+        producers,
         workers,
         toolchain: blaze_toolchain::PINNED,
         heap,
@@ -2928,6 +2929,9 @@ impl<'f> Place<'f> {
 pub(crate) struct Opts<'f> {
     /// Each kind's tool in the engine's form (engine_store.rs `tools`): in every task's key.
     pub(crate) tools: blaze_engine::Tools,
+    /// This binary's per-row producer identities (Rule 21, Rule 52): keys on-disk caches such as
+    /// `<store>/wasm64-sysroot-v2/<dir>/` so format bumps miss cleanly.
+    pub(crate) producers: blaze_ids::producer::Producers,
     pub(crate) place: Place<'f>,
     /// At most this many tasks at once.
     pub(crate) workers: NonZeroU32,
@@ -3441,7 +3445,7 @@ fn checking<'f, 's: 'f>(
 ) -> Result<BoxedChecked, CliError> {
     #[cfg(test)]
     stack_probe::at("checking");
-    let &Opts { tools, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, scope: check_scope } = opts;
+    let &Opts { tools, producers, workers, toolchain, heap, place, fresh, heads_from, head_units, head_jobs, head_sources, frame, scope_reads, unreadable: planted_unreadable, body_locals, status: _, origin, names_oracle, driver, ready_plant, scope: check_scope } = opts;
     // The oracle compares every crate's names, so every crate is entered: no stored answer read.
     let fresh = fresh || recovery == StoredRecovery::Fresh || names_oracle.on();
     let erased = blaze_own::Erased::new(frame);
@@ -4418,17 +4422,18 @@ fn checking<'f, 's: 'f>(
             };
             let found_edges = crate::engine_body_plan::found_edges(&found_units, &found_places, heap.alloc());
             let reach = bodies.plan_reach(cx, &mut store, graph, plan_list, scoped.as_ref(), &outlined, &found_edges, crate::engine_bodies::ReachFrom::Walk, heap.alloc())?;
-            // Under a scoped check, cfg-blind file walking from an active library dependency can
-            // outline a `#[cfg(test)] mod tests;` file that no active scoped unit reaches. Mark
-            // such unreached non-external files as skipped so `plan_views` plans no ownerless body
-            // tasks for them and `workspace_of_scoped` skips them cleanly.
-            if scoped.is_some()
-                && let Some(reach) = reach
-            {
+            // Cfg-blind file walking can outline a `#[cfg(test)] mod tests;` file that no active
+            // unit reaches — both under a scoped check (from an active library dependency) and in
+            // an unscoped check (from an example target compiled only with `test = false`, e.g.
+            // `examples/tempo_pipeline.rs` -> `#[cfg(test)] mod resolve_tests;`). Mark such
+            // unreached non-external files as skipped so `plan_views` plans no ownerless body
+            // tasks for them (matching inline `#[cfg(test)] mod tests { ... }` having 0 rows).
+            if let Some(reach) = reach {
                 let mut added = false;
                 for one in outlined.iter() {
                     if skipped.external.binary_search(&one.name).is_err()
                         && reach.ranks(one.name).is_empty()
+                        && (scoped.is_some() || reach.is_test_cut(one.name))
                         && skipped.files.binary_search(&one.name).is_err()
                     {
                         skipped.files.push(one.name);
@@ -4734,6 +4739,7 @@ fn checking<'f, 's: 'f>(
         lock: laid_now.and_then(|laid| laid.lock.as_ref()).map(|lockfile| lockfile.lock),
         members,
         env: &env,
+        producers,
         side: side.as_ref(),
         outlined: &outlined,
         workers,
@@ -6413,11 +6419,12 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
     let reach = rq.bodies.plan_reach(cx, &mut *store, rq.graph, Some(list), rq.scoped, &merged, &edges, crate::engine_bodies::ReachFrom::Walk, heap.alloc())?;
     let mut skipped_now: SVec<'_, Name> = SVec::new_in(alloc);
     skipped_now.extend(serve.skipped.iter().copied());
-    if rq.scoped.is_some()
-        && let Some(reach) = reach
-    {
+    if let Some(reach) = reach {
         for one in merged.iter() {
-            if external_now.binary_search(&one.name).is_err() && reach.ranks(one.name).is_empty() {
+            if external_now.binary_search(&one.name).is_err()
+                && reach.ranks(one.name).is_empty()
+                && (rq.scoped.is_some() || reach.is_test_cut(one.name))
+            {
                 skipped_now.push(one.name);
             }
         }

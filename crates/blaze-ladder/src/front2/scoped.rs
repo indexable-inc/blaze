@@ -258,12 +258,19 @@ impl<'d, 'n: 'd, S: NamesSource<'n>> MacroNames<'d> for ScopedBy<'d, 'n, S> {
             return Err(NoMacro::NotAPath);
         }
         // Where the call's name is read, by its first token's mark: the one rule
-        // (blaze-lower `mark_site::site_of`).
+        // (blaze-lower `mark_site::site_of`). For a single-segment bare function-like macro call
+        // emitted by a `#[macro_export(local_inner_macros)]` macro, resolve in the defining
+        // crate (`$crate::name!`).
         let site = blaze_lower::mark_site::site_of(at.mark, first, absolute, self.module).map_err(NoMacro::Site)?;
-        let (written_kind, rest) = match (first, site.dollar_crate) {
+        let local_inner_krate = match (kind, site.dollar_crate) {
+            (ProcKind::FnLike, None) => blaze_lower::mark_site::local_inner_crate(at.mark, first, segments.len(), absolute),
+            _ => None,
+        };
+        let (written_kind, rest) = match (first, site.dollar_crate, local_inner_krate) {
             _ if absolute => (PathKind::Abs, 0),
-            (_, Some(krate)) => (PathKind::DollarCrate(krate), 1),
-            (first, None) => match first {
+            (_, Some(krate), _) => (PathKind::DollarCrate(krate), 1),
+            (_, None, Some(krate)) => (PathKind::DollarCrate(krate), 0),
+            (first, None, None) => match first {
             "crate" => (PathKind::Crate, 1),
             "self" => (PathKind::SelfMod, 1),
             "super" => {
@@ -279,9 +286,9 @@ impl<'d, 'n: 'd, S: NamesSource<'n>> MacroNames<'d> for ScopedBy<'d, 'n, S> {
             ProcKind::Attr => CallShape::Attr,
             ProcKind::Derive => CallShape::Derive,
         };
-        // A path read at the call site (no opaque mark, no `$crate`) of a call written in the
-        // body's text is read in the innermost written block around the call: an `extern
-        // crate .. as` or `use` there binds its first segment (serde's derive writes
+        // A path read at the call site (no opaque mark, no `$crate`, no `local_inner_macros`) of a
+        // call written in the body's text is read in the innermost written block around the call:
+        // an `extern crate .. as` or `use` there binds its first segment (serde's derive writes
         // `extern crate serde as _serde; _serde::__require_serde_not_serde_core!();` in its
         // `const _` block). Every cell of that walk is the block module's (rule 21). Rust's
         // order is the walk's own (blaze-scope names.rs `lexical`): a one-segment name is read
@@ -291,7 +298,9 @@ impl<'d, 'n: 'd, S: NamesSource<'n>> MacroNames<'d> for ScopedBy<'d, 'n, S> {
         // A call an expansion wrote inside a block of its own is read at that block first
         // (`PathAt::block`, `BlockModules::expansion_module`): proptest's `prop_assert!` writes
         // `extern crate alloc;` and `alloc::format!(..)` in one `if` block.
-        let at_call = site.dollar_crate.is_none() && !matches!(at.mark, Some(m) if m.transparency == blaze_expand::Transparency::Opaque);
+        let at_call = site.dollar_crate.is_none()
+            && local_inner_krate.is_none()
+            && !matches!(at.mark, Some(m) if m.transparency == blaze_expand::Transparency::Opaque);
         let module = match (at.block, at.written) {
             (Some(block), _) if at_call => block,
             (None, Some(call)) if at_call => self.blocks.and_then(|b| b.hand_module(call)).unwrap_or(site.module),

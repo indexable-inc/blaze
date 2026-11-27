@@ -164,7 +164,7 @@ mod tests {
             mk("b", "/b/lib.rs", false),
             mk("c", "/c/lib.rs", false),
         ];
-        let sysroot = Sysroot { core: None, alloc: None, std: None, bstd: None };
+        let sysroot = Sysroot::default();
         let solved = resolve_crates(&inputs, sysroot, &texts, &Serial, bump).expect("resolve");
 
         // Abort returns None without touching lang crates.
