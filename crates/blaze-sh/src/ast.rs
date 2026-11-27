@@ -187,6 +187,25 @@ pub enum ExprKind<'a> {
         base: blaze_own::ABox<'a, Expr<'a>>,
         steps: AVec<'a, PathStep<'a>>,
     },
+    /// `base[]`: flatten one level and skip nulls (`Value::Nothing`).
+    Flatten {
+        base: blaze_own::ABox<'a, Expr<'a>>,
+    },
+    /// `base[idx]` / `base[-1]` / `base[a..b]` / `base["key"]`: index, negative index, or slice.
+    IndexSlice {
+        base: blaze_own::ABox<'a, Expr<'a>>,
+        index: blaze_own::ABox<'a, Expr<'a>>,
+    },
+    /// `base[source == null]`: inline row/item predicate filter.
+    Filter {
+        base: blaze_own::ABox<'a, Expr<'a>>,
+        pred: blaze_own::ABox<'a, Expr<'a>>,
+    },
+    /// `base.{name, ver: .version}`: inline record/table column projection & reshaping.
+    Project {
+        base: blaze_own::ABox<'a, Expr<'a>>,
+        fields: AVec<'a, (ARc<'a, str>, Option<Expr<'a>>)>,
+    },
     /// Bare cell-path literal (e.g. `size` inside `where size > 1mb` or `$.a.b`).
     BarePath(AVec<'a, PathStep<'a>>),
     Unary {
