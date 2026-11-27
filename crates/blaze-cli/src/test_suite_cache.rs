@@ -379,6 +379,14 @@ pub(crate) struct SuiteCache<'h> {
     verified_closed: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_workspace: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_dirty: bool,
+    /// Non-toolchain CAS keys reached or written via `HomeCodeStore` during this command so
+    /// `TestCache::commit` pins special non-pointer entries (`getter`/`ender`/personality/datums)
+    /// alongside verified `(code_key, content_key)` pairs under `test.<suite_id>`.
+    code_keys: Set<[u8; 32], FixedState, Alloc<'static>>,
+    /// Toolchain-class CAS keys written via `HomeCodeStore` during this command so
+    /// `TestCache::commit` roots them under `tool.<toolchain_id>` (`roots::keep_toolchain`).
+    toolchain_keys: Set<[u8; 32], FixedState, Alloc<'static>>,
+    code_keys_dirty: bool,
     pubs: Map<[u8; 32], CachedPub, BuildKeyHasher, Alloc<'static>>,
     datums: Map<[u8; 32], CachedDatum, BuildKeyHasher, Alloc<'static>>,
     by_record: Map<[u8; 32], CachedRecord, BuildKeyHasher, Alloc<'static>>,
@@ -412,6 +420,9 @@ impl<'h> SuiteCache<'h> {
             verified_closed: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
             verified_workspace: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
             verified_dirty: false,
+            code_keys: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
+            toolchain_keys: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
+            code_keys_dirty: false,
             pubs: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
             datums: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
             by_record: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
@@ -441,6 +452,35 @@ impl<'h> SuiteCache<'h> {
 
     pub(crate) fn verified_workspace_pairs(&self) -> impl Iterator<Item = ([u8; 32], [u8; 32])> + '_ {
         self.verified_workspace.iter().copied()
+    }
+
+    pub(crate) fn toolchain(&self) -> blaze_toolchain::ToolchainId {
+        self.builder.toolchain
+    }
+
+    pub(crate) fn record_code_keys(&mut self, reached: &[blaze_cas::Key], toolchain_made: &[blaze_cas::Key]) {
+        for key in reached {
+            if self.code_keys.insert(key.0.0) {
+                self.code_keys_dirty = true;
+            }
+        }
+        for key in toolchain_made {
+            if self.toolchain_keys.insert(key.0.0) {
+                self.code_keys_dirty = true;
+            }
+        }
+    }
+
+    pub(crate) fn code_keys_dirty(&self) -> bool {
+        self.code_keys_dirty
+    }
+
+    pub(crate) fn reached_code_keys(&self) -> impl Iterator<Item = blaze_cas::Key> + '_ {
+        self.code_keys.iter().map(|&raw| blaze_cas::Key(blaze_ids::ContentId(raw)))
+    }
+
+    pub(crate) fn toolchain_code_keys(&self) -> impl Iterator<Item = blaze_cas::Key> + '_ {
+        self.toolchain_keys.iter().map(|&raw| blaze_cas::Key(blaze_ids::ContentId(raw)))
     }
 
     fn record_verified_entry(&mut self, pair: ([u8; 32], [u8; 32]), tabled: ItemKey, name: &[u8], entry: &[u8], ids: &RunIds<'_>) {

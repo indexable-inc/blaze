@@ -850,6 +850,12 @@ impl<'a, 'h> BinBackend<'a> for RealBackend<'_, 'a, 'h> {
         let served = session.needs.serve(&mut resolver, inbox, outbox);
         let answer = resolver.requested.take();
         drop(resolver);
+        let _ = codes.ensure_persisted();
+        {
+            let reached = codes.reached();
+            let toolchain_made = codes.toolchain_made();
+            bin.suite_cache.borrow_mut().record_code_keys(reached.as_slice(), toolchain_made.as_slice());
+        }
         match served {
             Ok(0) => Ok((0, true)),
             Ok(taken) => {
@@ -1028,18 +1034,37 @@ impl<'a, 'h> BinServer<'a, 'h> {
         lent: &CommandLent,
         certificate: &crate::start_list::Certificate,
     ) -> Result<(), DriveError> {
+        let mut toolchain_keys: AVec<'_, blaze_cas::Key> = Vec::new_in(self.alloc);
+        let mut toolchain_id = None;
         for bin in self.bins.iter() {
             let sc = bin.suite_cache.borrow();
-            if sc.verified_dirty() {
+            if sc.verified_dirty() || sc.code_keys_dirty() {
                 crate::test_cache::save_verified_by_id(
                     lent,
                     bin.cache_id,
                     certificate,
                     sc.verified_closed_pairs(),
                     sc.verified_workspace_pairs(),
+                    sc.reached_code_keys(),
                     self.alloc,
                 )?;
+                toolchain_id = Some(sc.toolchain());
+                for key in sc.toolchain_code_keys() {
+                    toolchain_keys.push(key);
+                }
             }
+        }
+        if !toolchain_keys.is_empty()
+            && let Some(tc) = toolchain_id
+        {
+            toolchain_keys.sort_unstable();
+            toolchain_keys.dedup();
+            crate::store::roots::keep_toolchain(lent, tc, toolchain_keys.as_slice(), &[]).map_err(|e| {
+                DriveError::CacheStore {
+                    what: "pinning binary stub toolchain code root",
+                    why: crate::test_cache::CacheError::Root(e),
+                }
+            })?;
         }
         Ok(())
     }

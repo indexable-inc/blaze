@@ -21,7 +21,7 @@
 //!   previously filed `BZTR` passes via `Effect::Look`.
 
 use blaze_cas::Key as CasKey;
-use blaze_cas::plain::{Lent, LentError, Namespace};
+use blaze_cas::plain::{INDEX_KEYS_MOST, Lent, LentError, Namespace, ROOT_LIFE_NS};
 use blaze_code::datum::DatumView;
 use blaze_code::record::{CodeView, Space, Symbol as CodeSymbol};
 use blaze_core::Driver;
@@ -73,7 +73,7 @@ const VERIFIED_MAGIC: [u8; 4] = *b"BZTV";
 /// by per-suite `suite_cert`.
 const VERIFIED_VERSION: u32 = 2;
 /// Cap on verified `(instance_key, content_key)` pairs persisted per section (`closed` and `workspace`) per suite.
-const MOST_VERIFIED_PERSISTED: usize = 65_536;
+const MOST_VERIFIED_PERSISTED: usize = 524_288;
 /// Cap on historical `BZTR` result keys kept per suite beyond those referenced by the current
 /// `Head` (bounded MRU undo-history ring so `SuiteState` and CAS roots never grow unboundedly).
 const MOST_EXTRA_RESULT_KEYS: usize = 64;
@@ -817,13 +817,23 @@ pub(crate) fn load_verified_by_id<D: Driver>(
 }
 
 /// Persists and pins verified `(instance_key, content_key)` pairs for a workspace binary identity
-/// `id` under today's exact `certificate`.
+/// Returns `true` iff `key` is currently held in `lent` (either as a plain record or a pointer
+/// record), without copying or lending its bytes. Prevents pinning absent/pre-swept keys in a root
+/// index (`Driven::root_names_held`).
+fn cas_key_held<D: Driver>(lent: &Lent<D, StoreAlloc>, key: &CasKey) -> bool {
+    matches!(lent.tag_of(key), Ok(Some(_)) | Err(LentError::PointerTag { .. }))
+}
+
+/// Persists verified `(instance_key, content_key)` pairs (`BZTV`) for an arbitrary standalone cache
+/// `id` under today's exact `certificate`, pinning both the `BZTV` metadata and every held code
+/// pointer/content record under `test.<id>` so background GC never sweeps warm compiled code.
 pub(crate) fn save_verified_by_id<D: Driver>(
     lent: &Lent<D, StoreAlloc>,
     id: ContentId,
     certificate: &crate::start_list::Certificate,
     closed_pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
     workspace_pairs: impl Iterator<Item = ([u8; 32], [u8; 32])>,
+    extra_code_keys: impl Iterator<Item = CasKey>,
     alloc: Alloc<'_>,
 ) -> Result<(), DriveError> {
     let store_err = |e: LentError| DriveError::CacheStore { what: "writing binary stub verified cache", why: CacheError::Store(e) };
@@ -833,30 +843,61 @@ pub(crate) fn save_verified_by_id<D: Driver>(
         if closed_list.len() >= MOST_VERIFIED_PERSISTED {
             break;
         }
-        closed_list.push(pair);
+        if cas_key_held(lent, &CasKey(ContentId(pair.0))) && cas_key_held(lent, &CasKey(ContentId(pair.1))) {
+            closed_list.push(pair);
+        }
     }
     let mut ws_list: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
     for pair in workspace_pairs {
         if ws_list.len() >= MOST_VERIFIED_PERSISTED {
             break;
         }
-        ws_list.push(pair);
+        if cas_key_held(lent, &CasKey(ContentId(pair.0))) && cas_key_held(lent, &CasKey(ContentId(pair.1))) {
+            ws_list.push(pair);
+        }
     }
-    if closed_list.is_empty() && ws_list.is_empty() {
+    let mut extra_held: AVec<'_, CasKey> = Vec::new_in(alloc);
+    for key in extra_code_keys {
+        if cas_key_held(lent, &key) {
+            extra_held.push(key);
+        }
+    }
+    if closed_list.is_empty() && ws_list.is_empty() && extra_held.is_empty() {
         return Ok(());
     }
     closed_list.sort_unstable();
     closed_list.dedup();
     ws_list.sort_unstable();
     ws_list.dedup();
-    let cert = *certificate.bytes();
-    let mut vbytes: AVec<'_, u8> = Vec::new_in(alloc);
-    encode_verified(cert, cert, closed_list.as_slice(), ws_list.as_slice(), &mut vbytes);
-    let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
-    let vptr_key = verified_ptr_key(id);
-    lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).map_err(store_err)?;
-    lent.point(TestIndex::TAG, &vptr_key, &vstate_key).map_err(store_err)?;
-    roots::keep_test_suite(lent, &id, &[vptr_key, vstate_key]).map_err(root_err)?;
+    let mut pinned: AVec<'_, CasKey> =
+        Vec::with_capacity_in(2 + (closed_list.len() + ws_list.len()) * 2 + extra_held.len(), alloc);
+    if !closed_list.is_empty() || !ws_list.is_empty() {
+        let cert = *certificate.bytes();
+        let mut vbytes: AVec<'_, u8> = Vec::new_in(alloc);
+        encode_verified(cert, cert, closed_list.as_slice(), ws_list.as_slice(), &mut vbytes);
+        let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
+        let vptr_key = verified_ptr_key(id);
+        lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).map_err(store_err)?;
+        lent.point(TestIndex::TAG, &vptr_key, &vstate_key).map_err(store_err)?;
+        pinned.push(vptr_key);
+        pinned.push(vstate_key);
+    }
+    let base_len = pinned.len();
+    let mut code_pins: AVec<'_, CasKey> =
+        Vec::with_capacity_in((closed_list.len() + ws_list.len()) * 2 + extra_held.len(), alloc);
+    for &(ik, ck) in closed_list.iter().chain(ws_list.iter()) {
+        code_pins.push(CasKey(ContentId(ik)));
+        code_pins.push(CasKey(ContentId(ck)));
+    }
+    code_pins.extend_from_slice(extra_held.as_slice());
+    code_pins.sort_unstable();
+    code_pins.dedup();
+    let cap = INDEX_KEYS_MOST.saturating_sub(base_len);
+    if code_pins.len() > cap {
+        code_pins.truncate(cap);
+    }
+    pinned.extend_from_slice(code_pins.as_slice());
+    roots::keep_test_suite(lent, &id, pinned.as_slice()).map_err(root_err)?;
     Ok(())
 }
 
@@ -1402,9 +1443,17 @@ struct SuiteSlot<'a, 'm> {
     /// Existing persisted `(verified_ptr, verified_state)` keys if already in CAS for today's
     /// closed or full suite digest.
     loaded_verified_keys: Option<(CasKey, CasKey)>,
+    /// Code pointer & content keys referenced by `loaded_verified_keys` so a commit that updates
+    /// `SuiteState` or `extra_code_keys` without rewriting `BZTV` still keeps all previously
+    /// verified code records pinned under `test.<id>`.
+    loaded_verified_code_keys: AVec<'a, CasKey>,
     /// Newly verified `(closed_pairs, workspace_pairs)` to persist under today's
     /// `(suite_cert, closed_crates_digest)` on [`TestCache::commit`].
     verified_to_save: Option<(AVec<'a, ([u8; 32], [u8; 32])>, AVec<'a, ([u8; 32], [u8; 32])>)>,
+    /// Non-toolchain CAS keys reached or written via `HomeCodeStore` during this command
+    /// (captures special non-pointer entries like `getter`/`ender`/personality/datums alongside
+    /// verified `(code_key, content_key)` pairs).
+    extra_code_keys: AVec<'a, CasKey>,
 }
 
 /// CAS-backed incremental cache for all suites in one `blaze test` invocation.
@@ -1412,6 +1461,8 @@ pub(crate) struct TestCache<'a, 'm, D: Driver> {
     lent: &'m Lent<D, StoreAlloc>,
     cert: [u8; 32],
     tools_digest: [u8; 32],
+    toolchain: Option<blaze_toolchain::ToolchainId>,
+    toolchain_code_keys: AVec<'a, CasKey>,
     suites: AVec<'a, SuiteSlot<'a, 'm>>,
     /// Sorted `(TestId, SuiteId)` mapping for resolving the owning suite when the shared
     /// inventory pool (`SuiteId(u32::MAX)`) calls `Answers::answer`.
@@ -1456,7 +1507,9 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
                 new_postings: None,
                 dirty: false,
                 loaded_verified_keys: None,
+                loaded_verified_code_keys: Vec::new_in(alloc),
                 verified_to_save: None,
+                extra_code_keys: Vec::new_in(alloc),
             };
             let mut head = Head::EMPTY;
             let mut postings = Postings::EMPTY;
@@ -1517,7 +1570,22 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
 
         moved.sort_unstable();
         moved.dedup();
-        (TestCache { lent, cert, tools_digest, suites, owners: Vec::new_in(alloc), alloc }, heads, postings_list, moved)
+        let toolchain = suite_specs.first().map(|s| s.builder.toolchain);
+        (
+            TestCache {
+                lent,
+                cert,
+                tools_digest,
+                toolchain,
+                toolchain_code_keys: Vec::new_in(alloc),
+                suites,
+                owners: Vec::new_in(alloc),
+                alloc,
+            },
+            heads,
+            postings_list,
+            moved,
+        )
     }
 
     /// Registers the `(TestId, SuiteId)` ownership table for the shared inventory pool.
@@ -1568,7 +1636,33 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
             return (0, 0);
         };
         slot.loaded_verified_keys = Some((ptr_key, state_key));
+        slot.loaded_verified_code_keys.clear();
+        slot.loaded_verified_code_keys.reserve((into_closed.len() + into_workspace.len()) * 2);
+        for &(ik, ck) in into_closed.iter().chain(into_workspace.iter()) {
+            slot.loaded_verified_code_keys.push(CasKey(ContentId(ik)));
+            slot.loaded_verified_code_keys.push(CasKey(ContentId(ck)));
+        }
         loaded
+    }
+
+    /// Records CAS keys reached or written via `HomeCodeStore` for `suite` (program-class keys
+    /// pinned under `test.<suite_id>`, toolchain-class writes rooted under `tool.<toolchain_id>`).
+    pub(crate) fn record_code_keys(
+        &mut self,
+        suite: SuiteId,
+        reached: impl Iterator<Item = CasKey>,
+        toolchain_made: impl Iterator<Item = CasKey>,
+    ) {
+        if let Ok(idx) = usize::try_from(suite.0)
+            && let Some(slot) = self.suites.get_mut(idx)
+        {
+            for key in reached {
+                slot.extra_code_keys.push(key);
+            }
+        }
+        for key in toolchain_made {
+            self.toolchain_code_keys.push(key);
+        }
     }
 
     /// Schedules the full sets of closed and workspace verified `(instance_key, content_key)`
@@ -1671,51 +1765,116 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
     }
 
     /// Commits every dirty suite's `SuiteState`, verified-entry cache, pointer, and root into
-    /// `Lent` (flushed to disk by the command's single post-answer commit).
+    /// `Lent` (flushed to disk by the command's single post-answer commit), pinning both suite
+    /// metadata AND all held compiled code records (`BZTV` pointer/content keys + `HomeCodeStore`
+    /// reached keys under `test.<id>`, and toolchain-class writes under `tool.<toolchain>`) so
+    /// background GC never sweeps warm compiled test code.
     pub(crate) fn commit(mut self, ids: &RunIds<'_>) -> Result<(), DriveError> {
         let store_err = |e: LentError| DriveError::CacheStore { what: "writing test suite cache", why: CacheError::Store(e) };
         let root_err = |e: RootError| DriveError::CacheStore { what: "pinning test suite root", why: CacheError::Root(e) };
         for slot in self.suites.iter_mut() {
             let mut verified_keys = slot.loaded_verified_keys;
             let mut verified_changed = false;
+            let mut code_pins: AVec<'_, CasKey> = Vec::new_in(self.alloc);
             if let Some((mut closed_pairs, mut ws_pairs)) = slot.verified_to_save.take()
                 && (!closed_pairs.is_empty() || !ws_pairs.is_empty())
             {
-                closed_pairs.sort_unstable();
-                closed_pairs.dedup();
-                ws_pairs.sort_unstable();
-                ws_pairs.dedup();
-                let mut vbytes: AVec<'_, u8> = Vec::new_in(self.alloc);
-                encode_verified(
-                    slot.suite_cert,
-                    slot.closed_crates_digest,
-                    closed_pairs.as_slice(),
-                    ws_pairs.as_slice(),
-                    &mut vbytes,
-                );
-                let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
-                let vptr_key = verified_ptr_key(slot.id);
-                self.lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).map_err(store_err)?;
-                self.lent.point(TestIndex::TAG, &vptr_key, &vstate_key).map_err(store_err)?;
-                verified_keys = Some((vptr_key, vstate_key));
-                verified_changed = true;
+                closed_pairs.retain(|&(ik, ck)| {
+                    cas_key_held(self.lent, &CasKey(ContentId(ik)))
+                        && cas_key_held(self.lent, &CasKey(ContentId(ck)))
+                });
+                ws_pairs.retain(|&(ik, ck)| {
+                    cas_key_held(self.lent, &CasKey(ContentId(ik)))
+                        && cas_key_held(self.lent, &CasKey(ContentId(ck)))
+                });
+                if !closed_pairs.is_empty() || !ws_pairs.is_empty() {
+                    closed_pairs.sort_unstable();
+                    closed_pairs.dedup();
+                    ws_pairs.sort_unstable();
+                    ws_pairs.dedup();
+                    let mut vbytes: AVec<'_, u8> = Vec::new_in(self.alloc);
+                    encode_verified(
+                        slot.suite_cert,
+                        slot.closed_crates_digest,
+                        closed_pairs.as_slice(),
+                        ws_pairs.as_slice(),
+                        &mut vbytes,
+                    );
+                    let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
+                    let vptr_key = verified_ptr_key(slot.id);
+                    self.lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).map_err(store_err)?;
+                    self.lent.point(TestIndex::TAG, &vptr_key, &vstate_key).map_err(store_err)?;
+                    verified_keys = Some((vptr_key, vstate_key));
+                    verified_changed = true;
+                    code_pins.reserve((closed_pairs.len() + ws_pairs.len()) * 2);
+                    for &(ik, ck) in closed_pairs.iter().chain(ws_pairs.iter()) {
+                        code_pins.push(CasKey(ContentId(ik)));
+                        code_pins.push(CasKey(ContentId(ck)));
+                    }
+                }
+            } else if verified_keys.is_some() {
+                code_pins.reserve(slot.loaded_verified_code_keys.len());
+                for key in slot.loaded_verified_code_keys.iter() {
+                    if cas_key_held(self.lent, key) {
+                        code_pins.push(*key);
+                    }
+                }
             }
+            let has_extra_code = !slot.extra_code_keys.is_empty();
+            if has_extra_code {
+                code_pins.reserve(slot.extra_code_keys.len());
+                for key in slot.extra_code_keys.iter() {
+                    if cas_key_held(self.lent, key) {
+                        code_pins.push(*key);
+                    }
+                }
+            }
+            code_pins.sort_unstable();
+            code_pins.dedup();
+
+            let append_code_pins = |pinned: &mut AVec<'_, CasKey>, code_pins: &[CasKey]| {
+                let cap = INDEX_KEYS_MOST.saturating_sub(pinned.len());
+                let take = code_pins.len().min(cap);
+                pinned.extend_from_slice(&code_pins[..take]);
+            };
 
             if !slot.dirty {
-                if verified_changed
-                    && let Some((vptr_key, vstate_key)) = verified_keys
-                {
-                    let mut pinned: AVec<'_, CasKey> = Vec::with_capacity_in(slot.loaded_root_keys.len() + 2, self.alloc);
+                if verified_changed || has_extra_code {
+                    let mut pinned: AVec<'_, CasKey> =
+                        Vec::with_capacity_in(slot.loaded_root_keys.len() + 2 + code_pins.len(), self.alloc);
                     pinned.extend_from_slice(slot.loaded_root_keys.as_slice());
-                    pinned.push(vptr_key);
-                    pinned.push(vstate_key);
-                    roots::keep_test_suite(self.lent, &slot.id, pinned.as_slice()).map_err(root_err)?;
+                    if let Some((vptr_key, vstate_key)) = verified_keys {
+                        pinned.push(vptr_key);
+                        pinned.push(vstate_key);
+                    }
+                    append_code_pins(&mut pinned, code_pins.as_slice());
+                    if !pinned.is_empty() {
+                        roots::keep_test_suite(self.lent, &slot.id, pinned.as_slice()).map_err(root_err)?;
+                    }
+                } else if verified_keys.is_some() {
+                    let root = roots::RootName::test_suite(&slot.id);
+                    let _ = self.lent.renew_root(root.as_str(), ROOT_LIFE_NS);
                 }
                 continue;
             }
             let (head_key, head_bytes_slice): (CasKey, &[u8]) = match &slot.new_head {
                 Some((key, bytes)) => (*key, bytes.as_slice()),
-                None => continue,
+                None => {
+                    if verified_changed || has_extra_code {
+                        let mut pinned: AVec<'_, CasKey> =
+                            Vec::with_capacity_in(slot.loaded_root_keys.len() + 2 + code_pins.len(), self.alloc);
+                        pinned.extend_from_slice(slot.loaded_root_keys.as_slice());
+                        if let Some((vptr_key, vstate_key)) = verified_keys {
+                            pinned.push(vptr_key);
+                            pinned.push(vstate_key);
+                        }
+                        append_code_pins(&mut pinned, code_pins.as_slice());
+                        if !pinned.is_empty() {
+                            roots::keep_test_suite(self.lent, &slot.id, pinned.as_slice()).map_err(root_err)?;
+                        }
+                    }
+                    continue;
+                }
             };
             let Some(postings_key) = slot.new_postings else { continue };
             // Keep only `FnEntry` rows still referenced by the new head, and collect live head
@@ -1783,7 +1942,8 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
             self.lent.put(&state_key, Namespace::LOCAL, TestIndex::TAG, state_bytes.as_slice()).map_err(store_err)?;
             self.lent.point(TestIndex::TAG, &ptr_key, &state_key).map_err(store_err)?;
 
-            let mut pinned: AVec<'_, CasKey> = Vec::with_capacity_in(6 + live_results.len(), self.alloc);
+            let mut pinned: AVec<'_, CasKey> =
+                Vec::with_capacity_in(6 + live_results.len() + code_pins.len(), self.alloc);
             pinned.push(ptr_key);
             pinned.push(state_key);
             pinned.push(head_key);
@@ -1793,7 +1953,22 @@ impl<'a, 'm, D: Driver> TestCache<'a, 'm, D> {
                 pinned.push(vptr_key);
                 pinned.push(vstate_key);
             }
+            append_code_pins(&mut pinned, code_pins.as_slice());
             roots::keep_test_suite(self.lent, &slot.id, pinned.as_slice()).map_err(root_err)?;
+        }
+        if !self.toolchain_code_keys.is_empty()
+            && let Some(toolchain) = self.toolchain
+        {
+            self.toolchain_code_keys.retain(|key| cas_key_held(self.lent, key));
+            self.toolchain_code_keys.sort_unstable();
+            self.toolchain_code_keys.dedup();
+            if self.toolchain_code_keys.len() > INDEX_KEYS_MOST {
+                self.toolchain_code_keys.truncate(INDEX_KEYS_MOST);
+            }
+            if !self.toolchain_code_keys.is_empty() {
+                roots::keep_toolchain(self.lent, toolchain, self.toolchain_code_keys.as_slice(), &[])
+                    .map_err(|e| DriveError::CacheStore { what: "pinning test toolchain code root", why: CacheError::Root(e) })?;
+            }
         }
         Ok(())
     }
@@ -2744,5 +2919,167 @@ mod tests {
         );
         assert!(cache_stale.closed.is_empty());
         assert!(cache_stale.workspace.is_empty());
+    }
+
+    #[test]
+    fn test_cache_commit_and_save_verified_keep_code_records_across_gc() {
+        use core::time::Duration;
+        use blaze_cas::plain::{GRACE_NS, LEASE_NS, Liveness, Settings as StoreSettings};
+        use blaze_core::FileName;
+        use blaze_core::sim::{Faults, Sim};
+        use blaze_ladder::code_records::{CodeClass, CodeStore, entry_of};
+        use crate::code_store::HomeCodeStore;
+        use crate::store::plain_place::{Facts, after_answer, config, open, test_cx};
+
+        let run_case = |pin_code: bool| -> (usize, usize, usize) {
+            let alloc = blaze_own::testing::heap().alloc();
+            let open_proc = |sim: Sim, nonce: u64| {
+                let mut cfg = config(
+                    FileName::new("store").expect("dir"),
+                    &StoreSettings::default(),
+                    Facts { boot: Some(1), nonce },
+                    alloc,
+                );
+                cfg.liveness = Liveness::Reached;
+                open(sim, cfg, alloc).expect("open store")
+            };
+            let code_key = |tag: &'static str, n: u32| CodeKey(ContentId::of(tag, &n.to_le_bytes()));
+            let payload = |n: u32| -> std::vec::Vec<u8> {
+                (0..1024).map(|i| ((n as usize).wrapping_mul(131).wrapping_add(i) & 0xff) as u8).collect()
+            };
+            let content_key = |bytes: &[u8]| CodeKey(ContentId::of("test gc code content", bytes));
+
+            let sim = Sim::new(91, Faults::default());
+            let lent = open_proc(sim, 1);
+
+            let mut codes = HomeCodeStore::new(&lent);
+            let mut ws_pairs: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
+            let mut closed_pairs: AVec<'_, ([u8; 32], [u8; 32])> = Vec::new_in(alloc);
+            for i in 0..6u32 {
+                let bytes = payload(i);
+                let ck = content_key(&bytes);
+                let ik = code_key("test ws prog key", i);
+                codes.put(CodeClass::Program, ck, &bytes).expect("put prog");
+                codes.point(CodeClass::Program, ik, ck).expect("point prog");
+                ws_pairs.push((ik.0.0, ck.0.0));
+            }
+            for i in 100..104u32 {
+                let bytes = payload(i);
+                let ck = content_key(&bytes);
+                let ik = code_key("test tc key", i);
+                codes.put(CodeClass::Toolchain, ck, &bytes).expect("put tc");
+                codes.point(CodeClass::Toolchain, ik, ck).expect("point tc");
+                closed_pairs.push((ik.0.0, ck.0.0));
+            }
+            // Also a standalone non-pointer special entry (`getter` / `ender` style).
+            let special_bytes = payload(200);
+            let special_key = code_key("test special entry", 200);
+            codes.put(CodeClass::Program, special_key, &special_bytes).expect("put special");
+
+            let reached = codes.reached();
+            let tc_made = codes.toolchain_made();
+            drop(codes);
+
+            let suite_id = ContentId::of("test gc suite id", b"tempo-e2e/deferred");
+            let cert = crate::start_list::Certificate::for_tests([0x55; 32]);
+            if pin_code {
+                // Simulate a `!slot.dirty` foreign-code suite (like `tempo-e2e`) committing
+                // verified pairs + reached special code keys + toolchain writes.
+                let mut slot = SuiteSlot {
+                    id: suite_id,
+                    suite_cert: [0x55; 32],
+                    closed_crates_digest: [0x66; 32],
+                    head_bytes: None,
+                    postings_bytes: None,
+                    loaded_root_keys: Vec::new_in(alloc),
+                    fns: Vec::new_in(alloc),
+                    fn_index: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc, capacity: None }),
+                    result_keys: Vec::new_in(alloc),
+                    new_result_keys: Vec::new_in(alloc),
+                    new_head: None,
+                    new_postings: None,
+                    dirty: false,
+                    loaded_verified_keys: None,
+                    loaded_verified_code_keys: Vec::new_in(alloc),
+                    verified_to_save: None,
+                    extra_code_keys: Vec::new_in(alloc),
+                };
+                // Also include a pre-swept/absent pair to prove `cas_key_held` skips it cleanly
+                // without triggering a holed-root refusal.
+                let mut closed_with_absent = Vec::new_in(alloc);
+                closed_with_absent.extend_from_slice(closed_pairs.as_slice());
+                closed_with_absent.push(([0xde; 32], [0xad; 32]));
+                slot.verified_to_save = Some((closed_with_absent, ws_pairs));
+                let mut suites = Vec::new_in(alloc);
+                suites.push(slot);
+                let mut tc = TestCache {
+                    lent: &lent,
+                    cert: *cert.bytes(),
+                    tools_digest: [0x77; 32],
+                    toolchain: Some(blaze_toolchain::PINNED),
+                    toolchain_code_keys: Vec::new_in(alloc),
+                    suites,
+                    owners: Vec::new_in(alloc),
+                    alloc,
+                };
+                tc.record_code_keys(SuiteId(0), reached.iter().copied(), tc_made.iter().copied());
+                let empty_ids = RunIds::empty_for_tests();
+                tc.commit(&empty_ids).expect("TestCache::commit");
+            } else {
+                // Control (rule 23): pre-fix behavior that pinned ONLY `[vptr_key, vstate_key]`
+                // without pinning any code records.
+                let mut vbytes: AVec<'_, u8> = Vec::new_in(alloc);
+                encode_verified([0x55; 32], [0x66; 32], closed_pairs.as_slice(), ws_pairs.as_slice(), &mut vbytes);
+                let vstate_key = CasKey(ContentId::of(VERIFIED_STATE_DOMAIN, vbytes.as_slice()));
+                let vptr_key = verified_ptr_key(suite_id);
+                lent.put(&vstate_key, Namespace::LOCAL, TestIndex::TAG, vbytes.as_slice()).expect("put vstate");
+                lent.point(TestIndex::TAG, &vptr_key, &vstate_key).expect("point vptr");
+                roots::keep_test_suite(&lent, &suite_id, &[vptr_key, vstate_key]).expect("pre-fix root");
+            }
+
+            after_answer(&test_cx(), &lent, 0).expect("commit lent");
+            let mut sim = lent.into_store().into_driver();
+
+            // Run two full GC compaction rounds past lease + grace.
+            sim.advance(Duration::from_nanos(LEASE_NS.max(GRACE_NS)) + Duration::from_secs(60));
+            let gc1 = open_proc(sim, 2);
+            let _ = gc1.compact_foreground(32).expect("gc1");
+            let mut sim = gc1.into_store().into_driver();
+            sim.advance(Duration::from_nanos(GRACE_NS) + Duration::from_secs(60));
+            let gc2 = open_proc(sim, 3);
+            let _ = gc2.compact_foreground(32).expect("gc2");
+            let sim = gc2.into_store().into_driver();
+
+            // Reopen and verify survival.
+            let verify = open_proc(sim, 4);
+            let codes = HomeCodeStore::new(&verify);
+            let mut ws_hits = 0usize;
+            for i in 0..6u32 {
+                if entry_of(&codes, code_key("test ws prog key", i)).expect("read ws") == Some(payload(i).as_slice()) {
+                    ws_hits += 1;
+                }
+            }
+            let mut tc_hits = 0usize;
+            for i in 100..104u32 {
+                if entry_of(&codes, code_key("test tc key", i)).expect("read tc") == Some(payload(i).as_slice()) {
+                    tc_hits += 1;
+                }
+            }
+            let special_hit = usize::from(
+                entry_of(&codes, special_key).expect("read special") == Some(special_bytes.as_slice()),
+            );
+            (ws_hits, tc_hits, special_hit)
+        };
+
+        assert_eq!(
+            run_case(true),
+            (6, 4, 1),
+            "TestCache::commit must keep all program, toolchain, and special code records alive across GC",
+        );
+        assert_eq!(
+            run_case(false),
+            (0, 0, 0),
+            "control: without code record pinning, background GC sweeps every compiled test code record",
+        );
     }
 }
