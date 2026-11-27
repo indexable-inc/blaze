@@ -2317,9 +2317,120 @@ fn is_non_type_generic_arg(inner: &str) -> bool {
     false
 }
 
+/// Skip a leading balanced `<...>` group (tracking nested `<>`, `()`, `[]`, `{}`),
+/// returning the slice immediately after the matching `>`.
+fn skip_balanced_angles(s: &str) -> Option<&str> {
+    if !s.starts_with('<') {
+        return None;
+    }
+    let mut a = 0usize;
+    let mut p = 0usize;
+    let mut b = 0usize;
+    let mut br = 0usize;
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' => p += 1,
+            ')' => p = p.checked_sub(1)?,
+            '[' => b += 1,
+            ']' => b = b.checked_sub(1)?,
+            '{' => br += 1,
+            '}' => br = br.checked_sub(1)?,
+            '<' if p == 0 && b == 0 && br == 0 => a += 1,
+            '>' if p == 0 && b == 0 && br == 0 => {
+                a = a.checked_sub(1)?;
+                if a == 0 {
+                    return s.get(idx + 1..);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Returns `true` if `path_part` (the text before the trailing `<T>`) is a Rust `Type::Path`
+/// whose final segment is `Option` — supporting plain/qualified paths (`Option`,
+/// `core::option::Option`, `::std::option::Option`), generic intermediate segments
+/// (`Outer<T>::Option`), and qualified associated-type paths (`<Provider as Factory>::Option`),
+/// while rejecting non-path prefixes (`&Option`, `Box<Option<T>>`, `fn() -> Option`, `MyOption`).
+fn is_type_path_ending_in_option(path_part: &str) -> bool {
+    let path_part = path_part.strip_suffix("::").map_or(path_part, str::trim_end);
+    let mut rest = if path_part.starts_with('<') {
+        let Some(after_qself) = skip_balanced_angles(path_part) else {
+            return false;
+        };
+        let Some(after_sep) = after_qself.trim_start().strip_prefix("::") else {
+            return false;
+        };
+        after_sep.trim_start()
+    } else {
+        path_part.strip_prefix("::").unwrap_or(path_part).trim_start()
+    };
+    if rest.is_empty() {
+        return false;
+    }
+
+    loop {
+        let ident_start = rest;
+        let body = rest.strip_prefix("r#").unwrap_or(rest);
+        let mut chars = body.char_indices();
+        let Some((_, first)) = chars.next() else {
+            return false;
+        };
+        if !(first.is_ascii_alphabetic() || first == '_') {
+            return false;
+        }
+        let mut end = body.len();
+        for (idx, ch) in chars {
+            if !(ch.is_ascii_alphanumeric() || ch == '_') {
+                end = idx;
+                break;
+            }
+        }
+        let raw_prefix_len = ident_start.len() - body.len();
+        let Some(ident) = ident_start.get(..raw_prefix_len + end) else {
+            return false;
+        };
+        let Some(after_ident) = ident_start.get(raw_prefix_len + end..) else {
+            return false;
+        };
+        let after_ident = after_ident.trim_start();
+        if after_ident.is_empty() {
+            return ident == "Option";
+        }
+        if let Some(after_sep) = after_ident.strip_prefix("::") {
+            let after_sep = after_sep.trim_start();
+            if after_sep.starts_with('<') {
+                let Some(after_args) = skip_balanced_angles(after_sep) else {
+                    return false;
+                };
+                let Some(next) = after_args.trim_start().strip_prefix("::") else {
+                    return false;
+                };
+                rest = next.trim_start();
+            } else {
+                rest = after_sep;
+            }
+        } else if after_ident.starts_with('<') {
+            let Some(after_args) = skip_balanced_angles(after_ident) else {
+                return false;
+            };
+            let Some(next) = after_args.trim_start().strip_prefix("::") else {
+                return false;
+            };
+            rest = next.trim_start();
+        } else {
+            return false;
+        }
+        if rest.is_empty() {
+            return false;
+        }
+    }
+}
+
 /// If `ty` is a type path whose last segment is `Option<T>` with a single type argument
-/// (e.g. `Option<io::Error>`, `core::option::Option<E>`, `::std::option::Option<E>`),
-/// return the trimmed inner type `T`.
+/// (e.g. `Option<io::Error>`, `core::option::Option<E>`, `::std::option::Option<E>`,
+/// `<Provider as Factory>::Option<E>`), return the trimmed inner type `T`.
 ///
 /// Matches `thiserror_impl::expand::type_parameter_of_option`.
 fn option_inner_type(ty: &str) -> Option<&str> {
@@ -2331,6 +2442,7 @@ fn option_inner_type(ty: &str) -> Option<&str> {
     let mut angle_depth: usize = 0;
     let mut paren_depth: usize = 0;
     let mut bracket_depth: usize = 0;
+    let mut brace_depth: usize = 0;
     let mut open_idx = None;
     for (idx, ch) in without_close.char_indices().rev() {
         match ch {
@@ -2338,8 +2450,10 @@ fn option_inner_type(ty: &str) -> Option<&str> {
             '(' => paren_depth = paren_depth.checked_sub(1)?,
             ']' => bracket_depth += 1,
             '[' => bracket_depth = bracket_depth.checked_sub(1)?,
-            '>' if paren_depth == 0 && bracket_depth == 0 => angle_depth += 1,
-            '<' if paren_depth == 0 && bracket_depth == 0 => {
+            '}' => brace_depth += 1,
+            '{' => brace_depth = brace_depth.checked_sub(1)?,
+            '>' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => angle_depth += 1,
+            '<' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
                 if angle_depth == 0 {
                     open_idx = Some(idx);
                     break;
@@ -2352,28 +2466,7 @@ fn option_inner_type(ty: &str) -> Option<&str> {
     let open = open_idx?;
     let path_part = without_close.get(..open)?.trim();
     let inner = without_close.get(open + 1..)?.trim();
-    if inner.is_empty() {
-        return None;
-    }
-
-    // Verify `path_part` is a simple type path (optional leading `::`, identifier segments
-    // separated by `::`) whose final segment is `Option`.
-    // Rejects `&Option<T>`, `Box<Option<T>>`, `fn() -> Option<T>`, `MyOption<T>`, etc.
-    let path_body = path_part.strip_prefix("::").unwrap_or(path_part);
-    let mut last_seg = "";
-    for seg in path_body.split("::") {
-        let seg = seg.trim();
-        let mut chars = seg.chars();
-        let first = chars.next()?;
-        if !(first.is_ascii_alphabetic() || first == '_') {
-            return None;
-        }
-        if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-            return None;
-        }
-        last_seg = seg;
-    }
-    if last_seg != "Option" {
+    if inner.is_empty() || !is_type_path_ending_in_option(path_part) {
         return None;
     }
 
@@ -2386,19 +2479,22 @@ fn option_inner_type(ty: &str) -> Option<&str> {
     let mut a = 0usize;
     let mut p = 0usize;
     let mut b = 0usize;
+    let mut br = 0usize;
     for ch in inner.chars() {
         match ch {
-            '<' => a += 1,
-            '>' => a = a.checked_sub(1)?,
+            '<' if p == 0 && b == 0 && br == 0 => a += 1,
+            '>' if p == 0 && b == 0 && br == 0 => a = a.checked_sub(1)?,
             '(' => p += 1,
             ')' => p = p.checked_sub(1)?,
             '[' => b += 1,
             ']' => b = b.checked_sub(1)?,
-            ',' | '=' if a == 0 && p == 0 && b == 0 => return None,
+            '{' => br += 1,
+            '}' => br = br.checked_sub(1)?,
+            ',' | '=' if a == 0 && p == 0 && b == 0 && br == 0 => return None,
             _ => {}
         }
     }
-    if a != 0 || p != 0 || b != 0 {
+    if a != 0 || p != 0 || b != 0 || br != 0 {
         return None;
     }
     Some(inner)
@@ -2467,12 +2563,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                         return None;
                     }
                     let (from_ty, source_expr) = match option_inner_type(&f.ty) {
-                        Some(inner) => {
-                            if option_inner_type(inner).is_some() {
-                                return None;
-                            }
-                            (inner, "::core::option::Option::Some(__source)")
-                        }
+                        Some(inner) => (inner, "::core::option::Option::Some(__source)"),
                         None => (f.ty.as_str(), "__source"),
                     };
                     match v.shape {
@@ -2503,9 +2594,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
             }
             let source_field = explicit_source.or(implicit_source);
             if transparent && v.fields.len() == 1 {
-                if option_inner_type(&v.fields[0].ty).is_some()
-                    || v.fields[0].attrs.iter().any(|a| a.path == "source")
-                {
+                if v.fields[0].attrs.iter().any(|a| a.path == "source") {
                     return None;
                 }
                 let acc = match v.shape {
@@ -2523,10 +2612,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                     FieldsShape::Tuple => format!("&self.{idx}"),
                     FieldsShape::Unit => return None,
                 };
-                if let Some(inner) = option_inner_type(&f.ty) {
-                    if option_inner_type(inner).is_some() {
-                        return None;
-                    }
+                if option_inner_type(&f.ty).is_some() {
                     let _ = writeln!(
                         source_arms,
                         "        match ({acc}).as_ref() {{ ::core::option::Option::Some(__e) => ::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static)), ::core::option::Option::None => ::core::option::Option::None }}"
@@ -2571,12 +2657,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                             return None;
                         }
                         let (from_ty, source_expr) = match option_inner_type(&f.ty) {
-                            Some(inner) => {
-                                if option_inner_type(inner).is_some() {
-                                    return None;
-                                }
-                                (inner, "::core::option::Option::Some(__source)")
-                            }
+                            Some(inner) => (inner, "::core::option::Option::Some(__source)"),
                             None => (f.ty.as_str(), "__source"),
                         };
                         match v.shape {
@@ -2607,9 +2688,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                 }
                 let source_field = explicit_source.or(implicit_source);
                 if transparent && v.fields.len() == 1 {
-                    if option_inner_type(&v.fields[0].ty).is_some()
-                        || v.fields[0].attrs.iter().any(|a| a.path == "source")
-                    {
+                    if v.fields[0].attrs.iter().any(|a| a.path == "source") {
                         return None;
                     }
                     let _ = writeln!(
@@ -2617,10 +2696,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                         "            {pat} => ::core::error::Error::source(__f0),"
                     );
                 } else if let Some((idx, f)) = source_field {
-                    if let Some(inner) = option_inner_type(&f.ty) {
-                        if option_inner_type(inner).is_some() {
-                            return None;
-                        }
+                    if option_inner_type(&f.ty).is_some() {
                         let _ = writeln!(
                             source_arms,
                             "            {pat} => match __f{idx}.as_ref() {{ ::core::option::Option::Some(__e) => ::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static)), ::core::option::Option::None => ::core::option::Option::None }},"
@@ -3603,15 +3679,21 @@ mod tests {
             "explicit #[source] must beat later implicit `source` field:\n{exp_prec}"
         );
 
-        // 6. Helper unit checks for non-Option types and const/lifetime generic args.
+        // 6. Helper unit checks for non-Option types, qualified paths, braced macros, and const/lifetime args.
         assert_eq!(option_inner_type("Option <io::Error>"), Some("io::Error"));
         assert_eq!(option_inner_type("core::option::Option <Foo <A, B>>"), Some("Foo <A, B>"));
         assert_eq!(option_inner_type("::std::option::Option <E,>"), Some("E"));
         assert_eq!(option_inner_type("Option <&'static io::Error>"), Some("&'static io::Error"));
         assert_eq!(option_inner_type("Option <r#Error>"), Some("r#Error"));
+        assert_eq!(option_inner_type("<Provider as Factory>::Option <io::Error>"), Some("io::Error"));
+        assert_eq!(option_inner_type("<Foo <A, B> as Bar <C>>::sub::Option <E>"), Some("E"));
+        assert_eq!(option_inner_type("Outer <T>::Option <E>"), Some("E"));
+        assert_eq!(option_inner_type("Option <error_ty! {A, B}>"), Some("error_ty! {A, B}"));
+        assert_eq!(option_inner_type("Option <error_ty! {A = 1, B = 2}>"), Some("error_ty! {A = 1, B = 2}"));
         assert_eq!(option_inner_type("Box <Option <io::Error>>"), None);
         assert_eq!(option_inner_type("&Option <io::Error>"), None);
         assert_eq!(option_inner_type("MyOption <io::Error>"), None);
+        assert_eq!(option_inner_type("<Provider as Factory>::MyOption <io::Error>"), None);
         assert_eq!(option_inner_type("Option <A, B>"), None);
         assert_eq!(option_inner_type("fn() -> Option <io::Error>"), None);
         assert_eq!(option_inner_type("Option <3>"), None);
@@ -3724,16 +3806,47 @@ mod tests {
             "enum #[from] Option<E> must impl From<E> wrapping Some and unwrap source():\n{exp_from_enum}"
         );
 
-        // 8. Fallbacks to real `thiserror-impl`:
+        // 8. Transparent custom `Option`, nested `Option<Option<E>>`, qualified assoc `Option`,
+        //    and braced macro arg inside `Option<...>` all expand directly on the comptime path.
+        let trans_opt = r#"#[derive(Debug)] #[error(transparent)] pub struct TransOpt(Option<Leaf>);"#;
+        let exp_trans = expand_code("thiserror_impl", ProcKind::Derive, "Error", trans_opt)
+            .expect("#[error(transparent)] wrapping custom Option expands directly");
+        assert!(
+            exp_trans.contains("::core::error::Error::source(&self.0)"),
+            "transparent custom Option must delegate directly to Error::source(&self.0):\n{exp_trans}"
+        );
+
+        let nested_opt = r#"#[derive(Debug)] #[error("nested")] pub struct NestedOpt { #[source] source: Option<CustomOpt::Option<Leaf>> }"#;
+        let exp_nested = expand_code("thiserror_impl", ProcKind::Derive, "Error", nested_opt)
+            .expect("nested Option<CustomOpt::Option<Leaf>> expands directly");
+        assert!(
+            exp_nested.contains("match (&self.source).as_ref()"),
+            "nested Option must unwrap only outer Option layer:\n{exp_nested}"
+        );
+
+        let qpath_opt = r#"#[derive(Debug)] #[error("qpath")] pub struct QPathOpt { #[source] source: <Provider as Factory>::Option<std::io::Error> }"#;
+        let exp_qpath = expand_code("thiserror_impl", ProcKind::Derive, "Error", qpath_opt)
+            .expect("qualified associated-type Option expands directly");
+        assert!(
+            exp_qpath.contains("match (&self.source).as_ref()"),
+            "qualified associated-type Option must unwrap via .as_ref():\n{exp_qpath}"
+        );
+
+        let braced_macro_opt = r#"#[derive(Debug)] #[error("macro")] pub struct MacroOpt { #[source] source: Option<error_ty! { A, B }> }"#;
+        let exp_macro = expand_code("thiserror_impl", ProcKind::Derive, "Error", braced_macro_opt)
+            .expect("Option<error_ty! { A, B }> expands directly");
+        assert!(
+            exp_macro.contains("match (&self.source).as_ref()"),
+            "Option with braced macro arg must unwrap via .as_ref():\n{exp_macro}"
+        );
+
+        // 9. Fallbacks to real `thiserror-impl`:
         //    - `Option<Box<dyn Error>>` / `Option<&'static dyn Error>`
-        //    - `#[error(transparent)]` wrapping `Option<E>`
-        //    - nested `Option<Option<E>>` (for both `#[source]` and `#[from]`)
+        //    - `#[error(transparent)]` with invalid `#[source]`
         let fallbacks = [
             r#"#[derive(Debug)] #[error("dyn")] pub struct DynOpt { #[source] source: Option<Box<dyn std::error::Error + Send + Sync>> }"#,
             r#"#[derive(Debug)] #[error("dyn ref")] pub struct DynRefOpt { #[source] source: Option<&'static dyn std::error::Error> }"#,
-            r#"#[derive(Debug)] #[error(transparent)] pub struct TransOpt(Option<std::io::Error>);"#,
-            r#"#[derive(Debug)] #[error("nested")] pub struct NestedOpt { #[source] source: Option<Option<std::io::Error>> }"#,
-            r#"#[derive(Debug)] #[error("nested from")] pub struct NestedFromOpt { #[from] source: Option<Option<std::io::Error>> }"#,
+            r#"#[derive(Debug)] #[error(transparent)] pub struct TransWithSource(#[source] std::io::Error);"#,
         ];
         for src in fallbacks {
             assert!(
@@ -3941,6 +4054,30 @@ mod tests {
             ProcKind::Derive,
             "Error",
             r#"#[derive(Debug)] pub enum CustomOptEnum { #[error("custom opt")] Wrapped(#[source] Option<super::LeafErr>) }"#,
+        );
+        let custom_opt_transparent_impl = expand_raw(
+            "thiserror_impl",
+            ProcKind::Derive,
+            "Error",
+            r#"#[derive(Debug)] #[error(transparent)] pub struct TransCustomOpt(Option<super::LeafErr>);"#,
+        );
+        let nested_custom_opt_impl = expand_raw(
+            "thiserror_impl",
+            ProcKind::Derive,
+            "Error",
+            r#"#[derive(Debug)] #[error("nested custom")] pub struct NestedCustomOpt { #[source] source: ::core::option::Option<Option<super::LeafErr>> }"#,
+        );
+        let qpath_opt_impl = expand_raw(
+            "thiserror_impl",
+            ProcKind::Derive,
+            "Error",
+            r#"#[derive(Debug)] #[error("qpath")] pub struct QPathOptErr { #[source] source: <Provider as Factory>::Option<super::LeafErr> }"#,
+        );
+        let braced_macro_opt_impl = expand_raw(
+            "thiserror_impl",
+            ProcKind::Derive,
+            "Error",
+            r#"#[derive(Debug)] #[error("braced")] pub struct BracedMacroOptErr { #[source] source: Option<error_ty! { super::LeafErr, () }> }"#,
         );
 
         let strum_def = "pub enum Kind { FastPath, SlowFallback }";
@@ -4163,6 +4300,19 @@ mod custom_opt_shadow {{
     impl<T> Option<T> {{
         pub fn as_ref(&self) -> ::core::option::Option<&T> {{ self.0.as_ref() }}
     }}
+    impl<T: core::fmt::Display> core::fmt::Display for Option<T> {{
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {{
+            match &self.0 {{
+                ::core::option::Option::Some(v) => core::fmt::Display::fmt(v, f),
+                ::core::option::Option::None => f.write_str("empty"),
+            }}
+        }}
+    }}
+    impl<T: core::error::Error + 'static> core::error::Error for Option<T> {{
+        fn source(&self) -> ::core::option::Option<&(dyn core::error::Error + 'static)> {{
+            self.0.as_ref().map(|e| e as &(dyn core::error::Error + 'static))
+        }}
+    }}
     #[derive(Debug)]
     pub struct CustomOptErr {{
         pub source: Option<super::LeafErr>,
@@ -4173,6 +4323,36 @@ mod custom_opt_shadow {{
         Wrapped(Option<super::LeafErr>),
     }}
     {custom_opt_enum_impl}
+    #[derive(Debug)]
+    pub struct TransCustomOpt(pub Option<super::LeafErr>);
+    {custom_opt_transparent_impl}
+    #[derive(Debug)]
+    pub struct NestedCustomOpt {{
+        pub source: ::core::option::Option<Option<super::LeafErr>>,
+    }}
+    {nested_custom_opt_impl}
+}}
+mod qpath_and_macro_opt {{
+    pub trait Factory {{
+        type Option<T>;
+    }}
+    pub struct Provider;
+    impl Factory for Provider {{
+        type Option<T> = ::core::option::Option<T>;
+    }}
+    #[derive(Debug)]
+    pub struct QPathOptErr {{
+        pub source: <Provider as Factory>::Option<super::LeafErr>,
+    }}
+    {qpath_opt_impl}
+    macro_rules! error_ty {{
+        ($t:ty, $_ignored:ty) => {{ $t }};
+    }}
+    #[derive(Debug)]
+    pub struct BracedMacroOptErr {{
+        pub source: Option<error_ty! {{ super::LeafErr, () }}>,
+    }}
+    {braced_macro_opt_impl}
 }}
 {strum_def}
 {strum_as_ref}
@@ -4284,6 +4464,27 @@ fn main() {{
     assert!(std::error::Error::source(&cust_none).is_none());
     let cust_enum = custom_opt_shadow::CustomOptEnum::Wrapped(custom_opt_shadow::Option(Some(LeafErr)));
     assert_eq!(std::error::Error::source(&cust_enum).map(|s| s.to_string()).as_deref(), Some("leaf"));
+
+    let trans_cust = custom_opt_shadow::TransCustomOpt(custom_opt_shadow::Option(Some(LeafErr)));
+    assert_eq!(format!("{{trans_cust}}"), "leaf");
+    assert_eq!(std::error::Error::source(&trans_cust).map(|s| s.to_string()).as_deref(), Some("leaf"));
+
+    let nested_cust = custom_opt_shadow::NestedCustomOpt {{
+        source: Some(custom_opt_shadow::Option(Some(LeafErr))),
+    }};
+    assert_eq!(std::error::Error::source(&nested_cust).map(|s| s.to_string()).as_deref(), Some("leaf"));
+    let nested_cust_none = custom_opt_shadow::NestedCustomOpt {{ source: None }};
+    assert!(std::error::Error::source(&nested_cust_none).is_none());
+
+    let qp_some = qpath_and_macro_opt::QPathOptErr {{ source: Some(LeafErr) }};
+    assert_eq!(std::error::Error::source(&qp_some).map(|s| s.to_string()).as_deref(), Some("leaf"));
+    let qp_none = qpath_and_macro_opt::QPathOptErr {{ source: None }};
+    assert!(std::error::Error::source(&qp_none).is_none());
+
+    let bm_some = qpath_and_macro_opt::BracedMacroOptErr {{ source: Some(LeafErr) }};
+    assert_eq!(std::error::Error::source(&bm_some).map(|s| s.to_string()).as_deref(), Some("leaf"));
+    let bm_none = qpath_and_macro_opt::BracedMacroOptErr {{ source: None }};
+    assert!(std::error::Error::source(&bm_none).is_none());
 
     let k = Kind::FastPath;
     assert_eq!(k.as_ref(), "fast-path");
