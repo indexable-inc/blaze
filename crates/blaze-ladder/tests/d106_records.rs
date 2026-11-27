@@ -3360,3 +3360,109 @@ fn a_closure_behind_nested_opaques_checks_its_owner_on_demand_over_names_records
     assert_eq!(status, 42, "nested opaque closure returns 40 + 2 = 42");
     println!("d106 closure behind nested opaques over names records: first {first}; again {again}; status {status}");
 }
+
+/// Covers three Stage-2 self-hosting language forms together:
+/// 1. `if let` guard on an arm whose or-pattern binds (`(a, _) | (_, a) if let Opt::Some(v) = ...`),
+///    testing backtracking from alternative 1 to alternative 2 when the `if let` guard misses;
+/// 2. `if let` match guard whose scrutinee produces a drop-needing temporary (`Wrap`), dropping it
+///    on both guard-miss and guard-hit paths;
+/// 3. Qualified path `<M>::I::val()` with two segments after `<M>` (Cranelift's `<M>::I::rc_for_type`).
+const MATCH_LET_GUARDS_AND_QPATH: &str = "
+#[lang = \"drop\"]
+trait Drop {
+    fn drop(&mut self);
+}
+
+#[lang = \"drop_in_place\"]
+unsafe fn drop_in_place<T: ?Sized>(_to_drop: *mut T) {}
+
+enum Opt<T> {
+    None,
+    Some(T),
+}
+
+struct Wrap {
+    v: u32,
+    drops: *mut u32,
+}
+
+impl Drop for Wrap {
+    fn drop(&mut self) {
+        unsafe { *self.drops += 1; }
+    }
+}
+
+fn check_even(x: u32) -> Opt<u32> {
+    if x == 2 { Opt::Some(x + 10) } else { Opt::None }
+}
+
+fn wrap_opt(x: u32, drops: *mut u32) -> Opt<Wrap> {
+    if x == 1 { Opt::None } else { Opt::Some(Wrap { v: x, drops }) }
+}
+
+trait Inner {
+    fn val() -> u32;
+}
+
+trait Outer {
+    type I: Inner;
+}
+
+struct MyInner;
+impl Inner for MyInner {
+    fn val() -> u32 { 10 }
+}
+
+struct MyOuter;
+impl Outer for MyOuter {
+    type I = MyInner;
+}
+
+fn read_qpath<M: Outer>() -> u32 {
+    <M>::I::val()
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    // 1. Or-pattern binding + `if let` guard backtracks from (a=1) to (a=2) => 12.
+    let r1 = match (1u32, 2u32) {
+        (a, _) | (_, a) if let Opt::Some(v) = check_even(a) => v,
+        _ => 0,
+    };
+    // 2. `if let` guard with drop-needing scrutinee temporary: arm 1 misses (drops 0), arm 2 hits (drops 1, v=19).
+    let mut drops = 0u32;
+    let r2 = match 1u32 {
+        x if let Opt::Some(w) = wrap_opt(x, &mut drops as *mut u32) => w.v,
+        x if let Opt::Some(w) = wrap_opt(x + 18, &mut drops as *mut u32) => w.v,
+        _ => 0,
+    };
+    // 3. Qualified path `<M>::I::val()` => 10.
+    let r3 = read_qpath::<MyOuter>();
+    // 12 + 19 + 10 + drops(1) == 42
+    (r1 + r2 + r3 + drops) as i32
+}
+";
+
+#[test]
+fn or_pattern_if_let_guard_drop_temp_and_two_segment_qpath_work_over_names_records() {
+    let text = format!("{BLOCK_MOD_PRELUDE}{MATCH_LET_GUARDS_AND_QPATH}");
+    let f = fixture(&text);
+    let entry = fn_named(&f, "main");
+    let b = builder();
+    let mut store = MemoryStore::new_in(alloc());
+    let (first, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert!(first.reached > 0 && first.made == first.reached && first.found == 0, "every instance reached is made: {first}");
+    let (again, _) = walk_keeping(&f, &EveryItem, entry, &mut store, &b);
+    assert_eq!(
+        (again.reached, again.found, again.make_calls()),
+        (first.reached, first.reached, 0),
+        "a second walk finds every instance: {again}; first moved: {:?}",
+        again.first_moved
+    );
+    // For eager `run_whole`, mention `MyInner::val` in an untaken branch so eager reachability tables it,
+    // while the real call still goes through `read_qpath::<MyOuter>()` -> `<M>::I::val()`.
+    let runnable = text.replace("let r3 = read_qpath::<MyOuter>();", "if false { let _ = MyInner::val(); }\n    let r3 = read_qpath::<MyOuter>();");
+    let status = run_whole(&runnable);
+    assert_eq!(status, 42, "or-pattern if-let guard (12) + drop-temp guard (19) + qpath (10) + drops (1) = 42");
+    println!("d106 match if-let guards + qpath: first {first}; again {again}; status {status}");
+}
