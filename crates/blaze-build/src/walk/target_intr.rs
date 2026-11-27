@@ -64,6 +64,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             Target::Sha3(call) => self.sha3_intrinsic(e, list, t, call),
             Target::Sha2(f) => self.sha2_intrinsic(e, list, t, f),
             Target::Crc32(f) => self.crc32_intrinsic(e, list, t, f),
+            Target::Pmull(f) => self.pmull_intrinsic(e, list, t, f),
             Target::Wasm64MemoryGrow => {
                 let &[mem_arg, pages_arg] = list else {
                     return Err(BuildError::Target { target: t, expr: Some(e), why: "llvm.wasm.memory.grow.i64 expects (u32, usize)" });
@@ -349,6 +350,73 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let data = self.scalar(data_v, want_data)?;
         let res = intrinsics::target::crc32::build(&mut self.b, f, crc, data);
         self.push_val(V::Scalar(res), None);
+        Ok(())
+    }
+
+    /// AArch64 NEON polynomial multiply-long call `e` (`t` is `Target::Pmull(f)`):
+    /// - `Pmull64`: `(a: u64, b: u64) -> int8x16_t` (16-byte result, little-endian `[lo, hi]`).
+    /// - `PmullV8I16`: `(a: poly8x8_t, b: poly8x8_t) -> poly16x8_t` (8 lanes of `u8 x u8 -> u16`).
+    fn pmull_intrinsic(&mut self, e: ExprId, list: &[ExprId], t: Target, f: intrinsics::target::pmull::PmullFn) -> Result<(), BuildError> {
+        use intrinsics::target::pmull::PmullFn;
+
+        let &[lhs_arg, rhs_arg] = list else {
+            return Err(BuildError::Target { target: t, expr: Some(e), why: "a PMULL call with other than two operands" });
+        };
+        let base = self.vals.len().checked_sub(2).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
+        let lhs_v = self.vals[base];
+        let rhs_v = self.vals[base + 1];
+        self.truncate_vals(base);
+        if !self.live {
+            self.push_val(V::None, None);
+            return Ok(());
+        }
+        let lhs_ty = self.adjusted_ty(lhs_arg)?;
+        let rhs_ty = self.adjusted_ty(rhs_arg)?;
+        let lhs_repr = self.repr_at(lhs_arg, lhs_ty)?;
+        let rhs_repr = self.repr_at(rhs_arg, rhs_ty)?;
+        let rt = self.expr_ty(e)?;
+        let rrepr = self.repr_at(e, rt)?;
+        let Repr::Agg(_) = rrepr else {
+            return Err(BuildError::Target { target: t, expr: Some(e), why: "PMULL result is not a 16-byte vector" });
+        };
+        let (rsize, ralign) = self.size_align(rrepr);
+        if rsize != 16 {
+            return Err(BuildError::Target { target: t, expr: Some(e), why: "PMULL result size is not 16 bytes" });
+        }
+        let to = self.temp(rrepr);
+        match f {
+            PmullFn::Pmull64 => {
+                if lhs_repr.scalar() != Some(Ty::I64) || rhs_repr.scalar() != Some(Ty::I64) {
+                    return Err(BuildError::Target { target: t, expr: Some(e), why: "pmull64 operand types are not u64" });
+                }
+                let lhs = self.scalar(lhs_v, Ty::I64)?;
+                let rhs = self.scalar(rhs_v, Ty::I64)?;
+                let (lo, hi) = intrinsics::target::pmull::build_pmull64(&mut self.b, lhs, rhs);
+                let align8 = ralign.min(8);
+                self.b.store(Flags::NONE, lo, to.0, to.1, MemAttrs::aligned(align8));
+                self.b.store(Flags::NONE, hi, to.0, to.1 + 8, MemAttrs::aligned(align8));
+            }
+            PmullFn::PmullV8I16 => {
+                let (Repr::Agg(_), Repr::Agg(_)) = (lhs_repr, rhs_repr) else {
+                    return Err(BuildError::Target { target: t, expr: Some(e), why: "pmull.v8i16 operands are not 8-byte vectors" });
+                };
+                let (lsize, _) = self.size_align(lhs_repr);
+                let (r_in_size, _) = self.size_align(rhs_repr);
+                if lsize != 8 || r_in_size != 8 {
+                    return Err(BuildError::Target { target: t, expr: Some(e), why: "pmull.v8i16 operand size is not 8 bytes" });
+                }
+                let (lp, loff) = self.place(lhs_v, lhs_repr)?;
+                let (rp, roff) = self.place(rhs_v, rhs_repr)?;
+                let align2 = ralign.min(2);
+                for lane in 0i32..8 {
+                    let lb = self.b.load(Ty::I8, Flags::NONE, lp, loff + lane, MemAttrs::aligned(1));
+                    let rb = self.b.load(Ty::I8, Flags::NONE, rp, roff + lane, MemAttrs::aligned(1));
+                    let prod = intrinsics::target::pmull::build_pmull8(&mut self.b, lb, rb);
+                    self.b.store(Flags::NONE, prod, to.0, to.1 + lane * 2, MemAttrs::aligned(align2));
+                }
+            }
+        }
+        self.push_val(V::Place(to.0, to.1), None);
         Ok(())
     }
 

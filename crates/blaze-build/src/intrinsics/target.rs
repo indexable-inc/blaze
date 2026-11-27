@@ -38,6 +38,7 @@ mod float_tests;
 pub mod neon;
 #[cfg(test)]
 mod neon_tests;
+pub mod pmull;
 pub mod sha2;
 #[cfg(test)]
 mod sha2_tests;
@@ -71,6 +72,9 @@ pub enum Target {
     /// `llvm.aarch64.crc32{b,h,w,x}` and `llvm.aarch64.crc32c{b,h,w,x}` of target/crc32.rs:
     /// branchless LIR scalar operations, no `target_intrinsic`.
     Crc32(crc32::Crc32Fn),
+    /// `llvm.aarch64.neon.pmull64` and `llvm.aarch64.neon.pmull.v8i16` of target/pmull.rs:
+    /// branchless LIR scalar operations, no `target_intrinsic`.
+    Pmull(pmull::PmullFn),
     /// `llvm.aarch64.isb`: instruction synchronization barrier, `isb #imm`.
     Aarch64Isb,
     /// `llvm.aarch64.dmb`: data memory barrier, `dmb #imm`.
@@ -147,6 +151,9 @@ pub fn named(link_name: &str) -> Result<Target, UnknownTarget> {
     if let Some(f) = crc32::named(link_name) {
         return Ok(Target::Crc32(f));
     }
+    if let Some(f) = pmull::named(link_name) {
+        return Ok(Target::Pmull(f));
+    }
     if link_name == "llvm.wasm.memory.grow.i64" {
         return Ok(Target::Wasm64MemoryGrow);
     }
@@ -171,6 +178,7 @@ impl Target {
             Target::Sha3(call) => call.link_name(),
             Target::Sha2(f) => f.link_name(),
             Target::Crc32(f) => f.link_name(),
+            Target::Pmull(f) => f.link_name(),
         }
     }
 }
@@ -193,8 +201,8 @@ pub fn build<A: Allocator + Clone>(b: &mut Builder<A, Full>, t: Target, imm: Val
         Target::Sha3(_) => {
             return Err(BuildError::Target { target: t, expr: None, why: "a SHA3 function built as a barrier (a build bug)" });
         }
-        Target::Sha2(_) | Target::Crc32(_) => {
-            return Err(BuildError::Target { target: t, expr: None, why: "a SHA-2 function built as a barrier (a build bug)" });
+        Target::Sha2(_) | Target::Crc32(_) | Target::Pmull(_) => {
+            return Err(BuildError::Target { target: t, expr: None, why: "a crypto/CRC/PMULL function built as a barrier (a build bug)" });
         }
         Target::Wasm64MemoryGrow | Target::Wasm64MemorySize => {
             return Err(BuildError::Target { target: t, expr: None, why: "a wasm64 memory intrinsic built as a barrier (a build bug)" });
