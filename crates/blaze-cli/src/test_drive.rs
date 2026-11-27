@@ -152,6 +152,9 @@ pub(crate) enum DriveError {
     CodeWorkers(bstd::task::TaskError),
     /// The CAS store refused reading or writing incremental test cache records.
     CacheStore { what: &'static str, why: crate::test_cache::CacheError },
+    /// The command received a termination signal (SIGINT/SIGTERM), stopped only the already-running
+    /// children, and exited without starting remaining tests.
+    Interrupted { stopped: u32 },
 }
 
 impl fmt::Display for DriveError {
@@ -174,6 +177,7 @@ impl fmt::Display for DriveError {
             DriveError::Relay(error) => write!(f, "blaze test: {error}"),
             DriveError::CodeWorkers(error) => write!(f, "blaze test: the command's code workers (D194): {error}"),
             DriveError::CacheStore { what, why } => write!(f, "blaze test: {what}: {why}"),
+            DriveError::Interrupted { stopped } => write!(f, "blaze test: stopped by termination signal ({stopped} running test(s) stopped; remaining tests not started)"),
         }
     }
 }
@@ -725,6 +729,10 @@ fn drive_pending<'a, 'r, 'm, 'z, Z: Zygotes, D: blaze_core::Driver>(
 ) -> Result<Status, DriveError> {
     let mut effects: AVec<'a, Effect<'a>> = Vec::new_in(alloc);
     for _ in 0..steps_left {
+        if runner.terminated()? {
+            let stopped = runner.abort()?;
+            return Err(DriveError::Interrupted { stopped });
+        }
         core::mem::swap(&mut out, &mut effects);
         let mut done = None;
         for effect in effects.drain(..) {
@@ -735,18 +743,24 @@ fn drive_pending<'a, 'r, 'm, 'z, Z: Zygotes, D: blaze_core::Driver>(
                     let found = cache.look(*suite, *test)?;
                     machine.step(Event::Looked { test: *test, found }, runner.zygotes().now(), &mut out)?;
                 }
-                Effect::Run { test, row, .. } => match refuse.refusal(*row).map_err(DriveError::One)? {
-                    Some(why) => {
-                        let mut line = String::new_in(alloc);
-                        writeln!(line, "blaze test: {why}").map_err(|_| DriveError::Print)?;
-                        machine.row_detail(*row, line.into_bytes());
-                        machine.step(Event::CannotRun { test: *test, why: CannotRun::EntryRefused }, runner.zygotes().now(), &mut out)?;
+                Effect::Run { test, row, .. } => {
+                    if runner.terminated()? {
+                        let stopped = runner.abort()?;
+                        return Err(DriveError::Interrupted { stopped });
                     }
-                    None => {
-                        on_run(*row, cache);
-                        runner.effect(&effect)?;
+                    match refuse.refusal(*row).map_err(DriveError::One)? {
+                        Some(why) => {
+                            let mut line = String::new_in(alloc);
+                            writeln!(line, "blaze test: {why}").map_err(|_| DriveError::Print)?;
+                            machine.row_detail(*row, line.into_bytes());
+                            machine.step(Event::CannotRun { test: *test, why: CannotRun::EntryRefused }, runner.zygotes().now(), &mut out)?;
+                        }
+                        None => {
+                            on_run(*row, cache);
+                            runner.effect(&effect)?;
+                        }
                     }
-                },
+                }
                 Effect::Kill { .. } => runner.effect(&effect)?,
                 Effect::File { suite, test, address, slot, bytes } => cache.file(*suite, *test, *address, *slot, bytes.as_slice())?,
                 Effect::Flaky { suite, finding } => cache.flaky(*suite, finding.flaky.test)?,
@@ -768,6 +782,10 @@ fn drive_pending<'a, 'r, 'm, 'z, Z: Zygotes, D: blaze_core::Driver>(
         }
         let mut answers = CacheAnswers { cache, sink: entered_sink };
         runner.step(machine, &mut answers, &mut out)?;
+        if runner.terminated()? {
+            let stopped = runner.abort()?;
+            return Err(DriveError::Interrupted { stopped });
+        }
     }
     Err(DriveError::Steps { most })
 }
@@ -930,7 +948,42 @@ impl Signals {
         self.host_nanos.set(Some(cur.saturating_add(add)));
     }
 
+    fn is_terminated(&self) -> bool {
+        self.terminate.get()
+    }
+
+    /// Checks whether a termination signal was observed on an already-armed [`Held`] handle (or
+    /// latched via [`Self::terminate`]), without installing process-wide signal handlers.
+    fn poll_terminated(&self, now: Duration) -> bool {
+        if self.terminate.get() {
+            return true;
+        }
+        if let Some(held) = self.held.borrow_mut().as_mut()
+            && held.take_terminate(now)
+        {
+            self.terminate.set(true);
+        }
+        self.terminate.get()
+    }
+
+    /// Installs the process-wide termination signal handler once for a real `blaze test` run.
+    fn arm(&self) -> Result<(), OneError> {
+        let mut slot = self.held.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(Held::hold().map_err(OneError::Signals)?);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_terminated_for_test(&self) {
+        self.terminate.set(true);
+    }
+
     fn terminate(&self, now: Duration) -> Result<bool, OneError> {
+        if self.terminate.get() {
+            return Ok(true);
+        }
         let mut slot = self.held.borrow_mut();
         let held = match &mut *slot {
             Some(held) => held,
@@ -1041,7 +1094,9 @@ impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
                 0
             };
             let was_started = current.started;
+            let was_parked = current.parked_now;
             let is_started = self.signals.started.get();
+            let is_parked = self.signals.parked_now.get();
             current.started = is_started;
             if !was_started && is_started {
                 // Align `Runner`'s `answer_due` (counted from `asked`) with `run_captured`'s
@@ -1051,11 +1106,14 @@ impl<'b, R: RunOne, C: Fn() -> Nanos> OneEach<'b, R, C> {
             } else if stall > 0 {
                 if !was_started {
                     current.pre_start = Nanos(current.pre_start.0.saturating_add(stall));
-                } else {
+                } else if !(was_parked && is_parked) {
+                    // When `current` remained parked for the entire turn, its own `open_park`
+                    // already covers this turn's wall time; skip `current.stalled` to avoid
+                    // double-counting while still crediting all sibling children below.
                     current.stalled = Nanos(current.stalled.0.saturating_add(stall));
                 }
             }
-            current.parked_now = self.signals.parked_now.get();
+            current.parked_now = is_parked;
             current.parked = current.parked.max(Nanos(self.signals.parked.get()));
             let row = current.row;
             if self.longest.is_none_or(|longest| nanos > longest.nanos) {
@@ -1159,6 +1217,9 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
         let mut swept = false;
         let mut crossed_until = false;
         while self.batch.is_empty() && (!swept || (self.now)() < until) {
+            if self.terminated()? {
+                break;
+            }
             let before_sweep = (self.now)();
             let left = Duration::from_nanos(until.0.saturating_sub(before_sweep.0));
             self.signals.wait.set(interval.min(left));
@@ -1201,6 +1262,9 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
             }
             self.sweep(&mut context)?;
             swept = true;
+            if self.terminated()? {
+                break;
+            }
             crossed_until = before_sweep < until && (self.now)() >= until;
             interval = if self.signals.progress.get() {
                 Duration::ZERO
@@ -1211,7 +1275,7 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
         // If `until` was crossed mid-sweep, give every remaining child one non-blocking poll so
         // earlier-indexed children can report ready exits, enforce their own timeout, or refresh
         // their parked credit before `Runner::watch` checks for silence.
-        if crossed_until && !self.running.is_empty() {
+        if crossed_until && !self.running.is_empty() && !self.terminated()? {
             self.signals.wait.set(Duration::ZERO);
             self.sweep(&mut context)?;
         }
@@ -1254,6 +1318,10 @@ impl<R: RunOne, C: Fn() -> Nanos> Zygotes for OneEach<'_, R, C> {
         self.running.iter().find(|running| running.row == row).map_or(Nanos(0), |running| {
             Nanos(running.pre_start.0.saturating_add(running.parked.0).saturating_add(running.stalled.0))
         })
+    }
+
+    fn terminated(&mut self) -> Result<bool, RunError> {
+        Ok(self.signals.poll_terminated(Duration::from_nanos((self.now)().0)))
     }
 }
 
@@ -1649,6 +1717,105 @@ mod pool_tests {
         let stopped = drive_one_each(pool, 1, BUDGET, 1).expect_err("silent child must trip ZygoteSilent");
         assert!(matches!(stopped, RunError::ZygoteSilent { row: 0, .. }), "expected ZygoteSilent, got {stopped:?}");
         assert_eq!(silent.observed_stall.get(), 0, "idle Doing::Relaying must never credit stall time");
+    }
+
+    /// Verifies that host command-thread work (`Doing::Serving` for `code.pump` / `code.answer`)
+    /// performed while a child is parked credits sibling children without double-counting into
+    /// the still-parked child's `stalled`, and credits the child itself once it unparks.
+    #[test]
+    fn parked_child_host_work_credits_siblings_without_double_counting_self() {
+        const BUDGET: Nanos = Nanos(2_000_000_000);
+        const PUMP_NS: u64 = 2_000_000_000;
+        const ANSWER_NS: u64 = 3_000_000_000;
+
+        struct ParkedHostWork<'t> {
+            tick: &'t Cell<u64>,
+            parked_stalled_while_parked: Cell<u64>,
+            parked_stalled_after_unpark: Cell<u64>,
+            sibling_stalled: Cell<u64>,
+        }
+
+        impl RunOne for ParkedHostWork<'_> {
+            async fn run(&self, row: u32, _budget: Nanos, _: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
+                signals.started.set(true);
+                next_turn().await;
+                if row == 0 {
+                    // Turn 1: park waiting on a code worker.
+                    signals.begin(Doing::Relaying);
+                    let park_since = self.tick.get();
+                    signals.parked_now.set(true);
+                    next_turn().await;
+
+                    // Turn 2: stay parked while running `code.pump` for PUMP_NS (`was_parked && is_parked`).
+                    signals.begin(Doing::Serving);
+                    self.tick.set(self.tick.get().saturating_add(PUMP_NS));
+                    signals.add_host_nanos(Duration::from_nanos(PUMP_NS));
+                    signals.parked.set(self.tick.get().saturating_sub(park_since));
+                    signals.parked_now.set(true);
+                    next_turn().await;
+
+                    // Turn 3: `stalled` must NOT have double-counted PUMP_NS while still parked.
+                    self.parked_stalled_while_parked.set(signals.stalled.get());
+                    // Unpark and perform ANSWER_NS of `code.answer` (`finish_in_flight`) host work.
+                    signals.begin(Doing::Serving);
+                    signals.parked_now.set(false);
+                    self.tick.set(self.tick.get().saturating_add(ANSWER_NS));
+                    signals.add_host_nanos(Duration::from_nanos(ANSWER_NS));
+                    next_turn().await;
+
+                    // Turn 4: after unparking, `stalled` must credit ANSWER_NS.
+                    self.parked_stalled_after_unpark.set(signals.stalled.get());
+                    return Ok(RunOutcome {
+                        how: How::Reported(Said::Returned),
+                        keep: Err(NotKept::Untraced),
+                        panic_text: String::new_in(blaze_own::testing::heap().alloc()),
+                        entered: Vec::new_in(blaze_own::testing::heap().alloc()),
+                    });
+                }
+
+                // Row 1: stays running across row 0's pump and answer turns; must receive BOTH credits.
+                for _ in 0..4 {
+                    signals.begin(Doing::Relaying);
+                    next_turn().await;
+                }
+                self.sibling_stalled.set(signals.stalled.get());
+                Ok(RunOutcome {
+                    how: How::Reported(Said::Returned),
+                    keep: Err(NotKept::Untraced),
+                    panic_text: String::new_in(blaze_own::testing::heap().alloc()),
+                    entered: Vec::new_in(blaze_own::testing::heap().alloc()),
+                })
+            }
+        }
+
+        let heap = blaze_own::testing::heap().alloc();
+        let signals = Signals::default();
+        let tick = Cell::new(0u64);
+        let children = ParkedHostWork {
+            tick: &tick,
+            parked_stalled_while_parked: Cell::new(u64::MAX),
+            parked_stalled_after_unpark: Cell::new(0),
+            sibling_stalled: Cell::new(0),
+        };
+        let clock = || Nanos(tick.get());
+        let pool = OneEach::new(&children, &signals, clock, heap, heap).expect("process heap");
+        let (status, text) = drive_one_each(pool, 2, BUDGET, 2).expect("both children must pass without ZygoteSilent");
+        assert_eq!((status.passed, status.failed), (2, 0), "{text}");
+        assert_eq!(
+            children.parked_stalled_while_parked.get(),
+            0,
+            "still-parked child must not double-count PUMP_NS into stalled while open_park covers it"
+        );
+        assert_eq!(
+            children.parked_stalled_after_unpark.get(),
+            ANSWER_NS,
+            "unparking child must be credited with its code.answer host work"
+        );
+        assert_eq!(
+            children.sibling_stalled.get(),
+            PUMP_NS + ANSWER_NS,
+            "sibling must be credited with both PUMP_NS and ANSWER_NS host work"
+        );
     }
 }
 
@@ -3382,27 +3549,32 @@ impl<'c> Launched<'c, '_, '_> {
             next_turn().await;
             let _span = cx.span("blaze test: service one child's pipes, requests and deadline");
             signals.begin(Doing::Relaying);
-            let now = run.now();
-            let open_park = parked_guard.parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since));
+            let before_pump = run.now();
+            let mut pump_credited = false;
             if let Some(code) = self.codes {
-                let pumping = run.now();
-                if code.pump()? {
+                let drained = code.pump()?;
+                let pumped = run.now().saturating_sub(before_pump);
+                if drained {
                     signals.progress.set(true);
                 }
-                let pumped = run.now().saturating_sub(pumping);
-                if pumped >= DRAIN_EVERY {
+                if drained || pumped >= DRAIN_EVERY {
                     signals.begin(Doing::Serving);
                     signals.add_host_nanos(pumped);
+                    pump_credited = true;
                 }
                 // The runner's watch moves its answer's due by it (test_run.rs `answer_due`).
+                let open_park = parked_guard.parked.map_or(Duration::ZERO, |park| before_pump.saturating_sub(park.since));
                 signals.parked.set(u64::try_from(parked_for.saturating_add(open_park).as_nanos()).unwrap_or(u64::MAX));
                 signals.parked_now.set(parked_guard.parked.is_some());
             }
             if let (Some(park), Some(code)) = (parked_guard.parked, self.codes) {
                 if park.peer {
                     let done = !self.suite_cache.borrow().is_in_flight(park.row, park.epoch);
+                    let checked_at = run.now();
+                    let open_park = checked_at.saturating_sub(park.since);
                     if done {
-                        parked_for = parked_for.saturating_add(open_park);
+                        let park_end = if pump_credited { before_pump } else { checked_at };
+                        parked_for = parked_for.saturating_add(park_end.saturating_sub(park.since));
                         parked_guard.parked = None;
                         signals.parked.set(u64::try_from(parked_for.as_nanos()).unwrap_or(u64::MAX));
                         signals.parked_now.set(false);
@@ -3417,6 +3589,7 @@ impl<'c> Launched<'c, '_, '_> {
                         return Err(OneError::CodeLate { instance, symbol: park.symbol, waited });
                     }
                 } else {
+                    let answering = run.now();
                     let came = code.answer(child, |producer, reply| {
                         let cross_suite = producer.is_some_and(|suite| suite != self.suite);
                         match reply {
@@ -3462,13 +3635,18 @@ impl<'c> Launched<'c, '_, '_> {
                         }
                     })?;
                     if let Some(came) = came {
-                        parked_for = parked_for.saturating_add(open_park);
+                        let park_end = if pump_credited { before_pump } else { answering };
+                        parked_for = parked_for.saturating_add(park_end.saturating_sub(park.since));
                         parked_guard.parked = None;
                         signals.parked.set(u64::try_from(parked_for.as_nanos()).unwrap_or(u64::MAX));
                         signals.parked_now.set(false);
                         signals.progress.set(true);
                         match came {
                             Came::Made => {
+                                let elapsed = run.now().saturating_sub(answering);
+                                service_time += elapsed;
+                                signals.begin(Doing::Serving);
+                                signals.add_host_nanos(elapsed);
                                 again = true;
                             }
                             Came::RetrySuitePrivate => {
@@ -3478,11 +3656,20 @@ impl<'c> Launched<'c, '_, '_> {
                                     .begin_suite_private_retry(self.suite, park.row, park.epoch, code.alloc);
                                 match decision {
                                     RetryDecision::AlreadyDone => {
+                                        let elapsed = run.now().saturating_sub(answering);
+                                        service_time += elapsed;
+                                        signals.begin(Doing::Serving);
+                                        signals.add_host_nanos(elapsed);
                                         again = true;
                                     }
                                     RetryDecision::WaitPeer => {
+                                        let repark_at = run.now();
+                                        let elapsed = repark_at.saturating_sub(answering);
+                                        service_time += elapsed;
+                                        signals.begin(Doing::Serving);
+                                        signals.add_host_nanos(elapsed);
                                         parked_guard.parked = Some(Parked {
-                                            since: run.now(),
+                                            since: repark_at,
                                             symbol: park.symbol,
                                             row: park.row,
                                             epoch: park.epoch,
@@ -3497,8 +3684,13 @@ impl<'c> Launched<'c, '_, '_> {
                                             stop_child(run).map_err(child_error)?;
                                             return Err(error);
                                         }
+                                        let repark_at = run.now();
+                                        let elapsed = repark_at.saturating_sub(answering);
+                                        service_time += elapsed;
+                                        signals.begin(Doing::Serving);
+                                        signals.add_host_nanos(elapsed);
                                         parked_guard.parked = Some(Parked {
-                                            since: run.now(),
+                                            since: repark_at,
                                             symbol: park.symbol,
                                             row: park.row,
                                             epoch: park.epoch,
@@ -3526,6 +3718,7 @@ impl<'c> Launched<'c, '_, '_> {
                     }
                 }
             }
+            let now = run.now();
             let total_parked = parked_for.saturating_add(parked_guard.parked.map_or(Duration::ZERO, |park| now.saturating_sub(park.since)));
             let until = current_until(started_at, allowance, total_parked, signals);
             if until.passed(now) {
@@ -3705,9 +3898,6 @@ impl<'c> Launched<'c, '_, '_> {
                             });
                         }
                         Some(ChildAnswer::Waiting(need)) => {
-                            let elapsed = run.now().saturating_sub(serving);
-                            service_time += elapsed;
-                            signals.add_host_nanos(elapsed);
                             match need {
                                 NeedCode::Ask(ask) => {
                                     let asked = match self.codes {
@@ -3717,13 +3907,17 @@ impl<'c> Launched<'c, '_, '_> {
                                         }
                                         None => Err(OneError::Parent(ParentError::NotReady { symbol: ask.symbol })),
                                     };
+                                    let park_at = run.now();
+                                    let elapsed = park_at.saturating_sub(serving);
+                                    service_time += elapsed;
+                                    signals.add_host_nanos(elapsed);
                                     if let Err(error) = asked {
                                         self.suite_cache.borrow_mut().release_in_flight(ask.row, ask.epoch, false);
                                         stop_child(run).map_err(child_error)?;
                                         return Err(error);
                                     }
                                     parked_guard.parked = Some(Parked {
-                                        since: run.now(),
+                                        since: park_at,
                                         symbol: ask.symbol,
                                         row: ask.row,
                                         epoch: ask.epoch,
@@ -3733,8 +3927,12 @@ impl<'c> Launched<'c, '_, '_> {
                                     signals.parked_now.set(true);
                                 }
                                 NeedCode::WaitPeer { row: wait_row, epoch, symbol } => {
+                                    let park_at = run.now();
+                                    let elapsed = park_at.saturating_sub(serving);
+                                    service_time += elapsed;
+                                    signals.add_host_nanos(elapsed);
                                     parked_guard.parked = Some(Parked {
-                                        since: run.now(),
+                                        since: park_at,
                                         symbol,
                                         row: wait_row,
                                         epoch,
@@ -4190,8 +4388,12 @@ fn flush_reply<A: core::alloc::Allocator>(
         *write_since = None;
         return Ok(FlushOut::Done);
     }
+    let flushing = run.now();
     match run.send_some(pending, Deadline::PASSED) {
         Ok(ChannelWrite::Bytes(n)) if n > 0 => {
+            let flushed = run.now().saturating_sub(flushing);
+            signals.begin(Doing::Serving);
+            signals.add_host_nanos(flushed);
             *reply_at += n;
             signals.progress.set(true);
             if *reply_at >= reply.len() {
@@ -5060,6 +5262,7 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     let launched = Selected { suites: launches.as_mut_slice(), rows: locations };
     let mut refuse = Selected { suites: checks.as_mut_slice(), rows: locations };
     let signals = Signals::default();
+    signals.arm().map_err(one)?;
     let zygotes = OneEach::new(&launched, &signals, now, alloc, tables)?;
     let mut runner = Runner::new(zygotes, &config.plan, TestHost::THIS, alloc);
     let mut verified_loaded: AVec<'_, bool> = Vec::with_capacity_in(suites.len(), alloc);
@@ -5912,5 +6115,131 @@ mod zero_spawn_tests {
         assert_eq!(cache.borrow_mut().take(9), Some(42));
         assert!(!cache.borrow().contains(9));
         assert_eq!(cache.borrow_mut().take(9), None);
+    }
+
+    /// Regression for the `blaze test` SIGTERM storm: when a termination signal arrives while
+    /// 2 of 10 queued tests are running (width = 2), `drive_pending` must stop and drop ONLY
+    /// those 2 running children, return `DriveError::Interrupted { stopped: 2 }`, and NEVER
+    /// start any of the remaining 8 queued tests.
+    #[test]
+    fn termination_signal_stops_only_running_children_and_never_starts_remaining_tests() {
+        const TOTAL: u32 = 10;
+        const WIDTH: u32 = 2;
+
+        struct DropCount<'c>(&'c Cell<u32>);
+        impl Drop for DropCount<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        struct InterruptibleRuns {
+            started: Cell<u32>,
+            dropped: Cell<u32>,
+            tick: Cell<u64>,
+        }
+
+        impl RunOne for InterruptibleRuns {
+            async fn run(&self, _row: u32, _budget: Nanos, _: &mut Output<'_>, signals: &Signals) -> Result<RunOutcome, OneError> {
+                let _guard = DropCount(&self.dropped);
+                self.started.set(self.started.get() + 1);
+                signals.started.set(true);
+                if self.started.get() >= WIDTH {
+                    // Simulate SIGTERM arriving while the first batch of `WIDTH` tests is running.
+                    signals.set_terminated_for_test();
+                }
+                loop {
+                    next_turn().await;
+                    self.tick.set(self.tick.get().saturating_add(1_000_000));
+                }
+            }
+        }
+
+        let heap = blaze_own::testing::heap().alloc();
+        let cx = test_cx();
+        let tools: [Tool; blaze_drive::key::KINDS] = core::array::from_fn(|at| Tool(ContentId([u8::try_from(at).unwrap_or(u8::MAX); 32])));
+        let proofs = StandingProofs;
+        let asked_ids = IdsAsked::default();
+        let chk0 = Name::new(Kind::BodyCheck, ContentId([0x61; 32]));
+        let chk1 = Name::new(Kind::BodyCheck, ContentId([0x62; 32]));
+        let Some(ids) = build_ids(&cx, &tools, chk0, ContentId([0x11; 32]), chk1, ContentId([0x22; 32]), &proofs, &asked_ids, blaze_own::testing::bump()) else {
+            panic!("ids");
+        };
+        let cert = crate::start_list::Certificate::for_tests([0xaa; 32]);
+        let Some(lent) = open_sim_lent(Sim::new(77, Faults::default()), 1, heap) else { panic!("open sim lent") };
+        let (mut cache, _, _, _) = crate::test_cache::TestCache::open(&lent, &[], &ids, &cert, [0; 32], heap);
+        let config = LoopConfig {
+            plan: blaze_run::plan::Config {
+                width: WIDTH,
+                deadline: Nanos(60_000_000_000),
+                run_all: false,
+                ignored: blaze_run::plan::Ignored::Skip,
+                benches: false,
+                filter: blaze_run::plan::Filter::All,
+                skip: &[],
+            },
+            style: blaze_run::report::Style::text(80, false),
+            list: false,
+            run: blaze_run::CheckoutKey([0x44; 32]),
+            suites: 1,
+        };
+        let mut asked: AVec<'static, blaze_run::plan::Asked<'static>> = Vec::new_in(heap);
+        let mut owners: AVec<'static, SuiteId> = Vec::new_in(heap);
+        for row in 0..TOTAL {
+            let mut bytes = [0u8; 32];
+            bytes[0] = 0x77;
+            bytes[1] = u8::try_from(row).unwrap_or(u8::MAX);
+            asked.push(blaze_run::plan::Asked {
+                test: TestId(bytes),
+                path: "m::queued",
+                ignore: None,
+                bench: false,
+                should_panic: blaze_run::plan::ShouldPanic::No,
+            });
+            owners.push(SuiteId(0));
+        }
+        let heads = [Head::EMPTY];
+        let runs = InterruptibleRuns { started: Cell::new(0), dropped: Cell::new(0), tick: Cell::new(0) };
+        let signals = Signals::default();
+        let clock = || Nanos(runs.tick.get());
+        let Ok(pool) = OneEach::new(&runs, &signals, &clock, heap, heap) else { panic!("OneEach") };
+        let mut runner = Runner::new(pool, &config.plan, TestHost::Macos, heap);
+        let mut machine = TestLoop::new(config, heap).expect("test loop");
+        let mut pending: AVec<'static, Effect<'static>> = Vec::new_in(heap);
+        machine
+            .begin_inventory(asked, owners.as_slice(), &heads, Postings::EMPTY, &[], 0, runner.zygotes().now(), &mut pending)
+            .expect("begin inventory");
+        machine.step(Event::Checked { errors: 0 }, runner.zygotes().now(), &mut pending).expect("checked");
+
+        let entered_sink: RefCell<AVec<'static, (SuiteId, crate::test_cache::EnteredFn<'static>)>> = RefCell::new(Vec::new_in(heap));
+        let mut refuse = NoRefusal;
+        let mut on_run = |_row: u32, _cache: &mut crate::test_cache::TestCache<'_, '_, Sim>| {};
+        let mut printed = String::new_in(heap);
+        let mut print = |bytes: &[u8]| -> Result<(), DriveError> {
+            if let Ok(s) = core::str::from_utf8(bytes) {
+                printed.push_str(s);
+            }
+            Ok(())
+        };
+        let result = drive_pending(
+            &mut machine,
+            pending,
+            10_000,
+            10_000,
+            &mut runner,
+            &mut refuse,
+            &mut cache,
+            &entered_sink,
+            &mut on_run,
+            &mut print,
+            heap,
+        );
+        assert!(
+            matches!(result, Err(DriveError::Interrupted { stopped: WIDTH })),
+            "expected DriveError::Interrupted {{ stopped: {WIDTH} }}, got {result:?}"
+        );
+        assert_eq!(runs.started.get(), WIDTH, "remaining queued tests must never start after termination signal");
+        assert_eq!(runs.dropped.get(), WIDTH, "all running children must be stopped/dropped on abort");
+        assert!(printed.is_empty(), "interrupted tests must not spam failure/signal reports: {printed}");
     }
 }
