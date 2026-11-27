@@ -746,6 +746,14 @@ fn removable(op: Op) -> bool {
             | Op::Fcopysign
             | Op::Fneg
             | Op::Fabs
+            | Op::Sqrt
+            | Op::Floor
+            | Op::Ceil
+            | Op::Ftrunc
+            | Op::Nearest
+            | Op::Fround
+            | Op::Fma
+            | Op::Fmuladd
             | Op::Freeze
             | Op::PtrAdd
             | Op::PtrAddr
@@ -757,6 +765,20 @@ fn removable(op: Op) -> bool {
             | Op::Extract
             | Op::Insert
             | Op::Shuffle
+            | Op::ReduceAdd
+            | Op::ReduceMul
+            | Op::ReduceAnd
+            | Op::ReduceOr
+            | Op::ReduceXor
+            | Op::ReduceUmin
+            | Op::ReduceUmax
+            | Op::ReduceSmin
+            | Op::ReduceSmax
+            | Op::ReduceFadd
+            | Op::ReduceFmul
+            | Op::ReduceFmin
+            | Op::ReduceFmax
+            | Op::Bitmask
             | Op::Project
     )
 }
@@ -862,6 +884,22 @@ fn trivial(view: &View<'_>, inst: usize) -> u32 {
 /// The function `view` without its dead code and trivial branches, in `alloc`, verified:
 /// the module's [`dead`] pass.
 pub fn dead<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+    dead_inner(view, false, alloc)
+}
+
+/// Like [`dead`], but also treats `Op::Assume` as removable so pure proof computations that
+/// exist solely to feed `Op::Assume` (e.g. `core::simd::Mask::from_simd` / `assert_unchecked`
+/// precondition checks) are eliminated right before machine code generation after all LIR
+/// analyses have already consumed them.
+pub fn dead_strip_assumes<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, SimplifyError> {
+    dead_inner(view, true, alloc)
+}
+
+fn dead_inner<A: Allocator + Copy>(
+    view: View<'_>,
+    strip_assumes: bool,
+    alloc: A,
+) -> Result<Func<A>, SimplifyError> {
     if view.blocks() == 0 {
         return Err(SimplifyError::Refused { inst: 0, what: "a function with no blocks" });
     }
@@ -895,6 +933,7 @@ pub fn dead<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, Si
         for inst in view.block(block) {
             let root = match view.op(inst) {
                 Op::Param => !into.targets_only[b],
+                Op::Assume if strip_assumes => false,
                 op => !removable(op) && !is_trap_free_div_rem(&view, inst),
             };
             if root {

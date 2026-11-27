@@ -3635,9 +3635,17 @@ pub fn allocate_mfunc<'a>(
         //    Uses `def_pt <= re` because a `VReg` live-out past a trailing call in its block
         //    ends at `blk_end_pt == call.def_pt`, whereas a `Blr` target dying at the call ends
         //    at even `use_pt == call.def_pt - 1`.
-        if !call_sites.is_empty() && (forbid.0 & all_call_clobbers) != all_call_clobbers {
+        //    AAPCS64 only preserves the low 64 bits (`D8..=D15`) of `V8..=V15` across calls, so
+        //    any 128-bit `Vec128` live across a call must also forbid `V8..=V15`.
+        let vec128_call_forbid: u64 = if meta.class == VRegClass::Vec128 {
+            u64::from(CALLEE_SAVED_FP_MASK) << 32
+        } else {
+            0
+        };
+        let full_call_forbid = all_call_clobbers | vec128_call_forbid;
+        if !call_sites.is_empty() && (forbid.0 & full_call_forbid) != full_call_forbid {
             for &(rs, re) in slice {
-                if (forbid.0 & all_call_clobbers) == all_call_clobbers {
+                if (forbid.0 & full_call_forbid) == full_call_forbid {
                     break;
                 }
                 let mut pos = call_sites.partition_point(|c| c.def_pt <= rs);
@@ -3645,8 +3653,8 @@ pub fn allocate_mfunc<'a>(
                     if cs.def_pt > re {
                         break;
                     }
-                    forbid = forbid.union(cs.clobbers.clobbered);
-                    if (forbid.0 & all_call_clobbers) == all_call_clobbers {
+                    forbid = forbid.union(RegSet(cs.clobbers.clobbered.0 | vec128_call_forbid));
+                    if (forbid.0 & full_call_forbid) == full_call_forbid {
                         break;
                     }
                     pos += 1;
