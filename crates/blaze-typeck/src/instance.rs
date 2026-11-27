@@ -18,7 +18,7 @@ use blaze_own::{Alloc, Vec};
 
 use crate::error::{CheckError, Limit, Malformed, Stop};
 use crate::ids::{ItemKey, List};
-use crate::infer::{Exporter, InferCtx};
+use crate::infer::{Exporter, InferCtx, InferCtxIn};
 use crate::portable::{PNode, PTy, PTys, PortableTys};
 use crate::ty::{Cause, Goal, Obligation, Ty, TyView, TypeCtx};
 use crate::world::{ImplHeader, PClause, Question, Reads, Shape, World};
@@ -88,10 +88,10 @@ pub(crate) trait ClosureSource {
     type Error: From<CheckError>;
 
     /// `Question::Closure(owner, ordinal)`'s answer imported at `args`: `TyView::ClosureOf`.
-    fn closure_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Self::Error>;
+    fn closure_of(&mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Self::Error>;
 
     /// A named coroutine is read from its defining body's checked facts.
-    fn coroutine_of(&mut self, _: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, _: crate::ty::TyList, _: u32) -> Result<Ty, Self::Error> {
+    fn coroutine_of(&mut self, _: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, _: crate::ty::TyList, _: u32) -> Result<Ty, Self::Error> {
         Err(CheckError::Malformed(Malformed::BodyTypeInRecord(Question::Coroutine(owner, ordinal))).into())
     }
 
@@ -99,7 +99,7 @@ pub(crate) trait ClosureSource {
     #[allow(clippy::too_many_arguments)]
     fn future_of(
         &mut self,
-        _cx: &mut InferCtx<'_>,
+        _cx: &mut InferCtxIn<'_, '_>,
         _types: PTys<'_>,
         e: crate::ids::ExprId,
         _output: PTy,
@@ -117,7 +117,7 @@ pub(crate) struct NoClosures;
 impl ClosureSource for NoClosures {
     type Error = CheckError;
 
-    fn closure_of(&mut self, _: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, _: crate::ty::TyList, _: u32) -> Result<Ty, CheckError> {
+    fn closure_of(&mut self, _: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, _: crate::ty::TyList, _: u32) -> Result<Ty, CheckError> {
         Err(CheckError::Malformed(crate::error::Malformed::BodyTypeInRecord(Question::Closure(owner, ordinal))))
     }
 }
@@ -130,7 +130,7 @@ pub(crate) struct Asked<'r, 'w, 'a, W: World> {
 impl<W: World> ClosureSource for Asked<'_, '_, '_, W> {
     type Error = Stop;
 
-    fn closure_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Stop> {
+    fn closure_of(&mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Stop> {
         let Some((facts, env)) = self.reads.closure(owner, ordinal)? else {
             return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(Question::Closure(owner, ordinal))).into());
         };
@@ -144,7 +144,7 @@ impl<W: World> ClosureSource for Asked<'_, '_, '_, W> {
         Ok(cx.imported_closure(owner, ordinal, args, sig, facts.kind, env)?)
     }
 
-    fn coroutine_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Stop> {
+    fn coroutine_of(&mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Stop> {
         self.import_coroutine(cx, owner, ordinal, args, depth)
     }
 }
@@ -177,7 +177,7 @@ struct OwnFirst<'o, 'p, 'r, 'w, 'a, W: World> {
 impl<W: World> ClosureSource for OwnFirst<'_, '_, '_, '_, '_, W> {
     type Error = Stop;
 
-    fn closure_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Stop> {
+    fn closure_of(&mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Stop> {
         let Some(own) = self.own.filter(|o| o.owner == owner) else {
             return self.asked.closure_of(cx, owner, ordinal, args, depth);
         };
@@ -198,7 +198,7 @@ impl<W: World> ClosureSource for OwnFirst<'_, '_, '_, '_, '_, W> {
     }
 
     fn future_of(
-        &mut self, cx: &mut InferCtx<'_>, types: PTys<'_>, e: crate::ids::ExprId,
+        &mut self, cx: &mut InferCtxIn<'_, '_>, types: PTys<'_>, e: crate::ids::ExprId,
         output: PTy, interior: PTy, subst: &[Ty], depth: u32,
     ) -> Result<Ty, Stop> {
         let Some(own) = self.own else {
@@ -208,7 +208,7 @@ impl<W: World> ClosureSource for OwnFirst<'_, '_, '_, '_, '_, W> {
         cx.import_instance_future(self, &own.body, e, args, types, output, interior, subst, depth)
     }
 
-    fn coroutine_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Stop> {
+    fn coroutine_of(&mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, Stop> {
         let Some(own) = self.own.filter(|o| o.owner == owner) else {
             return self.asked.coroutine_of(cx, owner, ordinal, args, depth);
         };
@@ -248,7 +248,7 @@ impl<W: World> ClosureSource for OwnFirst<'_, '_, '_, '_, '_, W> {
 }
 
 /// Imports portable type `t` of `types` into `cx`, `Param(i)` becoming `subst[i]`.
-pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u32) -> Result<Ty, S::Error> {
+pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtxIn<'_, '_>, src: &mut S, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u32) -> Result<Ty, S::Error> {
     enum Kind {
         Tuple,
         Record(crate::ids::RecordSchema),
@@ -277,7 +277,7 @@ pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, types
         list: Option<(List, usize)>,
         extra: Option<PTy>,
     }
-    fn finish<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, kind: Kind, slice: &[Ty], depth: u32) -> Result<Ty, S::Error> {
+    fn finish<S: ClosureSource>(cx: &mut InferCtxIn<'_, '_>, src: &mut S, kind: Kind, slice: &[Ty], depth: u32) -> Result<Ty, S::Error> {
         let v = match kind {
             Kind::Tuple => TyView::Tuple(cx.mk_list(slice)?),
             Kind::Record(s) => TyView::Record(s, cx.mk_list(slice)?),
@@ -476,7 +476,7 @@ pub(crate) fn import<S: ClosureSource>(cx: &mut InferCtx<'_>, src: &mut S, types
 }
 
 pub(crate) fn import_list<S: ClosureSource>(
-    cx: &mut InferCtx<'_>,
+    cx: &mut InferCtxIn<'_, '_>,
     src: &mut S,
     types: PTys<'_>,
     l: List,
@@ -507,12 +507,12 @@ pub(crate) enum Keep {
 /// Exports `t`, fully resolved, into the ground table; `None` when it is not ground. Over an
 /// [`Exporter`] (`InferCtx::exporter`, or the solver's pull mid-step: infer `fill_const_holds`),
 /// the parts of the context an export reads, so it can run while the solver holds the rest.
-pub(crate) fn export(cx: &mut Exporter<'_, '_>, t: Ty, ground: &mut PortableTys<'_>, depth: u32) -> Result<Option<PTy>, CheckError> {
+pub(crate) fn export(cx: &mut Exporter<'_, '_, '_>, t: Ty, ground: &mut PortableTys<'_>, depth: u32) -> Result<Option<PTy>, CheckError> {
     export_as(cx, t, ground, Keep::Ground, depth)
 }
 
 /// [`export`] keeping the types `keep` names.
-pub(crate) fn export_as(cx: &mut Exporter<'_, '_>, t: Ty, ground: &mut PortableTys<'_>, keep: Keep, depth: u32) -> Result<Option<PTy>, CheckError> {
+pub(crate) fn export_as(cx: &mut Exporter<'_, '_, '_>, t: Ty, ground: &mut PortableTys<'_>, keep: Keep, depth: u32) -> Result<Option<PTy>, CheckError> {
     enum Kind {
         Future(crate::ids::ExprId),
         Tuple,
@@ -733,7 +733,7 @@ pub(crate) fn export_as(cx: &mut Exporter<'_, '_>, t: Ty, ground: &mut PortableT
 }
 
 fn export_list(
-    cx: &mut Exporter<'_, '_>,
+    cx: &mut Exporter<'_, '_, '_>,
     l: crate::ty::TyList,
     ground: &mut PortableTys<'_>,
     depth: u32,
@@ -743,7 +743,7 @@ fn export_list(
 
 /// [`export_list`] keeping the types `keep` names ([`export_as`]).
 pub(crate) fn export_list_as(
-    cx: &mut Exporter<'_, '_>,
+    cx: &mut Exporter<'_, '_, '_>,
     l: crate::ty::TyList,
     ground: &mut PortableTys<'_>,
     keep: Keep,
@@ -762,7 +762,7 @@ pub(crate) fn export_list_as(
 }
 
 /// The principal trait of a trait object's rows `l` (its first row, if an `ExTrait`).
-pub(crate) fn principal(cx: &InferCtx<'_>, l: crate::ty::TyList) -> Option<crate::ids::ItemKey> {
+pub(crate) fn principal(cx: &InferCtxIn<'_, '_>, l: crate::ty::TyList) -> Option<crate::ids::ItemKey> {
     if cx.list_len(l) == 0 {
         return None;
     }
@@ -772,7 +772,7 @@ pub(crate) fn principal(cx: &InferCtx<'_>, l: crate::ty::TyList) -> Option<crate
     }
 }
 
-pub(crate) fn shape_of(v: TyView, cx: &InferCtx<'_>) -> Option<Shape> {
+pub(crate) fn shape_of(v: TyView, cx: &InferCtxIn<'_, '_>) -> Option<Shape> {
     Some(match v {
         TyView::Bool => Shape::Bool,
         TyView::Char => Shape::Char,
@@ -806,7 +806,7 @@ pub(crate) fn shape_of(v: TyView, cx: &InferCtx<'_>) -> Option<Shape> {
 /// arguments to the goal's `args` (self first); the fresh arguments when all unify. On `None`
 /// the unifications made are left for the caller's snapshot to roll back.
 pub(crate) fn unify_header<'a>(
-    cx: &mut InferCtx<'a>,
+    cx: &mut InferCtxIn<'a, '_>,
     h: &ImplHeader<'_>,
     args: crate::ty::TyList,
 ) -> Result<Option<Vec<Ty, Alloc<'a>>>, CheckError> {

@@ -2004,7 +2004,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     }
 
     /// The read list and the needs of the run, sorted and deduplicated (rule 25).
-    pub(crate) fn finish(mut self, alloc: Alloc<'a>) -> (ReadList<'a>, Needs<'a>) {
+    pub(crate) fn finish<'b>(mut self, alloc: Alloc<'b>) -> (ReadList<'b>, Needs<'b>) {
         let recorded = self.entries.len() as u64;
         self.entries.sort_unstable();
         self.entries.dedup();

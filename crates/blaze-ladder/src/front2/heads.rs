@@ -2716,6 +2716,10 @@ pub struct Store<'n> {
     /// `with_lowered_in`), rolled back via `Frame::scope` after every item so repeated head
     /// lowerings never trigger `blaze_mem::frame::task` reserve/reset churn.
     parse_scratch: core::cell::RefCell<Option<blaze_mem::Frame>>,
+    /// Reusable per-round scratch `Frame` for `InferCtx` during `check_rounds_as`, rolled back
+    /// after every check round so multi-round bodies and transitive `opaque_auto` defining-body
+    /// checks do not accumulate dead `InferCtx`/`Solver`/`Terms` arenas in `BODY_SCRATCH`.
+    pub(crate) round_scratch: Option<blaze_mem::Frame>,
 }
 
 /// How [`Store::ensure`] meets the needs of a trait's members (front2_tables_cost.rs runs
@@ -3233,6 +3237,7 @@ impl<'n> Store<'n> {
             stretch_facts: None,
             seed_on_ensure: true,
             parse_scratch: core::cell::RefCell::new(None),
+            round_scratch: None,
         }
     }
 
@@ -3310,11 +3315,16 @@ impl<'n> Store<'n> {
             stretch_facts,
             seed_on_ensure,
             parse_scratch,
+            round_scratch,
         } = self;
         *stretch_facts = None;
         *seed_on_ensure = true;
         if let Some(frame) = parse_scratch.get_mut().as_mut() {
             frame.reset();
+        }
+        if let Some(frame) = round_scratch.as_mut() {
+            frame.reset();
+            frame.trim(8 << 20);
         }
         *work = heads_alloc;
         tys.clear();
@@ -3441,6 +3451,10 @@ impl<'n> Store<'n> {
     /// `work` survive `scratch.reset()`.
     pub(super) fn end_body_reuse(&mut self, snapshot: ReuseSnapshot, keys: &mut Keys) -> ReuseStatus {
         let heads_alloc = self.tys.alloc();
+        if let Some(frame) = self.round_scratch.as_mut() {
+            frame.reset();
+            frame.trim(8 << 20);
+        }
         let lowered_non_fn = self.lowered > 0
             && (self.seeds.is_none()
                 || self.opaques.len() != snapshot.opaques

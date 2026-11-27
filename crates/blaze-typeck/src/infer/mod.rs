@@ -47,11 +47,12 @@ use crate::world::{Reads, World};
 /// nothing mid-step (`stop_for_facts`) takes a round; the pull answers every question in place.
 const MAX_FILLS: u32 = 1 << 16;
 
-/// The real type context of one body's check.
-pub struct InferCtx<'a> {
+/// The real type context of one body's check, with an independent lifetime `'f` for its
+/// [`FactCache<'f>`] so a stretch-reused fact cache can outlive a per-round scratch frame `'a`.
+pub struct InferCtxIn<'a, 'f> {
     alloc: Alloc<'a>,
     pub terms: Terms<'a>,
-    pub facts: FactCache<'a>,
+    pub facts: FactCache<'f>,
     solver: Solver<'a>,
     env_clauses: Vec<Clause, Alloc<'a>>,
     env: Option<EnvId>,
@@ -69,6 +70,10 @@ pub struct InferCtx<'a> {
     /// Solver reads (the solver's own log; the body's read list is `Reads`): emptied after each
     /// call, as nothing here reads it (it grew for the whole body before).
     solver_reads: Vec<blaze_solve::Read, Alloc<'a>>,
+    /// Reusable fulfillment queue and index map for `select`, avoiding 13 fresh bump-frame
+    /// allocations per `select()` call.
+    fulfill: Fulfill<'a, Wake>,
+    select_ids: Vec<usize, Alloc<'a>>,
     /// Solver calls repeated after a fact was filled: the Need rounds inside the context.
     pub need_rounds: u64,
     /// How many `Specializes` questions this context is answering for the contexts above it
@@ -87,6 +92,10 @@ pub struct InferCtx<'a> {
     #[cfg(test)]
     pub(crate) stop_for_facts: bool,
 }
+
+/// The real type context of one body's check when its scratch arena and fact cache share one
+/// lifetime `'a`.
+pub type InferCtx<'a> = InferCtxIn<'a, 'a>;
 
 /// The deepest chain of `Specializes` questions asked while one is answered (an impl's
 /// where-clause whose own selection weighs two impls that specialize). Past it the check stops
@@ -181,9 +190,9 @@ impl<'a> BodyRows<'a> {
 /// A shared view of a body's terms: the reads `TypeCtx::view` makes, written once, for the
 /// context ([`InferCtx`]) and for [`Exporter`] alike (rule 30).
 #[derive(Clone, Copy)]
-pub(crate) struct Seen<'x, 'a> {
+pub(crate) struct Seen<'x, 'a, 'f> {
     terms: &'x Terms<'a>,
-    facts: &'x FactCache<'a>,
+    facts: &'x FactCache<'f>,
     rows: &'x BodyRows<'a>,
 }
 
@@ -192,9 +201,9 @@ pub(crate) struct Seen<'x, 'a> {
 /// read only, the body rows. Built by `InferCtx::exporter`, or in `Pull::fill` from the terms
 /// the solver hands it and the pull's own borrows, so a `where const` condition is answered
 /// where the solver meets it (no evaluation asked again from its root, D161 loop 3).
-pub(crate) struct Exporter<'x, 'a> {
+pub(crate) struct Exporter<'x, 'a, 'f> {
     terms: &'x mut Terms<'a>,
-    facts: &'x FactCache<'a>,
+    facts: &'x FactCache<'f>,
     rows: &'x mut BodyRows<'a>,
     alloc: Alloc<'a>,
 }
@@ -228,8 +237,8 @@ fn solve_err(e: blaze_solve::Stop) -> Result<(), CheckError> {
 /// `fill` and this pull's borrows of the facts and the body rows ([`fill_const_holds`]). So the
 /// caller's fill loops (`InferCtx::env`, `evaluate`, `select`) meet `Stop::Need` only under
 /// the test strategy that fills nothing (`stop_for_facts`); `Solve::refills` is 0 otherwise.
-struct Pull<'x, 'a, 'w, 'r, W: World> {
-    facts: &'x mut FactCache<'a>,
+struct Pull<'x, 'a, 'f, 'w, 'r, W: World> {
+    facts: &'x mut FactCache<'f>,
     rows: &'x mut BodyRows<'a>,
     reads: &'x mut Reads<'w, 'r, W>,
     alloc: Alloc<'a>,
@@ -246,8 +255,8 @@ struct Pull<'x, 'a, 'w, 'r, W: World> {
     stop: bool,
 }
 
-impl<'x, 'a, 'w, 'r, W: World> Pull<'x, 'a, 'w, 'r, W> {
-    fn new(facts: &'x mut FactCache<'a>, rows: &'x mut BodyRows<'a>, reads: &'x mut Reads<'w, 'r, W>, alloc: Alloc<'a>, spec_depth: u8) -> Self {
+impl<'x, 'a, 'f, 'w, 'r, W: World> Pull<'x, 'a, 'f, 'w, 'r, W> {
+    fn new(facts: &'x mut FactCache<'f>, rows: &'x mut BodyRows<'a>, reads: &'x mut Reads<'w, 'r, W>, alloc: Alloc<'a>, spec_depth: u8) -> Self {
         Pull {
             facts,
             rows,
@@ -263,11 +272,11 @@ impl<'x, 'a, 'w, 'r, W: World> Pull<'x, 'a, 'w, 'r, W> {
     }
 }
 
-impl<'a, W: World> blaze_solve::Source<Terms<'a>> for Pull<'_, 'a, '_, '_, W> {
-    type Facts = FactCache<'a>;
+impl<'a, 'f, W: World> blaze_solve::Source<Terms<'a>> for Pull<'_, 'a, 'f, '_, '_, W> {
+    type Facts = FactCache<'f>;
     const PULLS: bool = true;
 
-    fn facts(&self) -> &FactCache<'a> {
+    fn facts(&self) -> &FactCache<'f> {
         &*self.facts
     }
 
@@ -436,9 +445,9 @@ fn may_specialize_ty(
 /// [`Exporter`] over `terms`, `facts` and `rows`, which names the condition's record; the answer
 /// kept in `facts`. The one body of the answer, for the pull (`Pull::fill`, mid-step) and the
 /// test strategy's stop (`InferCtx::fill`).
-fn fill_const_holds<'a, W: World>(
+fn fill_const_holds<'a, 'f, W: World>(
     terms: &mut Terms<'a>,
-    facts: &mut FactCache<'a>,
+    facts: &mut FactCache<'f>,
     rows: &mut BodyRows<'a>,
     reads: &mut Reads<'_, '_, W>,
     alloc: Alloc<'a>,
@@ -545,7 +554,7 @@ impl<W: World> crate::instance::Asked<'_, '_, '_, W> {
     /// A nominal coroutine carries the defining item's arguments. Its output and
     /// stored types come from the same read used to lower that type in a body.
     pub(crate) fn import_coroutine(
-        &mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: TyList, depth: u32,
+        &mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: TyList, depth: u32,
     ) -> Result<Ty, Stop> {
         let q = crate::world::Question::Coroutine(owner, ordinal);
         let facts = self.reads.coroutine(owner, ordinal)?
@@ -568,7 +577,7 @@ impl<W: World> crate::instance::Asked<'_, '_, '_, W> {
     }
 }
 
-impl<'a> InferCtx<'a> {
+impl<'a, 'f> InferCtxIn<'a, 'f> {
     /// The allocator the check's caller handed in (D102): what this check's scratch lives in.
     pub(crate) fn alloc(&self) -> Alloc<'a> {
         self.alloc
@@ -595,27 +604,6 @@ impl<'a> InferCtx<'a> {
         self.mk_list(&args)
     }
 
-    /// Imports a future from the body currently being written back. Use its nominal
-    /// identity here so exporting the selected impl's arguments never exports a local
-    /// expression id. The output and interior are types of this same body.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn import_instance_future<S: crate::instance::ClosureSource>(
-        &mut self, source: &mut S,
-        body: &crate::body::BodyView<'_>, block: ExprId, owner_args: TyList,
-        types: crate::portable::PTys<'_>, output: crate::portable::PTy, interior: crate::portable::PTy,
-        subst: &[Ty], depth: u32,
-    ) -> Result<Ty, S::Error> {
-        let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(body, block) else {
-            let at = if (block.0 as usize) < body.exprs.len() { block } else { body.root };
-            return Err(CheckError::Malformed(crate::error::Malformed::FutureIdentity {
-                owner: body.owner, block, at: body.expr_range(at),
-            }).into());
-        };
-        let output = crate::instance::import(self, source, types, output, subst, depth)?;
-        let interior = crate::instance::import(self, source, types, interior, subst, depth)?;
-        Ok(self.imported_coroutine(body.owner, ordinal, owner_args, output, interior)?)
-    }
-
     /// The solver term for a portable coroutine instance. Its bounds use the first
     /// two elements. Unification includes every owner argument, even when absent
     /// from the stored state and output. (`pub(crate)`: stalled.rs imports another fn's
@@ -639,12 +627,35 @@ impl<'a> InferCtx<'a> {
         Ok(Ty(made.node().bits()))
     }
 
+    /// Imports a future from the body currently being written back. Use its nominal
+    /// identity here so exporting the selected impl's arguments never exports a local
+    /// expression id. The output and interior are types of this same body.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn import_instance_future<S: crate::instance::ClosureSource>(
+        &mut self, source: &mut S,
+        body: &crate::body::BodyView<'_>, block: ExprId, owner_args: TyList,
+        types: crate::portable::PTys<'_>, output: crate::portable::PTy, interior: crate::portable::PTy,
+        subst: &[Ty], depth: u32,
+    ) -> Result<Ty, S::Error> {
+        let Some(ordinal) = crate::coroutine_id::coroutine_ordinal(body, block) else {
+            let at = if (block.0 as usize) < body.exprs.len() { block } else { body.root };
+            return Err(CheckError::Malformed(crate::error::Malformed::FutureIdentity {
+                owner: body.owner, block, at: body.expr_range(at),
+            }).into());
+        };
+        let output = crate::instance::import(self, source, types, output, subst, depth)?;
+        let interior = crate::instance::import(self, source, types, interior, subst, depth)?;
+        Ok(self.imported_coroutine(body.owner, ordinal, owner_args, output, interior)?)
+    }
+}
+
+impl<'a> InferCtxIn<'a, 'a> {
     /// A context that checks a body, or answers a question asked while bodies are checked
     /// (`TypingMode::Analysis`): an opaque type outside its defining body is rigid, only its
     /// item bounds usable (the Reference, "Impl trait", "Abstract return types"); an auto
     /// trait still sees its hidden type (blaze-solve structural.rs).
     pub fn analysis_in(alloc: Alloc<'a>) -> InferCtx<'a> {
-        InferCtx::in_mode(alloc, TypingMode::Analysis)
+        InferCtxIn::in_mode(alloc, FactCache::new_in(alloc), TypingMode::Analysis)
     }
 
     /// A context that answers a question AFTER type checking, at an instance's ground
@@ -655,22 +666,37 @@ impl<'a> InferCtx<'a> {
     /// `<F as FnOnce<()>>::Output == U` with `F` a fn returning `impl Trait` and `U` that
     /// opaque's hidden type holds only so (suite/opaque_hidden_closure.rs).
     pub fn post_analysis_in(alloc: Alloc<'a>) -> InferCtx<'a> {
-        InferCtx::in_mode(alloc, TypingMode::PostAnalysis)
+        InferCtxIn::in_mode(alloc, FactCache::new_in(alloc), TypingMode::PostAnalysis)
     }
 
     /// [`InferCtx::analysis_in`] under its old name, for the callers outside this crate's
     /// writer's files until the one rewrite of every site (`InferCtx::new_in($A)` to
     /// `InferCtx::analysis_in($A)`) removes it: a new caller names its mode.
     pub fn new_in(alloc: Alloc<'a>) -> InferCtx<'a> {
-        InferCtx::in_mode(alloc, TypingMode::Analysis)
+        InferCtxIn::in_mode(alloc, FactCache::new_in(alloc), TypingMode::Analysis)
+    }
+}
+
+impl<'a, 'f> InferCtxIn<'a, 'f> {
+    /// A context for checking a body using a caller-owned [`FactCache<'f>`] whose lifetime `'f`
+    /// is independent of this round's scratch allocator `alloc` (`'a`), so the caller can reclaim
+    /// the round's entire scratch frame between check rounds while keeping a stretch-reused
+    /// fact cache alive.
+    pub fn analysis_with_facts_in(alloc: Alloc<'a>, facts: FactCache<'f>) -> InferCtxIn<'a, 'f> {
+        InferCtxIn::in_mode(alloc, facts, TypingMode::Analysis)
     }
 
-    fn in_mode(alloc: Alloc<'a>, mode: TypingMode) -> InferCtx<'a> {
-        InferCtx {
+    /// Returns the owned [`FactCache<'f>`], dropping the round's scratch tables.
+    pub fn into_facts(self) -> FactCache<'f> {
+        self.facts
+    }
+
+    fn in_mode(alloc: Alloc<'a>, facts: FactCache<'f>, mode: TypingMode) -> InferCtxIn<'a, 'f> {
+        InferCtxIn {
             mode,
             alloc,
             terms: Terms::new_in(alloc),
-            facts: FactCache::new_in(alloc),
+            facts,
             solver: Solver::new_in(alloc),
             env_clauses: Vec::new_in(alloc),
             env: None,
@@ -682,6 +708,8 @@ impl<'a> InferCtx<'a> {
             error_at: 0,
             rows: BodyRows::new_in(alloc),
             solver_reads: Vec::new_in(alloc),
+            fulfill: Fulfill::new_in(alloc),
+            select_ids: Vec::new_in(alloc),
             need_rounds: 0,
             spec_depth: 0,
             #[cfg(test)]
@@ -699,12 +727,12 @@ impl<'a> InferCtx<'a> {
     }
 
     /// The shared view of this context's terms ([`Seen`]).
-    fn seen(&self) -> Seen<'_, 'a> {
+    fn seen(&self) -> Seen<'_, 'a, 'f> {
         Seen { terms: &self.terms, facts: &self.facts, rows: &self.rows }
     }
 
     /// The parts of this context a ground export reads and adopts into ([`Exporter`]).
-    pub(crate) fn exporter(&mut self) -> Exporter<'_, 'a> {
+    pub(crate) fn exporter(&mut self) -> Exporter<'_, 'a, 'f> {
         Exporter { terms: &mut self.terms, facts: &self.facts, rows: &mut self.rows, alloc: self.alloc }
     }
 
@@ -872,7 +900,7 @@ impl<'a> InferCtx<'a> {
     }
 }
 
-impl<'x, 'a> Seen<'x, 'a> {
+impl<'x, 'a, 'f> Seen<'x, 'a, 'f> {
     /// Notes that handle `node` could not be read (`what`), keeping the first such note, and
     /// gives `stand_in` (`InferCtx::unreadable`).
     fn unreadable<T>(self, node: u32, what: crate::error::Unreadable, stand_in: T) -> T {
@@ -1041,8 +1069,8 @@ impl<'x, 'a> Seen<'x, 'a> {
     }
 }
 
-impl<'x, 'a> Exporter<'x, 'a> {
-    fn seen(&self) -> Seen<'_, 'a> {
+impl<'x, 'a, 'f> Exporter<'x, 'a, 'f> {
+    fn seen(&self) -> Seen<'_, 'a, 'f> {
         Seen { terms: &*self.terms, facts: self.facts, rows: &*self.rows }
     }
 
@@ -1171,7 +1199,7 @@ impl<'x, 'a> Exporter<'x, 'a> {
     }
 }
 
-impl<'a> InferCtx<'a> {
+impl<'a, 'f> InferCtxIn<'a, 'f> {
     /// A closure's signature (a `FnPtr`, inputs then output) in the solver's "rust-call" form:
     /// its one input the tuple of the closure's inputs (blaze-solve builtin.rs `callable`).
     fn rust_call_sig(&mut self, sig: Ty) -> Result<blaze_ty::Ty, CheckError> {
@@ -1248,7 +1276,7 @@ impl<'a> InferCtx<'a> {
     fn pulled<W: World, R>(
         &mut self,
         reads: &mut Reads<'_, '_, W>,
-        solve: impl FnOnce(&mut Solver<'a>, &mut Terms<'a>, &mut Pull<'_, 'a, '_, '_, W>, &mut Vec<blaze_solve::Read, Alloc<'a>>) -> Result<R, blaze_solve::Stop>,
+        solve: impl FnOnce(&mut Solver<'a>, &mut Terms<'a>, &mut Pull<'_, 'a, 'f, '_, '_, W>, &mut Vec<blaze_solve::Read, Alloc<'a>>) -> Result<R, blaze_solve::Stop>,
     ) -> Result<Result<R, blaze_solve::Stop>, Stop> {
         let at = reads.stamp();
         let mut src = Pull::new(&mut self.facts, &mut self.rows, reads, self.alloc, self.spec_depth);
@@ -1342,7 +1370,7 @@ impl<'a> InferCtx<'a> {
         let mode = self.mode;
         for _ in 0..MAX_FILLS {
             let g = SGoal { env, pred, bound: 0 };
-            let r = self.pulled(reads, |solver, terms, src, sr| solver.evaluate_from(terms, src, mode, g, sr));
+            let r = self.pulled(reads, |solver, terms, src, _| solver.evaluate_from_quiet(terms, src, mode, g));
             match r? {
                 Ok(a) => return Ok(a),
                 Err(blaze_solve::Stop::Need(q)) => {
@@ -1686,20 +1714,40 @@ impl<'a> InferCtx<'a> {
         let env = self.env(reads)?;
         let mode = self.mode;
         for _ in 0..MAX_FILLS {
-            let mut f: Fulfill<'a, Wake> = Fulfill::new_in(self.alloc);
-            let mut ids: Vec<usize, Alloc<'a>> = Vec::new_in(self.alloc);
-            for i in 0..self.obs.len() {
-                if self.state[i] == State::Pending {
-                    f.register(SGoal { env, pred: self.preds[i], bound: 0 }).map_err(CheckError::Solve)?;
-                    ids.push(i);
+            let mut f = core::mem::replace(&mut self.fulfill, Fulfill::new_in(self.alloc));
+            let mut ids = core::mem::replace(&mut self.select_ids, Vec::new_in(self.alloc));
+            f.clear();
+            ids.clear();
+            let reg_res = (|| -> Result<(), Stop> {
+                for i in 0..self.obs.len() {
+                    if self.state[i] == State::Pending {
+                        f.register(SGoal { env, pred: self.preds[i], bound: 0 }).map_err(CheckError::Solve)?;
+                        ids.push(i);
+                    }
                 }
+                Ok(())
+            })();
+            if let Err(e) = reg_res {
+                self.fulfill = f;
+                self.select_ids = ids;
+                return Err(e);
             }
             if ids.is_empty() {
+                self.fulfill = f;
+                self.select_ids = ids;
                 return Ok(());
             }
             // A fact a goal lacks is pulled where it is met (`Pull`): the obligations are
             // registered once, and again only under the test strategy's stop.
-            let r = self.pulled(reads, |solver, terms, src, sr| f.select_from(solver, terms, src, mode, sr))?;
+            let pulled_res = self.pulled(reads, |solver, terms, src, _| f.select_from_quiet(solver, terms, src, mode));
+            let r = match pulled_res {
+                Ok(r) => r,
+                Err(e) => {
+                    self.fulfill = f;
+                    self.select_ids = ids;
+                    return Err(e);
+                }
+            };
             for (j, &i) in ids.iter().enumerate() {
                 let s = f.state[j];
                 if s == State::Fails && self.state[i] == State::Pending {
@@ -1716,6 +1764,8 @@ impl<'a> InferCtx<'a> {
                 }
                 self.set_state(i, s);
             }
+            self.fulfill = f;
+            self.select_ids = ids;
             match r {
                 Ok(()) => return Ok(()),
                 Err(blaze_solve::Stop::Need(q)) => {
@@ -1761,7 +1811,7 @@ fn why_cand(c: blaze_solve::witness::Choice) -> crate::diag::WhyCand {
     }
 }
 
-impl<'a> TypeCtx for InferCtx<'a> {
+impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
     type Snapshot = InferSnapshot;
 
     fn mk(&mut self, v: TyView) -> Result<Ty, CheckError> {

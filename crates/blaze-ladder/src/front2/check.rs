@@ -250,8 +250,18 @@ pub(super) fn said<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKe
 /// One round's inference context, made in this frame and boxed in `alloc`: the caller's frame
 /// holds the box's two words ([`check_rounds_as`]).
 #[inline(never)]
-fn infer_boxed(alloc: blaze_own::Alloc<'static>) -> blaze_own::Box<InferCtx<'static>, blaze_own::Alloc<'static>> {
+fn infer_boxed_fresh<'r>(alloc: blaze_own::Alloc<'r>) -> blaze_own::Box<tc::InferCtxIn<'r, 'r>, blaze_own::Alloc<'r>> {
     blaze_own::Box::new_in(InferCtx::analysis_in(alloc), alloc)
+}
+
+/// One round's inference context reusing a stretch [`tc::infer::FactCache<'static>`] while keeping
+/// all per-round scratch tables (`Terms`, `Solver`, `Fulfill`) in the round's own frame `alloc`.
+#[inline(never)]
+fn infer_boxed_reused<'r>(
+    alloc: blaze_own::Alloc<'r>,
+    facts: tc::infer::FactCache<'static>,
+) -> blaze_own::Box<tc::InferCtxIn<'r, 'static>, blaze_own::Alloc<'r>> {
+    blaze_own::Box::new_in(tc::InferCtxIn::analysis_with_facts_in(alloc, facts), alloc)
 }
 
 const _: () = assert!(core::mem::size_of::<blaze_own::Box<InferCtx<'static>, blaze_own::Alloc<'static>>>() == 2 * core::mem::size_of::<usize>());
@@ -260,38 +270,111 @@ const _: () = assert!(core::mem::size_of::<blaze_own::Box<InferCtx<'static>, bla
 /// single-threaded inside one worker's stretch, zero TLS/statics/unsafe). Recursive checks see
 /// `store.stretch_facts == None` and use a fresh cache; [`Self::restore_to`] commits or rolls back
 /// and returns the cache to `store.stretch_facts`.
-struct RoundCx {
-    cx: blaze_own::Box<InferCtx<'static>, blaze_own::Alloc<'static>>,
-    replaced: Option<tc::infer::FactCache<'static>>,
-    committed: bool,
+enum RoundCx<'r> {
+    Reused {
+        cx: blaze_own::Box<tc::InferCtxIn<'r, 'static>, blaze_own::Alloc<'r>>,
+        committed: bool,
+    },
+    Fresh {
+        cx: blaze_own::Box<tc::InferCtxIn<'r, 'r>, blaze_own::Alloc<'r>>,
+    },
 }
 
-impl RoundCx {
-    fn new(alloc: blaze_own::Alloc<'static>, owner: ItemKey, allow_reuse: bool, slot: &mut Option<tc::infer::FactCache<'static>>) -> Self {
-        let mut cx = infer_boxed(alloc);
-        let replaced = if allow_reuse && let Some(mut reused) = slot.take() {
-            core::mem::swap(&mut cx.facts, &mut reused);
-            cx.facts.begin_body_reuse(owner);
-            Some(reused)
+impl<'r> RoundCx<'r> {
+    fn new(alloc: blaze_own::Alloc<'r>, owner: ItemKey, allow_reuse: bool, slot: &mut Option<tc::infer::FactCache<'static>>) -> Self {
+        if allow_reuse && let Some(mut reused) = slot.take() {
+            reused.begin_body_reuse(owner);
+            RoundCx::Reused { cx: infer_boxed_reused(alloc, reused), committed: false }
         } else {
-            None
-        };
-        RoundCx { cx, replaced, committed: false }
+            RoundCx::Fresh { cx: infer_boxed_fresh(alloc) }
+        }
     }
 
-    fn is_reusing(&self) -> bool {
-        self.replaced.is_some()
+    fn reused_facts(&self) -> Option<&tc::infer::FactCache<'static>> {
+        match self {
+            RoundCx::Reused { cx, .. } => Some(&cx.facts),
+            RoundCx::Fresh { .. } => None,
+        }
     }
 
     fn mark_commit(&mut self) {
-        self.committed = true;
+        if let RoundCx::Reused { committed, .. } = self {
+            *committed = true;
+        }
     }
 
-    fn restore_to(mut self, slot: &mut Option<tc::infer::FactCache<'static>>) {
-        if let Some(mut orig) = self.replaced.take() {
-            self.cx.facts.end_body_reuse(self.committed);
-            core::mem::swap(&mut self.cx.facts, &mut orig);
-            *slot = Some(orig);
+    fn keep_root_keys(&mut self) {
+        match self {
+            RoundCx::Reused { cx, .. } => cx.keep_root_keys(),
+            RoundCx::Fresh { cx } => cx.keep_root_keys(),
+        }
+    }
+
+    fn trace_trait_goals(&mut self, ask: blaze_solve::witness::TraceAsk) {
+        match self {
+            RoundCx::Reused { cx, .. } => cx.trace_trait_goals(ask),
+            RoundCx::Fresh { cx } => cx.trace_trait_goals(ask),
+        }
+    }
+
+    fn add_solver_counts(&self, out: &mut tc::Solve) {
+        match self {
+            RoundCx::Reused { cx, .. } => cx.add_solver_counts(out),
+            RoundCx::Fresh { cx } => cx.add_solver_counts(out),
+        }
+    }
+
+    fn root_keys(&self) -> &[u64] {
+        match self {
+            RoundCx::Reused { cx, .. } => cx.root_keys(),
+            RoundCx::Fresh { cx } => cx.root_keys(),
+        }
+    }
+
+    fn goal_hits(&self) -> &[blaze_solve::share::GoalHit] {
+        match self {
+            RoundCx::Reused { cx, .. } => cx.goal_hits(),
+            RoundCx::Fresh { cx } => cx.goal_hits(),
+        }
+    }
+
+    fn run_check<'w, W: tc::World>(
+        &mut self,
+        view: &BodyView<'_>,
+        world: &'w W,
+        hints: &Needs<'_>,
+        count: &mut Option<(&mut tc::Tally, &dyn tc::Clock)>,
+        stalls: super::stalled_goals::Stalls,
+        alloc: blaze_own::Alloc<'static>,
+    ) -> Result<Outcome<'static>, tc::CheckError> {
+        match self {
+            RoundCx::Reused { cx, .. } => match count {
+                Some((tally, clock)) => tc::check_counted(view, world, &mut **cx, hints, tally, *clock, alloc),
+                None if stalls == super::stalled_goals::Stalls::Decide => tc::check_deferring(view, world, &mut **cx, hints, alloc),
+                None => tc::check(view, world, &mut **cx, hints, alloc),
+            },
+            RoundCx::Fresh { cx } => match count {
+                Some((tally, clock)) => tc::check_counted(view, world, &mut **cx, hints, tally, *clock, alloc),
+                None if stalls == super::stalled_goals::Stalls::Decide => tc::check_deferring(view, world, &mut **cx, hints, alloc),
+                None => tc::check(view, world, &mut **cx, hints, alloc),
+            },
+        }
+    }
+
+    fn restore_to(self, slot: &mut Option<tc::infer::FactCache<'static>>) {
+        if let RoundCx::Reused { cx, committed } = self {
+            let mut facts = blaze_own::Box::into_inner(cx).into_facts();
+            facts.end_body_reuse(committed);
+            *slot = Some(facts);
+        }
+    }
+}
+
+impl RoundCx<'static> {
+    fn take_trace(&mut self) -> Option<blaze_solve::witness::Trace<'static>> {
+        match self {
+            RoundCx::Reused { cx, .. } => cx.take_trace(),
+            RoundCx::Fresh { cx } => cx.take_trace(),
         }
     }
 }
@@ -496,6 +579,136 @@ pub(crate) fn check_rounds_strict<'n, S: NamesSource<'n>>(
     out
 }
 
+enum RoundStep {
+    Done(tc::Checked<'static>),
+    DoneDiags(tc::Checked<'static>),
+    DoneGaps(tc::Checked<'static>),
+    Need { needs: Needs<'static>, fills: Vec<Fill, Global> },
+    CheckErr(tc::CheckError),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_one_round<'r, 'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
+    body: &Body<'_>,
+    scope: &BodyScope<'_>,
+    owner: ItemKey,
+    round: u32,
+    allow_diags: bool,
+    patched: Option<&super::body_const_gaps::PatchedConsts>,
+    hints: &Needs<'_>,
+    count: &mut Option<(&mut tc::Tally, &dyn tc::Clock)>,
+    stalls: super::stalled_goals::Stalls,
+    root_keys: &mut Option<&mut Vec<u64, Global>>,
+    all_gaps: &mut Vec<Gap, Global>,
+    alloc: blaze_own::Alloc<'static>,
+    round_alloc: blaze_own::Alloc<'r>,
+    capture_trace: Option<blaze_solve::witness::TraceAsk>,
+    on_trace: impl FnOnce(&mut RoundCx<'r>, &mut Records<'_, 'n, S>),
+) -> Result<RoundStep, CheckFail> {
+    let meter = r.store.cost;
+    let tys = match patched {
+        Some(p) => p.tys.view(&r.store.tys),
+        None => body.tys.view(&r.store.tys),
+    }
+    .map_err(|error| CheckFail::Check { owner, error })?;
+    let mut view: BodyView<'_> = body.typeck.view(tys);
+    if let Some(p) = patched {
+        view.type_lists = &p.type_lists;
+    }
+    let allow_facts_reuse = !allow_diags
+        && r.store.inferring_output_stack.is_empty()
+        && r.store.inferred_outputs.is_empty()
+        && r.store.provisional_impls.is_empty();
+    let mut round_cx = RoundCx::new(round_alloc, owner, allow_facts_reuse, &mut r.store.stretch_facts);
+    let world = world_at(r, scope);
+    if root_keys.is_some() {
+        round_cx.keep_root_keys();
+    }
+    if let Some(ask) = capture_trace {
+        round_cx.trace_trait_goals(ask);
+    }
+    let out = round_cx.run_check(&view, &world, hints, count, stalls, alloc);
+    if round == 0 && meter.is_some() {
+        r.store.gate.borrow_mut().freeze(alloc);
+    }
+    let out = match out {
+        Ok(out) => out,
+        Err(error) => {
+            drop(world);
+            if capture_trace.is_some() {
+                on_trace(&mut round_cx, r);
+            }
+            round_cx.restore_to(&mut r.store.stretch_facts);
+            return Ok(RoundStep::CheckErr(error));
+        }
+    };
+    if let Some((tally, _)) = count.as_mut() {
+        round_cx.add_solver_counts(&mut tally.solve);
+    }
+    if let Some(cost) = meter {
+        let mut solve = tc::Solve::default();
+        round_cx.add_solver_counts(&mut solve);
+        cost.round(&solve);
+    }
+    if let Some(keys) = root_keys.as_deref_mut() {
+        keys.clear();
+        keys.extend_from_slice(round_cx.root_keys());
+    }
+    let mut fills = world.fills.into_inner();
+    if r.order == BuildOrder::Reversed {
+        fills.reverse();
+    }
+    let mut gaps = world.gaps.into_inner();
+    if capture_trace.is_some() {
+        on_trace(&mut round_cx, r);
+    }
+    for (idx, &gap) in body.typeck.const_gaps.iter().enumerate() {
+        if patched.is_some_and(|p| p.resolved.get(idx).copied().unwrap_or(false)) {
+            continue;
+        }
+        gaps.push(Gap::BodyConst { owner, gap });
+    }
+    let round_gaps = !gaps.is_empty();
+    if round_gaps {
+        merge_gaps(all_gaps, gaps);
+    }
+    match out {
+        Outcome::Done(mut done) => {
+            if let Some(facts) = round_cx.reused_facts() {
+                if let Err(err) = merge_replayed_reads(r, scope, owner, &mut done, facts, alloc) {
+                    round_cx.restore_to(&mut r.store.stretch_facts);
+                    return Err(err);
+                }
+            }
+            if !round_gaps && r.store.inferred_outputs.is_empty() && r.store.provisional_impls.is_empty() {
+                round_cx.mark_commit();
+            }
+            if !round_gaps && !allow_diags && (!done.diags.is_empty() || !body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) {
+                round_cx.restore_to(&mut r.store.stretch_facts);
+                return Ok(RoundStep::DoneDiags(done));
+            }
+            if !round_gaps {
+                if !allow_diags
+                    && let Some(inferred_out) = done.inferred_output
+                {
+                    let _ = r.store.file_inferred_output(owner, done.types.view(), inferred_out);
+                }
+                r.store.goal_hits.clear();
+                r.store.goal_hits.extend_from_slice(round_cx.goal_hits());
+                round_cx.restore_to(&mut r.store.stretch_facts);
+                return Ok(RoundStep::Done(done));
+            }
+            round_cx.restore_to(&mut r.store.stretch_facts);
+            Ok(RoundStep::DoneGaps(done))
+        }
+        Outcome::Need(needs) => {
+            round_cx.restore_to(&mut r.store.stretch_facts);
+            Ok(RoundStep::Need { needs, fills })
+        }
+    }
+}
+
 /// [`check_rounds`] with the check's entry for an auto-trait goal of an async block's future
 /// that fails only on the superset interior named (front2 stalled_goals.rs `Stalls`): only
 /// `ProjectWorld::check_borrows` passes `Stalls::Decide`, and it decides every stalled row.
@@ -548,126 +761,103 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
         // Facts made on the spot this round (world_items.rs `BodyWorld::store_want`; under the
         // one ask, what it made: `Store::imports`).
         let imported_at = r.store.imports();
-        let tys = match &patched {
-            Some(p) => p.tys.view(&r.store.tys),
-            None => body.tys.view(&r.store.tys),
-        }
-        .map_err(|error| CheckFail::Check { owner, error })?;
-        let mut view: BodyView<'_> = body.typeck.view(tys);
-        if let Some(p) = &patched {
-            view.type_lists = &p.type_lists;
-        }
         let trace_ask = r.store.trace;
-        let allow_facts_reuse = !allow_diags
-            && r.store.inferring_output_stack.is_empty()
-            && r.store.inferred_outputs.is_empty()
-            && r.store.provisional_impls.is_empty();
-        // Boxed, made in a frame of its own: this frame stays on the stack under the whole
-        // check (blaze-int notes t29 overflow-bt4.txt: 48,576 bytes).
-        let mut round_cx = RoundCx::new(alloc, owner, allow_facts_reuse, &mut r.store.stretch_facts);
-        let world = world_at(r, scope);
-        if root_keys.is_some() {
-            round_cx.cx.keep_root_keys();
-        }
-        // A measurement for tests (heads.rs `Store::trace`): the last round's trace is kept.
-        if let Some(ask) = trace_ask {
-            round_cx.cx.trace_trait_goals(ask);
-        }
-        let out = match &mut count {
-            Some((tally, clock)) => tc::check_counted(&view, &world, &mut *round_cx.cx, &hints, tally, *clock, alloc),
-            // Stalled goals decided after the async bodies' flows (front2 stalled_goals.rs).
-            None if stalls == super::stalled_goals::Stalls::Decide => tc::check_deferring(&view, &world, &mut *round_cx.cx, &hints, alloc),
-            None => tc::check(&view, &world, &mut *round_cx.cx, &hints, alloc),
-        };
-        // Round 0's walk is over: defer building the gate's set until a round actually needs it.
-        if round == 0 && meter.is_some() {
-            r.store.gate.borrow_mut().freeze(alloc);
-        }
-        // An auto trait of another fn's opaque: its defining body filed (checked only if no
-        // clean check of it is filed yet), the opaque leaked to this check, the round again.
-        let out = match out {
-            Ok(out) => out,
-            Err(error) => {
-                drop(world);
-                if trace_ask.is_some() {
-                    r.store.traced = round_cx.cx.take_trace();
+        // Run each round's `InferCtx`/`Solver`/`Terms` inside `r.store.round_scratch` via
+        // `Frame::scope` (when not retaining a `'static` test trace) so multi-round bodies and
+        // transitive `opaque_auto` defining-body checks reclaim 100% of per-round solver memory
+        // immediately after each round instead of accumulating it in `BODY_SCRATCH`.
+        let step = if trace_ask.is_some() {
+            run_one_round(
+                r,
+                body,
+                scope,
+                owner,
+                round,
+                allow_diags,
+                patched.as_ref(),
+                &hints,
+                &mut count,
+                stalls,
+                &mut root_keys,
+                &mut all_gaps,
+                alloc,
+                alloc,
+                trace_ask,
+                |cx, r| {
+                    r.store.traced = cx.take_trace();
+                },
+            )?
+        } else {
+            let taken = match r.store.round_scratch.take() {
+                Some(frame) => Ok(frame),
+                None => blaze_mem::Frame::with_reserve(1 << 30, blaze_mem::Tag::Infer),
+            };
+            match taken {
+                Ok(mut rf) => {
+                    let res = rf.scope(|frame| {
+                        let erased = blaze_own::Erased::new(frame);
+                        run_one_round(
+                            r,
+                            body,
+                            scope,
+                            owner,
+                            round,
+                            allow_diags,
+                            patched.as_ref(),
+                            &hints,
+                            &mut count,
+                            stalls,
+                            &mut root_keys,
+                            &mut all_gaps,
+                            alloc,
+                            erased.handle(),
+                            None,
+                            |_, _| {},
+                        )
+                    });
+                    r.store.round_scratch = Some(rf);
+                    res?
                 }
-                round_cx.restore_to(&mut r.store.stretch_facts);
+                Err(_) => run_one_round(
+                    r,
+                    body,
+                    scope,
+                    owner,
+                    round,
+                    allow_diags,
+                    patched.as_ref(),
+                    &hints,
+                    &mut count,
+                    stalls,
+                    &mut root_keys,
+                    &mut all_gaps,
+                    alloc,
+                    alloc,
+                    None,
+                    |_, _| {},
+                )?,
+            }
+        };
+        let (needs, mut fills) = match step {
+            RoundStep::CheckErr(error) => {
                 handle_check_error(r, body, owner, error, &mut leaks, asked.as_deref_mut(), alloc)?;
                 stalled_rounds = 0;
                 continue;
             }
-        };
-        if let Some((tally, _)) = count.as_mut() {
-            round_cx.cx.add_solver_counts(&mut tally.solve);
-        }
-        if let Some(cost) = meter {
-            let mut solve = tc::Solve::default();
-            round_cx.cx.add_solver_counts(&mut solve);
-            cost.round(&solve);
-        }
-        if let Some(keys) = root_keys.as_deref_mut() {
-            keys.clear();
-            keys.extend_from_slice(round_cx.cx.root_keys());
-        }
-        let mut fills = world.fills.into_inner();
-        if r.order == BuildOrder::Reversed {
-            fills.reverse();
-        }
-        let mut gaps = world.gaps.into_inner();
-        if trace_ask.is_some() {
-            r.store.traced = round_cx.cx.take_trace();
-        }
-        for (idx, &gap) in body.typeck.const_gaps.iter().enumerate() {
-            if patched.as_ref().is_some_and(|p| p.resolved.get(idx).copied().unwrap_or(false)) {
-                continue;
+            RoundStep::DoneDiags(done) => {
+                let tys = match &patched {
+                    Some(p) => p.tys.view(&r.store.tys),
+                    None => body.tys.view(&r.store.tys),
+                }
+                .map_err(|error| CheckFail::Check { owner, error })?;
+                let mut view: BodyView<'_> = body.typeck.view(tys);
+                if let Some(p) = &patched {
+                    view.type_lists = &p.type_lists;
+                }
+                return Err(collect_done_diags(r, body, scope, &view, owner, done, asked.as_deref_mut(), alloc));
             }
-            gaps.push(Gap::BodyConst { owner, gap });
-        }
-        let round_gaps = !gaps.is_empty();
-        if round_gaps {
-            merge_gaps(&mut all_gaps, gaps);
-        }
-        let needs = match out {
-            Outcome::Done(mut done) => {
-                if round_cx.is_reusing() {
-                    merge_replayed_reads(r, scope, owner, &mut done, &round_cx.cx.facts, alloc)?;
-                }
-                if !round_gaps && r.store.inferred_outputs.is_empty() && r.store.provisional_impls.is_empty() {
-                    round_cx.mark_commit();
-                }
-                // A finished check with a diagnostic is not a checked body: each is a finding.
-                // A written type that named nothing (E0412, front2 type_miss.rs) is a finding too,
-                // before the checker's: the body was checked with the error type in its place. So is
-                // one of the fn's own signature (its head's, `Store::type_misses`): a body whose
-                // head holds the error type is never a clean check, even where the walk read none.
-                if !round_gaps && !allow_diags && (!done.diags.is_empty() || !body.type_misses.is_empty() || r.store.type_misses.contains_key(&owner)) {
-                    round_cx.restore_to(&mut r.store.stretch_facts);
-                    let tys = match &patched {
-                        Some(p) => p.tys.view(&r.store.tys),
-                        None => body.tys.view(&r.store.tys),
-                    }
-                    .map_err(|error| CheckFail::Check { owner, error })?;
-                    let mut view: BodyView<'_> = body.typeck.view(tys);
-                    if let Some(p) = &patched {
-                        view.type_lists = &p.type_lists;
-                    }
-                    return Err(collect_done_diags(r, body, scope, &view, owner, done, asked.as_deref_mut(), alloc));
-                }
-                if !round_gaps {
-                    if !allow_diags
-                        && let Some(inferred_out) = done.inferred_output
-                    {
-                        let _ = r.store.file_inferred_output(owner, done.types.view(), inferred_out);
-                    }
-                    // The shared goals the finished round took (blaze-solve share.rs `GoalHit`): the
-                    // one read each, which the body's result names (tables/task.rs).
-                    r.store.goal_hits.clear();
-                    r.store.goal_hits.extend_from_slice(round_cx.cx.goal_hits());
-                    round_cx.restore_to(&mut r.store.stretch_facts);
-                    return Ok(done);
-                }
-                round_cx.restore_to(&mut r.store.stretch_facts);
+            RoundStep::Done(done) => return Ok(done),
+            RoundStep::DoneGaps(done) => {
                 // A finished check with unresolved BodyConst argument gaps whose callee and
                 // declared const parameter type are now known: evaluate and re-check.
                 if super::body_const_gaps::resolve(r, body, &done, &mut patched, alloc)? {
@@ -688,10 +878,7 @@ pub(crate) fn check_rounds_as<'n, S: NamesSource<'n>>(
                 }
                 return Err(CheckFail::Gap { owner, gaps: all_gaps });
             }
-            Outcome::Need(needs) => {
-                round_cx.restore_to(&mut r.store.stretch_facts);
-                needs
-            }
+            RoundStep::Need { needs, fills } => (needs, fills),
         };
         let new_holes = holes.round(round, &needs.missing);
         if new_holes > 0 {
