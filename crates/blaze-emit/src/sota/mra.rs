@@ -1765,6 +1765,46 @@ struct RewriteOut<'a> {
     spill_written: Vec<bool, Alloc<'a>>,
 }
 
+/// Whether `[SP + off]` fits in a single unsigned-scaled `ldr`/`str` without `addr_scratch`.
+#[inline]
+const fn spill_fits_direct(off: u32, size: MemSize) -> bool {
+    let bytes = size.byte_size();
+    let max_direct = 4095u32.saturating_mul(bytes);
+    off <= max_direct && (off % bytes) == 0
+}
+
+/// Bitmask of reserved scratch registers currently live across a `ParallelCopy` step.
+#[derive(Clone, Copy)]
+struct LiveScratch {
+    x16: bool,
+    x17: bool,
+    v30: bool,
+}
+
+impl LiveScratch {
+    #[inline]
+    fn from_pending(pending: &[(CopyLoc, CopyLoc)]) -> Self {
+        let mut x16 = false;
+        let mut x17 = false;
+        let mut v30 = false;
+        for &(_, src) in pending {
+            if src == CopyLoc::Reg(PReg::X16) {
+                x16 = true;
+            } else if src == CopyLoc::Reg(PReg::X17) {
+                x17 = true;
+            } else if src == CopyLoc::Reg(PReg::V(30)) {
+                v30 = true;
+            }
+        }
+        Self { x16, x17, v30 }
+    }
+
+    #[inline]
+    const fn free_fp(self) -> PReg {
+        if self.v30 { PReg::V(31) } else { PReg::V(30) }
+    }
+}
+
 impl<'a> RewriteOut<'a> {
     fn new(cap: usize, orig_notes: &[MNote], spill_base_off: u32, spill_bytes: u32, alloc: Alloc<'a>) -> Self {
         let mut notes = Vec::with_capacity_in(orig_notes.len(), alloc);
@@ -1839,6 +1879,43 @@ impl<'a> RewriteOut<'a> {
         }
     }
 
+    /// Parks a 64-bit GPR value in a reserved FP scratch register (`fmov d_fp, x_gpr`, lossless
+    /// bitwise 64-bit transfer, never touches memory or NZCV).
+    fn emit_park_gpr_in_fp(&mut self, fp: PReg, gpr: PReg) {
+        self.push(
+            MOp::FpAlu {
+                op: FpAluOp::MovFromGpr,
+                dst: MReg::P(fp),
+                rn: MReg::P(gpr),
+                rm: None,
+                ra: None,
+                double: true,
+            },
+            MInstFlags::NONE,
+            NO_VFLAG,
+            NO_VFLAG,
+            NO_NOTE,
+        );
+    }
+
+    /// Restores a 64-bit GPR value previously parked in a reserved FP scratch (`fmov x_gpr, d_fp`).
+    fn emit_unpark_gpr_from_fp(&mut self, gpr: PReg, fp: PReg) {
+        self.push(
+            MOp::FpAlu {
+                op: FpAluOp::MovToGpr,
+                dst: MReg::P(gpr),
+                rn: MReg::P(fp),
+                rm: None,
+                ra: None,
+                double: true,
+            },
+            MInstFlags::NONE,
+            NO_VFLAG,
+            NO_VFLAG,
+            NO_NOTE,
+        );
+    }
+
     /// Emits a spill-slot load `dst <- [SP + off]` (never touches NZCV).
     fn emit_spill_load(
         &mut self,
@@ -1848,9 +1925,7 @@ impl<'a> RewriteOut<'a> {
         addr_scratch: PReg,
     ) -> Result<(), MRaError> {
         self.mark_spill_read(off);
-        let bytes = size.byte_size();
-        let max_direct = 4095u32.saturating_mul(bytes);
-        if off <= max_direct && (off % bytes) == 0 {
+        if spill_fits_direct(off, size) {
             let off_i32 = i32_of(off).ok_or(MRaError::InvalidSpillOffset { off })?;
             self.push(
                 MOp::Ldr {
@@ -1908,9 +1983,7 @@ impl<'a> RewriteOut<'a> {
         addr_scratch: PReg,
     ) -> Result<(), MRaError> {
         self.mark_spill_written(off);
-        let bytes = size.byte_size();
-        let max_direct = 4095u32.saturating_mul(bytes);
-        if off <= max_direct && (off % bytes) == 0 {
+        if spill_fits_direct(off, size) {
             let off_i32 = i32_of(off).ok_or(MRaError::InvalidSpillOffset { off })?;
             self.push(
                 MOp::Str {
@@ -2057,14 +2130,13 @@ impl<'a> RewriteOut<'a> {
         }
     }
 
-    /// Emits one elementary transfer `dst <- src` between any [`CopyLoc`] pair.
+    /// Emits one elementary transfer `dst <- src` between any [`CopyLoc`] pair without clobbering
+    /// any reserved scratch register currently live in `live`.
     fn emit_copy_loc(
         &mut self,
         dst: CopyLoc,
         src: CopyLoc,
-        gpr_scratch: PReg,
-        gpr_addr_scratch: PReg,
-        fp_scratch: PReg,
+        live: LiveScratch,
         orig_ops: &[MOp],
         orig_note_idx: &[u32],
     ) -> Result<(), MRaError> {
@@ -2076,27 +2148,147 @@ impl<'a> RewriteOut<'a> {
                 self.emit_reg_copy(d, s);
             }
             (CopyLoc::Reg(d), CopyLoc::Spill { off, size }) => {
-                let addr_sc = if matches!(d, PReg::Gpr(_)) { d } else { gpr_addr_scratch };
-                self.emit_spill_load(d, off, size, addr_sc)?;
+                if matches!(d, PReg::Gpr(_)) || spill_fits_direct(off, size) {
+                    let addr_sc = if matches!(d, PReg::Gpr(_)) { d } else { PReg::X16 };
+                    self.emit_spill_load(d, off, size, addr_sc)?;
+                } else if !live.x16 {
+                    self.emit_spill_load(d, off, size, PReg::X16)?;
+                } else if !live.x17 {
+                    self.emit_spill_load(d, off, size, PReg::X17)?;
+                } else {
+                    let park_fp = if d == PReg::V(30) || live.v30 { PReg::V(31) } else { PReg::V(30) };
+                    self.emit_park_gpr_in_fp(park_fp, PReg::X17);
+                    self.emit_spill_load(d, off, size, PReg::X17)?;
+                    self.emit_unpark_gpr_from_fp(PReg::X17, park_fp);
+                }
             }
             (CopyLoc::Spill { off, size }, CopyLoc::Reg(s)) => {
-                let addr_sc = if s == gpr_addr_scratch { gpr_scratch } else { gpr_addr_scratch };
-                self.emit_spill_store(s, off, size, addr_sc)?;
+                if spill_fits_direct(off, size) {
+                    let addr_sc = if s == PReg::X16 { PReg::X17 } else { PReg::X16 };
+                    self.emit_spill_store(s, off, size, addr_sc)?;
+                } else if !live.x16 && s != PReg::X16 {
+                    self.emit_spill_store(s, off, size, PReg::X16)?;
+                } else if !live.x17 && s != PReg::X17 {
+                    self.emit_spill_store(s, off, size, PReg::X17)?;
+                } else {
+                    let addr_sc = if s == PReg::X16 { PReg::X17 } else { PReg::X16 };
+                    let park_fp = if s == PReg::V(30) || live.v30 { PReg::V(31) } else { PReg::V(30) };
+                    self.emit_park_gpr_in_fp(park_fp, addr_sc);
+                    self.emit_spill_store(s, off, size, addr_sc)?;
+                    self.emit_unpark_gpr_from_fp(addr_sc, park_fp);
+                }
             }
             (CopyLoc::Reg(d), CopyLoc::Remat { def_inst, .. }) => {
                 self.emit_remat(d, def_inst, orig_ops, orig_note_idx);
             }
             (CopyLoc::Spill { off: d_off, size: d_sz }, CopyLoc::Spill { off: s_off, size: s_sz }) => {
-                let tmp = if d_sz.is_fp_or_vec() { fp_scratch } else { gpr_scratch };
-                let addr_sc = if tmp == gpr_scratch { gpr_addr_scratch } else { gpr_scratch };
-                self.emit_spill_load(tmp, s_off, s_sz, addr_sc)?;
-                self.emit_spill_store(tmp, d_off, d_sz, addr_sc)?;
+                if d_sz.is_fp_or_vec() {
+                    let tmp_fp = live.free_fp();
+                    let need_addr = !spill_fits_direct(s_off, s_sz) || !spill_fits_direct(d_off, d_sz);
+                    if !need_addr || !live.x16 {
+                        self.emit_spill_load(tmp_fp, s_off, s_sz, PReg::X16)?;
+                        self.emit_spill_store(tmp_fp, d_off, d_sz, PReg::X16)?;
+                    } else if !live.x17 {
+                        self.emit_spill_load(tmp_fp, s_off, s_sz, PReg::X17)?;
+                        self.emit_spill_store(tmp_fp, d_off, d_sz, PReg::X17)?;
+                    } else {
+                        let park_fp = if tmp_fp == PReg::V(30) { PReg::V(31) } else { PReg::V(30) };
+                        self.emit_park_gpr_in_fp(park_fp, PReg::X17);
+                        self.emit_spill_load(tmp_fp, s_off, s_sz, PReg::X17)?;
+                        self.emit_spill_store(tmp_fp, d_off, d_sz, PReg::X17)?;
+                        self.emit_unpark_gpr_from_fp(PReg::X17, park_fp);
+                    }
+                } else {
+                    let need_dst_addr = !spill_fits_direct(d_off, d_sz);
+                    if !live.x16 && !live.x17 {
+                        self.emit_spill_load(PReg::X16, s_off, s_sz, PReg::X16)?;
+                        self.emit_spill_store(PReg::X16, d_off, d_sz, PReg::X17)?;
+                    } else if !live.x16 {
+                        self.emit_spill_load(PReg::X16, s_off, s_sz, PReg::X16)?;
+                        if need_dst_addr {
+                            let park_fp = live.free_fp();
+                            self.emit_park_gpr_in_fp(park_fp, PReg::X17);
+                            self.emit_spill_store(PReg::X16, d_off, d_sz, PReg::X17)?;
+                            self.emit_unpark_gpr_from_fp(PReg::X17, park_fp);
+                        } else {
+                            self.emit_spill_store(PReg::X16, d_off, d_sz, PReg::X17)?;
+                        }
+                    } else if !live.x17 {
+                        self.emit_spill_load(PReg::X17, s_off, s_sz, PReg::X17)?;
+                        if need_dst_addr {
+                            let park_fp = live.free_fp();
+                            self.emit_park_gpr_in_fp(park_fp, PReg::X16);
+                            self.emit_spill_store(PReg::X17, d_off, d_sz, PReg::X16)?;
+                            self.emit_unpark_gpr_from_fp(PReg::X16, park_fp);
+                        } else {
+                            self.emit_spill_store(PReg::X17, d_off, d_sz, PReg::X16)?;
+                        }
+                    } else {
+                        self.emit_park_gpr_in_fp(PReg::V(30), PReg::X16);
+                        if need_dst_addr {
+                            self.emit_park_gpr_in_fp(PReg::V(31), PReg::X17);
+                        }
+                        self.emit_spill_load(PReg::X16, s_off, s_sz, PReg::X16)?;
+                        self.emit_spill_store(PReg::X16, d_off, d_sz, PReg::X17)?;
+                        if need_dst_addr {
+                            self.emit_unpark_gpr_from_fp(PReg::X17, PReg::V(31));
+                        }
+                        self.emit_unpark_gpr_from_fp(PReg::X16, PReg::V(30));
+                    }
+                }
             }
             (CopyLoc::Spill { off: d_off, size: d_sz }, CopyLoc::Remat { def_inst, is_fp }) => {
-                let tmp = if is_fp { fp_scratch } else { gpr_scratch };
-                let addr_sc = if tmp == gpr_scratch { gpr_addr_scratch } else { gpr_scratch };
-                self.emit_remat(tmp, def_inst, orig_ops, orig_note_idx);
-                self.emit_spill_store(tmp, d_off, d_sz, addr_sc)?;
+                if is_fp {
+                    let tmp_fp = live.free_fp();
+                    self.emit_remat(tmp_fp, def_inst, orig_ops, orig_note_idx);
+                    if spill_fits_direct(d_off, d_sz) || !live.x16 {
+                        self.emit_spill_store(tmp_fp, d_off, d_sz, PReg::X16)?;
+                    } else if !live.x17 {
+                        self.emit_spill_store(tmp_fp, d_off, d_sz, PReg::X17)?;
+                    } else {
+                        let park_fp = if tmp_fp == PReg::V(30) { PReg::V(31) } else { PReg::V(30) };
+                        self.emit_park_gpr_in_fp(park_fp, PReg::X17);
+                        self.emit_spill_store(tmp_fp, d_off, d_sz, PReg::X17)?;
+                        self.emit_unpark_gpr_from_fp(PReg::X17, park_fp);
+                    }
+                } else {
+                    let need_dst_addr = !spill_fits_direct(d_off, d_sz);
+                    if !live.x16 && !live.x17 {
+                        self.emit_remat(PReg::X16, def_inst, orig_ops, orig_note_idx);
+                        self.emit_spill_store(PReg::X16, d_off, d_sz, PReg::X17)?;
+                    } else if !live.x16 {
+                        self.emit_remat(PReg::X16, def_inst, orig_ops, orig_note_idx);
+                        if need_dst_addr {
+                            let park_fp = live.free_fp();
+                            self.emit_park_gpr_in_fp(park_fp, PReg::X17);
+                            self.emit_spill_store(PReg::X16, d_off, d_sz, PReg::X17)?;
+                            self.emit_unpark_gpr_from_fp(PReg::X17, park_fp);
+                        } else {
+                            self.emit_spill_store(PReg::X16, d_off, d_sz, PReg::X17)?;
+                        }
+                    } else if !live.x17 {
+                        self.emit_remat(PReg::X17, def_inst, orig_ops, orig_note_idx);
+                        if need_dst_addr {
+                            let park_fp = live.free_fp();
+                            self.emit_park_gpr_in_fp(park_fp, PReg::X16);
+                            self.emit_spill_store(PReg::X17, d_off, d_sz, PReg::X16)?;
+                            self.emit_unpark_gpr_from_fp(PReg::X16, park_fp);
+                        } else {
+                            self.emit_spill_store(PReg::X17, d_off, d_sz, PReg::X16)?;
+                        }
+                    } else {
+                        self.emit_park_gpr_in_fp(PReg::V(30), PReg::X16);
+                        if need_dst_addr {
+                            self.emit_park_gpr_in_fp(PReg::V(31), PReg::X17);
+                        }
+                        self.emit_remat(PReg::X16, def_inst, orig_ops, orig_note_idx);
+                        self.emit_spill_store(PReg::X16, d_off, d_sz, PReg::X17)?;
+                        if need_dst_addr {
+                            self.emit_unpark_gpr_from_fp(PReg::X17, PReg::V(31));
+                        }
+                        self.emit_unpark_gpr_from_fp(PReg::X16, PReg::V(30));
+                    }
+                }
             }
             (CopyLoc::Remat { .. }, _) => {}
         }
@@ -2182,7 +2374,6 @@ fn lower_parallel_copy(
     }
 
     let gpr_cycle_reg = if mentions_x16 { PReg::X17 } else { PReg::X16 };
-    let gpr_addr_reg = if gpr_cycle_reg == PReg::X16 { PReg::X17 } else { PReg::X16 };
     let fp_cycle_reg = if mentions_v30 { PReg::V(31) } else { PReg::V(30) };
 
     let max_iters = pending.len().saturating_mul(2).saturating_add(1);
@@ -2213,15 +2404,8 @@ fn lower_parallel_copy(
             };
             // Swap-remove without calling `Vec::remove`.
             swap_remove_fast(&mut pending, idx);
-            out.emit_copy_loc(
-                dst,
-                src,
-                gpr_cycle_reg,
-                gpr_addr_reg,
-                fp_cycle_reg,
-                orig_ops,
-                orig_note_idx,
-            )?;
+            let live = LiveScratch::from_pending(&pending);
+            out.emit_copy_loc(dst, src, live, orig_ops, orig_note_idx)?;
             continue;
         }
 
@@ -2234,15 +2418,8 @@ fn lower_parallel_copy(
         } else {
             CopyLoc::Reg(gpr_cycle_reg)
         };
-        out.emit_copy_loc(
-            cycle_loc,
-            d0,
-            gpr_cycle_reg,
-            gpr_addr_reg,
-            fp_cycle_reg,
-            orig_ops,
-            orig_note_idx,
-        )?;
+        let live = LiveScratch::from_pending(&pending);
+        out.emit_copy_loc(cycle_loc, d0, live, orig_ops, orig_note_idx)?;
         for pair in pending.iter_mut() {
             if pair.1 == d0 {
                 pair.1 = cycle_loc;
@@ -2376,15 +2553,18 @@ fn rewrite_single_inst(
     let mut use_binds = [ScratchBinding { vreg: NONE_U32, scratch: PReg::X16 }; 4];
     let mut use_bind_len = 0usize;
 
-    for (&v_id, &sc) in subslice(&gpr_use_vregs, 0, gpr_use_len).iter().zip(gpr_scratches.iter()) {
-        slice_set(&mut use_binds, use_bind_len, ScratchBinding { vreg: v_id, scratch: sc });
-        use_bind_len += 1;
-        materialize_vreg_into(v_id, sc, sc, alloc_loc, orig_ops, orig_note_idx, out)?;
-    }
+    // Materialize FP/NEON uses FIRST while `X16` is still free to serve as large-offset address
+    // scratch; GPR reloads then use their own destination scratch (`X16`/`X17`) as address scratch
+    // so neither GPR reload can clobber the other or any FP scratch.
     for (&v_id, &sc) in subslice(&fp_use_vregs, 0, fp_use_len).iter().zip(fp_scratches.iter()) {
         slice_set(&mut use_binds, use_bind_len, ScratchBinding { vreg: v_id, scratch: sc });
         use_bind_len += 1;
         materialize_vreg_into(v_id, sc, PReg::X16, alloc_loc, orig_ops, orig_note_idx, out)?;
+    }
+    for (&v_id, &sc) in subslice(&gpr_use_vregs, 0, gpr_use_len).iter().zip(gpr_scratches.iter()) {
+        slice_set(&mut use_binds, use_bind_len, ScratchBinding { vreg: v_id, scratch: sc });
+        use_bind_len += 1;
+        materialize_vreg_into(v_id, sc, sc, alloc_loc, orig_ops, orig_note_idx, out)?;
     }
 
     // Reject impossible 3-distinct-spilled-GPR or 3-distinct-spilled-FP def instructions
@@ -2510,10 +2690,67 @@ fn rewrite_single_inst(
         out.push(rewritten, flags, vdef, vuse, note_head);
     }
 
-    // Emit post-instruction spill stores.
+    // Emit post-instruction spill stores: GPR stores first (so `X16`/`X17` are both free as
+    // large-offset address scratch for any FP post-stores).
+    let mut gpr_stores: [(PReg, u32, MemSize); 2] = [(PReg::X16, 0, MemSize::X64); 2];
+    let mut gpr_store_len = 0usize;
+    let mut fp_stores: [(PReg, u32, MemSize); 2] = [(PReg::V(30), 0, MemSize::D64); 2];
+    let mut fp_store_len = 0usize;
     for &(sc, off, size) in subslice(&post_stores, 0, post_store_len) {
-        let addr_sc = if sc == PReg::X16 { PReg::X17 } else { PReg::X16 };
-        out.emit_spill_store(sc, off, size, addr_sc)?;
+        if size.is_fp_or_vec() {
+            if fp_store_len < 2 {
+                slice_set(&mut fp_stores, fp_store_len, (sc, off, size));
+                fp_store_len += 1;
+            }
+        } else if gpr_store_len < 2 {
+            slice_set(&mut gpr_stores, gpr_store_len, (sc, off, size));
+            gpr_store_len += 1;
+        }
+    }
+
+    match gpr_store_len {
+        0 => {}
+        1 => {
+            let (sc, off, size) = gpr_stores[0];
+            let addr_sc = if sc == PReg::X16 { PReg::X17 } else { PReg::X16 };
+            out.emit_spill_store(sc, off, size, addr_sc)?;
+        }
+        _ => {
+            // Two live GPR scratch defs (`X16` and `X17`, e.g. `Ldp` with both outputs spilled
+            // or writeback `Ldr` with both `dst` and `base` spilled). Never clobber the second
+            // live GPR scratch while computing a large `SP + off` address for the first!
+            let (sc0, off0, sz0) = gpr_stores[0];
+            let (sc1, off1, sz1) = gpr_stores[1];
+            if sc0 == sc1 {
+                let addr_sc = if sc0 == PReg::X16 { PReg::X17 } else { PReg::X16 };
+                out.emit_spill_store(sc0, off0, sz0, addr_sc)?;
+                out.emit_spill_store(sc1, off1, sz1, addr_sc)?;
+            } else if spill_fits_direct(off0, sz0) {
+                // Store 0 needs no address scratch, freeing `sc0` for store 1.
+                out.emit_spill_store(sc0, off0, sz0, sc1)?;
+                out.emit_spill_store(sc1, off1, sz1, sc0)?;
+            } else if spill_fits_direct(off1, sz1) {
+                // Store 1 needs no address scratch, freeing `sc1` for store 0.
+                out.emit_spill_store(sc1, off1, sz1, sc0)?;
+                out.emit_spill_store(sc0, off0, sz0, sc1)?;
+            } else {
+                // Both spill slots exceed direct unsigned-scaled `str` range (`> 32 KiB` for
+                // 64-bit). Park `sc1` losslessly in an unused reserved FP scratch (`V30` or
+                // `V31`) so `sc1` can safely materialize `SP + (off0 & ~0xfff)`.
+                let v30_live = subslice(&fp_stores, 0, fp_store_len)
+                    .iter()
+                    .any(|&(fp, _, _)| fp == PReg::V(30));
+                let park_fp = if v30_live { PReg::V(31) } else { PReg::V(30) };
+                out.emit_park_gpr_in_fp(park_fp, sc1);
+                out.emit_spill_store(sc0, off0, sz0, sc1)?;
+                out.emit_unpark_gpr_from_fp(sc1, park_fp);
+                out.emit_spill_store(sc1, off1, sz1, sc0)?;
+            }
+        }
+    }
+
+    for &(sc, off, size) in subslice(&fp_stores, 0, fp_store_len) {
+        out.emit_spill_store(sc, off, size, PReg::X16)?;
     }
 
     Ok(())
@@ -7821,6 +8058,423 @@ mod tests {
         std::eprintln!(
             "mega-function 16384x16384: peak_delta={:.2} MiB (dense bitsets would be 128.00 MiB), elapsed={elapsed_ms:.1} ms",
             peak_delta as f64 / (1024.0 * 1024.0)
+        );
+    }
+
+    #[test]
+    fn large_offset_ldp_dual_spilled_defs_preserves_both_values() {
+        // Reproduces the Stage-2 `blaze::run_package::locate` crash: `Ldp` defines 2 spilled GPRs
+        // (`X16` and `X17`) whose spill slots both exceed `32 KiB` (`spill_base_off = 0xa000`).
+        // Previously `emit_spill_store(X16, off0, X64, X17)` emitted `add x17, sp, #0xa, lsl #12`,
+        // overwriting `X17` before `post_stores[1]` stored `X17` to `[sp + off1]`.
+        let alloc = test_alloc();
+        let mut func = new_ssa(Os::MacOs);
+        let b0 = func.new_block(false);
+        let v_ptr = func.alloc_vreg(VRegClass::Gpr64);
+        let v_a = func.alloc_vreg(VRegClass::Gpr64);
+        let v_b = func.alloc_vreg(VRegClass::Gpr64);
+
+        // Pin 32 non-remat GPR live ranges across the `Ldp` so ALL allocatable GPRs are busy
+        // with shorter live ranges than `(v_a, v_b)` and BOTH `v_a` and `v_b` spill at `>= 0xa000`.
+        let mut crowd: Vec<VReg, Alloc<'static>> = Vec::new_in(alloc);
+        for _ in 0..32 {
+            crowd.push(func.alloc_vreg(VRegClass::Gpr64));
+        }
+
+        func.begin_block(b0);
+        func.push_inst(
+            MOp::Mov { dst: MReg::V(v_ptr), src: MReg::p(PReg::X0), wide: true },
+            MInstFlags::NONE,
+        );
+        for (idx, &vc) in crowd.iter().enumerate() {
+            // Non-rematerializable `AddImm` from `v_ptr` so linear scan cannot remat them.
+            func.push_inst(
+                MOp::AddImm {
+                    dst: MReg::V(vc),
+                    rn: MReg::V(v_ptr),
+                    imm12: u16::try_from(idx + 1).expect("fits u16"),
+                    shift12: false,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+        }
+        // `Ldp` defines `v_a` and `v_b` simultaneously while all 26 GPRs are occupied.
+        func.push_inst(
+            MOp::Ldp {
+                dst0: MReg::V(v_a),
+                dst1: MReg::V(v_b),
+                base: MReg::V(v_ptr),
+                off: 0,
+                size: crate::sota::mfunc::MemSize::X64,
+                post_idx: false,
+                pre_idx: false,
+            },
+            MInstFlags::MEM_READ,
+        );
+        // Keep `v_ptr` and every crowd vreg live strictly past `Ldp` (so `v_ptr` does not free
+        // a register at `Ldp`), leaving 0 free GPRs for both `v_a` and `v_b`!
+        let mut v_sum = v_ptr;
+        for &vc in crowd.iter() {
+            let next = func.alloc_vreg(VRegClass::Gpr64);
+            func.push_inst(
+                MOp::AddReg {
+                    dst: MReg::V(next),
+                    rn: MReg::V(v_sum),
+                    rm: MReg::V(vc),
+                    shift: None,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            v_sum = next;
+        }
+        // Return `(v_a ^ (v_b << 1))` XOR'd with `(v_sum ^ v_sum)` so the exact pair dominates.
+        let v_zero = func.alloc_vreg(VRegClass::Gpr64);
+        func.push_inst(
+            MOp::SubReg {
+                dst: MReg::V(v_zero),
+                rn: MReg::V(v_sum),
+                rm: MReg::V(v_sum),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        let v_res = func.alloc_vreg(VRegClass::Gpr64);
+        func.push_inst(
+            MOp::AddReg {
+                dst: MReg::V(v_res),
+                rn: MReg::V(v_a),
+                rm: MReg::V(v_b),
+                shift: Some(MShift::Lsl(1)),
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(
+            MOp::AddReg {
+                dst: MReg::p(PReg::X0),
+                rn: MReg::V(v_res),
+                rm: MReg::V(v_zero),
+                shift: None,
+                wide: true,
+                sets_flags: false,
+            },
+            MInstFlags::NONE,
+        );
+        func.push_inst(MOp::Ret, MInstFlags::TERMINATOR);
+        func.end_block(b0);
+        func.rebuild_cfg(alloc);
+
+        let opts = MRaOpts { spill_base_off: 0xa000, allow_x29_leaf: false, ..MRaOpts::default() };
+        let out = allocate_mfunc(&mut func, opts, alloc)
+            .expect("large-offset dual-spilled Ldp must allocate cleanly");
+        assert_eq!(mverify(&func), Ok(()));
+        assert!(out.stats.spill_slots_used >= 2);
+
+        // Structural proof: right after `Ldp x16, x17, [...]`, `X17` MUST be parked via `fmov d, x17`
+        // BEFORE any `add x17, sp, #hi, lsl #12` overwrites `X17`!
+        let mut saw_ldp_x16_x17 = false;
+        let mut saw_park_before_clobber = false;
+        for (i, op) in func.ops.iter().enumerate() {
+            if let MOp::Ldp { dst0, dst1, .. } = *op
+                && ((*dst0_eq_x16_x17(dst0, dst1)))
+            {
+                saw_ldp_x16_x17 = true;
+                let window = &func.ops[i + 1..(i + 8).min(func.ops.len())];
+                let park_pos = window.iter().position(|w| {
+                    matches!(
+                        *w,
+                        MOp::FpAlu {
+                            op: crate::sota::mfunc::FpAluOp::MovFromGpr,
+                            rn: MReg::P(PReg::X17),
+                            double: true,
+                            ..
+                        }
+                    )
+                });
+                let clobber_pos = window.iter().position(|w| {
+                    matches!(
+                        *w,
+                        MOp::AddImm { dst: MReg::P(PReg::X17), rn: MReg::SP, shift12: true, .. }
+                    )
+                });
+                assert!(
+                    park_pos.is_some() && clobber_pos.is_some() && park_pos < clobber_pos,
+                    "X17 must be parked in FP scratch before `add x17, sp, #hi, lsl #12` clobbers it: window={window:?}"
+                );
+                saw_park_before_clobber = true;
+            }
+        }
+        fn dst0_eq_x16_x17(d0: MReg, d1: MReg) -> &'static bool {
+            if (d0 == MReg::p(PReg::X16) && d1 == MReg::p(PReg::X17))
+                || (d0 == MReg::p(PReg::X17) && d1 == MReg::p(PReg::X16))
+            {
+                &true
+            } else {
+                &false
+            }
+        }
+        assert!(saw_ldp_x16_x17 && saw_park_before_clobber, "test must exercise dual-spilled Ldp x16, x17");
+
+        // Live execution proof on Apple Silicon hardware with a real `> 0xa000`-byte frame!
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let mut framed = MFunc::new(MFuncOpts {
+                os: Os::MacOs,
+                is_ssa: false,
+                ret_live_gprs: func.ret_live_gprs,
+                alloc,
+            });
+            let fb = framed.new_block(false);
+            framed.begin_block(fb);
+            // Reserve `0xb000` bytes on stack (`0xa000` base + `0x1000` spill + callee saves).
+            framed.push_inst(
+                MOp::SubImm {
+                    dst: MReg::SP,
+                    rn: MReg::SP,
+                    imm12: 0xb,
+                    shift12: true,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::NONE,
+            );
+            // Save all callee-saved GPRs `X19..=X28` at `[sp + 0..80]`.
+            for r in 19u8..=28u8 {
+                framed.push_inst(
+                    MOp::Str {
+                        src: MReg::gpr(r),
+                        addr: AddrMode::BaseOff { base: MReg::SP, off: i32::from(r - 19) * 8 },
+                        size: MemSize::X64,
+                    },
+                    MInstFlags::MEM_WRITE,
+                );
+            }
+            for &op in func.ops.iter() {
+                if matches!(op, MOp::Ret) {
+                    for r in 19u8..=28u8 {
+                        framed.push_inst(
+                            MOp::Ldr {
+                                dst: MReg::gpr(r),
+                                addr: AddrMode::BaseOff { base: MReg::SP, off: i32::from(r - 19) * 8 },
+                                size: MemSize::X64,
+                                signed: false,
+                            },
+                            MInstFlags::MEM_READ,
+                        );
+                    }
+                    framed.push_inst(
+                        MOp::AddImm {
+                            dst: MReg::SP,
+                            rn: MReg::SP,
+                            imm12: 0xb,
+                            shift12: true,
+                            wide: true,
+                            sets_flags: false,
+                        },
+                        MInstFlags::NONE,
+                    );
+                }
+                framed.push_inst(op, MInstFlags::NONE);
+            }
+            framed.end_block(fb);
+            framed.rebuild_cfg(alloc);
+            assert_eq!(mverify(&framed), Ok(()));
+            let enc = mencode(&framed, alloc).expect("mencode must succeed");
+            let mut bytes: Vec<u8, Alloc<'static>> = Vec::with_capacity_in(enc.words.len() * 4, alloc);
+            for &w in enc.words.iter() {
+                for b in w.to_le_bytes() {
+                    bytes.push(b);
+                }
+            }
+            let exec = blaze_inproc::exec::Executable::new(&bytes, 0).expect("W^X mapping");
+            // SAFETY: `exec` is a valid AAPCS64 `extern "C" fn(*const u64) -> u64` preserving callee-saved regs.
+            let f: extern "C" fn(*const u64) -> u64 = unsafe { exec.as_fn() };
+            let pair: [u64; 2] = [0x1122_3344_5566_7788, 0x0000_0000_0000_000a];
+            let got = f(pair.as_ptr());
+            let want = pair[0].wrapping_add(pair[1] << 1);
+            assert_eq!(got, want, "Ldp second word (len=10) must not be clobbered by sp+0xa000");
+        }
+    }
+
+    #[test]
+    fn large_offset_fp_and_gpr_spilled_uses_and_writeback_fp_ldr_do_not_clobber_x16() {
+        use super::{AllocLoc, RewriteOut, VRegMeta, rewrite_single_inst};
+        use crate::sota::mfunc::{AddrMode, MemSize};
+
+        let alloc = test_alloc();
+        // 1. Pre-reload: `Str { src: fp_v0, addr: BaseOff { base: gpr_v1, off: 0 } }` where BOTH
+        //    `fp_v0` and `gpr_v1` are spilled at `> 32 KiB`. FP reload MUST precede GPR reload so
+        //    `add x16, sp, #hi, lsl #12` for FP does not clobber `X16` holding `gpr_v1`.
+        let mut out = RewriteOut::new(16, &[], 0xa000, 0x100, alloc);
+        let alloc_loc = [
+            AllocLoc::Spill { off: 0xa000, size: MemSize::D64 },
+            AllocLoc::Spill { off: 0xa008, size: MemSize::X64 },
+        ];
+        let mut meta0 = VRegMeta::new(VRegClass::Fp64);
+        meta0.bank = super::RegBank::Fp;
+        let meta1 = VRegMeta::new(VRegClass::Gpr64);
+        let metas = [meta0, meta1];
+        let op = MOp::Str {
+            src: MReg::V(VReg(0)),
+            addr: AddrMode::BaseOff { base: MReg::V(VReg(1)), off: 0 },
+            size: MemSize::D64,
+        };
+        let orig_ops = [op];
+        let orig_notes = [super::NO_NOTE];
+        rewrite_single_inst(
+            0,
+            op,
+            MInstFlags::MEM_WRITE,
+            super::NO_VFLAG,
+            super::NO_VFLAG,
+            super::NO_NOTE,
+            &alloc_loc,
+            &metas,
+            &orig_ops,
+            &orig_notes,
+            &mut out,
+        )
+        .expect("FP+GPR large-offset pre-reload must succeed");
+        let fp_ldr_pos = out
+            .ops
+            .iter()
+            .position(|o| matches!(*o, MOp::Ldr { dst: MReg::P(PReg::V(30)), .. }))
+            .expect("FP spill reload into V30");
+        let gpr_ldr_pos = out
+            .ops
+            .iter()
+            .position(|o| matches!(*o, MOp::Ldr { dst: MReg::P(PReg::X16), .. }))
+            .expect("GPR spill reload into X16");
+        assert!(
+            fp_ldr_pos < gpr_ldr_pos,
+            "FP spill reload must run before GPR reload into X16: ops={:?}",
+            out.ops
+        );
+
+        // 2. Post-store: writeback FP `Ldr { dst: fp_v0, addr: PostIdx { base: gpr_v1, off: 8 } }`
+        //    where BOTH `fp_v0` (`V30`) and `gpr_v1` (`X16`) are spilled at `> 32 KiB`.
+        //    The GPR post-store MUST run before the FP post-store so `add x16, sp, #hi, lsl #12`
+        //    for FP does not clobber `X16` before `X16` is stored!
+        let mut out2 = RewriteOut::new(16, &[], 0xa000, 0x100, alloc);
+        let wb_op = MOp::Ldr {
+            dst: MReg::V(VReg(0)),
+            addr: AddrMode::PostIdx { base: MReg::V(VReg(1)), off: 8 },
+            size: MemSize::D64,
+            signed: false,
+        };
+        let wb_ops = [wb_op];
+        rewrite_single_inst(
+            0,
+            wb_op,
+            MInstFlags::MEM_READ,
+            super::NO_VFLAG,
+            super::NO_VFLAG,
+            super::NO_NOTE,
+            &alloc_loc,
+            &metas,
+            &wb_ops,
+            &orig_notes,
+            &mut out2,
+        )
+        .expect("writeback FP Ldr large-offset post-store must succeed");
+        let gpr_str_pos = out2
+            .ops
+            .iter()
+            .position(|o| matches!(*o, MOp::Str { src: MReg::P(PReg::X16), .. }))
+            .expect("GPR spill store from X16");
+        let fp_str_pos = out2
+            .ops
+            .iter()
+            .position(|o| matches!(*o, MOp::Str { src: MReg::P(PReg::V(30)), .. }))
+            .expect("FP spill store from V30");
+        assert!(
+            gpr_str_pos < fp_str_pos,
+            "GPR post-store must run before FP post-store using X16 as addr scratch: ops={:?}",
+            out2.ops
+        );
+    }
+
+    #[test]
+    fn large_offset_parallel_copy_spill_swap_cycles_do_not_clobber_cycle_reg() {
+        use blaze_own::CollectIn;
+        use super::{AllocLoc, RewriteOut, VRegMeta, lower_parallel_copy};
+        use crate::sota::mfunc::{MInst, MemSize};
+
+        let alloc = test_alloc();
+        // 1. GPR `Spill(0xa000) <-> Spill(0xa008)` swap cycle: `X16` holds the saved value of
+        //    slot `0xa000` while slot `0xa000 <- slot 0xa008` executes. It MUST NOT overwrite `X16`
+        //    without parking `X16` first!
+        let mut out = RewriteOut::new(32, &[], 0xa000, 0x100, alloc);
+        let alloc_loc = [
+            AllocLoc::Spill { off: 0xa000, size: MemSize::X64 },
+            AllocLoc::Spill { off: 0xa008, size: MemSize::X64 },
+            AllocLoc::Spill { off: 0xa010, size: MemSize::D64 },
+            AllocLoc::Spill { off: 0xa018, size: MemSize::D64 },
+        ];
+        let m_gpr = VRegMeta::new(VRegClass::Gpr64);
+        let mut m_fp = VRegMeta::new(VRegClass::Fp64);
+        m_fp.bank = super::RegBank::Fp;
+        let metas = [m_gpr, m_gpr, m_fp, m_fp];
+
+        let gpr_swap = [
+            (MReg::V(VReg(0)), MReg::V(VReg(1))),
+            (MReg::V(VReg(1)), MReg::V(VReg(0))),
+        ];
+        lower_parallel_copy(MInst(0), &gpr_swap, &alloc_loc, &metas, &[], &[], &mut out, alloc)
+            .expect("large-offset GPR spill swap must succeed");
+        // First load saves slot 0 into `X16`; the second load MUST target `X17` (not `X16`)!
+        let load_dsts: Vec<MReg, Alloc<'static>> = out
+            .ops
+            .iter()
+            .filter_map(|o| match *o {
+                MOp::Ldr { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .collect_in(alloc);
+        assert_eq!(
+            load_dsts.as_slice(),
+            &[MReg::p(PReg::X16), MReg::p(PReg::X17)],
+            "second load in GPR spill swap must use X17, not clobber live X16: ops={:?}",
+            out.ops
+        );
+        assert!(
+            out.ops.iter().any(|o| matches!(
+                *o,
+                MOp::FpAlu { op: crate::sota::mfunc::FpAluOp::MovFromGpr, rn: MReg::P(PReg::X16), double: true, .. }
+            )),
+            "live X16 must be parked in FP scratch before large-offset store uses X16 as addr_sc: ops={:?}",
+            out.ops
+        );
+
+        // 2. FP `Spill(0xa010) <-> Spill(0xa018)` swap cycle: `V30` holds saved slot `0xa010`, so
+        //    the copy `0xa010 <- 0xa018` MUST use `V31` (never overwriting `V30`)!
+        let mut out_fp = RewriteOut::new(32, &[], 0xa000, 0x100, alloc);
+        let fp_swap = [
+            (MReg::V(VReg(2)), MReg::V(VReg(3))),
+            (MReg::V(VReg(3)), MReg::V(VReg(2))),
+        ];
+        lower_parallel_copy(MInst(0), &fp_swap, &alloc_loc, &metas, &[], &[], &mut out_fp, alloc)
+            .expect("large-offset FP spill swap must succeed");
+        let fp_load_dsts: Vec<MReg, Alloc<'static>> = out_fp
+            .ops
+            .iter()
+            .filter_map(|o| match *o {
+                MOp::Ldr { dst, .. } => Some(dst),
+                _ => None,
+            })
+            .collect_in(alloc);
+        assert_eq!(
+            fp_load_dsts.as_slice(),
+            &[MReg::p(PReg::V(30)), MReg::p(PReg::V(31))],
+            "second load in FP spill swap must use V31, not clobber live V30: ops={:?}",
+            out_fp.ops
         );
     }
 }
