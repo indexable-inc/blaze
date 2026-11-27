@@ -172,16 +172,20 @@ impl<'a> FactFiles<'a> {
             // mid-sweep `/run/current-system` switch cannot let later leaves pass under the old closure,
             // while still reusing `self.root_reader` across leaves.
             let id = match (self.home, self.home_path) {
-                (Some((cx, _)), Some(home)) => {
+                (Some((cx, home_dir)), Some(home)) => {
                     if self.root_reader.as_ref().is_none_or(|r| r.is_stalled()) {
                         let created = bstd::procs::hermetic::RootReader::new(cx).map_err(|_| {
                             CliError::Text { what: "cannot open root reader for c-probe runtime closure identity" }
                         })?;
                         self.root_reader = Some(created);
                     }
+                    let elf_dir = Path::new("v2/build-script/records/elf-inodes-v1")
+                        .ok()
+                        .map(|rel| home_dir.subdir(&rel));
                     let computed = match self.root_reader.as_ref() {
                         Some(reader) => blaze_proc_macro::probe_clang::HermeticClangProbe::strategy_id_for_home_with(
                             reader,
+                            elf_dir.as_ref(),
                             cx,
                             home,
                             crate::graph::TRIPLE,

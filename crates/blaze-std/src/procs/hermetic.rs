@@ -43,6 +43,7 @@ use super::{Exit, Spawner};
 use crate::cx::Cx;
 
 mod execution;
+pub(crate) mod inode_record;
 mod machine;
 mod plan;
 mod report;
@@ -71,6 +72,7 @@ pub const CONFINEMENT_SOURCE: &[&[u8]] = &[
     include_bytes!("linked/run.rs"),
     include_bytes!("hermetic.rs"),
     include_bytes!("hermetic/execution.rs"),
+    include_bytes!("hermetic/inode_record.rs"),
     include_bytes!("hermetic/machine.rs"),
     include_bytes!("hermetic/native.rs"),
     include_bytes!("hermetic/plan.rs"),
@@ -109,7 +111,6 @@ pub struct VerifiedExec {
     len: u64,
 }
 
-#[cfg(target_os = "linux")]
 pub(super) fn remaining_for_cx(cx: &Cx) -> Result<Duration, crate::Stopped> {
     cx.check()?;
     let deadline = cx.deadline();
@@ -390,8 +391,7 @@ impl RootReader {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn fs_err_to_fault(call: &'static str, err: &crate::fs::FsError) -> Fault {
+pub(super) fn fs_err_to_fault(call: &'static str, err: &crate::fs::FsError) -> Fault {
     let code = match &err.kind {
         crate::fs::FsKind::Stopped(_) => 110,
         crate::fs::FsKind::NotFound => 2,
@@ -849,6 +849,12 @@ impl<T> StandbyReaperCore<T> {
     }
 }
 
+pub use inode_record::{
+    DirInodeRecordIo, ELF_INODE_RECORD_SUBDIR, InodeRecord, InodeRecordIo, InodeRecordPlant,
+    InodeStamp, MAX_INODE_RECORD_BYTES, MAX_INODE_RECORD_ENTRIES, RecordCorrupt, RecordRead,
+    decode_record, decode_record_with_parser, encode_record, encode_record_with_parser,
+    lookup_inode_record, parser_identity, publish_inode_record, publish_inode_record_capped,
+};
 #[cfg(target_os = "linux")]
 pub use landlock::{
     HostLdCaps, PreloadScanner, dl_dst_lib_token, dl_dst_platform_token, expand_rpath_tokens,

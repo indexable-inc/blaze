@@ -27,7 +27,7 @@
 
 use core::ffi::CStr;
 
-use blaze_own::{AVec, Alloc, planted::NoPlant};
+use blaze_own::{Alloc, SharedAlloc, Vec as OwnVec, planted::NoPlant};
 use blaze_sys::{
     Fd,
     linux::{
@@ -35,6 +35,11 @@ use blaze_sys::{
         confine::{self, ChildConfine, Filter, MOST_FILTER, Resource, Rlimit},
         landlock_abi, landlock_add_rule_path, landlock_create_ruleset, openat, pread, readlinkat,
     },
+};
+
+use super::inode_record::{
+    DirInodeRecordIo, InodeRecord, InodeRecordIo, InodeRecordPlant, InodeStamp,
+    lookup_inode_record, publish_inode_record,
 };
 
 use super::{
@@ -201,13 +206,16 @@ pub fn feed_nix_runtime_closure(
     feed: &mut dyn FnMut(&[u8]),
 ) -> Result<bool, Fault> {
     let reader = super::RootReader::new(cx)?;
-    feed_nix_runtime_closure_with(&reader, cx, program_path, alloc, feed)
+    feed_nix_runtime_closure_with(&reader, None, cx, program_path, alloc, feed)
 }
 
-/// Same as [`feed_nix_runtime_closure`], reusing a caller-owned [`super::RootReader`] so
-/// cancelled/stalled reads never allocate or leak a fresh async driver per probe.
+/// Same as [`feed_nix_runtime_closure`], reusing a caller-owned [`super::RootReader`] (so
+/// cancelled/stalled reads never allocate or leak a fresh async driver per probe) and an optional
+/// caller-owned capability `record_dir` (`bstd::fs::Dir<ReadWrite>`) for immutable write-once
+/// on-disk ELF inode records read from the kernel page cache (Rule 51: zero process-memory cache).
 pub fn feed_nix_runtime_closure_with(
     reader: &super::RootReader,
+    record_dir: Option<&crate::fs::Dir<crate::fs::ReadWrite>>,
     cx: &Cx,
     program_path: &str,
     alloc: Alloc<'_>,
@@ -225,10 +233,20 @@ pub fn feed_nix_runtime_closure_with(
     let Ok(cstr) = CStr::from_bytes_until_nul(name.get(..=bytes.len()).unwrap_or(&[0])) else {
         return Err(Fault::Host { call: "nix runtime closure (invalid program path)", code: 22 });
     };
+    let dir_io = record_dir.map(|dir| DirInodeRecordIo::new(dir, cx));
+    let record_io: Option<&dyn InodeRecordIo> = dir_io.as_ref().map(|io| io as &dyn InodeRecordIo);
     let mut opt_feed = Some(feed);
     // `HermeticClangProbe` always launches the verified binary via anonymous sealed `memfd`
     // (`execveat(..., AT_EMPTY_PATH)`), so model the exact memfd `$ORIGIN` (`"/"`).
-    walk_nix_elf_closure(Some(reader), Some(cx), Some(alloc), None, cstr, None, true, None, false, &mut opt_feed)
+    walk_nix_elf_closure(Some(reader), record_io, Some(cx), Some(alloc), None, cstr, None, true, None, false, &mut opt_feed)
+}
+
+fn now_sec_for_cx(cx: Option<&Cx>) -> i64 {
+    let Some(cx) = cx else {
+        return 0;
+    };
+    let secs = cx.io().wall_ns() / 1_000_000_000;
+    i64::try_from(secs).unwrap_or(0)
 }
 
 fn check_nix_cx(cx: Option<&Cx>) -> Result<(), Fault> {
@@ -316,7 +334,7 @@ fn grant_nix_elf_closure(
 ) -> Result<(), Fault> {
     let mut no_feed: Option<&mut dyn FnMut(&[u8])> = None;
     let memfd_origin = verified_exec_fd.is_some();
-    let _ = walk_nix_elf_closure(None, None, alloc, Some(ruleset), program, verified_exec_fd, memfd_origin, Some(plan), has_helper_folder, &mut no_feed)?;
+    let _ = walk_nix_elf_closure(None, None, None, alloc, Some(ruleset), program, verified_exec_fd, memfd_origin, Some(plan), has_helper_folder, &mut no_feed)?;
     Ok(())
 }
 
@@ -351,6 +369,7 @@ pub fn validate_rpath_entry(
 #[expect(clippy::too_many_arguments, reason = "internal ELF closure walker shared between Landlock admission and strategy hashing")]
 fn walk_nix_elf_closure(
     reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
     cx: Option<&Cx>,
     alloc: Option<Alloc<'_>>,
     ruleset: Option<Fd>,
@@ -367,6 +386,7 @@ fn walk_nix_elf_closure(
     const NIX_LD_SO: &CStr = c"/run/current-system/sw/share/nix-ld/lib/ld.so";
 
     check_nix_cx(cx)?;
+    let now_sec = now_sec_for_cx(cx);
 
     let opened_prog = match verified_exec_fd {
         Some(_) => None,
@@ -384,20 +404,13 @@ fn walk_nix_elf_closure(
         (None, Some(owned)) => owned.fd(),
         (None, None) => return Ok(false),
     };
-    let Some(hdr) = parse_elf64_meta(reader, cx, prog_fd)? else {
+    let Some(prog_elf) = load_or_compute_elf_record(reader, record_io, cx, now_sec, prog_fd, false)? else {
         return Ok(false);
     };
-    if hdr.interp_len == 0 {
+    if prog_elf.interp.is_empty() {
         return Ok(false);
     }
-    let mut interp_buf = [0u8; 512];
-    let Some(interp_slice) = interp_buf.get_mut(..hdr.interp_len) else {
-        return Ok(false);
-    };
-    let n = read_nix_at(reader, cx, prog_fd, interp_slice, hdr.interp_off, "pread (nix ELF PT_INTERP)")?;
-    let Some(interp_bytes) = interp_buf.get(..n) else {
-        return Ok(false);
-    };
+    let interp_bytes = prog_elf.interp.as_slice();
     let nul_pos = interp_bytes.iter().position(|&b| b == 0).unwrap_or(interp_bytes.len());
     let mut interp_c = [0u8; 513];
     if let (Some(dst), Some(src)) = (interp_c.get_mut(..nul_pos), interp_bytes.get(..nul_pos)) {
@@ -486,45 +499,24 @@ fn walk_nix_elf_closure(
             add_nix_loader_rule(rs, NIX_LD_SO)?;
         }
     }
-    let mut ld_cache_bytes: Option<AVec<'_, u8>> = None;
+    let mut ld_cache_raw: Option<OwnVec<u8, SharedAlloc<'static>>> = None;
     if let Some(f) = feed.as_deref_mut() {
-        feed_nix_file_by_path(reader, cx, interp_cstr, f)?;
+        feed_nix_file_by_path(reader, record_io, cx, now_sec, interp_cstr, f)?;
         if is_nix_ld {
-            feed_nix_file_by_path(reader, cx, NIX_LD_SO, f)?;
+            feed_nix_file_by_path(reader, record_io, cx, now_sec, NIX_LD_SO, f)?;
         }
         if !is_nix {
             match openat(CWD, blaze_sys::Path::new(c"/etc/ld.so.cache"), OpenFlags::CLOSE_ON_EXEC, 0) {
                 Ok(cache_fd) => {
-                    if let Some(a) = alloc {
-                        let framing = 4 + b"/etc/ld.so.cache".len() + 8;
-                        let mut captured = AVec::new_in(a);
-                        let mut overflow = false;
-                        feed_nix_fd(reader, cx, b"/etc/ld.so.cache", cache_fd.fd(), &mut |chunk| {
-                            f(chunk);
-                            if captured.len().saturating_add(chunk.len()) <= MAX_LD_CACHE_BYTES + framing {
-                                captured.extend_from_slice(chunk);
-                            } else {
-                                overflow = true;
-                            }
-                        })?;
-                        // `feed_nix_fd` frames the stream with a 4-byte path len + 16-byte path
-                        // prefix and an 8-byte total-length trailer; strip those framing bytes so
-                        // `captured` holds ONLY the exact raw `/etc/ld.so.cache` file contents.
-                        if overflow {
-                            return Err(Fault::Host { call: "read (/etc/ld.so.cache exceeds 4 MiB cap)", code: 27 });
-                        }
-                        let prefix = 4 + b"/etc/ld.so.cache".len();
-                        let trailer = 8;
-                        if captured.len() >= prefix + trailer {
-                            let body_len = captured.len() - prefix - trailer;
-                            let mut raw = AVec::with_capacity_in(body_len, a);
-                            if let Some(body) = captured.as_slice().get(prefix..prefix + body_len) {
-                                raw.extend_from_slice(body);
-                            }
-                            ld_cache_bytes = Some(raw);
-                        }
+                    if alloc.is_some() {
+                        let raw = read_ld_cache_bounded(reader, cx, cache_fd.fd())?;
+                        let sha256 = blaze_sha256::digest(raw.as_slice());
+                        let total_len = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+                        feed_framed_digest(b"/etc/ld.so.cache", &sha256, total_len, f);
+                        ld_cache_raw = Some(raw);
                     } else {
-                        feed_nix_fd(reader, cx, b"/etc/ld.so.cache", cache_fd.fd(), f)?;
+                        let (total_len, sha256) = stream_fd_sha256(reader, cx, cache_fd.fd())?;
+                        feed_framed_digest(b"/etc/ld.so.cache", &sha256, total_len, f);
                     }
                 }
                 Err(blaze_sys::Errno::NoEnt) => {}
@@ -533,30 +525,10 @@ fn walk_nix_elf_closure(
                 }
             }
         }
-    } else if !is_nix
-        && let Some(a) = alloc
-    {
+    } else if !is_nix && alloc.is_some() {
         match openat(CWD, blaze_sys::Path::new(c"/etc/ld.so.cache"), OpenFlags::CLOSE_ON_EXEC, 0) {
             Ok(cache_fd) => {
-                let mut raw = AVec::new_in(a);
-                let mut buf = [0u8; 64 << 10];
-                let mut off = 0u64;
-                loop {
-                    let n = pread(cache_fd.fd(), &mut buf, off)
-                        .map_err(|errno| Fault::Host { call: "pread (/etc/ld.so.cache)", code: errno.raw() })?;
-                    if n == 0 {
-                        break;
-                    }
-                    if raw.len().saturating_add(n) > MAX_LD_CACHE_BYTES {
-                        return Err(Fault::Host { call: "read (/etc/ld.so.cache exceeds 4 MiB cap)", code: 27 });
-                    }
-                    if let Some(chunk) = buf.get(..n) {
-                        raw.extend_from_slice(chunk);
-                    }
-                    let step = u64::try_from(n).map_err(|_| Fault::Host { call: "pread (/etc/ld.so.cache overflow)", code: 75 })?;
-                    off = off.checked_add(step).ok_or(Fault::Host { call: "pread (/etc/ld.so.cache overflow)", code: 75 })?;
-                }
-                ld_cache_bytes = Some(raw);
+                ld_cache_raw = Some(read_ld_cache_bounded(None, None, cache_fd.fd())?);
             }
             Err(blaze_sys::Errno::NoEnt) => {}
             Err(errno) => {
@@ -631,64 +603,26 @@ fn walk_nix_elf_closure(
             None => break,
         };
         q_head += 1;
-        let opened_cur = if cur_idx == 0 && verified_exec_fd.is_some() {
+        let loaded_cur: Option<InodeRecord> = if cur_idx == 0 {
             None
         } else {
             let Ok(cur_cstr) = CStr::from_bytes_until_nul(cur_path.get(..=cur_len).unwrap_or(&[0])) else {
                 return Err(Fault::Host { call: "landlock (NixOS ELF invalid queued path)", code: 22 });
             };
-            Some(
-                openat(CWD, blaze_sys::Path::new(cur_cstr), OpenFlags::CLOSE_ON_EXEC, 0)
-                    .map_err(|errno| Fault::Host { call: "openat (nix ELF closure object)", code: errno.raw() })?,
-            )
+            let opened_cur = openat(CWD, blaze_sys::Path::new(cur_cstr), OpenFlags::CLOSE_ON_EXEC, 0)
+                .map_err(|errno| Fault::Host { call: "openat (nix ELF closure object)", code: errno.raw() })?;
+            let Some(summary) = load_or_compute_elf_record(reader, record_io, cx, now_sec, opened_cur.fd(), false)? else {
+                continue;
+            };
+            Some(summary)
         };
-        let elf_fd = match (cur_idx == 0, verified_exec_fd, &opened_cur) {
-            (true, Some(fd), _) => fd,
-            (_, _, Some(owned)) => owned.fd(),
-            _ => continue,
+        let elf: &InodeRecord = match loaded_cur.as_ref() {
+            Some(rec) => rec,
+            None => &prog_elf,
         };
-        let Some(meta) = parse_elf64_meta(reader, cx, elf_fd)? else {
-            continue;
-        };
-        if meta.dyn_len == 0 {
+        if !elf.has_dyn {
             continue;
         }
-        let mut dyn_buf = [0u8; 8192];
-        let Some(dyn_slice) = dyn_buf.get_mut(..meta.dyn_len) else {
-            return Err(Fault::Host { call: "landlock (NixOS ELF PT_DYNAMIC exceeds cap)", code: 7 });
-        };
-        let dyn_read = read_nix_at(reader, cx, elf_fd, dyn_slice, meta.dyn_off, "pread (nix ELF PT_DYNAMIC)")?;
-        let mut strtab_vaddr = None;
-        let mut runpath_off = None;
-        let mut rpath_off = None;
-        let mut needed_offs = [0u64; 128];
-        let mut needed_count = 0usize;
-        let mut pos = 0usize;
-        while pos + 16 <= dyn_read {
-            let tag = read_u64_le(&dyn_buf, pos);
-            let val = read_u64_le(&dyn_buf, pos + 8);
-            pos += 16;
-            match tag {
-                0 => break,                // DT_NULL
-                1 => {                     // DT_NEEDED
-                    let Some(slot) = needed_offs.get_mut(needed_count) else {
-                        return Err(Fault::Host { call: "landlock (NixOS ELF DT_NEEDED exceeds cap)", code: 7 });
-                    };
-                    *slot = val;
-                    needed_count += 1;
-                }
-                5 => strtab_vaddr = Some(val), // DT_STRTAB
-                15 => rpath_off = Some(val),   // DT_RPATH
-                29 => runpath_off = Some(val), // DT_RUNPATH
-                _ => {}
-            }
-        }
-        let Some(strtab_vaddr) = strtab_vaddr else {
-            continue;
-        };
-        let Some(strtab_file_off) = meta.vaddr_to_offset(strtab_vaddr) else {
-            continue;
-        };
 
         // Resolve search directories with exact glibc ELF lookup order:
         // - `DT_RUNPATH` applies ONLY to direct dependencies of this object (non-transitive);
@@ -710,39 +644,23 @@ fn walk_nix_elf_closure(
         };
         let mut search_dirs = [([0u8; PATH_CAP], 0usize); 16];
         let mut search_count = 0usize;
-        let child_chain = if let Some(rp_off) = runpath_off {
-            if let Some(at) = strtab_file_off.checked_add(rp_off) {
-                let mut rp_buf = [0u8; 2048];
-                let n = read_nix_at(reader, cx, elf_fd, &mut rp_buf, at, "pread (nix ELF DT_RUNPATH)")?;
-                let raw = rp_buf.get(..n).unwrap_or(&[]);
-                let Some(end) = raw.iter().position(|&b| b == 0) else {
-                    return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH exceeds buffer cap)", code: 7 });
-                };
-                let rp_raw = raw.get(..end).unwrap_or(&[]);
-                if !rp_raw.is_empty() {
-                    for entry in rp_raw.split(|&b| b == b':') {
-                        let Some(slot) = search_dirs.get_mut(search_count) else {
-                            return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entries exceed cap)", code: 7 });
-                        };
-                        let expanded_len = validate_rpath_entry(entry, origin_dir, lib_token, platform_token, &mut slot.0)?;
-                        slot.1 = expanded_len;
-                        search_count += 1;
-                    }
+        let child_chain = if let Some(rp_vec) = elf.runpath.as_ref() {
+            let rp_raw = rp_vec.as_slice();
+            if !rp_raw.is_empty() {
+                for entry in rp_raw.split(|&b| b == b':') {
+                    let Some(slot) = search_dirs.get_mut(search_count) else {
+                        return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH entries exceed cap)", code: 7 });
+                    };
+                    let expanded_len = validate_rpath_entry(entry, origin_dir, lib_token, platform_token, &mut slot.0)?;
+                    slot.1 = expanded_len;
+                    search_count += 1;
                 }
             }
             inherited_chain
         } else {
             let mut eff_chain = RpathChain::EMPTY;
-            if let Some(rp_off) = rpath_off
-                && let Some(at) = strtab_file_off.checked_add(rp_off)
-            {
-                let mut rp_buf = [0u8; 2048];
-                let n = read_nix_at(reader, cx, elf_fd, &mut rp_buf, at, "pread (nix ELF DT_RPATH)")?;
-                let raw = rp_buf.get(..n).unwrap_or(&[]);
-                let Some(end) = raw.iter().position(|&b| b == 0) else {
-                    return Err(Fault::Host { call: "landlock (NixOS ELF RPATH exceeds buffer cap)", code: 7 });
-                };
-                let rp_raw = raw.get(..end).unwrap_or(&[]);
+            if let Some(rp_vec) = elf.rpath.as_ref() {
+                let rp_raw = rp_vec.as_slice();
                 if !rp_raw.is_empty() {
                     for entry in rp_raw.split(|&b| b == b':') {
                         let mut exp = [0u8; PATH_CAP];
@@ -769,18 +687,7 @@ fn walk_nix_elf_closure(
             eff_chain
         };
 
-        let mut name_buf = [0u8; 320];
-        for &str_off in needed_offs.get(..needed_count).unwrap_or(&[]) {
-            let Some(at) = strtab_file_off.checked_add(str_off) else {
-                continue;
-            };
-            let n = read_nix_at(reader, cx, elf_fd, &mut name_buf, at, "pread (nix ELF DT_NEEDED)")?;
-            let raw = name_buf.get(..n).unwrap_or(&[]);
-            let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-            let soname = raw.get(..end).unwrap_or(&[]);
-            if soname.is_empty() {
-                continue;
-            }
+        for soname in elf.needed_blob.as_slice().split(|&b| b == 0).filter(|s| !s.is_empty()) {
             if soname.contains(&b'/') {
                 let mut expanded = [0u8; PATH_CAP];
                 let exp_len = expand_rpath_tokens(soname, origin_dir, lib_token, platform_token, &mut expanded)?;
@@ -798,7 +705,9 @@ fn walk_nix_elf_closure(
                 }
                 if !try_grant_and_enqueue_lib(
                     reader,
+                    record_io,
                     cx,
+                    now_sec,
                     ruleset,
                     b"",
                     exp_slice,
@@ -819,7 +728,9 @@ fn walk_nix_elf_closure(
             } else {
                 enqueue_nix_soname(
                     reader,
+                    record_io,
                     cx,
+                    now_sec,
                     ruleset,
                     soname,
                     search_dirs.get(..search_count).unwrap_or(&[]),
@@ -827,7 +738,7 @@ fn walk_nix_elf_closure(
                     NIX_LD_DIR,
                     glibc_dir,
                     is_nix,
-                    ld_cache_bytes.as_deref(),
+                    ld_cache_raw.as_ref().map(OwnVec::as_slice),
                     &host_ld_caps,
                     plan,
                     &mut queue,
@@ -841,6 +752,7 @@ fn walk_nix_elf_closure(
 }
 
 struct Elf64Meta {
+    e_machine: u16,
     interp_off: u64,
     interp_len: usize,
     dyn_off: u64,
@@ -858,22 +770,174 @@ impl Elf64Meta {
     }
 }
 
+fn load_or_compute_elf_record(
+    reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
+    cx: Option<&Cx>,
+    now_sec: i64,
+    fd: Fd,
+    need_digest: bool,
+) -> Result<Option<InodeRecord>, Fault> {
+    let stamp = match record_io {
+        Some(_) => InodeStamp::from_fd(fd)?,
+        None => None,
+    };
+    if let (Some(io), Some(st)) = (record_io, stamp)
+        && let Some(hit) = lookup_inode_record(io, st, now_sec, need_digest, InodeRecordPlant::None)?
+    {
+        return Ok(Some(hit));
+    }
+    let Some(meta) = parse_elf64_meta(reader, cx, fd)? else {
+        return Ok(None);
+    };
+    let shared = SharedAlloc::global();
+    let mut interp = OwnVec::new_in(shared);
+    if meta.interp_len > 0 {
+        let mut interp_buf = [0u8; 512];
+        if let Some(interp_slice) = interp_buf.get_mut(..meta.interp_len) {
+            let n = read_nix_at(reader, cx, fd, interp_slice, meta.interp_off, "pread (nix ELF PT_INTERP)")?;
+            if let Some(bytes) = interp_buf.get(..n) {
+                let nul_pos = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                if let Some(src) = bytes.get(..nul_pos) {
+                    interp.extend_from_slice(src);
+                }
+            }
+        }
+    }
+    let mut has_dyn = false;
+    let mut runpath: Option<OwnVec<u8, SharedAlloc<'static>>> = None;
+    let mut rpath: Option<OwnVec<u8, SharedAlloc<'static>>> = None;
+    let mut needed_blob = OwnVec::new_in(shared);
+    if meta.dyn_len > 0 {
+        let mut dyn_buf = [0u8; 8192];
+        let Some(dyn_slice) = dyn_buf.get_mut(..meta.dyn_len) else {
+            return Err(Fault::Host { call: "landlock (NixOS ELF PT_DYNAMIC exceeds cap)", code: 7 });
+        };
+        let dyn_read = read_nix_at(reader, cx, fd, dyn_slice, meta.dyn_off, "pread (nix ELF PT_DYNAMIC)")?;
+        let mut strtab_vaddr = None;
+        let mut runpath_off = None;
+        let mut rpath_off = None;
+        let mut needed_offs = [0u64; 128];
+        let mut needed_count = 0usize;
+        let mut pos = 0usize;
+        while pos + 16 <= dyn_read {
+            let tag = read_u64_le(&dyn_buf, pos);
+            let val = read_u64_le(&dyn_buf, pos + 8);
+            pos += 16;
+            match tag {
+                0 => break,                // DT_NULL
+                1 => {                     // DT_NEEDED
+                    let Some(slot) = needed_offs.get_mut(needed_count) else {
+                        return Err(Fault::Host { call: "landlock (NixOS ELF DT_NEEDED exceeds cap)", code: 7 });
+                    };
+                    *slot = val;
+                    needed_count += 1;
+                }
+                5 => strtab_vaddr = Some(val), // DT_STRTAB
+                15 => rpath_off = Some(val),   // DT_RPATH
+                29 => runpath_off = Some(val), // DT_RUNPATH
+                _ => {}
+            }
+        }
+        if let Some(strtab_vaddr) = strtab_vaddr
+            && let Some(strtab_file_off) = meta.vaddr_to_offset(strtab_vaddr)
+        {
+            has_dyn = true;
+            if let Some(rp_off) = runpath_off {
+                let mut rp_vec = OwnVec::new_in(shared);
+                if let Some(at) = strtab_file_off.checked_add(rp_off) {
+                    let mut rp_buf = [0u8; 2048];
+                    let n = read_nix_at(reader, cx, fd, &mut rp_buf, at, "pread (nix ELF DT_RUNPATH)")?;
+                    let raw = rp_buf.get(..n).unwrap_or(&[]);
+                    let Some(end) = raw.iter().position(|&b| b == 0) else {
+                        return Err(Fault::Host { call: "landlock (NixOS ELF RUNPATH exceeds buffer cap)", code: 7 });
+                    };
+                    if let Some(src) = raw.get(..end) {
+                        rp_vec.extend_from_slice(src);
+                    }
+                }
+                runpath = Some(rp_vec);
+            } else if let Some(rp_off) = rpath_off
+                && let Some(at) = strtab_file_off.checked_add(rp_off)
+            {
+                let mut rp_buf = [0u8; 2048];
+                let n = read_nix_at(reader, cx, fd, &mut rp_buf, at, "pread (nix ELF DT_RPATH)")?;
+                let raw = rp_buf.get(..n).unwrap_or(&[]);
+                let Some(end) = raw.iter().position(|&b| b == 0) else {
+                    return Err(Fault::Host { call: "landlock (NixOS ELF RPATH exceeds buffer cap)", code: 7 });
+                };
+                let mut rp_vec = OwnVec::new_in(shared);
+                if let Some(src) = raw.get(..end) {
+                    rp_vec.extend_from_slice(src);
+                }
+                rpath = Some(rp_vec);
+            }
+            let mut name_buf = [0u8; 320];
+            for &str_off in needed_offs.get(..needed_count).unwrap_or(&[]) {
+                let Some(at) = strtab_file_off.checked_add(str_off) else {
+                    continue;
+                };
+                let n = read_nix_at(reader, cx, fd, &mut name_buf, at, "pread (nix ELF DT_NEEDED)")?;
+                let raw = name_buf.get(..n).unwrap_or(&[]);
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let soname = raw.get(..end).unwrap_or(&[]);
+                if !soname.is_empty() {
+                    needed_blob.extend_from_slice(soname);
+                    needed_blob.push(0);
+                }
+            }
+        }
+    }
+    let digest = if need_digest {
+        Some(stream_fd_sha256(reader, cx, fd)?)
+    } else {
+        None
+    };
+    let rec_stamp = stamp.unwrap_or(InodeStamp {
+        dev: 0,
+        ino: 0,
+        mode: 0,
+        size: 0,
+        mtime_sec: 0,
+        mtime_nsec: 0,
+        ctime_sec: 0,
+        ctime_nsec: 0,
+    });
+    let record = InodeRecord {
+        stamp: rec_stamp,
+        digest,
+        e_machine: meta.e_machine,
+        has_dyn,
+        interp,
+        runpath,
+        rpath,
+        needed_blob,
+    };
+    if let (Some(io), Some(_)) = (record_io, stamp) {
+        let _ = publish_inode_record(io, &record, now_sec, InodeRecordPlant::None)?;
+    }
+    Ok(Some(record))
+}
+
 fn parse_elf64_meta(
     reader: Option<&super::RootReader>,
     cx: Option<&Cx>,
     fd: Fd,
 ) -> Result<Option<Elf64Meta>, Fault> {
-    let mut ehdr = [0u8; 64];
-    let ehdr_n = read_nix_at(reader, cx, fd, &mut ehdr, 0, "pread (nix ELF header)")?;
-    if ehdr_n < 64 {
+    // Batch ELF64 header + program header table into a single 4 KiB read (covers 99.9%+ of
+    // ELF64 binaries and cuts ~12 async open+read round-trips per object down to 1).
+    let mut head = [0u8; 4096];
+    let head_n = read_nix_at(reader, cx, fd, &mut head, 0, "pread (nix ELF header)")?;
+    if head_n < 64 {
         return Ok(None);
     }
-    if ehdr.get(..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
+    if head.get(..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
         return Ok(None);
     }
-    let e_phoff = read_u64_le(&ehdr, 32);
-    let e_phentsize = usize::from(read_u16_le(&ehdr, 54));
-    let e_phnum = usize::from(read_u16_le(&ehdr, 56));
+    let e_machine = read_u16_le(&head, 18);
+    let e_phoff = read_u64_le(&head, 32);
+    let e_phentsize = usize::from(read_u16_le(&head, 54));
+    let e_phnum = usize::from(read_u16_le(&head, 56));
     if e_phentsize < 56 || e_phnum == 0 {
         return Ok(None);
     }
@@ -881,6 +945,7 @@ fn parse_elf64_meta(
         return Err(Fault::Host { call: "landlock (NixOS ELF program header count exceeds cap)", code: 7 });
     }
     let mut meta = Elf64Meta {
+        e_machine,
         interp_off: 0,
         interp_len: 0,
         dyn_off: 0,
@@ -888,26 +953,11 @@ fn parse_elf64_meta(
         loads: [(0, 0, 0); 16],
         load_count: 0,
     };
-    let mut ph_buf = [0u8; 64];
-    for i in 0..e_phnum {
-        let Some(off) = u64::try_from(i)
-            .ok()
-            .and_then(|n| n.checked_mul(u64::try_from(e_phentsize).unwrap_or(0)))
-            .and_then(|o| e_phoff.checked_add(o))
-        else {
-            return Ok(None);
-        };
-        let Some(ph_slice) = ph_buf.get_mut(..56) else {
-            return Ok(None);
-        };
-        let ph_n = read_nix_at(reader, cx, fd, ph_slice, off, "pread (nix ELF program header)")?;
-        if ph_n < 56 {
-            break;
-        }
-        let p_type = read_u32_le(&ph_buf, 0);
-        let p_offset = read_u64_le(&ph_buf, 8);
-        let p_vaddr = read_u64_le(&ph_buf, 16);
-        let p_filesz = read_u64_le(&ph_buf, 32);
+    let mut apply_phdr = |ph: &[u8]| -> Result<(), Fault> {
+        let p_type = read_u32_le(ph, 0);
+        let p_offset = read_u64_le(ph, 8);
+        let p_vaddr = read_u64_le(ph, 16);
+        let p_filesz = read_u64_le(ph, 32);
         match p_type {
             1 => {
                 let Some(slot) = meta.loads.get_mut(meta.load_count) else {
@@ -932,6 +982,58 @@ fn parse_elf64_meta(
             }
             _ => {}
         }
+        Ok(())
+    };
+    let ph_total = e_phnum.checked_mul(e_phentsize);
+    let in_head = ph_total
+        .and_then(|tot| usize::try_from(e_phoff).ok().and_then(|off| off.checked_add(tot)))
+        .is_some_and(|end| end <= head_n);
+    if in_head && let Ok(base) = usize::try_from(e_phoff) {
+        for i in 0..e_phnum {
+            let start = base + i * e_phentsize;
+            let Some(ph) = head.get(start..start + 56) else {
+                break;
+            };
+            apply_phdr(ph)?;
+        }
+        return Ok(Some(meta));
+    }
+    if let Some(tot) = ph_total
+        && tot <= 4096
+    {
+        let mut ph_table = [0u8; 4096];
+        if let Some(dst) = ph_table.get_mut(..tot) {
+            let got = read_nix_at(reader, cx, fd, dst, e_phoff, "pread (nix ELF program header)")?;
+            for i in 0..e_phnum {
+                let start = i * e_phentsize;
+                if start + 56 > got {
+                    break;
+                }
+                let Some(ph) = ph_table.get(start..start + 56) else {
+                    break;
+                };
+                apply_phdr(ph)?;
+            }
+            return Ok(Some(meta));
+        }
+    }
+    let mut ph_buf = [0u8; 64];
+    for i in 0..e_phnum {
+        let Some(off) = u64::try_from(i)
+            .ok()
+            .and_then(|n| n.checked_mul(u64::try_from(e_phentsize).unwrap_or(0)))
+            .and_then(|o| e_phoff.checked_add(o))
+        else {
+            return Ok(None);
+        };
+        let Some(ph_slice) = ph_buf.get_mut(..56) else {
+            return Ok(None);
+        };
+        let ph_n = read_nix_at(reader, cx, fd, ph_slice, off, "pread (nix ELF program header)")?;
+        if ph_n < 56 {
+            break;
+        }
+        apply_phdr(ph_buf.get(..56).unwrap_or(&[]))?;
     }
     Ok(Some(meta))
 }
@@ -1486,9 +1588,12 @@ pub fn parse_ld_so_cache_match(
     Ok(false)
 }
 
+#[expect(clippy::too_many_arguments, reason = "internal SONAME lookup shared between Landlock admission and strategy hashing")]
 fn enqueue_nix_soname<const N: usize>(
     reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
     cx: Option<&Cx>,
+    now_sec: i64,
     ruleset: Option<Fd>,
     soname: &[u8],
     search_dirs: &[([u8; 320], usize)],
@@ -1505,16 +1610,16 @@ fn enqueue_nix_soname<const N: usize>(
 ) -> Result<(), Fault> {
     for (dir_buf, dir_len) in search_dirs {
         let dir = dir_buf.get(..*dir_len).unwrap_or(&[]);
-        if try_grant_and_enqueue_lib(reader, cx, ruleset, dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
+        if try_grant_and_enqueue_lib(reader, record_io, cx, now_sec, ruleset, dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
             return Ok(());
         }
     }
     if is_nix {
-        if try_grant_and_enqueue_lib(reader, cx, ruleset, nix_ld_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
+        if try_grant_and_enqueue_lib(reader, record_io, cx, now_sec, ruleset, nix_ld_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
             return Ok(());
         }
         if let Some(dir) = glibc_dir {
-            if try_grant_and_enqueue_lib(reader, cx, ruleset, dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
+            if try_grant_and_enqueue_lib(reader, record_io, cx, now_sec, ruleset, dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
                 return Ok(());
             }
         }
@@ -1529,7 +1634,9 @@ fn enqueue_nix_soname<const N: usize>(
             let found = parse_ld_so_cache_match(cache_bytes, soname, host_caps, |resolved_path| {
                 try_grant_and_enqueue_lib(
                     reader,
+                    record_io,
                     cx,
+                    now_sec,
                     ruleset,
                     b"",
                     resolved_path,
@@ -1582,13 +1689,13 @@ fn enqueue_nix_soname<const N: usize>(
                         tail.copy_from_slice(sub);
                     }
                     if let Some(prefix) = joined.get(..jlen)
-                        && try_grant_and_enqueue_lib(reader, cx, ruleset, prefix, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)?
+                        && try_grant_and_enqueue_lib(reader, record_io, cx, now_sec, ruleset, prefix, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)?
                     {
                         return Ok(());
                     }
                 }
             }
-            if try_grant_and_enqueue_lib(reader, cx, ruleset, fhs_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
+            if try_grant_and_enqueue_lib(reader, record_io, cx, now_sec, ruleset, fhs_dir, soname, child_chain, nix_ld_dir, is_nix, false, plan, queue, q_len, feed)? {
                 return Ok(());
             }
         }
@@ -1659,9 +1766,12 @@ fn fhs_hwcap_subdirs(host_caps: &HostLdCaps) -> &'static [&'static [u8]] {
     }
 }
 
+#[expect(clippy::too_many_arguments, reason = "internal library candidate admission shared between Landlock and strategy hashing")]
 fn try_grant_and_enqueue_lib<const N: usize>(
     reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
     cx: Option<&Cx>,
+    now_sec: i64,
     ruleset: Option<Fd>,
     dir_prefix: &[u8],
     soname: &[u8],
@@ -1696,13 +1806,26 @@ fn try_grant_and_enqueue_lib<const N: usize>(
     };
     // Verify ELF64 class, little-endian data, and target `e_machine` (`EM_AARCH64=183` /
     // `EM_X86_64=62`) on the opened fd so cross-arch libraries in shared FHS dirs are skipped
-    // just as glibc `ld.so` skips them.
-    let mut ehdr_head = [0u8; 20];
-    let head_n = read_nix_at(reader, cx, fd.fd(), &mut ehdr_head, 0, "pread (ELF e_machine check)")?;
-    if head_n < 20 || ehdr_head.get(..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
-        return Ok(false);
-    }
-    let e_machine = read_u16_le(&ehdr_head, 18);
+    // just as glibc `ld.so` skips them. Reuses an immutable on-disk inode record from the kernel
+    // page cache when present (Rule 51: zero process-memory cache).
+    let record_hit = match record_io {
+        Some(io) => match InodeStamp::from_fd(fd.fd())? {
+            Some(st) => lookup_inode_record(io, st, now_sec, feed.is_some(), InodeRecordPlant::None)?,
+            None => None,
+        },
+        None => None,
+    };
+    let e_machine = match record_hit.as_ref() {
+        Some(rec) => rec.e_machine,
+        None => {
+            let mut ehdr_head = [0u8; 20];
+            let head_n = read_nix_at(reader, cx, fd.fd(), &mut ehdr_head, 0, "pread (ELF e_machine check)")?;
+            if head_n < 20 || ehdr_head.get(..6) != Some(&[0x7f, b'E', b'L', b'F', 2, 1]) {
+                return Ok(false);
+            }
+            read_u16_le(&ehdr_head, 18)
+        }
+    };
     #[cfg(target_arch = "aarch64")]
     if e_machine != 183 {
         return Ok(false);
@@ -1743,7 +1866,11 @@ fn try_grant_and_enqueue_lib<const N: usize>(
         .get(..*q_len)
         .is_some_and(|used| used.iter().any(|(b, l, _)| *l == res_slice.len() && b.get(..*l) == Some(res_slice)));
     if first_seen_path && let Some(f) = feed.as_deref_mut() {
-        feed_nix_fd(reader, cx, res_slice, fd.fd(), f)?;
+        if let Some((total_len, sha256)) = record_hit.as_ref().and_then(|rec| rec.digest) {
+            feed_framed_digest(res_slice, &sha256, total_len, f);
+        } else {
+            feed_nix_elf_fd(reader, record_io, cx, now_sec, res_slice, fd.fd(), f)?;
+        }
     }
     enqueue_nix_canonical_slice(res_slice, child_chain, queue, q_len)?;
     Ok(true)
@@ -1751,7 +1878,9 @@ fn try_grant_and_enqueue_lib<const N: usize>(
 
 fn feed_nix_file_by_path(
     reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
     cx: Option<&Cx>,
+    now_sec: i64,
     path: &CStr,
     feed: &mut dyn FnMut(&[u8]),
 ) -> Result<(), Fault> {
@@ -1760,21 +1889,77 @@ fn feed_nix_file_by_path(
         .map_err(|errno| Fault::Host { call: "openat (nix runtime loader)", code: errno.raw() })?;
     let mut resolved = [0u8; 320];
     let res_len = readlink_fd_path(fd.fd(), &mut resolved)?;
-    feed_nix_fd(reader, cx, resolved.get(..res_len).unwrap_or(&[]), fd.fd(), feed)
+    feed_nix_elf_fd(reader, record_io, cx, now_sec, resolved.get(..res_len).unwrap_or(&[]), fd.fd(), feed)
 }
 
-fn feed_nix_fd(
-    reader: Option<&super::RootReader>,
-    cx: Option<&Cx>,
+fn feed_framed_digest(
     canonical_path: &[u8],
-    fd: Fd,
+    sha256: &[u8; 32],
+    total_len: u64,
     feed: &mut dyn FnMut(&[u8]),
-) -> Result<(), Fault> {
+) {
     let path_len = u32::try_from(canonical_path.len()).unwrap_or(u32::MAX);
     feed(&path_len.to_le_bytes());
     feed(canonical_path);
-    let offset = if let (Some(r), Some(cx)) = (reader, cx) {
-        r.stream_fd(cx, fd, "bstd::fs read (nix runtime closure hash)", |chunk| feed(chunk))?
+    feed(sha256);
+    feed(&total_len.to_le_bytes());
+}
+
+fn read_ld_cache_bounded(
+    reader: Option<&super::RootReader>,
+    cx: Option<&Cx>,
+    fd: Fd,
+) -> Result<OwnVec<u8, SharedAlloc<'static>>, Fault> {
+    let mut raw = OwnVec::new_in(SharedAlloc::global());
+    let mut overflow = false;
+    if let (Some(r), Some(cx)) = (reader, cx) {
+        let _ = r.stream_fd(cx, fd, "bstd::fs read (/etc/ld.so.cache)", |chunk| {
+            if raw.len().saturating_add(chunk.len()) <= MAX_LD_CACHE_BYTES {
+                raw.extend_from_slice(chunk);
+            } else {
+                overflow = true;
+            }
+        })?;
+    } else {
+        let mut buf = [0u8; 64 << 10];
+        let mut off = 0u64;
+        loop {
+            check_nix_cx(cx)?;
+            let n = pread(fd, &mut buf, off)
+                .map_err(|errno| Fault::Host { call: "pread (/etc/ld.so.cache)", code: errno.raw() })?;
+            if n == 0 {
+                break;
+            }
+            if raw.len().saturating_add(n) > MAX_LD_CACHE_BYTES {
+                overflow = true;
+                break;
+            }
+            if let Some(chunk) = buf.get(..n) {
+                raw.extend_from_slice(chunk);
+            }
+            let step = u64::try_from(n)
+                .map_err(|_| Fault::Host { call: "pread (/etc/ld.so.cache overflow)", code: 75 })?;
+            off = off
+                .checked_add(step)
+                .ok_or(Fault::Host { call: "pread (/etc/ld.so.cache overflow)", code: 75 })?;
+        }
+    }
+    if overflow {
+        return Err(Fault::Host { call: "read (/etc/ld.so.cache exceeds 4 MiB cap)", code: 27 });
+    }
+    Ok(raw)
+}
+
+fn stream_fd_sha256(
+    reader: Option<&super::RootReader>,
+    cx: Option<&Cx>,
+    fd: Fd,
+) -> Result<(u64, [u8; 32]), Fault> {
+    let mut hasher = blaze_sha256::Sha256::new();
+    let total_len = if let (Some(r), Some(cx)) = (reader, cx) {
+        r.stream_fd(cx, fd, "bstd::fs read (nix runtime closure hash)", |chunk| {
+            hasher.update(chunk);
+        })?
     } else {
         let mut buf = [0u8; 64 << 10];
         let mut offset = 0u64;
@@ -1786,7 +1971,7 @@ fn feed_nix_fd(
                 break;
             }
             if let Some(chunk) = buf.get(..n) {
-                feed(chunk);
+                hasher.update(chunk);
             }
             let step = u64::try_from(n)
                 .map_err(|_| Fault::Host { call: "pread (nix runtime closure overflow)", code: 75 })?;
@@ -1796,7 +1981,26 @@ fn feed_nix_fd(
         }
         offset
     };
-    feed(&offset.to_le_bytes());
+    Ok((total_len, hasher.finish()))
+}
+
+fn feed_nix_elf_fd(
+    reader: Option<&super::RootReader>,
+    record_io: Option<&dyn InodeRecordIo>,
+    cx: Option<&Cx>,
+    now_sec: i64,
+    canonical_path: &[u8],
+    fd: Fd,
+    feed: &mut dyn FnMut(&[u8]),
+) -> Result<(), Fault> {
+    let (total_len, sha256) = match load_or_compute_elf_record(reader, record_io, cx, now_sec, fd, true)? {
+        Some(rec) => match rec.digest {
+            Some(pair) => pair,
+            None => stream_fd_sha256(reader, cx, fd)?,
+        },
+        None => stream_fd_sha256(reader, cx, fd)?,
+    };
+    feed_framed_digest(canonical_path, &sha256, total_len, feed);
     Ok(())
 }
 
