@@ -491,6 +491,7 @@ impl<'n> NamesSource<'n> for DecodeLangSource<'n> {
     fn text_marks(self, _krate: usize, _call: ItemKey) -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::super::item_site::MarksLost> { Ok(None) }
     fn extern_abi(self, _key: ItemKey) -> Option<Option<&'n str>> { None }
     fn attr_value(self, _key: ItemKey, _attr: &'static str) -> Option<Option<blaze_scope::attr_values::RowValue<'n>>> { None }
+    fn in_sans_io_scope(self, _key: ItemKey, _module: ItemKey) -> bool { false }
     fn kind_of_item(self, _key: ItemKey) -> Option<ItemKind> { None }
     fn detail_of(self, _key: ItemKey) -> Option<blaze_surface::ItemDetail> { None }
     fn is_ctor(self, _key: ItemKey) -> bool { false }
@@ -5710,19 +5711,17 @@ mod keeps_typed_tests {
     use crate::refusal::SourceFile;
 
     const SOURCE: &str = r#"
-macro_rules! byte {
-    () => {
-        u8
-    };
+fn stub<'a>(a: &'a u8, _b: &'a u8) -> &'a u8 {
+    a
 }
 
-fn m(x: &u8, _y: byte!()) -> &u8 {
+fn m(x: &u8, _y: fn(&u8, &u8) -> &u8) -> &u8 {
     x
 }
 
 fn calls_soft_refused() {
     let a = 1u8;
-    let r = m(&a, 2);
+    let r = m(&a, stub);
     let _ = *r;
 }
 

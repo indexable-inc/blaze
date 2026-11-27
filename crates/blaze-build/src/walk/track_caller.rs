@@ -81,7 +81,7 @@ const VTABLE: &str =
 
 impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// The world's answer for the fn `instance` resolves to.
-    fn tracked(&mut self, instance: Instance) -> Option<bool> {
+    fn tracked(&mut self, instance: Instance) -> Result<Option<bool>, BuildError> {
         let adts = self.adts;
         adts.track_caller(instance, self.ground)
     }
@@ -92,7 +92,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     pub(super) fn own_tracked(&mut self) -> Result<bool, BuildError> {
         let args = self.ground.intern_list(self.args).map_err(|_| malformed("the ground table is full"))?;
         let own = Instance { item: self.body.owner, args };
-        Ok(match self.tracked(own) {
+        Ok(match self.tracked(own)? {
             Some(true) => true,
             Some(false) => {
                 self.track = Track::No;
@@ -108,7 +108,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// The location a call of `callee` at `at` passes, when `callee` is tracked (module doc):
     /// this fn's own, forwarded, or a row of `at`'s place. `None`: not tracked, nothing passed.
     pub(super) fn caller_arg(&mut self, at: Option<ExprId>, callee: Instance) -> Result<Option<Value>, BuildError> {
-        if self.tracked(callee) != Some(true) {
+        if self.tracked(callee)? != Some(true) {
             return Ok(None);
         }
         let refuse = |why| BuildError::TrackCaller { expr: at, item: callee.item, why, gap: None };
@@ -144,7 +144,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// Shared helper for call shims (`Fn*` shim and `ReifyShim`): if `callee` is tracked, builds a
     /// `Location` data row for `site_item`'s definition site (`Adts::def_site(site_item)`).
     fn def_site_caller_arg(&mut self, callee: Instance, site_item: ItemKey, why: &'static str) -> Result<Option<Value>, BuildError> {
-        if self.tracked(callee) != Some(true) {
+        if self.tracked(callee)? != Some(true) {
             return Ok(None);
         }
         let adts = self.adts;
@@ -267,7 +267,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// The instance whose address represents `instance` as a plain fn pointer: its `ReifyShim`
     /// when `instance` is `#[track_caller]`, else `instance` itself.
     pub(super) fn reify_target(&mut self, instance: Instance) -> Result<Instance, BuildError> {
-        if self.tracked(instance) == Some(true) {
+        if self.tracked(instance)? == Some(true) {
             return crate::reify_shim_instance(instance, self.ground);
         }
         Ok(instance)
@@ -285,7 +285,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// (the attribute on a trait's declaration applies to every impl, so every slot needs the
     /// shim).
     pub(super) fn refuse_tracked_slot(&mut self, e: ExprId, instance: Instance) -> Result<(), BuildError> {
-        if self.tracked(instance) == Some(true) {
+        if self.tracked(instance)? == Some(true) {
             return Err(BuildError::TrackCaller { expr: Some(e), item: instance.item, why: VTABLE, gap: None });
         }
         Ok(())

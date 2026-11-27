@@ -403,6 +403,8 @@ pub struct StoreKept {
     pub copy_bytes: u64,
     /// Bytes of those copies alive now (outside a mapping).
     pub held_bytes: u64,
+    /// Shared arenas pinned past commit because a lending `get` set `shared_lent`.
+    pub kept_arenas: usize,
 }
 
 /// blaze's folder in the user's home, made by the first file made in it.
@@ -1475,7 +1477,12 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
     fn kept(&self) -> StoreKept {
         let lent = self.place.counts().lent;
         // A commit frees each arena chunk no get lent from (blaze-cas plain/lent.rs).
-        StoreKept { copies: lent.copied, copy_bytes: lent.arena_bytes, held_bytes: lent.held_bytes }
+        StoreKept {
+            copies: lent.copied,
+            copy_bytes: lent.arena_bytes,
+            held_bytes: lent.held_bytes,
+            kept_arenas: self.place.kept_arenas(),
+        }
     }
 
     fn get(&mut self, cx: &Cx, key: Key) -> Result<Option<Held<'m>>, CliError> {

@@ -594,7 +594,7 @@ fn a_fn_an_impl_level_macro_wrote_is_read_by_its_impl() {
     // file's `Surface` (the old checker's coarse key made S's head too: 2). The call's argument
     // is inside the impl, so the impl's head is entered and `S`'s text stands: 1 (measured 1).
     assert_eq!(seen.made.0, 1, "the call's edit enters the impl's head alone; S's head stands:\n{}", seen.after);
-    assert!((1..=2).contains(&seen.made.1), "the call's edit makes its one reader (and the call's own check, if any):\n{}", seen.after);
+    assert_eq!(seen.made.1, 4, "the call's edit makes the macro-written f's body and its one reader g, each in its 2 units' rows (D191, Wave 23 impl-macro coverage):\n{}", seen.after);
     std::println!("impl-level macro head: errors {:?}; call edit (Signature, BodyCheck) made {:?}", seen.errors, seen.made);
 }
 

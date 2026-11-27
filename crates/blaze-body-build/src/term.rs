@@ -239,7 +239,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
     /// `#[track_caller]`: forwards this fn's own hidden parameter if tracked, or materializes a
     /// `Location` data row at the current row's site if untracked.
     pub(crate) fn caller_arg(&mut self, callee: Instance, name: &'static str) -> Result<Option<Value>, BuildError> {
-        if self.adts.track_caller(callee, self.subst.ground) != Some(true) {
+        if self.adts.track_caller(callee, self.subst.ground).map_err(|e| self.facts(e))? != Some(true) {
             return Ok(None);
         }
         let stmt = self.row()?;
@@ -635,7 +635,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
                 let instance = self.instance(key, fn_args)?;
                 let may_unwind = self.adts.nounwind(key) != Some(true);
                 if let Some(slot) = self.dyn_vtable_slot(instance)? {
-                    if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
+                    if self.adts.track_caller(instance, self.subst.ground).map_err(|e| self.facts(e))? == Some(true) {
                         return Err(BuildError::TrackCaller { stmt: self.row()?, name: "the dyn method" });
                     }
                     dyn_slot = Some(slot);
@@ -825,7 +825,7 @@ impl<'a, A: Allocator + Copy> Cx<'a, '_, '_, A> {
                 let abi = self.adts.abi(key).ok_or(BuildError::NoAbi { item: key })?;
                 let instance = self.instance(key, fn_args)?;
                 if let Some(slot) = self.dyn_vtable_slot(instance)? {
-                    if self.adts.track_caller(instance, self.subst.ground) == Some(true) {
+                    if self.adts.track_caller(instance, self.subst.ground).map_err(|e| self.facts(e))? == Some(true) {
                         return Err(BuildError::TrackCaller { stmt: self.row()?, name: "the dyn method" });
                     }
                     dyn_slot = Some(slot);

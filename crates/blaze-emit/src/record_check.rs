@@ -89,10 +89,11 @@ pub(crate) fn adr_reaches(code: &[u8], end: usize, at: usize, word: u32) -> i64 
 
 /// Checks the first `insts` bytes of `view`'s code (the instructions): no load of a literal
 /// word (bits 29..27 `011`, bits 25..24 `00`); every `adr` reaches the data after the
-/// instructions (the far form's `adr` with its offset added: [`adr_reaches`]); every `adrp` is the first instruction of the next site row, written with a
-/// zero page and followed by `ldr xN, [xN]` (a load or call site; a call's register is `x16`
-/// and `blr x16` ends it) or `add xN, xN, #0` (a relro site); and no site row is left over.
-/// The number of sites on success.
+/// instructions (the far form's `adr` with its offset added: [`adr_reaches`]); every `adrp` is
+/// the first instruction of the next site row, written with a zero page and followed by
+/// `ldr xD, [xN]` (a load site, `Rn = xN`, zero offset, `Rt = xD`), `ldr x16, [x16]; blr x16`
+/// (a call site), or `add xD, xN, #0` (a relro site, `Rn = xN`, zero offset, `Rd = xD`); and no
+/// site row is left over. The number of sites on success.
 pub fn no_address_word(view: &CodeView<'_>, insts: u32) -> Result<usize, AddressWord> {
     let code = view.code();
     let end = insts as usize;
@@ -129,10 +130,13 @@ pub fn no_address_word(view: &CodeView<'_>, insts: u32) -> Result<usize, Address
         }
         let second = inst(code, at + 4);
         match row.kind {
-            SiteKind::Relro if second != 0x9100_0000 | (rd << 5) | rd => {
-                return Err(AddressWord::SiteForm { at: here, what: "add xN, xN, #0" });
+            SiteKind::Relro if (second & !0x1f) != (0x9100_0000 | (rd << 5)) || (second & 0x1f) == 31 => {
+                return Err(AddressWord::SiteForm { at: here, what: "add xD, xN, #0" });
             }
-            SiteKind::Load | SiteKind::Call if second != 0xf940_0000 | (rd << 5) | rd => {
+            SiteKind::Load if (second & !0x1f) != (0xf940_0000 | (rd << 5)) || (second & 0x1f) == 31 => {
+                return Err(AddressWord::SiteForm { at: here, what: "ldr xD, [xN]" });
+            }
+            SiteKind::Call if second != 0xf940_0000 | (rd << 5) | rd => {
                 return Err(AddressWord::SiteForm { at: here, what: "ldr xN, [xN]" });
             }
             _ => {}

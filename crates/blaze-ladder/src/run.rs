@@ -1177,12 +1177,15 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// The front end resolves the function's own or inherited caller-tracking attribute.
     /// Trait methods are resolved to their concrete impl item first so an impl-only
     /// `#[track_caller]` (such as `Result::from_residual`) matches between caller and callee.
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+    /// A lazy `ResolveError::Missing` is propagated as `BuildError::Select` so `make_asked` fills
+    /// the missing impl bucket instead of falling back to the trait method (Rule 3).
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         let item = match self.0.resolve(self.1, instance.item, instance.args, ground) {
             Ok((resolved, _)) => resolved,
+            Err(e @ blaze_typeck::ResolveError::Missing(_)) => return Err(BuildError::Select(e)),
             Err(_) => instance.item,
         };
-        self.0.track_caller(item)
+        Ok(self.0.track_caller(item))
     }
 
     /// The library's `#[lang = "panic_location"]` struct (core/src/panic/location.rs).

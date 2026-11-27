@@ -1350,6 +1350,7 @@ mod tests {
                 avatar_path: None,
                 fs_meta: None,
                 match_indices: Vec::new(),
+                preview: None,
             });
         }
         assert_eq!(ed.completion_scroll, 0);

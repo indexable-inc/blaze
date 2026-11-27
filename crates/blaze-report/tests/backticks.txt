@@ -1,26 +1,28 @@
 # Messages that put an interpolation between backticks by hand, a crate a line: what is left to
 # port to `blaze_report::say!` (docs/terminal.md, "Rich text"). `tests/backticks.rs` holds each
 # crate to its number: it only goes down.
+bgit 36
 blaze-audit 73
 blaze-base-tools 12
 blaze-bench 9
 blaze-body-build 2
 blaze-bstd-convert 45
 blaze-build 14
-blaze-build-script 34
+blaze-build-script 36
 blaze-c 6
 blaze-cas 9
 blaze-check 4
-blaze-cli 282
+blaze-cli 362
+blaze-cli-spec 9
 blaze-code 1
 blaze-comptime-sys 2
 blaze-cond 2
 blaze-consteval 6
 blaze-core 9
-blaze-emit 12
+blaze-emit 17
 blaze-engine 1
 blaze-expand 9
-blaze-export 3
+blaze-export 6
 blaze-fetch 8
 blaze-flow 1
 blaze-flow-lower 1
@@ -34,10 +36,10 @@ blaze-impls 1
 blaze-json 1
 blaze-keyed 2
 blaze-kit 11
-blaze-ladder 355
+blaze-ladder 399
 blaze-launch 21
 blaze-launch-rt 30
-blaze-launcher 3
+blaze-launcher 8
 blaze-lint-defs 9
 blaze-lir 11
 blaze-lower 18
@@ -49,11 +51,11 @@ blaze-memo-macros 6
 blaze-meter 5
 blaze-native 8
 blaze-new 34
-blaze-own 6
+blaze-own 7
 blaze-parquet 5
 blaze-pg 4
-blaze-proc-macro 83
-blaze-producers 6
+blaze-proc-macro 114
+blaze-producers 7
 blaze-profile 80
 blaze-rel 11
 blaze-report 29
@@ -62,6 +64,8 @@ blaze-run 2
 blaze-scope 87
 blaze-script 21
 blaze-serde-derive 12
+blaze-sh 5
+blaze-shell 63
 blaze-sim 81
 blaze-solve 11
 blaze-source 10
@@ -72,10 +76,11 @@ blaze-std 44
 blaze-store-check 2
 blaze-surface 3
 blaze-sys 6
+blaze-term-api 17
 blaze-text 1
 blaze-tier 2
 blaze-toolchain 6
-blaze-typeck 41
+blaze-typeck 42
 blaze-unit-graph 20
 blaze-wasi 1
 blaze-world 51

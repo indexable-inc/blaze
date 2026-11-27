@@ -3567,6 +3567,38 @@ pub(super) fn witness_and_decide<'n, 'a, S: NamesSource<'n>>(
     decide_stalled_goals(r, body, done, &interiors, reads, alloc)
 }
 
+/// Control wrapper for [`FactsPlant::NoFieldRegions`]: delegates every head region query except
+/// [`RegionFacts::field`], so `blaze-flow-lower`'s `field_slot_via_borrow` fallback also receives
+/// no field regions when the control turns field regions off.
+struct NoFieldRegionFacts<'r>(&'r dyn RegionFacts);
+
+impl RegionFacts for NoFieldRegionFacts<'_> {
+    fn sig(&self, item: tc::ItemKey) -> Result<tc::region_facts::SigRegions<'_>, tc::region_facts::RegionsUnread> {
+        self.0.sig(item)
+    }
+    fn clauses(&self, item: tc::ItemKey) -> Result<&[tc::region_facts::ClauseView<'_>], tc::region_facts::RegionsUnread> {
+        self.0.clauses(item)
+    }
+    fn outlives(&self, item: tc::ItemKey) -> Result<&[tc::region_facts::Outlives], tc::region_facts::RegionsUnread> {
+        self.0.outlives(item)
+    }
+    fn field(&self, adt: tc::ItemKey, _variant: u32, _field: u32) -> Result<tc::region_facts::ColView<'_>, tc::region_facts::RegionsUnread> {
+        Err(tc::region_facts::RegionsUnread { item: adt, why: tc::region_facts::UnreadWhy::NoHead })
+    }
+    fn impl_header(&self, impl_: tc::ItemKey) -> Result<(tc::region_facts::ColView<'_>, Option<tc::region_facts::ColView<'_>>), tc::region_facts::RegionsUnread> {
+        self.0.impl_header(impl_)
+    }
+    fn opaque_captures(&self, opaque: tc::ItemKey) -> Result<u32, tc::region_facts::RegionsUnread> {
+        self.0.opaque_captures(opaque)
+    }
+    fn lifetime_params(&self, item: tc::ItemKey) -> Result<tc::region_facts::ParamsView<'_>, tc::region_facts::RegionsUnread> {
+        self.0.lifetime_params(item)
+    }
+    fn impl_assoc(&self, impl_: tc::ItemKey, name: tc::Name) -> Result<tc::region_facts::ColView<'_>, tc::region_facts::RegionsUnread> {
+        self.0.impl_assoc(impl_, name)
+    }
+}
+
 /// The move and borrow check of `body`, whose type check gave `done`: the facts gathered, the
 /// body lowered to its flow, then the move check and the loans tiers.
 #[expect(clippy::too_many_arguments, reason = "the records, the body and its check, the two outputs, the test view, the control's plant and the allocator")]
@@ -3590,8 +3622,14 @@ fn borrows_of<'n, 'a, S: NamesSource<'n>>(
     // Every fn's signature regions are its head record's, read in place (D148): the lowering's
     // facts are the gathered ones with the head records' reader. The control
     // (`FactsPlant::NoAliases`) gives none: every call carrying a lifetime is then refused.
+    // `FactsPlant::NoFieldRegions` suppresses both `Facts::field_regions` and `RegionFacts::field`.
     let reader = r.store.regions.reader(alloc);
-    let regions: &dyn RegionFacts = if plant == FactsPlant::NoAliases { &NoRegions } else { &reader };
+    let no_field_regions = NoFieldRegionFacts(&reader);
+    let regions: &dyn RegionFacts = match plant {
+        FactsPlant::NoAliases => &NoRegions,
+        FactsPlant::NoFieldRegions => &no_field_regions,
+        _ => &reader,
+    };
     let lowering = facts.read_by(regions, r.store.tys.view());
     if let Some(out) = show.as_deref_mut() {
         use core::fmt::Write as _;

@@ -275,7 +275,7 @@ fn item_digest<'a>(items: &ItemsRecord<'a>, key: ItemKey, read: ReadText<'_, 'a>
         }
         Some(row) => {
             h.update(&[1]).id(&row.key.0).std(&row.kind).id(&row.module.0).std(&row.name);
-            h.update(&[u8::from(row.body_holds_items), u8::from(row.ctor), u8::from(row.impl_row.is_some())]);
+            h.update(&[u8::from(row.body_holds_items), u8::from(row.ctor), u8::from(row.impl_row.is_some()), u8::from(row.sans_io)]);
             // The block ABI of a foreign fn or static (`ItemRow::foreign`): what
             // `NamesSource::extern_abi` answers through this cell alone, so an edit of the
             // block's string moves it.

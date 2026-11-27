@@ -32,7 +32,7 @@ mod tests {
 
     use super::*;
 
-    const CODE_BUILDER_DOMAIN: &str = "blaze-cli code-builder producer 1";
+    const CODE_BUILDER_DOMAIN: &str = "blaze-cli code-builder cfg 1";
 
     fn walk_workspace_code_builder(
         workspace_root: &Path,

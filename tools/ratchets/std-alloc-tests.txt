@@ -42,7 +42,7 @@ blaze-cbor	3	0	0	0	0	0	1	0	0	0
 blaze-cc	6	0	0	1	0	0	0	0	0	0
 blaze-cert	7	0	0	2	0	0	0	0	0	2
 blaze-check	7	0	0	31	0	0	48	0	0	0
-blaze-cli	1275	31	3	752	294	96	3	9	0	3
+blaze-cli	1335	31	3	771	301	96	3	12	0	3
 blaze-cli-spec	1	0	0	0	0	0	0	0	0	0
 blaze-code	1	0	0	1	0	0	0	0	0	0
 blaze-columns	27	0	0	35	0	0	0	0	0	0
@@ -90,7 +90,7 @@ blaze-int	4	0	0	1	0	0	0	0	0	0
 blaze-json	3	0	0	0	0	0	1	0	0	0
 blaze-keyed	6	0	1	124	0	0	0	0	0	0
 blaze-kit	2	0	0	0	0	0	0	0	0	0
-blaze-ladder	784	289	0	2391	62	55	12	262	0	98
+blaze-ladder	784	289	0	2392	62	55	12	262	0	98
 blaze-launch	19	0	0	158	0	0	0	0	0	1
 blaze-launch-rt	118	2	0	101	8	7	19	1	0	0
 blaze-launcher	20	1	0	17	8	0	0	1	0	0
@@ -115,7 +115,7 @@ blaze-pbr	1	0	0	0	0	0	0	0	0	0
 blaze-pg	9	0	2	140	0	0	0	0	0	0
 blaze-phf	5	0	0	9	0	0	0	0	0	1
 blaze-preview	3	0	0	2	0	0	0	0	0	0
-blaze-proc-macro	388	3	0	314	224	1	5	16	0	1
+blaze-proc-macro	471	3	0	325	272	5	6	17	0	1
 blaze-producers	8	0	0	0	0	0	0	0	0	0
 blaze-profile	197	0	0	443	19	35	47	15	0	3
 blaze-protocol	23	0	0	116	10	0	0	0	0	2
@@ -131,7 +131,7 @@ blaze-rng	3	1	0	8	0	0	0	0	0	0
 blaze-roots	6	0	0	9	0	0	0	0	0	0
 blaze-run	15	0	0	217	0	0	0	0	0	0
 blaze-rung-tiers	4	1	0	2	0	0	0	0	0	0
-blaze-scope	107	1	0	68	3	0	1	1	0	0
+blaze-scope	123	1	0	78	3	0	1	1	0	0
 blaze-screen	3	3	0	57	1	0	0	0	0	0
 blaze-script	17	0	0	39	12	7	0	0	0	0
 blaze-semver	2	0	0	0	0	0	0	0	0	0
@@ -149,7 +149,7 @@ blaze-sqlite	6	0	0	117	0	0	0	0	0	0
 blaze-squeeze	5	0	0	12	0	0	0	0	0	0
 blaze-ssh	5	0	0	4	0	0	0	0	0	0
 blaze-stage	30	0	0	1	0	0	0	0	0	0
-blaze-std	249	4	59	670	48	37	19	5	0	0
+blaze-std	266	4	59	672	48	37	19	5	0	0
 blaze-store-check	0	0	0	10	0	0	0	0	0	0
 blaze-surface	6	0	0	17	0	0	0	0	0	0
 blaze-swiss	13	0	0	7	0	0	5	0	0	0

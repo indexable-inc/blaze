@@ -624,6 +624,18 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.attr_value(key, attr)
     }
 
+    /// The item's `Item` cell (or, for a body-local item with no items row, its enclosing
+    /// module's `Item` cell): `item_digest` covers both `ItemIdentity::sans_io` and
+    /// `ModuleRow::sans_io`, so checking `#![blaze::sans_io]` scope never touches
+    /// `NameCell::Whole { section: Items }`.
+    fn in_sans_io_scope(self, key: ItemKey, module: ItemKey) -> bool {
+        self.item(key);
+        if self.records.kind_of_item(key).is_none() {
+            self.item(module);
+        }
+        self.records.in_sans_io_scope(key, module)
+    }
+
     /// The trait's `Members` cell: the member rows hold each associated type's count (D155).
     fn assoc_lifetimes(self, trait_: ItemKey, name: blaze_typeck::Name) -> Option<u32> {
         self.cell(NameCell::Members { owner: trait_ });

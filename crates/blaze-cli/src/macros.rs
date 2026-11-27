@@ -158,7 +158,7 @@ impl core::fmt::Display for MacrosError {
 /// Every macro crate of the graph `graph_record` with its identity, over `lock`, the module
 /// store `modules` (its git folders) and `place` (a member's folder). The decoded graph is the
 /// task's scratch, made over `scratch`.
-fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>, scratch: Alloc<'_>) -> Result<MacroCrates, MacrosError> {
+pub(crate) fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>, scratch: Alloc<'_>) -> Result<MacroCrates, MacrosError> {
     let decoded = blaze_unit_graph::record::decode(graph_record, scratch).map_err(MacrosError::Graph)?;
     let locked = LockedPackages::of(lock.lock);
     let folders = git_folders(modules).map_err(MacrosError::Procs)?;
@@ -179,7 +179,7 @@ pub(crate) fn run<'b>(
     cx: &Cx,
     store: &mut dyn Store<'_>,
     lock: Option<&crate::fetch::Lockfile<'_>>,
-    crates: &mut Option<MacroCrates>,
+    crates: &mut Option<std::sync::Arc<MacroCrates>>,
     place: Place<'_, '_>,
     compile: Option<crate::wasm64_compile::CompileInputs<'_>>,
     task: &Task<'_>,
@@ -207,7 +207,7 @@ pub(crate) fn run<'b>(
             None => Err(MacrosError::NoLock),
         };
         match listed {
-            Ok(listed) => *crates = Some(listed),
+            Ok(listed) => *crates = Some(std::sync::Arc::new(listed)),
             Err(error) => {
                 let words = bstd::mem::format_in!(held, "the proc-macro crates of the graph could not be listed: {error}");
                 return Ok(Did::Hole(refused("the macro crates could not be listed"), held_str(words.as_str(), held)));
