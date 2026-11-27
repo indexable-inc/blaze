@@ -250,9 +250,9 @@ struct Candidate<'t> {
 }
 
 /// Reads the path `a::b::c` starting at the identifier at `i`: its segments and end, and
-/// whether it is a value path a leaf can be (not followed by `::<`, `(`, `!` or `{`). `None`
-/// for a longer path than [`MOST_SEGS`].
-fn read_path<'t>(text: &'t str, i: usize) -> (usize, Option<([&'t str; MOST_SEGS], usize)>) {
+/// whether it is a value path a leaf can be (not followed by `::<`, `(`, `!`, or `{` outside
+/// a no-struct header such as `if`/`while`/`match`). `None` for a longer path than [`MOST_SEGS`].
+fn read_path<'t>(text: &'t str, i: usize, allow_brace: bool) -> (usize, Option<([&'t str; MOST_SEGS], usize)>) {
     let b = text.as_bytes();
     let mut segs = [""; MOST_SEGS];
     let mut n = 0usize;
@@ -282,7 +282,7 @@ fn read_path<'t>(text: &'t str, i: usize) -> (usize, Option<([&'t str; MOST_SEGS
             }
         }
         let next = b.get(j).copied();
-        if matches!(next, Some(b'(' | b'!' | b'{')) || !ok {
+        if matches!(next, Some(b'(' | b'!')) || (!allow_brace && next == Some(b'{')) || !ok {
             return (at, None);
         }
         return (at, Some((segs, n)));
@@ -291,13 +291,34 @@ fn read_path<'t>(text: &'t str, i: usize) -> (usize, Option<([&'t str; MOST_SEGS
 
 /// The candidates of `text`, in order: `T::NAME` paths and `<T>::NAME` (a `<` where an
 /// operand starts, a plain path inside, `>::NAME` after it). A path after `.`, `::` or `'`,
-/// an absolute path, and a number's suffix are none.
+/// an absolute path, and a number's suffix are none. Inside an `if`/`while`/`match` header
+/// (Rust's no-struct expression grammar), a trailing `{` opens the branch block rather than
+/// a struct literal, so paths like `if Self::ENABLE { ... }` are still recognized.
 fn candidates<'t>(text: &'t str, out: &mut [Option<Candidate<'t>>; MOST_IN_TEXT]) -> Option<usize> {
     let b = text.as_bytes();
     let mut i = 0usize;
     let mut count = 0usize;
+    let mut paren_depth = 0u32;
+    let mut no_struct_depth: Option<u32> = None;
     while i < b.len() {
         let c = b[i];
+        if c == b'(' || c == b'[' {
+            paren_depth = paren_depth.saturating_add(1);
+            i += 1;
+            continue;
+        }
+        if c == b')' || c == b']' {
+            paren_depth = paren_depth.saturating_sub(1);
+            i += 1;
+            continue;
+        }
+        if c == b'{' {
+            if no_struct_depth == Some(paren_depth) {
+                no_struct_depth = None;
+            }
+            i += 1;
+            continue;
+        }
         if c.is_ascii_digit() {
             while i < b.len() && ident_byte(b[i]) {
                 i += 1;
@@ -310,7 +331,7 @@ fn candidates<'t>(text: &'t str, out: &mut [Option<Candidate<'t>>; MOST_IN_TEXT]
             let operand_before = prev_byte(b, i).is_some_and(|p| ident_byte(p) || p == b')' || p == b']' || p == b'>');
             let j = skip_ws(b, i + 1);
             if !operand_before && b.get(j).is_some_and(|&x| ident_start(x)) {
-                let (end, path) = read_path(text, j);
+                let (end, path) = read_path(text, j, false);
                 let k = skip_ws(b, end);
                 let after = skip_ws(b, k + 1);
                 if let Some((inner, inner_n)) = path
@@ -321,7 +342,10 @@ fn candidates<'t>(text: &'t str, out: &mut [Option<Candidate<'t>>; MOST_IN_TEXT]
                     let ns = skip_ws(b, after + 2);
                     let ne = (ns..b.len()).find(|&x| !ident_byte(b[x])).unwrap_or(b.len());
                     let tail = skip_ws(b, ne);
-                    let call = matches!(b.get(tail), Some(b'(' | b'!' | b'{')) || b.get(tail) == Some(&b':');
+                    let allow_brace = no_struct_depth == Some(paren_depth);
+                    let call = matches!(b.get(tail), Some(b'(' | b'!'))
+                        || (!allow_brace && b.get(tail) == Some(&b'{'))
+                        || b.get(tail) == Some(&b':');
                     if ne > ns && b.get(ns).is_some_and(|&x| ident_start(x)) && !call && inner_n < MOST_SEGS {
                         let mut segs = inner;
                         segs[inner_n] = text.get(ns..ne).unwrap_or("");
@@ -345,16 +369,18 @@ fn candidates<'t>(text: &'t str, out: &mut [Option<Candidate<'t>>; MOST_IN_TEXT]
             continue;
         }
         let after_path = prev_byte(b, i).is_some_and(|p| p == b'.' || p == b':' || p == b'\'');
-        let (end, path) = read_path(text, i);
-        if let Some((segs, n)) = path
-            && n >= 2
-            && !after_path
-        {
-            if count == MOST_IN_TEXT {
-                return None;
+        let allow_brace = no_struct_depth == Some(paren_depth);
+        let (end, path) = read_path(text, i, allow_brace);
+        if !after_path && let Some((segs, n)) = path {
+            if n == 1 && matches!(segs[0], "if" | "while" | "match") {
+                no_struct_depth = Some(paren_depth);
+            } else if n >= 2 {
+                if count == MOST_IN_TEXT {
+                    return None;
+                }
+                out[count] = Some(Candidate { start: i, end, segs, n });
+                count += 1;
             }
-            out[count] = Some(Candidate { start: i, end, segs, n });
-            count += 1;
         }
         i = end.max(i + 1);
     }
@@ -849,5 +875,28 @@ impl Bad {
             let a_key = member_key_of(impl_ck, MemberKind::Const, "A");
             assert!(fresh.fn_gaps.contains_key(&a_key), "refused `Bad::A` must preserve its fn_gaps entry across freeze, not drop to NoHead");
         }
+    }
+
+    #[test]
+    fn self_inherent_bool_const_before_if_brace_in_struct_field_array_len() {
+        const ZMIJ_LIKE: &str = "#![no_std]
+pub struct ExpShiftTable([u8; if Self::ENABLE { 4 } else { 0 }]);
+impl ExpShiftTable {
+    const ENABLE: bool = true;
+}
+pub fn take(t: ExpShiftTable) -> [u8; 4] { t.0 }
+pub fn wrong(t: ExpShiftTable) -> [u8; 2] { t.0 }
+";
+        let (names, _sized, frame) = world_of(ZMIJ_LIKE);
+        let mut world = ProjectWorld::from_records(names, frame, &[1], a()).expect("project world");
+        let take = world.check(BodyRef::Free(find_fn(names, "take")), a());
+        assert!(
+            take.refused.is_none() && take.gaps.is_empty() && take.diagnostics.is_empty(),
+            "`take` should check cleanly when `Self::ENABLE` precedes `{{`: {:?}",
+            (&take.refused, &take.gaps, &take.diagnostics)
+        );
+        let wrong = world.check(BodyRef::Free(find_fn(names, "wrong")), a());
+        assert!(wrong.refused.is_none(), "`wrong` was refused: {:?}", wrong.refused);
+        assert!(wrong.diagnostics.iter().any(|d| d.code == "E0308"), "expected E0308 for `wrong`, got {:?}", wrong.diagnostics);
     }
 }
