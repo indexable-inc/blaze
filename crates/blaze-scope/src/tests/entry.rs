@@ -257,6 +257,33 @@ fn a_local_inner_macros_body_calls_its_own_crate_s_macros() {
     assert_eq!(named, ["a", "b"], "the members the defining crate's helper wrote");
 }
 
+/// Same-crate `#[macro_export(local_inner_macros)]`: invoking it inside a submodule that defines a
+/// shadowing `macro_rules! helper` MUST still resolve `helper!` to the crate root's exported
+/// macro (`$crate::helper!`), never the submodule's local shadow.
+const SAME_CRATE_INNER: &str = "#![no_core]
+#[macro_export(local_inner_macros)]
+macro_rules! outer { ($f:ident) => { helper!{$f} } }
+#[macro_export]
+macro_rules! helper { ($f:ident) => { fn $f() {} } }
+pub mod sub {
+    macro_rules! helper { ($f:ident) => { fn shadowed_wrong() {} } }
+    pub struct S;
+    impl S { crate::outer! { from_root } }
+}
+";
+
+static SAME_CRATE_INNER_TEXTS: Texts = Texts(&[&[("/same/lib.rs", SAME_CRATE_INNER)]]);
+
+#[test]
+fn same_crate_local_inner_macros_resolves_at_crate_root_over_submodule_shadow() {
+    let crates = [input("same", "/same/lib.rs", &[])];
+    let names = resolved(&crates, &SAME_CRATE_INNER_TEXTS);
+    let impls = &names.krate(0).tables.impls;
+    assert_eq!(impls.len(), 1, "one impl");
+    let named: Vec<&str> = names.members(impls[0].key).unwrap_or(&[]).iter().filter_map(|m| m.name).collect();
+    assert_eq!(named, ["from_root"], "same-crate local_inner_macros must resolve at crate root, not submodule shadow");
+}
+
 /// The pinned library's shape (alloc's `use core::str;` beside `&str` and `str::from_utf8`): a
 /// module named `str` in scope beside the built-in type `str`.
 const STR_DEP: &str = "#![no_core]

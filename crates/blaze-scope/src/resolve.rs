@@ -4001,12 +4001,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         return fail_with(ExpandNote::NestedInput { macro_name: mac.name, error: crate::nested_input::NestedInputError::TooLarge }, &mut notes, &mut last, eager_checked_cell.into_inner());
     }
 
-    let roots_written = roots.iter().filter(|(_, k)| *k != here).count()
-        + usize::from(expansion.tokens.contexts().iter().any(|n| {
-            n.mark.transparency != blaze_expand::Transparency::Transparent
-                && n.mark.local_inner
-                && n.mark.site.krate != here
-        }));
+    let roots_written = roots_written_for(&roots, &expansion, here);
     let mut pre_block_items: Option<(AString<'_>, AVec<'_, crate::crate_roots::Copied>, AVec<'_, u32>)> = None;
     if in_call.in_block {
         let probe = outline(rendered.as_str(), edition, alloc);
@@ -4603,6 +4598,18 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
     Ok(out)
 }
 
+/// How many foreign `$crate` roots the rendered text writes, plus 1 if the expansion carries ANY
+/// non-transparent `local_inner_macros` mark (including same-crate marks, so a bare `helper!()`
+/// inside a submodule or block cannot lose its mark and bind an invocation-site/body-local shadow
+/// instead of `$crate::helper!`). Non-zero means the origin column is indispensable: losing it
+/// must refuse the expansion with `RootsLost` instead of silently proceeding with `marks: None`.
+fn roots_written_for(roots: &[(u32, CrateItemKey)], expansion: &blaze_expand::Expansion<'_>, here: CrateItemKey) -> usize {
+    roots.iter().filter(|(_, k)| *k != here).count()
+        + usize::from(expansion.tokens.contexts().iter().any(|n| {
+            n.mark.transparency != blaze_expand::Transparency::Transparent && n.mark.local_inner
+        }))
+}
+
 /// Expands one call the fill asked for: its declarations and text, or `None` (noted) when it
 /// adds nothing.
 ///
@@ -5166,12 +5173,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     }
     // How many `crate`s the text writes for another crate's `$crate`, plus any foreign
     // `local_inner_macros` marks: such a text is read only with its marks (crate::crate_roots).
-    let roots_written = roots.iter().filter(|(_, k)| *k != here).count()
-        + usize::from(expansion.tokens.contexts().iter().any(|n| {
-            n.mark.transparency != blaze_expand::Transparency::Transparent
-                && n.mark.local_inner
-                && n.mark.site.krate != here
-        }));
+    let roots_written = roots_written_for(&roots, &expansion, here);
     let in_block = held(run.made.read(), "made modules")
         .get(&src.module)
         .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
@@ -6528,5 +6530,55 @@ mod parallel_determinism_tests {
             assert_eq!(p_exp.made.map(|m| m.text), s_exp.made.map(|m| m.text), "expansion text for {call:?} must match");
             assert_eq!(p_exp.made.and_then(|m| m.origins.ok()), s_exp.made.and_then(|m| m.origins.ok()), "expansion origins for {call:?} must match");
         }
+    }
+
+    #[test]
+    fn same_crate_local_inner_marks_are_counted_as_indispensable() {
+        use blaze_expand::{Call, CallSite, Ctx, DefAt, DefSite, Export, LocalInner, MacroDefinition, Transparency, expand, lex};
+        let alloc = blaze_own::testing::heap().alloc();
+        let here = CrateItemKey(ContentId::of("resolve roots_written_for test", b"here"));
+        let other = CrateItemKey(ContentId::of("resolve roots_written_for test", b"other"));
+        struct NoCx;
+        impl blaze_expand::ExpandCx for NoCx {
+            fn env(&self, _: &str) -> Result<Option<&str>, blaze_expand::HostError> { Ok(None) }
+            fn cfg(&self, _: &blaze_expand::TokenStream<'_>) -> Result<bool, blaze_expand::HostError> { Ok(false) }
+            fn include(&self, _: &str, _: blaze_expand::IncludeAs) -> Result<blaze_expand::Included<'_>, blaze_expand::HostError> { Ok(blaze_expand::Included::Missing) }
+            fn place(&self, _: blaze_expand::PlaceOf) -> Result<blaze_expand::Place<'_>, blaze_expand::HostError> { Ok(blaze_expand::Place::Number(1)) }
+            fn run_proc_macro<'a>(&self, _: &MacroDefinition<'_>, _: blaze_expand::ProcCall<'_>, _: Alloc<'a>) -> Result<blaze_expand::Produced<'a>, blaze_expand::HostError> {
+                Err(blaze_expand::HostError { ask: blaze_expand::HostAsk::ProcMacro, why: blaze_expand::HostWhy::Refused })
+            }
+        }
+        let expand_one = |krate: CrateItemKey, local_inner: LocalInner, transparency: Option<Transparency>| {
+            let body = lex("() => { helper!(); };", Edition::E2021, alloc).expect("lexes");
+            let def = MacroDefinition::rules(
+                body,
+                DefAt { site: DefSite { krate, module: None }, edition: Edition::E2021, export: Export::Exported, local_inner, transparency },
+            );
+            let input = lex("", Edition::E2021, alloc).expect("lexes");
+            let site = CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: Ctx::root(Edition::E2021) };
+            match expand(&def, &Call::fn_like(&input, site), &NoCx, alloc).expect("expands") {
+                blaze_expand::Expanded::Expansion(e) => e,
+                blaze_expand::Expanded::NeedsExpanded(_) => panic!("not eager"),
+            }
+        };
+
+        // Same-crate `local_inner_macros`: indispensable even with empty `roots` (`krate == here`)!
+        let same_local_inner = expand_one(here, LocalInner::Yes, None);
+        assert!(roots_written_for(&[], &same_local_inner, here) > 0, "same-crate local_inner mark must be counted");
+
+        // Foreign `local_inner_macros`: also indispensable.
+        let foreign_local_inner = expand_one(other, LocalInner::Yes, None);
+        assert!(roots_written_for(&[], &foreign_local_inner, here) > 0, "foreign local_inner mark must be counted");
+
+        // Control: same-crate without `local_inner_macros` and no foreign `$crate` roots -> 0.
+        let same_plain = expand_one(here, LocalInner::No, None);
+        assert_eq!(roots_written_for(&[], &same_plain, here), 0, "plain same-crate expansion needs no foreign root guard");
+
+        // Control: transparent mark with `local_inner_macros` does not count.
+        let transparent_local_inner = expand_one(here, LocalInner::Yes, Some(Transparency::Transparent));
+        assert_eq!(roots_written_for(&[], &transparent_local_inner, here), 0, "transparent mark is skipped");
+
+        // Control: foreign `$crate` root in `roots` counts even without `local_inner_macros`.
+        assert_eq!(roots_written_for(&[(0, other)], &same_plain, here), 1);
     }
 }

@@ -224,6 +224,32 @@ pub fn neg2_caller_arg() -> u32 {
 
 // Negative control 3: non-macro paths (`CallerTy`, `CALLER_VAL`) resolve in `app` (`u32`), not `dep` (`bool`).
 dep::emit_val!(neg3_non_macro_paths);
+
+// Same-crate `#[macro_export(local_inner_macros)]` invoked inside a fn body with a shadowing
+// body-local `macro_rules! same_crate_helper` (incompatible type `bool`) must resolve to the
+// crate root's `#[macro_export] macro_rules! same_crate_helper` (`u32`).
+#[macro_export]
+macro_rules! same_crate_helper {
+    ($x:expr) => {
+        $x + 10u32
+    };
+}
+
+#[macro_export(local_inner_macros)]
+macro_rules! same_crate_outer {
+    ($x:expr) => {
+        same_crate_helper!($x)
+    };
+}
+
+pub fn pos3_same_crate_local_inner_over_body_shadow() -> u32 {
+    macro_rules! same_crate_helper {
+        ($x:expr) => {
+            true
+        };
+    }
+    same_crate_outer!(32u32)
+}
 "#;
 
 const APP_AT: usize = 0;
@@ -488,4 +514,8 @@ fn local_inner_macros_token_hygiene_positives_and_negative_controls() {
     // Negative control 3: non-macro paths (`CallerTy`, `CALLER_VAL`) resolve in `app` (`u32`), NOT `dep` (`bool`)!
     let neg3 = run_body(records, fn_key(names, records, "neg3_non_macro_paths"));
     assert!(issues(&neg3).is_empty(), "neg3_non_macro_paths must resolve CallerTy/CALLER_VAL in app (u32), got: {:?}", issues(&neg3));
+
+    // Same-crate `#[macro_export(local_inner_macros)]` resolves at crate root (`u32`), not body-local shadow (`bool`).
+    let pos3 = run_body(records, fn_key(names, records, "pos3_same_crate_local_inner_over_body_shadow"));
+    assert!(issues(&pos3).is_empty(), "pos3_same_crate_local_inner_over_body_shadow must resolve at crate root, got: {:?}", issues(&pos3));
 }
