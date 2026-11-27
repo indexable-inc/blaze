@@ -356,7 +356,7 @@ pub fn script_deps_digest(
         row.push(' ');
         match (&pkg.checksum, &pkg.source) {
             (Checksum::Sha256(sum), _) => {
-                let _ = write!(row, "checksum:{}", sum.as_str());
+                let _ = write!(row, "checksum:{} {}", sum.as_str(), pkg.source_text.as_str());
             }
             (Checksum::Absent, LockSource::Path) => match path_files(u.package) {
                 Some(hex) => {
@@ -365,7 +365,7 @@ pub fn script_deps_digest(
                 None => row.push_str("path:unpinned"),
             },
             (Checksum::Absent, LockSource::Git { commit, .. }) => {
-                let _ = write!(row, "git:{}", commit.as_str());
+                let _ = write!(row, "git:{} {}", commit.as_str(), pkg.source_text.as_str());
             }
             (Checksum::Absent, LockSource::Registry { .. }) => {
                 let _ = write!(row, "source:{}", pkg.source_text.as_str());
@@ -1463,5 +1463,111 @@ mod tests {
             .expect("frame ok")
             .expect("feat_off");
         assert_ne!(feat_on, feat_off, "script_deps_digest must change when a WASI-only dep feature toggles in wasm_graph");
+    }
+
+    #[test]
+    fn script_deps_digest_distinguishes_same_name_version_different_source_feature_swap() {
+        use blaze_manifest::lock::{Lock, LockId};
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let lock_text = "version = 4\n\n\
+            [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"dup 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\",\n \"dup 0.1.0 (git+https://example.com/dup.git#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)\",\n]\n\n\
+            [[package]]\nname = \"dup\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\n\n\
+            [[package]]\nname = \"dup\"\nversion = \"0.1.0\"\nsource = \"git+https://example.com/dup.git#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n";
+        let lock = Lock::read(lock_text.as_bytes(), alloc).expect("lock");
+
+        let mk_graph = |feats_reg: &[&str], feats_git: &[&str]| {
+            let mut bs_deps = OwnVec::new_in(alloc);
+            bs_deps.push(UnitDep { name: Text::from_str_in("dup_reg", alloc), unit: UnitId(1) });
+            bs_deps.push(UnitDep { name: Text::from_str_in("dup_git", alloc), unit: UnitId(2) });
+            let mk_feats = |fs: &[&str]| {
+                let mut v = OwnVec::new_in(alloc);
+                for f in fs {
+                    v.push(Text::from_str_in(f, alloc));
+                }
+                v
+            };
+            let mut units = OwnVec::new_in(alloc);
+            units.push(Unit {
+                package: LockId(0),
+                name: Text::from_str_in("app", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::BuildScript,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("build_script_build", alloc),
+                root: Text::from_str_in("build.rs", alloc),
+                features: OwnVec::new_in(alloc),
+                cfg: OwnVec::new_in(alloc),
+                deps: bs_deps,
+                build_script: None,
+                links: None,
+            });
+            units.push(Unit {
+                package: LockId(1),
+                name: Text::from_str_in("dup", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::Lib,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("dup", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: mk_feats(feats_reg),
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            units.push(Unit {
+                package: LockId(2),
+                name: Text::from_str_in("dup", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::Lib,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("dup", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: mk_feats(feats_git),
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) }
+        };
+
+        let host_empty = {
+            let mut units = OwnVec::new_in(alloc);
+            units.push(Unit {
+                package: LockId(0),
+                name: Text::from_str_in("app", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::BuildScript,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("build_script_build", alloc),
+                root: Text::from_str_in("build.rs", alloc),
+                features: OwnVec::new_in(alloc),
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) }
+        };
+        let wg_ab = mk_graph(&["feat_a"], &["feat_b"]);
+        let wg_ba = mk_graph(&["feat_b"], &["feat_a"]);
+        let d_ab = super::script_deps_digest(&host_empty, Some(&wg_ab), &lock, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("d_ab");
+        let d_ba = super::script_deps_digest(&host_empty, Some(&wg_ba), &lock, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("d_ba");
+        assert_ne!(
+            d_ab, d_ba,
+            "swapping features A and B between two same-name/version packages from different sources must change script_deps_digest"
+        );
     }
 }

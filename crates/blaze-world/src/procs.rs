@@ -74,16 +74,19 @@ impl MacroIdentity {
         f(&CrateId { name: &self.package, version: &self.version, source, deps: &self.deps, features: &features })
     }
 
-    /// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified features into this
-    /// identity's `deps` digest so enabling or removing a feature on any WASI-only (or host)
-    /// dependency via a sibling workspace unit invalidates the proc-macro module key (rule 21).
-    pub fn with_wasm_features<A: core::alloc::Allocator + Copy>(
+    /// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified features (bound to
+    /// each package's source pin) into this identity's `deps` digest so enabling, removing, or
+    /// swapping features across dependencies (including same-name/same-version packages from
+    /// different sources) invalidates the proc-macro module key (rule 21).
+    pub fn with_wasm_features<D: AsRef<str>, A: core::alloc::Allocator + Copy>(
         mut self,
+        lock: &Lock<'_>,
         wasm_graph: &blaze_unit_graph::UnitGraph<'_>,
         package: LockId,
+        path_files: impl FnMut(LockId) -> Option<D>,
         alloc: A,
     ) -> Self {
-        let folded = blaze_proc_macro::module::deps_with_wasm_features(&self.deps, wasm_graph, package, &self.features, alloc);
+        let folded = blaze_proc_macro::module::deps_with_wasm_features(&self.deps, lock, wasm_graph, package, &self.features, path_files, alloc);
         self.deps = folded.as_str().to_string();
         self
     }

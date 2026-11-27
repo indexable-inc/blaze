@@ -237,15 +237,18 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// WASI-side unified dependency features into `deps`.
 pub const MODULE_HEADER: &str = "blaze proc-macro module wasm64 8";
 
-/// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified feature sets into a
-/// proc-macro crate's `deps` digest so enabling or removing a feature on any WASI-only (or host)
-/// dependency via a sibling workspace build script or proc macro invalidates the module key
-/// (rule 21).
-pub fn deps_with_wasm_features<S: AsRef<str>, A: core::alloc::Allocator + Copy>(
+/// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified feature sets (bound to
+/// each package's source pin — registry checksum/source, git commit+URL, or path files digest)
+/// into a proc-macro crate's `deps` digest so enabling, removing, or swapping features across
+/// dependencies (including same-name/same-version packages from different sources) invalidates
+/// the module key (rule 21).
+pub fn deps_with_wasm_features<S: AsRef<str>, D: AsRef<str>, A: core::alloc::Allocator + Copy>(
     lock_deps: &str,
+    lock: &Lock<'_>,
     wasm_graph: &blaze_unit_graph::UnitGraph<'_>,
     package: blaze_manifest::lock::LockId,
     features: &[S],
+    mut path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<D>,
     alloc: A,
 ) -> blaze_own::String<A> {
     use core::fmt::Write as _;
@@ -322,8 +325,27 @@ pub fn deps_with_wasm_features<S: AsRef<str>, A: core::alloc::Allocator + Copy>(
                 blaze_unit_graph::UnitKind::ProcMacro => "proc-macro",
                 _ => "lib",
             };
+            let pkg = lock.package(u.package);
             let mut row = blaze_own::String::new_in(alloc);
             let _ = write!(row, "{} {} {} ", u.name.as_str(), u.version.as_str(), kind_word);
+            match (&pkg.checksum, &pkg.source) {
+                (Checksum::Sha256(sum), _) => {
+                    let _ = write!(row, "checksum:{} {}", sum.as_str(), pkg.source_text.as_str());
+                }
+                (Checksum::Absent, LockSource::Path) => match path_files(u.package) {
+                    Some(hex) => {
+                        let _ = write!(row, "files:{}", hex.as_ref());
+                    }
+                    None => row.push_str("path:unpinned"),
+                },
+                (Checksum::Absent, LockSource::Git { commit, .. }) => {
+                    let _ = write!(row, "git:{} {}", commit.as_str(), pkg.source_text.as_str());
+                }
+                (Checksum::Absent, LockSource::Registry { .. }) => {
+                    let _ = write!(row, "source:{}", pkg.source_text.as_str());
+                }
+            }
+            row.push(' ');
             for (i, f) in ufeats.iter().enumerate() {
                 if i > 0 {
                     row.push(',');
@@ -666,6 +688,11 @@ mod header_tests {
         use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
         let alloc = blaze_own::testing::heap().alloc();
 
+        let lock_text = "version = 4\n\n\
+            [[package]]\nname = \"demo_pm\"\nversion = \"0.1.0\"\ndependencies = [\"wasi_helper\"]\n\n\
+            [[package]]\nname = \"wasi_helper\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\n";
+        let lock = Lock::read(lock_text.as_bytes(), alloc).expect("lock");
+
         let mk_wasm_graph = |wasi_feats: &[&str]| {
             let mut pm_deps = OwnVec::new_in(alloc);
             pm_deps.push(UnitDep { name: Text::from_str_in("wasi_helper", alloc), unit: UnitId(1) });
@@ -709,8 +736,95 @@ mod header_tests {
 
         let wg_on = mk_wasm_graph(&["extra_wasi"]);
         let wg_off = mk_wasm_graph(&[]);
-        let d_on = deps_with_wasm_features("same-lock-closure", &wg_on, LockId(0), &[] as &[&str], std::alloc::Global);
-        let d_off = deps_with_wasm_features("same-lock-closure", &wg_off, LockId(0), &[] as &[&str], std::alloc::Global);
+        let d_on = deps_with_wasm_features("same-lock-closure", &lock, &wg_on, LockId(0), &[] as &[&str], |_| None::<&str>, std::alloc::Global);
+        let d_off = deps_with_wasm_features("same-lock-closure", &lock, &wg_off, LockId(0), &[] as &[&str], |_| None::<&str>, std::alloc::Global);
         assert_ne!(d_on.as_str(), d_off.as_str(), "proc-macro deps digest must change when a WASI-only dep feature toggles");
+    }
+
+    #[test]
+    fn deps_with_wasm_features_distinguishes_same_name_version_different_source_feature_swap() {
+        use blaze_manifest::lock::LockId;
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitId, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Two dependencies with the EXACT same name ("dup") and version ("0.1.0"), from two
+        // different sources (registry checksum vs git commit). Swapping feature sets A and B
+        // between them must produce a distinct digest even with identical `lock_deps`.
+        let lock_text = "version = 4\n\n\
+            [[package]]\nname = \"demo_pm\"\nversion = \"0.1.0\"\ndependencies = [\n \"dup 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\",\n \"dup 0.1.0 (git+https://example.com/dup.git#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)\",\n]\n\n\
+            [[package]]\nname = \"dup\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\n\n\
+            [[package]]\nname = \"dup\"\nversion = \"0.1.0\"\nsource = \"git+https://example.com/dup.git#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n";
+        let lock = Lock::read(lock_text.as_bytes(), alloc).expect("lock");
+
+        let mk_wasm_graph = |feats_reg: &[&str], feats_git: &[&str]| {
+            let mut pm_deps = OwnVec::new_in(alloc);
+            pm_deps.push(UnitDep { name: Text::from_str_in("dup_reg", alloc), unit: UnitId(1) });
+            pm_deps.push(UnitDep { name: Text::from_str_in("dup_git", alloc), unit: UnitId(2) });
+            let mk_feats = |fs: &[&str]| {
+                let mut v = OwnVec::new_in(alloc);
+                for f in fs {
+                    v.push(Text::from_str_in(f, alloc));
+                }
+                v
+            };
+            let mut units = OwnVec::new_in(alloc);
+            units.push(Unit {
+                package: LockId(0),
+                name: Text::from_str_in("demo_pm", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::ProcMacro,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("demo_pm", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: OwnVec::new_in(alloc),
+                cfg: OwnVec::new_in(alloc),
+                deps: pm_deps,
+                build_script: None,
+                links: None,
+            });
+            units.push(Unit {
+                package: LockId(1),
+                name: Text::from_str_in("dup", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::Lib,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("dup", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: mk_feats(feats_reg),
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            units.push(Unit {
+                package: LockId(2),
+                name: Text::from_str_in("dup", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::Lib,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("dup", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: mk_feats(feats_git),
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) }
+        };
+
+        let wg_ab = mk_wasm_graph(&["feat_a"], &["feat_b"]);
+        let wg_ba = mk_wasm_graph(&["feat_b"], &["feat_a"]);
+        let d_ab = deps_with_wasm_features("same-lock-closure", &lock, &wg_ab, LockId(0), &[] as &[&str], |_| None::<&str>, std::alloc::Global);
+        let d_ba = deps_with_wasm_features("same-lock-closure", &lock, &wg_ba, LockId(0), &[] as &[&str], |_| None::<&str>, std::alloc::Global);
+        assert_ne!(
+            d_ab.as_str(),
+            d_ba.as_str(),
+            "swapping features A and B between two same-name/version packages from different sources must change the digest"
+        );
     }
 }

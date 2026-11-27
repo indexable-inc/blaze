@@ -826,7 +826,7 @@ fn ensure_proc_macro_unit(
     })
     .map_err(|e| std::format!("identifying proc-macro dep {} {}: {e}", unit.name.as_str(), unit.version.as_str()))?
     .map_err(|e| std::format!("proc-macro dep {} {} not identified: {e}", unit.name.as_str(), unit.version.as_str()))?
-    .with_wasm_features(graph, unit.package, heap.alloc());
+    .with_wasm_features(lock, graph, unit.package, |dep_id| path_pkg_files_digest(checkout, members, dep_id), heap.alloc());
 
     let (mod_key, id_text, existing) = identity.with_id(|id| {
         (
