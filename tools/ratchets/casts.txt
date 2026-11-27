@@ -20,7 +20,7 @@ blaze-body-flow	24
 blaze-body-lower	22
 blaze-borrow	43
 blaze-bstd-convert	9
-blaze-build	729
+blaze-build	725
 blaze-build-script	109
 blaze-c	4
 blaze-cad	105
@@ -50,7 +50,7 @@ blaze-deflate	152
 blaze-drive	64
 blaze-dust	5
 blaze-ed25519	5
-blaze-emit	551
+blaze-emit	548
 blaze-engine	89
 blaze-expand	284
 blaze-export	595

@@ -502,8 +502,11 @@ fn chained_tuple_field_indices_parse_in_extent_and_assert() {
     let list_stream = tokens(r#"literal.3.2.is_some(), "missing""#);
     let words = Words::new(&list_stream, alloc());
     let list = words.list(Prefix::Expr, 0..list_stream.len(), alloc()).expect("list accepts chained tuple index");
-    let pieces: std::vec::Vec<_> = list.iter().map(|r| text(&list_stream, r.clone())).collect();
-    assert_eq!(pieces, ["literal . 3.2 . is_some ( )", "missing"]);
+    let mut pieces = blaze_own::Vec::new_in(alloc());
+    for r in list.iter() {
+        pieces.push(text(&list_stream, r.clone()));
+    }
+    assert_eq!(pieces.as_slice(), ["literal . 3.2 . is_some ( )", "missing"]);
 
     // End-to-end builtin `assert!` expansion with chained tuple field indices.
     let assert_def = crate::MacroDefinition::builtin_fn(crate::BuiltinFn::Assert, def_at(1), alloc());

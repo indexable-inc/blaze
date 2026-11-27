@@ -4895,28 +4895,35 @@ fn collect_slot_fields<A: Allocator + Copy>(view: &View<'_>, alloc: A) -> SlotFi
     if let Some(canon_v16) = Ty::vector(crate::Scalar::I8, 16) {
         let mut read = 0usize;
         let mut write = 0usize;
-        while read < accesses.len() {
-            let first = accesses[read];
+        while let Some(&first) = accesses.get(read) {
             let mut end = read + 1;
-            while end < accesses.len()
-                && accesses[end].slot == first.slot
-                && accesses[end].off == first.off
+            while let Some(next) = accesses.get(end)
+                && next.slot == first.slot
+                && next.off == first.off
             {
                 end += 1;
             }
-            if end - read >= 2
-                && (read..end).all(|i| {
-                    accesses[i].size == 16
-                        && matches!(accesses[i].ty.form(), crate::ty::Form::Vector)
-                        && accesses[i].ty.bits(64) == 128
-                })
-            {
-                accesses[write] = SlotAccess { slot: first.slot, off: first.off, size: 16, ty: canon_v16 };
-                write += 1;
+            let collapse = end - read >= 2
+                && accesses.get(read..end).is_some_and(|group| {
+                    group.iter().all(|acc| {
+                        acc.size == 16
+                            && matches!(acc.ty.form(), crate::ty::Form::Vector)
+                            && acc.ty.bits(64) == 128
+                    })
+                });
+            if collapse {
+                if let Some(dst) = accesses.get_mut(write) {
+                    *dst = SlotAccess { slot: first.slot, off: first.off, size: 16, ty: canon_v16 };
+                    write += 1;
+                }
             } else {
                 for i in read..end {
-                    accesses[write] = accesses[i];
-                    write += 1;
+                    if let Some(&src) = accesses.get(i)
+                        && let Some(dst) = accesses.get_mut(write)
+                    {
+                        *dst = src;
+                        write += 1;
+                    }
                 }
             }
             read = end;

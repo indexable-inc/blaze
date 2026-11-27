@@ -372,13 +372,30 @@ fn clean_after_a_watch_removes_its_cookies() {
 #[test]
 fn clean_all_removes_only_the_tables_folders() {
     use crate::layout::{LAYOUT, Scope, kept_at_home, of};
+    use core::fmt::Write as _;
+    let alloc = blaze_own::testing::heap().alloc();
     let planted = ["h/.blaze/v2/mine/notes", "h/.blaze/v2/run/other/x", "h/.blaze/v2/test/keep/x", "h/.blaze/v2/sdk-answers-old/x", "h/.blaze/notes.txt"];
-    let mut files: std::vec::Vec<(std::string::String, &str)> = std::vec![("ws/src/lib.rs".into(), "fn f() {}\n"), ("h/.blaze/v2/store/CACHEDIR.TAG".into(), TAG), (OWN_HEAD.into(), "head")];
-    for row in LAYOUT.iter().filter(|row| row.place == super::Place::Home && row.scope != Scope::Store) {
-        files.push((format!("h/{}/f", row.path), "x"));
+    let mut files = blaze_own::Vec::<(blaze_own::AString<'_>, &str), _>::new_in(alloc);
+    for (p, t) in [("ws/src/lib.rs", "fn f() {}\n"), ("h/.blaze/v2/store/CACHEDIR.TAG", TAG), (OWN_HEAD, "head")] {
+        let mut s = blaze_own::String::new_in(alloc);
+        s.push_str(p);
+        files.push((s, t));
     }
-    files.extend(planted.iter().map(|path| (std::string::String::from(*path), "mine")));
-    let io = world(&files.iter().map(|(path, text)| (path.as_str(), *text)).collect::<std::vec::Vec<_>>());
+    for row in LAYOUT.iter().filter(|row| row.place == super::Place::Home && row.scope != Scope::Store) {
+        let mut s = blaze_own::String::new_in(alloc);
+        let _ = write!(s, "h/{}/f", row.path);
+        files.push((s, "x"));
+    }
+    for path in planted {
+        let mut s = blaze_own::String::new_in(alloc);
+        s.push_str(path);
+        files.push((s, "mine"));
+    }
+    let mut pairs = blaze_own::Vec::with_capacity_in(files.len(), alloc);
+    for (path, text) in &files {
+        pairs.push((path.as_str(), *text));
+    }
+    let io = world(&pairs);
     let (result, said) = clean(&io, &["ws", "--all"]);
     println!("blaze clean ws --all, with planted folders:\n{said}");
     assert!(result.is_ok(), "{result:?}");

@@ -621,7 +621,7 @@ pub(crate) const fn stp_pre(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
 
 /// `ldp xt, xt2, [rn, #off]!`, `off` a multiple of 8 in -512..=504.
 pub(crate) const fn ldp_pre(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
-    0xa9c0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+    0xa9c0_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
 /// `ldp xt, xt2, [rn], #off`, `off` a multiple of 8 in -512..=504.
@@ -641,7 +641,7 @@ pub(crate) const fn stp_pre_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
 
 /// `ldp dt, dt2, [rn, #off]!` (C7.2.155, SIMD&FP 64-bit pre-index), `off` a multiple of 8 in -512..=504.
 pub(crate) const fn ldp_pre_d(rt: Reg, rt2: Reg, rn: Reg, off: i32) -> u32 {
-    0x6dc0_0000 | ((((off / 8) as u32) & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
+    0x6dc0_0000 | (((off / 8).cast_unsigned() & 0x7f) << 15) | (rt2 << 10) | (rn << 5) | rt
 }
 
 /// `ldp dt, dt2, [rn], #off` (C7.2.155, SIMD&FP 64-bit post-index), `off` a multiple of 8 in -512..=504.

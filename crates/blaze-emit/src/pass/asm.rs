@@ -217,7 +217,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
                     let sym = u32::try_from(syms.len())
                         .map_err(|_| unsupported(inst, op, "too many `sym` operands in an `asm!` block"))?;
                     syms.push(target);
-                    placed[i] = Some(Placed { bank: Bank::X, reg: 0, class: false, sym, input: None, member: None });
+                    if let Some(slot) = placed.get_mut(i) {
+                        *slot = Some(Placed { bank: Bank::X, reg: 0, class: false, sym, input: None, member: None });
+                    }
                     continue;
                 }
                 AsmOperandKind::Label => return Err(unsupported(inst, op, "a `label` operand of `asm!` outside an `asm_br`")),
@@ -239,7 +241,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 false => None,
             };
             if rec.class != 0 {
-                placed[i] = Some(Placed { bank: Bank::X, reg: u32::MAX, class: true, sym: u32::MAX, input, member });
+                if let Some(slot) = placed.get_mut(i) {
+                    *slot = Some(Placed { bank: Bank::X, reg: u32::MAX, class: true, sym: u32::MAX, input, member });
+                }
                 continue;
             }
             let name = view.asm_str(rec.reg_first, rec.reg_len);
@@ -252,7 +256,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 return Err(unsupported(inst, op, "two `asm!` operands in one explicit register"));
             }
             *used |= 1 << reg;
-            placed[i] = Some(Placed { bank, reg, class: false, sym: u32::MAX, input, member });
+            if let Some(slot) = placed.get_mut(i) {
+                *slot = Some(Placed { bank, reg, class: false, sym: u32::MAX, input, member });
+            }
         }
         for (i, rec) in operands.iter().enumerate() {
             let Some(p) = placed[i].as_mut() else { continue };
@@ -311,24 +317,34 @@ impl<A: Allocator> Pass<'_, '_, A> {
                             return Err(unsupported(inst, op, "a template modifier on a `sym` operand"));
                         }
                         let mut buf = [0u8; 16];
-                        buf[..4].copy_from_slice(b"$sym");
+                        if let Some(prefix) = buf.get_mut(..4) {
+                            prefix.copy_from_slice(b"$sym");
+                        }
                         let mut len = 4usize;
                         let mut v = p.sym;
                         let mut digits = [0u8; 10];
                         let mut nd = 0usize;
                         loop {
-                            digits[nd] = b'0' + (v % 10) as u8;
-                            nd += 1;
+                            if let (Ok(d), Some(slot)) = (u8::try_from(v % 10), digits.get_mut(nd)) {
+                                *slot = b'0' + d;
+                                nd += 1;
+                            }
                             v /= 10;
                             if v == 0 {
                                 break;
                             }
                         }
-                        for &d in digits[..nd].iter().rev() {
-                            buf[len] = d;
-                            len += 1;
+                        if let Some(written) = digits.get(..nd) {
+                            for &d in written.iter().rev() {
+                                if let Some(slot) = buf.get_mut(len) {
+                                    *slot = d;
+                                    len += 1;
+                                }
+                            }
                         }
-                        reader.feed(&buf[..len]).map_err(refused)?;
+                        if let Some(slice) = buf.get(..len) {
+                            reader.feed(slice).map_err(refused)?;
+                        }
                         continue;
                     }
                     if !p.class {
@@ -342,7 +358,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
         let sym_sites = reader.finish().map_err(refused)?;
         for s in sym_sites {
-            match syms[s.sym as usize] {
+            let Some(&target) = usize::try_from(s.sym).ok().and_then(|i| syms.get(i)) else { continue };
+            match target {
                 SymTarget::Record { place } => {
                     self.site(s.at, s.link, SiteTo::Import(RelocTo::Func(place)));
                 }

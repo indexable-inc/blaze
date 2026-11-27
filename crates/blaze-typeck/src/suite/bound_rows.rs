@@ -27,7 +27,7 @@
 use std::string::String;
 use std::vec::Vec;
 
-use super::check_body;
+use super::{check_body, clauses};
 use crate::body::IntSuffix;
 use crate::columns::Checked;
 use crate::fixture::{Bb, Fx, show};
@@ -52,36 +52,36 @@ struct World {
 
 fn world() -> World {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
     let p0 = fx.param(0);
     let (u8_, unit) = (fx.u8(), fx.unit());
     let ref_u8 = fx.r(Mutbl::Not, u8_);
-    let marker = fx.tr("Marker", 1, Vec::new(), &[]);
-    let marker_ref = fx.imp("impl Marker for &u8", 0, ref_u8, Some((marker, &[])), &[], Vec::new());
-    fx.imp("impl Marker for u8", 0, u8_, Some((marker, &[])), &[], Vec::new());
+    let marker = fx.tr("Marker", 1, clauses(&[]), &[]);
+    let marker_ref = fx.imp("impl Marker for &u8", 0, ref_u8, Some((marker, &[])), &[], clauses(&[]));
+    fx.imp("impl Marker for u8", 0, u8_, Some((marker, &[])), &[], clauses(&[]));
     let t_marker = fx.bound(marker, &[p0]);
-    fx.func("need", 1, &[p0], u8_, std::vec![t_marker]);
-    let caller = fx.func("caller", 0, &[], u8_, Vec::new());
-    let gen_caller = fx.func("gen_caller", 1, &[p0], u8_, std::vec![t_marker]);
+    fx.func("need", 1, &[p0], u8_, clauses(&[t_marker]));
+    let caller = fx.func("caller", 0, &[], u8_, clauses(&[]));
+    let gen_caller = fx.func("gen_caller", 1, &[p0], u8_, clauses(&[t_marker]));
     let ref_u8_marker = fx.bound(marker, &[ref_u8]);
-    let assumes = fx.func("assumes", 0, &[], u8_, std::vec![ref_u8_marker]);
+    let assumes = fx.func("assumes", 0, &[], u8_, clauses(&[ref_u8_marker]));
     let u16_ = fx.u16();
     let ref_u16 = fx.r(Mutbl::Not, u16_);
-    fx.imp("impl Marker for &u16", 0, ref_u16, Some((marker, &[])), &[], Vec::new());
+    fx.imp("impl Marker for &u16", 0, ref_u16, Some((marker, &[])), &[], clauses(&[]));
     let ref_u16_marker = fx.bound(marker, &[ref_u16]);
-    let assumes_other = fx.func("assumes_other", 0, &[], u8_, std::vec![ref_u16_marker]);
-    let clone = fx.tr("Clone", 1, Vec::new(), &[]);
+    let assumes_other = fx.func("assumes_other", 0, &[], u8_, clauses(&[ref_u16_marker]));
+    let clone = fx.tr("Clone", 1, clauses(&[]), &[]);
     let self_ref = fx.r(Mutbl::Not, p0);
     fx.trait_fn(clone, "clone", true, &[self_ref], p0);
     fx.use_trait(clone);
     let vec = fx.strukt("Vec", 1, &[]);
     let vec_t = fx.adt(vec, &[p0]);
     let t_clone = fx.bound(clone, &[p0]);
-    let clone_vec = fx.imp("impl Clone for Vec", 1, vec_t, Some((clone, &[])), &[], std::vec![t_clone]);
-    let clone_ref = fx.imp("impl Clone for &T", 1, self_ref, Some((clone, &[])), &[], Vec::new());
+    let clone_vec = fx.imp("impl Clone for Vec", 1, vec_t, Some((clone, &[])), &[], clauses(&[t_clone]));
+    let clone_ref = fx.imp("impl Clone for &T", 1, self_ref, Some((clone, &[])), &[], clauses(&[]));
     let vec_ref_u8 = fx.adt(vec, &[ref_u8]);
-    let cloner = fx.func("cloner", 0, &[vec_ref_u8], unit, Vec::new());
+    let cloner = fx.func("cloner", 0, &[vec_ref_u8], unit, clauses(&[]));
     fx.finish();
     World { fx, marker, marker_ref, clone, clone_vec, clone_ref, caller, gen_caller, assumes, assumes_other, cloner }
 }
@@ -224,18 +224,18 @@ fn a_callers_ground_clause_on_other_types_leaves_the_impl_selected() {
 #[test]
 fn alias_bound_supertrait_projection_normalizes_and_selects_intermediate_impls() {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
     let (p0, p1) = (fx.param(0), fx.param(1));
     let unit = fx.unit();
 
-    let node_types = fx.tr("NodeTypes", 1, Vec::new(), &["ChainSpec"]);
-    let cs_provider = fx.tr("ChainSpecProvider", 1, Vec::new(), &["ChainSpec"]);
-    let full_provider = fx.tr("FullProvider", 2, Vec::new(), &[]);
+    let node_types = fx.tr("NodeTypes", 1, clauses(&[]), &["ChainSpec"]);
+    let cs_provider = fx.tr("ChainSpecProvider", 1, clauses(&[]), &["ChainSpec"]);
+    let full_provider = fx.tr("FullProvider", 2, clauses(&[]), &[]);
     let p1_cs = fx.alias(node_types, "ChainSpec", &[p1]);
     let fp_sup_tr = fx.bound(cs_provider, &[p0]);
     let fp_sup_proj = fx.proj(cs_provider, &[p0], "ChainSpec", p1_cs);
-    fx.set_supers(full_provider, std::vec![fp_sup_tr, fp_sup_proj]);
+    fx.set_supers(full_provider, clauses(&[fp_sup_tr, fp_sup_proj]));
 
     let adapter = fx.strukt("Adapter", 1, &[]);
     let adapter_p0 = fx.adt(adapter, &[p0]);
@@ -247,19 +247,19 @@ fn alias_bound_supertrait_projection_normalizes_and_selects_intermediate_impls()
         adapter_p0,
         Some((node_types, &[])),
         &[("ChainSpec", p0_cs)],
-        std::vec![p0_nt],
+        clauses(&[p0_nt]),
     );
 
-    let full_node_types = fx.tr("FullNodeTypes", 1, Vec::new(), &["Types", "Provider"]);
+    let full_node_types = fx.tr("FullNodeTypes", 1, clauses(&[]), &["Types", "Provider"]);
     let fnt_types = fx.alias(full_node_types, "Types", &[p0]);
     let fnt_provider = fx.alias(full_node_types, "Provider", &[p0]);
     let fnt_types_nt = fx.bound(node_types, &[fnt_types]);
     let fnt_types_sized = fx.bound(sized, &[fnt_types]);
-    fx.set_assoc_bounds(full_node_types, "Types", std::vec![fnt_types_nt, fnt_types_sized]);
+    fx.set_assoc_bounds(full_node_types, "Types", clauses(&[fnt_types_nt, fnt_types_sized]));
     let adapter_types = fx.adt(adapter, &[fnt_types]);
     let fnt_prov_fp = fx.bound(full_provider, &[fnt_provider, adapter_types]);
     let fnt_prov_sized = fx.bound(sized, &[fnt_provider]);
-    fx.set_assoc_bounds(full_node_types, "Provider", std::vec![fnt_prov_fp, fnt_prov_sized]);
+    fx.set_assoc_bounds(full_node_types, "Provider", clauses(&[fnt_prov_fp, fnt_prov_sized]));
 
     let tempo_node = fx.strukt("TempoNode", 0, &[]);
     let tempo_node_t = fx.adt(tempo_node, &[]);
@@ -271,20 +271,20 @@ fn alias_bound_supertrait_projection_normalizes_and_selects_intermediate_impls()
         tempo_node_t,
         Some((node_types, &[])),
         &[("ChainSpec", tempo_cs_t)],
-        Vec::new(),
+        clauses(&[]),
     );
 
-    let hf = fx.tr("TempoHardforks", 1, Vec::new(), &[]);
-    let impl_hf_tempo = fx.imp("impl TempoHardforks for TempoChainSpec", 0, tempo_cs_t, Some((hf, &[])), &[], Vec::new());
+    let hf = fx.tr("TempoHardforks", 1, clauses(&[]), &[]);
+    let impl_hf_tempo = fx.imp("impl TempoHardforks for TempoChainSpec", 0, tempo_cs_t, Some((hf, &[])), &[], clauses(&[]));
 
     let p0_csp = fx.bound(cs_provider, &[p0]);
     let p0_csp_cs = fx.alias(cs_provider, "ChainSpec", &[p0]);
     let p0_csp_cs_hf = fx.bound(hf, &[p0_csp_cs]);
-    fx.func("need_hf", 1, &[p0], unit, std::vec![p0_csp, p0_csp_cs_hf]);
+    fx.func("need_hf", 1, &[p0], unit, clauses(&[p0_csp, p0_csp_cs_hf]));
 
     let node_fnt = fx.bound(full_node_types, &[p0]);
     let node_types_eq = fx.proj(full_node_types, &[p0], "Types", tempo_node_t);
-    let components = fx.func("components", 1, &[fnt_provider], unit, std::vec![node_fnt, node_types_eq]);
+    let components = fx.func("components", 1, &[fnt_provider], unit, clauses(&[node_fnt, node_types_eq]));
     fx.finish();
 
     let mut b = Bb::new();
@@ -314,18 +314,18 @@ fn alias_bound_supertrait_projection_normalizes_and_selects_intermediate_impls()
 #[test]
 fn impl_where_projection_clause_normalizes_lhs_and_rhs_aliases() {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
     let (p0, p1) = (fx.param(0), fx.param(1));
     let unit = fx.unit();
 
-    let node_types = fx.tr("NodeTypes", 1, Vec::new(), &["ChainSpec"]);
-    let cs_provider = fx.tr("ChainSpecProvider", 1, Vec::new(), &["ChainSpec"]);
-    let full_provider = fx.tr("FullProvider", 2, Vec::new(), &[]);
+    let node_types = fx.tr("NodeTypes", 1, clauses(&[]), &["ChainSpec"]);
+    let cs_provider = fx.tr("ChainSpecProvider", 1, clauses(&[]), &["ChainSpec"]);
+    let full_provider = fx.tr("FullProvider", 2, clauses(&[]), &[]);
     let p1_cs = fx.alias(node_types, "ChainSpec", &[p1]);
     let fp_sup_tr = fx.bound(cs_provider, &[p0]);
     let fp_sup_proj = fx.proj(cs_provider, &[p0], "ChainSpec", p1_cs);
-    fx.set_supers(full_provider, std::vec![fp_sup_tr, fp_sup_proj]);
+    fx.set_supers(full_provider, clauses(&[fp_sup_tr, fp_sup_proj]));
 
     let adapter = fx.strukt("Adapter", 1, &[]);
     let adapter_p0 = fx.adt(adapter, &[p0]);
@@ -337,19 +337,19 @@ fn impl_where_projection_clause_normalizes_lhs_and_rhs_aliases() {
         adapter_p0,
         Some((node_types, &[])),
         &[("ChainSpec", p0_cs)],
-        std::vec![p0_nt],
+        clauses(&[p0_nt]),
     );
 
-    let full_node_types = fx.tr("FullNodeTypes", 1, Vec::new(), &["Types", "Provider"]);
+    let full_node_types = fx.tr("FullNodeTypes", 1, clauses(&[]), &["Types", "Provider"]);
     let fnt_types = fx.alias(full_node_types, "Types", &[p0]);
     let fnt_provider = fx.alias(full_node_types, "Provider", &[p0]);
     let fnt_types_nt = fx.bound(node_types, &[fnt_types]);
     let fnt_types_sized = fx.bound(sized, &[fnt_types]);
-    fx.set_assoc_bounds(full_node_types, "Types", std::vec![fnt_types_nt, fnt_types_sized]);
+    fx.set_assoc_bounds(full_node_types, "Types", clauses(&[fnt_types_nt, fnt_types_sized]));
     let adapter_types = fx.adt(adapter, &[fnt_types]);
     let fnt_prov_fp = fx.bound(full_provider, &[fnt_provider, adapter_types]);
     let fnt_prov_sized = fx.bound(sized, &[fnt_provider]);
-    fx.set_assoc_bounds(full_node_types, "Provider", std::vec![fnt_prov_fp, fnt_prov_sized]);
+    fx.set_assoc_bounds(full_node_types, "Provider", clauses(&[fnt_prov_fp, fnt_prov_sized]));
 
     let tempo_node = fx.strukt("TempoNode", 0, &[]);
     let tempo_node_t = fx.adt(tempo_node, &[]);
@@ -361,10 +361,10 @@ fn impl_where_projection_clause_normalizes_lhs_and_rhs_aliases() {
         tempo_node_t,
         Some((node_types, &[])),
         &[("ChainSpec", tempo_cs_t)],
-        Vec::new(),
+        clauses(&[]),
     );
 
-    let pool_tr = fx.tr("Pool", 1, Vec::new(), &[]);
+    let pool_tr = fx.tr("Pool", 1, clauses(&[]), &[]);
     let tempo_pool = fx.strukt("TempoPool", 1, &[]);
     let tempo_pool_p0 = fx.adt(tempo_pool, &[p0]);
     let tempo_node_cs = fx.alias(node_types, "ChainSpec", &[tempo_node_t]);
@@ -376,16 +376,16 @@ fn impl_where_projection_clause_normalizes_lhs_and_rhs_aliases() {
         tempo_pool_p0,
         Some((pool_tr, &[])),
         &[],
-        std::vec![client_csp, client_csp_eq],
+        clauses(&[client_csp, client_csp_eq]),
     );
 
     let p0_pool = fx.bound(pool_tr, &[p0]);
-    fx.func("use_pool", 1, &[p0], unit, std::vec![p0_pool]);
+    fx.func("use_pool", 1, &[p0], unit, clauses(&[p0_pool]));
 
     let node_fnt = fx.bound(full_node_types, &[p0]);
     let node_types_eq = fx.proj(full_node_types, &[p0], "Types", tempo_node_t);
     let tempo_pool_prov = fx.adt(tempo_pool, &[fnt_provider]);
-    let components = fx.func("components", 1, &[tempo_pool_prov], unit, std::vec![node_fnt, node_types_eq]);
+    let components = fx.func("components", 1, &[tempo_pool_prov], unit, clauses(&[node_fnt, node_types_eq]));
     fx.finish();
 
     let mut b = Bb::new();
@@ -415,31 +415,31 @@ fn impl_where_projection_clause_normalizes_lhs_and_rhs_aliases() {
 #[test]
 fn rigid_param_alias_clause_does_not_shadow_ground_impl() {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
     let p0 = fx.param(0);
     let unit = fx.unit();
     let u8_ = fx.u8();
     let ru8 = fx.r(Mutbl::Not, u8_);
 
-    let marker = fx.tr("Marker", 1, Vec::new(), &[]);
+    let marker = fx.tr("Marker", 1, clauses(&[]), &[]);
     let super_marker = fx.bound(marker, &[p0]);
-    let sub_marker = fx.tr("SubMarker", 1, std::vec![super_marker], &[]);
-    let provider = fx.tr("Provider", 1, Vec::new(), &["Spec"]);
-    let marker_ref = fx.imp("impl Marker for &u8", 0, ru8, Some((marker, &[])), &[], Vec::new());
+    let sub_marker = fx.tr("SubMarker", 1, clauses(&[super_marker]), &[]);
+    let provider = fx.tr("Provider", 1, clauses(&[]), &["Spec"]);
+    let marker_ref = fx.imp("impl Marker for &u8", 0, ru8, Some((marker, &[])), &[], clauses(&[]));
 
     let p0_marker = fx.bound(marker, &[p0]);
-    fx.func("need", 1, &[p0], unit, std::vec![p0_marker]);
+    fx.func("need", 1, &[p0], unit, clauses(&[p0_marker]));
 
     let p0_prov = fx.bound(provider, &[p0]);
     let p0_spec = fx.alias(provider, "Spec", &[p0]);
     let spec_sub = fx.bound(sub_marker, &[p0_spec]);
-    let rigid_caller = fx.func("rigid_caller", 1, &[ru8], unit, std::vec![p0_prov, spec_sub]);
+    let rigid_caller = fx.func("rigid_caller", 1, &[ru8], unit, clauses(&[p0_prov, spec_sub]));
 
     let p0_prov2 = fx.bound(provider, &[p0]);
     let spec_eq = fx.proj(provider, &[p0], "Spec", ru8);
     let spec_sub2 = fx.bound(sub_marker, &[p0_spec]);
-    let equated_caller = fx.func("equated_caller", 1, &[ru8], unit, std::vec![p0_prov2, spec_eq, spec_sub2]);
+    let equated_caller = fx.func("equated_caller", 1, &[ru8], unit, clauses(&[p0_prov2, spec_eq, spec_sub2]));
     fx.finish();
 
     let run = |owner: ItemKey| {
@@ -479,12 +479,12 @@ fn rigid_param_alias_clause_does_not_shadow_ground_impl() {
 #[test]
 fn from_self_not_shadowed_by_other_from_bound() {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
     let (p0, p1, p2) = (fx.param(0), fx.param(1), fx.param(2));
 
-    let from_tr = fx.tr("From", 2, Vec::new(), &[]);
-    let impl_from_self = fx.imp("impl<T> From<T> for T", 1, p0, Some((from_tr, &[p0])), &[], Vec::new());
+    let from_tr = fx.tr("From", 2, clauses(&[]), &[]);
+    let impl_from_self = fx.imp("impl<T> From<T> for T", 1, p0, Some((from_tr, &[p0])), &[], clauses(&[]));
 
     let shape_err = fx.strukt("ShapeError", 1, &[]);
     let shape_a = fx.adt(shape_err, &[p0]);
@@ -492,20 +492,20 @@ fn from_self_not_shadowed_by_other_from_bound() {
 
     // fn convert<U, V: From<U>>(u: U) -> V
     let v_from_u = fx.bound(from_tr, &[p1, p0]);
-    fx.func("convert", 2, &[p0], p1, std::vec![v_from_u]);
+    fx.func("convert", 2, &[p0], p1, clauses(&[v_from_u]));
 
     // Caller 1: fn caller_self<A, E: From<ShapeError<A>>>(e: E) -> E { convert(e) }
     let e_from_sa = fx.bound(from_tr, &[p1, shape_a]);
-    let caller_self = fx.func("caller_self", 2, &[p1], p1, std::vec![e_from_sa]);
+    let caller_self = fx.func("caller_self", 2, &[p1], p1, clauses(&[e_from_sa]));
 
     // Caller 2 (twin): fn caller_match<A, E: From<ShapeError<A>>>(se: ShapeError<A>) -> E { convert(se) }
-    let caller_match = fx.func("caller_match", 2, &[shape_a], p1, std::vec![e_from_sa]);
+    let caller_match = fx.func("caller_match", 2, &[shape_a], p1, clauses(&[e_from_sa]));
 
     // Caller 3 (multi-clause): fn caller_two<A, B, E: From<ShapeError<A>> + From<ShapeError<B>>>(se: ShapeError<B>) -> E
     let e2_from_sa = fx.bound(from_tr, &[p2, shape_a]);
     let e2_from_sb = fx.bound(from_tr, &[p2, shape_b]);
-    let caller_two_b = fx.func("caller_two_b", 3, &[shape_b], p2, std::vec![e2_from_sa, e2_from_sb]);
-    let caller_two_self = fx.func("caller_two_self", 3, &[p2], p2, std::vec![e2_from_sa, e2_from_sb]);
+    let caller_two_b = fx.func("caller_two_b", 3, &[shape_b], p2, clauses(&[e2_from_sa, e2_from_sb]));
+    let caller_two_self = fx.func("caller_two_self", 3, &[p2], p2, clauses(&[e2_from_sa, e2_from_sb]));
     fx.finish();
 
     let run = |owner: ItemKey| {
@@ -558,11 +558,11 @@ fn from_self_not_shadowed_by_other_from_bound() {
 #[test]
 fn rigid_param_alias_does_not_block_concrete_or_nested_clone_impl() {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
-    let copy = fx.tr("Copy", 1, Vec::new(), &[]);
+    let copy = fx.tr("Copy", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Copy, copy);
-    let clone = fx.tr("Clone", 1, Vec::new(), &[]);
+    let clone = fx.tr("Clone", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Clone, clone);
 
     let (p0, p1) = (fx.param(0), fx.param(1));
@@ -571,15 +571,15 @@ fn rigid_param_alias_does_not_block_concrete_or_nested_clone_impl() {
     let ru8 = fx.r(Mutbl::Not, u8_);
     let ref_p0 = fx.r(Mutbl::Not, p0);
 
-    fx.imp("impl Copy for u8", 0, u8_, Some((copy, &[])), &[], Vec::new());
-    fx.imp("impl Clone for u8", 0, u8_, Some((clone, &[])), &[], Vec::new());
-    fx.imp("impl<T> Clone for &T", 1, ref_p0, Some((clone, &[])), &[], Vec::new());
-    fx.imp("impl<T> Copy for &T", 1, ref_p0, Some((copy, &[])), &[], Vec::new());
+    fx.imp("impl Copy for u8", 0, u8_, Some((copy, &[])), &[], clauses(&[]));
+    fx.imp("impl Clone for u8", 0, u8_, Some((clone, &[])), &[], clauses(&[]));
+    fx.imp("impl<T> Clone for &T", 1, ref_p0, Some((clone, &[])), &[], clauses(&[]));
+    fx.imp("impl<T> Copy for &T", 1, ref_p0, Some((copy, &[])), &[], clauses(&[]));
 
-    let into_iter = fx.tr("IntoIterator", 1, Vec::new(), &["Item", "IntoIter"]);
+    let into_iter = fx.tr("IntoIterator", 1, clauses(&[]), &["Item", "IntoIter"]);
     let range = fx.strukt("Range", 0, &[]);
     let range_ty = fx.adt(range, &[]);
-    fx.imp("impl Clone for Range", 0, range_ty, Some((clone, &[])), &[], Vec::new());
+    fx.imp("impl Clone for Range", 0, range_ty, Some((clone, &[])), &[], clauses(&[]));
 
     let flat_map = fx.strukt("FlatMap", 2, &[]);
     let flat_map_p = fx.adt(flat_map, &[p0, p1]);
@@ -591,7 +591,7 @@ fn rigid_param_alias_does_not_block_concrete_or_nested_clone_impl() {
         flat_map_p,
         Some((clone, &[])),
         &[],
-        std::vec![p0_clone, p1_clone],
+        clauses(&[p0_clone, p1_clone]),
     );
     fx.imp(
         "impl<I, F> IntoIterator for FlatMap<I, F>",
@@ -599,9 +599,9 @@ fn rigid_param_alias_does_not_block_concrete_or_nested_clone_impl() {
         flat_map_p,
         Some((into_iter, &[])),
         &[("Item", u8_), ("IntoIter", flat_map_p)],
-        Vec::new(),
+        clauses(&[]),
     );
-    fx.func("mk_fm", 2, &[p0, p1], flat_map_p, Vec::new());
+    fx.func("mk_fm", 2, &[p0, p1], flat_map_p, clauses(&[]));
 
     let wrap = fx.strukt("Wrap", 1, &[]);
     let wrap_p0 = fx.adt(wrap, &[p0]);
@@ -611,15 +611,15 @@ fn rigid_param_alias_does_not_block_concrete_or_nested_clone_impl() {
         wrap_p0,
         Some((clone, &[])),
         &[],
-        std::vec![p0_clone],
+        clauses(&[p0_clone]),
     );
 
     // fn rebuild<X: IntoIterator>(x: X) where X::IntoIter: Clone
     let x_ii = fx.bound(into_iter, &[p0]);
     let x_into = fx.alias(into_iter, "IntoIter", &[p0]);
     let x_into_clone = fx.bound(clone, &[x_into]);
-    fx.func("rebuild", 1, &[p0], unit, std::vec![x_ii, x_into_clone]);
-    fx.func("need_clone", 1, &[p0], unit, std::vec![p0_clone]);
+    fx.func("rebuild", 1, &[p0], unit, clauses(&[x_ii, x_into_clone]));
+    fx.func("need_clone", 1, &[p0], unit, clauses(&[p0_clone]));
 
     // Caller 1: fn rebuild_graph<I, S>(r: Range, s: &S) where I: IntoIterator<Item = u8>, I::IntoIter: Clone
     let i_ii = fx.bound(into_iter, &[p0]);
@@ -627,7 +627,7 @@ fn rigid_param_alias_does_not_block_concrete_or_nested_clone_impl() {
     let i_into = fx.alias(into_iter, "IntoIter", &[p0]);
     let i_into_clone = fx.bound(clone, &[i_into]);
     let ref_s = fx.r(Mutbl::Not, p1);
-    let rebuild_graph = fx.func("rebuild_graph", 2, &[range_ty, ref_s], unit, std::vec![i_ii, i_item_u8, i_into_clone]);
+    let rebuild_graph = fx.func("rebuild_graph", 2, &[range_ty, ref_s], unit, clauses(&[i_ii, i_item_u8, i_into_clone]));
 
     // Caller 2: nested rigid alias `where Wrap<I::IntoIter>: Clone` vs `Wrap<&u8>: Clone`
     let wrap_i_into = fx.adt(wrap, &[i_into]);
@@ -638,7 +638,7 @@ fn rigid_param_alias_does_not_block_concrete_or_nested_clone_impl() {
         1,
         &[wrap_ru8],
         unit,
-        std::vec![i_ii, wrap_i_into_clone],
+        clauses(&[i_ii, wrap_i_into_clone]),
     );
     // Caller 3 (twin): `where I: IntoIterator<IntoIter = &u8>, Wrap<I::IntoIter>: Clone`
     // Equating `I::IntoIter` makes the alias non-rigid, so `Wrap<&u8>: Clone` stays conservative.
@@ -648,7 +648,7 @@ fn rigid_param_alias_does_not_block_concrete_or_nested_clone_impl() {
         1,
         &[wrap_ru8],
         unit,
-        std::vec![i_ii, i_into_eq_ru8, wrap_i_into_clone],
+        clauses(&[i_ii, i_into_eq_ru8, wrap_i_into_clone]),
     );
     fx.finish();
 
@@ -707,17 +707,17 @@ fn rigid_param_alias_does_not_block_concrete_or_nested_clone_impl() {
 #[test]
 fn opaque_alias_projection_normalizes_for_bound_row() {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
     let p0 = fx.param(0);
     let unit = fx.unit();
     let u8_ = fx.u8();
     let ru8 = fx.r(Mutbl::Not, u8_);
 
-    let iter_tr = fx.tr("Iterator", 1, Vec::new(), &["Item"]);
+    let iter_tr = fx.tr("Iterator", 1, clauses(&[]), &["Item"]);
     let iter_sup = fx.bound(iter_tr, &[p0]);
-    let exact_tr = fx.tr("ExactSizeIterator", 1, std::vec![iter_sup], &[]);
-    let into_iter = fx.tr("IntoIterator", 1, Vec::new(), &["Item", "IntoIter"]);
+    let exact_tr = fx.tr("ExactSizeIterator", 1, clauses(&[iter_sup]), &[]);
+    let into_iter = fx.tr("IntoIterator", 1, clauses(&[]), &["Item", "IntoIter"]);
 
     let res = fx.strukt("Res", 1, &[]);
     let res_p0 = fx.adt(res, &[p0]);
@@ -728,7 +728,7 @@ fn opaque_alias_projection_normalizes_for_bound_row() {
         res_p0,
         Some((into_iter, &[])),
         &[("Item", p0), ("IntoIter", res_p0)],
-        Vec::new(),
+        clauses(&[]),
     );
 
     // Opaque 1: `impl ExactSizeIterator<Item = Res<&u8>>`
@@ -737,8 +737,8 @@ fn opaque_alias_projection_normalizes_for_bound_row() {
     let op_eq_exact = fx.bound(exact_tr, &[op_eq_ty]);
     let op_eq_item = fx.proj(iter_tr, &[op_eq_ty], "Item", res_ru8);
     let op_eq_sized = fx.bound(sized, &[op_eq_ty]);
-    fx.set_opaque_bounds(op_eq, std::vec![op_eq_exact, op_eq_item, op_eq_sized]);
-    fx.func("mk_eq", 0, &[], op_eq_ty, Vec::new());
+    fx.set_opaque_bounds(op_eq, clauses(&[op_eq_exact, op_eq_item, op_eq_sized]));
+    fx.func("mk_eq", 0, &[], op_eq_ty, clauses(&[]));
 
     // Opaque 2 (negative twin): `impl ExactSizeIterator` (no `Item = ...`, item itself only bounded by `IntoIterator`)
     let op_none = fx.opaque_key("mk_none::{opaque#0}");
@@ -747,17 +747,17 @@ fn opaque_alias_projection_normalizes_for_bound_row() {
     let op_none_exact = fx.bound(exact_tr, &[op_none_ty]);
     let op_none_ii = fx.bound(into_iter, &[op_none_item]);
     let op_none_sized = fx.bound(sized, &[op_none_ty]);
-    fx.set_opaque_bounds(op_none, std::vec![op_none_exact, op_none_ii, op_none_sized]);
-    fx.func("mk_none", 0, &[], op_none_ty, Vec::new());
+    fx.set_opaque_bounds(op_none, clauses(&[op_none_exact, op_none_ii, op_none_sized]));
+    fx.func("mk_none", 0, &[], op_none_ty, clauses(&[]));
 
     // fn flatten<I: Iterator>(i: I) where I::Item: IntoIterator
     let i_iter = fx.bound(iter_tr, &[p0]);
     let i_item = fx.alias(iter_tr, "Item", &[p0]);
     let i_item_ii = fx.bound(into_iter, &[i_item]);
-    fx.func("flatten", 1, &[p0], unit, std::vec![i_iter, i_item_ii]);
+    fx.func("flatten", 1, &[p0], unit, clauses(&[i_iter, i_item_ii]));
 
-    let user_eq = fx.func("user_eq", 0, &[], unit, Vec::new());
-    let user_none = fx.func("user_none", 0, &[], unit, Vec::new());
+    let user_eq = fx.func("user_eq", 0, &[], unit, clauses(&[]));
+    let user_none = fx.func("user_none", 0, &[], unit, clauses(&[]));
     fx.finish();
 
     let run = |owner: ItemKey, mk_name: &str| {
@@ -792,20 +792,20 @@ fn opaque_alias_projection_normalizes_for_bound_row() {
 #[test]
 fn trait_method_path_value_records_selection_without_duplicating_direct_call() {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
     let (p0, p1) = (fx.param(0), fx.param(1));
     let u8_ = fx.u8();
     let ru8 = fx.r(Mutbl::Not, u8_);
 
     let rust_call = crate::ids::FnPtrHeader { abi: crate::ids::Abi::RustCall, safety: crate::ids::Safety::Safe, c_variadic: false };
-    let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
+    let fn_once = fx.tr("FnOnce", 2, clauses(&[]), &["Output"]);
     fx.lang(LangItem::FnOnce, fn_once);
     let out = fx.alias(fn_once, "Output", &[p0, p1]);
     let call_once = fx.trait_fn(fn_once, "call_once", true, &[p0, p1], out);
     fx.set_header(call_once, rust_call);
 
-    let my_iter = fx.tr("MyIter", 1, Vec::new(), &["Item"]);
+    let my_iter = fx.tr("MyIter", 1, clauses(&[]), &["Item"]);
     let mut_self = fx.r(Mutbl::Mut, p0);
     let self_item = fx.alias(my_iter, "Item", &[p0]);
     fx.trait_fn(my_iter, "next", true, &[mut_self], self_item);
@@ -819,7 +819,7 @@ fn trait_method_path_value_records_selection_without_duplicating_direct_call() {
         keys_p0,
         Some((my_iter, &[])),
         &[("Item", p0)],
-        Vec::new(),
+        clauses(&[]),
     );
 
     // fn apply<T, F: FnOnce(&mut Keys<T>) -> T>(k: &mut Keys<T>, f: F) -> T
@@ -827,12 +827,12 @@ fn trait_method_path_value_records_selection_without_duplicating_direct_call() {
     let arg_tup = fx.tuple(&[mut_keys_p0]);
     let f_fn_once = fx.bound(fn_once, &[p1, arg_tup]);
     let f_out = fx.proj(fn_once, &[p1, arg_tup], "Output", p0);
-    fx.func("apply", 2, &[mut_keys_p0, p1], p0, std::vec![f_fn_once, f_out]);
+    fx.func("apply", 2, &[mut_keys_p0, p1], p0, clauses(&[f_fn_once, f_out]));
 
     let keys_ru8 = fx.adt(keys, &[ru8]);
     let mut_keys_ru8 = fx.r(Mutbl::Mut, keys_ru8);
-    let caller_val = fx.func("caller_val", 0, &[mut_keys_ru8], ru8, Vec::new());
-    let caller_direct = fx.func("caller_direct", 0, &[mut_keys_ru8], ru8, Vec::new());
+    let caller_val = fx.func("caller_val", 0, &[mut_keys_ru8], ru8, clauses(&[]));
+    let caller_direct = fx.func("caller_direct", 0, &[mut_keys_ru8], ru8, clauses(&[]));
     fx.finish();
 
     // Positive: `apply(k, MyIter::next)` -> selection recorded at `MyIter::next` (`Expr::Path`).
@@ -882,18 +882,18 @@ fn trait_method_path_value_records_selection_without_duplicating_direct_call() {
 #[test]
 fn unsize_to_dyn_records_trait_and_projection_selection() {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
-    let unsize = fx.tr("Unsize", 2, Vec::new(), &[]);
+    let unsize = fx.tr("Unsize", 2, clauses(&[]), &[]);
     fx.lang(LangItem::Unsize, unsize);
-    let coerce_unsized = fx.tr("CoerceUnsized", 2, Vec::new(), &[]);
+    let coerce_unsized = fx.tr("CoerceUnsized", 2, clauses(&[]), &[]);
     fx.lang(LangItem::CoerceUnsized, coerce_unsized);
 
     let (p0, p1) = (fx.param(0), fx.param(1));
     let u8_ = fx.u8();
     let ru8 = fx.r(Mutbl::Not, u8_);
 
-    let dyn_tr = fx.tr("DynTr", 1, Vec::new(), &["Out"]);
+    let dyn_tr = fx.tr("DynTr", 1, clauses(&[]), &["Out"]);
     let my_s = fx.strukt("MyS", 0, &[]);
     let my_s_ty = fx.adt(my_s, &[]);
     let impl_dyn_s = fx.imp(
@@ -902,7 +902,7 @@ fn unsize_to_dyn_records_trait_and_projection_selection() {
         my_s_ty,
         Some((dyn_tr, &[])),
         &[("Out", ru8)],
-        Vec::new(),
+        clauses(&[]),
     );
 
     let my_box = fx.strukt("MyBox", 1, &[("ptr", p0)]);
@@ -915,7 +915,7 @@ fn unsize_to_dyn_records_trait_and_projection_selection() {
         box_p0,
         Some((coerce_unsized, &[box_p1])),
         &[],
-        std::vec![p0_unsize_p1],
+        clauses(&[p0_unsize_p1]),
     );
     fx.unsized_param(box_coerce, 0);
     fx.unsized_param(box_coerce, 1);
@@ -940,8 +940,8 @@ fn unsize_to_dyn_records_trait_and_projection_selection() {
     let ref_arr4 = fx.r(Mutbl::Not, arr4);
     let ref_slice = fx.r(Mutbl::Not, slice_u8);
 
-    let coerce_ref = fx.func("coerce_ref", 0, &[ref_s], ref_dyn, Vec::new());
-    let coerce_box = fx.func("coerce_box", 0, &[box_s], box_dyn, Vec::new());
+    let coerce_ref = fx.func("coerce_ref", 0, &[ref_s], ref_dyn, clauses(&[]));
+    let coerce_box = fx.func("coerce_box", 0, &[box_s], box_dyn, clauses(&[]));
     let p0_dyn = fx.bound(dyn_tr, &[p0]);
     let p0_dyn_out = fx.proj(dyn_tr, &[p0], "Out", ru8);
     let coerce_param = fx.func(
@@ -949,9 +949,9 @@ fn unsize_to_dyn_records_trait_and_projection_selection() {
         1,
         &[ref_p0],
         ref_dyn,
-        std::vec![p0_dyn, p0_dyn_out],
+        clauses(&[p0_dyn, p0_dyn_out]),
     );
-    let coerce_slice = fx.func("coerce_slice", 0, &[ref_arr4], ref_slice, Vec::new());
+    let coerce_slice = fx.func("coerce_slice", 0, &[ref_arr4], ref_slice, clauses(&[]));
     fx.finish();
 
     let run = |owner: ItemKey| {
@@ -1006,24 +1006,24 @@ fn unsize_to_dyn_records_trait_and_projection_selection() {
 #[test]
 fn impl_header_alias_selects_nested_assoc_impl() {
     let mut fx = Fx::new();
-    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    let sized = fx.tr("Sized", 1, clauses(&[]), &[]);
     fx.lang(LangItem::Sized, sized);
     let (p0, p1) = (fx.param(0), fx.param(1));
     let unit = fx.unit();
 
     // trait AsContext { type Data; }
-    let as_ctx = fx.tr("AsContext", 1, Vec::new(), &["Data"]);
+    let as_ctx = fx.tr("AsContext", 1, clauses(&[]), &["Data"]);
     let p0_as_ctx = fx.bound(as_ctx, &[p0]);
     let p0_data = fx.alias(as_ctx, "Data", &[p0]);
     let p0_data_sized = fx.bound(sized, &[p0_data]);
-    fx.set_assoc_bounds(as_ctx, "Data", std::vec![p0_data_sized]);
+    fx.set_assoc_bounds(as_ctx, "Data", clauses(&[p0_data_sized]));
 
     // trait AsContextMut: AsContext {}
-    let as_ctx_mut = fx.tr("AsContextMut", 1, std::vec![p0_as_ctx], &[]);
+    let as_ctx_mut = fx.tr("AsContextMut", 1, clauses(&[p0_as_ctx]), &[]);
     let p0_as_ctx_mut = fx.bound(as_ctx_mut, &[p0]);
 
     // trait MyFrom<T> { fn from(v: T) -> Self; }
-    let my_from = fx.tr("MyFrom", 2, Vec::new(), &[]);
+    let my_from = fx.tr("MyFrom", 2, clauses(&[]), &[]);
     fx.trait_fn(my_from, "from", false, &[p1], p0);
 
     // struct Host; struct Caller<T>(T); struct StoreContextMut<T>(T);
@@ -1045,7 +1045,7 @@ fn impl_header_alias_selects_nested_assoc_impl() {
         caller_p0,
         Some((as_ctx, &[])),
         &[("Data", p0)],
-        Vec::new(),
+        clauses(&[]),
     );
     // impl<T> AsContextMut for Caller<T> {}
     fx.imp(
@@ -1054,7 +1054,7 @@ fn impl_header_alias_selects_nested_assoc_impl() {
         caller_p0,
         Some((as_ctx_mut, &[])),
         &[],
-        Vec::new(),
+        clauses(&[]),
     );
     // impl<T: AsContextMut> MyFrom<&mut T> for StoreContextMut<<T as AsContext>::Data> {}
     let impl_from_store = fx.imp(
@@ -1063,16 +1063,16 @@ fn impl_header_alias_selects_nested_assoc_impl() {
         store_mut_data,
         Some((my_from, &[mut_p0])),
         &[],
-        std::vec![p0_as_ctx_mut],
+        clauses(&[p0_as_ctx_mut]),
     );
 
     // fn data_and_store<S, T>(s: S) where StoreContextMut<T>: MyFrom<S>
     let store_mut_p1 = fx.adt(store_mut, &[p1]);
     let store_from_s = fx.bound(my_from, &[store_mut_p1, p0]);
-    fx.func("data_and_store", 2, &[p0], unit, std::vec![store_from_s]);
+    fx.func("data_and_store", 2, &[p0], unit, clauses(&[store_from_s]));
 
-    let owner_concrete = fx.func("owner_concrete", 0, &[mut_caller_host], unit, Vec::new());
-    let owner_generic = fx.func("owner_generic", 1, &[mut_p0], unit, std::vec![p0_as_ctx_mut]);
+    let owner_concrete = fx.func("owner_concrete", 0, &[mut_caller_host], unit, clauses(&[]));
+    let owner_generic = fx.func("owner_generic", 1, &[mut_p0], unit, clauses(&[p0_as_ctx_mut]));
     let _ = store_mut_host;
     fx.finish();
 

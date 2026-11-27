@@ -50,7 +50,7 @@ blaze-diag-parse	33
 blaze-drive	157
 blaze-dust	1
 blaze-ed25519	58
-blaze-emit	449
+blaze-emit	445
 blaze-engine	203
 blaze-expand	471
 blaze-export	381
@@ -87,7 +87,7 @@ blaze-lex	63
 blaze-lint	273
 blaze-lint-defs	109
 blaze-lir	1414
-blaze-lower	322
+blaze-lower	319
 blaze-macro-run	4
 blaze-manifest	150
 blaze-math	42

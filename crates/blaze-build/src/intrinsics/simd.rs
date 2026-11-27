@@ -237,6 +237,11 @@ pub(super) fn native_vec128_chunks(l: &Lanes) -> Option<(Ty, u64)> {
 }
 
 #[inline]
+pub(super) fn chunk_off(c: u64) -> i32 {
+    i32::try_from(c.saturating_mul(16)).unwrap_or(i32::MAX)
+}
+
+#[inline]
 fn chunk_mem_attrs(l: &Lanes, off: i32) -> MemAttrs {
     MemAttrs::aligned(if off == 0 { l.align } else { l.align.min(4) })
 }
@@ -336,7 +341,7 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             {
                 let out = temp(s, &l);
                 for c in 0..chunks {
-                    let off = (c * 16) as i32;
+                    let off = chunk_off(c);
                     let a = load_vec128_at(s, &l, vt, x, off);
                     let b = load_vec128_at(s, &l, vt, y, off);
                     let r = s.b.binary(lop, Flags::NONE, a, b);
@@ -367,7 +372,7 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             {
                 let out = temp(s, &l);
                 for c in 0..chunks {
-                    let off = (c * 16) as i32;
+                    let off = chunk_off(c);
                     let a = load_vec128_at(s, &l, vt, x, off);
                     let r = s.b.unary(lop, Flags::NONE, a);
                     store_vec128_at(s, &l, r, out, off);
@@ -412,7 +417,7 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 };
                 let out = temp(s, &m);
                 for c in 0..chunks {
-                    let off = (c * 16) as i32;
+                    let off = chunk_off(c);
                     let a = load_vec128_at(s, &l, vt, x, off);
                     let b = load_vec128_at(s, &l, vt, y, off);
                     let bits = s.b.icmp(cond, a, b);
@@ -473,7 +478,7 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 let r = s.b.convert(Op::Splat, Flags::NONE, vt, v);
                 let out = temp(s, &l);
                 for c in 0..chunks {
-                    store_vec128_at(s, &l, r, out, (c * 16) as i32);
+                    store_vec128_at(s, &l, r, out, chunk_off(c));
                 }
                 return Ok(Out::At(out));
             }
@@ -529,7 +534,7 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
                 let zeros = s.b.convert(Op::Splat, Flags::NONE, mt, zero);
                 let out = temp(s, &l);
                 for c in 0..chunks {
-                    let off = (c * 16) as i32;
+                    let off = chunk_off(c);
                     let mv = load_vec128_at(s, &m, mt, mask, off);
                     let bits = s.b.icmp(IntCond::Ne, mv, zeros);
                     let a = load_vec128_at(s, &l, vt, yes, off);
