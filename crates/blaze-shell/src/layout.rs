@@ -2918,8 +2918,6 @@ fn layout_table(
     let fold_rows = ((pane_h / 3.0 - (m.ch + 28.0)) / row_h_est)
         .floor()
         .clamp(4.0, TABLE_FOLD_ROWS as f32) as usize;
-    let is_scrollable = depth <= 1 && block.folded && total_rows > fold_rows;
-    let visible_rows = if is_scrollable { fold_rows } else { total_rows };
     let type_col_idx = table.col_index("type");
     let sample_rows = total_rows.min(256);
 
@@ -3029,6 +3027,40 @@ fn layout_table(
             if desc { ord.reverse() } else { ord }
         });
     }
+
+    // The native `git status` table reads as a rough tree (changed files under collapsed directory
+    // chains) when unsorted; the value keeps its flat rows and full paths, only the drawing changes.
+    let git_tree: Option<GitStatusTree> = match file_entry_col {
+        Some(fc)
+            if depth <= 1
+                && block.table_sort.is_none()
+                && col_displays[fc] == ColDisplay::FileEntry
+                && is_git_status_table(table, fc) =>
+        {
+            let mut entries: Vec<(usize, &str)> = Vec::with_capacity(total_rows);
+            for r in 0..total_rows {
+                entries.push((r, table.cell(r, fc).and_then(Value::as_str).unwrap_or("")));
+            }
+            Some(GitStatusTree {
+                name_col: fc,
+                rows: git_status_tree_rows(&entries),
+            })
+        }
+        _ => None,
+    };
+    // Rows drawn: the table's rows, or the tree's directory and entry rows.
+    let disp_rows = git_tree.as_ref().map_or(total_rows, |t| t.rows.len());
+    let disp_table_row = |disp_idx: usize| -> Option<usize> {
+        match git_tree.as_ref() {
+            Some(tree) => match &tree.rows[disp_idx].kind {
+                GitTreeRowKind::Entry { row, .. } => Some(*row),
+                GitTreeRowKind::Dir { .. } => None,
+            },
+            None => Some(row_order[disp_idx]),
+        }
+    };
+    let is_scrollable = depth <= 1 && block.folded && disp_rows > fold_rows;
+    let visible_rows = if is_scrollable { fold_rows } else { disp_rows };
 
     let mut hidden_col_names: Vec<&str> = (0..ncols)
         .filter(|&c| table.is_col_hidden(c))
@@ -3181,6 +3213,29 @@ fn layout_table(
         };
         col_extra_px.push(extra);
         col_max_num.push(max_num);
+    }
+    // A tree's name column needs room for guides plus leaf names, not the full paths it holds.
+    if let Some(tree) = git_tree.as_ref() {
+        let hdr_c = table
+            .columns
+            .get(tree.name_col)
+            .map_or(0, |s| s.as_ref().chars().count())
+            + 2;
+        let mut max_c = hdr_c.max(3);
+        for row in &tree.rows {
+            let (segs, _, _) = parse_tree_prefix(&row.prefix);
+            let guide_c = if segs == 0 {
+                0
+            } else {
+                ((segs as f32 * DATAFRAME_TREE_STEP + 4.0) / m.cw.max(1.0)).ceil() as usize
+            };
+            let name_c = match &row.kind {
+                GitTreeRowKind::Dir { label, .. } => label.chars().count(),
+                GitTreeRowKind::Entry { leaf, .. } => leaf.chars().count(),
+            };
+            max_c = max_c.max(guide_c + name_c);
+        }
+        col_chars[tree.name_col] = max_c.min(64);
     }
 
     // Priority-based responsive column widths: hidden columns take 0px; user-dragged overrides win;
@@ -3496,7 +3551,7 @@ fn layout_table(
     let mut cur_y = rows_top_y;
 
     // Snap scroll offset cleanly to exact integer row grid boundaries (never half-clipped rows!).
-    let max_first_row = total_rows.saturating_sub(visible_rows);
+    let max_first_row = disp_rows.saturating_sub(visible_rows);
     let max_scroll_y = max_first_row as f32 * row_h;
     let first_row = if is_scrollable && max_first_row > 0 {
         (block.table_scroll_y / row_h).round().clamp(0.0, max_first_row as f32) as usize
@@ -3537,7 +3592,9 @@ fn layout_table(
         && let Some(fc) = file_entry_col
     {
         for vis_i in 0..visible_rows {
-            let r = row_order[first_row + vis_i];
+            let Some(r) = disp_table_row(first_row + vis_i) else {
+                continue;
+            };
             if all_row_dust[r].is_some() {
                 continue;
             }
@@ -3566,10 +3623,89 @@ fn layout_table(
     } else {
         for vis_i in 0..visible_rows {
             let disp_idx = first_row + vis_i;
-            let r = row_order[disp_idx];
             let ty = cur_y + TABLE_ROW_PAD_Y;
             let iy = ty + (m.ch - icon_s) * 0.5;
-            scene.text(x0, ty, disp_idx.to_string(), theme::INK_4, false, false, clip_id);
+            // `git status` tree: a quiet directory row (guides, folder icon, muted collapsed chain;
+            // no index, status, size or time), or an entry row drawn with guides and its leaf name.
+            let (r, tree_entry): (usize, Option<(usize, &str, &str)>) = if let Some(tree) =
+                git_tree.as_ref()
+            {
+                let tree_row = &tree.rows[disp_idx];
+                match &tree_row.kind {
+                    GitTreeRowKind::Dir { label, path } => {
+                        let name_col = tree.name_col;
+                        let rx = x0 + idx_w + col_widths[..name_col].iter().sum::<f32>();
+                        let content_w = (col_widths[name_col] - col_gap).max(m.cw * 2.0);
+                        let pref_w = draw_dataframe_tree_guides(
+                            scene,
+                            rx,
+                            cur_y,
+                            row_h,
+                            icon_s,
+                            &tree_row.prefix,
+                            vis_i + 1 < visible_rows,
+                            clip_id,
+                        );
+                        let item_x = rx + pref_w;
+                        let icon_name = icon_name_for_file(path, None);
+                        let max_ch = ((content_w - pref_w - icon_pad - 6.0) / m.cw)
+                            .floor()
+                            .max(4.0) as usize;
+                        let txt = truncate_middle(label, max_ch);
+                        let txt_w = txt.chars().count() as f32 * m.cw;
+                        scene.svg_icon_alpha(item_x, iy, icon_s, icon_name, 0.7, clip_id);
+                        draw_shaded_filename(
+                            scene,
+                            item_x + icon_pad,
+                            ty,
+                            &txt,
+                            true,
+                            theme::INK_3,
+                            m,
+                            clip_id,
+                        );
+                        let cell_rect = HitRect::new(
+                            item_x - 3.0,
+                            cur_y,
+                            item_x + icon_pad + txt_w + 6.0,
+                            cur_y + row_h,
+                        );
+                        scene.push_drag_source_clipped(
+                            cell_rect,
+                            clip_id,
+                            DragPayload {
+                                label: path.clone(),
+                                insert_text: drag_path_for_entry(&block.source, path),
+                                icon: Some(icon_name),
+                            },
+                        );
+                        scene.push_hover_clipped(
+                            cell_rect,
+                            clip_id,
+                            HoverKind::FileEntry {
+                                full_path: full_path_for_entry(
+                                    &block.prompt_snapshot.cwd,
+                                    &block.source,
+                                    path,
+                                ),
+                                name: path.clone(),
+                                icon: Some(icon_name),
+                                is_dir: true,
+                            },
+                        );
+                        cur_y += row_h;
+                        continue;
+                    }
+                    GitTreeRowKind::Entry { row, leaf } => {
+                        // The index names the value's row, so `$it.N` still finds this entry.
+                        scene.text(x0, ty, row.to_string(), theme::INK_4, false, false, clip_id);
+                        (*row, Some((tree.name_col, tree_row.prefix.as_str(), leaf.as_str())))
+                    }
+                }
+            } else {
+                scene.text(x0, ty, disp_idx.to_string(), theme::INK_4, false, false, clip_id);
+                (row_order[disp_idx], None)
+            };
 
             let row_file_kind = type_col_idx
                 .and_then(|ti| table.cell(r, ti))
@@ -3750,6 +3886,19 @@ fn layout_table(
                                 );
                             }
                             ColDisplay::FileEntry => {
+                                // `git status` tree entry: guides first, then the usual chip at the
+                                // leaf's depth showing only the leaf (hover and drag keep the path).
+                                let (tree_pref_w, tree_leaf) = match tree_entry {
+                                    Some((name_col, prefix, leaf)) if name_col == c => (
+                                        draw_dataframe_tree_guides(
+                                            scene, rx, cur_y, row_h, icon_s, prefix, false, clip_id,
+                                        ),
+                                        Some(leaf),
+                                    ),
+                                    _ => (0.0, None),
+                                };
+                                let rx = rx + tree_pref_w;
+                                let content_w = (content_w - tree_pref_w).max(m.cw * 2.0);
                                 let raw_name = format_value_cell_at(cell, Some(now_ns));
                                 let icon_name = icon_name_for_file(&raw_name, row_file_kind);
                                 let is_dir = row_file_kind.is_some_and(blaze_sniff::is_dir_label)
@@ -3812,7 +3961,7 @@ fn layout_table(
                                     .as_ref()
                                     .and_then(|e| e.display_name.as_deref())
                                     .filter(|s| !s.is_empty())
-                                    .unwrap_or(&display_name);
+                                    .unwrap_or(tree_leaf.unwrap_or(&display_name));
                                 let git_pad = if badge.is_some() { m.cw * 1.8 } else { 0.0 };
                                 let max_ch = ((content_w - icon_pad - 8.0 - git_pad) / m.cw).floor().max(4.0) as usize;
                                 // Middle-truncate nested paths (`crates/…/layout.rs`) so filenames stay visible!
@@ -4407,7 +4556,7 @@ fn layout_table(
             [0.0; 4],
             clip_id,
         );
-        let frac = (visible_rows as f32 / total_rows as f32).clamp(0.12, 1.0);
+        let frac = (visible_rows as f32 / disp_rows as f32).clamp(0.12, 1.0);
         let thumb_h = (track_h * frac).max(18.0);
         let pos_frac = first_row as f32 / max_first_row as f32;
         let thumb_y0 = rows_top_y + (track_h - thumb_h) * pos_frac;
@@ -4429,14 +4578,14 @@ fn layout_table(
         );
     }
 
-    if depth <= 1 && total_rows > fold_rows {
+    if depth <= 1 && disp_rows > fold_rows {
         cur_y += 4.0;
         let lbl = if block.folded {
             format!(
                 "rows {}–{} of {} · scroll or show all",
                 first_row + 1,
                 first_row + visible_rows,
-                total_rows
+                disp_rows
             )
         } else {
             format!("− collapse to {fold_rows}-row scrollable view")
@@ -4455,6 +4604,170 @@ fn layout_table(
 }
 
 const DATAFRAME_TREE_STEP: f32 = 18.0;
+
+/// The render-time tree of a `git status` table: the table keeps its flat rows and full paths
+/// (so `where`/`get` see the same columns); only the drawing groups them under directories.
+struct GitStatusTree {
+    /// The path column the tree is drawn in.
+    name_col: usize,
+    rows: Vec<GitTreeRow>,
+}
+
+/// One drawn row of a [`GitStatusTree`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitTreeRow {
+    /// Guide text in `blaze-sh`'s `tree_prefix` form (4 chars per level: `"│   "`, `"    "`,
+    /// `"├── "`, `"└── "`), read by [`parse_tree_prefix`] / [`draw_dataframe_tree_guides`].
+    prefix: String,
+    kind: GitTreeRowKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GitTreeRowKind {
+    /// A directory row with no table row of its own: `label` is the collapsed single-child chain
+    /// (`crates/blaze-shell/src/`), `path` the full repo-relative directory, both ending in `/`.
+    Dir { label: String, path: String },
+    /// A changed entry: `row` indexes the table, `leaf` is its last path segment (an untracked
+    /// directory keeps its trailing `/`).
+    Entry { row: usize, leaf: String },
+}
+
+/// Git change words the native `git status` table writes in its `status` column
+/// (`prompt::status_label_for_tag`), plus the rename/add words the status renderer knows.
+fn is_git_change_word(s: &str) -> bool {
+    matches!(
+        s,
+        "staged" | "modified" | "deleted" | "untracked" | "conflict" | "renamed" | "added"
+    )
+}
+
+/// Recognizes the native `git status` table: a `status` column holding only git change words,
+/// string paths in `name_col`, and no `type` column (which would make it an `ls` listing).
+fn is_git_status_table(table: &Table<'_>, name_col: usize) -> bool {
+    let Some(status_col) = table.col_index("status") else {
+        return false;
+    };
+    if table.col_index("type").is_some() || table.nrows() == 0 {
+        return false;
+    }
+    (0..table.nrows()).all(|r| {
+        table
+            .cell(r, status_col)
+            .and_then(Value::as_str)
+            .is_some_and(is_git_change_word)
+            && table.cell(r, name_col).and_then(Value::as_str).is_some()
+    })
+}
+
+/// Split a repo-relative path into segments; the last keeps a trailing `/` (an untracked
+/// directory as git reports it), and empty segments from doubled slashes are dropped.
+fn split_git_tree_path(path: &str) -> Vec<&str> {
+    let body = path.strip_suffix('/').unwrap_or(path);
+    let mut segs: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    for (i, b) in body.bytes().enumerate() {
+        if b == b'/' {
+            if i > start {
+                segs.push(&body[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    if start < path.len() || segs.is_empty() {
+        segs.push(&path[start.min(path.len())..]);
+    }
+    segs
+}
+
+/// Lay `(table_row, path)` entries out as a rough `eza --tree` scoped to them: sorted by path
+/// segments, each directory a row above its entries, a directory whose only child is a directory
+/// collapsed into one row (`crates/blaze-shell/src/`), and leaves showing their last segment.
+fn git_status_tree_rows(entries: &[(usize, &str)]) -> Vec<GitTreeRow> {
+    let mut items: Vec<(usize, Vec<&str>)> =
+        entries.iter().map(|&(row, path)| (row, split_git_tree_path(path))).collect();
+    items.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    let mut out = Vec::with_capacity(items.len() * 2);
+    let mut rails: Vec<bool> = Vec::new();
+    push_git_tree_level(&items, 0, true, &mut rails, &mut out);
+    out
+}
+
+/// Emit the rows for `items` (sorted, sharing their first `level` segments). Top-level rows
+/// carry no guides; deeper rows get one `│`/blank per elbowed ancestor in `rails`, then an elbow.
+fn push_git_tree_level(
+    items: &[(usize, Vec<&str>)],
+    level: usize,
+    top: bool,
+    rails: &mut Vec<bool>,
+    out: &mut Vec<GitTreeRow>,
+) {
+    // Group into leaves (one item ending here) and directories (items sharing segment `level`).
+    let mut groups: Vec<(usize, usize, bool)> = Vec::new();
+    let mut i = 0usize;
+    while i < items.len() {
+        let segs = &items[i].1;
+        if segs.len() <= level + 1 {
+            groups.push((i, i + 1, false));
+            i += 1;
+            continue;
+        }
+        let seg = segs[level];
+        let mut j = i + 1;
+        while j < items.len() && items[j].1.len() > level + 1 && items[j].1[level] == seg {
+            j += 1;
+        }
+        groups.push((i, j, true));
+        i = j;
+    }
+    let n_groups = groups.len();
+    for (k, &(start, end, is_dir)) in groups.iter().enumerate() {
+        let is_last = k + 1 == n_groups;
+        let mut prefix = String::new();
+        if !top {
+            for &continues in rails.iter() {
+                prefix.push_str(if continues { "│   " } else { "    " });
+            }
+            prefix.push_str(if is_last { "└── " } else { "├── " });
+        }
+        let group = &items[start..end];
+        if !is_dir {
+            // Every item here has more than `level` segments: the top level splits to at least
+            // one, and a directory group recurses at `next` only while all go past it.
+            let (row, segs) = &group[0];
+            out.push(GitTreeRow {
+                prefix,
+                kind: GitTreeRowKind::Entry {
+                    row: *row,
+                    leaf: segs[level].to_owned(),
+                },
+            });
+            continue;
+        }
+        // Collapse the chain while every entry goes deeper through one shared directory.
+        let mut next = level + 1;
+        while group.iter().all(|(_, s)| s.len() > next + 1)
+            && group.iter().all(|(_, s)| s[next] == group[0].1[next])
+        {
+            next += 1;
+        }
+        let segs0 = &group[0].1;
+        let mut label = segs0[level..next].join("/");
+        label.push('/');
+        let mut path = segs0[..next].join("/");
+        path.push('/');
+        out.push(GitTreeRow {
+            prefix,
+            kind: GitTreeRowKind::Dir { label, path },
+        });
+        if !top {
+            rails.push(!is_last);
+        }
+        push_git_tree_level(group, next, false, rails, out);
+        if !top {
+            rails.pop();
+        }
+    }
+}
 
 /// Parse `blaze-sh`'s 4-char-per-level `tree_prefix` (composed of `"│   "`, `"    "`, `"├── "`,
 /// `"└── "`) into `(segments_count, continuing_mask, last_is_elbow_last)`.
@@ -10602,7 +10915,54 @@ fn parent_breadcrumbs(cwd: &str) -> Vec<(String, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_tree_prefix;
+    use super::{GitTreeRow, GitTreeRowKind, git_status_tree_rows, parse_tree_prefix};
+
+    #[test]
+    fn git_status_tree_groups_and_collapses_directories() {
+        let entries = [
+            (0, "crates/blaze-shell/src/layout.rs"),
+            (1, "crates/blaze-shell/src/lib.rs"),
+            (2, "crates/blaze-sh/src/builtins.rs"),
+            (3, "README.md"),
+            (4, "notes/"),
+        ];
+        let dir = |prefix: &str, label: &str, path: &str| GitTreeRow {
+            prefix: prefix.to_owned(),
+            kind: GitTreeRowKind::Dir {
+                label: label.to_owned(),
+                path: path.to_owned(),
+            },
+        };
+        let entry = |prefix: &str, row: usize, leaf: &str| GitTreeRow {
+            prefix: prefix.to_owned(),
+            kind: GitTreeRowKind::Entry {
+                row,
+                leaf: leaf.to_owned(),
+            },
+        };
+        assert_eq!(
+            git_status_tree_rows(&entries),
+            std::vec![
+                entry("", 3, "README.md"),
+                dir("", "crates/", "crates/"),
+                dir("├── ", "blaze-sh/src/", "crates/blaze-sh/src/"),
+                entry("│   └── ", 2, "builtins.rs"),
+                dir("└── ", "blaze-shell/src/", "crates/blaze-shell/src/"),
+                entry("    ├── ", 0, "layout.rs"),
+                entry("    └── ", 1, "lib.rs"),
+                entry("", 4, "notes/"),
+            ]
+        );
+        // A single shared chain collapses into one top-level directory row.
+        assert_eq!(
+            git_status_tree_rows(&[(0, "a/b/c.rs"), (1, "a/b/d.rs")]),
+            std::vec![
+                dir("", "a/b/", "a/b/"),
+                entry("├── ", 0, "c.rs"),
+                entry("└── ", 1, "d.rs"),
+            ]
+        );
+    }
 
     #[test]
     fn parse_tree_prefix_handles_standard_segments() {

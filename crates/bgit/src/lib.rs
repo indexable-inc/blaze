@@ -387,6 +387,19 @@ pub fn query_log_entries<'a>(
     Ok(Some(entries))
 }
 
+/// Structured status of the repo containing `cwd`, through the watcher-backed snapshot: the
+/// first call starts the repo's in-process watcher and scans fully, later calls answer from the
+/// watched dirty set (O(changed paths)). One snapshot is kept per distinct `opts`, so callers
+/// that want to share it (the prompt and a typed `git status`) must pass the same `opts`.
+pub fn query_status<'a>(
+    cwd: &Path,
+    opts: blaze_git::StatusOpts,
+    alloc: Alloc<'a>,
+) -> io::Result<blaze_git::PromptStatus<'a>> {
+    ensure_fsmonitor_watching(cwd);
+    status_driver::run_status(cwd, opts, alloc).map(|(status, _timing)| status)
+}
+
 /// Lists registered `bgit` worktrees for the repo containing `cwd`, if `.bgit/worktrees.bgwt` exists.
 pub fn query_worktrees<'a>(cwd: &Path, alloc: Alloc<'a>) -> io::Result<Option<Vec<WorktreeInfo>>> {
     let Some(root) = find_repo_root(cwd) else {
