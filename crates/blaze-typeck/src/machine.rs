@@ -1636,6 +1636,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         if root != raw_root && self.ty.ty_flags(root).is_empty() {
             return Ok(root);
         }
+        let mut selected_without_progress = false;
         if flags.has(TyFlags::HAS_INFER) && matches!(self.ty.view(root), TyView::Infer(_) | TyView::ConstInfer(_)) {
             if matches!(usage, AliasUse::Equality) {
                 return Ok(root);
@@ -1661,11 +1662,15 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
             let view = self.ty.view(t);
             if !expanded && matches!(view, TyView::Infer(_) | TyView::ConstInfer(_)) {
-                if matches!(usage, AliasUse::Shape(_)) {
+                if matches!(usage, AliasUse::Shape(_)) && !selected_without_progress {
                     self.select()?;
                     let resolved = self.ty.shallow_resolve(t);
                     if resolved != t {
                         work.push((resolved, false));
+                    } else {
+                        // `select()` reached fixpoint without resolving `t`; subsequent unbound
+                        // vars in the same walk cannot make progress until new relations arrive.
+                        selected_without_progress = true;
                     }
                 }
                 // An unbound variable is its own replacement.

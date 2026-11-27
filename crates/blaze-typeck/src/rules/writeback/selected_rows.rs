@@ -73,6 +73,10 @@ struct Rows<'s, 'a> {
     /// Each `(trait, arguments, name)` already decided: one selection per instance and body
     /// (a `Vec<_, Global>`'s `Global: Allocator` at each of thirty calls is selected once).
     memo: HashMap<(ItemKey, List, Option<Name>), Selected, Alloc<'a>>,
+    /// One persistent analysis `InferCtx` reused across all `select_row` queries via
+    /// `snapshot()` / `rollback_to()`, keeping its `FactCache` and `Solver` caches warm across
+    /// every row instead of re-filling entire impl buckets on every row.
+    cx: InferCtx<'a>,
 }
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
@@ -135,7 +139,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if self.reads.stopped() {
             return Ok(out);
         }
-        let mut rows = Rows { own, env, memo: HashMap::new_in(alloc) };
+        let mut rows = Rows { own, env, memo: HashMap::new_in(alloc), cx: InferCtx::analysis_in(alloc) };
         // Each row once per call: the call's own, then an impl's where-clauses and nested aliases.
         let mut seen: HashMap<(ExprId, ItemKey, Option<Name>, List), (), Alloc<'a>> = HashMap::new_in(alloc);
         let mut ps: Vec<PTy, Alloc<'a>> = Vec::new_in(alloc);
@@ -991,8 +995,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             );
             let mut decided = None;
             if try_impl && !self.any_clause_may_match(ex.out.view(), sel_ps, trait_, inert)? {
-                let mut cx = InferCtx::analysis_in(alloc);
-                match crate::instance::select_owning_owner(&mut cx, &mut self.reads, self.body.owner, Some(rows.own), trait_, sel_ps, &mut ex.out) {
+                let snap = rows.cx.snapshot();
+                let res = crate::instance::select_owning_owner(&mut rows.cx, &mut self.reads, self.body.owner, Some(rows.own), trait_, sel_ps, &mut ex.out);
+                rows.cx.rollback_to(snap);
+                match res {
                     Ok(Some((imp, iargs))) => decided = Some(Selected::Impl { imp, args: iargs }),
                     Ok(None) | Err(ResolveError::NoImpl { .. }) if !self_is_abstract => {
                         decided = Some(Selected::Builtin);
@@ -1010,8 +1016,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 || rows.env.traits.scan_for(&trait_).is_some()
                 || (rows.env.exact.scan_for(&trait_).is_some() && self.ground_clause_may_equal(ex.out.view(), sel_ps, trait_, inert)?);
             // Part of the body's own check, recorded for its borrow check: analysis.
-            let mut cx = InferCtx::analysis_in(alloc);
-            match crate::instance::select_owning(&mut cx, &mut self.reads, Some(rows.own), trait_, sel_ps, &mut ex.out) {
+            let snap = rows.cx.snapshot();
+            let res = crate::instance::select_owning(&mut rows.cx, &mut self.reads, Some(rows.own), trait_, sel_ps, &mut ex.out);
+            rows.cx.rollback_to(snap);
+            match res {
                 Ok(Some((imp, iargs))) if !env => Selected::Impl { imp, args: iargs },
                 // An impl holds, and so may the caller's clause, which rustc prefers: which
                 // one applies is not decided here (its lifetimes are erased).

@@ -1002,6 +1002,14 @@ pub struct Reads<'w, 'a, W: World> {
     /// world that records them mutes the second. A hole is not in it (the next ask may be
     /// answered, by reads the hole's did not make).
     heard: blaze_hash::HashSet<Question, Alloc<'a>>,
+    /// Per-run `(Question -> recorded digest)` memo: once a question has been answered `Ok` and
+    /// hashed into `entries`, repeat reads in the same `Reads` run skip re-running `StableHasher`
+    /// (`Hashes::rooted` / `hash_of`), skip duplicate `entries` pushes, and answer `recorded(q)`
+    /// in O(1) instead of scanning `entries`.
+    digests: HashMap<Question, Option<u64>, Alloc<'a>>,
+    /// Impl items whose header arity against `trait_def(trait_)` was already validated in this
+    /// run, skipping redundant `trait_def` asks on repeat `impl_header` reads.
+    impl_arity_ok: blaze_hash::HashSet<ItemKey, Alloc<'a>>,
 }
 
 /// A run's memo of term digests: a record table's node (the table's number, its index) to
@@ -1512,6 +1520,8 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
             tally,
             hashes: Hashes::new_in(alloc),
             heard: blaze_hash::HashSet::new_in(alloc),
+            digests: HashMap::new_in(alloc),
+            impl_arity_ok: blaze_hash::HashSet::new_in(alloc),
         }
     }
 
@@ -1632,7 +1642,14 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// The read-list digest of this run's latest answer to `q`, `None` when no answer to it
     /// entered the list (never asked, a hole, or an opaque seen as itself: [`Reads::opaque_record`]).
     pub(crate) fn recorded(&self, q: Question) -> Option<u64> {
-        self.entries.iter().rev().find(|e| e.0 == q).map(|e| e.1)
+        if let Some(&d) = self.digests.get(&q) {
+            return d;
+        }
+        #[cfg(test)]
+        if self.hole_plant == HolePlant::KeepEarlierReads {
+            return self.entries.iter().rev().find(|e| e.0 == q).map(|e| e.1);
+        }
+        None
     }
 
     /// `record` for an answer with a table: its digest covers only the terms it reaches.
@@ -1669,8 +1686,12 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         }
         match got {
             Ok(v) => {
-                if let Some(d) = digest(&mut self.hashes, &v)? {
-                    self.entries.push((q, d));
+                if !self.digests.contains_key(&q) {
+                    let d = digest(&mut self.hashes, &v)?;
+                    self.digests.insert(q, d);
+                    if let Some(d) = d {
+                        self.entries.push((q, d));
+                    }
                 }
                 self.count(q, false, asked_at, answered_at);
                 Ok(v)
@@ -1808,7 +1829,9 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         let asked_at = self.ask(Question::ImplHeader(item));
                 let got = self.world.impl_header(Self::seal(), item);
         let h = self.record_tabled(Question::ImplHeader(item), got, asked_at)?;
-        if let Some(ImplHeader { trait_: Some(trait_), trait_args, .. }) = h {
+        if let Some(ImplHeader { trait_: Some(trait_), trait_args, .. }) = h
+            && !self.impl_arity_ok.contains(&item)
+        {
             let holes = self.holes.len();
             let Some(def) = self.trait_def(trait_)? else {
                 if self.holes.len() > holes {
@@ -1821,6 +1844,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
             if trait_args.list().len != expected {
                 return Err(CheckError::ImplTraitArity { impl_: item, trait_, expected, got: trait_args.list().len }.into());
             }
+            self.impl_arity_ok.insert(item);
         }
         Ok(h)
     }

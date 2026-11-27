@@ -70,10 +70,17 @@ pub struct InferCtxIn<'a, 'f> {
     /// Solver reads (the solver's own log; the body's read list is `Reads`): emptied after each
     /// call, as nothing here reads it (it grew for the whole body before).
     solver_reads: Vec<blaze_solve::Read, Alloc<'a>>,
-    /// Reusable fulfillment queue and index map for `select`, avoiding 13 fresh bump-frame
-    /// allocations per `select()` call.
-    fulfill: Fulfill<'a, Wake>,
-    select_ids: Vec<usize, Alloc<'a>>,
+    /// Persistent `Fulfill<Wake>` carrying wake lists, binding cursor, and retained buffer
+    /// capacities across `select()` calls so repeated `select()` calls cost O(delta) with zero
+    /// per-call bump-frame allocations. Cleared in place whenever `env` changes or `rollback_to`
+    /// undoes obligations/bindings already seen by `fulfill`.
+    fulfill: Option<Fulfill<'a, Wake>>,
+    fulfill_env: Option<EnvId>,
+    fulfill_obs: Vec<usize, Alloc<'a>>,
+    fulfill_registered: usize,
+    fulfill_undo: usize,
+    fulfill_bindings: u32,
+    fulfill_dirty: bool,
     /// Solver calls repeated after a fact was filled: the Need rounds inside the context.
     pub need_rounds: u64,
     /// How many `Specializes` questions this context is answering for the contexts above it
@@ -708,8 +715,13 @@ impl<'a, 'f> InferCtxIn<'a, 'f> {
             error_at: 0,
             rows: BodyRows::new_in(alloc),
             solver_reads: Vec::new_in(alloc),
-            fulfill: Fulfill::new_in(alloc),
-            select_ids: Vec::new_in(alloc),
+            fulfill: Some(Fulfill::new_in(alloc)),
+            fulfill_env: None,
+            fulfill_obs: Vec::new_in(alloc),
+            fulfill_registered: 0,
+            fulfill_undo: 0,
+            fulfill_bindings: 0,
+            fulfill_dirty: true,
             need_rounds: 0,
             spec_depth: 0,
             #[cfg(test)]
@@ -1710,46 +1722,72 @@ impl<'a, 'f> InferCtxIn<'a, 'f> {
         }
     }
 
+    fn invalidate_fulfill(&mut self) {
+        if let Some(f) = self.fulfill.as_mut() {
+            f.clear();
+        }
+        self.fulfill_env = None;
+        self.fulfill_obs.clear();
+        self.fulfill_registered = 0;
+        self.fulfill_undo = 0;
+        self.fulfill_bindings = 0;
+        self.fulfill_dirty = true;
+    }
+
     fn select<W: World>(&mut self, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
         let env = self.env(reads)?;
         let mode = self.mode;
+        if self.fulfill_env != Some(env) {
+            self.invalidate_fulfill();
+        }
         for _ in 0..MAX_FILLS {
-            let mut f = core::mem::replace(&mut self.fulfill, Fulfill::new_in(self.alloc));
-            let mut ids = core::mem::replace(&mut self.select_ids, Vec::new_in(self.alloc));
-            f.clear();
-            ids.clear();
+            let mut f = self.fulfill.take().unwrap_or_else(|| Fulfill::new_in(self.alloc));
+            if self.fulfill_dirty {
+                f.clear();
+                self.fulfill_obs.clear();
+                self.fulfill_registered = 0;
+                self.fulfill_dirty = false;
+            }
             let reg_res = (|| -> Result<(), Stop> {
-                for i in 0..self.obs.len() {
+                for i in self.fulfill_registered..self.obs.len() {
                     if self.state[i] == State::Pending {
                         f.register(SGoal { env, pred: self.preds[i], bound: 0 }).map_err(CheckError::Solve)?;
-                        ids.push(i);
+                        self.fulfill_obs.push(i);
                     }
                 }
                 Ok(())
             })();
             if let Err(e) = reg_res {
-                self.fulfill = f;
-                self.select_ids = ids;
+                self.fulfill = Some(f);
+                self.invalidate_fulfill();
                 return Err(e);
             }
-            if ids.is_empty() {
-                self.fulfill = f;
-                self.select_ids = ids;
+            self.fulfill_registered = self.obs.len();
+            if self.fulfill_obs.is_empty() {
+                self.fulfill_env = Some(env);
+                self.fulfill_undo = self.undo.len();
+                self.fulfill_bindings = self.terms.bindings_len();
+                self.fulfill = Some(f);
                 return Ok(());
             }
+            f.resolved.clear();
             // A fact a goal lacks is pulled where it is met (`Pull`): the obligations are
             // registered once, and again only under the test strategy's stop.
             let pulled_res = self.pulled(reads, |solver, terms, src, _| f.select_from_quiet(solver, terms, src, mode));
             let r = match pulled_res {
                 Ok(r) => r,
                 Err(e) => {
-                    self.fulfill = f;
-                    self.select_ids = ids;
+                    self.fulfill = Some(f);
+                    self.invalidate_fulfill();
                     return Err(e);
                 }
             };
-            for (j, &i) in ids.iter().enumerate() {
-                let s = f.state[j];
+            // Sync in obligation registration order so `pull` and `stop_for_facts` emit identical
+            // diagnostic ordering regardless of which wake pass resolved each obligation.
+            f.resolved.sort_unstable();
+            for &j in f.resolved.iter() {
+                let i = self.fulfill_obs[j as usize];
+                let s = f.state[j as usize];
                 if s == State::Fails && self.state[i] == State::Pending {
                     let kind = match self.obs[i].goal {
                         Goal::Projection { .. } => FulfillErrorKind::Mismatch,
@@ -1764,15 +1802,27 @@ impl<'a, 'f> InferCtxIn<'a, 'f> {
                 }
                 self.set_state(i, s);
             }
-            self.fulfill = f;
-            self.select_ids = ids;
+            f.resolved.clear();
             match r {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    self.fulfill_env = Some(env);
+                    self.fulfill_undo = self.undo.len();
+                    self.fulfill_bindings = self.terms.bindings_len();
+                    self.fulfill = Some(f);
+                    return Ok(());
+                }
                 Err(blaze_solve::Stop::Need(q)) => {
+                    // `select_from_quiet` stopped mid-batch; keep capacity and rebuild wake state.
+                    self.fulfill = Some(f);
+                    self.invalidate_fulfill();
                     self.fill(q, reads)?;
                     self.need_rounds += 1;
                 }
-                Err(e) => solve_err(e)?,
+                Err(e) => {
+                    self.fulfill = Some(f);
+                    self.invalidate_fulfill();
+                    solve_err(e)?;
+                }
             }
         }
         Err(CheckError::Limit(crate::error::Limit::Solver).into())
@@ -2172,6 +2222,14 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
         self.error_at = s.error_at;
         self.env_clauses.truncate(s.env_clauses);
         self.env = s.env;
+        if self.fulfill.is_some()
+            && (s.obs < self.fulfill_registered
+                || s.undo < self.fulfill_undo
+                || self.fulfill_env != self.env
+                || self.terms.bindings_len() < self.fulfill_bindings)
+        {
+            self.invalidate_fulfill();
+        }
     }
 
     fn commit(&mut self, s: InferSnapshot) {
