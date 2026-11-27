@@ -14,6 +14,7 @@
 //! type (rustc resolves instances in its post-analysis typing mode). A body's own selection at
 //! ground arguments (writeback's `select_owning`) brings its analysis context instead.
 
+use blaze_hash::{FixedState, Set, SetOpts};
 use blaze_own::{Alloc, Vec};
 
 use crate::error::{CheckError, Limit, Malformed, Stop};
@@ -1056,13 +1057,29 @@ fn holding_owning<'x, W: World>(
         Some(s) => &[s, Shape::Param],
         None => &[Shape::Param],
     };
-    let mut seen: Vec<ItemKey, Alloc<'_>> = Vec::new_in(cx.alloc());
+    let mut candidates: Vec<ItemKey, Alloc<'_>> = Vec::new_in(cx.alloc());
     for &b in buckets {
-        for &imp in reads.impls_of(trait_, b)? {
-            if seen.contains(&imp) {
+        let bucket = reads.impls_of(trait_, b)?;
+        cx.prefilter_impls(trait_, b, bucket, goal_args, reads, &mut candidates)?;
+    }
+    if candidates.len() <= crate::machine::NAME_HASH_THRESHOLD {
+        let mut seen: Vec<ItemKey, Alloc<'_>> = Vec::with_capacity_in(candidates.len(), cx.alloc());
+        for &imp in candidates.iter() {
+            if seen.scan_for(&imp).is_some() {
                 continue;
             }
             seen.push(imp);
+            if let Some(impl_args) = try_impl(cx, reads, imp, trait_, goal_args)? {
+                holding.push(imp);
+                holding_args.push(impl_args);
+            }
+        }
+    } else {
+        let mut seen = Set::new(SetOpts { hasher: FixedState, alloc: cx.alloc(), capacity: Some(candidates.len()) });
+        for &imp in candidates.iter() {
+            if !seen.insert(imp) {
+                continue;
+            }
             if let Some(impl_args) = try_impl(cx, reads, imp, trait_, goal_args)? {
                 holding.push(imp);
                 holding_args.push(impl_args);

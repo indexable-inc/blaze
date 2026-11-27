@@ -8,7 +8,7 @@
 
 #![blaze::sans_io]
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, HashMap, Map, MapOpts, Set, SetOpts};
 use blaze_own::{Alloc, Soa, Vec};
 use core::mem::DropGuard;
 
@@ -178,6 +178,185 @@ pub(crate) enum Flow {
     Done(Ty),
 }
 
+/// Threshold above which field/variant name lookups switch from zero-alloc linear scans
+/// (faster in L1 cache) to O(1) `blaze_hash::Map` / `Set` lookups.
+pub(crate) const NAME_HASH_THRESHOLD: usize = 16;
+
+/// Trait for items carrying a field `Name`, shared by [`FieldNameSet`].
+pub(crate) trait HasFieldName {
+    fn field_name(&self) -> Name;
+}
+
+impl HasFieldName for crate::body::FieldInit {
+    #[inline]
+    fn field_name(&self) -> Name {
+        self.name
+    }
+}
+
+impl HasFieldName for crate::body::FieldPat {
+    #[inline]
+    fn field_name(&self) -> Name {
+        self.name
+    }
+}
+
+impl HasFieldName for Name {
+    #[inline]
+    fn field_name(&self) -> Name {
+        *self
+    }
+}
+
+/// O(1) membership oracle over a field-initializer or field-pattern slice when `len > 16`,
+/// keeping a zero-alloc linear scan for small slices (`<= 16`).
+pub(crate) enum FieldNameSet<'s, 'a, T> {
+    Linear(&'s [T]),
+    Hashed(Set<Name, FixedState, Alloc<'a>>),
+}
+
+impl<'s, 'a, T: HasFieldName> FieldNameSet<'s, 'a, T> {
+    pub(crate) fn new(items: &'s [T], alloc: Alloc<'a>) -> Self {
+        if items.len() <= NAME_HASH_THRESHOLD {
+            FieldNameSet::Linear(items)
+        } else {
+            let mut set = Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(items.len()) });
+            for item in items {
+                set.insert(item.field_name());
+            }
+            FieldNameSet::Hashed(set)
+        }
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, name: Name) -> bool {
+        match self {
+            FieldNameSet::Linear(items) => items.iter().any(|item| item.field_name() == name),
+            FieldNameSet::Hashed(set) => set.contains(&name),
+        }
+    }
+}
+
+/// Key for lazily cached `Name -> first index` maps on [`Machine`] for large ADTs and records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum NameIndexKey {
+    AdtFields(ItemKey, u32),
+    AdtVariants(ItemKey),
+    Record(RecordSchema),
+}
+
+/// Adjustments in the order made, paired with an intrusive per-`ExprId` LIFO linked list
+/// (`head`/`prev`) so per-expression queries (`has`, `last_ty`, `rows_rev`) are O(1) while
+/// `push` and `truncate` remain O(1) per row.
+///
+/// Implements read-only `Deref<Target = Soa<...>>` and intentionally no `DerefMut` so every
+/// mutation goes through `push`, `truncate`, `set_kind`, or `set_kind_ty`.
+pub(crate) struct AdjustLog<'a> {
+    rows: Soa<(ExprId, AdjustKind, Ty), Alloc<'a>>,
+    head: Vec<u32, Alloc<'a>>,
+    prev: Vec<u32, Alloc<'a>>,
+    expr_count: usize,
+}
+
+impl<'a> AdjustLog<'a> {
+    pub(crate) fn new_in(expr_count: usize, alloc: Alloc<'a>) -> Self {
+        AdjustLog {
+            rows: Soa::new_in(alloc),
+            head: Vec::new_in(alloc),
+            prev: Vec::new_in(alloc),
+            expr_count,
+        }
+    }
+
+    pub(crate) fn push(&mut self, row: (ExprId, AdjustKind, Ty)) {
+        let idx = self.rows.len() as u32;
+        let e = row.0;
+        self.rows.push(row);
+        if self.head.is_empty() && self.expr_count != 0 {
+            self.head.resize(self.expr_count, u32::MAX);
+        }
+        let prev = if let Some(slot) = self.head.get_mut(e.ix()) {
+            let p = *slot;
+            *slot = idx;
+            p
+        } else {
+            u32::MAX
+        };
+        self.prev.push(prev);
+    }
+
+    pub(crate) fn truncate(&mut self, len: usize) {
+        if len < self.rows.len() {
+            let es = self.rows.column::<0>();
+            for i in (len..es.len()).rev() {
+                let prev = self.prev.pop().unwrap_or(u32::MAX);
+                if let Some(slot) = self.head.get_mut(es[i].ix()) {
+                    *slot = prev;
+                }
+            }
+            self.rows.truncate(len);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_kind(&mut self, i: usize, kind: AdjustKind) {
+        self.rows.column_mut::<1>()[i] = kind;
+    }
+
+    #[inline]
+    pub(crate) fn set_kind_ty(&mut self, i: usize, kind: AdjustKind, ty: Ty) {
+        self.rows.column_mut::<1>()[i] = kind;
+        self.rows.column_mut::<2>()[i] = ty;
+    }
+
+    #[inline]
+    pub(crate) fn has(&self, e: ExprId) -> bool {
+        self.head.get(e.ix()).copied().is_some_and(|h| h != u32::MAX)
+    }
+
+    #[inline]
+    pub(crate) fn last_ty(&self, e: ExprId) -> Option<Ty> {
+        let h = self.head.get(e.ix()).copied().filter(|&h| h != u32::MAX)?;
+        self.rows.column::<2>().get(h as usize).copied()
+    }
+
+    /// Row indices of `e` in reverse chronological order (most recent first).
+    #[inline]
+    pub(crate) fn rows_rev(&self, e: ExprId) -> AdjustRowsRev<'_> {
+        let cur = self.head.get(e.ix()).copied().unwrap_or(u32::MAX);
+        AdjustRowsRev { prev: &self.prev, cur }
+    }
+}
+
+impl<'a> core::ops::Deref for AdjustLog<'a> {
+    type Target = Soa<(ExprId, AdjustKind, Ty), Alloc<'a>>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+/// Iterator over an expression's adjustment row indices, most recent first.
+pub(crate) struct AdjustRowsRev<'r> {
+    prev: &'r [u32],
+    cur: u32,
+}
+
+impl Iterator for AdjustRowsRev<'_> {
+    type Item = usize;
+
+    #[inline]
+    fn next(&mut self) -> Option<usize> {
+        if self.cur == u32::MAX {
+            return None;
+        }
+        let idx = self.cur as usize;
+        self.cur = self.prev.get(idx).copied().unwrap_or(u32::MAX);
+        Some(idx)
+    }
+}
+
 /// A coercion site with several sources (`CoerceMany`): `if`/`else`, `match` arms, a block's
 /// tail and its breaks, a loop's breaks, a body's returns.
 #[derive(Clone, Copy, Debug)]
@@ -185,6 +364,10 @@ pub(crate) struct CoerceMany {
     pub expected: Ty,
     pub final_ty: Option<Ty>,
     pub pushed: u32,
+    /// First index into `Machine::coerce_sources` for this site (`u32::MAX` when empty).
+    pub first_source: u32,
+    /// Last index into `Machine::coerce_sources` for this site (`u32::MAX` when empty).
+    pub last_source: u32,
 }
 
 /// An enclosing loop or block that a `break` may leave (`BreakableCtxt`).
@@ -364,8 +547,8 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub pat_ty: Vec<Ty, Alloc<'a>>,
     pub local_ty: Vec<Ty, Alloc<'a>>,
     // Sparse results, rows read whole.
-    /// Adjustments in the order made; scanned by expression (a receiver's autoref).
-    pub adjust: Soa<(ExprId, AdjustKind, Ty), Alloc<'a>>,
+    /// Adjustments in the order made, indexed by expression via an intrusive LIFO list.
+    pub adjust: AdjustLog<'a>,
     pub callees: Vec<(ExprId, ItemKey, TyList), Alloc<'a>>,
     /// What each value or struct path resolved to, at its expression or pattern.
     pub defs: Vec<(At, Def), Alloc<'a>>,
@@ -451,11 +634,11 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     /// `Checked::undecided`, never a pass and never an error.
     pub undecided: Vec<crate::rules::unsafety::Undecided, Alloc<'a>>,
     pub coerce_many: Vec<CoerceMany, Alloc<'a>>,
-    /// Each coercion site's value sources so far, `(site, expression)`, in push order; a `!`
-    /// source is not listed. Read when the site's fn items meet at a fn pointer
-    /// (rules/coerce_lub.rs): each earlier source then records `ReifyFnPointer` (rustc's
-    /// `CoerceMany::pushed` expressions).
-    pub coerce_sources: Vec<(u32, ExprId), Alloc<'a>>,
+    /// Each coercion site's value sources so far, `(expression, next_idx)`, linked in push order
+    /// from `CoerceMany::first_source` (`u32::MAX` terminates); a `!` source is not listed.
+    pub coerce_sources: Vec<(ExprId, u32), Alloc<'a>>,
+    /// Lazily cached `Name -> first index` maps for ADTs/variants/records with `> 16` entries.
+    name_index: Map<NameIndexKey, Map<Name, u32, FixedState, Alloc<'a>>, FixedState, Alloc<'a>>,
     pub breaks: Vec<BreakCtx, Alloc<'a>>,
     /// The innermost body's return site (the fn's, or a closure's).
     pub ret_sites: Vec<u32, Alloc<'a>>,
@@ -564,7 +747,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             reached,
             pat_ty,
             local_ty,
-            adjust: Soa::new_in(alloc),
+            adjust: AdjustLog::new_in(body.exprs.len(), alloc),
             callees: Vec::new_in(alloc),
             defs: Vec::new_in(alloc),
             const_args: Vec::new_in(alloc),
@@ -630,6 +813,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             undecided: Vec::new_in(alloc),
             coerce_many: Vec::new_in(alloc),
             coerce_sources: Vec::new_in(alloc),
+            name_index: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
             breaks: Vec::new_in(alloc),
             ret_sites: Vec::new_in(alloc),
             async_sites: Vec::new_in(alloc),
@@ -838,7 +1022,13 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     pub(crate) fn new_coerce_many(&mut self, expected: Ty) -> Result<u32, Stop> {
         let at = u32::try_from(self.coerce_many.len())
             .map_err(|_| CheckError::Limit(Limit::Table))?;
-        self.coerce_many.push(CoerceMany { expected, final_ty: None, pushed: 0 });
+        self.coerce_many.push(CoerceMany {
+            expected,
+            final_ty: None,
+            pushed: 0,
+            first_source: u32::MAX,
+            last_source: u32::MAX,
+        });
         Ok(at)
     }
 
@@ -877,7 +1067,16 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 if let Some(e) = e
                     && !self.is_never(ty)
                 {
-                    self.coerce_sources.push((site, e));
+                    let idx = u32::try_from(self.coerce_sources.len())
+                        .map_err(|_| CheckError::Limit(Limit::Table))?;
+                    self.coerce_sources.push((e, u32::MAX));
+                    let entry = &mut self.coerce_many[site as usize];
+                    if entry.first_source == u32::MAX {
+                        entry.first_source = idx;
+                    } else {
+                        self.coerce_sources[entry.last_source as usize].1 = idx;
+                    }
+                    entry.last_source = idx;
                 }
             }
             None => {
@@ -2382,10 +2581,85 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.record_names.get(list.range())
     }
 
-    /// Canonical field index of `name` in `schema`, if known.
-    pub(crate) fn record_field_index(&self, schema: RecordSchema, name: Name) -> Option<u32> {
-        let names = self.record_names(schema)?;
-        names.iter().position(|&n| n == name).and_then(|i| u32::try_from(i).ok())
+    /// Canonical field index of `name` in `schema`, if known. Uses a zero-alloc linear scan for
+    /// `<= 16` fields and a lazily cached `Map` for `> 16` fields.
+    pub(crate) fn record_field_index(&mut self, schema: RecordSchema, name: Name) -> Option<u32> {
+        let &(_, list) = self.record_schemas.iter().find(|&&(s, _)| s == schema)?;
+        if list.len == 0 {
+            return None;
+        }
+        let range = list.range();
+        if range.len() <= NAME_HASH_THRESHOLD {
+            let names = self.record_names.get(range)?;
+            return names.iter().position(|&n| n == name).and_then(|i| u32::try_from(i).ok());
+        }
+        let key = NameIndexKey::Record(schema);
+        if let Some(map) = self.name_index.get(&key) {
+            return map.get(&name).copied();
+        }
+        let names = self.record_names.get(range)?;
+        let mut map = Map::new(MapOpts { hasher: FixedState, alloc: self.alloc, capacity: Some(names.len()) });
+        for (i, &n) in names.iter().enumerate() {
+            if let Ok(idx) = u32::try_from(i) {
+                map.entry(n).or_insert(idx);
+            }
+        }
+        let out = map.get(&name).copied();
+        self.name_index.insert(key, map);
+        out
+    }
+
+    /// First field index with `name` in `declared` (for `(adt, variant)`): zero-alloc linear scan
+    /// for `<= 16` fields, lazily cached `Map` for `> 16` fields.
+    pub(crate) fn find_adt_field(
+        &mut self,
+        adt: ItemKey,
+        variant: u32,
+        declared: &[crate::world::Field],
+        name: Name,
+    ) -> Option<u32> {
+        if declared.len() <= NAME_HASH_THRESHOLD {
+            return declared.iter().position(|d| d.name == name).and_then(|i| u32::try_from(i).ok());
+        }
+        let key = NameIndexKey::AdtFields(adt, variant);
+        if let Some(map) = self.name_index.get(&key) {
+            return map.get(&name).copied();
+        }
+        let mut map = Map::new(MapOpts { hasher: FixedState, alloc: self.alloc, capacity: Some(declared.len()) });
+        for (i, d) in declared.iter().enumerate() {
+            if let Ok(idx) = u32::try_from(i) {
+                map.entry(d.name).or_insert(idx);
+            }
+        }
+        let out = map.get(&name).copied();
+        self.name_index.insert(key, map);
+        out
+    }
+
+    /// First variant index with `name` in `variants` (for `adt`): zero-alloc linear scan for
+    /// `<= 16` variants, lazily cached `Map` for `> 16` variants.
+    pub(crate) fn find_adt_variant(
+        &mut self,
+        adt: ItemKey,
+        variants: &[crate::world::Variant],
+        name: Name,
+    ) -> Option<u32> {
+        if variants.len() <= NAME_HASH_THRESHOLD {
+            return variants.iter().position(|v| v.name == name).and_then(|i| u32::try_from(i).ok());
+        }
+        let key = NameIndexKey::AdtVariants(adt);
+        if let Some(map) = self.name_index.get(&key) {
+            return map.get(&name).copied();
+        }
+        let mut map = Map::new(MapOpts { hasher: FixedState, alloc: self.alloc, capacity: Some(variants.len()) });
+        for (i, v) in variants.iter().enumerate() {
+            if let Ok(idx) = u32::try_from(i) {
+                map.entry(v.name).or_insert(idx);
+            }
+        }
+        let out = map.get(&name).copied();
+        self.name_index.insert(key, map);
+        out
     }
 
     /// A written type of the body.

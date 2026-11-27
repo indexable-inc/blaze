@@ -80,7 +80,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                         let want = name.unwrap_or(Name::of_index(index));
                         let Some(v) = adt.variants.first() else { continue };
                         let fields = adt.fields.get(v.fields.range()).unwrap_or(&[]);
-                        match fields.iter().position(|fl| fl.name == want) {
+                        match self.find_adt_field(k, 0, fields, want).map(|idx| idx as usize) {
                             Some(at) => {
                                 // Skip inaccessible fields of wrapper structs (e.g.
                                 // `ManuallyDrop<ScopeGuard<T, F>>::value` is private in `core`, so
@@ -186,18 +186,19 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                 }
                 TyView::Adt(k, args) => match self.field_adt(k)? {
                     Some(adt) if adt.kind == AdtKind::Enum && variant.is_none() => {
-                        if let Some(i) = adt.variants.iter().position(|v| v.name == want) {
-                            variant = Some(i);
+                        if let Some(i) = self.find_adt_variant(k, adt.variants, want) {
+                            variant = Some(i as usize);
                             continue;
                         }
                         None
                     }
                     Some(adt) => {
-                        let fs = match adt.variants.get(variant.unwrap_or(0)) {
+                        let var_idx = variant.unwrap_or(0);
+                        let fs = match adt.variants.get(var_idx) {
                             Some(v) => adt.fields.get(v.fields.range()).unwrap_or(&[]),
                             None => &[],
                         };
-                        match fs.iter().position(|fl| fl.name == want) {
+                        match self.find_adt_field(k, var_idx as u32, fs, want).map(|i| i as usize) {
                             Some(i) => {
                                 variant = None;
                                 Some(self.lower(adt.types, fs[i].ty, Lower::Args(args), Cause::Expr(e))?)

@@ -26,7 +26,7 @@ use crate::body::{Lit, Pat};
 use crate::diag::{About, At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{Edition, Mutbl, PatId};
-use crate::machine::{Frame, Lower, Machine};
+use crate::machine::{FieldNameSet, Frame, Lower, Machine};
 use crate::ty::{Cause, Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
 
@@ -328,7 +328,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
                 let mut tys: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(fps.len(), self.alloc);
                 for fp in fps {
-                    match declared.iter().find(|d| d.name == fp.name) {
+                    match self.find_adt_field(adt_key, variant, declared, fp.name).and_then(|i| declared.get(i as usize)) {
                         Some(d) => tys.push(self.lower(adt.types, d.ty, Lower::Args(args), Cause::Pat(fp.pat))?),
                         None => {
                             self.diag(DiagCode::NoSuchFieldPat, At::Pat(fp.pat), About::name(fp.name));
@@ -342,8 +342,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     if fps.len() != 1 {
                         self.diag(DiagCode::UnionPatternFields, at, About::Count { expected: 1, got: fps.len() as u32, found: Some(expected) });
                     }
-                } else if !rest && let Some(missing) = declared.iter().find(|d| !fps.iter().any(|fp| fp.name == d.name)) {
-                    self.diag(DiagCode::MissingFieldPats, at, About::found_named(expected, missing.name));
+                } else if !rest {
+                    let fp_set = FieldNameSet::new(fps, self.alloc);
+                    if let Some(missing) = declared.iter().find(|d| !fp_set.contains(d.name)) {
+                        self.diag(DiagCode::MissingFieldPats, at, About::found_named(expected, missing.name));
+                    }
                 }
                 for (fp, &t) in fps.iter().zip(tys.iter()).rev() {
                     self.push_pat(fp.pat, t, mode)?;
@@ -381,8 +384,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                 }
                 if !rest {
+                    let fp_set = FieldNameSet::new(fps, self.alloc);
                     let missing = self.record_names(schema).and_then(|names| {
-                        names.iter().copied().find(|&nm| !fps.iter().any(|fp| fp.name == nm))
+                        names.iter().copied().find(|&nm| !fp_set.contains(nm))
                     });
                     if let Some(nm) = missing {
                         self.diag(DiagCode::MissingFields, at, About::found_named(t, nm));

@@ -17,7 +17,7 @@
 
 use core::cell::{Cell, RefCell};
 
-use blaze_hash::HashMap;
+use blaze_hash::{FixedState, HashMap, Map, MapOpts};
 use blaze_own::{Alloc, Vec};
 use blaze_solve::facts::{
     AdtDef, AdtFlags, AssocDef, AssocKind, AssocTy, ConstHolds, Facts, Fetch, FnSigDef, ImplAssoc, ImplFlags, ImplHeader,
@@ -254,6 +254,14 @@ pub struct FactCache<'a> {
     /// `impl_columns` and their stride; `WIDTH * stride` bytes.
     impl_cols: HashMap<(u128, SShape), (u32, u32), Alloc<'a>>,
     impl_columns: Vec<u8, Alloc<'a>>,
+    /// Header-only fingerprint columns for `instance::holding_owning` when a bucket has `> 16`
+    /// impls and was not already filled via `fill_one(SQ::Impls)` (reads headers only, never
+    /// predicates). Cleared per body round in `clear_ephemeral`.
+    header_cols: Map<(ItemKey, Shape), (Span, u32, u32), FixedState, Alloc<'a>>,
+    header_impl_defs: Vec<ItemKey, Alloc<'a>>,
+    header_columns: Vec<u8, Alloc<'a>>,
+    /// Scratch survivor indices for `prefilter::filter` (reused across calls).
+    survivor_scratch: Vec<u32, Alloc<'a>>,
     /// One bucket's fingerprints and columns while it is filled (reused).
     fp_scratch: Vec<Fingerprint, Alloc<'a>>,
     col_scratch: Vec<u8, Alloc<'a>>,
@@ -447,6 +455,60 @@ pub fn shape(s: SShape) -> Shape {
     }
 }
 
+/// Inverse of [`shape`] for shapes that have a single `SShape` bucket in `FactCache::impls`.
+fn sshape(s: Shape) -> Option<SShape> {
+    use blaze_solve::term::{FloatTy as SF, IntTy as SI, UintTy as SU};
+    let m = |m: Mutbl| match m {
+        Mutbl::Not => SMutbl::Not,
+        Mutbl::Mut => SMutbl::Mut,
+    };
+    Some(match s {
+        Shape::Bool => SShape::Bool,
+        Shape::Char => SShape::Char,
+        Shape::Int(i) => SShape::Int(match i {
+            IntTy::Isize => SI::Isize,
+            IntTy::I8 => SI::I8,
+            IntTy::I16 => SI::I16,
+            IntTy::I32 => SI::I32,
+            IntTy::I64 => SI::I64,
+            IntTy::I128 => SI::I128,
+        }),
+        Shape::Uint(u) => SShape::Uint(match u {
+            UintTy::Usize => SU::Usize,
+            UintTy::U8 => SU::U8,
+            UintTy::U16 => SU::U16,
+            UintTy::U32 => SU::U32,
+            UintTy::U64 => SU::U64,
+            UintTy::U128 => SU::U128,
+        }),
+        Shape::Float(f) => SShape::Float(match f {
+            FloatTy::F16 => SF::F16,
+            FloatTy::F32 => SF::F32,
+            FloatTy::F64 => SF::F64,
+            FloatTy::F128 => SF::F128,
+        }),
+        Shape::Str => SShape::Str,
+        Shape::Never => SShape::Never,
+        Shape::Tuple(n) => SShape::Tuple(n),
+        Shape::Record(s, n) => SShape::Record(s, n),
+        Shape::Union(n) => SShape::Union(n),
+        Shape::Ref(x) => SShape::Ref(m(x)),
+        Shape::Ptr(x) => SShape::Ptr(m(x)),
+        Shape::Array => SShape::Array,
+        Shape::Slice => SShape::Slice,
+        Shape::Pat => SShape::Pat,
+        Shape::Adt(k) => SShape::Adt(SDef(k.0)),
+        Shape::Foreign(k) => SShape::Foreign(SDef(k.0)),
+        Shape::FnDef(k) => SShape::FnDef(SDef(k.0)),
+        Shape::FnPtr(n) => SShape::FnPtr(n),
+        Shape::Dynamic(d) => SShape::Dynamic(SDef(d.map_or(0, |k| k.0))),
+        Shape::AnyInt => SShape::AnyInt,
+        Shape::AnyFloat => SShape::AnyFloat,
+        Shape::Param => SShape::Blanket,
+        Shape::Closure | Shape::Opaque(_) => return None,
+    })
+}
+
 /// typeck's lang item of the solver's.
 pub fn lang_item(l: Lang) -> LangItem {
     match l {
@@ -554,6 +616,10 @@ impl<'a> FactCache<'a> {
             impls: HashMap::new_in(alloc),
             impl_cols: HashMap::new_in(alloc),
             impl_columns: Vec::new_in(alloc),
+            header_cols: Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
+            header_impl_defs: Vec::new_in(alloc),
+            header_columns: Vec::new_in(alloc),
+            survivor_scratch: Vec::new_in(alloc),
             fp_scratch: Vec::new_in(alloc),
             col_scratch: Vec::new_in(alloc),
             headers: HashMap::new_in(alloc),
@@ -721,6 +787,9 @@ impl<'a> FactCache<'a> {
             self.names.remove(&d);
         }
         self.round_inner_names.clear();
+        self.header_cols.clear();
+        self.header_impl_defs.clear();
+        self.header_columns.clear();
         self.retries = 0;
         self.counted = Converted::default();
     }
@@ -1986,6 +2055,111 @@ impl<'a> FactCache<'a> {
 
     fn portable(&self, p: Por) -> Portable<'_> {
         Portable { nodes: p.nodes.get(&self.nodes), lists: p.lists.get(&self.lists) }
+    }
+
+    /// Prefilters `bucket` (from `reads.impls_of(trait_, shape)`) against `goal_args` using
+    /// SIMD fingerprint columns (`blaze_solve::prefilter`), appending surviving impl keys in
+    /// bucket order into `out`.
+    ///
+    /// - Reuses solver-filled `impl_cols` when already cached (zero extra reads).
+    /// - Keeps direct scan for small buckets (`<= 16` impls).
+    /// - For larger uncached buckets (`> 16`), builds and caches header-only fingerprint columns
+    ///   via `reads.impl_header` (never touching `reads.predicates`).
+    pub(crate) fn prefilter_impls<W: World>(
+        &mut self,
+        trait_: ItemKey,
+        shape: Shape,
+        bucket: &[ItemKey],
+        terms: &crate::infer::Terms<'_>,
+        goal_args: SList,
+        reads: &mut Reads<'_, '_, W>,
+        out: &mut Vec<ItemKey, Alloc<'_>>,
+    ) -> Result<(), crate::instance::ResolveError> {
+        if bucket.is_empty() {
+            return Ok(());
+        }
+        #[cfg(test)]
+        let first_only = self.first_impl_only;
+        #[cfg(not(test))]
+        let first_only = false;
+        let goal_fp = prefilter::fingerprint_goal(terms, goal_args);
+        if !first_only
+            && let Some(ss) = sshape(shape)
+            && let Some(r) = self.impls.get(&(trait_.0, ss))
+            && let Some(&(at, stride)) = self.impl_cols.get(&(trait_.0, ss))
+            && r.span.len as usize == bucket.len()
+        {
+            let impls = r.span.get(&self.impl_defs);
+            let at_usize = usize::try_from(at).unwrap_or(usize::MAX);
+            let col_len = prefilter::WIDTH.saturating_mul(usize::try_from(stride).unwrap_or(usize::MAX));
+            if let Some(bytes) = self.impl_columns.get(at_usize..at_usize.saturating_add(col_len)) {
+                let len = u32::try_from(impls.len()).unwrap_or(u32::MAX);
+                self.survivor_scratch.clear();
+                prefilter::filter(&goal_fp, Columns { bytes, stride, len }, &mut self.survivor_scratch);
+                for &idx in self.survivor_scratch.iter() {
+                    if let Some(&d) = impls.get(idx as usize) {
+                        out.push(ItemKey(d.0));
+                    }
+                }
+                return Ok(());
+            }
+        }
+        if bucket.len() <= crate::machine::NAME_HASH_THRESHOLD {
+            out.extend_from_slice(bucket);
+            return Ok(());
+        }
+        if !self.header_cols.contains_key(&(trait_, shape)) {
+            let def_start = self.header_impl_defs.len();
+            self.fp_scratch.clear();
+            let mut terms_buf: Vec<STy, Alloc<'a>> = Vec::new_in(self.alloc);
+            for &imp in bucket {
+                let q = Question::ImplHeader(imp);
+                let Some(h) = reads.impl_header(imp)? else {
+                    return Err(crate::instance::ResolveError::Missing(q));
+                };
+                if h.trait_ != Some(trait_) || h.polarity != crate::world::ImplPolarity::Positive {
+                    continue;
+                }
+                let por = self.start();
+                let c = self.table(q, h.types);
+                let self_ty = self.ty(c, h.self_ty)?;
+                terms_buf.clear();
+                terms_buf.push(self_ty);
+                for i in h.trait_args.list().range() {
+                    let p = h.types.list_slot(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+                    terms_buf.push(self.ty(c, p)?);
+                }
+                let args = SList { start: self.lists.len() as u32, len: terms_buf.len() as u32 };
+                self.lists.extend_from_slice(&terms_buf);
+                let por = self.end(por);
+                let fp = prefilter::fingerprint_impl(self.portable(por), args);
+                self.header_impl_defs.push(imp);
+                self.fp_scratch.push(fp);
+            }
+            let span = Span::of(&self.header_impl_defs, def_start);
+            let stride = prefilter::columns_of(&self.fp_scratch, &mut self.col_scratch);
+            let at = u32::try_from(self.header_columns.len()).unwrap_or(u32::MAX);
+            self.header_columns.extend_from_slice(&self.col_scratch);
+            self.header_cols.insert((trait_, shape), (span, at, stride));
+        }
+        if let Some(&(span, at, stride)) = self.header_cols.get(&(trait_, shape)) {
+            let impls = span.get(&self.header_impl_defs);
+            let at_usize = usize::try_from(at).unwrap_or(usize::MAX);
+            let col_len = prefilter::WIDTH.saturating_mul(usize::try_from(stride).unwrap_or(usize::MAX));
+            if let Some(bytes) = self.header_columns.get(at_usize..at_usize.saturating_add(col_len)) {
+                let len = u32::try_from(impls.len()).unwrap_or(u32::MAX);
+                self.survivor_scratch.clear();
+                prefilter::filter(&goal_fp, Columns { bytes, stride, len }, &mut self.survivor_scratch);
+                for &idx in self.survivor_scratch.iter() {
+                    if let Some(&imp) = impls.get(idx as usize) {
+                        out.push(imp);
+                    }
+                }
+                return Ok(());
+            }
+        }
+        out.extend_from_slice(bucket);
+        Ok(())
     }
 
     /// The allocator the cache is in.
