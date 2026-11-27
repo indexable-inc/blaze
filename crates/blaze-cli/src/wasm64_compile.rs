@@ -129,6 +129,26 @@ impl Hex64 {
     pub(crate) fn as_str(&self) -> &str {
         core::str::from_utf8(&self.0).unwrap_or("")
     }
+
+    /// Decodes this 64-hex digest back into its 32-byte [`ContentId`] representation (zero hash
+    /// domains, zero allocations, injective for all valid lowercase hex digests).
+    pub(crate) fn to_content_id(self) -> ContentId {
+        const fn nibble(b: u8) -> u8 {
+            match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => b - b'a' + 10,
+                b'A'..=b'F' => b - b'A' + 10,
+                _ => 0,
+            }
+        }
+        let mut out = [0u8; 32];
+        for (dst, pair) in out.iter_mut().zip(self.0.chunks_exact(2)) {
+            if let [hi, lo] = *pair {
+                *dst = (nibble(hi) << 4) | nibble(lo);
+            }
+        }
+        ContentId(out)
+    }
 }
 
 /// C-probe state observable by a dependency build script during wasm64 self-compilation.

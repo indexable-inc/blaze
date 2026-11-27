@@ -1052,7 +1052,7 @@ impl<'t> Taken<'t> {
             }
             let part = match row.kind {
                 // No stream replays the home (the module's rule): its listings, on every request.
-                LeafKind::HomeListing => &mut parts.home,
+                LeafKind::HomeListing | LeafKind::DepProbes => &mut parts.home,
                 LeafKind::ScriptGit => &mut parts.git,
                 _ if script_asks && !fact_file => &mut parts.scripts,
                 kind => match unit_of(&views, kind, path) {
@@ -1283,8 +1283,8 @@ impl<'a> Index<'a> {
             // move only with the path or a folder above it; a listing with any entry of it.
             LeafKind::ScriptFile if rel.starts_with(sweep::FACT_MOUNT) => true,
             LeafKind::ScriptFile | LeafKind::ScriptStat => self.touched(rel, plant),
-            // A git fact is read from `.git` files the journal may not see: always followed.
-            LeafKind::ScriptGit => true,
+            // A git fact or host dependency-probe identity lives outside checkout file events: always followed.
+            LeafKind::ScriptGit | LeafKind::DepProbes => true,
             LeafKind::ScriptListing => self.touched(rel, plant) || self.children_of(rel).next().is_some(),
             // Decided by its files' and folders' rows (macro_files.rs `proven`).
             LeafKind::MacroFiles => false,

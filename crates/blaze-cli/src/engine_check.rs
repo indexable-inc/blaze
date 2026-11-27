@@ -3783,6 +3783,25 @@ fn checking<'f, 's: 'f>(
     if let Some(sweep) = script_sweep.as_mut() { sweep.prepare(cx, &mut store, pointer_root_name, &journal, frame)?; }
     let mut followed_kept = None;
     let mut own_scoped_moved = false;
+    let owned_probes = crate::scripts::SharedCommandProbes::new();
+    let command_probes = shared_probes.unwrap_or(&owned_probes);
+    let mut env = place.fetch_env(phases.clock().clone(), toolchain, fs.clone(), heap);
+    let wall_ns = phases.clock().wall().as_ns();
+    // Helper invoked ONLY when a stored pointer's leaf table carries a `LeafKind::DepProbes` row
+    // (workspaces with probe-dependent `MacroModule`s): validates live derived-fact pins / SDK /
+    // Linux clang closure BEFORE accepting a certificate AND populates `command_probes`'s checked
+    // snapshot so start-time `RunProcs` never recomputes live on a certificate hit.
+    let resolve_dep_probes = |env: &FetchEnv<'_>| -> Result<blaze_ids::ContentId, CliError> {
+        let resolved_sdk = match lazy_sdk {
+            Some(lazy) => lazy.resolve_on_demand(cx, Some(opened.home.dir()), wall_ns),
+            None => env.sdk,
+        };
+        let tag = match command_probes.with_env(env).with_sdk(resolved_sdk).dep_probe_identity_hex(cx) {
+            Ok(hex) => hex,
+            Err(err) => crate::wasm64_compile::probe_error_hex(err.kind),
+        };
+        Ok(tag.to_content_id())
+    };
     if let (Some(pointer), Some(lines)) = (&pointer, &last_lines) {
         // Only the rows the journal's changes reach are looked at; all where it says nothing.
         // Another checkout's leaves: every row looked at (its journal is not this checkout's).
@@ -3791,12 +3810,13 @@ fn checking<'f, 's: 'f>(
             crate::engine_ready_edit::StoredBase::Own | crate::engine_ready_edit::StoredBase::ToolsMoved => journal.marked(&pointer.leaves, frame),
         };
         let sdk_digest_fn = || match lazy_sdk {
-            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), wall_ns),
             None => Ok(blaze_build_script::facts::sdk_id_digest("")),
         };
+        let dep_probes_fn = || resolve_dep_probes(&env);
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
+        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &pointer.leaves, marked.as_deref(), script_sweep.as_mut(), Some(&sdk_digest_fn), Some(&dep_probes_fn), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         sweep_counts = journal.counts(statted, u32::try_from(pointer.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&pointer.leaves, frame)).with_looks(followed.looks, follow_ns);
         // Set, then borrowed SHARED: `Option::insert` hands back a `&mut`, and `today_slots` below
@@ -3928,12 +3948,13 @@ fn checking<'f, 's: 'f>(
         };
         let whole_marked = whole_journal.marked(&whole_ptr.leaves, frame);
         let sdk_digest_fn = || match lazy_sdk {
-            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), wall_ns),
             None => Ok(blaze_build_script::facts::sdk_id_digest("")),
         };
+        let dep_probes_fn = || resolve_dep_probes(&env);
         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
         let follow_began = phases.clock().now();
-        let (whole_followed, whole_statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &whole_ptr.leaves, whole_marked.as_deref(), None, Some(&sdk_digest_fn), frame)?;
+        let (whole_followed, whole_statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &whole_ptr.leaves, whole_marked.as_deref(), None, Some(&sdk_digest_fn), Some(&dep_probes_fn), frame)?;
         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
         let whole_moved = whole_followed.layout_moved
             || whole_followed.now.rows.iter().zip(whole_followed.was.iter()).any(|(now, was)| now.state() != *was);
@@ -4053,12 +4074,13 @@ fn checking<'f, 's: 'f>(
                     }
                     if let Some(new_ptr) = &pointer {
                         let sdk_digest_fn = || match lazy_sdk {
-                            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), phases.clock().wall().as_ns()),
+                            Some(lazy) => lazy.sdk_digest(cx, Some(opened.home.dir()), wall_ns),
                             None => Ok(blaze_build_script::facts::sdk_id_digest("")),
                         };
+                        let dep_probes_fn = || resolve_dep_probes(&env);
                         let follow = sweep::Follow { stamps: FromMeta::now(phases.clock()), plant: sweep::Plant::None };
                         let follow_began = phases.clock().now();
-                        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &new_ptr.leaves, None, script_sweep.as_mut(), Some(&sdk_digest_fn), frame)?;
+                        let (followed, statted) = follow.follow_served_with_sdk(cx, root, Some(opened.home.dir()), place.home, &new_ptr.leaves, None, script_sweep.as_mut(), Some(&sdk_digest_fn), Some(&dep_probes_fn), frame)?;
                         let follow_ns = phases.clock().now().since(follow_began).map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX));
                         sweep_counts = journal.counts(statted, u32::try_from(new_ptr.leaves.len()).unwrap_or(u32::MAX)).with_parts(journal.parts(&new_ptr.leaves, frame)).with_looks(followed.looks, follow_ns);
                         followed_kept = Some(followed);
@@ -4140,7 +4162,6 @@ fn checking<'f, 's: 'f>(
         phases.mark_cx(cx, "stored answer read", frame);
     }
     let read_from_last = last_root.is_some();
-    let mut env = place.fetch_env(phases.clock().clone(), toolchain, fs.clone(), heap);
 
     // 1. Plan: the units stage, then the files, then the crates; on the ready path
     // ([`ready_setup`]) none of them: the graph's row and list, the outlines read back by their
@@ -4198,8 +4219,6 @@ fn checking<'f, 's: 'f>(
         scoped: Option<ScopedUnits>,
     }
 
-    let owned_probes = crate::scripts::SharedCommandProbes::new();
-    let command_probes = shared_probes.unwrap_or(&owned_probes);
     let mut ready_preflight = None;
     if matches!(chosen, crate::engine_ready_edit::Chosen::Wake { .. }) && !crate::engine_units::ready_lays_out() {
         let attempt = own_frame(|| -> Result<Result<blaze_own::Box<CheckedSetup<'_, '_>, blaze_own::Alloc<'static>>, crate::engine_ready_edit::ReadyRefused>, CliError> {
@@ -4477,6 +4496,9 @@ fn checking<'f, 's: 'f>(
                     )?,
                     _ => crate::engine_scripts::PlannedDepProbes::empty(frame),
                 };
+                if let Some(dep_probes_id) = planned_dep_probes.leaf_id() {
+                    sweep::record_dep_probes(&mut rows, dep_probes_id);
+                }
                 let _cx = cx.span(STAGES_PLAN_SPAN);
                 let preserved_names = match (scoped.as_ref(), stored.as_ref()) {
                     (Some(strict), Some(last_stored)) => preserve_standing_sibling_names(

@@ -681,6 +681,21 @@ impl<'f> PlannedDepProbes<'f> {
     pub(crate) fn empty(frame: &'f Frame) -> Self {
         Self { proc_macros: Vec::new_in(frame), script_modules: Vec::new_in(frame) }
     }
+
+    /// Returns the 32-byte probe identity recorded as a `LeafKind::DepProbes` certificate leaf
+    /// when this command planned at least one probe-dependent `MacroModule`, or `None` when no
+    /// unit in the workspace has dependency build scripts (zero overhead on unrelated workspaces).
+    pub(crate) fn leaf_id(&self) -> Option<ContentId> {
+        for (_, entry) in self.proc_macros.iter().chain(self.script_modules.iter()) {
+            if let PlannedProbe::Digest(hex) = entry {
+                return Some(hex.to_content_id());
+            }
+        }
+        self.proc_macros
+            .first()
+            .or_else(|| self.script_modules.first())
+            .map(|(_, entry)| entry.source_hex().to_content_id())
+    }
 }
 
 /// Computes deterministic dependency-probe tables for every proc-macro and `RanAs::Wasm`

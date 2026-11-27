@@ -2386,4 +2386,181 @@ mod shared_command_probes_dst {
         assert_eq!(c_opens.load(Ordering::SeqCst), 1);
         assert_eq!(s_opens.load(Ordering::SeqCst), 1);
     }
+
+    #[test]
+    fn certificate_dep_probes_leaf_validates_populates_snapshot_and_invalidates_on_drift() {
+        use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, ProbeAnswerer};
+        use blaze_ids::ContentId;
+        use blaze_proc_macro::probe_clang::{CProbeStore, CScriptProbes, MemCProbeStore};
+
+        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        impl ProbeAnswerer for MutableAnswerer {
+            fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
+                Ok(ContentId([self.0.load(Ordering::SeqCst); 32]))
+            }
+            fn answer<'a, 'b>(
+                &self,
+                _probe: &CanonicalProbe<'_, '_>,
+                _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+                alloc: blaze_own::Alloc<'a>,
+            ) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+                Err(blaze_own::AString::from_str_in("unused", alloc))
+            }
+        }
+
+        let io = Io::simulated(SimWorld::new(73, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let fs = io.need_fs().expect("sim fs");
+        let root = fs.root();
+        let env = sim_env(&io);
+        let shared = SharedAlloc::global();
+        let frame = cx.frame();
+
+        let make_ready = |state: &std::sync::Arc<core::sync::atomic::AtomicU8>| {
+            let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
+                blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(state)), shared);
+            let records: blaze_own::Arc<dyn CProbeStore, SharedAlloc<'static>> =
+                blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
+            CProbeSetting::Ready(CScriptProbes {
+                answerer,
+                #[cfg(target_os = "linux")]
+                hermetic: None,
+                records,
+                sdk_dir: blaze_own::Arc::from_str_in("", shared),
+                sdk_id: blaze_own::Arc::from_str_in("", shared),
+                sdk_digest: [0; 32],
+                clang_sha256: [0x99; 32],
+            })
+        };
+
+        // 0. Zero-overhead workspace without `LeafKind::DepProbes`: sweep NEVER invokes `dep_probes_fn`.
+        let plain_rows = crate::sweep::Rows::new_in(frame);
+        let plain_bytes = crate::sweep::Leaves::bytes_in(&plain_rows, frame).expect("plain leaves");
+        let (plain_leaves, _) = crate::sweep::Leaves::of(&plain_bytes).expect("parse plain leaves");
+        let plain_calls = AtomicU32::new(0);
+        let plain_cb = || -> Result<ContentId, crate::CliError> {
+            plain_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ContentId([0; 32]))
+        };
+        let follow = crate::sweep::Follow {
+            stamps: crate::sweep::FromMeta::now(&env.clock),
+            plant: crate::sweep::Plant::None,
+        };
+        let (plain_followed, _) = follow
+            .follow_served_with_sdk(&cx, &root, None, None, &plain_leaves, None, None, None, Some(&plain_cb), frame)
+            .expect("follow plain");
+        assert_eq!(plain_calls.load(Ordering::SeqCst), 0, "workspaces without DepProbes leaf must pay zero probe overhead");
+        assert!(!plain_followed.now.rows.iter().zip(plain_followed.was.iter()).any(|(n, w)| n.state() != *w));
+
+        // 1. Seed initial stored leaf table with probe identity A (answerer 0xaa, clang 23.0.0).
+        let state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xaa));
+        let holder1 = SharedCommandProbes::new();
+        let probes1 = holder1.with_env(&env);
+        let _ = probes1.c_probes_with(&cx, |_| Some(make_ready(&state))).expect("seed c1");
+        let _ = probes1
+            .spawn_setting_with(&cx, |_| {
+                Ok(SpawnSetting::facts_only(FactPins {
+                    clang_version_text: std::string::String::from("clang version 23.0.0"),
+                    macos_product_version: std::string::String::new(),
+                    macos_build_version: std::string::String::new(),
+                }))
+            })
+            .expect("seed s1");
+        let hex_a = probes1.dep_probe_identity_hex(&cx).expect("hex A");
+
+        let mut stored_rows = crate::sweep::Rows::new_in(frame);
+        crate::sweep::record_dep_probes(&mut stored_rows, hex_a.to_content_id());
+        let stored_bytes = crate::sweep::Leaves::bytes_in(&stored_rows, frame).expect("encode leaves");
+        let (stored_leaves, _) = crate::sweep::Leaves::of(&stored_bytes).expect("parse leaves");
+
+        // 2. No-op certificate command with UNCHANGED probe inputs (fresh `SharedCommandProbes`
+        //    as a new `blaze run`/`test`/`export` command creates):
+        //    - Sweep sees `!moved` (certificate hit!),
+        //    - AND populates `holder2`'s checked snapshot so start-time `with_checked_snapshot()`
+        //      returns `hex_a` even if the live answerer shifts after the certificate check!
+        let holder2 = SharedCommandProbes::new();
+        let probes2 = holder2.with_env(&env);
+        let _ = probes2.c_probes_with(&cx, |_| Some(make_ready(&state))).expect("seed c2");
+        let _ = probes2
+            .spawn_setting_with(&cx, |_| {
+                Ok(SpawnSetting::facts_only(FactPins {
+                    clang_version_text: std::string::String::from("clang version 23.0.0"),
+                    macos_product_version: std::string::String::new(),
+                    macos_build_version: std::string::String::new(),
+                }))
+            })
+            .expect("seed s2");
+        let cert_cb = || -> Result<ContentId, crate::CliError> {
+            let hex = probes2.dep_probe_identity_hex(&cx).expect("live cert hex");
+            Ok(hex.to_content_id())
+        };
+        let (cert_followed, _) = follow
+            .follow_served_with_sdk(&cx, &root, None, None, &stored_leaves, Some(&[false]), None, None, Some(&cert_cb), frame)
+            .expect("follow cert hit");
+        let cert_moved = cert_followed.layout_moved
+            || cert_followed.now.rows.iter().zip(cert_followed.was.iter()).any(|(n, w)| n.state() != *w);
+        assert!(!cert_moved, "unchanged probe inputs must allow certificate hit (even with unmarked journal slice)");
+
+        // Now shift live answerer AFTER the certificate hit: start-time runner reusing `holder2`
+        // MUST return `hex_a` from the certificate-populated checked snapshot!
+        state.store(0xbb, Ordering::SeqCst);
+        let start_hex = holder2
+            .with_env(&env)
+            .with_checked_snapshot()
+            .dep_probe_identity_hex(&cx)
+            .expect("start snapshot after cert hit");
+        assert_eq!(start_hex, hex_a, "certificate hit must populate checked snapshot for start-time runners");
+
+        // 3. Changing clang runtime closure (0xaa -> 0xbb) MUST invalidate the certificate (`moved == true`),
+        //    while keeping `layout_moved == false` so `Stood` graph read-back still applies.
+        let holder3 = SharedCommandProbes::new();
+        let probes3 = holder3.with_env(&env);
+        let _ = probes3.c_probes_with(&cx, |_| Some(make_ready(&state))).expect("seed c3");
+        let _ = probes3
+            .spawn_setting_with(&cx, |_| {
+                Ok(SpawnSetting::facts_only(FactPins {
+                    clang_version_text: std::string::String::from("clang version 23.0.0"),
+                    macos_product_version: std::string::String::new(),
+                    macos_build_version: std::string::String::new(),
+                }))
+            })
+            .expect("seed s3");
+        let drift_cb = || -> Result<ContentId, crate::CliError> {
+            let hex = probes3.dep_probe_identity_hex(&cx).expect("drifted hex");
+            Ok(hex.to_content_id())
+        };
+        let (drift_followed, _) = follow
+            .follow_served_with_sdk(&cx, &root, None, None, &stored_leaves, Some(&[false]), None, None, Some(&drift_cb), frame)
+            .expect("follow drifted closure");
+        let drift_moved = drift_followed.layout_moved
+            || drift_followed.now.rows.iter().zip(drift_followed.was.iter()).any(|(n, w)| n.state() != *w);
+        assert!(drift_moved, "changed clang runtime closure must invalidate certificate hit");
+        assert!(!drift_followed.layout_moved, "DepProbes leaf must keep POST_GRAPH_MACRO so Stood graph stands");
+
+        // 4. Changing derived-fact pins (clang version 23.0.0 -> 23.1.0) with restored answerer 0xaa
+        //    MUST also invalidate the certificate (`moved == true`).
+        state.store(0xaa, Ordering::SeqCst);
+        let holder4 = SharedCommandProbes::new();
+        let probes4 = holder4.with_env(&env);
+        let _ = probes4.c_probes_with(&cx, |_| Some(make_ready(&state))).expect("seed c4");
+        let _ = probes4
+            .spawn_setting_with(&cx, |_| {
+                Ok(SpawnSetting::facts_only(FactPins {
+                    clang_version_text: std::string::String::from("clang version 23.1.0"),
+                    macos_product_version: std::string::String::new(),
+                    macos_build_version: std::string::String::new(),
+                }))
+            })
+            .expect("seed s4");
+        let pin_cb = || -> Result<ContentId, crate::CliError> {
+            let hex = probes4.dep_probe_identity_hex(&cx).expect("pin drifted hex");
+            Ok(hex.to_content_id())
+        };
+        let (pin_followed, _) = follow
+            .follow_served_with_sdk(&cx, &root, None, None, &stored_leaves, Some(&[false]), None, None, Some(&pin_cb), frame)
+            .expect("follow pin drift");
+        let pin_moved = pin_followed.layout_moved
+            || pin_followed.now.rows.iter().zip(pin_followed.was.iter()).any(|(n, w)| n.state() != *w);
+        assert!(pin_moved, "changed derived-fact pins must invalidate certificate hit");
+    }
 }

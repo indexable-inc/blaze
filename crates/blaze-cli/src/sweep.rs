@@ -472,6 +472,22 @@ pub enum LeafKind {
     /// sandbox digests it (engine_script_reads.rs `ReadKind::Git`). Read from `.git` files the
     /// journal may not see, so it is always followed (journal_sweep.rs).
     ScriptGit = 10,
+    /// Active dependency build-script probe/pin identity (`DepProbeIdentity`, `POST_GRAPH_MACRO`
+    /// flag), recorded ONLY when the workspace has at least one probe-dependent `MacroModule`
+    /// (proc-macro or `RanAs::Wasm` build script). Always followed so certificate hits validate
+    /// live derived-fact pins / SDK / Linux clang runtime closure AND populate
+    /// `SharedCommandProbes` for start-time runners (`run`/`test`/`export`), while workspaces
+    /// without probe-dependent `MacroModule`s emit no row and pay zero overhead.
+    DepProbes = 11,
+}
+
+/// Virtual path name of the single `LeafKind::DepProbes` row in a pointer's leaf table.
+pub(crate) const DEP_PROBES_LEAF: &str = "wasm64-dep-probes";
+
+/// Records the active dependency-probe identity leaf onto `rows` (`POST_GRAPH_MACRO` so it
+/// invalidates certificates and ready wakes on drift without invalidating `Stood` graph read-back).
+pub(crate) fn record_dep_probes(rows: &mut Rows<'_>, id: ContentId) {
+    rows.push(LeafKind::DepProbes, POST_GRAPH_MACRO, DEP_PROBES_LEAF, None, id);
 }
 
 impl LeafKind {
@@ -1256,11 +1272,11 @@ impl<S: Stamps> Follow<S> {
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_with_sdk(cx, root, home, None, last, marked, served, None, frame)
+        self.follow_served_with_sdk(cx, root, home, None, last, marked, served, None, None, frame)
     }
 
-    /// [`Follow::follow_served`] carrying a lazy active SDK identity resolver for `cc-probe`
-    /// revalidation (invoked at most once, only if `last` contains a `cc-probe` leaf).
+    /// [`Follow::follow_served`] carrying lazy active SDK identity and dependency-probe resolvers
+    /// (each invoked at most once, only if `last` contains a `cc-probe` or `DepProbes` leaf).
     #[expect(clippy::too_many_arguments, reason = "sweep follow: each input one capability or proof")]
     pub(crate) fn follow_served_with_sdk<'f>(
         &self,
@@ -1272,9 +1288,10 @@ impl<S: Stamps> Follow<S> {
         marked: Option<&[bool]>,
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         sdk_digest: Option<&dyn Fn() -> Result<[u8; 32], CliError>>,
+        dep_probes: Option<&dyn Fn() -> Result<ContentId, CliError>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by_with_sdk::<Batched>(cx, root, home, home_path, last, marked, served, sdk_digest, frame)
+        self.follow_served_by_with_sdk::<Batched>(cx, root, home, home_path, last, marked, served, sdk_digest, dep_probes, frame)
     }
 
     /// A served script observation can depend on paths beyond its recorded name, including
@@ -1293,7 +1310,7 @@ impl<S: Stamps> Follow<S> {
         served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
-        self.follow_served_by_with_sdk::<W>(cx, root, home, None, last, marked, served, None, frame)
+        self.follow_served_by_with_sdk::<W>(cx, root, home, None, last, marked, served, None, None, frame)
     }
 
     #[expect(clippy::too_many_arguments, reason = "sweep follow: each input one capability or proof")]
@@ -1307,6 +1324,7 @@ impl<S: Stamps> Follow<S> {
         marked: Option<&[bool]>,
         mut served: Option<&mut crate::engine_script_reads::CheckoutSweep<'_, '_>>,
         sdk_digest: Option<&dyn Fn() -> Result<[u8; 32], CliError>>,
+        dep_probes: Option<&dyn Fn() -> Result<ContentId, CliError>>,
         frame: &'f Frame,
     ) -> Result<(Followed<'f>, u32), CliError> {
         let cx = cx.span("sweep: stat each path the last answer read, and read only what its stamp does not prove");
@@ -1340,7 +1358,7 @@ impl<S: Stamps> Follow<S> {
             let path = last.path(i);
             let old_state = old.state();
             let fact_file = old.kind == LeafKind::ScriptFile && path.starts_with(FACT_MOUNT);
-            if unmarked(i) && !fact_file && old.kind != LeafKind::MacroFiles {
+            if unmarked(i) && !fact_file && !matches!(old.kind, LeafKind::MacroFiles | LeafKind::DepProbes) {
                 now.push(old.kind, old.flags, path, old.stamp, old.id);
                 was.push(old_state);
                 continue;
@@ -1396,6 +1414,13 @@ impl<S: Stamps> Follow<S> {
                     let place = if own { blaze_build_script::served::InPackage::Root } else { blaze_build_script::served::InPackage::Beneath };
                     let (flags, stamp, id) = crate::macro_files::folder_now(&cx, root, &self.stamps, self.plant, path, place, Some(&old), frame)?;
                     (flags | post_graph, stamp, id)
+                }
+                LeafKind::DepProbes => {
+                    let id = match dep_probes {
+                        Some(resolve) => resolve()?,
+                        None => ContentId([0; 32]),
+                    };
+                    (old.flags, None, id)
                 }
                 LeafKind::ScriptFile if fact_file => (0, None, fact_files.read(path, erased.handle())?),
                 LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat | LeafKind::ScriptGit => {
@@ -1544,7 +1569,7 @@ impl<'f> Leaves<'f> {
             }
             start = end;
             let at = row_at + ROW * k;
-            if bytes[at] > LeafKind::ScriptGit as u8 {
+            if bytes[at] > LeafKind::DepProbes as u8 {
                 return Err(refuse(at, WireWhy::Tag(bytes[at])));
             }
             if bytes[at + 1] & !FLAGS != 0 {
@@ -1588,7 +1613,8 @@ impl<'f> Leaves<'f> {
             7 => LeafKind::ScriptFile,
             8 => LeafKind::ScriptListing,
             9 => LeafKind::ScriptStat,
-            _ => LeafKind::ScriptGit,
+            10 => LeafKind::ScriptGit,
+            _ => LeafKind::DepProbes,
         };
         let stamp = Stamp::get(&row[4..4 + Stamp::BYTES]);
         let mut id = [0; 32];
@@ -1778,7 +1804,7 @@ mod tests {
                 // No member proc-macro crate in this sweep's workspace: no such row is made.
                 LeafKind::MacroFiles | LeafKind::MacroFile | LeafKind::MacroFolder => (ABSENT, ContentId([0; 32])),
                 // No build script in this sweep's workspace: no such row is made.
-                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat | LeafKind::ScriptGit => (ABSENT, ContentId([0; 32])),
+                LeafKind::ScriptFile | LeafKind::ScriptListing | LeafKind::ScriptStat | LeafKind::ScriptGit | LeafKind::DepProbes => (ABSENT, ContentId([0; 32])),
             }
         };
         let sweep = |round: &str| -> Result<(std::vec::Vec<(LeafKind, String)>, u64), Broke> {
@@ -2138,7 +2164,7 @@ mod tests {
             // empty SDK digest and falsely accepting stale no-SDK probe records.
             let failing_sdk = || Err(CliError::Text { what: "simulated SDK resolution I/O failure" });
             let err = Follow { stamps: &model, plant: Plant::None }
-                .follow_served_with_sdk(&cx, &root, Some(&home), None, &last, None, None, Some(&failing_sdk), frame)
+                .follow_served_with_sdk(&cx, &root, Some(&home), None, &last, None, None, Some(&failing_sdk), None, frame)
                 .err()
                 .expect("SDK resolution failure must propagate during c-probe sweep");
             assert!(
