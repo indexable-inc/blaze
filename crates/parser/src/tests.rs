@@ -529,6 +529,8 @@ mod termination {
         }
         let _guard = stdx::panic_context::enter("Reparser::top_level_item".to_owned());
         Reparser::top_level_item().parse(input);
+        let _guard = stdx::panic_context::enter("Reparser::trait_item".to_owned());
+        Reparser::trait_item().parse(input);
     }
 
     fn run(done: &AtomicUsize) {
@@ -632,5 +634,50 @@ mod warm_parse {
         blaze_alloc_count::assert_at_most(0, "a large parse after a small one", || {
             TopEntryPoint::SourceFile.parse(&large)
         });
+    }
+}
+
+#[test]
+fn trait_item_reparser_handles_rust_2015_anonymous_and_pattern_params() {
+    use crate::{Edition, LexedStr, OutlineStep, Reparser, Step};
+
+    let error_count = |reparser: Reparser, edition: Edition, src: &str| -> usize {
+        let lexed = LexedStr::new(edition, src);
+        let input = lexed.to_input(edition);
+        let output = reparser.parse_outline(input.tokens());
+        output
+            .steps()
+            .filter(|step| matches!(step, OutlineStep::Step(Step::Error { .. })))
+            .count()
+    };
+
+    // Positive controls in Rust 2015 under Reparser::trait_item():
+    for src in [
+        "fn hash_word(&mut self, Self);",
+        "fn more(&self, u32, &[u8], &mut [u8], *const u8, *mut u8, (u32, u64), [u8; 4], Option<fn(i32) -> bool>, impl Copy, #[allow(unused)] u32);",
+        "fn paths(&self, std::fmt::Formatter<'_>, <Self as Trait>::Assoc, fn(x: i32) -> bool, impl Iterator<Item: Clone>);",
+        "fn pats(&self, (a, b): (u32, u64), [c, d]: [u8; 2], ref x: u32, ref mut y: u32, S { f: z }: S) {}",
+    ] {
+        let errs = error_count(Reparser::trait_item(), Edition::Edition2015, src);
+        assert_eq!(errs, 0, "2015 trait_item `{src}` unexpected {errs} errors");
+    }
+
+    // Large tuple pattern (>4096 tokens before `:`) must still be recognized as a pattern param.
+    let pat_elems = "a, ".repeat(2100);
+    let ty_elems = "u8, ".repeat(2100);
+    let large_pat = format!("fn big(&self, ({pat_elems}z): ({ty_elems}u8)) {{}}");
+    let large_errs = error_count(Reparser::trait_item(), Edition::Edition2015, &large_pat);
+    assert_eq!(large_errs, 0, "2015 trait_item >4096-token pattern param unexpected {large_errs} errors");
+
+    // Negative controls: 2018+ trait_item MUST reject anonymous parameters.
+    for edition in [Edition::Edition2018, Edition::Edition2021, Edition::Edition2024] {
+        let errs = error_count(Reparser::trait_item(), edition, "fn hash_word(&mut self, Self);");
+        assert!(errs > 0, "{edition:?} trait_item must reject anonymous param `Self`");
+    }
+
+    // Negative control: 2015 top_level_item MUST reject anonymous parameters.
+    for src in ["fn hash_word(&mut self, Self);", "fn bad(u32) {}"] {
+        let errs = error_count(Reparser::top_level_item(), Edition::Edition2015, src);
+        assert!(errs > 0, "2015 top_level_item `{src}` must reject anonymous param");
     }
 }

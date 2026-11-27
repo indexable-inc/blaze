@@ -2648,7 +2648,11 @@ impl<'n> Store<'n> {
         } else {
             super::item_site::item_marks(names, lib, h.text).ok().flatten()
         };
-        super::heads::with_lowered(names, lib, h.text, |v| {
+        let context = match receiver_self {
+            Some(ReceiverSelf::Trait) => blaze_lower::ItemContext::Trait,
+            _ => blaze_lower::ItemContext::TopLevel,
+        };
+        super::heads::with_lowered_in_context(names, lib, h.text, context, |v| {
             let mut r = Reader::new(names, keys, locals, tys.view(), counts, h.module, marks, *alloc);
             // The container's type parameters shadow items too: every name the head was read with.
             for &(name, _) in h.params.iter() {

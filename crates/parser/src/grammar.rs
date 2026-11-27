@@ -195,6 +195,12 @@ pub(crate) fn top_level_item<S: Sink>(p: &mut Parser<'_, S>) {
     items::item_or_macro(p, false, true, false);
 }
 
+/// One associated item of a `trait` block, as `items::trait_item_list` parses one (allowing
+/// Rust 2015 anonymous method parameters).
+pub(crate) fn trait_item<S: Sink>(p: &mut Parser<'_, S>) {
+    items::item_or_macro(p, false, false, true);
+}
+
 /// A `{ .. }` block alone, every body in it parsed: what [`reparser`] gives for a
 /// `BLOCK_EXPR`, for any sink.
 pub(crate) fn block<S: Sink>(p: &mut Parser<'_, S>) {

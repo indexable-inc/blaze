@@ -15,8 +15,9 @@ use blaze_surface::{Attr, AttrKind, Edition, Item, ItemDetail, ItemIndex, ItemKi
 use crate::columns::View;
 use crate::form::ROW_LOCAL_ITEM;
 use crate::{
-    Cfg, CfgAnswer, ItemWords, Lowered, Need, anon_const_key, body_key, lower_anon_const_expanding, lower_body_expanding,
-    lower_body_words_expanding, lower_signature, lower_signature_words, signature_key, ValueNames,
+    Cfg, CfgAnswer, ItemContext, ItemWords, Lowered, Need, ValueNames, anon_const_key, body_key, lower_anon_const_expanding,
+    lower_body_expanding_in_context, lower_body_words_expanding_in_context, lower_signature_in_context, lower_signature_words_in_context,
+    signature_key,
 };
 
 /// How deep item macros may expand into item macros (rustc's `recursion_limit` default).
@@ -417,6 +418,9 @@ struct Job<'a> {
     /// The file's item this text descends from, an index into [`Driver::spent`]; `None` for
     /// the file itself.
     root: Option<u32>,
+    /// Syntactic context for top-level items in this job's outline (`ItemContext::Trait` when
+    /// expanded from a macro call or attribute macro inside a `trait { ... }` block).
+    context: ItemContext,
 }
 
 /// An item macro's expansion as words: the parser's words (no `EOF` padding), each one's
@@ -662,7 +666,13 @@ impl<'a> Driver<'_, 'a> {
                         let words = item_words
                             .filter(|_| !item.range.in_expansion())
                             .map(|w| w.slice(item.range.raw(), self.alloc));
-                        jobs.push(Job { text: Some(s), words, source: Source::BodyItem, root: Some(self.root) });
+                        jobs.push(Job {
+                            text: Some(s),
+                            words,
+                            source: Source::BodyItem,
+                            root: Some(self.root),
+                            context: ItemContext::TopLevel,
+                        });
                         self.stats.body_items += 1;
                     }
                 }
@@ -699,6 +709,7 @@ impl<'a> Driver<'_, 'a> {
         words: Option<&ExpansionWords<'a>>,
         source: Source,
         root: Option<u32>,
+        default_context: ItemContext,
         expand: &mut dyn Expand,
         jobs: &mut AVec<'a, Job<'a>>,
     ) {
@@ -731,6 +742,13 @@ impl<'a> Driver<'_, 'a> {
                 }
                 _ => self.stats.items += 1,
             }
+            let context = match item.parent {
+                None => default_context,
+                Some(p) => match items.get(p.at()) {
+                    Some(parent) if matches!(parent.detail, ItemDetail::Trait) => ItemContext::Trait,
+                    _ => ItemContext::TopLevel,
+                },
+            };
             match item.kind() {
                 ItemKind::Use | ItemKind::ExternCrate | ItemKind::MacroRules | ItemKind::Macro2 => {
                     self.stats.not_lowered += 1;
@@ -744,7 +762,7 @@ impl<'a> Driver<'_, 'a> {
                 }
                 ItemKind::MacroCall => {
                     let own = words.map(|w| w.slice(item.range, self.alloc));
-                    self.macro_call(&at, own.as_ref(), source, expand, jobs);
+                    self.macro_call(&at, own.as_ref(), source, context, expand, jobs);
                     i = past;
                     continue;
                 }
@@ -754,7 +772,7 @@ impl<'a> Driver<'_, 'a> {
             // call, an attribute or a derive names is read.
             let own = words.map(|w| w.slice(item.range, self.alloc));
             // An attribute macro takes the item: its expansion is lowered in its place.
-            if self.attr_macro(&at, own.as_ref(), outline.attrs(item), source, expand, jobs) {
+            if self.attr_macro(&at, own.as_ref(), outline.attrs(item), source, context, expand, jobs) {
                 i = past;
                 continue;
             }
@@ -769,12 +787,12 @@ impl<'a> Driver<'_, 'a> {
                 }
                 _ => item_text,
             };
-            let key = signature_key(key_text, self.edition, has_body);
+            let key = signature_key(key_text, self.edition, has_body, context);
             let padded = own.as_ref().map(|w| w.padded(self.alloc));
             let item_words = own.as_ref().zip(padded.as_ref()).map(|(o, p)| ItemWords { words: p, ranges: &o.ranges });
             let result = match item_words {
-                None => lower_signature(item_text, self.edition, self.cfg, self.alloc),
-                Some(w) => lower_signature_words(item_text, w, self.edition, self.cfg, self.alloc),
+                None => lower_signature_in_context(item_text, self.edition, context, self.cfg, self.alloc),
+                Some(w) => lower_signature_words_in_context(item_text, w, self.edition, context, self.cfg, self.alloc),
             };
             self.stats.signatures += 1;
             let live = self.emit(&at, What::Signature, key, &result, &mut consts, None);
@@ -788,10 +806,10 @@ impl<'a> Driver<'_, 'a> {
                 self.derives(&at, own.as_ref(), outline.attrs(item), source, expand, jobs);
             }
             if has_body {
-                let key = body_key(item_text, self.edition);
+                let key = body_key(item_text, self.edition, context);
                 let result = match item_words {
-                    None => lower_body_expanding(item_text, self.edition, self.cfg, self.values, expand, self.alloc),
-                    Some(w) => lower_body_words_expanding(item_text, w, self.edition, self.cfg, self.values, expand, self.alloc),
+                    None => lower_body_expanding_in_context(item_text, self.edition, context, self.cfg, self.values, expand, self.alloc),
+                    Some(w) => lower_body_words_expanding_in_context(item_text, w, self.edition, context, self.cfg, self.values, expand, self.alloc),
                 };
                 self.stats.bodies += 1;
                 self.emit(&at, What::Body, key, &result, &mut consts, Some((jobs, own.as_ref())));
@@ -867,7 +885,7 @@ impl<'a> Driver<'_, 'a> {
             let path_mark = marks.as_ref().and_then(|m| m[n]);
             let mut out = BodyOut::new_in(self.alloc);
             let expansion = expand.derive(&u.path, path_mark, &derives.input, derives.facts(u), self.edition, &mut out);
-            self.queue_expansion(expansion, &out, depth, jobs);
+            self.queue_expansion(expansion, &out, depth, ItemContext::TopLevel, jobs);
         }
     }
 
@@ -880,6 +898,7 @@ impl<'a> Driver<'_, 'a> {
         own: Option<&ExpansionWords<'a>>,
         attrs: &[Attr],
         source: Source,
+        context: ItemContext,
         expand: &mut dyn Expand,
         jobs: &mut AVec<'a, Job<'a>>,
     ) -> bool {
@@ -961,7 +980,7 @@ impl<'a> Driver<'_, 'a> {
                                 Some(marks) => Some(marks),
                                 None => {
                                     self.stats.macro_calls_failed += 1;
-                                    self.queue_expansion(expansion, &out, depth, jobs);
+                                    self.queue_expansion(expansion, &out, depth, context, jobs);
                                     return true;
                                 }
                             },
@@ -981,7 +1000,7 @@ impl<'a> Driver<'_, 'a> {
                                     let path_mark = marks.as_ref().and_then(|m| m[n]);
                                     let mut derived = BodyOut::new_in(self.alloc);
                                     let made = expand.derive(&u.path, path_mark, &derives.input, derives.facts(u), self.edition, &mut derived);
-                                    self.queue_expansion(made, &derived, depth, jobs);
+                                    self.queue_expansion(made, &derived, depth, ItemContext::TopLevel, jobs);
                                 }
                             }
                             // A later `#[cfg]` false, a cfg atom not known yet or a malformed
@@ -989,7 +1008,7 @@ impl<'a> Driver<'_, 'a> {
                             Ok(None) | Err(_) => self.stats.macro_calls_unsupported += 1,
                         }
                     }
-                    self.queue_expansion(expansion, &out, depth, jobs);
+                    self.queue_expansion(expansion, &out, depth, context, jobs);
                     return true;
                 }
             }
@@ -1017,13 +1036,13 @@ impl<'a> Driver<'_, 'a> {
     }
 
     /// Queues an item macro's expansion, `out`, as a text of its own read from its words.
-    fn queue_expansion(&mut self, expansion: Expansion, out: &BodyOut<'_>, depth: u32, jobs: &mut AVec<'a, Job<'a>>) {
+    fn queue_expansion(&mut self, expansion: Expansion, out: &BodyOut<'_>, depth: u32, context: ItemContext, jobs: &mut AVec<'a, Job<'a>>) {
         match expansion {
             Expansion::Expanded => {
                 self.stats.macro_calls_expanded += 1;
                 self.spent[self.root as usize] += 1;
                 let (text, words) = ExpansionWords::of(out, self.alloc);
-                jobs.push(Job { text: Some(text), words: Some(words), source: Source::Expansion { depth }, root: Some(self.root) });
+                jobs.push(Job { text: Some(text), words: Some(words), source: Source::Expansion { depth }, root: Some(self.root), context });
             }
             Expansion::Unsupported => self.stats.macro_calls_unsupported += 1,
             Expansion::Failed => self.stats.macro_calls_failed += 1,
@@ -1032,7 +1051,15 @@ impl<'a> Driver<'_, 'a> {
 
     /// The item macro call `at`, expanded and queued. `own`, the item's words when a macro wrote
     /// it, gives the path's first word its mark.
-    fn macro_call(&mut self, at: &ItemRef<'_>, own: Option<&ExpansionWords<'a>>, source: Source, expand: &mut dyn Expand, jobs: &mut AVec<'a, Job<'a>>) {
+    fn macro_call(
+        &mut self,
+        at: &ItemRef<'_>,
+        own: Option<&ExpansionWords<'a>>,
+        source: Source,
+        context: ItemContext,
+        expand: &mut dyn Expand,
+        jobs: &mut AVec<'a, Job<'a>>,
+    ) {
         let ItemDetail::MacroCall { path: Some(path), input: Some(input) } = at.item.detail else {
             self.stats.macro_calls_failed += 1;
             return;
@@ -1054,7 +1081,7 @@ impl<'a> Driver<'_, 'a> {
         };
         let input_marks = InputMarks::new(input.start, &starts, &bytes);
         let expansion = expand.expand(path.of(text), path_mark, input.of(text), input_marks, self.edition, &mut *self.cfg, &mut out);
-        self.queue_expansion(expansion, &out, depth, jobs);
+        self.queue_expansion(expansion, &out, depth, context, jobs);
     }
 }
 
@@ -1072,11 +1099,11 @@ pub fn lower_file(
 ) -> FileStats {
     let mut d = Driver { edition, cfg, values, sink, alloc, stats: FileStats::default(), grown: String::new_in(alloc), spent: Vec::new_in(alloc), root: 0 };
     let mut jobs: AVec<'_, Job<'_>> = Vec::new_in(alloc);
-    jobs.push(Job { text: None, words: None, source: Source::File, root: None });
+    jobs.push(Job { text: None, words: None, source: Source::File, root: None, context: ItemContext::TopLevel });
     while let Some(job) = jobs.pop() {
         match &job.text {
-            None => d.text(text, None, job.source, job.root, expand, &mut jobs),
-            Some(owned) => d.text(owned.as_str(), job.words.as_ref(), job.source, job.root, expand, &mut jobs),
+            None => d.text(text, None, job.source, job.root, job.context, expand, &mut jobs),
+            Some(owned) => d.text(owned.as_str(), job.words.as_ref(), job.source, job.root, job.context, expand, &mut jobs),
         }
     }
     d.stats
