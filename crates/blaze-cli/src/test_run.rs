@@ -221,6 +221,11 @@ pub(crate) trait Zygotes {
     /// thread, D194): its allowance does not run then, so [`answer_due`] moves by it. Zero for
     /// a row not running and wherever code is made inside the run's own turn.
     fn parked(&self, row: u32) -> Nanos;
+    /// Whether the command received a termination signal (SIGINT/SIGTERM) and must stop starting
+    /// new tests, stop/reap only already-running children, and exit promptly.
+    fn terminated(&mut self) -> Result<bool, RunError> {
+        Ok(false)
+    }
 }
 
 /// The driver's answers for a run whose report counted.
@@ -573,6 +578,27 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
         self.end_zygote()
     }
 
+    /// Whether the underlying process pool observed a termination signal (SIGINT/SIGTERM).
+    pub(crate) fn terminated(&mut self) -> Result<bool, RunError> {
+        self.zygotes.terminated()
+    }
+
+    /// Stops and reaps only the currently-running children on command termination (SIGINT/SIGTERM),
+    /// returning how many active runs were stopped. Never starts new runs.
+    pub(crate) fn abort(&mut self) -> Result<u32, RunError> {
+        let stopped = u32::try_from(self.flights.len()).unwrap_or(u32::MAX);
+        self.flights.clear();
+        self.owed.clear();
+        self.timeouts.clear();
+        self.zygotes.clear();
+        if self.phase != Phase::Idle {
+            let killed = self.zygotes.kill();
+            self.reset();
+            killed?;
+        }
+        Ok(stopped)
+    }
+
     fn run(&mut self, suite: SuiteId, test: TestId, row: u32, deadline: Nanos) -> Result<(), RunError> {
         if self.suite != Some(suite) {
             self.end_zygote()?;
@@ -685,6 +711,10 @@ impl<'b, Z: Zygotes> Runner<'b, Z> {
             return Err(RunError::NothingOwed);
         }
         self.zygotes.wait(until)?;
+        if self.zygotes.terminated()? {
+            self.zygotes.clear();
+            return Ok(());
+        }
         let mut now = self.zygotes.now();
         let mut heard = self.zygotes.heard_len();
         let taken = self.take(suite, machine, answers, out, now);
