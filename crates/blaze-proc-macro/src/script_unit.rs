@@ -389,10 +389,11 @@ pub fn records_named(store: &Path, name: &str, version: &str) -> Result<Vec<(Pat
 /// (scripts proc_macro_modules build_scripts.rs `library`), the same digest of the same file.
 const SHIM: &[u8] = include_bytes!("../guest/script_process.rs");
 
-/// Current wasm build-script module identity header (`blaze build-script module 4`): bumped when
-/// wasm64 build-script compilation semantics change so stale cached wasm modules are never reused
-/// and never collide as `Ambiguous` with newly compiled ones.
-pub const WASM_MODULE_HEADER: &str = "blaze build-script module 4";
+/// Current wasm build-script module identity header (`blaze build-script module 5`): bumped when
+/// wasm64 build-script compilation semantics or codegen change (v5: `blaze-build` `bind_let_place`
+/// peeled-reference deref fix) so stale cached wasm modules are never reused and never collide as
+/// `Ambiguous` with newly compiled ones.
+pub const WASM_MODULE_HEADER: &str = "blaze build-script module 5";
 
 /// Current native host build-script module identity header (`blaze build-script module 3`): kept
 /// at v3 so existing Tier-2 native host records remain usable without re-bootstrapping while
@@ -982,20 +983,27 @@ mod tests {
         )
         .expect("write v3 identity");
 
-        // Stale v3 wasm module is not returned (forces recompile with current semantics).
-        let miss = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup v3");
-        assert_eq!(miss, None, "stale v3 wasm module must not match WASM_MODULE_HEADER ({})", super::WASM_MODULE_HEADER);
-
-        // Current v4 module placed alongside stale v3 matches uniquely (never Ambiguous).
-        let v4_dir = store.join("build-script/modules/fresh-v4");
+        // Stale v3 and v4 wasm modules are not returned (forces recompile with current semantics).
+        let v4_dir = store.join("build-script/modules/stale-v4");
         std::fs::create_dir_all(&v4_dir).expect("create v4 dir");
         std::fs::write(
             v4_dir.join("identity"),
-            format!("{}\nname demo\nversion 0.1.0\nfeatures \n{shim}\nbuilder blaze-wasm64\n", super::WASM_MODULE_HEADER),
+            format!("blaze build-script module 4\nname demo\nversion 0.1.0\nfeatures \n{shim}\nbuilder blaze-wasm64\n"),
         )
         .expect("write v4 identity");
-        let hit = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup v4");
-        assert_eq!(hit, Some(v4_dir));
+        let miss = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup v3/v4");
+        assert_eq!(miss, None, "stale v3/v4 wasm modules must not match WASM_MODULE_HEADER ({})", super::WASM_MODULE_HEADER);
+
+        // Current v5 module placed alongside stale v3 and v4 matches uniquely (never Ambiguous).
+        let v5_dir = store.join("build-script/modules/fresh-v5");
+        std::fs::create_dir_all(&v5_dir).expect("create v5 dir");
+        std::fs::write(
+            v5_dir.join("identity"),
+            format!("{}\nname demo\nversion 0.1.0\nfeatures \n{shim}\nbuilder blaze-wasm64\n", super::WASM_MODULE_HEADER),
+        )
+        .expect("write v5 identity");
+        let hit = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup v5");
+        assert_eq!(hit, Some(v5_dir));
 
         let _ = std::fs::remove_dir_all(&store);
     }
