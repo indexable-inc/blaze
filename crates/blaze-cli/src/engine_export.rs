@@ -65,19 +65,21 @@ const MAX_EXPORT_WORKERS: usize = 256;
 const EXPORT_PAR_MIN_MISSES: usize = 4;
 
 /// Per-worker frame and heap-epoch reset budgets during parallel export codegen. Because
-/// [`SharedLazyFront`] retains all frozen heads, constants, member indexes, and dep/toolchain
-/// typed bodies across worker epoch resets, each worker's local `Frame` + `Maker` resets cleanly
-/// at a small budget (~16–64 MiB/worker instead of 3.5 GiB/worker) without thrashing.
-const EXPORT_WORKER_FRAME_HEADROOM: usize = 64 << 20;
-const EXPORT_WORKER_FRAME_HARD_RESET_AT: usize = 128 << 20;
-const EXPORT_WORKER_FRAME_KEEP: usize = 8 << 20;
+/// [`SharedLazyFront`] retains frozen heads, constants, member indexes, and dep/toolchain typed
+/// bodies and [`ScopeRecords`] retains shared module verification bitmaps + `FileItems` outlines
+/// across worker epoch resets, each worker's local `Frame` + `Maker` keeps a warm working set
+/// (~512 MiB–1 GiB / 1M–2M `Store::tys`) without thrashing `BZFZ` head re-imports every few dozen
+/// functions, while still resetting cleanly before unbounded growth.
+const EXPORT_WORKER_FRAME_HEADROOM: usize = 512 << 20;
+const EXPORT_WORKER_FRAME_HARD_RESET_AT: usize = 1024 << 20;
+const EXPORT_WORKER_FRAME_KEEP: usize = 64 << 20;
 /// Soft/hard caps on distinct live lowered `tabled` bodies and `Store::tys` nodes retained in one
 /// worker epoch (sibling monomorphizations of the same `tabled` fn count as 1 live body and stay
 /// warm across the soft cap).
-const EXPORT_WORKER_MAX_LIVE_BODIES: usize = 128;
-const EXPORT_WORKER_HARD_LIVE_BODIES: usize = 256;
-const EXPORT_WORKER_MAX_STORE_TYS: usize = 131_072;
-const EXPORT_WORKER_HARD_STORE_TYS: usize = 262_144;
+const EXPORT_WORKER_MAX_LIVE_BODIES: usize = 2048;
+const EXPORT_WORKER_HARD_LIVE_BODIES: usize = 4096;
+const EXPORT_WORKER_MAX_STORE_TYS: usize = 1_048_576;
+const EXPORT_WORKER_HARD_STORE_TYS: usize = 2_097_152;
 const EXPORT_WORKER_SCRATCH: usize = 1 << 20;
 /// Per-worker in-flight inbox depth and work-stealing low-water mark: keeping 2–4 jobs in each
 /// worker's private inbox eliminates coordinator round-trip waits while keeping the bulk of queued
@@ -2393,7 +2395,8 @@ fn export_program<'f>(
     let maker_procs = crate::job_texts::MadeOnce::new(|| inputs.make());
     let procs = crate::job_texts::Procs::ByNeed(&maker_procs);
 
-    let crates = run_names::crates_of(cx, &found, owner, &mut *standing.store, &mut facts.bodies, &mut read, env, &pack_dirs, frame, heap).map_err(CliError::RunNames)?;
+    let scope_records = crate::front_load::ScopeRecords::new(found.snapshot(), blaze_world::crate_list::CrateGraph::len(list), heap);
+    let crates = run_names::crates_of_by_need(cx, &found, owner, &mut *standing.store, &mut facts.bodies, &mut read, &scope_records, env, &pack_dirs, frame, heap).map_err(CliError::RunNames)?;
     let names = run_names::names_in(cx, root, crates, procs, &seen, frame).map_err(CliError::RunNames)?;
 
     watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Roots));
