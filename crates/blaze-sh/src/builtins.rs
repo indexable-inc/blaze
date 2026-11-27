@@ -2069,6 +2069,50 @@ fn builtin_open<'a>(
     }
 }
 
+/// Pure `#![no_std]` structured file parser matching `open`'s format sniffer (JSON, JSONL,
+/// TOML / `Cargo.toml` / `Cargo.lock`, CSV, TSV), used for zero-Tab live autocomplete in
+/// pipelines like `open Cargo.lock | .package.version`.
+pub fn parse_open_preview<'a>(path: &str, bytes: &[u8], alloc: Alloc<'a>) -> Option<Value<'a>> {
+    let span = Span::new(0, 0);
+    let sniff = blaze_sniff::sniff_file(path, bytes);
+    match sniff.label {
+        "JSON" | "Node manifest" | "TS config" | "Nix lock" => {
+            from_json_bytes(bytes, span, alloc).ok()
+        }
+        "JSONL" => {
+            let text = core::str::from_utf8(bytes).ok()?;
+            let mut list = PVec::new(alloc);
+            for line in text.lines().take(64) {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if let Ok(val) = from_json_bytes(t.as_bytes(), span, alloc) {
+                    list.push(val);
+                }
+            }
+            if let Some(tbl) = Table::try_from_list(&list, alloc) {
+                Some(Value::Table(tbl))
+            } else if !list.is_empty() {
+                Some(Value::List(list))
+            } else {
+                None
+            }
+        }
+        "TOML" | "Cargo manifest" | "Cargo lock" | "uv lock" | "Blaze lock"
+        | "Clippy config" | "Rustfmt config" | "Python proj" | "Rust pin" => {
+            let text = core::str::from_utf8(bytes).ok()?;
+            from_toml_str(text, span, alloc).ok()
+        }
+        "CSV" | "TSV" => {
+            let text = core::str::from_utf8(bytes).ok()?;
+            let sep = if sniff.label == "TSV" { '\t' } else { ',' };
+            Some(Value::Table(parse_csv(text, false, sep, alloc)))
+        }
+        _ => None,
+    }
+}
+
 fn builtin_save<'a>(
     eval: &mut Evaluator<'a, '_>,
     args: EvalArgs<'a>,

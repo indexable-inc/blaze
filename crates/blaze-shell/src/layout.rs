@@ -5698,24 +5698,37 @@ fn layout_list(
         scene.text(x0, y0, "[]", theme::INK_4, false, false, clip_id);
         return m.ch;
     }
-    let show = if depth == 0 && block.folded && items.len() > TABLE_FOLD_ROWS {
+    let total_items = items.len();
+    let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
+    let is_scrollable = depth <= 1 && block.folded && total_items > TABLE_FOLD_ROWS;
+    let visible_items = if is_scrollable {
         TABLE_FOLD_ROWS
     } else {
-        items.len()
+        total_items
     };
-    let idx_w = (items.len().to_string().len().max(2) as f32 * m.cw + 16.0).max(32.0);
-    let val_x = x0 + idx_w;
-    let max_val_cols = ((width - idx_w) / m.cw).floor().max(12.0) as usize;
+    let max_first_item = total_items.saturating_sub(visible_items);
+    let max_scroll_y = max_first_item as f32 * row_h;
+    let first_item = if is_scrollable {
+        ((block.table_scroll_y.clamp(0.0, max_scroll_y) / row_h).round() as usize)
+            .min(max_first_item)
+    } else {
+        0
+    };
 
-    let row_h = m.ch + TABLE_ROW_PAD_Y * 2.0;
+    let sb_reserve = if is_scrollable && max_first_item > 0 { 14.0 } else { 0.0 };
+    let content_w = (width - sb_reserve).max(80.0);
+    let idx_w = (total_items.to_string().len().max(2) as f32 * m.cw + 16.0).max(32.0);
+    let val_x = x0 + idx_w;
+    let max_val_cols = ((content_w - idx_w) / m.cw).floor().max(12.0) as usize;
+
     let mut cur_y = y0;
-    for i in 0..show {
+    for i in first_item..(first_item + visible_items) {
         scene.text(x0, cur_y + TABLE_ROW_PAD_Y, i.to_string(), theme::INK_4, false, false, clip_id);
         if let Some(val) = items.get(i) {
             let raw = format_value_cell_at(val, Some(now_ns));
             let txt = truncate_chars(&raw, max_val_cols);
             scene.text(val_x, cur_y + TABLE_ROW_PAD_Y, &txt, theme::value_color(val), false, false, clip_id);
-            let cell_rect = HitRect::new(val_x, cur_y, x0 + width, cur_y + row_h);
+            let cell_rect = HitRect::new(val_x, cur_y, x0 + content_w, cur_y + row_h);
             if !push_exact_value_hover(scene, cell_rect, val, now_ns, clip_id) && txt != raw {
                 scene.push_hover_clipped(
                     cell_rect,
@@ -5729,12 +5742,56 @@ fn layout_list(
         }
         cur_y += row_h;
     }
-    if depth == 0 && items.len() > TABLE_FOLD_ROWS {
+
+    // Crisp macOS-style minimal scrollbar track + thumb when scrolling a folded list in place.
+    if is_scrollable && max_first_item > 0 {
+        let track_h = (cur_y - y0).max(24.0);
+        let sb_x0 = x0 + content_w + 5.0;
+        let sb_w = 3.5;
+        scene.round_rect(
+            sb_x0,
+            y0,
+            sb_x0 + sb_w,
+            y0 + track_h,
+            1.75,
+            theme::BG_TRACK,
+            0.0,
+            [0.0; 4],
+            clip_id,
+        );
+        let frac = (visible_items as f32 / total_items as f32).clamp(0.12, 1.0);
+        let thumb_h = (track_h * frac).max(18.0);
+        let pos_frac = first_item as f32 / max_first_item as f32;
+        let thumb_y0 = y0 + (track_h - thumb_h) * pos_frac;
+        scene.over_round_rect(
+            sb_x0,
+            thumb_y0,
+            sb_x0 + sb_w,
+            thumb_y0 + thumb_h,
+            1.75,
+            theme::INK_4,
+            clip_id,
+        );
+        scene.push_scroll_region(
+            HitRect::new(x0, y0, x0 + width, cur_y),
+            clip_id,
+            block.id,
+            max_scroll_y,
+            0.0,
+        );
+    }
+
+    if depth <= 1 && total_items > TABLE_FOLD_ROWS {
         cur_y += 4.0;
         let lbl = if block.folded {
-            format!("+ {} more items", items.len() - TABLE_FOLD_ROWS)
+            format!(
+                "items {}–{} of {} · scroll or show all",
+                first_item + 1,
+                first_item + visible_items,
+                total_items
+            )
         } else {
-            format!("− collapse to {TABLE_FOLD_ROWS} items")
+            format!("− collapse to {TABLE_FOLD_ROWS}-item scrollable view")
         };
         let pw = lbl.chars().count() as f32 * m.cw + 8.0;
         scene.text(val_x, cur_y, lbl, theme::INK_3, false, false, clip_id);

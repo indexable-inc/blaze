@@ -22,6 +22,10 @@ use crate::value::{Record, Table, Value};
 /// Marker key present on records returned by [`infer_schema_value`].
 pub const SCHEMA_MARKER_KEY: &str = "__blaze_schema";
 
+/// Hidden O(1) CoW reference to the inspected subject value so running `open Cargo.lock | schema`
+/// (or `schema $lock`) binds `$_` to the underlying data rather than the schema meta-card.
+pub const SCHEMA_SUBJECT_KEY: &str = "__blaze_schema_subject";
+
 const MAX_DEPTH: usize = 4;
 const MAX_FIELDS: usize = 128;
 const MAX_SAMPLE_ROWS: usize = 4096;
@@ -141,6 +145,7 @@ pub fn infer_schema_value<'a>(value: &Value<'a>, alloc: Alloc<'a>) -> Value<'a> 
 
     let mut out = Record::new(alloc);
     out.insert(Rc::from_str_in(SCHEMA_MARKER_KEY, alloc), Value::Bool(true));
+    out.insert(Rc::from_str_in(SCHEMA_SUBJECT_KEY, alloc), value.share());
     out.insert(Rc::from_str_in("kind", alloc), Value::string(kind_str, alloc));
     out.insert(Rc::from_str_in("summary", alloc), Value::string(summary.as_str(), alloc));
     out.insert(Rc::from_str_in("rows", alloc), Value::Int(root_count));
@@ -630,9 +635,15 @@ fn profile_value_series<'a>(
             }
             Value::List(items) => {
                 list_count += 1;
-                list_min_len = list_min_len.min(items.len());
-                list_max_len = list_max_len.max(items.len());
-                list_sum_len += items.len();
+                let len = items.len();
+                list_min_len = list_min_len.min(len);
+                list_max_len = list_max_len.max(len);
+                list_sum_len += len;
+                let lf = len as f64;
+                nums.push(lf);
+                num_min = num_min.min(lf);
+                num_max = num_max.max(lf);
+                num_sum += lf;
                 if list_elem_ty.is_none() && !items.is_empty() {
                     list_elem_ty = Some(infer_list_elem_type(items));
                 }
@@ -733,12 +744,17 @@ fn profile_value_series<'a>(
     {
         let short = truncate_prefix_display(cp.as_str(), 20);
         let _ = write!(pattern, "{short}...");
-    } else if present >= 3 && !distinct_overflow && distinct.len() <= 6 && !matches!(primary_ty, Some("bool")) {
+    } else if primary_ty == Some("list") && list_count > 0 {
+        let _ = write!(pattern, "{list_min_len}..{list_max_len}");
+    } else if present >= 3
+        && !distinct_overflow
+        && !distinct.is_empty()
+        && distinct.len() <= 6
+        && !matches!(primary_ty, Some("bool"))
+    {
         pattern.push_str("enum");
     } else if primary_ty == Some("bool") && present > 0 {
         pattern.push_str("bool");
-    } else if primary_ty == Some("list") && list_count > 0 {
-        let _ = write!(pattern, "{list_min_len}..{list_max_len}");
     } else if !distinct_overflow && distinct.len() == present && present >= 4 {
         pattern.push_str("unique");
     }
