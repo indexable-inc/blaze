@@ -1653,8 +1653,10 @@ pub(crate) type Subjects = [Subject];
 /// 4: the cell also holds the item's enclosing module key, so one physical file mounted in
 /// multiple distinct modules of the same unit (`#[path = "..."]`) freezes distinct cells per mount.
 const HEAD_CELL_DOMAIN: &str = "blaze-cli engine head cell 4";
-/// The domain of a head's item, of no unit ([`head_item`]).
-const HEAD_ITEM_DOMAIN: &str = "blaze-cli engine head item 1";
+/// The domain of a head's item, of no unit ([`head_item`]). 2: includes the crate-relative module
+/// path so two `#[path]` mounts of one file within one unit count as distinct items while still
+/// sharing identity across units (lib vs test) of the same package.
+const HEAD_ITEM_DOMAIN: &str = "blaze-cli engine head item 2";
 /// The domain of a head task's source ([`plan_items`]). 2: its payload holds each run's cell
 /// ([`WorkedHead::payload`]), so no record of the old form is read by its key. 3: one run a
 /// (unit, cell), each frozen under its unit's records ([`HeadsStage::run_items`]).
@@ -1708,10 +1710,18 @@ pub(crate) fn head_cell(want: Want, module: blaze_id::ItemKey, item: &str, membe
 /// holds the item's enclosing `module` key, so one file mounted in multiple modules of the same
 /// unit (`#[path = "..."]`) gets one distinct cell per module mount while duplicate heads in the
 /// same module still collide and are refused.
+fn hash_head_text(h: &mut blaze_ids::Hasher, want: Want, item: &str, member: Option<&str>, written: Option<Written>, part: Cell) {
+    h.update(&want_bytes(want)[..1]).part(item.as_bytes()).opt_part(member).update(&part.0);
+    if let Some(written) = written {
+        h.update(&written.steps.0).update(&written.from_entry.to_le_bytes());
+    }
+}
+
 fn head_cell_written(want: Want, module: blaze_id::ItemKey, item: &str, member: Option<&str>, written: Option<Written>, part: Cell) -> Cell {
     let bytes = want_bytes(want);
     let mut h = blaze_ids::Hasher::new(HEAD_CELL_DOMAIN);
-    h.update(&bytes[1..9]).update(&module.0.0).update(&head_item(want, item, member, written, part).0);
+    h.update(&bytes[1..9]).update(&module.0.0);
+    hash_head_text(&mut h, want, item, member, written, part);
     let digest = h.finish();
     let mut cell = [0u8; 16];
     cell.copy_from_slice(&digest.0[..16]);
@@ -1729,16 +1739,15 @@ struct Written {
     from_entry: u32,
 }
 
-/// A head's item as an entry's text names it, of no unit: the want's kind, the item's name, an
-/// impl fn's name, the part, and where a macro wrote it ([`Written`]). Two units' cells of one
-/// item ([`head_cell`]) share it; the profile counts the items held by two units and more by it
-/// ([`UnitCounts`]).
-fn head_item(want: Want, item: &str, member: Option<&str>, written: Option<Written>, part: Cell) -> Cell {
+/// A head's item as its module and entry text name it, of no unit: the crate-relative module path
+/// (`module_path`), the want's kind, the item's name, an impl fn's name, the part, and where a
+/// macro wrote it ([`Written`]). Two units' cells of one mounted item ([`head_cell`]) share it
+/// while two `#[path]` mounts in distinct modules of the same unit get distinct identities; the
+/// profile counts frozen cells and items held by 2+ units by it ([`UnitCounts`]).
+fn head_item(want: Want, module_path: Option<&str>, item: &str, member: Option<&str>, written: Option<Written>, part: Cell) -> Cell {
     let mut h = blaze_ids::Hasher::new(HEAD_ITEM_DOMAIN);
-    h.update(&want_bytes(want)[..1]).part(item.as_bytes()).opt_part(member).update(&part.0);
-    if let Some(written) = written {
-        h.update(&written.steps.0).update(&written.from_entry.to_le_bytes());
-    }
+    h.opt_part(module_path);
+    hash_head_text(&mut h, want, item, member, written, part);
     let digest = h.finish();
     let mut cell = [0u8; 16];
     cell.copy_from_slice(&digest.0[..16]);
@@ -3478,7 +3487,7 @@ fn file_rows<'n>(
                 entry,
                 file: subject.slot,
                 cell: head_cell_written(want, module, name, member, written, WHOLE),
-                item: head_item(want, name, member, written, WHOLE),
+                item: head_item(want, NamesSource::module_path(records, module), name, member, written, WHOLE),
                 want,
                 body_holds_items: body_holds_items(&outline, ItemIndex(top), cover),
                 name,
@@ -3607,10 +3616,10 @@ impl<'r> ItemJob<'r, '_> {
 struct WorkedHead<'p> {
     out: ContentId,
     defines: SVec<'p, (Cell, ContentId)>,
-    /// Each cell's item ([`head_item`]) and its unit's crate prefix, as `defines` lists them:
-    /// what the profile counts by. Over the phase's `Sync` handle: it crosses back from the
-    /// worker and is unmapped when the phase ends.
-    items: SVec<'p, (Cell, [u8; 8])>,
+    /// Each cell's item ([`head_item`]), its cell ([`head_cell`]), and its unit's crate prefix,
+    /// as `defines` lists them: what the profile counts by. Over the phase's `Sync` handle: it
+    /// crosses back from the worker and is unmapped when the phase ends.
+    items: SVec<'p, (Cell, Cell, [u8; 8])>,
     reads: SVec<'p, CellId>,
     /// Each cell's want (front2 head.rs `want_bytes`), its cell ([`head_cell`], 16 bytes), its
     /// frozen bytes' length (u32 LE) and the frozen bytes, in cell order. The row's record adds
@@ -4724,10 +4733,11 @@ impl HeadsStage {
                 }
                 u32::try_from(said.len()).unwrap_or(u32::MAX)
             };
-            // The counts: each (item, unit) once; an item frozen under 2+ units counted shared.
+            // The counts: each (item, cell, unit) once so multiple module mounts in one unit each
+            // count as a frozen cell; an item frozen under 2+ distinct units is counted shared.
             let mut items = one.items;
             if items.len() == 1
-                && let Some(&(_, unit)) = items.first()
+                && let Some(&(_, _, unit)) = items.first()
             {
                 counts.frozen = counts.frozen.saturating_add(1);
                 counts.items = counts.items.saturating_add(1);
@@ -4740,11 +4750,12 @@ impl HeadsStage {
                 counts.frozen = counts.frozen.saturating_add(u32::try_from(items.len()).unwrap_or(u32::MAX));
                 for run in items.chunk_by(|a, b| a.0 == b.0) {
                     counts.items = counts.items.saturating_add(1);
-                    if run.len() > 1 {
+                    let first_unit = run.first().map(|entry| entry.2);
+                    if run.iter().any(|entry| Some(entry.2) != first_unit) {
                         counts.shared = counts.shared.saturating_add(1);
                     }
                 }
-                for &(_, unit) in items.iter() {
+                for &(_, _, unit) in items.iter() {
                     if !units.contains(&unit) {
                         units.push(unit);
                     }
@@ -5305,7 +5316,7 @@ fn heads_of<'p>(
                 while cur.at_head < cur.mine.len() {
                     let Some(head) = cur.mine.get(cur.at_head) else { break };
                     let (cell, want) = (&head.cell, &head.want);
-                    cur.worked.items.push((head.item, job.prefix));
+                    cur.worked.items.push((head.item, *cell, job.prefix));
                     // An ADT's constructors, whether its head freezes or not: a failed head's are listed
                     // as not run ([`ctor_facts`]), never left without a row's word.
                     if let Want::Adt(lib) = *want {

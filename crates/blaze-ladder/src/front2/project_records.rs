@@ -255,6 +255,10 @@ pub enum ChainError<'n> {
     /// Two bodies of one file have one chain (rule 21, keys-cover-every-input): the chain
     /// misses what tells them apart.
     Collision { file: u32, chain: ContentId, first: BodyRef<'n>, second: BodyRef<'n> },
+    /// A singular lookup by `(file, chain)` matched multiple distinct bodies at the same outline
+    /// entry (one physical file mounted into multiple modules via `#[path = "..."]`): callers
+    /// that handle multi-mounted files must use [`ByChain::all`].
+    Ambiguous { file: u32, chain: ContentId, first: BodyRef<'n>, second: BodyRef<'n> },
 }
 
 impl core::fmt::Display for ChainError<'_> {
@@ -265,6 +269,9 @@ impl core::fmt::Display for ChainError<'_> {
             ChainError::NotItsKind { file, entry, found, body } => write!(f, "file {file} of the program's crate: entry {entry} of its outline is {found:?}, not the item of the body {body:?}"),
             ChainError::Collision { file, chain, first, second } => {
                 write!(f, "file {file} of the program's crate: the bodies {first:?} and {second:?} have one item chain {chain:?} (rule keys-cover-every-input)")
+            }
+            ChainError::Ambiguous { file, chain, first, second } => {
+                write!(f, "file {file} of the program's crate: item chain {chain:?} matches multiple mounted bodies ({first:?} and {second:?}); use `ByChain::all`")
             }
         }
     }
@@ -281,11 +288,17 @@ pub struct ByChain<'n> {
 }
 
 impl<'n> ByChain<'n> {
-    /// The first body of file `file` (its index in the program's own crate) whose outline entry
-    /// has the chain `chain`. When one file is mounted in multiple modules of the same crate
-    /// (`#[path = "..."]`), use [`ByChain::all`] to visit every mount's body at that entry.
-    pub fn get(&self, file: u32, chain: ContentId) -> Option<BodyRef<'n>> {
-        self.all(file, chain).next()
+    /// The unique body of file `file` (its index in the program's own crate) whose outline entry
+    /// has the chain `chain`. Returns `Err(ChainError::Ambiguous { .. })` when multiple module
+    /// mounts of `file` (`#[path = "..."]`) share that entry; use [`ByChain::all`] to visit every
+    /// mount's body.
+    pub fn get(&self, file: u32, chain: ContentId) -> Result<Option<BodyRef<'n>>, ChainError<'n>> {
+        let mut iter = self.all(file, chain);
+        let Some(first) = iter.next() else { return Ok(None) };
+        if let Some(second) = iter.next() {
+            return Err(ChainError::Ambiguous { file, chain, first, second });
+        }
+        Ok(Some(first))
     }
 
     /// Every body of file `file` (its index in the program's own crate) whose outline entry has
@@ -489,7 +502,16 @@ mod tests {
             out
         };
         assert_eq!(got.as_slice(), &[body_a, body_b]);
-        assert_eq!(by.get(0, chain), Some(body_a));
+        // Negative control: singular lookup on multi-mounted `(file, chain)` must reject ambiguity.
+        assert_eq!(by.get(0, chain), Err(ChainError::Ambiguous { file: 0, chain, first: body_a, second: body_b }));
+
+        // Positive: singular lookup on unique `(file, chain)` succeeds.
+        let unique_chain = ContentId([8u8; 32]);
+        let mut single = AVec::new_in(alloc);
+        single.push((0, unique_chain, 2, body_a));
+        let by_single = by_chain_of(single, 0, alloc).expect("unique entry must succeed");
+        assert_eq!(by_single.get(0, unique_chain), Ok(Some(body_a)));
+        assert_eq!(by_single.get(0, chain), Ok(None));
 
         // Negative 1: two DIFFERENT outline entries sharing one (file, chain) must collide.
         let mut diff_entry = AVec::new_in(alloc);

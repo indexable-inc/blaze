@@ -8945,6 +8945,8 @@ fn run_stretch_with<'d, 's, 'a, 'b, 'f, 'r, 'm, R: ?Sized + CellDigests>(
                                         && found.iter().any(|prev| prev.rule == one_found.rule && prev.at == one_found.at && prev.message == one_found.message);
                                     if !dup_block && !dup_exact {
                                         found.push(one_found);
+                                    } else {
+                                        findings = findings.saturating_sub(1);
                                     }
                                 }
                                 Ok(None) => {}

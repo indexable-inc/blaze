@@ -575,6 +575,9 @@ fn last_segment(path: &str) -> &str {
 pub(super) enum NoRoot {
     /// No body is listed at the entry's chain, and it is not the root's `fn main`.
     NoBody,
+    /// Multiple mounted bodies share the entry's `(file, chain)` (e.g. a `#[path]` file mounted
+    /// in multiple modules); a singular root lookup cannot pick one silently.
+    Ambiguous,
     /// The entry is the root file's top-level `fn main`, no body is listed at its chain, and
     /// front2 finds no root `main` (run_entry.rs `root_main`).
     NoRootMain(EntryRefusal),
@@ -590,6 +593,7 @@ impl NoRoot {
     pub(super) fn cause(&self) -> &'static str {
         match self {
             NoRoot::NoBody => "front2 lists no body for it",
+            NoRoot::Ambiguous => "multiple module mounts share this item chain",
             NoRoot::NoRootMain(_) => "the root's `fn main` was replaced by an attribute and front2 finds no root `main`",
             NoRoot::RootMainUnplaced => "the root's `fn main` was replaced by an attribute and the root `main` has no place in the records",
             NoRoot::RootMainElsewhere { .. } => "the root's `fn main` was replaced by an attribute and the root `main` is listed at another item",
@@ -601,6 +605,7 @@ impl fmt::Display for NoRoot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NoRoot::NoBody => write!(f, "front2 lists no body at this item (rule: blaze-cli body_types/covered.rs)"),
+            NoRoot::Ambiguous => write!(f, "multiple module mounts share this item's `(file, chain)` (rule: blaze-cli body_types/covered.rs)"),
             NoRoot::NoRootMain(why) => write!(f, "this is the root's `fn main`, which an attribute replaced, and the expansion's `main` is not found: {why} (rule: blaze-cli body_types/covered.rs)"),
             NoRoot::RootMainUnplaced => write!(f, "this is the root's `fn main`, which an attribute replaced; the root `main` has no place in the records (rule: blaze-cli body_types/covered.rs)"),
             NoRoot::RootMainElsewhere { file } => write!(
@@ -625,12 +630,16 @@ pub(super) fn root_of<'n>(
     text: &str,
     root_file: bool,
 ) -> Result<Root<'n>, NoRoot> {
-    if let Some(body) = by_chain.get(file, chain) {
-        return match mine.iter().find(|l| l.body == body) {
-            Some(l) => Ok(Root::Written(*l)),
-            // `by_chain` is made from `mine` (body_types.rs `checker`): never apart.
-            None => Err(NoRoot::NoBody),
-        };
+    match by_chain.get(file, chain) {
+        Ok(Some(body)) => {
+            return match mine.iter().find(|l| l.body == body) {
+                Some(l) => Ok(Root::Written(*l)),
+                // `by_chain` is made from `mine` (body_types.rs `checker`): never apart.
+                None => Err(NoRoot::NoBody),
+            };
+        }
+        Err(_) => return Err(NoRoot::Ambiguous),
+        Ok(None) => {}
     }
     let root_main_entry = root_file && item.parent.is_none() && matches!(item.kind(), ItemKind::Function) && crate::item_name::shown_name(item, text) == "main";
     if !root_main_entry {

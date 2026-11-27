@@ -188,6 +188,15 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
         for (file, chain, body) in rows.iter() {
             let found: Vec<_> = world.chains().unwrap_or_else(|e| panic!("{label}: {e}")).all(*file, *chain).collect();
             assert!(found.contains(body), "{label}: the body at file {file} chain {chain:?} over the solved names: got {found:?}");
+            let singular = world.body_by_chain(*file, *chain);
+            if found.len() == 1 {
+                assert_eq!(singular, Ok(Some(*body)), "{label}: unique body at file {file} chain {chain:?} over solved names");
+            } else {
+                assert!(
+                    matches!(singular, Err(ChainError::Ambiguous { file: f, chain: c, .. }) if f == *file && c == *chain),
+                    "{label}: ambiguous multi-mount singular lookup must return ChainError::Ambiguous over solved names: got {singular:?}"
+                );
+            }
         }
         assert_eq!(rows.len() + unplaced as usize, listed.len(), "{label}: every listed body is indexed or counted unplaced");
         // The unplaced bodies by name and place: a body with no outline entry must be one a macro
@@ -267,6 +276,15 @@ fn compare(label: &str, files: &[(String, String)]) -> Compared {
     for (file, chain, body) in rows.iter() {
         let found: Vec<_> = world.chains().unwrap_or_else(|e| panic!("{label}: {e}")).all(*file, *chain).collect();
         assert!(found.contains(body), "{label}: the body at file {file} chain {chain:?} over records: got {found:?}");
+        let singular = world.body_by_chain(*file, *chain);
+        if found.len() == 1 {
+            assert_eq!(singular, Ok(Some(*body)), "{label}: unique body at file {file} chain {chain:?} over records");
+        } else {
+            assert!(
+                matches!(singular, Err(ChainError::Ambiguous { file: f, chain: c, .. }) if f == *file && c == *chain),
+                "{label}: ambiguous multi-mount singular lookup must return ChainError::Ambiguous over records: got {singular:?}"
+            );
+        }
     }
     let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
     assert!(errors.is_empty(), "{label}: the records filed {errors:?}");

@@ -346,6 +346,22 @@ mod tests {
 
     let (_, cold_text, cold) = run(&io, 1, false, HeadUnits::Each);
     all_clean("multi_mounted_path_cold", &cold_text, &cold, 1);
+    // Both module mounts (`a::*` and `b::*`) in each unit must be counted separately in
+    // `UnitCounts::frozen` and `UnitCounts::items` (matching `once.frozen` cell-for-cell:
+    // 5 heads in shared.rs * 2 mounts * 2 units = 20, plus lib.rs's Sized/Copy/use_both/check_both).
+    assert_eq!(
+        cold.seeds.units.frozen,
+        cold.seeds.once.frozen,
+        "UnitCounts::frozen must count every frozen cell across all module mounts:\n{}",
+        heads_lines(&cold)
+    );
+    assert!(
+        cold.seeds.units.items >= 12 && cold.seeds.units.frozen >= 23,
+        "expected both mounts' items and cells counted separately (frozen={}, items={}):\n{}",
+        cold.seeds.units.frozen,
+        cold.seeds.units.items,
+        heads_lines(&cold)
+    );
     let (bad, _) = head_reads_of_bodies(&io);
     assert!(bad.is_empty(), "cold: every body head read is defined by its head task: {bad:?}");
 
@@ -358,6 +374,52 @@ mod tests {
     assert_eq!(warm.seeds.not_put.member, 0, "warm edit: every member head taken from table:\n{}", heads_lines(&warm));
     let (bad, _) = head_reads_of_bodies(&io);
     assert!(bad.is_empty(), "warm edit: every body head read is defined by its head task: {bad:?}");
+}
+
+/// When two `#[path = "shared.rs"]` module mounts emit the exact same diagnostic on one shared
+/// body, `dup_exact` deduplicates the displayed finding and reconciles `Outcome::made`'s
+/// `findings` count so the stored row's `findings` equals the displayed error count (1, not 2).
+#[test]
+fn multi_mounted_path_deduped_finding_count_matches_displayed() {
+    let io = Io::simulated(SimWorld::new(41, Limits::USUAL));
+    write(&io, "Cargo.toml", "[package]\nname = \"multi_diag\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write(
+        &io,
+        "src/lib.rs",
+        "#[path = \"shared.rs\"]\npub mod a;\n#[path = \"shared.rs\"]\npub mod b;\n",
+    );
+    write(&io, "src/shared.rs", "pub fn bad() -> u8 {\n    \"wrong\"\n}\n");
+
+    let (ids, text, _) = run(&io, 1, false, HeadUnits::Each);
+    let errors = error_lines(&text);
+    assert_eq!(errors.len(), 1, "two identical mounts must display 1 deduplicated error:\n{text}");
+    assert_eq!(ids.len(), 1, "displayed finding ids must match: {ids:?}");
+
+    // Inspect the stored `BodyCheck` rows to confirm `Done::findings` matches the retained count.
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+    let fs = io.need_fs().expect("fs");
+    let root = fs.open_dir(&cx, &Path::new("ws").expect("ws")).expect("open ws");
+    let err = io.need_err().expect("err");
+    let host = io.need_host().expect("host");
+    let mut rng = io.need_rng().expect("rng");
+    let mut phases = super::engine_check_tests::boxed(|| Phases::new(io.need_clock().expect("clock")));
+    let body_findings = crate::engine_why::with_kept(&cx, &fs, &host, &mut rng, &root, &opts(&io, 1, false), &mut phases, &err, |kept| {
+        kept.answer
+            .rows
+            .iter()
+            .filter(|(name, _)| name.kind == blaze_drive::Kind::BodyCheck)
+            .map(|(_, row)| row.findings)
+            .collect::<std::vec::Vec<_>>()
+    })
+    .expect("with_kept")
+    .expect("stored answer");
+    assert!(!body_findings.is_empty(), "expected at least one stored BodyCheck row");
+    let nonzero: std::vec::Vec<u32> = body_findings.into_iter().filter(|&n| n > 0).collect();
+    assert!(!nonzero.is_empty(), "expected non-zero findings row for `bad`");
+    assert!(
+        nonzero.iter().all(|&n| n == 1),
+        "each stored BodyCheck row for deduplicated `bad` must record findings == 1 (matching displayed count), got {nonzero:?}"
+    );
 }
 
 /// Negative control: two duplicate items with identical `(module, want_kind, name)` under one
