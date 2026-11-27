@@ -357,8 +357,11 @@ struct Strings<'b, 's> {
 }
 
 impl<'b, 's> Strings<'b, 's> {
-    fn new(alloc: Alloc<'b>) -> Strings<'b, 's> {
-        Strings { bytes: RecordBytes::new_in(alloc), seen: HashMap::new_in(alloc) }
+    fn with_capacity(bytes_cap: usize, entries_cap: usize, alloc: Alloc<'b>) -> Strings<'b, 's> {
+        Strings {
+            bytes: RecordBytes::with_capacity_in(bytes_cap, alloc),
+            seen: HashMap::with_capacity_in(entries_cap, alloc),
+        }
     }
 
     fn put(&mut self, s: &'s str) -> Result<(u32, u32), ItemsRecordError> {
@@ -646,13 +649,19 @@ pub fn encode_with<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, hea
 }
 
 pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>, heads: &H, include_grain: bool, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, ItemsRecordError> {
-    let mut strings: Strings<'b, 'n> = Strings::new(alloc);
     let tables = &names.tables;
+    let str_entries_est = names
+        .files
+        .len()
+        .saturating_mul(2)
+        .saturating_add(tables.texts.len() / 2)
+        .saturating_add(64);
+    let mut strings: Strings<'b, 'n> = Strings::with_capacity(str_entries_est.saturating_mul(24), str_entries_est, alloc);
 
     // Files, by index; expansions that made a text, by call key. A file row keeps its
     // surface digest and paths. Its whole digest and length are supplied by FileItems when
     // a reader asks for the file.
-    let mut file_rows = RecordBytes::new_in(alloc);
+    let mut file_rows = RecordBytes::with_capacity_in(names.files.len().saturating_mul(FILE_ROW).next_multiple_of(ALIGN), alloc);
     for f in names.files.iter() {
         let (path, shown) = (strings.put(f.package.as_str())?, strings.put(f.shown)?);
         file_rows.extend_from_slice(&f.outline.surface().0);
@@ -663,13 +672,14 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     if names.files.len() >= EXPANSION as usize {
         return Err(ItemsRecordError::TooBig { what: "a crate's files" });
     }
-    let mut calls = AVec::new_in(alloc);
+    let made_calls = names.expansions.values().filter(|e| e.made.is_some()).count();
+    let mut calls = AVec::with_capacity_in(made_calls, alloc);
     calls.extend(names.expansions.iter().filter_map(|(k, e)| e.made.map(|m| (*k, m))));
     calls.sort_unstable_by_key(|c| c.0);
     if calls.len() >= EXPANSION as usize {
         return Err(ItemsRecordError::TooBig { what: "a crate's expansions" });
     }
-    let mut expansion_rows = RecordBytes::new_in(alloc);
+    let mut expansion_rows = RecordBytes::with_capacity_in(calls.len().saturating_mul(EXPANSION_ROW).next_multiple_of(ALIGN), alloc);
     for (call, made) in calls.iter() {
         expansion_rows.extend_from_slice(&call.0.0);
         expansion_rows.extend_from_slice(&made.id.0);
@@ -708,7 +718,16 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
 
     // The modules: those `Names::modules` lists (walked, then made), and any other key a row
     // names as a module (a parent, an item's home), unlisted.
-    let mut modules: AVec<'b, ItemKey> = AVec::new_in(alloc);
+    let modules_cap = names
+        .tree
+        .modules
+        .len()
+        .saturating_mul(2)
+        .saturating_add(names.made.len().saturating_mul(2))
+        .saturating_add(tables.texts.len())
+        .saturating_add(tables.macros.len())
+        .saturating_add(impls.len());
+    let mut modules: AVec<'b, ItemKey> = AVec::with_capacity_in(modules_cap, alloc);
     for m in names.tree.modules.iter() {
         modules.push(m.key);
         modules.extend(m.parent.map(|p| names.tree.modules[p].key));
@@ -726,7 +745,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         modules.binary_search(&m).map(|i| i as u32).map_err(|_| ItemsRecordError::NotListed { module: m })
     };
     u32_of(modules.len(), "a crate's modules")?;
-    let mut module_rows = RecordBytes::new_in(alloc);
+    let mut module_rows = RecordBytes::with_capacity_in(modules.len().saturating_mul(MODULE_ROW).next_multiple_of(ALIGN), alloc);
     for m in modules.iter() {
         let walked = names.tree.by_key.get(m).map(|i| &names.tree.modules[*i]);
         let made = names.made.get(m);
@@ -760,9 +779,23 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     }
 
     // The impl rows (columnar, single-allocation SoA buffer), and each impl's row by its key.
-    let mut col_scratch: AVec<'b, u8> = AVec::new_in(alloc);
-    let mut impl_rows = RecordBytes::new_in(alloc);
-    let mut impl_row_of: HashMap<ItemKey, u32, Alloc<'b>> = HashMap::new_in(alloc);
+    let total_members: usize = tables.members.values().map(|list| list.len()).sum();
+    let col_scratch_cap = impls
+        .len()
+        .max(tables.texts.len())
+        .max(total_members)
+        .saturating_mul(8)
+        .saturating_add(1024);
+    let mut col_scratch: AVec<'b, u8> = AVec::with_capacity_in(col_scratch_cap, alloc);
+    let impl_rows_cap = if impls.is_empty() {
+        0
+    } else {
+        (9 * 4usize)
+            .saturating_add(impls.len().saturating_mul(KEY_TAIL + 24))
+            .next_multiple_of(ALIGN)
+    };
+    let mut impl_rows = RecordBytes::with_capacity_in(impl_rows_cap, alloc);
+    let mut impl_row_of: HashMap<ItemKey, u32, Alloc<'b>> = HashMap::with_capacity_in(impls.len(), alloc);
     if !impls.is_empty() {
         let dir_at = impl_rows.len();
         for _ in 0..9 {
@@ -803,7 +836,16 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     // The items, by key (columnar, single-allocation SoA buffer).
     let mut items: AVec<'b, ItemKey> = AVec::from_iter_in(tables.texts.keys().copied(), alloc);
     items.sort_unstable();
-    let mut item_rows = RecordBytes::new_in(alloc);
+    let item_rows_cap = if items.is_empty() {
+        0
+    } else {
+        (13 * 4usize)
+            .saturating_add(items.len().saturating_mul(KEY_TAIL + 28))
+            .saturating_add(names.files.len().saturating_add(1).saturating_mul(4))
+            .next_multiple_of(ALIGN)
+    };
+    let mut item_rows = RecordBytes::with_capacity_in(item_rows_cap, alloc);
+    let mut expansion_items = 0usize;
     if !items.is_empty() {
         let dir_at = item_rows.len();
         for _ in 0..13 {
@@ -814,6 +856,9 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         file_counts.resize(names.files.len(), 0);
         for key in items.iter() {
             let (it, at) = &tables.texts[key];
+            if matches!(at, At::Expansion(_)) {
+                expansion_items = expansion_items.saturating_add(1);
+            }
             let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
             let entry = outline.items().get(it.item.0 as usize).ok_or(ItemsRecordError::NoOutline { item: *key })?;
             let detail = entry.detail;
@@ -928,13 +973,26 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     // Each trait's and impl's members, in declaration order (columnar, single-allocation SoA buffer).
     let mut owners: AVec<'b, ItemKey> = AVec::from_iter_in(tables.members.keys().copied(), alloc);
     owners.sort_unstable();
-    let mut owner_rows = RecordBytes::new_in(alloc);
-    let mut member_keys = RecordBytes::new_in(alloc);
-    let mut member_buf = cols::MemberColsBuf::new_in(alloc);
+    let mut owner_rows = RecordBytes::with_capacity_in(owners.len().saturating_mul(OWNER_ROW).next_multiple_of(ALIGN), alloc);
+    let member_rows_cap = if total_members == 0 {
+        0
+    } else {
+        (6 * 4usize)
+            .saturating_add(total_members.saturating_mul(KEY_TAIL + 20))
+            .next_multiple_of(ALIGN)
+    };
+    let mut member_rows = RecordBytes::with_capacity_in(member_rows_cap, alloc);
+    let member_dir_at = member_rows.len();
+    if total_members > 0 {
+        for _ in 0..6 {
+            put32(&mut member_rows, 0);
+        }
+    }
+    let mut member_buf = cols::MemberColsBuf::with_capacity_in(total_members, alloc);
     let mut members = 0usize;
     // Each named member's key, its owner's row and its own row: the member owners section
     // ([`owners`]), written after everything else.
-    let mut owned: AVec<'b, (ItemKey, u32, u32)> = AVec::new_in(alloc);
+    let mut owned: AVec<'b, (ItemKey, u32, u32)> = AVec::with_capacity_in(total_members, alloc);
     #[cfg(test)]
     let mut cut = plant::is(plant::Plant::ShortMembers);
     for (owner_idx, owner) in owners.iter().enumerate() {
@@ -970,7 +1028,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             let name_len = u16::try_from(name.1).map_err(|_| ItemsRecordError::TooBig { what: "a member's name" })?;
             let lifetimes = lifetimes_field(m.key, m.detail, m.text, names.edition)?;
             debug_assert_eq!(m.key.0.0[..8], names.key.prefix());
-            member_keys.extend_from_slice(&m.key.0.0[8..]);
+            member_rows.extend_from_slice(&m.key.0.0[8..]);
             member_buf.push(cols::MemberCol {
                 code: u64::from(code),
                 outline: u64::from(m.item.0),
@@ -988,27 +1046,23 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             members += 1;
         }
     }
-    let mut member_rows = RecordBytes::new_in(alloc);
     if members > 0 {
-        let dir_at = member_rows.len();
-        for _ in 0..6 {
-            put32(&mut member_rows, 0);
-        }
-        member_rows.extend_from_slice(&member_keys);
         let l0 = cols::encode_opt_u64(member_buf.codes(), 0, "member text codes", alloc, &mut col_scratch, &mut member_rows)?;
         let l1 = cols::encode_opt_u64(member_buf.outlines(), 0, "member outlines", alloc, &mut col_scratch, &mut member_rows)?;
         let l2 = cols::encode_opt_u64(member_buf.name_ats(), 0, "member name offsets", alloc, &mut col_scratch, &mut member_rows)?;
         let l3 = cols::encode_opt_u64(member_buf.metas(), 0, "member meta", alloc, &mut col_scratch, &mut member_rows)?;
         let l4 = cols::encode_opt_u64(member_buf.starts(), 0, "member text starts", alloc, &mut col_scratch, &mut member_rows)?;
         let l5 = cols::encode_opt_u64(member_buf.lens(), 0, "member text lengths", alloc, &mut col_scratch, &mut member_rows)?;
-        cols::patch_dir(&mut member_rows, dir_at, [l0, l1, l2, l3, l4, l5]);
+        cols::patch_dir(&mut member_rows, member_dir_at, [l0, l1, l2, l3, l4, l5]);
+    } else {
+        member_rows.clear();
     }
 
     // Lang items by (name, key).
     let mut langs: AVec<'b, (&'n str, ItemKey)> = AVec::from_iter_in(tables.langs.iter().map(|l| (l.name, l.key)), alloc);
     langs.sort_unstable_by(|a, b| (a.0.as_bytes(), a.1).cmp(&(b.0.as_bytes(), b.1)));
     langs.dedup();
-    let mut lang_rows = RecordBytes::new_in(alloc);
+    let mut lang_rows = RecordBytes::with_capacity_in(langs.len().saturating_mul(LANG_ROW).next_multiple_of(ALIGN), alloc);
     for (name, key) in langs.iter() {
         let name = strings.put(*name)?;
         lang_rows.extend_from_slice(&key.0.0);
@@ -1019,7 +1073,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     // Macro definitions by key: where the body is, never its bytes.
     let mut macros: AVec<'b, ItemKey> = AVec::from_iter_in(tables.macros.keys().copied(), alloc);
     macros.sort_unstable();
-    let mut macro_rows = RecordBytes::new_in(alloc);
+    let mut macro_rows = RecordBytes::with_capacity_in(macros.len().saturating_mul(MACRO_ROW).next_multiple_of(ALIGN), alloc);
     for key in macros.iter() {
         let m = &tables.macros[key];
         let at = tables.texts.get(key).map(|t| t.1);
@@ -1064,7 +1118,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
 
     // The cfg atoms, in `Cfg::atoms`' own (sorted) order.
     let atoms = names.cfg.atoms();
-    let mut atom_rows = RecordBytes::new_in(alloc);
+    let mut atom_rows = RecordBytes::with_capacity_in(atoms.len().saturating_mul(ATOM_ROW).next_multiple_of(ALIGN), alloc);
     for (name, value) in atoms.iter() {
         let name = strings.put(*name)?;
         let value = match value {
@@ -1098,7 +1152,48 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     if names.proc_key.is_some() {
         flags |= CRATE_PROC_KEY;
     }
-    let mut out = RecordBytes::with_capacity_in(at + strings.bytes.len(), alloc);
+    // Pre-size `out` to cover the fixed sections, strings, AND all five appended tail sections
+    // (`grain`, `owners`, `variants`, `buckets`, `values`) so `out` never reallocates on a bump
+    // allocator while tail-section helpers hold temporary scratch allocations above it.
+    let grain_cap = if include_grain {
+        ALIGN
+            .saturating_add(items.len().saturating_mul(36))
+            .saturating_add(expansion_items.saturating_mul(32))
+    } else {
+        0
+    };
+    let owners_cap = ALIGN.saturating_add(owned.len().saturating_mul(owners::OWNED_ROW));
+    let total_variants: usize = tables.enums.values().map(|v| v.len()).sum();
+    let variants_cap = if total_variants > 0 {
+        ALIGN.saturating_add(8).saturating_add(total_variants.saturating_mul(78)).saturating_add(256)
+    } else {
+        ALIGN
+    };
+    let filed_impls = impls.iter().filter(|i| matches!(i.filing, buckets::Filing::At(_))).count();
+    let unfiled_impls = impls.len().saturating_sub(filed_impls);
+    let buckets_cap = ALIGN
+        .saturating_add(if filed_impls > 0 {
+            16usize.saturating_add(filed_impls.saturating_mul(92)).saturating_add(512)
+        } else {
+            0
+        })
+        .saturating_add(ALIGN)
+        .saturating_add(unfiled_impls.saturating_mul(buckets::UNFILED_ROW));
+    let values_cap = if names.values.is_empty() {
+        0
+    } else {
+        ALIGN
+            .saturating_add(names.values.len().saturating_mul(values::VALUE_ROW + 32))
+            .saturating_add(64)
+    };
+    let out_cap = at
+        .saturating_add(strings.bytes.len())
+        .saturating_add(grain_cap)
+        .saturating_add(owners_cap)
+        .saturating_add(variants_cap)
+        .saturating_add(buckets_cap)
+        .saturating_add(values_cap);
+    let mut out = RecordBytes::with_capacity_in(out_cap, alloc);
     out.extend_from_slice(&MAGIC);
     put32(&mut out, VERSION);
     put32(&mut out, flags);
@@ -3130,5 +3225,109 @@ mod twins {
         let mut v15 = bytes.to_vec();
         v15[4..8].copy_from_slice(&15u32.to_le_bytes());
         assert!(matches!(super::ItemsRecord::open(aligned(&v15, bump), g), Err(super::ItemsRecordError::NotThisRecord)));
+    }
+
+    /// Regression test for massive crates (e.g. `aws_sdk_ec2`) whose Section 3 (`items`) record
+    /// panicked a worker `Frame` when `out` doubled past its initial `at + strings` capacity
+    /// while intermediate section buffers (`member_buf`, `owned`, `item_rows`, `strings`) had
+    /// already abandoned 2x-3x bump bytes. Pre-sizing every table buffer and covering all tail
+    /// sections (`grain`, `owners`, `variants`, `buckets`, `values`) in `out`'s initial capacity
+    /// keeps abandoned bump bytes well below the encoded record length and succeeds inside a
+    /// tight frame.
+    #[test]
+    fn large_items_record_presizes_output_and_avoids_bump_doubling() {
+        use core::fmt::Write as _;
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+        use crate::crate_scope::{Ready, resolve_by_records};
+        use crate::graph::Sysroot;
+        use crate::resolve::{CrateInput, SourceTexts, aligned};
+        use crate::task::Serial;
+
+        struct OneFile(&'static str, &'static str);
+        impl<'a> SourceTexts<'a> for OneFile {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                (krate == 0 && path == self.0).then_some(self.1)
+            }
+        }
+
+        let mut src = std::string::String::with_capacity(256 << 10);
+        src.push_str("#![no_core]\npub trait Op { fn name(&self) -> u32; }\n");
+        const STRUCTS: usize = 300;
+        const METHODS: usize = 10;
+        const ENUMS: usize = 120;
+        const VARIANTS: usize = 6;
+        for i in 0..STRUCTS {
+            let _ = writeln!(src, "pub struct S{i}(pub u32);");
+            let _ = writeln!(src, "impl S{i} {{");
+            for m in 0..METHODS {
+                let _ = writeln!(src, "    pub fn m{m}(&self) -> u32 {{ self.0 }}");
+            }
+            src.push_str("}\n");
+            let _ = writeln!(src, "impl Op for S{i} {{ fn name(&self) -> u32 {{ {i} }} }}");
+        }
+        for e in 0..ENUMS {
+            let _ = write!(src, "pub enum E{e} {{");
+            for v in 0..VARIANTS {
+                let _ = write!(src, " V{v},");
+            }
+            src.push_str(" }\n");
+        }
+        let leaked_src: &'static str = std::boxed::Box::leak(src.into_boxed_str());
+        let texts: &'static OneFile = std::boxed::Box::leak(std::boxed::Box::new(OneFile("/big/lib.rs", leaked_src)));
+        let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let input = CrateInput {
+            name: "big_items_crate",
+            key: blaze_id::CrateItemKey(ContentId::of("blaze-scope large items test", b"big_items_crate")),
+            edition: Edition::E2021,
+            implicit,
+            root: "/big/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let solve_frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("solve frame");
+        let solve_erased = blaze_own::Erased::new(&solve_frame);
+        let solve_bump = solve_erased.bump();
+        let (solved, _) = resolve_by_records(&[input], Sysroot::default(), texts, &Serial, &Ready::serial(std::time::Duration::from_secs(60)), solve_bump)
+            .expect("solve large crate");
+        let krate = solved.first().expect("one solved crate").names;
+
+        for include_grain in [false, true] {
+            let enc_frame = blaze_mem::Frame::with_reserve(16 << 20, blaze_mem::Tag::Nameres).expect("encode frame");
+            let enc_erased = blaze_own::Erased::new(&enc_frame);
+            let enc_bump = enc_erased.bump();
+            let enc_alloc = enc_bump.alloc();
+            let bytes = super::encode_for(krate, include_grain, enc_alloc).expect("encode large items record");
+            let abandoned = enc_frame.abandoned().bytes;
+            let len = bytes.len();
+            assert!(len > 100_000, "synthetic crate should produce a substantial items record (got {len} bytes)");
+            assert!(
+                abandoned < u64::try_from(len).unwrap_or(u64::MAX),
+                "pre-sized encode_for(include_grain={include_grain}) abandoned {abandoned} bytes for a {len}-byte record (peak {})",
+                enc_frame.peak()
+            );
+            let record = super::ItemsRecord::open(aligned(&bytes, enc_bump), enc_alloc).expect("open large items record");
+            assert!(record.items() >= STRUCTS * 3 + ENUMS, "items count");
+            assert_eq!(record.impls(), STRUCTS * 2, "impls count");
+            assert_eq!(record.owned_members(), STRUCTS * (METHODS + 1) + 1, "owned members count");
+            assert_eq!(record.variant_rows(), ENUMS * VARIANTS, "variants count");
+        }
+
+        // Also verify `names_record::encode` keeps bump abandonment low on the same large crate.
+        let names_frame = blaze_mem::Frame::with_reserve(16 << 20, blaze_mem::Tag::Nameres).expect("names encode frame");
+        let names_erased = blaze_own::Erased::new(&names_frame);
+        let names_bump = names_erased.bump();
+        let names_bytes = crate::names_record::encode(krate, names_bump.alloc()).expect("encode large names record");
+        let names_abandoned = names_frame.abandoned().bytes;
+        assert!(
+            names_abandoned < u64::try_from(names_bytes.len()).unwrap_or(u64::MAX).saturating_mul(2),
+            "names_record::encode abandoned {names_abandoned} bytes for a {}-byte record",
+            names_bytes.len()
+        );
+        let proof = crate::names_record::Verified::check(aligned(&names_bytes, names_bump)).expect("verify large names record");
+        assert_eq!(proof.key(), input.key);
     }
 }

@@ -39,7 +39,11 @@ pub fn pieces_of(outline: &Outline<'_>, item: &Item, text: &str) -> ItemPieces {
 pub(super) fn append(out: &mut RecordBytes<'_>, names: &CrateNames<'_>, items: &[ItemKey]) -> Result<(), ItemsRecordError> {
     pad(out);
     let at = u32_of(out.len(), "the item grain section")?;
-    let mut expansion_hashes = RecordBytes::new_in(*out.allocator());
+    let expansion_count = items
+        .iter()
+        .filter(|key| matches!(names.tables.texts.get(*key), Some((_, At::Expansion(_)))))
+        .count();
+    let mut expansion_hashes = RecordBytes::with_capacity_in(expansion_count.saturating_mul(32), *out.allocator());
     for key in items {
         let (it, place) = names.tables.texts.get(key).ok_or(ItemsRecordError::NoOutline { item: *key })?;
         let (text, outline) = names.outline_at(*place).ok_or(ItemsRecordError::NoOutline { item: *key })?;

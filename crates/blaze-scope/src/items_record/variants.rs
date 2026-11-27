@@ -62,7 +62,8 @@ impl<'a> VariantsCols<'a> {
 /// is not read: the rows are sorted here) to `out`, a record whose header is written, and sets
 /// its count and offset in the header.
 pub(super) fn append<'a>(out: &mut RecordBytes<'_>, enums: &HashMap<ItemKey, AVec<'a, Variant<&'a str>>, Alloc<'a>>, alloc: Alloc<'_>) -> Result<(), ItemsRecordError> {
-    let mut rows: AVec<'_, (ItemKey, ItemKey, u32)> = AVec::new_in(alloc);
+    let total_variants: usize = enums.values().map(|v| v.len()).sum();
+    let mut rows: AVec<'_, (ItemKey, ItemKey, u32)> = AVec::with_capacity_in(total_variants, alloc);
     for (owner, variants) in enums.iter() {
         for (index, v) in variants.iter().enumerate() {
             rows.push((v.key, *owner, u32_of(index, "an enum's variants")?));
@@ -81,7 +82,7 @@ pub(super) fn append<'a>(out: &mut RecordBytes<'_>, enums: &HashMap<ItemKey, AVe
             out.extend_from_slice(&variant.0.0);
             buf.push(VariantCol { owner: owner.0.0, index: u64::from(*index) });
         }
-        let mut scratch = AVec::new_in(alloc);
+        let mut scratch = AVec::with_capacity_in(rows.len().saturating_mul(8).saturating_add(128), alloc);
         let enum_len = encode_opt_id(buf.owners(), "the variant table's enum keys", alloc, &mut scratch, out)?;
         let idx_len = encode_opt_u64(buf.indices(), 0, "the variant table's indices", alloc, &mut scratch, out)?;
         patch_dir(out, dir_at, [enum_len, idx_len]);

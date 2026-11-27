@@ -303,10 +303,10 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
         let lb = names.chains.get(&b.1).map_or(0, |c| c.len());
         lb.cmp(&la).then_with(|| a.1.cmp(&b.1))
     });
-    let mut chains = RecordBytes::new_in(alloc);
+    let mut chains = RecordBytes::with_capacity_in(modules.len().saturating_mul(KEY), alloc);
     let mut chain_keys = 0usize;
-    let mut chain_places: HashMap<&[ItemKey], u32, Alloc<'b>> = HashMap::new_in(alloc);
-    let mut module_chain_at: AVec<'b, u32> = AVec::new_in(alloc);
+    let mut chain_places: HashMap<&[ItemKey], u32, Alloc<'b>> = HashMap::with_capacity_in(modules.len(), alloc);
+    let mut module_chain_at: AVec<'b, u32> = AVec::with_capacity_in(modules.len(), alloc);
     module_chain_at.resize(modules.len(), NONE);
     for &(idx, m) in chain_order.iter() {
         let Some(chain) = names.chains.get(&m) else { continue };
@@ -333,8 +333,13 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
         }
     }
 
-    let mut rows = RecordBytes::new_in(alloc);
-    let mut blob = RecordBytes::new_in(alloc);
+    let mut rows = RecordBytes::with_capacity_in(modules.len().saturating_mul(ROW), alloc);
+    let blob_est: usize = names
+        .done
+        .values()
+        .map(|done| 128usize.saturating_add(done.scope.bindings.len().saturating_mul(80)))
+        .sum();
+    let mut blob = RecordBytes::with_capacity_in(blob_est, alloc);
     #[cfg(test)]
     let mut planted_once = false;
     for (idx, m) in modules.iter().enumerate() {
@@ -383,9 +388,17 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
 
     let mut owners = AVec::from_iter_in(names.tables.enums.keys().copied(), alloc);
     owners.sort_unstable();
-    let mut enum_rows = RecordBytes::new_in(alloc);
-    let mut variant_rows = RecordBytes::new_in(alloc);
-    let mut strings = RecordBytes::new_in(alloc);
+    let mut total_variants = 0usize;
+    let mut total_variant_name_bytes = 0usize;
+    for list in names.tables.enums.values() {
+        total_variants = total_variants.saturating_add(list.len());
+        for v in list.iter() {
+            total_variant_name_bytes = total_variant_name_bytes.saturating_add(v.name.len());
+        }
+    }
+    let mut enum_rows = RecordBytes::with_capacity_in(owners.len().saturating_mul(ENUM_ROW).next_multiple_of(ALIGN), alloc);
+    let mut variant_rows = RecordBytes::with_capacity_in(total_variants.saturating_mul(VARIANT_ROW), alloc);
+    let mut strings = RecordBytes::with_capacity_in(total_variant_name_bytes.next_multiple_of(ALIGN), alloc);
     let mut variants = 0usize;
     for owner in owners.iter() {
         let list = &names.tables.enums[owner];

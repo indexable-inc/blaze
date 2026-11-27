@@ -516,8 +516,10 @@ impl<'a> BucketsCols<'a> {
 /// Appends the two tables for `filings` (impl row `i`'s filing at index `i`, the impl table's
 /// order) to `out`, a record whose header is written, and sets their counts and offsets.
 pub(super) fn append(out: &mut RecordBytes<'_>, filings: &[Filing], alloc: Alloc<'_>) -> Result<(), ItemsRecordError> {
-    let mut filed: AVec<'_, (BucketKey, u32)> = AVec::new_in(alloc);
-    let mut not: AVec<'_, (u32, NotFiled)> = AVec::new_in(alloc);
+    let filed_count = filings.iter().filter(|f| matches!(f, Filing::At(_))).count();
+    let unfiled_count = filings.len().saturating_sub(filed_count);
+    let mut filed: AVec<'_, (BucketKey, u32)> = AVec::with_capacity_in(filed_count, alloc);
+    let mut not: AVec<'_, (u32, NotFiled)> = AVec::with_capacity_in(unfiled_count, alloc);
     for (row, filing) in filings.iter().enumerate() {
         let row = u32_of(row, "a crate's impls")?;
         match *filing {
@@ -549,7 +551,7 @@ pub(super) fn append(out: &mut RecordBytes<'_>, filings: &[Filing], alloc: Alloc
             head_key.copy_from_slice(&key.bytes[36..68]);
             buf.push(BucketCol { meta: kind | (head_code << 8) | (arity << 16), trait_key, head_key, impl_row: u64::from(*row) });
         }
-        let mut scratch = AVec::new_in(alloc);
+        let mut scratch = AVec::with_capacity_in(filed.len().saturating_mul(8).saturating_add(128), alloc);
         let l0 = encode_opt_u64(buf.metas(), 0, "the bucket table's meta", alloc, &mut scratch, out)?;
         let l1 = encode_opt_id(buf.trait_keys(), "the bucket table's trait keys", alloc, &mut scratch, out)?;
         let l2 = encode_opt_id(buf.head_keys(), "the bucket table's head keys", alloc, &mut scratch, out)?;
