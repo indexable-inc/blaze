@@ -6309,6 +6309,7 @@ impl<'f> BodiesStage<'f> {
                                       max_steps: usize,
                                       parent_item: &dyn Fn(blaze_surface::ItemIndex) -> Option<blaze_surface::Item>,
                                       item_len: &dyn Fn(blaze_surface::ItemIndex) -> u32,
+                                      file_cfg: Option<(u32, bool)>,
                                       eval_attrs: &dyn Fn(&blaze_surface::Item, blaze_own::Alloc<'static>) -> Option<(u32, bool)>| {
                     // The bodies an expansion at this entry wrote: the entry's task checks
                     // each (one task an entry, planned from text; covered.rs).
@@ -6392,7 +6393,7 @@ impl<'f> BodiesStage<'f> {
                                 taken
                             };
                             if body && keys.is_empty() && !taken_above {
-                                match absent_entry_with(records, item, text, root_file, max_steps, parent_item, eval_attrs, g) {
+                                match absent_entry_with(records, item, text, root_file, max_steps, parent_item, file_cfg, eval_attrs, g) {
                                     Ok(key) => {
                                         keys.push(key);
                                         labels.push(Some(Unplaced { label: REPLACED_MAIN, words: crate::body_types::covered::WRITTEN_UNPLACED }));
@@ -6586,6 +6587,19 @@ impl<'f> BodiesStage<'f> {
                             let parent_item = |p: blaze_surface::ItemIndex| view.item(p).map(|e| e.item);
                             let item_len = |idx: blaze_surface::ItemIndex| view.item(idx).map_or(0, |e| e.item.range.len());
                             let cfg_ref = cfg.as_ref();
+                            let file_cfg = cfg_ref.map(|cfg| {
+                                let mut attrs = blaze_scope::task::Attrs::new_in(g);
+                                let mut stack = blaze_own::AVec::new_in(g);
+                                for attr in view.file_attrs() {
+                                    if attr.kind == blaze_surface::AttrKind::Doc {
+                                        continue;
+                                    }
+                                    if let Some(written) = text.get(attr.range.to_usize()) {
+                                        cfg.attr(&mut attrs, blaze_scope::task::strip_attr(written), &mut stack);
+                                    }
+                                }
+                                (attrs.cfg_unread, attrs.cfg_ok)
+                            });
                             let eval_attrs = |entry_item: &blaze_surface::Item, alloc: blaze_own::Alloc<'static>| {
                                 let cfg = cfg_ref?;
                                 let mut attrs = blaze_scope::task::Attrs::new_in(alloc);
@@ -6609,7 +6623,7 @@ impl<'f> BodiesStage<'f> {
                                         },
                                     },
                                 };
-                                push_entry(entry_u32, item, body, name, chain, text, own_key, view.len(), &parent_item, &item_len, &eval_attrs);
+                                push_entry(entry_u32, item, body, name, chain, text, own_key, view.len(), &parent_item, &item_len, file_cfg, &eval_attrs);
                             }
                             true
                         } else {
@@ -6623,6 +6637,10 @@ impl<'f> BodiesStage<'f> {
                                 let parent_item = |p: blaze_surface::ItemIndex| usize::try_from(p.0).ok().and_then(|i| outline.items().get(i)).copied();
                                 let item_len = |idx: blaze_surface::ItemIndex| usize::try_from(idx.0).ok().and_then(|i| outline.items().get(i)).map_or(0, |e| e.range.len());
                                 let cfg_ref = cfg.as_ref();
+                                let file_cfg = cfg_ref.map(|cfg| {
+                                    let attrs = blaze_scope::task::file_attrs(cfg, outline, text, g);
+                                    (attrs.cfg_unread, attrs.cfg_ok)
+                                });
                                 let eval_attrs = |entry_item: &blaze_surface::Item, alloc: blaze_own::Alloc<'static>| {
                                     let cfg = cfg_ref?;
                                     let attrs = blaze_scope::task::item_attrs(cfg, outline, entry_item, text, alloc);
@@ -6658,7 +6676,7 @@ impl<'f> BodiesStage<'f> {
                                             },
                                         },
                                     };
-                                    push_entry(u32::try_from(entry).unwrap_or(u32::MAX), item, body, name, chain, text, own_key, outline.items().len(), &parent_item, &item_len, &eval_attrs);
+                                    push_entry(u32::try_from(entry).unwrap_or(u32::MAX), item, body, name, chain, text, own_key, outline.items().len(), &parent_item, &item_len, file_cfg, &eval_attrs);
                                 }
                             })
                         }
@@ -9585,10 +9603,23 @@ fn absent_entry_with<'n>(
     root_file: bool,
     max_steps: usize,
     parent_item: impl Fn(blaze_surface::ItemIndex) -> Option<blaze_surface::Item>,
+    file_cfg: Option<(u32, bool)>,
     eval_attrs: impl Fn(&blaze_surface::Item, blaze_own::Alloc<'static>) -> Option<(u32, bool)>,
     g: blaze_own::Alloc<'static>,
 ) -> Result<ItemKey, &'static str> {
     if planted_silent_absent() {
+        return Err(crate::engine_body_plan::ENTRY_ABSENT);
+    }
+    // Check file-level inner `#![cfg(...)]` attributes first (e.g. `#![cfg(target_os = "linux")]`
+    // in `symbols.rs` declared via an unconditional `pub mod symbols;`): a false file-level cfg
+    // cuts every entry in the file cleanly as `ENTRY_ABSENT`.
+    let Some((file_unread, file_ok)) = file_cfg else {
+        return Err(CFG_ATOMS_UNREAD);
+    };
+    if file_unread > 0 {
+        return Err(CFG_UNREAD);
+    }
+    if !file_ok {
         return Err(crate::engine_body_plan::ENTRY_ABSENT);
     }
     // Up the parents, bounded by the outline's length (rule 18).

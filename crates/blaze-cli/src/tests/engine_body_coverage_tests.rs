@@ -47,3 +47,36 @@ fn a_cfg_false_body_is_absent_and_a_cfg_true_one_checked() {
     assert!(control_unchecked.is_empty(), "control: a body noted unchecked: {control_unchecked:?}");
     println!("CFG BODIES: {errors} error (cfg false absent), {control} with it true; {} unchecked notes", unchecked.len());
 }
+
+/// A submodule gated only by its own file-level `#![cfg(windows)]` (declared via an unconditional
+/// `pub mod off;` in `lib.rs`, like `blaze-launch-rt/src/symbols.rs` with `#![cfg(target_os = "linux")]`)
+/// must treat its items as `ENTRY_ABSENT`, never `ENTRY_UNLISTED`.
+#[test]
+fn a_file_level_inner_cfg_false_module_is_absent_not_unlisted() {
+    let io = Io::simulated(SimWorld::new(59, Limits::USUAL));
+    write(&io, "Cargo.toml", MANIFEST);
+    write(&io, "src/lib.rs", "pub mod off;\npub fn on(x: u8) -> u16 { x }\n");
+    write(&io, "src/off.rs", "#![cfg(windows)]\npub const C: u8 = 1;\npub fn dead(x: u8) -> u16 { x }\n");
+    let (_, lines, checked) = said(&io, true);
+    let errors = lines.iter().filter(|line| line.contains("error[")).count();
+    let mut unchecked: std::vec::Vec<std::string::String> = lines.into_iter().filter(|line| line.contains("not checked") || line.contains("NOT checked: types")).collect();
+    unchecked.extend(checked.bodies.0.into_iter().filter(|note| note.contains("not checked")));
+    assert_eq!(errors, 1, "only `on`'s E0308 should print; unchecked: {unchecked:?}");
+    assert!(unchecked.is_empty(), "file-level `#![cfg(windows)]` module should not be noted unchecked: {unchecked:?}");
+}
+
+/// An example target (compiled only with `cfg(not(test))`) declaring `#[cfg(test)] mod tests;`
+/// in a separate file (like `blaze-proc-macro/examples/tempo_pipeline.rs`) must skip the
+/// `test`-cut submodule rather than leaving its bodies `ownerless` (`NOT checked: types`).
+#[test]
+fn a_cfg_test_submodule_of_a_non_test_example_is_not_ownerless() {
+    let io = Io::simulated(SimWorld::new(61, Limits::USUAL));
+    write(&io, "Cargo.toml", MANIFEST);
+    write(&io, "src/lib.rs", "pub fn lib_ok() -> u8 { 1 }\n");
+    write(&io, "examples/demo.rs", "#[cfg(test)]\n#[path = \"demo/sub.rs\"]\nmod sub;\nfn main() {}\n");
+    write(&io, "examples/demo/sub.rs", "pub fn only_in_test() -> u16 { 1u8 }\n");
+    let (_, lines, checked) = said(&io, true);
+    let errors = lines.iter().filter(|line| line.contains("error[")).count();
+    assert_eq!(errors, 0, "cfg(test) submodule of an example should not produce errors: {lines:?}");
+    assert_eq!(checked.ownerless.0, 0, "cfg(test) submodule of an example must not be ownerless: {:?}", checked.ownerless);
+}

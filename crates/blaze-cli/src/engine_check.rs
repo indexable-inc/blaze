@@ -4418,17 +4418,18 @@ fn checking<'f, 's: 'f>(
             };
             let found_edges = crate::engine_body_plan::found_edges(&found_units, &found_places, heap.alloc());
             let reach = bodies.plan_reach(cx, &mut store, graph, plan_list, scoped.as_ref(), &outlined, &found_edges, crate::engine_bodies::ReachFrom::Walk, heap.alloc())?;
-            // Under a scoped check, cfg-blind file walking from an active library dependency can
-            // outline a `#[cfg(test)] mod tests;` file that no active scoped unit reaches. Mark
-            // such unreached non-external files as skipped so `plan_views` plans no ownerless body
-            // tasks for them and `workspace_of_scoped` skips them cleanly.
-            if scoped.is_some()
-                && let Some(reach) = reach
-            {
+            // Cfg-blind file walking can outline a `#[cfg(test)] mod tests;` file that no active
+            // unit reaches — both under a scoped check (from an active library dependency) and in
+            // an unscoped check (from an example target compiled only with `test = false`, e.g.
+            // `examples/tempo_pipeline.rs` -> `#[cfg(test)] mod resolve_tests;`). Mark such
+            // unreached non-external files as skipped so `plan_views` plans no ownerless body
+            // tasks for them (matching inline `#[cfg(test)] mod tests { ... }` having 0 rows).
+            if let Some(reach) = reach {
                 let mut added = false;
                 for one in outlined.iter() {
                     if skipped.external.binary_search(&one.name).is_err()
                         && reach.ranks(one.name).is_empty()
+                        && (scoped.is_some() || reach.is_test_cut(one.name))
                         && skipped.files.binary_search(&one.name).is_err()
                     {
                         skipped.files.push(one.name);
@@ -6413,11 +6414,12 @@ fn serve_found<'d, 'f, 'r, 's, 'w, 'm>(
     let reach = rq.bodies.plan_reach(cx, &mut *store, rq.graph, Some(list), rq.scoped, &merged, &edges, crate::engine_bodies::ReachFrom::Walk, heap.alloc())?;
     let mut skipped_now: SVec<'_, Name> = SVec::new_in(alloc);
     skipped_now.extend(serve.skipped.iter().copied());
-    if rq.scoped.is_some()
-        && let Some(reach) = reach
-    {
+    if let Some(reach) = reach {
         for one in merged.iter() {
-            if external_now.binary_search(&one.name).is_err() && reach.ranks(one.name).is_empty() {
+            if external_now.binary_search(&one.name).is_err()
+                && reach.ranks(one.name).is_empty()
+                && (rq.scoped.is_some() || reach.is_test_cut(one.name))
+            {
                 skipped_now.push(one.name);
             }
         }

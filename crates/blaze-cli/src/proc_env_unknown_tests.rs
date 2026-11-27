@@ -89,7 +89,7 @@ fn a_macro_s_getenv_answers_each_name_as_env_does_and_refuses_an_unknown_one_by_
     // The three truths are all met (the list is not vacuous).
     assert_eq!(package.env.get("CARGO_CRATE_NAME"), EnvAnswer::Set("app_it"));
     assert_eq!(package.env.get("CARGO_PRIMARY_PACKAGE"), EnvAnswer::Set("1"), "a member's crate is a selected package");
-    assert_eq!(package.env.get("CARGO_TARGET_TMPDIR"), EnvAnswer::Unknown);
+    assert_eq!(package.env.get("CARGO_TARGET_TMPDIR"), EnvAnswer::Set("/target/tmp"), "an integration test's scratch dir: the guest path");
     assert_eq!(package.env.get("OUT_DIR"), EnvAnswer::Unknown, "a script whose record is not joined");
     assert_eq!(package.env.get("CARGO_BIN_EXE_app"), EnvAnswer::Set("/target/debug/bin/app/app"), "an integration test's binary: the guest path of its launcher stub");
     assert_eq!(package.env.get("CARGO_BIN_EXE_other"), EnvAnswer::Unset, "no binary of that name in the package");
@@ -100,16 +100,16 @@ fn a_macro_s_getenv_answers_each_name_as_env_does_and_refuses_an_unknown_one_by_
     // The sandbox: an unknown read is a refusal naming the variable and the calling crate.
     let mut sandbox = Sandbox::new(Arc::new(package));
     assert_eq!(sandbox.var("PATH"), Ok(None), "unset is NotPresent");
-    let refused = sandbox.var("CARGO_TARGET_TMPDIR");
-    assert_eq!(refused, Err(EnvRefused { name: String::from("CARGO_TARGET_TMPDIR"), krate: Some(String::from("app_it")) }));
+    let refused = sandbox.var("OUT_DIR");
+    assert_eq!(refused, Err(EnvRefused { name: String::from("OUT_DIR"), krate: Some(String::from("app_it")) }));
 
     // The control: the set pairs alone answer the unknown name unset, where env! refuses it.
     let old = Package::new(member(), PackageEnv::set_only(set_pairs(&env)).unwrap_or_else(|e| panic!("{e}"))).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(old.env.get("CARGO_TARGET_TMPDIR"), EnvAnswer::Unset, "the planted set-only env refused an unknown name");
-    assert_ne!(old.env.get("CARGO_TARGET_TMPDIR"), truth(&env, "CARGO_TARGET_TMPDIR"));
+    assert_eq!(old.env.get("OUT_DIR"), EnvAnswer::Unset, "the planted set-only env refused an unknown name");
+    assert_ne!(old.env.get("OUT_DIR"), truth(&env, "OUT_DIR"));
 
     println!(
-        "macro getenv agrees with env! on {} names; CARGO_TARGET_TMPDIR refused in crate `{}`; the set-only env answered it unset",
+        "macro getenv agrees with env! on {} names; OUT_DIR refused in crate `{}`; the set-only env answered it unset",
         NAMES.len(),
         refused.err().and_then(|e| e.krate).unwrap_or_default()
     );

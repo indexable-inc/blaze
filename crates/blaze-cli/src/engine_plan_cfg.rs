@@ -84,6 +84,13 @@ impl Cut {
         self.under(test) == Tri::No
     }
 
+    /// Whether `self` cuts under `test` specifically because of the `test` atom (i.e. it does not
+    /// cut under both `Yes` and `No`, such as `#[cfg(test)]` in a non-test example target, rather
+    /// than an unconditionally false `#[cfg(any())]`).
+    pub(crate) fn cuts_by_test(self, test: Tri) -> bool {
+        self.cuts(test) && (!self.cuts(Tri::Yes) || !self.cuts(Tri::No))
+    }
+
     /// Both hold.
     fn and(self, other: Cut) -> Cut {
         Cut { no: self.no.and(other.no), yes: self.yes.and(other.yes), unknown: self.unknown.and(other.unknown) }
