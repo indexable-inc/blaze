@@ -192,6 +192,32 @@ pub(super) fn direct_name_in<'a, 'n, S: super::source::NamesSource<'n>>(
     Ok(Some(UseAt { depth, bound: Some(name), start: Some(start), written: AVec::new_in(alloc), item: module, range }))
 }
 
+/// Whether a block `use` row resolves only in the type namespace (e.g. `use foo::bar::{self}`
+/// importing module `bar`, or importing a braced struct/trait/enum) and NOT in the value
+/// namespace. In Rust's namespaces a type-only `use` must not shadow an outer value binding
+/// (`fn bar()`) for a single-segment value path.
+pub(super) fn use_is_type_only<'n, S: super::source::NamesSource<'n>>(
+    paths: &crate::resolve::Paths<S>,
+    locals: &super::locals::Locals<'_>,
+    owner: blaze_typeck::ItemKey,
+    module: LibKey,
+    row: &super::locals::Row<'_>,
+) -> bool {
+    let mut use_module = module;
+    if let Some(&head) = row.path.first()
+        && !row.abs
+        && let Some(item) = locals.find(owner, Some(row.scope), head, super::locals::LocalNs::Type).filter(|r| r.kind.in_block_module())
+    {
+        match item.module {
+            Some(m) => use_module = m,
+            None => return false,
+        }
+    }
+    let dollar = if row.abs { None } else { super::glob_uses::dollar_of(row.path.first().copied(), row.first_mark) };
+    !paths.resolves_exact(use_module, dollar, row.abs, row.path, crate::resolve::Ns::Value)
+        && paths.resolves_exact(use_module, dollar, row.abs, row.path, crate::resolve::Ns::Type)
+}
+
 /// The first segment of an expression path. A local item keeps its body's key and shadows an
 /// outer name before mark-based lookup applies. A binding in a nearer block shadows an outer
 /// syntax row.
@@ -204,12 +230,19 @@ pub(super) fn value_prefix<'n, 'l: 'a, 'a, S: super::source::NamesSource<'n>>(
     scope: Option<u32>,
     first: &'a str,
     single: bool,
+    path_ns: crate::resolve::Ns,
     mark: Option<blaze_lower::mark_site::TextMark>,
     alloc: Alloc<'a>,
 ) -> Result<(Option<super::locals::Row<'l>>, Option<super::glob_uses::Hit<'a>>), super::locals::LocalGap> {
     use super::locals::{LocalKind, LocalNs};
     let ns = if single { LocalNs::Value } else { LocalNs::Type };
-    let mut row = locals.find(owner, scope, first, ns);
+    let mut row = if single && path_ns == crate::resolve::Ns::Value {
+        locals.find_matching(owner, scope, first, ns, |r| {
+            r.kind != LocalKind::Use || !use_is_type_only(paths, locals, owner, module, r)
+        })
+    } else {
+        locals.find(owner, scope, first, ns)
+    };
     if row.is_none() && single {
         row = locals.find(owner, scope, first, LocalNs::Type)
             .filter(|r| r.kind.in_block_module() && !matches!(r.kind, LocalKind::Mod | LocalKind::ExternCrate));

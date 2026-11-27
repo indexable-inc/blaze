@@ -235,7 +235,8 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 }
                 Some(Unsizing::Adjust)
             }
-            (TyView::Infer(_), _) | (_, TyView::Infer(_)) => return Ok(None),
+            (TyView::Infer(crate::ty::Var { kind: crate::ty::VarKind::Ty, .. }), _)
+            | (_, TyView::Infer(crate::ty::Var { kind: crate::ty::VarKind::Ty, .. })) => return Ok(None),
             (_, TyView::Dynamic(_)) => self.unsize_to_dyn(pointee_a, pointee_b, cause)?,
             // A struct whose tail field unsizes (the Reference, "Type coercions", "Unsized
             // Coercions": "`Foo<.., T, ..>` to `Foo<.., U, ..>`, when `Foo` is a struct, `T`

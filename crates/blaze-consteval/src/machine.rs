@@ -1412,7 +1412,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
 
     fn repr(&mut self, t: PTy) -> R<'a, Repr> {
         Ok(match self.node(t)? {
-            PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) => Repr::Scalar(layout::int_size(self.node(t)?).ok_or(malformed("an int size"))?),
+            PNode::Bool | PNode::Char | PNode::Int(_) | PNode::Uint(_) => Repr::Scalar(layout::int_size(self.node(t)?, self.layout.ptr_bytes()).ok_or(malformed("an int size"))?),
             PNode::Float(FloatTy::F32) => Repr::Scalar(4),
             PNode::Float(FloatTy::F64) => Repr::Scalar(8),
             // binary16 and binary128: size and alignment their width (the targets' ABIs).

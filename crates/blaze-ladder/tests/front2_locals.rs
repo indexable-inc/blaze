@@ -138,6 +138,10 @@ mod fut_unexported {
 }
 fn block_use_private_namesake(x: u8) -> u8 { use crate::fut::poll_fn; use crate::tr::Twice as _; poll_fn(x).twice() }
 fn block_use_private_unexported(x: u8) -> u8 { use crate::fut_unexported::poll_fn; use crate::tr::Twice as _; x.twice() }
+mod sub_ns { pub struct Marker; }
+fn sub_ns() -> u8 { 9 }
+fn block_use_module_does_not_shadow_outer_fn() -> u8 { use crate::sub_ns::{self, Marker}; let _: Marker = Marker; sub_ns() }
+fn block_use_module_without_outer_fn() -> u8 { use crate::tr::{self}; tr() }
 ";
 
 /// The bodies that must check clean, each with the rule it proves.
@@ -159,6 +163,10 @@ const CLEAN: &[(&str, &str)] = &[
     (
         "block_use_private_namesake",
         "tokio's `Receiver::recv` shape (`use std::future::poll_fn;` over core's private `mod poll_fn` beside `pub use poll_fn::poll_fn`): a block's `use` takes the visible fn, the private module of the name brings no trait",
+    ),
+    (
+        "block_use_module_does_not_shadow_outer_fn",
+        "a block's type-only `use crate::sub_ns::{self, Marker};` does not shadow the enclosing module's `fn sub_ns()` in the value namespace",
     ),
 ];
 
@@ -182,6 +190,7 @@ const REFUSED: &[(&str, &str)] = &[
     ("block_use_out_of_block", "NoMethod"),
     ("block_trait_out_of_block", "NoMethod"),
     ("block_trait_path_elsewhere", "UnresolvedPath"),
+    ("block_use_module_without_outer_fn", "UnresolvedPath"),
 ];
 
 /// Bodies below the root that must check clean, by path from the root. `block_glob_super`: a

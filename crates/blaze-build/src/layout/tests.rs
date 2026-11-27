@@ -636,6 +636,38 @@ fn a_type_that_holds_itself_by_value_is_refused() {
     assert!(lay(&w, &mut g, &mut ls, t).is_ok());
 }
 
+/// 32-bit target layouts (`Layouts::with_ptr_bytes_in(4, ..)`, used for `Side::Macro` on
+/// `wasm32-wasip1`): `usize`, `isize`, thin references/pointers, and `fn()` are 4 bytes (align 4),
+/// and wide slice references `&[u8]` are 8 bytes (align 4), while 64-bit `Layouts::new_in` keeps
+/// them at 8 and 16 bytes.
+#[test]
+fn pointer_width_32_lays_out_usize_isize_and_pointers_at_4_bytes() {
+    let w = World::default();
+    let mut g = G::new();
+    let usize_ = g.n(PNode::Uint(UintTy::Usize));
+    let isize_ = g.n(PNode::Int(IntTy::Isize));
+    let u8_ = g.n(U8);
+    let thin = g.r(u8_);
+    let slice = g.n(PNode::Slice(u8_));
+    let wide = g.r(slice);
+
+    let mut ls32 = Layouts::with_ptr_bytes_in(4, std::alloc::Global);
+    let mut ls64 = Layouts::new_in(std::alloc::Global);
+    for (ty, want32, want64) in [
+        (usize_, (4u64, 2u8), (8u64, 3u8)),
+        (isize_, (4, 2), (8, 3)),
+        (thin, (4, 2), (8, 3)),
+        (wide, (8, 2), (16, 3)),
+    ] {
+        let id32 = lay(&w, &mut g, &mut ls32, ty).expect("32-bit layout");
+        let l32 = ls32.get(id32);
+        assert_eq!((l32.size, l32.align), want32, "32-bit layout of {ty:?}");
+        let id64 = lay(&w, &mut g, &mut ls64, ty).expect("64-bit layout");
+        let l64 = ls64.get(id64);
+        assert_eq!((l64.size, l64.align), want64, "64-bit layout of {ty:?}");
+    }
+}
+
 /// A random ground type from a pool of shapes, and the checks every layout must pass.
 fn random_types(tape: &Tape) -> Result<(), Broke> {
     let mut w = World::default();

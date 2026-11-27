@@ -2106,40 +2106,74 @@ pub fn gather_facts_planted<'n, 'a, S: NamesSource<'n>>(
         };
         let body_tys = c.types.view();
         for (idx, n) in body_tys.nodes().enumerate() {
-            let tc::PNode::Alias { trait_, name, .. } = *n else { continue };
             let mut is_copy = false;
-            if let Ok(pos) = g.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, nm, _)| (k, nm))
-                && let Some(&(_, _, a_item)) = g.assoc_items.get(pos)
-            {
-                if let Some(&(_, cached)) = assoc_copy_cache.iter().find(|&&(k, _)| k == a_item.0) {
-                    is_copy = cached;
-                } else {
-                    let mut sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
-                    if let Some(ap) = r.store.preds.get(&a_item) {
-                        let stys = r.store.tys.view();
-                        for ac in ap.clauses.iter() {
-                            if let tc::PClause::Trait { trait_: sup, args } = *ac
-                                && let Ok(list) = stys.list(args)
-                                && let Some(&first) = list.first()
-                                && let Ok(tc::PNode::Alias { trait_: at, name: an, .. }) = stys.node(first)
-                                && at == trait_
-                                && an == name
-                            {
-                                sups.push(sup);
+            match *n {
+                tc::PNode::Alias { trait_, name, .. } => {
+                    if let Ok(pos) = g.assoc_items.binary_search_by_key(&(trait_.0, name), |&(k, nm, _)| (k, nm))
+                        && let Some(&(_, _, a_item)) = g.assoc_items.get(pos)
+                    {
+                        if let Some(&(_, cached)) = assoc_copy_cache.iter().find(|&&(k, _)| k == a_item.0) {
+                            is_copy = cached;
+                        } else {
+                            let mut sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                            if let Some(ap) = r.store.preds.get(&a_item) {
+                                let stys = r.store.tys.view();
+                                for ac in ap.clauses.iter() {
+                                    if let tc::PClause::Trait { trait_: sup, args } = *ac
+                                        && let Ok(list) = stys.list(args)
+                                        && let Some(&first) = list.first()
+                                        && let Ok(tc::PNode::Alias { trait_: at, name: an, .. }) = stys.node(first)
+                                        && at == trait_
+                                        && an == name
+                                    {
+                                        sups.push(sup);
+                                    }
+                                }
+                            }
+                            let mut found = false;
+                            for &sup in sups.iter() {
+                                if reaches_copy(r, sup, &mut g.reads) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            assoc_copy_cache.push((a_item.0, found));
+                            g.reads.push(assoc_copy_read(a_item.0, found));
+                            is_copy = found;
+                        }
+                    }
+                }
+                tc::PNode::Opaque(ok, _) => {
+                    if let Some(&(_, cached)) = assoc_copy_cache.iter().find(|&&(k, _)| k == ok.0) {
+                        is_copy = cached;
+                    } else {
+                        let mut sups: AVec<'a, tc::ItemKey> = AVec::new_in(alloc);
+                        if let Some(op) = r.store.preds.get(&ok) {
+                            let stys = r.store.tys.view();
+                            for oc in op.clauses.iter() {
+                                if let tc::PClause::Trait { trait_: sup, args } = *oc
+                                    && let Ok(list) = stys.list(args)
+                                    && let Some(&first) = list.first()
+                                    && let Ok(tc::PNode::Opaque(k2, _)) = stys.node(first)
+                                    && k2 == ok
+                                {
+                                    sups.push(sup);
+                                }
                             }
                         }
-                    }
-                    let mut found = false;
-                    for &sup in sups.iter() {
-                        if reaches_copy(r, sup, &mut g.reads) {
-                            found = true;
-                            break;
+                        let mut found = false;
+                        for &sup in sups.iter() {
+                            if reaches_copy(r, sup, &mut g.reads) {
+                                found = true;
+                                break;
+                            }
                         }
+                        assoc_copy_cache.push((ok.0, found));
+                        g.reads.push(assoc_copy_read(ok.0, found));
+                        is_copy = found;
                     }
-                    assoc_copy_cache.push((a_item.0, found));
-                    g.reads.push(assoc_copy_read(a_item.0, found));
-                    is_copy = found;
                 }
+                _ => continue,
             }
             if !is_copy
                 && let Ok(pty_id) = u32::try_from(idx)

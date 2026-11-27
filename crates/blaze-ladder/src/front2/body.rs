@@ -1080,7 +1080,7 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
         let mut absolute = abs;
         if !abs {
             let (row, hit) = super::scope_table::value_prefix(
-                &self.builder.resolver, self.locals, self.owner, self.env.module, scope.map(|s| s.0), first, false, mark, self.mark_alloc,
+                &self.builder.resolver, self.locals, self.owner, self.env.module, scope.map(|s| s.0), first, false, crate::resolve::Ns::Value, mark, self.mark_alloc,
             ).map_err(|gap| Why::Unsupported(gap.form, range))?;
             if let Some(hit) = hit {
                 let mut through = hit.path;

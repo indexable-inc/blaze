@@ -991,6 +991,8 @@ pub struct Layouts<A: Allocator + Clone> {
     /// (a struct row's `Fields::Struct::first`, the row of its last field): every struct or
     /// tuple whose last field is itself a struct ending in a trait object, read by `dyn_chain`.
     dyn_inner: Vec<(u32, LayoutId), A>,
+    /// Target pointer width in bytes (8 for 64-bit targets, 4 for 32-bit targets like `wasm32-wasip1`).
+    ptr_bytes: u8,
     alloc: A,
     /// A planted bug for the control test (layout/niche_table.rs): every `repr(Rust)` enum of
     /// two or more present variants takes the tagged layout, never the niche one.
@@ -1003,23 +1005,25 @@ fn align_up(at: u64, align: u8) -> Result<u64, Refusal> {
     at.checked_add(a - 1).map(|v| v & !(a - 1)).filter(|&v| v <= MAX_SIZE).ok_or(Refusal::TooLarge)
 }
 
-fn int_prim(i: IntTy) -> Prim {
+fn int_prim_for(i: IntTy, ptr_bytes: u8) -> Prim {
     let bytes = match i {
         IntTy::I8 => 1,
         IntTy::I16 => 2,
         IntTy::I32 => 4,
-        IntTy::I64 | IntTy::Isize => 8,
+        IntTy::I64 => 8,
+        IntTy::Isize => ptr_bytes,
         IntTy::I128 => 16,
     };
     Prim::Int { bytes, signed: true }
 }
 
-fn uint_prim(u: UintTy) -> Prim {
+fn uint_prim_for(u: UintTy, ptr_bytes: u8) -> Prim {
     let bytes = match u {
         UintTy::U8 => 1,
         UintTy::U16 => 2,
         UintTy::U32 => 4,
-        UintTy::U64 | UintTy::Usize => 8,
+        UintTy::U64 => 8,
+        UintTy::Usize => ptr_bytes,
         UintTy::U128 => 16,
     };
     Prim::Int { bytes, signed: false }
@@ -1069,6 +1073,12 @@ fn better(a: Option<Niche>, b: Option<Niche>) -> Option<Niche> {
 
 impl<A: Allocator + Copy> Layouts<A> {
     pub fn new_in(alloc: A) -> Layouts<A> {
+        Layouts::with_ptr_bytes_in(PTR_BYTES as u8, alloc)
+    }
+
+    /// Creates a layout table with the given target pointer width in bytes (e.g. `4` for
+    /// `wasm32-wasip1`, `8` for 64-bit targets).
+    pub fn with_ptr_bytes_in(ptr_bytes: u8, alloc: A) -> Layouts<A> {
         Layouts {
             rows: Vec::new_in(alloc),
             by_ty: crate::instance::PtyMap::new_in(alloc),
@@ -1076,6 +1086,7 @@ impl<A: Allocator + Copy> Layouts<A> {
             variant_rows: Vec::new_in(alloc),
             discrs: Vec::new_in(alloc),
             dyn_inner: Vec::new_in(alloc),
+            ptr_bytes,
             alloc,
             #[cfg(test)]
             niche_off: false,
@@ -1084,6 +1095,10 @@ impl<A: Allocator + Copy> Layouts<A> {
 }
 
 impl<A: Allocator + Clone> Layouts<A> {
+    /// Target pointer width in bytes (`4` for 32-bit targets, `8` for 64-bit targets).
+    pub fn ptr_bytes(&self) -> u8 {
+        self.ptr_bytes
+    }
 
     /// The allocator the table's columns are in.
     pub fn alloc(&self) -> A {
@@ -1422,12 +1437,33 @@ impl<A: Allocator + Clone> Layouts<A> {
             niche: None,
             discrs: (0, 0),
         };
-        let nonnull = Some(WrappingRange { start: 1, end: mask(64) });
+        let ptr_bytes_u8 = self.ptr_bytes;
+        let ptr_bytes = u64::from(ptr_bytes_u8);
+        let ptr_bits = u32::from(ptr_bytes_u8) * 8;
+        let ptr_align = ptr_bytes_u8.trailing_zeros() as u8;
+        let nonnull = Some(WrappingRange { start: 1, end: mask(ptr_bits) });
+        let thin_ptr = |valid: WrappingRange| {
+            let scalar = Scalar { prim: Prim::Ptr, valid };
+            Layout {
+                ty: t,
+                call_ty: t,
+                size: ptr_bytes,
+                align: ptr_align,
+                tail: Tail::Sized,
+                uninhabited: false,
+                scalar: Some(scalar),
+                pair: None,
+                fields: Fields::Primitive,
+                variants: Variants::Single { index: 0 },
+                niche: Niche::of(0, scalar),
+                discrs: (0, 0),
+            }
+        };
         let layout = match node {
             PNode::Bool => prim(Prim::Int { bytes: 1, signed: false }, Some(WrappingRange { start: 0, end: 1 })),
             PNode::Char => prim(Prim::Int { bytes: 4, signed: false }, Some(WrappingRange { start: 0, end: 0x10FFFF })),
-            PNode::Int(i) => prim(int_prim(i), None),
-            PNode::Uint(u) => prim(uint_prim(u), None),
+            PNode::Int(i) => prim(int_prim_for(i, ptr_bytes_u8), None),
+            PNode::Uint(u) => prim(uint_prim_for(u, ptr_bytes_u8), None),
             PNode::Float(f) => prim(
                 match f {
                     FloatTy::F16 => Prim::F16,
@@ -1444,7 +1480,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     "an async block's future named by its expression in a ground type (only its identity, `PNode::Coroutine`, crosses a body: coroutine.rs)",
                 ));
             }
-            PNode::FnPtr(..) => prim(Prim::Ptr, nonnull),
+            PNode::FnPtr(..) => thin_ptr(nonnull.unwrap_or(WrappingRange::full(ptr_bits))),
             // A pattern type (typeck.md, "Pattern types"): its base's layout, its scalar (a
             // pointer's address, for a wide one) valid only in the node's one canonical range;
             // so an enclosing enum finds the niche (`Option<NonZero<u32>>` is 4 bytes).
@@ -1489,21 +1525,21 @@ impl<A: Allocator + Clone> Layouts<A> {
             }
             PNode::Ref(_, p) | PNode::Ptr(_, p) => {
                 let is_ref = matches!(node, PNode::Ref(..));
-                let addr = Scalar { prim: Prim::Ptr, valid: if is_ref { nonnull.unwrap_or(WrappingRange::full(64)) } else { WrappingRange::full(64) } };
+                let addr = Scalar { prim: Prim::Ptr, valid: if is_ref { nonnull.unwrap_or(WrappingRange::full(ptr_bits)) } else { WrappingRange::full(ptr_bits) } };
                 if let Some(tail) = self.pointee_tail(p, cx)? {
                     // The metadata: a length, or a trait object's vtable address (codegen.md,
                     // "Trait objects"); the niche stays in the data word, as a thin pointer's.
                     let len = match tail {
-                        Tail::Dyn => Scalar::full(Prim::Ptr),
-                        Tail::Slice { .. } | Tail::Sized => Scalar::full(Prim::Int { bytes: 8, signed: false }),
+                        Tail::Dyn => Scalar { prim: Prim::Ptr, valid: WrappingRange::full(ptr_bits) },
+                        Tail::Slice { .. } | Tail::Sized => Scalar::full(Prim::Int { bytes: ptr_bytes_u8, signed: false }),
                     };
                     let first = self.offsets.len() as u32;
-                    self.offsets.extend_from_slice(&[0, PTR_BYTES]);
+                    self.offsets.extend_from_slice(&[0, ptr_bytes]);
                     Layout {
                         ty: t,
                         call_ty: t,
-                        size: 2 * PTR_BYTES,
-                        align: PTR_ALIGN,
+                        size: 2 * ptr_bytes,
+                        align: ptr_align,
                         tail: Tail::Sized,
                         uninhabited: false,
                         scalar: None,
@@ -1514,7 +1550,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                         discrs: (0, 0),
                     }
                 } else {
-                    prim(Prim::Ptr, Some(addr.valid))
+                    thin_ptr(addr.valid)
                 }
             }
             PNode::Str | PNode::Slice(_) => {
@@ -2012,8 +2048,8 @@ impl<A: Allocator + Clone> Layouts<A> {
         // repr(C) and repr(<int>): explicit tagged layouts (RFC 2195).
         if attrs.c || attrs.int.is_some() {
             let prim = match attrs.int {
-                Some(IntRepr::Signed(i)) => int_prim(i),
-                Some(IntRepr::Unsigned(u)) => uint_prim(u),
+                Some(IntRepr::Signed(i)) => int_prim_for(i, self.ptr_bytes),
+                Some(IntRepr::Unsigned(u)) => uint_prim_for(u, self.ptr_bytes),
                 None => Prim::Int { bytes: 4, signed: true },
             };
             if !fits(prim, min) || !fits(prim, max) {

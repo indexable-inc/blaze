@@ -1185,7 +1185,7 @@ fn procs_of<P: blaze_world::Packages<'static>>(store: &FsPath, out: &FsPath, roo
         }
     }
     let path_dir = |id: LockId| paths.iter().find(|p| p.id == id).map(|p| root.join(p.dir));
-    let made = blaze_world::procs::register_macro_crates(&mut procs, store, lock, macro_units, path_dir).unwrap_or_else(|e| panic!("{e}"));
+    let made = blaze_world::procs::register_macro_crates(&mut procs, store, lock, graph, macro_units, path_dir).unwrap_or_else(|e| panic!("{e}"));
     for (i, why) in &made.unregistered {
         println!("procs         {} {}: not registered: {why:?}", world.crates[*i].package, world.crates[*i].version);
     }
