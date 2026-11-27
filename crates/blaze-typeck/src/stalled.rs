@@ -28,7 +28,7 @@ use core::mem::DropGuard;
 
 use crate::body::{BodyView, Expr};
 use crate::columns::Checked;
-use crate::diag::{Because, Diag, DiagCode, PendingWhyStep, UnmetGoal, Why, WhyDef, WhyReached, WhyStep};
+use crate::diag::{Because, Diag, DiagCode, PendingWhyStep, UnmetGoal, Why, WhyDef, WhyLeaf, WhyReached, WhyStep};
 use crate::error::{CheckError, Limit, Malformed, Stop};
 use crate::ids::{ExprId, ItemKey, Name};
 use crate::infer::{InferCtx, InferCtxIn};
@@ -252,105 +252,91 @@ fn decide<'a, 's, W: World>(
     let mut cx = InferCtx::analysis_in(alloc);
     assume_where_clauses(&mut cx, reads, body.owner)?;
     for row in checked.stalled.iter() {
-        let goal = {
-            let mut src = Exact { asked: Asked { reads }, body, types, exact };
-            match row.import_witness_goal(&mut cx, &mut src, record) {
-                Ok(goal) => goal,
-                Err(StalledError::Check(e)) => {
-                    if let CheckError::Malformed(crate::error::Malformed::NoRecord(Question::Coroutine(owner, ordinal))) = e
-                        && reads.coroutine_record(owner, ordinal)?.is_some_and(|f| f.is == crate::InteriorIs::Superset)
-                    {
-                        return Err(CheckError::ForeignWitness {
-                            gap: crate::EXTERNAL_WITNESS_GAP, item: owner, ordinal: Some(ordinal), at: row.diag.at,
-                        }.into());
-                    }
-                    return Err(e.at_coroutine_import(body.owner, row.diag.at).into());
-                }
-                Err(other) => return Err(other),
-            }
+        let (goal, first_superset) = {
+            let mut src = Exact {
+                asked: Asked { reads },
+                body,
+                types,
+                exact,
+                superset_open: false,
+                in_foreign: false,
+                first_superset: None,
+                open_interiors: Vec::new_in(alloc),
+            };
+            let g = import_row(row, &mut cx, &mut src, record, body.owner)?;
+            (g, src.first_superset)
         };
         cx.register(Obligation { goal, cause: Cause::Body })?;
         cx.select_all(reads)?;
         // Bounded: one obligation was registered, and each `next_error` removes one error.
-        let mut failure: Option<FulfillErrorKind> = None;
+        let mut saw_unsatisfied = false;
+        let mut saw_mismatch = false;
+        let mut saw_ambiguous = false;
         while let Some(err) = cx.next_error() {
             match err.kind {
-                FulfillErrorKind::Mismatch => failure = Some(FulfillErrorKind::Mismatch),
-                FulfillErrorKind::Unsatisfied => {
-                    if failure.is_none() {
-                        failure = Some(FulfillErrorKind::Unsatisfied);
-                    }
-                }
-                FulfillErrorKind::Ambiguous => {
-                    // Undecided because the solver stalled on another fn's opaque, at any depth
-                    // (a revealed future's interior holds a third fn's future): the typed gap
-                    // naming it, which the caller answers by revealing it and deciding again
-                    // (front2 stalled_goals.rs `decide_stalled_goals`), never the witness gap.
-                    if let Some(opaque) = cx.hidden_unknown(goal, &|_| false, reads)? {
-                        if let Some(h) = reads.opaque_record(opaque)? {
-                            use crate::rules::async_fn::{SupersetFrom, superset_record};
-                            if let Some((item, ordinal)) = superset_record(reads, SupersetFrom::Import(h), alloc)? {
-                                return Err(CheckError::ForeignWitness {
-                                    gap: crate::EXTERNAL_WITNESS_GAP, item, ordinal: Some(ordinal), at: row.diag.at,
-                                }.into());
-                            }
-                        }
-                        return Err(StalledError::Check(CheckError::OpaqueHiddenUnknown { opaque, trait_: row.trait_ }));
-                    }
-                    let storage = row.unproved_storage(goal, body, types, exact, &mut cx, reads, FulfillErrorKind::Ambiguous)?;
-                    let unavailable = match storage {
-                        Some((_, field)) => unavailable_witness(field, row.diag.at, body, types, exact, reads, true, false, alloc)?,
-                        None => row.unavailable_goal_witness(body, types, exact, reads, true, alloc)?,
-                    };
-                    if let Some(why) = unavailable {
-                        return Err(why);
-                    }
-                    // What it rests on (rule 19): the solver's undecided walk on the same goal,
-                    // in a probe (nothing is bound). It is bounded by the solver's
-                    // `MAX_WHY_ROWS` and `MAX_WHY_DEPTH`.
-                    let mut steps: Vec<PendingWhyStep, Alloc<'_>> = Vec::new_in(alloc);
-                    let undecided = cx.why_maybe_chain(goal, &mut steps, reads)?.map(|leaf| crate::error::UndecidedLeaf {
-                        trait_: steps.iter().rev().find_map(|s| s.goal.map(|(t, _)| t)),
-                        depth: u32::try_from(steps.len().saturating_sub(1)).unwrap_or(u32::MAX),
-                        leaf,
-                    });
-                    return Err(StalledError::Ambiguous { trait_: row.trait_, site: row.diag.at, storage, undecided });
-                }
+                FulfillErrorKind::Mismatch => saw_mismatch = true,
+                FulfillErrorKind::Unsatisfied => saw_unsatisfied = true,
+                FulfillErrorKind::Ambiguous => saw_ambiguous = true,
             }
         }
-        if let Some(fail_kind) = failure {
-            // A deferred projection whose trait/where-clauses now select cleanly on exact
-            // interiors and normalize to a different type than its term is E0271
-            // (`DiagCode::ProjectionMismatch`), matching `Machine::report_each_fulfill_error`.
-            if fail_kind == FulfillErrorKind::Mismatch
-                && let Goal::Projection { trait_, args, name, .. } = goal
-                && let Some(Because::Unmet { goal: UnmetGoal::Projection { term: expected_term, .. }, leaf: None }) = row.diag.because
-                && let Some(found_ty) = projection_found(&mut cx, reads, trait_, args, name, alloc)?
-            {
-                let mut diag = row.diag;
-                diag.code = DiagCode::ProjectionMismatch;
-                diag.expected = Some(expected_term);
-                diag.name = Some(name);
-                diag.found = match chains.as_mut() {
-                    Some(c) => export_as(&mut cx.exporter(), found_ty, c.table, Keep::Owner, 0)?,
-                    None => None,
-                };
-                out.push(diag);
-                continue;
+        // A deferred projection whose trait/where-clauses now select cleanly on exact interiors
+        // and normalize to a different type than its term is E0271 (`DiagCode::ProjectionMismatch`),
+        // matching `Machine::report_each_fulfill_error`.
+        if saw_mismatch
+            && let Goal::Projection { trait_, args, name, .. } = goal
+            && let Some(Because::Unmet { goal: UnmetGoal::Projection { term: expected_term, .. }, leaf: None }) = row.diag.because
+            && let Some(found_ty) = projection_found(&mut cx, reads, trait_, args, name, alloc)?
+        {
+            let mut diag = row.diag;
+            diag.code = DiagCode::ProjectionMismatch;
+            diag.expected = Some(expected_term);
+            diag.name = Some(name);
+            diag.found = match chains.as_mut() {
+                Some(c) => export_as(&mut cx.exporter(), found_ty, c.table, Keep::Owner, 0)?,
+                None => None,
+            };
+            out.push(diag);
+            continue;
+        }
+        let definitive_pass1 = saw_unsatisfied || (saw_mismatch && !saw_ambiguous);
+        if !definitive_pass1 && saw_ambiguous {
+            // Undecided because the solver stalled on another fn's opaque, at any depth
+            // (a revealed future's interior holds a third fn's future): the typed gap naming it,
+            // which the caller answers by revealing it and deciding again (front2
+            // stalled_goals.rs `decide_stalled_goals`), never the witness gap.
+            if let Some(err) = ambiguous_foreign_witness(row, goal, &mut cx, reads, first_superset, alloc)? {
+                return Err(err);
             }
-            let stored = match row.unproved_storage(goal, body, types, exact, &mut cx, reads, FulfillErrorKind::Unsatisfied)? {
-                Some((block, field)) => {
-                    // The blamed value may be another fn's future read as its superset
-                    // (`Exact::coroutine_of`): its `No` does not say what the state stores.
-                    if let Some(why) = unavailable_witness(field, row.diag.at, body, types, exact, reads, false, false, alloc)? {
-                        return Err(why);
-                    }
-                    Some((block, field))
-                }
+            let storage = row.unproved_storage(goal, types, exact, &mut cx, reads, FulfillErrorKind::Ambiguous)?;
+            // What it rests on (rule 19): the solver's undecided walk on the same goal, in a
+            // probe (nothing is bound). It is bounded by the solver's `MAX_WHY_ROWS` and
+            // `MAX_WHY_DEPTH`.
+            let mut steps: Vec<PendingWhyStep, Alloc<'_>> = Vec::new_in(alloc);
+            let undecided = cx.why_maybe_chain(goal, &mut steps, reads)?.map(|leaf| crate::error::UndecidedLeaf {
+                trait_: steps.iter().rev().find_map(|s| s.goal.map(|(t, _)| t)),
+                depth: u32::try_from(steps.len().saturating_sub(1)).unwrap_or(u32::MAX),
+                leaf,
+            });
+            return Err(StalledError::Ambiguous { trait_: row.trait_, site: row.diag.at, storage, undecided });
+        }
+        if definitive_pass1 {
+            // If Pass 1 imported any foreign `Superset` coroutine, verify that the solver's `No`
+            // still holds when every foreign `Superset` coroutine's interior is left open.
+            // If it becomes `Ambiguous` or no longer fails, the `No` relied on provisional
+            // superset state -> `EXTERNAL_WITNESS_GAP`, never a false E0277. If it still fails
+            // definitively (`No && Ambiguous == No`), use the verified context so `unproved_storage`
+            // and `why_chain` blame only the definitively failing constituent.
+            let mut verified: Option<(InferCtx<'_>, Goal)> = None;
+            if let Some(fallback) = first_superset {
+                verified = Some(verify_without_superset(row, body, record, types, exact, reads, fallback, alloc)?);
+            }
+            let (active_cx, active_goal) = match verified.as_mut() {
+                Some((cx2, g2)) => (cx2, *g2),
+                None => (&mut cx, goal),
+            };
+            let stored = match row.unproved_storage(active_goal, types, exact, active_cx, reads, FulfillErrorKind::Unsatisfied)? {
+                Some((block, field)) => Some((block, field)),
                 None => {
-                    if let Some(why) = row.unavailable_goal_witness(body, types, exact, reads, false, alloc)? {
-                        return Err(why);
-                    }
                     if matches!(types.node(row.ty)?, PNode::Future(..))
                         && (reads.lang_item(crate::LangItem::Send)? == Some(row.trait_)
                             || reads.lang_item(crate::LangItem::Sync)? == Some(row.trait_))
@@ -359,13 +345,13 @@ fn decide<'a, 's, W: World>(
                         // capture or saved value. The root failure alone cannot identify one.
                         return Err(StalledError::Ambiguous { trait_: row.trait_, site: row.diag.at, storage: None, undecided: None });
                     }
-                    unsize_storage(row, goal, body, types, exact, &mut cx, reads, alloc)?
+                    unsize_storage(row, active_goal, body, types, exact, active_cx, reads, alloc)?
                 }
             };
             // The row's own goal walked by the solver on the exact interiors: root, the
             // interior's slot, the clauses under it, and why the last goal fails by itself.
             let diag = match chains.as_mut() {
-                Some(c) => row.chained(goal, &mut cx, reads, exact, c)?,
+                Some(c) => row.chained(active_goal, active_cx, reads, exact, c)?,
                 None => row.diag,
             };
             if let Some((block, field)) = stored {
@@ -376,6 +362,138 @@ fn decide<'a, 's, W: World>(
     }
     drop_implied_projections(&mut out, fields, record)?;
     Ok(out)
+}
+
+/// Import a stalled row's goal through `src`, turning a missing record for a `Superset` foreign
+/// coroutine into `CheckError::ForeignWitness`.
+fn import_row<W: World>(
+    row: &Stalled,
+    cx: &mut InferCtx<'_>,
+    src: &mut Exact<'_, '_, '_, '_, '_, '_, '_, '_, W>,
+    record: PTys<'_>,
+    owner: ItemKey,
+) -> Result<Goal, StalledError> {
+    match row.import_witness_goal(cx, src, record) {
+        Ok(goal) => Ok(goal),
+        Err(StalledError::Check(e)) => {
+            if let CheckError::Malformed(Malformed::NoRecord(Question::Coroutine(cor_owner, ordinal))) = e
+                && src.asked.reads.coroutine_record(cor_owner, ordinal)?.is_some_and(|f| f.is == crate::InteriorIs::Superset)
+            {
+                return Err(CheckError::ForeignWitness {
+                    gap: crate::EXTERNAL_WITNESS_GAP, item: cor_owner, ordinal: Some(ordinal), at: row.diag.at,
+                }.into());
+            }
+            Err(e.at_coroutine_import(owner, row.diag.at).into())
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Classify an `Ambiguous` replay result when the solver stalled on an unrevealed opaque,
+/// an opaque backed by a foreign `Superset` coroutine, or an open foreign coroutine interior.
+fn ambiguous_foreign_witness<W: World>(
+    row: &Stalled,
+    goal: Goal,
+    cx: &mut InferCtx<'_>,
+    reads: &mut Reads<'_, '_, W>,
+    first_superset: Option<(ItemKey, u32)>,
+    alloc: Alloc<'_>,
+) -> Result<Option<StalledError>, StalledError> {
+    if let Some(opaque) = cx.hidden_unknown(goal, &|_| false, reads)? {
+        return Ok(Some(opaque_witness_gap(opaque, row, reads, alloc)?));
+    }
+    let mut steps: Vec<PendingWhyStep, Alloc<'_>> = Vec::new_in(alloc);
+    match cx.why_maybe_chain(goal, &mut steps, reads)? {
+        Some(WhyLeaf::InteriorUnknown { coroutine: WhyDef::Of { owner, ordinal } }) => {
+            return Ok(Some(CheckError::ForeignWitness {
+                gap: crate::EXTERNAL_WITNESS_GAP, item: owner, ordinal: Some(ordinal), at: row.diag.at,
+            }.into()));
+        }
+        Some(WhyLeaf::HiddenUnknown { opaque }) => {
+            return Ok(Some(opaque_witness_gap(opaque, row, reads, alloc)?));
+        }
+        _ => {}
+    }
+    if let Some((item, ordinal)) = first_superset {
+        return Ok(Some(CheckError::ForeignWitness {
+            gap: crate::EXTERNAL_WITNESS_GAP, item, ordinal: Some(ordinal), at: row.diag.at,
+        }.into()));
+    }
+    Ok(None)
+}
+
+/// For an opaque that caused ambiguity: `ForeignWitness` if its record is already known and
+/// reaches a `Superset` coroutine, else `OpaqueHiddenUnknown` so the driver reveals it.
+fn opaque_witness_gap<W: World>(
+    opaque: ItemKey,
+    row: &Stalled,
+    reads: &mut Reads<'_, '_, W>,
+    alloc: Alloc<'_>,
+) -> Result<StalledError, StalledError> {
+    if let Some(h) = reads.opaque_record(opaque)? {
+        use crate::rules::async_fn::{SupersetFrom, superset_record};
+        if let Some((item, ordinal)) = superset_record(reads, SupersetFrom::Import(h), alloc)? {
+            return Ok(CheckError::ForeignWitness {
+                gap: crate::EXTERNAL_WITNESS_GAP, item, ordinal: Some(ordinal), at: row.diag.at,
+            }.into());
+        }
+    }
+    Ok(StalledError::Check(CheckError::OpaqueHiddenUnknown { opaque, trait_: row.trait_ }))
+}
+
+/// Re-solve `row` with every foreign `Superset` coroutine's interior replaced by an open
+/// inference variable. Returns `Ok((cx2, goal2))` if the goal is still definitively `No`
+/// (independent of provisional foreign state), or `Err(ForeignWitness / OpaqueHiddenUnknown)`
+/// if the failure relied on a foreign `Superset` interior.
+#[allow(clippy::too_many_arguments)]
+fn verify_without_superset<'a, W: World>(
+    row: &Stalled,
+    body: &BodyView<'_>,
+    record: PTys<'_>,
+    types: PTys<'_>,
+    exact: LocalWitnesses<'_, '_>,
+    reads: &mut Reads<'_, '_, W>,
+    fallback: (ItemKey, u32),
+    alloc: Alloc<'a>,
+) -> Result<(InferCtx<'a>, Goal), StalledError> {
+    let mut cx2 = InferCtx::analysis_in(alloc);
+    assume_where_clauses(&mut cx2, reads, body.owner)?;
+    let mut src = Exact {
+        asked: Asked { reads },
+        body,
+        types,
+        exact,
+        superset_open: true,
+        in_foreign: false,
+        first_superset: None,
+        open_interiors: Vec::new_in(alloc),
+    };
+    let goal2 = import_row(row, &mut cx2, &mut src, record, body.owner)?;
+    let superset_hint = src.first_superset.unwrap_or(fallback);
+    cx2.register(Obligation { goal: goal2, cause: Cause::Body })?;
+    cx2.select_all(reads)?;
+    let mut saw_unsatisfied = false;
+    let mut saw_mismatch = false;
+    let mut saw_ambiguous = false;
+    while let Some(err) = cx2.next_error() {
+        match err.kind {
+            FulfillErrorKind::Unsatisfied => saw_unsatisfied = true,
+            FulfillErrorKind::Mismatch => saw_mismatch = true,
+            FulfillErrorKind::Ambiguous => saw_ambiguous = true,
+        }
+    }
+    if saw_unsatisfied || (saw_mismatch && !saw_ambiguous) {
+        return Ok((cx2, goal2));
+    }
+    if let Some(err) = ambiguous_foreign_witness(row, goal2, &mut cx2, reads, Some(superset_hint), alloc)? {
+        return Err(err);
+    }
+    Err(CheckError::ForeignWitness {
+        gap: crate::EXTERNAL_WITNESS_GAP,
+        item: superset_hint.0,
+        ordinal: Some(superset_hint.1),
+        at: row.diag.at,
+    }.into())
 }
 
 /// Drop any replayed `Unsatisfied` projection finding whose owning trait goal also failed as
@@ -420,57 +538,10 @@ fn drop_implied_projections(
 }
 
 impl Stalled {
-    /// Validate every root type of the replayed goal (all trait arguments and any projection
-    /// term, not just `Self`) against unavailable or superset witnesses.
-    fn unavailable_goal_witness<W: World>(
-        &self,
-        body: &BodyView<'_>,
-        types: PTys<'_>,
-        exact: LocalWitnesses<'_, '_>,
-        reads: &mut Reads<'_, '_, W>,
-        ambiguous: bool,
-        alloc: Alloc<'_>,
-    ) -> Result<Option<StalledError>, StalledError> {
-        let (args, extra) = match self.diag.because {
-            Some(Because::Unmet { goal: UnmetGoal::Trait { trait_, args }, .. })
-                if trait_ == self.trait_ && types.list(args)?.first() == Some(&self.ty) =>
-            {
-                (Some(args), None)
-            }
-            Some(Because::Unmet { goal: UnmetGoal::Projection { trait_, args, term, .. }, leaf: None })
-                if trait_ == self.trait_ && types.list(args)?.first() == Some(&self.ty) =>
-            {
-                (Some(args), Some(term))
-            }
-            Some(Because::Unmet { leaf: Some(UnmetGoal::Trait { trait_, args }), .. })
-                if trait_ == self.trait_ && types.list(args)?.first() == Some(&self.ty) =>
-            {
-                (Some(args), None)
-            }
-            _ => (None, Some(self.ty)),
-        };
-        let is_auto = reads.trait_def(self.trait_)?.is_some_and(|d| d.flags.0 & crate::world::TraitFlags::AUTO != 0);
-        let follow_sigs = !is_auto;
-        if let Some(args) = args {
-            for &ty in types.list(args)? {
-                if let Some(why) = unavailable_witness(ty, self.diag.at, body, types, exact, reads, ambiguous, follow_sigs, alloc)? {
-                    return Ok(Some(why));
-                }
-            }
-        }
-        if let Some(ty) = extra
-            && let Some(why) = unavailable_witness(ty, self.diag.at, body, types, exact, reads, ambiguous, follow_sigs, alloc)?
-        {
-            return Ok(Some(why));
-        }
-        Ok(None)
-    }
-
     /// Isolate the stored type responsible for a negative or undecided
     /// structural auto trait. A definitive failure requires a known witness.
-    #[allow(clippy::too_many_arguments)]
     fn unproved_storage<W: World>(
-        &self, goal: Goal, body: &BodyView<'_>, types: PTys<'_>, exact: LocalWitnesses<'_, '_>, cx: &mut InferCtx<'_>, reads: &mut Reads<'_, '_, W>,
+        &self, goal: Goal, types: PTys<'_>, exact: LocalWitnesses<'_, '_>, cx: &mut InferCtx<'_>, reads: &mut Reads<'_, '_, W>,
         kind: FulfillErrorKind,
     ) -> Result<Option<(ExprId, PTy)>, StalledError> {
         let PNode::Future(block, _, stored) = types.node(self.ty)? else { return Ok(None) };
@@ -488,9 +559,7 @@ impl Stalled {
             } else {
                 !cx.may_hold(goal, reads)?
             };
-            if matches && (kind != FulfillErrorKind::Unsatisfied
-                || unavailable_witness(field, self.diag.at, body, types, exact, reads, false, false, cx.alloc())?.is_none())
-            {
+            if matches {
                 return Ok(Some((block, field)));
             }
         }
@@ -598,7 +667,16 @@ fn unsize_storage<W: World>(
                 let PNode::Tuple(list) = types.node(interior)? else { continue };
                 for &field in types.list(list)?.iter() {
                     let ty = {
-                        let mut src = Exact { asked: Asked { reads }, body, types, exact };
+                        let mut src = Exact {
+                            asked: Asked { reads },
+                            body,
+                            types,
+                            exact,
+                            superset_open: true,
+                            in_foreign: false,
+                            first_superset: None,
+                            open_interiors: Vec::new_in(alloc),
+                        };
                         import(cx, &mut src, types, field, &[], 0)?
                     };
                     for &k in autos.iter() {
@@ -754,147 +832,6 @@ fn projection_found<W: World>(
     Ok(Some(value))
 }
 
-/// The row index in `checked.closures` for the `ordinal`-th closure expression of `body`.
-fn local_closure_row(body: &BodyView<'_>, checked: &Checked<'_>, ordinal: u32) -> Option<usize> {
-    let mut seen = 0u32;
-    let mut at: Option<ExprId> = None;
-    for (i, x) in body.exprs.iter().enumerate() {
-        if matches!(x, Expr::Closure { .. }) {
-            if seen == ordinal {
-                at = u32::try_from(i).ok().map(ExprId);
-                break;
-            }
-            seen += 1;
-        }
-    }
-    let e = at?;
-    checked.closures.column::<0>().iter().position(|&c| c == e)
-}
-
-/// An opaque may still lack its defining body; a revealed one, or a nominal coroutine, may
-/// reach another fn's record that is only a superset ([`crate::InteriorIs::Superset`]), which
-/// decides no failure (`EXTERNAL_WITNESS_GAP`). For a local future inspect only stored fields.
-/// When `ambiguous` is false (a definitive solver `No`), an unrevealed opaque cannot have
-/// caused a false `No` (structural auto traits answer `Ambiguous` for unrevealed opaques, and
-/// non-auto traits/projections ignore hidden types in analysis mode), so only its arguments
-/// and any already-revealed superset hidden types are checked.
-/// When `follow_sigs` is true (a non-auto trait or projection goal), function signatures
-/// (`FnPtr`, `FnDef`, and closure signatures) are also walked because impls can match on their
-/// parameter or return types; for auto traits only stored fields and captures matter.
-#[allow(clippy::too_many_arguments)]
-fn unavailable_witness<W: World>(
-    ty: PTy, at: crate::ids::Range, body: &BodyView<'_>, types: PTys<'_>, exact: LocalWitnesses<'_, '_>,
-    reads: &mut Reads<'_, '_, W>, ambiguous: bool, follow_sigs: bool, alloc: Alloc<'_>,
-) -> Result<Option<StalledError>, StalledError> {
-    let mut work = Vec::new_in(alloc);
-    let mut seen = blaze_hash::HashSet::new_in(alloc);
-    work.push(ty);
-    let mut steps = 0;
-    while let Some(t) = work.pop() {
-        if !seen.insert(t) {
-            continue;
-        }
-        steps += 1;
-        if steps > 65_536 {
-            return Err(CheckError::Limit(Limit::Steps).into());
-        }
-        match types.node(t)? {
-            PNode::Opaque(k, args) => {
-                match reads.opaque_record(k)? {
-                    None if ambiguous => {
-                        let future = reads.lang_item(crate::LangItem::Future)?;
-                        let bounds = reads.predicates(k)?;
-                        let is_future = bounds.clauses.iter().any(|c| matches!(c,
-                            PClause::Trait { trait_, .. } if Some(*trait_) == future));
-                        // Another fn's future whose hidden type has no record here: that opaque,
-                        // named (rule 19).
-                        let gap = if is_future {
-                            CheckError::ForeignWitness { gap: crate::rules::async_fn::EXTERNAL_WITNESS_GAP, item: k, ordinal: None, at }
-                        } else {
-                            CheckError::FutureWitness { reason: crate::INTERIOR_GAP, at }
-                        };
-                        return Ok(Some(StalledError::Check(gap)));
-                    }
-                    None => {}
-                    Some(h) => {
-                        use crate::rules::async_fn::{SupersetFrom, superset_record};
-                        if let Some((item, ordinal)) = superset_record(reads, SupersetFrom::Type(h.ty, h.types), alloc)? {
-                            let gap = crate::rules::async_fn::EXTERNAL_WITNESS_GAP;
-                            return Ok(Some(StalledError::Check(CheckError::ForeignWitness { gap, item, ordinal: Some(ordinal), at })));
-                        }
-                    }
-                }
-                work.extend_from_slice(types.list(args)?);
-            }
-            PNode::Coroutine { owner, ordinal, args } => {
-                use crate::rules::async_fn::{SupersetFrom, superset_record};
-                if let Some((item, first)) = superset_record(reads, SupersetFrom::Record(owner, ordinal), alloc)? {
-                    let gap = crate::rules::async_fn::EXTERNAL_WITNESS_GAP;
-                    return Ok(Some(StalledError::Check(CheckError::ForeignWitness { gap, item, ordinal: Some(first), at })));
-                }
-                work.extend_from_slice(types.list(args)?);
-            }
-            PNode::Closure { owner, ordinal, args } => {
-                if owner == body.owner {
-                    if let Some(row) = local_closure_row(body, exact.checked, ordinal) {
-                        if follow_sigs
-                            && let Some(&sig) = exact.checked.closures.column::<2>().get(row)
-                        {
-                            if let PNode::FnPtr(io, _) = types.node(sig)? {
-                                work.extend_from_slice(types.list(io)?);
-                            } else {
-                                work.push(sig);
-                            }
-                        }
-                        if let Some(&Some(upvars)) = exact.checked.closures.column::<3>().get(row) {
-                            work.push(upvars);
-                        }
-                    }
-                } else if let Some((f, env)) = reads.closure(owner, ordinal)? {
-                    use crate::rules::async_fn::{SupersetFrom, superset_record};
-                    if follow_sigs {
-                        if let PNode::FnPtr(io, _) = f.types.node(f.sig)? {
-                            for &part in f.types.list(io)? {
-                                if let Some((item, first)) = superset_record(reads, SupersetFrom::Type(part, f.types), alloc)? {
-                                    let gap = crate::rules::async_fn::EXTERNAL_WITNESS_GAP;
-                                    return Ok(Some(StalledError::Check(CheckError::ForeignWitness { gap, item, ordinal: Some(first), at })));
-                                }
-                            }
-                        } else if let Some((item, first)) = superset_record(reads, SupersetFrom::Type(f.sig, f.types), alloc)? {
-                            let gap = crate::rules::async_fn::EXTERNAL_WITNESS_GAP;
-                            return Ok(Some(StalledError::Check(CheckError::ForeignWitness { gap, item, ordinal: Some(first), at })));
-                        }
-                    }
-                    if let Some(env) = env
-                        && let Some((item, first)) = superset_record(reads, SupersetFrom::Type(env, f.types), alloc)?
-                    {
-                        let gap = crate::rules::async_fn::EXTERNAL_WITNESS_GAP;
-                        return Ok(Some(StalledError::Check(CheckError::ForeignWitness { gap, item, ordinal: Some(first), at })));
-                    }
-                }
-                work.extend_from_slice(types.list(args)?);
-            }
-            PNode::Future(e, _, stored) => match exact.interior(e, stored, at) {
-                Ok(interior) => work.push(interior),
-                Err(why) => return Ok(Some(why)),
-            },
-            PNode::FnPtr(io, _) => {
-                if follow_sigs {
-                    work.extend_from_slice(types.list(io)?);
-                }
-            }
-            PNode::FnDef(_, args) => {
-                if follow_sigs {
-                    work.extend_from_slice(types.list(args)?);
-                }
-            }
-            PNode::Dynamic(_) => {}
-            n => crate::machine::children(n, types, &mut work)?,
-        }
-    }
-    Ok(None)
-}
-
 /// The owner's where-clauses as assumptions of `cx`, as the check's `start_body` makes them:
 /// each clause's types imported with the owner's parameters left as parameters.
 fn assume_where_clauses<W: World>(cx: &mut InferCtx<'_>, reads: &mut Reads<'_, '_, W>, owner: ItemKey) -> Result<(), StalledError> {
@@ -969,18 +906,29 @@ impl LocalWitnesses<'_, '_> {
 
 /// The import source of a stalled type: a future of this body takes its exact interior; a
 /// closure of this body its signature from the record; anything else is asked of the world.
-struct Exact<'s, 'r, 'w, 'a, 'b, 'c, 'p, W: World> {
+struct Exact<'s, 'r, 'w, 'a, 'b, 'c, 'p, 'o, W: World> {
     asked: Asked<'r, 'w, 'a, W>,
     body: &'s BodyView<'b>,
     types: PTys<'p>,
     exact: LocalWitnesses<'s, 'c>,
+    /// When true, import every foreign `Superset` coroutine with a fresh open interior variable
+    /// instead of its provisional superset tuple so the solver leaves its auto traits `Ambiguous`.
+    superset_open: bool,
+    /// True while importing the output or interior of a foreign coroutine record, so nested
+    /// `PNode::Future`/`PNode::Closure` cannot accidentally match this body's own locals.
+    in_foreign: bool,
+    /// First foreign `Superset` coroutine imported during this pass, if any.
+    first_superset: Option<(ItemKey, u32)>,
+    /// Memoized open interior variables per `(owner, ordinal, args)` when `superset_open` is true,
+    /// so repeated occurrences of the same foreign `Superset` coroutine unify identically.
+    open_interiors: Vec<((ItemKey, u32, TyList), Ty), Alloc<'o>>,
 }
 
-impl<W: World> ClosureSource for Exact<'_, '_, '_, '_, '_, '_, '_, W> {
+impl<W: World> ClosureSource for Exact<'_, '_, '_, '_, '_, '_, '_, '_, W> {
     type Error = StalledError;
 
     fn closure_of(&mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, StalledError> {
-        if owner != self.body.owner {
+        if self.in_foreign || owner != self.body.owner {
             return self.asked.closure_of(cx, owner, ordinal, args, depth).map_err(Into::into);
         }
         // The `ordinal`-th closure expression of this body (rules/writeback.rs
@@ -1017,6 +965,9 @@ impl<W: World> ClosureSource for Exact<'_, '_, '_, '_, '_, '_, '_, W> {
     }
 
     fn future_of(&mut self, cx: &mut InferCtxIn<'_, '_>, types: PTys<'_>, e: ExprId, output: PTy, stored: PTy, subst: &[Ty], depth: u32) -> Result<Ty, StalledError> {
+        if self.in_foreign {
+            return self.asked.future_of(cx, types, e, output, stored, subst, depth).map_err(Into::into);
+        }
         let interior = self.exact.interior(e, stored, self.body.expr_range(e))?;
         let o = import(cx, self, types, output, subst, depth)?;
         let interior_types = self.types;
@@ -1026,31 +977,55 @@ impl<W: World> ClosureSource for Exact<'_, '_, '_, '_, '_, '_, '_, W> {
 
     /// Another fn's future held in this body's exact interior (`c.resolve().await` stores
     /// `resolve`'s future). Its record may be only its check's superset
-    /// ([`crate::InteriorIs::Superset`]: its own flow was refused); that record is imported
-    /// here as it is, because a `Yes` over a superset of what the state stores holds for the
-    /// state, and every `No` or open answer over one is turned into the gap
-    /// `EXTERNAL_WITNESS_GAP` before it is reported ([`unavailable_witness`], called on the
-    /// row and on the stored field `decide` blames). Nested coroutines inside it are read
-    /// exact only, through the world ([`Asked`]). The record is read through `Reads`, so its
-    /// digest, superset tag included, is in this body's read list (rule 21).
+    /// ([`crate::InteriorIs::Superset`]: its own flow was refused); Pass 1 imports that record
+    /// as it is so a `Yes` over a superset holds immediately, while `verify_without_superset`
+    /// re-imports it with an open interior variable (`superset_open = true`) so any `No` that
+    /// depended on provisional superset state turns into `EXTERNAL_WITNESS_GAP`. Nested
+    /// coroutines inside it flow through this same `coroutine_of` (with `in_foreign = true` so
+    /// foreign records never consult this body's own locals). The record is read through `Reads`,
+    /// so its digest, superset tag included, is in this body's read list (rule 21).
     fn coroutine_of(&mut self, cx: &mut InferCtxIn<'_, '_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, StalledError> {
         let q = Question::Coroutine(owner, ordinal);
         let facts = self.asked.reads.coroutine_record(owner, ordinal)?.ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+        if facts.is == crate::InteriorIs::Superset && self.first_superset.is_none() {
+            self.first_superset = Some((owner, ordinal));
+        }
         let n = cx.list_len(args);
         let mut subst: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(n as usize, cx.alloc());
         for i in 0..n {
             subst.push(cx.list_get(args, i));
         }
-        let nested = |e: Stop| -> StalledError {
+        let nested = |e: StalledError| -> StalledError {
             match e {
-                Stop::Error(CheckError::Malformed(Malformed::FutureOutsideOwner { block, reader })) => {
+                StalledError::Check(CheckError::Malformed(Malformed::FutureOutsideOwner { block, reader })) => {
                     CheckError::Malformed(Malformed::NestedFutureIdentity { owner, ordinal, block, reader }).into()
                 }
-                other => other.into(),
+                other => other,
             }
         };
-        let output = import(cx, &mut self.asked, facts.types, facts.output, &subst, depth).map_err(nested)?;
-        let interior = import(cx, &mut self.asked, facts.types, facts.interior, &subst, depth).map_err(nested)?;
+        let prev_foreign = self.in_foreign;
+        self.in_foreign = true;
+        let output = import(cx, self, facts.types, facts.output, &subst, depth);
+        let interior = match output {
+            Ok(_) if self.superset_open && facts.is == crate::InteriorIs::Superset => {
+                if let Some(&(_, v)) = self.open_interiors.iter().find(|&&(k, _)| k == (owner, ordinal, args)) {
+                    Ok(v)
+                } else {
+                    match cx.fresh(crate::ty::VarKind::Ty) {
+                        Ok(v) => {
+                            self.open_interiors.push(((owner, ordinal, args), v));
+                            Ok(v)
+                        }
+                        Err(e) => Err(StalledError::Check(e.into())),
+                    }
+                }
+            }
+            Ok(_) => import(cx, self, facts.types, facts.interior, &subst, depth),
+            Err(e) => Err(e),
+        };
+        self.in_foreign = prev_foreign;
+        let output = output.map_err(nested)?;
+        let interior = interior.map_err(nested)?;
         Ok(cx.imported_coroutine(owner, ordinal, args, output, interior)?)
     }
 }
