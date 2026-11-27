@@ -145,6 +145,11 @@ fn new_encodings() {
         (enc::cssc_minmax(true, true, 0, 1, 2), 0x9ac2_6c20, "umin x0, x1, x2"),
         (enc::cssc_cnt(0, 1), 0xdac0_1c20, "cnt x0, x1"),
         (enc::cssc_abs(0, 1), 0xdac0_2020, "abs x0, x1"),
+        // C6.2 SVC / BRK / CSET.
+        (enc::svc(0), 0b11010100_000_0000000000000000_000_01, "svc #0"),
+        (enc::svc(0x80), 0b11010100_000_0000000010000000_000_01, "svc #0x80"),
+        (enc::brk(1), 0b11010100_001_0000000000000001_000_00, "brk #1"),
+        (enc::cset(0, Cond::Hs), 0b1_0_0_11010100_11111_0011_0_1_11111_00000, "cset x0, cs"),
     ];
     for &(got, want, text) in cases {
         assert_eq!(got, want, "{text}: {got:#010x}, the manual's is {want:#010x}");

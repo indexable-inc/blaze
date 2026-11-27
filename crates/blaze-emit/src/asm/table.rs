@@ -162,6 +162,8 @@ const ROWS: &[Row] = &[
     Row { mnemonic: "ldxp", encode: load_pair },                    // L=1 pair=1 Rs=31 ordered=0
     Row { mnemonic: "stxp", encode: store_pair },                   // L=0 pair=1 ordered=0
     Row { mnemonic: "nop", encode: nop },
+    Row { mnemonic: "svc", encode: |o| trap_imm(o, enc::svc, "a `svc` immediate outside 0..=65535") },
+    Row { mnemonic: "brk", encode: |o| trap_imm(o, enc::brk, "a `brk` immediate outside 0..=65535") },
     Row { mnemonic: "xpaclri", encode: xpaclri },          // HINT #7 (0xd503_20ff)
     Row { mnemonic: "isb", encode: isb },
     Row { mnemonic: "dsb", encode: dsb },
@@ -176,6 +178,7 @@ const ROWS: &[Row] = &[
     Row { mnemonic: "tst", encode: tst_reg },
     Row { mnemonic: "tst", encode: tst_imm },
     Row { mnemonic: "csel", encode: csel },
+    Row { mnemonic: "cset", encode: cset },
     Row { mnemonic: "eor", encode: eor },
     Row { mnemonic: "cmp", encode: cmp_reg },
     Row { mnemonic: "cmp", encode: cmp_imm },
@@ -794,6 +797,17 @@ fn nop(ops: &Ops<'_>) -> Fit {
     }
 }
 
+fn trap_imm(ops: &Ops<'_>, encode: fn(u32) -> u32, why: &'static str) -> Fit {
+    let [Arg::Imm(v)] = *ops.args() else { return Fit::No };
+    if (0..=0xffff).contains(&v)
+        && let Ok(imm) = u32::try_from(v)
+    {
+        Fit::Word(encode(imm))
+    } else {
+        Fit::Bad { why, at: 0 }
+    }
+}
+
 fn xpaclri(ops: &Ops<'_>) -> Fit {
     match ops.args() {
         [] => Fit::Word(0xd503_20ff),
@@ -950,6 +964,14 @@ fn csel(ops: &Ops<'_>) -> Fit {
     match named(CONDS, ops.text(3)) {
         Some(cond) => Fit::Word(enc::sf(wide, enc::csel(rd, rn, rm, cond))),
         None => Fit::Bad { why: "a condition outside `eq`..`le` (`al` and `nv` are not taken)", at: 3 },
+    }
+}
+
+fn cset(ops: &Ops<'_>) -> Fit {
+    let [Arg::Gpr { reg: rd, wide, sp: false }, Arg::Name] = *ops.args() else { return Fit::No };
+    match named(CONDS, ops.text(1)) {
+        Some(cond) => Fit::Word(enc::sf(wide, enc::cset(rd, cond))),
+        None => Fit::Bad { why: "a condition outside `eq`..`le` (`al` and `nv` are not taken)", at: 1 },
     }
 }
 
