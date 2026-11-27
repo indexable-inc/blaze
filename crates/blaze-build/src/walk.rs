@@ -4985,35 +4985,56 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::PlaceDerefs(e, 0));
             }
             // A reborrow: the pointer to the place the dereferences reach is the borrow.
-            (_, true) => self.push_deref_chain(e, lead),
+            (_, true) => self.push_deref_chain(e, lead)?,
             // A dereference with no borrow: a copy out of the place.
             (_, false) => {
                 self.work.push(Task::LoadAdjusted(e, (lead - 1) as u32));
                 self.work.push(Task::DerefPlace);
-                self.push_deref_chain(e, lead);
+                self.push_deref_chain(e, lead)?;
             }
         }
         Ok(())
     }
 
+    /// Count of leading adjustments of `e` (within the first `lead`) that are dereferences of a
+    /// reference, raw pointer, array-to-slice, or `Box` (never a user `Deref::deref` call).
+    fn leading_place_derefs(&mut self, e: ExprId, lead: usize) -> Result<usize, BuildError> {
+        let rows = self.adjust_rows(e);
+        let mut n = 0usize;
+        for i in 0..lead {
+            let kind = *self
+                .checked
+                .adjusts
+                .column::<1>()
+                .get(rows.start + i)
+                .ok_or(malformed("an adjustment row past `adjusts`"))?;
+            match kind {
+                AdjustKind::Deref { overloaded: None } => n += 1,
+                AdjustKind::Deref { overloaded: Some(_) } => {
+                    let t = self.ty_before(e, i)?;
+                    let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
+                    if self.box_arg(g).map_err(|error| Self::ty_err(e, error))?.is_some() {
+                        n += 1;
+                    } else {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(n)
+    }
+
     /// Pushes the tasks that leave a pointer to the place `e`'s first `lead` adjustments (all
     /// dereferences) reach: a builtin one loads the next pointer from the place, an overloaded
     /// one calls `Deref::deref` with the pointer to its `Self` (`DerefCall`).
-    fn push_deref_chain(&mut self, e: ExprId, lead: usize) {
+    fn push_deref_chain(&mut self, e: ExprId, lead: usize) -> Result<(), BuildError> {
+        let place_n = self.leading_place_derefs(e, lead)?;
+        let place_u32 = u32::try_from(place_n).map_err(|_| malformed("dereference adjustments past u32"))?;
         let rows = self.adjust_rows(e);
         let kinds = &self.checked.adjusts.column::<1>()[rows.start..rows.start + lead];
-        let mut builtin_n = 0usize;
-        let mut builtin_u32 = 0u32;
-        for k in kinds {
-            if matches!(*k, AdjustKind::Deref { overloaded: None }) {
-                builtin_n += 1;
-                builtin_u32 += 1;
-            } else {
-                break;
-            }
-        }
         // The tasks run first to last, so they are pushed last to first.
-        for i in (builtin_n.max(1)..lead).rev() {
+        for i in (place_n.max(1)..lead).rev() {
             match kinds[i] {
                 AdjustKind::Deref { overloaded: Some(_) } => self.work.push(Task::DerefCall(e, i as u32)),
                 // The pointer step `i` dereferences is the place step `i - 1` reached, loaded
@@ -5024,18 +5045,19 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
             }
         }
-        if builtin_n > 0 {
-            // Leading builtin dereferences go through `PlaceDerefs` so a closure body whose
-            // environment holds a place below its binding (`*r`, `**r`: env_places.rs) reads
-            // the captured place rather than the un-dereferenced root.
+        if place_n > 0 {
+            // Leading builtin and `Box` dereferences go through `PlaceDerefs` so a closure body
+            // whose environment holds a place below its binding (`*r`, `**r`, `*b`: env_places.rs)
+            // reads the captured place rather than the un-dereferenced root.
             self.work.push(Task::Ref);
-            self.work.push(Task::PlaceDerefs(e, builtin_u32));
+            self.work.push(Task::PlaceDerefs(e, place_u32));
         } else {
             // `e` is the `Self`: borrowed in place.
             self.work.push(Task::DerefCall(e, 0));
             self.work.push(Task::Ref);
             self.work.push(Task::PlaceDerefs(e, 0));
         }
+        Ok(())
     }
 
     /// The type `e` has before its adjustment `n`: its own for the first, else the one the
@@ -5610,7 +5632,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         } else {
             self.work.push(Task::LoadAdjusted(base, (lead - 2) as u32));
             self.work.push(Task::DerefPlace);
-            self.push_deref_chain(base, lead - 1);
+            self.push_deref_chain(base, lead - 1)?;
         }
         Ok(())
     }
@@ -6433,16 +6455,22 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// Pushes the tasks that evaluate `e` as a place.
     fn place_of(&mut self, e: ExprId) -> Result<(), BuildError> {
         let rows = self.adjust_rows(e);
-        let kinds = &self.checked.adjusts.column::<1>()[rows.start..rows.end];
-        // An autoderef of builtin steps only: `*`, once per step.
-        if kinds.iter().all(|k| *k == AdjustKind::Deref { overloaded: None }) {
-            let n = kinds.len() as u32;
+        let len = rows.len();
+        // An autoderef of builtin or `Box` steps only: `*`, once per step, consulting `env_use`.
+        if self.leading_place_derefs(e, len)? == len {
+            let n = u32::try_from(len).map_err(|_| malformed("dereference adjustments past u32"))?;
             return self.place_derefs(e, n);
         }
+        let kinds = self
+            .checked
+            .adjusts
+            .column::<1>()
+            .get(rows.start..rows.end)
+            .ok_or(malformed("adjustment rows past `adjusts`"))?;
         // Dereferences, some overloaded: the place the pointer they leave points to.
         if kinds.iter().all(|k| matches!(k, AdjustKind::Deref { .. })) {
             self.work.push(Task::DerefPlace);
-            self.push_deref_chain(e, kinds.len());
+            self.push_deref_chain(e, len)?;
             return Ok(());
         }
         // A borrow or a coercion makes a new value: its place is a temporary of its own.
@@ -6450,22 +6478,36 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.eval_adjusted(e, rows)
     }
 
-    /// Pushes the tasks that evaluate `e` as a place after `n` builtin dereferences of its
-    /// value; its own adjustments are the caller's.
+    /// Pushes the tasks that evaluate `e` as a place after `n` builtin or `Box` dereferences of
+    /// its value; its own adjustments are the caller's.
     fn place_derefs(&mut self, e: ExprId, n: u32) -> Result<(), BuildError> {
         // A closure body's use of a place its environment holds (walk/moves/env_places.rs).
         if self.env_use(e, n, false)? {
             return Ok(());
         }
         if n > 0 {
-            // Step down one builtin dereference at a time so `env_use` is checked at every
-            // intermediate deref depth (e.g. `r: &mut &S` captured as `*r` with `n = 2`).
-            self.work.push(Task::DerefPlace);
-            if n == 1 {
-                self.work.push(Task::Raw(e));
-            } else {
-                self.work.push(Task::LoadAdjusted(e, n - 2));
+            // Step down one dereference at a time so `env_use` is checked at every intermediate
+            // deref depth (e.g. `r: &mut &S` captured as `*r` or `b: Box<Box<S>>` as `*b`).
+            let step = usize::try_from(n - 1).map_err(|_| malformed("dereference index past usize"))?;
+            let kind = *self
+                .checked
+                .adjusts
+                .column::<1>()
+                .get(self.adjust_rows(e).start + step)
+                .ok_or(malformed("an adjustment row past `adjusts`"))?;
+            if matches!(kind, AdjustKind::Deref { overloaded: Some(_) }) {
+                self.work.push(Task::DerefPlace);
+                self.work.push(Task::DerefCall(e, n - 1));
+                self.work.push(Task::Ref);
                 self.work.push(Task::PlaceDerefs(e, n - 1));
+            } else {
+                self.work.push(Task::DerefPlace);
+                if n == 1 {
+                    self.work.push(Task::Raw(e));
+                } else {
+                    self.work.push(Task::LoadAdjusted(e, n - 2));
+                    self.work.push(Task::PlaceDerefs(e, n - 1));
+                }
             }
             return Ok(());
         }

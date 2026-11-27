@@ -46,9 +46,8 @@
 //!
 //! Every case not built is refused by name, "not lowered: ...". The place analysis
 //! (blaze-typeck capture_places.rs `widen`) captures the WHOLE binding instead wherever this
-//! build would refuse a precise place: a place through a `Box`'s contents or a wide pointer,
-//! below an enum variant's field, a move below a captured place, a pattern that moves a
-//! captured place or matches above one. What stays refused: a zero-sized environment holding a
+//! build would refuse a precise place: below an enum variant's field, a move below a captured
+//! place, a pattern that moves a captured place or matches above one. What stays refused: a zero-sized environment holding a
 //! place (a place field always has a size), a by-value capture through a dereference that
 //! needs drop (the analysis truncates every by-value place at its first dereference), and a
 //! move out of a field the body does not own (E0507, the checker's).
@@ -224,19 +223,32 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     PlaceAt::Indirect(..) => return Err(malformed("unresolved indirect capture place in owner_place")),
                 },
                 CaptureProj::Deref => {
-                    if !matches!(self.ground_node(g).map_err(|error| Self::ty_err(e, error))?, PNode::Ref(..) | PNode::Ptr(..)) {
-                        return Err(unsupported(e, "not lowered: a captured place through a `Box`'s contents (`(*b).f`)"));
-                    }
                     let PlaceAt::Sized(base, off) = at else {
                         return Err(malformed("a pointer dereferenced from an unsized place"));
                     };
-                    if self.repr(g).map_err(|error| Self::ty_err(e, error))? == Repr::Ptr {
-                        let V::Scalar(p) = self.load(Repr::Ptr, (base, off)) else {
-                            return Err(malformed("a thin pointer loaded as other than a scalar"));
-                        };
-                        at = PlaceAt::Sized(p, 0);
+                    if let Some(target) = self.box_arg(g).map_err(|error| Self::ty_err(e, error))? {
+                        let ptr_off = self.box_data_word(g).map_err(|error| Self::ty_err(e, error))?;
+                        let field_off = off.checked_add(ptr_off).ok_or(malformed("a `Box`'s data pointer offset past i32"))?;
+                        let target_ls = self.ls_of(target).map_err(|error| Self::ty_err(e, error))?;
+                        if self.ls.get(target_ls).tail == crate::layout::Tail::Sized {
+                            let V::Scalar(p) = self.load(Repr::Ptr, (base, field_off)) else {
+                                return Err(malformed("a thin pointer loaded as other than a scalar"));
+                            };
+                            at = PlaceAt::Sized(p, 0);
+                        } else {
+                            at = PlaceAt::Unsized(base, field_off);
+                        }
+                    } else if matches!(self.ground_node(g).map_err(|error| Self::ty_err(e, error))?, PNode::Ref(..) | PNode::Ptr(..)) {
+                        if self.repr(g).map_err(|error| Self::ty_err(e, error))? == Repr::Ptr {
+                            let V::Scalar(p) = self.load(Repr::Ptr, (base, off)) else {
+                                return Err(malformed("a thin pointer loaded as other than a scalar"));
+                            };
+                            at = PlaceAt::Sized(p, 0);
+                        } else {
+                            at = PlaceAt::Unsized(base, off);
+                        }
                     } else {
-                        at = PlaceAt::Unsized(base, off);
+                        return Err(unsupported(e, "not lowered: a captured place through an overloaded dereference other than `Box`"));
                     }
                 }
                 CaptureProj::Index => return Err(malformed("a captured place with an element projection (the place analysis keeps none)")),
@@ -387,7 +399,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// the field (by value) or the loaded pointer's target (by reference), recorded for
     /// `env_use`. A by-value field whose type needs drop in an `FnOnce` body (an `async`
     /// block's is one) is the body's: it joins the outermost drop scope (`Held::EnvPlace`),
-    /// held. Refused: a zero-sized environment and a place through a `Box`'s contents.
+    /// held.
     pub(in crate::walk) fn bind_env_place(&mut self, closure: ExprId, f: EnvField, at: Option<(Value, i32)>, kind: FnTrait) -> Result<(), BuildError> {
         let at = match at {
             Some(at) => at,
@@ -398,11 +410,6 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 self.temp(Repr::None)
             }
         };
-        for i in 0..f.len {
-            if f.derefs_box(self.checked, i).ok_or(malformed("a captured place's projection past `capture_projs`"))? {
-                return Err(unsupported(closure, "not lowered: a captured place through a `Box`'s contents (`(*b).f`)"));
-            }
-        }
         let mut owned = None;
         let place = match f.how {
             CaptureKind::ByRef | CaptureKind::ByMutRef => {

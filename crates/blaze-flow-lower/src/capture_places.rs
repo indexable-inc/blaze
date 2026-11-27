@@ -89,10 +89,26 @@ impl<F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<'_, '_, 
             return Ok(None);
         }
         let (lo, hi) = self.adjust_rows(e);
-        let max_derefs = self.ck.adjusts.column::<1>()
-            .get(lo..hi)
-            .map_or(0, |rows| rows.iter().take_while(|&&k| matches!(k, AdjustKind::Deref { overloaded: None })).count());
-        let max_derefs = u32::try_from(max_derefs).unwrap_or(u32::MAX);
+        let mut max_derefs = 0u32;
+        if let (Some(kinds), Some(targets)) = (self.ck.adjusts.column::<1>().get(lo..hi), self.ck.adjusts.column::<2>().get(lo..hi)) {
+            let mut before = self.expr_ty(e)?;
+            for (&kind, &target) in kinds.iter().zip(targets.iter()) {
+                match kind {
+                    AdjustKind::Deref { overloaded: None } => {
+                        max_derefs = max_derefs.saturating_add(1);
+                    }
+                    AdjustKind::Deref { overloaded: Some(_) } => {
+                        if matches!(self.node(before, e)?, PNode::Adt(k, _) if self.adt_facts(k, e)?.is_box) {
+                            max_derefs = max_derefs.saturating_add(1);
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+                before = target;
+            }
+        }
         for skip in 0..=max_derefs {
             let cur_path = if skip == 0 {
                 path
