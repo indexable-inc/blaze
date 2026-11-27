@@ -50,13 +50,16 @@ use crate::{
 };
 
 /// This form's magic: the set's version. A step of the layout steps it.
-pub const MAGIC: [u8; 8] = *b"BZXSET3\0";
+pub const MAGIC: [u8; 8] = *b"BZXSET4\0";
 /// The first form: one whole expansion record per entry. Detected and rebuilt
 /// ([`KeptError::OldForm`]), never misread.
 pub const MAGIC_V1: [u8; 8] = *b"BZXSET1\0";
 /// The second form: this one with 8-byte atoms and a per-entry suffix column. Detected and
 /// rebuilt, never misread.
 pub const MAGIC_V2: [u8; 8] = *b"BZXSET2\0";
+/// The third form: before `Mark::local_inner` (bit 6 of Contexts flags). Detected and rebuilt,
+/// never misread.
+pub const MAGIC_V3: [u8; 8] = *b"BZXSET3\0";
 
 /// The atom builder's hash seed. It only spreads the builder's lookups: no byte of a set
 /// depends on it ([`AtomsBuilder`]), so it is a constant, not an input.
@@ -141,7 +144,7 @@ impl<'k> KeptSet<'k> {
         if bytes.len() < 8 {
             return Err(KeptError::Short { what: "its magic" });
         }
-        if bytes[..8] == MAGIC_V1 || bytes[..8] == MAGIC_V2 {
+        if bytes[..8] == MAGIC_V1 || bytes[..8] == MAGIC_V2 || bytes[..8] == MAGIC_V3 {
             return Err(KeptError::OldForm);
         }
         if bytes[..8] != MAGIC {
@@ -316,9 +319,10 @@ impl<'k> SetEntry<'k> {
             let transparency =
                 Transparency::from_byte(flags >> 1 & 0b11).ok_or_else(|| bad(column, start, "a mark of no transparency"))?;
             let edition = edition_of(u64::from(flags >> 3 & 0b11)).ok_or_else(|| bad(column, start, "a mark of no edition"))?;
-            if flags >> 6 != 0 {
+            if flags >> 7 != 0 {
                 return Err(bad(column, start, "a mark's flags with bits set no field uses"));
             }
+            let local_inner = (flags >> 6 & 1) != 0;
             let mut key = || -> Result<ContentId, RecordError> {
                 let id_at = at;
                 let id = leb_in(contexts, &mut at, column)?;
@@ -333,7 +337,7 @@ impl<'k> SetEntry<'k> {
                 0 => None,
                 _ => Some(ItemKey(key()?)),
             };
-            let mark = Mark { of, transparency, edition, site: DefSite { krate, module } };
+            let mark = Mark { of, transparency, edition, site: DefSite { krate, module }, local_inner };
             let ctx = stream.context(CtxNode { parent, mark }).map_err(|error| RecordError::Stream { column, error })?;
             if ctx.node() != Some(index(nodes.len())) {
                 return Err(bad(column, start, "a context the table already holds"));

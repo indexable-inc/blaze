@@ -1477,7 +1477,7 @@ const INNER_ITEM: (&str, &str) = ("inner_item", "(k: $k:expr) => { const C: u8 =
 fn expanding_marked<'t>(defs: &[(&'static str, &str)], text: &'t str, marked: &[u32]) -> Lowered<'static, 't> {
     let defs: StdVec<Def> = defs.iter().map(|&(name, body)| Def { name, body, macro2: false, external: false }).collect();
     let mut expander = by_name(&defs);
-    let mark = crate::mark_site::TextMark { site: at().site, transparency: blaze_expand::Transparency::SemiOpaque, edition: Edition::E2024 };
+    let mark = crate::mark_site::TextMark { site: at().site, transparency: blaze_expand::Transparency::SemiOpaque, edition: Edition::E2024, local_inner: false };
     let rows: StdVec<(u32, crate::mark_site::TextMark)> = marked.iter().map(|&at| (at, mark)).collect();
     let column = crate::mark_site::column_of_copy(text, &rows, Alloc::global()).expect("the copy's column writes");
     let column: &'static [u8] = Box::leak(StdVec::from(&column[..]).into_boxed_slice());

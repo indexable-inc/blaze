@@ -587,6 +587,7 @@ fn include_tokens_walk_past_transparent_mark_for_hygiene_and_edition() {
                 transparency: blaze_expand::Transparency::SemiOpaque,
                 edition: Edition::E2021,
                 site: DefSite { krate: outer_krate, module: None },
+                local_inner: false,
             },
         })
         .expect("outer ctx");
@@ -2034,6 +2035,7 @@ fn include_tokens_carry_call_site_ctx_without_core_mark() {
         transparency: Transparency::SemiOpaque,
         edition: Edition::E2021,
         site: DefSite { krate: caller_krate, module: None },
+        local_inner: false,
     };
     let call_ctx = marked_input
         .context(CtxNode { parent: Ctx::root(Edition::E2021), mark: caller_mark })
@@ -2062,18 +2064,21 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
         transparency: Transparency::Transparent,
         edition: Edition::E2021,
         site: DefSite { krate: krate_a, module: None },
+        local_inner: false,
     };
     let semi_b = Mark {
         of: MarkOf::Outer(ContentId([21; 32])),
         transparency: Transparency::SemiOpaque,
         edition: Edition::E2021,
         site: DefSite { krate: krate_b, module: None },
+        local_inner: false,
     };
     let opaque_c = Mark {
         of: MarkOf::Outer(ContentId([31; 32])),
         transparency: Transparency::Opaque,
         edition: Edition::E2021,
         site: DefSite { krate: krate_c, module: None },
+        local_inner: false,
     };
 
     let mut stream = TokenStream::new_in(alloc);
@@ -2106,4 +2111,80 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
     assert_eq!(body.words[0].mark, None);
     assert_eq!(body.words[1].mark.map(|m| (m.site.krate, m.transparency)), Some((krate_b, Transparency::SemiOpaque)));
     assert_eq!(body.words[2].mark.map(|m| (m.site.krate, m.transparency)), Some((krate_c, Transparency::Opaque)));
+}
+
+#[test]
+fn local_inner_mark_stamps_def_tokens_and_survives_metavar_forwarding_and_records() {
+    use blaze_expand::{OriginMaps, SourceIndexes, body_words};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let dep_krate = CrateItemKey(ContentId([0x41; 32]));
+    let outer_def = MacroDefinition::rules(
+        lex("($arg:expr) => { wrapper!(inner_code!($arg)) };", Edition::E2021, alloc).expect("lexes"),
+        DefAt {
+            site: DefSite { krate: dep_krate, module: None },
+            edition: Edition::E2021,
+            export: Export::Exported,
+            local_inner: LocalInner::Yes,
+            transparency: None,
+        },
+    );
+    let wrapper_def = MacroDefinition::rules(
+        lex("($e:expr) => { $e };", Edition::E2021, alloc).expect("lexes"),
+        DefAt {
+            site: DefSite { krate: dep_krate, module: None },
+            edition: Edition::E2021,
+            export: Export::Exported,
+            local_inner: LocalInner::No,
+            transparency: None,
+        },
+    );
+
+    let caller_input = lex("caller_mac!()", Edition::E2021, alloc).expect("lexes");
+    let outer_call = Call::fn_like(&caller_input, site());
+    let outer_exp = done(expand(&outer_def, &outer_call, &TestCx::new(), alloc));
+    assert!(outer_exp.diagnostics.is_empty(), "{:?}", outer_exp.diagnostics);
+
+    // Record round-trip preserves `local_inner` on `Mark` (both stream record and expansion record).
+    let stream_rec = outer_exp.tokens.write_record(alloc);
+    let stream_back = TokenStream::read_record(&stream_rec, alloc).expect("stream record reads");
+    assert_eq!(stream_back, outer_exp.tokens);
+    let sources = SourceIndexes::of(&outer_def, &outer_call, alloc);
+    let exp_rec = outer_exp.write_record(&sources.maps(), alloc).expect("expansion record writes");
+    let exp_back = Expansion::read_record(&exp_rec, alloc).expect("expansion record reads");
+    assert_eq!(exp_back, outer_exp);
+    let _ = OriginMaps::NONE;
+
+    // `wrapper` and `inner_code` come from `outer_def` (`TokenOrigin::Def`) -> `local_inner: true`.
+    // `caller_mac` comes from `caller_input` (`TokenOrigin::Input`) -> unmarked (`None`).
+    let find_ident = |stream: &TokenStream<'_>, name: &str| {
+        (0..stream.len())
+            .find(|&i| stream.text_at(i) == name)
+            .unwrap_or_else(|| panic!("token `{name}` not found"))
+    };
+    let w_idx = find_ident(&outer_exp.tokens, "wrapper");
+    let ic_idx = find_ident(&outer_exp.tokens, "inner_code");
+    let cm_idx = find_ident(&outer_exp.tokens, "caller_mac");
+    assert_eq!(outer_exp.non_transparent_mark(w_idx).map(|m| (m.site.krate, m.local_inner)), Some((dep_krate, true)));
+    assert_eq!(outer_exp.non_transparent_mark(ic_idx).map(|m| (m.site.krate, m.local_inner)), Some((dep_krate, true)));
+    assert_eq!(outer_exp.non_transparent_mark(cm_idx), None, "caller argument has no local_inner mark");
+
+    // Forward `inner_code!(caller_mac!())` through non-`local_inner` `wrapper!`:
+    // `inner_code` MUST keep `local_inner: true, site.krate == dep_krate`, while `caller_mac` stays unmarked!
+    let mut sealed = outer_exp.tokens.clone_in(alloc);
+    sealed.seal(ContentId([0x99; 32]));
+    let open = (0..sealed.len()).find(|&i| matches!(sealed.tokens()[i].kind, TokenKind::Open(Delim::Paren))).expect("open");
+    let close = sealed.close_of(open).expect("close");
+    let wrapper_args = sealed.copy_in(open + 1..close, alloc).expect("copy args");
+    let wrapper_exp = done(expand(&wrapper_def, &Call::fn_like(&wrapper_args, site()), &TestCx::new(), alloc));
+    assert!(wrapper_exp.diagnostics.is_empty(), "{:?}", wrapper_exp.diagnostics);
+    let ic2 = find_ident(&wrapper_exp.tokens, "inner_code");
+    let cm2 = find_ident(&wrapper_exp.tokens, "caller_mac");
+    assert_eq!(wrapper_exp.non_transparent_mark(ic2).map(|m| (m.site.krate, m.local_inner)), Some((dep_krate, true)));
+    assert_eq!(wrapper_exp.non_transparent_mark(cm2), None);
+
+    // `body_words` carries `local_inner: true` onto `BodyWord::mark` for `inner_code`.
+    let bw = body_words(&wrapper_exp.tokens, ContentId([0x77; 32]), alloc);
+    let ic_word = bw.words.iter().find(|w| &bw.text[w.text.0 as usize..w.text.1 as usize] == "inner_code").expect("inner_code word");
+    assert_eq!(ic_word.mark.map(|m| (m.site.krate, m.local_inner)), Some((dep_krate, true)));
 }

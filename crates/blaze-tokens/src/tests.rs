@@ -36,7 +36,7 @@ fn site(module: bool) -> DefSite {
 }
 
 fn node(parent: Ctx, of: MarkOf, transparency: Transparency, edition: Edition, module: bool) -> CtxNode {
-    CtxNode { parent, mark: Mark { of, transparency, edition, site: site(module) } }
+    CtxNode { parent, mark: Mark { of, transparency, edition, site: site(module), local_inner: false } }
 }
 
 /// One token of the round trip: its word, its lexeme, joined, which context (0 the root, 1 and
@@ -304,6 +304,27 @@ fn digest_is_of_the_tokens_alone() {
         let other = Tokens::open(bytes).unwrap();
         assert_ne!(other.digest(other.all()), digest, "{what} changed and the digest did not");
     }
+
+    // `local_inner` round-trips in `NodeRow` and changes the token digest.
+    let mut b = TokensBuilder::new_in(heap.alloc());
+    let root = Ctx::root(Edition::E2021);
+    let mut li_node = node(root, MarkOf::This, semi, Edition::E2021, false);
+    li_node.mark.local_inner = true;
+    let li_ctx = b.context(li_node).unwrap();
+    for (at, &(text, joined)) in [("x", true), ("y", false), ("x", false)].iter().enumerate() {
+        b.push(NewToken {
+            word: ident(),
+            lexeme: Some(text),
+            joined,
+            ctx: li_ctx,
+            origin: Origin::Input(u32::try_from(at).unwrap()),
+        })
+        .unwrap();
+    }
+    let li_bytes = b.finish().unwrap();
+    let li = Tokens::open(&li_bytes).unwrap();
+    assert_eq!(li.mark(0).map(|m| m.local_inner), Some(true), "local_inner round-trips");
+    assert_ne!(li.digest(li.all()), digest, "local_inner changed and the digest did not");
 }
 
 /// `999` `.` `try_into` `(` `)` stays five words, and `shown` never prints the float `999.`:

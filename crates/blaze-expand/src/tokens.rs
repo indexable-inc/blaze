@@ -268,6 +268,10 @@ pub struct Mark {
     /// The edition of the definition: the edition the token is read in.
     pub edition: Edition,
     pub site: DefSite,
+    /// Whether this mark came from a `#[macro_export(local_inner_macros)]` macro definition: a
+    /// single-segment bare function-like macro call whose first token carries this mark resolves
+    /// in `site.krate` (as `$crate::name!`).
+    pub local_inner: bool,
 }
 
 /// A context of a stream's table: a mark over a parent context.
@@ -280,7 +284,7 @@ pub struct CtxNode {
 impl CtxNode {
     fn encode<S: Sink>(self, out: &mut S) {
         out.put(&self.parent.0.to_be_bytes());
-        let Mark { of, transparency, edition, site } = self.mark;
+        let Mark { of, transparency, edition, site, local_inner } = self.mark;
         match of {
             MarkOf::This => out.put(&[0]),
             MarkOf::Outer(key) => {
@@ -288,7 +292,7 @@ impl CtxNode {
                 out.put(&key.0);
             }
         }
-        out.put(&[transparency.byte(), edition.byte()]);
+        out.put(&[transparency.byte(), edition.byte(), u8::from(local_inner)]);
         out.put(&site.krate.0.0);
         match site.module {
             None => out.put(&[0]),

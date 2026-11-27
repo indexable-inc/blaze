@@ -84,7 +84,7 @@ impl fmt::Display for KeptError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             KeptError::Magic => f.write_str("not a kept expansions set (its magic)"),
-            KeptError::OldForm => f.write_str("a kept expansions set of an earlier layout (BZXSET1 or BZXSET2): rebuilt, never read"),
+            KeptError::OldForm => f.write_str("a kept expansions set of an earlier layout (BZXSET1, BZXSET2 or BZXSET3): rebuilt, never read"),
             KeptError::Atoms { error } => write!(f, "a kept expansions set whose token atoms are not as written: {error}"),
             KeptError::Table { what, index } => write!(f, "a kept expansions set with {what} (at {index})"),
             KeptError::Trailing => f.write_str("a kept expansions set with bytes past its last column"),

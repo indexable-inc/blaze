@@ -12,7 +12,8 @@ use parser::SyntaxKind;
 
 /// What the columns mean: raised whenever a number in this module changes meaning. A record of
 /// another form is refused by its schema ([`TOKENS_SCHEMA`]) and written again (rule 26).
-pub const FORM: u64 = 1;
+// 2: `NodeRow` carries `local_inner` in `flags` (bit 2), 2026-11-27.
+pub const FORM: u64 = 2;
 
 /// The record's schema: its name, [`FORM`] and the root's layout.
 pub const TOKENS_SCHEMA: SchemaHash = blaze_format_core::schema_of(&[
@@ -138,6 +139,8 @@ pub struct Mark {
     /// The edition of the definition: what the token is read in.
     pub edition: Edition,
     pub site: DefSite,
+    /// Whether this mark came from a `#[macro_export(local_inner_macros)]` macro definition.
+    pub local_inner: bool,
 }
 
 /// A context of a record's table: a mark over a parent context, which is a root or an earlier
@@ -200,19 +203,24 @@ impl Lexeme {
     }
 }
 
+const FLAG_OUTER: u8 = 1 << 0;
+const FLAG_HAS_MODULE: u8 = 1 << 1;
+const FLAG_LOCAL_INNER: u8 = 1 << 2;
+const FLAGS_USED: u8 = FLAG_OUTER | FLAG_HAS_MODULE | FLAG_LOCAL_INNER;
+
 blaze_format_core::record! {
-    /// A node of the context table: its mark's keys (zero where [`NodeRow::outer`] or
-    /// [`NodeRow::has_module`] is false), its parent's raw [`Ctx`], and the mark's words.
+    /// A node of the context table: its mark's keys (zero where [`FLAG_OUTER`] or
+    /// [`FLAG_HAS_MODULE`] is clear), its parent's raw [`Ctx`], and the mark's words.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct NodeRow: 1 {
+    pub(crate) struct NodeRow: 2 {
         pub(crate) of: ContentId,
         pub(crate) krate: ContentId,
         pub(crate) module: ContentId,
         pub(crate) parent: u32,
         pub(crate) transparency: Transparency,
         pub(crate) edition: Edition,
-        pub(crate) outer: bool,
-        pub(crate) has_module: bool,
+        pub(crate) flags: u8,
+        pub(crate) reserved: u8,
     }
 }
 
@@ -220,11 +228,21 @@ const ZERO: ContentId = ContentId([0; 32]);
 
 impl NodeRow {
     pub(crate) fn of(node: CtxNode) -> NodeRow {
-        let Mark { of, transparency, edition, site } = node.mark;
+        let Mark { of, transparency, edition, site, local_inner } = node.mark;
         let (outer, of) = match of {
             MarkOf::This => (false, ZERO),
             MarkOf::Outer(key) => (true, key),
         };
+        let mut flags = 0u8;
+        if outer {
+            flags |= FLAG_OUTER;
+        }
+        if site.module.is_some() {
+            flags |= FLAG_HAS_MODULE;
+        }
+        if local_inner {
+            flags |= FLAG_LOCAL_INNER;
+        }
         NodeRow {
             of,
             krate: site.krate.0,
@@ -232,16 +250,19 @@ impl NodeRow {
             parent: node.parent.raw(),
             transparency,
             edition,
-            outer,
-            has_module: site.module.is_some(),
+            flags,
+            reserved: 0,
         }
     }
 
     pub(crate) fn node(self) -> CtxNode {
+        let outer = (self.flags & FLAG_OUTER) != 0;
+        let has_module = (self.flags & FLAG_HAS_MODULE) != 0;
+        let local_inner = (self.flags & FLAG_LOCAL_INNER) != 0;
         CtxNode {
             parent: Ctx::from_raw(self.parent),
             mark: Mark {
-                of: match self.outer {
+                of: match outer {
                     true => MarkOf::Outer(self.of),
                     false => MarkOf::This,
                 },
@@ -249,22 +270,26 @@ impl NodeRow {
                 edition: self.edition,
                 site: DefSite {
                     krate: CrateItemKey(self.krate),
-                    module: self.has_module.then_some(ItemKey(self.module)),
+                    module: has_module.then_some(ItemKey(self.module)),
                 },
+                local_inner,
             },
         }
     }
 
     /// Why row `index` is not one [`NodeRow::of`] writes into a table: its parent not a root or
-    /// an earlier node, or a key where its flag says none.
+    /// an earlier node, reserved bits set, or a key where its flag says none.
     pub(crate) fn refused(self, index: usize) -> Option<&'static str> {
         if !Ctx::is_in(self.parent, index) {
             return Some("a context whose parent is not a root or an earlier context");
         }
-        if !self.outer && self.of != ZERO {
+        if (self.flags & !FLAGS_USED) != 0 || self.reserved != 0 {
+            return Some("a context node with reserved flag bits set");
+        }
+        if (self.flags & FLAG_OUTER) == 0 && self.of != ZERO {
             return Some("a mark of this expansion that names an outer one");
         }
-        if !self.has_module && self.module != ZERO {
+        if (self.flags & FLAG_HAS_MODULE) == 0 && self.module != ZERO {
             return Some("a definition site with a module its flag says it has not");
         }
         None

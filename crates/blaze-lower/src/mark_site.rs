@@ -166,6 +166,28 @@ pub fn site_of(mark: Option<TextMark>, first: &str, absolute: bool, call: ItemKe
     Ok(PathSite { module, dollar_crate })
 }
 
+/// If `mark` came from a `#[macro_export(local_inner_macros)]` macro and the path is a single
+/// plain segment (`!absolute && segment_count == 1` and not a path keyword), returns the
+/// defining crate to resolve the function-like macro call in (as `$crate::name!`).
+///
+/// Never applies to non-macro paths, multi-segment paths, absolute paths, or attribute/derive
+/// paths (callers invoke this only for function-like macro calls).
+pub fn local_inner_crate(
+    mark: Option<TextMark>,
+    first: &str,
+    segment_count: usize,
+    absolute: bool,
+) -> Option<CrateItemKey> {
+    if absolute
+        || segment_count != 1
+        || matches!(first, "$crate" | "crate" | "self" | "super" | "Self" | "{{root}}" | "<qualified>")
+    {
+        return None;
+    }
+    mark.filter(|m| m.local_inner && m.transparency != Transparency::Transparent)
+        .map(|m| m.site.krate)
+}
+
 #[cfg(test)]
 mod tests {
     use blaze_expand::{DefSite, Edition};
@@ -178,7 +200,7 @@ mod tests {
     }
 
     fn mark(transparency: Transparency, module: Option<ItemKey>) -> TextMark {
-        TextMark { site: DefSite { krate: CrateItemKey(ContentId([9; 32])), module }, transparency, edition: Edition::E2021 }
+        TextMark { site: DefSite { krate: CrateItemKey(ContentId([9; 32])), module }, transparency, edition: Edition::E2021, local_inner: false }
     }
 
     /// The Reference, "Macros By Example", Hygiene: a `macro_rules!` (semi-opaque) writes an
@@ -200,5 +222,22 @@ mod tests {
         let made = mark(Transparency::Opaque, None);
         assert_eq!(site_of(Some(made), "f", false, call), Err(SiteRefused::OpaqueWithoutModule { krate: CrateItemKey(ContentId([9; 32])) }));
         assert_eq!(site_of(Some(made), "core", true, call), Ok(PathSite { module: call, dollar_crate: None }));
+    }
+
+    #[test]
+    fn local_inner_crate_applies_only_to_single_plain_segment_with_non_transparent_flag() {
+        let dep = CrateItemKey(ContentId([9; 32]));
+        let yes = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: true };
+        let no = TextMark { local_inner: false, ..yes };
+        let trans = TextMark { transparency: Transparency::Transparent, ..yes };
+        assert_eq!(local_inner_crate(Some(yes), "opts", 1, false), Some(dep));
+        assert_eq!(local_inner_crate(Some(no), "opts", 1, false), None);
+        assert_eq!(local_inner_crate(Some(trans), "opts", 1, false), None);
+        assert_eq!(local_inner_crate(None, "opts", 1, false), None);
+        assert_eq!(local_inner_crate(Some(yes), "opts", 2, false), None);
+        assert_eq!(local_inner_crate(Some(yes), "opts", 1, true), None);
+        for kw in ["$crate", "crate", "self", "super", "Self"] {
+            assert_eq!(local_inner_crate(Some(yes), kw, 1, false), None, "keyword `{kw}`");
+        }
     }
 }

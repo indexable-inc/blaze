@@ -149,7 +149,6 @@ fn nested_input_of_def_site_name() -> (TokenStream<'static>, ContentId, &'static
         &expansion.tokens,
         Some(USER_KEY),
         |at| expansion.hygiene(at).mark.map(|mark| mark.site.krate),
-        |_| false,
         &mut |token, start, end, _| places.push((start as u32, end as u32, token as u32)),
         Some(&mut words),
         alloc,

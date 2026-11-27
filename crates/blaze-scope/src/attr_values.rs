@@ -34,7 +34,7 @@ use core::fmt::{self, Write as _};
 
 use blaze_expand::origin_column::TextMark;
 use blaze_expand::{
-    Call, CallKind, CallSite, Ctx, Delim, Eager, ExpandCx, ExpandError, Expanded, Failed, Inside, LexError, LitKind, NestedKind, PathScope, ReadAnswer,
+    Call, CallKind, CallSite, Ctx, Delim, Eager, ExpandCx, ExpandError, Expanded, Failed, Inside, LexError, LitKind, NestedKind, ReadAnswer,
     ReadKind, StreamError, TokenKind, TokenStream, attr_literal, call_key, expand, lex, write_token, write_tokens,
 };
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
@@ -46,7 +46,7 @@ use crate::crate_scope::Dep;
 use crate::names::{PathError, RootRead, ScopeRead, VariantHit, Why, World, Written, variant_in};
 use crate::nested_input::{CallTokens, NestedInputError};
 use crate::resolve::{Built, CrateNames, EAGER_DEPTH, definition_of};
-use crate::task::{Loc, to_path_head};
+use crate::task::{Loc, to_fn_macro_path_head};
 
 /// One attribute value written as a macro call, as the lowering found it.
 #[derive(Clone, Copy, Debug)]
@@ -502,14 +502,12 @@ impl<'q, 'r, 'a> World<&'a str> for ValueWorld<'q, 'r, 'a> {
 // The expansion.
 
 /// A call in a stream, by token index: its path `path.0..path.1` (before the `!`), its group
-/// `open..=close`; `def_crate`: a single name a `local_inner_macros` body wrote, read as
-/// `$crate::name` (blaze-expand `PathScope::DefCrate`).
+/// `open..=close`.
 #[derive(Clone, Copy)]
 struct CallAt {
     path: (usize, usize),
     open: usize,
     close: usize,
-    def_crate: bool,
 }
 
 /// One site's expansion: its world, its host, and what it read so far.
@@ -586,7 +584,7 @@ fn one_call(stream: &TokenStream<'_>) -> Option<CallAt> {
         _ => return None,
     }
     let close = stream.close_of(open)?;
-    (close + 1 == hi).then_some(CallAt { path, open, close, def_crate: false })
+    (close + 1 == hi).then_some(CallAt { path, open, close })
 }
 
 impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
@@ -647,16 +645,19 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
     }
 
     /// The path of the call at `at` as segments in `'a` (`$crate` as one), whether it starts
-    /// with `::`, and its first token's mark (what a `$crate` names).
+    /// with `::`, and its first identifier token's mark (what `$crate` and `local_inner_macros`
+    /// resolve by).
     fn segments(&self, stream: &TokenStream<'_>, at: CallAt) -> (AVec<'a, &'a str>, bool, Option<TextMark>) {
         let alloc = self.alloc();
         let (start, end) = at.path;
         let mut segments: AVec<'a, &'a str> = AVec::new_in(alloc);
-        if at.def_crate {
-            segments.push("$crate");
-        }
         let abs = is_colons(stream, start);
-        let first = stream.tokens().get(start).and_then(|t| stream.non_transparent_mark(t.ctx)).map(TextMark::of);
+        let first = stream
+            .tokens()
+            .get(start..end)
+            .and_then(|s| s.iter().find(|t| matches!(t.kind, TokenKind::Ident { .. })))
+            .and_then(|t| stream.non_transparent_mark(t.ctx))
+            .map(TextMark::of);
         let mut i = start;
         while i < end {
             if let Some(n) = dollar_crate(stream, i) {
@@ -701,7 +702,7 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
                 return Err(self.refused(ValueWhy::TooDeep { mac }));
             }
             let own = self.world.own;
-            let (kind, skip) = to_path_head(abs, &segments, first, own.key);
+            let (kind, skip) = to_fn_macro_path_head(abs, &segments, first, own.key);
             let written = Written { kind, segments: &segments[skip..] };
             let module = self.world.module;
             let resolved = crate::names::path(&self.world, module, Namespace::Macros, written, alloc).map_err(|why| self.refused(ValueWhy::NotFound { mac, why }))?;
@@ -751,7 +752,6 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
                             path: (0, first_inner.path.end as usize - start),
                             open: first_inner.args.start as usize - start,
                             close: end - 1 - start,
-                            def_crate: first_inner.scope == PathScope::DefCrate,
                         };
                         let answers = AVec::with_capacity_in(nested.len(), alloc);
                         stack.push(Frame {
@@ -815,7 +815,6 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
                         path: (0, path_end - start),
                         open: args_start - start,
                         close: end - 1 - start,
-                        def_crate: inner.scope == PathScope::DefCrate,
                     };
                     cur_depth = top.depth + 1;
                     top.reduce_depth = top.depth + 2;

@@ -557,6 +557,7 @@ mod tests {
                     site: DefSite { krate: CrateItemKey(ContentId([defining_crate; 32])), module: None },
                     transparency: Transparency::Opaque,
                     edition: Edition::E2021,
+                    local_inner: false,
                 },
             ));
             ask.clone().carry_marks(marks).need

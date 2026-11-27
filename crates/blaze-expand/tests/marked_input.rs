@@ -188,7 +188,7 @@ fn rules(body: &str) -> MacroDefinition<'static> {
 
 /// The mark the expansion that wrote the copied text gave its `$crate` words.
 fn tracing_mark() -> TextMark {
-    TextMark { site: tracing_site(), transparency: Transparency::SemiOpaque, edition: Edition::E2021 }
+    TextMark { site: tracing_site(), transparency: Transparency::SemiOpaque, edition: Edition::E2021, local_inner: false }
 }
 
 /// The tokens inside the tree `text` (delimiters included), lexed as blaze-lower's `ByName::input`
