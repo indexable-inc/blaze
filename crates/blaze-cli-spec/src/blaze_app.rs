@@ -90,6 +90,8 @@ const CHECK_FLAGS: &[ArgSpec] = &[
 const BUILD_FLAGS: &[ArgSpec] = &[
     flag_multi("package", "package", Some('p'), "<name>", "Package to build", false),
     flag_value("bin", "bin", None, "<name>", "Binary target to build", false),
+    flag_bool("release", "release", Some('r'), "Build a standalone AOT PGO-optimized release binary", false),
+    flag_bool("standalone", "standalone", None, "Build a standalone AOT binary instead of JIT-on-call", false),
     flag_value("target", "target", None, "<triple>", "Build target (native or wasm64)", false),
     flag_value("output", "output", Some('o'), "<path>", "Destination executable path", false),
     flag_value("workers", "workers", None, "<N>", "Maximum concurrent workers", false),
@@ -102,6 +104,12 @@ const BUILD_FLAGS: &[ArgSpec] = &[
     flag_bool("names-oracle", "names-oracle", None, "Run differential names verification oracle", true),
     flag_value("driver", "driver", None, "auto|ready|phases", "Incremental check driver", true),
     flag_value("block-scopes", "block-scopes", None, "bodies|modules", "Block scope resolution strategy", true),
+];
+
+const JIT_EXEC_FLAGS: &[ArgSpec] = &[
+    flag_value("exe", "exe", None, "<path>", "Path to the built JIT launcher executable", true),
+    flag_value("arg0", "arg0", None, "<name>", "Original argv[0] passed to the built executable", true),
+    flag_value("manifest", "manifest", None, "<hex>", "Hex-encoded JIT build manifest", true),
 ];
 
 const RUN_FLAGS: &[ArgSpec] = &[
@@ -229,7 +237,7 @@ const COMMANDS: &[CommandSpec] = &[
         name: "build",
         aliases: &[],
         hidden: false,
-        about: "Build a standalone PGO-optimized native binary",
+        about: "Build a JIT-on-call executable (or standalone AOT with --release / --standalone)",
         usage_args: "[dir] [options]",
         flags: BUILD_FLAGS,
         accepts_passthrough: false,
@@ -386,6 +394,15 @@ const COMMANDS: &[CommandSpec] = &[
         usage_args: "[dir]",
         flags: &[],
         accepts_passthrough: false,
+    },
+    CommandSpec {
+        name: "jit-exec",
+        aliases: &[],
+        hidden: true,
+        about: "Execute a JIT-on-call binary built by `blaze build`",
+        usage_args: "--exe <path> --arg0 <name> --manifest <hex> [-- <args>...]",
+        flags: JIT_EXEC_FLAGS,
+        accepts_passthrough: true,
     },
 ];
 

@@ -945,7 +945,10 @@ mod tests {
         render_help(&BLAZE_APP, Some("build"), &mut build_help).expect("render build help");
         assert!(build_help.as_str().contains("blaze build [dir] [options]"));
         assert!(build_help.as_str().contains("-o, --output <path>"));
+        assert!(build_help.as_str().contains("-r, --release"));
+        assert!(build_help.as_str().contains("--standalone"));
         assert!(!build_help.as_str().contains("--names-oracle"));
+        assert!(!top.as_str().contains("jit-exec"));
 
         let mut usage = String::new_in(alloc);
         render_usage(&BLAZE_APP, &mut usage).expect("render usage");
@@ -1046,5 +1049,28 @@ mod tests {
         assert_eq!(dry.command, "engine-dry");
         assert_eq!(dry.positionals.as_slice(), &["src/lib.rs"]);
         assert_eq!(dry.last_value("driver"), Some("ready"));
+
+        let Ok(ParseOutcome::Command(build_rel)) =
+            parse_argv(&BLAZE_APP, &["blaze", "build", "-r", "--standalone", "-o", "out/app"], alloc)
+        else {
+            panic!("expected Command for build -r --standalone");
+        };
+        assert_eq!(build_rel.command, "build");
+        assert!(build_rel.has("release"));
+        assert!(build_rel.has("standalone"));
+        assert_eq!(build_rel.last_value("output"), Some("out/app"));
+
+        let Ok(ParseOutcome::Command(jit)) = parse_argv(
+            &BLAZE_APP,
+            &["blaze", "jit-exec", "--exe", "/tmp/app", "--arg0", "./app", "--manifest", "deadbeef", "--", "--viewer", "x"],
+            alloc,
+        ) else {
+            panic!("expected Command for hidden jit-exec");
+        };
+        assert_eq!(jit.command, "jit-exec");
+        assert_eq!(jit.last_value("exe"), Some("/tmp/app"));
+        assert_eq!(jit.last_value("arg0"), Some("./app"));
+        assert_eq!(jit.last_value("manifest"), Some("deadbeef"));
+        assert_eq!(jit.passthrough.as_slice(), &["--viewer", "x"]);
     }
 }

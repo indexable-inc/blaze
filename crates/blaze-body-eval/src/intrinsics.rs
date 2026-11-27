@@ -488,6 +488,9 @@ impl<'w, 'g, 't, 'a, W: BodyWorld, L: Layout> Machine<'w, 'g, 't, 'a, W, L> {
                 let ty = self.lookup_type_id_ty(tid)?;
                 self.put(d, u128::from(matches!(self.node(ty)?, PNode::Ref(Mutbl::Mut, _) | PNode::Ptr(Mutbl::Mut, _))))
             }
+            Intrinsic::TypeIdVtable => {
+                return Err(Stop::from(unsupported("`type_id_vtable` in body-eval")));
+            }
             Intrinsic::AssertInhabited | Intrinsic::AssertZeroValid | Intrinsic::AssertMemUninitializedValid => {
                 let t = t0.ok_or(Stop::from(malformed("validity assertion type argument")))?;
                 let check = blaze_build::intrinsics::validity::Check::of(i)

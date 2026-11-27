@@ -134,6 +134,70 @@ pub(super) fn drop_impl<'n, S: NamesSource<'n>>(
     Some(answer(adt, solved, noted, drop_fn))
 }
 
+/// Whether ground type `concrete` implements `trait_` at trait arguments `args` (excluding `Self`,
+/// which is `concrete`), as `ConstWorld::implements_trait` asks for `type_id_vtable`:
+/// uses `blaze_typeck::instance::select_impl` with the exact same `fills`/`gaps` protocol as
+/// [`drop_impl`], never guessing `false` when impl buckets or headers have not been made yet.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn implements_trait<'n, S: NamesSource<'n>>(
+    names: S,
+    keys: &Keys,
+    index: &Index<'n>,
+    store: &Store<'n>,
+    project: &ProjectAsk<'_>,
+    concrete: PTy,
+    trait_: ItemKey,
+    args: tc::List,
+    ground: &mut PortableTys<'_>,
+) -> Option<Result<bool, BuildError>> {
+    let Some(module) = keys.library_in(names, trait_) else {
+        return Some(Ok(false));
+    };
+    let tail = match ground.view().list(args) {
+        Ok(slice) => slice,
+        Err(_) => return Some(Err(BuildError::Malformed { what: "trait arguments past the ground table" })),
+    };
+    let mut full = Vec::with_capacity_in(1 + tail.len(), Global);
+    full.push(concrete);
+    full.extend_from_slice(tail);
+
+    let spell = Spelling::fixed();
+    let blocks = BlockTraits::module(store.work_alloc());
+    let self_ = SelfTy::None;
+    let world = BodyWorld {
+        names,
+        keys,
+        index,
+        store,
+        buckets: project.buckets(),
+        owner: trait_,
+        module,
+        params: &[],
+        self_: &self_,
+        spell: &spell,
+        traits: &[],
+        blocks: &blocks,
+        path_marks: &[],
+        path_ns: &[],
+        fills: RefCell::new(Vec::new_in(Global)),
+        gaps: RefCell::new(Vec::new_in(Global)),
+        reveal: super::opaque_auto::Reveal::All,
+    };
+    let solved = tc::select_impl(&world, trait_, &full, ground, ground.alloc());
+    let fills = world.fills.into_inner();
+    let gaps = world.gaps.into_inner();
+    let noted = !fills.is_empty() || !gaps.is_empty();
+    if noted {
+        project.note(fills, gaps);
+        return Some(Err(BuildError::MissingRecord { item: trait_ }));
+    }
+    Some(match solved {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) | Err(tc::ResolveError::NoImpl { .. }) => Ok(false),
+        Err(e) => Err(BuildError::Select(e)),
+    })
+}
+
 /// The answer from what the solver gave (`solved`: the impl, or none), whether the world noted
 /// anything to make or a gap (`noted`), and the `Drop` trait's `drop` fn if filed. While
 /// anything is noted the solver read only the impls made so far, so even "no impl" is no

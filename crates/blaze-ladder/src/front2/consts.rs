@@ -721,6 +721,10 @@ impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
         super::const_drop::drop_impl(self.names, self.keys, self.index, self.store, &self.project, ty, ground)
     }
 
+    fn implements_trait(&self, concrete: tc::PTy, trait_: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Option<Result<bool, blaze_build::BuildError>> {
+        super::const_drop::implements_trait(self.names, self.keys, self.index, self.store, &self.project, concrete, trait_, args, ground)
+    }
+
     /// core's `#[lang = "manually_drop"]` ADT (front2/const_drop.rs).
     fn manually_drop(&self) -> Option<Option<ItemKey>> {
         super::const_drop::manually_drop(self.names, self.index, &self.project)

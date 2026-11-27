@@ -2442,6 +2442,40 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 let ty = self.lookup_type_id_ty(tid)?;
                 s(u128::from(matches!(self.node(ty)?, PNode::Ref(Mutbl::Mut, _) | PNode::Ptr(Mutbl::Mut, _))))
             }
+            Intrinsic::TypeIdVtable => {
+                let concrete_tid = self.read_type_id(vals.first().ok_or(malformed("`type_id_vtable` concrete argument"))?.0)?;
+                let trait_tid = self.read_type_id(vals.get(1).ok_or(malformed("`type_id_vtable` trait argument"))?.0)?;
+                let concrete = self.lookup_type_id_ty(concrete_tid)?;
+                let trait_ty = self.lookup_type_id_ty(trait_tid)?;
+                if !matches!(self.node(trait_ty)?, PNode::Dynamic(_)) {
+                    return self.build_option_val(rt, None);
+                }
+                let Some((principal, args)) = self.principal_c(trait_ty)? else {
+                    return self.build_option_val(rt, None);
+                };
+                let Some(res) = self.world.implements_trait(concrete, principal, args, self.ground) else {
+                    return Err(Stop::Refused(Refusal::Missing { what: "`type_id_vtable` trait check", item: principal }));
+                };
+                let holds = res.map_err(|e| match e {
+                    blaze_build::BuildError::MissingRecord { item } => Stop::Refused(Refusal::Missing { what: "trait impls", item }),
+                    blaze_build::BuildError::Projection { trait_, name } => Stop::Refused(Refusal::Projection { trait_, name }),
+                    blaze_build::BuildError::OpaqueOwnerUnchecked { owner, .. } => Stop::Refused(Refusal::Missing { what: "opaque defining body", item: owner }),
+                    blaze_build::BuildError::Malformed { what } => Stop::Refused(Refusal::Malformed { what }),
+                    _ => Stop::Refused(Refusal::Unsupported { what: "selecting a trait impl in `type_id_vtable`" }),
+                })?;
+                if !holds {
+                    return self.build_option_val(rt, None);
+                }
+                let key = self.vtable_key_of(concrete, principal, args)?;
+                let vt = self.vtable_ptr(ConstVtable { key, vtable: VtableRef { concrete, principal, args } })?;
+                let (_, some_v) = self.option_variants(rt)?;
+                let ft = self.field_ty(rt, some_v, 0)?;
+                let ft_info = self.tyinfo(ft)?;
+                let inner = self.temp_i(ft_info)?;
+                self.work.mem.write(inner.at(0), PTR, Scalar::Ptr(vt))?;
+                let meta = self.load_i(Place::of(inner), ft_info)?;
+                self.build_option_val(rt, Some(meta))
+            }
             Intrinsic::AssertInhabited | Intrinsic::AssertZeroValid | Intrinsic::AssertMemUninitializedValid => {
                 let t = t0.ok_or(malformed("validity assertion type argument"))?;
                 let check = blaze_build::intrinsics::validity::Check::of(i).ok_or(malformed("validity assertion"))?;

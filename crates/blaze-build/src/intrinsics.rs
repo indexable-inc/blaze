@@ -175,6 +175,9 @@ pub enum Which {
     TypeIdPointsTo,
     /// `type_id_points_mutably(id)` (`#[rustc_comptime]`): whether ref/raw ptr is mutable.
     TypeIdPointsMutably,
+    /// `type_id_vtable(id, trait_id)` (`#[rustc_comptime]`): `Option<DynMetadata<*const ()>>` vtable
+    /// when `id` implements `trait_id`'s `dyn Trait`.
+    TypeIdVtable,
     /// `float_to_int_unchecked::<F, I>(value)`: `fptosi`/`fptoui` by `I`'s signedness.
     FloatToIntUnchecked,
     /// core's `ub_checks()`: `true` in a constant (blaze-consteval machine.rs `intrinsic`); at
@@ -332,6 +335,7 @@ pub const TABLE: &[Entry] = &[
     e("type_id_size_of", Which::TypeIdSizeOf, "Returns the byte size of the type represented by this `TypeId`, or `None` if unsized.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns `Option<usize>`"),
     e("type_id_type_of", Which::TypeIdTypeOf, "Computes the compile-time `core::mem::type_info::Type` of a concrete `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval constructs `Type`"),
     e("type_id_variants", Which::TypeIdVariants, "Gets the number of variants of the type represented by this `TypeId`.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval returns the variant count"),
+    e("type_id_vtable", Which::TypeIdVtable, "Check if a type represented by a `TypeId` implements a trait represented by a `TypeId`. If it implements the trait the dyn metadata gets returned for vtable access.", "nothing at run time (`#[rustc_comptime]`): blaze-consteval selects the impl and returns `Option<DynMetadata<*const ()>>`"),
     e("type_name", Which::TypeName, "Gets a static string slice containing the name of a type.", "nothing at run time (\"can only be called at compile-time\"): blaze-consteval evaluates it to the text of type_name.rs"),
     e("ub_checks", Which::UbChecks, "Returns whether we should perform some UB-checking at runtime.", "the building profile's `debug-assertions`, a constant; `true` in a constant"),
     e("unaligned_volatile_load", Which::UnalignedVolatileLoad, "Performs a volatile load from the `src` pointer The pointer is not required to be aligned.", "`load volatile`, alignment 1"),
@@ -1118,7 +1122,8 @@ pub fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         | W::TypeIdElementTy
         | W::TypeIdSizeOf
         | W::TypeIdPointsTo
-        | W::TypeIdPointsMutably => {
+        | W::TypeIdPointsMutably
+        | W::TypeIdVtable => {
             return Err(s.shape("a `#[rustc_comptime]` reflection intrinsic reached the intrinsic builder: it is evaluated at compile time (blaze-consteval)"));
         }
         // core reaches it in `TypeId::of`'s `const` block (blaze-consteval); a run-time call is

@@ -977,7 +977,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
 
     /// Principal trait and its arguments after `Self` of ground trait object `t`, `None` for
     /// auto-trait-only objects (`dyn Send`).
-    fn principal_c(&self, t: PTy) -> R<'a, Option<(ItemKey, List)>> {
+    pub(super) fn principal_c(&self, t: PTy) -> R<'a, Option<(ItemKey, List)>> {
         let view = self.ground.view();
         let PNode::Dynamic(l) = view.node(t).map_err(|_| malformed("a type past the ground table"))? else {
             return Err(malformed("a trait object's principal asked of another type"));
