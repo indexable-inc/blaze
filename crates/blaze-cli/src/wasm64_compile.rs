@@ -734,7 +734,8 @@ fn ensure_build_script_unit(
 
     let id = blaze_toolchain::PINNED;
     let mut identity = std::format!(
-        "blaze build-script module 3\nname {}\nversion {}\nfeatures {}\n",
+        "{}\nname {}\nversion {}\nfeatures {}\n",
+        script_unit::MODULE_HEADER,
         unit.name.as_str(),
         unit.version.as_str(),
         feats.join(","),
@@ -2781,16 +2782,91 @@ mod tests {
     }
 
     #[test]
-    fn wasm64_sysroot_closure_excludes_bstd_and_sonic_rs_without_needs_bstd() {
-        let Ok(home) = std::env::var("HOME") else {
-            return;
+    fn wasm64_sysroot_mark_excludes_bstd_and_transitive_deps_hermetic() {
+        use blaze_toolchain::implied::ImplicitSysroot;
+        use blaze_toolchain::record::{CrateIn, TargetIn, UnitIn, write};
+
+        let frame = Frame::with_reserve(4 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+
+        let mk_crate = |name: &'static str, role: Role| CrateIn {
+            name,
+            version: "0.0.0",
+            edition: "2024",
+            lib: name,
+            root: "src/lib.rs",
+            dir: "",
+            role,
+            pack_kind: 3,
+            pack_len: 0,
+            pack: [0; 32],
         };
+        let crates = [
+            mk_crate("core", Role::Core),
+            mk_crate("alloc", Role::Alloc),
+            mk_crate("compiler_builtins", Role::Library),
+            mk_crate("std", Role::Std),
+            mk_crate("proc_macro", Role::ProcMacro),
+            mk_crate("sonic_rs", Role::Registry),
+            mk_crate("ref_cast_impl", Role::Registry),
+            mk_crate("blaze_data", Role::Blaze),
+            mk_crate("bstd", Role::Bstd),
+        ];
+        let units = [
+            UnitIn { krate: 0, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[], sysroot: ImplicitSysroot::None },
+            UnitIn { krate: 1, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0)], sysroot: ImplicitSysroot::Core },
+            UnitIn { krate: 2, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0)], sysroot: ImplicitSysroot::Core },
+            UnitIn { krate: 3, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0), ("alloc", 1), ("compiler_builtins", 2)], sysroot: ImplicitSysroot::Core },
+            UnitIn { krate: 4, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0), ("std", 3)], sysroot: ImplicitSysroot::Std },
+            UnitIn { krate: 5, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0), ("std", 3), ("ref_cast_impl", 6)], sysroot: ImplicitSysroot::Std },
+            UnitIn { krate: 6, kind: TcUnitKind::ProcMacro, for_host: true, root: "src/lib.rs", features: &[], deps: &[], sysroot: ImplicitSysroot::Std },
+            UnitIn { krate: 7, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0), ("std", 3), ("sonic_rs", 5)], sysroot: ImplicitSysroot::Std },
+            UnitIn { krate: 8, kind: TcUnitKind::Lib, for_host: false, root: "src/lib.rs", features: &[], deps: &[("core", 0), ("alloc", 1), ("std", 3), ("blaze_data", 7)], sysroot: ImplicitSysroot::Std },
+        ];
+        let targets = [TargetIn { triple: WASM64_TARGET, units: &units, cfg: &[] }];
+        let bytes = write(&crates, &targets, a).expect("encode synthetic toolchain");
+        let tc_id = ToolchainView::id_of_bytes(bytes.as_slice());
+        let tc_view = ToolchainView::open(bytes.as_slice(), tc_id).expect("open synthetic view");
+        let sys = blaze_toolchain::sysroot(&tc_view, WASM64_TARGET, false).expect("synthetic sysroot");
+        let all_tc: std::vec::Vec<_> = tc_view.units(WASM64_TARGET).expect("synthetic units").collect();
+
+        let kept_names = |needs_bstd: bool| -> std::vec::Vec<&str> {
+            let mut keep = std::vec![false; all_tc.len()];
+            mark_wasm64_sysroot(&all_tc, sys, needs_bstd, &mut keep, a);
+            let mut names: std::vec::Vec<&str> = all_tc
+                .iter()
+                .enumerate()
+                .filter(|(u, row)| keep[*u] && (row.kind == TcUnitKind::ProcMacro || (row.kind == TcUnitKind::Lib && !row.for_host)))
+                .map(|(_, row)| tc_view.krate(row.krate).lib)
+                .collect();
+            names.sort_unstable();
+            names
+        };
+
+        assert_eq!(
+            kept_names(false),
+            ["alloc", "compiler_builtins", "core", "proc_macro", "std"],
+            "needs_bstd=false must keep only core/alloc/std/proc_macro closure and exclude bstd/blaze_data/sonic_rs/ref_cast_impl"
+        );
+        assert_eq!(
+            kept_names(true),
+            ["alloc", "blaze_data", "bstd", "compiler_builtins", "core", "proc_macro", "ref_cast_impl", "sonic_rs", "std"],
+            "needs_bstd=true must include bstd and its transitive closure"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs installed pinned toolchain under $HOME/.blaze/v2/toolchain"]
+    fn wasm64_sysroot_closure_excludes_bstd_and_sonic_rs_without_needs_bstd() {
+        let home = std::env::var("HOME").expect("HOME must be set for installed toolchain test");
         let shelf_dir = PathBuf::from(home).join(".blaze/v2/toolchain");
         let tc_id = blaze_toolchain::PINNED;
-        if !shelf_dir.join(tc_id.to_string()).exists() {
-            eprintln!("skipping wasm64 sysroot closure test: pinned toolchain {tc_id} absent");
-            return;
-        }
+        assert!(
+            shelf_dir.join(tc_id.to_string()).exists(),
+            "pinned toolchain {tc_id} missing under {}",
+            shelf_dir.display()
+        );
         let mut shelf = DirShelf::new(shelf_dir.to_string_lossy().into_owned());
         let manifest_file = blaze_toolchain::shelf::open_manifest(&mut shelf, tc_id).expect("open manifest");
         let tc_view = ToolchainView::open(manifest_file.as_ref(), tc_id).expect("open view");
@@ -2846,16 +2922,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs installed pinned toolchain under $HOME/.blaze/v2/toolchain"]
     fn wasm64_compile_build_script_with_real_toolchain_excludes_bstd_and_emits_valid_wasm64() {
-        let Ok(home) = std::env::var("HOME") else {
-            return;
-        };
+        let home = std::env::var("HOME").expect("HOME must be set for installed toolchain test");
         let real_shelf = PathBuf::from(home).join(".blaze/v2/toolchain");
         let tc_id = blaze_toolchain::PINNED;
-        if !real_shelf.join(tc_id.to_string()).exists() {
-            eprintln!("skipping wasm64 real build script test: pinned toolchain {tc_id} absent");
-            return;
-        }
+        assert!(
+            real_shelf.join(tc_id.to_string()).exists(),
+            "pinned toolchain {tc_id} missing under {}",
+            real_shelf.display()
+        );
 
         let tmp = std::env::temp_dir().join(std::format!(
             "blaze-wasm64-no-ambient-bstd-{}",

@@ -462,7 +462,7 @@ impl Plan<'_> {
             Some(native) => native.identity()?,
         };
         let identity = format!(
-            "blaze build-script module 3\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\n{runner}builder bootstrap\n",
+            "blaze build-script module 4\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\n{runner}builder bootstrap\n",
             wanted.name,
             wanted.version,
             origin.identity_line(),

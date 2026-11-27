@@ -26,7 +26,9 @@ use crate::scripts::RanAs;
 // (transitive build-dependencies, rule 21) so editing `build.rs` or any build-dependency
 // invalidates the module lookup and distinct packages never collide.
 const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 4";
-const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 1";
+// "2": wasm build-script module lookups require `script_unit::MODULE_HEADER` (v4), invalidating
+// cached `MacroModule` task records that pointed at pre-v4 modules.
+const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 2";
 const OUT_DOMAIN: &str = "blaze-cli build-script module out 2";
 
 /// The rule a lookup's failure names.
@@ -237,7 +239,10 @@ pub(crate) fn asked_lines(
     }
     match ran_as {
         RanAs::Native => lines.push(std::format!("target {host}")),
-        RanAs::Wasm => lines.push(blaze_proc_macro::script_unit::shim_line()),
+        RanAs::Wasm => {
+            lines.push(blaze_proc_macro::script_unit::MODULE_HEADER.to_owned());
+            lines.push(blaze_proc_macro::script_unit::shim_line());
+        }
     }
     lines
 }
@@ -266,25 +271,30 @@ mod tests {
     /// `time` feature the ask names, and the refusal shows the record's own features line.
     #[test]
     fn a_lookup_names_the_line_that_differs() {
-        let libproc = "blaze build-script module 3\nname libproc\nversion 0.14.11\nfeatures \ntoolchain nightly-2026-10-27\ntarget aarch64-apple-darwin\nbuilder bootstrap\n";
+        let header = blaze_proc_macro::script_unit::MODULE_HEADER;
+        let libproc = std::format!("{header}\nname libproc\nversion 0.14.11\nfeatures \ntoolchain nightly-2026-10-27\ntarget aarch64-apple-darwin\nbuilder bootstrap\n");
         let host = "aarch64-apple-darwin";
         let native = asked_lines(RanAs::Native, "libproc", "0.14.11", &[], host, None, None);
-        assert_eq!(differing(&native, RanAs::Native, libproc).count(), 0);
+        assert_eq!(differing(&native, RanAs::Native, &libproc).count(), 0);
         let shim = blaze_proc_macro::script_unit::shim_line();
         let wasm = asked_lines(RanAs::Wasm, "libproc", "0.14.11", &[], host, None, None);
-        let said: std::vec::Vec<_> = differing(&wasm, RanAs::Wasm, libproc).collect();
+        let said: std::vec::Vec<_> = differing(&wasm, RanAs::Wasm, &libproc).collect();
         assert_eq!(said, [std::format!("no `{shim}` line"), "target aarch64-apple-darwin (a native host binary; asked: a wasm module)".to_owned()]);
-        let nix = std::format!("blaze build-script module 3\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\n{shim}\nbuilder bootstrap\n");
+        let nix = std::format!("{header}\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\n{shim}\nbuilder bootstrap\n");
         let asked = asked_lines(RanAs::Wasm, "nix", "0.31.3", &["time", "default", "ioctl", "memoffset", "socket"], host, None, None);
         let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, &nix).collect();
         assert_eq!(said, ["features default,ioctl,memoffset,socket (asked: features default,ioctl,memoffset,socket,time)"]);
         // A module built with another process shim (before `found`, guest/script_process.rs)
         // is named by that line: what its rebuild changes.
-        let stale = "blaze build-script module 3\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\nshim c1a4bffa83fc8f619c4daf0a3c0121cc1079b345b415a6d553a910a8e8a6ede6\nbuilder bootstrap\n";
+        let stale = std::format!("{header}\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\nshim c1a4bffa83fc8f619c4daf0a3c0121cc1079b345b415a6d553a910a8e8a6ede6\nbuilder bootstrap\n");
         let asked = asked_lines(RanAs::Wasm, "nix", "0.31.3", &["default", "ioctl", "memoffset", "socket"], host, None, None);
-        let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, stale).collect();
+        let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, &stale).collect();
         assert_eq!(said, [std::format!("shim c1a4bffa83fc8f619c4daf0a3c0121cc1079b345b415a6d553a910a8e8a6ede6 (asked: {shim})")]);
-        assert_eq!(differing(&asked, RanAs::Wasm, &nix).count(), 0, "CONTROL: the record with this host's shim answers the ask");
+        // A stale v3 module header is named explicitly as differing from the current header.
+        let stale_v3 = std::format!("blaze build-script module 3\nname nix\nversion 0.31.3\nfeatures default,ioctl,memoffset,socket\n{shim}\nbuilder bootstrap\n");
+        let said: std::vec::Vec<_> = differing(&asked, RanAs::Wasm, &stale_v3).collect();
+        assert_eq!(said, [std::format!("blaze build-script module 3 (asked: {header})")]);
+        assert_eq!(differing(&asked, RanAs::Wasm, &nix).count(), 0, "CONTROL: the record with this host's header and shim answers the ask");
         // A native and a wasm ask of one script are two lookups.
         assert_ne!(subject(RanAs::Native, "libproc", "0.14.11", &[], None, None), subject(RanAs::Wasm, "libproc", "0.14.11", &[], None, None));
         // Distinct path-package file digests and build-dep digests produce distinct lookup subjects (rule 21).
