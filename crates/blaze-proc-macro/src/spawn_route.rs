@@ -503,7 +503,7 @@ pub(crate) fn same_guest_dir(cwd_override: &str, mount: &str) -> bool {
         }
         true
     }
-    if cwd_override.is_empty() {
+    if cwd_override.is_empty() || cwd_override.contains('\0') {
         return false;
     }
     let mut norm_mount = [""; MAX_PARTS];
@@ -523,6 +523,83 @@ pub(crate) fn same_guest_dir(cwd_override: &str, mount: &str) -> bool {
         return cwd_override == mount;
     }
     cwd_len == mount_len && norm_cwd.get(..cwd_len) == norm_mount.get(..mount_len)
+}
+
+/// If `cwd_override` is a clean, absolute directory strictly contained under `base`
+/// (collapsing trailing/duplicate `/` and `.` components, while rejecting empty, relative,
+/// NUL-containing, root-only `base`, prefix-confusion sibling, or `..`-traversing paths),
+/// returns its normalized `base`-relative path (e.g. `"out-c11"` or `"a/b"`).
+pub(crate) fn guest_dir_under_rel<'a>(cwd_override: &str, base: &str, alloc: Alloc<'a>) -> Option<blaze_own::AString<'a>> {
+    if !cwd_override.starts_with('/')
+        || !base.starts_with('/')
+        || cwd_override.contains('\0')
+        || base.contains('\0')
+    {
+        return None;
+    }
+    let mut base_parts = base.split('/').filter(|seg| !seg.is_empty() && *seg != ".");
+    let mut cwd_parts = cwd_override.split('/').filter(|seg| !seg.is_empty() && *seg != ".");
+    let mut saw_base = false;
+    for base_seg in &mut base_parts {
+        if base_seg == ".." {
+            return None;
+        }
+        saw_base = true;
+        let cwd_seg = cwd_parts.next()?;
+        if cwd_seg == ".." || cwd_seg != base_seg {
+            return None;
+        }
+    }
+    if !saw_base {
+        return None;
+    }
+    let mut rel = blaze_own::String::new_in(alloc);
+    for cwd_seg in cwd_parts {
+        if cwd_seg == ".." {
+            return None;
+        }
+        if !rel.is_empty() {
+            rel.push('/');
+        }
+        rel.push_str(cwd_seg);
+    }
+    if rel.is_empty() {
+        return None;
+    }
+    Some(rel)
+}
+
+/// Classification of a compiler probe's `current_dir` override against `mount` and `out_dir`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProbeCwd<'a> {
+    /// Equal to the script's `mount` or `out_dir` itself (both always exist).
+    MountOrOutDir,
+    /// Clean, traversal-free subdirectory strictly under `out_dir`, normalized to its
+    /// `OUT_DIR`-relative key (e.g. `"out-c11"` or `"a/b"`), which the caller must verify
+    /// exists as a directory (`Some(None)`) in the in-memory `OUT_DIR`.
+    OutSubdir(blaze_own::AString<'a>),
+    /// Disallowed path (outside `mount`/`out_dir`, relative, NUL-containing, or traversing `..`).
+    Disallowed,
+}
+
+/// Classifies `cwd_override` for a compiler probe against `mount` and `out_dir`.
+pub(crate) fn classify_probe_cwd<'a>(cwd_override: &str, mount: &str, out_dir: &str, alloc: Alloc<'a>) -> ProbeCwd<'a> {
+    if same_guest_dir(cwd_override, mount) {
+        return ProbeCwd::MountOrOutDir;
+    }
+    if !cwd_override.starts_with('/')
+        || cwd_override.contains('\0')
+        || cwd_override.split('/').any(|seg| seg == "..")
+    {
+        return ProbeCwd::Disallowed;
+    }
+    if same_guest_dir(cwd_override, out_dir) {
+        return ProbeCwd::MountOrOutDir;
+    }
+    match guest_dir_under_rel(cwd_override, out_dir, alloc) {
+        Some(rel) => ProbeCwd::OutSubdir(rel),
+        None => ProbeCwd::Disallowed,
+    }
 }
 
 impl ScriptSandbox {
@@ -613,16 +690,26 @@ impl ScriptSandbox {
         let sdk = env.iter().find(|(k, _)| *k == "SDKROOT").map_or("", |(_, v)| *v);
         let mount = script.cwd();
         let out_dir = script.out_dir();
-        // `cc-rs` spawns compiler flag probes (`flag_check.c`) with `.current_dir(OUT_DIR)`.
-        // `c_tasks_probe` refuses any relative or non-`OUT_DIR` file argument, so both `mount`
-        // and `out_dir` are hermetic probe working directories (rule 21).
-        if let Some(ref cwd_override) = spawned.cwd
-            && !same_guest_dir(cwd_override.as_str(), mount.as_str())
-            && !same_guest_dir(cwd_override.as_str(), out_dir)
-        {
-            return Err(self.refuse(Refusal::Spawn(refused(format!(
-                "compiler probe current_dir `{cwd_override}` differs from script cwd `{mount}` and OUT_DIR `{out_dir}` (rule 21)"
-            )))));
+        // `cc-rs` spawns compiler flag probes (`flag_check.c`) with `.current_dir(OUT_DIR)` or an
+        // existing subdirectory beneath `OUT_DIR` (e.g. `aws-lc-sys`'s `out-c11`). `c_tasks_probe`
+        // refuses any relative or non-`OUT_DIR` file argument, so `mount`, `out_dir`, and existing
+        // clean subdirectories strictly under `out_dir` are hermetic probe working directories
+        // (rule 21).
+        if let Some(ref cwd_override) = spawned.cwd {
+            let bad_reason = match classify_probe_cwd(cwd_override.as_str(), mount.as_str(), out_dir, alloc) {
+                ProbeCwd::MountOrOutDir => None,
+                ProbeCwd::OutSubdir(rel) => match self.out.get(rel.as_str()) {
+                    Some(None) => None,
+                    Some(Some(_)) => Some("is a regular file under OUT_DIR, not a directory"),
+                    None => Some("does not exist under OUT_DIR"),
+                },
+                ProbeCwd::Disallowed => Some("differs from script cwd and is not under OUT_DIR"),
+            };
+            if let Some(reason) = bad_reason {
+                return Err(self.refuse(Refusal::Spawn(refused(format!(
+                    "compiler probe current_dir `{cwd_override}` {reason} (script cwd `{mount}`, OUT_DIR `{out_dir}`, rule 21)"
+                )))));
+            }
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let out = &self.out;
