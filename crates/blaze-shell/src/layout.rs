@@ -7126,6 +7126,26 @@ fn layout_reverse_search_overlay(
     }
 }
 
+/// Count visible rows inside the visual branch commit graph card so popover sizing and
+/// rendering stay in exact sync.
+fn branch_graph_row_count(rel: &crate::prompt::BranchRelation) -> usize {
+    if rel.ahead == 0 && rel.behind == 0 {
+        let recent = rel.recent_commits.len().min(3);
+        if recent > 0 {
+            recent
+        } else {
+            usize::from(!rel.merge_base_short.is_empty())
+        }
+    } else {
+        let shown_ahead = rel.ahead_commits.len().min(5);
+        let more_ahead = usize::from(rel.ahead as usize > shown_ahead);
+        let shown_behind = rel.behind_commits.len().min(3);
+        let more_behind = usize::from(rel.behind as usize > shown_behind);
+        let has_mb = usize::from(!rel.merge_base_short.is_empty());
+        shown_ahead + more_ahead + shown_behind + more_behind + has_mb
+    }
+}
+
 /// Floating native Metal popover rendered when hovering or clicking any prompt capsule segment
 /// (branch switcher, uncommitted files, stashes, directory breadcrumbs, toolchains) or icon button.
 fn layout_active_popover(
@@ -7161,37 +7181,46 @@ fn layout_active_popover(
             (w, h)
         }
         HoverKind::GitBranch { branches, relation, .. } => {
-            let shown = branches.len().clamp(1, 10);
-            let max_br = branches
-                .iter()
-                .take(shown)
-                .map(|b| b.chars().count())
-                .max()
-                .unwrap_or(10);
-            let (rel_h, rel_chars) = if let Some(rel) = relation {
-                let has_mb = !rel.merge_base_short.is_empty();
-                let card_h = if has_mb {
-                    m.ch * 2.0 + 22.0
+            if let Some(rel) = relation {
+                let commit_row_h = m.ch + 6.0;
+                let graph_rows = branch_graph_row_count(rel);
+                let graph_hdr_h = m.ch + 10.0;
+                let card_h = if graph_rows > 0 {
+                    graph_hdr_h + graph_rows as f32 * commit_row_h + 10.0
                 } else {
                     m.ch + 16.0
                 };
-                let line1_c = 3 + rel.base_ref.chars().count() + 18;
-                let line2_c = if has_mb {
-                    (5 + rel.merge_base_short.chars().count() + 10 + rel.merge_base_subject.chars().count())
-                        .min(52)
+                let max_branches = if graph_rows > 0 { 6 } else { 10 };
+                let shown = branches.len().clamp(1, max_branches);
+                let w = if graph_rows > 0 {
+                    (vw - 32.0).min(540.0).max(410.0)
                 } else {
-                    0
+                    let max_br = branches
+                        .iter()
+                        .take(shown)
+                        .map(|b| b.chars().count())
+                        .max()
+                        .unwrap_or(10)
+                        .max(24)
+                        .min(48);
+                    (max_br as f32 * m.cw + pad_x * 2.0 + 36.0).clamp(300.0, 450.0)
                 };
-                (card_h + 6.0, line1_c.max(line2_c))
+                let h = (hdr_h + card_h + 8.0 + shown as f32 * row_h + pad_y).min(vh - 36.0);
+                (w, h)
             } else {
-                (0.0, 0)
-            };
-            let max_c = max_br.max(rel_chars).max(24).min(52);
-            let min_w = if relation.is_some() { 300.0 } else { 220.0 };
-            let max_w = if relation.is_some() { 450.0 } else { 380.0 };
-            let w = (max_c as f32 * m.cw + pad_x * 2.0 + 36.0).clamp(min_w, max_w);
-            let h = hdr_h + rel_h + shown as f32 * row_h + pad_y;
-            (w, h)
+                let shown = branches.len().clamp(1, 10);
+                let max_c = branches
+                    .iter()
+                    .take(shown)
+                    .map(|b| b.chars().count())
+                    .max()
+                    .unwrap_or(10)
+                    .max(24)
+                    .min(42);
+                let w = (max_c as f32 * m.cw + pad_x * 2.0 + 36.0).clamp(220.0, 380.0);
+                let h = hdr_h + shown as f32 * row_h + pad_y;
+                (w, h)
+            }
         }
         HoverKind::GitStashes { stashes, entries, .. } => {
             if !entries.is_empty() {
@@ -7506,12 +7535,19 @@ fn layout_active_popover(
         }
         HoverKind::GitBranch { current, branches, relation } => {
             let mut ry = draw_header(scene, "git branches", "click to switch");
+            let mut max_branches = 10usize;
             if let Some(rel) = relation {
-                let has_mb = !rel.merge_base_short.is_empty();
+                let commit_row_h = m.ch + 6.0;
+                let graph_rows = branch_graph_row_count(rel);
+                if graph_rows > 0 {
+                    max_branches = 6;
+                }
+                let graph_hdr_h = m.ch + 10.0;
                 let card_x0 = x0 + 8.0;
                 let card_x1 = x1 - 8.0;
-                let card_h = if has_mb {
-                    m.ch * 2.0 + 22.0
+                let card_bg = theme::rgb(0x14, 0x14, 0x19);
+                let card_h = if graph_rows > 0 {
+                    graph_hdr_h + graph_rows as f32 * commit_row_h + 10.0
                 } else {
                     m.ch + 16.0
                 };
@@ -7521,15 +7557,20 @@ fn layout_active_popover(
                     card_x1,
                     ry + card_h,
                     6.0,
-                    theme::rgb(0x16, 0x16, 0x1b),
+                    card_bg,
                     1.0,
                     theme::LINE,
                     0,
                 );
 
-                // Row 1: `vs <base_ref>` on the left + right-aligned ahead/behind status pills.
-                let inner_x0 = card_x0 + 8.0;
-                let inner_x1 = card_x1 - 8.0;
+                let add_col = theme::rgb(0x57, 0xc7, 0x85);
+                let del_col = theme::rgb(0xf0, 0x71, 0x78);
+                let behind_col = theme::rgb(0xe8, 0xa8, 0x48);
+                let sha_col = theme::rgb(0x74, 0xb9, 0xff);
+
+                // Card header: `vs <base_ref>` on the left + total `+A -D` & ahead/behind pills on the right.
+                let inner_x0 = card_x0 + 9.0;
+                let inner_x1 = card_x1 - 9.0;
                 let row1_y = ry + 6.0;
                 let pill_h = m.ch + 2.0;
                 let pill_y0 = row1_y - 1.0;
@@ -7566,7 +7607,7 @@ fn layout_active_popover(
                             scene,
                             &mut rx,
                             &lbl,
-                            theme::rgb(0xe8, 0xa8, 0x48),
+                            behind_col,
                             theme::rgba(0xe5, 0x9b, 0x45, 0.15),
                         );
                     }
@@ -7586,6 +7627,22 @@ fn layout_active_popover(
                     }
                 }
 
+                // Aggregate branch diff `+total_added -total_deleted` right beside the divergence badge.
+                if rel.total_deleted > 0 {
+                    let s = format!("-{}", rel.total_deleted);
+                    let sw = s.len() as f32 * m.cw;
+                    rx -= sw + 2.0;
+                    scene.overlay_text_run(rx, row1_y, &s, del_col, false, false, 0);
+                    rx -= 4.0;
+                }
+                if rel.total_added > 0 {
+                    let s = format!("+{}", rel.total_added);
+                    let sw = s.len() as f32 * m.cw;
+                    rx -= sw;
+                    scene.overlay_text_run(rx, row1_y, &s, add_col, false, false, 0);
+                    rx -= 8.0;
+                }
+
                 scene.overlay_text_run(inner_x0, row1_y, "vs ", theme::INK_4, false, false, 0);
                 let base_x = inner_x0 + 3.0 * m.cw;
                 let max_base_c = ((rx - base_x - 4.0) / m.cw).floor().max(6.0) as usize;
@@ -7599,82 +7656,359 @@ fn layout_active_popover(
                     0,
                 );
 
-                // Row 2: common ancestor (`merge-base`) clickable SHA + relative age + subject.
-                if has_mb {
-                    let row2_y = row1_y + m.ch + 6.0;
-                    let mut cx = inner_x0;
-                    scene.overlay_text_run(cx, row2_y, "base ", theme::INK_4, false, false, 0);
-                    cx += 5.0 * m.cw;
-
-                    let sha_w = rel.merge_base_short.chars().count() as f32 * m.cw;
-                    let sha_rect = HitRect::new(cx - 2.0, row2_y - 1.0, cx + sha_w + 2.0, row2_y + m.ch + 1.0);
-                    let sha_bg = if is_hovered(sha_rect) {
-                        theme::rgba(0x6e, 0xb5, 0xff, 0.22)
-                    } else {
-                        theme::rgba(0x6e, 0xb5, 0xff, 0.10)
-                    };
+                // Visual GPU vector commit DAG inside the card.
+                if graph_rows > 0 {
+                    let sep_y = ry + graph_hdr_h;
                     scene.overlay_round_rect(
-                        sha_rect.x0,
-                        sha_rect.y0,
-                        sha_rect.x1,
-                        sha_rect.y1,
-                        3.5,
-                        sha_bg,
+                        card_x0 + 1.0,
+                        sep_y,
+                        card_x1 - 1.0,
+                        sep_y + 1.0,
+                        0.0,
+                        theme::LINE_FAINT,
                         0.0,
                         [0.0; 4],
                         0,
                     );
-                    scene.overlay_text_run(
-                        cx,
-                        row2_y,
-                        &rel.merge_base_short,
-                        theme::rgb(0x74, 0xb9, 0xff),
-                        false,
-                        false,
-                        0,
-                    );
-                    scene.push_hit(sha_rect, HitAction::CopyText(rel.merge_base_short.clone()));
-                    cx += sha_w + 3.0;
 
-                    if rel.merge_base_time_secs > 0 && now_ns > 0 {
-                        let mut age = String::new();
-                        let _ = format_relative_time(
-                            DateTime {
-                                utc_ns: rel.merge_base_time_secs.saturating_mul(1_000_000_000),
-                                offset_secs: 0,
-                            },
-                            now_ns,
-                            &mut age,
-                        );
-                        let age_lbl = format!(" · {age}");
-                        let age_w = age_lbl.chars().count() as f32 * m.cw;
-                        if cx + age_w < inner_x1 {
-                            scene.overlay_text_run(cx, row2_y, &age_lbl, theme::INK_4, false, false, 0);
-                            cx += age_w;
+                    let g_top = sep_y + 5.0;
+                    let draw_diff_stats = |scene: &mut Scene,
+                                           right_x: f32,
+                                           ty: f32,
+                                           cy: f32,
+                                           added: u32,
+                                           deleted: u32| -> f32 {
+                        let mut cur_rx = right_x;
+                        if added == 0 && deleted == 0 {
+                            return cur_rx;
                         }
-                    }
+                        // Compact 2-color proportional `+/-` bar (`20px × 3.5px`).
+                        let bar_w = 20.0f32;
+                        let bar_h = 3.5f32;
+                        let bar_x0 = cur_rx - bar_w;
+                        let bar_y0 = cy - bar_h * 0.5;
+                        let total = (added + deleted) as f32;
+                        if added > 0 && deleted > 0 {
+                            let gap = 1.0;
+                            let avail = bar_w - gap;
+                            let aw = ((added as f32 / total) * avail).clamp(2.5, avail - 2.5);
+                            scene.overlay_round_rect(bar_x0, bar_y0, bar_x0 + aw, bar_y0 + bar_h, 1.5, add_col, 0.0, [0.0; 4], 0);
+                            scene.overlay_round_rect(bar_x0 + aw + gap, bar_y0, cur_rx, bar_y0 + bar_h, 1.5, del_col, 0.0, [0.0; 4], 0);
+                        } else if added > 0 {
+                            scene.overlay_round_rect(bar_x0, bar_y0, cur_rx, bar_y0 + bar_h, 1.5, add_col, 0.0, [0.0; 4], 0);
+                        } else {
+                            scene.overlay_round_rect(bar_x0, bar_y0, cur_rx, bar_y0 + bar_h, 1.5, del_col, 0.0, [0.0; 4], 0);
+                        }
+                        cur_rx = bar_x0 - 6.0;
 
-                    if !rel.merge_base_subject.is_empty() && cx + 6.0 * m.cw < inner_x1 {
-                        scene.overlay_text_run(cx, row2_y, " · ", theme::INK_4, false, false, 0);
-                        cx += 3.0 * m.cw;
-                        let rem_c = ((inner_x1 - cx) / m.cw).floor().max(0.0) as usize;
-                        if rem_c >= 4 {
-                            scene.overlay_text_run(
-                                cx,
-                                row2_y,
-                                truncate_chars(&rel.merge_base_subject, rem_c),
-                                theme::INK_3,
-                                false,
-                                false,
+                        if deleted > 0 {
+                            let ds = format!("-{deleted}");
+                            let dw = ds.len() as f32 * m.cw;
+                            cur_rx -= dw;
+                            scene.overlay_text_run(cur_rx, ty, &ds, del_col, false, false, 0);
+                            cur_rx -= 5.0;
+                        }
+                        if added > 0 {
+                            let as_ = format!("+{added}");
+                            let aw = as_.len() as f32 * m.cw;
+                            cur_rx -= aw;
+                            scene.overlay_text_run(cur_rx, ty, &as_, add_col, false, false, 0);
+                            cur_rx -= 6.0;
+                        }
+                        cur_rx
+                    };
+
+                    let draw_sha_chip = |scene: &mut Scene,
+                                         sx: f32,
+                                         ty: f32,
+                                         sha: &str,
+                                         accent: [f32; 4]| -> f32 {
+                        let short: String = sha.chars().take(7).collect();
+                        let sw = short.chars().count() as f32 * m.cw;
+                        let r = HitRect::new(sx - 2.0, ty - 1.0, sx + sw + 2.0, ty + m.ch + 1.0);
+                        let bg = if is_hovered(r) {
+                            [accent[0], accent[1], accent[2], 0.24]
+                        } else {
+                            [accent[0], accent[1], accent[2], 0.10]
+                        };
+                        scene.overlay_round_rect(r.x0, r.y0, r.x1, r.y1, 3.0, bg, 0.0, [0.0; 4], 0);
+                        scene.overlay_text_run(sx, ty, &short, accent, false, false, 0);
+                        scene.push_hit(r, HitAction::CopyText(sha.to_owned()));
+                        sx + sw + 7.0
+                    };
+
+                    let draw_dot = |scene: &mut Scene,
+                                    cx: f32,
+                                    cy: f32,
+                                    r: f32,
+                                    fill: [f32; 4],
+                                    border_w: f32,
+                                    border: [f32; 4]| {
+                        scene.overlay_round_rect(
+                            cx - r,
+                            cy - r,
+                            cx + r,
+                            cy + r,
+                            r,
+                            fill,
+                            border_w,
+                            border,
+                            0,
+                        );
+                    };
+
+                    if rel.ahead == 0 && rel.behind == 0 {
+                        // Single-trunk recent commits (HEAD == base).
+                        let lx0 = inner_x0 + 6.0;
+                        let text_x0 = lx0 + 13.0;
+                        let count = rel.recent_commits.len().min(3);
+                        if count > 0 {
+                            if count > 1 {
+                                let y_start = g_top + commit_row_h * 0.5;
+                                let y_end = g_top + (count - 1) as f32 * commit_row_h + commit_row_h * 0.5;
+                                scene.overlay_line(lx0, y_start, lx0, y_end, 1.5, theme::LINE_STRONG, 0);
+                            }
+                            for (idx, c) in rel.recent_commits.iter().take(count).enumerate() {
+                                let row_y = g_top + idx as f32 * commit_row_h;
+                                let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                                let cy = row_y + commit_row_h * 0.5;
+                                if idx == 0 {
+                                    draw_dot(scene, lx0, cy, 5.2, theme::rgba(0x4c, 0xc2, 0x7a, 0.24), 0.0, [0.0; 4]);
+                                    draw_dot(scene, lx0, cy, 3.1, theme::OK, 0.0, [0.0; 4]);
+                                } else {
+                                    draw_dot(scene, lx0, cy, 2.7, theme::INK_3, 1.0, card_bg);
+                                }
+                                let sx = draw_sha_chip(
+                                    scene,
+                                    text_x0,
+                                    ty,
+                                    &c.short_sha,
+                                    if idx == 0 { theme::OK } else { sha_col },
+                                );
+                                let right_limit = draw_diff_stats(scene, inner_x1, ty, cy, c.added_lines, c.deleted_lines);
+                                let rem_c = ((right_limit - sx - 2.0) / m.cw).floor().max(0.0) as usize;
+                                if rem_c >= 3 {
+                                    scene.overlay_text_run(
+                                        sx,
+                                        ty,
+                                        truncate_chars(&c.subject, rem_c),
+                                        if idx == 0 { theme::INK_1 } else { theme::INK_3 },
+                                        idx == 0,
+                                        false,
+                                        0,
+                                    );
+                                }
+                            }
+                        } else if !rel.merge_base_short.is_empty() {
+                            let row_y = g_top;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            draw_dot(scene, lx0, cy, 3.4, card_bg, 1.8, sha_col);
+                            let sx = draw_sha_chip(scene, text_x0, ty, &rel.merge_base_short, sha_col);
+                            let rem_c = ((inner_x1 - sx) / m.cw).floor().max(0.0) as usize;
+                            if rem_c >= 3 {
+                                scene.overlay_text_run(sx, ty, truncate_chars(&rel.merge_base_subject, rem_c), theme::INK_3, false, false, 0);
+                            }
+                        }
+                    } else {
+                        // Diverged or ahead/behind vector DAG:
+                        // Lane 0 (`lx0`): base branch (`main`/`master`)
+                        // Lane 1 (`lx1`): current `HEAD` branch (when `ahead > 0`)
+                        let two_lanes = rel.ahead > 0;
+                        let lx0 = inner_x0 + 6.0;
+                        let lx1 = if two_lanes { lx0 + 13.0 } else { lx0 };
+                        let text_x0 = lx1 + 12.0;
+
+                        let shown_ahead = rel.ahead_commits.len().min(5);
+                        let more_ahead = rel.ahead.saturating_sub(shown_ahead as u32);
+                        let ahead_rows = shown_ahead + usize::from(more_ahead > 0);
+
+                        let shown_behind = rel.behind_commits.len().min(3);
+                        let more_behind = rel.behind.saturating_sub(shown_behind as u32);
+                        let behind_rows = shown_behind + usize::from(more_behind > 0);
+
+                        let has_mb = !rel.merge_base_short.is_empty();
+                        let mb_idx = ahead_rows + behind_rows;
+                        let row_cy = |i: usize| g_top + i as f32 * commit_row_h + commit_row_h * 0.5;
+
+                        // 1. Draw vector rails first so circular commit dots render crisply on top.
+                        if two_lanes && ahead_rows > 0 {
+                            let y_first = row_cy(0);
+                            let y_last_branch = row_cy(ahead_rows + behind_rows - 1);
+                            if ahead_rows + behind_rows > 1 {
+                                scene.overlay_line(lx1, y_first, lx1, y_last_branch, 1.75, theme::OK, 0);
+                            }
+                            if has_mb {
+                                // Smooth diagonal fork edge from Lane 1 (HEAD) into Lane 0 (merge-base).
+                                scene.overlay_line(lx1, y_last_branch, lx0, row_cy(mb_idx), 1.75, theme::OK, 0);
+                            }
+                        }
+                        if behind_rows > 0 {
+                            let y_b0 = row_cy(ahead_rows);
+                            let y_b_end = if has_mb {
+                                row_cy(mb_idx)
+                            } else {
+                                row_cy(ahead_rows + behind_rows - 1)
+                            };
+                            if y_b_end > y_b0 {
+                                scene.overlay_line(lx0, y_b0, lx0, y_b_end, 1.75, behind_col, 0);
+                            }
+                        }
+
+                        // 2. Render `ahead` commits on Lane 1 (`HEAD`, emerald).
+                        let mut cur_row = 0usize;
+                        for (idx, c) in rel.ahead_commits.iter().take(shown_ahead).enumerate() {
+                            let row_y = g_top + cur_row as f32 * commit_row_h;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            if idx == 0 {
+                                draw_dot(scene, lx1, cy, 5.2, theme::rgba(0x4c, 0xc2, 0x7a, 0.25), 0.0, [0.0; 4]);
+                                draw_dot(scene, lx1, cy, 3.2, theme::OK, 0.0, [0.0; 4]);
+                            } else {
+                                draw_dot(scene, lx1, cy, 2.9, theme::OK, 1.0, card_bg);
+                            }
+                            let sx = draw_sha_chip(scene, text_x0, ty, &c.short_sha, theme::OK);
+                            let right_limit = draw_diff_stats(scene, inner_x1, ty, cy, c.added_lines, c.deleted_lines);
+                            let rem_c = ((right_limit - sx - 2.0) / m.cw).floor().max(0.0) as usize;
+                            if rem_c >= 3 {
+                                scene.overlay_text_run(
+                                    sx,
+                                    ty,
+                                    truncate_chars(&c.subject, rem_c),
+                                    if idx == 0 { theme::INK_1 } else { theme::INK_2 },
+                                    idx == 0,
+                                    false,
+                                    0,
+                                );
+                            }
+                            cur_row += 1;
+                        }
+                        if more_ahead > 0 {
+                            let row_y = g_top + cur_row as f32 * commit_row_h;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            draw_dot(scene, lx1, cy, 2.5, card_bg, 1.3, theme::OK);
+                            let more_lbl = if more_ahead == 1 {
+                                "+1 more commit on HEAD".to_owned()
+                            } else {
+                                format!("+{more_ahead} more commits on HEAD")
+                            };
+                            scene.overlay_text_run(text_x0, ty, &more_lbl, theme::INK_4, false, true, 0);
+                            cur_row += 1;
+                        }
+
+                        // 3. Render `behind` commits on Lane 0 (`<base_ref>`, amber).
+                        for (idx, c) in rel.behind_commits.iter().take(shown_behind).enumerate() {
+                            let row_y = g_top + cur_row as f32 * commit_row_h;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            if idx == 0 {
+                                draw_dot(scene, lx0, cy, 5.0, theme::rgba(0xe8, 0xa8, 0x48, 0.24), 0.0, [0.0; 4]);
+                                draw_dot(scene, lx0, cy, 3.1, behind_col, 0.0, [0.0; 4]);
+                            } else {
+                                draw_dot(scene, lx0, cy, 2.8, behind_col, 1.0, card_bg);
+                            }
+                            let sx = draw_sha_chip(scene, text_x0, ty, &c.short_sha, behind_col);
+                            let right_limit = draw_diff_stats(scene, inner_x1, ty, cy, c.added_lines, c.deleted_lines);
+                            let rem_c = ((right_limit - sx - 2.0) / m.cw).floor().max(0.0) as usize;
+                            if rem_c >= 3 {
+                                scene.overlay_text_run(
+                                    sx,
+                                    ty,
+                                    truncate_chars(&c.subject, rem_c),
+                                    theme::INK_3,
+                                    false,
+                                    false,
+                                    0,
+                                );
+                            }
+                            cur_row += 1;
+                        }
+                        if more_behind > 0 {
+                            let row_y = g_top + cur_row as f32 * commit_row_h;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            draw_dot(scene, lx0, cy, 2.5, card_bg, 1.3, behind_col);
+                            let more_lbl = if more_behind == 1 {
+                                format!("+1 more commit on {}", rel.base_ref)
+                            } else {
+                                format!("+{more_behind} more commits on {}", rel.base_ref)
+                            };
+                            scene.overlay_text_run(text_x0, ty, &more_lbl, theme::INK_4, false, true, 0);
+                            cur_row += 1;
+                        }
+
+                        // 4. Render common ancestor (`merge-base`) anchor node on Lane 0.
+                        if has_mb {
+                            let row_y = g_top + cur_row as f32 * commit_row_h;
+                            let ty = row_y + (commit_row_h - m.ch) * 0.5;
+                            let cy = row_y + commit_row_h * 0.5;
+                            let (node_col, tag_lbl) = if rel.ahead == 0 {
+                                (theme::OK, "HEAD")
+                            } else if rel.behind == 0 {
+                                (sha_col, rel.base_ref.as_str())
+                            } else {
+                                (sha_col, "base")
+                            };
+                            draw_dot(scene, lx0, cy, 3.6, card_bg, 1.8, node_col);
+
+                            // Right-aligned anchor pill (`[main]` / `[base]` / `[HEAD]`).
+                            let tag_shown = truncate_chars(tag_lbl, 14);
+                            let tag_w = tag_shown.chars().count() as f32 * m.cw + 8.0;
+                            let tag_x0 = inner_x1 - tag_w;
+                            scene.overlay_round_rect(
+                                tag_x0,
+                                ty - 1.0,
+                                inner_x1,
+                                ty + m.ch + 1.0,
+                                3.5,
+                                [node_col[0], node_col[1], node_col[2], 0.14],
+                                0.0,
+                                [0.0; 4],
                                 0,
                             );
+                            scene.overlay_text_run(tag_x0 + 4.0, ty, &tag_shown, node_col, true, false, 0);
+
+                            let mut cx = draw_sha_chip(scene, text_x0, ty, &rel.merge_base_short, sha_col);
+                            if rel.merge_base_time_secs > 0 && now_ns > 0 {
+                                let mut age = String::new();
+                                let _ = format_relative_time(
+                                    DateTime {
+                                        utc_ns: rel.merge_base_time_secs.saturating_mul(1_000_000_000),
+                                        offset_secs: 0,
+                                    },
+                                    now_ns,
+                                    &mut age,
+                                );
+                                let age_lbl = format!("{age} · ");
+                                let age_w = age_lbl.chars().count() as f32 * m.cw;
+                                if cx + age_w + 6.0 * m.cw < tag_x0 {
+                                    scene.overlay_text_run(cx, ty, &age_lbl, theme::INK_4, false, false, 0);
+                                    cx += age_w;
+                                }
+                            }
+                            let rem_c = ((tag_x0 - cx - 6.0) / m.cw).floor().max(0.0) as usize;
+                            if rem_c >= 3 && !rel.merge_base_subject.is_empty() {
+                                scene.overlay_text_run(
+                                    cx,
+                                    ty,
+                                    truncate_chars(&rel.merge_base_subject, rem_c),
+                                    theme::INK_3,
+                                    false,
+                                    false,
+                                    0,
+                                );
+                            }
                         }
                     }
                 }
 
-                ry += card_h + 6.0;
+                ry += card_h + 8.0;
             }
-            for br in branches.iter().take(10) {
+            for br in branches.iter().take(max_branches) {
+                if ry + row_h > y1 - 4.0 {
+                    break;
+                }
                 let row_rect = HitRect::new(x0 + 4.0, ry, x1 - 4.0, ry + row_h);
                 let is_cur = br == current;
                 let is_base = !is_cur && relation.as_ref().is_some_and(|r| r.base_ref == *br);
