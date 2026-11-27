@@ -67,30 +67,65 @@ pub fn sha1(bytes: &[u8]) -> [u8; 20] {
     h.finish()
 }
 
+#[inline]
 fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
-    let mut w = [0u32; 80];
-    for (i, chunk) in block.chunks_exact(4).enumerate() {
-        w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    let mut w = [0u32; 16];
+    for (slot, chunk) in w.iter_mut().zip(block.chunks_exact(4)) {
+        *slot = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
     }
-    for i in 16..80 {
-        w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-    }
+
     let [mut a, mut b, mut c, mut d, mut e] = *state;
-    for (i, &wi) in w.iter().enumerate() {
-        let (f, k) = match i {
-            0..20 => ((b & c) | (!b & d), 0x5a82_7999),
-            20..40 => (b ^ c ^ d, 0x6ed9_eba1),
-            40..60 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
-            _ => (b ^ c ^ d, 0xca62_c1d6),
-        };
-        let t = a.rotate_left(5).wrapping_add(f).wrapping_add(e).wrapping_add(k).wrapping_add(wi);
-        e = d;
-        d = c;
-        c = b.rotate_left(30);
-        b = a;
-        a = t;
+
+    macro_rules! expand {
+        ($i:expr) => {{
+            let x = w[($i + 13) & 15] ^ w[($i + 8) & 15] ^ w[($i + 2) & 15] ^ w[$i & 15];
+            let v = x.rotate_left(1);
+            w[$i & 15] = v;
+            v
+        }};
     }
-    for (s, v) in state.iter_mut().zip([a, b, c, d, e]) {
-        *s = s.wrapping_add(v);
+
+    macro_rules! step {
+        ($f:expr, $k:expr, $wi:expr) => {{
+            let t = a.rotate_left(5).wrapping_add($f).wrapping_add(e).wrapping_add($k).wrapping_add($wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = t;
+        }};
     }
+
+    // Round 1 (0..20): f = (b & c) | (!b & d) = d ^ (b & (c ^ d))
+    for i in 0..16 {
+        step!(d ^ (b & (c ^ d)), 0x5a82_7999, w[i]);
+    }
+    for i in 16..20 {
+        let wi = expand!(i);
+        step!(d ^ (b & (c ^ d)), 0x5a82_7999, wi);
+    }
+
+    // Round 2 (20..40): f = b ^ c ^ d
+    for i in 20..40 {
+        let wi = expand!(i);
+        step!(b ^ c ^ d, 0x6ed9_eba1, wi);
+    }
+
+    // Round 3 (40..60): f = (b & c) | (d & (b | c))
+    for i in 40..60 {
+        let wi = expand!(i);
+        step!((b & c) | (d & (b | c)), 0x8f1b_bcdc, wi);
+    }
+
+    // Round 4 (60..80): f = b ^ c ^ d
+    for i in 60..80 {
+        let wi = expand!(i);
+        step!(b ^ c ^ d, 0xca62_c1d6, wi);
+    }
+
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
 }

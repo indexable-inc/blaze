@@ -841,3 +841,53 @@ fn fsmonitor_o_dirty_status_diff_and_structured_queries() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn stateless_dircache_bgdc_detects_adds_deletes_and_edits_in_sparse_dirs() {
+    let base = std::env::temp_dir().join(format!("bgit-dircache-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let repo = base.join("repo");
+    fs::create_dir_all(repo.join("sub/nested")).unwrap();
+
+    run_git(&repo, &["init", "-b", "main"]);
+    fs::write(repo.join("sub/nested/only.txt"), "v1\n").unwrap();
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "init"]);
+
+    let alloc = blaze_own::Alloc::global();
+    let inf = bgit::run_bgit_in_process(&["infect"], &repo, false, alloc);
+    assert_eq!(inf.exit_code, 0);
+
+    // Wait past the 50 ms racy-dir window so `sub` and `sub/nested` are eligible for `.bgit/dircache.bgdc`.
+    std::thread::sleep(std::time::Duration::from_millis(80));
+
+    // Run 1 populates `.bgit/dircache.bgdc`.
+    let st1 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(st1.exit_code, 0);
+    assert!(String::from_utf8_lossy(&st1.stdout).trim().is_empty());
+    assert!(repo.join(".bgit/dircache.bgdc").is_file(), "expected .bgit/dircache.bgdc to be written");
+
+    // Run 2 hits `.bgit/dircache.bgdc` cleanly.
+    let st2 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(st2.exit_code, 0);
+    assert!(String::from_utf8_lossy(&st2.stdout).trim().is_empty());
+
+    // Edit file inside cached sparse dir (parent dir mtime unchanged, child stat changed!).
+    fs::write(repo.join("sub/nested/only.txt"), "v2 edited\n").unwrap();
+    let st3 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    assert_eq!(String::from_utf8_lossy(&st3.stdout).trim(), "M sub/nested/only.txt");
+
+    // Add a brand-new untracked file inside cached sparse dir (parent dir mtime bumped -> invalidates!).
+    fs::write(repo.join("sub/nested/extra.txt"), "new\n").unwrap();
+    let st4 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    let out4 = String::from_utf8_lossy(&st4.stdout);
+    assert!(out4.contains("M sub/nested/only.txt") && out4.contains("?? sub/nested/extra.txt"), "got:\n{out4}");
+
+    // Delete tracked file inside cached sparse dir -> detected immediately!
+    fs::remove_file(repo.join("sub/nested/only.txt")).unwrap();
+    let st5 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);
+    let out5 = String::from_utf8_lossy(&st5.stdout);
+    assert!(out5.contains("D sub/nested/only.txt") && out5.contains("?? sub/nested/extra.txt"), "got:\n{out5}");
+
+    let _ = fs::remove_dir_all(&base);
+}
