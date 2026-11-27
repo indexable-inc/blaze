@@ -1834,6 +1834,7 @@ impl<'a, 'm> Evaluator<'a, 'm> {
             env: env_pairs,
             stdin,
             mode,
+            forced_external: call.forced_external,
         };
         let ans = self.request(req, call.head_span)?;
         let Answer::External(res) = ans else {

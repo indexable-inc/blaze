@@ -10,6 +10,11 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 
+[lib]
+name = "bgit"
+path = "src/lib.rs"
+doctest = false
+
 [[bin]]
 name = "bgit"
 path = "src/main.rs"

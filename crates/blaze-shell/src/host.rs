@@ -256,7 +256,21 @@ fn handle_request(
             Ok(procs) => Answer::Processes(procs),
             Err(msg) => Answer::Err(ShellError::new(ErrorKind::Io, Span::ZERO, &msg, alloc)),
         },
-        Request::SpawnExternal { program, args, cwd, env, stdin, mode } => {
+        Request::SpawnExternal { program, args, cwd, env, stdin, mode, forced_external } => {
+            // Fast in-process `libbgit` execution for `bgit` and natively-backed `git` commands
+            // (zero fork/exec; bypassed on explicit `^git` / `^bgit` escape or piped stdin).
+            if !forced_external
+                && stdin.is_none()
+                && let Some(res) = try_run_in_process_bgit(
+                    program.as_str(),
+                    &args,
+                    cwd.as_str(),
+                    mode == ExternalMode::Interactive,
+                    alloc,
+                )
+            {
+                return Answer::External(res);
+            }
             if mode == ExternalMode::Interactive && allow_interactive_pty {
                 let spawn = InteractiveSpawn {
                     program: program.as_str().to_owned(),
@@ -1002,6 +1016,63 @@ fn run_external_captured(
     })
 }
 
+/// Runs `bgit` and natively-backed `git` commands directly in-process via `libbgit` (zero
+/// `fork`/`exec`, microsecond latency, thread-safe captured stdout/stderr).
+fn try_run_in_process_bgit(
+    program: &str,
+    args: &[AString<'static>],
+    cwd: &str,
+    rich_color: bool,
+    alloc: Alloc<'static>,
+) -> Option<ExternalResult<'static>> {
+    let prog_base = program.rsplit('/').next().unwrap_or(program);
+    if prog_base != "bgit" && prog_base != "git" {
+        return None;
+    }
+    let arg_refs: Vec<&str> = args.iter().map(AString::as_str).collect();
+    let cwd_path = Path::new(cwd);
+    let started = Instant::now();
+
+    let exec = if prog_base == "bgit" {
+        if bgit::is_streaming_bgit_command(&arg_refs) {
+            return None;
+        }
+        bgit::run_bgit_in_process(&arg_refs, cwd_path, rich_color, alloc)
+    } else {
+        bgit::try_run_git_via_bgit(&arg_refs, cwd_path, rich_color, alloc)?
+    };
+
+    let duration_ns = started.elapsed().as_nanos().min(i64::MAX as u128) as i64;
+    let mut stdout = AVec::with_capacity_in(exec.stdout.len(), alloc);
+    stdout.extend_from_slice(&exec.stdout);
+    let mut stderr = AVec::with_capacity_in(exec.stderr.len(), alloc);
+    stderr.extend_from_slice(&exec.stderr);
+    let mut chunks = AVec::new_in(alloc);
+    if !exec.stdout.is_empty() {
+        chunks.push(OutputChunk {
+            at: Nanos(duration_ns),
+            stream: OutputStream::Stdout,
+            bytes: Rc::from_slice_in(&exec.stdout, alloc),
+        });
+    }
+    if !exec.stderr.is_empty() {
+        chunks.push(OutputChunk {
+            at: Nanos(duration_ns),
+            stream: OutputStream::Stderr,
+            bytes: Rc::from_slice_in(&exec.stderr, alloc),
+        });
+    }
+
+    Some(ExternalResult {
+        exit_code: exec.exit_code,
+        duration_ns,
+        stdout,
+        stderr,
+        chunks,
+        interactive: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1113,6 +1184,87 @@ mod tests {
             // Clean up test file from Trash so unit tests leave no clutter.
             let _ = fs::remove_file(trashed_path);
         }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blaze_shell_routes_git_and_bgit_in_process_via_libbgit_and_respects_caret_escape() {
+        let dir = unique_temp_dir("libbgit");
+        let run_real_git = |args: &[&str]| {
+            let st = Command::new("git")
+                .current_dir(&dir)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@ix.dev")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@ix.dev")
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(st.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&st.stderr));
+        };
+        run_real_git(&["init", "-b", "main"]);
+        fs::write(dir.join("hello.txt"), "hi\n").unwrap();
+        run_real_git(&["add", "."]);
+        run_real_git(&["commit", "-m", "initial commit"]);
+        fs::write(dir.join("dirty.txt"), "untracked\n").unwrap();
+
+        let alloc = Alloc::global();
+        let cwd = dir.to_str().unwrap();
+        let path_val = std::env::var("PATH").unwrap_or_default();
+        let env_pairs = [("PATH", path_val.as_str())];
+
+        let run = |cmd: &str| {
+            let state = EngineState::new(cwd, &env_pairs, alloc);
+            run_command_line(cmd, state, false)
+        };
+
+        let value_stdout = |v: &blaze_sh::Value<'static>| -> String {
+            match v {
+                blaze_sh::Value::Output(o) => {
+                    String::from_utf8_lossy(o.stdout_bytes(alloc).as_slice()).into_owned()
+                }
+                blaze_sh::Value::String(s) => s.as_ref().to_owned(),
+                other => format!("{other:?}"),
+            }
+        };
+
+        // 1. `bgit infect` runs directly in-process via `libbgit` through `blaze-sh` host dispatch.
+        let res_infect = run("bgit infect");
+        assert_eq!(res_infect.outcome.exit_code, 0);
+        assert!(dir.join(".bgit/VERSION").is_file());
+
+        // 2. `git status --porcelain | lines` runs in-process via `libbgit` and feeds structured pipeline!
+        let res_pipe = run("git status --porcelain | lines");
+        assert_eq!(res_pipe.outcome.exit_code, 0);
+        if let blaze_sh::Value::List(items) = &res_pipe.outcome.value {
+            assert_eq!(items.len(), 1);
+            let first = items.iter().next().expect("first line");
+            assert_eq!(value_stdout(first), "?? dirty.txt");
+        } else {
+            panic!("expected List from `git status --porcelain | lines`, got {:?}", res_pipe.outcome.value);
+        }
+
+        // 3. `git rev-parse --abbrev-ref HEAD` and `git log --oneline -n 1` run in-process via `libbgit`.
+        let res_br = run("git rev-parse --abbrev-ref HEAD");
+        assert_eq!(res_br.outcome.exit_code, 0);
+        assert_eq!(value_stdout(&res_br.outcome.value).trim(), "main");
+
+        let res_log = run("git log --oneline -n 1");
+        assert_eq!(res_log.outcome.exit_code, 0);
+        let log_str = value_stdout(&res_log.outcome.value);
+        assert!(log_str.contains("initial commit"), "unexpected log: {log_str}");
+
+        // 4. Explicit `^git --version` bypasses `libbgit` and invokes external `git`.
+        let res_ext = run("^git --version");
+        assert_eq!(res_ext.outcome.exit_code, 0);
+        let ver_str = value_stdout(&res_ext.outcome.value);
+        assert!(ver_str.contains("git version"), "expected external git version, got: {ver_str}");
+
+        // 5. `try_native_git_command` returns a rich structured Table for `git log` / `bgit log`!
+        let log_tbl = crate::prompt::try_native_git_command("git log -n 1", cwd)
+            .expect("git log should return rich table");
+        assert!(matches!(log_tbl, blaze_sh::Value::Table(t) if t.nrows == 1));
 
         let _ = fs::remove_dir_all(&dir);
     }
