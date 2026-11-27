@@ -198,9 +198,10 @@ pub fn needs(list: &UnitCrates<'_>) -> Needs {
         test: list.crates[..list.toolchain].iter().any(|c| c.name == "test"),
     };
     for c in list.crates.iter().filter(|c| matches!(c.origin, ListOrigin::Unit(_))) {
-        n.std |= matches!(c.implicit.std, StdIs::Rust);
+        let rust_std = matches!(c.implicit.std, StdIs::Rust);
+        n.std |= rust_std;
         n.bstd |= matches!(c.implicit.std, StdIs::Bstd(_));
-        n.proc_macro |= n.std || c.implicit.proc_macro;
+        n.proc_macro |= rust_std || c.implicit.proc_macro;
     }
     n
 }

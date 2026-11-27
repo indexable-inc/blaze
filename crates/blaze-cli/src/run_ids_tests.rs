@@ -1324,7 +1324,7 @@ fn target_and_macro_side_member_units_get_distinct_views_and_walk_without_clash(
     use blaze_world::Side;
     use blaze_world::crate_list::{CrateList, HEADER_LEN, NONE, ROW, TEST, VERSION};
 
-    // Minimal valid `BZCL` v8 encoder for member rows with no deps/packs/scripts, verified by
+    // Minimal valid `BZCL` v9 encoder for member rows with no deps/packs/scripts, verified by
     // `CrateList::open` below.
     struct RowSpec<'a> {
         key_byte: u8,
@@ -1391,7 +1391,7 @@ fn target_and_macro_side_member_units_get_distinct_views_and_walk_without_clash(
         out.extend_from_slice(&u32::try_from(specs.len()).unwrap().to_le_bytes()); // n
         out.extend_from_slice(&0u32.to_le_bytes()); // d
         out.extend_from_slice(&u32::try_from(str_heap.len()).unwrap().to_le_bytes()); // heap
-        for _ in 0..4 {
+        for _ in 0..5 {
             out.extend_from_slice(&NONE.to_le_bytes()); // sysroot
         }
         for _ in 0..6 {

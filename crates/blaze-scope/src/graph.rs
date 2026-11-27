@@ -721,24 +721,26 @@ mod tests {
     }
 
     /// Under a blaze edition `std` names bstd and the prelude is bstd's edition module;
-    /// Rust's `std` has no name.
+    /// Rust's `std` and `proc_macro` have no name even when present in the graph's sysroot.
     #[test]
     fn externs_under_a_blaze_edition_name_bstd() {
-        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), proc_macro: None, bstd: Some(CrateId(3)) };
+        let sys = Sysroot { core: Some(CrateId(0)), alloc: Some(CrateId(1)), std: Some(CrateId(2)), proc_macro: Some(CrateId(4)), bstd: Some(CrateId(3)) };
         let g = graph(
             std::vec![
                 krate("core", &[], rust()),
                 krate("alloc", &[], rust()),
                 krate("std", &[], rust()),
                 krate("bstd", &[], rust()),
+                krate("proc_macro", &[("core", 0), ("std", 2)], rust()),
                 krate("hello", &[], blaze()),
             ],
             sys,
         )
         .expect("no cycle");
-        let e = g.externs(CrateId(4), RootAttrs::default());
+        let e = g.externs(CrateId(5), RootAttrs::default());
         assert_eq!(names(&e.prelude), std::vec![("core", 0), ("std", 3)]);
         assert!(e.deps.iter().all(|d| d.krate != CrateId(2)), "Rust's std is nameable: {:?}", names(&e.deps));
+        assert!(e.deps.iter().all(|d| d.krate != CrateId(4) && d.name != "proc_macro"), "Rust's proc_macro is nameable on a blaze-edition crate: {:?}", names(&e.deps));
         assert_eq!(e.macro_use, Some(CrateId(3)));
         assert_eq!(e.std_prelude, Some(PreludePath { krate: CrateId(3), path: ["prelude", "blaze_2026_11"] }));
         assert!(e.dropped.is_empty(), "{:?}", e.dropped);

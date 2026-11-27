@@ -579,14 +579,13 @@ pub fn implicit_key<'w, B: AsRef<[u8]>>(toolchain: &Toolchain<'w, B>, implicit: 
     let std = std.ok_or(WorldError::NoToolchainCrate { role })?;
     let mut bytes = [0u8; 65];
     bytes[..32].copy_from_slice(&toolchain.crates()[std].key.0.0);
-    if implicit.proc_macro {
-        let pm = toolchain.proc_macro().ok_or(WorldError::NoToolchainCrate { role: "proc_macro" })?;
-        bytes[32..64].copy_from_slice(&toolchain.crates()[pm].key.0.0);
-        bytes[64] = 1;
-    } else if matches!(implicit.std, blaze_unit_graph::StdIs::Rust)
-        && let Some(c) = toolchain.proc_macro().and_then(|pm| toolchain.crates().get(pm))
-    {
-        bytes[32..64].copy_from_slice(&c.key.0.0);
+    if matches!(implicit.std, blaze_unit_graph::StdIs::Rust) || implicit.proc_macro {
+        let pm = toolchain
+            .proc_macro()
+            .and_then(|pm| toolchain.crates().get(pm))
+            .ok_or(WorldError::NoToolchainCrate { role: "proc_macro" })?;
+        bytes[32..64].copy_from_slice(&pm.key.0.0);
+        bytes[64] = u8::from(implicit.proc_macro);
     }
     Ok(CrateItemKey(ContentId::of("blaze world implicit 2", &bytes)))
 }

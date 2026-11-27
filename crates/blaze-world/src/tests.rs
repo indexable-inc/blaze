@@ -714,3 +714,73 @@ version = "0.1.0"
     assert!(neg_errors > 0, "negative control must fail with unresolved `proc_macro`");
     assert_eq!(neg_bound, None, "negative control must NOT bind `TokenStream`");
 }
+
+/// A blaze-edition unit's `extern crate proc_macro;` behavior AND its crate key (`implicit_key`)
+/// must be 100% independent of whether an unrelated Rust-edition crate is present in the same
+/// workspace (no workspace-composition leakage).
+#[test]
+fn blaze_edition_proc_macro_and_key_are_independent_of_workspace_composition() {
+    const MIXED_LOCK: &str = r#"version = 4
+
+[[package]]
+name = "blz"
+version = "0.1.0"
+
+[[package]]
+name = "rust_sib"
+version = "0.1.0"
+"#;
+    let lock: &'static Lock<'static> = StdBox::leak(StdBox::new(Lock::read(MIXED_LOCK.as_bytes(), g()).expect("lock")));
+    let blz_pkg = lock.named("blz").next().expect("blz");
+
+    struct Placed {
+        blz: LockId,
+    }
+    impl Packages<'static> for Placed {
+        fn place(&mut self, package: LockId) -> Result<Place<'static>, WorldError<'static>> {
+            if package == self.blz {
+                Ok(Place::Checkout { dir: "blz" })
+            } else {
+                Ok(Place::Checkout { dir: "rust_sib" })
+            }
+        }
+    }
+
+    let run = |with_rust_sibling: bool| {
+        let mut units = AVec::new_in(g());
+        units.push(unit(lock, "blz", UnitKind::Lib, false, BLAZE, &[], None));
+        if with_rust_sibling {
+            units.push(unit(lock, "rust_sib", UnitKind::Lib, false, RUST21, &[], None));
+        }
+        let graph: &'static UnitGraph<'static> =
+            StdBox::leak(StdBox::new(UnitGraph { units, resolver: Resolver::V2, meta: AVec::new_in(g()), left_out: AVec::new_in(g()) }));
+        let mut places = Placed { blz: blz_pkg };
+        let (id, files) = crate::fixture::shelf(TRIPLE, crate::fixture::STD, &[("target_os", Some("macos")), ("unix", None)], g());
+        let listed = StdBox::leak(StdBox::new(open_list(&mut Memory(files.into_iter().collect()), id, TRIPLE, graph, lock, &mut places, b()).unwrap_or_else(|e| panic!("{e}"))));
+        let mut m = StdMap::new();
+        m.insert("blz/src/lib.rs", "extern crate proc_macro;\npub use proc_macro::TokenStream;\n");
+        m.insert("rust_sib/src/lib.rs", "pub fn ok() {}\n");
+        let co: &'static Files = StdBox::leak(StdBox::new(Files(m)));
+        let w = world(graph, lock, listed, &mut places, co, b()).unwrap_or_else(|e| panic!("{e}"));
+        let blz_at = w.crate_of_unit[0].expect("blz") as usize;
+        let blz_key = w.crates[blz_at].input.key;
+        let imp_key = crate::implicit_key(&listed.toolchain, w.crates[blz_at].input.implicit).unwrap_or_else(|e| panic!("{e}"));
+        let inputs = w.inputs(g());
+        let names = w.resolve(&inputs, &Serial, b()).unwrap_or_else(|e| panic!("{e}"));
+        let bound = names
+            .lookup(names.root(blz_at), blaze_surface::Namespace::Types, "TokenStream")
+            .and_then(|b| names.crate_of(b.def.key));
+        let errors: usize = names.krate(blz_at).done.values().map(|r| r.scope.errors.len()).sum();
+        (w.sysroot.proc_macro.is_some(), blz_key, imp_key, bound, errors)
+    };
+
+    let (alone_has_pm, alone_key, alone_imp, alone_bound, alone_errors) = run(false);
+    let (mixed_has_pm, mixed_key, mixed_imp, mixed_bound, mixed_errors) = run(true);
+    assert!(!alone_has_pm, "pure blaze-edition workspace does not open Rust proc_macro");
+    assert!(mixed_has_pm, "mixed workspace opens Rust proc_macro for its Rust sibling");
+    assert_eq!(alone_key, mixed_key, "blaze-edition crate key must not move when a Rust sibling joins the workspace");
+    assert_eq!(alone_imp, mixed_imp, "blaze-edition implicit_key must not move when a Rust sibling joins the workspace");
+    assert_eq!(alone_bound, None, "blaze-edition crate alone cannot resolve `extern crate proc_macro;`");
+    assert_eq!(mixed_bound, None, "blaze-edition crate beside a Rust sibling still cannot resolve `extern crate proc_macro;`");
+    assert!(alone_errors > 0 && mixed_errors > 0, "both workspaces must refuse `extern crate proc_macro;` in a blaze-edition crate");
+}
