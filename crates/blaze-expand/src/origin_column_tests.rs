@@ -199,7 +199,7 @@ fn shared_places_are_one_row_each() {
     let alloc = blaze_own::testing::heap().alloc();
     let text = "/// Doc.\n#[derive(Show)]\npub struct N<'a> { n: &'a u8 }";
     let places = input_places(text, InputShape::Whole, Edition::E2021, alloc).expect("the text lexes");
-    let column = OriginColumn::input_identity(&places, alloc).expect("one row a place is sorted");
+    let column = OriginColumn::input_identity(&places, |_| None, alloc).expect("one row a place is sorted");
     let mut bytes: AVec<'_, u8> = AVec::new_in(alloc);
     column.write(&mut bytes).expect("a small column");
     let (read, _) = OriginsRef::open(&bytes).expect("the column reads back");

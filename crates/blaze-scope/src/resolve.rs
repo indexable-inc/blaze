@@ -5446,14 +5446,32 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     };
     // Its origins: the identity column and the entry the call is at, the item itself
     // (expansion_origins.rs `kept`), so a head it declares is covered by that entry's check.
+    // When the kept item was written by a parent expansion (`At::Expansion(parent_call)`), carry
+    // the parent's `TextMark`s (including `root_mark` for cross-crate `$crate`) into the kept
+    // item's column and lowering; multi-stage `KEEP_ITEM` chains inherit them level by level.
     // The harness's text is blaze's own, no slice of any written text: no column, its tokens
     // read at the module with no marks (front2 item_site.rs `marks_of_column`: `Rewritten` is
     // `None`), a finding in it filed at its own place.
+    let parent_marks = match (keep, src.place.and_then(|p| p.text)) {
+        (KeepAs::Item, Some(At::Expansion(parent_call))) => held(run.expansions.lock(), "expansions")
+            .get(&parent_call)
+            .and_then(|e| e.made)
+            .and_then(|parent| parent.column.ok().map(|column| crate::crate_roots::TextMarks { text: parent.text, column })),
+        _ => None,
+    };
     let origins = match keep {
-        KeepAs::Item => crate::expansion_origins::kept(call, src.place, text, src.name, base.edition, bump),
+        KeepAs::Item => crate::expansion_origins::kept(call, src.place, text, src.name, base.edition, parent_marks, bump),
         KeepAs::Harness => Err(crate::expansion_origins::OriginsError::Rewritten { what: "a proc-macro crate's harness (`_DECLS`)" }),
     };
     let made: &'a ExpansionText<'a> = bump.alloc_val(ExpansionText::new(text, outline(text, base.edition, alloc), origins));
+    let marks = match (parent_marks, made.column) {
+        (None, _) => None,
+        (Some(_), Ok(column)) => Some(crate::crate_roots::TextMarks { text, column }),
+        (Some(_), Err(lost)) => {
+            note(ExpandNote::RootsLost { macro_name: name, lost });
+            return None;
+        }
+    };
     if let Some(error) = made.outline.errors().first() {
         note(ExpandNote::NotItems { macro_name: name, message: made.outline.message(error) });
         return None;
@@ -5475,9 +5493,9 @@ fn keep_item<'a, S: SourceTexts<'a>>(
             KeepAs::Item => Some(src.answered),
             KeepAs::Harness => None,
         },
-        // A kept item's text: the item as written at the call; its column (expansion_origins.rs
-        // `kept`) holds no marks, and its tokens are read at the module, as this says.
-        marks: None,
+        // When written by a parent expansion, the kept item carries its parent's marks
+        // (including `root_mark` for `$crate`); for a file-written item, `None`.
+        marks,
         // A slice of the calling text: written in an expansion, its calls take their inputs
         // from that expansion's tokens, placed in the same text.
         tokens: FragmentTokens::from_option(kept_tokens),
@@ -5491,7 +5509,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     // A struct, an enum or a union makes no module; moved as `expand_decls` moves them so a
     // change there stays one shape.
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
-    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks: None, tokens: FragmentTokens::from_option(kept_tokens), synthetic_blocks: &[] };
+    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks, tokens: FragmentTokens::from_option(kept_tokens), synthetic_blocks: &[] };
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
     make_modules(base, run, src.module, &mods, place, src.depth.saturating_add(1), &mut bodies, alloc);
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));

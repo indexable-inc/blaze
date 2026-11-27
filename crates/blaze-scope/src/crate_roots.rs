@@ -128,18 +128,16 @@ impl core::fmt::Display for MarkMiss {
 }
 
 impl<'t> TextMarks<'t> {
-    /// The mark of the token that starts where `segment` (a slice of the text) starts; `None`
-    /// when no row starts there (a token as written at the call keeps none).
-    pub fn mark_of(&self, segment: &str) -> Result<Option<TextMark>, MarkMiss> {
-        let len = u32::try_from(segment.len()).unwrap_or(u32::MAX);
-        let start = crate::expansion_origins::offset_in(self.text, segment).ok_or(MarkMiss::NotInText { len })?;
+    /// The mark of the token that starts at byte `start` of `self.text`; `None` when no row starts
+    /// there (a token as written at the call keeps none).
+    pub fn mark_at(&self, start: u32) -> Option<TextMark> {
         // Rows are sorted by start and do not overlap (blaze-expand `OriginsRef::open` checked).
         let (mut lo, mut hi) = (0usize, self.column.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let row = self.column.row(mid);
             if row.start == start {
-                return Ok(row.mark);
+                return row.mark;
             }
             if row.start < start {
                 lo = mid + 1;
@@ -147,7 +145,15 @@ impl<'t> TextMarks<'t> {
                 hi = mid;
             }
         }
-        Ok(None)
+        None
+    }
+
+    /// The mark of the token that starts where `segment` (a slice of the text) starts; `None`
+    /// when no row starts there (a token as written at the call keeps none).
+    pub fn mark_of(&self, segment: &str) -> Result<Option<TextMark>, MarkMiss> {
+        let len = u32::try_from(segment.len()).unwrap_or(u32::MAX);
+        let start = crate::expansion_origins::offset_in(self.text, segment).ok_or(MarkMiss::NotInText { len })?;
+        Ok(self.mark_at(start))
     }
 
     /// The uniform foreign crate that every `$crate` token across `slices` (each a slice of

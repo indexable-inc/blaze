@@ -61,6 +61,7 @@ mod items_grain;
 mod items_head_free;
 mod items_owners;
 mod items_buckets;
+mod kept_item_marks;
 mod kept_item_origins;
 mod kept_item_shared_places;
 mod impl_roots;
