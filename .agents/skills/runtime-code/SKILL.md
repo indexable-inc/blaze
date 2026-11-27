@@ -1,6 +1,6 @@
 ---
 name: runtime-code
-description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, all OS syscalls and kernel FFI in blaze-sys, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a `Need` park. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially OS/syscall FFI, the scheduler, the request loop, a build's helper process, the store or anything concurrent."
+description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, all OS syscalls and kernel FFI in blaze-sys, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially OS/syscall FFI, the scheduler, the request loop, a build's helper process, the store or anything concurrent."
 ---
 
 # Writing blaze's runtime code
@@ -45,14 +45,14 @@ waited behind whom into the profile's `lock_waits` (`blaze debug locks` ranks th
 use instead: arc-swap or RCU for reads, papaya for a map, an atomic for an integer, a channel for a
 queue, an owner for one holder); a shared map is `papaya::HashMap`; a single-owner map or set is
 `blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named as
-`bump-allocate` says), with `blaze_hash::KeyHasher` for keys that are already content hashes and
-`blaze_hash::Blake3Hasher` for persisted content IDs; parallel same-length columns
-(struct-of-arrays) are `blaze_own::soa!` (`Soa<C, A>`: one allocation, one `len`, one `capacity`,
-typed column slices), never parallel `Vec`/`AVec`s; results of parallel items come back from
-`blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is
-`crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag is
-an atomic. How a thread or fiber waits is `deadline-waits`. `BTreeMap` only where iteration order is
-part of the output.
+`bump-allocate` says: a frame's for a task, `Global` with a reason otherwise), with
+`blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for
+persisted content IDs; parallel same-length columns (struct-of-arrays) are `blaze_own::soa!`
+(`Soa<C, A>`: one allocation, one `len`, one `capacity`, typed column slices), never parallel
+`Vec`/`AVec`s; results of parallel items come back from `blaze_graph::par` in order, never pushed
+into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is
+`crossbeam-channel`; a counter or flag is an atomic. How a thread or fiber waits is
+`deadline-waits`. `BTreeMap` only where iteration order is part of the output.
 
 ## sans-io-cores (rule 14)
 
@@ -65,28 +65,28 @@ transcript with no real clock, and a deterministic simulation test drives the co
 cannot be proven. Protocol code is a core too: an HTTP client or server, TLS (through rustls's own
 byte-in/byte-out `Connection`, never `tokio-rustls`), the client's wire protocol to a build's helper
 process, a shared-cache or registry client. Its interface is bytes in, bytes and events out, so any
-IO backend can drive it by writing one thin driver, with no change to the core. A dependency that
-ties protocol logic to one runtime (hyper's connectors, hyper-util, reqwest, tokio-rustls) is
-replaced by a core and a driver, not wrapped. Persisted state is a core too: a writer of files that
-must survive a crash (a manifest, a journal, a history, a store) asks for each write, sync, rename,
-delete and lock as a blaze-core `Effect` and takes `Completion`s, so `Sim` sees every one and can
-tear what was not synced; its durability is the order of the effects it emits, never a direct
-`fsync`, `F_FULLFSYNC` or `flock`. Each core module carries `#![blaze::sans_io]` and
-`#![deny(blaze::sans_io_core)]`: the lint walks every call the module makes, through workspace
-functions, and refuses the clock, `std::fs`, `std::thread`, `std::net`, `std::process`, `std::env`,
-OS randomness and `libc`/`rustix`/`nix`. What a core needs of its process beyond IO (its pid,
-whether another process lives, symbols to name a stack) comes through a trait the driver implements,
-taken as a type parameter: calls through it are the driver's, not the core's. Drivers are separate,
-unmarked modules, so the exemption is by module, never by an allow on a line. A core's errors carry
-the path the driver will report, and a step that waits on no effect is a typed error
-(`bounded-progress`). There is no part of blaze this does not cover: the request loop (one command's
-process), a build's helper process (no `watch`: nothing builds unless asked), the build plan and the
-scheduler, the file watcher, the store, the linker's writes, the launcher, the client, the hub.
-Logic that does its own IO (reads a file, the clock or the environment, starts a thread or a
-process, opens a socket, sleeps) is not finished work, whoever wrote it and however long it has been
-there. When you meet such code in what you are changing, cut the seam in the same change without
-being asked: the decisions go into a core, the IO into a driver that only performs effects and
-returns completions; when it is too large for the change, record a fact/gotcha in
+IO backend can drive it (tokio today, io_uring on Linux later) by writing one thin driver, with no
+change to the core. A dependency that ties protocol logic to one runtime (hyper's connectors,
+hyper-util, reqwest, tokio-rustls) is replaced by a core and a driver, not wrapped. Persisted state
+is a core too: a writer of files that must survive a crash (a manifest, a journal, a history, a
+store) asks for each write, sync, rename, delete and lock as a blaze-core `Effect` and takes
+`Completion`s, so `Sim` sees every one and can tear what was not synced; its durability is the order
+of the effects it emits, never a direct `fsync`, `F_FULLFSYNC` or `flock`. Each core module carries
+`#![blaze::sans_io]` and `#![deny(blaze::sans_io_core)]`: the lint walks every call the module
+makes, through workspace functions, and refuses the clock, `std::fs`, `std::thread`, `std::net`,
+`std::process`, `std::env`, OS randomness and `libc`/`rustix`/`nix`. What a core needs of its
+process beyond IO (its pid, whether another process lives, symbols to name a stack) comes through a
+trait the driver implements, taken as a type parameter: calls through it are the driver's, not the
+core's. Drivers are separate, unmarked modules, so the exemption is by module, never by an allow on
+a line. A core's errors carry the path the driver will report, and a step that waits on no effect is
+a typed error (`bounded-progress`). There is no part of blaze this does not cover: the request loop
+(one command's process), a build's helper process (no `watch`: nothing builds unless asked), the
+build plan and the scheduler, the file watcher, the store, the linker's writes, the launcher, the
+client, the hub. Logic that does its own IO (reads a file, the clock or the environment, starts a
+thread or a process, opens a socket, sleeps) is not finished work, whoever wrote it and however long
+it has been there. When you meet such code in what you are changing, cut the seam in the same change
+without being asked: the decisions go into a core, the IO into a driver that only performs effects
+and returns completions; when it is too large for the change, record a fact/gotcha in
 `agents/kb/facts.jsonl` via `scripts/src/bin/kb.rs` naming the file and what blocks it, and add a
 ledger row if it needs one. One implementation, the real one: the code that ships is the code the
 simulation runs. A fake, mock, stub, test double or second model written because the real code could

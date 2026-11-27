@@ -24,9 +24,10 @@ build byte for byte, and a budget for a fresh process to first answer. A file th
 of blaze can find (in the state directory, in a home, in `/tmp`) also has a test that a file of its
 previous layout is handled: an old home after an upgrade is detected, reported by name and rebuilt,
 and nothing is migrated (scope decision D36); a file outside a home is refused by name with what to
-do, or left alone under a name that carries its layout. A restore that silently starts empty is a
-failure blaze reports, naming why. A format that is written while blaze runs and read after a crash
-also gets a DST (`dst-not-review`) that crashes it at every point and checks the restore.
+do, or left alone under a name that carries its layout; docs/cargo.md, "Files that outlive a
+version", lists each with its test. A restore that silently starts empty is a failure blaze reports,
+naming why. A format that is written while blaze runs and read after a crash also gets a DST
+(`dst-not-review`) that crashes it at every point and checks the restore.
 
 ## dst-not-review (rule 43)
 
@@ -72,10 +73,10 @@ blaze is to be a compiler whose correctness is proved, not only tested. The orde
 practice: (1) one specification of what MIR does, written in Lean as an executable semantics (an
 interpreter over a deep embedding of MIR), held to the tree by running it against blaze's MIR
 evaluator and blaze-built code on generated programs; it is the one meaning every proof refers to
-(`one-concept-one-home`); (2) user code is proved against it: the functional models blaze emits are
-derived from, and proved or checked equal to, the semantics of the body they model, so a proof is
-about what blaze compiles and not a hand-written copy; (3) each MIR transformation is correct
-against it: a small pass by a Lean theorem that its output refines its input, a large one by
+(`one-concept-one-home`); (2) user code is proved against it: the functional models `hir-ty-lean`
+emits are derived from, and proved or checked equal to, the semantics of the body they model, so a
+proof is about what blaze compiles and not a hand-written copy; (3) each MIR transformation is
+correct against it: a small pass by a Lean theorem that its output refines its input, a large one by
 translation validation (a checker, itself proved sound, that accepts each run's before and after),
 run in the gate on real crates; (4) then lowering to LIR and to machine code against machine models,
 the front end's rules, and the driver's state machines by refinement from their reference models
