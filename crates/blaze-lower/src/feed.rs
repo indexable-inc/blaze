@@ -246,7 +246,10 @@ fn run<'s>(m: &mut Machine<'_, '_, '_, 's>, output: &Output, toks: Toks<'_, '_, 
         m.return_cfg(cfg);
         match expansion {
             Expansion::Expanded => {
-                let ranges = m.append_expansion(&request, &out);
+                let mut ranges = m.append_expansion(&request, &out);
+                if request.fragment == blaze_expand::Fragment::Expr {
+                    strip_trailing_expr_semis(&mut out.words.parser.words, &mut ranges);
+                }
                 let tokens = parser::Tokens::new(&out.words.parser.words, true);
                 let output = request.fragment.entry().parse(tokens);
                 levels.push(Level { parse: Parse::Expansion(output), at: 0, toks: Toks::Words { ranges, pos: 0 } });
@@ -255,6 +258,80 @@ fn run<'s>(m: &mut Machine<'_, '_, '_, 's>, output: &Output, toks: Toks<'_, '_, 
             Expansion::Failed => m.unexpanded(request, Why::ExpansionFailed),
         }
     }
+}
+
+/// Skips leading outer attributes (`#[...]` and outer doc comments) in `words`, returning the
+/// index of the first token after them, or `None` if an outer attribute has unclosed brackets.
+fn skip_outer_attrs(words: &[u32]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(&word) = words.get(i) {
+        match parser::word_kind(word) {
+            SyntaxKind::OUTER_DOC_COMMENT => i += 1,
+            SyntaxKind::POUND if words.get(i + 1).is_some_and(|&next| parser::word_kind(next) == SyntaxKind::L_BRACK) => {
+                i += 2;
+                let mut depth = 1usize;
+                while depth > 0 {
+                    let kind = parser::word_kind(*words.get(i)?);
+                    i += 1;
+                    match kind {
+                        SyntaxKind::L_BRACK => depth += 1,
+                        SyntaxKind::R_BRACK => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+    Some(i)
+}
+
+/// Strips a single trailing `;` from an expression-position macro expansion (`Fragment::Expr`),
+/// matching rustc's `ensure_complete_parse` (`SEMICOLON_IN_EXPRESSIONS_FROM_MACROS` lint, never a
+/// hard syntax error under `--cap-lints allow`).
+///
+/// Refuses to strip when:
+/// - fewer than 2 real words exist (a lone `;` must not become empty EOF, which `top::expr` would
+///   abandon without `ERROR`),
+/// - the token before the trailing `;` is also `;` (rustc rejects `1;;` as a hard error),
+/// - nothing follows leading outer attributes (e.g. `#[allow(unused)] ;`), or
+/// - the first token after leading outer attributes is `let` (`let x = 1;` must stay a syntax
+///   error rather than parsing as `LET_EXPR`).
+fn strip_trailing_expr_semis(words: &mut AVec<'_, u32>, ranges: &mut AVec<'_, Range>) {
+    let Some(real) = words.len().checked_sub(parser::Tokens::PAD) else {
+        return;
+    };
+    if real < 2 || ranges.len() != real {
+        return;
+    }
+    let trimmed = real - 1;
+    let (Some(&last), Some(&prev)) = (words.get(trimmed), words.get(trimmed - 1)) else {
+        return;
+    };
+    if parser::word_kind(last) != SyntaxKind::SEMICOLON || parser::word_kind(prev) == SyntaxKind::SEMICOLON {
+        return;
+    }
+    let Some(body) = words.get(..trimmed) else {
+        return;
+    };
+    let Some(after_attrs) = skip_outer_attrs(body) else {
+        return;
+    };
+    let Some(&first) = body.get(after_attrs) else {
+        return;
+    };
+    if parser::word_kind(first) == SyntaxKind::LET_KW {
+        return;
+    }
+    if let Some(new_last) = words.get_mut(trimmed - 1) {
+        *new_last &= !parser::JOINT;
+    }
+    let new_len = trimmed + parser::Tokens::PAD;
+    if let Some(pad) = words.get_mut(trimmed..new_len) {
+        pad.fill(parser::Tokens::EOF_WORD);
+    }
+    words.truncate(new_len);
+    ranges.truncate(trimmed);
 }
 
 /// One step to the machine.

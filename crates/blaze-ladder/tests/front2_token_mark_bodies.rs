@@ -722,6 +722,28 @@ macro_rules! cfg_aliases {
             }
         )*
     };
+    (@parser_emit all $({$($grouped:tt)+})+) => {
+        ($(
+            ($crate::cfg_aliases!(@parser $($grouped)+))
+        )&&+)
+    };
+    (@parser_emit any $({$($grouped:tt)+})+) => {
+        ($(
+            ($crate::cfg_aliases!(@parser $($grouped)+))
+        )||+)
+    };
+    (@parser_clause $op:ident [$({$($grouped:tt)+})*] [, $($rest:tt)*] $($current:tt)+) => {
+        $crate::cfg_aliases!(@parser_clause $op [$({$($grouped)+})* {$($current)+}] [$($rest)*]);
+    };
+    (@parser_clause $op:ident [$({$($grouped:tt)+})*] [$tok:tt $($rest:tt)*] $($current:tt)*) => {
+        $crate::cfg_aliases!(@parser_clause $op [$({$($grouped)+})*] [$($rest)*] $($current)* $tok);
+    };
+    (@parser_clause $op:ident [$({$($grouped:tt)+})*] [] $($current:tt)+) => {
+        $crate::cfg_aliases!(@parser_emit $op $({$($grouped)+})* {$($current)+});
+    };
+    (@parser all($($tokens:tt)+)) => { $crate::cfg_aliases!(@parser_clause all [] [$($tokens)+]) };
+    (@parser any($($tokens:tt)+)) => { $crate::cfg_aliases!(@parser_clause any [] [$($tokens)+]) };
+    (@parser not($($tokens:tt)+)) => { !($crate::cfg_aliases!(@parser $($tokens)+)) };
     (@parser target_os = $v:literal) => { true };
     (@parser $alias:ident) => { __cfg_aliases_matcher__!($alias) };
     (@cfg_is_set $e:ident) => {{
@@ -741,6 +763,7 @@ pub fn main() {
     cfg_aliases::cfg_aliases! {
         linux: { target_os = \"linux\" },
         my_alias: { linux },
+        combined: { all(linux, not(any(my_alias, target_os = \"macos\"))) },
     }
 }
 ";

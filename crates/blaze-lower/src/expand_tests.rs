@@ -1658,3 +1658,74 @@ fn fill_holes_file_and_module_path_are_single_quoted_string_literals() {
         assert!(ok, "literal failed rustc unescape_str: {lit:?}");
     }
 }
+
+/// Expression-position macro expansions (`Fragment::Expr`) tolerate a single trailing `;` (rustc's
+/// `SEMICOLON_IN_EXPRESSIONS_FROM_MACROS` lint, as used in `cfg_aliases` 0.1.1 / 0.2.1's recursive
+/// `@parser_clause` arms), while still rejecting multiple trailing semicolons, lone semicolons,
+/// `let` statements, incomplete expressions, and item declarations with `DiagKind::Syntax`.
+#[test]
+fn expr_macro_expansion_strips_single_trailing_semicolon_matching_rustc() {
+    // Positive: `cfg_aliases!`-shaped recursive `@parser_clause` macro with trailing `;` in `if`.
+    let cfg_aliases = (
+        "cfg_aliases",
+        "(@parser_emit all $({$($grouped:tt)+})+) => { ($( ($crate::cfg_aliases!(@parser $($grouped)+)) )&&+) };
+         (@parser_emit any $({$($grouped:tt)+})+) => { ($( ($crate::cfg_aliases!(@parser $($grouped)+)) )||+) };
+         (@parser_clause $op:ident [$({$($grouped:tt)+})*] [, $($rest:tt)*] $($current:tt)+) => {
+             $crate::cfg_aliases!(@parser_clause $op [$({$($grouped)+})* {$($current)+}] [$($rest)*]);
+         };
+         (@parser_clause $op:ident [$({$($grouped:tt)+})*] [$tok:tt $($rest:tt)*] $($current:tt)*) => {
+             $crate::cfg_aliases!(@parser_clause $op [$({$($grouped)+})*] [$($rest)*] $($current)* $tok);
+         };
+         (@parser_clause $op:ident [$({$($grouped:tt)+})*] [] $($current:tt)+) => {
+             $crate::cfg_aliases!(@parser_emit $op $({$($grouped)+})* {$($current)+});
+         };
+         (@parser all($($tokens:tt)+)) => { $crate::cfg_aliases!(@parser_clause all [] [$($tokens)+]) };
+         (@parser any($($tokens:tt)+)) => { $crate::cfg_aliases!(@parser_clause any [] [$($tokens)+]) };
+         (@parser not($($tokens:tt)+)) => { !($crate::cfg_aliases!(@parser $($tokens)+)) };
+         (@parser $key:ident = $val:literal) => { true };
+         (@parser $name:ident) => { false };",
+    );
+    assert_expands(
+        &[cfg_aliases],
+        r#"fn f() -> u8 { if cfg_aliases!(@parser all(unix, not(any(windows, target_os = "macos")))) { 1 } else { 0 } }"#,
+        &["(if (paren (bin And", "(lit 1)", "(lit 0)"],
+    );
+
+    // Positive: single trailing `;` on literal, attributed macro call, nested expr macros, and
+    // diverging / control-flow expressions.
+    assert_expands(&[("m", "() => { 1; }")], "fn f() { let _x = m!(); }", &["(let _x@p0 (lit 1))"]);
+    assert_expands(
+        &[("foo", "() => { 42; }"), ("m", "() => { #[allow(unused)] foo!(); }")],
+        "fn f() -> u8 { m!() }",
+        &["(tail (lit 42))"],
+    );
+    assert_expands(&[("m", "() => { return; }")], "fn f() { let _ = m!(); }", &["(return)"]);
+    assert_expands(&[("m", "() => { break; }")], "fn f() { loop { let _ = m!(); } }", &["(break ->"]);
+    assert_expands(&[("m", "() => { continue; }")], "fn f() { loop { let _ = m!(); } }", &["(continue ->"]);
+    assert_expands(
+        &[("m", "() => { if let Some(v) = Some(1) { v } else { 0 }; }")],
+        "fn f() -> u8 { m!() }",
+        &["(tail (if (let"],
+    );
+
+    // Negative controls: MUST still emit `DiagKind::Syntax` (matching rustc hard errors).
+    let assert_syntax_error = |label: &str, body: &str, fn_text: &str| {
+        let l = expanding(&[("m", body)], fn_text);
+        let has_syntax = l.view().diags().filter_map(Result::ok).any(|d| d.kind == crate::DiagKind::Syntax);
+        assert!(has_syntax, "{label}: expected DiagKind::Syntax, got diags {:?}\n{}", l.view().diags, dump_of(&l));
+    };
+
+    assert_syntax_error("lone semicolon", "() => { ; }", "fn f() { let _ = m!(); }");
+    assert_syntax_error("double semicolon alone", "() => { ;; }", "fn f() { let _ = m!(); }");
+    assert_syntax_error("expr with double trailing semicolon", "() => { 1;; }", "fn f() { let _ = m!(); }");
+    assert_syntax_error("return with double trailing semicolon", "() => { return;; }", "fn f() { let _ = m!(); }");
+    assert_syntax_error("two expressions", "() => { 1; 2; }", "fn f() { let _ = m!(); }");
+    assert_syntax_error("incomplete binary expr", "() => { 1 + ; }", "fn f() { let _ = m!(); }");
+    assert_syntax_error("let statement in value pos", "() => { let x = 1; }", "fn f() { let _ = m!(); }");
+    assert_syntax_error("let statement in if cond", "() => { let x = 1; }", "fn f() { if m!() {} }");
+    assert_syntax_error("attributed let statement", "() => { #[cfg(all())] let x = 1; }", "fn f() { if m!() {} }");
+    assert_syntax_error("doc-commented let statement", "() => { /// doc\n let x = 1; }", "fn f() { if m!() {} }");
+    assert_syntax_error("attribute before lone semicolon", "() => { #[allow(unused)] ; }", "fn f() { let _ = m!(); }");
+    assert_syntax_error("const item", "() => { const X: i32 = 1; }", "fn f() { let _ = m!(); }");
+    assert_syntax_error("struct item", "() => { struct S; }", "fn f() { let _ = m!(); }");
+}
