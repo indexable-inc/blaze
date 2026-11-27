@@ -315,6 +315,13 @@ pub enum Rule {
     /// ([`Rule::typed`]). Error at every step ([`Step::levels`]). The lint
     /// `blaze::capability_in_sans_io`.
     CapabilityInSansIo = 48,
+    /// A direct call in an edition before 2024 outside `unsafe` to an `unsafe fn` marked
+    /// `#[rustc_deprecated_safe_2024]` or `#[deprecated_safe]`: rustc's `deprecated_safe_2024`
+    /// (RFC 3458, in groups `deprecated_safe` and `rust_2024_compatibility`). A TYPED rule
+    /// (`blaze-typeck` `rules/unsafety.rs`), off (`Allow`) by default in [`Step::levels`] and
+    /// turned on when a crate writes `#![warn/deny/forbid(deprecated_safe_2024 | deprecated_safe |
+    /// rust_2024_compatibility)]`.
+    DeprecatedSafe2024 = 49,
 }
 
 impl Rule {
@@ -371,6 +378,7 @@ impl Rule {
         Rule::ParallelVecs,
         Rule::CostContract,
         Rule::CapabilityInSansIo,
+        Rule::DeprecatedSafe2024,
     ];
 
     /// The ten rules ported from blaze's scripts: what [`Step::Strict`] runs. The rules after
@@ -443,6 +451,7 @@ impl Rule {
             Rule::ParallelVecs => "parallel-vecs",
             Rule::CostContract => "cost-contract",
             Rule::CapabilityInSansIo => "capability-in-sans-io",
+            Rule::DeprecatedSafe2024 => "deprecated-safe-2024",
         }
     }
 
@@ -501,7 +510,7 @@ impl Rule {
     /// A typed rule is in no [`RuleSet`] a step makes, so a token record's key never moves with
     /// it; the step turns it on through its level alone ([`Step::levels`]).
     pub const fn typed(self) -> bool {
-        matches!(self, Rule::ArgsInline | Rule::UnsafeOpInUnsafeFn | Rule::CostContract | Rule::CapabilityInSansIo)
+        matches!(self, Rule::ArgsInline | Rule::UnsafeOpInUnsafeFn | Rule::CostContract | Rule::CapabilityInSansIo | Rule::DeprecatedSafe2024)
     }
 
     /// The rule configuration names `name` ([`Rule::name`]'s spelling), if any.
@@ -1514,6 +1523,8 @@ impl Step {
         };
         levels[Rule::CostContract as usize - 1] = Level::Error;
         levels[Rule::CapabilityInSansIo as usize - 1] = Level::Error;
+        const { assert!(Rule::DeprecatedSafe2024.id() == 49) };
+        levels[48] = Level::Off;
         Levels(levels)
     }
 }

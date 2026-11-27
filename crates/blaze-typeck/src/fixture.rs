@@ -1246,6 +1246,13 @@ impl Bb {
         self.unsafe_blocks.clear();
     }
 
+    /// Marks `e` as an `unsafe { .. }` block (kept ascending for binary search).
+    pub fn mark_unsafe_block(&mut self, e: ExprId) {
+        if let Err(i) = self.unsafe_blocks.binary_search(&e) {
+            self.unsafe_blocks.insert(i, e);
+        }
+    }
+
     /// An integer literal written as a call's argument, whose value `value` the lowering
     /// hands over (`BodyView::call_arg_ints`).
     pub fn int_valued(&mut self, suffix: Option<IntSuffix>, value: u128) -> ExprId {

@@ -1550,6 +1550,24 @@ mod tests {
     }
 
     #[test]
+    fn deprecated_safe_2024_level_in_follows_crate_attributes() {
+        let num = number_of(Rule::DeprecatedSafe2024);
+        assert_eq!(rule_of(num), Some(Rule::DeprecatedSafe2024));
+        // Default: Allow (`Level::Off`) so Edition 2021 crates compile cleanly by default.
+        assert_eq!(level_in(Step::Rust, RootMarks::NONE, num), Level::Off);
+        assert_eq!(level_in(Step::Strict, RootMarks::NONE, num), Level::Off);
+        // `#![warn(...)]` -> Advice; `#![deny(...)]` / `#![deny(rust_2024_compatibility)]` -> Error.
+        assert_eq!(level_in(Step::Rust, marks_of("#![warn(deprecated_safe_2024)]\n", ""), num), Level::Advice);
+        assert_eq!(level_in(Step::Rust, marks_of("#![deny(deprecated_safe_2024)]\n", ""), num), Level::Error);
+        assert_eq!(level_in(Step::Rust, marks_of("#![deny(deprecated_safe)]\n", ""), num), Level::Error);
+        assert_eq!(level_in(Step::Rust, marks_of("#![deny(rust_2024_compatibility)]\n", ""), num), Level::Error);
+        assert_eq!(
+            level_in(Step::Rust, marks_of("#![deny(rust_2024_compatibility)]\n#![allow(deprecated_safe_2024)]\n", ""), num),
+            Level::Off
+        );
+    }
+
+    #[test]
     fn file_scope_matches_all_path_shapes_without_alloc() {
         assert_eq!(file_scope("app/src/lib.rs"), Scope::file(TestBits::NONE, false, false));
         assert_eq!(file_scope("app/src/main.rs"), Scope::file(TestBits::NONE, true, false));

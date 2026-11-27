@@ -357,6 +357,7 @@ impl CmdExt for Cmd {
 
 fn call_rustc_dep() { set_var_like() }
 fn call_rustc_dep_unsafe() { unsafe { set_var_like() } }
+unsafe fn call_rustc_dep_in_unsafe_fn() { set_var_like() }
 fn call_dep_safe() { dep_safe_like() }
 fn call_dep_safe_unsafe() { unsafe { dep_safe_like() } }
 fn call_inherent_dep(c: &Cmd) { c.inherent_dep() }
@@ -371,6 +372,7 @@ fn call_dep_tf() { dep_safe_tf() }
     let names = [
         "call_rustc_dep",
         "call_rustc_dep_unsafe",
+        "call_rustc_dep_in_unsafe_fn",
         "call_dep_safe",
         "call_dep_safe_unsafe",
         "call_inherent_dep",
@@ -380,35 +382,52 @@ fn call_dep_tf() { dep_safe_tf() }
         "call_dep_tf",
     ];
 
+    let check_matches = |got: &[(String, String)], want: &[(&str, &str)]| {
+        let mut wrong = Vec::new();
+        for ((n, outcome), (wn, w)) in got.iter().zip(want) {
+            assert_eq!(n, wn);
+            let ok = match w.strip_suffix('*') {
+                Some(prefix) => outcome.starts_with(prefix),
+                None => outcome == w,
+            };
+            if !ok {
+                wrong.push(format!("{n}: got {outcome:?}, want {w:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "mismatches:\n{}", wrong.join("\n"));
+    };
+
     let got_2021 = check_fns("2021", text, &names);
-    assert_eq!(
-        got_2021,
-        vec![
-            ("call_rustc_dep".to_string(), "clean".to_string()),
-            ("call_rustc_dep_unsafe".to_string(), "clean".to_string()),
-            ("call_dep_safe".to_string(), "clean".to_string()),
-            ("call_dep_safe_unsafe".to_string(), "clean".to_string()),
-            ("call_inherent_dep".to_string(), "clean".to_string()),
-            ("call_trait_dep".to_string(), "clean".to_string()),
-            ("call_plain_unsafe".to_string(), "E0133 call to unsafe function `uf` is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)".to_string()),
-            ("call_dep_via_ptr".to_string(), "E0133 call to unsafe function is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)".to_string()),
-            ("call_dep_tf".to_string(), "E0133 call to function `dep_safe_tf` with `#[target_feature]` is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)".to_string()),
-        ]
+    check_matches(
+        &got_2021,
+        &[
+            ("call_rustc_dep", "lint [\"deprecated-safe-2024 at *"),
+            ("call_rustc_dep_unsafe", "clean"),
+            ("call_rustc_dep_in_unsafe_fn", "clean"),
+            ("call_dep_safe", "lint [\"deprecated-safe-2024 at *"),
+            ("call_dep_safe_unsafe", "clean"),
+            ("call_inherent_dep", "lint [\"deprecated-safe-2024 at *"),
+            ("call_trait_dep", "lint [\"deprecated-safe-2024 at *"),
+            ("call_plain_unsafe", "E0133 call to unsafe function `uf` is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)"),
+            ("call_dep_via_ptr", "E0133 call to unsafe function is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)"),
+            ("call_dep_tf", "E0133 call to function `dep_safe_tf` with `#[target_feature]` is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)"),
+        ],
     );
 
     let got_2024 = check_fns("2024", text, &names);
-    assert_eq!(
-        got_2024,
-        vec![
-            ("call_rustc_dep".to_string(), "E0133 call to unsafe function `set_var_like` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
-            ("call_rustc_dep_unsafe".to_string(), "clean".to_string()),
-            ("call_dep_safe".to_string(), "E0133 call to unsafe function `dep_safe_like` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
-            ("call_dep_safe_unsafe".to_string(), "clean".to_string()),
-            ("call_inherent_dep".to_string(), "E0133 call to unsafe function `inherent_dep` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
-            ("call_trait_dep".to_string(), "E0133 call to unsafe function `before_exec_like` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
-            ("call_plain_unsafe".to_string(), "E0133 call to unsafe function `uf` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
-            ("call_dep_via_ptr".to_string(), "E0133 call to unsafe function is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
-            ("call_dep_tf".to_string(), "E0133 call to unsafe function `dep_safe_tf` is unsafe and requires unsafe block (E0133 RequiresUnsafe)".to_string()),
-        ]
+    check_matches(
+        &got_2024,
+        &[
+            ("call_rustc_dep", "E0133 call to unsafe function `set_var_like` is unsafe and requires unsafe block (E0133 RequiresUnsafe)"),
+            ("call_rustc_dep_unsafe", "clean"),
+            ("call_rustc_dep_in_unsafe_fn", "lint [\"unsafe-op-in-unsafe-fn at *"),
+            ("call_dep_safe", "E0133 call to unsafe function `dep_safe_like` is unsafe and requires unsafe block (E0133 RequiresUnsafe)"),
+            ("call_dep_safe_unsafe", "clean"),
+            ("call_inherent_dep", "E0133 call to unsafe function `inherent_dep` is unsafe and requires unsafe block (E0133 RequiresUnsafe)"),
+            ("call_trait_dep", "E0133 call to unsafe function `before_exec_like` is unsafe and requires unsafe block (E0133 RequiresUnsafe)"),
+            ("call_plain_unsafe", "E0133 call to unsafe function `uf` is unsafe and requires unsafe block (E0133 RequiresUnsafe)"),
+            ("call_dep_via_ptr", "E0133 call to unsafe function is unsafe and requires unsafe block (E0133 RequiresUnsafe)"),
+            ("call_dep_tf", "E0133 call to unsafe function `dep_safe_tf` is unsafe and requires unsafe block (E0133 RequiresUnsafe)"),
+        ],
     );
 }

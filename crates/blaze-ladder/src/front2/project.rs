@@ -676,6 +676,11 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
             text.push_str(&super::check::unsafe_op_shown(r, op));
             text.push_str(" is unsafe and requires unsafe block (the body of an `unsafe fn` is no unsafe block in edition 2024)");
         }
+        // rustc's words for `deprecated_safe_2024` (editions before 2024, RFC 3458).
+        blaze_typeck::TypedFinding::DeprecatedSafe2024 { callee, .. } => {
+            text.push_str(&super::check::unsafe_op_shown(r, blaze_typeck::UnsafeOp::Call(Some(callee))));
+            text.push_str(" is unsafe and will require an `unsafe` block in edition 2024");
+        }
         blaze_typeck::TypedFinding::Cost { violation, declared, actual, declared_sync, actual_sync, loop_depth, callee, .. } => {
             use core::fmt::Write as _;
             use blaze_typeck::CostViolation as V;

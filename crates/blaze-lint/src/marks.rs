@@ -31,6 +31,15 @@ pub struct RootMarks {
     pub uniq: bool,
     /// The rules whose lint the file denies or forbids, as [`Rule::bit`]s.
     denied: u64,
+    /// The rules whose lint the file explicitly warns on, as [`Rule::bit`]s
+    /// (e.g. `#![warn(deprecated_safe_2024)]`).
+    warned: u64,
+    /// The rules whose lint the file explicitly allows, as [`Rule::bit`]s
+    /// (e.g. `#![allow(deprecated_safe_2024)]`).
+    allowed: u64,
+    /// The rules whose lint the file forbids (cannot be downgraded by later `warn`/`allow`),
+    /// as [`Rule::bit`]s.
+    forbidden: u64,
 }
 
 impl RootMarks {
@@ -42,6 +51,9 @@ impl RootMarks {
         trust_unsafe: false,
         uniq: false,
         denied: 0,
+        warned: 0,
+        allowed: 0,
+        forbidden: 0,
     };
 
     /// The marks `text`'s leading inner attributes give. Comments and doc comments between them
@@ -65,13 +77,21 @@ impl RootMarks {
     /// The marks of a file under a crate root: the root's, with what the file's own top adds
     /// (a module may be a core in a crate that is not). `no_std` is the root's alone.
     pub const fn join(self, file: RootMarks) -> RootMarks {
+        let forbidden = self.forbidden | file.forbidden;
+        let file_set = (file.denied | file.warned | file.allowed) & !self.forbidden;
+        let denied = ((self.denied & !file_set) | (file.denied & !self.forbidden)) | forbidden;
+        let warned = (self.warned & !file_set) | (file.warned & !self.forbidden);
+        let allowed = (self.allowed & !file_set) | (file.allowed & !self.forbidden);
         RootMarks {
             no_std: self.no_std,
             sans_io: self.sans_io || file.sans_io,
             driver: self.driver || file.driver,
             trust_unsafe: self.trust_unsafe || file.trust_unsafe,
             uniq: self.uniq || file.uniq,
-            denied: self.denied | file.denied,
+            denied,
+            warned,
+            allowed,
+            forbidden,
         }
     }
 
@@ -93,6 +113,16 @@ impl RootMarks {
         self.denied & rule.bit() != 0
     }
 
+    /// Whether the file explicitly warns on `rule`'s lint.
+    pub const fn warns(&self, rule: Rule) -> bool {
+        self.warned & rule.bit() != 0
+    }
+
+    /// Whether the file explicitly allows `rule`'s lint.
+    pub const fn allows(&self, rule: Rule) -> bool {
+        self.allowed & rule.bit() != 0
+    }
+
     /// `scope` as the marks make it: in a core where the file is one, and with `trust_unsafe`
     /// where the crate root carries a valid `#![blaze::trust(unsafe, reason = "..")]`.
     pub const fn scope(&self, scope: Scope) -> Scope {
@@ -100,17 +130,14 @@ impl RootMarks {
         if self.trust_unsafe { scope.with_trust_unsafe() } else { scope }
     }
 
-    /// `base` and the rules the marks ask for: each rule whose lint is denied, and
+    /// `base` and the rules the marks ask for: each non-typed rule whose lint is denied, and
     /// `sans-io-core` in a core.
-    pub const fn rules(&self, base: RuleSet) -> RuleSet {
+    pub fn rules(&self, base: RuleSet) -> RuleSet {
         let mut rules = base;
-        let mut at = 0;
-        // Bounded: one turn per rule.
-        while at < Rule::ALL.len() {
-            if self.denies(Rule::ALL[at]) {
-                rules = rules.with(Rule::ALL[at]);
+        for rule in Rule::ALL {
+            if self.denies(rule) && !rule.typed() {
+                rules = rules.with(rule);
             }
-            at += 1;
         }
         if self.sans_io {
             rules = rules.with(Rule::SansIoCore);
@@ -121,16 +148,18 @@ impl RootMarks {
         rules
     }
 
-    /// `base` with each denied rule an error: the crate's own words, for its own findings.
-    pub const fn levels(&self, base: Levels) -> Levels {
+    /// `base` with each denied/warned/allowed rule's level applied: the crate's own words, for
+    /// its own findings.
+    pub fn levels(&self, base: Levels) -> Levels {
         let mut levels = base.0;
-        let mut at = 0;
-        // Bounded: one turn per rule.
-        while at < Rule::ALL.len() {
-            if self.denies(Rule::ALL[at]) {
-                levels[at] = Level::Error;
+        for (slot, rule) in levels.iter_mut().zip(Rule::ALL) {
+            if self.denies(rule) {
+                *slot = Level::Error;
+            } else if self.warns(rule) {
+                *slot = Level::Advice;
+            } else if self.allows(rule) {
+                *slot = Level::Off;
             }
-            at += 1;
         }
         Levels(levels)
     }
@@ -158,7 +187,31 @@ impl RootMarks {
                 }
                 _ => {}
             },
-            "deny" | "forbid" if peek_is(sig, TokenKind::OpenParen) => self.denied |= denied_list(sig),
+            "forbid" if peek_is(sig, TokenKind::OpenParen) => {
+                let bits = lint_list(sig);
+                self.forbidden |= bits;
+                self.denied |= bits;
+                self.warned &= !bits;
+                self.allowed &= !bits;
+            }
+            "deny" if peek_is(sig, TokenKind::OpenParen) => {
+                let bits = lint_list(sig) & !self.forbidden;
+                self.denied |= bits;
+                self.warned &= !bits;
+                self.allowed &= !bits;
+            }
+            "warn" if peek_is(sig, TokenKind::OpenParen) => {
+                let bits = lint_list(sig) & !self.forbidden;
+                self.warned |= bits;
+                self.denied &= !bits;
+                self.allowed &= !bits;
+            }
+            "allow" if peek_is(sig, TokenKind::OpenParen) => {
+                let bits = lint_list(sig) & !self.forbidden;
+                self.allowed |= bits;
+                self.denied &= !bits;
+                self.warned &= !bits;
+            }
             _ => {}
         }
         close(sig, 1);
@@ -297,25 +350,38 @@ fn blaze_path<'t>(sig: &mut Peekable<Sig<'t>>) -> Option<&'t str> {
     sig.next().map(|(_, name)| name)
 }
 
-/// `(blaze::a, blaze::b, other, reason = "..")` after a `deny` or `forbid`: the rules of the
-/// `blaze::` lints named, as bits; the list read up to and with its `)`.
-fn denied_list(sig: &mut Peekable<Sig<'_>>) -> u64 {
+/// Built-in rustc lint and lint-group names that map to typed rules tracked here.
+fn rustc_lint_bits(name: &str) -> u64 {
+    match name {
+        "deprecated_safe_2024" | "deprecated_safe" | "rust_2024_compatibility" => Rule::DeprecatedSafe2024.bit(),
+        _ => 0,
+    }
+}
+
+/// `(blaze::a, deprecated_safe_2024, other, reason = "..")` after `allow`, `warn`, `deny` or
+/// `forbid`: the rules of the `blaze::` and tracked rustc lints named, as bits; the list read up
+/// to and with its `)`.
+fn lint_list(sig: &mut Peekable<Sig<'_>>) -> u64 {
     let mut bits = 0;
     let mut depth = 0usize;
+    let mut after_colon = false;
     // Bounded: each turn takes one token of the text.
     while let Some((kind, word)) = sig.next() {
         depth = depth_of(kind, depth);
         if depth == 0 {
             return bits;
         }
-        if depth == 1
-            && kind == TokenKind::Ident
-            && word == "blaze"
-            && let Some(name) = blaze_path(sig)
-            && let Some(rule) = Rule::from_lint(name)
-        {
-            bits |= rule.bit();
+        if depth == 1 && kind == TokenKind::Ident && !after_colon {
+            if word == "blaze"
+                && let Some(name) = blaze_path(sig)
+                && let Some(rule) = Rule::from_lint(name)
+            {
+                bits |= rule.bit();
+            } else if !peek_is(sig, TokenKind::Colon) && !peek_is(sig, TokenKind::Eq) {
+                bits |= rustc_lint_bits(word);
+            }
         }
+        after_colon = kind == TokenKind::Colon;
     }
     bits
 }

@@ -884,6 +884,44 @@ fn root_marks_and_lint_names() {
     assert!(denies.denies(Rule::LockWithoutReason) && denies.rules(Step::Rust.rules()).runs(Rule::LockWithoutReason));
 }
 
+#[test]
+fn deprecated_safe_2024_lint_levels_and_groups() {
+    let rule = Rule::DeprecatedSafe2024;
+    assert_eq!(Rule::from_name("deprecated-safe-2024"), Some(rule));
+    assert!(rule.typed());
+    // Default level is `Off` (`Allow`) at every step so pre-2024 crates compile cleanly by default.
+    for step in [Step::Rust, Step::Suggest, Step::Edition, Step::Strict] {
+        assert_eq!(step.levels().of(rule), Level::Off);
+        assert!(!step.rules().runs(rule));
+    }
+    // Every rustc spelling and group name enables warning or error via RootMarks.
+    for name in ["deprecated_safe_2024", "deprecated_safe", "rust_2024_compatibility"] {
+        let warned = RootMarks::read(&format!("#![warn({name})]\n"));
+        assert!(warned.warns(rule) && !warned.denies(rule));
+        assert_eq!(warned.levels(Step::Rust.levels()).of(rule), Level::Advice);
+        assert!(!warned.rules(Step::Rust.rules()).runs(rule), "typed rule stays out of token RuleSet");
+
+        let denied = RootMarks::read(&format!("#![deny({name})]\n"));
+        assert!(denied.denies(rule));
+        assert_eq!(denied.levels(Step::Rust.levels()).of(rule), Level::Error);
+        assert!(!denied.rules(Step::Rust.rules()).runs(rule), "typed rule stays out of token RuleSet");
+    }
+    // Later `allow` overrides `deny`, but cannot override `forbid`.
+    let allowed = RootMarks::read("#![deny(rust_2024_compatibility)]\n#![allow(deprecated_safe_2024)]\n");
+    assert_eq!(allowed.levels(Step::Rust.levels()).of(rule), Level::Off);
+    let forbidden = RootMarks::read("#![forbid(deprecated_safe_2024)]\n#![allow(deprecated_safe_2024)]\n");
+    assert_eq!(forbidden.levels(Step::Rust.levels()).of(rule), Level::Error);
+    // Module-level `allow` overrides crate-level `deny`, but not crate-level `forbid`.
+    let crate_deny = RootMarks::read("#![deny(rust_2024_compatibility)]\n");
+    let crate_forbid = RootMarks::read("#![forbid(deprecated_safe_2024)]\n");
+    let mod_allow = RootMarks::read("#![allow(deprecated_safe_2024)]\n");
+    assert_eq!(crate_deny.join(mod_allow).levels(Step::Rust.levels()).of(rule), Level::Off);
+    assert_eq!(crate_forbid.join(mod_allow).levels(Step::Rust.levels()).of(rule), Level::Error);
+    // Tool-qualified path with the same leaf name must not trigger the rustc lint.
+    let foreign = RootMarks::read("#![deny(other_tool::deprecated_safe_2024)]\n");
+    assert_eq!(foreign.levels(Step::Rust.levels()).of(rule), Level::Off);
+}
+
 /// Expected: "test tests::lock_without_reason ... ok".
 #[test]
 fn lock_without_reason() {

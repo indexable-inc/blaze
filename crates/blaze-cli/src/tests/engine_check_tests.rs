@@ -1688,6 +1688,52 @@ fn engine_check_prints_a_lint_and_a_borrow_finding_as_check_does() {
     assert_eq!((again_ids, body(&again)), (ids, body(&lines)), "the certificate prints the same");
 }
 
+/// Edition 2021 calls to `#[rustc_deprecated_safe_2024]` functions emit the `deprecated-safe-2024`
+/// typed finding: silent under default `Allow`, a warning under `#![warn(deprecated_safe_2024)]`,
+/// and an error under `#![deny(deprecated_safe_2024)]` or `#![deny(rust_2024_compatibility)]`.
+#[test]
+fn engine_check_deprecated_safe_2024_lint_levels() {
+    const MANIFEST_2021: &str = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n";
+    const BODY: &str = "#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub fn caller() {\n    set_var_like();\n}\n";
+
+    let run_case = |seed: u64, prefix: &str| {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST_2021);
+        write(&io, "src/lib.rs", &format!("{prefix}{BODY}"));
+        let (ids, lines, _) = said(&io, false);
+        let rendered = lines.join("\n");
+        (ids, warning_lines(&rendered), error_lines(&rendered), rendered)
+    };
+
+    // 1. Default (`Allow`): finding is recorded in the body verdict, printed as neither error nor warning.
+    let (ids_default, warns_default, errs_default, out_default) = run_case(21, "");
+    assert!(ids_default.iter().any(|(code, _)| code == "deprecated-safe-2024"), "finding recorded: {ids_default:?}");
+    assert!(warns_default.is_empty(), "default Allow must print no warning:\n{out_default}");
+    assert!(errs_default.is_empty(), "default Allow must print no error:\n{out_default}");
+
+    // 2. `#![warn(deprecated_safe_2024)]`: prints one warning, zero errors.
+    let (_, warns_warn, errs_warn, out_warn) = run_case(22, "#![warn(deprecated_safe_2024)]\n");
+    assert_eq!(warns_warn.len(), 1, "expected 1 warning:\n{out_warn}");
+    assert!(warns_warn[0].contains("deprecated-safe-2024"), "warning names lint:\n{out_warn}");
+    assert!(errs_warn.is_empty(), "warn must print no error:\n{out_warn}");
+
+    // 3. `#![deny(deprecated_safe_2024)]`: prints one error, zero warnings.
+    let (_, warns_deny, errs_deny, out_deny) = run_case(23, "#![deny(deprecated_safe_2024)]\n");
+    assert_eq!(errs_deny.len(), 1, "expected 1 error under deny:\n{out_deny}");
+    assert!(errs_deny[0].contains("deprecated-safe-2024"), "error names lint:\n{out_deny}");
+    assert!(warns_deny.is_empty(), "deny must not also warn:\n{out_deny}");
+
+    // 4. `#![deny(rust_2024_compatibility)]`: prints one error.
+    let (_, _, errs_compat, out_compat) = run_case(24, "#![deny(rust_2024_compatibility)]\n");
+    assert_eq!(errs_compat.len(), 1, "expected 1 error under rust_2024_compatibility:\n{out_compat}");
+    assert!(errs_compat[0].contains("deprecated-safe-2024"), "error names lint:\n{out_compat}");
+
+    // 5. `#![deny(rust_2024_compatibility)]` + `#![allow(deprecated_safe_2024)]`: silent again.
+    let (_, warns_allow, errs_allow, out_allow) = run_case(25, "#![deny(rust_2024_compatibility)]\n#![allow(deprecated_safe_2024)]\n");
+    assert!(warns_allow.is_empty(), "allow must suppress warning:\n{out_allow}");
+    assert!(errs_allow.is_empty(), "allow must suppress error:\n{out_allow}");
+}
+
 /// A workspace of one member, `app`, under the `suggest` step, its module `a` holding `f`, which
 /// calls itself (blaze-lint `recursion`), and `g`, which does not. `f`'s comment and `g`'s body
 /// are the edits below, each keeping every length.

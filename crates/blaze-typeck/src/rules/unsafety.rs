@@ -288,6 +288,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             if self.body.expr_edition(e) < Edition::E2024 {
                 let attrs = self.reads.attrs(k)?;
                 if attrs.0 & TypeAttrs::DEPRECATED_SAFE_2024 != 0 {
+                    if ctx == Ctx::Safe {
+                        let at = self.range_of(At::Expr(e));
+                        self.typed_findings.push(TypedFinding::DeprecatedSafe2024 { callee: k, at });
+                    }
                     attrs
                 } else {
                     self.refuse(ctx, At::Expr(e), UnsafeOp::Call(Some(k)));
