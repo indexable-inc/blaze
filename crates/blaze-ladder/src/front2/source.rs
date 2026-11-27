@@ -704,11 +704,10 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>> {
         // An item with no place is declared by no block: as `program::placed` answered.
         let Some(Place { krate, at, item }) = self.place(key) else { return Some(None) };
-        let Some((text, outline)) = self.outline_at(krate, at) else { return Some(None) };
+        let krate = *self.crates().get(krate)?;
         // The one reading of a block's ABI, the items record writer's (`foreign_abi`): an ABI
         // it cannot read is not answered (`None`), as over records the record is not written.
-        let crate_key = self.crates().get(krate)?.key;
-        blaze_scope::items_record::foreign_abi(text, outline, outline.item(item), key, crate_key).ok()
+        blaze_scope::items_record::foreign_abi(krate, at, item, key).ok()
     }
 
     fn attr_value(self, key: ItemKey, attr: &'static str) -> Option<Option<RowValue<'n>>> {

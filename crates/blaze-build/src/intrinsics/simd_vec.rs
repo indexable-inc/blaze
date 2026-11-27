@@ -315,25 +315,46 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
             if l.count != m.count {
                 return Err(shape("`T` and `U` must have the same length"));
             }
-            let (from, to) = (vector_ty(which, &l)?, vector_ty(which, &m)?);
             let x = place(0)?;
-            let a = load_vector(s, &l, from, x);
             let (fb, tb) = (l.stride, m.stride);
             let unchecked = if op == SimdOp::Cast { Flags::IN_RANGE } else { Flags::NONE };
-            let r = match (kind(l.elem), kind(m.elem)) {
-                (Kind::Int { .. }, Kind::Int { .. }) if fb == tb => a,
-                (Kind::Int { signed }, Kind::Int { .. }) if fb < tb => s.b.convert(if signed { Op::Sext } else { Op::Zext }, Flags::NONE, to, a),
-                (Kind::Int { .. }, Kind::Int { .. }) => s.b.convert(Op::Trunc, Flags::NONE, to, a),
-                (Kind::Float, Kind::Float) if fb == tb => a,
-                (Kind::Float, Kind::Float) if fb < tb => s.b.convert(Op::Fpext, Flags::NONE, to, a),
-                (Kind::Float, Kind::Float) => s.b.convert(Op::Fptrunc, Flags::NONE, to, a),
-                (Kind::Int { signed: true }, Kind::Float) => s.b.convert(Op::SitoFp, Flags::NONE, to, a),
-                (Kind::Int { signed: false }, Kind::Float) => s.b.convert(Op::UitoFp, Flags::NONE, to, a),
-                (Kind::Float, Kind::Int { signed: true }) => s.b.convert(Op::FptoSi, unchecked, to, a),
-                (Kind::Float, Kind::Int { signed: false }) => s.b.convert(Op::FptoUi, unchecked, to, a),
-                _ => return Err(shape("`T` and `U` must be vectors of integers or floats")),
+            let (fk, mk) = (kind(l.elem), kind(m.elem));
+            if matches!(fk, Kind::Ptr) || matches!(mk, Kind::Ptr) {
+                return Err(shape("`T` and `U` must be vectors of integers or floats"));
+            }
+            let convert_val = |s: &mut B<'_, '_, '_, '_, LA, S, A>, dst_ty: Ty, a: Value| -> Result<Value, IntrinsicError> {
+                Ok(match (fk, mk) {
+                    (Kind::Int { .. }, Kind::Int { .. }) if fb == tb => a,
+                    (Kind::Int { signed }, Kind::Int { .. }) if fb < tb => s.b.convert(if signed { Op::Sext } else { Op::Zext }, Flags::NONE, dst_ty, a),
+                    (Kind::Int { .. }, Kind::Int { .. }) => s.b.convert(Op::Trunc, Flags::NONE, dst_ty, a),
+                    (Kind::Float, Kind::Float) if fb == tb => a,
+                    (Kind::Float, Kind::Float) if fb < tb => s.b.convert(Op::Fpext, Flags::NONE, dst_ty, a),
+                    (Kind::Float, Kind::Float) => s.b.convert(Op::Fptrunc, Flags::NONE, dst_ty, a),
+                    (Kind::Int { signed: true }, Kind::Float) => s.b.convert(Op::SitoFp, Flags::NONE, dst_ty, a),
+                    (Kind::Int { signed: false }, Kind::Float) => s.b.convert(Op::UitoFp, Flags::NONE, dst_ty, a),
+                    (Kind::Float, Kind::Int { signed: true }) => s.b.convert(Op::FptoSi, unchecked, dst_ty, a),
+                    (Kind::Float, Kind::Int { signed: false }) => s.b.convert(Op::FptoUi, unchecked, dst_ty, a),
+                    _ => return Err(shape("`T` and `U` must be vectors of integers or floats")),
+                })
             };
-            out_vector(s, &m, r)
+            if let (Ok(from), Ok(to)) = (vector_ty(which, &l), vector_ty(which, &m)) {
+                let a = load_vector(s, &l, from, x);
+                let r = convert_val(s, to, a)?;
+                out_vector(s, &m, r)
+            } else {
+                // Vector wider than 512 bits or non-power-of-two lane count (e.g. `Simd<u16, 32>`
+                // cast to `Simd<u32, 32>`): lower lane-by-lane with scalar conversions.
+                let from_lane = lir(l.elem).0;
+                let to_lane = lir(m.elem).0;
+                let slot = s.b.slot(m.size as u32, m.align, SlotKind::Temp);
+                let dst = s.b.slot_addr(slot);
+                for i in 0..l.count {
+                    let a = s.b.load(from_lane, Flags::NONE, x, (i * l.stride) as i32, MemAttrs::aligned(l.elem.align()));
+                    let r = convert_val(s, to_lane, a)?;
+                    s.b.store(Flags::NONE, r, dst, (i * m.stride) as i32, MemAttrs::aligned(m.elem.align()));
+                }
+                Out::At(dst)
+            }
         }
         // "Returns a new vector such that element `i` is selected from `xy[idx[i]]`, where `xy`
         // is the concatenation of `x` and `y`." "`V` must be a vector with the same element
@@ -359,43 +380,71 @@ pub(super) fn build<LA: Allocator + Clone, S: Sink, A: Allocator + Clone>(
         // from the identity). An integer sum or product wraps, so its order is unseen.
         SimdOp::ReduceAddOrdered | SimdOp::ReduceAddUnordered | SimdOp::ReduceMulOrdered | SimdOp::ReduceMulUnordered => {
             let l = lanes(s, ty(0)?)?;
-            let vt = vector_ty(which, &l)?;
-            let lane = vt.lane();
+            let lane = lir(l.elem).0;
             if s.scalar(c.ret)?.0 != lane {
                 return Err(shape("`U` must be the element type of `T`"));
             }
             let x = place(0)?;
             let ordered = matches!(op, SimdOp::ReduceAddOrdered | SimdOp::ReduceMulOrdered);
             let mul = matches!(op, SimdOp::ReduceMulOrdered | SimdOp::ReduceMulUnordered);
-            let a = load_vector(s, &l, vt, x);
-            let r = match kind(l.elem) {
-                Kind::Int { .. } => {
-                    let all = s.b.convert(if mul { Op::ReduceMul } else { Op::ReduceAdd }, Flags::NONE, lane, a);
-                    match ordered {
-                        true => {
-                            let start = scalar(1)?;
-                            s.b.binary(if mul { Op::Mul } else { Op::Add }, Flags::NONE, start, all)
+            if let Ok(vt) = vector_ty(which, &l) {
+                let a = load_vector(s, &l, vt, x);
+                let r = match kind(l.elem) {
+                    Kind::Int { .. } => {
+                        let all = s.b.convert(if mul { Op::ReduceMul } else { Op::ReduceAdd }, Flags::NONE, lane, a);
+                        match ordered {
+                            true => {
+                                let start = scalar(1)?;
+                                s.b.binary(if mul { Op::Mul } else { Op::Add }, Flags::NONE, start, all)
+                            }
+                            false => all,
                         }
-                        false => all,
                     }
-                }
-                Kind::Float => {
-                    let lop = if mul { Op::ReduceFmul } else { Op::ReduceFadd };
-                    match ordered {
-                        true => {
-                            let start = scalar(1)?;
-                            s.b.reduce_ordered(lop, Flags::NONE, start, a)
+                    Kind::Float => {
+                        let lop = if mul { Op::ReduceFmul } else { Op::ReduceFadd };
+                        match ordered {
+                            true => {
+                                let start = scalar(1)?;
+                                s.b.reduce_ordered(lop, Flags::NONE, start, a)
+                            }
+                            false => {
+                                let bits = float_identity(lane.elem(), mul).ok_or(shape(ints_or_floats))?;
+                                let start = s.b.fconst(lane, bits);
+                                s.b.reduce_ordered(lop, Flags::REASSOC, start, a)
+                            }
                         }
-                        false => {
+                    }
+                    Kind::Ptr => return Err(shape(ints_or_floats)),
+                };
+                Out::Scalar(r)
+            } else {
+                // Vector wider than 512 bits or non-power-of-two lane count (e.g.
+                // `Simd<u32, 32>::reduce_sum`): fold lane-by-lane in order.
+                let (binop, flags) = match kind(l.elem) {
+                    Kind::Int { .. } => (if mul { Op::Mul } else { Op::Add }, Flags::NONE),
+                    Kind::Float => (if mul { Op::Fmul } else { Op::Fadd }, if ordered { Flags::NONE } else { Flags::REASSOC }),
+                    Kind::Ptr => return Err(shape(ints_or_floats)),
+                };
+                let (mut acc, first_lane) = if ordered {
+                    (scalar(1)?, 0u64)
+                } else if l.count == 0 {
+                    match kind(l.elem) {
+                        Kind::Int { .. } => (s.b.iconst(lane, u128::from(mul)), 0u64),
+                        Kind::Float => {
                             let bits = float_identity(lane.elem(), mul).ok_or(shape(ints_or_floats))?;
-                            let start = s.b.fconst(lane, bits);
-                            s.b.reduce_ordered(lop, Flags::REASSOC, start, a)
+                            (s.b.fconst(lane, bits), 0u64)
                         }
+                        Kind::Ptr => return Err(shape(ints_or_floats)),
                     }
+                } else {
+                    (s.b.load(lane, Flags::NONE, x, 0, MemAttrs::aligned(l.elem.align())), 1u64)
+                };
+                for i in first_lane..l.count {
+                    let v = s.b.load(lane, Flags::NONE, x, (i * l.stride) as i32, MemAttrs::aligned(l.elem.align()));
+                    acc = s.b.binary(binop, flags, acc, v);
                 }
-                Kind::Ptr => return Err(shape(ints_or_floats)),
-            };
-            Out::Scalar(r)
+                Out::Scalar(acc)
+            }
         }
         // "Returns the maximum element of a vector." / "the minimum": by the lanes' signedness;
         // a float vector (core_arch's `vmaxvq_f32`) as `fmax_num`/`fmin_num`.

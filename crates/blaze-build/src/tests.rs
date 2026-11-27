@@ -3564,7 +3564,7 @@ enum Scrut {
 #[derive(Clone, Copy, Debug)]
 enum Arms {
     Or,
-    OrGuard,
+    OrGuard(bool),
     Each,
     Whole,
     Wild,
@@ -3611,7 +3611,7 @@ fn arm_list(b: &mut BodyBuf, arms: Arms) -> List {
         list.push(Arm { pat, guard: None, body });
     };
     match arms {
-        Arms::Or | Arms::OrGuard => {
+        Arms::Or | Arms::OrGuard(_) => {
             let (w0, s) = (b.pat(Pat::Wild), b.bind("s"));
             let pa = variant_pat(b, "A", &[w0, s]);
             let s2 = b.bind("s");
@@ -3621,8 +3621,8 @@ fn arm_list(b: &mut BodyBuf, arms: Arms) -> List {
             push(b, or, false);
             let w1 = b.pat(Pat::Wild);
             push(b, w1, false);
-            if let Arms::OrGuard = arms {
-                let (one, other) = (b.int(1, None), b.int(1, None));
+            if let Arms::OrGuard(pass) = arms {
+                let (one, other) = (b.int(1, None), b.int(if pass { 1 } else { 2 }, None));
                 list[0].guard = Some(b.bin(BinOp::Eq, one, other));
             }
         }

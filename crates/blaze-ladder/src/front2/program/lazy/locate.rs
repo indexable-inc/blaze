@@ -320,7 +320,7 @@ type Chain = Vec<LowerTarget, Global>;
 #[derive(Clone, Copy)]
 struct Searched<'n> {
     lib: LibKey,
-    member: Option<(LibKey, ItemKey)>,
+    member: Option<(LibKey, ItemKey, MemberKind)>,
     text: &'n str,
     name: &'n str,
 }
@@ -576,13 +576,20 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let (Some(crate_key), Some(edition), Some(atoms)) = (names.crate_key(krate), names.edition_of(krate), names.cfg_atoms(krate)) else {
             return Err(LazyRefusal::Unanswered { question: "crate_key, edition_of, cfg_atoms", item: self.crate_shown(krate) });
         };
-        // The crate's fns whose body holds items, free and members, in key order.
+        // The crate's fns, consts and statics whose body holds items, free and members, in key order.
         let mut tops: AVec<'n, Searched<'n>> = AVec::new_in(alloc);
         let mut containers: AVec<'n, LibKey> = AVec::new_in(alloc);
         let mut unread = 0u32;
         let listed = names.each_item(krate, &mut |lib, _module| match names.kind_of_item(lib) {
-            Some(ItemKind::Function) => {
-                if let Some(ItemDetail::Fn { body_holds_items: true }) = names.detail_of(lib) {
+            Some(ItemKind::Function | ItemKind::Const | ItemKind::Static) => {
+                if matches!(
+                    names.detail_of(lib),
+                    Some(
+                        ItemDetail::Fn { body_holds_items: true }
+                            | ItemDetail::Const { body_holds_items: true }
+                            | ItemDetail::Static { body_holds_items: true }
+                    )
+                ) {
                     match names.text_of(lib) {
                         Some(it) => tops.push(Searched { lib, member: None, text: it.text, name: it.name.unwrap_or("_") }),
                         None => unread += 1,
@@ -595,13 +602,13 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         if !listed {
             return Err(LazyRefusal::Unanswered { question: "each_item", item: self.crate_shown(krate) });
         }
-        let mut matching_names: AVec<'n, &'n str> = AVec::new_in(alloc);
+        let mut matching_names: AVec<'n, (ItemKind, &'n str)> = AVec::new_in(alloc);
         for &container in containers.iter() {
             matching_names.clear();
             names.each_member_matching(
                 container,
                 &mut |kind, mname| {
-                    if kind == ItemKind::Function && mname.is_some() {
+                    if matches!(kind, ItemKind::Function | ItemKind::Const) && mname.is_some() {
                         crate::front2::source::MemberWant::NameOnly
                     } else {
                         crate::front2::source::MemberWant::Skip
@@ -611,7 +618,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                     if m.body_holds_items
                         && let Some(name) = m.name
                     {
-                        matching_names.push(name);
+                        matching_names.push((m.kind, name));
                     }
                 },
             );
@@ -621,8 +628,8 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             names.each_member_matching(
                 container,
                 &mut |kind, mname| {
-                    if kind == ItemKind::Function
-                        && mname.is_some_and(|n| matching_names.iter().any(|&want| want == n))
+                    if matches!(kind, ItemKind::Function | ItemKind::Const)
+                        && mname.is_some_and(|n| matching_names.iter().any(|&(wk, wn)| wk == kind && wn == n))
                     {
                         crate::front2::source::MemberWant::WithText
                     } else {
@@ -630,13 +637,16 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                     }
                 },
                 &mut |m| {
-                    if m.kind == ItemKind::Function
-                        && m.body_holds_items
+                    if let Some(mkind) = match m.kind {
+                        ItemKind::Function => Some(MemberKind::Fn),
+                        ItemKind::Const => Some(MemberKind::Const),
+                        _ => None,
+                    } && m.body_holds_items
                         && let Some(name) = m.name
                     {
-                        let mk = member_key_of(checker_of(container), MemberKind::Fn, name);
+                        let mk = member_key_of(checker_of(container), mkind, name);
                         names.read_member_body(m.key, m.written_by);
-                        tops.push(Searched { lib: m.key, member: Some((container, mk)), text: m.text, name });
+                        tops.push(Searched { lib: m.key, member: Some((container, mk, mkind)), text: m.text, name });
                     }
                 },
             );
@@ -654,12 +664,13 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: format!("{rows}; more fns whose bodies hold items than the most one search reads ({MOST_SEARCHED})").into_boxed_str() });
             }
             let top = Top { text, name, library: Some((crate_key, lib)) };
-            let walked = walk_every(top, member, reading).map_err(|r| LazyRefusal::Head { item: self.refused_shown(checker_of(lib)), why: format!("the items declared in its body did not read: {r}").into_boxed_str() })?;
+            let top_body = member.map(|(container, mk, _)| (container, mk));
+            let walked = walk_every(top, top_body, reading).map_err(|r| LazyRefusal::Head { item: self.refused_shown(checker_of(lib)), why: format!("the items declared in its body did not read: {r}").into_boxed_str() })?;
             let first: LowerTarget = match member {
-                Some((_, mk)) => LowerTarget::Member(mk),
+                Some((_, mk, _)) => LowerTarget::Member(mk),
                 None => LowerTarget::Free(lib),
             };
-            let member_row = member.map(|(container, mk)| (mk, MemberRow { container, kind: MemberKind::Fn, name }));
+            let member_row = member.map(|(container, mk, mkind)| (mk, MemberRow { container, kind: mkind, name }));
             let chain_of = |within: u32| -> Option<Chain> {
                 let keys = walked.chain_to(within, alloc).ok()?.ok()?;
                 let mut c: Chain = Vec::new_in(Global);
@@ -753,7 +764,14 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 if let Some(body) = self.store.locals.body(owner)
                     && let Some(ix) = self.local_rows.get_mut(&krate)
                 {
-                    for row in body.rows.iter().filter(|r| r.kind == crate::front2::locals::LocalKind::Fn) {
+                    for row in body.rows.iter().filter(|r| {
+                        matches!(
+                            r.kind,
+                            crate::front2::locals::LocalKind::Fn
+                                | crate::front2::locals::LocalKind::Const
+                                | crate::front2::locals::LocalKind::Static
+                        )
+                    }) {
                         let mut next = chain.clone();
                         next.push(LowerTarget::Free(row.key));
                         ix.nested_queue.push(next);

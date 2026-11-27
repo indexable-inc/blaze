@@ -1404,7 +1404,7 @@ pub struct Built {
     reached: u32,
     /// Each fn instance a static points at, sorted by key, and its slot ([`static_fn_slots`]):
     /// placement writes the slot's thunk into the static's word.
-    static_fns: Vec<(InstanceKey, u32), Global>,
+    static_fns: Vec<(InstanceKey, place::StaticFnPlace), Global>,
     /// Each vtable a static points at, sorted by key, and its table index in `vtables`:
     /// placement writes the table's address into the static's word.
     static_vtables: blaze_own::Vec<(VtableKey, u32), Global>,
@@ -2515,6 +2515,7 @@ fn build_from<P: FrontEnd>(
     // is the evaluator's key, so resolve it to the instance and normalize it exactly as the
     // build's own slot key before placement. A missing descriptor or untabled body remains a
     // static-fn stub and keeps the named first-call refusal in [`static_fn_slots`].
+    let mut foreign_static_fns: Vec<(InstanceKey, Box<str, Global>), Global> = Vec::new_in(Global);
     if survey.stubs.is_some()
         && let Some(image) = image.as_mut()
     {
@@ -2536,11 +2537,19 @@ fn build_from<P: FrontEnd>(
                     }
                     let tabled = make_one::static_fn_tabled(program, instance, ground.view());
                     let Some(c) = program.fn_index(tabled) else { continue };
-                    let facts = FrontAdts(program, c, &consts, &langs, &checked_bodies);
-                    let normalized = key_of(program, c, instance, &mut ground, &facts)?;
-                    reached.slot(instance, c, normalized)?;
-                    canonical.insert(key, normalized);
-                    normalized
+                    if program.function(c).kind == FnKind::Foreign {
+                        if let Err(at) = foreign_static_fns.binary_search_by_key(&key, |f| f.0) {
+                            foreign_static_fns.insert(at, (key, program.function(c).symbol.into()));
+                        }
+                        canonical.insert(key, key);
+                        key
+                    } else {
+                        let facts = FrontAdts(program, c, &consts, &langs, &checked_bodies);
+                        let normalized = key_of(program, c, instance, &mut ground, &facts)?;
+                        reached.slot(instance, c, normalized)?;
+                        canonical.insert(key, normalized);
+                        normalized
+                    }
                 }
             };
             reloc.target = ImageTarget::Fn(reached_key);
@@ -3720,7 +3729,7 @@ fn build_from<P: FrontEnd>(
     // A build that runs: each fn a static points at gets its slot (a stub's when the walk did
     // not reach it), before the getter's slot.
     let static_fns = match (image.as_ref(), survey.stubs.as_mut()) {
-        (Some(image), Some(stubs)) => static_fn_slots(image, &reached.keys, stubs, &mut bodies)?,
+        (Some(image), Some(stubs)) => static_fn_slots(image, &reached.keys, &foreign_static_fns, stubs, &mut bodies)?,
         _ => Vec::new_in(Global),
     };
     // The thread-locals' getter and ender (THREADS.md D2), once each, in the two slots after
@@ -3782,7 +3791,13 @@ fn build_from<P: FrontEnd>(
 /// slot: the slot the walk built it in (`keys` by slot), else a slot of its own at the end of
 /// `bodies` holding a stub with [`RunError::StaticFn`] (the image names it by key alone, so the
 /// walk cannot build it: it stops the program only if called through the static).
-fn static_fn_slots(image: &StaticImage<Global>, keys: &[Option<InstanceKey>], stubs: &mut Stubs, bodies: &mut Vec<Body, Global>) -> Result<Vec<(InstanceKey, u32), Global>, RunError> {
+fn static_fn_slots(
+    image: &StaticImage<Global>,
+    keys: &[Option<InstanceKey>],
+    foreign_fns: &[(InstanceKey, Box<str, Global>)],
+    stubs: &mut Stubs,
+    bodies: &mut Vec<Body, Global>,
+) -> Result<Vec<(InstanceKey, place::StaticFnPlace), Global>, RunError> {
     let mut by_key: Vec<(InstanceKey, u32), Global> = Vec::with_capacity_in(keys.len(), Global);
     for (slot, key) in keys.iter().enumerate() {
         if let Some(key) = key {
@@ -3792,23 +3807,28 @@ fn static_fn_slots(image: &StaticImage<Global>, keys: &[Option<InstanceKey>], st
     // The first slot of a key, as `Reached::slot` gives it.
     by_key.sort_by_key(|k| k.0);
     by_key.dedup_by_key(|k| k.0);
-    let mut out: Vec<(InstanceKey, u32), Global> = Vec::new_in(Global);
+    let mut out: Vec<(InstanceKey, place::StaticFnPlace), Global> = Vec::new_in(Global);
     for r in image.relocs.iter() {
         let ImageTarget::Fn(key) = r.target else { continue };
         let Err(at) = out.binary_search_by_key(&key, |f| f.0) else { continue };
-        let slot = match by_key.binary_search_by_key(&key, |k| k.0) {
-            Ok(found) => by_key[found].1,
-            Err(_) => {
-                let slot = bodies.len();
-                // The static whose bytes hold the word: the last whose first byte is at or before it.
-                let static_ = image.statics.iter().filter(|s| s.1 <= r.at).max_by_key(|s| s.1).map(|s| s.0);
-                stubs.slot = slot;
-                stubs.keep(RunError::StaticFn { static_, key });
-                bodies.push(stubs.body(slot).ok_or(RunError::TooManyInstances)?);
-                u32::try_from(slot).map_err(|_| RunError::TooManyInstances)?
-            }
+        let dest = if let Ok(fi) = foreign_fns.binary_search_by_key(&key, |f| f.0) {
+            place::StaticFnPlace::Symbol(foreign_fns[fi].1.clone())
+        } else {
+            let slot = match by_key.binary_search_by_key(&key, |k| k.0) {
+                Ok(found) => by_key[found].1,
+                Err(_) => {
+                    let slot = bodies.len();
+                    // The static whose bytes hold the word: the last whose first byte is at or before it.
+                    let static_ = image.statics.iter().filter(|s| s.1 <= r.at).max_by_key(|s| s.1).map(|s| s.0);
+                    stubs.slot = slot;
+                    stubs.keep(RunError::StaticFn { static_, key });
+                    bodies.push(stubs.body(slot).ok_or(RunError::TooManyInstances)?);
+                    u32::try_from(slot).map_err(|_| RunError::TooManyInstances)?
+                }
+            };
+            place::StaticFnPlace::Slot(slot)
         };
-        out.insert(at, (key, slot));
+        out.insert(at, (key, dest));
     }
     Ok(out)
 }

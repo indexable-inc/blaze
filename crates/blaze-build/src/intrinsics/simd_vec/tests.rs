@@ -117,3 +117,64 @@ fn reduce_and_saturate() {
     // max(saturating x - 5) = 200 - 5.
     assert_eq!(got, 195);
 }
+
+/// Vectors wider than 512 bits (`Simd<u16, 32>` cast via `simd_as` to 1024-bit `Simd<u32, 32>`,
+/// then summed via `simd_reduce_add_ordered`): lowers cleanly lane-by-lane and produces the exact
+/// sum `start + sum(1..=32) = 100 + 528 = 628`.
+#[test]
+fn wide_cast_and_reduce_sum() {
+    let heap = blaze_own::testing::heap();
+    let mut w = World::default();
+    let vector = w.strukt(1, &[F::P(0)], SIMD);
+    let mut g = G::new();
+    let mut ls: Layouts<Global> = Layouts::new_in(Global);
+    let u16_ = g.n(PNode::Uint(UintTy::U16));
+    let u32_ = g.n(PNode::Uint(UintTy::U32));
+    let lanes_u16 = g.array(u16_, 32);
+    let lanes_u32 = g.array(u32_, 32);
+    let u16x32: PTy = g.adt(vector, &[lanes_u16]);
+    let u32x32: PTy = g.adt(vector, &[lanes_u32]);
+
+    let mut b = Builder::<Global, Full>::new_in(64, Global);
+    let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+    b.set_signature(sig);
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    let slot = b.slot(64, 6, SlotKind::Temp);
+    let addr = b.slot_addr(slot);
+    for i in 0..32u32 {
+        let v = b.iconst(Ty::I16, u128::from(i + 1));
+        b.store(Flags::NONE, v, addr, (i * 2) as i32, MemAttrs::aligned(1));
+    }
+    let init = b.iconst(Ty::I32, 100);
+    let sum = {
+        let mut cx = LayoutCx { ground: &mut g.t, facts: &w, scratch: heap.alloc() };
+        let needs_drop = |_: PTy| false;
+        let mut icx = IntrinsicCx { layouts: &mut ls, cx: &mut cx, needs_drop: &needs_drop, ub_checks: crate::UbChecks::Off, overflow_checks: crate::OverflowChecks::Off };
+        let cast_generics = [GenericArg::Ty(u16x32), GenericArg::Ty(u32x32)];
+        let cast_args = [Arg::Place(addr)];
+        let cast_call = Call { which: Which::Simd(SimdOp::As), generics: &cast_generics, args: &cast_args, ret: u32x32, site: None };
+        let widened = match build(&mut b, &cast_call, &mut icx).expect("simd_as builds for 1024-bit vector") {
+            Out::At(v) => v,
+            other => panic!("not a vector temporary: {other:?}"),
+        };
+        let red_generics = [GenericArg::Ty(u32x32), GenericArg::Ty(u32_)];
+        let red_args = [Arg::Place(widened), Arg::Scalar(init)];
+        let red_call = Call { which: Which::Simd(SimdOp::ReduceAddOrdered), generics: &red_generics, args: &red_args, ret: u32_, site: None };
+        match build(&mut b, &red_call, &mut icx).expect("simd_reduce_add_ordered builds for 1024-bit vector") {
+            Out::Scalar(v) => v,
+            other => panic!("not a scalar: {other:?}"),
+        }
+    };
+    let wide = b.convert(Op::Zext, Flags::NONE, Ty::I64, sum);
+    b.ret(&[wide]);
+    let f: Func<Global> = b.finish_checked().expect("the built function verifies");
+    let got = match run_in(f.view(), &[], 100_000, Global).expect("the evaluator models it") {
+        Outcome::Returned(v) => match v.first() {
+            Some(Val::Int(i)) => *i,
+            other => panic!("a non-integer result {other:?}"),
+        },
+        other => panic!("the run did not return: {other:?}"),
+    };
+    assert_eq!(got, 628);
+}

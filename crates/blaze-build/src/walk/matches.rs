@@ -386,11 +386,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             Some(g) => self.cond_has_let(g)?,
             None => false,
         };
-        let let_guard_fail = if guard_has_let && let Some((word, chains, n)) = expanded {
+        let let_guard_fail = if guard_has_let && let Some((word, chains, n, _)) = expanded {
             self.guard_alts_fail(word, chains, n, self.reached[pass.index()])?
         } else {
             next
         };
+        let common_from = self.pending_mark();
+        let alt_moves = expanded.map(|(word, _, n, ranges_start)| super::moves::AltMoves { word, ranges_start, n, common_from });
         self.begin(pass);
         let mark = u32::try_from(self.scope_pats.len()).map_err(|_| malformed("drop scope depth past u32::MAX"))?;
         self.scope_marks.push(mark);
@@ -411,13 +413,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if let Some(g) = arm.guard
             && guard_has_let
         {
-            return self.let_guard(g, arm.body, let_guard_fail, from);
+            return self.let_guard(g, arm.body, let_guard_fail, from, alt_moves);
         }
         self.work.push(Task::Eval(arm.body));
         if let Some(g) = arm.guard {
-            self.work.push(Task::ArmMoves { from });
+            self.work.push(Task::ArmMoves { from, alts: alt_moves });
             self.work.push(match expanded {
-                Some((word, chains, n)) => Task::GuardAlts { word, chains, n },
+                Some((word, chains, n, _)) => Task::GuardAlts { word, chains, n },
                 None => Task::Guard { m, i },
             });
             self.work.push(Task::Eval(g));
@@ -706,16 +708,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         }
                     } else {
                         if self.needs_drop(at.g).map_err(|error| Self::pat_ty_err(p, error))? {
-                            if alt && self.holding_moves() {
-                                // A guarded arm runs its guard per alternative (matches/alts.rs);
-                                // the held moves of one would be applied for all.
-                                return Err(BuildError::UnsupportedPat {
-                                    pat: p,
-                                    what: "a by-value binding of a part that needs drop in an or-pattern of a guarded arm",
-                                });
-                            }
                             // walk/moves.rs: the part moves out of a scrutinee the match owns
-                            // (its bit cleared); anywhere else refused by name.
+                            // (its bit cleared); in a guarded arm with or-patterns, each
+                            // expansion's moves are held in its own range and dispatched by
+                            // switching on `word` once the guard passes (`AltMoves`).
                             self.move_out(p, at.g, alt)?;
                             moved = true;
                         }

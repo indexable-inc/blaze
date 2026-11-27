@@ -32,26 +32,45 @@ use crate::layout::Variants;
 use super::At;
 use crate::BuildError;
 
-/// The bytes a `&str` constant's record points to, for constant pattern `p`: its root is the
-/// wide pointer (crate::layout's wide-pointer rule: the address word, then the length), the
-/// address word a relocation (crate::data `DataReloc`: "an 8-byte word holding the addend")
-/// to an allocation of the same record, whose bytes `addend..addend + len` are the string. A
-/// `&str` into a static's bytes is refused by name: no record here holds them.
-fn str_const_bytes<B: Allocator>(p: PatId, record: &crate::data::DataRecord<B>) -> Result<&[u8], BuildError> {
-    let root = record.allocs.first().ok_or(malformed("a const's record with no allocation"))?;
-    let word = |off: usize| -> Result<u64, BuildError> {
-        let part = root.bytes.get(off..off + 8).ok_or(malformed("a `&str` constant's record shorter than a wide pointer"))?;
-        Ok(part.iter().enumerate().fold(0u64, |v, (i, &byte)| v | (u64::from(byte) << (8 * i))))
-    };
-    let (addend, len) = (word(0)?, word(8)?);
-    let reloc = root.relocs.iter().find(|r| r.offset == 0).ok_or(malformed("a `&str` constant whose address word holds no relocation"))?;
+/// The most parts (scalars, fields, array/slice elements, and dereferenced references) one
+/// constant pattern's structural comparison may walk (rule 18).
+const MOST_CONST_PARTS: usize = 1 << 16;
+
+/// One value inside a constant pattern's structural comparison: its type, the allocation in the
+/// constant's `DataRecord` holding its bytes, its runtime place `(rt_base, rt_off)`, and its
+/// byte offset `const_off` within `record.allocs[alloc]`.
+#[derive(Clone, Copy)]
+struct ConstPart {
+    g: PTy,
+    alloc: usize,
+    rt_base: Value,
+    rt_off: i32,
+    const_off: u32,
+}
+
+/// Reads `n` little-endian bytes (`n <= 16`) at `off` from allocation `alloc` of `record`.
+fn const_word<B: Allocator>(record: &crate::data::DataRecord<B>, alloc: usize, off: u32, n: u32) -> Result<u128, BuildError> {
+    let bytes = &record.allocs.get(alloc).ok_or(malformed("a const's allocation index past its record"))?.bytes[..];
+    let start = off as usize;
+    let end = start.checked_add(n as usize).ok_or(malformed("a const's offset overflow"))?;
+    let part = bytes.get(start..end).ok_or(malformed("a const's bytes shorter than its type"))?;
+    Ok(part.iter().enumerate().fold(0u128, |v, (i, &byte)| v | (u128::from(byte) << (8 * i))))
+}
+
+/// The local target allocation index of the pointer relocation at `off` in `record.allocs[alloc]`.
+/// A pointer targeting a static, function, or vtable outside the constant's own record is refused
+/// by name: no record here holds its pointee bytes.
+fn local_pointee<B: Allocator>(p: PatId, record: &crate::data::DataRecord<B>, alloc: usize, off: u32) -> Result<usize, BuildError> {
+    let entry = record.allocs.get(alloc).ok_or(malformed("a const's allocation index past its record"))?;
+    let reloc = entry.relocs.iter().find(|r| r.offset == off).ok_or(malformed("a reference constant whose address word holds no relocation"))?;
     let crate::data::DataTarget::Local(n) = reloc.target else {
-        return Err(BuildError::UnsupportedPat { pat: p, what: "a `&str` constant pointing outside its own record (a static's bytes) as a pattern" });
+        return Err(BuildError::UnsupportedPat { pat: p, what: "a constant holding a reference pointing outside its own record (a static's bytes) as a pattern" });
     };
-    let to = record.allocs.get(n as usize).ok_or(malformed("a `&str` constant's relocation past its record's allocations"))?;
-    let start = usize::try_from(addend).map_err(|_| malformed("a `&str` constant's addend past a usize"))?;
-    let end = usize::try_from(len).ok().and_then(|len| start.checked_add(len)).ok_or(malformed("a `&str` constant's length past a usize"))?;
-    to.bytes.get(start..end).ok_or(malformed("a `&str` constant's bytes past its allocation"))
+    let idx = n as usize;
+    if idx >= record.allocs.len() {
+        return Err(malformed("a reference constant's relocation past its record's allocations"));
+    }
+    Ok(idx)
 }
 
 impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
@@ -63,57 +82,176 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// `[patterns.path.const]`; rustc's `const_to_pat` makes the same pattern): a scalar leaf
     /// compares with the constant's bytes there, a float by `==` (`FloatCond::Oeq`), an enum
     /// by its variant first, then that variant's fields, a struct, tuple or array by every
-    /// part. The leaves come from the type's walk row, so padding is never compared, and a
-    /// variant's fields are read only once the variant test passed. A `&str` constant is
-    /// compared by its bytes, as a string literal pattern is (`bytes_test`). Any other constant
-    /// holding a pointer (a `&str` field, a reference) is refused by name: its pointee would be
-    /// compared, which no row here holds.
+    /// part, a `&str` or `&[u8]` by its length and bytes (`bytes_test`), a `&[T]` by its length
+    /// and each element structurally, and a `&T` by its pointee structurally. Raw pointers and
+    /// references pointing outside the constant's own record are refused by name.
     pub(super) fn const_test(&mut self, p: PatId, at: At, ok: Block, fail: Block) -> Result<bool, BuildError> {
         let Some(Def::Const(item)) = self.pat_def(p) else { return Ok(false) };
         if at.no_read {
             return Err(malformed("a local used before its binding"));
         }
-        let root = self.repr(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
-        let node = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
-        let structural = matches!(node, PNode::Adt(..));
         let refuse = |what| BuildError::UnsupportedPat { pat: p, what };
-        // A `&str` constant: compared as a string literal pattern is (`str_test`), by its
-        // pointee's bytes. rustc_mir_build const_to_pat.rs `recur` makes a `&str` constant
-        // `PatKind::Constant`, tested by `TestKind::Eq` (`<str as PartialEq>::eq`): the same
-        // length, then the same bytes.
-        let str_ref = match node {
-            PNode::Ref(_, inner) => self.ground_node(inner).map_err(|error| Self::pat_ty_err(p, error))? == PNode::Str,
-            _ => false,
-        };
-        if root == Repr::Ptr && !str_ref {
-            return Err(refuse("a constant of a reference or pointer type other than `&str` as a pattern (compared by its pointee)"));
-        }
         let args = self.pat_const_args(p)?;
         let adts = self.adts;
         let record = adts.const_value(item, &args[..]).ok_or(BuildError::NoPatConstValue { pat: p, item })?;
         record.check().map_err(|_| malformed("a const's record that breaks the data form"))?;
-        if str_ref {
-            let bytes = str_const_bytes(p, record)?;
-            self.bytes_test(p, at, bytes, (true, true), ok, fail)?;
-            return Ok(true);
+        if record.allocs.is_empty() {
+            return Err(malformed("a const's record with no allocation"));
         }
-        let bytes = &record.allocs.first().ok_or(malformed("a const's record with no allocation"))?.bytes[..];
-        let word = |off: u32, n: u32| -> Result<u128, BuildError> {
-            let start = off as usize;
-            let part = bytes.get(start..start + n as usize).ok_or(malformed("a const's bytes shorter than its type"))?;
-            Ok(part.iter().enumerate().fold(0u128, |v, (i, &byte)| v | (u128::from(byte) << (8 * i))))
-        };
         let mut all: Option<Value> = None;
-        let mut todo: Vec<(Repr, u32), A> = Vec::new_in(self.alloc);
-        todo.push((root, 0));
-        while let Some((repr, off)) = todo.pop() {
-            let place = i32::try_from(off).ok().and_then(|o| at.at.1.checked_add(o)).ok_or(refuse("a constant pattern past an `i32` offset"))?;
+        let mut todo: Vec<ConstPart, A> = Vec::new_in(self.alloc);
+        todo.push(ConstPart { g: at.g, alloc: 0, rt_base: at.at.0, rt_off: at.at.1, const_off: 0 });
+        let mut steps = 0usize;
+        while let Some(part) = todo.pop() {
+            steps += 1;
+            if steps > MOST_CONST_PARTS {
+                return Err(refuse("a constant pattern with more structural parts than the limit"));
+            }
+            let ConstPart { g, alloc, rt_base, rt_off, const_off } = part;
+            let node = self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))?;
+            if let PNode::Ref(_, inner) = node {
+                let inner_node = self.ground_node(inner).map_err(|error| Self::pat_ty_err(p, error))?;
+                match inner_node {
+                    PNode::Str => {
+                        let addend = const_word(record, alloc, const_off, 8)? as u64;
+                        let len = const_word(record, alloc, const_off + 8, 8)? as u64;
+                        if len == 0 {
+                            let rt_len = self.b.load(Ty::I64, Flags::NONE, rt_base, rt_off + 8, MemAttrs::aligned(3));
+                            let zero = self.b.iconst(Ty::I64, 0);
+                            let hit = self.b.icmp(IntCond::Eq, rt_len, zero);
+                            all = Some(match all {
+                                Some(prev) => self.b.binary(Op::And, Flags::NONE, prev, hit),
+                                None => hit,
+                            });
+                            continue;
+                        }
+                        let target = local_pointee(p, record, alloc, const_off)?;
+                        let start = usize::try_from(addend).map_err(|_| malformed("a `&str` constant's addend past a usize"))?;
+                        let end = usize::try_from(len)
+                            .ok()
+                            .and_then(|l| start.checked_add(l))
+                            .ok_or(malformed("a `&str` constant's length past a usize"))?;
+                        let bytes = record.allocs[target]
+                            .bytes
+                            .get(start..end)
+                            .ok_or(malformed("a `&str` constant's bytes past its allocation"))?;
+                        if let Some(c) = all.take() {
+                            let mid = self.create();
+                            self.br(c, (mid, &[]), (fail, &[]));
+                            self.begin(mid);
+                        }
+                        let next_ok = self.create();
+                        let slice_at = At { at: (rt_base, rt_off), g, by_ref: false, copy: false, no_read: false };
+                        self.bytes_test(p, slice_at, bytes, (true, true), next_ok, fail)?;
+                        self.begin(next_ok);
+                        continue;
+                    }
+                    PNode::Slice(elem_ty) => {
+                        let addend = const_word(record, alloc, const_off, 8)? as u64;
+                        let len = const_word(record, alloc, const_off + 8, 8)? as u64;
+                        if len == 0 {
+                            let rt_len = self.b.load(Ty::I64, Flags::NONE, rt_base, rt_off + 8, MemAttrs::aligned(3));
+                            let zero = self.b.iconst(Ty::I64, 0);
+                            let hit = self.b.icmp(IntCond::Eq, rt_len, zero);
+                            all = Some(match all {
+                                Some(prev) => self.b.binary(Op::And, Flags::NONE, prev, hit),
+                                None => hit,
+                            });
+                            continue;
+                        }
+                        let elem_node = self.ground_node(elem_ty).map_err(|error| Self::pat_ty_err(p, error))?;
+                        let elem_repr = self.repr(elem_ty).map_err(|error| Self::pat_ty_err(p, error))?;
+                        if elem_repr == Repr::None {
+                            let rt_len = self.b.load(Ty::I64, Flags::NONE, rt_base, rt_off + 8, MemAttrs::aligned(3));
+                            let want = self.b.iconst(Ty::I64, u128::from(len));
+                            let hit = self.b.icmp(IntCond::Eq, rt_len, want);
+                            all = Some(match all {
+                                Some(prev) => self.b.binary(Op::And, Flags::NONE, prev, hit),
+                                None => hit,
+                            });
+                            continue;
+                        }
+                        let target = local_pointee(p, record, alloc, const_off)?;
+                        if elem_node == PNode::Uint(blaze_typeck::UintTy::U8) {
+                            let start = usize::try_from(addend).map_err(|_| malformed("a `&[u8]` constant's addend past a usize"))?;
+                            let end = usize::try_from(len)
+                                .ok()
+                                .and_then(|l| start.checked_add(l))
+                                .ok_or(malformed("a `&[u8]` constant's length past a usize"))?;
+                            let bytes = record.allocs[target]
+                                .bytes
+                                .get(start..end)
+                                .ok_or(malformed("a `&[u8]` constant's bytes past its allocation"))?;
+                            if let Some(c) = all.take() {
+                                let mid = self.create();
+                                self.br(c, (mid, &[]), (fail, &[]));
+                                self.begin(mid);
+                            }
+                            let next_ok = self.create();
+                            let slice_at = At { at: (rt_base, rt_off), g, by_ref: false, copy: false, no_read: false };
+                            self.bytes_test(p, slice_at, bytes, (true, true), next_ok, fail)?;
+                            self.begin(next_ok);
+                            continue;
+                        }
+                        if let Some(c) = all.take() {
+                            let mid = self.create();
+                            self.br(c, (mid, &[]), (fail, &[]));
+                            self.begin(mid);
+                        }
+                        let rt_len = self.b.load(Ty::I64, Flags::NONE, rt_base, rt_off + 8, MemAttrs::aligned(3));
+                        let want = self.b.iconst(Ty::I64, u128::from(len));
+                        let same_len = self.b.icmp(IntCond::Eq, rt_len, want);
+                        let mid = self.create();
+                        self.br(same_len, (mid, &[]), (fail, &[]));
+                        self.begin(mid);
+                        let (stride, _) = self.size_align(elem_repr);
+                        let stride = u64::from(stride);
+                        let rt_ptr = self.b.load(Ty::PTR, Flags::NONE, rt_base, rt_off, MemAttrs::aligned(3));
+                        let count = usize::try_from(len).map_err(|_| refuse("a slice constant pattern longer than usize"))?;
+                        if count > MOST_CONST_PARTS {
+                            return Err(refuse("a slice constant pattern with more elements than the limit"));
+                        }
+                        for i in (0..count).rev() {
+                            let byte_off = (i as u64).checked_mul(stride).ok_or(refuse("a slice constant pattern past an `i32` offset"))?;
+                            let elem_rt_off = i32::try_from(byte_off).map_err(|_| refuse("a slice constant pattern past an `i32` offset"))?;
+                            let elem_const_off = addend
+                                .checked_add(byte_off)
+                                .and_then(|o| u32::try_from(o).ok())
+                                .ok_or(malformed("a slice constant's element offset past a u32"))?;
+                            todo.push(ConstPart { g: elem_ty, alloc: target, rt_base: rt_ptr, rt_off: elem_rt_off, const_off: elem_const_off });
+                        }
+                        continue;
+                    }
+                    _ => {
+                        let ref_repr = self.repr(g).map_err(|error| Self::pat_ty_err(p, error))?;
+                        if ref_repr != Repr::Ptr {
+                            return Err(refuse("a constant holding an unsized reference other than `&str` or `&[T]` as a pattern"));
+                        }
+                        let inner_repr = self.repr(inner).map_err(|error| Self::pat_ty_err(p, error))?;
+                        if inner_repr == Repr::None {
+                            continue;
+                        }
+                        let target = local_pointee(p, record, alloc, const_off)?;
+                        let addend = const_word(record, alloc, const_off, 8)? as u64;
+                        let inner_const_off = u32::try_from(addend).map_err(|_| malformed("a reference constant's addend past a u32"))?;
+                        if let Some(c) = all.take() {
+                            let mid = self.create();
+                            self.br(c, (mid, &[]), (fail, &[]));
+                            self.begin(mid);
+                        }
+                        let rt_ptr = self.b.load(Ty::PTR, Flags::NONE, rt_base, rt_off, MemAttrs::aligned(3));
+                        todo.push(ConstPart { g: inner, alloc: target, rt_base: rt_ptr, rt_off: 0, const_off: inner_const_off });
+                        continue;
+                    }
+                }
+            }
+            let repr = self.repr(g).map_err(|error| Self::pat_ty_err(p, error))?;
             let hit = match repr {
                 Repr::None => continue,
                 Repr::Int { ty, .. } | Repr::Float(ty) => {
-                    let k = word(off, ty.bits(PTR_BITS).div_ceil(8))?;
+                    let k = const_word(record, alloc, const_off, ty.bits(PTR_BITS).div_ceil(8))?;
                     let attrs = self.mem(repr);
-                    let x = self.b.load(ty, Flags::NONE, at.at.0, place, attrs);
+                    let x = self.b.load(ty, Flags::NONE, rt_base, rt_off, attrs);
                     if let Repr::Float(_) = repr {
                         // rustc's `const_to_pat` refuses a NaN ("cannot use NaN in patterns"):
                         // it equals nothing, so the arm could never match.
@@ -137,18 +275,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     }
                 }
                 Repr::Bool => {
-                    let k = word(off, 1)?;
+                    let k = const_word(record, alloc, const_off, 1)?;
                     let attrs = self.mem(repr);
-                    let x = self.b.load(Ty::I8, Flags::NONE, at.at.0, place, attrs);
+                    let x = self.b.load(Ty::I8, Flags::NONE, rt_base, rt_off, attrs);
                     let k = self.b.iconst(Ty::I8, k);
                     self.b.icmp(IntCond::Eq, x, k)
                 }
                 Repr::Ptr => {
-                    return Err(refuse(if structural {
-                        "a structural match of an ADT constant holding a reference or a pointer (compared by its pointee)"
-                    } else {
-                        "a constant holding a reference or a pointer as a pattern (compared by its pointee)"
-                    }));
+                    return Err(refuse("a constant holding a raw pointer or function pointer as a pattern"));
                 }
                 Repr::Agg(l) => {
                     if self.layouts[l as usize].is_union {
@@ -156,14 +290,29 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     }
                     match self.layouts[l as usize].shape {
                         Shape::Fields { first, len } => {
-                            for i in first..first + len {
-                                let (_, at_off, part) = self.layout_fields[i as usize];
-                                todo.push((part, off + at_off));
+                            for i in (first..first + len).rev() {
+                                let (_, at_off, _) = self.layout_fields[i as usize];
+                                let field_ty = self.layout_field_tys[i as usize];
+                                let next_rt = i32::try_from(at_off)
+                                    .ok()
+                                    .and_then(|o| rt_off.checked_add(o))
+                                    .ok_or(refuse("a constant pattern past an `i32` offset"))?;
+                                let next_const = const_off.checked_add(at_off).ok_or(refuse("a constant pattern past a `u32` offset"))?;
+                                todo.push(ConstPart { g: field_ty, alloc, rt_base, rt_off: next_rt, const_off: next_const });
                             }
                         }
-                        Shape::Array { elem, len, stride } => {
-                            for i in 0..len {
-                                todo.push((elem, off + i * stride));
+                        Shape::Array { len, stride, .. } => {
+                            let PNode::Array(elem_ty, _) = node else {
+                                return Err(malformed("an array layout of other than an array"));
+                            };
+                            for i in (0..len).rev() {
+                                let at_off = i.checked_mul(stride).ok_or(refuse("a constant pattern past a `u32` offset"))?;
+                                let next_rt = i32::try_from(at_off)
+                                    .ok()
+                                    .and_then(|o| rt_off.checked_add(o))
+                                    .ok_or(refuse("a constant pattern past an `i32` offset"))?;
+                                let next_const = const_off.checked_add(at_off).ok_or(refuse("a constant pattern past a `u32` offset"))?;
+                                todo.push(ConstPart { g: elem_ty, alloc, rt_base, rt_off: next_rt, const_off: next_const });
                             }
                         }
                         Shape::Enum { id, .. } => {
@@ -172,7 +321,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                                 None => self.ls.variant_of_tag(id, 0),
                                 Some((tag_at, tag)) => {
                                     let tag_at = u32::try_from(tag_at).map_err(|_| malformed("an enum's tag past a u32 offset"))?;
-                                    let bits = word(off + tag_at, tag.prim.bits() / 8)?;
+                                    let bits = const_word(record, alloc, const_off + tag_at, tag.prim.bits() / 8)?;
                                     self.ls.variant_of_tag(id, bits)
                                 }
                             }
@@ -185,15 +334,21 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                                     self.br(c, (mid, &[]), (fail, &[]));
                                     self.begin(mid);
                                 }
-                                let d = self.read_discriminant(id, (at.at.0, place))?;
+                                let d = self.read_discriminant(id, (rt_base, rt_off))?;
                                 let case = self.discriminant_case(id, variant)?;
                                 let k = self.b.iconst(Ty::I64, case);
                                 all = Some(self.b.icmp(IntCond::Eq, d, k));
                             }
                             let (first, len, _) = self.variant_rows(l, variant)?;
-                            for i in first..first + len {
-                                let (_, at_off, part) = self.layout_fields[i as usize];
-                                todo.push((part, off + at_off));
+                            for i in (first..first + len).rev() {
+                                let (_, at_off, _) = self.layout_fields[i as usize];
+                                let field_ty = self.layout_field_tys[i as usize];
+                                let next_rt = i32::try_from(at_off)
+                                    .ok()
+                                    .and_then(|o| rt_off.checked_add(o))
+                                    .ok_or(refuse("a constant pattern past an `i32` offset"))?;
+                                let next_const = const_off.checked_add(at_off).ok_or(refuse("a constant pattern past a `u32` offset"))?;
+                                todo.push(ConstPart { g: field_ty, alloc, rt_base, rt_off: next_rt, const_off: next_const });
                             }
                             continue;
                         }
@@ -208,7 +363,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         match all {
             Some(c) => self.br(c, (ok, &[]), (fail, &[])),
-            // A constant of no bytes (a unit struct): the type alone matches.
+            // A constant of no bytes (a unit struct) or all checks already branched to `fail`.
             None => self.jump(ok, &[]),
         }
         Ok(true)

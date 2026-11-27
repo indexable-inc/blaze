@@ -135,6 +135,18 @@ pub(super) enum Pending {
     Clear { mask: SlotId, bits: FieldBits },
     /// Local `x` moved whole by `expr` (`moved`).
     Moved { expr: ExprId, x: PatId },
+    /// Local `x`'s runtime drop flag cleared (`set_flag(x, false)`): whole-local move inside
+    /// an or-pattern alternative of a guarded arm.
+    ClearFlag(PatId),
+}
+
+/// Per-expansion pending move slices for a guarded arm whose pattern holds or-patterns.
+#[derive(Clone, Copy)]
+pub(super) struct AltMoves {
+    pub(super) word: SlotId,
+    pub(super) ranges_start: u32,
+    pub(super) n: u32,
+    pub(super) common_from: u32,
 }
 
 /// The arm being bound: its pattern, its match's root, and whether it has a guard (its moves
@@ -169,6 +181,8 @@ pub(super) struct Moves<A: Allocator> {
     cx: Option<Cx>,
     /// The effects guarded arms hold until their guards pass, innermost last.
     pending: Vec<Pending, A>,
+    /// Per-expansion `(start, end)` slices into `pending` for guarded arms with or-patterns.
+    alt_ranges: Vec<(u32, u32), A>,
     /// The first bindings an or-pattern's alternatives moved a part into (each alternative
     /// cleared its own bits on its pass), owned once at the arm's pass (walk/matches.rs
     /// `bind_with`).
@@ -192,6 +206,7 @@ impl<A: Allocator + Copy> Moves<A> {
             mask_decl_loop: Vec::new_in(alloc),
             cx: None,
             pending: Vec::new_in(alloc),
+            alt_ranges: Vec::new_in(alloc),
             alt_owned: Vec::new_in(alloc),
             box_self: None,
             temp_spills: Vec::new_in(alloc),
@@ -520,14 +535,11 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 // The whole local moves (its flag, set by `scan_flags`).
                 self.moves.steps.truncate(start as usize);
                 if alt {
-                    if cx.guarded {
-                        return Err(BuildError::UnsupportedPat {
-                            pat: p,
-                            what: "a by-value binding of a part that needs drop in an or-pattern of a guarded arm",
-                        });
-                    }
                     if !self.has_drop_flag(x) {
                         return Err(malformed("a whole local moved inside an or-pattern without a drop flag (`scan_flags`)"));
+                    }
+                    if cx.guarded {
+                        return self.arm_effect(Pending::ClearFlag(x), true);
                     }
                     self.set_flag(x, false);
                     return Ok(());
@@ -581,6 +593,16 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.moves.pending.len() as u32
     }
 
+    /// Where the per-expansion pending slices for the next guarded or-pattern arm start.
+    pub(super) fn alt_ranges_mark(&self) -> u32 {
+        self.moves.alt_ranges.len() as u32
+    }
+
+    /// Records the `(start, end)` pending move slice for one expansion of a guarded or-pattern.
+    pub(super) fn push_alt_range(&mut self, start: u32, end: u32) {
+        self.moves.alt_ranges.push((start, end));
+    }
+
     /// Applies effect `e` of an arm's bindings now, or with `hold` after its guard passed.
     pub(super) fn arm_effect(&mut self, e: Pending, hold: bool) -> Result<(), BuildError> {
         if hold {
@@ -595,18 +617,68 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 Ok(())
             }
             Pending::Moved { expr, x } => self.moved(expr, x),
+            Pending::ClearFlag(x) => {
+                self.set_flag(x, false);
+                Ok(())
+            }
         }
     }
 
     /// An arm's guard passed (`Task::ArmMoves`): the effects its bindings held from `from` on
-    /// are applied in the order they were bound, at the start of its body. A guard's own
-    /// guarded arms held theirs after `from` and applied them first (the work list is a stack).
-    pub(super) fn arm_moves(&mut self, from: u32) -> Result<(), BuildError> {
+    /// are applied in the order they were bound, at the start of its body. For a guarded arm
+    /// whose pattern held or-patterns (`alts`), each expansion's moves are dispatched by
+    /// switching on `alts.word` (the expansion index stored by `test_alts`), then the arm's
+    /// common effects (outer moves and `Own` for every bound name) are applied once. A guard's
+    /// own guarded arms held theirs after `from` and applied them first (the work list is a stack).
+    pub(super) fn arm_moves(&mut self, from: u32, alts: Option<AltMoves>) -> Result<(), BuildError> {
         let from = from as usize;
         if from > self.moves.pending.len() {
             return Err(malformed("an arm's held moves past the list"));
         }
-        for i in from..self.moves.pending.len() {
+        let common_from = if let Some(AltMoves { word, ranges_start, n, common_from }) = alts {
+            let rs = ranges_start as usize;
+            let re = rs.checked_add(n as usize).ok_or(malformed("alt move ranges overflow"))?;
+            if re > self.moves.alt_ranges.len() || (common_from as usize) > self.moves.pending.len() {
+                return Err(malformed("an arm's alt move ranges past the list"));
+            }
+            let any_alt_move = (rs..re).any(|idx| {
+                let (s, e) = self.moves.alt_ranges[idx];
+                s < e
+            });
+            if any_alt_move && n > 0 {
+                let live = self.live;
+                let a = self.b.slot_addr(word);
+                let attrs = self.mem(Repr::Int { ty: Ty::I32, signed: false });
+                let k = self.b.load(Ty::I32, Flags::NONE, a, 0, attrs);
+                let join = self.create();
+                let mut blocks: Vec<blaze_lir::Block, A> = Vec::with_capacity_in(n as usize, self.alloc);
+                for _ in 0..n {
+                    blocks.push(self.create());
+                }
+                let mut cases: Vec<(u128, blaze_lir::Block), A> = Vec::with_capacity_in(n as usize - 1, self.alloc);
+                for j in 0..n - 1 {
+                    cases.push((u128::from(j), blocks[j as usize]));
+                }
+                self.switch(k, blocks[n as usize - 1], &cases);
+                for j in 0..n as usize {
+                    let (s, e) = self.moves.alt_ranges[rs + j];
+                    self.begin(blocks[j]);
+                    self.live = live;
+                    for i in s as usize..e as usize {
+                        let eff = self.moves.pending[i];
+                        self.arm_effect(eff, false)?;
+                    }
+                    self.jump(join, &[]);
+                }
+                self.begin(join);
+                self.live = live;
+            }
+            self.moves.alt_ranges.truncate(rs);
+            common_from as usize
+        } else {
+            from
+        };
+        for i in common_from..self.moves.pending.len() {
             let e = self.moves.pending[i];
             self.arm_effect(e, false)?;
         }

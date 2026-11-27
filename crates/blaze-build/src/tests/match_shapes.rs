@@ -303,27 +303,143 @@ fn constant_patterns_compare_structurally() {
 /// Prints: `test tests::match_shapes::or_pattern_bindings_move_their_part_out ... ok`
 #[test]
 fn or_pattern_bindings_move_their_part_out() {
-    let cases: &[(Scrut, bool, &[i32])] = &[
-        (Scrut::A, false, &[2, 9, 1]),
-        (Scrut::B, false, &[3, 9]),
-        (Scrut::C, false, &[9]),
-        (Scrut::W, false, &[9, 5, 6]),
-        (Scrut::A, true, &[2, 1, 9]),
-        (Scrut::B, true, &[3, 9]),
-        (Scrut::W, true, &[5, 6, 9]),
+    let cases: &[(Scrut, bool, Arms, &[i32])] = &[
+        (Scrut::A, false, Arms::Or, &[2, 9, 1]),
+        (Scrut::B, false, Arms::Or, &[3, 9]),
+        (Scrut::C, false, Arms::Or, &[9]),
+        (Scrut::W, false, Arms::Or, &[9, 5, 6]),
+        (Scrut::A, true, Arms::Or, &[2, 1, 9]),
+        (Scrut::B, true, Arms::Or, &[3, 9]),
+        (Scrut::W, true, Arms::Or, &[5, 6, 9]),
+        // Guarded or-pattern with guard true: exact same per-alternative move-out and drop order!
+        (Scrut::A, false, Arms::OrGuard(true), &[2, 9, 1]),
+        (Scrut::B, false, Arms::OrGuard(true), &[3, 9]),
+        (Scrut::C, false, Arms::OrGuard(true), &[9]),
+        (Scrut::W, false, Arms::OrGuard(true), &[9, 5, 6]),
+        (Scrut::A, true, Arms::OrGuard(true), &[2, 1, 9]),
+        (Scrut::B, true, Arms::OrGuard(true), &[3, 9]),
+        (Scrut::W, true, Arms::OrGuard(true), &[5, 6, 9]),
+        // Guarded or-pattern with guard false: nothing moved out; scrutinee drops intact!
+        (Scrut::A, false, Arms::OrGuard(false), &[9, 1, 2]),
+        (Scrut::B, false, Arms::OrGuard(false), &[9, 3]),
+        (Scrut::A, true, Arms::OrGuard(false), &[1, 2, 9]),
+        (Scrut::B, true, Arms::OrGuard(false), &[3, 9]),
     ];
     let mut failed = String::new();
-    for &(s, temp, want) in cases {
-        match match_drops(s, Arms::Or, temp) {
+    for &(s, temp, arms, want) in cases {
+        match match_drops(s, arms, temp) {
             // Off aarch64 built only (`g_drops`), nothing seen.
-            Ok(seen) if cfg!(target_arch = "aarch64") && seen.as_slice() != want => failed.push_str(&format!("{s:?} temp={temp}: dropped {seen:?}, want {want:?}\n")),
+            Ok(seen) if cfg!(target_arch = "aarch64") && seen.as_slice() != want => failed.push_str(&format!("{s:?} {arms:?} temp={temp}: dropped {seen:?}, want {want:?}\n")),
             Ok(_) => {}
-            Err(e) => failed.push_str(&format!("{s:?} temp={temp}: {e}\n")),
+            Err(e) => failed.push_str(&format!("{s:?} {arms:?} temp={temp}: {e}\n")),
         }
     }
     assert!(failed.is_empty(), "{failed}");
-    let refused = match_drops(Scrut::A, Arms::OrGuard, false).err().unwrap_or_default();
-    assert!(refused.contains("in an or-pattern of a guarded arm"), "{refused}");
+}
+
+/// Constant patterns of slice and reference types (`&[usize]`, `&[u8]`, `&[]`, `&u32`, and
+/// tuples holding `&[usize]`): e.g. `rustls::ExtendedKeyPurpose::for_values` matching
+/// `&[usize]` against `KeyUsage::CLIENT_AUTH_REPR` / `KeyUsage::SERVER_AUTH_REPR`.
+#[test]
+fn slice_and_ref_constant_patterns_compare_pointees() {
+    use crate::data::{DataAlloc, DataRecord, DataReloc, DataTarget};
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], U32);
+    let usize_ty = w.types.intern(PNode::Uint(UintTy::Usize)).expect("intern");
+    let u8_ty = w.types.intern(U8).expect("intern");
+    let u32_ty = w.types.intern(U32).expect("intern");
+    let slice_usize = w.types.intern(PNode::Slice(usize_ty)).expect("intern");
+    let ref_slice_usize = PNode::Ref(Mutbl::Not, slice_usize);
+    let slice_u8 = w.types.intern(PNode::Slice(u8_ty)).expect("intern");
+    let ref_slice_u8 = PNode::Ref(Mutbl::Not, slice_u8);
+    let ref_u32 = PNode::Ref(Mutbl::Not, u32_ty);
+
+    let make_slice_rec = |data: &[u8], len: u64, align: u8| -> DataRecord<Global> {
+        let mut root_bytes = std::vec::Vec::new();
+        root_bytes.extend_from_slice(&0u64.to_le_bytes());
+        root_bytes.extend_from_slice(&len.to_le_bytes());
+        let mut relocs = std::vec::Vec::new();
+        let mut allocs = std::vec::Vec::new();
+        if len > 0 {
+            relocs.push(DataReloc { offset: 0, target: DataTarget::Local(1) });
+            allocs.push(DataAlloc { bytes: root_bytes, align: 3, mutable: false, relocs });
+            let mut elem_bytes = std::vec::Vec::new();
+            elem_bytes.extend_from_slice(data);
+            allocs.push(DataAlloc { bytes: elem_bytes, align, mutable: false, relocs: std::vec::Vec::new() });
+        } else {
+            allocs.push(DataAlloc { bytes: root_bytes, align: 3, mutable: false, relocs });
+        }
+        DataRecord { allocs }
+    };
+    let make_ref_rec = |data: &[u8], align: u8| -> DataRecord<Global> {
+        let mut root_bytes = std::vec::Vec::new();
+        root_bytes.extend_from_slice(&0u64.to_le_bytes());
+        let mut relocs = std::vec::Vec::new();
+        relocs.push(DataReloc { offset: 0, target: DataTarget::Local(1) });
+        let mut elem_bytes = std::vec::Vec::new();
+        elem_bytes.extend_from_slice(data);
+        let mut allocs = std::vec::Vec::new();
+        allocs.push(DataAlloc { bytes: root_bytes, align: 3, mutable: false, relocs });
+        allocs.push(DataAlloc { bytes: elem_bytes, align, mutable: false, relocs: std::vec::Vec::new() });
+        DataRecord { allocs }
+    };
+    let usizes = |xs: &[u64]| -> std::vec::Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+    w.func(200, "CLIENT_AUTH", &[], ref_slice_usize);
+    w.consts.push((ItemKey(200), Some(make_slice_rec(&usizes(&[1, 3, 6, 1]), 4, 3))));
+    w.func(201, "SERVER_AUTH", &[], ref_slice_usize);
+    w.consts.push((ItemKey(201), Some(make_slice_rec(&usizes(&[1, 3, 6, 2]), 4, 3))));
+    w.func(202, "EMPTY_USIZE", &[], ref_slice_usize);
+    w.consts.push((ItemKey(202), Some(make_slice_rec(&[], 0, 3))));
+    w.func(203, "SHORT_USIZE", &[], ref_slice_usize);
+    w.consts.push((ItemKey(203), Some(make_slice_rec(&usizes(&[1, 3]), 2, 3))));
+    w.func(204, "BYTES_OK", &[], ref_slice_u8);
+    w.consts.push((ItemKey(204), Some(make_slice_rec(b"hello", 5, 0))));
+    w.func(205, "BYTES_NO", &[], ref_slice_u8);
+    w.consts.push((ItemKey(205), Some(make_slice_rec(b"world", 5, 0))));
+    w.func(206, "REF_7", &[], ref_u32);
+    w.consts.push((ItemKey(206), Some(make_ref_rec(&7u32.to_le_bytes(), 2))));
+    w.func(207, "REF_8", &[], ref_u32);
+    w.consts.push((ItemKey(207), Some(make_ref_rec(&8u32.to_le_bytes(), 2))));
+
+    let mut b = BodyBuf::new();
+    let mut stmts: Vec<Stmt, Global> = Vec::new_in(Global);
+    let matched = |b: &mut BodyBuf, stmts: &mut Vec<Stmt, Global>, name: &str, scrutinee: &str, pats: &[&str]| -> PatId {
+        let u32_t = b.types.intern(U32).expect("intern");
+        let mut list: Vec<(PatId, ExprId), Global> = Vec::new_in(Global);
+        for (i, &c) in pats.iter().enumerate() {
+            let path = b.path(c);
+            let p = b.pat(Pat::Path(path));
+            let r = b.int(i as u128 + 1, None);
+            list.push((p, r));
+        }
+        let wild = b.pat(Pat::Wild);
+        let r = b.int(pats.len() as u128 + 1, None);
+        list.push((wild, r));
+        let al = arms(b, &list);
+        let s = b.path(scrutinee);
+        let s = b.e(Expr::Path(s));
+        let m = b.e(Expr::Match { scrutinee: s, arms: al });
+        let p = b.bind(name);
+        stmts.push(Stmt::Let { pat: p, ty: Some(u32_t), init: Some(m), else_: None });
+        p
+    };
+    let a = matched(&mut b, &mut stmts, "a", "SERVER_AUTH", &["CLIENT_AUTH", "SERVER_AUTH"]); // 2
+    let c = matched(&mut b, &mut stmts, "c", "SHORT_USIZE", &["CLIENT_AUTH", "EMPTY_USIZE"]); // 3
+    let d = matched(&mut b, &mut stmts, "d", "EMPTY_USIZE", &["CLIENT_AUTH", "EMPTY_USIZE"]); // 2
+    let e = matched(&mut b, &mut stmts, "e", "BYTES_OK", &["BYTES_NO", "BYTES_OK"]);          // 2
+    let f = matched(&mut b, &mut stmts, "f", "REF_8", &["REF_7", "REF_8"]);                   // 2
+    let mut sum = b.local(f);
+    for (x, k) in [(a, 10_000u128), (c, 1_000), (d, 100), (e, 10)] {
+        let x = b.local(x);
+        let k = b.int(k, None);
+        let term = b.bin(BinOp::Mul, x, k);
+        sum = b.bin(BinOp::Add, sum, term);
+    }
+    let root = b.block(&stmts, Some(sum));
+    let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(target_arch = "aarch64")]
+    assert_eq!(run_native(&[(MAIN, &built)]) as u32, 23_222);
+    let _ = built;
 }
 
 /// Matching on `&mut E` or `&&E` with a variant arm and a catch-all identifier arm (`toml::de::
