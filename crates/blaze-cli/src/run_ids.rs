@@ -801,14 +801,39 @@ impl PartialOrd for Edge {
 const MOST_WALKED: usize = 1 << 22;
 
 /// One unit of the checkout as the walk asks its rows (D191): its crate root's `FileItems`
-/// name, its view (engine_body_plan.rs `unit_view`: the one spelling)
-/// and its crate key's prefix, which every key its checks cover begins with. Ordered by root,
-/// so the units of one root (a library and its test build) are one run.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+/// name, its view (engine_body_plan.rs `unit_view`: the one spelling), its crate key's prefix,
+/// which every key its checks cover begins with, and what plan time knows of its `test` cfg atom
+/// (engine_plan_cfg.rs `test_atom`). Ordered by root, so the units of one root (a library and its
+/// test build) are one run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct UnitRoot {
     pub(crate) root: Name,
     pub(crate) view: ViewKey,
     pub(crate) prefix: [u8; 8],
+    pub(crate) test_atom: blaze_expand::Tri,
+}
+
+impl UnitRoot {
+    fn sort_key(&self) -> (Name, ViewKey, [u8; 8], u8) {
+        let atom = match self.test_atom {
+            blaze_expand::Tri::No => 0,
+            blaze_expand::Tri::Yes => 1,
+            blaze_expand::Tri::Unknown => 2,
+        };
+        (self.root, self.view, self.prefix, atom)
+    }
+}
+
+impl Ord for UnitRoot {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.sort_key().cmp(&other.sort_key())
+    }
+}
+
+impl PartialOrd for UnitRoot {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Every member unit of `list` (its root in the checkout, tree 0) as a [`UnitRoot`], in the
@@ -824,7 +849,12 @@ pub(crate) fn unit_roots_scoped<'n, 'a>(list: &CrateList<'n>, scoped: Option<&cr
         let root = list.root(at);
         let Some(path) = root.strip_prefix("/0/") else { return Err(RunIdsError::UnitRootOutside { krate: CrateGraph::name(list, at), root }) };
         let key = list.key(at);
-        units.push(UnitRoot { root: Name::file(path.as_bytes()), view: crate::engine_body_plan::unit_view(list, at), prefix: key.prefix() });
+        units.push(UnitRoot {
+            root: Name::file(path.as_bytes()),
+            view: crate::engine_body_plan::unit_view(list, at),
+            prefix: key.prefix(),
+            test_atom: crate::engine_plan_cfg::test_atom(list, at),
+        });
     }
     Ok(units)
 }
@@ -883,6 +913,198 @@ fn views_of<'a>(edges: &[Edge], units: &[UnitRoot], alloc: Alloc<'a>) -> AVec<'a
     asks.sort_unstable();
     asks.dedup();
     asks
+}
+
+/// Lazily-populated plan-time cfg cut verifier, instantiated ONLY on the rare path where a
+/// `BodyCheck` part has no row in `answer` (zero cost for all normal bodies). Verifies via the
+/// exact same rules as `engine_bodies::plan_views` and `engine_body_plan::reached_under` (using
+/// the one `engine_plan_cfg::cuts_of_view`, rule 30) whether every active unit reaching the body's
+/// file cuts the body at plan time (e.g. `#[cfg(test)]` inside an example target or `#[cfg(any())]`
+/// inside any reached file). Fails closed (`Ok(false)` -> `RunIdsError::NotWalked`) if no unit
+/// reaches the file, any reaching unit does not cut the body, or any outline payload is missing.
+struct CutCache<'a> {
+    alloc: Alloc<'a>,
+    /// Sorted `(child, parent)` for `Edge::Part` where `parent` is `FileItems` and `child` is
+    /// `BodyCheck` or `FileItems`.
+    parents: AVec<'a, (Name, Name)>,
+    /// Decoded `FileItems` cut tables, sorted by `file`.
+    files: AVec<'a, FileCutInfo<'a>>,
+}
+
+struct FileCutInfo<'a> {
+    file: Name,
+    cuts: Option<crate::engine_plan_cfg::FileCuts<'a>>,
+    /// `(BodyCheck name, place)` sorted by `(name, place)`.
+    body_places: AVec<'a, (Name, u32)>,
+    /// `(child FileItems name, place)` sorted by `(name, place)`.
+    file_parts: AVec<'a, (Name, u32)>,
+}
+
+impl<'a> CutCache<'a> {
+    fn new(edges: &[Edge], alloc: Alloc<'a>) -> Self {
+        let mut parents: AVec<'a, (Name, Name)> = Vec::new_in(alloc);
+        for edge in edges.iter().copied() {
+            if let Edge::Part { parent, child } = edge
+                && parent.kind == Kind::FileItems
+                && matches!(child.kind, Kind::BodyCheck | Kind::FileItems)
+            {
+                parents.push((child, parent));
+            }
+        }
+        parents.sort_unstable();
+        parents.dedup();
+        CutCache { alloc, parents, files: Vec::new_in(alloc) }
+    }
+
+    fn parents_of(&self, child: Name) -> impl Iterator<Item = Name> + '_ {
+        let from = self.parents.partition_point(|&(c, _)| c < child);
+        let to = self.parents.partition_point(|&(c, _)| c <= child);
+        self.parents[from..to].iter().map(|&(_, parent)| parent)
+    }
+
+    fn load(&mut self, cx: &Cx, answer: &mut dyn Answer, file: Name) -> Result<usize, RunIdsError<'static>> {
+        if let Ok(idx) = self.files.binary_search_by_key(&file, |info| info.file) {
+            return Ok(idx);
+        }
+        let alloc = self.alloc;
+        let mut body_places: AVec<'a, (Name, u32)> = Vec::new_in(alloc);
+        let mut file_parts: AVec<'a, (Name, u32)> = Vec::new_in(alloc);
+        let mut cuts: Option<crate::engine_plan_cfg::FileCuts<'a>> = None;
+        let known = answer.open(cx, file, &mut |seen| {
+            match seen {
+                Seen::Part(part) => match part.name.kind {
+                    Kind::BodyCheck => body_places.push((part.name, part.place)),
+                    Kind::FileItems if !matches!(part.locate, blaze_drive::Locate::File { edition: blaze_drive::record::DATA_FILE }) => {
+                        file_parts.push((part.name, part.place));
+                    }
+                    _ => {}
+                },
+                Seen::Payload(bytes) => {
+                    if let Ok(view) = blaze_surface::FileItemsView::read(bytes) {
+                        cuts = Some(crate::engine_plan_cfg::cuts_of_view(file, &view, blaze_expand::Edition::E2024, alloc));
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        if !known {
+            cuts = None;
+        }
+        body_places.sort_unstable();
+        body_places.dedup();
+        file_parts.sort_unstable();
+        file_parts.dedup();
+        let slot = self.files.partition_point(|info| info.file < file);
+        self.files.insert_shift(slot, FileCutInfo { file, cuts, body_places, file_parts });
+        Ok(slot)
+    }
+
+    fn unit_reaches(
+        &mut self,
+        cx: &Cx,
+        answer: &mut dyn Answer,
+        root: Name,
+        test_atom: blaze_expand::Tri,
+        target: Name,
+        ancestors: &[Name],
+    ) -> Result<bool, RunIdsError<'static>> {
+        let mut seen: AVec<'a, Name> = Vec::new_in(self.alloc);
+        let mut stack: AVec<'a, Name> = Vec::new_in(self.alloc);
+        let mut outgoing: AVec<'a, (Name, u32)> = Vec::new_in(self.alloc);
+        stack.push(root);
+        while let Some(cur) = stack.pop() {
+            let Err(slot) = seen.binary_search(&cur) else { continue };
+            seen.insert_shift(slot, cur);
+            let idx = self.load(cx, answer, cur)?;
+            if self.files[idx].cuts.as_ref().is_some_and(|c| c.own.cuts(test_atom)) {
+                continue;
+            }
+            if cur == target {
+                return Ok(true);
+            }
+            outgoing.clear();
+            for &(child, place) in self.files[idx].file_parts.iter() {
+                if ancestors.binary_search(&child).is_ok()
+                    && !self.files[idx].cuts.as_ref().is_some_and(|c| c.of(place).cuts(test_atom))
+                {
+                    outgoing.push((child, place));
+                }
+            }
+            for &(child, _) in outgoing.iter() {
+                stack.push(child);
+            }
+        }
+        Ok(false)
+    }
+
+    fn is_body_cut_by_all_reachers(
+        &mut self,
+        cx: &Cx,
+        answer: &mut dyn Answer,
+        units: &[UnitRoot],
+        check: Name,
+    ) -> Result<bool, RunIdsError<'static>> {
+        if units.is_empty() || check.kind != Kind::BodyCheck {
+            return Ok(false);
+        }
+        let mut check_parents: AVec<'a, Name> = Vec::new_in(self.alloc);
+        check_parents.extend(self.parents_of(check));
+        if check_parents.is_empty() {
+            return Ok(false);
+        }
+        let mut body_cuts: AVec<'a, crate::engine_plan_cfg::Cut> = Vec::new_in(self.alloc);
+        let mut ancestors: AVec<'a, Name> = Vec::new_in(self.alloc);
+        let mut queue: AVec<'a, Name> = Vec::new_in(self.alloc);
+        for file in check_parents.iter().copied() {
+            let file_idx = self.load(cx, answer, file)?;
+            body_cuts.clear();
+            {
+                let info = &self.files[file_idx];
+                let Some(cuts) = info.cuts.as_ref() else { return Ok(false) };
+                let from = info.body_places.partition_point(|&(n, _)| n < check);
+                let to = info.body_places.partition_point(|&(n, _)| n <= check);
+                for &(_, place) in &info.body_places[from..to] {
+                    body_cuts.push(cuts.of(place));
+                }
+            }
+            if body_cuts.is_empty() {
+                return Ok(false);
+            }
+            // Fast reject: an entry whose cut holds under all `Tri` values is never plan-time cut.
+            if body_cuts.iter().any(|c| !c.cuts(blaze_expand::Tri::No) && !c.cuts(blaze_expand::Tri::Yes) && !c.cuts(blaze_expand::Tri::Unknown)) {
+                return Ok(false);
+            }
+            ancestors.clear();
+            queue.clear();
+            queue.push(file);
+            while let Some(cur) = queue.pop() {
+                let Err(slot) = ancestors.binary_search(&cur) else { continue };
+                ancestors.insert_shift(slot, cur);
+                for parent in self.parents_of(cur) {
+                    if parent.kind == Kind::FileItems {
+                        queue.push(parent);
+                    }
+                }
+            }
+            let mut any_reached = false;
+            for unit in units.iter().copied() {
+                if ancestors.binary_search(&unit.root).is_err() {
+                    continue;
+                }
+                if !self.unit_reaches(cx, answer, unit.root, unit.test_atom, file, &ancestors)? {
+                    continue;
+                }
+                any_reached = true;
+                if body_cuts.iter().any(|c| !c.cuts(unit.test_atom)) {
+                    return Ok(false);
+                }
+            }
+            if !any_reached {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// THE JOIN (the coordinator's decision, 2026-11-17: "the BodyCheck record lists the checker
@@ -1018,6 +1240,7 @@ pub(crate) fn workspace_of_scoped<'a>(cx: &Cx, answer: &mut dyn Answer, tool: To
     let mut bodies: AVec<'a, WorkspaceBody> = Vec::new_in(alloc);
     let mut facts: AVec<'a, (ContentId, Checked)> = Vec::new_in(alloc);
     let mut carried: Option<AVec<'a, BodyRow>> = None;
+    let mut cut_cache: Option<CutCache<'a>> = None;
     let mut scratch = BodyScratch::new(alloc);
     for check in checks.iter().copied() {
         if let Some(held) = answer.body(cx, check, tool, None, &mut scratch)? {
@@ -1038,6 +1261,16 @@ pub(crate) fn workspace_of_scoped<'a>(cx: &Cx, answer: &mut dyn Answer, tool: To
             // body cut by every active unit reaching its file (e.g. an inline `#[cfg(test)]` fn in
             // a library dependency whose test harness is out of scope). Omitting it here is
             // fail-closed: any call to an unlisted body is refused at runtime (`NotRunnable::NoRow`).
+            continue;
+        }
+        if check.kind == Kind::BodyCheck
+            && cut_cache.get_or_insert_with(|| CutCache::new(&edges, alloc)).is_body_cut_by_all_reachers(cx, answer, units, check)?
+        {
+            // Whole-workspace cfg-aware planning (D191 `plan_views`) also plans zero rows for a
+            // body cut at plan time by every unit reaching its file (e.g. `#[cfg(test)]` inside an
+            // example target or `#[cfg(any())]` inside any reached file). Checked before carrying
+            // from `previous` so a newly cfg-cut body drops stale rows; an unwalked file (`!known`)
+            // fails closed (`Ok(false)`) and carries from `previous` as before.
             continue;
         }
         let Some(previous) = previous else { return Err(RunIdsError::NotWalked { name: check }) };
@@ -1177,6 +1410,7 @@ pub(crate) fn workspace_of_delta<'a>(
     let same_edges = edges.as_slice() == previous.edges;
     let mut bodies: AVec<'a, WorkspaceBody> = Vec::with_capacity_in(previous.bodies.len() / BODY_ROW, alloc);
     let mut facts: AVec<'a, (ContentId, Checked)> = Vec::with_capacity_in(previous.bodies.len() / BODY_ROW, alloc);
+    let mut cut_cache: Option<CutCache<'a>> = None;
     let mut scratch = BodyScratch::new(alloc);
 
     if same_edges {
@@ -1198,6 +1432,11 @@ pub(crate) fn workspace_of_delta<'a>(
                 continue;
             }
             if from == WalkFrom::UnitRoots && check.kind == Kind::BodyCheck {
+                continue;
+            }
+            if check.kind == Kind::BodyCheck
+                && cut_cache.get_or_insert_with(|| CutCache::new(&edges, alloc)).is_body_cut_by_all_reachers(cx, answer, units, check)?
+            {
                 continue;
             }
             return Err(RunIdsError::NotWalked { name: check });
@@ -1257,6 +1496,11 @@ pub(crate) fn workspace_of_delta<'a>(
                 continue;
             }
             if from == WalkFrom::UnitRoots && check.kind == Kind::BodyCheck {
+                continue;
+            }
+            if check.kind == Kind::BodyCheck
+                && cut_cache.get_or_insert_with(|| CutCache::new(&edges, alloc)).is_body_cut_by_all_reachers(cx, answer, units, check)?
+            {
                 continue;
             }
             return Err(RunIdsError::NotWalked { name: check });
@@ -3275,6 +3519,7 @@ mod delta_tests {
             root,
             view: ViewKey::of_member(blaze_drive::view::MemberView::simple(&[byte], b"pkg", is_test)),
             prefix: CrateItemKey(ContentId([byte; 32])).prefix(),
+            test_atom: blaze_expand::Tri::of(is_test),
         }
     }
 

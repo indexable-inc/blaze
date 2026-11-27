@@ -866,7 +866,7 @@ const BIN: u8 = 0x43;
 
 fn unit(byte: u8, root: Name) -> UnitRoot {
     let key = CrateItemKey(ContentId([byte; 32]));
-    UnitRoot { root, view: unit_view(byte), prefix: key.prefix() }
+    UnitRoot { root, view: unit_view(byte), prefix: key.prefix(), test_atom: blaze_expand::Tri::of(byte == LIB_TEST) }
 }
 
 /// The view of the unit `byte` (blaze-drive view.rs `ViewKey::of_member`: its own root, the
