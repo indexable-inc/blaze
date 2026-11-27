@@ -574,10 +574,10 @@ fn every_lease_plant_is_caught_by_its_invariant() {
     controls(Config::cases(128), lease_sim);
 }
 
-/// Runs real concurrent multi-threaded `compare_exchange_weak` / `fetch_and` contention across
-/// multiple 64-bit words with a lock-free atomic ownership oracle:
+/// Runs real concurrent multi-threaded `lease` / `drop` contention across multiple 64-bit words
+/// with a lock-free atomic ownership oracle:
 /// - Phase A (under/at exact bound): total quota across all threads == `callers`, so `CallersTaken`
-///   must NEVER be returned spuriously even under cross-word drop/acquire races.
+///   must NEVER be returned spuriously even when the sole free bit moves backward across words.
 /// - Phase B (over bound): threads contest beyond `callers`, verifying no duplicate live IDs, no
 ///   out-of-bounds IDs, and exact `CallersTaken { most: callers }`.
 /// - Phase C (reclaim): after all threads drop, every one of `callers` slots is re-leasable once
@@ -653,7 +653,7 @@ fn run_concurrent_lease_contention(seed: u64, callers: u32, plant: LeasePlant) -
                         let lease = held.swap_remove(pick);
                         let slot = usize::try_from(lease.id().index() - FIRST).unwrap();
                         // Release oracle slot before dropping lease (synchronized by Lease::drop's
-                        // Release fetch_and -> next lease's Acquire CAS).
+                        // lock release -> next lease's lock acquire).
                         oracle[slot].store(false, Ordering::Release);
                         drop(lease);
                     }
@@ -806,4 +806,44 @@ fn concurrent_multiword_lease_harness_catches_every_planted_bug() {
         let caught = (1u64..=8).any(|seed| run_concurrent_lease_contention(seed, callers, plant).is_err());
         assert!(caught, "concurrent harness failed to catch planted bug {plant:?}");
     }
+}
+
+#[test]
+fn sole_free_bit_churning_across_words_never_falsely_exhausts() {
+    // Hold `callers - 2` leases pinned across words 0..=2 while two threads continuously swap the
+    // remaining 2 slots across word 0 and word 2: total live leases never exceed `callers`, so
+    // neither thread may ever observe spurious `CallersTaken`.
+    const CALLERS: u32 = 130;
+    const FIRST: u32 = 2;
+    let workers = Workers::bare(WorkersSetup {
+        limits: Limits { most_workers: FIRST, callers: CALLERS, most_slots: 0 },
+        seed: None,
+        models: 0,
+    })
+    .expect("workers setup");
+
+    // Lease all 130, then drop bit 0 (word 0) and bit 129 (word 2), keeping 128 pinned.
+    let mut pinned: StdVec<_> = (0..CALLERS).map(|_| workers.lease().expect("initial fill")).collect();
+    let _free_high = pinned.pop().expect("bit 129");
+    let _free_low = pinned.remove(0);
+    drop(_free_high);
+    drop(_free_low);
+
+    let barrier = Barrier::new(2);
+    thread::scope(|scope| {
+        for _ in 0..2 {
+            let workers = &workers;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                for _ in 0..2_000 {
+                    let lease = workers.lease().expect("one of the 2 free slots must always be claimable");
+                    let id = lease.id().index();
+                    assert!(id >= FIRST && id < FIRST + CALLERS, "out-of-bounds id {id}");
+                    drop(lease);
+                }
+            });
+        }
+    });
+    drop(pinned);
 }

@@ -148,10 +148,11 @@ use core::{
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
     ptr::NonNull,
-    sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence},
+    sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering, fence},
     time::Duration,
 };
 
+use blaze_core::lock::Lock;
 use blaze_mem::{Frame, MemError, Region, Tag};
 use blaze_meter::Tally;
 use blaze_own::{
@@ -316,7 +317,7 @@ pub(crate) enum WorkersPlant {
     SlotIndexReused,
     /// A wait returns without charging its time ([`charge_wait`]).
     WaitUncharged,
-    /// Multi-word caller lease skips the final-word mask and capacity cap, handing out bits past
+    /// Multi-word caller lease skips the final-word mask, handing out bits past
     /// [`Limits::callers`].
     CallerFinalMaskSkipped,
     /// Multi-word caller lease drops by clearing word 0 instead of its own word, aliasing a live
@@ -490,10 +491,10 @@ struct Core {
     cells: u32,
     /// Slots registered; sealed by [`Workers::new`].
     slots: u32,
-    /// Caller cells currently leased (`<= setup.limits.callers`).
-    leased: AtomicU32,
-    /// The caller cells leased, one bit each (`MOST_CALLERS` bits across `CALLER_WORDS` words).
-    callers: [AtomicU64; CALLER_WORDS],
+    /// The caller cells leased, one bit each (`MOST_CALLERS` bits across `CALLER_WORDS` words),
+    /// guarded by a named lock so multi-word scan+claim and release are strictly linearizable in
+    /// at most `CALLER_WORDS` iterations; dropped in [`Core::destroy`] before the reservation goes.
+    callers: ManuallyDrop<Lock<[u64; CALLER_WORDS]>>,
     /// Each worker's telemetry cell is made at this level in this allocator; `None`: no cells.
     telemetry: Option<(crate::telemetry::Level, SharedAlloc<'static>)>,
     columns: [MaybeUninit<Column>; MOST_SLOTS as usize],
@@ -605,6 +606,8 @@ impl Core {
                 unsafe { (*cell.own.get()).assume_init_drop() };
             }
         }
+        // SAFETY: dropped once before the reservation is unmapped; no handle or lease remains.
+        unsafe { ManuallyDrop::drop(&mut this.callers) };
         // SAFETY: moved out once; the header is not touched after the region goes.
         let region = unsafe { ManuallyDrop::take(&mut this.region) };
         drop(region);
@@ -651,8 +654,7 @@ impl WorkersOpts {
             setup,
             cells,
             slots: 0,
-            leased: AtomicU32::new(0),
-            callers: [const { AtomicU64::new(0) }; CALLER_WORDS],
+            callers: ManuallyDrop::new(Lock::new("workers.callers", [0u64; CALLER_WORDS])),
             telemetry: None,
             columns: [const { MaybeUninit::uninit() }; MOST_SLOTS as usize],
         };
@@ -828,64 +830,35 @@ impl Workers {
         let core = self.core();
         let callers = core.setup.limits.callers;
         let skip_mask = plant.has(WorkersPlant::CallerFinalMaskSkipped);
-        if !skip_mask {
-            let mut count = core.leased.load(Ordering::Relaxed);
-            loop {
-                if count >= callers {
-                    return Err(WorkersError::CallersTaken { most: callers });
-                }
-                match core.leased.compare_exchange_weak(count, count + 1, Ordering::Acquire, Ordering::Relaxed) {
-                    Ok(_) => break,
-                    Err(now) => count = now,
-                }
+        let mut bitmap = core.callers.lock();
+        let mut base = 0u32;
+        for (word_index, word) in bitmap.iter_mut().enumerate() {
+            let remaining = callers.saturating_sub(base);
+            if remaining == 0 {
+                break;
             }
-        } else {
-            core.leased.fetch_add(1, Ordering::Acquire);
-        }
-
-        // Bounded scan over the bitmap words (rule 18): because `leased` was reserved above and
-        // `Lease::drop` clears its bit before decrementing `leased`, a free bit exists whenever no
-        // bit is leaked; multiple passes handle concurrent drop-in-earlier-word / acquire-in-later-word
-        // interleavings without spurious `CallersTaken`.
-        for _ in 0..MOST_CALLERS {
-            let mut base = 0u32;
-            for (word_index, word) in core.callers.iter().enumerate() {
-                let remaining = callers.saturating_sub(base);
-                if remaining == 0 {
-                    break;
-                }
-                let mask = if skip_mask || remaining >= 64 { u64::MAX } else { (1u64 << remaining) - 1 };
-                let mut seen = word.load(Ordering::Relaxed);
-                loop {
-                    let free = !seen & mask;
-                    if free == 0 {
-                        break;
-                    }
-                    let offset = free.trailing_zeros();
-                    match word.compare_exchange_weak(seen, seen | (1u64 << offset), Ordering::Acquire, Ordering::Relaxed) {
-                        Ok(_) => {
-                            let clear_word = if plant.has(WorkersPlant::CallerBitLeaked) {
-                                CALLER_WORDS
-                            } else if plant.has(WorkersPlant::CallerDropWrongWord) {
-                                0
-                            } else {
-                                word_index
-                            };
-                            return Ok(Lease {
-                                workers: self.share(),
-                                word: clear_word,
-                                offset,
-                                id: WorkerId(core.first_caller() + base + offset),
-                            });
-                        }
-                        Err(now) => seen = now,
-                    }
-                }
-                base += 64;
+            let mask = if skip_mask || remaining >= 64 { u64::MAX } else { (1u64 << remaining) - 1 };
+            let free = !*word & mask;
+            if free != 0 {
+                let offset = free.trailing_zeros();
+                *word |= 1u64 << offset;
+                drop(bitmap);
+                let clear_word = if plant.has(WorkersPlant::CallerBitLeaked) {
+                    CALLER_WORDS
+                } else if plant.has(WorkersPlant::CallerDropWrongWord) {
+                    0
+                } else {
+                    word_index
+                };
+                return Ok(Lease {
+                    workers: self.share(),
+                    word: clear_word,
+                    offset,
+                    id: WorkerId(core.first_caller() + base + offset),
+                });
             }
-            core::hint::spin_loop();
+            base += 64;
         }
-        core.leased.fetch_sub(1, Ordering::Release);
         Err(WorkersError::CallersTaken { most: callers })
     }
 
@@ -1038,11 +1011,10 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let core = self.workers.core();
-        if let Some(word) = core.callers.get(self.word) {
-            word.fetch_and(!(1u64 << self.offset), Ordering::Release);
+        let mut bitmap = self.workers.core().callers.lock();
+        if let Some(word) = bitmap.get_mut(self.word) {
+            *word &= !(1u64 << self.offset);
         }
-        core.leased.fetch_sub(1, Ordering::Release);
     }
 }
 
