@@ -12,7 +12,7 @@
 use blaze_own::{Alloc, Vec};
 
 use crate::body::{BodyPath, IntSuffix, Lit, Segment};
-use crate::diag::{About, At, DiagCode};
+use crate::diag::{About, At, DiagCode, PendingDiag};
 use crate::error::{CheckError, Malformed, Stop};
 use crate::ids::{ExprId, ItemKey, Mutbl, Name, PathIdx, ScopeId};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
@@ -23,6 +23,17 @@ use crate::world::{AssocKind, CtorKind, Def, FnSig, PathRes, Shape, World};
 
 /// The segment `Self` (`Name::of`, as the world spells every name).
 const SELF_NAME: Name = Name::of("Self");
+
+/// Whether an inherent impl applies to a type-relative path's self type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InherentMatch {
+    /// The impl's self type does not unify with `self_ty`.
+    NoMatch,
+    /// The impl's self type unifies, but at least one impl where-clause is decided false.
+    UnmetClause,
+    /// The impl's self type unifies and all impl where-clauses hold or may hold.
+    Match,
+}
 
 /// Why a body path has no definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -855,8 +866,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // `#[unstable(feature = "allocator_ext", implied_by = "allocator_api")]` inherent fn is
         // left out, and the in-scope `TursoVecInExt::try_with_capacity_in` is the pick.
         let mut left_out = false;
+        let mut first_unmet: Option<ItemKey> = None;
         if let Some(shape) = nominal
-            && let Some(t) = self.inherent_value(at, cause, self_ty, seg, shape, true, &mut left_out)?
+            && let Some(t) = self.inherent_value(at, cause, self_ty, seg, shape, true, &mut left_out, &mut first_unmet)?
         {
             return Ok(t);
         }
@@ -910,9 +922,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // items change, and only when the first left one out.
         if left_out
             && let Some(shape) = nominal
-            && let Some(t) = self.inherent_value(at, cause, self_ty, seg, shape, false, &mut left_out)?
+            && let Some(t) = self.inherent_value(at, cause, self_ty, seg, shape, false, &mut left_out, &mut first_unmet)?
         {
             return Ok(t);
+        }
+        if let Some(imp) = first_unmet
+            && let Some(args) = self.impl_args(imp, self_ty, Cause::Body)?
+            && let Some(goal) = self.first_unmet_impl_clause(imp, args)?
+        {
+            self.errors += 1;
+            self.diags.push(PendingDiag::unmet(DiagCode::NoMethod, at, Some(self_ty), goal, None).with_name(Some(seg.name)));
+            return Ok(self.common.err);
         }
         self.diag(DiagCode::NoMethod, at, About::found_named(self_ty, seg.name));
         Ok(self.common.err)
@@ -922,6 +942,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// two is E0034 (the error, then `Some`); none, `None`. With `stable_only`, an applicable
     /// item unstable under a feature this crate does not turn on ([`World::member_unstable`])
     /// is not counted, and `left_out` is set (rustc's first pass, `consider_candidates`).
+    /// An inherent impl whose where-clause is decided false is dropped (matching rustc's
+    /// `probe_for_name` in `Mode::Path` and [`Machine::impl_clauses_may_hold`]) so other inherent
+    /// impls or in-scope trait items (e.g. `SyncP::<T>::YES` over `NoSync::YES`) can apply; the
+    /// first dropped impl is recorded in `first_unmet` for E0599's bound diagnostic if nothing
+    /// else matches.
     #[allow(clippy::too_many_arguments)]
     fn inherent_value(
         &mut self,
@@ -932,6 +957,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         shape: Shape,
         stable_only: bool,
         left_out: &mut bool,
+        first_unmet: &mut Option<ItemKey>,
     ) -> Result<Option<Ty>, Stop> {
         let cands = self.reads.inherent(shape, seg.name)?;
         let mut found: Option<(ItemKey, ItemKey, AssocKind)> = None;
@@ -941,14 +967,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             if cands[..i].iter().any(|c| c.item == cand.item) {
                 continue;
             }
-            if self.impl_applies(cand.container, self_ty)? {
-                if stable_only && self.reads.member_unstable(cand.container, seg.name)? {
-                    *left_out = true;
+            match self.impl_applies_clauses(cand.container, self_ty)? {
+                InherentMatch::NoMatch => continue,
+                InherentMatch::UnmetClause => {
+                    first_unmet.get_or_insert(cand.container);
                     continue;
                 }
-                count += 1;
-                if found.is_none() {
-                    found = Some((cand.container, cand.item, cand.kind));
+                InherentMatch::Match => {
+                    if stable_only && self.reads.member_unstable(cand.container, seg.name)? {
+                        *left_out = true;
+                        continue;
+                    }
+                    count += 1;
+                    if found.is_none() {
+                        found = Some((cand.container, cand.item, cand.kind));
+                    }
                 }
             }
         }
@@ -1044,10 +1077,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         self.concat(self_list, rest)
     }
 
-    /// Whether `imp`'s self type can be `self_ty`, in a probe.
-    pub(crate) fn impl_applies(&mut self, imp: ItemKey, self_ty: Ty) -> Result<bool, Stop> {
+    /// Whether `imp`'s self type can be `self_ty` and its where-clauses may hold, in a probe.
+    fn impl_applies_clauses(&mut self, imp: ItemKey, self_ty: Ty) -> Result<InherentMatch, Stop> {
         // A probe: rolled back, so its obligations' cause reaches no diagnostic.
-        Ok(self.probe(|m| m.impl_args(imp, self_ty, Cause::Body))?.is_some())
+        self.probe(|m| {
+            let Some(args) = m.impl_args(imp, self_ty, Cause::Body)? else {
+                return Ok(InherentMatch::NoMatch);
+            };
+            if !m.impl_clauses_may_hold(imp, args, Cause::Body)? {
+                return Ok(InherentMatch::UnmetClause);
+            }
+            Ok(InherentMatch::Match)
+        })
     }
 
     /// The value type of an associated item given its parent's arguments.

@@ -465,7 +465,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     ///   of an ambiguous group, and the body is "not checked: <the gap>" (a note), never an
     ///   error and never a quiet drop. A candidate whose `self` does not match is never asked,
     ///   so the right pick beside it stands (suite/inherent_impl_clauses.rs, `r` and `s`).
-    fn impl_clauses_may_hold(&mut self, imp: ItemKey, args: TyList, cause: Cause) -> Result<bool, Stop> {
+    pub(super) fn impl_clauses_may_hold(&mut self, imp: ItemKey, args: TyList, cause: Cause) -> Result<bool, Stop> {
         let wc = self.reads.predicates(imp)?;
         for &clause in wc.clauses.iter() {
             let Some(goal) = self.clause_goal(wc.types, clause, args, cause)? else { continue };
@@ -474,6 +474,25 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         Ok(true)
+    }
+
+    /// The first where-clause of `imp` (instantiated at `args`) that cannot hold, as a
+    /// `PendingGoal` for E0599's unmet-bound diagnostic. Runs outside a probe so the goal's terms
+    /// stay in the table for writeback.
+    pub(super) fn first_unmet_impl_clause(&mut self, imp: ItemKey, args: TyList) -> Result<Option<PendingGoal>, Stop> {
+        let wc = self.reads.predicates(imp)?;
+        for &clause in wc.clauses.iter() {
+            let Some(goal) = self.clause_goal(wc.types, clause, args, Cause::Body)? else { continue };
+            if !self.ty.may_hold(goal, &mut self.reads)? {
+                return Ok(match goal {
+                    Goal::Trait { trait_, args } => Some(PendingGoal::Trait { trait_, args }),
+                    Goal::Projection { trait_, args, name, term } => Some(PendingGoal::Projection { trait_, args, name, term }),
+                    // A well-formedness, `where const`, or `for<F in fields(..)>` clause: no trait goal to name.
+                    Goal::WellFormed(_) | Goal::ConstHolds { .. } | Goal::ForFields { .. } => None,
+                });
+            }
+        }
+        Ok(None)
     }
 
     /// The first where-clause of inherent candidate `c`'s impl that cannot hold, with its
@@ -493,19 +512,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if !self.unify(self_in, adjusted)? {
             return Ok(None);
         }
-        let wc = self.reads.predicates(c.container)?;
-        for &clause in wc.clauses.iter() {
-            let Some(goal) = self.clause_goal(wc.types, clause, parent, Cause::Body)? else { continue };
-            if !self.ty.may_hold(goal, &mut self.reads)? {
-                return Ok(match goal {
-                    Goal::Trait { trait_, args } => Some(PendingGoal::Trait { trait_, args }),
-                    Goal::Projection { trait_, args, name, term } => Some(PendingGoal::Projection { trait_, args, name, term }),
-                    // A well-formedness, `where const`, or `for<F in fields(..)>` clause: no trait goal to name.
-                    Goal::WellFormed(_) | Goal::ConstHolds { .. } | Goal::ForFields { .. } => None,
-                });
-            }
-        }
-        Ok(None)
+        self.first_unmet_impl_clause(c.container, parent)
     }
 
     /// `ConfirmContext::confirm`: the inputs after `self` and the output.
