@@ -1164,7 +1164,7 @@ mod tests {
 
         let mut input = lex("x > 0", Edition::E2021, Alloc::global()).expect("the input lexes");
         let site = DefSite { krate: crate::hook::crate_key("m"), module: None };
-        let mark = Mark { of: MarkOf::This, transparency: Transparency::SemiOpaque, edition: Edition::E2021, site };
+        let mark = Mark { of: MarkOf::This, transparency: Transparency::SemiOpaque, edition: Edition::E2021, site, local_inner: false };
         let made = input.context(CtxNode { parent: Ctx::root(Edition::E2021), mark }).expect("a context");
         input.ident("y", made).expect("a made token");
         let file = Ok("crates/core/src/lib.rs");
