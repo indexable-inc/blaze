@@ -659,6 +659,19 @@ impl QueryCache {
     }
 }
 
+/// Recorded first refusal of `ensure_one` for a key so a speculative failure (`compute_poly_summary`,
+/// `verify_instance`) or repeated demand never calls `check_one` a second time (AGENTS.md: no
+/// retries; propagate the original refusal).
+enum FailedEnsure {
+    /// Original typed refusal captured from a speculative `try_ensure`, ready to be returned
+    /// verbatim on the first non-speculative `ensure`.
+    Pending(RunError),
+    /// Original refusal already returned to a non-speculative caller; its rendered message and
+    /// scope are retained so any further demand on a shared `MakerState` still reports the
+    /// original failure without re-invoking `check_one`.
+    Reported(blaze_own::AString<'static>, crate::scope::Scope),
+}
+
 /// Cross-instance state of a [`MakerState`], kept disjoint from [`MakerState::fn_frame`] so
 /// per-function scratch borrowed from `fn_frame` never conflicts with `&mut MakerCore` methods
 /// (`ensure`, `pull_constants`, etc.) while the borrow checker statically guarantees nothing
@@ -666,6 +679,8 @@ impl QueryCache {
 struct MakerCore {
     /// Each fn key asked of `check_one`: the fn's index, `None` when it had no body.
     asked: blaze_hash::Map<ItemKey, Option<usize>, blaze_hash::FixedState, Alloc<'static>>,
+    /// First refusal of `ensure_one` per failing key, never retried.
+    failed: blaze_hash::Map<ItemKey, FailedEnsure, blaze_hash::FixedState, Alloc<'static>>,
     /// Fn `i`'s checked body, `None` until asked (or with none): what [`Bodies`] reads.
     checked: AVec<'static, Option<Checked<'static>>>,
     tables: Option<Tables>,
@@ -825,6 +840,7 @@ impl MakerState {
         };
         let core = MakerCore {
             asked: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
+            failed: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
             checked: blaze_own::Vec::new_in(alloc),
             tables: Some(tables),
             work,
@@ -985,11 +1001,70 @@ impl MakerCore {
         }
     }
 
-    /// [`MakerState::ensure`] of one key, owners not followed.
-    fn ensure_one<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
-        if let Some(&at) = self.asked.get(&key) {
-            return Ok(at);
+    /// Speculative [`Self::ensure`] used where a refusal must not immediately fail the root
+    /// caller (`compute_poly_summary`, `verify_instance`). Records the first refusal under the
+    /// failing key so any subsequent non-speculative [`Self::ensure`] replays that exact refusal
+    /// without calling `check_one` a second time.
+    fn try_ensure<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount, scratch: Alloc<'_>) -> Result<Option<usize>, ()> {
+        /// The most closure owners one ensure follows (rule 18).
+        const MOST_OWNERS: usize = 4096;
+        let first = self.try_ensure_one(program, typing, key, checks)?;
+        let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(scratch);
+        self.owners_named(&*program, key, &mut todo);
+        let mut steps = 0;
+        while let Some(owner) = todo.pop() {
+            if self.asked.contains_key(&owner) {
+                continue;
+            }
+            steps += 1;
+            if steps > MOST_OWNERS {
+                self.failed.insert(
+                    owner,
+                    FailedEnsure::Pending(RunError::OneBody {
+                        key,
+                        why: "more closure owners named than the most one ensure follows",
+                    }),
+                );
+                return Err(());
+            }
+            self.try_ensure_one(program, typing, owner, checks)?;
+            self.owners_named(&*program, owner, &mut todo);
         }
+        Ok(first)
+    }
+
+    fn record_reported_failure(&mut self, key: ItemKey, err: &RunError) {
+        let mut msg = blaze_own::String::new_in(self.work.alloc);
+        let _ = core::fmt::write(&mut msg, format_args!("{err}"));
+        self.failed.insert(key, FailedEnsure::Reported(msg, err.scope()));
+    }
+
+    fn take_prior_failure(&mut self, key: ItemKey) -> Option<RunError> {
+        let entry = self.failed.get_mut(&key)?;
+        match entry {
+            FailedEnsure::Pending(_) => {
+                let mut msg = blaze_own::String::new_in(self.work.alloc);
+                let mut scope = crate::scope::Scope::One;
+                if let FailedEnsure::Pending(err) = entry {
+                    let _ = core::fmt::write(&mut msg, format_args!("{err}"));
+                    scope = err.scope();
+                }
+                match core::mem::replace(entry, FailedEnsure::Reported(msg, scope)) {
+                    FailedEnsure::Pending(err) => Some(err),
+                    FailedEnsure::Reported(..) => None,
+                }
+            }
+            FailedEnsure::Reported(msg, scope) => Some(RunError::PriorEnsureFailure {
+                key,
+                first: msg.as_str().into(),
+                scope: *scope,
+            }),
+        }
+    }
+
+    /// Runs the one-shot `ensure_one` body for `key`, assuming `key` is neither in `self.asked`
+    /// nor in `self.failed`.
+    fn ensure_one_fresh<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
         // A ctor has no body to check: its row is made, and its instance built as a fn
         // ([`build_one`]'s ctor arm).
         // The trait's `Clone::clone` has no body either: the one instance tabled at it is a
@@ -1022,6 +1097,44 @@ impl MakerCore {
         };
         self.asked.insert(key, at);
         Ok(at)
+    }
+
+    /// [`MakerState::ensure`] of one key, owners not followed.
+    ///
+    /// Never calls `check_one` twice for the same key: if an earlier speculative `try_ensure`
+    /// refused `key`, replays that original refusal directly instead of retrying.
+    fn ensure_one<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
+        if let Some(&at) = self.asked.get(&key) {
+            return Ok(at);
+        }
+        if let Some(err) = self.take_prior_failure(key) {
+            return Err(err);
+        }
+        match self.ensure_one_fresh(program, typing, key, checks) {
+            Ok(at) => Ok(at),
+            Err(err) => {
+                self.record_reported_failure(key, &err);
+                Err(err)
+            }
+        }
+    }
+
+    /// Speculative [`Self::ensure_one`]: records the first refusal in `self.failed` and returns
+    /// `Err(())` without propagating it immediately or retrying on subsequent calls.
+    fn try_ensure_one<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, ()> {
+        if let Some(&at) = self.asked.get(&key) {
+            return Ok(at);
+        }
+        if self.failed.contains_key(&key) {
+            return Err(());
+        }
+        match self.ensure_one_fresh(program, typing, key, checks) {
+            Ok(at) => Ok(at),
+            Err(err) => {
+                self.failed.insert(key, FailedEnsure::Pending(err));
+                Err(())
+            }
+        }
     }
 
     /// Stores `done` at row `i` and refreshes the closure and coroutine tables if the body
@@ -2291,7 +2404,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     // An opaque type's hidden type is its defining fn's check's (coroutines.rs `opaque_hidden`);
     // a required trait fn's RPITIT has no body and needs only its signature row (`head_row`).
     for &owner in owners.iter() {
-        match core.ensure(program, typing, owner, checks, fn_alloc) {
+        match core.try_ensure(program, typing, owner, checks, fn_alloc) {
             Ok(Some(_)) => {}
             Ok(None) => {
                 let Ok(Some(row)) = program.head_row(owner) else {
@@ -2301,7 +2414,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                     *entry = Some(row);
                 }
             }
-            Err(_) => return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner }),
+            Err(()) => return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner }),
         }
     }
     // Ensure opaque definers, closure owners, object tables, and fn heads referenced in any
@@ -2317,7 +2430,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
             for &opaque in missing_opaques.iter() {
                 if matches!(program.opaque_head(opaque), Ok(true))
                     && let Some(Ok(owner)) = program.opaque_definer(opaque)
-                    && core.ensure(program, typing, owner, checks, fn_alloc).is_err()
+                    && core.try_ensure(program, typing, owner, checks, fn_alloc).is_err()
                 {
                     return Ok(Verdict::Stale { kind: ReadKind::TrackCaller, item: tabled });
                 }
@@ -2333,7 +2446,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 }
             }
             for &owner in track_owners.iter() {
-                if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                if core.try_ensure(program, typing, owner, checks, fn_alloc).is_err() {
                     return Ok(Verdict::Stale { kind: ReadKind::TrackCaller, item: tabled });
                 }
             }
@@ -2360,7 +2473,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 if matches!(program.opaque_head(opaque), Ok(true))
                     && let Some(Ok(owner)) = program.opaque_definer(opaque)
                 {
-                    if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                    if core.try_ensure(program, typing, owner, checks, fn_alloc).is_err() {
                         return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
                     }
                 }
@@ -2376,7 +2489,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 }
             }
             for &owner in need_owners.iter() {
-                if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                if core.try_ensure(program, typing, owner, checks, fn_alloc).is_err() {
                     return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
                 }
             }
@@ -2407,7 +2520,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                     | BuildError::CoroutineOwnerUnchecked { owner, .. },
                 ) if rounds < crate::front2::check::MOST_ROUNDS => {
                     rounds += 1;
-                    if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                    if core.try_ensure(program, typing, owner, checks, fn_alloc).is_err() {
                         return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
                     }
                 }
@@ -2445,7 +2558,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 break;
             }
             Ok(super::lay_states::Relaid::Unchecked(owner)) => {
-                if lays > MOST_HELD_COROUTINES || core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                if lays > MOST_HELD_COROUTINES || core.try_ensure(program, typing, owner, checks, fn_alloc).is_err() {
                     return Ok(stale);
                 }
             }
@@ -3344,12 +3457,13 @@ fn compute_poly_summary<P: FrontEnd, T: Typing<P>>(
         if Some(key) == drop_in_place || program.ctor_of(key).is_some() || program.intrinsic(key).is_some() {
             continue;
         }
-        let row = match core.ensure(program, typing, key, checks, fn_alloc) {
+        let row = match core.try_ensure(program, typing, key, checks, fn_alloc) {
             Ok(Some(c)) => c,
             Ok(None) => continue,
-            Err(_) => {
+            Err(()) => {
                 // Uncheckable callee (e.g. cold lib error or workspace check error): keep concrete
-                // here so the root caller still compiles and `Walk` handles the callee's own error.
+                // here so the root caller still compiles and `Walk` replays the callee's recorded
+                // first refusal if reachable.
                 had_ensure_err = true;
                 continue;
             }
@@ -4914,5 +5028,113 @@ mod ask_progress_tests {
 
         let half = make_binary(Ty::F16, Op::Fadd);
         assert!(func_needs_soft_float(&half.view()), "f16 arithmetic must trigger lazy compiler_builtins lookup");
+    }
+
+    #[test]
+    fn speculative_ensure_records_and_replays_first_refusal_without_retry() {
+        use super::{CheckCount, MakerState, Typing, TypingCounts};
+        use crate::crates::{Inputs, Toolchain};
+        use crate::front2::keys::checker_of;
+        use crate::front2::program::Front2Refusal;
+        use crate::front2::program::lazy::{LazyProgram, LazyRefusal};
+        use crate::refusal::SourceFile;
+        use crate::run::OverflowChecks;
+        use crate::seam::FrontEnd;
+        use blaze_emit::{Isa, Os};
+        use blaze_scope::names::{self, Written};
+        use blaze_surface::{Namespace, PathKind};
+        use blaze_typeck::Checked;
+
+        const SRC: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+const BAD: i32 = 1 / 0;
+
+fn bad_fn() -> i32 {
+    BAD
+}
+
+fn main() -> i32 {
+    0
+}
+";
+        struct CountingTyping {
+            check_one_calls: usize,
+        }
+        impl<P: FrontEnd> Typing<P> for CountingTyping {
+            fn check_one(&mut self, program: &mut P, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
+                self.check_one_calls += 1;
+                program.check_one(key)
+            }
+            fn counts(&self) -> Option<TypingCounts> {
+                None
+            }
+        }
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let files = [SourceFile { path: "src/main.rs", text: SRC }];
+        let tc = Toolchain::none(alloc);
+        let new = crate::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: OverflowChecks::On };
+        let texts = crate::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
+            .unwrap_or_else(|e| panic!("texts: {e}"));
+        let user = texts.user();
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("inputs: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
+        let value_key = |name: &'static str| {
+            let segments: &[&str] = &[name];
+            let written = Written { kind: PathKind::Plain, segments };
+            let found = names::path(&names, names.root(0), Namespace::Values, written, alloc).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
+            checker_of(found.whole(1).unwrap_or_else(|| panic!("`{name}` whole")).key)
+        };
+        let main_key = value_key("main");
+        let bad_key = value_key("bad_fn");
+
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let mut lazy = LazyProgram::new(&names, &frame, &files, Some(main_key), alloc).unwrap_or_else(|e| panic!("lazy: {e}"));
+        let mut state = MakerState::new(
+            &lazy,
+            main_key,
+            Isa { lse: true, os: Os::MacOs },
+            OverflowChecks::Off,
+            blaze_build::UbChecks::Off,
+            blaze_build::Panic::Unwind,
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("maker state: {e}"));
+        let mut typing = CountingTyping { check_one_calls: 0 };
+        let mut checks = CheckCount::default();
+
+        // 1. Speculative `try_ensure` invokes `check_one` once, records the refusal, and does not propagate it.
+        assert!(state.core.try_ensure(&mut lazy, &mut typing, bad_key, &mut checks, alloc).is_err());
+        assert_eq!(typing.check_one_calls, 1, "first speculative ensure calls check_one once");
+
+        // 2. A second speculative `try_ensure` short-circuits with zero retry.
+        assert!(state.core.try_ensure(&mut lazy, &mut typing, bad_key, &mut checks, alloc).is_err());
+        assert_eq!(typing.check_one_calls, 1, "second speculative ensure must not retry check_one");
+
+        // 3. First non-speculative `ensure` replays the exact original typed refusal with zero retry.
+        let first_err = state.ensure(&mut lazy, &mut typing, bad_key, &mut checks).expect_err("non-speculative ensure must replay recorded refusal");
+        assert_eq!(typing.check_one_calls, 1, "non-speculative ensure must not call check_one a second time");
+        assert!(
+            matches!(first_err, RunError::Front2(Front2Refusal::Lazy(LazyRefusal::Const { .. }))),
+            "expected original LazyRefusal::Const, got: {first_err}"
+        );
+        let first_shown = std::format!("{first_err}");
+
+        // 4. Any further non-speculative `ensure` on a shared MakerState still replays the original refusal with zero retry.
+        let second_err = state.ensure(&mut lazy, &mut typing, bad_key, &mut checks).expect_err("repeated ensure must still fail");
+        assert_eq!(typing.check_one_calls, 1, "repeated ensure must never retry check_one");
+        assert!(
+            matches!(second_err, RunError::PriorEnsureFailure { key, .. } if key == bad_key),
+            "expected PriorEnsureFailure, got: {second_err}"
+        );
+        assert_eq!(std::format!("{second_err}"), first_shown, "replayed message must preserve the original refusal verbatim");
     }
 }

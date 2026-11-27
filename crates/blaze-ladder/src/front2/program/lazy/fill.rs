@@ -73,7 +73,6 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             }
             Err(error) => return Err(LazyRefusal::Lower { function, error }),
         };
-        let checked_here = matches!(typer, Typer::Check);
         let checked = match typer {
             Typer::Check => {
                 let checked = if made.typeck.inline_fors.is_empty() {
@@ -89,7 +88,9 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                     let mut r = self.records(true);
                     crate::front2::inline_for::unroll_concrete_body(&mut r, prepared, &mut made)
                 };
-                checked.map_err(|error| self.check_refusal(&function, error))?
+                let checked = checked.map_err(|error| self.check_refusal(&function, error))?;
+                self.counts.checked += 1;
+                checked
             }
             // Read, not checked: `counts.checked` stays as it is (a run from records checks no
             // body, and the count says so).
@@ -110,25 +111,9 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             }
         };
         let i = self.row(key, false)?;
-        self.table_body_facts(i, key, made, &checked, &function)?;
-        if checked_here {
-            self.counts.checked += 1;
-        }
         self.rows.checked[i] = true;
+        self.table_body_facts(i, key, made, &checked, &function)?;
         Ok(Some((i, checked)))
-    }
-
-    /// Undoes the row-level commit of [`Self::check_one_key_by`] when a post-table step
-    /// (`check_one_by`'s `bind_internal`) refuses, so a later retry reports the underlying
-    /// refusal instead of [`LazyRefusal::AskedTwice`] and reuses the released live slot cleanly.
-    pub(super) fn rollback_checked_row(&mut self, i: usize, checked_here: bool) {
-        self.done_row(i);
-        if let Some(flag) = self.rows.checked.get_mut(i) {
-            *flag = false;
-        }
-        if checked_here {
-            self.counts.checked = self.counts.checked.saturating_sub(1);
-        }
     }
 
     /// Tables everything the build of row `i`'s checked body asks the `&self` seam getters
@@ -229,21 +214,13 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             return Ok(None);
         };
         let spec_i = self.push_specialized_row(orig_i, spec.spec_key, &function)?;
-        self.table_body_facts(spec_i, orig_key, spec.body, &spec.checked, &function)?;
         if let Some(flag) = self.rows.checked.get_mut(spec_i) {
             *flag = true;
         }
         self.counts.checked += 1;
+        self.table_body_facts(spec_i, orig_key, spec.body, &spec.checked, &function)?;
         self.inline_for_specs.push(crate::front2::inline_for::SpecRow { orig: orig_key, args: spec.args, row: spec_i });
         Ok(Some((spec_i, orig_key, spec.checked)))
-    }
-
-    /// Undoes [`Self::specialize_inline_for_row`]'s commit when `bind_internal` refuses.
-    pub(super) fn rollback_specialized_row(&mut self, spec_i: usize) {
-        if self.inline_for_specs.last().is_some_and(|s| s.row == spec_i) {
-            let _ = self.inline_for_specs.pop();
-        }
-        self.rollback_checked_row(spec_i, true);
     }
 
     fn push_specialized_row(&mut self, orig_i: usize, spec_key: ItemKey, function: &str) -> Result<usize, LazyRefusal> {
@@ -827,7 +804,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     fn adt_rows(&mut self, checked: &Checked<'static>) -> Result<(), LazyRefusal> {
         for round in 0.. {
             let mut missing: AVec<'_, ItemKey> = AVec::new_in(self.alloc);
-            let scanned = {
+            {
                 let store_view = self.store.tys.view();
                 let total = store_view.len();
                 let start = self.adt_scanned_tys.min(total);
@@ -838,8 +815,8 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                         missing.push(*k);
                     }
                 }
-                total
-            };
+                self.adt_scanned_tys = total;
+            }
             if round == 0 {
                 for n in checked.types.view().nodes() {
                     if let tc::PNode::Adt(k, _) = n
@@ -851,10 +828,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             }
             missing.sort_unstable();
             missing.dedup();
-            let Some(&first) = missing.first() else {
-                self.adt_scanned_tys = scanned;
-                break;
-            };
+            let Some(&first) = missing.first() else { break };
             if round == super::super::super::reach::MOST_FNS {
                 return Err(LazyRefusal::Adt { adt: self.refused_shown(first), why: Box::from("rows still missing after the most rounds") });
             }
@@ -865,7 +839,6 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 };
                 self.adt_row(lib, k)?;
             }
-            self.adt_scanned_tys = scanned;
         }
         Ok(())
     }
@@ -1242,7 +1215,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// were checked before it (D194: a `dyn` only an instance's ground arguments hold).
     fn body_objects(&mut self, checked: &Checked<'static>, function: &str) -> Result<(), LazyRefusal> {
         let mut asked: Vec<ItemKey, Global> = Vec::new_in(Global);
-        let scanned = {
+        {
             let store_view = self.store.tys.view();
             let total = store_view.len();
             let start = self.object_scanned_tys.min(total);
@@ -1253,8 +1226,8 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                     asked.push(k);
                 }
             }
-            total
-        };
+            self.object_scanned_tys = total;
+        }
         let body_view = checked.types.view();
         for n in body_view.nodes() {
             if let tc::PNode::Dynamic(l) = *n
@@ -1266,9 +1239,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         asked.sort_unstable();
         asked.dedup();
         asked.reverse();
-        self.objects_made(asked, function)?;
-        self.object_scanned_tys = scanned;
-        Ok(())
+        self.objects_made(asked, function)
     }
 
     /// The seam's `object_table`: trait `t`'s table and every supertrait's under it, made from
