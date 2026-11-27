@@ -3,7 +3,7 @@
  * (wrangler.jsonc `run_worker_first: true`): an old host or the bare base is redirected, the base is taken off the
  * path, and then, by site path:
  *
- *   /          the home page (the intro), or install.sh for a client that doesn't ask for HTML (curl, wget)
+ *   /          the home page (the front door, a scroll page), or install.sh for a client that doesn't ask for HTML (curl, wget)
  *   /usage     a 301 to /start: its content moved into lesson 1
  *   /latest.json   blaze's newest releases and its yanked ones, from the RELEASES bucket (docs/release.md), which
  *              every blaze daemon reads every few minutes with If-None-Match

@@ -20,8 +20,6 @@
  *   done something.
  * - On by default; the lesson's top bar has the switch (`blaze.sound`). All storage is wrapped, since it can be
  *   missing.
- * - The intro's soundtrack (client/lib/intro-sound.ts) shares the switch, the context and the output (`unlock`), so
- *   the site has one of each.
  *
  * Under client/lib/ (not bundled as an entry).
  */

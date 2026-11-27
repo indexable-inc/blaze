@@ -1,112 +1,302 @@
-/* The intro, the site's front door (a `Hero` page: render.rs writes it without the sidebar; client/intro.ts runs it).
-   The wordmark big in the window, then one line, the proof of it (a race, measured), the way in, and what else is
-   built. One screen, no scroll. Near-black, quiet: the fire is the only colour on the page. */
+/* The front door, / (a `Hero` page, content/site.flecs; render.rs writes `<main class="doc intro">` with the h1 and the
+   page's blocks in `.intro-after`; client/intro.ts runs it). A scroll page in seven scenes: the hero, then each
+   Section pinned (position: sticky) while the scroll scrubs its picture. Near-black, calm, big type, one idea a screen;
+   the fire is the one colour.
 
-body.front { min-height: 100svh; }
-main.intro { position: relative; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: clamp(14px, 2.4svh, 26px); max-width: none; min-height: 100svh; margin: 0; padding: 20px 16px 24px; text-align: center; overflow: hidden; }
+   Three forms, each saying the same:
+   - no JS: the blocks in order, the hero first; every Section a plain block of heading, sentence and code;
+   - JS, motion reduced: the same, each scene with its picture drawn still at the moment that tells it;
+   - JS: `main.intro[data-on]`; each Section `.scene`, its blocks moved into `.pin` (sticky, a window tall) with a
+     `.stage` the picture is drawn in, the section `--len` tall so the scroll has room to scrub it. Motion is
+     transform and opacity only, from `--p` (0 to 1, the scene's progress) that intro.ts sets per frame, or from CSS
+     scroll-driven animations where the browser has them. */
 
-/* The wordmark's frame: the letters with room for their flames, 43 by 23 cells (the brand picture's own shape, which
-   is what shows without JS). intro.ts sizes it to a whole number of device pixels a cell and draws on the canvas,
-   which runs twelve rows above the frame, for the letters to fall through. */
-.wordmark { position: relative; flex: none; width: min(86vw, 40svh * 688 / 368, 946px); aspect-ratio: 688 / 368; margin: 0; line-height: 0; }
-.wordmark .logo, .wordmark .logo img { display: block; width: 100%; height: 100%; }
-.wordmark .logo img { margin: 0; border-radius: 0; box-shadow: none; background: none; image-rendering: pixelated; }
-.wordmark canvas { position: absolute; left: 0; top: 0; display: none; image-rendering: pixelated; pointer-events: none; }
-main.intro[data-on] .wordmark { aspect-ratio: auto; }
-main.intro[data-on] .wordmark .logo { display: none; }
-main.intro[data-on] .wordmark canvas { display: block; }
+body.front {
+	--l-bg: #050506;
+	--l-ink: #f5f4f0;
+	--l-ink-2: #a9a8a4;
+	--l-ink-3: #7d7c77;
+	--l-line: #232325;
+	--l-card: #0d0d0f;
+	--l-fire: #ff5a1f;
+	--l-fire-2: #ffb36b;
+	min-height: 100svh;
+	background: var(--l-bg);
+	color: var(--l-ink-2);
+}
+@media (prefers-color-scheme: light) {
+	body.front {
+		--l-bg: #f6f5f1;
+		--l-ink: #121213;
+		--l-ink-2: #4c4c50;
+		--l-ink-3: #6e6d71;
+		--l-line: #dcdbd5;
+		--l-card: #ffffff;
+		--l-fire: #c4360f;
+		--l-fire-2: #ad4a12;
+	}
+}
 
-/* Under the word: what blaze is, the race, the way in, what else is built, and the reference pages, quietly. */
-.intro-after { display: grid; justify-items: center; gap: clamp(14px, 2.2svh, 22px); width: 100%; max-width: 100%; }
-.doc.intro .lede { max-width: 46em; margin: 0; font-size: clamp(17px, 1.9vw, 20px); line-height: 1.45; letter-spacing: -0.015em; color: var(--ink-1); text-wrap: balance; }
-.doc.intro .dim { margin: 0; font-size: 13.5px; color: var(--ink-3); }
-.doc.intro .dim a { color: var(--ink-2); text-decoration-color: transparent; }
-.doc.intro .dim a:hover { color: var(--ink-1); text-decoration-color: currentColor; }
-/* The last quiet line is the page's footer: the reference pages, at the bottom of the window, not under the button. */
-.doc.intro .intro-after > .dim:last-child { position: absolute; left: 0; right: 0; bottom: 18px; }
+main.intro {
+	position: relative;
+	isolation: isolate;
+	display: grid;
+	grid-template-columns: 1fr 1fr;
+	column-gap: 12px;
+	justify-items: center;
+	max-width: none;
+	margin: 0;
+	padding: 0 16px;
+	text-align: center;
+	color: var(--l-ink-2);
+}
+.intro-after { display: contents; }
+main.intro > *, .intro-after > * { grid-column: 1 / -1; }
+.doc.intro strong { color: var(--l-ink); }
+.doc.intro a { color: var(--l-ink); }
 
-/* A race (content/schema.flecs Race; render.rs): blaze and cargo building the same edit, two terminals side by side,
-   each with its clock. intro.ts types the commands and prints each line at the moment it was measured to. */
-.race { display: grid; gap: 10px; width: min(100%, 860px); margin: 0; }
-.race .terms { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-@media (max-width: 640px) { .race .terms { grid-template-columns: 1fr; } }
-.race .term { overflow: hidden; border-radius: 12px; background: var(--s-tint); box-shadow: inset 0 0 0 1px var(--line); text-align: left; }
-.race .term.blaze { box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fire) 45%, transparent); }
-.race .bar { display: flex; align-items: baseline; justify-content: space-between; padding: 8px 14px; border-bottom: 1px solid var(--line); }
-.race .who { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink-3); }
-.race .blaze .who { color: var(--fire); }
-.race .took { font-size: 13px; color: var(--ink-3); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.race .took b { font-size: 22px; font-weight: 600; letter-spacing: -0.03em; color: var(--ink-2); }
-.race .blaze .took b { color: var(--ink-1); }
-.race .blaze .took.done b { color: var(--fire); }
-.race pre { min-height: 7.2em; margin: 0; padding: 12px 14px 14px; background: none; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55; color: var(--ink-2); white-space: pre-wrap; word-break: break-word; }
-.race .ps { color: var(--ink-3); }
-.race .typed { color: var(--ink-1); }
-.race .st { font-weight: 600; color: #3fb950; }
-.race .st.cy { color: #39c5cf; }
-.race .fill { color: #39c5cf; font-weight: 800; }
-.race .rest { color: var(--line-2); }
-.race .caret { display: inline-block; width: 0.6em; height: 1.1em; margin-left: 1px; vertical-align: -0.2em; background: var(--ink-3); opacity: 0; }
-.race .caret.on { opacity: 0.8; }
-.race figcaption { font-size: 12.5px; line-height: 1.45; color: var(--ink-3); }
-.doc .race figcaption a { color: var(--ink-3); text-decoration-color: transparent; }
-.doc .race figcaption a:hover { color: var(--ink-1); text-decoration-color: currentColor; }
+/* The hero's still light, where the shader (intro.ts, WebGL) does not run: a warm glow under the word. */
+main.intro::before {
+	content: '';
+	position: absolute;
+	z-index: -1;
+	inset: 0 0 auto;
+	height: 100svh;
+	background: radial-gradient(60% 46% at 50% 92%, color-mix(in srgb, var(--l-fire) 22%, transparent), transparent 70%);
+	pointer-events: none;
+}
+main.intro[data-glow]::before { display: none; }
+.glow { position: fixed; z-index: -1; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 
-/* Chips (content/schema.flecs): small links to lessons, each with its lesson's glyph and, when the lesson's band of
-   the course has one, its tag (Experimental), so nothing unsettled reads as finished. */
-.doc .chips { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin: 0; padding: 0; list-style: none; }
-.doc .chips li { margin: 0; }
-.doc a.chip { display: inline-flex; align-items: center; gap: 7px; height: 32px; padding: 0 12px 0 9px; border-radius: 999px; box-shadow: inset 0 0 0 1px var(--line-2); color: var(--ink-2); font-size: 13.5px; text-decoration: none; white-space: nowrap; transition: color 0.12s, background-color 0.12s; }
-.doc a.chip:hover { background: var(--s-tint); color: var(--ink-1); }
-.chip-glyph { flex: none; width: 16px; height: 16px; color: var(--ink-3); }
-.chip-glyph .glyph { display: block; width: 100%; height: 100%; }
-.chip .tag { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); }
+/* 1. The hero: the word, one line, two small actions, a scroll cue. */
+.wordmark { margin: 0; padding-top: max(22svh, 96px); line-height: 0.82; }
+.wordmark .logo, .wordmark canvas { display: none; }
+.front .wordmark .sr {
+	position: static;
+	width: auto;
+	height: auto;
+	margin: 0;
+	overflow: visible;
+	clip: auto;
+	white-space: normal;
+	font-size: clamp(92px, 23vw, 300px);
+	font-weight: 700;
+	letter-spacing: -0.06em;
+	color: var(--l-ink);
+}
+.doc.intro :is(.intro-after, .hero) > .lede {
+	max-width: 22em;
+	margin: clamp(18px, 3.4svh, 34px) 0 clamp(22px, 4svh, 38px);
+	font-size: clamp(19px, 2.3vw, 27px);
+	line-height: 1.3;
+	letter-spacing: -0.022em;
+	color: var(--l-ink-2);
+	text-wrap: balance;
+}
+.intro-after > .lede + .go, .hero > .lede + .go { grid-column: 1; justify-self: end; }
+.intro-after > .go + .go, .hero > .go + .go { grid-column: 2; justify-self: start; }
+/* With JS the hero's blocks are gathered in one screen-tall box, so the first scene starts below the fold. */
+.hero { display: grid; grid-template-columns: 1fr auto auto 1fr; column-gap: 12px; justify-items: center; align-content: center; min-height: 100svh; padding-bottom: 8svh; }
+.hero > * { grid-column: 1 / -1; }
+.hero > .wordmark { padding-top: 0; }
+.hero > .lede + .go { grid-column: 2; }
+.hero > .go + .go { grid-column: 3; }
 
-/* Go: a page's one big button, a link (content/schema.flecs). */
+/* Go: the two actions, small. The first is filled, the second an outline. */
 .doc .go { margin: 0; }
-.doc .go a { display: inline-flex; align-items: center; justify-content: center; gap: 8px; height: 52px; padding: 0 28px; border-radius: 14px; background: var(--ink-1); color: var(--bg); font-size: 16.5px; font-weight: 600; letter-spacing: -0.01em; text-decoration: none; transition: opacity 0.15s, transform 0.1s; }
+.doc .go a {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	height: 44px;
+	padding: 0 20px;
+	border-radius: 999px;
+	background: var(--l-ink, var(--ink-1));
+	color: var(--l-bg, var(--bg));
+	font-size: 15px;
+	font-weight: 600;
+	letter-spacing: -0.01em;
+	text-decoration: none;
+	transition: opacity 0.15s;
+}
 .doc .go a::after { content: '→'; }
-.doc .go a:hover { opacity: 0.9; }
-.doc .go a:active { transform: scale(0.985); }
-.doc .go a:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 3px; }
+.doc .go a:hover { opacity: 0.86; }
+.doc .go a:focus-visible { outline: 2px solid var(--l-ink); outline-offset: 3px; }
+.doc.intro .go + .go a { background: none; color: var(--l-ink); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--l-ink) 32%, transparent); }
+.doc.intro .go + .go a::after { content: none; }
 
-/* The speaker (intro.ts makes it): the intro again, with its soundtrack. Lit while the sound is on. */
-.intro-snd { position: absolute; top: 14px; right: 14px; display: grid; place-items: center; width: 36px; height: 36px; padding: 0; border: 0; border-radius: 10px; background: none; color: var(--ink-3); cursor: pointer; transition: color 0.12s, background-color 0.12s; }
-.intro-snd .icon { width: 18px; height: 18px; }
-.intro-snd:hover { background: var(--s-tint); color: var(--ink-1); }
-.intro-snd[data-state='on'] { color: var(--fire); }
-.intro-snd[data-state='wait'] { color: var(--ink-1); cursor: progress; }
-.intro-snd:focus-visible { outline: 2px solid var(--ink-1); outline-offset: 1px; }
-
-/* The line and the button wait for the word to catch. A module runs after the page is parsed, so until intro.ts
-   starts the still picture and the text are held back, not flashed; if the script never comes they show after 1.5 s.
-   With motion reduced nothing waits. */
-@media (scripting: enabled) and (prefers-reduced-motion: no-preference) {
-	main.intro:not([data-on]) :is(.wordmark .logo, .intro-after) { animation: intro-hold 0s 1.5s both; }
-	main.intro[data-on] .intro-after { transition: opacity 0.6s ease-out, visibility 0s; }
-	main.intro[data-on]:not([data-lit]) .intro-after { opacity: 0; visibility: hidden; transition: none; }
+/* The scroll cue: a short line at the bottom of the first screen, a light running down it. */
+main.intro::after {
+	content: '';
+	position: absolute;
+	top: calc(100svh - 64px);
+	left: calc(50% - 0.5px);
+	width: 1px;
+	height: 40px;
+	background: linear-gradient(var(--l-ink-3), transparent);
+	opacity: 0.7;
 }
-@keyframes intro-hold {
-	from { visibility: hidden; }
-	to { visibility: visible; }
+@media (prefers-reduced-motion: no-preference) {
+	main.intro::after { background: linear-gradient(transparent 0 30%, var(--l-ink) 45%, transparent 60%) 0 0 / 100% 300% no-repeat, linear-gradient(color-mix(in srgb, var(--l-ink-3) 60%, transparent), transparent); animation: cue 2.4s cubic-bezier(0.6, 0, 0.4, 1) infinite; }
 }
-
-@media (max-width: 520px) {
-	.doc .go a { height: 50px; }
-	.doc.intro .dim { font-size: 13.5px; }
-}
-/* A short window (a phone on its side): everything closes up, and the chips go, so the word, the line, the race and
-   the button fit in it. */
-@media (max-height: 480px) {
-	main.intro { gap: 8px; padding-block: 8px; }
-	.intro-after { gap: 8px; }
-	.doc.intro .lede { max-width: none; font-size: 16px; }
-	.race { gap: 2px; }
-	.race .took b { font-size: 19px; }
-	.doc .go a { height: 40px; }
-	.doc .chips { display: none; }
+@keyframes cue {
+	from { background-position: 0 100%, 0 0; }
+	to { background-position: 0 -50%, 0 0; }
 }
 
-/* The exit (client/lib/burn.ts): the fire that burns the page away on Start, over everything. */
-.intro-old { position: fixed; z-index: 49; inset: 0; overflow: hidden; pointer-events: none; }
-.intro-burn { position: fixed; z-index: 50; top: 0; left: 0; image-rendering: pixelated; pointer-events: none; }
+/* The bar: the name and the ways in, along the top. Static without JS; with it, it shows once the hero is gone. */
+.doc.intro .intro-after > p.dim:not(.lede) {
+	position: fixed;
+	z-index: 10;
+	top: 0;
+	left: 0;
+	right: 0;
+	display: flex;
+	align-items: center;
+	gap: 22px;
+	height: 48px;
+	margin: 0;
+	padding: 0 max(16px, calc(50vw - 520px));
+	background: color-mix(in srgb, var(--l-bg) 72%, transparent);
+	-webkit-backdrop-filter: saturate(1.6) blur(18px);
+	backdrop-filter: saturate(1.6) blur(18px);
+	box-shadow: inset 0 -1px 0 color-mix(in srgb, var(--l-line) 70%, transparent);
+	font-size: 13px;
+	transition: opacity 0.25s, transform 0.25s;
+}
+.doc.intro .intro-after > p.dim:not(.lede) a { color: var(--l-ink-2); text-decoration: none; }
+.doc.intro .intro-after > p.dim:not(.lede) a:hover { color: var(--l-ink); }
+.doc.intro .intro-after > p.dim:not(.lede) a:first-child { margin-right: auto; color: var(--l-ink); font-size: 16px; font-weight: 700; letter-spacing: -0.04em; }
+main.intro[data-on]:not([data-bar]) .intro-after > p.dim:not(.lede) { opacity: 0; transform: translateY(-100%); pointer-events: none; }
+
+/* A scene, as a plain block (no JS, or before intro.ts runs): a headline, a sentence, its code. */
+.doc.intro section {
+	width: 100%;
+	max-width: 1080px;
+	margin: clamp(120px, 22svh, 220px) 0 0;
+	scroll-margin-top: 48px;
+}
+.doc.intro section h2 {
+	margin: 0 auto;
+	max-width: 14em;
+	font-size: clamp(40px, 7.4vw, 96px);
+	font-weight: 700;
+	line-height: 1;
+	letter-spacing: -0.05em;
+	color: var(--l-ink);
+	text-wrap: balance;
+}
+.doc.intro section h2 a.hash { color: inherit; text-decoration: none; }
+.doc.intro section > p, .doc.intro .copy > p {
+	max-width: 34em;
+	margin: clamp(16px, 2.6svh, 26px) auto 0;
+	font-size: clamp(17px, 1.75vw, 21px);
+	line-height: 1.45;
+	letter-spacing: -0.016em;
+	text-wrap: balance;
+}
+.doc.intro section .dim { max-width: 46em; margin: 12px auto 0; font-size: 13px; line-height: 1.5; color: var(--l-ink-3); text-wrap: pretty; }
+.doc.intro section .dim a { color: var(--l-ink-2); text-decoration-color: color-mix(in srgb, var(--l-ink-3) 50%, transparent); }
+.doc.intro section h3 { margin: 40px auto 0; font-size: 13px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--l-fire); }
+.doc.intro section .codeblock, .doc.intro section .cmd { max-width: 760px; margin: 16px auto 0; text-align: left; background: var(--l-card); box-shadow: inset 0 0 0 1px var(--l-line); border-radius: 16px; }
+.doc.intro section .codeblock pre { padding: 18px 20px; font-size: 14px; line-height: 1.65; }
+.doc.intro section .codeblock pre[data-lang=''] { font-size: 12.5px; line-height: 1.5; }
+.doc.intro section .cmd { max-width: 520px; margin-top: 36px; }
+.doc.intro section#begin { display: flex; flex-flow: row wrap; justify-content: center; align-content: center; gap: 0 12px; min-height: 100svh; margin: 0; padding: 64px 0 48px; }
+#begin > :not(.go) { flex: 0 0 100%; }
+#begin > .go { margin-top: 28px; }
+#begin > .cmd { box-sizing: border-box; min-width: 0; max-width: min(520px, 100%); overflow: hidden; }
+#begin > .dim:last-child { margin-top: 56px; }
+
+/* The scenes, pinned (intro.ts adds the classes; none of this applies without it). */
+.doc.intro section.scene { position: relative; height: var(--len, 300svh); margin: 0; max-width: none; }
+.scene > .pin {
+	position: sticky;
+	top: 0;
+	display: grid;
+	grid-template-rows: auto minmax(0, 1fr);
+	height: 100svh;
+	padding: clamp(72px, 13svh, 128px) 16px clamp(16px, 4svh, 40px);
+	overflow: hidden;
+}
+.scene .copy { position: relative; z-index: 1; }
+.scene .stage { position: relative; display: grid; place-items: center; min-height: 0; margin-top: clamp(12px, 3svh, 32px); }
+.scene .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+.scene .copy > :is(h2, p, .dim) { transform: translateY(calc((1 - var(--in, 1)) * 28px)); opacity: var(--in, 1); }
+
+/* Text comes in as its scene comes in: CSS scroll-driven where the browser has it, else intro.ts sets --in. */
+@supports (animation-timeline: view()) {
+	@media (prefers-reduced-motion: no-preference) {
+		.scene .copy > :is(h2, p, .dim) { animation: rise linear both; animation-timeline: --scene; animation-range: entry 10% entry 90%; }
+		.doc.intro section.scene { view-timeline: --scene block; }
+	}
+}
+@keyframes rise {
+	from { opacity: 0; transform: translateY(28px); }
+	to { opacity: 1; transform: none; }
+}
+
+/* 2. The edit loop: an editor line, then two lanes on one time scale. */
+.loop { display: grid; gap: clamp(14px, 3svh, 28px); width: min(100%, 880px); text-align: left; }
+.loop .ed { padding: 14px 18px; border-radius: 14px; background: var(--l-card); box-shadow: inset 0 0 0 1px var(--l-line); font-family: var(--font-mono); font-size: clamp(12px, 1.4vw, 14.5px); line-height: 1.6; color: var(--l-ink-3); white-space: pre; overflow: hidden; }
+.loop .ed .ln { color: var(--l-ink-2); }
+.loop .ed .ins { color: var(--l-fire-2); }
+.loop .ed .caret { display: inline-block; width: 2px; height: 1.15em; margin-left: 1px; vertical-align: -0.2em; background: var(--l-fire); }
+.loop .lanes { display: grid; gap: 14px; }
+.loop .lane { display: grid; grid-template-columns: 76px minmax(0, 1fr) 92px; align-items: center; gap: 14px; }
+.loop .who { font-family: var(--font-mono); font-size: 13px; color: var(--l-ink-3); }
+.loop .lane.b .who { color: var(--l-fire); }
+.loop .track { position: relative; height: 10px; border-radius: 99px; background: color-mix(in srgb, var(--l-ink) 8%, transparent); overflow: hidden; }
+.loop .fill { position: absolute; inset: 0; border-radius: 99px; background: var(--l-ink-3); transform-origin: 0 50%; transform: scaleX(0); }
+.loop .lane.b .fill { background: var(--l-fire); }
+.loop .t { font-size: clamp(18px, 2.2vw, 26px); font-weight: 650; letter-spacing: -0.03em; text-align: right; font-variant-numeric: tabular-nums; color: var(--l-ink-3); }
+.loop .done .t { color: var(--l-ink); }
+.loop .lane.b.done .t { color: var(--l-fire); }
+.loop .x { justify-self: center; font-size: clamp(56px, 10vw, 128px); font-weight: 700; letter-spacing: -0.06em; line-height: 1; color: var(--l-ink); font-variant-numeric: tabular-nums; }
+.loop .x small { display: block; margin-top: 6px; font-size: 13px; font-weight: 500; letter-spacing: 0; color: var(--l-ink-3); text-align: center; }
+@media (max-width: 560px) {
+	.loop .lane { grid-template-columns: 54px minmax(0, 1fr) 72px; gap: 10px; }
+	.loop .who { font-size: 12px; }
+}
+
+/* 4. The code: one card, its lines moving between the steps; the step's name and line over it. */
+.morph { display: grid; grid-template-rows: auto minmax(0, 1fr); gap: 14px; width: min(100%, 780px); height: 100%; text-align: left; }
+.morph .cap { display: grid; text-align: center; }
+.morph .cap > div { grid-area: 1 / 1; }
+.morph .cap b { display: block; font-size: 12.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--l-fire); }
+.morph .cap span { display: block; margin-top: 4px; font-size: clamp(14px, 1.5vw, 16.5px); color: var(--l-ink-2); }
+.morph .card { position: relative; align-self: start; contain: layout paint; border-radius: 18px; background: var(--l-card); box-shadow: inset 0 0 0 1px var(--l-line), 0 30px 80px -40px color-mix(in srgb, var(--l-fire) 30%, transparent); overflow: hidden; }
+.morph .line { position: absolute; left: 0; top: 0; padding: 0 22px; font-family: var(--font-mono); font-size: var(--fs, 14px); line-height: var(--lh, 24px); white-space: pre; color: var(--code-ink); will-change: transform, opacity; }
+.morph .line.add { color: inherit; }
+.morph .line .hl { position: absolute; inset: 0 -4px; z-index: -1; border-radius: 4px; background: color-mix(in srgb, var(--l-fire) 14%, transparent); }
+.morph .term { color: var(--l-ink-2); }
+.morph .term .e { color: #ff7b72; font-weight: 700; }
+.morph .term .g { color: #79c0ff; }
+.morph .term .u { color: #ff7b72; }
+.morph .term .h { color: #7ee2a8; font-weight: 600; }
+.morph .term .c { color: #79c0ff; text-decoration: underline; }
+@media (prefers-color-scheme: light) {
+	.morph .term .e, .morph .term .u { color: #cf222e; }
+	.morph .term .g, .morph .term .c { color: #0b5fc4; }
+	.morph .term .h { color: #0a7d4f; }
+}
+
+.morph .tag { position: absolute; top: 12px; right: 16px; z-index: 1; font-family: var(--font-mono); font-size: 11.5px; letter-spacing: 0.04em; color: var(--l-ink-3); }
+
+/* What a picture is made from (the superset's steps): read by screen readers, shown by the picture. */
+.scene > .kept { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+/* Under reduced motion nothing is pinned: each scene is a block, its picture drawn still; the superset shows its
+   steps as they are written instead of the moving card. */
+@media (prefers-reduced-motion: reduce) {
+	.doc.intro section.scene { height: auto; padding-bottom: 8svh; }
+	.scene > .pin { position: relative; height: auto; min-height: 0; overflow: visible; }
+	.scene .stage { height: min(62svh, 520px); }
+	#superset .stage { display: none; }
+	.scene > .kept { position: static; width: auto; height: auto; overflow: visible; clip: auto; white-space: normal; padding: 0 16px; }
+}
+
+@media (max-width: 560px) {
+	.doc.intro section .codeblock pre { font-size: 12px; padding: 14px; }
+	.doc.intro .intro-after > p.dim:not(.lede) { gap: 16px; }
+}

@@ -1,6 +1,6 @@
 /**
- * The random numbers the intro's sounds are made of (client/lib/fire-sound.ts, intro-track.ts, intro-soundtrack.ts):
- * one seed, a stream per layer, as anim's fire has it.
+ * Seeded random numbers (the front door's galaxy, client/lib/scene-galaxy.ts): one seed, a stream per use, so a
+ * picture made from them is the same on every load.
  *
  * Under client/lib/ (not bundled as an entry).
  */

@@ -1,6 +1,6 @@
 // The site's pages. Each page is an entity under `site`; its path is its URL (site.index is /).
-// The whole site is one course. Its front door, /, is the intro: the wordmark dropping in and catching fire, one line
-// and the way in. Lesson 1 is /start (what blaze is, installing it, the first build), the course map is /learn
+// The whole site is one course. Its front door, /, is a scroll page of what blaze is, in seven scenes, with the way
+// into the course at its top and its end. Lesson 1 is /start (what blaze is, installing it, the first build), the course map is /learn
 // (learn.flecs), the other lessons are in learn/, the updates in updates.flecs and updates/.
 // Reference pages (install details, benchmarks, the charter, RFCs) sit beside it in the sidebar (nav.flecs).
 site {
@@ -14,28 +14,158 @@ site {
   learn {}
   updates {}
 
-  // The front door: the wordmark, live (client/intro.ts), then what blaze is in one line, the proof of it, and the way
-  // into the course, and as little text as that takes (Andrew, 2026-11-12: "less text and more clear it is an
-  // alternative to cargo build"). No sidebar here, so the last line is the way to the course map and the reference pages.
+  // The front door, /: a scroll page in seven scenes (Andrew, 2026-11-16: "before you get to the course it should be
+  // some almost Apple-looking thing where you scroll and see blaze and how cool it is"). The course is one click away,
+  // /learn. A `Hero` page: no sidebar; client/intro.ts pins each Section as a scene and draws its picture, which is
+  // decoration (aria-hidden) over the headings, sentences and code written here. Without JS, or under reduced
+  // motion, the page is these blocks in order. A few words a scene: a headline and one sentence.
+  //
+  // Every claim here, and where it comes from (a doc whose front matter says `current`, unless noted). Keep the two
+  // in step: a sentence changes with its source.
+  //
+  // - Lede: AGENTS.md:4, "blaze is a Rust compiler and build tool for one thing: the shortest time from an edit to its
+  //   result" (the project's statement of what it is for: an aim, said as one).
+  // - edit: docs/benchmarks.md:81 (Linux aarch64, "helix 25.07.1 | 6.84 s → **82 ms** (83x)", edit a function),
+  //   :36 ("incremental `cargo build` → `blaze build`, both warm, same linker, Cranelift, the median of each run's
+  //   edits"), :55 ("pinned to 16 cores ... on 2026-10-23, median of 5 edits"), :15-16 ("Every number on this page is
+  //   blaze v1's ... No run of v2 has been published"), :34 ("All projects (geometric mean): macOS arm64 10× faster,
+  //   Linux aarch64 24× faster, Linux x86-64 11× faster"). client/intro.ts reads the two times from the <strong>s of
+  //   `edit.says` and draws them to scale.
+  // - grain: docs/usage.md:26, "From then on, an edit builds only what it changed"; docs/terminal.md:56-57, "An edit's
+  //   line names the functions recompiled".
+  // - superset: docs/usage.md:115-116, "Stable code and `#![feature(...)]` code both build"; docs/const.md:65-66,
+  //   extensions are "each opt-in by name", "v2 has neither yet". Capabilities: docs/cargo.md:1870, "A package of the
+  //   blaze edition ... a `main(cx: &Cx, io: Io)`"; "the edition becomes the default when blaze ships bstd";
+  //   docs/v2/plan/invariants.md:326 (`a_withheld_capability_is_missing_and_named`: "its `need_` form is `Ok` then
+  //   and otherwise a `Missing` naming it"); the code is docs/v2/plan/design/std.md:31-35 (a plan: the spelling).
+  //   Parameters (2026-11-16; these three docs as in the compiler lanes' tree that day, not yet on main):
+  //   docs/v2/plan/design/extensions.md:191-192 ("on bstd an effect is a value you are handed (an allocator, `Io` or
+  //   a narrower capability, `&Cx` for a wait)"), :204 ("The earlier decision of one effect row spelled `expect(..)`
+  //   is withdrawn"); docs/v2/plan/design/std.md:1851 (the blaze edition: "Rust's `std` has no name in the crate ...
+  //   So `std::fs`, `std::env`, `println!` and the rest of Rust std's ambient authority are not reachable by any
+  //   path", built); docs/v2/plan/design/run.md:310-312 ("Capabilities are values ... a library ... reaches only
+  //   what a caller hands it"). The code's spellings: std.md:31-46 (`Dir<ReadOnly>`, `path!`,
+  //   `Vec::new_in(cx.frame())`), :1508 (`read_all(into)`); all three are plans. Reflection: docs/const.md:87-94
+  //   ("`#![feature(blaze_comptime)]` ... `for const f in core::reflect::fields_of::<T>()` ... v2 has none of it
+  //   yet"); the code is docs/v2/plan/design/comptime.md:21-28 (a plan). The error: blaze-screen's golden rendering,
+  //   crates/blaze-screen/tests/golden/fail-80x24.txt (not a doc), and docs/terminal.md:20 (a failure: "the
+  //   diagnostics, then `✗ run failed in 0.14s · 1 error in hello (bin) · blaze explain hello`"). Linear values are
+  //   left out: no current doc says they exist (hir-ty-linear is parked).
+  // - sandbox: docs/cargo.md:706-707 ("Every build script ... is compiled by blaze and runs in the sandbox"),
+  //   :735-738 ("The machine is read-only; it writes its `OUT_DIR` ... there is no network but the sandbox's own
+  //   loopback"), :939-940 ("Every build runs its proc macros as `wasm32-wasip1` modules under Wasmtime").
+  // - shared: docs/gc.md:8-12 ("one standard library store ... shared by every daemon of the machine");
+  //   docs/cargo.md:714-716 ("the run is kept in the store by its code, what it was given and what it read ... so a
+  //   command whose inputs to it are as they were finds it there and runs nothing").
+  // - begin: docs/install.md:8 (the command), :21-22 ("macOS on Apple silicon, or Linux on x86-64 or ARM64");
+  //   releases: `gh release list` on 2026-11-16, every release a pre-release (canary), the newest v0.20261105.4;
+  //   docs/release.md:9-14 (canary is a GitHub prerelease); docs/v2/plan/parked.md:7-8 (the item layer and the
+  //   daemon deleted on 2026-11-15 "to be rebuilt from scratch").
+  //
+  // Not said, for want of a current doc: a shared cache across machines (CI filling it, std arriving precompiled from
+  // it: docs/remote-cache.md is a plan), "nothing leaves the machine unless you opt in", linear values, and any v2
+  // build time.
   index : Page {
     Hero
     Title: {"blaze"}
-    Tab: {"blaze: Rust that rebuilds in milliseconds"}
-    Description: {"blaze is a faster cargo build: the same Rust projects and commands, with an edit rebuilt in milliseconds."}
+    Tab: {"blaze: from an edit to its result"}
+    Description: {"blaze is a Rust compiler and build tool for one thing: the shortest time from an edit to its result."}
 
-    // The numbers are not written here: the build reads them from docs/benchmarks/history (gen/bench/race.ts), the
-    // latest Linux x86-64 run that timed this edit under both. On 2026-11-12 that is linux-x86-64.jsonl's run of
-    // 2026-10-22 (commit 2cf189feb6, AWS c7a.48xlarge pinned to 16 cores, median of 5 edits): helix 25.07.1 with
-    // LLVM, `body` (edit one function, then build), blaze 0.110 s, cargo 3.084 s. helix because its wait is long enough
-    // to see in real time (Andrew, 2026-11-12: ripgrep's 69 ms against 787 ms was "too fast to really see"); LLVM
-    // because it is cargo's default. Across that run's nine projects the same edit is 6x to 34x faster under blaze on
-    // eight, and slower on one, bevy (11.2 s against 3.8 s), which /bench shows. docs/benchmarks.md says every
-    // published number is blaze v1's, so `of` says v1; it and the run's day are in the figure's title.
-    Race race(dir: "docs/benchmarks/history", platform: "Linux x86-64", project: "helix/llvm", edit: "body", of: "blaze v1", more: "/bench")
+    Lede line("A Rust compiler for one thing: the shortest time from an edit to its result.")
+    Go course(label: "Take the course", href: "/learn")
+    Go install(label: "Install", href: "/install")
+    // The bar along the top: always there, quiet; client/intro.ts shows it once the hero has scrolled away.
+    Dim bar("[blaze](/) [Course](/learn) [Install](/install) [GitHub](https://github.com/indexable-inc/blaze)")
 
-    Go start(label: "Start the course", href: "/start")
+    Section edit(title: "Edit. Built.") {
+      P says("One function of helix changed, then built: **6.84 s** with cargo, **82 ms** with blaze.")
+      Dim how("blaze v1 against cargo, both warm, Linux aarch64 on 16 cores, median of 5 edits, October 2026. Over every project measured, an edit builds 10× faster on macOS arm64, 24× on Linux aarch64 and 11× on Linux x86-64: [the benchmarks](/bench).")
+    }
 
-    Dim more("[Course map](/learn) · [Install](/install) · [GitHub](https://github.com/indexable-inc/blaze)")
+    Section grain(title: "An edit rebuilds what it touches.") {
+      P says("blaze works a function at a time: an edit builds only what it changed, and the rest of the workspace stays as it was.")
+    }
+
+    // Headline options for the owner (2026-11-16): "Rust, and then more." (shipped), "Rust, extended.", "Rust, plus
+    // plus." (the ++ idea). "Rust++" stays off the page until he names it.
+    Section superset(title: "Rust, and then more.") {
+      P says("blaze reads Rust as it is, stable and nightly features alike, and grows opt-in extensions on top: a superset of Rust.")
+      Dim note("In development: the extensions below are not in a release yet.")
+
+      H3 caps("Capabilities")
+      Dim caps_says("In the blaze edition, `main` is handed what the program may use. What it was not handed is an error that names it.")
+      Code caps_rust(lang: "rust", text: `fn main() -> Result<(), Error> \{
+          let cfg = Path::new("data");
+          load(cfg)
+      }`)
+      Code caps_blaze(lang: "rust", text: `fn main(cx: &Cx, io: Io) -> Result<(), Error> \{
+          let data: Dir<ReadWrite> = io.fs().open_dir(cx, path!("data"))?;
+          let cfg: Dir<ReadOnly> = data.read_only();
+          load(cx, &cfg)
+      }`)
+
+      // Replaces the effects card (`#[blaze::expect()]`), withdrawn on 2026-11-16: on blaze's std an effect is a value a
+      // function is handed, so its signature says what it can do and no attribute is needed.
+      H3 reach("Parameters")
+      Dim reach_says("A function reaches only what it is handed. In the blaze edition Rust's `std::fs` is out of reach: to read a file, a function takes a `Dir`.")
+      Code reach_rust(lang: "rust", text: `fn load() -> Result<Config, Error> \{
+          let text = std::fs::read("config.toml")?;
+          Config::parse(&text)
+      }`)
+      Code reach_handed(lang: "rust", text: `fn load(cx: &Cx, cfg: &Dir<ReadOnly>) -> Result<Config, Error> \{
+          let mut text = Vec::new_in(cx.frame());
+          cfg.read_all(cx, path!("config.toml"), &mut text)?;
+          Config::parse(&text)
+      }`)
+      Code reach_refused(lang: "rust", text: `fn load(cx: &Cx) -> Result<Config, Error> \{
+          let text = std::fs::read("config.toml")?;
+          // error: Rust's std::fs is not reachable; take a &Dir
+          Config::parse(&text)
+      }`)
+
+      H3 reflect("Reflection")
+      Dim reflect_says("Code over a type's fields, at compile time, checked once.")
+      Code reflect_code(lang: "rust", text: `fn hash_fields<T: Struct, H: Hasher>(value: &T, state: &mut H)
+      where
+          for<F: Field<T>> F::Type: Hash,
+      \{
+          for const f in fields_of::<T>() \{
+              value.[f].hash(state);
+          }
+      }`)
+
+      H3 errors("Errors")
+      Dim errors_says("An error, as blaze draws it.")
+      Code errors_shown(lang: "", text: `error[E0425]: cannot find value \`c\` in this scope
+       --> src/main.rs:1:37
+        |
+      1 | fn add(a: u32, b: u32) -> u32 \{ a + c }
+        |                                     ^
+        |
+      help: a local variable with a similar name exists
+        |
+      1 - fn add(a: u32, b: u32) -> u32 \{ a + c }
+      1 + fn add(a: u32, b: u32) -> u32 \{ a + a }
+        |
+
+      For more information about this error, try \`rustc --explain E0425\`.
+      ✗ run failed in 6.30s · 1 error in hello (bin) · blaze explain hello`)
+    }
+
+    Section sandbox(title: "Sealed by default.") {
+      P says("Build scripts run in a sandbox: the machine is read-only, there is no network, and each writes only its own output directory. Proc macros run as WebAssembly.")
+    }
+
+    Section shared(title: "Built once. Found after.") {
+      P says("A result is kept by what it was made from. The standard library is built once per machine and shared by every project; a build script whose inputs are unchanged is found, not run.")
+    }
+
+    Section begin(title: "Try it on your project.") {
+      Command curl("curl -fsSL https://ix.dev/blaze | sh")
+      Go course_again(label: "Take the course", href: "/learn")
+      Go install_again(label: "Install", href: "/install")
+      Dim status("Today: canary releases, for macOS on Apple silicon and Linux. The numbers above are blaze v1's; the compiler is being rebuilt, and the extensions are in development. [The docs](https://github.com/indexable-inc/blaze/tree/main/docs).")
+    }
   }
 
   // Lesson 1: what blaze is, installing it, the first build and the commands you will type.
