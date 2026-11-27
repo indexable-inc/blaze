@@ -371,6 +371,8 @@ crates/blaze-sh/src/schema.rs	SCHEMA_MARKER_KEY	not persisted: in-memory shell s
 crates/blaze-sh/src/schema.rs	SCHEMA_SUBJECT_KEY	not persisted: in-memory shell schema record subject key
 crates/blaze-std/src/pat_ty.rs	LEGACY_VERSIONS	not persisted: unit-test SemVer array in #[cfg(test)]
 crates/blaze-std/src/pat_ty.rs	VERSIONS	not persisted: unit-test SemVer array in #[cfg(test)]
+crates/blaze-std/src/procs/hermetic/inode_record.rs	MAGIC	none
+crates/blaze-std/src/procs/hermetic/inode_record.rs	VERSION	none
 crates/blaze-std/src/procs/hermetic/landlock.rs	EXT_MAGIC	not persisted: external Linux glibc ld.so.cache extension magic
 crates/blaze-std/src/procs/hermetic/landlock.rs	NEW_MAGIC	not persisted: external Linux glibc ld.so.cache new-format header magic
 crates/blaze-std/src/procs/hermetic/landlock.rs	OLD_MAGIC	not persisted: external Linux glibc ld.so.cache old-format header magic

@@ -5736,12 +5736,31 @@ mod tests {
         };
         out.sort_by_key(|it| it.tag.0);
         let (server, client) = (conn(&out[0].done), conn(&out[1].done));
-        let large: Vec<u8> = (0..4 << 20).map(|at: usize| (at * 13) as u8).collect();
+        // `IORING_OP_SEND_ZC` pins the send buffer's pages against the calling user's
+        // `RLIMIT_MEMLOCK` (`mm_account_pinned_pages`). Under default Linux limits (e.g. 8 MiB
+        // shared across concurrent test processes under the same UID), a 4 MiB send can exceed
+        // `RLIMIT_MEMLOCK` and fail with `ENOMEM`. Use 4 MiB when `RLIMIT_MEMLOCK` is unlimited or
+        // generous (>= 32 MiB), and otherwise stay safely below the limit while still exceeding
+        // `ZERO_COPY_LEAST` (32 KiB) and requiring multiple receives.
+        let memlock = linux::host::prlimit64(0, linux::host::Resource::MEMLOCK, None)
+            .map(|limit| limit.rlim_cur)
+            .unwrap_or(0);
+        let large_len = if memlock == linux::host::RLIM_INFINITY || memlock >= 32 << 20 {
+            4 << 20
+        } else if memlock >= 1 << 20 {
+            128 << 10
+        } else {
+            usize::try_from(memlock / 4)
+                .unwrap_or(ZERO_COPY_LEAST)
+                .clamp(ZERO_COPY_LEAST, 128 << 10)
+        };
+        let recv_most = (large_len / 4).clamp(8 << 10, 64 << 10);
+        let large: Vec<u8> = (0..large_len).map(|at: usize| (at * 13) as u8).collect();
         let whole = large.len() + 4;
         // The small send only once the large one ended: sends in flight together may interleave.
         let mut effects = vec![
             Effect::Send { conn: client, bytes: large.clone(), tag: Tag(3) },
-            Effect::Recv { conn: server, most: 64 << 10, into: Vec::new(), tag: Tag(10) },
+            Effect::Recv { conn: server, most: recv_most, into: Vec::new(), tag: Tag(10) },
         ];
         let (mut got, mut sent, mut next) = (Vec::new(), Vec::new(), 11);
         run_until_idle(&mut ring, &mut effects, |done, effects| match done.done {
@@ -5761,7 +5780,7 @@ mod tests {
                 if got.len() < whole {
                     effects.push(Effect::Recv {
                         conn: server,
-                        most: 64 << 10,
+                        most: recv_most,
                         into: bytes,
                         tag: Tag(next),
                     });

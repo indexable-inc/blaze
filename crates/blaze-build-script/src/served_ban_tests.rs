@@ -5,9 +5,9 @@
 //! sources write that rule inline again: a line naming `"target"` and testing a name's leading
 //! dot.
 //!
-//! Exempt by name: walks of blaze's OWN tree for a source scan, which are no package walk
-//! (blaze-scope tests/no_spelled_dollar_crate.rs, parser lexed_str/differential.rs, scripts
-//! toolchain_cut.rs), and this file.
+//! Exempt by name: walks that are not Cargo package walks (blaze-scope
+//! tests/no_spelled_dollar_crate.rs, parser lexed_str/differential.rs, scripts
+//! toolchain_cut.rs, blaze-shell zoxide.rs interactive `cd` directory lookup), and this file.
 //!
 //! Prints `no_package_walk_writes_its_own_rule: N files scanned, 0 uses`.
 //! Control: the same scan over a planted line finds it.
@@ -15,7 +15,13 @@
 use std::string::{String, ToString};
 use std::vec::Vec;
 
-const EXEMPT: [&str; 4] = ["served_ban_tests.rs", "no_spelled_dollar_crate.rs", "differential.rs", "toolchain_cut.rs"];
+const EXEMPT: [&str; 5] = [
+    "served_ban_tests.rs",
+    "no_spelled_dollar_crate.rs",
+    "differential.rs",
+    "toolchain_cut.rs",
+    "zoxide.rs",
+];
 
 /// A line that writes the rule inline: it names the folder `target` and tests a leading dot.
 fn writes_the_rule(line: &str) -> bool {

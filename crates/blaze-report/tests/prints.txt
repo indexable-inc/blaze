@@ -1,6 +1,7 @@
 # std's `println!`, `print!`, `eprintln!` and `eprint!` left, a crate a line: each panics when its
 # stream's reader is gone. A command's path writes with `blaze_report::outln!` and its kin
 # (`blaze_report::out`). `tests/prints.rs` holds each crate to its number: it only goes down.
+bgit 6
 blaze-alloc-count 1
 blaze-answer 6
 blaze-bench 4
@@ -10,23 +11,25 @@ blaze-build-script 30
 blaze-cas 55
 blaze-cc 6
 blaze-cert 1
-blaze-cli 136
+blaze-cli 138
 blaze-code 11
 blaze-columns 1
 blaze-consteval 2
 blaze-core 30
-blaze-emit 71
+blaze-emit 72
 blaze-engine 36
 blaze-expand 13
 blaze-export 13
-blaze-flow 6
-blaze-flow-lower 162
+blaze-file-items 7
+blaze-flow 7
+blaze-flow-lower 166
 blaze-fmt 42
 blaze-format-core 1
+blaze-git-meta 2
 blaze-graph 5
 blaze-hash 5
 blaze-ids 2
-blaze-ladder 107
+blaze-ladder 109
 blaze-launch 4
 blaze-launch-rt 26
 blaze-lir 10
@@ -40,6 +43,7 @@ blaze-profile 5
 blaze-resolve 1
 blaze-scope 5
 blaze-script 8
+blaze-shell 16
 blaze-sim 6
 blaze-stage 3
 blaze-surface 2
