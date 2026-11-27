@@ -100,8 +100,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if !self.needs_drop(g).map_err(|error| Self::ty_err(scrutinee, error))? {
             return Ok(());
         }
-        let top = matches!(self.body.pats.get(pat.ix()), Some(Pat::Bind { ann, .. }) if ann.by_ref.is_none());
-        if top || self.moves_deep(pat)? {
+        if self.binds_whole_by_value(pat)? || self.moves_deep(pat)? {
             *self.partial.get_mut(x.ix()).ok_or(malformed("a local past `pats`"))? = true;
         }
         Ok(())

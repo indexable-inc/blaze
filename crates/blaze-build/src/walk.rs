@@ -2902,6 +2902,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
+    /// Whether binding `p` is owned by this body, needs drop, and has a runtime drop flag slot.
+    fn has_drop_flag(&self, p: PatId) -> bool {
+        matches!(self.owned.get(p.ix()).copied().and_then(LocalOwn::as_drop), Some(Owned { flag: Some(_), .. }))
+    }
+
     /// Stores `on` into binding `p`'s flag, if it has one.
     fn set_flag(&mut self, p: PatId, on: bool) {
         if on && let Some(du) = self.definitely_uninit.get_mut(p.ix()) {
@@ -3247,11 +3252,10 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     for arm in body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))? {
                         if let Some(x) = local {
                             let by_value = |p: PatId| matches!(body.pats.get(p.ix()), Some(Pat::Bind { ann, .. }) if ann.by_ref.is_none());
+                            if self.binds_whole_by_value(arm.pat)? {
+                                self.needs_flag[x.ix()] = true;
+                            }
                             let subs: &[PatId] = match body.pats.get(arm.pat.ix()) {
-                                Some(Pat::Bind { ann, .. }) if ann.by_ref.is_none() => {
-                                    self.needs_flag[x.ix()] = true;
-                                    &[]
-                                }
                                 Some(&Pat::TupleStruct { elems, .. }) => {
                                     body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?
                                 }
