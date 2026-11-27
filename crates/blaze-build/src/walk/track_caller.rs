@@ -26,7 +26,7 @@
 //!   `call_once`): [`crate::Adts::def_site`] of the shim's owner. So
 //!   `Some(()).map(tracked_fn)` reports core's `ops/function.rs` at the `Fn*` method, as rustc's
 //!   build does.
-//! - **A call from drop glue** (walk.rs `call_ptr`, `Kind::DropGlue` calling a `#[track_caller]`
+//! - **A call from drop glue** (walk.rs `call_drop_impl`, `Kind::DropGlue` calling a `#[track_caller]`
 //!   `Drop::drop`): drop glue is never tracked (`Track::No`, matching rustc's
 //!   `requires_caller_location` returning `false` for `InstanceKind::DropGlue`), so its call of
 //!   the tracked `Drop::drop` passes a row of [`crate::Adts::def_site`] of the glue's owner
@@ -149,8 +149,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.def_site_caller_arg(callee, callee.item, NO_REIFY_DEF_SITE)
     }
 
-    /// The location a drop call (walk.rs `call_ptr`, e.g. `drop_glue` calling a `#[track_caller]`
-    /// `Drop::drop`) passes to `callee`, when `callee` is tracked: forwards `self.track` if the
+    /// The location a `Drop::drop` call (walk.rs `call_drop_impl`, e.g. `drop_glue` calling a
+    /// `#[track_caller]` `Drop::drop`) passes to `callee`, when `callee` is tracked: forwards `self.track` if the
     /// current body is itself tracked (e.g. a `Box` freed directly inside a tracked fn), otherwise
     /// builds a row of the caller's definition site (`Adts::def_site(self.body.owner)` — in
     /// `drop_glue`, `core::ptr::drop_in_place`, matching rustc's `build_drop_shim` which uses

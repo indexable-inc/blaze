@@ -454,4 +454,80 @@ fn drop_glue_passes_def_site_to_tracked_drop_impl() {
     // 3. Tracked `Drop::drop` with no `def_site`: refused by name.
     let Err(refused) = build_glue(true, false) else { panic!("tracked drop_glue without def_site must be refused") };
     assert!(format!("{refused}").contains("`Adts::def_site`"), "{refused}");
+
+    // 4. Even if `drop_in_place` itself is marked `#[track_caller]`, `drop_at` calls to
+    // `drop_in_place` keep the 1-pointer `(ptr) -> ()` ABI (matching `Kind::DropGlue`'s own sig),
+    // while `DropStep::Impl` calls to a `#[track_caller]` `Drop::drop` still pass `(ptr, ptr) -> ()`.
+    let mut w = TestWorld::new();
+    let loc_key = ItemKey(29);
+    let str_ref = w.ref_(Mutbl::Not, PNode::Str);
+    w.strukt(loc_key.0, "Location", &[("filename", str_ref), ("line", U32), ("col", U32)]);
+    w.location = Some(loc_key);
+    let g_node = g_world(&mut w);
+    let g_ref = w.ref_(Mutbl::Mut, g_node);
+    w.func(G_DROP.0, "g_drop", &[g_ref], UNIT);
+    w.strukt(28, "Wrap", &[("g", g_node)]);
+    let wrap_node = PNode::Adt(ItemKey(28), List::EMPTY);
+    w.func(1, "main", &[g_node], UNIT);
+    w.tracked.push(DROP_IN_PLACE);
+    w.tracked.push(G_DROP);
+    w.def_site = Some(DROP_SITE);
+
+    // 4a. `drop_in_place::<Wrap>` drops field `g: G` via `drop_at` -> 1-pointer call `(ptr) -> ()`.
+    let mut gb = BodyBuf::new();
+    let p = gb.bind("p");
+    gb.params.push(p);
+    let groot = gb.block(&[], None);
+    let gview = gb.view(DROP_IN_PLACE, groot);
+    let mut ty = InferCtx::new_in(alloc);
+    let gchecked = match blaze_typeck::check(&gview, &w, &mut ty, &Needs::new_in(alloc), alloc) {
+        Ok(Outcome::Done(c)) => c,
+        Ok(Outcome::Need(n)) => panic!("check needed {:?}", n.questions),
+        Err(error) => panic!("check failed: {error:?}"),
+    };
+    let dip_sig = w.sig(DROP_IN_PLACE).expect("drop_in_place sig");
+    let mut ground = PortableTys::new_in(alloc);
+    let wrap_g = ground.intern(wrap_node).expect("intern Wrap");
+    let mut subst = Subst { args: &[wrap_g], ground: &mut ground, scratch: alloc };
+    let wrap_glue = crate::build_drop_glue(&gview, &gchecked, &dip_sig, &mut subst, &TestAdts { world: &w, body: &gb }, alloc)
+        .unwrap_or_else(|e| panic!("Wrap drop_glue failed: {e}"));
+    blaze_lir::verify(wrap_glue.func.view()).expect("Wrap drop_glue verifies");
+    let wtext = blaze_lir::print(wrap_glue.func.view());
+    assert!(has_own_sig(wrap_glue.func.view(), &[Ty::PTR], &[]), "Wrap drop_in_place own sig is (ptr): {wtext}");
+    assert!(has_direct_call_sig(wrap_glue.func.view(), &[Ty::PTR], &[]), "drop_at calls drop_in_place::<G> with (ptr): {wtext}");
+    assert!(!has_direct_call_sig(wrap_glue.func.view(), &[Ty::PTR, Ty::PTR], &[]), "drop_at must not pass location to drop_in_place: {wtext}");
+    assert!(wrap_glue.func.view().datas.is_empty(), "drop_at to drop_in_place makes no Location row: {wtext}");
+
+    // 4b. `fn main(x: G)` drops `x` at scope exit via `drop_at` -> 1-pointer call `(ptr) -> ()`.
+    let mut mb = BodyBuf::new();
+    let x = mb.bind("x");
+    mb.params.push(x);
+    let mroot = mb.block(&[], None);
+    let mview = mb.view(MAIN, mroot);
+    let mut ty = InferCtx::new_in(alloc);
+    let mchecked = match blaze_typeck::check(&mview, &w, &mut ty, &Needs::new_in(alloc), alloc) {
+        Ok(Outcome::Done(c)) => c,
+        Ok(Outcome::Need(n)) => panic!("check needed {:?}", n.questions),
+        Err(error) => panic!("check failed: {error:?}"),
+    };
+    let main_sig = w.sig(MAIN).expect("main sig");
+    let mut ground = PortableTys::new_in(alloc);
+    let mut subst = Subst { args: &[], ground: &mut ground, scratch: alloc };
+    let built_main = crate::build(&mview, &mchecked, &main_sig, &mut subst, &TestAdts { world: &w, body: &mb }, alloc)
+        .unwrap_or_else(|e| panic!("main drop failed: {e}"));
+    blaze_lir::verify(built_main.func.view()).expect("main verifies");
+    let mtext = blaze_lir::print(built_main.func.view());
+    assert!(has_direct_call_sig(built_main.func.view(), &[Ty::PTR], &[]), "scope drop calls drop_in_place with (ptr): {mtext}");
+    assert!(!has_direct_call_sig(built_main.func.view(), &[Ty::PTR, Ty::PTR], &[]), "scope drop must not pass location to drop_in_place: {mtext}");
+
+    // 4c. `drop_in_place::<G>` itself still passes `(ptr, ptr) -> ()` to tracked `G_DROP`.
+    let mut ground = PortableTys::new_in(alloc);
+    let g_ty = ground.intern(g_node).expect("intern G");
+    let mut subst = Subst { args: &[g_ty], ground: &mut ground, scratch: alloc };
+    let g_glue = crate::build_drop_glue(&gview, &gchecked, &dip_sig, &mut subst, &TestAdts { world: &w, body: &gb }, alloc)
+        .unwrap_or_else(|e| panic!("G drop_glue failed: {e}"));
+    blaze_lir::verify(g_glue.func.view()).expect("G drop_glue verifies");
+    let gtext = blaze_lir::print(g_glue.func.view());
+    assert!(has_own_sig(g_glue.func.view(), &[Ty::PTR], &[]), "G drop_in_place own sig is (ptr): {gtext}");
+    assert!(has_direct_call_sig(g_glue.func.view(), &[Ty::PTR, Ty::PTR], &[]), "DropStep::Impl passes (ptr, ptr) to tracked G_DROP: {gtext}");
 }
