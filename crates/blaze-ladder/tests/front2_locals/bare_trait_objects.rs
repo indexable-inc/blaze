@@ -1610,5 +1610,5 @@ fn takes_outer_hrtb_ref(_x: &OuterHrtbRef) {}
     }
 }
 
-#[path = "front2_bare_trait_objects/anon_trait_params.rs"]
+#[path = "anon_trait_params.rs"]
 mod anon_trait_params;
