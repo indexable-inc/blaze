@@ -439,19 +439,25 @@ pub fn native_outputs<'a>(
     }
 
     // The key: the compiler by its shelf digest, the SDK by its version (D69), the tools.
-    match toolchain::sysroot(CLANG_JSON, setting.host) {
-        Ok(Sysroot::MacosSdk) => {}
+    let sysroot_key = match toolchain::sysroot(CLANG_JSON, setting.host) {
+        Ok(Sysroot::MacosSdk) => {
+            let text = |file: &str| -> Result<String, NativeUnitError> {
+                String::from_utf8(read_file(native.sdk, file)?).map_err(|_| NativeUnitError::Read { path: format!("{}/{file}", native.sdk), why: "it is not UTF-8".to_owned() })
+            };
+            let (settings, built) = (text(blaze_apple_sdk::SETTINGS)?, text(blaze_apple_sdk::SYSTEM_VERSION)?);
+            let (_, id) = blaze_apple_sdk::identity_of(&settings, &built).map_err(|why| NativeUnitError::Read { path: native.sdk.to_owned(), why: format!("{why}, which a native script's key holds (D69)") })?;
+            blaze_own::format_in!(alloc, "macos-sdk {id}")
+        }
+        Ok(Sysroot::LinuxHost) => {
+            let bytes = read_file(native.sdk, toolchain::LINUX_HOST_SYSROOT_MARKER)?;
+            let digest = hex(&blaze_sha256::digest(&bytes));
+            blaze_own::format_in!(alloc, "linux-host {digest}")
+        }
         Ok(Sysroot::Pinned { .. }) => return Err(pin(format!("{}: {}'s pinned sysroot is not fetched yet (D69)", CLANG_PATH, setting.host))),
         Err(error) => return Err(pin(error.to_string())),
-    }
-    let text = |file: &str| -> Result<String, NativeUnitError> {
-        String::from_utf8(read_file(native.sdk, file)?).map_err(|_| NativeUnitError::Read { path: format!("{}/{file}", native.sdk), why: "it is not UTF-8".to_owned() })
     };
-    let (settings, built) = (text(blaze_apple_sdk::SETTINGS)?, text(blaze_apple_sdk::SYSTEM_VERSION)?);
-    let (_, id) = blaze_apple_sdk::identity_of(&settings, &built).map_err(|why| NativeUnitError::Read { path: native.sdk.to_owned(), why: format!("{why}, which a native script's key holds (D69)") })?;
-    let sysroot_key = format!("macos-sdk {id}");
     let compiler = hex32(native.shelf.rsplit('/').next().unwrap_or("")).ok_or_else(|| NativeUnitError::Shelf { shelf: native.shelf.to_owned() })?;
-    let parts = NativeKeyParts { compiler, target: setting.host, sysroot: &sysroot_key, host_tools: &tool_keys };
+    let parts = NativeKeyParts { compiler, target: setting.host, sysroot: sysroot_key.as_str(), host_tools: &tool_keys };
     let inputs = KeyInputs {
         module: module_digest,
         env: &env,

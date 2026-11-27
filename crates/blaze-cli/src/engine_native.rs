@@ -798,25 +798,24 @@ fn prepare_crates<'r, 'm: 's, 's>(
     // macOS: each library's install name is the SDK's stub's, so resolve the SDK lazily on demand
     // here (at most once per command via `Standing::resolve_sdk`, reusing the open `~/.blaze` dir)
     // instead of eagerly during `Standing` construction.
-    let sdk = match platform {
+    let (sdk, target_sdk) = match platform {
         Platform::MacosArm64 => match standing.resolve_sdk(cx) {
-            Ok(sdk) => Some(sdk),
+            Ok(sdk) => (Some(sdk), crate::native_runner_c::TargetSdk::Macos(sdk)),
             Err(why) => {
                 let ask = &standing.native;
                 return Err(NativeError::Sdk { words: held(bstd::mem::format_in!(scratch, "{why}").as_str(), ask) });
             }
         },
-        Platform::LinuxArm64 => None,
+        Platform::LinuxArm64 => (None, crate::native_runner_c::TargetSdk::LinuxHost),
     };
     // Disjoint fields: the ask and the readers are shared, the store is the one mutable borrow.
     let (ask, names, graph) = (&standing.native, standing.names, standing.graph);
     let store: &mut dyn Store<'m> = &mut *standing.store;
     let err = standing.err;
     let checkout_root = standing.place.served.root_text();
-    // A crate whose script deferred C requests: run here, before the link (native_runner_c.rs;
-    // macOS only, where the pinned clang and the SDK are; elsewhere the link refuses the record
-    // by name, natives.rs `DeferredC`).
-    let mut c_tasks = sdk.map(|sdk| crate::native_runner_c::CTasks::new(ask.home, checkout_root, sdk, &ask.fs, standing.workers.get(), standing.heap));
+    // A crate whose script deferred C requests: run here, before the link (native_runner_c.rs),
+    // on both macOS (Apple SDK) and Linux ARM64 (host `/usr` sysroot + pinned clang shelf).
+    let mut c_tasks = Some(crate::native_runner_c::CTasks::new(ask.home, checkout_root, target_sdk, &ask.fs, standing.workers.get(), standing.heap));
 
     // The crate list, in place from the unit graph's record.
     let payload = native_image::payload_in_place(cx, store, &graph).map_err(NativeError::Store)?;

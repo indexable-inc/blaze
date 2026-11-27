@@ -12,6 +12,7 @@
 //! "native: with a setting NoModule for zstd-sys 1.0.0, without NoNativeSetting".
 
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -196,4 +197,41 @@ fn a_native_placed_script_with_a_setting_reaches_its_binary_lookup() {
     jobs.end().unwrap_or_else(|e| panic!("{e}"));
     let _ = std::fs::remove_dir_all(&home);
     let _ = std::fs::remove_dir_all(&store);
+}
+
+/// Linux ARM64 uses `Sysroot::LinuxHost`: accepts a Linux shelf (no `lib/libclang.dylib` or
+/// `bin/ld64.lld`) and keys the sysroot by `<sdk>/include/features.h`, refusing when absent.
+#[test]
+fn linux_host_native_setting_accepts_linux_shelf_and_features_h() {
+    use blaze_build_script::toolchain::{LINUX_HOST_SYSROOT_MARKER, SHELF_MEMBERS_LINUX, Sysroot};
+    const LINUX_HOST: &str = "aarch64-unknown-linux-gnu";
+    const LINUX_PIN_HEX: &str = "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91";
+    let alloc = blaze_own::testing::heap().alloc();
+    let home = folder("linux-host");
+    let shelf = home.join(SHELF_DIR).join(LINUX_PIN_HEX);
+    for member in SHELF_MEMBERS_LINUX {
+        let path = shelf.join(member);
+        if member == "lib/clang" {
+            fs::create_dir_all(&path).expect("resource dir");
+        } else {
+            fs::create_dir_all(path.parent().expect("parent")).expect("bin");
+            fs::write(&path, b"").expect("member");
+        }
+    }
+    let sdk = home.join("usr");
+    fs::create_dir_all(sdk.join("include")).expect("include");
+    let home_s = home.to_str().expect("utf8");
+    let sdk_s = sdk.to_str().expect("utf8");
+
+    // Missing `include/features.h` is refused as `NoSdk`.
+    let missing = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).expect_err("missing features.h");
+    assert!(matches!(missing, NativeSettingError::NoSdk { .. }), "{missing}");
+
+    // With `include/features.h`, setting succeeds with `Sysroot::LinuxHost` and a 64-hex digest.
+    fs::write(sdk.join(LINUX_HOST_SYSROOT_MARKER), b"#define __GLIBC__ 2\n").expect("features.h");
+    let owned = command_native_setting(home_s, sdk_s, "test", LINUX_HOST, alloc).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(owned.sysroot, Sysroot::LinuxHost);
+    assert_eq!(owned.shelf.as_str().rsplit('/').next(), Some(LINUX_PIN_HEX));
+    assert_eq!(owned.sdk_version.len(), 64);
+    let _ = fs::remove_dir_all(&home);
 }
