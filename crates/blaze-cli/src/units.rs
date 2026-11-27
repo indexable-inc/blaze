@@ -1673,11 +1673,17 @@ version = \"0.29.0\"
             let empty_git = std::collections::BTreeMap::new();
             let sqlx_unit = make_unit(lock, "sqlx-macros", "0.9.0", "sqlx_macros", heap);
             let rasn_unit = make_unit(lock, "rasn-derive", "0.29.0", "rasn_derive", heap);
-            let sqlx_key = blaze_world::procs::identify(lock, &locked, &empty_git, &sqlx_unit, |id| Ok(place.member_files(id)))
+            let empty_graph = blaze_unit_graph::UnitGraph {
+                units: blaze_own::Vec::new_in(heap.alloc()),
+                resolver: blaze_unit_graph::Resolver::V2,
+                meta: blaze_own::Vec::new_in(heap.alloc()),
+                left_out: blaze_own::Vec::new_in(heap.alloc()),
+            };
+            let sqlx_key = blaze_world::procs::identify(lock, &locked, &empty_git, &empty_graph, &sqlx_unit, |id| Ok(place.member_files(id)))
                 .expect("identify sqlx io")
                 .expect("sqlx-macros must identify cleanly instead of ClosureError::Unpinned")
                 .with_id(blaze_proc_macro::module::module_key);
-            let rasn_key = blaze_world::procs::identify(lock, &locked, &empty_git, &rasn_unit, |id| Ok(place.member_files(id)))
+            let rasn_key = blaze_world::procs::identify(lock, &locked, &empty_git, &empty_graph, &rasn_unit, |id| Ok(place.member_files(id)))
                 .expect("identify rasn io")
                 .expect("rasn-derive must identify cleanly instead of ClosureError::Unpinned")
                 .with_id(blaze_proc_macro::module::module_key);
@@ -1877,7 +1883,13 @@ unibind-test-support = { path = \"../unibind-test-support\" }
                 links: None,
             };
             let empty_git = std::collections::BTreeMap::new();
-            let identity = blaze_world::procs::identify(lock, &locked, &empty_git, &unit, |id| Ok(place.member_files(id)))
+            let empty_graph = blaze_unit_graph::UnitGraph {
+                units: blaze_own::Vec::new_in(heap.alloc()),
+                resolver: blaze_unit_graph::Resolver::V2,
+                meta: blaze_own::Vec::new_in(heap.alloc()),
+                left_out: blaze_own::Vec::new_in(heap.alloc()),
+            };
+            let identity = blaze_world::procs::identify(lock, &locked, &empty_git, &empty_graph, &unit, |id| Ok(place.member_files(id)))
                 .expect("identify io")
                 .expect("unibind must identify cleanly across dev-dep lock closure");
             let key = identity.with_id(blaze_proc_macro::module::module_key);
@@ -1892,6 +1904,6 @@ unibind-test-support = { path = \"../unibind-test-support\" }
         assert!(!unique.contains("crates/unrelated"), "unrelated workspace member must not be eagerly swept (rule 60): {macro_dirs:?}");
         let (src_b, _, key_b) = run_once("pub fn s2() {}");
         assert_ne!(src_a, src_b, "editing transitive dev-dep member must move units_source (rule 21)");
-        assert_ne!(key_a, key_b, "editing transitive dev-dep member must move proc-macro module key (rule 21)");
+        assert_eq!(key_a, key_b, "editing uncompiled dev-dep member must not invalidate UnitGraph-scoped path proc-macro key");
     }
 }

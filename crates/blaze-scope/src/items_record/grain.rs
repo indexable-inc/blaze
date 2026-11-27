@@ -66,6 +66,30 @@ pub(super) fn append(out: &mut RecordBytes<'_>, names: &CrateNames<'_>, items: &
 }
 
 impl<'a> ItemsRecord<'a> {
+    /// Item row `i`'s chain, read directly from the grain section without opening its source file.
+    pub fn chain_at(&self, i: usize) -> Result<ContentId, ItemsRecordError> {
+        let short = ItemsRecordError::Short { what: "an item grain row", at: i };
+        if i >= self.counts[T_ITEMS] {
+            return Err(short);
+        }
+        let base = self.field(F_GRAIN_AT) as usize;
+        if base == 0 {
+            return Err(short);
+        }
+        let Some(r) = i.checked_mul(GRAIN_ROW).and_then(|o| base.checked_add(o)).filter(|r| r.checked_add(GRAIN_ROW).is_some_and(|end| end <= self.bytes.len())) else {
+            return Err(short);
+        };
+        Ok(id_at(self.bytes, r))
+    }
+
+    /// The item `key`'s chain; `Ok(None)` when the crate has no item with text under that key.
+    pub fn chain(&self, key: ItemKey) -> Result<Option<ContentId>, ItemsRecordError> {
+        match self.find(T_ITEMS, key) {
+            Some(i) => self.chain_at(i).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Item row `i`'s pieces, as the solve saw them.
     pub fn pieces_at(&self, i: usize) -> Result<ItemPieces, ItemsRecordError> {
         let short = ItemsRecordError::Short { what: "an item grain row", at: i };

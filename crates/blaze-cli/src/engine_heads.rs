@@ -437,6 +437,9 @@ fn outlined_by_path<'o, 'p>(outlined: &'o [Outlined<'_>], at_phase: SharedAlloc<
     let mut index: blaze_hash::Map<&'o [u8], usize, blaze_hash::FixedState, SharedAlloc<'p>> =
         blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: at_phase, capacity: Some(outlined.len()) });
     for (at, one) in outlined.iter().enumerate() {
+        if crate::data_include::is_data(one.edition) {
+            continue;
+        }
         index.entry(one.path.as_slice()).or_insert(at);
     }
     index
@@ -5383,5 +5386,34 @@ mod nested {
         }
         assert!(covered_count > 10, "expected covered top-level/nested items");
         assert!(held_count >= 2, "expected body-held items inside f_0");
+    }
+
+    #[test]
+    fn outlined_by_path_skips_data_file_shadowing_mod_rs() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let path = b"crates/demo/src/front2/mod.rs";
+        let data_name = Name::file(path);
+        let rust_name = Name::file(b"crates/demo/src/front2.rs");
+        let data_outline = Outlined {
+            name: data_name,
+            path: SVec::from_slice_in(path, alloc),
+            source: ContentId([0u8; 32]),
+            outline_source: ContentId([0u8; 32]),
+            edition: blaze_drive::record::DATA_FILE,
+            made: Ok(crate::work::Record::new_in(data_name, alloc)),
+        };
+        let rust_outline = Outlined {
+            name: rust_name,
+            path: SVec::from_slice_in(path, alloc),
+            source: ContentId([0u8; 32]),
+            outline_source: ContentId([0u8; 32]),
+            edition: blaze_surface::Edition::E2024.byte(),
+            made: Ok(crate::work::Record::new_in(rust_name, alloc)),
+        };
+        let outlined = [data_outline, rust_outline];
+        let by_path = outlined_by_path(&outlined, alloc);
+        assert_eq!(find_outlined_index(&by_path, path), Some(1));
+        assert_eq!(crate::engine_body_plan::outline_at_path(&outlined, path, &[]), Some(1));
     }
 }
