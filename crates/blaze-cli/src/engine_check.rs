@@ -4726,9 +4726,11 @@ fn checking<'f, 's: 'f>(
         buffers.push(Buffer::new_in(alloc));
     }
     let members = crate::names::member_dirs(laid_now);
+    let command_probes = crate::scripts::SharedCommandProbes::new(&env);
     let side = laid_now.and_then(|laid| laid.lock.as_ref()).map(|lockfile| crate::proc_runner::MacroSide {
         lock: lockfile,
         place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows },
+        probes: &command_probes,
         // PHASE-MEM-DEBT(Names): the proc macros' expansions on the process heap
         // (proc_runner.rs `MacroSide::heap`, `&'static Heap`): made in a Names phase, read by
         // the Scripts and Names phases after; the record is what should cross.
@@ -4740,6 +4742,7 @@ fn checking<'f, 's: 'f>(
         members,
         env: &env,
         producers,
+        probes: &command_probes,
         side: side.as_ref(),
         outlined: &outlined,
         workers,

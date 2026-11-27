@@ -170,6 +170,8 @@ pub enum MacrosError {
     NoLock,
     /// The module store could not be listed, or a path crate's files read.
     Procs(blaze_world::procs::ProcsError),
+    /// The command's derived-fact pin setting for dependency build scripts could not be opened.
+    Probes(crate::scripts::ProbeSetupError),
 }
 
 impl core::fmt::Display for MacrosError {
@@ -178,6 +180,7 @@ impl core::fmt::Display for MacrosError {
             MacrosError::Graph(refused) => write!(f, "the unit graph record at byte {}: {}", refused.at, refused.why),
             MacrosError::NoLock => f.write_str("no lock was read this command"),
             MacrosError::Procs(error) => write!(f, "{error}"),
+            MacrosError::Probes(error) => write!(f, "{error}"),
         }
     }
 }
@@ -185,24 +188,52 @@ impl core::fmt::Display for MacrosError {
 /// Every macro crate of the graph `sections` with its identity, over `lock`, the module
 /// store `modules` (its git folders) and `place` (a member's folder). When `sections.wasm_graph`
 /// is present, folds each proc-macro's resolved `wasm64-blaze-wasip1` dependency closure features
-/// into its module identity (rule 21). The decoded graph is the task's scratch, made over `scratch`.
-pub(crate) fn list(sections: crate::graph_payload::Sections<'_>, lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>, scratch: Alloc<'_>) -> Result<MacroCrates, MacrosError> {
+/// into its module identity (rule 21), and when its closure runs dependency build scripts folds
+/// `probes`'s deterministic probe/pin identity digest as well. The decoded graph is the task's
+/// scratch, made over `scratch`.
+pub(crate) fn list(
+    cx: &Cx,
+    sections: crate::graph_payload::Sections<'_>,
+    lock: &crate::fetch::Lockfile<'_>,
+    modules: &std::path::Path,
+    place: &Place<'_, '_>,
+    probes: Option<&crate::scripts::SharedCommandProbes<'_>>,
+    scratch: Alloc<'_>,
+) -> Result<MacroCrates, MacrosError> {
     let decoded = blaze_unit_graph::record::decode(sections.graph, scratch).map_err(MacrosError::Graph)?;
     let wasm_decoded = if sections.wasm_graph.is_empty() {
         None
     } else {
         Some(blaze_unit_graph::record::decode(sections.wasm_graph, scratch).map_err(MacrosError::Graph)?)
     };
+    let wasm_graph = wasm_decoded.as_ref().map(|d| &d.graph);
     let locked = LockedPackages::of(lock.lock);
     let folders = git_folders(modules).map_err(MacrosError::Procs)?;
     let mut crates = std::vec::Vec::new_in(Global);
-    for unit in decoded.graph.units.iter().filter(|unit| matches!(unit.kind, UnitKind::ProcMacro)) {
+    for (idx, unit) in decoded.graph.units.iter().enumerate() {
+        if !matches!(unit.kind, UnitKind::ProcMacro) {
+            continue;
+        }
         // A member macro crate's identity is its files' digest, read from its folder; a path
         // package that is no member has no folder here and is named as not identified.
         let identity = identify(lock.lock, &locked, &folders, &decoded.graph, unit, |id| Ok(place.member_files(id)), scratch).map_err(MacrosError::Procs)?;
-        let identity = match (&wasm_decoded, identity) {
-            (Some(wg), Ok(id)) => Ok(id.with_wasm_features(lock.lock, &wg.graph, unit.package, |dep_id| place.member_files(dep_id), scratch)),
+        let identity = match (wasm_graph, identity) {
+            (Some(wg), Ok(id)) => Ok(id.with_wasm_features(lock.lock, wg, unit.package, |dep_id| place.member_files(dep_id), scratch)),
             (_, other) => other,
+        };
+        let identity = match (identity, u32::try_from(idx).ok(), probes) {
+            (Ok(id), Some(uid), Some(probes))
+                if crate::wasm64_compile::unit_has_dep_build_scripts(
+                    &decoded.graph,
+                    wasm_graph,
+                    blaze_unit_graph::UnitId(uid),
+                    true,
+                ) =>
+            {
+                let hex = probes.dep_probe_identity_hex(cx).map_err(MacrosError::Probes)?;
+                Ok(id.with_dep_probes(hex.as_str()))
+            }
+            (other, _, _) => other,
         };
         crates.push((subject(unit), identity));
     }
@@ -240,7 +271,7 @@ pub(crate) fn run<'b>(
         // The task's frame carries no header: erased here, for this task's scratch.
         let scratch = blaze_own::Erased::new(frame);
         let listed = match lock {
-            Some(lock) => list(read.unit_graph(graph.name)?, lock, &modules, &place, scratch.handle()),
+            Some(lock) => list(&cx, read.unit_graph(graph.name)?, lock, &modules, &place, compile.and_then(|c| c.probes), scratch.handle()),
             None => Err(MacrosError::NoLock),
         };
         match listed {
@@ -271,7 +302,7 @@ pub(crate) fn run<'b>(
         Err(ModuleError::Missing { name: package, version, key }) => {
             if let Some(inputs) = compile {
                 let _compile_cx = cx.span("macro module: self-compile proc-macro to wasm64");
-                match crate::wasm64_compile::compile_proc_macro(&modules, inputs, identity) {
+                match crate::wasm64_compile::compile_proc_macro(&cx, &modules, inputs, identity) {
                     Ok(wasm_sha256) => {
                         let mut made = Made::new_in(name, held);
                         made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.as_bytes());

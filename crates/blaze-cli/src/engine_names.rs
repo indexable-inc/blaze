@@ -284,6 +284,7 @@ pub(crate) struct Handles<'h, 'f> {
     pub(crate) members: Option<&'h [crate::graph::CheckoutDir]>,
     pub(crate) env: &'h FetchEnv<'h>,
     pub(crate) producers: blaze_ids::producer::Producers,
+    pub(crate) probes: &'h crate::scripts::SharedCommandProbes<'h>,
     pub(crate) side: Option<&'h crate::proc_runner::MacroSide<'h, 'h, 'h>>,
     pub(crate) outlined: &'h [Outlined<'h>],
     pub(crate) workers: core::num::NonZeroU32,
@@ -698,7 +699,7 @@ impl<'f> NamesStage<'f> {
             Ok(made) => made,
             Err(why) => return Err(EngineCheckError::NamesWorld(why).into()),
         };
-        let runner = Self::runner(names, made, handles, frame);
+        let runner = Self::runner(&cx, names, made, handles, frame);
         let world = made.world();
         let crates = world.crates.as_slice();
         let all = world.sysroot;
@@ -927,12 +928,12 @@ impl<'f> NamesStage<'f> {
         Ok(())
     }
 
-    fn runner(names: &Names<'f>, made: &crate::names::NamesWorld<'_>, handles: &Handles<'_, 'f>, frame: &'f Frame) -> Result<Option<&'static crate::proc_runner::ProcRunner<'static>>, &'f str> {
+    fn runner(cx: &Cx, names: &Names<'f>, made: &crate::names::NamesWorld<'_>, handles: &Handles<'_, 'f>, frame: &'f Frame) -> Result<Option<&'static crate::proc_runner::ProcRunner<'static>>, &'f str> {
         if !made.world().crates.iter().any(|c| c.input.implicit.proc_macro) {
             return Ok(None);
         }
         match (names.procs(), handles.side) {
-            (None, Some(side)) => match crate::proc_runner::make(made, *names.list(), side) {
+            (None, Some(side)) => match crate::proc_runner::make(cx, made, *names.list(), side) {
                 Ok(runner) => {
                     names.set_procs(runner);
                     Ok(Some(runner))
@@ -1696,7 +1697,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
             Ok(made) => made,
             Err(why) => return Err(EngineCheckError::NamesWorld(why).into()),
         };
-        let runner = NamesStage::runner(names, made, handles, frame);
+        let runner = NamesStage::runner(cx, names, made, handles, frame);
         let world = made.world();
         let at = names.crate_at(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldCrates, key: name })?;
         let columns = *self.columns.get_or_insert_with(|| WorldColumns {

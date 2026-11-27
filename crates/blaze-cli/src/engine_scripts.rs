@@ -386,7 +386,6 @@ impl<'s> ScriptQueue<'s> {
                 members.push((entry.id, work::held_str(entry.dir.as_str(), self.jobs), entry.kind));
             }
         }
-        let dep_probes = crate::wasm64_compile::DepScriptProbes::open(cx, handles.env, self.jobs);
         let built = crate::wasm64_compile::CompileInputs {
             graph: sections.graph,
             wasm_graph: sections.wasm_graph,
@@ -395,8 +394,7 @@ impl<'s> ScriptQueue<'s> {
             members: members.into_bump_slice(),
             producers: handles.producers,
             heap: handles.env.heap,
-            c_probes: dep_probes.c_probes,
-            spawn_setting: dep_probes.spawn_setting,
+            probes: Some(handles.probes),
         };
         self.compile_inputs = Some(built);
         Ok(self.compile_inputs)
@@ -1054,7 +1052,7 @@ impl<'f> ScriptsStage<'f> {
         let tool = self.tools.ok_or(EngineCheckError::Unseen { task: name, read: Name::unit_graph() })?.of(name);
         let made = work::unwinding(|| {
             crate::scripts::job(
-                cx, handles.root, store, &mut self.scripts, &mut names.names, handles.env, tool,
+                cx, handles.root, store, &mut self.scripts, &mut names.names, handles.env, handles.probes, tool,
                 handles.workers.get(), handles.lock, handles.members, &drive, frame, jobs,
             )
         });
@@ -1465,12 +1463,26 @@ impl<'f> ScriptsStage<'f> {
                 Err(why) => return Err(EngineCheckError::NamesWorld(why).into()),
             };
             let module = made.script_module(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldScriptModules, key: name })?;
+            let deps = if module.ran_as == crate::scripts::RanAs::Wasm
+                && crate::wasm64_compile::unit_has_dep_build_scripts(made.graph(), made.wasm_graph(), module.script_unit, false)
+            {
+                match handles.probes.dep_probe_identity_hex(cx) {
+                    Ok(probes_hex) => Some(crate::wasm64_compile::fold_dep_probes_opt(module.deps.as_deref(), probes_hex.as_str(), queue.jobs)),
+                    Err(error) => {
+                        let failed = TaskFailure { name, why: Why::Refused { what: "the build-script dependency probe pins could not be opened", rule: crate::script_modules::RULE } };
+                        let words = bstd::mem::format_in!(frame, "the build script of {} {}: {error}", module.package, module.version);
+                        return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
+                    }
+                }
+            } else {
+                module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s))
+            };
             let wanted = crate::script_modules::Wanted {
                 script_unit: module.script_unit,
                 ran_as: module.ran_as, package: module.package, version: module.version,
                 features: queue.jobs.alloc_slice_copy(&module.features),
                 files: module.files.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
-                deps: module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
+                deps,
             };
             let compile = if wanted.ran_as == crate::scripts::RanAs::Wasm {
                 queue.ensure_compile_inputs(cx, store, graph_key, handles)?
@@ -1493,7 +1505,7 @@ impl<'f> ScriptsStage<'f> {
             let read = work::payload(cx, store, &graph, &scratch)?;
             let modules = std::path::Path::new(home).join(".blaze/v2");
             let erased = blaze_own::Erased::new(&scratch);
-            match crate::macros::list(read.unit_graph(graph.name)?, &side.lock, &modules, &side.place, erased.handle()) {
+            match crate::macros::list(cx, read.unit_graph(graph.name)?, &side.lock, &modules, &side.place, Some(handles.probes), erased.handle()) {
                 Ok(listed) => self.macros = Some(std::sync::Arc::new(listed)),
                 Err(error) => {
                     let failed = TaskFailure { name, why: Why::Refused { what: "the macro crates could not be listed", rule: "macros.rs" } };

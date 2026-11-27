@@ -189,8 +189,9 @@ impl<'n> RunProcs<'n, '_> {
             crate::units::emit_proc_macro_lock_files(cx, self.root, &stamps, proc_macros, lockfile.lock, checkout_dirs, None, &mut rows, frame)
                 .map_err(|error| said(format_args!("no proc-macro runner: macro files: {error}")))?;
         }
-        let side = crate::proc_runner::MacroSide { lock: lockfile, place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows }, heap: env.heap };
-        crate::proc_runner::make(world, *names.list(), &side).map_err(|error| said(format_args!("no proc-macro runner: {error} (proc_runner.rs `make`)")))
+        let command_probes = crate::scripts::SharedCommandProbes::new(env);
+        let side = crate::proc_runner::MacroSide { lock: lockfile, place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows }, probes: &command_probes, heap: env.heap };
+        crate::proc_runner::make(cx, world, *names.list(), &side).map_err(|error| said(format_args!("no proc-macro runner: {error} (proc_runner.rs `make`)")))
     }
 }
 

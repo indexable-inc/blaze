@@ -91,6 +91,17 @@ impl MacroIdentity {
         self.deps.push_str(folded.as_str());
         self
     }
+
+    /// Folds the 64-hex digest of dependency build-script probe/pin inputs into `self.deps`
+    /// when this proc-macro's `wasm64-blaze-wasip1` closure runs dependency build scripts
+    /// (rule 21: changes to C-probe clang/SDK identity or derived-fact pins invalidate cached
+    /// wasm64 proc-macro modules).
+    pub fn with_dep_probes(mut self, probes_hex: &str) -> Self {
+        self.deps.push_str("\ndep-probes ");
+        self.deps.push_str(probes_hex);
+        self.deps = blaze_proc_macro::module::sha256_hex(self.deps.as_bytes());
+        self
+    }
 }
 
 /// The git folders the store's modules were built from, by `name version`: read from the

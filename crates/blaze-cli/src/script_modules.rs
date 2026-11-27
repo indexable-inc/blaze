@@ -153,7 +153,7 @@ pub(crate) fn run<'b>(
             && let Some(inputs) = compile
         {
             let _compile_cx = cx.span("script module: self-compile build.rs to wasm64");
-            match crate::wasm64_compile::compile_build_script(&store, inputs, script_unit, package, version, features, deps) {
+            match crate::wasm64_compile::compile_build_script(cx, &store, inputs, script_unit, package, version, features, deps) {
                 Ok(wasm_sha256) => {
                     let mut made = Made::new_in(name, held);
                     made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.trim().as_bytes());

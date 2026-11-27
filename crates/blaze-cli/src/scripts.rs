@@ -561,13 +561,13 @@ impl<'f> Scripts<'f> {
     /// scripts' children share (the jobserver). `Err`: the setup's words, kept, so every later job
     /// fails with them and none opens it again.
     #[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or fact of it")]
-    fn shared(&mut self, cx: &Cx, env: &FetchEnv<'_>, store: &mut dyn Store<'_>, tool: blaze_drive::Tool, workers: u32, world: &blaze_world::World<'_>, frame: &'f Frame) -> Result<&'f Shared<'f>, &'f str> {
+    fn shared(&mut self, cx: &Cx, env: &FetchEnv<'_>, probes: &SharedCommandProbes<'_>, store: &mut dyn Store<'_>, tool: blaze_drive::Tool, workers: u32, world: &blaze_world::World<'_>, frame: &'f Frame) -> Result<&'f Shared<'f>, &'f str> {
         if let Some(opened) = self.shared {
             return opened;
         }
         let _cx = cx.span("scripts: the shared setup opened (the runtime, each side's probe answers, the native runner)");
         self.setups_opened = self.setups_opened.saturating_add(1);
-        let opened = Scripts::open_shared(cx, env, store, tool, workers, world, self.graph_record, frame).map_err(|error| said(frame, format_args!("{error}")));
+        let opened = Scripts::open_shared(cx, env, probes, store, tool, workers, world, self.graph_record, frame).map_err(|error| said(frame, format_args!("{error}")));
         self.shared = Some(opened);
         opened
     }
@@ -576,7 +576,7 @@ impl<'f> Scripts<'f> {
     /// `records` (the command's store) by its key, or walked once and put there ([`CommandFeatures`]); `tool` is the
     /// `Script` kind's tool, so a change of the walk's code moves the key (rule 52).
     #[expect(clippy::too_many_arguments, reason = "a task's edge: each argument one handle or fact of it")]
-    fn open_shared(cx: &Cx, env: &FetchEnv<'_>, records: &mut dyn Store<'_>, tool: blaze_drive::Tool, workers: u32, world: &blaze_world::World<'_>, graph_record: &'f [u8], frame: &'f Frame) -> Result<&'f Shared<'f>, SetupError<'f>> {
+    fn open_shared(cx: &Cx, env: &FetchEnv<'_>, probes: &SharedCommandProbes<'_>, records: &mut dyn Store<'_>, tool: blaze_drive::Tool, workers: u32, world: &blaze_world::World<'_>, graph_record: &'f [u8], frame: &'f Frame) -> Result<&'f Shared<'f>, SetupError<'f>> {
         let home = env.home.ok_or(SetupError::NoHome)?;
         // The heap, for the setting: it lives to the command's end ([`Scripts::open`]).
         let alloc: Alloc<'f> = env.heap.alloc();
@@ -627,7 +627,11 @@ impl<'f> Scripts<'f> {
         // resolved again here.
         let checkout = env.served.within(frame);
         let no_sdk = env.sdk.is_err();
-        let c_probes = open_c_probes(cx, env, home, host, alloc);
+        let c_probes = match probes.c_probes(cx) {
+            Ok(Some(c_probes)) => c_probes,
+            Ok(None) => return Err(SetupError::NoHome),
+            Err(error) => return Err(SetupError::Setting(said(frame, format_args!("{error}")))),
+        };
         let shared: &'f Shared<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Shared { result_alloc: env.heap.shared(), runtime, store, checkout, table, macro_table, spawn, c_probes, native, no_sdk, graph_record }, frame));
         Ok(shared)
     }
@@ -649,10 +653,160 @@ impl Drop for Scripts<'_> {
     }
 }
 
+/// Error initializing shared command-level C-probe or derived-fact pin settings.
+#[derive(Debug)]
+pub(crate) struct ProbeSetupError(pub(crate) blaze_own::String<blaze_own::SharedAlloc<'static>>);
+
+impl core::fmt::Display for ProbeSetupError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+
+/// Command-level lazy holder for `CProbeSetting` and derived-fact `SpawnSetting`, shared across
+/// normal workspace `Script` tasks (`Scripts::open_shared`) and wasm64 dependency build scripts
+/// (`wasm64_compile`, `macros::list`, `proc_runner::make`), so:
+/// - Zero home/clang-shelf/userland I/O runs until actually needed (cache miss or unit with
+///   dependency build scripts).
+/// - `open_command_c_probes` (`HermeticClangProbe`'s `verify_flight` and `VerifiedExec`) is
+///   opened at most once per command and reused between wave-0 self-compiles and wave-1 `Script`
+///   runs (Rule 30).
+/// - `fact_pins::command_spawn_setting` errors are preserved and propagated verbatim (Rule 3).
+pub(crate) struct SharedCommandProbes<'f> {
+    env: &'f FetchEnv<'f>,
+    c_probes: bstd::sync::Once<Option<blaze_proc_macro::probe_clang::CProbeSetting>>,
+    spawn_setting: bstd::sync::Once<Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>>,
+}
+
+impl<'f> SharedCommandProbes<'f> {
+    /// Creates an uninitialized lazy holder borrowing `env` (zero I/O, zero allocations).
+    pub(crate) fn new(env: &'f FetchEnv<'f>) -> Self {
+        Self {
+            env,
+            c_probes: bstd::sync::Once::new("command.c_probes"),
+            spawn_setting: bstd::sync::Once::new("command.spawn_setting"),
+        }
+    }
+
+    /// Lazily opens and shares the single command-level `CProbeSetting` (`Ok(None)` when `HOME`
+    /// is unset). Never called on `MacroModule` cache hits.
+    pub(crate) fn c_probes(
+        &self,
+        cx: &Cx,
+    ) -> Result<Option<blaze_proc_macro::probe_clang::CProbeSetting>, ProbeSetupError> {
+        let shared = self.env.heap.shared();
+        let slot = self
+            .c_probes
+            .get_or_make(cx, |cx| {
+                let opened = self.env.home.map(|home| {
+                    open_c_probes(cx, self.env, home, crate::graph::TRIPLE, self.env.heap.alloc())
+                });
+                Ok::<_, core::convert::Infallible>(opened)
+            })
+            .map_err(|error| {
+                let mut msg = blaze_own::String::new_in(shared);
+                let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("opening command C probes: {error}"));
+                ProbeSetupError(msg)
+            })?;
+        Ok(slot.as_ref().map(blaze_own::Share::share))
+    }
+
+    /// Lazily computes the command's derived-fact `SpawnSetting` (`command_spawn_setting`),
+    /// propagating any `CommandPinsError` verbatim (never falling back to `SpawnSetting::off()`).
+    pub(crate) fn spawn_setting(&self, cx: &Cx) -> Result<&SpawnSetting, ProbeSetupError> {
+        let shared = self.env.heap.shared();
+        let slot = self
+            .spawn_setting
+            .get_or_make(cx, |_cx| {
+                let res = blaze_proc_macro::fact_pins::command_spawn_setting(
+                    crate::graph::TRIPLE,
+                    self.env.heap.alloc(),
+                )
+                .map_err(|error| {
+                    let mut msg = blaze_own::String::new_in(shared);
+                    let _ = core::fmt::Write::write_fmt(
+                        &mut msg,
+                        format_args!("the command's spawn setting (the derived facts' pins): {error}"),
+                    );
+                    msg
+                });
+                Ok::<_, core::convert::Infallible>(res)
+            })
+            .map_err(|error| {
+                let mut msg = blaze_own::String::new_in(shared);
+                let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("opening command spawn pins: {error}"));
+                ProbeSetupError(msg)
+            })?;
+        match slot {
+            Ok(setting) => Ok(setting),
+            Err(why) => Err(ProbeSetupError(blaze_own::String::from_str_in(why.as_str(), shared))),
+        }
+    }
+
+    /// Computes the deterministic 64-hex digest of all probe/pin inputs observable by a dependency
+    /// build script (`host`, derived-fact `pins`, pinned `clang_sha256`, Apple `sdk_id`, and
+    /// `default_answerer_strategy_id`) without opening `CProbeSetting` or home filesystem
+    /// capabilities.
+    pub(crate) fn dep_probe_identity_hex(
+        &self,
+        cx: &Cx,
+    ) -> Result<crate::wasm64_compile::Hex64, ProbeSetupError> {
+        let spawn = self.spawn_setting(cx)?;
+        let mut sdk_buf = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
+        let (clang_sha256, sdk_id) = if self.env.home.is_some() {
+            (
+                blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE),
+                encode_sdk_hex(self.env, &mut sdk_buf).map(|(_, id)| id),
+            )
+        } else {
+            (None, None)
+        };
+        let answerer_id = blaze_proc_macro::probe_clang::default_answerer_strategy_id();
+        Ok(crate::wasm64_compile::DepProbeIdentity {
+            host: crate::graph::TRIPLE,
+            pins: spawn.pins.as_ref(),
+            clang_sha256,
+            sdk_id,
+            answerer_id,
+        }
+        .hex())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn c_probes_initialized(&self) -> bool {
+        self.c_probes.get().is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_setting_initialized(&self) -> bool {
+        self.spawn_setting.get().is_some()
+    }
+}
+
+/// Encodes any resolved Apple SDK identity from `env.sdk` into `(folder, 64-hex-id)` on `buf`.
+fn encode_sdk_hex<'a>(
+    env: &'a FetchEnv<'_>,
+    buf: &'a mut [u8; blaze_apple_sdk::SdkId::KEY_LEN * 2],
+) -> Option<(&'a str, &'a str)> {
+    let sdk = env.sdk.as_ref().ok()?;
+    let key = sdk.identity().key();
+    for (i, byte) in key.iter().enumerate() {
+        let hi = byte >> 4;
+        let lo = byte & 15;
+        if let Some(slot) = buf.get_mut(2 * i) {
+            *slot = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
+        }
+        if let Some(slot) = buf.get_mut(2 * i + 1) {
+            *slot = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
+        }
+    }
+    let id_str = core::str::from_utf8(buf).unwrap_or("");
+    Some((sdk.folder(), id_str))
+}
+
 /// Opens the command's hermetic C compiler probe setting (`probe_clang::open_command_c_probes`)
 /// for `host`, encoding any resolved Apple SDK identity into the `(folder, hex_id)` pair.
-/// Shared between normal workspace `Script` tasks (`Scripts::open_shared`) and wasm64 dependency
-/// build scripts (`wasm64_compile::DepScriptProbes::open`, rule 30).
+/// Called lazily at most once per command through [`SharedCommandProbes::c_probes`] (rule 30).
 pub(crate) fn open_c_probes(
     cx: &Cx,
     env: &FetchEnv<'_>,
@@ -661,21 +815,7 @@ pub(crate) fn open_c_probes(
     alloc: Alloc<'_>,
 ) -> blaze_proc_macro::probe_clang::CProbeSetting {
     let mut sdk_hex = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
-    let sdk_pair = env.sdk.as_ref().ok().map(|sdk| {
-        let key = sdk.identity().key();
-        for (i, byte) in key.iter().enumerate() {
-            let hi = byte >> 4;
-            let lo = byte & 15;
-            if let Some(slot) = sdk_hex.get_mut(2 * i) {
-                *slot = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
-            }
-            if let Some(slot) = sdk_hex.get_mut(2 * i + 1) {
-                *slot = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
-            }
-        }
-        let id_str = core::str::from_utf8(&sdk_hex).unwrap_or("");
-        (sdk.folder(), id_str)
-    });
+    let sdk_pair = encode_sdk_hex(env, &mut sdk_hex);
     blaze_proc_macro::probe_clang::open_command_c_probes(cx, &env.fs, home, host, sdk_pair, alloc)
 }
 
@@ -867,6 +1007,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     scripts: &mut Option<Result<Scripts<'f>, &'f str>>,
     names: &mut Option<crate::names::Names<'f>>,
     env: &FetchEnv<'_>,
+    probes: &SharedCommandProbes<'_>,
     tool: blaze_drive::Tool,
     workers: u32,
     lock: Option<&'f Lock<'static>>,
@@ -1014,7 +1155,7 @@ pub(crate) fn job<'f: 'j, 'j>(
     };
     // The first job made ready opens what the pool shares; a job that only asked for inputs
     // (above) opened none.
-    let shared = match scripts.shared(&cx, env, store, tool, workers, world, frame) {
+    let shared = match scripts.shared(&cx, env, probes, store, tool, workers, world, frame) {
         Ok(shared) => shared,
         Err(words) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true }),
     };
@@ -1026,6 +1167,14 @@ pub(crate) fn job<'f: 'j, 'j>(
     }) {
         Ok(opt) => opt.map(|hex| crate::work::held_str(&hex, jobs)),
         Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
+    };
+    let deps_digest = if crate::wasm64_compile::unit_has_dep_build_scripts(graph, scripts.wasm_graph, script, false) {
+        match probes.dep_probe_identity_hex(&cx) {
+            Ok(probes_hex) => Some(crate::wasm64_compile::fold_dep_probes_opt(deps_digest, probes_hex.as_str(), jobs)),
+            Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
+        }
+    } else {
+        deps_digest
     };
     Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole, deps_digest }))
 }
