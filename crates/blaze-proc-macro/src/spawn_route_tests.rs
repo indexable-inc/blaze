@@ -21,7 +21,9 @@ use crate::sandbox::Read;
 use crate::script::{ScriptError, ScriptWhy};
 use crate::script_sandbox::{Refusal, Script, ScriptSandbox, SpawnRefusal, Tree};
 use crate::spawn_records::Recorded;
-use crate::spawn_route::{Decoded, PinnedTool, Route, SpawnSetting, child_env, hex, program_found, route};
+use crate::spawn_route::{
+    Decoded, PinnedTool, Route, SpawnSetting, child_env, guest_dir_under, hex, probe_cwd_allowed, program_found, route,
+};
 
 const LIMITS: RunLimits = RunLimits { fuel: 1 << 26, memory: 16 << 20, out_dir_bytes: 1 << 20, out_dir_files: 16, output: 1 << 20, line: 256 << 10 };
 
@@ -502,4 +504,182 @@ fn a_deferred_compile_keeps_each_version_of_a_rewritten_source() {
         other => panic!("x.c: {other:?}"),
     };
     assert_eq!(last, X_B, "CONTROL: OUT_DIR read at run time is B for both compiles");
+}
+
+#[test]
+fn compiler_probe_cwd_validation_accepts_out_dir_subdirs_and_rejects_escapes() {
+    let mount = "/package";
+    let out_dir = "/target/debug/build/aws-lc-sys-0123456789abcdef/out";
+
+    // Strictly-contained clean subdirectories under `out_dir` are accepted.
+    for ok_sub in [
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/out-c11",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/out-c11/",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out//out-c11",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/./out-c11/.",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/a/b/",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/./a//b/c",
+    ] {
+        assert!(guest_dir_under(ok_sub, out_dir), "guest_dir_under must accept `{ok_sub}`");
+        assert!(guest_dir_under(ok_sub, "/target/debug/build/aws-lc-sys-0123456789abcdef/out/"), "trailing slash on base: `{ok_sub}`");
+        assert!(probe_cwd_allowed(ok_sub, mount, out_dir), "probe_cwd_allowed must accept `{ok_sub}`");
+    }
+
+    // `mount` and `out_dir` themselves are accepted by `probe_cwd_allowed` (while
+    // `guest_dir_under` requires a strictly contained child directory).
+    for ok_same in [
+        mount,
+        ".",
+        "./",
+        "/package/.",
+        out_dir,
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/.",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out//",
+    ] {
+        assert!(!guest_dir_under(ok_same, out_dir), "guest_dir_under must not treat `{ok_same}` as strict subdir");
+        assert!(probe_cwd_allowed(ok_same, mount, out_dir), "probe_cwd_allowed must accept `{ok_same}`");
+    }
+
+    // Traversals, prefix-confusion siblings, relative paths, unrelated absolute paths, and
+    // empty/NUL/malformed paths must all be rejected.
+    for bad in [
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/..",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/../escape",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/a/../../escape",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/a/../b",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/../out",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out-other",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out-evil/sub",
+        "/tmp",
+        "/tmp/out-c11",
+        "/",
+        "/package/sub",
+        "out-c11",
+        "./out-c11",
+        "../out",
+        "..",
+        "",
+        "/target/debug/build/aws-lc-sys-0123456789abcdef/out/out-c11\0",
+        "/package\0",
+    ] {
+        assert!(!guest_dir_under(bad, out_dir), "guest_dir_under must reject `{bad:?}`");
+        assert!(!probe_cwd_allowed(bad, mount, out_dir), "probe_cwd_allowed must reject `{bad:?}`");
+    }
+
+    // Degenerate bases (root-only, empty, relative, NUL, traversal) must never match.
+    assert!(!guest_dir_under("/tmp", "/"));
+    assert!(!guest_dir_under("/tmp", "///./"));
+    assert!(!guest_dir_under("/out/sub", ""));
+    assert!(!guest_dir_under("/out/sub", "out"));
+    assert!(!guest_dir_under("/out/sub", "/out\0"));
+    assert!(!guest_dir_under("/a/../out/sub", "/a/../out"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn spawn_probe_accepts_out_dir_subdir_and_refuses_escapes() {
+    use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, ProbeAnswerer};
+    use blaze_own::{AString, Arc as OwnArc, SharedAlloc, String as OwnString};
+
+    use crate::probe_clang::{CProbeSetting, CProbeStore, CScriptProbes, MemCProbeStore};
+
+    struct StubProbeAnswerer;
+
+    impl ProbeAnswerer for StubProbeAnswerer {
+        fn id<'a>(&self, _alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
+            Ok(ContentId([0x42; 32]))
+        }
+
+        fn answer<'a, 'b>(
+            &self,
+            probe: &CanonicalProbe<'_, '_>,
+            input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+            alloc: Alloc<'a>,
+        ) -> Result<ProbeAnswer<'a>, AString<'a>> {
+            assert_eq!(probe.input_rels.len(), 1, "expected one probe input file");
+            let bytes = input_bytes(probe.input_rels[0].1.as_str()).expect("probe input staged in OUT_DIR");
+            assert_eq!(bytes, b"int main(void) { return 0; }\n");
+            Ok(ProbeAnswer {
+                code: 0,
+                stdout: OwnString::new_in(alloc),
+                stderr: OwnString::new_in(alloc),
+            })
+        }
+    }
+
+    let out_dir = "/target/debug/build/aws-lc-sys-0123456789abcdef/out";
+    let host = "x86_64-unknown-linux-gnu";
+    let clang_pin = blaze_build_script::toolchain::clang_pin(blaze_pins::CLANG_JSON, host).expect("linux x64 clang pin");
+    let shared = SharedAlloc::global();
+    let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> = OwnArc::new_in(StubProbeAnswerer, shared);
+    let records: OwnArc<dyn CProbeStore, SharedAlloc<'static>> = OwnArc::new_in(MemCProbeStore::default(), shared);
+    let c_probes = CProbeSetting::Ready(CScriptProbes {
+        answerer,
+        records,
+        sdk_dir: OwnArc::from_str_in("", shared),
+        sdk_id: OwnArc::from_str_in("", shared),
+        sdk_digest: blaze_build_script::facts::sdk_id_digest(""),
+        clang_sha256: clang_pin.sha256,
+    });
+
+    let script = Arc::new(Script {
+        package: "aws-lc-sys 0.45.0".to_owned(),
+        tree: Tree::Mem { files: Arc::new(Vec::new()), submodules: Arc::from([]), git: None },
+        root: crate::script_sandbox::ScriptRoot::member("").expect("root package"),
+        env: vec![("OUT_DIR".to_owned(), out_dir.to_owned())],
+        target: host.to_owned(),
+        host: host.to_owned(),
+        c_mode: CMode::Deferred,
+        limits: LIMITS,
+        table: Arc::new(Vec::new()),
+        probes: None,
+        c_probes: Some(c_probes),
+        spawner: None,
+        step: ContentId([4; 32]),
+        spawn_setting: Arc::new(SpawnSetting::off()),
+        deps: Arc::new(crate::script_sandbox::dep_mount::DepViews::none()),
+    });
+
+    let src_bytes = b"int main(void) { return 0; }\n";
+    let out_obj = format!("{out_dir}/out-c11/flag_check");
+    let out_src = format!("{out_dir}/out-c11/flag_check.c");
+    let nested_obj = format!("{out_dir}/a/b/flag_check");
+    let nested_src = format!("{out_dir}/a/b/flag_check.c");
+
+    for (cwd, obj, src, rel) in [
+        (format!("{out_dir}/out-c11"), &out_obj, &out_src, "out-c11/flag_check.c"),
+        (format!("{out_dir}/a/b/"), &nested_obj, &nested_src, "a/b/flag_check.c"),
+        ("/workspace".to_owned(), &out_obj, &out_src, "out-c11/flag_check.c"),
+        (out_dir.to_owned(), &out_obj, &out_src, "out-c11/flag_check.c"),
+    ] {
+        let mut sandbox = ScriptSandbox::new(Arc::clone(&script));
+        put(&mut sandbox, rel, Some(src_bytes));
+        let req = shim(&["cc", "-c", "-o", obj.as_str(), src.as_str()], false, &[], Some(cwd.as_str()), b"", [2, 2]);
+        if let Err(stop) = sandbox.spawn(&req) {
+            panic!("expected probe with cwd `{cwd}` to succeed, stopped with: {}", stop.0);
+        }
+        assert_eq!(&sandbox.reply[..4], &0i32.to_le_bytes(), "exit 0 for cwd `{cwd}`");
+    }
+
+    for bad_cwd in [
+        format!("{out_dir}/.."),
+        format!("{out_dir}/a/../../escape"),
+        format!("{out_dir}-other"),
+        "/tmp".to_owned(),
+        "out-c11".to_owned(),
+    ] {
+        let mut sandbox = ScriptSandbox::new(Arc::clone(&script));
+        put(&mut sandbox, "out-c11/flag_check.c", Some(src_bytes));
+        let req = shim(&["cc", "-c", "-o", out_obj.as_str(), out_src.as_str()], false, &[], Some(bad_cwd.as_str()), b"", [2, 2]);
+        let Err(stop) = sandbox.spawn(&req) else {
+            panic!("probe with disallowed cwd `{bad_cwd}` must be refused");
+        };
+        assert!(
+            matches!(&sandbox.refused, Some(Refusal::Spawn(SpawnRefusal::Fact { why, .. })) if why.contains("compiler probe current_dir")),
+            "expected current_dir refusal for `{bad_cwd}`, got {:?} ({})",
+            sandbox.refused,
+            stop.0
+        );
+    }
 }

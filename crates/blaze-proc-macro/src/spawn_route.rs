@@ -503,7 +503,7 @@ pub(crate) fn same_guest_dir(cwd_override: &str, mount: &str) -> bool {
         }
         true
     }
-    if cwd_override.is_empty() {
+    if cwd_override.is_empty() || cwd_override.contains('\0') {
         return false;
     }
     let mut norm_mount = [""; MAX_PARTS];
@@ -523,6 +523,62 @@ pub(crate) fn same_guest_dir(cwd_override: &str, mount: &str) -> bool {
         return cwd_override == mount;
     }
     cwd_len == mount_len && norm_cwd.get(..cwd_len) == norm_mount.get(..mount_len)
+}
+
+/// Returns whether `cwd_override` is a clean, absolute directory strictly contained under
+/// `base` (collapsing trailing/duplicate `/` and `.` components, while rejecting empty,
+/// relative, NUL-containing, root-only `base`, prefix-confusion sibling, or `..`-traversing
+/// paths).
+pub(crate) fn guest_dir_under(cwd_override: &str, base: &str) -> bool {
+    if !cwd_override.starts_with('/')
+        || !base.starts_with('/')
+        || cwd_override.contains('\0')
+        || base.contains('\0')
+    {
+        return false;
+    }
+    let mut base_parts = base.split('/').filter(|seg| !seg.is_empty() && *seg != ".");
+    let mut cwd_parts = cwd_override.split('/').filter(|seg| !seg.is_empty() && *seg != ".");
+    let mut saw_base = false;
+    for base_seg in &mut base_parts {
+        if base_seg == ".." {
+            return false;
+        }
+        saw_base = true;
+        let Some(cwd_seg) = cwd_parts.next() else {
+            return false;
+        };
+        if cwd_seg == ".." || cwd_seg != base_seg {
+            return false;
+        }
+    }
+    if !saw_base {
+        return false;
+    }
+    let mut saw_child = false;
+    for cwd_seg in cwd_parts {
+        if cwd_seg == ".." {
+            return false;
+        }
+        saw_child = true;
+    }
+    saw_child
+}
+
+/// Returns whether `cwd_override` is a hermetic working directory for a compiler probe:
+/// equal to `mount`, equal to `out_dir` (absolute and traversal-free), or a clean
+/// normalized subdirectory strictly under `out_dir`.
+pub(crate) fn probe_cwd_allowed(cwd_override: &str, mount: &str, out_dir: &str) -> bool {
+    if same_guest_dir(cwd_override, mount) {
+        return true;
+    }
+    if !cwd_override.starts_with('/')
+        || cwd_override.contains('\0')
+        || cwd_override.split('/').any(|seg| seg == "..")
+    {
+        return false;
+    }
+    same_guest_dir(cwd_override, out_dir) || guest_dir_under(cwd_override, out_dir)
 }
 
 impl ScriptSandbox {
@@ -613,15 +669,15 @@ impl ScriptSandbox {
         let sdk = env.iter().find(|(k, _)| *k == "SDKROOT").map_or("", |(_, v)| *v);
         let mount = script.cwd();
         let out_dir = script.out_dir();
-        // `cc-rs` spawns compiler flag probes (`flag_check.c`) with `.current_dir(OUT_DIR)`.
-        // `c_tasks_probe` refuses any relative or non-`OUT_DIR` file argument, so both `mount`
-        // and `out_dir` are hermetic probe working directories (rule 21).
+        // `cc-rs` spawns compiler flag probes (`flag_check.c`) with `.current_dir(OUT_DIR)` or a
+        // subdirectory beneath `OUT_DIR` (e.g. `aws-lc-sys`'s `out-c11`). `c_tasks_probe` refuses
+        // any relative or non-`OUT_DIR` file argument, so `mount`, `out_dir`, and clean
+        // subdirectories strictly under `out_dir` are hermetic probe working directories (rule 21).
         if let Some(ref cwd_override) = spawned.cwd
-            && !same_guest_dir(cwd_override.as_str(), mount.as_str())
-            && !same_guest_dir(cwd_override.as_str(), out_dir)
+            && !probe_cwd_allowed(cwd_override.as_str(), mount.as_str(), out_dir)
         {
             return Err(self.refuse(Refusal::Spawn(refused(format!(
-                "compiler probe current_dir `{cwd_override}` differs from script cwd `{mount}` and OUT_DIR `{out_dir}` (rule 21)"
+                "compiler probe current_dir `{cwd_override}` differs from script cwd `{mount}` and is not under OUT_DIR `{out_dir}` (rule 21)"
             )))));
         }
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
