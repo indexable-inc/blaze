@@ -373,6 +373,10 @@ pub struct Consts<'n> {
     bodies: Vec<ConstBody<'n>, Global>,
     records: Vec<Evaluated>,
     unit: Option<(PortableTys<'static>, Layouts<Alloc<'static>>, Codes<Alloc<'static>>)>,
+    /// Separate 32-bit layout table for crates whose `target_pointer_width` is `"32"` (e.g.
+    /// `Side::Macro` on `wasm32-wasip1`) so `size_of::<usize>()` evaluates to `4` without
+    /// colliding with 64-bit `Layouts` entries over the shared `PortableTys`.
+    layout_32: Option<Layouts<Alloc<'static>>>,
     /// The facts of every closure written in a body checked here ([`Consts::check_as`]: a
     /// constant's, a const block's owner's), made by the build's one rule
     /// (`run::ClosureTable::add`); `None` until the first body with a closure is checked.
@@ -393,7 +397,7 @@ struct Evaluated {
 
 impl Default for Consts<'_> {
     fn default() -> Self {
-        Consts { bodies: Vec::new_in(Global), records: Vec::new_in(Global), unit: None, closures: None, definers: None }
+        Consts { bodies: Vec::new_in(Global), records: Vec::new_in(Global), unit: None, layout_32: None, closures: None, definers: None }
     }
 }
 
@@ -1140,7 +1144,16 @@ impl<'n> Consts<'n> {
                 self.check_as(r, prepared, owner, item, Some(at))?;
             }
         }
-        let (mut ground, mut layout, mut codes) = self.unit.take().unwrap_or_else(|| (PortableTys::new_in(alloc), Layouts::new_in(alloc), Codes::new_in(alloc)));
+        let ptr_bytes = crate_ptr_bytes(r, match root {
+            Root::Body { owner, .. } => owner,
+            _ => item,
+        });
+        let (mut ground, mut layout_64, mut codes) = self.unit.take().unwrap_or_else(|| (PortableTys::new_in(alloc), Layouts::new_in(alloc), Codes::new_in(alloc)));
+        let mut layout_32 = if ptr_bytes == 4 {
+            Some(self.layout_32.take().unwrap_or_else(|| Layouts::with_ptr_bytes_in(4, alloc)))
+        } else {
+            None
+        };
         let root = match root {
             Root::Plain => Ok((item, List::EMPTY)),
             Root::SelfTy(node) => self.select_root(r, item, node, &mut ground, alloc),
@@ -1149,7 +1162,10 @@ impl<'n> Consts<'n> {
         let (item, root_args) = match root {
             Ok(root) => root,
             Err(e) => {
-                self.unit = Some((ground, layout, codes));
+                self.unit = Some((ground, layout_64, codes));
+                if let Some(l32) = layout_32 {
+                    self.layout_32 = Some(l32);
+                }
                 return Err(e);
             }
         };
@@ -1158,7 +1174,10 @@ impl<'n> Consts<'n> {
         let instance = blaze_build::Instance { item, args: root_args };
         if let Some(done) = self.records.iter().find(|r| r.instance == instance) {
             r.store.maps.read_inputs(done.inputs.as_ref());
-            self.unit = Some((ground, layout, codes));
+            self.unit = Some((ground, layout_64, codes));
+            if let Some(l32) = layout_32 {
+                self.layout_32 = Some(l32);
+            }
             return Ok(done.record.key);
         }
         let mut settle = Settle::new(Need { kind: NeedKind::Value, item, args: root_args }, MOST_NEEDS, alloc);
@@ -1209,7 +1228,8 @@ impl<'n> Consts<'n> {
                 coroutines: build.and_then(|b| b.coroutines),
                 definers,
             };
-            let answer = value_of(&world, &mut layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc);
+            let layout = layout_32.as_mut().unwrap_or(&mut layout_64);
+            let answer = value_of(&world, layout, &mut codes, n.item, n.args, &mut ground, Limits::DEFAULT, alloc);
             let selected = world.selected.take();
             // A call refused by its callee's kind: the refusal carries what `fn_kind` said
             // (`None`: a head read without `const`; `Some(fact)`: a fact front2 does not hold).
@@ -1324,7 +1344,10 @@ impl<'n> Consts<'n> {
                 break;
             }
         }
-        self.unit = Some((ground, layout, codes));
+        self.unit = Some((ground, layout_64, codes));
+        if let Some(l32) = layout_32 {
+            self.layout_32 = Some(l32);
+        }
         out?;
         last.ok_or(ConstFail::Eval(format!("constant {item:?}: the evaluation settled with no record").into_boxed_str()))
     }
@@ -1459,6 +1482,38 @@ impl<'n> Consts<'n> {
         }
         Ok(ConstBody { key, inputs: None, text, hash: hash_text(text), typeck: lowered.typeck, tys: lowered.tys, checked, lits, root })
     }
+}
+
+/// Target pointer width in bytes (`4` for `target_pointer_width = "32"`, else `8`) for the crate
+/// owning `item` (resolved through library keys, member/anon containers, or local heads).
+fn crate_ptr_bytes<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, mut item: ItemKey) -> u8 {
+    for _ in 0..8 {
+        if let Some(lib) = r.keys.library_in(r.names, item)
+            && let Some(krate) = r.names.crate_of(lib)
+            && let Some(atoms) = r.names.cfg_atoms(krate)
+            && let Some(bits) = atoms
+                .iter()
+                .find(|(n, _)| *n == "target_pointer_width")
+                .and_then(|(_, w)| w.and_then(|w| w.parse::<u32>().ok()))
+        {
+            return (bits / 8) as u8;
+        }
+        if let Some(h) = r.store.locals.head(item)
+            && let Some(krate) = r.names.crate_of(h.module)
+            && let Some(atoms) = r.names.cfg_atoms(krate)
+            && let Some(bits) = atoms
+                .iter()
+                .find(|(n, _)| *n == "target_pointer_width")
+                .and_then(|(_, w)| w.and_then(|w| w.parse::<u32>().ok()))
+        {
+            return (bits / 8) as u8;
+        }
+        match r.keys.origin(item) {
+            Some(super::keys::Origin::Member { container, .. }) if *container != item => item = *container,
+            _ => break,
+        }
+    }
+    8
 }
 
 /// A constant's value as an unsigned integer of at most 16 bytes, from its record's root.

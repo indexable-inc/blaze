@@ -95,12 +95,59 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok((self.mk_list(&all)?, output))
     }
 
+    /// Weakest expected `ClosureKind` among any unsettled local closures inside `t` (e.g.
+    /// `Box<Closure, A>` where the closure received an `FnMut` or `FnOnce` bound from a helper
+    /// like `fn_mut(...)` / `fn_once(...)`). Prevents `overloaded_call` from prematurely picking
+    /// `Fn` while the closure's own kind inference variable is still unconstrained.
+    fn overloaded_call_min_kind(&mut self, root: Ty) -> Option<crate::ty::ClosureKind> {
+        let mut stack: blaze_own::Vec<Ty, blaze_own::Alloc<'a>> = blaze_own::Vec::new_in(self.alloc);
+        stack.push(root);
+        let mut min_kind: Option<crate::ty::ClosureKind> = None;
+        let mut steps = 0u32;
+        while let Some(ty) = stack.pop() {
+            steps += 1;
+            if steps > 64 {
+                break;
+            }
+            let ty = self.ty.shallow_resolve(ty);
+            match self.view(ty) {
+                TyView::Closure(ce, _) => {
+                    if let Some(k) = self.closures.iter().find(|c| c.expr == ce).and_then(|c| c.expected_kind) {
+                        min_kind = Some(match min_kind {
+                            Some(prev) => prev.max(k),
+                            None => k,
+                        });
+                    }
+                }
+                TyView::Ref(_, inner) | TyView::Ptr(_, inner) => stack.push(inner),
+                TyView::Adt(_, args) | TyView::Tuple(args) => {
+                    for i in 0..self.ty.list_len(args) {
+                        stack.push(self.ty.list_get(args, i));
+                    }
+                }
+                _ => {}
+            }
+        }
+        min_kind
+    }
+
     /// Probe each callable trait with a fresh argument tuple. The selected method determines
     /// the receiver adjustment and the result projection. For an async call the expression
     /// produces the call future. Awaiting that future yields the declared output.
     fn overloaded_call(&mut self, e: ExprId, callee: ExprId, t: Ty, n: usize) -> Result<Option<(TyList, Ty)>, Stop> {
+        let min_kind = self.overloaded_call_min_kind(t);
         let mut missing = None;
         for method in super::closure::CALL_METHODS {
+            let method_kind = match method.trait_ {
+                LangItem::Fn | LangItem::AsyncFn => crate::ty::ClosureKind::Fn,
+                LangItem::FnMut | LangItem::AsyncFnMut => crate::ty::ClosureKind::FnMut,
+                _ => crate::ty::ClosureKind::FnOnce,
+            };
+            if let Some(min_k) = min_kind
+                && method_kind < min_k
+            {
+                continue;
+            }
             let Some(tr) = self.lang(method.trait_)? else {
                 if missing.is_none() && matches!(method.trait_, LangItem::Fn | LangItem::FnMut | LangItem::FnOnce) {
                     missing = Some(method.trait_);

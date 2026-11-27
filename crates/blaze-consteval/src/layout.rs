@@ -43,6 +43,10 @@ impl From<Refusal<'static>> for Stop {
 
 /// The layout of ground types, as the machine asks it.
 pub trait Layout {
+    /// Target pointer width in bytes (`4` for 32-bit targets like `wasm32-wasip1`, `8` for 64-bit targets).
+    fn ptr_bytes(&self) -> u64 {
+        8
+    }
     /// Size and alignment (log 2) of a sized ground type.
     fn size_align(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<(u64, u8), Stop>;
     /// The offset of field `field` (declaration order) of variant `variant` (0 for a struct,
@@ -93,6 +97,10 @@ fn stop(e: &blaze_build::layout::LayoutError) -> Stop {
 const NO_ROW: Refusal<'static> = Refusal::Malformed { what: "a layout row its type does not have" };
 
 impl<A: Allocator + Clone> Layout for Layouts<A> {
+    fn ptr_bytes(&self) -> u64 {
+        u64::from(Layouts::ptr_bytes(self))
+    }
+
     fn size_align(&mut self, ty: PTy, cx: &mut LayoutCx<'_, '_>) -> Result<(u64, u8), Stop> {
         let id = self.of(ty, cx).map_err(|e| stop(&e))?;
         let l = self.get(id);
@@ -194,13 +202,14 @@ enum Decode {
     Niche { untagged: u32, first: u32, last: u32, start: u128, mask: u128 },
 }
 
-/// The size in bytes of an integer type (`isize`/`usize`: the target's pointers, 8).
-pub(crate) fn int_size(n: PNode) -> Option<u64> {
+/// The size in bytes of an integer type (`isize`/`usize`: `ptr_bytes`).
+pub(crate) fn int_size(n: PNode, ptr_bytes: u64) -> Option<u64> {
     Some(match n {
         PNode::Int(IntTy::I8) | PNode::Uint(UintTy::U8) | PNode::Bool => 1,
         PNode::Int(IntTy::I16) | PNode::Uint(UintTy::U16) => 2,
         PNode::Int(IntTy::I32) | PNode::Uint(UintTy::U32) | PNode::Char => 4,
-        PNode::Int(IntTy::I64) | PNode::Uint(UintTy::U64) | PNode::Int(IntTy::Isize) | PNode::Uint(UintTy::Usize) => 8,
+        PNode::Int(IntTy::I64) | PNode::Uint(UintTy::U64) => 8,
+        PNode::Int(IntTy::Isize) | PNode::Uint(UintTy::Usize) => ptr_bytes,
         PNode::Int(IntTy::I128) | PNode::Uint(UintTy::U128) => 16,
         _ => return None,
     })

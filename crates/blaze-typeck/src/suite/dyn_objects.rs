@@ -466,3 +466,33 @@ fn dyn_in_a_field_or_a_bodiless_signature_is_e0038() {
         assert_eq!(got, want, "{}", fx.name_of(item));
     }
 }
+
+/// `&{int}` (a reference to an unconstrained integer inference variable, e.g. `&(x * 10)` passed
+/// to `f: &mut dyn FnMut(&dyn Display)`) unsizes cleanly to `&dyn Tr` when `i32: Tr` holds.
+#[test]
+fn unsized_coercion_from_int_var_ref_to_dyn_trait() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let unsize = fx.tr("Unsize", 2, Vec::new(), &[]);
+    fx.lang(LangItem::Unsize, unsize);
+    let tr = fx.tr("Display", 1, Vec::new(), &[]);
+    let i32_ = fx.ty(PNode::Int(crate::ids::IntTy::I32));
+    fx.imp("impl Display for i32", 0, i32_, Some((tr, &[])), &[], Vec::new());
+    let ex = fx.ty(PNode::ExTrait(tr, List::EMPTY));
+    let dyn_tr = fx.t.dynamic(&[ex]).expect("dyn Display");
+    let ref_dyn = fx.r(Mutbl::Not, dyn_tr);
+    let unit = fx.unit();
+    fx.func("take", 0, &[ref_dyn], unit, Vec::new());
+    let main = fx.func("main", 0, &[], unit, Vec::new());
+    fx.finish();
+
+    let mut b = Bb::new();
+    let take = b.path(&["take"]);
+    let lit = b.int(None);
+    let r = b.borrow(Mutbl::Not, lit);
+    let call = b.call(take, &[r]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, main, root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "&{{int}} -> &dyn Display must check clean, got: {:?}", c.diags);
+}

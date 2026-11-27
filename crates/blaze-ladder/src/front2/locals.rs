@@ -853,6 +853,11 @@ impl<'n> Locals<'n> {
     /// block's items, then each enclosing block's (innermost first); where the body is itself
     /// a local item's, then the blocks around its declaration. `None`: the module's names.
     pub fn find(&self, owner: ItemKey, scope: Option<u32>, name: &str, ns: LocalNs) -> Option<Row<'n>> {
+        self.find_matching(owner, scope, name, ns, |_| true)
+    }
+
+    /// Like [`Self::find`], returning the innermost matching row for which `accept` returns `true`.
+    pub fn find_matching(&self, owner: ItemKey, scope: Option<u32>, name: &str, ns: LocalNs, mut accept: impl FnMut(&Row<'n>) -> bool) -> Option<Row<'n>> {
         let mut body = owner;
         let mut at = scope;
         // Each step out leaves a local item's body or a body's anonymous constant: at most as
@@ -863,7 +868,12 @@ impl<'n> Locals<'n> {
                 // A chain is at most as long as the body's blocks.
                 for _ in 0..=b.parents.len() {
                     let Some(here) = s else { break };
-                    let wanted = |r: &&Row<'n>| r.scope == here && r.name == name && if ns == LocalNs::Value { r.kind.in_values() } else { r.kind.in_types() };
+                    let wanted = |r: &&Row<'n>| {
+                        r.scope == here
+                            && r.name == name
+                            && if ns == LocalNs::Value { r.kind.in_values() } else { r.kind.in_types() }
+                            && accept(r)
+                    };
                     if let Some(r) = b.rows.iter().find(wanted) {
                         return Some(*r);
                     }

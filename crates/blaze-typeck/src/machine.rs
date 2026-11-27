@@ -393,6 +393,8 @@ pub(crate) struct PendingClosure {
     pub expr: ExprId,
     /// Where its signature's expectation came from (D148; rules/closure.rs `sig_from`).
     pub sig_from: crate::columns::SigFrom,
+    /// Callable kind hinted by an enclosing bound (`Fn`, `FnMut`, `FnOnce`, or `dyn Fn*`), if any.
+    pub expected_kind: Option<crate::ty::ClosureKind>,
 }
 
 /// An async block's (or async closure's) future whose interior is fixed after the walk
