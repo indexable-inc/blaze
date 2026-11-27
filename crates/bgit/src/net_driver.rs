@@ -248,17 +248,23 @@ impl UploadPackClient {
     fn open(url: &str) -> io::Result<Self> {
         match parse_remote_url(url)? {
             RemoteUrl::Http(target) => {
+                // GitHub (`github.com`) natively accepts direct Protocol v2 `POST /git-upload-pack`
+                // with `Git-Protocol: version=2` without a preliminary `GET /info/refs` round trip,
+                // saving a full network RTT on every `ls-remote`, `clone`, `fetch`, and `pull`!
+                let skip_info_refs = target.tls && target.host.eq_ignore_ascii_case("github.com");
                 let mut sess = SmartHttpSession::new(target);
-                let advert = sess.exchange(
-                    "GET",
-                    "/info/refs?service=git-upload-pack",
-                    None,
-                    true,
-                    b"",
-                )?;
-                blaze_git_fetch::check_advertisement(&advert).map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("bad v2 advert: {e:?}"))
-                })?;
+                if !skip_info_refs {
+                    let advert = sess.exchange(
+                        "GET",
+                        "/info/refs?service=git-upload-pack",
+                        None,
+                        true,
+                        b"",
+                    )?;
+                    blaze_git_fetch::check_advertisement(&advert).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("bad v2 advert: {e:?}"))
+                    })?;
+                }
                 Ok(UploadPackClient::Http(sess))
             }
             RemoteUrl::Ssh(target) => {
@@ -379,15 +385,17 @@ pub(crate) fn remote_clone<'a>(
     out: &mut dyn Write,
 ) -> io::Result<()> {
     let mut client = UploadPackClient::open(url)?;
-    let proto = client.proto_label();
-    // On shallow/filtered clones from huge GitHub repos, prefer fetching `HEAD` + `refs/heads/` + `refs/tags/`
-    // (avoiding thousands of GitHub `refs/pull/*` refs that bloat clones 10x!).
-    let prefixes: &[&str] = if params.depth.is_some() || params.filter.is_some() {
+    // On shallow/filtered clones from GitHub repos, fetch only HEAD + heads (skipping thousands
+    // of `refs/pull/*` refs) and default to single-branch on `--depth` (matching `git clone --depth`)!
+    let prefixes: &[&str] = if params.depth.is_some() {
+        &["HEAD", "refs/heads/"]
+    } else if params.filter.is_some() {
         &["HEAD", "refs/heads/", "refs/tags/"]
     } else {
         &[]
     };
     let remote_refs = client.ls_refs(prefixes, alloc)?;
+    let proto = client.proto_label();
 
     let mut wants = OwnVec::new_in(alloc);
     let mut head_sym: Option<String> = None;
@@ -398,14 +406,23 @@ pub(crate) fn remote_clone<'a>(
             head_oid = r.oid;
             head_sym = r.symref_target.as_ref().map(|s| s.as_str().to_string());
         }
-        // Skip GitHub's internal `refs/pull/*` refs on clone (matching `git clone`!).
-        if name.starts_with("refs/pull/") {
-            continue;
-        }
-        if let Some(oid) = r.oid
-            && !wants.iter().any(|w| *w == oid)
-        {
+    }
+    if params.depth.is_some() {
+        if let Some(oid) = head_oid {
             wants.push(oid);
+        }
+    } else {
+        for r in &remote_refs {
+            let name = r.name.as_str();
+            // Skip GitHub's internal `refs/pull/*` refs on clone (matching `git clone`!).
+            if name.starts_with("refs/pull/") {
+                continue;
+            }
+            if let Some(oid) = r.oid
+                && !wants.iter().any(|w| *w == oid)
+            {
+                wants.push(oid);
+            }
         }
     }
 
@@ -418,6 +435,9 @@ pub(crate) fn remote_clone<'a>(
     for r in &remote_refs {
         let name = r.name.as_str();
         if name == "HEAD" || name.starts_with("refs/pull/") {
+            continue;
+        }
+        if params.depth.is_some() && head_sym.as_deref() != Some(name) {
             continue;
         }
         let Some(oid) = r.oid else {
@@ -500,8 +520,8 @@ pub(crate) fn remote_fetch<'a>(
     out: &mut dyn Write,
 ) -> io::Result<u32> {
     let mut client = UploadPackClient::open(url)?;
-    let proto = client.proto_label();
     let remote_refs = client.ls_refs(&["refs/heads/", "refs/tags/"], alloc)?;
+    let proto = client.proto_label();
 
     let mut store = open_or_infect(repo_root, alloc)?;
     let mut wants = OwnVec::new_in(alloc);

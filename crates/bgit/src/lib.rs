@@ -9,6 +9,7 @@
 
 mod cli;
 mod disk;
+mod fsmonitor;
 mod index_io;
 mod net_driver;
 mod porcelain;
@@ -87,6 +88,36 @@ pub struct WorktreeInfo {
     pub head_short: String,
     pub is_vfs: bool,
     pub auto_delete_on_merge: bool,
+}
+
+/// Structured branch metadata returned by [`query_branches`] for rich shell tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchInfo {
+    pub name: String,
+    pub short_oid: String,
+    pub oid: String,
+    pub subject: String,
+    pub is_current: bool,
+    pub is_remote: bool,
+}
+
+/// Structured per-file diffstat row returned by [`query_diff_stat`] for rich shell tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffStatEntry {
+    pub path: String,
+    pub status: char,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+/// Starts or refreshes an in-process FSEvents / kernel journal dirty-path monitor for the repo
+/// containing `cwd`. Safe to call repeatedly (O(1) once started); accelerates subsequent in-process
+/// `bgit status` and `bgit diff` calls to O(dirty).
+pub fn ensure_fsmonitor_watching(cwd: &Path) -> bool {
+    let Some(root) = find_repo_root(cwd) else {
+        return false;
+    };
+    fsmonitor::ensure_watching(&root)
 }
 
 /// Explicit output writers so `libbgit` never hardcodes process-global stdout/stderr.
@@ -258,17 +289,17 @@ pub fn try_run_git_via_bgit<'a>(
         "show-ref" => try_git_show_ref_in_process(rest, &work_dir, alloc),
         "ls-remote" => try_git_ls_remote_in_process(rest, &work_dir, alloc),
         "worktree" => try_git_worktree_in_process(rest, &work_dir, use_color, alloc),
-        "branch" | "br" | "tag" | "diff" | "show" | "remote" => {
-            try_git_bgit_passthrough(sub, rest, &work_dir, use_color, alloc)
-        }
+        "branch" | "br" | "tag" | "diff" | "show" | "remote" | "add" | "commit" | "checkout"
+        | "switch" | "reset" | "restore" | "stash" | "rm" | "mv" | "cherry-pick" | "revert"
+        | "clean" | "config" => try_git_bgit_passthrough(sub, rest, &work_dir, use_color, alloc),
         _ => None,
     }
 }
 
-/// Forwards read/local-branch `git` subcommands (`branch`, `tag`, `diff`, `show`, `remote`)
-/// to in-process `libbgit` ONLY when the enclosing repo already has `.bgit/VERSION` AND every
-/// argument is accepted by `bgit`'s `bstd::cli` spec (never implicitly infecting un-infected
-/// `.git` repos and never intercepting exotic git flags).
+/// Forwards Git porcelain commands to in-process `libbgit` ONLY when the enclosing repo already
+/// has `.bgit/VERSION` AND every argument is accepted by `bgit`'s `bstd::cli` spec (never
+/// implicitly infecting un-infected `.git` repos and never intercepting interactive/exotic flags
+/// such as `-p`, `-i`, or `git commit` without `-m`/`--amend`).
 fn try_git_bgit_passthrough<'a>(
     sub: &str,
     rest: &[&str],
@@ -280,6 +311,18 @@ fn try_git_bgit_passthrough<'a>(
     if !root.join(".bgit/VERSION").is_file() {
         return None;
     }
+    // Interactive `$EDITOR` commits (`git commit` with neither `-m` nor `--amend`) must go to real git.
+    if sub == "commit"
+        && !rest.iter().any(|&a| {
+            a == "-m"
+                || a.starts_with("-m")
+                || a == "--message"
+                || a.starts_with("--message=")
+                || a == "--amend"
+        })
+    {
+        return None;
+    }
     let mut bgit_args: Vec<&str> = Vec::with_capacity(rest.len() + 1);
     bgit_args.push(sub);
     bgit_args.extend_from_slice(rest);
@@ -288,6 +331,41 @@ fn try_git_bgit_passthrough<'a>(
         Ok(ParseOutcome::Matched(_)) => Some(run_bgit_in_process(&bgit_args, work_dir, use_color, alloc)),
         _ => None,
     }
+}
+
+/// Reads structured branch metadata directly from `.bgit` mmap slabs (`BGRF` v2 O(log R + K)).
+/// Returns `Ok(None)` if the repo is not `.bgit`-infected (never creates `.bgit` implicitly).
+pub fn query_branches<'a>(
+    cwd: &Path,
+    include_all: bool,
+    remotes_only: bool,
+    alloc: Alloc<'a>,
+) -> io::Result<Option<Vec<BranchInfo>>> {
+    let Some(root) = find_repo_root(cwd) else {
+        return Ok(None);
+    };
+    let Some(store) = open_existing_bgit_fresh(&root, alloc)? else {
+        return Ok(None);
+    };
+    let rows = porcelain::query_branches_in_repo(&store, include_all, remotes_only, alloc)?;
+    Ok(Some(rows))
+}
+
+/// Reads structured diffstat rows directly from `.bgit` mmap slabs + in-process FSEvents dirty set.
+/// Returns `Ok(None)` if the repo is not `.bgit`-infected (never creates `.bgit` implicitly).
+pub fn query_diff_stat<'a>(
+    cwd: &Path,
+    staged: bool,
+    alloc: Alloc<'a>,
+) -> io::Result<Option<Vec<DiffStatEntry>>> {
+    let Some(root) = find_repo_root(cwd) else {
+        return Ok(None);
+    };
+    let Some(store) = open_existing_bgit_fresh(&root, alloc)? else {
+        return Ok(None);
+    };
+    let rows = porcelain::query_diff_stat_in_repo(&root, &store, staged, alloc)?;
+    Ok(Some(rows))
 }
 
 /// Reads structured commit log entries directly from `.bgit` mmap slabs (if `.bgit` exists for

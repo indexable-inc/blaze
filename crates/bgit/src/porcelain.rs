@@ -332,11 +332,18 @@ pub(crate) fn cmd_branch<'a>(
         return Ok(());
     }
 
-    // List branches.
+    // List branches (narrow prefix for O(log R + K) lookup over mmap `BGRF` v2!).
     let active = current_head_branch(&store, alloc);
+    let ref_prefix = if all {
+        "refs/"
+    } else if remotes_only {
+        "refs/remotes/"
+    } else {
+        "refs/heads/"
+    };
     let mut refs = OwnVec::new_in(alloc);
     store
-        .list_refs("refs/", alloc, &mut refs)
+        .list_refs(ref_prefix, alloc, &mut refs)
         .map_err(|e| io::Error::other(format!("{e}")))?;
 
     let mut local: Vec<(String, Oid)> = Vec::new();
@@ -1043,10 +1050,47 @@ pub(crate) fn cmd_diff<'a>(
     let mut stat_rows: Vec<(String, usize, usize)> = Vec::new();
 
     // Fast path 1: Working tree vs Index (`bgit diff` with no revs and not `--staged`).
-    // Uses parallel stat-cache check across cores — skips clean files with ZERO blob/file reads!
+    // When an in-process FSEvents monitor (`blaze-shell`) is active, checks ONLY the K dirty paths
+    // (0 index parsing when clean!); otherwise runs parallel stat-cache check across cores.
     if revs.is_empty() && !staged {
-        let idx = load_index(&repo_root, alloc)?;
-        let dirty = collect_dirty_worktree_entries(&repo_root, &idx, &filters);
+        let dirty: Vec<(WritableIndexEntry, Option<Vec<u8>>)> =
+            match crate::fsmonitor::try_diff_candidates(&repo_root, alloc) {
+                Some(crate::fsmonitor::DiffFastPath::Clean) => Vec::new(),
+                Some(crate::fsmonitor::DiffFastPath::Candidates(cands)) => {
+                    let mut all_dirty_paths = BTreeSet::new();
+                    let mut out = Vec::new();
+                    for e in cands {
+                        if let Some(d) = check_worktree_entry_dirty(&repo_root, &e) {
+                            all_dirty_paths.insert(e.path.clone());
+                            if path_matches_filters(&e.path, &filters) {
+                                out.push((e, d));
+                            }
+                        }
+                    }
+                    crate::fsmonitor::update_diff_known_dirty(&repo_root, all_dirty_paths);
+                    out
+                }
+                None => {
+                    let scan_gen = crate::fsmonitor::begin_full_scan(&repo_root);
+                    let idx = load_index(&repo_root, alloc)?;
+                    let all_dirty = if filters.is_empty() || crate::fsmonitor::is_watching(&repo_root) {
+                        let d = collect_dirty_worktree_entries(&repo_root, &idx, &[]);
+                        let dirty_names: BTreeSet<String> =
+                            d.iter().map(|(e, _)| e.path.clone()).collect();
+                        crate::fsmonitor::record_diff_baseline(&repo_root, dirty_names, scan_gen);
+                        d.into_iter()
+                            .filter(|(e, _)| path_matches_filters(&e.path, &filters))
+                            .map(|(e, b)| (e.clone(), b))
+                            .collect()
+                    } else {
+                        collect_dirty_worktree_entries(&repo_root, &idx, &filters)
+                            .into_iter()
+                            .map(|(e, b)| (e.clone(), b))
+                            .collect()
+                    };
+                    all_dirty
+                }
+            };
         for (entry, new_opt) in dirty {
             let old_opt = if name_only || name_status {
                 Some(Vec::new())
@@ -2619,4 +2663,178 @@ pub(crate) fn cmd_pull<'a>(
         );
     }
     Ok(())
+}
+
+// ============================================================================
+// Structured query helpers for `blaze-shell` rich tables (`branch`, `diff --stat`)
+// ============================================================================
+
+/// Returns structured branch rows (sorted, current branch marked, commit subject populated)
+/// directly from `.bgit` mmap slabs (`BGRF` v2 O(log R + K)).
+pub(crate) fn query_branches_in_repo<'a>(
+    store: &BgitDiskStore<'a>,
+    include_all: bool,
+    remotes_only: bool,
+    alloc: Alloc<'a>,
+) -> io::Result<Vec<crate::BranchInfo>> {
+    let active = current_head_branch(store, alloc);
+    let ref_prefix = if include_all {
+        "refs/"
+    } else if remotes_only {
+        "refs/remotes/"
+    } else {
+        "refs/heads/"
+    };
+    let mut refs = OwnVec::new_in(alloc);
+    store
+        .list_refs(ref_prefix, alloc, &mut refs)
+        .map_err(|e| io::Error::other(format!("{e}")))?;
+
+    let mut local: Vec<(String, Oid)> = Vec::new();
+    let mut remote: Vec<(String, Oid)> = Vec::new();
+    for r in &refs {
+        let oid = match &r.target {
+            RefTarget::Direct(o) => Some(*o),
+            RefTarget::Symbolic(_) => store.resolve_ref(r.name.as_str()).ok().flatten(),
+        };
+        let Some(oid) = oid else {
+            continue;
+        };
+        if let Some(short) = r.name.as_str().strip_prefix("refs/heads/") {
+            local.push((short.to_owned(), oid));
+        } else if let Some(short) = r.name.as_str().strip_prefix("refs/remotes/") {
+            remote.push((short.to_owned(), oid));
+        }
+    }
+    local.sort_by(|a, b| a.0.cmp(&b.0));
+    remote.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut out = Vec::with_capacity(local.len() + remote.len());
+    if !remotes_only {
+        if active.is_none()
+            && let Some(detached) =
+                store.resolve_commit("HEAD").map_err(|e| io::Error::other(format!("{e}")))?
+        {
+            let short = ShortOid::from_oid(detached, 7).as_str().to_owned();
+            let subject = read_commit_subject(store, detached, alloc);
+            out.push(crate::BranchInfo {
+                name: format!("(HEAD detached at {short})"),
+                short_oid: short,
+                oid: detached.to_string(),
+                subject,
+                is_current: true,
+                is_remote: false,
+            });
+        }
+        for (name, oid) in local {
+            let is_current = active.as_deref() == Some(name.as_str());
+            let subject = read_commit_subject(store, oid, alloc);
+            out.push(crate::BranchInfo {
+                name,
+                short_oid: ShortOid::from_oid(oid, 7).as_str().to_owned(),
+                oid: oid.to_string(),
+                subject,
+                is_current,
+                is_remote: false,
+            });
+        }
+    }
+    if include_all || remotes_only {
+        for (name, oid) in remote {
+            let subject = read_commit_subject(store, oid, alloc);
+            out.push(crate::BranchInfo {
+                name: format!("remotes/{name}"),
+                short_oid: ShortOid::from_oid(oid, 7).as_str().to_owned(),
+                oid: oid.to_string(),
+                subject,
+                is_current: false,
+                is_remote: true,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Returns structured diffstat rows for working-tree vs index (`staged == false`) or `HEAD` vs
+/// index (`staged == true`), using the in-process FSEvents O(dirty) fast path when active.
+pub(crate) fn query_diff_stat_in_repo<'a>(
+    repo_root: &Path,
+    store: &BgitDiskStore<'a>,
+    staged: bool,
+    alloc: Alloc<'a>,
+) -> io::Result<Vec<crate::DiffStatEntry>> {
+    let mut rows = Vec::new();
+    if !staged {
+        let dirty: Vec<(WritableIndexEntry, Option<Vec<u8>>)> =
+            match crate::fsmonitor::try_diff_candidates(repo_root, alloc) {
+                Some(crate::fsmonitor::DiffFastPath::Clean) => Vec::new(),
+                Some(crate::fsmonitor::DiffFastPath::Candidates(cands)) => {
+                    let mut all_dirty_paths = BTreeSet::new();
+                    let mut out = Vec::new();
+                    for e in cands {
+                        if let Some(d) = check_worktree_entry_dirty(repo_root, &e) {
+                            all_dirty_paths.insert(e.path.clone());
+                            out.push((e, d));
+                        }
+                    }
+                    crate::fsmonitor::update_diff_known_dirty(repo_root, all_dirty_paths);
+                    out
+                }
+                None => {
+                    let scan_gen = crate::fsmonitor::begin_full_scan(repo_root);
+                    let idx = load_index(repo_root, alloc)?;
+                    let d = collect_dirty_worktree_entries(repo_root, &idx, &[]);
+                    let dirty_names: BTreeSet<String> =
+                        d.iter().map(|(e, _)| e.path.clone()).collect();
+                    crate::fsmonitor::record_diff_baseline(repo_root, dirty_names, scan_gen);
+                    d.into_iter().map(|(e, b)| (e.clone(), b)).collect()
+                }
+            };
+        for (entry, new_opt) in dirty {
+            let old_opt = read_blob_bytes(store, entry.oid, alloc).ok();
+            let status = if new_opt.is_none() { 'D' } else { 'M' };
+            let (ins, del) =
+                diff_line_stats(old_opt.as_deref().unwrap_or(b""), new_opt.as_deref().unwrap_or(b""));
+            rows.push(crate::DiffStatEntry {
+                path: entry.path,
+                status,
+                insertions: ins,
+                deletions: del,
+            });
+        }
+        return Ok(rows);
+    }
+
+    let left_tree = head_flat_tree(store, alloc)?;
+    let idx = load_index(repo_root, alloc)?;
+    let mut paths: BTreeSet<&str> = BTreeSet::new();
+    for k in left_tree.keys() {
+        paths.insert(k.as_str());
+    }
+    for k in idx.keys() {
+        paths.insert(k.as_str());
+    }
+    for path in paths {
+        let left_oid = left_tree.get(path).map(|&(_, o)| o);
+        let right_oid = idx.get(path).map(|e| e.oid);
+        if left_oid == right_oid {
+            continue;
+        }
+        let status = match (left_oid, right_oid) {
+            (None, Some(_)) => 'A',
+            (Some(_), None) => 'D',
+            _ => 'M',
+        };
+        let old_b = left_oid.and_then(|o| read_blob_bytes(store, o, alloc).ok());
+        let new_b = right_oid.and_then(|o| read_blob_bytes(store, o, alloc).ok());
+        let (ins, del) =
+            diff_line_stats(old_b.as_deref().unwrap_or(b""), new_b.as_deref().unwrap_or(b""));
+        rows.push(crate::DiffStatEntry {
+            path: path.to_owned(),
+            status,
+            insertions: ins,
+            deletions: del,
+        });
+    }
+    Ok(rows)
 }

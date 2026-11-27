@@ -1778,6 +1778,89 @@ pub fn try_native_git_command(src: &str, cwd: &str) -> Option<blaze_sh::Value<'s
             }
             Some(blaze_sh::Value::Table(tbl))
         }
+        "branch" | "br"
+            if matches!(
+                rest,
+                [] | ["-v"]
+                    | ["-vv"]
+                    | ["--verbose"]
+                    | ["-a"]
+                    | ["--all"]
+                    | ["-r"]
+                    | ["--remotes"]
+                    | ["-av"]
+                    | ["-va"]
+                    | ["-rv"]
+                    | ["-vr"]
+            ) =>
+        {
+            let include_all = rest.iter().any(|&a| matches!(a, "-a" | "--all" | "-av" | "-va"));
+            let remotes_only =
+                rest.iter().any(|&a| matches!(a, "-r" | "--remotes" | "-rv" | "-vr"));
+            let branches =
+                bgit::query_branches(Path::new(cwd), include_all, remotes_only, alloc).ok()??;
+            if branches.is_empty() {
+                return None;
+            }
+            let mut tbl = blaze_sh::Table::from_col_names(
+                &["active", "branch", "commit", "summary", "sha"],
+                alloc,
+            );
+            tbl.set_col_display("commit", blaze_sh::ColDisplay::GitCommit);
+            tbl.hide_col_by_name("sha");
+            tbl.default_grid = false;
+            for br in &branches {
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(if br.is_current { "*" } else { "" }, alloc),
+                    blaze_sh::Value::string(&br.name, alloc),
+                    blaze_sh::Value::string(&br.short_oid, alloc),
+                    blaze_sh::Value::string(&br.subject, alloc),
+                    blaze_sh::Value::string(&br.oid, alloc),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
+        "diff" | "df"
+            if matches!(
+                rest,
+                ["--stat"]
+                    | ["--staged", "--stat"]
+                    | ["--cached", "--stat"]
+                    | ["--stat", "--staged"]
+                    | ["--stat", "--cached"]
+            ) =>
+        {
+            let cwd_path = Path::new(cwd);
+            let _ = bgit::ensure_fsmonitor_watching(cwd_path);
+            let staged = rest.iter().any(|&a| matches!(a, "--staged" | "--cached"));
+            let rows = bgit::query_diff_stat(cwd_path, staged, alloc).ok()??;
+            if rows.is_empty() {
+                return None;
+            }
+            let mut tbl = blaze_sh::Table::from_col_names(
+                &["status", "path", "added", "removed", "changes"],
+                alloc,
+            );
+            tbl.set_col_display("path", blaze_sh::ColDisplay::FileEntry);
+            tbl.default_grid = false;
+            for r in &rows {
+                let st_buf = [r.status as u8];
+                let st_str = core::str::from_utf8(&st_buf).unwrap_or("M");
+                let total = r.insertions + r.deletions;
+                let scale = if total > 24 { 24.0 / total as f32 } else { 1.0 };
+                let plus_n = ((r.insertions as f32 * scale).round() as usize).min(24);
+                let minus_n = ((r.deletions as f32 * scale).round() as usize).min(24 - plus_n);
+                let bar = format!("{}{}", "+".repeat(plus_n), "-".repeat(minus_n));
+                tbl.push_row_values(&[
+                    blaze_sh::Value::string(st_str, alloc),
+                    blaze_sh::Value::string(&r.path, alloc),
+                    blaze_sh::Value::Int(r.insertions as i64),
+                    blaze_sh::Value::Int(r.deletions as i64),
+                    blaze_sh::Value::string(&bar, alloc),
+                ]);
+            }
+            Some(blaze_sh::Value::Table(tbl))
+        }
         _ => None,
     }
 }

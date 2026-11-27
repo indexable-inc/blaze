@@ -1102,7 +1102,11 @@ pub(crate) fn refresh_bgit_if_git_refs_newer<'a>(
         matches!((bg_mtime, git_latest), (Some(bm), Some(gm)) if gm > bm)
     };
     if should_refresh {
-        let _ = infect_repo_on_disk(repo_dir, SlabCompression::AutoZstd, alloc)?;
+        if !force_refresh && repo_dir.join(".bgit/objects/index.bgix").is_file() {
+            crate::disk::refresh_bgit_incremental_on_disk(repo_dir, alloc)?;
+        } else {
+            let _ = infect_repo_on_disk(repo_dir, SlabCompression::AutoZstd, alloc)?;
+        }
     }
     Ok(())
 }

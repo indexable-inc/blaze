@@ -1031,6 +1031,7 @@ fn try_run_in_process_bgit(
     }
     let arg_refs: Vec<&str> = args.iter().map(AString::as_str).collect();
     let cwd_path = Path::new(cwd);
+    let _ = bgit::ensure_fsmonitor_watching(cwd_path);
     let started = Instant::now();
 
     let exec = if prog_base == "bgit" {
