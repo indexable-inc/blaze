@@ -466,7 +466,128 @@ pub(crate) fn http_clone<'a>(
         remote_refs.len(),
         checked_out
     )?;
+    // Record `origin` URL in `.bgit/config` so subsequent `bgit fetch` / `bgit pull` / `bgit push`
+    // work out of the box with no arguments.
+    let cfg_path = crate::index_io::GitConfig::config_path_for(dest_dir);
+    let mut cfg = crate::index_io::GitConfig::load_file(&cfg_path);
+    let _ = cfg.set("remote.origin.url", url);
+    let _ = cfg.save_file(&cfg_path);
     Ok(())
+}
+
+/// Fetches refs and missing objects from a remote Git Smart HTTP server into `repo_root`,
+/// updating `refs/remotes/<remote_name>/*` (and mirroring objects/refs to `.git` if present).
+pub(crate) fn http_fetch<'a>(
+    url: &str,
+    remote_name: &str,
+    repo_root: &Path,
+    alloc: Alloc<'a>,
+    out: &mut dyn Write,
+) -> io::Result<u32> {
+    let parsed = parse_http_url(url)?;
+    let info_path = format!("{}/info/refs?service=git-upload-pack", parsed.base_path);
+    let advert = http_exchange(parsed.host_port, "GET", &info_path, None, true, b"")?;
+    blaze_git_fetch::check_advertisement(&advert)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad v2 advert: {e:?}")))?;
+
+    let mut ls_req = OwnVec::new_in(alloc);
+    WireClient::encode_ls_refs(&[], &mut ls_req).map_err(|e| io::Error::other(format!("{e}")))?;
+    let up_path = format!("{}/git-upload-pack", parsed.base_path);
+    let ls_resp = http_exchange(
+        parsed.host_port,
+        "POST",
+        &up_path,
+        Some("application/x-git-upload-pack-request"),
+        true,
+        &ls_req,
+    )?;
+    let remote_refs = WireClient::parse_ls_refs(&ls_resp, alloc)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+
+    let mut store = open_or_infect(repo_root, alloc)?;
+    let mut wants = OwnVec::new_in(alloc);
+    let mut haves = OwnVec::new_in(alloc);
+
+    let mut local_refs = OwnVec::new_in(alloc);
+    store
+        .list_refs("", alloc, &mut local_refs)
+        .map_err(|e| io::Error::other(format!("{e}")))?;
+    for lr in &local_refs {
+        if let RefTarget::Direct(o) = lr.target
+            && !haves.iter().any(|h| *h == o)
+        {
+            haves.push(o);
+        }
+    }
+
+    for r in &remote_refs {
+        if let Some(oid) = r.oid
+            && !store.has_object(&oid)
+            && !wants.iter().any(|w| *w == oid)
+        {
+            wants.push(oid);
+        }
+    }
+
+    let mut unpacked_count = 0u32;
+    if !wants.is_empty() {
+        let mut fetch_req = OwnVec::new_in(alloc);
+        WireClient::encode_fetch(&wants, &haves, None, &mut fetch_req)
+            .map_err(|e| io::Error::other(format!("{e}")))?;
+        let fetch_resp = http_exchange(
+            parsed.host_port,
+            "POST",
+            &up_path,
+            Some("application/x-git-upload-pack-request"),
+            true,
+            &fetch_req,
+        )?;
+        let stats = WireClient::parse_fetch_and_unpack(
+            &fetch_resp,
+            &mut store,
+            WireLimits::SHIPPED,
+            alloc,
+        )
+        .map_err(|e| io::Error::other(format!("fetch unpack: {e}")))?;
+        unpacked_count = stats.objects_unpacked;
+    }
+
+    let mut updates = OwnVec::new_in(alloc);
+    let mut mirrored: Vec<(String, Oid)> = Vec::new();
+    for r in &remote_refs {
+        let Some(oid) = r.oid else {
+            continue;
+        };
+        let local_ref = if let Some(branch) = r.name.as_str().strip_prefix("refs/heads/") {
+            format!("refs/remotes/{remote_name}/{branch}")
+        } else if r.name.as_str().starts_with("refs/tags/") {
+            r.name.as_str().to_owned()
+        } else {
+            continue;
+        };
+        updates.push(RefUpdate {
+            name: OwnString::from_str_in(&local_ref, alloc),
+            old: None,
+            new: oid,
+        });
+        mirrored.push((local_ref, oid));
+    }
+    let _ = store
+        .apply_ref_updates(&updates, false, alloc)
+        .map_err(|e| io::Error::other(format!("{e}")))?;
+
+    crate::disk::mirror_overlay_objects_to_git(&store, repo_root, alloc);
+    store.flush()?;
+    for (ref_name, oid) in &mirrored {
+        crate::disk::mirror_ref_to_git(repo_root, ref_name, *oid);
+    }
+
+    writeln!(
+        out,
+        "From {url}\n * fetched {unpacked_count} object(s), updated {} ref(s)",
+        mirrored.len()
+    )?;
+    Ok(unpacked_count)
 }
 
 /// Pushes a local ref from `repo_root` to a remote Git Smart HTTP server (`git-receive-pack`).

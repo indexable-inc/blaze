@@ -9,7 +9,9 @@
 
 mod cli;
 mod disk;
+mod index_io;
 mod net_driver;
+mod porcelain;
 mod status_driver;
 mod vfs_driver;
 mod worktree_driver;
@@ -19,7 +21,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 use blaze_git::{
@@ -27,7 +29,7 @@ use blaze_git::{
     format_porcelain_v1, format_short_status, format_status,
     merge::{MergeLimits, MergeOpts, MergeStatus, find_merge_bases, merge_commits},
     slab::SlabCompression,
-    storage::{ObjectStore, RefStore, RefTarget, RefUpdate, Signature, encode_commit},
+    storage::{ObjectStore, RefStore, RefTarget, RefUpdate, encode_commit},
 };
 use blaze_git_fetch::{Kind as ObjectKind, store::Commit};
 use blaze_own::{Alloc, String as OwnString, Vec as OwnVec};
@@ -252,6 +254,34 @@ pub fn try_run_git_via_bgit<'a>(
         "show-ref" => try_git_show_ref_in_process(rest, &work_dir, alloc),
         "ls-remote" => try_git_ls_remote_in_process(rest, &work_dir, alloc),
         "worktree" => try_git_worktree_in_process(rest, &work_dir, use_color, alloc),
+        "branch" | "br" | "tag" | "diff" | "show" | "remote" => {
+            try_git_bgit_passthrough(sub, rest, &work_dir, use_color, alloc)
+        }
+        _ => None,
+    }
+}
+
+/// Forwards read/local-branch `git` subcommands (`branch`, `tag`, `diff`, `show`, `remote`)
+/// to in-process `libbgit` ONLY when the enclosing repo already has `.bgit/VERSION` AND every
+/// argument is accepted by `bgit`'s `bstd::cli` spec (never implicitly infecting un-infected
+/// `.git` repos and never intercepting exotic git flags).
+fn try_git_bgit_passthrough<'a>(
+    sub: &str,
+    rest: &[&str],
+    work_dir: &Path,
+    use_color: bool,
+    alloc: Alloc<'a>,
+) -> Option<ExecOutput> {
+    let root = find_repo_root(work_dir)?;
+    if !root.join(".bgit/VERSION").is_file() {
+        return None;
+    }
+    let mut bgit_args: Vec<&str> = Vec::with_capacity(rest.len() + 1);
+    bgit_args.push(sub);
+    bgit_args.extend_from_slice(rest);
+    // Validate strictly against `BGIT_CLI` first so any exotic git-only flag cleanly falls through.
+    match parse_in(&cli::BGIT_CLI, &bgit_args, alloc) {
+        Ok(ParseOutcome::Matched(_)) => Some(run_bgit_in_process(&bgit_args, work_dir, use_color, alloc)),
         _ => None,
     }
 }
@@ -722,6 +752,34 @@ fn dispatch<'a>(
 ) -> io::Result<()> {
     match matches.command_path().get(1).copied().unwrap_or("") {
         "status" => cmd_status(matches, cwd, use_color, alloc, io),
+        "add" => porcelain::cmd_add(matches, cwd, alloc, io),
+        "commit" => porcelain::cmd_commit(matches, cwd, alloc, io),
+        "branch" => porcelain::cmd_branch(matches, cwd, use_color, alloc, io),
+        "checkout" => porcelain::cmd_checkout(matches, cwd, alloc, io),
+        "switch" => porcelain::cmd_switch(matches, cwd, alloc, io),
+        "diff" => {
+            let color = use_color && !matches.flag("no-color");
+            porcelain::cmd_diff(matches, cwd, color, alloc, io)
+        }
+        "show" => {
+            let color = use_color && !matches.flag("no-color");
+            porcelain::cmd_show(matches, cwd, color, alloc, io)
+        }
+        "reset" => porcelain::cmd_reset(matches, cwd, alloc, io),
+        "restore" => porcelain::cmd_restore(matches, cwd, alloc, io),
+        "rm" => porcelain::cmd_rm(matches, cwd, alloc, io),
+        "mv" => porcelain::cmd_mv(matches, cwd, alloc, io),
+        "tag" => porcelain::cmd_tag(matches, cwd, alloc, io),
+        "rev-parse" => porcelain::cmd_rev_parse(matches, cwd, alloc, io),
+        "show-ref" => porcelain::cmd_show_ref(matches, cwd, alloc, io),
+        "remote" => porcelain::cmd_remote(matches, cwd, alloc, io),
+        "config" => porcelain::cmd_config(matches, cwd, alloc, io),
+        "stash" => porcelain::cmd_stash(matches, cwd, use_color, alloc, io),
+        "cherry-pick" => porcelain::cmd_cherry_pick(matches, cwd, alloc, io),
+        "revert" => porcelain::cmd_revert(matches, cwd, alloc, io),
+        "clean" => porcelain::cmd_clean(matches, cwd, alloc, io),
+        "fetch" => porcelain::cmd_fetch(matches, cwd, alloc, io),
+        "pull" => porcelain::cmd_pull(matches, cwd, alloc, io),
         "worktree" => cmd_worktree(matches, cwd, use_color, alloc, io),
         "mount" => cmd_mount(matches, cwd, alloc, io),
         "unmount" => cmd_unmount(matches, cwd, io),
@@ -796,32 +854,8 @@ fn dispatch<'a>(
             )?;
             Ok(())
         }
-        "log" => cmd_log(matches, cwd, alloc, io),
-        "merge-base" => {
-            let dir = resolve_path(cwd, matches.positional(0).expect("required DIR"));
-            let rev_a = matches.positional(1).expect("required REV_A");
-            let rev_b = matches.positional(2).expect("required REV_B");
-            let store = open_or_infect(&dir, alloc)?;
-            let a = store
-                .resolve_rev(rev_a)
-                .map_err(|e| io::Error::other(format!("{e}")))?
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, format!("rev not found: {rev_a}"))
-                })?;
-            let b = store
-                .resolve_rev(rev_b)
-                .map_err(|e| io::Error::other(format!("{e}")))?
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, format!("rev not found: {rev_b}"))
-                })?;
-            let cg = store.commit_graph();
-            let bases = find_merge_bases(&store, cg.as_ref(), a, b, MergeLimits::SHIPPED, alloc)
-                .map_err(|e| io::Error::other(format!("{e}")))?;
-            for base in bases {
-                writeln!(io.out, "{base}")?;
-            }
-            Ok(())
-        }
+        "log" => cmd_log(matches, cwd, use_color, alloc, io),
+        "merge-base" => cmd_merge_base(matches, cwd, alloc, io),
         "merge" => cmd_merge(matches, cwd, alloc, io),
         "serve" => {
             let repo = resolve_path(cwd, matches.positional(0).expect("required REPO"));
@@ -839,7 +873,21 @@ fn dispatch<'a>(
             }
         }
         "ls-remote" => {
-            http_ls_remote(matches.positional(0).expect("required HTTP_URL"), alloc, io.out)
+            let raw = matches.positional(0).unwrap_or("origin");
+            let url = if raw.starts_with("http://") {
+                raw.to_owned()
+            } else {
+                let root = find_repo_root(cwd).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "not a git or bgit repository")
+                })?;
+                let cfg = index_io::GitConfig::load_merged(&root);
+                cfg.get(&format!("remote.{raw}.url"))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, format!("no such remote '{raw}'"))
+                    })?
+                    .to_owned()
+            };
+            http_ls_remote(&url, alloc, io.out)
         }
         "clone" => {
             let url = matches.positional(0).expect("required HTTP_URL");
@@ -857,12 +905,7 @@ fn dispatch<'a>(
                 http_clone(url, &dest, true, alloc, io.out)
             }
         }
-        "push" => {
-            let url = matches.positional(0).expect("required HTTP_URL");
-            let dir = resolve_path(cwd, matches.positional(1).expect("required DIR"));
-            let ref_name = matches.positional(2).expect("required REF");
-            http_push(url, &dir, ref_name, alloc, io.out)
-        }
+        "push" => cmd_push(matches, cwd, alloc, io),
         "bench" => {
             let dir = resolve_path(cwd, matches.positional(0).unwrap_or("."));
             cmd_bench(&dir, alloc, io)
@@ -874,22 +917,142 @@ fn dispatch<'a>(
     }
 }
 
-fn cmd_log<'a>(
+fn cmd_merge_base<'a>(
     matches: &Matches<'_, Alloc<'a>>,
     cwd: &Path,
     alloc: Alloc<'a>,
     io: &mut IoStreams<'_>,
 ) -> io::Result<()> {
-    let dir = resolve_path(cwd, matches.positional(0).unwrap_or("."));
-    let rev = matches.positional(1).unwrap_or("HEAD");
+    let (dir, rev_a, rev_b) = if let Some(rb) = matches.positional(2) {
+        (
+            resolve_path(cwd, matches.positional(0).expect("required DIR")),
+            matches.positional(1).expect("required REV_A"),
+            rb,
+        )
+    } else {
+        let root = find_repo_root(cwd).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "not a git or bgit repository")
+        })?;
+        (
+            root,
+            matches.positional(0).expect("required REV_A"),
+            matches.positional(1).expect("required REV_B"),
+        )
+    };
+    let store = open_or_infect(&dir, alloc)?;
+    let a = store
+        .resolve_rev(rev_a)
+        .map_err(|e| io::Error::other(format!("{e}")))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("rev not found: {rev_a}")))?;
+    let b = store
+        .resolve_rev(rev_b)
+        .map_err(|e| io::Error::other(format!("{e}")))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("rev not found: {rev_b}")))?;
+    let cg = store.commit_graph();
+    let bases = find_merge_bases(&store, cg.as_ref(), a, b, MergeLimits::SHIPPED, alloc)
+        .map_err(|e| io::Error::other(format!("{e}")))?;
+    for base in bases {
+        writeln!(io.out, "{base}")?;
+    }
+    Ok(())
+}
+
+fn cmd_push<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
+    alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
+) -> io::Result<()> {
+    // Backwards-compatible 3-arg form: `bgit push <http_url> <dir> <ref>`
+    if let Some(ref_name) = matches.positional(2) {
+        let url = matches.positional(0).expect("required HTTP_URL");
+        let dir = resolve_path(cwd, matches.positional(1).expect("required DIR"));
+        return http_push(url, &dir, ref_name, alloc, io.out);
+    }
+    // Ergonomic Git form: `bgit push [<remote>] [<branch>]`
+    let root = find_repo_root(cwd).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "not a git or bgit repository")
+    })?;
+    let remote = matches.positional(0).unwrap_or("origin");
+    let url = if remote.starts_with("http://") {
+        remote.to_owned()
+    } else {
+        let cfg = index_io::GitConfig::load_merged(&root);
+        cfg.get(&format!("remote.{remote}.url"))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no such remote '{remote}' (configure with `bgit remote add {remote} <url>`)"),
+                )
+            })?
+            .to_owned()
+    };
+    let ref_name = if let Some(r) = matches.positional(1) {
+        canonical_branch_ref(r)
+    } else {
+        let store = open_or_infect(&root, alloc)?;
+        match store.read_head(alloc).map_err(|e| io::Error::other(format!("{e}")))? {
+            Some(RefTarget::Symbolic(sym)) => sym.as_str().to_owned(),
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "detached HEAD; specify a branch or ref to push",
+                ));
+            }
+        }
+    };
+    http_push(&url, &root, &ref_name, alloc, io.out)
+}
+
+fn cmd_log<'a>(
+    matches: &Matches<'_, Alloc<'a>>,
+    cwd: &Path,
+    use_color: bool,
+    alloc: Alloc<'a>,
+    io: &mut IoStreams<'_>,
+) -> io::Result<()> {
+    let oneline = matches.flag("oneline");
+    let color = use_color && !matches.flag("no-color");
     let limit = matches
         .opt_parse::<usize>("max-count")
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?
         .unwrap_or(20);
 
+    let (dir, rev) = match (matches.positional(0), matches.positional(1)) {
+        (Some(d), Some(r)) => (resolve_path(cwd, d), r),
+        (Some(arg), None) => {
+            let cand = resolve_path(cwd, arg);
+            if cand.join(".bgit/VERSION").is_file() || cand.join(".git").exists() {
+                (cand, "HEAD")
+            } else {
+                let root = find_repo_root(cwd).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "not a git or bgit repository")
+                })?;
+                (root, arg)
+            }
+        }
+        (None, _) => {
+            let root = find_repo_root(cwd).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "not a git or bgit repository")
+            })?;
+            (root, "HEAD")
+        }
+    };
+
+    if dir.join(".bgit/VERSION").is_file() {
+        let _ = refresh_bgit_if_git_refs_newer(&dir, false, alloc);
+    }
     let store = open_or_infect(&dir, alloc)?;
     for entry in collect_log_entries(&store, rev, limit, alloc)? {
-        writeln!(io.out, "{}  {}", entry.oid, entry.subject)?;
+        if oneline {
+            if color {
+                writeln!(io.out, "\x1b[33m{}\x1b[0m {}", entry.short_oid, entry.subject)?;
+            } else {
+                writeln!(io.out, "{} {}", entry.short_oid, entry.subject)?;
+            }
+        } else {
+            writeln!(io.out, "{}  {}", entry.oid, entry.subject)?;
+        }
     }
     Ok(())
 }
@@ -900,10 +1063,27 @@ fn cmd_merge<'a>(
     alloc: Alloc<'a>,
     io: &mut IoStreams<'_>,
 ) -> io::Result<()> {
-    let dir = resolve_path(cwd, matches.positional(0).expect("required DIR"));
-    let ours_rev = matches.positional(1).expect("required OURS");
-    let theirs_rev = matches.positional(2).expect("required THEIRS");
-    let write_commit = matches.flag("write-commit");
+    // Support both ergonomic 1-arg (`bgit merge <branch>`) and 3-arg (`bgit merge <dir> <ours> <theirs>`).
+    let (dir, ours_rev, theirs_rev, ergonomic_porcelain) = match (
+        matches.positional(0),
+        matches.positional(1),
+        matches.positional(2),
+    ) {
+        (Some(d), Some(ours), Some(theirs)) => (resolve_path(cwd, d), ours, theirs, false),
+        (Some(branch), None, _) => {
+            let root = find_repo_root(cwd).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "not a git or bgit repository")
+            })?;
+            (root, "HEAD", branch, true)
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "usage: bgit merge <branch> OR bgit merge <dir> <ours> <theirs>",
+            ));
+        }
+    };
+    let write_commit = ergonomic_porcelain || matches.flag("write-commit");
     let keep_worktree = matches.flag("keep-worktree");
     let no_sync = matches.flag("no-sync");
 
@@ -953,10 +1133,8 @@ fn cmd_merge<'a>(
         let commit_oid = if result.status == MergeStatus::FastForward {
             theirs
         } else {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs() as i64);
-            let sig = Signature { name: "bgit", email: "bgit@ix.dev", timestamp: now, tz: "+0000" };
+            let (name, email, ts) = index_io::resolve_identity(&dir);
+            let sig = index_io::make_signature(&name, &email, ts);
             let mut commit_buf = OwnVec::new_in(alloc);
             let msg = format!("Merge {theirs_rev} into {ours_rev}\n");
             encode_commit(result.tree, &[ours, theirs], sig, sig, &msg, &mut commit_buf);
@@ -982,6 +1160,15 @@ fn cmd_merge<'a>(
             None
         };
 
+        if ergonomic_porcelain {
+            let old_tree = index_io::read_commit_tree(&store, ours, alloc)?;
+            let old_flat = index_io::flatten_tree(&store, old_tree, alloc)?;
+            let new_flat = index_io::flatten_tree(&store, result.tree, alloc)?;
+            index_io::checkout_tree_to_worktree(&dir, &store, &old_flat, &new_flat, false, alloc)?;
+            let new_idx = index_io::index_from_flat_tree(&dir, &new_flat);
+            index_io::write_index(&dir, &new_idx)?;
+        }
+
         if let Some(ref sym) = target_ref {
             let _ = store
                 .apply_ref_updates(
@@ -995,7 +1182,11 @@ fn cmd_merge<'a>(
                 )
                 .map_err(|e| io::Error::other(format!("{e}")))?;
         }
+        disk::mirror_overlay_objects_to_git(&store, &dir, alloc);
         store.flush()?;
+        if let Some(ref sym) = target_ref {
+            disk::mirror_ref_to_git(&dir, sym, commit_oid);
+        }
         writeln!(io.out, "commit={commit_oid}")?;
 
         drop(store);
