@@ -398,25 +398,69 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     }
 
     /// `want` made, each constant its head names evaluated as met (at most `MOST_ADT_LENS`),
-    /// via the ONE shared [`crate::front2::program::ensure_want`]. `asker` names the step of this
-    /// file that asked (rule 19): a refusal says who asked which want for which item.
+    /// `want` made, each constant its head names evaluated as met (at most `MOST_ADT_LENS`),
+    /// sharing `BZFZ` frozen heads and `const_bits` via [`super::shared::SharedLazyFront`] when
+    /// attached so sibling workers and subsequent worker epochs never re-lower the same head.
+    /// `asker` names the step of this file that asked (rule 19): a refusal says who asked which
+    /// want for which item.
     fn make_want(&mut self, want: Want, item: ItemKey, asker: &'static str) -> Result<(), LazyRefusal> {
-        let made = {
-            let mut r = self.records(true);
-            crate::front2::program::ensure_want(&mut r, want)
-        };
-        match made {
-            Ok(()) => Ok(()),
-            Err(crate::front2::program::WantError::Const { key: c, error: e }) => {
-                let mut why = blaze_own::String::new_in(self.alloc);
-                let _ = core::fmt::write(&mut why, format_args!("{asker} asked {want:?}: the constant {c:x} its head names: {e:?}"));
-                Err(LazyRefusal::Head { item: self.refused_shown(item), why: why.as_str().into() })
+        const MOST_ADT_LENS: u32 = 1024;
+        let shared = self.shared();
+        if let Some(ref shared) = shared
+            && !self.store.made(want)
+        {
+            let alloc = self.store.tys.alloc();
+            let mut cache_guard = self.shared_import_cache.borrow_mut();
+            let import_cache = cache_guard.get_or_insert_with(|| crate::front2::tables::head::FrozenImportCache::new(alloc));
+            if super::try_import_need_from_shared(self.front.names, shared, &self.store, &self.front.keys, want, import_cache, alloc) {
+                return Ok(());
             }
-            Err(crate::front2::program::WantError::Head(e)) => {
-                let shown = crate::front2::item_shown::head_error_shown(self.front.names, &e);
-                let mut why = blaze_own::String::new_in(self.alloc);
-                let _ = core::fmt::write(&mut why, format_args!("{asker} (lazy/fill.rs) asked {want:?}: {shown}"));
-                Err(LazyRefusal::Head { item: self.refused_shown(item), why: why.as_str().into() })
+        }
+        let mut lens = 0u32;
+        loop {
+            let names = self.front.names;
+            match self.store.ensure(names, &mut self.front.keys, want) {
+                Err(crate::front2::heads::HeadError::Item(_, crate::front2::heads::Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
+                    lens += 1;
+                    let cacheable = self.store.maps.const_proofs.is_none()
+                        && !self.store.maps.qpaths.borrow().is_leaf(c)
+                        && !self.store.maps.inherents.borrow().has(c);
+                    if cacheable
+                        && let Some(ref shared) = shared
+                        && let Some(bits) = shared.get_const_bit(c)
+                    {
+                        self.store.maps.file_bits(c, bits);
+                        continue;
+                    }
+                    let mut r = self.records(true);
+                    if let Err(e) = crate::front2::check::eval_len(&mut r, c) {
+                        let mut why = blaze_own::String::new_in(self.alloc);
+                        let _ = core::fmt::write(&mut why, format_args!("{asker} asked {want:?}: the constant {c:x} its head names: {e:?}"));
+                        return Err(LazyRefusal::Head { item: self.refused_shown(item), why: why.as_str().into() });
+                    }
+                    if cacheable
+                        && let Some(ref shared) = shared
+                        && let Some(&bits) = self.store.maps.const_bits.get(&c)
+                    {
+                        shared.put_const_bit(c, bits);
+                    }
+                }
+                Err(e) => {
+                    let shown = crate::front2::item_shown::head_error_shown(names, &e);
+                    let mut why = blaze_own::String::new_in(self.alloc);
+                    let _ = core::fmt::write(&mut why, format_args!("{asker} (lazy/fill.rs) asked {want:?}: {shown}"));
+                    return Err(LazyRefusal::Head { item: self.refused_shown(item), why: why.as_str().into() });
+                }
+                Ok(()) => {
+                    if let Some(ref shared) = shared {
+                        let alloc = self.store.tys.alloc();
+                        if let Want::MemberFn(container, _) = want {
+                            super::publish_cell_to_shared(names, shared, &mut self.store, &self.front.keys, Want::Head(container), alloc);
+                        }
+                        super::publish_cell_to_shared(names, shared, &mut self.store, &self.front.keys, want, alloc);
+                    }
+                    return Ok(());
+                }
             }
         }
     }
@@ -956,23 +1000,54 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         }
         to_locate.sort_unstable();
         to_locate.dedup();
+        let shared = self.shared();
+        let mut to_eval: Vec<ItemKey, Global> = Vec::new_in(Global);
         for k in to_locate {
+            if let Some(ref shared) = shared
+                && let Some(record) = shared.get_pure_const(k)
+            {
+                if let Err(at) = self.const_values.binary_search_by_key(&k, |(x, _)| *x) {
+                    self.const_values.insert_shift(at, (k, record));
+                }
+                continue;
+            }
             // Locate cold constants (associated consts of traits/impls or body-local consts)
             // when `checked` was read from a cached typed record without running `check_body`,
             // so `self.front.keys` holds their `Origin` before `consts.value` lowers them.
             self.prepare_local(k, &[owner]);
             self.locate(k)?;
+            to_eval.push(k);
         }
-        let (values, refused) = {
-            let mut r = self.records(true);
-            const_values(&mut r, core::iter::once(checked))
-        };
-        if let Some((k, why)) = refused.into_iter().next() {
-            return Err(LazyRefusal::Const { constant: self.refused_shown(k), why });
+        if to_eval.is_empty() {
+            return Ok(());
         }
-        for (k, record) in values {
-            if let Err(at) = self.const_values.binary_search_by_key(&k, |(x, _)| *x) {
-                self.const_values.insert(at, (k, record));
+        for k in to_eval {
+            let made = {
+                let mut r = self.records(true);
+                let Some((consts, prepared)) = r.consts.take() else {
+                    return Err(LazyRefusal::Const {
+                        constant: self.refused_shown(k),
+                        why: Box::from("no evaluator: the program's records hold none"),
+                    });
+                };
+                let out = consts.value(&mut r, prepared, k).map(crate::front2::const_at::data_record);
+                r.consts = Some((consts, prepared));
+                out
+            };
+            match made {
+                Ok(record) => {
+                    if let Some(ref shared) = shared {
+                        shared.put_pure_const(k, &record);
+                    }
+                    if let Err(at) = self.const_values.binary_search_by_key(&k, |(x, _)| *x) {
+                        self.const_values.insert_shift(at, (k, record));
+                    }
+                }
+                Err(e) => {
+                    let said = format!("{e}");
+                    let why: Box<str> = said.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+                    return Err(LazyRefusal::Const { constant: self.refused_shown(k), why });
+                }
             }
         }
         Ok(())
@@ -1046,6 +1121,18 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         if let Some(kind) = self.statics.kind(item) {
             Ok(kind)
         } else {
+            let shared = self.shared();
+            if let Some(ref shared) = shared
+                && let Some((record, kind)) = shared.get_pure_static(item)
+            {
+                if let Err(at) = self.statics.values.binary_search_by_key(&item, |(x, _)| *x) {
+                    self.statics.values.insert(at, (item, record));
+                }
+                if let Err(at) = self.statics.kinds.binary_search_by_key(&item, |(x, _)| *x) {
+                    self.statics.kinds.insert(at, (item, kind));
+                }
+                return Ok(kind);
+            }
             // Locate the static first so body-local statics (e.g. `static X: OnceLock<..>`
             // inside a cached function whose enclosing body was not lowered in this run) are
             // registered in `self.front.keys` before `one_static` evaluates them.
@@ -1058,6 +1145,9 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 let static_ = self.static_shown(item);
                 LazyRefusal::Row { function: static_.clone(), refusal: Box::new(Front2Refusal::Static { static_, why }) }
             })?;
+            if let Some(ref shared) = shared {
+                shared.put_pure_static(item, &record, kind);
+            }
             if let Err(at) = self.statics.values.binary_search_by_key(&item, |(x, _)| *x) {
                 self.statics.values.insert(at, (item, record));
             }
@@ -1268,14 +1358,10 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             }
             return Ok(already(&self.store));
         }
-        // Check member fns (traits and impls) in `krate` via the cached per-crate member index.
-        let _ = self.member_index(krate)?;
-        let member_hit = self.member_rows.get(&krate).and_then(|ix| {
-            ix.rows.iter().find_map(|(&fk, row)| {
-                let row = (*row)?;
-                if row.kind != MemberKind::Fn {
-                    return None;
-                }
+        // Check member fns (traits and impls) in `krate` via the cached per-crate member index
+        // (checking the shared cross-worker index first when attached).
+        let member_hit = if let Some(shared_ix) = self.shared_crate_member_index(krate)? {
+            shared_ix.find_member_fn(|fk| {
                 for idx in 0u32..4 {
                     let ok = crate::front2::keys::opaque_key(fk, idx);
                     if ok == opaque {
@@ -1287,7 +1373,27 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
                 }
                 None
             })
-        });
+        } else {
+            let _ = self.member_index(krate)?;
+            self.member_rows.get(&krate).and_then(|ix| {
+                ix.rows.iter().find_map(|(&fk, row)| {
+                    let row = (*row)?;
+                    if row.kind != MemberKind::Fn {
+                        return None;
+                    }
+                    for idx in 0u32..4 {
+                        let ok = crate::front2::keys::opaque_key(fk, idx);
+                        if ok == opaque {
+                            return Some((fk, false));
+                        }
+                        if crate::front2::rpitit::default_key(ok) == opaque {
+                            return Some((fk, true));
+                        }
+                    }
+                    None
+                })
+            })
+        };
         if let Some((fk, is_twin)) = member_hit {
             self.head_row_key(fk)?;
             if is_twin {

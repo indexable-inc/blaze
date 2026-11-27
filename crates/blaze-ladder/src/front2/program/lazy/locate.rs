@@ -202,6 +202,86 @@ fn build_crate_member_index<'n, C: MemberCatalog<'n>>(
     Some(MemberIndex { rows, containers: u32::try_from(containers.len()).unwrap_or(u32::MAX) })
 }
 
+/// Builds a shared [`super::shared::SharedMemberIndex`] over `krate`'s `#[lang]` containers alone.
+fn build_shared_lang_member_index<'n, C: MemberCatalog<'n>>(
+    catalog: C,
+    krate: usize,
+    scratch: Alloc<'n>,
+    shared: blaze_own::SharedAlloc<'static>,
+) -> super::shared::SharedMemberIndex {
+    let mut containers: AVec<'n, (LibKey, ItemKind)> = AVec::new_in(scratch);
+    catalog.catalog_each_lang(krate, &mut |_name, lib| match catalog.catalog_kind_of_item(lib) {
+        Some(kind @ (ItemKind::Trait | ItemKind::Impl)) => containers.push((lib, kind)),
+        Some(ItemKind::Struct) if catalog.catalog_is_ctor(lib) => containers.push((lib, ItemKind::Struct)),
+        _ => {}
+    });
+    let mut ix = super::shared::SharedMemberIndex::new_in(u32::try_from(containers.len()).unwrap_or(u32::MAX), shared);
+    for &(container, kind) in containers.iter() {
+        let ck = checker_of(container);
+        if kind == ItemKind::Struct {
+            ix.put(member_key_of(ck, MemberKind::Ctor, ""), container, MemberKind::Ctor, "");
+            continue;
+        }
+        catalog.catalog_each_member_matching(
+            container,
+            &mut |mkind, mname| {
+                if mname.is_some() && member_kind(mkind).is_some() {
+                    crate::front2::source::MemberWant::NameOnly
+                } else {
+                    crate::front2::source::MemberWant::Skip
+                }
+            },
+            &mut |m| {
+                let (Some(name), Some(mk)) = (m.name, member_kind(m.kind)) else { return };
+                ix.put(member_key_of(ck, mk, name), container, mk, name);
+            },
+        );
+    }
+    ix
+}
+
+/// Builds the full crate-wide shared [`super::shared::SharedMemberIndex`] for `krate` using
+/// `MemberWant::NameOnly` (zero source file opens / zero outlines).
+fn build_shared_crate_member_index<'n, C: MemberCatalog<'n>>(
+    catalog: C,
+    krate: usize,
+    scratch: Alloc<'n>,
+    shared: blaze_own::SharedAlloc<'static>,
+) -> Option<super::shared::SharedMemberIndex> {
+    let mut containers: AVec<'n, (LibKey, ItemKind)> = AVec::new_in(scratch);
+    let listed = catalog.catalog_each_item(krate, &mut |lib, _module| match catalog.catalog_kind_of_item(lib) {
+        Some(kind @ (ItemKind::Trait | ItemKind::Impl)) => containers.push((lib, kind)),
+        Some(ItemKind::Struct) if catalog.catalog_is_ctor(lib) => containers.push((lib, ItemKind::Struct)),
+        _ => {}
+    });
+    if !listed {
+        return None;
+    }
+    let mut ix = super::shared::SharedMemberIndex::new_in(u32::try_from(containers.len()).unwrap_or(u32::MAX), shared);
+    for &(container, kind) in containers.iter() {
+        let ck = checker_of(container);
+        if kind == ItemKind::Struct {
+            ix.put(member_key_of(ck, MemberKind::Ctor, ""), container, MemberKind::Ctor, "");
+            continue;
+        }
+        catalog.catalog_each_member_matching(
+            container,
+            &mut |mkind, mname| {
+                if mname.is_some() && member_kind(mkind).is_some() {
+                    crate::front2::source::MemberWant::NameOnly
+                } else {
+                    crate::front2::source::MemberWant::Skip
+                }
+            },
+            &mut |m| {
+                let (Some(name), Some(mk)) = (m.name, member_kind(m.kind)) else { return };
+                ix.put(member_key_of(ck, mk, name), container, mk, name);
+            },
+        );
+    }
+    Some(ix)
+}
+
 /// Probes a single trait/impl container for `target` using `MemberWant::NameOnly`.
 fn probe_container_member<'n, C: MemberCatalog<'n>>(
     catalog: C,
@@ -297,6 +377,58 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let Some(krate) = names.crate_of(LibKey(blaze_ids::ContentId(whole))) else {
             return Err(LazyRefusal::NotFound { key, krate: Box::from("no crate of the program"), searched: Box::from("its key's crate prefix is no crate's of the program") });
         };
+        // Fast path: when a command-wide `SharedLazyFront` is attached, consult its crate-wide
+        // and lang-container member indexes shared across all workers (built at most once per
+        // crate across all 128 workers and worker epochs).
+        if let Some(shared) = self.shared()
+            && let Some(crate_key) = names.crate_key(krate)
+        {
+            if let Some(shared_ix) = shared.get_crate_members(crate_key) {
+                if let Some(found) = shared_ix.get(key) {
+                    let Some((container, kind, name)) = found else {
+                        return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: Box::from("two members of its crate are keyed alike (rule 21)") });
+                    };
+                    return self.file_member_parts(key, container, kind, name);
+                }
+                let rows = format!("its item, module and variant rows; the {} members' keys of its {} traits, impls and tuple or unit structs", shared_ix.len(), shared_ix.containers);
+                let inner = key.0.to_be_bytes()[8] & LibKey::INNER != 0;
+                if !inner {
+                    return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: format!("{rows}; not an item declared in a body (its key's inner bit is clear)").into_boxed_str() });
+                }
+                return self.locate_local(key, krate, &rows);
+            }
+            let lang_ix = match shared.get_lang_members(crate_key) {
+                Some(ix) => ix,
+                None => {
+                    let built = build_shared_lang_member_index(names, krate, self.alloc, shared.alloc());
+                    shared.put_lang_members(crate_key, built)
+                }
+            };
+            if let Some(found) = lang_ix.get(key) {
+                let Some((container, kind, name)) = found else {
+                    return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: Box::from("two members of its crate are keyed alike (rule 21)") });
+                };
+                return self.file_member_parts(key, container, kind, name);
+            }
+            if let Some(row) = self.probe_loaded_containers(key) {
+                return self.file_member(key, row);
+            }
+            let Some(shared_ix) = self.shared_crate_member_index(krate)? else {
+                return Err(LazyRefusal::Unanswered { question: "each_item", item: self.crate_shown(krate) });
+            };
+            if let Some(found) = shared_ix.get(key) {
+                let Some((container, kind, name)) = found else {
+                    return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: Box::from("two members of its crate are keyed alike (rule 21)") });
+                };
+                return self.file_member_parts(key, container, kind, name);
+            }
+            let rows = format!("its item, module and variant rows; the {} members' keys of its {} traits, impls and tuple or unit structs", shared_ix.len(), shared_ix.containers);
+            let inner = key.0.to_be_bytes()[8] & LibKey::INNER != 0;
+            if !inner {
+                return Err(LazyRefusal::NotFound { key, krate: self.crate_shown(krate), searched: format!("{rows}; not an item declared in a body (its key's inner bit is clear)").into_boxed_str() });
+            }
+            return self.locate_local(key, krate, &rows);
+        }
         // Fast path: if the full crate index is already cached, check it; otherwise probe `#[lang]`
         // containers and already-loaded store containers (with `MemberWant::NameOnly`, zero file
         // text reads and zero `each_item` scan) before falling back to a crate-wide member index.
@@ -330,6 +462,51 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         self.locate_local(key, krate, &rows)
     }
 
+    /// Returns the shared crate-wide [`super::shared::SharedMemberIndex`] for `krate` when a
+    /// [`super::shared::SharedLazyFront`] is attached, building and publishing it once on miss.
+    pub(super) fn shared_crate_member_index(
+        &mut self,
+        krate: usize,
+    ) -> Result<Option<std::sync::Arc<super::shared::SharedMemberIndex, blaze_own::SharedAlloc<'static>>>, LazyRefusal> {
+        let Some(shared) = self.shared() else {
+            return Ok(None);
+        };
+        let Some(crate_key) = self.front.names.crate_key(krate) else {
+            return Ok(None);
+        };
+        if let Some(ix) = shared.get_crate_members(crate_key) {
+            return Ok(Some(ix));
+        }
+        let Some(built) = build_shared_crate_member_index(self.front.names, krate, self.alloc, shared.alloc()) else {
+            return Err(LazyRefusal::Unanswered { question: "each_item", item: self.crate_shown(krate) });
+        };
+        Ok(Some(shared.put_crate_members(crate_key, built)))
+    }
+
+    /// Probes already-loaded `store.maps.traits` / `store.impls` matching `key`'s crate prefix.
+    fn probe_loaded_containers(&self, key: ItemKey) -> Option<MemberRow<'n>> {
+        let names = self.front.names;
+        let key_bytes = key.0.to_be_bytes();
+        let prefix = key_bytes.get(..8)?;
+        for (&trait_lib, _) in self.store.maps.traits.iter() {
+            if trait_lib.0.0.get(..8) == Some(prefix)
+                && let Some(row) = probe_container_member(names, trait_lib, key)
+            {
+                return Some(row);
+            }
+        }
+        for (&impl_ck, _) in self.store.impls.iter() {
+            let impl_bytes = impl_ck.0.to_be_bytes();
+            if impl_bytes.get(..8) == Some(prefix)
+                && let Some(impl_lib) = self.front.keys.library_in(names, impl_ck)
+                && let Some(row) = probe_container_member(names, impl_lib, key)
+            {
+                return Some(row);
+            }
+        }
+        None
+    }
+
     /// Probes targeted containers in `krate` (`#[lang]` items cached once per crate, plus already
     /// loaded `store.maps.traits` / `store.impls` matching `key`'s crate prefix) using
     /// `MemberWant::NameOnly` so common `core`/`std` members like `PartialEq::eq` resolve without
@@ -343,25 +520,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         if let Some(found) = self.lang_member_rows.get(&krate).and_then(|ix| ix.rows.get(&key).copied()) {
             return Some(found);
         }
-        let key_bytes = key.0.to_be_bytes();
-        let prefix = key_bytes.get(..8)?;
-        for (&trait_lib, _) in self.store.maps.traits.iter() {
-            if trait_lib.0.0.get(..8) == Some(prefix)
-                && let Some(row) = probe_container_member(names, trait_lib, key)
-            {
-                return Some(Some(row));
-            }
-        }
-        for (&impl_ck, _) in self.store.impls.iter() {
-            let impl_bytes = impl_ck.0.to_be_bytes();
-            if impl_bytes.get(..8) == Some(prefix)
-                && let Some(impl_lib) = self.front.keys.library_in(names, impl_ck)
-                && let Some(row) = probe_container_member(names, impl_lib, key)
-            {
-                return Some(Some(row));
-            }
-        }
-        None
+        self.probe_loaded_containers(key).map(Some)
     }
 
     /// Crate `krate` as a refusal shows it: its index and its key.
@@ -391,9 +550,13 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
 
     /// Files the member `row` asked for as `key`: its container as an item, then the member.
     fn file_member(&mut self, key: ItemKey, row: MemberRow<'n>) -> Result<(), LazyRefusal> {
-        let clash = |c: crate::front2::keys::KeyClash| LazyRefusal::Head { item: format!("{:x}", row.container).into_boxed_str(), why: format!("{c}").into_boxed_str() };
-        let container = self.front.keys.item(row.container).map_err(clash)?;
-        let filed = self.front.keys.member(container, row.kind, row.name).map_err(clash)?;
+        self.file_member_parts(key, row.container, row.kind, row.name)
+    }
+
+    fn file_member_parts(&mut self, key: ItemKey, container_lib: LibKey, kind: MemberKind, name: &str) -> Result<(), LazyRefusal> {
+        let clash = |c: crate::front2::keys::KeyClash| LazyRefusal::Head { item: format!("{container_lib:x}").into_boxed_str(), why: format!("{c}").into_boxed_str() };
+        let container = self.front.keys.item(container_lib).map_err(clash)?;
+        let filed = self.front.keys.member(container, kind, name).map_err(clash)?;
         if filed != key {
             return Err(LazyRefusal::NotFound { key, krate: self.refused_shown(container), searched: Box::from("its member index row filed under another key (keys.rs `member_key_of` and `Keys::member` disagree)") });
         }

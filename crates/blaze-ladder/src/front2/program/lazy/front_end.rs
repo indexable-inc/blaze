@@ -745,6 +745,14 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// As `Front2Program::const_at`: the evaluator the program keeps checks any body and makes
     /// any impl row the value needs.
     fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], build: crate::front2::const_at::BuildFacts<'_>) -> Result<DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
+        let shared = self.shared();
+        if let crate::front2::const_at::ConstNeed::Item(item) = need
+            && args.is_empty()
+            && let Some(ref shared) = shared
+            && let Some(cached) = shared.get_pure_const(item)
+        {
+            return Ok(cached);
+        }
         // Locate cold constants or cold const-block/promoted owners before evaluating so
         // `self.front.keys` holds their `Origin` even when the caller was read from a cached
         // typed record.
@@ -783,7 +791,14 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
                 self.consts.body_value(&mut records, prepared, owner, root, key, from, args, Some(build), alloc)
             }
         };
-        made.map(crate::front2::const_at::data_record).map_err(crate::front2::const_at::ConstAtWhy::Eval)
+        let record = made.map(crate::front2::const_at::data_record).map_err(crate::front2::const_at::ConstAtWhy::Eval)?;
+        if let crate::front2::const_at::ConstNeed::Item(item) = need
+            && args.is_empty()
+            && let Some(ref shared) = shared
+        {
+            shared.put_pure_const(item, &record);
+        }
+        Ok(record)
     }
 
     /// As `Front2Program::const_fn_instance`: the record of the evaluator the program keeps
