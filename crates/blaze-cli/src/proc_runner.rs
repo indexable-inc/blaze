@@ -358,11 +358,16 @@ mod with_sandbox {
                 Some(wg) => identity.with_wasm_features(side.lock.lock, wg, unit.package, |dep_id| side.place.member_files(dep_id), side.heap.alloc()),
                 None => identity,
             };
-            let identity = if crate::wasm64_compile::unit_has_dep_build_scripts(graph, names.wasm_graph(), unit_id, true).map_err(MakeError::Probes)? {
-                let hex = side.probes.dep_probe_identity_hex(cx).map_err(MakeError::Probes)?;
-                identity.with_dep_probes(hex.as_str())
-            } else {
-                identity
+            // Isolate per-macro dependency-probe failures just like `Unidentified` above: a
+            // failure on one dependent proc-macro never blocks unrelated proc-macros in this
+            // runner; that crate gets no key here and its own `MacroModule` task reports the error.
+            let identity = match crate::wasm64_compile::unit_has_dep_build_scripts(graph, names.wasm_graph(), unit_id, true) {
+                Ok(true) => match side.probes.dep_probe_identity_hex(cx) {
+                    Ok(hex) => identity.with_dep_probes(hex.as_str()),
+                    Err(_) => continue,
+                },
+                Ok(false) => identity,
+                Err(_) => continue,
             };
             let (key, module) = identity.with_id(|id| (crate_key(&module_key(id)), read_module(&modules, id)));
             if let Err(error) = &module

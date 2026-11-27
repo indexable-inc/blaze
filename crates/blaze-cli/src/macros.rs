@@ -71,9 +71,16 @@ pub struct ListedMacro {
     pub(crate) dep_probes: Option<crate::wasm64_compile::Hex64>,
 }
 
+/// Per-macro identity or probe-setup refusal kept on that crate alone so one dependent
+/// proc-macro's probe failure never aborts unrelated proc-macros in `macros::list` (Rule 20).
+pub enum MacroListFailure {
+    Unidentified(Unidentified),
+    Probes(crate::scripts::ProbeSetupError),
+}
+
 /// The macro crates of this command's graph, each with its module identity or why it has
 /// none: made once a command, at the first `MacroModule` task that runs.
-pub type MacroCrates = std::vec::Vec<(ContentId, Result<ListedMacro, Unidentified>), Global>;
+pub type MacroCrates = std::vec::Vec<(ContentId, Result<ListedMacro, MacroListFailure>), Global>;
 
 /// Where a command's macro crates are: the home (the module store is under it), the checkout
 /// relative to where blaze was started ("" for there: `FetchEnv::checkout`), each workspace
@@ -225,6 +232,7 @@ pub(crate) fn list(
     modules: &std::path::Path,
     place: &Place<'_, '_>,
     probes: Option<crate::scripts::CommandProbes<'_>>,
+    planned_probes: Option<&[(ContentId, crate::engine_scripts::PlannedProbe)]>,
     scratch: Alloc<'_>,
 ) -> Result<MacroCrates, MacrosError> {
     let decoded = blaze_unit_graph::record::decode(sections.graph, scratch).map_err(MacrosError::Graph)?;
@@ -241,6 +249,7 @@ pub(crate) fn list(
         if !matches!(unit.kind, UnitKind::ProcMacro) {
             continue;
         }
+        let subj = subject(unit);
         // A member macro crate's identity is its files' digest, read from its folder; a path
         // package that is no member has no folder here and is named as not identified.
         let identity = identify(lock.lock, &locked, &folders, &decoded.graph, unit, |id| Ok(place.member_files(id)), scratch).map_err(MacrosError::Procs)?;
@@ -248,29 +257,77 @@ pub(crate) fn list(
             (Some(wg), Ok(id)) => Ok(id.with_wasm_features(lock.lock, wg, unit.package, |dep_id| place.member_files(dep_id), scratch)),
             (_, other) => other,
         };
+        let planned_entry = planned_probes.and_then(|table| {
+            let at = table.binary_search_by_key(&subj, |(s, _)| *s).ok()?;
+            table.get(at).map(|(_, entry)| entry)
+        });
         let listed = match (identity, u32::try_from(idx).ok(), probes) {
             (Ok(id), Some(uid), Some(probes)) => {
-                if crate::wasm64_compile::unit_has_dep_build_scripts(
+                match crate::wasm64_compile::unit_has_dep_build_scripts(
                     &decoded.graph,
                     wasm_graph,
                     blaze_unit_graph::UnitId(uid),
                     true,
-                )
-                .map_err(MacrosError::Probes)?
-                {
-                    let hex = probes.dep_probe_identity_hex(cx).map_err(MacrosError::Probes)?;
-                    Ok(ListedMacro {
-                        identity: id.with_dep_probes(hex.as_str()),
-                        dep_probes: Some(hex),
-                    })
-                } else {
-                    Ok(ListedMacro { identity: id, dep_probes: None })
+                ) {
+                    Ok(true) => match planned_entry {
+                        Some(crate::engine_scripts::PlannedProbe::Failed(err)) => {
+                            Err(MacroListFailure::Probes(err.duplicate()))
+                        }
+                        Some(crate::engine_scripts::PlannedProbe::Digest(planned_hex)) => {
+                            match probes.dep_probe_identity_hex(cx) {
+                                Ok(live_hex) if live_hex == *planned_hex => Ok(ListedMacro {
+                                    identity: id.with_dep_probes(planned_hex.as_str()),
+                                    dep_probes: Some(*planned_hex),
+                                }),
+                                Ok(live_hex) => Err(MacroListFailure::Probes(
+                                    crate::scripts::ProbeSetupError::from_str(
+                                        crate::scripts::ProbeErrorKind::PlannedDrift,
+                                        bstd::mem::format_in!(
+                                            cx.frame(),
+                                            "live C-probe or derived-fact pin identity changed after planning {} (planned {}, now {}); refusing to file drifted result under planned task key",
+                                            unit.name.as_str(),
+                                            planned_hex.as_str(),
+                                            live_hex.as_str()
+                                        )
+                                        .as_str(),
+                                    ),
+                                )),
+                                Err(err) => Err(MacroListFailure::Probes(err)),
+                            }
+                        }
+                        None if planned_probes.is_some() => Err(MacroListFailure::Probes(
+                            crate::scripts::ProbeSetupError::from_str(
+                                crate::scripts::ProbeErrorKind::PlannedDrift,
+                                "proc-macro has dependency build scripts at lookup time without a planned probe identity",
+                            ),
+                        )),
+                        None => match probes.dep_probe_identity_hex(cx) {
+                            Ok(hex) => Ok(ListedMacro {
+                                identity: id.with_dep_probes(hex.as_str()),
+                                dep_probes: Some(hex),
+                            }),
+                            Err(err) => Err(MacroListFailure::Probes(err)),
+                        },
+                    },
+                    Ok(false) => match planned_entry {
+                        Some(crate::engine_scripts::PlannedProbe::Failed(err)) => {
+                            Err(MacroListFailure::Probes(err.duplicate()))
+                        }
+                        Some(crate::engine_scripts::PlannedProbe::Digest(_)) => Err(MacroListFailure::Probes(
+                            crate::scripts::ProbeSetupError::from_str(
+                                crate::scripts::ProbeErrorKind::PlannedDrift,
+                                "proc-macro was planned with a dependency-probe identity but has no dependency build scripts at lookup time",
+                            ),
+                        )),
+                        None => Ok(ListedMacro { identity: id, dep_probes: None }),
+                    },
+                    Err(err) => Err(MacroListFailure::Probes(err)),
                 }
             }
             (Ok(id), _, _) => Ok(ListedMacro { identity: id, dep_probes: None }),
-            (Err(why), _, _) => Err(why),
+            (Err(why), _, _) => Err(MacroListFailure::Unidentified(why)),
         };
-        crates.push((subject(unit), listed));
+        crates.push((subj, listed));
     }
     crates.sort_unstable_by_key(|(subject, _)| *subject);
     Ok(crates)
@@ -306,7 +363,7 @@ pub(crate) fn run<'b>(
         // The task's frame carries no header: erased here, for this task's scratch.
         let scratch = blaze_own::Erased::new(frame);
         let listed = match lock {
-            Some(lock) => list(&cx, read.unit_graph(graph.name)?, lock, &modules, &place, compile.and_then(|c| c.probes), scratch.handle()),
+            Some(lock) => list(&cx, read.unit_graph(graph.name)?, lock, &modules, &place, compile.and_then(|c| c.probes), None, scratch.handle()),
             None => Err(MacrosError::NoLock),
         };
         match listed {
@@ -326,9 +383,13 @@ pub(crate) fn run<'b>(
     };
     let listed = match &entry.1 {
         Ok(listed) => listed,
-        Err(why) => {
+        Err(MacroListFailure::Unidentified(why)) => {
             let words = bstd::mem::format_in!(held, "proc-macro module not looked up: {why}");
             return Ok(Did::FailedSaying(refused("a macro crate without a module identity"), held_str(words.as_str(), held)));
+        }
+        Err(MacroListFailure::Probes(why)) => {
+            let words = bstd::mem::format_in!(held, "proc-macro dependency probe identity refused: {why}");
+            return Ok(Did::Hole(refused("the proc-macro's dependency probe identity could not be verified"), held_str(words.as_str(), held)));
         }
     };
     let identity = &listed.identity;

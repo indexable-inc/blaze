@@ -525,6 +525,11 @@ pub(crate) struct ScriptsStage<'f> {
     /// The graph's proc-macro crates with their identities, listed once before dispatching
     /// proc-macro lookups so every lookup and wasm64 self-compile runs concurrently.
     macros: Option<std::sync::Arc<crate::macros::MacroCrates>>,
+    /// Planned dependency-probe identities bound during `plan_dep_probe_tags`, sorted by
+    /// `MacroModule` subject: lookups validate live probe identity against these frozen digests
+    /// (never filing a drifted live result under a planned task key, Rule 21).
+    planned_macro_probes: Vec<(ContentId, PlannedProbe), &'f Frame>,
+    planned_script_probes: Vec<(ContentId, PlannedProbe), &'f Frame>,
     /// Each planned task's reads, by name, sorted: what its plan hands it.
     reads: Vec<(Name, Vec<Name, &'f Frame>), &'f Frame>,
     runs: Vec<RunPlan<'f>, &'f Frame>,
@@ -649,6 +654,35 @@ pub(crate) fn with_runner<R>(runner: &'static dyn ScriptRunner, work: impl FnOnc
     work()
 }
 
+/// Planned dependency-probe state frozen for one `MacroModule` task during planning, so lookup
+/// and on-miss compilation bind strictly to the planned digest (or report the planned refusal)
+/// instead of silently filing a drifted live result under the planned task key (Rule 21).
+pub(crate) enum PlannedProbe {
+    Digest(crate::wasm64_compile::Hex64),
+    Failed(crate::scripts::ProbeSetupError),
+}
+
+impl PlannedProbe {
+    pub(crate) fn source_hex(&self) -> crate::wasm64_compile::Hex64 {
+        match self {
+            PlannedProbe::Digest(hex) => *hex,
+            PlannedProbe::Failed(err) => crate::wasm64_compile::probe_error_hex(err.kind),
+        }
+    }
+}
+
+/// Sorted `(subject, PlannedProbe)` tables emitted by [`plan_dep_probe_tags`].
+pub(crate) struct PlannedDepProbes<'f> {
+    pub(crate) proc_macros: Vec<(ContentId, PlannedProbe), &'f Frame>,
+    pub(crate) script_modules: Vec<(ContentId, PlannedProbe), &'f Frame>,
+}
+
+impl<'f> PlannedDepProbes<'f> {
+    pub(crate) fn empty(frame: &'f Frame) -> Self {
+        Self { proc_macros: Vec::new_in(frame), script_modules: Vec::new_in(frame) }
+    }
+}
+
 /// Computes deterministic dependency-probe task-source tags for planned `MacroModule` tasks
 /// (both proc-macro modules in `graph_pub.made.parts` and `RanAs::Wasm` build-script modules
 /// named by `world.script_module_subjects()`), ONLY for units whose `wasm64-blaze-wasip1`
@@ -659,8 +693,8 @@ pub(crate) fn with_runner<R>(runner: &'static dyn ScriptRunner, work: impl FnOnc
 /// - Proc-macro `MacroModule` parts in `graph_pub.made.parts` are updated in place via
 ///   `macros::part_source_with_dep_probes` so both `preserve_standing_sibling_names` and
 ///   `ScriptsStage::plan` share one source of truth.
-/// - Returns sorted `(script_module_subject, tag_hex)` pairs for build-script `MacroModule`
-///   tasks whose closure runs dependency build scripts (or errored during lookup/probing).
+/// - Refused stored graphs are propagated cleanly (never downgraded to empty probe tags, Rule 3).
+#[expect(clippy::too_many_arguments, reason = "planning edge over cx, world, store, graph_pub, tools, probes, skip_fixture, and frame")]
 pub(crate) fn plan_dep_probe_tags<'f>(
     cx: &Cx,
     world: &crate::names::Names<'_>,
@@ -668,22 +702,27 @@ pub(crate) fn plan_dep_probe_tags<'f>(
     graph_pub: &mut crate::engine_units::Published<'f>,
     tools: Tools,
     probes: crate::scripts::CommandProbes<'_>,
+    skip_fixture: bool,
     frame: &'f Frame,
-) -> Result<Vec<(ContentId, crate::wasm64_compile::Hex64), &'f Frame>, CliError> {
-    let mut script_tags: Vec<(ContentId, crate::wasm64_compile::Hex64), &'f Frame> = Vec::new_in(frame);
+) -> Result<PlannedDepProbes<'f>, CliError> {
+    let mut planned = PlannedDepProbes::empty(frame);
+    if skip_fixture {
+        return Ok(planned);
+    }
     let Ok(record) = &mut graph_pub.made else {
-        return Ok(script_tags);
+        return Ok(planned);
     };
     let has_proc_macros = record.parts.iter().any(|p| p.name.kind == Kind::MacroModule);
     let has_wasm_scripts = world
         .script_module_subjects()
         .any(|s| world.script_module(s).is_some_and(|m| m.ran_as == crate::scripts::RanAs::Wasm));
     if !has_proc_macros && !has_wasm_scripts {
-        return Ok(script_tags);
+        return Ok(planned);
     }
 
     // Obtain `(graph, wasm_graph)`: reuse the already-made world when present, else decode only
     // the graph sections from the store (without making `NamesWorld` or opening toolchain shelves).
+    // Propagate any `BackRefused` error cleanly instead of silently planning with empty probe tags.
     let decode_frame = if world.made().is_none() {
         Some(Frame::with_reserve(8 << 20, bstd::mem::Tag::Other).map_err(|_| CliError::Text {
             what: "failed to reserve frame for MacroModule dep-probe planning",
@@ -709,7 +748,13 @@ pub(crate) fn plan_dep_probe_tags<'f>(
                 };
                 Some((g, wg))
             }
-            Err(_) => None,
+            Err(why) => {
+                return Err(EngineCheckError::NamesWorld(crate::names::WorldRefused {
+                    needed_by: crate::names::NeededBy::ModuleLookup,
+                    why: crate::names::WorldWhy::Back(why),
+                })
+                .into());
+            }
         }
     } else {
         None
@@ -717,20 +762,16 @@ pub(crate) fn plan_dep_probe_tags<'f>(
     let (graph, wasm_graph) = match (world.made(), &decoded_pair) {
         (Some(made), _) => (made.graph(), made.wasm_graph()),
         (None, Some((g, wg))) => (&g.graph, wg.as_ref().map(|d| &d.graph)),
-        (None, None) => return Ok(script_tags),
+        (None, None) => return Ok(planned),
     };
 
-    let mut cached_probe_tag: Option<crate::wasm64_compile::Hex64> = None;
-    let mut get_probe_tag = || -> crate::wasm64_compile::Hex64 {
-        if let Some(hex) = cached_probe_tag {
-            return hex;
+    let mut cached_probe: Option<Result<crate::wasm64_compile::Hex64, crate::scripts::ProbeSetupError>> = None;
+    let mut get_planned_probe = || -> PlannedProbe {
+        let res = cached_probe.get_or_insert_with(|| probes.dep_probe_identity_hex(cx));
+        match res {
+            Ok(hex) => PlannedProbe::Digest(*hex),
+            Err(err) => PlannedProbe::Failed(err.duplicate()),
         }
-        let hex = match probes.dep_probe_identity_hex(cx) {
-            Ok(hex) => hex,
-            Err(error) => crate::wasm64_compile::probe_error_hex(&error),
-        };
-        cached_probe_tag = Some(hex);
-        hex
     };
 
     // 1. Proc-macro `MacroModule` parts in `graph_pub.made.parts`.
@@ -738,7 +779,7 @@ pub(crate) fn plan_dep_probe_tags<'f>(
         let (Kind::MacroModule, Locate::Source(cur_source)) = (part.name.kind, part.locate) else {
             continue;
         };
-        let mut fold_tag: Option<crate::wasm64_compile::Hex64> = None;
+        let mut entry: Option<PlannedProbe> = None;
         for (idx, unit) in graph.units.iter().enumerate() {
             if !matches!(unit.kind, blaze_unit_graph::UnitKind::ProcMacro) {
                 continue;
@@ -754,21 +795,23 @@ pub(crate) fn plan_dep_probe_tags<'f>(
                 true,
             ) {
                 Ok(true) => {
-                    fold_tag = Some(get_probe_tag());
+                    entry = Some(get_planned_probe());
                     break;
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    fold_tag = Some(crate::wasm64_compile::probe_error_hex(&error));
+                    entry = Some(PlannedProbe::Failed(error));
                     break;
                 }
             }
         }
-        if let Some(tag) = fold_tag {
+        if let Some(planned_entry) = entry {
+            let tag = planned_entry.source_hex();
             part.locate = Locate::Source(crate::macros::part_source_with_dep_probes(
                 cur_source,
                 tag.as_str(),
             ));
+            planned.proc_macros.push((part.name.subject, planned_entry));
         }
     }
 
@@ -787,25 +830,29 @@ pub(crate) fn plan_dep_probe_tags<'f>(
         let Some(run) = world.script_run(script_name.subject) else { continue };
         let script_unit = blaze_unit_graph::UnitId(run.unit);
         match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, script_unit, false) {
-            Ok(true) => script_tags.push((subject, get_probe_tag())),
+            Ok(true) => planned.script_modules.push((subject, get_planned_probe())),
             Ok(false) => {}
-            Err(error) => script_tags.push((subject, crate::wasm64_compile::probe_error_hex(&error))),
+            Err(error) => planned.script_modules.push((subject, PlannedProbe::Failed(error))),
         }
     }
-    script_tags.sort_unstable_by_key(|(s, _)| *s);
-    Ok(script_tags)
+    planned.proc_macros.sort_unstable_by_key(|(s, _)| *s);
+    planned.script_modules.sort_unstable_by_key(|(s, _)| *s);
+    Ok(planned)
 }
 
-/// Resolves a build-script `MacroModule` task's source, mixing in any dependency-probe tag from
-/// `script_module_probe_tags` (sorted by `subject`).
+/// Resolves a build-script `MacroModule` task's source, mixing in any planned dependency-probe
+/// tag from `script_module_probes` (sorted by `subject`).
 pub(crate) fn script_module_task_source(
     graph_source: ContentId,
     subject: ContentId,
-    script_module_probe_tags: &[(ContentId, crate::wasm64_compile::Hex64)],
+    script_module_probes: &[(ContentId, PlannedProbe)],
 ) -> ContentId {
-    match script_module_probe_tags.binary_search_by_key(&subject, |(s, _)| *s) {
-        Ok(at) => match script_module_probe_tags.get(at) {
-            Some((_, hex)) => crate::script_modules::part_source_with_dep_probes(graph_source, subject, hex.as_str()),
+    match script_module_probes.binary_search_by_key(&subject, |(s, _)| *s) {
+        Ok(at) => match script_module_probes.get(at) {
+            Some((_, planned)) => {
+                let hex = planned.source_hex();
+                crate::script_modules::part_source_with_dep_probes(graph_source, subject, hex.as_str())
+            }
             None => crate::script_modules::part_source(graph_source, subject),
         },
         Err(_) => crate::script_modules::part_source(graph_source, subject),
@@ -814,10 +861,18 @@ pub(crate) fn script_module_task_source(
 
 impl<'f> ScriptsStage<'f> {
     pub(crate) fn in_plan(&self) -> bool { !self.runs.is_empty() }
+    pub(crate) fn has_runner(&self) -> bool {
+        #[cfg(test)]
+        { self.runner.is_some() }
+        #[cfg(not(test))]
+        { false }
+    }
     pub(crate) fn new(frame: &'f Frame) -> ScriptsStage<'f> {
         ScriptsStage {
             scripts: None,
             macros: None,
+            planned_macro_probes: Vec::new_in(frame),
+            planned_script_probes: Vec::new_in(frame),
             reads: Vec::new_in(frame),
             runs: Vec::new_in(frame),
             completed: BTreeMap::new_in(frame),
@@ -1001,12 +1056,14 @@ impl<'f> ScriptsStage<'f> {
         tools: Tools,
         env: &FetchEnv<'_>,
         scoped: Option<&crate::engine_check::ScopedUnits>,
-        script_module_probe_tags: &[(ContentId, crate::wasm64_compile::Hex64)],
+        planned_dep_probes: PlannedDepProbes<'f>,
         alloc: SharedAlloc<'h>,
         frame: &'f Frame,
     ) -> Result<SVec<'h, Planned>, CliError> {
         let mut planned = SVec::new_in(alloc);
         self.tools = Some(tools);
+        self.planned_macro_probes = planned_dep_probes.proc_macros;
+        self.planned_script_probes = planned_dep_probes.script_modules;
         let (Some(names), Some(graph)) = (names.names.as_ref(), discovered.get(Name::unit_graph())) else { return Ok(planned) };
         let Ok(record) = &graph.made else { return Ok(planned) };
         let unit_graph = Name::unit_graph();
@@ -1079,7 +1136,7 @@ impl<'f> ScriptsStage<'f> {
                 continue;
             }
             let name = crate::script_modules::name(subject);
-            let source = script_module_task_source(graph.source, subject, script_module_probe_tags);
+            let source = script_module_task_source(graph.source, subject, self.planned_script_probes.as_slice());
             planned.push(Planned { name, phase: Phase::new(Stage::Scripts, 0), source, file: name });
             self.reads.push((name, reads_only(&[])));
         }
@@ -1628,25 +1685,74 @@ impl<'f> ScriptsStage<'f> {
                 Err(why) => return Err(EngineCheckError::NamesWorld(why).into()),
             };
             let module = made.script_module(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldScriptModules, key: name })?;
-            let deps = if module.ran_as == crate::scripts::RanAs::Wasm {
-                match crate::wasm64_compile::unit_has_dep_build_scripts(made.graph(), made.wasm_graph(), module.script_unit, false) {
-                    Ok(true) => match handles.probes.dep_probe_identity_hex(cx) {
-                        Ok(probes_hex) => Some(crate::wasm64_compile::fold_dep_probes_opt(module.deps.as_deref(), probes_hex.as_str(), queue.jobs)),
+            let planned_entry = self
+                .planned_script_probes
+                .binary_search_by_key(&name.subject, |(s, _)| *s)
+                .ok()
+                .and_then(|at| self.planned_script_probes.get(at))
+                .map(|(_, entry)| entry);
+            let (deps, expected_probes) = if module.ran_as == crate::scripts::RanAs::Wasm {
+                match (
+                    crate::wasm64_compile::unit_has_dep_build_scripts(made.graph(), made.wasm_graph(), module.script_unit, false),
+                    planned_entry,
+                ) {
+                    (_, Some(PlannedProbe::Failed(error))) => {
+                        let failed = TaskFailure { name, why: Why::Refused { what: "the build-script dependency probe pins could not be opened", rule: crate::script_modules::RULE } };
+                        let words = bstd::mem::format_in!(frame, "the build script of {} {}: {error}", module.package, module.version);
+                        return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
+                    }
+                    (Ok(true), Some(PlannedProbe::Digest(planned_hex))) => match handles.probes.dep_probe_identity_hex(cx) {
+                        Ok(live_hex) if live_hex == *planned_hex => (
+                            Some(crate::wasm64_compile::fold_dep_probes_opt(module.deps.as_deref(), planned_hex.as_str(), queue.jobs)),
+                            Some(*planned_hex),
+                        ),
+                        Ok(live_hex) => {
+                            let failed = TaskFailure { name, why: Why::Refused { what: "the live C-probe or derived-fact pin identity drifted after planning", rule: crate::script_modules::RULE } };
+                            let words = bstd::mem::format_in!(
+                                frame,
+                                "the build script of {} {}: live probe identity drifted after planning (planned {}, now {}); refusing to file under planned task key",
+                                module.package,
+                                module.version,
+                                planned_hex.as_str(),
+                                live_hex.as_str()
+                            );
+                            return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
+                        }
                         Err(error) => {
                             let failed = TaskFailure { name, why: Why::Refused { what: "the build-script dependency probe pins could not be opened", rule: crate::script_modules::RULE } };
                             let words = bstd::mem::format_in!(frame, "the build script of {} {}: {error}", module.package, module.version);
                             return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
                         }
                     },
-                    Ok(false) => module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
-                    Err(error) => {
+                    (Ok(true), None) => {
+                        let failed = TaskFailure { name, why: Why::Refused { what: "the build-script dependency probe identity was not planned", rule: crate::script_modules::RULE } };
+                        let words = bstd::mem::format_in!(
+                            frame,
+                            "the build script of {} {}: dependency build scripts found at lookup without a planned probe identity",
+                            module.package,
+                            module.version
+                        );
+                        return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
+                    }
+                    (Ok(false), Some(PlannedProbe::Digest(_))) => {
+                        let failed = TaskFailure { name, why: Why::Refused { what: "the build-script dependency probe identity drifted after planning", rule: crate::script_modules::RULE } };
+                        let words = bstd::mem::format_in!(
+                            frame,
+                            "the build script of {} {}: planned with dependency-probe identity but has no dependency build scripts at lookup",
+                            module.package,
+                            module.version
+                        );
+                        return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
+                    }
+                    (Ok(false), None) => (module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s)), None),
+                    (Err(error), _) => {
                         let failed = TaskFailure { name, why: Why::Refused { what: "the build-script wasm64 dependency graph lookup failed", rule: crate::script_modules::RULE } };
                         let words = bstd::mem::format_in!(frame, "the build script of {} {}: {error}", module.package, module.version);
                         return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
                     }
                 }
             } else {
-                module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s))
+                (module.deps.as_deref().map(|s| &*queue.jobs.alloc_str(s)), None)
             };
             let wanted = crate::script_modules::Wanted {
                 script_unit: module.script_unit,
@@ -1654,6 +1760,7 @@ impl<'f> ScriptsStage<'f> {
                 features: queue.jobs.alloc_slice_copy(&module.features),
                 files: module.files.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
                 deps,
+                expected_probes,
             };
             let compile = if wanted.ran_as == crate::scripts::RanAs::Wasm {
                 queue.ensure_compile_inputs(cx, store, graph_key, handles)?
@@ -1676,7 +1783,16 @@ impl<'f> ScriptsStage<'f> {
             let read = work::payload(cx, store, &graph, &scratch)?;
             let modules = std::path::Path::new(home).join(".blaze/v2");
             let erased = blaze_own::Erased::new(&scratch);
-            match crate::macros::list(cx, read.unit_graph(graph.name)?, &side.lock, &modules, &side.place, Some(handles.probes), erased.handle()) {
+            match crate::macros::list(
+                cx,
+                read.unit_graph(graph.name)?,
+                &side.lock,
+                &modules,
+                &side.place,
+                Some(handles.probes),
+                Some(self.planned_macro_probes.as_slice()),
+                erased.handle(),
+            ) {
                 Ok(listed) => self.macros = Some(std::sync::Arc::new(listed)),
                 Err(error) => {
                     let failed = TaskFailure { name, why: Why::Refused { what: "the macro crates could not be listed", rule: "macros.rs" } };

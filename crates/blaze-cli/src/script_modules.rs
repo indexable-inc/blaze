@@ -137,6 +137,10 @@ pub(crate) struct Wanted<'w> {
     pub features: &'w [&'w str],
     pub files: Option<&'w str>,
     pub deps: Option<&'w str>,
+    /// Planned dependency-probe identity frozen during planning (when this build script's
+    /// `wasm64-blaze-wasip1` closure executes dependency build scripts), verified again before
+    /// publishing on a cache miss (Rule 21).
+    pub expected_probes: Option<crate::wasm64_compile::Hex64>,
 }
 
 /// One build-script module lookup & on-miss `wasm64` self-compile: looks up
@@ -157,7 +161,7 @@ pub(crate) fn run<'b>(
         return Ok(Did::Hole(refused("no home: the module store is under it"), "the build-script module store is under the home, and HOME is not set"));
     };
     let store = std::path::Path::new(home).join(".blaze/v2");
-    let Wanted { script_unit, ran_as, package, version, features, files, deps } = wanted;
+    let Wanted { script_unit, ran_as, package, version, features, files, deps, expected_probes } = wanted;
     let host = crate::graph::TRIPLE;
     let (found, digest_file) = match ran_as {
         RanAs::Wasm => (blaze_proc_macro::script_unit::module_of_files_and_deps(&store, package, version, features, files, deps), "wasm-sha256"),
@@ -176,7 +180,7 @@ pub(crate) fn run<'b>(
             && let Some(inputs) = compile
         {
             let _compile_cx = cx.span("script module: self-compile build.rs to wasm64");
-            match crate::wasm64_compile::compile_build_script(cx, &store, inputs, script_unit, package, version, features, deps) {
+            match crate::wasm64_compile::compile_build_script(cx, &store, inputs, script_unit, package, version, features, deps, expected_probes) {
                 Ok(wasm_sha256) => {
                     let mut made = Made::new_in(name, held);
                     made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.trim().as_bytes());

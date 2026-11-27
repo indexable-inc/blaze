@@ -657,13 +657,58 @@ impl Drop for Scripts<'_> {
     }
 }
 
+/// Stable semantic class of a dependency build-script probe/pin setup failure (hashed into
+/// error-tagged task keys instead of diagnostic prose or machine paths, Rule 21).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum ProbeErrorKind {
+    CProbesOpen = 1,
+    SpawnPinsOpen = 2,
+    AnswererIdentity = 3,
+    WasmGraphMissing = 4,
+    WasmRootMissing = 5,
+    FrameReserve = 6,
+    PlannedDrift = 7,
+}
+
+impl ProbeErrorKind {
+    pub(crate) const fn tag(self) -> u8 {
+        match self {
+            ProbeErrorKind::CProbesOpen => 1,
+            ProbeErrorKind::SpawnPinsOpen => 2,
+            ProbeErrorKind::AnswererIdentity => 3,
+            ProbeErrorKind::WasmGraphMissing => 4,
+            ProbeErrorKind::WasmRootMissing => 5,
+            ProbeErrorKind::FrameReserve => 6,
+            ProbeErrorKind::PlannedDrift => 7,
+        }
+    }
+}
+
 /// Error initializing shared command-level C-probe or derived-fact pin settings.
 #[derive(Debug)]
-pub(crate) struct ProbeSetupError(pub(crate) blaze_own::String<blaze_own::SharedAlloc<'static>>);
+pub(crate) struct ProbeSetupError {
+    pub(crate) kind: ProbeErrorKind,
+    pub(crate) detail: blaze_own::String<blaze_own::SharedAlloc<'static>>,
+}
+
+impl ProbeSetupError {
+    pub(crate) fn new(kind: ProbeErrorKind, detail: blaze_own::String<blaze_own::SharedAlloc<'static>>) -> Self {
+        Self { kind, detail }
+    }
+
+    pub(crate) fn from_str(kind: ProbeErrorKind, detail: &str) -> Self {
+        Self { kind, detail: blaze_own::String::from_str_in(detail, blaze_own::SharedAlloc::global()) }
+    }
+
+    pub(crate) fn duplicate(&self) -> Self {
+        Self::from_str(self.kind, self.detail.as_str())
+    }
+}
 
 impl core::fmt::Display for ProbeSetupError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.0.as_str())
+        f.write_str(self.detail.as_str())
     }
 }
 
@@ -714,7 +759,7 @@ impl SharedCommandProbes {
 
     /// Pairs this shared command holder with the resolved command `env` (zero cost, `Copy`).
     pub(crate) fn with_env<'a>(&'a self, env: &'a FetchEnv<'a>) -> CommandProbes<'a> {
-        CommandProbes { inner: self, env }
+        CommandProbes { inner: self, env, sdk: env.sdk }
     }
 
     #[cfg(test)]
@@ -729,14 +774,25 @@ impl SharedCommandProbes {
 }
 
 /// Borrowed handle combining the single command-level [`SharedCommandProbes`] with the command's
-/// resolved [`FetchEnv`].
+/// resolved [`FetchEnv`] and macOS SDK snapshot.
 #[derive(Clone, Copy)]
 pub(crate) struct CommandProbes<'a> {
     inner: &'a SharedCommandProbes,
     env: &'a FetchEnv<'a>,
+    sdk: Result<blaze_apple_sdk::Sdk<'a>, blaze_apple_sdk::SdkRefused<'a>>,
 }
 
 impl<'a> CommandProbes<'a> {
+    /// Overrides the macOS SDK snapshot carried by this probe handle (used by start-time
+    /// `RunProcs` so `run`/`test`/`export` share the exact SDK resolved by `check` without
+    /// cloning `FetchEnv` handles).
+    pub(crate) fn with_sdk(
+        self,
+        sdk: Result<blaze_apple_sdk::Sdk<'a>, blaze_apple_sdk::SdkRefused<'a>>,
+    ) -> Self {
+        Self { sdk, ..self }
+    }
+
     /// Lazily opens and shares the single command-level `CProbeSetting` (`Ok(None)` when `HOME`
     /// is unset).
     pub(crate) fn c_probes(
@@ -745,7 +801,7 @@ impl<'a> CommandProbes<'a> {
     ) -> Result<Option<blaze_proc_macro::probe_clang::CProbeSetting>, ProbeSetupError> {
         self.c_probes_with(cx, |cx| {
             self.env.home.map(|home| {
-                open_c_probes(cx, self.env, home, crate::graph::TRIPLE, self.env.heap.alloc())
+                open_c_probes_with_sdk(cx, self.env, self.sdk, home, crate::graph::TRIPLE, self.env.heap.alloc())
             })
         })
     }
@@ -767,7 +823,7 @@ impl<'a> CommandProbes<'a> {
             .map_err(|error| {
                 let mut msg = blaze_own::String::new_in(shared);
                 let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("opening command C probes: {error}"));
-                ProbeSetupError(msg)
+                ProbeSetupError::new(ProbeErrorKind::CProbesOpen, msg)
             })?;
         Ok(slot.as_ref().map(blaze_own::Share::share))
     }
@@ -785,11 +841,14 @@ impl<'a> CommandProbes<'a> {
             .map_err(|error| {
                 let mut msg = blaze_own::String::new_in(shared);
                 let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("opening command spawn pins: {error}"));
-                ProbeSetupError(msg)
+                ProbeSetupError::new(ProbeErrorKind::SpawnPinsOpen, msg)
             })?;
         match slot {
             Ok(setting) => Ok(setting),
-            Err(why) => Err(ProbeSetupError(blaze_own::String::from_str_in(why.as_str(), shared))),
+            Err(why) => Err(ProbeSetupError::new(
+                ProbeErrorKind::SpawnPinsOpen,
+                blaze_own::String::from_str_in(why.as_str(), shared),
+            )),
         }
     }
 
@@ -810,7 +869,7 @@ impl<'a> CommandProbes<'a> {
         if matches!(self.inner.plant, ProbeOncePlant::SkipOnce) {
             return match open(cx) {
                 Ok(setting) => Ok(crate::wasm64_compile::dep_script_spawn_setting(Some(&setting))),
-                Err(why) => Err(ProbeSetupError(why)),
+                Err(why) => Err(ProbeSetupError::new(ProbeErrorKind::SpawnPinsOpen, why)),
             };
         }
         let shared = self.env.heap.shared();
@@ -821,18 +880,22 @@ impl<'a> CommandProbes<'a> {
             .map_err(|error| {
                 let mut msg = blaze_own::String::new_in(shared);
                 let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("opening command spawn pins: {error}"));
-                ProbeSetupError(msg)
+                ProbeSetupError::new(ProbeErrorKind::SpawnPinsOpen, msg)
             })?;
         match slot {
             Ok(setting) => Ok(crate::wasm64_compile::dep_script_spawn_setting(Some(setting))),
-            Err(why) => Err(ProbeSetupError(blaze_own::String::from_str_in(why.as_str(), shared))),
+            Err(why) => Err(ProbeSetupError::new(
+                ProbeErrorKind::SpawnPinsOpen,
+                blaze_own::String::from_str_in(why.as_str(), shared),
+            )),
         }
     }
 
     /// Computes the deterministic 64-hex digest of all probe/pin inputs observable by a dependency
     /// build script — including the shared `SpawnSetting` derived-fact pins AND the live C-probe
-    /// answerer's identity (`ready.answerer.id(alloc)` on Linux, which folds the live host ELF
-    /// runtime closure of `clang-23`) — reusing the single coalesced command-level `CProbeSetting`.
+    /// answerer's identity bounded by `cx` (`ready.answerer_id_in_cx(cx, alloc)` on Linux, which
+    /// folds the live host ELF runtime closure of `clang-23`) — reusing the single coalesced
+    /// command-level `CProbeSetting`.
     pub(crate) fn dep_probe_identity_hex(
         &self,
         cx: &Cx,
@@ -840,8 +903,9 @@ impl<'a> CommandProbes<'a> {
         let spawn = self.spawn_setting(cx)?;
         let c_probes = self.c_probes(cx)?;
         let mut sdk_buf = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
-        let sdk_id = encode_sdk_hex(self.env, &mut sdk_buf).map(|(_, id)| id);
+        let sdk_id = encode_sdk_hex(self.sdk, &mut sdk_buf).map(|(_, id)| id);
         crate::wasm64_compile::dep_probe_identity_from_setting(
+            cx,
             crate::graph::TRIPLE,
             spawn,
             c_probes.as_ref(),
@@ -876,12 +940,12 @@ fn open_spawn_setting(
     })
 }
 
-/// Encodes any resolved Apple SDK identity from `env.sdk` into `(folder, 64-hex-id)` on `buf`.
+/// Encodes any resolved Apple SDK identity into `(folder, 64-hex-id)` on `buf`.
 fn encode_sdk_hex<'a>(
-    env: &'a FetchEnv<'_>,
+    sdk: Result<blaze_apple_sdk::Sdk<'a>, blaze_apple_sdk::SdkRefused<'a>>,
     buf: &'a mut [u8; blaze_apple_sdk::SdkId::KEY_LEN * 2],
 ) -> Option<(&'a str, &'a str)> {
-    let sdk = env.sdk.as_ref().ok()?;
+    let sdk = sdk.ok()?;
     let key = sdk.identity().key();
     for (i, byte) in key.iter().enumerate() {
         let hi = byte >> 4;
@@ -899,16 +963,17 @@ fn encode_sdk_hex<'a>(
 
 /// Opens the command's hermetic C compiler probe setting (`probe_clang::open_command_c_probes`)
 /// for `host`, encoding any resolved Apple SDK identity into the `(folder, hex_id)` pair.
-/// Called lazily at most once per command through [`SharedCommandProbes::c_probes`] (rule 30).
-pub(crate) fn open_c_probes(
+/// Called lazily at most once per command through [`SharedCommandProbes`] (rule 30).
+fn open_c_probes_with_sdk(
     cx: &Cx,
     env: &FetchEnv<'_>,
+    sdk: Result<blaze_apple_sdk::Sdk<'_>, blaze_apple_sdk::SdkRefused<'_>>,
     home: &str,
     host: &str,
     alloc: Alloc<'_>,
 ) -> blaze_proc_macro::probe_clang::CProbeSetting {
     let mut sdk_hex = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
-    let sdk_pair = encode_sdk_hex(env, &mut sdk_hex);
+    let sdk_pair = encode_sdk_hex(sdk, &mut sdk_hex);
     blaze_proc_macro::probe_clang::open_command_c_probes(cx, &env.fs, home, host, sdk_pair, alloc)
 }
 
@@ -1920,7 +1985,7 @@ mod shared_command_probes_dst {
                     ))
                 })
                 .expect_err("injected spawn error must propagate");
-            assert_eq!(err.0.as_str(), "injected plist error #1");
+            assert_eq!(err.detail.as_str(), "injected plist error #1");
         }
         assert_eq!(s_inits.load(Ordering::SeqCst), 1);
 

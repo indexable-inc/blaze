@@ -925,7 +925,38 @@ pub(crate) struct Standing<'r, 'm> {
     home_dir: Option<&'r Dir<ReadWrite>>,
 }
 
+/// Borrowed lazy macOS SDK handle handed to start-time proc-macro runners (`RunProcs`) so
+/// `run`/`test`/`export` resolve the exact same SDK identity snapshot as `check` on first
+/// proc-macro demand (0 ms cost on pure-Rust starts) without borrowing `Standing::store`.
+#[derive(Clone, Copy)]
+pub(crate) struct RunSdk<'r> {
+    place_sdk: Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>>,
+    resolver: &'r dyn Fn(&Cx, Option<&Dir<ReadWrite>>, u64) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>>,
+    home_dir: Option<&'r Dir<ReadWrite>>,
+    wall_ns: u64,
+}
+
+impl<'r> RunSdk<'r> {
+    pub(crate) fn resolve(&self, cx: &Cx) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>> {
+        if self.place_sdk.is_ok() {
+            return self.place_sdk;
+        }
+        (self.resolver)(cx, self.home_dir, self.wall_ns)
+    }
+}
+
 impl<'r, 'm> Standing<'r, 'm> {
+    /// Returns a `Copy` lazy SDK handle borrowing only immutable fields of `Standing` so
+    /// start-time `RunProcs` can resolve the exact same macOS SDK snapshot as `check`.
+    pub(crate) fn sdk_for_procs(&self) -> RunSdk<'r> {
+        RunSdk {
+            place_sdk: self.place.sdk,
+            resolver: self.sdk_resolver,
+            home_dir: self.home_dir,
+            wall_ns: self.lent.wall_ns(),
+        }
+    }
+
     /// Resolves the macOS SDK lazily on first demand (at most once per command via `OnceCell`),
     /// reusing the already-opened `~/.blaze` home directory and caching the result into
     /// `self.place.sdk`.
@@ -1647,7 +1678,7 @@ fn preserve_standing_sibling_names<'a, 'f, 's, 'r>(
     last_lines: Option<&crate::engine_lines::Last<'_, '_>>,
     tools: &blaze_engine::Tools,
     env: &FetchEnv<'_>,
-    script_module_probe_tags: &[(blaze_ids::ContentId, crate::wasm64_compile::Hex64)],
+    script_module_probe_tags: &[(blaze_ids::ContentId, crate::engine_scripts::PlannedProbe)],
     alloc: SharedAlloc<'a>,
     heap_alloc: blaze_own::Alloc<'static>,
 ) -> Result<Option<ScopedUnits>, CliError> {
@@ -4383,7 +4414,7 @@ fn checking<'f, 's: 'f>(
                 {
                     env.sdk = lazy.resolve_in_home(cx, home_dir, phases);
                 }
-                let script_module_probe_tags = match (stage.names.as_ref(), discovered.get_mut(Name::unit_graph())) {
+                let planned_dep_probes = match (stage.names.as_ref(), discovered.get_mut(Name::unit_graph())) {
                     (Some(world), Some(graph_pub)) => crate::engine_scripts::plan_dep_probe_tags(
                         cx,
                         world,
@@ -4391,9 +4422,10 @@ fn checking<'f, 's: 'f>(
                         graph_pub,
                         tools,
                         command_probes.with_env(&env),
+                        scripts.has_runner(),
                         frame,
                     )?,
-                    _ => Vec::new_in(frame),
+                    _ => crate::engine_scripts::PlannedDepProbes::empty(frame),
                 };
                 let _cx = cx.span(STAGES_PLAN_SPAN);
                 let preserved_names = match (scoped.as_ref(), stored.as_ref()) {
@@ -4408,14 +4440,14 @@ fn checking<'f, 's: 'f>(
                         last_lines.as_ref(),
                         &tools,
                         &env,
-                        script_module_probe_tags.as_slice(),
+                        planned_dep_probes.script_modules.as_slice(),
                         alloc,
                         heap.alloc(),
                     )?,
                     _ => None,
                 };
                 let names_scoped = preserved_names.as_ref().or(scoped.as_ref());
-                planned.extend(scripts.plan(stage, &discovered, tools, &env, names_scoped, script_module_probe_tags.as_slice(), alloc, frame)?);
+                planned.extend(scripts.plan(stage, &discovered, tools, &env, names_scoped, planned_dep_probes, alloc, frame)?);
                 let no_reads = Rows::new_in(frame);
                 planned.extend(scripts.plan_reads(followed_kept.as_ref().map_or(&no_reads, |followed: &sweep::Followed<'_>| &followed.now), alloc));
                 planned.extend(stage.plan(names_scoped, alloc, frame)?);

@@ -263,6 +263,10 @@ impl c_tasks_probe::ProbeCache for CacheAdapter<'_> {
 #[derive(Clone)]
 pub struct CScriptProbes {
     pub answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>>,
+    /// Optional cancellation-aware Linux hermetic probe handle backing [`Self::answerer_id_in_cx`]
+    /// so live runtime-closure scans respect caller cancellation and deadlines.
+    #[cfg(target_os = "linux")]
+    pub hermetic: Option<OwnArc<HermeticClangProbe, SharedAlloc<'static>>>,
     pub records: OwnArc<dyn CProbeStore, SharedAlloc<'static>>,
     /// Configured host SDK directory (`""` when no SDK is active), verified against child
     /// `SDKROOT` overrides before canonicalizing a probe (rule 21).
@@ -273,6 +277,44 @@ pub struct CScriptProbes {
     pub sdk_digest: [u8; 32],
     /// Host pinned clang archive SHA-256 (verified in `cc-probe` read revalidation).
     pub clang_sha256: [u8; 32],
+}
+
+impl CScriptProbes {
+    /// Computes the live answerer identity bounded by the caller's `cx` cancellation and deadline
+    /// rather than spawning a fresh root context (rule 18).
+    pub fn answerer_id_in_cx<'a>(
+        &self,
+        cx: &bstd::cx::Cx,
+        alloc: Alloc<'a>,
+    ) -> Result<ContentId, AString<'a>> {
+        if cx.check().is_err() {
+            return Err(own_str("c-probe answerer identity cancelled", alloc));
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(hermetic) = &self.hermetic {
+            return hermetic.live_strategy_id(cx, alloc);
+        }
+        self.answerer.id(alloc)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SharedHermetic(OwnArc<HermeticClangProbe, SharedAlloc<'static>>);
+
+#[cfg(target_os = "linux")]
+impl ProbeAnswerer for SharedHermetic {
+    fn id<'a>(&self, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
+        self.0.id(alloc)
+    }
+
+    fn answer<'a, 'b>(
+        &self,
+        probe: &CanonicalProbe<'_, '_>,
+        input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+        alloc: Alloc<'a>,
+    ) -> Result<ProbeAnswer<'a>, AString<'a>> {
+        self.0.answer(probe, input_bytes, alloc)
+    }
 }
 
 impl blaze_own::Share for CScriptProbes {}
@@ -769,8 +811,18 @@ pub fn open_command_c_probes<'a>(
         let sdk_dir: OwnArc<str, SharedAlloc<'static>> = OwnArc::from_str_in(sdk_dir_str, shared);
         let sdk_id: OwnArc<str, SharedAlloc<'static>> = OwnArc::from_str_in(sdk_str, shared);
         let sdk_digest = facts::sdk_id_digest(sdk_str);
-        let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> = OwnArc::new_in(hermetic, shared);
-        CProbeSetting::Ready(CScriptProbes { answerer, records, sdk_dir, sdk_id, sdk_digest, clang_sha256 })
+        let hermetic_arc = OwnArc::new_in(hermetic, shared);
+        let answerer: OwnArc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
+            OwnArc::new_in(SharedHermetic(blaze_own::Share::share(&hermetic_arc)), shared);
+        CProbeSetting::Ready(CScriptProbes {
+            answerer,
+            hermetic: Some(hermetic_arc),
+            records,
+            sdk_dir,
+            sdk_id,
+            sdk_digest,
+            clang_sha256,
+        })
     }
 }
 
@@ -1715,6 +1767,8 @@ mod tests {
         assert!(store_err.as_str().contains("already held"), "unexpected store error: {store_err}");
         let failing_probes = super::CScriptProbes {
             answerer: blaze_own::Arc::new_in(StubAnswerer, super::SharedAlloc::global()),
+            #[cfg(target_os = "linux")]
+            hermetic: None,
             records: blaze_own::Arc::new_in(FailingCProbeStore, super::SharedAlloc::global()),
             sdk_dir: blaze_own::Arc::from_str_in("", super::SharedAlloc::global()),
             sdk_id: blaze_own::Arc::from_str_in("macos-sdk-15.2", super::SharedAlloc::global()),
@@ -3201,6 +3255,8 @@ mod tests {
         let shared = super::SharedAlloc::global();
         let probes = super::CScriptProbes {
             answerer: super::OwnArc::new_in(FailingAnswerer, shared),
+            #[cfg(target_os = "linux")]
+            hermetic: None,
             records: super::OwnArc::new_in(EmptyStore, shared),
             sdk_dir: super::OwnArc::from_str_in("", shared),
             sdk_id: super::OwnArc::from_str_in("", shared),
