@@ -3352,12 +3352,60 @@ mod tests {
         .expect("warm sid");
         assert_eq!(cold_sid, warm_sid, "strategy_id must be bit-for-bit identical on cold miss vs warm hit");
 
-        // Corrupt on-disk records (bit flip + truncation) and prove safe live-hash recovery.
-        let mut corrupted = std::fs::read(&written_files[0]).expect("read record 0");
+        // Corrupt on-disk records (bit flip, truncation, oversized) MUST fail loudly with typed
+        // EBADMSG (`code: 74`) instead of silently falling back to live hashing (AGENTS.md Rule 3).
+        let orig0 = std::fs::read(&written_files[0]).expect("read record 0");
+        let mut corrupted = orig0.clone();
         let mid = corrupted.len() / 2;
         corrupted[mid] ^= 0xff;
         std::fs::write(&written_files[0], &corrupted).expect("corrupt record 0");
-        std::fs::write(&written_files[1], b"BZELFIN1").expect("truncate record 1");
+        let err_flip = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+            &reader2,
+            Some(&rec_dir),
+            &cx,
+            target_str,
+            alloc,
+            &mut |_| {},
+        )
+        .expect_err("bit-flipped on-disk record must fail loudly with EBADMSG");
+        assert!(
+            matches!(err_flip, bstd::procs::hermetic::Fault::Host { code: 74, call } if call.contains("corrupt")),
+            "expected EBADMSG corruption error on bit-flip, got {err_flip:?}"
+        );
+        std::fs::write(&written_files[0], b"BZELFIN1").expect("truncate record 0");
+        let err_trunc = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+            &reader2,
+            Some(&rec_dir),
+            &cx,
+            target_str,
+            alloc,
+            &mut |_| {},
+        )
+        .expect_err("truncated on-disk record must fail loudly with EBADMSG");
+        assert!(
+            matches!(err_trunc, bstd::procs::hermetic::Fault::Host { code: 74, call } if call.contains("corrupt")),
+            "expected EBADMSG corruption error on truncation, got {err_trunc:?}"
+        );
+        std::fs::write(
+            &written_files[0],
+            std::vec![0u8; bstd::procs::hermetic::MAX_INODE_RECORD_BYTES + 16],
+        )
+        .expect("oversize record 0");
+        let err_big = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+            &reader2,
+            Some(&rec_dir),
+            &cx,
+            target_str,
+            alloc,
+            &mut |_| {},
+        )
+        .expect_err("oversized on-disk record must fail loudly with EBADMSG");
+        assert!(
+            matches!(err_big, bstd::procs::hermetic::Fault::Host { code: 74, call } if call.contains("corrupt")),
+            "expected EBADMSG corruption error on oversized record, got {err_big:?}"
+        );
+        // Removing the corrupted file cleanly recomputes & republishes the exact same bytes.
+        std::fs::remove_file(&written_files[0]).expect("remove corrupt record 0");
         let mut recovered_bytes = std::vec::Vec::new();
         let rec_ok = bstd::procs::hermetic::feed_nix_runtime_closure_with(
             &reader2,
@@ -3369,9 +3417,9 @@ mod tests {
                 recovered_bytes.extend_from_slice(chunk);
             },
         )
-        .expect("recovery walk after on-disk corruption");
+        .expect("clean recompute after removing corrupt record");
         assert!(rec_ok);
-        assert_eq!(cold_bytes, recovered_bytes, "corrupt on-disk record must safely fall back to live hash");
+        assert_eq!(cold_bytes, recovered_bytes, "recomputed closure after removing corrupt record must match cold");
 
         // 32-thread concurrent burst over on-disk records via the kernel page cache.
         let conc_t0 = std::time::Instant::now();
@@ -3547,91 +3595,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&rec_root);
     }
 
-    /// Multi-seed deterministic simulation test (AGENTS.md Rules 23 & 43) for the sans-IO ELF
-    /// inode record store: exercises interleaved concurrent lookups/publishes, mid-write crashes,
-    /// torn/short reads, checksum/magic/version corruption, stamp mismatches, racy-clean windows,
-    /// oversized files, and I/O errors against a cold-hash oracle, with 4 planted-bug controls.
+    /// Real `bstd::test::seeded` (`blaze_core::sim::Sim`) DST driving the ACTUAL production
+    /// `DirInodeRecordIo` publisher across power cuts, write/sync/rename faults, and two racing
+    /// independent peer worlds sharing the simulated disk (AGENTS.md Rules 23, 43 & 51).
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    fn run_elf_inode_record_dst(plant: bstd::procs::hermetic::InodeRecordPlant) -> Result<u64, std::string::String> {
+    fn elf_inode_dir_sim_program(
+        io: &bstd::io::Io,
+        plant: bstd::procs::hermetic::InodeRecordPlant,
+    ) -> Result<(), bstd::procs::hermetic::Fault> {
         use bstd::procs::hermetic::{
-            Fault, InodeRecord, InodeRecordIo, InodeRecordPlant, InodeStamp, MAX_INODE_RECORD_BYTES,
-            RecordRead, decode_record, encode_record, lookup_inode_record, publish_inode_record,
+            DirInodeRecordIo, ELF_INODE_RECORD_SUBDIR, Fault, InodeRecord, InodeStamp,
+            lookup_inode_record, publish_inode_record,
         };
-        use std::cell::RefCell;
-        use std::collections::BTreeMap;
-
-        struct SimFs {
-            files: BTreeMap<std::string::String, std::vec::Vec<u8>>,
-            fail_next_publish: bool,
-            fail_next_read: bool,
-            orphaned_temps: usize,
-        }
-        struct SimIo(RefCell<SimFs>);
-        impl SimIo {
-            fn new() -> Self {
-                Self(RefCell::new(SimFs {
-                    files: BTreeMap::new(),
-                    fail_next_publish: false,
-                    fail_next_read: false,
-                    orphaned_temps: 0,
-                }))
-            }
-        }
-        impl InodeRecordIo for SimIo {
-            fn read_bounded(&self, key_hex: &str, max_bytes: usize) -> Result<RecordRead, Fault> {
-                let mut st = self.0.borrow_mut();
-                if st.fail_next_read {
-                    st.fail_next_read = false;
-                    return Err(Fault::Host { call: "sim read", code: 5 });
-                }
-                let Some(data) = st.files.get(key_hex) else {
-                    return Ok(RecordRead::Absent);
-                };
-                if data.len() > max_bytes {
-                    return Ok(RecordRead::Oversized);
-                }
-                let mut out = blaze_own::Vec::with_capacity_in(data.len(), super::SharedAlloc::global());
-                out.extend_from_slice(data);
-                Ok(RecordRead::Bytes(out))
-            }
-
-            fn publish_atomic(&self, key_hex: &str, bytes: &[u8]) -> Result<(), Fault> {
-                let mut st = self.0.borrow_mut();
-                if st.fail_next_publish {
-                    st.fail_next_publish = false;
-                    // Crash mid-temp write: temp cleaned up, final path untouched.
-                    st.orphaned_temps += 1;
-                    return Err(Fault::Host { call: "sim publish crash", code: 28 });
-                }
-                st.files.insert(key_hex.to_owned(), bytes.to_vec());
-                Ok(())
-            }
-
-            fn write_direct_planted(&self, key_hex: &str, bytes: &[u8]) -> Result<(), Fault> {
-                let mut st = self.0.borrow_mut();
-                if st.fail_next_publish {
-                    st.fail_next_publish = false;
-                    // Non-atomic direct write leaves a truncated half-written file at final path!
-                    let half = bytes.len() / 2;
-                    st.files.insert(key_hex.to_owned(), bytes[..half].to_vec());
-                    return Err(Fault::Host { call: "sim direct write crash", code: 28 });
-                }
-                st.files.insert(key_hex.to_owned(), bytes.to_vec());
-                Ok(())
-            }
-        }
-
-        let make_rec = |stamp: InodeStamp, tag: u8, with_digest: bool| -> InodeRecord {
+        const NOW_SEC: i64 = 1_700_000_100;
+        const KEYS: usize = 8;
+        let make_rec = |idx: usize| -> InodeRecord {
+            let st = InodeStamp {
+                dev: 42,
+                ino: 2000 + u64::try_from(idx).unwrap_or(0),
+                mode: 0o100_644,
+                size: 4096 + i64::try_from(idx).unwrap_or(0) * 512,
+                mtime_sec: NOW_SEC - 3600 - i64::try_from(idx).unwrap_or(0) * 10,
+                mtime_nsec: 123_456,
+                ctime_sec: NOW_SEC - 3600 - i64::try_from(idx).unwrap_or(0) * 10,
+                ctime_nsec: 123_456,
+            };
             let shared = super::SharedAlloc::global();
             let mut interp = blaze_own::Vec::new_in(shared);
             interp.extend_from_slice(b"/lib/ld-linux-aarch64.so.1");
             let mut runpath = blaze_own::Vec::new_in(shared);
-            runpath.extend_from_slice(b"/nix/store/demo/lib");
+            runpath.extend_from_slice(b"/nix/store/demo-clang-closure/lib");
+            // Span > 1 KiB (multiple simulated disk sectors) so unsynced/direct writes tear on power cuts.
             let mut needed = blaze_own::Vec::new_in(shared);
-            needed.extend_from_slice(b"libc.so.6\0libm.so.6\0");
+            for j in 0..48usize {
+                let s = std::format!("libprobe_sim_{idx}_{j:02}.so.1\0");
+                needed.extend_from_slice(s.as_bytes());
+            }
+            let tag = u8::try_from((idx * 19 + 3) & 0xff).unwrap_or(1);
             InodeRecord {
-                stamp,
-                digest: with_digest.then_some((u64::try_from(stamp.size).unwrap_or(0), [tag; 32])),
+                stamp: st,
+                digest: Some((u64::try_from(st.size).unwrap_or(0), [tag; 32])),
                 e_machine: 183,
                 has_dyn: true,
                 interp,
@@ -3641,209 +3644,249 @@ mod tests {
             }
         };
 
-        let mut trace_hash = 0xcbf2_9ce4_8422_2325u64;
-        let mix = |h: &mut u64, v: u64| {
-            *h ^= v;
-            *h = h.wrapping_mul(0x1000_0000_01b3);
-        };
+        let root = io.need_fs().map_err(|_| Fault::Host { call: "sim fs", code: 5 })?.root();
+        let sub_path = bstd::path::Path::new(ELF_INODE_RECORD_SUBDIR)
+            .map_err(|_| Fault::Host { call: "sub path", code: 22 })?;
+        let rec_dir = root.subdir(&sub_path);
+        let cx = io
+            .cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME)
+            .map_err(|_| Fault::Host { call: "sim cx", code: 110 })?;
+        let dir_io = DirInodeRecordIo::new(&rec_dir, &cx);
 
-        for seed in 0u64..150 {
-            let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0xa076_1d64_78bd_642f;
-            let mut next = || -> u64 {
-                rng ^= rng << 13;
-                rng ^= rng >> 7;
-                rng ^= rng << 17;
-                rng
-            };
-
-            let io = SimIo::new();
-            let now_sec: i64 = 1_700_000_100;
-            let mut stamps = std::vec::Vec::new();
-            let mut oracle: std::vec::Vec<InodeRecord> = std::vec::Vec::new();
-            for i in 0u8..6 {
-                let recent = i >= 4;
-                let ts = if recent { now_sec - i64::from(i % 2) } else { now_sec - 3600 - i64::from(i) * 10 };
-                let st = InodeStamp {
-                    dev: 42,
-                    ino: 1000 + u64::from(i),
-                    mode: 0o100_644,
-                    size: 4096 + i64::from(i) * 512,
-                    mtime_sec: ts,
-                    mtime_nsec: 123_456,
-                    ctime_sec: ts,
-                    ctime_nsec: 123_456,
-                };
-                oracle.push(make_rec(st, i.wrapping_add(1).wrapping_mul(17), i % 3 != 0));
-                stamps.push(st);
-            }
-
-            for step in 0..48 {
-                let idx = (next() as usize) % stamps.len();
-                let st = stamps[idx];
-                let expected = &oracle[idx];
-                let key = std::str::from_utf8(&st.record_key_hex()).unwrap().to_owned();
-                let action = next() % 11;
-
-                match action {
-                    0..=2 => {
-                        let need_digest = (next() & 1) == 1;
-                        let got = lookup_inode_record(&io, st, now_sec, need_digest, plant)
-                            .map_err(|e| std::format!("seed {seed} step {step}: lookup fault {e:?}"))?;
-                        mix(&mut trace_hash, got.is_some() as u64);
-                        if let Some(rec) = got {
-                            if !st.is_cacheable(now_sec) {
-                                return Err(std::format!(
-                                    "seed {seed} step {step}: racy-clean violation on lookup for recent stamp"
-                                ));
-                            }
-                            if rec != *expected {
-                                return Err(std::format!(
-                                    "seed {seed} step {step}: oracle mismatch on lookup: got {rec:?}, want {expected:?}"
-                                ));
-                            }
-                            if need_digest && rec.digest.is_none() {
-                                return Err(std::format!(
-                                    "seed {seed} step {step}: returned digest-less record when need_digest=true"
-                                ));
-                            }
-                        }
-                    }
-                    3..=4 => {
-                        let published = publish_inode_record(&io, expected, now_sec, plant)
-                            .map_err(|e| std::format!("seed {seed} step {step}: publish fault {e:?}"))?;
-                        mix(&mut trace_hash, published as u64);
-                        if published && !st.is_cacheable(now_sec) {
-                            return Err(std::format!(
-                                "seed {seed} step {step}: racy-clean violation on publish for recent stamp"
-                            ));
-                        }
-                    }
-                    5 => {
-                        // Crash mid-publish: final path must NOT change or become torn.
-                        let before = io.0.borrow().files.get(&key).cloned();
-                        io.0.borrow_mut().fail_next_publish = true;
-                        let _ = publish_inode_record(&io, expected, now_sec, plant);
-                        io.0.borrow_mut().fail_next_publish = false;
-                        let after = io.0.borrow().files.get(&key).cloned();
-                        if before != after {
-                            return Err(std::format!(
-                                "seed {seed} step {step}: non-atomic publish left torn/modified file at {key}"
-                            ));
-                        }
-                    }
-                    6 => {
-                        // Bit-flip corruption in payload (not checksum) must NEVER decode!
-                        if let Some(mut raw) = encode_record(expected).map(|v| v.as_slice().to_vec()) {
-                            let flip = 75 + ((next() as usize) % (raw.len().saturating_sub(110).max(1)));
-                            raw[flip] ^= 0x5a;
-                            io.0.borrow_mut().files.insert(key.clone(), raw);
-                            if let Some(bad) = lookup_inode_record(&io, st, now_sec, false, plant)
-                                .map_err(|e| std::format!("seed {seed} step {step}: corrupt lookup fault {e:?}"))?
-                            {
-                                return Err(std::format!(
-                                    "seed {seed} step {step}: accepted corrupted record with invalid checksum: {bad:?}"
-                                ));
-                            }
-                        }
-                    }
-                    7 => {
-                        // Truncated/short read must return None, never panic or misdecode.
-                        if let Some(raw) = encode_record(expected).map(|v| v.as_slice().to_vec()) {
-                            let cut = (next() as usize) % raw.len();
-                            io.0.borrow_mut().files.insert(key.clone(), raw[..cut].to_vec());
-                            let got = lookup_inode_record(&io, st, now_sec, false, plant)
-                                .map_err(|e| std::format!("seed {seed} step {step}: short lookup fault {e:?}"))?;
-                            if got.is_some() {
-                                return Err(std::format!("seed {seed} step {step}: accepted truncated record"));
-                            }
-                        }
-                    }
-                    8 => {
-                        // Stamp mismatch: valid record for ANOTHER stamp placed under `key` must be rejected!
-                        let other_idx = (idx + 1) % stamps.len();
-                        if other_idx != idx
-                            && let Some(raw) = encode_record(&oracle[other_idx]).map(|v| v.as_slice().to_vec())
-                        {
-                            io.0.borrow_mut().files.insert(key.clone(), raw);
-                            if let Some(bad) = lookup_inode_record(&io, st, now_sec, false, plant)
-                                .map_err(|e| std::format!("seed {seed} step {step}: mismatch lookup fault {e:?}"))?
-                            {
-                                return Err(std::format!(
-                                    "seed {seed} step {step}: accepted wrong-stamp record under key: {bad:?}"
-                                ));
-                            }
-                        }
-                    }
-                    9 => {
-                        // Oversized record (> 64 KiB) must cleanly miss before allocating.
-                        io.0.borrow_mut().files.insert(key.clone(), std::vec![0u8; MAX_INODE_RECORD_BYTES + 17]);
-                        let got = lookup_inode_record(&io, st, now_sec, false, plant)
-                            .map_err(|e| std::format!("seed {seed} step {step}: oversized lookup fault {e:?}"))?;
-                        if got.is_some() {
-                            return Err(std::format!("seed {seed} step {step}: accepted oversized record"));
-                        }
-                    }
-                    _ => {
-                        // Transient read I/O error must propagate as Err (Rule 18), never silently miss.
-                        if st.is_cacheable(now_sec) {
-                            io.0.borrow_mut().fail_next_read = true;
-                            let res = lookup_inode_record(&io, st, now_sec, false, plant);
-                            if res.is_ok() {
-                                return Err(std::format!(
-                                    "seed {seed} step {step}: read I/O error was silently swallowed"
-                                ));
-                            }
-                        }
-                    }
+        // Post-crash oracle: after ANY power cut or I/O failure, every key must read back either
+        // Absent (`Ok(None)`) or the exact oracle record — NEVER a torn/corrupt record (`code: 74`).
+        for k in 0..KEYS {
+            let want = make_rec(k);
+            match lookup_inode_record(&dir_io, want.stamp, NOW_SEC, true, plant) {
+                Ok(None) => {}
+                Ok(Some(got)) => {
+                    assert_eq!(got, want, "elf inode sim oracle: key {k} survived crash with mismatched record");
                 }
-            }
-
-            // Sanity: bad magic / bad version are always refused.
-            if let Some(mut raw) = encode_record(&oracle[0]).map(|v| v.as_slice().to_vec()) {
-                raw[0] ^= 0x01;
-                if decode_record(&raw, stamps[0], plant).is_some() {
-                    return Err(std::format!("seed {seed}: accepted corrupted magic"));
+                Err(Fault::Host { code: 74, call }) => {
+                    panic!("elf inode sim oracle: key {k} left torn/corrupt after power cut ({call})");
                 }
-                let mut raw2 = encode_record(&oracle[0]).unwrap().as_slice().to_vec();
-                raw2[8] = 99;
-                if decode_record(&raw2, stamps[0], plant).is_some() {
-                    return Err(std::format!("seed {seed}: accepted bad version"));
-                }
-            }
-            if plant == InodeRecordPlant::None {
-                mix(&mut trace_hash, io.0.borrow().orphaned_temps as u64);
+                Err(other) => return Err(other),
             }
         }
-        Ok(trace_hash)
+
+        // Two independent racing peer worlds sharing the simulated disk.
+        let peer_a = io
+            .peer_world_for_test(Some(0x1111_aaaa_0000_0001))
+            .ok_or(Fault::Host { call: "peer a", code: 5 })?;
+        let peer_b = io
+            .peer_world_for_test(Some(0x2222_bbbb_0000_0002))
+            .ok_or(Fault::Host { call: "peer b", code: 5 })?;
+        let cx_a = peer_a
+            .cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME)
+            .map_err(|_| Fault::Host { call: "cx a", code: 110 })?;
+        let cx_b = peer_b
+            .cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME)
+            .map_err(|_| Fault::Host { call: "cx b", code: 110 })?;
+        let dir_a = peer_a.need_fs().map_err(|_| Fault::Host { call: "fs a", code: 5 })?.root().subdir(&sub_path);
+        let dir_b = peer_b.need_fs().map_err(|_| Fault::Host { call: "fs b", code: 5 })?.root().subdir(&sub_path);
+        let io_a = DirInodeRecordIo::new(&dir_a, &cx_a);
+        let io_b = DirInodeRecordIo::new(&dir_b, &cx_b);
+
+        for k in 0..KEYS {
+            let want = make_rec(k);
+            if k % 2 == 0 {
+                let _ = publish_inode_record(&io_a, &want, NOW_SEC, plant)?;
+                let _ = publish_inode_record(&io_b, &want, NOW_SEC, plant)?;
+            } else {
+                let _ = publish_inode_record(&io_b, &want, NOW_SEC, plant)?;
+                let _ = publish_inode_record(&io_a, &want, NOW_SEC, plant)?;
+            }
+            let got_a = lookup_inode_record(&io_a, want.stamp, NOW_SEC, true, plant)?;
+            let got_b = lookup_inode_record(&io_b, want.stamp, NOW_SEC, true, plant)?;
+            assert_eq!(got_a.as_ref(), Some(&want), "elf inode sim oracle: peer A mismatch on key {k}");
+            assert_eq!(got_b.as_ref(), Some(&want), "elf inode sim oracle: peer B mismatch on key {k}");
+        }
+        Ok(())
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn elf_inode_record_dst_passes_and_replays_deterministically() {
-        let a = run_elf_inode_record_dst(bstd::procs::hermetic::InodeRecordPlant::None)
-            .expect("150-seed ELF inode record DST must pass");
-        let b = run_elf_inode_record_dst(bstd::procs::hermetic::InodeRecordPlant::None)
-            .expect("150-seed ELF inode record DST second run must pass");
-        assert_eq!(a, b, "DST trace hash must replay identically across runs");
+    fn elf_inode_record_dst_survives_sim_crashes_and_concurrent_peers() {
+        match bstd::test::seeded(
+            "blaze-proc-macro",
+            module_path!(),
+            "elf_inode_dir_crash",
+            bstd::test::Seeds::DEFAULT.from(0, 200),
+            bstd::test::Given::NOTHING,
+            |_: &bstd::cx::Cx, io: bstd::io::Io| {
+                elf_inode_dir_sim_program(&io, bstd::procs::hermetic::InodeRecordPlant::None)
+                    .map_err(|e| std::format!("{e:?}"))
+            },
+        ) {
+            Ok(passed) => {
+                assert!(passed.counts.cuts > 50, "too few power cuts: {:?}", passed.counts);
+                assert!(passed.counts.failures > 50, "too few failures: {:?}", passed.counts);
+            }
+            Err(failed) => panic!("{failed}"),
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn elf_inode_record_dst_catches_all_four_planted_bugs() {
-        let err_ck = run_elf_inode_record_dst(bstd::procs::hermetic::InodeRecordPlant::SkipChecksum)
-            .expect_err("SkipChecksum must be caught by DST");
-        assert!(err_ck.contains("corrupted record"), "unexpected error: {err_ck}");
+        use bstd::procs::hermetic::{
+            DirInodeRecordIo, ELF_INODE_RECORD_SUBDIR, Fault, InodeRecord, InodeRecordPlant,
+            InodeStamp, MAX_INODE_RECORD_BYTES, RecordCorrupt, decode_record_with_parser,
+            encode_record, encode_record_with_parser, lookup_inode_record, publish_inode_record,
+            publish_inode_record_capped,
+        };
 
-        let err_rc = run_elf_inode_record_dst(bstd::procs::hermetic::InodeRecordPlant::SkipRacyClean)
-            .expect_err("SkipRacyClean must be caught by DST");
-        assert!(err_rc.contains("racy-clean violation"), "unexpected error: {err_rc}");
+        // 1. Planted DirectWrite caught by `bstd::test::seeded` power cuts on production DirInodeRecordIo!
+        match bstd::test::seeded(
+            "blaze-proc-macro",
+            module_path!(),
+            "elf_inode_dir_direct_write_plant",
+            bstd::test::Seeds::DEFAULT.from(0, 100),
+            bstd::test::Given::NOTHING,
+            |_: &bstd::cx::Cx, io: bstd::io::Io| {
+                elf_inode_dir_sim_program(&io, InodeRecordPlant::DirectWrite)
+                    .map_err(|e| std::format!("{e:?}"))
+            },
+        ) {
+            Ok(passed) => panic!("planted DirectWrite was not caught in {} starts", passed.starts),
+            Err(failed) => {
+                let said = std::format!("{failed}");
+                assert!(
+                    said.contains("elf inode sim oracle"),
+                    "planted DirectWrite failed for unexpected reason: {said}"
+                );
+            }
+        }
 
-        let err_dw = run_elf_inode_record_dst(bstd::procs::hermetic::InodeRecordPlant::DirectWrite)
-            .expect_err("DirectWrite must be caught by DST");
-        assert!(err_dw.contains("non-atomic publish"), "unexpected error: {err_dw}");
+        // 2. Parser-identity rollover + production `DirInodeRecordIo` under `Io::sim` +
+        //    `Sim::short_reads` + bounded cap + corruption reporting + 3 remaining planted bugs.
+        let run_validation = |plant: InodeRecordPlant| -> Result<(), std::string::String> {
+            const NOW_SEC: i64 = 1_700_000_100;
+            let make_rec = |idx: u64| -> InodeRecord {
+                let st = InodeStamp {
+                    dev: 9,
+                    ino: 5000 + idx,
+                    mode: 0o100_644,
+                    size: 4096 + i64::try_from(idx).unwrap_or(0) * 64,
+                    mtime_sec: NOW_SEC - 3600,
+                    mtime_nsec: 1,
+                    ctime_sec: NOW_SEC - 3600,
+                    ctime_nsec: 1,
+                };
+                let shared = super::SharedAlloc::global();
+                let mut interp = blaze_own::Vec::new_in(shared);
+                interp.extend_from_slice(b"/lib/ld-linux-aarch64.so.1");
+                let mut needed = blaze_own::Vec::new_in(shared);
+                for j in 0..32u32 {
+                    let s = std::format!("libsim_{idx}_{j:02}.so.1\0");
+                    needed.extend_from_slice(s.as_bytes());
+                }
+                InodeRecord {
+                    stamp: st,
+                    digest: Some((u64::try_from(st.size).unwrap_or(0), [u8::try_from(idx & 0xff).unwrap_or(1); 32])),
+                    e_machine: 183,
+                    has_dyn: true,
+                    interp,
+                    runpath: None,
+                    rpath: None,
+                    needed_blob: needed,
+                }
+            };
 
-        let err_st = run_elf_inode_record_dst(bstd::procs::hermetic::InodeRecordPlant::SkipStampCheck)
-            .expect_err("SkipStampCheck must be caught by DST");
-        assert!(err_st.contains("wrong-stamp record"), "unexpected error: {err_st}");
+            let rec0 = make_rec(1);
+            let rec1 = make_rec(2);
+            // Parser-identity rollover check.
+            assert_ne!(
+                rec0.stamp.record_key_hex_with_parser(&[0xaa; 32]),
+                rec0.stamp.record_key_hex_with_parser(&[0xbb; 32]),
+                "parser identity change must roll inode record key"
+            );
+            let enc_a = encode_record_with_parser(&rec0, &[0xaa; 32]).ok_or("enc_a")?;
+            if plant != InodeRecordPlant::SkipChecksum {
+                assert_eq!(
+                    decode_record_with_parser(enc_a.as_slice(), rec0.stamp, &[0xbb; 32], plant),
+                    Err(RecordCorrupt::BadChecksum)
+                );
+            }
+
+            let io = bstd::io::Io::sim(77);
+            let root = io.need_fs().map_err(|_| "no fs")?.root();
+            let sub = bstd::path::Path::new(ELF_INODE_RECORD_SUBDIR).map_err(|_| "sub")?;
+            let rec_dir = root.subdir(&sub);
+            let cx = io.cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME).map_err(|_| "cx")?;
+            let dir_io = DirInodeRecordIo::new(&rec_dir, &cx);
+
+            publish_inode_record(&dir_io, &rec0, NOW_SEC, plant).map_err(|e| std::format!("pub0: {e:?}"))?;
+            let short_dir = blaze_core::FileName::new(ELF_INODE_RECORD_SUBDIR).ok_or("short dir")?;
+            io.with_sim(|sim| sim.short_reads(short_dir, 1)).ok_or("expected sim")?;
+            let got = lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant)
+                .map_err(|e| std::format!("short read: {e:?}"))?;
+            if got.as_ref() != Some(&rec0) {
+                return Err("short-read oracle: truncated record under Sim::short_reads".into());
+            }
+
+            let k0_buf = rec0.stamp.record_key_hex();
+            let k0_str = std::str::from_utf8(&k0_buf).unwrap();
+            let k0 = bstd::path::Path::new(k0_str).map_err(|_| "k0")?;
+
+            // Bit-flip -> EBADMSG (catches SkipChecksum).
+            let mut flipped = encode_record(&rec0).ok_or("enc0")?.as_slice().to_vec();
+            flipped[85] ^= 0x5a;
+            rec_dir.publish(&cx, &k0, bstd::fs::Content::bytes(&flipped), bstd::fs::Durable::No).map_err(|_| "flip")?;
+            match lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant) {
+                Err(Fault::Host { code: 74, .. }) => {}
+                other => return Err(std::format!("corrupt checksum oracle: got {other:?}")),
+            }
+
+            // Wrong-stamp valid record under k0 -> EBADMSG (catches SkipStampCheck).
+            let raw1 = encode_record(&rec1).ok_or("enc1")?;
+            rec_dir.publish(&cx, &k0, bstd::fs::Content::bytes(raw1.as_slice()), bstd::fs::Durable::No).map_err(|_| "swap")?;
+            match lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant) {
+                Err(Fault::Host { code: 74, .. }) => {}
+                other => return Err(std::format!("wrong-stamp oracle: got {other:?}")),
+            }
+
+            // Oversized -> EBADMSG.
+            rec_dir
+                .publish(&cx, &k0, bstd::fs::Content::bytes(&std::vec![0u8; MAX_INODE_RECORD_BYTES + 1]), bstd::fs::Durable::No)
+                .map_err(|_| "big")?;
+            match lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant) {
+                Err(Fault::Host { code: 74, .. }) => {}
+                other => return Err(std::format!("oversized oracle: got {other:?}")),
+            }
+            rec_dir.remove(&cx, &k0, bstd::fs::Durable::No).map_err(|_| "rm")?;
+
+            // Racy-clean guard (catches SkipRacyClean).
+            let racy_st = InodeStamp { ctime_sec: NOW_SEC - 1, ..rec1.stamp };
+            let racy_rec = InodeRecord { stamp: racy_st, ..make_rec(3) };
+            if publish_inode_record(&dir_io, &racy_rec, NOW_SEC, plant).map_err(|e| std::format!("racy: {e:?}"))? {
+                return Err("racy-clean oracle: published record within 2s window".into());
+            }
+
+            // Bounded cap eviction (`max_entries = 4` across 10 distinct stamps).
+            let clock = io.need_clock().map_err(|_| "clock")?;
+            for i in 10..20u64 {
+                let rec = make_rec(i);
+                let _ = publish_inode_record_capped(&dir_io, &rec, NOW_SEC, 4, plant)
+                    .map_err(|e| std::format!("cap {i}: {e:?}"))?;
+                let _ = clock.sleep(&cx, super::Duration::from_millis(5));
+            }
+            let entries = rec_dir.own_entries(&cx).map_err(|_| "entries")?;
+            let count = (0..entries.len())
+                .filter(|&i| entries.kind(i) == bstd::fs::EntryKind::File && !entries.name(i).ends_with(".bstd-new"))
+                .count();
+            if count > 4 {
+                return Err(std::format!("bounded cap oracle: expected <= 4 files, found {count}"));
+            }
+            Ok(())
+        };
+
+        run_validation(InodeRecordPlant::None).expect("clean validation sim must pass");
+        let e_ck = run_validation(InodeRecordPlant::SkipChecksum).expect_err("must catch SkipChecksum");
+        assert!(e_ck.contains("corrupt checksum oracle"), "unexpected: {e_ck}");
+        let e_rc = run_validation(InodeRecordPlant::SkipRacyClean).expect_err("must catch SkipRacyClean");
+        assert!(e_rc.contains("racy-clean oracle"), "unexpected: {e_rc}");
+        let e_st = run_validation(InodeRecordPlant::SkipStampCheck).expect_err("must catch SkipStampCheck");
+        assert!(e_st.contains("wrong-stamp oracle"), "unexpected: {e_st}");
     }
 }

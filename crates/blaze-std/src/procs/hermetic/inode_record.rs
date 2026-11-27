@@ -2,9 +2,22 @@
 //! rely on the kernel page cache for fast reads across tasks and commands).
 //!
 //! Each record caches the pure-content facts of one regular file inode (its ELF64 header/dynamic
-//! section metadata and optionally its full-file SHA-256 + length), keyed strictly by its live
-//! `fstat(fd)` [`InodeStamp`] and guarded by a 2-second racy-clean window so same-tick in-place
+//! section metadata and optionally its full-file SHA-256 + length), keyed strictly by BOTH the
+//! parser code identity (`parser_identity()` over `landlock.rs` + `inode_record.rs`) AND the live
+//! `fstat(fd)` [`InodeStamp`], guarded by a 2-second racy-clean window so same-tick in-place
 //! writes never read or write stale records.
+//!
+//! Durability & corruption policy:
+//! - Records are published atomically with `Durable::Yes` (sibling temp file -> flush -> rename ->
+//!   sync directory) only on cold misses, so even a sudden power cut never leaves a torn record
+//!   at the final path.
+//! - Any existing record that is oversized, truncated, fails its BLAKE3 seal, has bad magic/
+//!   version/flags/layout, or mismatches the expected [`InodeStamp`] is reported loudly as a typed
+//!   corruption error (`EBADMSG`, code 74) instead of silently falling back to live hashing
+//!   (AGENTS.md Rule 3). Only genuine `FsKind::NotFound`, racy-clean timestamps, or valid
+//!   metadata-only records upgraded to require a full-file digest return `Ok(None)`.
+//! - Write-side directory bounding evicts oldest-mtime records when the directory exceeds
+//!   [`MAX_INODE_RECORD_ENTRIES`], complementing `blaze gc` expiry/LRU sweeps.
 //!
 //! Layout (all integers little-endian):
 //! - `[0..8]`   magic `b"BZELFIN1"`
@@ -19,7 +32,8 @@
 //! - `[123..127]` `rpath_len: u32`
 //! - `[127..131]` `needed_len: u32`
 //! - `[131..N-32]` payload bytes (`interp`, `runpath`, `rpath`, `needed_blob`)
-//! - `[N-32..N]` trailing 32-byte BLAKE3 self-checksum over `RECORD_SEAL_DOMAIN || bytes[..N-32]`.
+//! - `[N-32..N]` trailing 32-byte BLAKE3 self-checksum over
+//!   `RECORD_SEAL_DOMAIN || parser_identity || bytes[..N-32]`.
 
 use blaze_own::{SharedAlloc, Vec as OwnVec};
 
@@ -32,10 +46,21 @@ pub const ELF_INODE_RECORD_SUBDIR: &str = "build-script/records/elf-inodes-v1";
 /// Checked via file metadata BEFORE allocating a buffer.
 pub const MAX_INODE_RECORD_BYTES: usize = 64 << 10;
 
+/// Maximum number of on-disk ELF inode record files retained in `elf-inodes-v1` before cold-miss
+/// publishes prune oldest-mtime entries down to a 75% low watermark.
+pub const MAX_INODE_RECORD_ENTRIES: usize = 512;
+
+/// Upper bound on directory entries scanned during one bounded write-side prune pass (Rule 18).
+const PRUNE_SCAN_MOST: usize = 4096;
+
+/// Linux/POSIX `EBADMSG` errno reported for corrupt on-disk ELF inode records.
+const EBADMSG: u16 = 74;
+
 const MAGIC: [u8; 8] = *b"BZELFIN1";
 const VERSION: u32 = 1;
 const HEADER_LEN: usize = 131;
 const CHECKSUM_LEN: usize = 32;
+const PARSER_ID_DOMAIN: &[u8] = b"blaze-elf-inode-parser-id-v1\0";
 const RECORD_KEY_DOMAIN: &[u8] = b"blaze-elf-inode-record-v1\0";
 const RECORD_SEAL_DOMAIN: &[u8] = b"blaze-elf-inode-record-seal-v1\0";
 
@@ -48,6 +73,48 @@ const VALID_FLAGS_MASK: u8 = FLAG_HAS_DIGEST | FLAG_HAS_DYN | FLAG_HAS_RUNPATH |
 const MAX_INTERP_LEN: usize = 512;
 const MAX_RPATH_LEN: usize = 2048;
 const MAX_NEEDED_BLOB_LEN: usize = 128 * 320;
+
+/// Content digest of the ELF parser (`landlock.rs`) and inode-record codec (`inode_record.rs`)
+/// source bytes. Mixed into every record filename AND record seal so any change to ELF parsing or
+/// decoding automatically rolls every on-disk inode record key (Rule 21 & Rule 69).
+pub fn parser_identity() -> [u8; 32] {
+    let mut h = crate::digest::Blake3::new();
+    h.update(PARSER_ID_DOMAIN);
+    h.update(include_bytes!("landlock.rs"));
+    h.update(include_bytes!("inode_record.rs"));
+    h.finalize()
+}
+
+/// Typed corruption reason reported loudly (`EBADMSG`, code 74) whenever an existing on-disk ELF
+/// inode record fails validation (never silently downgraded to a cache miss, Rule 3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecordCorrupt {
+    Oversized,
+    Truncated,
+    BadChecksum,
+    BadMagic,
+    BadVersion,
+    StampMismatch,
+    InvalidFlags,
+    InvalidLayout,
+}
+
+impl RecordCorrupt {
+    /// Converts this corruption reason into a descriptive [`Fault::Host`] (`EBADMSG`).
+    pub const fn into_fault(self) -> Fault {
+        let call = match self {
+            RecordCorrupt::Oversized => "elf inode record corrupt (oversized)",
+            RecordCorrupt::Truncated => "elf inode record corrupt (truncated)",
+            RecordCorrupt::BadChecksum => "elf inode record corrupt (bad checksum)",
+            RecordCorrupt::BadMagic => "elf inode record corrupt (bad magic)",
+            RecordCorrupt::BadVersion => "elf inode record corrupt (bad version)",
+            RecordCorrupt::StampMismatch => "elf inode record corrupt (stamp mismatch)",
+            RecordCorrupt::InvalidFlags => "elf inode record corrupt (invalid flags)",
+            RecordCorrupt::InvalidLayout => "elf inode record corrupt (invalid layout)",
+        };
+        Fault::Host { call, code: EBADMSG }
+    }
+}
 
 /// Kernel inode metadata stamp of a live opened regular file descriptor (`fstat(fd)`):
 /// `(st_dev, st_ino, st_mode, st_size, st_mtime, st_ctime)`. Any write, truncation, attribute
@@ -111,10 +178,18 @@ impl InodeStamp {
     }
 
     /// Deterministic 64-byte lowercase hex record filename derived from
-    /// `blake3("blaze-elf-inode-record-v1\0" || stamp_le_bytes)`.
+    /// `blake3("blaze-elf-inode-record-v1\0" || parser_identity() || stamp_le_bytes)`.
     pub fn record_key_hex(&self) -> [u8; 64] {
+        let pid = parser_identity();
+        self.record_key_hex_with_parser(&pid)
+    }
+
+    /// Deterministic 64-byte lowercase hex record filename parameterized by explicit `parser_id`
+    /// so tests can prove that parser code changes roll every on-disk key.
+    pub fn record_key_hex_with_parser(&self, parser_id: &[u8; 32]) -> [u8; 64] {
         let mut h = crate::digest::Blake3::new();
         h.update(RECORD_KEY_DOMAIN);
+        h.update(parser_id);
         h.update(&self.dev.to_le_bytes());
         h.update(&self.ino.to_le_bytes());
         h.update(&self.mode.to_le_bytes());
@@ -171,7 +246,7 @@ pub enum InodeRecordPlant {
     SkipChecksum,
     /// Control 2: skips the 2-second racy-clean guard on read and publish.
     SkipRacyClean,
-    /// Control 3: writes records directly to the final path instead of atomic temp+rename.
+    /// Control 3: writes records directly (non-atomically) to the final path instead of synced temp+rename.
     DirectWrite,
     /// Control 4: skips checking that the decoded record's `InodeStamp` matches the asked stamp.
     SkipStampCheck,
@@ -185,23 +260,36 @@ pub enum RecordRead {
 }
 
 /// Sans-IO filesystem seam for immutable write-once ELF inode records, implemented in production
-/// by [`DirInodeRecordIo`] over `bstd::fs::Dir<ReadWrite>` and in DSTs by `SimRecordIo`.
+/// by [`DirInodeRecordIo`] over `bstd::fs::Dir<ReadWrite>`.
 pub trait InodeRecordIo {
     /// Reads `key_hex` (64 ASCII hex chars), capping size at `max_bytes` BEFORE allocating.
     fn read_bounded(&self, key_hex: &str, max_bytes: usize) -> Result<RecordRead, Fault>;
 
-    /// Publishes `bytes` atomically at `key_hex` (unique sibling temp file + rename, cleaning up
-    /// temp on failure).
+    /// Publishes `bytes` atomically and durably at `key_hex` (unique sibling temp file + flush +
+    /// rename + dir sync).
     fn publish_atomic(&self, key_hex: &str, bytes: &[u8]) -> Result<(), Fault>;
 
     /// Non-atomic direct write at `key_hex` (invoked ONLY by [`InodeRecordPlant::DirectWrite`]
     /// in DST controls).
     fn write_direct_planted(&self, key_hex: &str, bytes: &[u8]) -> Result<(), Fault>;
+
+    /// Prunes oldest-mtime entries when the record directory exceeds `max_entries`, preserving
+    /// `keep_key`. Invoked only on cold-miss publishes (never on warm lookups).
+    fn prune_to_cap(&self, max_entries: usize, keep_key: &str) -> Result<(), Fault>;
 }
 
-/// Encodes `record` into canonical self-checksummed bytes (`BZELFIN1` + trailing 32-byte BLAKE3).
+/// Encodes `record` into canonical self-checksummed bytes bound to [`parser_identity()`].
 /// Returns `None` if the encoded record would exceed [`MAX_INODE_RECORD_BYTES`].
 pub fn encode_record(record: &InodeRecord) -> Option<OwnVec<u8, SharedAlloc<'static>>> {
+    let pid = parser_identity();
+    encode_record_with_parser(record, &pid)
+}
+
+/// Encodes `record` into canonical self-checksummed bytes bound to explicit `parser_id`.
+pub fn encode_record_with_parser(
+    record: &InodeRecord,
+    parser_id: &[u8; 32],
+) -> Option<OwnVec<u8, SharedAlloc<'static>>> {
     let runpath_bytes = record.runpath.as_ref().map_or(&[][..], OwnVec::as_slice);
     let rpath_bytes = record.rpath.as_ref().map_or(&[][..], OwnVec::as_slice);
     let interp_bytes = record.interp.as_slice();
@@ -273,60 +361,76 @@ pub fn encode_record(record: &InodeRecord) -> Option<OwnVec<u8, SharedAlloc<'sta
 
     let mut seal = crate::digest::Blake3::new();
     seal.update(RECORD_SEAL_DOMAIN);
+    seal.update(parser_id);
     seal.update(out.as_slice());
     let checksum = seal.finalize();
     out.extend_from_slice(&checksum);
     Some(out)
 }
 
-/// Verifies and decodes a serialized ELF inode record against `expected_stamp`.
-/// Returns `None` on any size overflow, checksum failure, magic/version mismatch, stamp mismatch,
-/// invalid flags, or trailing bytes.
+/// Verifies and decodes a serialized ELF inode record against `expected_stamp` and
+/// [`parser_identity()`], returning a typed [`RecordCorrupt`] on any validation failure.
 pub fn decode_record(
     bytes: &[u8],
     expected_stamp: InodeStamp,
     plant: InodeRecordPlant,
-) -> Option<InodeRecord> {
-    if bytes.len() > MAX_INODE_RECORD_BYTES || bytes.len() < HEADER_LEN + CHECKSUM_LEN {
-        return None;
+) -> Result<InodeRecord, RecordCorrupt> {
+    let pid = parser_identity();
+    decode_record_with_parser(bytes, expected_stamp, &pid, plant)
+}
+
+/// Verifies and decodes a serialized ELF inode record against `expected_stamp` and explicit
+/// `parser_id`, returning a typed [`RecordCorrupt`] on any validation failure.
+pub fn decode_record_with_parser(
+    bytes: &[u8],
+    expected_stamp: InodeStamp,
+    parser_id: &[u8; 32],
+    plant: InodeRecordPlant,
+) -> Result<InodeRecord, RecordCorrupt> {
+    if bytes.len() > MAX_INODE_RECORD_BYTES {
+        return Err(RecordCorrupt::Oversized);
     }
-    let body_len = bytes.len().checked_sub(CHECKSUM_LEN)?;
-    let (body, trailing) = bytes.split_at_checked(body_len)?;
+    if bytes.len() < HEADER_LEN + CHECKSUM_LEN {
+        return Err(RecordCorrupt::Truncated);
+    }
+    let body_len = bytes.len().checked_sub(CHECKSUM_LEN).ok_or(RecordCorrupt::Truncated)?;
+    let (body, trailing) = bytes.split_at_checked(body_len).ok_or(RecordCorrupt::Truncated)?;
     if plant != InodeRecordPlant::SkipChecksum {
         let mut seal = crate::digest::Blake3::new();
         seal.update(RECORD_SEAL_DOMAIN);
+        seal.update(parser_id);
         seal.update(body);
         if seal.finalize().as_slice() != trailing {
-            return None;
+            return Err(RecordCorrupt::BadChecksum);
         }
     }
     if body.get(..8) != Some(MAGIC.as_slice()) {
-        return None;
+        return Err(RecordCorrupt::BadMagic);
     }
-    if read_u32(body, 8)? != VERSION {
-        return None;
+    if read_u32(body, 8).ok_or(RecordCorrupt::Truncated)? != VERSION {
+        return Err(RecordCorrupt::BadVersion);
     }
     let stamp = InodeStamp {
-        dev: read_u64(body, 12)?,
-        ino: read_u64(body, 20)?,
-        mode: read_u32(body, 28)?,
-        size: read_i64(body, 32)?,
-        mtime_sec: read_i64(body, 40)?,
-        mtime_nsec: read_i64(body, 48)?,
-        ctime_sec: read_i64(body, 56)?,
-        ctime_nsec: read_i64(body, 64)?,
+        dev: read_u64(body, 12).ok_or(RecordCorrupt::Truncated)?,
+        ino: read_u64(body, 20).ok_or(RecordCorrupt::Truncated)?,
+        mode: read_u32(body, 28).ok_or(RecordCorrupt::Truncated)?,
+        size: read_i64(body, 32).ok_or(RecordCorrupt::Truncated)?,
+        mtime_sec: read_i64(body, 40).ok_or(RecordCorrupt::Truncated)?,
+        mtime_nsec: read_i64(body, 48).ok_or(RecordCorrupt::Truncated)?,
+        ctime_sec: read_i64(body, 56).ok_or(RecordCorrupt::Truncated)?,
+        ctime_nsec: read_i64(body, 64).ok_or(RecordCorrupt::Truncated)?,
     };
     if plant != InodeRecordPlant::SkipStampCheck && stamp != expected_stamp {
-        return None;
+        return Err(RecordCorrupt::StampMismatch);
     }
-    let flags = *body.get(72)?;
+    let flags = *body.get(72).ok_or(RecordCorrupt::Truncated)?;
     if (flags & !VALID_FLAGS_MASK) != 0 {
-        return None;
+        return Err(RecordCorrupt::InvalidFlags);
     }
-    let e_machine = read_u16(body, 73)?;
-    let file_len = read_u64(body, 75)?;
+    let e_machine = read_u16(body, 73).ok_or(RecordCorrupt::Truncated)?;
+    let file_len = read_u64(body, 75).ok_or(RecordCorrupt::Truncated)?;
     let mut sha256 = [0u8; 32];
-    sha256.copy_from_slice(body.get(83..115)?);
+    sha256.copy_from_slice(body.get(83..115).ok_or(RecordCorrupt::Truncated)?);
     let digest = if (flags & FLAG_HAS_DIGEST) != 0 {
         Some((file_len, sha256))
     } else {
@@ -336,10 +440,14 @@ pub fn decode_record(
     let has_runpath = (flags & FLAG_HAS_RUNPATH) != 0;
     let has_rpath = (flags & FLAG_HAS_RPATH) != 0;
 
-    let interp_len = usize::try_from(read_u32(body, 115)?).ok()?;
-    let runpath_len = usize::try_from(read_u32(body, 119)?).ok()?;
-    let rpath_len = usize::try_from(read_u32(body, 123)?).ok()?;
-    let needed_len = usize::try_from(read_u32(body, 127)?).ok()?;
+    let interp_len = usize::try_from(read_u32(body, 115).ok_or(RecordCorrupt::Truncated)?)
+        .map_err(|_| RecordCorrupt::InvalidLayout)?;
+    let runpath_len = usize::try_from(read_u32(body, 119).ok_or(RecordCorrupt::Truncated)?)
+        .map_err(|_| RecordCorrupt::InvalidLayout)?;
+    let rpath_len = usize::try_from(read_u32(body, 123).ok_or(RecordCorrupt::Truncated)?)
+        .map_err(|_| RecordCorrupt::InvalidLayout)?;
+    let needed_len = usize::try_from(read_u32(body, 127).ok_or(RecordCorrupt::Truncated)?)
+        .map_err(|_| RecordCorrupt::InvalidLayout)?;
 
     if interp_len > MAX_INTERP_LEN
         || runpath_len > MAX_RPATH_LEN
@@ -348,42 +456,46 @@ pub fn decode_record(
         || (!has_runpath && runpath_len != 0)
         || (!has_rpath && rpath_len != 0)
     {
-        return None;
+        return Err(RecordCorrupt::InvalidLayout);
     }
-    let end_interp = HEADER_LEN.checked_add(interp_len)?;
-    let end_runpath = end_interp.checked_add(runpath_len)?;
-    let end_rpath = end_runpath.checked_add(rpath_len)?;
-    let end_needed = end_rpath.checked_add(needed_len)?;
+    let end_interp = HEADER_LEN.checked_add(interp_len).ok_or(RecordCorrupt::InvalidLayout)?;
+    let end_runpath = end_interp.checked_add(runpath_len).ok_or(RecordCorrupt::InvalidLayout)?;
+    let end_rpath = end_runpath.checked_add(rpath_len).ok_or(RecordCorrupt::InvalidLayout)?;
+    let end_needed = end_rpath.checked_add(needed_len).ok_or(RecordCorrupt::InvalidLayout)?;
     if end_needed != body.len() {
-        return None;
+        return Err(RecordCorrupt::InvalidLayout);
     }
 
     let shared = SharedAlloc::global();
     let mut interp = OwnVec::with_capacity_in(interp_len, shared);
-    interp.extend_from_slice(body.get(HEADER_LEN..end_interp)?);
+    interp.extend_from_slice(body.get(HEADER_LEN..end_interp).ok_or(RecordCorrupt::InvalidLayout)?);
     let runpath = if has_runpath {
         let mut v = OwnVec::with_capacity_in(runpath_len, shared);
-        v.extend_from_slice(body.get(end_interp..end_runpath)?);
+        v.extend_from_slice(body.get(end_interp..end_runpath).ok_or(RecordCorrupt::InvalidLayout)?);
         Some(v)
     } else {
         None
     };
     let rpath = if has_rpath {
         let mut v = OwnVec::with_capacity_in(rpath_len, shared);
-        v.extend_from_slice(body.get(end_runpath..end_rpath)?);
+        v.extend_from_slice(body.get(end_runpath..end_rpath).ok_or(RecordCorrupt::InvalidLayout)?);
         Some(v)
     } else {
         None
     };
     let mut needed_blob = OwnVec::with_capacity_in(needed_len, shared);
-    needed_blob.extend_from_slice(body.get(end_rpath..end_needed)?);
+    needed_blob.extend_from_slice(body.get(end_rpath..end_needed).ok_or(RecordCorrupt::InvalidLayout)?);
 
-    Some(InodeRecord { stamp, digest, e_machine, has_dyn, interp, runpath, rpath, needed_blob })
+    Ok(InodeRecord { stamp, digest, e_machine, has_dyn, interp, runpath, rpath, needed_blob })
 }
 
 /// Looks up an immutable on-disk ELF inode record for `stamp` at wall-clock second `now_sec`.
-/// Returns `Ok(None)` on racy-clean timestamps, missing/oversized/corrupt records, or when
-/// `need_digest` is true and the record holds ELF metadata only.
+///
+/// - Returns `Ok(None)` strictly for genuine cache misses: racy-clean timestamps, absent files
+///   (`FsKind::NotFound`), or valid metadata-only records when `need_digest` is true.
+/// - Returns `Err(Fault::Host { code: 74, .. })` on ANY existing oversized, truncated,
+///   checksum-corrupt, bad-magic/version/flags/layout, or wrong-stamp record (Rule 3: never
+///   silently fall back past store corruption).
 pub fn lookup_inode_record(
     io: &dyn InodeRecordIo,
     stamp: InodeStamp,
@@ -396,14 +508,13 @@ pub fn lookup_inode_record(
     }
     let key_buf = stamp.record_key_hex();
     let Ok(key_str) = core::str::from_utf8(&key_buf) else {
-        return Ok(None);
+        return Err(Fault::Host { call: "elf inode record key utf8", code: 22 });
     };
     match io.read_bounded(key_str, MAX_INODE_RECORD_BYTES)? {
-        RecordRead::Absent | RecordRead::Oversized => Ok(None),
+        RecordRead::Absent => Ok(None),
+        RecordRead::Oversized => Err(RecordCorrupt::Oversized.into_fault()),
         RecordRead::Bytes(raw) => {
-            let Some(rec) = decode_record(raw.as_slice(), stamp, plant) else {
-                return Ok(None);
-            };
+            let rec = decode_record(raw.as_slice(), stamp, plant).map_err(RecordCorrupt::into_fault)?;
             if need_digest && rec.digest.is_none() {
                 return Ok(None);
             }
@@ -413,13 +524,29 @@ pub fn lookup_inode_record(
 }
 
 /// Publishes an immutable on-disk ELF inode record if `record.stamp` is outside the racy-clean
-/// window and fits within [`MAX_INODE_RECORD_BYTES`]. Returns `Ok(true)` if published.
+/// window and fits within [`MAX_INODE_RECORD_BYTES`], enforcing the default directory cap
+/// [`MAX_INODE_RECORD_ENTRIES`]. Returns `Ok(true)` if published.
 pub fn publish_inode_record(
     io: &dyn InodeRecordIo,
     record: &InodeRecord,
     now_sec: i64,
     plant: InodeRecordPlant,
 ) -> Result<bool, Fault> {
+    publish_inode_record_capped(io, record, now_sec, MAX_INODE_RECORD_ENTRIES, plant)
+}
+
+/// Same as [`publish_inode_record`] with an explicit entry cap `max_entries` (for bounded-store
+/// tests and DSTs).
+pub fn publish_inode_record_capped(
+    io: &dyn InodeRecordIo,
+    record: &InodeRecord,
+    now_sec: i64,
+    max_entries: usize,
+    plant: InodeRecordPlant,
+) -> Result<bool, Fault> {
+    if max_entries == 0 {
+        return Ok(false);
+    }
     if plant != InodeRecordPlant::SkipRacyClean && !record.stamp.is_cacheable(now_sec) {
         return Ok(false);
     }
@@ -435,20 +562,20 @@ pub fn publish_inode_record(
     } else {
         io.publish_atomic(key_str, encoded.as_slice())?;
     }
+    io.prune_to_cap(max_entries, key_str)?;
     Ok(true)
 }
 
 /// Production [`InodeRecordIo`] backed by a caller-provided capability `bstd::fs::Dir<ReadWrite>`
 /// (zero ambient paths, zero in-process state — relies purely on the kernel page cache, Rule 51).
-#[cfg(target_os = "linux")]
-pub(super) struct DirInodeRecordIo<'a> {
+pub struct DirInodeRecordIo<'a> {
     dir: &'a crate::fs::Dir<crate::fs::ReadWrite>,
     cx: &'a crate::cx::Cx,
 }
 
-#[cfg(target_os = "linux")]
 impl<'a> DirInodeRecordIo<'a> {
-    pub(super) fn new(dir: &'a crate::fs::Dir<crate::fs::ReadWrite>, cx: &'a crate::cx::Cx) -> Self {
+    /// Creates a production on-disk inode record handle over `dir`, bounded by `cx`.
+    pub fn new(dir: &'a crate::fs::Dir<crate::fs::ReadWrite>, cx: &'a crate::cx::Cx) -> Self {
         Self { dir, cx }
     }
 
@@ -461,7 +588,6 @@ impl<'a> DirInodeRecordIo<'a> {
     }
 }
 
-#[cfg(target_os = "linux")]
 impl InodeRecordIo for DirInodeRecordIo<'_> {
     fn read_bounded(&self, key_hex: &str, max_bytes: usize) -> Result<RecordRead, Fault> {
         let rel = crate::path::Path::new(key_hex)
@@ -517,15 +643,86 @@ impl InodeRecordIo for DirInodeRecordIo<'_> {
         let rel = crate::path::Path::new(key_hex)
             .map_err(|_| Fault::Host { call: "elf inode record path", code: 22 })?;
         let sub = self.sub_cx()?;
+        // `Durable::Yes` flushes the sibling temp file before atomic rename and syncs the
+        // directory so even a sudden power cut never leaves a torn record at the final path.
         self.dir
-            .publish(&sub, &rel, crate::fs::Content::bytes(bytes), crate::fs::Durable::No)
+            .publish(&sub, &rel, crate::fs::Content::bytes(bytes), crate::fs::Durable::Yes)
             .map(|_| ())
             .map_err(|e| super::fs_err_to_fault("publish elf inode record", &e))
     }
 
     fn write_direct_planted(&self, key_hex: &str, bytes: &[u8]) -> Result<(), Fault> {
-        // Production always uses atomic publish; direct write exists only for DST controls.
-        self.publish_atomic(key_hex, bytes)
+        // Non-atomic direct write in two chunks (invoked ONLY by `InodeRecordPlant::DirectWrite`
+        // DST controls so simulated power cuts leave a genuinely torn file on disk).
+        let rel = crate::path::Path::new(key_hex)
+            .map_err(|_| Fault::Host { call: "elf inode record path", code: 22 })?;
+        let sub = self.sub_cx()?;
+        let file = self
+            .dir
+            .create(&sub, &rel)
+            .map_err(|e| super::fs_err_to_fault("create elf inode record (planted)", &e))?;
+        let mid = bytes.len() / 2;
+        let first = bytes.get(..mid).unwrap_or(&[]);
+        let second = bytes.get(mid..).unwrap_or(&[]);
+        let appended = file
+            .append(&sub, first, crate::fs::Durable::No)
+            .and_then(|()| file.append(&sub, second, crate::fs::Durable::No));
+        let closed = file.close(&sub, crate::fs::Durable::No).map(|_| ());
+        appended
+            .and(closed)
+            .map_err(|e| super::fs_err_to_fault("direct write elf inode record (planted)", &e))
+    }
+
+    fn prune_to_cap(&self, max_entries: usize, keep_key: &str) -> Result<(), Fault> {
+        let sub = self.sub_cx()?;
+        let entries = match self.dir.own_entries(&sub) {
+            Ok(e) => e,
+            Err(e) if e.kind == crate::fs::FsKind::NotFound => return Ok(()),
+            Err(e) => return Err(super::fs_err_to_fault("list elf inode records for prune", &e)),
+        };
+        let scan_len = entries.len().min(PRUNE_SCAN_MOST);
+        let mut live_count = 0usize;
+        for i in 0..scan_len {
+            if entries.kind(i) == crate::fs::EntryKind::File && !entries.name(i).ends_with(".bstd-new") {
+                live_count += 1;
+            }
+        }
+        if live_count <= max_entries {
+            return Ok(());
+        }
+        let target = ((max_entries.saturating_mul(3)) / 4).max(1).min(max_entries);
+        let shared = SharedAlloc::global();
+        let mut victims: OwnVec<(u64, crate::path::Path), SharedAlloc<'static>> =
+            OwnVec::with_capacity_in(live_count, shared);
+        for i in 0..scan_len {
+            if entries.kind(i) != crate::fs::EntryKind::File {
+                continue;
+            }
+            let name = entries.name(i);
+            if name == keep_key || name.ends_with(".bstd-new") {
+                continue;
+            }
+            let Ok(path) = entries.path(i) else {
+                continue;
+            };
+            let mtime_ns = match self.dir.stat(&sub, &path) {
+                Ok(Some(meta)) => meta.stamp.modified_ns,
+                Ok(None) => continue,
+                Err(e) if e.kind == crate::fs::FsKind::NotFound => continue,
+                Err(_) => 0,
+            };
+            victims.push((mtime_ns, path));
+        }
+        victims.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.as_str().cmp(b.1.as_str())));
+        let to_remove = live_count.saturating_sub(target);
+        for (_, path) in victims.iter().take(to_remove) {
+            match self.dir.remove(&sub, path, crate::fs::Durable::No) {
+                Ok(()) => {}
+                Err(e) if e.kind == crate::fs::FsKind::NotFound => {}
+                Err(e) => return Err(super::fs_err_to_fault("prune elf inode record", &e)),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -555,28 +752,58 @@ fn read_i64(buf: &[u8], at: usize) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        InodeRecord, InodeRecordIo, InodeRecordPlant, InodeStamp, MAX_INODE_RECORD_BYTES,
-        RecordRead, decode_record, encode_record, lookup_inode_record, publish_inode_record,
-    };
-    use crate::procs::hermetic::Fault;
-    use blaze_own::{SharedAlloc, Vec as OwnVec};
-    use std::cell::RefCell;
-    use std::collections::BTreeMap;
-    use std::string::String;
-    use std::vec::Vec;
+    use core::time::Duration;
 
-    fn make_record(stamp: InodeStamp, seed: u8, with_digest: bool) -> InodeRecord {
+    use blaze_own::{SharedAlloc, Vec as OwnVec};
+
+    use super::{
+        DirInodeRecordIo, ELF_INODE_RECORD_SUBDIR, InodeRecord, InodeRecordPlant, InodeStamp,
+        MAX_INODE_RECORD_BYTES, RecordCorrupt, decode_record_with_parser, encode_record,
+        encode_record_with_parser, lookup_inode_record, parser_identity, publish_inode_record,
+        publish_inode_record_capped,
+    };
+    use crate::cx::Cx;
+    use crate::fs::{Content, Durable};
+    use crate::io::Io;
+    use crate::mem::TASK_FRAME;
+    use crate::path::Path;
+    use crate::procs::hermetic::Fault;
+    use crate::test::{Given, Seeds, seeded};
+
+    const KEYS: usize = 8;
+    const NOW_SEC: i64 = 1_700_000_100;
+
+    fn stamp_for(idx: usize) -> InodeStamp {
+        InodeStamp {
+            dev: 7,
+            ino: 1000 + u64::try_from(idx).unwrap_or(0),
+            mode: 0o100_644,
+            size: 4096 + i64::try_from(idx).unwrap_or(0) * 512,
+            mtime_sec: NOW_SEC - 3600 - i64::try_from(idx).unwrap_or(0) * 10,
+            mtime_nsec: 123_456,
+            ctime_sec: NOW_SEC - 3600 - i64::try_from(idx).unwrap_or(0) * 10,
+            ctime_nsec: 123_456,
+        }
+    }
+
+    fn record_for(idx: usize) -> InodeRecord {
+        let st = stamp_for(idx);
         let shared = SharedAlloc::global();
         let mut interp = OwnVec::new_in(shared);
         interp.extend_from_slice(b"/lib/ld-linux-aarch64.so.1");
         let mut runpath = OwnVec::new_in(shared);
-        runpath.extend_from_slice(b"/nix/store/demo/lib");
+        runpath.extend_from_slice(b"/nix/store/demo-toolchain-closure/lib");
+        // Make payload span > 1 KiB (multiple simulated disk sectors) so unsynced/direct writes
+        // genuinely tear across power cuts in `bstd::test::seeded`!
         let mut needed = OwnVec::new_in(shared);
-        needed.extend_from_slice(b"libc.so.6\0libm.so.6\0");
+        for lib_i in 0..48usize {
+            let name = std::format!("libblaze_sim_{idx}_{lib_i:02}.so.1\0");
+            needed.extend_from_slice(name.as_bytes());
+        }
+        let tag = u8::try_from((idx * 17 + 5) & 0xff).unwrap_or(1);
         InodeRecord {
-            stamp,
-            digest: with_digest.then_some((u64::try_from(stamp.size).unwrap_or(0), [seed; 32])),
+            stamp: st,
+            digest: Some((u64::try_from(st.size).unwrap_or(0), [tag; 32])),
             e_machine: 183,
             has_dyn: true,
             interp,
@@ -586,227 +813,244 @@ mod tests {
         }
     }
 
-    struct SimFsState {
-        files: BTreeMap<String, Vec<u8>>,
-        orphaned_temps: usize,
-        fail_next_publish: bool,
-        fail_next_read: bool,
+    fn key_str(st: InodeStamp) -> std::string::String {
+        let buf = st.record_key_hex();
+        std::str::from_utf8(&buf).expect("hex utf8").to_owned()
     }
 
-    struct SimRecordIo {
-        state: RefCell<SimFsState>,
+    #[test]
+    fn parser_identity_rolls_record_key_and_rejects_cross_parser_seal() {
+        let st = stamp_for(0);
+        let rec = record_for(0);
+        let pid_a = [0x11u8; 32];
+        let pid_b = [0x22u8; 32];
+        assert_ne!(
+            st.record_key_hex_with_parser(&pid_a),
+            st.record_key_hex_with_parser(&pid_b),
+            "changing parser code identity must roll the on-disk record filename"
+        );
+        assert_ne!(
+            parser_identity(),
+            [0u8; 32],
+            "parser_identity must be a non-zero content digest of landlock.rs + inode_record.rs"
+        );
+        let encoded_a = encode_record_with_parser(&rec, &pid_a).expect("encode with parser A");
+        assert_eq!(
+            decode_record_with_parser(encoded_a.as_slice(), st, &pid_a, InodeRecordPlant::None),
+            Ok(rec)
+        );
+        assert_eq!(
+            decode_record_with_parser(encoded_a.as_slice(), st, &pid_b, InodeRecordPlant::None),
+            Err(RecordCorrupt::BadChecksum),
+            "record sealed under parser A must fail verification under parser B"
+        );
     }
 
-    impl SimRecordIo {
-        fn new() -> Self {
-            Self {
-                state: RefCell::new(SimFsState {
-                    files: BTreeMap::new(),
-                    orphaned_temps: 0,
-                    fail_next_publish: false,
-                    fail_next_read: false,
-                }),
-            }
-        }
-    }
+    /// Production `DirInodeRecordIo` crash/fault/concurrency program driven by `bstd::test::seeded`
+    /// (`blaze_core::sim::Sim`): exercises real `Dir::publish(Durable::Yes)` across power cuts,
+    /// sync/write/rename faults, and two racing peer worlds sharing the simulated disk.
+    fn dir_io_crash_program(io: &Io, plant: InodeRecordPlant) -> Result<(), Fault> {
+        let root = io.need_fs().map_err(|_| Fault::Host { call: "sim fs", code: 5 })?.root();
+        let sub_path = Path::new(ELF_INODE_RECORD_SUBDIR).map_err(|_| Fault::Host { call: "sub path", code: 22 })?;
+        let rec_dir = root.subdir(&sub_path);
+        let cx = io
+            .cx(Duration::from_secs(30), TASK_FRAME)
+            .map_err(|_| Fault::Host { call: "sim cx", code: 110 })?;
+        let dir_io = DirInodeRecordIo::new(&rec_dir, &cx);
 
-    impl InodeRecordIo for SimRecordIo {
-        fn read_bounded(&self, key_hex: &str, max_bytes: usize) -> Result<RecordRead, Fault> {
-            let mut st = self.state.borrow_mut();
-            if st.fail_next_read {
-                st.fail_next_read = false;
-                return Err(Fault::Host { call: "sim read EIO", code: 5 });
-            }
-            let Some(bytes) = st.files.get(key_hex) else {
-                return Ok(RecordRead::Absent);
-            };
-            if bytes.len() > max_bytes {
-                return Ok(RecordRead::Oversized);
-            }
-            let mut out = OwnVec::with_capacity_in(bytes.len(), SharedAlloc::global());
-            out.extend_from_slice(bytes);
-            Ok(RecordRead::Bytes(out))
-        }
-
-        fn publish_atomic(&self, key_hex: &str, bytes: &[u8]) -> Result<(), Fault> {
-            let mut st = self.state.borrow_mut();
-            if st.fail_next_publish {
-                // Mid-write crash: temp file orphaned, final path completely untouched!
-                st.fail_next_publish = false;
-                st.orphaned_temps += 1;
-                return Err(Fault::Host { call: "sim crash mid-atomic-publish", code: 5 });
-            }
-            st.files.insert(String::from(key_hex), bytes.to_vec());
-            Ok(())
-        }
-
-        fn write_direct_planted(&self, key_hex: &str, bytes: &[u8]) -> Result<(), Fault> {
-            let mut st = self.state.borrow_mut();
-            if st.fail_next_publish {
-                // Mid-write crash during non-atomic direct write leaves a torn prefix at final path!
-                st.fail_next_publish = false;
-                let half = bytes.len() / 2;
-                st.files.insert(String::from(key_hex), bytes[..half].to_vec());
-                return Err(Fault::Host { call: "sim crash mid-direct-write", code: 5 });
-            }
-            st.files.insert(String::from(key_hex), bytes.to_vec());
-            Ok(())
-        }
-    }
-
-    fn run_inode_record_dst(plant: InodeRecordPlant) -> Result<u64, &'static str> {
-        let mut combined_trace = 0u64;
-        for seed in 0u64..150 {
-            let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(11);
-            let mut next = || {
-                rng = rng.wrapping_add(0x9e37_79b9_7f4a_7c15);
-                let mut z = rng;
-                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-                z ^ (z >> 31)
-            };
-
-            let io = SimRecordIo::new();
-            let now_sec: i64 = 1_700_000_100;
-            let mut stamps: Vec<(InodeStamp, InodeRecord)> = Vec::new();
-            for i in 0u8..8 {
-                let st = InodeStamp {
-                    dev: 1,
-                    ino: 100 + u64::from(i),
-                    mode: 0o100_644,
-                    size: 4096 + i64::from(i) * 128,
-                    mtime_sec: 1,
-                    mtime_nsec: 0,
-                    ctime_sec: now_sec - 10,
-                    ctime_nsec: i64::from(i),
-                };
-                stamps.push((st, make_record(st, i.wrapping_add(1), true)));
-            }
-
-            // Track keys with intentionally injected external corruption vs clean atomic publishes.
-            let mut externally_corrupted: BTreeMap<String, bool> = BTreeMap::new();
-
-            for _step in 0..80 {
-                let idx = usize::try_from(next()).unwrap_or(0) % stamps.len();
-                let (st, expected) = &stamps[idx];
-                let key_bytes = st.record_key_hex();
-                let key_str = core::str::from_utf8(&key_bytes).expect("hex utf8");
-                let op = next() % 8;
-                match op {
-                    0 | 1 => {
-                        // Lookup and verify oracle agreement.
-                        if let Ok(Some(got)) = lookup_inode_record(&io, *st, now_sec, true, plant) {
-                            if got != *expected {
-                                return Err("oracle mismatch: lookup returned stale or corrupted record");
-                            }
-                            combined_trace = combined_trace.rotate_left(5) ^ u64::from(got.e_machine);
-                        }
-                    }
-                    2 | 3 => {
-                        // Publish (possibly with simulated mid-write crash).
-                        let crash = next() % 4 == 0;
-                        io.state.borrow_mut().fail_next_publish = crash;
-                        let res = publish_inode_record(&io, expected, now_sec, plant);
-                        if crash {
-                            if res.is_ok() {
-                                return Err("simulated crash did not return Err");
-                            }
-                            // Atomic publish invariant: a mid-write crash MUST NOT leave a torn
-                            // file at the final path!
-                            if !externally_corrupted.get(key_str).copied().unwrap_or(false)
-                                && let Some(raw) = io.state.borrow().files.get(key_str)
-                                && decode_record(raw, *st, InodeRecordPlant::None).is_none()
-                            {
-                                return Err("non-atomic crash left torn record at final path");
-                            }
-                        } else {
-                            let _ = res.map_err(|_| "unexpected publish failure")?;
-                            externally_corrupted.insert(String::from(key_str), false);
-                            let got = lookup_inode_record(&io, *st, now_sec, true, plant)
-                                .map_err(|_| "lookup after publish failed")?;
-                            if got.as_ref() != Some(expected) {
-                                return Err("warm lookup after publish disagreed with oracle");
-                            }
-                        }
-                    }
-                    4 => {
-                        // Corrupt one byte in the payload (not header magic/version) to test checksum!
-                        let mut fs = io.state.borrow_mut();
-                        if let Some(raw) = fs.files.get_mut(key_str)
-                            && raw.len() > 100
-                        {
-                            // Flip a byte inside sha256 (offset 85) so magic/version/stamp still look valid!
-                            raw[85] ^= 0xff;
-                            externally_corrupted.insert(String::from(key_str), true);
-                        }
-                        drop(fs);
-                        if let Ok(Some(got)) = lookup_inode_record(&io, *st, now_sec, true, plant)
-                            && got != *expected
-                        {
-                            return Err("corrupted checksum was accepted by lookup");
-                        }
-                    }
-                    5 => {
-                        // Swap another stamp's valid self-checksummed record into this key's file!
-                        let other_idx = (idx + 1) % stamps.len();
-                        let other_bytes = encode_record(&stamps[other_idx].1).expect("encode other");
-                        io.state.borrow_mut().files.insert(String::from(key_str), other_bytes.as_slice().to_vec());
-                        externally_corrupted.insert(String::from(key_str), true);
-                        if let Ok(Some(got)) = lookup_inode_record(&io, *st, now_sec, true, plant)
-                            && got != *expected
-                        {
-                            return Err("mismatched stamp record was accepted by lookup");
-                        }
-                    }
-                    6 => {
-                        // Racy-clean test: file touched <2s ago, published with version A, then
-                        // overwritten in-place at the exact same coarse timestamp tick with version B.
-                        let racy_st = InodeStamp { ctime_sec: now_sec - 1, ..*st };
-                        let rec_a = make_record(racy_st, 0x11, true);
-                        let rec_b = make_record(racy_st, 0x22, true);
-                        let _ = publish_inode_record(&io, &rec_a, now_sec, plant);
-                        if let Ok(Some(got)) = lookup_inode_record(&io, racy_st, now_sec, true, plant)
-                            && got != rec_b
-                        {
-                            return Err("racy-clean file returned stale cached record after same-tick mutation");
-                        }
-                    }
-                    _ => {
-                        // Oversized file + transient read I/O error.
-                        io.state.borrow_mut().files.insert(String::from(key_str), vec![0u8; MAX_INODE_RECORD_BYTES + 16]);
-                        externally_corrupted.insert(String::from(key_str), true);
-                        let got = lookup_inode_record(&io, *st, now_sec, true, plant)
-                            .map_err(|_| "oversized file should miss cleanly")?;
-                        if got.is_some() {
-                            return Err("oversized record was not rejected");
-                        }
-                        io.state.borrow_mut().fail_next_read = true;
-                        if lookup_inode_record(&io, *st, now_sec, true, plant).is_ok() {
-                            return Err("read I/O error was swallowed instead of propagated");
-                        }
-                    }
+        // Post-crash oracle: every surviving record must be Absent (`Ok(None)`) or the exact
+        // oracle record (`Ok(Some(want))`). A torn/corrupt record (`code == 74`) after a power cut
+        // is a hard invariant violation!
+        for k in 0..KEYS {
+            let st = stamp_for(k);
+            let want = record_for(k);
+            match lookup_inode_record(&dir_io, st, NOW_SEC, true, plant) {
+                Ok(None) => {}
+                Ok(Some(got)) => {
+                    assert_eq!(got, want, "inode record sim oracle: key {k} survived crash with mismatched record");
                 }
+                Err(Fault::Host { code: 74, call }) => {
+                    panic!("inode record sim oracle: key {k} left torn/corrupt after power cut ({call})");
+                }
+                Err(other) => return Err(other),
             }
         }
-        Ok(combined_trace)
+
+        // Race two independent peer worlds (`peer_a`, `peer_b`, simulating concurrent commands
+        // sharing the same on-disk `elf-inodes-v1` dir) publishing overlapping & distinct keys.
+        let peer_a = io
+            .peer_world_for_test(Some(0xaaaa_1111_0000_0001))
+            .ok_or(Fault::Host { call: "peer a", code: 5 })?;
+        let peer_b = io
+            .peer_world_for_test(Some(0xbbbb_2222_0000_0002))
+            .ok_or(Fault::Host { call: "peer b", code: 5 })?;
+        let cx_a = peer_a
+            .cx(Duration::from_secs(30), TASK_FRAME)
+            .map_err(|_| Fault::Host { call: "cx a", code: 110 })?;
+        let cx_b = peer_b
+            .cx(Duration::from_secs(30), TASK_FRAME)
+            .map_err(|_| Fault::Host { call: "cx b", code: 110 })?;
+        let dir_a = peer_a.need_fs().map_err(|_| Fault::Host { call: "fs a", code: 5 })?.root().subdir(&sub_path);
+        let dir_b = peer_b.need_fs().map_err(|_| Fault::Host { call: "fs b", code: 5 })?.root().subdir(&sub_path);
+        let io_a = DirInodeRecordIo::new(&dir_a, &cx_a);
+        let io_b = DirInodeRecordIo::new(&dir_b, &cx_b);
+
+        for k in 0..KEYS {
+            let rec = record_for(k);
+            if k % 2 == 0 {
+                let _ = publish_inode_record(&io_a, &rec, NOW_SEC, plant)?;
+                let _ = publish_inode_record(&io_b, &rec, NOW_SEC, plant)?;
+            } else {
+                let _ = publish_inode_record(&io_b, &rec, NOW_SEC, plant)?;
+                let _ = publish_inode_record(&io_a, &rec, NOW_SEC, plant)?;
+            }
+            let got_a = lookup_inode_record(&io_a, rec.stamp, NOW_SEC, true, plant)?;
+            let got_b = lookup_inode_record(&io_b, rec.stamp, NOW_SEC, true, plant)?;
+            assert_eq!(got_a.as_ref(), Some(&rec), "inode record sim oracle: peer A read mismatch on key {k}");
+            assert_eq!(got_b.as_ref(), Some(&rec), "inode record sim oracle: peer B read mismatch on key {k}");
+        }
+        Ok(())
     }
 
     #[test]
-    fn inode_record_dst_passes_and_replays_deterministically() {
-        let a = run_inode_record_dst(InodeRecordPlant::None).expect("clean DST must pass");
-        let b = run_inode_record_dst(InodeRecordPlant::None).expect("second DST run must pass");
-        assert_eq!(a, b, "DST must replay bit-for-bit identically");
+    fn dir_inode_record_io_survives_sim_crashes_and_concurrent_peers() {
+        match seeded(
+            "blaze-std",
+            module_path!(),
+            "dir_inode_record_crash",
+            Seeds::DEFAULT.from(0, 200),
+            Given::NOTHING,
+            |_: &Cx, io: Io| {
+                dir_io_crash_program(&io, InodeRecordPlant::None).map_err(|e| std::format!("{e:?}"))
+            },
+        ) {
+            Ok(passed) => {
+                assert!(passed.counts.cuts > 50, "too few power cuts: {:?}", passed.counts);
+                assert!(passed.counts.failures > 50, "too few failures: {:?}", passed.counts);
+            }
+            Err(failed) => panic!("{failed}"),
+        }
     }
 
     #[test]
-    fn inode_record_dst_catches_all_four_planted_bugs() {
-        let e1 = run_inode_record_dst(InodeRecordPlant::SkipChecksum).expect_err("must catch SkipChecksum");
-        assert!(e1.contains("checksum"), "unexpected: {e1}");
-        let e2 = run_inode_record_dst(InodeRecordPlant::SkipRacyClean).expect_err("must catch SkipRacyClean");
-        assert!(e2.contains("racy-clean"), "unexpected: {e2}");
-        let e3 = run_inode_record_dst(InodeRecordPlant::DirectWrite).expect_err("must catch DirectWrite");
-        assert!(e3.contains("torn"), "unexpected: {e3}");
-        let e4 = run_inode_record_dst(InodeRecordPlant::SkipStampCheck).expect_err("must catch SkipStampCheck");
-        assert!(e4.contains("stamp"), "unexpected: {e4}");
+    fn dir_inode_record_io_sim_catches_planted_direct_write() {
+        match seeded(
+            "blaze-std",
+            module_path!(),
+            "dir_inode_record_direct_write_plant",
+            Seeds::DEFAULT.from(0, 100),
+            Given::NOTHING,
+            |_: &Cx, io: Io| {
+                dir_io_crash_program(&io, InodeRecordPlant::DirectWrite).map_err(|e| std::format!("{e:?}"))
+            },
+        ) {
+            Ok(passed) => panic!("planted DirectWrite was not caught in {} starts", passed.starts),
+            Err(failed) => {
+                let said = std::format!("{failed}");
+                assert!(
+                    said.contains("inode record sim oracle"),
+                    "planted DirectWrite failed for unexpected reason: {said}"
+                );
+            }
+        }
+    }
+
+    fn run_dir_io_validation_and_cap_sim(plant: InodeRecordPlant) -> Result<(), std::string::String> {
+        let io = Io::sim(42);
+        let root = io.need_fs().map_err(|_| "no fs")?.root();
+        let sub_path = Path::new(ELF_INODE_RECORD_SUBDIR).map_err(|_| "sub")?;
+        let rec_dir = root.subdir(&sub_path);
+        let cx = io.cx(Duration::from_secs(30), TASK_FRAME).map_err(|_| "cx")?;
+        let dir_io = DirInodeRecordIo::new(&rec_dir, &cx);
+
+        // 1. Short-reads simulation on production `DirInodeRecordIo::read_bounded`.
+        let rec0 = record_for(0);
+        publish_inode_record(&dir_io, &rec0, NOW_SEC, plant).map_err(|e| std::format!("pub0: {e:?}"))?;
+        let short_dir = blaze_core::FileName::new(ELF_INODE_RECORD_SUBDIR).ok_or("short dir")?;
+        io.with_sim(|sim| sim.short_reads(short_dir, 1)).ok_or("expected sim")?;
+        let got0 = lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant)
+            .map_err(|e| std::format!("short read lookup: {e:?}"))?;
+        if got0.as_ref() != Some(&rec0) {
+            return Err("short-read oracle: failed to read full record under Sim::short_reads".into());
+        }
+
+        // 2. Corrupt-on-disk records MUST return typed EBADMSG (`code: 74`), NEVER `Ok(None)`!
+        let k0 = Path::new(&key_str(rec0.stamp)).map_err(|_| "k0")?;
+        let raw0 = encode_record(&rec0).ok_or("encode0")?;
+        // 2a. Payload bit-flip -> BadChecksum (catches `SkipChecksum`!).
+        let mut flipped = raw0.as_slice().to_vec();
+        flipped[85] ^= 0xff;
+        rec_dir.publish(&cx, &k0, Content::bytes(&flipped), Durable::No).map_err(|_| "write flip")?;
+        match lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant) {
+            Err(Fault::Host { code: 74, .. }) => {}
+            other => return Err(std::format!("corrupt checksum oracle: expected EBADMSG, got {other:?}")),
+        }
+        // 2b. Truncated file -> Truncated.
+        rec_dir.publish(&cx, &k0, Content::bytes(b"BZELFIN1"), Durable::No).map_err(|_| "write trunc")?;
+        match lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant) {
+            Err(Fault::Host { code: 74, .. }) => {}
+            other => return Err(std::format!("corrupt truncated oracle: expected EBADMSG, got {other:?}")),
+        }
+        // 2c. Oversized file (> 64 KiB) -> Oversized.
+        let big = std::vec![0u8; MAX_INODE_RECORD_BYTES + 32];
+        rec_dir.publish(&cx, &k0, Content::bytes(&big), Durable::No).map_err(|_| "write big")?;
+        match lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant) {
+            Err(Fault::Host { code: 74, .. }) => {}
+            other => return Err(std::format!("corrupt oversized oracle: expected EBADMSG, got {other:?}")),
+        }
+        // 2d. Wrong-stamp valid record placed under key 0 -> StampMismatch (catches `SkipStampCheck`!).
+        let rec1 = record_for(1);
+        let raw1 = encode_record(&rec1).ok_or("encode1")?;
+        rec_dir.publish(&cx, &k0, Content::bytes(raw1.as_slice()), Durable::No).map_err(|_| "write swap")?;
+        match lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant) {
+            Err(Fault::Host { code: 74, .. }) => {}
+            other => return Err(std::format!("stamp mismatch oracle: expected EBADMSG, got {other:?}")),
+        }
+        // Clean up corrupted key 0.
+        rec_dir.remove(&cx, &k0, Durable::No).map_err(|_| "rm k0")?;
+
+        // 3. Racy-clean guard (catches `SkipRacyClean`!).
+        let racy_st = InodeStamp { ctime_sec: NOW_SEC - 1, ..stamp_for(2) };
+        let racy_rec = InodeRecord { stamp: racy_st, ..record_for(2) };
+        let published = publish_inode_record(&dir_io, &racy_rec, NOW_SEC, plant)
+            .map_err(|e| std::format!("racy pub: {e:?}"))?;
+        if published {
+            return Err("racy-clean oracle: published record within 2s racy-clean window".into());
+        }
+
+        // 4. Write-side bounded directory cap (`max_entries = 4` across 10 distinct stamps).
+        let clock = io.need_clock().map_err(|_| "clock")?;
+        for idx in 10..20usize {
+            let rec = record_for(idx);
+            let _ = publish_inode_record_capped(&dir_io, &rec, NOW_SEC, 4, plant)
+                .map_err(|e| std::format!("cap pub {idx}: {e:?}"))?;
+            let _ = clock.sleep(&cx, Duration::from_millis(5));
+        }
+        let entries = rec_dir.own_entries(&cx).map_err(|_| "list after cap")?;
+        let files = (0..entries.len())
+            .filter(|&i| entries.kind(i) == crate::fs::EntryKind::File && !entries.name(i).ends_with(".bstd-new"))
+            .count();
+        if files > 4 {
+            return Err(std::format!("bounded cap oracle: expected <= 4 files, found {files}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dir_inode_record_io_reports_corruption_enforces_cap_and_catches_planted_bugs() {
+        run_dir_io_validation_and_cap_sim(InodeRecordPlant::None)
+            .expect("clean DirInodeRecordIo validation, short-reads, corruption, and cap sim must pass");
+
+        let e_ck = run_dir_io_validation_and_cap_sim(InodeRecordPlant::SkipChecksum)
+            .expect_err("must catch SkipChecksum");
+        assert!(e_ck.contains("corrupt checksum oracle"), "unexpected: {e_ck}");
+
+        let e_rc = run_dir_io_validation_and_cap_sim(InodeRecordPlant::SkipRacyClean)
+            .expect_err("must catch SkipRacyClean");
+        assert!(e_rc.contains("racy-clean oracle"), "unexpected: {e_rc}");
+
+        let e_st = run_dir_io_validation_and_cap_sim(InodeRecordPlant::SkipStampCheck)
+            .expect_err("must catch SkipStampCheck");
+        assert!(e_st.contains("stamp mismatch oracle"), "unexpected: {e_st}");
     }
 }
