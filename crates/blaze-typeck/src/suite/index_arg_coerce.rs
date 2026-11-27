@@ -1,11 +1,11 @@
 //! Overloaded `Index` argument coercion (rules/field.rs `expr_index`, `try_coerced_index`):
 //! follows rustc's `try_overloaded_place_op` + `demand_coerce`.
 //!
-//! When no autoderef step of `base` directly satisfies builtin indexing or `Index<idx>`,
-//! `expr_index` probes `step.ty: Index<?Idx>`: if a unique impl or where-clause constrains
-//! `?Idx` to a concrete or partially-known shape (not a bare unconstrained `Infer`), `index`
-//! is coerced to it (recording deref / reborrow / unsize adjustments on `index`) and `Index`
-//! is verified at the coerced type.
+//! At each autoderef step of `base` (before advancing to the next step), after builtin indexing
+//! and direct `Index<idx>`, `expr_index` probes `step.ty: Index<?Idx>`: if a unique impl or
+//! where-clause constrains `?Idx` to a concrete or partially-known shape (not a bare
+//! unconstrained `Infer`), `index` is coerced to it (recording deref / reborrow / unsize
+//! adjustments on `index`) and `Index` is verified at the coerced type.
 //!
 //! Real-world trigger: `meta.keys().filter(|k| meta[k] == 1)` on `BTreeMap<(u64, u64), u32>`,
 //! where `k: &&(u64, u64)`. `(u64, u64): Borrow<?Q>` uniquely determines `?Q = (u64, u64)`,
@@ -33,7 +33,9 @@ struct World {
     f_slicemap_arr: ItemKey,
     f_mutmap_assign: ItemKey,
     f_generic_param: ItemKey,
-    f_deref_priority: ItemKey,
+    f_outer_coerced: ItemKey,
+    f_outer_without_index: ItemKey,
+    f_outer_incompat_index: ItemKey,
     f_neg_vec_ref_usize: ItemKey,
     f_neg_arr_ref_usize: ItemKey,
     f_neg_map_wrong_key: ItemKey,
@@ -127,13 +129,23 @@ fn world() -> World {
     let slicemap_t = fx.adt(slicemap_k, &[]);
     fx.imp("impl Index<&[u8]> for SliceMap", 0, slicemap_t, Some((index, &[r_slice_u8])), &[("Output", u32_)], Vec::new());
 
-    // `Outer` -> `Deref<Target = Inner>`, `Outer: Index<&str, Output = u8>`, `Inner: Index<&String, Output = u16>`.
+    // Receiver-step priority (rustc `place_op.rs`):
+    // - `Outer`: `Deref<Target = Inner>` + `Index<&str, Output = u8>` (`Inner: Index<&String, Output = u16>`)
+    // - `OuterWithoutIndex`: `Deref<Target = Inner>`, no `Index`
+    // - `OuterIncompatIndex`: `Deref<Target = Inner>` + `Index<usize, Output = u8>` (cannot coerce `&String` to `usize`)
     let inner_k = fx.strukt("Inner", 0, &[]);
     let inner_t = fx.adt(inner_k, &[]);
     let outer_k = fx.strukt("Outer", 0, &[]);
     let outer_t = fx.adt(outer_k, &[]);
+    let outer_no_idx_k = fx.strukt("OuterWithoutIndex", 0, &[]);
+    let outer_no_idx_t = fx.adt(outer_no_idx_k, &[]);
+    let outer_incompat_k = fx.strukt("OuterIncompatIndex", 0, &[]);
+    let outer_incompat_t = fx.adt(outer_incompat_k, &[]);
     fx.imp("impl Deref for Outer", 0, outer_t, Some((deref, &[])), &[("Target", inner_t)], Vec::new());
     fx.imp("impl Index<&str> for Outer", 0, outer_t, Some((index, &[r_str])), &[("Output", u8_)], Vec::new());
+    fx.imp("impl Deref for OuterWithoutIndex", 0, outer_no_idx_t, Some((deref, &[])), &[("Target", inner_t)], Vec::new());
+    fx.imp("impl Deref for OuterIncompatIndex", 0, outer_incompat_t, Some((deref, &[])), &[("Target", inner_t)], Vec::new());
+    fx.imp("impl Index<usize> for OuterIncompatIndex", 0, outer_incompat_t, Some((index, &[usize_])), &[("Output", u8_)], Vec::new());
     fx.imp("impl Index<&String> for Inner", 0, inner_t, Some((index, &[r_string])), &[("Output", u16_)], Vec::new());
 
     // `Vec<T>` and `[T]` with multiple `Index` impls (`usize` and `Range`) via `SliceIndex`.
@@ -199,7 +211,9 @@ fn world() -> World {
     let m_idx_bound = fx.bound(index, &[p0, r_u32]);
     let m_idx_out = fx.proj(index, &[p0, r_u32], "Output", u8_);
     let f_generic_param = fx.func("f_generic_param", 1, &[r_p0, rr_u32], u8_, std::vec![m_idx_bound, m_idx_out]);
-    let f_deref_priority = fx.func("f_deref_priority", 0, &[outer_t, r_string], u16_, Vec::new());
+    let f_outer_coerced = fx.func("f_outer_coerced", 0, &[outer_t, r_string], u8_, Vec::new());
+    let f_outer_without_index = fx.func("f_outer_without_index", 0, &[outer_no_idx_t, r_string], u16_, Vec::new());
+    let f_outer_incompat_index = fx.func("f_outer_incompat_index", 0, &[outer_incompat_t, r_string], u16_, Vec::new());
     let f_neg_vec_ref_usize = fx.func("f_neg_vec_ref_usize", 0, &[vec_u32, r_usize], u32_, Vec::new());
     let f_neg_arr_ref_usize = fx.func("f_neg_arr_ref_usize", 0, &[arr_u32_4, r_usize], u32_, Vec::new());
     let f_neg_map_wrong_key = fx.func("f_neg_map_wrong_key", 0, &[map_pair_u32, r_u32], u32_, Vec::new());
@@ -217,7 +231,9 @@ fn world() -> World {
         f_slicemap_arr,
         f_mutmap_assign,
         f_generic_param,
-        f_deref_priority,
+        f_outer_coerced,
+        f_outer_without_index,
+        f_outer_incompat_index,
         f_neg_vec_ref_usize,
         f_neg_arr_ref_usize,
         f_neg_map_wrong_key,
@@ -324,13 +340,32 @@ fn mutable_index_uses_coerced_index_type_for_index_mut() {
     assert_eq!(adjusts(&w.fx, &c, lk), "* -> &(u64, u64), * -> (u64, u64), & -> &(u64, u64)");
 }
 
-/// Direct `Index<idx>` across receiver autoderef steps takes priority over index-argument coercion,
-/// so `Deref` receiver indexing never regresses.
+/// Receiver-step priority (rustc `place_op.rs`): overloaded `Index` with argument coercion at
+/// an outer autoderef step precedes advancing to an inner autoderef step, while wrappers without
+/// a matching `Index` impl still autoderef to `Inner`.
 #[test]
-fn direct_receiver_autoderef_precedes_index_coercion() {
+fn outer_coerced_index_precedes_inner_autoderef_step() {
     let w = world();
-    let (lm, lk, indexed, c) = check_index(&w.fx, w.f_deref_priority);
-    assert!(c.diags.is_empty(), "f_deref_priority: {:?}", c.diags);
+
+    // `Outer: Deref<Target = Inner> + Index<&str, Output = u8>`, `Inner: Index<&String, Output = u16>`
+    // indexed with `&String`: selects `Outer` at step 0 via `&String -> &str`.
+    let (lm, lk, indexed, c) = check_index(&w.fx, w.f_outer_coerced);
+    assert!(c.diags.is_empty(), "f_outer_coerced: {:?}", c.diags);
+    assert_eq!(show(&w.fx, c.types.view(), c.expr_ty[indexed.ix()]), "u8");
+    assert_eq!(adjusts(&w.fx, &c, lm), "");
+    assert_eq!(adjusts(&w.fx, &c, lk), "* -> String, *Deref -> str, & -> &str");
+
+    // `OuterWithoutIndex: Deref<Target = Inner>` (no `Index` on outer): autoderefs to `Inner`.
+    let (lm, lk, indexed, c) = check_index(&w.fx, w.f_outer_without_index);
+    assert!(c.diags.is_empty(), "f_outer_without_index: {:?}", c.diags);
+    assert_eq!(show(&w.fx, c.types.view(), c.expr_ty[indexed.ix()]), "u16");
+    assert_eq!(adjusts(&w.fx, &c, lm), "*Deref -> Inner");
+    assert_eq!(adjusts(&w.fx, &c, lk), "");
+
+    // `OuterIncompatIndex: Deref<Target = Inner> + Index<usize>`: `&String` does not coerce to
+    // `usize`, so step 0 rolls back cleanly and advances to `Inner: Index<&String>`.
+    let (lm, lk, indexed, c) = check_index(&w.fx, w.f_outer_incompat_index);
+    assert!(c.diags.is_empty(), "f_outer_incompat_index: {:?}", c.diags);
     assert_eq!(show(&w.fx, c.types.view(), c.expr_ty[indexed.ix()]), "u16");
     assert_eq!(adjusts(&w.fx, &c, lm), "*Deref -> Inner");
     assert_eq!(adjusts(&w.fx, &c, lk), "");

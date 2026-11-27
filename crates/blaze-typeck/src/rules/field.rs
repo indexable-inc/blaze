@@ -11,13 +11,14 @@
 //! An index: base, then index, each with no expectation. At each autoderef step of the base
 //! (then the array's slice), the builtin case first (an array or slice indexed by `usize` or an
 //! integer variable, which becomes `usize`), then `Index` through the solver at `[step.ty, idx]`,
-//! its `Output` the type. When no step directly matches `idx`, a second pass over the steps tries
-//! overloaded `Index` with index-argument coercion (`try_overloaded_place_op` + `demand_coerce`):
-//! a unique constrained index shape (`BTreeMap<(u64, u64), u32>` selecting `Index<&(u64, u64)>`
-//! via `Borrow`, or `Index<&str>`) coerces `index` to it (e.g. `&&(u64, u64) -> &(u64, u64)` or
-//! `&String -> &str`). None at all is E0608. In a mutable place, the base's overloaded derefs
-//! become `DerefMut` and an overloaded index itself `IndexMut` after the walk (rules/mut_places.rs,
-//! rustc's `convert_place_derefs_to_mutable`; `Checked::index_mut`). Omitted: privacy.
+//! then overloaded `Index` with index-argument coercion (`try_overloaded_place_op` +
+//! `demand_coerce`: a unique constrained index shape such as `BTreeMap<(u64, u64), u32>`
+//! selecting `Index<&(u64, u64)>` via `Borrow`, or `Index<&str>`, coerces `index` to it, e.g.
+//! `&&(u64, u64) -> &(u64, u64)` or `&String -> &str`) before advancing to the next autoderef
+//! step, its `Output` the type. None at all is E0608. In a mutable place, the base's overloaded
+//! derefs become `DerefMut` and an overloaded index itself `IndexMut` after the walk
+//! (rules/mut_places.rs, rustc's `convert_place_derefs_to_mutable`; `Checked::index_mut`).
+//! Omitted: privacy.
 
 use crate::diag::{About, At, DiagCode};
 use crate::error::{CheckError, Malformed, ParamSite, Stop};
@@ -271,10 +272,6 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                             self.register_trait(tr, args, Cause::Expr(e))?;
                             return Ok(Flow::Done(self.finish_overloaded_index(e, base, &steps, i, tr, args)?));
                         }
-                    }
-                }
-                if let Some(tr) = index_trait {
-                    for i in 0..steps.len() {
                         if let Some(out) = self.try_coerced_index(e, base, index, &steps, i, tr, idx)? {
                             return Ok(Flow::Done(out));
                         }
