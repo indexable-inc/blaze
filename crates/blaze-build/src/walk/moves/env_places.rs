@@ -275,7 +275,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         let len = self.moves.steps.len() as u32 - start;
         let Some(bit) = self.part_bit(mask, start, len, 0, Some(e))? else {
-            return Err(unsupported(e, "a move out of more than 64 parts of one local (its word)"));
+            return Err(unsupported(e, "a move out of more than 256 parts of one local (its bitset)"));
         };
         self.clear_bit(mask, bit);
         Ok(())

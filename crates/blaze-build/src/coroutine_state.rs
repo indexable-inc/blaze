@@ -47,10 +47,21 @@ pub struct LaidState {
     pub niche: crate::StateNiche,
 }
 
+/// Number of 64-bit words in a partial-move field-flags bitset (`rest` / `Held::Moved`).
+/// Shared between `lay_state` and `walk/moves.rs` so coroutine state reservations and stack slots
+/// always agree in size.
+pub const REST_WORDS: usize = 4;
+
+/// Byte size of one partial-move field-flags bitset (`REST_WORDS * 8` = 32 bytes, 8-byte aligned).
+pub const REST_BYTES: u32 = (REST_WORDS * 8) as u32;
+
+/// Total bit capacity of one partial-move field-flags bitset (`REST_WORDS * 64` = 256 bits).
+pub const REST_BITS: u32 = (REST_WORDS * 64) as u32;
+
 /// [`lay_state`]'s answer: the state, per saved local (the recipe's order) its field's offset,
-/// its drop flag's offset (`None`: its type needs no drop), and its 8-byte partial-move
-/// field-flags word offset (`rest`), plus per by-value upvar needing a drop flag or field-flags
-/// word its offset(s).
+/// its drop flag's offset (`None`: its type needs no drop), and its [`REST_BYTES`]-byte
+/// partial-move field-flags bitset offset (`rest`), plus per by-value upvar needing a drop flag
+/// or field-flags bitset its offset(s).
 pub struct Laid<A: Allocator> {
     pub state: LaidState,
     pub field: Vec<u32, A>,
@@ -114,7 +125,7 @@ impl<'a> StateNames<'a> {
         if rows.iter().any(|r| {
             !inside(r.offset, r.size)
                 || r.flag.is_some_and(|f| !inside(f, 1))
-                || r.rest.is_some_and(|w| !inside(w, 8) || w % 8 != 0)
+                || r.rest.is_some_and(|w| !inside(w, REST_BYTES) || w % 8 != 0)
         }) {
             return Err(BuildError::Malformed { what: "a coroutine state's saved field or flag outside its region" });
         }
@@ -294,13 +305,13 @@ pub fn lay_state_with_conflicts<A: Allocator + Copy>(
             at = here.checked_add(size).ok_or_else(too_big)?;
         }
     }
-    // The 8-byte partial-move field-flags words (`rest`, align 3), in recipe then upvar order.
+    // The partial-move field-flags bitsets (`rest`, `REST_BYTES` bytes, align 3), in recipe then upvar order.
     let mut rest: Vec<Option<u32>, A> = Vec::with_capacity_in(saved.len(), alloc);
     for &needs in needs_rest {
         if needs {
             let here = align_up(at, 3);
             rest.push(Some(u32::try_from(here).map_err(|_| too_big())?));
-            at = here.checked_add(8).ok_or_else(too_big)?;
+            at = here.checked_add(u64::from(REST_BYTES)).ok_or_else(too_big)?;
         } else {
             rest.push(None);
         }
@@ -310,7 +321,7 @@ pub fn lay_state_with_conflicts<A: Allocator + Copy>(
         if needs {
             let here = align_up(at, 3);
             upvar_rest.push(Some(u32::try_from(here).map_err(|_| too_big())?));
-            at = here.checked_add(8).ok_or_else(too_big)?;
+            at = here.checked_add(u64::from(REST_BYTES)).ok_or_else(too_big)?;
         } else {
             upvar_rest.push(None);
         }

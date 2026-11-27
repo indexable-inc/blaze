@@ -170,7 +170,7 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
             }
             self.moves.steps.push(Step::Field(row));
             let Some(bit) = self.part_bit(mask, start, len + 1, 0, Some(e))? else {
-                return Err(unsupported(e, "a struct update moving out more than 64 parts of one local (its word)"));
+                return Err(unsupported(e, "a struct update moving out more than 256 parts of one local (its bitset)"));
             };
             self.clear_bit(mask, bit);
             return Ok(());
@@ -212,7 +212,7 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
         let start = self.moves.steps.len() as u32;
         self.moves.steps.push(Step::Field(row));
         let Some(bit) = self.part_bit(mask, start, 1, 0, Some(e))? else {
-            return Err(unsupported(e, "a struct update moving out more than 64 parts of one temporary (its word)"));
+            return Err(unsupported(e, "a struct update moving out more than 256 parts of one temporary (its bitset)"));
         };
         self.clear_bit(mask, bit);
         Ok(())

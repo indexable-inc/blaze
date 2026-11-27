@@ -99,7 +99,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if let Some(&m) = self.temp_marks.get(t + 1) {
             pos = pos.min(m as usize);
         }
-        self.insert_held(pos, t + 1, depth, Held::Rest { at, l, variant: None, moved: 0 });
+        self.insert_held(pos, t + 1, depth, Held::Rest { at, l, variant: None, moved: super::moves::FieldBits::EMPTY });
         Ok(())
     }
 
@@ -323,7 +323,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// Drops an extended temporary (`Held::Temp`): at `at`, or, made under a branch, at the
     /// address in its home slot if its flag is set (cleared on the way).
     pub(super) fn drop_temp(&mut self, at: (Value, i32), l: u32, flag: Option<(SlotId, SlotId)>) -> Result<(), BuildError> {
-        let Some((flag, home)) = flag else { return self.drop_rest(at, l, None, 0) };
+        let Some((flag, home)) = flag else { return self.drop_rest(at, l, None, super::moves::FieldBits::EMPTY) };
         let fa = self.b.slot_addr(flag);
         let f = self.b.load(Ty::I8, Flags::NONE, fa, 0, MemAttrs::aligned(0));
         let zero = self.b.iconst(Ty::I8, 0);
@@ -334,7 +334,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.begin(yes);
         let ha = self.b.slot_addr(home);
         let p = self.b.load(Ty::PTR, Flags::NONE, ha, 0, MemAttrs::aligned(3));
-        self.drop_rest((p, 0), l, None, 0)?;
+        self.drop_rest((p, 0), l, None, super::moves::FieldBits::EMPTY)?;
         self.store_flag(flag, false);
         self.jump(join, &[]);
         self.begin(join);

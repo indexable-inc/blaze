@@ -263,7 +263,7 @@ impl LocalOwn {
 #[derive(Clone, Copy)]
 enum Held {
     Pat(PatId),
-    Rest { at: (Value, i32), l: u32, variant: Option<u32>, moved: u64 },
+    Rest { at: (Value, i32), l: u32, variant: Option<u32>, moved: moves::FieldBits },
     /// A temporary scrutinee of a match by tests that moves out of it (walk/moves.rs): of
     /// ground type `g` at `at`, what its word `mask` says is held, dropped at its statement's
     /// end like `Rest`.
@@ -2571,7 +2571,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             None
         };
         let rest = if self.partial[p.ix()] {
-            let slot = self.b.slot(8, 3, SlotKind::Named);
+            let slot = self.alloc_mask_slot();
             self.name_rest(slot, blaze_flow_lower::identity::Identity::Binding(p));
             self.record_mask_decl_loop(slot);
             Some(slot)
@@ -2618,16 +2618,16 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// allocating its field-flags word when a dropping part moves out of it (`partial`).
     fn own_kept(&mut self, p: PatId, init: bool) {
         self.track_local_slot(p);
-        let Some(entry) = self.owned.get_mut(p.ix()) else { return };
+        let Some(&existing) = self.owned.get(p.ix()) else { return };
         if !self.partial.get(p.ix()).copied().unwrap_or(false) {
-            *entry = LocalOwn::Kept;
+            self.owned[p.ix()] = LocalOwn::Kept;
             return;
         }
-        let slot = match *entry {
+        let slot = match existing {
             LocalOwn::KeptFlags(slot) => slot,
             LocalOwn::None | LocalOwn::Kept | LocalOwn::Drop(_) => {
-                let slot = self.b.slot(8, 3, SlotKind::Named);
-                *entry = LocalOwn::KeptFlags(slot);
+                let slot = self.alloc_mask_slot();
+                self.owned[p.ix()] = LocalOwn::KeptFlags(slot);
                 self.record_mask_decl_loop(slot);
                 slot
             }
@@ -2639,9 +2639,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.scope_slots.push((depth, slot, None));
             }
         }
-        let at = self.b.slot_addr(slot);
-        let bits = self.b.iconst(Ty::I64, if init { u128::from(u64::MAX) } else { 0 });
-        self.b.store(Flags::NONE, bits, at, 0, MemAttrs::aligned(3));
+        self.store_mask_words(slot, if init { u64::MAX } else { 0 });
     }
 
     /// The field-flags word of binding `p`, whether its type needs drop (`Owned::rest`) or not
@@ -2669,20 +2667,26 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// (its `let`, an assignment over it).
     fn hold_all(&mut self, p: PatId) {
         if let Some(slot) = self.field_mask(p) {
-            let at = self.b.slot_addr(slot);
-            let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
-            self.b.store(Flags::NONE, all, at, 0, MemAttrs::aligned(3));
+            self.store_mask_words(slot, u64::MAX);
         }
     }
 
-    /// The bit of field `j` of variant `variant` of enum layout `l` in a field-flag word: the
-    /// fields of every variant before it, then `j`; `None` past 64 fields.
+    /// The bit of field `j` of variant `variant` of enum layout `l` in a field-flag bitset:
+    /// variants share `0..max_variant_fields` because an enum holds one active variant at runtime
+    /// (switched on by discriminant before testing bits, and `hold_all` resets on overwrite);
+    /// `None` at or past `REST_BITS`.
     fn field_bit(&self, l: u32, variant: u32, j: u32) -> Result<Option<u32>, BuildError> {
-        let Shape::Enum { first, .. } = self.layouts[l as usize].shape else {
+        let Shape::Enum { first, len, .. } = self.layouts[l as usize].shape else {
             return Err(malformed("field flags of other than an enum"));
         };
-        let before: u32 = (0..variant).map(|v| self.layout_variants[(first + v) as usize].1).sum();
-        Ok(Some(before + j).filter(|&b| b < 64))
+        if variant >= len {
+            return Err(malformed("a variant index past its enum's variants"));
+        }
+        let fl = self.layout_variants[(first + variant) as usize].1;
+        if j >= fl {
+            return Err(malformed("a field index past its variant's fields"));
+        }
+        Ok(Some(j).filter(|&b| b < crate::coroutine_state::REST_BITS))
     }
 
     /// Drops what the binding of ground type `g` at `at` holds: all of it, or with field flags
@@ -2697,8 +2701,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let Shape::Enum { id, first, len } = self.layouts[l as usize].shape else {
             return Err(malformed("field flags on other than an enum"));
         };
-        let fa = self.b.slot_addr(slot);
-        let mask = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
         let exit = self.create();
         let mut cases = Vec::with_capacity_in(len as usize, self.alloc);
         let mut bodies = Vec::with_capacity_in(len as usize, self.alloc);
@@ -2722,15 +2724,12 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     continue;
                 }
                 let ft = self.layouts[fr as usize].ty;
-                // A field past 64 is never moved (`arm` refuses it), so always held.
+                // A field past `REST_BITS` is never moved (`arm` refuses it), so always held.
                 let Some(bit) = self.field_bit(l, v, j)? else {
                     self.drop_at(ft, (at.0, at.1 + off as i32))?;
                     continue;
                 };
-                let one = self.b.iconst(Ty::I64, 1u128 << bit);
-                let held = self.b.binary(Op::And, Flags::NONE, mask, one);
-                let zero = self.b.iconst(Ty::I64, 0);
-                let set = self.b.icmp(IntCond::Ne, held, zero);
+                let set = self.test_bit(slot, bit);
                 let yes = self.create();
                 let next = self.create();
                 self.br(set, (yes, &[]), (next, &[]));
@@ -2747,7 +2746,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
 
     /// Drops what an arm left of a temporary scrutinee (`Held::Rest`): its variant is known,
     /// so its fields not moved out are dropped with no flag; nothing moved, the whole value.
-    fn drop_rest(&mut self, at: (Value, i32), l: u32, variant: Option<u32>, moved: u64) -> Result<(), BuildError> {
+    fn drop_rest(&mut self, at: (Value, i32), l: u32, variant: Option<u32>, moved: moves::FieldBits) -> Result<(), BuildError> {
         let Some(v) = variant else {
             let g = self.layouts[l as usize].ty;
             return self.drop_at(g, at);
@@ -2756,8 +2755,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         for j in 0..fl {
             let (_, off, repr) = self.layout_fields[(ff + j) as usize];
             let Repr::Agg(fr) = repr else { continue };
-            // A field past 64 is never moved (`arm` refuses it).
-            let gone = self.field_bit(l, v, j)?.is_some_and(|bit| moved & (1 << bit) != 0);
+            // A field past `REST_BITS` is never moved (`arm` refuses it).
+            let gone = self.field_bit(l, v, j)?.is_some_and(|bit| moved.contains(bit));
             if self.layouts[fr as usize].needs_drop && !gone {
                 let ft = self.layouts[fr as usize].ty;
                 self.drop_at(ft, (at.0, at.1 + off as i32))?;
@@ -4168,6 +4167,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 // Dropped at its statement's end (walk/temps.rs).
                 if drop && self.live {
                     self.hold_temp(e, at, repr)?;
+                    self.note_temp_spill(e, at);
                 } else if !drop && self.live {
                     self.hold_copy_temp(e, at)?;
                 }
@@ -4821,6 +4821,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 // Dropped at its statement's end (walk/temps.rs).
                 if drop && self.live {
                     self.hold_temp(e, at, repr)?;
+                    self.note_temp_spill(e, at);
                 } else if !drop && self.live {
                     self.hold_copy_temp(e, at)?;
                 }
@@ -7295,7 +7296,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     PNode::FnPtr(sig_list, header) => {
                         list.extend_from_slice(written);
                         let declared = if header.c_variadic {
-                            let len = self.types.list(sig_list).map_err(|_| malformed("a fn pointer past the record's types"))?.len();
+                            let len = self.ground.view().list(sig_list).map_err(|_| malformed("a fn pointer past the ground table"))?.len();
                             Some(len.saturating_sub(1))
                         } else {
                             None
@@ -7664,13 +7665,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// the result) and left in place by `_`; nothing deeper is built.
     /// `own`: each by-value binding joins the drop scope here; else the caller owns them
     /// (a guarded arm, once its guard passed: walk/moves.rs `Pending`).
-    fn bind_variant(&mut self, p: PatId, at: (Value, i32), l: u32, by_ref: bool, own: bool) -> Result<u64, BuildError> {
+    fn bind_variant(&mut self, p: PatId, at: (Value, i32), l: u32, by_ref: bool, own: bool) -> Result<moves::FieldBits, BuildError> {
         let variant = Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?;
         let (first, len, _) = self.variant_rows(l, variant)?;
         let n = len as usize;
         // (field row, subpattern) pairs.
         let mut binds = Vec::new_in(self.alloc);
-        let mut moved = 0u64;
+        let mut moved = moves::FieldBits::EMPTY;
         match self.pat(p)? {
             Pat::TupleStruct { elems, rest, .. } => {
                 let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
@@ -7727,9 +7728,9 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                     Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none() => {
                         let bit = self.field_bit(l, variant, row as u32 - first)?.ok_or(BuildError::UnsupportedPat {
                             pat: sub,
-                            what: "a move out of a field past an enum's 64th (its field flags are one word)",
+                            what: "a move out of a field past an enum variant's 256th (its field flags are 256 bits)",
                         })?;
-                        moved |= 1 << bit;
+                        moved.set(bit);
                     }
                     _ => {
                         return Err(BuildError::UnsupportedPat {
@@ -7954,7 +7955,6 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         // The arm's drop scope: its bindings drop at its end. (A temporary scrutinee that needs
         // drop is never the switch's: the match by tests holds it in its temporary scope.)
         self.scope_marks.push(self.scope_pats.len() as u32);
-        let mut moved = 0u64;
         let mut whole = false;
         // A guarded arm's bindings are stored before its guard, which reads them, but own
         // their parts and take them from the scrutinee only once it passed (walk/moves.rs
@@ -7978,11 +7978,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 }
             }
             (Pat::TupleStruct { .. } | Pat::Struct { .. }, Some((at, l, _))) => {
-                moved = self.bind_variant(arm.pat, at, l, st.by_ref.is_some(), !hold)?;
+                let moved = self.bind_variant(arm.pat, at, l, st.by_ref.is_some(), !hold)?;
                 if hold && st.by_ref.is_none() {
                     self.arm_effect(moves::Pending::OwnPat(arm.pat), true)?;
                 }
-                if moved != 0 {
+                if !moved.is_empty() {
                     let _variant = Self::def_variant(self.pat_def(arm.pat)).ok_or(malformed("a variant pattern the check did not resolve"))?;
                     if self.layouts[l as usize].drop_fn.is_some() {
                         return Err(BuildError::UnsupportedPat {
