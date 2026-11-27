@@ -235,6 +235,29 @@ pub struct SuperProj {
     pub term: PTy,
 }
 
+/// One lifetime argument written on a trait's supertrait bound (`trait Sub<'x>: Super<'x>`),
+/// used by RFC 1156 default trait object lifetime resolution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuperLifetime {
+    /// `'static`.
+    Static,
+    /// The `i`-th declared lifetime parameter of the subtrait (`0..declared_lifetimes`).
+    Param(u32),
+    /// A non-substitutable lifetime (e.g. bound by `for<'a>` on the supertrait clause, or elided).
+    Other,
+}
+
+/// A trait's direct `Self: Super<'a, ..>` supertrait lifetime edges, packed into two flat
+/// vectors: edge `k` targets `edges[k].0` with lifetime arguments `args[edges[k].1..edges[k].2]`,
+/// plus any direct `Self: 'r` bounds inherited through trait alias supertraits
+/// (`trait LtAlias<'a> = 'a; trait Sub<'x>: LtAlias<'x> {}`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SuperLifetimes {
+    pub edges: blaze_own::Vec<(LibKey, u32, u32), Alloc<'static>>,
+    pub args: blaze_own::Vec<SuperLifetime, Alloc<'static>>,
+    pub alias_outlives: blaze_own::Vec<SuperLifetime, Alloc<'static>>,
+}
+
 /// The heads the type builder reads: an item's generics, a trait's defaults and associated
 /// types, by library key; `None` when not lowered yet.
 pub trait Heads {
@@ -323,6 +346,12 @@ pub trait Heads {
     fn trait_auto(&self, trait_: LibKey) -> Option<bool>;
     /// Whether the trait declares a `Self: 'static` bound (e.g. `core::any::Any`).
     fn trait_self_static(&self, trait_: LibKey) -> Option<bool>;
+    /// The declared lifetime parameter indices `i` (`0..declared_lifetimes`) for which the trait
+    /// directly declares `Self: 'lt_i` (in its supertrait bounds or `where Self: 'lt_i`), sorted.
+    fn trait_self_outlives_params(&self, trait_: LibKey) -> Option<&[u32]>;
+    /// The trait's direct `Self: Super<..>` supertrait lifetime edges, filed alongside
+    /// [`Heads::trait_supers`].
+    fn trait_super_lifetimes(&self, trait_: LibKey) -> Option<&SuperLifetimes>;
     /// A type alias's generic count and its aliased type over them (`Param(i)` the alias's
     /// i-th parameter): a path to it means the aliased type with its arguments substituted.
     /// `Some(None)`: its head was tried and refused (the why is in the store's `alias_gaps`).
@@ -455,6 +484,9 @@ pub struct TraitAliasHead {
     /// Its trait clauses on `Self` by library key (what `T::X` is looked up through, as a
     /// [`ParamBound`]), with their arguments over the same parameters.
     pub traits: blaze_own::Vec<(LibKey, List), Alloc<'static>>,
+    /// Expanded `Self: Tr<'a, ..>` lifetime edges (and direct `Self: 'a` bounds) over the
+    /// alias's own declared lifetimes, with nested trait aliases already substituted.
+    pub super_lifetimes: SuperLifetimes,
 }
 
 /// The refusal of a `Self` written where the [`Env`] has no `Self` ([`SelfTy::None`]): one
@@ -4590,7 +4622,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         let mut vars = 0u32;
         let mut object: Option<SlotKind> = None;
         let mut written = 0u32;
-        let mut resolved_traits: blaze_own::Vec<LibKey, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+        let mut resolved_traits: blaze_own::Vec<(LibKey, usize, usize), Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+        let mut resolved_args: blaze_own::Vec<Option<SlotKind>, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+        let mut alias_direct_bounds: blaze_own::Vec<SlotKind, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
         let mut trait_lts: blaze_own::Vec<(ItemKey, u32, u32), Alloc<'_>> = blaze_own::Vec::new_in(alloc);
         let mut lt_pool: blaze_own::Vec<Slot, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
         for &b in v.rows(bounds)? {
@@ -4631,8 +4665,8 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             let (abs, texts, _, pr) = path_texts_of(v, p, true)?;
             match self.bound_target(env, v, p, abs, &texts, pr) {
                 Ok(Bounded::Trait(key)) => {
-                    resolved_traits.push(key);
                     let checker_key = self.heads.checker(key);
+                    let mut lt_len = 0u32;
                     if let Some(want) = declared_lifetimes(self.heads, self.resolver.names, checker_key, Declared::Trait) {
                         if written_lts == 0 {
                             for _ in 0..want {
@@ -4640,18 +4674,98 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                             }
                             if want > 0 {
                                 trait_lts.push((checker_key, lt_start, want));
+                                lt_len = want;
                             }
                         } else if written_lts == want {
                             trait_lts.push((checker_key, lt_start, written_lts));
+                            lt_len = written_lts;
                         } else {
                             return Ok(Err(RegionRefusal::LifetimeArgs { at: pr, want, got: written_lts }));
                         }
                     } else if written_lts > 0 {
                         return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DeclaredCount, pr)));
                     }
+                    let r_start = resolved_args.len();
+                    if let (Ok(s0), Ok(ln)) = (usize::try_from(lt_start), usize::try_from(lt_len))
+                        && let Some(slice) = s0.checked_add(ln).and_then(|e0| lt_pool.get(s0..e0))
+                    {
+                        for slot in slice {
+                            resolved_args.push(Some(slot.kind));
+                        }
+                    }
+                    resolved_traits.push((key, r_start, resolved_args.len() - r_start));
+                }
+                Ok(Bounded::Alias(alias)) => {
+                    let mut alias_args: blaze_own::Vec<Slot, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+                    if let (Ok(s0), Ok(ln)) = (usize::try_from(lt_start), usize::try_from(written_lts))
+                        && let Some(slice) = s0.checked_add(ln).and_then(|e0| lt_pool.get(s0..e0))
+                    {
+                        alias_args.extend_from_slice(slice);
+                    }
+                    if let Ok(s0) = usize::try_from(lt_start) {
+                        lt_pool.truncate(s0);
+                    }
+                    if let Some(want) = declared_lifetimes(self.heads, self.resolver.names, self.heads.checker(alias), Declared::Trait) {
+                        if written_lts == 0 {
+                            for _ in 0..want {
+                                alias_args.push(Slot::written(s.new_elided(pr)));
+                            }
+                        } else if written_lts != want {
+                            return Ok(Err(RegionRefusal::LifetimeArgs { at: pr, want, got: written_lts }));
+                        }
+                    }
+                    if let Some(ah) = self.heads.trait_alias(alias) {
+                        for &ao in ah.super_lifetimes.alias_outlives.iter() {
+                            let mapped = match ao {
+                                SuperLifetime::Static => Some(SlotKind::Static),
+                                SuperLifetime::Param(pi) => usize::try_from(pi)
+                                    .ok()
+                                    .and_then(|i| alias_args.get(i))
+                                    .map(|slot| slot.kind),
+                                SuperLifetime::Other => None,
+                            };
+                            if let Some(kind) = mapped {
+                                alias_direct_bounds.push(kind);
+                            }
+                        }
+                        for &(k, e_start, e_end) in ah.super_lifetimes.edges.iter() {
+                            let r_start = resolved_args.len();
+                            let Ok(edge_lt_start) = u32::try_from(lt_pool.len()) else {
+                                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::TooMany, pr)));
+                            };
+                            let mut all_laid = true;
+                            let mut laid_count = 0u32;
+                            if let (Ok(es), Ok(ee)) = (usize::try_from(e_start), usize::try_from(e_end))
+                                && let Some(edge_args) = ah.super_lifetimes.args.get(es..ee)
+                            {
+                                for &ea in edge_args {
+                                    let mapped = match ea {
+                                        SuperLifetime::Static => Some(Slot::quiet(SlotKind::Static)),
+                                        SuperLifetime::Param(pi) => usize::try_from(pi).ok().and_then(|i| alias_args.get(i).copied()),
+                                        SuperLifetime::Other => None,
+                                    };
+                                    resolved_args.push(mapped.map(|slot| slot.kind));
+                                    if let Some(slot) = mapped {
+                                        lt_pool.push(slot);
+                                        laid_count = laid_count.saturating_add(1);
+                                    } else {
+                                        all_laid = false;
+                                    }
+                                }
+                            }
+                            let ck = self.heads.checker(k);
+                            let want = declared_lifetimes(self.heads, self.resolver.names, ck, Declared::Trait);
+                            if all_laid && want == Some(laid_count) && laid_count > 0 {
+                                trait_lts.push((ck, edge_lt_start, laid_count));
+                            } else if let Ok(st) = usize::try_from(edge_lt_start) {
+                                lt_pool.truncate(st);
+                            }
+                            resolved_traits.push((k, r_start, resolved_args.len() - r_start));
+                        }
+                    }
                 }
                 Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
-                Ok(Bounded::Alias(_)) | Err(_) => {
+                Err(_) => {
                     lt_pool.truncate(lt_start as usize);
                 }
             }
@@ -4722,36 +4836,178 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         if written > 1 {
             return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynLifetimes, r)));
         }
-        let mut static_bound = false;
-        if object.is_none() {
-            for &key in resolved_traits.iter() {
-                let mut work: blaze_own::Vec<LibKey, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
-                work.push(key);
-                let mut next = 0usize;
-                while next < work.len() && work.len() < 64 {
-                    let k = work[next];
-                    next += 1;
-                    if self.heads.trait_self_static(k) == Some(true) {
-                        static_bound = true;
-                        break;
+        let own = if let Some(k) = object {
+            Slot::written(k)
+        } else {
+            // RFC 1156 ("Default trait object lifetimes"): collect every unique lifetime bound
+            // implied on `Self` by the trait object's traits and their transitive supertraits
+            // (`Self: 'static` and `Self: 'param_i`, substituting lifetime arguments across
+            // supertrait edges).
+            // - Any derived `'static` bound -> `Slot::quiet(SlotKind::Static)` (absorbing, regardless
+            //   of discovery order or other lifetime bounds, per the Rust Reference).
+            // - 0 bounds -> `SlotKind::ObjectDefault(r)` (context decides: `'a` under `&'a dyn`, `'static` bare).
+            // - 1 unique non-`'static` bound -> `Slot::quiet(kind)`.
+            // - >1 distinct non-`'static` bounds -> explicit `RegionRefusal::ObjectDefault { at: r }` (E0228).
+            // Per-parameter `(trait, param_idx, canonical_slot)` propagation is exact (every
+            // supertrait lifetime argument forwards one independent parameter or `'static`) and
+            // runs in O((V + E) * S) with O(1) HashSet deduplication, avoiding exponential tuple
+            // blowup on branching supertrait hierarchies.
+            #[derive(Clone, Copy)]
+            enum BoundAcc {
+                None,
+                One(SlotKind),
+                Static,
+                Ambiguous,
+            }
+            impl BoundAcc {
+                /// Records a derived bound; returns `true` only once `'static` is reached
+                /// (absorbing). `Ambiguous` does not stop early because a later-visited supertrait
+                /// may still contribute `'static`.
+                fn push(&mut self, kind: SlotKind) -> bool {
+                    // A lifetime bound by `for<..>` on the trait bound itself (`SlotKind::Bound`)
+                    // cannot escape to the trait object's outer lifetime position.
+                    if matches!(kind, SlotKind::Bound(_)) {
+                        return false;
                     }
-                    if let Some(supers) = self.heads.trait_supers(k) {
-                        for &(sk, _) in supers {
-                            if work.scan_for(&sk).is_none() {
-                                work.push(sk);
+                    if matches!(kind, SlotKind::Static) {
+                        *self = BoundAcc::Static;
+                        return true;
+                    }
+                    match *self {
+                        BoundAcc::Static => true,
+                        BoundAcc::None => {
+                            *self = BoundAcc::One(kind);
+                            false
+                        }
+                        BoundAcc::One(prev) if same_region(prev, kind) => false,
+                        BoundAcc::One(_) | BoundAcc::Ambiguous => {
+                            *self = BoundAcc::Ambiguous;
+                            false
+                        }
+                    }
+                }
+            }
+            #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+            enum SlotKey {
+                Static,
+                Named(Name),
+                Elided(u32),
+                Late { binder: u32, var: u32 },
+                Given(Region),
+                ObjectDefault(u32, u32),
+            }
+            let slot_key = |kind: SlotKind| -> Option<SlotKey> {
+                match kind {
+                    SlotKind::Static => Some(SlotKey::Static),
+                    SlotKind::Named(name, _) => Some(SlotKey::Named(name)),
+                    SlotKind::Elided(id) => Some(SlotKey::Elided(id)),
+                    SlotKind::Late { binder, var } => Some(SlotKey::Late { binder, var }),
+                    SlotKind::Bound(_) => None,
+                    SlotKind::Given(reg) => Some(SlotKey::Given(reg)),
+                    SlotKind::ObjectDefault(at) => Some(SlotKey::ObjectDefault(at.start, at.end)),
+                }
+            };
+            let mut acc = BoundAcc::None;
+            for &kind in alias_direct_bounds.iter() {
+                if acc.push(kind) {
+                    break;
+                }
+            }
+            let mut visited_traits: blaze_hash::HashSet<LibKey, Alloc<'_>> = blaze_hash::HashSet::new_in(alloc);
+            let mut trait_work: blaze_own::Vec<LibKey, Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+            let mut visited_params: blaze_hash::HashSet<(LibKey, u32, SlotKey), Alloc<'_>> = blaze_hash::HashSet::new_in(alloc);
+            let mut param_work: blaze_own::Vec<(LibKey, u32, SlotKind), Alloc<'_>> = blaze_own::Vec::new_in(alloc);
+            let enqueue_param = |k: LibKey,
+                                 idx: u32,
+                                 kind: SlotKind,
+                                 visited_params: &mut blaze_hash::HashSet<(LibKey, u32, SlotKey), Alloc<'_>>,
+                                 param_work: &mut blaze_own::Vec<(LibKey, u32, SlotKind), Alloc<'_>>| {
+                if let Some(sk) = slot_key(kind)
+                    && visited_params.insert((k, idx, sk))
+                {
+                    param_work.push((k, idx, kind));
+                }
+            };
+            if !matches!(acc, BoundAcc::Static) {
+                for &(key, r_start, r_len) in resolved_traits.iter() {
+                    if visited_traits.insert(key) {
+                        trait_work.push(key);
+                    }
+                    if let Some(slice) = r_start.checked_add(r_len).and_then(|e0| resolved_args.get(r_start..e0)) {
+                        for (i, &opt_kind) in slice.iter().enumerate() {
+                            if let (Some(kind), Ok(idx)) = (opt_kind, u32::try_from(i)) {
+                                enqueue_param(key, idx, kind, &mut visited_params, &mut param_work);
                             }
                         }
                     }
                 }
-                if static_bound {
+            }
+            // Phase 1: Reachable traits and parameter-independent `'static` sources/edges — O(V + E).
+            let mut ti = 0usize;
+            while let Some(&k) = trait_work.get(ti) {
+                ti += 1;
+                if self.heads.trait_self_static(k) == Some(true) && acc.push(SlotKind::Static) {
                     break;
                 }
+                if let Some(sl) = self.heads.trait_super_lifetimes(k) {
+                    if sl.alias_outlives.scan_for(&SuperLifetime::Static).is_some() && acc.push(SlotKind::Static) {
+                        break;
+                    }
+                    for &(sk, e_start, e_end) in sl.edges.iter() {
+                        if visited_traits.insert(sk) {
+                            trait_work.push(sk);
+                        }
+                        if let (Ok(es), Ok(ee)) = (usize::try_from(e_start), usize::try_from(e_end))
+                            && let Some(edge_args) = sl.args.get(es..ee)
+                        {
+                            for (j, &ea) in edge_args.iter().enumerate() {
+                                if ea == SuperLifetime::Static
+                                    && let Ok(j32) = u32::try_from(j)
+                                {
+                                    enqueue_param(sk, j32, SlotKind::Static, &mut visited_params, &mut param_work);
+                                }
+                            }
+                        }
+                    }
+                }
             }
-        }
-        let own = match object {
-            Some(k) => Slot::written(k),
-            None if static_bound => Slot::quiet(SlotKind::Static),
-            None => Slot::quiet(SlotKind::ObjectDefault(r)),
+            // Phase 2: Per-parameter `(trait, param_idx, slot)` propagation — O((V + E) * S).
+            if !matches!(acc, BoundAcc::Static) {
+                let mut pi = 0usize;
+                while let Some(&(k, param_idx, kind)) = param_work.get(pi) {
+                    pi += 1;
+                    if let Some(outlives) = self.heads.trait_self_outlives_params(k)
+                        && outlives.binary_search(&param_idx).is_ok()
+                        && acc.push(kind)
+                    {
+                        break;
+                    }
+                    if let Some(sl) = self.heads.trait_super_lifetimes(k) {
+                        if sl.alias_outlives.scan_for(&SuperLifetime::Param(param_idx)).is_some() && acc.push(kind) {
+                            break;
+                        }
+                        for &(sk, e_start, e_end) in sl.edges.iter() {
+                            if let (Ok(es), Ok(ee)) = (usize::try_from(e_start), usize::try_from(e_end))
+                                && let Some(edge_args) = sl.args.get(es..ee)
+                            {
+                                for (j, &ea) in edge_args.iter().enumerate() {
+                                    if ea == SuperLifetime::Param(param_idx)
+                                        && let Ok(j32) = u32::try_from(j)
+                                    {
+                                        enqueue_param(sk, j32, kind, &mut visited_params, &mut param_work);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            match acc {
+                BoundAcc::Static => Slot::quiet(SlotKind::Static),
+                BoundAcc::None => Slot::quiet(SlotKind::ObjectDefault(r)),
+                BoundAcc::One(kind) => Slot::quiet(kind),
+                BoundAcc::Ambiguous => return Ok(Err(RegionRefusal::ObjectDefault { at: r })),
+            }
         };
         let arity = HeadsArity { heads: self.heads, opaques: &s.opaques, names: self.resolver.names };
         let whole = soft!(subtree(tys.view(), made, &arity, alloc));
@@ -4761,7 +5017,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             kid_slots += s.kid(n, k).map_or(0, |f| f.len);
         }
         let find_super_proj = |sup_tr: ItemKey, name: Name| -> Option<(&[Region], u32, u32)> {
-            for &rk in resolved_traits.iter() {
+            for &(rk, _, _) in resolved_traits.iter() {
                 let sub_ck = self.heads.checker(rk);
                 if let Some(regs) = self.heads.trait_super_proj_regions(sub_ck, sup_tr, name) {
                     let (lt_start, lt_len) = trait_lts.iter().find(|&&(k, _, _)| k == sub_ck).map_or((0, 0), |&(_, st, ln)| (st, ln));

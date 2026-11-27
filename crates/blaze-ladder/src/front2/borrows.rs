@@ -6803,3 +6803,283 @@ fn crc_for_loop_ok() -> u32 {
         }
     }
 }
+
+/// RFC 1156 ("Default trait object lifetimes"): parameterized `Self: 'a` superbounds (direct,
+/// `where Self: 'a`, and transitive through supertraits) decide `dyn Trait<'a>`'s default object
+/// lifetime instead of falling back to `'static` (bare) or the enclosing reference lifetime.
+#[cfg(test)]
+mod rfc1156_dyn_lifetime_default_tests {
+    use crate::crates::{DirShelf, Inputs, Toolchain, UserCrate};
+    use crate::front2::borrows::BorrowRefused;
+    use crate::front2::head_record::Unlaid;
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"
+#![feature(trait_alias)]
+
+trait AnyLt<'a>: 'a {
+    fn tag(&self) -> u8;
+}
+
+impl<'a> dyn AnyLt<'a> {
+    fn downcast_ref(&self) -> &() {
+        &()
+    }
+    fn as_lt(&self) -> &'a () {
+        &()
+    }
+}
+
+struct S<'a, 'e> {
+    extra: &'a dyn AnyLt<'e>,
+}
+
+fn pos1_downcast<'a, 'e>(s: &S<'a, 'e>) -> &'a () {
+    s.extra.downcast_ref()
+}
+
+fn pos1_as_lt<'a, 'e>(s: &S<'a, 'e>) -> &'e () {
+    s.extra.as_lt()
+}
+
+trait Sub<'x>: AnyLt<'x> {}
+impl<'x> dyn Sub<'x> {
+    fn probe(&self) -> &'x () {
+        &()
+    }
+}
+
+fn pos2_sub<'a, 'x>(s: &'a dyn Sub<'x>) -> &'x () {
+    s.probe()
+}
+
+trait Mid<'x, 'y>: AnyLt<'y> {}
+trait Leaf<'z>: Mid<'static, 'z> {}
+impl<'z> dyn Leaf<'z> {
+    fn leaf_probe(&self) -> &'z () {
+        &()
+    }
+}
+
+fn pos2_leaf<'a, 'z>(s: &'a dyn Leaf<'z>) -> &'z () {
+    s.leaf_probe()
+}
+
+trait WhereLt<'a>
+where
+    Self: 'a,
+{
+    fn ping(&self) -> u8;
+}
+
+impl<'a> dyn WhereLt<'a> {
+    fn check(&self) -> &'a () {
+        &()
+    }
+}
+
+fn pos3_where_self<'a, 'e>(x: &'a dyn WhereLt<'e>) -> &'e () {
+    x.check()
+}
+
+trait A<'a>: 'a {}
+trait B<'a>: 'a {}
+trait BothSame<'a>: A<'a> + B<'a> + 'a {}
+impl<'a> dyn BothSame<'a> {
+    fn ok(&self) -> &'a () {
+        &()
+    }
+}
+
+fn pos4_same_bound<'a, 'e>(x: &'a dyn BothSame<'e>) -> &'e () {
+    x.ok()
+}
+
+fn pos4_explicit_static<'a>(x: &'a (dyn A<'static> + 'static)) -> &'static () {
+    let _ = x;
+    &()
+}
+
+trait Plain<'a> {}
+impl<'a> dyn Plain<'a> {
+    fn f(&self) {}
+}
+
+fn neg1_plain_requires_static<'a, 'b>(x: &'b dyn Plain<'a>) {
+    x.f();
+}
+
+trait Two<'a, 'b>: 'a + 'b {}
+
+fn neg2_ambiguous<'a, 'b>(x: &'a dyn Two<'a, 'b>) {
+    let _ = x;
+}
+
+fn pos5_two_explicit<'a, 'b>(x: &'a (dyn Two<'a, 'b> + 'static)) {
+    let _ = x;
+}
+
+trait TwoTrans<'a, 'b>: A<'a> + B<'b> {}
+
+fn neg3_transitive_ambiguous<'a, 'b>(x: &'a dyn TwoTrans<'a, 'b>) {
+    let _ = x;
+}
+
+// Positive 6: Per the Rust Reference, any derived `'static` bound takes precedence over other
+// lifetime bounds regardless of order (including absorbing otherwise-ambiguous supertrait bounds).
+trait StaticAndLt<'a>: 'static + 'a {}
+trait LtAndStatic<'a>: 'a + 'static {}
+trait StaticSuper: 'static {}
+trait StaticSub<'a, 'b>: A<'a> + B<'b> + 'static {}
+trait TransStaticLast<'a, 'b>: A<'a> + B<'b> + StaticSuper {}
+
+fn take_static_and_lt<'a, 'r>(_: &'r (dyn StaticAndLt<'a> + 'static)) {}
+fn take_lt_and_static<'a, 'r>(_: &'r (dyn LtAndStatic<'a> + 'static)) {}
+fn take_static_sub<'a, 'b, 'r>(_: &'r (dyn StaticSub<'a, 'b> + 'static)) {}
+fn take_trans_static_last<'a, 'b, 'r>(_: &'r (dyn TransStaticLast<'a, 'b> + 'static)) {}
+
+fn pos6_static_precedence<'a, 'b, 'r>(
+    x: &'r dyn StaticAndLt<'a>,
+    y: &'r dyn LtAndStatic<'a>,
+    z: &'r dyn StaticSub<'a, 'b>,
+    w: &'r dyn TransStaticLast<'a, 'b>,
+) {
+    take_static_and_lt(x);
+    take_lt_and_static(y);
+    take_static_sub(z);
+    take_trans_static_last(w);
+}
+
+// Positive 7: Parameterized trait aliases (direct, swapped params, and chained) preserve lifetime
+// substitutions through supertraits.
+trait AliasLt<'a> = AnyLt<'a>;
+trait SubAlias<'e>: AliasLt<'e> {}
+impl<'e> dyn SubAlias<'e> {
+    fn alias_probe(&self) -> &'e () {
+        &()
+    }
+}
+
+trait Flip<'x, 'y> = AnyLt<'y>;
+trait SubFlip<'a, 'b>: Flip<'a, 'b> {}
+impl<'a, 'b> dyn SubFlip<'a, 'b> {
+    fn flip_probe(&self) -> &'b () {
+        &()
+    }
+}
+
+trait Chained<'z> = Flip<'static, 'z>;
+trait SubChained<'e>: Chained<'e> {}
+impl<'e> dyn SubChained<'e> {
+    fn chained_probe(&self) -> &'e () {
+        &()
+    }
+}
+
+fn pos7_trait_alias<'a, 'e>(x: &'a dyn SubAlias<'e>) -> &'e () {
+    x.alias_probe()
+}
+
+fn pos7_trait_alias_flip<'r, 'a, 'b>(x: &'r dyn SubFlip<'a, 'b>) -> &'b () {
+    x.flip_probe()
+}
+
+fn pos7_trait_alias_chained<'r, 'e>(x: &'r dyn SubChained<'e>) -> &'e () {
+    x.chained_probe()
+}
+
+// Positive 8: Direct trait alias as the object bound (`&'r dyn AliasLt<'e>`, `&'r dyn Flip<'a, 'b>`,
+// `impl<'a> dyn AliasLt<'a>`).
+impl<'a> dyn AliasLt<'a> {
+    fn direct_alias_method(&self) -> &'a () {
+        &()
+    }
+}
+
+fn pos8_direct_alias<'r, 'e>(x: &'r dyn AliasLt<'e>) -> &'e () {
+    let _ = x.as_lt();
+    x.direct_alias_method()
+}
+
+fn pos8_direct_flip<'r, 'a, 'b>(x: &'r dyn Flip<'a, 'b>) -> &'b () {
+    x.as_lt()
+}
+
+fn main() {}
+"#;
+
+    #[test]
+    fn rfc1156_default_trait_object_lifetimes_soundness() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let tc = Toolchain::open(&mut DirShelf::new(std::format!("{home}/.blaze/v2/toolchain"))).expect("installed toolchain");
+        let files = [("/rfc1156_dyn/src/main.rs".to_string(), SOURCE.to_string())];
+        let edition = edition::PackageEdition::of_manifest("2024").expect("Rust 2024");
+        let user = UserCrate {
+            name: "rfc1156_dyn",
+            dir: "/rfc1156_dyn/",
+            root: "/rfc1156_dyn/src/main.rs",
+            files: &files,
+            edition,
+            panic: blaze_build::Panic::Unwind,
+        };
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, erased.bump()).expect("fixture names");
+        let sources = [SourceFile { path: "src/main.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let free = |name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture body {name}"))
+        };
+
+        for name in [
+            "pos1_downcast",
+            "pos1_as_lt",
+            "pos2_sub",
+            "pos2_leaf",
+            "pos3_where_self",
+            "pos4_same_bound",
+            "pos4_explicit_static",
+            "pos5_two_explicit",
+            "pos6_static_precedence",
+            "pos7_trait_alias",
+            "pos7_trait_alias_flip",
+            "pos7_trait_alias_chained",
+            "pos8_direct_alias",
+            "pos8_direct_flip",
+        ] {
+            let (types, borrows) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        // Negative 1: `Plain<'a>` has no `: 'a` bound, so `impl<'a> dyn Plain<'a>` still defaults
+        // to `+ 'static` and `x: &'b dyn Plain<'a>` fails with a lifetime/borrow error.
+        let (types, bad) = world.check_borrows(free("neg1_plain_requires_static"), alloc);
+        assert!(types.is_clean(), "neg1_plain_requires_static types: {types:?}");
+        assert!(bad.refused.is_none(), "neg1_plain_requires_static refused: {bad:?}");
+        assert!(!bad.findings.is_empty(), "neg1_plain_requires_static must fail borrowck: {bad:?}");
+
+        // Negative 2 & 3: multiple distinct `Self: 'a + 'b` bounds without an explicit object
+        // lifetime are refused as `Unlaid::ObjectDefault` (ambiguous object lifetime default).
+        for name in ["neg2_ambiguous", "neg3_transitive_ambiguous"] {
+            let (types, bad) = world.check_borrows(free(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(
+                matches!(bad.refused, Some(BorrowRefused::RegionsUnread { unlaid: Some(Unlaid::ObjectDefault), .. })),
+                "{name} must refuse with Unlaid::ObjectDefault, got: {bad:?}"
+            );
+        }
+    }
+}

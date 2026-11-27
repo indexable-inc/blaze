@@ -636,3 +636,130 @@ fn main() {}
     assert!(why.contains("Missing"), "`type Out = &S`: the impl's regions are refused as E0106: {why}");
     println!("front2_region_rules: an_impls_associated_type_value_is_laid_in_the_impls_numbering: 3 heads as the rules say, E0106 refused");
 }
+
+/// RFC 1156 ("Default trait object lifetimes"): verifies exact laid region columns (and
+/// `head_record` round-trip) for direct `Self: 'a`, `where Self: 'a`, transitive supertraits,
+/// duplicate-same bounds, explicit overrides, bare `Plain<'a>`, and ambiguous `Two<'a, 'b>`.
+#[test]
+fn rfc1156_default_trait_object_lifetime_columns() {
+    const TEXT: &str = "
+#![feature(trait_alias)]
+trait AnyLt<'a>: 'a {}
+trait Sub<'x>: AnyLt<'x> {}
+trait WhereLt<'a> where Self: 'a {}
+trait A<'a>: 'a {}
+trait B<'a>: 'a {}
+trait Both<'a>: A<'a> + B<'a> {}
+trait Plain<'a> {}
+trait Two<'a, 'b>: 'a + 'b {}
+trait StaticAndLt<'a>: 'static + 'a {}
+trait LtAndStatic<'a>: 'a + 'static {}
+trait StaticSuper: 'static {}
+trait TransStaticLast<'a, 'b>: A<'a> + B<'b> + StaticSuper {}
+trait AliasLt<'a> = AnyLt<'a>;
+trait SubAlias<'a>: AliasLt<'a> {}
+trait Flip<'x, 'y> = AnyLt<'y>;
+trait SubFlip<'a, 'b>: Flip<'a, 'b> {}
+trait Chained<'z> = Flip<'static, 'z>;
+trait SubChained<'e>: Chained<'e> {}
+trait FlipStatic<'x> = Flip<'x, 'static>;
+trait SubFlipStatic<'e>: FlipStatic<'e> {}
+fn f_direct<'a, 'e>(_: &'a dyn AnyLt<'e>) {}
+fn f_sub<'a, 'x>(_: &'a dyn Sub<'x>) {}
+fn f_where<'a, 'e>(_: &'a dyn WhereLt<'e>) {}
+fn f_both<'a, 'e>(_: &'a dyn Both<'e>) {}
+fn f_explicit<'a, 'e>(_: &'a (dyn AnyLt<'e> + 'static)) {}
+fn f_plain<'a, 'e>(_: &'a dyn Plain<'e>) {}
+fn f_two_ambig<'a, 'b>(_: &'a dyn Two<'a, 'b>) {}
+fn f_two_same<'a>(_: &'a dyn Two<'a, 'a>) {}
+fn f_static_and_lt<'a, 'e>(_: &'a dyn StaticAndLt<'e>) {}
+fn f_lt_and_static<'a, 'e>(_: &'a dyn LtAndStatic<'e>) {}
+fn f_trans_static_last<'a, 'b>(_: &'a dyn TransStaticLast<'a, 'b>) {}
+fn f_alias<'a, 'e>(_: &'a dyn SubAlias<'e>) {}
+fn f_flip<'r, 'a, 'b>(_: &'r dyn SubFlip<'a, 'b>) {}
+fn f_chained<'a, 'e>(_: &'a dyn SubChained<'e>) {}
+fn f_flip_static<'a, 'e>(_: &'a dyn SubFlipStatic<'e>) {}
+fn f_direct_alias<'r, 'e>(_: &'r dyn AliasLt<'e>) {}
+fn f_direct_flip<'r, 'a, 'b>(_: &'r dyn Flip<'a, 'b>) {}
+fn f_direct_chained<'r, 'e>(_: &'r dyn Chained<'e>) {}
+fn f_direct_flip_static<'r, 'e>(_: &'r dyn FlipStatic<'e>) {}
+fn main() {}
+";
+    let got = heads(
+        TEXT,
+        &[
+            Ask::Free("f_direct"),
+            Ask::Free("f_sub"),
+            Ask::Free("f_where"),
+            Ask::Free("f_both"),
+            Ask::Free("f_explicit"),
+            Ask::Free("f_plain"),
+            Ask::Free("f_two_ambig"),
+            Ask::Free("f_two_same"),
+            Ask::Free("f_static_and_lt"),
+            Ask::Free("f_lt_and_static"),
+            Ask::Free("f_trans_static_last"),
+            Ask::Free("f_alias"),
+            Ask::Free("f_flip"),
+            Ask::Free("f_chained"),
+            Ask::Free("f_flip_static"),
+            Ask::Free("f_direct_alias"),
+            Ask::Free("f_direct_flip"),
+            Ask::Free("f_direct_chained"),
+            Ask::Free("f_direct_flip_static"),
+        ],
+    );
+    // `&'a (dyn Tr<'e> + 'e)` -> `[P0 (&'a), P1 (dyn object lifetime), P1 (Tr<'e>)]`
+    assert_eq!(laid(&got[0], "f_direct").col, [P0, P1, P1], "direct `AnyLt<'a>: 'a` defaults object lifetime to `'e`");
+    assert_eq!(laid(&got[1], "f_sub").col, [P0, P1, P1], "transitive `Sub<'x>: AnyLt<'x>` defaults object lifetime to `'x`");
+    assert_eq!(laid(&got[2], "f_where").col, [P0, P1, P1], "`where Self: 'a` defaults object lifetime to `'e`");
+    assert_eq!(laid(&got[3], "f_both").col, [P0, P1, P1], "duplicate same bound `A<'a> + B<'a>` deduplicates to `'e`");
+    assert_eq!(laid(&got[4], "f_explicit").col, [P0, ST, P1], "explicit `+ 'static` overrides trait default");
+    assert_eq!(laid(&got[5], "f_plain").col, [P0, P0, P1], "CONTROL: `Plain<'a>` without `: 'a` uses enclosing `&'a`");
+    assert!(got[6].is_err(), "NEGATIVE: `Two<'a, 'b>: 'a + 'b` without explicit lifetime must be refused as ambiguous");
+    assert_eq!(laid(&got[7], "f_two_same").col, [P0, P0, P0, P0], "`Two<'a, 'a>` deduplicates to single bound `'a`");
+    assert_eq!(laid(&got[8], "f_static_and_lt").col, [P0, ST, P1], "`'static + 'a` resolves to `'static`");
+    assert_eq!(laid(&got[9], "f_lt_and_static").col, [P0, ST, P1], "`'a + 'static` resolves to `'static`");
+    assert_eq!(laid(&got[10], "f_trans_static_last").col, [P0, ST, P0, P1], "transitive `'static` absorbs ambiguous supertrait bounds");
+    assert_eq!(laid(&got[11], "f_alias").col, [P0, P1, P1], "trait alias `AliasLt<'a> = AnyLt<'a>` preserves `'e`");
+    assert_eq!(laid(&got[12], "f_flip").col, [P0, P2, P1, P2], "swapped trait alias `Flip<'x, 'y> = AnyLt<'y>` maps object lifetime to `'b`");
+    assert_eq!(laid(&got[13], "f_chained").col, [P0, P1, P1], "chained trait alias `Chained<'z> = Flip<'static, 'z>` resolves to `'e`");
+    assert_eq!(laid(&got[14], "f_flip_static").col, [P0, ST, P1], "trait alias passing `'static` resolves to `'static`");
+    assert_eq!(laid(&got[15], "f_direct_alias").col, [P0, P1, P1], "direct `&'r dyn AliasLt<'e>` defaults object lifetime to `'e`");
+    assert_eq!(laid(&got[16], "f_direct_flip").col, [P0, P2, P2], "direct `&'r dyn Flip<'a, 'b>` defaults object lifetime to `'b`");
+    assert_eq!(laid(&got[17], "f_direct_chained").col, [P0, P1, P1], "direct `&'r dyn Chained<'e>` defaults object lifetime to `'e`");
+    assert_eq!(laid(&got[18], "f_direct_flip_static").col, [P0, ST, ST], "direct `&'r dyn FlipStatic<'e>` defaults object lifetime to `'static`");
+
+    // Deep supertrait chain (> 64 states, e.g. 70 levels): traverses past 64 and resolves `'e`.
+    let mut deep = String::from("trait S0<'a>: 'a {}\n");
+    for i in 1..=70 {
+        deep.push_str(&format!("trait S{i}<'a>: S{}<'a> {{}}\n", i - 1));
+    }
+    deep.push_str("fn f_deep<'a, 'e>(_: &'a dyn S70<'e>) {}\nfn main() {}\n");
+    let deep_got = heads(Box::leak(deep.into_boxed_str()), &[Ask::Free("f_deep")]);
+    assert_eq!(laid(&deep_got[0], "f_deep").col, [P0, P1, P1], "70-level supertrait chain derives `'e`");
+
+    // 20-level binary lifetime fan-out (> 1,000,000 distinct `(trait, lifetime-args)` tuple states,
+    // 22 traits total): O((V + E) * S) per-parameter propagation resolves `'e` instantaneously.
+    let mut wide = String::from("trait Root<'r>: 'r {}\n");
+    let extras = |n: usize| {
+        let mut s = String::new();
+        for i in 0..n {
+            s.push_str(&format!(", 'x{i}"));
+        }
+        s
+    };
+    wide.push_str(&format!("trait D0<'r, 'a, 'b{}>: Root<'r> {{}}\n", extras(20)));
+    for k in 1..=20 {
+        let ex = extras(20 - k);
+        wide.push_str(&format!(
+            "trait D{k}<'r, 'a, 'b{ex}>: D{}<'r, 'a, 'b{ex}, 'a> + D{}<'r, 'a, 'b{ex}, 'b> {{}}\n",
+            k - 1,
+            k - 1,
+        ));
+    }
+    wide.push_str("fn f_wide<'r, 'e, 'a, 'b>(_: &'r dyn D20<'e, 'a, 'b>) {}\nfn main() {}\n");
+    let wide_got = heads(Box::leak(wide.into_boxed_str()), &[Ask::Free("f_wide")]);
+    assert_eq!(laid(&wide_got[0], "f_wide").col, [P0, P1, P1, P2, Region::Param(3)], "20-level binary fan-out (>1M tuple states) derives `'e`");
+    println!("front2_region_rules: rfc1156_default_trait_object_lifetime_columns: 21 heads verified");
+}
