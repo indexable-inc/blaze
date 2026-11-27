@@ -111,7 +111,7 @@ blaze-remote	238
 blaze-report	137
 blaze-rng	3
 blaze-run	110
-blaze-scope	934
+blaze-scope	933
 blaze-screen	13
 blaze-script	11
 blaze-sh	145

@@ -481,7 +481,9 @@ fn lexical<'w, N: Name, W: World<N>>(
         let mut i = 0;
         while let Some(krate_root) = root.macro_use(i) {
             let Some(other) = world.root_of(krate_root) else { return Err(Why::NotRead { module: krate_root, layer: Unheld::MacroUse }) };
-            if let Some((key, shapes)) = other.macro_export(name) {
+            if let Some((key, shapes)) = other.macro_export(name)
+                && shapes.in_macro_use_prelude()
+            {
                 return Ok(Def { key, kind: DefKind::Macro(shapes) });
             }
             let found = in_source(world, Def::module(krate_root), ns, name, scratch).map_err(|why| match why {
@@ -490,7 +492,7 @@ fn lexical<'w, N: Name, W: World<N>>(
                 why => why,
             })?;
             if let Some(p) = found
-                && matches!(p.def.kind, DefKind::Macro(_))
+                && matches!(p.def.kind, DefKind::Macro(shapes) if shapes.in_macro_use_prelude())
                 && visible(p.vis, chain, head.krate)
             {
                 return Ok(p.def);

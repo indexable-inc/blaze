@@ -429,7 +429,7 @@ impl<'w, 'a> RootRead<&'a str> for ValueRoot<'w, 'a> {
             ValueRoot::Dep { head, built, alloc } => {
                 let found = dep_lookup(built, head.root_module, Namespace::Macros, name, alloc)?;
                 match found.def.kind {
-                    DefKind::Macro(shapes) => Some((found.def.key, shapes)),
+                    DefKind::Macro(shapes) if shapes.in_macro_use_prelude() => Some((found.def.key, shapes)),
                     _ => None,
                 }
             }

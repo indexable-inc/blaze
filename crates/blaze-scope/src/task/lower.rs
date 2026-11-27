@@ -3054,7 +3054,7 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     };
                     (shapes, MacroBody::Macro2 { params, body }, dollar_crate)
                 };
-                self.declare(name, Namespace::Macros, key, DefKind::Macro(shape), vis);
+                self.declare(name, Namespace::Macros, key, DefKind::Macro(shape.as_macro2()), vis);
                 let src = MacroSrc { name, body, module: self.module, export: false, local_inner: false, dollar_crate };
                 self.out.macros.push((key, src));
             }
