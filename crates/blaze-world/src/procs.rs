@@ -16,7 +16,7 @@ use std::vec::Vec;
 use blaze_id::CrateItemKey;
 use blaze_manifest::lock::{Checksum, Lock, LockId, LockSource};
 #[cfg(feature = "procs-run")]
-use blaze_proc_macro::hook::{AddError, ProcMacros, Reached};
+use blaze_proc_macro::hook::{AddError, ProcMacros};
 use blaze_proc_macro::module::{ClosureError, CrateId, LockedPackages, ModuleError, Source};
 use blaze_unit_graph::Unit;
 
@@ -88,6 +88,9 @@ pub fn git_folders(modules: &Path) -> Result<BTreeMap<String, String>, ProcsErro
     };
     for entry in listed {
         let entry = entry.map_err(|error| ProcsError::Store { at: listing.clone(), error })?;
+        if entry.file_name().to_str().is_some_and(|n| n.starts_with('.')) {
+            continue;
+        }
         // A module folder without an identity file is not a git module's: only those name one.
         let Ok(identity) = std::fs::read_to_string(entry.path().join("identity")) else { continue };
         let field = |k: &str| identity.lines().find_map(|l| l.strip_prefix(k).map(str::to_string));
@@ -111,7 +114,7 @@ pub fn identify<D: AsRef<str>>(
     locked: &LockedPackages<'_, '_>,
     git_folders: &BTreeMap<String, String>,
     unit: &Unit<'_>,
-    path_files: impl FnOnce(LockId) -> Result<Option<D>, ProcsError>,
+    mut path_files: impl FnMut(LockId) -> Result<Option<D>, ProcsError>,
 ) -> Result<Result<MacroIdentity, Unidentified>, ProcsError> {
     let (package, version) = (unit.name.as_str(), unit.version.as_str());
     let named = || (package.to_string(), version.to_string());
@@ -136,7 +139,7 @@ pub fn identify<D: AsRef<str>>(
             }
         },
     };
-    let deps = match locked.closure(package, version) {
+    let deps = match locked.closure_with(package, version, &mut path_files)? {
         Ok(deps) => deps,
         Err(error) => return Ok(Err(Unidentified::Closure(error))),
     };
@@ -214,8 +217,18 @@ pub fn register_macro_crates<'u>(
             }
         };
         let added = identity.with_id(|id| {
-            let reached = Reached { name: id.name, version: id.version, source: id.source, features: id.features };
-            procs.add_reached(modules, &locked, &reached)
+            let key = blaze_proc_macro::hook::crate_key(&blaze_proc_macro::module::module_key(id));
+            match blaze_proc_macro::module::read_module(modules, id) {
+                Err(error) if !matches!(error, ModuleError::Missing { .. }) => Err(AddError {
+                    name: id.name.to_string(),
+                    version: id.version.to_string(),
+                    why: blaze_proc_macro::hook::AddWhy::Module(error),
+                }),
+                module => {
+                    procs.add_crate_from_store(modules, key, id.name, id.version, module);
+                    Ok(key)
+                }
+            }
         });
         match added {
             Ok(key) => made.keys.push((index, key)),

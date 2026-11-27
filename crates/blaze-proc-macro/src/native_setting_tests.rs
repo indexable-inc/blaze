@@ -151,6 +151,7 @@ fn setting<'s>(store: &'s Path, native: Option<NativeSetting<'s>>) -> Setting<'s
         native,
         spawn_setting: Arc::new(SpawnSetting::off()),
         files_digest: None,
+        deps_digest: None,
     }
 }
 

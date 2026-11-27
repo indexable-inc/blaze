@@ -689,6 +689,9 @@ pub(crate) struct ScriptJob<'j> {
     /// What a member's run that read the checkout gives ([`CheckoutReads`]): a hole unless its
     /// caller keeps the reads as cells.
     pub(crate) checkout: CheckoutReads,
+    /// Transitive build-dependency digest (`deps <sha256>`, rule 21) when the build script has
+    /// build-dependencies; `None` when it has none.
+    deps_digest: Option<&'j str>,
 }
 
 /// What a member build script's reads of the checkout give (engine_scripts.rs sets it).
@@ -985,7 +988,14 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(shared) => shared,
         Err(words) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true }),
     };
-    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole }))
+    let deps_digest = blaze_proc_macro::script_unit::script_deps_digest(graph, lock, script, |dep_pkg| {
+        members
+            .iter()
+            .find(|m| m.id == dep_pkg)
+            .and_then(|m| crate::macro_files::package_files_digest_in_dir(&cx, &root.read_only(), m.dir, frame))
+    })
+    .map(|hex| crate::work::held_str(&hex, jobs));
+    Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole, deps_digest }))
 }
 
 /// What a script's run gave on its worker, in `Global` (its task frame ends with it): the
@@ -1119,6 +1129,7 @@ fn run(cx: &Cx, job: &ScriptJob<'_>, scratch: &Frame, checkout: &mut crate::engi
         native,
         spawn_setting: Arc::clone(&shared.spawn),
         files_digest: files_digest.as_deref(),
+        deps_digest: job.deps_digest,
     };
     // A macro-side run is made with its row's cfg (wasm32-wasip1's atoms); a target-side run
     // with the graph's, which its row copies (and a native target-side script may run).

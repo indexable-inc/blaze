@@ -385,6 +385,56 @@ pub(crate) fn script_files_digest_in_dir(
     Some(blaze_proc_macro::module::files_digest(&mut files))
 }
 
+/// Computes the exact same package-wide `files_digest` as `blaze_proc_macro::module::package_files`
+/// through the sans-IO checkout `Dir<ReadOnly>`, used for path build-dependencies and path
+/// proc-macro dependencies (rule 21).
+pub(crate) fn package_files_digest_in_dir(
+    cx: &Cx,
+    root: &Dir<bstd::fs::ReadOnly>,
+    dir: &str,
+    frame: &Frame,
+) -> Option<String> {
+    let mut files: std::vec::Vec<(String, std::vec::Vec<u8, Global>), Global> = std::vec::Vec::new_in(Global);
+    let mut folders: std::vec::Vec<String, Global> = std::vec::Vec::new_in(Global);
+    let mut bytes = Bytes::new_in(frame, "package files digest read");
+    folders.push(String::new());
+    while let Some(rel) = folders.pop() {
+        let at = under(dir, &rel);
+        let listed = if at.is_empty() {
+            root.own_entries(cx).ok()?
+        } else {
+            let p = Path::new(&at).ok()?;
+            root.entries(cx, &p).ok()??
+        };
+        let place = if rel.is_empty() { InPackage::Root } else { InPackage::Beneath };
+        for i in 0..listed.len() {
+            let name = listed.name(i);
+            let is_dir = match listed.kind(i) {
+                EntryKind::Dir => true,
+                EntryKind::File => false,
+                _ => continue,
+            };
+            if !in_package(name.as_bytes(), is_dir, place) {
+                continue;
+            }
+            let entry = if rel.is_empty() { String::from(name) } else { std::format!("{rel}/{name}") };
+            if is_dir {
+                folders.push(entry);
+            } else {
+                let path = under(dir, &entry);
+                let Ok(p) = Path::new(&path) else { continue };
+                bytes.clear();
+                if root.read_all(cx, &p, &mut bytes).is_ok() {
+                    let mut held = std::vec::Vec::new_in(Global);
+                    held.extend_from_slice(bytes.as_slice());
+                    files.push((entry, held));
+                }
+            }
+        }
+    }
+    Some(blaze_proc_macro::module::files_digest(&mut files))
+}
+
 #[cfg(test)]
 mod stamp_tests;
 
