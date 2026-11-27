@@ -51,7 +51,10 @@ const SUBJECT_DOMAIN: &str = "blaze-cli macro crate 1";
 // "7": proc-macro module identity bumped to form 9 (`blaze proc-macro module wasm64 9`) after
 // `blaze-build` `ScopeEnd`/`TempScopeEnd` adjusted-repr fix, invalidating cached `MacroModule`
 // task records that pointed at pre-v9 wasm64 proc-macro modules.
-const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 7";
+// "8": proc-macro module identity bumped to form 10 (`blaze proc-macro module wasm64 10`) after
+// adding target-level `getrandom_backend="custom"` for `wasm64-blaze-wasip1` (Rule 21),
+// invalidating cached `MacroModule` task records that pointed at pre-v10 wasm64 modules.
+const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 8";
 const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";

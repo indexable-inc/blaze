@@ -37,7 +37,10 @@ const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 4";
 // "5": wasm build-script module lookups require `script_unit::WASM_MODULE_HEADER` (v7) after
 // `blaze-build` `ScopeEnd`/`TempScopeEnd` adjusted-repr fix, invalidating cached `MacroModule`
 // task records that pointed at pre-v7 wasm64 build-script modules.
-const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 5";
+// "6": wasm build-script module lookups require `script_unit::WASM_MODULE_HEADER` (v8) after
+// adding target-level `getrandom_backend="custom"` for `wasm64-blaze-wasip1` (Rule 21),
+// invalidating cached `MacroModule` task records that pointed at pre-v8 wasm64 modules.
+const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 6";
 const OUT_DOMAIN: &str = "blaze-cli build-script module out 2";
 
 /// The rule a lookup's failure names.
