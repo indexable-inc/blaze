@@ -6865,7 +6865,10 @@ impl<'n> Store<'n> {
         ps.extend_from_slice(outer.params);
         let mut cs = blaze_own::Vec::with_capacity_in(outer.consts.len(), alloc);
         cs.extend_from_slice(outer.consts);
-        let owner = self.locals.head(key).is_none().then(|| Self::head_owner_member(owner_lib, detail, text)).flatten();
+        let owner = match self.locals.head(key) {
+            Some(_) => self.locals.local_head_owner(names, key, text).and_then(|(twin, aligned)| Self::head_owner_member(twin, detail, aligned)),
+            None => Self::head_owner_member(owner_lib, detail, text),
+        };
         let declared = {
             let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
             own_generics(&b, &mut self.tys, outer.module, v, parent, &mut ps, &mut cs)?

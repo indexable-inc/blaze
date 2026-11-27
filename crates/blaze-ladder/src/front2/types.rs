@@ -937,18 +937,23 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// expression), and one whose type is unknown or is not `bool`, `char` or an integer
     /// ([`Why::ConstPath`] naming the text).
     fn const_value_bits(&self, env: &Env<'_>, text: &str, r: Range, ty: Option<PNode>) -> Result<u128, Why> {
-        self.const_value_bits_owned(env, text, r, ty, None)
+        let text = text.trim();
+        self.const_value_bits_owned(env, text, text, r, ty, None, None)
     }
 
+    #[expect(clippy::too_many_arguments, reason = "const value evaluation carrying original text, head owner, and substitution edits")]
     fn const_value_bits_owned(
         &self,
         env: &Env<'_>,
+        orig_source: &str,
         text: &str,
         r: Range,
         ty: Option<PNode>,
-        carried_owner: Option<(super::anon::HeadOwner, Option<super::anon::HeadSite<'n>>, blaze_own::AVec<'static, super::anon::TextEdit>)>,
+        carried_owner: Option<(super::anon::HeadOwner, Option<super::anon::HeadSite<'n>>)>,
+        carried_edits: Option<blaze_own::AVec<'static, super::anon::TextEdit>>,
     ) -> Result<u128, Why> {
         let text = text.trim();
+        let orig_source = orig_source.trim();
         let other = || Why::ConstPath(Box::from(text), r);
         let (abs, rest) = match text.strip_prefix("::") {
             Some(rest) => (true, rest),
@@ -973,16 +978,11 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // place: a checked body's constant path holds no `Self` to select an impl by. A leaf
         // refused there refuses this head, naming the leaf and the reason.
         let resolve_ty = |abs: bool, segs: &[&str]| self.resolver.path(env.module, abs, segs, Ns::Type);
-        let owner_and_edits = match carried_owner {
-            Some(triple) => Some(triple),
-            None => match (self.head_owner_of(text), self.heads.mark_alloc()) {
-                (Some((owner, site)), Some(alloc)) => Some((owner, site, blaze_own::AVec::new_in(alloc))),
-                _ => None,
-            },
-        };
+        let owner_site = carried_owner.or_else(|| self.head_owner_of(orig_source));
+        let need_edits = owner_site.is_some() || self.marks.is_some();
         blaze_mem::frame::task(blaze_mem::Tag::Parse, |frame| {
         let scratch = blaze_own::Erased::new(frame);
-        let mut qpath_edits = owner_and_edits.as_ref().and_then(|_| self.heads.mark_alloc()).map(blaze_own::AVec::new_in);
+        let mut qpath_edits = need_edits.then(|| self.heads.mark_alloc()).flatten().map(blaze_own::AVec::new_in);
         let with_values = match super::const_qpath::substitute_mapped(self.heads, &resolve_ty, text, scratch.handle(), qpath_edits.as_mut()) {
             Ok(done) => done,
             Err(super::const_qpath::Stop::Need(need)) => return Err(Why::NeedConst(need, r)),
@@ -1018,9 +1018,9 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             }
         }
         let Some(mut ask) = ty.and_then(|ty| super::anon::Ask::of(env.module, ty, text)) else { return Err(other()) };
-        if let (Some((owner, site, first_edits)), Some(alloc)) = (owner_and_edits, self.heads.mark_alloc()) {
-            let final_edits = match qpath_edits {
-                Some(second_edits) if with_values.is_some() && !second_edits.is_empty() => {
+        if let Some(alloc) = self.heads.mark_alloc() {
+            let final_edits = match (carried_edits, qpath_edits) {
+                (Some(first_edits), Some(second_edits)) if with_values.is_some() && !second_edits.is_empty() => {
                     if first_edits.is_empty() {
                         Some(second_edits)
                     } else {
@@ -1028,26 +1028,34 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         super::anon::compose_edits(&first_edits, &second_edits, &mut merged).map(|()| merged)
                     }
                 }
-                _ => Some(first_edits),
+                (None, Some(second_edits)) if with_values.is_some() => Some(second_edits),
+                (Some(first_edits), _) => Some(first_edits),
+                (None, _) => Some(blaze_own::AVec::new_in(alloc)),
             };
-            if let Some(edits) = final_edits {
+            // A macro-written head's expression is lowered with its tokens' marks (anon.rs
+            // `head_marks_with_edits`), and keyed by them (`Ask::carry_marks`): zerocopy's
+            // `{ $crate::cryptocorrosion_derive_traits!(..) }` in an impl it writes in ppv-lite86,
+            // including after inherent-constant and/or qualified-constant substitution.
+            let carried_marks = if let Some(marks) = self.marks {
+                let mark_edits = final_edits.as_deref().unwrap_or(&[]);
+                match super::anon::head_marks_with_edits(marks, orig_source, text, mark_edits, alloc, r)? {
+                    Some(rows) => Some(rows),
+                    // Not the item's text: its marks are not read here. Only a `crate` would be
+                    // misread without them (a `macro_rules!` expansion's other paths resolve at the
+                    // call site, which is the head's module): refused by name.
+                    None if super::anon::names_crate(text) => {
+                        return Err(Why::Unsupported("a `crate` path in a constant expression of a macro-written head whose text is not the item's (its tokens' marks are not read: types.rs `const_value_bits`)", r));
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if let (Some((owner, site)), Some(edits)) = (owner_site, final_edits) {
                 ask = ask.in_head_item(owner, site, edits, alloc);
             }
-        }
-        // A macro-written head's expression is lowered with its tokens' marks (anon.rs
-        // `head_marks`), and keyed by them (`Ask::carry_marks`): zerocopy's
-        // `{ $crate::cryptocorrosion_derive_traits!(..) }` in an impl it writes in ppv-lite86.
-        // Heads with no evaluator (`mark_alloc` `None`) ask nothing, so carry nothing.
-        if let (Some(marks), Some(alloc)) = (self.marks, self.heads.mark_alloc()) {
-            match super::anon::head_marks(marks, source, with_values.as_deref(), alloc, r)? {
-                Some(rows) => ask = ask.carry_marks(rows),
-                // Not the item's text: its marks are not read here. Only a `crate` would be
-                // misread without them (a `macro_rules!` expansion's other paths resolve at the
-                // call site, which is the head's module): refused by name.
-                None if super::anon::names_crate(source) => {
-                    return Err(Why::Unsupported("a `crate` path in a constant expression of a macro-written head whose text is not the item's (its tokens' marks are not read: types.rs `const_value_bits`)", r));
-                }
-                None => {}
+            if let Some(rows) = carried_marks {
+                ask = ask.carry_marks(rows);
             }
         }
         if let Some(bits) = self.heads.const_bits(ask.need) {
@@ -1106,8 +1114,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // very length; the expression goes on with each leaf's value in its place.
         let inherent_resolve = |abs: bool, segs: &[&str]| self.resolver.path(env.module, abs, segs, Ns::Type);
         let self_adt = super::const_inherent::ground_self_adt(tys.view(), env);
-        let orig_owner = self.head_owner_of(text);
-        let mut inherent_edits = orig_owner.and_then(|_| self.heads.mark_alloc()).map(blaze_own::AVec::new_in);
+        let orig_text = text;
+        let orig_owner = self.head_owner_of(orig_text);
+        let need_edits = orig_owner.is_some() || self.marks.is_some();
+        let mut inherent_edits = need_edits.then(|| self.heads.mark_alloc()).flatten().map(blaze_own::AVec::new_in);
         // The substituted text is kept in the allocator of the type table this call holds.
         let substituted = match super::const_inherent::substitute_mapped(self.heads, &inherent_resolve, self_adt, text, tys.alloc(), inherent_edits.as_mut()) {
             Ok(done) => done,
@@ -1148,17 +1158,13 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         // `_`, takes a constant item's path or an expression whose type is its own, filed
         // with its type left to the checker: anon.rs `written_ty`).
         let node = tys.view().get(ty).copied();
-        let carried_owner = match (orig_owner, inherent_edits) {
-            (Some((owner, site)), Some(edits)) => Some((owner, site, edits)),
-            _ => None,
-        };
         // An expression that names `Self` where `Self` is a ground type has a value here
         // (`[u8; size_of::<Self>()]` in `impl u16`: front2/const_open.rs, state one): its
         // anonymous constant is filed with that `Self` in scope. Every other expression is
         // read as before; one over a generic parameter is refused there by name.
         let bits = match super::const_open::ground_self(tys.view(), env, text) {
-            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, text, self_ty, self_node, self.marks, carried_owner, r)?,
-            None => self.const_value_bits_owned(env, text, r, node, carried_owner)?,
+            Some((self_ty, self_node)) => super::anon::self_value(self.heads, env.module, node, orig_text, text, self_ty, self_node, self.marks, orig_owner, inherent_edits, r)?,
+            None => self.const_value_bits_owned(env, orig_text, text, r, node, orig_owner, inherent_edits)?,
         };
         intern(tys, PNode::ConstValue { ty, bits })
     }

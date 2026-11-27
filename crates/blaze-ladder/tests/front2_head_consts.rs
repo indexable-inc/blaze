@@ -1641,3 +1641,190 @@ fn main() {}
     let where_val = consts.value(&mut r, prepared, cond_key).unwrap_or_else(|e| panic!("eval frozen MacroS where const: {e}"));
     assert_eq!(int_of(where_val), Some(1), "frozen macro `where const` must resolve `$crate::N` (5) + 2 == 7");
 }
+
+/// Round 6 P1 #1: a macro-written head constant combining `$crate::N`, an inherent constant leaf
+/// (`Self::C` or `Pair::C`), and an item-declaring block (`enum E {}`) must remap def-site hygiene
+/// marks through `inherent_edits` on BOTH the `self_value` path (`Self` remains in the expression)
+/// and the `const_value_bits_owned` path (no `Self` remains).
+#[test]
+fn macro_head_const_with_inherent_const_and_dollar_crate_preserves_hygiene() {
+    use blaze_id::CrateItemKey;
+    use blaze_ids::ContentId;
+    use blaze_scope::graph::{CrateId, Sysroot};
+    use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+
+    struct WithDep<'t> {
+        base: &'t blaze_ladder::crates::Texts<'t>,
+        dep: usize,
+        files: &'t [(String, String)],
+    }
+
+    impl<'t> SourceTexts<'t> for WithDep<'t> {
+        fn read(&self, krate: usize, path: &str) -> Option<&'t str> {
+            if krate == self.dep {
+                return self.files.iter().find(|(p, _)| p == path).map(|(_, t)| t.as_str());
+            }
+            self.base.read(krate, path)
+        }
+    }
+
+    const DEP: &str = "
+pub const N: usize = 5;
+pub trait Tag<const K: usize> {}
+#[macro_export]
+macro_rules! define_inherent_head {
+    () => {
+        pub struct Pair(pub u16);
+        impl Pair {
+            pub const C: usize = 3;
+            pub fn take_self(_: [u8; {
+                #[repr(u16)]
+                enum SelfInherentEnum { A = 0, B = 1 }
+                $crate::N + Self::C + core::mem::size_of::<Self>() + core::mem::size_of::<SelfInherentEnum>()
+            }]) {}
+        }
+        impl $crate::Tag<{
+            #[repr(u16)]
+            enum NonSelfInherentEnum { A = 0, B = 1 }
+            $crate::N + Pair::C + core::mem::size_of::<NonSelfInherentEnum>()
+        }> for Pair {}
+    };
+}
+";
+    const APP: &str = "
+pub const N: usize = 99;
+dep::define_inherent_head!();
+fn need_tag<const K: usize, T: dep::Tag<K>>() {}
+fn self_ok() { Pair::take_self([0u8; 12]); }
+fn self_bad() { Pair::take_self([0u8; 13]); }
+fn tag_ok() { need_tag::<10, Pair>(); }
+fn tag_bad() { need_tag::<11, Pair>(); }
+fn main() {}
+";
+
+    let alloc = Alloc::global();
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user_files = [("/user/src/main.rs".to_string(), APP.to_string())];
+    let dep_files = [("/dep/src/lib.rs".to_string(), DEP.to_string())];
+    let user = UserCrate { name: "user", dir: "/user/", root: "/user/src/main.rs", files: &user_files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let mut crates: Vec<CrateInput<'_>> = inputs.crates();
+    let at = |name: &str| crates.iter().position(|c| c.name == name).map(|i| CrateId(u32::try_from(i).expect("few crates")));
+    let sysroot = Sysroot { core: at("core"), alloc: at("alloc"), std: at("std"), bstd: at("bstd") };
+    let dep_at = crates.len();
+    let user_deps: [(&str, usize); 1] = [("dep", dep_at)];
+    let (cfg, crate_edition, implicit) = (crates[0].cfg, crates[0].edition, crates[0].implicit);
+    crates[0].deps = &user_deps;
+    crates.push(CrateInput {
+        name: "dep",
+        key: CrateItemKey(ContentId([0x43; 32])),
+        edition: crate_edition,
+        implicit,
+        root: "/dep/src/lib.rs",
+        shown_from: "/dep/",
+        features: &[],
+        deps: &[],
+        cfg,
+        script: None,
+    });
+    let texts = WithDep { base: &inputs.texts, dep: dep_at, files: &dep_files };
+    let names = resolve_crates(&crates, sysroot, &texts, &blaze_scope::task::Serial, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: APP }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let mut front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut store = Store::new(front.index.lang("sized"), &frame, alloc);
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let mut got = Vec::new();
+    for &n in &["self_ok", "self_bad", "tag_ok", "tag_bad"] {
+        let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, alloc).unwrap_or_else(|e| panic!("`{n}`: {e}"));
+        let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
+        let mut lens = 0;
+        let outcome = loop {
+            match lower_fn(&names, prepared, &mut front.keys, &mut store, k) {
+                Err(BodyError::Convert { why: Some(Why::NeedConst(c, _)), .. }) | Err(BodyError::Head { error: HeadError::Item(_, Why::NeedConst(c, _)), .. }) if lens < MOST_LENS => {
+                    lens += 1;
+                    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+                    if let Err(e) = eval_len(&mut records, c) {
+                        break format!("not lowered: {e}");
+                    }
+                }
+                Err(e) => break format!("not lowered: {e}"),
+                Ok(body) => {
+                    let view = body.lowered.view();
+                    let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `{n}`: {e:?}"));
+                    let scope = body.scope(&spell);
+                    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+                    break match check_body(&mut records, &body, &scope) {
+                        Ok(done) if done.diags.is_empty() => "clean".to_string(),
+                        Ok(done) => format!("diags {:?}", done.diags),
+                        Err(CheckFail::Diags { diags, .. }) => format!("diags {diags:?}"),
+                        Err(e) => format!("not checked: {e}"),
+                    };
+                }
+            }
+        };
+        got.push((n.to_string(), outcome));
+    }
+    expect("inherent const + $crate hygiene", &got, &[true, false, true, false]);
+}
+
+/// Round 6 P1 #2: local `fn`, `const`, and `static` items declared inside a function body whose
+/// heads contain item-declaring const blocks (`fn outer() { fn inner(_: [u8; { enum E {} ... }]) {} }`)
+/// retain their library-twin head owner so `E` maps to the local item's `blaze-scope` block module.
+#[test]
+fn local_fn_const_and_static_heads_with_const_blocks_resolve_local_enums() {
+    const TEXT: &str = "
+fn ok_outer() -> u8 {
+    /// Leading doc comment exercises trivia alignment between parser and nested scanner.
+    fn inner(a: [u8; {
+        #[repr(u16)]
+        enum LocalFnEnum { A = 0, B = 1 }
+        core::mem::size_of::<LocalFnEnum>()
+    }]) -> u8 {
+        a[1]
+    }
+    const LOCAL_C: [u8; {
+        #[repr(u16)]
+        enum LocalConstEnum { A = 0, B = 1 }
+        core::mem::size_of::<LocalConstEnum>()
+    }] = [1, 2];
+    static LOCAL_S: [u8; {
+        #[repr(u16)]
+        enum LocalStaticEnum { A = 0, B = 1 }
+        core::mem::size_of::<LocalStaticEnum>()
+    }] = [3, 4];
+    inner([0u8; 2]) + LOCAL_C[1] + LOCAL_S[1]
+}
+fn bad_local_fn() {
+    fn inner(_: [u8; {
+        #[repr(u16)]
+        enum BadFnEnum { A = 0, B = 1 }
+        core::mem::size_of::<BadFnEnum>()
+    }]) {}
+    inner([0u8; 3]);
+}
+fn bad_local_const() -> [u8; 3] {
+    const LOCAL_C: [u8; {
+        #[repr(u16)]
+        enum BadConstEnum { A = 0, B = 1 }
+        core::mem::size_of::<BadConstEnum>()
+    }] = [1, 2];
+    LOCAL_C
+}
+fn bad_local_static() -> &'static [u8; 3] {
+    static LOCAL_S: [u8; {
+        #[repr(u16)]
+        enum BadStaticEnum { A = 0, B = 1 }
+        core::mem::size_of::<BadStaticEnum>()
+    }] = [3, 4];
+    &LOCAL_S
+}
+fn main() {}
+";
+    let got = check_fns(TEXT, &["ok_outer", "bad_local_fn", "bad_local_const", "bad_local_static"]);
+    expect("local fn/const/static head const blocks", &got, &[true, false, false, false]);
+}

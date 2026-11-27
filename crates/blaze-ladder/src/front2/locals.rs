@@ -929,6 +929,24 @@ impl<'n> Locals<'n> {
         library_item_or_member(names, keys, item, owner, text)
     }
 
+    /// For a local `fn`, `const`, or `static` whose own text writes a block (making it an item of
+    /// its block's names-library module via `NestedItem::body_writes`), returns its names-library
+    /// twin key and the subslice of `text` aligned with that twin's scanned text (with leading
+    /// comments/whitespace adjusted to match `blaze-file-items::nested::scan`).
+    pub(super) fn local_head_owner<S: NamesSource<'n>>(&self, names: S, key: ItemKey, text: &'n str) -> Option<(LibKey, &'n str)> {
+        let h = self.heads.get(&key)?;
+        let twin = self.library_twin(names, h, text)?;
+        let stripped = strip_leading_trivia(text);
+        let aligned = if let Some(it) = names.seeded_text_of(twin) {
+            let it_lead = it.text.len().saturating_sub(strip_leading_trivia(it.text).len());
+            let text_lead = text.len().saturating_sub(stripped.len());
+            text_lead.checked_sub(it_lead).and_then(|start| text.get(start..)).unwrap_or(stripped)
+        } else {
+            stripped
+        };
+        Some((twin, aligned))
+    }
+
     /// The names library's item for the local `fn`, `const` or `static` `h` whose text is
     /// `text`: the item of the same name its block's module ([`LocalHead::names_at`]) declares
     /// itself, with the same text. The library writes a block holding such an item as a module

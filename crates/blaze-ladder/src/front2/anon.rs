@@ -564,35 +564,44 @@ fn file_marks<'n>(
 /// [`Why::NeedConst`] naming it until the driver's `eval_len` has filed and evaluated it.
 /// An expression whose type is unknown or is not `bool`, `char` or an integer is
 /// [`Why::ConstPath`] naming its text.
-#[expect(clippy::too_many_arguments, reason = "self-typed anonymous constant lookup with head owner and token marks")]
+#[expect(clippy::too_many_arguments, reason = "self-typed anonymous constant lookup with head owner, substitution edits, and token marks")]
 pub fn self_value<H: super::types::Heads + ?Sized>(
     heads: &H,
     module: LibKey,
     ty: Option<PNode>,
+    orig_source: &str,
     text: &str,
     self_ty: tc::PTy,
     self_node: PNode,
     marks: Option<TextMarks<'_>>,
-    head_owner: Option<(HeadOwner, Option<HeadSite<'_>>, AVec<'static, TextEdit>)>,
+    head_owner: Option<(HeadOwner, Option<HeadSite<'_>>)>,
+    edits: Option<AVec<'static, TextEdit>>,
     r: blaze_surface::Range,
 ) -> Result<u128, Why> {
     let source = text.trim();
     let Some(mut ask) = ty.and_then(|ty| Ask::of_self(module, ty, source, self_ty, self_node)) else { return Err(Why::ConstPath(Box::from(source), r)) };
     if let Some(alloc) = heads.mark_alloc() {
-        if let Some((owner, site, edits)) = head_owner {
-            ask = ask.in_head_item(owner, site, edits, alloc);
-        }
-        if let Some(marks) = marks {
-            match head_marks(marks, source, None, alloc, r)? {
-                Some(rows) => ask = ask.carry_marks(rows),
+        let carried_marks = if let Some(marks) = marks {
+            let mark_edits = edits.as_deref().unwrap_or(&[]);
+            match head_marks_with_edits(marks, orig_source.trim(), source, mark_edits, alloc, r)? {
+                Some(rows) => Some(rows),
                 None if names_crate(source) => {
                     return Err(Why::Unsupported(
                         "a `crate` path in a constant expression of a macro-written head whose text is not the item's (its tokens' marks are not read: anon.rs `self_value`)",
                         r,
                     ));
                 }
-                None => {}
+                None => None,
             }
+        } else {
+            None
+        };
+        if let Some((owner, site)) = head_owner {
+            let edits = edits.unwrap_or_else(|| AVec::new_in(alloc));
+            ask = ask.in_head_item(owner, site, edits, alloc);
+        }
+        if let Some(rows) = carried_marks {
+            ask = ask.carry_marks(rows);
         }
     }
     if let Some(bits) = heads.const_bits(ask.need) {
@@ -605,46 +614,43 @@ pub fn self_value<H: super::types::Heads + ?Sized>(
     if heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(Why::ConstPath(Box::from(source), r)) }
 }
 
-/// The token marks of a HEAD's constant expression `source` (a slice of the text `marks` are
-/// of: a head a macro wrote), each at its place in `asked`, the text the constant is asked
-/// with: `source` itself, or `source` with every qualified constant leaf replaced by its
-/// value ([`super::const_qpath::substitute`]; a leaf's own marks go with it, its value being a
-/// literal). Rust's rule: a path in the expression resolves where ITS tokens' hygiene says
-/// (the Reference, "Macros By Example", "Hygiene": `$crate` "refers to the crate defining the
-/// macro"), so the constant made of it is lowered with them as a body's is
-/// ([`Ask::carry_marks`]). zerocopy's `cryptocorrosion_derive_traits!` writes `(): PaddingFree<
-/// Self, { $crate::cryptocorrosion_derive_traits!(@struct_padding_check ..) }>` into an impl
-/// it expands in ppv-lite86; without them `crate` named ppv-lite86 (tempo t1500, rand_chacha
-/// `refill_wide_impl`: "segment 0: not found"). `Ok(None)`: `source` is no slice of the marks'
-/// text (a type macro's expansion lowered inside the head's view, or a text the inherent
-/// leaves rewrote: `Builder::const_term`), whose marks this does not hold; the caller decides.
-/// An `asked` that does not follow from `source` leaf by leaf is refused by name.
-pub(super) fn head_marks(
+/// The token marks of a HEAD's constant expression `orig` (a slice of the text `marks` are
+/// of: a head a macro wrote), remapped to their positions in `asked` through the sorted,
+/// non-overlapping substitution `edits` (from inherent associated-constant substitution,
+/// qualified associated-constant substitution, or their composition via [`compose_edits`];
+/// marks inside a replaced leaf are dropped with the leaf since its replacement is a literal).
+/// `Ok(None)`: `orig` is not a slice of `marks`'s text (e.g. a type macro's expansion lowered
+/// inside the head's view), or `edits` is empty while `orig != asked`; the caller decides.
+pub(super) fn head_marks_with_edits(
     marks: blaze_scope::crate_roots::TextMarks<'_>,
-    source: &str,
-    asked: Option<&str>,
+    orig: &str,
+    asked: &str,
+    edits: &[TextEdit],
     alloc: Alloc<'static>,
     r: blaze_surface::Range,
 ) -> Result<Option<AVec<'static, (u32, TextMark)>>, Why> {
-    let Ok(item) = blaze_lower::mark_site::ItemMarks::of(source, marks) else { return Ok(None) };
+    let Ok(item) = blaze_lower::mark_site::ItemMarks::of(orig, marks) else { return Ok(None) };
     let mut rows = AVec::new_in(alloc);
-    let Some(asked) = asked else {
+    if edits.is_empty() {
+        if orig != asked {
+            return Ok(None);
+        }
         for row in item.marked() {
             rows.push(row);
         }
         return Ok(Some(rows));
-    };
-    let off = |why: &'static str| Why::Program(format!("a marked constant expression `{source}` asked as `{asked}`: {why}").into_boxed_str(), r);
+    }
+    let off = |why: &'static str| Why::Program(format!("a marked constant expression `{orig}` asked as `{asked}`: {why}").into_boxed_str(), r);
     let at = |i: usize| u32::try_from(i).map_err(|_| off("past 4 GiB"));
     let mut marked = item.marked().peekable();
-    // Copies `source[from..to]`, found at `asked[out..]`, with its marks.
+    // Copies `orig[from..to]`, found at `asked[out..]`, with its marks.
     let mut copy = |from: usize, to: usize, out: usize, rows: &mut AVec<'static, (u32, TextMark)>| -> Result<usize, Why> {
-        let seg = source.get(from..to).ok_or_else(|| off("a leaf off a char boundary"))?;
+        let seg = orig.get(from..to).ok_or_else(|| off("a leaf off a char boundary"))?;
         if !asked.get(out..).is_some_and(|rest| rest.starts_with(seg)) {
             return Err(off("the text between two leaves is not copied"));
         }
         while let Some(&(start, mark)) = marked.peek() {
-            let s = start as usize;
+            let s = usize::try_from(start).map_err(|_| off("past 4 GiB"))?;
             if s >= to {
                 break;
             }
@@ -655,14 +661,24 @@ pub(super) fn head_marks(
         }
         Ok(out + seg.len())
     };
-    let (mut from, mut out) = (0usize, 0usize);
-    for leaf in super::const_qpath::Leaves::of(source) {
-        out = copy(from, leaf.start, out, &mut rows)?;
-        out += literal_len(asked.get(out..).unwrap_or("")).ok_or_else(|| off("a leaf's value is no literal"))?;
-        from = leaf.end;
+    let (mut orig_at, mut sub_at) = (0usize, 0usize);
+    for edit in edits {
+        let o_s = usize::try_from(edit.orig_start).map_err(|_| off("past 4 GiB"))?;
+        let o_e = usize::try_from(edit.orig_end).map_err(|_| off("past 4 GiB"))?;
+        let s_s = usize::try_from(edit.sub_start).map_err(|_| off("past 4 GiB"))?;
+        let s_e = usize::try_from(edit.sub_end).map_err(|_| off("past 4 GiB"))?;
+        if o_s < orig_at || o_e < o_s || s_s < sub_at || s_e < s_s {
+            return Err(off("substitution edits are out of order"));
+        }
+        sub_at = copy(orig_at, o_s, sub_at, &mut rows)?;
+        if sub_at != s_s {
+            return Err(off("substitution edit start disagrees with copied text"));
+        }
+        orig_at = o_e;
+        sub_at = s_e;
     }
-    out = copy(from, source.len(), out, &mut rows)?;
-    if out != asked.len() {
+    sub_at = copy(orig_at, orig.len(), sub_at, &mut rows)?;
+    if sub_at != asked.len() {
         return Err(off("text past the last leaf"));
     }
     Ok(Some(rows))
@@ -682,21 +698,6 @@ pub(super) fn names_crate(text: &str) -> bool {
         from = e;
     }
     false
-}
-
-/// The length of the literal `text` starts with, as [`super::const_qpath::push_literal`]
-/// writes one: `true`/`false` or digits with a suffix (one word), `'\u{..}'`, or a negative
-/// integer `(-N - 1T)`.
-fn literal_len(text: &str) -> Option<usize> {
-    let b = text.as_bytes();
-    match *b.first()? {
-        b'(' => text.find(')').map(|i| i + 1),
-        b'\'' => text.find("}'").map(|i| i + 2),
-        _ => {
-            let n = b.iter().take_while(|c| c.is_ascii_alphanumeric() || **c == b'_').count();
-            (n > 0).then_some(n)
-        }
-    }
 }
 
 /// A body's anonymous constant is required. Return its bits or ask the driver
