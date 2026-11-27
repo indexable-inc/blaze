@@ -333,3 +333,45 @@ fn an_inline_replay_finds_a_vtables_datum_through_its_carrier() {
     assert_eq!(two.bytes, one.bytes, "run 2 sent other records than run 1");
     std::println!("run bytes replay: a vtable's datum found through its carrier, nothing built");
 }
+
+/// Asserts: `run_bytes::pointer` keys datum pointers by `ENTRY_FORM` (rule 21), so a store
+/// carrying a pointer written by another `blaze` with a different `ENTRY_FORM` (or the legacy
+/// unversioned 32-byte key) never collides with or poisons this `blaze`'s replay lookup.
+#[test]
+fn datum_pointer_keys_isolate_entry_forms() {
+    use blaze_ladder::code_records::{CodeClass, CodeKey, CodeStore, ENTRY_FORM};
+
+    let record = [0x42u8; 32];
+    for domain in [crate::run_bytes::RECORD_OF, crate::run_bytes::VTABLE_OF] {
+        let current = crate::run_bytes::pointer(domain, &record);
+        let prev = crate::run_bytes::pointer_for_form(domain, &record, ENTRY_FORM.wrapping_sub(1));
+        let next = crate::run_bytes::pointer_for_form(domain, &record, ENTRY_FORM.wrapping_add(1));
+        let legacy = CodeKey(blaze_ids::ContentId::of(domain, &record));
+        assert_ne!(current, prev, "current ENTRY_FORM collided with previous ENTRY_FORM");
+        assert_ne!(current, next, "current ENTRY_FORM collided with next ENTRY_FORM");
+        assert_ne!(current, legacy, "current ENTRY_FORM collided with legacy unversioned pointer");
+    }
+
+    // Even if the store holds a malformed/other-form entry under the previous ENTRY_FORM's
+    // pointer key for the same datum bytes, `ahead` misses cleanly rather than reading it.
+    let frame = bstd::mem::Frame::with_reserve(1 << 22, bstd::mem::Tag::Other).expect("the test's frame");
+    let erased = blaze_own::Erased::new(&frame);
+    let alloc = erased.handle();
+    let (calls, starts) = (Cell::new(0), Cell::new(0));
+    let toy = || ToyFront { calls: &calls, starts: &starts, clean: true, root: DYN };
+    let mut store = MemoryStore::new_in(alloc);
+    let datum = W.to_le_bytes();
+    let id = blaze_blake3::hash(&datum);
+    let other_form_target = CodeKey(blaze_ids::ContentId::of("other-form entry", b"bogus"));
+    store.put(CodeClass::Program, other_form_target, b"not-a-valid-entry").expect("put");
+    for domain in [crate::run_bytes::RECORD_OF, crate::run_bytes::VTABLE_OF] {
+        let old_ptr = crate::run_bytes::pointer_for_form(domain, &id, ENTRY_FORM.wrapping_sub(1));
+        store.point(CodeClass::Program, old_ptr, other_form_target).expect("point old form");
+        let legacy_ptr = CodeKey(blaze_ids::ContentId::of(domain, &id));
+        store.point(CodeClass::Program, legacy_ptr, other_form_target).expect("point legacy");
+    }
+    let mut bytes_folder = RunBytes::new(alloc);
+    let front = toy();
+    let found = bytes_folder.ahead(symbol_of(DYN), &RecordId(id), None, &front, &store).expect("other-form pointer must not fail ahead");
+    assert!(!found, "other-form pointer must not be treated as a hit");
+}

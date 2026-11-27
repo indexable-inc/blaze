@@ -31,7 +31,7 @@ use core::fmt;
 
 use blaze_hash::{ByHash, ByHashSet};
 use blaze_ids::ContentId;
-use blaze_ladder::code_records::{CodeClass, CodeKey, CodeStore, EntryError, StoreError, entry_of};
+use blaze_ladder::code_records::{CodeClass, CodeKey, CodeStore, ENTRY_FORM, EntryError, StoreError, entry_of};
 use blaze_launch::wire::RecordId;
 use blaze_launch::wire::run::{BYTES_RECORD_MOST, Symbol};
 use blaze_own::{AVec, Alloc, Vec};
@@ -39,15 +39,26 @@ use blaze_own::{AVec, Alloc, Vec};
 use crate::run_parent::{Folder, Front, ParentError, RecordsDir};
 
 /// The pointer domain of a datum that is its entry's own record (a static's datum).
-const RECORD_OF: &str = "blaze-cli run record by id: the entry's own record 1";
+pub(crate) const RECORD_OF: &str = "blaze-cli run record by id: the entry's own record 1";
 /// The pointer domain of a datum that is one of its entry's vtables (code_records.rs form 6).
-const VTABLE_OF: &str = "blaze-cli run record by id: a vtable the entry carries 1";
+pub(crate) const VTABLE_OF: &str = "blaze-cli run record by id: a vtable the entry carries 1";
 
 /// The store key of the pointer from datum `record` (its BLAKE3) to an entry carrying it, in
-/// `domain`. The id names the bytes exactly, so any entry it points to carries equal bytes
-/// (rule 21); nothing of the machine is in it (rule 25).
-fn pointer(domain: &'static str, record: &[u8; 32]) -> CodeKey {
-    CodeKey(ContentId::of(domain, record))
+/// `domain` for code-record format [`ENTRY_FORM`]. The id names the bytes exactly, so any entry
+/// of the same [`ENTRY_FORM`] it points to carries equal bytes (rule 21); including `ENTRY_FORM`
+/// ensures an upgrade or downgrade between `blaze` builds with different entry formats never
+/// resolves a datum pointer to an entry this build cannot read; nothing of the machine is in it
+/// (rule 25).
+pub(crate) fn pointer(domain: &'static str, record: &[u8; 32]) -> CodeKey {
+    pointer_for_form(domain, record, ENTRY_FORM)
+}
+
+/// [`pointer`] parameterized by `entry_form` so tests can verify cross-form key isolation.
+pub(crate) fn pointer_for_form(domain: &'static str, record: &[u8; 32], entry_form: u32) -> CodeKey {
+    let mut bytes = [0u8; 36];
+    bytes[..32].copy_from_slice(record);
+    bytes[32..].copy_from_slice(&entry_form.to_le_bytes());
+    CodeKey(ContentId::of(domain, &bytes))
 }
 
 /// Where a record's bytes are kept past this run, told to [`Folder::kept`] after it was filed.
