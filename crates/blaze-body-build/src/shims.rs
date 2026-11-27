@@ -938,15 +938,25 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
     fn emit_one_step(&mut self, step: DropStep, unwinding: bool) -> Result<Option<blaze_lir::Block>, BuildError> {
         match step {
             DropStep::DropImpl { instance, p, meta, may_unwind } => {
+                let site_item = self.adts.lang_fn("drop_in_place").unwrap_or(instance.item);
+                let loc = self.def_site_caller_arg(instance, site_item)?;
                 let r = self.func_ref(instance);
-                match meta {
-                    None => {
+                match (meta, loc) {
+                    (None, None) => {
                         let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
                         self.emit_void_call(ShimTarget::Direct(r), sig, &[p], may_unwind, unwinding)
                     }
-                    Some((m, mty)) => {
+                    (None, Some(loc)) => {
+                        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+                        self.emit_void_call(ShimTarget::Direct(r), sig, &[p, loc], may_unwind, unwinding)
+                    }
+                    (Some((m, mty)), None) => {
                         let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(mty)], &[]);
                         self.emit_void_call(ShimTarget::Direct(r), sig, &[p, m], may_unwind, unwinding)
+                    }
+                    (Some((m, mty)), Some(loc)) => {
+                        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(mty), Param::of(Ty::PTR)], &[]);
+                        self.emit_void_call(ShimTarget::Direct(r), sig, &[p, m, loc], may_unwind, unwinding)
                     }
                 }
             }

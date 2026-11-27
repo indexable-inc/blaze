@@ -1167,6 +1167,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         closure_sig: PTy,
         closure_env: PTy,
         panic: Panic,
+        tracked_drop: bool,
     }
 
     impl LayoutFacts for ShimWorld {
@@ -1223,7 +1224,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         }
         fn location_adt(&self) -> Option<ItemKey> { Some(LOC_ADT) }
         fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Result<Option<bool>, blaze_build::BuildError> {
-            Ok(Some(inst.item == TRACKED_FN))
+            Ok(Some(inst.item == TRACKED_FN || (self.tracked_drop && inst.item == DROP_IMPL_FN)))
         }
         fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
             Ok(blaze_build::CallerSite { file: "shims.rs", item, offset: 7 })
@@ -1242,7 +1243,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
     let cenv_list = at.intern_list(&[drop_adt_t]).unwrap();
     let closure_env = at.intern(PNode::Tuple(cenv_list)).unwrap();
 
-    let w_unwind = ShimWorld {
+    let mut w_unwind = ShimWorld {
         adt_tys: at,
         drop_fields: [Field { name: Name::of("x"), ty: u32_t }],
         drop_variants: [Variant { key: ADT_DROP, name: Name::of("Droppable"), fields: List { start: 0, len: 1 }, ctor: CtorKind::Braces }],
@@ -1264,6 +1265,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         closure_sig,
         closure_env,
         panic: Panic::Unwind,
+        tracked_drop: false,
     };
 
     // 1. `build_drop_glue`: struct with two droppable fields (unwind ladder), enum, slice, and plain ZST/Copy.
@@ -1281,6 +1283,16 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
 
         let b_drop = build_drop_glue(&mut Subst { args: &[g_drop], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
         assert!(b_drop.refs.iter().any(|r| r.item == DROP_IMPL_FN), "ADT_DROP glue must call Drop::drop");
+
+        w_unwind.tracked_drop = true;
+        let b_tracked_drop = build_drop_glue(&mut Subst { args: &[g_drop], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        w_unwind.tracked_drop = false;
+        assert!(b_tracked_drop.refs.iter().any(|r| r.item == DROP_IMPL_FN), "tracked ADT_DROP glue must call Drop::drop");
+        let lir_tracked_drop = printed(&b_tracked_drop);
+        assert!(
+            !b_tracked_drop.func.view().datas.is_empty() && lir_tracked_drop.contains("(ptr, ptr)"),
+            "tracked Drop::drop glue must materialize Location and pass (ptr, ptr):\n{lir_tracked_drop}"
+        );
 
         let b_wrap = build_drop_glue(&mut Subst { args: &[g_wrap], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
         let lir_wrap = printed(&b_wrap);

@@ -378,3 +378,80 @@ fn test_report_shim_builds_for_exit_code_sret_and_never() {
     blaze_lir::verify(built_never.func.view()).expect("test_never report shim verifies");
     assert_eq!(built_never.refs.as_slice(), &[Instance { item: test_never, args: List::EMPTY }]);
 }
+
+/// `build_drop_glue` calling a `#[track_caller]` `Drop::drop` impl passes a `Location` row of
+/// `drop_in_place`'s definition site (`Adts::def_site`) as the hidden last parameter (matching
+/// rustc's `build_drop_shim`), while keeping `drop_in_place`'s own signature as `(ptr) -> ()`.
+/// Untracked `Drop::drop` passes no location; missing `def_site` refuses by name.
+#[test]
+fn drop_glue_passes_def_site_to_tracked_drop_impl() {
+    let alloc = blaze_own::testing::heap().alloc();
+    const DROP_SITE: crate::CallerSite<'static> =
+        crate::CallerSite { file: "core/src/ptr/mod.rs", item: DROP_IN_PLACE, offset: 42 };
+
+    let build_glue = |tracked: bool, site: bool| -> Result<Built<blaze_own::Alloc<'static>>, crate::BuildError> {
+        let mut w = TestWorld::new();
+        let loc_key = ItemKey(29);
+        let str_ref = w.ref_(Mutbl::Not, PNode::Str);
+        w.strukt(loc_key.0, "Location", &[("filename", str_ref), ("line", U32), ("col", U32)]);
+        w.location = Some(loc_key);
+        let g_node = g_world(&mut w);
+        let g_ref = w.ref_(Mutbl::Mut, g_node);
+        w.func(G_DROP.0, "g_drop", &[g_ref], UNIT);
+        if tracked {
+            w.tracked.push(G_DROP);
+        }
+        w.def_site = site.then_some(DROP_SITE);
+
+        let mut gb = BodyBuf::new();
+        let p = gb.bind("p");
+        gb.params.push(p);
+        let root = gb.block(&[], None);
+        let view = gb.view(DROP_IN_PLACE, root);
+        let mut ty = InferCtx::new_in(alloc);
+        let checked = match blaze_typeck::check(&view, &w, &mut ty, &Needs::new_in(alloc), alloc) {
+            Ok(Outcome::Done(c)) => c,
+            Ok(Outcome::Need(n)) => panic!("check needed {:?}", n.questions),
+            Err(error) => panic!("check failed: {error:?}"),
+        };
+        let sig = w.sig(DROP_IN_PLACE).expect("drop_in_place sig");
+        let mut ground = PortableTys::new_in(alloc);
+        let g = ground.intern(g_node).expect("intern G");
+        let mut subst = Subst { args: &[g], ground: &mut ground, scratch: alloc };
+        let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, alloc)?;
+        blaze_lir::verify(built.func.view()).unwrap_or_else(|e| panic!("does not verify: {e}"));
+        Ok(built)
+    };
+
+    // 1. Tracked `Drop::drop` with `def_site`: own sig `(ptr) -> ()`, calls `Drop::drop` with `(ptr, ptr) -> ()`.
+    let built = build_glue(true, true).unwrap_or_else(|e| panic!("tracked drop_glue failed: {e}"));
+    let view = built.func.view();
+    let text = blaze_lir::print(view);
+    assert!(has_own_sig(view, &[Ty::PTR], &[]), "drop_in_place takes no hidden location: {text}");
+    assert!(has_direct_call_sig(view, &[Ty::PTR, Ty::PTR], &[]), "drop_glue passes location last to tracked Drop::drop: {text}");
+    let mut rows = blaze_own::Vec::new_in(alloc);
+    for d in (0..view.datas.len() as u32).map(blaze_lir::func::DataId) {
+        if !view.data_positions_of(d).is_empty() {
+            rows.push(d);
+        }
+    }
+    assert_eq!(rows.len(), 1, "one `Location` row: {text}");
+    let positions = view.data_positions_of(rows[0]);
+    assert_eq!(positions.len(), 2, "a line and a column: {text}");
+    for p in positions {
+        assert_eq!((p.item_key(), p.site), (DROP_SITE.item.0, DROP_SITE.offset), "drop_in_place def site: {text}");
+        let bytes = view.data_bytes_of(rows[0]);
+        assert_eq!(&bytes[p.offset as usize..p.offset as usize + 4], &[0; 4], "no absolute line or column: {text}");
+    }
+
+    // 2. Untracked `Drop::drop`: calls with `(ptr) -> ()` and makes no `Location` row.
+    let plain = build_glue(false, true).unwrap_or_else(|e| panic!("untracked drop_glue failed: {e}"));
+    let ptext = blaze_lir::print(plain.func.view());
+    assert!(has_direct_call_sig(plain.func.view(), &[Ty::PTR], &[]), "{ptext}");
+    assert!(!has_direct_call_sig(plain.func.view(), &[Ty::PTR, Ty::PTR], &[]), "untracked Drop::drop takes no location: {ptext}");
+    assert!(plain.func.view().datas.is_empty(), "no Location row for untracked Drop::drop: {ptext}");
+
+    // 3. Tracked `Drop::drop` with no `def_site`: refused by name.
+    let Err(refused) = build_glue(true, false) else { panic!("tracked drop_glue without def_site must be refused") };
+    assert!(format!("{refused}").contains("`Adts::def_site`"), "{refused}");
+}

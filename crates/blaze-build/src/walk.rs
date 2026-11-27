@@ -2545,13 +2545,22 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     }
 
     /// A drop call of `instance`, a fn of one pointer parameter and no result, with `p`: plain,
-    /// or an `invoke` when an unwind ladder says so (walk/unwind_ladder.rs `drop_call`).
+    /// or an `invoke` when an unwind ladder says so (walk/unwind_ladder.rs `drop_call`). Passes
+    /// the hidden `&'static Location<'static>` last when `instance` is `#[track_caller]`.
     fn call_ptr(&mut self, instance: Instance, p: Value) -> Result<(), BuildError> {
-        // A tracked `Drop::drop` has no call expression to be the place: refused by name.
-        let (sig, values) = self.lang_call_sig(None, instance, &[Param::of(Ty::PTR)], &[p])?;
+        let loc = self.drop_caller_arg(instance)?;
         let place = self.ref_place(instance);
         let reference = self.b.reference(RefKind::Func, place);
-        self.drop_call(Callee::Direct(reference), sig, &values)
+        match loc {
+            Some(loc) => {
+                let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+                self.drop_call(Callee::Direct(reference), sig, &[p, loc])
+            }
+            None => {
+                let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+                self.drop_call(Callee::Direct(reference), sig, &[p])
+            }
+        }
     }
 
     /// Binding `p`, just bound (`init`) or declared without a value, joins the innermost drop
