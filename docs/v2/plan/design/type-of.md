@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: "`type_of!(desc)`, a type computed by const code (row Q7 of sql.md; phase 3 of comptime.md). A description is a value of core's `reflect::TypeDesc`; `type_of!` names `<Described<'a, {desc}, Args> as TypeOf>::Type`, an associated type the trait solver normalizes by reading the description's value tree. No new syntax, no new kind of type: a described record is core's `Record`, so identity is by the description's value. blaze-sql's checker runs in a `const static` block and returns a description; a SQL error is the block's panic."
+summary: "`type_of!(desc)`, a type computed by const code (row Q7 of sql.md; phase 3 of comptime.md). A description is a value of core's `reflect::TypeDesc`; `type_of!` names `<Described<'a, {desc}, Args> as TypeOf>::Type`, an associated type the trait solver normalizes by reading the description's value tree. No new syntax, no new kind of type: a described record is core's `Record`, so identity is by the description's value. blaze-sql's checker runs in a `const static` block and returns a description; a SQL error is the block's panic. Built: core's items and the vendored solver's candidates; blaze-solve and blaze-typeck do not read them, so no `type_of!` use checks yet."
 date: 2026-11-13
 ---
 # `type_of!`: a type from a const value
@@ -31,6 +31,7 @@ no `TypeRef` variant: a macro in type position and a const argument are Rust alr
 
 ## Ergonomic v2 `TypeDesc` (`blaze-ty::type_desc`)
 
+Built, not wired: only its own tests use `TypeDescArena`, and core's `TypeDesc` has no `of`.
 Passing concrete types out-of-band in `; String` and indexing them via positional `Arg(0)` /
 numeric `FieldOf(&FieldOf(&Arg(0), t), c)` is brittle when struct fields move. In `blaze-ty`,
 `TypeDescArena` replaces positional indirection with:
@@ -90,13 +91,12 @@ the `const static` block runs blaze-sql's checker with no const checking (non-co
   past its fields, two record fields of one name, an empty name or one with `,`, `str` or a
   `Slice` anywhere but directly under `Ref`, `ArgOf` past the ADT's type arguments, a
   `TypeDesc` value the reader does not know): the trait goal fails, so the use is
-  the unmet bound `Described<..>: TypeOf`. Built. Wanted: its own diagnostic naming the variant
+  the unmet bound `Described<..>: TypeOf` (the vendored solver's candidate). Wanted: its own diagnostic naming the variant
   and the path into the description (`Record[2].ty: Arg(3) past 2 types`); not built.
 - A SQL error: the checker panics with its message in the block, so const eval fails at the
   block and the error carries the panic message (E0080) at the `type_of!` use. Not tested.
-- A cycle (a description whose evaluation needs its own `type_of!`): blaze-query's cycle
-  between `anon_const_eval` and type lowering. Wanted: a typed error naming the alias and the
-  constant; not built, and what the cycle reports today is not checked.
+- A cycle (a description whose evaluation needs its own `type_of!`): a typed error naming the
+  alias and the constant. Not built.
 
 ## What blaze-sql needs from the evaluator
 
@@ -117,21 +117,20 @@ a `const static` block:
 ## Floor and cost
 
 Floor per use: evaluate `D` once (the checker over the text: linear in the text and the tables
-it names) and build the result type once. Cost: `D` is an anonymous constant cached by
-blaze-query (one evaluation per distinct text and schema), the read is one walk of its value
+it names) and build the result type once. Cost: `D` is an anonymous constant, cached
+(one evaluation per distinct text and schema), the read is one walk of its value
 tree per normalization, and the result type is interned, so a second use of the same query
 costs one normalization lookup. A table's struct edited reruns the anon const of each query
 whose evaluation read that table's reflected fields, and nothing else.
 
-## Built (2026-11-13), and where the code stops
+## Built, and where the code stops
 
 - core: `TypeDesc`, `FieldDesc`, `Prim`, `Described`, `TypeOf`, `type_of!`
   (library/core/src/reflect.rs).
 - Lang items `blaze_described`, `blaze_type_of`, `blaze_type_of_type`; solver items
   `ReflectTypeOf`, `ReflectTypeOfType`; the trait and normalizes-to candidates
-  (vendor/rustc_next_trait_solver/src/solve/{reflect,trait_goals,normalizes_to}.rs); the
-  interner's `reflect_described_desc` and `reflect_type_of`; the reading,
-  crates/hir-ty/src/type_of.rs.
-- Tests: crates/hir-ty/src/tests/type_of.rs.
-- Stops at: the own diagnostic for a refused description, the cycle error, blaze-sql's
-  `desc_of`, and the typed surface (`query::<Q>`), which is row Q7's check.
+  (vendor/rustc_next_trait_solver/src/solve/{reflect,trait_goals,normalizes_to}.rs), which call
+  the interner's `reflect_described_desc` and `reflect_type_of`; no interner implements them.
+- Not built: the `Described`/`TypeOf` candidates in blaze-solve and the checker's use of them,
+  the own diagnostic for a refused description, the cycle error, blaze-sql's `desc_of`, and the
+  typed surface (`query::<Q>`), which is row Q7's check.

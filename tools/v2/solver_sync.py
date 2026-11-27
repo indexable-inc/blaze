@@ -2,7 +2,7 @@
 `vendor/rustc_next_trait_solver`, `vendor/rustc_type_ir_macros`, `vendor/rustc_transmute` and
 `vendor/rustc_parse_format` become rust-lang/rust's `compiler/<crate>` at that nightly's rustc
 commit, with blaze's patch series (`vendor/<crate>/PATCHES.md`) replayed on top
-(`docs/v2/plan/design/compile-time.md`, change 18). `harness/toolchain_bump.py` runs it on every
+(`docs/v2/plan/design/end-state.md`, D175). `harness/toolchain_bump.py` runs it on every
 bump.
 
     python3 tools/v2/solver_sync.py '{"nightly": "nightly-2026-10-27"}'

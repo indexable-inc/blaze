@@ -1,4 +1,4 @@
-//! THE IMPL TABLES ON REAL CORE (engine.md E3, D131): the questions a real check asks, answered
+//! THE IMPL TABLES ON REAL CORE (end-state.md D157, D131): the questions a real check asks, answered
 //! alike by today's index (`ItemsIndex`: the items records' bucket section) and the impl
 //! tables (`write_impl_tables` per crate, read through blaze-impls' lookups: `TableSet`).
 //!

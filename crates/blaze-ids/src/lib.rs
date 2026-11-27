@@ -1,4 +1,4 @@
-//! blaze v2's IDs (docs/v2/plan/design/data.md section 5, "IDs, two kinds").
+//! blaze v2's IDs (docs/v2/plan/design/bottom.md section 3, "Identity and keys").
 //!
 //! - A [`ContentId`] is the BLAKE3 hash of what a thing is, under a domain that names the
 //!   kind of thing and its schema. It is the identity used in every hash, key and output.
@@ -7,8 +7,8 @@
 //!   output. It may be kept in the daemon's image, which is one run's state.
 //! - An [`Interner`] holds one arena and maps each way between the two; [`Sharded`] is the
 //!   one blaze uses.
-//! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/design/item-hash.md
-//!   section 6.2).
+//! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/design/bottom.md
+//!   section 3).
 
 // `min_specialization`: implementing `blaze_hash::PlainKey`, a specialization trait, needs it.
 #![feature(allocator_api, allocator_ext, min_specialization, portable_simd, register_tool)]
@@ -482,7 +482,7 @@ struct Line<T>(T);
 struct Shard {
     /// The one lock of `Sharded`, held only to probe again, insert into the index and claim a
     /// block of indices: O(1), never the copy of a growth, never across a call
-    /// (docs/v2/plan/design/concurrency.md), and a find never takes it. A spin lock, as
+    /// (docs/v2/plan/design/end-state.md D179), and a find never takes it. A spin lock, as
     /// nothing below this crate parks a thread.
     lock: Line<Spin<Claimed>>,
     /// How many values the shard has, written under `lock`.

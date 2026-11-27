@@ -1,4 +1,4 @@
-//! The requests in flight, as columns (docs/v2/plan/design/data.md): a slab of 32-byte [`Hot`]
+//! The requests in flight, as columns (docs/v2/plan/design/bottom.md section 13): a slab of 32-byte [`Hot`]
 //! records, what a completion reads (the kind, the tag, the progress, whose request it is),
 //! and beside it by the same slot the buffer the request lends the kernel and the [`Cold`]
 //! fields only its submission and its end read. A request is named by its slab handle, whose

@@ -1,5 +1,4 @@
-//! How many cores blaze's work runs on, and at what priority: the one home of both
-//! (docs/cargo.md, "Cores and priority").
+//! How many cores blaze's work runs on, and at what priority: the one home of both.
 //!
 //! A build sized to every core, at the priority of the terminal that started it, takes the
 //! machine from whoever sits at it: on 2026-11-03 a `blaze build --release` of blaze-engine ran

@@ -1,14 +1,14 @@
 ---
 status: plan
-summary: "`blaze run` and `blaze test` from checked bodies to a running program, with no executable written (bottom.md section 11). End state (corrected 2026-11-16): a code record per instance and tier, position-independent, every outside reference through an import word that is the run's slot word; a stub a slot until its first call, which places a known record in-process or asks the parent (`blaze run` itself) over a socket pair, the record made then if absent; one placement, one release store, every waiter woken; callees compiled behind on idle cores; dependency bundles mapped in place; a repeat places the last run's records ahead of `main` in about 5 ms. Then the gap and the pieces. Below: blaze-run's sans-IO machines (Parent, Slots, FirstCall, Heat, Tier, Registry, Tests), the run path's."
+summary: "`blaze run` and `blaze test` from checked bodies to a running program, with no executable written; `blaze build` exports one from the same records. End state (corrected 2026-11-16): a code record per instance and tier, position-independent, every outside reference through an import word that is the run's slot word; a stub a slot until its first call, which places a known record in-process or asks the parent (`blaze run` itself) over a socket pair, the record made then if absent; one placement, one release store, every waiter woken; callees compiled behind on idle cores; dependency bundles mapped in place; a repeat places the last run's records ahead of `main` in about 5 ms. Then the pieces and what of them is built. Below: blaze-run's sans-IO machines (Parent, Slots, FirstCall, Heat, Tier, Registry, Tests), the run path's."
 date: 2026-11-16
 ---
 # Run and test
 
 Andrew, 2026-11-15: no daemon; "make it exist properly all in one go"; "everything in JIT world".
-There is no `blaze build` (bottom.md section 11). The end state below is the run path, and the
-blaze-run machines after it (Parent, Slots, FirstCall) are its parts: decision R1 ("nothing on the
-run path calls them") is withdrawn. Still later: an edit applied to a program while it runs
+`blaze build` is the exporter ("Export" below); D83's "no build" does not hold. The end state below
+is the run path, and the blaze-run machines after it (Parent, Slots, FirstCall) are its parts. Still
+later: an edit applied to a program while it runs
 (blaze-launch's staged edits and gates); now an edit is a new record, published on the next run.
 
 ## End state (D113, 2026-11-16 evening: the whole run, redone)
@@ -115,7 +115,7 @@ machine (blaze-drive), not a second mechanism (rule 30); the last three are the 
 
 | Stage | hello world | 1M lines, 100k files | Today |
 |---|---|---|---|
-| blaze starts | 1.5 | 1.5 | target.md |
+| blaze starts | 1.5 | 1.5 | bottom.md |
 | sweep, nothing changed | under 0.1 | 60 serial (0.6 us a stat, measured on tempo's 870: 0.51); 2 to 8 with `StatMany` or a journal | tempo 0.51 measured |
 | certificate, one read | 2 | 2 | hello 2 to 3 measured; tempo 13 against a floor of 2 (drive.md) |
 | start to `main` (spawn 1, maps 0.3, placing behind) | about 5 | about 5 (placing is behind `main`) | 15,900 (ratio 3,000) |
@@ -169,7 +169,7 @@ stored as a common set and differences; the parent's state dropped when idle; th
 - `Code` answers `NotBuilt` in the drive: the run path's records are the ladder's own; stage 5 puts them under
   the drive's `Code` name with the key above.
 
-### The child and the parent (the corrected end state of this morning, kept; D113's stage 6)
+### The child and the parent (D113's stage 6)
 
 > Withdrawn from the architect's first draft (coordinator, 14:30): the eager build before `main`, the image bound
 > ahead of time at fixed addresses with an edit rewriting posted words, and the patched clone. Kept: record, bundles.
@@ -224,7 +224,7 @@ offers each unasked; the child places an offer at once, so a first call usually 
 a (program, request shape) and user: the certificate it ran under, then the instances first called inside the
 start window (at most 8,192 rows), each as (symbol, its code record's key then), in first-call order; equal
 to the last one, it is not written. **Repeat, nothing changed**: blaze's start 1.5 ms + certificate 2 ms
-(target.md) + spawn of the launcher 1 ms + bundle maps and binds 0.3 ms; the list's certificate is today's,
+(bottom.md) + spawn of the launcher 1 ms + bundle maps and binds 0.3 ms; the list's certificate is today's,
 so its rows are placed as they are, ahead of `main` while `main` runs (placing is not compiling): about 5 ms
 to `main`'s first instruction, 5.2 ms for hello world to finish. Floor: a linked file started after the same
 certificate, 4.5 ms: ratio 1.15. **After an edit of one body**: the forward step has dirtied the `Code` tasks
@@ -262,63 +262,46 @@ records at the optimized tier, ASLR on, one GOT, calls in reach `bl`, code by pr
 patched after an edit. **Cost to the program**: a call through a slot is a load and an indirect branch, about
 1%, up to 5% in call-bound loops (to measure on reth); calls inside a bundle and in `export` pay nothing.
 
-### Gap (read 2026-11-16, corrected end state)
+### Pieces
 
-| End state needs | Today (file: function) | Missing |
-|---|---|---|
-| 1. A child process and a parent | blaze-cli main.rs: `Effect::StartProgram` calls `program::run` in-process; ladder place.rs `Placed::call` transmutes and calls on blaze's own thread, every function compiled and bound first ("Shortcuts") | spawn the launcher with a socket pair; the parent loop carrying `Parent`'s effects as drive `Code` jobs; `Exited`, `Stop` |
-| 2. Slots made as symbols appear | blaze-run parent.rs `Parent::new(functions)`, slots.rs `Slots::new(slots)`: a fixed list before the start; run.rs `Reached::slot`: slot n is the nth reached | `FirstCall` numbers slots by symbol (written); `Parent::declare` (additive) |
-| 3. The launcher on the new path | blaze-launcher main.rs: a sidecar file and the daemon's socket; launch-rt control.rs asks `Need` once a slot (no simulation), records.rs `Loaded` is the daemon's record form | descriptor 3, the run record, `FirstCall` and `Slots` in control.rs, placement of blaze-code records |
-| 4. Placement of a code record against the run's words | blaze-code image.rs `lay_out` completes sites against a segment's own import table; `Image` binds fixed addresses (withdrawn) | blaze-code place.rs `place` (written); `Image` and its postings deleted |
-| 5. Code records in the store, keyed fully | place.rs `Body` held in memory; blaze-build instance.rs `instance_key` lacks target, tier, settings, toolchain | put and read under the drive's `Code` name; the key |
-| Reusable as built | launch-rt sys.rs (two views; measured), arch.rs (stubs, head, resolver, thunks), table.rs (`resolve`, safepoints), unwind.rs, tls.rs, threads.rs, retired.rs, waits.rs; blaze-launch wire.rs; blaze-run `Parent`, `Slots`, `Heat`, `Tier`, `Registry`; drive request.rs `Gate::Beside` with `StartProgram`/`Stop`/`Exited` | |
-| Emitter | blaze-emit record.rs `emit_record`: import sites and relro (piece sent); pass.rs refuses `Invoke`/`Resume` | landing pads, unwind word |
-| Bundles | none mapped; `lay_out(Kind::Bundle)` lays one out | the CI writer, macOS signature, binding by (bundle, offset) |
-| Run record | `Parent::warm`, `image`, `WriteImage` (a startup image) | rows in first-call order; the child places them ahead of `main` |
-| Tier-up, statics, symbolize | as the architect's gap read them (tier.rs, heat.rs without an optimizer; run.rs `static_image` in memory) | as before |
+Built: 1 (blaze-run first_call.rs, used by launch-rt run_mode.rs), 2 (blaze-code place.rs), 4 (blaze-run
+parent/declare.rs, blaze-launch wire/run.rs), 5 (launch-rt run_mode.rs), 6 (blaze-cli run_parent.rs), 7
+(blaze-cli code_store.rs), 8 (blaze-cli start_list.rs), 12 (D147 below: engine_start.rs) and 14's export
+(`blaze build`, engine_export.rs). Left: 9, 10, 13 (ladder run.rs still holds `run_program_given` and
+`build_records_new`), and tier-up: blaze-run's `heat`, `tier` and `registry` are built, not wired.
 
-### Pieces (one writer each; "||" can be written at the same time; hello world first, then the repeat)
-
-1. || `FirstCall` (NEW blaze-run first_call.rs): WRITTEN 2026-11-16, never compiled; simulation with two
-   planted bugs (`AskTwice`, `WakeBeforeStore`) in sim/first_call.rs.
-2. || `place` (NEW blaze-code place.rs): a record's code completed against the run's words at its address;
-   WRITTEN, never compiled; tests in place_tests.rs.
-3. || `blaze run` on the new front end (blaze-cli program.rs; the architect's piece 1) and `emit_record`'s
+1. `FirstCall`: simulation with two planted bugs (`AskTwice`, `WakeBeforeStore`) in sim/first_call.rs.
+2. `place`: a record's code completed against the run's words at its address; tests in place_tests.rs.
+3. `blaze run` on the new front end (blaze-cli program.rs; the architect's piece 1) and `emit_record`'s
    sites on the run path (ladder run.rs). Test: the hello-world rung's records name targets by symbol.
-4. || `Parent::declare(instance) -> SlotId` and the wire's `Need` by symbol (blaze-run parent.rs, blaze-launch
-   wire.rs, additive). Test: a published record's new callee gets a slot once, whichever asks first.
-   WRITTEN 2026-11-16, never compiled: NEW blaze-run parent/declare.rs (`declare`, `growing`, `need_symbol`,
-   `looked_named`, `compiled_named`, `Resolve`; `Effect::Declare`/`Unresolved`), NEW blaze-launch wire/run.rs
-   (the run wire, its own schema: `Up::Need` by slot or symbol, `Down::Declare`/`Publish`/`Failed`);
-   simulation sim/declare.rs with planted `DeclareTwice`, `PublishBeforeTell`. The child's `FirstCall` still
-   numbers its own slots: piece 5 makes it take the parent's `Declare` pairs.
+4. `Parent::declare(instance) -> SlotId` and the wire's `Need` by symbol (additive): the run wire has its
+   own schema (`Up::Need` by slot or symbol, `Down::Declare`/`Publish`/`Failed`); simulation sim/declare.rs
+   with planted `DeclareTwice`, `PublishBeforeTell`. Test: a published record's new callee gets a slot once,
+   whichever asks first.
 5. The launcher's run mode (blaze-launcher main.rs, launch-rt control.rs, after 1, 2, 4): descriptor 3, the
    constant stub segment, `FirstCall` and `Slots` driving sys.rs. Test: a fake parent answering from a
    directory of records runs a rung that prints.
-6. The parent (NEW blaze-cli run_parent.rs, after 4): spawn, the socket loop, `Lookup`/`Compile` as drive
+6. The parent (after 4): spawn, the socket loop, `Lookup`/`Compile` as drive
    `Code` jobs, `Stop` kills, `Exited`. Test: the hello world prints under `blaze run`, compiled on first call.
-7. || Code records in the store with the full key (blaze-build instance.rs, ladder; the architect's 6, 7).
+7. Code records in the store with the full key (blaze-build instance.rs, ladder; the architect's 6, 7).
    Test: a second run compiles 0.
 8. The run record and placement ahead of `main` (blaze-run, launch-rt, after 6, 7). Test: a repeat run asks
    the parent nothing; the profile's span from start to `main` is quoted.
-9. || The std bundle (lay_out `Bundle`, a CI writer, the macOS signature, binding by (bundle, offset)).
+9. The std bundle (lay_out `Bundle`, a CI writer, the macOS signature, binding by (bundle, offset)).
    Test: hello world's std calls never reach a stub.
 10. Compiled behind (the parent's `Callee` queue fed to idle workers, offers placed). Test: tempo's start
     waits on fewer than 5% of its first calls.
-11. || Unwinding (emitter pads, unwind word, registration before the store). Test: `catch_unwind` catches.
+11. Unwinding (emitter pads, unwind word, registration before the store). Test: `catch_unwind` catches.
 12. The gate before the start on the real path. Tests: a type error in a reached workspace body stops
     `blaze run` before the child is spawned; one in an unreached body does not (`blaze check` reports it);
     `blaze test` starts beside and holds verdicts until the check ends.
 13. Delete: ladder place.rs's in-process run, blaze-code `Image` and its postings, the launcher's sidecar.
 14. Tier-up, then `blaze export`, then symbolize and the debug object.
 
-### The cut to the lazy parent (D124, 2026-11-17 02:20; the coordinator's spec)
+### The cut to the lazy parent (D124)
 
-Measured 02:08 on tree 5ab37c9156 (release r17): hello world runs in 16.6 s, then 12.3 s on a repeat. Read in
-the code: a Rust program with std is built WHOLE in blaze's process (`run_program_given`), refused there
-(`RunError::OwnProcess`), then built whole AGAIN before the child starts (run_parent.rs `lay_out`, the eager
-walk `build_records_new` into a `MemoryStore`); every name of 79 crates is solved from source each time. None
-of that is improved: it is deleted. The parent makes nothing before the start.
+No program is built whole in blaze's process or before the child starts. The parent makes nothing before
+the start.
 
 **The parent's loop** (run_parent.rs): the child is spawned at once; each `Need` is answered by ONE step of
 the D106 record walk (body_ids.rs `Walk::one`): the instance's key from text and today's facts, found in the
@@ -333,7 +316,7 @@ its item, with the toolchain as its one fact (a coarse proof: the cut covers eve
 check); a locked dependency's body by its unit's key the same way. So std's instances are found by key on
 every run after the first, with no `BodyCheck` record needed for them.
 
-**The maker** (make_one.rs): one owned session, made on the first miss and not before, over names READ FROM
+**The maker** (ladder run.rs `make_one`): one owned session, made on the first miss and not before, over names READ FROM
 RECORDS (front2 source.rs `Records`), never `resolve_crates` over source; `member_owner` by an index.
 
 **The entry** (ladder): which process, the roots of a Rust program with std (the shim, `lang_start::<T>`,
@@ -342,45 +325,28 @@ RECORDS (front2 source.rs `Records`), never `resolve_crates` over source; `membe
 **The start list** (stage 7; NEW blaze-cli start_list.rs): written at exit under the certificate; when the
 certificate is today's its rows are published as they are before `Begin`, nothing keyed or looked up.
 
-**Every program runs in the child** (corrected 02:25, after r18 measured no change: 15.3 s, then 12.9 s). The
-owner's hello world is a blaze-edition program (`fn main(cx: &Cx, out: Out)`), whose start is bstd's hosted
-entry, and that one runs IN blaze's process today (`run_program_given`, the whole program built first): the
-12 s. The launcher refuses a hosted entry by name. So: the launcher's run mode takes `hosted:<symbol>`, makes
+**Every program runs in the child.** A blaze-edition program (`fn main(cx: &Cx, out: Out)`) starts at
+bstd's hosted entry: the launcher's run mode takes `hosted:<symbol>`, makes
 the host's world in the child (bstd `Hosting` over the child's own `Io`, its arguments, and the grants the
 command line gave, handed by the parent) and calls `bstd_hosted_start(table)`; `blaze run` routes every
-program to the child, and the in-process run (ladder place.rs, `run_program_given`) is deleted (piece 13).
+program to the child, and the in-process run (ladder place.rs, `run_program_given`) goes (piece 13).
 A program's crash, exit or stray write then cannot reach blaze's store, and there is one run path.
 
-**The gate is before the start** (stage 4; the owner, 02:24: "we need both check AND run to be fast and
-ideally run should require check happened first"). `run` asks with `Gate::Before` (the drive has it,
-simulated: sim.rs "`Before` started a program over errors"); today main.rs asks `Gate::Beside` for every
-command, and hello world runs while `check` says `main` was not checked. An error, or an item the check
-could not check, stops the run before the child is spawned, with the check's own findings. Behind the gate
-the parent takes the check as its proof: a WORKSPACE body with no clean `BodyCheck` record is refused by
-name at its first ask (never checked a second way, never built unchecked); a toolchain or dependency body
-is checked once, where its code is first made, and found by key after.
+**The gate** is D147's (below): a program starts when the check has answered, and each workspace body is
+admitted at its first call by its own facts; a toolchain or dependency body is checked once, where its code
+is first made, and found by key after. Left of this cut: piece 13's deletions (`build_records_new`,
+`run_program_given`), records read in place from store segments and the run segment, compiled-behind, the
+std bundle. Check: hello world twice in one scratch home; the second run's line reads `code records:
+reached R, found R, made 0, unkeyed 0` or names each unkeyed instance, its profile holds no check or
+resolve span, and it ends inside 100 ms (floor 5 ms: ratio to be quoted).
 
-Pieces, one writer each, all at once: G the gate (drive request.rs, cli main.rs's ask); H the hosted start in
-the child (launch-rt run_mode.rs, blaze-launcher); W `Walk::one` (ladder body_ids.rs); I `BodyIds` over the command's
-records (cli run_ids.rs); M the maker session over records (ladder make_one.rs, front2 source.rs, lazy/);
-E the entry and the special records (ladder run.rs, front2 start.rs, run_entry.rs, NEW run/special.rs);
-S the start list and the parent's `Resolve` seam (cli start_list.rs, run_parent.rs); then P, the parent's
-loop over W, I, M, E, S, and the deletions: `build_records_new`, `run_records`'s from-source front,
-`run_program_given` for a Rust program, `Needs`' prebuilt index. Not in this cut, each its own piece after:
-records read in place from store segments and the run segment (today a file a record in the records
-folder), compiled-behind, the std bundle. Checks: hello world twice in one scratch home; the second run's
-line reads `code records: reached R, found R, made 0, unkeyed 0` or names each unkeyed instance, its
-profile holds no check or resolve span, and it ends inside 100 ms (floor 5 ms: ratio to be quoted).
+### Statics in the run
 
-### Statics in the run (lane HR's spec, 2026-11-17; rule 29: the spec, then the same lane builds it)
-
-Nothing above placed a static: the launcher refused a record's `Static` target with "statics come with
-piece 8", but piece 8 is the run record. Hello world's records name statics (green 515e6f7689: "record
-8959dccaa982 names Static ee9c4409b9c9"). The Reference, "Static items": one allocation for the whole
+Built: blaze-code datum.rs, launch-rt run_mode.rs, start_list.rs. The Reference, "Static items": one allocation for the whole
 program, its initializer evaluated at compile time, never dropped; `static mut` and a type with
 `UnsafeCell` are written in place; every reference to a static is to that one allocation.
 
-- **A static is a record of its own, a DATUM** (NEW blaze-code datum.rs, `bzdata01`, the form blaze-export's
+- **A static is a record of its own, a DATUM** (blaze-code datum.rs, `bzdata01`, the form blaze-export's
   `Data` takes): its place (`ReadOnly`: immutable with no interior mutability; `Writable`; `Zeroed { len }`:
   writable and all zero, no bytes), its alignment (a power of two, at most 4 KiB), its bytes, its targets by
   (space, symbol) like a code record's (a fn's address is its entry thunk, another static's is its first
@@ -588,7 +554,7 @@ without one, and a release names a profile record by digest or uses none, so the
 give the same bytes (rule 25). The optimized tier a RUN publishes stays as it is, with nothing
 observed in its key: one record shared by every run.
 
-## Export (writer, 2026-11-16)
+## Export
 
 crates/blaze-export (`export::export`, sans-IO, bytes into a vector the command passes): green
 (integrator, tree 4213e95e5d: 9 tests pass; `export_smoke` on the Mac printed "exported file
@@ -630,10 +596,9 @@ Pieces left, one writer each:
 6. Range-extension thunks when the code passes `bl`'s 128 MiB (refused today by name).
 7. The Linux run test on blaze-vm (the facts elf.rs marks "to verify").
 
-### The export command on the rebuilt path (the coordinator's design, 2026-11-16 20:55; not built)
+### The export command
 
-Today `blaze export` answers `NotBuilt`: the exporter takes a `ProgramIn` and only its own tests and example
-make one. The command is the same request machine as `check` and `run`, with one difference: an export
+The command is `blaze build` (blaze-cli engine_export.rs). It is the same request machine as `check` and `run`, with one difference: an export
 leaves no hole, so it CLOSES the program before it writes.
 
 1. Stages 1 to 4 as `run` (sweep, certificate, forward, the gate before: the workspace bodies the program
@@ -659,36 +624,20 @@ Floors: nothing changed, 3 ms (certificate, one compare); one body edited: its c
 write of the whole file (about 25 ms a 50 MB file each for the write and the page hashes): an export is
 written whole by design, and its floor is the file's size, not the program's source.
 
-### What a run takes from the request, and the native image as a task (the coordinator's design, 21:20; not built)
+### What a run takes from the request, and the native image
 
-Found by the NATIVE plan's last piece: `blaze run` reads only the source files again (blaze-cli program.rs
-`run`); the build scripts' outputs stay inside the drive, each crate's `CrateLinks` (front2 links.rs) has
-no caller, and nothing gives the parent a native image to send. RULE: a run takes its inputs from the
-request's RECORDS, never from a second reading of the tree. Two kinds, in the same machine as the checks:
+RULE: a run takes its inputs from the request's RECORDS, never from a second reading of the tree. The
+native image (the BNL2 record) is R2 of D147 below (engine_native.rs `image_for`): keyed by the program's
+link closure, each crate's link table (from its names record) and its `Script` record, found by that key on
+a repeat, made at the first start that lacks it. A program with no C input has a real image that links
+only the system library: there is no empty case. The parent sends `Down::Native` first, with the image's
+place, then answers first calls.
 
-- `Links`, one a crate: what the crate says about C names: its `#[link]` lines, its `extern` blocks' names,
-  the items that export a C name. Keyed from the crate's outlines; its out is that table.
-- `Native`, one a program (root, target, profile): the native image (the BNL2 record). It Needs, for each
-  crate of the program's closure (the crate list record's rows), that crate's `Links` and its `Script`
-  record (the link lines and the archives a build script made). Found by key on a repeat: a hit links
-  nothing. A program with no C input has a real record that links only the system library: there is no
-  empty case.
+### Run and test read the engine's answer (D147)
 
-`StartProgram` hands the run the names of those records; the parent sends `Down::Native` first, with the
-image's place, then answers first calls. ORDER OF BUILDING: (1) `blaze run` through the parent (pieces 5
-and 6 above; it waits on the ladder's L1b); (2) `Links` and `Native` as drive kinds; (3) the parent's send
-with the launcher's half of it, one batch. Until (1) is in, the in-process run stays the path a hello world
-is debugged on, and it links nothing.
-
-### Run and test read the engine's answer (D147, the coordinator's design, 2026-11-19; not built)
-
-MEASURED, 2026-11-19, the real project tempo, `blaze test -p tempo-dkg-onchain-artifacts` (a 171-line
-crate with one test): 193 s, then 62 s warm, **no test started**. `check` is the engine
-(main.rs: `"check" | "engine-check"` go to engine_check.rs); `run` and `test` still build the OLD
-request, whose own check (per-FILE body jobs in a 64 MB frame) runs before any start. On tempo that
-check runs out of its frames in dozens of files ("frames: its region of 67108864 reserved bytes is used
-up"), checks the whole workspace to test one crate, and holds every test behind any failure anywhere.
-The engine checks the same tree in 0.2 s when nothing moved and 2.6 s after a one-body edit.
+Built: engine_check.rs `check_for_start`, engine_start.rs (main.rs's `run` and `test` arms),
+engine_run_answer.rs, engine_body_facts.rs, engine_body_record.rs, engine_native.rs with native_image.rs,
+run_ids.rs, run_names.rs, run_package.rs and test_args.rs.
 
 RULE: `run` and `test` take every fact they need from the ENGINE's stored answer. The old request is
 not built for them; when both commands pass their tests on the engine it is deleted with `check-old`.
@@ -697,7 +646,7 @@ The seams exist. run_ids.rs asks two questions of "the command's standing answer
 `trait Today` (a name's out, a cell's digest) and `trait Answer` (a named record's parts, then its
 payload). The old `Request` answers both; so do the tests' tables. The engine gets its own answers
 (rule 78: one seam, each instantiation tested equal while two exist). What each consumer needs, and
-where the engine holds it (the facts: /Volumes/Projects/blaze-lanes-1117/_evidence/run-test-facts.txt):
+where the engine holds it:
 
 | The run path needs | Old request | Engine |
 |---|---|---|
@@ -747,70 +696,13 @@ units from the engine's unit graph (made with tests, so it holds the library, bi
 The old `run` graph was made without tests: a library unit's crate key must not depend on that flag
 (to verify before piece E3; if it does, that is a key that holds too much, rule 21).
 
-PIECES, one writer each; E1 || E2, then E3; the real runs are the coordinator's:
-- **E1** the facts record: engine_bodies.rs (where the row is built), engine_check.rs (the put), a new
-  engine_body_facts.rs (the bytes, one reader). First tests: restore equals fresh in bytes (rule 26);
-  a one-body edit puts one facts record; planted: a class of `clean` for a body with an error is
-  caught by the reader's oracle test.
-- **E2** the engine's `Today` and `Answer` (a new engine_run_answer.rs) and `Answer::body` in
-  run_ids.rs. First tests: over a two-crate fixture the table built from the engine's answer holds
-  the same bodies, classes and crate rows as the one built from the old request; a body the engine
-  refused is `Incomplete`, never `Clean`.
-- **E3** main.rs's `run` and `test` arms and run_names.rs's inputs: the engine check, then the start
-  from E2's answer; the certificate is the root; the old request is no longer built for them.
-- **The judge**: hello world prints through the new path in a fresh home and replays in 10 ms the
-  second time; then `blaze test -p tempo-dkg-onchain-artifacts` runs its one test; then
-  `tempo-hardfork` (17 tests); the first failure of each is the next piece.
-- NOT in this cut: code as engine tasks and a typed body kept for codegen (D144; the parent still
-  lowers a called body itself), `run` on a pool. They make the first run fast; this makes it happen.
+Not in this design: code as engine tasks (D144's second half) and `run` on a pool.
 
-THE CONTRACT OF E3 (2026-11-19 17:40; the pieces below are written at once, against these names):
-
-```rust
-// crates/blaze-cli/src/engine_check.rs (piece R1 owns the file): the check, kept open for a start.
-/// The engine's check of the checkout, its answer printed, and what a start reads afterwards.
-pub(crate) fn check_for_start<'r>(cx: &Cx, io: &Io, out: &Out, phases: &mut Phases, heap: &'static Heap, frame: &'r Frame)
-    -> Result<Standing<'r>, CliError>;
-pub(crate) struct Standing<'r> {
-    /// The answer's root: the certificate of the start list and of the run tables.
-    pub(crate) root: ContentId,
-    /// The command's store, its puts committed.
-    pub(crate) store: /* the command's store */,
-    /// E2's answer over the stored rows and records (engine_run_answer.rs).
-    pub(crate) answer: EngineAnswer<'r, ..>,
-    /// The unit graph's row and each crate's names row, as the run's names reader takes them.
-    pub(crate) graph: Input,
-    pub(crate) names: &'r dyn Fn(Name) -> Option<Input>,   // `NamesStage::input_of`
-    /// How many errors the check printed (the summary line is already out).
-    pub(crate) errors: u32,
-}
-
-// crates/blaze-cli/src/engine_start.rs (new; piece R1): what main.rs's `run` and `test` arms call.
-pub(crate) fn run_program(cx: &Cx, standing: Standing<'_>, picked: &run_package::Program, args: ..) -> Result<Status, CliError>;
-pub(crate) fn run_tests(cx: &Cx, standing: Standing<'_>, packages: &[..], args: &test_args::Args) -> Result<Status, CliError>;
-
-// crates/blaze-cli/src/engine_native.rs (new; piece R2): the program's native image, by key.
-/// The native image (the BNL2 record native_image.rs writes) of the program whose crates are
-/// `closure`: found by its key, else made now from each crate's link facts and its build script's
-/// record and put. A program with no C input has a real image that links the system library.
-pub(crate) fn image_for(cx: &Cx, standing: &mut Standing<'_>, closure: &[CrateAt]) -> Result<Key, NativeError>;
-```
-
-- **R1** engine_check.rs (`check_for_start`), engine_start.rs, main.rs's `run`/`test` arms,
-  run_names.rs (its inputs from `Standing`, opened with the snapshot as the Bodies stage opens them).
-  The start does what `Effect::StartProgram` / `StartTests` do today with the request's parts replaced
-  by `Standing`'s; the old request is not built for these commands.
-- **R2** engine_native.rs, native_image.rs: no new stage; the image is a record keyed by its inputs
-  (the closure's crates' link facts, read from their names and outline records, and their Script
-  records' outs), made at the first start that lacks it.
-- **R3** selection: run_package.rs and test_args.rs. A command given a member's directory walks up
-  to the workspace root (today: `error[manifest-not-read] ... the root's [workspace] does not offer
-  it`); `-p` and `--bin` pick from the engine's unit graph for `run` and `test` alike.
-- **R4** the typed body is kept (D144's first half, RV3's job 4): the Bodies stage leaves, beside
+- **R4** the typed body is kept (D144's first half; built, engine_body_record.rs): the Bodies stage leaves, beside
   the facts record, the checked generic body in the flat `blaze-body` form with the portable type
   table it indexes; the parent builds a called instance from it and lowers nothing again. Files:
-  front2 tables/task.rs, blaze-body, blaze-body-lower, and a new blaze-cli engine_body_record.rs.
-  Test first: a restored body builds the same instance as the fresh one (bytes of the code record).
+  front2 tables/task.rs, blaze-body, blaze-body-lower, blaze-cli engine_body_record.rs. Test: a
+  restored body builds the same instance as the fresh one (bytes of the code record).
 
 ## Records, keys and read lists
 

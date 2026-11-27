@@ -1,4 +1,4 @@
-//! The cost of checking bodies that select impls (typeck.md, "Cost"): bodies per second on a
+//! The cost of checking bodies that select impls: bodies per second on a
 //! generic file against a stated floor (rule 67), the solver's Need rounds per body, and R, the
 //! work task restarts repeat over the total, under the three arrival orders.
 //!

@@ -1110,7 +1110,7 @@ impl<'a> Needs<'a> {
     }
 }
 
-/// A HOLE: a record that is not here YET, this round (typeck.md, "Speed on real code").
+/// A HOLE: a record that is not here YET, this round (typeck.md, "The function").
 ///
 /// The world answered `Missing` to `question`. The run records it, reads the answer's stand-in
 /// ([`Holed::hole`]) and goes on, so one round finds every record the body needs, not one.

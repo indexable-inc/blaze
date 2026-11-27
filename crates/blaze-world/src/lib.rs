@@ -1,4 +1,4 @@
-//! One world for run and check (docs/v2/plan/design/typeck.md, "Checker at scale", lane 1).
+//! One world for run and check.
 //! Tonight it holds the names library's inputs: a project's unit graph made into one
 //! [`CrateInput`] per crate, for `blaze_scope::resolve::resolve_crates`.
 //!

@@ -17,12 +17,12 @@ branch. Land small and often through a pull request: `python3 .github/scripts/la
 branch's head, which contains origin/main), waits for the merge gate, and merges once the gate
 passes and the quote still holds for the head GitHub has (`'{"follow": true}'` resumes the waiting).
 It refuses to open, resume or merge without that quote (`proof-before-merge`); the gate's compile
-and unit tests do not stand in for it, and an admin merge needs it as much as any other. Harnesses
-run after merge in the release train. Never push to main. Sessions that share main land in turns:
-before the last `git merge origin/main` and its smoke, a session tells the others it is landing,
-they hold main until it says the merge is in (or thirty minutes pass), and it then says what moved
-and which files; a quote is made once, not once per session that moved main under it. `land.py`
-waits for the checks: start it in the background and go on with other work.
+and unit tests do not stand in for it, and an admin merge needs it as much as any other. Never push
+to main. Sessions that share main land in turns: before the last `git merge origin/main` and its
+smoke, a session tells the others it is landing, they hold main until it says the merge is in (or
+thirty minutes pass), and it then says what moved and which files; a quote is made once, not once
+per session that moved main under it. `land.py` waits for the checks: start it in the background and
+go on with other work.
 
 See [docs/contributing.md#landing-a-change](../../../docs/contributing.md#landing-a-change).
 
@@ -63,11 +63,12 @@ the body and will not open, resume or merge a pull request unless `smoke '{"veri
 the quote to the head's tree, clean, with verdict ok; it asks again just before it merges, against
 the head GitHub has, and refuses when main has moved past that head. No flag skips this, and an
 admin merge needs it as much. A change to build scripts, proc macros, C dependencies or the sandbox
-also runs `harness/v2/real_smoke.py` (how-to `real-smoke`). A step that fails or times out blocks
-the merge: fix it, never run it again hoping it passes (`no-fallback`). The merge gate's compile and
-unit tests do not stand in for this, and neither does a smoke of the branch before the merge or of
-another commit. A change that builds no binary (only docs or these rules) is smoked too: an
-exemption a pull request declares for itself is the kind of stand-in this rule removes.
+also runs `harness/v2/real_smoke.py` (how-to `real-smoke`; it still copies a `blaze-engine` binary,
+which no build makes). A step that fails or times out blocks the merge: fix it, never run it again
+hoping it passes (`no-fallback`). The merge gate's compile and unit tests do not stand in for this,
+and neither does a smoke of the branch before the merge or of another commit. A change that builds
+no binary (only docs or these rules) is smoked too: an exemption a pull request declares for itself
+is the kind of stand-in this rule removes.
 
 See [docs/contributing.md#landing-a-change](../../../docs/contributing.md#landing-a-change).
 
@@ -98,13 +99,12 @@ What `proof-before-merge` asks, step by step:
 From [docs/contributing.md#landing-a-change](../../../docs/contributing.md#landing-a-change):
 `land.py` pushes the branch, opens "Merge <branch>: what the branch does" with the smoke quote in
 its body, and its waiting merges once the gate passes and the quote still holds for the head.
-The merge gate is the build and unit tests on Linux AArch64 (ix runners) and the released blaze's
-`blaze check --workspace` on Linux AArch64 and macOS, with astlog's rules and the lint baselines.
-There is no merge queue; the release train on main catches changes that break together. The wait
+The merge gate is `.github/workflows/blaze.yaml` on Linux AArch64 (ix runners): the workspace's
+`cargo check` and unit tests, the rows of `tools/gate.txt` and the Lean proofs.
+There is no merge queue. The wait
 runs in its own process, logging to `.git/land/pr-N.log` in the main checkout; `land.py
 '{"follow": true}'` follows it again. A branch that conflicts, or that main has moved past, gets
-`git merge origin/main`, a new release build and a new smoke first. For anything the
-fast tier does not cover, run the train on the branch first: `gh workflow run train.yaml --ref <branch>`.
+`git merge origin/main`, a new release build and a new smoke first.
 
 A `Co-authored-by:` trailer uses the address the person's own commits use, or
 `<id>+<login>@users.noreply.github.com` with the id from `gh api users/<login> -q .id`; name the

@@ -1,4 +1,4 @@
-//! The seam between the process and the front end (docs/v2/plan/design/host.md, "Crates"): the
+//! The seam between the process and the front end (docs/v2/plan/design/end-state.md D157): the
 //! three tasks the driver's host asks of a front end, and the one lookup every side answers a
 //! fact by. Here, so neither side depends on the other: the host (crates/blaze-host) performs
 //! every [`Effect`](crate::driver::Effect) with a `Front` it is given; blaze-unitkey and

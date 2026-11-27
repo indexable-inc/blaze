@@ -30,12 +30,8 @@ all-defaults record literal (`open(p, { .. })`), and a field value starting with
 parenthesized. Where the grammar requires a block (`fn`, `if`, `loop`, `unsafe` bodies) it never
 asks. In a generic argument list `{` stays Rust's const block unless it starts `{ IDENT :`.
 
-**Gate.** `edition::Extensions::RECORDS` (bit 2), read off the root file's tokens by
-`base_db::crate_extensions` and held by every parse. Folding into the integration branch
-(`rework-int2-1109`) is mechanical: keep its `Extensions`, `Tokens`, `Parse` and
-`EditionedFileId` plumbing, add the `RECORDS` constant, `records()` and one `EXTENSION_ATTRS`
-row, and make `Parser::records_gate` read `self.inp.extensions_at(self.pos)`. Until then a
-macro's expansion parses with no extension, so records cannot be written inside a macro call.
+**Gate.** `edition::Extensions::RECORDS` (bit 2), held by every parse; `Parser::records_gate`
+reads `self.inp.extensions_at(self.pos)`, so a `{` another crate wrote (a macro's own) is Rust's.
 
 ## The type
 
@@ -108,13 +104,13 @@ layout. Named records and type-keyed type sets (`blaze-ty::type_set`) also unify
 
 ## Not built in this slice
 
-A spelling for "every default"; records inside a macro call (see Gate); `options_struct`; a
+Records inside a macro call (see Gate); `options_struct`; a
 "name it" help on E0116 and E0117; refusing a record an `extern` function returns (a parameter
 is refused); defaults that name the function's generic parameters.
 
 ## Use in blaze
 
 None yet: blaze's crates are built by a stage 0 that does not read records (rule
-`blaze-uses-its-extensions`). First, once a release reads them, three runs of positional
+`blaze-uses-its-extensions`). First, once a release reads them, two runs of positional
 edition, extensions and outline arguments: `SourceFile::parse_shared_with` (`crates/syntax`),
-`Reparse::parse` (`crates/base-db/src/reparse.rs`), `build_node` (`crates/syntax/src/parsing.rs`).
+`build_node` (`crates/syntax/src/parsing.rs`).

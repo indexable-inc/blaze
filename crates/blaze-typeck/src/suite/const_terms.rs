@@ -1,4 +1,4 @@
-//! Const terms in the checker's types (typeck.md, "Const generics"): an array length and a const
+//! Const terms in the checker's types (the Reference, "Const generics"): an array length and a const
 //! generic argument are `Ty` handles whose view is `ConstValue`, `ConstParam` or `ConstInfer`.
 //!
 //! The rules, from the Rust Reference:

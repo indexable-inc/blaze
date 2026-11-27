@@ -935,7 +935,7 @@ pub(crate) use columns;
 
 columns!(define);
 
-/// The hot bytes per instruction: an op, flags, a type and one word. data.md's budget.
+/// The hot bytes per instruction: an op, flags, a type and one word. bottom.md section 13's budget.
 const _: () = assert!(size_of::<u8>() + size_of::<u8>() + size_of::<u16>() + size_of::<u32>() == 8);
 const _: () = assert!(size_of::<SigRec>() == 12);
 const _: () = assert!(size_of::<ParamRec>() == 8);

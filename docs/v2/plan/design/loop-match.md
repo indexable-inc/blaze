@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: lane loop-match: `#[loop_match]` / `#[const_continue]` (feature loop_match) lower a constant state transition to a jump into its arm, past the loop head's chain of arm tests; malformed uses are refused with rustc's messages.
+summary: "`#[loop_match]` / `#[const_continue]` (feature loop_match): a constant state transition lowered to a jump into its arm, past the loop head's chain of arm tests; malformed uses refused with rustc's messages. Not built on the new layer: the attributes are accepted and the loop lowered plain."
 date: 2026-11-13
 ---
 # Direct jumps for `#[loop_match]`
@@ -12,15 +12,15 @@ is known at compile time. Rule 4 makes the attributes required: every program th
 nightly builds builds under blaze. Rule 3 makes the refusals binding: a `#[const_continue]`
 blaze can't resolve is an error naming it, never a plain `break` in its place.
 
-## Layers
+## Where it is
 
-| Layer | State |
-|---|---|
-| Parse | Outer attributes on a `loop` or `break` in statement or expression position attach to the node (`LoopExpr`, `BreakExpr` have `HasAttrs`). Target checks are `blaze-diagnostics`' attribute table (`Target::Loop`, `Target::Break`). |
-| Expression store | One sorted column `marked_exprs` (was `overflow_inheriting`) holds every expression an attribute changes the lowering of: closures with `#[rustc_inherit_overflow_checks]`, loops with `#[loop_match]`, breaks with `#[const_continue]`. The expression's kind tells them apart (`is_loop_match`, `is_const_continue`); `Expr::Loop` and `Expr::Break` are unchanged. The store schema goes to 17, since a 16 store would read with no marks and lower every loop plain. |
-| Check | `loop_match_check` (`crates/hir-ty-mir/src/mir/loop_match.rs`), rustc's checks in its order and with its messages: the loop body's shape, the scrutinee, the state update, the state type, arm guards, the break's label and value, the value's kind, the target arm. Rendered by `crates/blaze-diagnostics/src/lower/loop_match.rs`, reported through `hir`'s diagnostics like `become`'s refusals. A body the check refuses is never lowered to MIR. |
-| MIR | `crates/hir-ty-mir/src/mir/lower/loop_match.rs`, from the `Loop`, `Match` and `Break` arms of `lower.rs`. |
-| Back ends | Nothing: the result is ordinary gotos and switches. |
+Not built on the new layer: blaze-surface accepts both attributes (`builtin_attrs.rs`,
+`lang_features.rs`), and the loop is lowered as a plain loop, the arm tests run on each
+transition. The fixture `crates/blaze-real/extensions/b_loop_match.rs` expects acceptance. To
+build: rustc's checks in its order and with its messages (the loop body's shape, the scrutinee,
+the state update, the state type, arm guards, the break's label and value, the value's kind,
+the target arm), a body they refuse never lowered, then the lowering below. Back ends need
+nothing: the result is ordinary gotos and switches.
 
 ## The lowering contract
 
@@ -50,21 +50,10 @@ blaze can't resolve is an error naming it, never a plain `break` in its place.
   CFG is the real one: the jump reaches a subset of what the head reaches, so borrowck accepts
   at least what rustc accepts. A program rustc refuses only through that edge builds here.
 
-## Gaps (typed errors today)
-
-- A `#[loop_match]` in an anonymous const or a const block's body has no check entry; MIR
-  lowering refuses it with `NotSupported` naming the loop.
-- `#[loop_match]` on `while` or `for` is not marked; rustc's attribute check refuses it there.
-- `#[cfg_attr(.., loop_match)]` is not seen, as with `rustc_inherit_overflow_checks`.
-- `blaze-item-hash` has no read rule for `loop_match_check`, so a body with a `#[loop_match]`
-  is computed and not stored.
-
 ## Tests
 
-- `crates/hir-ty-mir/tests/mir/loop_match.rs`: the same output with and without the
-  attributes; a transition's MIR has no edge to the loop head; a live `Noisy` drops before the
-  jump in plain-break order; a jump to `x @ 1..=3` and to `x` binds the new value; one test per
-  refusal with rustc's message.
-- `harness/v2/frontend/cases/mir/` case `loop-match-jumps-into-the-arm`: a state machine run
-  under blaze prints what the plain loop prints. Its `dropping()` counts two drops of the old
-  state, which the pinned nightly does not make, so the nightly fails that case on purpose.
+- The same output with and without the attributes; a transition has no edge to the loop head;
+  a live `Noisy` drops before the jump in plain-break order; a jump to `x @ 1..=3` and to `x`
+  binds the new value; one test per refusal with rustc's message.
+- `harness/v2/frontend/cases/mir/054-loop-match-jumps-into-the-arm.rs`: a state machine run
+  under blaze prints what the plain loop prints.

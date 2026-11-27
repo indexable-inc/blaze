@@ -1,16 +1,14 @@
 ---
 status: plan
-summary: Const macros: proc macros written inline as const fn over flat syntax trees, run by the const evaluator. Experimental.
+summary: Const macros: proc macros written inline as const fn over flat syntax trees, run by the const evaluator. Not built beyond crates/const-ast's views.
 date: 2026-11-12
 ---
 # Const macros: proc macros written inline as `const fn`
 
-Status: design, partly built, behind `experimental = ["const-macros"]`: the evaluator call and
-expander (#915), and the manifest key and loading (#959). Of stage 2
-([below](#stage-2-the-item-as-a-flat-tree-through-const-views), #1441), the const views are on
-main: a macro is given `&const_ast::Item` and returns `const_ast::Output`, a flat tree it builds
-with `const_ast::Builder` or `const_ast::quote!`. Stage 0's text interface is removed. Nothing
-here is on by default. Issues: #859 (hermetic build graph), #860 (purity as a front-end query),
+Status: design. Of it only stage 2's const views exist
+([below](#stage-2-the-item-as-a-flat-tree-through-const-views), #1441), in `crates/const-ast`:
+a macro is given `&const_ast::Item` and returns `const_ast::Output`, a flat tree it builds with
+`const_ast::Builder` or `const_ast::quote!`. No evaluator, expander or manifest key calls them. Issues: #859 (hermetic build graph), #860 (purity as a front-end query),
 #867 (const traits, const closures, const heap, step budget), #863 (the build graph's `map`).
 
 ## What it is
@@ -54,37 +52,33 @@ pub struct Point { x: i32, y: i32 }
 ```
 
 There is no proc-macro crate, no second package, no dylib, no WebAssembly module and no
-process. Expanding `#[derive(macros::Named)]` is a call of `named` by the evaluator in
-`crates/hir-ty-mir/src/mir/eval.rs`, made from the proc-macro expansion query of `hir-expand`,
-and its result is a salsa value like any other expansion.
+process. Expanding `#[derive(macros::Named)]` is a call of `named` by blaze's const evaluator,
+and its result is a record like any other expansion.
 
-The direction this comes from: const is purity (`/tmp/blaze-lanes/const-sketch.md`, Andrew,
-2026-10-28). A const fn reads its arguments and rodata, writes only its own scratch memory,
+The direction this comes from: const is purity (Andrew, 2026-10-28). A const fn reads its arguments and rodata, writes only its own scratch memory,
 and touches no state, files, clock or network. That is exactly what a cached macro needs to
 be, so blaze checks it once in the front end instead of building a sandbox around it.
 
 ## Why not just today's proc macros
 
-Today a proc macro is a crate of its own (`proc-macro = true`), compiled for the host, or for
-`wasm32-wasip1` and run under Wasmtime (`crates/blaze-macro-wasm`). That costs:
+Today a proc macro is a crate of its own (`proc-macro = true`), compiled by blaze to a wasm64
+(memory64) module and run in-process under Wasmtime, sandboxed. That costs:
 
 - A second package, with its own manifest, for every crate that wants one derive.
 - Compiling it, and usually syn and quote, before the first expansion: seconds cold, on the
   critical path of every crate that uses it.
-- A boundary per expansion: a request to the proc-macro server, or a fresh wasm instance, with
-  the input and output encoded across it.
-- Purity by containment. A proc macro can read files and the environment; the sandbox
-  (`macro_sandbox.rs`) and the store's key (`crates/blaze-expand`, `blaze-macro-wasm/keyed.rs`)
-  record what it read so its expansion can be kept. That works, but it is checked at run time
-  and guessed for function-like macros (`BLAZE_PROC_MACRO_CACHE=all` is opt-in).
+- A boundary per expansion: a call into the wasm instance, with the input and output encoded
+  across it.
+- Purity by containment. A proc macro can read files and the environment; the sandbox records
+  what it read so its expansion can be kept. That works, but it is checked at run time.
 
 A const macro has none of these: nothing to compile but the macro's own MIR, which the front
 end lowers anyway; nothing to cross; and purity proven before it runs, so every expansion, of
 every kind, is a function of its input and can always be kept.
 
 What it does not replace: macros that need what const can't do (read a file, run a program,
-call C) stay ordinary proc macros. The two use the same expander interface
-(`hir_expand::proc_macro::ProcMacroExpander`), so a crate can use both.
+call C) stay ordinary proc macros. The two use the same expander interface, so a crate can use
+both.
 
 ## Spelling, and what plain rustc says
 
@@ -124,7 +118,7 @@ quoted tokens move unchanged.
 A macro used in the crate that defines it is a cycle. The crate's def map is what expanding
 `#[derive(Named)]` adds items to; evaluating `named` needs `named`'s MIR, which needs its
 types, which need the same crate's def map. rustc forbids it outright (proc macros can't be
-used in their own crate). Salsa would report it as a cycle.
+used in their own crate).
 
 v1 breaks it the way the proc-macro crate does, without making the user write the second
 package: blaze adds the macro file to the analysis crate graph as a crate of its own.
@@ -133,9 +127,7 @@ package: blaze adds the macro file to the analysis crate graph as a crate of its
   (not dev or build), its edition and cfgs the package's.
 - It is a proc-macro crate to the def map collector (`target_kind` proc-macro), so its
   `#[proc_macro_derive]`, `#[proc_macro_attribute]` and `#[proc_macro]` functions are exported
-  as macros by the code that does so for every proc-macro crate (`export_proc_macro` in
-  `hir-def/src/nameres/collector.rs`). Its `ProcMacros` entry lists them with the const
-  expander.
+  as macros by the code that does so for every proc-macro crate, with the const expander.
 - It is in the analysis graph only. Cargo knows nothing of it, codegen never compiles it, and
   no artifact is made: the evaluator runs its MIR.
 - It can't name the package's own items (`crate::` in it is itself), which is the rule that
@@ -173,9 +165,7 @@ every macro crate depends on as `const_ast`:
   `const_ast::quote!(b, ENTRY => TOKENS)` with `#x` (splice `x`, any value with a `const fn
   splice`), `#{ code }` (run statements there), `#for x in (e) { .. }` (repeat over an
   iterator) and `##` (a literal `#`). Its tokens are parsed by blaze's parser at `ENTRY` when
-  the macro crate is analyzed and lowered to builder calls (`crates/hir-ty-mir`'s
-  `const_macro/quote.rs`, the host expander of `const_ast_quote`, a proc-macro twin of
-  `const_ast` on the same root file). A quote that is not Rust fails where the macro is
+  the macro crate is analyzed and lowered to builder calls by the host. A quote that is not Rust fails where the macro is
   written, naming what it is not; a repetition that would cut a node in half is refused
   naming the node.
 
@@ -227,8 +217,8 @@ blaze-expand can't promise for proc macros.
 ### Errors
 
 - The macro panics: the expansion fails with the panic's message at the call site, with the
-  evaluator's stack of const fn frames in `macros.rs` as notes. Same as a proc macro's panic
-  today (`ProcMacroExpansionError::Panic`), more precise.
+  evaluator's stack of const fn frames in `macros.rs` as notes. Same as a proc macro's panic,
+  more precise.
 - The macro returns a tree with `compile_error!`: as for any proc macro.
 - The macro returns a tree that is not Rust: the host parses the output's tokens at its entry
   and refuses a tree that is not that parse, node for node, naming the macro and the output
@@ -243,16 +233,15 @@ blaze-expand can't promise for proc macros.
 
 ## Caching
 
-Within a daemon, the expansion is salsa's: `expand_proc_macro` for the call reads the call's
-tokens and, through the evaluator, the MIR of every function the macro reaches. Editing the
-macro re-expands each call (and only those calls) whose result changes; editing an item
-re-expands that item's derives. Nothing is keyed by hand.
+An expansion reads the call's tokens and, through the evaluator, the MIR of every function the
+macro reaches. Editing the macro re-expands each call (and only those calls) whose result
+changes; editing an item re-expands that item's derives. Nothing is keyed by hand.
 
-Across daemons and machines, an expansion is kept in blaze's store under (code hash, input
-hash), the shape blaze-expand uses with the dylib's content replaced by the code hash:
+An expansion is kept in blaze's store, across commands and machines, under (code hash, input
+hash):
 
-- code hash: fn-cache's `cache_code` of the macro function, which covers every function and
-  constant it reaches (docs/fn-cache.md), plus the evaluator's version;
+- code hash: the hash of the macro function's code and of every function and constant it
+  reaches (`cache_code` below), plus the evaluator's version;
 - input hash: the input tokens, and the attribute's tokens for an attribute, with spans
   replaced by their index in the span table (as above), and the macro's name and kind.
 
@@ -261,37 +250,15 @@ reach them. Unlike today's proc-macro cache this holds for function-like macros 
 
 ## How it compares
 
-| | macro_rules | proc macro (dylib/wasm) | const macro |
+| | macro_rules | proc macro (wasm64) | const macro |
 |---|---|---|---|
 | where written | anywhere | its own crate | `const-macros` file of the package (v1), anywhere (v2) |
 | language | patterns | Rust, anything | Rust, const fn |
-| runs | blaze's mbe | proc-macro server or Wasmtime | blaze's const evaluator, in-process |
+| runs | blaze's mbe | Wasmtime, in-process | blaze's const evaluator, in-process |
 | compiled first | no | yes, with its dependencies | no (MIR only) |
 | pure | yes | by sandbox and recorded reads | by const check |
 | kept across machines | n/a (cheap) | derives and attributes; bang opt-in | every kind |
 | plain rustc | yes | yes | no: clear error |
-
-## The prototype (stage 0, removed)
-
-Stage 0 was the smallest working path, so the plumbing existed before the const heap and const
-traits did. Its text interface is removed; what replaced each part:
-
-- The manifest key and the macro crate in the analysis graph, its `ProcMacros` entry listing
-  the file's `#[proc_macro_derive]`, `#[proc_macro_attribute]` and `#[proc_macro]` functions:
-  kept as they were.
-- The text signature, `fn(&str) -> String` (and `fn(&str, &str) -> String` for an attribute),
-  the input printed and the output lexed back with the call site's span on every token:
-  replaced by the trees of stage 2, `&const_ast::Item` or `&const_ast::TokenTree` in and
-  `const_ast::Output` out, read from the evaluator's heap as four arrays. A `&str` parameter
-  or a `String` return is an error naming the macro.
-- The expander downcasting the `&dyn SourceDatabase` it is given to `&dyn HirDatabase`: kept;
-  sound because the macro crate never depends on the crate being expanded.
-- Not requiring `const` (`format!` and `push_str` ran): still the purity query's job (#860,
-  lane ccheck); the builder needs neither, and the evaluator's sandbox is the guarantee until
-  then.
-- The list of macros read at load (a new `#[proc_macro_derive]` needs a reload): unchanged.
-- Every output token at the call site's span: replaced by the rules of "Spans and hygiene",
-  so a spliced name keeps the input's span and errors point into the macro's output.
 
 ## Stage 2: the item as a flat tree, through const views
 
@@ -312,14 +279,8 @@ plan, a pull request a step:
    `const fn next` (`while let Some(field) = fields.next()`), which implement `Iterator` too.
    A macro never sees a kind's number: they are in `kinds.rs`, private, checked against
    `SyntaxKind` by a test that rewrites them (`UPDATE_EXPECT=1`), so a grammar change changes
-   the views, and through `cache_code` every expansion that used them. Tested two ways: every
-   view and accessor against `syntax::ast`'s on every node of `library/core`, `library/alloc`,
-   salsa and the crate itself (`const_ast::tests`), and what a derive reads through them, folded
-   into one number, evaluated by blaze's const evaluator against the same code compiled, on real
-   files and on one with every kind of node the views read (`hir-ide`'s
-   `consteval::const_ast`). Running them in the evaluator found it laying out an overflowing
-   `u128` operation's `(u128, bool)` as twice a `u128` where the target aligns `u128` to 8;
-   it now pads to the alignment.
+   the views, and through `cache_code` every expansion that used them. Tested against
+   `syntax::ast`'s accessors on every node of real crates' files (`const_ast::tests`).
 2. **The item or the tokens as input, a tree as output**: each parameter of a const macro's
    function is `&const_ast::Item`, the tokens parsed back to an item as a flat tree (so it is
    what a proc macro is given: cfg-stripped, the derive itself taken out), or
@@ -343,19 +304,17 @@ plan, a pull request a step:
 
    Each token's span is its index in the call's span table: `def_site` 0, `call_site` 1,
    `mixed_site` 2, then each distinct span of the inputs in the order it first appears, one
-   table a call, shared by its inputs. The expander (`hir-ty-mir`'s `const_macro.rs`) writes
-   the arrays, the `Tree` and the view into the evaluator's heap (`call_const_macro`,
-   `eval/macro_call.rs`) and passes a reference. Every macro crate depends on `const_ast`,
-   blaze's own copy of `crates/const-ast` (its files are `const_ast::SOURCE`, which the loader
-   gives the VFS at `<sysroot>/lib/rustlib/blaze/const-ast`, a directory not on disk), so the
-   layout and kinds the host writes are the ones the views read; a `const_ast` whose root is
-   not blaze's text is refused. A parameter of any other type, a count of parameters that is
+   table a call, shared by its inputs. The expander writes the arrays, the `Tree` and the view
+   into the evaluator's heap (`call_const_macro`) and passes a reference. Every macro crate
+   depends on `const_ast`, blaze's own copy of `crates/const-ast` (its files are
+   `const_ast::SOURCE`), so the layout and kinds the host writes are the ones the views read;
+   a `const_ast` whose root is not blaze's text is refused. A parameter of any other type, a count of parameters that is
    not the macro kind's, a return type that is not `const_ast::Output`, or an input that does
    not parse to one item is an error naming it.
 
    The host reads the output's four arrays from the evaluator's heap, builds a flat tree (a
    splice is copied from the host's own input arrays) and turns it into tokens with each
-   token's span from the table (`syntax_bridge::call_input`): no text is printed, and none is
+   token's span from the table: no text is printed, and none is
    lexed but one built token at a time, to find its kind. Then the check: the tokens are
    parsed once at the output's entry and the built tree must be that parse, node for node, or
    the expansion is refused naming the macro and the first element that differs. The parser is
@@ -367,15 +326,11 @@ plan, a pull request a step:
    arguments. A callee given `&mut Builder` is memoized by what it appended: the range is
    position-independent because sizes are relative and splices are references. Measured on a
    derive over a large struct: edit one field and count the evaluations.
-4. A real derive ported, cold, warm and edit times against its proc-macro version, as in the
-   stage-0 table below.
+4. A real derive ported, cold, warm and edit times against its proc-macro version.
 
 ## Later
 
 - v2 (anywhere in the crate), above.
-- hir-expand takes the checked tree: today the expander parses an expansion's tokens once as
-  its check and hir-expand parses them again (`Expanded` carries tokens); passing it the
-  checked tree drops the second parse.
 - Non-const proc macros in the evaluator: the evaluator is itself a sandbox (no files, no
   FFI, deterministic), so an existing syn-based proc macro could run there with no wasm
   build. The open question is speed: the MIR interpreter is far slower than Wasmtime's
@@ -400,11 +355,10 @@ wasm instance:
   from the returned words. Whether `f` is const is the purity query's answer, not its
   signature's.
 - The key: (`cache_code` of `f`, the digests of the inputs, the digest of `args`).
-  `cache_code` is fn-cache's hash of `f`'s code and everything it reaches
-  (`crates/hir-ty-codegen/fncache.rs`), so editing a helper `f` calls changes the key, and
-  reformatting doesn't.
-- The result: in blaze's store, like any node's, not in salsa. It outlives the daemon, and a
-  second machine with the same key gets a hit.
+  `cache_code` is the hash of `f`'s code and everything it reaches, so editing a helper `f`
+  calls changes the key, and reformatting doesn't.
+- The result: in blaze's store, like any node's. It outlives the command, and a second
+  machine with the same key gets a hit.
 
 This waits on #863's `Graph` crate and executor, which don't exist yet. Until then there is
 no `map` node to run.
@@ -416,28 +370,13 @@ as a proc-macro crate, on the same command:
 
 - cold build of the using crate: the proc-macro path compiles the macro crate (and syn,
   quote); the const path compiles nothing extra. Expected to win by seconds.
-- no-op and edit: expansions are salsa-cached either way; a re-expansion is one evaluation
-  versus one wasm instance or server round trip. The evaluator is the risk here and is
-  measured per expansion before the experiment is proposed as a default.
-- load of a fresh daemon: both are kept in the store.
+- no-op and edit: expansions are kept in the store either way; a re-expansion is one
+  evaluation versus one wasm call. The evaluator is the risk here and is measured per
+  expansion before the experiment is proposed as a default.
 
-Measured with stage 0 (2026-10-28, ix VM, arm64, 16 CPUs, three alternating rounds, a fresh
-`BLAZE_HOME` each): harness/constmacros's derive, against the same derive (same body, taking
-`proc_macro::TokenStream`) as a proc-macro crate of the workspace. Each cell is `blaze run`'s
-time, and both print the same output at every step:
-
-| | cold | warm | the macro's output edited |
-|---|---|---|---|
-| proc-macro crate | 20.15-22.93 s | 0.01 s | 0.97-1.01 s |
-| const macro | 13.71-14.96 s | 0.01-0.03 s | 0.04-0.05 s |
-
-That table is stage 0's, with text output, and is the baseline the trees are measured against
-once built. Estimates, not measured, for a derive writing one method per field over 20 fields:
-
-- text: about 1,400 output bytes at about 25 MIR steps a byte (`push_str`'s loop), about
-  35,000 steps, then a lex and a parse of 1.4 KB on the host;
-- builder: about 30 elements a field (a spliced type is one element) and 60 fixed, about 660
-  pushes at about 35 steps, about 23,000 steps with no growth; on the host one tree build, one
-  bridge walk and one parse as the check, and hir-expand's parse as before.
+Estimated, not measured, for a derive writing one method per field over 20 fields: about 30
+elements a field (a spliced type is one element) and 60 fixed, about 660 pushes at about 35
+steps, about 23,000 steps with no growth; on the host one tree build, one bridge walk and one
+parse as the check.
 
 Nothing in this design touches a package that does not declare `const-macros`.

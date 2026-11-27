@@ -1,6 +1,6 @@
 ---
 name: build-and-test
-description: "How blaze is built, checked, tested and measured, and how a lane runs: cargo with the pinned nightly in the dev loop while blaze still builds blaze as the proof, the one build VM `blaze-vm` (never AWS, never a VM per lane), a timeout on every command, at most four lanes writing in one directory while the main agent compiles each piece within minutes and admits it onto the last green head, cleaning up and measuring the exact tree. How tests are written (property tests, deterministic simulation, testing a causal claim) is the `testing` skill; the smoke run before a merge is the `landing` skill. Load before any build, check, test run, benchmark, bisect or measurement, before running any command that can hang, before splitting work across subagents, and when starting or ending a lane."
+description: "How blaze is built, checked, tested and measured, and how a lane runs: cargo with the pinned nightly in the dev loop while blaze still builds blaze as the proof, the one build VM `blaze-vm` (never AWS, never a VM per lane), a timeout on every command, all lanes writing and committing in one directory, no worktree per lane, while the main agent builds once and admits each piece onto the last green head, cleaning up and measuring the exact tree. How tests are written (property tests, deterministic simulation, testing a causal claim) is the `testing` skill; the smoke run before a merge is the `landing` skill. Load before any build, check, test run, benchmark, bisect or measurement, before running any command that can hang, before splitting work across subagents, and when starting or ending a lane."
 ---
 
 # Building, testing and measuring blaze
@@ -129,41 +129,40 @@ each should show, and stops or goes on writing the next piece. Waiting is the wa
 removes: thirty-eight shells of lanes each waiting on its own build of its own branch is
 thirty-eight agents not writing, and their separate results had to be redone on the combined tree
 anyway. On the green head the main agent runs rounds: the one VM builds the whole tree once and runs
-everything at once (`harness/v2/integrate.py`: the edit-loop table beside the reference, the
-stale-answer run, new project, restart, memory, disk, the revision tests, the unit tests of the
-crates touched, each test a lane named), and every failure goes to the lane whose file it names,
-with the tree's commit, the command and the output; the lanes fix by writing. A lane writes so that
-its piece can join alone: new code beside the old until it is switched over, nothing half-applied
-across files it does not own, each piece with its test. A green head is not yet main: a merge also
-needs the smoke run (`proof-before-merge`). What a lane needs to see at run time (a profile's rows,
-what a command prints, whether a guess is right) it asks for as a line in its report: the main agent
-runs it in the next round and sends the answer. The exceptions are named in a lane's brief with the
-reason, and are few: one lane measuring a real project that takes minutes per run (it measures; it
-does not hold others up), and tools that need no build at all (a Python or TypeScript check that
-takes seconds). Landing: main takes the integration tree, or a part of it, when a round is clean on
-that exact commit and the smoke run has passed on it. A piece is cut without stopping the other
-lanes: the green head's tree is read into a scratch index, only the reporting lane's paths are added
-from the directory as they are on disk, and that one commit is what the VM compiles (`git read-tree
-<green>`, `git add -A -- <the lane's paths>`, `git write-tree`, `git commit-tree`); the lanes still
-writing are not in it, so its errors are that lane's.
+everything at once (the edit-loop table beside the reference, the stale-answer run, new project,
+restart, memory, disk, the revision tests, the unit tests of the crates touched, each test a lane
+named), and every failure goes to the lane whose file it names, with the tree's commit, the command
+and the output; the lanes fix by writing. A lane writes so that its piece can join alone: new code
+beside the old until it is switched over, nothing half-applied across files it does not own, each
+piece with its test. A green head is not yet main: a merge also needs the smoke run
+(`proof-before-merge`). What a lane needs to see at run time (a profile's rows, what a command
+prints, whether a guess is right) it asks for as a line in its report: the main agent runs it in the
+next round and sends the answer. The exceptions are named in a lane's brief with the reason, and are
+few: one lane measuring a real project that takes minutes per run (it measures; it does not hold
+others up), and tools that need no build at all (a Python or TypeScript check that takes seconds).
+Landing: main takes the integration tree, or a part of it, when a round is clean on that exact
+commit and the smoke run has passed on it. A piece is cut without stopping the other lanes: the
+green head's tree is read into a scratch index, only the reporting lane's paths are added from the
+directory as they are on disk, and that one commit is what the VM compiles (`git read-tree <green>`,
+`git add -A -- <the lane's paths>`, `git write-tree`, `git commit-tree`); the lanes still writing
+are not in it, so its errors are that lane's.
 
 ## worktree-per-lane (rule 36)
 
 The default is one directory: the integration checkout on the Mac (how-to `H12` under
 `agents/howto/` names it), on the integration branch. Every lane edits there, within the paths its
-brief gives it, and does not run git: the main agent commits (one commit per lane's piece, crediting
-it), compiles each piece as it is reported (`fan-out-write-only`), pushes, and has the one VM build
-and test the whole tree at once. A lane's paths are new files, or the files of one area (one crate,
-one module) that no other lane touches; a brief that would have two lanes edit one area's old code
-in place is split differently, or the rewrite gets a fresh core beside the old code
-(`agents-are-a-cost`). A lane says when its piece is ready to be built and what test shows it; until
-then its half-written files must not break the build for the others (add new code beside the old and
-switch over last, or keep it behind a module that is not yet referenced). Two lanes never write the
-same file: the brief's paths say who owns what, and a lane that needs a line in another's file asks
-the main agent. A worktree (uniquely named, with its own branch) is for the cases the one directory
-cannot serve: two lanes that must rewrite the same file, a bisect or a causal test that needs a
-variant tree, a long-lived rewrite that cannot keep the tree building; the brief says which. Never
-`git stash`: it is one stack shared by every worktree.
+brief gives it, and commits its own piece; the main agent builds each piece once as it is reported
+(`fan-out-write-only`), pushes, and has the one VM build and test the whole tree at once. A lane's
+paths are new files, or the files of one area (one crate, one module) that no other lane touches; a
+brief that would have two lanes edit one area's old code in place is split differently, or the
+rewrite gets a fresh core beside the old code (`agents-are-a-cost`). A lane says when its piece is
+ready to be built and what test shows it; until then its half-written files must not break the build
+for the others (add new code beside the old and switch over last, or keep it behind a module that is
+not yet referenced). Two lanes never write the same file: the brief's paths say who owns what, and a
+lane that needs a line in another's file asks the main agent. A worktree (uniquely named, with its
+own branch) is for the cases the one directory cannot serve: two lanes that must rewrite the same
+file, a bisect or a causal test that needs a variant tree, a long-lived rewrite that cannot keep the
+tree building; the brief says which. Never `git stash`: it is one stack shared by every worktree.
 
 ## clean-up-lane (rule 39)
 
@@ -295,13 +294,13 @@ cause.
 
 From [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#working-in-parallel):
 
-- A lane writes in the one integration directory (how-to `H12`), in new files or one area's
-  files, with the edit tools or `ast-grep` only, and runs nothing. At most four lanes write at
-  once. A worktree is only for the exceptions `worktree-per-lane` names; never `git stash`.
+- All lanes write in one directory (how-to `H12`), with no worktree per lane, in new files or
+  one area's files, with the edit tools or `ast-grep` only; a lane writes and commits and runs
+  nothing else, and the main agent builds once and admits; never `git stash`.
 - Linux work runs on `blaze-vm` through `/root/loop.sh` (`work-in-ix-vms`); no lane makes a VM.
 - Every command has a timeout (`every-command-has-a-timeout`): `timeout --kill-after=10s <s> <cmd>`
-  in a shell, the Bash tool's `timeout`, `timeout=` in Python. On expiry take `blaze debug inspect`
-  or `blaze slow` before the kill and quote it.
+  in a shell, the Bash tool's `timeout`, `timeout=` in Python. On expiry take a stack sample
+  (`sample <pid>`) before the kill and quote it.
 - The main agent compiles each piece as it is reported, while cargo builds blaze (rule 2):
   `cargo +<pins/toolchain> check -p <crate> --all-targets`, then
   `cargo +<pins/toolchain> check --workspace --all-targets` with the piece applied alone onto
@@ -311,16 +310,15 @@ From [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wo
   error.
 - Before a merge: the hello-world smoke of a release blaze built from the exact merge commit
   (`proof-before-merge`, the `landing` skill).
-- Checking a change fast with a blaze, per commit
+- Checking a change fast, per commit
   ([docs/contributing.md#checking-a-change-fast](../../../docs/contributing.md#checking-a-change-fast)):
-  `blaze check $(blaze run -q -p scripts --bin changed -- '{"base": "<the commit before>", "print": "args"}') --lib --tests`.
+  `cargo +<pins/toolchain> check $(blaze run -q -p scripts --bin changed -- '{"base": "<the commit before>", "print": "args"}') --lib --tests`.
   `changed` prints the packages the commit touched and their dependents in the order to check;
   hand the first error back to the agent that wrote the code. Never let thousands of lines pile
   up unchecked behind an hour-long build.
 - A lane script, a harness and your own loop check every command's exit status and stop at the
   first failure (`set -euo pipefail`; `check=True`), unless the line says why not. A command
-  that does not exist (`blaze daemon stop`; it is `blaze stop`) exits 101 and a script that
-  goes on measures nothing true
+  that does not exist (`blaze daemon stop`) fails and a script that goes on measures nothing true
   ([docs/contributing.md#scripts-that-run-commands](../../../docs/contributing.md#scripts-that-run-commands)).
 - Run harnesses with `RUST_BACKTRACE=0`.
 - Done (`clean-up-lane`): the lane's `/root/wt/<lane>/` and homes on `blaze-vm`, any blaze

@@ -1,4 +1,4 @@
-//! Names on demand across crates (cells/lazy_deps.rs, engine.md piece E13): `dep` has 300
+//! Names on demand across crates (cells/lazy_deps.rs, end-state.md D158): `dep` has 300
 //! modules; `app` reads three names of it, one through a chain of re-exports (`a` -> `m10` ->
 //! `m20`), one through a glob (`b` -> `m11::*`), one directly (`m7`). Solved with `app` whole
 //! and `dep` on demand: the groups solved in `dep` are exactly the closure the whole solve's

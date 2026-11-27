@@ -33,8 +33,8 @@ impl Pin {
             "blaze links only the LLVM pins/llvm.json pins (LLVM {}, commit {}), \
              and {found}. blaze sets {PIN_PREFIX} itself, to the release llvm.json pins for the \
              target, fetched by its sha256 and unpacked under blaze's home \
-             (`[workspace.metadata.blaze.native.llvm]` in the root Cargo.toml, docs/cargo.md \
-             \"Pinned native inputs\"); build with blaze. For a target llvm.json has no release \
+             (`[workspace.metadata.blaze.native.llvm]` in the root Cargo.toml, docs/contributing.md \
+             \"LLVM\"); build with blaze. For a target llvm.json has no release \
              for, build one with the `llvm` workflow (.github/workflows/llvm.yaml)",
             self.version, self.commit
         )

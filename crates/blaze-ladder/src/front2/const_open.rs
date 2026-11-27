@@ -1,6 +1,5 @@
 //! Constants in types: the three states a constant written in a type can be in where the
-//! front end builds a signature or converts a body (docs/v2/plan/design/typeck.md, "Constants
-//! in types: three states").
+//! front end builds a signature or converts a body.
 //!
 //! 1. A VALUE: known bits (`PNode::ConstValue`). A literal, a constant item's value, an
 //!    anonymous constant expression over nothing generic ([`super::anon`]), and, here, the two

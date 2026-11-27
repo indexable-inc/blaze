@@ -1,7 +1,7 @@
 ---
 status: plan
 summary: The plan for blaze, whole, on one page. The goal, the rules, the one design every part shares, the targets, and how the work is run; the ledger of objectives is plan/objectives.md.
-date: 2026-11-09
+date: 2026-11-26
 ---
 # blaze: the plan
 
@@ -55,8 +55,7 @@ pull request, a CI job, an agent's what-if patch) is a root hash; unchanged subt
 An edit is an atomic transaction that makes a new root. What changed is the diff of two roots,
 which skips equal subtrees by hash. Disk is one writer and one projection. A command's stat
 sweep against one small table says what changed, and no file is read whose metadata did not
-move.
-Specs: [vfs](plan/design/vfs.md), [vfs-sync](plan/design/vfs-sync.md).
+move. Not built.
 
 ### 2. Identity is content, never a name or a place
 
@@ -65,16 +64,15 @@ a code hash and a deep hash. A compiled body's key holds what it does, never wha
 callees are called or where they are written, so a rename, a move, a comment and a reformat
 compile nothing. A key covers every input its value depends on and nothing else: no absolute
 path, checkout, home or toolchain location.
-Specs: [code-identity](plan/design/code-identity.md), [item-hash](plan/design/item-hash.md),
-[name-free-identity](plan/design/name-free-identity.md), [caching](plan/design/caching.md).
+Specs: [bottom](plan/design/bottom.md) (section 3), [caches](plan/design/caches.md).
 
 ### 3. Records pulled at item grain
 
 A question about one item reads or makes one small record keyed from text; a record is valid by
 its key or by its read list, so a body edit reruns that body's tasks and nothing else. `blaze
 why` answers "why did this rerun" from the recorded reads, never by guessing. Language semantics
-live only in the front end. Specs: [bottom](plan/design/bottom.md), [frontend](plan/design/frontend.md), [dbsp](plan/design/dbsp.md), [why](plan/design/why.md),
-[kernel](plan/design/kernel.md).
+live only in the front end. Specs: [bottom](plan/design/bottom.md),
+[end-state](plan/design/end-state.md).
 
 ### 4. Data is columns
 
@@ -82,68 +80,69 @@ IDs are `u32`. Syntax is a flat tree; HIR, MIR, types and the solver's tables ar
 side tables for spans; lists are CSR; hot and cold fields are split; sizes are held by const
 asserts. The same bytes are the in-memory form, the store's form and the wire's form, so nothing
 is decoded on a hit and a restart maps the image instead of rebuilding it.
-Spec: [data](plan/design/data.md).
+Specs: [bottom](plan/design/bottom.md) (section 13), [columns](plan/design/columns.md).
 
 ### 5. One store
 
-`blaze-cas` keeps every result under its key: plain when hot, packed when warm, compressed when
-cold. It reads through its own buffer pool, not `mmap`: a reserved address range, explicit
-reads on the IO driver in parallel, and eviction by advice, so a page fault never stalls a worker
-and the pool's memory is counted in the one budget ([store-pool](plan/design/store-pool.md)).
+`blaze-cas` keeps every result under its key as a record written once and read in place: a
+small one by `pread` into the task's frame, a large plain array mapped read-only. The kernel's
+page cache is the only cache; there is no buffer pool of blaze's own.
 Reads never lock. A commit is one atomic flip. The remote cache is the same
 store off the critical path with the same keys, so a cold build is mostly a download, and a
 second checkout's outputs are clones. Trust is by verification: a sampled share of hits is
-recomputed and compared, and a model checker drives the real store through crashes.
-Specs: [store](plan/design/store.md), [verify](plan/design/verify.md),
-[storemodel](plan/design/storemodel.md), [clone-out](plan/design/clone-out.md),
+recomputed and compared, and a crash simulation drives the real store through power cuts and
+failed syncs.
+Specs: [bottom](plan/design/bottom.md) (section 10), [store-next](plan/design/store-next.md),
 [remote-cache](../remote-cache.md).
 
-### 6. One scheduler, one memory budget
+### 6. One scheduler, one memory measure
 
 Every unit of work (a query, a codegen unit, a link stage, a test, a sandboxed process) is a task
-on one work-stealing pool of fibers. A waiting task parks its fiber and frees its thread; equal
-keys are computed once (single flight); order follows the critical path learned from history.
+on one work-stealing pool of threads. A task that lacks a fact returns `Need`, parks, and resumes
+when the producers of what it read have merged; nothing starts over. Equal keys are computed
+once (single flight); order follows the critical path learned from history.
 Every kernel wait goes through one deadline wait, every lock is a named lock that records who
 waited behind whom, and every core is a sans-IO state machine with a thin driver (io_uring,
-kqueue, IOCP, simulation), which is what makes deterministic simulation tests possible. Memory is
-one pool run like a database buffer pool: every byte belongs to a running task's frame or to a
-named cache; footprint is measured, and nothing admits work by memory.
-Specs: [scheduler](plan/design/scheduler.md), [fibers](plan/design/fibers.md),
-[concurrency](plan/design/concurrency.md), [deadline-waits](plan/design/deadline-waits.md),
+kqueue, IOCP, simulation), which is what makes deterministic simulation tests possible. Every
+byte belongs to a running task's frame or is a record; footprint is measured, and nothing admits
+work by memory.
+Specs: [parallel](plan/design/parallel.md), [end-state](plan/design/end-state.md) (D157, D161,
+D179), [deadline-waits](plan/design/deadline-waits.md),
 [named-locks](plan/design/named-locks.md), [memory](plan/design/memory.md).
 
 ### 7. Code per function, and no link in the dev loop
 
 A codegen unit is one function instance, keyed by its code identity; equal instances are one.
 MIR is lowered once to LIR, blaze's own low-level IR (after layout, ABI and drops; before
-instruction selection; columns), and every producer of code reads it: the stencils, LLVM, and
-the wasm emitter. Cranelift IR is no longer an input of code generation.
-A dev build compiles a function when it is first called (lazy), by copy-and-patch from stencils,
-into the running process (no binary on disk, no link), and an edit patches the new code in place
-and rolls it back if checks fail. Stencil code is the first tier, not the last: a function the
-running program shows hot is recompiled by the optimizing tier in the background and patched in
-the same way, so dev code is fast without any edit waiting for an optimizer. Dependencies are
+instruction selection; columns), and every producer of code reads it: the template tier, LLVM,
+and the wasm emitter. Cranelift IR is not an input of code generation.
+A dev build compiles a function when it is first called (lazy), by the template tier
+(copy-and-patch with registers, D195), into the running process (no binary on disk, no link), and
+an edit patches the new code in place and rolls it back if checks fail. Template code is the
+first tier, not the last: a function the running program shows hot is recompiled by the
+optimizing tier in the background and patched in the same way, so dev code is fast without any edit waiting for an optimizer. Dependencies are
 compiled optimized once, shared by every checkout through the store, and arrive as one premapped
 image. A release build goes
 through blaze's pinned LLVM with per-function summaries, and blaze's own linker writes ELF,
-Mach-O and COFF in parallel (`blaze export`). blaze never runs rustc; what still does is listed in
+Mach-O and COFF in parallel (`blaze build`). blaze never runs rustc; what still does is listed in
 [no-rustc](../no-rustc.md).
-Specs: [compile-time](plan/design/compile-time.md), [codegen](plan/design/codegen.md),
+Specs: [backend-next](plan/design/backend-next.md), [codegen](plan/design/codegen.md),
 [icf](plan/design/icf.md), [polymorph](plan/design/polymorph.md),
 [constspec](plan/design/constspec.md), [devirt](plan/design/devirt.md),
-[heap-to-stack](plan/design/heap-to-stack.md), [field-order](plan/design/field-order.md),
-[code-layout](plan/design/code-layout.md), [tail-calls](plan/design/tail-calls.md),
-[toolchain-c](plan/design/toolchain-c.md).
+[heap-to-stack](plan/design/heap-to-stack.md),
+[sota-a64-architecture](plan/design/sota-a64-architecture.md), [c](plan/design/c.md).
 
 ### 8. User code is sandboxed, and its reads are its key
 
 Build scripts and proc macros always run in a sandbox that records every read; those reads are
-the result's key. Proc macros are wasm32-wasip1 modules under Wasmtime. A build script whose MIR
+the result's key. blaze compiles proc-macro crates and pure-Rust build scripts itself to wasm64
+(memory64) modules and runs them in-process under Wasmtime; native tools and build scripts that
+link C go to the hypervisor micro-VM sandbox. A build script whose MIR
 proves it pure is keyed without running. Tests run one process each from a fork server and are
 selected by the code hashes they reached, so a change runs only the tests it can affect. Doctests
 are built by blaze's own front end. One `blaze check` covers every configuration of a package.
 Specs: [proc-macros](plan/design/proc-macros.md), [doctests](plan/design/doctests.md),
-[multiconfig-check](plan/design/multiconfig-check.md), [lock-policy](plan/design/lock-policy.md).
+[conditions](plan/design/conditions.md), [lock-policy](plan/design/lock-policy.md).
 
 ### 9. One interface
 
@@ -155,8 +154,7 @@ Spec: [structured-output](plan/design/structured-output.md).
 ### 10. One span stream
 
 Every stretch of worker time and every wait is a span in one recorder (blaze's own, not
-`tracing`). The stream is kept as Parquet history; `blaze explain`, `blaze debug sql`, `blaze
-debug diff` and the profile read that one stream.
+`tracing`). The stream is kept as Parquet history, and every reader reads that one stream.
 Specs: [profiling](../profiling.md), [ix-prof-format](../ix-prof-format.md),
 [no-tracing](plan/design/no-tracing.md), [profile-history](plan/design/profile-history.md),
 [http3-sans-io](plan/design/http3-sans-io.md), [perf-history](plan/design/perf-history.md).
@@ -165,10 +163,10 @@ Specs: [profiling](../profiling.md), [ix-prof-format](../ix-prof-format.md),
 
 | claim | what decides it |
 |---|---|
-| a program means what the pinned nightly says | real projects build and pass their own test suites (`harness/v2/realprojects.py`, `corpus.py`) |
-| an incremental build equals a build from nothing | the oracle (`harness/v2/oracle.py`), under- and over-invalidation both |
-| output is deterministic | build twice, compare bytes (`harness/v2/determinism.py`) |
-| it is fast enough | the budgets and bounds (`harness/v2/budgets.py`) |
+| a program means what the pinned nightly says | real projects build and pass their own test suites |
+| an incremental build equals a build from nothing | an oracle, under- and over-invalidation both |
+| output is deterministic | build twice, compare bytes |
+| it is fast enough | the bounds in [bounds.md](plan/bounds.md) |
 | concurrent, durable or crash-recovering code is right | a deterministic simulation test with an invariant oracle and a planted bug |
 | lock-free code is right | the model checker ([model-checker](plan/design/model-checker.md)) |
 | unsafe code is sound | blaze's own UB checker on the MIR evaluator, and fuzzing ([unsafe](plan/design/unsafe.md)) |
@@ -180,7 +178,7 @@ every kind of check reads that same text:
 - a **reference model** is a small, pure, sequential implementation of what a component means
   ("a store is a map from key to bytes"), an ordinary type in the crate;
 - a **refinement** says the real component behaves as its model, or as another implementation
-  (an incremental build as a build from nothing, `Frames` as `Fibers`, the simulated driver as a
+  (an incremental build as a build from nothing, the simulated driver as a
   native one).
 
 A statement then climbs as far as it needs to, unchanged:
@@ -213,21 +211,23 @@ How each harness is run is in [harness.md](../harness.md).
 
 blaze's own language features are libraries on the language where they can be, and otherwise the
 smallest general primitive, checked on MIR in one shared walk. They build on each other in this
-order: [pure](plan/design/pure-fns.md), then [effects](plan/design/effects.md) and
-[may-suspend](plan/design/may-suspend.md), then [linear](plan/design/linear.md) and
+order: pure, then [effects](plan/design/effects.md) (purity is its first part) and
+may-suspend ([extensions](plan/design/extensions.md)), then [linear](plan/design/linear.md) and
 [contracts](plan/design/contracts.md), then verification ([verus](plan/design/verus.md),
 [formal-verification](plan/design/formal-verification.md)). Beside them:
 [comptime](plan/design/comptime.md), [arbitrary-ints](plan/design/arbitrary-ints.md),
 [bits](plan/design/bits.md), [sealed-orphan](plan/design/sealed-orphan.md),
-[specialization](plan/design/specialization.md), [borrowck-cursor](plan/design/borrowck-cursor.md)
+[specialization](plan/design/specialization.md), the borrow check's [flow](plan/design/flow.md)
 and the lints [vecreport](plan/design/vecreport.md) and
 [borrow-workarounds](plan/design/lint-borrow-workarounds.md). Further out: [future/](../future/).
 blaze's own crates use each extension as soon as it exists.
 
 ### 13. Its own standard library
 
-`bstd` is blaze's standard library, written from scratch on `core` and `alloc`: no ambient
-authority (`main` receives an `Io`, and a function touches only what it is handed), sans-IO
+`bstd` is blaze's standard library, written from scratch on `core`: blaze's crates are `no_std`
+without `alloc`, and no global allocator is reachable. No ambient authority (`main` names each
+capability it uses, such as `out: Out` or `args: Args`, and a function touches only what it is
+handed), sans-IO
 underneath (one `Io` over io_uring, kqueue, IOCP and the simulation of section 6), and the one
 lock, map, clock, wait and error shape the rules already name. Context and memory are explicit
 too: each task has a `Cx` (deadline, cancellation, span, frame allocator) passed as a parameter,
@@ -273,10 +273,10 @@ processes exist ([tasks](plan/design/tasks.md)).
 3. **Brief.** Each task gets the objective's row, the section of this page and the spec it
    belongs to, the paths it may touch, and what "done" prints. A row that needs a design gets
    its spec written first, by the same task that then builds it.
-4. **Write.** Workers only write and commit, each in its own worktree. They build and run
-   nothing. Use a worker only when the piece is independent and large enough to pay for its
+4. **Write.** Workers only write and commit, all in one directory (no worktree per lane). They
+   build and run nothing. Use a worker only when the piece is independent and large enough to pay for its
    context; the coordinator does small pieces itself. Four workers is a lot.
-5. **Integrate once.** The coordinator merges every worker's commits into one tree, runs one
+5. **Integrate once.** The coordinator builds the one tree once and admits what passes: one
    `blaze check` and one `blaze test`, then each row's check.
 6. **Land** what passes, one pull request per objective, through `land.py`. What fails goes back
    to its worker once with the check's output; a second failure is written into the row as what
@@ -293,13 +293,16 @@ spec in place. When a section here stops being true, fix it in the same change.
 
 Decided; object with evidence, don't work around.
 
-- No daemon: a command answers and exits; branches, pull requests and CI jobs share records.
+- No daemon: a command answers and exits; branches, pull requests and CI jobs share records. An
+  optional helper (the file-event journal, with an expiry) may live between commands; nothing
+  depends on it for correctness.
 - No IDE and no MCP. The agent API is the interface.
 - No GPU in the compiler; SIMD and huge pages are chosen at run time and every path is
   bit-identical.
-- One native I/O driver per target, chosen by `cfg`; where it is unavailable blaze stops and
-  says why.
-- Stackful fibers, not async, inside the scheduler; no IO inside a job.
+- No kernel floor: each operation uses the best interface the running kernel has, chosen once at
+  start from probed `KernelFacts`; where none fits blaze stops and says why.
+- No fibers and no async inside the scheduler: a task that lacks a fact returns `Need`; no IO
+  inside a job.
 - The front end's algorithms may be redone wherever a faster design exists; the bar is behaviour,
   proved by real projects' tests and the oracle.
 - `unsafe` only where it buys measured speed, behind a safe API, with `// SAFETY:`.

@@ -13,7 +13,7 @@ and [Custom instructions with AGENTS.md](https://learn.chatgpt.com/docs/agent-co
 
 So the adapter is a hook, like Claude Code's, not a notify program and not only an `AGENTS.md`
 line: `blaze agents hook codex vN`, which `blaze agents install codex` writes. An agent without
-hooks runs `blaze diagnostics --since TOKEN --file F` itself (docs/agents.md).
+hooks runs `blaze diagnostics --since TOKEN --file F` itself.
 
 ### Where it is configured
 

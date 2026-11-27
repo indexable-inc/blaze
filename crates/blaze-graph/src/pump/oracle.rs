@@ -761,7 +761,7 @@ fn apply(
     }
 }
 
-/// The microbench of the brief (docs/v2/plan/design/concurrency.md): runs claimed and
+/// The microbench of the brief (docs/v2/plan/design/end-state.md D179): runs claimed and
 /// ended with nobody waiting on one thread, 18 threads asking one hot key, and 18 threads on
 /// keys of their own; the table against the sharded design, in nanoseconds a run.
 #[test]

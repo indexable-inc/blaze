@@ -99,7 +99,7 @@ pub struct Thread(pub u64);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Txn(pub u64);
 
-/// The tier of a body (`blaze_api::Goal`'s two levels; docs/v2/plan/design/tiers.md).
+/// The tier of a body (`blaze_api::Goal`'s two levels; docs/v2/plan/design/backend-next.md).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Tier {
     /// Copy-and-patch code: what `edit` waits for.

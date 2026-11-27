@@ -1,5 +1,5 @@
 //! A BODY'S HEADS FROM FROZEN RECORDS: what a body task's store is seeded with, so a body
-//! lowers no head (engine.md "nothing starts over"; lane FJ's `seed`, head.rs).
+//! lowers no head (end-state.md D161, nothing starts over; lane FJ's `seed`, head.rs).
 //!
 //! A body's store asks its seed for each head it needs ([`HeadSeed`], heads.rs
 //! `Store::ensure_noting`): the need's cell is imported from its frozen record and filed, never
@@ -98,7 +98,7 @@ impl core::fmt::Display for SeedError {
     }
 }
 
-/// THE GATE'S FETCH (D168; typeck.md "The gate fetches, the recorder records"): the head cells
+/// THE GATE'S FETCH (D168): the head cells
 /// of a body's gate set (its last read list's head cells, on an edit) filed into the body's
 /// store before the body is entered, together, by `seeds`. One entry for the gate and for the
 /// engine's writer.

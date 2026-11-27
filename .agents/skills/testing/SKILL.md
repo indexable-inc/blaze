@@ -24,10 +24,9 @@ build byte for byte, and a budget for a fresh process to first answer. A file th
 of blaze can find (in the state directory, in a home, in `/tmp`) also has a test that a file of its
 previous layout is handled: an old home after an upgrade is detected, reported by name and rebuilt,
 and nothing is migrated (scope decision D36); a file outside a home is refused by name with what to
-do, or left alone under a name that carries its layout; docs/cargo.md, "Files that outlive a
-version", lists each with its test. A restore that silently starts empty is a failure blaze reports,
-naming why. A format that is written while blaze runs and read after a crash also gets a DST
-(`dst-not-review`) that crashes it at every point and checks the restore.
+do, or left alone under a name that carries its layout. A restore that silently starts empty is a
+failure blaze reports, naming why. A format that is written while blaze runs and read after a crash
+also gets a DST (`dst-not-review`) that crashes it at every point and checks the restore.
 
 ## dst-not-review (rule 43)
 
@@ -73,10 +72,10 @@ blaze is to be a compiler whose correctness is proved, not only tested. The orde
 practice: (1) one specification of what MIR does, written in Lean as an executable semantics (an
 interpreter over a deep embedding of MIR), held to the tree by running it against blaze's MIR
 evaluator and blaze-built code on generated programs; it is the one meaning every proof refers to
-(`one-concept-one-home`); (2) user code is proved against it: the functional models `hir-ty-lean`
-emits are derived from, and proved or checked equal to, the semantics of the body they model, so a
-proof is about what blaze compiles and not a hand-written copy; (3) each MIR transformation is
-correct against it: a small pass by a Lean theorem that its output refines its input, a large one by
+(`one-concept-one-home`); (2) user code is proved against it: the functional models blaze emits are
+derived from, and proved or checked equal to, the semantics of the body they model, so a proof is
+about what blaze compiles and not a hand-written copy; (3) each MIR transformation is correct
+against it: a small pass by a Lean theorem that its output refines its input, a large one by
 translation validation (a checker, itself proved sound, that accepts each run's before and after),
 run in the gate on real crates; (4) then lowering to LIR and to machine code against machine models,
 the front end's rules, and the driver's state machines by refinement from their reference models
@@ -129,11 +128,11 @@ Write few tests, each where it pays:
 - **Concurrent, durable, crash-recovering, billing or data-deleting code**: a deterministic
   simulation test (DST), below. This is the requirement of `dst-not-review`, not an option.
 - **A bug found in a real crate**: that crate's own tests under `blaze test`
-  (`verify-on-real-projects`); a daemon bug: a step in the edit harness
+  (`verify-on-real-projects`); an edit-loop bug: a step in the edit harness
   ([docs/harness.md](../../../docs/harness.md#adding-a-test)).
 - **A slow or flaky reproduction**: shrink it (blaze-sim's shrinker, treereduce, `git bisect`) into a
   test that runs in seconds, named for the property it breaks. That one is always allowed.
-- **Parsers of hostile bytes**: fuzzing (`crates/blaze-fuzz`, `fuzz/`).
+- **Parsers of hostile bytes**: fuzzing (`crates/blaze-fuzz`).
 
 No big suites, no tests of code whose shape is still changing, no red/green ritual on a dev
 host: push and let CI and the harnesses catch breakage.
@@ -201,9 +200,9 @@ fails, and replays it exactly.
   block changed on disk under what was synced). `crates/blaze-core/src/sim/pages.rs` is the
   worked example: a pool-shaped page store, its oracle, five planted bugs and seed replay.
 
-Examples: `crates/blaze-cas/src/tests/model_check.rs` (the store's operation sequence and the
-`Sim` seed are drawn, and the store is checked against a `BTreeMap`) and the crash tests in
-`crates/blaze-cas/src/tests.rs`; `crates/blaze-graph/src/sched/tests.rs` for the scheduler core.
+Examples: `crates/blaze-cas/src/plain/tests.rs` (the plain store under `Sim`: two writers, power
+cuts at any completion, failed effects, a reader after); `crates/blaze-graph/src/sched/tests.rs`
+for the scheduler core.
 
 Its limits: its own choices (latency, delivery order, what a crash tears) hang off one seed the
 test draws, so a failure's plan is shrunk and its schedule is not, until `Sim` takes the tape;
@@ -245,10 +244,10 @@ disk).
    - the fault classes to turn on, as a swarm: each run draws a subset (sync failures, short
      writes, latency, ENOSPC, lost watch changes) so a rare class is not drowned by a common one;
    - the crash points (after which op, or after how many completions);
-   - the schedule: which actor (thread, process, the daemon or a reader) takes its next step;
+   - the schedule: which actor (thread, process or a reader) takes its next step;
    - the `Sim` seed (`tape.next_u64("sim seed")`), until `Sim` takes the tape itself.
 3. **Run it in the simulation**: drive the core with the `Sim` driver, crash it, reopen it (the
-   restart runs recovery exactly as the daemon would), and keep going.
+   restart runs recovery exactly as a real start would), and keep going.
 4. **Check an oracle that states the invariant**, against a plain model kept beside the run, at
    every step and after every crash: "every row recorded and flushed appears exactly once after
    any crash", "a reader never sees a file the manifest does not list", "no byte is deleted while
@@ -265,8 +264,8 @@ disk).
    in the run reads real time, real threads or hash order (`deterministic-output`); a case that
    does is reported as not a function of its tape.
 
-A DST is fast enough for the merge gate at its default case count, and runs long
-(`BLAZE_SIM_SEEDS`) in the release train.
+A DST is fast enough for the merge gate at its default case count, and runs long with
+`BLAZE_SIM_SEEDS`.
 
 ### Worked example: blaze-profile's history
 

@@ -1,4 +1,4 @@
-//! Compression by tier (docs/v2/plan/design/data.md, "Compression follows the columns"). A
+//! Compression by tier (docs/v2/plan/design/columns.md). A
 //! column is `u32`s; the store picks its tier by how recently it was read, and every tier gives
 //! back exactly the values it was given.
 //!

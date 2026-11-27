@@ -1,5 +1,4 @@
-//! The project world's two source-independent pieces (drive.md, "End state: the whole pipeline
-//! on the command", piece 5 and the gap row "One body identity"):
+//! The project world's two source-independent pieces (end-state.md D157):
 //!
 //! - THE LIST of the program's own bodies ([`list_bodies`]), asked of any names source
 //!   ([`NamesSource`]: the solved names or each crate's records) through the same questions,

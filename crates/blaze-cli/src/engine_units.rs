@@ -1,4 +1,4 @@
-//! The `Units` stage of `blaze engine-check` (engine.md E6, second step): the records every later
+//! The `Units` stage of `blaze engine-check` (end-state.md D157): the records every later
 //! task's plan is made from, found forward before the first phase as the files are
 //! (engine_check.rs `plan`), each published by its task, entered once.
 //!
@@ -44,7 +44,7 @@
 //! profile's `plan:` line counts the rows read, the sources statted, the bytes written, the worlds
 //! built, the graph decodes and the fetched records mapped (floors 0 for the stats, bytes, worlds
 //! and decodes under the proof; the world and the decode are 1 until the world is read in place
-//! from the stored crate list, engine.md item 2).
+//! from the stored crate list, end-state.md D157).
 //!
 //! Anything else is a full discover, and the profile's phase line names why ([`UnitsCause`]). A
 //! stored record that cannot be read back is a typed refusal ([`BackRefused`]), never a quiet
@@ -265,7 +265,7 @@ pub(crate) struct PlanRows {
     /// Whether the sweep's [`Stood`] was handed to the stage.
     pub(crate) stood: bool,
     /// The names worlds made by the stage (names.rs `world`; floor 0 under a [`Stood`] once the
-    /// world is read in place from the stored crate list, engine.md item 2), and the graph
+    /// world is read in place from the stored crate list, end-state.md D157), and the graph
     /// decodes they made (floor 0 likewise).
     pub(crate) worlds_built: u32,
     pub(crate) graph_decodes: u32,
@@ -282,7 +282,7 @@ pub(crate) struct PlanRows {
 
 impl PlanRows {
     /// What making `names`' world did, counted into the line: nothing when the names were read
-    /// from the list and no world was made (its floor, engine.md item 2).
+    /// from the list and no world was made (its floor, end-state.md D157).
     fn world(&mut self, names: &Names<'_>) {
         let Some(made) = names.made() else { return };
         let opened = made.opened();
@@ -732,7 +732,7 @@ fn read_back<'f>(
         return Ok(Err(UnitsCause::World));
     }
     // The names from the crate list the record was sealed with (crate_list.rs version 6), read
-    // in place: no world made, no graph section decoded (engine.md item 2). The world is made by
+    // in place: no world made, no graph section decoded (end-state.md D157). The world is made by
     // need, from this record by its key, when a names, script or proc-macro task runs (names.rs
     // `made_or_make`). A list of an old home (version 5) is refused by its version and the graph
     // discovered in full (D160).

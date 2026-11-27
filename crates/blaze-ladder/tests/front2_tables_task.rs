@@ -1,4 +1,4 @@
-//! The body task over the read-only view (front2 tables/, engine.md E2): each body of a small
+//! The body task over the read-only view (front2 tables/, end-state.md D157): each body of a small
 //! no_core program checked by `check_body` over `Tables`, against today's path
 //! (`ProjectWorld::from_records`, one world for every body), in two orders, on 1 and 8
 //! workers, and with a planted bug in the recorder that an edit must catch.
@@ -406,7 +406,7 @@ fn order_and_workers_give_equal_bytes() {
     assert_eq!(shown(&forward), eight, "8 workers answer otherwise than 1");
 }
 
-/// ONE SHELF, MANY RUNS (engine.md E6, the Heads stage): each crate's tables made ONCE by the
+/// ONE SHELF, MANY RUNS (end-state.md D157, the Heads stage): each crate's tables made ONCE by the
 /// Heads task (`impl_tables_task`), framed as the store holds them and put on one `ImplShelf`;
 /// 8 runs on 8 threads, each with its own reader and its own `TableSet::lent` over that one
 /// shelf, give every body the same result, reads included, as one reader's own tables. A crate

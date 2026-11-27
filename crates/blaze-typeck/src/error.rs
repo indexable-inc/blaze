@@ -203,7 +203,7 @@ pub enum CheckError {
     Malformed(Malformed),
     /// The trait solver's own failure (a bound, malformed input, a part not ported).
     Solve(blaze_solve::SolveError),
-    /// A form the checker does not check yet, by name (typeck.md, "Owed to blaze-lower").
+    /// A form the checker does not check yet, by name (typeck.md, "Forms from blaze-lower").
     Unported(&'static str),
     /// The exact future witness is unavailable at this item-relative obligation or block.
     FutureWitness { reason: &'static str, at: crate::ids::Range },

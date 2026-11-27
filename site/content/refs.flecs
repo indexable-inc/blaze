@@ -48,7 +48,7 @@ refs {
   // blaze.
   Ref fn_cache(href: "https://github.com/indexable-inc/blaze/blob/main/docs/fn-cache.md", label: "blaze: the function cache", note: "#[blaze::cache], and what makes a function ineligible.")
   Ref sandbox(href: "https://github.com/indexable-inc/blaze/issues/147", label: "indexable-inc/blaze#147: sandbox build scripts and proc macros", note: "")
-  Ref borrowck(href: "https://github.com/indexable-inc/blaze/blob/main/docs/borrowck.md", label: "blaze: borrow checking", note: "")
+  Ref borrowck(href: "https://github.com/indexable-inc/blaze/blob/main/docs/v2/plan/design/flow.md", label: "blaze: borrow checking", note: "")
   Ref salsa(href: "https://github.com/salsa-rs/salsa", label: "salsa", note: "")
 
   // Rust and Lean.

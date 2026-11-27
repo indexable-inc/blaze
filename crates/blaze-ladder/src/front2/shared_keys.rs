@@ -1,5 +1,5 @@
 //! ONE FRONT-END PASS FOR A LIBRARY AND ITS TESTS (docs/v2/plan/design/test.md, "End state",
-//! piece 18; target.md: "an item's key holds no cfg, and every record's read list names the cfg
+//! piece 18; bottom.md section 3: "an item's key holds no cfg, and every record's read list names the cfg
 //! outcomes it read").
 //!
 //! THE FINDING (why the two units share nothing today, with the evidence):

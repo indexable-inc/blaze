@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Compile-time reflection in blaze. Phase 1 completes nightly `core::mem::type_info` in blaze's const evaluator; phase 2 is the opt-in `blaze_comptime` extension (`for const f in fields_of::<T>()`, `self.[f]`, `for<F: Field<T>>` bounds, `fn_info`), and 2b adds `dyn` and fn-pointer calls in const checked at evaluation and `const static { .. }` blocks that run any code at compile time; phase 3 builds types from const code (`type_of!`).
+summary: Compile-time reflection in blaze. Phase 1 answers nightly `core::mem::type_info` in blaze's const evaluator (built, crates/blaze-consteval); phase 2 is the opt-in `blaze_comptime` extension (`for const f in fields_of::<T>()`, `self.[f]`, `for<F: Field<T>>` bounds, `fn_info`), and 2b adds `dyn` and fn-pointer calls in const checked at evaluation and `const static { .. }` blocks that run any code at compile time; phase 3, types from const code, is type-of.md. The port to the item layer is tracked in extensions.md.
 date: 2026-11-09
 ---
 # Compile-time reflection (`comptime`)
@@ -33,52 +33,24 @@ Three phases, each usable on its own:
    Phase 2b, under the same feature: `dyn` and function-pointer calls in const, checked when
    they are evaluated, and `const static { .. }` blocks, which run any code that can run at
    compile time (`format!(..).leak()` as a `&'static str`).
-3. **Types built by const code** (`type_of!`). Design only; see the last section.
+3. **Types built by const code** (`type_of!`): [type-of.md](type-of.md).
 
 Rules this follows: superset-of-rust (phase 2 is opt-in and changes nothing for a crate that
-does not opt in), semantics-in-front-end (everything below is front end: hir-def, hir-ty,
-the solver, hir-ty-mir), errors-name-the-thing (a bound that fails names the field), and
+does not opt in), semantics-in-front-end (everything below is front end), errors-name-the-thing (a bound that fails names the field), and
 deterministic-output (fields in declaration order, never layout or hash order).
 
-## Phase 1: `core::mem::type_info` (done in this change)
+Where each piece stands on the item layer is extensions.md's ledger (the `for const`,
+`where const` and `#[blaze::reflect]` rows): the syntax is parsed by `crates/parser`,
+`fields_of` is lowered in `crates/blaze-flow-lower` and built in `crates/blaze-build`, and the
+probes are `crates/blaze-real/extensions/b_comptime_*.rs` and `b_reflect.rs`.
 
-`crates/hir-ty-mir/src/mir/eval/shim/reflection.rs` already answered every reflection
-intrinsic of the nightly (`type_id_type_of`, `type_id_fields`, `type_id_variants`,
-`type_id_generics`, `type_id_function_ptr`, `type_id_vtable`, the field-id family). What was
-missing against the pinned library and coretests (`library/coretests/tests/mem/type_info.rs`,
-`fn_ptr.rs`, `trait_info_of.rs`, `intrinsics.rs::test_type_id_vtable`):
+## Phase 1: `core::mem::type_info`
 
-| Gap | Fix |
-| --- | --- |
-| `#[rustc_splat]` on a fn pointer type's input was dropped: `FnPtr::splatted()` was always `None` (coretests `fn_ptr::test_splat`). Fn pointer inputs also ignored `#[cfg]` (RFC 2565 allows it there as on a function's). | `hir_def::hir::type_ref::FnType::splatted` (rustc's `FnDecl::splatted`: the first input with `#[rustc_splat]`, none on a C-variadic pointer), persisted (`ExpressionStore`/`Body` schema 9), lowered into `FnSigKind::set_splatted` (`hir-ty/src/lower.rs`), reflected as `is_splatted`/`splatted_index`. `#[cfg]` is checked per input. |
-| A field's `TypeId` was a private table entry, not a type: `type_id_field_representing_type(..) != TypeId::of::<field_of!(..)>()`, and the id meant nothing at run time (`ComplexMemoryMap::type_ids` held `None`). | A field's id is the id of `FieldRepresentingType<Base, VARIANT, FIELD>`, as rustc's `Ty::new_field_representing_type` makes it (lang item `FieldRepresentingType` added to `hir-def/src/lang_item.rs`). The field-id intrinsics read it back with `AdtDef::field_representing_type_info`, rustc's rule. `TypeIdOf` is gone; the evaluator's id table is plain types. |
-| `field_offset::<F>()` (what `core::field::Field::OFFSET` is) had no answer. | Answered from the FRT's base, variant and field (`Evaluator::field_offset`), as rustc's `field_offset` arm does. |
-| A `DynMetadata` in a constant (`trait_info_of::<dyn Tr>().get_vtable()`, coretests `trait_info_of::test_dyn_creation`) kept const eval's vtable id as if it were an address: a wrong pointer at run time, silently. | `hir-ty-codegen/mod.rs` `relocate`: a `DynMetadata<dyn Tr>` gets the vtable of its type for `Tr`, as a `&dyn Tr` does. A `DynMetadata<*const ()>` (what `type_id_vtable` and `trait_info_of_trait_type_id` return) is a typed error naming the type, because the id says which type but not which trait. |
-
-Tests: `crates/hir-ty-mir/src/tests/consteval/intrinsics.rs`
-(`type_info_field_ids_are_field_representing_types`, `type_info_field_offset`,
-`type_info_fn_ptr_splat`); the earlier `type_info_*` tests now go through FRTs.
-
-Left, each a known gap rather than a quiet difference:
-
-- **Vtable ids carry no trait.** `VTableMap` is keyed by type only, so a constant
-  `Option<DynMetadata<*const ()>>` from `type_id_vtable` (coretests
-  `intrinsics::test_type_id_vtable`, the second half of `trait_info_of::test_dyn_creation`)
-  cannot be emitted, and stops with the error above. The fix is rustc's: a vtable id names
-  `(type, dyn type)` (`GlobalAlloc::VTable(ty, dyn_ty)`). It is one port across
-  `hir-ty/src/mir.rs` (`VTableMap`), the constant encoders (`hir-ty/src/consteval.rs`,
-  `consteval/deps/codec.rs`), the identity hashes (`hir-ty-identity/src/facts.rs`,
-  `blaze-items/src/{facts,form}.rs`, `hir-ty-pure`) and codegen; it waits for lanes identity
-  and pure to land, which edit those files now.
-- `ComplexMemoryMap::type_ids` is still `Vec<Option<Ty>>`; the evaluator makes no `None`
-  now. Narrowing it to `Vec<Ty>` is the same kind of port, with the same files.
-- `builtin # field_of(..)` (the `field_of!` macro, `feature(field_projections)`) is not parsed
-  as a type, so a program can name an FRT only by `FieldRepresentingType<..>`. coretests'
-  type_info tests do not use it.
-- `field_offset` called at run time (not in const) reaches codegen, which has no arm for it
-  and stops with its unsupported-intrinsic error. rustc answers it in codegen by const eval.
-- `Type::of::<(A, B)>()` was refused, as rustc ICEs on it at the pinned nightly; it now answers
-  `TypeKind::Tuple` (2026-11-10, for `bstd::own`'s walk).
+Built: blaze's const evaluator answers the nightly's reflection intrinsics as rustc's const
+eval does (`crates/blaze-consteval/src/machine.rs`, tests in `src/tests/type_id.rs`), against the
+pinned library and coretests (`library/coretests/tests/mem/type_info.rs`). A field's `TypeId`
+is the id of `FieldRepresentingType<Base, VARIANT, FIELD>`, as rustc makes it, and a tuple's
+`TypeKind` is `Tuple` (rustc ICEs on it at the pinned nightly).
 
 ## Phase 2: `#![feature(blaze_comptime)]`
 
@@ -103,9 +75,7 @@ every crate graph and still could not hold them. The cost is one file
 
 ### The API
 
-Written (lane comptime-library, 2026-11-02): `library/core/src/reflect.rs`, its lang items in
-`crates/hir-def/src/lang_item.rs` (`Reflect*`) and blaze-diagnostics' lang-item table, its
-symbols in `crates/intern`, and the `library/UPSTREAM` entry. The file is the reference; in
+`library/core/src/reflect.rs` is the reference; in
 short (every item `#[unstable(feature = "blaze_comptime", issue = "none")]`, every trait
 `#[rustc_deny_explicit_impl]`):
 
@@ -176,14 +146,12 @@ Decided while writing it:
   `blaze_field_attrs::<F>() -> &'static [&'static str]`, `blaze_variant_index::<V>() -> usize`,
   `blaze_variant_discriminant::<V, E>() -> <E as DiscriminantKind>::Discriminant`,
   `blaze_fn_info::<F>() -> FnInfo`. Field names reuse nightly's
-  `field_representing_type_name`, variant names `type_id_variant_name`. The first five are in
-  `hir_ty::intrinsic::Intrinsic` (2026-11-02) in a range of blaze's own after rustc's
-  (`Intrinsic::FIRST_BLAZE`, append-only, since an intrinsic's index is persisted in MIR words
-  and hashed into code identity), each classed as reading its arguments' identity, and the
-  evaluator answers them (`eval/shim/reflection.rs`). `blaze_field_attrs` gives the empty slice
+  `field_representing_type_name`, variant names `type_id_variant_name`. They are in a range of
+  blaze's own after rustc's intrinsics, append-only, since an intrinsic's index is persisted
+  and hashed into code identity, each classed as reading its arguments' identity. `blaze_field_attrs` gives the empty slice
   for every field today: `#[blaze::attr(..)]` is not one of blaze's attributes yet, so no
-  accepted program has one. `blaze_fn_info` waits for the fn_info lane; until then its use is
-  the typed `UnknownIntrinsic` error at the constant that asks.
+  accepted program has one. Until `blaze_fn_info` is answered, its use is the typed
+  `UnknownIntrinsic` error at the constant that asks.
 - **A variant is two types.** The token `VariantRepresentingType<E, v>` (zero-sized, `Copy`, what
   `for const v` binds and what `Variant<E>` holds for) and the view `VariantOf<E, v>`
   (`repr(transparent)` over `E`, what `of` returns and what the variant's fields belong to).
@@ -269,14 +237,13 @@ copy, and a recursion limit.
 
 ### The solver: field-binder clauses
 
-Representation (as built, 2026-11-02): a field-binder clause is an ordinary
+Representation: a field-binder clause is an ordinary
 `Binder<ClauseKind>` whose bound variable is `BoundVariableKind::Reflected(ReflectedVar { kind,
 domain, container })` (`vendor/rustc_type_ir/src/reflect.rs`): `domain` is `Fields` or
 `Variants`, `container` the `T` of `Field<T>`, written inside the binder. The binder's bound is
 the variable itself, not a clause beside it, so a binder cannot lose its range: folding,
 visiting, flags and the persisted form (`next_solver/persist.rs`, bound variable tag 3) all
-carry the container. No new `ClauseKind`. Lowering builds one with
-`hir_ty::comptime::field_binder_clause` (lane infer owns `lower.rs`).
+carry the container. No new `ClauseKind`.
 
 Two rules, in `vendor/rustc_next_trait_solver/src/solve/reflect.rs`:
 
@@ -291,11 +258,11 @@ Two rules, in `vendor/rustc_next_trait_solver/src/solve/reflect.rs`:
    - a parameter, placeholder or rigid alias: prove `P(!F)` for a placeholder `!F` in a new
      universe, in the environment rule 1 extends. This is what lets one generic function call
      another with the same bound;
-   - otherwise: `C: Struct` (`Variants`: `C: Enum`), then `P(m)` for each member `m` of
-     `hir_ty::comptime::reflect_members_checked` (`FieldRepresentingType<C, 0, i>`; an enum's
+   - otherwise: `C: Struct` (`Variants`: `C: Enum`), then `P(m)` for each member `m`
+     (`FieldRepresentingType<C, 0, i>`; an enum's
      variants `VariantRepresentingType<E, v>`), in declaration order.
 
-   A failure names the member: `solver_errors.rs` proves the members again in a probe and
+   A failure names the member: the solver's error reporting proves the members again in a probe and
    reports the first that fails as `SolverDiagnosticKind::ReflectedMemberUnmet` with the error
    for it inside, which blaze-diagnostics prints as "field `b` of `S` has type `NotHash`, which
    does not implement `Hash`", the inner error as a note. Not yet: the primary span at the
@@ -325,57 +292,32 @@ hold. Rule 2 above expands over the filtered domain; rule 1 adds every bound as 
 Strings (`f.has_attr("skip")`) stay for `if const` pruning inside a body, where they decide
 per copy; they never narrow a bound, because a string is not a path and cannot be checked.
 
-### MIR: one generic body, unrolled at monomorphization
+### One generic body, unrolled per instance
 
-Borrow checking and every MIR pass run on generic MIR, before monomorphization
-(`crates/hir-ty/src/providers.rs`: Built, Runtime, Optimized, then `monomorphize`). So the loop
-stays one construct until an instance is made:
+Borrow checking and every pass run on the generic body, before an instance is made, so the loop
+stays one construct until then:
 
-- `TerminatorKind::ComptimeFor { domain, binder, body, after }` starts the loop and
-  `TerminatorKind::ComptimeNext { loop_ }` ends each iteration. Passes see an ordinary loop
-  (successors `body` and `after`), which is what borrowck and dataflow need: the body may run
-  any number of times. The MIR inliner does not inline a body that contains one.
-- `ProjectionElem::ReflectedField(F)` is `x.[f]` in generic MIR. Borrowck treats it as it
-  treats `Index`: it overlaps every field of the base, and two uses with the same binder in
-  one iteration are the same place (`&mut x.[f]` twice conflicts).
-- Moving out of `x.[f]` is refused for now (E0507, naming the place and the feature), behind a
-  reference as rustc refuses a named field's, and out of an owned base too. Two things are
-  missing for the owned case. First, rustc allows a move out of a field only from a base with
-  no `Drop` impl (E0509), and a generic `B: Struct` may have one, so the move would be refused
-  per instance, which breaks checking once; it needs a concrete base or a bound saying "no
-  `Drop`". Second, drop elaboration runs on the generic body, where the open drop of the base
-  after the move cannot say which field it skips. The plan: borrowck gives each binder one
-  move path, reset on the `ComptimeNext` back edge, plus a "some field of `x` moved through
-  `U`" state that conflicts with every use of `x` except `x.[f]` of that binder; drop
-  elaboration leaves an open drop with a reflected child to a run after the expansion.
-- Every pass after inference that solves goals over the body's types (borrowck, the MIR
-  passes, the evaluator, unsafeck, the lints) solves them in the env inference used, with
-  `InferenceResult::comptime_param_env` and an inference context raised to the binders'
-  universes (`hir_ty::comptime_env`), so it gives the same answers inference got inside the
-  loop.
-- monomorphization (`crates/hir-ty-mir/src/mir/monomorphization.rs`, reached through
-  `providers::Mir::monomorphize`) expands each `ComptimeFor` once its domain's base is
-  concrete: the region is the blocks dominated by `body`; for field `i` it copies the region,
-  gives every local whose type mentions `F` its own copy, substitutes `F := FRT<B, v, i>`,
-  turns `ReflectedField` into `Field(i)` (`Downcast(v), Field(i)` on a `VariantOf`), and
-  chains copy `i`'s `ComptimeNext` to copy `i + 1` (the last to `after`). Then a
-  `SwitchInt` on a now-monomorphic inline const is folded and unreachable blocks are dropped,
-  which is the `if const` guarantee (`monomorphization/comptime.rs` `fold_if_const`, run after
-  the fill on a body that had a loop: the switch's operand is the constant or the block's last
-  `_n = const C`; the blocks only the dead arm reached lose their statements and end in
-  `Unreachable`). An inline const inside a loop is lowered with the body's identity arguments
-  followed by one type argument per enclosing binder (`inline_const_args`), its own body reads
-  the loop's pattern as the binder's ZST value, and the instance puts `args[n + k]` in place of
-  binder `k` (`bind_inline_const`). A body with a loop has no shared compile identity: it is
-  compiled per instance (`Unshared::PerInstance`), keyed by its arguments, whose identity holds
-  each field's and variant's name (blaze-items form 3) besides their types and attributes. Nested loops expand outer first, since an inner domain
-  can name `F`. Copies are numbered in declaration order (deterministic-output).
+- Passes see an ordinary loop (the body may run any number of times), which is what borrowck
+  and dataflow need. A body that contains one is not inlined before it is expanded.
+- `x.[f]` is a place that overlaps every field of the base, as `Index` does, and two uses with
+  the same binder in one iteration are the same place (`&mut x.[f]` twice conflicts).
+- Moving out of `x.[f]` is refused (E0507, naming the place and the feature), behind a
+  reference and out of an owned base too: a generic `B: Struct` may have a `Drop` impl (E0509),
+  so the move would be refused per instance, which breaks checking once.
+- Every pass after inference that solves goals over the body's types solves them in the
+  environment inference used inside the loop, so it gets the same answers.
+- An instance expands each loop once its domain's base is concrete: for field `i` it copies the
+  body, gives every local whose type mentions `F` its own copy, substitutes
+  `F := FRT<B, v, i>`, turns `x.[f]` into field `i`, and chains the copies in declaration order.
+  A switch on a now-monomorphic inline const is folded and the dead arm dropped (the `if const`
+  guarantee). An inline const inside a loop gets one type argument per enclosing binder. Nested
+  loops expand outer first, since an inner domain can name `F`. A body with a loop is compiled
+  per instance, keyed by its arguments, whose identity holds each field's and variant's name.
 
-The construct lives in `crates/hir-ty-mir`; the domain rule (which fields, which filters,
-`Struct`/`Enum`) in a new front-end crate `crates/hir-ty-comptime`, which the solver's
-builtin candidates and the expansion both call, so the two cannot disagree.
+One home decides the domain (which fields, which filters, `Struct`/`Enum`), and both the
+solver's builtin candidates and the expansion ask it, so the two cannot disagree.
 
-### Building a struct (2026-11-09)
+### Building a struct
 
 Decoding needs a `T` made field by field, which `x.[f]` cannot do: it is a place of a value that
 already exists. A closure cannot be the per-field callback (it is not generic, and each field
@@ -432,9 +374,8 @@ Inside `take`, `F` is a type parameter, and rule 1 above reached a field binder 
 loop's binder or the solver's placeholder member, so the binder said nothing of it; the impl
 cannot write `where F::Type: Decode` itself (E0276: stricter than the trait). The addition is
 rule 1 for a parameter: a function's environment with `P: Field<C>` (`P: Variant<C>`) has each
-field binder over `C` in that domain instantiated at `P`, elaborated
-(`hir_ty::comptime::with_member_bounds`, run by `param_env_from_clauses`, so inference, the
-MIR passes and the impl-method comparison all see it). Sound for the reason rule 1 is: whatever
+field binder over `C` in that domain instantiated at `P`, elaborated where the environment is
+built, so inference, the passes and the impl-method comparison all see it. Sound for the reason rule 1 is: whatever
 instantiates `P` proves `P: Field<C>`, so it is a member, and the binder holds of every member.
 An environment with no field binder is returned as it is, so a crate without the feature is
 unchanged. It is a general rule, not a construction form: any helper generic over one field
@@ -444,7 +385,7 @@ unchanged. It is a general rule, not a construction form: any helper generic ove
 `fields_of`, `Field::OFFSET` and `MaybeUninit`; they belong to the serialization library
 (`bstd::data`), not `core::reflect`: a `for const` in `core` would need
 `#![feature(blaze_comptime)]` on `core`, which turns on phase 2b's dispatch check in `core`'s
-const bodies. The tests carry a copy (`crates/hir-ty-mir/src/tests/mir/comptime_codec.rs`).
+const bodies.
 
 Not yet: building an enum's variant (`build::<V::View>` makes a `VariantOf<E, v>` but does not
 write its discriminant, and `core::field::Field` of an enum's field representing types is still
@@ -474,12 +415,10 @@ exhaustiveness without the `unreachable!()` are later work.
 
 ### Function reflection: `fn_info`
 
-`fn_info(&f).code_id` is the one user-facing way to get a function's code hash: the behaviour
-identity of lane identity's `hir_ty_identity::code_id` (that lane's handoff
-`/tmp/blaze-lanes/v2-identity.md`; its plan doc, `docs/v2/plan/design/code-identity.md`, is
-being written), the root instance being `f` with its generic arguments (`fn_info(&g::<u8>)`, or
-a closure). `F: FnItem` holds for fn item and closure types only: a fn pointer has no code
-known at compile time.
+`fn_info(&f).code_id` is the one user-facing way to get a function's code hash: its behaviour
+identity (`CodeId`, bottom.md section 3), the root instance being `f` with its generic arguments
+(`fn_info(&g::<u8>)`, or a closure). `F: FnItem` holds for fn item and closure types only: a fn
+pointer has no code known at compile time.
 
 - **Answered by const eval, not codegen.** The library body (`FnInfo::of::<F>()`, which
   `fn_info(&f)` calls) is `const { intrinsics::blaze_fn_info::<F>() }`, an inline const, so the answer is a constant in
@@ -487,22 +426,16 @@ known at compile time.
   This matters for identity: `code_id` covers a body's constants' values but names a plain
   callee only by item key, so an intrinsic answered in codegen would give a caller the same
   CodeId before and after `f`'s code changes while its output changed (keys-cover-every-input).
-  As a constant, `f`'s id is in the caller's id. Lane identity's planned
-  `blaze_code_id::<F>()`, answered in hir-ty-codegen, becomes this intrinsic; the kernel reads
-  `fn_info(&step).code_id`. One door.
-- **Wiring.** `hir-ty-mir`'s evaluator cannot call `hir-ty-identity` (which depends on it), so
-  `code_id` is reached through a table in `hir_ty::providers` that `hir-ty-identity` registers
-  with `inventory::submit!`, as hir-ty-mir registers `providers::Mir`. A binary that links no
-  table answers with a typed `MirEvalError` naming `f` and the crate to link (a job failure,
-  not the panic `Mir` gives), never a zero id.
+  As a constant, `f`'s id is in the caller's id. The kernel reads
+  `fn_info(&step).code_id`: one door.
 - `Unidentified` (a `dyn` call the walk cannot follow, a body that does not lower) is an error
   at the constant that asked, naming `f` and the chain identity reports.
 - A function whose own constants ask for its own id (directly, or `f` asks for `g`'s and `g`
   for `f`'s) depends on itself. The query cycle is a typed error naming both functions and the
-  constant, never a fixpoint and never a salsa panic.
+  constant, never a fixpoint.
 - Under rustc: no `core::reflect`, so refused at compile time, never faked.
-- Wired once `hir-ty-identity` compiles; the rest of `FnInfo` (name, path, inputs, output,
-  const and unsafe) needs only what `type_id_function_ptr` already reads.
+- Not built. The rest of `FnInfo` (name, path, inputs, output, const and unsafe) needs only
+  what `type_id_function_ptr` already reads.
 
 ### Tests phase 2 must land with
 
@@ -521,39 +454,16 @@ known at compile time.
 - Borrowck: `&mut x.[f]` twice in one iteration is refused; moving `x.[f]` out of `&T` is
   refused, naming the place.
 - `if const` pruning: a copy whose dead arm holds `const { panic!() }` builds.
-- The codec (`hir-ty-mir/src/tests/mir/comptime_codec.rs`): `field_names` and `encode` over a
+- The codec: `field_names` and `encode` over a
   struct of a `u8`, a string and a `bool` print the names and encodings in declaration order;
   `decode` through `build` makes a struct, and when the input runs out at the third field drops
   the two written, in order. `encode` of a struct with a field lacking `Encode` is refused at
-  the call naming the field (`hir-ty/src/tests/comptime_solver.rs`); a parameter `F: Field<T>`
-  gets the binders over `T`, and one of `Field<U>` does not (`comptime_infer.rs`).
-
-### Work split (lanes for phase 2)
-
-Interfaces are this document's; each lane builds and lands on its own.
-
-1. **syntax**: `crates/parser` (`for const`, postfix `.[ ]`, bounded `for<..>` binders in
-   where clauses), the AST accessors (`ForExpr::const_token`, an index expression with a dot
-   token), hir-def lowering to `Expr::ComptimeFor` and `Expr::ReflectedField`, the binder
-   parameters' bounds in `GenericParams`, persistence (`hir/columns.rs`, `persist.rs`), and the
-   feature check. Every exhaustive match over `Expr` updated in the same batch (rule 21).
-2. **library** (written 2026-11-02, see "The API"): `library/core/src/reflect.rs`, lang items
-   in `hir-def/src/lang_item.rs`, `library/UPSTREAM` entry. Left for the solver, mir and
-   fn_info lanes: the six `blaze_*` intrinsics in `hir_ty::intrinsic::Intrinsic` and their
-   evaluator arms (five written 2026-11-02 by the mir lane; `blaze_fn_info` left).
-3. **solver**: builtin candidates and the two field-binder rules, errors naming the field
-   (`hir-ty/src/solver_errors.rs`), `crates/hir-ty-comptime` (the domain).
-4. **infer**: the loop's placeholder and param env, `.[ ]` place typing, const binding.
-5. **mir**: the terminators and projection, borrowck rules, generic-pass handling, the
-   expansion and the `if const` fold in monomorphization; the tests above. Written
-   2026-11-02 except the passes' env and partial moves; of the tests, the `Debug` parity (a
-   reduced fixture core: field names, indices and values, no `fmt`) and the `if const` one are
-   written, not yet run.
-6. **fn_info**: after lane identity lands.
+  the call naming the field; a parameter `F: Field<T>` gets the binders over `T`, and one of
+  `Field<U>` does not.
 
 ## Phase 2b: evaluation in place of const checking
 
-Two more pieces of `#![feature(blaze_comptime)]` (2026-11-09), for const code the nightly's
+Two more pieces of `#![feature(blaze_comptime)]`, for const code the nightly's
 const checker refuses although the evaluator can run it: calls through `dyn` and function
 pointers in a const context, checked when they are evaluated; and `const static { .. }` blocks,
 in which nothing is const-checked and everything that can happen at compile time runs:
@@ -566,8 +476,8 @@ const PAUSE: &str = const static { format!(".globl {SYM}\n{SYM}:\npause\nret\n")
 
 ### `dyn` and fn-pointer calls in const
 
-Without the feature, as rustc: the const checker (`hir-ty-mir/src/mir/const_check/calls.rs`,
-rustc's `check_consts`) refuses a call through a function pointer (`FnCallIndirect`) and a
+Without the feature, as rustc: the const checker (rustc's
+`check_consts`) refuses a call through a function pointer (`FnCallIndirect`) and a
 method call on `dyn Trait` of a trait that is not const (`NonConstFn`); `effects::non_const_calls`
 refuses the same. With it, in a crate that has it, neither is a static error: the call is
 checked where its target is known, when it is evaluated.
@@ -586,14 +496,13 @@ checked where its target is known, when it is evaluated.
   checker applies to a direct call: a `const fn` whose `[const]` bounds hold const, or a method
   of a `const trait` whose `Self: [const] Trait` holds (a `const impl`; a default method
   only through one). A closure is const when it is written `const ||`.
-- **The error.** Otherwise `MirEvalError::Comptime(ComptimeError { kind: NonConstTarget { .. },
-  at })`, naming the function that would run (a trait method resolved to its impl's), how it
+- **The error.** Otherwise a `NonConstTarget` error, naming the function that would run (a trait method resolved to its impl's), how it
   was reached (a function pointer, or the vtable of the `dyn` type), whether its `[const]`
-  bounds were what failed, and the call site; the frames it propagates through
-  (`MirEvalError::InFunction`) are the call chain.
+  bounds were what failed, and the call site; the frames it propagates through are the call
+  chain.
 - **When the check runs.** In an evaluation at compile time (a constant, a static, an anonymous
   constant), outside a `const static` block, at a call in a body that is a const context
-  (`effects::body_constness`, or an anonymous constant) of a crate with the feature
+  (a const body, or an anonymous constant) of a crate with the feature
   (`effects::dispatch_checked_at_eval`). That is exactly the set of calls the static check
   let through: a body of a crate without the feature never reaches one (refused statically),
   and a body that is no const context only runs at compile time inside a `const static` block.
@@ -618,7 +527,7 @@ generic code can come later on top.
   no keyword and no `SyntaxKind` (whose numbers are persisted in source maps), and reads as
   `const { .. }` evaluated statically, as D's `static if` and C++'s `static_assert` use the
   word. The parser takes it in every crate as a `BLOCK_EXPR` with a `const` and a `static`
-  token (`BlockExpr::is_comptime`); hir-def lowering refuses it without the feature
+  token (`BlockExpr::is_comptime`); lowering refuses it without the feature
   (`ComptimeForm::Block`, the `ComptimeWithoutFeature` error) and with it lowers it as an
   inline const, `Expr::Const`: the same type checking, the same generic handling (evaluated per
   instance), no new `Expr` and no change to the store's format. Whether an `Expr::Const` is one
@@ -655,7 +564,7 @@ generic code can come later on top.
   `HeapInValue`, as today: each use of the constant would copy its owner, and a drop would free
   the constant's memory. Heap the value does not reach is dropped, as in any constant.
 
-### `where const { COND }` and names by id (2026-11-10)
+### `where const { COND }` and names by id
 
 Two more pieces of the feature, for properties derived by a const walk over `type_info`
 ([ownership](ownership.md) has the design, the coherence rule and the tests):
@@ -664,19 +573,15 @@ Two more pieces of the feature, for properties derived by a const walk over `typ
   parameters, evaluated per instance. A blanket impl gated on it is how a reflection-derived
   trait is stated (`unsafe impl<T: ?Sized> Acyclic for T where const { none::<T, Cycle>() } {}`).
   A condition that panics does not hold, and its message is the reason the unmet bound's error
-  shows. `hir-def` `GenericParams::where_consts`, `ComptimeForm::WhereConst`;
-  `hir_ty::where_const`; the solver's `ConstEvaluatable` goal asks the delegate.
+  shows. On the item layer it is `WherePred::Const` and the solver goal `ConstHolds`
+  (extensions.md).
 - **`core::reflect::name_of(id)`** (intrinsic `blaze_type_name_of`): the type a `TypeId` is of,
   as a diagnostic names it. A walk over ids names the types on its path with it.
 - **A constant of `TypeId`s read by another evaluation** (`walk(id::<T>(), &Q::ASK)`, where
-  `Q::ASK` holds ids): an id's bytes in the evaluator are its place in the list of the
-  evaluation that made it, and the constant carries what type each is of
-  (`ComplexMemoryMap::type_ids`). Copying the constant into a reader gives each id the walk by
-  type reaches the reader's id of the same type (`Evaluator::own_type_id`), so the value is the
-  same whoever reads it and nothing is evaluated twice. A constant whose type could hide an id
-  from that walk (a raw pointer, a `dyn`, a union that may hold one) is refused by name.
-- Phase 1 answers a tuple's `TypeKind` (`Tuple`), which it refused as rustc ICEs: a walk by
-  kind has to tell a tuple from what it cannot see into.
+  `Q::ASK` holds ids): an id's bytes are the content digest of the ground type, so the value is
+  the same whoever reads it ([consteval](consteval.md), "Comptime on the item layer" 2).
+- Phase 1 answers a tuple's `TypeKind` (`Tuple`): a walk by kind has to tell a tuple from what
+  it cannot see into.
 
 ### Without the feature
 
@@ -693,8 +598,7 @@ Cost: one cached feature lookup per inline const of a constant's body at MIR low
 
 ### Tests
 
-`crates/hir-ty-mir/src/tests/consteval/comptime.rs` (evaluation) and
-`crates/hir-ty-mir/tests/mir/const_check.rs` (the static check):
+Evaluation and the static check:
 
 - a `dyn` call of a `const impl` method in a `const fn` evaluates; one of a plain impl is the
   `NonConstTarget` error naming the impl's method and the `dyn` type;
@@ -716,45 +620,6 @@ Cost: one cached feature lookup per inline const of a constant's body at MIR low
   refused statically, as std's impl is not const; through the evaluator it would be checked.
 - `const_eval_select` takes its const arm in every evaluation, so a `const static` block runs
   std's const-eval paths where std has them (`align_offset` gives `usize::MAX`).
-
-## Phase 3: types from const code (`type_of!`), design only
-
-Goal: const code computes a type. `type_of!(EXPR)` is a type position whose `EXPR` is a const
-expression of type `TypeId` (the inverse of `TypeId::of`) or of a description,
-`core::reflect::TypeDesc`:
-
-```rust
-const fn with_ids(fields: &[FieldDesc]) -> TypeDesc { .. }      // ordinary const code
-type Row = type_of!(TypeDesc::Struct(StructDesc { name: "Row", fields: &[
-    FieldDesc { name: "id", ty: TypeId::of::<u64>(), attrs: &[] },
-    FieldDesc { name: "name", ty: TypeId::of::<String>(), attrs: &[] },
-]}));
-```
-
-- **Identity.** A described type is structural: interned by a content hash of its evaluated
-  description (names, field types by identity, attributes, repr), so two equal descriptions
-  are one type in every crate. The description's hash is the type's key
-  (keys-cover-every-input), and its `type_name` is the description's name with that hash's
-  prefix, deterministic across machines.
-- **Back to a type.** `type_of!(id)` of a `TypeId` resolves through the evaluator's id table,
-  which already maps every id it made back to its type (phase 1 made field ids real types for
-  this reason).
-- **Generic.** In a generic context `type_of!(make::<T>())` is an alias the solver normalizes
-  once its arguments are concrete, rigid before that. What generic code may assume about it
-  comes from a declared bound on the alias (`type Out<T> = type_of!(make::<T>()) where
-  Out<T>: Debug;`), checked when the alias is normalized for concrete `T`. That check is
-  per instance; it reports at the instantiating use, naming the alias and the bound, which is
-  the one place phase 3 cannot avoid an instance-time error, so it is kept to declared bounds
-  and never reaches into bodies.
-- **Impls.** Auto traits follow fields; other traits come from phase 2's blanket code
-  (`for const` over a described struct is the same loop), or from an `impls` list in the
-  description naming impls generic over `T: Struct`.
-- **Cycles.** Lowering a type calls const eval, which may lower types: a type whose
-  description depends on itself is a typed cycle error naming the alias and the constant.
-- **Why not types as values (Zig's `comptime`).** Zig checks a function body per
-  instantiation, so a wrong use is reported at a caller, after the fact. blaze keeps Rust's
-  check-once rule: const code computes descriptions, and a type exists only after
-  `type_of!` has evaluated one.
 
 ## Prior art
 

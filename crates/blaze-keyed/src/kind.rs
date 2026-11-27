@@ -108,7 +108,7 @@ pub trait Kind: Sized + 'static {
     const LAYOUT: Layout;
     const GRAIN: Grain;
     const TRACE: Trace;
-    /// A default until the per-kind measurement of target.md, "Choosing what is resident".
+    /// A default until the per-kind measurement of docs/v2/plan/design/bottom.md section 10.
     const KEEP: Keep;
     /// The record's root: the record a buffer of this kind opens to.
     type Root: Headed;
@@ -471,7 +471,7 @@ kind! {
 }
 
 /// A surface's key: what it is, from text alone: the unit's identity and its own items' pieces
-/// (bodies cut, except what counts as interface: target.md, "Key rules"). Nothing of a
+/// (bodies cut, except what counts as interface: docs/v2/plan/design/bottom.md section 3). Nothing of a
 /// dependency: what it reads of one is its shape ([`Trace::Read`]).
 pub struct SurfaceInputs<'a> {
     pub tool: ToolId,
@@ -806,7 +806,7 @@ kind! {
     /// One test's result: an outside kind ([`crate::outside`]) whose asks are the functions the
     /// test executed and the outside reads it made (blaze-testsel's `ask`), so an edit misses
     /// only the tests that executed what it changed, and an undone edit finds its old result
-    /// (docs/v2/plan/design/test-selection.md).
+    /// (docs/v2/plan/design/test.md).
     TestRun {
         tag: 8, version: 2, layout: Flat, grain: Run, trace: Outside, keep: Disk, root: Traced,
         inputs: TestInputs,

@@ -183,7 +183,7 @@ fn cold(crates: &[CrateInput<'static>], texts: &'static Texts) -> Vec<(Vec<u8>, 
     solved.iter().map(|c| (c.record.to_vec(), c.inner.to_vec())).collect()
 }
 
-/// The architect's test (drive.md, piece 16): re-solving a crate after a name edit expands no
+/// The architect's test (drive.md): re-solving a crate after a name edit expands no
 /// unchanged derive again. And the round trip: the re-solve's records equal a cold solve's of
 /// the edited text, and its expansions set (four entries taken from the earlier set, one made)
 /// equals, byte for byte, the set a first solve of the edited text writes (every entry made).

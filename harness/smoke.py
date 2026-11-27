@@ -122,7 +122,7 @@ def blaze_program(given):
 
 
 def base_env():
-    # BLAZE_LOCK: the cases and projects are copies, throwaway workspaces with no committed lock: their builds may write lock files under CI (docs/cargo.md, "Lock files"); a typed --locked still wins.
+    # BLAZE_LOCK: the cases and projects are copies, throwaway workspaces with no committed lock: their builds may write lock files under CI (docs/v2/plan/design/lock-policy.md); a typed --locked still wins.
     env = dict(os.environ, CARGO_TERM_COLOR="never", RUST_BACKTRACE="0", BLAZE_LOCK="write")
     for name in ("RUSTFLAGS", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER"):
         env.pop(name, None)

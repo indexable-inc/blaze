@@ -223,7 +223,8 @@ promotes that check into a compiler-enforced boundary for sans-IO data:
   `#[blaze::linear] UnmanagedVec<'id, T, I = u32>`, `Small*` / `Large*` aliases, and the
   compressed-pointer tier (`ArenaBase<'id, A>`, 4-byte `Ref32<'id, T>`, 8-byte
   `ArenaVec<'id, T, I = u16>`).
-- **Planned (front end):** `hir-ty-linear` + MIR drop-elaboration unique-binding resolution for
+- **Built (front end):** the `#[blaze::capability]` check on `#![blaze::sans_io]` ADTs
+  (`crates/blaze-typeck/src/rules/capability.rs`, lint `blaze::capability_in_sans_io`).
+- **Planned (front end):** drop-elaboration unique-binding resolution for
   `DropWith<C>`, comptime reflection `DropWith` derivation over `fields_of` / `variants_of`,
-  optional `let v = .. with(cx);` disambiguator, and the `#[blaze::capability]` check on
-  `#![blaze::sans_io]` ADTs.
+  and the optional `let v = .. with(cx);` disambiguator.

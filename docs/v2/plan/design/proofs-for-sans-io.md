@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Lean proofs take the place of deterministic-simulation tests for sans-IO Rust. A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its statement is that it returns `true` for every argument, and returns. A state machine is proved by three of them over a well-formedness predicate written in Rust (it holds at the start, each step keeps it, it implies the property), and one Lean lemma gives every run. Worlds (clock, file system with crashes, locks, later atomics) are Rust predicates saying which answers the kernel may give; a theorem takes the answers as arguments. `blaze prove` emits the models, checks the proofs with the pinned Lean and reports open goals; agents write the proofs. Built so far (2026-11-13): the attribute; methods, integer and Option primitives and theorem statements in the translator; `Blaze.Machine`; `blaze_auto`; the plan of a proof check; `blaze prove` on the first driver (no sandbox yet); and the first proofs of blaze's own code, blaze-core's ETXTBSY retry schedule (two theorems, one sampled test deleted). No world model, no state machine and no simulation test yet. Reviewed from outside the work on 2026-11-13 (its changes are in).
+summary: Lean proofs take the place of deterministic-simulation tests for sans-IO Rust. A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its statement is that it returns `true` for every argument, and returns. A state machine is proved by three of them over a well-formedness predicate written in Rust (it holds at the start, each step keeps it, it implies the property), and one Lean lemma gives every run. Worlds (clock, file system with crashes, locks, later atomics) are Rust predicates saying which answers the kernel may give; a theorem takes the answers as arguments. The translator that emitted the models from the Rust (hir-ty-lean) and `blaze prove` are not in the tree: the models it generated stay checked in under lean/BlazeModel, the pinned Lean checks them and their proofs (scripts/src/bin/lean_gate.rs), and agents write the proofs.
 date: 2026-11-13
 ---
 # Proofs in place of simulation tests
@@ -161,13 +161,14 @@ over the run.
 
 ### 3. The translator's subset
 
-`hir-ty-lean` v0 took free, non-generic functions over integers, slices, structs and enums.
-The subset grows by steps, each a refusal removed and held by golden tests:
+The translator is not in the tree. hir-ty-lean, part of the old front end, took free,
+non-generic functions over integers, slices, structs and enums. Its subset, to be built again
+on the new layer, grows by steps, each a refusal removed and held by golden tests:
 
 | Step | Construct | How |
 |---|---|---|
 | 0 | opaque items: a type or function the property never looks inside (`io::Error`, `PathBuf`, `format!`'s result, a third-party type) | declared in Lean with no definition; a theorem holds for every meaning of it |
-| a | methods, associated functions, `self` in any form (built 2026-11-13) | the same translation, named `Type.method`; each type in a module of its own |
+| a | methods, associated functions, `self` in any form | the same translation, named `Type.method`; each type in a module of its own |
 | b | generic functions and types, trait bounds, derived impls, `?` | one module per instance; a bound is resolved to its impl at the instance |
 | c | closures, and std's safe combinators (`Option::map`, `is_some_and`, ..) | a closure is a Lean function over its captures; a combinator is translated from `library/` where its source is safe |
 | d | `Vec`, `VecDeque`, `BTreeMap`, `String`, `Duration`, `Box` and blaze's own containers | a table from Rust path to Lean model (`Blaze.Std.*`); an entry is trusted until the deep embedding proves it, and what a model assumes of a type (a lawful `Ord` for a map's key) is an obligation on that type, not an assumption |
@@ -175,8 +176,7 @@ The subset grows by steps, each a refusal removed and held by golden tests:
 | f | `&mut` inside a value or returned | backward functions, as Aeneas |
 | g | recursion | fuel, as loops |
 
-- **Generics are translated by instance** (step b; methods of non-generic trait impls built
-  2026-11-14, the rest designed here). A theorem function is closed, so everything it reaches
+- **Generics are translated by instance** (step b). A theorem function is closed, so everything it reaches
   is reached at concrete type arguments, as in codegen:
   - An *instance* is a function with every generic argument concrete. A body is translated
     at an instance: each type in it is substituted before it is modelled, each callee's
@@ -221,7 +221,7 @@ The subset grows by steps, each a refusal removed and held by golden tests:
   (`blaze_auto`: unfold the model, `mvcgen`, then `grind` and `omega`) before a proof file is
   asked for. What it closes needs no proof file.
 
-### 5. The command
+### 5. The command (not built)
 
 `blaze prove [-p crate]` (formal-verification.md's open question 2, decided: its own command):
 
@@ -264,8 +264,8 @@ and line; like `Open`, it makes the command fail.
 
 Generated models are build outputs, keyed by the function's code identity
 (`outputs-are-records`); the tree holds the proofs and, per theorem, the hash of the
-statement it was checked against. The models of hir-ty-lean's own fixtures stay checked in
-under `lean/BlazeModel/`: they are that crate's golden tests.
+statement it was checked against. The models hir-ty-lean generated stay checked in under
+`lean/BlazeModel/`, fixed until a translator emits them again.
 
 ### 6. Evidence that the model is the code
 
@@ -355,7 +355,7 @@ stated in by the runner it calls (decision D46, below).
   panic that names the rule; each word holds its newest message's value after every step.
   It is held to the Lean world by that world's 48 litmus runs restated in Rust with the same
   schedules and the same answers.
-- The translator (built 2026-11-14): a call of `two_weak` is `Threads.two_of`, as `two`'s
+- The translator (not in the tree; its rule): a call of `two_weak` is `Threads.two_of`, as `two`'s
   is; each function carries whether it reaches `two` and whether it reaches `two_weak`,
   through its callees and closures; a theorem that reaches `two_weak` has its statement over
   `.valueWeak`, and one that reaches both is refused by name. `Prog.valueAny` is gone.
@@ -395,9 +395,9 @@ for the unpark and 21 reachable states (`lean/Blaze/Tests/ThreadsParkProof.lean`
 
 Built 2026-11-14, all of it: both worlds; the method; the Rust `two` with scheduled atomics
 behind the facade `blaze_core::atomic` (`crates/blaze-core/src/world/threads.rs`); the
-translator (a function that reaches an atomic operation, `two`, `wait` or `wake`, or a
-function that does, is emitted as a `Threads.Prog`, and a shared theorem's statement is that
-its program's value is `ok true`); and the first proof of real lock-free code,
+translator's rule, for when one is in the tree again (a function that reaches an atomic
+operation, `two`, `wait` or `wake`, or a function that does, is emitted as a `Threads.Prog`, and
+a shared theorem's statement is that its program's value is `ok true`); and the first proof of real lock-free code,
 `no_unpark_is_lost` (`wait/parking.rs`, `BlazeCore/Wait/Parking.lean`): the real `park` and
 `unpark` as two threads, every schedule, every choice of the kernel's, the retry's count and
 the error path of a clock that stands still: 8 kinds of park point, 3 of the unpark, 26
@@ -440,7 +440,7 @@ deadline, and promptly after its wake).
 - Built as the first slice was: the Lean world (`Op.clock`, `Op.now`, `Op.wait_until` in
   `lean/Blaze/Threads.lean`) and its examples by evaluation (`lean/Blaze/Tests/ThreadsClock.lean`);
   the Rust `two` to match (`threads::{clock, now, time, wait_until}`, a reading in whole
-  nanoseconds, exact); their entries in the translator's table; the statements
+  nanoseconds, exact); the statements
   (`a_park_keeps_its_deadline` for (1) and (2), `a_park_left_alone_returns_or_sleeps` for (3),
   in `wait/parking.rs`), run on drawn schedules and readings with a planted kernel for each
   (one that says a deadline early, one whose wait has no deadline, one that never sleeps).
@@ -485,8 +485,7 @@ deadline, and promptly after its wake).
 ## Order of work
 
 1. The pipeline on real functions of blaze (done 2026-11-13 for
-   `blaze_core::busy`: two theorems proved, one sampled test deleted; held by the lake gate
-   and a golden test until `blaze prove`'s driver is the gate).
+   `blaze_core::busy`: two theorems proved, one sampled test deleted; held by the lake gate).
 2. Opaque items, methods and `Duration`: the wait's retry step (`Retry::left`, `Retry::after`
    in `blaze_core::wait::retry`) against a clock world. Its loop `drive` (a closure and a
    trait bound) follows with steps b and c; until then the DST stays.
@@ -503,7 +502,6 @@ the worlds with `Sim` held to them; the subset's coverage of sans-IO functions a
 the count of invariants at `proved`; atomics.
 
 The models under `lean/BlazeModel/blaze_core` are what the proofs in the tree were checked
-against, so they must be what `blaze prove` emits from the source today:
+against. With no translator in the tree, nothing holds them to the source today;
 `harness/v2/lean_gate.py '{"command": "models", "emitted": "<target>/lean/lib"}'` compares
-every model a run emitted with the checked-in one, byte for byte. It needs a built blaze and
-is run by hand after `blaze prove -p blaze-core` until the release train runs it.
+emitted models with the checked-in ones, byte for byte, once something emits them.

@@ -5034,7 +5034,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     def_crate_starts.extend(expansion.nested.iter().filter(|c| c.scope == PathScope::DefCrate).map(|c| c.path.start));
     def_crate_starts.sort_unstable();
     let def_crate = |at: usize| def_crate_starts.binary_search(&(at as u32)).is_ok();
-    // The column's input indexes are the call's text as written (drive.md, ruled 20:57): a
+    // The column's input indexes are the call's text as written (drive.md): a
     // fn-like call's input is that text; an item macro's is the item its walk made, matched to
     // the written item from its end (blaze-expand `align_suffix`). Lexed as `lexed` lexed it.
     // A call written in an expansion: its input's tokens indexed as written are the words the

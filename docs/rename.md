@@ -40,7 +40,7 @@ An old name that still worked would be one more name to document, test and keep.
   enabled, and removes the old programs (saying so in one line when it removes `cargo-blaze`).
 - `blaze` takes away the links to `cargo-blaze` an earlier `enable` made for `cargo fmt` and
   `cargo clippy`, with the rest of what `enable` wrote
-  ([cargo.md](cargo.md#plain-cargo-switched-on-globally)).
+  (cargo.md, "Plain cargo, switched on globally").
 
 The remote cache's keys and the fn-cache's files changed with the names they hash, so
 neither finds what was stored under the old ones.

@@ -720,7 +720,7 @@ impl<S: Split, O: Opening> Kqueue<S, O> {
             // a file thread (`threads::run`), a read on the file's kept descriptor (no open
             // after the first) and a batch one `preadv` a run, `F_NOCACHE` where it bypasses the cache and at
             // `IOPOL_THROTTLE` where it is idle; the store's pool gives its driver threads
-            // enough to keep a drive's queue deep (docs/v2/plan/design/store-pool.md).
+            // enough to keep a drive's queue deep.
             effect @ (Effect::ReadAll { .. }
             | Effect::Read { .. }
             | Effect::ReadInto { .. }

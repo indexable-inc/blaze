@@ -1,5 +1,5 @@
 //! Closures, fn items and constructors passed where a generic callee's bound says
-//! `F: FnOnce(Args) -> R` (typeck.md, "Closures against `Fn` bounds"). The pinned library's
+//! `F: FnOnce(Args) -> R` (typeck.md, "A closure's identity"). The pinned library's
 //! declarations (library/core/src/ops/function.rs):
 //!
 //! ```text

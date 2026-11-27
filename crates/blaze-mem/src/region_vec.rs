@@ -1,4 +1,4 @@
-//! [`RegionVec<T>`]: a column over a reserved region (docs/v2/plan/design/data.md). It
+//! [`RegionVec<T>`]: a column over a reserved region (docs/v2/plan/design/bottom.md section 13, "Layout: columns"). It
 //! grows in place by committing pages, so pushing never reallocates or copies, a `&T` taken
 //! before a push could stay valid after it (the borrow checker still asks for `&mut` to push),
 //! and an index is a stable `u32` ID for the life of the column.

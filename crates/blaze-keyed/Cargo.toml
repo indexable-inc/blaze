@@ -1,6 +1,6 @@
 [package]
 name = "blaze-keyed"
-description = "The fresh core's vocabulary (docs/v2/plan/design/target.md): record kinds keyed from text before the work, with read lists that let a moved key reuse its result; the store, pool, memo and machine interfaces; the sans-IO driver of one request and its simulation"
+description = "The fresh core's vocabulary (docs/v2/plan/design/bottom.md): record kinds keyed from text before the work, with read lists that let a moved key reuse its result; the store, pool, memo and machine interfaces; the sans-IO driver of one request and its simulation"
 publish = false
 
 version.workspace = true

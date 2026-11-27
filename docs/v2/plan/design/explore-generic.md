@@ -1,19 +1,17 @@
 ---
 status: plan
-summary: The explorer for any program that emits blaze telemetry, not just the blaze daemon. ix-prof gains the one serving side (feature `explore`, the WebTransport server, certificate, link, token and live stream moved out of blaze-explore) behind a `Source` trait; the protocol speaks of generic things (processes, threads, open spans, tasks with state, progress and a "waiting on", task edges); build steps, crates and build scripts are the `blaze` layer on top, and the daemon is one `Source`. Covers the tables, versions and the gate that keeps ix.dev/explore from falling behind, the page's Running now and Graph views, and the order of the work.
+summary: The explorer for any program that emits blaze telemetry. ix-prof holds the one serving side (feature `explore`, the WebTransport server, certificate, link, token and live stream) behind a `Source` trait, built in crates/ix-prof/src/explore; the protocol speaks of generic things (processes, threads, open spans, tasks with state, progress and a "waiting on", task edges); build steps, crates and build scripts are the `blaze` layer on top. Covers the tables, versions and the gate that keeps ix.dev/explore from falling behind, the page's Running now and Graph views, and what is left: task edges in the core and one transport for the page.
 date: 2026-11-05
 ---
 # The explorer for anything that emits blaze telemetry
 
 Andrew, 2026-11-05: `blaze explore` should show what is running right now, and the same page
-should open for any Rust program instrumented with ix-prof, not only for the blaze daemon. The
-protocol and the views talk about processes, threads, open spans and tasks; build steps,
-crates and build scripts are one layer on top.
+should open for any Rust program instrumented with ix-prof. The protocol and the views talk
+about processes, threads, open spans and tasks; build steps, crates and build scripts are one
+layer on top.
 
-Today there are two servers. blaze-explore (the daemon's: WebTransport on 127.0.0.1, a pinned
-certificate, Arrow answers, the live `spans`/`counters`/`open` stream; deleted with the daemon on 2026-11-15)
-and ix-prof's loopback HTTP (`/debug/pprof/*` and `/debug/pprof/live`; [ix-prof-format.md](../../../ix-prof-format.md)).
-The page reads only the first, and decodes its live stream wrongly after the first frame.
+Today ix-prof serves twice: `ix_prof::explore` (WebTransport) and its loopback HTTP
+(`/debug/pprof/*` and `/debug/pprof/live`; [ix-prof-format.md](../../../ix-prof-format.md)).
 
 ## Decisions
 
@@ -25,9 +23,8 @@ The page reads only the first, and decodes its live stream wrongly after the fir
    module.
 2. **A sans-IO session core.** Hello ordering, the token check, the in-flight limit, the live
    emit rules, certificate rotation and task eviction are `explore::session`, a state machine on
-   an injected clock (`#![blaze::sans_io]`). Today they sit in async code in blaze-explore's
-   `server.rs`; the move puts them in the core rather than carrying them over. The driver does
-   the QUIC, the streams and the blocking pool.
+   an injected clock (`#![blaze::sans_io]`, crates/ix-prof/src/explore/session.rs). The driver
+   does the QUIC, the streams and the blocking pool.
 3. **A program is a `Source`**, the driver's seam:
 
    ```rust
@@ -39,10 +36,8 @@ The page reads only the first, and decodes its live stream wrongly after the fir
    ```
 
    The core encodes the batches; a source never writes IPC. `stop` is set when the page stops
-   the request (blaze's `sql` kills DuckDB on it). ix-prof implements `Source` over its
-   `core::Recorder`; blaze-explore implements it for the daemon over blaze-profile's flight
-   recorder, the plane and the history, and keeps only the `blaze` layer: the ops `builds`,
-   `sql`, `views`, `view`, `spans`, `tiles`.
+   the request. ix-prof implements `Source` over its `core::Recorder` (`explore/source.rs`).
+   blaze's `Source`, with the `blaze` layer's ops, is not built.
 4. **One log per source, a position per session.** `Recorder::take_live` drains, so two pages
    reading it each would steal each other's rows. Every source's ticks go into ix-prof's
    `live::Log` (retention budget, GAP when a position falls out of it); each session reads from
@@ -56,7 +51,7 @@ The page reads only the first, and decodes its live stream wrongly after the fir
    `serverCertificateHashes` (the probe has not been run there), the HTTP stream stays as
    Safari's route instead.
 6. **Versions split.** `hello` carries `protocol` (the core's, owned by ix-prof, starting at 1)
-   and `layers: [{name, version}]`. The blaze daemon's layer is `blaze`, versioned by
+   and `layers: [{name, version}]`. blaze's layer is `blaze`, versioned by
    blaze-profile's `schema::VERSION` (5 today). Adding a nullable column or a table changes no
    version; the page ignores columns and tables it does not know. An unknown layer is not a
    refusal: its columns show as plain columns and its ops are not offered. An unknown `protocol`
@@ -74,11 +69,10 @@ The page reads only the first, and decodes its live stream wrongly after the fir
   times and a nonce), never its pid, which build scripts reuse. `hello` lists each process with
   its pid, name and its monotonic clock's offset from the source's, since time namespaces and
   VMs move `CLOCK_MONOTONIC`.
-- A **task** id is never reused within a session. The daemon's plane reuses node slots across
-  builds (a free list with generations, `blaze_graph::plane`), so its task id is
-  `request << 32 | node`, not the node id.
+- A **task** id is never reused within a session: a source that reuses slots across requests
+  sends `request << 32 | slot`.
 - Every reference to a task (`parent`, `needs`, `waiting_on_task`) is a (process, task) pair, so
-  a client waiting on the daemon, or the daemon on a build script, can be said.
+  a command waiting on a build script can be said.
 - One set of names and types for both producers: `thread` u64, `span` u64, `name`,
   `thread_name`. ix-prof's `open_spans` becomes `open`.
 
@@ -98,7 +92,7 @@ dictionary cap and restart the streams).
 
 - `state` is `waiting` (needs something unfinished), `ready`, `running` or `settled`;
   `outcome` (for `settled`) is the source's word (`built`, `cached`, `cached remote`, `failed`,
-  `skipped`, `cancelled` for the daemon) and `error` its message. A row is whole: a null clears.
+  `skipped`, `cancelled` for blaze) and `error` its message. A row is whole: a null clears.
 - A settled task leaves the live set 60 s after its `end_ns`, on the source's `at_ns`, with a
   last row; its edges go with it. The history keeps what the source keeps.
 - `open.task` is the nearest task among the span and its ancestors, so the page's join finds
@@ -128,7 +122,7 @@ What follows is what the TS page shipped (indexable-inc/ix#7612).
   layer's (`blaze`: Builds, SQL, Views).
 - **Running now:** one row per task that is `running`, or `waiting` on something that is itself
   running (a download, a lock), longest first: name, the layer's label (`kind` and `crate` for
-  the daemon), what it is doing (the innermost open span, the chain on hover), for how long, the
+  blaze), what it is doing (the innermost open span, the chain on hover), for how long, the
   thread under it, a progress bar with done/total and rate when it has progress, and what it
   waits on (a link to that task). Counts of `waiting` and `ready` tasks above, not rows: at a
   build's start thousands are waiting. Threads with open spans and no task are listed below, so
@@ -137,15 +131,15 @@ What follows is what the TS page shipped (indexable-inc/ix#7612).
   what needs it (downstream), by depth, states coloured, the longest unfinished chain marked.
   Search by name. Selecting a task in Running now opens it here.
 
-## Order of the work
+## What is built, and what is left
 
-1. Gate the page against the daemon's schema (done: indexable-inc/ix#7597, blaze
-   `explore_page.py`; ix.dev serves `{"reads":[1,2,3,4,5]}` since 2026-11-05 10:08 UTC).
-2. `ix_prof::explore`: the session core and its driver, moved from blaze-explore with the
-   `Source` trait and one log per source; blaze-explore becomes the daemon's source. The session
-   tests move with it, and the core gets a test on a virtual clock.
-3. `protocol`, `layers` and processes in `hello`; the page and both gates read them.
-4. `tasks`, `task_edges` and `open.task` in the core; ix-prof's producer, with a test that reads
+Built: the page gate (`.github/scripts/explore_page.py`); `ix_prof::explore` with the session
+core, the driver, the `Source` trait and one `live::Log` per source; `protocol` and `layers` in
+`hello` (crates/ix-prof/src/explore/tests.rs); the page (ix#7612).
+
+Left:
+1. `tasks`, `task_edges` and `open.task` in the core; ix-prof's producer, with a test that reads
    a task, its progress and a follows-from edge back through a session.
-6. The page: the stateful decoder, Running now, Graph (shipped in TS, ix#7612).
-7. The feed carries samples, frames, stacks and allocations; the HTTP live stream goes.
+2. The feed carries samples, frames, stacks and allocations; the HTTP live stream goes
+   (decision 5).
+3. blaze's own `Source` and its `blaze` layer.

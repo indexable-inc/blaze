@@ -10,7 +10,7 @@
 //! random ([`crate::table`]).
 //!
 //! A shard's table maps a hash to the values with it, SwissTable-style ([`crate::swiss`],
-//! docs/v2/plan/design/data.md, "interner and memo lookups"): slots in groups of seven, each group one cache line holding a
+//! docs/v2/plan/design/bottom.md section 13, "Layout: columns"): slots in groups of seven, each group one cache line holding a
 //! control word of tag bytes and the seven value pointers, so a lookup reads one line of the
 //! table and then the value. Finding a value takes no lock and writes nothing; interning one
 //! takes its shard's [`InsertLock`] only to look again and insert. A table grows by copying into
@@ -18,12 +18,12 @@
 //! probing one, so a shard's tables cost at most twice its last.
 //!
 //! Shards are a power of two of at least four times the core count, chosen once per process
-//! (docs/v2/plan/design/concurrency.md, "Writers shard by hash"). Readers load only the packed
+//! (docs/v2/plan/design/end-state.md D179). Readers load only the packed
 //! table pointers, which change when a table grows; writers lock a separate, padded array, so a
 //! write never dirties a line a reader loads.
 //!
 //! Chunks grow to 2 MiB, claimed from [`crate::space`]'s region, which is backed by huge pages
-//! where the kernel offers them (docs/v2/plan/design/data.md, "memory").
+//! where the kernel offers them (docs/v2/plan/design/bottom.md section 13, "Layout: columns").
 //!
 //! Cost: a value takes one 8-byte pointer and one tag byte in its group's line (9.1 bytes a
 //! slot) and an 8-byte hash in a column only growth reads, at a load of a quarter to a half: 34
@@ -288,7 +288,7 @@ impl Vacant<'_> {
 mod lock {
     #![allow(
         clippy::disallowed_types,
-        reason = "the one lock of `intern`, named and bounded as docs/v2/plan/design/concurrency.md asks"
+        reason = "the one lock of `intern`, named and bounded as docs/v2/plan/design/end-state.md D179 asks"
     )]
 
     use std::ops::{Deref, DerefMut};

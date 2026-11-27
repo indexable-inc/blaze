@@ -32,10 +32,10 @@ blaze-manifest = { workspace = true, default-features = false }
 # `outline`: each file's items, and the parser's events for bodies and signatures.
 blaze-file-items.workspace = true
 blaze-surface.workspace = true
-# The impl tables' lookups (front2/buckets/records.rs, engine.md E3): `candidates_in` over the
+# The impl tables' lookups (front2/buckets/records.rs, end-state.md D157): `candidates_in` over the
 # records blaze-surface writes.
 blaze-impls.workspace = true
-# The engine's task and result (engine.md, D131): the body task (front2/tables/task.rs) is
+# The engine's task and result (end-state.md D157, D131): the body task (front2/tables/task.rs) is
 # entered as a `Task` and answers a `Done`.
 blaze-engine.workspace = true
 # The checker's one ask (D161): the census a body task's meter keeps (front2 tables/cost.rs).

@@ -542,7 +542,7 @@ fn eight_flat() -> Topology {
 }
 
 /// A worker's thread starts when a wake first reaches it, and a wake tries started workers
-/// first (task/threads.rs, `Pool::rouse`, `Pool::wake_order`; bottom.md section 9: workers
+/// first (task/threads.rs, `Pool::rouse`, `Pool::wake_order`; parallel.md: workers
 /// start in proportion to queued work). A pool of eight given one task starts at most two
 /// threads (the one that finds the task wakes one more, which finds nothing); given three more
 /// that must all run at once (each waits, bounded, until all three have begun), at most four

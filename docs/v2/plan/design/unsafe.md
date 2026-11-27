@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze v2: unsafe where it makes code measurably faster, safe Rust everywhere else, and every unsafe line proved sound by our own tools (a Miri of our own, sanitizers in our code generator, model checking).
+summary: blaze v2: unsafe where it makes code measurably faster, safe Rust everywhere else, and every unsafe line proved sound by our own tools (a Miri of our own, sanitizers in our code generator, model checking). Built: the SAFETY lints and model checking (crates/blaze-check); the UB checker, the sanitizers and the fuzz targets are not built.
 date: 2026-10-29
 ---
 # Unsafe: where it pays, and proved
@@ -19,8 +19,8 @@ be proved, not just reviewed.
   such module says `#![forbid(unsafe_code)]`.
 - **Every `unsafe` block has a `// SAFETY:` comment** saying which invariant holds, where it is
   upheld, and what breaks if it isn't. `unsafe fn`s carry a `# Safety` section. The workspace
-  lints deny `unsafe_op_in_unsafe_fn`, `clippy::undocumented_unsafe_blocks` and
-  `clippy::multiple_unsafe_ops_per_block` in v2's crates.
+  lints deny `unsafe_op_in_unsafe_fn` and `clippy::undocumented_unsafe_blocks` and warn on
+  `clippy::multiple_unsafe_ops_per_block`.
 - **Bytes from disk or the network are untrusted until verified.** Before any zero-copy view is
   made of them, their content hash is checked against the key, and offsets and lengths are
   bounds-checked against the mapping. Nothing is transmuted unchecked from the store, the
@@ -28,7 +28,7 @@ be proved, not just reviewed.
 
 ## How it is proved (all without rustc)
 
-- **Our own Miri.** blaze already interprets MIR for const eval (`hir-ty`'s MIR evaluator). It
+- **Our own Miri.** blaze already interprets bodies for const eval (blaze-body-eval). It
   becomes a checker of undefined behavior for test runs:
   - Tree Borrows aliasing, alignment, uninitialized reads, out-of-bounds offsets, invalid
     values, use after free and leaks;
@@ -36,17 +36,16 @@ be proved, not just reviewed.
 
   `blaze test --ub` runs each unsafe module's tests under it. This is a superset feature:
   opt-in, and Rust's own behavior is unchanged.
-- **Sanitizers from our code generator.** The LLVM back end emits AddressSanitizer,
-  ThreadSanitizer, MemorySanitizer and SanitizerCoverage instrumentation, and the cranelift back
-  end at least bounds checks. This turns today's refusal of `-Zsanitizer` (`docs/support.md`)
-  into support, which is superset-of-rust: rustc's sanitizer flags work under blaze.
-- **Model checking of concurrency.** Every lock-free structure ([concurrency.md](concurrency.md))
-  is tested under the simulation driver with a loom-style scheduler. It explores the
+- **Sanitizers from our code generator.** LIR's code generator emits AddressSanitizer,
+  ThreadSanitizer, MemorySanitizer and SanitizerCoverage instrumentation. This turns today's
+  refusal of `-Zsanitizer` (`docs/support.md`) into support, which is superset-of-rust: rustc's sanitizer flags work under blaze.
+- **Model checking of concurrency.** Every lock-free structure is tested under blaze-check
+  ([model-checker.md](model-checker.md)), a loom-style scheduler (built). It explores the
   interleavings and memory orderings (relaxed, acquire, release) up to a bound, against a
   sequential model.
 - **Fuzzing.** Coverage-guided fuzz targets, built by blaze with SanitizerCoverage and ASan, for
   every parser of untrusted bytes: store packs and indexes, the remote protocol, CBOR, object
-  files and archives in the linker, the VFS journal, and wasm proc macros.
+  files and archives in the linker, and wasm proc macros.
 - **Differential.** Each unsafe fast path keeps a safe reference version in tests, and property
   tests check that both give the same bytes.
 

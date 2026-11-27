@@ -23,17 +23,22 @@ count a body's panics (`general_facts::panic_sites`: `panic_in_drop`, `unwind_ac
 counting a site the prover shows dead or shows cannot fail: `v[i]` under `if i < v.len()`,
 `o.unwrap()` under `if o.is_some()` or `if let Some(_) = o`, `a / b` under `if b != 0`.
 
+**Where it stands.** The macro is in `library/core/src/blaze.rs`. The check, the prover and
+their tests were in blaze-lints and hir-ty-pure, both deleted with the old front end; on the new
+layer none is built, and the macro is not expanded (probe
+`crates/blaze-real/extensions/a_unreachable.rs`, [extensions](extensions.md)). The paths below
+name where each piece lived.
+
 ## What it is
 
 - **The macro.** `blaze::unreachable!()` names `core::blaze::unreachable`, a builtin macro
   (`library/core/src/blaze.rs`), as `#[blaze::contract_test]` names `core::blaze::contract_test`:
   a path `blaze::unreachable` that names nothing else resolves there
-  (`nameres/path_resolution.rs`, `bang_path_alias`; a crate's own `blaze::unreachable` wins, so
-  no Rust program changes). It expands to `core::panicking::panic("entered
+  (a crate's own `blaze::unreachable` wins, so no Rust program changes). It expands to `core::panicking::panic("entered
   blaze::unreachable!()")`: at run time it is a panic, never undefined behaviour, so a build
   that skipped the check is still sound. A proved site is dead code the optimizer may delete
   (not built: `SpendFacts` reads the proof, facts.md).
-- **The check.** The lint `blaze::unreachable` (`blaze-lints`, `proved_unreachable.rs`): one
+- **The check.** The lint `blaze::unreachable` (not built; was `blaze-lints`' `proved_unreachable.rs`): one
   finding per unproved site, found by resolution (the call's macro is the builtin), never by
   text. It fails the compile and **no level waives it** (`blaze::UNWAIVABLE`):
   `Levels::of` gives it `deny` whatever an attribute, a flag, `warnings` or `--cap-lints`
@@ -45,7 +50,7 @@ counting a site the prover shows dead or shows cannot fail: `v[i]` under `if i <
   lint does not reach it and is no error. Whoever cannot prove a site returns a `Result` or
   writes core's `unreachable!()` and accepts that it counts as a panic site. The run-time
   panic stays as defence in depth (a crate whose lints are not run, a dependency).
-- **The prover.** `hir_ty_pure::reach` (rule `semantics-in-front-end`; beside `loops`, the other
+- **The prover.** `reach` (not built; was in `hir_ty_pure`; rule `semantics-in-front-end`; beside `loops`, the other
   analysis the effect walk reads). `reach::prove(db, env, body) -> Reach` is a function of one
   body's runtime MIR (after drop elaboration and `transform::asserts`, before any optimization)
   and of the *signatures* of what it calls (which std function a callee is); it reads no callee
@@ -60,7 +65,7 @@ counting a site the prover shows dead or shows cannot fail: `v[i]` under `if i <
 1. **Uninhabited types.** Already MIR's: lowering ends a block after a call or a value of an
    uninhabited type (`lower/uninhabited.rs`), a `match` on an empty enum is `Unreachable`. A
    site in such code has no reachable block, so it is proved by reachability alone.
-2. **Facts from dominating control flow** (built). A forward abstract interpretation over the
+2. **Facts from dominating control flow**. A forward abstract interpretation over the
    CFG. The state at a point is: a symbolic value per local (a hash-consed term: a constant, an
    unknown made at one program point, `Len(t)`, `Discr(t)`, a field or variant payload of a
    term, a comparison of two terms, the pointee of a reference) and a set of facts over terms
@@ -159,7 +164,7 @@ refusal is unchanged; it just no longer lists a discharged site.
 ## Lean
 
 Each discharge is a certificate a later Lean check can replay, not trust
-(formal-verification.md, "The semantics of MIR"; verify.md's rule that a claim is recomputed):
+(formal-verification.md, "The semantics of MIR"):
 `reach::Proved { site, goal, by }` where `goal` is an atom over terms and `by` lists the facts
 used, each with its origin (the `SwitchInt` edge or `Assert` it came from, a type bound, or a
 model row). The Lean side needs one lemma per kind of origin against the executable MIR
@@ -196,8 +201,7 @@ what in scope has that type: "`todo!()` in `open`: needs `Result<Dir, FsError>`;
 - **The gate decides, not the profile.** Every local build, dev and `--release`, warns
   (`blaze::todo` is a `blaze::general` lint; the profile is not an input of it). The gate
   denies it on the command line: `blaze check --deny blaze::todo`. `--allow`, `--warn`,
-  `--deny` and `--forbid LINT` are `check`'s lint levels (`blaze_units::lint_level`,
-  `crates/blaze-cargo/src/cli/args.rs`): each workspace member gets them after the
+  `--deny` and `--forbid LINT` are `check`'s lint levels: each workspace member gets them after the
   workspace's tables, the ratchet's baselines and its own `[lints]`, and they are part of the
   load's key (the schema and producer versions of the asked invocation and the plan are
   bumped). blaze's own workspace denies `general` in its `lints-ratchet`, read on every run,
@@ -216,11 +220,11 @@ what in scope has that type: "`todo!()` in `open`: needs `Result<Dir, FsError>`;
   which the job's catch turns into its `JobError::Todo`. Spec only: the job plumbing is not
   reachable from the lints.
 - **Listing.** `blaze check --message-format json` already carries the findings; `blaze status`
-  lists the count per crate from the daemon's last lint results. Spec only.
+  lists the count per crate from the last lint results. Spec only.
 
 ## Proof and tests
 
-`crates/blaze-lints/src/blaze/reach_tests.rs`: per discharged pattern one test that it passes
+Not built on the new layer (the tests lived in blaze-lints' `reach_tests.rs`): per discharged pattern one test that it passes
 and near misses that are still reported (the check is on another index, slice or option, the
 guard does not dominate, the value is reassigned between guard and use, the vector is cleared
 between, the loop's bound is another length), for `nopanic`, for `panic_in_drop` and for
@@ -234,7 +238,7 @@ started one past the length is reported.
 
 The invariant: *a site the prover discharges is not reached, or its condition holds, in every
 run of the MIR*. It is held by a blaze-sim test against the MIR evaluator
-(`crates/hir-ty-pure/src/tests/reach_oracle.rs`): random guards (variants, bounds, lengths,
+(hir-ty-pure's `reach_oracle.rs`, deleted): random guards (variants, bounds, lengths,
 linear expressions with `+`, `-`, `/ 2`, `&&`) around a random site, random arguments with
 the ends of `usize` among them, both overflow profiles; a body all of whose panic sites are
 discharged must not panic when run. Controls: a guarded site is proved and runs while the

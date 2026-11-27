@@ -1,4 +1,4 @@
-//! THE COST OF ONE BODY (rule 16; engine.md "Floors": about 1 ms of CPU a body): where a body
+//! THE COST OF ONE BODY (rule 16; end-state.md D168: about 1 ms of CPU a body): where a body
 //! task's time and bytes go, by part, measured with the caller's gauge (rule 75: the clock and
 //! the byte counter are passed in, never read from the ambient world). A measurement only: no
 //! answer, read list or byte of a result depends on it, and with no [`Cost`] nothing is read.

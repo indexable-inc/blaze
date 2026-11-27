@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Performance history of the programs blaze builds (lane perf-history). Each profiled run is one row set in the profile history (the run with its exact tree, blaze, binary and host; per function self and total samples, by path and by code identity), and `blaze perf diff <run> [<base>]` gives per function the change in time with a noise bound and the cause class read from the identities (its code changed, built with other settings, a callee changed, or same code and callees). Built: the code map each link writes, the rows and their Parquet round trip, the identity join, the diff (text and JSON) and `blaze perf record|runs|diff`. Designed: the `--prof` switch that records on its own, call and instruction counts.
+summary: Performance history of the programs blaze builds Each profiled run is one row set in the profile history (the run with its exact tree, blaze, binary and host; per function self and total samples, by path and by code identity), and `blaze perf diff <run> [<base>]` gives per function the change in time with a noise bound and the cause class read from the identities (its code changed, built with other settings, a callee changed, or same code and callees). Built in crates/blaze-profile: the code map's format, the rows and their Parquet round trip, the identity join and the diff (text and JSON). Designed: the link writing the map, `blaze perf record|runs|diff`, the `--prof` switch that records on its own, call and instruction counts.
 date: 2026-11-02
 ---
 # Performance history: compare runs and see what changed
@@ -72,7 +72,7 @@ A profile names each frame by build id and image-relative address
 reach graph (`blaze_codegen::driver::Built::reach`; its edges include the callees a body
 inlines or builds in), plus each function of the image the graph has no node of (a folded group's body, by its key).
 A static is named `<static INSTANCE>`, since the build keeps no path for it. The `layout` maps
-(docs/v2/plan/design/code-layout.md) hold only identity and address. This map adds what the
+(docs/v2/plan/design/sota-a64-architecture.md) hold only identity and address. This map adds what the
 cause classes need. The newest 8 maps of an image are kept. A run already recorded keeps
 `deep` in its rows, so a collected map only costs the names of the callees that changed, and
 the diff says so.
@@ -92,7 +92,7 @@ set. For each function present in both runs:
 1. **its code changed**: `code` differs. Its source or its type arguments' facts changed.
 2. **built with other settings**: same `code`, different `key`. The toolchain, backend, opt
    level or target changed. While `Toolchain::id` is still the blaze executable's hash
-   (`temporary_executable_id`, code-identity.md port 4), every blaze rebuild lands here.
+   (`temporary_executable_id`, bottom.md section 3), every blaze rebuild lands here.
 3. **same code, a callee changed**: same `key`, different `deep`. When both code maps are
    still kept, the diff names the callees whose own `key` changed (at most 5, found by walking
    down the nodes whose `deep` differs). It does so only for rows beyond noise.
@@ -180,15 +180,10 @@ Built (type-checked; tests written, run by the coordinator):
   into rows, with named gaps), `rows.rs` (the Parquet writer and reader, `format` checked),
   `diff.rs` (join, noise bound, cause classes, text and JSON), `tests.rs`.
 - `schema.rs`: `perf_runs` and `perf_functions`. `sql/views.sql` has their views.
-- The link writes the code map while `<target-dir>/perf` exists
-  (`crates/blaze-cargo/src/serve/unit/perf.rs`, called from `codegen.rs` `link_at` beside the
-  layout map). `Reach::graph` in blaze-codegen exposes the reach graph's arrays.
-- `blaze perf record [--target-dir DIR] [--workspace DIR] FILE.ixprof...`, `blaze perf runs
-  [--json]` and `blaze perf diff [RUN [BASE]] [--json] [--all]`
-  (`crates/blaze-cargo/src/cli/perf.rs`). The workspace defaults to the nearest directory with a
-  `Cargo.lock`, and the target directory to `CARGO_TARGET_DIR` or `<workspace>/target`.
 - `docs/profiling.md` lists both tables' columns.
 
-Designed only: `--prof` on run, test and bench, and the ix-prof link-in it needs (pprof lane);
+Designed only: the link writing the code map while `<target-dir>/perf` exists; the commands
+`blaze perf record [--target-dir DIR] [--workspace DIR] FILE.ixprof...`, `blaze perf runs
+[--json]` and `blaze perf diff [RUN [BASE]] [--json] [--all]`; `--prof` on run, test and bench, and the ix-prof link-in it needs (pprof lane);
 `calls` from PGO; `instructions`; grouping a `blaze test --prof` run by its `test` spans; a
 differential flame view in the explorer, read from the same rows.

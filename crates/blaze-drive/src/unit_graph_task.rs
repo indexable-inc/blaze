@@ -112,7 +112,7 @@ pub struct UnitGraphMadeIn<'a, 'r> {
     pub left_out: AVec<'a, LeftOut<'a>>,
 }
 
-/// What one entry of the task answered (drive.md, "For a successor", step 1). The task holds
+/// What one entry of the task answered (drive.md). The task holds
 /// nothing between entries: each replays the resolution from the roots over the records it was
 /// handed, so the reach is fetched level by level (tempo: 9 deep).
 pub enum Entry<'a> {

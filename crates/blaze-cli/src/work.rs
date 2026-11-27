@@ -661,7 +661,7 @@ pub(crate) fn failed_notes(failed: &Failures<'_>, lines: &Frame, each: &mut dyn 
 /// a full frame through `handle_alloc_error`, which aborts the process by default: the whole
 /// command, not the one task. The hook makes that refusal a panic like bstd's, so a task's
 /// `catch_unwind` fails it alone. It is the process's one hook, set once, before the first
-/// task; nothing else in blaze sets it (owed: drive.md, "For a successor").
+/// task; nothing else in blaze sets it (owed: drive.md).
 fn unwind_refusals() {
     static UNWIND_REFUSALS: std::sync::Once = std::sync::Once::new();
     UNWIND_REFUSALS.call_once(|| {
@@ -886,7 +886,7 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                 paths.push((name, at, path_bytes.len() as u32, false));
             }
             // The file's surface, its own part: what name resolution reads of it, never a body
-            // (drive.md, "SPEC, the NAMES step"). A body edit leaves its source, so it stands.
+            // (drive.md). A body edit leaves its source, so it stands.
             // Name resolution records physical file paths. Its read of this slot's surface
             // must move when the same text is found at the other module path.
             let file = crate::signature::SignatureFile::new(path.as_bytes());

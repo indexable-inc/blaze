@@ -26,7 +26,7 @@
 //! calling thread alone ([`Small`]): no job is submitted, so nothing is stolen and no worker
 //! is woken. That is the path of an edit's own chain (the one file parsed again, the one body
 //! checked again, the one function described again), whose loops hold one to a few items
-//! (docs/v2/plan/design/scheduler.md, "Hundreds of cores": a batch is worth its dispatch).
+//! (docs/v2/plan/design/end-state.md D171: a batch is worth its dispatch).
 
 use std::{
     any::Any,

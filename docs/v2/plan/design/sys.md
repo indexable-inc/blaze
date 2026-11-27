@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The bottom of bstd (ledger row S4). One crate, blaze-sys, is the only home of system calls (Linux by raw call with no libc, macOS through libSystem, Windows through ntdll and kernel32); the runtime pieces Rust's std provided each get an owner; blaze-core moves onto it call by call behind a ban list that is the progress meter.
+summary: The bottom of bstd (ledger row S4). One crate, blaze-sys, is the only home of system calls (Linux by raw call with no libc, macOS through libSystem, Windows through ntdll and kernel32; all three modules exist); the runtime pieces Rust's std provided each get an owner in `bstd::rt` (not built: bstd's rt.rs still takes them from std); blaze-core moves onto blaze-sys call by call behind a ban list, harness/v2/nostd.json, that is the progress meter; wave 4 puts the users' std on blaze-sys.
 date: 2026-11-10
 ---
 # blaze-sys and the runtime under bstd
@@ -145,11 +145,11 @@ What a Windows build still lacks, by reading the tree on 2026-11-20 (none of it 
 
 | piece | decision | slice 1 | later |
 |---|---|---|---|
-| entry, arguments | `_start` in `rt` reads `argc`, `argv`, `envp` and the auxiliary vector from the start block, builds the `Io` and calls `fn main(cx, io)`; arguments and environment exist only as `io.args()` and `io.env()` (S5) | nothing: `NativeWorld` is still filled by the caller | slice 5: `_start` for Linux; macOS enters through dyld's `main` |
+| entry, arguments | `_start` in `rt` reads `argc`, `argv`, `envp` and the auxiliary vector from the start block, builds the grants `main` names and calls it (D104: a whole `Io` is refused; `out: Out`, `args: Args`, ...); arguments and environment exist only as grants (S5) | nothing: `NativeWorld` is still filled by the caller | slice 5: `_start` for Linux; macOS enters through dyld's `main` |
 | panic handler | prints the message and location to fd 2 with one raw `write`, then fails its task. Standard error is not a capability (std.md, "Decided"), so this is the single ambient use in bstd, marked `// ambient: a panic must be seen when the program holds no Out` | `Fd::STDERR` and `write` exist for it | slice 5: the handler |
-| global allocator | none. `alloc` stays linked for its types (`Arc`, `Vec<T, A>`); the `#[global_allocator]` is a refuser that aborts through the panic path naming the size and, from `#[track_caller]` on bstd's own entry points, the site. Not linking `alloc` would also lose `Vec<T, A>` | bstd keeps today's global heap, each use with `// alloc:` | when effects stop owning their bytes (item 1 of the bstd improvements), the refuser goes in |
+| global allocator | none reachable (D173): blaze's crates are `no_std` without `alloc`, so the compiler refuses ambient allocation; the process heap is a grant `main` names and passes; the one `#[global_allocator]` lives in the binary crate as the counted, capped foreign heap for Wasmtime and vendored code | bstd still has `extern crate alloc` and its global heap underneath | slice 5 |
 | threads | `clone3` with `CLONE_VM` and a stack from the page pool, entered by an assembly trampoline; a guard page below each stack by `mprotect`. bstd has no thread-locals, but `rt` keeps one word per thread (the worker pointer) in the thread pointer register, set by `CLONE_SETTLS`; no ELF TLS segment is needed while no linked crate has a `#[thread_local]` | `clone3_process` (fork only), `mmap`, `mprotect` | slice 5 |
-| unwinding | kept: `panics-fail-one-job` needs a panic to end one task. On `library/unwind` and `library/panic_unwind` with blaze's own `rust_eh_personality` entry (the codegen and linker already emit and keep `.eh_frame`: `crates/hir-ty-codegen/unwind.rs`); under the `Frames` layout a panic takes the second return path instead. `panic = abort` is refused as the design: it would make a panic a process exit | bstd's `catch_unwind` is std's, in `rt.rs` | slice 5 |
+| unwinding | kept: `panics-fail-one-job` needs a panic to end one task. On `library/unwind` and `library/panic_unwind` with blaze's own `rust_eh_personality` entry (the emitter writes each code record's unwind rows: `crates/blaze-emit/src/pass/unwind.rs`); under the `Frames` layout a panic takes the second return path instead. `panic = abort` is refused as the design: it would make a panic a process exit | bstd's `catch_unwind` is std's, in `rt.rs` | slice 5 |
 | `memcpy` family | `library/compiler-builtins` with its `mem` feature | nothing (std links it) | slice 5 |
 | stack probes | `__rust_probestack` from compiler-builtins on x86-64; inline probes on aarch64 | nothing | slice 5 |
 | main thread's guard | the kernel's guard gap below the main stack is kept as it is; `rt` records the stack's bounds (the start block's address and `RLIMIT_STACK`) so an overflow's message can say so | nothing | slice 5 |
@@ -170,35 +170,13 @@ A `.clippy.toml` entry cannot say this (clippy bans items, not module trees, wit
 these files"). The refusal by name resolution is std.md's `ambient` effect (S2) with blaze-sys
 the one trusted crate; until then the script finds uses by text.
 
-### The work list: blaze-core today
-
-`libc::` and `std::` names by module, outside tests (801 and 575; `banned` is the std file,
-network, thread, process and clock paths among them, 162):
-
-| module | `libc::` | banned `std` | all `std::` | mostly |
-|---|---|---|---|---|
-| `uring` (+ files, flight, ops) | 210 | 10 | 36 | ring calls, open, statx, fallocate |
-| `wait` (+ ring, linux, macos, unix) | 113 | 6 | 32 | io_uring_enter, poll, kevent, ulock, wait4 |
-| `process` (+ spawn) | 105 | 14 | 22 | posix_spawn, fork, wait, signals |
-| `raw`, `net` | 150 | 16 | 39 | shared libc helpers, sockets |
-| `kqueue`, `signal` | 68 | 4 | 18 | kevent, fcntl, sigaction |
-| `fs` (+ mapped, private) | 48 | 53 | 98 | `std::fs`, mmap, clone, statfs |
-| `fanotify`, `watch` | 79 | 0 | 12 | fanotify, inotify |
-| `threads` | 13 | 9 | 31 | `std::thread`, poll |
-| `iocp` (+ 9 files), `create_process` | 0 | 18 | 158 | `windows-sys`; `std::ptr` and `std::mem` (core's) |
-| `fsevents`, `cgroup`, `cores`, `footprint` | 15 | 27 | 59 | `std::fs`, sysctl |
-| `lib`, `journal`, `lock`, `sim`, `wheel`, others | 0 | 5 | 70 | `std::path`, `std::io`, `std::sync` in the effect types |
-
-The `std::` names that are not banned (`path`, `io`, `ffi`, `os::fd`, `sync`) go when the effect
-types become the flat op records of std.md's boundary.
-
 ### Slices
 
 | slice | what | off the list |
 |---|---|---|
 | 1 (built) | blaze-sys for Linux; the `threads` driver's Read, Append, Sync, Truncate and WriteAt (`crates/blaze-core/src/fs/linux.rs`); the direct wait driver's kernel as a patch against all-1110 (`crates/blaze-core/patches/wait-direct-on-blaze-sys.patch`); bstd `#![no_std]` with `rt.rs` its one std module | five effects' calls; `wait/direct.rs` when the patch applies; every bstd module but `rt.rs` |
 | 2 | the rest of Linux: Write and Rename (and all-1110's `WriteUnsynced`, `RenameUnsynced`, `WriteBack` on `sync_file_range`), List, Stat, Clone; sockets; spawn and reap; the ring's calls; inotify and fanotify | `fs`, `net`, `process`, `raw`, `uring`, `watch`, `fanotify`, `wait/ring`, `wait/linux` |
-| 3 | macOS: the typed layer on the declared symbols, then `kqueue`, `fsevents`, `wait/macos` | those |
+| 3 | macOS: the typed layer on the declared symbols (declared: `crates/blaze-sys/src/macos.rs`), then `kqueue`, `fsevents`, `wait/macos` | those |
 | 4 | Windows: the imports, then `iocp` | `iocp/*` |
 | 5 | `bstd::rt`: entry, panic handler, threads, unwinding, the vDSO clock; `threads`, `signal`, `cores`, `busy` move; bstd's `rt.rs` is deleted | the rest of blaze-core and bstd |
 | S3 | every other crate, onto capabilities | the crate rows |

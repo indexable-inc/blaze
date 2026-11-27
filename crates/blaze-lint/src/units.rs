@@ -1,4 +1,4 @@
-//! A file's lint units, from its outline (docs/v2/plan/design/lint.md, "What the driver calls"):
+//! A file's lint units, from its outline (docs/v2/plan/design/lints-stage.md, "The task"):
 //! unit 0 is the file, with its top-level items as holes; unit `i + 1` is the outline's entry
 //! `i`, with its direct children as holes. A driver plans a file once, then lints each unit in
 //! pre-order with the scope its parent's pass gave it ([`Units::lint_all`] does that in one

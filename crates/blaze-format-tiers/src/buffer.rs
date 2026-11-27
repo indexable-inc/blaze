@@ -1,5 +1,4 @@
-//! Whole buffers in the warm and cold tiers, codec by column (docs/v2/plan/design/data.md,
-//! "Compression follows the columns"): the store sees a value as bytes, so the column codecs
+//! Whole buffers in the warm and cold tiers, codec by column (docs/v2/plan/design/columns.md): the store sees a value as bytes, so the column codecs
 //! are applied here, where the buffer's schema says where its columns are.
 //!
 //! A buffer's word tables ([`WordTable`]: the items of every slice of word-aligned records

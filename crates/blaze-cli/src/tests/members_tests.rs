@@ -1,4 +1,4 @@
-//! Names in a workspace of more than one member (drive.md, "End state", piece 1, MEMBERS):
+//! Names in a workspace of more than one member (end-state.md D157, MEMBERS):
 //! each path package is placed at its own member's directory. A child of main.rs's tests: its
 //! helpers are theirs.
 

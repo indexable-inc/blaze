@@ -1,20 +1,21 @@
 ---
-status: plan
-summary: "blaze-ctx: hierarchical 3-level repository context engine and hybrid retriever (BM25 + char 3-grams + pluggable dense embeddings + 1-hop graph expansion) emitting token-budgeted blaze-tab tables over an incremental BLAKE3/CBOR index."
-date: 2026-11-26
+status: current
+summary: "blaze-ctx (crates/blaze-ctx): a 3-level context tree over the repository's crates, docs and agents/howto notes, searched by BM25 + char 3-grams + optional dense embeddings + 1-hop graph expansion, printed as token-budgeted blaze-tab tables or JSON from an incremental BLAKE3/CBOR index."
 ---
 # blaze-ctx: Hierarchical Repo Context & Hybrid Search Engine
 
-## 1. Problem & Goal
+## 1. What it is for
 
-Large monorepos such as blaze (~190 workspace crates, hundreds of design documents, and 600+ agent how-tos and annoyance records under `agents/`) exceed what any agent or engineer should scan by raw `grep` or blind full-file reads. Unstructured search misses design docs linked to a crate, misses open annoyances for a subsystem, confuses historical `record`/`superseded` docs with `current` architecture, and wastes LLM context tokens on repeated JSON keys or irrelevant file bodies.
+Raw `grep` and whole-file reads over a repository of ~190 workspace crates, hundreds of documents
+and the `agents/howto/` notes miss the design docs linked to a crate, confuse `record` and
+`superseded` docs with `current` ones, and spend context tokens on irrelevant bodies.
 
-`blaze-ctx` (`crates/blaze-ctx`) solves this with a single, deterministic, zero-third-party, sans-IO context engine that:
+`blaze-ctx` (`crates/blaze-ctx`) is a deterministic, zero-third-party, sans-IO context engine that:
 
-1. Maintains a **3-level Hierarchical Summary Tree** over crates, docs, and `agents/` notes.
-2. Runs **Hybrid Retrieval** (field-weighted BM25 + character 3-gram overlap + optional dense `EmbeddingStore` cosine similarity + 1-hop typed graph expansion).
-3. Packs the highest-signal result slice within a strict **token budget** (`--budget <tokens>`), rendered natively in compact **`blaze-tab`** tables (via `crates/blaze-tab`) or JSON (`crates/blaze-json`) over `blaze-data::Value`.
-4. Caches parsed nodes incrementally in deterministic RFC 8949 CBOR (`.blaze/ctx-index.cbor`, via `crates/blaze-cbor`) keyed by per-file BLAKE3 content hashes (`crates/blaze-blake3`).
+1. Keeps a **3-level summary tree** over crates, docs, and `agents/` notes.
+2. Runs **hybrid retrieval** (field-weighted BM25 + character 3-gram overlap + optional dense `EmbeddingStore` cosine similarity + 1-hop typed graph expansion).
+3. Packs the best results within a **token budget** (`--budget <tokens>`), printed as **`blaze-tab`** tables (`crates/blaze-tab`) or JSON (`crates/blaze-json`) over `blaze-data::Value`.
+4. Caches parsed nodes in deterministic RFC 8949 CBOR (`.blaze/ctx-index.cbor`, via `crates/blaze-cbor`) keyed by per-file BLAKE3 content hashes (`crates/blaze-blake3`).
 
 ## 2. Architecture
 
@@ -24,7 +25,7 @@ The library (`crates/blaze-ctx/src/lib.rs`) is `#![no_std]`, `#![blaze::sans_io]
 
 | Module | Responsibility |
 |---|---|
-| `tree` | 3-level data model (`DomainSummary`, `CrateNode`, `DocNode`, `AgentNoteNode`, `SlicePtr`), incremental BLAKE3 snapshot ingestion (`update_incremental`), TOML/Rust/Markdown/JSON extractors, deterministic CBOR serialization. |
+| `tree` | 3-level data model (`DomainSummary`, `CrateNode`, `DocNode`, `AgentNoteNode`, `SlicePtr`), incremental BLAKE3 snapshot ingestion (`build_incremental`), TOML/Rust/Markdown/JSON extractors, deterministic CBOR serialization. |
 | `graph` | Typed directed + reverse-indexed concept graph (`DesignedBy`, `ImplementedIn`, `DependsOn`, `AnnoyancesFor`, `ReferencesDoc`) and 1-hop scored neighbor expansion with provenance. |
 | `embed` | Optional fixed-dimension dense `EmbeddingStore` with strict dimension validation and deterministic cosine similarity (never a silent fallback). |
 | `search` | Identifier-aware tokenizer (`snake_case`, `CamelCase`, `kebab-case`, `::`), pure-`core` deterministic `ln`/`sqrt`, field-weighted BM25 + char 3-gram overlap + optional dense fusion, heading-level slice pinpointing, and token-budgeted greedy packer. |
@@ -44,7 +45,7 @@ The library (`crates/blaze-ctx/src/lib.rs`) is `#![no_std]`, `#![blaze::sans_io]
 
 1. **Tokenization**: Splits ASCII identifiers on `_`, `-`, `/`, `.`, `::`, punctuation, digit boundaries, and `CamelCase` transitions (`HTTPServer` -> `http`, `server`). Lowercases deterministically.
 2. **BM25 + Character 3-Grams**: Field-weighted BM25 (`k1 = 1.2`, `b = 0.75`; title/name/exports `3.0x`, summary/area/tags `2.0x`, body/detail/deps `1.0x`) combined with character 3-gram Dice overlap over titles, headings, and summaries so morphological variants (`refinement`/`refined`, `persistence`/`persisted`, `serialization`/`serialize`) match without a stemmer.
-3. **Pluggable Dense Embeddings**: `QueryOpts::dense: Option<&[f32]>` fuses exact cosine similarity from `EmbeddingStore` when provided. Passing a dense vector when the store is empty returns `SearchError::NoEmbeddingsLoaded`; passing the wrong dimension returns `SearchError::DimensionMismatch`. Never silently degrades.
+3. **Pluggable Dense Embeddings**: `QueryOpts::dense: Option<&[f32]>` fuses exact cosine similarity from `EmbeddingStore` when provided. Passing a dense vector when the store is empty returns `SearchError::NoEmbeddingsLoaded`; passing the wrong dimension returns `EmbedError::DimensionMismatch`. Never silently degrades.
 4. **1-Hop Graph Expansion**: Top lexical/hybrid seeds expand 1 hop across `designed_by`, `implemented_in`, `depends_on`, `annoyances_for`, and `references_doc` edges, attaching `via` provenance (e.g. `designed_by(crate:blaze-ty)`).
 5. **Status Transparency & Freshness**: Every output row carries its status badge (`live`, `parked`, `experimental`, `current`, `plan`, `record`, `superseded`, `open`). Superseded docs receive a mild ranking discount (`0.55x`) unless matched directly by path or id, while never being hidden.
 6. **Token-Budgeted Packing**: Estimates rendered tokens deterministically and packs direct hits, graph neighbors, and matching `#Lstart-Lend` heading slices up to `budget_tokens`, reporting `used_tokens`, `budget_tokens`, `total_candidates`, and `omitted`.
@@ -60,7 +61,3 @@ The library (`crates/blaze-ctx/src/lib.rs`) is `#![no_std]`, `#![blaze::sans_io]
 - `blaze-ctx outline <doc-path> [--root <dir>] [--format tab|json]` — prints the doc's heading tree with exact `path#Lstart-Lend` slice pointers.
 - `blaze-ctx area <crate-or-topic> [--root <dir>] [--format tab|json]` — prints the crate card, dependencies, reverse dependents, top exports, linked design docs, and related `agents/howto` & `agents/annoyances` entries.
 - `blaze-ctx map [--root <dir>] [--format tab|json]` — prints the Level-0 domain map.
-
-## 4. Performance Floor (Rule 67)
-
-On a single core (`1 core`), indexing ~1,100 metadata/doc/note files (~6–10 MiB total text) is bounded by filesystem read + BLAKE3 hashing (~2.5 GB/s/core) + single-pass linear text scanning (~500 MB/s/core) + CBOR encoding, giving a single-core floor of ~15–40 ms warm in page cache, and sub-5 ms for incremental no-op re-index and queries over ~800–1,000 Level-1 nodes.

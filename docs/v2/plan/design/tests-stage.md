@@ -1,12 +1,12 @@
 ---
 status: plan
-summary: "The Tests stage of the engine (plan row E2): one task a test item, its result a record keyed by the test and valid by its REACH, the code records its process reached on a first call (each instance by name and code key, each static's datum) and the files and variables its sandbox let it read. An edit reruns exactly the tests whose reach holds a moved cell; nothing changed runs none. A test granted the clock, the network or unseeded randomness is never reused, by name; `--audit` reruns reusable tests and marks a difference non-deterministic. Core: crates/blaze-test-reach."
+summary: "The Tests stage of the engine (plan row E2): one task a test item, its result a record keyed by the test and valid by its REACH, the code records its process reached on a first call (each instance by name and code key, each static's datum) and the files and variables its sandbox let it read. An edit reruns exactly the tests whose reach holds a moved cell; nothing changed runs none. A test granted the clock, the network or unseeded randomness is never reused, by name; `--audit` reruns reusable tests and marks a difference non-deterministic. Core: crates/blaze-test-reach, built, not wired."
 date: 2026-11-17
 ---
 # The Tests stage
 
 The owner: "also need incremental test (only rerun ones that changed)". Plan row E2: one body edit
-reruns only the tests that reach it. This is that stage on the engine (engine.md), after `Bodies`;
+reruns only the tests that reach it. This is that stage on the engine (end-state.md D157), after `Bodies`;
 runtime.md points 3 (read lists checked in order), 8 (a program is a manifest over code records)
 and 9 (published records fetched, yours stay).
 
@@ -88,7 +88,7 @@ from text: body_ids.rs `Walk::one`); for `Datum` the static's datum key today; f
 never a silent rerun (rule 3).
 
 A failure stands like a pass: its record is reused while its reach stands and is printed again from
-its output record (engine.md: an error stops only what reads it). What is printed:
+its output record (end-state.md D157: an error stops only what reads it). What is printed:
 `tests: N run, R reused (unchanged reach), F failed`; a reused test shows `ok (reused)` or
 `FAILED (reused)`; `--why <test>` prints its `Because` in `blaze why`'s words ("`f::<u8>`'s code
 moved", "file `x.json` changed", "never reused: it was granted the clock").
@@ -124,9 +124,9 @@ test_run.rs `Answers::answer` (zygote runs: `entered` and `reads` to rows) and `
 
 ## Relation to what is in the tree
 
-blaze-run's plan.rs/result.rs/postings.rs (test.md) key a result by an address H(test, asks,
-answers); blaze-testsel (test-selection.md) does the same on the old path from slot bytes. This
-stage keeps their postings and judging and replaces the address with the read list, the engine's
+crates/blaze-test-reach is built, not wired: no crate depends on it and blaze-engine has no
+`Stage::Tests`. blaze-run's plan.rs/result.rs/postings.rs (test.md), which `blaze test` runs, key a
+result by an address H(test, asks, answers). This stage keeps their postings and judging and replaces the address with the read list, the engine's
 one validity rule: one concept, one home (rule 30), once wired.
 
 ## Not in this piece

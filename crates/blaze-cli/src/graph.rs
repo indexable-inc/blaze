@@ -1,5 +1,4 @@
-//! The `UnitGraph` task's work (blaze_drive::unit_graph_task; drive.md, "For a successor",
-//! step 1): one job a command, made when the layout and a lock were read this command.
+//! The `UnitGraph` task's work (blaze_drive::unit_graph_task; drive.md): one job a command, made when the layout and a lock were read this command.
 //!
 //! - **Its inputs** are known before the work: the lock's text, what the layout read (the
 //!   units' source, which holds the members' manifests), the members' facts, the target's cfg

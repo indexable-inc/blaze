@@ -22,7 +22,7 @@
 //! every one filed so far (`Buckets::negative_of`), so `Bee: Tr` asked after `A: Tr` held `a`'s
 //! `impl !Tr for NotTr` and asked alone did not; they are narrowed by the question's home now.
 //!
-//! THE IMPL TABLES (engine.md E3, D131) are held to the same answers: each crate's impls
+//! THE IMPL TABLES (end-state.md D157, D131) are held to the same answers: each crate's impls
 //! written once by `write_impl_tables` (equal bytes for its rows in either order), read through
 //! blaze-impls' lookups behind the `BucketSource` seam, asked alone, forward and reversed. The
 //! candidates and the unread among them equal the index's; a negative impl is found at its own
@@ -577,7 +577,7 @@ fn impl_questions_answer_alike_in_any_order_and_look_each_bucket_up_once() {
     }
     assert_eq!(forward_index.bucket_lookups(), before, "a question asked again looks a bucket up again");
 
-    // THE IMPL TABLES (engine.md E3): each crate's impls filed once into blaze-surface's
+    // THE IMPL TABLES (end-state.md D157): each crate's impls filed once into blaze-surface's
     // records by `write_impl_tables`, read through blaze-impls' lookups. Equal bytes for the
     // rows in either order; then every question answers as the index above answers it.
     let g = a();

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Correct by construction for values. Narrow integer types, `Int<LO, HI>` as a library over `where const`, `#[blaze::invariant(..)]` on private-field structs, and `requires`/`ensures` that the compiler proves at every site or refuses with the missing relation. One prover (hir-ty-pure's reach, linear facts), one deny lint (`blaze::refinement`), and std measures (`len`) with a table of how std calls change them.
+summary: Correct by construction for values. Narrow integer types, `Int<LO, HI>` as a library over `where const`, `#[blaze::invariant(..)]` on private-field structs, and `requires`/`ensures` that the compiler proves at every site or refuses with the missing relation. Pattern types (`T is PAT`) for single-value refinements (their type algebra built in blaze-ty). One prover (a forward abstract interpreter over MIR with linear facts, not built on the item layer), one deny lint (`blaze::refinement`), and std measures (`len`) with a table of how std calls change them.
 date: 2026-11-13
 ---
 # Refined values: proved or refused
@@ -21,7 +21,7 @@ The cheapest refinement is a type. `#![blaze::arbitrary_ints]` ([arbitrary-ints.
 gives `u1..u128` and `i1..i128`. `Twice::new(x: u30)` needs no prover at all. `x as i32 * 2`
 fits by interval arithmetic over the type, and the unused bits are a niche. Every refusal below
 whose range is a power-of-two span suggests the narrow type in its note: "`x` must be in
-`0..=1073741823`: take a `u30`". This is `advice` in `reach/obligations.rs`, over `narrow_type`.
+`0..=1073741823`: take a `u30`".
 
 ## 2. Pattern types (`T is PAT`) replace `Int<LO, HI>`
 
@@ -41,6 +41,8 @@ A range that is not a power of two needs no wrapper struct: **pattern types (`T 
   with same layout as `T`, free subset subtyping (`OLD <: ALL <: T`), flow-sensitive `match`
   exhaustiveness (`narrow_exclude` + `missing_members` witnesses), and strict `&uniq` field-and-whole
   write guards.
+- The type algebra of all three is built: `crates/blaze-ty/src/pat_ty.rs` (used by blaze-typeck)
+  and `crates/blaze-std/src/pat_ty.rs`.
 - **`#[blaze::invariant]` and `requires`/`ensures`** focus purely on **relational** properties
   across multiple fields or parameters (`self.len <= self.cap`, `i < v.len()`).
 
@@ -48,8 +50,7 @@ A range that is not a power of two needs no wrapper struct: **pattern types (`T 
 
 On a struct declared at module level whose fields are all private (`pub(self)`). `PRED` reads
 `self.f`, `self.f.len()`, integer literals, `iN::MAX`/`MIN`, `+ - *const /const`, the six
-comparisons, `&& || !`, `true` and `false`. It is read once per struct (`refined::invariant`, a
-tracked query). It is refused at the type, unwaivably, when:
+comparisons, `&& || !`, `true` and `false`. It is read once per struct. It is refused at the type, unwaivably, when:
 
 - the item is an enum or a union, or the struct is declared in a block;
 - a field is not private: "`Open.x` is not private, so code outside `mod a` sets it and the
@@ -83,14 +84,13 @@ This is blaze's native clause syntax ([contracts.md](contracts.md)), behind
 Every function that takes an `S` (by value, `&` or `&mut`) assumes the predicate at entry. Every
 call that returns an `S` gives it to the caller. So the facts flow without being restated. In
 `fn doubled(t: &Twice) -> i32 { t.x * 2 }` the overflow check is shown never to fail
-(`tests/refined.rs`). The same goes for `cap - len` under `len <= cap`, and for indexing under a
-length relation. Today these facts feed only lint verdicts: `blaze::refinement`,
-`blaze::unreachable` and the overflow report. Removing the codegen checks they discharge is the
-next step after the gate has run on real projects.
+The same goes for `cap - len` under `len <= cap`, and for indexing under a length relation. The
+facts feed lint verdicts first: `blaze::refinement`, `blaze::unreachable` and the overflow report.
+Removing the codegen checks they discharge comes after the gate has run on real projects.
 
 ## 6. The fragment and its cost
 
-The prover is hir-ty-pure's reach: a forward abstract interpreter over MIR. Its facts are linear
+The prover is a forward abstract interpreter over MIR (not built on the item layer). Its facts are linear
 inequalities over hash-consed terms (locals, fields, `len` measures, `MutRef` epochs). It does
 join at merges and widen at loop heads, and its implication query `lin_le` searches to depth 4
 with fuel 256.
@@ -111,19 +111,17 @@ with fuel 256.
 - **The missing relation is named.** A refusal says which clause was needed, the value as
   written, and where the facts that are known come from: "`x` must be in `0..=1073741823`, and
   is shown only in `0..=2147483647`".
-- **Granularity.** The verdicts are a per-body query (`refined::of_body`). The invariant and the
+- **Granularity.** The verdicts are per body. The invariant and the
   contract are per-item queries keyed by their own attribute and clause text (rule 65,
   granular-caching). Editing one body re-proves only that body and its direct callers' sites.
 
 ## 7. Opt-in and compatibility
 
-`refined::in_play(krate)` is false unless the crate or one of its dependencies enables
-`blaze_verify` or declares an invariant. A crate that does neither runs no part of this, and its
-output is byte-identical. A program without the attribute or the clauses is unchanged (rule 4,
-superset-of-rust). `#[blaze::invariant]` is an inert attribute word (`attr_resolution.rs`), so it
-expands to nothing and changes no item. The lint is
-`deny`, and `#[allow]` on it is itself refused (`check_waiver`). A refinement that can be waived
-proves nothing.
+A crate runs no part of this unless it or one of its dependencies enables `blaze_verify` or
+declares an invariant; one that does neither builds byte-identical output. A program without the attribute or
+the clauses is unchanged (rule 4, superset-of-rust). `#[blaze::invariant]` is an inert attribute
+word (blaze-surface tool_attrs.rs), so it expands to nothing and changes no item. The lint is
+`deny`, and `#[allow]` on it is itself refused. A refinement that can be waived proves nothing.
 
 **Not covered.** `unsafe` code can break an invariant by writing through a raw pointer. It is
 trusted, and that trust is listed beside the other trusted items in
@@ -134,7 +132,7 @@ trusted, and that trust is listed beside the other trusted items in
 Andrew's `Vec<T>` with `len(v) == n` comes in a restricted form. The predicate is the same
 linear fragment, and each type gets one measure, `len`.
 
-**The std measure table** (`reach/models.rs`). Each row maps a call to its effect on `len` and
+**The std measure table.** Each row maps a call to its effect on `len` and
 sets the receiver's new epoch:
 
 | call | effect |
@@ -157,7 +155,7 @@ at its return: "this return gives `self` back, and the `Spans` it leads to needs
 **Not yet:**
 
 - tracking a push to a field through `&mut self` as a field place, so a method that pushes to
-  both fields is refused too today;
+  both fields is refused too;
 - facts behind a `&mut` parameter are lost across an unrelated call;
 - closures, nested fields, `Option<S>` niches;
 - `split_at`, range slices and `collect`.
@@ -175,8 +173,6 @@ crate (`blaze_verify` with the lint), not by the clause.
    effect summary shows they do not touch it.
 3. Drop the overflow, bounds and `unwrap` checks that a proved fact discharges, in codegen. That
    needs a translation-validation obligation ([formal-verification.md](formal-verification.md)).
-4. Merge `refined::Clause` with `hir-ty-contracts/clause.rs` (rule 30, one-concept-one-home), and
-   read nightly's `core::contracts` attributes as the rustc-compatible spelling.
+4. One clause type for this page and [contracts.md](contracts.md) (rule 30), reading nightly's
+   `core::contracts` attributes as the rustc-compatible spelling.
 5. Generate property tests from invariants for the cases where the prover refuses.
-6. Add an `AttrFlags` bit for "has an invariant", so `in_play` does not walk every struct's
-   attributes.

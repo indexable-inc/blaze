@@ -1,5 +1,5 @@
 //! The driver's properties, through `blaze_sim::check` on generated bodies over generated toy
-//! worlds (typeck.md, "Testing"):
+//! worlds (typeck.md, "Proof"):
 //!
 //! - determinism: two runs of one body over one world give equal records, bytes and read list;
 //! - the read-list property: changing an answer the read list does not name changes nothing,
@@ -592,7 +592,7 @@ fn deep_binary_ops_do_not_grow_the_stack() {
 }
 
 /// Five structs, a parameter of each, and `let a_k = p_k.f0;` for each: five independent
-/// records the body reads (typeck.md, "Speed on real code": rounds).
+/// records the body reads (typeck.md, "The function": rounds).
 fn five_fields() -> Case {
     let mut structs = Vec::new_in(Global);
     let mut params = Vec::new_in(Global);

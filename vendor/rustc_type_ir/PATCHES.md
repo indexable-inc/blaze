@@ -3,7 +3,7 @@
 Base: rust-lang/rust `16d1ffac17ad8b739e32483ac2e65fe7e1804977`, nightly-2026-10-27.
 
 `src/` is upstream's `compiler/rustc_type_ir/src` at the base commit with the series below
-applied in order (`docs/v2/plan/design/compile-time.md`, change 18). `tools/v2/solver_sync.py`
+applied in order (`docs/v2/plan/design/end-state.md`, D175). `tools/v2/solver_sync.py`
 replaces the base on every toolchain bump and replays the series; it stops at the first patch
 that no longer applies, naming it. Each `### NNNN-name` heading is `patches/NNNN-name.patch`, a
 diff of `src/` taken with `a/` and `b/` prefixes. To change the series: edit `src/`, regenerate
@@ -41,8 +41,7 @@ gains a scope:
 - rustc's two asserts are kept, comparing results by value. The file has its own tests.
 
 Why: blaze's database is shared by `&` across worker threads
-(`docs/v2/plan/design/concurrency.md`), and solved goals are reused across queries
-(compile-time.md change 17). rustc's cache is one `HashMap` behind one lock for the session.
+(`docs/v2/plan/design/end-state.md`, D179), and solved goals are reused across queries. rustc's cache is one `HashMap` behind one lock for the session.
 Lane db's notes: `docs/v2/plan/lanes/db/trait-solver.md`.
 
 ### 0004-unsafe-code-policy

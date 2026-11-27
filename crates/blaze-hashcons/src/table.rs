@@ -1,4 +1,4 @@
-//! The interner (docs/v2/plan/design/concurrency.md): [`blaze_ids::Shards`] shards, each
+//! The interner (docs/v2/plan/design/end-state.md, D179): [`blaze_ids::Shards`] shards, each
 //! an append-only arena of nodes in chunks that never move and one open-addressed table from
 //! fingerprint bits to the node's place in the arena.
 //!

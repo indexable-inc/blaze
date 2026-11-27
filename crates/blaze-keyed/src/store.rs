@@ -2,7 +2,7 @@
 //! the code lanes call, what the plain store (crates/blaze-cas) implements, and what the shared
 //! cache (crates/blaze-remote) puts on the wire, whatever the physical form underneath.
 //!
-//! The form it promises (target.md, "On disk"):
+//! The form it promises (docs/v2/plan/design/bottom.md section 10):
 //!
 //! - Immutable segments and a generation manifest. A reader maps a generation once per process
 //!   and takes no lock; segments are never unmapped while the process runs (an unmap is a TLB

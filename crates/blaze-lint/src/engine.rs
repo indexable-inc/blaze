@@ -4,7 +4,7 @@
 //!
 //! Every rule here is a port of its script under `scripts/src/bin/` with the same matches and
 //! exemptions, read over tokens instead of bytes; where the two read differently, the comment at
-//! the rule says how (docs/v2/plan/design/lint.md lists them all).
+//! the rule says how (docs/v2/plan/design/lints-stage.md lists them all).
 
 use blaze_lex::{Cpu, FrontmatterAllowed, LiteralKind, TokenKind, tokenize};
 use blaze_memchr::{memchr, memrchr};

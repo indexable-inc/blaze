@@ -15,7 +15,7 @@ own:
 3. **E-graph simplification**, shared by both, which shrinks the code either one produces.
 
 Layer 2 and the minimum of layer 3 it needs are built as libraries, up to the derivative's MIR
-body; see [What is built](#what-is-built). Layer 1, the GPU side and the `blaze::grad!` call in
+body: `crates/blaze-algebra` (`bstd::algebra`) and `crates/blaze-body-flow/src/algebra`. Layer 1, the GPU side and the `blaze::grad!` call in
 user code are not. Like every blaze extension, it's opt-in (`superset-of-rust`): a crate that
 doesn't use `#[blaze::differentiable]` builds exactly as before.
 
@@ -68,7 +68,7 @@ fn f(x: f64, y: f64) -> f64 { (x * y).sin() / (1.0 + x * x) }
 //   (y * cos(x * y) * (1 + x²) - 2x * sin(x * y)) / (1 + x²)²
 ```
 
-- **What lifts.** A function `#[blaze::pure]` proves pure (`crates/hir-ty-pure`), over scalars,
+- **What lifts.** A function `#[blaze::pure]` proves pure, over scalars,
   small fixed arrays and SIMD vectors. Its loops must have constant trip counts (unrolled) and its
   branches must turn into `select`. Everything else stays in layer 1.
 - **Lifting.** Monomorphized MIR becomes an expression graph with shared nodes. The derivative is
@@ -102,75 +102,24 @@ for layer 1's output where a region lifts.
 
 ## What is built
 
-Two crates, written 2026-11-10. Nothing in the build calls them yet: no program changes.
+Layers 2 and 3 as libraries, described in
+[symbolic-algebra.md](../v2/plan/design/symbolic-algebra.md):
 
-**`crates/blaze-diff`**: the math, a sans-IO core that knows nothing of the compiler.
+- `crates/blaze-algebra` (`bstd::algebra`): the hash-consed expression DAG, differentiation
+  (`diff`, `grad`, `hessian`, `taylor`) checked against a forward-mode `Dual` oracle, the
+  bounded e-graph simplifier, the solver, `const fn` graphs and the Rust emitter.
+- `crates/blaze-body-flow/src/algebra`: `lift_body`, `splice_body`, `diff_body`, `grad_bodies`
+  and `simplify_body`, from a verified MIR body to the DAG and back. Built, not wired: only its
+  tests call it.
 
-- `crates/blaze-diff/src/expr.rs`: the expression graph. A hash-consed DAG over `f32` or `f64`:
-  constants by their bits, parameters, `+ - * /`, `neg`, `powi` (constant exponent), `powf`,
-  `sqrt`, `exp`, `ln`, `sin`, `cos`, `tan`, `tanh`, `abs`, `min`, `max`, `mul_add`, comparisons,
-  `and`/`or`/`not` and `select`. Ids are given in insertion order and an argument's id is below
-  its user's, so id order is a topological order and no order comes from a hash map. A tuple or
-  array is several roots.
-- `crates/blaze-diff/rules.json`: the one source of the two tables below.
-  `scripts/src/bin/diff_rules.rs` writes the Rust tables from it (`src/rules_gen.rs`) and the Lean
-  ones the proofs are about; see
-  [formal-verification.md, "Derivatives"](../v2/plan/design/formal-verification.md#derivatives-2026-11-10):
-  the rules are proved to give the derivative over the reals wherever their domain holds, and
-  the `fast_math` rewrites to be identities over the reals.
-- `crates/blaze-diff/src/diff.rs`: derivatives. `RULES` is the one table, 19 rules, one per float
-  operation: the node's tangent as a template over its arguments, itself and their tangents, the
-  domain the rule holds on, and its kink if it has one. One pass in id order keeps each node's
-  derivative, so a shared node is differentiated once. A derivative that is zero because the
-  term has no `x` in it is never built (`0 * e`, `0 + e`, `1 * e` are resolved while a rule is
-  instantiated): that is the definition of the derivative, not a rewrite of float code. Gradient,
-  Jacobian, and Hessian as the Jacobian of the gradient.
-- `crates/blaze-diff/src/simplify.rs`: equality saturation on an e-graph of our own (union-find,
-  hash-cons, rebuild to congruence, a constant analysis). `REWRITES` is the one table: 21 exact
-  rewrites and 28 `fast_math` ones, each with its IEEE condition. Extraction takes the cheapest
-  term by a cost model (operations weighted, a math-library call dear, `mul_add` cheap only on a
-  target that fuses). `Fuel` bounds the e-nodes and the rounds; `Stop` says whether it ran to the
-  end, and the term found so far is returned either way with the names of the rewrites that ran.
-- `crates/blaze-diff/src/print.rs`: an expression as a Rust function (`let` for each shared
-  node) and as one line of math (`x²`, `2x`).
-- `crates/blaze-diff/src/eval.rs`: evaluation in `f32` or `f64`, and the one place an
-  operation's value is defined. `eval::dual` is forward-mode differentiation by dual numbers, the
-  independent method the tests hold the symbolic derivative to; it does not read `RULES`.
-
-**`crates/blaze-diff-mir`**: the compiler's side. A crate of its own, not a pass in
-`crates/hir-ty-mir/src/mir/optimize`: it is not one of rustc's passes, no body goes through it
-unless a derivative is asked, and it reads `#[blaze::pure]`'s proof, which is
-`crates/hir-ty-pure`'s, a crate above hir-ty-mir.
-
-- `crates/blaze-diff-mir/src/lift.rs`: `lift(db, body)`. Runs a monomorphized runtime body
-  symbolically. What lifts: float arithmetic and comparisons; the float intrinsics (`sqrt`, `sin`,
-  `cos`, `exp`, `log`, `fabs`, `powf`, `powi`, `fma`, `minimum_number_nsz_f64`, `maximum_number_nsz_f64` and their `f32` twins)
-  and the inherent `f32`/`f64` methods of `core` and `std` by name (`sin`, `cos`, `tan`, `tanh`,
-  `exp`, `ln`, `sqrt`, `abs`, `powi`, `powf`, `mul_add`, `min`, `max`); integers that are constants
-  on every path (a loop counter, a `powi` exponent, an index); tuples and arrays of floats; a
-  branch on a float comparison, by running both arms to the return and joining with `select`; a
-  loop whose exit test folds, unrolled up to 64 visits of a block per path. Everything else is
-  `NotLifted`, with the span: `Loop` (the exit depends on a value, or more than 64 turns),
-  `Branch` (not a condition, one way panics, too many paths, arms of different shapes), `Call`
-  (the callee, by name), `Memory` (the place), `Type` (the type), `Operation` (what has no
-  expression form: `%` on floats, a cast).
-- `crates/blaze-diff-mir/src/lower.rs`: `lower(db, graph, roots, signature, callees)`. A
-  runtime MIR body: one local per node, a `Call` of the same intrinsic or method the lifted body
-  called, a `SwitchInt` diamond for a `select`.
-- `crates/blaze-diff-mir/src/surface.rs`: `derivative_body(db, function, wrt)`, the body of
-  `d(function)/d(parameter wrt)` for a function that is `#[blaze::differentiable(symbolic)]`
-  (the attribute is read by `AttrFlags::differentiable_attr` in `crates/hir-def/src/attrs.rs`)
-  and `#[blaze::pure]`; and `explain(db, function, wrt, names)`, the text of `blaze explain d/dx
-  f`. Each refusal is a `DiffError` naming the function, the thing, where it is written and what
-  layer 1 would do with it.
 
 ### Choices the plan left open
 
-- **Points without a derivative.** `Choice::Error` is the default: differentiating through
-  `abs`, `min`, `max`, `sqrt`, or a `select` whose condition depends on the variable, is a typed
-  error naming the operation and the point (`abs` at 0, a tie, the boundary of the condition).
-  `Choice::Subgradient(v)` makes the derivative there `v`. `derivative_body` always uses
-  `Choice::Error`; a way to write the choice on the function is not designed.
+- **Points without a derivative.** An error is the default: differentiating through `abs`,
+  `min`, `max`, `sqrt`, or a `select` whose condition depends on the variable, is a typed error
+  naming the operation and the point (`abs` at 0, a tie, the boundary of the condition). A
+  subgradient `v` makes the derivative there `v`; a way to write the choice on the function is
+  not designed.
 - **NaN.** Rust does not specify a NaN's sign or payload, so "bit for bit" everywhere here means
   the same bits or both NaN.
 - **What the exact rewrites fold.** Constants are folded only through operations IEEE 754 rounds
@@ -190,15 +139,10 @@ unless a derivative is asked, and it reads `#[blaze::pure]`'s proof, which is
 
 ### Not built
 
-- **The use in code.** `blaze::grad!(f, wrt = x)` is to compile as `#[blaze::cache]`'s private
-  call does (`crates/hir-ty-codegen/fncache.rs`): the macro calls a function of the `blaze`
-  crate named for it, and the code generator answers the call with the body
-  `derivative_body` gives instead of compiling the function's own. That needs the name beside
-  `CACHE_CODE` in `crates/hir-ty-mir/src/mir.rs` and a case in the code generator's call
-  handling; neither is written.
-- **`blaze explain d/dx f`.** The explain there is today is the profile's
-  (`crates/blaze-profile/sql/examples.sql`); there is no path for a compiler answer by topic.
-  `explain` in `crates/blaze-diff-mir/src/surface.rs` is the library function such a path calls.
+- **The use in code.** `blaze::grad!(f, wrt = x)`: the macro calls a function of the `blaze`
+  crate named for it, and the code generator answers the call with the derivative's body
+  instead of compiling the function's own.
+- **`blaze explain d/dx f`.** There is no path for a compiler answer by topic.
 - **A diagnostic at the attribute.** A function marked `symbolic` that does not lift is refused
   only when its derivative is asked; a lint that reports `DiffError` at the attribute is left.
 - **Generic functions, arrays and SIMD vectors as parameters, a custom
@@ -222,14 +166,14 @@ unless a derivative is asked, and it reads `#[blaze::pure]`'s proof, which is
 3. The same transforms on GPU kernels, with tapes in thread or workgroup memory
    ([gpu/plan.md](gpu/plan.md) phase 6).
 4. Lifting pure functions to expressions, symbolic derivatives, and `blaze explain d/dx`.
-   Built: the lift, the derivative, the lowering and the explanation's text
+   Built: the lift, the derivative and the lowering, not wired
    ([What is built](#what-is-built)). Left: the call in user code and the CLI's `explain`.
 5. E-graph simplification with IEEE-exact rules, then `fast_math` rules, with per-target cost
-   models. Built: the e-graph, both rule sets and a cost model with an FMA switch. Left: range
-   facts and cost models per target.
+   models. Built in `crates/blaze-algebra`: the e-graph, an IEEE-exact rewrite mode beside the
+   full set, interval facts and a cost model with FMA fusion. Left: cost models per target.
 6. Simplified Hessians and Jacobians, and simplification of layer 1 regions that lift. Built
-   in `crates/blaze-diff` for expressions (a Hessian is the Jacobian of the gradient, simplified
-   together); not reachable from a function yet, and layer 1 does not exist.
+   in `crates/blaze-algebra` for expressions; not reachable from a function yet, and layer 1
+   does not exist.
 
 ## Prior art
 

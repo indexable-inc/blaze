@@ -23,7 +23,7 @@ pub struct ItemPieces {
 /// disambiguator and, for an entry with no name (an impl, a `use`, a macro call), its head, so
 /// two unnamed siblings never share a chain. A walk up the parents, no recursion.
 ///
-/// The chain's one home is `blaze_file_items::item_chain` (drive.md's piece 5): this is a call
+/// The chain's one home is `blaze_file_items::item_chain`: this is a call
 /// to it, the bytes and the domain as they were.
 pub fn item_chain(outline: &Outline<'_>, item: &Item, text: &str) -> ContentId {
     blaze_file_items::item_chain(outline, item, text)

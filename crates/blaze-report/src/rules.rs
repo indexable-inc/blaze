@@ -52,8 +52,8 @@ pub const RULES: &[Rule] = &[
     Rule {
         id: "sandbox:link-arg",
         title: "a sandboxed build script may give the linker only listed arguments",
-        text: "A build script runs in the sandbox (docs/cargo.md, \"Build scripts and proc macros run in a \
-               sandbox\"), and what it prints reaches every link of its package and of what links it, so its \
+        text: "A build script runs in the sandbox (docs/v2/plan/design/build-scripts.md), \
+               and what it prints reaches every link of its package and of what links it, so its \
                `rustc-link-arg` lines (and their -bins, -bin=, -tests, -benches, -examples and -cdylib forms) \
                may give only arguments that change how the output is linked, never which program links it or \
                what it loads: the list in crates/blaze-cargo/src/directives.rs (LINK_ARGS), `-lNAME`, and an \

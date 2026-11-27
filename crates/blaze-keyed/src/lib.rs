@@ -1,4 +1,4 @@
-//! The fresh core's vocabulary (docs/v2/plan/design/target.md): what every builder of the core
+//! The fresh core's vocabulary (docs/v2/plan/design/bottom.md): what every builder of the core
 //! writes against.
 //!
 //! - [`kind`]: the record kinds as declarations. One trait, [`kind::Kind`], says per kind its key

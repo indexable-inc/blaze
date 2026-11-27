@@ -1,16 +1,15 @@
 ---
 status: plan
-summary: blaze's `blaze::borrow_workaround` and `blaze::nll_workaround` — code written around a weaker borrow checker than blaze's (a second lookup, a clone to end a borrow, an index loop for a cursor, take and put back), found only when the direct form passes blaze's checker on the rewritten MIR and behaves the same; what is built (the double lookup), how a rewrite is checked, how published crates are kept building on stable Rust, and the shapes still to build.
+summary: blaze's `blaze::borrow_workaround` and `blaze::nll_workaround` — code written around a weaker borrow checker than blaze's (a second lookup, a clone to end a borrow, an index loop for a cursor, take and put back), found only when the direct form passes blaze's checker on the rewritten MIR and behaves the same; the double lookup designed first, how a rewrite is checked, how published crates are kept building on stable Rust, and the other shapes; no rule implements them yet.
 date: 2026-11-02
 ---
 # Borrow-checker workarounds
 
-`crates/blaze-lints/src/blaze/borrow_workaround.rs`; the user's docs are
-`docs/lints.md#borrow_workaround` and
-`#nll_workaround`.
+The two lints' names and levels are in `crates/blaze-lint-defs/src/lints.rs`; no rule implements
+them.
 
-blaze's default borrow checker is the Polonius alpha (`BLAZE_BORROWCK`, `hir_ty_borrowck::mode`),
-which accepts NLL problem case #3: a loan whose region flows to the return on one branch and is
+blaze's borrow checker (`crates/blaze-borrow`, a polonius-shaped solver) is to accept NLL
+problem case #3: a loan whose region flows to the return on one branch and is
 dead on the other. Code written for stable Rust's checker (NLL) works around that, and the
 workaround costs at run time. These lints find the workaround and offer the direct form, but
 only after proving it.
@@ -48,7 +47,7 @@ unpublished crates of any workspace.
 
 ## Shapes
 
-### Built: a second lookup (S1)
+### A second lookup (S1)
 
 `if m.contains_key(&k) { .. m.get_mut(&k).unwrap() .. }`, `if m.get(&k).is_some() { ..
 &m[&k] .. }`, `if o.is_some() { .. o.as_mut().unwrap() .. }`, and their shared forms, for std's
@@ -99,16 +98,10 @@ these shapes, each with a test, as each shape is built.
 
 ## Tests
 
-`crates/blaze-lints/src/blaze/borrow_workaround_tests.rs`: one per shape that fires (problem
-case #3 as `nll_workaround`; a shared `get` and `&m[&k]` as `borrow_workaround`; an option's
-`is_some` then `as_ref`), and near misses (the database in `Mode::Nll`, so the fix fails the
-checker; another key; a call between the test and the lookup).
+One per shape that fires (problem case #3 as `nll_workaround`; a shared `get` and `&m[&k]` as
+`borrow_workaround`; an option's `is_some` then `as_ref`), and near misses (the checker in an
+NLL mode, so the fix fails it; another key; a call between the test and the lookup).
 
 ## Baseline
 
-A new lint starts with its count on blaze's tree recorded: `blaze check --workspace --target
-aarch64-unknown-linux-gnu --baselines crates/blaze-lints/baselines --new-baseline
-blaze::borrow_workaround,blaze::nll_workaround` writes
-`crates/blaze-lints/baselines/blaze.borrow_workaround.txt` and `blaze.nll_workaround.txt`
-(`crate<TAB>count`), which may only shrink. Neither is made yet, as no baseline is
-(the lints doc, deleted 2026-11-15, said why).
+A new lint starts with its count on blaze's tree recorded per crate, which may only shrink.

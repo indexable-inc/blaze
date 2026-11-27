@@ -1,4 +1,4 @@
-//! The heap sampler (docs/memory-footprint.md, step 1): every
+//! The heap sampler (docs/profiling.md, `alloc_samples`): every
 //! [`blaze_graph::arena::SAMPLE_EVERY`] bytes a thread allocates through the daemon's counting
 //! allocator, the allocation that crosses it is sampled with its stack, so "what churns the
 //! global heap" has an answer by call site: the `alloc_samples` table, each row a sample that

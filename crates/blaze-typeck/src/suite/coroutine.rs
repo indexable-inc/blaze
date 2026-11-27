@@ -1,4 +1,4 @@
-//! Async blocks, async closures and `.await` (typeck.md, "Async: decided by lane 2"), each case
+//! Async blocks, async closures and `.await` (typeck.md, "Witness records"), each case
 //! with the rule of the Reference it checks ("Async blocks", "Await expressions", "Closure
 //! expressions", "Auto traits"). The world is rung 7c's ([`crate::fixture::rung_7c`]) plus:
 //!

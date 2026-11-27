@@ -33,7 +33,7 @@ mod deps;
 mod early;
 // E4's incremental half: an edit re-solves the groups whose inputs moved, from the records.
 mod edit;
-// E4: what the cold solve writes, one record per group of modules (engine.md "Tables").
+// E4: what the cold solve writes, one record per group of modules (end-state.md D158).
 mod groups;
 // E13: a crate's groups solved on demand from the modules asked, never the whole crate.
 mod lazy;

@@ -1,4 +1,4 @@
-//! Facts a body MAKES that another body reads (D114 rulings, "Signatures", "FACTS A BODY MAKES",
+//! Facts a body MAKES that another body reads (drive.md, "FACTS A BODY MAKES",
 //! (i) to (iii)): each a stale check across two files.
 //!
 //! Each runs three checks of a two-file crate: as written, after an edit of `src/a.rs`, after

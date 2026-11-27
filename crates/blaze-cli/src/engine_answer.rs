@@ -1,4 +1,4 @@
-//! `engine-check`'s stored answer (engine.md E6, the incremental half): the engine's answer and
+//! `engine-check`'s stored answer (end-state.md D157, the incremental half): the engine's answer and
 //! causes as pages (blaze-engine pages.rs), the leaf table of what the request read (sweep.rs
 //! `Leaves`), and a sealed pointer naming both (seal.rs), under one root of the store per
 //! checkout ([`root_name`]).

@@ -1,4 +1,4 @@
-//! A file's bytes and its text, held without a copy (docs/v2/plan/design/frontend.md item 6).
+//! A file's bytes and its text, held without a copy (docs/v2/plan/design/bottom.md).
 //! [`Bytes`] are a heap
 //! `Arc<[u8]>`, an `Arc<[u8]>` in [`blaze_mem::Kept`] (a fetched source's files: [`Bytes::kept`]),
 //! a range of something that keeps them in place (the daemon's mapped image), or a `'static`

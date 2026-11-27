@@ -50,7 +50,7 @@ const LEAST: usize = 64;
 /// The executor's one kind of lock, held only to claim or hand over a slot (a key's flight, a
 /// wait's edge, a spare pool, a panic to raise later, a cap's bytes), never across a call into
 /// work or the database: no guard lives across a query, so none can deadlock or invert a
-/// priority (docs/v2/plan/design/concurrency.md, "No guard lives across a query call"). It is
+/// priority (docs/v2/plan/design/end-state.md D179). It is
 /// `blaze_core::lock`'s named lock: a contended acquire waits in a span naming it.
 #[allow(clippy::disallowed_types)]
 pub(crate) struct Lock<T>(crate::sync::Lock<T>);

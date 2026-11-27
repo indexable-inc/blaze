@@ -144,7 +144,8 @@ change in steady-state throughput. Cost: one liveness pass per body, span `mir.e
 
 ## Built and not built
 
-Built on `early-drop-1110`: the gate, `#[blaze::drop(..)]`, `drop_class`, the pass, the
-frees-only check, the tests. Not built: `blaze check` reporting `check_drop_attr`, the lint,
-`async` bodies, the "not yet" of section 2. `edition::Extensions` (`rework-int2-1109`) gets
+Built: the attribute names `early_drop` and `drop` (`crates/blaze-surface/src/tool_attrs.rs`)
+and two corpus cases (`crates/blaze-real/extensions/`). Not built: the gate, `drop_class`, the
+pass, the frees-only check, `blaze check` reporting `check_drop_attr`, the lint, `async` bodies,
+the "not yet" of section 2. `edition::Extensions` (`rework-int2-1109`) gets
 `early_drop` as `handles`; under `#[blaze::expect(..)]` frees-only is a `drop` that may `alloc`.

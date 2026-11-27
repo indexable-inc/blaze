@@ -9,7 +9,7 @@
 //! "Scopes", item scopes: "The name of an item declared directly in a block is in scope for the
 //! entire block", before its declaration too, and shadows the outer names of its namespace.
 //!
-//! What is here (docs/v2/plan/design/typeck.md, "Items inside bodies"; decision D62):
+//! What is here (decision D62):
 //! - THE TEXT. A body's lowering is dropped with its `Body`; a local item's head borrows its
 //!   text for `'n` like any item's. So when a body that holds local items is lowered, its rows
 //!   are KEPT in the command's frame (made by the caller of `Front2::new`): a row's text is a
@@ -159,7 +159,7 @@ impl LocalKind {
     /// The gap's words for a struct, enum, union or alias whose block has no module in the
     /// names library: one a macro call in the body wrote (the scan of the body's text does
     /// not see it), or one in the body of an item that is itself local to a body (that item
-    /// has front2's derived key, not the library's: typeck.md, "Impls inside blocks", owed).
+    /// has front2's derived key, not the library's; owed).
     pub fn unplaced(self) -> &'static str {
         match self {
             LocalKind::Struct => "a struct in a block that a macro call wrote or that is in a local item's body",

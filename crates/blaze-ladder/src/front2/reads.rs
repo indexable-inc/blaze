@@ -1,5 +1,4 @@
-//! A body's read list as facts (drive.md, "End state: the whole pipeline on the command",
-//! piece 8 and the gap row "Read lists as facts"): what the body's check asked of the world,
+//! A body's read list as facts (end-state.md D157): what the body's check asked of the world,
 //! each as (which fact, the digest of the answer it got), sorted by the fact's bytes, with no
 //! duplicate. Every body has one: clean, with diagnostics, with gaps or refused.
 //!

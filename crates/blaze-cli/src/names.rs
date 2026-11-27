@@ -1,5 +1,5 @@
 //! The `CrateScope` task: one crate's names resolved from its dependencies' records
-//! (docs/v2/plan/design/drive.md, the NAMES step, "HANDED ON 07:xx").
+//! (docs/v2/plan/design/drive.md).
 //!
 //! The world (blaze-world: every crate's `CrateInput`, its key and where its files are) is
 //! made once a command from the `UnitGraph` record, the lock, the pinned toolchain on the
@@ -169,7 +169,7 @@ impl core::fmt::Display for NamesError {
 }
 
 /// What a request's names world was made by need for ([`Names::made_or_make`]): each its own
-/// span, so the profile says when the world was made and why (rule 15; engine.md item 2).
+/// span, so the profile says when the world was made and why (rule 15; end-state.md D157).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NeededBy {
     /// A `CrateScope` task entered (engine_names.rs).
@@ -1074,7 +1074,7 @@ pub(crate) fn place_pieces(message: &[u8]) -> Result<(Option<(&str, u64, blaze_s
     Ok((Some((path, chain, edition)), words))
 }
 
-/// The names step's state for a command (engine.md item 2): the crate list it plans from, read
+/// The names step's state for a command (end-state.md D157): the crate list it plans from, read
 /// in place (blaze-world crate_list.rs version 6), each crate by subject, what the tasks made (a
 /// task that asks for its files' `Surface`s answers from here when entered again), and the world
 /// the list stands for, made only when a task needs it ([`Names::made_or_make`]). Every planner
@@ -1089,8 +1089,8 @@ pub struct Names<'f> {
     /// (subject, crate index), sorted.
     by_subject: blaze_own::Vec<(ContentId, usize), Alloc<'static>>,
     made: std::vec::Vec<(ContentId, Resolved), Global>,
-    /// The subjects of the crates whose records may hold nothing of a project (target.md,
-    /// "Namespaces"): the toolchain's, and a registry archive's known by its lock checksum
+    /// The subjects of the crates whose records may hold nothing of a project (bottom.md
+    /// section 10, namespaces): the toolchain's, and a registry archive's known by its lock checksum
     /// (the list's `PUBLIC` flag); then each run of such a crate placed on the wasm path.
     /// Whether a record is public also needs every name it reads public: the store's check.
     public: blaze_own::Vec<ContentId, Alloc<'static>>,
@@ -1265,7 +1265,7 @@ impl<'f> NamesWorld<'f> {
 impl<'f> Names<'f> {
     /// The names read from the crate list `list` (its bytes held to the command's end), the
     /// world made by need from `maker`'s record ([`Names::made_or_make`]). No world is made and
-    /// no graph decoded here: O(crates), the list's rows read in place (engine.md item 2).
+    /// no graph decoded here: O(crates), the list's rows read in place (end-state.md D157).
     pub(crate) fn of_list(list_bytes: &'static [u8], maker: Option<Maker<'f>>, heap: Alloc<'static>) -> Result<Names<'f>, NamesError> {
         let list = CrateList::open(list_bytes).map_err(NamesError::List)?;
         let n = list.len();
@@ -1580,7 +1580,7 @@ impl Names<'_> {
 /// The crate list's planners' facts (blaze-world crate_list.rs version 6), answered from the
 /// world and the graph it was made from, by the one maker of the list ([`world`]): what the
 /// names, scripts and units stages then plan from with no world made and no graph decoded
-/// (engine.md item 2). [`Names::list_differences`] holds the list's answers equal to these.
+/// (end-state.md D157). [`Names::list_differences`] holds the list's answers equal to these.
 impl blaze_world::crate_list::ListFacts for NamesWorld<'_> {
     fn script(&self, at: usize) -> Option<[u8; 33]> {
         self.script_name_of(at)
@@ -1915,7 +1915,7 @@ pub(crate) fn tell_public(store: &mut dyn Store<'_>, names: &Names<'_>) {
 }
 
 /// The `CrateScope` parts the graph's record names: one per crate of the world, by subject,
-/// its source the same key's digest. Owed (drive.md, RUNNER 16): every part runs, so a
+/// its source the same key's digest. Owed (drive.md): every part runs, so a
 /// `#![no_core]` workspace still resolves all 15 toolchain crates cold; a `Need` locates its
 /// name among its home's parts, so a toolchain crate cannot simply be left out here: the
 /// drive needs a part that is located but run only when wanted.

@@ -1,4 +1,4 @@
-//! The engine's tasks for `blaze engine-check` (engine.md E6): what one entered task does, by its
+//! The engine's tasks for `blaze engine-check` (end-state.md D157): what one entered task does, by its
 //! stage, writing its result into its worker's buffer.
 //!
 //! Outlines: the planner outlines every file before the first phase (invariant 1 of engine.rs:

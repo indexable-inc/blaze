@@ -42,11 +42,6 @@ and `stdx -> blaze-profile` would be a cycle. So there is a new crate `crates/bl
 | the postmortem writer (`Store`, `Mapping`, `persist`) of pd-postmortem | the postmortem reader (`dead`, `Found::read`, `recover_into`) |
 | `testing::{capture, print_tree}` (feature `testing`) | |
 
-**wasm32-wasip1.** `blaze-trace` builds for `wasm32-wasip1`, because crates below it are built
-for proc macros on wasm. There `ticks()` reads `std::time::Instant`, the barrier is a compiler
-fence (one thread), the owner check is always true, and there is no inline asm, no mmap and no
-postmortem store. A CI check builds it for that target (lane 0.1).
-
 `blaze-graph` depends on `blaze-trace` and calls the `Wait`, `Hold`, `Job` and `Worker` kinds and
 the fiber enter-stack carry directly. That deletes the function-pointer hooks
 `pump::span_waits`/`WaitSpans`, `pool::span_jobs`/`JobSpans` and
@@ -764,8 +759,8 @@ crate's `tracing.workspace = true` (in each crate's own phase 1 lane); the solve
 Config: the tracing entries of `.clippy.toml` and the hot crates' `clippy.toml`.
 
 Docs: `docs/profiling.md` (tracing targets, the keep table, column docs that say "tracing
-target" or "tracing event"); `crates/blaze-profile/src/schema.rs` docs; `docs/cargo.md` (one
-mention); `docs/v2/plan.md`; `tools/agents/rules.ts` rule 16's
+target" or "tracing event"); `crates/blaze-profile/src/schema.rs` docs;
+`docs/v2/plan.md`; `tools/agents/rules.ts` rule 16's
 `tracing::info_span!(target: "blaze", ...)` becomes `blaze_trace::span!(...)`, then `bun
 tools/agents/rules.ts --write` regenerates `AGENTS.md` and the skills. fed1eb428d:docs/v2/requests and lane
 plans are dated records or plans and stay as written.
@@ -839,7 +834,7 @@ independent of blaze-trace and land on their own, any time.
 | 1G `conv-solver` | 1 | `vendor/rustc_next_trait_solver/**`, `vendor/rustc_type_ir/**`, `tools/v2/solver_sync.py` | `NNNN-blaze-trace` patches: sites to `trace` |
 | 1H `conv-vendor-rest` | 1 | `vendor/rustc_transmute/**`, `vendor/charon/**` | `NNNN-no-tracing` and `blaze.diff`: deletion |
 | 2A `delete-recorder` | 2 | `crates/blaze-profile/**` (with `schema.rs`'s docs), `crates/blaze-trace/**`, `crates/blaze-bench/benches/trace.rs` | 8.1 coexistence and 8.2's code deletions; `tracing_info_span` out of the bench |
-| 2B `docs-config` | 2 | `.clippy.toml`, the hot crates' `clippy.toml`, `docs/profiling.md`, `docs/cargo.md`, `docs/v2/plan.md`, `tools/agents/rules.ts`, `AGENTS.md`, `.agents/skills/**`, `.claude/skills/**`, this doc | 7.1 entries out, docs true, rule 16, this doc to `current` |
+| 2B `docs-config` | 2 | `.clippy.toml`, the hot crates' `clippy.toml`, `docs/profiling.md`, `docs/v2/plan.md`, `tools/agents/rules.ts`, `AGENTS.md`, `.agents/skills/**`, `.claude/skills/**`, this doc | 7.1 entries out, docs true, rule 16, this doc to `current` |
 
 Lanes 1A to 1H run `--fix` with the integrator's tree-built blaze (5.2). After phase 2 lands, the
 integrator cuts the release and bumps `.github/blaze-version` (7.2).

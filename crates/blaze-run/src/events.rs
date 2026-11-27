@@ -1,4 +1,4 @@
-//! A run's event stream as blaze-format records in columns (data.md section 5): the parent
+//! A run's event stream as blaze-format records in columns (bottom.md section 13): the parent
 //! gathers the [`RunEvent`]s its machines say and writes them, every flush, as one [`Batch`]
 //! buffer appended to the run's stream (`<name>.events`, each buffer at a multiple of
 //! `blaze_format::ALIGN`, so a viewer opens each where it lies, mapped, with no copy).

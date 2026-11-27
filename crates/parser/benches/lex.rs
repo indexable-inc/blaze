@@ -1,6 +1,6 @@
 //! `LexedStr::new` and `LexedStr::new_hashed` on every `.rs` file of `library/`, against the
 //! speed-of-light bounds of the kernel this build has
-//! (`docs/v2/plan/design/data.md`).
+//! (`docs/v2/plan/design/bottom.md` section 13).
 //!
 //! The clock is measured, not assumed: a chain of dependent adds runs one add per cycle on
 //! every core blaze targets, so its time gives cycles per nanosecond. The lexer's median of 11

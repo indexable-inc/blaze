@@ -1,4 +1,4 @@
-//! The execution engine (docs/v2/plan/design/engine.md, decision D131) as a sans-IO core: phases
+//! The execution engine (docs/v2/plan/design/end-state.md, decisions D157 and D131) as a sans-IO core: phases
 //! over shared tables in place of a machine stepped per task event.
 //!
 //! | module | what |

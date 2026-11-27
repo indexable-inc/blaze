@@ -292,7 +292,7 @@ pub(crate) fn check_hole_plant<'a, W: World, C: TypeCtx>(
     run(body, reads, ty, hints, Plant::None, stalled::Interior::Gap, alloc).map(|(o, _)| o)
 }
 
-/// The walk and the end sequence (typeck.md, "The walk and its queues").
+/// The walk and the end sequence (typeck.md, "The walk: a work stack in rustc's order").
 fn walk<W: World, C: TypeCtx>(m: &mut Machine<'_, '_, '_, '_, W, C>) -> Result<(), Stop> {
     let output = m.start_body()?;
     m.run()?;

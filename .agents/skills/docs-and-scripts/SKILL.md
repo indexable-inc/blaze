@@ -49,5 +49,5 @@ See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-
 `blaze run -q -p scripts --bin docs -- check` holds every doc's links, and a current doc's anchors,
 repository paths in backticks and `BLAZE_*` settings, against the tree, and refuses a `.py` file
 that is not on `tools/python-allowed.txt`; `blaze run -q -p scripts --bin docs -- write` regenerates the index,
-docs/README.md. It runs on the pinned release, never on the tree's blaze. The front-matter fields
+docs/README.md. The gate runs it from the cargo-built scripts (`tools/gate.txt`). The front-matter fields
 are in `scripts/src/bin/docs.rs`'s module comment.

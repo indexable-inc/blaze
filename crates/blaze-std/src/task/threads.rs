@@ -7,8 +7,8 @@
 //!   but the `Parker` each worker sleeps on and the clock passed in. A worker's thread starts
 //!   when a wake first reaches it ([`Pool::rouse`]), not with the pool: a wake tries the
 //!   started workers first ([`Pool::wake_order`]), so a command with k tasks runnable at once
-//!   starts about k threads, not one a core (bottom.md section 9, "Workers start in
-//!   proportion to queued work").
+//!   starts about k threads, not one a core (parallel.md, "Sized by one rule":
+//!   workers start in proportion to queued work).
 //! - **Queues** (all bounded, never grown: std.md's backpressure rule). Each worker has a
 //!   one-task LIFO slot that only it reads, a Chase-Lev deque of [`DEQUE`] slots
 //!   (task/deque.rs) that the others steal from, a mailbox `must_overlap` hands a reserved

@@ -1,5 +1,5 @@
 //! A path in a body expansion resolves by the mark of its first segment (piece token-mark-1;
-//! drive.md, "A token keeps its mark", ruled 21:27; the one resolver is blaze-lower
+//! drive.md, "A token keeps its mark"; the one resolver is blaze-lower
 //! `mark_site::site_of`, asked by front2 `BodyWorld::path`).
 //!
 //! The Reference, "Macros By Example", Hygiene: "By default, all identifiers referred to in a

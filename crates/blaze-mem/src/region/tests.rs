@@ -1,5 +1,5 @@
-//! A sparse region counted by ranges, as the store's buffer pool uses it
-//! (docs/v2/plan/design/store-pool.md lane 1): the pool's reservation of terabytes, the kernel's
+//! A sparse region counted by ranges, as the store's buffer pool uses it:
+//! the pool's reservation of terabytes, the kernel's
 //! give-back of its pages, and its tag following every reuse and eviction.
 
 use std::ops::Range;
@@ -131,8 +131,7 @@ fn step(tape: &Tape) -> Step {
 }
 
 /// Every reuse adds its bytes to the region's tag and every eviction takes off what the kernel
-/// gave back, so the tag holds exactly the held pages (oracle 4 of store-pool.md's DST,
-/// `Tag::Pool` equals the loaded pages times `PAGE`, for the layer below the pool); held pages
+/// gave back, so the tag holds exactly the held pages (`Tag::Pool` equals the loaded pages times `PAGE`, for the layer below the pool); held pages
 /// keep their bytes across other pages' evictions; on Linux a page given back reads zeros; and
 /// dropping the region takes the rest off. The only test that moves `Tag::Pool`.
 #[test]

@@ -1,4 +1,4 @@
-//! The plan, its phases and the bulk merge (engine.md, "The design" 2, 5 and 6).
+//! The plan, its phases and the bulk merge (end-state.md D157).
 //!
 //! # The invariants (rule 53), each with its simulation in sim.rs
 //!
@@ -239,7 +239,7 @@ pub const STAGES: usize = 7;
 
 /// Why a task was entered: the first reason the engine found, in this order. Kept for every
 /// entered task and nothing for a task that stood, so a profile says why each was redone and
-/// `blaze why` can walk the chain back to the edit (engine.md, E6 telemetry).
+/// `blaze why` can walk the chain back to the edit (end-state.md D157).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Cause {
     /// No row of it: never made, or removed.
@@ -387,7 +387,7 @@ pub struct Done<'a> {
     pub failed: bool,
 }
 
-/// A record a task made inline that the plan did not name (engine.md, "The design" 3).
+/// A record a task made inline that the plan did not name (end-state.md D157).
 #[derive(PartialEq, Eq, Debug)]
 pub struct Made<'a> {
     pub planned: Planned,
@@ -1151,7 +1151,7 @@ impl fmt::Display for EngineError {
             }
             EngineError::BackwardRead { reader, read, reader_phase, phase } => write!(
                 f,
-                "{read:?} moved in {phase:?} and {reader:?} reads it in {reader_phase:?}: a phase reads only earlier ones (engine.md, invariant 2)"
+                "{read:?} moved in {phase:?} and {reader:?} reads it in {reader_phase:?}: a phase reads only earlier ones (invariant 2)"
             ),
             EngineError::OutOfTurn => write!(f, "a merge with no phase open, or a phase opened before the last merged (engine.rs)"),
             EngineError::StillPending { phase, name } => write!(f, "{name:?} in {phase:?} was still waiting for its producers at finish (engine.rs)"),
@@ -1281,7 +1281,7 @@ impl<L: LastAnswer> View<'_, '_, L> {
         }
     }
 
-    /// A record a task needs inline (engine.md, "The design" 3), found standing: `name`'s row
+    /// A record a task needs inline (end-state.md D157), found standing: `name`'s row
     /// under `key`, owed nothing, every read of it today in its read order (the validation a
     /// planned task's row gets, invariant 8). The hit is one read: the caller reads the cells of
     /// it that it uses, as any cell, and none of the record's own reads, which the record keeps

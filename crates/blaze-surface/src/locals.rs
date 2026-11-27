@@ -71,7 +71,7 @@ impl<T> PartialOrd for Local<T> {
     }
 }
 
-/// The order a task first asked in: never an order for output or a key (identity.md, point 5).
+/// The order a task first asked in: never an order for output or a key (bottom.md, section 3 "Identity and keys").
 impl<T> Ord for Local<T> {
     fn cmp(&self, other: &Local<T>) -> Ordering {
         self.index.cmp(&other.index)

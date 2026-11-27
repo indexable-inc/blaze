@@ -1,4 +1,4 @@
-//! The engine's check on one checkout (engine.md E6), stage by stage. A child of main.rs's
+//! The engine's check on one checkout (end-state.md D157), stage by stage. A child of main.rs's
 //! tests: its helpers are theirs.
 //!
 //! Until 2026-11-19 these tests compared what the engine printed with what the old machine
@@ -147,7 +147,7 @@ fn two_crates(io: &Io) {
     write(io, "b/src/lib.rs", "use a::*;\nuse a::g;\n\npub fn h() -> u8 {\n    f() + m::k()\n}\n");
 }
 
-/// The names stage on the engine (engine.md E6, second step): `engine-check` resolves every
+/// The names stage on the engine (end-state.md D157): `engine-check` resolves every
 /// crate of the unit graph (the two members and the shelf's crates), each `Names` task entered
 /// once at its crate's depth, and lists the names findings `check` lists: the one unresolved
 /// import, and nothing for the glob. 1 and 4 workers give the same answer. CONTROL: before the
@@ -215,7 +215,7 @@ fn typed_crates(io: &Io, typed: Typed) {
     write(io, "b/src/lib.rs", b);
 }
 
-/// THE BODIES STAGE (engine.md E5/E6): every body is its own `BodyCheck` task, entered once,
+/// THE BODIES STAGE (end-state.md D157): every body is its own `BodyCheck` task, entered once,
 /// on 1 and 4 workers with one answer, and the answer is `check`'s: the same exit status and
 /// the same word on whether types were checked. The plain pair checks every body clean and
 /// says types were checked; the wrong body is its one note and fails the command.
@@ -642,7 +642,7 @@ pub(super) fn profile_lines(io: &Io) -> std::string::String {
     profile(io).lines().filter(|line| line.contains("phases") || line.starts_with("files:") || line.starts_with("stored answer:")).collect::<std::vec::Vec<_>>().join("\n")
 }
 
-/// ONLY CHANGED FILES ARE READ (engine.md E6, the incremental half): from the stored answer of
+/// ONLY CHANGED FILES ARE READ (end-state.md D157, the incremental half): from the stored answer of
 /// the plain pair with a module, a comment in one file outlines that file alone and reads no
 /// other: the two unchanged files' outlines are read back from the store (their records hold
 /// their parts, paths and findings), and the answer is a fresh run's. CONTROL: the first
@@ -743,7 +743,7 @@ fn engine_check_plans_a_project_sized_workspace() {
     assert_eq!(head_refused, 0, "no crate's impl tables refused");
     // Rule 21: every cell a task reads is defined by a task or ABSENT by its task's intent.
     assert_eq!(checked.undefined_reads.1, 0, "reads of a record no task has a row for: {:?}", checked.undefined_reads.0);
-    // AN EDIT'S COST FOLLOWS THE EDIT (engine.md E6): one statement in one crate's body enters
+    // AN EDIT'S COST FOLLOWS THE EDIT (end-state.md D168): one statement in one crate's body enters
     // one outline and one body, reads one file and reads every other outline back.
     write(&io, "c7/src/lib.rs", "pub fn f7() -> u8 {\n    let _ = c4::g4();\n    let _ = c5::g5();\n    let _ = c6::g6();\n    g7()\n}\n\npub fn g7() -> u8 {\n    let _ = 0u8;\n    2\n}\n");
     let began = std::time::Instant::now();
@@ -1409,7 +1409,7 @@ pub(super) fn entries(checked: &engine_check::Checked) -> std::string::String {
     )
 }
 
-/// The stored answer (engine.md E6, the incremental half): a second request with nothing
+/// The stored answer (end-state.md D157, the incremental half): a second request with nothing
 /// changed is the certificate (no task entered); a comment, an item added and a module
 /// dropped each enter their file's `Outlines` task and only the readers of what moved; after
 /// each, nothing changed is the certificate again. CONTROL: a fresh request (no stored answer
@@ -1840,7 +1840,7 @@ fn names_reads_of_bodies(io: &Io) -> (std::vec::Vec<std::string::String>, [u32; 
     }
 }
 
-/// NAMES READ BY CELL (engine.md E4; lane NC): a body's names reads are the cells of its
+/// NAMES READ BY CELL (end-state.md D158; lane NC): a body's names reads are the cells of its
 /// crate's cell table its walks consulted (engine_bodies.rs `widen`), and the crate's `Names`
 /// task defines every cell of that table (engine_names.rs `cells_of`), so an edit that moves the
 /// crate's names enters only the bodies whose consulted cells moved. Each edit below enters its

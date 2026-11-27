@@ -1,5 +1,5 @@
 //! blaze: what a provider's seed gives, as pure functions of it
-//! (docs/v2/plan/design/determinism.md, section A).
+//! (docs/v2/plan/design/end-state.md, D177).
 //!
 //! The one home of the derivation. std uses it (`super`), and blaze includes this same file
 //! (`blaze_usercode::provider::derive`, by `#[path]`) for the sandbox's answers, the wasm

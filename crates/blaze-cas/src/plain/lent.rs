@@ -1,5 +1,5 @@
 //! [`Lent`]: the command's one append-only owner of every byte a get lends (drive.md, "The
-//! store under the command", ruling 6; home decided by the coordinator 2026-11-16: blaze-cas,
+//! store under the command"; home decided by the coordinator 2026-11-16: blaze-cas,
 //! beside the guarantee the lend rests on).
 //!
 //! It owns the plain store ([`Driven`], whose segment mappings are never unmapped while it is

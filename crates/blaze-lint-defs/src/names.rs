@@ -313,7 +313,7 @@ pub(super) const BLAZE_GROUPS: &[(&str, &[&str])] = &[
             "blaze::parallel_vecs",
         ],
     ),
-    // The cross-configuration reachability lints (docs/v2/plan/design/multiconfig-check.md), also in
+    // The cross-configuration reachability lints (docs/v2/plan/design/conditions.md), also in
     // `blaze::general`: one name to make them strict, `reach = "deny"`.
     ("blaze::reach", &["blaze::dead", "blaze::test_only", "blaze::cfg_only"]),
     // The three kinds of procedural macro a workspace crate defines, also in `blaze::edition`:

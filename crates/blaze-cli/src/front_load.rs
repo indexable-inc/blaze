@@ -1,5 +1,4 @@
-//! The front end's [`Load`] over the store (drive.md, "End state: the whole pipeline on the
-//! command", piece 6, STORE LOAD).
+//! The front end's [`Load`] over the store (end-state.md D157, STORE LOAD).
 //!
 //! front2 checks a body over `Records` (front2 source.rs), which asks a [`Load`] for a crate's
 //! names section, its items section and the texts their rows point into, each the first time

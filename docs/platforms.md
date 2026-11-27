@@ -196,7 +196,7 @@ What is specific to the port:
 Not there: debug info is not checked on macOS (the harness reads DWARF out of ELF).
 `blaze` serves dev and test builds;
 `harness/blaze_cli.py --small` (ripgrep, fd, hyperfine) passes under both backends, and
-the larger projects of that harness have not been run ([cargo.md](cargo.md#macos-arm64)).
+the larger projects of that harness have not been run (cargo.md, "macOS arm64").
 `storefull.py`, `remote.py`, `farsplices.py` and the fuzzer are not run. The first port
 noted that under LLVM the unwind rules are not exact inside prologues and epilogues;
 nothing later says that changed.

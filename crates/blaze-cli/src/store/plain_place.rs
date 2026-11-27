@@ -1,4 +1,4 @@
-//! The command's store on blaze-cas's plain store (D114 piece (b); drive.md, "D114 rulings",
+//! The command's store on blaze-cas's plain store (D114 piece (b); drive.md,
 //! "The store under the command"): ONE store a user of each form, at `<home>/.blaze/`
 //! [`STORE_DIR`] (`v2/store/f5s3`, D160), read and written by every checkout and worktree;
 //! records read IN PLACE.
@@ -17,7 +17,7 @@
 //! command's records (made again by the next), never part of one: the flip is the commit.
 //!
 //! Generic over the driver (rule 78): the simulation in the tests, bstd's lent driver in the
-//! command (one driver a process: drive.md ruling 5).
+//! command (one driver a process: drive.md).
 
 use core::fmt;
 use core::marker::PhantomData;
@@ -43,7 +43,7 @@ pub type StoreAlloc = Alloc<'static>;
 #[path = "forms.rs"]
 pub(crate) mod forms;
 
-/// The root of every store's folder under blaze's folder in the home (drive.md ruling 1): it
+/// The root of every store's folder under blaze's folder in the home (drive.md): it
 /// holds blaze's cache directory tag, the store of each form a blaze on this machine made
 /// ([`STORE_DIR`]), and, from format 4 and before, that store's files directly (the legacy
 /// layout, [`forms`]).
@@ -309,7 +309,7 @@ pub struct Counts {
 }
 
 /// The store handle the command's `Store` seam is implemented on: the namespace a record goes
-/// to is decided here (drive.md ruling 2), every byte lives in the `Lent`.
+/// to is decided here (drive.md), every byte lives in the `Lent`.
 pub struct PlainPlace<'m, D: Driver> {
     lent: &'m Lent<D, StoreAlloc>,
     /// Whether this machine may write [`Namespace::PUBLIC`] (a trusted builder).
@@ -359,7 +359,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
         self.public_writer
     }
 
-    /// The record's namespace (drive.md ruling 2): `PUBLIC` only when every name in it is
+    /// The record's namespace (drive.md): `PUBLIC` only when every name in it is
     /// public AND this machine is a trusted builder; else `LOCAL`.
     pub fn namespace(&self, all_names_public: bool) -> Namespace {
         if all_names_public && self.public_writer { Namespace::PUBLIC } else { Namespace::LOCAL }
@@ -489,7 +489,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     }
 
     /// The record the root `name` is, in place (its bytes the 32-byte keys it names, in order):
-    /// a root is a name in the newest manifest, not a probe (drive.md ruling 7). `None`: no
+    /// a root is a name in the newest manifest, not a probe (drive.md). `None`: no
     /// root of that name. Uses the root's creation generation as a segment-locality hint so warm
     /// reads avoid mapping older/larger segments.
     pub fn root(&self, name: &str) -> Result<Option<Held<'m>>, PlaceError> {
@@ -500,7 +500,7 @@ impl<'m, D: Driver> PlainPlace<'m, D> {
     /// Keeps `keys` under the root `name` from the next commit on, for blaze-cas
     /// `ROOT_LIFE_NS` from it (each commit that names them again renews it): cleanup keeps
     /// every record an unexpired root names (a running program's code records; a checkout's
-    /// last answer for each request shape: drive.md ruling 3), and nothing else past a
+    /// last answer for each request shape: drive.md), and nothing else past a
     /// command's lease. The one function of the [`Answer`] class (store/roots.rs): its
     /// [`Rooted`] says the root expires with the checkout.
     pub(crate) fn pin(&self, name: &str, keys: &[Key]) -> Result<Rooted<Answer>, PlaceError> {

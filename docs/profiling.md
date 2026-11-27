@@ -5,6 +5,11 @@ date: 2026-11-04
 ---
 # Profiling blaze
 
+What the tree shows today: no binary reaches `crates/blaze-profile` (the `blaze` binary,
+crates/blaze-cli, does not depend on it), and what a `blaze` run records is bstd's telemetry
+report (crates/blaze-std/src/telemetry.rs), printed to stderr under `--stats`, and the
+command's profile in `.blaze/v2/profile.txt`; the rest of this page describes blaze-profile.
+
 blaze has one profiler, its own: one stream of span and counter events, one buffer, and
 several readers.
 
@@ -352,7 +357,7 @@ there a repeated name is not a repeated key.
 | since | u64? | the last build that computed it (however that build ended), which it is compared with |
 
 `blaze why` reads the same rows from the daemon (`Request::Rebuilt`). How each cause is worked
-out is in docs/v2/plan/design/why.md.
+out is in crates/blaze-cli/src/engine_why.rs.
 
 The fiber driver notes the four `fiber stack` counters when a job ends, as one row in the
 recorder (`blaze_profile::fiber_stack`):

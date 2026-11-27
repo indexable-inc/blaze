@@ -859,8 +859,7 @@ impl Ready<'static> {
 /// only records: its direct dependencies' and the sysroot crates before it in the graph's order
 /// (it waits for those), then what each `Need` names. One [`Prepares`] for the whole call: a
 /// macro defined in one crate and called in fifty is prepared once. A measurement and the
-/// proof's other side, not the driver: the driver keys, stores and schedules (drive.md, "SPEC,
-/// the NAMES step"). The answer is by crate index; `needs` counts the re-entries a `Need` made.
+/// proof's other side, not the driver: the driver keys, stores and schedules (drive.md). The answer is by crate index; `needs` counts the re-entries a `Need` made.
 /// `alloc` is taken from every worker at once: it must be a heap any thread may use (as
 /// `par`'s threads already require).
 pub fn resolve_by_records<'a, S: SourceTexts<'a>, P: Par>(

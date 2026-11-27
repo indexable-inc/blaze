@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: What a test is on the rebuilt path. A test unit is a unit like any other with `test` in its cfg and its own key; its tests are one record per unit built from attributes alone (crates/blaze-scope/src/tests_record.rs); the runner is blaze's own, one forked process per test over the suite's shared code area; a result is a record read-addressed by the functions the test entered and the outside reads it made, so an edit reruns only the tests that entered what changed, found by a postings record (End state, with the gap and the pieces). Built 2026-11-16: test units become crates of the names set, and the tests record with its reader; written, not compiled: the plan machine and the postings record (crates/blaze-run plan.rs, postings.rs). Not built: the runner, the head record, integration-test units, benches, doc tests. A second end state (2026-11-16) decides property tests as a kind the runner knows (case board, failing tapes as shared records, background search), differential tests (in-tree `differ`, the previous version by `previous(f)`), end-to-end tests (traced spawns, step traces, snapshots as reads) and judge-changed findings.
+summary: What a test is on the rebuilt path. A test unit is a unit like any other with `test` in its cfg and its own key; its tests are one record per unit built from attributes alone (crates/blaze-scope/src/tests_record.rs); the runner is blaze's own, one forked process per test over the suite's shared code area; a result is a record read-addressed by the functions the test entered and the outside reads it made, so an edit reruns only the tests that entered what changed, found by a postings record. Built: the tests record, the plan machine, head, postings, results and Flaky findings (crates/blaze-run), the zygote and child, the suite as one program (blaze-ladder front2/program/suite.rs), D191's full view (blaze-drive view.rs) and `blaze test`'s drive loop (blaze-cli test_loop.rs, test_run.rs). Not built: D152's one crate key, the launcher's recording wrappers, the not-kept precheck from effect facts, doc tests, shared results. A second end state decides property tests as a kind the runner knows (case board, failing tapes as shared records, background search), differential tests (in-tree `differ`, the previous version by `previous(f)`), end-to-end tests (traced spawns, step traces, snapshots as reads) and judge-changed findings.
 date: 2026-11-16
 ---
 # Tests
@@ -171,26 +171,20 @@ number from its first argument and calls that row's function. ONE PROCESS PER TE
   `should_panic(expected = "..")` is judged by the parent reading that message. One process that
   stops at the first panic would report one failure per run and could not judge `should_panic`.
 - a hang, a stack overflow or a wild write fails one test with its name (rules 18, 20), tests run
-  on every core without sharing state, and a test's result is a record of one process's run,
-  which is the shape test-selection.md keys.
+  on every core without sharing state, and a test's result is a record of one process's run.
 - cost: one spawn per test (the floor is the kernel's process start, about a millisecond; tempo's
   4,005 test bodies are seconds across cores), paid only by tests that rerun.
 
 Output: one line per test in path order (`test tests::panics ... ok`, `FAILED`, `ignored, slow`),
 the failures' messages, one summary line (`3 tests: 2 passed, 0 failed, 1 ignored`); status 0 when
-none failed, else 1. First cut: tests returning `()`; one returning a `Termination` type is refused
-by name until the entry calls `report`.
-
-## Incremental: tests by reach
-
-Replaced by "End state" below: a test's asks are the functions it ENTERED (exact, from the run's
-mark stubs); the reach walk's set is the asks only for a test that started a second thread.
+none failed, else 1. A test returning a `Termination` type is entered through a report shim over
+its `Termination::report` (blaze-ladder front2/program/suite.rs `SuiteEntry`).
 
 ## The other targets
 
 - Integration tests (`tests/*.rs`): each file its own unit, kind test, depending on the library's
-  PLAIN unit and the dev-dependencies; same record, same runner. Not built: blaze-manifest's layout
-  does not read `tests/`, `examples/` or `benches/`, and the unit graph has no kind for them.
+  PLAIN unit and the dev-dependencies; same record, same runner. The unit graph has their kinds
+  (`UnitKind::IntegrationTest`, `Bench`, `Example`).
 - `#[bench]`: listed in the tests record with its own flag so nothing is dropped quietly; the
   runner prints it as not run. Measuring is its own design.
 - Doc tests: later work, in doctests.md.
@@ -198,14 +192,46 @@ mark stubs); the reach walk's set is the asks only for a test that started a sec
 ## End state (architect, 2026-11-16)
 
 Stands: "A test unit", "The tests record", the verdicts of "The runner", run.md "What a program
-is given" (fixed environment, run spec in the key), test-selection.md 1 to 4 (a cached pass
-reads as a pass, the not-kept table, the outside form). Its section 5 is the daemon's, old.
+is given" (fixed environment, run spec in the key).
+
+**A cached pass reads as a pass.** `test parse::empty ... ok <0.012s> (cached)`, the time the
+last real run's; the summary counts it as passed (`41 passed (38 cached)`); in JSON `"outcome":
+"passed"` with a `"cached"` object (basis `executed` or `reached`, why, the last run's millis).
+A test that ran and is not kept says why, by name (`(not kept: it read the wall clock)`); a test
+that ran although selection was asked says which ask moved (`no-head`, `no-row`,
+`function-changed`, `read-changed`). `--run-all` runs every test asked and still files what it
+learns.
+
+**Not kept, refused, own** (the invariant: a test is reported cached only if rerunning it now
+would give the same result, so everything it can observe is an ask or the result is not kept).
+One row per operation and site in blaze-run oscall.rs `RULES`; the reasons are plan.rs `NotKept`:
+
+| What the test touches | Decision |
+|---|---|
+| The wall clock | Not kept (`Clock`): its value is never equal twice |
+| The monotonic and CPU clocks | Its own: an async runtime reads `Instant` on every poll; a failure always reruns |
+| Randomness the provider answered | Its own: seeded from the test's base key, the same whatever ran before it |
+| Its own loopback, its temporary folder | Its own |
+| A file, listing or variable under the root or outside it | An ask, by name, answered by its digest |
+| The host's loopback | Not kept (`Network`) |
+| A peer off the machine; a write outside its temporary folder | Refused by the sandbox: the test fails naming it |
+| Code the tracer cannot see (inline assembly, an unbound foreign call, a program not of the workspace) | Not kept (`Foreign`) |
+| A spawned workspace binary (`CARGO_BIN_EXE_<n>`) | Traced: its asks join the test's |
+| A descriptor the sandbox did not see opened | Not kept (`Descriptor`) |
+| Not sandboxed | Not kept (`Unsandboxed`); its base key says it ran outside |
+
+A test that cannot be traced is not kept, by name, every time it runs: never an error, never rerun
+under another rule. Failures are not kept: a failing test runs every time it is asked. An undone
+edit after a failure finds the older pass by its address. Nondeterminism the asks do not cover (a
+data race, a timing-dependent test) is the test's own: a pass and a failure at one address is a
+`Flaky` finding. The recording wrappers that observe these calls in the child are the launcher's
+and are not built.
 
 **A test is an item**: a row of its unit's tests record, from attributes alone; no harness
 binary per crate. Its id is `TestRun`'s base key (`TestInputs`: toolchain, unit settings, item,
 attributes, run spec digest, arguments); nothing of its code is in it.
 
-**A result is a record, read-addressed** (target.md, trace b). Asks: each function the run
+**A result is a record, read-addressed.** Asks: each function the run
 ENTERED, by stable name (item and type arguments), answered by its code identity now (the
 instance key: its body's result, the layouts and constants it read, the statics it names); each
 outside read by name (a file from the root, a variable, a host fact), answered by its digest.
@@ -259,7 +285,7 @@ address is a `Flaky` finding naming the two runs. **Shared**: CI files passes in
 organisation's namespace, signed; a developer hits only an equal address, so exactly when its
 code and reads answer as CI's did (target and host facts are asks). Developers never write one.
 
-**Floors** (estimates, Mac numbers from target.md). No edit: floor 2 ms (one head read), design
+**Floors** (estimates, Mac). No edit: floor 2 ms (one head read), design
 4 to 7 ms. One body edited in a tempo leaf crate, entered by k tests: the build (15 to 40 ms) +
 one fork per test (0.3 ms Linux, 1 ms macOS; k at once) + the slowest test's own time + 1 ms of
 report; floor the same less the forks: ratio about 1.1. blaze's tests are 0.1 to 2 s simulations:
@@ -274,56 +300,29 @@ idea; better: identity covers layouts and constants, reads are asks, marks have 
 Jest/Vitest `--changed`: file grain over imports. Zig: matched on compiler-found tests and a
 protocol to the parent; better: a crash fails one test, and results are kept.
 
-### Gap (2026-11-16, tree at 3f8b478055)
+### Pieces (code comments cite them by number)
 
-| Needed | Today, with evidence | Missing | Reached by |
-|---|---|---|---|
-| `blaze test` runs tests | blaze-cli main.rs `close`: prints "tests are not run yet", returns FAILED; blaze-drive request.rs `runs_program`/`units_known`: `Test` starts the package's program like `Run` | the whole runner | the command |
-| Selection forward from C | blaze-run suite.rs `Tests::affected`: postings in a HashMap in memory, never a record; a failed test is not rerun | the record form, failures, reads, undo by address | only a test |
-| Tests listed | blaze-scope tests_record.rs `encode`, `TestsRecord::find`: no caller outside its test | the driver filing it per test unit | only a test |
-| Process per test, zygote, descriptor 3 | blaze-ladder place.rs: the program runs on blaze's own thread, every function compiled before the entry ("Shortcuts") | zygote, fork, report protocol, capture | only the ladder |
-| Entered marks | blaze-run suite.rs `entered`; blaze-launch-rt observe.rs mark stub | the wire message `TestEnded`, the per-process bitmap read | only a test |
-| Result records | blaze-keyed kind.rs `TestRun` (tag 8, `TestInputs`); blaze-drive run.rs `test_name`, `code_read`: no caller | the writer, the head, the flaky record | nothing |
-| Sandbox per test | blaze-proc-macro native_sandbox.rs `run`: build scripts only | a test profile, temporary folder, refusals named | nothing |
-| Outside reads traced | place.rs `symbol` binds imports by `dlsym` (the seam); blaze-std hosting.rs `Hold` for hosted bstd programs | recording wrappers, not-kept classes | nothing |
-| Effect facts per instance | no match for an effect fact in front2 | the precheck of not-kept | nothing |
-| Lib and test unit share records | none: two crate keys (above, "A test build is a view of its crate") | the view (D152) | the command |
-| Integration tests, doctests | unit graph has no kind for `tests/`; blaze-doc doctest.rs is the old path's | units, records | nothing |
-| Shared results | blaze-remote serves records; nothing for `TestRun` | CI writer, signed statements | nothing |
-
-### Pieces, in build order (one writer each; NB = needs the builder to build real bodies)
-
-1. blaze-run plan.rs: the plan machine (filter, ignore, candidates from postings, look, run
-   queue by width and longest-first, deadlines, judge, report). Written 2026-11-16, not compiled.
-2. blaze-run postings.rs: the postings record (sorted (ask, test) rows; open, find). Written with 1.
-3. The head record: one row per test (id, last outcome, address, micros, asks range) and the
-   read table; encode, open, round trip. Now; with 4, 5, 11, 14, 16.
-4. The result value and the `Flaky` finding: the pass and failure values at an address; a fail
-   beside a pass is flaky. Now.
-5. The run report: failures first as they end, capped output, summary, `--format json`; a pure
-   formatter in blaze-run. Now.
-6. The driver files the tests record when a test unit's names are solved (blaze-drive; DRIVER
-   runner 10). Now; with 7.
-7. `blaze test` arguments into `plan::Config`: filters, libtest flags, refusal by name (blaze-cli;
-   DRIVER runner 10). Now.
-8. The suite entry: a generated function that calls row n of the tests record (front2 program.rs).
-   NB.
-9. The zygote and the per-test child: fork, sandbox, temporary folder, descriptor-3 report,
-   deadline kill with stacks (blaze-launch). NB to run; writable now.
-10. `TestEnded{test, verdict, entered}` on the wire, marks read per process (blaze-launch-rt). NB.
-11. The OS-import classifier: a call name and arguments to an ask or a not-kept reason, sans-IO.
-    Now; its wrappers NB.
+1. The plan machine: built, blaze-run plan.rs.
+2. The postings record: built, blaze-run postings.rs.
+3. The head record and its read table: built, blaze-run head.rs.
+4. The result value and the `Flaky` finding: built, blaze-run result.rs.
+5. The run report: built, blaze-run report.rs.
+6. The tests record filed per test unit: built (blaze-cli names/sections.rs, the fifth section).
+7. `blaze test` arguments into `plan::Config`: built, blaze-cli test_args.rs.
+8. The suite entry: built, blaze-ladder front2/program/suite.rs `SuiteEntry`.
+9. The zygote and the per-test child: built, blaze-run zygote.rs and child.rs.
+10. The child's report, marks read per process: built, driven by blaze-cli test_run.rs.
+11. The OS-import classifier: built, blaze-run oscall.rs. Its recording wrappers in the launcher
+    are not built; until they exist a run is `NotKept::Untraced`.
 12. The not-kept precheck from effect facts. Waits on effect facts on the new layer.
-13. Basis `reached` for a test that started a thread: the reach record per test (front2 reach.rs).
-    NB.
-14. Integration-test units: blaze-manifest reads `tests/`; a unit kind per file. Now.
-15. Doctest units on the rebuilt path. NB.
-16. The drive loop: after the gate, per suite `Plan` effects to store lookups, the zygote and puts
-    (blaze-drive; DRIVER runner 10). After 1 to 7.
+13. Basis `reached` for a test that started a thread: built, front2 reach.rs `reach_all`.
+14. Integration-test units: the unit graph has the kinds (`UnitKind::IntegrationTest`).
+15. Doctest units on the rebuilt path. Not built.
+16. The drive loop: built, blaze-cli test_loop.rs and test_run.rs.
 17. Shared results: CI puts `TestRun` in its namespace, signed; lookups through the remote
     source. After 16 and the store lane.
 18. The test build as a view of its crate (D152, above): one crate key, cfg as a read, the
-    overlay. Large; first, because no test that calls library code runs without it.
+    overlay. D191's full view is built (blaze-drive view.rs); the one crate key is not.
 
 ## End state: property, differential and end-to-end tests (architect, 2026-11-16)
 
@@ -343,7 +342,7 @@ attributes alone. A test is a TAPE SEARCH when it opens the case board (below) t
 
 - **Opaque, unchanged Rust** (proptest, quickcheck, any `#[test]` drawing from `rand`): the
   sandbox answers `getrandom` and `/dev/urandom` from a seed H(base key, run number), as
-  test-selection.md section 2 already decides ("an input of the key, not of the world"). So a
+  "Not kept, refused, own" above already decides ("an input of the key, not of the world"). So a
   proptest suite is deterministic and its pass is kept like any test. Run 0 is the foreground;
   searching more means more runs under seeds 1, 2, ... (each run does the library's own cases).
   A failing run's record is its seed. proptest's `proptest-regressions/` files are reads (asks);
@@ -474,7 +473,7 @@ An e2e test is any test that runs the program or a command: a `tests/*.rs` file 
 workspace binary, a `harness = false` driver, a server started on loopback. `CARGO_BIN_EXE_<n>`
 names a launcher stub for that binary's manifest (no executable is written, bottom.md 11), so
 the spawned process is a launched program whose entered functions and reads join the test's
-asks, as test-selection.md section 2 decides ("Child processes: kept when traced"); oscall.rs
+asks, as "Not kept, refused, own" above decides (a spawned workspace binary is traced); oscall.rs
 `RULES` must change `Spawn` from `NotKept::Foreign` to traced for a workspace binary (any other
 program stays not kept). Loopback servers the test starts are its own (oscall.rs
 `ConnectOwnLoopback`). The monotonic and CPU clocks become KEPT, the wall clock stays not kept:
@@ -550,29 +549,9 @@ never kept, never shared. Writes go to the test's temporary folder only.
    nearest measured number is the no-edit names step on tempo, 27.9 to 37 ms
    (read-addressed.md, Gap), which the head read replaces.
 
-### F. Gap (tree at 131c427750)
-
-| Needed | Today, with evidence | Missing |
-|---|---|---|
-| runner knows tape searches | blaze-sim check.rs `check` reads `BLAZE_SIM_*` from the environment, `drive` uses `catch_unwind`; plan.rs has no property kind | case board, kind in head row |
-| sans-IO search in the parent | search.rs `Search::next`/`ran`, shrink.rs `Shrinker::next`/`ran`: sans-IO already | a driver in blaze-run |
-| failing tapes, corpus, searched | text.rs `print`/`parse` give the tape line; nothing keeps it | three records, the shared lookup |
-| seeded randomness | test-selection.md section 2 decides it; oscall.rs `RULES` (`Random`, `Own`) and its doc pass the real call through | the wrapper answering from the seed |
-| clocks for e2e | oscall.rs `RULES`: monotonic and CPU are `NotKept::Clock` | the row change |
-| spawned workspace binaries | oscall.rs `RULES`: `Spawn` is `NotKept::Foreign` | stub for `CARGO_BIN_EXE_*`, joined asks |
-| function coverage per case | observe.rs `mark` bitmap; test.md piece 10 reads it per process | per-case clear and read |
-| branch coverage | blaze-launch-host record.rs refuses SanitizerCoverage code; bottom.md 11 versions with hooks: design only | a coverage hook version |
-| guided search | search.rs proposes seeds `first..first + cases` or a given tape only | a guided phase |
-| draws by reflection | draw.rs `Any`: hand impls per type; comptime reflection: extensions.md row 112 | `Any` over reflection, `Draw` mark |
-| args-drawn tests | contract_test.rs expands one `blaze_sim::check` per function | the `#[test]`-with-arguments form |
-| differ, seam check | control.rs `control` (planted bugs); rule 78 by habit (blaze-memo tests/resident.rs) | `differ`, `SeamUntested` |
-| `previous(f)` | code records by code identity (code-identity.md); no base manifest kept, no primitive | primitive, base manifests, refusals |
-| step trace | zygote.rs `Effect::Stacks`, wire.rs `encode_stacks_into` | blocked calls, spans, entered steps in the report |
-| judge-changed | result.rs `flaky` is the one test finding | the finding, the CI gate |
-
 ### G. Pieces
 
-One writer each, none compiles; "CHILD" = needs the test runner's child (test.md pieces 7 to 11).
+Built: 1 (blaze-sim board.rs), 3 (blaze-run property.rs), 4 (tapes.rs), 6 (oscall.rs `RULES`), 8 (blaze-sim guided.rs), 13 (blaze-sim differ.rs), 18's formatter (blaze-run report/steps.rs), 19 (judge.rs). "CHILD" = needs the test runner's child.
 
 1. blaze-sim board.rs: the case board's form (plan, progress word, record area, coverage
    bits); encode, open with every bound checked. Test `board_round_trips` and a cut board
@@ -589,7 +568,7 @@ One writer each, none compiles; "CHILD" = needs the test runner's child (test.md
 5. blaze-run plan.rs: a property row's decide: failing tape first and never kept, seed chunks
    across idle width, regression tapes in the run spec. After 4; coordinate with plan.rs's lane.
 6. blaze-run oscall.rs `RULES`: monotonic and CPU clocks kept; `Spawn` of a workspace binary
-   traced; doc text corrected to test-selection.md's randomness. Test `table_covers_every_op`
+   traced; doc text corrected to the randomness row of "Not kept, refused, own". Test `table_covers_every_op`
    stands. Parallel, now.
 7. The launcher's `getrandom`/`/dev/urandom` wrapper answering from H(base key, run). CHILD.
 8. blaze-sim search.rs: a guided phase over a corpus (splice, raise, lower), keeping a tape that
@@ -646,7 +625,10 @@ shrink.rs); `Tape::int_in` with small offsets from a range's ends; twelve specia
 `Tape::reached` with `Verdict::Unreached` (a point no passing case reached fails the test); `check_given`;
 `control` with planted bugs; a coverage-guided phase that takes its signal as an input (guided.rs); `differ`.
 blaze-core's `Sim` tears unsynced writes by sector, fails syncs, runs out of room; blaze-check explores
-interleavings and checks linearizability. What is missing is below, as pieces S1 to S8.
+interleavings and checks linearizability. The pieces are S1 to S8. Built behind the `edge-first`
+feature (blaze-sim Cargo.toml, off until the harvest): S1a edge_ints.rs, S1b edge_text.rs, S2
+shape.rs, S3 kept.rs, S4 observe.rs; S5's enumeration is blaze-core sim/every_cut.rs. S8, the
+harvest, is not done.
 
 The method, chosen, with what each part is known for: a choice-sequence tape with internal shrinking (kept);
 interesting-value tables at every primitive (the boundary values fuzzers keep in a dictionary); swarm testing

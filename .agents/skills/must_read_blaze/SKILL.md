@@ -12,7 +12,7 @@ Read this before touching Rust, Cargo, or tooling in this repo. Also check [`age
 ## 1. What `blaze` is
 
 - Vertically integrated Rust stack owning every layer: language, `bstd`, MIR/LIR, ABI, JIT/PGO/AOT, exporter, linter, runtime, and bare-metal/unikernel VMs (kernel too). Design in full: [`docs/v2/plan/design/bottom.md`](../../../docs/v2/plan/design/bottom.md).
-- **Commands**: `blaze run`, `blaze test`, `blaze check`, `blaze export` (native, PGO by default). **No `build`, never `rustc`** (rules 1, 2). Dogfood `blaze` for inner loops (`blaze test crates/<crate>`), never cold `cargo`.
+- **Commands**: `blaze check`, `blaze build` (JIT-on-call, PGO by default; `--release` AOT), `blaze run`, `blaze test`. **Never `rustc`** (rules 1, 2). Dogfood `blaze` for inner loops (`blaze test crates/<crate>`), never cold `cargo`.
 - **Storage & incrementality**: Item-grain records keyed from text before work (rule 65), written once, read in place via kernel page cache only; no in-memory dependency graph; restarts re-index nothing.
 
 ## 2. `bstd` (`crates/blaze-std`) & Batteries
@@ -67,7 +67,7 @@ Unified single-value refinement surface in [`crates/blaze-ty/src/pat_ty.rs`](../
 ## 4. LLVM Replacement & Execution
 
 - **LIR ([`crates/blaze-lir`](../../../crates/blaze-lir))**: Columnar SSA LIR (`Func`/`View`), bottom-up Tarjan SCC ThinLTO (`lto.rs`), coroutine splitting (`coroutine.rs`), decayed cross-run PGO `BPG1` (`pgo.rs`, rule 86), and `aegraph` e-graph + loop/regalloc planners (`simplify/egraph.rs`).
-- **Codegen ([`crates/blaze-emit`](../../../crates/blaze-emit), [`crates/blaze-tier`](../../../crates/blaze-tier))**: Single-pass AArch64 baseline (`emit_record`) + experimental non-LLVM optimizing tier `TierName::Sota` ([`crates/blaze-emit/src/sota/`](../../../crates/blaze-emit/src/sota/), [`docs/v2/plan/design/sota-tier.md`](../../../docs/v2/plan/design/sota-tier.md)): Acyclic E-Graphs (`aegraph`) + ISLE-style DAG ISEL (`isel.rs`) + Chordal-SSA regalloc (`regalloc.rs`) for AArch64 & x86-64. Cranelift is ONLY used inside Wasmtime for `wasm32-wasip1` proc macros (rule 10).
+- **Codegen ([`crates/blaze-emit`](../../../crates/blaze-emit), [`crates/blaze-tier`](../../../crates/blaze-tier))**: Single-pass AArch64 baseline (`emit_record`) + experimental non-LLVM optimizing tier `TierName::Sota` ([`crates/blaze-emit/src/sota/`](../../../crates/blaze-emit/src/sota/), [`docs/v2/plan/design/sota-a64-architecture.md`](../../../docs/v2/plan/design/sota-a64-architecture.md)): Acyclic E-Graphs (`aegraph`) + ISLE-style DAG ISEL (`isel.rs`) + Chordal-SSA regalloc (`regalloc.rs`) for AArch64 & x86-64. Proc macros and pure-Rust build scripts compile to wasm64 (memory64) modules run in-process under Wasmtime, sandboxed (rule 10).
 - **Slot-based execution ([`crates/blaze-run`](../../../crates/blaze-run), [`crates/blaze-launch`](../../../crates/blaze-launch))**: Position-independent code records placed into slot words in the program's own process, compiled on first call, epoch-retired on edit or background tier-up — no link step ([`docs/v2/plan/design/run.md`](../../../docs/v2/plan/design/run.md), [`docs/v2/plan/design/launcher.md`](../../../docs/v2/plan/design/launcher.md)).
 
 ## 5. GPU, UI, PBR & CAD Stack

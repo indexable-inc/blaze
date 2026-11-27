@@ -30,8 +30,8 @@ A bump, in order (each step names itself when it fails, and stops there):
     (`lint_table write`, scripts/src/bin/lint_table.rs): crates/blaze-lint-defs/src/rustc.rs.
     The gate refuses a registry written from another commit than library/UPSTREAM's;
  5. moves the pins written down elsewhere: the old toolchain name, rustc version line and
-    commit in crates/rustc_lexer/Cargo.toml, the toolchain's names and `rustc -V` in README.md, docs/toolchain.md and
-    docs/cargo.md, Cargo.toml's rust-version, and the flake's rust-overlay input (`nix flake
+    commit in crates/rustc_lexer/Cargo.toml, the toolchain's names and `rustc -V` in README.md, docs/toolchain.md,
+    Cargo.toml's rust-version, and the flake's rust-overlay input (`nix flake
     update rust-overlay`, when nix is on PATH);
  6. installs the nightly with rustup.
 
@@ -91,7 +91,7 @@ COMPONENTS = [
 MENTIONS = ["crates/rustc_lexer/Cargo.toml"]
 # Docs that name the pin as it is today. Only its names and `rustc -V` move there: a bare commit
 # in them can be what something was ported from.
-DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]
+DOCS = ["README.md", "docs/toolchain.md"]
 ABI = ("crates/rustc_abi/src", "compiler/rustc_abi/src")
 # blaze's lines at the top of crates/rustc_abi/src/lib.rs, kept across a copy: the first is this
 # comment's marker, and it and the three after it (the tool and the crate's

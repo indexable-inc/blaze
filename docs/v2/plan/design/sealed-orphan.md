@@ -1,25 +1,23 @@
 ---
 status: plan
-summary: Relaxing the orphan rule soundly as an opt-in blaze extension: `#[blaze::sealed]` traits whose crate may write `impl<T: Sealed> ForeignTrait for T` (built, with its checks in `hir-ty-coherence`), and the ranked alternatives, including a whole-workspace coherence domain (designed, not built).
+summary: Relaxing the orphan rule soundly as an opt-in blaze extension: `#[blaze::sealed]` traits whose crate may write `impl<T: Sealed> ForeignTrait for T` (the attribute and the solver's knowability rule are on the item layer; the checks are not built), and the ranked alternatives, including a whole-workspace coherence domain (designed, not built).
 date: 2026-11-02
 ---
 # Relaxing the orphan rule, soundly (`#[blaze::sealed]`)
 
-Lanes `orphan` (design and first build), `orphan2` and `orphan3` (review fixes), 2026-11-02.
 Rules that bind: AGENTS.md 3 (no-fallback), 4 (superset-of-rust: opt-in extensions), 16, 18, 20,
 25, 26.
 
 ## Answer first
 
-- The built slice is **sealed-trait blanket impls**: `#[blaze::sealed] trait S {}` in crate L
+- The first slice is **sealed-trait blanket impls**: `#[blaze::sealed] trait S {}` in crate L
   lets L write `impl<T: S> ForeignTrait for T` (and any header where a parameter bounded by `S`
   stands where a local type would). It is sound per crate as long as the restrictions below
   hold, needs no re-check of any upstream crate, and changes nothing for code that does not
   write `#[blaze::sealed]`. It is Jules Bertholet's proposal (IRLO 22718) with scottmcm's
   condition (the trait must be sealed).
-- blaze has **no overlap check (E0119) for ordinary impls** (`blaze-diagnostics`'
-  `checks/impls.rs`: overlap is the front end's, never built). The slice builds the overlap
-  primitive (`hir-ty-coherence`) and runs it on relaxed impls only. Because no crate checks
+- blaze has **no overlap check (E0119) for ordinary impls**. The slice needs the overlap
+  primitive and runs it on relaxed impls only. Because no crate checks
   E0119 against the impls of other crates, the slice refuses every relaxed impl whose
   expansion a downstream crate could overlap (an uncovered type parameter beside the sealed
   one, rule 5 below). E0119 for every crate is the precondition for lifting that, for rank
@@ -94,13 +92,13 @@ implement, and every impl it enables names only L's own types.
 ### Rules (each a typed refusal naming the items and the rule, AGENTS.md rule 16)
 
 1. **Sealed** (checked in every crate that names `S`, registry dependencies included: see
-   "Where the checks run"; `check_impl` and `check_trait`): no impl
+   "Where the checks run"): no impl
    of `S` outside L; no trait outside L has `S` anywhere in its supertrait closure, `where
-   Self:` bounds included (`hir_ty::all_super_traits`). Otherwise `dyn Sub` would be an
+   Self:` bounds included. Otherwise `dyn Sub` would be an
    instance of `S` for a type of another crate, through the object candidate, with no impl:
    with `trait LSub: S` in L and `trait DSub: l::LSub` in D, `dyn DSub: S` holds. The refusal
    names the trait, `S` and the chain (`DSub: LSub: S`).
-2. **Closed over local types** (`sealed_closure`, a tracked query): every impl of `S` in L has
+2. **Closed over local types**: every impl of `S` in L has
    a self type local by the orphan walk (a local ADT or `dyn` of a local trait, possibly under
    `&`, `&mut`, `Box`, `Pin`), with no type parameter or alias under a `#[fundamental]` type
    (walked as rustc walks them, every argument of each but `Box`; `impl<Q> S for LPair<A, Q>`
@@ -108,17 +106,16 @@ implement, and every impl it enables names only L's own types.
    `impl F for LPair<A, DLocal>`), and `S` is not an auto trait. Otherwise the relaxation is
    unavailable: the impl gets E0117/E0210 and a refusal naming the impl of `S` that breaks
    closure. (`#[blaze::sealed]` used only to seal may still be implemented for foreign types.)
-3. **Param-as-local** (hir-ty's `check_orphan_rules` and blaze-diagnostics' E0210 walk, one
-   predicate, `hir_ty::sealed_local_bound`): an impl type parameter with a direct where-clause
+3. **Param-as-local** (one predicate shared by the orphan check and the E0210 walk): an impl type parameter with a direct where-clause
    `T: S`, `S` sealed, defined in the impl's crate and closed, is a local type. Only direct
    bounds count. Of several sealed bounds on one parameter, the first closed one in
-   where-clause order is the one used, by the orphan walks and by `sealed_relaxation` alike, so
+   where-clause order is the one used, by the orphan walks and by the relaxation alike, so
    the order of the bounds decides nothing; only when none is closed is the first named.
 4. **Foreign traits it may not relax**: auto traits, `#[fundamental]` traits, and the lang
    items whose impls the solver builds in or rustc checks one type at a time (`Sized` and its
    kin, `Unsize`, `Copy`, `Drop`, `Destruct`, `CoerceUnsized`, `DispatchFromDyn`, the `Fn*` and
    `AsyncFn*` traits, `Unpin`, `Freeze`, `Receiver`, `DerefPure`, the structural-eq markers,
-   `ConstParamTy_`; the list is `not_relaxable`). The pinned nightly has no
+   `ConstParamTy_`). The pinned nightly has no
    `UnsizedConstParamTy`. Negative relaxed impls are refused.
    **Sized**: every parameter of a relaxed impl with a sealed bound, the one the relaxation
    leans on and any other (rule 5 lets a sealed parameter stand uncovered), must be `Sized`
@@ -134,20 +131,19 @@ implement, and every impl it enables names only L's own types.
    **What counts as relaxed**: an impl leans on `S` only when the first input type the orphan
    rules decide by (under `&`, `Box`, `Pin`: the first local type or parameter) is the sealed
    parameter. `impl<T: S> From<T> for Local` is legal Rust already and is not checked further.
-5. **No uncovered parameter beside the sealed one** (`hir_ty::relaxed_uncovered_input`): no
+5. **No uncovered parameter beside the sealed one**: no
    input type of the trait-ref (self type included) may hold, under fundamental types, a type
    parameter without a closed sealed bound, or an alias the orphan walk can't see through.
    Fundamental types are walked as rustc's orphan checker walks them
-   (`rustc_next_trait_solver::coherence`, `OrphanChecker::visit_ty`; `hir_ty`'s
-   `any_fundamental_leaf`): `&` and `&mut`, `Box`'s first argument alone, and every argument
+   (`rustc_next_trait_solver::coherence`, `OrphanChecker::visit_ty`): `&` and `&mut`, `Box`'s first argument alone, and every argument
    of any other `#[fundamental]` ADT. `impl<T: S, U> F<U> for T` and
    `impl<T: S, U> F for Pair<T, U>` (a fundamental `Pair<X, Y>`) are refused;
    `impl<T: S, U> F<Vec<U>> for T`, `impl<T: S> F for Pair<T, A>` and
    `impl<T: S, U: S2> F<U> for T` are allowed. See "Why it is sound" below.
 6. **No overlap**: the relaxed impl is checked in `TypingMode::Coherence` against every impl
    of its trait visible from L (L and the crates it loads, blanket and derive impls, and the
-   `#[rustc_reservation_impl]` impls, which the solver's tables leave out and
-   `hir_ty::method_resolution::reservation_impls` keeps for coherence). Overlap is a refusal
+   `#[rustc_reservation_impl]` impls, which the solver's tables leave out and coherence must
+   keep). Overlap is a refusal
    (E0119) naming both impls. A specializing relaxed impl overlaps by definition and is
    refused.
 7. **Sealed knowability** (solver): in coherence, a trait-ref of a sealed trait never has a
@@ -205,7 +201,7 @@ Composition: D can't seal `DS` and write `impl<T: DS> l::S for T`: rule 1 refuse
 
 ### Where the checks run
 
-Decision (lane `orphan3`): **sealing is an opt-in extension of the sealing crate.** It binds
+Decision: **sealing is an opt-in extension of the sealing crate.** It binds
 every crate that can name the sealed trait, including a registry crate that rustc accepted
 (rustc treats `#[blaze::sealed]` as inert). When such a crate implements `S`, or extends it as a
 supertrait, refusing it is what the extension means; it does not break superset-of-rust,
@@ -213,80 +209,24 @@ because the program uses the extension through L. A graph with no `#[blaze::seal
 behaves exactly as before. The refusal names both crates (the one that wrote the impl or trait,
 and L), the trait and the rule.
 
-- A workspace member, a path package (a `[patch]`ed one under a registry crate included) and
-  a dependency under `BLAZE_DEPS=full` are checked whole. hir's item collector runs
-  `check_impl`, `check_trait` and the orphan check on every item, bodies' blocks included.
-- A crate of which only what the build's programs reach is checked (std, and any registry or
-  git dependency, `blaze-cargo`'s `reached_only`) otherwise runs no item check. For such a
-  unit, `compile::reached_only_diags` runs the sealed checks alone when
-  `hir_ty::sealed_in_graph(krate)` holds, whatever `BLAZE_DEPS` says. That flag is true when the
-  crate or any crate it depends on, directly or not, declares a sealed trait. The checks are
-  `hir::check::check_sealed` and `blaze_diagnostics::check_sealed`: `check_impl` on every impl,
-  `check_trait` on every trait, and rustc's orphan check on every impl of another crate's trait
-  (blaze-diagnostics' `trait_impl_orphan::in_sealed_graph`, lane `orphan4`). They cover the
-  crate's modules and the blocks of every body. Their errors fail the unit, as any
-  error-level diagnostic does in `assemble`. Lints are left out, as `--cap-lints` leaves them.
+- A crate checked whole runs the sealed checks with its item checks. A crate of which only what
+  the build reaches is checked (std, a registry or git dependency) runs them alone when it or
+  any crate it depends on declares a sealed trait, over its modules and every body's blocks;
+  their errors fail the crate, lints are left out.
 - Why every impl of a foreign trait, not only those with a sealed bound: the knowability rule
   (rule 7) and the expansion argument assume every crate that can name `S` obeys rustc's
   orphan rule, and a registry D that depends on a blaze-only L was never checked by rustc.
   With `impl<T: S> up::Conv for T { type Out = u64; }` in L, D's
   `impl up::Conv for l::A { type Out = &'static str; }` (E0117 under rustc) would give two
   values of `<l::A as up::Conv>::Out`. The walker is rustc's (Proper, then Compat for the
-  error), never hir's stricter `check_orphan_rules`, so a registry crate rustc accepts is
-  still accepted (`impl F for Pair<l::A, DLocal>` with a two-argument fundamental `Pair`
-  included). Each error names the impl, its trait and crate, the rule and the crate that
-  seals. Tests: blaze-cargo's `a_reached_only_orphan_impl_in_a_sealed_graph_is_refused` and
-  `a_reached_only_crate_rustc_accepts_stays_accepted_in_a_sealed_graph`.
-- Keys (rule 18): a reached-only unit's record key holds its crate's front-end identity
-  (`blaze_lower::Lowered::identity`), which hashes each dependency's identity and so L's source.
-  When L gains `#[blaze::sealed]`, D's key moves, so a record of D made while its graph had no
-  sealed trait (no check, no refusal) is never served for the sealed graph; in a kept daemon,
-  `sealed_in_graph` is a tracked query over the same source. Test:
-  `a_dependency_gaining_sealed_moves_a_reached_only_dependents_key_and_checks_it_again`.
-- Cost: `sealed_in_graph` and `declares_sealed` are tracked per crate. `declares_sealed` reads
-  each module-level trait's `AttrFlags`, and the crate's impl table for relaxed impls in
-  blocks. A crate with no sealed trait in its graph pays that memo read and nothing else. A
-  crate in a sealed graph also lowers (does not type-check) every body, to find the traits
-  and impls in its blocks. A text filter over bodies, like `Look` in `hir_def`'s `demand`
-  module, would cut that down (follow-up).
-
-### Where it lives (AGENTS.md rule 26)
-
-- `hir-def`: `AttrFlags::BLAZE_SEALED`, `TraitFlags::SEALED` (the last bit of `TraitFlags`'s
-  `u16`: the next flag widens it), `blaze::sealed` registered as a blaze tool attribute.
-- `vendor/rustc_type_ir`, `vendor/rustc_next_trait_solver`: the knowability hook.
-- `hir-ty` (`traits.rs`, beside `check_orphan_rules`): `sealed_bounds`, `sealed_local_bound`,
-  `sealed_closure` (tracked), `sealed_relaxation`, `relaxed_uncovered_input`,
-  `param_is_sized`, `any_fundamental_leaf` (rustc's walk of fundamental types),
-  `declares_sealed` and `sealed_in_graph` (tracked); `method_resolution::reservation_impls`
-  (tracked, per crate, empty without a walk unless the crate enables `rustc_attrs`) and
-  `TraitImpls::impls`.
-- `hir` (`check::check_sealed`, `DiagnosticsCollector::collect_sealed`), `blaze-diagnostics`
-  (`check_sealed`) and `blaze-cargo` (`compile::reached_only_diags`): the sealed checks of a
-  crate no other check covers.
-- `hir-ty-coherence`: the overlap primitive (`overlapping_impl`, one inference context with a
-  probe per candidate, under a `sealed_overlap` span) and `check_impl`/`check_trait`, returning
-  `CoherenceError { rule, message, note }`. `check_impl` makes no text unless it refuses.
-  `hir`'s diagnostics push them as it does specialization's.
-- `blaze-diagnostics`' `trait_impl_orphan::Checker` asks `sealed_local_bound` for a type
-  parameter, so its E0210 walk agrees with hir-ty.
-
-### Caching (AGENTS.md rule 18)
-
-- `orphan_rules_hold(impl)` is tracked; it reads the sealed trait's signature flags and,
-  through `sealed_closure(S)`, L's impls of `S` (`TraitImpls::for_crate_and_trait`), so it
-  reruns when either changes.
-- The store fact `Fact::Coherence(impl)` (`blaze-items/src/facts.rs`, `write_coherence`)
-  hashes the orphan result and the impls the impl could overlap. For an impl over a sealed
-  bound it adds every impl of each sealed bound trait (`part(b"sealed bound")`), every impl of
-  its own trait when it has a simplified self type (`part(b"relaxed")`), and for an impl of a
-  sealed trait the flag (`part(b"sealed trait")`). Each part is written only when it applies,
-  so no other impl's fact bytes change. These cover the orphan result. They do not cover
-  `hir-ty-coherence`'s overlap answer, which is not stored through this fact: it also reads
-  the impls of every trait named in a candidate's where clauses and the reservation impls. If
-  the overlap answer is ever stored, its key needs those (the crate fact would cover them).
-- Upstream results never depend on a relaxed impl (the expansion argument), so nothing upstream
-  needs a new key.
+  error), so a registry crate rustc accepts is still accepted (`impl F for Pair<l::A, DLocal>`
+  with a two-argument fundamental `Pair` included).
+- Keys (rule 21): whether a crate's graph is sealed is read from its dependencies' text, so L
+  gaining `#[blaze::sealed]` moves D's key and D is checked again. The orphan result of an impl
+  over a sealed bound reads every impl of each sealed bound trait and, for a relaxed impl, every
+  impl of its own trait; the overlap answer also reads the impls of every trait named in a
+  candidate's where clauses and the reservation impls. Upstream results never depend on a
+  relaxed impl (the expansion argument), so nothing upstream needs a new key.
 
 ## Phase 3: workspace coherence domain (designed, not built)
 
@@ -300,8 +240,8 @@ type is defined in any domain member. To stay sound:
 1. **Domain view for solving.** Every query that reasons about impls (the solver, coherence,
    method resolution, codegen's impl lookup, vtables, specialization) for a domain member runs
    with the domain root view: the impls of all domain members and their dependencies.
-   `DbInterner::krate` becomes a `CoherenceView` (a crate, or a domain) and
-   `TraitImpls::for_crate_and_deps` takes it. This removes hazard 2.
+   The crate a solve is for becomes a coherence view (a crate, or a domain). This removes
+   hazard 2.
 2. **Negative reasoning re-checked.** Each member's overlap check runs in the domain view
    (hazard 1).
 3. **Whole-domain overlap check** at the root: E0119 across members.
@@ -311,30 +251,25 @@ type is defined in any domain member. To stay sound:
 5. **Keys.** The view is part of every key of a query that reads impls; the domain list is an
    input whose digest goes into each member's unit key.
 
-Cost: the `krate` to view change touches every `DbInterner::new_with` caller (a whole port,
-AGENTS.md rule 21). Rank 1 needs none of it.
+Cost: the crate-to-view change touches every place a solve is opened (a whole port, rule 24).
+Rank 1 needs none of it.
 
 ## Follow-ups (not built)
 
 - E0119 for every crate (lifts rule 5; enables 1b; precondition for phase 3). Measure it
   against the corpus first: an imprecise overlap check refuses programs rustc accepts.
-- Merge the two orphan walkers (hir-ty's and blaze-diagnostics') into one in hir-ty.
 - Supertrait elaboration for rule 3 (`T: Sub` where `Sub: S`).
-- Lower fewer bodies for the sealed check of a crate in a sealed graph: only those whose text
-  may declare a trait or an impl (a `Look` variant in `hir_def`'s `demand`).
-- The orphan check's own walk (`unwrap_fundamental`, both orphan walkers) still follows the
-  first argument of a fundamental type alone, so blaze refuses `impl F for Pair<l::A, DLocal>`
-  with E0117 where rustc accepts it (a superset-of-rust gap, not a soundness one). Porting it
-  to rustc's walk is safe for the relaxation now: rule 5 and rule 2 already walk every
-  argument, so D's impl can no longer overlap a relaxed impl's expansion.
+- Read fewer bodies for the sealed check of a crate in a sealed graph: only those whose text
+  may declare a trait or an impl.
+- The orphan check walks every argument of a fundamental type, as rustc does, so it never
+  refuses `impl F for Pair<l::A, DLocal>` where rustc accepts it.
 
 ## What is built
 
-Rank 1, in `hir-def`, the two vendored solver patches, `hir-ty`, `hir-ty-coherence`, `hir`,
-`blaze-diagnostics`, `blaze-items` and `blaze-cargo` (the sealed check of reached-only units),
-as described above. Tests in
-`crates/hir-ty-coherence/src/tests.rs` (fixtures `up`, optionally `l`, and `main`, over
-minicore), each named for the property it pins:
+On the item layer: `blaze::sealed` is a known attribute (blaze-surface tool_attrs.rs), and
+blaze-solve has `TraitFlags::SEALED` (facts.rs) and its knowability rule (coherence.rs).
+Nothing sets the flag; the relaxed orphan check and the sealed refusals are not built. The
+properties their tests pin:
 
 - `closed_sealed_blanket_is_allowed` (also beside an upstream `impl<T: Show + ?Sized> Show for
   &T`, which needs the knowability patch);
@@ -350,9 +285,5 @@ minicore), each named for the property it pins:
   `const_param_ty_is_not_relaxable`;
 - `uncovered_param_beside_the_sealed_one_is_refused`;
 - `sealed_bound_choice_does_not_depend_on_order`;
-- `every_argument_of_a_fundamental_type_is_walked` (rule 5 and rule 2 over `Pair<X, Y>`).
-
-In `crates/blaze-cargo/src/serve/unit/tests.rs`:
-`a_reached_only_crate_that_implements_a_trait_sealed_upstream_is_refused`. It lowers three
-registry crates as a build does. `d` implements and extends `l`'s sealed trait and gets both
-refusals. `l` gets none. `plain`, with no sealed trait in its graph, gets no check.
+- `every_argument_of_a_fundamental_type_is_walked` (rule 5 and rule 2 over `Pair<X, Y>`);
+- a reached-only crate that implements a trait sealed upstream is refused.

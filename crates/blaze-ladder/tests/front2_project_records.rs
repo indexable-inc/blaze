@@ -1,5 +1,4 @@
-//! THE PROJECT WORLD OVER RECORDS (drive.md, "End state: the whole pipeline on the command",
-//! piece 5): `ProjectWorld::from_records` gives, for every body of a project, the verdict
+//! THE PROJECT WORLD OVER RECORDS (end-state.md D157): `ProjectWorld::from_records` gives, for every body of a project, the verdict
 //! `ProjectWorld::new` gives over the solved names, and a body is found by the identity the
 //! command names it by, (its file, its item chain).
 //!

@@ -1,5 +1,5 @@
 //! A `Signature`: one head the checker asks for, as a drive task (D114, drive.md "Check times:
-//! the end state in numbers" rule 4, and "D114 rulings / Signatures").
+//! the end state in numbers" rule 4).
 //!
 //! THE UNIT is one `heads::Want` of front2 (blaze-ladder front2/project/head_digest.rs): a fn,
 //! `const` or `static`; a struct, enum or union with its variants and constructors; a trait with

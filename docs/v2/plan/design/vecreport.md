@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Lint `blaze::vecreport` - report what LLVM's optimized code still does in a loop (a bounds, overflow or panic check that survived, a loop left scalar and why) at the source line, read from the IR after every pass and the loop vectorizer's remarks, hot loops only under a profile; prior art, the design, the guarantee it rests on, and what the stencil tier can say.
+summary: Lint `blaze::vecreport` - report what LLVM's optimized code still does in a loop (a bounds, overflow or panic check that survived, a loop left scalar and why) at the source line, read from the IR after every pass and the loop vectorizer's remarks, hot loops only under a profile; prior art, the design, the guarantee it rests on. Built, not wired: the IR walk in vendor/llvm-sys's C++ wrapper and the lint's id; nothing in Rust calls the walk.
 date: 2026-11-02
 ---
 # vecreport: what the optimized code still does
@@ -31,10 +31,9 @@ a deterministic order, never an IR dump. With a profile, only hot loops are told
 - **Compiler Explorer**'s opt-remarks pane: remarks next to the source, one function at a time.
 - **gatlinnewhouse/bounds_analyzer**: searches a compiled binary for calls of
   `panic_bounds_check`, by address, not by loop or line.
-- In blaze: `blaze::checkfree` (docs/lints.md#checkfree; lane `v2-checkfree`) holds a marked
-  function to no check by a MIR scan (`hir_ty_mir::mir::checks`), with the LLVM tier's own
-  check planned; `blaze::profile_hot` and the lint profile (`clippy.toml`'s `profile`,
-  `blaze-lints/src/profile.rs`) give function-level heat from a profile.
+- In blaze: the lint ids `blaze::checkfree` (a marked function holds no check) and
+  `blaze::profile_hot` (function-level heat from the lint profile) are declared in
+  blaze-lint-defs.
 
 What is new here: one report of both kinds of finding, read from the IR LLVM is about to emit,
 placed by blaze's own statement lines, filtered by the profile's loop counts, and kept with the
@@ -42,9 +41,8 @@ function's code in the store, so a cached function reports as a compiled one doe
 
 ## Design
 
-**What is read.** In `llvm::release::compile`, after the post-link pipeline (and the rebase
-and `elim-avail-extern` runs), before the sanitizers, the wrapper
-(`vendor/llvm-sys/wrappers/passes.cpp`) walks the function:
+**What is read.** After the optimizing tier's LLVM pipeline (D97), before any sanitizer, the
+wrapper (`vendor/llvm-sys/wrappers/passes.cpp`, `LLVMBlazeReport*`) walks the function:
 
 - *Kept checks*: `LoopInfo` over the function; for each block of a loop, each successor
   outside the loop whose path (following single successors, fuel 16) ends in `unreachable` (or
@@ -60,50 +58,29 @@ and `elim-avail-extern` runs), before the sanitizers, the wrapper
   hot by `isHotCount`. Remarks get their loop's count by its line. Computing BFI in the walk,
   not by asking remarks for hotness, keeps the passes' analysis cache as it is.
 
-**Where.** Each instruction's line is the statement index plus one (`LineRow`), in a file named
+**Where.** Each instruction's line is the statement index plus one, in a file named
 after the function. Inlined code is placed at its outermost `inlinedAt`, the function's own
 statement. Report mode forces these lines into the IR on every format (Mach-O too) and marks
-the function (`Defined::marked`); variables stay off unless debug info is asked for. When the
+the function; variables stay off unless debug info is asked for. When the
 object should not carry the lines (no debug info, or Mach-O, whose line table blaze doesn't
 read back), they are stripped after the walk and before the object is written.
 
-**Kept with the code.** `v2::release::emit` maps each row: line to statement to the function's
-`SpanRef`, a `blaze.f.N` callee to its request's `Target` (`Function`/`Direct` to the instance,
-`Extern`/`Weak` to the symbol). A line past the statements or a callee nothing places is an
-error naming the function, never a dropped row. Interleaving remarks are dropped. Rows are
-sorted and kept in the function's side table as a trailing postcard section with its own
-version (`v2::report`); a side table without one is byte-identical, and a function with rows
-and no table gets an empty table first. The store keeps it under `keys::side`, so a function
-the store had reports with no compile.
-
-**Keys.** `Spec::report` is hashed into `Settings` only when on, as a suffix, so every build
-without it keeps its keys; the report's code may in principle differ (lines in the IR), and its
-side table does. `Policy::report` sets it for LLVM units only.
-
-**Printing.** blaze-cargo turns it on from the unit's rustflags (`-W`/`-D`/`-F`/`--force-warn`
-`blaze::vecreport` or `blaze::pedantic_perf`, the last flag winning). At the link phase,
-`Generated::report` reads the side table of each function written in a workspace crate
-(`Built::editable`; not `Owner`, which says what a dependency image holds) from
-the build's puts or the store, and `HirFrontend::vecreport` resolves each `SpanRef` through
-the build's span tables to `file:line:col`, classifies the callee by its debug name (bounds,
-overflow, division, `unwrap`, panic), drops rows not hot under a profile, sorts by position and
-message and prints each once as a warning.
+**Not built: the Rust side.** Reading the wrapper's rows, mapping each line to the function's
+statement and span and each `blaze.f.N` callee to its instance (a line or callee nothing places
+is an error naming the function, never a dropped row), keeping the sorted rows with the
+function's code in the store (so a function the store had reports with no compile), putting the
+report flag in the function's key only when on, and printing: rows of workspace crates
+resolved to `file:line:col`, classified by callee (bounds, overflow, division, `unwrap`, panic),
+filtered by heat, sorted, each printed once as a warning.
 
 ## The guarantee it rests on
 
 LLVM's rule that debug information and remarks don't change code: a remark is made after the
 decision it describes and only an observer receives it, and debug intrinsics and locations are
 ignored by every transform's cost model (LLVM's `-g`-invariance testing, `llvm/utils/check-
-debugify`). `asking_for_the_report_changes_no_code` holds LLVM to it on a vectorized loop:
-the object is the same bytes with and without the report. Even so the flag is in the key, so a
+debugify`). The test owed is that the object is the same bytes with and without the report on a vectorized
+loop. Even so the flag is in the key, so a
 report build and a plain one never share an entry by assumption.
-
-## The stencil tier
-
-A stencil keeps every check its MIR has (no pass proves a range) and vectorizes no loop. The
-only true report there is the MIR's own check list, which `blaze::checkfree`'s scan
-(`hir_ty_mir::mir::checks`) already makes; `vecreport` reports nothing for stencil or Cranelift
-code rather than repeat it. Dev builds are told so in docs/lints.md#vecreport.
 
 ## Profile gating
 
@@ -117,4 +94,4 @@ coarser filter the profile's loop counts make unnecessary here.
 - A diagnostic with a real span (an editor's squiggle) rather than a `file:line:col` prefix.
 - `#![warn(blaze::vecreport)]` in the source: the flag is in the build's keys, which are fixed
   before the source is read.
-- The checkfree lane's LLVM-tier check can read these rows instead of walking again.
+- `blaze::checkfree`'s optimized-code check can read these rows instead of walking again.

@@ -2790,7 +2790,7 @@ enum Step {
     First(Want),
 }
 
-/// A want parked on [`Store::ensure_seeded`]'s stack (typeck.md "Head making waits"): the want
+/// A want parked on [`Store::ensure_seeded`]'s stack (end-state.md D161): the want
 /// and, once a step reached its text, that text's lowering, kept until the want is made.
 pub(super) struct HeadFrame<'n> {
     want: Want,

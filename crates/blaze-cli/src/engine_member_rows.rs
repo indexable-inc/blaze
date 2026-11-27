@@ -1,4 +1,4 @@
-//! A MEMBER'S LISTING ROW (engine.md "An edit costs what it moved", D149 piece I1; rule 51: what
+//! A MEMBER'S LISTING ROW (end-state.md D168, D149 piece I1; rule 51: what
 //! outlives a task is a record; rule 77: never rebuild what a record holds).
 //!
 //! THE CAUSE IT REMOVES (tempo, one body edited, tree 9cec6e9546): the Bodies phase opened every

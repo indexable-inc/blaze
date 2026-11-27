@@ -1,4 +1,4 @@
-//! The puts of `blaze engine-check` (engine.md E6; "The design" 5): after each phase's merge,
+//! The puts of `blaze engine-check` (end-state.md D157): after each phase's merge,
 //! the records its tasks made go to the store in bulk, sorted by key (rule 25), so the next
 //! phase's tasks read them through the store as the old functions expect (`work::payload`).
 //!

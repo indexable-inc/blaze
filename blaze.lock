@@ -1,5 +1,5 @@
 # blaze.lock: what blaze builds this workspace with besides the crates in Cargo.lock.
-# blaze writes it (`blaze lock`); commit it. docs/cargo.md, "Lock files".
+# blaze writes it (`blaze lock`); commit it. docs/v2/plan/design/lock-policy.md.
 version = 1
 
 [blaze]

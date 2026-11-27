@@ -1,4 +1,4 @@
-//! `Lent`'s one promise (lent.rs, ruling 6): bytes handed out early stay byte-equal AND at the
+//! `Lent`'s one promise (lent.rs): bytes handed out early stay byte-equal AND at the
 //! same address after later gets that map more segments and after puts that add chunks. The
 //! planted control is the arena as one growing buffer (`LentPlant::OneBuffer`): its first
 //! reallocation moves what it lent, and the address check catches the move. The planted run

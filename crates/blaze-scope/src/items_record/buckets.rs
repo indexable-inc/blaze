@@ -1,5 +1,5 @@
-//! The bucket index of the items record (drive.md, "End state: the whole pipeline on the
-//! command", piece 12; the bullet "An impl bucket is a fact, not a task"): the crate's impls
+//! The bucket index of the items record (end-state.md D157; the bullet
+//! "An impl bucket is a fact, not a task"): the crate's impls
 //! filed by RESOLVED (trait or "inherent", the self type's head), so "which impls of this crate
 //! can answer `T: Trait`" is one binary search over the record's bytes, and a reader that asks
 //! one bucket reads no other impl's row and opens no text.
