@@ -236,3 +236,223 @@ fn inferred_outlives_and_implied_bounds() {
     has(&implied("assoc"), Some(T_A), None, "assoc");
     lacks(&implied("assoc_n"), Some(T_A), None, "assoc_n");
 }
+
+const ZERO_PARAM_MAIN: &str = "use std::marker::PhantomData;
+
+fn main() {}
+
+struct Inner<'a, 'e: 'a>(&'a &'e ());
+
+// 0-parameter ADT whose field has a region-layout refusal (`NotLaidWhy::DynLifetimes`
+// from two explicit trait-object lifetime bounds): must NOT be walked by `adt_facts_of`
+// and must NOT poison enclosing ADTs' inferred outlives or implied bounds.
+struct ZeroParamComplex {
+    _opaque: &'static (dyn Send + 'static + 'static),
+}
+
+// Same field, but on a parameterized ADT: its fields MUST still be walked.
+struct ParamComplex<'a> {
+    _opaque: &'a (dyn Send + 'static + 'static),
+}
+
+// Parameterized ADT with NO declared bound: walking its field infers `'e: 'a` (RFC 2093).
+struct ParamInferred<'a, 'e>(&'a &'e ());
+
+struct Wrap<'a, 'e> {
+    _inner: Inner<'a, 'e>,
+    _opaque: ZeroParamComplex,
+}
+
+impl<'a, 'e: 'a> Wrap<'a, 'e> {
+    fn m(&mut self) {}
+}
+
+struct WrapNoBound<'a, 'e> {
+    _a: PhantomData<&'a ()>,
+    _e: PhantomData<&'e ()>,
+    _opaque: ZeroParamComplex,
+}
+
+impl<'a, 'e: 'a> WrapNoBound<'a, 'e> {
+    fn m_no(&mut self) {}
+}
+
+struct WrapParam<'a, 'e> {
+    _inner: Inner<'a, 'e>,
+    _opaque: ParamComplex<'a>,
+}
+
+struct WrapInferred<'a, 'e> {
+    _inferred: ParamInferred<'a, 'e>,
+    _opaque: ZeroParamComplex,
+}
+
+impl<'a, 'e: 'a> WrapInferred<'a, 'e> {
+    fn m_inf(&mut self) {}
+}
+
+fn ok_with_zero_param<'a, 'e>(w: &mut Wrap<'a, 'e>) {
+    w.m();
+}
+
+fn ok_with_inferred_param<'a, 'e>(w: &mut WrapInferred<'a, 'e>) {
+    w.m_inf();
+}
+
+fn bad_without_inner<'a, 'e>(w: &mut WrapNoBound<'a, 'e>) {
+    w.m_no();
+}
+
+fn param_still_walked<'a, 'e>(w: &mut WrapParam<'a, 'e>) {
+    let _ = w;
+}
+";
+
+#[test]
+fn zero_param_adt_does_not_poison_implied_outlives() {
+    let root = root();
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/zpa/src/main.rs".to_string(), ZERO_PARAM_MAIN.to_string())];
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user = UserCrate { name: "zpa", dir: "/zpa/", root: "/zpa/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+
+    let sources = [SourceFile { path: "src/main.rs", text: ZERO_PARAM_MAIN }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+    let mut world = ProjectWorld::new(&names, &frame, &sources, root.alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let bodies = world.bodies(root.alloc());
+    let name_of = |b: &BodyRef<'_>| -> String {
+        match b {
+            BodyRef::Free(k) => names.item_text(*k).and_then(|t| t.name).unwrap_or("?").to_string(),
+            BodyRef::Member { name, .. } => name.to_string(),
+        }
+    };
+    let find = |n: &str| bodies.iter().find(|(b, _)| name_of(b) == n).map(|(b, _)| *b).unwrap_or_else(|| panic!("`{n}` listed"));
+
+    let mut check = |n: &str| -> (String, bool, bool, Vec<&'static str>, String) {
+        let b = find(n);
+        let mut shown = String::new();
+        let (types, v) = world.check_borrows_shown(b, &mut shown, root.alloc());
+        assert!(types.is_clean(), "{n}'s types: {types:?}");
+        let line = shown.lines().find(|l| l.starts_with("implied ")).unwrap_or("<no implied line>").to_string();
+        let codes: Vec<&'static str> = v.findings.iter().map(|d| d.code).collect();
+        let dbg = format!("findings={:?} refused={:?}", v.findings, v.refused);
+        println!("{n}: {line}; {dbg}");
+        (line, v.is_clean(), v.refused.is_some(), codes, dbg)
+    };
+
+    // Positive: `Wrap<'a, 'e>` carries `Inner<'a, 'e>` (implying `'e: 'a`) alongside
+    // `ZeroParamComplex` (0-param with refused field regions). Implied `'e: 'a` is preserved
+    // and `w.m()` checks with 0 errors.
+    // Lifetimes of `fn<'a, 'e>(w: &Wrap<'a, 'e>)`: `'a` = Param(0), `'e` = Param(1), elided = Param(2).
+    let (ok_line, ok_clean, _, _, ok_dbg) = check("ok_with_zero_param");
+    let (_, ok_regions) = implied_lists(&ok_line).unwrap_or_else(|| panic!("ok_with_zero_param implied bounds poisoned: {ok_line}"));
+    assert!(ok_regions.contains("(Param(1), Param(0))"), "ok_with_zero_param missing implied `'e: 'a`: [{ok_regions}]");
+    assert!(ok_clean, "ok_with_zero_param must check with 0 errors: {ok_dbg}");
+
+    // Negative control: without `Inner<'a, 'e>`, `'e: 'a` is NOT implied, so calling `w.m_no()`
+    // MUST still fail with `UnprovenOutlives` (`code == "outlives"`).
+    let (bad_line, _, bad_refused, bad_codes, bad_dbg) = check("bad_without_inner");
+    let (_, bad_regions) = implied_lists(&bad_line).unwrap_or_else(|| panic!("bad_without_inner implied bounds poisoned: {bad_line}"));
+    assert!(!bad_regions.contains("(Param(1), Param(0))"), "NEGATIVE CONTROL: bad_without_inner must not imply `'e: 'a`: [{bad_regions}]");
+    assert!(!bad_refused, "NEGATIVE CONTROL: bad_without_inner must not refuse: {bad_dbg}");
+    assert!(bad_codes.contains(&"outlives"), "NEGATIVE CONTROL: bad_without_inner must fail with UnprovenOutlives: {bad_dbg}");
+
+    // Control 2: when a struct has lifetime parameters, its fields ARE still walked:
+    // (a) `ParamComplex<'a>`'s refused field regions still surface in `implied`;
+    // (b) `ParamInferred<'a, 'e>` (no declared bound) still infers `'e: 'a` from its field
+    //     so `w.m_inf()` checks with 0 errors.
+    let (param_line, _, _, _, _) = check("param_still_walked");
+    assert!(
+        param_line.starts_with("implied Err(Outlives(Unsolved"),
+        "CONTROL 2a: ParamComplex<'a> must still have its fields walked (expected Unsolved refusal): {param_line}"
+    );
+    let (inf_line, inf_clean, _, _, inf_dbg) = check("ok_with_inferred_param");
+    let (_, inf_regions) = implied_lists(&inf_line).unwrap_or_else(|| panic!("CONTROL 2b: ok_with_inferred_param implied bounds poisoned: {inf_line}"));
+    assert!(inf_regions.contains("(Param(1), Param(0))"), "CONTROL 2b: ParamInferred<'a, 'e> must still infer `'e: 'a`: [{inf_regions}]");
+    assert!(inf_clean, "CONTROL 2b: ok_with_inferred_param must check with 0 errors: {inf_dbg}");
+}
+
+#[test]
+fn adt_outlives_apply_skips_only_zero_param_adts() {
+    use blaze_ladder::front2::adt_outlives::{Mode, OutlivesBuf, OutlivesRefusal, Required, Requirements, requirements_of};
+    use blaze_ladder::front2::adt_variance::{LaidNode, NO_PARENT};
+    use blaze_typeck::regions::Region;
+    use blaze_typeck::{ItemKey, List, PNode, PTy};
+
+    struct AlwaysUnsolved;
+    impl Required for AlwaysUnsolved {
+        fn required(&self, adt: u128) -> Result<Requirements<'_>, OutlivesRefusal> {
+            Err(OutlivesRefusal::Unsolved { adt })
+        }
+    }
+
+    let root = root();
+    let mut out = OutlivesBuf::new_in(root.alloc());
+
+    // 0-parameter ADT (`own == 0 && kids == 0`): short-circuits without querying `Required`.
+    let zero_param = [LaidNode {
+        ty: PTy(0),
+        node: PNode::Adt(ItemKey(0xdead), List::EMPTY),
+        start: 0,
+        own: 0,
+        end: 0,
+        parent: NO_PARENT,
+        nth: 0,
+        kids: 0,
+        after: 1,
+    }];
+    assert_eq!(requirements_of(&zero_param, &[], Mode::Fn, &AlwaysUnsolved, &mut out), Ok(()));
+    assert!(out.params.is_empty() && out.regions.is_empty());
+
+    // 1-lifetime ADT (`own == 1, kids == 0`): MUST query `Required` and propagate `Unsolved`.
+    let one_lt = [LaidNode {
+        ty: PTy(0),
+        node: PNode::Adt(ItemKey(0xbeef), List::EMPTY),
+        start: 0,
+        own: 1,
+        end: 1,
+        parent: NO_PARENT,
+        nth: 0,
+        kids: 0,
+        after: 1,
+    }];
+    assert_eq!(
+        requirements_of(&one_lt, &[Region::Param(0)], Mode::Fn, &AlwaysUnsolved, &mut out),
+        Err(OutlivesRefusal::Unsolved { adt: 0xbeef })
+    );
+
+    // 1-type-parameter ADT (`own == 0, kids == 1`): MUST query `Required` and propagate `Unsolved`.
+    let one_ty = [
+        LaidNode {
+            ty: PTy(0),
+            node: PNode::Adt(ItemKey(0xcafe), List::EMPTY),
+            start: 0,
+            own: 0,
+            end: 0,
+            parent: NO_PARENT,
+            nth: 0,
+            kids: 1,
+            after: 2,
+        },
+        LaidNode {
+            ty: PTy(1),
+            node: PNode::Param(0),
+            start: 0,
+            own: 0,
+            end: 0,
+            parent: 0,
+            nth: 0,
+            kids: 0,
+            after: 2,
+        },
+    ];
+    assert_eq!(
+        requirements_of(&one_ty, &[], Mode::Fn, &AlwaysUnsolved, &mut out),
+        Err(OutlivesRefusal::Unsolved { adt: 0xcafe })
+    );
+}
