@@ -960,6 +960,14 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         for k in to_locate {
             self.prepare_local(k, &[owner]);
             self.locate(k)?;
+            if !self.store.fns.contains_key(&k) || !self.store.statics.contains_key(&k) {
+                let want = crate::front2::fill::want_of_key(self.front.names, &self.front.keys, k).map_err(|e| {
+                    let mut why = blaze_own::String::new_in(self.alloc);
+                    let _ = core::fmt::write(&mut why, format_args!("body_statics (lazy/fill.rs): {e}"));
+                    LazyRefusal::Head { item: self.refused_shown(k), why: why.as_str().into() }
+                })?;
+                self.make_want(want, k, "body_statics (a static's head)")?;
+            }
         }
         let (made, refused) = {
             let mut r = self.records(true);

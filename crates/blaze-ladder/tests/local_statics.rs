@@ -971,3 +971,124 @@ fn read_buf() -> i32 {
         "read_buf()",
     );
 }
+
+/// Regression for cold cached-`Typed` lazy runs referencing body-local foreign statics (plain
+/// `extern "C" { static environ; }` and `#[linkage = "extern_weak"] static pidfd_getpid;`) plus
+/// a Rust static whose initializer carries a transitive `DataTarget::Static` relocation to a
+/// foreign static: `body_statics` and `statics::static_values` must ensure every foreign static's
+/// head in `Store::fns` / `Store::statics` without running `check_body`, and preserve
+/// `extern_weak: true`.
+#[test]
+fn cold_typed_record_foreign_statics_including_extern_weak_and_transitive_ref() {
+    use blaze_ladder::run::make_one::{FromRecord, Twin};
+    use blaze_ladder::seam::FrontEnd;
+
+    let text = "#![feature(no_core, lang_items, linkage)]
+#![no_core]
+#![no_main]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+unsafe extern \"C\" {
+    static TRANSITIVE_EXT: *const u8;
+}
+
+static HOLD_EXT: *const *const u8 = unsafe { &TRANSITIVE_EXT as *const *const u8 };
+
+#[inline(never)]
+fn use_foreign_statics() -> usize {
+    unsafe extern \"C\" {
+        static environ: *const *const u8;
+        #[linkage = \"extern_weak\"]
+        static pidfd_getpid: *const u8;
+    }
+    unsafe {
+        let a = (&environ as *const *const *const u8) as usize;
+        let b = (&pidfd_getpid as *const *const u8) as usize;
+        let c = (&HOLD_EXT as *const *const *const u8) as usize;
+        a ^ b ^ c
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    (use_foreign_statics() & 1) as i32
+}
+";
+
+    let f = fixture(text);
+    let b = builder();
+    let main_key = fn_named(&f, "main");
+    let use_key = fn_named(&f, "use_foreign_statics");
+
+    // 1. Typing oracle walk (`SecondCheck` vs cold `FromRecord::rechecked`): byte-equal entries
+    // and ZERO `check_body` invocations on the reading side.
+    let names = reader(&f);
+    let checking = Maker::new(names, Some(main_key), &b, alloc());
+    let typing = FromRecord::rechecked(names, Some(main_key), alloc()).expect("rechecked double");
+    let reading = Maker::typed(names, Some(main_key), typing, &b, alloc());
+    let mut twin = Twin::new(checking, reading, alloc());
+    let mut store = MemoryStore::new_in(alloc());
+    let (walk, counts) = walk_records(main_key, &EveryItem, &mut store, &b, &producer(), &mut twin, alloc())
+        .unwrap_or_else(|e| panic!("cold typed-record foreign statics walk failed: {e}; log={:?}", logged(names.records)));
+    assert!(logged(names.records).is_empty(), "records log must be empty: {:?}", logged(names.records));
+    assert!(counts.made > 0, "expected makes in walk: {counts}");
+    assert_eq!(twin.compared, counts.make_calls(), "every entry must match byte-for-byte");
+    let program = twin.reading.program().expect("reading program");
+    assert_eq!(program.counts().checked, 0, "cold reading maker must not run check_body");
+
+    // 2. Inspect the emitted code entry of `use_foreign_statics` (byte-identical to the cold
+    // reading maker's): verify plain `environ` (`Space::Outside`) and weak `pidfd_getpid`
+    // (`Space::WeakOutside`).
+    let use_row = (0..walk.len())
+        .find(|&r| walk.tabled(r) == use_key)
+        .expect("use_foreign_statics reached by walk");
+    let use_code_key = walk.key(use_row).expect("use_foreign_statics code key");
+    let bytes = blaze_ladder::code_records::entry_of(&store, use_code_key)
+        .expect("store read")
+        .expect("use_foreign_statics entry bytes");
+    let entry = blaze_ladder::code_records::EntryView::read(bytes).expect("valid EntryView");
+    let mut saw_environ = false;
+    let mut saw_pidfd_getpid = false;
+    for i in 0..entry.record.targets() {
+        let target = entry.record.target(i);
+        match target.space {
+            blaze_code::record::Space::Outside => {
+                if entry.record.name(target.symbol) == Some("environ") {
+                    saw_environ = true;
+                }
+            }
+            blaze_code::record::Space::WeakOutside => {
+                if entry.record.name(target.symbol) == Some("pidfd_getpid") {
+                    saw_pidfd_getpid = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_environ, "expected body-local foreign static `environ` as Space::Outside");
+    assert!(saw_pidfd_getpid, "expected body-local extern_weak static `pidfd_getpid` as Space::WeakOutside");
+
+    // 3. Verify the cold reading `LazyProgram` also recorded the transitive foreign static
+    // `TRANSITIVE_EXT` reached via `HOLD_EXT`'s initializer (`DataTarget::Static`).
+    let mut ext_keys = Vec::new();
+    assert!(names.records.each_item(0, &mut |key, _| {
+        if names.records.kind_of_item(key) == Some(ItemKind::Static)
+            && names.records.name_of(key) == Some("TRANSITIVE_EXT")
+        {
+            ext_keys.push(checker_of(key));
+        }
+    }));
+    let [ext_key] = ext_keys.as_slice() else {
+        panic!("expected one TRANSITIVE_EXT static, found {}", ext_keys.len());
+    };
+    assert_eq!(program.foreign_static(*ext_key), Some("TRANSITIVE_EXT"));
+    assert_eq!(
+        program.static_item(*ext_key),
+        Some(blaze_build::StaticItem { thread_local: false, mutable: false, extern_weak: false })
+    );
+}

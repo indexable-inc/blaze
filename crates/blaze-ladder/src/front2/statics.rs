@@ -105,6 +105,23 @@ pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bod
             refused.push((k, format!("more than {MOST_STATICS} statics reached (the work list's bound)").into_boxed_str()));
             break;
         }
+        if let Err(err) = ensure_static_head(r, k) {
+            let mut msg = blaze_own::String::new_in(r.store.work_alloc());
+            match err {
+                StaticHeadError::Want(e) => {
+                    let _ = core::fmt::write(&mut msg, format_args!("{e}"));
+                }
+                StaticHeadError::Const(want, c, e) => {
+                    let _ = core::fmt::write(&mut msg, format_args!("static head asked {want:?}: the constant {c:x} its head names: {e:?}"));
+                }
+                StaticHeadError::Head(want, e) => {
+                    let shown = super::item_shown::head_error_shown(r.names, &e);
+                    let _ = core::fmt::write(&mut msg, format_args!("static head asked {want:?}: {shown}"));
+                }
+            }
+            refused.push((k, msg.as_str().into()));
+            continue;
+        }
         match super::program::foreign_static_symbol(r.names, &*r.keys, &*r.store, k) {
             Ok(Some(symbol)) => {
                 match foreign_kind(r, k) {
@@ -143,6 +160,35 @@ pub fn static_values<'c, 'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, bod
     kinds.sort_unstable_by_key(|(k, _)| *k);
     foreign.sort_unstable_by_key(|(k, _)| *k);
     (Statics { values, kinds, foreign }, refused)
+}
+
+enum StaticHeadError {
+    Want(super::fill::FillError),
+    Const(super::heads::Want, blaze_id::ItemKey, super::consts::ConstFail),
+    Head(super::heads::Want, super::heads::HeadError),
+}
+
+/// Ensures static `k`'s head is filed in `r.store.fns` and `r.store.statics` (including for
+/// cold cached-`Typed` runs and transitive `DataTarget::Static` relocations pointing to foreign
+/// statics whose heads were never loaded by `check_body`).
+fn ensure_static_head<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: ItemKey) -> Result<(), StaticHeadError> {
+    if r.store.fns.contains_key(&k) && r.store.statics.contains_key(&k) {
+        return Ok(());
+    }
+    let want = super::fill::want_of_key(r.names, &*r.keys, k).map_err(StaticHeadError::Want)?;
+    let mut lens = 0u32;
+    loop {
+        match r.store.ensure(r.names, &mut *r.keys, want) {
+            Ok(()) => return Ok(()),
+            Err(super::heads::HeadError::Item(_, super::types::Why::NeedConst(c, _))) if lens < super::program::MOST_ADT_LENS => {
+                lens += 1;
+                if let Err(e) = super::check::eval_len(r, c) {
+                    return Err(StaticHeadError::Const(want, c, e));
+                }
+            }
+            Err(e) => return Err(StaticHeadError::Head(want, e)),
+        }
+    }
 }
 
 /// Static `k`'s record (copied out of the evaluator's arena) and its kind. The run's static

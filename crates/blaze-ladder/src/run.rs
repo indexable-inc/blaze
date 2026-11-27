@@ -3807,11 +3807,16 @@ mod missing_record_retry_tests {
         withhold_repr: bool,
         withhold_valid_range: bool,
         withhold_discriminant: bool,
+        withhold_abi_item: Option<ItemKey>,
         can_fill: bool,
+        can_fill_abi: bool,
+        head_row_returns_some_without_filling: bool,
+        abi_filled: bool,
         left_out_why: Option<&'static str>,
         asked: RefCell<blaze_own::AVec<'static, (AskedKind, ItemKey)>>,
         filled: blaze_own::AVec<'static, (AskedKind, ItemKey)>,
         make_asked_calls: usize,
+        head_row_calls: usize,
         alloc: Alloc<'static>,
     }
 
@@ -3823,11 +3828,16 @@ mod missing_record_retry_tests {
                 withhold_repr: false,
                 withhold_valid_range: false,
                 withhold_discriminant: false,
+                withhold_abi_item: None,
                 can_fill: true,
+                can_fill_abi: true,
+                head_row_returns_some_without_filling: false,
+                abi_filled: false,
                 left_out_why: None,
                 asked: RefCell::new(blaze_own::AVec::new_in(alloc)),
                 filled: blaze_own::AVec::new_in(alloc),
                 make_asked_calls: 0,
+                head_row_calls: 0,
                 alloc,
             }
         }
@@ -3873,6 +3883,26 @@ mod missing_record_retry_tests {
         }
         fn sig(&self, i: usize) -> FnSig<'_> { self.inner.sig(i) }
         fn fn_index(&self, key: ItemKey) -> Option<usize> { self.inner.fn_index(key) }
+        fn fn_abi(&self, key: ItemKey) -> Option<blaze_build::Abi> {
+            if self.withhold_abi_item == Some(key) && !self.abi_filled {
+                return None;
+            }
+            <Front<'_> as FrontEnd>::fn_abi(&self.inner, key)
+        }
+        fn head_row(&mut self, key: ItemKey) -> Result<Option<usize>, RunError> {
+            if self.withhold_abi_item == Some(key) {
+                self.head_row_calls += 1;
+                if self.head_row_returns_some_without_filling {
+                    return Ok(self.inner.fn_index(key));
+                }
+                if !self.can_fill_abi {
+                    return Ok(None);
+                }
+                self.abi_filled = true;
+                return Ok(self.inner.fn_index(key));
+            }
+            Ok(self.inner.fn_index(key))
+        }
         fn check_all(&mut self) -> Result<CheckedBodies, RunError> { self.inner.check_all() }
         fn body_reads(&self, i: usize, checked: &Checked<'static>) -> Option<crate::front2::body_reads::ReadsDigest> {
             self.inner.body_reads(i, checked)
@@ -4055,6 +4085,100 @@ mod missing_record_retry_tests {
         assert!(
             matches!(err, RunError::LeftOut { ref why, .. } if why.as_ref() == "adt head refused"),
             "expected LeftOut, got {err}"
+        );
+    }
+
+    const CALL_SAMPLE: &str = "
+        fn helper(x: i32) -> i32 {
+            x + 1
+        }
+        fn main() {
+            let _ = helper(41);
+        }
+    ";
+
+    const CALL_SAMPLE_FILES: [SourceFile<'static>; 1] = [SourceFile { path: "main.rs", text: CALL_SAMPLE }];
+
+    fn call_sample_front(alloc: Alloc<'static>) -> Front<'static> {
+        let mut blaze = BlazeAttrs::default();
+        Front::new(&CALL_SAMPLE_FILES, "main.rs", &mut blaze, alloc).expect("call sample program lowers")
+    }
+
+    fn helper_key_of(front: &LazyMissingFront<'_>) -> ItemKey {
+        (0..front.fn_count())
+            .find_map(|i| {
+                let f = front.function(i);
+                f.path.ends_with("helper").then_some(f.key)
+            })
+            .expect("helper fn present")
+    }
+
+    #[test]
+    fn make_one_retries_no_abi_via_head_row_and_stops_when_unfillable() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let ground = PortableTys::new_in(alloc);
+
+        // Retry succeeds when `head_row(item)` loads the missing ABI.
+        let mut lazy = LazyMissingFront::new(call_sample_front(alloc), alloc);
+        lazy.prechecked = Some(lazy.inner.check_all().expect("check_all"));
+        let helper = helper_key_of(&lazy);
+        lazy.withhold_abi_item = Some(helper);
+        let main_i = lazy.entry().expect("main entry");
+        let main_key = lazy.function(main_i).key;
+        let mut name = blaze_own::Vec::new_in(alloc);
+        crate::symbols::encode_instance(main_key, List::EMPTY, ground.view(), alloc, &mut name).expect("encode main");
+        let mut state = make_one::MakerState::new(&lazy, main_key, isa(), OverflowChecks::Off, blaze_build::UbChecks::Off, blaze_build::Panic::Abort, alloc)
+            .expect("MakerState::new");
+        let mut checks = make_one::CheckCount::default();
+        let mut entry = blaze_own::Vec::new_in(alloc);
+        make_one::make_instance(&mut lazy, &mut make_one::SecondCheck, &mut state, &mut checks, main_key, &name, &mut entry)
+            .expect("make_instance retries BuildError::NoAbi via head_row and succeeds");
+        assert_eq!(lazy.head_row_calls, 1, "expected exactly one head_row call for helper");
+        assert!(lazy.abi_filled);
+        assert!(!entry.is_empty());
+
+        // Control 1: `head_row(item)` returns `Ok(None)` -> returns `BuildError::NoAbi` without looping.
+        let mut unfillable = LazyMissingFront::new(call_sample_front(alloc), alloc);
+        unfillable.prechecked = Some(unfillable.inner.check_all().expect("check_all"));
+        let helper = helper_key_of(&unfillable);
+        unfillable.withhold_abi_item = Some(helper);
+        unfillable.can_fill_abi = false;
+        let main_i = unfillable.entry().expect("main entry");
+        let main_key = unfillable.function(main_i).key;
+        let mut name = blaze_own::Vec::new_in(alloc);
+        crate::symbols::encode_instance(main_key, List::EMPTY, ground.view(), alloc, &mut name).expect("encode main");
+        let mut state = make_one::MakerState::new(&unfillable, main_key, isa(), OverflowChecks::Off, blaze_build::UbChecks::Off, blaze_build::Panic::Abort, alloc)
+            .expect("MakerState::new");
+        let mut checks = make_one::CheckCount::default();
+        let mut entry = blaze_own::Vec::new_in(alloc);
+        let err = make_one::make_instance(&mut unfillable, &mut make_one::SecondCheck, &mut state, &mut checks, main_key, &name, &mut entry)
+            .expect_err("unfillable NoAbi must fail cleanly");
+        assert_eq!(unfillable.head_row_calls, 1, "must stop after head_row returns Ok(None) without looping");
+        assert!(
+            matches!(err, RunError::Build { error: BuildError::NoAbi { item }, .. } if item == helper),
+            "expected BuildError::NoAbi for helper, got {err}"
+        );
+
+        // Control 2: `head_row(item)` returns `Ok(Some(_))` without providing ABI -> stops after one retry.
+        let mut stuck = LazyMissingFront::new(call_sample_front(alloc), alloc);
+        stuck.prechecked = Some(stuck.inner.check_all().expect("check_all"));
+        let helper = helper_key_of(&stuck);
+        stuck.withhold_abi_item = Some(helper);
+        stuck.head_row_returns_some_without_filling = true;
+        let main_i = stuck.entry().expect("main entry");
+        let main_key = stuck.function(main_i).key;
+        let mut name = blaze_own::Vec::new_in(alloc);
+        crate::symbols::encode_instance(main_key, List::EMPTY, ground.view(), alloc, &mut name).expect("encode main");
+        let mut state = make_one::MakerState::new(&stuck, main_key, isa(), OverflowChecks::Off, blaze_build::UbChecks::Off, blaze_build::Panic::Abort, alloc)
+            .expect("MakerState::new");
+        let mut checks = make_one::CheckCount::default();
+        let mut entry = blaze_own::Vec::new_in(alloc);
+        let err = make_one::make_instance(&mut stuck, &mut make_one::SecondCheck, &mut state, &mut checks, main_key, &name, &mut entry)
+            .expect_err("stuck NoAbi must fail cleanly");
+        assert_eq!(stuck.head_row_calls, 1, "must not spin when head_row returns Some without resolving ABI");
+        assert!(
+            matches!(err, RunError::Build { error: BuildError::NoAbi { item }, .. } if item == helper),
+            "expected BuildError::NoAbi for helper, got {err}"
         );
     }
 }

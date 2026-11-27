@@ -1182,12 +1182,17 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
                     return Err(e);
                 }
             }
+            Err(e) if let Some(item) = abi_missing(&e) && pulled.allow_once(AskKey::Abi(item)) => {
+                if program.head_row(item)?.is_none() {
+                    return Err(e);
+                }
+            }
             Err(e) => return Err(e),
         }
     }
     let mut owners = 0usize;
     // Phase 1: lay out coroutine states and build LIR ONCE into an owned `BuiltPhase`. Any
-    // missing fact (`Missing` / `OpaqueOwnerUnchecked` / `NoTrait` / `Check`) retries only Phase 1.
+    // missing fact (`Missing` / `OpaqueOwnerUnchecked` / `NoTrait` / `NoAbi` / `Check`) retries only Phase 1.
     let mut asked = AskProgress::new_in(alloc);
     let built_phase = loop {
         let MakerState { checked, tables, work, .. } = &mut *state;
@@ -1248,6 +1253,11 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
                                     return Err(e);
                                 }
                             }
+                            Err(e) if let Some(item) = abi_missing(&e) && owner_pulled.allow_once(AskKey::Abi(item)) => {
+                                if program.head_row(item)?.is_none() {
+                                    return Err(e);
+                                }
+                            }
                             Err(e) => return Err(e),
                         }
                     }
@@ -1272,6 +1282,12 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
             }
             Err(e) if let Some(t) = object_missing(&e) && asked.allow(&e) => {
                 if program.object_table(t)? {
+                    continue;
+                }
+                return Err(e);
+            }
+            Err(e) if let Some(item) = abi_missing(&e) && asked.allow_once(AskKey::Abi(item)) => {
+                if program.head_row(item)?.is_some() {
                     continue;
                 }
                 return Err(e);
@@ -1357,12 +1373,13 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
     Ok(())
 }
 
-/// What an `asks_again` / `object_missing` retry round stopped on, for [`AskProgress`].
+/// What an `asks_again` / `object_missing` / `abi_missing` retry round stopped on, for [`AskProgress`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum AskKey {
     Question(blaze_typeck::Question),
     Adt(ItemKey),
     Object(ItemKey),
+    Abi(ItemKey),
     Row(ReadKind, ItemKey),
 }
 
@@ -1370,6 +1387,7 @@ fn build_error_ask_key(error: &BuildError) -> Option<AskKey> {
     match error {
         BuildError::Select(blaze_typeck::ResolveError::Missing(q)) => Some(AskKey::Question(*q)),
         BuildError::NoAdt { adt } | BuildError::MissingRecord { item: adt } => Some(AskKey::Adt(*adt)),
+        BuildError::NoAbi { item } => Some(AskKey::Abi(*item)),
         _ => None,
     }
 }
@@ -1418,6 +1436,13 @@ impl<'a> AskProgress<'a> {
         self.allow_key(ask_key(e))
     }
 
+    fn allow_once(&mut self, key: AskKey) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+        self.allow_key(Some(key))
+    }
+
     fn allow_key(&mut self, key: Option<AskKey>) -> bool {
         if self.rounds >= crate::front2::check::MOST_PROGRESS_ROUNDS {
             return false;
@@ -1444,6 +1469,16 @@ fn object_missing(e: &RunError) -> Option<ItemKey> {
     match e {
         RunError::Build { error: BuildError::Vtable { error: VtableError::NoTrait(t), .. }, .. } => Some(*t),
         RunError::Vtable { why: VtableFail::Shape(VtableError::NoTrait(t)), .. } => Some(*t),
+        _ => None,
+    }
+}
+
+/// The fn item a refused build found no ABI for (`BuildError::NoAbi`): its head row is
+/// requested via `FrontEnd::head_row` before retrying Phase 1. `None` for every other refusal.
+fn abi_missing(e: &RunError) -> Option<ItemKey> {
+    match e {
+        RunError::Build { error: BuildError::NoAbi { item }, .. }
+        | RunError::ItemRefused { error: BuildError::NoAbi { item }, .. } => Some(*item),
         _ => None,
     }
 }
@@ -3771,7 +3806,7 @@ pub fn walk_records<M: Make<Error = RunError, Grant = Fixture>>(
 
 #[cfg(test)]
 mod ask_progress_tests {
-    use super::{AskKey, AskProgress, ask_key, build_error_ask_key};
+    use super::{AskKey, AskProgress, abi_missing, ask_key, build_error_ask_key};
     use crate::front2::check::{MOST_PROGRESS_ROUNDS, MOST_ROUNDS};
     use crate::run::{Named, RunError, asks_again, build_error_asks_again};
     use blaze_build::BuildError;
@@ -3827,6 +3862,32 @@ mod ask_progress_tests {
         };
         assert!(!asks_again(&non_retryable));
         assert_eq!(ask_key(&non_retryable), None);
+    }
+
+    #[test]
+    fn no_abi_tracks_abi_ask_key_without_asks_again_and_allows_once_per_item() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let item = ItemKey(0xCAFE_BABE);
+        let other = ItemKey(0xCAFE_0002);
+        let named = || Named { path: "test::f".into(), at: crate::front::At { file: 0, place: 0 } };
+        let no_abi = BuildError::NoAbi { item };
+        assert!(!build_error_asks_again(&no_abi), "NoAbi must be handled via head_row, not make_asked");
+        assert_eq!(build_error_ask_key(&no_abi), Some(AskKey::Abi(item)));
+
+        let as_build = RunError::Build { function: named(), error: BuildError::NoAbi { item }, range: None };
+        assert!(!asks_again(&as_build));
+        assert_eq!(ask_key(&as_build), Some(AskKey::Abi(item)));
+        assert_eq!(abi_missing(&as_build), Some(item));
+
+        let as_refused = RunError::ItemRefused { function: named(), error: BuildError::NoAbi { item }, item, path: None };
+        assert!(!asks_again(&as_refused));
+        assert_eq!(ask_key(&as_refused), Some(AskKey::Abi(item)));
+        assert_eq!(abi_missing(&as_refused), Some(item));
+
+        let mut progress = AskProgress::new_in(alloc);
+        assert!(progress.allow_once(AskKey::Abi(item)));
+        assert!(!progress.allow_once(AskKey::Abi(item)), "repeating the same NoAbi item must stop immediately");
+        assert!(progress.allow_once(AskKey::Abi(other)), "a distinct NoAbi item is still allowed");
     }
 
     #[test]
