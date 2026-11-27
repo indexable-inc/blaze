@@ -1558,6 +1558,8 @@ struct Symbols {
     track_caller: bool,
     /// `#[inline]`, `#[inline(always)]`, `#[inline(never)]`, `#[cold]`.
     fn_attrs: blaze_lir::func::FnAttrs,
+    /// `#[linkage = "extern_weak"]`: only supported on foreign statics (refused on functions).
+    extern_weak: bool,
 }
 
 /// The identifier a signature's lowering declares, `r#` dropped: the symbol `#[no_mangle]`
@@ -1584,7 +1586,7 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
     // `sig::HAS_BODY`), as the frozen fn head's qualifiers read by const_fn_fact.rs.
     let has_body = v.head[head::FLAGS] & blaze_lower::machine::sig::HAS_BODY != 0;
     let intrinsic_declared = super::intrinsic_rule::Declared { has_body, must_be_overridden: false };
-    let mut out = Symbols { export: None, link_name: None, intrinsic: false, intrinsic_declared, nounwind: false, track_caller: false, fn_attrs: blaze_lir::func::FnAttrs::default() };
+    let mut out = Symbols { export: None, link_name: None, intrinsic: false, intrinsic_declared, nounwind: false, track_caller: false, fn_attrs: blaze_lir::func::FnAttrs::default(), extern_weak: false };
     for &n in v.rows(v.list(head::ATTRS)).map_err(|e| refuse(format!("{e:?}")))? {
         let a = v.attr(n).map_err(|e| refuse(format!("{e:?}")))?;
         // The cooked string, as the native image reads it (links.rs `symbol_of`): escapes
@@ -1612,6 +1614,12 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
             "rustc_nounwind" => out.nounwind = true,
             "track_caller" => out.track_caller = true,
             "cold" => out.fn_attrs.0 |= blaze_lir::func::FnAttrs::COLD,
+            "linkage" => {
+                let t = v.text_at(a.args).map_err(|e| refuse(format!("{e:?}")))?;
+                if t.trim().trim_start_matches('=').trim().trim_matches('"') == "extern_weak" {
+                    out.extern_weak = true;
+                }
+            }
             "inline" => {
                 let args = v.text_at(a.args).map_or("", str::trim);
                 let inner = args.strip_prefix('(').and_then(|s| s.strip_suffix(')')).unwrap_or(args).trim();

@@ -886,7 +886,6 @@ struct Attrs<'t> {
     intrinsic: bool,
     repr: ReprAttrs,
     thread_local: bool,
-    extern_weak: bool,
 }
 
 /// One `#[repr(..)]`'s arguments folded into `out`: `C`, `transparent`, an integer type,
@@ -1055,7 +1054,7 @@ fn read_attrs<'t>(v: &View<'t>, list: lf::List, at: At, blaze: &mut BlazeAttrs) 
             "link_name" => out.link_name = Some(value()),
             "rustc_intrinsic" => out.intrinsic = true,
             "thread_local" => out.thread_local = true,
-            "linkage" if value() == "extern_weak" => out.extern_weak = true,
+            "linkage" => return Err(Why::Unsupported("`#[linkage]`", r)),
             "" | "doc" | "allow" | "warn" | "deny" | "expect" | "forbid" | "inline" | "cold" | "must_use" | "track_caller" => {}
             "repr" => read_repr(args, r, &mut out.repr)?,
             "derive" => return Err(Why::Unsupported("`#[derive(..)]`", r)),
@@ -1805,7 +1804,7 @@ impl<'f> Front<'f> {
             (None, false) => None,
         };
         if kind == FnKind::Static {
-            self.statics.push((key, StaticItem { thread_local: attrs.thread_local, mutable: flags & sig::MUT != 0, extern_weak: attrs.extern_weak }));
+            self.statics.push((key, StaticItem { thread_local: attrs.thread_local, mutable: flags & sig::MUT != 0, extern_weak: false }));
         } else if attrs.thread_local {
             return Err(Why::Unsupported("`#[thread_local]` on other than a `static`", whole).at(at));
         }
@@ -2953,5 +2952,33 @@ mod tests {
         assert_eq!(repr_parts("(packed ( 4 ))", &mut packed_spaced), Ok(()));
         assert_eq!(packed_spaced, ReprAttrs { packed: Some(2), ..ReprAttrs::default() });
         assert_eq!(repr_parts("(align(16)", &mut ReprAttrs::default()), Err("this `repr`"));
+    }
+
+    #[test]
+    fn linkage_extern_weak_refused_in_front() {
+        use super::{At, BlazeAttrs, Range, Why, lower_sig, read_attrs};
+        use blaze_lower::head;
+        use blaze_own::Alloc;
+
+        let alloc = Alloc::global();
+        let at = At { file: 0, place: 0 };
+        let weak_text = "#[linkage = \"extern_weak\"] fn opt_fn();";
+        let weak_sig = lower_sig(weak_text, at, Range::new(0, weak_text.len() as u32), alloc)
+            .expect("lower weak fn signature");
+        let v = weak_sig.view();
+        let mut blaze = BlazeAttrs::default();
+        let err = read_attrs(&v, v.list(head::ATTRS), at, &mut blaze)
+            .err()
+            .expect("`#[linkage = \"extern_weak\"]` must be refused on non-static items");
+        assert!(matches!(err, Why::Unsupported("`#[linkage]`", _)), "unexpected error: {err:?}");
+
+        // Control: `#[link_name = "..."]` remains accepted on foreign functions.
+        let link_text = "#[link_name = \"c_opt_fn\"] fn opt_fn();";
+        let link_sig = lower_sig(link_text, at, Range::new(0, link_text.len() as u32), alloc)
+            .expect("lower link_name fn signature");
+        let v2 = link_sig.view();
+        let ok = read_attrs(&v2, v2.list(head::ATTRS), at, &mut blaze)
+            .expect("control: `#[link_name]` must remain accepted");
+        assert_eq!(ok.link_name, Some("c_opt_fn"));
     }
 }

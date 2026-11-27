@@ -1149,11 +1149,14 @@ pub fn compile_lir_wasm64<'a>(
         }
     }
 
-    // 4. Pre-scan all `Op::FuncAddr` across functions so `indirect_table` is finalized before
-    //    lowering any `Op::CallIndirect` (deterministic slot ordering).
+    // 4. Pre-scan all `Op::FuncAddr` (and `Op::DataAddr` targeting `RefKind::Func`, e.g. a
+    //    foreign static resolved to a Rust `#[no_mangle]`/`#[export_name]` function) across
+    //    functions so `indirect_table` is finalized before lowering any `Op::CallIndirect`
+    //    (deterministic slot ordering).
     for f in module.funcs {
         for inst in 0..f.view.len() {
-            if f.view.op(inst) == Op::FuncAddr {
+            let op = f.view.op(inst);
+            if op == Op::FuncAddr || op == Op::DataAddr {
                 let ref_id = f.view.operands(inst).reference();
                 if ref_id.index() >= f.view.refs.len() {
                     return Err(LirWasm64Error::UnsupportedRef {
@@ -1164,16 +1167,21 @@ pub fn compile_lir_wasm64<'a>(
                     });
                 }
                 let rec = f.view.reference(ref_id);
-                if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
-                    return Err(LirWasm64Error::UnsupportedRef {
-                        func: f.place,
-                        inst,
-                        kind: rec.kind,
-                        place: rec.place,
-                    });
+                if op == Op::FuncAddr {
+                    if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
+                        return Err(LirWasm64Error::UnsupportedRef {
+                            func: f.place,
+                            inst,
+                            kind: rec.kind,
+                            place: rec.place,
+                        });
+                    }
+                    let wasm_idx = ctx.resolve_func(f.place, inst, rec.place)?;
+                    ctx.intern_indirect_func(wasm_idx);
+                } else if RefKind::from_word(rec.kind) == Some(RefKind::Func) {
+                    let wasm_idx = ctx.resolve_func(f.place, inst, rec.place)?;
+                    ctx.intern_indirect_func(wasm_idx);
                 }
-                let wasm_idx = ctx.resolve_func(f.place, inst, rec.place)?;
-                ctx.intern_indirect_func(wasm_idx);
             }
         }
     }
@@ -2171,6 +2179,10 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                         })?,
                     Some(RefKind::Static | RefKind::Vtable | RefKind::Tls) => {
                         self.ctx.resolve_static(self.place, inst, rec.place)?
+                    }
+                    Some(RefKind::Func) => {
+                        let wasm_idx = self.ctx.resolve_func(self.place, inst, rec.place)?;
+                        u64::from(self.ctx.intern_indirect_func(wasm_idx))
                     }
                     _ => {
                         return Err(LirWasm64Error::UnsupportedRef {

@@ -173,7 +173,10 @@ pub(crate) fn one_static<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, k: 
     let Some(&m) = r.store.statics.get(&k) else {
         return Err(Box::from("no static head in the store (heads.rs `Store::statics`)"));
     };
-    let (thread_local, _, single_threaded_wasm) = static_attrs_of(r, k)?;
+    let (thread_local, extern_weak, single_threaded_wasm) = static_attrs_of(r, k)?;
+    if extern_weak {
+        return Err("`#[linkage = \"extern_weak\"]` is only supported on foreign statics".into());
+    }
     Ok((record, StaticItem { thread_local: thread_local && !single_threaded_wasm, mutable: matches!(m, tc::Mutbl::Mut), extern_weak: false }))
 }
 
