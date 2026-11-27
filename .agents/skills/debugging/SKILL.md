@@ -1,6 +1,6 @@
 ---
 name: debugging
-description: "How to find out why a blaze build did what it did from its profile parquet. Covers where the files are, the tables (spans, provenance, key_parts, misses, task spans), how to run DuckDB (`blaze debug sql`, `blaze explain`, `BLAZE_DUCKDB`; the commands are parked with blaze-cargo's CLI), and ready queries for top time by span, what reran and why, diffing two runs' keys, memory by task and a cycle that won't settle. Also the method: reproduce, capture, query, claim a cause, remove it and watch the effect go. Adding spans and making a speed claim are `perf-and-tracing`; how memory is meant to be held is `memory-and-data`. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before writing a query over the profile, and before making a claim about why a build did something."
+description: "How to find out why a blaze run did what it did from what it records: `.blaze/v2/profile.txt` (each phase's tasks planned and entered, wasted entries, why tasks were entered), `.blaze/v2/start.txt`, `--stats`, `--status-every` and the signal status, `blaze why <file[::item]>` and `blaze explain <status>`. Also the method: reproduce, capture, claim a cause, remove it and watch the effect go. Adding spans and making a speed claim are `perf-and-tracing`; how memory is meant to be held is `memory-and-data`. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before reading the profile, and before making a claim about why a build did something."
 ---
 
 # Debugging blaze from its profile
@@ -9,14 +9,13 @@ description: "How to find out why a blaze build did what it did from its profile
 
 ## ask-the-profile-first (rule 17)
 
-Every build already records its footprint and live bytes, each task's peak memory, its spans, its
-waits and what it reran and why, in `<BLAZE_HOME>/v2/profile/*.parquet` (every command writes it; a
-path that writes none is unfinished: `slow-is-p0-traced`). A why question (slow, rerunning,
-memory-hungry, idle workers, hung) starts with `blaze explain footprint_per_build`, `memory` or
-`worker_states`, `blaze why`, or a `blaze debug sql` query on the home that showed it (these
-commands are parked with blaze-cargo's CLI; until the new command line has them, DuckDB over the
-parquet files), and quotes the rows. A guess or a fresh experiment comes only after the rows can't
-answer, and then the gap gets a span or counter.
+Every check already records each phase's tasks planned and entered, its wasted entries and why tasks
+were entered, in `.blaze/v2/profile.txt` in the checkout; `blaze run` writes its start to
+`.blaze/v2/start.txt`, and `--stats` prints one line at exit (a path that records nothing is
+unfinished: `slow-is-p0-traced`). A why question (slow, rerunning, memory-hungry, idle workers,
+hung) starts with those lines, `blaze why <file[::item]>`, `blaze explain <status>` or a stack
+sample of the hang, and quotes them. A guess or a fresh experiment comes only after the lines can't
+answer, and then the gap gets a counter or a line in the profile.
 
 ## claims-from-evidence (rule 61)
 

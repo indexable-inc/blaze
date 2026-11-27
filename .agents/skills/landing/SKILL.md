@@ -17,12 +17,12 @@ branch. Land small and often through a pull request: `python3 .github/scripts/la
 branch's head, which contains origin/main), waits for the merge gate, and merges once the gate
 passes and the quote still holds for the head GitHub has (`'{"follow": true}'` resumes the waiting).
 It refuses to open, resume or merge without that quote (`proof-before-merge`); the gate's compile
-and unit tests do not stand in for it, and an admin merge needs it as much as any other. Harnesses
-run after merge in the release train. Never push to main. Sessions that share main land in turns:
-before the last `git merge origin/main` and its smoke, a session tells the others it is landing,
-they hold main until it says the merge is in (or thirty minutes pass), and it then says what moved
-and which files; a quote is made once, not once per session that moved main under it. `land.py`
-waits for the checks: start it in the background and go on with other work.
+and unit tests do not stand in for it, and an admin merge needs it as much as any other. Never push
+to main. Sessions that share main land in turns: before the last `git merge origin/main` and its
+smoke, a session tells the others it is landing, they hold main until it says the merge is in (or
+thirty minutes pass), and it then says what moved and which files; a quote is made once, not once
+per session that moved main under it. `land.py` waits for the checks: start it in the background and
+go on with other work.
 
 See [docs/contributing.md#landing-a-change](../../../docs/contributing.md#landing-a-change).
 
@@ -63,11 +63,12 @@ the body and will not open, resume or merge a pull request unless `smoke '{"veri
 the quote to the head's tree, clean, with verdict ok; it asks again just before it merges, against
 the head GitHub has, and refuses when main has moved past that head. No flag skips this, and an
 admin merge needs it as much. A change to build scripts, proc macros, C dependencies or the sandbox
-also runs `harness/v2/real_smoke.py` (how-to `real-smoke`). A step that fails or times out blocks
-the merge: fix it, never run it again hoping it passes (`no-fallback`). The merge gate's compile and
-unit tests do not stand in for this, and neither does a smoke of the branch before the merge or of
-another commit. A change that builds no binary (only docs or these rules) is smoked too: an
-exemption a pull request declares for itself is the kind of stand-in this rule removes.
+also runs `harness/v2/real_smoke.py` (how-to `real-smoke`; it still copies a `blaze-engine` binary,
+which no build makes). A step that fails or times out blocks the merge: fix it, never run it again
+hoping it passes (`no-fallback`). The merge gate's compile and unit tests do not stand in for this,
+and neither does a smoke of the branch before the merge or of another commit. A change that builds
+no binary (only docs or these rules) is smoked too: an exemption a pull request declares for itself
+is the kind of stand-in this rule removes.
 
 See [docs/contributing.md#landing-a-change](../../../docs/contributing.md#landing-a-change).
 
