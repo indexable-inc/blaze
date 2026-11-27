@@ -66,7 +66,7 @@ use super::lifetimes::{AdtLife, ContainerLife, LifeOf, LifeRefusal, LifeVariance
 use super::preds::Preds;
 use super::rows::Rows;
 use super::type_miss::{HeadMiss, MissOf};
-use super::types::{AliasRegions, AliasSlot, NotLaidWhy, ParamBound, SelfTy, SigPart, TraitAliasHead};
+use super::types::{AliasRegions, AliasSlot, NotLaidWhy, ParamBound, SelfTy, SigPart, SuperLifetime, SuperLifetimes, TraitAliasHead};
 
 /// The allocator a decoded head's own lists and lifetime parts are kept in: the store's.
 type Mem = Alloc<'static>;
@@ -205,7 +205,9 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 43: `AdtRow` carries `capability` (`#[blaze::capability]`) and `sans_io` (`#![blaze::sans_io]`
 /// scope) flags after `args`.
 /// 44: `FnQualifiers` bit 7 carries `#[rustc_deprecated_safe_2024]` (`TypeAttrs::DEPRECATED_SAFE_2024`).
-pub const VERSION: u32 = 44;
+/// 45: `TraitHead::self_outlives_params` and `HeadRef::Trait::super_lifetimes` carry parameterized
+/// `Self: 'a` and supertrait lifetime edges for RFC 1156 default trait object lifetimes.
+pub const VERSION: u32 = 45;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -436,6 +438,7 @@ pub enum HeadRef<'h, 'n> {
         head: &'h TraitHead,
         extra: Option<&'h TraitExtra>,
         supers: &'h [(LibKey, List)],
+        super_lifetimes: Option<&'h SuperLifetimes>,
         const_params: &'h [(u32, PTy)],
         preds: Option<&'h Preds>,
         /// Its associated types' side rows (form 9), one per `head.assoc` name.
@@ -639,6 +642,7 @@ pub enum Head<'n> {
         head: TraitHead,
         extra: Option<TraitExtra>,
         supers: Vec<(LibKey, List), Mem>,
+        super_lifetimes: Option<SuperLifetimes>,
         const_params: Vec<(u32, PTy), Mem>,
         preds: Option<HeadPreds>,
         assoc_side: Vec<AssocSide, Mem>,
@@ -681,11 +685,12 @@ impl<'n> Head<'n> {
                 regions: regions.as_ref(),
             },
             Head::Ctor { key, sig, regions } => HeadRef::Ctor { key: *key, sig, regions: regions.as_ref() },
-            Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life, regions } => HeadRef::Trait {
+            Head::Trait { key, head, extra, supers, super_lifetimes, const_params, preds, assoc_side, life, regions } => HeadRef::Trait {
                 key: *key,
                 head,
                 extra: extra.as_ref(),
                 supers: &supers[..],
+                super_lifetimes: super_lifetimes.as_ref(),
                 const_params: &const_params[..],
                 preds: preds.as_deref(),
                 assoc_side: AssocSides::Rows(&assoc_side[..]),
@@ -896,6 +901,7 @@ pub fn from_store<'h, 'n>(store: &'h Store<'n>, at: HeadAt) -> Result<HeadRef<'h
                 head,
                 extra,
                 supers,
+                super_lifetimes: store.maps.super_lifetimes.get(&lib),
                 const_params,
                 preds: store.preds.get(&ck),
                 assoc_side,
@@ -1446,7 +1452,7 @@ fn encode_into_scratch<'b>(
             o.ty(sig.output)?;
             K_CTOR
         }
-        HeadRef::Trait { key, head, extra, supers, const_params, preds, assoc_side, life, regions: _ } => {
+        HeadRef::Trait { key, head, extra, supers, super_lifetimes, const_params, preds, assoc_side, life, regions: _ } => {
             o.lib(key);
             o.u32(head.generics);
             o.defaults(&head.defaults)?;
@@ -1462,6 +1468,11 @@ fn encode_into_scratch<'b>(
             for m in &head.members {
                 o.member(*m);
             }
+            if o.parts == Parts::WithRegions {
+                let s = o.body.len();
+                o.u32s(&head.self_outlives_params, "a trait's `Self` outlives lifetime parameters")?;
+                o.erased_skip_ranges.push((s, o.body.len()));
+            }
             o.opt(extra, |o, x| {
                 o.clauses(&x.supertraits, "a trait's supertrait clauses")?;
                 o.count(x.assoc.len(), "a trait's associated type rows")?;
@@ -1473,6 +1484,11 @@ fn encode_into_scratch<'b>(
                 o.named_keys(&x.consts, "a trait's associated constants")
             })?;
             o.lib_lists(supers, "a trait's supertraits")?;
+            if o.parts == Parts::WithRegions {
+                let s = o.body.len();
+                o.opt(super_lifetimes, |o, sl| o.super_lifetimes(sl))?;
+                o.erased_skip_ranges.push((s, o.body.len()));
+            }
             o.const_params(const_params)?;
             o.opt(preds, |o, p| o.preds(p))?;
             // Form 9: each associated type's side rows, in `head.assoc` order (written order).
@@ -1626,6 +1642,11 @@ fn encode_into_scratch<'b>(
             o.u32(head.generics);
             o.clauses(&head.clauses, "a trait alias's clauses")?;
             o.lib_lists(&head.traits, "a trait alias's traits")?;
+            if o.parts == Parts::WithRegions {
+                let s = o.body.len();
+                o.super_lifetimes(&head.super_lifetimes)?;
+                o.erased_skip_ranges.push((s, o.body.len()));
+            }
             K_TRAIT_ALIAS
         }
         HeadRef::Opaque { key, fn_, index, preds, regions: _ } => {
@@ -1997,6 +2018,33 @@ impl Out<'_, '_, '_, '_> {
         for &(a, b) in v {
             self.region(a);
             self.region(b);
+        }
+        Ok(())
+    }
+    fn super_lifetime(&mut self, a: SuperLifetime) {
+        match a {
+            SuperLifetime::Static => self.byte(0),
+            SuperLifetime::Param(i) => {
+                self.byte(1);
+                self.u32(i);
+            }
+            SuperLifetime::Other => self.byte(2),
+        }
+    }
+    fn super_lifetimes(&mut self, sl: &SuperLifetimes) -> Result<(), E> {
+        self.count(sl.edges.len(), "a trait's supertrait lifetime edges")?;
+        for &(k, start, end) in sl.edges.iter() {
+            self.lib(k);
+            self.u32(start);
+            self.u32(end);
+        }
+        self.count(sl.args.len(), "a trait's supertrait lifetime arguments")?;
+        for &a in sl.args.iter() {
+            self.super_lifetime(a);
+        }
+        self.count(sl.alias_outlives.len(), "a trait's alias outlives lifetimes")?;
+        for &a in sl.alias_outlives.iter() {
+            self.super_lifetime(a);
         }
         Ok(())
     }
@@ -2861,7 +2909,8 @@ impl<'r> In<'r, '_, '_, '_> {
         let generics = self.u32("a trait alias's generics")?;
         let clauses = self.own("a trait alias's clauses", |r| r.clause())?;
         let traits = self.own("a trait alias's traits", |r| Ok((r.lib("a trait alias's trait")?, r.list("a trait alias's trait arguments")?)))?;
-        Ok(self.box_head(Head::TraitAlias { key, head: TraitAliasHead { generics, clauses, traits } }))
+        let super_lifetimes = self.super_lifetimes()?;
+        Ok(self.box_head(Head::TraitAlias { key, head: TraitAliasHead { generics, clauses, traits, super_lifetimes } }))
     }
 
     #[inline(never)]
@@ -3703,6 +3752,30 @@ impl<'r> In<'r, '_, '_, '_> {
         Ok(MemberFacts { name, shape })
     }
 
+    fn super_lifetime(&mut self) -> Result<SuperLifetime, E> {
+        match self.u8("a supertrait lifetime argument's kind")? {
+            0 => Ok(SuperLifetime::Static),
+            1 => Ok(SuperLifetime::Param(self.u32("a supertrait lifetime parameter")?)),
+            2 => Ok(SuperLifetime::Other),
+            byte => Err(E::Byte { what: "a supertrait lifetime argument's kind", byte }),
+        }
+    }
+    fn super_lifetimes(&mut self) -> Result<SuperLifetimes, E> {
+        let edges = self.own("a trait's supertrait lifetime edges", |r| {
+            let k = r.lib("a supertrait's key")?;
+            let start = r.u32("a supertrait's lifetime args start")?;
+            let end = r.u32("a supertrait's lifetime args end")?;
+            Ok((k, start, end))
+        })?;
+        let args = self.own("a trait's supertrait lifetime arguments", |r| r.super_lifetime())?;
+        let alias_outlives = self.own("a trait's alias outlives lifetimes", |r| r.super_lifetime())?;
+        for &(_, start, end) in edges.iter() {
+            if start > end || usize::try_from(end).map_or(true, |e| e > args.len()) {
+                return Err(E::Shape { what: "a supertrait's lifetime argument range is past its arguments" });
+            }
+        }
+        Ok(SuperLifetimes { edges, args, alias_outlives })
+    }
     #[inline(never)]
     fn trait_<'n>(&mut self) -> Result<blaze_own::Box<Head<'n>, Mem>, E> {
         let key = self.lib("a trait's key")?;
@@ -3714,7 +3787,8 @@ impl<'r> In<'r, '_, '_, '_> {
         let marks = self.coherence_marks()?;
         let all_self_defaults = self.flag("a trait's parameters all default to Self")?;
         let members = self.own("a trait's member facts", |r| r.member())?;
-        let head = TraitHead { generics, defaults, assoc, fns, flags, members, marks, all_self_defaults };
+        let self_outlives_params = self.own("a trait's `Self` outlives lifetime parameters", |r| r.u32("a trait's `Self` outlives lifetime parameter"))?;
+        let head = TraitHead { generics, defaults, assoc, fns, flags, members, marks, all_self_defaults, self_outlives_params };
         if head.all_self_defaults != super::heads::all_self_defaults(&head.defaults, self.tys.view()) {
             return Err(E::Shape { what: "a trait's Self-default flag disagrees with its parameter defaults" });
         }
@@ -3730,6 +3804,7 @@ impl<'r> In<'r, '_, '_, '_> {
             Ok(TraitExtra { supertraits, assoc, consts })
         })?;
         let supers = self.own("a trait's supertraits", |r| Ok((r.lib("a supertrait")?, r.list("a supertrait's arguments")?)))?;
+        let super_lifetimes = self.opt("a trait's supertrait lifetimes", |r| r.super_lifetimes())?;
         let const_params = self.const_params_own()?;
         let preds = self.opt("a trait's where-clauses", |r| r.preds())?;
         let mut assoc_side = Vec::with_capacity_in(head.assoc.len(), self.alloc);
@@ -3773,7 +3848,7 @@ impl<'r> In<'r, '_, '_, '_> {
             assoc_side.push(AssocSide { name, generics, where_, consts, bounds, regions });
         }
         let life = self.container_life()?;
-        Ok(self.box_head(Head::Trait { key, head, extra, supers, const_params, preds, assoc_side, life, regions: None }))
+        Ok(self.box_head(Head::Trait { key, head, extra, supers, super_lifetimes, const_params, preds, assoc_side, life, regions: None }))
     }
 
     #[inline(never)]
@@ -3996,8 +4071,8 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             None
         }
         (
-            HeadRef::Trait { key: k1, head: h1, extra: x1, supers: u1, const_params: c1, preds: p1, assoc_side: s1, life: l1, regions: g1 },
-            HeadRef::Trait { key: k2, head: h2, extra: x2, supers: u2, const_params: c2, preds: p2, assoc_side: s2, life: l2, regions: g2 },
+            HeadRef::Trait { key: k1, head: h1, extra: x1, supers: u1, super_lifetimes: sl1, const_params: c1, preds: p1, assoc_side: s1, life: l1, regions: g1 },
+            HeadRef::Trait { key: k2, head: h2, extra: x2, supers: u2, super_lifetimes: sl2, const_params: c2, preds: p2, assoc_side: s2, life: l2, regions: g2 },
         ) => {
             need!(regions_same(g1, g2), "a trait's regions");
             need!(life_same(l1, l2, container_same), "a trait's lifetime part");
@@ -4024,6 +4099,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(h1.marks == h2.marks, "a trait's coherence marks");
             need!(h1.all_self_defaults == h2.all_self_defaults, "a trait's parameters all default to Self");
             need!(h1.members[..] == h2.members[..], "a trait's member facts");
+            need!(h1.self_outlives_params[..] == h2.self_outlives_params[..], "a trait's `Self` outlives lifetime parameters");
             need!(
                 match (x1, x2) {
                     (None, None) => true,
@@ -4033,6 +4109,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
                 "a trait's members part"
             );
             need!(lib_lists(u1, u2), "a trait's supertraits");
+            need!(sl1 == sl2, "a trait's supertrait lifetimes");
             need!(c1 == c2, "a trait's const parameters");
             need!(preds(p1, p2), "a trait's where-clauses");
             None
@@ -4081,6 +4158,7 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(k1 == k2 && h1.generics == h2.generics, "a trait alias's key or generics");
             need!(clauses(&h1.clauses, &h2.clauses), "a trait alias's clauses");
             need!(lib_lists(&h1.traits, &h2.traits), "a trait alias's traits");
+            need!(h1.super_lifetimes == h2.super_lifetimes, "a trait alias's supertrait lifetimes");
             None
         }
         (
@@ -5118,6 +5196,78 @@ mod region_tests {
             assert_eq!(&payload[start..], &want_bytes[..], "payload bytes differ");
             assert_eq!(erased, want_erased, "erased reader digest differs");
             assert_eq!(regions, want_regions, "regions digest differs");
+        }
+    }
+
+    /// Changing `TraitHead::self_outlives_params` (`trait T<'a, 'b>: 'a` -> `: 'b`) or
+    /// `HeadRef::Trait::super_lifetimes` (`trait Sub<'a, 'b>: Sup<'a>` -> `Sup<'b>`) leaves
+    /// `reader_digest` (`Parts::Erased`) unchanged while moving `regions_digest`, and matches
+    /// single-pass `encode_with_digests_into` + `decode` round-trip.
+    #[test]
+    fn trait_self_outlives_and_super_lifetimes_move_only_regions_digest() {
+        let t = tys();
+        let make_head = |param: u32| {
+            let mut self_outlives_params = Vec::new_in(a());
+            self_outlives_params.push(param);
+            TraitHead {
+                generics: 1,
+                all_self_defaults: true,
+                marks: CoherenceMarks::default(),
+                defaults: Vec::new_in(a()),
+                assoc: Vec::new_in(a()),
+                fns: Vec::new_in(a()),
+                flags: tc::TraitFlags(tc::TraitFlags::LIFETIME_PARAMS),
+                members: Vec::new_in(a()),
+                self_outlives_params,
+            }
+        };
+        let make_sl = |param: u32| {
+            let mut edges = Vec::new_in(a());
+            edges.push((LibKey(ContentId([0x22; 32])), 0, 1));
+            let mut args = Vec::new_in(a());
+            args.push(SuperLifetime::Param(param));
+            SuperLifetimes { edges, args, alias_outlives: Vec::new_in(a()) }
+        };
+        let key = LibKey(ContentId([0x11; 32]));
+        let h0 = make_head(0);
+        let h1 = make_head(1);
+        let sl0 = make_sl(0);
+        let sl1 = make_sl(1);
+        fn ref_of<'h>(key: LibKey, head: &'h TraitHead, sl: &'h SuperLifetimes) -> HeadRef<'h, 'static> {
+            HeadRef::Trait {
+                key,
+                head,
+                extra: None,
+                supers: &[],
+                super_lifetimes: Some(sl),
+                const_params: &[],
+                preds: None,
+                assoc_side: AssocSides::Rows(&[]),
+                life: None,
+                regions: None,
+            }
+        }
+        let a_ref = ref_of(key, &h0, &sl0);
+        let b_self = ref_of(key, &h1, &sl0);
+        let b_super = ref_of(key, &h0, &sl1);
+        let erased = |h| reader_digest(h, t.tys.view(), a()).unwrap_or_else(|e| panic!("erased: {e}"));
+        let regions = |h| regions_digest(h, t.tys.view(), a()).unwrap_or_else(|e| panic!("regions: {e}"));
+
+        assert_eq!(erased(a_ref), erased(b_self), "`Self: 'a` -> `Self: 'b` must not move erased digest");
+        assert_ne!(regions(a_ref), regions(b_self), "`Self: 'a` -> `Self: 'b` must move regions digest");
+        assert_eq!(erased(a_ref), erased(b_super), "supertrait lifetime edit must not move erased digest");
+        assert_ne!(regions(a_ref), regions(b_super), "supertrait lifetime edit must move regions digest");
+
+        let mut scratch = EncodeScratch::new_in(a());
+        let mut payload: RecordBytes<'_> = RecordBytes::new_in(a());
+        for hr in [a_ref, b_self, b_super] {
+            let start = payload.len();
+            let (e1, r1) = encode_with_digests_into(hr, t.tys.view(), &missing_origin, &mut scratch, &mut payload)
+                .unwrap_or_else(|e| panic!("encode_with_digests_into: {e}"));
+            assert_eq!(e1, erased(hr), "single-pass erased digest must match reader_digest");
+            assert_eq!(r1, regions(hr), "single-pass regions digest must match regions_digest");
+            let decoded = decode(&payload[start..], None, &tys_empty(), a()).unwrap_or_else(|e| panic!("decode: {e}"));
+            assert_eq!(same(hr, decoded.as_ref(), t.tys.view()), None, "round-trip trait head must match");
         }
     }
 }
