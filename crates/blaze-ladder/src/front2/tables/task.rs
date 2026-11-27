@@ -513,6 +513,7 @@ impl<'n> NamesSource<'n> for DecodeLangSource<'n> {
         Err(blaze_scope::names::PathError { module, at: 0, why: blaze_scope::names::Why::NotRead { module, layer: blaze_scope::names::Unheld::Step } })
     }
     fn module_path(self, _module: ItemKey) -> Option<&'n str> { None }
+    fn module_info(self, _module: ItemKey) -> Option<(Option<ItemKey>, Option<u32>, Option<&'n str>)> { None }
     fn failed_call<'b>(self, _call: ItemKey, _bump: blaze_own::Bump<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
     where
         'n: 'b,
@@ -1086,8 +1087,9 @@ pub struct Said<'a> {
 pub enum SaidWhat<'a> {
     /// A type error, by its code.
     Type { code: &'static str },
-    /// A typed lint's finding, by the lint's name (blaze-lint `Rule::from_name`).
-    Lint { lint: &'static str },
+    /// A typed lint's finding, by the lint's name (blaze-lint `Rule::from_name`), with optional
+    /// pre-resolved severity for rustc typed lints (`deprecated-safe-2024`, `unsafe-op-in-unsafe-fn`).
+    Lint { lint: &'static str, level: Option<super::super::project::LintLevel> },
     /// A move or borrow error, by its code.
     Borrow { code: &'static str },
     /// The body was not checked: refused or past a gap, grouped under `cause` (said.rs). A
@@ -2090,7 +2092,7 @@ fn said_of<'n, 'a>(verdict: &BodyVerdict<'_>, borrows: &BorrowVerdict<'_>, names
         push(SaidWhat::Type { code: d.code }, d.start, d.end, text(d.text.as_str()));
     }
     for d in verdict.findings.iter() {
-        push(SaidWhat::Lint { lint: d.lint }, d.start, d.end, text(d.text.as_str()));
+        push(SaidWhat::Lint { lint: d.lint, level: d.level }, d.start, d.end, text(d.text.as_str()));
     }
     if let Some(refused) = &verdict.refused {
         let cause = super::super::said::refused_cause(names, keys, refused);

@@ -443,6 +443,10 @@ pub trait NamesSource<'n>: Copy {
     /// has no path (a block's module), or its crate is not read.
     fn module_path(self, module: ItemKey) -> Option<&'n str>;
 
+    /// Module lineage metadata for `module`: `(parent_module, file_index, module_path)`.
+    /// Used when resolving lexical lint attributes across external `mod foo;` boundaries.
+    fn module_info(self, module: ItemKey) -> Option<(Option<ItemKey>, Option<u32>, Option<&'n str>)>;
+
     /// Question 20b: the macro call `call` whose expansion failed (a [`Why::Refused`]'s `call`
     /// with `RefusedWhy::Expansion`): the macro's path as written, whether it is D104's implicit
     /// `::std::main`, and the matcher's reason, decoded into `bump`. `None`: no crate's notes
@@ -787,6 +791,24 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
     fn module_path(self, module: ItemKey) -> Option<&'n str> {
         let c: &'n blaze_scope::resolve::CrateNames<'n> = self.krate(Names::crate_of(self, module)?);
         c.path_of(module)
+    }
+
+    fn module_info(self, module: ItemKey) -> Option<(Option<ItemKey>, Option<u32>, Option<&'n str>)> {
+        let c: &'n blaze_scope::resolve::CrateNames<'n> = self.krate(Names::crate_of(self, module)?);
+        if let Some(&i) = c.tree.by_key.get(&module)
+            && let Some(m) = c.tree.modules.get(i)
+        {
+            let parent = m.parent.and_then(|p| c.tree.modules.get(p)).map(|p| p.key);
+            return Some((parent, Some(m.file), c.path_of(module)));
+        }
+        if let Some(made) = c.made.get(&module) {
+            let file = match made.at {
+                blaze_scope::resolve::At::File(f) => Some(f),
+                blaze_scope::resolve::At::Expansion(_) => None,
+            };
+            return Some((made.info.parent, file, c.path_of(module)));
+        }
+        None
     }
 
     fn failed_call<'b>(self, call: ItemKey, bump: Bump<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
@@ -2333,6 +2355,13 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         let krate = self.items.crate_of(module)?;
         self.items_of(krate)?;
         self.read(krate, self.items.module(module))??.path
+    }
+
+    fn module_info(self, module: ItemKey) -> Option<(Option<ItemKey>, Option<u32>, Option<&'n str>)> {
+        let krate = self.items.crate_of(module)?;
+        self.items_of(krate)?;
+        let row = self.read(krate, self.items.module(module))??;
+        Some((row.parent, row.file, row.path))
     }
 
     /// From the failed-calls section of the names record of the call's crate, by its key's

@@ -9434,8 +9434,15 @@ fn found_of<'s>(line: &Line<'_>, written: Option<Unplaced<'_>>, item: Option<(&s
     let (rule, code) = match &line.what {
         SaidWhat::Type { code } => (crate::body_types::TYPES, Some(*code)),
         SaidWhat::Borrow { code } => (crate::body_types::BORROWS, Some(*code)),
-        SaidWhat::Lint { lint } => match blaze_lint::Rule::from_name(lint) {
-            Some(rule) => (crate::lints::number_of(rule), None),
+        SaidWhat::Lint { lint, level } => match blaze_lint::Rule::from_name(lint) {
+            Some(rule) => {
+                let num = match level {
+                    None => crate::lints::number_of(rule),
+                    Some(blaze_ladder::front2::project::LintLevel::Warn) => crate::lints::number_of_warn(rule),
+                    Some(blaze_ladder::front2::project::LintLevel::Error) => crate::lints::number_of_error(rule),
+                };
+                (num, None)
+            }
             None => return Err("a typed lint's finding names no rule of blaze-lint"),
         },
         SaidWhat::NotChecked { .. } | SaidWhat::BorrowsNotChecked => return Ok(None),

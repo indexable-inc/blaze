@@ -78,6 +78,7 @@ pub mod inspect;
 pub mod inspect_view;
 pub mod keys;
 pub mod linked;
+pub mod lint_level;
 pub mod langs;
 pub mod lifetimes;
 pub(crate) mod links;

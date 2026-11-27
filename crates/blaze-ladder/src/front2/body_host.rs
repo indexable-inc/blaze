@@ -217,7 +217,7 @@ impl<'h> Placed<'h> {
     /// is at the OUTERMOST call's site, and so is every call in it, whatever `at` says (core
     /// `line!`). `None`: no place in crate `krate` (an item of another crate, a call whose
     /// origins are not kept): `line!()` refused by name.
-    fn of<S: NamesSource<'h>>(names: S, krate: usize, at: BodyAt, alloc: Alloc<'_>) -> Option<Placed<'h>> {
+    pub(super) fn of<S: NamesSource<'h>>(names: S, krate: usize, at: BodyAt, alloc: Alloc<'_>) -> Option<Placed<'h>> {
         let (in_crate, text, start, by_call) = crate::front2::program::lazy::body_place(names, at.lib, alloc).ok()?;
         if in_crate != krate {
             return None;

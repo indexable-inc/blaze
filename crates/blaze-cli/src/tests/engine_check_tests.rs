@@ -1705,9 +1705,9 @@ fn engine_check_deprecated_safe_2024_lint_levels() {
         (ids, warning_lines(&rendered), error_lines(&rendered), rendered)
     };
 
-    // 1. Default (`Allow`): finding is recorded in the body verdict, printed as neither error nor warning.
+    // 1. Default (`Allow`): finding resolves to `Off` in front2 (neither recorded nor printed).
     let (ids_default, warns_default, errs_default, out_default) = run_case(21, "");
-    assert!(ids_default.iter().any(|(code, _)| code == "deprecated-safe-2024"), "finding recorded: {ids_default:?}");
+    assert!(ids_default.is_empty(), "default Allow must omit finding: {ids_default:?}");
     assert!(warns_default.is_empty(), "default Allow must print no warning:\n{out_default}");
     assert!(errs_default.is_empty(), "default Allow must print no error:\n{out_default}");
 
@@ -1828,13 +1828,155 @@ fn engine_check_deprecated_safe_2024_lint_levels() {
     assert!(errs_cfg_allow[0].contains("src/lib.rs:8:"), "error at line 8 (denied_on_unix):\n{out_cfg_allow}");
     assert!(warns_cfg_allow.is_empty(), "no warnings:\n{out_cfg_allow}");
 
-    // 11. Signature const block `fn f() -> Foo<{ 1 }> { ... }` preserves item `#[deny]`.
+    // 11. Signature const block `fn f() -> Foo<{ 1 }> { ... }` and braced signature macro
+    //     `fn f() -> Ty!{} { ... }` preserve item `#[deny]`.
     let (_, errs_const, out_const) = run_raw(
         35,
         "#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub struct Foo<const N: usize>;\n#[deny(deprecated_safe_2024)]\npub fn with_const_sig() -> Foo<{ 1 }> { set_var_like(); Foo }\n",
     );
     assert_eq!(errs_const.len(), 1, "signature const block must not clear item #[deny]:\n{out_const}");
     assert!(errs_const[0].contains("deprecated-safe-2024"), "error names lint:\n{out_const}");
+
+    let (_, errs_mac_sig, out_mac_sig) = run_raw(
+        37,
+        "#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\nmacro_rules! Ty { () => { () }; }\n#[deny(deprecated_safe_2024)]\npub fn with_macro_sig() -> Ty!{} { set_var_like(); }\n",
+    );
+    assert_eq!(errs_mac_sig.len(), 1, "braced signature macro must not clear item #[deny]:\n{out_mac_sig}");
+    assert!(errs_mac_sig[0].contains("deprecated-safe-2024"), "error names lint:\n{out_mac_sig}");
+
+    // 12. Unit-specific `#[cfg_attr(test, deny(deprecated_safe_2024))]`: test unit fails while
+    //     non-test library call stays clean!
+    let (_, errs_test_cfg, out_test_cfg) = run_raw(
+        38,
+        "#![cfg_attr(test, deny(deprecated_safe_2024))]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub fn lib_caller() { set_var_like(); }\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_caller() { super::set_var_like(); }\n}\n",
+    );
+    assert!(!errs_test_cfg.is_empty(), "cfg_attr(test, deny(..)) must fail test unit:\n{out_test_cfg}");
+    assert!(errs_test_cfg.iter().any(|l| l.contains("src/lib.rs:9:") && l.contains("deprecated-safe-2024")), "test_caller fails:\n{out_test_cfg}");
+    // Control: checking lib_caller alone in a crate where only `cfg(not(test))` denies it.
+    let (_, errs_nottest, out_nottest) = run_raw(
+        39,
+        "#![cfg_attr(not(test), deny(deprecated_safe_2024))]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn test_caller() { super::set_var_like(); }\n}\n",
+    );
+    assert!(errs_nottest.is_empty(), "cfg_attr(not(test), deny(..)) must NOT fail test unit:\n{out_nottest}");
+
+    // 13. Post-build-script `cargo::rustc-cfg=has_foo` + `#![cfg_attr(has_foo, deny(deprecated_safe_2024))]`.
+    struct HasFooScript;
+    impl crate::engine_scripts::ScriptRunner for HasFooScript {
+        fn run(&self, cx: &Cx, _: &Dir<ReadWrite>, name: blaze_drive::Name, kept: Option<crate::engine_scripts::KeptReads>, _: &[(blaze_drive::Input, &[u8])]) -> crate::scripts::PooledScript {
+            let frame = cx.frame();
+            let (plant, _) = kept.expect("kept reads");
+            let empty = crate::engine_script_reads::cells_of(core::iter::empty(), plant).expect("empty reads");
+            let erased = blaze_own::Erased::new(frame);
+            let outputs = blaze_build_script::outputs::Outputs::read(
+                b"cargo::rustc-cfg=has_foo\n",
+                "/out",
+                blaze_build_script::instr::OutputLimits::DEFAULT,
+                erased.handle(),
+            )
+            .expect("script outputs");
+            let made = crate::scripts::outputs_record(name, &[], crate::scripts::RanAs::Wasm, &outputs, "app 0.1.0");
+            crate::scripts::PooledScript { did: Ok(made), used: 0, ns: 0, checkout: empty, unkept: None }
+        }
+    }
+    static HAS_FOO_RUNNER: HasFooScript = HasFooScript;
+    let io_bs = Io::simulated(SimWorld::new(40, Limits::USUAL));
+    write(&io_bs, "Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n");
+    write(&io_bs, "build.rs", "fn main() { println!(\"cargo::rustc-cfg=has_foo\"); }\n");
+    write(
+        &io_bs,
+        "src/lib.rs",
+        "#![cfg_attr(has_foo, deny(deprecated_safe_2024))]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub fn caller() { set_var_like(); }\n",
+    );
+    let (_, lines_bs, _) = crate::engine_scripts::with_runner(&HAS_FOO_RUNNER, || said(&io_bs, false));
+    let out_bs = lines_bs.join("\n");
+    let errs_bs = error_lines(&out_bs);
+    assert_eq!(errs_bs.len(), 1, "post-build-script cargo::rustc-cfg=has_foo must activate cfg_attr(has_foo, deny(..)):\n{out_bs}");
+    assert!(errs_bs[0].contains("deprecated-safe-2024"), "error names lint:\n{out_bs}");
+
+    // 14. External `#[deny(deprecated_safe_2024)] mod foo;` + nested inline/external module chain.
+    let io_ext = Io::simulated(SimWorld::new(41, Limits::USUAL));
+    write(&io_ext, "Cargo.toml", MANIFEST_2021);
+    write(
+        &io_ext,
+        "src/lib.rs",
+        "#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\n#[deny(deprecated_safe_2024)]\npub mod foo;\n#[deny(deprecated_safe_2024)]\npub mod outer {\n    #[allow(deprecated_safe_2024)]\n    pub mod inner;\n}\n",
+    );
+    write(&io_ext, "src/foo.rs", "pub fn in_foo() { crate::set_var_like(); }\n");
+    write(&io_ext, "src/outer/inner.rs", "pub fn in_inner() { crate::set_var_like(); }\n");
+    let (_, lines_ext, _) = said(&io_ext, false);
+    let out_ext = lines_ext.join("\n");
+    let errs_ext = error_lines(&out_ext);
+    assert_eq!(errs_ext.len(), 1, "external #[deny] mod foo must fail src/foo.rs while #[allow] mod inner suppresses src/outer/inner.rs:\n{out_ext}");
+    assert!(errs_ext[0].contains("src/foo.rs:1:") && errs_ext[0].contains("deprecated-safe-2024"), "error in src/foo.rs:\n{out_ext}");
+
+    // 15. Deep `cfg_attr` predicate (>32 nested `all(...)`) & deep block nesting (>128) E2E.
+    let mut deep_src = std::string::String::from("#![cfg_attr(");
+    for _ in 0..40 {
+        deep_src.push_str("all(");
+    }
+    deep_src.push_str("unix");
+    for _ in 0..40 {
+        deep_src.push(')');
+    }
+    deep_src.push_str(", deny(deprecated_safe_2024))]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub fn deep() {\n");
+    for _ in 0..140 {
+        deep_src.push('{');
+    }
+    deep_src.push_str(" set_var_like(); ");
+    for _ in 0..140 {
+        deep_src.push('}');
+    }
+    deep_src.push_str("\n}\n");
+    let (_, errs_deep, out_deep) = run_raw(42, &deep_src);
+    assert_eq!(errs_deep.len(), 1, "deep cfg_attr (>32) + deep blocks (>128) must fail cleanly:\n{out_deep}");
+
+    // 16. Standing-replay incremental edit: check with `#![warn(deprecated_safe_2024)]` in
+    //     `src/lib.rs` and call in `src/foo.rs`, then edit ONLY `src/lib.rs` to `#![deny(..)]`
+    //     (leaving `src/foo.rs` untouched) -> second check MUST fail with error, never replay stale warning.
+    let io_inc = Io::simulated(SimWorld::new(43, Limits::USUAL));
+    write(&io_inc, "Cargo.toml", MANIFEST_2021);
+    write(
+        &io_inc,
+        "src/lib.rs",
+        "#![warn(deprecated_safe_2024)]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub mod foo;\n",
+    );
+    write(&io_inc, "src/foo.rs", "pub fn call_sub() { crate::set_var_like(); }\n");
+    let (_, lines_inc1, _) = said(&io_inc, false);
+    let out_inc1 = lines_inc1.join("\n");
+    assert_eq!(warning_lines(&out_inc1).len(), 1, "first check warns:\n{out_inc1}");
+    assert!(error_lines(&out_inc1).is_empty(), "first check has 0 errors:\n{out_inc1}");
+    // Edit ONLY src/lib.rs from warn -> deny; src/foo.rs is untouched!
+    write(
+        &io_inc,
+        "src/lib.rs",
+        "#![deny(deprecated_safe_2024)]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub mod foo;\n",
+    );
+    let (_, lines_inc2, checked_inc2) = said(&io_inc, false);
+    let out_inc2 = lines_inc2.join("\n");
+    assert_eq!(error_lines(&out_inc2).len(), 1, "second check must upgrade src/foo.rs warning to error:\n{out_inc2}");
+    assert!(warning_lines(&out_inc2).is_empty(), "second check must not leave stale warning:\n{out_inc2}");
+    assert_eq!(checked_inc2.status.0, Status::FAILED.0, "second check must fail exit status");
+
+    // 17. Edition 2021 `unsafe fn`: default is clean (`Allow`), `#![deny(unsafe_op_in_unsafe_fn)]`
+    //     fails `*p` (not `set_var_like`), and `#![deny(rust_2024_compatibility)]` fails BOTH.
+    let (_, errs_u21_def, out_u21_def) = run_raw(
+        44,
+        "#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub unsafe fn f(p: *const u8) -> u8 { set_var_like(); *p }\n",
+    );
+    assert!(errs_u21_def.is_empty(), "Edition 2021 unsafe fn default must be clean:\n{out_u21_def}");
+
+    let (_, errs_u21_uop, out_u21_uop) = run_raw(
+        45,
+        "#![deny(unsafe_op_in_unsafe_fn)]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub unsafe fn f(p: *const u8) -> u8 { set_var_like(); *p }\n",
+    );
+    assert_eq!(errs_u21_uop.len(), 1, "Edition 2021 deny(unsafe_op_in_unsafe_fn) must fail `*p` only:\n{out_u21_uop}");
+    assert!(errs_u21_uop[0].contains("unsafe-op-in-unsafe-fn"), "error names unsafe-op-in-unsafe-fn:\n{out_u21_uop}");
+
+    let (_, errs_u21_compat, out_u21_compat) = run_raw(
+        46,
+        "#![deny(rust_2024_compatibility)]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub unsafe fn f(p: *const u8) -> u8 { set_var_like(); *p }\n",
+    );
+    assert_eq!(errs_u21_compat.len(), 2, "Edition 2021 deny(rust_2024_compatibility) must fail both set_var_like and *p:\n{out_u21_compat}");
 }
 
 /// A workspace of one member, `app`, under the `suggest` step, its module `a` holding `f`, which

@@ -36,16 +36,20 @@
 
 use blaze_drive::{Kind, Locate, Name, Part, Why};
 use blaze_ids::{ContentId, Hasher};
-use blaze_lint::{CfgAtoms, Findings, Geometry, Level, OwnHeads, OwnUnit, RootMarks, Rule, RuleSet, Scope, Span, Step, TestBits, UnitPlan, Units, Variants, VariantsView, statics_of_path};
+use blaze_lint::{Findings, Geometry, Level, OwnHeads, OwnUnit, RootMarks, Rule, RuleSet, Scope, Span, Step, TestBits, UnitPlan, Units, Variants, VariantsView, statics_of_path};
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_world::crate_list::CrateGraph;
 use std::alloc::Global;
 
 use crate::work::Record;
 
 /// The first finding number of a lint: a finding numbered `LINT_BASE + rule.id()` is the lint
-/// `rule`'s. Far from every other number the cli and the drive use (1..=0x40, 0xC0F6..).
+/// `rule`'s (level decided at print time from step + file marks). `LINT_WARN_BASE + rule.id()`
+/// and `LINT_ERROR_BASE + rule.id()` carry a severity already resolved in `front2::lint_level`
+/// (for rustc typed lints such as `deprecated-safe-2024` and `unsafe-op-in-unsafe-fn`). Far from
+/// every other number the cli and the drive use (1..=0x40, 0xC0F6..).
 pub const LINT_BASE: u16 = 0x4C00;
+pub const LINT_WARN_BASE: u16 = 0x4D00;
+pub const LINT_ERROR_BASE: u16 = 0x4E00;
 
 const UNIT_NAME_DOMAIN: &str = "blaze-cli lint unit name 1";
 /// 3: `variant-count`'s read is in a unit's source only when the rule runs ([`parts_in`]: the
@@ -65,10 +69,41 @@ pub(crate) const fn number_of(rule: Rule) -> u16 {
     LINT_BASE + rule.id()
 }
 
-/// The lint rule a finding number is, if it is one.
+/// The finding number of lint `rule` pre-resolved to `Warn` (`Level::Advice`) in `front2`.
+pub(crate) const fn number_of_warn(rule: Rule) -> u16 {
+    LINT_WARN_BASE + rule.id()
+}
+
+/// The finding number of lint `rule` pre-resolved to `Error` (`Level::Error`) in `front2`.
+pub(crate) const fn number_of_error(rule: Rule) -> u16 {
+    LINT_ERROR_BASE + rule.id()
+}
+
+/// The lint rule a finding number is, if it is one (across default, warn, and error bases).
 pub(crate) fn rule_of(number: u16) -> Option<Rule> {
-    let id = number.checked_sub(LINT_BASE)?;
+    let id = if number >= LINT_ERROR_BASE && number < LINT_ERROR_BASE + 0x100 {
+        number - LINT_ERROR_BASE
+    } else if number >= LINT_WARN_BASE && number < LINT_WARN_BASE + 0x100 {
+        number - LINT_WARN_BASE
+    } else if number >= LINT_BASE && number < LINT_BASE + 0x100 {
+        number - LINT_BASE
+    } else {
+        return None;
+    };
     Rule::ALL.into_iter().find(|rule| rule.id() == id)
+}
+
+/// Pre-resolved lint level carried by `number` (for `LINT_WARN_BASE` / `LINT_ERROR_BASE`);
+/// `None` for step-configured lints (`LINT_BASE`) or non-lint findings.
+pub(crate) fn resolved_level(number: u16) -> Option<Level> {
+    rule_of(number)?;
+    if number >= LINT_ERROR_BASE && number < LINT_ERROR_BASE + 0x100 {
+        Some(Level::Error)
+    } else if number >= LINT_WARN_BASE && number < LINT_WARN_BASE + 0x100 {
+        Some(Level::Advice)
+    } else {
+        None
+    }
 }
 
 /// Whether finding number `number` is a lint's.
@@ -81,6 +116,9 @@ pub(crate) fn is_lint(number: u16) -> bool {
 /// words, never stored): the step's level, an error where the crate denies the rule's lint
 /// (blaze-lint `RootMarks::levels`).
 pub(crate) fn level_in(step: Step, marks: RootMarks, number: u16) -> Level {
+    if let Some(level) = resolved_level(number) {
+        return level;
+    }
     match rule_of(number) {
         Some(rule) => marks.levels(step.levels()).of(rule),
         None => Level::Off,
@@ -95,169 +133,6 @@ pub(crate) fn marks_of(crate_root_text: &str, text: &str) -> RootMarks {
         return RootMarks::read(text);
     }
     RootMarks::read(crate_root_text).join(RootMarks::read(text))
-}
-
-/// Per-crate lint context built once from the workspace's `UnitGraph`: each member unit's crate
-/// root path, directory prefix, active `cfg` atoms, and pre-parsed crate-root [`RootMarks`], so
-/// submodule files (`src/foo.rs`) inherit crate-root lint attributes (`#![deny(..)]`,
-/// `#![cfg_attr(..)]`, `#![forbid(warnings)]`) and evaluate `#[cfg_attr(..)]` against the unit's
-/// real active `cfg`.
-pub(crate) struct CrateLintUnit<'f> {
-    pub(crate) root_path: &'f str,
-    pub(crate) dir_prefix: &'f str,
-    pub(crate) is_test: bool,
-    pub(crate) is_lib: bool,
-    pub(crate) cfg: &'f [(&'f str, Option<&'f str>)],
-    pub(crate) root_marks: RootMarks,
-}
-
-/// Workspace-wide crate lint context attached to [`crate::print::Shown`].
-pub(crate) struct CrateLintCtx<'f> {
-    pub(crate) units: Vec<CrateLintUnit<'f>, &'f bstd::mem::Frame>,
-}
-
-impl<'f> CrateLintCtx<'f> {
-    pub(crate) fn empty(frame: &'f bstd::mem::Frame) -> Self {
-        Self { units: Vec::new_in(frame) }
-    }
-
-    /// Populates the crate lint context from the stored `UnitGraph` record at `graph_key`.
-    /// Silently keeps whatever could be read if the graph is absent (e.g. a check that failed
-    /// before `UnitGraph` ran).
-    pub(crate) fn populate<'m>(
-        &mut self,
-        cx: &bstd::cx::Cx,
-        checkout: &bstd::fs::Dir<bstd::fs::ReadWrite>,
-        store: &mut dyn crate::store::Store<'m>,
-        graph_key: blaze_drive::Key,
-        frame: &'f bstd::mem::Frame,
-    ) {
-        self.units.clear();
-        let Ok(Ok((_view, sections))) = crate::engine_units::stored_graph_at(cx, store, graph_key) else {
-            return;
-        };
-        let Ok(Some(list)) = sections.crates() else {
-            return;
-        };
-        let Ok(scratch) = bstd::mem::Frame::with_reserve(16 << 20, bstd::mem::Tag::Other) else {
-            return;
-        };
-        let scratch_erased = blaze_own::Erased::new(&scratch);
-        let Ok(decoded) = blaze_unit_graph::record::decode(sections.graph, scratch_erased.handle()) else {
-            return;
-        };
-        let mut root_buf = bstd::mem::Bytes::new_in(&scratch, "crate root lint marks");
-        let n = list.len();
-        for r in 0..n {
-            if !list.member(r) {
-                continue;
-            }
-            let Some(rel_root) = list.root(r).strip_prefix("/0/") else {
-                continue;
-            };
-            let pkg = list.package(r);
-            let krate = list.name(r);
-            let is_test = list.test(r);
-            let matched = decoded.graph.units.iter().find(|u| {
-                u.name.as_str() == pkg
-                    && u.crate_name.as_str() == krate
-                    && rel_root.ends_with(u.root.as_str())
-                    && u.cfg.iter().any(|a| a.name.as_str() == "test" && a.value.is_none()) == is_test
-            });
-            let cfg_slice: &'f [(&'f str, Option<&'f str>)] = match matched {
-                Some(u) => {
-                    let mut atoms: Vec<(&'f str, Option<&'f str>), &'f bstd::mem::Frame> = Vec::with_capacity_in(u.cfg.len(), frame);
-                    for a in u.cfg.iter() {
-                        let name: &'f str = frame.alloc_str(a.name.as_str());
-                        let value: Option<&'f str> = a.value.as_ref().map(|v| &*frame.alloc_str(v.as_str()));
-                        atoms.push((name, value));
-                    }
-                    atoms.into_bump_slice()
-                }
-                None => &[],
-            };
-            root_buf.clear();
-            let root_marks = bstd::path::Path::new(rel_root)
-                .ok()
-                .and_then(|p| checkout.read_all(cx, &p, &mut root_buf).ok())
-                .and_then(|_| core::str::from_utf8(root_buf.as_slice()).ok())
-                .map_or(RootMarks::NONE, |text| RootMarks::read_with_cfg(text, CfgAtoms(cfg_slice)));
-            let root_path = frame.alloc_str(rel_root);
-            let dir_prefix = match root_path.rsplit_once('/') {
-                Some((dir, _)) => frame.alloc_str(bstd::mem::format_in!(frame, "{dir}/").as_str()),
-                None => "",
-            };
-            let is_lib = root_path == "lib.rs" || root_path.ends_with("/lib.rs");
-            self.units.push(CrateLintUnit {
-                root_path,
-                dir_prefix,
-                is_test,
-                is_lib,
-                cfg: cfg_slice,
-                root_marks,
-            });
-        }
-    }
-
-    /// Finds the owning workspace unit for checkout-relative `path`: exact `root_path` match first
-    /// (preferring non-test), else longest matching `dir_prefix` (preferring non-test and `lib.rs`).
-    pub(crate) fn unit_for(&self, path: &str) -> Option<&CrateLintUnit<'f>> {
-        let exact = self
-            .units
-            .iter()
-            .filter(|u| u.root_path == path)
-            .min_by_key(|u| u.is_test);
-        if exact.is_some() {
-            return exact;
-        }
-        let mut best: Option<&CrateLintUnit<'f>> = None;
-        for u in self.units.iter() {
-            if !path.starts_with(u.dir_prefix) {
-                continue;
-            }
-            let better = match best {
-                None => true,
-                Some(cur) => {
-                    (u.dir_prefix.len(), !u.is_test, u.is_lib) > (cur.dir_prefix.len(), !cur.is_test, cur.is_lib)
-                }
-            };
-            if better {
-                best = Some(u);
-            }
-        }
-        best
-    }
-
-    /// Effective lint marks at byte offset `at` inside `text` (at checkout-relative `path`),
-    /// joining the owning crate root's marks and evaluating `cfg_attr(..)` against the unit's
-    /// active `cfg` atoms.
-    pub(crate) fn marks_at(&self, path: Option<&str>, text: &str, at: u32, alloc: Alloc<'_>) -> RootMarks {
-        let offset = usize::try_from(at).unwrap_or(text.len());
-        let Some(unit) = path.and_then(|p| self.unit_for(p)) else {
-            return RootMarks::read_at_in(text, offset, CfgAtoms::EMPTY, alloc);
-        };
-        let cfg = CfgAtoms(unit.cfg);
-        if path == Some(unit.root_path) {
-            RootMarks::read_at_in(text, offset, cfg, alloc)
-        } else {
-            RootMarks::read_at_under(unit.root_marks, text, offset, cfg, alloc)
-        }
-    }
-
-    /// Digest of the crate-root lint marks and active `cfg` atoms for `path`, folded into
-    /// rendered file-section keys so editing crate-root lint attributes invalidates submodule
-    /// sections (Rule 21).
-    pub(crate) fn section_salt(&self, path: &str) -> ContentId {
-        let mut h = Hasher::new("blaze-cli lint section salt 1");
-        if let Some(unit) = self.unit_for(path) {
-            h.update(&unit.root_marks.level_bytes());
-            h.update(&u64::try_from(unit.cfg.len()).unwrap_or(u64::MAX).to_le_bytes());
-            for &(name, val) in unit.cfg {
-                h.part(name.as_bytes()).opt_part(val.map(str::as_bytes));
-            }
-        }
-        h.finish()
-    }
 }
 
 /// Why the root manifest's lints could not be read: each names the key (rule 19).
@@ -1714,21 +1589,22 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_safe_2024_level_in_follows_crate_attributes() {
-        let num = number_of(Rule::DeprecatedSafe2024);
-        assert_eq!(rule_of(num), Some(Rule::DeprecatedSafe2024));
-        // Default: Allow (`Level::Off`) so Edition 2021 crates compile cleanly by default.
-        assert_eq!(level_in(Step::Rust, RootMarks::NONE, num), Level::Off);
-        assert_eq!(level_in(Step::Strict, RootMarks::NONE, num), Level::Off);
-        // `#![warn(...)]` -> Advice; `#![deny(...)]` / `#![deny(rust_2024_compatibility)]` -> Error.
-        assert_eq!(level_in(Step::Rust, marks_of("#![warn(deprecated_safe_2024)]\n", ""), num), Level::Advice);
-        assert_eq!(level_in(Step::Rust, marks_of("#![deny(deprecated_safe_2024)]\n", ""), num), Level::Error);
-        assert_eq!(level_in(Step::Rust, marks_of("#![deny(deprecated_safe)]\n", ""), num), Level::Error);
-        assert_eq!(level_in(Step::Rust, marks_of("#![deny(rust_2024_compatibility)]\n", ""), num), Level::Error);
-        assert_eq!(
-            level_in(Step::Rust, marks_of("#![deny(rust_2024_compatibility)]\n#![allow(deprecated_safe_2024)]\n", ""), num),
-            Level::Off
-        );
+    fn deprecated_safe_2024_resolved_level_bases() {
+        let base = number_of(Rule::DeprecatedSafe2024);
+        let warn = number_of_warn(Rule::DeprecatedSafe2024);
+        let err = number_of_error(Rule::DeprecatedSafe2024);
+        assert_eq!(rule_of(base), Some(Rule::DeprecatedSafe2024));
+        assert_eq!(rule_of(warn), Some(Rule::DeprecatedSafe2024));
+        assert_eq!(rule_of(err), Some(Rule::DeprecatedSafe2024));
+        assert_eq!(resolved_level(base), None);
+        assert_eq!(resolved_level(warn), Some(Level::Advice));
+        assert_eq!(resolved_level(err), Some(Level::Error));
+        // Default base is `Level::Off` under every step; pre-resolved warn/error bases
+        // take precedence over step defaults.
+        assert_eq!(level_in(Step::Rust, RootMarks::NONE, base), Level::Off);
+        assert_eq!(level_in(Step::Strict, RootMarks::NONE, base), Level::Off);
+        assert_eq!(level_in(Step::Rust, RootMarks::NONE, warn), Level::Advice);
+        assert_eq!(level_in(Step::Rust, RootMarks::NONE, err), Level::Error);
     }
 
     #[test]

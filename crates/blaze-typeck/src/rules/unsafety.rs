@@ -255,32 +255,27 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// The operation `op` at `at`, met in `ctx` (never [`Ctx::Block`]): E0133 in a safe
-    /// context; in an `unsafe fn`'s body from edition 2024 the `unsafe-op-in-unsafe-fn` lint's
-    /// finding (no level: rule 81), before 2024 nothing ([`Ctx::UnsafeFn`]).
+    /// context; in an `unsafe fn`'s body (any edition), the `unsafe-op-in-unsafe-fn` lint's
+    /// finding (front2 resolves its effective lint level: default `Allow` before 2024, `Warn`
+    /// from 2024, overridden by `#[allow/warn/deny/forbid]` and `rust_2024_compatibility`).
     fn refuse(&mut self, ctx: Ctx, at: At, op: UnsafeOp) {
         match ctx {
             Ctx::Safe => self.diag(DiagCode::RequiresUnsafe, at, About::Unsafe(op)),
-            Ctx::UnsafeFn if self.body.edition >= Edition::E2024 => {
+            Ctx::UnsafeFn => {
                 let at = self.range_of(at);
                 self.typed_findings.push(TypedFinding::UnsafeOpInUnsafeFn { op, at });
             }
-            Ctx::UnsafeFn | Ctx::Block => {}
+            Ctx::Block => {}
         }
     }
 
     /// A call `e` of the fn item `k`: E0133 when `k` is `unsafe` (except a direct call in an
-    /// edition before 2024 to a fn marked `#[rustc_deprecated_safe_2024]` / `#[deprecated_safe]`)
-    /// or a safe `#[target_feature]` fn in a body that enables none of its features, outside
-    /// `unsafe`; [`Undecided`] when the body has features of its own and the outcome would be a
-    /// finding.
+    /// edition before 2024 to a fn marked `#[rustc_deprecated_safe_2024]` / `#[deprecated_safe]`,
+    /// which emits `TypedFinding::DeprecatedSafe2024`) or a safe `#[target_feature]` fn in a body
+    /// that enables none of its features, outside `unsafe`; [`Undecided`] when the body has
+    /// features of its own and the outcome would be a finding.
     fn unsafe_call(&mut self, e: ExprId, k: ItemKey, ctx: Ctx) -> Result<(), Stop> {
-        // Before 2024 nothing in an `unsafe fn`'s body is filed ([`Ctx::UnsafeFn`]).
-        let files = match ctx {
-            Ctx::Safe => true,
-            Ctx::UnsafeFn => self.body.edition >= Edition::E2024,
-            Ctx::Block => false,
-        };
-        if !files {
+        if ctx == Ctx::Block {
             return Ok(());
         }
         let Some(sig) = self.reads.fn_sig(k)? else { return Ok(()) };
@@ -288,11 +283,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             if self.body.expr_edition(e) < Edition::E2024 {
                 let attrs = self.reads.attrs(k)?;
                 if attrs.0 & TypeAttrs::DEPRECATED_SAFE_2024 != 0 {
-                    // Emit `deprecated_safe_2024` both in safe contexts and in edition 2024+
-                    // `unsafe fn` bodies (where `files` is true because `unsafe_op_in_unsafe_fn`
-                    // applies; pre-2024 `unsafe fn` bodies and `unsafe {}` blocks returned early).
                     let at = self.range_of(At::Expr(e));
-                    self.typed_findings.push(TypedFinding::DeprecatedSafe2024 { callee: k, at });
+                    self.typed_findings.push(TypedFinding::DeprecatedSafe2024 {
+                        callee: k,
+                        at,
+                        in_unsafe_fn: ctx == Ctx::UnsafeFn,
+                    });
                     attrs
                 } else {
                     self.refuse(ctx, At::Expr(e), UnsafeOp::Call(Some(k)));
@@ -354,7 +350,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// pattern of a union struct pattern that is not `_` ("Unions", "Pattern matching on
     /// unions").
     fn union_pats(&mut self, p: PatId, ctx: Ctx, stack: &mut Vec<PatId, Alloc<'a>>) -> Result<(), Stop> {
-        if ctx == Ctx::Block || (ctx == Ctx::UnsafeFn && self.body.edition < Edition::E2024) {
+        if ctx == Ctx::Block {
             return Ok(());
         }
         let body = self.body;

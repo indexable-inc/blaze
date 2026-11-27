@@ -1614,7 +1614,7 @@ const MOST_LOCAL_LEVELS: usize = 64;
 /// in its copy is (core `line!`: "the first macro invocation leading up to the expansion"), so
 /// the offsets inside it are dropped. `None`: no library body (an anonymous constant's
 /// rendering, a chain past [`MOST_LOCAL_LEVELS`]).
-fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: LibKey, owner: ItemKey, text: &str) -> Option<super::body_host::BodyAt> {
+pub(super) fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: LibKey, owner: ItemKey, text: &str) -> Option<super::body_host::BodyAt> {
     let mut key = owner;
     let mut off = 0u32;
     let mut fixed = false;

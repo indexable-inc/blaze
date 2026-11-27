@@ -80,9 +80,6 @@ pub struct Shown<'f> {
     /// The command's lint step (lints.rs `lints_of`): a lint finding's level is its levels' at
     /// print time (rule 81), never stored. `Step::Rust` until the command sets it.
     pub lints: blaze_lint::Step,
-    /// Per-crate lint context (crate-root marks + active `cfg` atoms per workspace unit) so
-    /// module files inherit crate-root lint attributes and evaluate `cfg_attr(..)`.
-    pub(crate) lint_ctx: crate::lints::CrateLintCtx<'f>,
     /// `--each`: every finding that is only a consequence (a task waiting on a failed one, an
     /// item or a body not checked) drawn one by one, as well as counted under its cause. Off,
     /// they are counted and grouped only, and never placed in their files.
@@ -119,7 +116,6 @@ impl<'f> Shown<'f> {
             borrows_unchecked: 0,
             not_run: Vec::new_in(frame),
             lints: blaze_lint::Step::Rust,
-            lint_ctx: crate::lints::CrateLintCtx::empty(frame),
             each: false,
             verbose: false,
             behind: crate::not_checked::Behind::default(),
@@ -799,25 +795,22 @@ fn finding_about<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], file: Option<&str>, s
         }
         return Ok(());
     }
-    if l.fix.is_some() {
-        shown.fixes.push(l.id);
-    }
-    // A lint finding: the level the step's levels give its rule, now (rule 81). Advice is a
-    // warning, and no step's is an error today (main.rs `every_rule`); an `Off` rule is not
-    // drawn or counted.
-    // The crate root's and file's lint marks (including enclosing item/module/block lint
-    // attributes at `l.start` and active `cfg_attr(..)`), read only when the finding is a lint
-    // rule. A lint finding's file is UTF-8 (engine_lints.rs refuses any other), so a text that
-    // is not has none.
-    let lint = crate::lints::rule_of(l.rule).map(|_| {
-        let erased = blaze_own::Erased::new(frame);
-        let marks = core::str::from_utf8(text).map_or(blaze_lint::RootMarks::NONE, |text| {
-            shown.lint_ctx.marks_at(l.path.or(file), text, l.start, erased.handle())
-        });
-        crate::lints::level_in(shown.lints, marks, l.rule)
-    });
+    // A lint finding: either pre-resolved in `front2::lint_level` (`resolved_level`, for rustc
+    // typed lints such as `deprecated-safe-2024` and `unsafe-op-in-unsafe-fn`), or decided now
+    // from the step's levels and the file's top marks (rule 81). An `Off` rule is neither drawn,
+    // counted, nor recorded in `shown.fixes`.
+    let lint = match crate::lints::resolved_level(l.rule) {
+        Some(level) => Some(level),
+        None => crate::lints::rule_of(l.rule).map(|_| {
+            let marks = core::str::from_utf8(text).map_or(blaze_lint::RootMarks::NONE, |text| crate::lints::marks_of(text, text));
+            crate::lints::level_in(shown.lints, marks, l.rule)
+        }),
+    };
     if lint == Some(blaze_lint::Level::Off) {
         return Ok(());
+    }
+    if l.fix.is_some() {
+        shown.fixes.push(l.id);
     }
     // Every other finding is what its rule's row says (D164: severity is a column of the
     // table, `Kind`): a body whose types were not checked a note that keeps `check` from
@@ -1225,5 +1218,46 @@ mod tests {
         for (area, number) in emitted {
             assert!(wording(area, number).is_some(), "a rule blaze-cli prints has no words in WORDINGS: {area:?} {number}");
         }
+    }
+
+    /// A lint finding whose resolved level is `Level::Off` must neither draw nor record a fix
+    /// in `shown.fixes` (so `blaze fix` is never advertised for a suppressed finding).
+    #[test]
+    fn suppressed_fixable_lint_does_not_record_fix() {
+        use bstd::io::{Io, Limits, SimWorld};
+        use bstd::mem::TASK_FRAME;
+        use core::time::Duration;
+
+        let io = Io::simulated(SimWorld::new(7, Limits::USUAL));
+        let cx = io.cx(Duration::from_secs(5), TASK_FRAME).expect("cx");
+        let frame = cx.frame();
+        let out = io.need_out().expect("out");
+        let mut shown = super::Shown::new(blaze_report::frame::Caps::LINES, super::View::Person, "/ws", frame);
+        // `Rule::DeprecatedSafe2024` has `Level::Off` under default `Step::Rust`.
+        let rule = crate::lints::number_of(blaze_lint::Rule::DeprecatedSafe2024);
+        let listed = super::Listed {
+            path: Some("src/lib.rs"),
+            about: blaze_drive::Name::new(blaze_drive::Kind::BodyCheck, blaze_ids::ContentId([1; 32])),
+            read: blaze_ids::ContentId([0; 32]),
+            area: Area::Cli,
+            rule,
+            words: b"suppressed lint",
+            item: 0,
+            start: 0,
+            end: 1,
+            id: super::Id::UNSHOWN,
+            fix: Some(super::Change {
+                start: 0,
+                end: 1,
+                insert: "",
+                reason: blaze_report::frame::words::HelpKind::ToolchainLine,
+                args: ["", ""],
+                given: 0,
+            }),
+        };
+        super::finding_about(&cx, &listed, b"fn f() {}", Some("src/lib.rs"), &mut shown, frame, &out).expect("finding_about");
+        assert!(shown.fixes.is_empty(), "Level::Off finding must not push into shown.fixes");
+        assert_eq!(shown.counts.errors, 0);
+        assert_eq!(shown.counts.warnings, 0);
     }
 }

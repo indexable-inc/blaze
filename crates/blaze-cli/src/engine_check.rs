@@ -4891,9 +4891,6 @@ fn checking<'f, 's: 'f>(
         if let Some(live) = live {
             live.see(blaze_screen::Step::Says);
         }
-        if let Ok(Some(graph_key)) = records.get(Name::unit_graph()) {
-            shown.lint_ctx.populate(cx, root, &mut store, graph_key, frame);
-        }
         *printed_out = true;
         let printed = print_answer(cx, root, &view_slot, &mut store, &made, rows, (names.as_ref(), &*bodies), &finished, (outlined, files_checked), unreadable.as_ref(), names_oracle, &*phases, shown, frame, out)?;
         let AnswerPrinted { tally, lines_key, lines_bytes, status, oracle, bodies_whole } = printed;
@@ -5622,18 +5619,6 @@ fn certified<'m, 'f, D: blaze_core::Driver, S: crate::store::Sharing>(
 ) -> Result<(Status, crate::engine_lines::Tally), CliError> {
     let (chosen, now_places, journal_counts) = journal;
     let facts = pointer.facts;
-    {
-        let cert_alloc = heap.shared();
-        if let Ok(Ok(whole_dir)) = crate::engine_answer::open_root(cx, store, pointer.root, cert_alloc) {
-            let graph_key = store.snapshot_in(cert_alloc).ok().and_then(|snapshot| {
-                let stored = crate::engine_answer::Stored::new(&whole_dir, &snapshot, &pointer.headers, blaze_engine::pages::Check::Store, cert_alloc);
-                stored.header(Name::unit_graph()).ok().flatten().and_then(|h| h.record)
-            });
-            if let Some(graph_key) = graph_key {
-                shown.lint_ctx.populate(cx, root, store, graph_key, frame);
-            }
-        }
-    }
     // A rendered view is immutable under its semantic lines key and presentation.  A hit
     // transfers the stored stream in one write, avoiding a re-render of every note and finding.
     // Older answers, a different view, or a caller needing a listing take the ordinary semantic

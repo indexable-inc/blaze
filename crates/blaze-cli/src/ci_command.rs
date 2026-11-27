@@ -372,13 +372,13 @@ fn collect_check_items<'f>(
             if l.area == Area::Cli && l.rule == crate::work::NOT_RUN {
                 continue;
             }
-            let lint_level = crate::lints::rule_of(l.rule).map(|_| {
-                let erased = blaze_own::Erased::new(&scratch);
-                let marks = text_opt.map_or(blaze_lint::RootMarks::NONE, |t| {
-                    shown.lint_ctx.marks_at(path_opt, t, l.start, erased.handle())
-                });
-                crate::lints::level_in(shown.lints, marks, l.rule)
-            });
+            let lint_level = match crate::lints::resolved_level(l.rule) {
+                Some(level) => Some(level),
+                None => crate::lints::rule_of(l.rule).map(|_| {
+                    let marks = text_opt.map_or(blaze_lint::RootMarks::NONE, |t| crate::lints::marks_of(t, t));
+                    crate::lints::level_in(shown.lints, marks, l.rule)
+                }),
+            };
             if lint_level == Some(blaze_lint::Level::Off) {
                 continue;
             }

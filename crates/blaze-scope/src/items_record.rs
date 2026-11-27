@@ -91,7 +91,10 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// 16: per-file CSR item index (`by_file`: `(files + 1)` u32 offsets + `u32` item indices) stored
 /// as column 12 of `T_ITEMS` for O(items_in_file) per-file item iteration (`file_item_indices`);
 /// a version-15 record is refused the same way.
-const VERSION: u32 = 16;
+/// 17: module rows store each module's file index (`ModuleRow::file`, `MODULE_ROW = 52`), so
+/// front2 resolves module-level lint attributes across external `mod foo;` boundaries; a
+/// version-16 record is refused the same way.
+const VERSION: u32 = 17;
 const KEY_TAIL: usize = 24;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
@@ -109,7 +112,7 @@ const ROOT_TRAIT: u32 = 1;
 const ROOT_SELF: u32 = 2;
 const LANG_ROW: usize = 40;
 const MACRO_ROW: usize = 72;
-const MODULE_ROW: usize = 48;
+const MODULE_ROW: usize = 52;
 const ATOM_ROW: usize = 16;
 
 // The header's u32 fields, by index (field `i` is at byte `8 + 4 * i`).
@@ -883,8 +886,16 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             }
             None => (0, 0),
         };
+        let file = match (walked, made) {
+            (Some(w), _) => w.file,
+            (None, Some(made)) => match made.at {
+                At::File(f) => f,
+                At::Expansion(_) => NONE,
+            },
+            (None, None) => NONE,
+        };
         module_rows.extend_from_slice(&m.0.0);
-        for n in [parent, path.0, path.1, flags] {
+        for n in [parent, path.0, path.1, flags, file] {
             put32(&mut module_rows, n);
         }
     }
@@ -1707,6 +1718,7 @@ pub struct ModuleRow<'a> {
     pub path: Option<&'a str>,
     pub listed: bool,
     pub made: bool,
+    pub file: Option<u32>,
 }
 
 /// A macro definition's body as its row holds it (question 21).
@@ -2867,13 +2879,14 @@ impl<'a> ItemsRecord<'a> {
             return Ok(None);
         }
         let (b, r) = (self.bytes, self.row(T_MODULES, i));
-        let (parent, flags) = (le32(b, r + 32), le32(b, r + 44));
+        let (parent, flags, file) = (le32(b, r + 32), le32(b, r + 44), le32(b, r + 48));
         Ok(Some(ModuleRow {
             key: key_at(b, r),
             parent: if parent == NONE { None } else { Some(self.module_key(parent)?) },
             path: if flags & HAS_PATH != 0 { Some(self.str_at("a module's path", le32(b, r + 36), le32(b, r + 40))?) } else { None },
             listed: flags & LISTED != 0,
             made: flags & MADE != 0,
+            file: if file == NONE { None } else { Some(file) },
         }))
     }
 

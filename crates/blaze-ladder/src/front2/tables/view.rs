@@ -576,6 +576,12 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.module_path(module)
     }
 
+    /// The module's own cell (its module row, covering `parent`, `file`, and `path`).
+    fn module_info(self, module: ItemKey) -> Option<(Option<ItemKey>, Option<u32>, Option<&'n str>)> {
+        self.item(module);
+        self.records.module_info(module)
+    }
+
     /// WHOLE: the names record's failed-call rows have no cell (read only on an error's path).
     fn failed_call<'b>(self, call: ItemKey, bump: blaze_own::Bump<'b>) -> Option<blaze_scope::names_record::FailedRow<'b>>
     where

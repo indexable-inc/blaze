@@ -68,7 +68,7 @@ use blaze_own::{AVec, Alloc};
 pub use allowed::{ALLOWED_STATICS, Allowed, AllowedStatic, is_hermetic_path, statics_of_path};
 pub use engine::Scratch;
 pub use fix::{FixError, apply, apply_all};
-pub use marks::{CfgAtoms, OwnHeads, RootMarks};
+pub use marks::{OwnHeads, RootMarks};
 pub use message::show_message;
 pub use units::{ChildHoles, HOLE_MARK, HOLE_MARK_LEN, OwnUnit, UnitLinted, UnitPlan, Units, holes_in, own_place, own_text, real_place, real_range};
 pub use variants::{Geometry, Variants, VariantsView};

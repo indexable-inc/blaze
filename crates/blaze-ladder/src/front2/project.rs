@@ -94,8 +94,18 @@ pub enum NoteKind {
     HeldAcross,
 }
 
+/// Resolved diagnostic severity for a rustc typed lint (`deprecated-safe-2024`,
+/// `unsafe-op-in-unsafe-fn`), decided in `front2::lint_level` from the exact unit's `cfg` atoms,
+/// module ancestor chain, and CST lint attributes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LintLevel {
+    Warn,
+    Error,
+}
+
 /// A finding of a typed lint in a body (blaze-typeck `TypedFinding`, `args-inline` the first):
-/// no error of the program's types; its level is the configuration's, at print time (rule 81).
+/// no error of the program's types; its level is either resolved here (`level: Some(..)`, for
+/// rustc typed lints) or the step configuration's at print time (`level: None`, rule 81).
 #[derive(Debug)]
 pub struct BodyLintFinding<'a> {
     /// The lint's name (blaze-lint `Rule::name`'s spelling: `args-inline`).
@@ -105,6 +115,8 @@ pub struct BodyLintFinding<'a> {
     /// Item-relative (rule 71).
     pub start: u32,
     pub end: u32,
+    /// Resolved level for rustc typed lints; `None` for step-configured blaze typed lints.
+    pub level: Option<LintLevel>,
 }
 
 /// A construct of a checked body that the check could not decide (blaze-typeck `Undecided`):
@@ -626,7 +638,9 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
                     verdict.diagnostics.push(BodyDiagnostic { code: d.code.code(), text: AString::new_in(alloc), start: d.at.start, end: d.at.end, notes: AVec::new_in(alloc) });
                 }
                 for f in done.findings.iter() {
-                    verdict.findings.push(lint_finding(&r, f, alloc));
+                    if let Some(finding) = lint_finding(&r, &*lowered, f, alloc) {
+                        verdict.findings.push(finding);
+                    }
                 }
                 for u in done.undecided.iter() {
                     let at = u.at();
@@ -657,8 +671,34 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
 }
 
 /// A typed lint's finding with its words, the struct named by its path (rule 19).
-fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_typeck::TypedFinding, alloc: Alloc<'a>) -> BodyLintFinding<'a> {
+/// Returns `None` when a rustc typed lint (`deprecated-safe-2024`, `unsafe-op-in-unsafe-fn`)
+/// resolves to `Allow` (`Off`) at its lexical call site.
+fn lint_finding<'a, 'n, S: NamesSource<'n>>(
+    r: &Records<'_, 'n, S>,
+    lowered: &Body<'n>,
+    f: &blaze_typeck::TypedFinding,
+    alloc: Alloc<'a>,
+) -> Option<BodyLintFinding<'a>> {
+    use super::lint_level::{ResolvedLintLevel, RustcLint, resolve_rustc_lint};
+
     let at = f.at();
+    let level = match *f {
+        blaze_typeck::TypedFinding::UnsafeOpInUnsafeFn { .. } => {
+            match resolve_rustc_lint(r, lowered, at.start, RustcLint::UnsafeOpInUnsafeFn, alloc) {
+                ResolvedLintLevel::Off => return None,
+                ResolvedLintLevel::Warn => Some(LintLevel::Warn),
+                ResolvedLintLevel::Error => Some(LintLevel::Error),
+            }
+        }
+        blaze_typeck::TypedFinding::DeprecatedSafe2024 { in_unsafe_fn, .. } => {
+            match resolve_rustc_lint(r, lowered, at.start, RustcLint::DeprecatedSafe2024 { in_unsafe_fn }, alloc) {
+                ResolvedLintLevel::Off => return None,
+                ResolvedLintLevel::Warn => Some(LintLevel::Warn),
+                ResolvedLintLevel::Error => Some(LintLevel::Error),
+            }
+        }
+        _ => None,
+    };
     let mut text = AString::new_in(alloc);
     match *f {
         blaze_typeck::TypedFinding::ArgsInline { misuse, adt, .. } => {
@@ -671,10 +711,10 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
             text.push_str("` is an options struct (`#[blaze::args]`), a call's named arguments and nothing else: it ");
             text.push_str(misuse.says());
         }
-        // rustc's words for `unsafe_op_in_unsafe_fn` (edition 2024).
+        // rustc's words for `unsafe_op_in_unsafe_fn`.
         blaze_typeck::TypedFinding::UnsafeOpInUnsafeFn { op, .. } => {
             text.push_str(&super::check::unsafe_op_shown(r, op));
-            text.push_str(" is unsafe and requires unsafe block (the body of an `unsafe fn` is no unsafe block in edition 2024)");
+            text.push_str(" is unsafe and requires unsafe block (an `unsafe fn`'s body requires an `unsafe` block under `unsafe_op_in_unsafe_fn`)");
         }
         // rustc's words for `deprecated_safe_2024` (editions before 2024, RFC 3458).
         blaze_typeck::TypedFinding::DeprecatedSafe2024 { callee, .. } => {
@@ -814,7 +854,7 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
             text.push_str(": pass capabilities as method arguments instead of storing them in sans-IO data");
         }
     }
-    BodyLintFinding { lint: f.lint(), text, start: at.start, end: at.end }
+    Some(BodyLintFinding { lint: f.lint(), text, start: at.start, end: at.end, level })
 }
 
 /// Lowers `body` by [`lower_made`] (each head and constant its lowering needs made first); a

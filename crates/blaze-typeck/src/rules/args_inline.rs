@@ -98,9 +98,11 @@ pub enum TypedFinding {
         at: Range,
     },
     /// `deprecated-safe-2024` (rustc's `deprecated_safe_2024`, RFC 3458): a direct call in an
-    /// edition before 2024 outside `unsafe` to an `unsafe fn` carrying
-    /// `#[rustc_deprecated_safe_2024]` or `#[deprecated_safe]` (rules/unsafety.rs).
-    DeprecatedSafe2024 { callee: ItemKey, at: Range },
+    /// edition before 2024 outside `unsafe {}` to an `unsafe fn` carrying
+    /// `#[rustc_deprecated_safe_2024]` or `#[deprecated_safe]` (rules/unsafety.rs). When
+    /// `in_unsafe_fn` is true, the call is inside an `unsafe fn` body outside an `unsafe {}`
+    /// block, so rustc emits the lint only when `unsafe_op_in_unsafe_fn` is not `Allow`.
+    DeprecatedSafe2024 { callee: ItemKey, at: Range, in_unsafe_fn: bool },
 }
 
 impl TypedFinding {

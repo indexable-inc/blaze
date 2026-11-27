@@ -318,7 +318,9 @@ fn before_2024_the_words_name_the_unsafe_fn() {
         vec![
             ("call_2021".to_string(), "E0133 call to unsafe function `uf` is unsafe and requires unsafe function or block (E0133 RequiresUnsafe)".to_string()),
             ("call_2021_ok".to_string(), "clean".to_string()),
-            ("in_unsafe_fn_2021".to_string(), "clean".to_string()),
+            // Raw `check_body` emits `unsafe-op-in-unsafe-fn` in all editions; `project.rs`
+            // resolves its effective lint level (default `Allow` before 2024).
+            ("in_unsafe_fn_2021".to_string(), "lint [\"unsafe-op-in-unsafe-fn at Range { start: 32, end: 36 }\"]".to_string()),
         ]
     );
 }
@@ -403,7 +405,7 @@ fn call_dep_tf() { dep_safe_tf() }
         &[
             ("call_rustc_dep", "lint [\"deprecated-safe-2024 at *"),
             ("call_rustc_dep_unsafe", "clean"),
-            ("call_rustc_dep_in_unsafe_fn", "clean"),
+            ("call_rustc_dep_in_unsafe_fn", "lint [\"deprecated-safe-2024 at *"),
             ("call_dep_safe", "lint [\"deprecated-safe-2024 at *"),
             ("call_dep_safe_unsafe", "clean"),
             ("call_inherent_dep", "lint [\"deprecated-safe-2024 at *"),
