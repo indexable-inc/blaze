@@ -31,8 +31,8 @@ const fn low_bits_mask(rem: usize) -> u64 {
 ///
 /// # Invariants
 ///
-/// - `words.len() == len.div_ceil(64)`.
-/// - Whenever `len % 64 != 0`, every bit at index `>= len % 64` in the final word is `0`.
+/// - `words.len() == len.div_ceil(64)`. Evidence: [`tests::bit_col_word_boundaries_push_get_set_pop_truncate_clear`].
+/// - Whenever `len % 64 != 0`, every bit at index `>= len % 64` in the final word is `0`. Evidence: [`tests::bit_col_from_elem_in_tail_mask_invariant`].
 pub struct BitCol<A: Allocator> {
     words: Vec<u64, A>,
     len: usize,
@@ -385,9 +385,9 @@ impl FusedIterator for OnesIter<'_> {}
 ///
 /// # Invariants
 ///
-/// - `BITS` is `1`, `2`, or `4`.
-/// - `words.len() == len.div_ceil(Self::TAGS_PER_WORD)`.
-/// - Unused high bits in the final partial `u64` word are always `0`.
+/// - `BITS` is `1`, `2`, or `4`. Evidence: [`tests::small_tag_col_1_2_4_round_trips_across_word_boundaries`].
+/// - `words.len() == len.div_ceil(Self::TAGS_PER_WORD)`. Evidence: [`tests::small_tag_col_1_2_4_round_trips_across_word_boundaries`].
+/// - Unused high bits in the final partial `u64` word are always `0`. Evidence: [`tests::small_tag_col_1_2_4_round_trips_across_word_boundaries`].
 pub struct SmallTagCol<const BITS: u32, A: Allocator> {
     words: Vec<u64, A>,
     len: usize,

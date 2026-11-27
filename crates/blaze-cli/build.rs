@@ -23,7 +23,7 @@ use blaze_ids::Hasher;
 use blaze_ids::producer::Row;
 use blaze_producers::{Digest, Entry, Step, Walk};
 
-const CODE_BUILDER_DOMAIN: &str = "blaze-cli code-builder producer 1";
+const BUILD_CFG_DOMAIN: &str = "blaze-cli code-builder cfg 1";
 
 fn main() -> ExitCode {
     #[expect(clippy::disallowed_methods, reason = "cargo hands a build script its target only as `CARGO_CFG_TARGET_OS`")]
@@ -40,14 +40,15 @@ fn main() -> ExitCode {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-env-changed=CARGO_CFG_DEBUG_ASSERTIONS");
 
-    if let Err(why) = emit_code_builder_producer(&os) {
+    let alloc = blaze_own::Heap::process().alloc();
+    if let Err(why) = emit_code_builder_producer(&os, alloc) {
         eprintln!("blaze-cli build.rs: failed to compute CodeBuilder producer digest: {why}");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
 }
 
-fn emit_code_builder_producer(os: &str) -> Result<(), String> {
+fn emit_code_builder_producer(os: &str, alloc: blaze_own::Alloc<'_>) -> Result<(), String> {
     #[expect(clippy::disallowed_methods, reason = "cargo hands a build script its manifest/out dirs and cfg via env")]
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").map_err(|e| format!("CARGO_MANIFEST_DIR: {e}"))?;
     #[expect(clippy::disallowed_methods, reason = "cargo hands a build script its out dir via env")]
@@ -60,7 +61,6 @@ fn emit_code_builder_producer(os: &str) -> Result<(), String> {
     let debug_assertions = std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some();
 
     let workspace_root = Path::new(&manifest_dir).join("../..");
-    let alloc = blaze_own::Heap::process().alloc();
     let mut walk = Walk::for_row(Row::CodeBuilder, alloc).map_err(|why| format!("{why}"))?;
     loop {
         let (is_list, path) = match walk.next().map_err(|why| format!("{why}"))? {
@@ -111,7 +111,7 @@ fn emit_code_builder_producer(os: &str) -> Result<(), String> {
         println!("cargo::rerun-if-changed={}", workspace_root.join(rel.as_str()).display());
     }
 
-    let mut hasher = Hasher::new(CODE_BUILDER_DOMAIN);
+    let mut hasher = Hasher::new(BUILD_CFG_DOMAIN);
     hasher
         .part(&row_digest)
         .part(arch.as_bytes())

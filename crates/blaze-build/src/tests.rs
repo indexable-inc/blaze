@@ -597,8 +597,8 @@ impl World for TestWorld {
 
     fn predicates(&self, _: Seal, item: ItemKey) -> Fetch<Predicates<'_>> {
         match self.where_clauses.iter().find(|(k, _)| *k == item) {
-            Some((_, clauses)) => Ok(Predicates { clauses: clauses.as_slice(), types: self.types.view() }),
-            None => Ok(Predicates { clauses: &[] as &[PClause], types: PTys::EMPTY }),
+            Some((_, clauses)) => Ok(Predicates { clauses: clauses.as_slice(), types: self.types.view(), regions: None }),
+            None => Ok(Predicates { clauses: &[] as &[PClause], types: PTys::EMPTY, regions: None }),
         }
     }
 
@@ -633,6 +633,7 @@ impl World for TestWorld {
                 assoc_types: &[],
                 types: self.types.view(),
                 polarity: blaze_typeck::ImplPolarity::Positive,
+                regions: None,
             }));
         }
         Ok(match (item, self.deref, self.index) {
@@ -644,6 +645,7 @@ impl World for TestWorld {
                 assoc_types: &self.deref_assoc,
                 types: self.types.view(),
                 polarity: blaze_typeck::ImplPolarity::Positive,
+                regions: None,
             }),
             (INDEX_IMPL, _, Some((s, after))) => Some(ImplHeader {
                 generics: 0,
@@ -653,6 +655,7 @@ impl World for TestWorld {
                 assoc_types: &self.index_assoc,
                 types: self.types.view(),
                 polarity: blaze_typeck::ImplPolarity::Positive,
+                regions: None,
             }),
             (INDEX_MUT_IMPL, _, Some((s, after))) if self.index_mut_fn.is_some() => Some(ImplHeader {
                 generics: 0,
@@ -662,6 +665,7 @@ impl World for TestWorld {
                 assoc_types: &[],
                 types: self.types.view(),
                 polarity: blaze_typeck::ImplPolarity::Positive,
+                regions: None,
             }),
             _ => None,
         })

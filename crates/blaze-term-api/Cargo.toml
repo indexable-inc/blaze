@@ -13,7 +13,7 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-blaze-own = { path = "../blaze-own" }
-blaze-data = { path = "../blaze-data" }
-blaze-json = { path = "../blaze-json" }
-blaze-base64 = { path = "../blaze-base64" }
+blaze-own.workspace = true
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-base64.workspace = true

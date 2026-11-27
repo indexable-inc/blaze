@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-317 invariants, 42 refinements, 12 reference models.
-By level: 257 tested, 86 simulated, 1 model-checked, 15 proved.
+322 invariants, 45 refinements, 13 reference models.
+By level: 264 tested, 87 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -182,12 +182,21 @@ By level: 257 tested, 86 simulated, 1 model-checked, 15 proved.
 - **`the_index_reads_each_file_once_cold_and_downloads_nothing_warm`** *tested* (`crates/blaze-fetch/src/tests/index.rs`): the sparse-index machine reads each crate index once cold, sends cached validators when warm, and downloads nothing when unchanged. A clean machine passes 300 cases; a failure prints the oracle's words and the tape, e.g. "asked again: se/rd/serde asked 2 times, not 1".
   Controls: `a_request_sent_without_its_validator`.
 - **`a_fetch_stores_only_verified_records_and_ends_whatever_the_origin_does`** *tested* (`crates/blaze-fetch/src/tests/sim.rs`): a fetch stores only checksum- and path-verified records within allocation bounds, never trusts an unverified commit or wire size, and terminates under any origin fault or crash.
-  Controls: `a_pack_stored_before_its_checksum`, `an_entry_outside_its_folder`, `a_commit_taken_from_the_server`, `a_size_from_the_wire_allocated_unchecked`.
+  Controls: `a_pack_stored_before_its_checksum`, `an_entry_outside_its_folder`, `a_commit_taken_from_the_server`, `a_size_from_the_wire_allocated_unchecked`, `a_dropped_submodule`.
 
 ### blaze-file-items
 
 - **`resplit_equals_split_after_random_edits`** *tested* (`crates/blaze-file-items/src/split/tests.rs`): a resplit after any edit is the split of the new text, digests and all.
   Controls: `a_suffix_kept_unsynced`.
+
+### blaze-git
+
+- **`run_slab_roundtrip_and_corruption`** *tested* (`crates/blaze-git/src/engine_tests.rs`): every object written into a `BGOB` slab (Raw or AutoZstd) and indexed by `BGIX` round-trips byte-for-byte with CRC-32 protection, and any single-byte corruption is refused.
+  Controls: `skip_slab_crc_check`, `skip_three_way_conflict`, `skip_cas_old_oid_check`, `corrupt_pack_trailer`.
+- **`run_blob_merge_oracle`** *tested* (`crates/blaze-git/src/engine_tests.rs`): non-overlapping edits merge cleanly and commute; overlapping differing edits ALWAYS report a conflict with markers.
+  Controls: `skip_slab_crc_check`, `skip_three_way_conflict`, `skip_cas_old_oid_check`, `corrupt_pack_trailer`.
+- **`worktree_and_index_counts_match_oracle`** *tested* (`crates/blaze-git/src/tests.rs`): racy edits, deletions, staged changes, and conflicts are counted identically to the reference construction across random working-tree states.
+  Controls: `skip_merge_second_parent`, `skip_racy_hash_check`, `skip_conflict_count`, `skip_staged_diff`, `ignore_negation`.
 
 ### blaze-graph
 
@@ -291,7 +300,7 @@ By level: 257 tested, 86 simulated, 1 model-checked, 15 proved.
 
 ### blaze-proc-macro
 
-- **`a_crash_or_failure_anywhere_keeps_each_record_whole_or_absent`** *tested* (`crates/blaze-proc-macro/src/record_tests.rs`): after any crash or I/O failure during proc-macro expansion persistence, every record read back is whole and sealed or absent.
+- **`a_crash_or_failure_anywhere_keeps_each_record_whole_or_absent`** *simulated* (`crates/blaze-proc-macro/src/record_tests.rs`): after any crash or I/O failure during proc-macro expansion persistence, every record read back is whole and sealed or absent.
   Controls: `a_read_that_skips_the_seal`.
 - **`a_crash_or_failure_anywhere_keeps_each_table_whole_or_absent`** *tested* (`crates/blaze-proc-macro/src/table_tests.rs`): under power cuts, failures, and concurrent writers, every opened proc-macro results table is sealed and whole or absent, and never published before its bytes are whole.
   Controls: `a_read_that_skips_the_tables_seal`, `a_name_given_before_the_bytes_are_whole`.
@@ -417,6 +426,8 @@ By level: 257 tested, 86 simulated, 1 model-checked, 15 proved.
   Controls: `a_deliver_that_swap_removes`.
 - **`a_kept_line_reads_back_as_written`** *tested* (`crates/blaze-sim/src/kept/tests.rs`): every kept failure line written by `write_line` round-trips through the kept-file parser as a single line without splitting on its reason text. (b) A property of the engine itself: for drawn test paths, versions, tapes and whys, the line [`write_line`] writes reads back through the file's reader as exactly that line: text -> line -> parse -> tape is the identity (the tape's trailing zeros cut, as a tape's text always is). Prints: `blaze-sim: kept::tests::a_kept_line_reads_back_as_written: 300 cases, <n> choices`
   Controls: `a_why_written_whole`.
+- **`linear_passes_on`** *tested* (`crates/blaze-sim/src/scaling/tests.rs`): linear work satisfies `O(N)` scaling on both time and space axes.
+  Controls: `planted_quadratic_under_on`, `n_log_n_under_on`, `quadratic_under_onlogn`, `linear_under_ologn`, `linear_space_under_o1`, `zero_to_nonzero_spill`.
 - **`a_search_ends_on_the_least_failing_tape`** *tested* (`crates/blaze-sim/src/tests/search.rs`): a search over a body with a known least failing tape ends on exactly that tape.
   Controls: `a_shrinker_that_keeps_a_passing_candidate`, `a_shrinker_that_keeps_a_record_that_is_not_simpler`, `a_verdict_that_depends_on_a_counter`, `a_search_that_reports_the_candidate_as_proposed`, `a_search_that_skips_the_final_run`, `a_simpler_that_counts_trailing_zeros`.
 - **`one_configuration_gives_one_verdict`** *tested* (`crates/blaze-sim/src/tests/search.rs`): one configuration gives one verdict (the same search twice gives equal verdicts, for failing and passing bodies).
@@ -628,6 +639,11 @@ By level: 257 tested, 86 simulated, 1 model-checked, 15 proved.
 - **`an_answer_not_read_changes_nothing`** *tested* (`crates/blaze-typeck/src/tests.rs`): type checking is deterministic and changing any world answer not recorded in the read list changes nothing in the resulting record.
   Controls: `an_unrecorded_read`.
 
+### blaze-vt
+
+- **`snapshot_round_trip_preserves_terminal_state`** *tested* (`crates/blaze-vt/src/snapshot_tests.rs`): for any drawn VT stream, `snapshot_vt` -> `restore_vt_snapshot` produces a terminal whose screens, scrollback, styles, graphemes, hyperlinks, soft-wraps, cursor, modes, margins, colors, title, cwd, and subsequent resize reflow match the original.
+  Controls: `every_snapshot_plant`.
+
 ### blaze-watch
 
 - **`every_command_is_told_every_change_since_its_place_by_the_helper_or_its_own_replay`** *simulated* (`crates/blaze-watch/src/sim/helper.rs`): every command learns every change since its saved place (via the helper or journal replay) respecting flush cookies, event-id barriers, binary changes, queue caps, and deadlines.
@@ -806,6 +822,11 @@ By level: 257 tested, 86 simulated, 1 model-checked, 15 proved.
 - **`open_refuses_every_buffer_an_unchecked_read_would_misread`** *tested* (`crates/blaze-format-core/src/verified_tests.rs`): `Verified::open` refuses every buffer the byte-by-byte reference reader refuses (including out-of-bounds references and invalid UTF-8), and every unchecked read agrees with the reference.
   Controls: `a_reference_past_its_field`, `text_that_is_not_utf8`.
 
+### blaze-git
+
+- **`ahead_behind_matches_reference_model`** *tested* (`crates/blaze-git/src/tests.rs`): ahead/behind computed by [`StatusMachine`] (both via `CGPH` commit-graph and via loose objects) equals [`ref_ahead_behind`] on every random DAG including merges.
+  Controls: `skip_merge_second_parent`, `skip_racy_hash_check`, `skip_conflict_count`, `skip_staged_diff`, `ignore_negation`.
+
 ### blaze-ids
 
 - **`a_keyed_set_kept_by_edits_is_the_set_made_whole`** *tested* (`crates/blaze-ids/src/keyed.rs`): after any sequence of sets and removals, the root kept by hashing only the edited entries' paths is the root of the same entries hashed whole, and so are the nodes kept.
@@ -876,6 +897,13 @@ By level: 257 tested, 86 simulated, 1 model-checked, 15 proved.
 - **`affected_is_exactly_the_tests_that_entered_a_changed_body`** *tested* (`crates/blaze-run/src/sim/suite.rs`): `Tests::affected` equals a naive scan of each test's latest entered-body record without keeping stale postings from earlier records.
   Controls: `postings_kept_from_an_old_record`.
 
+### blaze-sh
+
+- **`pmap_refines_btreemap_across_forks`** *tested* (`crates/blaze-sh/src/persist_tests.rs`): persistent `PMap` with O(1) CoW forks matches `BTreeMap` across every branch.
+  Controls: `pmap_fork_leak`, `pvec_fork_leak`.
+- **`pvec_refines_vec_across_forks`** *tested* (`crates/blaze-sh/src/persist_tests.rs`): persistent `PVec` with O(1) CoW forks matches `Vec` across every branch.
+  Controls: `pmap_fork_leak`, `pvec_fork_leak`.
+
 ### blaze-sim
 
 - **`a_seeded_tape_is_splitmix64`** *tested* (`crates/blaze-sim/src/tests/tape.rs`): a seeded tape, recorded or not, gives what `SplitMix64` of its seed gives on any sequence of calls, and leaves the stream where `SplitMix64` leaves it.
@@ -942,6 +970,10 @@ By level: 257 tested, 86 simulated, 1 model-checked, 15 proved.
 
 - **`Serial`** (`crates/blaze-engine/src/code_pool_sim.rs`): give each child's first demand of a key its next slot, execute only that key synchronously and remember its result. Exit withdraws unanswered receipts. The order is each child's own (D194): a child's replies keep its demand order, and no child's reply waits on another's.
 
+### blaze-git
+
+- **`ref_ahead_behind`** (`crates/blaze-git/src/tests.rs`): pure sequential symmetric difference on an in-memory DAG.
+
 ### blaze-memchr
 
 - **`naive_find`** (`crates/blaze-memchr/src/tests.rs`): the first byte of `haystack` in `needles`, one byte at a time.
@@ -967,7 +999,7 @@ Every promise of a doc comment or an effect attribute and how it is held
 `Evidence:` or `Unverified:`, an effect attribute, a `# Safety` obligation, a proved contract.
 A checked attribute and an obligation are counted, not listed.
 
-4205 claims. By level: 31 none, 4 unverified, 387 obligation, 3743 checked, 0 tested, 2 simulated, 0 model-checked, 38 proved.
+4380 claims. By level: 28 none, 4 unverified, 391 obligation, 3901 checked, 16 tested, 2 simulated, 0 model-checked, 38 proved.
 
 ### Totals
 
@@ -995,7 +1027,7 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-malloc | 0 | 0 | 27 | 0 | 0 | 0 | 0 | 0 |
 | blaze-mem | 0 | 0 | 26 | 0 | 0 | 0 | 0 | 0 |
 | blaze-memo | 0 | 0 | 10 | 0 | 0 | 0 | 0 | 0 |
-| blaze-own | 21 | 0 | 47 | 8 | 0 | 0 | 0 | 0 |
+| blaze-own | 18 | 0 | 51 | 8 | 16 | 0 | 0 | 0 |
 | blaze-pg | 0 | 0 | 0 | 188 | 0 | 0 | 0 | 0 |
 | blaze-profile | 0 | 0 | 9 | 0 | 0 | 0 | 0 | 0 |
 | blaze-queue | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
@@ -1003,14 +1035,14 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-scope | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
 | blaze-sha256 | 0 | 0 | 2 | 0 | 0 | 0 | 0 | 0 |
 | blaze-shapes | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 1 |
-| blaze-sim | 0 | 0 | 0 | 492 | 0 | 0 | 0 | 0 |
+| blaze-sim | 0 | 0 | 0 | 543 | 0 | 0 | 0 | 0 |
 | blaze-sort | 0 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
 | blaze-sql | 0 | 0 | 0 | 179 | 0 | 0 | 0 | 0 |
 | blaze-sqlite | 4 | 0 | 1 | 6 | 0 | 0 | 0 | 0 |
-| blaze-std | 0 | 0 | 19 | 1271 | 0 | 0 | 0 | 0 |
+| blaze-std | 0 | 0 | 19 | 1274 | 0 | 0 | 0 | 0 |
 | blaze-store-check | 0 | 0 | 8 | 0 | 0 | 0 | 0 | 0 |
 | blaze-surface | 0 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
-| blaze-sys | 0 | 4 | 86 | 1511 | 0 | 0 | 0 | 0 |
+| blaze-sys | 0 | 4 | 86 | 1615 | 0 | 0 | 0 | 0 |
 | blaze-text | 0 | 0 | 5 | 0 | 0 | 0 | 0 | 0 |
 | blaze-trace | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
 | blaze-url | 0 | 0 | 0 | 58 | 0 | 0 | 0 | 0 |
@@ -1065,24 +1097,37 @@ A checked attribute and an obligation are counted, not listed.
 - **`blaze-ladder::argv::Argv#1`** *none* none (`crates/blaze-ladder/src/argv.rs:30`): 1. `text` holds `name` and each of `rest`, in order, each followed by one NUL byte, and none holds a NUL of its own ([`Argv::new_in`] refuses one). 2. `pointers` holds `1 + rest.len()` pointers, the `i`th to the first byte of argument `i` in `text`, then one null pointer: C's `argv` with `argv[argc] == NULL` (C17 5.1.2.2.1: "argv[argc] shall be a null pointer"). 3. Neither vector grows after `new_in` returns, so the pointers stay where they point until the `Argv` is dropped (moving the `Argv` moves no heap bytes). 4. `1 + rest.len() <= i32::MAX`: `argc` is a C `int`.
 - **`blaze-own::arc::Arc#1`** *none* none (`crates/blaze-own/src/arc.rs:63`): `ptr` points to a block `alloc` (or an equivalent clone) returned for `Layout::for_value(&*ptr)`, whose `strong` count includes this owner, so `value` is live.
 - **`blaze-own::arc::Weak#1`** *none* none (`crates/blaze-own/src/arc.rs:77`): `ptr` points to a block as `Arc`'s whose `weak` count includes this reference, so the block, though maybe not the value, is live.
+- **`blaze-own::bit_col::BitCol#1`** *tested* evidenced (`crates/blaze-own/src/bit_col.rs:34`): `words.len() == len.div_ceil(64)`. Evidence: `tests::bit_col_word_boundaries_push_get_set_pop_truncate_clear`.
+- **`blaze-own::bit_col::BitCol#2`** *tested* evidenced (`crates/blaze-own/src/bit_col.rs:35`): Whenever `len % 64 != 0`, every bit at index `>= len % 64` in the final word is `0`. Evidence: `tests::bit_col_from_elem_in_tail_mask_invariant`.
+- **`blaze-own::bit_col::SmallTagCol#1`** *tested* evidenced (`crates/blaze-own/src/bit_col.rs:388`): `BITS` is `1`, `2`, or `4`. Evidence: `tests::small_tag_col_1_2_4_round_trips_across_word_boundaries`.
+- **`blaze-own::bit_col::SmallTagCol#2`** *tested* evidenced (`crates/blaze-own/src/bit_col.rs:389`): `words.len() == len.div_ceil(Self::TAGS_PER_WORD)`. Evidence: `tests::small_tag_col_1_2_4_round_trips_across_word_boundaries`.
+- **`blaze-own::bit_col::SmallTagCol#3`** *tested* evidenced (`crates/blaze-own/src/bit_col.rs:390`): Unused high bits in the final partial `u64` word are always `0`. Evidence: `tests::small_tag_col_1_2_4_round_trips_across_word_boundaries`.
 - **`blaze-own::boxed::Box#1`** *none* none (`crates/blaze-own/src/boxed.rs:41`): `ptr` points to a live `T`. When `Layout::for_value` of it has a size, the block is one `alloc` returned for that layout; when the size is 0 nothing is allocated and `ptr` is dangling and aligned.
 - **`blaze-own::btree::Leaf#1`** *none* none (`crates/blaze-own/src/btree.rs:86`): `keys[..len]` and `vals[..len]` are written, the keys strictly increasing; `parent` is the internal node whose edge `parent_idx` this is, `None` for the root.
+- **`blaze-own::csr::Csr#1`** *tested* evidenced (`crates/blaze-own/src/csr.rs:34`): `offsets` starts with `0` (`offsets.len() == self.len() + 1`). Evidence: `tests::csr_empty_push_slice_row_iter_and_clear`.
+- **`blaze-own::csr::Csr#2`** *tested* evidenced (`crates/blaze-own/src/csr.rs:35`): `offsets` is monotonically non-decreasing, and its last element equals `values.len()`. Evidence: `tests::csr_push_row_rolls_back_and_drops_on_iterator_panic`.
 - **`blaze-own::deque::Drain#1`** *none* none (`crates/blaze-own/src/deque.rs:499`): The ring's length is `start` and its head unchanged; indices `front..back` hold the values not yet given out, `end..len` the values after the range.
 - **`blaze-own::deque::VecDeque#1`** *none* none (`crates/blaze-own/src/deque.rs:35`): `head < capacity` (or 0 when nothing is allocated); the `len` values are in the slots `head, head + 1, ..` taken modulo the capacity; `len <= capacity`.
+- **`blaze-own::disjoint_ranges::DisjointRanges#1`** *tested* evidenced (`crates/blaze-own/src/disjoint_ranges.rs:15`): Every entry `(start, end)` satisfies `start <= end`. Evidence: `tests::try_from_sorted_disjoint_validates_invariants`.
+- **`blaze-own::disjoint_ranges::DisjointRanges#2`** *tested* evidenced (`crates/blaze-own/src/disjoint_ranges.rs:16`): Every adjacent pair `(s0, e0), (s1, e1)` satisfies `e0 < s1` (strictly ascending and disjoint). Evidence: `tests::try_from_sorted_disjoint_validates_invariants`.
+- **`blaze-own::disjoint_ranges::DisjointRanges#3`** *none* none (`crates/blaze-own/src/disjoint_ranges.rs:18`): Zero allocation, `#![no_std]`, zero `unsafe`.
+- **`blaze-own::frame_vec::RawParts#1`** *tested* evidenced (`crates/blaze-own/src/frame_vec.rs:192`): For zero-sized `T`: `cap == I::MAX`, `ptr` is dangling and aligned, and nothing is ever allocated. Evidence: `tests::frame_vec_zst_and_small_index_overflow`.
+- **`blaze-own::frame_vec::RawParts#2`** *tested* evidenced (`crates/blaze-own/src/frame_vec.rs:194`): For non-ZST `T` with `cap == 0`: `len == 0`, `ptr` is dangling and aligned, and nothing is allocated. Evidence: `tests::layout_sizes_and_niches`.
+- **`blaze-own::frame_vec::RawParts#3`** *tested* evidenced (`crates/blaze-own/src/frame_vec.rs:196`): Otherwise `ptr` points to a block allocated by the matching branded allocator/arena for `Layout::array::<T>(cap.to_usize())`, `len <= cap`, and slots `0..len` hold initialized `T`s. Evidence: `tests::unmanaged_vec_every_failure_preserves_contents_and_zero_leaks`.
 - **`blaze-own::raw::RawBuf#1`** *none* none (`crates/blaze-own/src/raw.rs:19`): `T` sized 0: `cap` is `usize::MAX` and nothing is ever allocated; `ptr` is dangling, aligned.
 - **`blaze-own::raw::RawBuf#2`** *none* none (`crates/blaze-own/src/raw.rs:21`): `cap` 0: `ptr` is dangling, aligned, and nothing is allocated.
 - **`blaze-own::raw::RawBuf#3`** *none* none (`crates/blaze-own/src/raw.rs:22`): Otherwise `ptr` is a block `alloc` returned for `Layout::array::<T>(cap)` (at least that size; the excess is not used), which this value frees when dropped.
 - **`blaze-own::raw::RawBuf#4`** *none* none (`crates/blaze-own/src/raw.rs:25`): Dropping it frees the block and drops no `T`: which slots hold values is the owner's to know.
 - **`blaze-own::rc::Rc#1`** *none* none (`crates/blaze-own/src/rc.rs:45`): As `Arc`'s: `ptr` is a block of `alloc` (or an equivalent clone) for `Layout::for_value` of it, whose `strong` count includes this owner.
-- **`blaze-own::soa::Soa#1`** *none* none (`crates/blaze-own/src/soa.rs:461`): `base` is a block of `alloc` for `Soa::layout(cap)` when `cap != 0` and rows are not sized 0, else dangling aligned to `C::ALIGN`; `cols` are the columns' starts in it for `cap`; rows `0..len` of every column hold values; `len <= cap`; `cap` is `usize::MAX` when rows are sized 0.
+- **`blaze-own::soa::Soa#1`** *none* none (`crates/blaze-own/src/soa.rs:461`): `base` is a block of `alloc` for `Soa::layout(cap)` when `cap != 0` and rows are not sized 0, else dangling aligned to `C::ALIGN`; column `field` starts at `base + C::PREFIX[field] * cap`; rows `0..len` of every column hold values; `len <= cap`; `cap` is `usize::MAX` when rows are sized 0.
 - **`blaze-own::sorted::SortedMap#1`** *none* none (`crates/blaze-own/src/sorted.rs:31`): The keys are strictly increasing.
 - **`blaze-own::sorted::SortedSet#1`** *none* none (`crates/blaze-own/src/sorted.rs:574`): The values are strictly increasing.
-- **`blaze-own::thin_arc::ThinArc#1`** *none* none (`crates/blaze-own/src/thin_arc.rs:115`): For every public constructor of `ThinArc`, `ptr` points to a live block allocated by `alloc` with `block_layout::<H, T, A>(len)`, with full-block provenance; its `HeaderPrefix`, `alloc`, `header`, and `len` trailing `T` values at `data_offset::<H, T, A>()` are initialized, and `strong` accounts for this handle (or is immortal).
-- **`blaze-own::thin_arc::ThinArc#2`** *none* none (`crates/blaze-own/src/thin_arc.rs:119`): For the private empty-string sentinel used exclusively by [`ThinStr`], `ptr` points to [`EMPTY_STR`] (`strong == u32::MAX`, `len == 0`) and only `HeaderPrefix` is ever read.
-- **`blaze-own::thin_vec::ThinVec#1`** *none* none (`crates/blaze-own/src/thin_vec.rs:85`): When `header().cap == 0`, `ptr` points to [`EMPTY_HEADER`] (`len == 0`) and nothing is allocated; [`EMPTY_HEADER`] is never mutated.
-- **`blaze-own::thin_vec::ThinVec#2`** *none* none (`crates/blaze-own/src/thin_vec.rs:87`): When `header().cap > 0`, `ptr` points to a mutable heap block allocated by `alloc` with `block_layout::<T>(cap)`, with full-block provenance; `len <= cap`, and the first `len` slots starting at `data_offset::<T>()` hold initialized `T` values.
-- **`blaze-own::vec::Drain#1`** *none* none (`crates/blaze-own/src/vec.rs:1244`): The vector's length is the range's start; slots `front..back` hold the values not yet given out, `tail_start..tail_start + tail_len` the values after the range, which the drop moves down to the length.
-- **`blaze-own::vec::IntoIter#1`** *none* none (`crates/blaze-own/src/vec.rs:1156`): Slots `front..back` of `buf` hold the values not yet given out.
+- **`blaze-own::thin_arc::ThinArc#1`** *tested* evidenced (`crates/blaze-own/src/thin_arc.rs:115`): For every public constructor of `ThinArc`, `ptr` points to a live block allocated by `alloc` with `block_layout::<H, T, A>(len)`, with full-block provenance; its `HeaderPrefix`, `alloc`, `header`, and `len` trailing `T` values at `data_offset::<H, T, A>()` are initialized, and `strong` accounts for this handle (or is immortal). Evidence: `tests::drop_counts_no_leaks_no_double_drops`.
+- **`blaze-own::thin_arc::ThinArc#2`** *tested* evidenced (`crates/blaze-own/src/thin_arc.rs:119`): For the private empty-string sentinel used exclusively by [`ThinStr`], `ptr` points to [`EMPTY_STR`] (`strong == u32::MAX`, `len == 0`) and only `HeaderPrefix` is ever read. Evidence: `tests::thin_str_roundtrip_eq_hash_and_empty_zero_alloc`.
+- **`blaze-own::thin_vec::ThinVec#1`** *tested* evidenced (`crates/blaze-own/src/thin_vec.rs:85`): When `header().cap == 0`, `ptr` points to [`EMPTY_HEADER`] (`len == 0`) and nothing is allocated; [`EMPTY_HEADER`] is never mutated. Evidence: `tests::empty_thin_vec_does_zero_allocations`.
+- **`blaze-own::thin_vec::ThinVec#2`** *tested* evidenced (`crates/blaze-own/src/thin_vec.rs:87`): When `header().cap > 0`, `ptr` points to a mutable heap block allocated by `alloc` with `block_layout::<T>(cap)`, with full-block provenance; `len <= cap`, and the first `len` slots starting at `data_offset::<T>()` hold initialized `T` values. Evidence: `tests::size_and_niche`.
+- **`blaze-own::vec::Drain#1`** *none* none (`crates/blaze-own/src/vec.rs:1250`): The vector's length is the range's start; slots `front..back` hold the values not yet given out, `tail_start..tail_start + tail_len` the values after the range, which the drop moves down to the length.
+- **`blaze-own::vec::IntoIter#1`** *none* none (`crates/blaze-own/src/vec.rs:1162`): Slots `front..back` of `buf` hold the values not yet given out.
 - **`blaze-own::vec::Vec#1`** *none* none (`crates/blaze-own/src/vec.rs:36`): The first `len` slots of `buf` hold values; `len <= buf.capacity()`.
 - **`blaze-shapes::hunts_find_the_hit#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from the fixture's theorem function hunts_find_the_hit holds of its model: a loop that returns, or breaks with, a field its match arm bound gives the Rust's values on the inputs it names. Evidence: Lean blaze_shapes.hunts_find_the_hit.spec.proof.
 - **`blaze-sqlite::CText#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:470`): `CText::bytes` ends in a NUL and holds no other. Upheld by `nul_terminated`, its one constructor.

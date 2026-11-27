@@ -47,15 +47,11 @@ the standard library is part of a compiler.
   `crates/blaze-pins`, the one Rust reader of `pins/`; [pins/README.md](../pins/README.md)). So `rustc -V`
   still says `1.101.0-nightly (16d1ffac1 2026-10-26)`.
 - **Where:** `~/.blaze/toolchains/nightly-2026-10-27-<host>`, the machine's: every `BLAZE_HOME` reads
-  this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain).
-  `BLAZE_TOOLCHAINS=<dir>` names another directory in place of `~/.blaze/toolchains`
-  (`toolchain::own::toolchains`), for a machine whose home is small, read-only or not there;
-  the daemon keeps the one it was started with. `~` is the user's home as blaze finds it
-  everywhere (`blaze_core::home::user`): `HOME` when it is set and not empty, else the
-  system's record of the user (`getpwuid_r` of the effective uid; on Windows `USERPROFILE`,
-  then the profile directory), so a systemd unit, a CI runner or cron with no `HOME` finds
-  the same copy a shell does. With neither, blaze stops, saying what it tried and naming
-  `BLAZE_TOOLCHAINS`. It is found
+  this one copy (`BLAZE_HOME` moves a daemon's settings and state, not the toolchain). `~` is the
+  user's home as blaze finds it everywhere (`blaze_core::home::user`): `HOME` when it is set and
+  not empty, else the system's record of the user (`getpwuid_r` of the effective uid; on Windows
+  `USERPROFILE`, then the profile directory), so a systemd unit, a CI runner or cron with no `HOME`
+  finds the same copy a shell does. With neither, blaze stops, saying what it tried. It is found
   with nothing run (`crates/blaze-cli/src/toolchain.rs`). rustup's directory is never
   read, not even when it has the same nightly: a toolchain found by its directory's name is
   trusted by name, whatever was installed there ([v2/plan/toolchain-c.md](v2/plan/design/toolchain-c.md),
@@ -145,9 +141,7 @@ of blaze is told where it is in `BLAZE_LIBRARY`, the first of:
 - `~/.blaze/library/<digest>/library`, which blaze makes once, beside the toolchain's
   download: copied from the checkout it was built in when that has the same library, else
   downloaded as the release's `library-<digest>.tar.xz` (6.0 MB, `harness/library.py
-  archive` writes it, the release workflow attaches it). `BLAZE_LIBRARY_FROM` names another
-  place to get it from (an address or a directory with that archive, or a library to copy),
-  taken over the checkout too. Whichever way it
+  archive` writes it, the release workflow attaches it). Whichever way it
   came it is checked against the digest file by file. A checkout's own
   `library/` is never read in place: what the store keeps of a crate whose data names the
   checkout being built is that checkout's alone, and the standard library's is everyone's.

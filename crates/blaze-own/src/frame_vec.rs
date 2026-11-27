@@ -190,11 +190,12 @@ const fn min_non_zero_cap<T>() -> usize {
 /// # Invariants
 ///
 /// - For zero-sized `T`: `cap == I::MAX`, `ptr` is dangling and aligned, and nothing is ever
-///   allocated.
+///   allocated. Evidence: [`tests::frame_vec_zst_and_small_index_overflow`].
 /// - For non-ZST `T` with `cap == 0`: `len == 0`, `ptr` is dangling and aligned, and nothing is
-///   allocated.
+///   allocated. Evidence: [`tests::layout_sizes_and_niches`].
 /// - Otherwise `ptr` points to a block allocated by the matching branded allocator/arena for
 ///   `Layout::array::<T>(cap.to_usize())`, `len <= cap`, and slots `0..len` hold initialized `T`s.
+///   Evidence: [`tests::unmanaged_vec_every_failure_preserves_contents_and_zero_leaks`].
 struct RawParts<T, I: LenIdx> {
     ptr: I::Ptr<T>,
     len: I,

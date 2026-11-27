@@ -12,8 +12,8 @@ use core::slice;
 ///
 /// # Invariants
 ///
-/// - Every entry `(start, end)` satisfies `start <= end`.
-/// - Every adjacent pair `(s0, e0), (s1, e1)` satisfies `e0 < s1` (strictly ascending and disjoint).
+/// - Every entry `(start, end)` satisfies `start <= end`. Evidence: [`tests::try_from_sorted_disjoint_validates_invariants`].
+/// - Every adjacent pair `(s0, e0), (s1, e1)` satisfies `e0 < s1` (strictly ascending and disjoint). Evidence: [`tests::try_from_sorted_disjoint_validates_invariants`].
 ///
 /// Zero allocation, `#![no_std]`, zero `unsafe`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

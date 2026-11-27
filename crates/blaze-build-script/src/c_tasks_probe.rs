@@ -45,7 +45,7 @@ const ID_DOMAIN: &str = "blaze-build-script clang answers table 1";
 pub const PROBE_KEY_DOMAIN: &str = "blaze-build-script c probe 1";
 /// Domain for [`canonical_reply_digest`] (matches `spawn_route::reply_digest` so `fact_now` and
 /// `spawn_probe` agree).
-const REPLY_DOMAIN: &str = "blaze build-script spawn reply 1";
+pub const REPLY_DOMAIN: &str = "blaze build-script spawn reply 1";
 /// Magic bytes of an encoded binary probe cache record (`bzcp` v1).
 const ANSWER_MAGIC: [u8; 4] = *b"bzcp";
 const ANSWER_VERSION: u32 = 1;

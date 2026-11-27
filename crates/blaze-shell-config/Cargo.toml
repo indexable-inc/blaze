@@ -13,6 +13,6 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-blaze-own = { path = "../blaze-own" }
-blaze-toml = { path = "../blaze-toml" }
-blaze-data = { path = "../blaze-data" }
+blaze-own.workspace = true
+blaze-toml.workspace = true
+blaze-data.workspace = true

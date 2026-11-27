@@ -31,8 +31,8 @@ fn offset_of(len: usize, additional: usize) -> Result<u32, AllocFailure> {
 ///
 /// # Invariants
 ///
-/// - `offsets` starts with `0` (`offsets.len() == self.len() + 1`).
-/// - `offsets` is monotonically non-decreasing, and its last element equals `values.len()`.
+/// - `offsets` starts with `0` (`offsets.len() == self.len() + 1`). Evidence: [`tests::csr_empty_push_slice_row_iter_and_clear`].
+/// - `offsets` is monotonically non-decreasing, and its last element equals `values.len()`. Evidence: [`tests::csr_push_row_rolls_back_and_drops_on_iterator_panic`].
 pub struct Csr<T, A: Allocator> {
     offsets: Vec<u32, A>,
     values: Vec<T, A>,
