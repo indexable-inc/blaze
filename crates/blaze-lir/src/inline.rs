@@ -561,6 +561,18 @@ struct ResidualEh {
     has_resume: bool,
 }
 
+/// Whether the `Op::Call` / `Op::CallIndirect` instruction at `at` in `view` invokes a C-variadic
+/// signature (`SigRec::VARIADIC`). In Rust/blaze-build semantics a `"C"` variadic callee does not
+/// unwind (`blaze-build/src/walk/c_variadic.rs`) and `blaze-emit/src/pass/variadic.rs` refuses
+/// `Op::Invoke` with stacked variadic arguments; the inliner must never promote it to `Op::Invoke`.
+fn call_is_variadic(view: View<'_>, at: usize) -> bool {
+    let Some(&extra_start) = view.data.get(at) else { return false };
+    let Ok(start) = usize::try_from(extra_start) else { return false };
+    let Some(&sig_word) = view.extra.get(start.saturating_add(1)) else { return false };
+    let Ok(sig_idx) = usize::try_from(sig_word) else { return false };
+    view.sigs.get(sig_idx).is_some_and(|s| (s.bits & SigRec::VARIADIC) != 0)
+}
+
 /// Computes [`ResidualEh`] for node `n` bottom-up from its already-computed `child_eh` entries.
 fn residual_eh_with<A: Allocator + Copy>(
     view: View<'_>,
@@ -593,7 +605,7 @@ fn residual_eh_with<A: Allocator + Copy>(
                         .and_then(|b| usize::try_from(b).ok())
                         .and_then(|bi| cleanup.get(bi).copied())
                         .unwrap_or(false);
-                    if !in_clean {
+                    if !in_clean && !call_is_variadic(view, at) {
                         out.may_unwind = true;
                     }
                 }
@@ -619,7 +631,7 @@ fn residual_eh_with<A: Allocator + Copy>(
                     .and_then(|b| usize::try_from(b).ok())
                     .and_then(|bi| cleanup.get(bi).copied())
                     .unwrap_or(false);
-                if !in_clean {
+                if !in_clean && !call_is_variadic(view, at) {
                     out.may_unwind = true;
                 }
             }
@@ -2846,6 +2858,7 @@ fn emit<A: Allocator + Copy>(
                 .ok()
                 .and_then(|fi| e.frame_unwind.get(fi).copied().flatten())
             && !e.is_cleanup(cursor.frame, cursor.block)
+            && !call_is_variadic(body, at)
         {
             e.copy_as_invoke(cursor.frame, cursor.block, at, ut)?;
         } else {
@@ -3672,5 +3685,70 @@ mod tests {
         assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Project).count(), 0);
         assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Call).count(), 0);
         assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Invoke).count(), 1);
+    }
+
+    #[test]
+    fn inlining_variadic_c_call_into_invoke_keeps_plain_call() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        // Callee wraps a C-variadic call (like `fcntl(fd, cmd, arg)`).
+        let callee = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32)], &[Param::of(Ty::I32)]);
+            let var_sig = b.sig(Conv::C, Variadic::Yes, &[Param::of(Ty::I32), Param::of(Ty::I32)], &[Param::of(Ty::I32)]);
+            b.set_signature(sig);
+            b.set_attrs(FnAttrs::default().with_inline(Inline::Hint));
+            let ext_fcntl = b.reference(RefKind::Func, 99);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let fd = b.param(Ty::I32);
+            let cmd = b.iconst(Ty::I32, 2);
+            let arg = b.iconst(Ty::I32, 1);
+            let r = b.call(Flags::NONE, ext_fcntl, var_sig, &[fd, cmd, arg]);
+            b.ret(&[r]);
+            b.finish_checked().expect("variadic wrapper callee builds")
+        };
+
+        // Caller calls `callee` via `Op::Invoke` with a cleanup landing pad.
+        let caller = {
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I32)], &[Param::of(Ty::I32)]);
+            b.set_signature(sig);
+            let callee_ref = b.reference(RefKind::Func, 0);
+            let entry = b.create_block(BlockKind::Normal);
+            let norm = b.create_block(BlockKind::Normal);
+            let pad = b.create_block(BlockKind::Cleanup);
+            b.begin(entry);
+            let fd = b.param(Ty::I32);
+            let r = b.invoke(Flags::NONE, callee_ref, sig, &[fd], norm, pad);
+            b.begin(norm);
+            b.ret(&[r]);
+            b.begin(pad);
+            let exc = b.param(Ty::PTR);
+            b.resume(exc);
+            b.finish_checked().expect("invoke caller builds")
+        };
+
+        let mut bodies = OwnVec::new_in(alloc);
+        bodies.push((body_id(1), caller));
+        bodies.push((body_id(2), callee));
+        let mut links = OwnVec::new_in(alloc);
+        links.push((body_id(1), RefId(0), body_id(2)));
+        let bank = LocalBank { bodies, links };
+
+        let guided = inline_guided(
+            bank.bodies[0].1.view(),
+            body_id(1),
+            &bank,
+            &NoWeights,
+            InlinePolicy::default(),
+            alloc,
+        )
+        .expect("variadic wrapper inlines into invoke caller");
+        let out = guided.func.view();
+        verify(out).expect("inlined variadic call verifies");
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Call).count(), 1, "variadic C call must stay Op::Call");
+        assert_eq!((0..out.len()).filter(|&i| out.op(i) == Op::Invoke).count(), 0, "variadic C call must never be promoted to Op::Invoke");
     }
 }
