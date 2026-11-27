@@ -329,6 +329,35 @@ impl<'a> BoundRef<'a> {
         let name = self.text.get(s..e)?;
         Some(Declared { tabled, name })
     }
+
+    /// Feeds every found soft-float routine's symbol, `ItemKey`, and instance name into `hasher`
+    /// so content-addressed whole-program LTO SCC keys invalidate if soft-float bindings change
+    /// (Rule 21).
+    pub fn hash_into(&self, hasher: &mut blaze_ids::Hasher) {
+        for r in SoftFloat::ALL {
+            match self.symbols.get(r as usize).copied().flatten() {
+                Some(sym) => {
+                    hasher.update(&[1]);
+                    hasher.update(&sym.0);
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+            match self.declared(r) {
+                Some(decl) => {
+                    hasher.update(&[1]);
+                    hasher.update(&decl.tabled.0.to_le_bytes());
+                    let len = u32::try_from(decl.name.len()).unwrap_or(u32::MAX);
+                    hasher.update(&len.to_le_bytes());
+                    hasher.update(decl.name);
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            }
+        }
+    }
 }
 
 /// The emitter's routine table for one instance, and how a called routine is declared.

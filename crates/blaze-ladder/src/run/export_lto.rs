@@ -52,6 +52,13 @@ use crate::front2::builtins_shim::Routines;
 use crate::run::RunError;
 use crate::symbols::{static_symbol, tls_symbol};
 
+#[path = "export_lto_all.rs"]
+mod all_crates;
+pub use all_crates::{
+    CachedLtoStatus, CachedLtoView, ExportAllLtoOut, ExportLirBuilder, LtoRowResult,
+    MakerLirBuilder, decode_lto_scc_header, extract_direct_calls, optimize_export_all_par_cached,
+};
+
 pub use blaze_lir::lto::LtoRunner as ExportLtoRunner;
 pub use blaze_lir::simplify::SimplifyError as ExportLtoSimplifyError;
 pub use blaze_tier::Machine as ExportLtoMachine;
@@ -118,7 +125,7 @@ impl ExportLtoOpts<'static> {
             max_bodies: 12288,
             max_callee_insts: 512,
             max_always_inline_insts: 1024,
-            max_caller_insts: 8192,
+            max_caller_insts: 32_768,
             policy: InlinePolicy {
                 cost_threshold: 120,
                 max_callee_insts: 256,
@@ -277,8 +284,21 @@ pub trait ExportLtoCache {
     fn get(&self, _key: [u8; 32], _alloc: SharedAlloc<'static>) -> Option<Vec<u8, SharedAlloc<'static>>> {
         None
     }
+    /// Zero-copy cache probe callback: returns `Some(true)` if `key` hit and `on_hit` ran,
+    /// `Some(false)` if `key` missed, or `None` if zero-copy borrows are unavailable (caller falls
+    /// back to [`Self::get`]).
+    fn get_slice_with(&self, _key: [u8; 32], _on_hit: &mut dyn FnMut(&[u8])) -> Option<bool> {
+        None
+    }
     /// Persists an LTO cache payload under its 32-byte key.
     fn put(&self, _key: [u8; 32], _bytes: &[u8]) {}
+    /// Persists an LTO cache payload tagged by crate class (`is_toolchain` routes toolchain LTO
+    /// artifacts into the shared toolchain GC root so all workspaces reuse them).
+    fn put_with_class(&self, _is_toolchain: bool, key: [u8; 32], bytes: &[u8]) {
+        self.put(key, bytes);
+    }
+    /// Records a cache-hit key under its crate class's GC root (`is_toolchain`).
+    fn touch_with_class(&self, _is_toolchain: bool, _key: [u8; 32]) {}
     /// Monotonic timestamp in nanoseconds for sub-phase timings (`0` when timing is disabled).
     fn now_ns(&self) -> u64 {
         0
@@ -463,6 +483,35 @@ impl From<ParLtoErr> for ExportLtoError {
 }
 
 type DeclaredRow = (ItemKey, Vec<u8, SharedAlloc<'static>>);
+
+/// Lowers hardware-exact IEEE-754 libm calls in `built` in place for `machine` and verifies the
+/// rewritten LIR if changed.
+pub fn prepare_built_lir_in_place<A: core::alloc::Allocator>(
+    built: &mut BuiltLir<A>,
+    machine: Machine,
+    scratch: Alloc<'_>,
+) -> Result<bool, VerifyError> {
+    let lowered = lower_ieee_libm_calls(built, machine, scratch);
+    if lowered {
+        verify(built.func.view())?;
+    }
+    Ok(lowered)
+}
+
+/// Lowers hardware-exact IEEE-754 libm calls in `built`, verifies if rewritten, and encodes
+/// `BLZLIR02` bytes for `HomeLtoCache` (shared by walk-time capture and export LTO misses).
+pub(crate) fn prepare_and_encode_built_lir(
+    built: &mut BuiltLir<SharedAlloc<'static>>,
+    declared: &[DeclaredRow],
+    machine: Machine,
+    scratch: Alloc<'_>,
+    shared: SharedAlloc<'static>,
+) -> Option<Vec<u8, SharedAlloc<'static>>> {
+    if prepare_built_lir_in_place(built, machine, scratch).is_err() {
+        return None;
+    }
+    encode_built_lir(built, declared, shared)
+}
 
 fn encode_built_lir(
     built: &BuiltLir<SharedAlloc<'static>>,
