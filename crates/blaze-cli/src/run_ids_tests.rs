@@ -872,7 +872,7 @@ fn unit(byte: u8, root: Name) -> UnitRoot {
 /// The view of the unit `byte` (blaze-drive view.rs `ViewKey::of_member`: its own root, the
 /// package's name, the test flag of `LIB_TEST`).
 fn unit_view(byte: u8) -> ViewKey {
-    ViewKey::of_member(&[byte], b"pkg", byte == LIB_TEST)
+    ViewKey::of_member(blaze_drive::view::MemberView::simple(&[byte], b"pkg", byte == LIB_TEST))
 }
 
 /// `check`'s name at the view of the unit `byte`.
@@ -1309,4 +1309,175 @@ fn a_constructor_is_keyed_and_gated_by_its_adts_head_task() {
 
     let bare = ids_of(&without.bodies, &without.edges, Checked::Clean);
     assert!(matches!(bare.runnable(ctor), Err(NotRunnable::NoRow(_))), "control: no `Signature` part, no row (`hold nothing`)");
+}
+
+/// Regression test for D191 `ViewOfAnotherUnit` when a workspace library is compiled on BOTH
+/// `Side::Target` and `Side::Macro` (e.g. `blaze-int` reached by `blaze-memo-macros`) as well as
+/// `test = true`, plus the residual collision path where two member units share every `MemberView`
+/// field (e.g. a lib and an example on the same root/name/package).
+///
+/// CONTROL (rule 23): giving the Target and Macro units the same `ViewKey` (the pre-fix bug where
+/// `ViewKey::of_member` hashed only `(root, name, test)`) reproduces `RunIdsError::ViewOfAnotherUnit`.
+#[test]
+fn target_and_macro_side_member_units_get_distinct_views_and_walk_without_clash() {
+    use blaze_drive::view::{Full, ViewPlan as _};
+    use blaze_world::Side;
+    use blaze_world::crate_list::{CrateList, HEADER_LEN, NONE, ROW, TEST, VERSION};
+
+    // Minimal valid `BZCL` v8 encoder for member rows with no deps/packs/scripts, verified by
+    // `CrateList::open` below.
+    struct RowSpec<'a> {
+        key_byte: u8,
+        name: &'a str,
+        pkg: &'a str,
+        dir: &'a str,
+        root: &'a str,
+        side: Side,
+        is_test: bool,
+    }
+    let encode_list = |specs: &[RowSpec<'_>]| -> std::vec::Vec<u8> {
+        let mut heap = std::vec::Vec::new();
+        let mut put_str = |s: &str| -> [u8; 8] {
+            let off = u32::try_from(heap.len()).unwrap();
+            let len = u32::try_from(s.len()).unwrap();
+            heap.extend_from_slice(s.as_bytes());
+            let mut out = [0u8; 8];
+            out[..4].copy_from_slice(&off.to_le_bytes());
+            out[4..].copy_from_slice(&len.to_le_bytes());
+            out
+        };
+        let mut rows = std::vec::Vec::with_capacity(specs.len() * ROW);
+        for spec in specs {
+            let start = rows.len();
+            rows.extend_from_slice(&[spec.key_byte; 32]); // key
+            rows.extend_from_slice(&put_str(spec.name)); // name
+            rows.extend_from_slice(&put_str(spec.root)); // root
+            rows.extend_from_slice(&put_str("/0/")); // shown_from
+            rows.extend_from_slice(&0u32.to_le_bytes()); // deps start
+            rows.extend_from_slice(&0u32.to_le_bytes()); // deps count
+            rows.push(match spec.side {
+                Side::Target => 0,
+                Side::Macro => 1,
+            });
+            // MEMBER = 4, TEST = 16
+            rows.push(4u8 | if spec.is_test { TEST } else { 0 });
+            rows.extend_from_slice(&[0u8; 34]); // no script
+            // EnvFacts at offset 100
+            rows.extend_from_slice(&put_str(spec.name)); // crate_name
+            rows.extend_from_slice(&put_str(spec.pkg)); // package
+            rows.extend_from_slice(&put_str("0.1.0")); // version
+            rows.extend_from_slice(&put_str("")); // bin
+            rows.extend_from_slice(&put_str(spec.dir)); // member dir
+            // ENV_PACKAGE (1) | ENV_MEMBER (16) = 17
+            rows.extend_from_slice(&[17u8, 0, 0, 0]);
+            for _ in 0..8 {
+                rows.extend_from_slice(&put_str("")); // meta
+            }
+            rows.extend_from_slice(&put_str("")); // bin_exes
+            assert_eq!(rows.len() - start, ROW);
+        }
+        let mut by_key: std::vec::Vec<usize> = (0..specs.len()).collect();
+        by_key.sort_unstable_by_key(|&i| [specs[i].key_byte; 32]);
+        let mut out = std::vec::Vec::with_capacity(HEADER_LEN + rows.len() + specs.len() * 4 + heap.len());
+        out.extend_from_slice(b"BZCL");
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&u32::try_from(specs.len()).unwrap().to_le_bytes()); // n
+        out.extend_from_slice(&0u32.to_le_bytes()); // d
+        out.extend_from_slice(&u32::try_from(heap.len()).unwrap().to_le_bytes()); // heap
+        for _ in 0..4 {
+            out.extend_from_slice(&NONE.to_le_bytes()); // sysroot
+        }
+        for _ in 0..6 {
+            out.extend_from_slice(&0u32.to_le_bytes()); // t, c, m, u, q, p
+        }
+        assert_eq!(out.len(), HEADER_LEN);
+        out.extend_from_slice(&rows);
+        for idx in by_key {
+            out.extend_from_slice(&u32::try_from(idx).unwrap().to_le_bytes());
+        }
+        out.extend_from_slice(&heap);
+        out
+    };
+
+    let io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+    let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("a root context");
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+
+    let encoded = encode_list(&[
+        RowSpec { key_byte: 0x11, name: "blaze_int", pkg: "blaze-int", dir: "crates/blaze-int", root: "/0/crates/blaze-int/src/lib.rs", side: Side::Target, is_test: false },
+        RowSpec { key_byte: 0x22, name: "blaze_int", pkg: "blaze-int", dir: "crates/blaze-int", root: "/0/crates/blaze-int/src/lib.rs", side: Side::Macro, is_test: false },
+        RowSpec { key_byte: 0x33, name: "blaze_int", pkg: "blaze-int", dir: "crates/blaze-int", root: "/0/crates/blaze-int/src/lib.rs", side: Side::Target, is_test: true },
+        // Residual collision: two distinct crates sharing every MemberView field (e.g. Lib + Example).
+        RowSpec { key_byte: 0x44, name: "dup", pkg: "dup", dir: "crates/dup", root: "/0/crates/dup/src/lib.rs", side: Side::Target, is_test: false },
+        RowSpec { key_byte: 0x55, name: "dup", pkg: "dup", dir: "crates/dup", root: "/0/crates/dup/src/lib.rs", side: Side::Target, is_test: false },
+    ]);
+    let list = CrateList::open(&encoded).unwrap_or_else(|e| panic!("{e}"));
+
+    // 1. All five member units receive strictly distinct ViewKeys via `unit_roots` -> `unit_view`.
+    let roots = unit_roots(&list, alloc).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(roots.len(), 5);
+    let [u_target, u_macro, u_test, u_dup0, u_dup1] = [roots[0], roots[1], roots[2], roots[3], roots[4]];
+    assert_ne!(u_target.view, u_macro.view, "Target and Macro side units sharing (root, name, test) must have distinct ViewKeys");
+    assert_ne!(u_target.view, u_test.view, "Target and Test units must have distinct ViewKeys");
+    assert_ne!(u_macro.view, u_test.view, "Macro and Test units must have distinct ViewKeys");
+    assert_ne!(u_dup0.view, u_dup1.view, "residual MemberView collision must be disambiguated by crate key");
+
+    // 2. Plan rows under `Full` for `blaze-int`'s three units and verify `workspace_of` resolves all three.
+    let rust = blaze_drive::Locate::File { edition: 2 };
+    let source = blaze_drive::Locate::Source(ContentId([0x70; 32]));
+    let pkg = Name::manifest(b"crates/blaze-int/Cargo.toml");
+    let lib_rs = Name::file(b"crates/blaze-int/src/lib.rs");
+    let body = Name::new(Kind::BodyCheck, ContentId([0x99; 32]));
+    let body_text = ContentId([0xaa; 32]);
+    let views = [u_target.view, u_macro.view, u_test.view];
+    let row_target = at_view(body, Full::view_of(&views, 0));
+    let row_macro = at_view(body, Full::view_of(&views, 1));
+    let row_test = at_view(body, Full::view_of(&views, 2));
+    assert_eq!(row_target, body, "rank 0 is the base row");
+    assert_ne!(row_macro, row_target);
+    assert_ne!(row_test, row_target);
+    assert_ne!(row_macro, row_test);
+
+    let mut answer = Held(std::vec![
+        (Name::units(), std::vec![part(pkg, source)], None),
+        (pkg, std::vec![part(lib_rs, rust)], None),
+        (lib_rs, std::vec![part(body, source)], None),
+        (row_target, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x11, 1)])),
+        (row_macro, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x22, 1)])),
+        (row_test, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x33, 1)])),
+    ]);
+    let tool = tools()[Kind::BodyCheck.index()];
+    let active = [u_target, u_macro, u_test];
+    let walk = workspace_of(&cx, &mut answer, tool, &active, None, alloc).unwrap_or_else(|e| panic!("expected clean walk: {e}"));
+    let rows = rows_of(&walk);
+    assert_eq!(rows.len(), 3, "every holder (Target, Macro, Test) resolves its own body row: {rows:?}");
+    assert_eq!(rows.iter().find(|r| r.item == item(0x11, 1)).map(|r| r.check), Some(row_target));
+    assert_eq!(rows.iter().find(|r| r.item == item(0x22, 1)).map(|r| r.check), Some(row_macro));
+    assert_eq!(rows.iter().find(|r| r.item == item(0x33, 1)).map(|r| r.check), Some(row_test));
+
+    // 3. PLANTED CONTROL (rule 23): collapsing Target and Macro onto the same ViewKey (pre-fix bug)
+    //    causes `workspace_of` to trip `RunIdsError::ViewOfAnotherUnit` when querying Target's view.
+    let colliding_macro = UnitRoot { view: u_target.view, ..u_macro };
+    let bad_views = [u_target.view, colliding_macro.view, u_test.view];
+    let bad_macro_row = at_view(body, Full::view_of(&bad_views, 1));
+    let mut bad_answer = Held(std::vec![
+        (Name::units(), std::vec![part(pkg, source)], None),
+        (pkg, std::vec![part(lib_rs, rust)], None),
+        (lib_rs, std::vec![part(body, source)], None),
+        (body, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x11, 1)])),
+        (bad_macro_row, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x22, 1)])),
+        (row_test, std::vec::Vec::new(), payload(lib_rs, body_text, &[item(0x33, 1)])),
+    ]);
+    let bad_active = [u_target, colliding_macro, u_test];
+    match workspace_of(&cx, &mut bad_answer, tool, &bad_active, None, alloc) {
+        Err(RunIdsError::ViewOfAnotherUnit { check, unit, covered }) => {
+            assert_eq!(check, bad_macro_row);
+            assert_eq!(unit, u_target.prefix);
+            assert_eq!(covered, u_macro.prefix);
+        }
+        Err(other) => panic!("planted control: expected ViewOfAnotherUnit, got: {other}"),
+        Ok(_) => panic!("planted control: colliding Target/Macro views unexpectedly passed"),
+    }
 }

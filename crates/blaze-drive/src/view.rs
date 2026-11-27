@@ -22,16 +22,54 @@
 //!
 //! The one home of a view (rule 30): nothing else spells one.
 
-use blaze_id::ContentId;
+use blaze_id::{ContentId, CrateItemKey};
 use blaze_ids::Hasher;
 
 use crate::key::Name;
 
 /// The domain of a member unit's view ([`ViewKey::of_member`]).
-const MEMBER_VIEW_DOMAIN: &str = "blaze-drive member view 2";
+/// 3: folds the unit's side (`macro_side`), target kind flags (`proc_macro`, `test_or_bench`),
+/// binary target name (`bin`), and package name (`package`) so two member units sharing
+/// `(root, name, test)` — such as a library compiled for both `Side::Target` and `Side::Macro`
+/// in a member proc-macro's dependency closure — never collide on one view key (D191, rule 21).
+const MEMBER_VIEW_DOMAIN: &str = "blaze-drive member view 3";
+/// The domain for disambiguating two member units whose [`MemberView`] fields still match
+/// ([`ViewKey::disambiguate`], e.g. a lib and an example sharing one file and crate name).
+const MEMBER_VIEW_DISAMBIGUATE_DOMAIN: &str = "blaze-drive member view disambiguate 1";
 /// The domain of a name at a view ([`at_view`]): not the view's own, so a view's key and a name
 /// at it are never one digest.
 const AT_VIEW_DOMAIN: &str = "blaze-drive name at view 1";
+
+/// Identity of a workspace member unit for [`ViewKey::of_member`]: every fact that tells two
+/// member units apart without naming their dependencies, so adding or bumping a dependency edge
+/// never renames any unit's view rows (rule 77).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MemberView<'a> {
+    /// The crate list's root path in the checkout tree (`/0/...`, never a machine path: rule 25).
+    pub root: &'a [u8],
+    /// The target's crate name.
+    pub name: &'a [u8],
+    /// Whether `cfg(test)` is set on this unit.
+    pub test: bool,
+    /// Whether this unit is built for the macro side (`wasm32-wasip1`, `Side::Macro`).
+    pub macro_side: bool,
+    /// Whether this unit is a proc-macro crate (`proc-macro = true`).
+    pub proc_macro: bool,
+    /// Whether this unit is an integration test or benchmark target.
+    pub test_or_bench: bool,
+    /// The binary target name for `Bin` / `Test { bin: Some(..) }` units, `None` otherwise.
+    pub bin: Option<&'a [u8]>,
+    /// The Cargo package name (`b""` if none).
+    pub package: &'a [u8],
+}
+
+impl<'a> MemberView<'a> {
+    /// Minimal target-side library/test member view (for tests and fixtures where only
+    /// `(root, name, test)` vary).
+    pub const fn simple(root: &'a [u8], name: &'a [u8], test: bool) -> MemberView<'a> {
+        MemberView { root, name, test, macro_side: false, proc_macro: false, test_or_bench: false, bin: None, package: b"" }
+    }
+}
 
 /// The unit a row was checked under, where that unit is not the body's base holder: WHAT THE
 /// UNIT IS, never what it depends on (D152 point 1's (crate, `test`)). One home: nothing else
@@ -40,18 +78,34 @@ const AT_VIEW_DOMAIN: &str = "blaze-drive name at view 1";
 pub struct ViewKey(pub ContentId);
 
 impl ViewKey {
-    /// The view of the member unit whose root is `root` (the crate list's root path, in the
-    /// checkout's tree: `/0/a/src/lib.rs`, never a machine path: rule 25), whose crate is named
-    /// `name` (the target's name: the library's, a bin's, an integration test's) and which is a
-    /// test build or not. Not the unit's crate key: that key held every dependency's key, so a
-    /// dependency bumped or an edge added renamed every view row and moved every shared body's
-    /// row key (`source_at_views`), entering bodies that read nothing of it (rule 77). Since D158
-    /// the crate key is the identity alone (blaze-world list.rs `unit_crate_key`); the view stays
-    /// by (root, name, test), which a source correction or a member's move does not rename.
-    /// Two member units never share (root, name, test): that triple is what tells them apart.
-    pub fn of_member(root: &[u8], name: &[u8], test: bool) -> ViewKey {
+    /// The view of a member unit from its [`MemberView`] identity: its root path in the checkout
+    /// tree (`/0/a/src/lib.rs`, never a machine path: rule 25), crate name, `test` flag, build
+    /// side (`macro_side`), target-kind flags (`proc_macro`, `test_or_bench`), binary name, and
+    /// package name. Not the unit's crate key: that key holds every dependency's key, so a
+    /// dependency bumped or an edge added would rename every view row and move every shared body's
+    /// row key (`source_at_views`), entering bodies that read nothing of it (rule 77).
+    pub fn of_member(member: MemberView<'_>) -> ViewKey {
         let mut h = Hasher::new(MEMBER_VIEW_DOMAIN);
-        h.update(&[u8::from(test)]).part(root).part(name);
+        let flags = u8::from(member.test)
+            | (u8::from(member.macro_side) << 1)
+            | (u8::from(member.proc_macro) << 2)
+            | (u8::from(member.test_or_bench) << 3)
+            | (u8::from(member.bin.is_some()) << 4);
+        h.update(&[flags])
+            .part(member.root)
+            .part(member.name)
+            .part(member.bin.unwrap_or(b""))
+            .part(member.package);
+        ViewKey(h.finish())
+    }
+
+    /// Disambiguates `base` with `crate_key` when two distinct member units in one `CrateList`
+    /// share every [`MemberView`] field (e.g., an example and a library pointing at the same file
+    /// and crate name in one package). Because `CrateList::open` enforces strictly distinct crate
+    /// keys across all rows, this guarantees every member unit gets a unique [`ViewKey`].
+    pub fn disambiguate(base: ViewKey, crate_key: CrateItemKey) -> ViewKey {
+        let mut h = Hasher::new(MEMBER_VIEW_DISAMBIGUATE_DOMAIN);
+        h.id(&base.0).id(&crate_key.0);
         ViewKey(h.finish())
     }
 }
