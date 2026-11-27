@@ -97,22 +97,11 @@ pub(crate) fn check_adt_capabilities_in<'a, W: World>(
             continue;
         };
         for field in fields {
+            visited.truncate(1);
             path_buf.clear();
             path_buf.push(field.name);
             let mut hit: Option<Hit> = None;
-            walk_pty(
-                reads,
-                def.types,
-                field.ty,
-                None,
-                0,
-                false,
-                None,
-                &mut visited,
-                &mut path_buf,
-                &mut hit,
-                alloc,
-            )?;
+            walk_pty(reads, def.types, field.ty, &mut visited, &mut path_buf, &mut hit, alloc)?;
             if let Some(hit) = hit {
                 let mut saved_path: Vec<Name, Alloc<'a>> = Vec::with_capacity_in(path_buf.len(), alloc);
                 saved_path.extend_from_slice(path_buf.as_slice());
@@ -141,149 +130,189 @@ struct Hit {
 /// Active substitution environment when descending into a generic ADT `Foo<A, B>` whose field types
 /// reference `PNode::Param(i)` in `owner_types`: maps parameter `i` back to `(caller_types, args[i])`.
 #[derive(Clone, Copy)]
-struct Subst<'t> {
+struct SubstNode<'t> {
     caller_types: PTys<'t>,
     args: &'t [PTy],
-    parent: Option<&'t Subst<'t>>,
+    parent: Option<usize>,
 }
 
-#[expect(clippy::too_many_arguments, reason = "explicit sans-IO traversal state without ambient allocators")]
+enum WalkStep<'t> {
+    Visit {
+        types: PTys<'t>,
+        ty: PTy,
+        subst: Option<usize>,
+        depth: usize,
+        borrowed: bool,
+        via_adt: Option<ItemKey>,
+    },
+    PushField(Name),
+    PopField,
+    PopVisited,
+}
+
 fn walk_pty<'a, 't, W: World>(
-    reads: &mut Reads<'_, 'a, W>,
-    types: PTys<'t>,
-    ty: PTy,
-    subst: Option<&Subst<'t>>,
-    depth: usize,
-    borrowed: bool,
-    via_adt: Option<ItemKey>,
+    reads: &mut Reads<'t, 'a, W>,
+    root_types: PTys<'t>,
+    root_ty: PTy,
     visited: &mut Vec<ItemKey, Alloc<'a>>,
     path_buf: &mut Vec<Name, Alloc<'a>>,
     hit: &mut Option<Hit>,
     alloc: Alloc<'a>,
 ) -> Result<(), Stop> {
-    if hit.is_some() || depth >= MAX_WALK_DEPTH {
-        return Ok(());
-    }
-    let Ok(node) = types.node(ty) else {
-        return Ok(());
-    };
-    match node {
-        PNode::Param(ix) => {
-            if let Some(s) = subst
-                && let Some(&arg_ty) = s.args.get(ix as usize)
-            {
-                walk_pty(
-                    reads,
-                    s.caller_types,
-                    arg_ty,
-                    s.parent,
-                    depth + 1,
-                    borrowed,
-                    via_adt,
-                    visited,
-                    path_buf,
-                    hit,
-                    alloc,
-                )?;
+    let mut substs: Vec<SubstNode<'t>, Alloc<'a>> = Vec::new_in(alloc);
+    let mut work: Vec<WalkStep<'t>, Alloc<'a>> = Vec::new_in(alloc);
+    work.push(WalkStep::Visit {
+        types: root_types,
+        ty: root_ty,
+        subst: None,
+        depth: 0,
+        borrowed: false,
+        via_adt: None,
+    });
+
+    while let Some(step) = work.pop() {
+        match step {
+            WalkStep::PushField(name) => path_buf.push(name),
+            WalkStep::PopField => {
+                let _ = path_buf.pop();
             }
-        }
-        PNode::Ref(_, inner) | PNode::Ptr(_, inner) => {
-            walk_pty(reads, types, inner, subst, depth + 1, true, via_adt, visited, path_buf, hit, alloc)?;
-        }
-        PNode::Array(elem, _) | PNode::Slice(elem) | PNode::Pat(elem, _) => {
-            walk_pty(reads, types, elem, subst, depth + 1, borrowed, via_adt, visited, path_buf, hit, alloc)?;
-        }
-        PNode::Tuple(list) | PNode::Record(_, list) | PNode::Union(list) => {
-            if let Ok(elems) = types.list(list) {
-                for &elem in elems {
-                    walk_pty(reads, types, elem, subst, depth + 1, borrowed, via_adt, visited, path_buf, hit, alloc)?;
-                    if hit.is_some() {
-                        return Ok(());
-                    }
+            WalkStep::PopVisited => {
+                let _ = visited.pop();
+            }
+            WalkStep::Visit { types, ty, subst, depth, borrowed, via_adt } => {
+                if hit.is_some() || depth >= MAX_WALK_DEPTH {
+                    continue;
                 }
-            }
-        }
-        PNode::Adt(inner_adt, args_list) => {
-            let inner_attrs = reads.attrs(inner_adt)?;
-            if inner_attrs.is_capability() {
-                *hit = Some(Hit { capability: inner_adt, via_adt, borrowed });
-                return Ok(());
-            }
-            let arg_slice = types.list(args_list).ok().unwrap_or(&[]);
-            // 1. Inspect inner ADT's fields with generic arguments substituted (so `Wrap<Cap>`
-            //    reports the full nested field path `["w", "x"]` before falling back to arg scan).
-            let next_via = via_adt.or(Some(inner_adt));
-            if !visited.iter().any(|&k| k == inner_adt)
-                && let Some(inner_def) = reads.adt(inner_adt)?
-            {
-                visited.push(inner_adt);
-                let next_subst = Subst { caller_types: types, args: arg_slice, parent: subst };
-                'variants: for variant in inner_def.variants {
-                    let Some(fields) = inner_def.fields.get(variant.fields.range()) else {
-                        continue;
-                    };
-                    for field in fields {
-                        let mark = path_buf.len();
-                        path_buf.push(field.name);
-                        walk_pty(
-                            reads,
-                            inner_def.types,
-                            field.ty,
-                            Some(&next_subst),
-                            depth + 1,
-                            borrowed,
-                            next_via,
-                            visited,
-                            path_buf,
-                            hit,
-                            alloc,
-                        )?;
-                        if hit.is_some() {
-                            break 'variants;
+                let Ok(node) = types.node(ty) else {
+                    continue;
+                };
+                match node {
+                    PNode::Param(ix) => {
+                        if let Some(s_idx) = subst
+                            && let Some(&s) = substs.get(s_idx)
+                            && let Some(&arg_ty) = s.args.get(ix as usize)
+                        {
+                            work.push(WalkStep::Visit {
+                                types: s.caller_types,
+                                ty: arg_ty,
+                                subst: s.parent,
+                                depth: depth + 1,
+                                borrowed,
+                                via_adt,
+                            });
                         }
-                        path_buf.truncate(mark);
                     }
-                }
-                visited.pop();
-                if hit.is_some() {
-                    return Ok(());
-                }
-            }
-            // 2. Also scan generic type arguments directly for opaque/external wrappers whose
-            //    bodies aren't populated in `world` or hold `PhantomData<Cap>` (e.g. `Option<Cap>`,
-            //    `Box<Cap>`, `Vec<Cap>`).
-            for &arg_ty in arg_slice {
-                walk_pty(reads, types, arg_ty, subst, depth + 1, borrowed, next_via, visited, path_buf, hit, alloc)?;
-                if hit.is_some() {
-                    return Ok(());
+                    PNode::Ref(_, inner) | PNode::Ptr(_, inner) => {
+                        work.push(WalkStep::Visit {
+                            types,
+                            ty: inner,
+                            subst,
+                            depth: depth + 1,
+                            borrowed: true,
+                            via_adt,
+                        });
+                    }
+                    PNode::Array(elem, _) | PNode::Slice(elem) | PNode::Pat(elem, _) => {
+                        work.push(WalkStep::Visit {
+                            types,
+                            ty: elem,
+                            subst,
+                            depth: depth + 1,
+                            borrowed,
+                            via_adt,
+                        });
+                    }
+                    PNode::Tuple(list) | PNode::Record(_, list) | PNode::Union(list) => {
+                        if let Ok(elems) = types.list(list) {
+                            for &elem in elems.iter().rev() {
+                                work.push(WalkStep::Visit {
+                                    types,
+                                    ty: elem,
+                                    subst,
+                                    depth: depth + 1,
+                                    borrowed,
+                                    via_adt,
+                                });
+                            }
+                        }
+                    }
+                    PNode::Adt(inner_adt, args_list) => {
+                        let inner_attrs = reads.attrs(inner_adt)?;
+                        if inner_attrs.is_capability() {
+                            *hit = Some(Hit { capability: inner_adt, via_adt, borrowed });
+                            break;
+                        }
+                        let arg_slice = types.list(args_list).ok().unwrap_or(&[]);
+                        let next_via = via_adt.or(Some(inner_adt));
+                        // 2. Queued first (runs after field walk): scan generic type arguments
+                        //    directly for opaque/external wrappers whose bodies aren't populated
+                        //    in `world` or hold `PhantomData<Cap>` (`Option<Cap>`, `Box<Cap>`, `Vec<Cap>`).
+                        for &arg_ty in arg_slice.iter().rev() {
+                            work.push(WalkStep::Visit {
+                                types,
+                                ty: arg_ty,
+                                subst,
+                                depth: depth + 1,
+                                borrowed,
+                                via_adt: next_via,
+                            });
+                        }
+                        // 1. Queued last (runs first): inspect inner ADT's fields with generic
+                        //    arguments substituted so `Wrap<Cap>` reports full nested field paths.
+                        if !visited.iter().any(|&k| k == inner_adt)
+                            && let Some(inner_def) = reads.adt(inner_adt)?
+                        {
+                            visited.push(inner_adt);
+                            let next_subst = substs.len();
+                            substs.push(SubstNode { caller_types: types, args: arg_slice, parent: subst });
+                            work.push(WalkStep::PopVisited);
+                            for variant in inner_def.variants.iter().rev() {
+                                let Some(fields) = inner_def.fields.get(variant.fields.range()) else {
+                                    continue;
+                                };
+                                for field in fields.iter().rev() {
+                                    work.push(WalkStep::PopField);
+                                    work.push(WalkStep::Visit {
+                                        types: inner_def.types,
+                                        ty: field.ty,
+                                        subst: Some(next_subst),
+                                        depth: depth + 1,
+                                        borrowed,
+                                        via_adt: next_via,
+                                    });
+                                    work.push(WalkStep::PushField(field.name));
+                                }
+                            }
+                        }
+                    }
+                    // Function pointers (`fn(&Cap) -> T`, including `Brand<'id>`'s `fn(&'id ()) -> &'id ()`)
+                    // take capabilities as call parameters rather than storing them.
+                    PNode::FnPtr(..)
+                    | PNode::FnDef(..)
+                    | PNode::Bool
+                    | PNode::Char
+                    | PNode::Int(_)
+                    | PNode::Uint(_)
+                    | PNode::Float(_)
+                    | PNode::Str
+                    | PNode::Never
+                    | PNode::Closure { .. }
+                    | PNode::Future(..)
+                    | PNode::Coroutine { .. }
+                    | PNode::Alias { .. }
+                    | PNode::Opaque(..)
+                    | PNode::Infer
+                    | PNode::Error
+                    | PNode::ConstValue { .. }
+                    | PNode::ConstParam(_)
+                    | PNode::Dynamic(_)
+                    | PNode::ExTrait(..)
+                    | PNode::ExProj { .. }
+                    | PNode::ExAuto(_)
+                    | PNode::Foreign(_) => {}
                 }
             }
         }
-        // Function pointers (`fn(&Cap) -> T`, including `Brand<'id>`'s `fn(&'id ()) -> &'id ()`)
-        // take capabilities as call parameters rather than storing them.
-        PNode::FnPtr(..)
-        | PNode::FnDef(..)
-        | PNode::Bool
-        | PNode::Char
-        | PNode::Int(_)
-        | PNode::Uint(_)
-        | PNode::Float(_)
-        | PNode::Str
-        | PNode::Never
-        | PNode::Closure { .. }
-        | PNode::Future(..)
-        | PNode::Coroutine { .. }
-        | PNode::Alias { .. }
-        | PNode::Opaque(..)
-        | PNode::Infer
-        | PNode::Error
-        | PNode::ConstValue { .. }
-        | PNode::ConstParam(_)
-        | PNode::Dynamic(_)
-        | PNode::ExTrait(..)
-        | PNode::ExProj { .. }
-        | PNode::ExAuto(_)
-        | PNode::Foreign(_) => {}
     }
     Ok(())
 }

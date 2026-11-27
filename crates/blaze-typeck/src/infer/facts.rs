@@ -1306,7 +1306,7 @@ impl<'a> FactCache<'a> {
         let mut pos = 0usize;
         let mut budget = MOST_REGION_STEPS;
         let mut local_bound = false;
-        if let Some(s) = self.ty_regions_rec(c, root, slots, &mut pos, arity, binders, 0, &mut budget, &mut local_bound)?
+        if let Some(s) = self.ty_regions_iter(c, root, slots, &mut pos, arity, binders, &mut budget, &mut local_bound)?
             && pos == slots.len()
         {
             *used_bound |= local_bound;
@@ -1316,192 +1316,257 @@ impl<'a> FactCache<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn ty_regions_rec(
+    fn ty_regions_iter(
         &mut self,
         c: Conv<'_>,
-        t: PTy,
+        root: PTy,
         slots: &[Region],
         pos: &mut usize,
         arity: &dyn Arity,
         binders: u32,
-        depth: u32,
         budget: &mut u32,
         used_bound: &mut bool,
     ) -> Result<Option<STy>, Stop> {
-        if *budget == 0 || depth > 128 {
-            return Ok(None);
+        enum RegBuild {
+            Ref(STy, Mutbl),
+            Dynamic(STy, u32),
+            Ptr(Mutbl),
+            Slice,
+            Array(STy),
+            Pat(SList),
+            Tuple(u32),
+            Record(u64, u32),
+            Union(u32),
+            Adt(SDef, u32),
+            FnDef(SDef, u32),
+            FnPtr(crate::ids::FnPtrHeader, u32),
+            Alias(SDef, u32),
+            Opaque(SDef, u32),
+            ExTrait(SDef, u32),
+            ExProj(SDef, u32),
         }
-        *budget -= 1;
-        let node = c.t.node(t).map_err(Stop::from)?;
-        let Ok(own) = region_arity(t, node, arity) else {
-            return Ok(None);
-        };
-        let own_len = own as usize;
-        let Some(own_slots) = slots.get(*pos..pos.saturating_add(own_len)) else {
-            return Ok(None);
-        };
-        *pos += own_len;
-
-        let k = match node {
-            PNode::Ref(m, p) => {
-                let Some(&r) = own_slots.first() else { return Ok(None) };
-                let r = self.region_term(r, binders, depth, used_bound);
-                let Some(p) = self.ty_regions_rec(c, p, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::Ref(r, p, mutbl(m))
-            }
-            PNode::Dynamic(l) => {
-                let Some(&r) = own_slots.first() else { return Ok(None) };
-                let r = self.region_term(r, binders, depth, used_bound);
-                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::Dynamic(l, r)
-            }
-            PNode::Ptr(m, p) => {
-                let Some(p) = self.ty_regions_rec(c, p, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::RawPtr(p, mutbl(m))
-            }
-            PNode::Slice(e) => {
-                let Some(e) = self.ty_regions_rec(c, e, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::Slice(e)
-            }
-            PNode::Array(e, n) => {
-                let Some(e) = self.ty_regions_rec(c, e, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                let n = self.ty(c, n)?;
-                K::Array(e, n)
-            }
-            PNode::Pat(b, l) => {
-                let Some(b) = self.ty_regions_rec(c, b, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                let l = self.list(c, l)?;
-                K::Pat(b, l)
-            }
-            PNode::Tuple(l) => {
-                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::Tuple(l)
-            }
-            PNode::Record(schema, l) => {
-                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::Record(schema.0, l)
-            }
-            PNode::Union(l) => {
-                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::Union(l)
-            }
-            PNode::Adt(k, l) => {
-                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::Adt(SDef(k.0), l)
-            }
-            PNode::FnDef(k, l) => {
-                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::FnDef(SDef(k.0), l)
-            }
-            PNode::FnPtr(l, h) => {
-                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::FnPtr(l, h)
-            }
-            PNode::Alias { trait_, name, args } => {
-                let d = assoc_def(trait_, name);
-                if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
-                    self.round_inner_names.push(d);
-                }
-                let Some(args) = self.ty_regions_list(c, args, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::Alias(Rigid::No, SAlias::Projection, SDef(d), args)
-            }
-            PNode::Opaque(k, l) => {
-                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::Alias(Rigid::No, SAlias::Opaque, SDef(k.0), l)
-            }
-            PNode::ExTrait(k, l) => {
-                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::ExTrait(SDef(k.0), l)
-            }
-            PNode::ExProj { trait_, name, args, term } => {
-                let d = assoc_def(trait_, name);
-                if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
-                    self.round_inner_names.push(d);
-                }
-                let Some(args) = self.ty_regions_list(c, args, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                let Some(term) = self.ty_regions_rec(c, term, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
-                    return Ok(None);
-                };
-                K::ExProj(SDef(d), args, term)
-            }
-            PNode::Bool
-            | PNode::Char
-            | PNode::Int(_)
-            | PNode::Uint(_)
-            | PNode::Float(_)
-            | PNode::Str
-            | PNode::Never
-            | PNode::Param(_)
-            | PNode::ConstParam(_)
-            | PNode::ConstValue { .. }
-            | PNode::Error
-            | PNode::ExAuto(_)
-            | PNode::Foreign(_) => return Ok(Some(self.ty(c, t)?)),
-            PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } | PNode::Infer => {
-                return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(c.q)).into());
-            }
-        };
-        let s = STy(self.nodes.len() as u32);
-        self.nodes.push(k);
-        Ok(Some(s))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn ty_regions_list(
-        &mut self,
-        c: Conv<'_>,
-        l: crate::ids::List,
-        slots: &[Region],
-        pos: &mut usize,
-        arity: &dyn Arity,
-        binders: u32,
-        child_depth: u32,
-        budget: &mut u32,
-        used_bound: &mut bool,
-    ) -> Result<Option<SList>, Stop> {
-        let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(l.len as usize, self.alloc);
-        for i in l.range() {
-            let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
-            let Some(st) = self.ty_regions_rec(c, p, slots, pos, arity, binders, child_depth, budget, used_bound)? else {
-                return Ok(None);
-            };
-            terms.push(st);
+        enum RegWork {
+            Visit { t: PTy, depth: u32 },
+            Build(RegBuild),
         }
-        let start = self.lists.len() as u32;
-        self.lists.extend_from_slice(&terms);
-        Ok(Some(SList { start, len: l.len }))
+
+        let mut work: Vec<RegWork, Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut vals: Vec<STy, Alloc<'a>> = Vec::new_in(self.alloc);
+        let push_list = |work: &mut Vec<RegWork, Alloc<'a>>, l: crate::ids::List, child_depth: u32| -> Result<(), Stop> {
+            for i in l.range().rev() {
+                let Ok(idx) = usize::try_from(i) else {
+                    return Err(CheckError::Malformed(Malformed::NoRecord(c.q)).into());
+                };
+                let p = c.t.list_slot(idx).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+                work.push(RegWork::Visit { t: p, depth: child_depth });
+            }
+            Ok(())
+        };
+        work.push(RegWork::Visit { t: root, depth: 0 });
+
+        while let Some(step) = work.pop() {
+            match step {
+                RegWork::Visit { t, depth } => {
+                    if *budget == 0 || depth > 128 {
+                        return Ok(None);
+                    }
+                    *budget -= 1;
+                    let node = c.t.node(t).map_err(Stop::from)?;
+                    let Ok(own) = region_arity(t, node, arity) else {
+                        return Ok(None);
+                    };
+                    let Ok(own_len) = usize::try_from(own) else {
+                        return Ok(None);
+                    };
+                    let Some(own_slots) = slots.get(*pos..pos.saturating_add(own_len)) else {
+                        return Ok(None);
+                    };
+                    *pos += own_len;
+
+                    match node {
+                        PNode::Ref(m, p) => {
+                            let Some(&r) = own_slots.first() else { return Ok(None) };
+                            let r = self.region_term(r, binders, depth, used_bound);
+                            work.push(RegWork::Build(RegBuild::Ref(r, m)));
+                            work.push(RegWork::Visit { t: p, depth });
+                        }
+                        PNode::Dynamic(l) => {
+                            let Some(&r) = own_slots.first() else { return Ok(None) };
+                            let r = self.region_term(r, binders, depth, used_bound);
+                            work.push(RegWork::Build(RegBuild::Dynamic(r, l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::Ptr(m, p) => {
+                            work.push(RegWork::Build(RegBuild::Ptr(m)));
+                            work.push(RegWork::Visit { t: p, depth });
+                        }
+                        PNode::Slice(e) => {
+                            work.push(RegWork::Build(RegBuild::Slice));
+                            work.push(RegWork::Visit { t: e, depth });
+                        }
+                        PNode::Array(e, n) => {
+                            let n = self.ty(c, n)?;
+                            work.push(RegWork::Build(RegBuild::Array(n)));
+                            work.push(RegWork::Visit { t: e, depth });
+                        }
+                        PNode::Pat(b, l) => {
+                            let l = self.list(c, l)?;
+                            work.push(RegWork::Build(RegBuild::Pat(l)));
+                            work.push(RegWork::Visit { t: b, depth });
+                        }
+                        PNode::Tuple(l) => {
+                            work.push(RegWork::Build(RegBuild::Tuple(l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::Record(schema, l) => {
+                            work.push(RegWork::Build(RegBuild::Record(schema.0, l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::Union(l) => {
+                            work.push(RegWork::Build(RegBuild::Union(l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::Adt(k, l) => {
+                            work.push(RegWork::Build(RegBuild::Adt(SDef(k.0), l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::FnDef(k, l) => {
+                            work.push(RegWork::Build(RegBuild::FnDef(SDef(k.0), l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::FnPtr(l, h) => {
+                            work.push(RegWork::Build(RegBuild::FnPtr(h, l.len)));
+                            push_list(&mut work, l, depth + 1)?;
+                        }
+                        PNode::Alias { trait_, name, args } => {
+                            let d = assoc_def(trait_, name);
+                            if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
+                                self.round_inner_names.push(d);
+                            }
+                            work.push(RegWork::Build(RegBuild::Alias(SDef(d), args.len)));
+                            push_list(&mut work, args, depth)?;
+                        }
+                        PNode::Opaque(k, l) => {
+                            work.push(RegWork::Build(RegBuild::Opaque(SDef(k.0), l.len)));
+                            push_list(&mut work, l, depth)?;
+                        }
+                        PNode::ExTrait(k, l) => {
+                            work.push(RegWork::Build(RegBuild::ExTrait(SDef(k.0), l.len)));
+                            push_list(&mut work, l, depth + 1)?;
+                        }
+                        PNode::ExProj { trait_, name, args, term } => {
+                            let d = assoc_def(trait_, name);
+                            if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
+                                self.round_inner_names.push(d);
+                            }
+                            work.push(RegWork::Build(RegBuild::ExProj(SDef(d), args.len)));
+                            work.push(RegWork::Visit { t: term, depth: depth + 1 });
+                            push_list(&mut work, args, depth + 1)?;
+                        }
+                        PNode::Bool
+                        | PNode::Char
+                        | PNode::Int(_)
+                        | PNode::Uint(_)
+                        | PNode::Float(_)
+                        | PNode::Str
+                        | PNode::Never
+                        | PNode::Param(_)
+                        | PNode::ConstParam(_)
+                        | PNode::ConstValue { .. }
+                        | PNode::Error
+                        | PNode::ExAuto(_)
+                        | PNode::Foreign(_) => {
+                            vals.push(self.ty(c, t)?);
+                        }
+                        PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } | PNode::Infer => {
+                            return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(c.q)).into());
+                        }
+                    }
+                }
+                RegWork::Build(build) => {
+                    let pop_list = |vals: &mut Vec<STy, Alloc<'a>>, lists: &mut Vec<STy, Alloc<'a>>, len: u32| -> Option<SList> {
+                        let count = usize::try_from(len).ok()?;
+                        let start_idx = vals.len().checked_sub(count)?;
+                        let tail = vals.as_slice().get(start_idx..)?;
+                        let start = u32::try_from(lists.len()).ok()?;
+                        lists.extend_from_slice(tail);
+                        vals.truncate(start_idx);
+                        Some(SList { start, len })
+                    };
+                    let k = match build {
+                        RegBuild::Ref(r, m) => {
+                            let Some(p) = vals.pop() else { return Ok(None) };
+                            K::Ref(r, p, mutbl(m))
+                        }
+                        RegBuild::Dynamic(r, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Dynamic(l, r)
+                        }
+                        RegBuild::Ptr(m) => {
+                            let Some(p) = vals.pop() else { return Ok(None) };
+                            K::RawPtr(p, mutbl(m))
+                        }
+                        RegBuild::Slice => {
+                            let Some(e) = vals.pop() else { return Ok(None) };
+                            K::Slice(e)
+                        }
+                        RegBuild::Array(n) => {
+                            let Some(e) = vals.pop() else { return Ok(None) };
+                            K::Array(e, n)
+                        }
+                        RegBuild::Pat(l) => {
+                            let Some(b) = vals.pop() else { return Ok(None) };
+                            K::Pat(b, l)
+                        }
+                        RegBuild::Tuple(len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Tuple(l)
+                        }
+                        RegBuild::Record(schema, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Record(schema, l)
+                        }
+                        RegBuild::Union(len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Union(l)
+                        }
+                        RegBuild::Adt(d, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Adt(d, l)
+                        }
+                        RegBuild::FnDef(d, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::FnDef(d, l)
+                        }
+                        RegBuild::FnPtr(h, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::FnPtr(l, h)
+                        }
+                        RegBuild::Alias(d, len) => {
+                            let Some(args) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Alias(Rigid::No, SAlias::Projection, d, args)
+                        }
+                        RegBuild::Opaque(d, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::Alias(Rigid::No, SAlias::Opaque, d, l)
+                        }
+                        RegBuild::ExTrait(d, len) => {
+                            let Some(l) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::ExTrait(d, l)
+                        }
+                        RegBuild::ExProj(d, len) => {
+                            let Some(term) = vals.pop() else { return Ok(None) };
+                            let Some(args) = pop_list(&mut vals, &mut self.lists, len) else { return Ok(None) };
+                            K::ExProj(d, args, term)
+                        }
+                    };
+                    let s = STy(self.nodes.len() as u32);
+                    self.nodes.push(k);
+                    vals.push(s);
+                }
+            }
+        }
+        Ok(vals.pop())
     }
 
     /// Converts impl where-clauses with their optional `HeadRegionRead`, recording higher-ranked
