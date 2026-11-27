@@ -117,23 +117,26 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// Match arm guard `g` holding a `let` (an `if let` guard, core's `dec2flt`: `None if let
     /// Some(value) = parse_inf_nan(s, negative) => return Ok(value),`; or a chain with `&&`),
-    /// then the arm's `body`; every failed link to `next`, the next arm's block. The Reference,
-    /// "Match guards": the guard "may be ... a chain of conditions" whose `let` bindings are in
-    /// scope in the arm's body, and when it is false (a `let` fails) "control moves on to the
-    /// next arm". Built as an `if let` condition's links (`push_links`) in a region of its own
-    /// (lets/scope.rs) opened inside the arm's drop scope: a failed link drops what the region
-    /// holds then (`link_fail`), the matched path drops it after the body (a `Task::ScopeEnd`
-    /// of the body, which settles the body's value), before the arm's own bindings. A scrutinee temporary that needs drop is refused by name
-    /// (lets/scope.rs `let_anchor`: its temporary scope is not built for a guard).
-    pub(super) fn let_guard(&mut self, g: ExprId, body: ExprId, next: Block) -> Result<(), BuildError> {
+    /// then the arm's `body`; every failed link to `fail` (the next arm's block, or an or-pattern
+    /// arm's alternative dispatch block from `guard_alts_fail`). The Reference, "Match guards":
+    /// the guard "may be ... a chain of conditions" whose `let` bindings are in scope in the
+    /// arm's body, and when it is false (a `let` fails) "control moves on to the next arm" (or
+    /// next or-pattern alternative). Built as an `if let` condition's links (`push_links`) in a
+    /// region of its own (lets/scope.rs `if_let_open`) opened inside the arm's drop scope: a
+    /// failed link drops what the region holds then (`link_fail`), while the matched path applies
+    /// the arm's deferred moves (`Task::ArmMoves { from }`), evaluates `body`, drops the guard's
+    /// bindings and scrutinee temporaries (`Task::ScopeEnd(body)` + `Task::TempScopeEnd(g)`), and
+    /// then drops the arm's own bindings.
+    pub(super) fn let_guard(&mut self, g: ExprId, body: ExprId, fail: Block, from: u32) -> Result<(), BuildError> {
         let links = self.links_of(g)?;
-        if links.len() > 1 && !self.if_let_2024() {
-            return Err(unsupported(g, "a `let` chain before edition 2024 (chains are an edition-2024 form)"));
+        let temps = self.if_let_open(g, g, links.len())?;
+        if temps {
+            self.work.push(Task::TempScopeEnd(g));
         }
-        self.scope_marks.push(self.scope_pats.len() as u32);
         self.work.push(Task::ScopeEnd(body));
         self.work.push(Task::Eval(body));
-        self.push_links(&links, next)
+        self.work.push(Task::ArmMoves { from });
+        self.push_links(&links, fail)
     }
 
     /// A `let`'s scrutinee as walk.rs's `match` pushes one: a local that needs drop is a

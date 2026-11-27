@@ -105,7 +105,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 Expr::If { cond, .. } if cond.0 == c => {
                     return Ok(if self.if_let_2024() { LetAnchor::Cond(cond.0) } else { LetAnchor::Above(ExprId(up)) });
                 }
-                _ => return Err(unsupported(l, "a `let` expression that is not a link of an `if` or `while` condition")),
+                Expr::Match { arms, .. } => {
+                    let list = self.body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))?;
+                    if list.iter().any(|a| a.guard.is_some_and(|g| g.0 == c)) {
+                        return Ok(if self.if_let_2024() { LetAnchor::Cond(c) } else { LetAnchor::Above(ExprId(up)) });
+                    }
+                    return Err(unsupported(l, "a `let` expression that is not a link of an `if`, `while`, or match guard condition"));
+                }
+                _ => return Err(unsupported(l, "a `let` expression that is not a link of an `if`, `while`, or match guard condition")),
             }
         }
     }

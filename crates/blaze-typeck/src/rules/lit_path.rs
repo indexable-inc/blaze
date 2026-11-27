@@ -503,12 +503,27 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         let (assoc, seg) = match segs {
             [seg] => (None, seg),
-            [assoc, seg] if anchor.trait_.is_some() => (Some(*assoc), seg),
+            [assoc, seg] => (Some(*assoc), seg),
             _ => return Err(malformed()),
         };
         let self_ty = self.lower_body_ty(anchor.ty, at)?;
         let Some(tpath) = anchor.trait_ else {
-            return self.assoc_value(at, cause, self_ty, *seg, scope);
+            let target_ty = match assoc {
+                None => self_ty,
+                Some(assoc) => {
+                    use crate::rules::self_path::AssocPrefix;
+                    let resolved = self.try_structurally_resolve(self_ty)?;
+                    let prefix = match self.view(resolved) {
+                        TyView::Param(i) => AssocPrefix::Param(i),
+                        _ => AssocPrefix::Other,
+                    };
+                    let Some(projected) = self.assoc_ty_of_prefix(at, cause, prefix, assoc)? else {
+                        return Ok(self.common.err);
+                    };
+                    projected
+                }
+            };
+            return self.assoc_value(at, cause, target_ty, *seg, scope);
         };
         let tbp = self.body.path(tpath)?;
         let tsegs = self.body.segment_list(tbp.segments)?;
