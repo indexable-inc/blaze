@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-322 invariants, 45 refinements, 13 reference models.
-By level: 264 tested, 87 simulated, 1 model-checked, 15 proved.
+302 invariants, 45 refinements, 12 reference models.
+By level: 251 tested, 80 simulated, 1 model-checked, 15 proved.
 
 ## Invariants
 
@@ -305,45 +305,6 @@ By level: 264 tested, 87 simulated, 1 model-checked, 15 proved.
 - **`a_crash_or_failure_anywhere_keeps_each_table_whole_or_absent`** *tested* (`crates/blaze-proc-macro/src/table_tests.rs`): under power cuts, failures, and concurrent writers, every opened proc-macro results table is sealed and whole or absent, and never published before its bytes are whole.
   Controls: `a_read_that_skips_the_tables_seal`, `a_name_given_before_the_bytes_are_whole`.
 
-### blaze-profile
-
-- **`every_recompute_of_a_simulated_build_sequence_chains_to_a_change`** *tested* (`crates/blaze-profile/src/account.rs`): in every build of a sequence of edits, each unit made again chains through the units it reads to a file that changed in that build (the first build's to "first time"), the units made are exactly those the change reaches, and the stage's total is the pieces its causes count.
-  Controls: `a_recompute_started_without_a_cause`, `work_a_stage_counted_and_never_said`.
-- **`profiling_md_lists_only_columns_the_schema_has`** *tested* (`crates/blaze-profile/src/describe.rs`): docs/profiling.md lists no column the schema lacks. Its tables are written by hand; each row of a table under a `### \`<table>\`` heading names columns of that table (several on a row are `a, b`), and every table of the schema is named there.
-  Controls: `a_column_the_schema_lacks`.
-- **`every_name_reads_back_as_recorded_or_is_counted_forgotten`** *tested* (`crates/blaze-profile/src/flight/names/tests.rs`): every name a row holds reads back as the text recorded or is counted as forgotten, never as another text; and nothing is forgotten in a run that lost no row.
-  Controls: `a_foreign_name_written_with_no_link`, `a_generation_begun_with_no_gen_row`, `a_reader_that_ignores_the_window`, `a_table_kept_across_a_park`.
-- **`a_reader_holds_at_most_window_generations_in_one_buffer_each`** *tested* (`crates/blaze-profile/src/flight/names/tests.rs`): a reader of a live ring holds at most [`RETAIN`] generations of it, each read generation in one text buffer and one index sized to what it defines, so what it holds stays under `RETAIN * (T + A)` plus the generation being read into, its definition buffer and the rows it read, however many generations the ring went through (`T` the text bytes, `A` the index bytes of one). The control keeps 64 generations, as the reader did before 2026-11-12, and goes past the bound; and the newest names still read back.
-  Controls: `a_foreign_name_written_with_no_link`, `a_generation_begun_with_no_gen_row`, `a_reader_that_ignores_the_window`, `a_table_kept_across_a_park`.
-- **`a_store_s_disk_is_reserved_as_it_is_handed_out_and_not_before`** *tested* (`crates/blaze-profile/src/flight/postmortem.rs`): every store handed out lies in disk the file reserved, and the file holds no store's disk before it is handed out.
-  Controls: `a_store_handed_out_with_no_disk_under_it`.
-- **`a_solo_answer_is_one_build_row_with_its_slot_and_its_clients_spans`** *tested* (`crates/blaze-profile/src/history.rs`): a solo answer is one `builds` row of its own number, outcome ok, with the client's times as its start, length and client columns, `misses` 0 and its solo columns set, and its client's spans under it; a daemon's build in the same flush has null solo columns. Control: a solo build's spans of another build are refused naming it, and nothing of it is noted.
-  Controls: `a_cap_without_its_bounds`.
-- **`the_cap_follows_the_store_between_its_bounds`** *tested* (`crates/blaze-profile/src/history.rs`): unset, the cap never falls as the home's store grows and stays within [`CAP_LEAST`] and [`CAP_MOST`]; a [`CAP_VAR`] that reads is the cap whatever the store holds; one that does not is refused, naming it.
-  Controls: `a_cap_without_its_bounds`.
-- **`every_row_is_in_the_history_once_after_any_crash`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): whatever the faults, wherever the power goes out, every row handed to the history is listed, handed back or left to read, exactly once, and the history opens.
-  Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`, `a_build_retired_while_rows_of_no_build_stay`, `a_flush_with_no_build_retiring_the_last_build`, `the_cap_checked_before_the_kept_builds_are_set_aside`.
-- **`the_cap_retires_whole_builds_and_none_that_runs`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): past the cap no build loses a part of its rows, a running build and the last `keep` finished lose none, the newest flush's file of no build stays, and beyond those the oldest unit goes first, whichever builds ran at once and whatever each flush was named for.
-  Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`, `a_build_retired_while_rows_of_no_build_stay`, `a_flush_with_no_build_retiring_the_last_build`, `the_cap_checked_before_the_kept_builds_are_set_aside`.
-- **`the_cap_retires_rows_of_no_build_before_any_build_s`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): past the cap, rows of no build (a daemon's own between builds) go before any build's rows do, whatever their ages.
-  Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`, `a_build_retired_while_rows_of_no_build_stay`, `a_flush_with_no_build_retiring_the_last_build`, `the_cap_checked_before_the_kept_builds_are_set_aside`.
-- **`the_last_builds_stay_whole_through_any_flushes_pins_and_restarts`** *simulated* (`crates/blaze-profile/src/history/files/tests.rs`): the history holds, whole, every running build and the last `keep` finished builds, whatever the cap and whatever flushes come after (a flush with no build protects nothing by itself, and moves nothing out); a file a reader pinned stays on disk until the pin goes, and goes at the next flush after; a restart with nothing running reads the same files back.
-  Controls: `a_rename_with_no_sync_before`, `what_a_flush_consumed_marked_after_its_commit`, `a_build_retired_while_rows_of_no_build_stay`, `a_flush_with_no_build_retiring_the_last_build`, `the_cap_checked_before_the_kept_builds_are_set_aside`.
-- **`every_wait_row_says_who_ends_it_in_the_ring_and_in_the_batch`** *tested* (`crates/blaze-profile/src/lib.rs`): every `wait` row says who ends it. A wait opened through any of blaze-graph's waits has `owned_by` in its ring row and in the `spans` batch a profile file is written from; `owner` names a job exactly when `owned_by` is `job`; a wait that learns its waker as it ends names that job; and a client's wait for its daemon says the daemon.
-  Controls: `a_wait_that_says_no_owner`.
-- **`a_step_that_always_answers_again_is_said_within_the_bound`** *tested* (`crates/blaze-profile/src/stuck/again/tests.rs`): a step that always answers "again" with nothing changed ends with [`SameAgain`] at its start number `AGAIN_BOUND + 1`, never before, and is said once.
-  Controls: `restart_counted_as_progress`.
-- **`the_core_says_exactly_the_tasks_started_again_unchanged`** *tested* (`crates/blaze-profile/src/stuck/again/tests.rs`): under any order of restarts and ends, the core says a task exactly when it has started more than [`AGAIN_BOUND`] times in a row with nothing changed, once, and never otherwise.
-  Controls: `restart_counted_as_progress`.
-- **`oracle`** *simulated* (`crates/blaze-profile/src/stuck/tests.rs`): every task that can never run again is reported within its bound, with the edge that explains it; no task that later makes progress by itself is ever reported; every reported cycle is a real cycle of the model's waits; and a task is said once.
-  Controls: `a_watchdog_that_counts_job_code_as_progress`, `a_watchdog_that_flags_by_elapsed_time`, `a_watchdog_that_drops_the_holder`.
-- **`the_watchdog_says_exactly_the_tasks_that_never_run_again`** *simulated* (`crates/blaze-profile/src/stuck/tests.rs`): under any mix of running, sleeping, signalled, locking and joining tasks with any of the planted faults, every task that can never run again is reported within its bound with the edge that explains it, no task that later makes progress by itself is reported, and every reported cycle is a real one.
-  Controls: `a_watchdog_that_counts_job_code_as_progress`, `a_watchdog_that_flags_by_elapsed_time`, `a_watchdog_that_drops_the_holder`.
-- **`an_oversized_batch_is_split_and_every_row_that_fits_is_written_once`** *tested* (`crates/blaze-profile/src/supervise.rs`): whatever the rows' sizes and the batch size, every row that fits a batch alone is in exactly one batch, in order, no batch holds more than fits, and each row that does not fit alone is counted dropped: rows written plus rows dropped is the rows given.
-  Controls: `a_flush_that_makes_one_batch_of_everything`.
-- **`workers_ending_loop_items_or_proving_memos_are_progress_and_parked_ones_stall`** *tested* (`crates/blaze-profile/src/watchdog.rs`): a daemon whose workers end a loop's items or prove memos current is never said to be stalled, however long no pool job ends and no query runs under a flight; one whose workers are all parked is said to be, at the bound.
-  Controls: `a_count_of_queries_under_a_flight_alone`.
-
 ### blaze-remote
 
 - **`published_records_are_true_bytes_or_typed_refusals_in_three_waves`** *tested* (`crates/blaze-remote/src/published/tests.rs`): published remote reads return only verified true bytes of public settled records or typed refusals within configured index limits.
@@ -471,11 +432,6 @@ By level: 264 tested, 87 simulated, 1 model-checked, 15 proved.
 
 - **`every_record_comes_back_with_its_dictionary_or_none`** *tested* (`crates/blaze-squeeze/src/tests.rs`): every squeezed record round-trips only with its exact dictionary, refuses trailing or corrupt bytes, and rejects decoded sizes over the limit before growing the output.
   Controls: `a_record_naming_another_dictionary`, `trailing_bytes_kept`, `the_limit_ignored`.
-
-### blaze-stage
-
-- **`the_driver_holds_every_law`** *tested* (`crates/blaze-stage/src/sim_tests.rs`): the stage driver resets task frames, merges in plan order, reports transitive waits accurately, starts nothing after stop, and exposes no result before commit.
-  Controls: `a_frame_not_reset`, `a_merge_in_completion_order`, `a_wait_naming_its_direct_input`, `a_start_after_stop`, `a_result_visible_before_its_commit`.
 
 ### blaze-std
 
@@ -672,11 +628,6 @@ By level: 264 tested, 87 simulated, 1 model-checked, 15 proved.
   Controls: `a_size_off_by_one`.
 - **`a_full_fixed_builder_panics_naming_its_size`** *tested* (`crates/const-ast/src/tests.rs`): a fixed builder never writes past its arrays, and says how many they hold.
   Controls: `a_size_off_by_one`.
-
-### ix-prof
-
-- **`every_request_is_answered_once_by_its_rule_and_the_live_stream_keeps_its_period`** *simulated* (`crates/ix-prof/src/explore/tests.rs`): every request the page opens ends exactly once, finished, with the answer its rule says (`unauthenticated` before hello, hello, the source's rows, `bad_args`, `unknown_op` naming the op, a late request's `bad_args` REQUEST_WAIT after it opened, and `bad_token` closing that session alone, and only after the page has the whole answer and its FIN: the close waits for the answer's acknowledgement (`Event::StreamAcked`), not for a margin of time, so it holds however late loss makes the answer); every refused CONNECT gets its status; the live stream's frames all parse and come at least every other period; and the stop closes every session with CLOSE_STOPPED and ends the machine: whether the network is clean or loses, duplicates and reorders datagrams, and whatever each job takes.
-  Controls: `a_dropped_job_result`, `a_timer_never_armed`.
 
 ### parser
 
@@ -979,10 +930,6 @@ By level: 264 tested, 87 simulated, 1 model-checked, 15 proved.
 - **`naive_find`** (`crates/blaze-memchr/src/tests.rs`): the first byte of `haystack` in `needles`, one byte at a time.
 - **`naive_find_bytes`** (`crates/blaze-memchr/src/tests.rs`): the first start of `needle`, compared at every start.
 
-### blaze-profile
-
-- **`Project`** (`crates/blaze-profile/src/account.rs`): a project of files and units, each unit reading some files and some earlier units; a build makes again exactly the units that read a changed file or a unit made again, and each says why through the ledger.
-
 ### tests
 
 - **`Model`** (`crates/blaze-id/tests/identity.rs`): a list of pairs, at most one per key.
@@ -999,7 +946,7 @@ Every promise of a doc comment or an effect attribute and how it is held
 `Evidence:` or `Unverified:`, an effect attribute, a `# Safety` obligation, a proved contract.
 A checked attribute and an obligation are counted, not listed.
 
-4380 claims. By level: 28 none, 4 unverified, 391 obligation, 3901 checked, 16 tested, 2 simulated, 0 model-checked, 38 proved.
+4343 claims. By level: 28 none, 4 unverified, 354 obligation, 3901 checked, 16 tested, 2 simulated, 0 model-checked, 38 proved.
 
 ### Totals
 
@@ -1024,12 +971,10 @@ A checked attribute and an obligation are counted, not listed.
 | blaze-ladder | 1 | 0 | 4 | 0 | 0 | 0 | 0 | 0 |
 | blaze-launch-rt | 0 | 0 | 23 | 0 | 0 | 0 | 0 | 0 |
 | blaze-lex | 0 | 0 | 2 | 0 | 0 | 0 | 0 | 0 |
-| blaze-malloc | 0 | 0 | 27 | 0 | 0 | 0 | 0 | 0 |
 | blaze-mem | 0 | 0 | 26 | 0 | 0 | 0 | 0 | 0 |
 | blaze-memo | 0 | 0 | 10 | 0 | 0 | 0 | 0 | 0 |
 | blaze-own | 18 | 0 | 51 | 8 | 16 | 0 | 0 | 0 |
 | blaze-pg | 0 | 0 | 0 | 188 | 0 | 0 | 0 | 0 |
-| blaze-profile | 0 | 0 | 9 | 0 | 0 | 0 | 0 | 0 |
 | blaze-queue | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
 | blaze-radix | 0 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
 | blaze-scope | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
@@ -1052,7 +997,6 @@ A checked attribute and an obligation are counted, not listed.
 | extensions | 0 | 0 | 0 | 4 | 0 | 0 | 0 | 0 |
 | gpu | 0 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
 | intern | 0 | 0 | 3 | 0 | 0 | 0 | 0 | 0 |
-| ix-prof | 0 | 0 | 1 | 0 | 0 | 0 | 0 | 0 |
 | orders | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 |
 | parser | 0 | 0 | 4 | 0 | 0 | 0 | 0 | 0 |
 | queue | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 3 |
@@ -1135,7 +1079,7 @@ A checked attribute and an obligation are counted, not listed.
 - **`blaze-sqlite::Raw#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:458`): `Raw::stmt` is a live statement prepared on `Raw::connection`, finalized by the raw's drop and by nothing else. Upheld by `Raw::prepare`, the one constructor, and `Raw::drop`.
 - **`blaze-sqlite::Text#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:92`): `Text::bytes` is UTF-8. Upheld by its constructors (`Text::of`, `Text::empty`, `Text::lossy`, `Text::from_utf8`) and by `Text::push_str`, the one way it grows, which appends a whole `str`.
 - **`blaze-sys::linux::mem::mapped#2`** *unverified* trusted (`crates/blaze-sys/src/linux/mem.rs:136`): `mapped` is nopanic Unverified: NonNull::new aborts only in new_unchecked's check that the pointer is not null, which new itself tests before it calls it.
-- **`blaze-sys::linux::wait::clock_gettime_vdso#1`** *unverified* trusted (`crates/blaze-sys/src/linux/wait.rs:311`): `clock_gettime_vdso` is noalloc Unverified: the vDSO's clock_gettime is the kernel's code: it reads the clock page and, for a clock it cannot read there, makes the system call; it calls no code of this process, so no allocator runs.
+- **`blaze-sys::linux::wait::clock_gettime_vdso#1`** *unverified* trusted (`crates/blaze-sys/src/linux/wait.rs:310`): `clock_gettime_vdso` is noalloc Unverified: the vDSO's clock_gettime is the kernel's code: it reads the clock page and, for a clock it cannot read there, makes the system call; it calls no code of this process, so no allocator runs.
 - **`blaze-sys::posix::io::mem::mapped#2`** *unverified* trusted (`crates/blaze-sys/src/posix/io/mem.rs:168`): `mapped` is nopanic Unverified: NonNull::new aborts only in new_unchecked's check that the pointer is not null, which new itself tests before it calls it.
 - **`blaze-sys::types::to_duration#2`** *unverified* trusted (`crates/blaze-sys/src/types.rs:161`): `to_duration` is nopanic Unverified: Duration::new panics only when nanos of 1_000_000_000 or more carry the seconds past u64::MAX; nsec is refused above before it is called.
 - **`consts::constants_are_their_values#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from the fixture's theorem function constants_are_their_values holds of its model: a trait's associated constant at its implementor (its own value or the trait's default), an inherent constant, an anonymous constant and an array length given by an expression are the values blaze's evaluator gives. Evidence: Lean consts.constants_are_their_values.spec.proof.

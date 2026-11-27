@@ -11,19 +11,19 @@ description: "How a slow thing is found and fixed: a span names every stretch of
 
 Anything slow is a P0 until a span names it, and anything large until the profile says what held it
 (bytes by allocator tag, each task's peak, the allocation samples); the trace comes before the fix.
-Every command writes that profile through the one allocator, the one schema
-(`crates/blaze-profile/src/schema.rs`) and the one set of readers: a new command, path or task kind
-that writes none is itself the P0, fixed before its numbers are discussed, and it gets no second
-accounting or summary line computed apart from the profile. Every stretch of worker time sits under
-a `tracing::info_span!(target: "blaze", ...)` that names the work: the macro path for a proc-macro
-expansion, the package, version and target kind for a unit, the query and key, the creator of a
-scope being waited on. Its own CPU time (`self_cpu_ns`) is filled, so a DuckDB query over
-`<BLAZE_HOME>/v2/profile/*.spans.parquet` says which item took the time and whether it was busy or
-waiting. A sampler stack or a guess from a log is a lead. The PR that makes something faster quotes
-the before and after from those spans. Every throughput or latency number reported (a benchmark, a
-commit, a PR, a reply) names its core count and is stated per core (`MB/s/core`, `GB/s/core`,
-`ops/s/core`, `ns/op/core`); an aggregate shows both (`38.7 GB/s across 18 cores = 2.15 GB/s/core`),
-never a bare `MB/s` that hides whether the run was 1 core or 18.
+Every command writes that profile through the one allocator, bstd's one telemetry report (`Report`,
+`crates/blaze-std/src/telemetry.rs`, end-state.md D178) and the command's `.blaze/v2/profile.txt`: a
+new command, path or task kind that writes none is itself the P0, fixed before its numbers are
+discussed, and it gets no second accounting or summary line computed apart from the profile. Every
+stretch of worker time sits under a span (`cx.span`, or blaze-trace's `info_span!(target: "blaze",
+...)`) that names the work: the macro path for a proc-macro expansion, the package, version and
+target kind for a unit, the query and key, the creator of a scope being waited on. Its own use
+(time, instructions, allocations, waits) is filled, so the report (`--stats`) says which item took
+the time and whether it was busy or waiting. A sampler stack or a guess from a log is a lead. The PR
+that makes something faster quotes the before and after from those spans. Every throughput or
+latency number reported (a benchmark, a commit, a PR, a reply) names its core count and is stated
+per core (`MB/s/core`, `GB/s/core`, `ops/s/core`, `ns/op/core`); an aggregate shows both (`38.7 GB/s
+across 18 cores = 2.15 GB/s/core`), never a bare `MB/s` that hides whether the run was 1 core or 18.
 
 ## incremental-first (rule 60)
 

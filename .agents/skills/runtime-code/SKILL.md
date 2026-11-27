@@ -87,8 +87,8 @@ process, opens a socket, sleeps) is not finished work, whoever wrote it and howe
 there. When you meet such code in what you are changing, cut the seam in the same change without
 being asked: the decisions go into a core, the IO into a driver that only performs effects and
 returns completions; when it is too large for the change, record a fact/gotcha in
-`agents/kb/facts.jsonl` via `scripts/src/bin/kb.rs` naming the file and what blocks it, and add a
-ledger row if it needs one. One implementation, the real one: the code that ships is the code the
+`agents/kb/facts.jsonl` via `scripts/src/bin/kb.rs` naming the file and what blocks it, and record a
+decision row if it needs one. One implementation, the real one: the code that ships is the code the
 simulation runs. A fake, mock, stub, test double or second model written because the real code could
 not run in a test (a simulated request loop beside the real one, a toy scheduler in a test, a
 hand-written in-memory store with its own logic) is a duplicate (`one-concept-one-home`) that proves
@@ -119,32 +119,33 @@ outcome. Every loop that waits for progress (a solver, a fixpoint, a readiness p
 build's rounds) has a bound (fuel, depth or a deadline from the injected clock) and ends in a typed
 outcome: done, or a failure naming what it was doing, the goal or key, and how far it got. Never an
 open loop whose only exit is success, and never a spin with no cap. What no bound in the code
-catches, the watchdog does (`blaze_profile::stuck`, a sans-IO core): a task that has not moved for
-the bound of what it waits on, a cycle of waits, and a task started again and again for the same
-work with no input changed (`again`). Each is a hang, and a hang is a bug: the watchdog fails the
-build with a typed error that names the task, what it waits on or repeats, how long and how often,
-writes the flight recording and prints its path, so the person sees one line and a file to read,
-never a build that just runs on. A new kind of wait or a new loop over rounds feeds the watchdog in
-the same change, with a test that a planted hang of that kind is reported. A hang found by hand (a
-person or an agent saw it hang) is two bugs: the hang, and the watchdog not catching it; fix both.
-How an agent's own commands are bounded is `every-command-has-a-timeout`. Every blocking wait names
-what it waits for: it opens a span naming the awaited key, lock, channel, IO or child, and its owner
-when known; a wait with no name, and worker time covered by no span, are bugs the profile test fails
-on. A thread blocks in the kernel only through `blaze_core::wait`, which takes an absolute
-`Deadline` on the injected clock (a driver's `now()`), recomputes the time left from that clock
-before every system call, treats an interrupted (EINTR) or spurious return as a retry, and ends in a
-typed outcome (`Waited::Ready` or `Waited::Deadline`), with fuel for a clock that does not move.
-`Driver::poll` takes that `Deadline`, never a relative timeout, so no layer restarts one. The
-kernel's waits (`poll`, `ppoll`, `select`, `epoll_wait`, `kevent`, `nanosleep`, `usleep`, `sleep`,
-...) are banned in `.clippy.toml` outside `crates/blaze-core/src/wait*`, each with its
-`blaze_core::wait` replacement; io_uring waits pass a signal mask that blocks every asynchronous
-signal but the stop signals. Only IO driver threads and the pool's idle park block in the kernel: a
-fiber that waits, with a deadline or without, parks on the scheduler (a key, a counter, a job, a
-timer on the driver's wheel), never a `Condvar`, a channel receive, `thread::sleep` or a raw
-`spin_loop`; elsewhere a spin is the one bounded spin-then-park helper. Nothing sends a signal to a
-pool or driver thread: the sampler reads the kernel's samples (Linux `perf_event_open`) or stops the
-thread (macOS `thread_suspend`). The DST in `crates/blaze-core/src/wait/tests.rs` interrupts every
-wait and checks that it ends by its deadline, with a planted relative-timeout retry it must catch.
+catches, the watchdog does (a sans-IO core; the daemon's went with the profile crate on 2026-11-27,
+end-state.md D178, so a new one is owed): a task that has not moved for the bound of what it waits
+on, a cycle of waits, and a task started again and again for the same work with no input changed
+(`again`). Each is a hang, and a hang is a bug: the watchdog fails the build with a typed error that
+names the task, what it waits on or repeats, how long and how often, writes it to the command's
+profile and prints its path, so the person sees one line and a file to read, never a build that just
+runs on. A new kind of wait or a new loop over rounds feeds the watchdog in the same change, with a
+test that a planted hang of that kind is reported. A hang found by hand (a person or an agent saw it
+hang) is two bugs: the hang, and the watchdog not catching it; fix both. How an agent's own commands
+are bounded is `every-command-has-a-timeout`. Every blocking wait names what it waits for: it opens
+a span naming the awaited key, lock, channel, IO or child, and its owner when known; a wait with no
+name, and worker time covered by no span, are bugs the profile test fails on. A thread blocks in the
+kernel only through `blaze_core::wait`, which takes an absolute `Deadline` on the injected clock (a
+driver's `now()`), recomputes the time left from that clock before every system call, treats an
+interrupted (EINTR) or spurious return as a retry, and ends in a typed outcome (`Waited::Ready` or
+`Waited::Deadline`), with fuel for a clock that does not move. `Driver::poll` takes that `Deadline`,
+never a relative timeout, so no layer restarts one. The kernel's waits (`poll`, `ppoll`, `select`,
+`epoll_wait`, `kevent`, `nanosleep`, `usleep`, `sleep`, ...) are banned in `.clippy.toml` outside
+`crates/blaze-core/src/wait*`, each with its `blaze_core::wait` replacement; io_uring waits pass a
+signal mask that blocks every asynchronous signal but the stop signals. Only IO driver threads and
+the pool's idle park block in the kernel: a fiber that waits, with a deadline or without, parks on
+the scheduler (a key, a counter, a job, a timer on the driver's wheel), never a `Condvar`, a channel
+receive, `thread::sleep` or a raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park
+helper. Nothing sends a signal to a pool or driver thread: the sampler reads the kernel's samples
+(Linux `perf_event_open`) or stops the thread (macOS `thread_suspend`). The DST in
+`crates/blaze-core/src/wait/tests.rs` interrupts every wait and checks that it ends by its deadline,
+with a planted relative-timeout retry it must catch.
 
 See [docs/v2/plan/design/deadline-waits.md](../../../docs/v2/plan/design/deadline-waits.md).
 
