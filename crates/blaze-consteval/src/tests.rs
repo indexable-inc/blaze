@@ -1790,3 +1790,121 @@ fn overloaded_deref_and_deref_mut_in_constants() {
     let e = w.eval("NON_CONST").expect_err("non-const Deref::deref must refuse");
     assert!(matches!(e.refusal, Refusal::NotConstFn { item } if item == nc_deref), "expected NotConstFn, got {:?}", e.refusal);
 }
+
+/// The Reference, "Literal patterns": a byte-string literal pattern `b"..."` matches `&[u8]`
+/// (as a wide pointer `(ptr, len)`), `&[u8; N]` (by value of its `N` bytes, never pointer
+/// address), and `&str` / `&CStr` continue to match by length and bytes; a byte-string
+/// expression coerced to `&[u8]` still widens once via `AdjustKind::Unsize`.
+#[test]
+fn byte_string_and_string_literal_patterns() {
+    let mut w = world();
+    let cstr = w.strukt("CStr", &[("inner", "[i8]")]);
+    w.fx.lang(blaze_typeck::LangItem::CStr, cstr);
+
+    // Core's `str::as_bytes`: `&str` and `&[u8]` share layout `(ptr, len)`.
+    w.const_fn("as_bytes", &[("s", "&str")], "&[u8]", "{ transmute(s) }");
+
+    // 1. `const fn` matching `s.as_bytes()` (`&[u8]`) against `b"newfunc"`, `b""`, same-length
+    //    non-matching `b"abcdefg"`, different-length `b"hi"`, and an or-pattern.
+    w.const_fn(
+        "classify_bytes",
+        &[("s", "&str")],
+        "u32",
+        r#"{
+            match as_bytes(s) {
+                b"newfunc" => 1,
+                b"" => 2,
+                b"abcdefg" => 3,
+                b"hi" | b"yo" => 4,
+                _ => 9,
+            }
+        }"#,
+    );
+    w.konst("SLICE_MATCH", "u32", r#"classify_bytes("newfunc")"#);
+    w.konst("SLICE_EMPTY", "u32", r#"classify_bytes("")"#);
+    w.konst("SLICE_SAME_LEN_MISS", "u32", r#"classify_bytes("newfunx")"#);
+    w.konst("SLICE_DIFF_LEN_MISS", "u32", r#"classify_bytes("longer_string")"#);
+    w.konst("SLICE_OR_SECOND", "u32", r#"classify_bytes("yo")"#);
+    w.konst("SLICE_SAME_LEN_HIT", "u32", r#"classify_bytes("abcdefg")"#);
+
+    // 2. `const fn` matching `&[u8; 3]` against `b"abc"` (matching + non-matching) and `&[u8; 0]`
+    //    against `b""`.
+    w.const_fn(
+        "match_arr3",
+        &[("x", "&[u8; 3]")],
+        "u32",
+        r#"{
+            match x {
+                b"abc" => 10,
+                b"xyz" => 20,
+                _ => 30,
+            }
+        }"#,
+    );
+    w.const_fn("match_arr0", &[("x", "&[u8; 0]")], "u32", r#"{ match x { b"" => 7, _ => 0 } }"#);
+    w.konst("ARR3_HIT", "u32", r#"match_arr3(&[b'a', b'b', b'c'])"#);
+    w.konst("ARR3_HIT2", "u32", r#"match_arr3(b"xyz")"#);
+    w.konst("ARR3_MISS", "u32", r#"match_arr3(b"abd")"#);
+    w.konst("ARR0_HIT", "u32", r#"match_arr0(&[])"#);
+
+    // 3. `const fn` matching `&str` against `"hello"` and `""`.
+    w.const_fn(
+        "match_str",
+        &[("s", "&str")],
+        "u32",
+        r#"{ match s { "hello" => 11, "" => 22, _ => 33 } }"#,
+    );
+    w.konst("STR_HIT", "u32", r#"match_str("hello")"#);
+    w.konst("STR_EMPTY", "u32", r#"match_str("")"#);
+    w.konst("STR_MISS", "u32", r#"match_str("world")"#);
+
+    // 4. `const fn` matching `&CStr` against `c"hi"` and `c""`.
+    w.const_fn(
+        "match_cstr",
+        &[("s", "&CStr")],
+        "u32",
+        r#"{ match s { c"hi" => 41, c"" => 42, _ => 43 } }"#,
+    );
+    w.konst("CSTR_HIT", "u32", r#"match_cstr(c"hi")"#);
+    w.konst("CSTR_EMPTY", "u32", r#"match_cstr(c"")"#);
+    w.konst("CSTR_MISS", "u32", r#"match_cstr(c"no")"#);
+
+    // 5. Expression `let s: &[u8] = b"hello";` inside `const fn` (no double-widening!).
+    w.const_fn(
+        "coerce_bstr",
+        &[],
+        "u32",
+        r#"{
+            let s: &[u8] = b"hello";
+            match s {
+                b"hello" => (s[0] as u32) * 1000 + (s[4] as u32),
+                _ => 0,
+            }
+        }"#,
+    );
+    w.konst("EXPR_COERCE", "u32", "coerce_bstr()");
+
+    w.build();
+
+    assert_eq!(eval_int(&mut w, "SLICE_MATCH"), Ok(1));
+    assert_eq!(eval_int(&mut w, "SLICE_EMPTY"), Ok(2));
+    assert_eq!(eval_int(&mut w, "SLICE_SAME_LEN_MISS"), Ok(9));
+    assert_eq!(eval_int(&mut w, "SLICE_DIFF_LEN_MISS"), Ok(9));
+    assert_eq!(eval_int(&mut w, "SLICE_OR_SECOND"), Ok(4));
+    assert_eq!(eval_int(&mut w, "SLICE_SAME_LEN_HIT"), Ok(3));
+
+    assert_eq!(eval_int(&mut w, "ARR3_HIT"), Ok(10));
+    assert_eq!(eval_int(&mut w, "ARR3_HIT2"), Ok(20));
+    assert_eq!(eval_int(&mut w, "ARR3_MISS"), Ok(30));
+    assert_eq!(eval_int(&mut w, "ARR0_HIT"), Ok(7));
+
+    assert_eq!(eval_int(&mut w, "STR_HIT"), Ok(11));
+    assert_eq!(eval_int(&mut w, "STR_EMPTY"), Ok(22));
+    assert_eq!(eval_int(&mut w, "STR_MISS"), Ok(33));
+
+    assert_eq!(eval_int(&mut w, "CSTR_HIT"), Ok(41));
+    assert_eq!(eval_int(&mut w, "CSTR_EMPTY"), Ok(42));
+    assert_eq!(eval_int(&mut w, "CSTR_MISS"), Ok(43));
+
+    assert_eq!(eval_int(&mut w, "EXPR_COERCE"), Ok(u128::from(b'h') * 1000 + u128::from(b'o')));
+}

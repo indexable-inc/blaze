@@ -222,10 +222,20 @@ pub(super) enum Op {
 const _: () = assert!(core::mem::size_of::<Op>() <= 16);
 
 #[derive(Clone, Copy, Debug)]
+pub(super) enum StrKind {
+    /// A thin pointer (`&[u8; N]`).
+    Thin,
+    /// A wide pointer (`&str`, `&[u8]`, `&CStr`): `(ptr, len)`.
+    Wide,
+    /// An array value in memory (`[u8; N]`, `N > 0`).
+    Mem,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(super) struct StrLit {
     pub(super) at: u32,
     pub(super) len: u32,
-    pub(super) wide: bool,
+    pub(super) kind: StrKind,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1673,10 +1683,25 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
             Lit::Char => Val::Int(u64::from(lit::char(src).map_err(Refusal::Literal)?)),
             Lit::Str | Lit::ByteStr(_) => {
                 let bytes = lit::bytes(src, self.alloc).map_err(Refusal::Literal)?;
+                let kind = if matches!(l, Lit::Str) {
+                    StrKind::Wide
+                } else {
+                    match node {
+                        PNode::Ref(_, inner) if matches!(self.node(inner)?, PNode::Slice(_)) => StrKind::Wide,
+                        PNode::Array(..) => {
+                            if bytes.is_empty() {
+                                self.emit(code, cc, Op::ImmZst { dst });
+                                return Ok(dst);
+                            }
+                            StrKind::Mem
+                        }
+                        _ => StrKind::Thin,
+                    }
+                };
                 let at = code.bytes.len() as u32;
                 code.bytes.extend_from_slice(&bytes);
                 let k = code.strs.len() as u32;
-                code.strs.push(StrLit { at, len: bytes.len() as u32, wide: matches!(l, Lit::Str) });
+                code.strs.push(StrLit { at, len: bytes.len() as u32, kind });
                 self.emit(code, cc, Op::Str { dst, k });
                 return Ok(dst);
             }
@@ -1687,7 +1712,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 let at = code.bytes.len() as u32;
                 code.bytes.extend_from_slice(&bytes);
                 let k = code.strs.len() as u32;
-                code.strs.push(StrLit { at, len: bytes.len() as u32, wide: true });
+                code.strs.push(StrLit { at, len: bytes.len() as u32, kind: StrKind::Wide });
                 self.emit(code, cc, Op::Str { dst, k });
                 return Ok(dst);
             }
