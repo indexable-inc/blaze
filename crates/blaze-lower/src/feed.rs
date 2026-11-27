@@ -247,7 +247,7 @@ fn run<'s>(m: &mut Machine<'_, '_, '_, 's>, output: &Output, toks: Toks<'_, '_, 
         match expansion {
             Expansion::Expanded => {
                 let mut ranges = m.append_expansion(&request, &out);
-                if request.fragment == blaze_expand::Fragment::Expr {
+                if request.fragment == blaze_expand::Fragment::Expr && out.non_local {
                     strip_trailing_expr_semis(&mut out.words.parser.words, &mut ranges);
                 }
                 let tokens = parser::Tokens::new(&out.words.parser.words, true);
@@ -286,9 +286,12 @@ fn skip_outer_attrs(words: &[u32]) -> Option<usize> {
     Some(i)
 }
 
-/// Strips a single trailing `;` from an expression-position macro expansion (`Fragment::Expr`),
-/// matching rustc's `ensure_complete_parse` (`SEMICOLON_IN_EXPRESSIONS_FROM_MACROS` lint, never a
-/// hard syntax error under `--cap-lints allow`).
+/// Strips a single trailing `;` from a non-local expression-position macro expansion
+/// (`Fragment::Expr` where the defining crate differs from the body's crate), matching rustc's
+/// `ensure_complete_parse` and `docs/support.md`: another crate's macro triggers the warn-by-default
+/// `semicolon_in_expressions_from_non_local_macros` lint (allowed in deps), while the crate's own
+/// macro triggers the deny-by-default `semicolon_in_expressions_from_macros` lint and is NOT
+/// stripped.
 ///
 /// Refuses to strip when:
 /// - fewer than 2 real words exist (a lone `;` must not become empty EOF, which `top::expr` would

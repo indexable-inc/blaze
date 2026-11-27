@@ -493,6 +493,13 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         }
     }
 
+    fn local_site(&self) -> Option<DefSite> {
+        match &self.names {
+            Names::Lists(lists) => lists.local_site(),
+            Names::Caller(names) => names.local_site(),
+        }
+    }
+
     /// Copies tokens `start..end` (stripping outer delimiters when `strip_delims` is true)
     /// from an earlier body expansion and seals them with that expansion's key.
     fn expanded_slice(&self, expansion: u32, start: u32, end: u32, strip_delims: bool) -> Result<TokenStream<'a>, Refused<'a>> {
@@ -521,11 +528,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
     fn local(&self, path: &str, locals: &[LocalMacro<'_>], edition: Edition) -> Option<Result<MacroDefinition<'a>, Refused<'a>>> {
         let name = path.trim();
         let written = locals.iter().rev().find(|l| l.name == name)?;
-        let site = match &self.names {
-            Names::Lists(lists) => lists.local_site(),
-            Names::Caller(names) => names.local_site(),
-        };
-        let Some(site) = site else { return Some(Err(Refused::Unknown(NoMacro::LocalWithoutCrate))) };
+        let Some(site) = self.local_site() else { return Some(Err(Refused::Unknown(NoMacro::LocalWithoutCrate))) };
         let at = DefAt { site, edition, export: Export::Local, local_inner: LocalInner::No, transparency: None };
         let lex_text = |text: &str, marks: InputMarks<'_>| match marks.is_empty() {
             true => lex(text, edition, self.alloc),
@@ -622,7 +625,8 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         })
     }
 
-    /// Expands `name!(input)`: its key and its expansion's tokens.
+    /// Expands `name!(input)`: its key, its expansion's tokens, and whether the macro is defined
+    /// in a crate other than the caller's own (`non_local`).
     fn call(
         &mut self,
         path: &str,
@@ -634,7 +638,7 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
         locals: &[LocalMacro<'_>],
         mut cfg: Option<&mut (dyn crate::Cfg + '_)>,
         written: Option<u32>,
-    ) -> Result<(ContentId, TokenStream<'a>), Refused<'a>> {
+    ) -> Result<(ContentId, TokenStream<'a>, bool), Refused<'a>> {
         let mut parents: AVec<'a, CallFrame<'d, 'a>> = Vec::new_in(self.alloc);
         let mut current = self.call_frame(path, at, input, edition, inside, depth, locals, written)?;
         loop {
@@ -710,7 +714,14 @@ impl<'d: 'a, 'a, C: ExpandCx> ByName<'d, 'a, C> {
                             parent.answers.push(tokens);
                             current = parent;
                         }
-                        None => return Ok((key, tokens)),
+                        None => {
+                            let def_krate = match &current.resolved {
+                                Resolved::Def(def) => def.site().krate,
+                                Resolved::Prepared(prepared) => prepared.def().site().krate,
+                            };
+                            let non_local = self.local_site().is_some_and(|local| def_krate != local.krate);
+                            return Ok((key, tokens, non_local));
+                        }
                     }
                 }
                 Ok(Expanded::NeedsExpanded(mut nested)) if current.answers.is_empty() && current.depth < EAGER_DEPTH => {
@@ -927,9 +938,10 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
             .input(CallInput::Text(input), input_marks, edition)
             .and_then(|input| self.call(path, at, input, edition, Inside::Plain, 0, &[], Some(cfg), None));
         match result {
-            Ok((key, tokens)) => {
+            Ok((key, tokens, non_local)) => {
                 out.key = key;
                 out.words = blaze_expand::body_words(&tokens, key, *out.words.words.allocator());
+                out.non_local = non_local;
                 Expansion::Expanded
             }
             Err(Refused::Unknown(_)) => Expansion::Unsupported,
@@ -968,9 +980,10 @@ impl<'d: 'a, 'a, C: ExpandCx> Expand for ByName<'d, 'a, C> {
         // call's error alike (`call`): placed at this call.
         self.note_reads(Some(call.range), call.path, blaze_surface::CallShape::FnLike, before);
         match result {
-            Ok((key, tokens)) => {
+            Ok((key, tokens, non_local)) => {
                 out.key = key;
                 out.words = blaze_expand::body_words(&tokens, key, *out.words.words.allocator());
+                out.non_local = non_local;
                 self.expansions.push((key, tokens));
                 Expansion::Expanded
             }

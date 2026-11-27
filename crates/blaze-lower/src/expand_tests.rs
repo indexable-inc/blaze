@@ -67,11 +67,30 @@ pub(crate) fn at() -> DefAt {
     }
 }
 
+pub(crate) fn external_at() -> DefAt {
+    DefAt {
+        site: DefSite { krate: CrateItemKey(ContentId([2; 32])), module: None },
+        edition: Edition::E2024,
+        export: Export::Exported,
+        local_inner: LocalInner::No,
+        transparency: None,
+    }
+}
+
+fn expanding_with<'t>(defs: &[(&'static str, &str)], external: bool, text: &'t str) -> Lowered<'static, 't> {
+    let defs: StdVec<Def> = defs.iter().map(|&(name, body)| Def { name, body, macro2: false, external }).collect();
+    expanding_defs(&defs, text)
+}
+
 /// `text`'s body lowered with `defs` (`(name, rules)`, the rules without their braces):
 /// the lowering, which reads its expansions' text through its view.
 fn expanding<'t>(defs: &[(&'static str, &str)], text: &'t str) -> Lowered<'static, 't> {
-    let defs: StdVec<Def> = defs.iter().map(|&(name, body)| Def { name, body, macro2: false }).collect();
-    expanding_defs(&defs, text)
+    expanding_with(defs, false, text)
+}
+
+/// Like [`expanding`], with `defs` defined in an external crate (`external_at().site.krate` != `at().site.krate`).
+fn expanding_external<'t>(defs: &[(&'static str, &str)], text: &'t str) -> Lowered<'static, 't> {
+    expanding_with(defs, true, text)
 }
 
 /// A definition of a test: `macro_rules! name { body }`, or `macro name { body }`.
@@ -80,6 +99,7 @@ struct Def<'b> {
     name: &'static str,
     body: &'b str,
     macro2: bool,
+    external: bool,
 }
 
 fn expanding_defs<'t>(defs: &[Def<'_>], text: &'t str) -> Lowered<'static, 't> {
@@ -101,9 +121,10 @@ fn by_name_with<C: ExpandCx>(defs: &[Def<'_>], host: C) -> ByName<'static, 'stat
     let mut rules: StdVec<(&'static str, Prepared<'static>)> = StdVec::new();
     for d in defs {
         let stream = lex(d.body, Edition::E2024, Alloc::global()).expect("the rules lex");
+        let def_at = if d.external { external_at() } else { at() };
         let def = match d.macro2 {
-            false => MacroDefinition::rules(stream, at()),
-            true => MacroDefinition::macro2(None, stream, at()),
+            false => MacroDefinition::rules(stream, def_at),
+            true => MacroDefinition::macro2(None, stream, def_at),
         };
         let def: &'static MacroDefinition<'static> = Box::leak(Box::new(def));
         rules.push((d.name, prepare(def).expect("the rules compile")));
@@ -147,7 +168,7 @@ impl ExpandCx for Placing {
 
 /// The dump of `text`'s body lowered with `defs` over [`Placing`], every form handled.
 fn placed_dump(defs: &[(&'static str, &str)], text: &str) -> String {
-    let defs: StdVec<Def> = defs.iter().map(|&(name, body)| Def { name, body, macro2: false }).collect();
+    let defs: StdVec<Def> = defs.iter().map(|&(name, body)| Def { name, body, macro2: false, external: false }).collect();
     let mut expander = by_name_with(&defs, Placing);
     let l = match lower_body_expanding(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()) {
         Ok(l) => l,
@@ -426,12 +447,14 @@ const CORE_DEBUG_ASSERT: Def<'static> = Def {
     name: "debug_assert",
     body: "($($arg:tt)*) => { if $crate::cfg!(debug_assertions) { $crate::assert!($($arg)*); } };",
     macro2: false,
+    external: false,
 };
 const CORE_WRITE: Def<'static> = Def {
     name: "write",
     body: "($dst:expr, $($arg:tt)*) => { $dst.write_fmt($crate::format_args!($($arg)*)) };
            ($($arg:tt)*) => { compile_error!(\"requires a destination and format arguments\") };",
     macro2: false,
+    external: false,
 };
 const CORE_CONST_EVAL_SELECT: Def<'static> = Def {
     name: "const_eval_select",
@@ -474,9 +497,10 @@ const CORE_CONST_EVAL_SELECT: Def<'static> = Def {
         )
     },",
     macro2: true,
+    external: false,
 };
 const CORE_PANIC_2021: Def<'static> =
-    Def { name: "panic_2021", body: "($($t:tt)+) => {{ $crate::const_format_args!($($t)+) }}", macro2: false };
+    Def { name: "panic_2021", body: "($($t:tt)+) => {{ $crate::const_format_args!($($t)+) }}", macro2: false, external: false };
 
 /// The hosted hello's census: `<*const T>::is_null` (core const_ptr.rs:26) calls core's
 /// `macro const_eval_select`, a `macro` (2.0) whose second arm calls the first through
@@ -1403,7 +1427,7 @@ const INNER_ITEM: (&str, &str) = ("inner_item", "(k: $k:expr) => { const C: u8 =
 /// and a mark of the defining crate at each byte of `marked` (where `mark_site::column_of_copy`
 /// starts a word's row: a `$crate`'s `$`).
 fn expanding_marked<'t>(defs: &[(&'static str, &str)], text: &'t str, marked: &[u32]) -> Lowered<'static, 't> {
-    let defs: StdVec<Def> = defs.iter().map(|&(name, body)| Def { name, body, macro2: false }).collect();
+    let defs: StdVec<Def> = defs.iter().map(|&(name, body)| Def { name, body, macro2: false, external: false }).collect();
     let mut expander = by_name(&defs);
     let mark = crate::mark_site::TextMark { site: at().site, transparency: blaze_expand::Transparency::SemiOpaque, edition: Edition::E2024 };
     let rows: StdVec<(u32, crate::mark_site::TextMark)> = marked.iter().map(|&at| (at, mark)).collect();
@@ -1659,13 +1683,32 @@ fn fill_holes_file_and_module_path_are_single_quoted_string_literals() {
     }
 }
 
-/// Expression-position macro expansions (`Fragment::Expr`) tolerate a single trailing `;` (rustc's
-/// `SEMICOLON_IN_EXPRESSIONS_FROM_MACROS` lint, as used in `cfg_aliases` 0.1.1 / 0.2.1's recursive
-/// `@parser_clause` arms), while still rejecting multiple trailing semicolons, lone semicolons,
-/// `let` statements, incomplete expressions, and item declarations with `DiagKind::Syntax`.
+/// Non-local expression-position macro expansions (`Fragment::Expr` where the macro is defined in
+/// another crate) tolerate a single trailing `;` (rustc's warn-by-default
+/// `semicolon_in_expressions_from_non_local_macros`, as used in `cfg_aliases` 0.1.1 / 0.2.1's
+/// recursive `@parser_clause` arms and `anyhow::bail!`), while:
+/// - local macros (same crate or body-local `macro_rules!`) STILL fail with `DiagKind::Syntax`
+///   (preserving rustc's deny-by-default `semicolon_in_expressions_from_macros`, docs/support.md),
+/// - external macros emitting multiple trailing semicolons, lone semicolons, `let` statements,
+///   incomplete expressions, or item declarations STILL fail with `DiagKind::Syntax`.
 #[test]
 fn expr_macro_expansion_strips_single_trailing_semicolon_matching_rustc() {
-    // Positive: `cfg_aliases!`-shaped recursive `@parser_clause` macro with trailing `;` in `if`.
+    let assert_external_expands = |defs: &[(&'static str, &str)], text: &str, fragments: &[&str]| {
+        let l = expanding_external(defs, text);
+        let dump = dump_of(&l);
+        let v = l.view();
+        assert!(v.unhandled().next().is_none(), "{text}: unhandled\n{dump}");
+        assert!(v.diags.is_empty(), "{text}: diagnostics {:?}\n{dump}", v.diags);
+        let mut at = 0;
+        for f in fragments {
+            match dump[at..].find(f) {
+                Some(i) => at += i + f.len(),
+                None => panic!("{text}: `{f}` not found after byte {at} of\n{dump}"),
+            }
+        }
+    };
+
+    // Positive (external): `cfg_aliases!`-shaped recursive `@parser_clause` macro with trailing `;` in `if`.
     let cfg_aliases = (
         "cfg_aliases",
         "(@parser_emit all $({$($grouped:tt)+})+) => { ($( ($crate::cfg_aliases!(@parser $($grouped)+)) )&&+) };
@@ -1685,47 +1728,62 @@ fn expr_macro_expansion_strips_single_trailing_semicolon_matching_rustc() {
          (@parser $key:ident = $val:literal) => { true };
          (@parser $name:ident) => { false };",
     );
-    assert_expands(
+    assert_external_expands(
         &[cfg_aliases],
         r#"fn f() -> u8 { if cfg_aliases!(@parser all(unix, not(any(windows, target_os = "macos")))) { 1 } else { 0 } }"#,
         &["(if (paren (bin And", "(lit 1)", "(lit 0)"],
     );
 
-    // Positive: single trailing `;` on literal, attributed macro call, nested expr macros, and
-    // diverging / control-flow expressions.
-    assert_expands(&[("m", "() => { 1; }")], "fn f() { let _x = m!(); }", &["(let _x@p0 (lit 1))"]);
-    assert_expands(
+    // Positive (external): single trailing `;` on literal, attributed macro call, nested expr
+    // macros, and diverging / control-flow expressions.
+    assert_external_expands(&[("m", "() => { 1; }")], "fn f() { let _x = m!(); }", &["(let _x@p0 (lit 1))"]);
+    assert_external_expands(
         &[("foo", "() => { 42; }"), ("m", "() => { #[allow(unused)] foo!(); }")],
         "fn f() -> u8 { m!() }",
         &["(tail (lit 42))"],
     );
-    assert_expands(&[("m", "() => { return; }")], "fn f() { let _ = m!(); }", &["(return)"]);
-    assert_expands(&[("m", "() => { break; }")], "fn f() { loop { let _ = m!(); } }", &["(break ->"]);
-    assert_expands(&[("m", "() => { continue; }")], "fn f() { loop { let _ = m!(); } }", &["(continue ->"]);
-    assert_expands(
+    assert_external_expands(&[("m", "() => { return; }")], "fn f() { let _ = m!(); }", &["(return)"]);
+    assert_external_expands(&[("m", "() => { break; }")], "fn f() { loop { let _ = m!(); } }", &["(break ->"]);
+    assert_external_expands(&[("m", "() => { continue; }")], "fn f() { loop { let _ = m!(); } }", &["(continue ->"]);
+    assert_external_expands(
         &[("m", "() => { if let Some(v) = Some(1) { v } else { 0 }; }")],
         "fn f() -> u8 { m!() }",
         &["(tail (if (let"],
     );
 
-    // Negative controls: MUST still emit `DiagKind::Syntax` (matching rustc hard errors).
-    let assert_syntax_error = |label: &str, body: &str, fn_text: &str| {
-        let l = expanding(&[("m", body)], fn_text);
+    // Negative controls (local macros): same-crate and body-local macros MUST stay refused with
+    // `DiagKind::Syntax` (preserving deny-by-default `semicolon_in_expressions_from_macros`).
+    let assert_local_syntax_error = |label: &str, defs: &[(&'static str, &str)], fn_text: &str| {
+        let l = expanding(defs, fn_text);
+        let has_syntax = l.view().diags().filter_map(Result::ok).any(|d| d.kind == crate::DiagKind::Syntax);
+        assert!(has_syntax, "{label}: expected DiagKind::Syntax, got diags {:?}\n{}", l.view().diags, dump_of(&l));
+    };
+    assert_local_syntax_error("same-crate expr with trailing semi", &[("m", "() => { 1; }")], "fn f() { let _ = m!(); }");
+    assert_local_syntax_error("same-crate return with trailing semi", &[("m", "() => { return; }")], "fn f() { let _ = m!(); }");
+    assert_local_syntax_error(
+        "body-local macro_rules with trailing semi",
+        &[],
+        "fn f() -> u8 { macro_rules! m { () => { 1; }; } m!() }",
+    );
+
+    // Negative controls (external macros): invalid shapes MUST still emit `DiagKind::Syntax`.
+    let assert_external_syntax_error = |label: &str, body: &str, fn_text: &str| {
+        let l = expanding_external(&[("m", body)], fn_text);
         let has_syntax = l.view().diags().filter_map(Result::ok).any(|d| d.kind == crate::DiagKind::Syntax);
         assert!(has_syntax, "{label}: expected DiagKind::Syntax, got diags {:?}\n{}", l.view().diags, dump_of(&l));
     };
 
-    assert_syntax_error("lone semicolon", "() => { ; }", "fn f() { let _ = m!(); }");
-    assert_syntax_error("double semicolon alone", "() => { ;; }", "fn f() { let _ = m!(); }");
-    assert_syntax_error("expr with double trailing semicolon", "() => { 1;; }", "fn f() { let _ = m!(); }");
-    assert_syntax_error("return with double trailing semicolon", "() => { return;; }", "fn f() { let _ = m!(); }");
-    assert_syntax_error("two expressions", "() => { 1; 2; }", "fn f() { let _ = m!(); }");
-    assert_syntax_error("incomplete binary expr", "() => { 1 + ; }", "fn f() { let _ = m!(); }");
-    assert_syntax_error("let statement in value pos", "() => { let x = 1; }", "fn f() { let _ = m!(); }");
-    assert_syntax_error("let statement in if cond", "() => { let x = 1; }", "fn f() { if m!() {} }");
-    assert_syntax_error("attributed let statement", "() => { #[cfg(all())] let x = 1; }", "fn f() { if m!() {} }");
-    assert_syntax_error("doc-commented let statement", "() => { /// doc\n let x = 1; }", "fn f() { if m!() {} }");
-    assert_syntax_error("attribute before lone semicolon", "() => { #[allow(unused)] ; }", "fn f() { let _ = m!(); }");
-    assert_syntax_error("const item", "() => { const X: i32 = 1; }", "fn f() { let _ = m!(); }");
-    assert_syntax_error("struct item", "() => { struct S; }", "fn f() { let _ = m!(); }");
+    assert_external_syntax_error("lone semicolon", "() => { ; }", "fn f() { let _ = m!(); }");
+    assert_external_syntax_error("double semicolon alone", "() => { ;; }", "fn f() { let _ = m!(); }");
+    assert_external_syntax_error("expr with double trailing semicolon", "() => { 1;; }", "fn f() { let _ = m!(); }");
+    assert_external_syntax_error("return with double trailing semicolon", "() => { return;; }", "fn f() { let _ = m!(); }");
+    assert_external_syntax_error("two expressions", "() => { 1; 2; }", "fn f() { let _ = m!(); }");
+    assert_external_syntax_error("incomplete binary expr", "() => { 1 + ; }", "fn f() { let _ = m!(); }");
+    assert_external_syntax_error("let statement in value pos", "() => { let x = 1; }", "fn f() { let _ = m!(); }");
+    assert_external_syntax_error("let statement in if cond", "() => { let x = 1; }", "fn f() { if m!() {} }");
+    assert_external_syntax_error("attributed let statement", "() => { #[cfg(all())] let x = 1; }", "fn f() { if m!() {} }");
+    assert_external_syntax_error("doc-commented let statement", "() => { /// doc\n let x = 1; }", "fn f() { if m!() {} }");
+    assert_external_syntax_error("attribute before lone semicolon", "() => { #[allow(unused)] ; }", "fn f() { let _ = m!(); }");
+    assert_external_syntax_error("const item", "() => { const X: i32 = 1; }", "fn f() { let _ = m!(); }");
+    assert_external_syntax_error("struct item", "() => { struct S; }", "fn f() { let _ = m!(); }");
 }
