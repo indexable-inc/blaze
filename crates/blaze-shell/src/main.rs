@@ -5555,6 +5555,16 @@ mod macos_app {
                                             shell.refresh_editor_assist(false);
                                             dirty = true;
                                         }
+                                        HitAction::RunCommand(cmd) => {
+                                            active_popover = None;
+                                            let (cols, rows) = grid_for(size, &fonts, scale);
+                                            let cpx = (
+                                                fonts.metrics.cell_w as u32,
+                                                fonts.metrics.cell_h as u32,
+                                            );
+                                            shell.submit_command(&cmd, cols, rows, cpx, true);
+                                            dirty = true;
+                                        }
                                         HitAction::CopyText(txt) => {
                                             copy_to_pasteboard(&txt);
                                         }
