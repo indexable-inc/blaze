@@ -188,6 +188,20 @@ pub fn resolve_written<'n, S: NamesSource<'n>>(
     resolver.path_with(site.module, site.dollar_crate, abs, texts, ns).map_err(|e| Why::Resolve(e, r))
 }
 
+/// The mark of path `p`'s first token in `v`: from `v.mark_of_path(p)` for an expansion
+/// lowered in place, else from `marks` for a non-expansion item slice, else `None`.
+pub fn path_mark(marks: Option<TextMarks<'_>>, v: &View<'_>, p: PathIdx, r: Range) -> Result<Option<TextMark>, Why> {
+    let range = v.path_range(p)?;
+    match (v.mark_of_path(p)?, marks) {
+        (Some(m), _) => Ok(Some(m)),
+        (None, Some(marks)) if !range.in_expansion() => {
+            let start = v.text_at(range)?;
+            marks.mark_of(start).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), r))
+        }
+        (None, _) => Ok(None),
+    }
+}
+
 /// Where the path `p` of `v` (first segment `first`, from `::` when `abs`), written in
 /// `module`, is read: the module and `$crate`'s crate its first token's mark says
 /// ([`site_in`]), the mark found as [`resolve_written`] finds it. The one reading of a written
@@ -204,15 +218,7 @@ pub fn written_site<'n, S: NamesSource<'n>>(
     first: &str,
     r: Range,
 ) -> Result<PathSite, Why> {
-    let range = v.path_range(p)?;
-    let mark = match (v.mark_of_path(p)?, marks) {
-        (Some(m), _) => Some(m),
-        (None, Some(marks)) if !range.in_expansion() => {
-            let start = v.text_at(range)?;
-            marks.mark_of(start).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), r))?
-        }
-        (None, _) => None,
-    };
+    let mark = path_mark(marks, v, p, r)?;
     marked_site(resolver.names, mark, first, abs, module, r)
 }
 

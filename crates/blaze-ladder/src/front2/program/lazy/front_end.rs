@@ -49,6 +49,48 @@ impl<'n> InternalBindings<'n> {
     }
 }
 
+/// All foreign-block declarations in this program search the same linked crate closure for a
+/// matching strong Rust `#[no_mangle]` / `#[export_name]` definition. Cache both positive hits
+/// (`Some(def)`) and external C misses (`None`) per declaration key so repeated queries are O(1),
+/// and keep the covering `NameCell::Exports` reads once for callers.
+pub(super) struct ExportBindings<'n> {
+    linked: Option<AVec<'n, usize>>,
+    resolved: Map<ItemKey, Option<ItemKey>, Alloc<'n>>,
+    callers: Map<ItemKey, (), Alloc<'n>>,
+    reads: AVec<'n, TableRead>,
+    refused: Option<Front2Refusal>,
+}
+
+impl<'n> ExportBindings<'n> {
+    pub(super) fn new_in(alloc: Alloc<'n>) -> Self {
+        Self {
+            linked: None,
+            resolved: Map::new_in(alloc),
+            callers: Map::new_in(alloc),
+            reads: AVec::new_in(alloc),
+            refused: None,
+        }
+    }
+
+    fn read<S: NamesSource<'n>>(&mut self, owner: Option<ItemKey>, names: S) -> Result<(), Front2Refusal> {
+        if self.reads.is_empty() {
+            for krate in 0..names.crate_count() {
+                let Some(key) = names.crate_key(krate) else {
+                    self.reads.clear();
+                    return Err(Front2Refusal::Unlisted { krate });
+                };
+                self.reads.push(crate::front2::export_shim::search_read(key));
+            }
+            self.reads.sort_unstable();
+            self.reads.dedup();
+        }
+        if let Some(owner) = owner {
+            self.callers.insert(owner, ());
+        }
+        Ok(())
+    }
+}
+
 impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     /// ADT `key`'s head is not made: a NEED, noted for the build's `make_asked` (as a world's
     /// question notes what it found unmade); the build's `NoAdt` makes it and asks again (run.rs
@@ -136,6 +178,47 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         if bindings.callers.contains_key(&owner) { bindings.reads.as_slice() } else { &[] }
     }
 
+    /// Resolves `item` against same-program strong Rust `#[no_mangle]` / `#[export_name]` exports,
+    /// caching both hits (`Some(def)`) and external C misses (`None`) per declaration key.
+    pub(super) fn bind_export(&self, owner: Option<ItemKey>, item: ItemKey) -> Result<Option<ItemKey>, Front2Refusal> {
+        use crate::front2::export_shim::{self, ExportRefused};
+        let names = self.front.names;
+        let mut bindings = self.export_bindings.borrow_mut();
+        if let Some(&cached) = bindings.resolved.get(&item) {
+            if owner.is_some() {
+                bindings.read(owner, names)?;
+            }
+            return Ok(cached);
+        }
+        let alloc = self.store.tys.alloc();
+        let refused = |why: ExportRefused<'_>| Front2Refusal::Unchecked {
+            function: crate::front2::item_shown::ItemShown::of(names, &self.front.keys, item).boxed(),
+            class: why.class().into(),
+            first: export_shim::format_refused(&why, alloc).as_str().into(),
+        };
+        let Some(decl) = export_shim::declares(names, &self.store, item, alloc).map_err(refused)? else {
+            return Ok(None);
+        };
+        bindings.read(owner, names)?;
+        let linked = match &bindings.linked {
+            Some(crates) => crates.as_slice(),
+            None => {
+                let crates = export_shim::linked_crates(names, self.export_roots.as_slice(), &decl.symbol, self.alloc)
+                    .map_err(refused)?;
+                bindings.linked.insert(crates).as_slice()
+            }
+        };
+        let target = export_shim::bound_in(names, &self.front.keys, linked, &decl, alloc).map_err(refused)?;
+        bindings.resolved.insert(item, target);
+        Ok(target)
+    }
+
+    /// The caller's cross-crate reads for same-program exported symbol binding.
+    pub fn export_binding_reads(&mut self, owner: ItemKey) -> &[TableRead] {
+        let bindings = self.export_bindings.get_mut();
+        if bindings.callers.contains_key(&owner) { bindings.reads.as_slice() } else { &[] }
+    }
+
     /// The seam's `check_one` with the body's checked columns read from the check's record
     /// (typed.rs), never checked here: the typing seam's `FromRecord` (run/make_one.rs). A
     /// gap is [`LazyRefusal::Typed`] naming the body.
@@ -155,9 +238,11 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             });
             for callee in checked.callees.column::<1>().iter().copied().chain(values) {
                 self.bind_internal(key, callee).map_err(RunError::Front2)?;
+                self.bind_export(Some(key), callee).map_err(RunError::Front2)?;
             }
         } else {
             self.bind_internal(key, key).map_err(RunError::Front2)?;
+            self.bind_export(Some(key), key).map_err(RunError::Front2)?;
         }
         Ok(body)
     }
@@ -219,11 +304,20 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
         if let Some(default) = crate::front2::alloc_shim::bound(self.front.names, &self.front.index, &self.store, item, alloc) {
             return Ok((default, List::EMPTY));
         }
-        match self.bind_internal(self.rows.key[i], item) {
+        let owner = self.rows.key[i];
+        match self.bind_internal(owner, item) {
             Ok(Some(def)) => return Ok((def, List::EMPTY)),
             Ok(None) => {}
             Err(why) => {
                 self.internal_bindings.borrow_mut().refused = Some(why);
+                return Err(ResolveError::Missing(tc::Question::Attrs(item)));
+            }
+        }
+        match self.bind_export(Some(owner), item) {
+            Ok(Some(def)) => return Ok((def, List::EMPTY)),
+            Ok(None) => {}
+            Err(why) => {
+                self.export_bindings.borrow_mut().refused = Some(why);
                 return Err(ResolveError::Missing(tc::Question::Attrs(item)));
             }
         }
@@ -244,6 +338,9 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// as the body check makes its own (check.rs `make_all`).
     fn make_asked(&mut self, i: usize) -> Result<bool, crate::run::RunError> {
         if let Some(why) = self.internal_bindings.get_mut().refused.take() {
+            return Err(crate::run::RunError::Front2(why));
+        }
+        if let Some(why) = self.export_bindings.get_mut().refused.take() {
             return Err(crate::run::RunError::Front2(why));
         }
         let fills = core::mem::replace(self.asked.get_mut(), Vec::new_in(Global));
@@ -330,9 +427,11 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// callee the build resolved to before its own `check_one` made its row still has its
     /// signature's ABI.
     fn fn_abi(&self, key: ItemKey) -> Option<Abi> {
-        // The ABI of the fn an allocator declaration runs, not the declaration's (program.rs
-        // `fn_abi`, blaze-build `Adts::abi`).
-        let key = crate::front2::alloc_shim::bound(self.front.names, &self.front.index, &self.store, key, self.store.tys.alloc()).unwrap_or(key);
+        // The ABI of the fn an allocator declaration or same-program export runs, not the
+        // declaration's (program.rs `fn_abi`, blaze-build `Adts::abi`).
+        let key = crate::front2::alloc_shim::bound(self.front.names, &self.front.index, &self.store, key, self.store.tys.alloc())
+            .or_else(|| self.bind_export(None, key).ok().flatten())
+            .unwrap_or(key);
         let tabled = self.rows.by_key.get(&key).and_then(|&i| self.rows.abi.get(i as usize).copied());
         super::seam_rules::fn_abi(tabled, self.front.names, &self.store, key)
     }

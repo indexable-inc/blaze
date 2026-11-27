@@ -43,13 +43,15 @@ struct Row<'n> {
 /// a fn with none (a foreign fn, a trait's declaration when `of_trait`, an intrinsic).
 pub(super) fn table_one<'n>(
     names: &'n Names<'n>,
+    keys: &crate::front2::keys::Keys,
     store: &Store<'n>,
+    roots: &[usize],
     key: ItemKey,
     body: Option<(Body<'n>, Checked<'static>)>,
     path: crate::front2::row_path::RowPath,
     of_trait: bool,
 ) -> Verdict<'n> {
-    match row(names, store, key, body, &path, of_trait) {
+    match row(names, keys, store, roots, key, body, &path, of_trait) {
         Ok(r) => Verdict::Tabled(Tabled {
             key,
             body: r.body,
@@ -73,7 +75,9 @@ pub(super) fn table_one<'n>(
 /// [`table_one`]'s work. Every `Err` here is a refusal of THIS fn, named.
 fn row<'n>(
     names: &'n Names<'n>,
+    keys: &crate::front2::keys::Keys,
     store: &Store<'n>,
+    roots: &[usize],
     key: ItemKey,
     body: Option<(Body<'n>, Checked<'static>)>,
     row_path: &crate::front2::row_path::RowPath,
@@ -129,7 +133,12 @@ fn row<'n>(
     // `__rust_no_alloc_shim_is_unstable_v2` is built in place as nothing (front2/alloc_shim.rs).
     let alloc_shim = crate::front2::alloc_shim::declares(names, store, key, alloc)
         .map_err(|why| Front2Refusal::Attrs { function: function(), why: why.detail() })?;
-    let bound = lazy::seam_rules::bound_decl_row(names, store, key, panic_entry, alloc_shim, path)?;
+    let export_bound = if !panic_entry && alloc_shim.is_none() && foreign.is_some() && head.container.is_none() {
+        lazy::seam_rules::export_binding(names, keys, store, roots, key, || Ok(()))?.is_some()
+    } else {
+        false
+    };
+    let bound = lazy::seam_rules::bound_decl_row(names, store, key, panic_entry, alloc_shim, export_bound, path)?;
     let (body, checked, kind, symbol, lits) = match (body, bound) {
         (Some((body, checked)), _) => {
             let lits = literals(&body, path)?;

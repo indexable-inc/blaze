@@ -88,6 +88,7 @@ pub mod on_unimplemented;
 pub mod opaque_auto;
 pub mod own_trait;
 pub mod alloc_shim;
+pub mod export_shim;
 pub mod internal_symbol;
 /// The soft-float routines (`__addtf3` ..) bound from the program's compiler_builtins
 /// (INTRINSICS.md 3.5, P5b).

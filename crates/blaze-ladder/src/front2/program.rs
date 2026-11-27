@@ -1334,7 +1334,7 @@ impl<'n> Front2Program<'n> {
                     continue;
                 }
             };
-            match tabled::table_one(names, &store, key, body, path, of_trait) {
+            match tabled::table_one(names, &front.keys, &store, front.index.scope(), key, body, path, of_trait) {
                 tabled::Verdict::Tabled(row) => {
                     by_key.insert(key, fns.len());
                     fns.push(row);
@@ -1351,7 +1351,7 @@ impl<'n> Front2Program<'n> {
         let mut inline_for_specs: blaze_own::Vec<super::inline_for::SpecRow, Alloc<'static>> = blaze_own::Vec::with_capacity_in(spec_lowered.len(), alloc);
         for (orig, args, body, checked, path) in spec_lowered {
             let key = body.owner;
-            match tabled::table_one(names, &store, key, Some((body, checked)), path, false) {
+            match tabled::table_one(names, &front.keys, &store, front.index.scope(), key, Some((body, checked)), path, false) {
                 tabled::Verdict::Tabled(row) => {
                     let row_idx = fns.len();
                     by_key.insert(key, row_idx);
@@ -1857,7 +1857,9 @@ impl FrontEnd for Front2Program<'_> {
         // is made with the ABI of the fn it runs (std's `__rdl_alloc`, "C", a `usize`):
         // blaze-build `Adts::abi`. Read from the declaration, the caller passed the address of
         // its `Alignment` where the default reads the value (std hello's trap, 2026-11-17).
-        let key = super::alloc_shim::bound(self.front.names, &self.front.index, &self.store, key, self.store.tys.alloc()).unwrap_or(key);
+        let key = super::alloc_shim::bound(self.front.names, &self.front.index, &self.store, key, self.store.tys.alloc())
+            .or_else(|| lazy::seam_rules::export_binding(self.front.names, &self.front.keys, &self.store, self.front.index.scope(), key, || Ok(())).ok().flatten())
+            .unwrap_or(key);
         let tabled = self.by_key.get(&key).map(|&i| self.fns[i].abi);
         lazy::seam_rules::fn_abi(tabled, self.front.names, &self.store, key)
     }
@@ -1890,6 +1892,9 @@ impl FrontEnd for Front2Program<'_> {
         // `UserCrate::panic`: crate::panic_strategy). An unreadable one was refused by name by
         // the reach walk at the declaration, so no call of it is built to come here.
         if let Ok(Some(def)) = lazy::seam_rules::internal_binding(self.front.names, &self.front.keys, &self.store, item, || Ok(())) {
+            return Ok((def, List::EMPTY));
+        }
+        if let Ok(Some(def)) = lazy::seam_rules::export_binding(self.front.names, &self.front.keys, &self.store, self.front.index.scope(), item, || Ok(())) {
             return Ok((def, List::EMPTY));
         }
         let r = self.in_world(i, |w| resolve_instance(w, item, args, ground, alloc))??;
