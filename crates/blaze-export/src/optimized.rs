@@ -749,10 +749,14 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                             regions.tls_indices_at + 8 * u64::from(index)
                         }
                         Space::Func if call_triple(&r, k) => {
-                            if target_home(members, &by_symbol, &home, data, &by_target, &regions.data_home, regions.tls_desc, t).is_none() {
+                            let Some(to) = target_home(members, &by_symbol, &home, data, &by_target, &regions.data_home, regions.tls_desc, t) else {
                                 return Err(ExportError::OutOfReach { from: symbol, target: t });
+                            };
+                            if bl(pc + 8, to, symbol).is_ok() {
+                                write32(&mut text, x, NOP);
+                            } else {
+                                write32(&mut text, x, adrp(inst, pc, to, symbol)?);
                             }
-                            write32(&mut text, x, NOP);
                             continue;
                         }
                         Space::Func | Space::Static | Space::Vtable => {
@@ -787,8 +791,14 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                             match (call, t.space) {
                                 (true, Space::Func) => {
                                     expect(&text, x + 4, BLR, symbol, "blr")?;
-                                    write32(&mut text, x, NOP);
-                                    write32(&mut text, x + 4, bl(pc + 4, to, symbol)?);
+                                    if let Ok(branch) = bl(pc + 4, to, symbol) {
+                                        write32(&mut text, x, NOP);
+                                        write32(&mut text, x + 4, branch);
+                                    } else {
+                                        // Target is past `bl`'s ±128 MiB reach; `GotPage21` kept
+                                        // `adrp`, so convert `ldr` to `add_lo12` and keep `blr`.
+                                        write32(&mut text, x, add_lo12(inst, to));
+                                    }
                                 }
                                 (true, _) => return Err(ExportError::CallOfData { from: symbol, at: reloc.at }),
                                 (false, _) => write32(&mut text, x, add_lo12(inst, to)),

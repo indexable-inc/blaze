@@ -1672,9 +1672,16 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
                             return Err(ExportError::CallOfData { from: symbol, at: site.at });
                         }
                         SiteKind::Call => {
-                            write32(&mut text, x, NOP);
-                            write32(&mut text, x + 4, NOP);
-                            write32(&mut text, x + 8, bl(pc + 8, to, symbol)?);
+                            if let Ok(branch) = bl(pc + 8, to, symbol) {
+                                write32(&mut text, x, NOP);
+                                write32(&mut text, x + 4, NOP);
+                                write32(&mut text, x + 8, branch);
+                            } else {
+                                // Target is past ARM64 `bl`'s ±128 MiB reach: materialize `to` via
+                                // `adrp + add` (±4 GiB reach) into the existing `blr` at `x + 8`.
+                                write32(&mut text, x, adrp(first, pc, to, symbol)?);
+                                write32(&mut text, x + 4, add_lo12(second, to));
+                            }
                         }
                         _ => {
                             write32(&mut text, x, adrp(first, pc, to, symbol)?);
