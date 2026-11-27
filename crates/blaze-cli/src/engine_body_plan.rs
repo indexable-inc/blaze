@@ -414,7 +414,11 @@ impl fmt::Display for Unoutlined {
 /// there is, but for a file named twice). `None`: no outline is at `path`.
 pub(crate) fn outline_at_path(outlined: &[Outlined<'_>], path: &[u8], reach: &[Name]) -> Option<usize> {
     let mut first = None;
-    for (at, one) in outlined.iter().enumerate().filter(|(_, one)| one.path.as_slice() == path) {
+    for (at, one) in outlined
+        .iter()
+        .enumerate()
+        .filter(|(_, one)| one.path.as_slice() == path && !crate::data_include::is_data(one.edition))
+    {
         if reach.binary_search(&one.name).is_ok() {
             return Some(at);
         }

@@ -3433,7 +3433,7 @@ fn outline_exists(outlines: &[Outlined<'_>], real: &str, alloc: blaze_own::Alloc
             .binary_search_by_key(&slot, |one| one.name)
             .ok()
             .and_then(|i| outlines.get(i))
-            .is_some_and(|one| one.path.as_slice() == real.as_bytes())
+            .is_some_and(|one| one.path.as_slice() == real.as_bytes() && !crate::data_include::is_data(one.edition))
     };
     if locate(Name::file(real.as_bytes())) {
         return true;

@@ -243,8 +243,8 @@ fn text_cell_of<'n>(
     }
     let bad = |what| Unplaced { key, why: UnplacedWhy::Record { what } };
     let items = records.items_record(k).ok_or_else(|| bad("no items record"))?;
-    let (at, owner, member) = if let Some(row) = items.item(key).map_err(|_| bad("unreadable item row"))? {
-        (row.text.ok_or_else(|| bad("item row has no text span"))?.at, key, None)
+    let (at, owner, member) = if let Some(identity) = items.identity(key).map_err(|_| bad("unreadable item row"))? {
+        (identity.at.ok_or_else(|| bad("item row has no text span"))?, key, None)
     } else if let Some((owner, _)) = items.member_owner(key).map_err(|_| bad("unreadable member owner"))? {
         let rows = items.members(owner).map_err(|_| bad("unreadable member rows"))?.ok_or_else(|| bad("owner has no member rows"))?;
         let mut found = None;
@@ -278,8 +278,8 @@ fn text_cell_of<'n>(
     let row = subjects.binary_search_by(|row| (row.prefix, row.file).cmp(&(prefix, file)))
         .map_err(|_| Unplaced { key, why: UnplacedWhy::NoOutline { file } })?;
     let subject = &subjects[row];
-    let pieces = items.pieces(owner).map_err(|_| bad("unreadable item chain"))?.ok_or_else(|| bad("missing item chain"))?;
-    let entry = subject.signature_file.entry_from_chain(pieces.chain);
+    let chain = items.chain(owner).map_err(|_| bad("unreadable item chain"))?.ok_or_else(|| bad("missing item chain"))?;
+    let entry = subject.signature_file.entry_from_chain(chain);
     let name = match member {
         Some((kind, name)) => crate::engine_tasks::member_entry(entry, kind, name),
         None => entry,
