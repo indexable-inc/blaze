@@ -148,6 +148,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-diag-parse"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+]
+
+[[package]]
 name = "blaze-dust"
 version = "0.0.0"
 dependencies = [
@@ -444,6 +451,7 @@ dependencies = [
  "blaze-base64",
  "blaze-cli-spec",
  "blaze-data",
+ "blaze-diag-parse",
  "blaze-dust",
  "blaze-git",
  "blaze-git-meta",
@@ -458,6 +466,7 @@ dependencies = [
  "blaze-sys",
  "blaze-sysmon",
  "blaze-term-api",
+ "blaze-tiling",
  "blaze-ui",
  "blaze-vim",
  "blaze-vt",
@@ -610,6 +619,13 @@ name = "blaze-text"
 version = "0.0.0"
 dependencies = [
  "blaze-int",
+ "blaze-own",
+]
+
+[[package]]
+name = "blaze-tiling"
+version = "0.0.0"
+dependencies = [
  "blaze-own",
 ]
 

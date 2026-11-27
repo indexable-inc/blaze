@@ -1,0 +1,22 @@
+[package]
+name = "blaze-diag-parse"
+description = "Pure no_std, zero-unsafe, sans-IO inline Markdown parser and universal compiler/CLI diagnostic line classifier on blaze-own explicit allocators"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+authors = ["blaze contributors"]
+
+[lib]
+name = "blaze_diag_parse"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+blaze-own = { path = "../blaze-own" }
+
+[dev-dependencies]
+blaze-own = { path = "../blaze-own", features = ["testing"] }
+
+[lints]
+workspace = true

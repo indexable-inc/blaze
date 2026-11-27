@@ -1577,19 +1577,77 @@ fn layout_starship_line(
         draw_icon(scene, Icon::Branch, cx, ty + (m.ch - branch_s) * 0.5, branch_s, branch_icon_col, clip_id);
         cx += branch_s + 5.0;
 
-        let branch_lbl = if prompt.git_detached {
-            format!("@{branch}")
+        if prompt.git_detached {
+            let branch_lbl = format!("@{branch}");
+            scene.text(cx, ty, &branch_lbl, branch_col, false, false, clip_id);
+            cx += branch_lbl.chars().count() as f32 * m.cw;
         } else {
-            branch.clone()
-        };
-        scene.text(cx, ty, &branch_lbl, branch_col, false, false, clip_id);
-        cx += branch_lbl.chars().count() as f32 * m.cw;
+            cx += draw_styled_branch_name(scene, cx, ty, branch, is_live, false, m, clip_id);
+        }
 
         if let Some(st) = &prompt.git_status {
             if let Some(state_lbl) = &st.state_label {
                 cx += 6.0;
                 scene.text(cx, ty, state_lbl, theme::FIRE, true, false, clip_id);
                 cx += state_lbl.chars().count() as f32 * m.cw;
+            }
+            // Compact inline divergence indicator + mini visual bar vs `main` / `origin/main`
+            // right on the branch segment (hovering opens the full visual commit graph popover!).
+            if is_live
+                && let Some(rel) = &st.branch_relation
+                && (rel.ahead > 0 || rel.behind > 0)
+            {
+                cx += 7.0;
+                let a_col = theme::rgb(0x57, 0xc7, 0x85);
+                let b_col = if rel.behind >= 10 {
+                    theme::rgb(0xf0, 0x71, 0x78)
+                } else {
+                    theme::rgb(0xe8, 0xa8, 0x48)
+                };
+                if rel.ahead > 0 {
+                    let s = format!("↑{}", rel.ahead);
+                    scene.text(cx, ty, &s, a_col, false, false, clip_id);
+                    cx += s.chars().count() as f32 * m.cw;
+                    if rel.behind > 0 {
+                        cx += 4.0;
+                    }
+                }
+                if rel.behind > 0 {
+                    let s = format!("↓{}", rel.behind);
+                    scene.text(cx, ty, &s, b_col, rel.behind >= 10, false, clip_id);
+                    cx += s.chars().count() as f32 * m.cw;
+                }
+                // Proportional mini ahead/behind bar (`20px × 3.5px`) so divergence reads at a glance.
+                cx += 5.0;
+                let bar_w = 20.0f32;
+                let bar_h = 3.5f32;
+                let bar_y0 = ty + (m.ch - bar_h) * 0.5;
+                scene.round_rect(
+                    cx,
+                    bar_y0,
+                    cx + bar_w,
+                    bar_y0 + bar_h,
+                    1.75,
+                    theme::BG_TRACK,
+                    0.0,
+                    [0.0; 4],
+                    clip_id,
+                );
+                let total_d = (rel.ahead + rel.behind) as f32;
+                let fill_scale = ((total_d + 1.0).ln() / 20.0f32.ln()).clamp(0.28, 1.0);
+                let fill_w = (bar_w * fill_scale).max(4.0);
+                if rel.ahead > 0 && rel.behind > 0 {
+                    let gap = 1.0;
+                    let avail = (fill_w - gap).max(3.0);
+                    let aw = ((rel.ahead as f32 / total_d) * avail).clamp(2.0, avail - 2.0);
+                    scene.round_rect(cx, bar_y0, cx + aw, bar_y0 + bar_h, 1.5, a_col, 0.0, [0.0; 4], clip_id);
+                    scene.round_rect(cx + aw + gap, bar_y0, cx + fill_w, bar_y0 + bar_h, 1.5, b_col, 0.0, [0.0; 4], clip_id);
+                } else if rel.ahead > 0 {
+                    scene.round_rect(cx, bar_y0, cx + fill_w, bar_y0 + bar_h, 1.5, a_col, 0.0, [0.0; 4], clip_id);
+                } else {
+                    scene.round_rect(cx, bar_y0, cx + fill_w, bar_y0 + bar_h, 1.5, b_col, 0.0, [0.0; 4], clip_id);
+                }
+                cx += bar_w;
             }
         }
         let branch_rect = HitRect::new(seg2_x0, y, cx + 4.0, y + cap_h);
@@ -1673,14 +1731,19 @@ fn layout_starship_line(
                 );
             }
 
-            // Segment 4: Ahead/behind & stash count (hover over `≡ 3` inspects actual git stashes!).
-            if st.ahead > 0 || st.behind > 0 || st.stashed > 0 {
+            // Segment 4: Upstream ahead/behind (only when distinct from Segment 2's base relation) & stash count.
+            let show_upstream_ab = (st.ahead > 0 || st.behind > 0)
+                && !st
+                    .branch_relation
+                    .as_ref()
+                    .is_some_and(|r| is_live && r.ahead == st.ahead && r.behind == st.behind);
+            if show_upstream_ab || st.stashed > 0 {
                 cx += sep_pad;
                 draw_divider(scene, cx);
                 cx += sep_pad;
 
                 let mut need_gap = false;
-                if st.ahead > 0 || st.behind > 0 {
+                if show_upstream_ab {
                     let ab_x0 = cx - 4.0;
                     if st.ahead > 0 {
                         let s = format!("↑{}", st.ahead);
@@ -1792,15 +1855,15 @@ fn layout_starship_line(
         } else {
             format!("{count}")
         };
-        let icons_w = distinct_icons.len() as f32 * (proc_s + 3.0);
         let cnt_w = cnt_lbl.chars().count() as f32 * m.cw;
 
-        if fp.is_hot {
-            let approx_w = (m.cw + 5.0) + icons_w + cnt_w + 8.0;
+        // Reserve pill background first, then patch its exact right edge after laying out icons, bar & count!
+        let hot_pill_idx = if fp.is_hot {
+            let idx = scene.rects.len();
             scene.round_rect(
                 seg6_x0 + 1.0,
                 y + 2.5,
-                (cx + approx_w).min(x0 + max_w - pad_x),
+                cx + 40.0,
                 y + cap_h - 2.5,
                 (cap_h - 5.0) * 0.5,
                 theme::rgba(0xe8, 0x6a, 0x35, 0.16),
@@ -1808,12 +1871,15 @@ fn layout_starship_line(
                 theme::rgba(0xff, 0x8a, 0x4c, 0.48),
                 clip_id,
             );
+            cx += 3.0;
             scene.text(cx, ty, "🔥", pill_fg, true, false, clip_id);
             cx += m.cw + 5.0;
+            Some(idx)
         } else {
             scene.over_circle(cx + 3.0, ty + m.ch * 0.5, 2.7, dot_col, clip_id);
             cx += 9.5;
-        }
+            None
+        };
 
         let p_iy = ty + (m.ch - proc_s) * 0.5;
         for ic in &distinct_icons {
@@ -1827,8 +1893,30 @@ fn layout_starship_line(
             }
             cx += proc_s + 3.0;
         }
+        // Compact inline CPU heat bar (`24px × 4px`) when active/hot so load reads visually at a glance!
+        let peak_pct = fp.total_cpu_pct.max(fp.total_gpu_pct);
+        if fp.is_hot || peak_pct >= 2.0 {
+            let bar_w = 24.0f32;
+            let bar_h = 4.0f32;
+            let bar_y0 = ty + (m.ch - bar_h) * 0.5;
+            let frac = (peak_pct / 100.0).clamp(0.08, 1.0);
+            let bar_col = if peak_pct >= 60.0 {
+                theme::rgb(0xff, 0x6b, 0x4a)
+            } else if peak_pct >= 20.0 {
+                theme::rgb(0xe8, 0xa8, 0x48)
+            } else {
+                theme::OK
+            };
+            scene.round_rect(cx, bar_y0, cx + bar_w, bar_y0 + bar_h, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], clip_id);
+            scene.round_rect(cx, bar_y0, cx + (bar_w * frac).max(3.0), bar_y0 + bar_h, 2.0, bar_col, 0.0, [0.0; 4], clip_id);
+            cx += bar_w + 5.0;
+        }
         scene.text(cx, ty, &cnt_lbl, pill_fg, fp.is_hot, false, clip_id);
         cx += cnt_w + 2.0;
+        if let Some(idx) = hot_pill_idx {
+            cx += 3.0;
+            scene.rects[idx].rect[2] = cx.min(x0 + max_w - pad_x + 4.0);
+        }
         scene.push_hover_clipped(
             HitRect::new(seg6_x0, y, cx + 4.0, y + cap_h),
             clip_id,
@@ -4706,13 +4794,13 @@ fn with_cached_help_doc<R>(
     stdout_len: usize,
     stderr_len: usize,
     lines: &[&str],
-    f: impl FnOnce(Option<&crate::help_view::HelpDoc>) -> R,
+    f: impl FnOnce(Option<&crate::help_view::HelpDoc<'static>>) -> R,
 ) -> R {
     use std::cell::RefCell;
     use std::collections::HashMap;
 
     thread_local! {
-        static CACHE: RefCell<HashMap<(u64, usize, usize), Option<crate::help_view::HelpDoc>>> =
+        static CACHE: RefCell<HashMap<(u64, usize, usize), Option<crate::help_view::HelpDoc<'static>>>> =
             RefCell::new(HashMap::new());
     }
 
@@ -4723,7 +4811,8 @@ fn with_cached_help_doc<R>(
             if map.len() > 48 {
                 map.clear();
             }
-            let parsed = crate::help_view::parse_help_doc(cmd_source, lines);
+            let parsed =
+                crate::help_view::parse_help_doc_in(cmd_source, lines, blaze_own::Alloc::global());
             map.insert(key, parsed);
         }
         f(map.get(&key).and_then(Option::as_ref))
@@ -8636,8 +8725,8 @@ fn layout_active_popover(
                 let max_c = ((pop_w - pad_x * 2.0 - 18.0 - right_reserve) / m.cw)
                     .floor()
                     .max(8.0) as usize;
-                let col = if is_cur { theme::INK_1 } else { theme::INK_2 };
-                scene.overlay_text_run(x0 + pad_x + 14.0, ty, truncate_chars(br, max_c), col, is_cur, false, 0);
+                let shown_br = truncate_chars(br, max_c);
+                draw_styled_branch_name(scene, x0 + pad_x + 14.0, ty, &shown_br, is_cur, true, m, 0);
                 if let Some(tag) = right_tag {
                     let tw = tag.len() as f32 * m.cw;
                     scene.overlay_text_run(x1 - pad_x - tw, ty, tag, theme::INK_4, false, false, 0);
@@ -9349,11 +9438,36 @@ fn layout_active_popover(
                 scene.overlay_ui_small(act_x0 + 6.0, ty1, &act_lbl, act_fg, item.shell_pane.is_some(), false, 0);
 
                 let mut rx = act_x0 - 8.0;
+                let max_mem = summary
+                    .items
+                    .iter()
+                    .map(|p| p.mem_bytes)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let bar_h = 4.0f32;
+                let bar_y0 = ty1 + (m.ch - bar_h) * 0.5;
+
+                // Fixed-width Memory column: right-aligned label + proportional blue/cyan bar.
+                let mem_col_w = 50.0f32;
                 let mem_s = crate::sysmon_view::format_iec_bytes(item.mem_bytes);
                 let mem_w = m.measure(&mem_s, TextFace::UiSmall);
-                rx -= mem_w;
-                scene.overlay_ui_small(rx, ty1, &mem_s, theme::INK_2, false, false, 0);
-                rx -= 10.0;
+                scene.overlay_ui_small(rx - mem_w, ty1, &mem_s, theme::INK_2, false, false, 0);
+                rx -= mem_col_w + 4.0;
+                let mem_bar_w = 30.0f32;
+                let mem_bx0 = rx - mem_bar_w;
+                let mem_frac = (item.mem_bytes as f32 / max_mem as f32).clamp(0.0, 1.0);
+                scene.overlay_round_rect(mem_bx0, bar_y0, rx, bar_y0 + bar_h, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], 0);
+                if item.mem_bytes > 0 {
+                    let mw = (mem_bar_w * mem_frac).max(2.5);
+                    let m_col = if mem_frac >= 0.65 {
+                        theme::rgb(0x6e, 0xb5, 0xff)
+                    } else {
+                        theme::rgba(0x6e, 0xb5, 0xff, 0.65)
+                    };
+                    scene.overlay_round_rect(mem_bx0, bar_y0, mem_bx0 + mw, bar_y0 + bar_h, 2.0, m_col, 0.0, [0.0; 4], 0);
+                }
+                rx = mem_bx0 - 10.0;
 
                 if item.gpu_pct >= 0.5 {
                     let gpu_s = format!("G:{:.0}%", item.gpu_pct);
@@ -9363,22 +9477,34 @@ fn layout_active_popover(
                     rx -= 8.0;
                 }
 
+                // Fixed-width CPU column: right-aligned % + heat-colored proportional CPU bar.
+                let cpu_col_w = 36.0f32;
                 let cpu_s = if item.is_hot {
-                    format!("🔥{:.0}%", item.cpu_pct)
+                    format!("{:.0}%", item.cpu_pct)
                 } else {
                     format!("{:.1}%", item.cpu_pct)
                 };
                 let cpu_col = if item.is_hot {
-                    theme::rgb(0xff, 0x8a, 0x4c)
-                } else if item.cpu_pct >= 5.0 {
-                    theme::rgb(0xe5, 0xc0, 0x7b)
+                    theme::rgb(0xff, 0x7c, 0x4c)
+                } else if item.cpu_pct >= 15.0 {
+                    theme::rgb(0xe8, 0xa8, 0x48)
+                } else if item.cpu_pct >= 2.0 {
+                    theme::OK
                 } else {
                     theme::INK_3
                 };
                 let cpu_w = m.measure(&cpu_s, TextFace::UiSmall);
-                rx -= cpu_w;
-                scene.overlay_ui_small(rx, ty1, &cpu_s, cpu_col, item.is_hot, false, 0);
-                rx -= 10.0;
+                scene.overlay_ui_small(rx - cpu_w, ty1, &cpu_s, cpu_col, item.is_hot, false, 0);
+                rx -= cpu_col_w + 4.0;
+                let cpu_bar_w = 30.0f32;
+                let cpu_bx0 = rx - cpu_bar_w;
+                let cpu_frac = (item.cpu_pct / 100.0).clamp(0.0, 1.0);
+                scene.overlay_round_rect(cpu_bx0, bar_y0, rx, bar_y0 + bar_h, 2.0, theme::BG_TRACK, 0.0, [0.0; 4], 0);
+                if item.cpu_pct >= 0.5 {
+                    let cw = (cpu_bar_w * cpu_frac).max(2.5);
+                    scene.overlay_round_rect(cpu_bx0, bar_y0, cpu_bx0 + cw, bar_y0 + bar_h, 2.0, cpu_col, 0.0, [0.0; 4], 0);
+                }
+                rx = cpu_bx0 - 10.0;
 
                 if item.uptime_secs > 0 {
                     let up_s = format!("up {}", crate::sysmon_view::format_uptime(item.uptime_secs));
@@ -9885,6 +10011,69 @@ fn is_shell_name(name: &str) -> bool {
             | "xonsh"
             | "pwsh"
     )
+}
+
+/// Render a git branch name with subtle semantic syntax highlighting on `<prefix>/` namespaces
+/// (`feat/`, `fix/`, `perf/`, `refactor/`, `chore/`, `docs/`) so the important leaf name after
+/// the slash stands out cleanly in bright primary ink. Returns logical width consumed.
+#[allow(clippy::too_many_arguments)]
+fn draw_styled_branch_name(
+    scene: &mut Scene,
+    x: f32,
+    y: f32,
+    branch: &str,
+    live: bool,
+    overlay: bool,
+    m: CellMetrics,
+    clip_id: u32,
+) -> f32 {
+    let mut emit = |cx: f32, txt: &str, col: [f32; 4], bold: bool| {
+        if overlay {
+            scene.overlay_text_run(cx, y, txt, col, bold, false, clip_id);
+        } else {
+            scene.text(cx, y, txt, col, bold, false, clip_id);
+        }
+    };
+    if let Some(slash) = branch.rfind('/')
+        && slash > 0
+        && slash + 1 < branch.len()
+    {
+        let prefix = &branch[..slash];
+        let leaf = &branch[slash + 1..];
+        let head = prefix.split('/').next().unwrap_or(prefix);
+        let prefix_col = if !live {
+            theme::INK_4
+        } else if head.eq_ignore_ascii_case("feat") || head.eq_ignore_ascii_case("feature") {
+            theme::rgb(0x58, 0xb9, 0x80)
+        } else if head.eq_ignore_ascii_case("fix")
+            || head.eq_ignore_ascii_case("hotfix")
+            || head.eq_ignore_ascii_case("bugfix")
+        {
+            theme::rgb(0xe0, 0x75, 0x7c)
+        } else if head.eq_ignore_ascii_case("perf") || head.eq_ignore_ascii_case("bench") {
+            theme::rgb(0xe2, 0xa8, 0x52)
+        } else if head.eq_ignore_ascii_case("refactor")
+            || head.eq_ignore_ascii_case("chore")
+            || head.eq_ignore_ascii_case("ci")
+            || head.eq_ignore_ascii_case("docs")
+            || head.eq_ignore_ascii_case("test")
+        {
+            theme::rgb(0x7f, 0xa8, 0xe8)
+        } else {
+            theme::INK_3
+        };
+        let slash_col = theme::INK_4;
+        let leaf_col = if live { theme::INK_1 } else { theme::INK_3 };
+        let pw = prefix.chars().count() as f32 * m.cw;
+        let lw = leaf.chars().count() as f32 * m.cw;
+        emit(x, prefix, prefix_col, false);
+        emit(x + pw, "/", slash_col, false);
+        emit(x + pw + m.cw, leaf, leaf_col, false);
+        return pw + m.cw + lw;
+    }
+    let col = if live { theme::INK_1 } else { theme::INK_3 };
+    emit(x, branch, col, false);
+    branch.chars().count() as f32 * m.cw
 }
 
 /// Resolved icon source for a running folder process (native macOS app icon or semantic SVG badge).

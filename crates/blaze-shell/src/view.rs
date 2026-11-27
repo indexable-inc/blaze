@@ -173,6 +173,30 @@ impl HitRect {
     }
 }
 
+impl From<blaze_tiling::TileRect> for HitRect {
+    #[inline]
+    fn from(r: blaze_tiling::TileRect) -> Self {
+        Self {
+            x0: r.x0,
+            y0: r.y0,
+            x1: r.x1,
+            y1: r.y1,
+        }
+    }
+}
+
+impl From<HitRect> for blaze_tiling::TileRect {
+    #[inline]
+    fn from(r: HitRect) -> Self {
+        Self {
+            x0: r.x0,
+            y0: r.y0,
+            x1: r.x1,
+            y1: r.y1,
+        }
+    }
+}
+
 /// A Retina SVG icon quad positioned in logical pixels, resolved through `IconAtlas`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IconQuad {
