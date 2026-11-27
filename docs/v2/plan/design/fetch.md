@@ -225,12 +225,12 @@ bytes onto the key (equal bytes, rule 25). A record's presence under its key is 
 record vouches for it, so a deleted file is made again, never a wedge.
 **Per-package records.** Later stages write, per package, an outline, names (`CrateScope`), items,
 checked signatures and bodies, keyed by the package's source key plus features, cfg, target and
-the toolchain (rule 21). A registry package's records are public (bottom.md section 10): they go
-to `v2/shared` and CI seals them into the bucket; anyone reads them without a login; a fetched
-record is checked against its signed statement, its digest and the size limits before it is mapped
-(remote-read.md "Trust"). A package whose records all arrive this way needs no source bytes at all
-(deferred, as Buck2 defers materializing): sources are fetched only when a task asks for a file.
-Private code (members, path, git, private registries) never leaves `v2/own` or the checkout.
+the toolchain (rule 21), and kept in the machine's own content-deduplicated store, so a new
+checkout finds them by key. Publishing and fetching them is an option, built, off unless chosen:
+a registry package's records are public (bottom.md section 10), go to `v2/shared` and CI seals
+them into the bucket; a fetched record is checked against its signed statement, its digest and
+the size limits before it is mapped (remote-read.md "Trust"). Private code (members, path, git,
+private registries) never leaves `v2/own` or the checkout.
 
 **`blaze check` on three machines.** Never seen the package: the graph task wants each level's
 packages at once; each is adopted from cargo's archive or fetched, overlapping up to the in-flight

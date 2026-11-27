@@ -12,11 +12,13 @@ When performance tradeoffs compete in Blaze, decisions follow one fixed order ac
 
 1. **Incremental compile time** (including huge crates and huge files even after a cold reboot,
    with zero re-indexing and automatic cross-worktree sharing) **=** **Lint speed**
-2. **Remote cache fetch** (R2 / P2P content-addressed records, coalesced HTTP Range fetches)
-3. **Memory footprint** (explicit allocators, SoA columns, frame-reset scratch)
-4. **Cold compile time**
-5. **Non-locking disk GC**
-6. **Disk usage**
+2. **Memory footprint** (explicit allocators, SoA columns, frame-reset scratch)
+3. **Cold compile time**
+4. **Non-blocking disk GC**
+5. **Disk usage**
+
+The remote cache is supported and is not in the order: nothing is designed around it or traded
+against these.
 
 Selective incremental testing (`blaze-test-reach` `BTI1` zero-reindex SoA impact store) rides
 the same content-addressed discipline: only tests whose transitive read set intersects the

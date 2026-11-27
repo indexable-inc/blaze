@@ -1,4 +1,4 @@
-# blaze-gateway API: the blob store (slice 3 of docs/remote-cache.md)
+# blaze-gateway API: the blob store (docs/remote-cache.md)
 
 The content-addressed store beside v0's per-tenant layout (API-v0.md): `/has`, `/get`,
 `/blob/<sha256>` and `/put` on the gateway's root; and the signed index of slice 4 under
@@ -171,7 +171,7 @@ Answer: `{"etag": text, "refreshed": {"segments": n, "packs": n, "copied": n}}`,
 
 ### Refresh
 
-Inside a head write, before the head is stored (docs/remote-cache.md, "GC"): each named segment
+Inside a head write, before the head is stored (docs/remote-cache.md): each named segment
 whose R2 upload date is more than 2 days old, and each pack holding a blob those segments name
 whose `objects.uploaded` is more than 45 days old, is written again onto its own name through the
 R2 binding (a pack streamed back with its MD5 or SHA-256 checked by R2), then `HEAD`ed: the head

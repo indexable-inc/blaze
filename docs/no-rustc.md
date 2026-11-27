@@ -80,6 +80,7 @@ Outside `crates/`, which the counter does not read, cargo or rustc still run in:
 | Place | What runs | What removes it |
 |---|---|---|
 | `tools/nix/unit_graph.py` and `tools/nix/unit_build.py` | cargo's unit graph, and one rustc per unit in the flake's per-unit builds | deleting the flake (decided 2026-11-04) |
+| `blaze.yaml`'s `cargo` job, `.github/actions/script/build.sh`, `land.py`'s smoke line | `cargo check`, the unit tests and the scripts' build with the pinned nightly | blaze building, checking and testing blaze there too (a gap) |
 
 The long form of this page (the measurements of October 2026, each step's design and the lanes
 that did them) is in git: `git show 9112d5e40e:docs/no-rustc.md`.

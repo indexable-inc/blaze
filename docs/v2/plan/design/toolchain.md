@@ -50,7 +50,7 @@ digest: the manifest and every pack. Read-only to a build. Decided against the o
   is no place for 100 MB of data;
 - *the checkout's store* (`.blaze/v2/records`): one copy per project, not per user;
 - *the shared cache*: no bucket exists, and a private build must work offline. It is designed
-  as a way to fill the shelf, never a build's dependency: `blaze toolchain fetch <id>`, started
+  as an option to fill the shelf, off unless chosen and never a build's dependency: `blaze toolchain fetch <id>`, started
   in the shelf (its start folder, the only place it writes), reads the manifest and each pack by
   digest through blaze-remote's read path, verifies each as `open` does, and publishes it.
 

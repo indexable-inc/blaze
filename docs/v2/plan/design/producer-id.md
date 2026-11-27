@@ -134,8 +134,7 @@ listing and one BLAKE3 pass over the closures' files (about 8 MB of source on 20
 
 Why a build script: it is the one step that sees the source as the binary is built, and only
 the entry depends on its output, so an edit to any crate reruns one script and recompiles only
-the crate that is recompiled anyway. Under cargo it runs as any build script. When blaze builds
-blaze it runs in blaze's deterministic sandbox, which serves a workspace member the workspace
+the crate that is recompiled anyway. It runs in blaze's deterministic sandbox, which serves a workspace member the workspace
 above `/workspace/<member dir>` (decision D96); every file it reads is in its read list, so it
 reruns exactly when a file of a closure changes.
 

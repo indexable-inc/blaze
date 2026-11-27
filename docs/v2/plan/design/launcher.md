@@ -123,7 +123,8 @@ freed.
 - **Panics and backtraces.** The unwinder asks the launcher, not a list of registered frames:
   Apple's libunwind through `__unw_add_find_dynamic_unwind_sections` (private; commented and
   symbol-tested, `macos-private-apis`), ELF through the same hook in the LLVM libunwind that
-  blaze's std builds, Windows through `RtlInstallFunctionTableCallback`. Lazy code unwinds.
+  blaze's std builds, and later (Windows is out of scope now) Windows through
+  `RtlInstallFunctionTableCallback`. Lazy code unwinds.
   std's backtrace names a frame by asking the dev runtime: the index gives the record, whose
   name and lines come from the store.
 - **A debugger** gets the GDB JIT interface (`__jit_debug_descriptor`): one object a commit,
@@ -218,15 +219,13 @@ is immutable (no interior mutability) stays shared and PC-relative.
 
 ## 6. Test selection
 
-A stub fires once a process, so with domains the dependency set is taken a domain: under
-`blaze test` every body's entry sets one byte of its domain (`base + mark + slot`). A test's
-*set* is its marked slots, each widened by the bodies its code built in. The result is stored
-under (test identity, toolchain) as entries of `{set: [(function, code id)], reads: [(what,
-hash)], effects, outcome}`; an entry is reused when every function's code id and every read
-is as recorded (the same trace shape as optimized code in backend-next.md), so it is shared across
-machines by code identity. A save reruns the tests whose set holds a function whose code id
-moved; the daemon keeps `function -> tests` to find them. This replaces the armed log stubs
-(`live/log.rs`) and the fork a test.
+A test's result is keyed by [test.md](test.md)'s rule, the one `blaze test` runs: a record
+read-addressed by the functions the test entered and the outside reads it made, found after an
+edit by a postings record (crates/blaze-run). What the launcher adds is how the entered set is
+seen: a stub fires once a process, so with domains the set is taken a domain: under
+`blaze test` every body's entry sets one byte of its domain (`base + mark + slot`), and a
+test's set is its marked slots, each widened by the bodies its code built in. The launcher's
+recording wrappers are not built (test.md).
 
 ## Not built
 

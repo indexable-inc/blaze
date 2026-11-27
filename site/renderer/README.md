@@ -6,7 +6,7 @@ build's bake step, and the worker's routing and headers.
 
 ```
 content/*.flecs ──▶ site-snapshot.wasm (Flecs inside) ──▶ snapshot (.gen/site.cbor) ──▶ site.wasm ──▶ HTML
-   gen/build.ts bake: highlight.js; bench charts ──┘
+   gen/build.ts bake: highlight.js ──┘
 ```
 
 | crate | what it is |
@@ -71,7 +71,7 @@ A Rust panic is a trap (panic=abort): the build stops.
 `site-snapshot.wasm`: `snap_new`, `snap_alloc`, `snap_free`, `snap_build(h, input, len)` (0 with the snapshot, or 1 with
 the error), `snap_output_ptr`, `snap_output_len`, `snap_drop`. The input is JSON
 `{scripts: [{name, code}], bakes: {<entity path>: {highlighted?, baked?}}}`, the scripts in run order (`schema.flecs`,
-`refs.flecs`, then the rest by path, then the ones the build generated, such as the benchmark charts).
+`refs.flecs`, then the rest by path).
 
 ## Highlighting and glyphs stay in TS, embedded as-is; charts are content
 
@@ -80,8 +80,7 @@ and the snapshot step sets that HTML on the entities as `Highlighted {html}` (Co
 lesson or update page). The core embeds it unchanged, so the core has no highlighter.
 
 Charts are elements like any other (`RowChart`, `LineChart`, `Charts`, `Picker` in `content/schema.flecs`), drawn by
-`core/src/chart.rs` as HTML rows and inline SVG with a table of their numbers. The benchmark page's are written by the build from the
-history files (`gen/bench/`) as a Flecs script that runs after the content.
+`core/src/chart.rs` as HTML rows and inline SVG with a table of their numbers.
 
 ## wasi:http host
 

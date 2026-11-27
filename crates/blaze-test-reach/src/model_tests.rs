@@ -1,4 +1,4 @@
-//! THE MODEL TEST of reuse by reach (tests-stage.md, "Reuse" and "Determinism"; brief T-b, T-c).
+//! THE MODEL TEST of reuse by reach (test.md, piece 19; brief T-b, T-c).
 //!
 //! A generated program: functions calling functions (a call goes to a later function, so runs
 //! end), some calls FOLDED (inlined: the callee's body is in its caller's code record), some

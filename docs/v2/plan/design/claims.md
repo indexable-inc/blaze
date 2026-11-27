@@ -27,8 +27,8 @@ and a doc the facts refute, are findings.
 
 ## Why this syntax
 
-- A rustdoc section with intra-doc links is plain Rust: rustc ignores it, so it holds while
-  cargo builds blaze (rule 6 forbids a `cfg` guard, and a new attribute would need one); rustdoc
+- A rustdoc section with intra-doc links is plain Rust: rustc ignores it, so it holds under
+  any Rust toolchain (rule 6 forbids a `cfg` guard, and a new attribute would need one); rustdoc
   renders it and checks the links; an agent reads the promise and its proof where the item is.
 - It extends the `/// The invariant:` statements the ledger already reads, with one marker
   each: one spelling (`Tested by`, `Proof:`, lowercase `evidence:` are findings, with a fix).

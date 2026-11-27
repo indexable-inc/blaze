@@ -5,9 +5,10 @@ date: 2026-11-02
 ---
 # Bootstrap: blaze from a wasm seed
 
-Today the first blaze on a machine (stage 0) is built by `cargo +nightly`, and so is every
-runner gate. That is the one place `no-rustc` still cannot hold: something has to build blaze
-before blaze exists. This plan removes it with the seed matklad describes in
+blaze builds, checks and tests blaze; cargo does not. The one exception is the first blaze on a
+machine (stage 0), which is still built through cargo; a gap. That is the one place `no-rustc`
+still cannot hold: something has to build blaze before blaze exists. This plan removes it with
+the seed matklad describes in
 [Reasonable Bootstrap](https://matklad.github.io/2023/04/13/reasonable-bootstrap.html):
 
 - blaze's source at a version, and
@@ -19,8 +20,9 @@ own seed, with no chain of older compilers. Nothing here is built.
 
 ## Only blaze builds blaze
 
-The seed and the blaze toolchain are the only ways blaze gets built. Real rustc and cargo are not
-part of the bootstrap and are not kept working for blaze's own source:
+The seed and the blaze toolchain are the only ways blaze gets built, as the rule already says for
+everything after stage 0. Real rustc and cargo are not part of the bootstrap and are not kept
+working for blaze's own source:
 
 - **Seed N is made by blaze.** It is source N compiled to wasm by blaze N-1, or by blaze N itself
   as a fixed point. No rustc is involved.

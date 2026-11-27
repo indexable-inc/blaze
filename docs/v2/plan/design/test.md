@@ -235,8 +235,8 @@ attributes, run spec digest, arguments); nothing of its code is in it.
 ENTERED, by stable name (item and type arguments), answered by its code identity now (the
 instance key: its body's result, the layouts and constants it read, the statics it names); each
 outside read by name (a file from the root, a variable, a host fact), answered by its digest.
-Filed at H(id, asks, answers). Entered is exact: during tests each slot word is a mark stub
-(run.md, Tests). Why the last asks decide before the next run: a run is a function of the code
+Filed at H(id, asks, answers). A lint finding is not an ask: it never changes what a test does.
+Entered is exact: during tests each slot word is a mark stub (run.md, Tests). Why the last asks decide before the next run: a run is a function of the code
 it enters and what it reads; if no answer moved it enters the same functions, and a function it
 did not enter cannot change it. A test that starts a second thread may enter other functions
 under another schedule, so its asks are its REACH (front2/reach.rs, a superset), basis `reached`.
@@ -257,7 +257,7 @@ held. A candidate's last asks are answered now: a pass at that address is a hit 
 nothing), else it runs. Every other pass stands by the coarse proof. Failures and not-kept tests
 always run. **No edit**: the certificate names each suite's head; the kept results are printed.
 **First run**: the gate checks the scope (drive.md, `Beside`); a function is compiled at its
-first call, so code no test enters is never built; CI's records answer what they can.
+first call, so code no test enters is never built; CI's records, when chosen, answer what they can.
 
 **One process per test.** Per suite a zygote (the launcher, the suite's code area mapped
 shared, one thread) forks a child per test; the child applies the test's sandbox (macOS
@@ -281,7 +281,7 @@ each once as a test; measuring is `blaze bench`, never cached. **Filters**: subs
 `module::name`, `--exact`, `--skip`; libtest's flags (`--nocapture` runs one at a time,
 `--test-threads`, `--list`, `--format json`) are blaze's; any other is refused by name.
 **Flaky**: no retry (rule 3); a failure is filed beside the pass at its address, and both at one
-address is a `Flaky` finding naming the two runs. **Shared**: CI files passes in the
+address is a `Flaky` finding naming the two runs. **Shared** (off unless chosen): CI files passes in the
 organisation's namespace, signed; a developer hits only an equal address, so exactly when its
 code and reads answer as CI's did (target and host facts are asks). Developers never write one.
 
@@ -323,6 +323,8 @@ protocol to the parent; better: a crash fails one test, and results are kept.
     source. After 16 and the store lane.
 18. The test build as a view of its crate (D152, above): one crate key, cfg as a read, the
     overlay. D191's full view is built (blaze-drive view.rs); the one crate key is not.
+19. `crates/blaze-test-reach` (a result valid by its reach, as a sans-IO core): built, not wired;
+    no crate depends on it.
 
 ## End state: property, differential and end-to-end tests (architect, 2026-11-16)
 
@@ -354,10 +356,9 @@ attributes alone. A test is a TAPE SEARCH when it opens the case board (below) t
   per-case coverage; per-case deadlines; tapes as records shared with CI; a split of one
   test's seeds across idle cores.
 - **Arguments drawn by type**: `#[test] fn round_trip(header: Header, body: Vec<u8>)` is blaze's
-  extension (rustc refuses a test with arguments, so blaze's own crates use it only once cargo
-  no longer builds them, rule 6). It is a builtin attribute expanding to a tape search, as
-  `#[blaze::contract_test]` already expands to `blaze_sim::check` (hir-expand
-  builtin/attr_macro/contract_test.rs). An argument is drawn by `blaze_sim::Any`, and `Any`
+  extension (rustc refuses a test with arguments). It is a builtin attribute expanding to a tape
+  search, the same search a contract test (a mode of `blaze test`, contracts.md, not an
+  attribute) runs through `blaze_sim::check`. An argument is drawn by `blaze_sim::Any`, and `Any`
   becomes ONE comptime function over the type's reflected shape (rule 56: `fields_of`,
   `variants_of`; a struct field by field, an enum by variant index then fields, the first
   variant calm), replacing draw.rs's hand impls except for primitives. A type whose fields are
@@ -578,7 +579,7 @@ Built: 1 (blaze-sim board.rs), 3 (blaze-run property.rs), 4 (tapes.rs), 6 (oscal
    print `blaze: background search found codec::round_trip failing at tape ..`. After 3, 5. CHILD.
 10. Branch-coverage hook version for moved functions (launcher, bottom.md 11 versions). CHILD.
 11. blaze-sim draw.rs `Any` by reflection and the `Draw` mark. Waits on comptime on the new layer.
-12. The `#[test]`-with-arguments builtin attribute, beside contract_test.rs. After 11 for types
+12. The `#[test]`-with-arguments builtin attribute. After 11 for types
     other than primitives; parallel otherwise.
 13. blaze-sim differ.rs: `differ`, `Differ { normalize, approve }`, the difference print, a
     planted-divergence control. Parallel, now.

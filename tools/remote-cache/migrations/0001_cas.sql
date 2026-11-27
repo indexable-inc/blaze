@@ -1,4 +1,4 @@
--- The blob store's tables (API.md, "Storage"; docs/remote-cache.md, "The API").
+-- The blob store's tables (API.md, "Storage"; docs/remote-cache.md).
 CREATE TABLE tenants (
   id TEXT PRIMARY KEY,
   salt BLOB NOT NULL,

@@ -8,7 +8,7 @@ date: 2026-11-15
 Rule 51: a record is written once and read in place through the page cache. A general-purpose
 compressor (zstd, LZ4, DEFLATE) on that path makes every read a decompress-and-copy. Records are still big: the first run on `core`
 made 8.1 MB of outline records and 4.4 MB of scope records from 14.7 MB of source, and memory is
-the third priority. The answer for columns of ids, offsets,
+the second priority. The answer for columns of ids, offsets,
 lengths, small enums and names, read a few values at a time and scanned sometimes, is the column
 stores' lightweight encodings: each value is found in O(1) or close, decoded alone, from bytes
 that stay where they are.

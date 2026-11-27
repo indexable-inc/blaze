@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is not built on the new layer: its goldens (lean/BlazeModel) and first proof are in the tree, its translator is not; built: the theorem gate (lean/theorems.json, lean_gate), the no_std Lean kernel checker in blaze-cert and #[blaze::theorem] proofs; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. For sans-IO code a proof takes the place of the simulation test (decision D38, proofs-for-sans-io.md); what is not proved keeps its simulation test. A second package, lean/analysis, proves blaze-diff's derivative rules and fast_math rewrites over the reals with Mathlib, from the rule table the Rust differentiator runs.
+summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is not built on the new layer: its goldens (lean/BlazeModel) and first proof are in the tree, its translator is not; built: the theorem gate (lean/theorems.json, lean_gate), the no_std Lean kernel checker in blaze-cert and #[blaze::theorem] proofs; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. A proof is extra evidence on top of the simulation test and never replaces it (rule 43; proofs-for-sans-io.md). A second package, lean/analysis, proves blaze-diff's derivative rules and fast_math rewrites over the reals with Mathlib, from the rule table the Rust differentiator runs.
 date: 2026-11-10
 ---
 # Formal verification: blaze's MIR to Lean
@@ -60,12 +60,10 @@ parts this one builds on, and it links to them rather than repeating them:
 
 ### DST on everything, proofs on small stable cores
 
-Changed on 2026-11-13 (decision D40, [proofs-for-sans-io.md](proofs-for-sans-io.md)): for
-sans-IO code the translator reads, a proof Lean has checked in the gate takes the place of
-the simulation test, which is deleted; that doc says what stands for what a proof does not
-cover (a conformance test per world model, and each translated function run as its Lean model
-and as built code). The first two points below are as they were decided on 2026-11-04 and
-hold for code that is not proved.
+A proof Lean has checked in the gate is extra evidence on top of the simulation test and never
+replaces it (rule 43; D40, [proofs-for-sans-io.md](proofs-for-sans-io.md), which adds for
+sans-IO code the translator reads a conformance test per world model and each translated
+function run as its Lean model and as built code).
 
 - **DST stays the requirement.** The testing skill's `dst-not-review` rule holds for all
   concurrent, durable, crash-recovering, billing and data-deleting code, proved or not. A
@@ -80,7 +78,7 @@ hold for code that is not proved.
   1. **DST traces checked against the model.** The sim's trace of effects and crash states
      is replayed through the Lean model, compiled to an executable, which must allow every
      state the sim produced.
-  2. **Real-kernel replay.** Crash tests run on real Linux and macOS in ix VMs, cutting
+  2. **Real-kernel replay.** Crash tests run on real macOS (the Mac) and Linux (in CI), cutting
      power at the block layer (for example with dm-log-writes). Every state observed after
      the crash must be one the model allows.
 
@@ -1219,7 +1217,7 @@ reused directly.
   is the only defence.
 - Perennial's Lean port is young.
 
-**CI:** as in v0, plus a real-kernel replay job in ix VMs on the release train.
+**CI:** as in v0, plus a real-kernel Linux replay job on the release train.
 
 ## v4: compiler correctness
 

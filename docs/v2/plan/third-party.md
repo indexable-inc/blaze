@@ -92,8 +92,8 @@ The plan is to do both.
 blaze-toml and blaze-semver; no crate names those packages.
 
 **TLS, QUIC and signatures** (ring in blaze-remote; rustls, rustls-native-certs and quinn-proto
-in blaze-http; rcgen in tests). The shared cache is read without a login over HTTPS, so
-something has to speak TLS. Options:
+in blaze-http; rcgen in tests). Locked sources are fetched over HTTPS, and so is the remote
+cache when one is chosen (off unless chosen), so something has to speak TLS. Options:
 
 1. Write TLS 1.3 client-only, with one cipher suite (TLS_AES_128_GCM_SHA256 over X25519, and
    Ed25519 or ECDSA P-256 certificates). That is about 4k lines, including the primitives, and
@@ -104,7 +104,7 @@ something has to speak TLS. Options:
    digest, which the Trust rule requires anyway. Then TLS protects only privacy, and public
    records do not need it.
 
-Option 3 removes the need for reads of public records. Option 1 is for remote execution.
+Option 3 removes the need for reads of public records; fetching sources still needs TLS.
 
 **zstd** (blaze-format-tiers, blaze-parquet, blaze-squeeze; patched to `vendor/zstd-sys`, which
 is C). Options:

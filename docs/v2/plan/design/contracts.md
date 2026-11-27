@@ -16,11 +16,10 @@ Loop `invariant`, `spec fn`, `forall` and `==>` are verus.md's too; nothing here
 syntax. Parts 1 to 3 read the native clauses' clause groups.
 
 **Where it stands.** On the item layer only the profile setting of part 1 is built
-(`contract_checks` in `crates/blaze-manifest/src/profiles.rs`); the syntax has nodes and
-`contract_test` is a registered tool attribute (`crates/blaze-surface/src/tool_attrs.rs`), and
-the probe `crates/blaze-real/extensions/c_contract_test.rs` fails at check. extensions.md's
-row decides a contract test is a mode of `blaze test`, not an attribute, which part 2's
-attribute form below is open against.
+(`contract_checks` in `crates/blaze-manifest/src/profiles.rs`); the syntax has nodes. A
+contract test is a mode of `blaze test`, not an attribute (part 2); the `contract_test` tool
+attribute still registered in `crates/blaze-surface/src/tool_attrs.rs` and its probe
+`crates/blaze-real/extensions/c_contract_test.rs` go.
 
 Nightly's `#[core::contracts::requires(expr)]` / `#[core::contracts::ensures(|ret| expr)]`
 (`#![feature(contracts)]`) stay only for compatibility:
@@ -217,18 +216,18 @@ How they are made:
 
 ## 2. Tested by generation
 
-- **Opt-in per crate.** `#![blaze::contract_tests]` in the crate root generates the tests.
-  `#[blaze::contract_test]` on one function generates one, and `#[blaze::contract_test(skip)]`
-  leaves a function out.
-- **Why opt-in first.** A generated test runs code the author never called with random inputs.
+- **A mode of `blaze test`, not an attribute.** `blaze test` in its contract mode generates one
+  test per function with contracts in the packages it tests; no attribute marks a function.
+- **Why a mode, not the default.** A generated test runs code the author never called with
+  random inputs.
   - A function with side effects (files, a global) would do them in the test run.
   - Input generation needs a generator for each argument type, and many types have none yet.
-  - Opting in per crate lets a crate turn on the tests where they make sense, without blocking
-    every crate that uses contracts.
-  - Once purity is checked, a crate-wide default for pure functions is the next step.
-- **The test.** For each opted-in function with contracts, the front end synthesizes a test
-  item in a `#[cfg(test)]` module, as `#[test]`'s expansion makes one. It is a
-  `blaze_sim::check` and runs under `blaze test` with the crate's other tests. Each case:
+  - Choosing the mode per run lets it be used where it makes sense, without blocking every
+    crate that uses contracts.
+  - Once purity is checked, the mode's default for pure functions is the next step.
+- **The test.** For each function with contracts, the mode synthesizes a test item, as
+  `#[test]`'s expansion makes one. It is a `blaze_sim::check` and runs under `blaze test` with
+  the crate's other tests. Each case:
   1. draws each argument from the tape by its type's `blaze_sim::Any`: integers, `bool`,
      `char`, floats, `String`, `Vec<T>`, slices by reference, tuples, arrays, `Option` and
      `Box`; a type with no draw makes the generation an error naming the argument and its type;
@@ -244,13 +243,12 @@ How they are made:
   `ensures(&args, &ret) -> bool`. The generated test, the caller-side check (part 1) and the
   verifier (part 4) share them.
 
-### The expansion of `#[blaze::contract_test]` (not built)
+### The generated test (not built)
 
-- **The mechanism.** A builtin attribute macro, unstable under `blaze_verify`; the path
-  `blaze::contract_test` resolves in every crate, so a crate needs no `blaze` dependency. It is
-  a macro, not a synthesis in the front end, because the test is ordinary syntax:
-  name resolution, inference, diagnostics, the IDE and `blaze test`'s harness see it as any
-  `#[test]`, and its spans are the function's own, so an error in a clause points at the clause.
+- **The mechanism.** The contract mode makes each test as ordinary syntax, so a crate needs no
+  `blaze` dependency: name resolution, inference, diagnostics, the IDE and `blaze test`'s
+  harness see it as any `#[test]`, and its spans are the function's own, so an error in a
+  clause points at the clause.
 - **The expansion.** The function as written, then `#[cfg(test)] #[test] fn <f>_contract()`,
   whose body is `blaze_sim::check(Config::DEFAULT, |tape| ..)`. Each argument is drawn with
   `tape.any::<T>("<the argument's name>")`; `&T` is lent from a drawn `<T as ToOwned>::Owned`
@@ -262,14 +260,13 @@ How they are made:
   case, named as the function's), and each `ensures` is checked with the named return bound to
   the result. A failing case notes itself (`tape.note`) as a plain `#[test] fn f_contract_case()`
   with the arguments as literals (their `Debug`, with `String::from(..)` and `vec!` around a
-  `String` or `Vec`) and panics with ``#[blaze::contract_test] on `f`: `ensures r > x` does not
-  hold``; blaze-sim's report gives that message and, under `notes:`, the case of the least tape.
+  `String` or `Vec`) and panics with ``contract test of `f`: `ensures r > x` does not hold``;
+  blaze-sim's report gives that message and, under `notes:`, the case of the least tape.
 - **Refused, naming the function and why:** generic, `async`, `gen` and `unsafe` functions,
   methods and associated functions, a function inside a block, a function without arguments
   (every case is the same call), `&mut`, `impl Trait` and pattern arguments, a function
-  without `requires` or `ensures`, an argument to the attribute other than `skip`, and a crate
-  built with `cfg(test)` without a `blaze_sim` dependency. On a refusal the function is kept as
-  written. `recommends` and `decreases` are not checked.
+  without `requires` or `ensures`, and a crate built with `cfg(test)` without a `blaze_sim`
+  dependency. On a refusal the function gets no generated test. `recommends` and `decreases` are not checked.
 - **Contract checks abort.** Part 1's checks (on in the dev and test profiles) call
   `panic_nounwind`, so a broken `ensures` aborts the test process (exit 134) inside the callee
   before the test sees the result, and blaze-sim never shrinks it. Until part 3's unchecked
@@ -328,8 +325,9 @@ The interface between the two is one fact each way.
   `NotProved` names the function, the clause and why: no proof file, a construct v0 does not
   translate, a generic function, a `requires` (proved at call sites, which v0 does not lower),
   Lean refusing the proof, an axiom that is not allowed. It is never a pass.
-- **The generated test stays the cheap first pass.** Part 2's blaze-sim test runs first, and a counterexample
-  it finds is reported before a proof is tried. It is now the only source of counterexamples.
+- **The generated test stays.** A Lean proof is evidence on top of part 2's blaze-sim test and
+  never replaces it: the test runs whether or not a proof stands, and a counterexample it finds
+  is reported before a proof is tried. It is the only source of counterexamples.
 
 ### Prior art
 
@@ -356,7 +354,7 @@ The interface between the two is one fact each way.
   `requires_and_ensures_abort_only_with_contract_checks`: a broken `requires` exits 134 in dev,
   0 with `contract-checks = false`.
 - `broken_requires_names_function_and_clause` and `broken_ensures_names_function_and_value`.
-- `generated_test_finds_planted_bug` and `contract_test_expands_to_a_test_of_the_clauses`: the
-  expansion assumes the `requires` and checks the `ensures`.
+- `generated_test_finds_planted_bug` and `contract_mode_makes_a_test_of_the_clauses`: the
+  generated test assumes the `requires` and checks the `ensures`.
 - `proved_contract_removes_bounds_check` and `unproved_contract_keeps_bounds_check`.
 - `contract_must_be_pure`: a clause that reads the environment is an error naming it.

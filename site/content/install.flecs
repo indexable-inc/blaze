@@ -18,7 +18,6 @@ site {
         Li glibc("**On Linux, glibc 2.34 or newer:** RHEL 9, Debian 12, Ubuntu 22.04 and anything newer. Alpine and other musl systems are not supported; the installer says so.")
         Li cc("**A C compiler for linking:** `gcc` or `cc` on Linux, Apple's command line tools on macOS (`xcode-select --install`).")
         Li container("**User namespaces or Landlock.** Build scripts and proc macros run in a sandbox. In a container whose seccomp profile refuses both, run it with `--security-opt seccomp=unconfined`, or set `BLAZE_SANDBOX=off` to run them unsandboxed, as cargo does. The error says so.")
-        Li memory("**Memory to spare.** blaze's background process holds a few GB for a small project and tens of GB for the largest ([numbers](https://github.com/indexable-inc/blaze/blob/main/docs/benchmarks.md#how-much-memory-and-disk-it-takes)).")
       }
       P rust("You do not need Rust or rustup. blaze is its own toolchain: it downloads its pinned nightly once into `~/.blaze` (rustc, cargo, the standard library and its source, about 100 to 130 MB), or uses rustup's copy of that nightly when it has one. It builds your project with that nightly whatever its `rust-toolchain.toml` says, so stable code and `#![feature(...)]` code both build ([why](https://github.com/indexable-inc/blaze/blob/main/docs/toolchain.md)).")
     }

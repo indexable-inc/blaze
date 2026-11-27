@@ -55,13 +55,13 @@ builds through a rustc soundness bug.
 
 blaze's own source uses blaze's extensions (`#[blaze::pure]`, `nopanic`/`noalloc`/`nonblocking`,
 `#[blaze::linear]`, contracts, comptime, sealed traits) wherever they make blaze more correct or
-more incremental, and relies on them being checked when blaze builds blaze. While cargo also builds
-blaze (`blaze-builds-blaze`), an extension is used only in a form rustc ignores (an attribute, a
-tool attribute), and code only blaze accepts waits until blaze builds blaze again. No `cfg_attr`
-guard, no rustc-compatible copy, no inert-under-rustc fallback: an extension blaze can't check yet
-is an error to fix in blaze. The one limit is stage 0: an extension blaze's source uses must be one
-the stage-0 blaze (`.github/blaze-version`) already reads, so a new extension lands in a release
-before blaze's source depends on it.
+more incremental, and relies on them being checked when blaze builds blaze (`blaze-builds-blaze`).
+While the gate's workspace check still runs through cargo (a gap), an extension is used in a form
+rustc ignores (an attribute, a tool attribute), and code only blaze accepts waits for that gap to
+close. No `cfg_attr` guard, no rustc-compatible copy, no inert-under-rustc fallback: an extension
+blaze can't check yet is an error to fix in blaze. The one limit is stage 0: an extension blaze's
+source uses must be one the stage-0 blaze (`.github/blaze-version`) already reads, so a new
+extension lands in a release before blaze's source depends on it.
 
 See [docs/future/bootstrap.md](../../../docs/future/bootstrap.md).
 
@@ -96,18 +96,19 @@ key is a refusal with a typed error, never an overwrite, and the fix is the key,
 
 Nothing of the machine is in what is kept or shared: no absolute path, host name, user, time,
 address or thread order in a key, a record or an output. Two builders of one key, on any machine,
-produce byte-identical values: that is what lets a record be fetched from the shared cache instead
-of made, so it is a protocol requirement, and the CI push refuses a key whose bytes differ from the
-bucket's. How: make a path relative to its root (the workspace, the toolchain, the registry archive)
-before it enters a key; fill a time or an absolute position in only when printed; order by
-construction, never by arrival. No output (an object, a diagnostic's order, a store key, a profile
-row's identity) depends on hash-map iteration order, thread timing, addresses or the wall clock.
-Hashers have fixed seeds, except a table whose keys an attacker may pick (names, paths, literals),
-which is keyed by a `blaze_hash::SipKey`: random when nothing persists its layout and nothing output
-depends on where a key lands, or `blaze_ids::index_key` of its content when an image lays it out; a
-hot one may instead be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run
-no honest keys make, then a random `SipKey` for good. Anything iterated into output is sorted or
-ordered by construction; a test builds twice and compares bytes.
+produce byte-identical values: that is what lets the machine's store keep one copy for every
+checkout, and a remote cache, where one is chosen, serve a record instead of making it, so it is a
+protocol requirement, and a push refuses a key whose bytes differ from what the cache holds. How:
+make a path relative to its root (the workspace, the toolchain, the registry archive) before it
+enters a key; fill a time or an absolute position in only when printed; order by construction, never
+by arrival. No output (an object, a diagnostic's order, a store key, a profile row's identity)
+depends on hash-map iteration order, thread timing, addresses or the wall clock. Hashers have fixed
+seeds, except a table whose keys an attacker may pick (names, paths, literals), which is keyed by a
+`blaze_hash::SipKey`: random when nothing persists its layout and nothing output depends on where a
+key lands, or `blaze_ids::index_key` of its content when an image lays it out; a hot one may instead
+be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run no honest keys make,
+then a random `SipKey` for good. Anything iterated into output is sorted or ordered by construction;
+a test builds twice and compares bytes.
 
 ## semantics-in-front-end (rule 31)
 
@@ -150,7 +151,17 @@ pinned `std`/`core`/`alloc` or `bstd`, and delete the jank/boilerplate completel
 that does not use them (`superset-of-rust`), and dogfood them across blaze's own crates
 (`blaze-uses-its-extensions`). Any abstraction paying runtime cost (`dyn`, clone, heap box, lock,
 duplicate solver/IR) or manual boilerplate solely because the language or stdlib cannot express it
-statically is a bug to fix at the language/stdlib layer (`guard-the-cause`).
+statically is a bug to fix at the language/stdlib layer (`guard-the-cause`). The same holds for the
+whole tree: a design that says "this would use X, but X is not in the tree" is not finished. The
+missing piece (a language or reflection feature, an intrinsic, a bstd module, a SIMD primitive, a
+harness check, a debugging command) is part of the work: specify it, build it in its right home and
+use it, in the same lane or one started at once, with a ledger row so it is tracked. An interim form
+is allowed only while the piece is being built: it is marked at the spot (`// when <piece> lands:
+<what changes>`), listed in the lane's report and its ledger row, and removed when the piece lands.
+Never leave the weaker design standing with a note that the tree lacked something (a scalar loop
+where the design is vectorized, a hand-written impl where reflection should derive it, a guessed
+number where a measurement tool should exist). If the piece is large, say so
+(`flag-jank-or-monumentous-in-all-caps`) and start it; do not quietly scope it out.
 
 See [docs/v2/plan/design/edition.md](../../../docs/v2/plan/design/edition.md).
 
@@ -169,8 +180,7 @@ hand-rolled copies (`whole-ports`, `one-concept-one-home`). Never write a Rust b
 use comptime reflection directly (`blaze-builds-blaze`). Whenever reflection cannot yet express a
 pattern cleanly (a missing `type_info` query, enum/variant/tuple/field-attribute introspection,
 const-generic bound, or body inspection), extending reflection IS the primary work
-(`own-the-language`, `build-the-missing-piece`) — never leave hand-rolled jank standing in its
-place.
+(`own-the-language`) — never leave hand-rolled jank standing in its place.
 
 See [docs/v2/plan/design/comptime.md](../../../docs/v2/plan/design/comptime.md).
 
@@ -236,22 +246,17 @@ racy-stamp rule decides the edge case); with a watcher journal, only the paths t
 looked at. (6) A put of bytes the store already holds writes nothing, and nothing syncs on the edit
 path. The counters that show it are checks per kind per request; a second check of one thing in one
 snapshot is a bug the simulation's oracle catches. This is `type-then-lint-then-rule` applied to
-verification: the type makes the second check impossible to write.
+verification: the type makes the second check impossible to write. The same holds for all work: it
+is done once, or not at all. Never compute at request time what a key computed before the work can
+skip (`granular-caching`): an equal key is a hit, with no other check. Never rebuild what a record
+already holds (`outputs-are-records`), never hold in memory what a fresh process could rebuild from
+records (`no-state-between-requests`), and never write what the store already holds. How: for each
+step on a hot path, ask what makes it necessary on this request; if the answer is "it might have
+changed", find the key, stamp or proof that says whether it did and skip on that. Count checks and
+recomputes per kind per request in the profile; a second of one thing in one snapshot is an
+invariant the simulation's oracle checks.
 
 See [docs/v2/plan/design/bottom.md](../../../docs/v2/plan/design/bottom.md).
-
-## work-once (rule 77)
-
-Work is done once, or not at all. Never compute at request time what a key computed before the work
-can skip (`granular-caching`): an equal key is a hit, with no other check. Never verify twice
-(`verify-once`): a check returns a proof and later code takes it, and a proof or an unchanged parent
-covers everything under it. Never rebuild what a record already holds (`outputs-are-records`): a
-result is filed once and read in place. Never hold in memory what a fresh process could rebuild from
-records (`no-state-between-requests`), and never write what the store already holds: an identical
-put writes nothing. How: for each step on a hot path, ask what makes it necessary on this request;
-if the answer is "it might have changed", find the key, stamp or proof that says whether it did and
-skip on that. Count checks and recomputes per kind per request in the profile; a second of one thing
-in one snapshot is an invariant the simulation's oracle checks.
 
 ## findings-are-records (rule 81)
 
