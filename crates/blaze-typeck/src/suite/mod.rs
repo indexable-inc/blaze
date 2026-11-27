@@ -42,6 +42,7 @@ mod async_fmt;
 mod await_impl;
 mod borrow_unsized_tail;
 mod box_deref_capture;
+mod capability;
 mod cast_branch_expect;
 mod checked_record;
 mod closure_identity;

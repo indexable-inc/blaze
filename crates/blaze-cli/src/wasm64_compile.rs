@@ -31,8 +31,8 @@ use blaze_ladder::front2::keys::checker_of;
 use blaze_ladder::front2::source::{Load, LoadedExpansion, Log, NamesSource, Records};
 use blaze_ladder::run::OverflowChecks;
 use blaze_ladder::run::make_one::wasm64::{
-    Wasm64BuildOpts, compile_items_to_wasm64, compile_roots_to_wasm64, default_wasm64_import,
-    fn_symbol_of_item,
+    Wasm64BuildError, Wasm64BuildOpts, compile_items_to_wasm64, compile_roots_to_wasm64,
+    default_wasm64_import, fn_symbol_of_item,
 };
 use blaze_ladder::run::make_one::{Maker, NamesRecords, SecondCheck};
 use blaze_ladder::run::special::{MakerStart, run_roots};
@@ -545,6 +545,74 @@ fn sorted_features_match(unit: &Unit<'_>, want_sorted: &[&str]) -> bool {
     got.as_slice() == want_sorted
 }
 
+/// Typed error returned by on-demand `wasm64-blaze-wasip1` self-compilation of build scripts and
+/// proc-macro crates (rules 1, 3, 19). Distinguishes Tier-2 native/C-linking/host-spawn gaps from
+/// ordinary Rust compilation or store errors — never falls back to `rustc`.
+#[derive(Debug)]
+pub(crate) enum SelfCompileError {
+    /// The build script or proc-macro uses a Tier-2 feature unsupported in the `wasm64` sandbox
+    /// (e.g., an external native C/OS FFI symbol outside `wasi_snapshot_preview1_64` /
+    /// `blaze_seed` / `blaze_build_script_64` / `blaze_proc_macro_64`).
+    Tier2Unsupported {
+        module: std::string::String,
+        symbol: std::string::String,
+        detail: std::string::String,
+    },
+    /// Any non-Tier-2 compilation, resolution, linking, validation, or publication failure.
+    Failed(std::string::String),
+}
+
+impl SelfCompileError {
+    pub(crate) fn is_tier2(&self) -> bool {
+        matches!(self, SelfCompileError::Tier2Unsupported { .. })
+    }
+}
+
+impl core::fmt::Display for SelfCompileError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SelfCompileError::Tier2Unsupported { module, symbol, detail } => {
+                if symbol.is_empty() {
+                    write!(
+                        f,
+                        "Tier-2 unsupported native/host feature in `{module}` ({detail}; no rustc fallback, rules 1 & 3)"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Tier-2 unsupported native C/FFI symbol `{symbol}` in `{module}` ({detail}; not provided by wasm64 sandbox and no rustc fallback, rules 1 & 3)"
+                    )
+                }
+            }
+            SelfCompileError::Failed(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl From<std::string::String> for SelfCompileError {
+    fn from(value: std::string::String) -> Self {
+        SelfCompileError::Failed(value)
+    }
+}
+
+fn map_wasm64_build_error(module_name: &str, mode: CompileMode, err: Wasm64BuildError) -> SelfCompileError {
+    let kind = match mode {
+        CompileMode::BuildScript => "build-script",
+        CompileMode::ProcMacro => "proc-macro",
+    };
+    match err {
+        Wasm64BuildError::UnresolvedImport { name, name_len, what, .. } => {
+            let sym = core::str::from_utf8(&name[..usize::from(name_len)]).unwrap_or("").to_owned();
+            SelfCompileError::Tier2Unsupported {
+                module: module_name.to_owned(),
+                symbol: sym,
+                detail: std::format!("wasm64 {kind} link: {what}"),
+            }
+        }
+        other => SelfCompileError::Failed(std::format!("wasm64 {kind} compile failed: {other}")),
+    }
+}
+
 /// Ensures the build-script unit `package version features` has a compiled `wasm64` module in
 /// `<store>/build-script/modules/` and returns its `wasm-sha256` hex digest.
 pub(crate) fn compile_build_script(
@@ -553,20 +621,20 @@ pub(crate) fn compile_build_script(
     package: &str,
     version: &str,
     features: &[&str],
-) -> Result<std::string::String, std::string::String> {
+) -> Result<std::string::String, SelfCompileError> {
     let Some(checkout) = inputs.checkout else {
-        return Err(std::format!(
+        return Err(SelfCompileError::Failed(std::format!(
             "cannot self-compile build script {package} {version}: no on-disk checkout"
-        ));
+        )));
     };
     let frame = Frame::with_reserve(COMPILE_FRAME_RESERVE, Tag::Other)
-        .map_err(|_| std::string::String::from("failed to reserve wasm64 compile frame"))?;
+        .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve wasm64 compile frame")))?;
     let erased = Erased::new(&frame);
     let alloc = erased.handle();
     let decoded = blaze_unit_graph::record::decode(inputs.graph, alloc)
-        .map_err(|e| std::format!("unit graph decode failed at byte {}: {}", e.at, e.why))?;
+        .map_err(|e| SelfCompileError::Failed(std::format!("unit graph decode failed at byte {}: {}", e.at, e.why)))?;
     let lock = Lock::read(inputs.lock, alloc)
-        .map_err(|e| std::format!("Cargo.lock parse failed: {e}"))?;
+        .map_err(|e| SelfCompileError::Failed(std::format!("Cargo.lock parse failed: {e}")))?;
     let mut want_sorted: std::vec::Vec<&str> = features.to_vec();
     want_sorted.sort_unstable();
     let Some(unit_idx) = decoded.graph.units.iter().position(|u| {
@@ -575,13 +643,28 @@ pub(crate) fn compile_build_script(
             && u.version.as_str() == version
             && sorted_features_match(u, &want_sorted)
     }) else {
-        return Err(std::format!(
+        return Err(SelfCompileError::Failed(std::format!(
             "unit graph has no BuildScript unit for {package} {version} with features [{}]",
             want_sorted.join(",")
-        ));
+        )));
     };
     let script_id = UnitId(unit_idx as u32);
     ensure_build_script_unit(store, &decoded.graph, &lock, checkout, inputs.members, inputs.heap, script_id, 0)
+}
+
+fn path_pkg_files_digest(
+    checkout: &blaze_proc_macro::script_sandbox::RealRoot,
+    members: &[(LockId, &str, blaze_world::PathKind)],
+    pkg_id: LockId,
+) -> Option<std::string::String> {
+    let (_, dir, _) = members.iter().find(|(id, _, _)| *id == pkg_id)?;
+    let pkg_dir = if dir.is_empty() {
+        checkout.path().to_path_buf()
+    } else {
+        checkout.path().join(dir)
+    };
+    let mut files = blaze_proc_macro::module::package_files(&pkg_dir).ok()?;
+    Some(blaze_proc_macro::module::files_digest(&mut files))
 }
 
 /// Recursively compiles `script_id` (and any build-script dependencies of its build-dependencies)
@@ -596,11 +679,11 @@ fn ensure_build_script_unit(
     heap: &'static blaze_own::Heap,
     script_id: UnitId,
     depth: u8,
-) -> Result<std::string::String, std::string::String> {
+) -> Result<std::string::String, SelfCompileError> {
     if depth > 8 {
-        return Err(std::string::String::from(
+        return Err(SelfCompileError::Failed(std::string::String::from(
             "build-script self-compilation recursion limit exceeded",
-        ));
+        )));
     }
     let unit = &graph.units[script_id.index()];
     let mut feats: std::vec::Vec<&str> = unit.features.iter().map(|f| f.as_str()).collect();
@@ -615,18 +698,22 @@ fn ensure_build_script_unit(
                 checkout.path().join(dir)
             };
             script_unit::script_files_digest(&pkg_dir, unit.root.as_str()).map_err(|e| {
-                std::format!("reading build script files of {}: {e}", unit.name.as_str())
+                SelfCompileError::Failed(std::format!("reading build script files of {}: {e}", unit.name.as_str()))
             })
         })
         .transpose()?;
+    let deps_digest = script_unit::script_deps_digest(graph, lock, script_id, |dep_pkg| {
+        path_pkg_files_digest(checkout, members, dep_pkg)
+    });
 
     // Fast path: already compiled and cached on disk.
-    if let Ok(Some(record_dir)) = script_unit::module_of_files(
+    if let Ok(Some(record_dir)) = script_unit::module_of_files_and_deps(
         store,
         unit.name.as_str(),
         unit.version.as_str(),
         &feats,
         files_digest.as_deref(),
+        deps_digest.as_deref(),
     ) && let Ok(digest) = std::fs::read_to_string(record_dir.join("wasm-sha256"))
     {
         return Ok(digest.trim().to_owned());
@@ -655,7 +742,14 @@ fn ensure_build_script_unit(
     if let Some(hex) = &files_digest {
         let _ = writeln!(identity, "files {hex}");
     }
-    let _ = writeln!(identity, "toolchain {id}\n{}\nbuilder blaze-wasm64", script_unit::shim_line());
+    if let Some(hex) = &deps_digest {
+        let _ = writeln!(identity, "deps {hex}");
+    }
+    let _ = writeln!(
+        identity,
+        "toolchain {id}\nwasm-target {WASM64_TARGET}\n{}\nbuilder blaze-wasm64",
+        script_unit::shim_line()
+    );
     let key = sha256_hex(identity.as_bytes());
     let wasm_sha256 = sha256_hex(&wasm);
     publish_build_script_module(store, &key, &identity, &wasm, &wasm_sha256)?;
@@ -675,11 +769,11 @@ fn ensure_proc_macro_unit(
     heap: &'static blaze_own::Heap,
     pm_id: UnitId,
     depth: u8,
-) -> Result<(CrateItemKey, blaze_proc_macro::module::ModuleRecord, std::string::String, std::string::String), std::string::String> {
+) -> Result<(CrateItemKey, blaze_proc_macro::module::ModuleRecord, std::string::String, std::string::String), SelfCompileError> {
     if depth > 8 {
-        return Err(std::string::String::from(
+        return Err(SelfCompileError::Failed(std::string::String::from(
             "proc-macro dependency self-compilation recursion limit exceeded",
-        ));
+        )));
     }
     let unit = &graph.units[pm_id.index()];
     let locked = blaze_proc_macro::module::LockedPackages::of(lock);
@@ -743,10 +837,10 @@ fn ensure_proc_macro_unit(
                 })?
         }
         Err(e) => {
-            return Err(std::format!(
+            return Err(SelfCompileError::Failed(std::format!(
                 "reading proc-macro dep {} {}: {e}",
                 identity.package, identity.version
-            ));
+            )));
         }
     };
     Ok((pm_key, record, identity.package, identity.version))
@@ -758,21 +852,21 @@ pub(crate) fn compile_proc_macro(
     store: &Path,
     inputs: CompileInputs<'_>,
     identity: &blaze_world::procs::MacroIdentity,
-) -> Result<std::string::String, std::string::String> {
+) -> Result<std::string::String, SelfCompileError> {
     let Some(checkout) = inputs.checkout else {
-        return Err(std::format!(
+        return Err(SelfCompileError::Failed(std::format!(
             "cannot self-compile proc-macro {} {}: no on-disk checkout",
             identity.package, identity.version
-        ));
+        )));
     };
     let frame = Frame::with_reserve(COMPILE_FRAME_RESERVE, Tag::Other)
-        .map_err(|_| std::string::String::from("failed to reserve wasm64 compile frame"))?;
+        .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve wasm64 compile frame")))?;
     let erased = Erased::new(&frame);
     let alloc = erased.handle();
     let decoded = blaze_unit_graph::record::decode(inputs.graph, alloc)
-        .map_err(|e| std::format!("unit graph decode failed at byte {}: {}", e.at, e.why))?;
+        .map_err(|e| SelfCompileError::Failed(std::format!("unit graph decode failed at byte {}: {}", e.at, e.why)))?;
     let lock = Lock::read(inputs.lock, alloc)
-        .map_err(|e| std::format!("Cargo.lock parse failed: {e}"))?;
+        .map_err(|e| SelfCompileError::Failed(std::format!("Cargo.lock parse failed: {e}")))?;
     let mut want_sorted: std::vec::Vec<std::string::String> =
         identity.with_id(|id| id.features.iter().map(|s| (*s).to_owned()).collect());
     want_sorted.sort_unstable();
@@ -783,12 +877,12 @@ pub(crate) fn compile_proc_macro(
             && u.version.as_str() == identity.version.as_str()
             && sorted_features_match(u, &want_refs)
     }) else {
-        return Err(std::format!(
+        return Err(SelfCompileError::Failed(std::format!(
             "unit graph has no ProcMacro unit for {} {} with features [{}]",
             identity.package,
             identity.version,
             want_refs.join(",")
-        ));
+        )));
     };
     let pm_id = UnitId(unit_idx as u32);
     let built = compile_unit_to_wasm64(
@@ -844,11 +938,11 @@ fn run_dep_build_script(
     tc_cfg: &[(std::string::String, Option<std::string::String>)],
     tc_names: &[std::string::String],
     depth: u8,
-) -> Result<std::vec::Vec<u8>, std::string::String> {
+) -> Result<std::vec::Vec<u8>, SelfCompileError> {
     // Ensure the build script's own wasm64 module exists first.
     let _ = ensure_build_script_unit(store, graph, lock, checkout, members, heap, bs_id, depth + 1)?;
     let frame = Frame::with_reserve(128 << 20, Tag::Other)
-        .map_err(|_| std::string::String::from("failed to reserve dep build-script frame"))?;
+        .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve dep build-script frame")))?;
     let erased = Erased::new(&frame);
     let alloc = erased.handle();
     let unit = &graph.units[bs_id.index()];
@@ -918,6 +1012,9 @@ fn run_dep_build_script(
             };
             script_unit::script_files_digest(&pkg_dir, unit.root.as_str()).ok()
         });
+    let deps_digest = script_unit::script_deps_digest(graph, lock, bs_id, |dep_pkg| {
+        path_pkg_files_digest(checkout, members, dep_pkg)
+    });
     let setting = Setting {
         store,
         target: WASM64_TARGET,
@@ -930,6 +1027,7 @@ fn run_dep_build_script(
         native: None,
         spawn_setting: Arc::new(SpawnSetting::off()),
         files_digest: files_digest.as_deref(),
+        deps_digest: deps_digest.as_deref(),
     };
     let mut side_cfg: AVec<'_, CfgAtom<'_>> = OwnVec::with_capacity_in(tc_cfg.len(), alloc);
     for (k, v) in tc_cfg {
@@ -973,9 +1071,10 @@ fn compile_unit_to_wasm64(
     root_unit: UnitId,
     mode: CompileMode,
     depth: u8,
-) -> Result<CompiledWasm64, std::string::String> {
-    // Collect `root_unit` + transitive `UnitGraph` dependency closure (DFS worklist) up front so
-    // any dependency proc-macro runtime outlives `compile_unit_in`'s `Frame` (zero leaks).
+) -> Result<CompiledWasm64, SelfCompileError> {
+    // Collect `root_unit` + transitive `UnitGraph` dependency closure in deterministic sorted
+    // order (Rule 25: independent of workspace unit-index ordering) up front so any dependency
+    // proc-macro runtime outlives `compile_unit_in`'s `Frame` (zero leaks).
     let mut unit_order: std::vec::Vec<UnitId> = std::vec::Vec::new();
     let mut unit_to_pos: HashMap<UnitId, usize> = HashMap::new();
     let mut stack = std::vec![root_unit];
@@ -987,11 +1086,28 @@ fn compile_unit_to_wasm64(
         unit_to_pos.insert(uid, pos);
         unit_order.push(uid);
         let u = &graph.units[uid.index()];
+        let mut child_deps: std::vec::Vec<(&str, &str, &str, &str, u8, UnitId)> = std::vec::Vec::new();
         for dep in u.deps.iter() {
             let du = &graph.units[dep.unit.index()];
             if matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro) {
-                stack.push(dep.unit);
+                let kind_ord = match du.kind {
+                    UnitKind::Lib => 0u8,
+                    UnitKind::ProcMacro => 1u8,
+                    _ => 2u8,
+                };
+                child_deps.push((
+                    dep.name.as_str(),
+                    du.name.as_str(),
+                    du.version.as_str(),
+                    du.crate_name.as_str(),
+                    kind_ord,
+                    dep.unit,
+                ));
             }
+        }
+        child_deps.sort_unstable_by(|a, b| (a.0, a.1, a.2, a.3, a.4).cmp(&(b.0, b.1, b.2, b.3, b.4)));
+        for (_, _, _, _, _, dep_unit) in child_deps.into_iter().rev() {
+            stack.push(dep_unit);
         }
     }
 
@@ -1050,9 +1166,9 @@ fn compile_unit_to_wasm64(
     }
 
     let frame = Frame::with_reserve(COMPILE_FRAME_RESERVE, Tag::Other)
-        .map_err(|_| std::string::String::from("failed to reserve wasm64 compile frame"))?;
+        .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve wasm64 compile frame")))?;
     let infer_frame = Frame::with_reserve(COMPILE_FRAME_RESERVE, Tag::Infer)
-        .map_err(|_| std::string::String::from("failed to reserve wasm64 infer frame"))?;
+        .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve wasm64 infer frame")))?;
     let arena = Arena::new(Tag::Other);
     let erased = Erased::new(&frame);
     let bump = erased.bump();
@@ -1103,7 +1219,7 @@ fn compile_unit_in<'a>(
     infer_frame: &'a Frame,
     arena: &'a Arena,
     bump: Bump<'a>,
-) -> Result<CompiledWasm64, std::string::String> {
+) -> Result<CompiledWasm64, SelfCompileError> {
     let alloc = bump.alloc();
 
     // 1. Open pinned `wasm64-blaze-wasip1` toolchain from `<store>/toolchain`.
@@ -1348,6 +1464,9 @@ fn compile_unit_in<'a>(
             implicit(u.edition, &u.kind)
         };
 
+        // Workspace-independent deterministic crate key (Rule 25): never hashes host `UnitId(uid.0)`,
+        // so compiling the same build script or proc-macro from any workspace emits byte-identical
+        // `.wasm` output.
         let mut key_buf = std::vec::Vec::new();
         key_buf.extend_from_slice(u.name.as_str().as_bytes());
         key_buf.push(0);
@@ -1355,8 +1474,25 @@ fn compile_unit_in<'a>(
         key_buf.push(0);
         key_buf.extend_from_slice(u.crate_name.as_str().as_bytes());
         key_buf.push(0);
-        key_buf.extend_from_slice(&(uid.0).to_le_bytes());
-        let crate_key = CrateItemKey(ContentId::of("blaze wasm64 unit", &key_buf));
+        let kind_byte: u8 = match u.kind {
+            UnitKind::Lib => 1,
+            UnitKind::ProcMacro => 2,
+            UnitKind::BuildScript => 3,
+            UnitKind::Bin(_) => 4,
+            UnitKind::Test { .. } => 5,
+            UnitKind::Example(_) => 6,
+            UnitKind::Bench(_) => 7,
+            _ => 8,
+        };
+        key_buf.push(kind_byte);
+        let mut sorted_feats: std::vec::Vec<&str> = feats_slice.to_vec();
+        sorted_feats.sort_unstable();
+        sorted_feats.dedup();
+        for f in sorted_feats {
+            key_buf.push(0);
+            key_buf.extend_from_slice(f.as_bytes());
+        }
+        let crate_key = CrateItemKey(ContentId::of("blaze wasm64 unit 2", &key_buf));
 
         let env = CrateEnv::of(
             EnvFacts {
@@ -1448,10 +1584,10 @@ fn compile_unit_in<'a>(
         for &(name, raw_d) in &u.raw_deps {
             let mapped = tc_at[raw_d];
             if mapped == usize::MAX {
-                return Err(std::format!(
+                return Err(SelfCompileError::Failed(std::format!(
                     "toolchain crate `{}` depends on unkept toolchain unit {raw_d}",
                     u.name
-                ));
+                )));
             }
             deps.push((name, tc_base + mapped));
         }
@@ -1696,7 +1832,7 @@ fn emit_wasm64_from_records<'n>(
     pm_crate_key: Option<CrateItemKey>,
     alloc: Alloc<'n>,
     heap_alloc: Alloc<'static>,
-) -> Result<std::vec::Vec<u8>, std::string::String> {
+) -> Result<std::vec::Vec<u8>, SelfCompileError> {
     let nr = NamesRecords { records, frame: infer_frame, lang_crates, body_sources: Some(body_sources) };
     let builder = wasm64_builder(tc_id);
 
@@ -1738,7 +1874,7 @@ fn emit_wasm64_from_records<'n>(
                 &mut wasm_out,
                 heap_alloc,
             )
-            .map_err(|e| std::format!("wasm64 build-script compile failed: {e}"))?;
+            .map_err(|e| map_wasm64_build_error(module_name, CompileMode::BuildScript, e))?;
         }
         CompileMode::ProcMacro => {
             let shim_crate = shim_idx
@@ -1803,7 +1939,7 @@ fn emit_wasm64_from_records<'n>(
                 &mut wasm_out,
                 heap_alloc,
             )
-            .map_err(|e| std::format!("wasm64 proc-macro compile failed: {e}"))?;
+            .map_err(|e| map_wasm64_build_error(module_name, CompileMode::ProcMacro, e))?;
         }
     }
 
@@ -1822,14 +1958,17 @@ fn publish_build_script_module(
     wasm_sha256: &str,
 ) -> Result<(), std::string::String> {
     let base = store.join("build-script/modules");
+    let stage_root = store.join("build-script/.stage");
     std::fs::create_dir_all(&base)
         .map_err(|e| std::format!("create {}: {e}", base.display()))?;
+    std::fs::create_dir_all(&stage_root)
+        .map_err(|e| std::format!("create {}: {e}", stage_root.display()))?;
     let final_dir = base.join(key);
     if final_dir.join("wasm-sha256").is_file() {
         return Ok(());
     }
     let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let stage = base.join(std::format!(".tmp.{key}.{}.{seq}", std::process::id()));
+    let stage = stage_root.join(std::format!("{key}.{}.{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)
         .map_err(|e| std::format!("create {}: {e}", stage.display()))?;
@@ -1860,14 +1999,17 @@ fn publish_proc_macro_module(
     decls_global: &str,
 ) -> Result<(), std::string::String> {
     let base = store.join("proc-macro/modules");
+    let stage_root = store.join("proc-macro/.stage");
     std::fs::create_dir_all(&base)
         .map_err(|e| std::format!("create {}: {e}", base.display()))?;
+    std::fs::create_dir_all(&stage_root)
+        .map_err(|e| std::format!("create {}: {e}", stage_root.display()))?;
     let final_dir = base.join(key);
     if final_dir.join("wasm-sha256").is_file() {
         return Ok(());
     }
     let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let stage = base.join(std::format!(".tmp.{key}.{}.{seq}", std::process::id()));
+    let stage = stage_root.join(std::format!("{key}.{}.{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)
         .map_err(|e| std::format!("create {}: {e}", stage.display()))?;
@@ -2095,12 +2237,15 @@ fn publish_sysroot_crate(
     }
     std::fs::create_dir_all(sysroot_dir)
         .map_err(|e| std::format!("create {}: {e}", sysroot_dir.display()))?;
+    let stage_root = sysroot_dir.parent().unwrap_or(sysroot_dir).join(".stage");
+    std::fs::create_dir_all(&stage_root)
+        .map_err(|e| std::format!("create {}: {e}", stage_root.display()))?;
     let final_dir = sysroot_dir.join(key_hex);
     if final_dir.join("expansions.bin").is_file() {
         return Ok(());
     }
     let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
-    let stage = sysroot_dir.join(std::format!(".tmp.{key_hex}.{}.{seq}", std::process::id()));
+    let stage = stage_root.join(std::format!("{key_hex}.{}.{seq}", std::process::id()));
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&stage)
         .map_err(|e| std::format!("create {}: {e}", stage.display()))?;

@@ -748,6 +748,16 @@ impl<'f> NamesStage<'f> {
                         clock.names_admitted(name, crates[at].input.name)
                     });
                     let script = names.script_of(at).map(|script| lookup(&self.made, name, script, failed_out)).transpose()?;
+                    let macro_module = {
+                        use blaze_world::crate_list::CrateGraph as _;
+                        let list = names.list();
+                        if list.proc_macro(at) {
+                            let mm = Name::new(Kind::MacroModule, crate::macros::subject_of(list.package(at), list.version(at)));
+                            self.made.binary_search_by_key(&mm, |(n, _)| *n).ok().and_then(|idx| self.made[idx].1).map(|(key, out)| Input { name: mm, at: key, out })
+                        } else {
+                            None
+                        }
+                    };
                     let gate = match (runner, world.refusal(at), script) {
                         (Err(words), _, _) => Err(Blocked::Runner(words)),
                         (_, Some(why), _) => Err(Blocked::Shelf(why)),
@@ -842,7 +852,7 @@ impl<'f> NamesStage<'f> {
                                     }
                                 }
                             }
-                            let job = Job { at, crates, all, deps: &deps, uncommitted_snap: None, script: script_bytes, home, env, packs, corrected, procs, kept, shared_prepares: job_prepares, workers, oracle, clock, board, serve };
+                            let job = Job { at, crates, all, deps: &deps, uncommitted_snap: None, script: script_bytes, macro_module, home, env, packs, corrected, procs, kept, shared_prepares: job_prepares, workers, oracle, clock, board, serve };
                             job.run(cx, root, task, outlined, alloc)
                         });
                         shown.end(board.now(clock));
@@ -1700,6 +1710,16 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         #[cfg(test)]
         if let Some(clock) = crate::engine_scripts::runner_clock() { clock.names_entered(name, krate); }
         let script = names.script_of(at).map(|script| lookup(&stage.made, name, script, stage.failed_out)).transpose()?;
+        let macro_module = {
+            use blaze_world::crate_list::CrateGraph as _;
+            let list = names.list();
+            if list.proc_macro(at) {
+                let mm = Name::new(Kind::MacroModule, crate::macros::subject_of(list.package(at), list.version(at)));
+                stage.made.binary_search_by_key(&mm, |(n, _)| *n).ok().and_then(|idx| stage.made[idx].1).map(|(key, out)| Input { name: mm, at: key, out })
+            } else {
+                None
+            }
+        };
         let refused = |what| Why::Refused { what, rule: crate::names::RULE };
         let mut gate = match (runner, world.refusal(at), script) {
             (Err(words), _, _) => Err((refused("the proc-macro runner could not be made"), Some(blaze_own::String::from_str_in(words, alloc)))),
@@ -1898,7 +1918,7 @@ impl<'j, 'a: 'j> NamesQueue<'j, 'a> {
         if self.shared_prepares.is_none() {
             self.shared_prepares = crate::names::SharedPrepares::new(handles.env.heap.shared()).ok();
         }
-        let job = Job { at, crates: columns.crates, all, deps, uncommitted_snap, script: script_bytes, home: handles.env.home, env, packs: columns.packs,
+        let job = Job { at, crates: columns.crates, all, deps, uncommitted_snap, script: script_bytes, macro_module, home: handles.env.home, env, packs: columns.packs,
             corrected: columns.corrected, procs: gate.as_ref().ok().copied().flatten(), kept: handles.env.heap.shared(),
             shared_prepares: self.shared_prepares.as_ref().map(crate::names::SharedPrepares::share),
             workers, oracle: handles.oracle, clock: &handles.env.clock, board: handles.board, serve: handles.serve() };
@@ -2038,6 +2058,10 @@ struct Job<'j, 'd> {
     /// Short-lived snapshot keeping any `ExportRef::InSnapshot` arena alive for this job alone.
     uncommitted_snap: Option<crate::store::SharedSnapshot>,
     script: Option<(Input, &'j [u8])>,
+    /// For a proc-macro crate, its settled `Kind::MacroModule` task so any change to its compiled
+    /// module (including edits to its body or path dependencies) wakes this `CrateScope` and
+    /// refreshes the `proc_macro_key` embedded in its `items`/`exports` records (Rule 21).
+    macro_module: Option<Input>,
     home: Option<&'j str>,
     env: Option<EnvLent<'j, 'j>>,
     packs: crate::job_texts::SyncPacks<'j>,
@@ -2377,7 +2401,7 @@ impl Job<'_, '_> {
         found.outlined.sort_unstable_by_key(|one| one.name);
         found.probes.sort_unstable_by_key(|(slot, ..)| Name::file(slot));
         let implicit_entry_root = input.implicit.entry.then(|| input.root.strip_prefix("/0/")).flatten();
-        let mut answer = finish(task, input.name, implicit_entry_root, resolved, ok, unresolved, oracle, &order, &exports, snap_ref, script_input, outlined, found, alloc, local, bump, self.kept)?;
+        let mut answer = finish(task, input.name, implicit_entry_root, resolved, ok, unresolved, oracle, &order, &exports, snap_ref, script_input, self.macro_module, outlined, found, alloc, local, bump, self.kept)?;
         answer.scope_bytes = scope_bytes;
         Ok(answer)
     }
@@ -2449,7 +2473,7 @@ fn unseen_file(task: Name, read: Name, krate: &str, path: &str, heap: SharedAllo
 }
 
 #[expect(clippy::too_many_arguments, reason = "one resolved crate and the inputs it was handed")]
-fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], dep_exports: &[Verified<'_>], snap: Option<&crate::store::StoreSnapshot>, script: Option<Input>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, bump: blaze_own::Bump<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
+fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>, resolved: Resolved, ok: bool, unresolved: u32, oracle: Option<OracleCrate>, deps: &[Dependency<'_>], dep_exports: &[Verified<'_>], snap: Option<&crate::store::StoreSnapshot>, script: Option<Input>, macro_module: Option<Input>, outlined: &[Outlined<'_>], found: FoundBy, alloc: SharedAlloc<'a>, scratch: blaze_own::Alloc<'_>, bump: blaze_own::Bump<'_>, heap: SharedAlloc<'static>) -> Result<WorkerAnswer<'a>, WorkerError> {
     let name = task.planned.name;
     // A file this crate found and its worker outlined (which may upgrade a walk `DATA_FILE` to a
     // Rust outline), else one the request's outlines hold.
@@ -2459,7 +2483,7 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
     record.out = resolved.out;
     resolved.file_findings(&mut record).map_err(|crate::names::FindingText(what)| WorkerError::Finding(what))?;
     let (files, absent, data) = resolved.checkout_reads();
-    let count = files.len() + absent.len() + data.len() + deps.len() + usize::from(script.is_some());
+    let count = files.len() + absent.len() + data.len() + deps.len() + usize::from(script.is_some()) + usize::from(macro_module.is_some());
     record.reads.reserve(count);
     let mut reads = SVec::with_capacity_in(count, alloc);
     // A file read the plan did not hand ([`unoutlined`] found none before this call; kept so a
@@ -2571,6 +2595,10 @@ fn finish<'a>(task: &EngineTask, krate: &str, implicit_entry_root: Option<&str>,
         reads.push(dep_input_cell(dep, snap));
     }
     if let Some(input) = script {
+        record.reads.push((input.name, input.out));
+        reads.push(input_cell(input, false));
+    }
+    if let Some(input) = macro_module {
         record.reads.push((input.name, input.out));
         reads.push(input_cell(input, false));
     }

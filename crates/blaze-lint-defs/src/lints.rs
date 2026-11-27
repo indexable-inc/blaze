@@ -589,4 +589,7 @@ pub(super) const BLAZE: &[Lint] = &[
     // Opt-in checked complexity cost contracts (`#[blaze::cost(...)]`), checked by blaze-typeck's `cost-contract` rule.
     l("blaze::cost_contract", Deny, "detects a violation of an opt-in `#[blaze::cost(...)]` time, space, or synchronization contract (loop depth, callee complexity, direct recursion, lock in loop, or malformed cost attribute)")
         .externally_loaded(),
+    // Sans-IO capability firewall (`#[blaze::capability]` stored in `#![blaze::sans_io]` ADT), checked by blaze-typeck's `capability-in-sans-io` rule.
+    l("blaze::capability_in_sans_io", Deny, "detects a `#[blaze::capability]` type stored (directly or transitively) as a field inside a type defined in a `#![blaze::sans_io]` crate or module")
+        .externally_loaded(),
 ];

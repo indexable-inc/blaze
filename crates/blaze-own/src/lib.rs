@@ -17,16 +17,22 @@
 //! | [`Rc`], [`rc::Weak`] | the same, counted on one thread |
 //! | [`VecDeque`] | a ring buffer |
 //! | [`SortedMap`], [`SortedSet`] | ordered by key, a sorted vector searched by halving: for small or read-mostly maps |
+//! | [`SortedSlice`] | a zero-allocation borrowed proof wrapper over `&[(K, V)]` sorted ascending by key for O(log N) lookup |
+//! | [`DisjointRanges`] | a zero-allocation borrowed proof wrapper over sorted disjoint inclusive `(u32, u32)` intervals with O(\|small\| log \|large\|) overlap |
 //! | [`BTreeMap`], [`BTreeSet`] | ordered by key, a B-tree of 15-entry nodes, keys and values in separate columns: for large or insert-heavy maps |
 //! | [`Heap4`] | a 4-ary min-heap in one vector, the priority queue; its plant on the [`planted`] seam |
 //! | [`CloneIn`], [`Share`], [`DefaultIn`], [`FromIn`], [`IntoIn`], [`FromStrIn`] | std's `Clone`, `Default`, `From`, `Into` and `FromStr` with the allocator named; `Share` the copy that is another handle ([`make`]) |
 //! | [`Cow`] | borrowed or owned, copied into the allocator the caller names when it must own |
 //! | [`Soa`], [`soa!`] | a struct-of-arrays vector: one packed column per field in one allocation; the macro names its rows and columns |
+//! | [`BitCol`], [`SmallTagCol`], [`ArchetypeHandle`], [`archetypal!`] | bit-packed boolean and small-tag columns (8x–64x smaller than `Vec<bool>`/`Vec<u8>`) and archetype-partitioned enum storage (`archetypal!`) |
 //! | [`Csr`] | a zero-unsafe Compressed Sparse Row container: flat `offsets: Vec<u32, A>` (`[0, ..]`) + `values: Vec<T, A>` |
 //! | [`String`], [`format_in!`], [`format_into!`] | UTF-8 text over [`Vec<u8, A>`](Vec); `blaze_mem` re-exports it, keeping only `OsString` and `PathBuf` |
 //! | [`FixedVec`] | up to `N` values inline, no allocator; a push past `N` is refused with [`Full`], the value handed back |
 //! | [`Packed`], [`Pack`] | values of different sizes end to end in one byte buffer, each its own size; iterated, not indexed, with an optional checkpoint every `K` values for seeking |
 //! | [`Inline`] | an allocator over a buffer inside itself (`&Inline<BYTES>`), so any of these lives on the stack; refuses when full, never falls back |
+//! | [`Brand`], [`BrandedAlloc`], [`BrandedBump`], [`DropWith`] | invariant lifetime brands (`with_brand`) and contextual teardown for unmanaged linear types (`docs/v2/plan/design/drop-with.md`) |
+//! | [`FrameVec`], [`UnmanagedVec`], [`LenIdx`] | branded unmanaged vectors (`16 B` default `u32`, `12 B` `Small*` `u16` packing `(u32, Small*)` into `16 B`, `24 B` `Large*` `usize`; `Option` niche preserved) |
+//! | [`ArenaBase`], [`Ref32`], [`ArenaVec`] | compressed 32-bit offset tier over a base-anchored 32 GiB slab (`4 B` `Ref32` & `Option<Ref32>`, `8 B` `ArenaVec<T, u16>` in one register) |
 //! | [`Alloc`], [`Erased`], [`AVec`] and friends | the allocator as a value of one type, one word: what a function takes (`alloc: Alloc<'_>`) instead of a type parameter; [`Erased`] makes any allocator hand one out ([`alloc_ref`]) |
 //!
 //! The cargo feature `std` (off by default; blaze-mem turns it on) adds what only this crate
@@ -110,16 +116,23 @@ mod macros;
 
 pub mod alloc_ref;
 pub mod arc;
+#[macro_use]
+pub mod archetypal;
+pub mod arena_ptr;
+pub mod bit_col;
 pub mod boxed;
+pub mod brand;
 pub mod btree;
 pub mod byte_cursor;
 pub mod cow;
 pub mod csr;
 pub mod deque;
+pub mod disjoint_ranges;
 mod error;
 pub mod fixed;
 // A lookup's answer across a crate: Known, Absent or Unknown (D193 point 5).
 pub mod found;
+pub mod frame_vec;
 pub mod heap4;
 pub mod lists;
 pub mod lz77;
@@ -139,6 +152,7 @@ pub mod segs;
 #[macro_use]
 pub mod soa;
 pub mod sorted;
+pub mod sorted_slice;
 pub mod spec;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -166,10 +180,18 @@ pub use segs::{Appender, Segs, SharedSegs};
 pub use texts::{SortedTexts, Texts};
 pub use blaze_memchr::blaze_int::{self, Idx, Int};
 pub use arc::Arc;
+pub use archetypal::{ArchetypeHandle, MAX_ROWS_PER_VARIANT, MAX_VARIANTS};
+pub use arena_ptr::{ArenaBase, ArenaVec, Ref32};
+pub use bit_col::{BitCol, OnesIter, SmallTagCol};
 pub use boxed::{Box, CallOnce};
+pub use brand::{Brand, BrandedAlloc, BrandedBump, DropWith, with_brand};
 pub use btree::{BTreeMap, BTreeSet};
 pub use byte_cursor::{
     ByteCursor, RevBitCursor, SeqExecCtx, SeqLeafResult, SeqOp, SliceWriter, common_prefix_len,
+};
+pub use frame_vec::{
+    FrameVec, LargeFrameVec, LargeUnmanagedVec, LenIdx, SmallFrameVec, SmallUnmanagedVec,
+    UnmanagedVec,
 };
 pub use lz77::{
     FseSeqEncTables, LZ77_DEF_BUCKETS, LZ77_FAST_HASH_SIZE, count_seq_symbols_fast,
@@ -179,6 +201,7 @@ pub use lz77::{
 pub use cow::{Cow, ToOwnedIn};
 pub use csr::Csr;
 pub use deque::VecDeque;
+pub use disjoint_ranges::DisjointRanges;
 pub use error::AllocFailure;
 pub use fixed::{FixedString, FixedVec, Full, Inline, Overflow};
 pub use heap4::{Heap4, Heap4Plant};
@@ -190,6 +213,7 @@ pub use raw::RawBuf;
 pub use rc::Rc;
 pub use soa::Soa;
 pub use sorted::{SortedMap, SortedSet};
+pub use sorted_slice::SortedSlice;
 pub use text::{FromUtf8Error, String};
 pub use thin_arc::{ThinArc, ThinArcSlice, ThinStr};
 pub use thin_vec::ThinVec;

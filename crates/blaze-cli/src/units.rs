@@ -206,14 +206,72 @@ pub fn lay<'f, 'l>(
                 listed[k] = Some((made.name, member_source(&made)));
                 made_of[k] = Some(made);
             }
+            // Collect all workspace members and path packages whose whole file tree enters a
+            // proc-macro or build-script module key (rule 21): every proc-macro crate, every
+            // transitive path dependency of a proc-macro crate, and every transitive path
+            // build-dependency of a crate with a build script.
+            let mut whole_dirs: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+            let mut dep_stack: Vec<(bool, usize), &Frame> = Vec::new_in(frame);
+            let mut seen_pkgs: std::collections::BTreeSet<(bool, usize)> = std::collections::BTreeSet::new();
+            let push_pkg = |is_path: bool, idx: usize, seen: &mut std::collections::BTreeSet<(bool, usize)>, stack: &mut Vec<(bool, usize), &Frame>| {
+                if seen.insert((is_path, idx)) {
+                    stack.push((is_path, idx));
+                }
+            };
+            let push_dep_target = |dep: &blaze_manifest::layout::Dependency<'_>, units: &layout::Units<'_>, seen: &mut std::collections::BTreeSet<(bool, usize)>, stack: &mut Vec<(bool, usize), &Frame>| {
+                match &dep.source {
+                    blaze_manifest::layout::Source::Member(idx) => push_pkg(false, *idx, seen, stack),
+                    blaze_manifest::layout::Source::Path(dir) => {
+                        if let Some(idx) = units.path_packages.iter().position(|p| p.dir.as_str() == dir.as_str()) {
+                            push_pkg(true, idx, seen, stack);
+                        } else if let Some(idx) = units.members.iter().position(|m| m.dir.as_str() == dir.as_str()) {
+                            push_pkg(false, idx, seen, stack);
+                        }
+                    }
+                    _ => {}
+                }
+            };
+            for (idx, m) in units.members.iter().enumerate() {
+                if m.lib.iter().any(|lib| lib.proc_macro) {
+                    push_pkg(false, idx, &mut seen_pkgs, &mut dep_stack);
+                }
+                if m.build.is_some() {
+                    for dep in m.dependencies.iter() {
+                        if dep.kind == blaze_manifest::layout::DepKind::Build {
+                            push_dep_target(dep, &units, &mut seen_pkgs, &mut dep_stack);
+                        }
+                    }
+                }
+            }
+            for (idx, p) in units.path_packages.iter().enumerate() {
+                if p.lib.iter().any(|lib| lib.proc_macro) {
+                    push_pkg(true, idx, &mut seen_pkgs, &mut dep_stack);
+                }
+                if p.build.is_some() {
+                    for dep in p.dependencies.iter() {
+                        if dep.kind == blaze_manifest::layout::DepKind::Build {
+                            push_dep_target(dep, &units, &mut seen_pkgs, &mut dep_stack);
+                        }
+                    }
+                }
+            }
+            while let Some((is_path, idx)) = dep_stack.pop() {
+                let pkg = if is_path { &units.path_packages[idx] } else { &units.members[idx] };
+                whole_dirs.insert(pkg.dir.as_str());
+                for dep in pkg.dependencies.iter() {
+                    if matches!(dep.kind, blaze_manifest::layout::DepKind::Normal | blaze_manifest::layout::DepKind::Build) {
+                        push_dep_target(dep, &units, &mut seen_pkgs, &mut dep_stack);
+                    }
+                }
+            }
             for (member, made) in units.members.iter().zip(made_of.iter_mut()) {
                 let Some(made) = made.take() else { return Err(CliError::Text { what: "a member's units were not made in the layout's dependency order (units.rs `deps_first`)" }) };
                 root_made.parts.push(Part { name: made.name, locate: Locate::Source(member_source(&made)), place: 0 });
                 members.push((made.name, made));
-                // A member proc-macro crate's files, whole: its module key holds them, so they are
-                // in the units' source (macro_files.rs, rule 21), each file and folder with its
-                // stamp, so the next sweep proves the crate unchanged by stats alone (rule 77).
-                if member.lib.iter().any(|lib| lib.proc_macro) {
+                // A member proc-macro crate (or transitive path dep of a proc-macro or build
+                // script): its files enter the module key (macro_files.rs, rule 21), each file
+                // and folder with its stamp, so the next sweep proves it unchanged by stats alone.
+                if whole_dirs.contains(member.dir.as_str()) {
                     crate::macro_files::read_row(&cx, root, stamps, member.dir.as_str(), rows, frame)?;
                 } else if let Some(build) = &member.build {
                     let rel = if member.dir.is_empty() {
@@ -225,13 +283,14 @@ pub fn lay<'f, 'l>(
                 }
             }
             // Non-member path packages: keep each target root's edition for the file walk and
-            // track proc-macro and build-script source trees in the sweep leaf table (rule 21).
+            // track proc-macro, transitive path dep, and build-script source trees in the sweep
+            // leaf table (rule 21).
             for pkg in units.path_packages.iter() {
                 let edition = syntax_of(pkg.edition.syntax).byte();
                 for target in pkg.lib.iter().chain(pkg.bins.iter()).chain(pkg.build.iter()) {
                     path_roots.push((frame.alloc_str(target.root.as_str()), edition));
                 }
-                if pkg.lib.iter().any(|lib| lib.proc_macro) {
+                if whole_dirs.contains(pkg.dir.as_str()) {
                     crate::macro_files::read_row(&cx, root, stamps, pkg.dir.as_str(), rows, frame)?;
                 } else if let Some(build) = &pkg.build {
                     let rel = if pkg.dir.is_empty() {

@@ -111,6 +111,15 @@ pub struct Digests<'a> {
     pub watch: Vec<Text<'a>, Alloc<'a>>,
 }
 
+/// The walk's answer for a single producer row ([`Walk::for_row`], [`Walk::finish_row`]).
+pub struct SingleDigest<'a> {
+    pub row: Row,
+    pub digest: Digest<'a>,
+    /// Relative to the workspace root, sorted, each once: only the manifests, lock, pins, and
+    /// top-level entries of crates inside this row's closure.
+    pub watch: Vec<Text<'a>, Alloc<'a>>,
+}
+
 /// One row's answer.
 #[derive(Debug)]
 pub enum Digest<'a> {
@@ -150,6 +159,9 @@ pub enum Refused<'a> {
     /// A `producer-own` list: a crate's own files without its closure, less than its producing
     /// function runs (rule 21).
     OwnFilesOnly { path: Text<'a> },
+    /// A `[package.metadata.blaze.producer-exclude]` entry naming a dependency not declared by
+    /// the crate (rule 3, rule 21).
+    UnknownExclude { path: Text<'a>, dep: Text<'a> },
     /// No crate names this row as its `producer`.
     NoRoot { row: Row },
     /// A `x.workspace = true` with no `[workspace.dependencies] x`.
@@ -181,6 +193,10 @@ impl fmt::Display for Refused<'_> {
                 f,
                 "{path}: `[package.metadata.blaze] producer-own` digests a crate's own files without the crates its code calls, so a key would miss code that makes its value (rule 21): name the row in `producer`, which covers the whole closure"
             ),
+            Refused::UnknownExclude { path, dep } => write!(
+                f,
+                "{path}: `[package.metadata.blaze.producer-exclude]` names `{dep}`, which is not a declared dependency of this crate"
+            ),
             Refused::NoRoot { row } => write!(f, "no crate's `[package.metadata.blaze] producer` names `{}`", row.name()),
             Refused::NoWorkspaceDep { path, key } => {
                 write!(f, "{path}: `{key}.workspace = true` with no `[workspace.dependencies] {key}`")
@@ -210,6 +226,7 @@ impl Refused<'_> {
             | Refused::Escapes { path, .. }
             | Refused::UnknownRow { path, .. }
             | Refused::OwnFilesOnly { path }
+            | Refused::UnknownExclude { path, .. }
             | Refused::NoWorkspaceDep { path, .. } => Some(path.as_str()),
             Refused::NoRoot { .. } | Refused::NotLocked { .. } | Refused::NoPathCrate { .. } | Refused::Unasked { .. } => None,
         }
@@ -221,8 +238,9 @@ struct Crate<'a> {
     dir: Text<'a>,
     name: Text<'a>,
     producer: u8,
-    /// Each dependency, and whether it is `optional = true`.
-    deps: Vec<(Dep<'a>, bool), Alloc<'a>>,
+    excludes: Vec<(Row, Text<'a>), Alloc<'a>>,
+    /// Each dependency's manifest key, target, and whether it is `optional = true`.
+    deps: Vec<(Text<'a>, Dep<'a>, bool), Alloc<'a>>,
     /// Its files' (path, digest), filled in the files phase.
     files: Vec<(Text<'a>, ContentId), Alloc<'a>>,
 }
@@ -266,6 +284,7 @@ enum Phase {
 /// The walk (see the crate's docs).
 pub struct Walk<'a> {
     alloc: Alloc<'a>,
+    wanted_rows: u8,
     phase: Phase,
     /// Jobs not yet asked, each with its path.
     queue: VecDeque<(Job, Text<'a>), Alloc<'a>>,
@@ -283,13 +302,41 @@ pub struct Walk<'a> {
     watch: Vec<Text<'a>, Alloc<'a>>,
 }
 
+const ALL_SOURCE_ROWS: u8 = {
+    let mut mask = 0u8;
+    let mut i = 0;
+    while i < ROWS.len() {
+        mask |= 1u8 << ROWS[i].index();
+        i += 1;
+    }
+    mask
+};
+
 impl<'a> Walk<'a> {
-    /// A walk from the root manifest.
+    /// A walk from the root manifest over all source rows ([`ROWS`]).
     pub fn new(alloc: Alloc<'a>) -> Walk<'a> {
+        Walk::with_mask(ALL_SOURCE_ROWS, alloc)
+    }
+
+    /// A walk from the root manifest over a single source row (`row != Row::Whole`): reads,
+    /// hashes, and watches only the crates inside `row`'s closure (plus manifests, lock, and
+    /// `pins/`).
+    pub fn for_row(row: Row, alloc: Alloc<'a>) -> Result<Walk<'a>, Refused<'a>> {
+        if row == Row::Whole {
+            return Err(Refused::UnknownRow {
+                path: text(ROOT_MANIFEST, alloc),
+                name: text(row.name(), alloc),
+            });
+        }
+        Ok(Walk::with_mask(1u8 << row.index(), alloc))
+    }
+
+    fn with_mask(wanted_rows: u8, alloc: Alloc<'a>) -> Walk<'a> {
         let mut queue = VecDeque::new_in(alloc);
         queue.push_back((Job::Root, text(ROOT_MANIFEST, alloc)));
         Walk {
             alloc,
+            wanted_rows,
             phase: Phase::Manifests,
             queue,
             asked: None,
@@ -372,7 +419,7 @@ impl<'a> Walk<'a> {
                 let root = self.root.as_ref().ok_or(Refused::Unasked { answered: "a manifest before the root" })?;
                 // Path crates outside the members are read too: a closure may reach them.
                 let mut reach: Vec<Text<'a>, Alloc<'a>> = Vec::new_in(alloc);
-                for (dep, _) in member.deps.iter() {
+                for (_, dep, _) in member.deps.iter() {
                     match dep {
                         Dep::Path(dir) => reach.push(dir.clone()),
                         Dep::Workspace(key) => match ws_dep(root, key) {
@@ -390,6 +437,7 @@ impl<'a> Walk<'a> {
                 let krate = &mut self.crates[at];
                 krate.name = member.name;
                 krate.producer = member.producer;
+                krate.excludes = member.excludes;
                 krate.deps = member.deps;
                 for dir in reach.iter() {
                     self.want_crate(dir.as_str());
@@ -543,6 +591,22 @@ impl<'a> Walk<'a> {
         &self.watch[..]
     }
 
+    /// The digest of `row`, once [`Walk::next`] said [`Step::Done`] on a walk created with
+    /// [`Walk::for_row`] (or [`Walk::new`]).
+    pub fn finish_row(self, row: Row) -> Result<SingleDigest<'a>, Refused<'a>> {
+        let alloc = self.alloc;
+        if row == Row::Whole || (self.wanted_rows & (1u8 << row.index())) == 0 {
+            return Err(Refused::Unasked { answered: "finish_row for an unwalked row" });
+        }
+        let digests = self.finish()?;
+        for (r, digest) in digests.rows {
+            if r == row {
+                return Ok(SingleDigest { row, digest, watch: digests.watch });
+            }
+        }
+        Err(Refused::UnknownRow { path: text(ROOT_MANIFEST, alloc), name: text(row.name(), alloc) })
+    }
+
     /// Asks for the manifest of the crate at `dir` once, and knows the crate by it.
     fn want_crate(&mut self, dir: &str) {
         let alloc = self.alloc;
@@ -554,6 +618,7 @@ impl<'a> Walk<'a> {
             dir: text(dir, alloc),
             name: Text::new_in(alloc),
             producer: 0,
+            excludes: Vec::new_in(alloc),
             deps: Vec::new_in(alloc),
             files: Vec::new_in(alloc),
         });
@@ -572,6 +637,15 @@ impl<'a> Walk<'a> {
         digested.resize(self.crates.len(), false);
         for row in ROWS {
             let bit = 1u8 << row.index();
+            if (self.wanted_rows & bit) == 0 {
+                self.plans.push(Plan {
+                    crates: Vec::new_in(alloc),
+                    ws: Vec::new_in(alloc),
+                    locked: Vec::new_in(alloc),
+                    refused: None,
+                });
+                continue;
+            }
             let mut seen = Vec::new_in(alloc);
             seen.resize(self.crates.len(), false);
             let mut work: Vec<usize, Alloc<'a>> = Vec::new_in(alloc);
@@ -597,7 +671,10 @@ impl<'a> Walk<'a> {
                 if let Some(at) = work.pop() {
                     let krate = &self.crates[at];
                     let manifest = child(krate.dir.as_str(), "Cargo.toml", alloc);
-                    for (dep, optional) in krate.deps.iter() {
+                    for (dep_key, dep, optional) in krate.deps.iter() {
+                        if krate.excludes.iter().any(|(r, k)| *r == row && k.as_str() == dep_key.as_str()) {
+                            continue;
+                        }
                         let dir = match dep {
                             Dep::Path(dir) => dir,
                             Dep::Outside(name) => {

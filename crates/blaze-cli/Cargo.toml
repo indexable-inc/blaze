@@ -157,7 +157,14 @@ sandbox = ["blaze-proc-macro/runtime"]
 # default: a developer's blaze refuses `blaze store publish` by name and writes only `LOCAL`.
 publish = ["blaze-remote/sign"]
 
+[build-dependencies]
+blaze-ids.workspace = true
+blaze-own = { workspace = true, features = ["std"] }
+blaze-producers.workspace = true
+
 [dev-dependencies]
+# producers.rs: verifies compile-time `CODE_BUILDER_SOURCE` matches live workspace walk.
+blaze-producers.workspace = true
 # `blaze_meter::testing::stop`: the meter's readers off, for the on/off byte-equality test.
 blaze-meter = { workspace = true, features = ["testing"] }
 # The names fixture runs a real worker pool over its simulated filesystem.

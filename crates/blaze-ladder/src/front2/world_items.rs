@@ -1207,8 +1207,11 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// asked for as an ADT (rung x0-drop-11-zst-temporary: "a fn (asked for as an ADT)").
     fn attrs_once(&self, item: ItemKey) -> Fetch<TypeAttrs> {
         if let Some(a) = self.store.adts.get(&item) {
-            // `#[blaze::args]` (rule 83): the options-struct mark, from the made head or its record.
+            // `#[blaze::args]` (rule 83), `#[blaze::capability]`, and `#![blaze::sans_io]` marks.
             let args = if a.args { TypeAttrs::ARGS } else { 0 };
+            let capability = if a.capability { TypeAttrs::CAPABILITY } else { 0 };
+            let sans_io = if a.sans_io { TypeAttrs::SANS_IO } else { 0 };
+            let base = args | capability | sans_io;
             // `repr(packed)` in any form (`packed(N)`, `C, packed`): the layout's own fact
             // (`ReprAttrs::packed`), answered for the capture analysis (TypeAttrs::PACKED).
             let packed = if a.repr.packed.is_some() { TypeAttrs::PACKED } else { 0 };
@@ -1218,9 +1221,9 @@ impl<'n, S: NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 0
             };
             return Ok(match a.kind {
-                tc::AdtKind::Enum => TypeAttrs(args).with_discr(super::heads::discr_ty(a.repr)),
-                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | args | packed | auto_copy),
-                _ => TypeAttrs(args | packed | auto_copy),
+                tc::AdtKind::Enum => TypeAttrs(base).with_discr(super::heads::discr_ty(a.repr)),
+                tc::AdtKind::Struct if a.repr.simd => TypeAttrs(TypeAttrs::SIMD | base | packed | auto_copy),
+                _ => TypeAttrs(base | packed | auto_copy),
             });
         }
         if let Some(f) = self.store.fns.get(&item) {

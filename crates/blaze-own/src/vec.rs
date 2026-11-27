@@ -235,6 +235,7 @@ impl<T, A: Allocator> Vec<T, A> {
         self.buf.shrink_to(min_capacity.max(self.len));
     }
 
+    #[blaze::cost(amortized O(1))]
     #[inline]
     pub fn push(&mut self, value: T) {
         if self.len == self.buf.capacity() {
@@ -246,6 +247,7 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     /// Pushes `value`, or gives it back with the [`AllocFailure`] when there is no room.
+    #[blaze::cost(amortized O(1))]
     pub fn try_push(&mut self, value: T) -> Result<(), Refused<T>> {
         if let Err(why) = self.buf.try_reserve(self.len, 1) {
             return Err(Refused { value, why });
@@ -256,6 +258,7 @@ impl<T, A: Allocator> Vec<T, A> {
         Ok(())
     }
 
+    #[blaze::cost(O(1))]
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
@@ -462,6 +465,7 @@ impl<T, A: Allocator> Vec<T, A> {
     /// The index of the first value equal to `needle`, by a linear scan: blaze-memchr's vector
     /// search for `u8`, `i8` and `bool`, `==` per value otherwise ([`Find`]). For repeated
     /// lookups keep the values sorted (`SortedSet`) or in a map.
+    #[blaze::cost(O(n), space = O(1))]
     #[inline]
     pub fn scan_for(&self, needle: &T) -> Option<usize>
     where
@@ -903,6 +907,7 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     #[deprecated(note = "a linear scan: use `scan_for(needle).is_some()`")]
+    #[blaze::cost(O(n), space = O(1))]
     #[inline]
     pub fn contains(&self, needle: &T) -> bool
     where
@@ -912,6 +917,7 @@ impl<T, A: Allocator> Vec<T, A> {
     }
 
     #[deprecated(note = "a linear scan: use `scan_for`")]
+    #[blaze::cost(O(n), space = O(1))]
     #[inline]
     pub fn position(&self, needle: &T) -> Option<usize>
     where

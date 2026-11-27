@@ -583,6 +583,25 @@ impl TypeAttrs {
     /// Bits 13..=21: opt-in complexity cost contract ([`CostContract`], 9 bits); 0 is `NONE`.
     const COST_SHIFT: u32 = 13;
     const COST_MASK: u32 = 0x01ff << Self::COST_SHIFT;
+    /// `#[blaze::capability]` on a struct/enum/union: a host/runtime capability (e.g. `Alloc`,
+    /// `Fs`, `Net`, `Clock`, `Mutex`) that cannot be stored as a field (directly or transitively)
+    /// inside any type defined in a `#![blaze::sans_io]` crate or module (rules/capability.rs).
+    /// Bit 22.
+    pub const CAPABILITY: u32 = 1 << 22;
+    /// ADT defined inside a `#![blaze::sans_io]` crate or module (or marked `#[blaze::sans_io]`):
+    /// checked by `capability-in-sans-io` (rules/capability.rs) to store no `#[blaze::capability]`
+    /// field directly or transitively. Bit 23.
+    pub const SANS_IO: u32 = 1 << 23;
+
+    /// Whether this item carries `#[blaze::capability]`.
+    pub const fn is_capability(self) -> bool {
+        (self.0 & Self::CAPABILITY) != 0
+    }
+
+    /// Whether this ADT is defined in a `#![blaze::sans_io]` crate/module or marked `#[blaze::sans_io]`.
+    pub const fn is_sans_io(self) -> bool {
+        (self.0 & Self::SANS_IO) != 0
+    }
 
     /// These attributes with a complexity cost contract set.
     pub const fn with_cost(self, c: CostContract) -> Self {

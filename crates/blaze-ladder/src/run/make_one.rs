@@ -166,6 +166,15 @@ pub struct CheckCount {
     pub coroutine_walks: usize,
 }
 
+/// Polymorphization layout-canonicalization counters for a [`Maker`] session.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PolyCanonStats {
+    /// Total generic direct-call references inspected for polymorphization canonicalization.
+    pub generic_calls: u64,
+    /// Generic direct-call references rewritten to a strictly simpler canonical ground instance.
+    pub canonicalized_calls: u64,
+}
+
 /// A made function at or past this many bytes of code or of estimated frame is reported
 /// ([`MakeSizes`]; rule 16: a huge function is a P0 until its profile names it).
 pub const MAKE_REPORT_BYTES: u64 = 1 << 20;
@@ -581,6 +590,24 @@ struct Work {
     /// `adt_drop_impl`, `resolve`) keyed by interned IDs in `self.ground`. Sits below `Recorded` /
     /// `Asking` so every build's `ReadLog` is unchanged.
     query_cache: core::cell::RefCell<QueryCache>,
+    /// Per-`MakerState` cache of propagated polymorphization [`ParamUse`] summaries per generic
+    /// callee, backed by [`SharedLazyFront`] across parallel workers when available.
+    poly_cache: blaze_hash::Map<ItemKey, PolyCached, blaze_hash::FixedState, Alloc<'static>>,
+    /// Session-wide polymorphization canonicalization counters.
+    poly_stats: PolyCanonStats,
+}
+
+/// Cached propagated polymorphization summary for one generic function item.
+struct PolyCached {
+    usage: AVec<'static, crate::front2::poly_canon::ParamUse>,
+    /// Sorted, deduped transitive analyzed callees (including self) whose body text + signature
+    /// contributed to `usage`. Empty when `!can_canon` (no `PolyBodyText` read needed).
+    deps: AVec<'static, ItemKey>,
+    /// Sorted, deduped ADTs whose definitions / drop impls contributed to `usage`. Empty when
+    /// `!can_canon`.
+    adt_deps: AVec<'static, ItemKey>,
+    /// `true` iff at least one parameter has `level() != CanonLevel::Concrete`.
+    can_canon: bool,
 }
 
 /// Compact stack-inline argument list key for [`QueryCache::normalize`] (99%+ of projections have
@@ -675,6 +702,8 @@ struct RefGaps<'f> {
     first_ask: Option<RunError>,
     missing_objects: AVec<'f, (ItemKey, RunError)>,
     untabled: AVec<'f, (ItemKey, RunError)>,
+    /// Generic callees needing a propagated polymorphization summary (`compute_poly_summary`).
+    need_poly: AVec<'f, ItemKey>,
 }
 
 impl<'f> RefGaps<'f> {
@@ -683,11 +712,15 @@ impl<'f> RefGaps<'f> {
             first_ask: None,
             missing_objects: AVec::new_in(alloc),
             untabled: AVec::new_in(alloc),
+            need_poly: AVec::new_in(alloc),
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.first_ask.is_none() && self.missing_objects.is_empty() && self.untabled.is_empty()
+        self.first_ask.is_none()
+            && self.missing_objects.is_empty()
+            && self.untabled.is_empty()
+            && self.need_poly.is_empty()
     }
 }
 
@@ -783,6 +816,8 @@ impl MakerState {
             ref_reads: ReadLog::new(ReadPlant::None),
             answers: Answers::new_in(alloc),
             query_cache: core::cell::RefCell::new(QueryCache::new_in(alloc)),
+            poly_cache: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
+            poly_stats: PolyCanonStats::default(),
         };
         let core = MakerCore {
             asked: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
@@ -831,6 +866,11 @@ impl MakerState {
     pub fn take_last_make(&mut self) -> Option<MakeSizes> {
         self.core.work.last_make_reportable = false;
         self.core.work.last_make.take()
+    }
+
+    /// Polymorphization canonicalization counters recorded by this worker state.
+    pub fn poly_stats(&self) -> PolyCanonStats {
+        self.core.work.poly_stats
     }
 
     #[cfg(test)]
@@ -1377,6 +1417,7 @@ fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocato
     // `blaze_build::build`, and using `program.head_row` (not `core.ensure`) for untabled callees.
     let mut ref_asked = AskProgress::new_in(fn_alloc);
     let mut tried_table: blaze_hash::HashSet<ItemKey, Alloc<'_>> = blaze_hash::HashSet::new_in(fn_alloc);
+    let mut tried_poly: blaze_hash::HashSet<ItemKey, Alloc<'_>> = blaze_hash::HashSet::new_in(fn_alloc);
     let mut built_phase = Some(built_phase);
     loop {
         let MakerCore { checked, tables, work, .. } = &mut *core;
@@ -1429,6 +1470,14 @@ fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocato
                             return Err(refusal);
                         } else {
                             core.ensure(program, typing, key, checks, fn_alloc)?;
+                            made_any = true;
+                        }
+                    }
+                }
+                if !gaps.need_poly.is_empty() {
+                    for key in gaps.need_poly {
+                        if tried_poly.insert(key) {
+                            compute_poly_summary(program, typing, core, checks, key, fn_alloc)?;
                             made_any = true;
                         }
                     }
@@ -2014,6 +2063,18 @@ impl<P: FrontEnd> reads::Beyond for Today<'_, P> {
             .map(|&(_, digest)| digest)
             .ok_or(ReadsError::Unanswered { kind: ReadKind::Laid })
     }
+
+    fn poly_body_text(&mut self, item: ItemKey, scratch: Alloc<'_>) -> Result<Option<ContentId>, ReadsError> {
+        let Some(c) = self.program.fn_index(item) else {
+            return Err(ReadsError::Unanswered { kind: ReadKind::PolyBodyText });
+        };
+        let f = self.program.function(c);
+        if f.text.is_empty() {
+            return Ok(None);
+        }
+        let sig = self.program.sig(c);
+        Ok(Some(crate::front2::poly_canon::poly_body_text_digest(f.text, &sig, f.abi, scratch)))
+    }
 }
 
 /// Whether code `entry`, found under an instance key of fn `tabled`, holds today: every row of
@@ -2065,6 +2126,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
             | ReadKind::CVariadic
             | ReadKind::LegacyConstGenerics
             | ReadKind::ForeignFn
+            | ReadKind::PolyBodyText
             | ReadKind::ObjectTrait
             | ReadKind::OpaqueHidden
             | ReadKind::Static
@@ -2089,7 +2151,13 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
             }
             // Each answered from the fn's row (lazy front_end.rs: tabled rows only): its row
             // made from its head; the row's answer decides whether it holds.
-            ReadKind::Abi | ReadKind::Nounwind | ReadKind::TrackCaller | ReadKind::CVariadic | ReadKind::LegacyConstGenerics | ReadKind::ForeignFn => {
+            ReadKind::Abi
+            | ReadKind::Nounwind
+            | ReadKind::TrackCaller
+            | ReadKind::CVariadic
+            | ReadKind::LegacyConstGenerics
+            | ReadKind::ForeignFn
+            | ReadKind::PolyBodyText => {
                 if program.head_row(item).is_err() {
                     return Ok(stale);
                 }
@@ -2558,13 +2626,32 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
     let mut reach = Reach::new_in(fn_alloc);
     let mut funcs: AVec<'f, Callee<'_>> = blaze_own::Vec::with_capacity_in(built.refs.len(), fn_alloc);
     let mut gaps = RefGaps::new_in(fn_alloc);
+    let mut layouts: Layouts<Alloc<'f>> = Layouts::new_in(fn_alloc);
+    let mut round_poly_stats = PolyCanonStats::default();
     for &called in built.refs.iter() {
-        match name_ref(program, &asking, &mut work.ground, fn_alloc, &mut reach, i, instance.args, called) {
+        match name_ref(
+            program,
+            &asking,
+            &mut work.ground,
+            &mut layouts,
+            &work.poly_cache,
+            &mut round_poly_stats,
+            fn_alloc,
+            &mut reach,
+            i,
+            instance.args,
+            called,
+        ) {
             Ok(Named1::Instance(symbol)) => funcs.push(Callee::Symbol(symbol)),
             Ok(Named1::C(c_name)) => funcs.push(Callee::C(c_name)),
             Ok(Named1::Untabled(key, refusal)) => {
                 if !gaps.untabled.iter().any(|(k, _)| *k == key) {
                     gaps.untabled.push((key, refusal));
+                }
+            }
+            Ok(Named1::NeedPoly(key)) => {
+                if gaps.need_poly.scan_for(&key).is_none() {
+                    gaps.need_poly.push(key);
                 }
             }
             Err(e) if asks_again(&e) => {
@@ -2579,7 +2666,6 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
         }
     }
     let mut vtable_data: AVec<'f, (blaze_code::record::Symbol, AVec<'f, u8>)> = blaze_own::Vec::new_in(fn_alloc);
-    let mut layouts: Layouts<Alloc<'f>> = Layouts::new_in(fn_alloc);
     for &want in built.vtables.iter() {
         match vtable_rows(
             program,
@@ -2612,6 +2698,16 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
     }
     if !gaps.is_empty() {
         return Ok(Phase2::Needs(gaps));
+    }
+    work.poly_stats.generic_calls += round_poly_stats.generic_calls;
+    work.poly_stats.canonicalized_calls += round_poly_stats.canonicalized_calls;
+    if let Some(shared) = program.shared_front() {
+        for _ in 0..round_poly_stats.canonicalized_calls {
+            shared.record_poly_call(true);
+        }
+        for _ in 0..round_poly_stats.generic_calls.saturating_sub(round_poly_stats.canonicalized_calls) {
+            shared.record_poly_call(false);
+        }
     }
     let sym = |e| RunError::CodeRecord { function: name(), error: CodeRecordError::Symbol(e) };
     let mut vtables: AVec<'f, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(built.vtables.len(), fn_alloc);
@@ -2815,17 +2911,23 @@ enum Named1<'p> {
     /// reaches only at ground arguments (`Future::poll` of an `.await`ed future) is named by
     /// no body. [`Step::Table`] has it checked; `.1` is the refusal if that tables no row.
     Untabled(ItemKey, RunError),
+    /// A generic callee needs its polymorphization usage summary computed before deciding whether
+    /// to canonicalize this call site.
+    NeedPoly(ItemKey),
 }
 
 /// build_from's reference loop for one reference, by name: a closure's, a coroutine's or a
 /// shim's instance tabled as its owner; a trait's fn as the selected impl's; an outside fn by
 /// its C name. A reference with no instance is this instance's refusal (no stub on this path).
 #[allow(clippy::too_many_arguments)]
-fn name_ref<'p, P: FrontEnd>(
+fn name_ref<'p, 'f, P: FrontEnd>(
     program: &'p P,
     asking: &Asking<'_, P>,
     ground: &mut PortableTys<'static>,
-    alloc: Alloc<'_>,
+    layouts: &mut Layouts<Alloc<'f>>,
+    poly_cache: &blaze_hash::Map<ItemKey, PolyCached, blaze_hash::FixedState, Alloc<'static>>,
+    poly_stats: &mut PolyCanonStats,
+    alloc: Alloc<'f>,
     reach: &mut Reach<'_>,
     i: usize,
     at: List,
@@ -2927,9 +3029,613 @@ fn name_ref<'p, P: FrontEnd>(
         return Ok(Named1::C(target.symbol));
     }
     if bodied(program, asking.checked(), c) {
+        let callee = match canonicalize_callee(
+            program,
+            asking,
+            &world,
+            ground,
+            layouts,
+            poly_cache,
+            poly_stats,
+            alloc,
+            &name,
+            at,
+            callee,
+            target.kind,
+            is_ctor,
+        )? {
+            PolyCalleeStep::Use(inst) => inst,
+            PolyCalleeStep::NeedPoly(key) => return Ok(Named1::NeedPoly(key)),
+            PolyCalleeStep::Untabled(key) => {
+                let refusal = callee_refusal(program, name(), at, Instance { item: key, args: List::EMPTY }, crate::callee_shown::CalleeGap::NotTabled, ground.view());
+                return Ok(Named1::Untabled(key, refusal));
+            }
+        };
         return reach.declare(target.key, callee, ground, alloc).map(Named1::Instance).map_err(|e| named(e, callee, &*ground));
     }
     Err(callee_refusal(program, name(), at, callee, crate::callee_shown::CalleeGap::NoBody, ground.view()))
+}
+
+// ---------------------------------------------------------------------------
+// Polymorphization Layout-Canonicalization Pipeline Wiring
+// ---------------------------------------------------------------------------
+
+/// Maximum distinct generic callees analyzed in one bounded interprocedural BFS closure (Rule 18).
+const MAX_POLY_CALLEES: usize = 16;
+/// Maximum call-graph depth explored for one generic callee's polymorphization closure (Rule 18).
+const MAX_POLY_DEPTH: u8 = 4;
+/// Maximum distinct ADTs gathered for one polymorphization closure's [`AdtGraphSummary`] (Rule 18).
+const MAX_POLY_ADTS: usize = 64;
+
+enum PolyCalleeStep {
+    Use(Instance),
+    NeedPoly(ItemKey),
+    Untabled(ItemKey),
+}
+
+struct FrontPolyFacts<'p, 'a, P> {
+    program: &'p P,
+    phantom_data: Option<ItemKey>,
+    manually_drop: Option<ItemKey>,
+    own_box: Option<ItemKey>,
+    adt_graph: &'a crate::front2::poly_canon::AdtGraphSummary<'a>,
+}
+
+impl<P: FrontEnd> crate::front2::poly_canon::AnalysisFacts for FrontPolyFacts<'_, '_, P> {
+    fn phantom_data(&self) -> Option<ItemKey> {
+        self.phantom_data
+    }
+
+    fn manually_drop(&self) -> Option<ItemKey> {
+        self.manually_drop
+    }
+
+    fn own_box(&self) -> Option<ItemKey> {
+        self.own_box
+    }
+
+    fn adt_summary(&self, adt: ItemKey) -> Option<(&[crate::front2::poly_canon::AdtParamUse], bool)> {
+        self.adt_graph.get(adt)
+    }
+
+    fn intrinsic_which(&self, item: ItemKey) -> Option<blaze_build::intrinsics::Which> {
+        self.program.intrinsic(item).and_then(|intr| match intr {
+            blaze_build::Intrinsic::Table(w) => Some(w),
+            _ => None,
+        })
+    }
+
+    fn is_trait_method(&self, item: ItemKey) -> bool {
+        self.program.fn_index(item).is_some_and(|c| matches!(self.program.function(c).kind, FnKind::Trait(_)))
+    }
+}
+
+/// Computes and caches the propagated polymorphization parameter-usage summary for `root_key`
+/// over a bounded interprocedural BFS closure, sharing converged summaries across workers via
+/// [`FrontEnd::shared_front`] when available.
+fn compute_poly_summary<P: FrontEnd, T: Typing<P>>(
+    program: &mut P,
+    typing: &mut T,
+    core: &mut MakerCore,
+    checks: &mut CheckCount,
+    root_key: ItemKey,
+    fn_alloc: Alloc<'_>,
+) -> Result<(), RunError> {
+    use crate::front2::poly_canon::{
+        AdtDefInput, CanonLevel, FnAnalysis, NoFacts, ParamUse, analyze_adt_graph, analyze_checked_body,
+        propagate_call_graph,
+    };
+
+    if core.work.poly_cache.contains_key(&root_key) {
+        return Ok(());
+    }
+    let alloc = core.work.alloc;
+    if let Some(shared) = program.shared_front()
+        && let Some(entry) = shared.get_poly_usage(root_key)
+    {
+        let mut usage = AVec::with_capacity_in(entry.usage.len(), alloc);
+        usage.extend_from_slice(&entry.usage);
+        let mut deps = AVec::with_capacity_in(entry.deps.len(), alloc);
+        deps.extend_from_slice(&entry.deps);
+        let mut adt_deps = AVec::with_capacity_in(entry.adt_deps.len(), alloc);
+        adt_deps.extend_from_slice(&entry.adt_deps);
+        core.work.poly_cache.insert(root_key, PolyCached { usage, deps, adt_deps, can_canon: entry.can_canon });
+        return Ok(());
+    }
+
+    let store_concrete = |core: &mut MakerCore, publish: bool, program: &P| {
+        core.work.poly_cache.insert(
+            root_key,
+            PolyCached {
+                usage: AVec::new_in(alloc),
+                deps: AVec::new_in(alloc),
+                adt_deps: AVec::new_in(alloc),
+                can_canon: false,
+            },
+        );
+        if publish && let Some(shared) = program.shared_front() {
+            shared.put_poly_usage(root_key, &[], &[], &[], false);
+        }
+    };
+
+    let drop_in_place = program.fn_lang(FnLang::DropInPlace);
+    if Some(root_key) == drop_in_place || program.ctor_of(root_key).is_some() || program.intrinsic(root_key).is_some() {
+        store_concrete(core, true, &*program);
+        return Ok(());
+    }
+
+    // 1. Bounded BFS over direct generic callees starting at `root_key`.
+    let mut queue: AVec<'_, (ItemKey, u8)> = AVec::new_in(fn_alloc);
+    let mut visited: AVec<'_, ItemKey> = AVec::new_in(fn_alloc);
+    let mut analyzed_rows: AVec<'_, (ItemKey, usize)> = AVec::new_in(fn_alloc);
+    let mut had_ensure_err = false;
+    queue.push((root_key, 0));
+    let mut qhead = 0usize;
+    while qhead < queue.len() && analyzed_rows.len() < MAX_POLY_CALLEES {
+        let (key, depth) = queue[qhead];
+        qhead += 1;
+        if visited.scan_for(&key).is_some() {
+            continue;
+        }
+        visited.push(key);
+        if Some(key) == drop_in_place || program.ctor_of(key).is_some() || program.intrinsic(key).is_some() {
+            continue;
+        }
+        let row = match core.ensure(program, typing, key, checks, fn_alloc) {
+            Ok(Some(c)) => c,
+            Ok(None) => continue,
+            Err(_) => {
+                // Uncheckable callee (e.g. cold lib error or workspace check error): keep concrete
+                // here so the root caller still compiles and `Walk` handles the callee's own error.
+                had_ensure_err = true;
+                continue;
+            }
+        };
+        let f = program.function(row);
+        if f.body.is_none() || f.text.is_empty() || !matches!(f.kind, FnKind::Free | FnKind::Impl(_)) {
+            continue;
+        }
+        let sig = program.sig(row);
+        if sig.parent_count.saturating_add(sig.own_count) == 0 {
+            continue;
+        }
+        let Some(done) = core.checked.get(row).and_then(Option::as_ref) else {
+            continue;
+        };
+        analyzed_rows.push((key, row));
+
+        if depth < MAX_POLY_DEPTH {
+            let next_depth = depth + 1;
+            let view = done.types.view();
+            for node in view.nodes() {
+                if let PNode::FnDef(callee_key, arg_list) = *node
+                    && arg_list != List::EMPTY
+                    && visited.scan_for(&callee_key).is_none()
+                {
+                    let is_trait = program.fn_index(callee_key).is_some_and(|c| matches!(program.function(c).kind, FnKind::Trait(_)));
+                    if !is_trait && program.intrinsic(callee_key).is_none() && program.ctor_of(callee_key).is_none() {
+                        queue.push((callee_key, next_depth));
+                    }
+                }
+            }
+            let callee_items = done.callees.column::<1>();
+            let callee_args = done.callees.column::<2>();
+            for idx in 0..done.callees.len() {
+                let callee_key = callee_items[idx];
+                if callee_args[idx] != List::EMPTY && visited.scan_for(&callee_key).is_none() {
+                    let is_trait = program.fn_index(callee_key).is_some_and(|c| matches!(program.function(c).kind, FnKind::Trait(_)));
+                    if !is_trait && program.intrinsic(callee_key).is_none() && program.ctor_of(callee_key).is_none() {
+                        queue.push((callee_key, next_depth));
+                    }
+                }
+            }
+        }
+    }
+
+    let Some(&(_, root_row)) = analyzed_rows.first().filter(|&&(k, _)| k == root_key) else {
+        store_concrete(core, !had_ensure_err, &*program);
+        return Ok(());
+    };
+
+    // 2. Collect ADTs referenced in all analyzed functions (and transitively their fields),
+    //    materializing lazy ADT heads and Drop impls deterministically up to `MAX_POLY_ADTS`.
+    let mut adt_keys: AVec<'_, ItemKey> = AVec::new_in(fn_alloc);
+    for &(_, row) in analyzed_rows.iter() {
+        let sig = program.sig(row);
+        for node in sig.types.nodes() {
+            if let PNode::Adt(k, _) = *node
+                && adt_keys.len() < MAX_POLY_ADTS
+                && adt_keys.scan_for(&k).is_none()
+            {
+                adt_keys.push(k);
+            }
+        }
+        if let Some(done) = core.checked.get(row).and_then(Option::as_ref) {
+            for node in done.types.view().nodes() {
+                if let PNode::Adt(k, _) = *node
+                    && adt_keys.len() < MAX_POLY_ADTS
+                    && adt_keys.scan_for(&k).is_none()
+                {
+                    adt_keys.push(k);
+                }
+            }
+        }
+    }
+
+    let drop_trait = program.drop_trait().map(|(t, _)| t);
+    let mut adt_drop_flags: AVec<'_, (ItemKey, bool)> = AVec::new_in(fn_alloc);
+    for _round in 0..8u32 {
+        let mut need_ask = false;
+        let mut cursor = 0usize;
+        while cursor < adt_keys.len() {
+            let k = adt_keys[cursor];
+            cursor += 1;
+            match program.adt(k) {
+                Some(adt) => {
+                    for node in adt.types.nodes() {
+                        if let PNode::Adt(inner, _) = *node
+                            && adt_keys.len() < MAX_POLY_ADTS
+                            && adt_keys.scan_for(&inner).is_none()
+                        {
+                            adt_keys.push(inner);
+                        }
+                    }
+                }
+                None => {
+                    need_ask = true;
+                }
+            }
+        }
+        adt_drop_flags.clear();
+        for &k in adt_keys.iter() {
+            if program.adt(k).is_none() {
+                need_ask = true;
+                continue;
+            }
+            let has_drop = match drop_trait {
+                None => false,
+                Some(tr) => match program.adt_drop_impl(root_row, tr, k, fn_alloc) {
+                    Ok(opt) => opt.is_some(),
+                    Err(blaze_typeck::ResolveError::Missing(_)) => {
+                        need_ask = true;
+                        true
+                    }
+                    Err(_) => true,
+                },
+            };
+            adt_drop_flags.push((k, has_drop));
+        }
+        if !need_ask {
+            break;
+        }
+        match program.make_asked(root_row) {
+            Ok(true) => {}
+            _ => break,
+        }
+    }
+
+    // 3. Build AdtGraphSummary over loaded ADTs.
+    let mut adt_field_bufs: AVec<'_, AVec<'_, PTy>> = AVec::with_capacity_in(adt_drop_flags.len(), fn_alloc);
+    for &(k, _) in adt_drop_flags.iter() {
+        let mut fields = AVec::new_in(fn_alloc);
+        if let Some(adt) = program.adt(k) {
+            fields.reserve(adt.fields.len());
+            for f in adt.fields {
+                fields.push(f.ty);
+            }
+        }
+        adt_field_bufs.push(fields);
+    }
+    let mut adt_inputs: AVec<'_, AdtDefInput<'_>> = AVec::with_capacity_in(adt_drop_flags.len(), fn_alloc);
+    for (idx, &(k, has_drop_impl)) in adt_drop_flags.iter().enumerate() {
+        if let Some(adt) = program.adt(k) {
+            adt_inputs.push(AdtDefInput {
+                key: k,
+                param_count: adt.generics,
+                field_tys: adt_field_bufs[idx].as_slice(),
+                has_drop_impl,
+                tys: adt.types,
+            });
+        }
+    }
+    let phantom_data = program.lang_item(LangItem::PhantomData).ok().flatten();
+    let manually_drop = program.lang_item(LangItem::ManuallyDrop).ok().flatten();
+    let own_box = program.lang_item(LangItem::OwnedBox).ok().flatten();
+    struct LangOnlyFacts {
+        phantom_data: Option<ItemKey>,
+        manually_drop: Option<ItemKey>,
+        own_box: Option<ItemKey>,
+    }
+    impl crate::front2::poly_canon::AnalysisFacts for LangOnlyFacts {
+        fn phantom_data(&self) -> Option<ItemKey> { self.phantom_data }
+        fn manually_drop(&self) -> Option<ItemKey> { self.manually_drop }
+        fn own_box(&self) -> Option<ItemKey> { self.own_box }
+    }
+    let lang_facts = LangOnlyFacts { phantom_data, manually_drop, own_box };
+    let adt_graph = match analyze_adt_graph(adt_inputs.as_slice(), &lang_facts, fn_alloc) {
+        Ok(g) => g,
+        Err(_) => match analyze_adt_graph(&[], &NoFacts, fn_alloc) {
+            Ok(empty) => empty,
+            Err(_) => {
+                store_concrete(core, false, &*program);
+                return Ok(());
+            }
+        },
+    };
+
+    let facts = FrontPolyFacts { program: &*program, phantom_data, manually_drop, own_box, adt_graph: &adt_graph };
+
+    // 4. Analyze each checked body in the BFS closure and run fixed-point propagation.
+    let mut analyses: AVec<'_, FnAnalysis<'_>> = AVec::with_capacity_in(analyzed_rows.len(), fn_alloc);
+    let mut kept_rows: AVec<'_, usize> = AVec::with_capacity_in(analyzed_rows.len(), fn_alloc);
+    for &(key, row) in analyzed_rows.iter() {
+        let f = program.function(row);
+        let Some((body, _)) = f.body else { continue };
+        let Some(done) = core.checked.get(row).and_then(Option::as_ref) else { continue };
+        let sig = program.sig(row);
+        let view = body.view(program.body_types(row));
+        let has_inline_for = program.has_inline_for(row);
+        if let Ok(a) = analyze_checked_body(key, &sig, f.abi, &view, done, has_inline_for, &facts, fn_alloc) {
+            analyses.push(a);
+            kept_rows.push(row);
+        }
+    }
+    let checked_slice = &core.checked[..];
+    let propagated = match propagate_call_graph(
+        analyses.as_slice(),
+        &|idx| {
+            let row = kept_rows[idx];
+            checked_slice[row].as_ref().expect("kept_rows checked entry exists").types.view()
+        },
+        &facts,
+        fn_alloc,
+    ) {
+        Ok(p) => p,
+        Err(_) => {
+            store_concrete(core, false, &*program);
+            return Ok(());
+        }
+    };
+
+    let Some(root_usage) = propagated.get(root_key) else {
+        store_concrete(core, !had_ensure_err, &*program);
+        return Ok(());
+    };
+    let can_canon = root_usage.iter().any(|u| u.level() != CanonLevel::Concrete);
+    let mut usage: AVec<'static, ParamUse> = AVec::with_capacity_in(root_usage.len(), alloc);
+    usage.extend_from_slice(root_usage);
+    let mut deps: AVec<'static, ItemKey> = AVec::new_in(alloc);
+    let mut adt_deps: AVec<'static, ItemKey> = AVec::new_in(alloc);
+    if can_canon {
+        deps.reserve(analyses.len());
+        for a in analyses.iter() {
+            deps.push(a.item);
+        }
+        deps.sort_unstable();
+        deps.dedup();
+        adt_deps.reserve(adt_inputs.len());
+        for a in adt_inputs.iter() {
+            adt_deps.push(a.key);
+        }
+        adt_deps.sort_unstable();
+        adt_deps.dedup();
+    }
+    if !had_ensure_err && let Some(shared) = program.shared_front() {
+        shared.put_poly_usage(root_key, usage.as_slice(), deps.as_slice(), adt_deps.as_slice(), can_canon);
+    }
+    core.work.poly_cache.insert(root_key, PolyCached { usage, deps, adt_deps, can_canon });
+    Ok(())
+}
+
+/// Computes concrete [`ArgInfo`] for one ground generic argument `ty` through `world` (`Recorded`),
+/// propagating lazy-load gaps (`NoAdt`, `Missing`, `ResolveError::Missing`) as `asks_again`
+/// `RunError`s so Phase 2 loads missing facts deterministically before retrying.
+#[allow(clippy::too_many_arguments)]
+fn poly_arg_info<'f, P: FrontEnd>(
+    ty: PTy,
+    need_level: crate::front2::poly_canon::CanonLevel,
+    program: &P,
+    world: &Recorded<'_>,
+    ground: &mut PortableTys<'static>,
+    layouts: &mut Layouts<Alloc<'f>>,
+    alloc: Alloc<'f>,
+    name: &dyn Fn() -> Named,
+) -> Result<crate::front2::poly_canon::ArgInfo, RunError> {
+    use blaze_build::drop_facts::NeedsDropError;
+    use blaze_build::layout::{LayoutFacts, Refusal};
+    use crate::front2::poly_canon::{ArgInfo, CanonLevel, ParamKind};
+
+    let node = match ground.view().node(ty) {
+        Ok(n) => n,
+        Err(_) => return Ok(ArgInfo { ty, kind: ParamKind::Type, thin_pointee: false, needs_drop: true, layout: None }),
+    };
+    match node {
+        PNode::ConstValue { .. } | PNode::ConstParam(_) => return Ok(ArgInfo::const_arg(ty)),
+        PNode::Foreign(_) => return Ok(ArgInfo::foreign(ty)),
+        PNode::Str => return Ok(ArgInfo::unsized_ty(ty, false)),
+        PNode::Slice(_) | PNode::Dynamic(_) => return Ok(ArgInfo::unsized_ty(ty, true)),
+        PNode::Coroutine { .. } => {
+            // Conservatively keep coroutines concrete so canonicalization never depends on ambient
+            // coroutine-lay state across build orders.
+            return Ok(ArgInfo { ty, kind: ParamKind::Type, thin_pointee: false, needs_drop: true, layout: None });
+        }
+        _ => {}
+    }
+
+    let layout_id = {
+        let mut cx = LayoutCx { ground: &mut *ground, facts: world as &dyn LayoutFacts, scratch: alloc };
+        match layouts.of(ty, &mut cx) {
+            Ok(id) => id,
+            Err(err) => match err.why {
+                Refusal::NoAdt(adt) => {
+                    return Err(RunError::NoAdt { function: name(), adt, path: program.item_named(adt) });
+                }
+                Refusal::Missing(m) => {
+                    return Err(RunError::Build { function: name(), error: BuildError::MissingRecord { item: m.item }, range: None });
+                }
+                Refusal::Ground(e) | Refusal::FieldGround { error: e, .. } if build_error_ask_key(&e).is_some() => {
+                    return Err(RunError::Build { function: name(), error: e, range: None });
+                }
+                _ => {
+                    // Non-retryable refusal (e.g. unsized extern tail, opaque, closure): keep concrete.
+                    return Ok(ArgInfo { ty, kind: ParamKind::Type, thin_pointee: false, needs_drop: true, layout: None });
+                }
+            },
+        }
+    };
+    let layout = *layouts.get(layout_id);
+    if need_level == CanonLevel::OpaquePtr {
+        // `OpaquePtr` only inspects `thin_pointee` (`layout.tail == Tail::Sized`).
+        return Ok(ArgInfo::from_layout(ty, &layout, true, ground.view()));
+    }
+    let manually_drop = program.lang_item(LangItem::ManuallyDrop).ok().flatten();
+    let needs_drop = match blaze_build::drop_facts::needs_drop(
+        ty,
+        ground,
+        world as &dyn LayoutFacts,
+        manually_drop,
+        &mut |adt_ty, g| world.drop_impl(adt_ty, g),
+        alloc,
+    ) {
+        Ok(b) => b,
+        Err(NeedsDropError::NoAdt { adt }) => {
+            return Err(RunError::NoAdt { function: name(), adt, path: program.item_named(adt) });
+        }
+        Err(NeedsDropError::Ask(e)) | Err(NeedsDropError::Ground(e)) if build_error_ask_key(&e).is_some() => {
+            return Err(RunError::Build { function: name(), error: e, range: None });
+        }
+        Err(_) => true,
+    };
+    Ok(ArgInfo::from_layout(ty, &layout, needs_drop, ground.view()))
+}
+
+/// Attempts to canonicalize a resolved direct generic call `callee` to its canonical ground
+/// representative instance before symbol encoding and `Walk` declaration.
+///
+/// Soundness & Rule 21 invariants:
+/// - Non-canonicalized callees (`!can_canon` or unchanged) emit ZERO `PolyBodyText` reads.
+/// - Canonicalized callees emit `ReadKind::PolyBodyText(dep)` for every analyzed callee in the
+///   transitive closure plus `Adt` / `DropImpl` reads for every ADT in `adt_deps` and every
+///   canonicalized ground argument via `world` (`Recorded`).
+#[allow(clippy::too_many_arguments)]
+fn canonicalize_callee<'f, P: FrontEnd>(
+    program: &P,
+    asking: &Asking<'_, P>,
+    world: &Recorded<'_>,
+    ground: &mut PortableTys<'static>,
+    layouts: &mut Layouts<Alloc<'f>>,
+    poly_cache: &blaze_hash::Map<ItemKey, PolyCached, blaze_hash::FixedState, Alloc<'static>>,
+    poly_stats: &mut PolyCanonStats,
+    alloc: Alloc<'f>,
+    name: &dyn Fn() -> Named,
+    _at: List,
+    callee: Instance,
+    target_kind: FnKind,
+    is_ctor: bool,
+) -> Result<PolyCalleeStep, RunError> {
+    use blaze_build::layout::LayoutFacts;
+    use crate::front2::poly_canon::{
+        ArgInfo, CanonLevel, ParamKind, canonicalize_instance_to_ground, poly_body_text_digest,
+    };
+
+    if callee.args == List::EMPTY || is_ctor {
+        return Ok(PolyCalleeStep::Use(callee));
+    }
+
+    // Special case: `core::ptr::drop_in_place::<T>` has no ordinary body (`build_drop_glue`).
+    // Any thin-pointer `!needs_drop` type compiles to a pure no-op `ret`, canonicalized to `()`.
+    if Some(callee.item) == program.fn_lang(FnLang::DropInPlace) {
+        let Ok(&[ty]) = ground.view().list(callee.args) else {
+            return Ok(PolyCalleeStep::Use(callee));
+        };
+        poly_stats.generic_calls += 1;
+        let arg = poly_arg_info(ty, CanonLevel::LayoutOnly, program, world, ground, layouts, alloc, name)?;
+        if arg.kind == ParamKind::Type && arg.thin_pointee && !arg.needs_drop {
+            if let Ok(unit) = ground.intern(PNode::Tuple(List::EMPTY))
+                && let Ok(rep_list) = ground.intern_list(&[unit])
+                && rep_list != callee.args
+            {
+                poly_stats.canonicalized_calls += 1;
+                return Ok(PolyCalleeStep::Use(Instance { item: callee.item, args: rep_list }));
+            }
+        }
+        return Ok(PolyCalleeStep::Use(callee));
+    }
+
+    if !matches!(target_kind, FnKind::Free | FnKind::Impl(_)) {
+        return Ok(PolyCalleeStep::Use(callee));
+    }
+
+    let Some(cached) = poly_cache.get(&callee.item) else {
+        return Ok(PolyCalleeStep::NeedPoly(callee.item));
+    };
+    poly_stats.generic_calls += 1;
+    if !cached.can_canon {
+        return Ok(PolyCalleeStep::Use(callee));
+    }
+
+    let mut raw_args: AVec<'f, PTy> = AVec::new_in(alloc);
+    match ground.view().list(callee.args) {
+        Ok(list) => raw_args.extend_from_slice(list),
+        Err(_) => return Ok(PolyCalleeStep::Use(callee)),
+    }
+    if raw_args.len() != cached.usage.len() {
+        return Ok(PolyCalleeStep::Use(callee));
+    }
+
+    let mut arg_infos: AVec<'f, ArgInfo> = AVec::with_capacity_in(raw_args.len(), alloc);
+    for (&ty, &u) in raw_args.iter().zip(cached.usage.iter()) {
+        let level = u.level();
+        if matches!(ground.view().node(ty), Ok(PNode::ConstValue { .. } | PNode::ConstParam(_))) {
+            arg_infos.push(ArgInfo::const_arg(ty));
+        } else if matches!(level, CanonLevel::Unused | CanonLevel::Concrete) {
+            arg_infos.push(ArgInfo { ty, kind: ParamKind::Type, thin_pointee: false, needs_drop: true, layout: None });
+        } else {
+            arg_infos.push(poly_arg_info(ty, level, program, world, ground, layouts, alloc, name)?);
+        }
+    }
+
+    match canonicalize_instance_to_ground(cached.usage.as_slice(), arg_infos.as_slice(), ground, alloc, alloc) {
+        Ok(Some((_canon, rep_list))) => {
+            // Ensure every transitive analyzed callee has a head row in this worker's `FrontEnd`
+            // before recording `ReadKind::PolyBodyText`.
+            for &dep in cached.deps.iter() {
+                if program.fn_index(dep).is_none() {
+                    return Ok(PolyCalleeStep::Untabled(dep));
+                }
+            }
+            for &dep in cached.deps.iter() {
+                if let Some(dep_c) = program.fn_index(dep) {
+                    let dep_f = program.function(dep_c);
+                    let digest = if dep_f.text.is_empty() {
+                        None
+                    } else {
+                        let dep_sig = program.sig(dep_c);
+                        Some(poly_body_text_digest(dep_f.text, &dep_sig, dep_f.abi, alloc))
+                    };
+                    asking.log.ask_poly_body_text(dep, digest);
+                }
+            }
+            let has_drop_trait = program.drop_trait().is_some();
+            for &adt_k in cached.adt_deps.iter() {
+                if LayoutFacts::adt(world, adt_k).is_none() {
+                    return Err(RunError::NoAdt { function: name(), adt: adt_k, path: program.item_named(adt_k) });
+                }
+                if has_drop_trait
+                    && let Ok(adt_ty) = ground.intern(PNode::Adt(adt_k, List::EMPTY))
+                {
+                    if let Err(error) = world.drop_impl(adt_ty, ground) {
+                        if build_error_ask_key(&error).is_some() {
+                            return Err(RunError::Build { function: name(), error, range: None });
+                        }
+                    }
+                }
+            }
+            poly_stats.canonicalized_calls += 1;
+            Ok(PolyCalleeStep::Use(Instance { item: callee.item, args: rep_list }))
+        }
+        Ok(None) | Err(_) => Ok(PolyCalleeStep::Use(callee)),
+    }
 }
 
 /// Whether fn row `c` is made as an instance of its own: its body is held now, or this run
@@ -3317,6 +4023,11 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// The checks the makes cost so far.
     pub fn checks(&self) -> CheckCount {
         self.checks
+    }
+
+    /// Polymorphization layout-canonicalization counters recorded during this maker session.
+    pub fn poly_stats(&self) -> PolyCanonStats {
+        self.made.as_ref().map_or_else(PolyCanonStats::default, |(_, state)| state.poly_stats())
     }
 
     /// The lazy program's lowering counts, with the typing's counts of where each body's

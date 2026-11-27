@@ -783,6 +783,31 @@ fn lint_finding<'a, 'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, f: &blaze_ty
                 }
             }
         }
+        blaze_typeck::TypedFinding::CapabilityInSansIo { adt, capability, via_adt, borrowed, .. } => {
+            let show_item = |text: &mut AString<'a>, k: blaze_typeck::ItemKey| {
+                let shown = super::item_shown::ItemShown::of(r.names, &*r.keys, k);
+                text.push_str("`");
+                match shown.path() {
+                    Some(path) => text.push_str(path),
+                    None => text.push_str(&shown.boxed()),
+                }
+                text.push_str("`");
+            };
+            show_item(&mut text, adt);
+            text.push_str(" is defined in `#![blaze::sans_io]` and ");
+            if borrowed {
+                text.push_str("borrows");
+            } else {
+                text.push_str("stores");
+            }
+            text.push_str(" `#[blaze::capability]` type ");
+            show_item(&mut text, capability);
+            if let Some(via) = via_adt {
+                text.push_str(" transitively through ");
+                show_item(&mut text, via);
+            }
+            text.push_str(": pass capabilities as method arguments instead of storing them in sans-IO data");
+        }
     }
     BodyLintFinding { lint: f.lint(), text, start: at.start, end: at.end }
 }

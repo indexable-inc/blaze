@@ -2608,6 +2608,42 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 self.work.mem.memset(p, total, byte)?;
                 Ok(Val::Zst)
             }
+            Intrinsic::CopyNonoverlapping | Intrinsic::Copy => {
+                let t = t0.ok_or(malformed("`copy` / `copy_nonoverlapping` with no type"))?;
+                let (src, _) = *vals.first().ok_or(malformed("`copy` arguments"))?;
+                let (dst, _) = *vals.get(1).ok_or(malformed("`copy` arguments"))?;
+                let count = u64::try_from(int(2)?).map_err(|_| malformed("`copy` count past 64 bits"))?;
+                let (size, align_log2) = self.size_align(t)?;
+                let total = size.checked_mul(count).ok_or(Stop::Refused(Refusal::OutOfBounds {
+                    offset: u64::MAX,
+                    size,
+                    len: 0,
+                }))?;
+                let ps_pl = self.deref(src)?;
+                let pd_pl = self.deref(dst)?;
+                if total == 0 {
+                    let align = 1u64 << align_log2;
+                    for pl in [ps_pl, pd_pl] {
+                        if pl.alloc == NO_ALLOC && (pl.offset == 0 || !pl.offset.is_multiple_of(align)) {
+                            return Err(Stop::Refused(Refusal::IntAsPointer));
+                        }
+                    }
+                    return Ok(Val::Zst);
+                }
+                let ps = ps_pl.ptr()?;
+                let pd = pd_pl.ptr()?;
+                self.ensure_loaded(ps.alloc)?;
+                self.ensure_loaded(pd.alloc)?;
+                if i == Intrinsic::CopyNonoverlapping
+                    && ps.alloc == pd.alloc
+                    && ps.offset < pd.offset.saturating_add(total)
+                    && pd.offset < ps.offset.saturating_add(total)
+                {
+                    return Err(Stop::Refused(Refusal::Unreachable));
+                }
+                self.work.mem.copy(ps, pd, total)?;
+                Ok(Val::Zst)
+            }
             // A row of the table the evaluator does not compute: refused by its name.
             other => Err(unsupported(other.entry().name)),
         }

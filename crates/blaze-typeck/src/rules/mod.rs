@@ -25,6 +25,7 @@ pub(crate) mod c_variadic;
 #[cfg(test)]
 mod c_variadic_tests;
 pub(crate) mod call;
+pub(crate) mod capability;
 pub(crate) mod cast;
 pub(crate) mod closure;
 pub(crate) mod coerce;

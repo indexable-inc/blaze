@@ -201,7 +201,10 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// the same key (rule 21).
 /// 41: ADTs carry per-field visibility bytes (`AdtRow::field_vis`) so `World::member_visible`
 /// checks struct/union field visibility during field-access autoderef.
-pub const VERSION: u32 = 42;
+/// 42: `FnHead::cost` carries opt-in `#[blaze::cost(..)]` complexity contracts.
+/// 43: `AdtRow` carries `capability` (`#[blaze::capability]`) and `sans_io` (`#![blaze::sans_io]`
+/// scope) flags after `args`.
+pub const VERSION: u32 = 43;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";
@@ -1391,6 +1394,8 @@ fn encode_into_scratch<'b>(
                 Ok(())
             })?;
             o.flag(row.args);
+            o.flag(row.capability);
+            o.flag(row.sans_io);
             o.coherence_marks(row.marks);
             o.u32(row.lifetimes);
             o.field_regions(row)?;
@@ -3574,6 +3579,8 @@ impl<'r> In<'r, '_, '_, '_> {
             end: self.opt("an ADT's valid range end", |r| r.u128("a valid range end"))?,
         };
         let args = self.flag("an ADT's `#[blaze::args]` mark")?;
+        let capability = self.flag("an ADT's `#[blaze::capability]` mark")?;
+        let sans_io = self.flag("an ADT's `#![blaze::sans_io]` scope mark")?;
         let marks = self.coherence_marks()?;
         let lifetimes = self.u32("an ADT's declared lifetime arity")?;
         let mut field_region_at = Vec::with_capacity_in(fields.len(), self.alloc);
@@ -3613,7 +3620,7 @@ impl<'r> In<'r, '_, '_, '_> {
         })?;
         let fieldless = self.opt("a fieldless enum's variant count", |r| r.u32("a fieldless enum's variant count"))?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.alloc);
-        let row = AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, marks, lifetimes, field_regions };
+        let row = AdtRow { kind, generics, variants, fields, field_vis, repr, valid, discrs, args, capability, sans_io, marks, lifetimes, field_regions };
         if row.field_vis.len() != row.fields.len() {
             return Err(E::Shape { what: "an ADT's field visibilities are not one per field" });
         }
@@ -3960,6 +3967,8 @@ pub fn same(a: HeadRef<'_, '_>, b: HeadRef<'_, '_>, tys: PTys<'_>) -> Option<&'s
             need!(r1.field_vis[..] == r2.field_vis[..], "an ADT's field visibilities");
             need!(r1.repr == r2.repr && r1.valid == r2.valid, "an ADT's repr");
             need!(r1.args == r2.args, "an ADT's `#[blaze::args]` mark");
+            need!(r1.capability == r2.capability, "an ADT's `#[blaze::capability]` mark");
+            need!(r1.sans_io == r2.sans_io, "an ADT's `#![blaze::sans_io]` scope mark");
             need!(r1.marks == r2.marks, "an ADT's coherence marks");
             need!(r1.lifetimes == r2.lifetimes, "an ADT's declared lifetime arity");
             need!(r1.field_regions.at[..] == r2.field_regions.at[..] && r1.field_regions.list[..] == r2.field_regions.list[..], "an ADT's field region positions");

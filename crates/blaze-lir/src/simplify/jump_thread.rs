@@ -5479,4 +5479,103 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn mega_function_5000_blocks_chain_and_tree_hit_bound_cleanly() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // 1. 5,000-block single-predecessor jump chain (> MAX_THREAD_BLOCKS = 4096):
+        //    hits the mega-function bound and collapses cleanly to 1 block via `coalesce_cfg`.
+        {
+            const CHAIN_BLOCKS: usize = 5000;
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+
+            let mut blks: Vec<Block, _> = Vec::with_capacity_in(CHAIN_BLOCKS, alloc);
+            for _ in 0..CHAIN_BLOCKS {
+                blks.push(b.create_block(BlockKind::Normal));
+            }
+
+            for i in 0..CHAIN_BLOCKS {
+                b.begin(blks[i]);
+                let x = b.param(Ty::I64);
+                if i + 1 < CHAIN_BLOCKS {
+                    b.jump((blks[i + 1], &[x]));
+                } else {
+                    b.ret(&[x]);
+                }
+            }
+
+            let input = b.finish_checked().expect("valid 5,000-block chain");
+            assert_eq!(input.view().blocks(), CHAIN_BLOCKS);
+
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps on 5,000-block chain");
+            verify(out.view()).expect("coalesced chain verifies");
+            assert_eq!(out.view().blocks(), 1, "5,000-block chain must coalesce to 1 block");
+
+            let args = [Val::Int(12345)];
+            let after = run_in(out.view(), &args, FUEL, alloc).expect("eval coalesced chain");
+            assert!(
+                matches!(after, Outcome::Returned(ref got) if got[..] == [Val::Int(12345)]),
+                "unexpected chain return: {after:?}"
+            );
+        }
+
+        // 2. 5,001-block balanced binary decision tree (2,500 internal `br` blocks + 2,501 leaf
+        //    `ret` blocks, > MAX_THREAD_BLOCKS = 4096): hits the mega-function bound cleanly
+        //    without hanging and preserves exact semantics.
+        {
+            const INTERNAL_NODES: usize = 2500;
+            const TOTAL_NODES: usize = INTERNAL_NODES * 2 + 1;
+            let mut b = Builder::<_, Full>::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+
+            let mut blks: Vec<Block, _> = Vec::with_capacity_in(TOTAL_NODES, alloc);
+            for _ in 0..TOTAL_NODES {
+                blks.push(b.create_block(BlockKind::Normal));
+            }
+
+            let mut x_root = None;
+            for i in 0..TOTAL_NODES {
+                b.begin(blks[i]);
+                let x = if i == 0 {
+                    let p = b.param(Ty::I64);
+                    x_root = Some(p);
+                    p
+                } else {
+                    x_root.expect("entry param created first")
+                };
+                if i < INTERNAL_NODES {
+                    let left = blks[2 * i + 1];
+                    let right = blks[2 * i + 2];
+                    let shift = u32::try_from(i % 63).expect("mod 63 fits u32");
+                    let bit = u128::from(1u64 << shift);
+                    let mask_c = b.iconst(Ty::I64, bit);
+                    let masked = b.binary(Op::And, Flags::NONE, x, mask_c);
+                    let zero = b.iconst(Ty::I64, 0);
+                    let cond = b.icmp(IntCond::Ne, masked, zero);
+                    b.br(Flags::NONE, cond, (left, &[]), (right, &[]));
+                } else {
+                    let val = b.iconst(Ty::I64, u128::try_from(i).expect("i fits u128"));
+                    b.ret(&[val]);
+                }
+            }
+
+            let input = b.finish_checked().expect("valid 5,001-block decision tree");
+            assert_eq!(input.view().blocks(), TOTAL_NODES);
+
+            let out = thread_jumps(input.view(), alloc).expect("thread_jumps on 5,001-block tree");
+            verify(out.view()).expect("mega-tree output verifies");
+            assert_eq!(out.view().blocks(), TOTAL_NODES);
+
+            for sample in [0u128, 1, 0x5555_5555, 0x1234_5678_9abc_def0] {
+                let args = [Val::Int(sample)];
+                let before = run_in(input.view(), &args, FUEL, alloc).expect("eval input tree");
+                let after = run_in(out.view(), &args, FUEL, alloc).expect("eval output tree");
+                assert_eq!(before, after, "tree semantics diverged for sample={sample:#x}");
+            }
+        }
+    }
 }

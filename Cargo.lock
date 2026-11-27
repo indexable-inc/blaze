@@ -696,6 +696,7 @@ dependencies = [
  "blaze-native",
  "blaze-own",
  "blaze-proc-macro",
+ "blaze-producers",
  "blaze-remote",
  "blaze-report",
  "blaze-run",

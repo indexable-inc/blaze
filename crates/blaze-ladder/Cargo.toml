@@ -16,6 +16,12 @@ repository.workspace = true
 [package.metadata.blaze]
 producer = ["body-checker", "code-builder"]
 
+[package.metadata.blaze.producer-exclude]
+# `blaze-ladder` depends on `blaze-export` only for `natives.rs` (`Kind::Native`, keyed by
+# `Row::Whole`) and `run/wasm64.rs` (`MacroModule`), never for `CodeRecord` emission
+# (`code_records.rs`, `run/make_one.rs`). Guarded by `code_builder_never_calls_blaze_export`.
+code-builder = ["blaze-export"]
+
 [lib]
 doctest = false
 

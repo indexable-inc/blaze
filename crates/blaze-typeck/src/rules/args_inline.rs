@@ -86,6 +86,17 @@ pub enum TypedFinding {
         callee: Option<ItemKey>,
         at: Range,
     },
+    /// `capability-in-sans-io`: a `#[blaze::capability]` type stored (directly or transitively)
+    /// as a field inside a type defined in a `#![blaze::sans_io]` crate or module
+    /// (rules/capability.rs).
+    CapabilityInSansIo {
+        adt: ItemKey,
+        capability: ItemKey,
+        field: crate::ids::Name,
+        via_adt: Option<ItemKey>,
+        borrowed: bool,
+        at: Range,
+    },
 }
 
 impl TypedFinding {
@@ -95,6 +106,7 @@ impl TypedFinding {
             TypedFinding::ArgsInline { .. } => "args-inline",
             TypedFinding::UnsafeOpInUnsafeFn { .. } => "unsafe-op-in-unsafe-fn",
             TypedFinding::Cost { .. } => "cost-contract",
+            TypedFinding::CapabilityInSansIo { .. } => "capability-in-sans-io",
         }
     }
 
@@ -103,7 +115,8 @@ impl TypedFinding {
         match *self {
             TypedFinding::ArgsInline { at, .. }
             | TypedFinding::UnsafeOpInUnsafeFn { at, .. }
-            | TypedFinding::Cost { at, .. } => at,
+            | TypedFinding::Cost { at, .. }
+            | TypedFinding::CapabilityInSansIo { at, .. } => at,
         }
     }
 
@@ -114,6 +127,7 @@ impl TypedFinding {
             TypedFinding::ArgsInline { misuse, at, .. } => (at.start, at.end, 0, misuse as u8),
             TypedFinding::UnsafeOpInUnsafeFn { at, .. } => (at.start, at.end, 1, 0),
             TypedFinding::Cost { violation, at, .. } => (at.start, at.end, 2, violation as u8),
+            TypedFinding::CapabilityInSansIo { borrowed, at, .. } => (at.start, at.end, 3, if borrowed { 1 } else { 0 }),
         }
     }
 }

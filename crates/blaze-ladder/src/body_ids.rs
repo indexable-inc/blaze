@@ -256,7 +256,11 @@ pub fn each_item(name: &[u8], mut each: impl FnMut(ItemKey)) -> Result<(), NameE
             _ => return Err(NameError::Tag { tag, at }),
         };
         if keyed {
-            each(key_at(at + 1)?);
+            let item = key_at(at + 1)?;
+            // Synthetic polymorphization opaque-thin marker (`PNode::Foreign`) has no user crate.
+            if item != crate::front2::poly_canon::OPAQUE_THIN_FOREIGN_KEY {
+                each(item);
+            }
         }
         // The tag, the payload, the child count, then each child's reference.
         let kids = u32_at(at + 1 + payload)? as usize;

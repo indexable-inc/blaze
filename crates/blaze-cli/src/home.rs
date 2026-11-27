@@ -152,24 +152,31 @@ mod tests {
     }
 
     /// Rule 21 across builds: two builds of blaze (two linker ids, one source tree) never share
-    /// a key for any kind, the old engine's tools and the new engine's alike. Before 2026-11-17
-    /// the `CrateScope` tool was the Names row, a digest of named crates' sources, which two
-    /// builds with other code elsewhere (blaze-ladder's table digest, the `sandbox` feature)
-    /// shared: this test failed there for every kind but the `Whole` ones. The control: one
-    /// build id gives one table.
+    /// a key for any kind whose producer still lives in `blaze-cli`, while `Kind::Code`
+    /// (`Row::CodeBuilder`) is decoupled from the binary's `LC_UUID` via its compile-time
+    /// compiler-crate source closure digest (`producers.rs`). The control: one build id gives one
+    /// table.
     #[test]
     fn another_build_moves_every_kinds_key() {
         let rules = crate::lints::Lints::NONE.rules;
         let one = tools(&crate::producers::table(b"one build"), rules);
         let other = tools(&crate::producers::table(b"another build"), rules);
         for kind in Kind::ALL {
-            assert_ne!(one[kind.index()], other[kind.index()], "{kind:?} keeps its tool across builds");
+            if kind == Kind::Code {
+                assert_eq!(one[kind.index()], other[kind.index()], "Kind::Code stays stable across LC_UUID-only rebuilds");
+            } else {
+                assert_ne!(one[kind.index()], other[kind.index()], "{kind:?} keeps its tool across builds");
+            }
         }
         let (new_one, new_other) = (crate::engine_store::tools(&one), crate::engine_store::tools(&other));
         for kind in Kind::ALL {
-            assert_ne!(new_one.0[kind.index()], new_other.0[kind.index()], "{kind:?} keeps its engine tool across builds");
+            if kind == Kind::Code {
+                assert_eq!(new_one.0[kind.index()], new_other.0[kind.index()], "Kind::Code engine tool stays stable across LC_UUID-only rebuilds");
+            } else {
+                assert_ne!(new_one.0[kind.index()], new_other.0[kind.index()], "{kind:?} keeps its engine tool across builds");
+            }
         }
         assert_eq!(tools(&crate::producers::table(b"one build"), rules), one, "the control: one build, one table");
-        std::println!("home: another build moves all {} kinds' tools", Kind::ALL.len());
+        std::println!("home: another build moves all non-CodeBuilder kinds' tools and keeps CodeBuilder stable");
     }
 }
