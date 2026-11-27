@@ -93,7 +93,7 @@ pub fn body_blocks<'a>(krate: blaze_id::CrateItemKey, body: ItemKey, text: &str,
     }
     let modules = blaze_scope::blocks::block_modules(krate, body, &nested, alloc);
     let head_module = (!nested.head_calls.is_empty()).then(|| blaze_scope::blocks::head_call_module(krate, body));
-    let hand = super::scope_table::OwnedHandBlocks { modules, head_module, call_keys: Vec::new_in(alloc) };
+    let hand = super::scope_table::OwnedHandBlocks { modules, head_module, call_keys: AVec::new_in(alloc) };
     Some(body_blocks_from(krate, nested, hand, alloc))
 }
 

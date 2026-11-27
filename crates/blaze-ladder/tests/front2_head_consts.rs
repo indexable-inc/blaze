@@ -549,32 +549,28 @@ fn main() {}
     expect("macro expanded head anon block", &got, &[true, false]);
 }
 
-/// Negative control: an enum declared inside a block that a body-level macro expansion wrote in an
-/// expression position (outside any filed `blaze-scope` block module, here an expression call at a
-/// `const` initializer's top level) must still be refused explicitly with `LocalKind::Enum.unplaced()`,
-/// never silently dropped or mis-keyed.
+/// A direct unbraced macro call at a `const` initializer's top level expanding to a block with a
+/// local enum (`const VAL: usize = make_expr_enum!();`) is scanned via `head_calls` into
+/// `__blaze_block_head` and resolves `MacroConstEnum` cleanly.
 #[test]
-fn an_unplaced_enum_in_an_expression_macro_expansion_stays_refused() {
+fn top_level_const_initializer_macro_call_resolves_expanded_enum() {
     const TEXT: &str = "
 macro_rules! make_expr_enum {
     () => {
         {
-            enum Unplaced { A }
-            core::mem::size_of::<Unplaced>()
+            #[repr(u16)]
+            enum MacroConstEnum { A = 0, B = 1 }
+            core::mem::size_of::<MacroConstEnum>()
         }
     };
 }
-const BAD: usize = make_expr_enum!();
-fn use_bad() -> [u8; BAD] { [0u8; BAD] }
+const VAL: usize = make_expr_enum!();
+fn ok_len() -> [u8; VAL] { [0u8; 2] }
+fn bad_len() -> [u8; VAL] { [0u8; 3] }
 fn main() {}
 ";
-    let got = check_fns(TEXT, &["use_bad"]);
-    assert_eq!(got.len(), 1);
-    let (name, outcome) = &got[0];
-    assert!(
-        outcome.contains("an enum in a block that a macro call wrote or that is in a local item's body"),
-        "`{name}` must refuse the genuinely unplaced macro enum explicitly, got: {outcome}"
-    );
+    let got = check_fns(TEXT, &["ok_len", "bad_len"]);
+    expect("top-level const macro call", &got, &[true, false]);
 }
 
 /// A multi-line head-level anonymous constant calling `line!()` on two different lines and
