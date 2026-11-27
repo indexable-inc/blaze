@@ -49,7 +49,7 @@ use blaze_scope::crate_env::{BinNames, CrateEnv, EnvFacts, SeenRoot};
 use blaze_scope::crate_scope::{Kept, Ready, Solved, resolve_kept};
 use blaze_scope::graph::{CrateId, Sysroot};
 use blaze_scope::resolve::{CrateInput, SourceTexts, aligned};
-use blaze_scope::task::{MacroBody, Par, Scratch, Serial, proc_macro_decls_key};
+use blaze_scope::task::{Par, Scratch, Serial, proc_macro_decls_key};
 use blaze_scope::{items_record, names_record};
 use blaze_surface::{Edition, ItemKind, ProcKind};
 use blaze_toolchain::{Role, ToolchainId, ToolchainView, UnitKind as TcUnitKind};
@@ -1817,37 +1817,30 @@ fn compile_unit_in<'a>(
     let (solved, _) = resolve_kept(crates.as_slice(), sysroot, sources, &par, &ready, &sysroot_kept, bump)
         .map_err(|(at, e)| std::format!("blaze-scope resolve failed on `{}`: {e:?}", crates[at].name))?;
 
-    // Extract proc-macro exports in declaration order (matching `_DECLS`) if in ProcMacro mode.
+    // Extract proc-macro exports in exact `_DECLS` order (including macro-generated
+    // `#[proc_macro*]` items such as `derive_more-impl`'s `create_derive!`) if in ProcMacro mode.
     let mut exported_macros: std::vec::Vec<Exported> = std::vec::Vec::new();
     if mode == CompileMode::ProcMacro
         && let Some(Solved::Solved(pm_scope)) = solved.first()
     {
-        let pm_crate = pm_scope.names;
-        if let Some((_, root_decls)) = pm_crate.decls.get(&pm_crate.root) {
-            let mut idx = 0u32;
-            for decl in root_decls.items.iter() {
-                if let Some(src) = pm_crate.tables.macros.get(&decl.def.key)
-                    && let MacroBody::Proc { kind, helpers } = src.body
-                {
-                    let helper_list: std::vec::Vec<std::string::String> = helpers
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_owned)
-                        .collect();
-                    exported_macros.push(Exported {
-                        index: idx,
-                        kind: match kind {
-                            blaze_surface::ProcKind::Derive => ProcKind::Derive,
-                            blaze_surface::ProcKind::Attr => ProcKind::Attr,
-                            blaze_surface::ProcKind::FnLike => ProcKind::FnLike,
-                        },
-                        name: src.name.to_owned(),
-                        helpers: helper_list,
-                    });
-                    idx += 1;
-                }
-            }
+        for (idx, entry) in pm_scope.names.proc_exports.iter().enumerate() {
+            let helper_list: std::vec::Vec<std::string::String> = entry
+                .helpers
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect();
+            exported_macros.push(Exported {
+                index: idx as u32,
+                kind: match entry.kind {
+                    blaze_surface::ProcKind::Derive => ProcKind::Derive,
+                    blaze_surface::ProcKind::Attr => ProcKind::Attr,
+                    blaze_surface::ProcKind::FnLike => ProcKind::FnLike,
+                },
+                name: entry.macro_name.to_owned(),
+                helpers: helper_list,
+            });
         }
     }
 

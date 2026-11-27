@@ -382,6 +382,9 @@ pub struct Tables<'a> {
     /// The `link_name`/`export_name` values written as macro calls, each at its item's place:
     /// expanded once the names are solved ([`crate::attr_values::value_rows`]).
     pub values: AVec<'a, crate::attr_values::ValueSite<'a>>,
+    /// Root-level `#[proc_macro*]` functions lowered directly or from root macro expansions,
+    /// tagged with their source fragment and ordinal for deterministic harness synthesis.
+    pub proc_harness: AVec<'a, (At, u32, crate::task::ProcHarnessEntry<'a>)>,
 }
 
 impl<'a> Tables<'a> {
@@ -392,6 +395,7 @@ impl<'a> Tables<'a> {
     fn with_by_place_in(alloc: Alloc<'a>, track_by_place: bool) -> Tables<'a> {
         Tables {
             values: AVec::new_in(alloc),
+            proc_harness: AVec::new_in(alloc),
             macros: HashMap::new_in(alloc),
             calls: HashMap::new_in(alloc),
             enums: HashMap::new_in(alloc),
@@ -425,11 +429,14 @@ impl<'a> Tables<'a> {
     /// A fragment's tables (not its declarations, nor the modules it made) added; `owner` is
     /// the fragment's key, `at` the text it is.
     fn add<'s>(&mut self, owner: ItemKey, at: At, part: Lowered<'a, 'a, 's>) -> AVec<'s, LowerNote<'a>> {
-        let Lowered { macros, calls, enums, impls, langs, use_locs, texts, members, ctors, notes, values, .. } = part;
+        let Lowered { macros, calls, enums, impls, langs, use_locs, texts, members, ctors, notes, values, proc_harness, .. } = part;
         for (owner, list) in members {
             self.join_members(owner, list);
         }
         self.values.extend(values);
+        for (ord, entry) in proc_harness.into_iter().enumerate() {
+            self.proc_harness.push((at, ord as u32, entry));
+        }
         self.ctors.extend(ctors.into_iter().map(|k| (k, ())));
         self.macros.extend(macros);
         // The one door a lowered call enters the tables by: its calling text is `at`
@@ -476,12 +483,14 @@ impl<'a> Tables<'a> {
                 }
             }
         }
-        let Tables { macros, calls, enums, impls, langs, use_locs, texts, by_place, track_by_place: _, members, ctors, values } = other;
+        let Tables { macros, calls, enums, impls, langs, use_locs, texts, by_place, track_by_place: _, members, ctors, values, proc_harness } = other;
         if self.track_by_place {
             merge_map(&mut self.by_place, by_place);
         }
         self.values.reserve(values.len());
         self.values.extend(values);
+        self.proc_harness.reserve(proc_harness.len());
+        self.proc_harness.extend(proc_harness);
         if members.len() > self.members.len() {
             let prev = core::mem::replace(&mut self.members, members);
             self.members.reserve(prev.len());
@@ -862,6 +871,9 @@ pub struct CrateNames<'a> {
     /// Each `link_name`/`export_name` value written as a macro call, expanded at its item's
     /// place: one row per item and attribute, sorted ([`crate::attr_values::row`] reads one).
     pub values: AVec<'a, crate::attr_values::ValueRow<'a>>,
+    /// Ordered `#[proc_macro*]` exports of a proc-macro crate (direct + macro-expanded),
+    /// matching the exact entry order of the synthesized `_DECLS` static.
+    pub proc_exports: AVec<'a, crate::task::ProcHarnessEntry<'a>>,
 }
 
 /// A body whose blocks a crate solve left to the body's own solve (D189 step 4).
@@ -1704,6 +1716,7 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
             built,
             sources,
             listed: listed.is_some(),
+            proc_macro: input.implicit.proc_macro,
             kept,
             // D189's seam: under `Bodies` the crate solve holds every body's blocks for the
             // body's own solve (`crate::body_scope`); no block is a module of the crate.
@@ -1782,6 +1795,70 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
         crate_root_record.extern_prelude.sort_by(|a, b| a.0.cmp(b.0));
         crate_root_record.extern_prelude.dedup_by_key(|it| it.0);
     }
+    // Synthesize the proc-macro crate's `_DECLS` harness static AFTER macro expansion completes
+    // so macro-generated `#[proc_macro*]` exports (e.g. `derive_more-impl`'s `create_derive!`)
+    // appear alongside direct root declarations in deterministic order.
+    let mut proc_exports: AVec<'a, crate::task::ProcHarnessEntry<'a>> = AVec::new_in(alloc);
+    if input.implicit.proc_macro {
+        let mut expanded: AVec<'a, (ItemKey, u32, crate::task::ProcHarnessEntry<'a>)> = AVec::new_in(alloc);
+        {
+            let tables_r = held(run.tables.read(), "tables");
+            for &(at, ord, entry) in tables_r.proc_harness.iter() {
+                match at {
+                    At::File(_) => proc_exports.push(entry),
+                    At::Expansion(call) => expanded.push((call, ord, entry)),
+                }
+            }
+        }
+        expanded.sort_unstable_by_key(|(call, ord, _)| (*call, *ord));
+        proc_exports.extend(expanded.into_iter().map(|(_, _, entry)| entry));
+        let call = crate::task::proc_macro_harness_call(input.key);
+        let root = tree.modules[0].key;
+        let text = crate::task::proc_macro_harness_text(&proc_exports, bump);
+        let origins = Err(crate::expansion_origins::OriginsError::Rewritten { what: "a proc-macro crate's harness (`_DECLS`)" });
+        let made: &'a ExpansionText<'a> = bump.alloc_val(ExpansionText::new(text, outline(text, edition, alloc), origins));
+        if let Some(error) = made.outline.errors().first() {
+            notes.push(NamesNote::Expand {
+                call,
+                at: Some(Loc { file: 0, offset: 0 }),
+                note: ExpandNote::NotItems { macro_name: HARNESS_NAME, message: made.outline.message(error) },
+            });
+        } else {
+            let fragment = Fragment {
+                module: root,
+                owner: call,
+                text,
+                outline: &made.outline,
+                items: None,
+                at: Where::Expansion(Loc { file: 0, offset: 0 }),
+                depth: 1,
+                made: false,
+                members_of: None,
+                written: input.root,
+                kept: None,
+                marks: None,
+                tokens: FragmentTokens::from_option(None),
+            };
+            let out = lower_in(
+                LowerCx {
+                    krate: input.key,
+                    tools: &crate_root_record.tools,
+                    edition,
+                    cfg: &cfg,
+                    walked: &tree,
+                    procs: ProcDecls::Module { here: &[] },
+                    entry: false,
+                    harness: false,
+                    order: sources.attr_order(),
+                },
+                fragment,
+                alloc,
+                bump,
+            );
+            add_lowered(&run, call, At::Expansion(call), out);
+            held(run.expansions.lock(), "expansions").insert(call, Expansion::empty_with(Some(made)));
+        }
+    }
     par.stage(crate::task::Stage::Publish);
     let mut done = core::mem::replace(&mut fill.done, HashMap::new_in(alloc));
     let mut in_made: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::new_in(alloc);
@@ -1845,6 +1922,7 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
         notes,
         bodies,
         values: AVec::new_in(alloc),
+        proc_exports,
     };
     // The `link_name`/`export_name` values written as macro calls, each expanded at its item's
     // place over the finished names (crate::attr_values), by the host a call there has: its
@@ -2098,6 +2176,7 @@ pub fn solve_held_body_scratch<'a, S: SourceTexts<'a>>(
         built: &built,
         sources,
         listed: input.implicit.proc_macro && sources.proc_exports(source).is_some(),
+        proc_macro: false,
         kept: &kept,
         blocks: BlocksAt::Body,
         made_before: Some(&c.made),
@@ -2843,6 +2922,9 @@ struct Base<'r, 'a, S> {
     sources: &'r S,
     /// A macro crate whose module's list declared its macros: an expansion declares none.
     listed: bool,
+    /// True when this crate is a `proc-macro = true` crate whose root-level expansions may
+    /// generate `#[proc_macro*]` functions for the `_DECLS` harness.
+    proc_macro: bool,
     /// The crate's expansions kept between solves ([`crate::expansions`]): asked and told by
     /// [`expand_decls`] alone.
     kept: &'r crate::expansions::KeptExpansions<'r, 'a>,
@@ -3992,7 +4074,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
             walked: base.tree,
             procs: base.expansion_procs(),
             entry: false,
-            harness: false,
+            harness: base.proc_macro && src.module == base.tree.modules[0].key,
             order: attr_order,
         },
         fragment,
@@ -5146,7 +5228,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     };
     // The lowering is kept (the call's declarations and modules): output in `home`, scratch in
     // resettable `call_scratch` (`alloc`).
-    let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, alloc, home_bump);
+    let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: base.proc_macro && src.module == base.tree.modules[0].key, order: base.sources.attr_order() }, fragment, alloc, home_bump);
     // Entered only by a call that makes modules: one that makes none stays in `Lower` for the
     // few moves below (what the part costs is what `make_modules` does: a module's file read,
     // outlined and lowered).
@@ -5289,7 +5371,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         tokens: FragmentTokens::from_option(kept_tokens),
     };
     let mut out = lower_in(
-        LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() },
+        LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: base.proc_macro && src.module == base.tree.modules[0].key && keep == KeepAs::Item, order: base.sources.attr_order() },
         fragment,
         alloc,
         bump,
