@@ -509,6 +509,26 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             let (_, want) = self.target_of(key)?;
             self.make_want(want, key, "row")?;
         }
+        // A trait impl's method inherits `#[track_caller]` from its trait's declaration
+        // (seam_rules.rs `track_caller`), so ensure the trait's members are filed whenever a
+        // trait-impl method is tabled (caller or callee), including on cold cached-`Typed` runs.
+        let trait_members = match self.front.keys.origin(key) {
+            Some(Origin::Member { container, kind: MemberKind::Fn, .. }) => self
+                .store
+                .impls
+                .get(container)
+                .and_then(|imp| imp.trait_)
+                .and_then(|trait_| {
+                    let lib = self.front.keys.library_in(self.front.names, trait_)?;
+                    (self.front.names.kind_of_item(lib) == Some(blaze_surface::ItemKind::Trait)).then_some((trait_, lib))
+                }),
+            _ => None,
+        };
+        if let Some((trait_, trait_lib)) = trait_members
+            && !self.store.made(Want::Members(trait_lib))
+        {
+            self.make_want(Want::Members(trait_lib), trait_, "row (trait members for impl method)")?;
+        }
         let Some(head) = self.store.fns.get(&key) else {
             return Err(refuse(Front2Refusal::NoHead { function: Box::from(path.as_str()) }));
         };
