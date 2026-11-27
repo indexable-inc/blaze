@@ -555,14 +555,31 @@ fn count_at(s: &str) -> (Option<Count<'_>>, &str) {
 /// ['0'][width]['.' precision][type]`); `None` when it is none.
 pub(crate) fn fmt_spec(spec: &str) -> Option<Spec<'_>> {
     let mut s = spec;
-    let mut chars = s.char_indices();
-    let first = chars.next();
-    let second = chars.next();
     let align = |c: char| matches!(c, '<' | '^' | '>');
-    match (first, second) {
-        (Some(_), Some((at, a))) if align(a) => s = &s[at + a.len_utf8()..],
-        (Some((_, a)), _) if align(a) => s = &s[1..],
-        _ => {}
+    // `spec` is a raw source slice of the format string literal, so an escaped fill character
+    // (`\0<pad$`, `\t>8`, `\x20^4`, `\u{0020}<10`, `\\<4`) occupies multiple source bytes
+    // before the alignment character.
+    let after_fill = if let Some(rest) = s.strip_prefix('\\') {
+        let b = rest.as_bytes();
+        let skip = match b.first().copied() {
+            Some(b'n' | b'r' | b't' | b'0' | b'\\' | b'\'' | b'"') => Some(1),
+            Some(b'x') if b.len() >= 3 && b[1].is_ascii_hexdigit() && b[2].is_ascii_hexdigit() => Some(3),
+            Some(b'u') if b.get(1) == Some(&b'{') => rest.find('}').map(|end| end + 1),
+            _ => None,
+        };
+        skip.and_then(|n| rest.get(n..))
+    } else {
+        s.chars().next().map(|c| &s[c.len_utf8()..])
+    };
+    if let Some(after) = after_fill
+        && let Some(a) = after.chars().next()
+        && align(a)
+    {
+        s = &after[a.len_utf8()..];
+    } else if let Some(a) = s.chars().next()
+        && align(a)
+    {
+        s = &s[a.len_utf8()..];
     }
     s = s.strip_prefix(['+', '-']).unwrap_or(s);
     s = s.strip_prefix('#').unwrap_or(s);

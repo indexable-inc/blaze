@@ -665,6 +665,24 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
+    /// Whether `e` names an owned by-value projected capture (`EnvPlaces::owned`) in this
+    /// closure/async body: such a place CAN be moved out of (evaluated as a temporary via
+    /// `env_moved`), so `scrutinee_in_place` must not treat it as an unowned place.
+    pub(super) fn is_owned_env_place(&self, e: ExprId) -> Result<bool, BuildError> {
+        if self.env_places.env.is_empty() {
+            return Ok(false);
+        }
+        let Some(path) = use_path(self.body, self.checked, e, 0).map_err(|error| path_error(e, error))? else {
+            return Ok(false);
+        };
+        match cover(self.checked, &self.env_places.env, &path) {
+            Cover::Exact(j) | Cover::Under { j, .. } => {
+                Ok(self.env_places.owned.get(j).and_then(|o| *o).is_some())
+            }
+            _ => Ok(false),
+        }
+    }
+
     pub(in crate::walk) fn env_use(&mut self, e: ExprId, adjusted: u32, value: bool) -> Result<bool, BuildError> {
         if self.env_places.env.is_empty() {
             return Ok(false);

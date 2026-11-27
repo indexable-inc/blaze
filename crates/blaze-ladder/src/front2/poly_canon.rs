@@ -1271,6 +1271,7 @@ impl IntrinsicClass {
             | Which::TypeIdSizeOf
             | Which::TypeIdPointsTo
             | Which::TypeIdPointsMutably
+            | Which::TypeIdVtable
             | Which::VariantCount
             | Which::BlazeFieldCount
             | Which::BlazeIsEnum

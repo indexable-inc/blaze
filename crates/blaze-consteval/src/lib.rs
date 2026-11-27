@@ -280,6 +280,14 @@ pub trait ConstWorld: LayoutFacts {
         None
     }
 
+    /// Whether ground type `concrete` implements `trait_` at trait arguments `args` (excluding
+    /// `Self`, which is `concrete`), as `type_id_vtable` asks (blaze-typeck `select_impl`).
+    /// `None`, the default: this world does not answer (`Refusal::Missing`); never a guessed `false`.
+    fn implements_trait(&self, concrete: PTy, trait_: ItemKey, args: List, ground: &mut PortableTys<'_>) -> Option<Result<bool, blaze_build::BuildError>> {
+        let _ = (concrete, trait_, args, ground);
+        None
+    }
+
     /// core's `ManuallyDrop` ADT (`#[lang = "manually_drop"]`), whose value is never dropped:
     /// `Some(None)` when the library declares none. `None`, the default: not answered, refused
     /// as [`ConstWorld::drop_impl`]'s default is.

@@ -1238,14 +1238,21 @@ fn compile_unit_in<'a>(
         .ok_or_else(|| std::format!("toolchain {tc_id} has no units for `{WASM64_TARGET}`"))?
         .collect();
 
+    let needs_bstd = unit_order.iter().any(|&uid| {
+        let u = &graph.units[uid.index()];
+        u.edition.blaze.is_some()
+            || u.deps.iter().any(|d| d.name.as_str() == "bstd" || d.name.as_str() == "blaze_std")
+    });
     let mut keep_tc = std::vec![false; all_tc.len()];
     let mut tc_todo = std::vec![
         sys.core.0 as usize,
         sys.alloc.0 as usize,
         sys.std.0 as usize,
         sys.proc_macro.0 as usize,
-        sys.bstd.0 as usize,
     ];
+    if needs_bstd {
+        tc_todo.push(sys.bstd.0 as usize);
+    }
     while let Some(u) = tc_todo.pop() {
         if keep_tc[u] {
             continue;
@@ -1815,7 +1822,22 @@ fn compile_unit_in<'a>(
         pm_crate_key,
         alloc,
         heap.alloc(),
-    )?;
+    )
+    .map_err(|err| {
+        if let Some(Solved::Solved(scope)) = solved.first()
+            && !scope.names.notes.is_empty()
+        {
+            let mut note_str = std::string::String::new();
+            for n in scope.names.notes.iter().take(6) {
+                let _ = write!(note_str, "; scope note: {n:?}");
+            }
+            return match err {
+                SelfCompileError::Failed(msg) => SelfCompileError::Failed(std::format!("{msg}{note_str}")),
+                other => other,
+            };
+        }
+        err
+    })?;
     Ok(CompiledWasm64 { wasm, macros: exported_macros })
 }
 

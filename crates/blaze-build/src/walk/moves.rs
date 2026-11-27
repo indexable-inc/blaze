@@ -1196,7 +1196,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 // A binding this body does not currently own (a guarded match arm's binding
                 // while its guard runs, or a binding captured by a non-`FnOnce` closure):
                 // matched in place, owned by no one here (`Err(e) if matches!(e.kind, ..)`).
+                // Exclude owned by-value projected captures (`EnvPlaces::owned`), which CAN be
+                // moved out of as temporaries (`if let Some(body) = m.catch_all` in an `FnOnce`).
                 Expr::Local(x) if !self.local_is_owned(x) => {
+                    if self.is_owned_env_place(scrutinee)? {
+                        break false;
+                    }
                     let t = self.adjusted_ty(scrutinee)?;
                     let g = self.ground_ty(t).map_err(|error| Self::ty_err(scrutinee, error))?;
                     break self.needs_drop(g).map_err(|error| Self::ty_err(scrutinee, error))?;

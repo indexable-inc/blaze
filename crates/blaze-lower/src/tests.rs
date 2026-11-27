@@ -822,7 +822,7 @@ fn a_where_for_fields_predicate_lowers_with_container_subject_and_bounds() {
 fn format_specs_name_their_trait_and_counts() {
     use crate::typeck::{Count, fmt_spec};
     use blaze_typeck::FmtTrait as T;
-    let cases: [(&str, T, Option<Count<'_>>, Option<Count<'_>>); 12] = [
+    let cases: [(&str, T, Option<Count<'_>>, Option<Count<'_>>); 17] = [
         ("", T::Display, None, None),
         ("?", T::Debug, None, None),
         ("#x?", T::Debug, None, None),
@@ -835,6 +835,11 @@ fn format_specs_name_their_trait_and_counts() {
         ("0$", T::Display, Some(Count::Index(0)), None),
         (".*", T::Display, None, Some(Count::Star)),
         ("-^#010.2p", T::Pointer, None, None),
+        (r"\0<pad$", T::Display, Some(Count::Name("pad")), None),
+        (r"\t>8", T::Display, None, None),
+        (r"\x20^4", T::Display, None, None),
+        (r"\u{0020}<10", T::Display, None, None),
+        (r"\\<4", T::Display, None, None),
     ];
     for (spec, t, width, precision) in cases {
         let s = fmt_spec(spec).unwrap_or_else(|| panic!("{spec:?} is a spec"));
