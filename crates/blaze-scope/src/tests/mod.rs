@@ -40,6 +40,7 @@ mod failed_record;
 mod implicit_main;
 mod main_call;
 mod include_data;
+mod include_hygiene;
 mod include_macros;
 mod include_nested_mods;
 mod include_roots;

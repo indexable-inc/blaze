@@ -655,7 +655,7 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
             segments.push("$crate");
         }
         let abs = is_colons(stream, start);
-        let first = stream.tokens().get(start).and_then(|t| stream.hygiene(t.ctx).mark).map(TextMark::of);
+        let first = stream.tokens().get(start).and_then(|t| stream.non_transparent_mark(t.ctx)).map(TextMark::of);
         let mut i = start;
         while i < end {
             if let Some(n) = dollar_crate(stream, i) {

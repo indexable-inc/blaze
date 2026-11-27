@@ -547,7 +547,7 @@ impl<'a> ExpansionWords<'a> {
 fn first_word_mark(stream: &TokenStream<'_>, from: usize) -> Option<crate::mark_site::TextMark> {
     let tokens = stream.tokens();
     let at = (from..tokens.len()).find(|&i| matches!(tokens[i].kind, blaze_expand::TokenKind::Ident { .. }))?;
-    stream.hygiene(tokens[at].ctx).mark.map(crate::mark_site::TextMark::of)
+    tokens.get(at).and_then(|t| stream.non_transparent_mark(t.ctx)).map(crate::mark_site::TextMark::of)
 }
 
 /// The marks of the item's derive paths, in the order blaze-expand's `ItemAttrs::derives` lists

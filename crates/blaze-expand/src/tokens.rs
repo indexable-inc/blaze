@@ -497,6 +497,20 @@ impl<'a> TokenStream<'a> {
         TokenHygiene { mark: self.node(ctx).map(|node| node.mark), edition: self.edition_of(ctx) }
     }
 
+    /// The innermost mark of `ctx` that is not [`Transparency::Transparent`], walking parent
+    /// contexts until a [`Transparency::SemiOpaque`] or [`Transparency::Opaque`] mark is reached
+    /// (`None` at the root). Transparent (`Span::call_site()`) marks do not attribute `$crate` or
+    /// def-site hygiene to the macro that emitted them.
+    pub fn non_transparent_mark(&self, mut ctx: Ctx) -> Option<Mark> {
+        while let Some(node) = self.node(ctx) {
+            if node.mark.transparency != Transparency::Transparent {
+                return Some(node.mark);
+            }
+            ctx = node.parent;
+        }
+        None
+    }
+
     /// The index of the delimiter that closes the group opened at `open`.
     pub fn close_of(&self, open: usize) -> Option<usize> {
         let mut depth = 0u32;

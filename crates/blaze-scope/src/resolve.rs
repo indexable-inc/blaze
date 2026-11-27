@@ -3832,7 +3832,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
     let rendered = render_with(
         &expansion.tokens,
         Some(here),
-        |at| expansion.hygiene(at).mark.map(|mark| mark.site.krate),
+        |at| expansion.non_transparent_mark(at).map(|mark| mark.site.krate),
         def_crate,
         &mut |token, start, end, root| match (u32::try_from(token), u32::try_from(start), u32::try_from(end), u32::try_from(placed.len())) {
             (Ok(token), Ok(start), Ok(end), Ok(place)) => {
@@ -3881,7 +3881,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         CallShape::FnLike => blaze_expand::origin_column::InputShape::Inside,
         CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
     };
-    let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
+    let mark_of = |at: usize| expansion.non_transparent_mark(at).map(blaze_expand::origin_column::TextMark::of);
     let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
     let (rendered_text, text, made, column, moved_copies, synthetic_blocks): (
         &'a str,
@@ -4962,7 +4962,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     let rendered = render_with(
         &expansion.tokens,
         Some(here),
-        |at| expansion.hygiene(at).mark.map(|mark| mark.site.krate),
+        |at| expansion.non_transparent_mark(at).map(|mark| mark.site.krate),
         def_crate,
         &mut |token, start, end, root| match (u32::try_from(token), u32::try_from(start), u32::try_from(end), u32::try_from(placed.len())) {
             (Ok(token), Ok(start), Ok(end), Ok(place)) => {
@@ -5023,7 +5023,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
         CallShape::FnLike => blaze_expand::origin_column::InputShape::Inside,
         CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
     };
-    let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
+    let mark_of = |at: usize| expansion.non_transparent_mark(at).map(blaze_expand::origin_column::TextMark::of);
     let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
     let (rendered_text, text, made, column, moved_copies, synthetic_blocks): (
         &'a str,
