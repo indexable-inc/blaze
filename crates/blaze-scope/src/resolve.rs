@@ -37,7 +37,7 @@ use blaze_expand::{
     BuiltinAttr, BuiltinDerive, Call, CallSite, Ctx, DefAt, ItemAttrs, ItemAttrsError, NextAttr, DefSite, Delim, Diagnostic, ExpandCx, ExpandError, Expanded,
     Export, HostAsk, HostError, HostWhy, IncludeAs, Included, LexError, LitKind, LocalInner,
     MacroDefinition, Place as HostPlace, PlaceOf, ProcCall, Produced, Raw, Spacing, TokenKind,
-    TokenStream, expand, lex, CallKind, Inside, NestedCall, NestedKind, PathScope, call_key,
+    TokenStream, expand, lex, CallKind, Inside, NestedCall, NestedKind, call_key,
 };
 use blaze_file_items::{Outline, outline};
 use blaze_format::FormatError;
@@ -3392,7 +3392,6 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for ParHost<'_, '_, 'a, S> {
             predicate,
             None,
             |_| None,
-            |_| false,
             &mut |_, _, _, _| {},
             Option::<&mut AVec<'_, Option<u32>>>::None,
             self.alloc,
@@ -3948,10 +3947,6 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
     }
 
     let here = base.key;
-    let mut def_crate_starts: AVec<'_, u32> = AVec::new_in(alloc);
-    def_crate_starts.extend(expansion.nested.iter().filter(|c| c.scope == PathScope::DefCrate).map(|c| c.path.start));
-    def_crate_starts.sort_unstable();
-    let def_crate = |at: usize| u32::try_from(at).ok().is_some_and(|pos| def_crate_starts.binary_search(&pos).is_ok());
 
     let written_input = match (call_of.kind, src.tokens) {
         (CallKind::FnLike { .. }, crate::nested_input::CallTokens::Expansion(tokens)) => Some(tokens.written(alloc)),
@@ -3986,7 +3981,6 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         &expansion.tokens,
         Some(here),
         |at| expansion.non_transparent_mark(at).map(|mark| mark.site.krate),
-        def_crate,
         &mut |token, start, end, root| match (u32::try_from(token), u32::try_from(start), u32::try_from(end), u32::try_from(placed.len())) {
             (Ok(token), Ok(start), Ok(end), Ok(place)) => {
                 if let Some(root) = root {
@@ -4007,7 +4001,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         return fail_with(ExpandNote::NestedInput { macro_name: mac.name, error: crate::nested_input::NestedInputError::TooLarge }, &mut notes, &mut last, eager_checked_cell.into_inner());
     }
 
-    let roots_written = roots.iter().filter(|(_, k)| *k != here).count();
+    let roots_written = roots_written_for(&roots, &expansion, here);
     let mut pre_block_items: Option<(AString<'_>, AVec<'_, crate::crate_roots::Copied>, AVec<'_, u32>)> = None;
     if in_call.in_block {
         let probe = outline(rendered.as_str(), edition, alloc);
@@ -4305,7 +4299,7 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
     fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
         // No `here` and no mark: a predicate writes no definition's `$crate`; a refusal would
         // still be one, never read as false.
-        let text = render_with(predicate, None, |_| None, |_| false, &mut |_, _, _, _| {}, Option::<&mut AVec<'_, Option<u32>>>::None, self.alloc)
+        let text = render_with(predicate, None, |_| None, &mut |_, _, _, _| {}, Option::<&mut AVec<'_, Option<u32>>>::None, self.alloc)
             .map_err(|_| HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })?;
         Ok(self.cfg.eval(&text).unwrap_or(false))
     }
@@ -4426,18 +4420,16 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
 /// `MacroSrc`, while a single definition mixing `$crate` from two different crates is refused
 /// ([`crate::crate_roots::ForeignDollarCrate`]).
 ///
-/// A token `def_crate(at)` says begins a single-name call the body of a `local_inner_macros`
-/// macro wrote ([`blaze_expand::PathScope::DefCrate`]) is rendered with the defining crate's
-/// `$crate::` before it. The Reference, "Macros By Example", "Hygiene": "Additionally, the
-/// `local_inner_macros` key [of `macro_export`] can be used to automatically prefix all
-/// contained macro invocations with `$crate::`."
+/// `#[macro_export(local_inner_macros)]` is carried as token hygiene on each token's mark
+/// (`TextMark::local_inner`), never by rewriting tokens into `$crate::` here, so nested macro
+/// arguments and `stringify!` keep their exact tokens while single-segment bare function-like
+/// macro calls resolve in the defining crate.
 pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
     stream: &TokenStream<'_>,
     here: Option<CrateItemKey>,
     dollar: impl Fn(usize) -> Option<CrateItemKey>,
-    def_crate: impl Fn(usize) -> bool,
     // Told each written token's index and its bytes in the text (a `$crate` pair: the `$`'s
-    // index; a `crate::` written before a token: part of it): the origin column's places.
+    // index): the origin column's places.
     placed: &mut dyn FnMut(usize, usize, usize, Option<CrateItemKey>),
     // With `Some`, one entry pushed per stream token, in order: the index of the token's first
     // word in the text as a lexer reads it back (`None`: an invisible delimiter, which writes
@@ -4450,8 +4442,7 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
     let mut out = AString::new_in(alloc);
     let mut prev: Option<TokenKind> = None;
     let mut at = 0;
-    // The words written so far: `$crate` as `crate` is one, as `$crate` two (`$`, `crate`);
-    // a `local_inner_macros` prefix is its crate's word(s) and `::`'s two.
+    // The words written so far: `$crate` as `crate` is one, as `$crate` two (`$`, `crate`).
     let mut word = 0u32;
     fn note_word<W: core::alloc::Allocator>(words: &mut Option<&mut blaze_own::Vec<Option<u32>, W>>, at: Option<u32>) {
         if let Some(words) = words {
@@ -4516,10 +4507,8 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
             out.push(' ');
         }
         let (first, start) = (at, out.len());
-        // The written `crate`'s crate, and where the row of the token itself starts (after a
-        // `local_inner_macros` prefix, which is its own row).
+        // The written `crate`'s crate.
         let mut root: Option<CrateItemKey> = None;
-        let mut name_start = start;
         let named_def = def_head;
         def_head = match (def_head, token.kind) {
             (_, TokenKind::Ident { raw: Raw::No, .. }) if text == "macro_rules" => 1,
@@ -4558,17 +4547,6 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
         }
         // A `$crate` is one word written as `crate`, two as `$crate` (`$`, `crate`).
         let crate_words = if in_def.is_some() { 2 } else { 1 };
-        if def_crate(at) {
-            let prefix = crate_of(&mut out, dollar(at), in_def.is_some(), &mut def_crate_seen)?;
-            if prefix.is_some() {
-                placed(first, start, out.len(), prefix);
-            }
-            out.push_str("::");
-            if prefix.is_some() {
-                name_start = out.len();
-            }
-            word += crate_words + 2;
-        }
         note_word(&mut words, Some(word));
         let mut own = 1;
         match token.kind {
@@ -4612,12 +4590,24 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
             TokenKind::Close(Delim::Bracket) => out.push(']'),
             TokenKind::Open(Delim::Invisible) | TokenKind::Close(Delim::Invisible) => {}
         }
-        placed(first, name_start, out.len(), root);
+        placed(first, start, out.len(), root);
         word += own;
         prev = Some(token.kind);
         at += 1;
     }
     Ok(out)
+}
+
+/// How many foreign `$crate` roots the rendered text writes, plus 1 if the expansion carries ANY
+/// non-transparent `local_inner_macros` mark (including same-crate marks, so a bare `helper!()`
+/// inside a submodule or block cannot lose its mark and bind an invocation-site/body-local shadow
+/// instead of `$crate::helper!`). Non-zero means the origin column is indispensable: losing it
+/// must refuse the expansion with `RootsLost` instead of silently proceeding with `marks: None`.
+fn roots_written_for(roots: &[(u32, CrateItemKey)], expansion: &blaze_expand::Expansion<'_>, here: CrateItemKey) -> usize {
+    roots.iter().filter(|(_, k)| *k != here).count()
+        + usize::from(expansion.tokens.contexts().iter().any(|n| {
+            n.mark.transparency != blaze_expand::Transparency::Transparent && n.mark.local_inner
+        }))
 }
 
 /// Expands one call the fill asked for: its declarations and text, or `None` (noted) when it
@@ -5117,10 +5107,6 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
         note(ExpandNote::Diagnostic { macro_name: mac.name, diagnostic: *diagnostic });
     }
     let here = base.key;
-    let mut def_crate_starts: AVec<'_, u32> = AVec::new_in(alloc);
-    def_crate_starts.extend(expansion.nested.iter().filter(|c| c.scope == PathScope::DefCrate).map(|c| c.path.start));
-    def_crate_starts.sort_unstable();
-    let def_crate = |at: usize| def_crate_starts.binary_search(&(at as u32)).is_ok();
     // The column's input indexes are the call's text as written (drive.md): a
     // fn-like call's input is that text; an item macro's is the item its walk made, matched to
     // the written item from its end (blaze-expand `align_suffix`). Lexed as `lexed` lexed it.
@@ -5162,7 +5148,6 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
         &expansion.tokens,
         Some(here),
         |at| expansion.non_transparent_mark(at).map(|mark| mark.site.krate),
-        def_crate,
         &mut |token, start, end, root| match (u32::try_from(token), u32::try_from(start), u32::try_from(end), u32::try_from(placed.len())) {
             (Ok(token), Ok(start), Ok(end), Ok(place)) => {
                 if let Some(root) = root {
@@ -5186,9 +5171,9 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
         note(ExpandNote::NestedInput { macro_name: mac.name, error: crate::nested_input::NestedInputError::TooLarge });
         return None;
     }
-    // How many `crate`s the text writes for another crate's `$crate`: such a text is read only
-    // with its marks (crate::crate_roots).
-    let roots_written = roots.iter().filter(|(_, k)| *k != here).count();
+    // How many `crate`s the text writes for another crate's `$crate`, plus any foreign
+    // `local_inner_macros` marks: such a text is read only with its marks (crate::crate_roots).
+    let roots_written = roots_written_for(&roots, &expansion, here);
     let in_block = held(run.made.read(), "made modules")
         .get(&src.module)
         .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
@@ -6563,5 +6548,55 @@ mod parallel_determinism_tests {
             assert_eq!(p_exp.made.map(|m| m.text), s_exp.made.map(|m| m.text), "expansion text for {call:?} must match");
             assert_eq!(p_exp.made.and_then(|m| m.origins.ok()), s_exp.made.and_then(|m| m.origins.ok()), "expansion origins for {call:?} must match");
         }
+    }
+
+    #[test]
+    fn same_crate_local_inner_marks_are_counted_as_indispensable() {
+        use blaze_expand::{Call, CallSite, Ctx, DefAt, DefSite, Export, LocalInner, MacroDefinition, Transparency, expand, lex};
+        let alloc = blaze_own::testing::heap().alloc();
+        let here = CrateItemKey(ContentId::of("resolve roots_written_for test", b"here"));
+        let other = CrateItemKey(ContentId::of("resolve roots_written_for test", b"other"));
+        struct NoCx;
+        impl blaze_expand::ExpandCx for NoCx {
+            fn env(&self, _: &str) -> Result<Option<&str>, blaze_expand::HostError> { Ok(None) }
+            fn cfg(&self, _: &blaze_expand::TokenStream<'_>) -> Result<bool, blaze_expand::HostError> { Ok(false) }
+            fn include(&self, _: &str, _: blaze_expand::IncludeAs) -> Result<blaze_expand::Included<'_>, blaze_expand::HostError> { Ok(blaze_expand::Included::Missing) }
+            fn place(&self, _: blaze_expand::PlaceOf) -> Result<blaze_expand::Place<'_>, blaze_expand::HostError> { Ok(blaze_expand::Place::Number(1)) }
+            fn run_proc_macro<'a>(&self, _: &MacroDefinition<'_>, _: blaze_expand::ProcCall<'_>, _: Alloc<'a>) -> Result<blaze_expand::Produced<'a>, blaze_expand::HostError> {
+                Err(blaze_expand::HostError { ask: blaze_expand::HostAsk::ProcMacro, why: blaze_expand::HostWhy::Refused })
+            }
+        }
+        let expand_one = |krate: CrateItemKey, local_inner: LocalInner, transparency: Option<Transparency>| {
+            let body = lex("() => { helper!(); };", Edition::E2021, alloc).expect("lexes");
+            let def = MacroDefinition::rules(
+                body,
+                DefAt { site: DefSite { krate, module: None }, edition: Edition::E2021, export: Export::Exported, local_inner, transparency },
+            );
+            let input = lex("", Edition::E2021, alloc).expect("lexes");
+            let site = CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: Ctx::root(Edition::E2021) };
+            match expand(&def, &Call::fn_like(&input, site), &NoCx, alloc).expect("expands") {
+                blaze_expand::Expanded::Expansion(e) => e,
+                blaze_expand::Expanded::NeedsExpanded(_) => panic!("not eager"),
+            }
+        };
+
+        // Same-crate `local_inner_macros`: indispensable even with empty `roots` (`krate == here`)!
+        let same_local_inner = expand_one(here, LocalInner::Yes, None);
+        assert!(roots_written_for(&[], &same_local_inner, here) > 0, "same-crate local_inner mark must be counted");
+
+        // Foreign `local_inner_macros`: also indispensable.
+        let foreign_local_inner = expand_one(other, LocalInner::Yes, None);
+        assert!(roots_written_for(&[], &foreign_local_inner, here) > 0, "foreign local_inner mark must be counted");
+
+        // Control: same-crate without `local_inner_macros` and no foreign `$crate` roots -> 0.
+        let same_plain = expand_one(here, LocalInner::No, None);
+        assert_eq!(roots_written_for(&[], &same_plain, here), 0, "plain same-crate expansion needs no foreign root guard");
+
+        // Control: transparent mark with `local_inner_macros` does not count.
+        let transparent_local_inner = expand_one(here, LocalInner::Yes, Some(Transparency::Transparent));
+        assert_eq!(roots_written_for(&[], &transparent_local_inner, here), 0, "transparent mark is skipped");
+
+        // Control: foreign `$crate` root in `roots` counts even without `local_inner_macros`.
+        assert_eq!(roots_written_for(&[(0, other)], &same_plain, here), 1);
     }
 }

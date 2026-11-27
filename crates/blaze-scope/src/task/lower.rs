@@ -1356,6 +1356,29 @@ pub fn to_path_head(abs: bool, segments: &[&str], first_mark: Option<blaze_expan
     }
 }
 
+/// Like [`to_path_head`], for a function-like macro call (`name!(..)`): when the path is a single
+/// plain segment whose token carries a `#[macro_export(local_inner_macros)]` mark, resolves it in
+/// the defining crate (`PathKind::DollarCrate(m.site.krate)`), leaving non-macro paths,
+/// multi-segment paths, absolute paths, and attribute/derive paths untouched.
+pub fn to_fn_macro_path_head(
+    abs: bool,
+    segments: &[&str],
+    first_mark: Option<blaze_expand::origin_column::TextMark>,
+    krate: CrateItemKey,
+) -> (PathKind, usize) {
+    let (kind, taken) = to_path_head(abs, segments, first_mark, krate);
+    if !abs
+        && segments.len() == 1
+        && kind == PathKind::Plain
+        && let Some(m) = first_mark
+        && m.local_inner
+        && m.transparency != blaze_expand::Transparency::Transparent
+    {
+        return (PathKind::DollarCrate(m.site.krate), 0);
+    }
+    (kind, taken)
+}
+
 /// A simple path (`a::b`, `crate::a`, `$crate::a`, `::a`); `None` for anything else.
 pub fn parse_path<'t, 'a>(text: &'t str, krate: CrateItemKey, alloc: Alloc<'a>) -> Option<Path<'a, &'t str>> {
     parse_path_marked(text, krate, &|_| None, alloc)
@@ -1381,6 +1404,19 @@ fn parse_path_marked_in<'t, 'a>(
     scratch: Alloc<'_>,
     alloc: Alloc<'a>,
 ) -> Option<Path<'a, &'t str>> {
+    parse_path_marked_with(text, krate, mark_of, false, scratch, alloc)
+}
+
+/// Like [`parse_path_marked_in`], applying `#[macro_export(local_inner_macros)]` token hygiene
+/// when `fn_macro` is true (function-like macro calls only).
+fn parse_path_marked_with<'t, 'a>(
+    text: &'t str,
+    krate: CrateItemKey,
+    mark_of: &dyn Fn(&'t str) -> Option<blaze_expand::origin_column::TextMark>,
+    fn_macro: bool,
+    scratch: Alloc<'_>,
+    alloc: Alloc<'a>,
+) -> Option<Path<'a, &'t str>> {
     let mut tokens = (PLex { text, at: 0 }).peekable();
     let mut abs = false;
     let mut segments = AVec::new_in(scratch);
@@ -1398,7 +1434,11 @@ fn parse_path_marked_in<'t, 'a>(
         }
     }
     let first_mark = segments.first().copied().and_then(mark_of);
-    Some(to_path_marked(abs, &segments, first_mark, krate, alloc))
+    let (kind, taken) = match fn_macro {
+        true => to_fn_macro_path_head(abs, &segments, first_mark, krate),
+        false => to_path_head(abs, &segments, first_mark, krate),
+    };
+    segments.get(taken..).map(|rest| Path { kind, segments: AVec::from_slice_in(rest, alloc) })
 }
 
 /// One leaf of a `use` tree.
@@ -3159,7 +3199,7 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
             return;
         };
         let path_text = item.text(text, path);
-        let Some(parsed) = parse_path_marked_in(path_text, self.krate, &|s| self.mark_of(s), self.scratch, self.alloc) else {
+        let Some(parsed) = parse_path_marked_with(path_text, self.krate, &|s| self.mark_of(s), true, self.scratch, self.alloc) else {
             self.note(LowerNoteKind::MacroCallPathNotRead, at, path_text);
             return;
         };

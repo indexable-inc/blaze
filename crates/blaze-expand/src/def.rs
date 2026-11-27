@@ -386,7 +386,13 @@ impl<'a> MacroDefinition<'a> {
 
     /// The mark this definition's expansion puts on a token, at `transparency`.
     pub(crate) fn mark(&self, transparency: Transparency) -> Mark {
-        Mark { of: MarkOf::This, transparency, edition: self.at.edition, site: self.at.site }
+        Mark {
+            of: MarkOf::This,
+            transparency,
+            edition: self.at.edition,
+            site: self.at.site,
+            local_inner: self.at.local_inner == LocalInner::Yes,
+        }
     }
 
     /// The mark this definition's expansion puts on an explicit `$crate` token when
@@ -396,7 +402,7 @@ impl<'a> MacroDefinition<'a> {
             Some(krate) => DefSite { krate, module: None },
             None => self.at.site,
         };
-        Mark { of: MarkOf::This, transparency, edition: self.at.edition, site }
+        Mark { of: MarkOf::This, transparency, edition: self.at.edition, site, local_inner: false }
     }
 
     fn hash(&self) -> MacroContent {

@@ -302,6 +302,7 @@ fn record_mark(mark: Mark) -> blaze_tokens::Mark {
         transparency: mark.transparency,
         edition: mark.edition,
         site: mark.site,
+        local_inner: mark.local_inner,
     }
 }
 

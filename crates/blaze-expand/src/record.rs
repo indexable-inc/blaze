@@ -105,7 +105,8 @@ pub const EXPANSION_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     // 2: `NoRuleMatched` holds the closest rule (`closest`), 2026-11-16.
     // 3: the root's last slot is the expansion's token record (drive.md D122), 2026-11-17. A
     // record of an earlier version fails `open_as` and is made again (rule 26).
-    Part::U64(3),
+    // 4: `Mark` carries `local_inner` (bit 6 of Contexts flags) and `blaze-tokens` FORM 2, 2026-11-27.
+    Part::U64(4),
     Part::Schema(<ExpansionRoot as Record>::SCHEMA),
 ]);
 
@@ -390,7 +391,8 @@ pub fn stream_record_id(bytes: &[u8]) -> ContentId {
 /// The schema of a token stream stored alone ([`TokenStream::write_record`]).
 pub const STREAM_SCHEMA: SchemaHash = blaze_format::schema_of(&[
     Part::Str("blaze-expand TokenStream"),
-    Part::U64(1),
+    // 2: `Mark` carries `local_inner` (bit 6 of Contexts flags), 2026-11-27.
+    Part::U64(2),
     Part::Schema(<Root as Record>::SCHEMA),
 ]);
 
@@ -411,11 +413,11 @@ fn write_stream(c: &mut Columns<'_>, tokens: &TokenStream<'_>) {
         }
     }
     for node in tokens.contexts() {
-        let Mark { of, transparency, edition, site } = node.mark;
+        let Mark { of, transparency, edition, site, local_inner } = node.mark;
         c.leb(RecordColumn::Contexts, u64::from(node.parent.raw()));
         let outer = u8::from(matches!(of, MarkOf::Outer(_)));
         let module = u8::from(site.module.is_some());
-        let flags = outer | transparency.byte() << 1 | edition.byte() << 3 | module << 5;
+        let flags = outer | transparency.byte() << 1 | edition.byte() << 3 | module << 5 | u8::from(local_inner) << 6;
         c.put(RecordColumn::Contexts, &[flags]);
         if let MarkOf::Outer(key) = of {
             c.put(RecordColumn::Contexts, &key.0);
@@ -895,9 +897,10 @@ fn read_tokens<'a>(
             .ok_or_else(|| contexts.bad("a mark of no transparency"))?;
         let edition = edition_of(u64::from(flags >> 3 & 0b11))
             .ok_or_else(|| contexts.bad("a mark of no edition"))?;
-        if flags >> 6 != 0 {
+        if flags >> 7 != 0 {
             return Err(contexts.bad("a mark's flags with bits set no field uses"));
         }
+        let local_inner = (flags >> 6 & 1) != 0;
         let of = match flags & 1 {
             0 => MarkOf::This,
             _ => MarkOf::Outer(contexts.id()?),
@@ -907,7 +910,7 @@ fn read_tokens<'a>(
             0 => None,
             _ => Some(ItemKey(contexts.id()?)),
         };
-        let mark = Mark { of, transparency, edition, site: DefSite { krate, module } };
+        let mark = Mark { of, transparency, edition, site: DefSite { krate, module }, local_inner };
         let at = contexts.at;
         let ctx = stream
             .context(CtxNode { parent, mark })

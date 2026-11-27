@@ -72,12 +72,19 @@ impl<'d, 'p: 'd> MacroNames<'d> for Scoped<'d, 'p> {
             return Err(NoMacro::NotAPath);
         }
         // Where the call's name is read, by its first token's mark: the one rule
-        // (`crate::mark_site::site_of`).
+        // (`crate::mark_site::site_of`). For a single-segment bare function-like macro call
+        // emitted by a `#[macro_export(local_inner_macros)]` macro, resolve in the defining
+        // crate (`$crate::name!`).
         let site = crate::mark_site::site_of(at.mark, first, absolute, self.module).map_err(NoMacro::Site)?;
-        let (written_kind, rest) = match (first, site.dollar_crate) {
+        let local_inner_krate = match (kind, site.dollar_crate) {
+            (ProcKind::FnLike, None) => crate::mark_site::local_inner_crate(at.mark, first, segments.len(), absolute),
+            _ => None,
+        };
+        let (written_kind, rest) = match (first, site.dollar_crate, local_inner_krate) {
             _ if absolute => (PathKind::Abs, 0),
-            (_, Some(krate)) => (PathKind::DollarCrate(krate), 1),
-            (first, None) => match first {
+            (_, Some(krate), _) => (PathKind::DollarCrate(krate), 1),
+            (_, None, Some(krate)) => (PathKind::DollarCrate(krate), 0),
+            (first, None, None) => match first {
             "crate" => (PathKind::Crate, 1),
             "self" => (PathKind::SelfMod, 1),
             "super" => {

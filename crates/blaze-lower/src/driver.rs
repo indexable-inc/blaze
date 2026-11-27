@@ -515,7 +515,7 @@ impl<'a> ExpansionWords<'a> {
             let ctx = match self.mark_at(start) {
                 None => t.ctx,
                 Some(m) => {
-                    let mark = blaze_expand::Mark { of: blaze_expand::MarkOf::This, transparency: m.transparency, edition: m.edition, site: m.site };
+                    let mark = blaze_expand::Mark { of: blaze_expand::MarkOf::This, transparency: m.transparency, edition: m.edition, site: m.site, local_inner: m.local_inner };
                     probe.context(blaze_expand::CtxNode { parent: t.ctx, mark }).ok()?
                 }
             };

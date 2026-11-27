@@ -95,6 +95,7 @@ fn origins_of(call: ItemKey, bump: blaze_own::Bump<'static>) -> &'static [u8] {
             site: DefSite { krate: CrateItemKey(ContentId([7; 32])), module: Some(ItemKey(ContentId(module))) },
             transparency: Transparency::SemiOpaque,
             edition: Edition::E2021,
+            local_inner: false,
         };
         column.push(start, start + 1, TextOrigin::Def(i as u32), Some(mark)).expect("rows in order");
     }
