@@ -2592,8 +2592,8 @@ fn export_program<'f>(
         symbol_names: symbol_names.as_slice(),
     };
 
-    let mut exe_bytes: AVec<'_, u8> = Vec::new_in(alloc);
-    let exported = blaze_export::export(&program_in, platform, &mut exe_bytes, alloc).map_err(|error| box_err(ExportCliError::Export(error), heap))?;
+    let mut exe_bytes: AVec<'_, u8> = Vec::new_in(heap.alloc());
+    let exported = blaze_export::export(&program_in, platform, &mut exe_bytes, heap.alloc()).map_err(|error| box_err(ExportCliError::Export(error), heap))?;
 
     // Release immutable borrows of `codes` before restoring any concurrently swept entries and
     // persisting closing program + toolchain roots (Rule 3: refuse instead of silently dropping).
