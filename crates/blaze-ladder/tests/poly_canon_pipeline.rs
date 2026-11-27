@@ -719,3 +719,87 @@ pub extern "C-unwind" fn main() -> u64 {
     assert_eq!(post_poly_generic_instances, 11, "expected 11 canonical generic instances (4.73x reduction)");
     assert!(ratio >= 4.0, "expected >= 4.0x generic instance reduction, got {ratio:.2}x");
 }
+
+#[test]
+fn custom_drop_with_ref_param_keeps_allocator_concrete() {
+    // End-to-end regression for `alloc::rcs::arc::Arc<T, A>::drop_slow` constructing & dropping
+    // `Weak<T, &A>` where `impl<T, A: Alloc> Drop for Weak<T, A>` resolves `<&A as Alloc>::dealloc`.
+    // Previously `walk_drop_ty` dropped `PNode::Ref` even under `WalkCtx::Concrete`, canonicalizing
+    // ZST `A = GlobalA` to `()` so `drop_glue` failed resolving `<Weak<Inner, &()> as Drop>::drop`.
+    const SRC: &str = r#"
+#[lang = "sized"]
+pub trait Sized {}
+
+#[lang = "copy"]
+pub trait Copy {}
+
+#[lang = "drop"]
+pub trait Drop {
+    fn drop(&mut self);
+}
+
+#[lang = "drop_in_place"]
+unsafe fn drop_in_place<T: ?Sized>(_to_drop: *mut T) {}
+
+pub trait Alloc {
+    fn tag(&self) -> u64;
+}
+
+impl<A: Alloc> Alloc for &A {
+    fn tag(&self) -> u64 { (**self).tag() }
+}
+
+struct GlobalA;
+impl Alloc for GlobalA {
+    fn tag(&self) -> u64 { 11 }
+}
+
+struct GlobalB;
+impl Alloc for GlobalB {
+    fn tag(&self) -> u64 { 22 }
+}
+
+struct Inner(u64);
+
+struct Weak<T, A: Alloc> {
+    ptr: *const T,
+    alloc: A,
+}
+
+impl<T, A: Alloc> Drop for Weak<T, A> {
+    fn drop(&mut self) {
+        let _ = self.alloc.tag();
+    }
+}
+
+struct ArcBox<T, A: Alloc> {
+    ptr: *const T,
+    alloc: A,
+}
+
+fn drop_slow<T, A: Alloc>(arc: &mut ArcBox<T, A>) {
+    let _weak: Weak<T, &A> = Weak { ptr: arc.ptr, alloc: &arc.alloc };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> u64 {
+    let x = Inner(7);
+    let mut a = ArcBox { ptr: &x as *const Inner, alloc: GlobalA };
+    let mut b = ArcBox { ptr: &x as *const Inner, alloc: GlobalB };
+    drop_slow(&mut a);
+    drop_slow(&mut b);
+    x.0
+}
+"#;
+
+    let f = fixture(SRC);
+    let ids = ids_of(&f);
+    let mut store = MemoryStore::new_in(alloc());
+    let summary = run_walk(&f, &ids, &mut store);
+    let drop_slow = fn_named(&f, "drop_slow");
+    assert_eq!(
+        instances_of(&summary, drop_slow).len(),
+        2,
+        "ArcBox::<Inner, GlobalA>::drop_slow and GlobalB must stay distinct concrete instances"
+    );
+}

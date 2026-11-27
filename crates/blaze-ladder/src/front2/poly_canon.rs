@@ -1109,7 +1109,7 @@ fn walk_adt_field_ty(
                 let items = tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
                 let next_ctx = if ctx == WalkCtx::Phantom {
                     WalkCtx::Phantom
-                } else if header.abi != Abi::Rust || header.c_variadic {
+                } else if ctx == WalkCtx::Concrete || header.abi != Abi::Rust || header.c_variadic {
                     WalkCtx::Concrete
                 } else {
                     WalkCtx::ByValue
@@ -1120,14 +1120,21 @@ fn walk_adt_field_ty(
             }
             PNode::Adt(k, l) => {
                 let args = tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
-                if ctx == WalkCtx::Phantom || facts.phantom_data() == Some(k) {
+                if ctx == WalkCtx::Phantom {
+                    for &arg in args {
+                        stack.push((arg, WalkCtx::Phantom));
+                    }
+                } else if ctx == WalkCtx::Concrete {
+                    for &arg in args {
+                        stack.push((arg, WalkCtx::Concrete));
+                    }
+                } else if facts.phantom_data() == Some(k) {
                     for &arg in args {
                         stack.push((arg, WalkCtx::Phantom));
                     }
                 } else if facts.non_null() == Some(k) {
-                    let next_ctx = if ctx == WalkCtx::Concrete { WalkCtx::Concrete } else { WalkCtx::BehindThinPtr };
                     for &arg in args {
-                        stack.push((arg, next_ctx));
+                        stack.push((arg, WalkCtx::BehindThinPtr));
                     }
                 } else if let Some((param_uses, _)) = graph.and_then(|g| g.get(k)).or_else(|| facts.adt_summary(k)) {
                     if param_uses.len() == args.len() {
@@ -1404,8 +1411,10 @@ impl WalkCtx {
 #[inline]
 const fn combine_adt_ctx(outer: WalkCtx, adt_use: AdtParamUse) -> WalkCtx {
     match (outer, adt_use) {
-        (WalkCtx::Phantom, _) | (_, AdtParamUse::Unused) => WalkCtx::Phantom,
-        (WalkCtx::Concrete, _) | (_, AdtParamUse::Concrete) => WalkCtx::Concrete,
+        (WalkCtx::Phantom, _) => WalkCtx::Phantom,
+        (WalkCtx::Concrete, _) => WalkCtx::Concrete,
+        (_, AdtParamUse::Unused) => WalkCtx::Phantom,
+        (_, AdtParamUse::Concrete) => WalkCtx::Concrete,
         (_, AdtParamUse::OpaquePtr) => WalkCtx::BehindThinPtr,
         (WalkCtx::BehindThinPtr, AdtParamUse::ByValue) => WalkCtx::BehindThinPtr,
         (WalkCtx::ByValue, AdtParamUse::ByValue) => WalkCtx::ByValue,
@@ -1683,7 +1692,7 @@ impl<'e> BodyWalkCx<'_, '_, '_, '_, 'e> {
                     let items = self.body.ty_list(&self.tys, l)?;
                     let next_ctx = if ctx == WalkCtx::Phantom {
                         WalkCtx::Phantom
-                    } else if header.abi != Abi::Rust || header.c_variadic {
+                    } else if ctx == WalkCtx::Concrete || header.abi != Abi::Rust || header.c_variadic {
                         WalkCtx::Concrete
                     } else {
                         WalkCtx::ByValue
@@ -1694,15 +1703,21 @@ impl<'e> BodyWalkCx<'_, '_, '_, '_, 'e> {
                 }
                 PNode::Adt(k, l) => {
                     let args = self.body.ty_list(&self.tys, l)?;
-                    if ctx == WalkCtx::Phantom || self.facts.phantom_data() == Some(k) {
+                    if ctx == WalkCtx::Phantom {
+                        for arg in args.iter() {
+                            self.stack.push((arg, WalkCtx::Phantom));
+                        }
+                    } else if ctx == WalkCtx::Concrete {
+                        for arg in args.iter() {
+                            self.stack.push((arg, WalkCtx::Concrete));
+                        }
+                    } else if self.facts.phantom_data() == Some(k) {
                         for arg in args.iter() {
                             self.stack.push((arg, WalkCtx::Phantom));
                         }
                     } else if self.facts.non_null() == Some(k) {
-                        let next_ctx =
-                            if ctx == WalkCtx::Concrete { WalkCtx::Concrete } else { WalkCtx::BehindThinPtr };
                         for arg in args.iter() {
-                            self.stack.push((arg, next_ctx));
+                            self.stack.push((arg, WalkCtx::BehindThinPtr));
                         }
                     } else if let Some((param_uses, _has_drop)) = self.facts.adt_summary(k) {
                         if param_uses.len() == args.len() {
@@ -1725,6 +1740,11 @@ impl<'e> BodyWalkCx<'_, '_, '_, '_, 'e> {
                         let items = self.body.ty_list(&self.tys, l)?;
                         for child in items.iter() {
                             self.stack.push((child, WalkCtx::Phantom));
+                        }
+                    } else if ctx == WalkCtx::Concrete {
+                        let items = self.body.ty_list(&self.tys, l)?;
+                        for child in items.iter() {
+                            self.stack.push((child, WalkCtx::Concrete));
                         }
                     } else {
                         self.record_edge(k, l, false)?;
@@ -1780,8 +1800,7 @@ impl<'e> BodyWalkCx<'_, '_, '_, '_, 'e> {
             }
             let node = self.body.ty(&self.tys, ty)?;
             match node {
-                // Dropping a primitive, reference, raw pointer, fn item, fn ptr, or extern type is a
-                // no-op and never drops any pointee.
+                // Dropping a primitive or extern type is a no-op.
                 PNode::Bool
                 | PNode::Char
                 | PNode::Int(_)
@@ -1790,13 +1809,28 @@ impl<'e> BodyWalkCx<'_, '_, '_, '_, 'e> {
                 | PNode::Str
                 | PNode::Never
                 | PNode::Foreign(_)
-                | PNode::Ref(..)
-                | PNode::Ptr(..)
-                | PNode::FnDef(..)
-                | PNode::FnPtr(..)
-                | PNode::Union(_)
-                | PNode::ConstValue { .. }
                 | PNode::ExAuto(_) => {}
+                // Dropping `&T` / `*const T` by value is a no-op, but when `ctx == WalkCtx::Concrete`
+                // (e.g. a custom `Drop` impl on `Weak<T, &A>`), the pointee type is part of the
+                // `Drop` impl's trait resolution and MUST stay concrete!
+                PNode::Ref(_, inner) | PNode::Ptr(_, inner) => {
+                    if ctx == WalkCtx::Concrete {
+                        self.stack.push((inner, WalkCtx::Concrete));
+                    }
+                }
+                PNode::FnDef(_, l) | PNode::FnPtr(l, _) | PNode::Union(l) => {
+                    if ctx == WalkCtx::Concrete {
+                        let items = self.body.ty_list(&self.tys, l)?;
+                        for child in items.iter() {
+                            self.stack.push((child, WalkCtx::Concrete));
+                        }
+                    }
+                }
+                PNode::ConstValue { ty: cty, .. } => {
+                    if ctx == WalkCtx::Concrete {
+                        self.stack.push((cty, WalkCtx::Concrete));
+                    }
+                }
                 PNode::Param(i) => {
                     let flag = if ctx == WalkCtx::Concrete {
                         ParamUse::UNANALYZED_CALLEE | ParamUse::DROP_GLUE
@@ -1815,25 +1849,45 @@ impl<'e> BodyWalkCx<'_, '_, '_, '_, 'e> {
                     }
                 }
                 PNode::Array(elem, len) => {
-                    // `[T; 0]` has no drop, but if `len` is a `ConstParam` it depends on `N`.
-                    match self.body.ty(&self.tys, len)? {
-                        PNode::ConstValue { bits: 0, .. } => {}
-                        PNode::ConstParam(n) => {
-                            self.mark_param(n, ParamUse::CONST_PARAM)?;
-                            self.stack.push((elem, ctx));
+                    if ctx == WalkCtx::Concrete {
+                        self.stack.push((elem, WalkCtx::Concrete));
+                        self.stack.push((len, WalkCtx::Concrete));
+                    } else {
+                        // `[T; 0]` has no drop, but if `len` is a `ConstParam` it depends on `N`.
+                        match self.body.ty(&self.tys, len)? {
+                            PNode::ConstValue { bits: 0, .. } => {}
+                            PNode::ConstParam(n) => {
+                                self.mark_param(n, ParamUse::CONST_PARAM)?;
+                                self.stack.push((elem, ctx));
+                            }
+                            _ => self.stack.push((elem, ctx)),
                         }
-                        _ => self.stack.push((elem, ctx)),
                     }
                 }
-                PNode::Slice(elem) | PNode::Pat(elem, _) => self.stack.push((elem, ctx)),
+                PNode::Slice(elem) => self.stack.push((elem, ctx)),
+                PNode::Pat(elem, ranges) => {
+                    self.stack.push((elem, ctx));
+                    if ctx == WalkCtx::Concrete {
+                        let items = self.body.ty_list(&self.tys, ranges)?;
+                        for r in items.iter() {
+                            self.stack.push((r, WalkCtx::Concrete));
+                        }
+                    }
+                }
                 PNode::Adt(k, l) => {
+                    let args = self.body.ty_list(&self.tys, l)?;
+                    if ctx == WalkCtx::Concrete {
+                        for arg in args.iter() {
+                            self.stack.push((arg, WalkCtx::Concrete));
+                        }
+                        continue;
+                    }
                     if self.facts.phantom_data() == Some(k)
                         || self.facts.manually_drop() == Some(k)
                         || self.facts.non_null() == Some(k)
                     {
                         continue;
                     }
-                    let args = self.body.ty_list(&self.tys, l)?;
                     if let Some((param_uses, has_drop_impl)) = self.facts.adt_summary(k) {
                         if has_drop_impl {
                             if let Some(drop_fn) = self.facts.adt_drop_fn(k) {
@@ -2484,7 +2538,7 @@ fn propagate_arg_ty(
                 let items = tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
                 let next_ctx = if ctx == WalkCtx::Phantom {
                     WalkCtx::Phantom
-                } else if header.abi != Abi::Rust || header.c_variadic {
+                } else if ctx == WalkCtx::Concrete || header.abi != Abi::Rust || header.c_variadic {
                     WalkCtx::Concrete
                 } else {
                     WalkCtx::ByValue
@@ -2495,14 +2549,21 @@ fn propagate_arg_ty(
             }
             PNode::Adt(k, l) => {
                 let args = tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
-                if ctx == WalkCtx::Phantom || facts.phantom_data() == Some(k) {
+                if ctx == WalkCtx::Phantom {
+                    for &arg in args {
+                        stack.push((arg, WalkCtx::Phantom, false));
+                    }
+                } else if ctx == WalkCtx::Concrete {
+                    for &arg in args {
+                        stack.push((arg, WalkCtx::Concrete, false));
+                    }
+                } else if facts.phantom_data() == Some(k) {
                     for &arg in args {
                         stack.push((arg, WalkCtx::Phantom, false));
                     }
                 } else if facts.non_null() == Some(k) {
-                    let next_ctx = if ctx == WalkCtx::Concrete { WalkCtx::Concrete } else { WalkCtx::BehindThinPtr };
                     for &arg in args {
-                        stack.push((arg, next_ctx, false));
+                        stack.push((arg, WalkCtx::BehindThinPtr, false));
                     }
                 } else if facts.manually_drop() == Some(k) {
                     for &arg in args {
@@ -3505,7 +3566,7 @@ impl<'e> CheckedWalkCx<'_, '_, '_, 'e> {
                     let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
                     let next_ctx = if ctx == WalkCtx::Phantom {
                         WalkCtx::Phantom
-                    } else if header.abi != Abi::Rust || header.c_variadic {
+                    } else if ctx == WalkCtx::Concrete || header.abi != Abi::Rust || header.c_variadic {
                         WalkCtx::Concrete
                     } else {
                         WalkCtx::ByValue
@@ -3516,15 +3577,21 @@ impl<'e> CheckedWalkCx<'_, '_, '_, 'e> {
                 }
                 PNode::Adt(k, l) => {
                     let args = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
-                    if ctx == WalkCtx::Phantom || self.facts.phantom_data() == Some(k) {
+                    if ctx == WalkCtx::Phantom {
+                        for &arg in args {
+                            self.stack.push((arg, WalkCtx::Phantom));
+                        }
+                    } else if ctx == WalkCtx::Concrete {
+                        for &arg in args {
+                            self.stack.push((arg, WalkCtx::Concrete));
+                        }
+                    } else if self.facts.phantom_data() == Some(k) {
                         for &arg in args {
                             self.stack.push((arg, WalkCtx::Phantom));
                         }
                     } else if self.facts.non_null() == Some(k) {
-                        let next_ctx =
-                            if ctx == WalkCtx::Concrete { WalkCtx::Concrete } else { WalkCtx::BehindThinPtr };
                         for &arg in args {
-                            self.stack.push((arg, next_ctx));
+                            self.stack.push((arg, WalkCtx::BehindThinPtr));
                         }
                     } else if let Some((param_uses, _has_drop)) = self.facts.adt_summary(k) {
                         if param_uses.len() == args.len() {
@@ -3547,6 +3614,11 @@ impl<'e> CheckedWalkCx<'_, '_, '_, 'e> {
                         let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
                         for &child in items {
                             self.stack.push((child, WalkCtx::Phantom));
+                        }
+                    } else if ctx == WalkCtx::Concrete {
+                        let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                        for &child in items {
+                            self.stack.push((child, WalkCtx::Concrete));
                         }
                     } else {
                         // Save outer stack while classifying callee (visit_callee_item reuses `self.stack`
@@ -3627,13 +3699,28 @@ impl<'e> CheckedWalkCx<'_, '_, '_, 'e> {
                 | PNode::Str
                 | PNode::Never
                 | PNode::Foreign(_)
-                | PNode::Ref(..)
-                | PNode::Ptr(..)
-                | PNode::FnDef(..)
-                | PNode::FnPtr(..)
-                | PNode::Union(_)
-                | PNode::ConstValue { .. }
                 | PNode::ExAuto(_) => {}
+                // Dropping `&T` / `*const T` by value is a no-op, but under `WalkCtx::Concrete`
+                // (e.g. a custom `Drop` impl on `Weak<T, &A>`), the pointee type participates in
+                // the `Drop` impl's trait resolution and MUST stay concrete!
+                PNode::Ref(_, inner) | PNode::Ptr(_, inner) => {
+                    if ctx == WalkCtx::Concrete {
+                        self.stack.push((inner, WalkCtx::Concrete));
+                    }
+                }
+                PNode::FnDef(_, l) | PNode::FnPtr(l, _) | PNode::Union(l) => {
+                    if ctx == WalkCtx::Concrete {
+                        let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                        for &child in items {
+                            self.stack.push((child, WalkCtx::Concrete));
+                        }
+                    }
+                }
+                PNode::ConstValue { ty: cty, .. } => {
+                    if ctx == WalkCtx::Concrete {
+                        self.stack.push((cty, WalkCtx::Concrete));
+                    }
+                }
                 PNode::Param(i) => {
                     let flag = if ctx == WalkCtx::Concrete {
                         ParamUse::UNANALYZED_CALLEE | ParamUse::DROP_GLUE
@@ -3651,23 +3738,45 @@ impl<'e> CheckedWalkCx<'_, '_, '_, 'e> {
                         self.stack.push((child, ctx));
                     }
                 }
-                PNode::Array(elem, len) => match self.tys.node(len).map_err(|_| PolyError::Ty(TyError::NotInRecord(len)))? {
-                    PNode::ConstValue { bits: 0, .. } => {}
-                    PNode::ConstParam(n) => {
-                        self.mark_param(n, ParamUse::CONST_PARAM)?;
-                        self.stack.push((elem, ctx));
+                PNode::Array(elem, len) => {
+                    if ctx == WalkCtx::Concrete {
+                        self.stack.push((elem, WalkCtx::Concrete));
+                        self.stack.push((len, WalkCtx::Concrete));
+                    } else {
+                        match self.tys.node(len).map_err(|_| PolyError::Ty(TyError::NotInRecord(len)))? {
+                            PNode::ConstValue { bits: 0, .. } => {}
+                            PNode::ConstParam(n) => {
+                                self.mark_param(n, ParamUse::CONST_PARAM)?;
+                                self.stack.push((elem, ctx));
+                            }
+                            _ => self.stack.push((elem, ctx)),
+                        }
                     }
-                    _ => self.stack.push((elem, ctx)),
-                },
-                PNode::Slice(elem) | PNode::Pat(elem, _) => self.stack.push((elem, ctx)),
+                }
+                PNode::Slice(elem) => self.stack.push((elem, ctx)),
+                PNode::Pat(elem, ranges) => {
+                    self.stack.push((elem, ctx));
+                    if ctx == WalkCtx::Concrete {
+                        let items = self.tys.list(ranges).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(ranges)))?;
+                        for &r in items {
+                            self.stack.push((r, WalkCtx::Concrete));
+                        }
+                    }
+                }
                 PNode::Adt(k, l) => {
+                    let args = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                    if ctx == WalkCtx::Concrete {
+                        for &arg in args {
+                            self.stack.push((arg, WalkCtx::Concrete));
+                        }
+                        continue;
+                    }
                     if self.facts.phantom_data() == Some(k)
                         || self.facts.manually_drop() == Some(k)
                         || self.facts.non_null() == Some(k)
                     {
                         continue;
                     }
-                    let args = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
                     if let Some((param_uses, has_drop_impl)) = self.facts.adt_summary(k) {
                         if has_drop_impl {
                             if self.record_edges
@@ -5617,5 +5726,71 @@ mod tests {
         assert_ne!(d1, d_body_edit, "body token edit must change digest");
         assert_ne!(d1, d_sig_edit, "signature type edit must change digest");
         assert_ne!(d1, d_abi_edit, "ABI edit must change digest");
+    }
+
+    #[test]
+    fn custom_drop_ref_and_concrete_phantom_stay_concrete() {
+        let frame = test_frame();
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+
+        // Lattice check: `WalkCtx::Concrete` must NEVER be downgraded to `Phantom` by an unused
+        // ADT parameter (e.g. `<Marker<T> as Trait>::f()` or `TypeId::of::<Marker<T>>()`).
+        assert_eq!(combine_adt_ctx(WalkCtx::Concrete, AdtParamUse::Unused), WalkCtx::Concrete);
+        assert_eq!(combine_adt_ctx(WalkCtx::Concrete, AdtParamUse::OpaquePtr), WalkCtx::Concrete);
+        assert_eq!(combine_adt_ctx(WalkCtx::Phantom, AdtParamUse::Concrete), WalkCtx::Phantom);
+
+        // Regression for `Arc<T, A>::drop_slow`: builds & drops `Weak<T, &A>` where `Weak` has a
+        // custom `Drop` impl (`impl<T, A: Allocator> Drop for Weak<T, A>`). `A` appears only behind
+        // `&A`, so `walk_drop_ty` MUST recurse through `PNode::Ref` when `ctx == WalkCtx::Concrete`!
+        let mut tys = PortableTys::new_in(alloc);
+        let t0 = tys.intern(PNode::Param(0)).unwrap();
+        let a1 = tys.intern(PNode::Param(1)).unwrap();
+        let ref_a1 = tys.intern(PNode::Ref(Mutbl::Not, a1)).unwrap();
+        let unit = tys.intern(PNode::Tuple(List::EMPTY)).unwrap();
+        let weak_k = ItemKey(0xCAFE_1001);
+        let weak_args = tys.intern_list(&[t0, ref_a1]).unwrap();
+        let weak_ty = tys.intern(PNode::Adt(weak_k, weak_args)).unwrap();
+        let ref_t0 = tys.intern(PNode::Ref(Mutbl::Not, t0)).unwrap();
+        let ref_a_in = tys.intern(PNode::Ref(Mutbl::Not, a1)).unwrap();
+
+        let adts = [AdtDefInput {
+            key: weak_k,
+            param_count: 2,
+            field_tys: &[ref_t0, a1],
+            has_drop_impl: true,
+            tys: tys.view(),
+        }];
+        let adt_graph = analyze_adt_graph(&adts, &NoFacts, alloc).unwrap();
+        struct WeakFacts<'a> {
+            graph: &'a AdtGraphSummary<'a>,
+        }
+        impl AnalysisFacts for WeakFacts<'_> {
+            fn adt_summary(&self, adt: ItemKey) -> Option<(&[AdtParamUse], bool)> {
+                self.graph.get(adt)
+            }
+        }
+        let facts = WeakFacts { graph: &adt_graph };
+
+        let mut b = BodyBuilder::new_with_types_in(tys.view(), alloc);
+        let _ret = b.new_local(LocalDecl { ty: unit, kind: LocalKind::Return, mutbl: Mutbl::Mut });
+        let _p_a = b.new_local(LocalDecl { ty: ref_a_in, kind: LocalKind::Arg(0), mutbl: Mutbl::Not });
+        let w = b.new_local(LocalDecl { ty: weak_ty, kind: LocalKind::Arg(1), mutbl: Mutbl::Not });
+        let pw = b.local_place(w);
+        let bb0 = b.new_block(BlockKind::Normal);
+        let bb1 = b.new_block(BlockKind::Normal);
+        b.start(bb0);
+        b.terminate(StmtKind::Drop { place: pw, target: bb1, unwind: Unwind::Continue }, zero_span());
+        b.start(bb1);
+        b.terminate(StmtKind::Return, zero_span());
+        let body = b.finish().unwrap();
+
+        let analysis = analyze_body(ItemKey(0xCAFE_2001), 2, Abi::Rust, body.view(), tys.view(), &facts, alloc).unwrap();
+        assert_eq!(analysis.local_use[0].level(), CanonLevel::Concrete, "T in Weak<T, &A> must stay Concrete");
+        assert_eq!(
+            analysis.local_use[1].level(),
+            CanonLevel::Concrete,
+            "A behind &A in custom-Drop Weak<T, &A> must stay Concrete (never canonicalized to ())"
+        );
     }
 }
