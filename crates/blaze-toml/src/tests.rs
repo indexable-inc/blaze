@@ -1,4 +1,4 @@
-//! TOML 1.0's forms read and lowered, its refusals with offsets, the bounds, the forms Cargo's
+//! TOML 1.1's forms read and lowered, its refusals with offsets, the bounds, the forms Cargo's
 //! manifests use (this workspace's own root manifest among them), the writer's exact text, the
 //! editor's exact text for the edits blaze-new makes, and two properties (write then read gives
 //! the value back; an edit inserts only its own bytes and reads back as the value set) with a
@@ -121,7 +121,7 @@ fn datetimes_are_typed_and_checked() {
     assert_eq!(refused("a = 2026-02-29"), Error { at: 4, what: What::NoSuchDatetime });
     assert_eq!(refused("a = 2026-04-31"), Error { at: 4, what: What::NoSuchDatetime });
     assert_eq!(refused("a = 24:00:00"), Error { at: 4, what: What::NoSuchDatetime });
-    assert_eq!(refused("a = 1979-05-27T07:32"), Error { at: 20, what: What::End { expected: Expected::DatetimePart } });
+    assert_eq!(refused("a = 1979-05-27T07:3"), Error { at: 19, what: What::End { expected: Expected::DatetimePart } });
 }
 
 #[test]
@@ -138,7 +138,10 @@ fn refusals_name_the_byte_and_the_first_place() {
         ("a = 1\na.b = 2", Error { at: 6, what: What::NotATable { first: 0 } }),
         ("a = 1\nb", Error { at: 7, what: What::End { expected: Expected::Equals } }),
         ("a = 1 b", Error { at: 6, what: What::Unexpected { found: 'b', expected: Expected::EndOfLine } }),
-        ("a = { b = 1, }", Error { at: 13, what: What::Unexpected { found: '}', expected: Expected::Key } }),
+        ("a = { b = 1,, }", Error { at: 12, what: What::Unexpected { found: ',', expected: Expected::Key } }),
+        ("a = {\n x = 1\n y = 2 }", Error { at: 14, what: What::Unexpected { found: 'y', expected: Expected::CommaOrEndInline } }),
+        ("a = 07:32.5", Error { at: 9, what: What::Unexpected { found: '.', expected: Expected::EndOfLine } }),
+        ("a = \"\\x4\"", Error { at: 8, what: What::Unexpected { found: '"', expected: Expected::Hex } }),
         ("a = [1 2]", Error { at: 7, what: What::Unexpected { found: '2', expected: Expected::CommaOrEndArray } }),
         ("[a", Error { at: 2, what: What::End { expected: Expected::CloseHeader } }),
         ("[[a]", Error { at: 3, what: What::Unexpected { found: ']', expected: Expected::CloseArrayHeader } }),
@@ -169,6 +172,54 @@ fn refusals_name_the_byte_and_the_first_place() {
         error.display("a = 1\n\n  b = 1\n  b = 2").to_string(),
         "line 4, column 3: the key is already defined at byte 9"
     );
+}
+
+/// What TOML 1.1 added to 1.0, all of which Cargo reads: an inline table over several lines
+/// with comments and a trailing comma, `\e` and `\xHH`, and a time without seconds. The first
+/// text is a manifest `cargo check` took and `blaze check` refused at the newline.
+#[test]
+fn toml_1_1_forms_read() {
+    let text = "[package.metadata]\nexample = {\n    enabled = true, # why\n    nested = { a = 1,\n      b = [1, 2], },\n}\nafter = 1\n";
+    assert_eq!(
+        lower(text),
+        value!(in heap(); {"package": {"metadata": {"example": {"enabled": true, "nested": {"a": 1, "b": [1, 2]}}, "after": 1}}})
+    );
+    assert_eq!(lower("a = {\n}\nb = { # c\n x = 1 # d\n , y = 2 }"), value!(in heap(); {"a": {}, "b": {"x": 1, "y": 2}}));
+    let doc = parse(text);
+    let example = doc.root().get("package").unwrap().get("metadata").unwrap().get("example").unwrap();
+    assert_eq!(&text[example.span()], "{\n    enabled = true, # why\n    nested = { a = 1,\n      b = [1, 2], },\n}", "the span is the table");
+    assert_eq!(lower("s = \"a\\eb\\x41\\xe9\""), value!(in heap(); {"s": "a\u{1b}bA\u{e9}"}));
+    let doc = parse("lt = 07:32\nldt = 1979-05-27T07:32\nodt = 1979-05-27 07:32Z");
+    let shown: StdVec<StdString> =
+        doc.root().children().map(|item| item.as_datetime().map(Datetime::to_string).unwrap()).collect();
+    assert_eq!(shown, ["07:32:00", "1979-05-27T07:32:00", "1979-05-27T07:32:00Z"]);
+}
+
+/// The editor in a TOML 1.1 inline table: which comma goes, and where an entry is added, is
+/// read from the text, so every result is TOML and keeps its comments.
+#[test]
+fn edits_keep_a_toml_1_1_inline_table() {
+    let set = |text: &str| edited(text, |doc, e| e.set(doc.root().get("a").unwrap(), "k", &value!(in heap(); 3)).unwrap());
+    let removed = |text: &str, key: &str| edited(text, |doc, e| e.remove(doc.root().get("a").unwrap().get(key).unwrap()).unwrap());
+    let cases: &[(StdString, &str)] = &[
+        (removed("a = {\n  x = 1, # one\n  y = 2,\n}\n", "x"), "a = {\n  # one\n  y = 2,\n}\n"),
+        (removed("a = {\n  x = 1, # one\n  y = 2,\n}\n", "y"), "a = {\n  x = 1, # one\n  \n}\n"),
+        (removed("a = { x = 1, # one\n  y = 2\n}\n", "y"), "a = { x = 1 # one\n\n}\n"),
+        (removed("a = { x = 1, }\n", "x"), "a = { }\n"),
+        // An entry of a dotted table stands between `x` and its next sibling `y`.
+        (removed("a = { b.c = 1, x = 2, b.d = 3, y = 4 }\n", "x"), "a = { b.c = 1, b.d = 3, y = 4 }\n"),
+        (set("a = {\n  x = 1, # one\n  y = 2,\n}\n"), "a = {\n  x = 1, # one\n  y = 2, k = 3,\n}\n"),
+        (set("a = { x = 1 # c\n}\n"), "a = { x = 1, k = 3 # c\n}\n"),
+        (set("a = {\n}\n"), "a = { k = 3 }\n"),
+        // A comment in a table with no entry, or beside its only one, is kept.
+        (set("a = {\n  # note\n}\n"), "a = { k = 3\n  # note\n}\n"),
+        (removed("a = { # note\n  x = 1\n}\n", "x"), "a = { # note\n  \n}\n"),
+        (removed("a = { x = 1 # note\n}\n", "x"), "a = {  # note\n}\n"),
+    ];
+    for (edited, want) in cases {
+        assert_eq!(edited, want);
+        parse(edited);
+    }
 }
 
 #[test]

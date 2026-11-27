@@ -20,7 +20,7 @@ path = "src/bin/blaze-bstd-convert.rs"
 [dependencies]
 # Full lossless Rust 2024 CST/AST parser (zero third-party deps).
 syntax.workspace = true
-# Strict TOML 1.0 parser and lossless manifest editor (zero third-party deps).
+# Strict TOML 1.1 parser and lossless manifest editor (zero third-party deps).
 blaze-toml.workspace = true
 # Strict RFC 8259 JSON parser/writer and format-neutral Value (zero third-party deps).
 blaze-data.workspace = true

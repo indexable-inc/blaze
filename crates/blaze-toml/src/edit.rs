@@ -101,6 +101,19 @@ fn blank(b: u8) -> bool {
     b == b' ' || b == b'\t'
 }
 
+/// The comma that follows byte `at`, a value's end in an array or an inline table, past
+/// blanks, newlines and comments; none when the close or another value comes first.
+fn comma_after(bytes: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        match bytes.get(at)? {
+            b' ' | b'\t' | b'\n' | b'\r' => at += 1,
+            b'#' => at += bytes[at..].iter().position(|&b| b == b'\n')?,
+            b',' => return Some(at),
+            _ => return None,
+        }
+    }
+}
+
 impl<'d, 't, A: Allocator, B: Allocator + Clone> Edit<'d, 't, A, B> {
     /// No edits yet to `doc`; the edits' texts and the result in `alloc`.
     pub fn new_in(doc: &'d Document<'t, A>, alloc: B) -> Edit<'d, 't, A, B> {
@@ -168,24 +181,23 @@ impl<'d, 't, A: Allocator, B: Allocator + Clone> Edit<'d, 't, A, B> {
                 self.splice(at, at, text);
             }
             Origin::Inline => {
-                let bytes = self.doc.text().as_bytes();
-                let mut at = span.end - 1;
-                while at > span.start + 1 && blank(bytes[at - 1]) {
-                    at -= 1;
-                }
-                let empty = table.is_empty();
-                let start = if empty { span.start } else { at };
-                text.push_str(if empty { "{ " } else { ", " });
+                // After the last value written in it: before a trailing comma, a comment or
+                // a newline the table closes with, so the text stays TOML whichever it has.
+                // An empty one becomes `{ k = v }`; one that holds only a comment keeps it,
+                // the entry going just after its `{`.
+                let last = self.value_end_before(table.id, span.end);
+                let bare = self.doc.text()[span.start + 1..span.end - 1].trim().is_empty();
+                let (at, end, lead, tail) = match last {
+                    Some(at) => (at, at, ", ", ""),
+                    None if bare => (span.start, span.end, "{ ", " }"),
+                    None => (span.start + 1, span.start + 1, " ", ""),
+                };
+                text.push_str(lead);
                 write_key(key, &mut text);
                 text.push_str(" = ");
                 write_inline(value, &mut text).map_err(|error| EditError { at, what: EditWhat::Value(error) })?;
-                match empty {
-                    true => {
-                        text.push_str(" }");
-                        self.splice(start, span.end, text);
-                    }
-                    false => self.splice(at, at, text),
-                }
+                text.push_str(tail);
+                self.splice(at, end, text);
             }
             origin => return Err(EditError { at: span.start, what: EditWhat::NotEditable { origin } }),
         }
@@ -316,30 +328,59 @@ impl<'d, 't, A: Allocator, B: Allocator + Clone> Edit<'d, 't, A, B> {
         }
     }
 
-    /// An inline table's entry and a comma beside it.
+    /// An inline table's entry and a comma beside it. Which comma is read from the text, not
+    /// from the entry's place among its siblings: an entry of a dotted table (`a.c` after `x`
+    /// in `{ a.b = 1, x = 2, a.c = 3 }`) stands between siblings, and a TOML 1.1 table has
+    /// comments, newlines and a trailing comma between its entries.
     fn remove_inline_entry(&mut self, item: Item<'_, '_, A>, table: Item<'_, '_, A>) {
-        let nodes = &self.doc.nodes;
         let bytes = self.doc.text().as_bytes();
         let start = item.key_span().start;
-        let next = nodes.next_siblings()[widen(item.id)];
-        let empty = String::new_in(self.alloc.clone());
-        if next != NONE {
-            // Up to the next entry's first key: the comma and the blanks after it.
-            let until = nodes.key_spans()[widen(next)].range().start;
-            self.splice(start, until, empty);
-        } else if nodes.first_children()[widen(table.id)] != item.id {
-            // The last of several: from the comma before it.
-            let mut comma = start;
-            while comma > 0 && blank(bytes[comma - 1]) {
-                comma -= 1;
+        let end = item.span().end;
+        let mut text = String::new_in(self.alloc.clone());
+        if let Some(comma) = comma_after(bytes, end) {
+            // The comma after it, and the blanks up to what follows.
+            let mut until = comma + 1;
+            while bytes.get(until).copied().is_some_and(blank) {
+                until += 1;
             }
-            self.splice(comma - 1, item.span().end, empty);
+            self.splice(start, until, text);
+        } else if let Some(before) = self.value_end_before(table.id, start) {
+            // The last written, with no comma after: the comma before it goes, and what
+            // stood between the two (a comment, a newline) stays, less the entry's indent.
+            let comma = comma_after(bytes, before).unwrap_or_else(|| unreachable!("a comma parts two entries"));
+            let kept = self.doc.text()[comma + 1..start].trim_end_matches([' ', '\t']);
+            text.push_str(kept);
+            self.splice(comma, end, text);
         } else {
-            let mut text = empty;
-            text.push_str("{}");
+            // The only one: `{}` in the table's place, unless a comment stands in it too.
             let span = table.span();
-            self.splice(span.start, span.end, text);
+            let source = self.doc.text();
+            let alone = source[span.start + 1..start].trim().is_empty() && source[end..span.end - 1].trim().is_empty();
+            match alone {
+                true => {
+                    text.push_str("{}");
+                    self.splice(span.start, span.end, text);
+                }
+                false => self.splice(start, end, text),
+            }
         }
+    }
+
+    /// Where the last value written inside the inline table `table` before byte `limit` ends:
+    /// the end of the entry before `limit`, whatever table of dotted keys it went into.
+    fn value_end_before(&self, table: u32, limit: usize) -> Option<usize> {
+        let nodes = &self.doc.nodes;
+        let within = nodes.spans()[widen(table)].range();
+        let mut last = None;
+        for id in 0..nodes.spans().len() {
+            let span = nodes.spans()[id].range();
+            // A table of dotted keys has no text of its own; a value under it has.
+            let dotted = nodes.kinds()[id] == Kind::Table && nodes.origins()[id] == Origin::Dotted;
+            if !dotted && span.start > within.start && span.end <= limit && span.end < within.end {
+                last = last.max(Some(span.end));
+            }
+        }
+        last
     }
 
     /// The section of every header table at or under `item` and the line of every key/value

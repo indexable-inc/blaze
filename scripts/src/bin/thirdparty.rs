@@ -62,7 +62,7 @@ An optional dependency Cargo.lock does not list (no feature anywhere turns it on
 build and not counted; one it lists counts, whichever crate's features turn it on. A crate that
 is not a member has no dev-dependencies read: cargo resolves none for it.
 
-The manifests and Cargo.lock are read as TOML 1.0 by blaze-toml, which refuses what is not TOML
+The manifests and Cargo.lock are read as TOML 1.1 by blaze-toml, which refuses what is not TOML
 naming the file, line and column. A key whose value is not of the shape it must be is refused
 naming the file and line. A Cargo.lock that does not list a dependency is refused, naming the
 crate, the dependency and its manifest line: update the lock.
