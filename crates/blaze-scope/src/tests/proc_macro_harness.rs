@@ -88,3 +88,46 @@ fn a_proc_macro_crate_lists_its_macros_in_one_unnamed_static() {
     let (plain, crates) = resolved(false);
     assert!(text_of(&plain, 1, proc_macro_decls_key(crates[1].key)).is_none(), "a crate that is no proc-macro crate made a harness");
 }
+
+/// Macro-generated `#[proc_macro*]` exports (like `derive_more-impl`'s `create_derive!`)
+/// must appear in BOTH `_DECLS` AND `CrateNames::proc_exports` in identical order.
+#[test]
+fn macro_expanded_proc_macro_exports_appear_in_decls_and_proc_exports() {
+    const EXPANDED_MACROS: &str = r#"#![no_core]
+macro_rules! create_derive {
+    ($trait:ident, $fn_name:ident, $attr:ident) => {
+        #[proc_macro_derive($trait, attributes($attr))]
+        pub fn $fn_name() {}
+    };
+}
+#[proc_macro]
+pub fn direct_fn() {}
+create_derive!(Deref, deref_derive, deref);
+create_derive!(DerefMut, deref_mut_derive, deref_mut);
+"#;
+    static EXP_TEXTS: Texts = Texts(&[&[("/macros/lib.rs", EXPANDED_MACROS)]]);
+    let macros = input("macros", "/macros/lib.rs", &[]);
+    let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
+    let crates = [CrateInput { implicit, ..macros }];
+    let names = resolve_crates(&crates, Sysroot::default(), &EXP_TEXTS, &Serial, super::SyncFrame::leaked())
+        .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let key = proc_macro_decls_key(crates[0].key);
+    let (_, text) = text_of(&names, 0, key).expect("_DECLS must exist for macro-expanded proc-macro crate");
+    let exports = &names.krate(0).proc_exports;
+    assert_eq!(exports.len(), 3, "expected 1 direct + 2 macro-expanded exports, got {exports:?}");
+    assert_eq!(exports[0].macro_name, "direct_fn");
+    assert_eq!(exports[0].fn_name, "direct_fn");
+    let mut expanded_names: Vec<&str> = exports[1..].iter().map(|e| e.macro_name).collect();
+    expanded_names.sort_unstable();
+    assert_eq!(expanded_names.as_slice(), &["Deref", "DerefMut"]);
+    // Every `proc_exports` entry must match its exact slot in `_DECLS`.
+    let client = "::proc_macro::bridge::client::Client::";
+    assert_eq!(text.matches(client).count(), 3, "_DECLS must contain all 3 entries: {text}");
+    let mut prev = 0usize;
+    for entry in exports.iter() {
+        let needle = format!("{client}expand1(crate::{})", entry.fn_name);
+        let pos = text.find(&needle).unwrap_or_else(|| panic!("`{needle}` missing from `_DECLS`: {text}"));
+        assert!(pos >= prev, "`_DECLS` order must match `proc_exports` order: {text}");
+        prev = pos;
+    }
+}

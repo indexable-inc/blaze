@@ -1923,12 +1923,47 @@ const HARNESS_HEAD: &str =
 /// One entry's path up to its constructor.
 const HARNESS_CLIENT: &str = "::proc_macro::bridge::client::Client::";
 
+/// One `#[proc_macro]`, `#[proc_macro_attribute]`, or `#[proc_macro_derive(..)]` function
+/// declared in a proc-macro crate's root module (either directly in `lib.rs` or via a
+/// root-level macro expansion such as `derive_more-impl`'s `create_derive!`). Used to build
+/// both the crate's `_DECLS` harness static and the wasm64 module's `macros` export manifest
+/// in identical order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcHarnessEntry<'a> {
+    pub kind: ProcKind,
+    pub macro_name: &'a str,
+    pub helpers: &'a str,
+    pub fn_name: &'a str,
+}
+
+/// The key of the synthetic harness call whose expansion defines crate `krate`'s `_DECLS` static.
+pub fn proc_macro_harness_call(krate: CrateItemKey) -> ItemKey {
+    key_of(krate, root_key(krate), HARNESS_TAG, HARNESS_PATH, 0)
+}
+
+/// Formats the `#[rustc_proc_macro_decls] pub static _DECLS` text for `entries` in order.
+pub fn proc_macro_harness_text<'a>(entries: &[ProcHarnessEntry<'a>], bump: Bump<'a>) -> &'a str {
+    let mut text = BString::new_in(bump);
+    text.push_str(HARNESS_HEAD);
+    for entry in entries {
+        text.push_str(HARNESS_CLIENT);
+        text.push_str(match entry.kind {
+            ProcKind::Derive | ProcKind::FnLike => "expand1(crate::",
+            ProcKind::Attr => "expand2(crate::",
+        });
+        text.push_str(entry.fn_name);
+        text.push_str("), ");
+    }
+    text.push_str("];\n");
+    text.into_bump_str()
+}
+
 /// The key of crate `krate`'s `_DECLS` static (D175): the static's key in the harness call's
 /// expansion, the call being the root's one entry of its tag. A function of the crate's key
 /// alone (rule 71): what a code-record program names it by (blaze-ladder front2
 /// `proc_macro_decls`). Only a proc-macro crate (`Implicit::proc_macro`) has the item.
 pub fn proc_macro_decls_key(krate: CrateItemKey) -> ItemKey {
-    let call = key_of(krate, root_key(krate), HARNESS_TAG, HARNESS_PATH, 0);
+    let call = proc_macro_harness_call(krate);
     key_of(krate, call, kind_tag(ItemKind::Static), PROC_MACRO_DECLS, 0)
 }
 
@@ -2192,6 +2227,8 @@ pub struct Lowered<'t, 'a, 's> {
     pub notes: AVec<'s, LowerNote<'t>>,
     /// The `link_name`/`export_name` values written as macro calls, each at its item's place.
     pub values: AVec<'s, crate::attr_values::ValueSite<'t>>,
+    /// Root-level `#[proc_macro*]` functions lowered in this fragment (when `LowerCx::harness` is true).
+    pub proc_harness: AVec<'s, ProcHarnessEntry<'t>>,
 }
 
 impl Lowered<'_, '_, '_> {
@@ -2361,11 +2398,10 @@ pub fn lower_in_out<'p: 't, 't, 'o, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<
         && fragment.depth == 0
         && matches!(fragment.at, Where::File(_))
         && !exports_entry(cx.cfg, fragment.outline, fragment.text, scratch);
-    let harness = cx.harness && fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) && fragment.members_of.is_none();
+    let harness = cx.harness && fragment.items.is_none() && fragment.members_of.is_none();
     let mut low = Lower {
         entry,
         harness,
-        harnessed: AVec::new_in(scratch),
         krate: cx.krate,
         tools: cx.tools,
         edition: cx.edition,
@@ -2409,6 +2445,7 @@ pub fn lower_in_out<'p: 't, 't, 'o, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<
             ctors: AVec::new_in(out_alloc),
             notes: AVec::new_in(out_alloc),
             values: AVec::new_in(out_alloc),
+            proc_harness: AVec::new_in(out_alloc),
         },
     };
     // The entries left to lower, each a run of siblings (`at..end`): an extern block's items
@@ -2423,9 +2460,6 @@ pub fn lower_in_out<'p: 't, 't, 'o, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<
     // keeps no module file whose `#![cfg]` is false, so this is the crate root's: the crate
     // exists and is empty (a proc-macro crate's harness lists nothing).
     if fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) && !file_attrs(low.cfg, outline, low.text, scratch).cfg_ok {
-        if low.harness {
-            low.proc_macro_harness();
-        }
         return low.out;
     }
     // A macro crate's module list: the root's fragment declares each macro it names.
@@ -2449,9 +2483,6 @@ pub fn lower_in_out<'p: 't, 't, 'o, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<
             runs.push(children_run(outline, Some(idx)));
         }
     }
-    if low.harness {
-        low.proc_macro_harness();
-    }
     low.out
 }
 
@@ -2466,11 +2497,8 @@ fn children_run(outline: &Outline<'_>, parent: Option<ItemIndex>) -> (usize, usi
 struct Lower<'c, 'o, 's, 't, 'a, W: ?Sized> {
     /// [`LowerCx::entry`], and the file exports no entry of its own.
     entry: bool,
-    /// [`LowerCx::harness`], and this is the root file's own fragment.
+    /// [`LowerCx::harness`], and this fragment is the root module or a root-level expansion.
     harness: bool,
-    /// Under `harness`: each `#[proc_macro*]` fn at the root, in declaration order, its kind
-    /// and its name as written (a raw `r#name` kept raw): the harness's list.
-    harnessed: AVec<'s, (ProcKind, &'t str)>,
     krate: CrateItemKey,
     /// [`LowerCx::tools`].
     tools: &'c [&'c str],
@@ -2655,61 +2683,6 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
         self.out.macros.push((key, src));
     }
 
-    /// D175: the proc-macro crate's harness, as rustc's (compiler/rustc_builtin_macros
-    /// proc_macro_harness.rs at the pinned nightly) writes it: ONE static listing the crate's
-    /// macros in declaration order, each the pinned `proc_macro::bridge::client::Client` of its
-    /// fn (library/proc_macro/src/bridge/client.rs: `Client::expand1` for a derive and a
-    /// function-like macro, `Client::expand2` for an attribute macro, whose fn takes two
-    /// streams). The macro's name and a derive's helpers are not in it (the pinned bridge
-    /// keeps them out of `Client`); they are the crate's `ProcExport`s, in the same order.
-    ///
-    /// It is sent as a call with no macro ([`CallRole::ProcMacroHarness`]): the cells answer
-    /// it at once and resolve.rs `keep_item` lowers its input, the static's text, as its
-    /// expansion, declaring no name (rustc's `_DECLS` is def-site). So the static is an
-    /// ordinary item of an expansion: a text, a key ([`proc_macro_decls_key`]), a head and a
-    /// body checked and evaluated as any static's, named by key from a code-record program.
-    /// Its key is a function of the crate alone (rule 71); its content, this text, is a
-    /// function of the root's declarations alone, made here, before any work (rule 65).
-    fn proc_macro_harness(&mut self) {
-        let mut text = BString::new_in(self.bump);
-        text.push_str(HARNESS_HEAD);
-        for &(kind, function) in self.harnessed.iter() {
-            text.push_str(HARNESS_CLIENT);
-            text.push_str(match kind {
-                ProcKind::Derive | ProcKind::FnLike => "expand1(crate::",
-                ProcKind::Attr => "expand2(crate::",
-            });
-            text.push_str(function);
-            text.push_str("), ");
-        }
-        text.push_str("];\n");
-        let input: &'t str = text.into_bump_str();
-        let call = self.key(self.owner, HARNESS_TAG, HARNESS_PATH);
-        let Some(parsed) = parse_path(HARNESS_PATH, self.krate, self.alloc) else {
-            self.note(LowerNoteKind::MacroCallPathNotRead, 0, HARNESS_PATH);
-            return;
-        };
-        let pos = self.next_pos();
-        self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: None, role: CallRole::ProcMacroHarness });
-        let src = CallSrc {
-            module: self.module,
-            owner: None,
-            name: HARNESS_PATH,
-            input,
-            kind: CallShape::Attr,
-            loc: self.loc(0),
-            written: self.written,
-            depth: self.depth,
-            implicit: false,
-            // No written text holds it: its expansion keeps no column (resolve.rs `KeepAs`).
-            place: None,
-            tokens: crate::nested_input::CallTokens::Text,
-            answered: 0,
-            on: None,
-        };
-        self.out.calls.push((call, src));
-    }
-
     /// Lowers one entry; true when its children are to be lowered next, in its place (an
     /// extern block's).
     fn item(&mut self, idx: ItemIndex, item: &Item) -> bool {
@@ -2854,15 +2827,21 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     if let Some(proc) = attrs.proc_macro.filter(|_| from_text) {
                         self.proc_macro(ProcExport { kind: proc.kind, name: proc.derive.unwrap_or(name), helpers: proc.helpers });
                     }
-                    // The harness's list (D175): read from the text in both `ProcDecls` modes,
-                    // as rustc's collector reads the root's `#[proc_macro*]` fns in order.
+                    // The harness's list (D175): read from the text in both `ProcDecls` modes
+                    // (both directly in `lib.rs` and from root-level macro expansions), as rustc's
+                    // collector reads the root's `#[proc_macro*]` fns after expansion.
                     if self.harness
                         && item.parent.is_none()
                         && matches!(item.detail, ItemDetail::Fn { .. })
                         && let Some(proc) = attrs.proc_macro
                         && let Some(written) = item.name.map(|r| item.text(text, r))
                     {
-                        self.harnessed.push((proc.kind, written));
+                        self.out.proc_harness.push(ProcHarnessEntry {
+                            kind: proc.kind,
+                            macro_name: proc.derive.unwrap_or(name),
+                            helpers: proc.helpers,
+                            fn_name: written,
+                        });
                     }
                     self.declare(name, Namespace::Values, key, DefKind::Other, vis);
                 }
