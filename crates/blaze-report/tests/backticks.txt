@@ -54,7 +54,7 @@ blaze-new 34
 blaze-own 7
 blaze-parquet 5
 blaze-pg 4
-blaze-proc-macro 114
+blaze-proc-macro 116
 blaze-producers 7
 blaze-profile 80
 blaze-rel 11

@@ -183,6 +183,8 @@ fn layout_err(error: LayoutError) -> TyErr {
         Refusal::Recursive => TyErr::Malformed("an aggregate that contains itself by value"),
         Refusal::TooLarge => TyErr::Unsupported("a type larger than `isize::MAX` bytes"),
         Refusal::NoAdt(adt) => TyErr::Other(BuildError::NoAdt { adt }),
+        Refusal::NoClosure { owner, ordinal } => TyErr::Other(BuildError::ClosureOwnerUnchecked { owner, ordinal }),
+        Refusal::NoCoroutine { owner, ordinal } => TyErr::Other(BuildError::CoroutineOwnerUnchecked { owner, ordinal }),
         Refusal::Ground(error) | Refusal::FieldGround { error, .. } => ground_err(error),
         Refusal::Missing(m) => TyErr::Other(BuildError::MissingRecord { item: m.item }),
         // A clean check never holds an extern type by value (it is not `Sized`).

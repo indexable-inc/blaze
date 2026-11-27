@@ -776,6 +776,12 @@ pub enum Refusal {
     TooLarge,
     /// The world does not know this ADT.
     NoAdt(ItemKey),
+    /// The world does not have closure facts for `(owner, ordinal)` yet (its owner fn has not
+    /// been checked in a lazy program).
+    NoClosure { owner: ItemKey, ordinal: u32 },
+    /// The world does not have coroutine facts for `(owner, ordinal)` yet (its owner fn has not
+    /// been checked in a lazy program).
+    NoCoroutine { owner: ItemKey, ordinal: u32 },
     /// Grounding a field's type was refused.
     Ground(BuildError),
     /// Grounding the type of field `field` (its row in `Adt::fields`, named `name`) of ADT
@@ -822,6 +828,8 @@ impl fmt::Display for LayoutError {
             Refusal::Recursive => write!(f, "type {t} holds itself by value (an infinite size)"),
             Refusal::TooLarge => write!(f, "type {t} is larger than `isize::MAX` bytes"),
             Refusal::NoAdt(key) => write!(f, "type {t}: the world does not know ADT {:#x}", key.0),
+            Refusal::NoClosure { owner, ordinal } => write!(f, "type {t}: closure #{ordinal} needs owner fn {:#x} checked", owner.0),
+            Refusal::NoCoroutine { owner, ordinal } => write!(f, "type {t}: coroutine #{ordinal} needs owner fn {:#x} checked", owner.0),
             Refusal::Ground(error) => write!(f, "type {t}: grounding a field's type: {error}"),
             Refusal::FieldGround { adt, field, name, error } => {
                 write!(f, "type {t}: field {field} (name {:#x}) of ADT {:#x}: grounding its type: {error}", name.0, adt.0)
@@ -1348,7 +1356,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             // environment, a fact of its identity grounded at the owner's arguments.
             PNode::Closure { owner, ordinal, args: l } => {
                 let facts = cx.facts;
-                let c = facts.closure(owner, ordinal).ok_or(Refusal::Unsupported("a closure whose facts the world did not answer"))?;
+                let c = facts.closure(owner, ordinal).ok_or(Refusal::NoClosure { owner, ordinal })?;
                 let mut args: blaze_own::AVec<'_, PTy> = blaze_own::AVec::new_in(cx.scratch);
                 args.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
                 out.push(ground(c.types, c.env, &args, cx.ground, cx.scratch, facts).map_err(Refusal::Ground)?);
@@ -1358,7 +1366,7 @@ impl<A: Allocator + Clone> Layouts<A> {
             PNode::Coroutine { .. } => {
                 let facts = cx.facts;
                 let of = crate::coroutine_of(view, t).ok_or(Refusal::Malformed("a coroutine node `coroutine_of` does not read"))?;
-                let c = facts.coroutine(of.owner, of.ordinal).ok_or(Refusal::Unsupported("a coroutine whose facts the world did not answer"))?;
+                let c = facts.coroutine(of.owner, of.ordinal).ok_or(Refusal::NoCoroutine { owner: of.owner, ordinal: of.ordinal })?;
                 let mut args: blaze_own::AVec<'_, PTy> = blaze_own::AVec::new_in(cx.scratch);
                 args.extend_from_slice(view.list(of.owner_args).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
                 out.push(ground(c.types, c.env, &args, cx.ground, cx.scratch, facts).map_err(Refusal::Ground)?);

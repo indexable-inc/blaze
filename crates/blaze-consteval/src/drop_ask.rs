@@ -52,6 +52,8 @@ fn refusal(e: NeedsDropError<Ask>) -> Refusal<'static> {
     let build = |e: BuildError, what: &'static str| match e {
         BuildError::Projection { trait_, name } => Refusal::Projection { trait_, name },
         BuildError::OpaqueOwnerUnchecked { owner, .. } => Refusal::Missing { what: "opaque defining body", item: owner },
+        BuildError::ClosureOwnerUnchecked { owner, .. } => Refusal::Missing { what: "closure facts", item: owner },
+        BuildError::CoroutineOwnerUnchecked { owner, .. } => Refusal::Missing { what: "coroutine facts", item: owner },
         _ => Refusal::NeedsDrop { what },
     };
     match e {
