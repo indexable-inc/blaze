@@ -172,6 +172,13 @@ jobs:
           }
           tc="$(cat pins/toolchain)"
           run_bounded 1800 cargo +"$tc" build --locked --release -p blaze-cli --bin blaze --bin blaze-fact-shim -p blaze-launcher --bin blaze-launcher
+          out_dir="${CARGO_TARGET_DIR:-target}/release"
+          mkdir -p target/release
+          if [ "$(cd "$out_dir" && pwd -P)" != "$(cd target/release && pwd -P)" ]; then
+            cp "$out_dir/blaze" target/release/blaze
+            cp "$out_dir/blaze-launcher" target/release/blaze-launcher
+            cp "$out_dir/blaze-fact-shim" target/release/blaze-fact-shim
+          fi
       - name: Archive and checksum
         run: |
           set -euo pipefail
@@ -187,7 +194,13 @@ jobs:
           [ -f "$NAME/toolchain/$pinned" ] || { echo "::error::bundled toolchain shelf missing pinned manifest $pinned" >&2; exit 1; }
           "$NAME/blaze" --version
           "$NAME/blaze" toolchain
-          command -v xz >/dev/null || brew install xz
+          if ! command -v xz >/dev/null 2>&1; then
+            if command -v brew >/dev/null 2>&1; then
+              brew install xz
+            else
+              sudo apt-get update && sudo apt-get install -y xz-utils
+            fi
+          fi
           tar cf - "$NAME" | xz -9e -T0 > "$NAME.tar.xz"
           tar czf "$NAME.tar.gz" "$NAME"
           if command -v sha256sum >/dev/null 2>&1; then
