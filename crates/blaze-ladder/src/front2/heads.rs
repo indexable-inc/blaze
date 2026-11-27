@@ -871,6 +871,81 @@ pub(crate) fn is_auto_copy_pub_view<'n, S: NamesSource<'n>>(
 ///   Rust edition it needs `#![feature(default_field_values)]` at the crate root (the crate
 ///   root record's `features`, `NamesSource::has_feature`), refused naming the feature
 ///   without it.
+/// Synthetic anonymous-member name for ADT field default `(variant, field)`.
+pub(crate) fn field_default_label<'a>(variant: usize, field: usize, ty_text: &str, value_text: &str, alloc: Alloc<'a>) -> blaze_own::String<Alloc<'a>> {
+    blaze_own::format_in!(alloc, "field default {variant}.{field}: {ty_text} = {value_text}")
+}
+
+/// Synthetic anonymous-member name for ADT field default `(variant, field)`, including its
+/// observable source placement when the default expression invokes a macro (`line!()`, `column!()`,
+/// `file!()`, etc.).
+pub(crate) fn field_default_label_with_site<'a>(
+    variant: usize,
+    field: usize,
+    ty_text: &str,
+    value_text: &str,
+    site: Option<super::anon::HeadSite<'_>>,
+    alloc: Alloc<'a>,
+) -> blaze_own::String<Alloc<'a>> {
+    match site {
+        Some(s) => blaze_own::format_in!(alloc, "field default {variant}.{field}: {ty_text} = {value_text} @{}:{}:{}", s.line, s.col, s.file.unwrap_or("")),
+        None => field_default_label(variant, field, ty_text, value_text, alloc),
+    }
+}
+
+/// Synthetic inline `const` declaration stored in `FnHead::text` for an ADT field default.
+pub(crate) fn field_default_decl<'a>(ty_text: &str, value_text: &str, alloc: Alloc<'a>) -> blaze_own::String<Alloc<'a>> {
+    blaze_own::format_in!(alloc, "const _: {ty_text} = {value_text};")
+}
+
+/// Reconstructs [`field_default_label`] from a frozen [`field_default_decl`] string.
+pub(crate) fn field_default_label_from_decl<'a>(variant: usize, field: usize, decl: &str, alloc: Alloc<'a>) -> Option<blaze_own::String<Alloc<'a>>> {
+    let body = decl.strip_prefix("const _: ")?.strip_suffix(';')?;
+    Some(blaze_own::format_in!(alloc, "field default {variant}.{field}: {body}"))
+}
+
+/// Reconstructs the anonymous-member label for a frozen ADT field default, falling back to the
+/// enclosing ADT's source placement when the default calls a macro and its key includes `HeadSite`.
+pub(crate) fn field_default_label_for_frozen<'n, 'a, S: NamesSource<'n>>(
+    names: S,
+    adt: LibKey,
+    container: ItemKey,
+    variant: usize,
+    field: usize,
+    decl: &str,
+    expected: ItemKey,
+    alloc: Alloc<'a>,
+) -> Option<blaze_own::String<Alloc<'a>>> {
+    let plain = field_default_label_from_decl(variant, field, decl, alloc)?;
+    if super::keys::member_key_of(container, MemberKind::Anon, plain.as_str()) == expected || !decl.contains('!') {
+        return Some(plain);
+    }
+    let owner_text = super::locals::owner_scanned_text(names, adt)?;
+    let is_enum = matches!(names.detail_of(adt), Some(ItemDetail::Enum));
+    let situated = with_lowered(names, adt, owner_text, |v| {
+        let field_row = if is_enum {
+            let vn = v.rows(v.list(head::FIELDS)).ok()?.get(variant).copied()?;
+            let var = lf::Variant::decode(vn).ok()?;
+            v.rows(var.fields).ok()?.get(field).copied()?
+        } else {
+            if variant != 0 {
+                return None;
+            }
+            v.rows(v.list(head::FIELDS)).ok()?.get(field).copied()?
+        };
+        let f = lf::Field::decode(field_row).ok()?;
+        let c = f.default?;
+        let ty_text = v.text_at(v.type_range(f.ty).ok()?).ok()?.trim();
+        let value_text = v.text_at(v.const_range(c).ok()?).ok()?.trim();
+        let offset = blaze_scope::expansion_origins::offset_in(owner_text, value_text)?;
+        let site = super::anon::head_site_of(names, adt, offset, value_text);
+        Some(field_default_label_with_site(variant, field, ty_text, value_text, site, alloc))
+    })
+    .ok()
+    .flatten();
+    situated.or(Some(plain))
+}
+
 pub(crate) fn field_default_allowed<'n, S: NamesSource<'n>>(names: S, adt: LibKey, kind: tc::AdtKind, ctor: tc::CtorKind, r: Range) -> Result<(), Why> {
     if kind == tc::AdtKind::Union {
         return Err(Why::Program(Box::from("a union's field may not have a default value (RFC 3681: unions cannot have default field values)"), r));
@@ -3794,10 +3869,7 @@ impl<'n> Store<'n> {
         site: Option<super::anon::HeadSite<'_>>,
         alloc: Alloc<'static>,
     ) -> blaze_own::String<Alloc<'static>> {
-        match site {
-            Some(s) => blaze_own::format_in!(alloc, "field default {vi}.{j}: {ty_text} = {value_text} @{}:{}:{}", s.line, s.col, s.file.unwrap_or("")),
-            None => blaze_own::format_in!(alloc, "field default {vi}.{j}: {ty_text} = {value_text}"),
-        }
+        field_default_label_with_site(vi, j, ty_text, value_text, site, alloc)
     }
 
     fn record_default_member_name(
@@ -6123,7 +6195,7 @@ impl<'n> Store<'n> {
                 let dk = keys
                     .member(ck, MemberKind::Anon, label.as_str())
                     .map_err(|c| Why::Program(format!("{c}").into_boxed_str(), r))?;
-                let src = blaze_own::format_in!(alloc, "const _: {ty_text} = {value_text};");
+                let src = field_default_decl(ty_text, value_text, alloc);
                 let text: &'n str = self.locals.keep_text(src.as_str());
                 let ty_prefix = "const _: ".len();
                 let val_prefix = ty_prefix + ty_text.len() + " = ".len();
