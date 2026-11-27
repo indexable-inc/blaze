@@ -714,3 +714,44 @@ fn extensions_and_cfg_atoms_cells_stand_on_private_fn_and_move_on_own_change() {
     let both_ext = lookup(WITH_UNIQ_RECORDS, &|krate| NameCell::Extensions { krate });
     assert!(both_ext.is_some() && both_ext != uniq_ext, "adding #![blaze::records] moves Extensions cell");
 }
+
+#[test]
+fn exports_cell_is_absent_without_exports_and_moves_only_on_exported_fns() {
+    const BASE: &str = "#![no_core]\npub fn a() {}\nunsafe extern \"C\" { fn ext(); }\n";
+    const WITH_PRIV: &str = "#![no_core]\npub fn a() {}\nfn priv_helper() {}\nunsafe extern \"C\" { fn ext(); }\n";
+    const WITH_NO_MANGLE: &str = "#![no_core]\n#[unsafe(no_mangle)] pub unsafe extern \"C\" fn f() {}\n";
+    const WITH_NO_MANGLE_AND_PRIV: &str = "#![no_core]\n#[unsafe(no_mangle)] pub unsafe extern \"C\" fn f() {}\nfn unrelated() {}\n";
+    const WITH_EXPORT_NAME: &str = "#![no_core]\n#[unsafe(export_name = \"f\")] pub unsafe extern \"C\" fn impl_f() {}\n";
+
+    let lookup = |src: &'static str| -> Option<ContentId> {
+        let solved = super::items_record::solve_one(src, None);
+        let bump = super::SyncFrame::leaked();
+        let g = bump.alloc();
+        let names_bytes = aligned(&encode(solved, g).expect("encode names"), bump);
+        let items_bytes = aligned(&items_encode(solved, g).expect("encode items"), bump);
+        let wholes = [(Section::Items, items_bytes)];
+        let tbl = crate::names_cells::crate_table(solved, names_bytes, items_bytes, &wholes, bump).expect("crate_table");
+        let cell = NameCell::Exports { krate: solved.key.prefix() };
+        let table_val = seen_in(&tbl, cell.key()).expect("seen_in");
+        let record = NamesRecord::open(Verified::check(names_bytes).expect("verify names"));
+        let mut items = crate::items_record::ItemsRecord::open(items_bytes, g).expect("open items");
+        items.use_solved_texts(solved, bump);
+        let read = |of: TextOf<'_>| -> Option<&str> {
+            match of {
+                TextOf::File { index: 0, .. } => Some(src),
+                _ => None,
+            }
+        };
+        let rec_val = seen_by_record(&record, Some((&items, &read)), &wholes, cell).expect("seen_by_record");
+        assert_eq!(table_val, rec_val, "crate_table and seen_by_record disagree on Exports");
+        table_val
+    };
+
+    assert_eq!(lookup(BASE), None, "crate with only extern decl has absent Exports cell");
+    assert_eq!(lookup(WITH_PRIV), None, "adding private fn keeps Exports cell absent");
+    let d1 = lookup(WITH_NO_MANGLE);
+    assert!(d1.is_some(), "#[unsafe(no_mangle)] fn defines Exports cell");
+    assert_eq!(lookup(WITH_NO_MANGLE_AND_PRIV), d1, "adding unrelated private fn must not move Exports cell");
+    let d2 = lookup(WITH_EXPORT_NAME);
+    assert!(d2.is_some() && d2 != d1, "changing exported fn to #[export_name] must move Exports cell");
+}

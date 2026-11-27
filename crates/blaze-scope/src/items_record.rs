@@ -98,7 +98,11 @@ const MAGIC: [u8; 4] = *b"BZIT";
 /// 18: macro rows keep `dollar_crate` (token-mark-3: 32-byte `CrateItemKey` + `HAS_DOLLAR_CRATE`
 /// flag; `MACRO_ROW` = 104 bytes) so generated `macro_rules!`/`macro` definitions preserve another
 /// crate's `$crate`; a version-17 record is refused the same way.
-const VERSION: u32 = 18;
+/// 19: item flags keep `EXPORT_NO_MANGLE` (`1 << 5`) and `EXPORT_NAME` (`1 << 6`) for non-extern
+/// function items whose signature head mentions `no_mangle` or `export_name` so `NameCell::Exports`
+/// and `export_shim` scan only the in-memory `meta` column without opening unrelated files; a
+/// version-18 record is refused the same way.
+const VERSION: u32 = 19;
 const KEY_TAIL: usize = 24;
 const ALIGN: usize = 16;
 const HEADER: usize = 256;
@@ -166,6 +170,10 @@ const CTOR_OR_WRITTEN_BY: u8 = 1 << 2;
 const FOREIGN: u8 = 1 << 3;
 /// Item only: defined inside a `#![blaze::sans_io]` crate, module file, or inline `mod` block.
 const SANS_IO: u8 = 1 << 4;
+/// Item only: function outside an `extern` block whose signature head mentions `no_mangle`.
+const EXPORT_NO_MANGLE: u8 = 1 << 5;
+/// Item only: function outside an `extern` block whose signature head mentions `export_name`.
+const EXPORT_NAME: u8 = 1 << 6;
 
 // Impl marks.
 const HAS_TRAIT: u8 = 1;
@@ -1333,6 +1341,15 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             if any_file_mentions_sans_io && item_in_sans_io_scope(names, *key, it.module) {
                 flags |= SANS_IO;
             }
+            if detail.kind() == ItemKind::Function && foreign.is_none() {
+                let sig_head = crate::names_cells::module_head(it.text);
+                if sig_head.contains("no_mangle") {
+                    flags |= EXPORT_NO_MANGLE;
+                }
+                if sig_head.contains("export_name") {
+                    flags |= EXPORT_NAME;
+                }
+            }
             let abi = match foreign {
                 Some(abi) => {
                     flags |= FOREIGN;
@@ -1961,6 +1978,10 @@ pub struct ItemIdentity<'a> {
     /// Whether this item sits inside a `#![blaze::sans_io]` crate, module file, or inline `mod`
     /// block (computed once during solve, covered by `NameCell::Item`, zero whole-crate reads).
     pub sans_io: bool,
+    /// Whether this item is a non-extern function whose signature head mentions `no_mangle`.
+    pub export_no_mangle: bool,
+    /// Whether this item is a non-extern function whose signature head mentions `export_name`.
+    pub export_name: bool,
 }
 
 /// A member of a trait or an impl.
@@ -2980,7 +3001,31 @@ impl<'a> ItemsRecord<'a> {
             foreign: if flags & FOREIGN != 0 { Some(self.str_at("an item's block ABI", c.abi_at.get_u32(i), c.abi_len.get_u32(i))?) } else { None },
             lifetimes: lifetimes_of(lifetimes),
             sans_io: flags & SANS_IO != 0,
+            export_no_mangle: flags & EXPORT_NO_MANGLE != 0,
+            export_name: flags & EXPORT_NAME != 0,
         }))
+    }
+
+    /// Visits every function item outside an `extern` block whose signature head mentions
+    /// `no_mangle` or `export_name`, scanning only the in-memory `meta` column (zero file reads).
+    pub fn each_export_candidate(&self, each: &mut dyn FnMut(ItemKey, Option<&'a str>, bool, bool)) -> Result<(), ItemsRecordError> {
+        let c = self.item_cols;
+        let mask = u64::from(EXPORT_NO_MANGLE | EXPORT_NAME) << 24;
+        for i in 0..self.items() {
+            let meta = c.meta.get(i);
+            if meta & mask == 0 {
+                continue;
+            }
+            let flags = u8::try_from((meta >> 24) & 0xff).unwrap_or(0);
+            let name_len = u32::try_from(meta & 0xffff).unwrap_or(0);
+            let name = if flags & NAMED != 0 {
+                Some(self.str_at("an item's name", c.name_at.get_u32(i), name_len)?)
+            } else {
+                None
+            };
+            each(self.item_key(i), name, flags & EXPORT_NO_MANGLE != 0, flags & EXPORT_NAME != 0);
+        }
+        Ok(())
     }
 
     pub fn identity(&self, key: ItemKey) -> Result<Option<ItemIdentity<'a>>, ItemsRecordError> {

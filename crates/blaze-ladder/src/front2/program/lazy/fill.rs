@@ -552,7 +552,12 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let panic_entry = crate::front2::panic_entry::declares(self.front.names, &self.store, key, alloc).map_err(local).map_err(&refuse)?;
         let alloc_shim = crate::front2::alloc_shim::declares(self.front.names, &self.store, key, alloc)
             .map_err(|why| refuse(Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.detail() }))?;
-        let bound = seam_rules::bound_decl_row(self.front.names, &self.store, key, panic_entry, alloc_shim, &path).map_err(&refuse)?;
+        let export_def = if !panic_entry && alloc_shim.is_none() && foreign.is_some() && !in_container {
+            self.bind_export(None, key).map_err(&refuse)?
+        } else {
+            None
+        };
+        let bound = seam_rules::bound_decl_row(self.front.names, &self.store, key, panic_entry, alloc_shim, export_def.is_some(), &path).map_err(&refuse)?;
         // A call of an allocator declaration is made with the ABI of the fn it runs (front_end.rs
         // `fn_abi`), which the builder asks at the call, before that fn is called: its head is
         // made here, with the declaration's row (no check of the caller made it: the caller
@@ -563,6 +568,12 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         {
             let (_, want) = self.target_of(default)?;
             self.make_want(want, default, "row (an allocator declaration's bound fn)")?;
+        }
+        if let Some(def) = export_def
+            && !self.store.fns.contains_key(&def)
+        {
+            let (_, want) = self.target_of(def)?;
+            self.make_want(want, def, "row (an extern declaration's exported Rust fn)")?;
         }
         let (kind, symbol) = if let Some(bound) = bound {
             bound

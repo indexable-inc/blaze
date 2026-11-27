@@ -222,7 +222,7 @@ crates/blaze-scope/src/body_scope.rs	MAGIC	none
 crates/blaze-scope/src/body_scope/merged.rs	MERGED_VERSION	none
 crates/blaze-scope/src/cells/groups.rs	MAGIC	none
 crates/blaze-scope/src/items_record.rs	MAGIC	none
-crates/blaze-scope/src/items_record.rs	VERSION	test previous_items_version_13_is_rejected
+crates/blaze-scope/src/items_record.rs	VERSION	test previous_items_version_18_is_rejected
 crates/blaze-scope/src/names_record.rs	MAGIC	none
 crates/blaze-scope/src/names_record.rs	VERSION	none
 crates/blaze-scope/src/scope_record.rs	MAGIC	none

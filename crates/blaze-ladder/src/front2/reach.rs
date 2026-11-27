@@ -656,12 +656,18 @@ pub fn reach_all<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, starts: V
                 None => match crate::panic_strategy::of_program(r.names) {
                     Ok(panic) => match super::internal_symbol::reached(r, k, panic, alloc) {
                         Some(bound) => bound,
-                        None => super::panic_entry::reached(r, k, alloc),
+                        None => match super::panic_entry::reached(r, k, alloc) {
+                            (Reached::NoBody, None) => super::export_shim::reached(r, k, alloc).unwrap_or((Reached::NoBody, None)),
+                            other => other,
+                        },
                     },
                     Err(why) if super::internal_symbol::declares(r.names, &*r.store, k, alloc).is_ok_and(|d| d.is_some()) => {
                         (Reached::Failed { class: why.class().into(), detail: why.to_string().into_boxed_str(), refusal: None }, None)
                     }
-                    Err(_) => super::panic_entry::reached(r, k, alloc),
+                    Err(_) => match super::panic_entry::reached(r, k, alloc) {
+                        (Reached::NoBody, None) => super::export_shim::reached(r, k, alloc).unwrap_or((Reached::NoBody, None)),
+                        other => other,
+                    },
                 },
             };
             queue.extend(callee.map(|h| (h, None)));
