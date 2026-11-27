@@ -30,10 +30,10 @@ use crate::view::{
 };
 
 // =============================================================================
-// Fleet Hub Palette Tokens (harmonized with `ix.dev/blaze` charcoal)
+// Fleet Hub Palette Tokens (over the Ghostty-matched `theme` greys)
 // =============================================================================
 
-const CARD_BG: [f32; 4] = theme::rgb(0x18, 0x18, 0x1a);
+const CARD_BG: [f32; 4] = theme::BG_CHIP;
 const WAITING_AMBER: [f32; 4] = theme::rgb(0xe5, 0xb5, 0x67);
 const WAITING_BG: [f32; 4] = theme::rgba(0xe5, 0xb5, 0x67, 0.14);
 const WAITING_BORDER: [f32; 4] = theme::rgba(0xe5, 0xb5, 0x67, 0.36);
@@ -2010,7 +2010,7 @@ fn layout_agent_hub_inner(
                 right_edge,
                 box_y1,
                 7.0,
-                theme::rgb(0x16, 0x16, 0x19),
+                theme::BG_POPUP,
                 1.0,
                 PRIMARY_BORDER,
                 right_clip,

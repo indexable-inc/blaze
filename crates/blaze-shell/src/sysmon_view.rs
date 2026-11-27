@@ -37,10 +37,10 @@ const FOOTER_GAP: f32 = 6.0;
 const FOOTER_H: f32 = 24.0;
 const PAD_Y: f32 = 10.0;
 
-// Harmonized telemetry semantic palette over `ix.dev/blaze` warm charcoal (`#101011` / `#141415`).
-const CARD_BG: [f32; 4] = theme::rgb(0x18, 0x18, 0x1a);
+// Telemetry semantic palette over the Ghostty-matched `#1e1e1e` canvas (`theme`).
+const CARD_BG: [f32; 4] = theme::BG_CHIP;
 const PLOT_BG: [f32; 4] = theme::rgba(0x0b, 0x0b, 0x0d, 0.72);
-const TABLE_HEAD_BG: [f32; 4] = theme::rgba(0x1b, 0x1b, 0x1e, 0.90);
+const TABLE_HEAD_BG: [f32; 4] = theme::with_alpha(theme::BG_TRACK, 0.90);
 const ZEBRA_BG: [f32; 4] = theme::rgba(0xff, 0xff, 0xff, 0.016);
 const ROW_SELECTED_BG: [f32; 4] = theme::rgba(0x3a, 0x62, 0xa8, 0.24);
 
@@ -1343,7 +1343,7 @@ fn draw_process_table(
     let scrollbar_w = if show_scrollbar { 8.0 } else { 0.0 };
 
     // Table container frame
-    scene.round_rect(x0, y0, x1, y1, 8.0, theme::rgb(0x13, 0x13, 0x15), 1.0, theme::LINE, clip_id);
+    scene.round_rect(x0, y0, x1, y1, 8.0, theme::BG_SURFACE, 1.0, theme::LINE, clip_id);
     let tclip = intersect_clip(scene, clip_id, x0 + 1.0, y0 + 1.0, x1 - 1.0, y1 - 1.0, 7.0);
 
     // Responsive column geometry
@@ -1649,7 +1649,7 @@ fn draw_process_table(
             track_x1,
             thumb_y0 + thumb_h,
             2.0,
-            theme::rgba(0xeb, 0xea, 0xe6, 0.25),
+            theme::with_alpha(theme::INK_1, 0.25),
             0.0,
             [0.0; 4],
             tclip,

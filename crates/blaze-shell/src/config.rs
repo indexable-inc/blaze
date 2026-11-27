@@ -11,7 +11,7 @@ use std::time::UNIX_EPOCH;
 
 use blaze_own::Alloc;
 pub use blaze_shell_config::{
-    CompletionSpecOverride, NamedDesc, STARTER_CONFIG, SymbolRule, UserConfig,
+    AltScreenPlacement, CompletionSpecOverride, NamedDesc, STARTER_CONFIG, SymbolRule, UserConfig,
     symbol_cluster_count,
 };
 
