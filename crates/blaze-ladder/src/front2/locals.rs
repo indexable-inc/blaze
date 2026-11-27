@@ -765,7 +765,7 @@ impl<'n> Locals<'n> {
                         rows.push(Row { scope: s as u32, kind, name: d.name, key, range, path: &[], abs: false, first_mark: None, module: None });
                         let ck = keys.local(key, kind).map_err(HeadError::Key)?;
                         self.heads.insert(ck, LocalHead { lib: key, kind, text: d.text, module: at.module, names_at, enclosing: at.owner, scope: s as u32, range, copied: from.is_none(), marks });
-                        self.foreign.insert(ck, LocalForeign { kind: d.kind, abi, safe: d.safe });
+                        self.foreign.insert(ck, LocalForeign { kind: d.kind, abi, safe: d.safe, wasm_import: d.wasm_import });
                     }
                     continue;
                 }

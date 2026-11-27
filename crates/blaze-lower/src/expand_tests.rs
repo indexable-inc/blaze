@@ -1835,3 +1835,99 @@ fn expr_macro_expansion_strips_single_trailing_semicolon_matching_rustc() {
     assert_external_syntax_error("const item", "() => { const X: i32 = 1; }", "fn f() { let _ = m!(); }");
     assert_external_syntax_error("struct item", "() => { struct S; }", "fn f() { let _ = m!(); }");
 }
+
+/// An item macro (including nested item macros) invoked inside a Rust 2015 `trait { ... }` block
+/// preserves `ItemContext::Trait` across `driver.rs`'s expansion jobs so anonymous method
+/// parameters (`fn hash_word(&mut self, Self);`) lower cleanly with `ty: Some(Self)`, while the
+/// same macro invoked at top level still lowers under `ItemContext::TopLevel` and emits a syntax
+/// diagnostic.
+#[test]
+fn trait_macro_expansion_preserves_rust_2015_trait_context() {
+    use crate::{ItemContext, Outcome, Param, SelfKind, Sink, What, head};
+
+    struct Capture {
+        fn_sigs: u32,
+        clean_anon_self: u32,
+        syntax_diag_no_ty: u32,
+    }
+    impl Sink for Capture {
+        fn record(&mut self, at: &crate::ItemRef<'_>, what: What, key: blaze_id::ContentId, outcome: Outcome<'_, '_>) {
+            if what != What::Signature || !matches!(at.item.detail, blaze_surface::ItemDetail::Fn { .. }) {
+                return;
+            }
+            self.fn_sigs += 1;
+            let Outcome::Record { view, .. } = outcome else { panic!("expected signature record") };
+            let rows = view.rows(view.list(head::PARAMS)).expect("params");
+            let p0 = Param::decode(rows[0]).expect("p0");
+            let p1 = Param::decode(rows[1]).expect("p1");
+            assert_eq!(p0.self_kind, SelfKind::Ref(crate::Mutbl::Mut));
+            let has_syntax = view.diags().any(|d| d.is_ok_and(|d| d.kind == crate::DiagKind::Syntax));
+            if !has_syntax && p1.pat.is_none() && p1.ty.is_some() {
+                let expected = crate::signature_key(
+                    at.item.signature.get(at.item_text()).unwrap_or(at.item_text()),
+                    Edition::E2015,
+                    false,
+                    ItemContext::Trait,
+                );
+                assert_eq!(key, expected, "expanded trait method key must encode ItemContext::Trait");
+                self.clean_anon_self += 1;
+            } else if has_syntax && p1.ty.is_none() {
+                let expected = crate::signature_key(
+                    at.item.signature.get(at.item_text()).unwrap_or(at.item_text()),
+                    Edition::E2015,
+                    false,
+                    ItemContext::TopLevel,
+                );
+                assert_eq!(key, expected, "top-level expanded fn key must encode ItemContext::TopLevel");
+                self.syntax_diag_no_ty += 1;
+            }
+        }
+
+        fn refused(&mut self, _item: &crate::ItemRef<'_>, _refusal: crate::Refusal<'_>) {}
+    }
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let at_2015 = DefAt { edition: Edition::E2015, ..at() };
+    let outer_stream = lex("() => { inner!(); }", Edition::E2015, alloc).expect("outer lex");
+    let inner_stream = lex("() => { fn hash_word(&mut self, Self); }", Edition::E2015, alloc).expect("inner lex");
+    let outer_def = MacroDefinition::rules(outer_stream, at_2015);
+    let inner_def = MacroDefinition::rules(inner_stream, at_2015);
+    let rules = [
+        ("outer", prepare(&outer_def).expect("outer prepare")),
+        ("inner", prepare(&inner_def).expect("inner prepare")),
+    ];
+
+    // Positive control: nested macro inside a Rust 2015 trait preserves `ItemContext::Trait`.
+    let mut expander = ByName::new(&rules, at_2015, Host, alloc);
+    let mut cap = Capture { fn_sigs: 0, clean_anon_self: 0, syntax_diag_no_ty: 0 };
+    let stats = crate::lower_file(
+        "trait HashWord { outer!(); }",
+        Edition::E2015,
+        &mut Unix,
+        &mut crate::NoModule,
+        &mut expander,
+        &mut cap,
+        alloc,
+    );
+    assert_eq!(stats.macro_calls_expanded, 2);
+    assert_eq!(cap.fn_sigs, 1);
+    assert_eq!(cap.clean_anon_self, 1);
+    assert_eq!(cap.syntax_diag_no_ty, 0);
+
+    // Negative control: same nested macro at top level stays `ItemContext::TopLevel`.
+    let mut top_expander = ByName::new(&rules, at_2015, Host, alloc);
+    let mut top_cap = Capture { fn_sigs: 0, clean_anon_self: 0, syntax_diag_no_ty: 0 };
+    let top_stats = crate::lower_file(
+        "outer!();",
+        Edition::E2015,
+        &mut Unix,
+        &mut crate::NoModule,
+        &mut top_expander,
+        &mut top_cap,
+        alloc,
+    );
+    assert_eq!(top_stats.macro_calls_expanded, 2);
+    assert_eq!(top_cap.fn_sigs, 1);
+    assert_eq!(top_cap.clean_anon_self, 0);
+    assert_eq!(top_cap.syntax_diag_no_ty, 1);
+}

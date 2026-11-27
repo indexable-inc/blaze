@@ -1173,3 +1173,117 @@ mod b { #[unsafe(export_name = "dup_sym")] pub unsafe extern "C" fn other() -> i
         assert!(wd.contains("dup_sym") && wd.contains("defined twice"), "unexpected refusal detail: {wd}");
     });
 }
+
+#[test]
+fn wasm_import_module_and_mismatched_arity_externs_stay_foreign() {
+    on_checker_stack(|| {
+        let caller: &'static str = r#"#![feature(no_core)]
+#![no_core]
+#[link(wasm_import_module = "blaze_seed")]
+unsafe extern "C" {
+    fn unlink(path: *const u8, len: usize) -> i32;
+    fn same_arity_host(x: i32) -> i32;
+}
+unsafe extern "C" {
+    fn mismatch_arity(a: i32, b: i32) -> i32;
+    fn matched_rt(x: i32) -> i32;
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn main() -> i32 {
+    #[link(wasm_import_module = "wasi_snapshot_preview1")]
+    unsafe extern "C" {
+        fn local_host(x: i32) -> i32;
+    }
+    let p = 0usize as *const u8;
+    unsafe {
+        unlink(p, 0) + same_arity_host(1) + local_host(2) + mismatch_arity(3, 4) + matched_rt(5)
+    }
+}
+"#;
+        let provider: &'static str = r#"#![feature(no_core)]
+#![no_core]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn unlink(_path: *const u8) -> i32 { 10 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn same_arity_host(_x: i32) -> i32 { 20 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn local_host(_x: i32) -> i32 { 30 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn mismatch_arity(_a: i32) -> i32 { 40 }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn matched_rt(x: i32) -> i32 { x + 50 }
+"#;
+        let frame = Frame::new(blaze_mem::tag::Tag::Infer).expect("fixture frame");
+        let a = blaze_own::testing::heap().alloc();
+        let files = [SourceFile { path: ROOT, text: caller }];
+        let tc = Toolchain::none(a);
+        let new = NewFront { package: "ladder", edition: "2024", shelf: None, overflow: OverflowChecks::Off };
+        let texts = ProgramTexts::new(&files, ROOT, new, &tc, Panic::Unwind).expect("fixture texts");
+        let user = texts.user();
+        let inputs = Inputs::new(&user, &tc).expect("fixture inputs");
+        let app = inputs.crates()[0];
+        let crates = [
+            CrateInput { deps: &[("provider", 1)], ..app },
+            CrateInput {
+                name: "provider",
+                key: CrateItemKey(ContentId::of("wasm import fixture crate", b"provider")),
+                implicit: blaze_unit_graph::implicit(user.edition, &blaze_unit_graph::UnitKind::Lib),
+                root: "/provider/src/lib.rs",
+                shown_from: "/provider",
+                deps: &[],
+                ..app
+            },
+        ];
+        let roots = [(app.root, caller), (crates[1].root, provider)];
+        let names = resolve_crates(&crates, Sysroot::default(), &FixtureFiles(&roots), &Serial, blaze_own::testing::bump()).expect("fixture names");
+        let lib = |krate, name| names.items(krate).map(|(k, _, _)| k).find(|&k| names.name_of(k) == Some(name)).expect("named item");
+        let main = lib(0, "main");
+        let entry = checker_of(main);
+        let decl_unlink = checker_of(lib(0, "unlink"));
+        let decl_same_arity_host = checker_of(lib(0, "same_arity_host"));
+        let decl_mismatch = checker_of(lib(0, "mismatch_arity"));
+        let decl_matched = checker_of(lib(0, "matched_rt"));
+        let def_matched = checker_of(lib(1, "matched_rt"));
+
+        let whole = Front2Program::new(&names, &frame, &files, a).expect("whole program");
+        let log = frame.alloc(Log::new(&["ladder", "provider"], a));
+        let kept = keep(&names, &frame, a);
+        let records = frame.alloc(Records::new(frame.alloc_slice_copy(&[crates[0].key, crates[1].key]), kept, log, &frame, a));
+        let mut lazy = LazyProgram::from_records(records, &frame, &[0], Some(entry), a).expect("lazy program");
+        lazy.decide_start(blaze_ladder::run::special::MakerStart::ByRule).expect("exported main");
+        let (li, checked) = lazy.check_one(entry).expect("lazy check main").expect("main has a body");
+        let wi = whole.entry().expect("whole main");
+
+        let decl_local_host = *checked
+            .callees
+            .column::<1>()
+            .iter()
+            .find(|&&k| k != decl_unlink && k != decl_same_arity_host && k != decl_mismatch && k != decl_matched)
+            .expect("body-local wasm import callee");
+
+        let check_row = |front: &dyn FrontEnd, key, want_kind, want_sym: &str| {
+            let idx = front.fn_index(key).expect("tabled fn");
+            let f = front.function(idx);
+            assert_eq!((f.kind, f.symbol), (want_kind, want_sym));
+        };
+        // Module-level wasm_import_module (both mismatched and identical arity) stay Foreign.
+        check_row(&whole, decl_unlink, FnKind::Foreign, "unlink");
+        check_row(&lazy, decl_unlink, FnKind::Foreign, "unlink");
+        check_row(&whole, decl_same_arity_host, FnKind::Foreign, "same_arity_host");
+        check_row(&lazy, decl_same_arity_host, FnKind::Foreign, "same_arity_host");
+        // Body-local wasm_import_module stays Foreign even with identical arity.
+        check_row(&whole, decl_local_host, FnKind::Foreign, "local_host");
+        check_row(&lazy, decl_local_host, FnKind::Foreign, "local_host");
+        // Plain extern with mismatched parameter count stays Foreign rather than misbinding.
+        check_row(&whole, decl_mismatch, FnKind::Foreign, "mismatch_arity");
+        check_row(&lazy, decl_mismatch, FnKind::Foreign, "mismatch_arity");
+
+        // Plain extern with matching arity still binds to the same-program Rust export.
+        let mut ground = PortableTys::new_in(a);
+        assert_eq!(whole.resolve(wi, decl_matched, List::EMPTY, &mut ground).expect("whole matched_rt"), (def_matched, List::EMPTY));
+        assert_eq!(lazy.resolve(li, decl_matched, List::EMPTY, &mut ground).expect("lazy matched_rt"), (def_matched, List::EMPTY));
+        check_row(&whole, decl_matched, FnKind::Free, "");
+        check_row(&lazy, decl_matched, FnKind::Free, "");
+        assert!(records.errors().is_empty(), "record reads: {:?}", records.errors());
+    });
+}

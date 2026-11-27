@@ -49,6 +49,60 @@ impl fmt::Display for ToolchainId {
     }
 }
 
+/// The target triple every self-compiled build script and proc-macro targets (`memory64` WASI p1).
+pub const WASM64_TARGET: &str = "wasm64-blaze-wasip1";
+
+/// Target-level cfg atoms applied for [`WASM64_TARGET`] beyond what `ToolchainView::cfg` records
+/// (matching `.cargo/config.toml`'s `[target.wasm64-blaze-wasip1] rustflags`).
+///
+/// `getrandom` 0.3 and 0.4 have no built-in `wasm64` WASI backend and select their `custom`
+/// backend (`__getrandom_v03_custom`), which `library/wasi_rt/src/rt/random.rs` implements over
+/// `wasip1::random_get`.
+pub const WASM64_TARGET_EXTRA_CFGS: &[(&str, Option<&str>)] = &[
+    ("getrandom_backend", Some("custom")),
+];
+
+/// Target-level extra cfg atoms for `triple` (empty for targets that need none).
+pub fn target_extra_cfgs(triple: &str) -> &'static [(&'static str, Option<&'static str>)] {
+    if triple == WASM64_TARGET { WASM64_TARGET_EXTRA_CFGS } else { &[] }
+}
+
+/// The cfg atoms of `triple` from `view` combined with [`target_extra_cfgs`] (deduplicated so a
+/// future toolchain cut that already records an atom never duplicates it). Returns `None` when
+/// `view` was not cut for `triple`.
+pub fn target_cfg<'b>(
+    view: &ToolchainView<'b>,
+    triple: &str,
+) -> Option<impl Iterator<Item = (&'b str, Option<&'b str>)> + use<'b>> {
+    let base = view.cfg(triple)?;
+    let (extra_triple, extra): (&'static str, &'static [(&'static str, Option<&'static str>)]) =
+        if triple == WASM64_TARGET { (WASM64_TARGET, WASM64_TARGET_EXTRA_CFGS) } else { ("", &[]) };
+    let view_copy = *view;
+    let extra_iter = extra.iter().copied().filter(move |&atom| {
+        !view_copy.cfg(extra_triple).is_some_and(|mut it| it.any(|existing| existing == atom))
+    });
+    Some(base.chain(extra_iter))
+}
+
+/// Builds a [`blaze_unit_graph::TargetDesc`] for `triple` from `view`, folding in
+/// [`target_extra_cfgs`] (deduplicated and sorted by `TargetDesc::new`). Returns `None` when
+/// `view` was not cut for `triple`.
+pub fn target_desc<'a>(
+    view: &ToolchainView<'_>,
+    triple: &str,
+    alloc: blaze_own::Alloc<'a>,
+) -> Option<blaze_unit_graph::TargetDesc<'a>> {
+    let atoms = target_cfg(view, triple)?;
+    let mut cfg = blaze_own::Vec::new_in(alloc);
+    for (name, value) in atoms {
+        cfg.push(match value {
+            Some(value) => blaze_unit_graph::CfgAtom::pair(name, value, alloc),
+            None => blaze_unit_graph::CfgAtom::flag(name, alloc),
+        });
+    }
+    Some(blaze_unit_graph::TargetDesc::new(triple, cfg, alloc))
+}
+
 /// The toolchain's library units for `triple` on one side (`for_host`: what build scripts and
 /// proc macros are given), found by their crates' roles; `None` when the manifest has no graph
 /// for the triple or lacks one of the five.

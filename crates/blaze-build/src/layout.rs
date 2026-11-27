@@ -678,6 +678,19 @@ impl Layout {
                 let (ty, signed) = crate::intrinsics::lir(s.prim);
                 Ok(rust_scalar(ty, signed, self.fields != Fields::Primitive))
             }
+            // A niche-encoded single-scalar enum (such as `Result<(), Error>` where
+            // `struct Error(NonZeroI32)` is a plain newtype without `#[repr(transparent)]`, as
+            // in `getrandom 0.3/0.4`'s `extern "Rust"` backend linked against `wasi_rt`'s
+            // `Result<(), NonZeroI32>`) crosses Rust calls as its one scalar register, matching
+            // rustc's `BackendRepr::Scalar` ABI.
+            _ if matches!(self.variants, Variants::Multiple { encoding: TagEncoding::Niche { .. }, .. }) => {
+                if let Some(s) = self.scalar {
+                    let (ty, signed) = crate::intrinsics::lir(s.prim);
+                    Ok(rust_scalar(ty, signed, self.fields != Fields::Primitive))
+                } else {
+                    Ok(Pass::Ref)
+                }
+            }
             _ => Ok(Pass::Ref),
         }
     }
@@ -761,6 +774,48 @@ fn transparent_calls_inherit_only_the_abi_fields_convention() {
     let old = Layout { call_ty: nn, ..*ls.get(row) };
     assert_eq!(old.rust_pass(g.t.view()).unwrap(), Pass::Ref);
     println!("transparent scalar, nullable pointer, two-word and indirect ABI classes verified");
+}
+
+#[cfg(test)]
+#[test]
+fn niche_single_scalar_enum_over_plain_newtype_matches_underlying_scalar_rust_pass() {
+    use self::tests::{F, G, World, lay};
+    use crate::abi::Pass;
+    use blaze_lir::{Ty, func::Ext};
+
+    let transparent = ReprAttrs { transparent: true, ..ReprAttrs::RUST };
+    let mut w = World::default();
+    let nz_wrapper = w.strukt(1, &[F::P(0)], transparent);
+    let plain_err = w.strukt(1, &[F::P(0)], ReprAttrs::RUST);
+    let result = w.def(AdtKind::Enum, 2, &[&[F::P(0)], &[F::P(1)]], ReprAttrs::RUST);
+
+    let mut g = G::new();
+    let i32_t = g.n(PNode::Int(IntTy::I32));
+    let u32_t = g.n(PNode::Uint(UintTy::U32));
+    let unit = g.tuple(&[]);
+    let nz_i32_lo = g.n(PNode::ConstValue { bits: 1, ty: u32_t });
+    let nz_i32_hi = g.n(PNode::ConstValue { bits: u32::MAX as u128, ty: u32_t });
+    let nz_range = g.t.intern_list(&[nz_i32_lo, nz_i32_hi]).unwrap();
+    let nz_i32_pat = g.n(PNode::Pat(i32_t, nz_range));
+    let nz_u32_pat = g.n(PNode::Pat(u32_t, nz_range));
+    let non_zero_i32 = g.adt(nz_wrapper, &[nz_i32_pat]);
+    let non_zero_u32 = g.adt(nz_wrapper, &[nz_u32_pat]);
+    let error_i32 = g.adt(plain_err, &[non_zero_i32]);
+    let error_u32 = g.adt(plain_err, &[non_zero_u32]);
+
+    let res_nz_i32 = g.adt(result, &[unit, non_zero_i32]);
+    let res_err_i32 = g.adt(result, &[unit, error_i32]);
+    let res_err_u32 = g.adt(result, &[unit, error_u32]);
+
+    let mut ls = Layouts::new_in(std::alloc::Global);
+    let want = Pass::Scalar { ty: Ty::I32, ext: Ext::None, agg: true };
+    for ty in [res_nz_i32, res_err_i32, res_err_u32] {
+        let row = lay(&w, &mut g, &mut ls, ty).unwrap();
+        assert_eq!(ls.get(row).rust_pass(g.t.view()).unwrap(), want);
+    }
+    // Control: the plain newtype struct itself stays indirect (`Pass::Ref`).
+    let err_row = lay(&w, &mut g, &mut ls, error_i32).unwrap();
+    assert_eq!(ls.get(err_row).rust_pass(g.t.view()).unwrap(), Pass::Ref);
 }
 
 /// Why a type has no layout.

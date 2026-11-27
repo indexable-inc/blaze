@@ -1609,3 +1609,6 @@ fn takes_outer_hrtb_ref(_x: &OuterHrtbRef) {}
         assert_eq!(life.regions.as_slice(), &[Region::Anon(0), Region::Anon(0), Region::Anon(0)], "alias_hrtb_elide fn_life");
     }
 }
+
+#[path = "anon_trait_params.rs"]
+mod anon_trait_params;
