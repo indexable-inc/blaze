@@ -312,7 +312,13 @@ where
         let Err(slot) = walked.binary_search(&call) else { continue };
         walked.try_insert_slice_shift(slot, &[call]).map_err(|_| LinksError::Alloc)?;
         let at = At::Expansion(call);
-        gather.text(TextOf::Expansion(call), m.text, &m.outline, &|item| entry_of(c, &by_place, &inputs, at, &m.outline, item))?;
+        gather.top_foreign = blaze_scope::items_record::call_foreign_abi(c, call)
+            .ok()
+            .flatten()
+            .is_some_and(|abi| !NO_SYMBOL_ABIS.contains(&abi));
+        let walk = gather.text(TextOf::Expansion(call), m.text, &m.outline, &|item| entry_of(c, &by_place, &inputs, at, &m.outline, item));
+        gather.top_foreign = false;
+        walk?;
         gather.met.reverse();
         expand_met(c, &by_place, &inputs, &mut gather, &mut walked)?;
     }
@@ -1716,5 +1722,108 @@ mod tests {
         assert!(links.decls.is_empty() && links.foreign.is_empty() && links.exports.is_empty());
         // Without per-item scratch rollback, 400 `lower_signature` calls grow `out_frame` by >400 KB.
         assert!(grew < 8 * 1024, "Gather leaked per-item lowering scratch into bump: {grew} bytes");
+    }
+
+    /// Regression test for `wasmtime`'s `#[versioned_link]` inside `unsafe extern "C" { ... }`:
+    /// an attribute proc-macro's input item is skipped by `entry == Entry::Input`, so its expansion
+    /// is walked via `rest` rather than `self.call(...)`. `crate_links` must inherit `top_foreign`
+    /// via `items_record::call_foreign_abi` so the expanded `#[link_name = "..."] fn ...;` is
+    /// recorded in `CrateLinks::foreign`.
+    #[test]
+    fn attr_proc_macro_inside_extern_block_collects_foreign_link_name() {
+        use blaze_expand::{HostAsk, HostError, HostWhy, MacroDefinition, ProcCall, ProcKind, Produced, Reads, TokenOrigin, Transparency, lex};
+        use blaze_id::{ContentId, CrateItemKey};
+        use blaze_scope::graph::Sysroot;
+        use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+        use blaze_scope::task::Serial;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+        const PM: &str = "#[proc_macro_attribute]\npub fn versioned_link(_attr: TokenStream, item: TokenStream) -> TokenStream { item }\n";
+        const USER: &str = "\
+#![no_core]
+macro_rules! wrap { ($($t:tt)*) => { $($t)* }; }
+unsafe extern \"C\" {
+    #[macros::versioned_link]
+    fn wasmtime_libunwind();
+}
+wrap! {
+    unsafe extern \"C\" {
+        #[macros::versioned_link]
+        fn wasmtime_jit_debug_descriptor();
+    }
+}
+pub fn own() {}
+";
+        const RUNNER: CrateItemKey = CrateItemKey(ContentId([9; 32]));
+        struct Runner;
+        impl<'a> SourceTexts<'a> for Runner {
+            fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+                match (krate, path) {
+                    (0, "/user/lib.rs") => Some(USER),
+                    (1, "/macros/lib.rs") => Some(PM),
+                    _ => None,
+                }
+            }
+            fn proc_macro_key(&self, krate: usize) -> Option<CrateItemKey> {
+                (krate == 1).then_some(RUNNER)
+            }
+            fn run_proc_macro<'b>(&self, _: usize, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError> {
+                let refused = HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused };
+                let has_ident = |needle: &str| (0..call.input.tokens().len()).any(|i| call.input.text_at(i) == needle);
+                let text = match (call.kind, def.proc_name()) {
+                    (ProcKind::Attr, Some("versioned_link")) if has_ident("wasmtime_jit_debug_descriptor") => {
+                        "#[link_name = \"wasmtime_jit_debug_descriptor_50_0_1\"] fn wasmtime_jit_debug_descriptor();"
+                    }
+                    (ProcKind::Attr, Some("versioned_link")) => {
+                        "#[link_name = \"wasmtime_libunwind_50_0_1\"] fn wasmtime_libunwind();"
+                    }
+                    _ => return Err(refused),
+                };
+                let tokens = lex(text, Edition::E2021, alloc).map_err(|_| refused)?;
+                let mut origins = AVec::new_in(alloc);
+                origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(Transparency::Transparent)));
+                Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+            }
+        }
+        static FILES: Runner = Runner;
+        let implicit_user = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let implicit_pm = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: true, entry: false };
+        let inputs = [
+            CrateInput {
+                name: "user",
+                key: CrateItemKey(ContentId::of("links_attr_extern_user", b"user")),
+                root: "/user/lib.rs",
+                shown_from: "/user/",
+                edition: Edition::E2024,
+                implicit: implicit_user,
+                features: &[],
+                deps: &[("macros", 1)],
+                cfg: &[],
+                script: None,
+            },
+            CrateInput {
+                name: "macros",
+                key: CrateItemKey(ContentId::of("links_attr_extern_pm", b"macros")),
+                root: "/macros/lib.rs",
+                shown_from: "/macros/",
+                edition: Edition::E2024,
+                implicit: implicit_pm,
+                features: &[],
+                deps: &[],
+                cfg: &[],
+                script: None,
+            },
+        ];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let erased = Erased::new(&frame);
+        let names = resolve_crates(&inputs, Sysroot::default(), &FILES, &Serial, erased.bump()).expect("resolve");
+        let out_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("out frame");
+        let out_erased = Erased::new(&out_frame);
+        let links = scope_links(names.krate(0), out_erased.bump()).expect("scope_links");
+        assert_eq!(
+            links.foreign.as_slice(),
+            ["wasmtime_jit_debug_descriptor_50_0_1", "wasmtime_libunwind_50_0_1"],
+            "both attribute-macro-expanded foreign fns must be collected as native foreign symbols"
+        );
     }
 }

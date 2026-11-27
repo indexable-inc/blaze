@@ -496,6 +496,20 @@ pub fn foreign_abi<'t>(names: &CrateNames<'t>, mut at: At, mut idx: ItemIndex, i
     Ok(None)
 }
 
+/// The ABI of the `extern` block enclosing macro call `call` in `names`, if any (walking out
+/// through enclosing macro calls via `CallSrc::place`). Used by `blaze-ladder`'s native-link
+/// collector (`front2/links.rs`) when walking attribute-macro expansions whose input item was
+/// skipped inside an `extern` block (e.g. `wasmtime`'s `#[versioned_link]`).
+pub fn call_foreign_abi<'t>(names: &CrateNames<'t>, call: ItemKey) -> Result<Option<&'t str>, ItemsRecordError> {
+    let Some(place) = names.tables.calls.get(&call).and_then(|src| src.place) else {
+        return Ok(None);
+    };
+    let Some(parent_at) = place.text else {
+        return Ok(None);
+    };
+    foreign_abi(names, parent_at, place.item, call)
+}
+
 fn body_holds_items(detail: ItemDetail) -> bool {
     matches!(
         detail,

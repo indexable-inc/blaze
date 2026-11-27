@@ -6561,3 +6561,220 @@ fn main() {}
         );
     }
 }
+
+/// End-to-end `front2` + `blaze-flow-lower` + `blaze-flow::check` regression & soundness tests
+/// for the workspace `CalleeValueUnknown` shapes:
+/// 1. `scripts/src/bin/ambient/{heap,reach}.rs`: `|pick: fn(&(Vec<u32>, Vec<u32>)) -> &Vec<u32>|`
+///    (shared `WrittenRegion::Late(0)` on input 0 & output), with a borrow-conflict negative.
+/// 2. `crates/blaze-emit/src/sota/isel.rs`: `|make: fn(&mut Builder<Alloc<'static>, Full>, u32) -> u32|`
+///    (`WrittenRegion::Static` on nested ADT lifetime), with a local-borrow negative.
+/// 3. `crates/blaze-own/src/tests/shapes.rs`: `written(|put| write_with(&mut |s| put(s)))`
+///    (unannotated closure param recovering `&mut dyn FnMut(&str)` from `written`'s `FnOnce` clause).
+/// 4. `crates/blaze-ids/src/crc32c.rs`: `for (_name, path) in paths() { path(0, b"123"); }`
+///    (desugared `for`-loop tracing `Iterator::next(&mut iter)` -> `IntoIterator::into_iter(paths())`).
+#[cfg(test)]
+mod callee_value_end_to_end_tests {
+    use blaze_id::{ContentId, CrateItemKey};
+    use blaze_scope::graph::Sysroot;
+    use blaze_scope::resolve::{CrateInput, SourceTexts, resolve_crates};
+    use blaze_scope::task::Serial;
+    use blaze_surface::Edition;
+    use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+    use crate::front2::project::{BodyRef, ProjectWorld};
+    use crate::refusal::SourceFile;
+
+    const SOURCE: &str = r#"#![no_core]
+
+#[lang = "sized"]
+pub trait Sized {}
+#[lang = "copy"]
+pub trait Copy {}
+#[lang = "pointee_sized"]
+pub trait PointeeSized {}
+#[lang = "meta_sized"]
+pub trait MetaSized: PointeeSized {}
+#[lang = "unsize"]
+pub trait Unsize<T: ?Sized> {}
+#[lang = "coerce_unsized"]
+pub trait CoerceUnsized<T: ?Sized> {}
+impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a mut U> for &'a mut T {}
+impl<'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'a T {}
+#[lang = "fn_once"]
+pub trait FnOnce<Args: Tuple> {
+    #[lang = "fn_once_output"]
+    type Output;
+    extern "rust-call" fn call_once(self, args: Args) -> Self::Output;
+}
+#[lang = "fn_mut"]
+pub trait FnMut<Args: Tuple>: FnOnce<Args> {
+    extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;
+}
+#[lang = "fn"]
+pub trait Fn<Args: Tuple>: FnMut<Args> {
+    extern "rust-call" fn call(&self, args: Args) -> Self::Output;
+}
+#[lang = "tuple_trait"]
+pub trait Tuple {}
+#[lang = "Option"]
+pub enum Option<T> {
+    #[lang = "None"]
+    None,
+    #[lang = "Some"]
+    Some(T),
+}
+pub trait Iterator {
+    type Item;
+    #[lang = "next"]
+    fn next(&mut self) -> Option<Self::Item>;
+}
+pub trait IntoIterator {
+    type Item;
+    type IntoIter: Iterator<Item = Self::Item>;
+    #[lang = "into_iter"]
+    fn into_iter(self) -> Self::IntoIter;
+}
+pub struct List<T>(T);
+pub struct ListIter<T>(Option<T>);
+impl<T> Iterator for ListIter<T> {
+    type Item = T;
+    fn next(&mut self) -> Option<T> {
+        Option::None
+    }
+}
+impl<T> IntoIterator for List<T> {
+    type Item = T;
+    type IntoIter = ListIter<T>;
+    fn into_iter(self) -> ListIter<T> {
+        ListIter(Option::Some(self.0))
+    }
+}
+
+struct Bag(u32);
+struct Alloc<'a>(&'a u8);
+struct Full;
+struct Builder<A, M>(A, M);
+
+fn tally(b: &Bag) -> u32 {
+    b.0
+}
+
+fn mutate(b: &mut Bag) {
+    b.0 = 9;
+}
+
+fn ambient_pick_ok(pair: &(Bag, Bag)) -> u32 {
+    let totals = |pick: fn(&(Bag, Bag)) -> &Bag| -> u32 {
+        tally(pick(pair))
+    };
+    totals(|p| &p.0)
+}
+
+fn ambient_pick_conflict_bad() -> u32 {
+    let run = |pick: fn(&(Bag, Bag)) -> &Bag| -> u32 {
+        let mut pair = (Bag(1), Bag(2));
+        let r = pick(&pair);
+        mutate(&mut pair.0);
+        tally(r)
+    };
+    run(|p| &p.0)
+}
+
+fn isel_static_arg_ok(b: &mut Builder<Alloc<'static>, Full>) -> u32 {
+    let run = |make: fn(&mut Builder<Alloc<'static>, Full>, u32) -> u32| -> u32 {
+        make(b, 7)
+    };
+    run(|_b, v| v)
+}
+
+fn isel_static_arg_local_bad() -> u32 {
+    let local = 5u8;
+    let mut b = Builder(Alloc(&local), Full);
+    let run = |make: fn(&mut Builder<Alloc<'static>, Full>, u32) -> u32| -> u32 {
+        make(&mut b, 7)
+    };
+    run(|_b, v| v)
+}
+
+fn written(write: impl FnOnce(&mut dyn FnMut(&str))) {
+    let _ = write;
+}
+
+fn write_with(sink: &mut dyn FnMut(&str)) {
+    sink("ok");
+}
+
+fn shapes_written_ok() {
+    written(|put| write_with(&mut |s| put(s)));
+}
+
+fn step_a(acc: u32, _bytes: &[u8]) -> u32 {
+    acc
+}
+
+fn paths() -> List<(&'static str, fn(u32, &[u8]) -> u32)> {
+    List(("a", step_a))
+}
+
+fn crc_for_loop_ok() -> u32 {
+    let mut total = 0u32;
+    for (_name, path) in paths() {
+        total = path(total, b"123456789");
+    }
+    total
+}
+"#;
+
+    struct OneFile<'a>(&'a str);
+    impl<'a> SourceTexts<'a> for OneFile<'a> {
+        fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+            (krate == 0 && path == "/cval/src/lib.rs").then_some(self.0)
+        }
+    }
+
+    #[test]
+    fn callee_value_workspace_patterns_end_to_end() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("checker frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let input = CrateInput {
+            name: "cval",
+            key: CrateItemKey(ContentId::of("callee_value_e2e_test", b"cval")),
+            root: "/cval/src/lib.rs",
+            shown_from: "/cval/",
+            edition: Edition::E2024,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2024), proc_macro: false, entry: false },
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let names = resolve_crates(&[input], Sysroot::default(), &OneFile(SOURCE), &Serial, erased.bump()).expect("resolve");
+        let sources = [SourceFile { path: "src/lib.rs", text: SOURCE }];
+        let mut world = ProjectWorld::new(&names, &frame, &sources, alloc).expect("front2");
+        let bodies = world.bodies(alloc);
+        let item = |fn_name: &str| {
+            bodies
+                .iter()
+                .find_map(|&(body, _)| {
+                    let BodyRef::Free(key) = body else { return None };
+                    (names.item_text(key).and_then(|item| item.name) == Some(fn_name)).then_some(body)
+                })
+                .unwrap_or_else(|| panic!("missing fixture fn {fn_name}"))
+        };
+
+        for name in ["ambient_pick_ok", "isel_static_arg_ok", "shapes_written_ok", "crc_for_loop_ok"] {
+            let (types, borrows) = world.check_borrows(item(name), alloc);
+            assert!(types.is_clean(), "{name} types: {types:?}");
+            assert!(borrows.is_clean(), "{name} borrows: {borrows:?}");
+        }
+
+        for bad in ["ambient_pick_conflict_bad", "isel_static_arg_local_bad"] {
+            let (types, borrows) = world.check_borrows(item(bad), alloc);
+            assert!(types.is_clean(), "{bad} types: {types:?}");
+            assert!(borrows.refused.is_none(), "{bad} must not refuse: {borrows:?}");
+            assert!(!borrows.findings.is_empty(), "{bad} must report a borrow/lifetime error: {borrows:?}");
+        }
+    }
+}

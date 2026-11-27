@@ -1762,3 +1762,207 @@ fn closure_dyn_fn_param_elided_wrapper_positive_and_soundness_negatives() {
         bad_fnptr.err()
     );
 }
+
+/// Regression & soundness test for `scripts/src/bin/ambient/{heap,reach}.rs`:
+/// `|pick: fn(&S) -> &S| { let mut s = mk(); let r = pick(&s); ... use_s(r); }`
+/// - POSITIVE: shared `WrittenRegion::Late(0)` on input 0 and output lowers cleanly and passes
+///   `blaze_flow::check`.
+/// - NEGATIVE 1 (borrow soundness): mutating `s` (`mut_s(&mut s)`) while `r = pick(&s)` is still
+///   live before `use_s(r)` MUST report a borrow conflict.
+/// - NEGATIVE 2 (unbound output): missing `WrittenRegion::Late` on output MUST be refused
+///   (`CalleeValueUnknown`).
+/// - NEGATIVE 3 (`WrittenRegion::Named`): named lifetime on `fn(&'a S) -> &'a S` MUST be refused
+///   (`CalleeValueUnknown`).
+#[test]
+fn closure_fn_ptr_param_shared_late_return_and_borrow_soundness() {
+    use blaze_typeck::{ClosureParamRegion, WrittenRegion};
+
+    let mut items = None;
+    let w = world_with(|fx, st, rs, unit| {
+        let rms = fx.r(Mutbl::Mut, st);
+        let fn_list = fx.list(&[rs, rs]);
+        let fn_ptr = fx.ty(PNode::FnPtr(fn_list, FnPtrHeader::RUST));
+        let mk = fx.func("mk", 0, &[], st, no_clauses());
+        let use_s = fx.func("use_s", 0, &[rs], unit, no_clauses());
+        let mut_s = fx.func("mut_s", 0, &[rms], unit, no_clauses());
+        let f = fx.func("f", 0, &[], unit, no_clauses());
+        items = Some((fn_ptr, rms, mk, use_s, mut_s, f));
+    });
+    let (fn_ptr, rms, mk, use_s, mut_s, f) = items.expect("declared");
+    let mut facts = Lane::of(&w);
+    facts.wide.add(mk, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.st, slots: &[] });
+    facts.wide.add(use_s, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[w.rs], output: w.unit, slots: &[P0] });
+    facts.wide.add(mut_s, FnHead { lifetimes: 1, late: &[0], outlives: &[], inputs: &[rms], output: w.unit, slots: &[P0] });
+    facts.wide.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.unit, slots: &[] });
+
+    let root_path = ClosureParamRegion::ROOT;
+    let in0 = ClosureParamRegion::push_step(root_path, 0).expect("in0");
+    let ret = ClosureParamRegion::push_step(root_path, 1).expect("ret");
+
+    let run = |mutate_while_borrowed: bool, regions_fn: &dyn Fn(ExprId) -> std::vec::Vec<ClosureParamRegion>| {
+        let mut b = Bb::new();
+        let ppick = b.bind("pick");
+        let pmk = b.path(&["mk"]);
+        let call_mk = b.call(pmk, &[]);
+        let ps = b.bind_mut("s");
+        let st1 = b.let_(ps, None, call_mk);
+        let lpick = b.local(ppick);
+        let ls1 = b.local(ps);
+        let bor_s = b.borrow(Mutbl::Not, ls1);
+        let call_pick = b.call(lpick, &[bor_s]);
+        let pr = b.bind("r");
+        let st2 = b.let_(pr, None, call_pick);
+        let puse = b.path(&["use_s"]);
+        let lr = b.local(pr);
+        let call_use = b.call(puse, &[lr]);
+        let st_use = b.semi(call_use);
+        let inner = if mutate_while_borrowed {
+            let pmut = b.path(&["mut_s"]);
+            let ls2 = b.local(ps);
+            let bor_mut = b.borrow(Mutbl::Mut, ls2);
+            let call_mut = b.call(pmut, &[bor_mut]);
+            let st_mut = b.semi(call_mut);
+            b.block(&[st1, st2, st_mut, st_use], None)
+        } else {
+            b.block(&[st1, st2, st_use], None)
+        };
+        let cl = b.closure(&[ppick], inner);
+        let pc = b.bind("c");
+        let st_c = b.let_(pc, None, cl);
+        let root = b.block(&[st_c], None);
+        let mut body = b.view(f, root);
+        let opt_tys = [Some(fn_ptr)];
+        body.types = w.fx.t.view();
+        body.opt_types = &opt_tys;
+        let mut written = regions_fn(cl);
+        written.sort_unstable();
+        body.closure_param_regions = &written;
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.wide.sigs.decls.lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc())
+    };
+
+    // POSITIVE: shared `Late(0)` ties output to input 0 cleanly.
+    let ok = run(false, &|cl| {
+        std::vec![
+            ClosureParamRegion { closure: cl, param: 0, path: in0, own: 0, kind: WrittenRegion::Late(0) },
+            ClosureParamRegion { closure: cl, param: 0, path: ret, own: 0, kind: WrittenRegion::Late(0) },
+        ]
+    })
+    .expect("POSITIVE: `fn(&S) -> &S` with shared `Late(0)` must lower cleanly");
+    let report = blaze_flow::check(&ok.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+    assert!(report.moves.is_empty() && report.borrows.is_empty(), "POSITIVE: expected clean check: {:?}", report.borrows);
+
+    // NEGATIVE 1: mutating `s` while `r = pick(&s)` is live must report a borrow conflict.
+    let conflict = run(true, &|cl| {
+        std::vec![
+            ClosureParamRegion { closure: cl, param: 0, path: in0, own: 0, kind: WrittenRegion::Late(0) },
+            ClosureParamRegion { closure: cl, param: 0, path: ret, own: 0, kind: WrittenRegion::Late(0) },
+        ]
+    })
+    .expect("NEGATIVE 1: conflicting body lowers cleanly");
+    let conflict_report = blaze_flow::check(&conflict.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+    assert!(
+        !conflict_report.borrows.is_empty(),
+        "NEGATIVE 1: mutating `s` while `r = pick(&s)` is still live must report a borrow conflict"
+    );
+
+    // NEGATIVE 2: missing output `Late` annotation must be refused (`CalleeValueUnknown`).
+    let unbound = run(false, &|_| std::vec![]);
+    assert!(
+        matches!(unbound, Err(Refusal { form: Form::CalleeValueUnknown, .. })),
+        "NEGATIVE 2: unbound output lifetime on `fn(&S) -> &S` must be refused, got {:?}",
+        unbound.err()
+    );
+
+    // NEGATIVE 3: `WrittenRegion::Named` must be refused (`CalleeValueUnknown`).
+    let named = run(false, &|cl| {
+        std::vec![
+            ClosureParamRegion { closure: cl, param: 0, path: in0, own: 0, kind: WrittenRegion::Named },
+            ClosureParamRegion { closure: cl, param: 0, path: ret, own: 0, kind: WrittenRegion::Named },
+        ]
+    });
+    assert!(
+        matches!(named, Err(Refusal { form: Form::CalleeValueUnknown, .. })),
+        "NEGATIVE 3: `WrittenRegion::Named` on `fn(&'a S) -> &'a S` must be refused, got {:?}",
+        named.err()
+    );
+}
+
+/// Regression & soundness test for `crates/blaze-emit/src/sota/isel.rs`:
+/// `|cb: fn(&'static S)| { ... }` with `WrittenRegion::Static` on an input slot:
+/// - POSITIVE: calling `cb(get_static())` where `get_static() -> &'static S` passes borrowck.
+/// - NEGATIVE (borrow soundness): calling `cb(&local)` where `local` is a stack local MUST be
+///   caught as a borrow/lifetime error by `blaze_flow::check` (local borrow does not outlive
+///   `'static`).
+#[test]
+fn closure_fn_ptr_param_static_input_positive_and_local_negative() {
+    use blaze_typeck::{ClosureParamRegion, WrittenRegion};
+
+    let mut items = None;
+    let w = world_with(|fx, st, rs, unit| {
+        let fn_list = fx.list(&[rs, unit]);
+        let fn_ptr = fx.ty(PNode::FnPtr(fn_list, FnPtrHeader::RUST));
+        let mk = fx.func("mk", 0, &[], st, no_clauses());
+        let get_static = fx.func("get_static", 0, &[], rs, no_clauses());
+        let f = fx.func("f", 0, &[], unit, no_clauses());
+        items = Some((fn_ptr, mk, get_static, f));
+    });
+    let (fn_ptr, mk, get_static, f) = items.expect("declared");
+    let mut facts = Lane::of(&w);
+    facts.wide.add(mk, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.st, slots: &[] });
+    facts.wide.add(get_static, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.rs, slots: &[crate::Region::Static] });
+    facts.wide.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.unit, slots: &[] });
+
+    let in0 = ClosureParamRegion::push_step(ClosureParamRegion::ROOT, 0).expect("in0");
+
+    let run = |pass_local: bool| {
+        let mut b = Bb::new();
+        let pcb = b.bind("cb");
+        let inner = if pass_local {
+            let pmk = b.path(&["mk"]);
+            let call_mk = b.call(pmk, &[]);
+            let ps = b.bind("s");
+            let st1 = b.let_(ps, None, call_mk);
+            let lcb = b.local(pcb);
+            let ls = b.local(ps);
+            let bor = b.borrow(Mutbl::Not, ls);
+            let call_cb = b.call(lcb, &[bor]);
+            let st2 = b.semi(call_cb);
+            b.block(&[st1, st2], None)
+        } else {
+            let pget = b.path(&["get_static"]);
+            let call_get = b.call(pget, &[]);
+            let lcb = b.local(pcb);
+            let call_cb = b.call(lcb, &[call_get]);
+            let st = b.semi(call_cb);
+            b.block(&[st], None)
+        };
+        let cl = b.closure(&[pcb], inner);
+        let pc = b.bind("c");
+        let st_c = b.let_(pc, None, cl);
+        let root = b.block(&[st_c], None);
+        let mut body = b.view(f, root);
+        let opt_tys = [Some(fn_ptr)];
+        body.types = w.fx.t.view();
+        body.opt_types = &opt_tys;
+        let written = [ClosureParamRegion { closure: cl, param: 0, path: in0, own: 0, kind: WrittenRegion::Static }];
+        body.closure_param_regions = &written;
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.wide.sigs.decls.lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc())
+    };
+
+    let ok = run(false).expect("POSITIVE: `fn(&'static S)` called with `&'static S` must lower cleanly");
+    let ok_report = blaze_flow::check(&ok.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+    assert!(ok_report.moves.is_empty() && ok_report.borrows.is_empty(), "POSITIVE: expected clean check: {:?}", ok_report.borrows);
+
+    let bad = run(true).expect("NEGATIVE: `fn(&'static S)` called with local `&s` lowers cleanly");
+    let bad_report = blaze_flow::check(&bad.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+    assert!(
+        !bad_report.borrows.is_empty(),
+        "NEGATIVE: passing local `&s` to `fn(&'static S)` must report a borrow/lifetime error"
+    );
+}
