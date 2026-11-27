@@ -15,7 +15,7 @@ blaze-build-script	19
 blaze-c	2
 blaze-cas	86
 blaze-check	7
-blaze-cli	68
+blaze-cli	70
 blaze-columns	29
 blaze-cond	3
 blaze-consteval	47
@@ -50,7 +50,7 @@ blaze-kit	15
 blaze-ladder	60
 blaze-launch	4
 blaze-launch-rt	5
-blaze-launcher	2
+blaze-launcher	3
 blaze-lint	6
 blaze-lint-defs	1
 blaze-lir	29

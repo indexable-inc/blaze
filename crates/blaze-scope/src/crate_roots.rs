@@ -41,9 +41,12 @@ mod tests {
     fn a_root_by_its_mark() {
         let dep = CrateItemKey(ContentId([7; 32]));
         let rules = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::SemiOpaque, edition: Edition::E2021 };
+        let transparent = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::Transparent, edition: Edition::E2024 };
         assert_eq!(root_by_mark("$crate", Some(rules)), Root::Crate(dep));
         assert_eq!(root_by_mark("crate", Some(rules)), Root::Here);
         assert_eq!(root_by_mark("crate", Some(root_mark(dep, Edition::E2021))), Root::Crate(dep));
+        assert_eq!(root_by_mark("$crate", Some(transparent)), Root::Here);
+        assert_eq!(root_by_mark("crate", Some(transparent)), Root::Here);
         assert_eq!(root_by_mark("$crate", None), Root::Here);
         assert_eq!(root_by_mark("inner", Some(rules)), Root::NotARoot);
     }
@@ -70,15 +73,17 @@ pub enum Root {
 /// resolver-by-mark of a crate root: blaze-scope's [`to_path_marked`](crate::task::to_path_marked)
 /// and the front end's `blaze_lower::mark_site::site_of` (token-mark-1) both ask it.
 ///
-/// - `$crate`: the mark's definition crate; with no mark, the crate whose text holds it (a
-///   `$crate` no expansion wrote: tokio 1.53.2's `doc! { macro_rules! try_join { .. $crate .. } }`,
-///   in a definition's own tokens). A body has no unmarked `$crate`: `site_of` refuses it first.
+/// - `$crate`: the mark's definition crate for a non-transparent (`SemiOpaque` or `Opaque`) mark;
+///   with a transparent mark (`include!`, `Span::call_site()`) or no mark, the crate whose text
+///   holds it (tokio 1.53.2's `doc! { macro_rules! try_join { .. $crate .. } }`, target-lexicon's
+///   `mod triple { include!("src/triple.rs"); }` whose included file defines `macro_rules! triple`).
+///   A body has no unmarked `$crate`: `site_of` refuses it first.
 /// - `crate`: an opaque mark's crate (a `macro` item's, and the renderer's `$crate`, [`root_mark`]);
 ///   a semi-opaque or transparent mark, or none: [`Root::Here`].
 pub fn root_by_mark(first: &str, mark: Option<TextMark>) -> Root {
     match (first, mark) {
-        ("$crate", Some(m)) => Root::Crate(m.site.krate),
-        ("$crate", None) => Root::Here,
+        ("$crate", Some(m)) if m.transparency != Transparency::Transparent => Root::Crate(m.site.krate),
+        ("$crate", _) => Root::Here,
         ("crate", Some(m)) if m.transparency == Transparency::Opaque => Root::Crate(m.site.krate),
         ("crate", _) => Root::Here,
         _ => Root::NotARoot,

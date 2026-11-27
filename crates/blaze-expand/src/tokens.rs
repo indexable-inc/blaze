@@ -300,10 +300,11 @@ impl CtxNode {
     }
 }
 
-/// What resolves one token's names: its context's innermost mark, and its edition.
+/// What resolves one token's names: its context's innermost non-transparent mark, and its edition.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TokenHygiene {
-    /// The innermost mark: `None` for a token no expansion made, which resolves where the
+    /// The innermost non-transparent mark: `None` for a token no non-transparent expansion made
+    /// (written source, `include!`, or call-site proc-macro tokens), which resolves where the
     /// reader places the stream.
     pub mark: Option<Mark>,
     pub edition: Edition,
@@ -481,20 +482,30 @@ impl<'a> TokenStream<'a> {
         ctx.node().and_then(|at| self.contexts.get(at as usize)).copied()
     }
 
-    /// The edition a token of `ctx` is read in: its root's, or its innermost mark's.
+    /// The edition a token of `ctx` is read in: its innermost non-transparent mark's edition,
+    /// walking past [`Transparency::Transparent`] marks (call-site / `include!`) to its root's.
     pub fn edition_of(&self, ctx: Ctx) -> Edition {
-        match (ctx.root_edition(), self.node(ctx)) {
-            (Some(edition), _) => edition,
-            (None, Some(node)) => node.mark.edition,
-            (None, None) => unreachable!(
-                "a token's context is checked to be its stream's when it is pushed (`TokenStream::push`)"
-            ),
-        }
+        self.hygiene(ctx).edition
     }
 
-    /// What resolves the names of a token of `ctx`.
-    pub fn hygiene(&self, ctx: Ctx) -> TokenHygiene {
-        TokenHygiene { mark: self.node(ctx).map(|node| node.mark), edition: self.edition_of(ctx) }
+    /// What resolves the names of a token of `ctx`: its innermost non-transparent mark (`None`
+    /// when every mark on `ctx` is [`Transparency::Transparent`] — call-site / `include!` — or
+    /// `ctx` is a root) and its edition.
+    pub fn hygiene(&self, mut ctx: Ctx) -> TokenHygiene {
+        loop {
+            match (ctx.root_edition(), self.node(ctx)) {
+                (Some(edition), _) => return TokenHygiene { mark: None, edition },
+                (None, Some(node)) if node.mark.transparency == Transparency::Transparent => {
+                    ctx = node.parent;
+                }
+                (None, Some(node)) => {
+                    return TokenHygiene { mark: Some(node.mark), edition: node.mark.edition };
+                }
+                (None, None) => unreachable!(
+                    "a token's context is checked to be its stream's when it is pushed (`TokenStream::push`)"
+                ),
+            }
+        }
     }
 
     /// The index of the delimiter that closes the group opened at `open`.

@@ -554,6 +554,60 @@ fn include_lexes_its_file_at_the_call_site() {
 }
 
 #[test]
+fn include_tokens_walk_past_transparent_mark_for_hygiene_and_edition() {
+    let cx = TestCx {
+        files: &[("triple.rs", b"pub struct Triple; macro_rules! triple { () => { $crate::Triple }; }")],
+        ..TestCx::new()
+    };
+    // `core::include!` is defined in a foreign crate on edition 2024; the caller is edition 2018.
+    let def = MacroDefinition::builtin_fn(
+        BuiltinFn::Include,
+        DefAt { edition: Edition::E2024, ..at(0xC0) },
+        blaze_own::testing::heap().alloc(),
+    );
+    let input = lex("\"triple.rs\"", Edition::E2018, blaze_own::testing::heap().alloc()).expect("lex");
+    let call = Call::fn_like(&input, CallSite { edition: Edition::E2018, panic_edition: Edition::E2018, ctx: Ctx::root(Edition::E2018) });
+    let exp = done(expand(&def, &call, &cx, blaze_own::testing::heap().alloc()));
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    for i in 0..exp.tokens.len() {
+        let h = exp.hygiene(i);
+        assert_eq!(h.mark, None, "token {i} (`{}`) must not carry foreign Transparent mark", exp.tokens.text_at(i));
+        assert_eq!(h.edition, Edition::E2018, "token {i} must inherit call-site edition E2018");
+    }
+
+    // Layered case: a Transparent mark on top of a SemiOpaque outer mark resolves to the outer
+    // SemiOpaque mark (both mark and edition), not the Transparent mark and not None.
+    let outer_krate = CrateItemKey(ContentId([0xAA; 32]));
+    let mut nested_input = TokenStream::new_in(blaze_own::testing::heap().alloc());
+    let outer_ctx = nested_input
+        .context(blaze_expand::CtxNode {
+            parent: Ctx::root(Edition::E2018),
+            mark: blaze_expand::Mark {
+                of: MarkOf::Outer(ContentId([0xBB; 32])),
+                transparency: blaze_expand::Transparency::SemiOpaque,
+                edition: Edition::E2021,
+                site: DefSite { krate: outer_krate, module: None },
+            },
+        })
+        .expect("outer ctx");
+    nested_input
+        .push(
+            TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone },
+            "triple.rs",
+            outer_ctx,
+        )
+        .expect("push arg");
+    let nested_call = Call::fn_like(
+        &nested_input,
+        CallSite { edition: Edition::E2018, panic_edition: Edition::E2018, ctx: outer_ctx },
+    );
+    let nested_exp = done(expand(&def, &nested_call, &cx, blaze_own::testing::heap().alloc()));
+    let h = nested_exp.hygiene(0);
+    assert_eq!(h.mark.map(|m| m.site.krate), Some(outer_krate));
+    assert_eq!(h.edition, Edition::E2021);
+}
+
+#[test]
 fn assert_panics_with_its_condition_or_its_message() {
     let cx = TestCx::new();
     let exp = call_fn(&builtin(BuiltinFn::Assert), "a == b", &cx);
