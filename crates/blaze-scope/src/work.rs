@@ -997,7 +997,7 @@ impl<'a, N: Name> Work<'a, N> {
             return Err(ResolveError::TooManyExpansions { module });
         }
         let at = r.calls[c as usize].at;
-        let depth = r.frags[at.frag as usize].expansion + 1;
+        let depth = r.frags[at.frag as usize].expansion.saturating_add(1);
         let before = r.upto();
         let frag = r.add_fragment(&expanded, Some(key), depth, Some(at))?;
         r.set_call_state(c as usize, CallState::Expanded { frag, def });

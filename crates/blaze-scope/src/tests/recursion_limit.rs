@@ -184,6 +184,49 @@ fn cfg_attr_recursion_limit_respects_predicate() {
 }
 
 #[test]
+fn recursion_limit_accepts_comments_escapes_and_raw_strings() {
+    let valid_attrs = [
+        "#![recursion_limit = /* comment */ \"256\"]",
+        "#![recursion_limit /* before eq */ = /* after eq */ \"256\" /* after */]",
+        "#![recursion_limit = // line comment\n \"256\"]",
+        "#![recursion_limit = \"\\x32\\x35\\x36\"]",
+        "#![recursion_limit = \"\\u{32}\\u{35}\\u{36}\"]",
+        "#![recursion_limit = \"25\\\n    6\"]",
+        "#![recursion_limit = r#\"256\"#]",
+        "#![recursion_limit = r\"256\"]",
+    ];
+    for attr in valid_attrs {
+        let root = format!("#![no_core]\n{attr}\npub struct S;\n");
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let files = [("/k/lib.rs", root.as_str())];
+        let names = solve_one(&files, erased.bump());
+        assert_eq!(names.root_attrs.recursion_limit, 256, "attr `{attr}` must parse to 256");
+        assert_eq!(names.crate_root.head.recursion_limit, 256, "attr `{attr}` must set head limit to 256");
+    }
+
+    // Suffixed, byte, c-string, and invalid-escape string literals must be rejected.
+    let invalid_literals = [
+        "#![recursion_limit = b\"256\"]",
+        "#![recursion_limit = c\"256\"]",
+        "#![recursion_limit = \"256\"u32]",
+        "#![recursion_limit = \"\\q\"]",
+        "#![recursion_limit = '2']",
+    ];
+    for attr in invalid_literals {
+        let root = format!("#![no_core]\n{attr}\npub struct S;\n");
+        let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let files = [("/k/lib.rs", root.as_str())];
+        let err = try_solve_one(&files, erased.bump()).expect_err("invalid string literal must fail");
+        assert!(
+            matches!(err, (0, CrateScopeError::Names(NamesError::InvalidRecursionLimit { krate: "k", .. }))),
+            "attr `{attr}` must return NamesError::InvalidRecursionLimit, got {err:?}"
+        );
+    }
+}
+
+#[test]
 fn large_recursion_limit_above_4096_is_preserved() {
     let root = "#![no_core]\n#![recursion_limit = \"5000\"]\npub struct S;\n";
     let frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("frame");

@@ -1327,6 +1327,67 @@ fn a_call_at_the_recursion_limit_is_an_error() {
     compare(&w, root, &c).expect("the reference Resolver agrees with raised recursion_limit");
 }
 
+/// Expansion depth is tracked as `u32` (never saturating at `u16::MAX` = 65,535), so limits
+/// `>= 65_536` are enforced consistently in both `Cells` and `Resolver`.
+#[test]
+fn u32_depth_does_not_saturate_at_u16_max() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.cr(root).head.recursion_limit = 65_536;
+
+    // Cells: build a 65,536-link fragment parent chain (depth 0..=65_536) and verify `depth`
+    // reaches 65,536 without saturating at 65,535, and `read_fragment` marks a call at depth
+    // 65,536 `deep = true` under limit 65,536 and `deep = false` under limit 65,537.
+    let mut c = Cells::load_planted(&w, root, None, CellPlant::None, Alloc::global()).expect("load");
+    let mut parent = c.modules[c.root as usize].text;
+    assert_eq!(c.depth(parent), 0);
+    for _ in 0..65_535u32 {
+        let fid = c.frags.len() as super::FragId;
+        c.frags.push(super::Frag {
+            module: c.root,
+            up: Some((parent, 0)),
+            slots: blaze_own::AVec::new_in(Alloc::global()),
+            prev_live: blaze_own::AVec::new_in(Alloc::global()),
+            textual_empty: true,
+            guess_skip_epoch: 0,
+            guess_prev_live: blaze_own::AVec::new_in(Alloc::global()),
+        });
+        parent = fid;
+    }
+    assert_eq!(c.depth(parent), 65_535);
+
+    let mut decls = crate::DeclsBuilder::new_in(Alloc::global());
+    let call_key = ItemKey(blaze_id::ContentId([9; 32]));
+    decls.calls.push(crate::MacroCallDecl {
+        call: call_key,
+        path: crate::Path { kind: crate::PathKind::Plain, segments: blaze_own::AVec::from_slice_in(&["m"], Alloc::global()) },
+        kind: crate::CallShape::FnLike,
+        role: blaze_surface::CallRole::Call,
+        item: None,
+        pos: 0,
+    });
+
+    // At parent depth 65_535, the new fragment's depth is 65_536 -> deep under limit 65_536.
+    let deep_frag = c.read_fragment(c.root, &decls, Some((parent, 0))).expect("read_fragment at 65536");
+    assert_eq!(c.depth(deep_frag), 65_536);
+    assert!(c.items.last().expect("call pushed").deep, "depth 65_536 must be TooDeep under limit 65_536");
+
+    // Under limit 65_537, the exact same depth 65_536 is allowed (`deep == false`).
+    c.recursion_limit = 65_537;
+    let ok_frag = c.read_fragment(c.root, &decls, Some((parent, 0))).expect("read_fragment allowed at 65536");
+    assert_eq!(c.depth(ok_frag), 65_536);
+    assert!(!c.items.last().expect("call pushed").deep, "depth 65_536 must be allowed under limit 65_537");
+
+    // Resolver: `add_fragment` accepts `u32` expansion depth 65_536 and enforces 65_536 vs 65_537.
+    let mut r = crate::Resolver::new_in(root, &w, Alloc::global()).expect("resolver");
+    assert_eq!(r.recursion_limit, 65_536);
+    r.add_fragment(&decls, None, 65_536, None).expect("resolver add_fragment at 65536");
+    assert_eq!(r.calls.last().expect("resolver call").state, crate::resolver::CallState::TooDeep);
+    r.recursion_limit = 65_537;
+    r.add_fragment(&decls, None, 65_536, None).expect("resolver add_fragment allowed at 65536");
+    assert_eq!(r.calls.last().expect("resolver call").state, crate::resolver::CallState::Pending);
+}
+
 /// mach2 0.5.0 on tempo's graph (edition 2015; c10-g3: "differ 153, cells failed 153, stalls 1").
 /// The Reference, `items.use.path.edition2018`: "In the 2015 edition, `use` paths are relative to
 /// the crate root." and "The 2015 edition does not allow use declarations to reference the extern

@@ -936,32 +936,34 @@ impl<'a> Attrs<'_, 'a> {
     }
 }
 
-/// Unquotes a single Rust normal (`"..."`) or raw (`r#"..."#`) string literal, rejecting trailing
-/// tokens or unquoted expressions.
-fn unquote_str(expr: &str) -> Option<&str> {
-    if let Some(inner) = expr.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-        return (!inner.contains('"')).then_some(inner);
-    }
-    let rest = expr.strip_prefix('r')?;
-    let hashes = rest.bytes().take_while(|&b| b == b'#').count();
-    let prefix = rest.get(..hashes)?;
-    rest.get(hashes..)?.strip_prefix('"')?.strip_suffix(prefix)?.strip_suffix('"')
-}
-
-/// Parses `#![recursion_limit = "N"]`, preserving the requested limit (up to `u32::MAX`) and
-/// returning `Err(content)` when the attribute or its value is malformed or overflows `usize`.
+/// Parses `#![recursion_limit = "N"]` using Rust literal tokenization and escape decoding
+/// (allowing comments around `=`, string escapes like `"\x32\x35\x36"`, and raw strings like
+/// `r#"256"#`), preserving the requested limit (up to `u32::MAX`) and returning `Err(content)`
+/// when the attribute or its decoded value is malformed or overflows `usize`.
 fn parse_recursion_limit<'t>(content: &'t str) -> Result<u32, &'t str> {
     let attr = head(content);
     let Some(rest) = content.get(attr.len()..) else { return Err(content) };
-    let Some(value) = rest.trim_start().strip_prefix('=').filter(|it| !it.starts_with('=')) else {
-        return Err(content);
-    };
-    let Some(raw) = unquote_str(value.trim()) else { return Err(content) };
-    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+    let mut has_digits = false;
+    let mut valid = true;
+    let mut value: usize = 0;
+    let decoded = blaze_expand::decode_name_value_str(rest, |ch| {
+        if !valid {
+            return;
+        }
+        let Some(digit) = ch.to_digit(10).and_then(|d| usize::try_from(d).ok()) else {
+            valid = false;
+            return;
+        };
+        has_digits = true;
+        match value.checked_mul(10).and_then(|v| v.checked_add(digit)) {
+            Some(next) => value = next,
+            None => valid = false,
+        }
+    });
+    if !decoded || !valid || !has_digits {
         return Err(content);
     }
-    let Ok(parsed) = raw.parse::<usize>() else { return Err(content) };
-    Ok(u32::try_from(parsed).unwrap_or(u32::MAX))
+    Ok(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 /// An attribute the lowering never takes for an item's attribute macro by its name alone: a

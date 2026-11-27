@@ -1864,11 +1864,11 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         // The fragment's expansion depth: a call written at the crate's effective
         // `recursion_limit` or deeper is an error, not a call (the old core's `CallState::TooDeep`).
-        let depth = match up {
+        let depth: u32 = match up {
             Some((u, _)) => self.depth(u).saturating_add(1),
             None => 0,
         };
-        let deep = u32::from(depth) >= self.recursion_limit && self.plant != CellPlant::NoRecursionLimit;
+        let deep = depth >= self.recursion_limit && self.plant != CellPlant::NoRecursionLimit;
         for c in d.calls.iter() {
             // A tool attribute (Reference `attributes.tool`: "The tool attributes are ..
             // `rustfmt` and `clippy`", and `register_tool`'s): inert, no call. The first segment
