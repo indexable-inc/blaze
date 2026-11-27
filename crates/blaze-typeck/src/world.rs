@@ -592,6 +592,10 @@ impl TypeAttrs {
     /// checked by `capability-in-sans-io` (rules/capability.rs) to store no `#[blaze::capability]`
     /// field directly or transitively. Bit 23.
     pub const SANS_IO: u32 = 1 << 23;
+    /// `#[rustc_deprecated_safe_2024(..)]` on an `unsafe fn` (e.g. `std::env::set_var` /
+    /// `remove_var`): calling it without `unsafe` is allowed in editions prior to 2024 and
+    /// requires `unsafe` starting in edition 2024 (rules/unsafety.rs). Bit 24.
+    pub const DEPRECATED_SAFE_2024: u32 = 1 << 24;
 
     /// Whether this item carries `#[blaze::capability]`.
     pub const fn is_capability(self) -> bool {
