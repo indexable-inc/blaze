@@ -277,6 +277,10 @@ pub enum HitAction {
     InsertToken(String),
     /// In-app tiling window manager & workspace tab actions.
     SwitchTab(TabId),
+    /// Switch to workspace `tab` and activate CoW session fork `branch` in its focused pane.
+    SwitchTabBranch { tab: TabId, branch: BranchId },
+    /// Toggle the collapsible left workspace & fork-hierarchy sidebar (`Cmd+S`).
+    ToggleSidebar,
     NewTab,
     CloseTab(TabId),
     SplitPane(SplitAxis),

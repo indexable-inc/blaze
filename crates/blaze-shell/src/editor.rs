@@ -321,6 +321,7 @@ pub struct ReverseSearch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaletteAction {
     NewTab,
+    ToggleSidebar,
     NewTiledPane,
     NewWindow,
     SplitVertical,
@@ -364,6 +365,7 @@ const PALETTE_CATALOG: &[PaletteCommand] = &[
     PaletteCommand { title: "Equalize Split Ratios", category: "Tiling", shortcut: "⌘⌃=", action: PaletteAction::EqualizeSplits },
     PaletteCommand { title: "Close Focused Pane / Tab", category: "Tiling", shortcut: "⌘W", action: PaletteAction::ClosePane },
     PaletteCommand { title: "New Workspace Tab", category: "Workspace", shortcut: "⌘T", action: PaletteAction::NewTab },
+    PaletteCommand { title: "Toggle Workspace Sidebar", category: "Workspace", shortcut: "⌘S", action: PaletteAction::ToggleSidebar },
     PaletteCommand { title: "New OS Window (Separate)", category: "Window", shortcut: "⌘⇧N", action: PaletteAction::NewWindow },
     PaletteCommand { title: "Fork Session Branch (O(1) CoW)", category: "Session", shortcut: "⌘B", action: PaletteAction::ForkBranch },
     PaletteCommand { title: "Open File Browser (y)", category: "Tools", shortcut: "y", action: PaletteAction::OpenYazi },

@@ -116,8 +116,9 @@ mod macos_app {
     use blaze_shell::image_atlas::ImageAtlas;
     use blaze_shell::keys;
     use blaze_shell::layout::{
-        LayoutInput, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers,
-        layout_command_palette, layout_fullscreen_terminal_pane, layout_window_top_bar,
+        LayoutInput, SIDEBAR_W, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene,
+        collect_branch_tree, draw_split_dividers, layout_command_palette,
+        layout_fullscreen_terminal_pane, layout_window_top_bar, layout_workspace_sidebar,
     };
     use blaze_shell::prompt::{GitStatusWorker, PromptInfo, try_native_git_command};
     use blaze_shell::pty::{Pty, Read as PtyRead};
@@ -1892,8 +1893,14 @@ mod macos_app {
         output_nav: Option<OutputNav>,
         dragging_split: Option<SplitHandle>,
         command_palette: Option<&CommandPalette>,
+        sidebar_open: bool,
     ) -> (Scene, TileLayout) {
-        let work_area = HitRect::new(0.0, TOP_BAR_H, vw, vh.max(TOP_BAR_H + 60.0));
+        let sidebar_w = if sidebar_open {
+            SIDEBAR_W.min(vw * 0.34).max(180.0)
+        } else {
+            0.0
+        };
+        let work_area = HitRect::new(sidebar_w, TOP_BAR_H, vw, vh.max(TOP_BAR_H + 60.0));
         let tile_layout = wm.layout(work_area, TILE_GAP);
         let mut master = Scene::new();
         let is_split = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
@@ -2103,6 +2110,7 @@ mod macos_app {
                 });
                 let symbol = p.and_then(|s| s.prompt.project_symbol.as_deref());
                 let process_tag = p.and_then(|s| s.process_tag());
+                let branches = p.map_or_else(Vec::new, |s| collect_branch_tree(&s.store));
                 TabBarItem {
                     id: tab.id,
                     slot: i + 1,
@@ -2112,9 +2120,13 @@ mod macos_app {
                     pane_count: tab.root.leaf_count(),
                     zoomed: tab.zoomed,
                     process_tag,
+                    branches,
                 }
             })
             .collect();
+        if sidebar_open {
+            layout_workspace_sidebar(&mut master, &tab_items, sidebar_w, vh, metrics, mouse_pos);
+        }
         if let Some(focused) = panes.get(&focused_id) {
             layout_window_top_bar(
                 &mut master,
@@ -2128,6 +2140,7 @@ mod macos_app {
                 metrics,
                 zoom_pct,
                 inline_titlebar,
+                sidebar_open,
             );
         }
 
@@ -2199,6 +2212,7 @@ mod macos_app {
         font_points: &mut f64,
         zoom_changed: &mut bool,
         pty_sizes_dirty: &mut bool,
+        sidebar_open: &mut bool,
         quit: &mut bool,
     ) {
         let cwd = panes
@@ -2209,6 +2223,10 @@ mod macos_app {
             PaletteAction::NewTab => {
                 let (_, new_pid) = wm.new_tab();
                 panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                *pty_sizes_dirty = true;
+            }
+            PaletteAction::ToggleSidebar => {
+                *sidebar_open = !*sidebar_open;
                 *pty_sizes_dirty = true;
             }
             PaletteAction::NewTiledPane => {
@@ -2504,6 +2522,7 @@ mod macos_app {
         pty_sizes_dirty: &mut bool,
         dirty: &mut bool,
         last_pty_sync: &mut Instant,
+        sidebar_open: bool,
     ) {
         match ev {
             ResizeEvent::WillStartLiveResize => {
@@ -2559,6 +2578,7 @@ mod macos_app {
                     None,
                     None,
                     None,
+                    sidebar_open,
                 );
                 *tile_layout = next_tl;
 
@@ -2824,6 +2844,7 @@ mod macos_app {
                 None,
                 None,
                 None,
+                false,
             );
             let vh = size.height as f32;
             let glyphs = fonts.rasterize_runs(&scene.text_runs, scale, vh);
@@ -2910,6 +2931,7 @@ mod macos_app {
         let mut last_hovered_link: Option<String> = None;
         let mut was_hidden = false;
         let mut last_pty_sync = Instant::now();
+        let mut sidebar_open = false;
 
         loop {
             let mut quit = false;
@@ -2940,6 +2962,7 @@ mod macos_app {
                             &mut pty_sizes_dirty,
                             &mut dirty,
                             &mut last_pty_sync,
+                            sidebar_open,
                         );
                     };
                     with_resize_hook(&mut on_resize, || {
@@ -3198,6 +3221,7 @@ mod macos_app {
                                             &mut font_points,
                                             &mut zoom_changed,
                                             &mut pty_sizes_dirty,
+                                            &mut sidebar_open,
                                             &mut quit,
                                         );
                                     } else {
@@ -3257,7 +3281,15 @@ mod macos_app {
                                     }
                                     continue;
                                 }
-                                // 2. `Cmd+T`: new workspace tab inheriting focused pane's cwd.
+                                // 2. `Cmd+S`: toggle collapsible left workspace & fork-hierarchy sidebar.
+                                if (key == Key::KeyS || lower == "s") && !ctrl && !alt && !shift {
+                                    sidebar_open = !sidebar_open;
+                                    active_popover = None;
+                                    pty_sizes_dirty = true;
+                                    dirty = true;
+                                    continue;
+                                }
+                                // 2b. `Cmd+T`: new workspace tab inheriting focused pane's cwd.
                                 if key == Key::KeyT && !ctrl && !alt {
                                     let cwd = panes
                                         .get(&wm.focused_pane())
@@ -4782,6 +4814,7 @@ mod macos_app {
                                         &mut font_points,
                                         &mut zoom_changed,
                                         &mut pty_sizes_dirty,
+                                        &mut sidebar_open,
                                         &mut quit,
                                     );
                                     dirty = true;
@@ -4820,6 +4853,11 @@ mod macos_app {
                                         output_nav = None;
                                         active_popover = None;
                                         match action {
+                                            HitAction::ToggleSidebar => {
+                                                sidebar_open = !sidebar_open;
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                            }
                                             HitAction::SwitchTab(tid) => {
                                                 if wm.select_tab_by_id(tid).is_some() {
                                                     pty_sizes_dirty = true;
@@ -4911,11 +4949,89 @@ mod macos_app {
                                     }
                                 }
 
-                                // 3. Clicking inside any tiled pane focuses it immediately & checks
-                                //    pane header chrome buttons (Close `×`, Zoom, Focus).
+                                // 3. Clicking inside the workspace sidebar or tiled panes handles
+                                //    sidebar tab/fork switches, pane chrome buttons, and focus.
                                 if y >= TOP_BAR_H {
                                     if let Some(action) = composite_scene.hit_test(x, y) {
                                         match action {
+                                            HitAction::ToggleSidebar => {
+                                                sidebar_open = !sidebar_open;
+                                                active_popover = None;
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                                continue;
+                                            }
+                                            HitAction::SwitchTab(tid) => {
+                                                if wm.select_tab_by_id(tid).is_some() {
+                                                    active_popover = None;
+                                                    output_selection = None;
+                                                    output_nav = None;
+                                                    pty_sizes_dirty = true;
+                                                    dirty = true;
+                                                }
+                                                continue;
+                                            }
+                                            HitAction::SwitchTabBranch { tab, branch } => {
+                                                let _ = wm.select_tab_by_id(tab);
+                                                if let Some(shell) = panes.get_mut(&wm.focused_pane())
+                                                    && shell.store.switch_branch(branch)
+                                                {
+                                                    shell.yazi = None;
+                                                    shell.agent_hub = None;
+                                                    shell.scroll_y = 0.0;
+                                                    shell.auto_scroll_bottom = true;
+                                                    shell.refresh_prompt(0, 0);
+                                                }
+                                                active_popover = None;
+                                                output_selection = None;
+                                                output_nav = None;
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                                continue;
+                                            }
+                                            HitAction::NewTab => {
+                                                let cwd = panes
+                                                    .get(&wm.focused_pane())
+                                                    .map(|p| p.cwd().to_owned())
+                                                    .unwrap_or_else(|| "/".to_owned());
+                                                let (_, new_pid) = wm.new_tab();
+                                                panes.insert(new_pid, ShellApp::new_in(Some(&cwd)));
+                                                active_popover = None;
+                                                output_selection = None;
+                                                output_nav = None;
+                                                pty_sizes_dirty = true;
+                                                dirty = true;
+                                                continue;
+                                            }
+                                            HitAction::CloseTab(tid) => {
+                                                if let CloseOutcome::TabClosed { closed_panes, .. } =
+                                                    wm.close_tab(tid)
+                                                {
+                                                    for pid in closed_panes {
+                                                        if let Some(mut p) = panes.remove(&pid)
+                                                            && let Some(ap) = p.active_pty.take()
+                                                        {
+                                                            ap.pty.hangup();
+                                                        }
+                                                    }
+                                                    active_popover = None;
+                                                    output_selection = None;
+                                                    pty_sizes_dirty = true;
+                                                    dirty = true;
+                                                }
+                                                continue;
+                                            }
+                                            HitAction::ForkActiveBranch => {
+                                                if let Some(shell) = panes.get_mut(&wm.focused_pane()) {
+                                                    let _ = shell.store.fork_active_branch(None);
+                                                    shell.refresh_prompt(
+                                                        shell.prompt.last_exit,
+                                                        shell.prompt.last_duration_ms,
+                                                    );
+                                                    dirty = true;
+                                                }
+                                                continue;
+                                            }
                                             HitAction::ClosePane(pid) => {
                                                 match wm.close_pane(pid) {
                                                     CloseOutcome::PaneClosed { closed, .. } => {
@@ -4978,6 +5094,13 @@ mod macos_app {
                                             }
                                             _ => {}
                                         }
+                                    }
+                                    if sidebar_open
+                                        && x < SIDEBAR_W.min(size.width as f32 * 0.34).max(180.0)
+                                    {
+                                        active_popover = None;
+                                        dirty = true;
+                                        continue;
                                     }
                                     if let Some(pl) =
                                         tile_layout.panes.iter().find(|p| p.rect.contains(x, y))
@@ -5513,6 +5636,8 @@ mod macos_app {
                                             }
                                         }
                                         HitAction::SwitchTab(_)
+                                        | HitAction::SwitchTabBranch { .. }
+                                        | HitAction::ToggleSidebar
                                         | HitAction::NewTab
                                         | HitAction::CloseTab(_)
                                         | HitAction::SplitPane(_)
@@ -5734,6 +5859,12 @@ mod macos_app {
                                     dirty = true;
                                 }
 
+                                if sidebar_open
+                                    && y >= TOP_BAR_H
+                                    && x < SIDEBAR_W.min(size.width as f32 * 0.34).max(180.0)
+                                {
+                                    dirty = true;
+                                }
                                 let hovered_link = match composite_scene.hit_test(x, y) {
                                     Some(HitAction::OpenLink { href, .. }) => Some(href),
                                     _ => None,
@@ -6043,6 +6174,7 @@ mod macos_app {
                             &mut pty_sizes_dirty,
                             &mut dirty,
                             &mut last_pty_sync,
+                            sidebar_open,
                         );
                     };
                     with_resize_hook(&mut on_resize, || {
@@ -6070,6 +6202,7 @@ mod macos_app {
                         &mut pty_sizes_dirty,
                         &mut dirty,
                         &mut last_pty_sync,
+                        sidebar_open,
                     );
                 };
                 with_resize_hook(&mut on_resize, || {
@@ -6378,7 +6511,12 @@ mod macos_app {
                 dirty = true;
             }
             if pty_sizes_dirty {
-                let area = HitRect::new(0.0, TOP_BAR_H, size.width as f32, size.height as f32);
+                let sw = if sidebar_open {
+                    SIDEBAR_W.min(size.width as f32 * 0.34).max(180.0)
+                } else {
+                    0.0
+                };
+                let area = HitRect::new(sw, TOP_BAR_H, size.width as f32, size.height as f32);
                 let next_tl = wm.layout(area, TILE_GAP);
                 sync_pty_sizes(&mut panes, &next_tl, &fonts, scale);
                 pty_sizes_dirty = false;
@@ -6449,6 +6587,7 @@ mod macos_app {
                     output_nav,
                     dragging_split,
                     command_palette.as_ref(),
+                    sidebar_open,
                 );
                 tile_layout = next_tl;
 
@@ -6497,6 +6636,7 @@ mod macos_app {
                                     output_nav,
                                     dragging_split,
                                     command_palette.as_ref(),
+                                    sidebar_open,
                                 );
                                 blaze_shell::layout::apply_find_overlay(
                                     &mut rescene,

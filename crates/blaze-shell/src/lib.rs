@@ -1249,6 +1249,7 @@ mod tests {
             pane_count: l.pane_count_in_tab,
             zoomed: l.is_zoomed,
             process_tag: None,
+            branches: crate::layout::collect_branch_tree(&store),
         }];
         layout_window_top_bar(
             &mut master,
@@ -1262,7 +1263,9 @@ mod tests {
             CellMetrics::default(),
             100,
             true,
+            false,
         );
+        assert!(master.hit_regions.iter().any(|h| h.action == HitAction::ToggleSidebar));
         assert!(master.hit_regions.iter().any(|h| h.action == HitAction::NewTab));
         assert!(master.hit_regions.iter().any(|h| h.action == HitAction::NewWindow));
         assert!(
@@ -1271,6 +1274,54 @@ mod tests {
                 .iter()
                 .any(|h| h.action == HitAction::SplitPane(SplitAxis::Vertical))
         );
+
+        // Verify collapsible workspace sidebar renders nested fork hierarchy with SwitchTabBranch hits.
+        let st0 = EngineState::new("/tmp", &[], Alloc::global());
+        let mut forked_store = BlockStore::new(st0.fork());
+        let b1 = forked_store.record_block(
+            "ls -l".to_owned(),
+            prompt.clone(),
+            st0.fork(),
+            st0.fork(),
+            1,
+            0,
+            0,
+            BlockBody::Value(Value::Nothing),
+        );
+        let f1 = forked_store.fork_from_block(b1, Some("fork-1")).expect("fork-1");
+        let b2 = forked_store.record_block(
+            "blaze check".to_owned(),
+            prompt.clone(),
+            st0.fork(),
+            st0.fork(),
+            2,
+            0,
+            0,
+            BlockBody::Value(Value::Nothing),
+        );
+        let f2 = forked_store.fork_from_block(b2, Some("fork-2")).expect("fork-2");
+        let tree = crate::layout::collect_branch_tree(&forked_store);
+        assert_eq!(tree.len(), 3);
+        assert_eq!((tree[0].depth, tree[1].depth, tree[2].depth), (0, 1, 2));
+        assert_eq!(tree[1].id, f1);
+        assert_eq!(tree[1].fork_cmd.as_deref(), Some("ls -l"));
+        assert_eq!(tree[2].id, f2);
+        assert_eq!(tree[2].fork_cmd.as_deref(), Some("blaze check"));
+        let sb_tabs = [TabBarItem {
+            id: wm.active_tab().id,
+            slot: 1,
+            symbol: None,
+            title: "tmp",
+            active: true,
+            pane_count: 1,
+            zoomed: false,
+            process_tag: None,
+            branches: tree,
+        }];
+        let mut sb_scene = Scene::new();
+        crate::layout::layout_workspace_sidebar(&mut sb_scene, &sb_tabs, 240.0, 800.0, CellMetrics::default(), None);
+        assert!(sb_scene.hit_regions.iter().any(|h| h.action == HitAction::SwitchTab(wm.active_tab().id)));
+        assert!(sb_scene.hit_regions.iter().any(|h| h.action == HitAction::SwitchTabBranch { tab: wm.active_tab().id, branch: f2 }));
     }
 
     #[test]

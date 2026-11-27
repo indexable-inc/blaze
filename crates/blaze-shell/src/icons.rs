@@ -35,6 +35,7 @@ pub enum Icon {
     Close,
     Maximize,
     NewWindow,
+    Sidebar,
 }
 
 /// Infer the best semantic icon and restrained `ix.dev/blaze` accent color for a filesystem entry.
@@ -495,6 +496,24 @@ pub fn draw_icon(
             scene.line(x + s * 0.12, y + s * 0.36, x + s * 0.88, y + s * 0.36, t * 0.9, color, clip_id);
             scene.line(cx, y + s * 0.48, cx, y + s * 0.74, t * 0.95, color, clip_id);
             scene.line(cx - s * 0.13, y + s * 0.61, cx + s * 0.13, y + s * 0.61, t * 0.95, color, clip_id);
+        }
+        Icon::Sidebar => {
+            // Native macOS sidebar toggle icon: rounded frame with left rail + two item bars.
+            scene.round_rect(
+                x + s * 0.08,
+                y + s * 0.14,
+                x + s * 0.92,
+                y + s * 0.86,
+                s * 0.15,
+                [0.0; 4],
+                t,
+                color,
+                clip_id,
+            );
+            let div_x = x + s * 0.38;
+            scene.line(div_x, y + s * 0.16, div_x, y + s * 0.84, t, color, clip_id);
+            scene.line(x + s * 0.17, y + s * 0.36, x + s * 0.29, y + s * 0.36, t * 0.9, color, clip_id);
+            scene.line(x + s * 0.17, y + s * 0.54, x + s * 0.29, y + s * 0.54, t * 0.9, color, clip_id);
         }
     }
 }
