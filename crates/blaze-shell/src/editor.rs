@@ -581,6 +581,11 @@ pub struct Editor {
     /// When the user explicitly presses `Esc` to dismiss auto-opened completions on a token,
     /// remember that token's start offset so we don't immediately re-open until they move on.
     completions_suppressed_token_start: Option<usize>,
+    /// Byte offset right after an auto-inserted trailing `.` from Tab-drilling into a nested
+    /// container (e.g. `Cargo.lock.package.`). If the user immediately pivots to `Enter`, ` `,
+    /// `|`, or `[`, the dangling auto-dot is cleanly removed; if they type `.`, it overtypes
+    /// cleanly instead of producing `..`.
+    auto_dot_pos: Option<usize>,
     /// Fish/Nushell-style dimmed inline ghost suffix shown directly after the cursor.
     pub ghost: Option<String>,
     /// Sans-IO Vim modal editing engine (`Normal`/`Insert`/`Visual`/`VisualLine`, undo/redo,
@@ -716,6 +721,7 @@ impl Editor {
             completion_scroll: 0,
             completion_replace_start: 0,
             completions_suppressed_token_start: None,
+            auto_dot_pos: None,
             ghost: None,
             vim: VimMachine::new(
                 VimOpts {
@@ -1053,6 +1059,22 @@ impl Editor {
         self.clamp_cursor();
         let next_ch = self.text[self.cursor..].chars().next();
         let prev_ch = self.text[..self.cursor].chars().next_back();
+
+        // 1b. Smart auto-dot handling right after Tab-drilling into a container (`Cargo.lock.package.`):
+        //     - Typing `.` reflexively overtypes the auto-dot instead of producing `..`.
+        //     - Pivoting to ` `, `|`, or `[` cleanly strips the dangling auto-dot first.
+        if self.auto_dot_pos == Some(self.cursor) && prev_ch == Some('.') {
+            self.auto_dot_pos = None;
+            if ch == '.' {
+                return;
+            }
+            if matches!(ch, ' ' | '|' | '[') {
+                self.text.remove(self.cursor - 1);
+                self.cursor -= 1;
+            }
+        } else {
+            self.auto_dot_pos = None;
+        }
 
         // 2. Overtype closing delimiter if cursor is already right before it.
         if matches!(ch, '}' | ')' | ']' | '"' | '\'') && next_ch == Some(ch) {
@@ -1631,6 +1653,15 @@ impl Editor {
 
     /// Submit current buffer, recording it in history and resetting input state.
     pub fn take_submitted(&mut self) -> String {
+        // Strip a dangling Tab-inserted auto-dot (e.g. `Cargo.lock.package.` -> `Cargo.lock.package`)
+        // when the user hits Enter directly without typing another field.
+        if self.auto_dot_pos == Some(self.cursor)
+            && self.cursor == self.text.len()
+            && self.text.ends_with('.')
+        {
+            self.text.pop();
+        }
+        self.auto_dot_pos = None;
         let submitted = core::mem::take(&mut self.text);
         self.cursor = 0;
         self.selection_anchor = None;
@@ -2447,79 +2478,119 @@ impl Editor {
                 let before_pipe = &prev_non_ws[..prev_non_ws.len() - 1];
                 if before_pipe.trim().is_empty() {
                     if let Some(slot) = state.get_var("_") {
-                        collect_value_path_completions(&slot.value, "", &prefix[1..], &mut scored);
+                        collect_value_path_completions(&slot.value, "", &prefix[1..], false, &mut scored);
                     }
                 } else if let Some(piped_val) = resolve_piped_value_for_dot(before_pipe, state) {
-                    collect_value_path_completions(&piped_val, "", &prefix[1..], &mut scored);
+                    collect_value_path_completions(&piped_val, "", &prefix[1..], false, &mut scored);
                 } else {
                     collect_piped_command_schema_dot_completions(before_pipe, &prefix[1..], &mut scored);
                 }
             } else if let Some(slot) = state.get_var("_") {
-                collect_value_path_completions(&slot.value, "", &prefix[1..], &mut scored);
+                collect_value_path_completions(&slot.value, "", &prefix[1..], false, &mut scored);
             }
         } else if at_expr_start
             && let Some((file_part, rest_after_dot)) = split_data_file_dot_prefix(prefix)
         {
             let abs = resolve_preview_path(state.cwd.as_ref(), file_part, state.get_env("HOME"));
             if let Some(parsed) = load_cached_open_preview(&abs) {
-                collect_value_path_completions(&parsed, file_part, rest_after_dot, &mut scored);
+                collect_value_path_completions(&parsed, file_part, rest_after_dot, false, &mut scored);
+            }
+        } else if at_expr_start && !prev_non_ws.ends_with('|') && is_bare_data_file(prefix) {
+            // Right after completing or typing a bare structured data file (`Cargo.toml`,
+            // `Cargo.lock`, `blaze.lock`), immediately offer its `.field` drill-down items so
+            // pressing `Tab` again drills smoothly without manually typing `.` (while `Enter`
+            // still runs `Cargo.toml` cleanly!).
+            let abs = resolve_preview_path(state.cwd.as_ref(), prefix, state.get_env("HOME"));
+            if let Some(parsed) = load_cached_open_preview(&abs) {
+                collect_value_path_completions(&parsed, prefix, "", true, &mut scored);
             }
         } else if let Some(var_prefix) = prefix.strip_prefix('$') {
             if let Some((var_name, rest_after_dot)) = var_prefix.split_once('.') {
                 let base_prefix = format!("${var_name}");
                 if var_name == "env" {
                     let env_val = Value::Record(state.env_record());
-                    collect_value_path_completions(&env_val, &base_prefix, rest_after_dot, &mut scored);
+                    collect_value_path_completions(&env_val, &base_prefix, rest_after_dot, false, &mut scored);
                 } else if let Some(slot) = state.get_var(var_name) {
-                    collect_value_path_completions(&slot.value, &base_prefix, rest_after_dot, &mut scored);
+                    collect_value_path_completions(&slot.value, &base_prefix, rest_after_dot, false, &mut scored);
                 }
             } else {
-                for (name, detail, doc) in [
-                    ("env", "record", "Environment variables record ($env.PATH, $env.HOME)"),
-                    ("in", "any", "Value piped from the previous stage"),
-                ] {
-                    if let Some((score, mut idxs)) = fuzzy_match_score(name, var_prefix) {
-                        for i in &mut idxs {
-                            *i += 1; // offset past `$`
-                        }
-                        scored.push((
-                            score + 20,
-                            CompletionItem {
-                                label: format!("${name}"),
-                                insert: format!("${name}"),
-                                detail: detail.to_owned(),
-                                doc: doc.to_owned(),
-                                kind: CompletionKind::Variable,
-                                icon: None,
-                                avatar_path: None,
-                                fs_meta: None,
-                                match_indices: idxs,
-                            },
-                        ));
+                // Exact variable match holding a container (`$lock`, `$env`): immediately offer
+                // `.field` drill-down if no other variable shares this prefix.
+                let mut exact_container: Option<Value<'static>> = None;
+                let mut var_matches = 0usize;
+                for name in ["env", "in"] {
+                    if fuzzy_match_score(name, var_prefix).is_some() {
+                        var_matches += 1;
                     }
                 }
-                state.vars.for_each(&mut |k, slot| {
-                    if let Some((score, mut idxs)) = fuzzy_match_score(k.as_ref(), var_prefix) {
-                        for i in &mut idxs {
-                            *i += 1;
-                        }
-                        let ty = slot.value.type_name().to_owned();
-                        scored.push((
-                            score + 10,
-                            CompletionItem {
-                                label: format!("${}", k.as_ref()),
-                                insert: format!("${}", k.as_ref()),
-                                detail: ty.clone(),
-                                doc: format!("session variable · {ty}"),
-                                kind: CompletionKind::Variable,
-                                icon: None,
-                                avatar_path: None,
-                                fs_meta: None,
-                                match_indices: idxs,
-                            },
-                        ));
+                state.vars.for_each(&mut |k, _| {
+                    if fuzzy_match_score(k.as_ref(), var_prefix).is_some() {
+                        var_matches += 1;
                     }
                 });
+                if !var_prefix.is_empty() && var_matches == 1 {
+                    if var_prefix == "env" {
+                        exact_container = Some(clone_value_global(&Value::Record(state.env_record())));
+                    } else if let Some(slot) = state.get_var(var_prefix)
+                        && matches!(
+                            slot.value,
+                            Value::Record(_) | Value::Table(_) | Value::List(_) | Value::Output(_)
+                        )
+                    {
+                        exact_container = Some(clone_value_global(&slot.value));
+                    }
+                }
+                if let Some(val) = exact_container {
+                    let base_prefix = format!("${var_prefix}");
+                    collect_value_path_completions(&val, &base_prefix, "", true, &mut scored);
+                } else {
+                    for (name, detail, doc) in [
+                        ("env", "record", "Environment variables record ($env.PATH, $env.HOME)"),
+                        ("in", "any", "Value piped from the previous stage"),
+                    ] {
+                        if let Some((score, mut idxs)) = fuzzy_match_score(name, var_prefix) {
+                            for i in &mut idxs {
+                                *i += 1; // offset past `$`
+                            }
+                            scored.push((
+                                score + 20,
+                                CompletionItem {
+                                    label: format!("${name}"),
+                                    insert: format!("${name}"),
+                                    detail: detail.to_owned(),
+                                    doc: doc.to_owned(),
+                                    kind: CompletionKind::Variable,
+                                    icon: None,
+                                    avatar_path: None,
+                                    fs_meta: None,
+                                    match_indices: idxs,
+                                },
+                            ));
+                        }
+                    }
+                    state.vars.for_each(&mut |k, slot| {
+                        if let Some((score, mut idxs)) = fuzzy_match_score(k.as_ref(), var_prefix) {
+                            for i in &mut idxs {
+                                *i += 1;
+                            }
+                            let ty = slot.value.type_name().to_owned();
+                            scored.push((
+                                score + 10,
+                                CompletionItem {
+                                    label: format!("${}", k.as_ref()),
+                                    insert: format!("${}", k.as_ref()),
+                                    detail: ty.clone(),
+                                    doc: format!("session variable · {ty}"),
+                                    kind: CompletionKind::Variable,
+                                    icon: None,
+                                    avatar_path: None,
+                                    fs_meta: None,
+                                    match_indices: idxs,
+                                },
+                            ));
+                        }
+                    });
+                }
             }
         } else if prefix.starts_with('-') {
             let stage_start = before.rfind(['|', ';', '\n']).map_or(0, |p| p + 1);
@@ -3563,8 +3634,10 @@ impl Editor {
                 insert.push(' ');
             }
         }
+        let auto_added_dot = insert.ends_with('.') && is_cell_path_insert;
         self.text.replace_range(start..self.cursor, &insert);
         self.cursor = start + insert.len();
+        self.auto_dot_pos = auto_added_dot.then_some(self.cursor);
         self.selection_anchor = None;
         self.dismiss_completions();
         self.ghost = None;
@@ -5382,6 +5455,7 @@ fn collect_value_path_completions(
     root: &Value<'_>,
     base_prefix: &str,
     rest_after_first_dot: &str,
+    label_leading_dot: bool,
     scored: &mut Vec<(i32, CompletionItem)>,
 ) {
     let parts: Vec<&str> = rest_after_first_dot.split('.').collect();
@@ -5491,7 +5565,7 @@ fn collect_value_path_completions(
                       detail: String,
                       doc: String,
                       is_container: bool| {
-        if let Some((score, idxs)) = fuzzy_match_score(key, leaf_prefix) {
+        if let Some((score, mut idxs)) = fuzzy_match_score(key, leaf_prefix) {
             let mut insert = String::with_capacity(built_prefix.len() + key.len() + 2);
             insert.push_str(&built_prefix);
             insert.push('.');
@@ -5499,10 +5573,18 @@ fn collect_value_path_completions(
             if is_container {
                 insert.push('.');
             }
+            let label = if label_leading_dot {
+                for i in &mut idxs {
+                    *i += 1;
+                }
+                format!(".{key}")
+            } else {
+                key.to_owned()
+            };
             scored.push((
                 score + 80 + rank_bonus,
                 CompletionItem {
-                    label: key.to_owned(),
+                    label,
                     insert,
                     detail,
                     doc,
@@ -5515,6 +5597,47 @@ fn collect_value_path_completions(
             ));
         }
     };
+
+    // If `leaf_prefix` already exactly names a field/column whose value is a nested/nullable
+    // list (e.g. `Cargo.lock.package.dependencies`), immediately offer `[]` (flatten + drop nulls)!
+    if !leaf_prefix.is_empty() {
+        let exact_col_val: Option<Value<'_>> = match &cur {
+            Value::Record(r) => r.get(leaf_prefix).map(Share::share),
+            Value::Table(t) => t
+                .col_index(leaf_prefix)
+                .and_then(|ci| t.cols.get(ci))
+                .map(|c| Value::List(c.share())),
+            _ => None,
+        };
+        if let Some(Value::List(items)) = exact_col_val {
+            let has_nested_or_null = items
+                .iter()
+                .take(64)
+                .any(|v| matches!(v, Value::List(_) | Value::Nothing));
+            if has_nested_or_null {
+                let mut flat_insert = String::with_capacity(built_prefix.len() + leaf_prefix.len() + 3);
+                flat_insert.push_str(&built_prefix);
+                flat_insert.push('.');
+                flat_insert.push_str(leaf_prefix);
+                flat_insert.push_str("[]");
+                scored.push((
+                    500,
+                    CompletionItem {
+                        label: "[]".to_owned(),
+                        insert: flat_insert,
+                        detail: "flatten".to_owned(),
+                        doc: "flatten nested lists & drop nulls".to_owned(),
+                        kind: CompletionKind::Keyword,
+                        icon: None,
+                        avatar_path: None,
+                        fs_meta: None,
+                        match_indices: Vec::new(),
+                    },
+                ));
+                return;
+            }
+        }
+    }
 
     match &cur {
         Value::Record(r) => {
@@ -5969,6 +6092,56 @@ mod tests {
         ed.set_text_initial("echo \"hello".to_owned());
         ed.refresh_assist(&state, &[], false);
         assert!(ed.completions.is_empty(), "must not auto-open inside string literal");
+
+        // 5. Seamless Tab drill-down: `Cargo.lock` -> `.package` -> `Cargo.lock.package.` -> `dependencies` -> `[]`!
+        fs::write(
+            tmp_dir.join("Cargo.lock"),
+            "version = 4\n\n[[package]]\nname = \"adler2\"\nversion = \"2.0.1\"\ndependencies = [\"cfg-if\"]\n",
+        )
+        .unwrap();
+        ed.set_text_initial("Cargo.lock".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        assert!(
+            ed.completions.iter().any(|c| c.label == ".package" && c.insert == "Cargo.lock.package."),
+            "bare `Cargo.lock` must immediately offer `.package` drill-down, got {:?}",
+            ed.completions.iter().map(|c| (&c.label, &c.insert)).collect::<Vec<_>>()
+        );
+        let pkg_idx = ed.completions.iter().position(|c| c.label == ".package").unwrap();
+        assert!(ed.apply_completion(pkg_idx));
+        assert_eq!(ed.text, "Cargo.lock.package.");
+
+        // Reflexive `.` overtypes cleanly instead of producing `..`.
+        ed.insert_typed(".");
+        assert_eq!(ed.text, "Cargo.lock.package.");
+
+        // Next refresh immediately shows `name`, `version`, `dependencies`!
+        ed.refresh_assist(&state, &[], false);
+        assert!(ed.completions.iter().any(|c| c.label == "dependencies"));
+
+        // Selecting `dependencies` and refreshing immediately offers `[]` flatten+drop-nulls!
+        let dep_idx = ed.completions.iter().position(|c| c.label == "dependencies").unwrap();
+        assert!(ed.apply_completion(dep_idx));
+        assert_eq!(ed.text, "Cargo.lock.package.dependencies");
+        ed.refresh_assist(&state, &[], false);
+        assert_eq!(ed.completions[0].label, "[]");
+        assert_eq!(ed.completions[0].insert, "Cargo.lock.package.dependencies[]");
+        assert!(ed.apply_selected_completion());
+        assert_eq!(ed.text, "Cargo.lock.package.dependencies[]");
+
+        // Auto-dot strips cleanly if user hits Space, `[`, or Enter directly on `Cargo.lock.package.`!
+        ed.set_text_initial("Cargo.lock".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        let pkg_idx = ed.completions.iter().position(|c| c.label == ".package").unwrap();
+        assert!(ed.apply_completion(pkg_idx));
+        assert_eq!(ed.text, "Cargo.lock.package.");
+        ed.insert_typed(" ");
+        assert_eq!(ed.text, "Cargo.lock.package ");
+
+        ed.set_text_initial("Cargo.lock".to_owned());
+        ed.refresh_assist(&state, &[], false);
+        let pkg_idx = ed.completions.iter().position(|c| c.label == ".package").unwrap();
+        assert!(ed.apply_completion(pkg_idx));
+        assert_eq!(ed.take_submitted(), "Cargo.lock.package");
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
