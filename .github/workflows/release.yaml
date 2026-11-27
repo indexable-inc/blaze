@@ -224,17 +224,13 @@ jobs:
           EOF
           cat out/SHA256SUMS
           cat out/B3SUMS
-      - name: Plan R2 release upload
-        id: r2
-        run: |
-          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py "{\"kind\": \"release\", \"tag\": \"$TAG\", \"dir\": \"out\"}"; echo R2; } >> "$GITHUB_OUTPUT"
       - name: Upload release assets to R2
-        uses: cloudflare/wrangler-action@v4
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: |
-            ${{ steps.r2.outputs.r2 }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          python3 -I .github/scripts/r2.py "{\"kind\": \"release\", \"tag\": \"$TAG\", \"dir\": \"out\", \"run\": true, \"s3\": true}"
       - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -257,7 +253,6 @@ jobs:
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" "${FLAGS[@]}" "${ASSETS[@]}"
           fi
       - name: Update stable and canary channel pointers
-        id: channels
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -269,11 +264,10 @@ jobs:
             curl -fsSL https://blaze-releases.ix.dev/channels/stable > channels/stable
           fi
           gh release upload channels --repo "$GITHUB_REPOSITORY" --clobber channels/stable channels/canary
-          { echo 'r2<<R2'; python3 -I .github/scripts/r2.py '{"kind": "channels", "dir": "channels"}'; echo R2; } >> "$GITHUB_OUTPUT"
       - name: Upload channel pointers to R2
-        uses: cloudflare/wrangler-action@v4
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_R2_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: |
-            ${{ steps.channels.outputs.r2 }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          python3 -I .github/scripts/r2.py '{"kind": "channels", "dir": "channels", "run": true, "s3": true}'

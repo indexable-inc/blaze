@@ -18,18 +18,22 @@ every byte against the pinned hash (versions.rs, library.rs, serve/native.rs, ll
     r2.py '{"kind": "release", "tag": "v0.20261105.1", "dir": "out"}'
     r2.py '{"kind": "native", "dir": "llvm"}'          # every *.tar.xz under dir
     r2.py '{"kind": "channels", "dir": "channels"}'    # the files stable and canary in dir
-    r2.py '{..., "run": true}'                         # put them with the wrangler on PATH
+    r2.py '{..., "run": true}'                         # put via S3 if R2_* env set, else wrangler
+    r2.py '{..., "run": true, "s3": true}'             # put via aws s3api using R2_* env vars
 
-Without `run` it prints one wrangler command per line (without the leading `wrangler`), which
-the workflows hand to cloudflare/wrangler-action, so the R2 token reaches wrangler alone and the
-key layout lives here alone. With `run` (backfilling by hand, logged in with `wrangler login`)
-it puts them, four at a time, each bounded; a failure names the object, the command, its exit
-code and its stderr's tail. The JSON is inline, a file's path, or `-` for stdin. Stdlib only,
+Without `run` it prints one wrangler command per line (without the leading `wrangler`), or one
+`aws s3api put-object` command per line when `s3` is true, so the key layout lives here alone.
+With `run` it puts them, four at a time, each bounded: using `aws s3api put-object` when `s3` is
+true or when `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY` are all set in the
+environment, and otherwise using the `wrangler` on PATH (e.g. local backfill after `wrangler
+login`). A failure names the object, the command, its exit code and its stderr's tail (never
+printing secret keys). The JSON is inline, a file's path, or `-` for stdin. Stdlib only,
 Python 3.11+.
 """
 
 import asyncio
 import json
+import os
 import re
 import shlex
 import sys
@@ -48,6 +52,7 @@ NATIVE = re.compile(r"[A-Za-z0-9._-]+-[0-9a-f]{16}\.tar\.xz")
 CHANNELS = ("stable", "canary")
 # versions.rs's B3SUMS_SINCE: the first date of releases that all publish B3SUMS.
 B3SUMS_SINCE = 20261031
+R2_ENV_VARS = ("R2_ENDPOINT", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY")
 
 
 class Failed(Exception):
@@ -60,6 +65,22 @@ class Input:
     dir: str
     tag: str = ""
     run: bool = False
+    s3: bool = False
+
+
+@dataclass(frozen=True)
+class S3Config:
+    endpoint: str
+    access_key_id: str
+    secret_access_key: str
+
+    def env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["AWS_ACCESS_KEY_ID"] = self.access_key_id
+        env["AWS_SECRET_ACCESS_KEY"] = self.secret_access_key
+        env["AWS_DEFAULT_REGION"] = "auto"
+        env["AWS_EC2_METADATA_DISABLED"] = "true"
+        return env
 
 
 @dataclass(frozen=True)
@@ -72,6 +93,19 @@ class Put:
     def command(self) -> list[str]:
         return ["r2", "object", "put", f"{BUCKET}/{self.key}", f"--file={self.file}",
                 f"--content-type={self.type}", f"--cache-control={self.cache}", "--remote"]
+
+    def s3_command(self, endpoint: str | None) -> list[str]:
+        cmd = ["aws", "s3api", "put-object"]
+        if endpoint:
+            cmd.extend(["--endpoint-url", endpoint])
+        cmd.extend([
+            "--bucket", BUCKET,
+            "--key", self.key,
+            "--body", str(self.file),
+            "--content-type", self.type,
+            "--cache-control", self.cache,
+        ])
+        return cmd
 
 
 def typed(text: str) -> Input:
@@ -149,11 +183,38 @@ def planned(it: Input) -> list[Put]:
     return sorted(puts, key=lambda p: p.key)
 
 
-async def put(one: Put, gate: asyncio.Semaphore) -> None:
-    cmd = ["wrangler", *one.command()]
+def s3_config(required: bool) -> S3Config | None:
+    vals = {name: os.environ.get(name, "").strip() for name in R2_ENV_VARS}
+    if all(vals.values()):
+        return S3Config(
+            endpoint=vals["R2_ENDPOINT"].rstrip("/"),
+            access_key_id=vals["R2_ACCESS_KEY_ID"],
+            secret_access_key=vals["R2_SECRET_ACCESS_KEY"],
+        )
+    if required:
+        missing = [name for name in R2_ENV_VARS if not vals[name]]
+        sys.exit(f"r2.py: s3 mode requires environment variable(s): {', '.join(missing)}")
+    return None
+
+
+async def put(one: Put, gate: asyncio.Semaphore, s3: S3Config | None) -> None:
+    if s3 is not None:
+        cmd = one.s3_command(s3.endpoint)
+        env = s3.env()
+    else:
+        cmd = ["wrangler", *one.command()]
+        env = None
     async with gate:
         print(f"r2.py: {one.key} ({one.file.stat().st_size} bytes)", flush=True)
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+        except FileNotFoundError:
+            raise Failed(f"r2.py: putting {one.key}: `{cmd[0]}` not found on PATH") from None
         try:
             async with asyncio.timeout(1800):
                 out, err = await proc.communicate()
@@ -165,11 +226,11 @@ async def put(one: Put, gate: asyncio.Semaphore) -> None:
         raise Failed(f"r2.py: putting {one.key}: `{shlex.join(cmd)}` exited {proc.returncode}:\n{tail}")
 
 
-async def run(puts: list[Put]) -> None:
+async def run(puts: list[Put], s3: S3Config | None) -> None:
     gate = asyncio.Semaphore(4)
     async with asyncio.TaskGroup() as group:
         for one in puts:
-            group.create_task(put(one, gate))
+            group.create_task(put(one, gate, s3))
 
 
 def main() -> None:
@@ -178,11 +239,17 @@ def main() -> None:
     it = typed(sys.argv[1])
     puts = planned(it)
     if it.run:
+        s3 = s3_config(required=it.s3)
         try:
-            asyncio.run(run(puts))
+            asyncio.run(run(puts, s3))
         except* Failed as failed:
             sys.exit("\n".join(str(e) for e in failed.exceptions))
-        print(f"r2.py: put {len(puts)} objects into {BUCKET}")
+        mode = "s3" if s3 is not None else "wrangler"
+        print(f"r2.py: put {len(puts)} objects into {BUCKET} ({mode})")
+    elif it.s3:
+        endpoint = os.environ.get("R2_ENDPOINT", "").strip().rstrip("/") or None
+        for one in puts:
+            print(shlex.join(one.s3_command(endpoint)))
     else:
         for one in puts:
             print(shlex.join(one.command()))
