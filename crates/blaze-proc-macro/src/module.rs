@@ -230,10 +230,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&blaze_sha256::digest(bytes))
 }
 
-/// Current proc-macro module identity header (`blaze proc-macro module 5`): bumped when
-/// proc-macro compilation semantics or sysroot closure change (form 5: minimal Rust sysroot
-/// without ambient `bstd` unless referenced) so stale form-4 modules map to a distinct key.
-pub const MODULE_HEADER: &str = "blaze proc-macro module 5";
+/// Current proc-macro module identity header (`blaze proc-macro module 6`): bumped when
+/// proc-macro compilation semantics, export synthesis, or sysroot closure change (form 6:
+/// post-expansion proc-macro `_DECLS` and `macros` export synthesis in #2746) so stale
+/// form-5 modules with empty/partial `macros` files map to a distinct key.
+pub const MODULE_HEADER: &str = "blaze proc-macro module 6";
 
 /// The crate's identity as text: what the module key is the digest of.
 pub fn identity(id: &CrateId<'_>) -> String {
@@ -257,6 +258,9 @@ pub fn identity(id: &CrateId<'_>) -> String {
         // (scripts proc_macro_modules.rs) writes the same text.
         // Form 5 (2026-11-27): wasm64 self-compilation no longer pulls ambient `bstd` (and its
         // transitive closure) into proc-macro sysroot records unless the unit closure references it.
+        // Form 6 (2026-11-27): proc-macro `_DECLS` and `macros` exports are synthesized after
+        // macro expansion (#2746), invalidating pre-#2746 form-5 records whose `macros` files
+        // missed macro-generated `#[proc_macro*]` exports (e.g. `zerocopy-derive`, `derive_more-impl`).
         "{MODULE_HEADER}\nname {}\nversion {}\n{source}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
         id.name,
         id.version,
@@ -465,7 +469,7 @@ mod header_tests {
     use super::*;
 
     #[test]
-    fn proc_macro_module_identity_uses_form_5_and_misses_stale_form_4_store_entry() {
+    fn proc_macro_module_identity_uses_form_6_and_misses_stale_form_5_and_4_store_entries() {
         let id = CrateId {
             name: "demo_derive",
             version: "0.1.0",
@@ -473,40 +477,49 @@ mod header_tests {
             deps: "deps-hash",
             features: &["default"],
         };
-        let v5_identity = identity(&id);
-        assert_eq!(v5_identity.lines().next(), Some(MODULE_HEADER));
-        let v4_identity = v5_identity.replacen(MODULE_HEADER, "blaze proc-macro module 4", 1);
+        let v6_identity = identity(&id);
+        assert_eq!(MODULE_HEADER, "blaze proc-macro module 6");
+        assert_eq!(v6_identity.lines().next(), Some(MODULE_HEADER));
+        let v5_identity = v6_identity.replacen(MODULE_HEADER, "blaze proc-macro module 5", 1);
+        let v4_identity = v6_identity.replacen(MODULE_HEADER, "blaze proc-macro module 4", 1);
+        let v5_key = sha256_hex(v5_identity.as_bytes());
         let v4_key = sha256_hex(v4_identity.as_bytes());
-        let v5_key = module_key(&id);
-        assert_ne!(v4_key, v5_key, "form 5 key must differ from stale form 4 key");
+        let v6_key = module_key(&id);
+        assert_ne!(v5_key, v6_key, "form 6 key must differ from stale form 5 key");
+        assert_ne!(v4_key, v6_key, "form 6 key must differ from stale form 4 key");
 
-        let store = std::env::temp_dir().join(format!("blaze-pm-module-v5-test-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("blaze-pm-module-v6-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
-        let v4_dir = store.join("proc-macro/modules").join(&v4_key);
-        std::fs::create_dir_all(&v4_dir).expect("create v4 dir");
-        std::fs::write(v4_dir.join("identity"), &v4_identity).expect("write v4 identity");
-        std::fs::write(v4_dir.join("wasm-sha256"), "deadbeef\n").expect("write v4 digest");
-        std::fs::write(v4_dir.join("macros"), "0 derive Demo\n").expect("write v4 macros");
-        std::fs::write(v4_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write v4 decls");
+        for (stale_key, stale_identity, stale_digest) in [(&v4_key, &v4_identity, "deadbeef\n"), (&v5_key, &v5_identity, "feedface\n")] {
+            let stale_dir = store.join("proc-macro/modules").join(stale_key);
+            std::fs::create_dir_all(&stale_dir).expect("create stale dir");
+            std::fs::write(stale_dir.join("identity"), stale_identity).expect("write stale identity");
+            std::fs::write(stale_dir.join("wasm-sha256"), stale_digest).expect("write stale digest");
+            // Stale form-5 entries built before #2746 could carry empty/partial `macros` files.
+            std::fs::write(stale_dir.join("macros"), "").expect("write stale macros");
+            std::fs::write(stale_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write stale decls");
+        }
 
-        // Lookup by current form 5 misses the stale form 4 directory cleanly.
-        assert!(matches!(find_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v5_key));
-        assert!(matches!(read_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v5_key));
+        // Lookup by current form 6 misses stale form 5 and form 4 directories cleanly.
+        assert!(matches!(find_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v6_key));
+        assert!(matches!(read_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v6_key));
 
-        // Publishing form 5 alongside stale form 4 resolves uniquely to form 5.
-        let v5_dir = store.join("proc-macro/modules").join(&v5_key);
-        std::fs::create_dir_all(&v5_dir).expect("create v5 dir");
-        std::fs::write(v5_dir.join("identity"), &v5_identity).expect("write v5 identity");
-        std::fs::write(v5_dir.join("wasm-sha256"), "cafebabe\n").expect("write v5 digest");
-        std::fs::write(v5_dir.join("macros"), "0 derive Demo\n").expect("write v5 macros");
-        std::fs::write(v5_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write v5 decls");
+        // Publishing form 6 alongside stale form 5 and form 4 resolves uniquely to form 6.
+        let v6_dir = store.join("proc-macro/modules").join(&v6_key);
+        std::fs::create_dir_all(&v6_dir).expect("create v6 dir");
+        std::fs::write(v6_dir.join("identity"), &v6_identity).expect("write v6 identity");
+        std::fs::write(v6_dir.join("wasm-sha256"), "cafebabe\n").expect("write v6 digest");
+        std::fs::write(v6_dir.join("macros"), "0 derive Demo\n").expect("write v6 macros");
+        std::fs::write(v6_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write v6 decls");
 
-        let (found_key, digest) = find_module(&store, &id).expect("find v5 module");
-        assert_eq!(found_key, v5_key);
+        let (found_key, digest) = find_module(&store, &id).expect("find v6 module");
+        assert_eq!(found_key, v6_key);
         assert_eq!(digest, "cafebabe");
-        let rec = read_module(&store, &id).expect("read v5 module");
-        assert_eq!(rec.key, v5_key);
+        let rec = read_module(&store, &id).expect("read v6 module");
+        assert_eq!(rec.key, v6_key);
         assert_eq!(rec.wasm_sha256, "cafebabe");
+        assert_eq!(rec.macros.len(), 1);
+        assert_eq!(rec.macros[0].name, "Demo");
 
         let _ = std::fs::remove_dir_all(&store);
     }
