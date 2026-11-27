@@ -733,6 +733,10 @@ pub(crate) enum ProbeOncePlant {
 pub(crate) struct SharedCommandProbes {
     c_probes: bstd::sync::Once<Option<blaze_proc_macro::probe_clang::CProbeSetting>>,
     spawn_setting: bstd::sync::Once<Result<SpawnSetting, blaze_own::String<blaze_own::SharedAlloc<'static>>>>,
+    /// First verified dependency-probe identity computed during `check`, reused by start-time
+    /// proc-macro runners (`RunProcs` via `Standing`) so `run`/`test`/`export` look up the exact
+    /// `MacroModule` that `check` keyed and produced even if a host closure shifts afterwards.
+    checked_dep_probe_hex: bstd::sync::Once<crate::wasm64_compile::Hex64>,
     #[cfg(test)]
     plant: ProbeOncePlant,
 }
@@ -743,6 +747,7 @@ impl SharedCommandProbes {
         Self {
             c_probes: bstd::sync::Once::new("command.c_probes"),
             spawn_setting: bstd::sync::Once::new("command.spawn_setting"),
+            checked_dep_probe_hex: bstd::sync::Once::new("command.checked_dep_probe_hex"),
             #[cfg(test)]
             plant: ProbeOncePlant::None,
         }
@@ -753,13 +758,14 @@ impl SharedCommandProbes {
         Self {
             c_probes: bstd::sync::Once::new("command.c_probes"),
             spawn_setting: bstd::sync::Once::new("command.spawn_setting"),
+            checked_dep_probe_hex: bstd::sync::Once::new("command.checked_dep_probe_hex"),
             plant,
         }
     }
 
     /// Pairs this shared command holder with the resolved command `env` (zero cost, `Copy`).
     pub(crate) fn with_env<'a>(&'a self, env: &'a FetchEnv<'a>) -> CommandProbes<'a> {
-        CommandProbes { inner: self, env, sdk: env.sdk }
+        CommandProbes { inner: self, env, sdk: env.sdk, reuse_checked_dep_probes: false }
     }
 
     #[cfg(test)]
@@ -780,6 +786,9 @@ pub(crate) struct CommandProbes<'a> {
     inner: &'a SharedCommandProbes,
     env: &'a FetchEnv<'a>,
     sdk: Result<blaze_apple_sdk::Sdk<'a>, blaze_apple_sdk::SdkRefused<'a>>,
+    /// When `true` (start-time `RunProcs` via `Standing`), `dep_probe_identity_hex` reuses the
+    /// verified check-time digest stored in `inner.checked_dep_probe_hex` instead of rescanning.
+    reuse_checked_dep_probes: bool,
 }
 
 impl<'a> CommandProbes<'a> {
@@ -791,6 +800,12 @@ impl<'a> CommandProbes<'a> {
         sdk: Result<blaze_apple_sdk::Sdk<'a>, blaze_apple_sdk::SdkRefused<'a>>,
     ) -> Self {
         Self { sdk, ..self }
+    }
+
+    /// Marks this handle as a start-time consumer (`run`/`test`/`export` via `Standing`) that
+    /// reuses the verified check-time probe identity snapshot when present.
+    pub(crate) fn with_checked_snapshot(self) -> Self {
+        Self { reuse_checked_dep_probes: true, ..self }
     }
 
     /// Lazily opens and shares the single command-level `CProbeSetting` (`Ok(None)` when `HOME`
@@ -929,11 +944,16 @@ impl<'a> CommandProbes<'a> {
         &self,
         cx: &Cx,
     ) -> Result<crate::wasm64_compile::Hex64, ProbeSetupError> {
+        if self.reuse_checked_dep_probes
+            && let Some(&hex) = self.inner.checked_dep_probe_hex.get()
+        {
+            return Ok(hex);
+        }
         let spawn = self.spawn_setting(cx)?;
         let c_probes = self.c_probes(cx)?;
         let mut sdk_buf = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
         let sdk_id = encode_sdk_hex(self.sdk, &mut sdk_buf).map(|(_, id)| id);
-        crate::wasm64_compile::dep_probe_identity_from_setting(
+        let hex = crate::wasm64_compile::dep_probe_identity_from_setting(
             cx,
             crate::graph::TRIPLE,
             spawn,
@@ -941,7 +961,12 @@ impl<'a> CommandProbes<'a> {
             sdk_id,
             self.env.heap.alloc(),
             self.env.heap.shared(),
-        )
+        )?;
+        let _ = self
+            .inner
+            .checked_dep_probe_hex
+            .get_or_make(cx, |_cx| Ok::<_, core::convert::Infallible>(hex));
+        Ok(hex)
     }
 
     #[cfg(test)]
@@ -1355,15 +1380,49 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(opt) => opt.map(|hex| crate::work::held_str(&hex, jobs)),
         Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
     };
-    let deps_digest = match crate::wasm64_compile::unit_has_dep_build_scripts(graph, scripts.wasm_graph, script, false) {
-        Ok(true) => match probes.dep_probe_identity_hex(&cx) {
-            Ok(probes_hex) => Some(crate::wasm64_compile::fold_dep_probes_opt(deps_digest, probes_hex.as_str(), jobs)),
-            Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
-        },
-        Ok(false) => deps_digest,
+    let ran_as = {
+        let erased = blaze_own::Erased::new(frame);
+        RanAs::of(&blaze_proc_macro::native_unit::placed_in_store(
+            &shared.store,
+            graph,
+            script,
+            MODE,
+            crate::graph::TRIPLE,
+            erased.handle(),
+        ))
+    };
+    let deps_digest = match fold_wasm_script_dep_probes(&cx, ran_as, graph, scripts.wasm_graph, script, deps_digest, probes, jobs) {
+        Ok(folded) => folded,
         Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
     };
     Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole, deps_digest }))
+}
+
+/// Folds the dependency build-script probe identity digest into `deps_digest` ONLY for
+/// `RanAs::Wasm` build scripts (which execute wasm64 self-compiled modules and require
+/// `wasm_graph`). Native build scripts (`RanAs::Native`) skip wasm64 dependency scanning so
+/// minimal toolchains without `wasm64-blaze-wasip1` never fail native preparation.
+#[expect(clippy::too_many_arguments, reason = "build-script deps-digest folding over cx, placement, graphs, unit, digest, probes, and bump")]
+fn fold_wasm_script_dep_probes<'j>(
+    cx: &Cx,
+    ran_as: RanAs,
+    graph: &UnitGraph<'_>,
+    wasm_graph: Option<&UnitGraph<'_>>,
+    script: UnitId,
+    deps_digest: Option<&'j str>,
+    probes: CommandProbes<'_>,
+    jobs: &'j Frame,
+) -> Result<Option<&'j str>, ProbeSetupError> {
+    if ran_as != RanAs::Wasm {
+        return Ok(deps_digest);
+    }
+    match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, script, false)? {
+        true => {
+            let probes_hex = probes.dep_probe_identity_hex(cx)?;
+            Ok(Some(crate::wasm64_compile::fold_dep_probes_opt(deps_digest, probes_hex.as_str(), jobs)))
+        }
+        false => Ok(deps_digest),
+    }
 }
 
 /// What a script's run gave on its worker, in `Global` (its task frame ends with it): the
@@ -2167,5 +2226,164 @@ mod shared_command_probes_dst {
             });
         }
         assert_eq!(p_inits.load(Ordering::SeqCst), 2, "SkipOnce plant must duplicate init");
+    }
+
+    #[test]
+    fn native_script_skips_wasm_dep_scan_when_wasm_graph_is_none() {
+        let io = Io::simulated(SimWorld::new(71, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let env = sim_env(&io);
+        let holder = SharedCommandProbes::new();
+        let probes = holder.with_env(&env);
+
+        let frame = bstd::mem::Frame::with_reserve(2 << 20, bstd::mem::Tag::Other).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let a = erased.handle();
+        let mut units = blaze_own::Vec::new_in(a);
+        units.push(blaze_unit_graph::Unit {
+            package: blaze_manifest::lock::LockId(0),
+            name: blaze_own::String::from_str_in("native-pkg", a),
+            version: blaze_own::String::from_str_in("0.1.0", a),
+            kind: blaze_unit_graph::UnitKind::BuildScript,
+            for_host: true,
+            edition: edition::PackageEdition::of_manifest("2024").expect("edition"),
+            crate_name: blaze_own::String::from_str_in("build_script_build", a),
+            root: blaze_own::String::from_str_in("build.rs", a),
+            features: blaze_own::Vec::new_in(a),
+            cfg: blaze_own::Vec::new_in(a),
+            deps: blaze_own::Vec::new_in(a),
+            build_script: None,
+            links: None,
+        });
+        let graph = blaze_unit_graph::UnitGraph {
+            resolver: blaze_unit_graph::Resolver::V3,
+            units,
+            meta: blaze_own::Vec::new_in(a),
+            left_out: blaze_own::Vec::new_in(a),
+        };
+
+        // Native build script with `wasm_graph = None` MUST succeed untouched without
+        // requiring `wasm64-blaze-wasip1` or initializing `SharedCommandProbes`.
+        let native_res = super::fold_wasm_script_dep_probes(
+            &cx,
+            super::RanAs::Native,
+            &graph,
+            None,
+            blaze_unit_graph::UnitId(0),
+            Some("orig-deps"),
+            probes,
+            &frame,
+        )
+        .expect("native script must skip wasm_graph scan when wasm_graph is None");
+        assert_eq!(native_res, Some("orig-deps"));
+        assert!(!holder.c_probes_initialized());
+        assert!(!holder.spawn_setting_initialized());
+
+        // Contrast: Wasm build script with `wasm_graph = None` MUST refuse with `WasmGraphMissing`.
+        let wasm_err = super::fold_wasm_script_dep_probes(
+            &cx,
+            super::RanAs::Wasm,
+            &graph,
+            None,
+            blaze_unit_graph::UnitId(0),
+            Some("orig-deps"),
+            probes,
+            &frame,
+        )
+        .expect_err("wasm script must refuse when wasm_graph is None");
+        assert_eq!(wasm_err.kind, ProbeErrorKind::WasmGraphMissing);
+    }
+
+    #[test]
+    fn start_time_probes_reuse_check_time_snapshot_after_live_answerer_drift() {
+        use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, ProbeAnswerer};
+        use blaze_ids::ContentId;
+        use blaze_proc_macro::probe_clang::{CProbeStore, CScriptProbes, MemCProbeStore};
+
+        struct MutableAnswerer(std::sync::Arc<core::sync::atomic::AtomicU8>);
+        impl ProbeAnswerer for MutableAnswerer {
+            fn id<'a>(&self, _alloc: blaze_own::Alloc<'a>) -> Result<ContentId, blaze_own::AString<'a>> {
+                Ok(ContentId([self.0.load(Ordering::SeqCst); 32]))
+            }
+            fn answer<'a, 'b>(
+                &self,
+                _probe: &CanonicalProbe<'_, '_>,
+                _input_bytes: &mut dyn FnMut(&str) -> Option<&'b [u8]>,
+                alloc: blaze_own::Alloc<'a>,
+            ) -> Result<ProbeAnswer<'a>, blaze_own::AString<'a>> {
+                Err(blaze_own::AString::from_str_in("unused", alloc))
+            }
+        }
+
+        let io = Io::simulated(SimWorld::new(72, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let env = sim_env(&io);
+        let shared = SharedAlloc::global();
+        let state = std::sync::Arc::new(core::sync::atomic::AtomicU8::new(0xaa));
+        let answerer: blaze_own::Arc<dyn ProbeAnswerer + Send + Sync, SharedAlloc<'static>> =
+            blaze_own::Arc::new_in(MutableAnswerer(std::sync::Arc::clone(&state)), shared);
+        let records: blaze_own::Arc<dyn CProbeStore, SharedAlloc<'static>> =
+            blaze_own::Arc::new_in(MemCProbeStore::default(), shared);
+        let ready = CProbeSetting::Ready(CScriptProbes {
+            answerer,
+            #[cfg(target_os = "linux")]
+            hermetic: None,
+            records,
+            sdk_dir: blaze_own::Arc::from_str_in("", shared),
+            sdk_id: blaze_own::Arc::from_str_in("", shared),
+            sdk_digest: [0; 32],
+            clang_sha256: [0x99; 32],
+        });
+
+        // Simulate check phase populating `SharedCommandProbes` once (as `checking` does).
+        let holder = SharedCommandProbes::new();
+        let check_probes = holder.with_env(&env);
+        let c_opens = AtomicU32::new(0);
+        let s_opens = AtomicU32::new(0);
+        let _ = check_probes
+            .c_probes_with(&cx, |_| {
+                c_opens.fetch_add(1, Ordering::SeqCst);
+                Some(ready)
+            })
+            .expect("seed c_probes");
+        let _ = check_probes
+            .spawn_setting_with(&cx, |_| {
+                s_opens.fetch_add(1, Ordering::SeqCst);
+                Ok(SpawnSetting::facts_only(FactPins {
+                    clang_version_text: std::string::String::from("clang version 23.0.0"),
+                    macos_product_version: std::string::String::new(),
+                    macos_build_version: std::string::String::new(),
+                }))
+            })
+            .expect("seed spawn_setting");
+        let check_hex = check_probes
+            .dep_probe_identity_hex(&cx)
+            .expect("check-time dep_probe_identity_hex");
+        assert_eq!(c_opens.load(Ordering::SeqCst), 1);
+        assert_eq!(s_opens.load(Ordering::SeqCst), 1);
+
+        // Host ELF closure shifts between `check` and start-time `run`/`test`/`export`!
+        state.store(0xbb, Ordering::SeqCst);
+
+        // Check-time handles (without `.with_checked_snapshot()`) still observe live drift so
+        // mid-compile revalidation keeps refusing drifted publications.
+        let live_drifted_hex = check_probes
+            .dep_probe_identity_hex(&cx)
+            .expect("live check handle observes drift");
+        assert_ne!(live_drifted_hex, check_hex);
+
+        // Start-time `RunProcs` handle (borrowing the same `SharedCommandProbes` via `Standing`
+        // with `.with_checked_snapshot()`) MUST reuse the exact check-time probe snapshot and
+        // never reopen `c_probes` or `spawn_setting`.
+        let start_probes = holder.with_env(&env).with_sdk(env.sdk).with_checked_snapshot();
+        let start_hex = start_probes
+            .dep_probe_identity_hex(&cx)
+            .expect("start-time dep_probe_identity_hex reuses check snapshot");
+        assert_eq!(
+            start_hex, check_hex,
+            "start-time RunProcs must reuse check-time probe identity snapshot instead of rereading drifted closure"
+        );
+        assert_eq!(c_opens.load(Ordering::SeqCst), 1);
+        assert_eq!(s_opens.load(Ordering::SeqCst), 1);
     }
 }

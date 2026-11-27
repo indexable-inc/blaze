@@ -452,7 +452,7 @@ pub(crate) fn warm_toolchain(
         shown.quiet = true;
         let mut check_opts = opts();
         check_opts.fresh = fresh;
-        let checked = check_live(cx, fs, host, rng, Some(args), net, root, check_opts, &mut shown, phases, out, err, None, Some(&lazy_sdk), None, crate::store::StoreTeardown::Drop)?;
+        let checked = check_live(cx, fs, host, rng, Some(args), net, root, check_opts, &mut shown, phases, out, err, None, Some(&lazy_sdk), None, None, crate::store::StoreTeardown::Drop)?;
         let tc_hex = blaze_toolchain::PINNED.hex();
         out.line(
             cx,
@@ -508,7 +508,7 @@ fn serve(
                     let ran = crate::run_line::watched(cx, err, clock, line, |watch, bg| {
                         watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Checking));
                         let live = line.live.then_some(bg);
-                        let res = check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, live, Some(&lazy_sdk), None, crate::store::StoreTeardown::ForgetForExit);
+                        let res = check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, live, Some(&lazy_sdk), None, None, crate::store::StoreTeardown::ForgetForExit);
                         watch.see(blaze_screen::Step::Says);
                         res
                     }).map_err(CliError::RunLine)??;
@@ -524,7 +524,7 @@ fn serve(
                     if selectors.is_empty() {
                         selectors.push("all");
                     }
-                    let mut ask = |mut shown| check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, None, Some(&lazy_sdk), None, crate::store::StoreTeardown::Drop).map(|checked| (checked, shown));
+                    let mut ask = |mut shown| check_live(cx, fs, host, rng, Some(args), net, root, opts(), &mut shown, phases, out, err, None, Some(&lazy_sdk), None, None, crate::store::StoreTeardown::Drop).map(|checked| (checked, shown));
                     match crate::fix_then_check::<crate::fix::Atomic, Checked>(cx, root, &selectors, (caps, view, shown_root), frame, out, &mut ask)? {
                         crate::Fixed::Refused => None,
                         crate::Fixed::Checked(checked, _) => Some(checked),
@@ -923,6 +923,10 @@ pub(crate) struct Standing<'r, 'm> {
     /// already-opened `~/.blaze` directory so pure-Rust starts pay 0 ms for SDK probing.
     sdk_resolver: &'r dyn Fn(&Cx, Option<&Dir<ReadWrite>>, u64) -> Result<blaze_apple_sdk::Sdk<'r>, blaze_apple_sdk::SdkRefused<'r>>,
     home_dir: Option<&'r Dir<ReadWrite>>,
+    /// Check-time command probes (`SharedCommandProbes`) carried into start-time proc-macro
+    /// runners (`RunProcs`) so `run`/`test`/`export` reuse the exact probe/pin snapshot that
+    /// keyed and produced the `MacroModule` records.
+    probes: &'r crate::scripts::SharedCommandProbes,
 }
 
 /// Borrowed lazy macOS SDK handle handed to start-time proc-macro runners (`RunProcs`) so
@@ -955,6 +959,12 @@ impl<'r, 'm> Standing<'r, 'm> {
             home_dir: self.home_dir,
             wall_ns: self.lent.wall_ns(),
         }
+    }
+
+    /// Returns the check-time command probe holder (`SharedCommandProbes`) so start-time
+    /// `RunProcs` reuse the exact spawn-pin, C-probe, and probe-identity snapshot from `check`.
+    pub(crate) fn probes_for_procs(&self) -> &'r crate::scripts::SharedCommandProbes {
+        self.probes
     }
 
     /// Resolves the macOS SDK lazily on first demand (at most once per command via `OnceCell`),
@@ -2358,6 +2368,7 @@ pub(crate) fn open_pinned_standing<R>(
     let sdk_resolver = |cx: &Cx, home_dir: Option<&Dir<ReadWrite>>, wall_ns: u64| {
         lazy_sdk.resolve_on_demand(cx, home_dir, wall_ns)
     };
+    let command_probes = crate::scripts::SharedCommandProbes::new();
     let standing = Standing {
         root: cert,
         store: &mut store,
@@ -2384,6 +2395,7 @@ pub(crate) fn open_pinned_standing<R>(
         test_packages: None,
         sdk_resolver: &sdk_resolver,
         home_dir: Some(opened.home.dir()),
+        probes: &command_probes,
     };
     let started = start(standing, phases, rng);
     if let Some((name, why)) = refused.get() {
@@ -2728,7 +2740,7 @@ fn check_and_open<R>(
                     let mut first = print::Shown::new(caps, blaze_report::frame::plain::View::Agent, shown_root, frame);
                     first.quiet = true;
                     first.output_only = false;
-                    let _ = check_live(cx, fs, host, rng, args, net, root, opts(), &mut first, phases, out, err, None, Some(&lazy_sdk), Some(&mut reused_store), crate::store::StoreTeardown::Drop)?;
+                    let _ = check_live(cx, fs, host, rng, args, net, root, opts(), &mut first, phases, out, err, None, Some(&lazy_sdk), None, Some(&mut reused_store), crate::store::StoreTeardown::Drop)?;
                     if first.listed.iter().any(|l| l.fix.is_some())
                         && let Ok(applied) = crate::fix::apply(cx, root, &crate::fix::Atomic, &first.listed, &["all"], frame)?
                     {
@@ -2745,7 +2757,8 @@ fn check_and_open<R>(
         let mut opts = opts();
         opts.scope = check_scope;
         let toolchain = opts.toolchain;
-        let checked = check_live(cx, fs, host, rng, args, net, root, opts, &mut shown, phases, out, err, live, Some(&lazy_sdk), Some(&mut reused_store), crate::store::StoreTeardown::Drop)?;
+        let command_probes = crate::scripts::SharedCommandProbes::new();
+        let checked = check_live(cx, fs, host, rng, args, net, root, opts, &mut shown, phases, out, err, live, Some(&lazy_sdk), Some(&command_probes), Some(&mut reused_store), crate::store::StoreTeardown::Drop)?;
         // The check has answered: its signals go back before the start, which takes the
         // parent's own (D103: run_loop.rs `Held::hold`; a suite's pool, test_drive.rs
         // `Signals`, once for the suite). Held into the start, the first run is refused.
@@ -2852,6 +2865,7 @@ fn check_and_open<R>(
                     test_packages: selected_packages,
                     sdk_resolver: &sdk_resolver,
                     home_dir: Some(opened.home.dir()),
+                    probes: &command_probes,
                 })
             }
             _ => None,
@@ -3136,7 +3150,7 @@ pub(crate) fn check<'f>(
     out: &Out,
     err: &Out,
 ) -> Result<Checked, CliError> {
-    check_live(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, None, None, None, crate::store::StoreTeardown::Drop)
+    check_live(cx, fs, host, rng, args, net, root, opts, shown, phases, out, err, None, None, None, None, crate::store::StoreTeardown::Drop)
 }
 
 /// Extracts an [`crate::engine_answer::Unreadable`] reason when reading a lazy page or standing
@@ -3257,6 +3271,7 @@ fn check_live<'f, 's: 'f>(
     err: &Out,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
     lazy_sdk: Option<&LazySdk<'s>>,
+    shared_probes: Option<&crate::scripts::SharedCommandProbes>,
     mut reuse_store: Option<&mut Option<crate::store::Opened>>,
     teardown: crate::store::StoreTeardown,
 ) -> Result<Checked, CliError> {
@@ -3313,6 +3328,7 @@ fn check_live<'f, 's: 'f>(
                             &mut active,
                             live,
                             lazy_sdk,
+                            shared_probes,
                             reuse,
                             &request_mem_slot,
                             teardown,
@@ -3340,6 +3356,7 @@ fn check_live<'f, 's: 'f>(
                         &mut active,
                         live,
                         lazy_sdk,
+                        shared_probes,
                         reuse,
                         &request_mem_slot,
                         teardown,
@@ -3474,6 +3491,7 @@ fn checking<'f, 's: 'f>(
     active: &mut Option<Phase>,
     live: Option<&(dyn blaze_screen::Watch + Sync)>,
     lazy_sdk: Option<&LazySdk<'s>>,
+    shared_probes: Option<&crate::scripts::SharedCommandProbes>,
     mut reuse_store: Option<&mut Option<crate::store::Opened>>,
     request_mem_slot: &core::cell::OnceCell<crate::engine_phase_mem::RequestMem>,
     teardown: crate::store::StoreTeardown,
@@ -4180,7 +4198,8 @@ fn checking<'f, 's: 'f>(
         scoped: Option<ScopedUnits>,
     }
 
-    let command_probes = crate::scripts::SharedCommandProbes::new();
+    let owned_probes = crate::scripts::SharedCommandProbes::new();
+    let command_probes = shared_probes.unwrap_or(&owned_probes);
     let mut ready_preflight = None;
     if matches!(chosen, crate::engine_ready_edit::Chosen::Wake { .. }) && !crate::engine_units::ready_lays_out() {
         let attempt = own_frame(|| -> Result<Result<blaze_own::Box<CheckedSetup<'_, '_>, blaze_own::Alloc<'static>>, crate::engine_ready_edit::ReadyRefused>, CliError> {
