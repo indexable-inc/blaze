@@ -1558,10 +1558,22 @@ impl Scene {
         is_focused: bool,
         win_w: f32,
         win_h: f32,
+        visible: HitRect,
+        radius: f32,
     ) {
         let dx = pane_rect.x0;
         let dy = pane_rect.y0 - top_offset;
-        let pane_clip = self.push_clip(pane_rect.x0, pane_rect.y0, pane_rect.x1, pane_rect.y1, 0.0);
+        // Only the part of the pane inside `visible` is drawn or hit (a floating sidebar
+        // covers the rest); positions still come from the whole `pane_rect`.
+        let vx0 = pane_rect.x0.max(visible.x0);
+        let vy0 = pane_rect.y0.max(visible.y0);
+        let pane_rect = HitRect::new(
+            vx0,
+            vy0,
+            pane_rect.x1.min(visible.x1).max(vx0),
+            pane_rect.y1.min(visible.y1).max(vy0),
+        );
+        let pane_clip = self.push_clip(pane_rect.x0, pane_rect.y0, pane_rect.x1, pane_rect.y1, radius);
 
         let mut clip_map: Vec<u32> = Vec::with_capacity(sub.clips.len());
         let mut overlay_clip_map: Vec<u32> = Vec::with_capacity(sub.clips.len());

@@ -27,10 +27,12 @@ use blaze_own::{AString, AVec, Alloc, String, Vec};
 pub const STARTER_CONFIG: &str = r#"# blaze-shell configuration (~/.config/blaze-shell/config.toml)
 # Edits reload automatically — no restart needed.
 
+# The prompt shows no hostname on this machine unless [host] sets a symbol or label
+# (SSH sessions always name the remote host).
 [host]
-# Replace the default laptop icon with any emoji or symbol:
+# Show an emoji or symbol (followed by the hostname) for this machine:
 # symbol = "🦑"
-# Set label = "" to show only the symbol (omit to keep your hostname):
+# Show this label instead of the hostname (label = "" with a symbol shows only the symbol):
 # label = ""
 
 # Per-hostname overrides (works for both local and SSH hosts):
@@ -49,7 +51,14 @@ pub const STARTER_CONFIG: &str = r#"# blaze-shell configuration (~/.config/blaze
 
 # Prompt display options:
 # [prompt]
-# show_toolchains = true
+# show_toolchains = true   # project toolchain icons (Rust, Nix, ...), off by default
+# show_processes = true    # live processes running in this directory, off by default
+
+# Terminal options:
+# [terminal]
+# alt_screen = "pane"      # full-screen programs (vim, htop, less, claude) open in a new tiled
+#                          # pane that closes when they exit (default); "inline" keeps them in
+#                          # the scrollback where they were started
 
 # Custom command-position abbreviations (expanded inline on Space/Enter):
 # [abbreviations]
@@ -101,6 +110,17 @@ pub struct CompletionSpecOverride<'a> {
     pub subcommands: AVec<'a, NamedDesc<'a>>,
 }
 
+/// Where a command that switches its terminal to the alternate screen is shown
+/// (`[terminal] alt_screen = "pane" | "inline"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AltScreenPlacement {
+    /// Move the program into a new tiled pane split off the one it started in, full-size and
+    /// focused; the pane closes when the program exits (the default).
+    Pane,
+    /// Keep the program inline in the scrollback of the pane it started in.
+    Inline,
+}
+
 /// Parsed `~/.config/blaze-shell/config.toml` allocated into an explicit [`Alloc`].
 #[derive(Debug, PartialEq, Eq)]
 pub struct UserConfig<'a> {
@@ -115,8 +135,17 @@ pub struct UserConfig<'a> {
     /// Manual CLI flag/subcommand overrides (`[completions.<cmd>]`).
     pub completions: AVec<'a, CompletionSpecOverride<'a>>,
     /// Whether to display detected project toolchain/language badges (Rust, Python, Nix, etc.)
-    /// in the prompt capsule (`[prompt] show_toolchains = true|false`, default `true`).
+    /// in the prompt capsule (`[prompt] show_toolchains = true|false`, default `false`).
     pub show_toolchains: bool,
+    /// Whether to display the live processes running in the working directory in the prompt
+    /// capsule (`[prompt] show_processes = true|false`, default `false`).
+    pub show_processes: bool,
+    /// Where alternate-screen programs are shown (`[terminal] alt_screen`, default `"pane"`).
+    pub alt_screen: AltScreenPlacement,
+    /// The `[terminal] alt_screen` value when it was neither `"pane"` nor `"inline"` (a string
+    /// of anything else, or a non-string). The host refuses to place alternate-screen programs
+    /// by a value it could not read and names this one instead.
+    pub alt_screen_rejected: Option<AString<'a>>,
 }
 
 impl<'a> UserConfig<'a> {
@@ -128,7 +157,10 @@ impl<'a> UserConfig<'a> {
             projects: Vec::new_in(alloc),
             abbreviations: Vec::new_in(alloc),
             completions: Vec::new_in(alloc),
-            show_toolchains: true,
+            show_toolchains: false,
+            show_processes: false,
+            alt_screen: AltScreenPlacement::Pane,
+            alt_screen_rejected: None,
         }
     }
 
@@ -192,6 +224,35 @@ impl<'a> UserConfig<'a> {
                                 && let DataValue::Bool(b) = *pv
                             {
                                 cfg.show_toolchains = b;
+                            }
+                            if matches!(pk, "show_processes" | "processes")
+                                && let DataValue::Bool(b) = *pv
+                            {
+                                cfg.show_processes = b;
+                            }
+                        }
+                    }
+                }
+                "terminal" => {
+                    if let DataValue::Map(m) = v {
+                        for (tk, tv) in m.iter() {
+                            if tk == "alt_screen" {
+                                match tv {
+                                    DataValue::Text(t) if t.as_str().trim() == "pane" => {
+                                        cfg.alt_screen = AltScreenPlacement::Pane;
+                                    }
+                                    DataValue::Text(t) if t.as_str().trim() == "inline" => {
+                                        cfg.alt_screen = AltScreenPlacement::Inline;
+                                    }
+                                    DataValue::Text(t) => {
+                                        cfg.alt_screen_rejected =
+                                            Some(String::from_str_in(t.as_str(), alloc));
+                                    }
+                                    _ => {
+                                        cfg.alt_screen_rejected =
+                                            Some(String::from_str_in("<not a string>", alloc));
+                                    }
+                                }
                             }
                         }
                     }
@@ -509,5 +570,20 @@ cl = "claude --dangerously-skip-permissions"
         assert_eq!(ov.subcommands[0].name.as_str(), "run");
         assert_eq!(symbol_cluster_count("🦑"), 1);
         assert_eq!(symbol_cluster_count("👋🌎"), 2);
+    }
+
+    #[test]
+    fn terminal_alt_screen_defaults_to_pane_and_names_a_bad_value() {
+        let alloc = Alloc::global();
+        let cfg = UserConfig::parse_in("", alloc);
+        assert_eq!(cfg.alt_screen, AltScreenPlacement::Pane);
+        assert_eq!(cfg.alt_screen_rejected, None);
+
+        let cfg = UserConfig::parse_in("[terminal]\nalt_screen = \"inline\"\n", alloc);
+        assert_eq!(cfg.alt_screen, AltScreenPlacement::Inline);
+        assert_eq!(cfg.alt_screen_rejected, None);
+
+        let cfg = UserConfig::parse_in("[terminal]\nalt_screen = \"tab\"\n", alloc);
+        assert_eq!(cfg.alt_screen_rejected.as_ref().map(AString::as_str), Some("tab"));
     }
 }

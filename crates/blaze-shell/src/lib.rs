@@ -1109,7 +1109,8 @@ mod tests {
     #[test]
     fn tiling_wm_invariants_and_scene_compositing() {
         use crate::layout::{
-            TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers, layout_window_top_bar,
+            Chrome, SidebarStatus, TOP_BAR_H, TabBarItem, build_pane_scene, draw_split_dividers,
+            layout_workspace_sidebar,
         };
         use crate::tiling::{CloseOutcome, FocusDir, SplitAxis, TileManager};
         use crate::view::{HitRect, Scene};
@@ -1239,9 +1240,9 @@ mod tests {
                 mouse_pos: None,
                 output_nav: None,
             });
-            master.composite_pane(sub, content, TOP_BAR_H, pl.focused, 1200.0, 800.0);
+            master.composite_pane(sub, content, TOP_BAR_H, pl.focused, 1200.0, 800.0, content, 0.0);
         }
-        draw_split_dividers(&mut master, &l.handles, None);
+        draw_split_dividers(&mut master, &l.handles, None, 0);
         let tabs = [TabBarItem {
             id: wm.active_tab().id,
             slot: 1,
@@ -1253,23 +1254,35 @@ mod tests {
             process_tag: None,
             branches: crate::layout::collect_branch_tree(&store),
         }];
-        layout_window_top_bar(
-            &mut master,
-            &tabs,
-            wm.focused_pane(),
-            l.is_zoomed,
-            l.pane_count_in_tab,
-            &store,
-            &prompt,
-            1200.0,
-            CellMetrics::default(),
-            100,
-            true,
-            false,
-        );
+        let status = SidebarStatus {
+            focused_pane: wm.focused_pane(),
+            is_zoomed: l.is_zoomed,
+            pane_count_in_tab: l.pane_count_in_tab,
+            zoom_pct: 100,
+        };
+        // A hidden sidebar draws nothing and takes no clicks: the content fills the window.
+        let hidden = Chrome::hidden(1200.0);
+        let before = master.hit_regions.len();
+        layout_workspace_sidebar(&mut master, &tabs, &hidden, status, 800.0, CellMetrics::default(), None);
+        assert_eq!(master.hit_regions.len(), before);
+        assert_eq!(hidden.content(1200.0, 800.0), HitRect::new(0.0, 0.0, 1200.0, 800.0));
+        // The sidebar eases in, settles exactly, and reverses mid-motion from where it is.
+        let mut motion = crate::layout::SidebarMotion::hidden();
+        motion.toggle_dock(10.0);
+        assert!(motion.moving(10.1));
+        let mid = motion.chrome(1200.0, 10.1).dock;
+        assert!(mid > 0.0 && mid < 1.0, "mid-motion dock {mid}");
+        assert_eq!(motion.chrome(1200.0, 11.0).dock, 1.0);
+        assert_eq!(motion.settled_chrome(1200.0).dock, 1.0);
+        motion.toggle_dock(10.1);
+        assert!((motion.chrome(1200.0, 10.1).dock - mid).abs() < 1e-6);
+        assert_eq!(motion.settled_chrome(1200.0).dock, 0.0);
+        // A docked sidebar is all of the window's chrome: toggle, `+` and the split buttons.
+        let docked = Chrome::docked(1200.0);
+        layout_workspace_sidebar(&mut master, &tabs, &docked, status, 800.0, CellMetrics::default(), None);
+        assert!(docked.content(1200.0, 800.0).x0 >= docked.sidebar_w);
         assert!(master.hit_regions.iter().any(|h| h.action == HitAction::ToggleSidebar));
         assert!(master.hit_regions.iter().any(|h| h.action == HitAction::NewTab));
-        assert!(master.hit_regions.iter().any(|h| h.action == HitAction::NewWindow));
         assert!(
             master
                 .hit_regions
@@ -1321,7 +1334,15 @@ mod tests {
             branches: tree,
         }];
         let mut sb_scene = Scene::new();
-        crate::layout::layout_workspace_sidebar(&mut sb_scene, &sb_tabs, 240.0, 800.0, CellMetrics::default(), None);
+        crate::layout::layout_workspace_sidebar(
+            &mut sb_scene,
+            &sb_tabs,
+            &Chrome::docked(1200.0),
+            status,
+            800.0,
+            CellMetrics::default(),
+            None,
+        );
         assert!(sb_scene.hit_regions.iter().any(|h| h.action == HitAction::SwitchTab(wm.active_tab().id)));
         assert!(sb_scene.hit_regions.iter().any(|h| h.action == HitAction::SwitchTabBranch { tab: wm.active_tab().id, branch: f2 }));
     }

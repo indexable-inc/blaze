@@ -110,7 +110,7 @@ pub fn draw_scrollbar(
         track_x1,
         thumb_y1,
         radius,
-        theme::rgba(0xeb, 0xea, 0xe6, 0.28),
+        theme::with_alpha(theme::INK_1, 0.28),
         clip_id,
     );
 }

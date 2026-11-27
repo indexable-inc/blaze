@@ -161,7 +161,11 @@ pub enum CloseOutcome<'a> {
         closed_panes: AVec<'a, PaneId>,
         next_focus: PaneId,
     },
+    /// The only pane of the only workspace: closing it closes the window.
     LastPaneInLastTab,
+    /// The pane or tab asked for is not in this window's active workspace; nothing closed.
+    /// (Never reported as `LastPaneInLastTab`, which would close the window with panes left.)
+    NotFound,
 }
 
 const MIN_RATIO: f32 = 0.15;
@@ -309,7 +313,7 @@ impl<'a> TileManager<'a> {
             v
         };
         if leaves.scan_for(&target).is_none() {
-            return CloseOutcome::LastPaneInLastTab;
+            return CloseOutcome::NotFound;
         }
         if leaves.len() <= 1 {
             if self.tabs.len() <= 1 {
@@ -357,7 +361,7 @@ impl<'a> TileManager<'a> {
             return CloseOutcome::LastPaneInLastTab;
         }
         let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
-            return CloseOutcome::LastPaneInLastTab;
+            return CloseOutcome::NotFound;
         };
         let removed = self.tabs.remove_shift(idx);
         let mut closed_panes = Vec::new_in(self.alloc);

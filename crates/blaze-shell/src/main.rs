@@ -116,9 +116,9 @@ mod macos_app {
     use blaze_shell::image_atlas::ImageAtlas;
     use blaze_shell::keys;
     use blaze_shell::layout::{
-        LayoutInput, SIDEBAR_W, TILE_GAP, TOP_BAR_H, TabBarItem, build_pane_scene,
-        collect_branch_tree, draw_split_dividers, layout_command_palette,
-        layout_fullscreen_terminal_pane, layout_window_top_bar, layout_workspace_sidebar,
+        Chrome, LayoutInput, PEEK_EDGE, SidebarMotion, SidebarStatus, TILE_GAP, TOP_BAR_H,
+        TabBarItem, build_pane_scene, collect_branch_tree, draw_split_dividers,
+        layout_command_palette, layout_fullscreen_terminal_pane, layout_workspace_sidebar,
     };
     use blaze_shell::prompt::{GitStatusWorker, PromptInfo, try_native_git_command};
     use blaze_shell::pty::{Pty, Read as PtyRead};
@@ -148,6 +148,19 @@ mod macos_app {
     const RESIZE_CORNER: f32 = 9.0;
 
     #[inline]
+    /// Show or hide the close, minimise and zoom buttons (they live in the sidebar's header).
+    fn set_traffic_lights_visible(window: &NSWindow, visible: bool) {
+        for kind in [
+            objc2_app_kit::NSWindowButton::CloseButton,
+            objc2_app_kit::NSWindowButton::MiniaturizeButton,
+            objc2_app_kit::NSWindowButton::ZoomButton,
+        ] {
+            if let Some(button) = window.standardWindowButton(kind) {
+                button.setHidden(!visible);
+            }
+        }
+    }
+
     fn on_resize_edge(x: f32, y: f32, w: f32, h: f32) -> bool {
         if x <= RESIZE_EDGE || x >= w - RESIZE_EDGE || y <= RESIZE_EDGE || y >= h - RESIZE_EDGE {
             return true;
@@ -167,9 +180,12 @@ mod macos_app {
         cwd: Option<String>,
         cmd: Option<String>,
         screenshot: Option<PathBuf>,
+        /// Start with the workspace sidebar docked (`--sidebar`).
+        sidebar: bool,
     }
 
     fn parse_cli() -> CliOpts {
+        let mut sidebar = false;
         let mut demo = false;
         let mut demo_popup = false;
         let mut demo_history = false;
@@ -196,6 +212,7 @@ mod macos_app {
                     demo_tiled = true;
                 }
                 "--scroll-bottom" => scroll_bottom = true,
+                "--sidebar" => sidebar = true,
                 "--scroll" => {
                     if let Some(v) = args.next() {
                         scroll_y = v.parse::<f32>().ok();
@@ -229,6 +246,7 @@ mod macos_app {
             cwd,
             cmd,
             screenshot,
+            sidebar,
         }
     }
 
@@ -792,8 +810,9 @@ mod macos_app {
         auto_scroll_bottom: bool,
         scroll_to_block: Option<BlockId>,
         active_pty: Option<ActivePty>,
-        /// Alternate-screen TUIs (`claude`, `vim`, `htop`) render inline by default so scrollback
-        /// remains visible; toggle true fullscreen anytime with `Cmd+Shift+F` (or block `⤢` pill).
+        /// Whether the PTY fills the pane. Alternate-screen TUIs (`claude`, `vim`, `htop`) move into
+        /// a dedicated pane with this set (`[terminal] alt_screen = "pane"`, the default); with
+        /// `"inline"` they stay in the scrollback. `Cmd+Shift+F` (or the block `⤢` pill) toggles it.
         pty_fullscreen: bool,
         /// When an inline PTY is running (`!pty_fullscreen`), whether keyboard & scroll focus is
         /// captured by the inline PTY (`true`) or returned to the shell composer (`false`).
@@ -801,6 +820,13 @@ mod macos_app {
         /// Optional row-count override for the inline PTY box, adjusted with `Cmd+Opt+`/`-`/`0`
         /// while focused inside the inline alternate-screen terminal.
         pty_inline_rows_override: Option<u16>,
+        /// `Some(origin)` when this pane exists only for one alternate-screen program moved here
+        /// from pane `origin` (`[terminal] alt_screen = "pane"`): it is never moved again and it
+        /// closes when the program exits, handing focus back to `origin`.
+        dedicated_tui: Option<PaneId>,
+        /// The running terminal block whose alternate-screen placement was already decided (moved,
+        /// kept inline by config, or refused with an error), so the decision is made once.
+        alt_screen_settled: Option<BlockId>,
         active_sysmon: Option<BlockId>,
         sysmon_fullscreen: bool,
         last_sysmon_tick: Instant,
@@ -856,6 +882,8 @@ mod macos_app {
                 pty_fullscreen: false,
                 pty_focused: false,
                 pty_inline_rows_override: None,
+                dedicated_tui: None,
+                alt_screen_settled: None,
                 active_sysmon: None,
                 sysmon_fullscreen: false,
                 last_sysmon_tick: Instant::now(),
@@ -1580,6 +1608,16 @@ mod macos_app {
                         height: cell_px.1,
                     });
                     if let Ok(mut term) = Terminal::new_in(opts, alloc) {
+                        theme::apply_terminal_colors(term.colors_mut());
+                        // The program inherits the cursor shape the line editor left the
+                        // terminal in, as under Ghostty, where the shell's DECSCUSR (nushell's
+                        // `cursor_shape.vi_insert: line`) persists into `claude`, which never
+                        // sends one. Steady: the owner's Ghostty has `cursor-style-blink = false`.
+                        term.feed(match self.editor.vim_cursor_shape() {
+                            blaze_vim::CursorShape::Block => b"\x1b[2 q",
+                            blaze_vim::CursorShape::Underline => b"\x1b[4 q",
+                            blaze_vim::CursorShape::Beam => b"\x1b[6 q",
+                        });
                         term.set_focused(true);
                         let body = BlockBody::Terminal {
                             term,
@@ -1896,7 +1934,6 @@ mod macos_app {
         cursor_vis: bool,
         frame_now: i64,
         zoom_pct: u16,
-        inline_titlebar: bool,
         active_drag: Option<&ActiveDrag>,
         active_trail: Option<CursorTrail>,
         output_selection: Option<TextSelection>,
@@ -1905,17 +1942,29 @@ mod macos_app {
         output_nav: Option<OutputNav>,
         dragging_split: Option<SplitHandle>,
         command_palette: Option<&CommandPalette>,
-        sidebar_open: bool,
+        chrome: Chrome,
     ) -> (Scene, TileLayout<'static>) {
-        let sidebar_w = if sidebar_open {
-            SIDEBAR_W.min(vw * 0.34).max(180.0)
-        } else {
-            0.0
-        };
-        let work_area = HitRect::new(sidebar_w, TOP_BAR_H, vw, vh.max(TOP_BAR_H + 60.0));
+        let work_area = chrome.content(vw, vh);
+        let visible = chrome.content_visible(vw, vh);
+        let card_radius = chrome.card_radius();
         let tile_layout = wm.layout(work_area.into(), TILE_GAP);
         let mut master = Scene::new();
         let is_split = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
+
+        // The opaque content card; around it (and through the sidebar) the window's blurred
+        // backdrop shows.
+        let card_clip = master.push_clip(visible.x0, visible.y0, visible.x1, visible.y1, 0.0);
+        master.round_rect(
+            work_area.x0,
+            work_area.y0,
+            work_area.x1,
+            work_area.y1,
+            card_radius,
+            theme::BG_CANVAS,
+            0.0,
+            [0.0; 4],
+            card_clip,
+        );
 
         // 1. Lay out and composite every visible pane in the active workspace tab!
         for pl in &tile_layout.panes {
@@ -2084,7 +2133,7 @@ mod macos_app {
             pane.last_scene.total_content_height = sub.total_content_height;
             pane.last_scene.scroll_viewport_height = sub.scroll_viewport_height;
 
-            master.composite_pane(sub, content_rect, TOP_BAR_H, pl.focused, vw, vh);
+            master.composite_pane(sub, content_rect, TOP_BAR_H, pl.focused, vw, vh, visible, card_radius);
 
             // Subtle Ghostty-style dim veil on unfocused tiled panes so focus is unmistakable.
             if is_split && !pl.focused {
@@ -2093,16 +2142,16 @@ mod macos_app {
                     pl.rect.y0,
                     pl.rect.x1,
                     pl.rect.y1,
-                    0.0,
+                    card_radius,
                     theme::rgba(0x08, 0x08, 0x0a, 0.22),
-                    0,
+                    card_clip,
                 );
             }
         }
 
         // 2. Crisp hairline split dividers between tiled panes.
         if !tile_layout.handles.is_empty() {
-            draw_split_dividers(&mut master, &tile_layout.handles, dragging_split.map(|h| h.split));
+            draw_split_dividers(&mut master, &tile_layout.handles, dragging_split.map(|h| h.split), card_clip);
         }
 
         // 3. Unified window-level titlebar with workspace tabs (`Cmd+1..9`), `+` (`Cmd+T`),
@@ -2136,25 +2185,21 @@ mod macos_app {
                 }
             })
             .collect();
-        if sidebar_open {
-            layout_workspace_sidebar(&mut master, &tab_items, sidebar_w, vh, metrics, mouse_pos);
-        }
-        if let Some(focused) = panes.get(&focused_id) {
-            layout_window_top_bar(
-                &mut master,
-                &tab_items,
-                focused_id,
-                tile_layout.is_zoomed,
-                tile_layout.pane_count_in_tab,
-                &focused.store,
-                &focused.prompt,
-                vw,
-                metrics,
+        // The workspace sidebar is the window's only chrome (no toolbar).
+        layout_workspace_sidebar(
+            &mut master,
+            &tab_items,
+            &chrome,
+            SidebarStatus {
+                focused_pane: focused_id,
+                is_zoomed: tile_layout.is_zoomed,
+                pane_count_in_tab: tile_layout.pane_count_in_tab,
                 zoom_pct,
-                inline_titlebar,
-                sidebar_open,
-            );
-        }
+            },
+            vh,
+            metrics,
+            mouse_pos,
+        );
 
         // 4. Optional `Cmd+Shift+P` Command Palette rendered above everything.
         if let Some(pal) = command_palette {
@@ -2173,15 +2218,15 @@ mod macos_app {
             let tw = metrics.measure(&shown, TextFace::UiSmall);
             let pw = (tw + 18.0).min(vw - 24.0);
             let ph = metrics.line_h(TextFace::UiSmall) + 8.0;
-            let px0 = 10.0;
-            let py0 = (vh - ph - 8.0).max(TOP_BAR_H + 8.0);
+            let px0 = visible.x0 + 10.0;
+            let py0 = (visible.y1 - ph - 8.0).max(visible.y0 + 8.0);
             master.overlay_round_rect(
                 px0,
                 py0,
                 px0 + pw,
                 py0 + ph,
                 5.0,
-                theme::rgba(0x14, 0x15, 0x1a, 0.94),
+                theme::with_alpha(theme::BG_POPUP, 0.94),
                 1.0,
                 theme::LINE,
                 0,
@@ -2202,10 +2247,18 @@ mod macos_app {
     }
 
     fn auto_split_axis(tile_layout: &TileLayout<'_>) -> SplitAxis {
+        match tile_layout.panes.iter().find(|p| p.focused) {
+            Some(p) => split_axis_for_pane(tile_layout, p.pane),
+            None => SplitAxis::Vertical,
+        }
+    }
+
+    /// Split along `pane`'s longer side (BSP spiral), as `Cmd+N` does for the focused pane.
+    fn split_axis_for_pane(tile_layout: &TileLayout<'_>, pane: PaneId) -> SplitAxis {
         tile_layout
             .panes
             .iter()
-            .find(|p| p.focused)
+            .find(|p| p.pane == pane)
             .map_or(SplitAxis::Vertical, |p| {
                 if (p.rect.x1 - p.rect.x0) >= (p.rect.y1 - p.rect.y0) {
                     SplitAxis::Vertical
@@ -2213,6 +2266,160 @@ mod macos_app {
                     SplitAxis::Horizontal
                 }
             })
+    }
+
+    /// Why an alternate-screen program could not be moved into its own pane (it stays inline).
+    #[derive(Debug)]
+    enum AltScreenMoveError {
+        /// The origin pane is not in the active workspace tab, so it cannot be split now.
+        OriginNotInActiveTab,
+        /// `TileManager::split_focused` did not split the origin pane.
+        SplitFailed,
+        /// The origin pane has no running PTY, or its block is not a running terminal.
+        NoRunningTerminal,
+    }
+
+    impl std::fmt::Display for AltScreenMoveError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Self::OriginNotInActiveTab => "the pane is not in the active workspace tab",
+                Self::SplitFailed => "splitting the pane did not produce a new pane",
+                Self::NoRunningTerminal => "the pane has no running terminal block",
+            })
+        }
+    }
+
+    /// Move the alternate-screen program running in pane `origin` into a new pane split off it:
+    /// the PTY and its terminal block go to the new pane's store (nothing is re-spawned), the new
+    /// pane shows it full-size and takes focus, and `origin` keeps its scrollback with a note on
+    /// the block and gets its prompt back. On error nothing has changed.
+    fn move_alt_screen_to_new_pane(
+        origin: PaneId,
+        wm: &mut TileManager<'static>,
+        tile_layout: &TileLayout<'_>,
+        panes: &mut std::collections::HashMap<PaneId, ShellApp>,
+    ) -> Result<PaneId, AltScreenMoveError> {
+        if !wm.active_tab_panes().iter().any(|&p| p == origin) {
+            return Err(AltScreenMoveError::OriginNotInActiveTab);
+        }
+        let Some(src) = panes.get(&origin) else {
+            return Err(AltScreenMoveError::NoRunningTerminal);
+        };
+        let Some(block_id) = src.active_pty.as_ref().map(|ap| ap.block_id) else {
+            return Err(AltScreenMoveError::NoRunningTerminal);
+        };
+        if !matches!(
+            src.store.block(block_id).map(|b| &b.body),
+            Some(BlockBody::Terminal { running: true, .. })
+        ) {
+            return Err(AltScreenMoveError::NoRunningTerminal);
+        }
+        let cwd = src.cwd().to_owned();
+        let axis = split_axis_for_pane(tile_layout, origin);
+        let prev_focus = wm.focused_pane();
+        wm.focus_pane(origin);
+        let new_pid = wm.split_focused(axis);
+        if wm.focused_pane() != new_pid {
+            wm.focus_pane(prev_focus);
+            return Err(AltScreenMoveError::SplitFailed);
+        }
+
+        let Some(src) = panes.get_mut(&origin) else {
+            unreachable!("origin pane checked above");
+        };
+        let (Some(ap), Some(handoff)) = (
+            src.active_pty.take(),
+            src.store
+                .take_running_terminal(block_id, "↗ moved to its own pane (alternate screen)"),
+        ) else {
+            unreachable!("running terminal checked above");
+        };
+        src.pty_fullscreen = false;
+        src.pty_focused = false;
+        src.pty_inline_rows_override = None;
+        src.alt_screen_settled = None;
+        src.refresh_prompt(src.prompt.last_exit, src.prompt.last_duration_ms);
+        src.auto_scroll_bottom = true;
+
+        let mut dst = ShellApp::new_in(Some(&cwd));
+        let new_block = dst.store.adopt_terminal(handoff);
+        dst.active_pty = Some(ActivePty {
+            block_id: new_block,
+            pty: ap.pty,
+            started: ap.started,
+        });
+        dst.pty_fullscreen = true;
+        dst.pty_focused = true;
+        dst.dedicated_tui = Some(origin);
+        dst.alt_screen_settled = Some(new_block);
+        panes.insert(new_pid, dst);
+        Ok(new_pid)
+    }
+
+    /// Close dedicated alternate-screen panes whose program has exited, through the same
+    /// `close_pane` path as `Cmd+W`, and hand focus back to each one's origin pane if it is still
+    /// open. A pane in a background workspace tab closes when its tab is active again; the last
+    /// pane of the window is kept (its prompt is live) instead of quitting.
+    fn close_finished_dedicated_panes(
+        wm: &mut TileManager<'static>,
+        panes: &mut std::collections::HashMap<PaneId, ShellApp>,
+    ) -> bool {
+        if !panes.values().any(|p| p.dedicated_tui.is_some() && p.active_pty.is_none()) {
+            return false;
+        }
+        let active = wm.active_tab_panes();
+        let finished: Vec<(PaneId, PaneId)> = panes
+            .iter()
+            .filter(|(pid, p)| {
+                p.dedicated_tui.is_some() && p.active_pty.is_none() && active.iter().any(|a| a == *pid)
+            })
+            .filter_map(|(&pid, p)| p.dedicated_tui.map(|origin| (pid, origin)))
+            .collect();
+        let mut changed = false;
+        for (pid, origin) in finished {
+            match wm.close_pane(pid) {
+                CloseOutcome::PaneClosed { closed, .. } => {
+                    if let Some(mut p) = panes.remove(&closed)
+                        && let Some(ap) = p.active_pty.take()
+                    {
+                        ap.pty.hangup();
+                    }
+                    if panes.contains_key(&origin) {
+                        wm.focus_pane(origin);
+                    }
+                    changed = true;
+                }
+                CloseOutcome::TabClosed { closed_panes, .. } => {
+                    for cp in closed_panes {
+                        if let Some(mut p) = panes.remove(&cp)
+                            && let Some(ap) = p.active_pty.take()
+                        {
+                            ap.pty.hangup();
+                        }
+                    }
+                    if panes.contains_key(&origin) {
+                        wm.focus_pane_anywhere(origin);
+                    }
+                    changed = true;
+                }
+                CloseOutcome::LastPaneInLastTab => {
+                    if let Some(p) = panes.get_mut(&pid) {
+                        p.dedicated_tui = None;
+                    }
+                    changed = true;
+                }
+                CloseOutcome::NotFound => {
+                    eprintln!(
+                        "blaze-shell: closing the finished alternate-screen pane {}: it is not in the active workspace; left open",
+                        pid.0
+                    );
+                    if let Some(p) = panes.get_mut(&pid) {
+                        p.dedicated_tui = None;
+                    }
+                }
+            }
+        }
+        changed
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2224,7 +2431,8 @@ mod macos_app {
         font_points: &mut f64,
         zoom_changed: &mut bool,
         pty_sizes_dirty: &mut bool,
-        sidebar_open: &mut bool,
+        sidebar: &mut SidebarMotion,
+        now_s: f64,
         quit: &mut bool,
     ) {
         let cwd = panes
@@ -2238,7 +2446,7 @@ mod macos_app {
                 *pty_sizes_dirty = true;
             }
             PaletteAction::ToggleSidebar => {
-                *sidebar_open = !*sidebar_open;
+                sidebar.toggle_dock(now_s);
                 *pty_sizes_dirty = true;
             }
             PaletteAction::NewTiledPane => {
@@ -2286,6 +2494,9 @@ mod macos_app {
                     *pty_sizes_dirty = true;
                 }
                 CloseOutcome::LastPaneInLastTab => *quit = true,
+                CloseOutcome::NotFound => {
+                    eprintln!("blaze-shell: close pane: the focused pane is not in the active workspace; nothing closed");
+                }
             },
             PaletteAction::ForkBranch => {
                 if let Some(p) = panes.get_mut(&wm.focused_pane()) {
@@ -2534,7 +2745,7 @@ mod macos_app {
         pty_sizes_dirty: &mut bool,
         dirty: &mut bool,
         last_pty_sync: &mut Instant,
-        sidebar_open: bool,
+        chrome: Chrome,
     ) {
         match ev {
             ResizeEvent::WillStartLiveResize => {
@@ -2581,7 +2792,6 @@ mod macos_app {
                     cursor_vis,
                     now_ns(),
                     zoom_pct,
-                    true,
                     None,
                     None,
                     None,
@@ -2590,7 +2800,7 @@ mod macos_app {
                     None,
                     None,
                     None,
-                    sidebar_open,
+                    chrome,
                 );
                 *tile_layout = next_tl;
 
@@ -2710,13 +2920,10 @@ mod macos_app {
         window.setTitlebarAppearsTransparent(true);
         window.setMovableByWindowBackground(false);
         window.setAcceptsMouseMovedEvents(true);
-        let bg_color = objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(
-            0x10 as f64 / 255.0,
-            0x10 as f64 / 255.0,
-            0x11 as f64 / 255.0,
-            1.0,
-        );
-        window.setBackgroundColor(Some(&bg_color));
+        // A see-through window: the sidebar and the margin around the content card show the
+        // blurred desktop through an `NSVisualEffectView`; the content card itself is opaque.
+        window.setOpaque(false);
+        window.setBackgroundColor(Some(&objc2_app_kit::NSColor::clearColor()));
         // SAFETY: `NSAppearanceNameDarkAqua` is a valid static AppKit constant.
         let dark_name = unsafe { objc2_app_kit::NSAppearanceNameDarkAqua };
         if let Some(app_dark) = objc2_app_kit::NSAppearance::appearanceNamed(dark_name) {
@@ -2729,7 +2936,20 @@ mod macos_app {
             NSAutoresizingMaskOptions::ViewWidthSizable
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
-        window.setContentView(Some(&view));
+        let backdrop = objc2_app_kit::NSVisualEffectView::initWithFrame(
+            objc2_app_kit::NSVisualEffectView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(init_w, init_h)),
+        );
+        backdrop.setMaterial(objc2_app_kit::NSVisualEffectMaterial::Sidebar);
+        backdrop.setBlendingMode(objc2_app_kit::NSVisualEffectBlendingMode::BehindWindow);
+        backdrop.setState(objc2_app_kit::NSVisualEffectState::Active);
+        backdrop.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        window.setContentView(Some(&backdrop));
+        backdrop.addSubview(&view);
+        window.makeFirstResponder(Some(&view));
 
         let renderer = Renderer::new(MTLCreateSystemDefaultDevice().expect("no Metal GPU device"));
         let layer = CAMetalLayer::new();
@@ -2742,12 +2962,9 @@ mod macos_app {
         CATransaction::setDisableActions(true);
         // SAFETY: `kCAGravityTopLeft` is a valid QuartzCore static NSString constant.
         layer.setContentsGravity(unsafe { kCAGravityTopLeft });
-        let ground = CGColor::new_srgb(
-            0x10 as f64 / 255.0,
-            0x10 as f64 / 255.0,
-            0x11 as f64 / 255.0,
-            1.0,
-        );
+        // Transparent where nothing is drawn, so the blurred backdrop shows through.
+        layer.setOpaque(false);
+        let ground = CGColor::new_srgb(0.0, 0.0, 0.0, 0.0);
         layer.setBackgroundColor(Some(&ground));
         CATransaction::commit();
         view.setLayer(Some(&layer));
@@ -2847,7 +3064,6 @@ mod macos_app {
                 true,
                 frame_now,
                 zoom_pct,
-                true,
                 None,
                 None,
                 None,
@@ -2856,7 +3072,11 @@ mod macos_app {
                 None,
                 None,
                 None,
-                false,
+                if cli.sidebar {
+                    Chrome::docked(size.width as f32)
+                } else {
+                    Chrome::hidden(size.width as f32)
+                },
             );
             let vh = size.height as f32;
             let glyphs = fonts.rasterize_runs(&scene.text_runs, scale, vh);
@@ -2943,10 +3163,28 @@ mod macos_app {
         let mut last_hovered_link: Option<String> = None;
         let mut was_hidden = false;
         let mut last_pty_sync = Instant::now();
-        let mut sidebar_open = false;
+        let mut sidebar = if cli.sidebar {
+            SidebarMotion::docked_at_rest()
+        } else {
+            SidebarMotion::hidden()
+        };
+        let mut chrome = sidebar.chrome(size.width as f32, anim_epoch.elapsed().as_secs_f64());
+        let mut traffic_lights_shown: Option<bool> = None;
 
         loop {
             let mut quit = false;
+            // Sidebar geometry for this iteration's events and frame; the traffic lights live
+            // in the sidebar, so they show only while it does.
+            let now_s = anim_epoch.elapsed().as_secs_f64();
+            chrome = sidebar.chrome(size.width as f32, now_s);
+            if sidebar.moving(now_s) {
+                dirty = true;
+            }
+            let lights = chrome.traffic_lights_visible();
+            if traffic_lights_shown != Some(lights) {
+                set_traffic_lights_visible(&window, lights);
+                traffic_lights_shown = Some(lights);
+            }
             autoreleasepool(|_| {
                 // SAFETY: `NSDefaultRunLoopMode` is a valid Foundation static string.
                 let mode = unsafe { NSDefaultRunLoopMode };
@@ -2974,7 +3212,7 @@ mod macos_app {
                             &mut pty_sizes_dirty,
                             &mut dirty,
                             &mut last_pty_sync,
-                            sidebar_open,
+                            chrome,
                         );
                     };
                     with_resize_hook(&mut on_resize, || {
@@ -3233,7 +3471,8 @@ mod macos_app {
                                             &mut font_points,
                                             &mut zoom_changed,
                                             &mut pty_sizes_dirty,
-                                            &mut sidebar_open,
+                                            &mut sidebar,
+                                            now_s,
                                             &mut quit,
                                         );
                                     } else {
@@ -3295,7 +3534,7 @@ mod macos_app {
                                 }
                                 // 2. `Cmd+S`: toggle collapsible left workspace & fork-hierarchy sidebar.
                                 if (key == Key::KeyS || lower == "s") && !ctrl && !alt && !shift {
-                                    sidebar_open = !sidebar_open;
+                                    sidebar.toggle_dock(now_s);
                                     active_popover = None;
                                     pty_sizes_dirty = true;
                                     dirty = true;
@@ -3390,6 +3629,11 @@ mod macos_app {
                                         }
                                         CloseOutcome::LastPaneInLastTab => {
                                             quit = true;
+                                        }
+                                        CloseOutcome::NotFound => {
+                                            eprintln!(
+                                                "blaze-shell: Cmd+W: the focused pane is not in the active workspace; nothing closed"
+                                            );
                                         }
                                     }
                                     continue;
@@ -4796,7 +5040,7 @@ mod macos_app {
                             let y = (size.height - pt.y) as f32;
                             // Always yield native window resize edges/corners (and traffic lights
                             // on unfocused windows) directly to AppKit via `with_resize_hook` below.
-                            let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
+                            let in_traffic_lights = chrome.in_traffic_lights(x, y);
                             let yield_to_appkit = on_resize_edge(x, y, size.width as f32, size.height as f32)
                                 || (!window.isKeyWindow() && in_traffic_lights);
                             if yield_to_appkit {
@@ -4825,7 +5069,8 @@ mod macos_app {
                                         &mut font_points,
                                         &mut zoom_changed,
                                         &mut pty_sizes_dirty,
-                                        &mut sidebar_open,
+                                        &mut sidebar,
+                                        now_s,
                                         &mut quit,
                                     );
                                     dirty = true;
@@ -4837,8 +5082,10 @@ mod macos_app {
                             }
                             // Let macOS AppKit handle native window edge/corner resize drags directly!
                             if !yield_to_appkit {
+                                let in_sidebar = chrome.sidebar_contains(x, y, size.height as f32);
+                                let in_header = chrome.header_contains(x, y, size.height as f32);
                                 // 1. Grabbing a tiled split divider starts live drag resize!
-                                if y >= TOP_BAR_H
+                                if !in_sidebar
                                     && let Some(&sh) = tile_layout
                                         .handles
                                         .iter()
@@ -4856,16 +5103,16 @@ mod macos_app {
                                     continue;
                                 }
 
-                                // 2. Unified titlebar clicks (workspace tabs, +, split V/H, new window,
-                                //    zoom, branch tabs, fork) & window drag work EVERYWHERE!
-                                if y < TOP_BAR_H {
+                                // 2. Sidebar header clicks (toggle, `+`); its empty parts drag the
+                                //    window, which has no toolbar.
+                                if in_header {
                                     if let Some(action) = composite_scene.hit_test(x, y) {
                                         output_selection = None;
                                         output_nav = None;
                                         active_popover = None;
                                         match action {
                                             HitAction::ToggleSidebar => {
-                                                sidebar_open = !sidebar_open;
+                                                sidebar.toggle_dock(now_s);
                                                 pty_sizes_dirty = true;
                                                 dirty = true;
                                             }
@@ -4954,7 +5201,7 @@ mod macos_app {
                                         }
                                         continue;
                                     }
-                                    if x > 74.0 {
+                                    if !in_traffic_lights {
                                         window.performWindowDragWithEvent(&ev);
                                         continue;
                                     }
@@ -4962,11 +5209,11 @@ mod macos_app {
 
                                 // 3. Clicking inside the workspace sidebar or tiled panes handles
                                 //    sidebar tab/fork switches, pane chrome buttons, and focus.
-                                if y >= TOP_BAR_H {
+                                if !in_header {
                                     if let Some(action) = composite_scene.hit_test(x, y) {
                                         match action {
                                             HitAction::ToggleSidebar => {
-                                                sidebar_open = !sidebar_open;
+                                                sidebar.toggle_dock(now_s);
                                                 active_popover = None;
                                                 pty_sizes_dirty = true;
                                                 dirty = true;
@@ -5069,7 +5316,7 @@ mod macos_app {
                                                         pty_sizes_dirty = true;
                                                         dirty = true;
                                                     }
-                                                    CloseOutcome::LastPaneInLastTab => {}
+                                                    CloseOutcome::LastPaneInLastTab | CloseOutcome::NotFound => {}
                                                 }
                                                 continue;
                                             }
@@ -5106,9 +5353,7 @@ mod macos_app {
                                             _ => {}
                                         }
                                     }
-                                    if sidebar_open
-                                        && x < SIDEBAR_W.min(size.width as f32 * 0.34).max(180.0)
-                                    {
+                                    if chrome.sidebar_contains(x, y, size.height as f32) {
                                         active_popover = None;
                                         dirty = true;
                                         continue;
@@ -5739,14 +5984,8 @@ mod macos_app {
                                     continue;
                                 }
 
-                                // Empty inline titlebar drag moves the macOS window natively.
-                                if y < TOP_BAR_H && x > 74.0 {
-                                    window.performWindowDragWithEvent(&ev);
-                                    continue;
-                                }
-
                                 // Drag-select (or double/triple click) any rendered block/terminal output text!
-                                if y >= TOP_BAR_H {
+                                if !in_sidebar {
                                     shell.editor.selection_anchor = None;
                                     let m = fonts.cell_metrics(scale);
                                     let clicks = ev.clickCount();
@@ -5784,7 +6023,24 @@ mod macos_app {
                             let x = pt.x as f32;
                             let y = (size.height - pt.y) as f32;
                             last_mouse = Some((x, y));
-                            let in_traffic_lights = y >= 0.0 && y < TOP_BAR_H && x >= 0.0 && x < 76.0;
+                            // Dia-style peek: resting the pointer on the window's left edge
+                            // slides the hidden sidebar in over the content; leaving it slides
+                            // it back out.
+                            if !sidebar.docked() {
+                                let vh = size.height as f32;
+                                let inside_y = (0.0..=vh).contains(&y);
+                                let peek = if sidebar.peeking() {
+                                    inside_y
+                                        && (0.0..=chrome.sidebar_w + 16.0).contains(&x)
+                                } else {
+                                    inside_y && (0.0..=PEEK_EDGE).contains(&x)
+                                };
+                                if peek != sidebar.peeking() {
+                                    sidebar.set_peek(peek, now_s);
+                                    dirty = true;
+                                }
+                            }
+                            let in_traffic_lights = chrome.in_traffic_lights(x, y);
                             let near_resize_edge = on_resize_edge(x, y, size.width as f32, size.height as f32);
                             let in_window = x >= 0.0 && y >= 0.0 && x <= size.width as f32 && y <= size.height as f32;
                             let shell = panes
@@ -5889,10 +6145,7 @@ mod macos_app {
                                     dirty = true;
                                 }
 
-                                if sidebar_open
-                                    && y >= TOP_BAR_H
-                                    && x < SIDEBAR_W.min(size.width as f32 * 0.34).max(180.0)
-                                {
+                                if chrome.sidebar_contains(x, y, size.height as f32) {
                                     dirty = true;
                                 }
                                 let hovered_link = match composite_scene.hit_test(x, y) {
@@ -6204,7 +6457,7 @@ mod macos_app {
                             &mut pty_sizes_dirty,
                             &mut dirty,
                             &mut last_pty_sync,
-                            sidebar_open,
+                            chrome,
                         );
                     };
                     with_resize_hook(&mut on_resize, || {
@@ -6232,7 +6485,7 @@ mod macos_app {
                         &mut pty_sizes_dirty,
                         &mut dirty,
                         &mut last_pty_sync,
-                        sidebar_open,
+                        chrome,
                     );
                 };
                 with_resize_hook(&mut on_resize, || {
@@ -6391,6 +6644,7 @@ mod macos_app {
             let focused_pid = wm.focused_pane();
             let cpx = (fonts.metrics.cell_w as u32, fonts.metrics.cell_h as u32);
             let mut any_running_jobs = false;
+            let mut alt_screen_entered: Vec<PaneId> = Vec::new();
             for (&pid, pane) in panes.iter_mut() {
                 if let Some((cwd, summary)) = pane.git_worker.poll()
                     && cwd == pane.prompt.cwd
@@ -6507,8 +6761,70 @@ mod macos_app {
                     }
                     pane.refresh_prompt(code, dur_ms);
                     pane.auto_scroll_bottom = true;
+                    pane.alt_screen_settled = None;
                     dirty = true;
                 }
+                // A program in this pane's PTY just switched to the alternate screen: decide once
+                // (below, outside the pane borrow) whether it moves into a pane of its own.
+                if pane.dedicated_tui.is_none()
+                    && let Some(ap) = &pane.active_pty
+                    && pane.alt_screen_settled != Some(ap.block_id)
+                    && pane.store.is_terminal_on_alternate_screen(ap.block_id)
+                {
+                    alt_screen_entered.push(pid);
+                }
+            }
+            if !alt_screen_entered.is_empty() {
+                let home = panes
+                    .get(&alt_screen_entered[0])
+                    .map(|p| p.home.clone())
+                    .unwrap_or_default();
+                let cfg = blaze_shell::config::load_cached(&home);
+                for origin in alt_screen_entered.drain(..) {
+                    let Some(block_id) = panes
+                        .get(&origin)
+                        .and_then(|p| p.active_pty.as_ref())
+                        .map(|ap| ap.block_id)
+                    else {
+                        continue;
+                    };
+                    if let Some(bad) = &cfg.alt_screen_rejected {
+                        eprintln!(
+                            "blaze-shell: [terminal] alt_screen = {:?} in {} is not \"pane\" or \"inline\"; the alternate-screen program in pane {} stays inline",
+                            bad.as_str(),
+                            blaze_shell::config::config_path(&home).display(),
+                            origin.0
+                        );
+                    } else if cfg.alt_screen == blaze_shell::config::AltScreenPlacement::Pane {
+                        match move_alt_screen_to_new_pane(origin, &mut wm, &tile_layout, &mut panes) {
+                            Ok(_) => {
+                                active_popover = None;
+                                output_selection = None;
+                                output_nav = None;
+                                pty_sizes_dirty = true;
+                                dirty = true;
+                                continue;
+                            }
+                            // Not refused: a background tab cannot be split now, so the move
+                            // happens when that tab is active again.
+                            Err(AltScreenMoveError::OriginNotInActiveTab) => continue,
+                            Err(e) => eprintln!(
+                                "blaze-shell: moving the alternate-screen program in pane {} into its own pane: {e}; it stays inline",
+                                origin.0
+                            ),
+                        }
+                    }
+                    if let Some(p) = panes.get_mut(&origin) {
+                        p.alt_screen_settled = Some(block_id);
+                    }
+                }
+            }
+            if close_finished_dedicated_panes(&mut wm, &mut panes) {
+                active_popover = None;
+                output_selection = None;
+                output_nav = None;
+                pty_sizes_dirty = true;
+                dirty = true;
             }
             if any_running_jobs && last_running_tick.elapsed().as_millis() >= 80 {
                 last_running_tick = Instant::now();
@@ -6541,12 +6857,11 @@ mod macos_app {
                 dirty = true;
             }
             if pty_sizes_dirty {
-                let sw = if sidebar_open {
-                    SIDEBAR_W.min(size.width as f32 * 0.34).max(180.0)
-                } else {
-                    0.0
-                };
-                let area = HitRect::new(sw, TOP_BAR_H, size.width as f32, size.height as f32);
+                // Size terminals for where the sidebar is heading, not for each frame of its
+                // motion, so programs see one resize per toggle.
+                let area = sidebar
+                    .settled_chrome(size.width as f32)
+                    .content(size.width as f32, size.height as f32);
                 let next_tl = wm.layout(area.into(), TILE_GAP);
                 sync_pty_sizes(&mut panes, &next_tl, &fonts, scale);
                 pty_sizes_dirty = false;
@@ -6608,7 +6923,6 @@ mod macos_app {
                     cursor_vis,
                     frame_now,
                     zoom_pct,
-                    true,
                     active_drag.as_ref(),
                     active_trail,
                     output_selection,
@@ -6617,7 +6931,7 @@ mod macos_app {
                     output_nav,
                     dragging_split,
                     command_palette.as_ref(),
-                    sidebar_open,
+                    chrome,
                 );
                 tile_layout = next_tl;
 
@@ -6657,7 +6971,6 @@ mod macos_app {
                                     cursor_vis,
                                     frame_now,
                                     zoom_pct,
-                                    true,
                                     active_drag.as_ref(),
                                     active_trail,
                                     output_selection,
@@ -6666,7 +6979,7 @@ mod macos_app {
                                     output_nav,
                                     dragging_split,
                                     command_palette.as_ref(),
-                                    sidebar_open,
+                                    chrome,
                                 );
                                 blaze_shell::layout::apply_find_overlay(
                                     &mut rescene,
@@ -6755,7 +7068,7 @@ mod macos_app {
                     && my >= 0.0
                     && mx <= size.width as f32
                     && my <= size.height as f32
-                    && !(my < TOP_BAR_H && mx < 76.0)
+                    && !chrome.in_traffic_lights(mx, my)
                     && !on_resize_edge(mx, my, size.width as f32, size.height as f32)
                 {
                     let alt_scr = panes

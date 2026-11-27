@@ -131,6 +131,18 @@ pub struct Branch {
     pub blocks: Vec<BlockId>,
 }
 
+/// A running PTY terminal block moved out of one [`BlockStore`] by
+/// [`BlockStore::take_running_terminal`]; only [`BlockStore::adopt_terminal`] consumes it.
+pub struct HandedOffTerminal {
+    source: String,
+    prompt_snapshot: PromptInfo,
+    state_before: EngineState<'static>,
+    state_after: EngineState<'static>,
+    started_ms: u64,
+    /// Always `BlockBody::Terminal { running: true, .. }`.
+    body: BlockBody,
+}
+
 /// Session tree store managing all branches and blocks.
 pub struct BlockStore {
     branches: Vec<Branch>,
@@ -495,6 +507,51 @@ impl BlockStore {
             }
         }
         None
+    }
+
+    /// Take the running PTY terminal out of block `id` so another pane's store can
+    /// [`adopt_terminal`](Self::adopt_terminal) it. The block stays in this store's scrollback with
+    /// `note` as its output (it no longer runs here). `None` when `id` is not a running terminal.
+    pub fn take_running_terminal(&mut self, id: BlockId, note: &str) -> Option<HandedOffTerminal> {
+        let blk = self.block_mut(id)?;
+        if !matches!(blk.body, BlockBody::Terminal { running: true, .. }) {
+            return None;
+        }
+        let body = core::mem::replace(
+            &mut blk.body,
+            BlockBody::StreamAndValue { lines: vec![note.to_owned()], value: Value::Nothing },
+        );
+        Some(HandedOffTerminal {
+            source: blk.source.clone(),
+            prompt_snapshot: blk.prompt_snapshot.clone(),
+            state_before: blk.state_before.fork(),
+            state_after: blk.state_after.fork(),
+            started_ms: blk.started_ms,
+            body,
+        })
+    }
+
+    /// Append a terminal taken from another store as a new block on the active branch.
+    pub fn adopt_terminal(&mut self, t: HandedOffTerminal) -> BlockId {
+        self.record_block(
+            t.source,
+            t.prompt_snapshot,
+            t.state_before,
+            t.state_after,
+            t.started_ms,
+            0,
+            0,
+            t.body,
+        )
+    }
+
+    /// True if block `id` is a running terminal currently showing its alternate screen.
+    pub fn is_terminal_on_alternate_screen(&self, id: BlockId) -> bool {
+        matches!(
+            self.block(id),
+            Some(Block { body: BlockBody::Terminal { term, running: true, .. }, .. })
+                if term.active() == Which::Alternate
+        )
     }
 
     /// True if the active running terminal has switched to the alternate screen (vim, htop, less).

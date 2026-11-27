@@ -195,10 +195,13 @@ pub struct PromptInfo {
     pub project_icons: Vec<&'static str>,
     /// Detailed project markers `(icon_name, toolchain_name, marker_file)` for hover inspection.
     pub project_details: Vec<(&'static str, &'static str, &'static str)>,
-    /// True when `[prompt] show_toolchains = false` in `~/.config/blaze-shell/config.toml`.
-    pub hide_toolchains: bool,
+    /// Draw the toolchain icons: `[prompt] show_toolchains = true` in
+    /// `~/.config/blaze-shell/config.toml` (off by default).
+    pub show_toolchains: bool,
     /// Live processes running in `cwd`, subfolders, and descendants (updated asynchronously).
     pub folder_procs: crate::sysmon_driver::FolderProcSnapshot,
+    /// Draw the live-processes segment: `[prompt] show_processes = true` (off by default).
+    pub show_folder_procs: bool,
     pub last_exit: i32,
     pub last_duration_ms: u64,
 }
@@ -270,8 +273,9 @@ impl PromptInfo {
             in_rust_project,
             project_icons,
             project_details,
-            hide_toolchains: false,
+            show_toolchains: false,
             folder_procs: crate::sysmon_driver::FolderProcSnapshot::default(),
+            show_folder_procs: false,
             last_exit,
             last_duration_ms,
         };
@@ -296,7 +300,8 @@ impl PromptInfo {
             self.project_symbol = None;
             self.project_label_override = None;
         }
-        self.hide_toolchains = !cfg.show_toolchains;
+        self.show_toolchains = cfg.show_toolchains;
+        self.show_folder_procs = cfg.show_processes;
         self.project_color = None;
         self.project_badge = None;
         self.project_entity_id = None;
