@@ -319,6 +319,7 @@ impl<'a> ValueWorld<'_, '_, 'a> {
             no_std: false,
             no_core: false,
             arbitrary_ints: false,
+            recursion_limit: crate::RECURSION_LIMIT,
             prelude: None,
         };
         ValueRoot::Dep { head, built: self.built, alloc: self.alloc }

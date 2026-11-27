@@ -2349,7 +2349,12 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
     let tools = crate_tools(&attrs, alloc);
     let mut low = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, notes, par, opts, None, sources.attr_order(), bump);
-    let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+    let root_attrs = RootAttrs {
+        no_std: attrs.no_std,
+        no_core: attrs.no_core,
+        arbitrary_ints: attrs.arbitrary_ints,
+        recursion_limit: attrs.recursion_limit.unwrap_or(crate::RECURSION_LIMIT),
+    };
     let macro_exports = core::mem::replace(&mut low.macro_exports, AVec::new_in(alloc));
     let root_bytes = root_record_of(graph, input, id, root.id, &attrs, &tree, &mut low, &macro_exports, built, notes, bump)?;
     Ok(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: None })
@@ -2372,7 +2377,12 @@ fn root_record_of<'a>(
     bump: Bump<'a>,
 ) -> Result<&'a [u8], NamesError<'a>> {
     let alloc = bump.alloc();
-    let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+    let root_attrs = RootAttrs {
+        no_std: attrs.no_std,
+        no_core: attrs.no_core,
+        arbitrary_ints: attrs.arbitrary_ints,
+        recursion_limit: attrs.recursion_limit.unwrap_or(crate::RECURSION_LIMIT),
+    };
     let plan = root_plan(graph, id, root_attrs, built, notes, bump)?;
     // From 2018 the injected item's name is def-site (rustc's `std_inject`: `ident_span = if
     // edition >= Edition2018 { span } else { call_site }`, `span` with the pass's def-site
@@ -2512,6 +2522,9 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     let (tools, attrs) = if root_member {
         let root = set.at(tree.modules[0].file as usize);
         let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
+        if attrs.recursion_limit.unwrap_or(crate::RECURSION_LIMIT) != record.recursion_limit {
+            return Ok(None);
+        }
         (crate_tools(&attrs, alloc), Some((root.id, attrs)))
     } else {
         (AVec::from_slice_in(&record.tools, alloc), None)
@@ -2539,10 +2552,23 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
         notes
     };
     let (root_attrs, root_bytes) = match attrs {
-        None => (RootAttrs { no_std: record.no_std, no_core: record.no_core, arbitrary_ints: record.arbitrary_ints }, stored),
+        None => (
+            RootAttrs {
+                no_std: record.no_std,
+                no_core: record.no_core,
+                arbitrary_ints: record.arbitrary_ints,
+                recursion_limit: record.recursion_limit,
+            },
+            stored,
+        ),
         Some((root_file, attrs)) => {
             let exports: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::from_iter_in(stored_view.macro_exports(), alloc);
-            let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+            let root_attrs = RootAttrs {
+                no_std: attrs.no_std,
+                no_core: attrs.no_core,
+                arbitrary_ints: attrs.arbitrary_ints,
+                recursion_limit: attrs.recursion_limit.unwrap_or(crate::RECURSION_LIMIT),
+            };
             (root_attrs, root_record_of(graph, input, id, root_file, &attrs, &tree, &mut low, &exports, built, notes, bump)?)
         }
     };
@@ -2663,6 +2689,7 @@ fn tree_record_of<'a>(
         no_std: root_attrs.no_std,
         no_core: root_attrs.no_core,
         arbitrary_ints: root_attrs.arbitrary_ints,
+        recursion_limit: root_attrs.recursion_limit,
         crate_root,
     };
     record.write(alloc)
@@ -5474,12 +5501,12 @@ enum KeepAs {
 /// What [`ExpandNote`]s and part marks name a proc-macro harness's expansion by.
 const HARNESS_NAME: &str = "proc-macro harness";
 
-/// The most bodies deep (past macro expansions up to [`crate::RECURSION_LIMIT`]) a block's module
-/// is made: `body.depth` accumulates both macro-expansion depth (e.g. `pin_project!` peeling 90+
+/// Extra block-in-block nesting headroom above the crate's effective `recursion_limit`:
+/// `body.depth` accumulates both macro-expansion depth (e.g. `pin_project!` peeling 90+
 /// doc-comment attributes on `tokio::time::Sleep` before emitting `const _: () = { impl Sleep .. }`)
-/// and block-in-block nesting, so a block written at expansion depth `< RECURSION_LIMIT` must still
+/// and block-in-block nesting, so a block written at expansion depth `< recursion_limit` must still
 /// be allowed to make its block module (rule 18).
-const MAX_BLOCK_DEPTH: u16 = crate::RECURSION_LIMIT + 64;
+const BLOCK_DEPTH_SLACK: u16 = 64;
 
 /// Makes the modules of the blocks of `bodies` that hold an `impl` ([`crate::blocks`]): each
 /// body's text is scanned once by syntax; one that writes an impl in a block gets a fragment
@@ -5513,7 +5540,8 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
         if nested.end != blaze_file_items::nested::NestedEnd::Whole || !nested.writes() {
             continue;
         }
-        if body.depth >= MAX_BLOCK_DEPTH {
+        let max_block_depth = base.root.head.recursion_limit.saturating_add(BLOCK_DEPTH_SLACK);
+        if body.depth >= max_block_depth {
             run.note(NamesNote::Made { name: crate::blocks::BLOCK_MODULE, at: body.loc, note: MadeNote::TooMany });
             continue;
         }

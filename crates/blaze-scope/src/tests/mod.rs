@@ -87,6 +87,7 @@ pub(crate) use oracle::{B, Imp, reference_imports, reference_world};
 mod per_crate;
 mod pkg_meta_env;
 mod prelude_records;
+mod recursion_limit;
 mod super_in_block;
 mod written_module;
 mod proc_left_package;
@@ -290,6 +291,7 @@ impl World {
             no_std: false,
             no_core: false,
             arbitrary_ints: false,
+            recursion_limit: crate::RECURSION_LIMIT,
             prelude: None,
         };
         let mut cr = CrateRootBuilder::new_in(head, Alloc::global());

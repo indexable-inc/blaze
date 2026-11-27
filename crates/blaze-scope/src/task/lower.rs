@@ -572,6 +572,11 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 "no_implicit_prelude" => attrs.no_implicit_prelude = true,
                 "no_std" => attrs.no_std = true,
                 "no_core" => attrs.no_core = true,
+                "recursion_limit" => {
+                    if let Some(limit) = parse_recursion_limit(content) {
+                        attrs.recursion_limit = Some(limit);
+                    }
+                }
                 "feature" => {
                     for feature in SplitTop::new(args(content)) {
                         let feature = feature.trim();
@@ -805,6 +810,8 @@ pub struct Attrs<'t, 'a> {
     pub no_core: bool,
     /// `#![blaze::arbitrary_ints]` (docs/v2/plan/design/arbitrary-ints.md).
     pub arbitrary_ints: bool,
+    /// `#![recursion_limit = "N"]` (crate-level, capped at [`crate::MAX_RECURSION_LIMIT`]).
+    pub recursion_limit: Option<u16>,
     pub tools: AVec<'a, &'t str>,
     /// `#![feature(a, b)]`'s names, as written (a crate root's: the crate root record's
     /// `features`, which a gate of the crate's code reads).
@@ -916,6 +923,7 @@ impl<'a> Attrs<'_, 'a> {
             no_std: false,
             no_core: false,
             arbitrary_ints: false,
+            recursion_limit: None,
             tools: AVec::new_in(alloc),
             features: AVec::new_in(alloc),
             others: AVec::new_in(alloc),
@@ -926,6 +934,20 @@ impl<'a> Attrs<'_, 'a> {
             proc_macro: None,
         }
     }
+}
+
+/// Parses the unsigned decimal integer inside `#![recursion_limit = "N"]`, clamped to
+/// [`crate::MAX_RECURSION_LIMIT`]. Malformed or non-numeric values return `None`.
+fn parse_recursion_limit(content: &str) -> Option<u16> {
+    let (Some(raw), None) = attr_string(content) else { return None };
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut limit = 0u16;
+    for b in raw.bytes() {
+        limit = limit.saturating_mul(10).saturating_add(u16::from(b - b'0')).min(crate::MAX_RECURSION_LIMIT);
+    }
+    Some(limit)
 }
 
 /// An attribute the lowering never takes for an item's attribute macro by its name alone: a
@@ -3377,6 +3399,7 @@ pub fn crate_root<'t, 'a>(
         no_std: attrs.no_std,
         no_core: attrs.no_core,
         arbitrary_ints: attrs.arbitrary_ints,
+        recursion_limit: attrs.recursion_limit.unwrap_or(crate::RECURSION_LIMIT),
         prelude,
     };
     let mut cr = CrateRootBuilder::new_in(head, alloc);

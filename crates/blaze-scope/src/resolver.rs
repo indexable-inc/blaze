@@ -45,7 +45,10 @@ use crate::work::{Key, Work};
 pub const MAX_MODULE_DEPTH: usize = 128;
 
 /// rustc's default `recursion_limit`: a macro call written at this expansion depth is an error.
-pub const RECURSION_LIMIT: u16 = 128;
+pub const RECURSION_LIMIT: u16 = blaze_surface::DEFAULT_RECURSION_LIMIT;
+
+/// Safe upper bound on crate-level `#![recursion_limit = "N"]` (rule 18).
+pub const MAX_RECURSION_LIMIT: u16 = 4096;
 
 /// The most macro expansions one module may take in (rule 18).
 pub const MAX_EXPANSIONS: usize = 1 << 16;
@@ -633,6 +636,8 @@ pub struct Resolver<'a, N> {
     pub(crate) prelude: Option<ItemKey>,
     /// The crate root's `#![blaze::arbitrary_ints]`: `u24`, `i80` are builtin types here.
     pub(crate) arbitrary_ints: bool,
+    /// The crate's effective macro expansion recursion limit (`#![recursion_limit = "N"]`).
+    pub(crate) recursion_limit: u16,
     pub(crate) tools: AVec<'a, N>,
     /// Sorted.
     pub(crate) builtin_attrs: AVec<'a, N>,
@@ -715,6 +720,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             macro_use,
             prelude: cr.head.prelude,
             arbitrary_ints: cr.head.arbitrary_ints,
+            recursion_limit: cr.head.recursion_limit,
             tools,
             builtin_attrs,
             frags: Vec::new_in(alloc),
@@ -973,7 +979,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         }
         for c in decls.calls.iter() {
             let i = count(self.calls.len(), module)?;
-            let state = if expansion >= RECURSION_LIMIT {
+            let state = if expansion >= self.recursion_limit {
                 CallState::TooDeep
             } else {
                 self.unexpanded += 1;

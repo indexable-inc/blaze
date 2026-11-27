@@ -1313,6 +1313,18 @@ fn a_call_at_the_recursion_limit_is_an_error() {
     let deep = format!("RecursionLimit {{ call: {:?} }}", chain[128]);
     assert_eq!(written_errors(&w, root, CellPlant::None), format!("[{deep}]"), "the call at depth 128");
     assert_eq!(written_errors(&w, root, CellPlant::NoRecursionLimit), "[]", "the control");
+
+    // Raising the crate root's `recursion_limit` to 256 allows the 131-call chain to expand
+    // cleanly in both `Cells` and the reference `Resolver`.
+    w.cr(root).head.recursion_limit = 256;
+    assert_eq!(written_errors(&w, root, CellPlant::None), "[]", "raised crate recursion_limit = 256");
+    w.expanded.borrow_mut().clear();
+    let mut c = Cells::load_planted(&w, root, None, CellPlant::None, Alloc::global()).expect("load");
+    let expand = |call: ItemKey, _: crate::Def| {
+        w.expanded.borrow_mut().insert(call);
+    };
+    c.run(&w, &expand, &[]).expect("run with raised limit");
+    compare(&w, root, &c).expect("the reference Resolver agrees with raised recursion_limit");
 }
 
 /// mach2 0.5.0 on tempo's graph (edition 2015; c10-g3: "differ 153, cells failed 153, stalls 1").

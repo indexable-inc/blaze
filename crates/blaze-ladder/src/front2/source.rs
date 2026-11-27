@@ -1779,7 +1779,12 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     /// wrote from the same `RootAttrs`.
     fn root_attrs(self, krate: usize) -> Option<blaze_scope::graph::RootAttrs> {
         let head = self.names_of(krate)?.crate_root().head();
-        Some(blaze_scope::graph::RootAttrs { no_std: head.no_std, no_core: head.no_core, arbitrary_ints: head.arbitrary_ints })
+        Some(blaze_scope::graph::RootAttrs {
+            no_std: head.no_std,
+            no_core: head.no_core,
+            arbitrary_ints: head.arbitrary_ints,
+            recursion_limit: head.recursion_limit,
+        })
     }
 
     fn has_feature(self, krate: usize, name: &str) -> Option<bool> {
