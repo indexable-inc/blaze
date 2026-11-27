@@ -319,6 +319,10 @@ pub struct StatusMachine<'a, P: Planted<GitStatusPlant>> {
     verified_entries: AVec<'a, bool>,
     /// Current wave of directories to list.
     walk_queue: AVec<'a, WalkDir<'a>>,
+    /// True during Round 1 when every tracked directory from `.git/index` was pre-queued in exact
+    /// top-down pre-order so all tracked dirs saturate all CPU cores in ONE parallel batch instead
+    /// of 18+ depth-by-depth barrier rounds.
+    tracked_dirs_prequeued: bool,
     /// Listings buffered while waiting for newly discovered `.gitignore` files in those directories.
     buffered_dirs: AVec<'a, (WalkDir<'a>, DirListing<'a>)>,
     /// Directories whose `.gitignore` was just requested.
@@ -418,6 +422,7 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
             ignores: IgnoreStack::new(opts.limits, alloc),
             verified_entries: Vec::new_in(alloc),
             walk_queue: Vec::new_in(alloc),
+            tracked_dirs_prequeued: false,
             buffered_dirs: Vec::new_in(alloc),
             pending_ignore_dirs: Vec::new_in(alloc),
             collapse_found: Vec::new_in(alloc),
@@ -554,13 +559,17 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                         self.queue_unverified_stats(idx.view());
                         self.phase = Phase::StatRemaining;
                     } else {
-                        self.walk_queue.push(WalkDir {
-                            path: String::new_in(self.alloc),
-                            depth: 0,
-                            index_start: 0,
-                            index_end: n,
-                            collapse_group: None,
-                        });
+                        collect_tracked_dirs(
+                            idx.view(),
+                            0,
+                            0,
+                            0,
+                            n,
+                            self.opts.limits.most_dir_depth,
+                            self.alloc,
+                            &mut self.walk_queue,
+                        );
+                        self.tracked_dirs_prequeued = true;
                         self.phase = Phase::WalkDirs;
                     }
                     self.index = Some(idx);
@@ -1204,15 +1213,56 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
 
     fn process_buffered_dirs(&mut self) -> Result<(), GitError> {
         let buffered = core::mem::replace(&mut self.buffered_dirs, Vec::new_in(self.alloc));
+        let prequeued = core::mem::replace(&mut self.tracked_dirs_prequeued, false);
         let owned_opt = self.index.take();
         let parsed = owned_opt.as_ref().map(OwnedIndex::view);
 
-        for (wd, listing) in buffered {
+        // When `prequeued`, `buffered` is in exact top-down pre-order (every parent precedes its
+        // descendants). Track the current ignored ancestor slot and any non-dir (e.g. symlink)
+        // ancestor that replaced a tracked directory so descendants never produce spurious entries.
+        let mut ignored_slot: Option<usize> = None;
+        let mut non_dir_prefixes: AVec<'a, AString<'a>> = Vec::new_in(self.alloc);
+
+        for slot in 0..buffered.len() {
+            let (wd, listing) = &buffered[slot];
             if let Some(group_id) = wd.collapse_group
                 && self.collapse_found[group_id as usize]
             {
                 continue;
             }
+
+            if prequeued && !non_dir_prefixes.is_empty() {
+                let path = wd.path.as_str();
+                if non_dir_prefixes.iter().any(|p| {
+                    let ps = p.as_str();
+                    path == ps
+                        || (path.len() > ps.len()
+                            && path.starts_with(ps)
+                            && path.as_bytes()[ps.len()] == b'/')
+                }) {
+                    continue;
+                }
+            }
+
+            let dir_is_ignored = if prequeued && !wd.path.is_empty() {
+                let under_ignored = ignored_slot.is_some_and(|ig_slot| {
+                    let anc = buffered[ig_slot].0.path.as_str();
+                    wd.path.len() > anc.len()
+                        && wd.path.as_str().starts_with(anc)
+                        && wd.path.as_bytes()[anc.len()] == b'/'
+                });
+                if under_ignored {
+                    true
+                } else if self.ignores.is_ignored(wd.path.as_str(), true) {
+                    ignored_slot = Some(slot);
+                    true
+                } else {
+                    ignored_slot = None;
+                    false
+                }
+            } else {
+                false
+            };
 
             let prefix_len = if wd.path.is_empty() { 0 } else { wd.path.len() + 1 };
             let idx_slice = match parsed {
@@ -1268,9 +1318,6 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                 self.child_scratch.push_str(name);
 
                 if is_dir {
-                    if self.ignores.is_ignored(self.child_scratch.as_str(), true) {
-                        continue;
-                    }
                     // Find exact sub-range of index entries under `name/` inside `idx_slice`!
                     let (sub_start, sub_end) = if let Some(idx) = parsed
                         && !idx_slice.is_empty()
@@ -1285,20 +1332,39 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                                 core::cmp::Ordering::Equal => rel[name_bytes.len()] < b'/',
                             }
                         });
-                        let hi = lo
-                            + idx_slice[lo..].partition_point(|ie| {
+                        if prequeued {
+                            // Only need to know if `sub_start < sub_end` (already pre-queued!).
+                            let has_tracked = idx_slice.get(lo).is_some_and(|ie| {
                                 let rel = &idx.path_bytes(ie)[prefix_len..];
                                 rel.len() > name_bytes.len()
                                     && rel.starts_with(name_bytes)
                                     && rel[name_bytes.len()] == b'/'
                             });
-                        (wd.index_start + lo, wd.index_start + hi)
+                            if has_tracked {
+                                (wd.index_start + lo, wd.index_start + lo + 1)
+                            } else {
+                                (0, 0)
+                            }
+                        } else {
+                            let hi = lo
+                                + idx_slice[lo..].partition_point(|ie| {
+                                    let rel = &idx.path_bytes(ie)[prefix_len..];
+                                    rel.len() > name_bytes.len()
+                                        && rel.starts_with(name_bytes)
+                                        && rel[name_bytes.len()] == b'/'
+                                });
+                            (wd.index_start + lo, wd.index_start + hi)
+                        }
                     } else {
                         (0, 0)
                     };
 
                     if sub_start < sub_end {
-                        if wd.depth + 1 <= self.opts.limits.most_dir_depth {
+                        if !prequeued
+                            && !dir_is_ignored
+                            && !self.ignores.is_ignored(self.child_scratch.as_str(), true)
+                            && wd.depth + 1 <= self.opts.limits.most_dir_depth
+                        {
                             self.walk_queue.push(WalkDir {
                                 path: String::from_str_in(self.child_scratch.as_str(), self.alloc),
                                 depth: wd.depth + 1,
@@ -1307,6 +1373,9 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                                 collapse_group: None,
                             });
                         }
+                        continue;
+                    }
+                    if dir_is_ignored || self.ignores.is_ignored(self.child_scratch.as_str(), true) {
                         continue;
                     }
                     if presence_untracked_done {
@@ -1351,6 +1420,38 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                         });
                     }
                 } else {
+                    // If a non-directory (e.g. symlink to another dir) replaced a tracked subtree,
+                    // suppress any pre-queued listings beneath it so its tracked files stay Deleted.
+                    if prequeued
+                        && let Some(idx) = parsed
+                        && !idx_slice.is_empty()
+                    {
+                        let lo = idx_slice.partition_point(|ie| {
+                            let rel = &idx.path_bytes(ie)[prefix_len..];
+                            let n = rel.len().min(name_bytes.len());
+                            match rel[..n].cmp(&name_bytes[..n]) {
+                                core::cmp::Ordering::Less => true,
+                                core::cmp::Ordering::Greater => false,
+                                core::cmp::Ordering::Equal if rel.len() <= name_bytes.len() => true,
+                                core::cmp::Ordering::Equal => rel[name_bytes.len()] < b'/',
+                            }
+                        });
+                        if let Some(ie) = idx_slice.get(lo) {
+                            let rel = &idx.path_bytes(ie)[prefix_len..];
+                            if rel.len() > name_bytes.len()
+                                && rel.starts_with(name_bytes)
+                                && rel[name_bytes.len()] == b'/'
+                            {
+                                non_dir_prefixes.push(String::from_str_in(
+                                    self.child_scratch.as_str(),
+                                    self.alloc,
+                                ));
+                            }
+                        }
+                    }
+                    if dir_is_ignored {
+                        continue;
+                    }
                     // Skip unmerged conflicted paths (present at index stage 1..=3): never untracked.
                     if let Some(idx) = parsed
                         && idx.has_conflict(self.child_scratch.as_bytes())
@@ -1404,46 +1505,31 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
                     let entry = &idx.entries[i];
                     let rel = &idx.path_bytes(entry)[prefix_len..];
                     if let Some(slash) = memchr(b'/', rel) {
-                        // Skip entire subdirectory block in O(log block) / linear scan; if that
-                        // subdirectory was missing on disk, its entries stay unverified and get
-                        // caught cleanly (or deleted if subdir wasn't listed).
                         let sub = &rel[..slash];
-                        // Check if this subdir existed in `listing`: if NOT, every entry under it
-                        // is deleted!
+                        // O(log block) binary search to find end of `sub/` block instead of O(N) scan!
+                        let rest = &idx.entries[i..wd.index_end];
+                        let block_len = rest.partition_point(|e2| {
+                            let r2 = &idx.path_bytes(e2)[prefix_len..];
+                            r2.len() > slash && r2[..slash] == *sub && r2[slash] == b'/'
+                        });
                         if !listing.has_name(sub) {
-                            while i < wd.index_end {
-                                let e2 = &idx.entries[i];
-                                let p2 = idx.path_bytes(e2);
-                                let r2 = &p2[prefix_len..];
-                                if r2.len() > slash && r2[..slash] == *sub && r2[slash] == b'/' {
-                                    if !self.verified_entries[i]
-                                        && !e2.assume_valid
-                                        && !e2.skip_worktree
-                                        && !e2.is_sparse_dir()
-                                        && !e2.is_gitlink()
-                                    {
-                                        self.counts.deleted = self.counts.deleted.saturating_add(1);
-                                        self.verified_entries[i] = true;
-                                        self.record_sample_bytes(p2, ChangeKind::Deleted);
-                                        self.record_worktree_entry(p2, FileStatus::Deleted);
-                                    }
-                                    i += 1;
-                                } else {
-                                    break;
-                                }
-                            }
-                        } else {
-                            // Subdir exists: jump past it in `idx_slice`.
-                            i += 1;
-                            while i < wd.index_end {
-                                let r2 = &idx.path_bytes(&idx.entries[i])[prefix_len..];
-                                if r2.len() > slash && r2[..slash] == *sub && r2[slash] == b'/' {
-                                    i += 1;
-                                } else {
-                                    break;
+                            for k in i..i + block_len {
+                                let e2 = &idx.entries[k];
+                                if !self.verified_entries[k]
+                                    && !e2.assume_valid
+                                    && !e2.skip_worktree
+                                    && !e2.is_sparse_dir()
+                                    && !e2.is_gitlink()
+                                {
+                                    let p2 = idx.path_bytes(e2);
+                                    self.counts.deleted = self.counts.deleted.saturating_add(1);
+                                    self.verified_entries[k] = true;
+                                    self.record_sample_bytes(p2, ChangeKind::Deleted);
+                                    self.record_worktree_entry(p2, FileStatus::Deleted);
                                 }
                             }
                         }
+                        i += block_len.max(1);
                     } else {
                         if !self.verified_entries[i]
                             && !entry.assume_valid
@@ -1566,9 +1652,17 @@ impl<'a, P: Planted<GitStatusPlant>> StatusMachine<'a, P> {
             && (entry.ctime_nsec == 0 || entry.ctime_nsec == stat.ctime_nsec);
         let ino_match = entry.ino == 0 || entry.ino == (stat.ino as u32);
 
+        // Nanosecond-precision racy-git check: when both the index entry and `.git/index` carry
+        // sub-second timestamps (APFS, ext4, xfs, btrfs), compare `(sec, nsec)` so files written
+        // milliseconds before `.git/index` during `git merge`/`checkout` don't trigger spurious
+        // SHA-1 re-hashing; fall back to whole-second conservatism on coarse filesystems.
         let racy = !self.plant.has(GitStatusPlant::SkipRacyHashCheck)
             && self.index_mtime.0 > 0
-            && i64::from(entry.mtime_sec) >= self.index_mtime.0;
+            && if entry.mtime_nsec > 0 && self.index_mtime.1 > 0 {
+                (i64::from(entry.mtime_sec), entry.mtime_nsec) >= self.index_mtime
+            } else {
+                i64::from(entry.mtime_sec) >= self.index_mtime.0
+            };
 
         if size_match && mtime_match && ctime_match && ino_match && !racy {
             return;
@@ -2123,4 +2217,75 @@ pub fn hash_worktree_blob(bytes: &[u8], autocrlf: AutoCrlf, alloc: Alloc<'_>) ->
 fn is_binary(bytes: &[u8]) -> bool {
     let probe = &bytes[..bytes.len().min(8000)];
     memchr(0, probe).is_some()
+}
+
+/// Extracts every tracked directory from the lexicographically sorted `.git/index` in exact
+/// top-down pre-order with each directory's contiguous `[index_start..index_end)` slice.
+///
+/// Pre-queuing all tracked directories lets `Want::ListDirs` saturate all CPU cores in ONE
+/// parallel `getattrlistbulk` batch instead of 18+ depth-by-depth wavefront round-trips.
+fn collect_tracked_dirs<'a>(
+    idx: IndexView<'_>,
+    prefix_len: usize,
+    depth: u16,
+    start: usize,
+    end: usize,
+    max_depth: u16,
+    alloc: Alloc<'a>,
+    out: &mut AVec<'a, WalkDir<'a>>,
+) {
+    let path = if prefix_len == 0 {
+        String::new_in(alloc)
+    } else {
+        let dir_bytes = &idx.path_bytes(&idx.entries[start])[..prefix_len - 1];
+        let Ok(s) = core::str::from_utf8(dir_bytes) else {
+            return;
+        };
+        String::from_str_in(s, alloc)
+    };
+    out.push(WalkDir {
+        path,
+        depth,
+        index_start: start,
+        index_end: end,
+        collapse_group: None,
+    });
+    if depth >= max_depth {
+        return;
+    }
+
+    let mut i = start;
+    while i < end {
+        let rel = &idx.path_bytes(&idx.entries[i])[prefix_len..];
+        let Some(slash) = memchr(b'/', rel) else {
+            i += 1;
+            continue;
+        };
+        if slash == 0 {
+            i += 1;
+            continue;
+        }
+        let sub = &rel[..slash];
+        let rest = &idx.entries[i..end];
+        let block_len = rest.partition_point(|e2| {
+            let r2 = &idx.path_bytes(e2)[prefix_len..];
+            r2.len() > slash && r2[..slash] == *sub && r2[slash] == b'/'
+        });
+        let child_end = i + block_len;
+        // Skip degenerate sparse-dir entries whose path ends right at the trailing `/`.
+        let child_prefix = prefix_len + slash + 1;
+        if child_end > i && idx.path_bytes(&idx.entries[i]).len() > child_prefix {
+            collect_tracked_dirs(
+                idx,
+                child_prefix,
+                depth + 1,
+                i,
+                child_end,
+                max_depth,
+                alloc,
+                out,
+            );
+        }
+        i = child_end.max(i + 1);
+    }
 }
