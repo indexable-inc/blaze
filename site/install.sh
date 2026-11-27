@@ -309,6 +309,29 @@ fi
 # earlier `blaze update` installed goes; and a canary install has `blaze update` follow canary,
 # unless its settings name a channel already.
 blaze_home="${BLAZE_HOME:-$HOME/.blaze}"
+
+# The pinned v2 toolchain shelf (content-addressed BLAKE3 manifest + std/bstd source packs),
+# bundled in v2 release archives so `blaze warm-toolchain` and builds work on a bare HOME.
+if [ -d "$unpacked/toolchain" ]; then
+    shelf="$blaze_home/v2/toolchain"
+    mkdir -p "$shelf" 2>"$tmp/error" || fail "blaze's toolchain shelf could not be made." "$(cat "$tmp/error")"
+    shelf_new=0
+    shelf_kept=0
+    for entry in "$unpacked/toolchain"/*; do
+        [ -f "$entry" ] || continue
+        name=$(basename "$entry")
+        if [ -f "$shelf/$name" ]; then
+            shelf_kept=$((shelf_kept + 1))
+            continue
+        fi
+        cp "$entry" "$shelf/.$name.blaze-new"
+        chmod 644 "$shelf/.$name.blaze-new"
+        mv -f "$shelf/.$name.blaze-new" "$shelf/$name"
+        shelf_new=$((shelf_new + 1))
+    done
+    step "installed toolchain shelf in $shelf ($shelf_new new, $shelf_kept already there)"
+fi
+
 rm -f "$blaze_home/default"
 # config.toml read as TOML enough for this: a table header (comments after it allowed), and the key
 # `channel` in the table [update] (or `update.channel` before any table); a commented line is no key.
