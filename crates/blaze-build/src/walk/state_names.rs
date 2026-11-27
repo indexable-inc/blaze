@@ -115,8 +115,8 @@ pub(super) fn task_expr(t: &Task) -> Option<ExprId> {
         | Task::PlaceDerefs(e, _)
         | Task::Intrinsic(e, _)
         | Task::DropValue(e)
-        | Task::ScopeEnd(e)
-        | Task::TempScopeEnd(e)
+        | Task::ScopeEnd { expr: e, .. }
+        | Task::TempScopeEnd { anchor: e, .. }
         | Task::BlockExit(e)
         | Task::LoopEnd(e)
         | Task::Break(e, _)

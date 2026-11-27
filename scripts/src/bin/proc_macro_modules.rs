@@ -1791,7 +1791,7 @@ impl Plan<'_> {
         let identity = format!(
             // Distinct target-bearing header for `wasm32-wasip1` bootstrap records so they never
             // share a write-once key with on-demand `wasm64-blaze-wasip1` self-compiled modules
-            // (`blaze proc-macro module wasm64 8` in `crates/blaze-proc-macro/src/module.rs`).
+            // (`blaze proc-macro module wasm64 9` in `crates/blaze-proc-macro/src/module.rs`).
             "blaze proc-macro module wasm32 7\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
             wanted.name,
             wanted.version,

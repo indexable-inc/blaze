@@ -251,12 +251,12 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex(&blaze_sha256::digest(bytes))
 }
 
-/// Current proc-macro module identity header (`blaze proc-macro module wasm64 8`): target-bearing
+/// Current proc-macro module identity header (`blaze proc-macro module wasm64 9`): target-bearing
 /// so on-demand `wasm64-blaze-wasip1` self-compiled modules never share a write-once key with
-/// `wasm32-wasip1` bootstrap records (`blaze proc-macro module wasm32 7`) or pre-v8 records.
-/// Form 8 resolves `[target.'cfg(...)'.dependencies]` against `wasm64-blaze-wasip1` and folds
-/// WASI-side unified dependency features into `deps`.
-pub const MODULE_HEADER: &str = "blaze proc-macro module wasm64 8";
+/// `wasm32-wasip1` bootstrap records (`blaze proc-macro module wasm32 7`) or pre-v9 records.
+/// Form 9 invalidates pre-fix wasm64 modules compiled before `blaze-build` `ScopeEnd` /
+/// `TempScopeEnd` adjusted-repr settling (fat pointers truncated from 16B to 8B before drops).
+pub const MODULE_HEADER: &str = "blaze proc-macro module wasm64 9";
 
 /// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified feature sets (bound to
 /// each package's source pin — registry checksum/source, git commit+URL, or path files digest)
@@ -425,6 +425,9 @@ pub fn identity(id: &CrateId<'_>) -> String {
         // projecting off `self`'s stack slot, invalidating stale form-6 `clap_derive` modules.
         // Form 8 (2026-11-27): wasm64 self-compilation resolves `[target.'cfg(...)'.dependencies]`
         // against `wasm64-blaze-wasip1` instead of the host triple, invalidating pre-fix form-7 records.
+        // Form 9 (2026-11-27): `blaze-build` `Task::ScopeEnd` / `Task::TempScopeEnd` use adjusted
+        // repr for already-adjusted arm/branch bodies (`Box<T> -> Box<dyn Trait>`, `&T -> &dyn Trait`,
+        // `&[T; N] -> &[T]`), invalidating stale form-8 wasm64 modules (e.g. `snafu-derive`).
         "{MODULE_HEADER}\nname {}\nversion {}\n{source}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
         id.name,
         id.version,
@@ -633,7 +636,7 @@ mod header_tests {
     use super::*;
 
     #[test]
-    fn proc_macro_module_identity_uses_form_8_and_misses_stale_form_7_6_5_and_4_store_entries() {
+    fn proc_macro_module_identity_uses_form_9_and_misses_stale_form_8_7_6_5_and_4_store_entries() {
         let id = CrateId {
             name: "demo_derive",
             version: "0.1.0",
@@ -641,27 +644,30 @@ mod header_tests {
             deps: "deps-hash",
             features: &["default"],
         };
-        let v8_identity = identity(&id);
-        assert_eq!(MODULE_HEADER, "blaze proc-macro module wasm64 8");
-        assert_eq!(v8_identity.lines().next(), Some(MODULE_HEADER));
-        let v7_w32_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm32 7", 1);
-        let v7_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 7", 1);
-        let v6_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 6", 1);
-        let v5_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 5", 1);
-        let v4_identity = v8_identity.replacen(MODULE_HEADER, "blaze proc-macro module 4", 1);
+        let v9_identity = identity(&id);
+        assert_eq!(MODULE_HEADER, "blaze proc-macro module wasm64 9");
+        assert_eq!(v9_identity.lines().next(), Some(MODULE_HEADER));
+        let v8_w64_identity = v9_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm64 8", 1);
+        let v7_w32_identity = v9_identity.replacen(MODULE_HEADER, "blaze proc-macro module wasm32 7", 1);
+        let v7_identity = v9_identity.replacen(MODULE_HEADER, "blaze proc-macro module 7", 1);
+        let v6_identity = v9_identity.replacen(MODULE_HEADER, "blaze proc-macro module 6", 1);
+        let v5_identity = v9_identity.replacen(MODULE_HEADER, "blaze proc-macro module 5", 1);
+        let v4_identity = v9_identity.replacen(MODULE_HEADER, "blaze proc-macro module 4", 1);
+        let v8_w64_key = sha256_hex(v8_w64_identity.as_bytes());
         let v7_w32_key = sha256_hex(v7_w32_identity.as_bytes());
         let v7_key = sha256_hex(v7_identity.as_bytes());
         let v6_key = sha256_hex(v6_identity.as_bytes());
         let v5_key = sha256_hex(v5_identity.as_bytes());
         let v4_key = sha256_hex(v4_identity.as_bytes());
-        let v8_key = module_key(&id);
-        assert_ne!(v7_w32_key, v8_key, "wasm64 form 8 key must differ from wasm32 bootstrap form 7 key");
-        assert_ne!(v7_key, v8_key, "form 8 key must differ from stale form 7 key");
-        assert_ne!(v6_key, v8_key, "form 8 key must differ from stale form 6 key");
-        assert_ne!(v5_key, v8_key, "form 8 key must differ from stale form 5 key");
-        assert_ne!(v4_key, v8_key, "form 8 key must differ from stale form 4 key");
+        let v9_key = module_key(&id);
+        assert_ne!(v8_w64_key, v9_key, "wasm64 form 9 key must differ from stale wasm64 form 8 key");
+        assert_ne!(v7_w32_key, v9_key, "wasm64 form 9 key must differ from wasm32 bootstrap form 7 key");
+        assert_ne!(v7_key, v9_key, "form 9 key must differ from stale form 7 key");
+        assert_ne!(v6_key, v9_key, "form 9 key must differ from stale form 6 key");
+        assert_ne!(v5_key, v9_key, "form 9 key must differ from stale form 5 key");
+        assert_ne!(v4_key, v9_key, "form 9 key must differ from stale form 4 key");
 
-        let store = std::env::temp_dir().join(format!("blaze-pm-module-v8-test-{}", std::process::id()));
+        let store = std::env::temp_dir().join(format!("blaze-pm-module-v9-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&store);
         for (stale_key, stale_identity, stale_digest) in [
             (&v4_key, &v4_identity, "deadbeef\n"),
@@ -669,6 +675,7 @@ mod header_tests {
             (&v6_key, &v6_identity, "badc0ffe\n"),
             (&v7_key, &v7_identity, "01234567\n"),
             (&v7_w32_key, &v7_w32_identity, "76543210\n"),
+            (&v8_w64_key, &v8_w64_identity, "89abcdef\n"),
         ] {
             let stale_dir = store.join("proc-macro/modules").join(stale_key);
             std::fs::create_dir_all(&stale_dir).expect("create stale dir");
@@ -678,23 +685,23 @@ mod header_tests {
             std::fs::write(stale_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write stale decls");
         }
 
-        // Lookup by current wasm64 form 8 misses wasm32 form 7 and stale form 7, 6, 5, and 4 directories cleanly.
-        assert!(matches!(find_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v8_key));
-        assert!(matches!(read_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v8_key));
+        // Lookup by current wasm64 form 9 misses stale wasm64 form 8, wasm32 form 7, and form 7..4 directories cleanly.
+        assert!(matches!(find_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v9_key));
+        assert!(matches!(read_module(&store, &id), Err(ModuleError::Missing { ref key, .. }) if key == &v9_key));
 
-        // Publishing form 8 alongside stale form 7, 6, 5, and 4 resolves uniquely to form 8.
-        let v8_dir = store.join("proc-macro/modules").join(&v8_key);
-        std::fs::create_dir_all(&v8_dir).expect("create v8 dir");
-        std::fs::write(v8_dir.join("identity"), &v8_identity).expect("write v8 identity");
-        std::fs::write(v8_dir.join("wasm-sha256"), "cafebabe\n").expect("write v8 digest");
-        std::fs::write(v8_dir.join("macros"), "0 derive Demo\n").expect("write v8 macros");
-        std::fs::write(v8_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write v8 decls");
+        // Publishing form 9 alongside stale form 8, 7, 6, 5, and 4 resolves uniquely to form 9.
+        let v9_dir = store.join("proc-macro/modules").join(&v9_key);
+        std::fs::create_dir_all(&v9_dir).expect("create v9 dir");
+        std::fs::write(v9_dir.join("identity"), &v9_identity).expect("write v9 identity");
+        std::fs::write(v9_dir.join("wasm-sha256"), "cafebabe\n").expect("write v9 digest");
+        std::fs::write(v9_dir.join("macros"), "0 derive Demo\n").expect("write v9 macros");
+        std::fs::write(v9_dir.join("decls"), "__rustc_proc_macro_decls_blaze__\n").expect("write v9 decls");
 
-        let (found_key, digest) = find_module(&store, &id).expect("find v8 module");
-        assert_eq!(found_key, v8_key);
+        let (found_key, digest) = find_module(&store, &id).expect("find v9 module");
+        assert_eq!(found_key, v9_key);
         assert_eq!(digest, "cafebabe");
-        let rec = read_module(&store, &id).expect("read v8 module");
-        assert_eq!(rec.key, v8_key);
+        let rec = read_module(&store, &id).expect("read v9 module");
+        assert_eq!(rec.key, v9_key);
         assert_eq!(rec.wasm_sha256, "cafebabe");
         assert_eq!(rec.macros.len(), 1);
         assert_eq!(rec.macros[0].name, "Demo");
