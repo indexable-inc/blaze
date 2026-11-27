@@ -910,7 +910,10 @@ impl<'a> RefStore<'a> for BgitDiskStore<'a> {
     ) -> Result<(), GitError> {
         self.overlay.list_refs(prefix, alloc, out)?;
         for entry in out.iter_mut() {
+            // Only tag refs can point to annotated tag objects; avoid decompressing thousands of
+            // branch commits during `bgit branch` on large monorepos!
             if entry.peeled.is_none()
+                && entry.name.as_str().starts_with("refs/tags/")
                 && let Some(oid) = match &entry.target {
                     RefTarget::Direct(o) => Some(*o),
                     RefTarget::Symbolic(_) => self.resolve_ref(entry.name.as_str())?,
@@ -945,15 +948,25 @@ pub(crate) fn infect_repo_on_disk<'a>(
     alloc: Alloc<'a>,
 ) -> io::Result<InfectStats> {
     let git_dir = locate_git_dir(repo_root)?;
+    let common_dir = resolve_common_git_dir(repo_root).unwrap_or_else(|| git_dir.clone());
     let workers = thread::available_parallelism().map_or(1, |n| n.get()).min(16);
 
-    let mut builder = InfectBuilder::new(PackLimits::SHIPPED, alloc);
+    // Local disk `.git` repositories (e.g. monorepos with dozens of packfiles) can exceed the 2 GiB
+    // untrusted network fetch cap; use an explicit monorepo-sized ingest budget here.
+    let local_pack_limits = PackLimits {
+        most_objects: 16_000_000,
+        most_object: 1 << 30,
+        most_total: 64 << 30,
+        most_depth: 4096,
+        most_cache: 128 << 20,
+    };
+    let mut builder = InfectBuilder::new(local_pack_limits, alloc);
     let mut loose_count = 0u32;
     let mut packfiles_in = 0u32;
     let mut packed_objects_in = 0u32;
 
-    // 1. Collect packfiles and unpack via `InfectBuilder`.
-    let pack_dir = git_dir.join("objects").join("pack");
+    // 1. Collect packfiles and unpack via `InfectBuilder` (objects live in `common_dir` for linked worktrees).
+    let pack_dir = common_dir.join("objects").join("pack");
     if pack_dir.is_dir() {
         let mut packs: Vec<PathBuf> = Vec::new();
         for entry in fs::read_dir(&pack_dir)? {
@@ -976,7 +989,7 @@ pub(crate) fn infect_repo_on_disk<'a>(
 
     // 2. Collect loose object paths and inflate + SHA-1 verify them IN PARALLEL across cores!
     let mut loose_paths: Vec<(Oid, PathBuf)> = Vec::new();
-    let objects_dir = git_dir.join("objects");
+    let objects_dir = common_dir.join("objects");
     if objects_dir.is_dir() {
         for fan in fs::read_dir(&objects_dir)? {
             let fan = fan?;
@@ -1050,7 +1063,7 @@ pub(crate) fn infect_repo_on_disk<'a>(
         }
     }
 
-    // 3. Ingest HEAD, packed-refs, and loose refs (in exact Git precedence order!).
+    // 3. Ingest HEAD (worktree-local `git_dir`), packed-refs, and loose refs (`common_dir`).
     let head_path = git_dir.join("HEAD");
     if head_path.is_file() {
         let head_bytes = fs::read(&head_path)?;
@@ -1058,16 +1071,22 @@ pub(crate) fn infect_repo_on_disk<'a>(
             .feed_head(&head_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("HEAD: {e}")))?;
     }
-    let packed_refs_path = git_dir.join("packed-refs");
+    let packed_refs_path = common_dir.join("packed-refs");
     if packed_refs_path.is_file() {
         let pr_bytes = fs::read(&packed_refs_path)?;
         builder
             .feed_packed_refs(&pr_bytes)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("packed-refs: {e}")))?;
     }
-    let refs_dir = git_dir.join("refs");
+    let refs_dir = common_dir.join("refs");
     if refs_dir.is_dir() {
         walk_loose_refs(&refs_dir, "refs", &mut builder)?;
+    }
+    if git_dir != common_dir {
+        let wt_refs_dir = git_dir.join("refs");
+        if wt_refs_dir.is_dir() {
+            walk_loose_refs(&wt_refs_dir, "refs", &mut builder)?;
+        }
     }
 
     // Merge packed objects (in builder.store()) and parallel-inflated loose objects into one

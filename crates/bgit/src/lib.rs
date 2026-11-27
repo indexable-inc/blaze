@@ -12,6 +12,7 @@ mod disk;
 mod index_io;
 mod net_driver;
 mod porcelain;
+mod remote_transport;
 mod status_driver;
 mod vfs_driver;
 mod worktree_driver;
@@ -37,7 +38,10 @@ use bstd::cli::{Matches, ParseOutcome, format_help_with_path_in, parse_in};
 
 use crate::{
     disk::{BgitDiskStore, disinfect_repo_on_disk, infect_repo_on_disk, open_or_infect},
-    net_driver::{http_clone, http_ls_remote, http_push, serve_http, serve_stdio},
+    net_driver::{
+        FetchParams, remote_clone, remote_ls_remote, remote_push, serve_http, serve_stdio,
+    },
+    remote_transport::{default_clone_dir_name, looks_like_remote_url},
     status_driver::run_status,
     vfs_driver::{cmd_internal_vfs_serve, cmd_mount, cmd_unmount, spawn_background_mount},
     worktree_driver::{
@@ -638,7 +642,7 @@ fn try_git_ls_remote_in_process<'a>(
     let [url] = rest else {
         return None;
     };
-    if !url.starts_with("http://") {
+    if !looks_like_remote_url(url) {
         return None;
     }
     Some(run_bgit_in_process(&["ls-remote", url], work_dir, false, alloc))
@@ -874,7 +878,7 @@ fn dispatch<'a>(
         }
         "ls-remote" => {
             let raw = matches.positional(0).unwrap_or("origin");
-            let url = if raw.starts_with("http://") {
+            let url = if looks_like_remote_url(raw) {
                 raw.to_owned()
             } else {
                 let root = find_repo_root(cwd).ok_or_else(|| {
@@ -887,11 +891,20 @@ fn dispatch<'a>(
                     })?
                     .to_owned()
             };
-            http_ls_remote(&url, alloc, io.out)
+            remote_ls_remote(&url, alloc, io.out)
         }
         "clone" => {
-            let url = matches.positional(0).expect("required HTTP_URL");
-            let dest = resolve_path(cwd, matches.positional(1).expect("required DEST_DIR"));
+            let url = matches.positional(0).expect("required URL");
+            let dest_raw = matches
+                .positional(1)
+                .map(str::to_owned)
+                .unwrap_or_else(|| default_clone_dir_name(url));
+            let dest = resolve_path(cwd, &dest_raw);
+            let depth = matches
+                .opt_parse::<u32>("depth")
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
+            let filter = matches.opt("filter");
+            let params = FetchParams { depth, filter };
             if matches.flag("vfs") {
                 let mut store_name = dest
                     .file_name()
@@ -899,10 +912,10 @@ fn dispatch<'a>(
                     .unwrap_or_else(|| std::ffi::OsString::from("repo"));
                 store_name.push(".bgit-store");
                 let store_dir = dest.with_file_name(store_name);
-                http_clone(url, &store_dir, false, alloc, io.out)?;
+                remote_clone(url, &store_dir, false, params, alloc, io.out)?;
                 spawn_background_mount(&store_dir, &dest, "HEAD", false, io.out)
             } else {
-                http_clone(url, &dest, true, alloc, io.out)
+                remote_clone(url, &dest, true, params, alloc, io.out)
             }
         }
         "push" => cmd_push(matches, cwd, alloc, io),
@@ -963,18 +976,18 @@ fn cmd_push<'a>(
     alloc: Alloc<'a>,
     io: &mut IoStreams<'_>,
 ) -> io::Result<()> {
-    // Backwards-compatible 3-arg form: `bgit push <http_url> <dir> <ref>`
+    // Backwards-compatible 3-arg form: `bgit push <url> <dir> <ref>`
     if let Some(ref_name) = matches.positional(2) {
-        let url = matches.positional(0).expect("required HTTP_URL");
+        let url = matches.positional(0).expect("required URL");
         let dir = resolve_path(cwd, matches.positional(1).expect("required DIR"));
-        return http_push(url, &dir, ref_name, alloc, io.out);
+        return remote_push(url, &dir, ref_name, alloc, io.out);
     }
     // Ergonomic Git form: `bgit push [<remote>] [<branch>]`
     let root = find_repo_root(cwd).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "not a git or bgit repository")
     })?;
     let remote = matches.positional(0).unwrap_or("origin");
-    let url = if remote.starts_with("http://") {
+    let url = if looks_like_remote_url(remote) {
         remote.to_owned()
     } else {
         let cfg = index_io::GitConfig::load_merged(&root);
@@ -1001,7 +1014,7 @@ fn cmd_push<'a>(
             }
         }
     };
-    http_push(&url, &root, &ref_name, alloc, io.out)
+    remote_push(&url, &root, &ref_name, alloc, io.out)
 }
 
 fn cmd_log<'a>(

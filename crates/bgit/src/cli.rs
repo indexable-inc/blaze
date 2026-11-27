@@ -545,10 +545,19 @@ const CLEAN_SPEC: CommandSpec<'static> = CommandSpec {
 
 const FETCH_SPEC: CommandSpec<'static> = CommandSpec {
     name: "fetch",
-    about: "Download objects and refs from a remote via Git Protocol v2",
+    about: "Download objects and refs via Git Protocol v2 (HTTP/2+TLS1.3 or SSH)",
+    opts: &[
+        OptSpec { long: "depth", value_name: "N", help: "Limit fetching to N commits (shallow)", .. },
+        OptSpec {
+            long: "filter",
+            value_name: "SPEC",
+            help: "Partial clone filter (e.g. blob:none or tree:0)",
+            ..
+        },
+    ],
     positionals: &[PositionalSpec {
         name: "REMOTE",
-        help: "Remote name or HTTP URL (default: origin)",
+        help: "Remote name or URL (https://, git@host:org/repo, github:org/repo; default: origin)",
         ..
     }],
     ..
@@ -885,15 +894,33 @@ const LS_REMOTE_SPEC: CommandSpec<'static> = CommandSpec {
 
 const CLONE_SPEC: CommandSpec<'static> = CommandSpec {
     name: "clone",
-    about: "Clone a remote repository via Git Protocol v2 into .bgit (or lazily with --vfs)",
+    about: "Clone a remote repo via Protocol v2 (HTTP/2+TLS1.3 or SSH) into .bgit",
     flags: &[FlagSpec {
         long: "vfs",
         help: "Mount cloned repo lazily via NFSv3 with 0 checked-out files",
         ..
     }],
+    opts: &[
+        OptSpec { long: "depth", value_name: "N", help: "Create a shallow clone truncated to N commits", .. },
+        OptSpec {
+            long: "filter",
+            value_name: "SPEC",
+            help: "Partial clone filter (e.g. blob:none for instant treeless/blobless clone)",
+            ..
+        },
+    ],
     positionals: &[
-        PositionalSpec { name: "HTTP_URL", required: true, help: "Remote HTTP URL", .. },
-        PositionalSpec { name: "DEST_DIR", required: true, help: "Destination directory", .. },
+        PositionalSpec {
+            name: "URL",
+            required: true,
+            help: "Remote URL (https://github.com/org/repo, git@github.com:org/repo, github:org/repo, http://...)",
+            ..
+        },
+        PositionalSpec {
+            name: "DEST_DIR",
+            help: "Destination directory (defaults to repository name)",
+            ..
+        },
     ],
     ..
 };

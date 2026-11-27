@@ -20,14 +20,18 @@ name = "bgit"
 path = "src/main.rs"
 
 [dependencies]
+blaze-base64.workspace = true
 blaze-core.workspace = true
 blaze-deflate.workspace = true
 blaze-git.workspace = true
 blaze-git-fetch.workspace = true
+blaze-h2.workspace = true
 blaze-hash.workspace = true
 blaze-own.workspace = true
 blaze-std.workspace = true
 blaze-zstd.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
 
 [lints]
 workspace = true
