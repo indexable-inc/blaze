@@ -82,7 +82,7 @@ use crate::run_parent::{self, CodeRefusal, Codes, Needs, ParentError, RECORDS, W
 /// (`ByKind`, zero lock contention across worker threads), matching `RunMaker` (`FromRecord`)
 /// without re-typechecking workspace bodies on worker threads.
 pub(crate) type TestMaker<'h> = Maker<'h, crate::run_ids::Runnable, ByKind<crate::engine_body_record::SnapshotTyped<'h>>>;
-use blaze_engine::SVec;
+use blaze_engine::{SMap, SVec};
 use blaze_engine::code_pool::relay::{self as code_relay, Relay as PoolRelay, RelayError, Reply};
 use blaze_engine::code_pool::{Child, Time, Worker};
 use blaze_ladder::run::special::{MakerKind, MakerStart};
@@ -1802,6 +1802,12 @@ pub(crate) struct CodeRelay<'a> {
     /// A step refused where no error could be returned (a run's end, [`Asking`]'s drop): said by
     /// the next [`CodeRelay::pump`], so nothing is quietly dropped (rule 3).
     fault: Cell<Option<RelayError>>,
+    /// Which suite actually produced each keyed entry currently in the relay, so a child from a
+    /// different suite knows to verify the entry against its own crates and bindings before
+    /// accepting it.
+    entry_suite: RefCell<SMap<'static, blaze_engine::code_pool::CodeKey, SuiteId>>,
+    /// Keyed ask currently open for each child (`None` when idle or on an unkeyed ask).
+    child_key: RefCell<SVec<'static, Option<blaze_engine::code_pool::CodeKey>>>,
 }
 
 impl<'a> CodeRelay<'a> {
@@ -1821,7 +1827,17 @@ impl<'a> CodeRelay<'a> {
             most_bytes: MOST_KEPT,
         };
         let relay = PoolRelay::new(Time(now().0), opts)?;
-        Ok(CodeRelay { relay: RefCell::new(relay), workers, now, alloc, fault: Cell::new(None) })
+        let mut child_key = SVec::with_capacity_in(children, alloc);
+        child_key.resize(children, None);
+        Ok(CodeRelay {
+            relay: RefCell::new(relay),
+            workers,
+            now,
+            alloc,
+            fault: Cell::new(None),
+            entry_suite: RefCell::new(SMap::new_in(alloc)),
+            child_key: RefCell::new(child_key),
+        })
     }
 
     fn time(&self) -> Time {
@@ -1847,7 +1863,10 @@ impl<'a> CodeRelay<'a> {
             .map_err(OneError::Relay)?;
         }
         relay.tick(now).map_err(OneError::Relay)?;
-        while let Some((worker, _, job)) = relay.job() {
+        while let Some((worker, key, job)) = relay.job() {
+            if let Some(slot) = self.entry_suite.borrow_mut().get_mut(&key) {
+                *slot = job.suite;
+            }
             self.workers.give(worker, job)?;
         }
         Ok(drained)
@@ -1856,14 +1875,35 @@ impl<'a> CodeRelay<'a> {
     /// Child `child` asks for the code of `key` (`None`: unkeyed, its own), to be made by `job`.
     pub(crate) fn ask(&self, child: Child, key: Option<blaze_ladder::code_records::CodeKey>, job: Job<'static>) -> Result<(), OneError> {
         let key = key.map(|key| blaze_engine::code_pool::CodeKey(key.0));
+        let suite = job.suite;
         self.relay.borrow_mut().ask(self.time(), child, key, job).map_err(OneError::Relay)?;
+        if let Some(slot) = self.child_key.borrow_mut().get_mut(child.0) {
+            *slot = key;
+        }
+        if let Some(key) = key {
+            self.entry_suite.borrow_mut().entry(key).or_insert(suite);
+        }
         let _ = self.pump()?;
         Ok(())
     }
 
-    /// Child `child`'s answer through `with`, once it came; `None` while it has not.
-    pub(crate) fn answer<R>(&self, child: Child, with: impl FnOnce(Reply<'_, CodeRefusal>) -> R) -> Result<Option<R>, OneError> {
-        self.relay.borrow_mut().answer(child, with).map_err(OneError::Relay)
+    /// Child `child`'s answer through `with`, once it came; `None` while it has not. Passes the
+    /// producing suite (`Some(suite)` for a keyed entry, `None` for an unkeyed child-private ask).
+    pub(crate) fn answer<R>(&self, child: Child, with: impl FnOnce(Option<SuiteId>, Reply<'_, CodeRefusal>) -> R) -> Result<Option<R>, OneError> {
+        let producer = self
+            .child_key
+            .borrow()
+            .get(child.0)
+            .copied()
+            .flatten()
+            .and_then(|key| self.entry_suite.borrow().get(&key).copied());
+        let answered = self.relay.borrow_mut().answer(child, |reply| with(producer, reply)).map_err(OneError::Relay)?;
+        if answered.is_some()
+            && let Some(slot) = self.child_key.borrow_mut().get_mut(child.0)
+        {
+            *slot = None;
+        }
+        Ok(answered)
     }
 }
 
@@ -1876,6 +1916,9 @@ struct Asking<'r, 'a> {
 
 impl Drop for Asking<'_, '_> {
     fn drop(&mut self) {
+        if let Some(slot) = self.code.child_key.borrow_mut().get_mut(self.child.0) {
+            *slot = None;
+        }
         let now = self.code.time();
         if let Err(fault) = self.code.relay.borrow_mut().exited(now, self.child)
             && self.code.fault.get().is_none()
@@ -2773,6 +2816,7 @@ struct Parked {
     row: usize,
     epoch: u64,
     peer: bool,
+    private_retry: bool,
 }
 
 /// RAII guard ensuring a parked child always releases its waiter count in `SuiteCache` on drop
@@ -2785,7 +2829,7 @@ struct ParkedGuard<'c, 'h> {
 impl Drop for ParkedGuard<'_, '_> {
     fn drop(&mut self) {
         if let Some(park) = self.parked.take() && !park.peer {
-            self.cache.borrow_mut().release_in_flight(park.row, park.epoch);
+            self.cache.borrow_mut().release_in_flight(park.row, park.epoch, park.private_retry);
         }
     }
 }
@@ -2793,6 +2837,7 @@ impl Drop for ParkedGuard<'_, '_> {
 /// What a parked run's answer was, taken out of the relay's borrow.
 enum Came {
     Made,
+    RetrySuitePrivate,
     Failed(ParentError),
     Late { waited: u64 },
 }
@@ -3094,7 +3139,7 @@ impl<'c> Launched<'c, '_, '_> {
     ///   this child with its execution allowance paused until the worker finishes.
     #[expect(clippy::too_many_arguments, reason = "runs one sandboxed test child with its suite dir, unwind marker, and captures")]
     async fn run_captured(&self, row: u32, budget: Nanos, output: &mut Output<'_>, signals: &Signals, suite_dir: &Dir<ReadWrite>, stderr: &mut StderrCapture<'_>, unwound_path: &Path, frame: &Frame) -> Result<RunOutcome, OneError> {
-        use suite_cache::{ChildAnswer, ChildResolver, ChildSent, NeedCode};
+        use suite_cache::{ChildAnswer, ChildResolver, ChildSent, CrossSuiteVerdict, NeedCode, RetryDecision};
 
         let cx = self.cx;
         let test = key_of(&self.tests, row)?;
@@ -3372,30 +3417,49 @@ impl<'c> Launched<'c, '_, '_> {
                         return Err(OneError::CodeLate { instance, symbol: park.symbol, waited });
                     }
                 } else {
-                    let came = code.answer(child, |reply| match reply {
-                        Reply::Made(entry) => {
-                            match self.suite_cache.borrow_mut().finish_in_flight(
-                                park.row,
-                                park.epoch,
-                                entry,
-                                self.ids,
-                                &mut *codes,
-                                cx,
-                                self.watch,
-                            ) {
-                                Ok(()) => Came::Made,
-                                Err(cause) => Came::Failed(cause),
+                    let came = code.answer(child, |producer, reply| {
+                        let cross_suite = producer.is_some_and(|suite| suite != self.suite);
+                        match reply {
+                            Reply::Made(entry) => {
+                                let mut sc = self.suite_cache.borrow_mut();
+                                if cross_suite {
+                                    match sc.verify_cross_suite_in_flight(park.row, park.epoch, entry, self.ids, alloc) {
+                                        Ok(CrossSuiteVerdict::AlreadyDone) => return Came::Made,
+                                        Ok(CrossSuiteVerdict::Retry) => return Came::RetrySuitePrivate,
+                                        Ok(CrossSuiteVerdict::Holds) => {}
+                                        Err(cause) => return Came::Failed(cause),
+                                    }
+                                }
+                                match sc.finish_in_flight(
+                                    park.row,
+                                    park.epoch,
+                                    entry,
+                                    self.ids,
+                                    &mut *codes,
+                                    cx,
+                                    self.watch,
+                                ) {
+                                    Ok(()) => Came::Made,
+                                    Err(cause) => Came::Failed(cause),
+                                }
                             }
-                        }
-                        // Every asker of the key is handed the same refusal (rule 19).
-                        Reply::Refused(why) => {
-                            let refused = self.suite_cache.borrow_mut().refused_in_flight(park.row, park.epoch);
-                            match refused {
-                                Ok(()) => Came::Failed(ParentError::CodeRefused { symbol: park.symbol, why: why.for_asker() }),
-                                Err(cause) => Came::Failed(cause),
+                            // Every asker of the key is handed the same refusal (rule 19). If
+                            // another suite built and refused this shared key, retry privately
+                            // under this suite's own bindings rather than attributing a foreign
+                            // suite's refusal here.
+                            Reply::Refused(why) => {
+                                if cross_suite {
+                                    Came::RetrySuitePrivate
+                                } else {
+                                    let refused = self.suite_cache.borrow_mut().refused_in_flight(park.row, park.epoch);
+                                    match refused {
+                                        Ok(()) => Came::Failed(ParentError::CodeRefused { symbol: park.symbol, why: why.for_asker() }),
+                                        Err(cause) => Came::Failed(cause),
+                                    }
+                                }
                             }
+                            Reply::Late { waited, .. } => Came::Late { waited },
                         }
-                        Reply::Late { waited, .. } => Came::Late { waited },
                     })?;
                     if let Some(came) = came {
                         parked_for = parked_for.saturating_add(open_park);
@@ -3403,20 +3467,62 @@ impl<'c> Launched<'c, '_, '_> {
                         signals.parked.set(u64::try_from(parked_for.as_nanos()).unwrap_or(u64::MAX));
                         signals.parked_now.set(false);
                         signals.progress.set(true);
-                        let stop = match came {
-                            Came::Made => None,
-                            Came::Failed(cause) => Some(test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause)),
+                        match came {
+                            Came::Made => {
+                                again = true;
+                            }
+                            Came::RetrySuitePrivate => {
+                                let decision = self
+                                    .suite_cache
+                                    .borrow_mut()
+                                    .begin_suite_private_retry(self.suite, park.row, park.epoch, code.alloc);
+                                match decision {
+                                    RetryDecision::AlreadyDone => {
+                                        again = true;
+                                    }
+                                    RetryDecision::WaitPeer => {
+                                        parked_guard.parked = Some(Parked {
+                                            since: run.now(),
+                                            symbol: park.symbol,
+                                            row: park.row,
+                                            epoch: park.epoch,
+                                            peer: true,
+                                            private_retry: false,
+                                        });
+                                        signals.parked_now.set(true);
+                                    }
+                                    RetryDecision::Submit(job) => {
+                                        if let Err(error) = code.ask(child, None, job) {
+                                            self.suite_cache.borrow_mut().release_in_flight(park.row, park.epoch, true);
+                                            stop_child(run).map_err(child_error)?;
+                                            return Err(error);
+                                        }
+                                        parked_guard.parked = Some(Parked {
+                                            since: run.now(),
+                                            symbol: park.symbol,
+                                            row: park.row,
+                                            epoch: park.epoch,
+                                            peer: false,
+                                            private_retry: true,
+                                        });
+                                        signals.parked_now.set(true);
+                                    }
+                                }
+                            }
+                            Came::Failed(cause) => {
+                                let error = test_parent_error_places(&mut *self.suite_cache.borrow_mut(), cause);
+                                stop_child(run).map_err(child_error)?;
+                                return Err(error);
+                            }
                             Came::Late { waited } => {
                                 let mut sc = self.suite_cache.borrow_mut();
-                                sc.release_in_flight(park.row, park.epoch);
-                                Some(OneError::CodeLate { instance: sc.name_of(park.symbol), symbol: park.symbol, waited })
+                                sc.release_in_flight(park.row, park.epoch, park.private_retry);
+                                let error = OneError::CodeLate { instance: sc.name_of(park.symbol), symbol: park.symbol, waited };
+                                drop(sc);
+                                stop_child(run).map_err(child_error)?;
+                                return Err(error);
                             }
-                        };
-                        if let Some(error) = stop {
-                            stop_child(run).map_err(child_error)?;
-                            return Err(error);
                         }
-                        again = true;
                     }
                 }
             }
@@ -3612,7 +3718,7 @@ impl<'c> Launched<'c, '_, '_> {
                                         None => Err(OneError::Parent(ParentError::NotReady { symbol: ask.symbol })),
                                     };
                                     if let Err(error) = asked {
-                                        self.suite_cache.borrow_mut().release_in_flight(ask.row, ask.epoch);
+                                        self.suite_cache.borrow_mut().release_in_flight(ask.row, ask.epoch, false);
                                         stop_child(run).map_err(child_error)?;
                                         return Err(error);
                                     }
@@ -3622,6 +3728,7 @@ impl<'c> Launched<'c, '_, '_> {
                                         row: ask.row,
                                         epoch: ask.epoch,
                                         peer: false,
+                                        private_retry: false,
                                     });
                                     signals.parked_now.set(true);
                                 }
@@ -3632,6 +3739,7 @@ impl<'c> Launched<'c, '_, '_> {
                                         row: wait_row,
                                         epoch,
                                         peer: true,
+                                        private_retry: false,
                                     });
                                     signals.parked_now.set(true);
                                 }

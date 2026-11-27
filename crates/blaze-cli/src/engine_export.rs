@@ -2931,7 +2931,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
             match done.result {
                 Ok(entry_bytes) => {
                     let one = walk
-                        .finish::<RunError>(pend, entry_bytes.as_slice(), codes, &body_ids::EntryForm, MOST_WALKED, scratch)
+                        .finish::<RunError>(pend, entry_bytes.as_slice(), ids, codes, &body_ids::EntryForm, MOST_WALKED, scratch)
                         .map_err(|why| {
                             box_err(
                                 ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
