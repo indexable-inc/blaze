@@ -483,9 +483,11 @@ pub(crate) fn run_with(
     }
 
     // Sweep dead-PID telemetry rings / build summaries (`v2/runs/`), orphaned test temp dirs
-    // (`v2/test/tmp/`), and expired legacy run record files (`v2/run/records/`).
+    // (`v2/test/tmp/`), and expired legacy run record files (`v2/run/records/`). When the store
+    // budget is unlimited (`BLAZE_STORE_MAX_GB=0` / `--max-gb 0`), auxiliary caches are swept by
+    // age only (no byte-cap eviction of live `v2/build-script/files` outputs).
     let probe = OsPidProbe;
-    let aux = sweep_aux_with(cx, home.dir(), now_ns, &probe, false, AuxSweepPlant::None);
+    let aux = sweep_aux_for_budget(cx, home.dir(), now_ns, summary.cap_bytes, &probe, false, AuxSweepPlant::None);
     summary.aux_files_removed = aux.files;
     summary.aux_bytes_freed = aux.bytes;
 
@@ -612,7 +614,7 @@ fn run_dry(
     }
 
     let probe = OsPidProbe;
-    let aux = sweep_aux_with(cx, home.dir(), now_ns, &probe, true, AuxSweepPlant::None);
+    let aux = sweep_aux_for_budget(cx, home.dir(), now_ns, summary.cap_bytes, &probe, true, AuxSweepPlant::None);
     summary.aux_files_removed = aux.files;
     summary.aux_bytes_freed = aux.bytes;
     if aux.files > 0 {
@@ -701,6 +703,14 @@ impl AuxCaps {
         build_script_files: BUILD_SCRIPT_FILES_MAX_BYTES,
         native_work: NATIVE_WORK_MAX_BYTES,
         run_records: RUN_RECORDS_MAX_BYTES,
+    };
+
+    /// Age-only auxiliary caps (`0` = no byte-budget eviction) used when `BLAZE_STORE_MAX_GB=0` /
+    /// `--max-gb 0` sets an unlimited store budget.
+    pub(crate) const UNBOUNDED: AuxCaps = AuxCaps {
+        build_script_files: 0,
+        native_work: 0,
+        run_records: 0,
     };
 }
 
@@ -1138,6 +1148,35 @@ pub(crate) fn sweep_aux_with(
     plant: AuxSweepPlant,
 ) -> AuxSummary {
     sweep_aux_with_caps(cx, blaze_dir, now_ns, AuxCaps::DEFAULT, probe, dry_run, plant)
+}
+
+/// [`sweep_aux_with`] honoring the store's resolved `cap_bytes`: when `cap_bytes == u64::MAX`
+/// (unlimited via `BLAZE_STORE_MAX_GB=0`, `BLAZE_STORE_MAX_BYTES=0`, or `--max-gb 0`), auxiliary
+/// caches sweep by age only so live `v2/build-script/files` artifacts are never LRU-evicted.
+pub(crate) fn sweep_aux_for_budget(
+    cx: &Cx,
+    blaze_dir: &Dir<ReadWrite>,
+    now_ns: u64,
+    cap_bytes: u64,
+    probe: &impl PidProbe,
+    dry_run: bool,
+    plant: AuxSweepPlant,
+) -> AuxSummary {
+    if cap_bytes == u64::MAX {
+        sweep_aux_inner(
+            cx,
+            blaze_dir,
+            now_ns,
+            AuxLimits { caps: AuxCaps::UNBOUNDED, ..AuxLimits::DEFAULT },
+            0,
+            0,
+            probe,
+            dry_run,
+            plant,
+        )
+    } else {
+        sweep_aux_with(cx, blaze_dir, now_ns, probe, dry_run, plant)
+    }
 }
 
 /// [`sweep_aux_with`] with explicit size-budget [`AuxCaps`] (parameterized for deterministic tests).
