@@ -62,7 +62,7 @@ pub struct ScopedBy<'d, 'n: 'd, S> {
 pub struct BodyBlocks<'a> {
     krate: blaze_id::CrateItemKey,
     nested: blaze_file_items::nested::Nested<'a>,
-    hand: AVec<'a, Option<ItemKey>>,
+    hand: super::scope_table::OwnedHandBlocks<'a>,
     read: core::cell::RefCell<ReadExpansions<'a>>,
     alloc: Alloc<'a>,
 }
@@ -91,7 +91,9 @@ pub fn body_blocks<'a>(krate: blaze_id::CrateItemKey, body: ItemKey, text: &str,
     if nested.end != blaze_file_items::nested::NestedEnd::Whole {
         return None;
     }
-    let hand = blaze_scope::blocks::block_modules(krate, body, &nested, alloc);
+    let modules = blaze_scope::blocks::block_modules(krate, body, &nested, alloc);
+    let head_module = (!nested.head_calls.is_empty()).then(|| blaze_scope::blocks::head_call_module(krate, body));
+    let hand = super::scope_table::OwnedHandBlocks { modules, head_module, call_keys: Vec::new_in(alloc) };
     Some(body_blocks_from(krate, nested, hand, alloc))
 }
 
@@ -100,7 +102,7 @@ pub fn body_blocks<'a>(krate: blaze_id::CrateItemKey, body: ItemKey, text: &str,
 pub fn body_blocks_from<'a>(
     krate: blaze_id::CrateItemKey,
     nested: blaze_file_items::nested::Nested<'a>,
-    hand: AVec<'a, Option<ItemKey>>,
+    hand: super::scope_table::OwnedHandBlocks<'a>,
     alloc: Alloc<'a>,
 ) -> BodyBlocks<'a> {
     let read = ReadExpansions { made: Vec::new_in(alloc), at: Vec::new_in(alloc) };
@@ -128,7 +130,7 @@ impl BlockModules for BodyBlocks<'_> {
     /// those that hold it, since a block inside another opens after it. `None` when no block
     /// holds the call.
     fn hand_module(&self, call: blaze_surface::Range) -> Option<ItemKey> {
-        self.nested.blocks.iter().zip(self.hand.iter()).filter(|(b, m)| m.is_some() && b.open < call.start && call.end <= b.close).last().and_then(|(_, m)| *m)
+        self.nested.blocks.iter().zip(self.hand.modules.iter()).filter(|(b, m)| m.is_some() && b.open < call.start && call.end <= b.close).last().and_then(|(_, m)| *m)
     }
 
     /// The module of the innermost block an expansion wrote that holds the body call at `call`
@@ -219,7 +221,7 @@ impl<'a> BodyBlocks<'a> {
             }
         }
         for &j in chain.iter().rev() {
-            let one = super::scope_table::expanded(self.krate, &self.nested, Some(self.hand.as_slice()), &expansions, j, &read.made, self.alloc).map_err(|r| r.form())?;
+            let one = super::scope_table::expanded(self.krate, &self.nested, Some(self.hand.as_ref()), &expansions, j, &read.made, self.alloc).map_err(|r| r.form())?;
             read.made[j as usize] = Some(one);
             read.at[j as usize] = place(j);
         }

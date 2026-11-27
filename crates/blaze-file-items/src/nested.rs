@@ -152,6 +152,10 @@ pub struct Nested<'a> {
     pub blocks: AVec<'a, Block>,
     pub items: AVec<'a, NestedItem>,
     pub calls: AVec<'a, NestedCall>,
+    /// Direct macro calls outside every `{ ... }` block (e.g., `type A = [u8; make_len!()];`,
+    /// `struct T([u8; make_len!()]);`, `const C: usize = make_len!();`, or signature/header
+    /// calls). Not inside attributes (`#[...]` / `#![...]`).
+    pub head_calls: AVec<'a, NestedCall>,
     pub end: NestedEnd,
     /// D189, point 1: whether the body's TEXT alone shows something seen outside it (an item
     /// with [`NestedItem::surface`]); a body with it is a surface body whatever its calls are.
@@ -177,7 +181,7 @@ impl Nested<'_> {
     /// an item that writes it ([`NestedItem::writes`]: an item that makes a module, or a
     /// local `fn`, `const` or `static` whose own body writes one) or a statement call.
     pub fn writes(&self) -> bool {
-        !self.calls.is_empty() || self.items.iter().any(NestedItem::writes)
+        !self.calls.is_empty() || !self.head_calls.is_empty() || self.items.iter().any(NestedItem::writes)
     }
 }
 
@@ -303,12 +307,81 @@ pub fn may_write_block(text: &str) -> bool {
     text.contains('!') || WORDS.into_iter().any(|word| text.contains(word))
 }
 
-/// Whether `text` contains any brace block `{ ... }` whose interior passes [`may_write_block`].
+/// Whether `text` contains a direct macro invocation `ident!(...)`, `ident![...]`, or
+/// `ident!{...}` outside strings, comments, and `#[...]` / `#![...]` attributes. Does not
+/// match unary `!expr`, `!=`, `-> !`, or `if !(x)`.
+pub fn has_macro_call(text: &str) -> bool {
+    if !text.contains('!') {
+        return false;
+    }
+    let mut at = 0usize;
+    let mut after_pound = false;
+    let mut attr_depth = 0u32;
+    let mut after_ident = false;
+    let mut after_bang = false;
+    for tok in tokenize(text, FrontmatterAllowed::No, Cpu::BASELINE) {
+        let start = at;
+        let Ok(len) = usize::try_from(tok.len) else {
+            return false;
+        };
+        at += len;
+        let kind = tok.kind;
+        if matches!(kind, TokenKind::Whitespace | TokenKind::LineComment { .. } | TokenKind::BlockComment { .. }) {
+            continue;
+        }
+        if attr_depth > 0 {
+            match kind {
+                TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
+                    attr_depth = attr_depth.saturating_add(1);
+                }
+                TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
+                    attr_depth -= 1;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let was_pound = core::mem::take(&mut after_pound);
+        let was_ident = core::mem::take(&mut after_ident);
+        let was_bang = core::mem::take(&mut after_bang);
+        match kind {
+            TokenKind::Pound => {
+                after_pound = true;
+            }
+            TokenKind::Bang if was_pound => {
+                after_pound = true;
+            }
+            TokenKind::OpenBracket if was_pound => {
+                attr_depth = 1;
+            }
+            TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace if was_bang => {
+                return true;
+            }
+            TokenKind::Bang if was_ident => {
+                after_bang = true;
+            }
+            TokenKind::Ident => {
+                after_ident = text.get(start..at).is_some_and(|w| !not_a_macro(w));
+            }
+            TokenKind::RawIdent => {
+                after_ident = true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether `text` contains any brace block `{ ... }` whose interior passes [`may_write_block`],
+/// OR a direct macro invocation outside attributes ([`has_macro_call`], e.g. `type A = [u8;
+/// make_len!()];` where `make_len!()` expands to an item-declaring block).
 /// Unlike calling [`may_write_block`] on an entire item (which always matches the item's own
-/// leading `struct`/`enum`/`union`/`type`/`trait`/`impl` keyword), this inspects only the text
-/// inside brace groups so ordinary headers without item- or macro-bearing const blocks return
-/// `false`.
+/// leading `struct`/`enum`/`union`/`type`/`trait`/`impl` keyword), this inspects only brace
+/// interiors and direct macro invocations so ordinary headers return `false`.
 pub fn has_writing_block(text: &str) -> bool {
+    if has_macro_call(text) {
+        return true;
+    }
     if !text.contains('{') {
         return false;
     }
@@ -412,9 +485,6 @@ pub fn trait_head(text: &str) -> &str {
 /// or defaults, or enum discriminants), without counting the item's own `{ fields/variants }`
 /// braces or plain struct-variant braces.
 pub fn adt_has_writing_block(text: &str) -> bool {
-    if !text.contains('{') {
-        return false;
-    }
     match outer_brace_span(text) {
         Some((open, close)) => {
             text.get(..open).is_some_and(has_writing_block)
@@ -572,6 +642,8 @@ pub(crate) fn digest_body_blocks(text: &str, feed: &mut impl FnMut(&[u8])) -> bo
     let mut call_count = 0usize;
 
     let mut prev = Prev::Other;
+    let mut after_pound = false;
+    let mut attr_depth = 0u32;
     let mut at = 0usize;
 
     for token in tokenize(text, FrontmatterAllowed::No, Cpu::BASELINE) {
@@ -586,6 +658,39 @@ pub(crate) fn digest_body_blocks(text: &str, feed: &mut impl FnMut(&[u8])) -> bo
         let kind = token.kind;
         if matches!(kind, TokenKind::Whitespace | TokenKind::LineComment { .. } | TokenKind::BlockComment { .. }) {
             continue;
+        }
+        if attr_depth > 0 {
+            match kind {
+                TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
+                    attr_depth = attr_depth.saturating_add(1);
+                }
+                TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
+                    attr_depth -= 1;
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if brace_depth == 0 {
+            let was_pound = core::mem::take(&mut after_pound);
+            match kind {
+                TokenKind::Pound => {
+                    after_pound = true;
+                    prev = Prev::Other;
+                    continue;
+                }
+                TokenKind::Bang if was_pound => {
+                    after_pound = true;
+                    prev = Prev::Other;
+                    continue;
+                }
+                TokenKind::OpenBracket if was_pound => {
+                    attr_depth = 1;
+                    prev = Prev::Other;
+                    continue;
+                }
+                _ => {}
+            }
         }
 
         // Track direct top-level arguments of an open `STD_EXPR_MACROS` call.
@@ -617,6 +722,9 @@ pub(crate) fn digest_body_blocks(text: &str, feed: &mut impl FnMut(&[u8])) -> bo
 
         if let Some((delim, close)) = open_delim {
             if let Prev::Bang { std_idx } = prev {
+                if brace_depth == 0 && call_depth == 0 {
+                    return true;
+                }
                 if brace_depth > 0 {
                     let Some(macro_idx) = std_idx else {
                         return true;
@@ -791,7 +899,10 @@ pub(crate) fn digest_body_blocks(text: &str, feed: &mut impl FnMut(&[u8])) -> bo
                 _ => Prev::Other,
             },
             TokenKind::RawIdent | TokenKind::Dollar => Prev::RawOrGroup,
-            TokenKind::Ident => Prev::Ident { std_idx: None, not_macro: false },
+            TokenKind::Ident => Prev::Ident {
+                std_idx: None,
+                not_macro: text.get(start..at).is_some_and(not_a_macro),
+            },
             _ => Prev::Other,
         };
     }
@@ -1195,8 +1306,8 @@ fn scan_at<'a>(text: &str, depth: u16, alloc: Alloc<'a>) -> Nested<'a> {
                     NestedKind::Impl | NestedKind::ExternBlock | NestedKind::MacroRules | NestedKind::Macro | NestedKind::Use | NestedKind::ExternCrate
                 );
                 let own_surface = matches!(item.kind, NestedKind::Impl | NestedKind::ExternBlock) || attrs_emit(own);
-                // A body with no brace group has no block (`const K: u8 = 1;`).
-                let braced = own.contains('{');
+                // A body with no brace group and no direct macro call has no block (`const K: u8 = 1;`).
+                let braced = own.contains('{') || has_macro_call(own);
                 let deep = top.depth >= MAX_BODY_DEPTH;
                 if braced && !deep && (writes_kind || (surface_kind && !own_surface)) {
                     let mut inner = scan_one(own, alloc);
@@ -1444,6 +1555,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
         blocks: AVec::new_in(alloc),
         items: AVec::new_in(alloc),
         calls: AVec::new_in(alloc),
+        head_calls: AVec::new_in(alloc),
         end: NestedEnd::Whole,
         surface_by_text: false,
     };
@@ -1492,8 +1604,8 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
     let mut after_match_kw = false;
     let mut after_struct_head = false;
     let mut can_start_closure = false;
-    // The listed call whose arguments are open: its range ends at their closer.
-    let mut open_call: Option<usize> = None;
+    // The listed call whose arguments are open: `(is_head_call, index)`.
+    let mut open_call: Option<(bool, usize)> = None;
     let mut at = 0usize;
     for token in tokenize(text, FrontmatterAllowed::No, Cpu::BASELINE) {
         let start = at;
@@ -1559,8 +1671,14 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 heads.pop();
                 in_call -= 1;
                 if in_call == 0 {
-                    if let Some(call) = open_call.take() {
-                        out.calls[call].range.end = offset(at);
+                    if let Some((is_head, call)) = open_call.take() {
+                        if is_head {
+                            if let Some(c) = out.head_calls.get_mut(call) {
+                                c.range.end = offset(at);
+                            }
+                        } else if let Some(c) = out.calls.get_mut(call) {
+                            c.range.end = offset(at);
+                        }
                     }
                     fresh = kind == TokenKind::CloseBrace && matches!(stack.last(), Some(Open::Brace(_)));
                 }
@@ -1601,17 +1719,29 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 // `let read = tokio::select! { .. }` writes `{ mod __tokio_select_util { .. }
                 // .. }`, reth's `with_adapter!` writes `{ type $A = ..; $body }`).
                 (_, Some(head)) => {
-                    if let (Some(head), Some(block)) = (head, enclosing) {
-                        open_call = Some(out.calls.len());
-                        let none = Range { start: head.path.start, end: head.path.start };
-                        let attrs = if bang_stmt { none } else { blocks_state.get(block as usize).and_then(|s| s.attrs).unwrap_or(none) };
-                        out.calls.push(NestedCall {
-                            block,
-                            path: head.path,
-                            range: Range { start: head.start, end: head.path.end },
-                            expr: !bang_stmt,
-                            attrs,
-                        });
+                    if let Some(head) = head {
+                        if let Some(block) = enclosing {
+                            open_call = Some((false, out.calls.len()));
+                            let none = Range { start: head.path.start, end: head.path.start };
+                            let attrs = if bang_stmt { none } else { blocks_state.get(block as usize).and_then(|s| s.attrs).unwrap_or(none) };
+                            out.calls.push(NestedCall {
+                                block,
+                                path: head.path,
+                                range: Range { start: head.start, end: head.path.end },
+                                expr: !bang_stmt,
+                                attrs,
+                            });
+                        } else {
+                            open_call = Some((true, out.head_calls.len()));
+                            let none = Range { start: head.path.start, end: head.path.start };
+                            out.head_calls.push(NestedCall {
+                                block: 0,
+                                path: head.path,
+                                range: Range { start: head.start, end: head.path.end },
+                                expr: true,
+                                attrs: none,
+                            });
+                        }
                     }
                     in_call += 1;
                     Open::Call
@@ -1665,8 +1795,9 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                     out.blocks.push(Block { parent, attrs, open: offset(start), close: 0 });
                     Open::Brace(id)
                 }
-                // `#[..]`, `#![..]` and `pub(..)` leave the statement at its start.
-                (TokenKind::OpenBracket, None) => Open::Other { stmt: fresh && was_pound },
+                // `#[..]`, `#![..]` (inside a block at statement start, or outside blocks in a
+                // head/signature/group) and `pub(..)` leave the statement at its start.
+                (TokenKind::OpenBracket, None) => Open::Other { stmt: (fresh || block.is_none()) && was_pound },
                 _ => Open::Other { stmt: fresh && was_pub },
             };
             let keeps = matches!(open, Open::Other { stmt: true });
@@ -1772,16 +1903,25 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
                 after_eq = kind == TokenKind::Eq;
                 after_minus = kind == TokenKind::Minus;
             }
+            if matches!(stack.last(), Some(Open::Other { stmt: true })) {
+                continue;
+            }
             after_ident = matches!(kind, TokenKind::Ident | TokenKind::RawIdent) && !not_a_macro(&text[start..at]);
             match kind {
-                TokenKind::Bang if was_ident => {
-                    call_start = None;
-                    after_bang_of = Some(path_start.take().filter(|_| enclosing.is_some()).map(|p| CallHead { start: p, path: Range { start: p, end: offset(start) } }));
-                    bang_stmt = false;
-                }
-                _ if enclosing.is_none() => {
+                TokenKind::Pound => {
+                    after_pound = true;
                     path_start = None;
                     call_start = None;
+                }
+                TokenKind::Bang if was_pound => {
+                    after_pound = true;
+                    path_start = None;
+                    call_start = None;
+                }
+                TokenKind::Bang if was_ident => {
+                    call_start = None;
+                    after_bang_of = Some(path_start.take().map(|p| CallHead { start: p, path: Range { start: p, end: offset(start) } }));
+                    bang_stmt = false;
                 }
                 TokenKind::Ident | TokenKind::RawIdent if was_sep == 2 || was_dollar => {}
                 TokenKind::Ident | TokenKind::RawIdent => {
@@ -2680,5 +2820,36 @@ fn h() {
 
         // Unbalanced delimiter conservatively checks the whole input.
         assert!(may_declare_format_args("foo(, { struct Local; 1 }"));
+    }
+
+    #[test]
+    fn direct_macro_calls_in_heads_are_detected_and_scanned_without_false_positives() {
+        let heap = blaze_own::testing::heap();
+        assert!(super::has_writing_block("type A = [u8; make_len!()];"));
+        assert!(super::has_writing_block("pub fn f(_: [u8; make_len!()]) {}"));
+        assert!(super::adt_has_writing_block("pub struct T([u8; make_len!()]);"));
+        assert!(super::adt_has_writing_block("pub struct R { pub n: usize = make_len!() }"));
+
+        // Non-macro `!` forms and attribute macros must NOT trigger head scanning.
+        assert!(!super::has_writing_block("pub fn f() -> !"));
+        assert!(!super::has_writing_block("pub const X: bool = !true;"));
+        assert!(!super::has_writing_block("pub const Y: bool = a != b;"));
+        assert!(!super::has_writing_block("#[doc = concat!(\"a\", \"b\")] pub type Plain = [u8; 4];"));
+        assert!(!super::adt_has_writing_block("#![allow(dead_code)] pub struct Plain { #[doc = concat!(\"x\", \"y\")] pub x: u8 }"));
+
+        // `scan` records unbraced head calls in `head_calls` and marks `writes() == true`, while
+        // ignoring attributes.
+        let text = "#[doc = concat!(\"a\", \"b\")] type A = [u8; make_len!()];";
+        let n = scan(text, heap.alloc());
+        assert_eq!(n.end, NestedEnd::Whole);
+        assert!(n.blocks.is_empty());
+        assert!(n.calls.is_empty());
+        assert_eq!(n.head_calls.len(), 1);
+        assert_eq!(&text[n.head_calls[0].range.start as usize..n.head_calls[0].range.end as usize], "make_len!()");
+        assert!(n.writes());
+
+        // `digest_body_blocks` returns `whole = true` for direct head macro calls so edits invalidate surface.
+        let mut buf = AVec::new_in(heap.alloc());
+        assert!(super::digest_body_blocks(text, &mut |b| buf.extend_from_slice(b)));
     }
 }

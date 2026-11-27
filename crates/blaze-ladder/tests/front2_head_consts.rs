@@ -2069,3 +2069,54 @@ fn main() {}
     let val = consts.value(&mut r, prepared, dk).unwrap_or_else(|e| panic!("eval method record default: {e}"));
     assert_eq!(blaze_ladder::front2::consts::int_of(val), Some(2), "method structural record default must evaluate size_of::<Enum>() == 2");
 }
+
+/// Round 8 P1: a direct unbraced macro call in an item head (`type A = [u8; make_len!()];`,
+/// tuple struct, fn signature) or nominal field default (`n: usize = make_len!()`) where the
+/// macro expands to an item-declaring block (`{ enum E {} size_of::<E>() }`) is scanned by
+/// `blaze-scope`, expanded into a block module, and mapped back when evaluating the constant.
+#[test]
+fn direct_macro_call_in_head_and_field_default_resolves_expanded_enum() {
+    const TEXT: &str = "
+macro_rules! make_len {
+    () => {
+        {
+            #[repr(u16)]
+            enum MacroHeadEnum { A = 0, B = 1 }
+            core::mem::size_of::<MacroHeadEnum>()
+        }
+    };
+}
+macro_rules! one {
+    () => { 1usize };
+}
+
+pub type AliasArr = [u8; make_len!()];
+pub struct TupleArr(pub [u8; make_len!()]);
+pub fn take_arr(_: [u8; make_len!()]) {}
+pub struct Opts {
+    pub a: usize = one!(),
+    pub n: usize = make_len!(),
+}
+
+const DEF_N: usize = Opts { .. }.n;
+
+fn alias_ok() -> AliasArr { [0u8; 2] }
+fn alias_bad() -> AliasArr { [0u8; 3] }
+fn tuple_ok() -> TupleArr { TupleArr([0u8; 2]) }
+fn tuple_bad() -> TupleArr { TupleArr([0u8; 3]) }
+fn fn_ok() { take_arr([0u8; 2]); }
+fn fn_bad() { take_arr([0u8; 3]); }
+fn default_ok() -> [u8; DEF_N] { [0u8; 2] }
+fn default_bad() -> [u8; DEF_N] { [0u8; 3] }
+fn main() {}
+";
+    let got = check_fns(
+        TEXT,
+        &["alias_ok", "alias_bad", "tuple_ok", "tuple_bad", "fn_ok", "fn_bad", "default_ok", "default_bad"],
+    );
+    expect(
+        "direct macro call in heads & field defaults",
+        &got,
+        &[true, false, true, false, true, false, true, false],
+    );
+}

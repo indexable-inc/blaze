@@ -429,7 +429,7 @@ where
 /// the body is no item or member of the library (a local item's own body).
 pub struct PatternBlocks<'a> {
     nested: Nested<'a>,
-    modules: Option<AVec<'a, Option<LibKey>>>,
+    modules: Option<super::scope_table::OwnedHandBlocks<'a>>,
 }
 
 impl<'a> PatternBlocks<'a> {
@@ -532,7 +532,7 @@ pub fn by_uses<'n, 'a, S: NamesSource<'n>>(
                 let Some(crate_key) = paths.names.crate_of(module).and_then(|k| paths.names.crate_key(k)) else {
                     return Err(LocalGap { item, form: THROUGH_LOCAL, range });
                 };
-                let built = super::scope_table::build(crate_key, module, view, &blocks.nested, blocks.modules.as_deref(), planted, alloc)
+                let built = super::scope_table::build(crate_key, module, view, &blocks.nested, blocks.modules.as_ref().map(super::scope_table::OwnedHandBlocks::as_ref), planted, alloc)
                     .map_err(|r| LocalGap { item, form: r.form(), range })?;
                 table = Some(built);
             }

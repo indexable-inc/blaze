@@ -1087,3 +1087,44 @@ fn trait_head_and_adt_skip_where_const_blocks_when_finding_body_braces() {
     let plain_struct = "pub struct Plain { pub x: u8 }";
     assert!(!blaze_file_items::nested::adt_has_writing_block(plain_struct));
 }
+
+const DIRECT_HEAD_MACRO_CALL: &str = r#"#![no_core]
+macro_rules! make_len {
+    () => {
+        {
+            pub enum HeadMacroEnum { A = 0, B = 1 }
+            pub trait Mark {}
+            impl Mark for HeadMacroEnum {}
+            2
+        }
+    };
+}
+pub type A = [u8; make_len!()];
+"#;
+
+static DIRECT_HEAD_MACRO_CALL_TEXTS: Texts = Texts(&[&[("/user/lib.rs", DIRECT_HEAD_MACRO_CALL)]]);
+
+/// Round 8 P1: a direct unbraced macro call in an item head (`type A = [u8; make_len!()];`)
+/// emits a `__blaze_block_head` module under `A`, expands `make_len!()` in statement/expression
+/// position, and creates the expansion's block module holding `HeadMacroEnum` and its `impl`.
+#[test]
+fn direct_macro_call_in_type_alias_head_creates_expansion_block_module() {
+    use blaze_surface::DefKind;
+    let alloc = blaze_own::testing::heap().alloc();
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &DIRECT_HEAD_MACRO_CALL_TEXTS);
+    let mark_impl = impl_ending(&names, 0, "MarkforHeadMacroEnum");
+    let root = names.root(0);
+    let alias = names
+        .item_at(root, Namespace::Types, Written { kind: PathKind::Plain, segments: &["A"] }, alloc)
+        .unwrap_or_else(|e| panic!("`A`: {e}"));
+    let head_mod = crate::blocks::head_call_module(names.krate(0).key, alias.def.key);
+    let call_key = crate::task::key_of(names.krate(0).key, head_mod, "MacroCall", "", 0);
+    let exp_name = crate::expanded_blocks::expansion_block_name(call_key, 0, alloc);
+    let exp_mod = crate::task::key_of(names.krate(0).key, call_key, "mod", exp_name.as_str(), 0);
+    assert_eq!(mark_impl.module, exp_mod);
+    let e = names
+        .item_at(exp_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &["HeadMacroEnum"] }, alloc)
+        .unwrap_or_else(|e| panic!("`HeadMacroEnum` in expansion block module: {e}"));
+    assert_eq!(e.def.kind, DefKind::Enum);
+}

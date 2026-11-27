@@ -481,6 +481,38 @@ impl ExpansionTexts for blaze_lower::Expansions<'_> {
     }
 }
 
+/// Borrowed view of a body's `blaze-scope` hand block modules and direct item-level call keys.
+#[derive(Clone, Copy)]
+pub(super) struct HandBlocks<'a> {
+    /// Module key for each hand `{ ... }` block of `nested.blocks`.
+    pub(super) modules: &'a [Option<LibKey>],
+    /// Module key for [`blaze_scope::blocks::HEAD_BLOCK_MODULE`] when a library body's own text
+    /// has direct unbraced macro calls (`nested.head_calls`).
+    pub(super) head_module: Option<LibKey>,
+    /// Direct mapping from item-relative call start offset (`CallAt::Item { start }`) to the
+    /// enclosing owner item's `blaze-scope` `MacroCall` key, used for synthetic head-level
+    /// anonymous constants (`HeadAnon`) whose calls may live in either `owner_nested.calls` or
+    /// `owner_nested.head_calls`.
+    pub(super) call_keys: &'a [(u32, LibKey)],
+}
+
+/// Owned counterpart of [`HandBlocks`] returned by `Locals::body_block_modules`.
+pub struct OwnedHandBlocks<'a> {
+    pub(super) modules: AVec<'a, Option<LibKey>>,
+    pub(super) head_module: Option<LibKey>,
+    pub(super) call_keys: AVec<'a, (u32, LibKey)>,
+}
+
+impl<'a> OwnedHandBlocks<'a> {
+    pub(super) fn as_ref(&self) -> HandBlocks<'_> {
+        HandBlocks {
+            modules: self.modules.as_slice(),
+            head_module: self.head_module,
+            call_keys: self.call_keys.as_slice(),
+        }
+    }
+}
+
 /// Expansion `j`'s blocks as the names library numbers and keys them ([`Expanded`]): its
 /// call's key from where the call stands, in the item's text `nested` (whose blocks' modules
 /// are `hand`) or in its writer's expansion, which `made` holds at the writer's index (a
@@ -489,7 +521,7 @@ impl ExpansionTexts for blaze_lower::Expansions<'_> {
 pub(super) fn expanded<'a, E: ExpansionTexts + ?Sized>(
     krate: CrateItemKey,
     nested: &Nested<'_>,
-    hand: Option<&[Option<LibKey>]>,
+    hand: Option<HandBlocks<'_>>,
     texts: &E,
     j: u32,
     made: &[Option<Expanded<'a>>],
@@ -498,9 +530,17 @@ pub(super) fn expanded<'a, E: ExpansionTexts + ?Sized>(
     let text = texts.text_of(j)?;
     let blocks = expansion_blocks(text, alloc).map_err(|_| ScopeRefused::ExpansionUnbalanced { expansion: j })?;
     let call = match texts.call_of(j)? {
-        CallAt::Item { start } => statement_call(nested, start).and_then(|(block, n)| {
-            let owner = hand?.get(block as usize).copied().flatten()?;
-            Some(key_of(krate, owner, "MacroCall", "", n))
+        CallAt::Item { start } => hand.and_then(|h| {
+            if let Some(&(_, direct)) = h.call_keys.iter().find(|&&(at, _)| at == start) {
+                return Some(direct);
+            }
+            if let Some((block, n)) = statement_call(nested, start) {
+                let owner = h.modules.get(block as usize).copied().flatten()?;
+                return Some(key_of(krate, owner, "MacroCall", "", n));
+            }
+            let head_mod = h.head_module?;
+            let n = head_call(nested, start)?;
+            Some(key_of(krate, head_mod, "MacroCall", "", n))
         }),
         CallAt::Expansion { expansion: writer, start } => match made.get(writer as usize).and_then(|w| w.as_ref()) {
             Some(w) => w.call.and_then(|k| {
@@ -541,12 +581,19 @@ pub(super) fn expanded<'a, E: ExpansionTexts + ?Sized>(
 /// call node starts at its first outer attribute or at its path, and the scan's call at its
 /// statement's start or its path: each is one of THIS call's own anchors, which no other
 /// call shares.
-fn statement_call(nested: &Nested<'_>, start: u32) -> Option<(u32, u32)> {
+pub(super) fn statement_call(nested: &Nested<'_>, start: u32) -> Option<(u32, u32)> {
     let i = nested.calls.iter().position(|c| c.range.start == start || c.path.start == start)?;
     let block = nested.calls.get(i)?.block;
     let prefix = nested.calls.get(..i)?;
     let n = u32::try_from(prefix.iter().filter(|c| c.block == block).count()).ok()?;
     Some((block, n))
+}
+
+/// The top-level unbraced call of `nested.head_calls` that starts at `start`: its ordinal in
+/// [`blaze_scope::blocks::HEAD_BLOCK_MODULE`].
+pub(super) fn head_call(nested: &Nested<'_>, start: u32) -> Option<u32> {
+    let i = nested.head_calls.iter().position(|c| c.range.start == start || c.path.start == start)?;
+    u32::try_from(i).ok()
 }
 
 /// The scope table of the body lowered to `view`: its crate `krate`, its module
@@ -558,7 +605,7 @@ pub fn build<'a>(
     body_module: LibKey,
     view: &View<'_>,
     nested: &Nested<'_>,
-    hand: Option<&[Option<LibKey>]>,
+    hand: Option<HandBlocks<'_>>,
     planted: Planted,
     alloc: Alloc<'a>,
 ) -> Result<ScopeTable<'a>, ScopeRefused> {
@@ -628,7 +675,7 @@ pub fn build<'a>(
                 // `nested.blocks` is pushed in left-to-right lex order, so `blk.open` is strictly sorted.
                 let b = nested.blocks.binary_search_by_key(&open, |blk| blk.open).map_err(|_| ScopeRefused::ScopeNotScanned { scope: s_u32 })?;
                 let at = match hand {
-                    Some(h) => match h.get(b).copied().flatten() {
+                    Some(h) => match h.modules.get(b).copied().flatten() {
                         Some(m) => ScopeAt::Own(m),
                         None => ScopeAt::Inherits(parent),
                     },
