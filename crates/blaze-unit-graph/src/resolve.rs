@@ -351,11 +351,15 @@ impl<'l, 'a> Resolution<'l, 'a> {
     /// [`UnitError::PathOutsideAnchor`]: no source can answer it, so it is never asked for.
     fn locked(&self, id: LockId, package: &Package<'a>, e: usize) -> Result<LockId, UnitError<'a>> {
         let child = self.locked_entry(id, package, e)?;
-        let dep = &package.deps[e];
-        if let DepSource::OutsideAnchor { path } = &dep.source
+        if let Some(dep) = package.deps.get(e)
+            && let DepSource::OutsideAnchor { path } = &dep.source
             && matches!(self.answers.get(child.index()), Some(Answer::Pending))
         {
-            return Err(UnitError::PathOutsideAnchor { package: package.name.clone(), dep: dep.key.clone(), path: path.clone() });
+            return Err(UnitError::PathOutsideAnchor {
+                package: own(package.name.as_str(), self.alloc),
+                dep: own(dep.key.as_str(), self.alloc),
+                path: own(path.as_str(), self.alloc),
+            });
         }
         Ok(child)
     }

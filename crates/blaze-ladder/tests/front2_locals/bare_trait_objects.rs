@@ -28,7 +28,7 @@ use blaze_surface::{ItemKind, Namespace, PathKind};
 use blaze_unit_graph::implicit;
 use edition::PackageEdition;
 
-const PRELUDE: &str = include_str!("../../blaze-cli/tests/ladder/front2/twin-prelude.rs");
+const PRELUDE: &str = include_str!("../../../blaze-cli/tests/ladder/front2/twin-prelude.rs");
 
 /// Exact `glob 0.3.3` pattern (`impl Error for GlobError { fn cause(&self) -> Option<&Error> }`)
 /// plus broader bare trait object forms: one-name generic arg (`Holder<Error>`), associated type
@@ -258,7 +258,7 @@ fn run_for_edition(edition: &'static str) -> Result<u8, String> {
 
 fn with_minimal(edition: &'static str, f: impl FnOnce(&blaze_scope::resolve::Names<'_>, &[SourceFile<'_>])) {
     let files = [SourceFile { path: "src/main.rs", text: MINIMAL_PROGRAM }];
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let new = NewFront { package: "bare_min", edition, shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
         .unwrap_or_else(|e| panic!("ProgramTexts({edition}): {e}"));
@@ -272,7 +272,7 @@ fn with_minimal(edition: &'static str, f: impl FnOnce(&blaze_scope::resolve::Nam
 fn key_of(names: &blaze_scope::resolve::Names<'_>, ns: Namespace, name: &'static str) -> blaze_typeck::ItemKey {
     let segments: &[&str] = &[name];
     let written = Written { kind: PathKind::Plain, segments };
-    let found = names::path(names, names.root(0), ns, written, Alloc::global()).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
+    let found = names::path(names, names.root(0), ns, written, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
     checker_of(found.whole(1).unwrap_or_else(|| panic!("`{name}` resolves whole")).key)
 }
 
@@ -317,7 +317,7 @@ fn bare_trait_object_heads_regions_and_lazy_program_succeed_in_2015_and_2018() {
                 blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame"),
                 blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame"),
             );
-            let whole = Front2Program::new(names, &wf, files, Alloc::global())
+            let whole = Front2Program::new(names, &wf, files, blaze_own::testing::heap().alloc())
                 .unwrap_or_else(|e| panic!("Front2Program ({edition}): {e}"));
             let main = key_of(names, Namespace::Values, "main");
             let error_trait = key_of(names, Namespace::Types, "Error");
@@ -332,8 +332,8 @@ fn bare_trait_object_heads_regions_and_lazy_program_succeed_in_2015_and_2018() {
             assert!(lazy.object_trait(error_trait).is_some(), "lazy built object table for Error ({edition})");
 
             // Head regions of `<impl Error for GlobError>::cause` are laid cleanly (no refusal).
-            let mut front = Front2::new(names, &hf, files, Alloc::global()).unwrap_or_else(|e| panic!("front2 ({edition}): {e}"));
-            let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+            let mut front = Front2::new(names, &hf, files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2 ({edition}): {e}"));
+            let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
             store.ensure(names, &mut front.keys, Want::Impl(impl_lib)).unwrap_or_else(|e| panic!("Want::Impl ({edition}): {e:?}"));
             store
                 .ensure(names, &mut front.keys, Want::MemberFn(impl_lib, cause_key))
@@ -423,7 +423,7 @@ macro_rules! make_bare_fn {
 dep::make_bare_fn!({fn_name});
 "
     );
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let cfg = tc.program_cfg(blaze_build::Panic::Unwind);
     let dep_pkg = PackageEdition { syntax: dep_edition, blaze: None };
     let root_pkg = PackageEdition { syntax: root_edition, blaze: None };
@@ -458,8 +458,8 @@ dep::make_bare_fn!({fn_name});
         .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
     let sources = [SourceFile { path: "src/main.rs", text: &root }];
-    let mut front = Front2::new(&names, &frame, &sources, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
     let fk = key_of(&names, Namespace::Values, fn_name);
     let lib = front.keys.library_in(&names, fk).unwrap_or_else(|| panic!("lib key of `{fn_name}`"));
     store.ensure(&names, &mut front.keys, Want::Fn(lib)).map_err(|e| format!("{e:?}"))?;
@@ -533,7 +533,7 @@ fn takes_defaulted(_d: &Defaulted) {}
 fn takes_defaulted_lt<'x>(_d: &DefaultedLt<'x>) {}
 ";
     let files = [SourceFile { path: "src/main.rs", text: EDGE_PROGRAM }];
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let new = NewFront { package: "bare_edges", edition: "2015", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
         .unwrap_or_else(|e| panic!("ProgramTexts: {e}"));
@@ -542,8 +542,8 @@ fn takes_defaulted_lt<'x>(_d: &DefaultedLt<'x>) {}
     let crates = inputs.crates();
     let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-    let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
     // Finding 2: ordinary type alias `type Obj<'b> = dyn Tr + 'b` must not enter bare-object arm.
     let alias_fn = key_of(&names, Namespace::Values, "alias_ref");
@@ -642,7 +642,7 @@ pub struct Tr;
 
 dep::make_dollar_crate_items!();
 ";
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let cfg = tc.program_cfg(blaze_build::Panic::Unwind);
     let dep_pkg = PackageEdition { syntax: edition::Edition::Edition2015, blaze: None };
     let root_pkg = PackageEdition { syntax: edition::Edition::Edition2021, blaze: None };
@@ -677,8 +677,8 @@ dep::make_dollar_crate_items!();
         .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
     let sources = [SourceFile { path: "src/main.rs", text: root }];
-    let mut front = Front2::new(&names, &frame, &sources, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
     let fn_key = key_of(&names, Namespace::Values, "via_macro");
     let fn_lib = front.keys.library_in(&names, fn_key).expect("via_macro lib key");
@@ -726,7 +726,7 @@ fn hrtb_nested_elide(_x: &for<'a> GenTr<&'a u8>) -> &u8 { loop {} }
 fn hrtb_free_arg<'x>(_x: &for<'a> GenTr<&'x u8>) -> &u8 { loop {} }
 ";
     let files = [SourceFile { path: "src/main.rs", text: PROG }];
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let new = NewFront { package: "bare_r2_elide", edition: "2015", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
         .unwrap_or_else(|e| panic!("ProgramTexts: {e}"));
@@ -735,8 +735,8 @@ fn hrtb_free_arg<'x>(_x: &for<'a> GenTr<&'x u8>) -> &u8 { loop {} }
     let crates = inputs.crates();
     let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-    let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
     // Lifetime-free trait alias preserves elision.
     let alias_fn = key_of(&names, Namespace::Values, "alias_elide");
@@ -783,16 +783,19 @@ fn hrtb_free_arg<'x>(_x: &for<'a> GenTr<&'x u8>) -> &u8 { loop {} }
 /// traits without finding `Self: 'static`.
 #[test]
 fn supertrait_self_static_walk_inspects_all_64_queued_and_refuses_overflow() {
-    let mut src = String::from("#![feature(no_core, lang_items)]\n#![no_core]\n#[lang = \"sized\"] trait Sized {}\n");
+    use core::fmt::Write as _;
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut src = blaze_own::AString::new_in(alloc);
+    src.push_str("#![feature(no_core, lang_items)]\n#![no_core]\n#[lang = \"sized\"] trait Sized {}\n");
     for i in 0..64 {
-        src.push_str(&format!("trait S{i} {{}}\n"));
+        let _ = writeln!(src, "trait S{i} {{}}");
     }
     src.push_str("trait StaticTail: 'static {}\n");
     // Wide64 has 62 non-static supertraits + StaticTail = 64 distinct traits total (Wide64 + 63).
     // `work.len()` hits 64 before `StaticTail` is popped, so inspecting all queued items must find `'static`.
     src.push_str("trait Wide64: ");
     for i in 0..62 {
-        src.push_str(&format!("S{i} + "));
+        let _ = write!(src, "S{i} + ");
     }
     src.push_str("StaticTail {}\n");
     // Wide65 has 64 non-static supertraits = 65 distinct traits total (exceeds cap 64 -> must refuse).
@@ -801,14 +804,14 @@ fn supertrait_self_static_walk_inspects_all_64_queued_and_refuses_overflow() {
         if i > 0 {
             src.push_str(" + ");
         }
-        src.push_str(&format!("S{i}"));
+        let _ = write!(src, "S{i}");
     }
     src.push_str(" {}\n");
     src.push_str("fn takes_wide64<'a>(_x: &'a Wide64) {}\n");
     src.push_str("fn takes_wide65<'a>(_x: &'a Wide65) {}\n");
 
-    let files = [SourceFile { path: "src/main.rs", text: &src }];
-    let tc = Toolchain::none(Alloc::global());
+    let files = [SourceFile { path: "src/main.rs", text: src.as_str() }];
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let new = NewFront { package: "bare_r2_static", edition: "2015", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
         .unwrap_or_else(|e| panic!("ProgramTexts: {e}"));
@@ -817,8 +820,8 @@ fn supertrait_self_static_walk_inspects_all_64_queued_and_refuses_overflow() {
     let crates = inputs.crates();
     let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-    let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
     // Wide64: 64th trait (`StaticTail: 'static`) is found -> object lifetime is `'static`, NOT `'a`.
     let k64 = key_of(&names, Namespace::Values, "takes_wide64");
@@ -867,7 +870,7 @@ fn uses_bad(_x: Bad) {}
 fn uses_bad_alias(_x: BadAlias) {}
 ";
         let files = [SourceFile { path: "src/main.rs", text: PROG }];
-        let tc = Toolchain::none(Alloc::global());
+        let tc = Toolchain::none(blaze_own::testing::heap().alloc());
         let new = NewFront { package: "bare_r3_assoc_nominal", edition, shelf: None, overflow: blaze_build::OverflowChecks::On };
         let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
             .unwrap_or_else(|e| panic!("edition {edition} ProgramTexts: {e}"));
@@ -876,8 +879,8 @@ fn uses_bad_alias(_x: BadAlias) {}
         let crates = inputs.crates();
         let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("edition {edition} resolve: {e}"));
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-        let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("edition {edition} front2: {e}"));
-        let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+        let mut front = Front2::new(&names, &frame, &files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("edition {edition} front2: {e}"));
+        let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
         for name in ["uses_direct", "uses_bad", "uses_bad_alias"] {
             let k = key_of(&names, Namespace::Values, name);
@@ -929,7 +932,7 @@ fn same_lt<'a>(_x: &'a Tr<'a>) -> &u8 { loop {} }
 fn diff_lt<'a, 'b>(_x: &'a Tr<'b>) -> &u8 { loop {} }
 ";
     let files = [SourceFile { path: "src/main.rs", text: PROG }];
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let new = NewFront { package: "bare_r3_life", edition: "2015", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
         .unwrap_or_else(|e| panic!("ProgramTexts: {e}"));
@@ -938,8 +941,8 @@ fn diff_lt<'a, 'b>(_x: &'a Tr<'b>) -> &u8 { loop {} }
     let crates = inputs.crates();
     let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-    let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
     // Unique bound `'a` on `Tr<'a>: 'a` resolves `*const Tr<'a>` to `'a` (`Region::Named(0)`).
     let uniq_k = key_of(&names, Namespace::Types, "PtrUnique");
@@ -1020,7 +1023,7 @@ fn takes_iter_alias<'a>(_x: &'a IterAlias<'a>) {}
 fn takes_super_proj<'a>(_x: &'a Sub<'a, A = &'a u8>) {}
 ";
     let files = [SourceFile { path: "src/main.rs", text: PROG }];
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let new = NewFront { package: "bare_r3_regions", edition: "2015", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
         .unwrap_or_else(|e| panic!("ProgramTexts: {e}"));
@@ -1029,8 +1032,8 @@ fn takes_super_proj<'a>(_x: &'a Sub<'a, A = &'a u8>) {}
     let crates = inputs.crates();
     let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-    let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
     use blaze_typeck::regions::Region as R;
 
@@ -1141,7 +1144,7 @@ fn takes_combo_rev(_x: &ComboRev) {}
 fn takes_combo_nested<'a>(_x: &'a ComboNested<'a>) {}
 ";
     let files = [SourceFile { path: "src/main.rs", text: PROG }];
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let new = NewFront { package: "bare_r4", edition: "2015", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
         .unwrap_or_else(|e| panic!("ProgramTexts: {e}"));
@@ -1150,8 +1153,8 @@ fn takes_combo_nested<'a>(_x: &'a ComboNested<'a>) {}
     let crates = inputs.crates();
     let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-    let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
     use blaze_typeck::regions::Region as R;
 
@@ -1268,7 +1271,7 @@ struct PtrAliasLt<'a> {
 }
 ";
     let files = [SourceFile { path: "src/main.rs", text: PROG }];
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let new = NewFront { package: "bare_r5", edition: "2015", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
         .unwrap_or_else(|e| panic!("ProgramTexts: {e}"));
@@ -1277,8 +1280,8 @@ struct PtrAliasLt<'a> {
     let crates = inputs.crates();
     let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-    let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
     use blaze_typeck::regions::Region as R;
 
@@ -1412,7 +1415,7 @@ fn takes_iter_alias2_ref<'a>(_x: &'a IterAlias2<Item = &'a u8>) {}
 fn takes_sub_alias_proj<'a>(_x: &'a SubAlias<'a, A = &'a u8>) {}
 ";
     let files = [SourceFile { path: "src/main.rs", text: PROG }];
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let new = NewFront { package: "bare_r6", edition: "2018", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
         .unwrap_or_else(|e| panic!("ProgramTexts: {e}"));
@@ -1421,8 +1424,8 @@ fn takes_sub_alias_proj<'a>(_x: &'a SubAlias<'a, A = &'a u8>) {}
     let crates = inputs.crates();
     let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-    let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
     use blaze_typeck::regions::Region as R;
 
@@ -1532,7 +1535,7 @@ fn takes_alias_hrtb_ref(_x: &AliasHrtbRef) {}
 fn takes_outer_hrtb_ref(_x: &OuterHrtbRef) {}
 ";
     let files = [SourceFile { path: "src/main.rs", text: PROG }];
-    let tc = Toolchain::none(Alloc::global());
+    let tc = Toolchain::none(blaze_own::testing::heap().alloc());
     let new = NewFront { package: "bare_r7", edition: "2018", shelf: None, overflow: blaze_build::OverflowChecks::On };
     let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
         .unwrap_or_else(|e| panic!("ProgramTexts: {e}"));
@@ -1541,8 +1544,8 @@ fn takes_outer_hrtb_ref(_x: &OuterHrtbRef) {}
     let crates = inputs.crates();
     let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-    let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+    let mut front = Front2::new(&names, &frame, &files, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
 
     use blaze_typeck::regions::Region as R;
 

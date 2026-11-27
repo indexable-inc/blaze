@@ -364,6 +364,7 @@ pub fn does_not_leak_later_prelude(x: u32) -> Result<u16, core::num::TryFromIntE
 }
 
 mod front2_locals {
+    mod bare_trait_objects;
     mod box_deref_captures;
     mod closure_uncaptured_place_run;
     mod deep_interior_stall;

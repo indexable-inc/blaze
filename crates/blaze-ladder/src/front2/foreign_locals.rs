@@ -49,6 +49,8 @@ pub struct Declared<'t> {
     /// The `safe` qualifier is written ("implicitly unsafe unless the safe function qualifier
     /// is present").
     pub safe: bool,
+    /// Whether the enclosing `extern` block carries `#[link(wasm_import_module = ...)]`.
+    pub wasm_import: bool,
 }
 
 /// What a local foreign item's head and the code builder ask beyond its text: its block's ABI
@@ -61,6 +63,8 @@ pub struct LocalForeign<'n> {
     /// that the library they are calling uses the standard C ABI").
     pub abi: &'n str,
     pub safe: bool,
+    /// Whether the enclosing `extern` block carries `#[link(wasm_import_module = ...)]`.
+    pub wasm_import: bool,
 }
 
 /// Why an `extern` block in a body was not read: each a form refused by name.
@@ -137,6 +141,7 @@ pub fn declared<'t, 'a>(block: &'t str, edition: Edition, cfg: &mut dyn Cfg, all
     let mut top = outline.children(None);
     let (Some((at, item)), None) = (top.next(), top.next()) else { return Err(Refused::NotOneBlock) };
     let ItemDetail::ExternBlock { abi } = item.detail else { return Err(Refused::NotOneBlock) };
+    let wasm_import = blaze_scope::items_record::extern_block_wasm_import(block, &outline, item);
     let abi = match abi {
         None => C_ABI,
         Some(r) => {
@@ -183,7 +188,7 @@ pub fn declared<'t, 'a>(block: &'t str, edition: Edition, cfg: &mut dyn Cfg, all
         let safe = quals.split_whitespace().any(|w| w == "safe");
         let name = slice(text, name)?;
         let name = name.strip_prefix("r#").unwrap_or(name);
-        out.push(Declared { kind, name, text, at: child.range, safe });
+        out.push(Declared { kind, name, text, at: child.range, safe, wasm_import });
     }
     Ok((abi, out))
 }

@@ -893,50 +893,71 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
     /// [`Self::quiet_all`] carrying `bound` lifetime hashes from enclosing `for<..>` binders so
     /// bound lifetimes nested inside type arguments (e.g. `for<'a> Tr<&'a u8>`) are recognized as
     /// bound rather than free input lifetimes.
-    fn quiet_all_bound(&mut self, v: &View<'_>, bound: &[u64], mut todo: List<lf::TypeId>, alias_depth: u8) -> Result<bool, LifeRefusal> {
+    fn quiet_all_bound(&mut self, v: &View<'_>, bound: &[u64], todo: List<lf::TypeId>, alias_depth: u8) -> Result<bool, LifeRefusal> {
+        let mut bound_stack: List<u64> = Vec::with_capacity_in(bound.len(), self.alloc);
+        bound_stack.extend_from_slice(bound);
+        let mut work: List<QuietWork> = Vec::with_capacity_in(todo.len(), self.alloc);
+        for &t in todo.iter() {
+            work.push(QuietWork::Ty(t));
+        }
+        let mut sub_todo: List<lf::TypeId> = Vec::new_in(self.alloc);
+        let mut cur_depth = alias_depth;
         let mut steps = 0u32;
-        while let Some(t) = todo.pop() {
+        while let Some(item) = work.pop() {
+            let t = match item {
+                QuietWork::PopBound { prev_len, prev_depth } => {
+                    bound_stack.truncate(prev_len);
+                    cur_depth = prev_depth;
+                    continue;
+                }
+                QuietWork::Ty(t) => t,
+            };
             steps += 1;
             if steps > MOST {
                 return Err(LifeRefusal::Bound);
             }
             match v.ty(t)? {
                 lf::TypeRef::Never | lf::TypeRef::Infer => {}
-                lf::TypeRef::Ref { lifetime: Some(nm), inner, .. } if bound.contains(&v.name(nm)?) => {
-                    todo.push(inner);
+                lf::TypeRef::Ref { lifetime: Some(nm), inner, .. } if bound_stack.contains(&v.name(nm)?) => {
+                    work.push(QuietWork::Ty(inner));
                 }
-                lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => todo.push(inner),
-                lf::TypeRef::Array { elem, .. } => todo.push(elem),
-                lf::TypeRef::Pat { base, .. } => todo.push(base),
+                lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => work.push(QuietWork::Ty(inner)),
+                lf::TypeRef::Array { elem, .. } => work.push(QuietWork::Ty(elem)),
+                lf::TypeRef::Pat { base, .. } => work.push(QuietWork::Ty(base)),
                 lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => {
                     for &i in v.ids(l)? {
-                        todo.push(lf::TypeId(i));
+                        work.push(QuietWork::Ty(lf::TypeId(i)));
                     }
                 }
                 lf::TypeRef::Path(p) => {
-                    if !self.quiet_path_bound(v, p, bound, &mut todo, alias_depth)? {
+                    sub_todo.clear();
+                    if !self.quiet_path_bound(v, p, &bound_stack, &mut sub_todo, cur_depth)? {
                         return Ok(false);
+                    }
+                    for &st in sub_todo.iter() {
+                        work.push(QuietWork::Ty(st));
                     }
                 }
                 lf::TypeRef::Dyn(b) | lf::TypeRef::Impl(b) => {
-                    if !self.quiet_bounds_bound(v, b, false, bound, &mut todo, alias_depth)? {
+                    sub_todo.clear();
+                    if !self.quiet_bounds_bound(v, b, false, &bound_stack, &mut sub_todo, cur_depth)? {
                         return Ok(false);
+                    }
+                    for &st in sub_todo.iter() {
+                        work.push(QuietWork::Ty(st));
                     }
                 }
-                lf::TypeRef::For { binder, inner } if alias_depth < 8 => {
-                    let binder_rows = v.rows(binder)?;
-                    let mut nested: List<u64> = Vec::with_capacity_in(bound.len() + binder_rows.len(), self.alloc);
-                    nested.extend_from_slice(bound);
-                    for &brow in binder_rows {
+                lf::TypeRef::For { binder, inner } if cur_depth < 8 => {
+                    let prev_len = bound_stack.len();
+                    let prev_depth = cur_depth;
+                    for &brow in v.rows(binder)? {
                         if let lf::GenericParam::Lifetime { name, .. } = lf::GenericParam::decode(brow)? {
-                            nested.push(v.name(name)?);
+                            bound_stack.push(v.name(name)?);
                         }
                     }
-                    let mut sub: List<lf::TypeId> = Vec::new_in(self.alloc);
-                    sub.push(inner);
-                    if !self.quiet_all_bound(v, &nested, sub, alias_depth + 1)? {
-                        return Ok(false);
-                    }
+                    cur_depth = cur_depth.saturating_add(1);
+                    work.push(QuietWork::PopBound { prev_len, prev_depth });
+                    work.push(QuietWork::Ty(inner));
                 }
                 // A reference with an unbound/elided lifetime, a fn pointer, or a macro call: a
                 // lifetime is or may be written.
@@ -1977,11 +1998,27 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
         bound: &[u64],
         alias_map: Option<(&[u64], &[Option<Region>])>,
         at: Range,
-        mut todo: List<(lf::TypeId, bool)>,
+        todo: List<(lf::TypeId, bool)>,
         depth: u8,
     ) -> Result<bool, LifeRefusal> {
+        let mut bound_stack: List<u64> = Vec::with_capacity_in(bound.len(), self.alloc);
+        bound_stack.extend_from_slice(bound);
+        let mut work: List<RecordInputWork> = Vec::with_capacity_in(todo.len(), self.alloc);
+        for &(t, elide_bound) in todo.iter() {
+            work.push(RecordInputWork::Ty(t, elide_bound));
+        }
+        let mut sub_todo: List<(lf::TypeId, bool)> = Vec::new_in(self.alloc);
+        let mut cur_depth = depth;
         let mut steps = 0u32;
-        while let Some((t, elide_bound)) = todo.pop() {
+        while let Some(item) = work.pop() {
+            let (t, elide_bound) = match item {
+                RecordInputWork::PopBound { prev_len, prev_depth } => {
+                    bound_stack.truncate(prev_len);
+                    cur_depth = prev_depth;
+                    continue;
+                }
+                RecordInputWork::Ty(t, elide_bound) => (t, elide_bound),
+            };
             steps += 1;
             if steps > MOST {
                 return Err(LifeRefusal::Bound);
@@ -1991,7 +2028,7 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                 lf::TypeRef::Ref { lifetime, inner, .. } => {
                     match lifetime {
                         Some(nm) => {
-                            if self.record_written_lt(v, nm, bound, alias_map, elide_bound, at)?.is_none() {
+                            if self.record_written_lt(v, nm, &bound_stack, alias_map, elide_bound, at)?.is_none() {
                                 return Ok(false);
                             }
                         }
@@ -2002,46 +2039,63 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                             }
                         }
                     }
-                    todo.push((inner, elide_bound));
+                    work.push(RecordInputWork::Ty(inner, elide_bound));
                 }
-                lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => todo.push((inner, elide_bound)),
-                lf::TypeRef::Array { elem, .. } => todo.push((elem, elide_bound)),
-                lf::TypeRef::Pat { base, .. } => todo.push((base, elide_bound)),
+                lf::TypeRef::Ptr { inner, .. } | lf::TypeRef::Slice(inner) => work.push(RecordInputWork::Ty(inner, elide_bound)),
+                lf::TypeRef::Array { elem, .. } => work.push(RecordInputWork::Ty(elem, elide_bound)),
+                lf::TypeRef::Pat { base, .. } => work.push(RecordInputWork::Ty(base, elide_bound)),
                 lf::TypeRef::Tuple(l) | lf::TypeRef::Union(l) => {
                     for &i in v.ids(l)? {
-                        todo.push((lf::TypeId(i), elide_bound));
+                        work.push(RecordInputWork::Ty(lf::TypeId(i), elide_bound));
                     }
                 }
                 lf::TypeRef::Path(p) => {
-                    if !self.record_path_inputs(v, p, bound, alias_map, None, elide_bound, at, &mut todo, depth)? {
+                    sub_todo.clear();
+                    if !self.record_path_inputs(v, p, &bound_stack, alias_map, None, elide_bound, at, &mut sub_todo, cur_depth)? {
                         return Ok(false);
+                    }
+                    for &(st, eb) in sub_todo.iter() {
+                        work.push(RecordInputWork::Ty(st, eb));
                     }
                 }
                 lf::TypeRef::Dyn(b) | lf::TypeRef::Impl(b) => {
-                    if !self.record_bounds_inputs(v, b, bound, alias_map, elide_bound, at, &mut todo, depth)? {
+                    sub_todo.clear();
+                    if !self.record_bounds_inputs(v, b, &bound_stack, alias_map, elide_bound, at, &mut sub_todo, cur_depth)? {
                         return Ok(false);
+                    }
+                    for &(st, eb) in sub_todo.iter() {
+                        work.push(RecordInputWork::Ty(st, eb));
                     }
                 }
-                lf::TypeRef::For { binder, inner } if depth < 8 => {
-                    let binder_rows = v.rows(binder)?;
-                    let mut nested: List<u64> = Vec::with_capacity_in(bound.len() + binder_rows.len(), self.alloc);
-                    nested.extend_from_slice(bound);
-                    for &brow in binder_rows {
+                lf::TypeRef::For { binder, inner } if cur_depth < 8 => {
+                    let prev_len = bound_stack.len();
+                    let prev_depth = cur_depth;
+                    for &brow in v.rows(binder)? {
                         if let lf::GenericParam::Lifetime { name, .. } = lf::GenericParam::decode(brow)? {
-                            nested.push(v.name(name)?);
+                            bound_stack.push(v.name(name)?);
                         }
                     }
-                    let mut sub: List<(lf::TypeId, bool)> = Vec::new_in(self.alloc);
-                    sub.push((inner, elide_bound));
-                    if !self.record_all_inputs(v, &nested, alias_map, at, sub, depth + 1)? {
-                        return Ok(false);
-                    }
+                    cur_depth = cur_depth.saturating_add(1);
+                    work.push(RecordInputWork::PopBound { prev_len, prev_depth });
+                    work.push(RecordInputWork::Ty(inner, elide_bound));
                 }
                 _ => return Ok(false),
             }
         }
         Ok(true)
     }
+}
+
+/// Worklist entry for `Eliding::quiet_all_bound`.
+enum QuietWork {
+    Ty(lf::TypeId),
+    PopBound { prev_len: usize, prev_depth: u8 },
+}
+
+/// Worklist entry for `Eliding::record_all_inputs`.
+enum RecordInputWork {
+    Ty(lf::TypeId, bool),
+    PopBound { prev_len: usize, prev_depth: u8 },
 }
 
 /// No position is left unfilled.

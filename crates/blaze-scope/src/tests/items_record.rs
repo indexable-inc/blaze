@@ -644,3 +644,17 @@ fn previous_items_version_18_is_rejected() {
         "version-18 items record must be rejected as NotThisRecord"
     );
 }
+
+#[test]
+fn previous_items_version_19_is_rejected() {
+    let bump = super::SyncFrame::leaked();
+    let g = bump.alloc();
+    let n = solve_one("#![no_core]\npub struct S;\n", None);
+    let mut bytes = encode(n, g).unwrap_or_else(|e| panic!("encode: {e:?}")).to_vec();
+    bytes[4..8].copy_from_slice(&19u32.to_le_bytes());
+    let aligned_bytes = aligned(&bytes, bump);
+    assert!(
+        matches!(ItemsRecord::open(aligned_bytes, g), Err(ItemsRecordError::NotThisRecord)),
+        "version-19 items record must be rejected as NotThisRecord"
+    );
+}

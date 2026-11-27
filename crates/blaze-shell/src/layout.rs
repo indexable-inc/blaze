@@ -3044,7 +3044,7 @@ fn layout_table(
             }
             Some(GitStatusTree {
                 name_col: fc,
-                rows: git_status_tree_rows(&entries),
+                rows: git_status_tree_rows(&entries, Alloc::global()),
             })
         }
         _ => None,
@@ -3689,7 +3689,7 @@ fn layout_table(
                                     &block.source,
                                     path,
                                 ),
-                                name: path.clone(),
+                                name: path.to_owned(),
                                 icon: Some(icon_name),
                                 is_dir: true,
                                 git_change: false,
@@ -4614,7 +4614,7 @@ const DATAFRAME_TREE_STEP: f32 = 18.0;
 struct GitStatusTree {
     /// The path column the tree is drawn in.
     name_col: usize,
-    rows: Vec<GitTreeRow>,
+    rows: blaze_own::AVec<'static, GitTreeRow>,
 }
 
 /// One drawn row of a [`GitStatusTree`].
@@ -4665,9 +4665,9 @@ fn is_git_status_table(table: &Table<'_>, name_col: usize) -> bool {
 
 /// Split a repo-relative path into segments; the last keeps a trailing `/` (an untracked
 /// directory as git reports it), and empty segments from doubled slashes are dropped.
-fn split_git_tree_path(path: &str) -> Vec<&str> {
+fn split_git_tree_path<'p, 'a>(path: &'p str, alloc: Alloc<'a>) -> blaze_own::AVec<'a, &'p str> {
     let body = path.strip_suffix('/').unwrap_or(path);
-    let mut segs: Vec<&str> = Vec::new();
+    let mut segs: blaze_own::AVec<'a, &'p str> = blaze_own::AVec::new_in(alloc);
     let mut start = 0usize;
     for (i, b) in body.bytes().enumerate() {
         if b == b'/' {
@@ -4686,27 +4686,31 @@ fn split_git_tree_path(path: &str) -> Vec<&str> {
 /// Lay `(table_row, path)` entries out as a rough `eza --tree` scoped to them: sorted by path
 /// segments, each directory a row above its entries, a directory whose only child is a directory
 /// collapsed into one row (`crates/blaze-shell/src/`), and leaves showing their last segment.
-fn git_status_tree_rows(entries: &[(usize, &str)]) -> Vec<GitTreeRow> {
-    let mut items: Vec<(usize, Vec<&str>)> =
-        entries.iter().map(|&(row, path)| (row, split_git_tree_path(path))).collect();
-    items.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
-    let mut out = Vec::with_capacity(items.len() * 2);
-    let mut rails: Vec<bool> = Vec::new();
-    push_git_tree_level(&items, 0, true, &mut rails, &mut out);
+fn git_status_tree_rows<'a>(entries: &[(usize, &str)], alloc: Alloc<'a>) -> blaze_own::AVec<'a, GitTreeRow> {
+    let mut items: blaze_own::AVec<'a, (usize, blaze_own::AVec<'a, &str>)> =
+        blaze_own::AVec::with_capacity_in(entries.len(), alloc);
+    for &(row, path) in entries {
+        items.push((row, split_git_tree_path(path, alloc)));
+    }
+    items.sort_by(|a, b| a.1.as_slice().cmp(b.1.as_slice()).then(a.0.cmp(&b.0)));
+    let mut out = blaze_own::AVec::with_capacity_in(items.len() * 2, alloc);
+    let mut rails: blaze_own::AVec<'a, bool> = blaze_own::AVec::new_in(alloc);
+    push_git_tree_level(&items, 0, true, &mut rails, &mut out, alloc);
     out
 }
 
 /// Emit the rows for `items` (sorted, sharing their first `level` segments). Top-level rows
 /// carry no guides; deeper rows get one `│`/blank per elbowed ancestor in `rails`, then an elbow.
-fn push_git_tree_level(
-    items: &[(usize, Vec<&str>)],
+fn push_git_tree_level<'p, 'a>(
+    items: &[(usize, blaze_own::AVec<'a, &'p str>)],
     level: usize,
     top: bool,
-    rails: &mut Vec<bool>,
-    out: &mut Vec<GitTreeRow>,
+    rails: &mut blaze_own::AVec<'a, bool>,
+    out: &mut blaze_own::AVec<'a, GitTreeRow>,
+    alloc: Alloc<'a>,
 ) {
     // Group into leaves (one item ending here) and directories (items sharing segment `level`).
-    let mut groups: Vec<(usize, usize, bool)> = Vec::new();
+    let mut groups: blaze_own::AVec<'a, (usize, usize, bool)> = blaze_own::AVec::new_in(alloc);
     let mut i = 0usize;
     while i < items.len() {
         let segs = &items[i].1;
@@ -4766,7 +4770,7 @@ fn push_git_tree_level(
         if !top {
             rails.push(!is_last);
         }
-        push_git_tree_level(group, next, false, rails, out);
+        push_git_tree_level(group, next, false, rails, out, alloc);
         if !top {
             rails.pop();
         }
@@ -10944,9 +10948,10 @@ mod tests {
                 leaf: leaf.to_owned(),
             },
         };
+        let alloc = blaze_own::Alloc::global();
         assert_eq!(
-            git_status_tree_rows(&entries),
-            std::vec![
+            git_status_tree_rows(&entries, alloc).as_slice(),
+            [
                 entry("", 3, "README.md"),
                 dir("", "crates/", "crates/"),
                 dir("├── ", "blaze-sh/src/", "crates/blaze-sh/src/"),
@@ -10959,8 +10964,8 @@ mod tests {
         );
         // A single shared chain collapses into one top-level directory row.
         assert_eq!(
-            git_status_tree_rows(&[(0, "a/b/c.rs"), (1, "a/b/d.rs")]),
-            std::vec![
+            git_status_tree_rows(&[(0, "a/b/c.rs"), (1, "a/b/d.rs")], alloc).as_slice(),
+            [
                 dir("", "a/b/", "a/b/"),
                 entry("├── ", 0, "c.rs"),
                 entry("└── ", 1, "d.rs"),

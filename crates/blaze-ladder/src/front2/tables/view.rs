@@ -445,6 +445,11 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
         self.records.extern_abi(key)
     }
 
+    fn is_wasm_import(self, key: ItemKey) -> Option<bool> {
+        self.item(key);
+        self.records.is_wasm_import(key)
+    }
+
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind> {
         self.item(key);
         self.records.kind_of_item(key)

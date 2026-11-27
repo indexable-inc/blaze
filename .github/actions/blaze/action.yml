@@ -128,6 +128,39 @@ runs:
           rm -f "$archive"
         fi
 
+    # Pinned clang-23 shelf for macOS ARM64 deferred C tasks and clang probes (pins/clang.json).
+    - name: ensure macOS ARM64 clang shelf (pins/clang.json)
+      if: runner.os == 'macOS' && runner.arch == 'ARM64'
+      shell: bash
+      run: |
+        set -euo pipefail
+        shelf_sha="5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef"
+        shelf_root="${BLAZE_HOME:-$HOME/.blaze}/v2/toolchain/clang"
+        shelf_dir="$shelf_root/$shelf_sha"
+        if [ ! -x "$shelf_dir/bin/clang-23" ] || [ ! -d "$shelf_dir/lib/clang/23" ]; then
+          mkdir -p "$shelf_root"
+          archive="$shelf_root/$shelf_sha.tar.xz"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --max-time 600 \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/LLVM-23.1.4-macOS-ARM64.tar.xz" \
+            -o "$archive.part"
+          echo "$shelf_sha  $archive.part" | shasum -a 256 -c -
+          mv -f "$archive.part" "$archive"
+          stage="$shelf_dir.stage.$$"
+          rm -rf "$stage" && mkdir -p "$stage"
+          tar -xJf "$archive" -C "$stage" --strip-components=1 \
+            LLVM-23.1.4-macOS-ARM64/bin/clang \
+            LLVM-23.1.4-macOS-ARM64/bin/clang++ \
+            LLVM-23.1.4-macOS-ARM64/bin/clang-23 \
+            LLVM-23.1.4-macOS-ARM64/bin/lld \
+            LLVM-23.1.4-macOS-ARM64/bin/ld64.lld \
+            LLVM-23.1.4-macOS-ARM64/bin/llvm-ar \
+            LLVM-23.1.4-macOS-ARM64/bin/llvm-nm \
+            LLVM-23.1.4-macOS-ARM64/lib/libclang.dylib \
+            LLVM-23.1.4-macOS-ARM64/lib/clang
+          rm -rf "$shelf_dir" && mv "$stage" "$shelf_dir"
+          rm -f "$archive"
+        fi
+
     - name: warm toolchain records
       if: inputs.warm-toolchain == 'true'
       shell: bash

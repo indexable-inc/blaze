@@ -948,7 +948,7 @@ pub(crate) fn record_status_baseline(
     // new baseline is not trusted and the next status scans fully.
     let (concurrent_pending, needs_full) = match (&mon.status_baseline, start_gen) {
         (Some(prev), Some(g)) if mon.generation != g => (prev.pending_paths.clone(), prev.needs_full),
-        (None, Some(g)) if mon.generation != g => (BTreeSet::new(), true),
+        (None, Some(g)) if mon.generation != g => (Default::default(), true),
         _ => (BTreeSet::new(), false),
     };
     mon.status_baseline = Some(StatusBaseline {

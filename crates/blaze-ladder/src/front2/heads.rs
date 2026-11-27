@@ -871,6 +871,22 @@ pub(crate) fn is_auto_copy_pub_view<'n, S: NamesSource<'n>>(
 ///   Rust edition it needs `#![feature(default_field_values)]` at the crate root (the crate
 ///   root record's `features`, `NamesSource::has_feature`), refused naming the feature
 ///   without it.
+/// Synthetic anonymous-member name for ADT field default `(variant, field)`.
+pub(crate) fn field_default_label<'a>(variant: usize, field: usize, ty_text: &str, value_text: &str, alloc: Alloc<'a>) -> blaze_own::String<Alloc<'a>> {
+    blaze_own::format_in!(alloc, "field default {variant}.{field}: {ty_text} = {value_text}")
+}
+
+/// Synthetic inline `const` declaration stored in `FnHead::text` for an ADT field default.
+pub(crate) fn field_default_decl<'a>(ty_text: &str, value_text: &str, alloc: Alloc<'a>) -> blaze_own::String<Alloc<'a>> {
+    blaze_own::format_in!(alloc, "const _: {ty_text} = {value_text};")
+}
+
+/// Reconstructs [`field_default_label`] from a frozen [`field_default_decl`] string.
+pub(crate) fn field_default_label_from_decl<'a>(variant: usize, field: usize, decl: &str, alloc: Alloc<'a>) -> Option<blaze_own::String<Alloc<'a>>> {
+    let body = decl.strip_prefix("const _: ")?.strip_suffix(';')?;
+    Some(blaze_own::format_in!(alloc, "field default {variant}.{field}: {body}"))
+}
+
 pub(crate) fn field_default_allowed<'n, S: NamesSource<'n>>(names: S, adt: LibKey, kind: tc::AdtKind, ctor: tc::CtorKind, r: Range) -> Result<(), Why> {
     if kind == tc::AdtKind::Union {
         return Err(Why::Program(Box::from("a union's field may not have a default value (RFC 3681: unions cannot have default field values)"), r));
@@ -5891,11 +5907,11 @@ impl<'n> Store<'n> {
                 let value_text = v.text_at(at)?.trim();
                 // Keyed by the ADT, the field's place and the default's text (rule 21: the
                 // text is the value's input; the ADT's generics are its head's).
-                let label = blaze_own::format_in!(alloc, "field default {vi}.{j}: {ty_text} = {value_text}");
+                let label = field_default_label(vi, j, ty_text, value_text, alloc);
                 let dk = keys
                     .member(ck, MemberKind::Anon, label.as_str())
                     .map_err(|c| Why::Program(format!("{c}").into_boxed_str(), r))?;
-                let src = blaze_own::format_in!(alloc, "const _: {ty_text} = {value_text};");
+                let src = field_default_decl(ty_text, value_text, alloc);
                 let text: &'n str = self.locals.keep_text(src.as_str());
                 defaults.push(Some(dk));
                 default_heads.push((dk, text, ty));
