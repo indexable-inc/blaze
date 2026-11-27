@@ -956,3 +956,38 @@ fn impl_header_where_const_block_creates_block_module_without_scanning_impl_body
     assert_ne!(body_impl.module, tag_impl.module);
     assert_ne!(body_impl.module, outer_impl.module);
 }
+
+const BODY_FREE_FN_WHERE_CONST_BLOCK: &str = r#"#![no_core]
+pub trait Tr<const N: usize> {}
+
+pub fn f()
+where
+    (): Tr<{
+        enum E { A = 0 }
+        0
+    }>,
+{}
+"#;
+
+static BODY_FREE_FN_WHERE_CONST_BLOCK_TEXTS: Texts = Texts(&[&[("/user/lib.rs", BODY_FREE_FN_WHERE_CONST_BLOCK)]]);
+
+/// A body-free `fn` (`{}` so `body_holds_items == false`) declaring an item inside a `where`-clause
+/// const block still emits a `BodySrc` in `blaze-scope` and creates a block module holding `E`.
+#[test]
+fn body_free_fn_where_const_block_creates_block_module() {
+    use blaze_surface::DefKind;
+    let crates = [input("user", "/user/lib.rs", &[])];
+    let names = resolved(&crates, &BODY_FREE_FN_WHERE_CONST_BLOCK_TEXTS);
+    let root = names.root(0);
+    let f_item = names
+        .item_at(root, Namespace::Values, Written { kind: PathKind::Plain, segments: &["f"] }, Alloc::global())
+        .unwrap_or_else(|e| panic!("`f`: {e}"));
+    let at = BODY_FREE_FN_WHERE_CONST_BLOCK.find("pub fn f").expect("`pub fn f` in fixture");
+    let nested = blaze_file_items::nested::scan(&BODY_FREE_FN_WHERE_CONST_BLOCK[at..], Alloc::global());
+    let mods = crate::blocks::block_modules(names.krate(0).key, f_item.def.key, &nested, Alloc::global());
+    let block_mod = mods.iter().copied().flatten().next().expect("where-clause const block module");
+    let e = names
+        .item_at(block_mod, Namespace::Types, Written { kind: PathKind::Plain, segments: &["E"] }, Alloc::global())
+        .unwrap_or_else(|e| panic!("`E` in `f`'s where-clause block module: {e}"));
+    assert_eq!(e.def.kind, DefKind::Enum);
+}

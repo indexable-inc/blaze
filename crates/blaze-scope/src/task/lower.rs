@@ -2104,9 +2104,12 @@ pub struct BodySrc<'t> {
 }
 
 impl<'t> BodySrc<'t> {
-    /// The entry for an item of `detail` and `text`, if its body may write an impl.
+    /// The entry for an item of `detail` and `text`, if its body or signature const blocks may
+    /// write an item or macro block.
+    #[expect(clippy::too_many_arguments, reason = "internal body source constructor forwarding lowering fields")]
     fn of(
         detail: ItemDetail,
+        sig: &'t str,
         key: ItemKey,
         module: ItemKey,
         text: &'t str,
@@ -2120,7 +2123,9 @@ impl<'t> BodySrc<'t> {
         let holds = matches!(
             detail,
             ItemDetail::Fn { body_holds_items: true } | ItemDetail::Const { body_holds_items: true } | ItemDetail::Static { body_holds_items: true }
-        );
+        ) || (matches!(detail, ItemDetail::Fn { .. } | ItemDetail::Const { .. } | ItemDetail::Static { .. })
+            && sig.contains('{')
+            && blaze_file_items::nested::may_write_block(sig));
         // The words of the items that make a block a module
         // (`blaze_file_items::nested::NestedKind::makes_module`): a body without one costs
         // eight substring searches and no scan. A trait declared in a block makes one too
@@ -2872,7 +2877,7 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
             let loc = self.loc(at);
             self.out.langs.push(LangSrc { name: lang, key, loc });
         }
-        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
+        if let Some(body) = BodySrc::of(item.detail, item.text(text, item.signature), key, self.module, whole, self.loc(at), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
             self.out.bodies.push(body);
         }
         match item.detail {
@@ -3235,7 +3240,7 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
             let whole = &text[item.range.start as usize..item.range.end as usize];
             members.push(Member { key, name, item: idx, detail: item.detail, text: whole, written_by });
             self.attr_checks(idx, item.range.start, &attrs.checks);
-            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
+            if let Some(body) = BodySrc::of(item.detail, item.text(text, item.signature), key, self.module, whole, self.loc(item.range.start), self.written, self.depth, (self.owner, self.pos), self.marks, self.tokens) {
                 self.out.bodies.push(body);
             }
             if is_call {

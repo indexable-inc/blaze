@@ -619,3 +619,192 @@ fn main() {}
     let got = check_fns(TEXT, &["exact_ok", "fixed_wrong", "local_exact_ok", "local_fixed_wrong"]);
     expect("multiline head anon line/column", &got, &[true, false, true, false]);
 }
+
+/// P1 #1: a body-free `fn` (`{}` so `body_holds_items == false`) declaring an item inside a
+/// `where`-clause const block must emit a `blaze-scope` block module and wire `Builder::owner`
+/// so the signature freezes and evaluates cleanly.
+#[test]
+fn a_body_free_fn_where_const_block_with_enum_evaluates_cleanly() {
+    const TEXT: &str = "
+trait Tr<const N: usize> {}
+impl Tr<2> for () {}
+fn ok_fn()
+where
+    (): Tr<{
+        #[repr(u16)]
+        enum E { A = 0, B = 1 }
+        core::mem::size_of::<E>()
+    }>,
+{}
+fn bad_fn()
+where
+    (): Tr<{
+        #[repr(u8)]
+        enum E { A = 0, B = 1 }
+        core::mem::size_of::<E>()
+    }>,
+{}
+fn call_ok() { ok_fn() }
+fn call_bad() { bad_fn() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["call_ok", "call_bad"]);
+    expect("body-free fn where const block", &got, &[true, false]);
+}
+
+/// P1 #2: when a head-level item-declaring const block ALSO contains a qualified associated
+/// constant (`<A as Value>::N`) or an inherent associated constant (`A::M`), leaf substitution
+/// must preserve `HeadOwner` and remap block byte offsets (including inner blocks appearing
+/// after the substituted leaf) back to the enclosing item's `blaze-scope` block modules.
+#[test]
+fn a_head_anon_const_block_preserves_owner_across_qpath_and_inherent_substitution() {
+    const TEXT: &str = "
+trait Value { const N: usize; }
+struct A;
+impl Value for A { const N: usize = 10; }
+impl A { const M: usize = 20; }
+trait Check<const N: usize> {}
+impl Check<12> for () {}
+impl Check<22> for () {}
+trait QPathOk {}
+trait QPathBad {}
+trait InherentOk {}
+trait InherentBad {}
+struct S;
+impl QPathOk for S
+where
+    (): Check<{
+        let base = <A as Value>::N;
+        {
+            #[repr(u16)]
+            enum E { X = 0, Y = 1 }
+            base + core::mem::size_of::<E>()
+        }
+    }>,
+{}
+impl QPathBad for S
+where
+    (): Check<{
+        #[repr(u8)]
+        enum E { X = 0, Y = 1 }
+        <A as Value>::N + core::mem::size_of::<E>()
+    }>,
+{}
+impl InherentOk for S
+where
+    (): Check<{
+        let base = A::M;
+        {
+            #[repr(u16)]
+            enum Inner { X = 0, Y = 1 }
+            base + core::mem::size_of::<Inner>()
+        }
+    }>,
+{}
+impl InherentBad for S
+where
+    (): Check<{
+        let base = A::M;
+        {
+            #[repr(u8)]
+            enum Inner { X = 0, Y = 1 }
+            base + core::mem::size_of::<Inner>()
+        }
+    }>,
+{}
+fn need_qpath_ok<T: QPathOk>() {}
+fn need_qpath_bad<T: QPathBad>() {}
+fn need_inherent_ok<T: InherentOk>() {}
+fn need_inherent_bad<T: InherentBad>() {}
+fn qpath_ok() { need_qpath_ok::<S>() }
+fn qpath_bad() { need_qpath_bad::<S>() }
+fn inherent_ok() { need_inherent_ok::<S>() }
+fn inherent_bad() { need_inherent_bad::<S>() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["qpath_ok", "qpath_bad", "inherent_ok", "inherent_bad"]);
+    expect("head anon const across substitution", &got, &[true, false, true, false]);
+}
+
+/// P1 #3: inserting a blank line above an unchanged `impl` whose head anonymous constant calls
+/// `line!()` keeps the enclosing `impl`'s item-relative `LibKey` identical, but MUST change the
+/// exported anonymous constant's key and evaluated value (and the frozen head's meaning) so
+/// cached heads / `const_bits` never serve stale line numbers.
+#[test]
+fn inserting_a_blank_line_above_a_line_macro_head_const_invalidates_its_key_and_read() {
+    use blaze_ladder::front2::heads::Want;
+    use blaze_ladder::front2::tables::head::{HeadCells, SeededHeads, SeededHeadsOpts, StoreConsts};
+
+    const BEFORE: &str = "trait Check<const N: u32> {}
+struct S;
+impl Check<{ line!() }> for S {}
+fn need3<T: Check<3>>() {}
+fn need4<T: Check<4>>() {}
+fn at_3() { need3::<S>() }
+fn at_4() { need4::<S>() }
+fn main() {}
+";
+    const AFTER: &str = "
+trait Check<const N: u32> {}
+struct S;
+impl Check<{ line!() }> for S {}
+fn need3<T: Check<3>>() {}
+fn need4<T: Check<4>>() {}
+fn at_3() { need3::<S>() }
+fn at_4() { need4::<S>() }
+fn main() {}
+";
+
+    let freeze_impl = |text: &str| {
+        let alloc = Alloc::global();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = format!("{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
+        let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+        let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let sources = [SourceFile { path: "src/main.rs", text }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+        let impl_key = names
+            .krate(0)
+            .tables
+            .impls
+            .iter()
+            .find(|i| i.header.contains("line!()"))
+            .expect("impl Check<{ line!() }> for S")
+            .key;
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
+        let mut evaluator = StoreConsts { names: &names, index: &front.index, prepared };
+        let sized = front.index.lang("sized");
+        let mut source = SeededHeads::new(SeededHeadsOpts {
+            names: &names,
+            sized,
+            pointers: blaze_ladder::front2::receiver::Pointers::NOT_LOOKED_UP,
+            frame: &frame,
+            scratch: alloc,
+            alloc,
+            consts: Some(&mut evaluator),
+            known: None,
+            owners: None,
+        });
+        let (frozen, read) = source.cell(Want::Impl(impl_key)).unwrap_or_else(|e| panic!("freeze impl: {e}"));
+        (impl_key, frozen.meaning(), read.consts.to_vec())
+    };
+
+    let (key_before, meaning_before, consts_before) = freeze_impl(BEFORE);
+    let (key_after, meaning_after, consts_after) = freeze_impl(AFTER);
+    assert_eq!(key_before, key_after, "enclosing impl key is item-relative (unchanged by blank line)");
+    assert_eq!(consts_before.len(), 1, "before: one head anon const evaluated: {consts_before:?}");
+    assert_eq!(consts_after.len(), 1, "after: one head anon const evaluated: {consts_after:?}");
+    assert_eq!(consts_before[0].1, 3, "before: line!() is 3");
+    assert_eq!(consts_after[0].1, 4, "after: line!() is 4");
+    assert_ne!(consts_before[0].0, consts_after[0].0, "inserting a blank line must change the cached head anon const key");
+    assert_ne!(meaning_before, meaning_after, "frozen impl head meaning must reflect the new line number");
+
+    expect("before blank line", &check_fns(BEFORE, &["at_3", "at_4"]), &[true, false]);
+    expect("after blank line", &check_fns(AFTER, &["at_3", "at_4"]), &[false, true]);
+}

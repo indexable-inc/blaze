@@ -419,6 +419,19 @@ pub fn substitute<'a, H: Heads + ?Sized>(
     text: &str,
     alloc: Alloc<'a>,
 ) -> Result<Option<String<Alloc<'a>>>, Stop> {
+    substitute_mapped(heads, resolve, self_adt, text, alloc, None)
+}
+
+/// [`substitute`], optionally recording each leaf replacement's byte mapping into `edits`
+/// so head-level anonymous constants keep their enclosing item's block coordinates.
+pub fn substitute_mapped<'a, H: Heads + ?Sized>(
+    heads: &H,
+    resolve: &dyn Fn(bool, &[&str]) -> Result<Target, ResolveError>,
+    self_adt: Option<ItemKey>,
+    text: &str,
+    alloc: Alloc<'a>,
+    mut edits: Option<&mut blaze_own::AVec<'static, super::anon::TextEdit>>,
+) -> Result<Option<String<Alloc<'a>>>, Stop> {
     let Some(table) = heads.inherent_leaves() else { return Ok(None) };
     let mut found: [Option<Candidate<'_>>; MOST_IN_TEXT] = [const { None }; MOST_IN_TEXT];
     let Some(count) = candidates(text, &mut found) else { return Err(Stop::Full) };
@@ -436,8 +449,20 @@ pub fn substitute<'a, H: Heads + ?Sized>(
                 let Some(bits) = heads.const_bits(need) else { continue };
                 let Some(before) = text.get(copied..c.start) else { return Ok(None) };
                 out.push_str(before);
+                let sub_start = out.len();
                 if !super::const_qpath::push_literal(&mut out, ty, bits) {
                     return Ok(None);
+                }
+                let sub_end = out.len();
+                if let Some(edits) = edits.as_deref_mut()
+                    && let (Ok(sub_start), Ok(sub_end), Ok(orig_start), Ok(orig_end)) = (
+                        u32::try_from(sub_start),
+                        u32::try_from(sub_end),
+                        u32::try_from(c.start),
+                        u32::try_from(c.end),
+                    )
+                {
+                    edits.push(super::anon::TextEdit { sub_start, sub_end, orig_start, orig_end });
                 }
                 copied = c.end;
                 any = true;

@@ -1622,7 +1622,7 @@ const MOST_LOCAL_LEVELS: usize = 64;
 /// in its copy is (core `line!`: "the first macro invocation leading up to the expansion"), so
 /// the offsets inside it are dropped. `None`: no library body (an anonymous constant's
 /// rendering, a chain past [`MOST_LOCAL_LEVELS`]).
-fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: LibKey, owner: ItemKey, text: &str) -> Option<super::body_host::BodyAt> {
+fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, item: LibKey, owner: ItemKey, text: &str) -> Option<super::body_host::BodyAt<'n>> {
     let mut key = owner;
     let mut off = 0u32;
     let mut fixed = false;
@@ -1635,14 +1635,15 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
                     .unwrap_or(0);
                 let base = header_off.checked_add(ha.expr_offset)?;
                 if fixed {
-                    let rel = off.checked_sub(ha.prefix)?;
-                    return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base.checked_add(rel)?, sub: 0, fixed: true });
+                    let rel = super::anon::orig_offset(ha.edits, off.checked_sub(ha.prefix)?)?;
+                    return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base.checked_add(rel)?, sub: 0, fixed: true, edits: &[] });
                 }
                 if let Some(rel) = off.checked_sub(ha.prefix) {
-                    return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base.checked_add(rel)?, sub: 0, fixed: false });
+                    let rel = super::anon::orig_offset(ha.edits, rel)?;
+                    return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base.checked_add(rel)?, sub: 0, fixed: false, edits: &[] });
                 }
                 let sub = ha.prefix.checked_sub(off)?;
-                return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base, sub, fixed: false });
+                return Some(super::body_host::BodyAt { lib: ha.owner_item, off: base, sub, fixed: false, edits: ha.edits });
             }
             // A library body: the lowered body itself (a free fn: its item; a member: the member
             // whose text it is, never its container, whose first byte is not the member's), or
@@ -1667,7 +1668,7 @@ fn body_at<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>, ite
                     }
                 }
             };
-            return Some(super::body_host::BodyAt { lib, off, sub: 0, fixed });
+            return Some(super::body_host::BodyAt { lib, off, sub: 0, fixed, edits: &[] });
         };
         if h.copied {
             off = h.range.start;

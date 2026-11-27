@@ -187,12 +187,16 @@ fn message(sink: &mut impl Sink, text: &str, edition: u8, item: &Item, attrs: &[
         | ItemDetail::Const { body_holds_items }
         | ItemDetail::Static { body_holds_items } => {
             sink.part(&[u8::from(body_holds_items)]);
-            // `BodySrc::of`: a body that holds items is scanned for the modules its blocks make.
-            // When the body's only block-writing constructs are bare, unqualified std expression
-            // macros (`nested::STD_EXPR_MACROS`), digest only the written-block and call shape so
-            // edits inside `#[test]` / library bodies keep `Outline::surface()` stable; shadowed
-            // macro definitions are guarded in `engine_names.rs` (`has_shadowed_expr_macro`).
-            if body_holds_items {
+            // `BodySrc::of`: a body that holds items, or a signature whose const generic
+            // arguments / `where` clause write a block with items or macros, is scanned for the
+            // modules its blocks make. When the only block-writing constructs are bare,
+            // unqualified std expression macros (`nested::STD_EXPR_MACROS`), digest only the
+            // written-block and call shape so edits inside `#[test]` / library bodies keep
+            // `Outline::surface()` stable; shadowed macro definitions are guarded in
+            // `engine_names.rs` (`has_shadowed_expr_macro`).
+            let sig = item.text(text, item.signature);
+            let head_blocks = sig.contains('{') && crate::nested::may_write_block(sig);
+            if body_holds_items || head_blocks {
                 whole |= crate::nested::digest_body_blocks(item.range.of(text), &mut |bytes| {
                     sink.part(bytes);
                 });

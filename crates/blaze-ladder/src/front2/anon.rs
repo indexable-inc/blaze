@@ -52,21 +52,99 @@ use super::keys::{KeyClash, Keys, MemberKind, anon_const_key, checker_of};
 use super::preds::Preds;
 use super::types::{PRIMS, SelfTy, Why, intern};
 
+/// One leaf replacement applied while preparing a head anonymous constant's text
+/// (`const_inherent::substitute_mapped` / `const_qpath::substitute_mapped`): maps byte offsets
+/// in the substituted text back to byte offsets in the original enclosing item's text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextEdit {
+    pub sub_start: u32,
+    pub sub_end: u32,
+    pub orig_start: u32,
+    pub orig_end: u32,
+}
+
+/// Maps byte offset `pos` in a leaf-substituted expression back to its byte offset in the
+/// original unmodified expression slice.
+pub(super) fn orig_offset(edits: &[TextEdit], pos: u32) -> Option<u32> {
+    let mut sub_cur = 0u32;
+    let mut orig_cur = 0u32;
+    for &e in edits {
+        if pos < e.sub_start {
+            return orig_cur.checked_add(pos.checked_sub(sub_cur)?);
+        }
+        if pos < e.sub_end {
+            return Some(e.orig_start);
+        }
+        sub_cur = e.sub_end;
+        orig_cur = e.orig_end;
+    }
+    orig_cur.checked_add(pos.checked_sub(sub_cur)?)
+}
+
+/// Composes two non-overlapping substitution passes (`first`: `mid -> orig`, `second`: `final -> mid`)
+/// into a single sorted edit list (`final -> orig`).
+pub(super) fn compose_edits(first: &[TextEdit], second: &[TextEdit], out: &mut AVec<'static, TextEdit>) -> Option<()> {
+    let (mut i, mut j) = (0usize, 0usize);
+    let (mut mid_cur, mut final_cur) = (0u32, 0u32);
+    while let (Some(&e1), Some(&e2)) = (first.get(i), second.get(j)) {
+        if e2.orig_end <= e1.sub_start {
+            let orig_start = orig_offset(first, e2.orig_start)?;
+            let orig_end = orig_offset(first, e2.orig_end)?;
+            out.push(TextEdit { sub_start: e2.sub_start, sub_end: e2.sub_end, orig_start, orig_end });
+            mid_cur = e2.orig_end;
+            final_cur = e2.sub_end;
+            j += 1;
+        } else if e1.sub_end <= e2.orig_start {
+            let gap = e1.sub_start.checked_sub(mid_cur)?;
+            let sub_start = final_cur.checked_add(gap)?;
+            let sub_len = e1.sub_end.checked_sub(e1.sub_start)?;
+            let sub_end = sub_start.checked_add(sub_len)?;
+            out.push(TextEdit { sub_start, sub_end, orig_start: e1.orig_start, orig_end: e1.orig_end });
+            i += 1;
+        } else {
+            return None;
+        }
+    }
+    while let Some(&e2) = second.get(j) {
+        let orig_start = orig_offset(first, e2.orig_start)?;
+        let orig_end = orig_offset(first, e2.orig_end)?;
+        out.push(TextEdit { sub_start: e2.sub_start, sub_end: e2.sub_end, orig_start, orig_end });
+        mid_cur = e2.orig_end;
+        final_cur = e2.sub_end;
+        j += 1;
+    }
+    while let Some(&e1) = first.get(i) {
+        let gap = e1.sub_start.checked_sub(mid_cur)?;
+        let sub_start = final_cur.checked_add(gap)?;
+        let sub_len = e1.sub_end.checked_sub(e1.sub_start)?;
+        let sub_end = sub_start.checked_add(sub_len)?;
+        out.push(TextEdit { sub_start, sub_end, orig_start: e1.orig_start, orig_end: e1.orig_end });
+        i += 1;
+    }
+    Some(())
+}
+
 /// The enclosing library item whose scanned text (`blaze_scope::blocks`) owns the block modules
 /// of a head-level anonymous constant expression (`where (): Trait<{ pub enum Tag .. }>`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadOwner {
     pub item: LibKey,
-    /// Byte offset of `Ask::text` inside `item`'s scanned text (`impl_header` for an impl,
-    /// whole text for a fn/const/static body).
+    /// Byte offset of the original unmodified expression inside `item`'s scanned text
+    /// (`impl_header` for an impl, whole text for a fn/const/static).
     pub offset: u32,
-    /// Byte length of `Ask::text` inside `item`'s scanned text.
+    /// Byte length of the original unmodified expression inside `item`'s scanned text.
     pub len: u32,
+    /// 1-based `(line, col)` of the expression's start in the source file (or the outermost
+    /// macro invocation's `(line, col)` for a macro-written item) when the expression contains
+    /// a macro call (`!`) and may observe `line!()`/`column!()`: hashed into the anonymous
+    /// constant key so inserting a blank line above the enclosing item invalidates cached bits.
+    pub site_pos: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug)]
 struct HeadOwned {
     owner: HeadOwner,
+    edits: AVec<'static, TextEdit>,
     member: AString<'static>,
 }
 
@@ -315,20 +393,30 @@ impl Ask {
         Some(Ask { need, module, ty, name, text: Box::from(text), self_ty: Some(self_ty), body: None, head_owner: None, marked: None })
     }
 
-    pub(super) fn in_head_item(mut self, owner: HeadOwner, alloc: Alloc<'static>) -> Self {
+    pub(super) fn in_head_item(mut self, owner: HeadOwner, edits: AVec<'static, TextEdit>, alloc: Alloc<'static>) -> Self {
         let mut hash = blaze_ids::Hasher::new("blaze-ladder head item anonymous constant 1");
         hash.part(self.member_name().as_bytes());
         hash.update(&owner.item.0.0);
         hash.update(&owner.offset.to_le_bytes());
+        match owner.site_pos {
+            Some((line, col)) => {
+                hash.update(&[1]);
+                hash.update(&line.to_le_bytes());
+                hash.update(&col.to_le_bytes());
+            }
+            None => {
+                hash.update(&[0]);
+            }
+        }
         let member = blaze_own::format_in!(alloc, "head {:x}", hash.finish());
         let key = anon_const_key(checker_of(self.module), &member);
         self.need = if self.body.is_some() { body_need_key(key) } else { need_key(key) };
-        self.head_owner = Some(HeadOwned { owner, member });
+        self.head_owner = Some(HeadOwned { owner, edits, member });
         self
     }
 
-    pub(super) fn head_owner(&self) -> Option<HeadOwner> {
-        self.head_owner.as_ref().map(|h| h.owner)
+    pub(super) fn head_owner(&self) -> Option<(HeadOwner, &[TextEdit])> {
+        self.head_owner.as_ref().map(|h| (h.owner, h.edits.as_slice()))
     }
 
     pub(super) fn carry_marks(mut self, rows: AVec<'static, (u32, TextMark)>) -> Self {
@@ -396,14 +484,14 @@ pub fn self_value<H: super::types::Heads + ?Sized>(
     self_ty: tc::PTy,
     self_node: PNode,
     marks: Option<TextMarks<'_>>,
-    head_owner: Option<HeadOwner>,
+    head_owner: Option<(HeadOwner, AVec<'static, TextEdit>)>,
     r: blaze_surface::Range,
 ) -> Result<u128, Why> {
     let source = text.trim();
     let Some(mut ask) = ty.and_then(|ty| Ask::of_self(module, ty, source, self_ty, self_node)) else { return Err(Why::ConstPath(Box::from(source), r)) };
     if let Some(alloc) = heads.mark_alloc() {
-        if let Some(owner) = head_owner {
-            ask = ask.in_head_item(owner, alloc);
+        if let Some((owner, edits)) = head_owner {
+            ask = ask.in_head_item(owner, edits, alloc);
         }
         if let Some(marks) = marks {
             match head_marks(marks, source, None, alloc, r)? {
@@ -553,10 +641,10 @@ pub fn file_asked<'n>(store: &mut Store<'n>, keys: &mut Keys) -> Result<Vec<LibK
             store.locals.file_anon(key, owner, scope);
         }
         let prim = written_ty(a.ty, &a.text).ok_or(FileFail::NoName(a.ty))?;
-        if let Some(owner) = a.head_owner() {
+        if let Some((owner, edits)) = a.head_owner() {
             let prefix = "const _: ".len() + prim.len() + " = { ".len();
             if let Ok(prefix) = u32::try_from(prefix) {
-                store.locals.file_head_anon(key, owner, prefix);
+                store.locals.file_head_anon(key, owner, edits, prefix);
             }
         }
         if store.fns.contains_key(&key) {
@@ -653,14 +741,20 @@ mod tests {
         let base = Ask::of(module, PNode::Uint(tc::UintTy::Usize), expr).expect("usize anon const");
         let item_a = LibKey(ContentId([2; 32]));
         let item_b = LibKey(ContentId([3; 32]));
-        let a_at_10 = base.clone().in_head_item(HeadOwner { item: item_a, offset: 10, len: expr.len() as u32 }, alloc);
-        let a_at_10_again = base.clone().in_head_item(HeadOwner { item: item_a, offset: 10, len: expr.len() as u32 }, alloc);
-        let a_at_20 = base.clone().in_head_item(HeadOwner { item: item_a, offset: 20, len: expr.len() as u32 }, alloc);
-        let b_at_10 = base.clone().in_head_item(HeadOwner { item: item_b, offset: 10, len: expr.len() as u32 }, alloc);
+        let owner = |item, offset, site_pos| HeadOwner { item, offset, len: expr.len() as u32, site_pos };
+        let empty = || blaze_own::AVec::new_in(alloc);
+        let a_at_10 = base.clone().in_head_item(owner(item_a, 10, None), empty(), alloc);
+        let a_at_10_again = base.clone().in_head_item(owner(item_a, 10, None), empty(), alloc);
+        let a_at_20 = base.clone().in_head_item(owner(item_a, 20, None), empty(), alloc);
+        let b_at_10 = base.clone().in_head_item(owner(item_b, 10, None), empty(), alloc);
+        let a_line_3 = base.clone().in_head_item(owner(item_a, 10, Some((3, 5))), empty(), alloc);
+        let a_line_4 = base.clone().in_head_item(owner(item_a, 10, Some((4, 5))), empty(), alloc);
         assert_eq!(a_at_10.need, a_at_10_again.need, "identical head owner and offset share one key");
         assert_ne!(a_at_10.need, base.need, "head-owned anon const differs from unowned");
         assert_ne!(a_at_10.need, a_at_20.need, "different offsets in the same item get distinct keys");
         assert_ne!(a_at_10.need, b_at_10.need, "different enclosing items get distinct keys");
+        assert_ne!(a_line_3.need, a_line_4.need, "shifting an enclosing item's line invalidates the cached key");
+        assert_ne!(a_line_3.need, a_at_10.need, "positioned key differs from unpositioned key");
         // Marks compose with head owner without dropping owner identity.
         let mark = TextMark {
             site: DefSite { krate: CrateItemKey(ContentId([4; 32])), module: None },
@@ -672,5 +766,11 @@ mod tests {
         let mut marks_b = blaze_own::AVec::new_in(alloc);
         marks_b.push((0, mark));
         assert_ne!(a_at_10.carry_marks(marks_a).need, b_at_10.carry_marks(marks_b).need, "marks preserve head owner distinction");
+        // Composed substitution edits map final offsets back to original offsets in either order.
+        let first = [TextEdit { sub_start: 15, sub_end: 21, orig_start: 15, orig_end: 19 }];
+        let second = [TextEdit { sub_start: 0, sub_end: 6, orig_start: 0, orig_end: 12 }];
+        let mut merged = blaze_own::AVec::new_in(alloc);
+        compose_edits(&first, &second, &mut merged).expect("disjoint passes compose");
+        assert_eq!(orig_offset(&merged, 18), Some(22));
     }
 }

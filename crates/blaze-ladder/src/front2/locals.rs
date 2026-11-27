@@ -410,11 +410,14 @@ pub(super) fn library_item_or_member<'n, S: NamesSource<'n>>(names: S, keys: &Ke
 /// (`"const _: TY = { <expr> };"`), used to map its blocks back to the enclosing item's
 /// `blaze-scope` block modules.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct HeadAnon {
+pub(super) struct HeadAnon<'n> {
     pub owner_item: LibKey,
     pub expr_offset: u32,
     pub expr_len: u32,
     pub prefix: u32,
+    /// Leaf substitutions applied to the expression text (`const_inherent`/`const_qpath`),
+    /// mapping byte offsets past `prefix` back to byte offsets in the original expression slice.
+    pub edits: &'n [super::anon::TextEdit],
 }
 
 /// The local items of every body lowered in this command, kept in the command's frame.
@@ -432,7 +435,7 @@ pub struct Locals<'n> {
     anons: HashMap<ItemKey, (ItemKey, u32), &'n Frame>,
     /// Head-level anonymous constants that may declare items or invoke macros inside a block,
     /// mapped back to the enclosing library item whose `blaze-scope` block modules hold them.
-    head_anons: HashMap<ItemKey, HeadAnon, &'n Frame>,
+    head_anons: HashMap<ItemKey, HeadAnon<'n>, &'n Frame>,
     /// Each block module (`__blaze_block_*`) owned by a lowered body, mapping the block module's
     /// library key back to its enclosing body's checker key: what `type_name` prints items
     /// declared in that block (`struct LocalStruct;` in `fn outer`) under (`crate::outer::LocalStruct`).
@@ -493,12 +496,13 @@ impl<'n> Locals<'n> {
 
     /// Files the head-level anonymous constant `key` as originating from `owner` in its enclosing
     /// library item, wrapped with a `prefix`-byte synthetic `"const _: TY = { "` header.
-    pub(super) fn file_head_anon(&mut self, key: ItemKey, owner: super::anon::HeadOwner, prefix: u32) {
-        self.head_anons.insert(key, HeadAnon { owner_item: owner.item, expr_offset: owner.offset, expr_len: owner.len, prefix });
+    pub(super) fn file_head_anon(&mut self, key: ItemKey, owner: super::anon::HeadOwner, edits: &[super::anon::TextEdit], prefix: u32) {
+        let edits: &'n [super::anon::TextEdit] = if edits.is_empty() { &[] } else { self.frame.alloc_slice_copy(edits) };
+        self.head_anons.insert(key, HeadAnon { owner_item: owner.item, expr_offset: owner.offset, expr_len: owner.len, prefix, edits });
     }
 
     /// The enclosing library item alignment of a head-level anonymous constant, if any.
-    pub(super) fn head_anon(&self, key: ItemKey) -> Option<HeadAnon> {
+    pub(super) fn head_anon(&self, key: ItemKey) -> Option<HeadAnon<'n>> {
         self.head_anons.get(&key).copied()
     }
 
@@ -872,11 +876,9 @@ impl<'n> Locals<'n> {
         let mut any = false;
         for blk in nested.blocks.iter() {
             let module = if blk.open >= ha.prefix {
-                let target_open = ha.expr_offset.saturating_add(blk.open - ha.prefix);
-                owner_nested
-                    .blocks
-                    .binary_search_by_key(&target_open, |b| b.open)
-                    .ok()
+                super::anon::orig_offset(ha.edits, blk.open - ha.prefix)
+                    .and_then(|rel| ha.expr_offset.checked_add(rel))
+                    .and_then(|target_open| owner_nested.blocks.binary_search_by_key(&target_open, |b| b.open).ok())
                     .and_then(|idx| owner_modules.get(idx).copied().flatten())
             } else {
                 enclosing_module

@@ -6585,12 +6585,13 @@ impl<'n> Store<'n> {
         cs.extend_from_slice(outer.consts);
         let owner = (container.is_none()
             && self.locals.head(key).is_none()
-            && matches!(
+            && matches!(detail, ItemDetail::Fn { .. } | ItemDetail::Const { .. } | ItemDetail::Static { .. })
+            && (matches!(
                 detail,
                 ItemDetail::Fn { body_holds_items: true }
                     | ItemDetail::Const { body_holds_items: true }
                     | ItemDetail::Static { body_holds_items: true }
-            ))
+            ) || (text.contains('{') && blaze_file_items::nested::may_write_block(text))))
         .then_some((lib, text));
         let declared = {
             let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
