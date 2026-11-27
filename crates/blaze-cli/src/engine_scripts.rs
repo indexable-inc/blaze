@@ -386,6 +386,7 @@ impl<'s> ScriptQueue<'s> {
                 members.push((entry.id, work::held_str(entry.dir.as_str(), self.jobs), entry.kind));
             }
         }
+        let dep_probes = crate::wasm64_compile::DepScriptProbes::open(cx, handles.env, self.jobs);
         let built = crate::wasm64_compile::CompileInputs {
             graph: sections.graph,
             wasm_graph: sections.wasm_graph,
@@ -394,6 +395,8 @@ impl<'s> ScriptQueue<'s> {
             members: members.into_bump_slice(),
             producers: handles.producers,
             heap: handles.env.heap,
+            c_probes: dep_probes.c_probes,
+            spawn_setting: dep_probes.spawn_setting,
         };
         self.compile_inputs = Some(built);
         Ok(self.compile_inputs)

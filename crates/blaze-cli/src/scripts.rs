@@ -627,23 +627,7 @@ impl<'f> Scripts<'f> {
         // resolved again here.
         let checkout = env.served.within(frame);
         let no_sdk = env.sdk.is_err();
-        let mut sdk_hex = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
-        let sdk_pair = env.sdk.as_ref().ok().map(|sdk| {
-            let key = sdk.identity().key();
-            for (i, byte) in key.iter().enumerate() {
-                let hi = byte >> 4;
-                let lo = byte & 15;
-                if let Some(slot) = sdk_hex.get_mut(2 * i) {
-                    *slot = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
-                }
-                if let Some(slot) = sdk_hex.get_mut(2 * i + 1) {
-                    *slot = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
-                }
-            }
-            let id_str = core::str::from_utf8(&sdk_hex).unwrap_or("");
-            (sdk.folder(), id_str)
-        });
-        let c_probes = blaze_proc_macro::probe_clang::open_command_c_probes(cx, &env.fs, home, host, sdk_pair, alloc);
+        let c_probes = open_c_probes(cx, env, home, host, alloc);
         let shared: &'f Shared<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(Shared { result_alloc: env.heap.shared(), runtime, store, checkout, table, macro_table, spawn, c_probes, native, no_sdk, graph_record }, frame));
         Ok(shared)
     }
@@ -663,6 +647,36 @@ impl Drop for Scripts<'_> {
             end_jobs(native.jobs);
         }
     }
+}
+
+/// Opens the command's hermetic C compiler probe setting (`probe_clang::open_command_c_probes`)
+/// for `host`, encoding any resolved Apple SDK identity into the `(folder, hex_id)` pair.
+/// Shared between normal workspace `Script` tasks (`Scripts::open_shared`) and wasm64 dependency
+/// build scripts (`wasm64_compile::DepScriptProbes::open`, rule 30).
+pub(crate) fn open_c_probes(
+    cx: &Cx,
+    env: &FetchEnv<'_>,
+    home: &str,
+    host: &str,
+    alloc: Alloc<'_>,
+) -> blaze_proc_macro::probe_clang::CProbeSetting {
+    let mut sdk_hex = [0u8; blaze_apple_sdk::SdkId::KEY_LEN * 2];
+    let sdk_pair = env.sdk.as_ref().ok().map(|sdk| {
+        let key = sdk.identity().key();
+        for (i, byte) in key.iter().enumerate() {
+            let hi = byte >> 4;
+            let lo = byte & 15;
+            if let Some(slot) = sdk_hex.get_mut(2 * i) {
+                *slot = if hi < 10 { b'0' + hi } else { b'a' + (hi - 10) };
+            }
+            if let Some(slot) = sdk_hex.get_mut(2 * i + 1) {
+                *slot = if lo < 10 { b'0' + lo } else { b'a' + (lo - 10) };
+            }
+        }
+        let id_str = core::str::from_utf8(&sdk_hex).unwrap_or("");
+        (sdk.folder(), id_str)
+    });
+    blaze_proc_macro::probe_clang::open_command_c_probes(cx, &env.fs, home, host, sdk_pair, alloc)
 }
 
 /// The command's jobserver ended: its descriptor closed, its fifo removed. A drop cannot return

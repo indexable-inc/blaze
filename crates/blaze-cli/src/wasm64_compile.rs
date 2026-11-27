@@ -125,6 +125,74 @@ pub(crate) struct CompileInputs<'a> {
     pub producers: Producers,
     /// Process heap for `Maker` tables (reclaimed when `Maker` drops).
     pub heap: &'static blaze_own::Heap,
+    /// Command-level hermetic C compiler probe setting (`scripts::open_c_probes`), threaded into
+    /// dependency build scripts run during wasm64 self-compilation (e.g. `ring` under
+    /// `sqlx-macros`). `None` when `HOME` is unset or unavailable.
+    pub c_probes: Option<&'a blaze_proc_macro::probe_clang::CProbeSetting>,
+    /// Command-level derived-fact spawn setting (`fact_pins::command_spawn_setting` pins,
+    /// strictly hermetic with `hvbox_allowed = false` and no ambient tools), threaded into
+    /// dependency build scripts run during wasm64 self-compilation. `None` falls back to
+    /// `SpawnSetting::off()`.
+    pub spawn_setting: Option<&'a SpawnSetting>,
+}
+
+/// Hermetic C-probe and derived-fact spawn settings threaded from [`CompileInputs`] into
+/// dependency build scripts executed during wasm64 self-compilation.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DepScriptProbes<'a> {
+    pub(crate) c_probes: Option<&'a blaze_proc_macro::probe_clang::CProbeSetting>,
+    pub(crate) spawn_setting: Option<&'a SpawnSetting>,
+}
+
+impl<'a> DepScriptProbes<'a> {
+    fn from_inputs(inputs: CompileInputs<'a>) -> Self {
+        Self { c_probes: inputs.c_probes, spawn_setting: inputs.spawn_setting }
+    }
+
+    /// Opens command-level hermetic C compiler probes (`scripts::open_c_probes`) and derived-fact
+    /// pins (`fact_pins::command_spawn_setting`) once lazily when preparing [`CompileInputs`],
+    /// allocated in `jobs`. Returns `c_probes: None` when `env.home` is `None`, and keeps
+    /// `hvbox_allowed = false` with no ambient tools.
+    pub(crate) fn open(
+        cx: &bstd::cx::Cx,
+        env: &crate::fetch::FetchEnv<'_>,
+        jobs: &'a bstd::mem::Frame,
+    ) -> Self {
+        let alloc = env.heap.alloc();
+        let host = crate::graph::TRIPLE;
+        let c_probes = env.home.map(|home| {
+            let opened = crate::scripts::open_c_probes(cx, env, home, host, alloc);
+            &*blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(opened, jobs))
+        });
+        let spawn_setting = blaze_proc_macro::fact_pins::command_spawn_setting(host, alloc)
+            .ok()
+            .map(|setting| {
+                &*blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(setting, jobs))
+            });
+        Self { c_probes, spawn_setting }
+    }
+}
+
+/// Shares the configured C compiler probe setting for a dependency build script (`None` when
+/// unset, e.g. when `HOME` was unavailable).
+fn dep_script_c_probes(
+    dep_probes: DepScriptProbes<'_>,
+) -> Option<blaze_proc_macro::probe_clang::CProbeSetting> {
+    dep_probes.c_probes.map(blaze_own::Share::share)
+}
+
+/// Builds a strictly hermetic [`SpawnSetting`] carrying only the derived-fact pins from
+/// `dep_probes` (never `hvbox_allowed`, ambient `tools`, or `userland`), or
+/// [`SpawnSetting::off`] when absent.
+fn dep_script_spawn_setting(dep_probes: DepScriptProbes<'_>) -> SpawnSetting {
+    match dep_probes.spawn_setting.and_then(|s| s.pins.as_ref()) {
+        Some(pins) => SpawnSetting::facts_only(blaze_proc_macro::spawn_route::FactPins {
+            clang_version_text: pins.clang_version_text.as_str().into(),
+            macos_product_version: pins.macos_product_version.as_str().into(),
+            macos_build_version: pins.macos_build_version.as_str().into(),
+        }),
+        None => SpawnSetting::off(),
+    }
 }
 
 /// Wasm64 proc-macro reactor shim compiled as crate 0 alongside the proc-macro crate (crate 1).
@@ -761,6 +829,7 @@ pub(crate) fn compile_build_script(
         inputs.members,
         &inputs.producers,
         inputs.heap,
+        DepScriptProbes::from_inputs(inputs),
         script_id,
         expected_deps,
         0,
@@ -784,7 +853,7 @@ fn path_pkg_files_digest(
 
 /// Recursively compiles `script_id` (and any build-script dependencies of its build-dependencies)
 /// into `<store>/build-script/modules/<key>` and returns its `wasm-sha256` digest.
-#[expect(clippy::too_many_arguments, reason = "recursive build-script compilation over store, graph, wasm_graph, lock, checkout, members, heap, unit, expected_deps, and depth")]
+#[expect(clippy::too_many_arguments, reason = "recursive build-script compilation over store, graph, wasm_graph, lock, checkout, members, heap, dep_probes, unit, expected_deps, and depth")]
 fn ensure_build_script_unit(
     store: &Path,
     graph: &UnitGraph<'_>,
@@ -794,6 +863,7 @@ fn ensure_build_script_unit(
     members: &[(LockId, &str, blaze_world::PathKind)],
     producers: &Producers,
     heap: &'static blaze_own::Heap,
+    dep_probes: DepScriptProbes<'_>,
     script_id: UnitId,
     expected_deps: Option<&str>,
     depth: u8,
@@ -865,6 +935,7 @@ fn ensure_build_script_unit(
         members,
         producers,
         heap,
+        dep_probes,
         script_id,
         CompileMode::BuildScript,
         depth,
@@ -909,6 +980,7 @@ fn ensure_proc_macro_unit(
     members: &[(LockId, &str, blaze_world::PathKind)],
     producers: &Producers,
     heap: &'static blaze_own::Heap,
+    dep_probes: DepScriptProbes<'_>,
     pm_id: UnitId,
     depth: u8,
 ) -> Result<(CrateItemKey, blaze_proc_macro::module::ModuleRecord, std::string::String, std::string::String), SelfCompileError> {
@@ -958,6 +1030,7 @@ fn ensure_proc_macro_unit(
                 members,
                 producers,
                 heap,
+                dep_probes,
                 pm_id,
                 CompileMode::ProcMacro,
                 depth,
@@ -1049,6 +1122,7 @@ pub(crate) fn compile_proc_macro(
         inputs.members,
         &inputs.producers,
         inputs.heap,
+        DepScriptProbes::from_inputs(inputs),
         pm_id,
         CompileMode::ProcMacro,
         0,
@@ -1210,6 +1284,7 @@ fn run_dep_build_script(
     members: &[(LockId, &str, blaze_world::PathKind)],
     producers: &Producers,
     heap: &'static blaze_own::Heap,
+    dep_probes: DepScriptProbes<'_>,
     bs_id: UnitId,
     tc_cfg: &[(std::string::String, Option<std::string::String>)],
     tc_names: &[std::string::String],
@@ -1217,7 +1292,7 @@ fn run_dep_build_script(
     depth: u8,
 ) -> Result<std::vec::Vec<u8>, SelfCompileError> {
     // Ensure the build script's own wasm64 module exists first (`graph` here is already `wasm_graph`).
-    let _ = ensure_build_script_unit(store, graph, Some(graph), lock, checkout, members, producers, heap, bs_id, None, depth + 1)?;
+    let _ = ensure_build_script_unit(store, graph, Some(graph), lock, checkout, members, producers, heap, dep_probes, bs_id, None, depth + 1)?;
     let frame = Frame::with_reserve(128 << 20, Tag::Other)
         .map_err(|_| SelfCompileError::Failed(std::string::String::from("failed to reserve dep build-script frame")))?;
     let erased = Erased::new(&frame);
@@ -1302,11 +1377,11 @@ fn run_dep_build_script(
         host: crate::graph::TRIPLE,
         table: Arc::new(table),
         probes: None,
-        c_probes: None,
+        c_probes: dep_script_c_probes(dep_probes),
         c_mode: CMode::Deferred,
         mode: Mode::Check,
         native: None,
-        spawn_setting: Arc::new(SpawnSetting::off()),
+        spawn_setting: Arc::new(dep_script_spawn_setting(dep_probes)),
         files_digest: files_digest.as_deref(),
         deps_digest: deps_digest.as_deref(),
     };
@@ -1677,7 +1752,7 @@ fn resolve_wasm64_graph<'r>(
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "whole-program wasm64 compilation over store, graph, pre-resolved wasm_graph, lock, checkout, members, root unit, mode, and recursion depth"
+    reason = "whole-program wasm64 compilation over store, graph, pre-resolved wasm_graph, lock, checkout, members, dep_probes, root unit, mode, and recursion depth"
 )]
 fn compile_unit_to_wasm64(
     store: &Path,
@@ -1688,6 +1763,7 @@ fn compile_unit_to_wasm64(
     members: &[(LockId, &str, blaze_world::PathKind)],
     producers: &Producers,
     heap: &'static blaze_own::Heap,
+    dep_probes: DepScriptProbes<'_>,
     root_unit: UnitId,
     mode: CompileMode,
     depth: u8,
@@ -1796,6 +1872,7 @@ fn compile_unit_to_wasm64(
                 members,
                 producers,
                 heap,
+                dep_probes,
                 uid,
                 depth + 1,
             )?;
@@ -1845,6 +1922,7 @@ fn compile_unit_to_wasm64(
         members,
         producers,
         heap,
+        dep_probes,
         wasm_root_unit,
         unit_order.as_slice(),
         &unit_to_pos,
@@ -1934,6 +2012,7 @@ fn compile_unit_in<'a>(
     members: &[(LockId, &str, blaze_world::PathKind)],
     producers: &Producers,
     heap: &'static blaze_own::Heap,
+    dep_probes: DepScriptProbes<'_>,
     root_unit: UnitId,
     unit_order: &[UnitId],
     unit_to_pos: &blaze_own::BTreeMap<UnitId, usize, Alloc<'_>>,
@@ -2066,6 +2145,7 @@ fn compile_unit_in<'a>(
                 members,
                 producers,
                 heap,
+                dep_probes,
                 bs_id,
                 &tc_cfg_owned,
                 &tc_names,
@@ -3612,6 +3692,7 @@ mod tests {
             &members,
             &producers,
             heap,
+            DepScriptProbes::default(),
             UnitId(0),
             CompileMode::BuildScript,
             0,
@@ -3826,5 +3907,187 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             Ok(None),
             "STD_ENV_ARCH must be unset (Ok(None)) so BodyHost/Host falls back to target_arch"
         );
+    }
+
+    #[test]
+    fn compile_inputs_threads_c_probes_and_spawn_setting_into_dep_script_setting() {
+        let tmp = std::env::temp_dir().join(std::format!(
+            "blaze-wasm64-dep-probes-unit-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let checkout = tmp.join("checkout");
+        let home_dir = tmp.join("home");
+        std::fs::create_dir_all(&checkout).expect("checkout dir");
+        std::fs::create_dir_all(home_dir.join(".blaze/v2")).expect("home .blaze/v2 dir");
+
+        let io = bstd::test::native(&checkout).expect("native io");
+        let cx = io
+            .cx(core::time::Duration::from_secs(30), bstd::mem::TASK_FRAME)
+            .expect("root cx");
+        let jobs = Frame::with_reserve(4 << 20, Tag::Other).expect("jobs frame");
+        let home_str = home_dir.to_str().expect("utf8 home");
+        let env_with_home = crate::fetch::FetchEnv {
+            clock: io.need_clock().expect("clock"),
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: Some(home_str),
+            cargo_home: None,
+            start: Some(checkout.to_str().expect("utf8 checkout")),
+            toolchain: blaze_toolchain::PINNED,
+            fs: io.need_fs().expect("fs"),
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap: blaze_own::testing::heap(),
+        };
+
+        let opened = DepScriptProbes::open(&cx, &env_with_home, &jobs);
+        assert!(
+            opened.c_probes.is_some(),
+            "DepScriptProbes::open with home=Some(..) must open c_probes"
+        );
+        #[cfg(target_os = "linux")]
+        if blaze_proc_macro::probe_clang::active_clang_pin(crate::graph::TRIPLE).is_some() {
+            assert!(
+                opened.c_probes.and_then(|p| p.ready()).is_some(),
+                "Linux host with pinned clang must open CProbeSetting::Ready"
+            );
+        }
+        let spawn = opened
+            .spawn_setting
+            .expect("command_spawn_setting must succeed for supported host");
+        assert!(!spawn.hvbox_allowed, "dep script spawn_setting must never allow unhermetic hvbox");
+        assert!(spawn.tools.is_empty(), "dep script spawn_setting must not enable ambient tools");
+        assert!(spawn.userland.is_none(), "dep script spawn_setting must not enable ambient userland");
+        if matches!(
+            crate::graph::TRIPLE,
+            "aarch64-unknown-linux-gnu" | "aarch64-apple-darwin"
+        ) {
+            let pins = spawn
+                .pins
+                .as_ref()
+                .expect("pinned host must populate derived-fact pins");
+            assert!(
+                pins.clang_version_text.starts_with("clang version "),
+                "unexpected clang_version_text: {:?}",
+                pins.clang_version_text
+            );
+        }
+
+        let inputs = CompileInputs {
+            graph: &[],
+            wasm_graph: &[],
+            lock: &[],
+            checkout: None,
+            members: &[],
+            heap: blaze_own::testing::heap(),
+            c_probes: opened.c_probes,
+            spawn_setting: opened.spawn_setting,
+        };
+        let from_inputs = DepScriptProbes::from_inputs(inputs);
+        let setting = Setting {
+            store: &home_dir,
+            target: WASM64_TARGET,
+            host: crate::graph::TRIPLE,
+            table: Arc::new(std::vec::Vec::new()),
+            probes: None,
+            c_probes: dep_script_c_probes(from_inputs),
+            c_mode: CMode::Deferred,
+            mode: Mode::Check,
+            native: None,
+            spawn_setting: Arc::new(dep_script_spawn_setting(from_inputs)),
+            files_digest: None,
+            deps_digest: None,
+        };
+        assert!(
+            setting.c_probes.is_some(),
+            "CompileInputs must thread c_probes into dep build script Setting"
+        );
+        assert_eq!(
+            setting.spawn_setting.pins.is_some(),
+            spawn.pins.is_some(),
+            "CompileInputs must thread derived-fact pins into dep build script Setting"
+        );
+        assert!(!setting.spawn_setting.hvbox_allowed);
+        assert!(setting.spawn_setting.tools.is_empty());
+
+        // Negative control 1: when `home` is `None`, `c_probes` must remain `None`.
+        let env_no_home = crate::fetch::FetchEnv {
+            clock: io.need_clock().expect("clock"),
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: None,
+            cargo_home: None,
+            start: None,
+            toolchain: blaze_toolchain::PINNED,
+            fs: io.need_fs().expect("fs"),
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap: blaze_own::testing::heap(),
+        };
+        let no_home = DepScriptProbes::open(&cx, &env_no_home, &jobs);
+        assert!(
+            no_home.c_probes.is_none(),
+            "DepScriptProbes::open with home=None must leave c_probes as None"
+        );
+
+        // Negative control 2: CompileInputs with None / None keeps c_probes=None and SpawnSetting::off().
+        let empty_inputs = CompileInputs {
+            c_probes: None,
+            spawn_setting: None,
+            ..inputs
+        };
+        let empty_probes = DepScriptProbes::from_inputs(empty_inputs);
+        let empty_c_probes = dep_script_c_probes(empty_probes);
+        let empty_spawn = dep_script_spawn_setting(empty_probes);
+        assert!(empty_c_probes.is_none());
+        assert!(empty_spawn.pins.is_none());
+        assert!(!empty_spawn.hvbox_allowed);
+        assert!(empty_spawn.tools.is_empty());
+
+        // Negative control 3: Unavailable c_probes is preserved verbatim (never upgraded to Ready).
+        let unavail = blaze_proc_macro::probe_clang::CProbeSetting::Unavailable(
+            blaze_own::Arc::from_str_in("no clang pin", blaze_own::SharedAlloc::global()),
+        );
+        let unavail_inputs = CompileInputs {
+            c_probes: Some(&unavail),
+            spawn_setting: None,
+            ..inputs
+        };
+        let unavail_c_probes = dep_script_c_probes(DepScriptProbes::from_inputs(unavail_inputs));
+        assert!(
+            matches!(
+                unavail_c_probes,
+                Some(blaze_proc_macro::probe_clang::CProbeSetting::Unavailable(_))
+            ),
+            "Unavailable c_probes must be threaded verbatim"
+        );
+
+        // Negative control 4: even if a caller constructed a SpawnSetting with hvbox_allowed=true,
+        // `dep_script_spawn_setting` strips it and retains only hermetic derived-fact pins.
+        let unhermetic = SpawnSetting {
+            hvbox_allowed: true,
+            tools: std::vec::Vec::new(),
+            userland: None,
+            pins: spawn.pins.clone(),
+        };
+        let sanitized = dep_script_spawn_setting(DepScriptProbes {
+            c_probes: None,
+            spawn_setting: Some(&unhermetic),
+        });
+        assert!(!sanitized.hvbox_allowed, "dep_script_spawn_setting must stay strictly hermetic");
+        assert!(sanitized.tools.is_empty());
+        assert!(sanitized.userland.is_none());
+        assert_eq!(sanitized.pins, spawn.pins);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
