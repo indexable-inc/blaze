@@ -80,6 +80,9 @@ pub struct Shown<'f> {
     /// The command's lint step (lints.rs `lints_of`): a lint finding's level is its levels' at
     /// print time (rule 81), never stored. `Step::Rust` until the command sets it.
     pub lints: blaze_lint::Step,
+    /// Per-crate lint context (crate-root marks + active `cfg` atoms per workspace unit) so
+    /// module files inherit crate-root lint attributes and evaluate `cfg_attr(..)`.
+    pub(crate) lint_ctx: crate::lints::CrateLintCtx<'f>,
     /// `--each`: every finding that is only a consequence (a task waiting on a failed one, an
     /// item or a body not checked) drawn one by one, as well as counted under its cause. Off,
     /// they are counted and grouped only, and never placed in their files.
@@ -116,6 +119,7 @@ impl<'f> Shown<'f> {
             borrows_unchecked: 0,
             not_run: Vec::new_in(frame),
             lints: blaze_lint::Step::Rust,
+            lint_ctx: crate::lints::CrateLintCtx::empty(frame),
             each: false,
             verbose: false,
             behind: crate::not_checked::Behind::default(),
@@ -801,11 +805,15 @@ fn finding_about<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], file: Option<&str>, s
     // A lint finding: the level the step's levels give its rule, now (rule 81). Advice is a
     // warning, and no step's is an error today (main.rs `every_rule`); an `Off` rule is not
     // drawn or counted.
-    // The file's own marks (including enclosing item/module/block lint attributes at `l.start`),
-    // read only when the finding is a lint rule. A lint finding's file is UTF-8 (engine_lints.rs
-    // refuses any other), so a text that is not has none.
+    // The crate root's and file's lint marks (including enclosing item/module/block lint
+    // attributes at `l.start` and active `cfg_attr(..)`), read only when the finding is a lint
+    // rule. A lint finding's file is UTF-8 (engine_lints.rs refuses any other), so a text that
+    // is not has none.
     let lint = crate::lints::rule_of(l.rule).map(|_| {
-        let marks = core::str::from_utf8(text).map_or(blaze_lint::RootMarks::NONE, |text| crate::lints::marks_at(text, text, l.start));
+        let erased = blaze_own::Erased::new(frame);
+        let marks = core::str::from_utf8(text).map_or(blaze_lint::RootMarks::NONE, |text| {
+            shown.lint_ctx.marks_at(l.path.or(file), text, l.start, erased.handle())
+        });
         crate::lints::level_in(shown.lints, marks, l.rule)
     });
     if lint == Some(blaze_lint::Level::Off) {

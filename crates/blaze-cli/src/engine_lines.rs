@@ -2225,13 +2225,14 @@ fn key_reads_text() -> bool {
 }
 
 /// A file section's key (module docs at [`RENDER_FORM`]).
-fn section_key(presentation: ContentId, path: &str, text: ContentId, findings: ContentId) -> ContentId {
+fn section_key(presentation: ContentId, path: &str, text: ContentId, findings: ContentId, lint_salt: ContentId) -> ContentId {
     let mut h = blaze_ids::Hasher::new(SECTION_DOMAIN);
     h.update(&presentation.0).part(path.as_bytes());
     if key_reads_text() {
         h.update(&text.0);
     }
     h.update(&findings.0);
+    h.update(&lint_salt.0);
     h.finish()
 }
 
@@ -2358,7 +2359,9 @@ impl<'p, 'm, 'a, 's, 'f> Files<'f, Capture<'m, 'a, 's, 'f>> for Sectioned<'p, 'm
                     None => Plan::Drawn,
                     Some(_) if prints[from..past].iter().any(print::adds_to_lists) => Plan::Drawn,
                     Some(text) => {
-                        let key = section_key(self.presentation, path, text, findings_digest(&prints[from..past], &wanted[from..past]));
+                        let salt = shown.lint_ctx.section_salt(path);
+                        let digest = findings_digest(prints.get(from..past).unwrap_or(&[]), wanted.get(from..past).unwrap_or(&[]));
+                        let key = section_key(self.presentation, path, text, digest, salt);
                         match self.files.get(&key) {
                             Some(row) => Plan::Stored { key, path, row: *row, text, at: 0 },
                             None => Plan::Section(key),

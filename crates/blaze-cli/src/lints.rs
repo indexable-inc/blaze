@@ -36,8 +36,9 @@
 
 use blaze_drive::{Kind, Locate, Name, Part, Why};
 use blaze_ids::{ContentId, Hasher};
-use blaze_lint::{Findings, Geometry, Level, OwnHeads, OwnUnit, RootMarks, Rule, RuleSet, Scope, Span, Step, TestBits, UnitPlan, Units, Variants, VariantsView, statics_of_path};
+use blaze_lint::{CfgAtoms, Findings, Geometry, Level, OwnHeads, OwnUnit, RootMarks, Rule, RuleSet, Scope, Span, Step, TestBits, UnitPlan, Units, Variants, VariantsView, statics_of_path};
 use blaze_own::{AVec, Alloc, Vec};
+use blaze_world::crate_list::CrateGraph;
 use std::alloc::Global;
 
 use crate::work::Record;
@@ -96,15 +97,167 @@ pub(crate) fn marks_of(crate_root_text: &str, text: &str) -> RootMarks {
     RootMarks::read(crate_root_text).join(RootMarks::read(text))
 }
 
-/// The effective lint marks at byte offset `at` inside `text` (joining the crate root's
-/// file-top attributes with `text`'s file-top and enclosing item/module/block/statement lint
-/// attributes).
-pub(crate) fn marks_at(crate_root_text: &str, text: &str, at: u32) -> RootMarks {
-    let offset = usize::try_from(at).unwrap_or(text.len());
-    if core::ptr::eq(crate_root_text, text) {
-        return RootMarks::read_at(text, offset);
+/// Per-crate lint context built once from the workspace's `UnitGraph`: each member unit's crate
+/// root path, directory prefix, active `cfg` atoms, and pre-parsed crate-root [`RootMarks`], so
+/// submodule files (`src/foo.rs`) inherit crate-root lint attributes (`#![deny(..)]`,
+/// `#![cfg_attr(..)]`, `#![forbid(warnings)]`) and evaluate `#[cfg_attr(..)]` against the unit's
+/// real active `cfg`.
+pub(crate) struct CrateLintUnit<'f> {
+    pub(crate) root_path: &'f str,
+    pub(crate) dir_prefix: &'f str,
+    pub(crate) is_test: bool,
+    pub(crate) is_lib: bool,
+    pub(crate) cfg: &'f [(&'f str, Option<&'f str>)],
+    pub(crate) root_marks: RootMarks,
+}
+
+/// Workspace-wide crate lint context attached to [`crate::print::Shown`].
+pub(crate) struct CrateLintCtx<'f> {
+    pub(crate) units: Vec<CrateLintUnit<'f>, &'f bstd::mem::Frame>,
+}
+
+impl<'f> CrateLintCtx<'f> {
+    pub(crate) fn empty(frame: &'f bstd::mem::Frame) -> Self {
+        Self { units: Vec::new_in(frame) }
     }
-    RootMarks::read(crate_root_text).join(RootMarks::read_at(text, offset))
+
+    /// Populates the crate lint context from the stored `UnitGraph` record at `graph_key`.
+    /// Silently keeps whatever could be read if the graph is absent (e.g. a check that failed
+    /// before `UnitGraph` ran).
+    pub(crate) fn populate<'m>(
+        &mut self,
+        cx: &bstd::cx::Cx,
+        checkout: &bstd::fs::Dir<bstd::fs::ReadWrite>,
+        store: &mut dyn crate::store::Store<'m>,
+        graph_key: blaze_drive::Key,
+        frame: &'f bstd::mem::Frame,
+    ) {
+        self.units.clear();
+        let Ok(Ok((_view, sections))) = crate::engine_units::stored_graph_at(cx, store, graph_key) else {
+            return;
+        };
+        let Ok(Some(list)) = sections.crates() else {
+            return;
+        };
+        let Ok(scratch) = bstd::mem::Frame::with_reserve(16 << 20, bstd::mem::Tag::Other) else {
+            return;
+        };
+        let scratch_erased = blaze_own::Erased::new(&scratch);
+        let Ok(decoded) = blaze_unit_graph::record::decode(sections.graph, scratch_erased.handle()) else {
+            return;
+        };
+        let mut root_buf = bstd::mem::Bytes::new_in(&scratch, "crate root lint marks");
+        let n = list.len();
+        for r in 0..n {
+            if !list.member(r) {
+                continue;
+            }
+            let Some(rel_root) = list.root(r).strip_prefix("/0/") else {
+                continue;
+            };
+            let pkg = list.package(r);
+            let krate = list.name(r);
+            let is_test = list.test(r);
+            let matched = decoded.graph.units.iter().find(|u| {
+                u.name.as_str() == pkg
+                    && u.crate_name.as_str() == krate
+                    && rel_root.ends_with(u.root.as_str())
+                    && u.cfg.iter().any(|a| a.name.as_str() == "test" && a.value.is_none()) == is_test
+            });
+            let cfg_slice: &'f [(&'f str, Option<&'f str>)] = match matched {
+                Some(u) => {
+                    let mut atoms: Vec<(&'f str, Option<&'f str>), &'f bstd::mem::Frame> = Vec::with_capacity_in(u.cfg.len(), frame);
+                    for a in u.cfg.iter() {
+                        let name: &'f str = frame.alloc_str(a.name.as_str());
+                        let value: Option<&'f str> = a.value.as_ref().map(|v| &*frame.alloc_str(v.as_str()));
+                        atoms.push((name, value));
+                    }
+                    atoms.into_bump_slice()
+                }
+                None => &[],
+            };
+            root_buf.clear();
+            let root_marks = bstd::path::Path::new(rel_root)
+                .ok()
+                .and_then(|p| checkout.read_all(cx, &p, &mut root_buf).ok())
+                .and_then(|_| core::str::from_utf8(root_buf.as_slice()).ok())
+                .map_or(RootMarks::NONE, |text| RootMarks::read_with_cfg(text, CfgAtoms(cfg_slice)));
+            let root_path = frame.alloc_str(rel_root);
+            let dir_prefix = match root_path.rsplit_once('/') {
+                Some((dir, _)) => frame.alloc_str(bstd::mem::format_in!(frame, "{dir}/").as_str()),
+                None => "",
+            };
+            let is_lib = root_path == "lib.rs" || root_path.ends_with("/lib.rs");
+            self.units.push(CrateLintUnit {
+                root_path,
+                dir_prefix,
+                is_test,
+                is_lib,
+                cfg: cfg_slice,
+                root_marks,
+            });
+        }
+    }
+
+    /// Finds the owning workspace unit for checkout-relative `path`: exact `root_path` match first
+    /// (preferring non-test), else longest matching `dir_prefix` (preferring non-test and `lib.rs`).
+    pub(crate) fn unit_for(&self, path: &str) -> Option<&CrateLintUnit<'f>> {
+        let exact = self
+            .units
+            .iter()
+            .filter(|u| u.root_path == path)
+            .min_by_key(|u| u.is_test);
+        if exact.is_some() {
+            return exact;
+        }
+        let mut best: Option<&CrateLintUnit<'f>> = None;
+        for u in self.units.iter() {
+            if !path.starts_with(u.dir_prefix) {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some(cur) => {
+                    (u.dir_prefix.len(), !u.is_test, u.is_lib) > (cur.dir_prefix.len(), !cur.is_test, cur.is_lib)
+                }
+            };
+            if better {
+                best = Some(u);
+            }
+        }
+        best
+    }
+
+    /// Effective lint marks at byte offset `at` inside `text` (at checkout-relative `path`),
+    /// joining the owning crate root's marks and evaluating `cfg_attr(..)` against the unit's
+    /// active `cfg` atoms.
+    pub(crate) fn marks_at(&self, path: Option<&str>, text: &str, at: u32, alloc: Alloc<'_>) -> RootMarks {
+        let offset = usize::try_from(at).unwrap_or(text.len());
+        let Some(unit) = path.and_then(|p| self.unit_for(p)) else {
+            return RootMarks::read_at_in(text, offset, CfgAtoms::EMPTY, alloc);
+        };
+        let cfg = CfgAtoms(unit.cfg);
+        if path == Some(unit.root_path) {
+            RootMarks::read_at_in(text, offset, cfg, alloc)
+        } else {
+            RootMarks::read_at_under(unit.root_marks, text, offset, cfg, alloc)
+        }
+    }
+
+    /// Digest of the crate-root lint marks and active `cfg` atoms for `path`, folded into
+    /// rendered file-section keys so editing crate-root lint attributes invalidates submodule
+    /// sections (Rule 21).
+    pub(crate) fn section_salt(&self, path: &str) -> ContentId {
+        let mut h = Hasher::new("blaze-cli lint section salt 1");
+        if let Some(unit) = self.unit_for(path) {
+            h.update(&unit.root_marks.level_bytes());
+            h.update(&u64::try_from(unit.cfg.len()).unwrap_or(u64::MAX).to_le_bytes());
+            for &(name, val) in unit.cfg {
+                h.part(name.as_bytes()).opt_part(val.map(str::as_bytes));
+            }
+        }
+        h.finish()
+    }
 }
 
 /// Why the root manifest's lints could not be read: each names the key (rule 19).

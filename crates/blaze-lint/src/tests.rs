@@ -924,11 +924,15 @@ fn deprecated_safe_2024_lint_levels_and_groups() {
 
 #[test]
 fn read_at_lexical_scopes_and_warnings_meta_lint() {
+    use crate::CfgAtoms;
+    let alloc: blaze_own::Alloc<'_> = blaze_own::testing::bump().into();
     let rule = Rule::DeprecatedSafe2024;
-    let level_at = |src: &str, needle: &str| {
+    let unsafe_op = Rule::UnsafeOpInUnsafeFn;
+    let level_at_cfg = |src: &str, needle: &str, cfg: CfgAtoms<'_>, r: Rule| {
         let at = src.find(needle).unwrap_or_else(|| panic!("missing `{needle}` in:\n{src}"));
-        RootMarks::read_at(src, at).levels(Step::Rust.levels()).of(rule)
+        RootMarks::read_at_in(src, at, cfg, alloc).levels(Step::Rust.levels()).of(r)
     };
+    let level_at = |src: &str, needle: &str| level_at_cfg(src, needle, CfgAtoms::EMPTY, rule);
 
     // 1. Item-scoped `#[deny]` under default `Allow`, not leaking to sibling item.
     let item_deny = r#"
@@ -1011,7 +1015,13 @@ pub fn outside_mod() {
     let forbid_src = "#![forbid(deprecated_safe_2024)]\n#[allow(deprecated_safe_2024)]\npub fn f() { call_f(); }\n";
     assert_eq!(level_at(forbid_src, "call_f"), Level::Error);
 
-    // 5. `warnings` meta-lint: affects `Warn`-resolved lints only, honoring `forbid`.
+    // 5. `rust_2024_compatibility` includes BOTH `deprecated_safe_2024` AND `unsafe_op_in_unsafe_fn`.
+    let compat = RootMarks::read("#![deny(rust_2024_compatibility)]\n");
+    assert_eq!(compat.levels(Step::Rust.levels()).of(rule), Level::Error);
+    assert_eq!(compat.levels(Step::Rust.levels()).of(unsafe_op), Level::Error);
+
+    // 6. `warnings` meta-lint: affects `Warn`-resolved lints only, and `forbid(warnings)` blocks
+    //    inner specific `#[allow(...)]` on any lint that is warned (or warn-by-default).
     assert_eq!(RootMarks::read("#![deny(warnings)]\n").levels(Step::Rust.levels()).of(rule), Level::Off);
     assert_eq!(RootMarks::read("#![warn(deprecated_safe_2024)]\n#![deny(warnings)]\n").levels(Step::Rust.levels()).of(rule), Level::Error);
     assert_eq!(RootMarks::read("#![deny(warnings)]\n#![warn(deprecated_safe_2024)]\n").levels(Step::Rust.levels()).of(rule), Level::Error);
@@ -1023,19 +1033,97 @@ pub fn outside_mod() {
 #![deny(warnings)]
 #![warn(deprecated_safe_2024)]
 #[allow(warnings)]
-pub fn ok() { call_ok(); }
+pub fn ok_w() { call_ok_w(); }
+#[allow(deprecated_safe_2024)]
+pub fn ok_spec() { call_ok_spec(); }
 pub fn err() { call_err(); }
 "#;
-    assert_eq!(level_at(warn_deny_override, "call_ok"), Level::Off);
+    assert_eq!(level_at(warn_deny_override, "call_ok_w"), Level::Off);
+    assert_eq!(level_at(warn_deny_override, "call_ok_spec"), Level::Off);
     assert_eq!(level_at(warn_deny_override, "call_err"), Level::Error);
 
-    let warn_forbid = r#"
+    // `#![forbid(warnings)]` blocks inner `#[allow(warnings)]`, inner `#[allow(deprecated_safe_2024)]`
+    // (when warned), and inner `#[allow(unsafe_op_in_unsafe_fn)]` (warn-by-default).
+    let warn_forbid_spec = r#"
 #![forbid(warnings)]
 #![warn(deprecated_safe_2024)]
 #[allow(warnings)]
-pub fn still_err() { call_err(); }
+pub fn still_err_w() { call_w(); }
+#[allow(deprecated_safe_2024)]
+pub fn still_err_spec() { call_spec(); }
+#[allow(unsafe_op_in_unsafe_fn)]
+pub unsafe fn still_err_uop() { call_uop(); }
 "#;
-    assert_eq!(level_at(warn_forbid, "call_err"), Level::Error);
+    assert_eq!(level_at(warn_forbid_spec, "call_w"), Level::Error);
+    assert_eq!(level_at(warn_forbid_spec, "call_spec"), Level::Error);
+    assert_eq!(level_at_cfg(warn_forbid_spec, "call_uop", CfgAtoms::EMPTY, unsafe_op), Level::Error);
+    // Cross-file `read_at_under`: crate-root `#![forbid(warnings)]` + submodule `#![warn(..)]`
+    // + inner `#[allow(..)]` stays forbidden.
+    let sub_root = RootMarks::read("#![forbid(warnings)]\n");
+    let sub_src = "#![warn(deprecated_safe_2024)]\n#[allow(deprecated_safe_2024)]\npub fn f() { call_sub(); }\n";
+    let sub_off = sub_src.find("call_sub").expect("needle");
+    let sub_marks = RootMarks::read_at_under(sub_root, sub_src, sub_off, CfgAtoms::EMPTY, alloc);
+    assert_eq!(sub_marks.levels(Step::Rust.levels()).of(rule), Level::Error);
+    // Control: `allow` BEFORE `forbid(warnings)` stays allowed.
+    let allow_before_forbid = "#![allow(unsafe_op_in_unsafe_fn)]\n#![forbid(warnings)]\npub unsafe fn f() { call_f(); }\n";
+    assert_eq!(level_at_cfg(allow_before_forbid, "call_f", CfgAtoms::EMPTY, unsafe_op), Level::Off);
+
+    // 7. Active & inactive `cfg_attr` (including nested and multi-attr `cfg_attr`).
+    let unix_strict = CfgAtoms(&[("unix", None), ("feature", Some("strict"))]);
+    let win_plain = CfgAtoms(&[("windows", None)]);
+    let cfg_src = r#"
+#![cfg_attr(unix, deny(rust_2024_compatibility))]
+#[cfg_attr(all(unix, feature = "strict"), allow(deprecated_safe_2024))]
+pub fn f_allowed_on_strict() { call_a(); }
+#[cfg_attr(not(unix), allow(deprecated_safe_2024))]
+pub fn f_denied_on_unix() { call_b(); }
+#[cfg_attr(unix, cfg_attr(all(), warn(deprecated_safe_2024), deny(warnings)))]
+pub fn f_nested_cfg() { call_c(); }
+"#;
+    assert_eq!(level_at_cfg(cfg_src, "call_a", unix_strict, rule), Level::Off);
+    assert_eq!(level_at_cfg(cfg_src, "call_b", unix_strict, rule), Level::Error);
+    assert_eq!(level_at_cfg(cfg_src, "call_b", win_plain, rule), Level::Off);
+    assert_eq!(level_at_cfg(cfg_src, "call_c", unix_strict, rule), Level::Error);
+    assert_eq!(level_at_cfg(cfg_src, "call_c", win_plain, rule), Level::Off);
+
+    // 8. Signature const blocks (`fn f() -> Foo<{ 1 }>`) preserve outer item lint attributes.
+    let const_sig = r#"
+#[deny(deprecated_safe_2024)]
+pub fn with_const() -> Foo<{ 1 }> {
+    call_in_const_sig();
+}
+#[deny(deprecated_safe_2024)]
+pub fn with_nested_const() -> Foo<Bar<{ 1 + 2 }>> {
+    call_in_nested_const();
+}
+pub fn after_const_sig() {
+    call_after_const();
+}
+"#;
+    assert_eq!(level_at(const_sig, "call_in_const_sig"), Level::Error);
+    assert_eq!(level_at(const_sig, "call_in_nested_const"), Level::Error);
+    assert_eq!(level_at(const_sig, "call_after_const"), Level::Off);
+
+    // 9. Deep nesting (> 150 scopes) preserves lint attributes without silently dropping them.
+    let mut deep = std::string::String::from("#[deny(deprecated_safe_2024)]\npub fn deep() ");
+    for _ in 0..160 {
+        deep.push_str("{ ");
+    }
+    deep.push_str("call_deep();");
+    for _ in 0..160 {
+        deep.push_str(" }");
+    }
+    assert_eq!(level_at(&deep, "call_deep"), Level::Error);
+
+    let mut deep_allow = std::string::String::from("#![deny(deprecated_safe_2024)]\npub fn deep() ");
+    for _ in 0..160 {
+        deep_allow.push_str("{ ");
+    }
+    deep_allow.push_str("#[allow(deprecated_safe_2024)] call_deep_allow();");
+    for _ in 0..160 {
+        deep_allow.push_str(" }");
+    }
+    assert_eq!(level_at(&deep_allow, "call_deep_allow"), Level::Off);
 }
 
 /// Expected: "test tests::lock_without_reason ... ok".

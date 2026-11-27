@@ -1772,11 +1772,69 @@ fn engine_check_deprecated_safe_2024_lint_levels() {
 
     let (w, e, out) = run_raw(
         30,
-        "#![forbid(warnings)]\n#![warn(deprecated_safe_2024)]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\n#[allow(warnings)]\npub fn still_forbidden() { set_var_like(); }\n",
+        "#![forbid(warnings)]\n#![warn(deprecated_safe_2024)]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\n#[allow(warnings)]\npub fn still_forbidden() { set_var_like(); }\n#[allow(deprecated_safe_2024)]\npub fn still_forbidden_specific() { set_var_like(); }\n",
     );
-    assert_eq!(e.len(), 1, "forbid(warnings) must not be downgraded by inner allow(warnings):\n{out}");
-    assert!(e[0].contains("deprecated-safe-2024"), "error names lint:\n{out}");
+    assert_eq!(e.len(), 2, "forbid(warnings) must block both allow(warnings) and specific allow(deprecated_safe_2024):\n{out}");
     assert!(w.is_empty(), "no warnings:\n{out}");
+
+    // 8. Multi-file crate: `#![deny(rust_2024_compatibility)]` in `src/lib.rs` applies to calls in
+    //    `src/foo.rs`, and `#[allow(deprecated_safe_2024)]` inside `src/foo.rs` overrides it.
+    let io_mod = Io::simulated(SimWorld::new(31, Limits::USUAL));
+    write(&io_mod, "Cargo.toml", MANIFEST_2021);
+    write(
+        &io_mod,
+        "src/lib.rs",
+        "#![deny(rust_2024_compatibility)]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub mod foo;\n",
+    );
+    write(
+        &io_mod,
+        "src/foo.rs",
+        "pub fn denied_in_sub() { crate::set_var_like(); }\n#[allow(deprecated_safe_2024)]\npub fn allowed_in_sub() { crate::set_var_like(); }\n",
+    );
+    let (_, lines_mod, _) = said(&io_mod, false);
+    let out_mod = lines_mod.join("\n");
+    let errs_mod = error_lines(&out_mod);
+    assert_eq!(errs_mod.len(), 1, "crate-root deny must fail submodule call in src/foo.rs:\n{out_mod}");
+    assert!(errs_mod[0].contains("src/foo.rs:1:") && errs_mod[0].contains("deprecated-safe-2024"), "error in src/foo.rs:1:\n{out_mod}");
+
+    // 9. `rust_2024_compatibility` includes `unsafe_op_in_unsafe_fn` (Edition 2024 error).
+    let io_uop = Io::simulated(SimWorld::new(32, Limits::USUAL));
+    write(&io_uop, "Cargo.toml", MANIFEST);
+    write(&io_uop, "src/lib.rs", "#![deny(rust_2024_compatibility)]\npub unsafe fn read(p: *const u8) -> u8 { *p }\n");
+    let (_, lines_uop, _) = said(&io_uop, false);
+    let out_uop = lines_uop.join("\n");
+    let errs_uop = error_lines(&out_uop);
+    assert_eq!(errs_uop.len(), 1, "rust_2024_compatibility must deny unsafe_op_in_unsafe_fn:\n{out_uop}");
+    assert!(errs_uop[0].contains("unsafe-op-in-unsafe-fn"), "error names unsafe-op-in-unsafe-fn:\n{out_uop}");
+
+    // 10. Active & inactive `cfg_attr` lint attributes evaluated against the unit's real cfg.
+    let (_, errs_cfg_on, out_cfg_on) = run_raw(
+        33,
+        "#![cfg_attr(unix, deny(rust_2024_compatibility))]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub fn caller() { set_var_like(); }\n",
+    );
+    assert_eq!(errs_cfg_on.len(), 1, "active cfg_attr(unix, deny(..)) must fail on unix:\n{out_cfg_on}");
+
+    let (warns_cfg_off, errs_cfg_off, out_cfg_off) = run_raw(
+        34,
+        "#![cfg_attr(not(unix), deny(rust_2024_compatibility))]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub fn caller() { set_var_like(); }\n",
+    );
+    assert!(errs_cfg_off.is_empty() && warns_cfg_off.is_empty(), "inactive cfg_attr(not(unix), ..) must stay clean on unix:\n{out_cfg_off}");
+
+    let (warns_cfg_allow, errs_cfg_allow, out_cfg_allow) = run_raw(
+        36,
+        "#![deny(deprecated_safe_2024)]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\n#[cfg_attr(unix, allow(deprecated_safe_2024))]\npub fn allowed_on_unix() { set_var_like(); }\n#[cfg_attr(not(unix), allow(deprecated_safe_2024))]\npub fn denied_on_unix() { set_var_like(); }\n",
+    );
+    assert_eq!(errs_cfg_allow.len(), 1, "active cfg_attr(unix, allow(..)) suppresses only allowed_on_unix:\n{out_cfg_allow}");
+    assert!(errs_cfg_allow[0].contains("src/lib.rs:8:"), "error at line 8 (denied_on_unix):\n{out_cfg_allow}");
+    assert!(warns_cfg_allow.is_empty(), "no warnings:\n{out_cfg_allow}");
+
+    // 11. Signature const block `fn f() -> Foo<{ 1 }> { ... }` preserves item `#[deny]`.
+    let (_, errs_const, out_const) = run_raw(
+        35,
+        "#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\npub struct Foo<const N: usize>;\n#[deny(deprecated_safe_2024)]\npub fn with_const_sig() -> Foo<{ 1 }> { set_var_like(); Foo }\n",
+    );
+    assert_eq!(errs_const.len(), 1, "signature const block must not clear item #[deny]:\n{out_const}");
+    assert!(errs_const[0].contains("deprecated-safe-2024"), "error names lint:\n{out_const}");
 }
 
 /// A workspace of one member, `app`, under the `suggest` step, its module `a` holding `f`, which
