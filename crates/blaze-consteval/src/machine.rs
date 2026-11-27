@@ -14,10 +14,10 @@ use blaze_build::vtable::{VtableKey, VtableRef, vtable_key};
 use blaze_build::{InstanceKey, instance_key};
 use blaze_ids::ContentId;
 use blaze_own::{Alloc, Vec};
-use blaze_typeck::{AdtKind, BinOp, FloatTy, IntTy, ItemKey, List, Mutbl, Name, PNode, PTy, PTys, PortableTys, UnOp};
+use blaze_typeck::{AdtKind, BinOp, FloatTy, IntTy, ItemKey, List, Mutbl, Name, PNode, PTy, PTys, PortableTys, UintTy, UnOp};
 
 pub use code::Codes;
-use code::{Code, CodeTable, EnumFacts, Meta, Num, Op, Reg, TyInfo, Valid};
+use code::{Code, CodeTable, EnumFacts, Meta, Num, Op, Reg, StrKind, TyInfo, Valid};
 
 // The rules on bits live in `arith` (rule 30); `code`, `late` and the tests reach them here.
 pub(crate) use crate::arith::{Plant, int_binop, int_info, mask, sext};
@@ -944,10 +944,10 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                     }
                 };
                 let p = Pointer { alloc: id, offset: 0 };
-                let out = if lit.wide {
-                    Out::Pair(Pair::of(Scalar::Ptr(p), Scalar::Int(u128::from(lit.len))))
-                } else {
-                    Out::Ptr(p)
+                let out = match lit.kind {
+                    StrKind::Wide => Out::Pair(Pair::of(Scalar::Ptr(p), Scalar::Int(u128::from(lit.len)))),
+                    StrKind::Thin => Out::Ptr(p),
+                    StrKind::Mem => Out::Mem(p),
                 };
                 self.set(b, dst, out);
             }
@@ -2881,6 +2881,9 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 if n != m {
                     return Ok(false);
                 }
+                if n == 0 {
+                    return Ok(true);
+                }
                 let (pa, pb) = (self.deref(Val::Pair(p))?.ptr()?, self.deref(Val::Pair(q))?.ptr()?);
                 self.ensure_loaded(pa.alloc)?;
                 self.ensure_loaded(pb.alloc)?;
@@ -2888,9 +2891,35 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 let right = self.work.mem.read_bytes(pb, m as u64)?;
                 left == right
             }
+            (Val::Ptr(pa), Val::Ptr(pb)) => {
+                let PNode::Ref(_, inner) = self.node(t)? else {
+                    return Err(unsupported("a pattern compared with a value of this shape"));
+                };
+                self.same_byte_array(pa, pb, inner)?
+            }
+            (Val::Mem(pa), Val::Mem(pb)) => self.same_byte_array(pa, pb, t)?,
             (Val::Zst, Val::Zst) => true,
             _ => return Err(unsupported("a pattern compared with a value of this shape")),
         })
+    }
+
+    /// Two `[u8; N]` byte arrays at `pa` and `pb` compare equal.
+    fn same_byte_array(&mut self, pa: Pointer, pb: Pointer, arr: PTy) -> R<'a, bool> {
+        let PNode::Array(elem, len) = self.node(arr)? else {
+            return Err(unsupported("a pattern compared with a value of this shape"));
+        };
+        if self.node(elem)? != PNode::Uint(UintTy::U8) {
+            return Err(unsupported("a pattern compared with a value of this shape"));
+        }
+        let n = self.len(len)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        self.ensure_loaded(pa.alloc)?;
+        self.ensure_loaded(pb.alloc)?;
+        let left = self.work.mem.read_bytes(pa, n)?;
+        let right = self.work.mem.read_bytes(pb, n)?;
+        Ok(left == right)
     }
 
     // ---- The result ----

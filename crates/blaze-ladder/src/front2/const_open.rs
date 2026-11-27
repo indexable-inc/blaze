@@ -576,4 +576,84 @@ pub fn local_const_repeat_sibling_const_ok() -> [u8; 4] {
             assert!(err.contains("is not a constant"), "`{bad}` refusal did not name non-const: {err}");
         }
     }
+
+    #[test]
+    fn byte_string_literal_patterns_eval_through_front2() {
+        const BYTESTR_APP: &str = r#"#![no_std]
+pub const fn slot_tag(bytes: &[u8]) -> usize {
+    match bytes {
+        b"newfunc" => 1,
+        b"" => 2,
+        b"abcdefg" => 3,
+        b"hi" => 4,
+        _ => 5,
+    }
+}
+pub const fn arr3_tag(bytes: &[u8; 3]) -> usize {
+    match bytes {
+        b"abc" => 6,
+        _ => 7,
+    }
+}
+pub const fn str_tag(s: &str) -> usize {
+    match s {
+        "hello" => 8,
+        _ => 9,
+    }
+}
+pub const fn expr_coerce() -> usize {
+    let s: &[u8] = b"hello";
+    match s {
+        b"hello" => 10,
+        _ => 11,
+    }
+}
+pub const PAT_ARR3: &[u8; 3] = b"abc";
+pub const fn const_arr3_tag(bytes: &[u8; 3]) -> usize {
+    match bytes {
+        PAT_ARR3 => 12,
+        _ => 13,
+    }
+}
+pub const U32_ONE: &u32 = &1u32;
+pub const fn ptr_refused() -> usize {
+    let x = 1u32;
+    match &x {
+        U32_ONE => 1,
+        _ => 2,
+    }
+}
+pub fn slice_match_ok() -> [u8; 1] { [0u8; slot_tag(b"newfunc")] }
+pub fn slice_empty_ok() -> [u8; 2] { [0u8; slot_tag(b"")] }
+pub fn slice_same_len_miss_ok() -> [u8; 5] { [0u8; slot_tag(b"newfunx")] }
+pub fn slice_diff_len_miss_ok() -> [u8; 5] { [0u8; slot_tag(b"longer")] }
+pub fn arr3_match_ok() -> [u8; 6] { [0u8; arr3_tag(b"abc")] }
+pub fn arr3_miss_ok() -> [u8; 7] { [0u8; arr3_tag(b"abd")] }
+pub fn str_match_ok() -> [u8; 8] { [0u8; str_tag("hello")] }
+pub fn expr_coerce_ok() -> [u8; 10] { [0u8; expr_coerce()] }
+pub fn const_arr3_hit_ok() -> [u8; 12] { [0u8; const_arr3_tag(&[b'a', b'b', b'c'])] }
+pub fn const_arr3_miss_ok() -> [u8; 13] { [0u8; const_arr3_tag(&[b'a', b'b', b'd'])] }
+pub fn slice_match_wrong() -> [u8; 99] { [0u8; slot_tag(b"newfunc")] }
+pub fn ptr_refused_check() -> [u8; 1] { [0u8; ptr_refused()] }
+"#;
+        for ok in [
+            "slice_match_ok",
+            "slice_empty_ok",
+            "slice_same_len_miss_ok",
+            "slice_diff_len_miss_ok",
+            "arr3_match_ok",
+            "arr3_miss_ok",
+            "str_match_ok",
+            "expr_coerce_ok",
+            "const_arr3_hit_ok",
+            "const_arr3_miss_ok",
+        ] {
+            let diags = check_fn(BYTESTR_APP, ok).unwrap_or_else(|e| panic!("`{ok}` was refused: {e}"));
+            assert!(diags.is_empty(), "`{ok}` had unexpected diagnostics: {diags:?}");
+        }
+        let wrong = check_fn(BYTESTR_APP, "slice_match_wrong").expect("slice_match_wrong should typecheck with E0308");
+        assert!(wrong.contains(&"E0308"), "expected E0308, got {wrong:?}");
+        let refused = check_fn(BYTESTR_APP, "ptr_refused_check").expect_err("non-byte-array `&u32` pattern must be refused");
+        assert!(refused.contains("value of this shape"), "expected shape refusal, got: {refused}");
+    }
 }
