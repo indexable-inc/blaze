@@ -399,6 +399,12 @@ pub const WASM_MODULE_HEADER: &str = "blaze build-script module 4";
 /// still selecting one version cleanly (no `Ambiguous` collisions).
 pub const NATIVE_MODULE_HEADER: &str = "blaze build-script module 3";
 
+/// Native host build-script module identity header written by the native bootstrap builder
+/// (`blaze build-script module native 1`, D69). Accepted by native lookups alongside
+/// [`NATIVE_MODULE_HEADER`] so pre-built Tier-2 native host binaries (`reth-mdbx-sys`,
+/// `sha3-asm`, `libproc`, `librocksdb-sys`, etc.) resolve cleanly without re-bootstrapping.
+pub const NATIVE_BOOTSTRAP_HEADER: &str = "blaze build-script module native 1";
+
 /// The identity line a wasm module must carry to be run by this host: `shim <sha256 hex>`.
 pub fn shim_line() -> String {
     format!("shim {}", crate::module::sha256_hex(SHIM))
@@ -428,10 +434,15 @@ fn module_where(
     let shim = shim_line();
     let mut fits = records(store)?.into_iter().filter(|(_, identity)| {
         // Every build-script record must carry the expected header for its runner (`WASM_MODULE_HEADER`
-        // for wasm, `NATIVE_MODULE_HEADER` for native), and a wasm module must also carry the shim
-        // this host speaks to: one built with another header or shim is not this ask's record, so
-        // stale records never match and never collide as `Ambiguous`.
-        let header_fits = identity.lines().next() == Some(expected_header);
+        // for wasm, `NATIVE_MODULE_HEADER` or `NATIVE_BOOTSTRAP_HEADER` for native), and a wasm
+        // module must also carry the shim this host speaks to: one built with another header or
+        // shim is not this ask's record, so stale records never match and never collide as `Ambiguous`.
+        let first_line = identity.lines().next();
+        let header_fits = if target.is_some() {
+            first_line == Some(NATIVE_MODULE_HEADER) || first_line == Some(NATIVE_BOOTSTRAP_HEADER)
+        } else {
+            first_line == Some(expected_header)
+        };
         let runner_fits = match &target {
             Some(want) => identity.lines().any(|l| l == want),
             None => !identity.lines().any(|l| l.starts_with("target ")) && identity.lines().any(|l| l == shim),
@@ -1014,6 +1025,24 @@ mod tests {
         .expect("write native v3 identity");
         let hit = super::module_of_native(&store, "libproc", "0.14.11", &[], host).expect("lookup native v3");
         assert_eq!(hit, Some(v3_dir));
+
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn native_lookup_accepts_native_1_bootstrap_header() {
+        let store = std::env::temp_dir().join(format!("blaze-script-unit-native1-header-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let host = "aarch64-apple-darwin";
+        let native1_dir = store.join("build-script/modules/existing-native-1");
+        std::fs::create_dir_all(&native1_dir).expect("create native 1 dir");
+        std::fs::write(
+            native1_dir.join("identity"),
+            format!("{}\nname reth-mdbx-sys\nversion 2.11.0\nfeatures \ntarget {host}\n", super::NATIVE_BOOTSTRAP_HEADER),
+        )
+        .expect("write native 1 identity");
+        let hit = super::module_of_native_files(&store, "reth-mdbx-sys", "2.11.0", &[], host, None).expect("lookup native 1");
+        assert_eq!(hit, Some(native1_dir));
 
         let _ = std::fs::remove_dir_all(&store);
     }
