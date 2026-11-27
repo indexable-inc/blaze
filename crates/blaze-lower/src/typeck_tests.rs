@@ -2143,3 +2143,26 @@ fn closure_param_regions_descend_into_fn_ptr_and_for_binders() {
         ]
     );
 }
+
+/// Zero-padded captured width (`format_args!("{x:0full$x}")`) and precision (`{x:#0full$.prec$x}`)
+/// must capture `full`/`prec` as format arguments (matching `typeck::fmt_spec`) rather than
+/// swallowing the leading `0` flag into the identifier scan.
+#[test]
+fn format_args_zero_padded_captured_width_and_precision() {
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let src = r#"fn f(x: u32, full: usize, prec: usize) {
+        let _ = format_args!("{x:0full$x}");
+        let _ = format_args!("{x:#0full$.prec$x}");
+        let _ = format_args!("{x:0<full$}");
+    }"#;
+    let body = lower_body(src, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc).expect("lower");
+    let view = body.view();
+    let mut tys = PortableTys::new_in(alloc);
+    let mut types = PrimTypes;
+    let converted = to_typeck(&view, ItemKey(0), &mut tys, &mut types, alloc)
+        .unwrap_or_else(|e| panic!("format_args convert refused: {e:?}"));
+    // Each of the 3 format_args! calls should record width/precision Count uses.
+    let count_uses = converted.fmt_uses.iter().filter(|u| u.trait_ == blaze_typeck::FmtTrait::Count).count();
+    assert_eq!(count_uses, 4, "expected 4 Count uses (full, full, prec, full); got {:?}", converted.fmt_uses);
+}
