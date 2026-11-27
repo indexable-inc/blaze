@@ -820,6 +820,7 @@ fn edge_at<'l, R>(
     };
     let mut shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
     shown.each = flags.each;
+    shown.verbose = flags.verbose;
     // `check` owns stdout for the request, so a standing answer may transfer its persisted
     // rendered bytes in one write.  The first quiet pass of `--fix` remains ineligible through
     // `Shown::ready_to_replay` and therefore never publishes a view it did not print.
