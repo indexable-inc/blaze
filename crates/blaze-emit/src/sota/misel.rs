@@ -1924,7 +1924,7 @@ struct SelectOut<'a> {
     mfunc: MFunc<'a>,
     targets: TargetTable<'a>,
     relro: RelroData<'a>,
-    trap_kinds: Vec<(TrapKind, Option<u32>), Alloc<'a>>,
+    trap_kinds: Vec<(TrapKind, Option<u32>, Held), Alloc<'a>>,
     unwind_entries: Vec<Option<(MBlock, blaze_code::unwind::Action)>, Alloc<'a>>,
     block_weights: Vec<u32, Alloc<'a>>,
     call_clobbers_seq: Vec<CallClobbers, Alloc<'a>>,
@@ -1946,9 +1946,10 @@ struct Selector<'a, 'v> {
     targets: TargetTable<'a>,
     relro: RelroData<'a>,
     data_relro_off: Vec<Option<u32>, Alloc<'a>>,
-    trap_kinds: Vec<(TrapKind, Option<u32>), Alloc<'a>>,
+    trap_kinds: Vec<(TrapKind, Option<u32>, Held), Alloc<'a>>,
     unwind_entries: Vec<Option<(MBlock, blaze_code::unwind::Action)>, Alloc<'a>>,
     unreach_ord: Vec<u32, Alloc<'a>>,
+    sole_switch_default: Vec<u32, Alloc<'a>>,
     block_weights: Vec<u32, Alloc<'a>>,
     call_clobbers_seq: Vec<CallClobbers, Alloc<'a>>,
     incoming_stack_params: Vec<IncomingStackParam, Alloc<'a>>,
@@ -5467,7 +5468,23 @@ impl<'a, 'v> Selector<'a, 'v> {
                 let imm = u16_of(BRK_UNREACHABLE).unwrap_or(0xff02);
                 let trap_idx = u32_of(self.trap_kinds.len()).unwrap_or(u32::MAX);
                 let ord = self.unreach_ord.get(inst).copied().filter(|&o| o != NONE_U32);
-                self.trap_kinds.push((TrapKind::Intrinsic, ord));
+                let mut held = Held::Unknown;
+                if ord.is_some()
+                    && let Some(&blk_idx) = self.inst_block.get(inst)
+                    && self.view.block(Block(blk_idx)).start == inst
+                    && let Some(&switch_term) = self.sole_switch_default.get(to_idx(blk_idx))
+                    && switch_term != NONE_U32
+                {
+                    let scrut = self.view.operands(to_idx(switch_term)).value();
+                    if self.view.ty(scrut) != Ty::I128 {
+                        let sr = self.get_val(scrut, false);
+                        scratch_pairs.clear();
+                        scratch_pairs.push((MReg::gpr(9), sr));
+                        self.mfunc.push_parallel_copy(scratch_pairs, MInstFlags::NONE);
+                        held = Held::Reg(9);
+                    }
+                }
+                self.trap_kinds.push((TrapKind::Intrinsic, ord, held));
                 let mi = self.push_op(
                     MOp::Brk { imm },
                     MInstFlags::TERMINATOR.union(MInstFlags::MAY_TRAP),
@@ -9378,6 +9395,7 @@ fn select_mfunc_ssa<'a>(
         trap_kinds: Vec::new_in(alloc),
         unwind_entries: Vec::new_in(alloc),
         unreach_ord,
+        sole_switch_default: crate::pass::frame::sole_switch_defaults(*view, alloc),
         block_weights: Vec::with_capacity_in(n_blocks * 2, alloc),
         call_clobbers_seq: Vec::new_in(alloc),
         incoming_stack_params: Vec::new_in(alloc),
@@ -10654,7 +10672,7 @@ fn build_emitted<'a>(
     unwind_frame: Option<blaze_code::unwind::Frame>,
     targets: TargetTable<'a>,
     relro: RelroData<'a>,
-    trap_kinds: &[(TrapKind, Option<u32>)],
+    trap_kinds: &[(TrapKind, Option<u32>, Held)],
     unwind_entries: &[Option<(MBlock, blaze_code::unwind::Action)>],
     alloc: Alloc<'a>,
 ) -> Result<Emitted<'a>, TierError> {
@@ -10690,15 +10708,15 @@ fn build_emitted<'a>(
 
     out.traps.reserve(encoded.trap_byte_offs.len());
     for &t in encoded.trap_byte_offs.iter() {
-        let (kind, ord) = trap_kinds
+        let (kind, ord, held) = trap_kinds
             .get(to_idx(t.trap_idx))
             .copied()
-            .unwrap_or((TrapKind::Intrinsic, None));
+            .unwrap_or((TrapKind::Intrinsic, None, Held::Unknown));
         out.traps.push(TrapRow {
             at: t.byte_off,
             kind,
             site: ord.map(|o| (0, o)),
-            held: Held::Unknown,
+            held,
             subject: None,
         });
     }

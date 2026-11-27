@@ -3970,9 +3970,10 @@ fn op_gpr_def_use_masks(op: &MOp) -> Option<(u32, u32)> {
         | MOp::Fcsel { .. }
         | MOp::B { .. }
         | MOp::BCond { .. }
-        | MOp::Brk { .. }
         | MOp::Udf
         | MOp::Nop => (0, 0),
+        // Preserve `x9` into `brk` so `Held::Reg(9)` discriminant trap reports read the switched value.
+        MOp::Brk { .. } => (0, 1u32 << 9),
         MOp::Bl
         | MOp::Blr { .. }
         | MOp::Br { .. }
