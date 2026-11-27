@@ -29,7 +29,10 @@ use blaze_own::Alloc;
 use blaze_rng::SplitMix64;
 use blaze_sim::{Broken, Config, NoPlant, Tape, check, controls};
 
-use super::{Held, Limits, MOST_CALLERS, Slot, SlotOpts, WorkerId, Workers, WorkersError, WorkersOpts, WorkersPlant, WorkersSetup, charge_wait};
+use super::{
+    Held, Limits, MOST_CALLERS, MOST_LEASE_ATTEMPTS, Slot, SlotOpts, WorkerId, Workers, WorkersError, WorkersOpts, WorkersPlant,
+    WorkersSetup, charge_wait,
+};
 use crate::io::{Io, Limits as IoLimits, SimWorld};
 
 /// A cell of the stand-in: whose it is and what was last written.
@@ -425,6 +428,9 @@ enum LeaseBroken {
     /// `lease` returned `CallersTaken` even though fewer than `callers` leases were live (or after
     /// all leases were dropped, indicating a leak).
     SpuriousFull { callers: u32, live: usize },
+    /// `lease` returned `CallersContended` unexpectedly (e.g. a leaked bitmap bit exhausted scan
+    /// passes while `leased < callers`).
+    Contended { attempts: u32, live: usize },
     /// `CallersTaken` reported the wrong limit.
     WrongBound { want: u32, got: u32 },
 }
@@ -442,6 +448,9 @@ impl fmt::Display for LeaseBroken {
             LeaseBroken::SpuriousFull { callers, live } => {
                 write!(f, "CallersTaken returned with only {live}/{callers} leases live")
             }
+            LeaseBroken::Contended { attempts, live } => {
+                write!(f, "CallersContended after {attempts} attempts with {live} leases live")
+            }
             LeaseBroken::WrongBound { want, got } => {
                 write!(f, "CallersTaken reported bound {got}, expected {want}")
             }
@@ -450,25 +459,26 @@ impl fmt::Display for LeaseBroken {
 }
 
 blaze_sim::plants! {
-    /// Planted bugs in the lock-free caller free-list stack, each caught by its oracle invariant.
+    /// Planted bugs in the multi-word caller lease bitmap, each caught by its oracle invariant.
     enum LeasePlant breaks LeaseBroken {
-        /// The lock-free caller free list as shipped.
+        /// The multi-word caller lease bitmap as shipped.
         None,
-        /// Ignores the empty-list sentinel and hands out an out-of-bounds index past `Limits::callers`.
-        BoundOffByOne => LeaseBroken::OutOfBounds { .. } | LeaseBroken::MissedBound { .. },
-        /// Returns the head index without popping `caller_head`, duplicating a live caller ID.
-        FreeListSkipsPop => LeaseBroken::Duplicate { .. },
-        /// Drops a lease without pushing its index back onto `caller_head`, leaking the slot.
-        DropLeaksSlot => LeaseBroken::SpuriousFull { .. },
+        /// Final-word mask and capacity check are skipped: hands out bits past `Limits::callers`.
+        FinalMaskSkipped => LeaseBroken::OutOfBounds { .. } | LeaseBroken::MissedBound { .. },
+        /// Dropping a lease clears word 0 instead of its own word: duplicates a live word-0 ID or
+        /// leaks the higher-word bit until `Contended`.
+        DropWrongWord => LeaseBroken::Duplicate { .. } | LeaseBroken::Contended { .. },
+        /// Dropping a lease forgets to clear its bitmap bit: leaks slots until `Contended`.
+        BitLeaked => LeaseBroken::Contended { .. },
     }
 }
 
 fn to_workers_plant(plant: LeasePlant) -> WorkersPlant {
     match plant {
         LeasePlant::None => WorkersPlant::None,
-        LeasePlant::BoundOffByOne => WorkersPlant::CallerBoundOffByOne,
-        LeasePlant::FreeListSkipsPop => WorkersPlant::CallerFreeListSkipsPop,
-        LeasePlant::DropLeaksSlot => WorkersPlant::CallerDropLeaksSlot,
+        LeasePlant::FinalMaskSkipped => WorkersPlant::CallerFinalMaskSkipped,
+        LeasePlant::DropWrongWord => WorkersPlant::CallerDropWrongWord,
+        LeasePlant::BitLeaked => WorkersPlant::CallerBitLeaked,
     }
 }
 
@@ -520,6 +530,9 @@ fn lease_sim(tape: &Tape, plant: LeasePlant) -> Result<(), Broken<LeaseBroken>> 
                     return Err(Broken::Oracle(LeaseBroken::SpuriousFull { callers, live: live.len() }));
                 }
                 Ok(())
+            }
+            Err(WorkersError::CallersContended { attempts }) => {
+                Err(Broken::Oracle(LeaseBroken::Contended { attempts, live: live.len() }))
             }
             Err(other) => Err(Broken::Harness(format!("unexpected lease error: {other}"))),
         }
@@ -645,6 +658,11 @@ fn run_concurrent_lease_contention(seed: u64, callers: u32, plant: LeasePlant) -
                                 failed.store(true, Ordering::Relaxed);
                                 break;
                             }
+                            Err(WorkersError::CallersContended { attempts }) => {
+                                broken = Some(LeaseBroken::Contended { attempts, live: held.len() });
+                                failed.store(true, Ordering::Relaxed);
+                                break;
+                            }
                             Err(other) => panic!("unexpected lease error: {other}"),
                         }
                     } else {
@@ -652,7 +670,7 @@ fn run_concurrent_lease_contention(seed: u64, callers: u32, plant: LeasePlant) -
                         let lease = held.swap_remove(pick);
                         let slot = usize::try_from(lease.id().index() - FIRST).unwrap();
                         // Release oracle slot before dropping lease (synchronized by Lease::drop's
-                        // Release CAS push -> next lease's Acquire/AcqRel CAS pop).
+                        // wait-free Release fetch_and -> next lease's Acquire CAS).
                         oracle[slot].store(false, Ordering::Release);
                         drop(lease);
                     }
@@ -717,6 +735,11 @@ fn run_concurrent_lease_contention(seed: u64, callers: u32, plant: LeasePlant) -
                                     break;
                                 }
                             }
+                            Err(WorkersError::CallersContended { attempts }) => {
+                                broken = Some(LeaseBroken::Contended { attempts, live: held.len() });
+                                failed.store(true, Ordering::Relaxed);
+                                break;
+                            }
                             Err(other) => panic!("unexpected lease error: {other}"),
                         }
                     } else {
@@ -764,6 +787,9 @@ fn run_concurrent_lease_contention(seed: u64, callers: u32, plant: LeasePlant) -
                     LeaseBroken::SpuriousFull { callers, live: reclaimed.len() }
                 });
             }
+            Err(WorkersError::CallersContended { attempts }) => {
+                return Err(LeaseBroken::Contended { attempts, live: reclaimed.len() });
+            }
             Err(other) => panic!("unexpected lease error during reclaim: {other}"),
         }
     }
@@ -798,13 +824,42 @@ fn concurrent_multiword_leases_never_duplicate_leak_or_spuriously_exhaust() {
 #[test]
 fn concurrent_multiword_lease_harness_catches_every_planted_bug() {
     for &(plant, callers) in &[
-        (LeasePlant::BoundOffByOne, 65u32),
-        (LeasePlant::FreeListSkipsPop, 130u32),
-        (LeasePlant::DropLeaksSlot, 130u32),
+        (LeasePlant::FinalMaskSkipped, 65u32),
+        (LeasePlant::DropWrongWord, 130u32),
+        (LeasePlant::BitLeaked, 130u32),
     ] {
         let caught = (1u64..=8).any(|seed| run_concurrent_lease_contention(seed, callers, plant).is_err());
         assert!(caught, "concurrent harness failed to catch planted bug {plant:?}");
     }
+}
+
+#[test]
+fn contended_lease_returns_callers_contended_and_rolls_back_reservation() {
+    const CALLERS: u32 = 130;
+    let workers = Workers::bare(WorkersSetup {
+        limits: Limits { most_workers: 2, callers: CALLERS, most_slots: 0 },
+        seed: None,
+        models: 0,
+    })
+    .expect("workers setup");
+
+    // Exhausting Step B must report `CallersContended` (never `CallersTaken`) and roll back
+    // `core.leased` so zero capacity is leaked.
+    match workers.lease_planted(WorkersPlant::CallerScanContended) {
+        Err(err @ WorkersError::CallersContended { attempts }) => {
+            assert_eq!(attempts, MOST_LEASE_ATTEMPTS);
+            let msg = format!("{err}");
+            assert!(msg.contains("contention") && msg.contains("4096"), "unexpected display: {msg}");
+        }
+        Ok(lease) => panic!("contended plant must not succeed, got {:?}", lease.id()),
+        Err(other) => panic!("expected CallersContended, got {other}"),
+    }
+
+    // Prove zero leaked capacity: all 130 caller slots remain leaseable, and the 131st fails with
+    // `CallersTaken { most: 130 }`.
+    let leases: StdVec<_> = (0..CALLERS).map(|_| workers.lease().expect("all 130 slots available after rollback")).collect();
+    assert!(matches!(workers.lease(), Err(WorkersError::CallersTaken { most: CALLERS })));
+    drop(leases);
 }
 
 #[test]
