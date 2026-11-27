@@ -810,6 +810,23 @@ impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
             {
                 Some(blaze_typeck::WrittenRegion::Elided(id))
             }
+            super::types::SlotKind::Late { binder: 0, var }
+            | super::types::SlotKind::Given(blaze_typeck::regions::Region::Late { binder: 0, var })
+                if slots
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            s.kind,
+                            super::types::SlotKind::Late { binder: 0, var: v }
+                                | super::types::SlotKind::Given(blaze_typeck::regions::Region::Late { binder: 0, var: v })
+                                if v == var
+                        )
+                    })
+                    .count()
+                    > 1 =>
+            {
+                Some(blaze_typeck::WrittenRegion::Late(var))
+            }
             _ => None,
         };
         while let Some(top) = sp.checked_sub(1) {
@@ -2563,7 +2580,9 @@ pub fn hrtb_alias_and_tuple<'a>() {
         assert_eq!(
             &lower_regions(src, "hrtb_alias_and_tuple", alloc)[..],
             &[
+                (0, step(root, 0), 0, WrittenRegion::Late(0)),
                 (0, step(root, 1), 0, WrittenRegion::Named),
+                (0, step(root, 2), 0, WrittenRegion::Late(0)),
                 (1, step(root, 1), 0, WrittenRegion::Named),
                 (1, step(root, 2), 0, WrittenRegion::Static),
                 (2, step(root, 1), 0, WrittenRegion::Named),
@@ -2640,6 +2659,32 @@ pub fn use_dyn<'a>() {
                 (1, step(root, 0), 0, WrittenRegion::Static),
                 (2, root, 0, WrittenRegion::Elided(0)),
                 (2, step(root, 0), 0, WrittenRegion::Elided(0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn closure_param_regions_records_fn_ptr_shared_late_and_static() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+        let src = r#"#![no_core]
+pub struct Wrap<'a>(&'a u8);
+pub fn use_pick() {
+    let _c = |pick: fn(&(u8, u8)) -> &u8, f: for<'a, 'b> fn(&'a u8, &'b u8) -> &'a u8, g: fn(&mut Wrap<'static>, u8) -> u8| {
+        let _ = (pick, f, g);
+    };
+}
+"#;
+        let step = |p: u64, c: u32| ClosureParamRegion::push_step(p, c).expect("step");
+        let root = ClosureParamRegion::ROOT;
+        assert_eq!(
+            &lower_regions(src, "use_pick", alloc)[..],
+            &[
+                (0, step(root, 0), 0, WrittenRegion::Late(0)),
+                (0, step(root, 1), 0, WrittenRegion::Late(0)),
+                (1, step(root, 0), 0, WrittenRegion::Late(0)),
+                (1, step(root, 2), 0, WrittenRegion::Late(0)),
+                (2, step(step(root, 0), 0), 0, WrittenRegion::Static),
             ]
         );
     }

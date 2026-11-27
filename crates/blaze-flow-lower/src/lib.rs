@@ -9051,7 +9051,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 | Expr::Ref { operand: i, .. }
                 | Expr::Cast { operand: i, .. }
                 | Expr::Block { tail: Some(i), .. } => cur = i,
-                Expr::Call { .. } => {
+                Expr::Call { callee: call_callee, args: call_args } => {
                     if let Some((callee, _)) = self.callee_of(cur)
                         && let Ok(sig) = facts.sig(callee)
                         && let Some(out_slots) = sig.output()
@@ -9059,6 +9059,25 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                         && let Some((ty, sl)) = self.extract_callable_from_head(out_ty, out_slots, heads, want, e)?
                     {
                         return Ok(Some((ty, sl, false)));
+                    }
+                    // Desugared `for pat in head`:
+                    //   match IntoIterator::into_iter(head) { mut iter => loop { match Iterator::next(&mut iter) { ... } } }
+                    // Trace `Iterator::next(&mut iter)` -> `IntoIterator::into_iter(head)` -> `head`
+                    // when `iter` is never reassigned and only mutably borrowed at this `next` call.
+                    if let Some(&[only]) = self.body.expr_lists.get(call_args.range()) {
+                        match self.expr_lang(call_callee) {
+                            Some(blaze_typeck::LangItem::IntoIterIntoIter) => {
+                                cur = only;
+                                continue;
+                            }
+                            Some(blaze_typeck::LangItem::IteratorNext) => {
+                                if let Some(head) = self.for_loop_iter_head(only)? {
+                                    cur = head;
+                                    continue;
+                                }
+                            }
+                            _ => {}
+                        }
                     }
                     return Ok(None);
                 }
@@ -9162,6 +9181,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                     if let Some(i) = self.local_binding_init(p)? {
                         cur = i;
                         continue;
+                    }
+                    // Parameter of a closure passed to a fn/method call whose declared signature
+                    // or `Fn*` clause gives the parameter's callable type (e.g.
+                    // `written(|put| ours.write(id, &mut |s| put(s)))`).
+                    if self.in_nested
+                        && let Some((ty, sl)) = self.closure_param_callee_sig(p, want, heads, e)?
+                    {
+                        return Ok(Some((ty, sl, false)));
                     }
                     // Parameter of a closure passed to a method call (e.g. `opt.and_then(|d| d(x))`).
                     if self.in_nested
@@ -9325,6 +9352,231 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             }
         }
         Ok(found)
+    }
+
+    fn expr_lang(&self, id: ExprId) -> Option<blaze_typeck::LangItem> {
+        let Expr::Path(p) = *self.body.exprs.get(id.ix())? else { return None };
+        self.body.paths.get(p.ix())?.lang
+    }
+
+    /// If `borrow` is `&mut iter` passed to a desugared `for`-loop's `Iterator::next(&mut iter)`
+    /// where `iter` is bound uniquely by `match IntoIterator::into_iter(head) { iter => ... }`,
+    /// never assigned anywhere, and mutably borrowed ONLY by `borrow`, returns `Some(head)`.
+    fn for_loop_iter_head(&self, borrow: ExprId) -> Result<Option<ExprId>, Refusal> {
+        let Expr::Ref { mutbl: Mutbl::Mut, operand } = self.expr(borrow)? else {
+            return Ok(None);
+        };
+        let Expr::Local(iter_pat) = self.expr(operand)? else {
+            return Ok(None);
+        };
+        for (i, expr) in self.body.exprs.iter().enumerate() {
+            match *expr {
+                Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. }
+                    if matches!(self.body.exprs.get(lhs.ix()), Some(&Expr::Local(q)) if q == iter_pat) =>
+                {
+                    return Ok(None);
+                }
+                Expr::Ref { mutbl: Mutbl::Mut, operand: op }
+                    if u32::try_from(i).ok() != Some(borrow.0)
+                        && matches!(self.body.exprs.get(op.ix()), Some(&Expr::Local(q)) if q == iter_pat) =>
+                {
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+        let mut head: Option<ExprId> = None;
+        for expr in self.body.exprs.iter() {
+            let Expr::Match { scrutinee, arms } = *expr else { continue };
+            let Some(arm_list) = self.body.arms.get(arms.range()) else { continue };
+            let mut matched = false;
+            for arm in arm_list.iter() {
+                if self.pat_contains(arm.pat, iter_pat)? {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                continue;
+            }
+            if head.is_some() {
+                return Ok(None);
+            }
+            let Expr::Call { callee, args } = self.expr(scrutinee)? else { return Ok(None) };
+            if self.expr_lang(callee) != Some(blaze_typeck::LangItem::IntoIterIntoIter) {
+                return Ok(None);
+            }
+            let Some(&[h]) = self.body.expr_lists.get(args.range()) else { return Ok(None) };
+            head = Some(h);
+        }
+        Ok(head)
+    }
+
+    /// If `p` is bound in parameter `pi` of a closure expression `ce` passed as an argument to a
+    /// known fn/method call `callee(..., ce, ...)` whose declared parameter type (or `Fn*` trait
+    /// clause) directly gives parameter `pi`'s head type + regions, extracts the matching callable
+    /// `(ty, slots)` from that parameter's head type.
+    fn closure_param_callee_sig(
+        &self,
+        p: PatId,
+        want: WantCallable,
+        heads: &blaze_borrow::Columns<'_>,
+        e: ExprId,
+    ) -> Result<Option<(PTy, &'b [Region])>, Refusal> {
+        let mut closure_info: Option<(ExprId, usize, usize)> = None;
+        for (i, expr) in self.body.exprs.iter().enumerate() {
+            let Expr::Closure { params, .. } = *expr else { continue };
+            let Some(plist) = self.body.pat_lists.get(params.range()) else { continue };
+            for (pi, &param_pat) in plist.iter().enumerate() {
+                if self.pat_contains(param_pat, p)? {
+                    let Ok(idx) = u32::try_from(i) else { return Ok(None) };
+                    closure_info = Some((ExprId(idx), pi, plist.len()));
+                    break;
+                }
+            }
+            if closure_info.is_some() {
+                break;
+            }
+        }
+        let Some((ce, pi, arity)) = closure_info else { return Ok(None) };
+        let matches_ce = |mut arg: ExprId| -> Result<bool, Refusal> {
+            for _ in 0..8 {
+                if arg == ce {
+                    return Ok(true);
+                }
+                match self.expr(arg)? {
+                    Expr::Paren(inner) | Expr::Ref { operand: inner, .. } => arg = inner,
+                    _ => return Ok(false),
+                }
+            }
+            Ok(false)
+        };
+        let mut call_site: Option<(ExprId, u32)> = None;
+        for (i, expr) in self.body.exprs.iter().enumerate() {
+            let Ok(idx) = u32::try_from(i) else { break };
+            let (args, offset) = match *expr {
+                Expr::Call { args, .. } => (args, 0u32),
+                Expr::MethodCall { args, .. } => (args, 1u32),
+                _ => continue,
+            };
+            let Some(alist) = self.body.expr_lists.get(args.range()) else { continue };
+            for (j, &arg) in alist.iter().enumerate() {
+                if matches_ce(arg)? {
+                    let Ok(j32) = u32::try_from(j) else { return Ok(None) };
+                    let Some(sig_idx) = j32.checked_add(offset) else { return Ok(None) };
+                    call_site = Some((ExprId(idx), sig_idx));
+                    break;
+                }
+            }
+            if call_site.is_some() {
+                break;
+            }
+        }
+        let Some((call_expr, sig_idx)) = call_site else { return Ok(None) };
+        let Some((callee, _)) = self.callee_of(call_expr) else { return Ok(None) };
+        let facts: &'b F = self.facts;
+        let Ok(sig) = facts.sig(callee) else { return Ok(None) };
+        let (Some(mut slots), Ok(mut declared)) = (sig.input(sig_idx), self.sig_declared(sig, sig_idx, e)) else {
+            return Ok(None);
+        };
+        for _ in 0..16 {
+            match self.head_node(declared, e)? {
+                PNode::Ref(_, inner) => {
+                    let Some(rest) = slots.get(1..) else { return Ok(None) };
+                    declared = inner;
+                    slots = rest;
+                }
+                PNode::Adt(k, l) if facts.adt(k).is_some_and(|a| a.lifetimes == 0) => {
+                    let list = self.head_list(l, e)?;
+                    let Some(&inner) = list.first() else { return Ok(None) };
+                    if list.len() > 2 {
+                        break;
+                    }
+                    let Ok(ic) = blaze_borrow::RegionTypes::count(heads, inner) else { break };
+                    let Some(inner_slots) = slots.get(..ic.len()) else { break };
+                    declared = inner;
+                    slots = inner_slots;
+                }
+                _ => break,
+            }
+        }
+        let extract_param = |kids: &[PTy], kids_slots: &'b [Region]| -> Result<Option<(PTy, &'b [Region])>, Refusal> {
+            let mut rest = kids_slots;
+            for (idx, &kid) in kids.iter().enumerate() {
+                let Ok(kc) = blaze_borrow::RegionTypes::count(heads, kid) else { return Ok(None) };
+                let Some((kslots, next)) = rest.split_at_checked(kc.len()) else { return Ok(None) };
+                rest = next;
+                if idx == pi {
+                    return self.extract_callable_from_head(kid, kslots, heads, want, e);
+                }
+            }
+            Ok(None)
+        };
+        match self.head_node(declared, e)? {
+            PNode::Param(tp) => {
+                let Ok(clauses) = facts.regions().clauses(callee) else { return Ok(None) };
+                let mut found: Option<(PTy, &'b [Region])> = None;
+                for cv in clauses.iter() {
+                    let PNode::ExTrait(tr, list) = self.head_node(cv.col.ty(), e)? else { continue };
+                    if !facts.is_fn_trait(tr) {
+                        continue;
+                    }
+                    let [me, tuple] = self.head_list(list, e)? else { continue };
+                    if !matches!(self.head_node(*me, e)?, PNode::Param(q) if q == tp) {
+                        continue;
+                    }
+                    let PNode::Tuple(in_list) = self.head_node(*tuple, e)? else { continue };
+                    let in_kids = self.head_list(in_list, e)?;
+                    if in_kids.len() != arity {
+                        continue;
+                    }
+                    let Some(in_slots) = cv.col.child(1) else { continue };
+                    if found.is_some() {
+                        return Ok(None);
+                    }
+                    found = Some((*tuple, in_slots));
+                }
+                let Some((tuple_ty, in_slots)) = found else { return Ok(None) };
+                let PNode::Tuple(in_list) = self.head_node(tuple_ty, e)? else { return Ok(None) };
+                extract_param(self.head_list(in_list, e)?, in_slots)
+            }
+            PNode::Dynamic(preds) => {
+                let pred_list = self.head_list(preds, e)?;
+                let Some(mut rest) = slots.get(1..) else { return Ok(None) };
+                let mut found: Option<(PTy, &'b [Region])> = None;
+                for &pred in pred_list {
+                    let Ok(pc) = blaze_borrow::RegionTypes::count(heads, pred) else { return Ok(None) };
+                    let Some((pslots, next)) = rest.split_at_checked(pc.len()) else { return Ok(None) };
+                    rest = next;
+                    let PNode::ExTrait(tr, al) = self.head_node(pred, e)? else { continue };
+                    if !facts.is_fn_trait(tr) {
+                        continue;
+                    }
+                    let [tuple] = self.head_list(al, e)? else { continue };
+                    let PNode::Tuple(in_list) = self.head_node(*tuple, e)? else { continue };
+                    if self.head_list(in_list, e)?.len() != arity {
+                        continue;
+                    }
+                    let Ok(own) = blaze_borrow::RegionTypes::own(heads, pred) else { return Ok(None) };
+                    let Some((_, in_slots)) = pslots.split_at_checked(own.len()) else { return Ok(None) };
+                    if found.is_some() {
+                        return Ok(None);
+                    }
+                    found = Some((*tuple, in_slots));
+                }
+                let Some((tuple_ty, in_slots)) = found else { return Ok(None) };
+                let PNode::Tuple(in_list) = self.head_node(tuple_ty, e)? else { return Ok(None) };
+                extract_param(self.head_list(in_list, e)?, in_slots)
+            }
+            PNode::FnPtr(fn_list, _) => {
+                let kids = self.head_list(fn_list, e)?;
+                if kids.len() != arity + 1 {
+                    return Ok(None);
+                }
+                extract_param(&kids[..arity], slots)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// If `p` is bound in a parameter pattern of a closure expression `ce` passed as an argument
@@ -9665,16 +9917,200 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
     }
 
     /// Calls a fn-pointer or `dyn Fn*` parameter of an enclosing closure (e.g.
-    /// `|edit: fn(&mut Tx)| edit(&mut tx)` or `|draw: &dyn Fn(&mut Pen<'_, '_>)| draw(pen)`)
-    /// when its return type carries zero lifetime slots and its written parameter type carries no
-    /// explicit `'static`/named lifetime annotations (so every input lifetime is higher-ranked).
+    /// `|edit: fn(&mut Tx)| edit(&mut tx)`, `|pick: fn(&Pair) -> &Item| pick(it)`,
+    /// `|make: fn(&mut Builder<Alloc<'static>, Full>, Value) -> Value| make(b, v)`, or
+    /// `|draw: &dyn Fn(&mut Pen<'_, '_>)| draw(pen)`).
+    ///
+    /// For a direct `fn(...)` parameter, walks each input and return type in DFS order aligned
+    /// with `BodyView::closure_param_regions`, reconstructing `'static` (`Region::Static`),
+    /// shared late-bound lifetimes (`WrittenRegion::Late(var)` -> shared `Region::Late`), and
+    /// independent higher-ranked input lifetimes, while refusing `WrittenRegion::Named`, stray
+    /// `WrittenRegion::Elided`, unvisited entries, and unbound output lifetime slots.
     fn call_through_closure_fn_ptr_param(&mut self, c: ExprId, args: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
         let Expr::Local(p) = self.expr(c)? else { return Ok(false) };
-        if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) || self.npos_d(dest_ty, e)? != 0 {
+        if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) {
             return Ok(false);
         }
         let Ok(c_ty) = self.expr_ty(c) else { return Ok(false) };
         let facts: &'b F = self.facts;
+        let mut found: Option<(ExprId, u32)> = None;
+        for (ix, expr) in self.body.exprs.iter().enumerate() {
+            let Expr::Closure { params, param_tys, .. } = *expr else { continue };
+            let Some(ps) = self.body.pat_lists.get(params.range()) else { continue };
+            let Some(pi) = ps.iter().position(|&q| q == p) else { continue };
+            let Some(ce_u32) = u32::try_from(ix).ok() else { return Ok(false) };
+            let Some(pi_u32) = u32::try_from(pi).ok() else { return Ok(false) };
+            let written = self.body.opt_types.get(param_tys.range()).and_then(|l| l.get(pi)).is_some_and(Option::is_some);
+            if !written {
+                return Ok(false);
+            }
+            found = Some((ExprId(ce_u32), pi_u32));
+            break;
+        }
+        let Some((ce, pi)) = found else { return Ok(false) };
+
+        // Direct `fn(...) -> ...` closure parameter: reconstruct exact `Region::Static`, shared
+        // `Region::Late`, and independent higher-ranked input slots across both inputs and output.
+        if let Ok(PNode::FnPtr(fn_list, _)) = self.node(c_ty, c) {
+            let fn_kids = self.list(fn_list, e)?;
+            if fn_kids.len() != args.len() + 1 {
+                return Ok(false);
+            }
+            let mut total_entries = 0usize;
+            for r in self.body.closure_param_regions.iter() {
+                if r.closure == ce && r.param == pi {
+                    if !matches!(r.kind, blaze_typeck::WrittenRegion::Static | blaze_typeck::WrittenRegion::Late(_)) {
+                        return Ok(false);
+                    }
+                    total_entries += 1;
+                }
+            }
+            let mut regions: Vec<Region, A> = Vec::new_in(self.alloc);
+            let mut ends: Vec<u32, A> = Vec::new_in(self.alloc);
+            let mut late_map: Vec<(u32, u32), A> = Vec::new_in(self.alloc);
+            let mut next_var = 0u32;
+            let mut matched_entries = 0usize;
+            let mut stack: Vec<(PTy, u64), A> = Vec::new_in(self.alloc);
+            for (kid_idx, &kid_ty) in fn_kids.iter().enumerate() {
+                let is_output = kid_idx == args.len();
+                let Ok(kid_u32) = u32::try_from(kid_idx) else { return Ok(false) };
+                let Some(kid_path) = blaze_typeck::ClosureParamRegion::push_step(blaze_typeck::ClosureParamRegion::ROOT, kid_u32) else {
+                    return Ok(false);
+                };
+                let start_len = regions.len();
+                stack.clear();
+                stack.push((kid_ty, kid_path));
+                let mut steps = 0u32;
+                while let Some((ty, path)) = stack.pop() {
+                    steps += 1;
+                    if steps > MOST_POSITIONS {
+                        return Ok(false);
+                    }
+                    let mut emit_slot = |own: u32| -> bool {
+                        let mut found_kind: Option<blaze_typeck::WrittenRegion> = None;
+                        for r in self.body.closure_param_regions.iter() {
+                            if r.closure == ce && r.param == pi && r.path == path && r.own == own {
+                                if found_kind.is_some() {
+                                    return false;
+                                }
+                                found_kind = Some(r.kind);
+                                matched_entries += 1;
+                            }
+                        }
+                        match found_kind {
+                            Some(blaze_typeck::WrittenRegion::Static) => {
+                                regions.push(Region::Static);
+                                true
+                            }
+                            Some(blaze_typeck::WrittenRegion::Late(id)) => {
+                                if let Some(&(_, mapped)) = late_map.iter().find(|&&(k, _)| k == id) {
+                                    regions.push(Region::Late { binder: 0, var: mapped });
+                                    true
+                                } else if is_output {
+                                    // Unbound output late lifetime (never appeared in any input).
+                                    false
+                                } else {
+                                    let mapped = next_var;
+                                    next_var += 1;
+                                    late_map.push((id, mapped));
+                                    regions.push(Region::Late { binder: 0, var: mapped });
+                                    true
+                                }
+                            }
+                            Some(
+                                blaze_typeck::WrittenRegion::Named
+                                | blaze_typeck::WrittenRegion::Elided(_)
+                                | blaze_typeck::WrittenRegion::Inferred,
+                            ) => false,
+                            None if is_output => false,
+                            None => {
+                                let mapped = next_var;
+                                next_var += 1;
+                                regions.push(Region::Late { binder: 0, var: mapped });
+                                true
+                            }
+                        }
+                    };
+                    match self.node(ty, e)? {
+                        PNode::Ref(_, inner) => {
+                            if !emit_slot(0) {
+                                return Ok(false);
+                            }
+                            let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, 0) else {
+                                return Ok(false);
+                            };
+                            stack.push((inner, next));
+                        }
+                        PNode::Ptr(_, inner) | PNode::Slice(inner) | PNode::Array(inner, _) | PNode::Pat(inner, _) => {
+                            let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, 0) else {
+                                return Ok(false);
+                            };
+                            stack.push((inner, next));
+                        }
+                        PNode::Tuple(l) => {
+                            for (ci, &child) in self.list(l, e)?.iter().enumerate().rev() {
+                                let Ok(ci_u32) = u32::try_from(ci) else { return Ok(false) };
+                                let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, ci_u32) else {
+                                    return Ok(false);
+                                };
+                                stack.push((child, next));
+                            }
+                        }
+                        PNode::Adt(k, l) => {
+                            let Some(adt) = facts.adt(k) else { return Ok(false) };
+                            for own in 0..adt.lifetimes {
+                                if !emit_slot(own) {
+                                    return Ok(false);
+                                }
+                            }
+                            for (ci, &child) in self.list(l, e)?.iter().enumerate().rev() {
+                                let Ok(ci_u32) = u32::try_from(ci) else { return Ok(false) };
+                                let Some(next) = blaze_typeck::ClosureParamRegion::push_step(path, ci_u32) else {
+                                    return Ok(false);
+                                };
+                                stack.push((child, next));
+                            }
+                        }
+                        PNode::Bool
+                        | PNode::Char
+                        | PNode::Int(_)
+                        | PNode::Uint(_)
+                        | PNode::Float(_)
+                        | PNode::Str
+                        | PNode::Never
+                        | PNode::Param(_)
+                        | PNode::ConstValue { .. }
+                        | PNode::ConstParam(_)
+                        | PNode::Infer
+                        | PNode::Error
+                        | PNode::FnDef(..) => {}
+                        _ => return Ok(false),
+                    }
+                }
+                let emitted = regions.len() - start_len;
+                if is_output {
+                    if usize::try_from(self.npos_d(dest_ty, e)?).ok() != Some(emitted) {
+                        return Ok(false);
+                    }
+                } else {
+                    if usize::try_from(self.npos_d(args[kid_idx].ty, e)?).ok() != Some(emitted) {
+                        return Ok(false);
+                    }
+                    let Ok(end_u32) = u32::try_from(regions.len()) else { return Ok(false) };
+                    ends.push(end_u32);
+                }
+            }
+            if matched_entries != total_entries {
+                return Ok(false);
+            }
+            let laid = Laid { regions: &regions, ends: &ends, bounds: &[] };
+            return self.call_laid(laid, &[], args, dest, dest_ty, e);
+        }
+
+        // Wrapped `&fn(...)` or `&dyn Fn(...)` with zero output lifetime slots.
+        if self.npos_d(dest_ty, e)? != 0 {
+            return Ok(false);
+        }
         let mut dyn_wrapper_depth: Option<u32> = None;
         let callable_arity_ok = if let Some((fp_ty, _)) = self.peel_body_fn_ptr(TyD::of(c_ty), e)?
             && let Ok(PNode::FnPtr(fn_list, _)) = self.node(fp_ty, c)
@@ -9705,21 +10141,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         if !callable_arity_ok {
             return Ok(false);
         }
-        let mut found: Option<(ExprId, u32)> = None;
-        for (ix, expr) in self.body.exprs.iter().enumerate() {
-            let Expr::Closure { params, param_tys, .. } = *expr else { continue };
-            let Some(ps) = self.body.pat_lists.get(params.range()) else { continue };
-            let Some(pi) = ps.iter().position(|&q| q == p) else { continue };
-            let Some(ce_u32) = u32::try_from(ix).ok() else { return Ok(false) };
-            let Some(pi_u32) = u32::try_from(pi).ok() else { return Ok(false) };
-            let written = self.body.opt_types.get(param_tys.range()).and_then(|l| l.get(pi)).is_some_and(Option::is_some);
-            if !written {
-                return Ok(false);
-            }
-            found = Some((ExprId(ce_u32), pi_u32));
-            break;
-        }
-        let Some((ce, pi)) = found else { return Ok(false) };
         // If any explicit `'static`, named lifetime, or non-wrapper shared elided lifetime was
         // written on this callable param, do not assume all input lifetimes are independent
         // higher-ranked binders.
