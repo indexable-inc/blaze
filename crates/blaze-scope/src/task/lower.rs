@@ -945,8 +945,9 @@ impl<'a> Attrs<'_, 'a> {
 /// requested limit (up to `u32::MAX`) and returning `Err(content)` when the attribute or its
 /// decoded value is malformed or overflows `usize`.
 fn parse_recursion_limit<'t>(content: &'t str) -> Result<u32, &'t str> {
-    let attr = head(content);
-    let Some(rest) = content.get(attr.len()..) else { return Err(content) };
+    let trimmed = skip_attr_trivia(content);
+    let attr = head(trimmed);
+    let Some(rest) = trimmed.get(attr.len()..) else { return Err(content) };
     let mut saw_any = false;
     let mut has_digits = false;
     let mut valid = true;

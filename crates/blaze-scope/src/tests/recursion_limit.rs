@@ -186,6 +186,8 @@ fn cfg_attr_recursion_limit_respects_predicate() {
 #[test]
 fn recursion_limit_accepts_comments_escapes_and_raw_strings() {
     let valid_attrs = [
+        "#![/* reason */ recursion_limit = \"256\"]",
+        "#![ // note\n recursion_limit = \"256\"]",
         "#![recursion_limit = /* comment */ \"256\"]",
         "#![recursion_limit /* before eq */ = /* after eq */ \"256\" /* after */]",
         "#![recursion_limit = // line comment\n \"256\"]",
