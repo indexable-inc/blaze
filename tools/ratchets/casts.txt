@@ -35,7 +35,7 @@ blaze-cast	40
 blaze-cc	17
 blaze-cert	14
 blaze-check	108
-blaze-cli	619
+blaze-cli	620
 blaze-cli-spec	9
 blaze-code	139
 blaze-columns	2
@@ -111,7 +111,7 @@ blaze-remote	238
 blaze-report	137
 blaze-rng	3
 blaze-run	110
-blaze-scope	933
+blaze-scope	934
 blaze-screen	13
 blaze-script	11
 blaze-sh	145
