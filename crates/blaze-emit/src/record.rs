@@ -175,7 +175,9 @@ pub(crate) fn emit_record_sourced<'a>(
         };
         record.words.push(Word { at: row.at, target, addend: row.addend });
     }
-    pass::unwind::into_record(&form.unwind, &mut record).map_err(RecordEmitError::Emit)?;
+    if (func.head.attrs & blaze_lir::func::FnAttrs::NAKED) == 0 {
+        pass::unwind::into_record(&form.unwind, &mut record).map_err(RecordEmitError::Emit)?;
+    }
     for source in traps {
         let Some(&(at, held)) = form.unreachables.get(source.ordinal as usize) else {
             return Err(RecordEmitError::TrapOrdinal { ordinal: source.ordinal, unreachables: form.unreachables.len() as u32 });

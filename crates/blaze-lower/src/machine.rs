@@ -3538,9 +3538,9 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
                 Err(w) => why = w,
             }
         }
-        // `asm!` expands (blaze-expand's `builtin # asm(..)`, lowered by `asm.rs`);
-        // `global_asm!` and `naked_asm!` have no lowering yet: refused by name, never expanded.
-        if self.library_macro(path, &["global_asm", "naked_asm"]).is_some() {
+        // `asm!` and `naked_asm!` expand (blaze-expand's `builtin # asm(..)` / `builtin # naked_asm(..)`,
+        // lowered by `asm.rs`); `global_asm!` has no lowering yet: refused by name, never expanded.
+        if self.library_macro(path, &["global_asm"]).is_some() {
             why = Why::Asm;
         }
         // A statement of a block, `m!(..);` among them, expands to statements (Rust's rule

@@ -134,7 +134,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         self.record.is_some()
     }
 
-    fn site(&mut self, at: u32, call: bool, to: SiteTo) {
+    pub(super) fn site(&mut self, at: u32, call: bool, to: SiteTo) {
         if let Some(form) = self.record.as_mut() {
             form.sites.push(SiteRow { at, call, to });
         }

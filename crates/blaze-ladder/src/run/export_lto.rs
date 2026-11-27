@@ -2477,8 +2477,9 @@ fn direct_internal_callee_idx(
 fn should_expand_non_seed(attrs: u32) -> bool {
     let is_cold = (attrs & FnAttrs::COLD) != 0;
     let is_noreturn = (attrs & FnAttrs::NORETURN) != 0;
+    let is_naked = (attrs & FnAttrs::NAKED) != 0;
     let inline_attr = FnAttrs(attrs).inline();
-    !is_noreturn && (!is_cold || inline_attr == Inline::Always)
+    !is_noreturn && !is_naked && (!is_cold || inline_attr == Inline::Always)
 }
 
 /// Decides whether a non-workspace callee reached during demand-driven export LTO BFS enters

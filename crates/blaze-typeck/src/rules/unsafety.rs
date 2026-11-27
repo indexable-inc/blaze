@@ -212,7 +212,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 {
                     self.refuse(ctx, At::Expr(e), UnsafeOp::UnionField);
                 }
-                Expr::Asm { .. } if open => self.refuse(ctx, At::Expr(e), UnsafeOp::InlineAsm),
+                // `naked_asm!` inside a `#[unsafe(naked)]` fn is safe to write without an
+                // enclosing `unsafe` block (RFC 2972: `#[unsafe(naked)]` is the unsafe boundary).
+                Expr::Asm { options, .. } if open && (options & crate::asm::ASM_NAKED) == 0 => {
+                    self.refuse(ctx, At::Expr(e), UnsafeOp::InlineAsm);
+                }
                 _ => {}
             }
             // The patterns this node binds, in its context.

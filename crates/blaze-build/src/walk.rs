@@ -570,6 +570,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Copy> {
     reached: Vec<bool, A>,
     /// Whether the code being built is reachable.
     live: bool,
+    /// Whether this function is `#[unsafe(naked)]`: no parameter slot setup, no `TrapSource` on
+    /// trailing `unreachable` (`naked_asm!` is the entire machine-code body).
+    is_naked: bool,
     /// Per expression: whether it is a block some `break` leaves.
     break_target: Vec<bool, A>,
     work: Vec<Task, A>,
@@ -951,6 +954,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         dest_slots: blaze_own::Vec::new_in(alloc),
         reached: Vec::new_in(alloc),
         live: true,
+        is_naked: false,
         break_target,
         work: Vec::new_in(alloc),
         vals: Vec::new_in(alloc),
@@ -3615,6 +3619,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         let own = self.b.sig(Conv::C, variadic, &params, &rets);
         self.b.set_signature(own);
         self.mark_nounwind(owner, abi, kind == Kind::Body)?;
+        self.is_naked = kind == Kind::Body
+            && (self.adts.fn_attrs(owner).0 & blaze_lir::func::FnAttrs::NAKED) != 0;
         let entry = self.create();
         self.reached[entry.index()] = true;
         self.begin(entry);
@@ -3670,8 +3676,13 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
             }
             return Ok(());
         }
-        // The parameters' drop scope, the outermost.
+        // The parameters' drop scope, the outermost. A `#[unsafe(naked)]` function cannot bind
+        // parameters into stack slots (`naked_asm!` only takes `sym`/`const` operands and emits
+        // the entire machine-code body with no prologue or stack frame).
         self.scope_marks.push(0);
+        if self.is_naked {
+            return self.walk_root();
+        }
         for (i, &repr) in reprs.iter().enumerate() {
             let p = self.body.params[i];
             if abi == Abi::RustCall && i + 1 == reprs.len() {
@@ -3778,6 +3789,8 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         }
         if self.live {
             self.ret_value(v)?;
+        } else if self.is_naked {
+            self.b.unreachable();
         } else {
             self.unreachable_of(TrapKind::BodyEnd, Some(self.body.root));
         }

@@ -1622,6 +1622,7 @@ fn symbols_of<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey, valu
             "rustc_nounwind" => out.nounwind = true,
             "track_caller" => out.track_caller = true,
             "cold" => out.fn_attrs.0 |= blaze_lir::func::FnAttrs::COLD,
+            "naked" => out.fn_attrs.0 |= blaze_lir::func::FnAttrs::NAKED,
             "linkage" => {
                 let t = v.text_at(a.args).map_err(|e| refuse(format!("{e:?}")))?;
                 if t.trim().trim_start_matches('=').trim().trim_matches('"') == "extern_weak" {

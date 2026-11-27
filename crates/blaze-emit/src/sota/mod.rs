@@ -969,7 +969,7 @@ pub fn can_use_internal_fast_a64(
     machine: Machine,
     role: InternalFastRole,
 ) -> bool {
-    if machine.arch != Arch::Arm64 {
+    if machine.arch != Arch::Arm64 || (view.head.attrs & FnAttrs::NAKED) != 0 {
         return false;
     }
     misel::check_misel_subset(
@@ -996,6 +996,9 @@ pub fn can_use_internal_fast_a64(
 /// - no inline `Op::Asm` / `Op::AsmBr`, and
 /// - either explicitly `FnAttrs::NOUNWIND` or a strict zero-call leaf that cannot unwind.
 fn is_safe_for_cold_preserve_all(view: blaze_lir::View<'_>) -> bool {
+    if (view.head.attrs & FnAttrs::NAKED) != 0 {
+        return false;
+    }
     for b in 0..view.blocks() {
         let Ok(b_u32) = u32::try_from(b) else {
             return false;
@@ -1176,6 +1179,12 @@ fn try_emit_sota_a64_core<'a>(
     alloc: Alloc<'a>,
 ) -> Result<Option<(CodeRecord<'a>, u32, CallClobbers)>, RecordEmitError> {
     let machine = opts.machine;
+
+    if (func.view().head.attrs & FnAttrs::NAKED) != 0 {
+        let (rec, insts, called) =
+            emit_record_sourced(func, names, routines, isa, BULK_INLINE_MOST, traps, alloc)?;
+        return Ok((rec, insts, called, CallClobbers::C_ABI_ARM64));
+    }
 
     // Mega-function mid-end bound (rule 18, matching `value_info::MAX_BLOCKS` and
     // `layout::EXACT_LOOP_MAX_BLOCKS`): above this size (e.g. generated `cranelift-isle` decision
