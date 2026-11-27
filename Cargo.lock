@@ -1371,6 +1371,7 @@ dependencies = [
 name = "blaze-ladder"
 version = "0.0.0"
 dependencies = [
+ "blaze-alloc-count",
  "blaze-ask",
  "blaze-body",
  "blaze-body-build",

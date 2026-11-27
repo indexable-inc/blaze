@@ -2030,7 +2030,7 @@ pub fn unswitch_loops<A: Allocator + Copy>(
             }
         }
 
-        verify(func.view()).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
         let cleaned = dead(func.view(), alloc)?;
         cur = coalesce_cfg(cleaned.view(), alloc)?;
         total += 1;

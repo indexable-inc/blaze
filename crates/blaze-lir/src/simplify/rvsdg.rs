@@ -888,7 +888,7 @@ pub fn co_optimize_regions<A: Allocator + Copy>(
     model: PortCostModel,
     alloc: A,
 ) -> Result<RvsdgOutput<A>, SimplifyError> {
-    verify(view).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(view, alloc).map_err(SimplifyError::Verify)?;
 
     let initial_cost = estimate_function_cost(view, model).total_cost;
     let mut best_func = view.to_func_in(alloc);
@@ -898,7 +898,7 @@ pub fn co_optimize_regions<A: Allocator + Copy>(
 
     // Strategy A: algebraic-first + masked SIMD / loop-nest fusion.
     let cand_a = run_strategy_a(view, model, alloc)?;
-    verify(cand_a.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(cand_a.view(), cand_a.allocator()).map_err(SimplifyError::Verify)?;
     rounds += 1;
     let cost_a = estimate_function_cost(cand_a.view(), model).total_cost;
     if cost_a < best_cost {
@@ -909,7 +909,7 @@ pub fn co_optimize_regions<A: Allocator + Copy>(
 
     // Strategy B: loop-fusion/interchange-first unlocking cross-loop cancellation & scalar unroll.
     let cand_b = run_strategy_b(view, alloc)?;
-    verify(cand_b.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(cand_b.view(), cand_b.allocator()).map_err(SimplifyError::Verify)?;
     rounds += 1;
     let cost_b = estimate_function_cost(cand_b.view(), model).total_cost;
     if cost_b < best_cost {
@@ -920,7 +920,7 @@ pub fn co_optimize_regions<A: Allocator + Copy>(
 
     // Strategy C: unswitching-first unlocking invariant branch hoisting + SIMD / memchr.
     let cand_c = run_strategy_c(view, model, alloc)?;
-    verify(cand_c.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(cand_c.view(), cand_c.allocator()).map_err(SimplifyError::Verify)?;
     rounds += 1;
     let cost_c = estimate_function_cost(cand_c.view(), model).total_cost;
     if cost_c < best_cost {
@@ -929,7 +929,7 @@ pub fn co_optimize_regions<A: Allocator + Copy>(
         chosen_strategy = "strategy_c_unswitch_simd";
     }
 
-    verify(best_func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(best_func.view(), best_func.allocator()).map_err(SimplifyError::Verify)?;
 
     Ok(RvsdgOutput {
         func: best_func,

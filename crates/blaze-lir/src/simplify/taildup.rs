@@ -988,7 +988,7 @@ pub fn tail_duplicate_dispatch<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(TailDupOutput {
         func,
         stats: TailDupStats {

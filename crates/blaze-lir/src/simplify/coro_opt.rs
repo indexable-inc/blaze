@@ -1842,7 +1842,7 @@ pub fn fuse_nested_coroutines<A: Allocator + Copy>(
         }
     }
 
-    verify(out.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(out.view(), out.allocator()).map_err(SimplifyError::Verify)?;
     Ok(CoroFuseOutput { func: out, stats })
 }
 

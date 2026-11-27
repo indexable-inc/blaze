@@ -1484,7 +1484,7 @@ pub fn specialize_body_const_param<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     sota_optimize_body(func.view(), opts, alloc)
 }
 
@@ -2383,7 +2383,7 @@ fn eliminate_self_tail_calls_if_any<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(Some((func, SelfTceStats { tail_calls_eliminated: sites })))
 }
 

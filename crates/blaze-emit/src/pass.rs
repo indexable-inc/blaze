@@ -2,8 +2,8 @@
 //! as it comes, branch and PC-relative fields patched once everything is placed from the list
 //! of patches the pass kept (no second walk of the input).
 
+use alloc::alloc::Allocator;
 use alloc::vec::Vec;
-use alloc::{alloc::Allocator, alloc::Global};
 
 use blaze_lir::{
     Block, Flags, IntCond, Op, Scalar, Ty, Value, View,
@@ -115,24 +115,24 @@ struct Pass<'a, 'c, A: Allocator> {
     /// The source position fields of the placed data rows, filled as the data is placed.
     positions: &'c mut Vec<PositionFix, A>,
     /// The literal words placement fills, other than the fixups': each once, in order.
-    words: Vec<RelocTo, Global>,
+    words: blaze_own::AVec<'c, RelocTo>,
     /// The `add`s that make an address in the stretch of the frame where a call's `byval`
     /// copies go, placed after the staging words once their count is known: (the first of
     /// the two words, its register, the offset in the stretch).
-    byval_fixes: Vec<(u32, Reg, u32), Global>,
+    byval_fixes: blaze_own::AVec<'c, (u32, Reg, u32)>,
     /// The most bytes one call's `byval` copies took.
     byval_most: u32,
     /// The function's own returns.
     rets: &'a [ParamRec],
-    patches: Vec<Patch, Global>,
+    patches: blaze_own::AVec<'c, Patch>,
     /// Per block, its first byte (`NONE` until placed).
-    block_at: Vec<u32, Global>,
+    block_at: blaze_own::AVec<'c, u32>,
     /// Per reference row, its literal's index (`NONE` until asked).
-    ref_literal: Vec<u32, Global>,
+    ref_literal: blaze_own::AVec<'c, u32>,
     /// Per data row, its index among `placed` (`NONE` until asked).
-    data_index: Vec<u32, Global>,
+    data_index: blaze_own::AVec<'c, u32>,
     /// The data rows `data_addr` reaches, in the order they are placed.
-    placed: Vec<u32, Global>,
+    placed: blaze_own::AVec<'c, u32>,
     /// Per value, the offset from `sp` of its cell (`NONE` for `Ty::NONE` instructions).
     cell_at: blaze_own::AVec<'c, u32>,
     /// Total bytes occupied by all cells (past the last cell's end).
@@ -152,7 +152,7 @@ struct Pass<'a, 'c, A: Allocator> {
     /// The most alignment a slot asks (at least 16): the prologue rounds `sp` down to it.
     most_align: u64,
     /// Where each landing block's `sp` restore starts (pass/stack.rs), patched with the frame.
-    sp_fixes: Vec<u32, Global>,
+    sp_fixes: blaze_own::AVec<'c, u32>,
     /// Per block, its sole empty-arg `Op::Switch` default terminator (`NONE` otherwise).
     sole_switch_default: blaze_own::AVec<'c, u32>,
     /// The block being lowered.
@@ -203,11 +203,11 @@ pub(crate) fn run<A: Allocator>(
     let most_align = slots.most_align;
     let sole_switch_default = frame::sole_switch_defaults(view, scratch);
 
-    let mut block_at = Vec::with_capacity_in(view.blocks(), Global);
+    let mut block_at = blaze_own::AVec::with_capacity_in(view.blocks(), scratch);
     block_at.resize(view.blocks(), NONE);
-    let mut ref_literal = Vec::with_capacity_in(view.refs.len(), Global);
+    let mut ref_literal = blaze_own::AVec::with_capacity_in(view.refs.len(), scratch);
     ref_literal.resize(view.refs.len(), NONE);
-    let mut data_index = Vec::with_capacity_in(view.datas.len(), Global);
+    let mut data_index = blaze_own::AVec::with_capacity_in(view.datas.len(), scratch);
     data_index.resize(view.datas.len(), NONE);
     let mut pass = Pass {
         view,
@@ -219,24 +219,24 @@ pub(crate) fn run<A: Allocator>(
         fixups,
         relocs,
         positions,
-        words: Vec::new_in(Global),
-        byval_fixes: Vec::new_in(Global),
+        words: blaze_own::AVec::new_in(scratch),
+        byval_fixes: blaze_own::AVec::new_in(scratch),
         byval_most: 0,
         rets: sig.rets,
-        patches: Vec::new_in(Global),
+        patches: blaze_own::AVec::new_in(scratch),
         block_at,
         ref_literal,
         data_index,
         cell_at: cells.cell_at,
         cells_end: cells.end,
-        placed: Vec::new_in(Global),
+        placed: blaze_own::AVec::new_in(scratch),
         slot_at: slots.slot_at,
         wide_pair_at: cells.wide_pair_at,
         staging_at: staging_at as u32,
         staging: 0,
         record,
         most_align,
-        sp_fixes: Vec::new_in(Global),
+        sp_fixes: blaze_own::AVec::new_in(scratch),
         sole_switch_default,
         block: Block(0),
         far: reach::Far::new(reach, view, scratch),
@@ -1493,7 +1493,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             _ => None,
         };
         // The copies, each at its alignment in this call's stretch of the frame.
-        let mut copies: Vec<u32, Global> = Vec::new_in(Global);
+        let mut copies: blaze_own::AVec<'_, u32> = blaze_own::AVec::new_in(self.scratch);
         let mut area = 0u32;
         for (arg, param) in args.iter().zip(sig.params) {
             if param.kind != ParamKind::Byval as u8 {
@@ -1510,7 +1510,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         self.byval_most = self.byval_most.max(area);
         let mut regs = Regs::new(isa.os);
         let mut nsaa = stack::Nsaa::new(isa.os);
-        let mut stacked: Vec<stack::StackedArg, Global> = Vec::new_in(Global);
+        let mut stacked: blaze_own::AVec<'_, stack::StackedArg> = blaze_own::AVec::new_in(self.scratch);
         let mut copy = copies.iter();
         for (arg, param) in args.iter().zip(sig.params) {
             if param.kind == ParamKind::Sret as u8 {
@@ -1723,9 +1723,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
         self.code.resize(self.code.len() + 8 * self.words.len(), 0);
         // Data rows, then the rows their relocations reach (the list grows as it is walked).
-        let mut data_at = Vec::with_capacity_in(self.placed.len(), Global);
+        let mut data_at = blaze_own::AVec::with_capacity_in(self.placed.len(), self.scratch);
         // (word, index of the data row it reaches, addend), resolved once every row is placed.
-        let mut inner: Vec<(u32, u32, i64), Global> = Vec::new_in(Global);
+        let mut inner: blaze_own::AVec<'_, (u32, u32, i64)> = blaze_own::AVec::new_in(self.scratch);
         let mut at = 0;
         while at < self.placed.len() {
             let row = self.placed[at];
@@ -1792,7 +1792,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         if self.code.len() > u32::MAX as usize / 2 {
             return Err(EmitError::TooLarge { what: "the code (2 GiB)" });
         }
-        let patches = core::mem::replace(&mut self.patches, Vec::new_in(Global));
+        let patches = core::mem::replace(&mut self.patches, blaze_own::AVec::new_in(self.scratch));
         for patch in patches.iter() {
             let to = match patch.to {
                 Label::Block(block) => self.block_at[block as usize],
@@ -1818,7 +1818,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
         // The `byval` copies' stretch, after the staging words; under 16 MiB with the copies
         // (`frame_bytes` refused it otherwise, in `place_frame`, before this).
         let byval_at = self.byval_at();
-        let fixes = core::mem::replace(&mut self.byval_fixes, Vec::new_in(Global));
+        let fixes = core::mem::replace(&mut self.byval_fixes, blaze_own::AVec::new_in(self.scratch));
         for &(at, rd, off) in fixes.iter() {
             let to = byval_at as u32 + off;
             self.set(at, enc::add_imm(rd, SP, to >> 12, true));

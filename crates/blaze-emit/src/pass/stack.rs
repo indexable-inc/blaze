@@ -238,7 +238,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
 
     /// Writes the frame's size `frame` into every [`Pass::restore_sp`].
     pub(super) fn patch_restores(&mut self, frame: u32) {
-        let fixes = core::mem::take(&mut self.sp_fixes);
+        let fixes = core::mem::replace(&mut self.sp_fixes, blaze_own::AVec::new_in(self.scratch));
         for &at in fixes.iter() {
             self.set(at, enc::sub_imm(X16, FP, frame >> 12, true));
             self.set(at + 4, enc::sub_imm(X16, X16, frame & 0xfff, false));

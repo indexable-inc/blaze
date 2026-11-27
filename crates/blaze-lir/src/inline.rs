@@ -2700,7 +2700,7 @@ fn emit<A: Allocator + Copy>(
     let view = nodes[0].view;
     // No-op fast path: nothing spliced -> verify and copy directly.
     if nodes.len() == 1 {
-        verify(view).map_err(InlineError::Verify)?;
+        crate::verify::verify_in(view, alloc).map_err(InlineError::Verify)?;
         return Ok((view.to_func_in(*alloc), Vec::new_in(*alloc)));
     }
     let mut out = view.to_func_in(*alloc);
@@ -2918,7 +2918,7 @@ fn emit<A: Allocator + Copy>(
         }
     }
     row(out.extra.len(), "extra")?;
-    verify(out.view()).map_err(InlineError::Verify)?;
+    crate::verify::verify_in(out.view(), out.allocator()).map_err(InlineError::Verify)?;
     Ok((out, imported_refs))
 }
 

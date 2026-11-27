@@ -945,7 +945,7 @@ pub fn promote_heap_to_stack<A: Allocator + Copy>(
     if u32::try_from(func.ops.len()).is_err() || u32::try_from(func.extra.len()).is_err() {
         return Err(SimplifyError::Refused { inst: 0, what: "an output past LIR's columns" });
     }
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(EscapeOutput { func, stats })
 }
 

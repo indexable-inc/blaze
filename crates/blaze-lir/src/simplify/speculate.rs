@@ -472,7 +472,7 @@ pub fn specialize_guarded_value<A: Allocator + Copy>(
     // Blocks 1+B..1+2*B: generic slow fallback clone.
     splice_body_clone(&view, &new_params, slow_entry, &mut func, &alloc);
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(SpeculateOutput {
         func,
         stats: SpeculateStats {
@@ -585,7 +585,7 @@ pub fn guard_alias_for_simd<A: Allocator + Copy>(
     // Blocks 1+fast_blocks..: untouched scalar fallback body.
     splice_body_clone(&view, &new_params, slow_entry, &mut func, &alloc);
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(SpeculateOutput {
         func,
         stats: SpeculateStats {
@@ -774,7 +774,7 @@ pub fn synthesize_osr_entry<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(OsrPlan {
         func,
         osr_header,

@@ -39,9 +39,14 @@
 //! THE ONE GROUND TABLE lives across instances in [`MakerState`]: coroutine states, pulled
 //! constants and the coroutine stash are keyed by interned types of it, as in build_from.
 //!
-//! Allocators: `Alloc<'static>` handed in by the caller (the tables this calls into take
-//! `Alloc<'static>`: `CoroutineTable::of`, lay_states.rs). `Global` is named only where run.rs's
-//! existing types fix it (`Bodies::const_at`, `BuiltParts::args`, blaze-build's `Built<Global>`).
+//! Allocators: cross-instance tables (`MakerState`'s `checked`, `ground`, `layouts`, `query_cache`,
+//! `answers`) use `Alloc<'static>` handed in by the caller. All per-function transient data
+//! (`blaze-build`'s `Built<Alloc<'f>>`, LIR optimization/verification passes, `blaze-emit`'s SOTA
+//! `MFunc`/`MRA`/`msched`/record passes, `Reach`, `ReadList`, `vtable_rows`, and `make_entry_with_vtables`)
+//! allocates in `MakerState::fn_frame`, a dedicated per-worker resettable [`blaze_mem::Frame`]
+//! reset in O(1) after every function (copying only the final encoded entry bytes into the caller's
+//! output buffer). `Global` remains only where cross-instance tables (`Bodies::const_at`,
+//! `BuiltParts` coroutine stash, `Needs`) outlive a single function.
 
 use super::*;
 
@@ -265,11 +270,58 @@ struct MadeSizes {
     code: CodeSize,
 }
 
+/// Allocator-erased borrowed view of a [`blaze_build::Built<A>`], allowing `resolve_and_emit_phase`
+/// and [`MadeSizes::of`] to read either a per-function bump-frame `Built<Alloc<'f>>` or a
+/// cross-instance coroutine-stash `Built<Global>` uniformly without cloning or allocating.
+#[derive(Clone, Copy)]
+struct BuiltRef<'b> {
+    func: blaze_lir::Verified<'b>,
+    refs: &'b [Instance],
+    statics: &'b [ItemKey],
+    thread_locals: &'b [ItemKey],
+    vtables: &'b [VtableRef],
+    traps: &'b [blaze_code::record::TrapSource],
+    copy_insts: u64,
+}
+
+impl<'b> BuiltRef<'b> {
+    fn of<A: core::alloc::Allocator>(built: &'b blaze_build::Built<A>) -> Self {
+        Self {
+            func: built.func.verified(),
+            refs: &built.refs,
+            statics: &built.statics,
+            thread_locals: &built.thread_locals,
+            vtables: &built.vtables,
+            traps: &built.traps,
+            copy_insts: built.copy_insts,
+        }
+    }
+}
+
+/// Warm per-worker bump-frame memory retained across `Frame::reset()` calls (4 MiB = 2 chunks).
+/// Ordinary functions fit inside this with zero syscalls; mega-functions expand on demand up to
+/// `blaze_mem::frame::FRAME_RESERVE` (4 GiB virtual reservation) and immediately return excess
+/// chunks/spans to the OS when the function finishes.
+const FN_FRAME_TRIM_KEEP: usize = 4 << 20;
+
+/// RAII guard that resets a worker's per-function bump [`blaze_mem::Frame`] in O(1) on exit
+/// (success, error, or unwind) and trims excess blocks after mega-functions.
+struct ResetOnDrop<'f>(&'f mut blaze_mem::Frame);
+
+impl Drop for ResetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.reset();
+        if self.0.committed() > FN_FRAME_TRIM_KEEP {
+            self.0.trim(FN_FRAME_TRIM_KEEP);
+        }
+    }
+}
+
 impl MadeSizes {
     /// The sizes of `built` and its entry `made`. The entry is read (`EntryView::read`) only
     /// when it is at least [`MAKE_REPORT_BYTES`] long: its code is no longer than it.
-    fn of(function: Named, built: &blaze_build::Built<Global>, made: &[u8]) -> MadeSizes {
-        let view = built.func.verified().view();
+    fn of(function: Named, built: BuiltRef<'_>, made: &[u8]) -> MadeSizes {
+        let view = built.func.view();
         let mut slots = [SlotSum::default(); 3];
         for s in view.slots.iter() {
             use blaze_lir::func::SlotKind;
@@ -519,6 +571,9 @@ struct Work {
     /// `repr` before a head was made is never kept), then sealed into the entry's read list
     /// (code_reads.rs).
     reads: ReadLog,
+    /// Phase 2's reusable per-round read log (cleared each round without freeing capacity, then
+    /// absorbed into `reads` once Phase 2 finishes with no gaps).
+    ref_reads: ReadLog,
     /// The read-list answers found holding this run, by question ([`verify_instance`]): a
     /// question many found entries ask is asked of the front end once.
     answers: Answers<'static>,
@@ -577,14 +632,25 @@ impl QueryCache {
     }
 }
 
-/// One maker's state over program `P` (made with the program, on the first miss).
-pub struct MakerState {
+/// Cross-instance state of a [`MakerState`], kept disjoint from [`MakerState::fn_frame`] so
+/// per-function scratch borrowed from `fn_frame` never conflicts with `&mut MakerCore` methods
+/// (`ensure`, `pull_constants`, etc.) while the borrow checker statically guarantees nothing
+/// stored in `MakerCore` borrows from `fn_frame`.
+struct MakerCore {
     /// Each fn key asked of `check_one`: the fn's index, `None` when it had no body.
     asked: blaze_hash::Map<ItemKey, Option<usize>, blaze_hash::FixedState, Alloc<'static>>,
     /// Fn `i`'s checked body, `None` until asked (or with none): what [`Bodies`] reads.
     checked: AVec<'static, Option<Checked<'static>>>,
     tables: Option<Tables>,
     work: Work,
+}
+
+/// One maker's state over program `P` (made with the program, on the first miss).
+pub struct MakerState {
+    core: MakerCore,
+    /// Dedicated per-worker resettable bump arena for one function's transient build, LIR,
+    /// optimization, emission, and entry-sealing scratch, reset in O(1) after every function.
+    fn_frame: blaze_mem::Frame,
 }
 
 /// Outcome of Phase 1 (LIR construction) before reference resolution and emission.
@@ -594,25 +660,25 @@ struct BuiltPhase<A: core::alloc::Allocator> {
 }
 
 /// Phase 1 step outcome.
-enum Phase1<A: core::alloc::Allocator> {
-    Built(BuiltPhase<A>),
+enum Phase1<'f> {
+    Built(BuiltPhase<Alloc<'f>>),
     /// The lay of a coroutine state met owner fn `.0` not checked yet (lay_states.rs
     /// `Lay::Unchecked`): check it, then build again.
     Check(ItemKey),
     /// One or more coroutines laid for this build need their owner's constants pulled
     /// (lay_states.rs `Lay::PullConstants`): pull them, then build again.
-    PullConstants(AVec<'static, (ItemKey, List)>),
+    PullConstants(AVec<'f, (ItemKey, List)>),
 }
 
 /// Missing facts collected in a single Phase 2 sweep across all `built.refs` and `built.vtables`.
-struct RefGaps {
+struct RefGaps<'f> {
     first_ask: Option<RunError>,
-    missing_objects: AVec<'static, (ItemKey, RunError)>,
-    untabled: AVec<'static, (ItemKey, RunError)>,
+    missing_objects: AVec<'f, (ItemKey, RunError)>,
+    untabled: AVec<'f, (ItemKey, RunError)>,
 }
 
-impl RefGaps {
-    fn new_in(alloc: Alloc<'static>) -> Self {
+impl<'f> RefGaps<'f> {
+    fn new_in(alloc: Alloc<'f>) -> Self {
         Self {
             first_ask: None,
             missing_objects: AVec::new_in(alloc),
@@ -626,9 +692,9 @@ impl RefGaps {
 }
 
 /// Phase 2 step outcome (reference resolution, vtable assembly, and emission).
-enum Phase2 {
+enum Phase2<'f> {
     Done,
-    Needs(RefGaps),
+    Needs(RefGaps<'f>),
 }
 
 fn tables_gone(key: ItemKey) -> RunError {
@@ -671,51 +737,8 @@ impl MakerState {
         kind: StaticItem,
         template: bool,
     ) -> Result<AVec<'static, u8>, crate::code_records::statics::StaticRecordError> {
-        self.static_entry_with_vtables(program, value, kind, template, &[], &[], &[])
-    }
-
-    /// [`Self::static_entry`] carrying the resolved vtable symbols, declared instances and datums
-    /// built for any `DataTarget::Vtable` words in `value`.
-    #[allow(clippy::too_many_arguments)]
-    fn static_entry_with_vtables<P: FrontEnd>(
-        &mut self,
-        program: &P,
-        value: &crate::seam::SeamData,
-        kind: StaticItem,
-        template: bool,
-        vtable_syms: &[(blaze_build::vtable::VtableKey, blaze_code::record::Symbol)],
-        extra_declared: &[Declared<'_>],
-        carried_vtables: &[VtableDatum<'_>],
-    ) -> Result<AVec<'static, u8>, crate::code_records::statics::StaticRecordError> {
-        use crate::code_records::statics::{make_static_entry_with_targets, make_template_entry_with_targets};
-
-        let alloc = self.work.alloc;
-        let ground = &mut self.work.ground;
-        let fn_target = |key| {
-            let Some(mut instance) = program.const_fn_instance(key, ground, alloc) else {
-                return Ok(None);
-            };
-            if program.track_caller(instance.item) == Some(true) {
-                instance = blaze_build::reify_shim_instance(instance, ground).map_err(|_| crate::symbols::SymbolError::TableFull)?;
-            }
-            let view = ground.view();
-            let tabled = static_fn_tabled(program, instance, view);
-            let mut name = blaze_own::Vec::new_in(alloc);
-            encode_instance(instance.item, instance.args, view, alloc, &mut name)?;
-            Ok(Some((tabled, name)))
-        };
-        let vtable_target = |key| Ok(vtable_syms.iter().find(|&&(k, _)| k == key).map(|&(_, sym)| sym));
-        let foreign_static = |k| {
-            program.foreign_static(k).map(|cname| {
-                let weak = program.static_item(k).is_some_and(|st| st.extern_weak);
-                (cname, weak)
-            })
-        };
-        if template {
-            make_template_entry_with_targets(value, kind, fn_target, vtable_target, foreign_static, extra_declared, carried_vtables, alloc)
-        } else {
-            make_static_entry_with_targets(value, kind, fn_target, vtable_target, foreign_static, extra_declared, carried_vtables, alloc)
-        }
+        let alloc = self.core.work.alloc;
+        self.core.static_entry_with_vtables(program, value, kind, template, &[], &[], &[], alloc)
     }
 
     /// The state for `program`, before its first instance. Refuses a front end that evaluates
@@ -727,6 +750,10 @@ impl MakerState {
                 why: "this front end evaluates its constants for the whole program (run.rs `eval_consts`); the record walk takes one that evaluates each at its arguments (front2)",
             });
         }
+        let fn_frame = blaze_mem::Frame::new(blaze_mem::Tag::Codegen).map_err(|_| RunError::OneBody {
+            key: first,
+            why: "could not create per-function bump frame (make_one.rs `MakerState::new`)",
+        })?;
         let langs = BackLangs::of(program)?;
         let empty: &[Option<Checked<'static>>] = &[];
         let tables = Tables {
@@ -753,34 +780,36 @@ impl MakerState {
             last_make: None,
             last_make_reportable: false,
             reads: ReadLog::new(ReadPlant::None),
+            ref_reads: ReadLog::new(ReadPlant::None),
             answers: Answers::new_in(alloc),
             query_cache: core::cell::RefCell::new(QueryCache::new_in(alloc)),
         };
-        Ok(MakerState {
+        let core = MakerCore {
             asked: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
             checked: blaze_own::Vec::new_in(alloc),
             tables: Some(tables),
             work,
-        })
+        };
+        Ok(MakerState { core, fn_frame })
     }
 
     /// The read-list tests' planted bug (code_reads.rs `ReadPlant`, rule 23): every build after
     /// this records with `plant`.
     pub fn plant_reads(&mut self, plant: ReadPlant) {
-        self.work.reads = ReadLog::new(plant);
+        self.core.work.reads = ReadLog::new(plant);
     }
 
     /// Times every later make on `clock`, and keeps a large or slow one's [`MakeSizes`] for
     /// [`MakerState::take_report`].
     pub fn time_on(&mut self, clock: blaze_core::wait::Monotonic) {
-        self.work.clock = Some(clock);
+        self.core.work.clock = Some(clock);
     }
 
     /// The last make's report, when it was large or slow ([`MakeSizes`]); taken once.
     pub fn take_report(&mut self) -> Option<MakeSizes> {
-        if self.work.last_make_reportable {
-            self.work.last_make_reportable = false;
-            self.work.last_make.take()
+        if self.core.work.last_make_reportable {
+            self.core.work.last_make_reportable = false;
+            self.core.work.last_make.take()
         } else {
             None
         }
@@ -789,9 +818,9 @@ impl MakerState {
     /// Borrows the last make's [`MakeSizes`] once if it crossed the large/slow threshold, leaving
     /// `last_make` intact for [`MakerState::take_last_make`].
     fn report_if_large_or_slow(&mut self) -> Option<&MakeSizes> {
-        if self.work.last_make_reportable {
-            self.work.last_make_reportable = false;
-            self.work.last_make.as_ref()
+        if self.core.work.last_make_reportable {
+            self.core.work.last_make_reportable = false;
+            self.core.work.last_make.as_ref()
         } else {
             None
         }
@@ -800,8 +829,63 @@ impl MakerState {
     /// Takes the last compiled function's [`MakeSizes`] (populated whenever `clock` is set),
     /// regardless of whether it crossed the large/slow reporting threshold.
     pub fn take_last_make(&mut self) -> Option<MakeSizes> {
-        self.work.last_make_reportable = false;
-        self.work.last_make.take()
+        self.core.work.last_make_reportable = false;
+        self.core.work.last_make.take()
+    }
+
+    #[cfg(test)]
+    fn ensure<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
+        let MakerState { core, fn_frame } = self;
+        let fn_guard = ResetOnDrop(fn_frame);
+        let fn_erased = blaze_own::Erased::new(&*fn_guard.0);
+        core.ensure(program, typing, key, checks, fn_erased.handle())
+    }
+}
+
+impl MakerCore {
+    /// [`MakerState::static_entry`] carrying the resolved vtable symbols, declared instances and
+    /// datums built for any `DataTarget::Vtable` words in `value`, allocating output and scratch
+    /// in `out_alloc`.
+    #[allow(clippy::too_many_arguments)]
+    fn static_entry_with_vtables<'a, P: FrontEnd>(
+        &mut self,
+        program: &P,
+        value: &crate::seam::SeamData,
+        kind: StaticItem,
+        template: bool,
+        vtable_syms: &[(blaze_build::vtable::VtableKey, blaze_code::record::Symbol)],
+        extra_declared: &[Declared<'_>],
+        carried_vtables: &[VtableDatum<'_>],
+        out_alloc: Alloc<'a>,
+    ) -> Result<AVec<'a, u8>, crate::code_records::statics::StaticRecordError> {
+        use crate::code_records::statics::{make_static_entry_with_targets, make_template_entry_with_targets};
+
+        let ground = &mut self.work.ground;
+        let fn_target = |key| {
+            let Some(mut instance) = program.const_fn_instance(key, ground, out_alloc) else {
+                return Ok(None);
+            };
+            if program.track_caller(instance.item) == Some(true) {
+                instance = blaze_build::reify_shim_instance(instance, ground).map_err(|_| crate::symbols::SymbolError::TableFull)?;
+            }
+            let view = ground.view();
+            let tabled = static_fn_tabled(program, instance, view);
+            let mut name = blaze_own::Vec::new_in(out_alloc);
+            encode_instance(instance.item, instance.args, view, out_alloc, &mut name)?;
+            Ok(Some((tabled, name)))
+        };
+        let vtable_target = |key| Ok(vtable_syms.iter().find(|&&(k, _)| k == key).map(|&(_, sym)| sym));
+        let foreign_static = |k| {
+            program.foreign_static(k).map(|cname| {
+                let weak = program.static_item(k).is_some_and(|st| st.extern_weak);
+                (cname, weak)
+            })
+        };
+        if template {
+            make_template_entry_with_targets(value, kind, fn_target, vtable_target, foreign_static, extra_declared, carried_vtables, out_alloc)
+        } else {
+            make_static_entry_with_targets(value, kind, fn_target, vtable_target, foreign_static, extra_declared, carried_vtables, out_alloc)
+        }
     }
 
     /// Fn `key` checked, once a run: its index, `None` when the front end has no body for it.
@@ -809,11 +893,11 @@ impl MakerState {
     /// tables over the bodies checked so far. Every OTHER fn whose closure a checked body's
     /// types hold is checked too, before this returns (its closure's facts are in its body):
     /// by a work list, each owner once.
-    fn ensure<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
+    fn ensure<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount, scratch: Alloc<'_>) -> Result<Option<usize>, RunError> {
         /// The most closure owners one ensure follows (rule 18).
         const MOST_OWNERS: usize = 4096;
         let first = self.ensure_one(program, typing, key, checks)?;
-        let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(self.work.alloc);
+        let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(scratch);
         self.owners_named(&*program, key, &mut todo);
         let mut steps = 0;
         while let Some(owner) = todo.pop() {
@@ -946,6 +1030,7 @@ impl MakerState {
         spec_i: usize,
         done: Checked<'static>,
         checks: &mut CheckCount,
+        scratch: Alloc<'_>,
     ) -> Result<(), RunError> {
         /// The most closure owners one ensure follows (rule 18).
         const MOST_OWNERS: usize = 4096;
@@ -953,7 +1038,7 @@ impl MakerState {
             self.asked.insert(spec_key, Some(spec_i));
         }
         self.register_checked_row(&*program, spec_key, spec_i, done, checks)?;
-        let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(self.work.alloc);
+        let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(scratch);
         self.owners_named(&*program, spec_key, &mut todo);
         let mut steps = 0;
         while let Some(owner) = todo.pop() {
@@ -1008,34 +1093,35 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     entry: &mut AVec<'_, u8>,
 ) -> Result<(), RunError> {
     use blaze_core::wait::Clock as _;
-    let made_from = state.work.clock.map(|c| c.now());
-    state.work.times = MakeTimes::default();
-    state.work.last_make = None;
-    state.work.last_make_reportable = false;
+    let made_from = state.core.work.clock.map(|c| c.now());
+    state.core.work.times = MakeTimes::default();
+    state.core.work.last_make = None;
+    state.core.work.last_make_reportable = false;
     make_instance_timed(program, typing, state, checks, tabled, name, entry)?;
-    finish_make_timing(state, made_from);
+    finish_make_timing(&mut state.core, made_from);
     Ok(())
 }
 
 /// Records the make's [`MakeSizes`] (rule 16): its times split, with checks and constant pulls
 /// (`lower`) being what builds and emits leave of the whole, and marks whether it crossed the
 /// large/slow threshold.
-fn finish_make_timing(state: &mut MakerState, made_from: Option<core::time::Duration>) {
+fn finish_make_timing(core: &mut MakerCore, made_from: Option<core::time::Duration>) {
     use blaze_core::wait::Clock as _;
-    if let (Some(c), Some(from)) = (state.work.clock, made_from) {
+    if let (Some(c), Some(from)) = (core.work.clock, made_from) {
         let took = c.now().saturating_sub(from);
-        let times = core::mem::take(&mut state.work.times);
+        let times = core::mem::take(&mut core.work.times);
         if let Some(last) = times.last {
             let reportable = last.reported(took);
             let MadeSizes { function, blocks, insts, copy_insts, slots, frame_estimate, entry_bytes, code } = last;
             let lower = took.saturating_sub(times.build).saturating_sub(times.emit);
-            state.work.last_make = Some(MakeSizes { function, blocks, insts, copy_insts, slots, frame_estimate, entry_bytes, code, lower, build: times.build, emit: times.emit });
-            state.work.last_make_reportable = reportable;
+            core.work.last_make = Some(MakeSizes { function, blocks, insts, copy_insts, slots, frame_estimate, entry_bytes, code, lower, build: times.build, emit: times.emit });
+            core.work.last_make_reportable = reportable;
         }
     }
 }
 
-/// [`make_instance`]'s work, timed by it.
+/// [`make_instance`]'s work, timed by it. Runs inside `state.fn_frame`, resetting the bump frame
+/// in O(1) on exit (keeping only the final encoded entry bytes copied into `entry`).
 fn make_instance_timed<'a, P: FrontEnd, T: Typing<P>>(
     program: &mut P,
     typing: &mut T,
@@ -1045,27 +1131,33 @@ fn make_instance_timed<'a, P: FrontEnd, T: Typing<P>>(
     name: &[u8],
     entry: &mut AVec<'a, u8>,
 ) -> Result<(), RunError> {
+    let MakerState { core, fn_frame } = state;
+    let fn_guard = ResetOnDrop(fn_frame);
+    let fn_erased = blaze_own::Erased::new(&*fn_guard.0);
+    let fn_alloc = fn_erased.handle();
     let mut sink = BuildSink::<Alloc<'a>>::Entry(entry);
-    run_instance_loop(program, typing, state, checks, tabled, name, &mut sink)
+    run_instance_loop(program, typing, core, fn_alloc, checks, tabled, name, &mut sink)
 }
 
 /// Shared instance-lowering loop for both [`make_instance_timed`] (entry emission) and
-/// [`Maker::build_lir`] (LIR extraction for export LTO).
-fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + Copy>(
+/// [`Maker::build_lir`] (LIR extraction for export LTO). All per-function transient data
+/// allocates in `fn_alloc` (backed by [`MakerState::fn_frame`], reset in O(1) after every fn).
+#[allow(clippy::too_many_arguments)]
+fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + Copy>(
     program: &mut P,
     typing: &mut T,
-    state: &mut MakerState,
+    core: &mut MakerCore,
+    fn_alloc: Alloc<'f>,
     checks: &mut CheckCount,
     tabled: ItemKey,
     name: &[u8],
     sink: &mut BuildSink<'_, 'a, A>,
 ) -> Result<(), RunError> {
-    let alloc = state.work.alloc;
     // The bodies this ONE instance reads: its fn's, and each owner its name holds.
-    let Some(i) = state.ensure(program, typing, tabled, checks)? else {
+    let Some(i) = core.ensure(program, typing, tabled, checks, fn_alloc)? else {
         return Err(RunError::OneBody { key: tabled, why: "the record walk reached an instance of a fn the front end holds no checked body for" });
     };
-    let (item, args) = decode_instance(name, &mut state.work.ground, alloc).map_err(|e| RunError::CodeRecord { function: program.function(i).named(), error: CodeRecordError::Symbol(e) })?;
+    let (item, args) = decode_instance(name, &mut core.work.ground, fn_alloc).map_err(|e| RunError::CodeRecord { function: program.function(i).named(), error: CodeRecordError::Symbol(e) })?;
     let instance = Instance { item, args };
     // Each fn whose check another fact of this instance's ARGUMENTS is in: a closure's or an
     // async block's owner (its capture facts are in its body: `LayoutFacts::closure`, which
@@ -1074,13 +1166,13 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
     // checked body's types. Read from the ground tree, not by the program's rows: a lazy front
     // end has no row for an owner until it is checked (front2/program/lazy `fn_index`), so a
     // filter by row skipped `rand::rngs::thread::rng` for `LocalKey::try_with` at its closure.
-    let Held { owners, items, objects, missing_opaques } = held_owners(&*program, state.work.ground.view(), args, tabled, alloc)?;
+    let Held { owners, items, objects, missing_opaques } = held_owners(&*program, core.work.ground.view(), args, tabled, fn_alloc)?;
     for &opaque in missing_opaques.iter() {
         if program.opaque_head(opaque)?
             && let Some(Ok(owner)) = program.opaque_definer(opaque)
             && owner != tabled
         {
-            state.ensure(program, typing, owner, checks)?;
+            core.ensure(program, typing, owner, checks, fn_alloc)?;
         }
     }
     // Each `dyn` principal the arguments hold: its object table asked by name BEFORE the build
@@ -1097,7 +1189,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
     // could not serve stays the build's typed `SiteGap::NoEnclosingRow`.
     program.site_heads(tabled)?;
     for &owner in owners.iter() {
-        state.ensure(program, typing, owner, checks)?;
+        core.ensure(program, typing, owner, checks, fn_alloc)?;
     }
     // Each fn item whose TYPE the arguments hold: its row from its head, its body not checked
     // (this instance reads none of it; its own instance is the walk's, found or made). The
@@ -1116,7 +1208,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
     // A test report shim calls `Termination::report` (the trait method, which `name_ref` then
     // resolves to the selected impl): ensure its trait head and row exist before the build asks
     // for its signature and ABI.
-    if blaze_build::test_report_shim_of(instance, state.work.ground.view()).is_some()
+    if blaze_build::test_report_shim_of(instance, core.work.ground.view()).is_some()
         && let Some(report_fn) = program.termination_report()
     {
         program.head_row(report_fn)?;
@@ -1124,15 +1216,15 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
     // Generic `inline for` functions specialize on demand at concrete ground arguments into a
     // monomorphic unrolled row with 0 generic args of its own (matching `run.rs:2321-2327`).
     let (build_i, build_instance) = if instance.args.len > 0 && instance.item == tabled {
-        let mut ground_args: AVec<'_, PTy> = blaze_own::Vec::new_in(alloc);
-        if let Ok(list) = state.work.ground.view().list(instance.args) {
+        let mut ground_args: AVec<'_, PTy> = blaze_own::Vec::new_in(fn_alloc);
+        if let Ok(list) = core.work.ground.view().list(instance.args) {
             ground_args.extend_from_slice(list);
         }
-        match program.specialize_inline_for(i, &ground_args, state.work.ground.view())? {
+        match program.specialize_inline_for(i, &ground_args, core.work.ground.view())? {
             Some((spec_i, spec_checked)) => {
                 let spec_key = program.function(spec_i).key;
                 if let Some(done) = spec_checked {
-                    state.register_specialized(program, typing, spec_key, spec_i, done, checks)?;
+                    core.register_specialized(program, typing, spec_key, spec_i, done, checks, fn_alloc)?;
                 }
                 (spec_i, Instance { item: spec_key, args: List::EMPTY })
             }
@@ -1151,10 +1243,10 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
     // projection paths passed). The same ask-again as the build's: the program makes what the
     // worlds asked (`FrontEnd::make_asked`) and the constants are pulled again; bounded by the
     // same count (rule 18), and nothing made is the `Missing` itself.
-    let mut pulled = AskProgress::new_in(alloc);
+    let mut pulled = AskProgress::new_in(fn_alloc);
     let mut pull_owners = 0usize;
     loop {
-        match pull_constants(program, state, build_i, build_instance) {
+        match pull_constants(program, core, build_i, build_instance, fn_alloc) {
             Ok(PullStep::Done) => break,
             Ok(PullStep::Check(owner)) => {
                 pull_owners += 1;
@@ -1162,20 +1254,20 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
                     let error = BuildError::UnsupportedSig { what: "an instance whose constant evaluation needed more than 4096 coroutine owner fns checked" };
                     return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
                 }
-                if state.ensure(program, typing, owner, checks)?.is_none() {
+                if core.ensure(program, typing, owner, checks, fn_alloc)?.is_none() {
                     return Err(unchecked_owner(&*program, build_i, owner));
                 }
             }
             Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner }, .. })
                 if pull_owners < MOST_HELD_COROUTINES
                     && (opaque == owner
-                        || match state.asked.get(&owner) {
+                        || match core.asked.get(&owner) {
                             None => true,
                             Some(entry) => entry.is_none() && program.fn_index(owner).is_none(),
                         }) =>
             {
                 pull_owners += 1;
-                ensure_opaque_owner(program, typing, state, checks, build_i, opaque, owner)?;
+                ensure_opaque_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
             }
             Err(e) if asks_again(&e) && pulled.allow(&e) => {
                 if !program.make_asked(build_i)? {
@@ -1186,14 +1278,15 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
         }
     }
     let mut owners = 0usize;
-    // Phase 1: lay out coroutine states and build LIR ONCE into an owned `BuiltPhase`. Any
-    // missing fact (`Missing` / `OpaqueOwnerUnchecked` / `NoTrait` / `Check`) retries only Phase 1.
-    let mut asked = AskProgress::new_in(alloc);
+    // Phase 1: lay out coroutine states and build LIR ONCE into an owned `BuiltPhase<Alloc<'f>>`
+    // inside `fn_frame`. Any missing fact (`Missing` / `OpaqueOwnerUnchecked` / `NoTrait` /
+    // `Check`) retries only Phase 1.
+    let mut asked = AskProgress::new_in(fn_alloc);
     let built_phase = loop {
-        let MakerState { checked, tables, work, .. } = &mut *state;
+        let MakerCore { checked, tables, work, .. } = &mut *core;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
-        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
-        let step = build_lir_phase(&*program, &bodies, work, build_i, build_instance);
+        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: fn_alloc };
+        let step = build_lir_phase(&*program, &bodies, work, build_i, build_instance, fn_alloc);
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
         match step {
             Ok(Phase1::Built(built)) => break built,
@@ -1203,7 +1296,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
                     let error = BuildError::UnsupportedSig { what: "an instance whose coroutine states needed more than 4096 owner fns checked" };
                     return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
                 }
-                if state.ensure(program, typing, owner, checks)?.is_none() {
+                if core.ensure(program, typing, owner, checks, fn_alloc)?.is_none() {
                     return Err(unchecked_owner(&*program, build_i, owner));
                 }
             }
@@ -1214,13 +1307,13 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
                     return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
                 }
                 for &(owner, owner_args) in missing.iter() {
-                    let Some(owner_i) = state.ensure(program, typing, owner, checks)? else {
+                    let Some(owner_i) = core.ensure(program, typing, owner, checks, fn_alloc)? else {
                         return Err(unchecked_owner(&*program, build_i, owner));
                     };
                     let owner_inst = Instance { item: owner, args: owner_args };
-                    let mut owner_pulled = AskProgress::new_in(alloc);
+                    let mut owner_pulled = AskProgress::new_in(fn_alloc);
                     loop {
-                        match pull_constants(program, state, owner_i, owner_inst) {
+                        match pull_constants(program, core, owner_i, owner_inst, fn_alloc) {
                             Ok(PullStep::Done) => break,
                             Ok(PullStep::Check(co_owner)) => {
                                 pull_owners += 1;
@@ -1228,20 +1321,20 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
                                     let error = BuildError::UnsupportedSig { what: "an instance whose constant evaluation needed more than 4096 coroutine owner fns checked" };
                                     return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
                                 }
-                                if state.ensure(program, typing, co_owner, checks)?.is_none() {
+                                if core.ensure(program, typing, co_owner, checks, fn_alloc)?.is_none() {
                                     return Err(unchecked_owner(&*program, build_i, co_owner));
                                 }
                             }
                             Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner: op_owner }, .. })
                                 if pull_owners < MOST_HELD_COROUTINES
                                     && (opaque == op_owner
-                                        || match state.asked.get(&op_owner) {
+                                        || match core.asked.get(&op_owner) {
                                             None => true,
                                             Some(entry) => entry.is_none() && program.fn_index(op_owner).is_none(),
                                         }) =>
                             {
                                 pull_owners += 1;
-                                ensure_opaque_owner(program, typing, state, checks, build_i, opaque, op_owner)?;
+                                ensure_opaque_owner(program, typing, core, checks, build_i, opaque, op_owner, fn_alloc)?;
                             }
                             Err(e) if asks_again(&e) && owner_pulled.allow(&e) => {
                                 if !program.make_asked(owner_i)? {
@@ -1262,13 +1355,13 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
             Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner }, .. })
                 if owners < MOST_HELD_COROUTINES
                     && (opaque == owner
-                        || match state.asked.get(&owner) {
+                        || match core.asked.get(&owner) {
                             None => true,
                             Some(entry) => entry.is_none() && program.fn_index(owner).is_none(),
                         }) =>
             {
                 owners += 1;
-                ensure_opaque_owner(program, typing, state, checks, build_i, opaque, owner)?;
+                ensure_opaque_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
             }
             Err(e) if let Some(t) = object_missing(&e) && asked.allow(&e) => {
                 if program.object_table(t)? {
@@ -1281,16 +1374,15 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
     };
     // Phase 2: resolve all call refs and vtables over the ALREADY-BUILT LIR, batch-collecting all
     // missing impls/ADTs/object tables/head rows in one sweep per round without ever re-running
-    // `blaze_build::build`, and using `program.head_row` (not `state.ensure`) for untabled callees.
-    let mut ref_asked = AskProgress::new_in(alloc);
-    let mut tried_table: blaze_hash::HashSet<ItemKey, Alloc<'_>> = blaze_hash::HashSet::new_in(alloc);
-    let ref_reads = ReadLog::new(ReadPlant::None);
+    // `blaze_build::build`, and using `program.head_row` (not `core.ensure`) for untabled callees.
+    let mut ref_asked = AskProgress::new_in(fn_alloc);
+    let mut tried_table: blaze_hash::HashSet<ItemKey, Alloc<'_>> = blaze_hash::HashSet::new_in(fn_alloc);
     let mut built_phase = Some(built_phase);
     loop {
-        ref_reads.clear();
-        let MakerState { checked, tables, work, .. } = &mut *state;
+        let MakerCore { checked, tables, work, .. } = &mut *core;
+        work.ref_reads.clear();
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
-        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: fn_alloc };
         let phase_step = resolve_and_emit_phase(
             &*program,
             &bodies,
@@ -1298,7 +1390,7 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
             build_i,
             build_instance,
             &mut built_phase,
-            &ref_reads,
+            fn_alloc,
             sink,
         );
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
@@ -1333,10 +1425,10 @@ fn run_instance_loop<'a, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocator + 
                         }
                         if program.head_row(key)?.is_some() {
                             made_any = true;
-                        } else if state.asked.contains_key(&key) {
+                        } else if core.asked.contains_key(&key) {
                             return Err(refusal);
                         } else {
-                            state.ensure(program, typing, key, checks)?;
+                            core.ensure(program, typing, key, checks, fn_alloc)?;
                             made_any = true;
                         }
                     }
@@ -1528,14 +1620,16 @@ struct Held<'a> {
 /// `program.opaque_of(opaque)` is still `None`, loads the opaque's defining head (and RPITIT
 /// default twin row if applicable) via `FrontEnd::opaque_head`; otherwise ensures `owner`'s
 /// checked body (or head-only row for trait methods without a body).
+#[allow(clippy::too_many_arguments)]
 fn ensure_opaque_owner<P: FrontEnd, T: Typing<P>>(
     program: &mut P,
     typing: &mut T,
-    state: &mut MakerState,
+    core: &mut MakerCore,
     checks: &mut CheckCount,
     build_i: usize,
     opaque: ItemKey,
     owner: ItemKey,
+    scratch: Alloc<'_>,
 ) -> Result<(), RunError> {
     if opaque == owner && program.opaque_of(opaque).is_none() {
         if !program.opaque_head(opaque)? {
@@ -1544,11 +1638,11 @@ fn ensure_opaque_owner<P: FrontEnd, T: Typing<P>>(
         }
         return Ok(());
     }
-    if state.ensure(program, typing, owner, checks)?.is_none() {
+    if core.ensure(program, typing, owner, checks, scratch)?.is_none() {
         let Some(row) = program.head_row(owner)? else {
             return Err(unchecked_owner(&*program, build_i, owner));
         };
-        if let Some(entry) = state.asked.get_mut(&owner) {
+        if let Some(entry) = core.asked.get_mut(&owner) {
             *entry = Some(row);
         }
     }
@@ -1567,8 +1661,8 @@ enum PullStep {
 /// builds and its verifier read every constant from the one pulled table (rule 30). A
 /// closure's and a coroutine's function read their owner's body at the owner's arguments, as
 /// `build_one` builds them, so they pull the owner's needs there.
-fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize, instance: Instance) -> Result<PullStep, RunError> {
-    let MakerState { checked, tables, work, .. } = &mut *state;
+fn pull_constants<P: FrontEnd>(program: &mut P, core: &mut MakerCore, i: usize, instance: Instance, fn_alloc: Alloc<'_>) -> Result<PullStep, RunError> {
+    let MakerCore { checked, tables, work, .. } = &mut *core;
     work.needs.clear();
     let function = program.function(i);
     // A ctor's fn reads no constant: its fields in, its value out. Nor a builtin clone (a copy,
@@ -1587,7 +1681,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     };
     let malformed = |_| RunError::Build { function: function.named(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
     let t = tables.take().ok_or_else(|| tables_gone(function.key))?;
-    let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+    let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: fn_alloc };
     let view = body.view(program.body_types(i));
     let facts = CachedFront { front: FrontAdts(&*program, i, &[], &work.langs, &bodies), cache: &work.query_cache };
     // The arguments `build_one` reads the body at: the instance's own; a coroutine's
@@ -1606,13 +1700,13 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         let first = work.ground.view().list(instance.args).ok().and_then(|a| a.first().copied());
         first.and_then(|t| blaze_build::closure_of(work.ground.view(), t)).map(|of| of.owner_args)
     };
-    let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
+    let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(fn_alloc);
     let found = match at {
         None => Ok(()),
         Some(at) => match work.ground.view().list(at) {
             Ok(list) => {
                 args.extend_from_slice(list);
-                crate::front2::const_at::needs_of(&view, done, &args, &mut work.ground, &facts, work.alloc, &mut work.needs)
+                crate::front2::const_at::needs_of(&view, done, &args, &mut work.ground, &facts, fn_alloc, &mut work.needs)
                     .and_then(|()| crate::front2::const_at::plain_needs_of(done, &mut work.needs))
                     .map_err(|error| RunError::Build { function: function.named(), error, range: None })
             }
@@ -1626,7 +1720,7 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
     // entry always forgets its own shape before `lay_and_build_one`), avoiding redundant re-laying.
     let mut unchecked_coro = None;
     let lay_result = if found.is_ok() && !work.needs.is_empty() {
-        let mut need_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
+        let mut need_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(fn_alloc);
         for (_, a) in work.needs.iter() {
             need_tys.extend_from_slice(a);
         }
@@ -1635,9 +1729,9 @@ fn pull_constants<P: FrontEnd>(program: &mut P, state: &mut MakerState, i: usize
         if need_tys.is_empty() {
             Ok(())
         } else {
-            match crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc) {
+            match crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, fn_alloc) {
                 Ok(coro_roots) if coro_roots.is_empty() => Ok(()),
-                Ok(coro_roots) => match lay_only(&*program, &[], &work.langs, &bodies, &work.query_cache, &mut work.ground, &mut work.layouts, i, &coro_roots, work.alloc) {
+                Ok(coro_roots) => match lay_only(&*program, &[], &work.langs, &bodies, &work.query_cache, &mut work.ground, &mut work.layouts, i, &coro_roots, fn_alloc) {
                     Ok(LaidOnly::Done(_)) => Ok(()),
                     Ok(LaidOnly::Unchecked(owner)) => {
                         unchecked_coro = Some(owner);
@@ -1945,17 +2039,20 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     tabled: ItemKey,
     entry: &[u8],
 ) -> Result<Verdict, RunError> {
+    let MakerState { core, fn_frame } = state;
+    let fn_guard = ResetOnDrop(fn_frame);
+    let fn_erased = blaze_own::Erased::new(&*fn_guard.0);
+    let fn_alloc = fn_erased.handle();
     let Some(i) = program.head_row(tabled)? else {
         return Err(RunError::OneBody { key: tabled, why: "a found code entry's fn has no row today (make_one.rs `verify_instance`)" });
     };
     let refused = |program: &RecordsProgram<'n>, error| RunError::CodeRecord { function: program.function(i).named(), error };
     let view = EntryView::read(entry).map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
-    let alloc = state.work.alloc;
-    let mut owners: AVec<'_, ItemKey> = blaze_own::Vec::new_in(alloc);
+    let mut owners: AVec<'_, ItemKey> = blaze_own::Vec::new_in(fn_alloc);
     // The coroutines whose states the rows read: laid again below, as the build's lay laid
     // them, before any row is asked.
-    let mut roots: AVec<'_, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(alloc);
-    state.work.needs.clear();
+    let mut roots: AVec<'_, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(fn_alloc);
+    core.work.needs.clear();
     for row in view.reads() {
         let (bytes, _) = row.map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
         // A row of no kind: `verify_today` refuses it by name below.
@@ -1976,7 +2073,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
             | ReadKind::Promoted => {}
             _ => continue,
         }
-        let (kind, extra, item, list) = reads::question(bytes, &mut state.work.ground, alloc).map_err(|e| refused(&*program, CodeRecordError::Reads(e)))?;
+        let (kind, extra, item, list) = reads::question(bytes, &mut core.work.ground, fn_alloc).map_err(|e| refused(&*program, CodeRecordError::Reads(e)))?;
         let stale = Verdict::Stale { kind, item };
         let expr = u32::try_from(extra).ok().map(blaze_typeck::ExprId);
         let need = match kind {
@@ -2038,19 +2135,19 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
             }
             _ => continue,
         };
-        let args = state.work.ground.view().list(list).map_err(|_| refused(&*program, CodeRecordError::Reads(ReadsError::Question)))?;
-        state.work.needs.push(need, args).map_err(|error| RunError::Build { function: program.function(i).named(), error, range: None })?;
+        let args = core.work.ground.view().list(list).map_err(|_| refused(&*program, CodeRecordError::Reads(ReadsError::Question)))?;
+        core.work.needs.push(need, args).map_err(|error| RunError::Build { function: program.function(i).named(), error, range: None })?;
     }
     // An opaque type's hidden type is its defining fn's check's (coroutines.rs `opaque_hidden`);
     // a required trait fn's RPITIT has no body and needs only its signature row (`head_row`).
     for &owner in owners.iter() {
-        match state.ensure(program, typing, owner, checks) {
+        match core.ensure(program, typing, owner, checks, fn_alloc) {
             Ok(Some(_)) => {}
             Ok(None) => {
                 let Ok(Some(row)) = program.head_row(owner) else {
                     return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner });
                 };
-                if let Some(entry) = state.asked.get_mut(&owner) {
+                if let Some(entry) = core.asked.get_mut(&owner) {
                     *entry = Some(row);
                 }
             }
@@ -2060,9 +2157,9 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     // Also include any coroutine held by value in the constant needs' arguments (e.g.
     // `Box::new(async move { .. })` verifying `<{coroutine} as SizedTypeProperties>::LAYOUT`),
     // laid BEFORE `const_at::pull` below so constant evaluation sees their laid `StateShape`s.
-    if !state.work.needs.is_empty() {
-        let mut need_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(alloc);
-        for (_, a) in state.work.needs.iter() {
+    if !core.work.needs.is_empty() {
+        let mut need_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(fn_alloc);
+        for (_, a) in core.work.needs.iter() {
             need_tys.extend_from_slice(a);
         }
         need_tys.sort_unstable();
@@ -2070,11 +2167,11 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
         let mut rounds = 0u32;
         while !need_tys.is_empty() {
             let found = {
-                let MakerState { checked, tables, work, .. } = &mut *state;
+                let MakerCore { checked, tables, work, .. } = &mut *core;
                 let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
-                let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+                let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: fn_alloc };
                 let facts = FrontAdts(&*program, i, &[], &work.langs, &bodies);
-                let found = crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, work.alloc);
+                let found = crate::front2::coroutine_needs::referenced_coroutines(&mut work.ground, &need_tys, &facts, fn_alloc);
                 *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
                 found
             };
@@ -2089,7 +2186,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 }
                 Err(BuildError::OpaqueOwnerUnchecked { owner, .. }) if rounds < crate::front2::check::MOST_ROUNDS => {
                     rounds += 1;
-                    if state.ensure(program, typing, owner, checks).is_err() {
+                    if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
                         return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
                     }
                 }
@@ -2106,16 +2203,16 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     // compared with the same digest: a row moves only when its answer does. An owner not checked
     // is checked and an ADT head a lay met unmade is made, then the lay again (bounded, rule 18);
     // a lay that cannot be made today leaves the entry stale, and the make that follows refuses by name.
-    let mut relaid: AVec<'_, (blaze_build::CoroutineOf, ContentId)> = blaze_own::Vec::new_in(alloc);
-    let mut recorded: AVec<'_, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(alloc);
+    let mut relaid: AVec<'_, (blaze_build::CoroutineOf, ContentId)> = blaze_own::Vec::new_in(fn_alloc);
+    let mut recorded: AVec<'_, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(fn_alloc);
     let mut lays = 0usize;
     while !roots.is_empty() {
         lays += 1;
         let out = {
-            let MakerState { checked, tables, work, .. } = &mut *state;
+            let MakerCore { checked, tables, work, .. } = &mut *core;
             let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
-            let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
-            let out = super::lay_states::relay(&*program, &work.langs, &bodies, &work.query_cache, &mut work.ground, &mut work.layouts, i, &roots, work.alloc);
+            let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: fn_alloc };
+            let out = super::lay_states::relay(&*program, &work.langs, &bodies, &work.query_cache, &mut work.ground, &mut work.layouts, i, &roots, fn_alloc);
             *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
             out
         };
@@ -2127,7 +2224,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 break;
             }
             Ok(super::lay_states::Relaid::Unchecked(owner)) => {
-                if lays > MOST_HELD_COROUTINES || state.ensure(program, typing, owner, checks).is_err() {
+                if lays > MOST_HELD_COROUTINES || core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
                     return Ok(stale);
                 }
             }
@@ -2142,12 +2239,12 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     // relaid coroutine states visible to constant evaluation.
     let mut pulled = 0u32;
     let mut pull_stale = None;
-    while !state.work.needs.is_empty() {
-        let table = state.tables.as_mut().ok_or_else(|| tables_gone(tabled))?;
+    while !core.work.needs.is_empty() {
+        let table = core.tables.as_mut().ok_or_else(|| tables_gone(tabled))?;
         let Err(refusal) = crate::front2::const_at::pull(
             &mut *program,
-            &state.work.needs,
-            state.work.ground.view(),
+            &core.work.needs,
+            core.work.ground.view(),
             &mut table.const_at,
             crate::front2::const_at::BuildFacts::new(&table.closures, &table.coroutines),
         ) else {
@@ -2167,12 +2264,12 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     }
     let verdict = match pull_stale {
         Some(stale) => Ok(stale),
-        None => verify_rows(program, state, i, tabled, &view, &relaid),
+        None => verify_rows(program, core, i, tabled, &view, &relaid, fn_alloc),
     };
     // The states laid again above were built into nothing: forgotten, so a make that follows
     // lays and builds them (lay_states.rs `forget_laid`).
-    if let Some(t) = state.tables.as_ref() {
-        forget_laid_in(&t.coroutines, &recorded, state.work.ground.view());
+    if let Some(t) = core.tables.as_ref() {
+        forget_laid_in(&t.coroutines, &recorded, core.work.ground.view());
     }
     verdict
 }
@@ -2180,17 +2277,17 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
 /// [`verify_instance`]'s asking: every row of `view` asked again (code_reads.rs
 /// `verify_today`) over the states laid again (`relaid`), by rounds while the program makes
 /// what the rows noted unmade.
-fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: usize, tabled: ItemKey, view: &EntryView<'_>, relaid: &[(blaze_build::CoroutineOf, ContentId)]) -> Result<Verdict, RunError> {
+fn verify_rows<'n>(program: &mut RecordsProgram<'n>, core: &mut MakerCore, i: usize, tabled: ItemKey, view: &EntryView<'_>, relaid: &[(blaze_build::CoroutineOf, ContentId)], fn_alloc: Alloc<'_>) -> Result<Verdict, RunError> {
     let refused = |program: &RecordsProgram<'n>, error| RunError::CodeRecord { function: program.function(i).named(), error };
-    let mut rounds = AskProgress::new_in(state.work.alloc);
+    let mut rounds = AskProgress::new_in(fn_alloc);
     loop {
-        let MakerState { checked, tables, work, .. } = &mut *state;
+        let MakerCore { checked, tables, work, .. } = &mut *core;
         let t = tables.take().ok_or_else(|| tables_gone(tabled))?;
-        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+        let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: fn_alloc };
         let verified = {
             let front = FrontAdts(&*program, i, &[], &work.langs, &bodies);
             let mut today = Today { program: &*program, i, laid: relaid };
-            reads::verify_today(view, &front, &mut today, &mut work.answers, true, &mut work.ground, work.alloc)
+            reads::verify_today(view, &front, &mut today, &mut work.answers, true, &mut work.ground, fn_alloc)
         };
         *tables = Some(Tables { closures: bodies.closures, coroutines: bodies.coroutines, const_at: bodies.const_at });
         let verified = verified.map_err(|e| refused(&*program, CodeRecordError::Reads(e)))?;
@@ -2221,15 +2318,17 @@ fn verify_rows<'n>(program: &mut RecordsProgram<'n>, state: &mut MakerState, i: 
 }
 
 /// Phase 1 of making one instance: lays out coroutine states and lowers the body to LIR
-/// (`blaze_build::build`), recording Phase 1's reads in `work.reads`. Returns an owned
-/// [`BuiltPhase`] so Phase 2 can retry reference/vtable resolution without ever rebuilding LIR.
-fn build_lir_phase<P: FrontEnd>(
+/// (`blaze_build::build`) inside the per-function bump frame `fn_alloc`, recording Phase 1's reads
+/// in `work.reads`. Returns an owned [`BuiltPhase<Alloc<'f>>`] so Phase 2 can retry
+/// reference/vtable resolution without ever rebuilding LIR.
+fn build_lir_phase<'f, P: FrontEnd>(
     program: &P,
     bodies: &Bodies<'_>,
     work: &mut Work,
     i: usize,
     instance: Instance,
-) -> Result<Phase1<Global>, RunError> {
+    fn_alloc: Alloc<'f>,
+) -> Result<Phase1<'f>, RunError> {
     let function = program.function(i);
     let name = || function.named();
     let ctor_row = match (function.kind, function.body) {
@@ -2322,7 +2421,7 @@ fn build_lir_phase<P: FrontEnd>(
             },
         }
     };
-    let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(work.alloc);
+    let mut args: AVec<'_, PTy> = blaze_own::Vec::new_in(fn_alloc);
     args.extend_from_slice(work.ground.view().list(owner_args).map_err(malformed)?);
     let twice = || RunError::Build { function: name(), error: BuildError::Malformed { what: "a coroutine's function its instance's build did not leave (asked for twice)" }, range: None };
     let from_coroutine: Option<(usize, usize)> = match coroutine {
@@ -2341,7 +2440,7 @@ fn build_lir_phase<P: FrontEnd>(
                 // (preserving already-laid child shapes) so `lay_and_build_one` lays and builds
                 // only `of` itself into `work.stash`.
                 bodies.coroutines.states.forget(of.owner, of.ordinal, &args);
-                match lay_and_build_one(program, &[], &work.langs, bodies, &work.query_cache, &mut work.ground, &mut work.layouts, &mut work.stash, i, of, true, work.alloc)? {
+                match lay_and_build_one(program, &[], &work.langs, bodies, &work.query_cache, &mut work.ground, &mut work.layouts, &mut work.stash, i, of, true, fn_alloc)? {
                     Lay::Done => {}
                     Lay::Unchecked(owner) => return Ok(Phase1::Check(owner)),
                     Lay::PullConstants(missing) => return Ok(Phase1::PullConstants(missing)),
@@ -2362,13 +2461,13 @@ fn build_lir_phase<P: FrontEnd>(
     if from_coroutine.is_none() {
         let include_body = shim.is_none() && vtable_shim.is_none() && test_report.is_none() && builtin_clone.is_none() && builtin_from.is_none() && builtin_fn_ptr.is_none();
         let extra_args = (instance.args != owner_args).then_some(instance.args);
-        let roots = roots_of_instance(program, bodies, &adts, i, &args, extra_args, include_body, &mut work.ground, work.alloc)?;
+        let roots = roots_of_instance(program, bodies, &adts, i, &args, extra_args, include_body, &mut work.ground, fn_alloc)?;
         if !roots.is_empty() {
             // Non-coroutine callers (e.g. `Pin::as_mut`, `DerefMut::deref_mut`, `Box::into_pin`,
             // `drop_glue`, async callers) only need each referenced coroutine's `StateShape`
             // (types only), never its LIR — each coroutine builds its own LIR lazily when its
             // `poll`/`resume`/`drop` entry is actually demanded.
-            match lay_only(program, &[], &work.langs, bodies, &work.query_cache, &mut work.ground, &mut work.layouts, i, &roots, work.alloc)? {
+            match lay_only(program, &[], &work.langs, bodies, &work.query_cache, &mut work.ground, &mut work.layouts, i, &roots, fn_alloc)? {
                 LaidOnly::Done(_) => {}
                 LaidOnly::Unchecked(owner) => return Ok(Phase1::Check(owner)),
             }
@@ -2380,8 +2479,8 @@ fn build_lir_phase<P: FrontEnd>(
     let own = if from_coroutine.is_some() {
         None
     } else {
-        let mut subst = Subst { args: &args, ground: &mut work.ground, scratch: work.alloc };
-        let g = Global;
+        let mut subst = Subst { args: &args, ground: &mut work.ground, scratch: fn_alloc };
+        let g = fn_alloc;
         let made = if let Some(s) = shim {
             match s.item {
                 Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, g),
@@ -2431,35 +2530,36 @@ fn build_lir_phase<P: FrontEnd>(
 
 /// Phase 2 of making one instance: resolves all call references and vtable datums over the
 /// already-built LIR, batch-collecting all missing facts in one sweep, then seals the read log
-/// and emits the entry (or hands back `BuiltLir`). Never re-runs `blaze_build::build`.
+/// and emits the entry (or hands back `BuiltLir`) using the per-function bump frame `fn_alloc`.
+/// Never re-runs `blaze_build::build`.
 #[allow(clippy::too_many_arguments)]
-fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
+fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>(
     program: &P,
     bodies: &Bodies<'_>,
     work: &mut Work,
     i: usize,
     instance: Instance,
-    built_slot: &mut Option<BuiltPhase<Global>>,
-    ref_reads: &ReadLog,
+    built_slot: &mut Option<BuiltPhase<Alloc<'f>>>,
+    fn_alloc: Alloc<'f>,
     sink: &mut BuildSink<'_, 'a, A>,
-) -> Result<Phase2, RunError> {
+) -> Result<Phase2<'f>, RunError> {
     let function = program.function(i);
     let name = || function.named();
     let twice = || RunError::Build { function: name(), error: BuildError::Malformed { what: "a coroutine's function its instance's build did not leave (asked for twice)" }, range: None };
     let built_phase = built_slot.as_ref().ok_or_else(twice)?;
     let from_coroutine = built_phase.from_coroutine;
     let built = match (&built_phase.own, from_coroutine) {
-        (Some(b), _) => b,
-        (None, Some((at, part))) => work.stash[at].parts[part].as_ref().ok_or_else(twice)?,
+        (Some(b), _) => BuiltRef::of(b),
+        (None, Some((at, part))) => BuiltRef::of(work.stash[at].parts[part].as_ref().ok_or_else(twice)?),
         (None, None) => return Err(twice()),
     };
-    let asking = Asking::new(program, i, &work.langs, bodies, &work.query_cache, ref_reads);
+    let asking = Asking::new(program, i, &work.langs, bodies, &work.query_cache, &work.ref_reads);
     work.thread_locals |= !built.thread_locals.is_empty();
-    let mut reach = Reach::new_in(work.alloc);
-    let mut funcs: AVec<'_, Callee<'_>> = blaze_own::Vec::with_capacity_in(built.refs.len(), work.alloc);
-    let mut gaps = RefGaps::new_in(work.alloc);
+    let mut reach = Reach::new_in(fn_alloc);
+    let mut funcs: AVec<'f, Callee<'_>> = blaze_own::Vec::with_capacity_in(built.refs.len(), fn_alloc);
+    let mut gaps = RefGaps::new_in(fn_alloc);
     for &called in built.refs.iter() {
-        match name_ref(program, &asking, &mut work.ground, work.alloc, &mut reach, i, instance.args, called) {
+        match name_ref(program, &asking, &mut work.ground, fn_alloc, &mut reach, i, instance.args, called) {
             Ok(Named1::Instance(symbol)) => funcs.push(Callee::Symbol(symbol)),
             Ok(Named1::C(c_name)) => funcs.push(Callee::C(c_name)),
             Ok(Named1::Untabled(key, refusal)) => {
@@ -2478,15 +2578,15 @@ fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
             Err(e) => return Err(e),
         }
     }
-    let mut vtable_data: AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)> = blaze_own::Vec::new_in(work.alloc);
-    let mut layouts: Layouts<Alloc<'static>> = Layouts::new_in(work.alloc);
+    let mut vtable_data: AVec<'f, (blaze_code::record::Symbol, AVec<'f, u8>)> = blaze_own::Vec::new_in(fn_alloc);
+    let mut layouts: Layouts<Alloc<'f>> = Layouts::new_in(fn_alloc);
     for &want in built.vtables.iter() {
         match vtable_rows(
             program,
             &asking,
             &mut work.ground,
             &mut layouts,
-            work.alloc,
+            fn_alloc,
             &mut reach,
             i,
             instance.args,
@@ -2514,11 +2614,11 @@ fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
         return Ok(Phase2::Needs(gaps));
     }
     let sym = |e| RunError::CodeRecord { function: name(), error: CodeRecordError::Symbol(e) };
-    let mut vtables: AVec<'_, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(built.vtables.len(), work.alloc);
+    let mut vtables: AVec<'f, blaze_code::record::Symbol> = blaze_own::Vec::with_capacity_in(built.vtables.len(), fn_alloc);
     for &table in built.vtables.iter() {
-        vtables.push(vtable_symbol(table, work.ground.view(), work.alloc).map_err(sym)?);
+        vtables.push(vtable_symbol(table, work.ground.view(), fn_alloc).map_err(sym)?);
     }
-    let mut c_statics: AVec<'_, crate::code_records::ForeignStatic<'_>> = blaze_own::Vec::new_in(work.alloc);
+    let mut c_statics: AVec<'f, crate::code_records::ForeignStatic<'_>> = blaze_own::Vec::new_in(fn_alloc);
     for &s in built.statics.iter() {
         if let Some(c) = asking.foreign_static(s) {
             let weak = asking.world().static_item(s).is_some_and(|st| st.extern_weak);
@@ -2526,7 +2626,7 @@ fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
         }
     }
     // Absorb Phase 2's clean read log into `work.reads` (which applies `work.reads.plant`).
-    work.reads.absorb(ref_reads);
+    work.reads.absorb(&work.ref_reads);
     match sink {
         BuildSink::Lir { alloc, out, declared } => {
             let out_alloc = *alloc;
@@ -2565,7 +2665,7 @@ fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
                 lir_c_statics.push(BuiltForeignStatic { item: cs.item, start, len, weak: cs.weak });
             }
             let mut lir_statics: blaze_own::Vec<ItemKey, A> = blaze_own::Vec::with_capacity_in(built.statics.len(), out_alloc);
-            lir_statics.extend_from_slice(&built.statics);
+            lir_statics.extend_from_slice(built.statics);
             let mut lir_vtables: blaze_own::Vec<blaze_code::record::Symbol, A> = blaze_own::Vec::with_capacity_in(vtables.len(), out_alloc);
             lir_vtables.extend_from_slice(vtables.as_slice());
             let mut lir_vtable_data: blaze_own::Vec<(blaze_code::record::Symbol, blaze_own::Vec<u8, A>), A> = blaze_own::Vec::with_capacity_in(vtable_data.len(), out_alloc);
@@ -2575,9 +2675,9 @@ fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
                 lir_vtable_data.push((*vsym, copied));
             }
             let mut lir_tls: blaze_own::Vec<ItemKey, A> = blaze_own::Vec::with_capacity_in(built.thread_locals.len(), out_alloc);
-            lir_tls.extend_from_slice(&built.thread_locals);
+            lir_tls.extend_from_slice(built.thread_locals);
             let mut lir_traps: blaze_own::Vec<blaze_code::record::TrapSource, A> = blaze_own::Vec::with_capacity_in(built.traps.len(), out_alloc);
-            lir_traps.extend_from_slice(&built.traps);
+            lir_traps.extend_from_slice(built.traps);
             if work.clock.is_some() {
                 work.times.last = Some(MadeSizes::of(name(), built, &[]));
             }
@@ -2606,19 +2706,19 @@ fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
             } else {
                 crate::front2::builtins_shim::Routines::NONE
             };
-            let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };
-            let mut declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), work.alloc);
+            let names = InstanceNames { funcs: &funcs, statics: built.statics, c_statics: &c_statics, vtables: &vtables, tls: built.thread_locals };
+            let mut declared: AVec<'f, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), fn_alloc);
             for n in 0..reach.rows.len() {
                 let (tabled, name_bytes) = reach.row(n);
                 declared.push(Declared { tabled, name: name_bytes });
             }
-            let mut carried: AVec<'_, VtableDatum<'_>> = blaze_own::Vec::with_capacity_in(vtable_data.len(), work.alloc);
+            let mut carried: AVec<'f, VtableDatum<'_>> = blaze_own::Vec::with_capacity_in(vtable_data.len(), fn_alloc);
             for (symbol, datum) in vtable_data.iter() {
                 carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
             }
-            let read_list = work.reads.seal(&mut work.ground, work.alloc).map_err(|error| RunError::CodeRecord { function: name(), error: CodeRecordError::Reads(error) })?;
+            let read_list = work.reads.seal(&mut work.ground, fn_alloc).map_err(|error| RunError::CodeRecord { function: name(), error: CodeRecordError::Reads(error) })?;
             let emitted_from = work.clock.map(|c| c.now());
-            let made = make_entry_with_vtables(built.func.verified(), &names, &mut carried, routines, &mut declared, &read_list, &built.traps, work.isa, work.alloc)
+            let made = make_entry_with_vtables(built.func, &names, &mut carried, routines, &mut declared, &read_list, built.traps, work.isa, fn_alloc)
                 .map_err(|error| RunError::CodeRecord { function: name(), error })?;
             if let (Some(c), Some(from)) = (work.clock, emitted_from) {
                 work.times.emit += c.now().saturating_sub(from);
@@ -2725,7 +2825,7 @@ fn name_ref<'p, P: FrontEnd>(
     program: &'p P,
     asking: &Asking<'_, P>,
     ground: &mut PortableTys<'static>,
-    alloc: Alloc<'static>,
+    alloc: Alloc<'_>,
     reach: &mut Reach<'_>,
     i: usize,
     at: List,
@@ -2855,18 +2955,18 @@ fn bodied<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>], c: usi
 /// the instance made again. Each table's DATUM goes onto `data` by its symbol, each once (the
 /// entry carries it: code_records.rs `VtableDatum`), when every word of it is named.
 #[allow(clippy::too_many_arguments)]
-fn vtable_rows<P: FrontEnd>(
+fn vtable_rows<'f, P: FrontEnd>(
     program: &P,
     asking: &Asking<'_, P>,
     ground: &mut PortableTys<'static>,
-    layouts: &mut Layouts<Alloc<'static>>,
-    alloc: Alloc<'static>,
+    layouts: &mut Layouts<Alloc<'f>>,
+    alloc: Alloc<'f>,
     reach: &mut Reach<'_>,
     i: usize,
     at: List,
     want: VtableRef,
     on_untabled: &mut impl FnMut(ItemKey, RunError),
-    data: &mut AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)>,
+    data: &mut AVec<'_, (blaze_code::record::Symbol, AVec<'f, u8>)>,
 ) -> Result<(), RunError> {
     let world = asking.world();
     let adts = &world;
@@ -2907,7 +3007,7 @@ fn vtable_rows<P: FrontEnd>(
         let glue_item = glue.map(|g| g.item);
         let mut targs: AVec<'_, PTy> = blaze_own::Vec::new_in(alloc);
         targs.extend_from_slice(ground.view().list(t.args).map_err(|_| full())?);
-        let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut *ground, adts, alloc, Global).map_err(|e| fail(VtableFail::Build(e)))?;
+        let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut *ground, adts, alloc, alloc).map_err(|e| fail(VtableFail::Build(e)))?;
         // The table's datum (code_records.rs `VtableDatum`): its bytes as built (the header's
         // size and alignment, every address word 0), each address word a target by symbol.
         let mut datum = blaze_code::datum::Datum::new_in(blaze_code::datum::Place::ReadOnly, 3, alloc);
@@ -2985,7 +3085,7 @@ fn vtable_rows<P: FrontEnd>(
         if whole {
             let symbol = vtable_symbol(t, ground.view(), alloc).map_err(sym)?;
             let sealed = datum.seal().map_err(|why| RunError::CodeRecord { function: name(), error: CodeRecordError::VtableDatum(why) })?;
-            let mut bytes: AVec<'static, u8> = blaze_own::Vec::new_in(alloc);
+            let mut bytes: AVec<'f, u8> = blaze_own::Vec::new_in(alloc);
             sealed.encode(&mut bytes);
             if !data.iter().any(|(s, _)| *s == symbol) {
                 data.push((symbol, bytes));
@@ -3211,7 +3311,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     /// one is said by bzcode03's declared rows (kinds 4 and 5); until that form lands the
     /// caller makes the getter's and ender's records when this is true or its own records say so.
     pub fn made_thread_locals(&self) -> bool {
-        self.made.as_ref().is_some_and(|(_, s)| s.work.thread_locals)
+        self.made.as_ref().is_some_and(|(_, s)| s.core.work.thread_locals)
     }
 
     /// The checks the makes cost so far.
@@ -3344,14 +3444,20 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::build_lir`)" });
         };
         use blaze_core::wait::Clock as _;
-        let made_from = state.work.clock.map(|c| c.now());
-        state.work.times = MakeTimes::default();
-        state.work.last_make = None;
-        state.work.last_make_reportable = false;
+        let made_from = state.core.work.clock.map(|c| c.now());
+        state.core.work.times = MakeTimes::default();
+        state.core.work.last_make = None;
+        state.core.work.last_make_reportable = false;
         let mut out: Option<BuiltLir<A>> = None;
-        let mut sink = BuildSink::Lir { alloc, out: &mut out, declared };
-        run_instance_loop(program, &mut self.typing, state, &mut self.checks, tabled, name, &mut sink)?;
-        finish_make_timing(state, made_from);
+        {
+            let MakerState { core, fn_frame } = state;
+            let fn_guard = ResetOnDrop(fn_frame);
+            let fn_erased = blaze_own::Erased::new(&*fn_guard.0);
+            let fn_alloc = fn_erased.handle();
+            let mut sink = BuildSink::Lir { alloc, out: &mut out, declared };
+            run_instance_loop(program, &mut self.typing, core, fn_alloc, &mut self.checks, tabled, name, &mut sink)?;
+        }
+        finish_make_timing(&mut state.core, made_from);
         if let (Some(watch), Some(sizes)) = (self.watch, state.report_if_large_or_slow()) {
             (watch.report)(sizes);
         }
@@ -3363,7 +3469,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
     pub fn prepare_routines(&self) -> Result<Option<crate::front2::builtins_shim::BoundRef<'_>>, CodeRecordError> {
         match self.made.as_ref() {
             Some((program, state)) => {
-                let bound = get_or_init_routines(&state.work.routines, program, &state.work.ground, state.work.alloc)
+                let bound = get_or_init_routines(&state.core.work.routines, program, &state.core.work.ground, state.core.work.alloc)
                     .map_err(CodeRecordError::Symbol)?;
                 Ok(Some(bound.as_ref()))
             }
@@ -3387,11 +3493,14 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: item, why: "the maker's program was not made (make_one.rs `Maker::make_static`)" });
         };
-        state.work.last_make = None;
-        state.work.last_make_reportable = false;
+        let MakerState { core, fn_frame } = state;
+        let fn_guard = ResetOnDrop(fn_frame);
+        let fn_erased = blaze_own::Erased::new(&*fn_guard.0);
+        let fn_alloc = fn_erased.handle();
+        core.work.last_make = None;
+        core.work.last_make_reportable = false;
         let kind = program.make_static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
-        let alloc = state.work.alloc;
-        let mut vtable_keys: AVec<'_, blaze_build::vtable::VtableKey> = blaze_own::Vec::new_in(alloc);
+        let mut vtable_keys: AVec<'_, blaze_build::vtable::VtableKey> = blaze_own::Vec::new_in(fn_alloc);
         {
             let value = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
             for a in value.allocs.iter() {
@@ -3406,7 +3515,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         }
         if vtable_keys.is_empty() {
             let value = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
-            let made = match state.static_entry(program, value, kind, template) {
+            let made = match core.static_entry_with_vtables(program, value, kind, template, &[], &[], &[], fn_alloc) {
                 Ok(made) => made,
                 Err(error) => return Err(RunError::StaticRecord { static_: program.static_shown(item), error }),
             };
@@ -3415,21 +3524,21 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         }
         // Resolve each vtable key the static names and build its datum(s) + declared method rows,
         // retrying missing object traits, lazy impl fills, and untabled method bodies as `make_instance` does.
-        let mut resolved: AVec<'_, (blaze_build::vtable::VtableKey, VtableRef)> = blaze_own::Vec::with_capacity_in(vtable_keys.len(), alloc);
+        let mut resolved: AVec<'_, (blaze_build::vtable::VtableKey, VtableRef)> = blaze_own::Vec::with_capacity_in(vtable_keys.len(), fn_alloc);
         for key in vtable_keys {
-            if let Some(vtable) = program.const_vtable_ref(key, &mut state.work.ground, alloc) {
+            if let Some(vtable) = program.const_vtable_ref(key, &mut core.work.ground, fn_alloc) {
                 program.object_table(vtable.principal)?;
                 resolved.push((key, vtable));
             }
         }
-        let mut vtable_syms: AVec<'_, (blaze_build::vtable::VtableKey, blaze_code::record::Symbol)> = blaze_own::Vec::with_capacity_in(resolved.len(), alloc);
+        let mut vtable_syms: AVec<'_, (blaze_build::vtable::VtableKey, blaze_code::record::Symbol)> = blaze_own::Vec::with_capacity_in(resolved.len(), fn_alloc);
         for &(key, vtable) in resolved.iter() {
-            let sym = vtable_symbol(vtable, state.work.ground.view(), alloc)
+            let sym = vtable_symbol(vtable, core.work.ground.view(), fn_alloc)
                 .map_err(|error| RunError::StaticRecord { static_: program.static_shown(item), error: crate::code_records::statics::StaticRecordError::VtableName { alloc: 0, at: 0, error } })?;
             vtable_syms.push((key, sym));
         }
-        let mut reach = Reach::new_in(alloc);
-        let mut vtable_data: AVec<'_, (blaze_code::record::Symbol, AVec<'static, u8>)> = blaze_own::Vec::new_in(alloc);
+        let mut reach = Reach::new_in(fn_alloc);
+        let mut vtable_data: AVec<'_, (blaze_code::record::Symbol, AVec<'_, u8>)> = blaze_own::Vec::new_in(fn_alloc);
         if !resolved.is_empty() {
             // A fresh pooled worker whose first job is a static with vtables starts with
             // `program.fn_count() == 0` when `self.entry` is `None` (`MakerStart::Direct`).
@@ -3447,7 +3556,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                         })
                     });
                 if let Some(seed_fn) = seed {
-                    state.ensure(program, &mut self.typing, seed_fn, &mut self.checks)?;
+                    core.ensure(program, &mut self.typing, seed_fn, &mut self.checks, fn_alloc)?;
                 }
             }
             if program.fn_count() == 0 {
@@ -3456,19 +3565,19 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                     why: "a static references a vtable, and no function row could be seeded to build its vtable datum (make_one.rs `static_over`)",
                 });
             }
-            let mut asked = AskProgress::new_in(alloc);
+            let mut asked = AskProgress::new_in(fn_alloc);
             let mut owners = 0usize;
             loop {
-                reach = Reach::new_in(alloc);
+                reach = Reach::new_in(fn_alloc);
                 vtable_data.clear();
-                let mut untabled: AVec<'_, (ItemKey, RunError)> = blaze_own::Vec::new_in(alloc);
+                let mut untabled: AVec<'_, (ItemKey, RunError)> = blaze_own::Vec::new_in(fn_alloc);
                 let step = {
-                    let MakerState { checked, tables, work, .. } = &mut *state;
+                    let MakerCore { checked, tables, work, .. } = &mut *core;
                     let t = tables.take().ok_or_else(|| tables_gone(item))?;
-                    let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: work.alloc };
+                    let bodies = Bodies { checked: &checked[..], closures: t.closures, coroutines: t.coroutines, const_at: t.const_at, overflow: work.overflow, ub: work.ub, panic: work.panic, alloc: fn_alloc };
                     work.reads.clear();
                     let asking = Asking::new(&*program, 0, &work.langs, &bodies, &work.query_cache, &work.reads);
-                    let mut layouts: Layouts<Alloc<'static>> = Layouts::new_in(alloc);
+                    let mut layouts: Layouts<Alloc<'_>> = Layouts::new_in(fn_alloc);
                     let mut res = Ok(());
                     for &(_, want) in resolved.iter() {
                         if let Err(e) = vtable_rows(
@@ -3476,7 +3585,7 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                             &asking,
                             &mut work.ground,
                             &mut layouts,
-                            alloc,
+                            fn_alloc,
                             &mut reach,
                             0,
                             List::EMPTY,
@@ -3512,10 +3621,10 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                     Ok(()) if !untabled.is_empty() => {
                         for (key, refusal) in untabled {
                             owners += 1;
-                            if owners > MOST_HELD_COROUTINES || state.asked.contains_key(&key) {
+                            if owners > MOST_HELD_COROUTINES || core.asked.contains_key(&key) {
                                 return Err(refusal);
                             }
-                            state.ensure(program, &mut self.typing, key, &mut self.checks)?;
+                            core.ensure(program, &mut self.typing, key, &mut self.checks, fn_alloc)?;
                         }
                     }
                     Ok(()) => break,
@@ -3530,17 +3639,17 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                 }
             }
         }
-        let mut extra_declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), alloc);
+        let mut extra_declared: AVec<'_, Declared<'_>> = blaze_own::Vec::with_capacity_in(reach.rows.len(), fn_alloc);
         for n in 0..reach.rows.len() {
             let (tabled, name_bytes) = reach.row(n);
             extra_declared.push(Declared { tabled, name: name_bytes });
         }
-        let mut carried: AVec<'_, VtableDatum<'_>> = blaze_own::Vec::with_capacity_in(vtable_data.len(), alloc);
+        let mut carried: AVec<'_, VtableDatum<'_>> = blaze_own::Vec::with_capacity_in(vtable_data.len(), fn_alloc);
         for (symbol, datum) in vtable_data.iter() {
             carried.push(VtableDatum { symbol: *symbol, datum: datum.as_slice() });
         }
         let value = program.static_value(item).map_err(|e| RunError::Front2(Front2Refusal::Lazy(e)))?;
-        let made = match state.static_entry_with_vtables(program, value, kind, template, &vtable_syms, &extra_declared, &carried) {
+        let made = match core.static_entry_with_vtables(program, value, kind, template, &vtable_syms, &extra_declared, &carried, fn_alloc) {
             Ok(made) => made,
             Err(error) => return Err(RunError::StaticRecord { static_: program.static_shown(item), error }),
         };

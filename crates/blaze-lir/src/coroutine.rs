@@ -350,7 +350,7 @@ fn split_inner<A: Allocator + Clone>(
     region: Option<(Region, &[SlotName])>,
     alloc: A,
 ) -> Result<Split<A>, CoroutineError> {
-    verify(view).map_err(CoroutineError::Verify)?;
+    crate::verify::verify_in(view, &alloc).map_err(CoroutineError::Verify)?;
     let scratch = &alloc;
     let body = read(view, shape, panics, &scratch)?;
     let live = overlap::addressed(&body, &scratch);
@@ -1473,7 +1473,7 @@ fn emit<S: Allocator + Copy, A: Allocator + Clone>(
     }
     // As the builder does: the output is checked in debug builds.
     if cfg!(debug_assertions) {
-        verify(func.view()).map_err(|error| CoroutineError::Output(which, error))?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(|error| CoroutineError::Output(which, error))?;
     }
     Ok(func)
 }

@@ -105,7 +105,7 @@ pub use simplify::{
 #[cfg(any(test, feature = "eval"))]
 pub use simplify::validate;
 pub use ty::{Scalar, Ty};
-pub use verify::{Verified, VerifiedFunc, VerifyError, verify};
+pub use verify::{Verified, VerifiedFunc, VerifyError, verify, verify_in};
 
 /// The version of what LIR's bytes mean: its operations, their operands and flags, its types
 /// and tables. Part of the record's schema ([`persist::SCHEMA`]) and of every key of a LIR, so

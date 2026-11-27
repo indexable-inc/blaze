@@ -991,9 +991,9 @@ pub fn apply_semantic_proofs<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     let cleaned = dead(func.view(), alloc)?;
-    verify(cleaned.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(cleaned.view(), cleaned.allocator()).map_err(SimplifyError::Verify)?;
     Ok(SemProofOutput { func: cleaned, stats })
 }
 

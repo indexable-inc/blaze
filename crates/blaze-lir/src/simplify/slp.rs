@@ -664,7 +664,7 @@ pub fn slp_vectorize<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Sl
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     let cleaned = dead(func.view(), alloc)?;
     Ok(SlpOutput {
         func: cleaned,
@@ -971,7 +971,7 @@ pub fn vectorize_memchr_loops<A: Allocator + Copy>(
         }
     }
 
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(MemchrOutput {
         func,
         stats: MemchrStats { loops_vectorized: 1 },

@@ -1618,7 +1618,7 @@ fn apply_if_pattern<A: Allocator + Copy>(
         set_at(&mut val_map, param_old, mapped);
     }
     apply_val_fixups(&mut func, &val_map, &fixups)?;
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     let (d, d_taken) = if taken_by_block.is_empty() {
         (dead(func.view(), alloc)?, Vec::new_in(alloc))
     } else {
@@ -2144,7 +2144,7 @@ fn balance_select_chains_once<A: Allocator + Copy>(
     }
 
     apply_val_fixups(&mut func, &val_map, &fixups)?;
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(Some(func))
 }
 

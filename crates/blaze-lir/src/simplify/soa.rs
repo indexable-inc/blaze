@@ -1049,7 +1049,7 @@ pub fn rewrite_aos_to_soa<A: Allocator + Copy>(
     }
 
     let cleaned = dead(func.view(), alloc)?;
-    verify(cleaned.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(cleaned.view(), cleaned.allocator()).map_err(SimplifyError::Verify)?;
 
     Ok(SoaOutput {
         func: cleaned,

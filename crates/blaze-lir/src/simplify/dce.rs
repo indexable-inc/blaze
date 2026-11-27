@@ -316,7 +316,7 @@ pub(super) fn rebuild<A: Allocator + Copy>(view: View<'_>, edit: &Edit<A>, alloc
             }
         }
         let func = out.func;
-        verify(func.view()).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
         return Ok(func);
     }
 
@@ -418,7 +418,7 @@ pub(super) fn rebuild<A: Allocator + Copy>(view: View<'_>, edit: &Edit<A>, alloc
         }
     }
     let func = out.func;
-    verify(func.view()).map_err(SimplifyError::Verify)?;
+    crate::verify::verify_in(func.view(), func.allocator()).map_err(SimplifyError::Verify)?;
     Ok(func)
 }
 
@@ -948,7 +948,7 @@ pub fn dead<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Func<A>, Si
         }
     }
     if !any_jump && !any_merge && live_count == len && reached.iter().all(|&r| r) {
-        verify(view).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(view, alloc).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
     let mut stands = Vec::with_capacity_in(len, alloc);
@@ -1003,7 +1003,7 @@ pub fn coalesce_cfg<A: Allocator + Copy>(view: View<'_>, alloc: A) -> Result<Fun
         }
     }
     if !any_merge && reached.iter().all(|&r| r) {
-        verify(view).map_err(SimplifyError::Verify)?;
+        crate::verify::verify_in(view, alloc).map_err(SimplifyError::Verify)?;
         return Ok(view.to_func_in(alloc));
     }
     let mut stands = Vec::with_capacity_in(len, alloc);
