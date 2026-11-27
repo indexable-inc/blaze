@@ -19,10 +19,16 @@
 //!
 //! archetypal! {
 //!     pub enum ExprStore, #[derive(Debug, PartialEq, Eq)] ExprRef {
-//!         Empty => push_empty / get_empty / empty_count,
-//!         Lit(u64) => push_lit / get_lit / lit_slice / lit_slice_mut,
-//!         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-//!         Call { callee: u32, args: u32 } => push_call / get_call / call_slice / call_slice_mut,
+//!         unit {
+//!             Empty => push_empty / get_empty / empty_count,
+//!         }
+//!         tuple {
+//!             Lit(u64) => push_lit / get_lit / lit_slice / lit_slice_mut,
+//!         }
+//!         struct {
+//!             #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+//!             Call { callee: u32, args: u32 } => push_call / get_call / call_slice / call_slice_mut,
+//!         }
 //!     }
 //! }
 //!
@@ -114,12 +120,34 @@ impl fmt::Debug for ArchetypeHandle {
     }
 }
 
-/// Computes a variant's `u8` discriminant at compile time from the list of preceding variants.
+/// Computes a variant's `u8` discriminant at compile time by locating `target` in `names`.
 #[doc(hidden)]
 #[inline]
-pub const fn __tag_of(prev: &[&str]) -> u8 {
-    assert!(prev.len() < MAX_VARIANTS, "archetypal! supports at most 256 variants");
-    prev.len() as u8
+pub const fn __tag_index(names: &[&str], target: &str) -> u8 {
+    assert!(names.len() <= MAX_VARIANTS, "archetypal! supports at most 256 variants");
+    let mut i = 0u8;
+    let mut rest = names;
+    while let Some((&name, next)) = rest.split_first() {
+        let mut a = name.as_bytes();
+        let mut b = target.as_bytes();
+        let mut same = a.len() == b.len();
+        while same {
+            match (a.split_first(), b.split_first()) {
+                (Some((&x, na)), Some((&y, nb))) => {
+                    same = x == y;
+                    a = na;
+                    b = nb;
+                }
+                _ => break,
+            }
+        }
+        if same {
+            return i;
+        }
+        i = i.wrapping_add(1);
+        rest = next;
+    }
+    0
 }
 
 /// Builds an [`ArchetypeHandle`] for `row` or panics on 24-bit row overflow before mutating storage.
@@ -145,496 +173,16 @@ fn __overflow_variant(variant: &'static str, row: usize) -> ! {
     )
 }
 
-/// Internal TT-muncher helper for [`archetypal!`].
-///
-/// Takes the recursive macro path in `step: [$step:path]` so external callers recurse through
-/// `$crate::__archetypal_step` while crate-internal tests can pass bare `__archetypal_step`
-/// (avoiding rustc issue #52234 under `blaze-own`'s crate-level `#![blaze::trust]` attribute).
-#[doc(hidden)]
-#[macro_export]
-macro_rules! __archetypal_step {
-    // Struct payload variant: `Call { callee: u32, args: u32 } => push_call / get_call / call_slice / call_slice_mut`
-    (
-        step: [$step:path],
-        store_meta: [$($store_meta:tt)*],
-        ref_meta: [$($ref_meta:tt)*],
-        vis: [$($vis:tt)*],
-        store: $Store:ident,
-        ref_ty: $Ref:ident,
-        ids: [$alloc_id:ident, $self_id:ident, $handle_id:ident],
-        prev: [$($prev:ident),*],
-        payload_structs: [$($payload_structs:tt)*],
-        ref_variants: [$($ref_variants:tt)*],
-        store_fields: [$($store_fields:tt)*],
-        init_fields: [$($init_fields:tt)*],
-        len_terms: [$($len_terms:tt)*],
-        clear_stmts: [$($clear_stmts:tt)*],
-        methods: [$($methods:tt)*],
-        get_arms: [$($get_arms:tt)*],
-        rest: [
-            $(#[$vmeta:meta])*
-            $Variant:ident { $($field:ident : $fty:ty),* $(,)? } => $push:ident / $get:ident / $slice:ident / $slice_mut:ident
-            $(, $($rest:tt)*)?
-        ]
-    ) => {
-        $step! {
-            step: [$step],
-            store_meta: [$($store_meta)*],
-            ref_meta: [$($ref_meta)*],
-            vis: [$($vis)*],
-            store: $Store,
-            ref_ty: $Ref,
-            ids: [$alloc_id, $self_id, $handle_id],
-            prev: [$($prev,)* $Variant],
-            payload_structs: [
-                $($payload_structs)*
-                $(#[$vmeta])*
-                $($vis)* struct $Variant {
-                    $( pub $field: $fty, )*
-                }
-            ],
-            ref_variants: [
-                $($ref_variants)*
-                $Variant(&'a $Variant),
-            ],
-            store_fields: [
-                $($store_fields)*
-                $Variant: $crate::Vec<$Variant, A>,
-            ],
-            init_fields: [
-                $($init_fields)*
-                $Variant: $crate::Vec::new_in($alloc_id.clone()),
-            ],
-            len_terms: [
-                $($len_terms)*
-                + $self_id.$Variant.len()
-            ],
-            clear_stmts: [
-                $($clear_stmts)*
-                $self_id.$Variant.clear();
-            ],
-            methods: [
-                $($methods)*
-                #[track_caller]
-                #[inline]
-                $($vis)* fn $push(&mut self, $($field: $fty),*) -> $crate::archetypal::ArchetypeHandle {
-                    const TAG: u8 = $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]);
-                    let handle = $crate::archetypal::__make_handle(
-                        TAG,
-                        self.$Variant.len(),
-                        stringify!($Variant),
-                    );
-                    self.$Variant.push($Variant { $($field),* });
-                    handle
-                }
-
-                #[inline]
-                $($vis)* fn $get(&self, h: $crate::archetypal::ArchetypeHandle) -> Option<&$Variant> {
-                    const TAG: u8 = $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]);
-                    if h.tag() != TAG {
-                        return None;
-                    }
-                    self.$Variant.get(h.row() as usize)
-                }
-
-                #[inline]
-                $($vis)* fn $slice(&self) -> &[$Variant] {
-                    self.$Variant.as_slice()
-                }
-
-                #[inline]
-                $($vis)* fn $slice_mut(&mut self) -> &mut [$Variant] {
-                    self.$Variant.as_mut_slice()
-                }
-            ],
-            get_arms: [
-                $($get_arms)*
-                if $handle_id.tag() == $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]) {
-                    return $self_id.$Variant.get($handle_id.row() as usize).map($Ref::$Variant);
-                }
-            ],
-            rest: [$($($rest)*)?]
-        }
-    };
-
-    // Single-payload tuple variant: `Lit(u64) => push_lit / get_lit / lit_slice / lit_slice_mut`
-    (
-        step: [$step:path],
-        store_meta: [$($store_meta:tt)*],
-        ref_meta: [$($ref_meta:tt)*],
-        vis: [$($vis:tt)*],
-        store: $Store:ident,
-        ref_ty: $Ref:ident,
-        ids: [$alloc_id:ident, $self_id:ident, $handle_id:ident],
-        prev: [$($prev:ident),*],
-        payload_structs: [$($payload_structs:tt)*],
-        ref_variants: [$($ref_variants:tt)*],
-        store_fields: [$($store_fields:tt)*],
-        init_fields: [$($init_fields:tt)*],
-        len_terms: [$($len_terms:tt)*],
-        clear_stmts: [$($clear_stmts:tt)*],
-        methods: [$($methods:tt)*],
-        get_arms: [$($get_arms:tt)*],
-        rest: [
-            $(#[$vmeta:meta])*
-            $Variant:ident ( $ty:ty ) => $push:ident / $get:ident / $slice:ident / $slice_mut:ident
-            $(, $($rest:tt)*)?
-        ]
-    ) => {
-        $step! {
-            step: [$step],
-            store_meta: [$($store_meta)*],
-            ref_meta: [$($ref_meta)*],
-            vis: [$($vis)*],
-            store: $Store,
-            ref_ty: $Ref,
-            ids: [$alloc_id, $self_id, $handle_id],
-            prev: [$($prev,)* $Variant],
-            payload_structs: [$($payload_structs)*],
-            ref_variants: [
-                $($ref_variants)*
-                $(#[$vmeta])*
-                $Variant(&'a $ty),
-            ],
-            store_fields: [
-                $($store_fields)*
-                $Variant: $crate::Vec<$ty, A>,
-            ],
-            init_fields: [
-                $($init_fields)*
-                $Variant: $crate::Vec::new_in($alloc_id.clone()),
-            ],
-            len_terms: [
-                $($len_terms)*
-                + $self_id.$Variant.len()
-            ],
-            clear_stmts: [
-                $($clear_stmts)*
-                $self_id.$Variant.clear();
-            ],
-            methods: [
-                $($methods)*
-                #[track_caller]
-                #[inline]
-                $($vis)* fn $push(&mut self, value: $ty) -> $crate::archetypal::ArchetypeHandle {
-                    const TAG: u8 = $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]);
-                    let handle = $crate::archetypal::__make_handle(
-                        TAG,
-                        self.$Variant.len(),
-                        stringify!($Variant),
-                    );
-                    self.$Variant.push(value);
-                    handle
-                }
-
-                #[inline]
-                $($vis)* fn $get(&self, h: $crate::archetypal::ArchetypeHandle) -> Option<&$ty> {
-                    const TAG: u8 = $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]);
-                    if h.tag() != TAG {
-                        return None;
-                    }
-                    self.$Variant.get(h.row() as usize)
-                }
-
-                #[inline]
-                $($vis)* fn $slice(&self) -> &[$ty] {
-                    self.$Variant.as_slice()
-                }
-
-                #[inline]
-                $($vis)* fn $slice_mut(&mut self) -> &mut [$ty] {
-                    self.$Variant.as_mut_slice()
-                }
-            ],
-            get_arms: [
-                $($get_arms)*
-                if $handle_id.tag() == $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]) {
-                    return $self_id.$Variant.get($handle_id.row() as usize).map($Ref::$Variant);
-                }
-            ],
-            rest: [$($($rest)*)?]
-        }
-    };
-
-    // Unit variant with count accessor: `Empty => push_empty / get_empty / empty_count`
-    (
-        step: [$step:path],
-        store_meta: [$($store_meta:tt)*],
-        ref_meta: [$($ref_meta:tt)*],
-        vis: [$($vis:tt)*],
-        store: $Store:ident,
-        ref_ty: $Ref:ident,
-        ids: [$alloc_id:ident, $self_id:ident, $handle_id:ident],
-        prev: [$($prev:ident),*],
-        payload_structs: [$($payload_structs:tt)*],
-        ref_variants: [$($ref_variants:tt)*],
-        store_fields: [$($store_fields:tt)*],
-        init_fields: [$($init_fields:tt)*],
-        len_terms: [$($len_terms:tt)*],
-        clear_stmts: [$($clear_stmts:tt)*],
-        methods: [$($methods:tt)*],
-        get_arms: [$($get_arms:tt)*],
-        rest: [
-            $(#[$vmeta:meta])*
-            $Variant:ident => $push:ident / $get:ident / $count:ident
-            $(, $($rest:tt)*)?
-        ]
-    ) => {
-        $step! {
-            step: [$step],
-            store_meta: [$($store_meta)*],
-            ref_meta: [$($ref_meta)*],
-            vis: [$($vis)*],
-            store: $Store,
-            ref_ty: $Ref,
-            ids: [$alloc_id, $self_id, $handle_id],
-            prev: [$($prev,)* $Variant],
-            payload_structs: [$($payload_structs)*],
-            ref_variants: [
-                $($ref_variants)*
-                $(#[$vmeta])*
-                $Variant,
-            ],
-            store_fields: [
-                $($store_fields)*
-                $Variant: u32,
-            ],
-            init_fields: [
-                $($init_fields)*
-                $Variant: 0,
-            ],
-            len_terms: [
-                $($len_terms)*
-                + ($self_id.$Variant as usize)
-            ],
-            clear_stmts: [
-                $($clear_stmts)*
-                $self_id.$Variant = 0;
-            ],
-            methods: [
-                $($methods)*
-                #[track_caller]
-                #[inline]
-                $($vis)* fn $push(&mut self) -> $crate::archetypal::ArchetypeHandle {
-                    const TAG: u8 = $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]);
-                    let handle = $crate::archetypal::__make_handle(
-                        TAG,
-                        self.$Variant as usize,
-                        stringify!($Variant),
-                    );
-                    self.$Variant += 1;
-                    handle
-                }
-
-                #[inline]
-                $($vis)* fn $get(&self, h: $crate::archetypal::ArchetypeHandle) -> Option<()> {
-                    const TAG: u8 = $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]);
-                    if h.tag() == TAG && h.row() < self.$Variant {
-                        Some(())
-                    } else {
-                        None
-                    }
-                }
-
-                #[inline]
-                $($vis)* fn $count(&self) -> usize {
-                    self.$Variant as usize
-                }
-            ],
-            get_arms: [
-                $($get_arms)*
-                if $handle_id.tag() == $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]) {
-                    return if $handle_id.row() < $self_id.$Variant {
-                        Some($Ref::$Variant)
-                    } else {
-                        None
-                    };
-                }
-            ],
-            rest: [$($($rest)*)?]
-        }
-    };
-
-    // Unit variant without count accessor: `Empty => push_empty / get_empty`
-    (
-        step: [$step:path],
-        store_meta: [$($store_meta:tt)*],
-        ref_meta: [$($ref_meta:tt)*],
-        vis: [$($vis:tt)*],
-        store: $Store:ident,
-        ref_ty: $Ref:ident,
-        ids: [$alloc_id:ident, $self_id:ident, $handle_id:ident],
-        prev: [$($prev:ident),*],
-        payload_structs: [$($payload_structs:tt)*],
-        ref_variants: [$($ref_variants:tt)*],
-        store_fields: [$($store_fields:tt)*],
-        init_fields: [$($init_fields:tt)*],
-        len_terms: [$($len_terms:tt)*],
-        clear_stmts: [$($clear_stmts:tt)*],
-        methods: [$($methods:tt)*],
-        get_arms: [$($get_arms:tt)*],
-        rest: [
-            $(#[$vmeta:meta])*
-            $Variant:ident => $push:ident / $get:ident
-            $(, $($rest:tt)*)?
-        ]
-    ) => {
-        $step! {
-            step: [$step],
-            store_meta: [$($store_meta)*],
-            ref_meta: [$($ref_meta)*],
-            vis: [$($vis)*],
-            store: $Store,
-            ref_ty: $Ref,
-            ids: [$alloc_id, $self_id, $handle_id],
-            prev: [$($prev,)* $Variant],
-            payload_structs: [$($payload_structs)*],
-            ref_variants: [
-                $($ref_variants)*
-                $(#[$vmeta])*
-                $Variant,
-            ],
-            store_fields: [
-                $($store_fields)*
-                $Variant: u32,
-            ],
-            init_fields: [
-                $($init_fields)*
-                $Variant: 0,
-            ],
-            len_terms: [
-                $($len_terms)*
-                + ($self_id.$Variant as usize)
-            ],
-            clear_stmts: [
-                $($clear_stmts)*
-                $self_id.$Variant = 0;
-            ],
-            methods: [
-                $($methods)*
-                #[track_caller]
-                #[inline]
-                $($vis)* fn $push(&mut self) -> $crate::archetypal::ArchetypeHandle {
-                    const TAG: u8 = $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]);
-                    let handle = $crate::archetypal::__make_handle(
-                        TAG,
-                        self.$Variant as usize,
-                        stringify!($Variant),
-                    );
-                    self.$Variant += 1;
-                    handle
-                }
-
-                #[inline]
-                $($vis)* fn $get(&self, h: $crate::archetypal::ArchetypeHandle) -> Option<()> {
-                    const TAG: u8 = $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]);
-                    if h.tag() == TAG && h.row() < self.$Variant {
-                        Some(())
-                    } else {
-                        None
-                    }
-                }
-            ],
-            get_arms: [
-                $($get_arms)*
-                if $handle_id.tag() == $crate::archetypal::__tag_of(&[$(stringify!($prev)),*]) {
-                    return if $handle_id.row() < $self_id.$Variant {
-                        Some($Ref::$Variant)
-                    } else {
-                        None
-                    };
-                }
-            ],
-            rest: [$($($rest)*)?]
-        }
-    };
-
-    // Terminal rule: emit payload structs, reference view enum, store struct, and methods.
-    (
-        step: [$step:path],
-        store_meta: [$($store_meta:tt)*],
-        ref_meta: [$($ref_meta:tt)*],
-        vis: [$($vis:tt)*],
-        store: $Store:ident,
-        ref_ty: $Ref:ident,
-        ids: [$alloc_id:ident, $self_id:ident, $handle_id:ident],
-        prev: [$($prev:ident),*],
-        payload_structs: [$($payload_structs:tt)*],
-        ref_variants: [$($ref_variants:tt)*],
-        store_fields: [$($store_fields:tt)*],
-        init_fields: [$($init_fields:tt)*],
-        len_terms: [$($len_terms:tt)*],
-        clear_stmts: [$($clear_stmts:tt)*],
-        methods: [$($methods:tt)*],
-        get_arms: [$($get_arms:tt)*],
-        rest: []
-    ) => {
-        $($payload_structs)*
-
-        #[doc = concat!("Borrowed reference view of one element in `", stringify!($Store), "`.")]
-        #[derive(Clone, Copy)]
-        $($ref_meta)*
-        #[allow(dead_code)]
-        $($vis)* enum $Ref<'a> {
-            $($ref_variants)*
-        }
-
-        $($store_meta)*
-        #[allow(non_snake_case)]
-        $($vis)* struct $Store<A: $crate::archetypal::Allocator> {
-            $($store_fields)*
-            _alloc: $crate::archetypal::PhantomData<A>,
-        }
-
-        #[allow(dead_code, non_snake_case)]
-        impl<A: $crate::archetypal::Allocator + Clone> $Store<A> {
-            #[inline]
-            $($vis)* fn new_in($alloc_id: A) -> Self {
-                let _ = &$alloc_id;
-                Self {
-                    $($init_fields)*
-                    _alloc: $crate::archetypal::PhantomData,
-                }
-            }
-        }
-
-        #[allow(dead_code, non_snake_case)]
-        impl<A: $crate::archetypal::Allocator> $Store<A> {
-            #[inline]
-            $($vis)* fn len(&$self_id) -> usize {
-                0usize $($len_terms)*
-            }
-
-            #[inline]
-            $($vis)* fn is_empty(&self) -> bool {
-                self.len() == 0
-            }
-
-            #[inline]
-            $($vis)* fn clear(&mut $self_id) {
-                $($clear_stmts)*
-            }
-
-            #[inline]
-            $($vis)* fn get(&$self_id, $handle_id: $crate::archetypal::ArchetypeHandle) -> Option<$Ref<'_>> {
-                $($get_arms)*
-                None
-            }
-
-            $($methods)*
-        }
-    };
-}
-
 /// Defines an archetypal enum store with one dense [`Vec`](crate::Vec) column per payload variant
 /// and a zero-byte-per-element `u32` counter per unit variant.
 ///
 /// Mirrors [`soa!`](crate::soa!): `macro_rules!` cannot synthesize snake_case method names from
-/// variant names, so each variant lists its accessor names after `=>`:
+/// variant names, so each variant lists its accessor names after `=>`, grouped into optional
+/// `unit { .. }`, `tuple { .. }`, and `struct { .. }` sections (single-pass, zero macro recursion):
 ///
-/// - Unit variant: `Empty => push_empty / get_empty` or `Empty => push_empty / get_empty / empty_count`
-/// - Tuple payload variant: `Lit(u64) => push_lit / get_lit / lit_slice / lit_slice_mut`
-/// - Struct payload variant: `Call { callee: u32, args: u32 } => push_call / get_call / call_slice / call_slice_mut`
+/// - `unit { Empty => push_empty / get_empty / empty_count, }` (or omit `/ empty_count`)
+/// - `tuple { Lit(u64) => push_lit / get_lit / lit_slice / lit_slice_mut, }`
+/// - `struct { Call { callee: u32, args: u32 } => push_call / get_call / call_slice / call_slice_mut, }`
 ///
 /// Generates:
 /// - A payload struct `$vis struct $Variant { $($vis $field: $fty),* }` for each struct variant.
@@ -650,27 +198,229 @@ macro_rules! archetypal {
     (
         $(#[$store_meta:meta])*
         $vis:vis enum $Store:ident, $(#[$ref_meta:meta])* $Ref:ident {
-            $($body:tt)*
+            $(
+                unit {
+                    $(
+                        $(#[$umeta:meta])*
+                        $UVariant:ident => $upush:ident / $uget:ident $(/ $ucount:ident)?
+                    ),* $(,)?
+                }
+            )?
+            $(
+                tuple {
+                    $(
+                        $(#[$tmeta:meta])*
+                        $TVariant:ident ( $tty:ty ) => $tpush:ident / $tget:ident / $tslice:ident / $tslice_mut:ident
+                    ),* $(,)?
+                }
+            )?
+            $(
+                struct {
+                    $(
+                        $(#[$smeta:meta])*
+                        $SVariant:ident { $($sfield:ident : $sfty:ty),* $(,)? } => $spush:ident / $sget:ident / $sslice:ident / $sslice_mut:ident
+                    ),* $(,)?
+                }
+            )?
         }
     ) => {
-        $crate::__archetypal_step! {
-            step: [$crate::__archetypal_step],
-            store_meta: [$(#[$store_meta])*],
-            ref_meta: [$(#[$ref_meta])*],
-            vis: [$vis],
-            store: $Store,
-            ref_ty: $Ref,
-            ids: [alloc, self, h],
-            prev: [],
-            payload_structs: [],
-            ref_variants: [],
-            store_fields: [],
-            init_fields: [],
-            len_terms: [],
-            clear_stmts: [],
-            methods: [],
-            get_arms: [],
-            rest: [$($body)*]
+        $($(
+            $(#[$smeta])*
+            $vis struct $SVariant {
+                $( pub $sfield: $sfty, )*
+            }
+        )*)?
+
+        #[doc = concat!("Borrowed reference view of one element in `", stringify!($Store), "`.")]
+        #[derive(Clone, Copy)]
+        $(#[$ref_meta])*
+        #[allow(dead_code)]
+        $vis enum $Ref<'a> {
+            $($(
+                $(#[$umeta])*
+                $UVariant,
+            )*)?
+            $($(
+                $(#[$tmeta])*
+                $TVariant(&'a $tty),
+            )*)?
+            $($(
+                $SVariant(&'a $SVariant),
+            )*)?
+        }
+
+        impl $Ref<'static> {
+            #[doc(hidden)]
+            #[inline(always)]
+            const fn __blaze_archetypal_tag(name: &'static str) -> u8 {
+                $crate::archetypal::__tag_index(
+                    &[
+                        $($(stringify!($UVariant),)*)?
+                        $($(stringify!($TVariant),)*)?
+                        $($(stringify!($SVariant),)*)?
+                    ],
+                    name,
+                )
+            }
+        }
+
+        $(#[$store_meta])*
+        #[allow(non_snake_case)]
+        $vis struct $Store<A: $crate::archetypal::Allocator> {
+            $($( $UVariant: u32, )*)?
+            $($( $TVariant: $crate::Vec<$tty, A>, )*)?
+            $($( $SVariant: $crate::Vec<$SVariant, A>, )*)?
+            _alloc: $crate::archetypal::PhantomData<A>,
+        }
+
+        #[allow(dead_code, non_snake_case)]
+        impl<A: $crate::archetypal::Allocator + Clone> $Store<A> {
+            #[inline]
+            $vis fn new_in(alloc: A) -> Self {
+                let _ = &alloc;
+                Self {
+                    $($( $UVariant: 0, )*)?
+                    $($( $TVariant: $crate::Vec::new_in(alloc.clone()), )*)?
+                    $($( $SVariant: $crate::Vec::new_in(alloc.clone()), )*)?
+                    _alloc: $crate::archetypal::PhantomData,
+                }
+            }
+        }
+
+        #[allow(dead_code, non_snake_case)]
+        impl<A: $crate::archetypal::Allocator> $Store<A> {
+            #[inline]
+            $vis fn len(&self) -> usize {
+                0usize
+                    $($( + (self.$UVariant as usize) )*)?
+                    $($( + self.$TVariant.len() )*)?
+                    $($( + self.$SVariant.len() )*)?
+            }
+
+            #[inline]
+            $vis fn is_empty(&self) -> bool {
+                self.len() == 0
+            }
+
+            #[inline]
+            $vis fn clear(&mut self) {
+                $($( self.$UVariant = 0; )*)?
+                $($( self.$TVariant.clear(); )*)?
+                $($( self.$SVariant.clear(); )*)?
+            }
+
+            #[inline]
+            $vis fn get(&self, h: $crate::archetypal::ArchetypeHandle) -> Option<$Ref<'_>> {
+                $($(
+                    if h.tag() == const { $Ref::__blaze_archetypal_tag(stringify!($UVariant)) } {
+                        return (h.row() < self.$UVariant).then_some($Ref::$UVariant);
+                    }
+                )*)?
+                $($(
+                    if h.tag() == const { $Ref::__blaze_archetypal_tag(stringify!($TVariant)) } {
+                        return self.$TVariant.get(h.row() as usize).map($Ref::$TVariant);
+                    }
+                )*)?
+                $($(
+                    if h.tag() == const { $Ref::__blaze_archetypal_tag(stringify!($SVariant)) } {
+                        return self.$SVariant.get(h.row() as usize).map($Ref::$SVariant);
+                    }
+                )*)?
+                None
+            }
+
+            $($(
+                #[inline]
+                $vis fn $upush(&mut self) -> $crate::archetypal::ArchetypeHandle {
+                    let row = self.$UVariant as usize;
+                    let handle = $crate::archetypal::__make_handle(
+                        const { $Ref::__blaze_archetypal_tag(stringify!($UVariant)) },
+                        row,
+                        stringify!($UVariant),
+                    );
+                    self.$UVariant += 1;
+                    handle
+                }
+
+                #[inline]
+                $vis fn $uget(&self, h: $crate::archetypal::ArchetypeHandle) -> Option<()> {
+                    if h.tag() != const { $Ref::__blaze_archetypal_tag(stringify!($UVariant)) } {
+                        return None;
+                    }
+                    (h.row() < self.$UVariant).then_some(())
+                }
+
+                $(
+                    #[inline]
+                    $vis fn $ucount(&self) -> u32 {
+                        self.$UVariant
+                    }
+                )?
+            )*)?
+
+            $($(
+                #[inline]
+                $vis fn $tpush(&mut self, value: $tty) -> $crate::archetypal::ArchetypeHandle {
+                    let row = self.$TVariant.len();
+                    let handle = $crate::archetypal::__make_handle(
+                        const { $Ref::__blaze_archetypal_tag(stringify!($TVariant)) },
+                        row,
+                        stringify!($TVariant),
+                    );
+                    self.$TVariant.push(value);
+                    handle
+                }
+
+                #[inline]
+                $vis fn $tget(&self, h: $crate::archetypal::ArchetypeHandle) -> Option<&$tty> {
+                    if h.tag() != const { $Ref::__blaze_archetypal_tag(stringify!($TVariant)) } {
+                        return None;
+                    }
+                    self.$TVariant.get(h.row() as usize)
+                }
+
+                #[inline]
+                $vis fn $tslice(&self) -> &[$tty] {
+                    self.$TVariant.as_slice()
+                }
+
+                #[inline]
+                $vis fn $tslice_mut(&mut self) -> &mut [$tty] {
+                    self.$TVariant.as_mut_slice()
+                }
+            )*)?
+
+            $($(
+                #[inline]
+                $vis fn $spush(&mut self, $( $sfield: $sfty ),*) -> $crate::archetypal::ArchetypeHandle {
+                    let row = self.$SVariant.len();
+                    let handle = $crate::archetypal::__make_handle(
+                        const { $Ref::__blaze_archetypal_tag(stringify!($SVariant)) },
+                        row,
+                        stringify!($SVariant),
+                    );
+                    self.$SVariant.push($SVariant { $( $sfield ),* });
+                    handle
+                }
+
+                #[inline]
+                $vis fn $sget(&self, h: $crate::archetypal::ArchetypeHandle) -> Option<&$SVariant> {
+                    if h.tag() != const { $Ref::__blaze_archetypal_tag(stringify!($SVariant)) } {
+                        return None;
+                    }
+                    self.$SVariant.get(h.row() as usize)
+                }
+
+                #[inline]
+                $vis fn $sslice(&self) -> &[$SVariant] {
+                    self.$SVariant.as_slice()
+                }
+
+                #[inline]
+                $vis fn $sslice_mut(&mut self) -> &mut [$SVariant] {
+                    self.$SVariant.as_mut_slice()
+                }
+            )*)?
         }
     };
 }
@@ -687,33 +437,20 @@ mod tests {
         bytes: [u8; 64],
     }
 
-    // Crate-internal invocation passes bare `__archetypal_step` to avoid rustc #52234 under
-    // `blaze-own`'s `#![blaze::trust]` root attribute; external callers use `blaze_own::archetypal!`
-    // directly (also exercised by the doc test above).
-    __archetypal_step! {
-        step: [__archetypal_step],
-        store_meta: [],
-        ref_meta: [#[derive(Debug, PartialEq, Eq)]],
-        vis: [],
-        store: NodeStore,
-        ref_ty: NodeRef,
-        ids: [alloc, self, h],
-        prev: [],
-        payload_structs: [],
-        ref_variants: [],
-        store_fields: [],
-        init_fields: [],
-        len_terms: [],
-        clear_stmts: [],
-        methods: [],
-        get_arms: [],
-        rest: [
-            Empty => push_empty / get_empty / empty_count,
-            Small(u32) => push_small / get_small / small_slice / small_slice_mut,
-            #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-            Call { callee: u32, args: u32 } => push_call / get_call / call_slice / call_slice_mut,
-            Large(BigPayload) => push_large / get_large / large_slice / large_slice_mut,
-        ]
+    archetypal! {
+        enum NodeStore, #[derive(Debug, PartialEq, Eq)] NodeRef {
+            unit {
+                Empty => push_empty / get_empty / empty_count,
+            }
+            tuple {
+                Small(u32) => push_small / get_small / small_slice / small_slice_mut,
+                Large(BigPayload) => push_large / get_large / large_slice / large_slice_mut,
+            }
+            struct {
+                #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+                Call { callee: u32, args: u32 } => push_call / get_call / call_slice / call_slice_mut,
+            }
+        }
     }
 
     #[test]
