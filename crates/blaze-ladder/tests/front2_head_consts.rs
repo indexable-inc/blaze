@@ -1090,3 +1090,191 @@ fn main() {}
     );
     expect("type/struct/enum/trait head const blocks", &got, &[true, false, true, false, true, false, true, false, true]);
 }
+
+/// Round 4 P1 #1: nominal field default containing an item-declaring const block (`struct S {
+/// n: usize = { enum E {} core::mem::size_of::<E>() } }`) registers its synthetic `FnHead`
+/// with `HeadAnon` under the ADT so lowering and evaluating the default resolves `E` in BOTH a
+/// fresh store AND a frozen/seeded store (`Store::ensure_field_default_head_anon`).
+#[test]
+fn nominal_field_default_const_block_with_enum_evaluates_cleanly() {
+    use blaze_ladder::front2::consts::int_of;
+    use blaze_ladder::front2::heads::Want;
+    use blaze_ladder::front2::keys::{Keys, checker_of};
+    use blaze_ladder::front2::tables::head::{FrozenHead, Plant, export, file_frozen};
+
+    const TEXT: &str = "#![feature(default_field_values)]
+pub struct Opts {
+    pub n: usize = {
+        #[repr(u16)]
+        enum DefaultEnum { A = 0, B = 1 }
+        core::mem::size_of::<DefaultEnum>()
+    },
+}
+const DEF_N: usize = Opts { .. }.n;
+fn ok_len() -> [u8; DEF_N] { [0u8; 2] }
+fn bad_len() -> [u8; DEF_N] { [0u8; 3] }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["ok_len", "bad_len"]);
+    expect("nominal field default const block", &got, &[true, false]);
+
+    // Also verify the frozen/seeded store path (`ensure_field_default_head_anon`).
+    let alloc = Alloc::global();
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/hello-world/src/main.rs".to_string(), TEXT.to_string())];
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: TEXT }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+    let opts = names::path(&names, names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &["Opts"] }, alloc)
+        .unwrap_or_else(|e| panic!("Opts: {e}"))
+        .whole(1)
+        .expect("Opts key")
+        .key;
+    let sized = front.index.lang("sized");
+    let mut maker = Store::new(sized, &frame, alloc);
+    let mut maker_keys = Keys::new();
+    maker.ensure(&names, &mut maker_keys, Want::Adt(opts)).unwrap_or_else(|e| panic!("ensure Opts: {e}"));
+    let bytes = export(&names, &maker_keys, &mut maker, Want::Adt(opts), Plant::None, alloc).unwrap_or_else(|e| panic!("export Opts: {e}"));
+    let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read frozen Opts: {e}"));
+    let mut seeded = Store::new(sized, &frame, alloc);
+    let mut seeded_keys = Keys::new();
+    file_frozen(&names, Want::Adt(opts), frozen, &seeded, &seeded_keys, alloc).unwrap_or_else(|e| panic!("file_frozen Opts: {e}"));
+    let dk = seeded.field_defaults.get(&checker_of(opts)).expect("field_defaults")[0].expect("first default key");
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let mut r = Records { names: &names, index: &front.index, store: &mut seeded, keys: &mut seeded_keys, buckets: &mut buckets, consts: None, order: BuildOrder::AsAsked };
+    let val = consts.value(&mut r, prepared, dk).unwrap_or_else(|e| panic!("eval frozen field default: {e}"));
+    assert_eq!(int_of(val), Some(2), "frozen field default must evaluate size_of::<DefaultEnum>() == 2");
+}
+
+/// Round 4 P2 #2: a `where const` condition declaring a local item (`impl Tr for S where const {
+/// enum E {} core::mem::size_of::<E>() == 2 } {}`) attaches its synthetic `const _: bool = ...;`
+/// `FnHead` to the enclosing item's `blaze-scope` block module so `E` resolves and the clause
+/// evaluates cleanly (true impl selected, false impl rejected).
+#[test]
+fn where_const_condition_with_local_enum_evaluates_cleanly() {
+    const TEXT: &str = "
+trait OkTr {}
+trait FalseTr {}
+struct S;
+
+impl OkTr for S
+where
+    const {
+        #[repr(u16)]
+        enum WhereEnum { A = 0, B = 1 }
+        core::mem::size_of::<WhereEnum>() == 2
+    }
+{}
+
+impl FalseTr for S
+where
+    const {
+        #[repr(u8)]
+        enum WhereEnumBad { A = 0, B = 1 }
+        core::mem::size_of::<WhereEnumBad>() == 2
+    }
+{}
+
+fn need_ok<T: OkTr>() {}
+fn need_false<T: FalseTr>() {}
+fn ok_holds() { need_ok::<S>() }
+fn false_rejected() { need_false::<S>() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["ok_holds", "false_rejected"]);
+    expect("where const local enum", &got, &[true, false]);
+}
+
+/// Round 4 P1 #3: replacing a long qualified associated constant (`<A as Value>::N`) with the
+/// identical literal produced by substitution (`10usize`) leaves the substituted text, owner,
+/// offset, and start site identical while shifting a later `column!()` call in the original
+/// source. Hashing `owner.len` and `edits` into the head anon const key ensures the two builds
+/// get distinct keys and exact distinct `column!()` values.
+#[test]
+fn replacing_substituted_qpath_with_literal_invalidates_column_macro_head_const_key() {
+    use blaze_ladder::front2::heads::Want;
+    use blaze_ladder::front2::tables::head::{HeadCells, SeededHeads, SeededHeadsOpts, StoreConsts};
+
+    // Line 5 in WITH_QPATH: `impl Check<{ <A as Value>::N + column!() }> for S {}`
+    //   `column!()` starts at 1-based column 32 -> 10 + 32 = 42.
+    // Line 5 in WITH_LITERAL: `impl Check<{ 10usize + column!() }> for S {}`
+    //   `column!()` starts at 1-based column 24 -> 10 + 24 = 34.
+    // Both substitute to the exact same text `10usize + column!()` at the exact same
+    // (owner.item, owner.offset, line=5, col=14, file="src/main.rs").
+    const WITH_QPATH: &str = "trait Value { const N: usize; }
+struct A;
+impl Value for A { const N: usize = 10; }
+trait Check<const N: u32> {}
+struct S;
+impl Check<{ <A as Value>::N as u32 + column!() }> for S {}
+fn main() {}
+";
+    const WITH_LITERAL: &str = "trait Value { const N: usize; }
+struct A;
+impl Value for A { const N: usize = 10; }
+trait Check<const N: u32> {}
+struct S;
+impl Check<{ 10usize as u32 + column!() }> for S {}
+fn main() {}
+";
+
+    let freeze_impl = |text: &str| {
+        let alloc = Alloc::global();
+        let home = std::env::var("HOME").expect("HOME is set");
+        let shelf = format!("{home}/.blaze/v2/toolchain");
+        let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+        let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
+        let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+        let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition, panic: blaze_build::Panic::Unwind };
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+        let sources = [SourceFile { path: "src/main.rs", text }];
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let front = Front2::new(&names, &frame, &sources, alloc).unwrap_or_else(|e| panic!("front2: {e}"));
+        let impl_key = names
+            .krate(0)
+            .tables
+            .impls
+            .iter()
+            .find(|i| i.header.contains("column!()"))
+            .expect("impl Check<{ ... column!() }> for S")
+            .key;
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
+        let mut evaluator = StoreConsts { names: &names, index: &front.index, prepared };
+        let sized = front.index.lang("sized");
+        let mut source = SeededHeads::new(SeededHeadsOpts {
+            names: &names,
+            sized,
+            pointers: blaze_ladder::front2::receiver::Pointers::NOT_LOOKED_UP,
+            frame: &frame,
+            scratch: alloc,
+            alloc,
+            consts: Some(&mut evaluator),
+            known: None,
+            owners: None,
+        });
+        let (frozen, read) = source.cell(Want::Impl(impl_key)).unwrap_or_else(|e| panic!("freeze impl: {e}"));
+        (impl_key, frozen.meaning(), read.consts.to_vec())
+    };
+
+    let (key_qpath, meaning_qpath, consts_qpath) = freeze_impl(WITH_QPATH);
+    let (key_lit, meaning_lit, consts_lit) = freeze_impl(WITH_LITERAL);
+    assert_eq!(key_qpath, key_lit, "enclosing impl key is identical");
+    // `consts_qpath` has both the `<A as Value>::N` leaf (10) and the head anon const (10 + 39 = 49);
+    // `consts_lit` has only the head anon const (10 + 31 = 41).
+    let &(anon_qpath_key, anon_qpath_val) = consts_qpath.iter().find(|&&(_, v)| v > 10).expect("qpath head anon const");
+    let &(anon_lit_key, anon_lit_val) = consts_lit.iter().find(|&&(_, v)| v > 10).expect("literal head anon const");
+    assert_eq!(anon_qpath_val, 10 + 39, "qpath column!() must report original column 39");
+    assert_eq!(anon_lit_val, 10 + 31, "literal column!() must report column 31");
+    assert_ne!(anon_qpath_key, anon_lit_key, "replacing substituted leaf with its literal must invalidate the head anon const key");
+    assert_ne!(meaning_qpath, meaning_lit, "frozen impl head meaning must reflect the new column");
+}

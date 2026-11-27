@@ -1498,23 +1498,27 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
     // `trait_members`): the expansion of the call in the container's body that wrote it, or
     // else the container's own (front2 item_site.rs `head_marks`). A derived impl's `default`
     // writes `crate::default::Default::default()`, its `crate` core's only by its mark.
-    let marks = match keys.origin(key) {
-        Some(Origin::Member { kind: MemberKind::Anon, .. }) => store.anon_marks.get(&key).copied(),
-        Some(Origin::Member { kind, name, .. }) => {
-            let item_kind = match kind {
-                MemberKind::Fn => blaze_surface::ItemKind::Function,
-                MemberKind::Const => blaze_surface::ItemKind::Const,
-                MemberKind::Type => blaze_surface::ItemKind::TypeAlias,
-                // A constructor has no text of its own and no body.
-                MemberKind::Ctor | MemberKind::Anon => return Err(BodyError::NoBody(key)),
-            };
-            super::item_site::head_marks(names, head.lib, name, item_kind, head.text).map_err(|lost| BodyError::Record { item: head.lib, owner: key, why: lost.why() })?
-        }
-        // A head in `store.fns` under a key front2 never filed as a member: lowered here only
-        // by a caller's mistake (a free fn is `lower_fn`'s).
-        Some(Origin::Item(_)) | None => {
-            let why = Why::Program(format!("{key:?} has a head but is filed as no member of a trait, an impl or a module (a free fn is lowered by `lower_fn`)").into_boxed_str(), Range::new(0, 0));
-            return Err(BodyError::Record { item: head.lib, owner: key, why });
+    let marks = if head.text_inline {
+        store.anon_marks.get(&key).copied()
+    } else {
+        match keys.origin(key) {
+            Some(Origin::Member { kind: MemberKind::Anon, .. }) => store.anon_marks.get(&key).copied(),
+            Some(Origin::Member { kind, name, .. }) => {
+                let item_kind = match kind {
+                    MemberKind::Fn => blaze_surface::ItemKind::Function,
+                    MemberKind::Const => blaze_surface::ItemKind::Const,
+                    MemberKind::Type => blaze_surface::ItemKind::TypeAlias,
+                    // A constructor has no text of its own and no body.
+                    MemberKind::Ctor | MemberKind::Anon => return Err(BodyError::NoBody(key)),
+                };
+                super::item_site::head_marks(names, head.lib, name, item_kind, head.text).map_err(|lost| BodyError::Record { item: head.lib, owner: key, why: lost.why() })?
+            }
+            // A head in `store.fns` under a key front2 never filed as a member: lowered here only
+            // by a caller's mistake (a free fn is `lower_fn`'s).
+            Some(Origin::Item(_)) | None => {
+                let why = Why::Program(format!("{key:?} has a head but is filed as no member of a trait, an impl or a module (a free fn is lowered by `lower_fn`)").into_boxed_str(), Range::new(0, 0));
+                return Err(BodyError::Record { item: head.lib, owner: key, why });
+            }
         }
     };
     let alloc = store.work_alloc();
@@ -1698,6 +1702,7 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let edition = names.edition_of(krate).ok_or(BodyError::NoText(item))?;
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
+    store.ensure_field_default_head_anon(names, item, owner, text);
     // The body's blocks the names library made modules: a call in one, written by hand or by
     // an expansion, reads its path there (scoped.rs `body_blocks`). Uses `store.locals.body_block_modules`
     // so top-level items/members, local fns/consts/statics whose blocks the names library wrote
@@ -2055,7 +2060,8 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     defaults_gate(names, krate, &typeck).map_err(|why| BodyError::Record { item, owner, why })?;
     if Store::view_has_record_type(&view) {
         let body_env = Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts, body: None };
-        store.register_record_defaults(names, keys, item, &body_env, None, &view).map_err(|why| BodyError::Record { item, owner, why })?;
+        let rec_owner = names.seeded_text_of(item).map(|it| (item, it.text));
+        store.register_record_defaults(names, keys, item, rec_owner, &body_env, None, &view).map_err(|why| BodyError::Record { item, owner, why })?;
     }
 
     let in_scope = names.traits_in_scope(module, alloc).map_err(|error| BodyError::Traits { item, error })?;

@@ -3586,6 +3586,7 @@ impl<'n> Store<'n> {
         preds_table: &Rows<ItemKey, Preds>,
         owner_ck: ItemKey,
         lib: LibKey,
+        owner: Option<(LibKey, &'n str)>,
         module: LibKey,
         v: &View<'_>,
         env: &Env<'_>,
@@ -3593,15 +3594,17 @@ impl<'n> Store<'n> {
         total_generics: u32,
         keys: &Keys,
         preds: &mut Preds,
-    ) -> Result<(), Why> {
-        if preds.conds.is_empty() {
-            return Ok(());
-        }
+    ) -> Result<blaze_own::Vec<(ItemKey, super::anon::HeadOwner, u32), Alloc<'static>>, Why> {
         let alloc = tys.alloc();
+        if preds.conds.is_empty() {
+            return Ok(blaze_own::Vec::new_in(alloc));
+        }
         let bool_ty = intern(tys, PNode::Bool)?;
         let args = params(tys, 0, total_generics, env.consts)?;
         let conds = core::mem::replace(&mut preds.conds, blaze_own::Vec::new_in(alloc));
         let mut made: blaze_own::Vec<(ItemKey, &'n str), Alloc<'static>> = blaze_own::Vec::with_capacity_in(conds.len(), alloc);
+        let mut anons: blaze_own::Vec<(ItemKey, super::anon::HeadOwner, u32), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
+        let prefix = u32::try_from("const _: bool = ".len()).ok();
         for (k, &cond) in conds.iter().enumerate() {
             let at = v.const_range(cond)?;
             let r = v.site(at)?;
@@ -3616,6 +3619,13 @@ impl<'n> Store<'n> {
                 .map_err(|_| Why::Unsupported("duplicate `where const` condition key", r))?;
             let decl = blaze_own::format_in!(alloc, "const _: bool = {body_expr};");
             let text: &'n str = locals.keep_text(decl.as_str());
+            if let (Some((owner_item, owner_text)), Some(prefix)) = (owner, prefix)
+                && blaze_file_items::nested::may_write_block(body_expr)
+                && let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, body_expr)
+                && let Ok(len) = u32::try_from(body_expr.len())
+            {
+                anons.push((cond_key, super::anon::HeadOwner { item: owner_item, offset, len }, prefix));
+            }
             preds.push(PClause::Const { cond: cond_key, args }, super::heads_regions::Src::Derived);
             made.push((cond_key, text));
         }
@@ -3654,7 +3664,7 @@ impl<'n> Store<'n> {
             };
             fns.insert(cond_key, row);
         }
-        Ok(())
+        Ok(anons)
     }
 
     /// Reconstructs the synthetic `FnHead` + `Preds` for a `where const` condition key whose
@@ -3673,7 +3683,7 @@ impl<'n> Store<'n> {
         let mut own_bounds: blaze_own::Vec<ParamBound, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let mut own_assoc: blaze_own::Vec<(Name, PTy), Alloc<'static>> = blaze_own::Vec::new_in(alloc);
         let mut clauses: blaze_own::Vec<PClause, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
-        let (owner_ck, lib, module, text, total_generics, self_) = match owner_want {
+        let (owner_ck, lib, owner_lib, module, text, total_generics, self_) = match owner_want {
             Want::Impl(lib) => {
                 let ck = checker_of(lib);
                 let Some(it) = names.signature_text_of(lib) else { return Ok(false) };
@@ -3685,7 +3695,7 @@ impl<'n> Store<'n> {
                 own_bounds.extend_from_slice(&frame.bounds);
                 own_assoc.extend_from_slice(&imp.assoc);
                 clauses.extend_from_slice(&p.clauses);
-                (ck, lib, frame.module, it.text, frame.generics, frame.self_)
+                (ck, lib, Some(lib), frame.module, it.text, frame.generics, frame.self_)
             }
             Want::Fn(lib) => {
                 let ck = checker_of(lib);
@@ -3696,7 +3706,7 @@ impl<'n> Store<'n> {
                 own_bounds.extend_from_slice(&f.bounds);
                 own_assoc.extend_from_slice(&f.self_assoc);
                 clauses.extend_from_slice(&p.clauses);
-                (ck, lib, f.module, f.text, f.parent + f.own, f.self_)
+                (ck, lib, Some(lib), f.module, f.text, f.parent + f.own, f.self_)
             }
             Want::MemberFn(lib, fk) => {
                 let Some(f) = self.fns.get(&fk) else { return Ok(false) };
@@ -3706,7 +3716,8 @@ impl<'n> Store<'n> {
                 own_bounds.extend_from_slice(&f.bounds);
                 own_assoc.extend_from_slice(&f.self_assoc);
                 clauses.extend_from_slice(&p.clauses);
-                (fk, lib, f.module, f.text, f.parent + f.own, f.self_)
+                let member_lib = keys.source_member(names, fk, f.text).map(|(_, m)| m.key);
+                (fk, lib, member_lib, f.module, f.text, f.parent + f.own, f.self_)
             }
             Want::Adt(lib) => {
                 let ck = checker_of(lib);
@@ -3723,7 +3734,7 @@ impl<'n> Store<'n> {
                 param_names(&v, 0, &mut own_params, Consts::Keep).map_err(|w| HeadError::Item(lib, w))?;
                 let self_args = params(&mut self.tys, 0, adt.generics, &own_consts).map_err(|w| HeadError::Item(lib, w))?;
                 let self_ty = intern(&mut self.tys, PNode::Adt(ck, self_args)).map_err(|w| HeadError::Item(lib, w))?;
-                (ck, lib, module, it.text, adt.generics, SelfTy::Ty(self_ty, None))
+                (ck, lib, Some(lib), module, it.text, adt.generics, SelfTy::Ty(self_ty, None))
             }
             Want::Members(lib) => {
                 let ck = checker_of(lib);
@@ -3738,10 +3749,18 @@ impl<'n> Store<'n> {
                 let low = self.lower_alloc_here(names, lib, it.text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering trait for `where const`", Range::new(0, 0))))?;
                 let v = low.view();
                 param_names(&v, 1, &mut own_params, Consts::Keep).map_err(|w| HeadError::Item(lib, w))?;
-                (ck, lib, module, it.text, tr.generics, SelfTy::Trait(lib))
+                (ck, lib, Some(lib), module, it.text, tr.generics, SelfTy::Trait(lib))
             }
             Want::Head(_) => return Ok(false),
         };
+        let header_off = match owner_want {
+            Want::Impl(impl_lib) => names
+                .seeded_text_of(impl_lib)
+                .and_then(|it| it.impl_header.and_then(|hdr| blaze_scope::expansion_origins::offset_in(it.text, hdr)))
+                .unwrap_or(0),
+            _ => 0,
+        };
+        let prefix = u32::try_from("const _: bool = ".len()).ok();
         let low = self.lower_alloc_here(names, lib, text, alloc).map_err(|_| HeadError::Item(lib, Why::Unsupported("lowering owner for `where const`", Range::new(0, 0))))?;
         let v = low.view();
         let rows = v.rows(v.list(head::WHERE)).map_err(|b| HeadError::Item(lib, Why::from(b)))?;
@@ -3760,6 +3779,14 @@ impl<'n> Store<'n> {
             let member_name = blaze_own::format_in!(alloc, "where const {k}");
             let cond_key = keys.member(owner_ck, MemberKind::Anon, member_name.as_str()).map_err(HeadError::Key)?;
             k += 1;
+            if let (Some(owner_item), Some(prefix)) = (owner_lib, prefix)
+                && blaze_file_items::nested::may_write_block(body_expr)
+                && let Some(raw_off) = blaze_scope::expansion_origins::offset_in(text, body_expr)
+                && let Some(offset) = raw_off.checked_sub(header_off)
+                && let Ok(len) = u32::try_from(body_expr.len())
+            {
+                self.locals.file_head_anon(cond_key, super::anon::HeadOwner { item: owner_item, offset, len }, &[], prefix);
+            }
             if self.fns.contains_key(&cond_key) {
                 continue;
             }
@@ -3800,6 +3827,69 @@ impl<'n> Store<'n> {
             self.fns.insert(cond_key, row);
         }
         Ok(self.fns.contains_key(&cond))
+    }
+
+    /// Registers `HeadAnon` alignment for a frozen/seeded inline field default (`text_inline: true`)
+    /// lowered in a fresh store whose `locals.head_anons` was not populated by `Store::adt`.
+    pub(super) fn ensure_field_default_head_anon<S: NamesSource<'n>>(&mut self, names: S, item: LibKey, owner: ItemKey, text: &str) {
+        if self.locals.head_anon(owner).is_some() || self.locals.head(owner).is_some() {
+            return;
+        }
+        if !self.fns.get(&owner).is_some_and(|h| h.text_inline) {
+            return;
+        }
+        let Some(field_idx) = self.field_defaults.get(&checker_of(item)).and_then(|ds| ds.iter().position(|d| *d == Some(owner))) else {
+            return;
+        };
+        let Some(owner_text) = super::locals::owner_scanned_text(names, item) else {
+            return;
+        };
+        let alloc = self.tys.alloc();
+        let Ok(low) = self.lower_alloc_here(names, item, owner_text, alloc) else {
+            return;
+        };
+        let v = low.view();
+        let mut seen = 0usize;
+        let is_enum = matches!(names.detail_of(item), Some(ItemDetail::Enum));
+        let mut found: Option<&str> = None;
+        if is_enum {
+            if let Ok(variants) = v.rows(v.list(head::FIELDS)) {
+                'outer: for &vn in variants {
+                    let Ok(var) = lf::Variant::decode(vn) else { continue };
+                    let Ok(rows) = v.rows(var.fields) else { continue };
+                    for &fn_row in rows {
+                        if seen == field_idx {
+                            if let Ok(f) = lf::Field::decode(fn_row)
+                                && let Some(c) = f.default
+                                && let Ok(at) = v.const_range(c)
+                                && let Ok(val) = v.text_at(at)
+                            {
+                                found = Some(val.trim());
+                            }
+                            break 'outer;
+                        }
+                        seen += 1;
+                    }
+                }
+            }
+        } else if let Ok(rows) = v.rows(v.list(head::FIELDS))
+            && let Some(&fn_row) = rows.get(field_idx)
+            && let Ok(f) = lf::Field::decode(fn_row)
+            && let Some(c) = f.default
+            && let Ok(at) = v.const_range(c)
+            && let Ok(val) = v.text_at(at)
+        {
+            found = Some(val.trim());
+        }
+        let Some(value_text) = found else { return };
+        if !blaze_file_items::nested::may_write_block(value_text) {
+            return;
+        }
+        let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, value_text) else { return };
+        let Some(prefix_usize) = text.len().checked_sub(value_text.len()).and_then(|n| n.checked_sub(1)) else { return };
+        if let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from(prefix_usize)) {
+            self.locals.file_head_anon(owner, super::anon::HeadOwner { item, offset, len }, &[], prefix);
+        }
     }
 
     /// Whether ADT `item` is eligible for Blaze-edition automatic `Copy`/`Clone`
@@ -4887,7 +4977,7 @@ impl<'n> Store<'n> {
             self.preds.insert(o.key, o.preds);
             self.opaques.insert(o.key, (alias_ck, o.index));
         }
-        self.register_record_defaults(names, keys, key, &env, marks, v)?;
+        self.register_record_defaults(names, keys, key, owner, &env, marks, v)?;
         self.maps.alias_defaults.insert(key, defaults);
         self.maps.aliases.insert(key, Some((generics, ty)));
         self.maps.const_params.insert(key, cs);
@@ -5327,7 +5417,9 @@ impl<'n> Store<'n> {
         // (D148), never `RegionRefusal::NoContainer` for a header that is here. One the record
         // or `trait_head` filed stands.
         self.container_regions.insert_absent(ck, ContainerRegions::of_header(v, None, alloc)?);
-        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, own + 1, keys, &mut preds)?;
+        for (cond_key, head_owner, prefix) in Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, owner, module, v, &env, &bounds, own + 1, keys, &mut preds)? {
+            self.locals.file_head_anon(cond_key, head_owner, &[], prefix);
+        }
         let mut inherited = blaze_own::Vec::with_capacity_in(preds.clauses.len() + 1, alloc);
         inherited.push(PClause::Trait { trait_: ck, args: params(&mut self.tys, 0, own + 1, &cs)? });
         inherited.extend_from_slice(&preds.clauses);
@@ -5661,6 +5753,13 @@ impl<'n> Store<'n> {
                     .map_err(|c| Why::Program(format!("{c}").into_boxed_str(), r))?;
                 let src = blaze_own::format_in!(alloc, "const _: {ty_text} = {value_text};");
                 let text: &'n str = self.locals.keep_text(src.as_str());
+                if let Some((owner_item, owner_text)) = owner
+                    && blaze_file_items::nested::may_write_block(value_text)
+                    && let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, value_text)
+                    && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from("const _: ".len() + ty_text.len() + " = ".len()))
+                {
+                    self.locals.file_head_anon(dk, super::anon::HeadOwner { item: owner_item, offset, len }, &[], prefix);
+                }
                 defaults.push(Some(dk));
                 default_heads.push((dk, text, ty));
             }
@@ -5674,7 +5773,9 @@ impl<'n> Store<'n> {
         let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
-        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, generics, keys, &mut preds)?;
+        for (cond_key, head_owner, prefix) in Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, owner, module, v, &env, &bounds, generics, keys, &mut preds)? {
+            self.locals.file_head_anon(cond_key, head_owner, &[], prefix);
+        }
         // D148: the ADT's regions (its own lifetimes, its clauses' columns, its fields'), filed
         // under its checker key ([`super::head_record::regions_key`]), plus a `HeadRegions::sig`
         // for each tuple struct / tuple variant constructor (`CtorSig`) so `FnDef` values like
@@ -5821,7 +5922,7 @@ impl<'n> Store<'n> {
         }
         sans_io |= names.in_sans_io_scope(key, module);
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
-        self.register_record_defaults(names, keys, key, &env, marks, v)?;
+        self.register_record_defaults(names, keys, key, owner, &env, marks, v)?;
         let (lifetimes, field_region_at, field_region_list) = super::borrows::freeze_field_regions(names, keys, self, ck, v, kind, &fields, self.tys.alloc())?;
         let field_regions = super::borrows::FieldRegions::new(field_region_at, field_region_list, self.tys.alloc());
         let auto_copy = is_auto_copy_pub_view(names, key, module, kind, v)?;
@@ -6119,7 +6220,9 @@ impl<'n> Store<'n> {
         let env = Env { self_assoc: &assoc, ..env };
         let mut preds = Preds::new_in(scope.clone_in(alloc));
         b.predicates(&mut self.tys, &env, v, 0, None, self.sized, &mut preds)?;
-        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, module, v, &env, &bounds, generics, keys, &mut preds)?;
+        for (cond_key, head_owner, prefix) in Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, ck, key, owner, module, v, &env, &bounds, generics, keys, &mut preds)? {
+            self.locals.file_head_anon(cond_key, head_owner, &[], prefix);
+        }
         let mut consts = blaze_own::Vec::with_capacity_in(const_texts.len(), alloc);
         let mut life_names = Vec::new_in(alloc);
         lifetime_names(v, &mut life_names)?;
@@ -6445,11 +6548,13 @@ impl<'n> Store<'n> {
     /// `self.field_defaults` so `Expr::Record { .. }` resolves them via `World::field_defaults`.
     #[cold]
     #[inline(never)]
+    #[expect(clippy::too_many_arguments, reason = "owner item head context for structural record defaults")]
     pub(super) fn register_record_defaults<S: NamesSource<'n>>(
         &mut self,
         names: S,
         keys: &Keys,
         lib: LibKey,
+        owner: Option<(LibKey, &'n str)>,
         env: &Env<'_>,
         marks: Option<TextMarks<'n>>,
         v: &View<'_>,
@@ -6480,7 +6585,6 @@ impl<'n> Store<'n> {
             if !has_default && !has_spread {
                 continue;
             }
-            let owner = Self::head_owner_item(names, lib);
             let b = Builder { resolver: Paths { names }, heads: &self.maps, marks, owner };
             let mut merged: blaze_own::Vec<(&str, Name, DefaultEntry), Alloc<'_>> = blaze_own::Vec::with_capacity_in(rows.len(), alloc);
             let mut inherited_any = false;
@@ -6580,6 +6684,13 @@ impl<'n> Store<'n> {
                 let mut src = blaze_own::String::new_in(alloc);
                 let _ = core::fmt::Write::write_fmt(&mut src, format_args!("const _: {ty_text} = {value_text};"));
                 let text: &'n str = self.locals.keep_text(&src);
+                if let Some((owner_item, owner_text)) = owner
+                    && blaze_file_items::nested::may_write_block(value_text)
+                    && let Some(offset) = blaze_scope::expansion_origins::offset_in(owner_text, value_text)
+                    && let (Ok(len), Ok(prefix)) = (u32::try_from(value_text.len()), u32::try_from("const _: ".len() + ty_text.len() + " = ".len()))
+                {
+                    self.locals.file_head_anon(dk, super::anon::HeadOwner { item: owner_item, offset, len }, &[], prefix);
+                }
                 let scope = Scope::item(v, None, 0, alloc).map_err(Why::Regions)?;
                 self.preds.insert(dk, Preds::new_in(scope));
                 let head_alloc = self.tys.alloc();
@@ -7042,7 +7153,7 @@ impl<'n> Store<'n> {
         }
         b.predicates(&mut self.tys, &env, v, parent, None, self.sized, &mut preds)?;
         b.impl_bounds(&mut self.tys, &env, v, &anon[..params_end], self.sized, &mut preds)?;
-        Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, key, lib, env.module, v, &env, &bounds, parent + own, keys, &mut preds)?;
+        let where_anons = Self::file_where_consts(&mut self.tys, &self.locals, &self.fns, &self.preds, key, lib, owner, env.module, v, &env, &bounds, parent + own, keys, &mut preds)?;
         // The bounds' E0405s: one per bound path (the parameter-bound walk and the predicates
         // walk each meet it), in text order. One the words cannot be made for (a path not in
         // the fn's own text) stays the head's error, as before.
@@ -7220,10 +7331,13 @@ impl<'n> Store<'n> {
         {
             file_regions(self, op_k, op_filed);
         }
+        for (cond_key, head_owner, prefix) in where_anons {
+            self.locals.file_head_anon(cond_key, head_owner, &[], prefix);
+        }
         file_regions(self, key, filed);
         if Self::view_has_record_type(v) {
             let rec_env = Env { module, params: &ps, bounds: Bounds::Done(&bounds), self_, self_assoc: self_assoc_slice, anon: &anon, consts: &cs, body: None };
-            self.register_record_defaults(names, keys, lib, &rec_env, marks, v)?;
+            self.register_record_defaults(names, keys, owner.map_or(lib, |(k, _)| k), owner, &rec_env, marks, v)?;
         }
         self.fns.insert(
             key,

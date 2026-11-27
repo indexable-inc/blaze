@@ -351,6 +351,7 @@ fn outer_brace_span(text: &str) -> Option<(usize, usize)> {
     let mut group = 0u32;
     let mut angle = 0u32;
     let mut prev_arrow = false;
+    let mut prev_const = false;
     let mut open: Option<usize> = None;
     for tok in tokenize(text, FrontmatterAllowed::No, Cpu::BASELINE) {
         let Ok(len) = usize::try_from(tok.len) else {
@@ -375,7 +376,7 @@ fn outer_brace_span(text: &str) -> Option<(usize, usize)> {
             TokenKind::OpenParen | TokenKind::OpenBracket => group = group.saturating_add(1),
             TokenKind::CloseParen | TokenKind::CloseBracket => group = group.saturating_sub(1),
             TokenKind::OpenBrace => {
-                if brace == 0 && group == 0 && angle == 0 {
+                if brace == 0 && group == 0 && angle == 0 && !prev_const {
                     open = Some(at);
                     brace = 1;
                 } else {
@@ -389,6 +390,7 @@ fn outer_brace_span(text: &str) -> Option<(usize, usize)> {
         }
         if !matches!(kind, TokenKind::Whitespace | TokenKind::LineComment { .. } | TokenKind::BlockComment { .. }) {
             prev_arrow = matches!(kind, TokenKind::Minus | TokenKind::Eq);
+            prev_const = kind == TokenKind::Ident && text.get(at..at + len) == Some("const");
         }
         at += len;
     }

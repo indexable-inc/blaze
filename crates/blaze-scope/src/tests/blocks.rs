@@ -1072,3 +1072,17 @@ fn all_item_heads_with_const_blocks_create_block_modules() {
     check("EnumWithBlock", "pub enum EnumWithBlock", "DiscEnum", false);
     check("TraitWithBlock", "pub trait TraitWithBlock", "TraitHeadEnum", true);
 }
+
+#[test]
+fn trait_head_and_adt_skip_where_const_blocks_when_finding_body_braces() {
+    let trait_src = "pub trait T where const { enum E { A = 0 } true } { fn f(); }";
+    assert_eq!(
+        blaze_file_items::nested::trait_head(trait_src),
+        "pub trait T where const { enum E { A = 0 } true }"
+    );
+    assert!(blaze_file_items::nested::has_writing_block(blaze_file_items::nested::trait_head(trait_src)));
+    let struct_src = "pub struct S where const { enum E { A = 0 } true } { pub x: u8 }";
+    assert!(blaze_file_items::nested::adt_has_writing_block(struct_src));
+    let plain_struct = "pub struct Plain { pub x: u8 }";
+    assert!(!blaze_file_items::nested::adt_has_writing_block(plain_struct));
+}

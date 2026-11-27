@@ -403,6 +403,19 @@ impl Ask {
         hash.part(self.member_name().as_bytes());
         hash.update(&owner.item.0.0);
         hash.update(&owner.offset.to_le_bytes());
+        hash.update(&owner.len.to_le_bytes());
+        // Include the full substitution mapping: `BodyHost::place_of_call` remaps call columns
+        // through `edits`, so replacing a long qualified constant with its literal value changes
+        // later `column!()` positions even when the substituted text, owner, offset, and start
+        // site are identical.
+        for e in edits.iter() {
+            hash.update(&[1]);
+            hash.update(&e.sub_start.to_le_bytes());
+            hash.update(&e.sub_end.to_le_bytes());
+            hash.update(&e.orig_start.to_le_bytes());
+            hash.update(&e.orig_end.to_le_bytes());
+        }
+        hash.update(&[0]);
         match site {
             Some(s) => {
                 hash.update(&[1]);
@@ -788,5 +801,11 @@ mod tests {
         let mut merged = blaze_own::AVec::new_in(alloc);
         compose_edits(&first, &second, &mut merged).expect("disjoint passes compose");
         assert_eq!(orig_offset(&merged, 18), Some(22));
+        // Distinct substitution edit lists at identical (text, owner, offset, site) get distinct keys.
+        let site = Some(HeadSite { line: 3, col: 5, file: Some("src/a.rs") });
+        let mut sub_edits = blaze_own::AVec::new_in(alloc);
+        sub_edits.push(TextEdit { sub_start: 0, sub_end: 7, orig_start: 0, orig_end: 15 });
+        let with_edits = base.clone().in_head_item(owner(item_a, 10), site, sub_edits, alloc);
+        assert_ne!(with_edits.need, a_line_3.need, "changing substitution edits must change the head anon const key");
     }
 }
