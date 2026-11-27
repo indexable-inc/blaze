@@ -583,14 +583,43 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
             return Ok(None);
         }
         let own = written.get(at as usize).copied().unwrap_or(&[]);
-        let args = if own.is_empty() {
+        let consts = super::types::Heads::const_params(self.builder.heads, target.key).ok_or(Why::Need(target.key))?;
+        let mut stamped = OwnVec::new_in(alloc);
+        let own_in: &[PTy] = if own.is_empty() || consts.is_empty() {
+            own
+        } else {
+            stamped.reserve(own.len());
+            for (idx, &a) in own.iter().enumerate() {
+                let mut a = a;
+                if let Some(&(_, want_ty)) = consts.iter().find(|&&(ci, _)| usize::try_from(ci).ok() == Some(idx))
+                    && let Some(&PNode::ConstValue { ty, bits }) = tys.view().get(a)
+                    && matches!(tys.view().get(ty), Some(PNode::Infer))
+                {
+                    a = super::types::intern(tys, PNode::ConstValue { ty: want_ty, bits })?;
+                }
+                stamped.push(a);
+            }
+            &stamped
+        };
+        let mut args = if own_in.is_empty() {
             let hole = super::types::intern(tys, PNode::Infer)?;
             let mut holes = OwnVec::with_capacity_in(generics as usize, alloc);
             holes.resize(generics as usize, hole);
             holes
         } else {
-            super::types::with_defaults(tys, own, generics, super::types::Heads::alias_defaults(self.builder.heads, target.key), shown, r)?
+            super::types::with_defaults(tys, own_in, generics, super::types::Heads::alias_defaults(self.builder.heads, target.key), shown, r)?
         };
+        if !consts.is_empty() {
+            for &(ci, want_ty) in consts {
+                if let Ok(idx) = usize::try_from(ci)
+                    && let Some(slot) = args.get_mut(idx)
+                    && let Some(&PNode::ConstValue { ty, bits }) = tys.view().get(*slot)
+                    && matches!(tys.view().get(ty), Some(PNode::Infer))
+                {
+                    *slot = super::types::intern(tys, PNode::ConstValue { ty: want_ty, bits })?;
+                }
+            }
+        }
         for a in of {
             out(super::types::subst(tys, a, &args)?);
         }

@@ -1438,6 +1438,13 @@ impl<'n> Consts<'n> {
                 }
                 match lowered.typeck.exprs.get(borrow.0 as usize) {
                     Some(&tc::Expr::Ref { mutbl: tc::Mutbl::Not, operand }) => Some(operand),
+                    Some(&tc::Expr::Index { base, .. }) => {
+                        // A promoted shared index base (`&[("/b", B)][..]`, `Checked::promoted`
+                        // names the `Expr::Index`): the promoted value is `base` before its
+                        // array-to-slice/deref adjustments.
+                        strip_expr_adjusts(&mut checked, base);
+                        Some(base)
+                    }
                     Some(_) => {
                         // A promoted shared autoref (`AdjustKind::Borrow { mutbl: Not, raw: false }`
                         // at index 0 on `borrow`): the promoted value is `borrow`'s unadjusted

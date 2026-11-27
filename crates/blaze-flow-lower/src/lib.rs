@@ -235,6 +235,9 @@ pub struct OwnerTraitImpl {
     pub trait_: ItemKey,
     pub generics: u32,
     pub self_shape: SelfShape,
+    /// `true` when `imp` is the body owner's own enclosing impl (whose lifetime and type parameter
+    /// indices `0..` coincide with the body's leading parameters); `false` for a supertrait impl.
+    pub is_enclosing: bool,
 }
 
 /// Metadata for a trait fn's RPITIT opaque (`-> impl Trait` or `async fn` in a trait, RFC 3425):
@@ -6075,11 +6078,30 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             // The Reference, "Constant promotion": a borrow the checker promoted
             // (`Checked::promoted`) is of a `'static` slot: no loan of the body's, and the
             // operand's code does not run here (the builder reads the evaluator's value).
-            Expr::Ref { mutbl: Mutbl::Not, .. } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
+            Expr::Ref { mutbl: Mutbl::Not, operand } if self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok() => {
                 let ty = TyD::of(self.expr_ty(e)?);
                 let t = self.temp(ty, e)?;
                 let tp = self.place_of(t);
                 self.b.assign(tp, Operand::Const, self.span(e));
+                // If the promoted rvalue is a non-capturing closure, still enforce any owner
+                // signature requirements its body emitted.
+                let mut inner = operand;
+                while let Expr::Paren(p) = self.expr(inner)? {
+                    inner = p;
+                }
+                if matches!(self.expr(inner)?, Expr::Closure { .. }) && self.plant != Plant::NoRequirements && R::RELATES {
+                    let mut ci = self.info(tp);
+                    if ci.len > 0 {
+                        ci.start += 1;
+                        ci.len -= 1;
+                    }
+                    let facts: &'b F = self.facts;
+                    for r in facts.closure_requirements(inner) {
+                        let from = self.need_origin(r.from, ci, 0, inner)?;
+                        let into = self.need_origin(r.into, ci, 0, inner)?;
+                        self.b.subset(from, into);
+                    }
+                }
                 self.push_place(tp, ty);
             }
             Expr::Ref { mutbl, operand } => {
@@ -6395,7 +6417,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
                 AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. }
                     if matches!(v.at, At::Const)
                         || (i == lo
-                            && !matches!(self.body.exprs.get(e.ix()), Some(Expr::Ref { .. }))
+                            && !matches!(self.body.exprs.get(e.ix()), Some(Expr::Ref { .. } | Expr::Index { .. }))
                             && self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()) =>
                 {
                     let t = self.temp(out, e)?;
@@ -7586,12 +7608,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
         let idx = self.pop(e)?;
         let base = self.pop(e)?;
         let ty = TyD::of(self.expr_ty(e)?);
-        let static_base = if !m && matches!(base.at, At::Const)
+        let static_base = if !m
             && let Expr::Index { base: be, .. } = self.expr(e)?
         {
-            self.is_immutable_static(be)?
-                || matches!(self.expr(be)?, Expr::Array { elems } if elems.len == 0)
-                || self.const_init_freeze_no_drop(base.ty, e)?
+            self.ck.promoted.binary_search_by_key(&e.0, |x| x.0).is_ok()
+                || (matches!(base.at, At::Const)
+                    && (self.is_immutable_static(be)?
+                        || matches!(self.expr(be)?, Expr::Array { elems } if elems.len == 0)
+                        || self.const_init_freeze_no_drop(base.ty, e)?))
         } else {
             false
         };
@@ -10916,6 +10940,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: one_call::CallRule> Lower<'b, 'c,
             Some(x) => {
                 self.super_let_else(s, x)?;
                 let p = self.as_place(v, x)?;
+                // The Reference, "Temporary lifetime extension", "Extending based on patterns":
+                // a `let PAT = init else { ... };` with an extending pattern (`ref`/`ref mut`)
+                // extends the initializer temporary to the enclosing block, just as `let PAT = init;`.
+                if init.is_some() && self.pat_extends(pat)? {
+                    let pi = self.info(p);
+                    if pi.parent == u32::MAX
+                        && let Some(at) = self.temps.iter().rposition(|l| l.0 == pi.local)
+                    {
+                        let l = self.temps.remove(at);
+                        self.temp_left(at);
+                        self.vars.push(l);
+                    }
+                }
                 let (bind, eb) = (self.b.block(), self.b.block());
                 self.b.switch(p, &[bind, eb], self.span(x));
                 self.b.start(eb);

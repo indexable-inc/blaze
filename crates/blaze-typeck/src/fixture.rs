@@ -1541,6 +1541,12 @@ impl Bb {
         StmtId(at)
     }
 
+    pub fn let_else(&mut self, pat: PatId, ty: Option<PTy>, init: ExprId, else_: ExprId) -> StmtId {
+        let at = self.stmts.len() as u32;
+        self.stmts.push(Stmt::Let { pat, ty, init: Some(init), else_: Some(else_) });
+        StmtId(at)
+    }
+
     pub fn semi(&mut self, expr: ExprId) -> StmtId {
         let at = self.stmts.len() as u32;
         self.stmts.push(Stmt::Expr { expr, semi: true });

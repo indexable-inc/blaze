@@ -1908,3 +1908,68 @@ fn byte_string_and_string_literal_patterns() {
 
     assert_eq!(eval_int(&mut w, "EXPR_COERCE"), Ok(u128::from(b'h') * 1000 + u128::from(b'o')));
 }
+
+/// Or-pattern bindings (`Reason::A(ed, _) | Reason::B(ed, _) | Reason::C(ed, _) => Some(ed)`):
+/// every alternative must write into the canonical first binding's home (both memory-resident
+/// enums like `Edition` and scalar register bindings like `u32`). Previously alternatives 2+
+/// wrote into distinct slots, leaving alternative 1's slot uninitialized (`Refusal::Uninit`).
+#[test]
+fn or_pattern_bindings_share_one_home_across_alternatives() {
+    let mut w = world();
+    w.enum_(
+        "Edition",
+        Some("u8"),
+        &[("E2015", &[], Some("0")), ("E2018", &[], Some("1")), ("E2021", &[], Some("2")), ("E2024", &[], Some("3"))],
+    );
+    w.enum_(
+        "OptEd",
+        None,
+        &[("None", &[], None), ("Some", &["Edition"], None)],
+    );
+    w.enum_(
+        "Reason",
+        None,
+        &[
+            ("A", &["Edition", "u32"], None),
+            ("B", &["Edition", "u32"], None),
+            ("C", &["Edition", "u32"], None),
+            ("Other", &["u32"], None),
+        ],
+    );
+    w.const_fn(
+        "reason_edition",
+        &[("r", "Reason")],
+        "OptEd",
+        "{ match r { Reason::A(ed, _) | Reason::B(ed, _) | Reason::C(ed, _) => OptEd::Some(ed), Reason::Other(_) => OptEd::None } }",
+    );
+    w.const_fn(
+        "reason_code",
+        &[("r", "Reason")],
+        "u32",
+        "{ match r { Reason::A(_, n) | Reason::B(_, n) | Reason::C(_, n) | Reason::Other(n) => n } }",
+    );
+    w.const_fn(
+        "ed_num",
+        &[("r", "Reason")],
+        "u8",
+        "{ match reason_edition(r) { OptEd::Some(e) => e as u8, OptEd::None => 99 } }",
+    );
+    w.konst("ED_A", "u8", "ed_num(Reason::A(Edition::E2015, 10))");
+    w.konst("ED_B", "u8", "ed_num(Reason::B(Edition::E2018, 20))");
+    w.konst("ED_C", "u8", "ed_num(Reason::C(Edition::E2024, 30))");
+    w.konst("ED_OTHER", "u8", "ed_num(Reason::Other(40))");
+    w.konst("CODE_A", "u32", "reason_code(Reason::A(Edition::E2015, 10))");
+    w.konst("CODE_B", "u32", "reason_code(Reason::B(Edition::E2018, 20))");
+    w.konst("CODE_C", "u32", "reason_code(Reason::C(Edition::E2024, 30))");
+    w.konst("CODE_OTHER", "u32", "reason_code(Reason::Other(40))");
+    w.build();
+
+    assert_eq!(eval_int(&mut w, "ED_A"), Ok(0));
+    assert_eq!(eval_int(&mut w, "ED_B"), Ok(1));
+    assert_eq!(eval_int(&mut w, "ED_C"), Ok(3));
+    assert_eq!(eval_int(&mut w, "ED_OTHER"), Ok(99));
+    assert_eq!(eval_int(&mut w, "CODE_A"), Ok(10));
+    assert_eq!(eval_int(&mut w, "CODE_B"), Ok(20));
+    assert_eq!(eval_int(&mut w, "CODE_C"), Ok(30));
+    assert_eq!(eval_int(&mut w, "CODE_OTHER"), Ok(40));
+}

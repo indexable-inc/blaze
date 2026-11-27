@@ -1031,6 +1031,15 @@ impl Conv<'_, '_, '_, '_, '_> {
                         }
                     }
                 }
+                TypeRef::Infer => {
+                    self.out.closure_param_regions.push(tc::ClosureParamRegion {
+                        closure,
+                        param,
+                        path,
+                        own: 0,
+                        kind: tc::WrittenRegion::Inferred,
+                    });
+                }
                 _ => {}
             }
         }

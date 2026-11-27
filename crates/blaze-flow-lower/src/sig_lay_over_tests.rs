@@ -472,4 +472,100 @@ mod through_impl {
         let bad = run(Region::Static, true);
         assert!(matches!(&bad, Ok(lines) if !lines.is_empty()), "TWIN: &'a does not outlive &'static: {bad:?}");
     }
+
+    /// Regression for `crates/syntax/src/view/traits.rs:207-216` (`impl<'t, I: Iterator<Item = AnyAttr<'t>>> Iterator for AttrsIter<I> { type Item = Attr<'t>; fn next(&mut self) -> Option<Self::Item> }`):
+    /// `'t` does not appear in `AttrsIter<I>` or `Iterator`, so `bind_header_ty` leaves `param_regs[0]`
+    /// unbound. Because `imp` is this body's own enclosing impl (`is_enclosing: true`) and all bound
+    /// impl parameters are identity (`I` -> `Param(0)`), `through_impl` fills `param_regs[0]` with
+    /// the body's own `Region::Param(0)` (`'t`).
+    #[test]
+    fn enclosing_impl_unconstrained_lifetime_uses_identity_param() {
+        struct EnclosingHeads {
+            with_lifetime: vec::Vec<ItemKey>,
+            oti: Option<crate::OwnerTraitImpl>,
+        }
+        impl Facts for EnclosingHeads {
+            fn regions(&self) -> &dyn crate::RegionFacts { &crate::NoRegions }
+            fn region_tys(&self) -> Option<blaze_typeck::PTys<'_>> { None }
+            fn implied_bounds(&self) -> Option<(&[(u32, crate::Region)], &[(crate::Region, crate::Region)])> { None }
+            fn constant_initializer(&self) -> bool { false }
+            fn fn_binders(&self) -> bool { true }
+            fn closure_bodies_checked(&self) -> bool { false }
+            fn closure_requirements(&self, _: blaze_typeck::ExprId) -> &[crate::Requirement] { &[] }
+            fn async_bodies_checked(&self) -> bool { false }
+            fn is_future(&self, _: blaze_typeck::PTy) -> Option<bool> { None }
+            fn shape(&self, _: blaze_typeck::ItemKey) -> Option<crate::Shape<'_>> { None }
+            fn object_trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<bool> { None }
+            fn call_bounds(&self, _: blaze_typeck::ItemKey) -> Option<crate::CallBounds<'_>> { None }
+            fn trait_lifetimes(&self, _: blaze_typeck::ItemKey) -> Option<u32> { None }
+            fn alias_lifetimes(&self, _: blaze_typeck::ItemKey, _: blaze_typeck::Name) -> Option<u32> { None }
+            fn ties(&self, _: blaze_typeck::ItemKey) -> Option<crate::Ties<'_>> { None }
+            fn field_param(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<u32> { None }
+            fn field_lead(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<crate::FieldLead> { None }
+            fn field_regions(&self, _: blaze_typeck::ItemKey, _: u32, _: u32) -> Option<&[crate::FieldRegion]> { None }
+            fn copy_args(&self, _: blaze_typeck::ItemKey) -> Option<&[bool]> { None }
+            fn owner_trait_impl(&self, trait_: ItemKey) -> Option<crate::OwnerTraitImpl> {
+                self.oti.filter(|o| o.trait_ == trait_)
+            }
+            fn adt(&self, k: ItemKey) -> Option<AdtFacts> {
+                let lifetimes = u32::from(self.with_lifetime.contains(&k));
+                Some(AdtFacts { copy: false, drop_impl: false, needs_drop: false, lifetimes, union: false, is_enum: false, is_box: false })
+            }
+            fn callee(&self, _: ItemKey) -> Option<CalleeFacts> { None }
+            fn field(&self, _: ItemKey, _: u32, _: Name) -> Option<u32> { None }
+            fn field_count(&self, _: ItemKey, _: u32) -> Option<u32> { None }
+            fn param_copy(&self, _: u32) -> bool { false }
+            fn adt_variances(&self, k: ItemKey) -> Option<&[crate::Variance]> {
+                const CO: [crate::Variance; 1] = [crate::Variance::Co];
+                if self.with_lifetime.contains(&k) { Some(&CO) } else { Some(&[]) }
+            }
+        }
+
+        let run = |is_enclosing: bool, in_reg: Region| {
+            let mut fx = Fx::new();
+            let attrs_iter = fx.strukt("AttrsIter", 1, &[]);
+            let attr = fx.strukt("Attr", 0, &[]);
+            let p0 = fx.param(0);
+            let iter_p0 = fx.adt(attrs_iter, &[p0]);
+            let attr_ty = fx.adt(attr, &[]);
+            let tr = fx.tr("Tr", 1, vec![], &["Item"]);
+            let self_item = fx.alias(tr, "Item", &[iter_p0]);
+            let imp = fx.imp("impl<'t, I> Tr for AttrsIter<I> { type Item = Attr<'t>; }", 1, iter_p0, Some((tr, &[])), &[("Item", attr_ty)], vec![]);
+            let next = fx.func("next", 1, &[attr_ty], attr_ty, vec![]);
+            fx.finish();
+            let mut decls = Decls::new();
+            decls.adt(attr, 1);
+            decls.trait_(tr, 0);
+            decls.alias(tr, "Item", 0);
+            // `fn next<'t>(x: Attr<'in_reg>) -> <AttrsIter<I> as Tr>::Item`
+            decls.func(next, FnHead { lifetimes: 1, late: &[], outlives: &[], inputs: &[attr_ty], output: self_item, slots: &[in_reg] });
+            decls.imp(imp, ImplHead { lifetimes: 1, outlives: &[], self_ty: iter_p0, self_slots: &[], trait_ref: Some((tr, &[], &[])) });
+            decls.impl_assoc(imp, "Item", attr_ty, &[P0]);
+            let heads = EnclosingHeads {
+                with_lifetime: vec![attr],
+                oti: Some(crate::OwnerTraitImpl {
+                    imp,
+                    trait_: tr,
+                    generics: 1,
+                    self_shape: crate::SelfShape::Adt(attrs_iter),
+                    is_enclosing,
+                }),
+            };
+            let mut b = Bb::new();
+            let px = b.param("x");
+            let lx = b.local(px);
+            let root = b.block(&[], Some(lx));
+            let view = b.view(next, root);
+            let mut c = region_fixture::checked(&fx, &view);
+            let selected = Selected::Impl { imp, args: List::EMPTY };
+            c.selected.push(Projected { expr: root, at: 0, trait_: tr, name: Some(Name::of("Item")), args: List::EMPTY, global_env: false, selected });
+            c.selected.sort_by_key(|r| (r.expr, r.name.is_none()));
+            region_fixture::lower(&fx, &view, &mut c, &heads, &decls, Plant::None).map(|r| r.lines)
+        };
+
+        let clean = run(true, P0);
+        assert_eq!(clean, Ok(vec::Vec::new()), "enclosing impl unconstrained `'t` matches body's `Param(0)`: {clean:?}");
+        let non_enclosing = run(false, P0);
+        assert!(matches!(&non_enclosing, Ok(lines) if !lines.is_empty()), "NEGATIVE: supertrait/non-enclosing impl must NOT assume identity `'t`: {non_enclosing:?}");
+    }
 }

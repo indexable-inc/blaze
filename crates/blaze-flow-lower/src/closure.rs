@@ -1422,7 +1422,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             let written = ce.and_then(|c| self.body.closure_param_region(c, param, path, own));
             match written {
                 Some(blaze_typeck::WrittenRegion::Static) => out.push(SigSlot::Static),
-                Some(blaze_typeck::WrittenRegion::Named) => {
+                Some(blaze_typeck::WrittenRegion::Named | blaze_typeck::WrittenRegion::Inferred) => {
                     out.push(SigSlot::Owner(*owner));
                     *owner += 1;
                 }
@@ -1448,6 +1448,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 push_default(self.npos(t, e)?, owner, out);
                 continue;
             };
+            // A written `_` placeholder at `p` (e.g. `|v: Value<_>|`): every lifetime introduced
+            // by inferring `_` is an existential owner region, never a late-bound call region.
+            if ce.and_then(|c| self.body.closure_param_region(c, param, p, 0))
+                == Some(blaze_typeck::WrittenRegion::Inferred)
+            {
+                let n = self.npos(t, e)?;
+                for _ in 0..n {
+                    out.push(SigSlot::Owner(*owner));
+                    *owner += 1;
+                }
+                continue;
+            }
             match self.node(t, e)? {
                 PNode::Ref(_, inner) => {
                     push_written(p, 0, owner, out);
