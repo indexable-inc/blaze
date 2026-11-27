@@ -303,28 +303,43 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
         let lb = names.chains.get(&b.1).map_or(0, |c| c.len());
         lb.cmp(&la).then_with(|| a.1.cmp(&b.1))
     });
-    // Pass 1: deduplicate chains longest-first into `emitted` while `chain_places` is the only
-    // growable table (sized from `chain_order.len() * 2`, not the pre-dedup quadratic sum), then
-    // Pass 2 allocates `chains` at the exact deduplicated `chain_keys * KEY` byte length.
+    // Pass 1: pre-populate `chain_places` with the exact `chain_order.len()` module chains that
+    // can ever be queried (mapped to `None`), then deduplicate longest-first updating only those
+    // pre-existing slots. Because no new keys are ever inserted during the loop, `chain_places`
+    // stays O(modules) and never rehashes even on deep trunk + many-leaf broom trees. Pass 2 then
+    // allocates `chains` once at the exact deduplicated `chain_keys * KEY` byte length.
     let mut emitted: AVec<'b, &[ItemKey]> = AVec::with_capacity_in(chain_order.len(), alloc);
     let mut module_chain_at: AVec<'b, u32> = AVec::with_capacity_in(modules.len(), alloc);
     module_chain_at.resize(modules.len(), NONE);
-    let mut chain_places: HashMap<&[ItemKey], u32, Alloc<'b>> = HashMap::with_capacity_in(chain_order.len().saturating_mul(2), alloc);
+    let mut chain_places: HashMap<&[ItemKey], Option<u32>, Alloc<'b>> = HashMap::with_capacity_in(chain_order.len(), alloc);
+    for &(_, m) in chain_order.iter() {
+        if let Some(chain) = names.chains.get(&m) {
+            chain_places.insert(chain.as_slice(), None);
+        }
+    }
     let mut chain_keys = 0usize;
     for &(idx, m) in chain_order.iter() {
         let Some(chain) = names.chains.get(&m) else { continue };
         let slice = chain.as_slice();
-        let at = if let Some(&existing) = chain_places.get(slice) {
+        let at = if let Some(existing) = chain_places.get(slice).copied().flatten() {
             existing
         } else {
             let start = u32_of(chain_keys, "names chains")?;
             emitted.push(slice);
             for len in 1..=slice.len() {
-                chain_places.entry(&slice[..len]).or_insert(start);
+                if let Some(sub) = slice.get(..len)
+                    && let Some(slot) = chain_places.get_mut(sub)
+                {
+                    slot.get_or_insert(start);
+                }
             }
             for off in 1..slice.len() {
                 let sub_start = u32_of(chain_keys + off, "names chains")?;
-                chain_places.entry(&slice[off..]).or_insert(sub_start);
+                if let Some(sub) = slice.get(off..)
+                    && let Some(slot) = chain_places.get_mut(sub)
+                {
+                    slot.get_or_insert(sub_start);
+                }
             }
             chain_keys += slice.len();
             start
@@ -1397,5 +1412,66 @@ mod sizing_tests {
             proof.head.blob_len,
             enc_frame.peak()
         );
+    }
+
+    /// A broom-shaped module tree (long shared trunk + many leaf modules) previously inserted
+    /// `O(leaves * depth)` prefix/suffix slices into `chain_places` and rehashed on the bump
+    /// frame. Pre-populating `chain_places` with only the `chain_order.len()` queryable module
+    /// chains keeps `chain_places` O(modules) with zero rehashes while decoding every module's
+    /// chain identically.
+    #[test]
+    fn broom_tree_trunk_and_many_leaves_do_not_rehash_chain_places() {
+        const TRUNK: usize = 48;
+        const LEAVES: usize = 200;
+        let mut src = std::string::String::with_capacity(16 << 10);
+        src.push_str("#![no_core]\n");
+        for i in 0..TRUNK {
+            let _ = writeln!(src, "pub mod t{i} {{");
+        }
+        for l in 0..LEAVES {
+            let _ = writeln!(src, "pub mod leaf_{l} {{ pub struct L; }}");
+        }
+        for _ in 0..TRUNK {
+            src.push_str("}\n");
+        }
+        let texts = OneFile("/broom/lib.rs", src.as_str());
+        let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
+        let input = CrateInput {
+            name: "broom_tree",
+            key: CrateItemKey(ContentId::of("blaze-scope broom tree test", b"broom_tree")),
+            edition: Edition::E2021,
+            implicit,
+            root: "/broom/lib.rs",
+            shown_from: "/",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let solve_frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("solve frame");
+        let solve_erased = blaze_own::Erased::new(&solve_frame);
+        let (solved, _) = resolve_by_records(&[input], Sysroot::default(), &texts, &Serial, &Ready::serial(std::time::Duration::from_secs(60)), solve_erased.bump())
+            .expect("solve broom tree crate");
+        let krate = solved.first().expect("solved crate").names;
+        assert_eq!(krate.chains.len(), 1 + TRUNK + LEAVES);
+
+        let enc_frame = blaze_mem::Frame::with_reserve(8 << 20, blaze_mem::Tag::Nameres).expect("encode frame");
+        let enc_erased = blaze_own::Erased::new(&enc_frame);
+        let enc_bump = enc_erased.bump();
+        let bytes = encode(krate, enc_bump.alloc()).expect("encode broom tree names record");
+        // Without filtering `chain_places` to queryable module chains, ~200 * 48 = 9,600+ entries
+        // would force multiple rehashes abandoning hundreds of KiB on the bump frame.
+        assert!(
+            enc_frame.abandoned().bytes < u64::try_from(bytes.len() / 2).unwrap_or(u64::MAX),
+            "broom tree encode abandoned {} bytes for a {}-byte record (peak {})",
+            enc_frame.abandoned().bytes,
+            bytes.len(),
+            enc_frame.peak()
+        );
+        let proof = Verified::check(aligned(&bytes, enc_bump)).expect("verify broom tree names record");
+        let record = NamesRecord::open(proof);
+        for (module, expected) in krate.chains.iter() {
+            assert_eq!(record.chain(*module), Some(expected.as_slice()), "decoded chain must match solve");
+        }
     }
 }
