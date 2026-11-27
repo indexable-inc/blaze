@@ -113,7 +113,7 @@ impl Kept {
         let mut held = std::vec::Vec::with_capacity_in(sections.list.len(), Global);
         held.extend_from_slice(sections.list);
         let bytes: &'static [u8] = held.leak();
-        let list = crate::graph_payload::Sections { graph: &[], list: bytes }.crates().map_err(|error| CliError::Input { name: graph.name, why: crate::work::InputWhy::Graph(error) })?;
+        let list = crate::graph_payload::Sections { graph: &[], list: bytes, wasm_graph: &[] }.crates().map_err(|error| CliError::Input { name: graph.name, why: crate::work::InputWhy::Graph(error) })?;
         self.list = Some((graph.out, list));
         Ok(list)
     }
@@ -1051,7 +1051,8 @@ pub(crate) fn names_world<'f>(
     let read = crate::work::payload(cx, store, graph, frame)?;
     let made = {
         let _cx = cx.span("names: make the world");
-        crate::names::world(cx, root, read.unit_graph(graph.name)?.graph, lock, members, &facts.fetch_env)
+        let sections = read.unit_graph(graph.name)?;
+        crate::names::world(cx, root, sections.graph, sections.wasm_graph, lock, members, &facts.fetch_env)
     };
     match made {
         Ok(made) => {

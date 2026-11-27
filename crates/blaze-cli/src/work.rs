@@ -336,10 +336,10 @@ pub(crate) fn held_refused<'f>(name: Name) -> Did<'f> {
 /// place where it is: the graph's record is handed to its task's record on the heap (graph.rs
 /// `hand_graph`), so the list and trailer are appended there, never to an empty built payload
 /// beside it. Returns the record's out.
-pub(crate) fn seal_graph<A: Allocator + Copy>(record: &mut Record<A>, list: &[u8]) -> ContentId {
+pub(crate) fn seal_graph<A: Allocator + Copy>(record: &mut Record<A>, list: &[u8], wasm_graph: &[u8]) -> ContentId {
     match &mut record.handed {
-        Handed::Kept(payload) => crate::graph_payload::seal(payload, list),
-        Handed::None => crate::graph_payload::seal(&mut record.payload, list),
+        Handed::Kept(payload) => crate::graph_payload::seal(payload, list, wasm_graph),
+        Handed::None => crate::graph_payload::seal(&mut record.payload, list, wasm_graph),
         // Every caller seals the record it has just made, before its put; a released record
         // sealed would be an out over no payload. A panic fails its one job (rule 20), never a
         // quiet seal.

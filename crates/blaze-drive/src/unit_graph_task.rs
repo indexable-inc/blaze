@@ -22,7 +22,9 @@ use blaze_id::ContentId;
 use blaze_manifest::lock::{Lock, LockId};
 use blaze_own::{AVec, Alloc};
 use blaze_unit_graph::record::{self, NotItsCfg, Source};
-use blaze_unit_graph::{Ask, ExternalRecords, LeftOut, Open, Package, Pass, Records, Resolution, Resolver, SourceError, StoreSources, TargetDesc, Text, UnitError};
+use blaze_unit_graph::{
+    Ask, ExternalRecords, HostUnitAsk, HostUnitKind, LeftOut, Open, Package, Pass, Records, Resolution, Resolver, SourceError, StoreSources, TargetDesc, Text, UnitError, UnitGraph, UnitKind,
+};
 
 /// The most passes of the resolution: each pass asks for the packages one level deeper, so the
 /// count is the graph's depth (tempo: 9). Past it, [`UnitGraphTaskError::Passes`] (rule 18).
@@ -41,6 +43,11 @@ pub struct UnitGraphInputs<'i, 'a> {
     pub resolver: Resolver,
     pub target: &'i TargetDesc<'a>,
     pub host: &'i TargetDesc<'a>,
+    /// Optional `wasm64-blaze-wasip1` execution platform for self-compiled build scripts and proc
+    /// macros. When present, discovery also resolves and fetches any wasm64-only locked packages
+    /// reachable from the graph's `BuildScript` and `ProcMacro` units (e.g. `errno` under `rustix`
+    /// on Linux) so `<store>/sources/` holds them before `wasm64_compile` runs.
+    pub wasm_host: Option<&'i TargetDesc<'a>>,
     pub ask: &'i Ask<'a>,
 }
 
@@ -51,7 +58,11 @@ pub fn source(inputs: &UnitGraphInputs<'_, '_>) -> ContentId {
     s.workspace(&inputs.workspace_read.0);
     // The toolchain's id is not added here: the `Units` record's out already carries it, and
     // `workspace_read` is that (one home per input, rule 30).
-    s.platform("target", inputs.target).platform("host", inputs.host).ask(inputs.ask);
+    s.platform("target", inputs.target).platform("host", inputs.host);
+    if let Some(wasm_host) = inputs.wasm_host {
+        s.platform("wasm_host", wasm_host);
+    }
+    s.ask(inputs.ask);
     ContentId(s.finish().0)
 }
 
@@ -97,6 +108,9 @@ impl fmt::Display for UnitGraphTaskError<'_> {
 /// [`UnitGraphTaskError::Missing`]); the task maps each finding to a finding record naming it.
 pub struct UnitGraphMade<'a> {
     pub record: AVec<'a, u8>,
+    /// Optional encoded `wasm64-blaze-wasip1` host-unit graph record (present when `wasm_host`
+    /// was supplied and the host graph had at least one build script or proc macro).
+    pub wasm_record: Option<AVec<'a, u8>>,
     pub findings: AVec<'a, SourceError<'a>>,
     /// The roots' targets left out by `required-features` (also in the record): the task
     /// says each as a note, never quietly (rule 3).
@@ -108,6 +122,7 @@ pub struct UnitGraphMade<'a> {
 /// left-out entries live in the session's scratch allocator `'a`.
 pub struct UnitGraphMadeIn<'a, 'r> {
     pub record: AVec<'r, u8>,
+    pub wasm_record: Option<AVec<'r, u8>>,
     pub findings: AVec<'a, SourceError<'a>>,
     pub left_out: AVec<'a, LeftOut<'a>>,
 }
@@ -153,11 +168,20 @@ pub struct UnitGraphSession<'l, 'b, 'a> {
     lock: &'l Lock<'a>,
     target: &'l TargetDesc<'a>,
     host: &'l TargetDesc<'a>,
+    wasm_host: Option<&'l TargetDesc<'a>>,
+    resolver: Resolver,
     sources: StoreSources<'l, 'b, 'a, ExternalRecords>,
     res: Resolution<'l, 'a>,
+    done_graph: Option<UnitGraph<'a>>,
+    wasm_res: Option<Resolution<'l, 'a>>,
+    /// Packages requested via `SessionEntry::Need` that have not yet been fed into the active
+    /// resolution (`wasm_res` if `Some`, else `res`). Preserving them across cold fetch handoffs
+    /// lets re-entry load newly fetched packages without burning an extra resolution pass.
+    pending: AVec<'a, LockId>,
     findings: AVec<'a, SourceError<'a>>,
     not_fetched: u32,
     passes: u32,
+    wasm_passes: u32,
     alloc: Alloc<'a>,
 }
 
@@ -188,11 +212,17 @@ impl<'l, 'b, 'a> UnitGraphSession<'l, 'b, 'a> {
             lock,
             target: inputs.target,
             host: inputs.host,
+            wasm_host: inputs.wasm_host,
+            resolver: inputs.resolver,
             sources,
             res,
+            done_graph: None,
+            wasm_res: None,
+            pending: AVec::new_in(alloc),
             findings: AVec::new_in(alloc),
             not_fetched: 0,
             passes: 0,
+            wasm_passes: 0,
             alloc,
         })
     }
@@ -207,10 +237,67 @@ impl<'l, 'b, 'a> UnitGraphSession<'l, 'b, 'a> {
         unheld: Unheld<'_>,
     ) -> Result<Entry<'a>, UnitGraphTaskError<'a>> {
         match self.step_encoded(records, unheld, self.alloc)? {
-            SessionEntry::Made(made) => Ok(Entry::Made(UnitGraphMade { record: made.record, findings: made.findings, left_out: made.left_out })),
+            SessionEntry::Made(made) => Ok(Entry::Made(UnitGraphMade { record: made.record, wasm_record: made.wasm_record, findings: made.findings, left_out: made.left_out })),
             SessionEntry::Need(needs) => Ok(Entry::Need(needs)),
             SessionEntry::NotFetched { count } => Ok(Entry::NotFetched { count }),
         }
+    }
+
+    fn finish_missing(&mut self, missing: &[LockId]) -> Result<SessionEntry<'a, 'static>, UnitGraphTaskError<'a>> {
+        let alloc = self.alloc;
+        if self.not_fetched > 0 {
+            return Ok(SessionEntry::NotFetched { count: self.not_fetched });
+        }
+        let mut packages = AVec::with_capacity_in(missing.len(), alloc);
+        for id in missing {
+            let locked = self.lock.package(*id);
+            let mut named = Text::new_in(alloc);
+            let _ = fmt::Write::write_fmt(&mut named, format_args!("{} {}", locked.name, locked.version));
+            packages.push(named);
+        }
+        let findings = core::mem::replace(&mut self.findings, AVec::new_in(alloc));
+        Err(UnitGraphTaskError::Missing { packages, findings })
+    }
+
+    /// Loads `needs` from `records` into the active resolution (`wasm_res` if `Some`, else `res`).
+    /// Packages still unheld are retained in `self.pending` and their fetch keys returned in `asks`
+    /// so cold fetch handoffs do not consume an extra resolution pass on re-entry.
+    fn feed_needs<R: Records<'b>>(
+        &mut self,
+        needs: &[LockId],
+        records: &mut R,
+        unheld: Unheld<'_>,
+    ) -> Result<AVec<'a, ContentId>, UnitGraphTaskError<'a>> {
+        let alloc = self.alloc;
+        let mut asks = AVec::new_in(alloc);
+        let mut still_pending = AVec::new_in(alloc);
+        for &id in needs {
+            let package = match self.sources.package_with(id, records) {
+                Ok(package) => Some(package),
+                Err(SourceError::NotFetched { key, .. }) if unheld.failed.binary_search(&ContentId(key)).is_ok() => {
+                    self.not_fetched += 1;
+                    None
+                }
+                Err(SourceError::NotFetched { key, .. }) if unheld.refused.binary_search(&ContentId(key)).is_err() => {
+                    asks.push(ContentId(key));
+                    still_pending.push(id);
+                    continue;
+                }
+                Err(finding) => {
+                    self.findings.push(finding);
+                    None
+                }
+            };
+            let res = match &mut self.wasm_res {
+                Some(wasm_res) => wasm_res,
+                None => &mut self.res,
+            };
+            res.package(id, package).map_err(UnitGraphTaskError::Resolve)?;
+        }
+        self.pending = still_pending;
+        asks.sort_unstable();
+        asks.dedup();
+        Ok(asks)
     }
 
     /// As [`Self::step`], encoding the finished graph record directly into `record_alloc` (e.g.
@@ -223,16 +310,90 @@ impl<'l, 'b, 'a> UnitGraphSession<'l, 'b, 'a> {
         record_alloc: Alloc<'r>,
     ) -> Result<SessionEntry<'a, 'r>, UnitGraphTaskError<'a>> {
         let alloc = self.alloc;
-        while self.passes < MOST_PASSES {
+        if !self.pending.is_empty() {
+            let pending = core::mem::replace(&mut self.pending, AVec::new_in(alloc));
+            let asks = self.feed_needs(pending.as_slice(), records, unheld)?;
+            if !asks.is_empty() {
+                return Ok(SessionEntry::Need(asks));
+            }
+        }
+        loop {
+            if let Some(wasm_res) = &mut self.wasm_res {
+                if self.wasm_passes >= MOST_PASSES {
+                    return Err(UnitGraphTaskError::Passes);
+                }
+                self.wasm_passes += 1;
+                match wasm_res.pass().map_err(UnitGraphTaskError::Resolve)? {
+                    Pass::Done(wasm_graph) => {
+                        if self.not_fetched > 0 {
+                            return Ok(SessionEntry::NotFetched { count: self.not_fetched });
+                        }
+                        if let Some(graph) = self.done_graph.take() {
+                            let record = record::encode(&graph, self.target, self.host, record_alloc).map_err(UnitGraphTaskError::Cfg)?;
+                            let wasm_record = match self.wasm_host {
+                                Some(wasm_desc) => Some(record::encode(&wasm_graph, wasm_desc, wasm_desc, record_alloc).map_err(UnitGraphTaskError::Cfg)?),
+                                None => None,
+                            };
+                            let findings = core::mem::replace(&mut self.findings, AVec::new_in(alloc));
+                            return Ok(SessionEntry::Made(UnitGraphMadeIn { record, wasm_record, findings, left_out: graph.left_out }));
+                        }
+                        return Err(UnitGraphTaskError::Passes);
+                    }
+                    Pass::Partial(partial) => {
+                        if self.not_fetched > 0 {
+                            return Ok(SessionEntry::NotFetched { count: self.not_fetched });
+                        }
+                        return match self.finish_missing(partial.missing()) {
+                            Ok(SessionEntry::NotFetched { count }) => Ok(SessionEntry::NotFetched { count }),
+                            Err(err) => Err(err),
+                            Ok(_) => Err(UnitGraphTaskError::Passes),
+                        };
+                    }
+                    Pass::Need(needs) => {
+                        let asks = self.feed_needs(needs.as_slice(), records, unheld)?;
+                        if !asks.is_empty() {
+                            return Ok(SessionEntry::Need(asks));
+                        }
+                    }
+                }
+                continue;
+            }
+            if self.passes >= MOST_PASSES {
+                return Err(UnitGraphTaskError::Passes);
+            }
             self.passes += 1;
             match self.res.pass().map_err(UnitGraphTaskError::Resolve)? {
                 Pass::Done(graph) => {
                     if self.not_fetched > 0 {
                         return Ok(SessionEntry::NotFetched { count: self.not_fetched });
                     }
+                    if let Some(wasm_desc) = self.wasm_host {
+                        let mut roots = AVec::new_in(alloc);
+                        for (idx, unit) in graph.units.iter().enumerate() {
+                            let kind = match unit.kind {
+                                UnitKind::BuildScript => HostUnitKind::BuildScript,
+                                UnitKind::ProcMacro => HostUnitKind::ProcMacro,
+                                _ => continue,
+                            };
+                            let Ok(uid) = u32::try_from(idx) else { continue };
+                            let side = graph.host_unit_side(blaze_unit_graph::UnitId(uid));
+                            let mut features = AVec::with_capacity_in(unit.features.len(), alloc);
+                            for feat in unit.features.iter() {
+                                features.push(Text::from_str_in(feat.as_str(), alloc));
+                            }
+                            roots.push(HostUnitAsk { package: unit.package, kind, side, features });
+                        }
+                        if !roots.is_empty() {
+                            let mut wasm_res = Resolution::for_host_units(self.lock, wasm_desc, roots, self.resolver, alloc);
+                            self.res.move_packages_into(&mut wasm_res).map_err(UnitGraphTaskError::Resolve)?;
+                            self.done_graph = Some(graph);
+                            self.wasm_res = Some(wasm_res);
+                            continue;
+                        }
+                    }
                     let record = record::encode(&graph, self.target, self.host, record_alloc).map_err(UnitGraphTaskError::Cfg)?;
                     let findings = core::mem::replace(&mut self.findings, AVec::new_in(alloc));
-                    return Ok(SessionEntry::Made(UnitGraphMadeIn { record, findings, left_out: graph.left_out }));
+                    return Ok(SessionEntry::Made(UnitGraphMadeIn { record, wasm_record: None, findings, left_out: graph.left_out }));
                 }
                 Pass::Partial(partial) => {
                     // A package not fetched this command is asked again by the next one.
@@ -240,46 +401,20 @@ impl<'l, 'b, 'a> UnitGraphSession<'l, 'b, 'a> {
                         return Ok(SessionEntry::NotFetched { count: self.not_fetched });
                     }
                     // Refused for good: no graph is made without them (states.md 35), each named.
-                    let mut packages = AVec::with_capacity_in(partial.missing().len(), alloc);
-                    for id in partial.missing() {
-                        let locked = self.lock.package(*id);
-                        let mut named = Text::new_in(alloc);
-                        let _ = fmt::Write::write_fmt(&mut named, format_args!("{} {}", locked.name, locked.version));
-                        packages.push(named);
-                    }
-                    let findings = core::mem::replace(&mut self.findings, AVec::new_in(alloc));
-                    return Err(UnitGraphTaskError::Missing { packages, findings });
+                    return match self.finish_missing(partial.missing()) {
+                        Ok(SessionEntry::NotFetched { count }) => Ok(SessionEntry::NotFetched { count }),
+                        Err(err) => Err(err),
+                        Ok(_) => Err(UnitGraphTaskError::Passes),
+                    };
                 }
                 Pass::Need(needs) => {
-                    let mut asks = AVec::new_in(alloc);
-                    for id in needs.iter() {
-                        let package = match self.sources.package_with(*id, records) {
-                            Ok(package) => Some(package),
-                            Err(SourceError::NotFetched { key, .. }) if unheld.failed.binary_search(&ContentId(key)).is_ok() => {
-                                self.not_fetched += 1;
-                                None
-                            }
-                            Err(SourceError::NotFetched { key, .. }) if unheld.refused.binary_search(&ContentId(key)).is_err() => {
-                                asks.push(ContentId(key));
-                                continue;
-                            }
-                            Err(finding) => {
-                                self.findings.push(finding);
-                                None
-                            }
-                        };
-                        self.res.package(*id, package).map_err(UnitGraphTaskError::Resolve)?;
-                    }
+                    let asks = self.feed_needs(needs.as_slice(), records, unheld)?;
                     if !asks.is_empty() {
-                        // A git commit's record serves all its packages: one ask a record.
-                        asks.sort_unstable();
-                        asks.dedup();
                         return Ok(SessionEntry::Need(asks));
                     }
                 }
             }
         }
-        Err(UnitGraphTaskError::Passes)
     }
 
     /// Non-empty package subdirectories discovered inside git commit packs during this session,
@@ -391,6 +526,7 @@ mod session_tests {
             resolver: Resolver::V2,
             target: &target,
             host: &target,
+            wasm_host: None,
             ask: &ask,
         };
 
@@ -440,5 +576,417 @@ mod session_tests {
             _ => panic!("expected stateless Made"),
         };
         assert_eq!(session_bytes.as_slice(), stateless_bytes.as_slice());
+    }
+
+    /// When `wasm_host` is supplied (`wasm64-blaze-wasip1`), `UnitGraphSession` also discovers
+    /// and requests `Fetch` for wasm64-only locked packages reached by build scripts (such as
+    /// `errno` under `rustix` on Linux hosts) even though those packages are absent from the host
+    /// Linux `UnitGraph`, and `unit_graph_task::source` hashes `wasm_host` (Rule 21).
+    #[test]
+    fn stateful_session_fetches_wasm64_only_build_script_deps_not_active_on_host() {
+        let alloc = blaze_own::testing::heap().alloc();
+        const LOCK_TEXT: &str = "version = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"shim\"]\n\n\
+             [[package]]\nname = \"shim\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\ndependencies = [\"wasi_only\"]\n\n\
+             [[package]]\nname = \"wasi_only\"\nversion = \"0.3.14\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"2222222222222222222222222222222222222222222222222222222222222222\"\n";
+        let lock = Lock::read(LOCK_TEXT.as_bytes(), alloc).expect("lock");
+        let app_id = lock.named("app").next().expect("app");
+
+        let mut layout = Layout::new("", alloc).expect("layout");
+        let app_toml = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n[build-dependencies]\nshim = \"1\"\n";
+        let app_pkg = loop {
+            match layout.pass().expect("layout pass") {
+                LayoutPass::Done(units) => break Package::from_member(&units.members[0], alloc),
+                LayoutPass::Need(needs) => {
+                    for need in needs.iter() {
+                        match need {
+                            LayoutNeed::Manifest(path) if path == "Cargo.toml" => layout.manifest(path, Some(app_toml)).expect("manifest"),
+                            LayoutNeed::Manifest(path) => layout.manifest(path, None).expect("manifest"),
+                            LayoutNeed::Listing(dir) if dir == "src" => {
+                                let entries = [LayoutEntry { name: "lib.rs", is_dir: false }];
+                                layout.listing(dir, Some(&entries));
+                            }
+                            LayoutNeed::Listing(dir) if dir.is_empty() => {
+                                let entries = [
+                                    LayoutEntry { name: "Cargo.toml", is_dir: false },
+                                    LayoutEntry { name: "build.rs", is_dir: false },
+                                    LayoutEntry { name: "src", is_dir: true },
+                                ];
+                                layout.listing(dir, Some(&entries));
+                            }
+                            LayoutNeed::Listing(dir) => layout.listing(dir, None),
+                        }
+                    }
+                }
+            }
+        };
+
+        let shim_toml = b"[package]\nname = \"shim\"\nversion = \"1.0.0\"\nedition = \"2021\"\n\
+            [target.'cfg(target_os = \"wasi\")'.dependencies]\n\
+            wasi_only = \"0.3\"\n";
+        let wasi_toml = b"[package]\nname = \"wasi_only\"\nversion = \"0.3.14\"\nedition = \"2021\"\n";
+        let shim_sha = [0x11; 32];
+        let wasi_sha = [0x22; 32];
+        let shim_src = SourceId::Crate { name: "shim", version: "1.0.0", sha256: shim_sha };
+        let wasi_src = SourceId::Crate { name: "wasi_only", version: "0.3.14", sha256: wasi_sha };
+        let shim_pack = make_pack(shim_sha, &[("Cargo.toml", shim_toml), ("src/lib.rs", b"pub fn s() {}\n")], alloc);
+        let wasi_pack = make_pack(wasi_sha, &[("Cargo.toml", wasi_toml), ("src/lib.rs", b"pub fn w() {}\n")], alloc);
+
+        let mut linux_cfg = Vec::new_in(alloc);
+        linux_cfg.push(CfgAtom::pair("target_os", "linux", alloc));
+        let linux = TargetDesc::new("x86_64-unknown-linux-gnu", linux_cfg, alloc);
+        let mut wasi_cfg = Vec::new_in(alloc);
+        wasi_cfg.push(CfgAtom::pair("target_os", "wasi", alloc));
+        let wasi = TargetDesc::new("wasm64-blaze-wasip1", wasi_cfg, alloc);
+
+        let mut roots = Vec::new_in(alloc);
+        roots.push(app_id);
+        let ask = Ask { roots, features: Vec::new_in(alloc), all_features: false, no_default_features: false, tests: false };
+        let members = [(app_id, app_pkg)];
+        let inputs_without = UnitGraphInputs {
+            lock: LOCK_TEXT.as_bytes(),
+            workspace_read: ContentId([1; 32]),
+            members: &members,
+            path_packages: &[],
+            resolver: Resolver::V2,
+            target: &linux,
+            host: &linux,
+            wasm_host: None,
+            ask: &ask,
+        };
+        let inputs_with = UnitGraphInputs { wasm_host: Some(&wasi), ..inputs_without };
+        assert_ne!(source(&inputs_without), source(&inputs_with), "wasm_host must enter UnitGraph source key (Rule 21)");
+
+        struct Handed<'p, 'a> {
+            handed: AVec<'a, (ContentId, &'p [u8])>,
+        }
+        impl<'p> Records<'p> for Handed<'p, '_> {
+            fn record(&mut self, source: &SourceId<'_>) -> Option<&'p [u8]> {
+                let key = source.key();
+                self.handed.iter().find(|(k, _)| *k == key).map(|(_, b)| *b)
+            }
+        }
+
+        let unheld = Unheld { failed: &[], refused: &[] };
+        let mut session = UnitGraphSession::new(&inputs_with, &lock, PackView::open_source_put, alloc).expect("session");
+        let mut recs = Handed { handed: Vec::new_in(alloc) };
+        // Wave 1: host graph needs `shim`.
+        match session.step(&mut recs, unheld).expect("wave 1") {
+            Entry::Need(needs) => assert_eq!(needs.as_slice(), &[shim_src.key()]),
+            _ => panic!("expected wave 1 Need(shim)"),
+        }
+        // Wave 2: host graph finishes, then wasm64 host-unit pass discovers `wasi_only`!
+        recs.handed.push((shim_src.key(), shim_pack.as_slice()));
+        match session.step(&mut recs, unheld).expect("wave 2") {
+            Entry::Need(needs) => assert_eq!(needs.as_slice(), &[wasi_src.key()]),
+            _ => panic!("expected wave 2 Need(wasi_only)"),
+        }
+        // Wave 3: hand `wasi_only`, session completes with the host UnitGraph (which has no `wasi_only` unit).
+        recs.handed.push((wasi_src.key(), wasi_pack.as_slice()));
+        let made = match session.step(&mut recs, unheld).expect("wave 3") {
+            Entry::Made(made) => made,
+            _ => panic!("expected wave 3 Made"),
+        };
+        let decoded = record::decode(made.record.as_slice(), alloc).expect("decode graph");
+        assert!(!decoded.graph.units.iter().any(|u| u.name.as_str() == "wasi_only"));
+    }
+
+    /// The wasm64 host-unit discovery phase gets its own `MOST_PASSES` budget independent of the
+    /// host phase, so a graph whose host discovery plus WASI-only dependency chain exceeds 256
+    /// total waves (each phase within `MOST_PASSES`) still completes cleanly.
+    #[test]
+    fn stateful_session_wasm_phase_has_independent_pass_budget() {
+        let alloc = blaze_own::testing::heap().alloc();
+        const LOCK_TEXT: &str = "version = 4\n\n\
+             [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"shim\"]\n\n\
+             [[package]]\nname = \"shim\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\ndependencies = [\"wasi_a\"]\n\n\
+             [[package]]\nname = \"wasi_a\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"2222222222222222222222222222222222222222222222222222222222222222\"\ndependencies = [\"wasi_b\"]\n\n\
+             [[package]]\nname = \"wasi_b\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"3333333333333333333333333333333333333333333333333333333333333333\"\n";
+        let lock = Lock::read(LOCK_TEXT.as_bytes(), alloc).expect("lock");
+        let app_id = lock.named("app").next().expect("app");
+
+        let mut layout = Layout::new("", alloc).expect("layout");
+        let app_toml = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n[build-dependencies]\nshim = \"1\"\n";
+        let app_pkg = loop {
+            match layout.pass().expect("layout pass") {
+                LayoutPass::Done(units) => break Package::from_member(&units.members[0], alloc),
+                LayoutPass::Need(needs) => {
+                    for need in needs.iter() {
+                        match need {
+                            LayoutNeed::Manifest(path) if path == "Cargo.toml" => layout.manifest(path, Some(app_toml)).expect("manifest"),
+                            LayoutNeed::Manifest(path) => layout.manifest(path, None).expect("manifest"),
+                            LayoutNeed::Listing(dir) if dir == "src" => {
+                                let entries = [LayoutEntry { name: "lib.rs", is_dir: false }];
+                                layout.listing(dir, Some(&entries));
+                            }
+                            LayoutNeed::Listing(dir) if dir.is_empty() => {
+                                let entries = [
+                                    LayoutEntry { name: "Cargo.toml", is_dir: false },
+                                    LayoutEntry { name: "build.rs", is_dir: false },
+                                    LayoutEntry { name: "src", is_dir: true },
+                                ];
+                                layout.listing(dir, Some(&entries));
+                            }
+                            LayoutNeed::Listing(dir) => layout.listing(dir, None),
+                        }
+                    }
+                }
+            }
+        };
+
+        let shim_sha = [0x11; 32];
+        let wasi_a_sha = [0x22; 32];
+        let wasi_b_sha = [0x33; 32];
+        let shim_src = SourceId::Crate { name: "shim", version: "1.0.0", sha256: shim_sha };
+        let wasi_a_src = SourceId::Crate { name: "wasi_a", version: "0.1.0", sha256: wasi_a_sha };
+        let wasi_b_src = SourceId::Crate { name: "wasi_b", version: "0.1.0", sha256: wasi_b_sha };
+        let shim_pack = make_pack(
+            shim_sha,
+            &[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname = \"shim\"\nversion = \"1.0.0\"\nedition = \"2021\"\n[target.'cfg(target_os = \"wasi\")'.dependencies]\nwasi_a = \"0.1\"\n",
+                ),
+                ("src/lib.rs", b"pub fn s() {}\n"),
+            ],
+            alloc,
+        );
+        let wasi_a_pack = make_pack(
+            wasi_a_sha,
+            &[
+                (
+                    "Cargo.toml",
+                    b"[package]\nname = \"wasi_a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nwasi_b = \"0.1\"\n",
+                ),
+                ("src/lib.rs", b"pub fn a() {}\n"),
+            ],
+            alloc,
+        );
+        let wasi_b_pack = make_pack(
+            wasi_b_sha,
+            &[
+                ("Cargo.toml", b"[package]\nname = \"wasi_b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
+                ("src/lib.rs", b"pub fn b() {}\n"),
+            ],
+            alloc,
+        );
+
+        let mut linux_cfg = Vec::new_in(alloc);
+        linux_cfg.push(CfgAtom::pair("target_os", "linux", alloc));
+        let linux = TargetDesc::new("x86_64-unknown-linux-gnu", linux_cfg, alloc);
+        let mut wasi_cfg = Vec::new_in(alloc);
+        wasi_cfg.push(CfgAtom::pair("target_os", "wasi", alloc));
+        let wasi = TargetDesc::new("wasm64-blaze-wasip1", wasi_cfg, alloc);
+
+        let mut roots = Vec::new_in(alloc);
+        roots.push(app_id);
+        let ask = Ask { roots, features: Vec::new_in(alloc), all_features: false, no_default_features: false, tests: false };
+        let members = [(app_id, app_pkg)];
+        let inputs = UnitGraphInputs {
+            lock: LOCK_TEXT.as_bytes(),
+            workspace_read: ContentId([2; 32]),
+            members: &members,
+            path_packages: &[],
+            resolver: Resolver::V2,
+            target: &linux,
+            host: &linux,
+            wasm_host: Some(&wasi),
+            ask: &ask,
+        };
+
+        struct Handed<'p, 'a> {
+            handed: AVec<'a, (ContentId, &'p [u8])>,
+        }
+        impl<'p> Records<'p> for Handed<'p, '_> {
+            fn record(&mut self, source: &SourceId<'_>) -> Option<&'p [u8]> {
+                let key = source.key();
+                self.handed.iter().find(|(k, _)| *k == key).map(|(_, b)| *b)
+            }
+        }
+
+        let unheld = Unheld { failed: &[], refused: &[] };
+        let mut session = UnitGraphSession::new(&inputs, &lock, PackView::open_source_put, alloc).expect("session");
+        // Simulate host discovery consuming `MOST_PASSES - 2` passes before the final host waves:
+        // pass MOST_PASSES - 1 asks for `shim`, cold handoff feeds `shim` without consuming a pass,
+        // and pass MOST_PASSES finishes the host graph and hands off to `wasm_res` with a fresh budget.
+        session.passes = MOST_PASSES - 2;
+        let mut recs = Handed { handed: Vec::new_in(alloc) };
+        match session.step(&mut recs, unheld).expect("host wave 1") {
+            Entry::Need(needs) => assert_eq!(needs.as_slice(), &[shim_src.key()]),
+            _ => panic!("expected Need(shim)"),
+        }
+        recs.handed.push((shim_src.key(), shim_pack.as_slice()));
+        // Host finishes on its `MOST_PASSES`-th pass; wasm phase now starts with its own fresh budget
+        // and spans 3 passes (Need(wasi_a), Need(wasi_b), Done), exceeding MOST_PASSES in total!
+        match session.step(&mut recs, unheld).expect("wasm wave 1") {
+            Entry::Need(needs) => assert_eq!(needs.as_slice(), &[wasi_a_src.key()]),
+            _ => panic!("expected Need(wasi_a)"),
+        }
+        recs.handed.push((wasi_a_src.key(), wasi_a_pack.as_slice()));
+        match session.step(&mut recs, unheld).expect("wasm wave 2") {
+            Entry::Need(needs) => assert_eq!(needs.as_slice(), &[wasi_b_src.key()]),
+            _ => panic!("expected Need(wasi_b)"),
+        }
+        recs.handed.push((wasi_b_src.key(), wasi_b_pack.as_slice()));
+        assert!(matches!(session.step(&mut recs, unheld).expect("wasm done"), Entry::Made(_)));
+        assert_eq!(session.passes, MOST_PASSES);
+        assert_eq!(session.wasm_passes, 3);
+    }
+
+    /// Cold fetch handoffs (`Entry::Need` -> re-entry with newly fetched sources) must consume the
+    /// exact same resolution pass count as warm runs where every source is already present, so a
+    /// 130-deep cold WASI-only dependency chain completes cleanly within `MOST_PASSES` (256).
+    #[test]
+    fn stateful_session_cold_fetch_handoffs_do_not_consume_resolution_passes() {
+        use std::fmt::Write as _;
+        const CHAIN_LEN: usize = 130;
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let mut lock_text = std::string::String::from("version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"shim\"]\n\n");
+        let _ = writeln!(
+            lock_text,
+            "[[package]]\nname = \"shim\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{:064x}\"\ndependencies = [\"w0\"]\n",
+            0xaausize
+        );
+        for i in 0..CHAIN_LEN {
+            let _ = writeln!(
+                lock_text,
+                "[[package]]\nname = \"w{i}\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{:064x}\"",
+                i + 1
+            );
+            if i + 1 < CHAIN_LEN {
+                let _ = writeln!(lock_text, "dependencies = [\"w{}\"]", i + 1);
+            }
+            lock_text.push('\n');
+        }
+        let lock = Lock::read(lock_text.as_bytes(), alloc).expect("lock");
+        let app_id = lock.named("app").next().expect("app");
+
+        let mut layout = Layout::new("", alloc).expect("layout");
+        let app_toml = "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n[build-dependencies]\nshim = \"1\"\n";
+        let app_pkg = loop {
+            match layout.pass().expect("layout pass") {
+                LayoutPass::Done(units) => break Package::from_member(&units.members[0], alloc),
+                LayoutPass::Need(needs) => {
+                    for need in needs.iter() {
+                        match need {
+                            LayoutNeed::Manifest(path) if path == "Cargo.toml" => layout.manifest(path, Some(app_toml)).expect("manifest"),
+                            LayoutNeed::Manifest(path) => layout.manifest(path, None).expect("manifest"),
+                            LayoutNeed::Listing(dir) if dir == "src" => {
+                                let entries = [LayoutEntry { name: "lib.rs", is_dir: false }];
+                                layout.listing(dir, Some(&entries));
+                            }
+                            LayoutNeed::Listing(dir) if dir.is_empty() => {
+                                let entries = [
+                                    LayoutEntry { name: "Cargo.toml", is_dir: false },
+                                    LayoutEntry { name: "build.rs", is_dir: false },
+                                    LayoutEntry { name: "src", is_dir: true },
+                                ];
+                                layout.listing(dir, Some(&entries));
+                            }
+                            LayoutNeed::Listing(dir) => layout.listing(dir, None),
+                        }
+                    }
+                }
+            }
+        };
+
+        let mut shim_sha = [0u8; 32];
+        shim_sha[31] = 0xaa;
+        let shim_key = SourceId::Crate { name: "shim", version: "1.0.0", sha256: shim_sha }.key();
+        let shim_pack = make_pack(
+            shim_sha,
+            &[
+                ("Cargo.toml", b"[package]\nname = \"shim\"\nversion = \"1.0.0\"\nedition = \"2021\"\n[target.'cfg(target_os = \"wasi\")'.dependencies]\nw0 = \"0.1\"\n"),
+                ("src/lib.rs", b"pub fn s() {}\n"),
+            ],
+            alloc,
+        );
+        let mut all_packs: std::vec::Vec<(ContentId, AVec<'_, u8>)> = std::vec::Vec::with_capacity(CHAIN_LEN + 1);
+        all_packs.push((shim_key, shim_pack));
+        for i in 0..CHAIN_LEN {
+            let mut sha = [0u8; 32];
+            sha[24..].copy_from_slice(&((i + 1) as u64).to_be_bytes());
+            let name = std::format!("w{i}");
+            let key = SourceId::Crate { name: &name, version: "0.1.0", sha256: sha }.key();
+            let toml = if i + 1 < CHAIN_LEN {
+                std::format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nw{} = \"0.1\"\n", i + 1)
+            } else {
+                std::format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+            };
+            let pack = make_pack(sha, &[("Cargo.toml", toml.as_bytes()), ("src/lib.rs", b"pub fn f() {}\n")], alloc);
+            all_packs.push((key, pack));
+        }
+
+        let mut linux_cfg = Vec::new_in(alloc);
+        linux_cfg.push(CfgAtom::pair("target_os", "linux", alloc));
+        let linux = TargetDesc::new("x86_64-unknown-linux-gnu", linux_cfg, alloc);
+        let mut wasi_cfg = Vec::new_in(alloc);
+        wasi_cfg.push(CfgAtom::pair("target_os", "wasi", alloc));
+        let wasi = TargetDesc::new("wasm64-blaze-wasip1", wasi_cfg, alloc);
+
+        let mut roots = Vec::new_in(alloc);
+        roots.push(app_id);
+        let ask = Ask { roots, features: Vec::new_in(alloc), all_features: false, no_default_features: false, tests: false };
+        let members = [(app_id, app_pkg)];
+        let inputs = UnitGraphInputs {
+            lock: lock_text.as_bytes(),
+            workspace_read: ContentId([3; 32]),
+            members: &members,
+            path_packages: &[],
+            resolver: Resolver::V2,
+            target: &linux,
+            host: &linux,
+            wasm_host: Some(&wasi),
+            ask: &ask,
+        };
+
+        struct Handed<'p, 'a> {
+            handed: AVec<'a, (ContentId, &'p [u8])>,
+        }
+        impl<'p> Records<'p> for Handed<'p, '_> {
+            fn record(&mut self, source: &SourceId<'_>) -> Option<&'p [u8]> {
+                let key = source.key();
+                self.handed.iter().find(|(k, _)| *k == key).map(|(_, b)| *b)
+            }
+        }
+
+        let unheld = Unheld { failed: &[], refused: &[] };
+        // Cold run: hand one newly requested pack per wave across all 131 waves.
+        let mut cold = UnitGraphSession::new(&inputs, &lock, PackView::open_source_put, alloc).expect("cold session");
+        let mut cold_recs = Handed { handed: Vec::new_in(alloc) };
+        let cold_made = loop {
+            match cold.step(&mut cold_recs, unheld).expect("cold step must stay within pass budget") {
+                Entry::Made(made) => break made,
+                Entry::Need(needs) => {
+                    for want in needs.iter() {
+                        let (_, pack) = all_packs.iter().find(|(k, _)| k == want).expect("pack exists");
+                        cold_recs.handed.push((*want, pack.as_slice()));
+                    }
+                }
+                Entry::NotFetched { .. } => panic!("unexpected NotFetched"),
+            }
+        };
+
+        // Warm run: hand all 131 packs up front.
+        let mut warm = UnitGraphSession::new(&inputs, &lock, PackView::open_source_put, alloc).expect("warm session");
+        let mut warm_recs = Handed { handed: Vec::new_in(alloc) };
+        for (k, p) in all_packs.iter() {
+            warm_recs.handed.push((*k, p.as_slice()));
+        }
+        let warm_made = match warm.step(&mut warm_recs, unheld).expect("warm step") {
+            Entry::Made(made) => made,
+            _ => panic!("expected warm Made in one call"),
+        };
+
+        assert_eq!(cold.passes, warm.passes, "cold and warm host pass counts must match");
+        assert_eq!(cold.wasm_passes, warm.wasm_passes, "cold and warm wasm pass counts must match");
+        assert_eq!(cold.wasm_passes, (CHAIN_LEN + 1) as u32);
+        assert_eq!(cold_made.record.as_slice(), warm_made.record.as_slice());
+        assert_eq!(
+            cold_made.wasm_record.as_deref(),
+            warm_made.wasm_record.as_deref(),
+            "cold and warm wasm_record bytes must match"
+        );
     }
 }

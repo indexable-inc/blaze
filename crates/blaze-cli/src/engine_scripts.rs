@@ -388,6 +388,7 @@ impl<'s> ScriptQueue<'s> {
         }
         let built = crate::wasm64_compile::CompileInputs {
             graph: sections.graph,
+            wasm_graph: sections.wasm_graph,
             lock: side.lock.text,
             checkout: Some(root),
             members: members.into_bump_slice(),
@@ -1461,6 +1462,7 @@ impl<'f> ScriptsStage<'f> {
             };
             let module = made.script_module(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldScriptModules, key: name })?;
             let wanted = crate::script_modules::Wanted {
+                script_unit: module.script_unit,
                 ran_as: module.ran_as, package: module.package, version: module.version,
                 features: queue.jobs.alloc_slice_copy(&module.features),
                 files: module.files.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
@@ -1487,7 +1489,7 @@ impl<'f> ScriptsStage<'f> {
             let read = work::payload(cx, store, &graph, &scratch)?;
             let modules = std::path::Path::new(home).join(".blaze/v2");
             let erased = blaze_own::Erased::new(&scratch);
-            match crate::macros::list(read.unit_graph(graph.name)?.graph, &side.lock, &modules, &side.place, erased.handle()) {
+            match crate::macros::list(read.unit_graph(graph.name)?, &side.lock, &modules, &side.place, erased.handle()) {
                 Ok(listed) => self.macros = Some(std::sync::Arc::new(listed)),
                 Err(error) => {
                     let failed = TaskFailure { name, why: Why::Refused { what: "the macro crates could not be listed", rule: "macros.rs" } };

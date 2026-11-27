@@ -31,7 +31,10 @@ const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 4";
 // "3": wasm build-script module lookups require `script_unit::WASM_MODULE_HEADER` (v5) after
 // `blaze-build` `bind_let_place` peeled-reference deref fix, invalidating cached `MacroModule`
 // task records that pointed at stale v4 wasm build-script modules.
-const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 3";
+// "4": wasm build-script module lookups require `script_unit::WASM_MODULE_HEADER` (v6:
+// wasm64-blaze-wasip1 target-specific dependency resolution + lock-closure deps digest),
+// invalidating cached `MacroModule` task records that pointed at pre-v6 modules.
+const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 4";
 const OUT_DOMAIN: &str = "blaze-cli build-script module out 2";
 
 /// The rule a lookup's failure names.
@@ -88,6 +91,7 @@ pub(crate) fn part_source(graph_source: ContentId, subject: ContentId) -> Conten
 pub(crate) struct ScriptModule {
     pub subject: ContentId,
     pub crate_at: usize,
+    pub script_unit: blaze_unit_graph::UnitId,
     pub ran_as: RanAs,
     pub package: &'static str,
     pub version: &'static str,
@@ -96,9 +100,11 @@ pub(crate) struct ScriptModule {
     pub deps: Option<std::string::String>,
 }
 
-/// What one lookup is for: the run's placement and the script unit's package, version,
-/// features, optional path-package `files` digest, and optional build-dependency `deps` digest.
+/// What one lookup is for: the run's placement and the script unit's exact graph id, package,
+/// version, features, optional path-package `files` digest, and optional build-dependency `deps`
+/// digest.
 pub(crate) struct Wanted<'w> {
+    pub script_unit: blaze_unit_graph::UnitId,
     pub ran_as: RanAs,
     pub package: &'w str,
     pub version: &'w str,
@@ -125,7 +131,7 @@ pub(crate) fn run<'b>(
         return Ok(Did::Hole(refused("no home: the module store is under it"), "the build-script module store is under the home, and HOME is not set"));
     };
     let store = std::path::Path::new(home).join(".blaze/v2");
-    let Wanted { ran_as, package, version, features, files, deps } = wanted;
+    let Wanted { script_unit, ran_as, package, version, features, files, deps } = wanted;
     let host = crate::graph::TRIPLE;
     let (found, digest_file) = match ran_as {
         RanAs::Wasm => (blaze_proc_macro::script_unit::module_of_files_and_deps(&store, package, version, features, files, deps), "wasm-sha256"),
@@ -144,7 +150,7 @@ pub(crate) fn run<'b>(
             && let Some(inputs) = compile
         {
             let _compile_cx = cx.span("script module: self-compile build.rs to wasm64");
-            match crate::wasm64_compile::compile_build_script(&store, inputs, package, version, features) {
+            match crate::wasm64_compile::compile_build_script(&store, inputs, script_unit, package, version, features, deps) {
                 Ok(wasm_sha256) => {
                     let mut made = Made::new_in(name, held);
                     made.out = ContentId::of(OUT_DOMAIN, wasm_sha256.trim().as_bytes());

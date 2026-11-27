@@ -167,7 +167,7 @@ impl<'n> RunProcs<'n, '_> {
             Ok(blaze_drive::record::Stored::Shape(_)) => return Err(said(format_args!("no proc-macro runner: the unit graph's record is a shape, not a record"))),
             Err(error) => return Err(said(format_args!("no proc-macro runner: the unit graph's record is malformed: {error:?}"))),
         };
-        let graph = crate::graph_payload::sections(payload).map_err(|error| said(format_args!("no proc-macro runner: the unit graph's record: {error}")))?.graph;
+        let sections = crate::graph_payload::sections(payload).map_err(|error| said(format_args!("no proc-macro runner: the unit graph's record: {error}")))?;
         let stamps = crate::sweep::FromMeta::now(&env.clock);
         let mut rows = crate::sweep::Rows::new_in(frame);
         let erased = blaze_own::Erased::new(frame);
@@ -177,7 +177,7 @@ impl<'n> RunProcs<'n, '_> {
             return Err(said(format_args!("no proc-macro runner: the workspace has no `Cargo.lock` the units read, so no macro crate is located (units.rs `Laid::lock`)")));
         };
         let members = crate::names::member_dirs(Some(&laid));
-        let names = crate::names::world(cx, self.root, graph, Some(lockfile.lock), members, env)
+        let names = crate::names::world(cx, self.root, sections.graph, sections.wasm_graph, Some(lockfile.lock), members, env)
             .map_err(|error| said(format_args!("no proc-macro runner: the names world: {error}")))?;
         let world = names.made().ok_or_else(|| said(format_args!("no proc-macro runner: the names world was made and not kept (names.rs `world`)")))?;
         let side = crate::proc_runner::MacroSide { lock: lockfile, place: crate::macros::Place { home: env.home, checkout: env.checkout, members, rows: &rows }, heap: env.heap };

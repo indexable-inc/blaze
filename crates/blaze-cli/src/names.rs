@@ -1167,6 +1167,10 @@ pub(crate) struct NamesWorld<'f> {
     /// The unit graph the world was made from (leaked with it): a proc-macro crate's unit, whose
     /// module identity the runner keys it by (proc_runner.rs).
     graph: &'static blaze_unit_graph::UnitGraph<'static>,
+    /// Optional resolved `wasm64-blaze-wasip1` host-unit graph carried alongside `graph` in the
+    /// `UnitGraph` record payload, used by `proc_runner::make` and `script_deps_digest` so
+    /// WASI-side unified dependency features enter module identities (Rule 21, Rule 30).
+    wasm_graph: Option<&'static blaze_unit_graph::UnitGraph<'static>>,
     /// Where the world placed each locked package (proc_callers.rs): populated on the eager
     /// discovery path (`make_world`), empty on the lazy standing-list path (`make_world_from_list`).
     placed: &'static [(LockId, blaze_world::Place<'static>)],
@@ -1208,6 +1212,11 @@ impl<'f> NamesWorld<'f> {
     /// The unit graph the world was made from.
     pub(crate) fn graph(&self) -> &'static blaze_unit_graph::UnitGraph<'static> {
         self.graph
+    }
+
+    /// Optional resolved `wasm64-blaze-wasip1` host-unit graph carried beside `graph`.
+    pub(crate) fn wasm_graph(&self) -> Option<&'static blaze_unit_graph::UnitGraph<'static>> {
+        self.wasm_graph
     }
 
     /// What making the world did: its graph decodes, fetched records mapped and packages placed.
@@ -1371,7 +1380,7 @@ impl<'f> Names<'f> {
         if view.out != maker.out {
             return refused(WorldWhy::Back(crate::engine_units::BackRefused::Out { key: maker.record }));
         }
-        let made = match make_world(&cx, root, sections.graph, maker.lock, maker.members, &[], &[], env, Some(self.list)) {
+        let made = match make_world(&cx, root, sections.graph, sections.wasm_graph, maker.lock, maker.members, &[], &[], env, Some(self.list)) {
             Ok(made) => made,
             Err(why) => return refused(WorldWhy::Make(why)),
         };
@@ -1644,11 +1653,12 @@ pub(crate) fn world<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     graph_record: &[u8],
+    wasm_graph_record: &[u8],
     lock: Option<&'f Lock<'static>>,
     members: Option<&[crate::graph::CheckoutDir]>,
     env: &FetchEnv<'_>,
 ) -> Result<Names<'f>, NamesError> {
-    world_with_mapped(cx, root, graph_record, lock, members, &[], &[], env)
+    world_with_mapped(cx, root, graph_record, wasm_graph_record, lock, members, &[], &[], env)
 }
 
 /// As [`world`], reusing fetched source records already mapped during unit-graph discovery
@@ -1659,6 +1669,7 @@ pub(crate) fn world_with_mapped<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     graph_record: &[u8],
+    wasm_graph_record: &[u8],
     lock: Option<&'f Lock<'static>>,
     members: Option<&[crate::graph::CheckoutDir]>,
     pre_mapped: &[(ContentId, &'static [u8])],
@@ -1670,7 +1681,7 @@ pub(crate) fn world_with_mapped<'f>(
     let heap: Alloc<'static> = env.heap.alloc();
     let mut dirs: blaze_own::Vec<blaze_world::CheckoutPath<'_>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(members.len(), heap);
     dirs.extend(members.iter().map(|entry| blaze_world::CheckoutPath { id: entry.id, dir: entry.dir.as_str(), kind: entry.kind }));
-    let made = make_world(cx, root, graph_record, lock, &dirs, pre_mapped, pre_dirs, env, None)?;
+    let made = make_world(cx, root, graph_record, wasm_graph_record, lock, &dirs, pre_mapped, pre_dirs, env, None)?;
     let list: &'static [u8] = {
         let _cx = cx.span("names: the crate list written");
         blaze_world::crate_list::encode_with(&made.world, &made, heap).map_err(NamesError::List)?.leak_static()
@@ -1717,6 +1728,7 @@ fn make_world<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     graph_record: &[u8],
+    wasm_graph_record: &[u8],
     lock_whole: &'f Lock<'static>,
     members: &[blaze_world::CheckoutPath<'_>],
     pre_mapped: &[(ContentId, &'static [u8])],
@@ -1737,6 +1749,13 @@ fn make_world<'f>(
     };
     let decoded: &'static blaze_unit_graph::record::Decoded<'static> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(decoded, frame));
     let graph = &decoded.graph;
+    let wasm_graph: Option<&'static blaze_unit_graph::UnitGraph<'static>> = if wasm_graph_record.is_empty() {
+        None
+    } else {
+        let wd = blaze_unit_graph::record::decode(wasm_graph_record, frame_alloc).map_err(NamesError::Graph)?;
+        let wd: &'static blaze_unit_graph::record::Decoded<'static> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(wd, frame));
+        Some(&wd.graph)
+    };
     let cx: &'static Cx = std::boxed::Box::leak(std::boxed::Box::new(cx.until(cx.deadline())));
     let mut shelf = {
         let _cx = cx.span("names: the toolchain's shelf opened");
@@ -1845,16 +1864,18 @@ fn make_world<'f>(
             .iter()
             .find(|p| p.id == script.package)
             .and_then(|p| crate::macro_files::script_files_digest_in_dir(cx, &reader.root, p.dir, script.root.as_str(), frame));
-        let deps = blaze_proc_macro::script_unit::script_deps_digest(graph, lock, script_id, |dep_pkg| {
-            paths
+        let deps = blaze_proc_macro::script_unit::script_deps_digest(graph, wasm_graph, lock, script_id, |dep_pkg| {
+            members
                 .iter()
                 .find(|p| p.id == dep_pkg)
                 .and_then(|p| crate::macro_files::package_files_digest_in_dir(cx, &reader.root, p.dir, frame))
-        });
+        })
+        .map_err(|_| NamesError::Frame)?;
         let subject = crate::script_modules::subject(ran_as, script.name.as_str(), script.version.as_str(), &features, files.as_deref(), deps.as_deref());
         script_modules.push(crate::script_modules::ScriptModule {
             subject,
             crate_at: at,
+            script_unit: script_id,
             ran_as,
             package: script.name.as_str(),
             version: script.version.as_str(),
@@ -1875,7 +1896,7 @@ fn make_world<'f>(
     // Decommit any over-committed span tail pages past the cursor in `NAMES_FRAME` while keeping
     // all live world allocations intact for the remainder of the command.
     frame.trim_tail();
-    Ok(NamesWorld { world, crate_public, heap, scripts, script_roots, script_modules, graph, placed, lazy_trees, frame, opened })
+    Ok(NamesWorld { world, crate_public, heap, scripts, script_roots, script_modules, graph, wasm_graph, placed, lazy_trees, frame, opened })
 }
 
 /// Each crate (by world index, in order) made from a unit with a build script, with that
