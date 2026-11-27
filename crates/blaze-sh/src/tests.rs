@@ -891,7 +891,15 @@ fn modern_data_shell_syntax_leading_pipe_brackets_projection_files_and_verbs() {
         other => panic!("expected flattened deduped list, got {other:?}"),
     }
 
-    // 2. Bare `Cargo.toml.package.version`!
+    // 2. Bare standalone data file (`Cargo.lock`, `(Cargo.toml)`) & chained `Cargo.toml.package.version`!
+    let bare_lock = host.run("Cargo.lock", st.fork());
+    assert_eq!(bare_lock.exit_code, 0, "got {:?}", bare_lock.value);
+    assert!(matches!(bare_lock.value, Value::Record(_)), "expected Record, got {:?}", bare_lock.value);
+
+    let bare_paren = host.run("(Cargo.toml).package.version", st.fork());
+    assert_eq!(bare_paren.exit_code, 0, "got {:?}", bare_paren.value);
+    assert_eq!(bare_paren.value, Value::string("0.1.0", alloc()));
+
     let ver = host.run("Cargo.toml.package.version", st.fork());
     assert_eq!(ver.exit_code, 0, "got {:?}", ver.value);
     assert_eq!(ver.value, Value::string("0.1.0", alloc()));
