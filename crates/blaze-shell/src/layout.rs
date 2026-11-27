@@ -7483,15 +7483,29 @@ fn layout_completion_popup(
                 ),
             };
             scene.overlay_round_rect(ix, iy, ix + icon_s, iy + icon_s, radius, fill_col, 1.0, border_col, 0);
-            let gx = ix + (icon_s - m.cw) * 0.5;
-            scene.overlay_text_run(gx, ty, glyph, fg_col, true, false, 0);
+            // Optically center the badge glyph inside `[ix..ix+icon_s, iy..iy+icon_s]` using
+            // `UiSmall` bold (sized to breathe cleanly inside the `icon_s` badge) and exact
+            // compensation for `UiSmall`'s mono-baseline `y_nudge_px`.
+            let cx = ix + icon_s * 0.5;
+            let cy = iy + icon_s * 0.5;
+            let gw = m.measure_styled(glyph, TextFace::UiSmall, true);
+            let gx = cx - gw * 0.5;
+            let baseline_offset = match glyph {
+                "s" | "v" => 0.625,
+                "-" | "·" => 0.645,
+                _ => 0.565,
+            };
+            let gy = cy - m.ch * baseline_offset;
+            scene.overlay_ui_small(gx, gy, glyph, fg_col, true, false, 0);
         }
 
-        // Fixed right-hand tabular columns (all vertically centered on the exact row centerline):
+        // Fixed right-hand tabular columns (all baseline-aligned cleanly with the primary label):
         // - In filesystem mode (`any_size_bar || any_age`): `[label] [age] [==== size bar] [size/detail]`
         // - In unified subcommand/flag mode (`inline_doc_mode`): `[label] [inline 1-line description]`
+        // Note: `UiSmall` already carries `y_nudge_px = mono_baseline - ui_small_baseline` in
+        // `Fonts::rasterize_runs`, so passing `ty` aligns its baseline pixel-for-pixel with `Mono`!
         let vis = &row_vis[offset];
-        let ty_small = ry + (row_h - m.line_h(TextFace::UiSmall)) * 0.5;
+        let ty_small = ty;
         let right_edge = px1 - 14.0 - sb_pad;
         let label_x = ix + icon_s + 9.0;
         let mut col_left;
@@ -7681,7 +7695,7 @@ fn layout_completion_popup(
     // Bottom status / Quick-Doc strip in SF Pro + scroll count indicator.
     let div_y = py1 - doc_h;
     scene.overlay_line(px0 + 1.0, div_y, px1 - 1.0, div_y, 1.0, theme::LINE, 0);
-    let doc_ty = div_y + (doc_h - m.line_h(TextFace::UiSmall)) * 0.5;
+    let doc_ty = div_y + (doc_h - m.ch) * 0.5;
     let hint = if has_sb {
         format!("{}/{}  ·  tab complete  ·  ↑↓  ·  esc", editor.completion_selected + 1, total)
     } else {
