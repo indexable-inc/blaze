@@ -1,44 +1,41 @@
 #!/usr/bin/env bash
-# The cache key of the repository's built scripts (scripts/, docs/v2/plan/design/scripts.md):
-# prints `scripts-<os>-<arch>-<blaze version>-<sha256>`, run from the checkout's top. No
-# argument, and it reads only the files below, so the `changes` job's sparse checkout has them.
+# The cache key of the repository's job-scoped built scripts (scripts/,
+# docs/v2/plan/design/scripts.md): prints `scripts-<job>-<os>-<arch>-<blaze version>-<sha256>`,
+# run from the checkout's top.
 #
 # Why the key covers every input of what `build.sh` makes (AGENTS.md keys-cover-every-input):
-# the binaries are what the pinned release builds from these, and nothing else is read:
-# - the compiler: .github/blaze-version (the release, with its own toolchain; rule own-nightly),
+# - the job and exact binary set (`bins.sh <job>`, plus `tools/gate.txt` for `scripts`);
+# - the compiler: .github/blaze-cli-version (the pinned v2 release, with its own toolchain),
 #   pins/toolchain (the nightly blaze pins), and the runner's OS and architecture;
-# - the sources: every file under scripts/, crates/blaze-script/, crates/blaze-pins/ and pins/
-#   (which blaze-pins includes), by content;
-# - the dependencies: the Cargo.lock blocks of the scripts package's whole dependency closure
-#   (name, version, registry and checksum, so each crate's source is fixed by its checksum); a
-#   package in it with no checksum (a path or a [patch]) is refused below, as its source is not
-#   hashed here;
-# - the manifests: the root Cargo.toml whole but for what cannot reach these packages (the
-#   workspace's member and exclude lists, which the lock's closure already resolves; the
-#   [workspace.dependencies] entries scripts and blaze-script do not name; [patch] entries, each
-#   of which a closure package would show by losing its checksum), and .cargo/config.toml whole;
-# - the checkout's absolute path: docs, rustcsites and guards find the tree as
-#   `env!("CARGO_MANIFEST_DIR")/..`, baked in at build time, so a binary built in another checkout
-#   would read that one;
-# - the environment: build.sh unsets every variable cargo or blaze reads from the caller
-#   (engine.py's SCRUBBED), so none is an input;
-# - this action's own files, which make the binaries.
+# - the dependencies: the Cargo.lock blocks of the `scripts` package's whole transitive closure
+#   (every registry crate is fixed by its SHA-256 checksum);
+# - the sources: EVERY unchecksummed (workspace or `[patch]`) package in `scripts`'s Cargo.lock
+#   closure, mapped to its directory on disk (refused if any cannot be located) and hashed in full,
+#   plus `pins/`, `.github/actions/script/`, and `.github/actions/blaze/`;
+# - the manifests: root `Cargo.toml` filtered to workspace dependencies referenced by any path
+#   package in the closure, plus `.cargo/config.toml` whole;
+# - the checkout's absolute path (`pwd -P`): scripts that bake in `env!("CARGO_MANIFEST_DIR")`;
+# - the environment: `build.sh` scrubs compiler/build env vars so none leaks into the build.
 set -euo pipefail
 
+here=$(cd "$(dirname "$0")" && pwd -P)
 sha() { if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi; }
+sha_files() { if command -v sha256sum >/dev/null; then xargs sha256sum; else xargs shasum -a 256; fi; }
 die() { echo "::error::$*" >&2; echo "key.sh: $*" >&2; exit 1; }
 
-for need in .github/blaze-version .github/blaze-cli-version pins/toolchain Cargo.toml Cargo.lock .cargo/config.toml scripts/Cargo.toml crates/blaze-script/Cargo.toml; do
+[ $# = 1 ] || die "takes JOB (scripts, lean, or release), not: $*"
+job=$1
+
+for need in .github/blaze-cli-version pins/toolchain Cargo.toml Cargo.lock .cargo/config.toml scripts/Cargo.toml; do
   [ -f "$need" ] || die "no $need in $(pwd -P): run from the checkout's top, with this file checked out"
 done
 export LC_ALL=C
 
-# The workspace dependencies the two path packages name in their dependency tables
-# (`x.workspace = true`, `x = { workspace = true ... }`).
-direct=$(awk '/^\[/ { deps = $0 ~ /dependencies\]$/ } deps' scripts/Cargo.toml crates/blaze-script/Cargo.toml |
-  sed -nE 's/^([A-Za-z0-9_-]+)(\.workspace *= *true| *= *\{.*workspace *= *true).*/\1/p' | sort -u | tr '\n' ' ')
+bins=$("$here/bins.sh" "$job")
 
-closure=$(awk '
+# Walk Cargo.lock from `scripts` to extract both the full lock closure and every unchecksummed
+# (workspace member or `[patch]`) package name in that closure.
+walk=$(awk '
   function flush() { if (n) text[n] = block }
   /^\[\[package\]\]/ { flush(); n++; block = $0 "\n"; next }
   n { block = block $0 "\n" }
@@ -54,21 +51,56 @@ closure=$(awk '
     while (h <= t) {
       split(q[h++], w, " ")
       c = split(byname[w[1]], ids, " ")
-      if (c == 0) { print "MISSING " w[1]; exit }
+      if (c == 0) { print "__ERR__ MISSING " w[1]; exit }
       for (k = 1; k <= c; k++) {
         i = ids[k]
         if (w[2] != "" && ver[i] != w[2]) continue
         if (seen[i]++) continue
-        if (!sum[i] && name[i] != "scripts" && name[i] != "blaze-script" && name[i] != "blaze-pins") { print "UNHASHED " name[i] " " ver[i]; exit }
-        printf "%s", text[i]
+        if (!sum[i]) path_pkgs[name[i]] = 1
+        out = out text[i]
         m = split(deps[i], ds, "|"); for (j = 2; j <= m; j++) q[++t] = ds[j]
       }
     }
+    for (p in path_pkgs) print "__PATH__ " p
+    print "__CLOSURE__"
+    printf "%s", out
   }' Cargo.lock)
-case "$closure" in
-  MISSING*) die "Cargo.lock has no package ${closure#MISSING } in the scripts package's dependencies" ;;
-  UNHASHED*) die "${closure#UNHASHED } in the scripts package's dependencies has no checksum in Cargo.lock (a path or a [patch]): its source is no input of this key, so add its directory to the sources key.sh hashes" ;;
-esac
+
+err_line=$(printf '%s\n' "$walk" | grep '^__ERR__ ' || true)
+if [ -n "$err_line" ]; then
+  die "Cargo.lock has no package ${err_line#__ERR__ MISSING } in the scripts package's dependencies"
+fi
+
+path_pkg_names=$(printf '%s\n' "$walk" | sed -n 's/^__PATH__ //p' | sort -u)
+closure=$(printf '%s\n' "$walk" | awk 'seen { print } /^__CLOSURE__$/ { seen = 1 }')
+
+# Map every package name in `scripts/`, `crates/*/`, and `vendor/*/` to its directory.
+pkg_map=$(awk '
+  FNR == 1 { in_pkg = 0 }
+  /^\[/ { in_pkg = ($0 == "[package]") }
+  in_pkg && /^name[ \t]*=/ {
+    v = $0
+    sub(/^[^"]*"/, "", v)
+    sub(/".*$/, "", v)
+    dir = FILENAME
+    sub(/\/Cargo\.toml$/, "", dir)
+    print v "\t" dir
+    nextfile
+  }' scripts/Cargo.toml crates/*/Cargo.toml vendor/*/Cargo.toml)
+
+source_dirs=()
+manifest_files=()
+while IFS= read -r pkg; do
+  [ -n "$pkg" ] || continue
+  dir=$(printf '%s\n' "$pkg_map" | awk -F'\t' -v p="$pkg" '$1 == p { print $2; exit }')
+  [ -n "$dir" ] && [ -d "$dir" ] || die "unchecksummed package '$pkg' in scripts's Cargo.lock closure has no Cargo.toml under scripts/, crates/*/, or vendor/*/"
+  source_dirs+=("$dir")
+  manifest_files+=("$dir/Cargo.toml")
+done <<< "$path_pkg_names"
+
+# All workspace dependencies named by any path package in scripts's closure.
+direct=$(awk '/^\[/ { deps = $0 ~ /dependencies\]$/ } deps' "${manifest_files[@]}" |
+  sed -nE 's/^([A-Za-z0-9_-]+)(\.workspace *= *true| *= *\{.*workspace *= *true).*/\1/p' | sort -u | tr '\n' ' ')
 
 manifest=$(awk -v direct=" $direct " '
   /^\[/ { table = $0; skip = 0; depth = 0 }
@@ -82,17 +114,22 @@ manifest=$(awk -v direct=" $direct " '
   skip { line = $0; if (line ~ /\]/) skip = 0; next }
   { print }' Cargo.toml)
 
+extra_inputs=(pins .github/actions/script .github/actions/blaze)
+if [ "$job" = scripts ]; then
+  extra_inputs+=(tools/gate.txt)
+fi
+
+blaze_ver=$(tr -d '[:space:]' < .github/blaze-cli-version)
 digest=$({
-  printf 'blaze-version %s\n' "$(cat .github/blaze-version)"
-  printf 'blaze-cli-version %s\n' "$(cat .github/blaze-cli-version)"
+  printf 'job %s\n' "$job"
+  printf 'bins\n%s\n' "$bins"
+  printf 'blaze-cli-version %s\n' "$blaze_ver"
   printf 'toolchain %s\n' "$(cat pins/toolchain)"
   printf 'host %s %s\n' "$(uname -s)" "$(uname -m)"
   printf 'checkout %s\n' "$(pwd -P)"
   printf 'direct %s\n' "$direct"
-  find scripts crates/blaze-script crates/blaze-pins crates/blaze-fetch crates/blaze-git-fetch pins .github/actions/script -type f ! -path '*/target/*' | sort | while read -r f; do
-    printf 'file %s %s\n' "$f" "$(sha < "$f" | cut -d' ' -f1)"
-  done
+  find "${source_dirs[@]}" "${extra_inputs[@]}" -type f ! -path '*/target/*' | sort -u | sha_files
   printf '%s\n' "$closure" "$manifest"
   cat .cargo/config.toml
 } | sha | cut -d' ' -f1)
-echo "scripts-$(uname -s)-$(uname -m)-$(cat .github/blaze-cli-version)-$digest"
+echo "scripts-$job-$(uname -s)-$(uname -m)-$blaze_ver-$digest"

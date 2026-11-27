@@ -59,12 +59,9 @@ const TAIL: usize = 12;
 const CI_ONLY_STEPS: [(&str, &str); 0] = [];
 
 /// The scripts another job of the workflow calls, each with why it is not a row.
-const CI_ONLY_SCRIPTS: [(&str, &str); 5] = [
+const CI_ONLY_SCRIPTS: [(&str, &str); 2] = [
     ("gate", "the runner itself, called by the `scripts` job's one gate step"),
     ("lean_gate", "the `lean` job: builds Lean packages and verifies `#print axioms`"),
-    ("toolchain_cut", "the `cargo` job: cuts the pinned toolchain shelf before running workspace tests"),
-    ("ci_test", "the `cargo` job: runs workspace tests in parallel with bounded timeouts"),
-    ("sys_imports", "the `cargo` job: checks blaze-sys object imports across targets"),
 ];
 
 /// Why the list, the justfile or the workflow is refused (rule 19: each names the file and line).

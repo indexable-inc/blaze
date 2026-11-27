@@ -1,7 +1,7 @@
-# blaze: the merge gate (zero Python, zero uv).
+# blaze: the merge gate (100% blaze — zero cargo, zero rustc, zero rustup, zero Python).
 #
 #   every change: gate checks (`scripts`), workflow validation (`workflows`), Lean proofs (`lean`);
-#   code changes: workspace check, parallel tests, and blaze-sys import audit (`cargo`).
+#   code changes: incremental workspace check and tests (`blaze`).
 #
 # `ci` is the single required status check for branch protection and the merge queue.
 name: blaze
@@ -23,7 +23,7 @@ env:
   BLAZE_CORES: all
 
 jobs:
-  # Fast shell path filter: decides whether code-building jobs (`cargo`) need to run.
+  # Fast shell path filter: decides whether the code-checking/testing job (`blaze`) needs to run.
   changes:
     name: changes
     runs-on: [ix, arm64]
@@ -50,11 +50,11 @@ jobs:
             echo "tier=none" >> "$GITHUB_OUTPUT"
           fi
 
-  # All repository gate checks (tools/gate.txt, identical to `just lint`, zero Python).
+  # All repository gate checks (tools/gate.txt, identical to `just lint`, built by blaze).
   scripts:
     name: gate
     runs-on: [ix, arm64]
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: oven-sh/setup-bun@v2
@@ -73,7 +73,7 @@ jobs:
             "$BLAZE_SCRIPTS/gate" "{\"command\": \"run\", \"scripts\": \"$BLAZE_SCRIPTS\"}"
           fi
 
-  # Lean formal verification proofs (pure Rust lean_gate runner, zero Python).
+  # Lean formal verification proofs (pure Rust lean_gate runner, built by blaze).
   lean:
     name: lean proofs
     runs-on: [ix, arm64]
@@ -136,8 +136,8 @@ jobs:
           tar -xzf "$tgz" -C "$RUNNER_TEMP" actionlint
       - run: '"$RUNNER_TEMP/actionlint" -color -shellcheck='
 
-  # Workspace check, parallel unit tests, and blaze-sys symbol import audit.
-  cargo:
+  # Incremental workspace check and parallel sandboxed unit tests via blaze (zero cargo/rustc).
+  blaze:
     name: check and test, linux arm64
     needs: changes
     if: needs.changes.outputs.tier != 'none'
@@ -145,52 +145,16 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          components: llvm-tools
-          targets: x86_64-unknown-linux-gnu aarch64-apple-darwin
-      - uses: ./.github/actions/script
-        with:
-          job: cargo
-      - name: cut toolchain shelf
-        run: |
-          pinned="$(tr -d '[:space:]' < crates/blaze-toolchain/PINNED)"
-          shelf="$HOME/.blaze/v2/toolchain"
-          tc="$(cat pins/toolchain)"
-          cargo +"$tc" fetch --locked --quiet
-          reg="$(ls -d "${CARGO_HOME:-$HOME/.cargo}"/registry/cache/index.crates.io-* | head -n 1)"
-          if [ -f "$shelf/$pinned" ]; then
-            "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", \"wasm64-blaze-wasip1\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": true, \"macro_side\": true}"
-          else
-            "$BLAZE_SCRIPTS/toolchain_cut" "{\"tree\": \".\", \"targets\": [\"aarch64-apple-darwin\", \"aarch64-unknown-linux-gnu\", \"wasm64-blaze-wasip1\"], \"registry\": \"$reg\", \"shelf\": \"$shelf\", \"write_pin\": false, \"check\": false, \"macro_side\": true}"
-            if [ ! -f "$shelf/$pinned" ]; then
-              echo "::error::crates/blaze-toolchain/PINNED ($pinned) does not match toolchain_cut output" >&2
-              exit 1
-            fi
-          fi
-      - name: cargo check --workspace --exclude blaze-std --all-targets
-        run: cargo +"$(cat pins/toolchain)" check --locked --workspace --exclude blaze-std --all-targets --message-format short
-      - name: cargo test --workspace --exclude blaze-std
-        run: '"$BLAZE_SCRIPTS/ci_test" ''{"exclude": ["blaze-std"]}'''
-      - name: blaze-sys imports, per target
-        run: |
-          tc="$(cat pins/toolchain)"
-          sysroot="$(rustc +"$tc" --print sysroot)"
-          nm="$sysroot/lib/rustlib/aarch64-unknown-linux-gnu/bin/llvm-nm"
-          for triple in aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu aarch64-apple-darwin; do
-            timeout -k 30 600 cargo +"$tc" build --locked -p blaze-sys --lib --target "$triple" --target-dir target/sys-imports
-            builtins=$(echo "$sysroot/lib/rustlib/$triple/lib/"libcompiler_builtins-*.rlib)
-            case "$triple" in
-              *-linux-*) extra='' ; os=linux ;;
-              *) extra=', "ratchet": "tools/ratchets/blaze-sys-libsystem.txt"' ; os=macos ;;
-            esac
-            timeout -k 30 120 "$BLAZE_SCRIPTS/sys_imports" "{\"command\": \"check\", \"target\": \"$os\", \"objects\": [\"target/sys-imports/$triple/debug/libblaze_sys.rlib\"], \"builtins\": \"$builtins\", \"nm\": \"$nm\"$extra}"
-          done
+      - uses: ./.github/actions/blaze
+      - name: blaze check
+        run: timeout -k 30 1200 blaze check . --stats
+      - name: blaze test
+        run: timeout -k 30 1800 blaze test . --stats
 
   # Single required status check summarizing every job expected for this tier.
   ci:
     name: ci
-    needs: [changes, scripts, workflows, lean, cargo]
+    needs: [changes, scripts, workflows, lean, blaze]
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5
@@ -201,7 +165,7 @@ jobs:
           R_SCRIPTS: ${{ needs.scripts.result }}
           R_WORKFLOWS: ${{ needs.workflows.result }}
           R_LEAN: ${{ needs.lean.result }}
-          R_CARGO: ${{ needs.cargo.result }}
+          R_BLAZE: ${{ needs.blaze.result }}
         run: |
           set -euo pipefail
           printf '%s\t%s\n' \
@@ -209,14 +173,14 @@ jobs:
             "$R_SCRIPTS" scripts \
             "$R_WORKFLOWS" workflows \
             "$R_LEAN" lean \
-            "$R_CARGO" cargo
+            "$R_BLAZE" blaze
           case "$TIER" in
             none) expected="changes scripts workflows lean" ;;
-            gate|warm) expected="changes scripts workflows lean cargo" ;;
+            gate|warm) expected="changes scripts workflows lean blaze" ;;
             *) echo "::error::unexpected tier '$TIER'"; exit 1 ;;
           esac
           failed=0
-          for r in "$R_CHANGES" "$R_SCRIPTS" "$R_WORKFLOWS" "$R_LEAN" "$R_CARGO"; do
+          for r in "$R_CHANGES" "$R_SCRIPTS" "$R_WORKFLOWS" "$R_LEAN" "$R_BLAZE"; do
             if [ "$r" = failure ] || [ "$r" = cancelled ]; then failed=1; fi
           done
           result_of() {
@@ -225,7 +189,7 @@ jobs:
               scripts) printf '%s' "$R_SCRIPTS" ;;
               workflows) printf '%s' "$R_WORKFLOWS" ;;
               lean) printf '%s' "$R_LEAN" ;;
-              cargo) printf '%s' "$R_CARGO" ;;
+              blaze) printf '%s' "$R_BLAZE" ;;
             esac
           }
           missed=""
