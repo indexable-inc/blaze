@@ -275,6 +275,8 @@ pub enum HitAction {
     SwitchGitBranch(String),
     ChangeDir(String),
     InsertToken(String),
+    /// Submit a command directly into the focused pane (e.g. clicking `git help tutorial ↗` or `?` in help cards).
+    RunCommand(String),
     /// In-app tiling window manager & workspace tab actions.
     SwitchTab(TabId),
     /// Switch to workspace `tab` and activate CoW session fork `branch` in its focused pane.

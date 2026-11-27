@@ -9,6 +9,7 @@ pub mod blocks;
 pub mod cli_spec_driver;
 pub mod config;
 pub mod diag_view;
+pub mod help_view;
 pub mod dust_driver;
 pub mod editor;
 pub mod find;

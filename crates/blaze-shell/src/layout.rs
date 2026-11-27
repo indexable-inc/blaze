@@ -2393,7 +2393,9 @@ fn layout_value(
                 .max(m.ch)
             })
         }
-        Value::Output(out) => layout_command_output(scene, out, x0, y0, width, m, clip_id),
+        Value::Output(out) => {
+            layout_command_output(scene, block.id.0, &block.source, out, x0, y0, width, m, clip_id)
+        }
         scalar => layout_scalar(scene, scalar, x0, y0, width, m, clip_id, now_ns),
     }
 }
@@ -4698,9 +4700,41 @@ fn draw_shaded_filename(
 /// `stdout` and `stderr` streams, full ANSI SGR color rendering (16 / 256 / 24-bit TrueColor,
 /// bold/dim/italic, backgrounds), subtle coral gutter rail on `stderr` lines, exact per-line
 /// arrival timestamp hover tooltips, and explicit `exit N · out · err` metadata pills.
+fn with_cached_help_doc<R>(
+    block_id: u64,
+    cmd_source: &str,
+    stdout_len: usize,
+    stderr_len: usize,
+    lines: &[&str],
+    f: impl FnOnce(Option<&crate::help_view::HelpDoc>) -> R,
+) -> R {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static CACHE: RefCell<HashMap<(u64, usize, usize), Option<crate::help_view::HelpDoc>>> =
+            RefCell::new(HashMap::new());
+    }
+
+    let key = (block_id, stdout_len, stderr_len);
+    CACHE.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if !map.contains_key(&key) {
+            if map.len() > 48 {
+                map.clear();
+            }
+            let parsed = crate::help_view::parse_help_doc(cmd_source, lines);
+            map.insert(key, parsed);
+        }
+        f(map.get(&key).and_then(Option::as_ref))
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn layout_command_output(
     scene: &mut Scene,
+    block_id: u64,
+    cmd_source: &str,
     out: &blaze_sh::CommandOutput<'_>,
     x0: f32,
     y0: f32,
@@ -4813,6 +4847,39 @@ fn layout_command_output(
         };
         scene.text(x0, y0, &empty_msg, theme::INK_4, false, true, clip_id);
         return m.ch;
+    }
+
+    // Structured interactive CLI Help / Man-Page rendering (`git --help`, `rg --help`,
+    // `blaze --help`, `man ...`, etc.) with syntax-highlighted Usage, runnable Examples,
+    // categorized subcommand/flag tables, inline Markdown chips, and one-click drill-down.
+    if lines.len() <= 500 {
+        let all_refs: Vec<&str> = lines.iter().map(|(_, _, s)| s.as_str()).collect();
+        let help_h = with_cached_help_doc(
+            block_id,
+            cmd_source,
+            stdout_len,
+            stderr_len,
+            &all_refs,
+            |doc| {
+                doc.map(|d| {
+                    let h = crate::help_view::layout_help_doc(
+                        scene,
+                        d,
+                        x0,
+                        y0,
+                        width,
+                        pill_w + 18.0,
+                        m,
+                        clip_id,
+                    );
+                    draw_meta_pill(scene, y0 + 7.5, 14.0);
+                    h
+                })
+            },
+        );
+        if let Some(h) = help_h {
+            return h;
+        }
     }
 
     let first_is_diag_card = lines.first().is_some_and(|(_, s, l)| {
