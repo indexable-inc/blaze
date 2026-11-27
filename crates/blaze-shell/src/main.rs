@@ -3168,7 +3168,8 @@ mod macos_app {
         } else {
             SidebarMotion::hidden()
         };
-        let mut chrome = sidebar.chrome(size.width as f32, anim_epoch.elapsed().as_secs_f64());
+        // Set at the top of every loop iteration, before any event reads it.
+        let mut chrome: Chrome;
         let mut traffic_lights_shown: Option<bool> = None;
 
         loop {
@@ -5985,7 +5986,7 @@ mod macos_app {
                                 }
 
                                 // Drag-select (or double/triple click) any rendered block/terminal output text!
-                                if !in_sidebar {
+                                if !chrome.sidebar_contains(x, y, size.height as f32) {
                                     shell.editor.selection_anchor = None;
                                     let m = fonts.cell_metrics(scale);
                                     let clicks = ev.clickCount();
