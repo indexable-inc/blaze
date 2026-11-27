@@ -54,6 +54,7 @@ use blaze_build_script::c_tasks_tree::{self, FIXED_ENV, TREE_LINES, TreeError, T
 use blaze_build_script::host_tools::{self, HostTool};
 use blaze_build_script::key::HostToolKey;
 use blaze_build_script::outputs::{FileLimits, Outputs, OutputsRef, StoredFile};
+use blaze_build_script::toolchain::Sysroot;
 use blaze_core::wait::Deadline;
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Heap, SharedAlloc, String, Vec};
@@ -76,6 +77,8 @@ pub struct CTasksSetting<'s> {
     /// The shelf and the SDK, laid (their digests are the toolchain's identity).
     pub shelf: Laid<'s>,
     pub sdk: Laid<'s>,
+    /// Which sysroot model clang uses (`MacosSdk` vs `LinuxHost`).
+    pub sysroot: Sysroot,
     /// A folder of the home's, canonical and existing: each worker's task folder is under it.
     pub work: &'s str,
     /// The home's file area (scripts.rs `file_area`), canonical, on `work`'s volume.
@@ -538,6 +541,7 @@ fn worker<'b>(
             clang: setting.clang,
             shelf: setting.shelf,
             sdk: setting.sdk,
+            sysroot: setting.sysroot,
             sources: sources[job.state as usize],
             roots,
             task_out: &task_out,
@@ -967,9 +971,11 @@ impl TreeRunner for ShelfTree<'_> {
             for (name, value) in tool_env.iter() {
                 vars.push((name.clone_in(alloc), value.clone_in(alloc)));
             }
-            vars.push((String::from_str_in("MACOSX_DEPLOYMENT_TARGET", alloc), String::from_str_in(blaze_build_script::toolchain::MACOS_MIN, alloc)));
+            if setting.sysroot == Sysroot::MacosSdk {
+                vars.push((String::from_str_in("MACOSX_DEPLOYMENT_TARGET", alloc), String::from_str_in(blaze_build_script::toolchain::MACOS_MIN, alloc)));
+                vars.push((String::from_str_in("SDKROOT", alloc), String::from_str_in(sdk, alloc)));
+            }
             vars.push((String::from_str_in("PATH", alloc), path_value.clone_in(alloc)));
-            vars.push((String::from_str_in("SDKROOT", alloc), String::from_str_in(sdk, alloc)));
             vars.push((String::from_str_in("TMPDIR", alloc), tmp.clone_in(alloc)));
             for (name, value) in FIXED_ENV {
                 vars.push((String::from_str_in(name, alloc), String::from_str_in(value, alloc)));

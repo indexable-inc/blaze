@@ -16,7 +16,12 @@ use blaze_http::{Event, Method, Request, driver::Handle};
 use blaze_proc_macro::record::native_world;
 use bstd::{fs::Durable, mem::TASK_FRAME, path::Path as BPath};
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const HOST: &str = "aarch64-apple-darwin";
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const HOST: &str = "aarch64-unknown-linux-gnu";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const HOST: &str = "x86_64-unknown-linux-gnu";
 /// Bytes held before each append: one effect per piece of this size.
 const PIECE: usize = 8 << 20;
 /// Each append's budget.

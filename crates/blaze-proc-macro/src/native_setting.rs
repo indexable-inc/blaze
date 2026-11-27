@@ -50,10 +50,12 @@ pub const NATIVE_RUN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 pub struct OwnedNativeSetting<'a> {
     /// The resolved shelf, named by the pin's SHA-256.
     pub shelf: AString<'a>,
-    /// The resolved SDK folder.
+    /// The resolved SDK/sysroot folder.
     pub sdk: AString<'a>,
-    /// The SDK's `Version` (in every native run's key, as `macos-sdk <version>`).
+    /// The SDK's `Version` (macOS) or marker SHA-256 hex (Linux host).
     pub sdk_version: AString<'a>,
+    /// Which sysroot model `pins/clang.json` selected for the host.
+    pub sysroot: Sysroot,
     /// The resolved work folder, made if absent.
     pub work: AString<'a>,
     pub deadline: Duration,
@@ -182,7 +184,7 @@ impl core::fmt::Display for NativeSettingError<'_> {
                 shelf.as_str(),
                 CLANG_PATH
             ),
-            NativeSettingError::NoSdk { path, error } => write!(f, "{}: {error}: the macOS SDK the native build scripts compile against (D112)", path.as_str()),
+            NativeSettingError::NoSdk { path, error } => write!(f, "{}: {error}: the target SDK/sysroot the native build scripts compile against (D112)", path.as_str()),
             NativeSettingError::SdkVersion { path } => write!(f, "{}: no `Version`, which a native script's key holds (D69)", path.as_str()),
             NativeSettingError::Work { path, error } => write!(f, "{}: {error}: the native build scripts' work folder (D112)", path.as_str()),
             NativeSettingError::NotUtf8 { path } => write!(f, "{}: resolves to a path that is not UTF-8 (Seatbelt's profile holds text)", path.as_str()),
@@ -251,9 +253,9 @@ pub fn native_setting<'a>(
     alloc: Alloc<'a>,
 ) -> Result<OwnedNativeSetting<'a>, NativeSettingError<'a>> {
     let pin = toolchain::clang_pin(CLANG_JSON, host).map_err(NativeSettingError::Pin)?;
-    match toolchain::sysroot(CLANG_JSON, host).map_err(NativeSettingError::Pin)? {
-        Sysroot::MacosSdk => {}
-        Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),
+    let sysroot = toolchain::sysroot(CLANG_JSON, host).map_err(NativeSettingError::Pin)?;
+    if matches!(sysroot, Sysroot::Pinned { .. }) {
+        return Err(NativeSettingError::PinnedSysroot { host });
     }
 
     let digest = hex(&pin.sha256, alloc);
@@ -265,19 +267,32 @@ pub fn native_setting<'a>(
     // nm-row: every member the native runs start or load is on the shelf (a link must lead to
     // a file); a shelf unpacked before a member was added is refused naming it.
     let member_there = |member: &str| fs::metadata(text(&[shelf.as_str(), "/", member], alloc).as_str()).is_ok();
-    if let Some(member) = toolchain::shelf_missing(member_there) {
+    if let Some(member) = toolchain::shelf_missing_for(sysroot, member_there) {
         return Err(NativeSettingError::ShelfIncomplete { shelf, member });
     }
 
     let sdk = resolved(&String::from_str_in(sdk, alloc), |path, error| NativeSettingError::NoSdk { path, error }, alloc)?;
-    let settings_path = text(&[sdk.as_str(), "/SDKSettings.json"], alloc);
-    let settings = fs::read_to_string(settings_path.as_str()).map_err(|error| NativeSettingError::NoSdk { path: settings_path.clone(), error })?;
-    let version = sdk_version(&settings).ok_or(NativeSettingError::SdkVersion { path: settings_path })?;
-    let sdk_version = String::from_str_in(version, alloc);
+    let marker_rel = match sysroot {
+        Sysroot::MacosSdk => "SDKSettings.json",
+        Sysroot::LinuxHost => toolchain::LINUX_HOST_SYSROOT_MARKER,
+        Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),
+    };
+    let settings_path = text(&[sdk.as_str(), "/", marker_rel], alloc);
+    let settings = fs::read(settings_path.as_str()).map_err(|error| NativeSettingError::NoSdk { path: settings_path.clone(), error })?;
+    let sdk_version = match sysroot {
+        Sysroot::MacosSdk => {
+            let Some(version) = core::str::from_utf8(&settings).ok().and_then(sdk_version) else {
+                return Err(NativeSettingError::SdkVersion { path: settings_path });
+            };
+            String::from_str_in(version, alloc)
+        }
+        Sysroot::LinuxHost => hex(&blaze_sha256::digest(&settings), alloc),
+        Sysroot::Pinned { .. } => return Err(NativeSettingError::PinnedSysroot { host }),
+    };
 
     let work = String::from_str_in(work, alloc);
     fs::create_dir_all(work.as_str()).map_err(|error| NativeSettingError::Work { path: work.clone(), error })?;
     let work = resolved(&work, |path, error| NativeSettingError::Work { path, error }, alloc)?;
 
-    Ok(OwnedNativeSetting { shelf, sdk, sdk_version, work, deadline: NATIVE_RUN_DEADLINE })
+    Ok(OwnedNativeSetting { shelf, sdk, sdk_version, sysroot, work, deadline: NATIVE_RUN_DEADLINE })
 }

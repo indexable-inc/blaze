@@ -3,8 +3,8 @@ use blaze_pins::CLANG_JSON as PIN;
 use blaze_unit_graph::UnitId;
 
 use super::{
-    CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PinError, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads, headers_digest, placement,
-    sysroot,
+    CInputs, ClangPin, Mode, NATIVE_EVERY_MODE, PinError, SHELF_MEMBERS_LINUX, Shelf, Sysroot, c_env, clang_major, clang_pin, depfile_reads, headers_digest,
+    placement, shelf_missing_for, sysroot,
 };
 use crate::native::Runner;
 
@@ -30,13 +30,24 @@ fn the_pin_table_holds_both_archives() {
     assert_eq!(clang_pin(PIN, "x86_64-pc-windows-msvc"), Err(PinError::NoRow { target: "x86_64-pc-windows-msvc" }));
 }
 
-/// macOS takes the machine's SDK; Linux's sysroot row is there and empty: a typed refusal.
+/// macOS takes the machine's SDK, Linux ARM64 uses the host `/usr` sysroot, and Linux x86_64
+/// remains unpinned (`null`: a typed refusal).
 #[test]
 fn linux_has_no_sysroot_pinned_yet() {
     assert_eq!(sysroot(PIN, "aarch64-apple-darwin"), Ok(Sysroot::MacosSdk));
-    let refused = sysroot(PIN, "aarch64-unknown-linux-gnu").expect_err("no sysroot is pinned");
-    assert_eq!(refused, PinError::NoSysroot { target: "aarch64-unknown-linux-gnu" });
-    assert!(refused.to_string().contains("no sysroot pinned for aarch64-unknown-linux-gnu"), "{refused}");
+    assert_eq!(sysroot(PIN, "aarch64-unknown-linux-gnu"), Ok(Sysroot::LinuxHost));
+    let refused = sysroot(PIN, "x86_64-unknown-linux-gnu").expect_err("no sysroot is pinned for x86_64");
+    assert_eq!(refused, PinError::NoSysroot { target: "x86_64-unknown-linux-gnu" });
+    assert!(refused.to_string().contains("no sysroot pinned for x86_64-unknown-linux-gnu"), "{refused}");
+}
+
+/// Linux shelves do not ship macOS-only `bin/ld64.lld` or `lib/libclang.dylib`.
+#[test]
+fn linux_shelf_members_do_not_require_macos_only_files() {
+    assert!(SHELF_MEMBERS_LINUX.is_sorted());
+    assert_eq!(shelf_missing_for(Sysroot::LinuxHost, |m| m != "lib/libclang.dylib" && m != "bin/ld64.lld"), None);
+    assert_eq!(shelf_missing_for(Sysroot::LinuxHost, |m| m != "bin/clang-23"), Some("bin/clang-23"));
+    assert_eq!(shelf_missing_for(Sysroot::MacosSdk, |m| m != "lib/libclang.dylib"), Some("lib/libclang.dylib"));
 }
 
 #[test]

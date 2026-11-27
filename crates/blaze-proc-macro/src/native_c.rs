@@ -34,6 +34,7 @@ use std::io::Read as _;
 
 use blaze_build_script::c_tasks::{Area, CCompiler, Compile, CompilerKind, Compiled, ERROR_LINES, FactError, FileRef, GuestRoots, Lang, Refused, StoreFailed, Today};
 use blaze_build_script::outputs::{FileLimits, Outputs};
+use blaze_build_script::toolchain::{self, Sysroot};
 use blaze_core::lock::Lock;
 use blaze_core::wait::Deadline;
 use blaze_ids::ContentId;
@@ -406,6 +407,8 @@ pub struct ShelfClang<'s> {
     /// read, never in a read list (the toolchain's identity covers them).
     pub shelf: Laid<'s>,
     pub sdk: Laid<'s>,
+    /// Sysroot model for clang (`-isysroot <sdk>` on macOS, `--sysroot=/` + `-resource-dir` on Linux).
+    pub sysroot: Sysroot,
     /// The package, the script's `OUT_DIR` as its record laid, each dependency's laid
     /// `OUT_DIR`: the roots a read list names.
     pub sources: &'s [Laid<'s>],
@@ -511,6 +514,19 @@ fn refused<'a>(alloc: Alloc<'a>, parts: &[&str]) -> Refused<'a> {
     Refused { words }
 }
 
+/// Computes the `--sysroot=...` argument for a Linux host sysroot whose read root is `sdk_host`
+/// (e.g. `"/usr"` -> `"--sysroot=/"`, `"/tmp/root/usr"` -> `"--sysroot=/tmp/root"`).
+fn linux_sysroot_flag<'a>(sdk_host: &str, alloc: Alloc<'a>) -> AString<'a> {
+    let root = match sdk_host.strip_suffix("/usr") {
+        Some("") => "/",
+        Some(parent) => parent,
+        None => sdk_host,
+    };
+    let mut out = String::from_str_in("--sysroot=", alloc);
+    out.push_str(root);
+    out
+}
+
 impl CCompiler for ShelfClang<'_> {
     const KIND: CompilerKind = CompilerKind::ShelfClang;
 
@@ -524,8 +540,21 @@ impl CCompiler for ShelfClang<'_> {
             }
             out
         };
-        held.push(text(&["-fintegrated-cc1"]));
-        held.push(text(&["--no-default-config"]));
+        if self.sysroot != Sysroot::MacosSdk {
+            if matches!(unit.lang, Lang::Cxx) {
+                held.push(text(&["--driver-mode=g++"]));
+            }
+            held.push(text(&["-fintegrated-cc1"]));
+            held.push(text(&["--no-default-config"]));
+            // Under Linux Landlock `/proc/self/exe` is outside the roots, so pin Clang's builtin
+            // resource directory explicitly to the shelf.
+            let major = toolchain::clang_major(blaze_pins::CLANG_JSON).unwrap_or("23");
+            held.push(text(&["-resource-dir"]));
+            held.push(text(&[self.shelf.host, "/lib/clang/", major]));
+        } else {
+            held.push(text(&["-fintegrated-cc1"]));
+            held.push(text(&["--no-default-config"]));
+        }
         let mut skip_value = false;
         let mut has_sysroot = false;
         for arg in unit.args.iter().copied() {
@@ -546,8 +575,18 @@ impl CCompiler for ShelfClang<'_> {
             held.push(self.host_arg(arg, alloc)?);
         }
         if !has_sysroot {
-            held.push(text(&["-isysroot"]));
-            held.push(text(&[self.sdk.host]));
+            match self.sysroot {
+                Sysroot::MacosSdk => {
+                    held.push(text(&["-isysroot"]));
+                    held.push(text(&[self.sdk.host]));
+                }
+                Sysroot::LinuxHost => {
+                    held.push(linux_sysroot_flag(self.sdk.host, alloc));
+                }
+                Sysroot::Pinned { .. } => {
+                    held.push(text(&["--sysroot=", self.sdk.host]));
+                }
+            }
         }
         // The maps last: a later map wins where two match (clang applies them last first).
         for laid in self.laid() {
@@ -679,7 +718,7 @@ fn replace_all<'a>(text: &str, from: &str, to: &str, alloc: Alloc<'a>) -> AStrin
 
 #[cfg(test)]
 mod tests {
-    use super::{Depfile, Laid, PATH_MOST, join, laid_of, lang_flags};
+    use super::{Depfile, Laid, PATH_MOST, join, laid_of, lang_flags, linux_sysroot_flag};
     use blaze_build_script::c_tasks::Lang;
     use bstd::procs::hermetic::ReportParser;
 
@@ -722,5 +761,13 @@ mod tests {
         assert_eq!(join(&mut buf, &["/w", "/a"]), Some("/w/a"));
         let long = "x".repeat(PATH_MOST);
         assert_eq!(join(&mut buf, &["/", &long]), None);
+    }
+
+    #[test]
+    fn linux_sysroot_flag_maps_usr_to_root() {
+        let alloc = blaze_own::testing::heap().alloc();
+        assert_eq!(linux_sysroot_flag("/usr", alloc).as_str(), "--sysroot=/");
+        assert_eq!(linux_sysroot_flag("/tmp/fake/usr", alloc).as_str(), "--sysroot=/tmp/fake");
+        assert_eq!(linux_sysroot_flag("/opt/sysroot", alloc).as_str(), "--sysroot=/opt/sysroot");
     }
 }
