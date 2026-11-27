@@ -2273,20 +2273,55 @@ pub(crate) fn seed_pinned_dep_probes<D: blaze_core::Driver, S: crate::store::Sha
             continue;
         }
         let Some(header) = stored.header(name).map_err(crate::engine_answer::page_error)? else {
-            continue;
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule header is missing from the stored answer",
+            }
+            .into());
         };
         if header.facts.failed {
             continue;
         }
-        if let Some(rec_key) = header.record
-            && let Some(held) = store.get(cx, rec_key)?
-            && let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(held.bytes)
-            && view.name == name
-            && let Some(hex) = crate::wasm64_compile::Hex64::from_hex_bytes(view.payload)
-        {
-            probes.publish_checked_dep_probe_hex(hex);
-            return Ok(Some(hex));
+        let Some(rec_key) = header.record else {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule row has no stored record key",
+            }
+            .into());
+        };
+        let Some(held) = store.get(cx, rec_key)? else {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule record is missing from the store",
+            }
+            .into());
+        };
+        let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(held.bytes) else {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule record in the store is malformed",
+            }
+            .into());
+        };
+        if view.name != name {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule record in the store names a different task",
+            }
+            .into());
         }
+        if view.payload.is_empty() {
+            continue;
+        }
+        let Some(hex) = crate::wasm64_compile::Hex64::from_hex_bytes(view.payload) else {
+            return Err(EngineCheckError::StartPage {
+                name,
+                why: "a pinned MacroModule record carries a malformed dependency-probe payload",
+            }
+            .into());
+        };
+        probes.publish_checked_dep_probe_hex(hex);
+        return Ok(Some(hex));
     }
     Ok(None)
 }

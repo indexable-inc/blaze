@@ -5256,10 +5256,10 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
         let pm_plain_subj = crate::macros::subject_of("pm-plain", "0.1.0");
         let pm_dep_subj = crate::macros::subject_of("pm-dep-ring", "0.1.0");
 
-        // Case 1: Planned probe failure on `pm-dep-ring` MUST be isolated to `pm-dep-ring`,
-        // leaving unrelated `pm-plain` listed as `Ok(ListedMacro { dep_probes: None, .. })`.
+        // Case 1: Planned probe failure on `pm-dep-ring` (`UnitId(4)`) MUST be isolated to
+        // `pm-dep-ring`, leaving unrelated `pm-plain` listed as `Ok(ListedMacro { dep_probes: None, .. })`.
         let planned_failed = [(
-            pm_dep_subj,
+            UnitId(4),
             crate::engine_scripts::PlannedProbe::Failed(crate::scripts::ProbeSetupError::from_str(
                 crate::scripts::ProbeErrorKind::SpawnPinsOpen,
                 "simulated spawn pin failure",
@@ -5290,11 +5290,11 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
             "dependent proc-macro must carry its planned probe failure"
         );
 
-        // Case 2: Stale planned digest on `pm-dep-ring` MUST be refused with `PlannedDrift`
+        // Case 2: Stale planned digest on `pm-dep-ring` (`UnitId(4)`) MUST be refused with `PlannedDrift`
         // rather than silently compiling/filing a different live probe identity under the planned
         // task key — while still keeping `pm-plain` unaffected.
         let stale_hex = Hex64(*b"0000000000000000000000000000000000000000000000000000000000000000");
-        let planned_stale = [(pm_dep_subj, crate::engine_scripts::PlannedProbe::Digest(stale_hex))];
+        let planned_stale = [(UnitId(4), crate::engine_scripts::PlannedProbe::Digest(stale_hex))];
         let listed_drift = crate::macros::list(
             &cx,
             sections,
@@ -5315,6 +5315,178 @@ checksum = \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"
                 Err(crate::macros::MacroListFailure::Probes(e)) if e.kind == crate::scripts::ProbeErrorKind::PlannedDrift
             ),
             "drifted live probe identity must be refused with PlannedDrift"
+        );
+    }
+
+    #[test]
+    fn duplicate_proc_macro_subjects_aggregate_probes_without_false_planned_drift() {
+        let frame = Frame::with_reserve(8 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let a = erased.handle();
+        let make_u = |pkg: u32, name: &str, kind: UnitKind<'static>, build_script: Option<u32>, features: &[&str], deps: &[(&str, u32)]| -> Unit<'_> {
+            let mut u = make_unit(pkg, name, name, kind, "2024", deps, a);
+            u.version = Text::from_str_in("0.1.0", a);
+            u.build_script = build_script.map(UnitId);
+            for &feat in features {
+                u.features.push(Text::from_str_in(feat, a));
+                u.cfg.push(CfgAtom::pair("feature", feat, a));
+            }
+            u.cfg.push(CfgAtom::flag("debug_assertions", a));
+            if matches!(u.kind, UnitKind::ProcMacro) {
+                u.cfg.push(CfgAtom::flag("proc_macro", a));
+            }
+            u.cfg.sort();
+            u
+        };
+
+        // Two distinct `UnitKind::ProcMacro` units sharing the SAME `(name, version)` ("pm-dup" 0.1.0):
+        // - Unit 3: feature "with-ring" -> depends on `ring` (HAS dependency build script)
+        // - Unit 4: feature "plain" -> depends on `plain-lib` (NO dependency build script)
+        let graph_dep_first = make_graph(
+            std::vec![
+                make_u(0, "plain-lib", UnitKind::Lib, None, &[], &[]),
+                make_u(1, "ring", UnitKind::BuildScript, None, &[], &[]),
+                make_u(1, "ring", UnitKind::Lib, Some(1), &[], &[]),
+                make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["with-ring"], &[("ring", 2)]),
+                make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["plain"], &[("plain_lib", 0)]),
+            ],
+            a,
+        );
+        let graph_plain_first = make_graph(
+            std::vec![
+                make_u(0, "plain-lib", UnitKind::Lib, None, &[], &[]),
+                make_u(1, "ring", UnitKind::BuildScript, None, &[], &[]),
+                make_u(1, "ring", UnitKind::Lib, Some(1), &[], &[]),
+                make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["plain"], &[("plain_lib", 0)]),
+                make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["with-ring"], &[("ring", 2)]),
+            ],
+            a,
+        );
+
+        let lock_text = b"version = 4\n\n\
+[[package]]\nname = \"plain-lib\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\n\n\
+[[package]]\nname = \"ring\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"2222222222222222222222222222222222222222222222222222222222222222\"\n\n\
+[[package]]\nname = \"pm-dup\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"5555555555555555555555555555555555555555555555555555555555555555\"\n";
+        let heap = blaze_own::testing::heap();
+        let lock = crate::fetch::Lockfile::read(lock_text, heap, &frame).expect("parse lockfile");
+        let rows = crate::sweep::Rows::new_in(&frame);
+        let place = crate::macros::Place { home: None, checkout: "", members: None, rows: &rows };
+        let empty_modules = std::path::Path::new("/nonexistent-blaze-test-modules-dir");
+
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(78, bstd::io::Limits::USUAL));
+        let cx = io
+            .cx(core::time::Duration::from_secs(10), bstd::mem::TASK_FRAME)
+            .expect("sim cx");
+        let fetch_env = crate::fetch::FetchEnv {
+            clock: io.need_clock().expect("sim clock"),
+            checkout: "",
+            served: crate::engine_script_reads::Served::Simulated,
+            cert_file: None,
+            cert_dir: None,
+            rustflags: blaze_manifest::rustflags::RustflagsEnv::default(),
+            home: None,
+            cargo_home: None,
+            start: None,
+            toolchain: blaze_toolchain::PINNED,
+            fs: io.need_fs().expect("sim fs"),
+            sdk: crate::sdk::NONE_IN_TESTS,
+            exe_dir: Err(crate::fetch::ExeDirWhy::NotRead),
+            lan_peer: crate::fetch::LanPeerConfig::DISABLED,
+            heap,
+        };
+        let shared_probes = crate::scripts::SharedCommandProbes::new();
+        let probes = shared_probes.with_env(&fetch_env);
+        let pm_dup_subj = crate::macros::subject_of("pm-dup", "0.1.0");
+        let target = blaze_unit_graph::TargetDesc::new(
+            "x86_64-unknown-linux-gnu",
+            blaze_own::Vec::new_in(a),
+            a,
+        );
+
+        for (label, graph, expected_dep_uid) in [
+            ("dep-first", &graph_dep_first, UnitId(3)),
+            ("plain-first", &graph_plain_first, UnitId(4)),
+        ] {
+            let planned = crate::engine_scripts::classify_dep_probe_tags(
+                &cx,
+                graph,
+                Some(graph),
+                true,
+                &[],
+                None,
+                probes,
+                &frame,
+            );
+            assert_eq!(planned.proc_macros.len(), 1, "{label}: subject table must contain pm-dup");
+            assert_eq!(planned.proc_macros[0].0, pm_dup_subj);
+            assert_eq!(planned.proc_macro_units.len(), 1, "{label}: only the dep-script unit gets a planned probe entry");
+            assert_eq!(planned.proc_macro_units[0].0, expected_dep_uid);
+            let live_hex = planned.digest().expect("planned digest");
+
+            let encoded = blaze_unit_graph::record::encode(graph, &target, &target, a).expect("encode graph");
+            let sections = crate::graph_payload::Sections {
+                graph: &encoded,
+                list: &[],
+                wasm_graph: &encoded,
+            };
+            let listed = crate::macros::list(
+                &cx,
+                sections,
+                &lock,
+                empty_modules,
+                &place,
+                Some(probes),
+                Some(planned.proc_macro_units.as_slice()),
+                a,
+            )
+            .expect("macros::list must succeed for duplicate subjects");
+            assert_eq!(listed.len(), 2, "{label}: both duplicate units must be listed");
+            // Neither unit may hit `PlannedDrift`!
+            assert!(
+                listed.iter().all(|(s, r)| *s == pm_dup_subj && r.is_ok()),
+                "{label}: neither duplicate unit may fail with PlannedDrift"
+            );
+            // Deterministic sort puts the probe-dependent unit FIRST (rank 1) and the plain unit
+            // SECOND (rank 2), so `macros::run`'s `partition_point` matches `planned.proc_macros`.
+            assert!(
+                matches!(&listed[0].1, Ok(m) if m.dep_probes == Some(live_hex)),
+                "{label}: first duplicate entry must carry dep_probes = Some(live_hex)"
+            );
+            assert!(
+                matches!(&listed[1].1, Ok(m) if m.dep_probes.is_none()),
+                "{label}: second duplicate entry must stay Ok with dep_probes = None"
+            );
+        }
+
+        // Also verify that if the second duplicate unit fails (missing wasm root), `classify_dep_probe_tags`
+        // does NOT drop its error when the first duplicate unit succeeded with `Digest`!
+        let partial_wasm = make_graph(
+            std::vec![
+                make_u(0, "plain-lib", UnitKind::Lib, None, &[], &[]),
+                make_u(1, "ring", UnitKind::BuildScript, None, &[], &[]),
+                make_u(1, "ring", UnitKind::Lib, Some(1), &[], &[]),
+                make_u(2, "pm-dup", UnitKind::ProcMacro, None, &["with-ring"], &[("ring", 2)]),
+            ],
+            a,
+        );
+        let planned_err = crate::engine_scripts::classify_dep_probe_tags(
+            &cx,
+            &graph_dep_first,
+            Some(&partial_wasm),
+            true,
+            &[],
+            None,
+            probes,
+            &frame,
+        );
+        assert_eq!(planned_err.proc_macro_units.len(), 2, "both units must be classified (first Digest, second Failed)");
+        assert!(
+            matches!(
+                planned_err.proc_macros.first(),
+                Some((s, crate::engine_scripts::PlannedProbe::Failed(e)))
+                    if *s == pm_dup_subj && e.kind == crate::scripts::ProbeErrorKind::WasmRootMissing
+            ),
+            "error on second duplicate unit must win over first duplicate's Digest"
         );
     }
 

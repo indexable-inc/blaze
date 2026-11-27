@@ -232,7 +232,7 @@ pub(crate) fn list(
     modules: &std::path::Path,
     place: &Place<'_, '_>,
     probes: Option<crate::scripts::CommandProbes<'_>>,
-    planned_probes: Option<&[(ContentId, crate::engine_scripts::PlannedProbe)]>,
+    planned_probes: Option<&[(blaze_unit_graph::UnitId, crate::engine_scripts::PlannedProbe)]>,
     scratch: Alloc<'_>,
 ) -> Result<MacroCrates, MacrosError> {
     let decoded = blaze_unit_graph::record::decode(sections.graph, scratch).map_err(MacrosError::Graph)?;
@@ -257,8 +257,9 @@ pub(crate) fn list(
             (Some(wg), Ok(id)) => Ok(id.with_wasm_features(lock.lock, wg, unit.package, |dep_id| place.member_files(dep_id), scratch)),
             (_, other) => other,
         };
-        let planned_entry = planned_probes.and_then(|table| {
-            let at = table.binary_search_by_key(&subj, |(s, _)| *s).ok()?;
+        let planned_entry = u32::try_from(idx).ok().and_then(|uid| {
+            let table = planned_probes?;
+            let at = table.binary_search_by_key(&blaze_unit_graph::UnitId(uid), |(u, _)| *u).ok()?;
             table.get(at).map(|(_, entry)| entry)
         });
         let listed = match (identity, u32::try_from(idx).ok(), probes) {
@@ -329,7 +330,18 @@ pub(crate) fn list(
         };
         crates.push((subj, listed));
     }
-    crates.sort_unstable_by_key(|(subject, _)| *subject);
+    // Sort deterministically by `(subject, rank)` so duplicate proc-macro subjects never hide a
+    // probe error or probe-dependent entry behind an unrelated feature-set duplicate when
+    // `macros::run` looks up `name.subject` via `partition_point`.
+    crates.sort_by_key(|(subject, res)| {
+        let rank: u8 = match res {
+            Err(MacroListFailure::Probes(_)) => 0,
+            Ok(listed) if listed.dep_probes.is_some() => 1,
+            Ok(_) => 2,
+            Err(MacroListFailure::Unidentified(_)) => 3,
+        };
+        (*subject, rank)
+    });
     Ok(crates)
 }
 
@@ -375,10 +387,8 @@ pub(crate) fn run<'b>(
         }
     }
     let crates = crates.as_ref().expect("listed above");
-    let Ok(at) = crates.binary_search_by_key(&name.subject, |(subject, _)| *subject) else {
-        return Ok(Did::FailedSaying(refused("a macro crate the graph does not name"), "a `MacroModule` part names a crate this command's graph does not hold"));
-    };
-    let Some(entry) = crates.get(at) else {
+    let at = crates.partition_point(|(subject, _)| *subject < name.subject);
+    let Some(entry) = crates.get(at).filter(|(subject, _)| *subject == name.subject) else {
         return Ok(Did::FailedSaying(refused("a macro crate the graph does not name"), "a `MacroModule` part names a crate this command's graph does not hold"));
     };
     let listed = match &entry.1 {

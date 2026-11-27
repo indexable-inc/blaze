@@ -722,6 +722,15 @@ pub(crate) enum ProbeOncePlant {
     SkipOnce,
 }
 
+/// Test-only bug plant for [`CheckedHexSlot`] DST negative controls (rule 23).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckedHexPlant {
+    None,
+    /// Skips seqlock odd/mismatch verification so a concurrent mid-write read observes torn words.
+    SkipSeqCheck,
+}
+
 /// Lock-free updatable `Option<Hex64>` snapshot (`Send + Sync`, zero allocations, zero `std`).
 ///
 /// Uses a seqlock over the 32-byte `ContentId` representation of `Hex64` so a completed check
@@ -732,6 +741,8 @@ struct CheckedHexSlot {
     seq: core::sync::atomic::AtomicU64,
     present: core::sync::atomic::AtomicBool,
     words: [core::sync::atomic::AtomicU64; 4],
+    #[cfg(test)]
+    plant: CheckedHexPlant,
 }
 
 impl CheckedHexSlot {
@@ -745,6 +756,23 @@ impl CheckedHexSlot {
                 core::sync::atomic::AtomicU64::new(0),
                 core::sync::atomic::AtomicU64::new(0),
             ],
+            #[cfg(test)]
+            plant: CheckedHexPlant::None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_plant(plant: CheckedHexPlant) -> Self {
+        Self {
+            seq: core::sync::atomic::AtomicU64::new(0),
+            present: core::sync::atomic::AtomicBool::new(false),
+            words: [
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+                core::sync::atomic::AtomicU64::new(0),
+            ],
+            plant,
         }
     }
 
@@ -766,12 +794,22 @@ impl CheckedHexSlot {
     }
 
     fn publish(&self, hex: crate::wasm64_compile::Hex64) {
+        self.publish_with_hook(hex, || {});
+    }
+
+    fn publish_with_hook(&self, hex: crate::wasm64_compile::Hex64, on_mid_write: impl FnOnce()) {
         use core::sync::atomic::Ordering;
         let odd = self.acquire_write();
         let bytes = hex.to_content_id().0;
-        for (dst, chunk) in self.words.iter().zip(bytes.chunks_exact(8)) {
+        let mut hook = Some(on_mid_write);
+        for (idx, (dst, chunk)) in self.words.iter().zip(bytes.chunks_exact(8)).enumerate() {
             if let Ok(arr) = <[u8; 8]>::try_from(chunk) {
                 dst.store(u64::from_le_bytes(arr), Ordering::Relaxed);
+            }
+            if idx == 1
+                && let Some(cb) = hook.take()
+            {
+                cb();
             }
         }
         self.present.store(true, Ordering::Relaxed);
@@ -785,33 +823,46 @@ impl CheckedHexSlot {
         self.seq.store(odd.wrapping_add(1), Ordering::Release);
     }
 
-    fn load(&self) -> Option<crate::wasm64_compile::Hex64> {
+    /// Single non-blocking seqlock read attempt: returns `Ok(val)` when a consistent snapshot was
+    /// observed, or `Err(())` when a concurrent write was in progress and the caller must retry.
+    fn try_load_once(&self) -> Result<Option<crate::wasm64_compile::Hex64>, ()> {
         use core::sync::atomic::Ordering;
         let [w0, w1, w2, w3] = &self.words;
+        let s1 = self.seq.load(Ordering::Acquire);
+        #[cfg(test)]
+        let skip_seq = matches!(self.plant, CheckedHexPlant::SkipSeqCheck);
+        #[cfg(not(test))]
+        let skip_seq = false;
+        if !skip_seq && (s1 & 1 != 0) {
+            return Err(());
+        }
+        let present = self.present.load(Ordering::Relaxed);
+        let words = [
+            w0.load(Ordering::Relaxed),
+            w1.load(Ordering::Relaxed),
+            w2.load(Ordering::Relaxed),
+            w3.load(Ordering::Relaxed),
+        ];
+        core::sync::atomic::fence(Ordering::Acquire);
+        let s2 = self.seq.load(Ordering::Relaxed);
+        if !skip_seq && s1 != s2 {
+            return Err(());
+        }
+        if !present {
+            return Ok(None);
+        }
+        let mut bytes = [0u8; 32];
+        for (dst, word) in bytes.chunks_exact_mut(8).zip(words) {
+            dst.copy_from_slice(&word.to_le_bytes());
+        }
+        Ok(Some(crate::wasm64_compile::Hex64::from_bytes(bytes)))
+    }
+
+    fn load(&self) -> Option<crate::wasm64_compile::Hex64> {
         loop {
-            let s1 = self.seq.load(Ordering::Acquire);
-            if s1 & 1 != 0 {
-                core::hint::spin_loop();
-                continue;
-            }
-            let present = self.present.load(Ordering::Relaxed);
-            let words = [
-                w0.load(Ordering::Relaxed),
-                w1.load(Ordering::Relaxed),
-                w2.load(Ordering::Relaxed),
-                w3.load(Ordering::Relaxed),
-            ];
-            core::sync::atomic::fence(Ordering::Acquire);
-            let s2 = self.seq.load(Ordering::Relaxed);
-            if s1 == s2 {
-                if !present {
-                    return None;
-                }
-                let mut bytes = [0u8; 32];
-                for (dst, word) in bytes.chunks_exact_mut(8).zip(words) {
-                    dst.copy_from_slice(&word.to_le_bytes());
-                }
-                return Some(crate::wasm64_compile::Hex64::from_bytes(bytes));
+            match self.try_load_once() {
+                Ok(val) => return val,
+                Err(()) => core::hint::spin_loop(),
             }
         }
     }
@@ -2958,5 +3009,248 @@ mod shared_command_probes_dst {
             .dep_probe_identity_hex(&cx)
             .expect("cleared snapshot falls back to live");
         assert_eq!(after_clear, hex_c);
+    }
+
+    fn checked_hex_slot_schedule(tape: &Tape, plant: super::CheckedHexPlant) -> Result<(), Broke> {
+        let slot = super::CheckedHexSlot::new_with_plant(plant);
+        let steps = *tape.one_of(&[8usize, 16, 24, 32], "seqlock steps");
+        let palette = [
+            crate::wasm64_compile::Hex64::from_bytes([0x11; 32]),
+            crate::wasm64_compile::Hex64::from_bytes([0x22; 32]),
+            crate::wasm64_compile::Hex64::from_bytes([0x33; 32]),
+            crate::wasm64_compile::Hex64::from_bytes([0x44; 32]),
+        ];
+        let mut expected: Option<crate::wasm64_compile::Hex64> = None;
+        for _ in 0..steps {
+            let op = *tape.one_of(&[0u8, 1, 2, 3], "seqlock op");
+            match op {
+                0 => {
+                    // Interleaved publish with a concurrent mid-write reader probe after words[0..2]
+                    // have been overwritten while words[2..4] still hold the previous digest!
+                    let next = *tape.one_of(&palette, "next hex");
+                    let mut mid_err: Option<Broke> = None;
+                    let prev = expected;
+                    slot.publish_with_hook(next, || match slot.try_load_once() {
+                        Err(()) => {}
+                        Ok(observed) => {
+                            // A concurrent read mid-write must NEVER observe a torn combination of
+                            // old and new words (nor an unverified in-flight write).
+                            let valid = observed == prev || observed == Some(next);
+                            if !valid || (prev.is_some() && prev != Some(next)) {
+                                mid_err = Some(Broke::Oracle(std::format!(
+                                    "mid-write seqlock read returned {:?} while transitioning {:?} -> {:?}",
+                                    observed.map(|h| std::string::String::from(h.as_str())),
+                                    prev.map(|h| std::string::String::from(h.as_str())),
+                                    next.as_str(),
+                                )));
+                            }
+                        }
+                    });
+                    if let Some(err) = mid_err {
+                        return Err(err);
+                    }
+                    expected = Some(next);
+                }
+                1 => {
+                    slot.clear();
+                    expected = None;
+                }
+                2 => {
+                    let got = slot.load();
+                    if got != expected {
+                        return Err(Broke::Oracle(std::format!(
+                            "load() returned {:?}, expected {:?}",
+                            got.map(|h| std::string::String::from(h.as_str())),
+                            expected.map(|h| std::string::String::from(h.as_str())),
+                        )));
+                    }
+                }
+                _ => {
+                    let got = slot
+                        .try_load_once()
+                        .map_err(|()| Broke::Oracle(std::string::String::from("quiescent try_load_once unexpectedly retried")))?;
+                    if got != expected {
+                        return Err(Broke::Oracle(std::format!(
+                            "quiescent try_load_once returned {:?}, expected {:?}",
+                            got.map(|h| std::string::String::from(h.as_str())),
+                            expected.map(|h| std::string::String::from(h.as_str())),
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn checked_hex_slot_dst_never_returns_torn_reads_and_catches_planted_race() {
+        sim_check(Config::cases(500), |tape| {
+            checked_hex_slot_schedule(tape, super::CheckedHexPlant::None)
+        });
+        control(
+            Config::cases(500),
+            super::CheckedHexPlant::None,
+            super::CheckedHexPlant::SkipSeqCheck,
+            "mid-write",
+            checked_hex_slot_schedule,
+        );
+    }
+
+    #[test]
+    fn pinned_standing_propagates_missing_and_malformed_macro_module_records() {
+        use blaze_drive::{Key, Kind, Name, Tool};
+        use blaze_engine::{Cause, Gen, Phase, Row, Stage, Tools, pages};
+        use blaze_ids::ContentId;
+
+        let io = Io::simulated(SimWorld::new(77, Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, bstd::mem::TASK_FRAME).expect("root sim cx");
+        let fs = io.need_fs().expect("sim fs");
+        let clock = io.need_clock().expect("sim clock");
+        let err = io.need_err().expect("sim err");
+        let home = crate::store::Home::of(&cx, &fs, Some("/h")).expect("home");
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let frame = cx.frame();
+        let erased = blaze_own::Erased::new(frame);
+        let lent = home
+            .open_store(&blaze_cas::plain::Settings::default(), crate::store::Facts { boot: Some(1), nonce: 77 }, heap.alloc())
+            .expect("open store");
+        let mut store = crate::store::CommandStore::new(&cx, &lent, false, 0, None, clock, &err, erased.handle())
+            .expect("command store");
+        let tools = Tools([Tool(ContentId([0x44; 32])); blaze_drive::key::KINDS]);
+
+        let build_pinned = |store: &mut crate::store::CommandStore<'_, '_, _, _>,
+                            pm_name: Name,
+                            rec_key: Option<Key>| {
+            let pm_src = ContentId([0x55; 32]);
+            let mut kept = pages::Kept::new_in(alloc);
+            kept.answer.serial = Gen(1);
+            kept.answer.by_file.entry(pm_name).or_insert_with(|| blaze_own::Vec::new_in(alloc)).push(pm_name);
+            kept.answer.rows.insert(
+                pm_name,
+                Row {
+                    key: tools.key(pm_name, &pm_src),
+                    phase: Phase::new(Stage::Scripts, 0),
+                    file: pm_name,
+                    source: pm_src,
+                    out: ContentId([0x88; 32]),
+                    serial: Gen(1),
+                    defines: blaze_own::Vec::new_in(alloc),
+                    reads: blaze_own::Vec::new_in(alloc),
+                    by_cell: blaze_own::Vec::new_in(alloc),
+                    findings: 0,
+                    inline: false,
+                    failed: false,
+                },
+            );
+            kept.causes.insert(pm_name, (Gen(1), Cause::New));
+            if let Some(k) = rec_key {
+                kept.records.insert(pm_name, k);
+            }
+            let enc = pages::encode_at_bits(&kept, 4, alloc);
+            for (k, b) in enc.puts.iter() {
+                crate::store::Store::put(store, &cx, *k, b).expect("put page");
+            }
+            let root = crate::engine_answer::open_root(&cx, store, enc.root, alloc)
+                .expect("open root io")
+                .expect("valid root");
+            (enc.root.0, root)
+        };
+
+        let pm_name = Name::new(Kind::MacroModule, crate::macros::subject_of("sqlx-macros", "0.9.0"));
+
+        // 1. Missing CAS record -> MUST return Err(StartPage) instead of silently Ok(None).
+        let missing_key = Key(ContentId([0xde; 32]));
+        let (cert_missing, root_missing) = build_pinned(&mut store, pm_name, Some(missing_key));
+        let snap1 = store.snapshot_in(alloc).expect("snap1");
+        let headers = pages::Headers::Absent { since: Gen(0) };
+        let stored1 = crate::engine_answer::Stored::new(&root_missing, &snap1, &headers, pages::Check::Store, alloc);
+        let res_missing = crate::engine_check::seed_pinned_dep_probes(
+            &cx,
+            &mut store,
+            &stored1,
+            &root_missing,
+            cert_missing,
+            "/missing-pinned",
+            crate::engine_check::CheckScope::Whole,
+            &SharedCommandProbes::new(),
+            frame,
+        );
+        assert!(res_missing.is_err(), "missing pinned MacroModule record must return Err instead of falling back to live probes");
+
+        // 2. Corrupt/malformed CAS record bytes -> MUST return Err(StartPage).
+        let corrupt_bytes = b"not a valid blaze_drive record";
+        let corrupt_key = blaze_drive::key::content_key(corrupt_bytes);
+        crate::store::Store::put(&mut store, &cx, corrupt_key, corrupt_bytes).expect("put corrupt");
+        let (cert_corrupt, root_corrupt) = build_pinned(&mut store, pm_name, Some(corrupt_key));
+        let snap2 = store.snapshot_in(alloc).expect("snap2");
+        let stored2 = crate::engine_answer::Stored::new(&root_corrupt, &snap2, &headers, pages::Check::Store, alloc);
+        let res_corrupt = crate::engine_check::seed_pinned_dep_probes(
+            &cx,
+            &mut store,
+            &stored2,
+            &root_corrupt,
+            cert_corrupt,
+            "/corrupt-pinned",
+            crate::engine_check::CheckScope::Whole,
+            &SharedCommandProbes::new(),
+            frame,
+        );
+        assert!(res_corrupt.is_err(), "malformed pinned MacroModule record must return Err");
+
+        // 3. Non-empty malformed probe payload -> MUST return Err(StartPage).
+        let bad_payload_bytes = blaze_drive::record::write_plain(
+            pm_name,
+            ContentId([0x55; 32]),
+            ContentId([0x88; 32]),
+            &[],
+            b"not-64-hex-bytes",
+            erased.handle(),
+        );
+        let bad_payload_key = blaze_drive::key::content_key(&bad_payload_bytes);
+        crate::store::Store::put(&mut store, &cx, bad_payload_key, &bad_payload_bytes).expect("put bad payload");
+        let (cert_bad, root_bad) = build_pinned(&mut store, pm_name, Some(bad_payload_key));
+        let snap3 = store.snapshot_in(alloc).expect("snap3");
+        let stored3 = crate::engine_answer::Stored::new(&root_bad, &snap3, &headers, pages::Check::Store, alloc);
+        let res_bad = crate::engine_check::seed_pinned_dep_probes(
+            &cx,
+            &mut store,
+            &stored3,
+            &root_bad,
+            cert_bad,
+            "/bad-payload-pinned",
+            crate::engine_check::CheckScope::Whole,
+            &SharedCommandProbes::new(),
+            frame,
+        );
+        assert!(res_bad.is_err(), "non-empty malformed probe payload must return Err");
+
+        // 4. Legitimate empty payload (probe-free MacroModule) -> Ok(None).
+        let empty_payload_bytes = blaze_drive::record::write_plain(
+            pm_name,
+            ContentId([0x55; 32]),
+            ContentId([0x88; 32]),
+            &[],
+            &[],
+            erased.handle(),
+        );
+        let empty_payload_key = blaze_drive::key::content_key(&empty_payload_bytes);
+        crate::store::Store::put(&mut store, &cx, empty_payload_key, &empty_payload_bytes).expect("put empty payload");
+        let (cert_empty, root_empty) = build_pinned(&mut store, pm_name, Some(empty_payload_key));
+        let snap4 = store.snapshot_in(alloc).expect("snap4");
+        let stored4 = crate::engine_answer::Stored::new(&root_empty, &snap4, &headers, pages::Check::Store, alloc);
+        let res_empty = crate::engine_check::seed_pinned_dep_probes(
+            &cx,
+            &mut store,
+            &stored4,
+            &root_empty,
+            cert_empty,
+            "/empty-payload-pinned",
+            crate::engine_check::CheckScope::Whole,
+            &SharedCommandProbes::new(),
+            frame,
+        )
+        .expect("empty payload on non-probe MacroModule is valid");
+        assert_eq!(res_empty, None);
     }
 }

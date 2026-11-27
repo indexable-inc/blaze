@@ -525,10 +525,12 @@ pub(crate) struct ScriptsStage<'f> {
     /// The graph's proc-macro crates with their identities, listed once before dispatching
     /// proc-macro lookups so every lookup and wasm64 self-compile runs concurrently.
     macros: Option<std::sync::Arc<crate::macros::MacroCrates>>,
-    /// Planned dependency-probe identities bound during `plan_dep_probe_tags`, sorted by
-    /// `MacroModule` subject: lookups validate live probe identity against these frozen digests
-    /// (never filing a drifted live result under a planned task key, Rule 21).
-    planned_macro_probes: Vec<(ContentId, PlannedProbe), &'f Frame>,
+    /// Planned dependency-probe identities bound during `plan_dep_probe_tags`:
+    /// - `planned_macro_probes` is keyed by exact `UnitId` for `macros::list` so duplicate
+    ///   proc-macro subjects (distinct feature sets or host-feature sides) each validate against
+    ///   their own unit's planned probe state rather than colliding by subject.
+    /// - `planned_script_probes` is keyed by `MacroModule` subject for build scripts.
+    planned_macro_probes: Vec<(blaze_unit_graph::UnitId, PlannedProbe), &'f Frame>,
     planned_script_probes: Vec<(ContentId, PlannedProbe), &'f Frame>,
     /// Each planned task's reads, by name, sorted: what its plan hands it.
     reads: Vec<(Name, Vec<Name, &'f Frame>), &'f Frame>,
@@ -671,15 +673,24 @@ impl PlannedProbe {
     }
 }
 
-/// Sorted `(subject, PlannedProbe)` tables emitted by [`plan_dep_probe_tags`].
+/// Sorted `(subject, PlannedProbe)` and per-unit `(UnitId, PlannedProbe)` tables emitted by
+/// [`plan_dep_probe_tags`].
 pub(crate) struct PlannedDepProbes<'f> {
+    /// Per-subject aggregated probe tags for `MacroModule` task keying & ready-wake validation.
     pub(crate) proc_macros: Vec<(ContentId, PlannedProbe), &'f Frame>,
+    /// Per-unit exact probe tags for `macros::list` (distinguishes duplicate proc-macro subjects
+    /// with distinct feature sets or host-feature sides).
+    pub(crate) proc_macro_units: Vec<(blaze_unit_graph::UnitId, PlannedProbe), &'f Frame>,
     pub(crate) script_modules: Vec<(ContentId, PlannedProbe), &'f Frame>,
 }
 
 impl<'f> PlannedDepProbes<'f> {
     pub(crate) fn empty(frame: &'f Frame) -> Self {
-        Self { proc_macros: Vec::new_in(frame), script_modules: Vec::new_in(frame) }
+        Self {
+            proc_macros: Vec::new_in(frame),
+            proc_macro_units: Vec::new_in(frame),
+            script_modules: Vec::new_in(frame),
+        }
     }
 
     /// Returns the verified 64-hex probe identity when this command planned at least one
@@ -786,8 +797,21 @@ pub(crate) fn classify_dep_probe_tags<'f>(
         }
     };
 
-    // 1. Proc-macro `MacroModule` units in `graph` (filtered to `scoped_sets`, sorted and deduped).
+    // 1. Proc-macro `MacroModule` units in `graph` (filtered to `scoped_sets`). Classify EVERY
+    //    in-scope unit (even duplicate subjects on distinct feature sets / host-feature sides):
+    //    - Record exact per-unit probe state in `proc_macro_units` for `macros::list`.
+    //    - Aggregate per-subject probe state in `proc_macros` (errors win over `Digest`, never
+    //      dropping a later duplicate's probe dependency or error).
     if has_proc_macros {
+        let mut merge_subject = |subj: ContentId, entry: PlannedProbe| {
+            if let Some((_, existing)) = planned.proc_macros.iter_mut().find(|(s, _)| *s == subj) {
+                if matches!(entry, PlannedProbe::Failed(_)) && !matches!(existing, PlannedProbe::Failed(_)) {
+                    *existing = entry;
+                }
+            } else {
+                planned.proc_macros.push((subj, entry));
+            }
+        };
         for (idx, unit) in graph.units.iter().enumerate() {
             if !matches!(unit.kind, blaze_unit_graph::UnitKind::ProcMacro) {
                 continue;
@@ -798,19 +822,23 @@ pub(crate) fn classify_dep_probe_tags<'f>(
             {
                 continue;
             }
-            if planned.proc_macros.iter().any(|(s, _)| *s == subj) {
-                continue;
-            }
             let Ok(uid) = u32::try_from(idx) else { continue };
-            match crate::wasm64_compile::unit_has_dep_build_scripts(
-                graph,
-                wasm_graph,
-                blaze_unit_graph::UnitId(uid),
-                true,
-            ) {
-                Ok(true) => planned.proc_macros.push((subj, get_planned_probe())),
+            let unit_id = blaze_unit_graph::UnitId(uid);
+            match crate::wasm64_compile::unit_has_dep_build_scripts(graph, wasm_graph, unit_id, true) {
+                Ok(true) => {
+                    let entry = get_planned_probe();
+                    let unit_entry = match &entry {
+                        PlannedProbe::Digest(hex) => PlannedProbe::Digest(*hex),
+                        PlannedProbe::Failed(err) => PlannedProbe::Failed(err.duplicate()),
+                    };
+                    planned.proc_macro_units.push((unit_id, unit_entry));
+                    merge_subject(subj, entry);
+                }
                 Ok(false) => {}
-                Err(error) => planned.proc_macros.push((subj, PlannedProbe::Failed(error))),
+                Err(error) => {
+                    planned.proc_macro_units.push((unit_id, PlannedProbe::Failed(error.duplicate())));
+                    merge_subject(subj, PlannedProbe::Failed(error));
+                }
             }
         }
     }
@@ -829,6 +857,7 @@ pub(crate) fn classify_dep_probe_tags<'f>(
         }
     }
     planned.proc_macros.sort_unstable_by_key(|(s, _)| *s);
+    planned.proc_macro_units.sort_unstable_by_key(|(u, _)| *u);
     planned.script_modules.sort_unstable_by_key(|(s, _)| *s);
     planned
 }
@@ -1268,7 +1297,7 @@ impl<'f> ScriptsStage<'f> {
     ) -> Result<SVec<'h, Planned>, CliError> {
         let mut planned = SVec::new_in(alloc);
         self.tools = Some(tools);
-        self.planned_macro_probes = planned_dep_probes.proc_macros;
+        self.planned_macro_probes = planned_dep_probes.proc_macro_units;
         self.planned_script_probes = planned_dep_probes.script_modules;
         let (Some(names), Some(graph)) = (names.names.as_ref(), discovered.get(Name::unit_graph())) else { return Ok(planned) };
         let Ok(record) = &graph.made else { return Ok(planned) };
