@@ -359,17 +359,17 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// the same capture modes as closures": which mode is the checker's answer, never guessed
     /// here. A binding is of the enclosing body exactly when it has a home where the block is
     /// evaluated: the block's own bindings get theirs when its body is built.
-    fn uncaptured(&self, e: ExprId, caps: &[(PatId, CaptureKind)]) -> Result<(), BuildError> {
+    fn uncaptured(&mut self, e: ExprId, caps: &[(PatId, CaptureKind)]) -> Result<(), BuildError> {
         let n = self.body.exprs.len();
         // Per expression: 0 not known yet, 1 inside the block, 2 outside it. Each expression's
         // side is found once, walking up its parents to one whose side is known.
         let mut side: Vec<u8, A> = Vec::with_capacity_in(n, self.alloc);
         side.resize(n, 0);
         let mut path: Vec<u32, A> = Vec::new_in(self.alloc);
-        for (i, x) in self.body.exprs.iter().enumerate() {
-            let Expr::Local(p) = *x else { continue };
+        for i in 0..n {
+            let Some(&Expr::Local(p)) = self.body.exprs.get(i) else { continue };
             path.clear();
-            let mut cur = i as u32;
+            let mut cur = u32::try_from(i).map_err(|_| malformed("an expression index past u32"))?;
             let mut found = 0u8;
             for _ in 0..=n {
                 if cur == e.0 {
@@ -406,7 +406,8 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     .iter()
                     .zip(self.checked.captures.column::<1>().iter())
                     .any(|(&owner, &pat)| owner == e && pat == p);
-            if outer && !in_record {
+            let expr_id = ExprId(u32::try_from(i).map_err(|_| malformed("an expression index past u32"))?);
+            if outer && !in_record && !self.is_non_reading_local_use(expr_id)? {
                 return Err(unsupported(e, "an async block that names a binding of the enclosing body with no capture row in the record (`Checked::captures`)"));
             }
         }
@@ -556,6 +557,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The Reference, "Destructors": "The variables that a closure captures by move are
     /// dropped in an unspecified order": here the upvars' tuple's glue, in capture order.
     pub(super) fn run_coroutine(&mut self, block: ExprId) -> Result<blaze_lir::coroutine::Shape, BuildError> {
+        self.mark_owner_bound(block)?;
         let (_, parts, items, poll) = self.co_entry(block)?;
         // RESUME is private to the split pass. Its state parameter is always number one.
         self.ret_pass = Pass::Ref;

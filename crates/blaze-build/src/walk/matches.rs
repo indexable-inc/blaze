@@ -66,6 +66,9 @@ pub(super) struct At {
     pub(super) by_ref: bool,
     /// The scrutinee's value copied into the match's own slot: a `ref mut` would write a copy.
     copy: bool,
+    /// RFC 2229 uncaptured outer place: no byte of `at` may be read, dereferenced, bound, or
+    /// dropped (every pattern tested against it must be structurally non-reading).
+    pub(super) no_read: bool,
 }
 
 /// A test still to emit: a subpattern, its place, its block, where it goes on a pass and on a
@@ -251,7 +254,24 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // temporary held to its statement's end), so arms may move parts out of it.
         let m_next = self.matches.len() as u32;
         let at = self.owned_place(m_next, e, scrutinee, s, srepr)?;
-        let (at, g, copy) = (at.at, at.g, at.copy);
+        self.match_tested_at(e, arms, at)
+    }
+
+    /// Starts match `e` by tests over an RFC 2229 uncaptured outer scrutinee whose every arm
+    /// pattern is non-reading: no place is evaluated, owned, loaded, or dropped.
+    pub(super) fn match_tested_no_read(&mut self, e: ExprId, scrutinee: ExprId, arms: List) -> Result<(), BuildError> {
+        let at = self.no_read_at(scrutinee)?;
+        self.match_tested_at(e, arms, at)
+    }
+
+    /// A non-reading [`At`] for an RFC 2229 uncaptured outer place `scrutinee`.
+    pub(super) fn no_read_at(&mut self, scrutinee: ExprId) -> Result<At, BuildError> {
+        let t = self.adjusted_ty(scrutinee)?;
+        let g = self.ground_ty(t).map_err(|error| Self::ty_err(scrutinee, error))?;
+        Ok(At { at: (self.b.uninit(Ty::PTR), 0), g, by_ref: false, copy: false, no_read: true })
+    }
+
+    fn match_tested_at(&mut self, e: ExprId, arms: List, at: At) -> Result<(), BuildError> {
         let list = self.body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))?;
         let repr = self.expr_repr(e)?;
         let first = self.arm_blocks.len() as u32;
@@ -263,11 +283,11 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let n = list.len() as u32;
         let to = self.arm_blocks[first as usize];
         self.jump(to, &[]);
-        let tested = Some(At { at, g, by_ref: false, copy });
+        let tested = Some(At { by_ref: false, ..at });
         let res = self.join_slot(repr);
         self.matches.push(MatchState {
             expr: e,
-            scrutinee: at.0,
+            scrutinee: at.at.0,
             width: 0,
             of_enum: None,
             join,
@@ -296,7 +316,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// and the rest drops at that scope's end, once.
     pub(super) fn owned_place(&mut self, m: u32, e: ExprId, scrutinee: ExprId, s: V, srepr: Repr) -> Result<At, BuildError> {
         match self.own_scrutinee(m, e, scrutinee, s, srepr)? {
-            Some((p, off, g)) => Ok(At { at: (p, off), g, by_ref: false, copy: false }),
+            Some((p, off, g)) => Ok(At { at: (p, off), g, by_ref: false, copy: false, no_read: false }),
             None => self.tested_place(scrutinee, s, srepr, "a scrutinee temporary that needs drop, not owned (its drop point is not built)"),
         }
     }
@@ -332,7 +352,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             V::None if srepr == Repr::None => ((self.b.uninit(Ty::PTR), 0), false),
             V::None => (self.place(s, srepr)?, false),
         };
-        Ok(At { at, g, by_ref: false, copy })
+        Ok(At { at, g, by_ref: false, copy, no_read: false })
     }
 
     /// Arm `i` of match `m` by tests: its pattern's tests from `block`, a failure to `next`;
@@ -499,10 +519,18 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 },
                 // matches/forms.rs: a float by `==`, a string by length and bytes.
                 Pat::Lit(Lit::Float(_)) | Pat::NegLit(Lit::Float(_)) => {
+                    if at.no_read {
+                        return Err(malformed("a local used before its binding"));
+                    }
                     let c = self.float_test(p, at)?;
                     self.br(c, (ok, &[]), (fail, &[]));
                 }
-                Pat::Lit(Lit::Str | Lit::ByteStr(_)) => self.str_test(p, at, ok, fail)?,
+                Pat::Lit(Lit::Str | Lit::ByteStr(_)) => {
+                    if at.no_read {
+                        return Err(malformed("a local used before its binding"));
+                    }
+                    self.str_test(p, at, ok, fail)?;
+                }
                 Pat::Lit(_) | Pat::NegLit(_) => {
                     let (x, ty, _) = self.scalar_at(p, at)?;
                     let v = self.lit_bits(p, ty.bits(PTR_BITS))?;
@@ -647,6 +675,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             let pat = self.pat(p)?;
             match pat {
                 Pat::Bind { ann, name, sub, .. } => {
+                    if at.no_read {
+                        return Err(malformed("a local used before its binding"));
+                    }
                     let at = match self.checked.union_pat_of(p) {
                         None => at,
                         Some(UnionPat::Variant(v)) => {
@@ -788,7 +819,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     }
 
     /// The patterns that follow references (rules/pat.rs `step_pat`'s `peel`).
-    fn peels(pat: Pat) -> bool {
+    pub(super) fn peels(pat: Pat) -> bool {
         match pat {
             Pat::Tuple { .. } | Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Record { .. } | Pat::Slice { .. } | Pat::Path(_) | Pat::Range { .. } => true,
             Pat::Lit(l) | Pat::NegLit(l) => !matches!(l, Lit::Str | Lit::ByteStr(_) | Lit::CStr),
@@ -797,7 +828,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     }
 
     /// Whether pattern `p`'s own type, as the check recorded it, is a reference.
-    fn pat_is_ref(&mut self, p: PatId) -> Result<bool, BuildError> {
+    pub(super) fn pat_is_ref(&mut self, p: PatId) -> Result<bool, BuildError> {
         let t = *self.checked.pat_ty.get(p.ix()).ok_or(malformed("a pattern without a type in the record"))?;
         let g = self.ground_ty(t).map_err(|error| Self::pat_ty_err(p, error))?;
         Ok(matches!(self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))?, PNode::Ref(..)))
@@ -815,15 +846,21 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The place the reference at `at` points to, of type `inner`: an unsized one is held as
     /// the wide pointer's own memory.
     fn deref_at(&mut self, p: PatId, at: At, inner: PTy) -> Result<At, BuildError> {
+        if at.no_read {
+            return Ok(At { at: at.at, g: inner, by_ref: at.by_ref, copy: false, no_read: true });
+        }
         let to = match self.ground_node(inner).map_err(|error| Self::pat_ty_err(p, error))? {
             PNode::Slice(_) | PNode::Str => at.at,
             _ => (self.b.load(Ty::PTR, Flags::NONE, at.at.0, at.at.1, MemAttrs::aligned(3)), 0),
         };
-        Ok(At { at: to, g: inner, by_ref: at.by_ref, copy: false })
+        Ok(At { at: to, g: inner, by_ref: at.by_ref, copy: false, no_read: false })
     }
 
     /// The scalar at `at` for a literal or range test: its value, LIR type and signedness.
     fn scalar_at(&mut self, p: PatId, at: At) -> Result<(Value, Ty, bool), BuildError> {
+        if at.no_read {
+            return Err(malformed("a local used before its binding"));
+        }
         let repr = self.repr(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
         let (ty, signed) = match repr {
             Repr::Int { ty, signed } => (ty, signed),
@@ -870,6 +907,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         })?;
         let l = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
         let Shape::Enum { id, .. } = self.layouts[l as usize].shape else { return Ok(None) };
+        if at.no_read {
+            if matches!(self.ls.get(id).variants, Variants::Single { index } if index == v) {
+                return Ok(None);
+            }
+            return Err(malformed("a local used before its binding"));
+        }
         let d = self.read_discriminant(id, at.at)?;
         let case = self.discriminant_case(id, v)?;
         let k = self.b.iconst(Ty::I64, case);
@@ -880,6 +923,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// a slice; none over an array (the check fixed its length).
     fn length_test(&mut self, p: PatId, at: At, n: u32, rest: bool) -> Result<Option<Value>, BuildError> {
         let PNode::Slice(_) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else { return Ok(None) };
+        if at.no_read {
+            if rest && n == 1 {
+                return Ok(None);
+            }
+            return Err(malformed("a local used before its binding"));
+        }
         let len = self.b.load(Ty::I64, Flags::NONE, at.at.0, at.at.1 + 8, MemAttrs::aligned(3));
         let fixed = n - u32::from(rest);
         let k = self.b.iconst(Ty::I64, u128::from(fixed));
@@ -891,7 +940,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     fn parts(&mut self, p: PatId, at: At, out: &mut Vec<(PatId, At), A>) -> Result<(), BuildError> {
         let part = |at: At, off: i64, g: PTy| -> Result<At, BuildError> {
             let off = i32::try_from(i64::from(at.at.1) + off).map_err(|_| BuildError::UnsupportedPat { pat: p, what: "a part past an `i32` offset" })?;
-            Ok(At { at: (at.at.0, off), g, by_ref: at.by_ref, copy: at.copy })
+            Ok(At { at: (at.at.0, off), g, by_ref: at.by_ref, copy: at.copy, no_read: at.no_read })
         };
         match self.pat(p)? {
             Pat::Tuple { elems, rest } | Pat::TupleStruct { elems, rest, .. } => {
@@ -975,9 +1024,17 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         }
                     }
                     None => {
+                        if at.no_read {
+                            if rest == Some(0) && subs.len() == 1 {
+                                let g = self.rest_ty(subs[0])?;
+                                out.push((subs[0], At { at: at.at, g, by_ref: at.by_ref, copy: false, no_read: true }));
+                                return Ok(());
+                            }
+                            return Err(malformed("a local used before its binding"));
+                        }
                         let data = self.b.load(Ty::PTR, Flags::NONE, at.at.0, at.at.1, MemAttrs::aligned(3));
                         let len = self.b.load(Ty::I64, Flags::NONE, at.at.0, at.at.1 + 8, MemAttrs::aligned(3));
-                        let base = At { at: (data, 0), g: elem, by_ref: at.by_ref, copy: false };
+                        let base = At { at: (data, 0), g: elem, by_ref: at.by_ref, copy: false, no_read: false };
                         for (j, &sub) in subs.iter().enumerate() {
                             let j = j as i64;
                             match rest {
@@ -993,7 +1050,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                                     let left = self.b.binary(Op::Sub, Flags::NONE, len, fixed);
                                     self.b.store(Flags::NONE, left, wa, 8, MemAttrs::aligned(3));
                                     let g = self.rest_ty(sub)?;
-                                    out.push((sub, At { at: (wa, 0), g, by_ref: at.by_ref, copy: false }));
+                                    out.push((sub, At { at: (wa, 0), g, by_ref: at.by_ref, copy: false, no_read: false }));
                                 }
                                 // The suffix: `len - (count - j)` from the start.
                                 Some(r) if j > i64::from(r) => {
@@ -1002,7 +1059,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                                     let s = self.b.iconst(Ty::I64, stride as u128);
                                     let off = self.b.binary(Op::Mul, Flags::NONE, k, s);
                                     let ptr = self.b.ptr_add(Flags::NONE, data, off);
-                                    out.push((sub, At { at: (ptr, 0), g: elem, by_ref: at.by_ref, copy: false }));
+                                    out.push((sub, At { at: (ptr, 0), g: elem, by_ref: at.by_ref, copy: false, no_read: false }));
                                 }
                                 _ => out.push((sub, part(base, j * stride, elem)?)),
                             }
@@ -1017,7 +1074,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// The type of a slice pattern's `..` element (`[T]`, or `[T; N - k]` over an array): the
     /// check's type of it.
-    fn rest_ty(&mut self, sub: PatId) -> Result<PTy, BuildError> {
+    pub(super) fn rest_ty(&mut self, sub: PatId) -> Result<PTy, BuildError> {
         let t = *self.checked.pat_ty.get(sub.ix()).ok_or(malformed("a pattern without a type in the record"))?;
         self.ground_ty(t).map_err(|error| Self::pat_ty_err(sub, error))
     }
@@ -1051,6 +1108,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// The test that a union value at `at` (references peeled) holds variant `v`: `None` when it
     /// always holds `v` (single-arm transparent union or single-present-variant layout).
     fn union_variant_test(&mut self, p: PatId, at: At, v: u32) -> Result<Option<Value>, BuildError> {
+        if at.no_read {
+            return Err(malformed("a local used before its binding"));
+        }
         let PNode::Union(ul) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
             return Err(malformed("a union variant pattern over other than a structural union"));
         };
@@ -1097,7 +1157,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 .ok()
                 .and_then(|xs| xs.first().copied())
                 .ok_or(malformed("a union list past the ground table"))?;
-            return Ok(At { at: at.at, g: only, by_ref: at.by_ref, copy: at.copy });
+            return Ok(At { at: at.at, g: only, by_ref: at.by_ref, copy: at.copy, no_read: at.no_read });
         }
         let l = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
         let (first, len, _) = self.variant_rows(l, v)?;
@@ -1116,7 +1176,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             .layout_field_tys
             .get(first_idx)
             .ok_or(malformed("a union variant's field type past `layout_field_tys`"))?;
-        Ok(At { at: (at.at.0, off_i32), g: member_g, by_ref: at.by_ref, copy: at.copy })
+        Ok(At { at: (at.at.0, off_i32), g: member_g, by_ref: at.by_ref, copy: at.copy, no_read: at.no_read })
     }
 
     /// The narrowed sub-union ground type of a `UnionPat::Residual` binding pattern `p`.
@@ -1133,6 +1193,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// Tests whether union value `at` holds any variant whose ground type appears in `dst_g`.
     fn union_residual_test(&mut self, p: PatId, at: At, dst_g: PTy) -> Result<ResidualTest, BuildError> {
+        if at.no_read {
+            return Err(malformed("a local used before its binding"));
+        }
         let PNode::Union(src_l) = self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? else {
             return Err(malformed("a union residual pattern over other than a structural union"));
         };
@@ -1222,7 +1285,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         );
         let dst_repr = self.repr(dst_g).map_err(|error| Self::pat_ty_err(p, error))?;
         if dst_repr == Repr::None {
-            return Ok(At { at: (self.b.uninit(Ty::PTR), 0), g: dst_g, by_ref: at.by_ref, copy: true });
+            return Ok(At { at: (self.b.uninit(Ty::PTR), 0), g: dst_g, by_ref: at.by_ref, copy: true, no_read: false });
         }
         let Repr::Agg(dst_layout) = dst_repr else {
             return Err(malformed("a narrowed sub-union not held as an aggregate"));
@@ -1232,6 +1295,6 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             let src_layout = self.layout(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
             self.remap_union(None, src_layout, at.at, &src_members, dst_layout, dst_at, &dst_members)?;
         }
-        Ok(At { at: dst_at, g: dst_g, by_ref: at.by_ref, copy: true })
+        Ok(At { at: dst_at, g: dst_g, by_ref: at.by_ref, copy: true, no_read: false })
     }
 }

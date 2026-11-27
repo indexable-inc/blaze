@@ -104,6 +104,14 @@ impl<A: Allocator + Copy> EnvPlaces<A> {
     pub(in crate::walk) fn new_in(alloc: A) -> Self {
         EnvPlaces { env: Vec::new_in(alloc), at: Vec::new_in(alloc), owned: Vec::new_in(alloc) }
     }
+
+    pub(in crate::walk) fn is_empty(&self) -> bool {
+        self.env.is_empty()
+    }
+
+    pub(in crate::walk) fn fields(&self) -> &[EnvField] {
+        &self.env
+    }
 }
 
 /// [`use_path`]'s refusal as the build's.
