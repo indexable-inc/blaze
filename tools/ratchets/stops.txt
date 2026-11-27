@@ -32,7 +32,7 @@ blaze-cbor	27
 blaze-cc	8
 blaze-cert	108
 blaze-check	196
-blaze-cli	1322
+blaze-cli	1323
 blaze-cli-spec	117
 blaze-code	94
 blaze-columns	193
@@ -124,7 +124,7 @@ blaze-rng	3
 blaze-roots	24
 blaze-run	273
 blaze-rungs	2
-blaze-scope	1650
+blaze-scope	1647
 blaze-screen	30
 blaze-script	91
 blaze-semver	9

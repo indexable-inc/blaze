@@ -27,7 +27,7 @@ blaze-mem	0	0	0	0	1
 blaze-proc-macro	10	13	1	0	0
 blaze-real	51	0	0	0	0
 blaze-scope	3	0	0	0	0
-blaze-std	0	54	0	1	0
+blaze-std	0	60	0	1	0
 blaze-trace	0	0	1	0	0
 blaze-typeck	1	0	0	0	0
 blaze-world	3	0	0	0	0
