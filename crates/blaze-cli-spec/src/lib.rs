@@ -27,6 +27,7 @@ pub mod app;
 pub mod blaze_app;
 pub mod codec;
 pub mod explain;
+pub mod help_doc;
 pub mod help_parser;
 pub mod man_parser;
 pub mod manual;

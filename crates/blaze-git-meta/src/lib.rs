@@ -92,6 +92,24 @@ pub struct AvatarIndexRow<'a> {
     pub status: AvatarCacheStatus,
 }
 
+/// Parsed summary counts from `git diff --shortstat` or `git log --shortstat`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShortStat {
+    pub files_changed: u32,
+    pub added_lines: u32,
+    pub deleted_lines: u32,
+}
+
+/// Compact commit entry with diff churn (`+added` / `-deleted`) parsed from
+/// `git log --shortstat --format=%x1e%h%x1f%ct%x1f%s`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchCommit<'a> {
+    pub short_sha: AString<'a>,
+    pub time_secs: i64,
+    pub subject: AString<'a>,
+    pub stat: ShortStat,
+}
+
 /// Parse a GitHub remote URL (`git@github.com:owner/repo.git`, `https://github.com/owner/repo`,
 /// `ssh://git@github.com/owner/repo.git`, `git://github.com/owner/repo.git`) into `owner/repo`.
 pub fn parse_github_remote<'a>(url: &str, alloc: Alloc<'a>) -> Option<GitHubRepo<'a>> {
@@ -479,6 +497,117 @@ pub fn format_avatar_index_in<'a>(rows: &[AvatarIndexRow<'_>], alloc: Alloc<'a>)
     out
 }
 
+/// Parse one `git diff --shortstat` / `git log --shortstat` summary line into [`ShortStat`].
+pub fn parse_git_shortstat(line: &str) -> ShortStat {
+    let mut stat = ShortStat::default();
+    for part in line.split(',') {
+        let mut toks = part.split_whitespace();
+        let Some(num_s) = toks.next() else {
+            continue;
+        };
+        let Ok(num) = num_s.parse::<u32>() else {
+            continue;
+        };
+        let rest = toks.next().unwrap_or("");
+        if rest.starts_with("file") {
+            stat.files_changed = num;
+        } else if rest.starts_with("insertion") {
+            stat.added_lines = num;
+        } else if rest.starts_with("deletion") {
+            stat.deleted_lines = num;
+        }
+    }
+    stat
+}
+
+/// Parse `git log --shortstat --format=%x1e%h%x1f%ct%x1f%s` output into at most `limit`
+/// [`BranchCommit`] entries (unbounded when `limit == 0`).
+pub fn parse_git_log_commits_in<'a>(
+    stdout: &str,
+    limit: usize,
+    alloc: Alloc<'a>,
+) -> AVec<'a, BranchCommit<'a>> {
+    let mut commits: AVec<'a, BranchCommit<'a>> = Vec::with_capacity_in(limit.min(64), alloc);
+    for rec in stdout.split('\x1e') {
+        if limit > 0 && commits.len() >= limit {
+            break;
+        }
+        let rec = rec.trim();
+        if rec.is_empty() {
+            continue;
+        }
+        let mut lines = rec.lines();
+        let Some(header) = lines.next() else {
+            continue;
+        };
+        let mut fields = header.splitn(3, '\x1f');
+        let Some(sha) = fields.next().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let time_secs = fields
+            .next()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let subject = fields.next().unwrap_or("").trim();
+        let mut stat = ShortStat::default();
+        for stat_line in lines {
+            let trimmed = stat_line.trim();
+            if trimmed.contains("file")
+                || trimmed.contains("insertion")
+                || trimmed.contains("deletion")
+            {
+                stat = parse_git_shortstat(trimmed);
+                break;
+            }
+        }
+        commits.push(BranchCommit {
+            short_sha: String::from_str_in(sha, alloc),
+            time_secs,
+            subject: String::from_str_in(subject, alloc),
+            stat,
+        });
+    }
+    commits
+}
+
+/// Split `"WIP on main: c54fc93e6 Merge..."` or `"On main: pre-pull-backup"` into
+/// `(branch, summary)` with zero allocations.
+pub fn parse_stash_header(raw: &str) -> (&str, &str) {
+    let trimmed = raw.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("WIP on ")
+        .or_else(|| trimmed.strip_prefix("On "))
+        && let Some((br, msg)) = rest.split_once(':')
+    {
+        return (br.trim(), msg.trim());
+    }
+    ("", trimmed)
+}
+
+/// Parse `git diff --numstat` lines (`<added>\t<deleted>\t<path>`) into `(path, added, deleted)`
+/// entries (bounded to 256 lines). Binary entries (`-\t-\t<path>`) are omitted.
+pub fn parse_git_diff_numstat_in<'a>(
+    stdout: &str,
+    alloc: Alloc<'a>,
+) -> AVec<'a, (AString<'a>, u32, u32)> {
+    let mut out: AVec<'a, (AString<'a>, u32, u32)> = Vec::new_in(alloc);
+    for line in stdout.lines().take(256) {
+        let mut parts = line.splitn(3, '\t');
+        let (Some(a_s), Some(d_s), Some(raw_path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let path = raw_path.trim_end_matches('\r');
+        if path.is_empty() || a_s == "-" || d_s == "-" {
+            continue;
+        }
+        if let (Ok(added), Ok(deleted)) = (a_s.parse::<u32>(), d_s.parse::<u32>()) {
+            out.push((String::from_str_in(path, alloc), added, deleted));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,5 +709,84 @@ filename src/main.rs
         let (init, len) = author_initials("Andrew Gazelka");
         assert_eq!(&init[..len], b"AG");
         assert_eq!(avatar_cache_key_hex("A@B.COM"), avatar_cache_key_hex("  <a@b.com> "));
+    }
+
+    #[test]
+    fn parses_git_shortstat_variants() {
+        assert_eq!(
+            parse_git_shortstat(" 3 files changed, 42 insertions(+), 7 deletions(-)"),
+            ShortStat { files_changed: 3, added_lines: 42, deleted_lines: 7 }
+        );
+        assert_eq!(
+            parse_git_shortstat(" 1 file changed, 1 insertion(+)"),
+            ShortStat { files_changed: 1, added_lines: 1, deleted_lines: 0 }
+        );
+        assert_eq!(
+            parse_git_shortstat(" 2 files changed, 9 deletions(-)"),
+            ShortStat { files_changed: 2, added_lines: 0, deleted_lines: 9 }
+        );
+        assert_eq!(parse_git_shortstat(""), ShortStat::default());
+    }
+
+    #[test]
+    fn parses_git_log_commits_with_shortstat_and_limit() {
+        let alloc = Alloc::global();
+        let raw = "\
+\x1ea1b2c3d\x1f1700000100\x1ffeat commit two
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+\x1ee4f5a6b\x1f1700000050\x1ffeat commit one
+ 2 files changed, 10 insertions(+)
+
+\x1e9999999\x1f1700000000\x1fempty commit
+";
+        let all = parse_git_log_commits_in(raw, 5, alloc);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].short_sha.as_str(), "a1b2c3d");
+        assert_eq!(all[0].time_secs, 1_700_000_100);
+        assert_eq!(all[0].subject.as_str(), "feat commit two");
+        assert_eq!(
+            all[0].stat,
+            ShortStat { files_changed: 1, added_lines: 2, deleted_lines: 1 }
+        );
+        assert_eq!(all[1].short_sha.as_str(), "e4f5a6b");
+        assert_eq!(
+            all[1].stat,
+            ShortStat { files_changed: 2, added_lines: 10, deleted_lines: 0 }
+        );
+        assert_eq!(all[2].short_sha.as_str(), "9999999");
+        assert_eq!(all[2].stat, ShortStat::default());
+
+        let capped = parse_git_log_commits_in(raw, 2, alloc);
+        assert_eq!(capped.len(), 2);
+        assert_eq!(capped[1].short_sha.as_str(), "e4f5a6b");
+    }
+
+    #[test]
+    fn parses_stash_headers_zero_alloc() {
+        assert_eq!(
+            parse_stash_header("WIP on main: c54fc93e6 Merge PR #12"),
+            ("main", "c54fc93e6 Merge PR #12")
+        );
+        assert_eq!(
+            parse_stash_header("  On feat/tiling: pre-pull-backup  "),
+            ("feat/tiling", "pre-pull-backup")
+        );
+        assert_eq!(
+            parse_stash_header("custom raw message"),
+            ("", "custom raw message")
+        );
+    }
+
+    #[test]
+    fn parses_git_diff_numstat_text_and_skips_binary() {
+        let alloc = Alloc::global();
+        let raw = "12\t3\tsrc/prompt.rs\n-\t-\tassets/logo.png\n0\t5\told.md\r\n\n";
+        let got = parse_git_diff_numstat_in(raw, alloc);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0.as_str(), "src/prompt.rs");
+        assert_eq!((got[0].1, got[0].2), (12, 3));
+        assert_eq!(got[1].0.as_str(), "old.md");
+        assert_eq!((got[1].1, got[1].2), (0, 5));
     }
 }

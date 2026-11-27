@@ -868,6 +868,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-diag-parse"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+]
+
+[[package]]
 name = "blaze-drive"
 version = "0.0.0"
 dependencies = [
@@ -2414,6 +2421,13 @@ dependencies = [
  "blaze-own",
  "blaze-run",
  "target-features",
+]
+
+[[package]]
+name = "blaze-tiling"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
 ]
 
 [[package]]

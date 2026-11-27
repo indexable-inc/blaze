@@ -619,13 +619,13 @@ mod macos_app {
     /// Collect all live child PTY and background-job PIDs across every pane & tab so the
     /// folder-process monitor knows which processes belong to which `blaze-shell` pane/TUI.
     fn collect_shell_pane_pids(
-        wm: &TileManager,
+        wm: &TileManager<'_>,
         panes: &std::collections::HashMap<PaneId, ShellApp>,
     ) -> Vec<blaze_sysmon::ShellPanePid> {
         let mut out = Vec::new();
         let mut pane_num = 0u32;
         for tab in wm.tabs() {
-            let mut leaves = Vec::new();
+            let mut leaves = blaze_own::Vec::new_in(blaze_own::Alloc::global());
             tab.root.collect_leaves(&mut leaves);
             for pid in leaves {
                 pane_num += 1;
@@ -1840,12 +1840,12 @@ mod macos_app {
 
     fn sync_pty_sizes(
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
-        tile_layout: &TileLayout,
+        tile_layout: &TileLayout<'_>,
         fonts: &Fonts,
         scale: f64,
     ) {
         for pl in &tile_layout.panes {
-            let content_rect = pl.rect;
+            let content_rect: HitRect = pl.rect.into();
             if let Some(pane) = panes.get_mut(&pl.pane)
                 && let Some(ap) = &pane.active_pty
             {
@@ -1876,7 +1876,7 @@ mod macos_app {
 
     #[allow(clippy::too_many_arguments)]
     fn build_window_scene(
-        wm: &TileManager,
+        wm: &TileManager<'static>,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
         vw: f32,
         vh: f32,
@@ -1894,14 +1894,14 @@ mod macos_app {
         dragging_split: Option<SplitHandle>,
         command_palette: Option<&CommandPalette>,
         sidebar_open: bool,
-    ) -> (Scene, TileLayout) {
+    ) -> (Scene, TileLayout<'static>) {
         let sidebar_w = if sidebar_open {
             SIDEBAR_W.min(vw * 0.34).max(180.0)
         } else {
             0.0
         };
         let work_area = HitRect::new(sidebar_w, TOP_BAR_H, vw, vh.max(TOP_BAR_H + 60.0));
-        let tile_layout = wm.layout(work_area, TILE_GAP);
+        let tile_layout = wm.layout(work_area.into(), TILE_GAP);
         let mut master = Scene::new();
         let is_split = tile_layout.pane_count_in_tab > 1 && !tile_layout.is_zoomed;
 
@@ -1910,7 +1910,7 @@ mod macos_app {
             let Some(pane) = panes.get_mut(&pl.pane) else {
                 continue;
             };
-            let content_rect = pl.rect;
+            let content_rect: HitRect = pl.rect.into();
             let pw = (content_rect.x1 - content_rect.x0).max(120.0);
             let ph = (content_rect.y1 - content_rect.y0).max(80.0);
             let sub_vh = ph + TOP_BAR_H;
@@ -2189,7 +2189,7 @@ mod macos_app {
         (master, tile_layout)
     }
 
-    fn auto_split_axis(tile_layout: &TileLayout) -> SplitAxis {
+    fn auto_split_axis(tile_layout: &TileLayout<'_>) -> SplitAxis {
         tile_layout
             .panes
             .iter()
@@ -2206,8 +2206,8 @@ mod macos_app {
     #[allow(clippy::too_many_arguments)]
     fn run_palette_action(
         action: PaletteAction,
-        wm: &mut TileManager,
-        tile_layout: &TileLayout,
+        wm: &mut TileManager<'static>,
+        tile_layout: &TileLayout<'_>,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
         font_points: &mut f64,
         zoom_changed: &mut bool,
@@ -2507,7 +2507,7 @@ mod macos_app {
         window: &NSWindow,
         layer: &CAMetalLayer,
         renderer: &Renderer,
-        wm: &TileManager,
+        wm: &TileManager<'static>,
         panes: &mut std::collections::HashMap<PaneId, ShellApp>,
         fonts: &mut Fonts,
         icon_atlas: &mut IconAtlas,
@@ -2517,7 +2517,7 @@ mod macos_app {
         font_points: f64,
         anim_epoch: Instant,
         has_animated_images: &mut bool,
-        tile_layout: &mut TileLayout,
+        tile_layout: &mut TileLayout<'static>,
         composite_scene: &mut Scene,
         pty_sizes_dirty: &mut bool,
         dirty: &mut bool,
@@ -2761,7 +2761,7 @@ mod macos_app {
         let term_server = blaze_shell::term_server::start_global(&term_home);
         let mut last_term_rev = term_server.revision();
 
-        let (mut wm, _, first_pane_id) = TileManager::new();
+        let (mut wm, _, first_pane_id) = TileManager::new(blaze_own::Alloc::global());
         let mut panes: std::collections::HashMap<PaneId, ShellApp> = std::collections::HashMap::new();
         let mut first_pane = ShellApp::new_in(cli.cwd.as_deref());
         let (init_cols, init_rows) = grid_for(size, &fonts, scale);
@@ -2896,7 +2896,7 @@ mod macos_app {
         let mut was_key_window = window.isKeyWindow();
         let mut pty_sizes_dirty = false;
         let mut composite_scene = Scene::new();
-        let mut tile_layout = TileLayout::default();
+        let mut tile_layout = TileLayout::empty(blaze_own::Alloc::global());
         let mut dragging_split: Option<SplitHandle> = None;
         let mut dragging_agent_sidebar = false;
         let mut dragging_table_col: Option<(BlockId, usize, f32)> = None;
@@ -3408,7 +3408,7 @@ mod macos_app {
                                             size.width as f32,
                                             size.height as f32,
                                         );
-                                        if wm.focus_direction(d, area, TILE_GAP).is_some() {
+                                        if wm.focus_direction(d, area.into(), TILE_GAP).is_some() {
                                             active_popover = None;
                                             output_selection = None;
                                             output_nav = None;
@@ -3492,11 +3492,11 @@ mod macos_app {
 
                                     if inline_pty_focused {
                                         if let Some(pane) = panes.get_mut(&focused_pid) {
-                                            let pane_rect = tile_layout
+                                            let pane_rect: HitRect = tile_layout
                                                 .panes
                                                 .iter()
                                                 .find(|pl| pl.pane == focused_pid)
-                                                .map(|pl| pl.rect)
+                                                .map(|pl| pl.rect.into())
                                                 .unwrap_or_else(|| {
                                                     HitRect::new(
                                                         0.0,
@@ -4683,8 +4683,8 @@ mod macos_app {
                                     // Send true SGR / X10 mouse wheel events (`\x1b[<64;col;rowM`)
                                     // whenever the TUI (e.g. Claude Code, vim, htop) enabled mouse
                                     // reporting — never falling back to arrow keys!
-                                    let pane_rect = hovered_pl
-                                        .map(|p| p.rect)
+                                    let pane_rect: HitRect = hovered_pl
+                                        .map(|p| p.rect.into())
                                         .unwrap_or_else(|| {
                                             HitRect::new(0.0, TOP_BAR_H, size.width as f32, size.height as f32)
                                         });
@@ -5966,11 +5966,11 @@ mod macos_app {
                                 continue;
                             }
                             if dragging_agent_sidebar {
-                                let pane_rect = tile_layout
+                                let pane_rect: HitRect = tile_layout
                                     .panes
                                     .iter()
                                     .find(|p| p.focused)
-                                    .map(|p| p.rect)
+                                    .map(|p| p.rect.into())
                                     .unwrap_or_else(|| {
                                         HitRect::new(0.0, 0.0, size.width as f32, size.height as f32)
                                     });
@@ -6389,7 +6389,7 @@ mod macos_app {
                     .panes
                     .iter()
                     .find(|pl| pl.pane == pid)
-                    .map(|pl| grid_for_rect(pl.rect, &fonts, scale))
+                    .map(|pl| grid_for_rect(pl.rect.into(), &fonts, scale))
                     .unwrap_or_else(|| grid_for(size, &fonts, scale));
                 if pane.poll_async_jobs(cols, rows, cpx) {
                     dirty = true;
@@ -6527,7 +6527,7 @@ mod macos_app {
                     0.0
                 };
                 let area = HitRect::new(sw, TOP_BAR_H, size.width as f32, size.height as f32);
-                let next_tl = wm.layout(area, TILE_GAP);
+                let next_tl = wm.layout(area.into(), TILE_GAP);
                 sync_pty_sizes(&mut panes, &next_tl, &fonts, scale);
                 pty_sizes_dirty = false;
             }

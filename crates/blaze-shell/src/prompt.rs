@@ -693,24 +693,13 @@ fn classify_changed_file_kind(abs: &Path, leaf: &str) -> &'static str {
     res.label
 }
 
-/// Parse `git diff --numstat` lines (`<added>\t<deleted>\t<path>`) into `path -> (added, deleted)`.
-/// Binary entries (`-\t-\t<path>`) are omitted so callers leave line counts `None`.
+/// Parse `git diff --numstat` lines (`<added>\t<deleted>\t<path>`) into `path -> (added, deleted)`
+/// via the pure `#![no_std]` parser in `blaze-git-meta`.
 fn parse_git_diff_numstat(stdout: &str) -> std::collections::HashMap<String, (u32, u32)> {
-    let mut map = std::collections::HashMap::new();
-    for line in stdout.lines().take(256) {
-        let mut parts = line.splitn(3, '\t');
-        let (Some(a_s), Some(d_s), Some(raw_path)) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        let path = raw_path.trim_end_matches('\r');
-        if path.is_empty() || a_s == "-" || d_s == "-" {
-            continue;
-        }
-        if let (Ok(added), Ok(deleted)) = (a_s.parse::<u32>(), d_s.parse::<u32>()) {
-            map.insert(path.to_owned(), (added, deleted));
-        }
-    }
-    map
+    blaze_git_meta::parse_git_diff_numstat_in(stdout, Alloc::global())
+        .into_iter()
+        .map(|(path, added, deleted)| (path.as_str().to_owned(), (added, deleted)))
+        .collect()
 }
 
 /// Run one fast bounded `git -C <work_tree> diff --numstat HEAD` for up to 32 tracked paths.
@@ -771,15 +760,8 @@ fn read_git_stashes(common_dir: &Path, limit: usize) -> Vec<String> {
 
 /// Split `"WIP on main: c54fc93e6 Merge..."` or `"On main: pre-pull-backup"` into `(branch, summary)`.
 fn parse_stash_header(raw: &str) -> (String, String) {
-    let trimmed = raw.trim();
-    if let Some(rest) = trimmed
-        .strip_prefix("WIP on ")
-        .or_else(|| trimmed.strip_prefix("On "))
-        && let Some((br, msg)) = rest.split_once(':')
-    {
-        return (br.trim().to_owned(), msg.trim().to_owned());
-    }
-    (String::new(), trimmed.to_owned())
+    let (br, msg) = blaze_git_meta::parse_stash_header(raw);
+    (br.to_owned(), msg.to_owned())
 }
 
 /// Read rich per-stash file diff stats (`+added` / `-removed`), cached by `(common_dir, reflog mtime, len)`.
@@ -1213,25 +1195,10 @@ fn read_branch_relation(
 }
 
 /// Parse one `git diff --shortstat` / `git log --shortstat` summary line into
-/// `(files_changed, added_lines, deleted_lines)`.
+/// `(files_changed, added_lines, deleted_lines)` via `blaze-git-meta`.
 fn parse_git_shortstat(line: &str) -> (u32, u32, u32) {
-    let mut files = 0u32;
-    let mut added = 0u32;
-    let mut deleted = 0u32;
-    for part in line.split(',') {
-        let mut toks = part.split_whitespace();
-        let Some(num_s) = toks.next() else { continue };
-        let Ok(num) = num_s.parse::<u32>() else { continue };
-        let rest = toks.next().unwrap_or("");
-        if rest.starts_with("file") {
-            files = num;
-        } else if rest.starts_with("insertion") {
-            added = num;
-        } else if rest.starts_with("deletion") {
-            deleted = num;
-        }
-    }
-    (files, added, deleted)
+    let stat = blaze_git_meta::parse_git_shortstat(line);
+    (stat.files_changed, stat.added_lines, stat.deleted_lines)
 }
 
 /// Fetch up to `limit` commits for `rev_range` with compact `--shortstat` `+`/`-` churn.
@@ -1246,7 +1213,7 @@ fn read_git_log_commits(work_tree: &Path, rev_range: &str, limit: usize) -> Vec<
             "log",
             &max_flag,
             "--shortstat",
-            "--format=\x1e%h\x1f%ct\x1f%s",
+            "--format=\x1e%h\x1f%ct%x1f%s",
             rev_range,
         ])
         .stdin(Stdio::null())
@@ -1259,46 +1226,17 @@ fn read_git_log_commits(work_tree: &Path, rev_range: &str, limit: usize) -> Vec<
         return Vec::new();
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut commits = Vec::with_capacity(limit);
-    for rec in text.split('\x1e') {
-        let rec = rec.trim();
-        if rec.is_empty() {
-            continue;
-        }
-        let mut lines = rec.lines();
-        let Some(header) = lines.next() else { continue };
-        let mut fields = header.splitn(3, '\x1f');
-        let Some(sha) = fields.next().map(str::trim).filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        let time_secs = fields
-            .next()
-            .and_then(|s| s.trim().parse::<i64>().ok())
-            .unwrap_or(0);
-        let subject = fields.next().unwrap_or("").trim().to_owned();
-        let mut files_changed = 0u32;
-        let mut added_lines = 0u32;
-        let mut deleted_lines = 0u32;
-        for stat_line in lines {
-            let trimmed = stat_line.trim();
-            if trimmed.contains("file") || trimmed.contains("insertion") || trimmed.contains("deletion") {
-                let (f, a, d) = parse_git_shortstat(trimmed);
-                files_changed = f;
-                added_lines = a;
-                deleted_lines = d;
-                break;
-            }
-        }
-        commits.push(BranchCommit {
-            short_sha: sha.to_owned(),
-            time_secs,
-            subject,
-            added_lines,
-            deleted_lines,
-            files_changed,
-        });
-    }
-    commits
+    blaze_git_meta::parse_git_log_commits_in(&text, limit, Alloc::global())
+        .into_iter()
+        .map(|c| BranchCommit {
+            short_sha: c.short_sha.as_str().to_owned(),
+            time_secs: c.time_secs,
+            subject: c.subject.as_str().to_owned(),
+            added_lines: c.stat.added_lines,
+            deleted_lines: c.stat.deleted_lines,
+            files_changed: c.stat.files_changed,
+        })
+        .collect()
 }
 
 fn resolve_scoped(head: &GitHead, sp: &ScopedPath<'_>) -> PathBuf {
