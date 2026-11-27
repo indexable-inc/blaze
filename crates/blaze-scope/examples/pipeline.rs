@@ -1759,7 +1759,7 @@ impl<'a> Lower<'a> {
                     };
                     (shapes, MacroBody::Macro2 { params, body })
                 };
-                self.declare(name, Namespace::Macros, key, DefKind::Macro(shape), vis);
+                self.declare(name, Namespace::Macros, key, DefKind::Macro(shape.as_macro2()), vis);
                 let src = MacroSrc { name, body, module: self.module, export: false, local_inner: false };
                 self.out.macros.push((key, src));
             }

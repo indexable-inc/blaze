@@ -32,10 +32,11 @@ fn def(tape: &Tape) -> Def {
     Def { key: key(n), kind }
 }
 
-/// A non-empty set of call shapes.
+/// A non-empty set of call shapes, optionally marked Macros 2.0.
 fn shapes(tape: &Tape) -> MacroShapes {
     let byte = u8::try_from(1 + tape.below(7, "shapes")).expect("below 8 fits a u8");
-    MacroShapes::from_byte(byte).expect("one to seven is a set")
+    let s = MacroShapes::from_byte(byte).expect("one to seven is a set");
+    if tape.coin("macro2") { s.as_macro2() } else { s }
 }
 
 fn vis(tape: &Tape) -> Visibility {
@@ -342,4 +343,33 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
     let mut twice = CrateRootBuilder::new_in(head, blaze_own::testing::heap().alloc());
     twice.extern_prelude.extend_from_slice(&[("core", key(7)), ("core", key(8))]);
     assert!(matches!(twice.write(blaze_own::testing::heap().alloc()).err(), Some(BuildError::Twice { .. })));
+}
+
+#[test]
+fn macro_shapes_wire_bits_and_macro2_flag() {
+    for byte in 0u8..=255 {
+        let got = MacroShapes::from_byte(byte);
+        match byte {
+            1..=7 => {
+                let s = got.expect("1..=7 are valid non-macro2 shape sets");
+                assert_eq!(s.byte(), byte);
+                assert!(!s.is_macro2());
+                assert!(s.in_macro_use_prelude());
+            }
+            9..=15 => {
+                let s = got.expect("9..=15 are valid macro2 shape sets");
+                assert_eq!(s.byte(), byte);
+                assert!(s.is_macro2());
+                assert!(!s.in_macro_use_prelude());
+            }
+            _ => assert_eq!(got, None, "byte {byte} must be rejected"),
+        }
+    }
+    let m2 = MacroShapes::FN_LIKE.as_macro2().with(CallShape::Attr);
+    assert!(m2.is_macro2());
+    assert!(!m2.in_macro_use_prelude());
+    assert!(m2.accepts(CallShape::FnLike));
+    assert!(m2.accepts(CallShape::Attr));
+    assert!(!m2.accepts(CallShape::Derive));
+    assert_eq!(MacroShapes::from_byte(m2.byte()), Some(m2));
 }

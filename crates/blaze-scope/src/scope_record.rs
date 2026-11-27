@@ -71,7 +71,9 @@ pub(crate) const MAGIC: [u8; 4] = *b"BZCS";
 // (`NotThisRecord`), so every home solves each crate once more and writes this form.
 // 6: macro rows keep `dollar_crate` (token-mark-3: `has_dollar_crate` u8 + 32-byte `CrateItemKey`,
 // `MACRO_ROW` = 128 bytes); a version-5 record is refused (`NotThisRecord`).
-pub(crate) const VERSION: u32 = 6;
+// 7: `MacroShapes` bit 3 marks Macros 2.0 (`pub macro`) definitions (excluded from the
+// `#[macro_use]` prelude); a version-6 record is refused (`NotThisRecord`).
+pub(crate) const VERSION: u32 = 7;
 pub(crate) const ALIGN: usize = 16;
 /// The errored flag of an error crate's record (crate_scope.rs `error_record`); 0 in any other.
 pub(crate) const ERRORED: u8 = 1;
