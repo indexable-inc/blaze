@@ -997,6 +997,10 @@ pub enum MNoteKind {
     Volatile,
     /// Anchors an `adr` / jump-table base address site for table `table_id`.
     JumpTableAnchor { table_id: u32 },
+    /// Per-call-site IPRA clobber bitmask (`0..31` = GPR, `32..63` = FP/SIMD) attached directly
+    /// to each `Bl` / `Blr` instruction so `mopt` block relocations/pruning and `msched`
+    /// instruction reordering can never desynchronize call-site clobbers.
+    CallClobbers { mask: u64 },
 }
 
 /// Linked-list node in [`MFunc::notes`] allowing multiple notes per instruction with zero extra arrays.
@@ -2566,7 +2570,7 @@ pub fn mencode<'a>(func: &MFunc<'a>, alloc: Alloc<'a>) -> Result<EncodedMFunc<'a
                             table_adr_word_idxs.push(TableAdrAt { table_id, word_idx });
                         }
                     }
-                    MNoteKind::Volatile => {}
+                    MNoteKind::Volatile | MNoteKind::CallClobbers { .. } => {}
                 }
                 cur_note = note.next;
             }
