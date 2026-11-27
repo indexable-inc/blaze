@@ -3262,7 +3262,10 @@ fn compute_poly_summary<P: FrontEnd, T: Typing<P>>(
         }
     }
 
-    let drop_trait = program.drop_trait().map(|(t, _)| t);
+    let drop_trait = match program.drop_trait().map(|(t, _)| t) {
+        Some(tr) => Ok(Some(tr)),
+        None => program.lang_item(LangItem::Drop),
+    };
     let mut adt_drop_flags: AVec<'_, (ItemKey, bool)> = AVec::new_in(fn_alloc);
     for _round in 0..8u32 {
         let mut need_ask = false;
@@ -3292,9 +3295,10 @@ fn compute_poly_summary<P: FrontEnd, T: Typing<P>>(
                 need_ask = true;
                 continue;
             }
-            let has_drop = match drop_trait {
-                None => false,
-                Some(tr) => match program.adt_drop_impl(root_row, tr, k, fn_alloc) {
+            let has_drop = match &drop_trait {
+                Ok(None) => false,
+                Err(_) => true,
+                Ok(Some(tr)) => match program.adt_drop_impl(root_row, *tr, k, fn_alloc) {
                     Ok(opt) => opt.is_some(),
                     Err(blaze_typeck::ResolveError::Missing(_)) => {
                         need_ask = true;
