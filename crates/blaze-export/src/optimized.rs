@@ -236,13 +236,17 @@ pub fn v1_to_v2<'a>(view: CodeView<'_>, by: &dyn Declares, out: &mut AVec<'a, u8
     }
     for k in 0..view.targets() {
         let target = view.target(k);
-        if target.space != Space::Outside {
+        if !target.space.is_outside() {
             continue;
         }
         let Some(name) = view.name(target.symbol) else {
             return Err(FormError::NameMissing { symbol: target.symbol });
         };
-        r.outside(name);
+        if target.space == Space::WeakOutside {
+            r.weak_outside(name);
+        } else {
+            r.outside(name);
+        }
     }
     let mut e = from_v1(r, alloc)?;
     declare(&mut e, by)?;
@@ -262,7 +266,7 @@ impl Declares for StartBound {
         match t.space {
             Space::Func => Some(Declare { kind: DeclaredKind::Bound, item: 0, name: &[] }),
             Space::Static => Some(Declare { kind: DeclaredKind::TlsDescriptor, item: 0, name: &[] }),
-            Space::Vtable | Space::Tls | Space::Outside => None,
+            Space::Vtable | Space::Tls | Space::Outside | Space::WeakOutside => None,
         }
     }
 }
@@ -560,11 +564,11 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                         return Err(ExportError::OutOfReach { from: m.symbol, target: t });
                     }
                 }
-                Space::Outside => {
+                Space::Outside | Space::WeakOutside => {
                     let Some(name) = r.name(t.symbol) else {
                         return Err(ExportError::OutsideNameMissing { from: m.symbol, target: t });
                     };
-                    imports.push(Import { symbol: t.symbol, name });
+                    imports.push(Import { symbol: t.symbol, name, weak: t.space == Space::WeakOutside });
                 }
                 Space::Func | Space::Static | Space::Vtable => {}
             }
@@ -576,15 +580,14 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
         };
         for w in datum.words {
             if let Some(t) = w.target
-                && t.space == Space::Outside
+                && t.space.is_outside()
                 && let Some(&(_, name)) = datum.outside.iter().find(|&&(sym, _)| sym == t.symbol)
             {
-                imports.push(Import { symbol: t.symbol, name });
+                imports.push(Import { symbol: t.symbol, name, weak: t.space == Space::WeakOutside });
             }
         }
     }
-    imports.sort_unstable_by(|a, b| a.symbol.cmp(&b.symbol));
-    imports.dedup_by(|a, b| a.symbol == b.symbol);
+    crate::layout::dedup_imports(&mut imports);
     let import_of = |symbol: Symbol| imports.binary_search_by(|it| it.symbol.cmp(&symbol)).ok();
 
     // The stubs: one per C name some `b`/`bl` reaches, after the code, in import order.
@@ -600,7 +603,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                 continue;
             }
             if let Some(t) = named(&r, reloc.target)
-                && t.space == Space::Outside
+                && t.space.is_outside()
                 && let Some(index) = import_of(t.symbol)
             {
                 stub_at[index] = 0;
@@ -666,7 +669,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                     let t = r.target(index as usize);
                     match t.space {
                         Space::Tls => return Err(ExportError::TlsAddress { from: symbol, at: reloc.at }),
-                        Space::Outside => return Err(ExportError::AddressOfOutside { from: symbol, target: t, at: reloc.at }),
+                        Space::Outside | Space::WeakOutside => return Err(ExportError::AddressOfOutside { from: symbol, target: t, at: reloc.at }),
                         Space::Func | Space::Static | Space::Vtable => {
                             match target_home(members, &by_symbol, &home, data, &by_target, &regions.data_home, regions.tls_desc, t) {
                                 Some(to) => to,
@@ -690,7 +693,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                         let value = u64::from(index).wrapping_add_signed(reloc.addend);
                         regions.write_const_word(symbol, at, value)?;
                     }
-                    Some(t) if t.space == Space::Outside => {
+                    Some(t) if t.space.is_outside() => {
                         let to = match import_of(t.symbol) {
                             Some(import) => FixTo::Bind { import: import as u32 },
                             None => unreachable!("every outside target a placed record uses was gathered above"),
@@ -717,7 +720,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                         None => address(reloc, &regions)?,
                         Some(t) => match t.space {
                             Space::Func => address(reloc, &regions)?,
-                            Space::Outside => match import_of(t.symbol) {
+                            Space::Outside | Space::WeakOutside => match import_of(t.symbol) {
                                 Some(index) if stub_at[index] != NO_STUB => stub_at[index],
                                 _ => unreachable!("every outside target a b/bl reaches was given a stub above"),
                             },
@@ -741,7 +744,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                     // The seal refused an import-word kind on the record's own code or relro.
                     let t = r.target(reloc.target as usize);
                     let to = match t.space {
-                        Space::Outside => word_of(t.symbol),
+                        Space::Outside | Space::WeakOutside => word_of(t.symbol),
                         Space::Tls => {
                             let Some(index) = regions.tls_index_of(t.symbol) else {
                                 return Err(ExportError::OutOfReach { from: symbol, target: t });
@@ -769,7 +772,7 @@ pub(crate) fn lay_out_records_with_tls<'a, 'r>(
                     let t = r.target(reloc.target as usize);
                     let call = calls(r.code(), reloc.at);
                     match t.space {
-                        Space::Outside => write32(&mut text, x, ldr_lo12(inst, word_of(t.symbol))),
+                        Space::Outside | Space::WeakOutside => write32(&mut text, x, ldr_lo12(inst, word_of(t.symbol))),
                         Space::Tls => {
                             if call {
                                 return Err(ExportError::CallOfData { from: symbol, at: reloc.at });

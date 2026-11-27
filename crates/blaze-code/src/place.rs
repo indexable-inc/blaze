@@ -180,7 +180,7 @@ pub fn place_positions(
             OWN_RELRO => at.relro,
             index => {
                 let target = record.target(index as usize);
-                if target.space == Space::Outside && word.addend != 0 {
+                if target.space.is_outside() && word.addend != 0 {
                     return Err(PlaceError::Site(ImageError::OutsideAddend { symbol: target.symbol }));
                 }
                 words.value(target)?

@@ -1230,7 +1230,7 @@ where
                         continue;
                     }
                     let t = dview.target(word.target as usize);
-                    if t.space == Space::Outside
+                    if t.space.is_outside()
                         && let Some(c_name) = dview.name(t.symbol)
                     {
                         if let Some(def_item) =
@@ -1674,7 +1674,7 @@ where
                         };
                         LirWasm64RelocTarget::Static(st_place)
                     }
-                    Space::Outside => {
+                    Space::Outside | Space::WeakOutside => {
                         let c_name = view.name(t.symbol);
                         if let Some(name) = c_name
                             && let Some(fn_place) =

@@ -34,8 +34,8 @@ use crate::image::ImageError;
 use crate::place::Words;
 use crate::record::{Space, Symbol, Target, Word};
 
-/// The first eight bytes of every encoded datum.
-pub const DATUM_MAGIC: [u8; 8] = *b"bzdata01";
+/// The first eight bytes of every encoded datum (`bzdata02` adds [`Space::WeakOutside`]).
+pub const DATUM_MAGIC: [u8; 8] = *b"bzdata02";
 
 /// A [`Word`]'s target meaning this datum's own byte `addend`.
 pub const OWN_DATUM: u32 = u32::MAX;
@@ -117,7 +117,7 @@ impl fmt::Display for DatumError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let form = "a static's data record (blaze-code datum.rs; run.md, \"Statics in the run\")";
         match *self {
-            DatumError::Magic => write!(f, "the bytes are not {form}: no `bzdata01` head"),
+            DatumError::Magic => write!(f, "the bytes are not {form}: no `bzdata02` head"),
             DatumError::Length { need, have } => write!(f, "{form}'s head counts {need} bytes; it has {have}"),
             DatumError::PlaceByte { byte } => write!(f, "{form} has the unknown place {byte}"),
             DatumError::Align { align } => write!(f, "{form} asks an alignment of 2^{align}, past a page (2^{MOST_ALIGN})"),
@@ -181,6 +181,16 @@ impl<'a> Datum<'a> {
     /// C name `name`'s index as a target ([`Space::Outside`], [`Symbol::of_name`]), its text
     /// kept for the run's binding, for a word made before [`Datum::seal`].
     pub fn outside(&mut self, name: &str) -> u32 {
+        self.outside_in(Space::Outside, name)
+    }
+
+    /// Weak C name `name`'s index as a target ([`Space::WeakOutside`], [`Symbol::of_name`]), its
+    /// text kept for the run's binding (resolves to 0 when undefined).
+    pub fn weak_outside(&mut self, name: &str) -> u32 {
+        self.outside_in(Space::WeakOutside, name)
+    }
+
+    fn outside_in(&mut self, space: Space, name: &str) -> u32 {
         let symbol = Symbol::of_name(name);
         if !self.names.iter().any(|&(kept, _, _)| kept == symbol) {
             // A length past a u32 is refused at the seal (`TooLarge`); saturated here.
@@ -189,7 +199,7 @@ impl<'a> Datum<'a> {
             self.names.push((symbol, start, len));
             self.text.extend_from_slice(name.as_bytes());
         }
-        self.target(Target { space: Space::Outside, symbol })
+        self.target(Target { space, symbol })
     }
 
     /// The datum in its one canonical form: targets sorted and unique (every word renumbered),
@@ -245,7 +255,7 @@ impl<'a> Datum<'a> {
         // (equal data write equal bytes however their names were added).
         let mut kept: AVec<'a, (Symbol, u32, u32)> = Vec::new_in(alloc);
         let mut kept_text: AVec<'a, u8> = Vec::new_in(alloc);
-        for t in sorted.iter().filter(|t| t.space == Space::Outside) {
+        for t in sorted.iter().filter(|t| t.space.is_outside()) {
             let Some(&(_, start, name_len)) = names.iter().find(|&&(symbol, _, _)| symbol == t.symbol) else {
                 return Err(DatumError::NoName { symbol: t.symbol });
             };
@@ -264,7 +274,7 @@ impl<'a> Datum<'a> {
 /// A target a datum may name (the module doc).
 fn allowed(t: Target) -> Result<(), DatumError> {
     match t.space {
-        Space::Func | Space::Static | Space::Vtable | Space::Outside => Ok(()),
+        Space::Func | Space::Static | Space::Vtable | Space::Outside | Space::WeakOutside => Ok(()),
         Space::Tls => Err(DatumError::Space { space: t.space, symbol: t.symbol }),
     }
 }
@@ -380,9 +390,12 @@ pub struct DatumView<'b> {
     /// The names section's rows and texts (empty when the datum names no C name).
     name_rows: &'b [u8],
     name_text: &'b [u8],
-    /// The index of the first C name target: they sort last ([`Space::Outside`] is the last
-    /// space), so target `first_outside + k` is row `k`'s.
+    /// The index of the first C name target (`Space::Outside` or `Space::WeakOutside`): they sort
+    /// last (`Outside` then `WeakOutside`), so target `first_outside + k` is row `k`'s.
     first_outside: usize,
+    /// The index of the first `Space::WeakOutside` target (`first_outside <= first_weak <= targets`).
+    /// Both `first_outside..first_weak` and `first_weak..targets` are strictly sorted by symbol.
+    first_weak: usize,
 }
 
 impl<'b> DatumView<'b> {
@@ -430,9 +443,10 @@ impl<'b> DatumView<'b> {
         }
         let mut last: Option<Target> = None;
         let mut first_outside = count_targets;
+        let mut first_weak = count_targets;
         for row in 0..count_targets {
             let byte = targets[row * TARGET_ROW];
-            let Some(space) = space_of(byte) else {
+            let Some(space) = Space::from_byte(byte) else {
                 return Err(DatumError::SpaceByte { row: row as u32, byte });
             };
             let t = Target { space, symbol: symbol_at(targets, row * TARGET_ROW + 8) };
@@ -440,12 +454,16 @@ impl<'b> DatumView<'b> {
             if last.is_some_and(|before| before >= t) {
                 return Err(DatumError::TargetsOrder);
             }
-            if space == Space::Outside && first_outside == count_targets {
+            if space.is_outside() && first_outside == count_targets {
                 first_outside = row;
+            }
+            if space == Space::WeakOutside && first_weak == count_targets {
+                first_weak = row;
             }
             last = Some(t);
         }
-        // The C name targets sort last, so they are rows `first_outside..`; each has its row.
+        // The C name targets sort last (`Outside` then `WeakOutside`), so they are rows
+        // `first_outside..`; each has its row.
         let outside = count_targets - first_outside;
         if outside == 0 && count_names != 0 {
             return Err(DatumError::Names { why: "the datum names no C name" });
@@ -470,25 +488,28 @@ impl<'b> DatumView<'b> {
         if next != name_text.len() {
             return Err(DatumError::Names { why: "its texts run past its rows" });
         }
-        let view = DatumView { bytes, place, align, data, targets, words, name_rows, name_text, first_outside };
+        let view = DatumView { bytes, place, align, data, targets, words, name_rows, name_text, first_outside, first_weak };
         check_words((0..count_words).map(|i| view.word(i)), align, len, count_targets)?;
         Ok(view)
     }
 
     /// The name kept for C name target `symbol` (checked on read to hash to it), by halving
-    /// over the C name targets; `None` when the datum does not name it.
+    /// over the `Space::Outside` and `Space::WeakOutside` target ranges; `None` when the datum
+    /// does not name it.
     pub fn name(&self, symbol: Symbol) -> Option<&'b str> {
         let rows = self.name_rows.len() / NAME_ROW;
-        let (mut lo, mut hi) = (0usize, rows);
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            match symbol_at(self.targets, (self.first_outside + mid) * TARGET_ROW + 8).cmp(&symbol) {
-                core::cmp::Ordering::Less => lo = mid + 1,
-                core::cmp::Ordering::Greater => hi = mid,
-                core::cmp::Ordering::Equal => {
-                    let start = get32(self.name_rows, mid * NAME_ROW) as usize;
-                    let len = get32(self.name_rows, mid * NAME_ROW + 4) as usize;
-                    return core::str::from_utf8(self.name_text.get(start..start + len)?).ok();
+        let split = self.first_weak.saturating_sub(self.first_outside);
+        for (mut lo, mut hi) in [(0usize, split), (split, rows)] {
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                match symbol_at(self.targets, (self.first_outside + mid) * TARGET_ROW + 8).cmp(&symbol) {
+                    core::cmp::Ordering::Less => lo = mid + 1,
+                    core::cmp::Ordering::Greater => hi = mid,
+                    core::cmp::Ordering::Equal => {
+                        let start = get32(self.name_rows, mid * NAME_ROW) as usize;
+                        let len = get32(self.name_rows, mid * NAME_ROW + 4) as usize;
+                        return core::str::from_utf8(self.name_text.get(start..start + len)?).ok();
+                    }
                 }
             }
         }
@@ -532,7 +553,7 @@ impl<'b> DatumView<'b> {
 
     pub fn target(&self, i: usize) -> Target {
         let row = i * TARGET_ROW;
-        let Some(space) = space_of(self.targets[row]) else {
+        let Some(space) = Space::from_byte(self.targets[row]) else {
             unreachable!("DatumView::read checked every target's space byte");
         };
         Target { space, symbol: symbol_at(self.targets, row + 8) }
@@ -546,10 +567,6 @@ impl<'b> DatumView<'b> {
         let row = i * WORD_ROW;
         Word { at: get32(self.words, row), target: get32(self.words, row + 4), addend: get64(self.words, row + 8) as i64 }
     }
-}
-
-fn space_of(byte: u8) -> Option<Space> {
-    [Space::Func, Space::Static, Space::Vtable, Space::Tls, Space::Outside].get(usize::from(byte)).copied()
 }
 
 fn symbol_at(b: &[u8], at: usize) -> Symbol {

@@ -391,7 +391,7 @@ impl<'a> Image<'a> {
 
     /// Binds the word at `at` to `target` plus `addend`, and posts it under the target.
     fn bind(&mut self, target: Target, at: u64, addend: i64, writes: &mut AVec<'a, Write>, outside: &mut AVec<'a, (u64, Symbol)>) -> Result<(), ImageError> {
-        if target.space == Space::Outside {
+        if target.space.is_outside() {
             if addend != 0 {
                 return Err(ImageError::OutsideAddend { symbol: target.symbol });
             }

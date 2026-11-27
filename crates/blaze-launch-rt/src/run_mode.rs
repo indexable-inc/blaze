@@ -267,9 +267,11 @@ pub trait Memory {
     /// The address of `slot`'s entry thunk: the function's address.
     fn thunk(&self, slot: SlotId) -> u64;
     /// Binds the C name `name` of symbol `symbol`, which record `record` names, through the
-    /// run's strategy (run_mode/bind.rs; once a run; again gives the same). A C name the program
-    /// defines never comes here: the binder resolves it to its slot or static first.
-    fn outside(&mut self, record: RecordId, symbol: CodeSymbol, name: &str) -> Result<Outside, RunModeError>;
+    /// run's strategy (run_mode/bind.rs; once a run; again gives the same). When `weak` is true
+    /// (`Space::WeakOutside`), a missing symbol (`BindError::NotFound`) binds to 0 (null) instead
+    /// of failing. A C name the program defines never comes here: the binder resolves it to its
+    /// slot or static first.
+    fn outside(&mut self, record: RecordId, symbol: CodeSymbol, name: &str, weak: bool) -> Result<Outside, RunModeError>;
     /// `len` bytes of the code area on `align`: their run-view address.
     fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError>;
     /// `len` bytes of the hot region on `align`, where promoted code is laid out in the order the
@@ -1355,7 +1357,7 @@ impl<M: Memory> Binder<'_, '_, M> {
     /// THE BINDER SEAM (run_mode/bind.rs): C name target `symbol` of the record being placed,
     /// first as what the program defines (a declared slot, a told static: its symbol is the
     /// name's own), then through the memory's strategy, which needs the name's text.
-    fn outside(&mut self, symbol: CodeSymbol) -> Result<Bound, RunModeError> {
+    fn outside(&mut self, symbol: CodeSymbol, weak: bool) -> Result<Bound, RunModeError> {
         if let Some(slot) = self.slots.declared(symbol) {
             return Ok(Bound::Slot(slot));
         }
@@ -1365,29 +1367,33 @@ impl<M: Memory> Binder<'_, '_, M> {
         let Some(name) = self.names.name(symbol) else {
             return Err(RunModeError::Outside { record: self.record, symbol, name: CName::NONE, why: "the record keeps no name for it" });
         };
-        let bound = self.memory.outside(self.record, symbol, name)?;
+        let bound = self.memory.outside(self.record, symbol, name, weak)?;
         self.slots.bound_outside.insert(symbol.0, ());
         Ok(Bound::Outside(bound))
     }
 
     /// The word a C name target's site loads: for a call the word holding the code to run, for
     /// a load the word holding its address.
-    fn outside_word(&mut self, symbol: CodeSymbol, call: bool) -> Result<u64, RunModeError> {
-        match self.outside(symbol)? {
+    fn outside_word(&mut self, symbol: CodeSymbol, call: bool, weak: bool) -> Result<u64, RunModeError> {
+        match self.outside(symbol, weak)? {
             Bound::Slot(slot) => Ok(match call {
                 true => self.memory.word(slot),
                 false => self.memory.address_word(slot),
             }),
             Bound::Static(at) if !call => Ok(self.memory.static_word(at.index)),
             // A call of data the program defines: no code is there.
-            Bound::Static(_) => Err(RunModeError::Target { record: self.record, space: Space::Outside, symbol }),
+            Bound::Static(_) => Err(RunModeError::Target {
+                record: self.record,
+                space: if weak { Space::WeakOutside } else { Space::Outside },
+                symbol,
+            }),
             Bound::Outside(it) => Ok(it.word),
         }
     }
 
     /// A C name target's address, as a datum's word holds it.
-    fn outside_value(&mut self, symbol: CodeSymbol) -> Result<u64, RunModeError> {
-        Ok(match self.outside(symbol)? {
+    fn outside_value(&mut self, symbol: CodeSymbol, weak: bool) -> Result<u64, RunModeError> {
+        Ok(match self.outside(symbol, weak)? {
             Bound::Slot(slot) => self.memory.thunk(slot),
             Bound::Static(at) => at.at,
             Bound::Outside(it) => it.value,
@@ -1418,7 +1424,7 @@ impl<M: Memory> Words for Binder<'_, '_, M> {
                 true => self.memory.word(slot),
                 false => self.memory.address_word(slot),
             }),
-            Space::Outside => self.outside_word(target.symbol, call),
+            Space::Outside | Space::WeakOutside => self.outside_word(target.symbol, call, target.space == Space::WeakOutside),
             // A load of the static's address reads its word; nothing calls a static. A vtable is
             // a datum the parent sent as a static's (code_records.rs `VtableDatum`), bound alike.
             Space::Static | Space::Vtable if !call => self.static_at(target.symbol).map(|it| self.memory.static_word(it.index)),
@@ -1438,7 +1444,7 @@ impl<M: Memory> Words for Binder<'_, '_, M> {
     fn value(&mut self, target: Target) -> Result<u64, ImageError> {
         let found = match target.space {
             Space::Func => self.func(target.symbol).map(|slot| self.memory.thunk(slot)),
-            Space::Outside => self.outside_value(target.symbol),
+            Space::Outside | Space::WeakOutside => self.outside_value(target.symbol, target.space == Space::WeakOutside),
             // A vtable's first word (a supertrait's table, in a vtable's datum) is its datum's.
             Space::Static | Space::Vtable => self.static_at(target.symbol).map(|it| it.at),
             Space::Tls => {
@@ -1970,7 +1976,7 @@ impl<B: Bind> Memory for NativeMemory<'_, B> {
         self.at(self.layout.thunks + slot.index() * crate::arch::THUNK)
     }
 
-    fn outside(&mut self, record: RecordId, symbol: CodeSymbol, name: &str) -> Result<Outside, RunModeError> {
+    fn outside(&mut self, record: RecordId, symbol: CodeSymbol, name: &str, weak: bool) -> Result<Outside, RunModeError> {
         let found = self.outside.binary_search_by_key(&symbol, |&(it, _)| it);
         let index = match found {
             Ok(at) => self.outside[at].1,
@@ -1993,11 +1999,16 @@ impl<B: Bind> Memory for NativeMemory<'_, B> {
                 //    `_Unwind_RaiseException`, and telemetry wrappers are never bypassed.
                 // 2. Otherwise, a run with its native library binds through the library handle;
                 //    without one, through the run's strategy (`Dlsym` or `Table`).
+                //    For `Space::WeakOutside` (`weak == true`), a missing symbol resolves to 0.
                 let address = match self.bind.intercept(name) {
                     Some(addr) => addr,
                     None => match self.natives.as_mut() {
-                        Some(natives) => crate::native_lib::bind(Some(natives), record, symbol, name)?,
-                        None => self.bind.address(name, cname).map_err(|err| refused(err.reason()))?,
+                        Some(natives) => crate::native_lib::bind(Some(natives), record, symbol, name, weak)?,
+                        None => match self.bind.address(name, cname) {
+                            Ok(addr) => addr,
+                            Err(bind::BindError::NotFound) if weak => 0,
+                            Err(err) => return Err(refused(err.reason())),
+                        },
                     },
                 };
                 self.code.store(self.layout.outside + count as usize * 8, address).map_err(RunModeError::Sys)?;
@@ -2008,6 +2019,14 @@ impl<B: Bind> Memory for NativeMemory<'_, B> {
         let word = self.at(self.layout.outside + index as usize * 8);
         // SAFETY: the word stored above, in a mapping never unmapped; only this thread writes it.
         let value = unsafe { (word as *const u64).read() };
+        if !weak && value == 0 {
+            return Err(RunModeError::Outside {
+                record,
+                symbol,
+                name: CName::new(name),
+                why: bind::BindError::NotFound.reason(),
+            });
+        }
         Ok(Outside { word, value })
     }
 
@@ -2954,7 +2973,7 @@ mod position_tests {
         fn word(&self, _: SlotId) -> u64 { unreachable!("no calls") }
         fn address_word(&self, _: SlotId) -> u64 { unreachable!("no function address loads") }
         fn thunk(&self, _: SlotId) -> u64 { unreachable!("no function addresses") }
-        fn outside(&mut self, _: RecordId, _: CodeSymbol, _: &str) -> Result<Outside, RunModeError> { unreachable!("no C names") }
+        fn outside(&mut self, _: RecordId, _: CodeSymbol, _: &str, _: bool) -> Result<Outside, RunModeError> { unreachable!("no C names") }
         fn reserve(&mut self, len: usize, align: usize) -> Result<u64, RunModeError> {
             let at = self.next.next_multiple_of(align as u64);
             self.next = at + len as u64;
@@ -3237,5 +3256,113 @@ mod eager_open_dst {
     fn control_missing_drop_wake_and_missing_init_err_stop_are_caught() {
         control(Config::cases(1_000), Plant::None, Plant::SkipDropWake, "deadlock between initial thread and control thread", run_case);
         control(Config::cases(1_000), Plant::None, Plant::SkipInitErrStop, "deadlock between initial thread and control thread", run_case);
+    }
+}
+
+#[cfg(test)]
+mod weak_outside_tests {
+    use core::ffi::CStr;
+
+    use blaze_code::place::Words;
+    use blaze_code::record::{CodeRecord, CodeView, Space, Symbol as CodeSymbol, Target};
+    use blaze_launch::wire::RecordId;
+    use blaze_own::{Alloc, SharedAlloc, Vec};
+
+    use super::bind::{Bind, BindError};
+    use super::{Binder, Memory, Names, NativeMemory, RunMode, RunModeError};
+
+    const PRESENT_ADDR: u64 = 0x0000_0000_1234_5678;
+
+    struct FakeBind;
+
+    impl Bind for FakeBind {
+        fn address(&mut self, name: &str, _cname: &CStr) -> Result<u64, BindError> {
+            match name {
+                "present_sym" => Ok(PRESENT_ADDR),
+                _ => Err(BindError::NotFound),
+            }
+        }
+    }
+
+    /// Rule 23 test for `NativeMemory::outside` + `Binder` on `Space::WeakOutside` vs `Space::Outside`:
+    /// - weak missing symbol binds its import word and value to 0 (null)
+    /// - weak present symbol binds to its real address
+    /// - strong missing symbol is refused with `RunModeError::Outside`
+    /// - strong reference to a symbol previously cached as 0 via weak MUST still be refused!
+    #[test]
+    fn native_memory_and_binder_handle_weak_and_strong_outside() {
+        let alloc = Alloc::global();
+        let Ok(reg) = crate::unwind_reg::Registry::new_in(16, SharedAlloc::global()) else {
+            panic!("unwind registry allocates");
+        };
+        let reg: &'static crate::unwind_reg::Registry = std::boxed::Box::leak(std::boxed::Box::new(reg));
+        let Ok(unwind) = reg.writer() else {
+            panic!("unwind registry writer");
+        };
+        let Ok(mut memory) = NativeMemory::new(FakeBind, alloc, unwind) else {
+            panic!("NativeMemory::new must allocate code reservation");
+        };
+        let record = RecordId([0xAB; 32]);
+        let missing_sym = CodeSymbol::of_name("missing_weak_sym");
+        let present_sym = CodeSymbol::of_name("present_sym");
+        let strong_missing_sym = CodeSymbol::of_name("missing_strong_sym");
+
+        // 1. Weak missing symbol -> binds to 0 (not an error!).
+        let Ok(weak_missing) = memory.outside(record, missing_sym, "missing_weak_sym", true) else {
+            panic!("weak missing symbol must bind to 0");
+        };
+        assert_eq!(weak_missing.value, 0);
+        // SAFETY: `weak_missing.word` is the live outside import word slot inside `memory`.
+        let word_val = unsafe { (weak_missing.word as *const u64).read() };
+        assert_eq!(word_val, 0);
+
+        // 2. Strong reference to the SAME symbol that was previously cached as 0 via weak -> MUST FAIL!
+        let strong_after_weak = memory.outside(record, missing_sym, "missing_weak_sym", false);
+        assert!(
+            matches!(strong_after_weak, Err(RunModeError::Outside { symbol, .. }) if symbol == missing_sym),
+            "strong reference after weak-missing cache must still be refused: {strong_after_weak:?}"
+        );
+
+        // 3. Weak present symbol -> binds to PRESENT_ADDR.
+        let Ok(weak_present) = memory.outside(record, present_sym, "present_sym", true) else {
+            panic!("weak present symbol must bind to its real address");
+        };
+        assert_eq!(weak_present.value, PRESENT_ADDR);
+        // SAFETY: `weak_present.word` is the live outside import word slot inside `memory`.
+        let present_word_val = unsafe { (weak_present.word as *const u64).read() };
+        assert_eq!(present_word_val, PRESENT_ADDR);
+
+        // 4. Strong missing symbol -> refused with `RunModeError::Outside`.
+        let strong_missing = memory.outside(record, strong_missing_sym, "missing_strong_sym", false);
+        assert!(
+            matches!(strong_missing, Err(RunModeError::Outside { symbol, .. }) if symbol == strong_missing_sym),
+            "strong missing symbol must be refused: {strong_missing:?}"
+        );
+
+        // 5. Through `Binder` (Words::word and Words::value) over a sealed `CodeView`.
+        let mut rec = CodeRecord::new_in(alloc);
+        rec.code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes());
+        rec.weak_outside("missing_weak_sym");
+        rec.weak_outside("present_sym");
+        rec.outside("missing_strong_sym");
+        let mut bytes = Vec::new_in(alloc);
+        let Ok(sealed) = rec.seal() else { panic!("record seals") };
+        sealed.encode(&mut bytes);
+        let Ok(view) = CodeView::read(&bytes) else { panic!("view reads") };
+        let mut mode = RunMode::new(alloc);
+        let mut binder = Binder {
+            record,
+            names: Names::Code(view),
+            slots: &mut mode.slots,
+            statics: &mode.statics,
+            thread_locals: &mut mode.thread_locals,
+            memory: &mut memory,
+            refused: None,
+        };
+        assert_eq!(binder.value(Target { space: Space::WeakOutside, symbol: missing_sym }), Ok(0));
+        assert_eq!(binder.value(Target { space: Space::WeakOutside, symbol: present_sym }), Ok(PRESENT_ADDR));
+        assert!(binder.word(Target { space: Space::WeakOutside, symbol: missing_sym }, false).is_ok());
+        assert!(binder.value(Target { space: Space::Outside, symbol: strong_missing_sym }).is_err());
+        assert!(matches!(binder.refused, Some(RunModeError::Outside { symbol, .. }) if symbol == strong_missing_sym));
     }
 }

@@ -2176,6 +2176,10 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                 Space::Func | Space::Static => (Target { space: Space::Outside, symbol: Symbol::of_name(name) }, Some(name)),
                 _ => return Err(refused(self.inst, "a C name for a vtable or a thread-local")),
             },
+            Named::WeakC(name) => match space {
+                Space::Func | Space::Static => (Target { space: Space::WeakOutside, symbol: Symbol::of_name(name) }, Some(name)),
+                _ => return Err(refused(self.inst, "a C name for a vtable or a thread-local")),
+            },
         };
         Ok(self.intern(target, name))
     }
@@ -2329,7 +2333,7 @@ impl<'v, 'r, 'a> Composer<'v, 'r, 'a> {
                     Some(RefKind::Tls) | None => return Err(refused_fn("the address of a thread-local in data (it differs per thread)")),
                 };
                 let t = self.target_of(of, space)?;
-                if self.out.targets[t as usize].space == Space::Outside && r.addend != 0 {
+                if usize::try_from(t).ok().and_then(|idx| self.out.targets.get(idx)).is_some_and(|tgt| tgt.space.is_outside()) && r.addend != 0 {
                     return Err(refused_fn("data holding a C name's address plus an addend"));
                 }
                 self.out.words.push(RelroWord { at: word, target: t, addend: r.addend });

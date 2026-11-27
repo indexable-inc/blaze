@@ -48,7 +48,7 @@ pub use module::{CompiledModuleFn, ModuleFn, SotaModuleOpts, SotaModuleOut, comp
 #[cfg(test)]
 mod tests;
 
-use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, TrapRow, TrapSource, Word};
+use blaze_code::record::{CodeRecord, NO_TARGET, OWN_CODE, OWN_RELRO, Site, SiteKind, Space, TrapRow, TrapSource, Word};
 use blaze_lir::{
     Block, BlockKind, Op, Verified,
     amac::{AmacOpts, interleave_amac_loops},
@@ -721,11 +721,13 @@ fn emitted_to_code_record<'a>(
     let mut target_remap: blaze_own::Vec<u32, Alloc<'a>> =
         blaze_own::Vec::with_capacity_in(emitted.targets.len(), alloc);
     for t in emitted.targets.iter() {
-        if let Some(&(_, start, len)) = emitted.names.iter().find(|(sym, _, _)| *sym == t.symbol) {
+        if t.space.is_outside() {
+            let &(_, start, len) = emitted.names.iter().find(|(sym, _, _)| *sym == t.symbol)?;
             let start_idx = usize::try_from(start).ok()?;
             let end_idx = usize::try_from(start.checked_add(len)?).ok()?;
             let s = core::str::from_utf8(emitted.text.get(start_idx..end_idx)?).ok()?;
-            target_remap.push(rec.outside(s));
+            let idx = if t.space == Space::WeakOutside { rec.weak_outside(s) } else { rec.outside(s) };
+            target_remap.push(idx);
         } else {
             let idx = u32::try_from(rec.targets.len()).ok()?;
             rec.targets.push(*t);

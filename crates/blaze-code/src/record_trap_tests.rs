@@ -38,7 +38,7 @@ fn traps_seal_by_offset_and_read_back() {
     assert_eq!(view.trap_at(8), None, "a `ret` has no row");
     assert_eq!(view.trap_at(0), None);
     assert_eq!(view.trap_at(16), None);
-    assert_eq!(&one[..8], b"bzcode07");
+    assert_eq!(&one[..8], b"bzcode09");
 }
 
 #[test]

@@ -587,7 +587,7 @@ pub(crate) fn check_record_purity(bytes: &[u8]) -> Result<(), NotKept> {
     };
     for i in 0..view.targets() {
         let target = view.target(i);
-        if target.space == Space::Outside {
+        if target.space.is_outside() {
             let Some(name) = view.name(target.symbol) else {
                 return Err(NotKept::Foreign);
             };
@@ -631,7 +631,7 @@ pub(crate) fn check_datum_purity(bytes: &[u8]) -> Result<(), NotKept> {
     };
     for i in 0..view.targets() {
         let target = view.target(i);
-        if target.space == Space::Outside {
+        if target.space.is_outside() {
             let Some(name) = view.name(target.symbol) else {
                 return Err(NotKept::Foreign);
             };

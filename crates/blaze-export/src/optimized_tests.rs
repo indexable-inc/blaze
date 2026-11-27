@@ -71,7 +71,7 @@ impl Declares for BySpace {
             Space::Static => d(DeclaredKind::Static, b""),
             Space::Vtable => d(DeclaredKind::Vtable, b"a vtable"),
             Space::Tls => d(DeclaredKind::ThreadLocal, b""),
-            Space::Outside => None,
+            Space::Outside | Space::WeakOutside => None,
         }
     }
 }

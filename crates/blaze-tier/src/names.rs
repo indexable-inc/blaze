@@ -48,6 +48,10 @@ pub enum Named<'n> {
     /// A C library name the launcher binds with `dlsym` (`Space::Outside`): a function or a
     /// static only, and with no addend.
     C(&'n str),
+    /// A weak C library name (`#[linkage = "extern_weak"]`) the launcher binds with `dlsym`
+    /// (`Space::WeakOutside`), resolving to null (0) when undefined: a function or a static only,
+    /// and with no addend.
+    WeakC(&'n str),
 }
 
 /// The caller's names for what the function references: the run path knows which instance,

@@ -73,6 +73,16 @@ pub enum BuiltCallee {
     C { start: u32, len: u32 },
 }
 
+/// One foreign (`extern`) static in a [`BuiltLir`] body: its item key, offset span into
+/// [`BuiltLir::c_text`], and whether it carries `#[linkage = "extern_weak"]`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BuiltForeignStatic {
+    pub item: ItemKey,
+    pub start: u32,
+    pub len: u32,
+    pub weak: bool,
+}
+
 /// One instance lowered to verified LIR with all outside references resolved, before machine-code
 /// emission (used by [`export_lto`] for whole-program cross-function inlining and LTO).
 pub struct BuiltLir<A: core::alloc::Allocator> {
@@ -81,8 +91,8 @@ pub struct BuiltLir<A: core::alloc::Allocator> {
     pub funcs: blaze_own::Vec<BuiltCallee, A>,
     /// Static items in `func.refs` order.
     pub statics: blaze_own::Vec<ItemKey, A>,
-    /// Foreign (`extern`) statics among `statics`: `(item, start, len)` into `c_text`.
-    pub c_statics: blaze_own::Vec<(ItemKey, u32, u32), A>,
+    /// Foreign (`extern`) statics among `statics`.
+    pub c_statics: blaze_own::Vec<BuiltForeignStatic, A>,
     /// Vtable symbols in `func.refs` order.
     pub vtables: blaze_own::Vec<blaze_code::record::Symbol, A>,
     /// Encoded vtable datums needed by `vtables` (and their supertraits).
@@ -107,8 +117,13 @@ impl<A: core::alloc::Allocator> BuiltLir<A> {
 
     /// Returns the C static symbol name for `item`, if it is a foreign static.
     pub fn foreign_static_name(&self, item: ItemKey) -> Option<&str> {
-        let &(_, start, len) = self.c_statics.iter().find(|(k, _, _)| *k == item)?;
-        self.c_str(start, len)
+        self.foreign_static(item).map(|(name, _)| name)
+    }
+
+    /// Returns `(c_name, weak)` for `item`, if it is a foreign static.
+    pub fn foreign_static(&self, item: ItemKey) -> Option<(&str, bool)> {
+        let cs = self.c_statics.iter().find(|cs| cs.item == item)?;
+        Some((self.c_str(cs.start, cs.len)?, cs.weak))
     }
 
     /// Slices a UTF-8 C symbol name out of `self.c_text`.
@@ -686,10 +701,16 @@ impl MakerState {
             Ok(Some((tabled, name)))
         };
         let vtable_target = |key| Ok(vtable_syms.iter().find(|&&(k, _)| k == key).map(|&(_, sym)| sym));
+        let foreign_static = |k| {
+            program.foreign_static(k).map(|cname| {
+                let weak = program.static_item(k).is_some_and(|st| st.extern_weak);
+                (cname, weak)
+            })
+        };
         if template {
-            make_template_entry_with_targets(value, kind, fn_target, vtable_target, extra_declared, carried_vtables, alloc)
+            make_template_entry_with_targets(value, kind, fn_target, vtable_target, foreign_static, extra_declared, carried_vtables, alloc)
         } else {
-            make_static_entry_with_targets(value, kind, fn_target, vtable_target, extra_declared, carried_vtables, alloc)
+            make_static_entry_with_targets(value, kind, fn_target, vtable_target, foreign_static, extra_declared, carried_vtables, alloc)
         }
     }
 
@@ -2467,10 +2488,11 @@ fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
     for &table in built.vtables.iter() {
         vtables.push(vtable_symbol(table, work.ground.view(), work.alloc).map_err(sym)?);
     }
-    let mut c_statics: AVec<'_, (ItemKey, &str)> = blaze_own::Vec::new_in(work.alloc);
+    let mut c_statics: AVec<'_, crate::code_records::ForeignStatic<'_>> = blaze_own::Vec::new_in(work.alloc);
     for &s in built.statics.iter() {
         if let Some(c) = asking.foreign_static(s) {
-            c_statics.push((s, c));
+            let weak = asking.world().static_item(s).is_some_and(|st| st.extern_weak);
+            c_statics.push(crate::code_records::ForeignStatic { item: s, name: c, weak });
         }
     }
     // Absorb Phase 2's clean read log into `work.reads` (which applies `work.reads.plant`).
@@ -2507,10 +2529,10 @@ fn resolve_and_emit_phase<'a, P: FrontEnd, A: core::alloc::Allocator + Copy>(
                     }
                 }
             }
-            let mut lir_c_statics: blaze_own::Vec<(ItemKey, u32, u32), A> = blaze_own::Vec::with_capacity_in(c_statics.len(), out_alloc);
-            for &(item, cname) in c_statics.iter() {
-                let (start, len) = push_c(cname)?;
-                lir_c_statics.push((item, start, len));
+            let mut lir_c_statics: blaze_own::Vec<BuiltForeignStatic, A> = blaze_own::Vec::with_capacity_in(c_statics.len(), out_alloc);
+            for cs in c_statics.iter() {
+                let (start, len) = push_c(cs.name)?;
+                lir_c_statics.push(BuiltForeignStatic { item: cs.item, start, len, weak: cs.weak });
             }
             let mut lir_statics: blaze_own::Vec<ItemKey, A> = blaze_own::Vec::with_capacity_in(built.statics.len(), out_alloc);
             lir_statics.extend_from_slice(&built.statics);

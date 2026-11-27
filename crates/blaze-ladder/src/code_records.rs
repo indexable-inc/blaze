@@ -355,6 +355,15 @@ pub enum Callee<'n> {
     C(&'n str),
 }
 
+/// One foreign (`extern`) static referenced by a function: its item key, its C symbol name, and
+/// whether it carries `#[linkage = "extern_weak"]` (resolves to null when undefined).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ForeignStatic<'n> {
+    pub item: ItemKey,
+    pub name: &'n str,
+    pub weak: bool,
+}
+
 /// The names of what one built instance references, by reference place (blaze-build's
 /// `Built::refs`, `statics`, `vtables`, `thread_locals`): `blaze_emit::Names` over the run's
 /// tables, replacing `Target::Slot` and the `via` table.
@@ -364,10 +373,10 @@ pub struct InstanceNames<'n> {
     /// declared by the entry, so the run's parent can send it before the record.
     pub statics: &'n [ItemKey],
     /// The statics among `statics` an `extern` block declares, each with its C symbol (its
-    /// `#[link_name]`, else its name): its place is that symbol (bound as a foreign fn is,
-    /// blaze-emit record.rs `target_of`), and the entry does not declare it, since it has no
-    /// record of its own (the Reference, "External blocks", "Statics": no initializer).
-    pub c_statics: &'n [(ItemKey, &'n str)],
+    /// `#[link_name]`, else its name) and weak flag: its place is that symbol (bound as a foreign
+    /// fn is, blaze-emit record.rs `target_of`), and the entry does not declare it, since it has
+    /// no record of its own (the Reference, "External blocks", "Statics": no initializer).
+    pub c_statics: &'n [ForeignStatic<'n>],
     pub vtables: &'n [Symbol],
     /// The thread-locals, by item key: each is named by its symbol (symbols.rs `tls_symbol`)
     /// and declared by the entry, so the run's parent can send its template before the record.
@@ -382,8 +391,9 @@ impl Names for InstanceNames<'_> {
                 Callee::Symbol(symbol) => Named::Symbol(symbol),
                 Callee::C(name) => Named::C(name),
             }),
-            Outside::Static(place) => self.statics.get(at(place)).map(|&s| match self.c_statics.iter().find(|(k, _)| *k == s) {
-                Some(&(_, c)) => Named::C(c),
+            Outside::Static(place) => self.statics.get(at(place)).map(|&s| match self.c_statics.iter().find(|cs| cs.item == s) {
+                Some(cs) if cs.weak => Named::WeakC(cs.name),
+                Some(cs) => Named::C(cs.name),
                 None => Named::Symbol(static_symbol(s)),
             }),
             Outside::Vtable(place) => self.vtables.get(at(place)).map(|&s| Named::Symbol(s)),
@@ -573,7 +583,7 @@ pub fn make_entry_with_vtables<'a, 'd>(
     }
     // A foreign static has no entry to send (its place is its C symbol): not declared.
     let mut own: AVec<'_, ItemKey> = Vec::with_capacity_in(names.statics.len(), alloc);
-    own.extend(names.statics.iter().copied().filter(|s| !names.c_statics.iter().any(|(k, _)| k == s)));
+    own.extend(names.statics.iter().copied().filter(|s| !names.c_statics.iter().any(|cs| cs.item == *s)));
     put_statics(&own, &mut out, alloc).map_err(|what| CodeRecordError::Seal(RecordError::TooLarge { what }))?;
     // Form 5: the thread-locals, in the same keys form (each one's template is sent before the
     // record, as a static is).
@@ -1174,7 +1184,7 @@ pub fn instance_declares(
             d.instance(row.tabled, row.name).map_err(large)?;
         }
     }
-    for &s in names.statics.iter().filter(|s| !names.c_statics.iter().any(|(k, _)| k == *s)) {
+    for &s in names.statics.iter().filter(|s| !names.c_statics.iter().any(|cs| cs.item == **s)) {
         d.static_item(s).map_err(large)?;
     }
     let mut trees: AVec<'_, u8> = Vec::new_in(alloc);

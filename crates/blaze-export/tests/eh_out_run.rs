@@ -479,7 +479,7 @@ impl Declares for TlsTestDeclares {
             Space::Static => Some(Declare { kind: DeclaredKind::TlsDescriptor, item: 0, name: &[] }),
             Space::Vtable => Some(Declare { kind: DeclaredKind::Vtable, item: 1, name: b"vt" }),
             Space::Tls => Some(Declare { kind: DeclaredKind::ThreadLocal, item: 1, name: &[] }),
-            Space::Outside => None,
+            Space::Outside | Space::WeakOutside => None,
         }
     }
 }

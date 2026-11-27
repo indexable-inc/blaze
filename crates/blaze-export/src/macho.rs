@@ -101,6 +101,8 @@ const N_SECT: u8 = 0x0e;
 const N_UNDEF_EXT: u8 = 0x01;
 /// `SET_LIBRARY_ORDINAL(n_desc, 1)`: libSystem, the first `LC_LOAD_DYLIB`.
 const LIBSYSTEM_ORDINAL: u16 = 1 << 8;
+/// `N_WEAK_REF` (`<mach-o/nlist.h>`): undefined weak reference (`#[linkage = "extern_weak"]`).
+const N_WEAK_REF: u16 = 0x0040;
 
 /// `__TEXT`'s sections, each always written (an empty one has size 0): `__text`, `__eh_frame`,
 /// `__gcc_except_tab`, `__unwind_info`.
@@ -468,7 +470,10 @@ fn chained<'a>(laid: &Laid<'_, '_>, native: Option<&Merged<'_, '_>>, segs: &[Seg
     let program = kept.len();
     let import = |i: usize| match (i.checked_sub(program), native) {
         (Some(k), Some(m)) => m.imports[k],
-        _ => ChainImport { lead: b"_", name: laid.imports[kept[i] as usize].name.as_bytes(), ordinal: 1, weak: false, addend: 0 },
+        _ => match kept.get(i).and_then(|&k| usize::try_from(k).ok()).and_then(|k| laid.imports.get(k)) {
+            Some(imp) => ChainImport { lead: b"_", name: imp.name.as_bytes(), ordinal: 1, weak: imp.weak, addend: 0 },
+            None => ChainImport { lead: b"_", name: b"", ordinal: 1, weak: false, addend: 0 },
+        },
     };
     let (rows, count) = match native {
         None => (ImportRows::Plain, program),
@@ -659,7 +664,7 @@ pub fn write_native<'a>(
         bytes::u32(&mut link, strx);
         bytes::u8(&mut link, N_UNDEF_EXT);
         bytes::u8(&mut link, 0);
-        bytes::u16(&mut link, LIBSYSTEM_ORDINAL);
+        bytes::u16(&mut link, LIBSYSTEM_ORDINAL | if import.weak { N_WEAK_REF } else { 0 });
         bytes::u64(&mut link, 0);
         let step = import
             .name

@@ -886,6 +886,7 @@ struct Attrs<'t> {
     intrinsic: bool,
     repr: ReprAttrs,
     thread_local: bool,
+    extern_weak: bool,
 }
 
 /// One `#[repr(..)]`'s arguments folded into `out`: `C`, `transparent`, an integer type,
@@ -1054,6 +1055,7 @@ fn read_attrs<'t>(v: &View<'t>, list: lf::List, at: At, blaze: &mut BlazeAttrs) 
             "link_name" => out.link_name = Some(value()),
             "rustc_intrinsic" => out.intrinsic = true,
             "thread_local" => out.thread_local = true,
+            "linkage" if value() == "extern_weak" => out.extern_weak = true,
             "" | "doc" | "allow" | "warn" | "deny" | "expect" | "forbid" | "inline" | "cold" | "must_use" | "track_caller" => {}
             "repr" => read_repr(args, r, &mut out.repr)?,
             "derive" => return Err(Why::Unsupported("`#[derive(..)]`", r)),
@@ -1803,7 +1805,7 @@ impl<'f> Front<'f> {
             (None, false) => None,
         };
         if kind == FnKind::Static {
-            self.statics.push((key, StaticItem { thread_local: attrs.thread_local, mutable: flags & sig::MUT != 0, extern_weak: false }));
+            self.statics.push((key, StaticItem { thread_local: attrs.thread_local, mutable: flags & sig::MUT != 0, extern_weak: attrs.extern_weak }));
         } else if attrs.thread_local {
             return Err(Why::Unsupported("`#[thread_local]` on other than a `static`", whole).at(at));
         }

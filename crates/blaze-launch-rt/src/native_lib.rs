@@ -309,20 +309,25 @@ impl NativeLoad {
 }
 
 /// Binds C name `name` (code record symbol `symbol`, named by record `record`) through the
-/// loaded library: its address. `natives` is `None` before the parent's `Native` was loaded.
-pub fn bind<N: Natives>(natives: Option<&mut N>, record: RecordId, symbol: CodeSymbol, name: &str) -> Result<u64, RunModeError> {
+/// loaded library: its address (or 0 when `weak` is true and no library defines it). `natives`
+/// is `None` before the parent's `Native` was loaded.
+pub fn bind<N: Natives>(natives: Option<&mut N>, record: RecordId, symbol: CodeSymbol, name: &str, weak: bool) -> Result<u64, RunModeError> {
     let Some(natives) = natives else {
         return Err(RunModeError::NoNativeLibrary { symbol });
     };
     if name.len() >= NAME_MOST || name.as_bytes().contains(&0) {
         return Err(RunModeError::Outside { record, symbol, name: CName::new(name), why: "its name is longer than 511 bytes or holds a NUL" });
     }
-    natives.lookup(name).ok_or(RunModeError::Outside {
-        record,
-        symbol,
-        name: CName::new(name),
-        why: "neither the program's native library nor a library it loads defines it (`dlsym` on its handle)",
-    })
+    match natives.lookup(name) {
+        Some(address) => Ok(address),
+        None if weak => Ok(0),
+        None => Err(RunModeError::Outside {
+            record,
+            symbol,
+            name: CName::new(name),
+            why: "neither the program's native library nor a library it loads defines it (`dlsym` on its handle)",
+        }),
+    }
 }
 
 /// The store's file of `id` under `folder` (no trailing `/`), NUL-terminated, in `out`: its

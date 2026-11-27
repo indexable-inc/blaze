@@ -976,7 +976,7 @@ pub(crate) fn check_misel_subset(
                         let outside = Outside::Vtable(ref_rec.place);
                         match names.name(outside) {
                             Some(Named::Symbol(_)) => {}
-                            Some(Named::C(_)) => {
+                            Some(Named::C(_) | Named::WeakC(_)) => {
                                 return Err(refuse(Some(inst), "C name for vtable"));
                             }
                             None => return Err(TierError::NoName { tier: TIER, of: outside }),
@@ -1014,7 +1014,7 @@ pub(crate) fn check_misel_subset(
                                     let outside = Outside::Vtable(target.place);
                                     match names.name(outside) {
                                         Some(Named::Symbol(_)) => {}
-                                        Some(Named::C(_)) => {
+                                        Some(Named::C(_) | Named::WeakC(_)) => {
                                             return Err(refuse(Some(inst), "C name for vtable in data"));
                                         }
                                         None => {
@@ -1249,7 +1249,7 @@ pub(crate) fn check_misel_subset(
                 let call_fast = is_internal_fast_call(opts.internal_fast_calls, inst);
                 match names.name(outside) {
                     None => return Err(TierError::NoName { tier: TIER, of: outside }),
-                    Some(Named::C(_)) if call_fast => {
+                    Some(Named::C(_) | Named::WeakC(_)) if call_fast => {
                         return Err(refuse(Some(inst), "InternalFast on extern C call"));
                     }
                     Some(_) => {}
@@ -1313,7 +1313,7 @@ pub(crate) fn check_misel_subset(
                 let call_fast = is_internal_fast_call(opts.internal_fast_calls, inst);
                 match names.name(outside) {
                     None => return Err(TierError::NoName { tier: TIER, of: outside }),
-                    Some(Named::C(_)) if call_fast => {
+                    Some(Named::C(_) | Named::WeakC(_)) if call_fast => {
                         return Err(refuse(Some(inst), "InternalFast on extern C invoke"));
                     }
                     Some(_) => {}
@@ -1417,6 +1417,10 @@ impl<'a> TargetTable<'a> {
     }
 
     fn intern_c_name(&mut self, c_name: &str) -> Result<u32, TierError> {
+        self.intern_c_name_in_space(c_name, Space::Outside)
+    }
+
+    fn intern_c_name_in_space(&mut self, c_name: &str, space: Space) -> Result<u32, TierError> {
         let sym = Symbol::of_name(c_name);
         let mut have_name = false;
         for &(existing_sym, _, _) in self.names.iter() {
@@ -1435,7 +1439,7 @@ impl<'a> TargetTable<'a> {
             }
             self.names.push((sym, start, len));
         }
-        self.intern_target(Target { space: Space::Outside, symbol: sym })
+        self.intern_target(Target { space, symbol: sym })
     }
 
     fn intern_outside(
@@ -1455,7 +1459,13 @@ impl<'a> TargetTable<'a> {
                 if !allow_c_name {
                     return Err(refuse(Some(inst), "C name for non-func/static"));
                 }
-                self.intern_c_name(c_name)
+                self.intern_c_name_in_space(c_name, Space::Outside)
+            }
+            Named::WeakC(c_name) => {
+                if !allow_c_name {
+                    return Err(refuse(Some(inst), "C name for non-func/static"));
+                }
+                self.intern_c_name_in_space(c_name, Space::WeakOutside)
             }
         }
     }
@@ -1467,7 +1477,8 @@ impl<'a> TargetTable<'a> {
         };
         match named {
             Named::Symbol(sym) => self.intern_target(Target { space: Space::Func, symbol: sym }),
-            Named::C(c_name) => self.intern_c_name(c_name),
+            Named::C(c_name) => self.intern_c_name_in_space(c_name, Space::Outside),
+            Named::WeakC(c_name) => self.intern_c_name_in_space(c_name, Space::WeakOutside),
         }
     }
 }
