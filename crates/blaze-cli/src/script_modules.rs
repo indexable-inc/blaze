@@ -28,7 +28,10 @@ use crate::scripts::RanAs;
 const SUBJECT_DOMAIN: &str = "blaze-cli build-script module subject 4";
 // "2": wasm build-script module lookups require `script_unit::MODULE_HEADER` (v4), invalidating
 // cached `MacroModule` task records that pointed at pre-v4 modules.
-const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 2";
+// "3": wasm build-script module lookups require `script_unit::WASM_MODULE_HEADER` (v5) after
+// `blaze-build` `bind_let_place` peeled-reference deref fix, invalidating cached `MacroModule`
+// task records that pointed at stale v4 wasm build-script modules.
+const SOURCE_DOMAIN: &str = "blaze-cli build-script module source 3";
 const OUT_DOMAIN: &str = "blaze-cli build-script module out 2";
 
 /// The rule a lookup's failure names.
