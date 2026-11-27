@@ -722,6 +722,28 @@ macro_rules! cfg_aliases {
             }
         )*
     };
+    (@parser_emit all $({$($grouped:tt)+})+) => {
+        ($(
+            ($crate::cfg_aliases!(@parser $($grouped)+))
+        )&&+)
+    };
+    (@parser_emit any $({$($grouped:tt)+})+) => {
+        ($(
+            ($crate::cfg_aliases!(@parser $($grouped)+))
+        )||+)
+    };
+    (@parser_clause $op:ident [$({$($grouped:tt)+})*] [, $($rest:tt)*] $($current:tt)+) => {
+        $crate::cfg_aliases!(@parser_clause $op [$({$($grouped)+})* {$($current)+}] [$($rest)*]);
+    };
+    (@parser_clause $op:ident [$({$($grouped:tt)+})*] [$tok:tt $($rest:tt)*] $($current:tt)*) => {
+        $crate::cfg_aliases!(@parser_clause $op [$({$($grouped)+})*] [$($rest)*] $($current)* $tok);
+    };
+    (@parser_clause $op:ident [$({$($grouped:tt)+})*] [] $($current:tt)+) => {
+        $crate::cfg_aliases!(@parser_emit $op $({$($grouped)+})* {$($current)+});
+    };
+    (@parser all($($tokens:tt)+)) => { $crate::cfg_aliases!(@parser_clause all [] [$($tokens)+]) };
+    (@parser any($($tokens:tt)+)) => { $crate::cfg_aliases!(@parser_clause any [] [$($tokens)+]) };
+    (@parser not($($tokens:tt)+)) => { !($crate::cfg_aliases!(@parser $($tokens)+)) };
     (@parser target_os = $v:literal) => { true };
     (@parser $alias:ident) => { __cfg_aliases_matcher__!($alias) };
     (@cfg_is_set $e:ident) => {{
@@ -737,11 +759,22 @@ macro_rules! cfg_aliases {
 #![no_core]
 #![no_main]
 
+macro_rules! local_semi {
+    () => {
+        1u8;
+    };
+}
+
 pub fn main() {
     cfg_aliases::cfg_aliases! {
         linux: { target_os = \"linux\" },
         my_alias: { linux },
+        combined: { all(linux, not(any(my_alias, target_os = \"macos\"))) },
     }
+}
+
+pub fn local_semi_err() -> u8 {
+    local_semi!()
 }
 ";
     const MAIN_PATH: &str = "/build_app/src/main.rs";
@@ -813,21 +846,34 @@ pub fn main() {
         .path(names.root(0), false, &["main"], Ns::Value)
         .unwrap_or_else(|e| panic!("`main` from root: {e:?}"))
         .key;
+    let local_semi_err = Paths { names: &names }
+        .path(names.root(0), false, &["local_semi_err"], Ns::Value)
+        .unwrap_or_else(|e| panic!("`local_semi_err` from root: {e:?}"))
+        .key;
     let fns = [("main", Asked::Free(main))];
     let mut failed = Vec::new();
 
     let sources = [SourceFile { path: "src/main.rs", text: BUILD_MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
-    let solved = {
+    let (solved, local_names_err) = {
         let mut front = Front2::new(&names, &frame, &sources, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("front2: {e}"));
-        rows(&names, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &fns, &mut failed)
+        let solved = rows(&names, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &fns, &mut failed);
+        let prepared = Prepares::new_in(blaze_own::testing::bump());
+        let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
+        let local_err = checked(&names, prepared, &mut front.keys, &front.index, &mut store, Asked::Free(local_semi_err));
+        (solved, local_err)
     };
-    println!("front2_token_mark_bodies cfg_aliases names: {solved}");
+    println!("front2_token_mark_bodies cfg_aliases names: {solved}; local_semi_err: {local_names_err}");
+    assert!(local_names_err.starts_with("does not lower:"), "local macro with trailing `;` must be refused over names: {local_names_err}");
 
     let (records, frame) = reader(keys, crate_names, kept_of(&names));
     let mut front = Front2::from_records(records, frame, &[0, 1, 2]).unwrap_or_else(|e| panic!("front2 over records: {e}"));
     let over_records = rows(records, &front.index, &mut front.keys, front.frame, front.index.lang("sized"), &fns, &mut failed);
-    println!("front2_token_mark_bodies cfg_aliases records: {over_records}");
+    let prepared = Prepares::new_in(blaze_own::testing::bump());
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::testing::heap().alloc());
+    let local_records_err = checked(records, prepared, &mut front.keys, &front.index, &mut store, Asked::Free(local_semi_err));
+    println!("front2_token_mark_bodies cfg_aliases records: {over_records}; local_semi_err: {local_records_err}");
+    assert!(local_records_err.starts_with("does not lower:"), "local macro with trailing `;` must be refused over records: {local_records_err}");
     let errors: Vec<String> = records.errors().iter().map(|e| e.to_string()).collect();
     assert!(errors.is_empty(), "the records filed {errors:?}");
     assert!(failed.is_empty(), "cfg_aliases bodies that did not check clean: {failed:?}");
