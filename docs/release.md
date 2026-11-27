@@ -31,12 +31,12 @@ availability, not for content.
 A version is one release for good, and a native archive's name carries its hash (a rebuild gets
 a new name), so the immutable keys never change bytes and are cached at the edge and by clients.
 
-`.github/scripts/r2.py` owns the layout: given a release's assets, a native build or the
-pointers, it prints the `wrangler r2 object put` commands, which the workflows hand to
-cloudflare/wrangler-action with `CLOUDFLARE_R2_API_TOKEN` (the token reaches wrangler alone).
-llvm.yaml puts each LLVM build under `native/` (GitHub has no copy of builds after
-2026-11-05). By hand, logged in with `wrangler login`, `"run": true` puts them itself, which is
-how a published release gets there:
+`.github/scripts/r2.py` owns the layout: `release.yaml` invokes it directly with `"run": true, "s3": true`
+to upload release assets and channel pointers via R2's S3-compatible API (`aws s3api put-object`,
+using `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY`). Without `"run": true`, it
+prints `wrangler r2 object put` commands for `llvm.yaml` (`cloudflare/wrangler-action`). By hand,
+either with the `R2_*` env vars set or logged in with `wrangler login`, `"run": true` puts them
+itself, which is how a published release gets there:
 
     gh release download v0.YYYYMMDD.N -R indexable-inc/blaze -D out
     python3 -I .github/scripts/r2.py '{"kind": "release", "tag": "v0.YYYYMMDD.N", "dir": "out", "run": true}'
