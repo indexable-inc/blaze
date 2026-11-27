@@ -81,8 +81,20 @@ pub struct ChangedFileDetail {
     pub deleted_lines: Option<u32>,
 }
 
+/// Compact commit entry with diff churn (`+added` / `-deleted`) for the visual branch commit graph.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchCommit {
+    pub short_sha: String,
+    pub time_secs: i64,
+    pub subject: String,
+    pub added_lines: u32,
+    pub deleted_lines: u32,
+    pub files_changed: u32,
+}
+
 /// Relation of the current HEAD to the repository's base branch (`main`/`master`/`origin/...`),
-/// including ahead/behind commit counts and common ancestor (`git merge-base`) commit summary.
+/// including ahead/behind commit counts, total branch diff churn, per-commit graph entries,
+/// and common ancestor (`git merge-base`) commit summary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BranchRelation {
     /// Short display name of the comparison ref (e.g. `"main"`, `"master"`, `"origin/main"`).
@@ -91,12 +103,22 @@ pub struct BranchRelation {
     pub ahead: u32,
     /// Commits reachable from `base_ref` but not from `HEAD`.
     pub behind: u32,
+    /// Aggregate diff stats across `base_ref...HEAD` (`git diff --shortstat`).
+    pub total_added: u32,
+    pub total_deleted: u32,
+    pub total_files: u32,
     /// Abbreviated SHA of the common ancestor (`git merge-base <base_ref> HEAD`).
     pub merge_base_short: String,
     /// Unix timestamp (seconds) of the common ancestor commit.
     pub merge_base_time_secs: i64,
     /// Single-line subject of the common ancestor commit.
     pub merge_base_subject: String,
+    /// Up to 5 newest commits on `HEAD` ahead of `base_ref` (newest first).
+    pub ahead_commits: Vec<BranchCommit>,
+    /// Up to 3 newest commits on `base_ref` behind `HEAD` (newest first).
+    pub behind_commits: Vec<BranchCommit>,
+    /// Up to 3 newest commits at `HEAD` when `ahead == 0 && behind == 0` (up to date).
+    pub recent_commits: Vec<BranchCommit>,
 }
 
 /// Full Starship-class Git prompt summary produced by `blaze-git`.
@@ -1121,13 +1143,52 @@ fn read_branch_relation(
             (String::new(), 0, String::new())
         };
 
+    let (total_files, total_added, total_deleted) = if ahead > 0 {
+        let range = format!("{full_ref}...HEAD");
+        Command::new("git")
+            .arg("-C")
+            .arg(&head.work_tree)
+            .args(["diff", "--shortstat", &range])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| parse_git_shortstat(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or((0, 0, 0))
+    } else {
+        (0, 0, 0)
+    };
+
+    let ahead_commits = if ahead > 0 {
+        read_git_log_commits(&head.work_tree, &format!("{full_ref}..HEAD"), 5)
+    } else {
+        Vec::new()
+    };
+    let behind_commits = if behind > 0 {
+        read_git_log_commits(&head.work_tree, &format!("HEAD..{full_ref}"), 3)
+    } else {
+        Vec::new()
+    };
+    let recent_commits = if ahead == 0 && behind == 0 {
+        read_git_log_commits(&head.work_tree, "HEAD", 3)
+    } else {
+        Vec::new()
+    };
+
     let rel = Some(BranchRelation {
         base_ref: base_ref.clone(),
         ahead,
         behind,
+        total_added,
+        total_deleted,
+        total_files,
         merge_base_short,
         merge_base_time_secs,
         merge_base_subject,
+        ahead_commits,
+        behind_commits,
+        recent_commits,
     });
 
     if let Ok(mut guard) = cache.lock() {
@@ -1145,6 +1206,95 @@ fn read_branch_relation(
         );
     }
     rel
+}
+
+/// Parse one `git diff --shortstat` / `git log --shortstat` summary line into
+/// `(files_changed, added_lines, deleted_lines)`.
+fn parse_git_shortstat(line: &str) -> (u32, u32, u32) {
+    let mut files = 0u32;
+    let mut added = 0u32;
+    let mut deleted = 0u32;
+    for part in line.split(',') {
+        let mut toks = part.split_whitespace();
+        let Some(num_s) = toks.next() else { continue };
+        let Ok(num) = num_s.parse::<u32>() else { continue };
+        let rest = toks.next().unwrap_or("");
+        if rest.starts_with("file") {
+            files = num;
+        } else if rest.starts_with("insertion") {
+            added = num;
+        } else if rest.starts_with("deletion") {
+            deleted = num;
+        }
+    }
+    (files, added, deleted)
+}
+
+/// Fetch up to `limit` commits for `rev_range` with compact `--shortstat` `+`/`-` churn.
+fn read_git_log_commits(work_tree: &Path, rev_range: &str, limit: usize) -> Vec<BranchCommit> {
+    use std::process::{Command, Stdio};
+
+    let max_flag = format!("-n{limit}");
+    let Ok(out) = Command::new("git")
+        .arg("-C")
+        .arg(work_tree)
+        .args([
+            "log",
+            &max_flag,
+            "--shortstat",
+            "--format=\x1e%h\x1f%ct\x1f%s",
+            rev_range,
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut commits = Vec::with_capacity(limit);
+    for rec in text.split('\x1e') {
+        let rec = rec.trim();
+        if rec.is_empty() {
+            continue;
+        }
+        let mut lines = rec.lines();
+        let Some(header) = lines.next() else { continue };
+        let mut fields = header.splitn(3, '\x1f');
+        let Some(sha) = fields.next().map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let time_secs = fields
+            .next()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let subject = fields.next().unwrap_or("").trim().to_owned();
+        let mut files_changed = 0u32;
+        let mut added_lines = 0u32;
+        let mut deleted_lines = 0u32;
+        for stat_line in lines {
+            let trimmed = stat_line.trim();
+            if trimmed.contains("file") || trimmed.contains("insertion") || trimmed.contains("deletion") {
+                let (f, a, d) = parse_git_shortstat(trimmed);
+                files_changed = f;
+                added_lines = a;
+                deleted_lines = d;
+                break;
+            }
+        }
+        commits.push(BranchCommit {
+            short_sha: sha.to_owned(),
+            time_secs,
+            subject,
+            added_lines,
+            deleted_lines,
+            files_changed,
+        });
+    }
+    commits
 }
 
 fn resolve_scoped(head: &GitHead, sp: &ScopedPath<'_>) -> PathBuf {
@@ -2086,10 +2236,10 @@ mod tests {
 
         // Create feature branch with 2 commits ahead of common base.
         run_git(&["switch", "-q", "-c", "feat/demo"]);
-        fs::write(dir.join("feat1.txt"), "1\n").expect("write feat1");
+        fs::write(dir.join("feat1.txt"), "1\n2\n3\n").expect("write feat1");
         run_git(&["add", "."]);
         run_git(&["commit", "-q", "-m", "feat commit one"]);
-        fs::write(dir.join("feat2.txt"), "2\n").expect("write feat2");
+        fs::write(dir.join("a.txt"), "updated\nmore\n").expect("modify a");
         run_git(&["add", "."]);
         run_git(&["commit", "-q", "-m", "feat commit two"]);
 
@@ -2106,9 +2256,23 @@ mod tests {
         assert_eq!(rel.base_ref, "main");
         assert_eq!(rel.ahead, 2);
         assert_eq!(rel.behind, 1);
+        assert_eq!(rel.total_added, 5);
+        assert_eq!(rel.total_deleted, 1);
+        assert_eq!(rel.total_files, 2);
         assert!(!rel.merge_base_short.is_empty());
         assert!(rel.merge_base_time_secs > 0);
         assert_eq!(rel.merge_base_subject, "common base commit");
+        assert_eq!(rel.ahead_commits.len(), 2);
+        assert_eq!(rel.ahead_commits[0].subject, "feat commit two");
+        assert_eq!(rel.ahead_commits[0].added_lines, 2);
+        assert_eq!(rel.ahead_commits[0].deleted_lines, 1);
+        assert_eq!(rel.ahead_commits[1].subject, "feat commit one");
+        assert_eq!(rel.ahead_commits[1].added_lines, 3);
+        assert_eq!(rel.ahead_commits[1].deleted_lines, 0);
+        assert_eq!(rel.behind_commits.len(), 1);
+        assert_eq!(rel.behind_commits[0].subject, "main moved ahead");
+        assert_eq!(rel.behind_commits[0].added_lines, 1);
+        assert_eq!(rel.behind_commits[0].deleted_lines, 0);
 
         // Second call hits the in-process OID cache and returns the exact same relation.
         let st2 = query_blaze_git_status(dir.to_str().unwrap()).expect("cached git status");
