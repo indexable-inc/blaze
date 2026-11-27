@@ -5,9 +5,18 @@
 - Licence: Apache-2.0 WITH LLVM-exception (LICENSE).
 - Left out: Cargo.toml.orig, Cargo.lock.
 
-The copy is the crate unchanged except for one visibility and one fix, the whole diff against it:
+The copy is the crate unchanged except for one visibility, one fix, and removing the non-hermetic `git rev-parse HEAD` spawn in `build.rs`, the whole diff against it:
 
 ```diff
+--- cranelift-codegen-0.137.1/build.rs
++++ vendor/cranelift-codegen/build.rs
+@@ -102,26 +102,3 @@
+-    let pkg_version = env::var("CARGO_PKG_VERSION").unwrap();
+-    let mut cmd = std::process::Command::new("git");
+-    ...
++    // blaze: do not spawn `git rev-parse HEAD` inside a build script (non-hermetic and refused
++    // outside gitdir by the build-script sandbox; vendor/cranelift-codegen/SOURCE.md).
++    let version = env::var("CARGO_PKG_VERSION").unwrap();
 --- cranelift-codegen-0.137.1/src/machinst/buffer.rs
 +++ vendor/cranelift-codegen/src/machinst/buffer.rs
 @@ -432 +432 @@

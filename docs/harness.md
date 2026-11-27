@@ -156,8 +156,7 @@ labels, its disk included: the checkout, cargo's target directory and `~/.rustup
 made on ix: its scrub
 refuses to snapshot a machine with swap on. The image is Ubuntu 24.04 with build-essential, git,
 gh, jq, python3 and Nix, and lacks some of what a hosted image has: `.github/actions/rustup`
-installs rustup when there is none, `.github/actions/nix` uses the image's Nix in place of
-Determinate's installer, and an `apt-get install` first fetches the package lists the image does
+installs rustup when there is none, and an `apt-get install` first fetches the package lists the image does
 not ship.
 
 A run off main never becomes a snapshot, and before every snapshot ix's scrub removes what a job

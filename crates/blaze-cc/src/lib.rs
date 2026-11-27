@@ -28,10 +28,6 @@
 #![deny(blaze::process_static)]
 #![forbid(unsafe_code)]
 
-// `alloc`'s `Vec` alone, for bstd's channel read in driver.rs and front.rs
-// (`RunChild::recv_message` takes one): kept until bstd reads into blaze-own's.
-extern crate alloc;
-
 #[cfg(test)]
 extern crate std;
 

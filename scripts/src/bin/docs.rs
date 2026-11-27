@@ -991,8 +991,8 @@ fn selftest(p: &Patterns) {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    // The checkout this script was built in, as the Python took the one its file was in.
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap_or(Path::new("."));
+    // The checkout root: current working directory (hermetic builds set virtual CARGO_MANIFEST_DIR=/workspace/scripts).
+    let root = Path::new(".");
     let p = Patterns::new();
     let end = |errors: Vec<String>| {
         if !errors.is_empty() {

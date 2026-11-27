@@ -71,9 +71,7 @@ pub fn serve<'a, C: RunChild, V: View, P: Planted<JobPlant>>(
 ) -> Result<(), DriverError<V::Error>> {
     let mut start = Some(start);
     let mut child: Option<C> = None;
-    // bstd's channel reads into `alloc`'s `Vec`, not blaze-own's: the named gap in the D174
-    // report ("what a base crate lacks").
-    let mut inbox: alloc::vec::Vec<u8, Alloc<'a>> = alloc::vec::Vec::new_in(alloc);
+    let mut inbox: AVec<'a, u8> = Vec::new_in(alloc);
     let mut file: AVec<'a, u8> = Vec::new_in(alloc);
     loop {
         while let Some(effect) = job.next_effect() {

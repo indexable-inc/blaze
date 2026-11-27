@@ -126,7 +126,7 @@ pub struct ClangFrontEnd<'r, 'a, C, S> {
     shelf: SearchList<'a>,
     /// The files answered so far, by root and path, for the error's [`FileNo`].
     files: AVec<'a, (RootId, AString<'a>, FileNo)>,
-    inbox: alloc::vec::Vec<u8, Alloc<'a>>,
+    inbox: AVec<'a, u8>,
     abi: Option<CAbi>,
     done: Option<(DeclsBuilder<'a>, Census)>,
 }
@@ -148,7 +148,7 @@ impl<'r, 'a, C: RunChild, S: FnOnce() -> Result<C, RunError>> ClangFrontEnd<'r, 
             package,
             shelf,
             files: Vec::new_in(alloc),
-            inbox: alloc::vec::Vec::new_in(alloc),
+            inbox: Vec::new_in(alloc),
             abi: None,
             done: None,
         })
