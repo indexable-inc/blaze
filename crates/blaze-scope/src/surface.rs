@@ -267,6 +267,10 @@ fn source_bytes(src: Option<MacroSrc<'_>>) -> [u8; 32] {
         MacroBody::BuiltinOther(_) => h.update(b"o"),
         MacroBody::Proc { .. } => h.update(b"p"),
     };
+    match src.dollar_crate {
+        None => h.update(&[0]),
+        Some(krate) => h.update(&[1]).update(&krate.0.0),
+    };
     h.finish().0
 }
 
@@ -714,7 +718,7 @@ mod tests {
     }
 
     fn rules(name: &'static str, text: &'static str) -> MacroSrc<'static> {
-        MacroSrc { name, body: MacroBody::Rules(text), module: key("dep"), export: true, local_inner: false }
+        MacroSrc { name, body: MacroBody::Rules(text), module: key("dep"), export: true, local_inner: false, dollar_crate: None }
     }
 
     fn world() -> World {

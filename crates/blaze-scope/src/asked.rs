@@ -282,14 +282,14 @@ pub(crate) fn lookup_digest(found: Option<Binding>) -> ContentId {
 }
 
 /// The digest of a [`Kind::Macro`] answer: none, or the macro's name, body (its variant's tag,
-/// then its fields), module, and its `export` and `local_inner` flags.
+/// then its fields), module, `export`, `local_inner`, and `dollar_crate` override.
 pub(crate) fn macro_digest(src: Option<MacroSrc<'_>>) -> ContentId {
     let mut h = answer_hasher(Kind::Macro);
     match src {
         None => {
             h.update(&[0]);
         }
-        Some(MacroSrc { name, body, module, export, local_inner }) => {
+        Some(MacroSrc { name, body, module, export, local_inner, dollar_crate }) => {
             h.update(&[1]).part(name.as_bytes());
             match body {
                 MacroBody::Rules(text) => h.update(&[0]).part(text.as_bytes()),
@@ -300,6 +300,14 @@ pub(crate) fn macro_digest(src: Option<MacroSrc<'_>>) -> ContentId {
                 MacroBody::BuiltinDerive { helpers } => h.update(&[5]).part(helpers.as_bytes()),
             };
             h.id(&module.0).update(&[u8::from(export), u8::from(local_inner)]);
+            match dollar_crate {
+                None => {
+                    h.update(&[0]);
+                }
+                Some(krate) => {
+                    h.update(&[1]).id(&krate.0);
+                }
+            }
         }
     }
     h.finish()

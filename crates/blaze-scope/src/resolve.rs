@@ -675,8 +675,8 @@ pub enum ExpandNote<'a> {
     Failed { path: &'a str, implicit: bool, failed: blaze_expand::Failed<'a> },
     /// The expansion does not read as items: the outline's first syntax error.
     NotItems { macro_name: &'a str, message: &'a str },
-    /// The expansion writes a macro definition holding another crate's `$crate`
-    /// ([`crate::crate_roots::ForeignDollarCrate`]): refused until token-mark-3.
+    /// The expansion writes a single macro definition mixing `$crate` tokens from two different
+    /// crates ([`crate::crate_roots::ForeignDollarCrate`]).
     ForeignDollarCrate { macro_name: &'a str, krate: CrateItemKey },
     /// The expansion writes another crate's root and keeps no marks to tell it by
     /// ([`crate::crate_roots::RootsLost`]).
@@ -4353,10 +4353,11 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
 /// `fixed_bytes_macros!` writes `address!`, whose body calls `$crate::hex!`; written as
 /// `crate::hex!` a call from another crate would name the caller's `hex`.
 ///
-/// token-mark-2 (drive.md "A token keeps its mark"): no spelled token. Outside a definition a
-/// `$crate` is written as `crate` and placed with its crate (`placed`'s fourth value), whose row
-/// carries [`crate::crate_roots::root_mark`]; inside one it is written `$crate`, which the written
-/// definition reads as the crate expanding (`here`): another crate's is refused
+/// token-mark-2 & token-mark-3 (drive.md "A token keeps its mark"): no spelled token. Outside a
+/// definition a `$crate` is written as `crate` and placed with its crate (`placed`'s fourth
+/// value), whose row carries [`crate::crate_roots::root_mark`]; inside one it is written `$crate`
+/// and also placed with its crate so lowering records a uniform foreign `dollar_crate` on
+/// `MacroSrc`, while a single definition mixing `$crate` from two different crates is refused
 /// ([`crate::crate_roots::ForeignDollarCrate`]).
 ///
 /// A token `def_crate(at)` says begins a single-name call the body of a `local_inner_macros`
@@ -4392,22 +4393,33 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
         }
     }
     // Groups open now; the depth a definition's body opened at while inside one; how far the
-    // tokens read so far are into `macro_rules ! name` (1, 2, 3) or `macro name` (2, 3).
+    // tokens read so far are into `macro_rules ! name` (1, 2, 3) or `macro name` (4, 5).
     let mut depth = 0u32;
     let mut in_def: Option<u32> = None;
     let mut def_head = 0u8;
+    // True while inside a 2.0 `macro name(...) { ... }` parameter list so the immediately
+    // following `{ ... }` body continues the same definition.
+    let mut macro2_params = false;
+    // Uniform `$crate` crate seen so far inside the current `in_def` definition: if two `$crate`
+    // tokens in the same definition name distinct crates, refuse (`ForeignDollarCrate`).
+    let mut def_crate_seen: Option<CrateItemKey> = None;
     // A `$crate` no expansion wrote (tokio's `doc! { macro_rules! try_join { .. $crate .. } }`:
     // in the call's own tokens) names the crate whose text holds it, the one expanding.
-    // Returns the crate a written `crate` stands for (its row's root), `None` for none.
-    let crate_of = |out: &mut AString<'_>, krate: Option<CrateItemKey>, in_def: bool| -> Result<Option<CrateItemKey>, crate::crate_roots::ForeignDollarCrate> {
+    // Returns the crate a written `crate` / `$crate` stands for (its row's root), `None` for none.
+    let mut crate_of = |out: &mut AString<'_>, krate: Option<CrateItemKey>, in_def: bool, seen: &mut Option<CrateItemKey>| -> Result<Option<CrateItemKey>, crate::crate_roots::ForeignDollarCrate> {
         if in_def {
-            return match krate {
-                Some(k) if here.is_some_and(|h| h != k) => Err(crate::crate_roots::ForeignDollarCrate { krate: k }),
-                _ => {
-                    out.push_str("$crate");
-                    Ok(None)
+            out.push_str("$crate");
+            if let Some(eff) = krate.or(here) {
+                match *seen {
+                    None => *seen = Some(eff),
+                    Some(prev) if prev != eff => {
+                        let foreign = if here == Some(eff) { prev } else { eff };
+                        return Err(crate::crate_roots::ForeignDollarCrate { krate: foreign });
+                    }
+                    Some(_) => {}
                 }
-            };
+            }
+            return Ok(krate);
         }
         out.push_str("crate");
         Ok(krate)
@@ -4442,18 +4454,25 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
         // `local_inner_macros` prefix, which is its own row).
         let mut root: Option<CrateItemKey> = None;
         let mut name_start = start;
-        let named_def = def_head == 3;
+        let named_def = def_head;
         def_head = match (def_head, token.kind) {
             (_, TokenKind::Ident { raw: Raw::No, .. }) if text == "macro_rules" => 1,
-            (_, TokenKind::Ident { raw: Raw::No, .. }) if text == "macro" => 2,
+            (_, TokenKind::Ident { raw: Raw::No, .. }) if text == "macro" => 4,
             (1, TokenKind::Punct { char: '!', .. }) => 2,
             (2, TokenKind::Ident { .. }) => 3,
+            (4, TokenKind::Ident { .. }) => 5,
             _ => 0,
         };
         match token.kind {
-            TokenKind::Open(Delim::Paren | Delim::Brace | Delim::Bracket) => {
-                if named_def && in_def.is_none() {
-                    in_def = Some(depth);
+            TokenKind::Open(delim @ (Delim::Paren | Delim::Brace | Delim::Bracket)) => {
+                if in_def.is_none() {
+                    if named_def == 3 || named_def == 5 {
+                        in_def = Some(depth);
+                        def_crate_seen = None;
+                        macro2_params = named_def == 5 && delim == Delim::Paren;
+                    } else if named_def == 6 && delim == Delim::Brace {
+                        in_def = Some(depth);
+                    }
                 }
                 depth += 1;
             }
@@ -4461,6 +4480,12 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
                 depth = depth.saturating_sub(1);
                 if in_def == Some(depth) {
                     in_def = None;
+                    if macro2_params {
+                        macro2_params = false;
+                        def_head = 6;
+                    } else {
+                        def_crate_seen = None;
+                    }
                 }
             }
             _ => {}
@@ -4468,7 +4493,7 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
         // A `$crate` is one word written as `crate`, two as `$crate` (`$`, `crate`).
         let crate_words = if in_def.is_some() { 2 } else { 1 };
         if def_crate(at) {
-            let prefix = crate_of(&mut out, dollar(at), in_def.is_some())?;
+            let prefix = crate_of(&mut out, dollar(at), in_def.is_some(), &mut def_crate_seen)?;
             if prefix.is_some() {
                 placed(first, start, out.len(), prefix);
             }
@@ -4486,11 +4511,11 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
                 // The pair's `crate`: the same word(s) as its `$`.
                 note_word(&mut words, Some(word));
                 own = crate_words;
-                root = crate_of(&mut out, dollar(at), in_def.is_some())?;
+                root = crate_of(&mut out, dollar(at), in_def.is_some(), &mut def_crate_seen)?;
             }
             TokenKind::Ident { .. } if text == "$crate" => {
                 own = crate_words;
-                root = crate_of(&mut out, dollar(at), in_def.is_some())?;
+                root = crate_of(&mut out, dollar(at), in_def.is_some(), &mut def_crate_seen)?;
             }
             TokenKind::Ident { raw: Raw::Yes, .. } => {
                 out.push_str("r#");
@@ -5707,7 +5732,7 @@ fn definition_of_in<'m, 'd>(
 ) -> Result<MacroDefinition<'d>, ExpandNote<'m>> {
     let module = matches!(mac.body, MacroBody::Macro2 { .. }).then_some(mac.module);
     let def_at = DefAt {
-        site: DefSite { krate, module },
+        site: DefSite { krate: mac.dollar_crate.unwrap_or(krate), module },
         edition,
         export: if mac.export { Export::Exported } else { Export::Local },
         local_inner: if mac.local_inner { LocalInner::Yes } else { LocalInner::No },

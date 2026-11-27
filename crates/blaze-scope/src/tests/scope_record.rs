@@ -231,7 +231,8 @@ fn generated(bump: blaze_own::Bump<'static>) -> Vec<(&'static str, &'static [u8]
             7 => MacroBody::Proc { kind: ProcKind::Attr, helpers: t },
             _ => MacroBody::BuiltinDerive { helpers: t },
         };
-        macros.push((key("macro", i), MacroSrc { name: texts[(i * 7) % 600], body, module: key("module", i % 5), export: i % 2 == 0, local_inner: i % 3 == 0 }));
+        let dollar_crate = if i % 5 == 0 { Some(crate_key(10 + (i % 7))) } else { None };
+        macros.push((key("macro", i), MacroSrc { name: texts[(i * 7) % 600], body, module: key("module", i % 5), export: i % 2 == 0, local_inner: i % 3 == 0, dollar_crate }));
     }
     let modules = [Module { key: root, scope: scope_bytes(root, &[], &[], g), chain: Some(&[]) }];
     out.push(("many macros", record_of(&Parts { modules: &modules, macros: &macros, ..base("macros", root) }, bump)));
@@ -371,7 +372,7 @@ fn equal_parts_write_equal_bytes_in_any_order() {
     let vs = [Variant { name: "A", key: key("a", 0), record: false }, Variant { name: "B", key: key("b", 0), record: true }];
     let enums: Vec<(ItemKey, &[Variant<&str>])> = (0..10).map(|i| (key("e", i), &vs[..i % 3])).collect();
     let macros: Vec<(ItemKey, MacroSrc<'_>)> =
-        (0..10).map(|i| (key("mac", i), MacroSrc { name: "m", body: MacroBody::Rules("() => {}"), module: root, export: i % 2 == 0, local_inner: false })).collect();
+        (0..10).map(|i| (key("mac", i), MacroSrc { name: "m", body: MacroBody::Rules("() => {}"), module: root, export: i % 2 == 0, local_inner: false, dollar_crate: None })).collect();
     let reaches: Vec<CrateItemKey> = (0..10).map(crate_key).collect();
     let parts = Parts { modules: &modules, enums: &enums, macros: &macros, reaches: &reaches, ..base("order", root) };
     let first = write(&parts, g).unwrap_or_else(|e| panic!("{e}"));

@@ -248,6 +248,28 @@ impl<'a> Out<'_, 'a> {
         Ok(ctx)
     }
 
+    /// When a `$crate` token in a macro's definition already carries a non-transparent mark from
+    /// an enclosing macro expansion (a macro-generating-macro across crates, e.g. `cfg_aliases!`),
+    /// keeps that token's existing context without pushing this inner macro's mark on top so
+    /// `$crate` still resolves to the outer defining crate. Returns `Ok(None)` when the token has
+    /// no prior non-transparent mark (normal case: use [`Out::ctx_for`]).
+    pub(crate) fn preserve_dollar_crate_ctx(&mut self, origin: TokenOrigin) -> Result<Option<Ctx>, ExpandError> {
+        let (src, at) = match origin {
+            TokenOrigin::Def(at) => (self.def.body(), at),
+            TokenOrigin::Params(at) => match self.def.params() {
+                Some(params) => (params, at),
+                None => return Err(ExpandError::ForeignOrigin { origin }),
+            },
+            _ => return Ok(None),
+        };
+        let idx = usize::try_from(at).map_err(|_| ExpandError::ForeignOrigin { origin })?;
+        let token = src.tokens().get(idx).ok_or(ExpandError::ForeignOrigin { origin })?;
+        if src.non_transparent_mark(token.ctx).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.exp.tokens.import_ctx(src, token.ctx)?))
+    }
+
     /// A token the expansion makes.
     pub(crate) fn made(
         &mut self,

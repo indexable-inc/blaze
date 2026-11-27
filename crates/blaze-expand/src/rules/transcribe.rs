@@ -287,13 +287,37 @@ pub(crate) fn transcribe<'f, B: Copying>(
             let op = program.ops[at as usize];
             scratch.stack[top].at += 1;
             let e = match op {
-                Op::Tok(tok) => match push_def(scratch, out, engine, tok) {
-                    Ok(()) => None,
-                    Err(error) => return Ok(Err(error)),
-                },
+                Op::Tok(tok) => {
+                    let is_dollar_crate = matches!(engine.def.kind(tok), TokenKind::Ident { raw: Raw::No, .. })
+                        && engine.def.text(tok) == "$crate";
+                    let res = if is_dollar_crate {
+                        match out.preserve_dollar_crate_ctx(tok.origin()) {
+                            Ok(Some(ctx)) => {
+                                join_prev(out, tok.origin());
+                                out.push_whole_ctx(written(engine.def.kind(tok)), WholeText::of("$crate"), tok.origin(), ctx)
+                            }
+                            Ok(None) => push_def(scratch, out, engine, tok),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        push_def(scratch, out, engine, tok)
+                    };
+                    match res {
+                        Ok(()) => None,
+                        Err(error) => return Ok(Err(error)),
+                    }
+                }
                 Op::Crate(tok) => {
                     let kind = TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone };
-                    if let Err(error) = push(scratch, out, kind, WholeText::of("$crate"), tok.origin()) {
+                    let res = match out.preserve_dollar_crate_ctx(tok.origin()) {
+                        Ok(Some(ctx)) => {
+                            join_prev(out, tok.origin());
+                            out.push_whole_ctx(kind, WholeText::of("$crate"), tok.origin(), ctx)
+                        }
+                        Ok(None) => push(scratch, out, kind, WholeText::of("$crate"), tok.origin()),
+                        Err(error) => Err(error),
+                    };
+                    if let Err(error) = res {
                         return Ok(Err(error));
                     }
                     None
