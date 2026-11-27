@@ -23,12 +23,12 @@
 use core::fmt;
 
 use blaze_code::datum::DatumView;
-use blaze_code::record::{Space, Subject, Symbol, TrapKind, TrapSource};
+use blaze_code::record::{CodeView, Space, Subject, Symbol, Target as CodeTarget, TrapKind, TrapSource};
 use blaze_emit::{
     AbiFnInput, CallConvKind, InternalFastRole, Isa, ScratchOrder, SotaRecordAbiOpts, ZeroAbiOpts,
     can_use_internal_fast_a64, plan_module_abi,
 };
-use blaze_hash::{FixedState, Map, MapOpts};
+use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_lir::{
     Block, BlockKind, Field, Flags, Layout, Op, Ty, VerifyError,
     body::{Bodies, BodyId, DatumId, Target},
@@ -159,6 +159,11 @@ pub enum ExportLtoError {
     Record { symbol: [u8; 32], error: CodeRecordError },
     /// A content-addressed LTO cache record failed lossless decode (Rule 3: no silent fallback).
     CorruptCache { what: &'static str, key: [u8; 32] },
+    /// A post-LTO emitted `CodeRecord` or vtable datum failed decode during target verification.
+    DecodeRecord { symbol: [u8; 32], what: &'static str },
+    /// A post-LTO emitted body or vtable referenced a target neither in `Walk` nor in any LTO
+    /// origin's declared tables (Rule 3: export never leaves a hole).
+    MissingDeclared { from: [u8; 32], target: CodeTarget },
 }
 
 struct Hex<'a>(&'a [u8; 32]);
@@ -220,6 +225,16 @@ impl fmt::Display for ExportLtoError {
             ExportLtoError::CorruptCache { what, key } => {
                 write!(f, "export LTO: corrupt cached {what} under key {} (export_lto.rs)", Hex(key))
             }
+            ExportLtoError::DecodeRecord { symbol, what } => {
+                write!(f, "export LTO: decoding post-LTO {what} for {} failed (export_lto.rs)", Hex(symbol))
+            }
+            ExportLtoError::MissingDeclared { from, target } => write!(
+                f,
+                "export LTO: post-LTO function {} references {:?} {} with no declaration in walk or LTO origins (export_lto.rs)",
+                Hex(from),
+                target.space,
+                target.symbol
+            ),
         }
     }
 }
@@ -276,8 +291,10 @@ pub struct NoExportLtoCache;
 
 impl ExportLtoCache for NoExportLtoCache {}
 
-/// Magic + format version for cached pre-LTO [`BuiltLir`] payloads.
-const BUILT_LIR_CACHE_MAGIC: &[u8; 8] = b"BLZLIR01";
+/// Magic + format version for cached pre-LTO [`BuiltLir`] payloads (v2 persists `declared`
+/// instance `(ItemKey, name_bytes)` rows so cache hits never drop walk declarations across
+/// binaries or incremental rebuilds).
+const BUILT_LIR_CACHE_MAGIC: &[u8; 8] = b"BLZLIR02";
 /// Hash domain for cached pre-LTO [`BuiltLir`] keys (Rule 21).
 const EXPORT_LTO_BUILT_LIR_KEY_DOMAIN: &str = "blaze v2 export lto built lir 1";
 /// Magic + format version for cached post-LTO emitted body payloads.
@@ -445,8 +462,11 @@ impl From<ParLtoErr> for ExportLtoError {
     }
 }
 
+type DeclaredRow = (ItemKey, Vec<u8, SharedAlloc<'static>>);
+
 fn encode_built_lir(
     built: &BuiltLir<SharedAlloc<'static>>,
+    declared: &[DeclaredRow],
     alloc: SharedAlloc<'static>,
 ) -> Option<Vec<u8, SharedAlloc<'static>>> {
     let func_bytes = blaze_lir::persist::to_bytes_in(&built.func.view(), alloc);
@@ -458,7 +478,8 @@ fn encode_built_lir(
         .saturating_add(built.vtables.len().saturating_mul(32))
         .saturating_add(built.tls.len().saturating_mul(16))
         .saturating_add(built.traps.len().saturating_mul(112))
-        .saturating_add(built.c_text.len());
+        .saturating_add(built.c_text.len())
+        .saturating_add(declared.len().saturating_mul(48));
     let mut out: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(est, alloc);
     out.extend_from_slice(BUILT_LIR_CACHE_MAGIC);
     // 8-byte length after 8-byte magic places `func_bytes` at offset 16 (matching `blaze_format::ALIGN`).
@@ -537,13 +558,20 @@ fn encode_built_lir(
 
     push_len(&mut out, built.c_text.len())?;
     out.extend_from_slice(built.c_text.as_slice());
+
+    push_len(&mut out, declared.len())?;
+    for (item, name) in declared.iter() {
+        push_u128(&mut out, item.0);
+        push_len(&mut out, name.len())?;
+        out.extend_from_slice(name.as_slice());
+    }
     Some(out)
 }
 
 fn decode_built_lir(
     bytes: &[u8],
     alloc: SharedAlloc<'static>,
-) -> Option<BuiltLir<SharedAlloc<'static>>> {
+) -> Option<(BuiltLir<SharedAlloc<'static>>, Vec<DeclaredRow, SharedAlloc<'static>>)> {
     let mut r = ByteReader::new(bytes);
     if r.take(8)? != BUILT_LIR_CACHE_MAGIC {
         return None;
@@ -639,13 +667,24 @@ fn decode_built_lir(
 
     let c_text_len = r.len()?;
     let c_text_slice = r.take(c_text_len)?;
-    if !r.at_end() {
-        return None;
-    }
     let mut c_text: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(c_text_len, alloc);
     c_text.extend_from_slice(c_text_slice);
 
-    Some(BuiltLir { func, funcs, statics, c_statics, vtables, vtable_data, tls, traps, c_text })
+    let declared_len = r.len()?;
+    let mut declared: Vec<DeclaredRow, SharedAlloc<'static>> = Vec::with_capacity_in(declared_len, alloc);
+    for _ in 0..declared_len {
+        let item = ItemKey(r.u128()?);
+        let nlen = r.len()?;
+        let nslice = r.take(nlen)?;
+        let mut name: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(nlen, alloc);
+        name.extend_from_slice(nslice);
+        declared.push((item, name));
+    }
+    if !r.at_end() {
+        return None;
+    }
+
+    Some((BuiltLir { func, funcs, statics, c_statics, vtables, vtable_data, tls, traps, c_text }, declared))
 }
 
 fn encode_emitted_body(
@@ -854,6 +893,14 @@ pub struct LtoBodyOut {
 pub struct ExportLtoOut<'a> {
     /// Optimized functions replacing their walk rows in the exported binary.
     pub bodies: Vec<LtoBodyOut, SharedAlloc<'static>>,
+    /// Any `Space::Func` targets referenced by post-LTO records or vtables that were not yet in
+    /// `Walk`, as `(declarer_row, tabled, name_bytes)` in deterministic body/target order.
+    pub extra_walk_instances: Vec<(usize, ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
+    /// Any `Space::Static` targets referenced by post-LTO records or vtables that were not yet in
+    /// `Walk`.
+    pub extra_walk_statics: Vec<ItemKey, SharedAlloc<'static>>,
+    /// Any `Space::Tls` targets referenced by post-LTO records that were not yet in `Walk`.
+    pub extra_walk_tls: Vec<ItemKey, SharedAlloc<'static>>,
     /// Hot module symbols ranked hottest-first for `blaze_export::Profile::hot`
     /// (16 KB iTLB-page-aware Ext-TSP code packing).
     pub hot_symbols: AVec<'a, Symbol>,
@@ -876,6 +923,7 @@ struct LtoOrigin {
     is_seed: bool,
     orig_unreachables: usize,
     built: BuiltLir<SharedAlloc<'static>>,
+    declared: Vec<DeclaredRow, SharedAlloc<'static>>,
 }
 
 struct LtoBodies<'b> {
@@ -2799,6 +2847,133 @@ where
     )
 }
 
+struct MissingWalkTargets {
+    instances: Vec<(usize, ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
+    statics: Vec<ItemKey, SharedAlloc<'static>>,
+    tls: Vec<ItemKey, SharedAlloc<'static>>,
+}
+
+/// Scans every surviving post-LTO [`LtoBodyOut`]'s sealed `CodeRecord` and carried `vtable_data`
+/// against `walk`, recovering any `Space::Func`, `Space::Static`, or `Space::Tls` target not yet
+/// in `walk` from the `origins`' persisted declared/static/tls tables (regardless of whether the
+/// origin came from a fresh `build_lir_with_reach_in` or a `BLZLIR02` / `BLZEMT01` cache hit).
+///
+/// Refuses with [`ExportLtoError::MissingDeclared`] if any emitted target has no declaration in
+/// either `walk` or `origins` (Rule 3: export never leaves a hole).
+fn collect_missing_walk_targets<'a>(
+    walk: &Walk<'_>,
+    origins: &[LtoOrigin],
+    out_bodies: &[LtoBodyOut],
+    shared: SharedAlloc<'static>,
+    alloc: Alloc<'a>,
+) -> Result<MissingWalkTargets, ExportLtoError> {
+    let mut decl_by_sym: Map<Symbol, (usize, ItemKey, &[u8]), FixedState, Alloc<'a>> =
+        Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(origins.len().saturating_mul(2)) });
+    let mut static_by_sym: Map<Symbol, ItemKey, FixedState, Alloc<'a>> =
+        Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(origins.len() / 4) });
+    let mut tls_by_sym: Map<Symbol, ItemKey, FixedState, Alloc<'a>> =
+        Map::new(MapOpts { hasher: FixedState, alloc, capacity: Some(16) });
+    for orig in origins.iter() {
+        for (tabled, name) in orig.declared.iter() {
+            let sym = crate::symbols::fn_symbol_of_name(name.as_slice());
+            decl_by_sym.entry(sym).or_insert((orig.row, *tabled, name.as_slice()));
+        }
+        for &item in orig.built.statics.iter() {
+            if orig.built.foreign_static(item).is_none() {
+                static_by_sym.entry(static_symbol(item)).or_insert(item);
+            }
+        }
+        for &item in orig.built.tls.iter() {
+            tls_by_sym.entry(tls_symbol(item)).or_insert(item);
+        }
+    }
+
+    let mut soft_float_syms: Set<Symbol, FixedState, Alloc<'a>> =
+        Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(16) });
+    for body in out_bodies.iter() {
+        for (_, name) in body.extra_declared.iter() {
+            soft_float_syms.insert(crate::symbols::fn_symbol_of_name(name.as_slice()));
+        }
+    }
+
+    let tls_getter = crate::symbols::tls_getter_symbol();
+    let tls_desc = crate::symbols::tls_desc_symbol();
+    let mut seen_inst: Set<Symbol, FixedState, Alloc<'a>> =
+        Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(32) });
+    let mut seen_static: Set<Symbol, FixedState, Alloc<'a>> =
+        Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(16) });
+    let mut seen_tls: Set<Symbol, FixedState, Alloc<'a>> =
+        Set::new(SetOpts { hasher: FixedState, alloc, capacity: Some(8) });
+    let mut instances: Vec<(usize, ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> = Vec::new_in(shared);
+    let mut statics: Vec<ItemKey, SharedAlloc<'static>> = Vec::new_in(shared);
+    let mut tls: Vec<ItemKey, SharedAlloc<'static>> = Vec::new_in(shared);
+
+    let mut check_target = |from_sym: [u8; 32], target: CodeTarget| -> Result<(), ExportLtoError> {
+        match target.space {
+            Space::Func => {
+                if walk.row_of(&target.symbol).is_some()
+                    || target.symbol == tls_getter
+                    || soft_float_syms.contains(&target.symbol)
+                    || seen_inst.contains(&target.symbol)
+                {
+                    return Ok(());
+                }
+                let Some(&(declarer_row, tabled, name_slice)) = decl_by_sym.get(&target.symbol) else {
+                    return Err(ExportLtoError::MissingDeclared { from: from_sym, target });
+                };
+                seen_inst.insert(target.symbol);
+                let mut copied: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(name_slice.len(), shared);
+                copied.extend_from_slice(name_slice);
+                instances.push((declarer_row, tabled, copied));
+                Ok(())
+            }
+            Space::Static => {
+                if walk.row_of(&target.symbol).is_some()
+                    || target.symbol == tls_desc
+                    || seen_static.contains(&target.symbol)
+                {
+                    return Ok(());
+                }
+                let Some(&item) = static_by_sym.get(&target.symbol) else {
+                    return Err(ExportLtoError::MissingDeclared { from: from_sym, target });
+                };
+                seen_static.insert(target.symbol);
+                statics.push(item);
+                Ok(())
+            }
+            Space::Tls => {
+                if walk.row_of(&target.symbol).is_some() || seen_tls.contains(&target.symbol) {
+                    return Ok(());
+                }
+                let Some(&item) = tls_by_sym.get(&target.symbol) else {
+                    return Err(ExportLtoError::MissingDeclared { from: from_sym, target });
+                };
+                seen_tls.insert(target.symbol);
+                tls.push(item);
+                Ok(())
+            }
+            Space::Vtable | Space::Outside | Space::WeakOutside => Ok(()),
+        }
+    };
+
+    for body in out_bodies.iter() {
+        let view = CodeView::read(body.record.as_slice())
+            .map_err(|_| ExportLtoError::DecodeRecord { symbol: body.symbol.0, what: "code record" })?;
+        for ti in 0..view.targets() {
+            check_target(body.symbol.0, view.target(ti))?;
+        }
+        for (_, datum_bytes) in body.vtable_data.iter() {
+            let dv = DatumView::read(datum_bytes.as_slice())
+                .map_err(|_| ExportLtoError::DecodeRecord { symbol: body.symbol.0, what: "vtable datum" })?;
+            for ti in 0..dv.targets() {
+                check_target(body.symbol.0, dv.target(ti))?;
+            }
+        }
+    }
+
+    Ok(MissingWalkTargets { instances, statics, tls })
+}
+
 /// Whole-program parallel demand-driven cross-function LIR inlining and host-ISA SOTA emission
 /// with content-addressed local incremental caching (`BuiltLir` + post-LTO emitted bodies) and
 /// wavefront-parallel bottom-up Tarjan SCC IPRA emission (Rule 21, Rule 25, Rule 51).
@@ -2825,6 +3000,9 @@ where
     if seeds.is_empty() || opts.max_bodies == 0 {
         return Ok(ExportLtoOut {
             bodies: Vec::new_in(shared),
+            extra_walk_instances: Vec::new_in(shared),
+            extra_walk_statics: Vec::new_in(shared),
+            extra_walk_tls: Vec::new_in(shared),
             hot_symbols: Vec::new_in(alloc),
             profile_digest: [0u8; 32],
             module_bodies: 0,
@@ -2864,8 +3042,6 @@ where
     let mut total_scanned = 0usize;
     let mut reserve_scans = 0usize;
     let mut origins: Vec<LtoOrigin, SharedAlloc<'static>> = Vec::with_capacity_in(call_queue.len(), shared);
-    let mut missing_walk_declared: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> = Vec::new_in(shared);
-    let mut missing_walk_syms: AVec<'a, Symbol> = Vec::new_in(alloc);
     let mut call_head = 0usize;
     let mut indirect_head = 0usize;
     while origins.len() < opts.max_bodies && total_scanned < max_scanned {
@@ -2902,7 +3078,7 @@ where
         let symbol = walk.symbol(row);
         let name = walk.name(row);
         let lir_key = cache.lir_key(row, opts.machine);
-        let built = if let Some(key) = lir_key
+        let (built, declared) = if let Some(key) = lir_key
             && let Some(cached) = cache.get(key, shared)
         {
             times.lir_hits = times.lir_hits.saturating_add(1);
@@ -2913,36 +3089,32 @@ where
             let Some(grant) = grant_for(tabled) else {
                 return Err(ExportLtoError::NotRunnable { symbol: symbol.0, tabled });
             };
+            let enclosers = crate::body_ids::local_enclosers_of(walk, row, tabled);
+            if !enclosers.locals().is_empty() {
+                maker.prepare_local(enclosers.locals(), enclosers.enclosers());
+            }
             let mut lto_decl = crate::body_ids::DeclaredList::new_in(alloc);
             let mut built = maker
                 .build_lir_with_reach_in(&grant, tabled, name, Some(&mut lto_decl), shared)
                 .map_err(|error| ExportLtoError::BuildLir { symbol: symbol.0, error })?;
-            let mut has_missing_walk_callee = false;
+            let mut declared: Vec<DeclaredRow, SharedAlloc<'static>> = Vec::with_capacity_in(lto_decl.len(), shared);
             for idx in 0..lto_decl.len() {
                 let (decl_tabled, decl_name) = lto_decl.row(idx);
-                let decl_sym = crate::symbols::fn_symbol_of_name(decl_name);
-                if walk.row_of(&decl_sym).is_none() {
-                    has_missing_walk_callee = true;
-                    if !missing_walk_syms.contains(&decl_sym) {
-                        missing_walk_syms.push(decl_sym);
-                        let mut copied = Vec::with_capacity_in(decl_name.len(), shared);
-                        copied.extend_from_slice(decl_name);
-                        missing_walk_declared.push((decl_tabled, copied));
-                    }
-                }
+                let mut copied = Vec::with_capacity_in(decl_name.len(), shared);
+                copied.extend_from_slice(decl_name);
+                declared.push((decl_tabled, copied));
             }
             let lowered_libm = lower_ieee_libm_calls(&mut built, opts.machine, alloc);
             if lowered_libm {
                 verify(built.func.view())
                     .map_err(|error| ExportLtoError::Verify { symbol: symbol.0, error })?;
             }
-            if !has_missing_walk_callee
-                && let Some(key) = lir_key
-                && let Some(encoded) = encode_built_lir(&built, shared)
+            if let Some(key) = lir_key
+                && let Some(encoded) = encode_built_lir(&built, declared.as_slice(), shared)
             {
                 cache.put(key, encoded.as_slice());
             }
-            built
+            (built, declared)
         };
 
         let view = built.func.view();
@@ -2991,6 +3163,7 @@ where
             is_seed,
             orig_unreachables,
             built,
+            declared,
         });
     }
     times.bfs_ns = cache.now_ns().saturating_sub(t_bfs);
@@ -2998,6 +3171,9 @@ where
     if origins.is_empty() {
         return Ok(ExportLtoOut {
             bodies: Vec::new_in(shared),
+            extra_walk_instances: Vec::new_in(shared),
+            extra_walk_statics: Vec::new_in(shared),
+            extra_walk_tls: Vec::new_in(shared),
             hot_symbols: Vec::new_in(alloc),
             profile_digest: [0u8; 32],
             module_bodies: 0,
@@ -3276,6 +3452,9 @@ where
         times.prep_ns = cache.now_ns().saturating_sub(t_prep);
         return Ok(ExportLtoOut {
             bodies: Vec::new_in(shared),
+            extra_walk_instances: Vec::new_in(shared),
+            extra_walk_statics: Vec::new_in(shared),
+            extra_walk_tls: Vec::new_in(shared),
             hot_symbols,
             profile_digest,
             module_bodies: n,
@@ -3913,12 +4092,13 @@ where
         }
     }
 
-    if let Some(first) = out_bodies.first_mut() {
-        first.extra_declared.extend(missing_walk_declared);
-    }
+    let missing = collect_missing_walk_targets(walk, origins.as_slice(), out_bodies.as_slice(), shared, alloc)?;
 
     Ok(ExportLtoOut {
         bodies: out_bodies,
+        extra_walk_instances: missing.instances,
+        extra_walk_statics: missing.statics,
+        extra_walk_tls: missing.tls,
         hot_symbols,
         profile_digest,
         module_bodies: n,
@@ -5073,8 +5253,13 @@ mod tests {
         traps.push(TrapSource { ordinal: 1, kind: TrapKind::BodyEnd, site: None, subject: None });
 
         let built = BuiltLir { func, funcs, statics, c_statics, vtables, vtable_data, tls, traps, c_text };
-        let encoded = encode_built_lir(&built, shared).expect("encode_built_lir succeeds");
-        let decoded = decode_built_lir(encoded.as_slice(), shared).expect("decode_built_lir succeeds");
+        let mut decl_name: Vec<u8, SharedAlloc<'static>> = Vec::new_in(shared);
+        decl_name.extend_from_slice(&0x5566_7788u128.to_le_bytes());
+        decl_name.extend_from_slice(&0u32.to_le_bytes());
+        let mut declared: Vec<DeclaredRow, SharedAlloc<'static>> = Vec::new_in(shared);
+        declared.push((ItemKey(0x5566_7788), decl_name));
+        let encoded = encode_built_lir(&built, declared.as_slice(), shared).expect("encode_built_lir succeeds");
+        let (decoded, dec_declared) = decode_built_lir(encoded.as_slice(), shared).expect("decode_built_lir succeeds");
         assert_eq!(
             blaze_lir::persist::to_bytes_in(&built.func.view(), shared).as_slice(),
             blaze_lir::persist::to_bytes_in(&decoded.func.view(), shared).as_slice(),
@@ -5089,13 +5274,180 @@ mod tests {
         assert_eq!(built.tls.as_slice(), decoded.tls.as_slice());
         assert_eq!(built.traps.as_slice(), decoded.traps.as_slice());
         assert_eq!(built.c_text.as_slice(), decoded.c_text.as_slice());
+        assert_eq!(dec_declared.len(), 1);
+        assert_eq!(dec_declared[0].0, declared[0].0);
+        assert_eq!(dec_declared[0].1.as_slice(), declared[0].1.as_slice());
 
         // Rule 3: truncated or corrupted payloads must decode to `None`.
         assert!(decode_built_lir(&encoded[..encoded.len() - 1], shared).is_none());
         let mut bad_magic = encoded.as_slice().to_vec();
         bad_magic[0] ^= 0xFF;
         assert!(decode_built_lir(&bad_magic, shared).is_none());
+    }
 
+    #[test]
+    fn collect_missing_walk_targets_recovers_cached_built_lir_and_vtable_targets_and_rejects_hole() {
+        use blaze_code::datum::{Datum, Place as DatumPlace};
+        use blaze_code::record::{CodeRecord, Site, SiteKind, Word as RecordWord};
+
+        let shared = blaze_own::testing::heap().shared();
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Construct a caller root already in `walk`, plus three targets NOT in `walk`:
+        // 1. A direct `Space::Func` callee (e.g. from a cached `BLZLIR02` inlined callee)
+        // 2. A `Space::Func` method referenced only inside a carried vtable datum
+        // 3. A `Space::Static` and `Space::Tls` referenced by the post-LTO code record.
+        let caller_key = ItemKey(0xAAAA_0001);
+        let mut caller_name = [0u8; 20];
+        caller_name[0..16].copy_from_slice(&caller_key.0.to_le_bytes());
+        let caller_sym = crate::symbols::fn_symbol_of_name(&caller_name);
+
+        let missing_callee_key = ItemKey(0xBBBB_0002);
+        let mut missing_callee_name = [0u8; 20];
+        missing_callee_name[0..16].copy_from_slice(&missing_callee_key.0.to_le_bytes());
+        let missing_callee_sym = crate::symbols::fn_symbol_of_name(&missing_callee_name);
+
+        let vtable_fn_key = ItemKey(0xCCCC_0003);
+        let mut vtable_fn_name = [0u8; 20];
+        vtable_fn_name[0..16].copy_from_slice(&vtable_fn_key.0.to_le_bytes());
+        let vtable_fn_sym = crate::symbols::fn_symbol_of_name(&vtable_fn_name);
+
+        let missing_static_key = ItemKey(0xDDDD_0004);
+        let missing_static_sym = static_symbol(missing_static_key);
+        let missing_tls_key = ItemKey(0xEEEE_0005);
+        let missing_tls_sym = tls_symbol(missing_tls_key);
+
+        let mut walk = Walk::new_in(alloc);
+        let caller_row = walk.root::<()>( (caller_key, &caller_name), 64 ).expect("root caller");
+        assert!(walk.row_of(&missing_callee_sym).is_none());
+        assert!(walk.row_of(&vtable_fn_sym).is_none());
+        assert!(walk.row_of(&missing_static_sym).is_none());
+        assert!(walk.row_of(&missing_tls_sym).is_none());
+
+        // Round-trip `BuiltLir` + `declared` through `BLZLIR02` cache codec to simulate a cache hit
+        // written by another binary whose `walk` happened to contain the callee.
+        let func = build_single_loop_leaf(alloc).view().to_func_in(shared);
+        let mut statics: Vec<ItemKey, SharedAlloc<'static>> = Vec::new_in(shared);
+        statics.push(missing_static_key);
+        let mut tls: Vec<ItemKey, SharedAlloc<'static>> = Vec::new_in(shared);
+        tls.push(missing_tls_key);
+        let built = BuiltLir {
+            func,
+            funcs: Vec::new_in(shared),
+            statics,
+            c_statics: Vec::new_in(shared),
+            vtables: Vec::new_in(shared),
+            vtable_data: Vec::new_in(shared),
+            tls,
+            traps: Vec::new_in(shared),
+            c_text: Vec::new_in(shared),
+        };
+        let mut declared: Vec<DeclaredRow, SharedAlloc<'static>> = Vec::new_in(shared);
+        let mut n1: Vec<u8, SharedAlloc<'static>> = Vec::new_in(shared);
+        n1.extend_from_slice(&missing_callee_name);
+        declared.push((missing_callee_key, n1));
+        let mut n2: Vec<u8, SharedAlloc<'static>> = Vec::new_in(shared);
+        n2.extend_from_slice(&vtable_fn_name);
+        declared.push((vtable_fn_key, n2));
+
+        let cached_bytes = encode_built_lir(&built, declared.as_slice(), shared).expect("encode BLZLIR02");
+        let (decoded_built, decoded_declared) =
+            decode_built_lir(cached_bytes.as_slice(), shared).expect("decode BLZLIR02");
+
+        // Build a sealed post-LTO CodeRecord referencing `missing_callee_sym`, `missing_static_sym`,
+        // `missing_tls_sym`, plus a sealed vtable datum referencing `vtable_fn_sym`.
+        let mut rec = CodeRecord::new_in(alloc);
+        let call_t = rec.target(CodeTarget { space: Space::Func, symbol: missing_callee_sym });
+        let stat_t = rec.target(CodeTarget { space: Space::Static, symbol: missing_static_sym });
+        let tls_t = rec.target(CodeTarget { space: Space::Tls, symbol: missing_tls_sym });
+        rec.code.extend_from_slice(&0x9000_0010u32.to_le_bytes()); // 0:  adrp x16, #0
+        rec.code.extend_from_slice(&0xF940_0210u32.to_le_bytes()); // 4:  ldr x16, [x16]
+        rec.code.extend_from_slice(&0xD63F_0200u32.to_le_bytes()); // 8:  blr x16
+        rec.code.extend_from_slice(&0x9000_0000u32.to_le_bytes()); // 12: adrp x0, #0
+        rec.code.extend_from_slice(&0xF940_0000u32.to_le_bytes()); // 16: ldr x0, [x0]
+        rec.code.extend_from_slice(&0x9000_0001u32.to_le_bytes()); // 20: adrp x1, #0
+        rec.code.extend_from_slice(&0xF940_0021u32.to_le_bytes()); // 24: ldr x1, [x1]
+        rec.code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes()); // 28: ret
+        rec.sites.push(Site { at: 0, kind: SiteKind::Call, target: call_t, addend: 0 });
+        rec.sites.push(Site { at: 12, kind: SiteKind::Load, target: stat_t, addend: 0 });
+        rec.sites.push(Site { at: 20, kind: SiteKind::Load, target: tls_t, addend: 0 });
+        let sealed_rec = rec.seal().expect("seal post-LTO record");
+        let mut rec_bytes: Vec<u8, SharedAlloc<'static>> = Vec::new_in(shared);
+        let mut rec_tmp: AVec<'_, u8> = Vec::new_in(alloc);
+        sealed_rec.encode(&mut rec_tmp);
+        rec_bytes.extend_from_slice(rec_tmp.as_slice());
+
+        let mut vt = Datum::new_in(DatumPlace::ReadOnly, 3, alloc);
+        vt.bytes.resize(8, 0);
+        let vt_fn_t = vt.target(CodeTarget { space: Space::Func, symbol: vtable_fn_sym });
+        vt.words.push(RecordWord { at: 0, target: vt_fn_t, addend: 0 });
+        let sealed_vt = vt.seal().expect("seal vtable datum");
+        let mut vt_tmp: AVec<'_, u8> = Vec::new_in(alloc);
+        sealed_vt.encode(&mut vt_tmp);
+        let mut vt_bytes: Vec<u8, SharedAlloc<'static>> = Vec::new_in(shared);
+        vt_bytes.extend_from_slice(vt_tmp.as_slice());
+        let mut vtable_data: Vec<(Symbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> = Vec::new_in(shared);
+        vtable_data.push((Symbol::of_name("vt_test"), vt_bytes));
+
+        let out_bodies = [LtoBodyOut {
+            row: caller_row,
+            symbol: caller_sym,
+            record: rec_bytes,
+            vtable_data,
+            extra_declared: Vec::new_in(shared),
+            inlined_bodies: 1,
+        }];
+
+        // Positive proof: with `BLZLIR02` persisted declarations, EVERY missing Func/vtable-method/
+        // Static/Tls target is recovered with the originating declarer row.
+        let origins_ok = [LtoOrigin {
+            row: caller_row,
+            symbol: caller_sym,
+            is_seed: true,
+            orig_unreachables: 0,
+            built: decoded_built,
+            declared: decoded_declared,
+        }];
+        let missing = collect_missing_walk_targets(&walk, &origins_ok, &out_bodies, shared, alloc)
+            .expect("all missing targets must be recovered from persisted BLZLIR02 declarations");
+        assert_eq!(missing.instances.len(), 2);
+        assert_eq!(missing.instances[0].0, caller_row);
+        assert_eq!(missing.instances[0].1, missing_callee_key);
+        assert_eq!(missing.instances[0].2.as_slice(), &missing_callee_name);
+        assert_eq!(missing.instances[1].0, caller_row);
+        assert_eq!(missing.instances[1].1, vtable_fn_key);
+        assert_eq!(missing.instances[1].2.as_slice(), &vtable_fn_name);
+        assert_eq!(missing.statics.as_slice(), &[missing_static_key]);
+        assert_eq!(missing.tls.as_slice(), &[missing_tls_key]);
+
+        // Planted-bug control (Rule 23): stripping `declared` (the old BLZLIR01 bug) MUST be
+        // refused immediately with `ExportLtoError::MissingDeclared` rather than leaving a hole.
+        let (decoded_built_control, _) =
+            decode_built_lir(cached_bytes.as_slice(), shared).expect("decode BLZLIR02 control");
+        let origins_dropped_decl = [LtoOrigin {
+            row: caller_row,
+            symbol: caller_sym,
+            is_seed: true,
+            orig_unreachables: 0,
+            built: decoded_built_control,
+            declared: Vec::new_in(shared),
+        }];
+        let err = collect_missing_walk_targets(&walk, &origins_dropped_decl, &out_bodies, shared, alloc)
+            .err()
+            .expect("missing declaration must fail with ExportLtoError::MissingDeclared");
+        assert!(
+            matches!(
+                err,
+                ExportLtoError::MissingDeclared { from, target }
+                    if from == caller_sym.0 && target == CodeTarget { space: Space::Func, symbol: missing_callee_sym }
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn emitted_body_cache_codec_round_trip_and_corrupt_rejection() {
+        let shared = blaze_own::testing::heap().shared();
         // EmittedBody codec round-trip + corruption check.
         let mut extra_name: Vec<u8, SharedAlloc<'static>> = Vec::new_in(shared);
         extra_name.extend_from_slice(b"__addtf3");

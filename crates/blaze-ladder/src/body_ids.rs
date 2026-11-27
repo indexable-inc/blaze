@@ -926,6 +926,26 @@ impl<'a> Walk<'a> {
         self.reach(entry.0, entry.1, RowKind::Instance, most, NO_ROW)
     }
 
+    /// Reaches an instance `entry` whose declarer is an already-walked row `declarer` (e.g., an
+    /// extra callee discovered during export LTO) so [`local_enclosers_of`] can still trace the
+    /// declarer chain for body-local functions.
+    pub fn root_from<E>(&mut self, declarer: usize, entry: (ItemKey, &[u8]), most: usize) -> Result<usize, WalkError<E>> {
+        let by = u32::try_from(declarer).ok().filter(|&d| (d as usize) < self.symbols.len()).unwrap_or(NO_ROW);
+        self.reach(entry.0, entry.1, RowKind::Instance, most, by)
+    }
+
+    /// Reaches a `RowKind::Static` root (`item`) with nothing done for it yet, or returns its
+    /// existing row.
+    pub fn root_static<E>(&mut self, item: ItemKey, most: usize) -> Result<usize, WalkError<E>> {
+        self.reach(item, &static_name(item), RowKind::Static, most, NO_ROW)
+    }
+
+    /// Reaches a `RowKind::ThreadLocal` root (`item`) with nothing done for it yet, or returns its
+    /// existing row.
+    pub fn root_thread_local<E>(&mut self, item: ItemKey, most: usize) -> Result<usize, WalkError<E>> {
+        self.reach(item, &static_name(item), RowKind::ThreadLocal, most, NO_ROW)
+    }
+
     /// Whether row `row` is a fn instance or a static.
     pub fn kind(&self, row: usize) -> RowKind {
         self.kinds[row]
@@ -1400,6 +1420,87 @@ impl<'a> Walk<'a> {
         self.how[row] = How::Done(stepped);
         Ok(())
     }
+}
+
+/// Maximum body-local keys and same-crate declarer enclosers tracked for one walked row
+/// (`const_eval_select!` -> `is_null::runtime`, `thread_local!` closures, nested `fn`s).
+pub const MAX_LOCAL_ENCLOSERS: usize = 8;
+
+/// Body-local item keys (`LibKey::INNER` set) in a row's tabled key or generic arguments together
+/// with their outermost-first same-crate declarer chain from [`Walk::declarer`].
+#[derive(Clone, Copy)]
+pub struct LocalEnclosers {
+    pub locals: [ItemKey; MAX_LOCAL_ENCLOSERS],
+    pub locals_len: usize,
+    pub items: [ItemKey; MAX_LOCAL_ENCLOSERS],
+    pub len: usize,
+}
+
+impl Default for LocalEnclosers {
+    fn default() -> Self {
+        Self {
+            locals: [ItemKey(0); MAX_LOCAL_ENCLOSERS],
+            locals_len: 0,
+            items: [ItemKey(0); MAX_LOCAL_ENCLOSERS],
+            len: 0,
+        }
+    }
+}
+
+impl LocalEnclosers {
+    pub fn locals(&self) -> &[ItemKey] {
+        self.locals.get(..self.locals_len).unwrap_or(&[])
+    }
+
+    pub fn enclosers(&self) -> &[ItemKey] {
+        self.items.get(..self.len).unwrap_or(&[])
+    }
+}
+
+/// Collects any body-local keys (`LibKey::INNER` set) in `key` or the encoded generic arguments of
+/// `row`, together with their outermost-first same-crate declarer chain from [`Walk::declarer`]
+/// (fast-path returns empty in ~20 ns when no key is local).
+pub fn local_enclosers_of(walk: &Walk<'_>, row: usize, key: ItemKey) -> LocalEnclosers {
+    let mut out = LocalEnclosers::default();
+    let mut push_local = |k: ItemKey| {
+        if crate::front2::program::lazy::typed::is_local(k)
+            && !out.locals().contains(&k)
+            && let Some(slot) = out.locals.get_mut(out.locals_len)
+        {
+            *slot = k;
+            out.locals_len += 1;
+        }
+    };
+    push_local(key);
+    let name = walk.name(row);
+    if !name.is_empty() {
+        let _ = each_item(name, |k| push_local(k));
+    }
+    if out.locals_len == 0 {
+        return out;
+    }
+    let mut cur = row;
+    let mut hops = 0usize;
+    while let Some(parent) = walk.declarer(cur) {
+        hops += 1;
+        if hops > MAX_LOCAL_ENCLOSERS * 2 || out.len >= MAX_LOCAL_ENCLOSERS {
+            break;
+        }
+        let tabled = walk.tabled(parent);
+        let prefix = tabled.0 >> 64;
+        if out.locals().iter().any(|l| (l.0 >> 64) == prefix && *l != tabled)
+            && !out.enclosers().contains(&tabled)
+            && let Some(slot) = out.items.get_mut(out.len)
+        {
+            *slot = tabled;
+            out.len += 1;
+        }
+        cur = parent;
+    }
+    if let Some(slice) = out.items.get_mut(..out.len) {
+        slice.reverse();
+    }
+    out
 }
 
 /// [`Walk::start`]'s answer: [`Begun`] with no borrow of the walk.
