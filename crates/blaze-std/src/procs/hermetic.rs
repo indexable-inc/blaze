@@ -146,6 +146,7 @@ struct RootReaderInner {
     root: Option<crate::fs::Dir<crate::fs::ReadOnly>>,
     stalled: core::sync::atomic::AtomicBool,
     holds_reaper_slot: bool,
+    closure_cache: landlock::ClosureDigestCache,
 }
 
 #[cfg(target_os = "linux")]
@@ -222,6 +223,7 @@ impl RootReader {
                 root: Some(root),
                 stalled: core::sync::atomic::AtomicBool::new(false),
                 holds_reaper_slot: true,
+                closure_cache: landlock::ClosureDigestCache::new(),
             },
             blaze_own::SharedAlloc::global(),
         );
@@ -232,6 +234,11 @@ impl RootReader {
     /// long-lived owners should rotate in a fresh reader and let this one retire to the reaper).
     pub fn is_stalled(&self) -> bool {
         self.inner.stalled.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Caller-owned bounded inode-validated ELF closure digest cache held on this reader.
+    pub fn closure_cache(&self) -> &landlock::ClosureDigestCache {
+        &self.inner.closure_cache
     }
 
     fn io_ref(&self) -> Result<&crate::io::Io, Fault> {
@@ -851,9 +858,10 @@ impl<T> StandbyReaperCore<T> {
 
 #[cfg(target_os = "linux")]
 pub use landlock::{
-    HostLdCaps, PreloadScanner, dl_dst_lib_token, dl_dst_platform_token, expand_rpath_tokens,
-    feed_nix_runtime_closure, feed_nix_runtime_closure_with, parse_ld_so_cache_match,
-    validate_rpath_entry, x86_64_fhs_hwcap_subdirs,
+    ClosureDigestCache, HostLdCaps, InodeStamp, PreloadScanner, dl_dst_lib_token,
+    dl_dst_platform_token, expand_rpath_tokens, feed_nix_runtime_closure,
+    feed_nix_runtime_closure_with, parse_ld_so_cache_match, validate_rpath_entry,
+    x86_64_fhs_hwcap_subdirs,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use crate::rt::{AttemptSignal, LockBackend, LockPlant, LockRuntime, LockedIoHandshake, LockedIoPlant, NativeLockErr};

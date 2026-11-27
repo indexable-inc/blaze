@@ -399,7 +399,7 @@ impl HermeticClangProbe {
         let base = Self::strategy_id();
         let prog = shelf_pins::shelf_program(CLANG_JSON, host, "clang-23")
             .map_err(|e| own_fmt(format_args!("{e}"), alloc))?;
-        let mut h = blaze_ids::Hasher::new("blaze-build-script c-probe runtime closure 2");
+        let mut h = blaze_ids::Hasher::new("blaze-build-script c-probe runtime closure 3");
         h.id(&base)
             .part(host.as_bytes())
             .part(prog.shelf_path.as_bytes())
@@ -3192,5 +3192,256 @@ mod tests {
         )
         .expect_err("fact_reply_matches_with_probes must also propagate identity failures");
         assert!(match_err.as_str().contains("simulated nix runtime closure timeout"), "unexpected error: {match_err}");
+    }
+
+    /// Proves that `ClosureDigestCache` on `RootReader`:
+    /// 1. Produces 100% bit-for-bit identical closure streams & `strategy_id` on cold miss vs warm hit
+    ///    (and records cache hits on aged system/shelf libraries with zero new misses).
+    /// 2. Immediately invalidates on same-size in-place mutation, size-changing mutation, and atomic
+    ///    rename replacement of a dependency shared library.
+    /// 3. Scales cleanly across 32 concurrent threads sharing one `RootReader` with identical digests.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn closure_digest_cache_matches_cold_hash_invalidates_on_mutation_and_scales_concurrently() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let (io, _) = crate::record::native_world(&std::env::temp_dir()).expect("tmp native world");
+        let cx = io.cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME).expect("cx");
+
+        // 1. Real ELF binary (prefer unpacked clang-23 shelf binary if present, else current test exe).
+        let host = if cfg!(target_arch = "aarch64") {
+            "aarch64-unknown-linux-gnu"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        };
+        let mut target_exe = std::env::current_exe().expect("current_exe");
+        let mut is_clang = false;
+        if let Ok(home) = std::env::var("HOME")
+            && let Ok(pin) = clang_pin(CLANG_JSON, host)
+        {
+            let pin_hex = super::hex_bytes(&pin.sha256, alloc);
+            let candidate = Path::new(&home)
+                .join(crate::native_setting::SHELF_DIR)
+                .join(pin_hex.as_str())
+                .join("bin/clang-23");
+            if candidate.is_file() {
+                target_exe = candidate;
+                is_clang = true;
+            }
+        }
+        let target_str = target_exe.to_str().expect("utf8 target exe");
+
+        let mut cold_bytes = std::vec::Vec::new();
+        let cold_t0 = std::time::Instant::now();
+        let cold_ok = bstd::procs::hermetic::feed_nix_runtime_closure(&cx, target_str, alloc, &mut |chunk| {
+            cold_bytes.extend_from_slice(chunk);
+        })
+        .expect("cold closure walk");
+        let cold_elapsed = cold_t0.elapsed();
+        assert!(cold_ok, "expected ELF runtime closure for {target_str}");
+
+        let reader = bstd::procs::hermetic::RootReader::new(&cx).expect("root reader");
+        let mut first_bytes = std::vec::Vec::new();
+        let first_t0 = std::time::Instant::now();
+        let first_ok = bstd::procs::hermetic::feed_nix_runtime_closure_with(&reader, &cx, target_str, alloc, &mut |chunk| {
+            first_bytes.extend_from_slice(chunk);
+        })
+        .expect("first warm-reader walk");
+        let first_elapsed = first_t0.elapsed();
+        assert!(first_ok);
+        assert_eq!(cold_bytes, first_bytes, "cold reader and fresh shared reader must feed identical bytes");
+
+        let misses_after_first = reader.closure_cache().digest_misses();
+        let hits_before_second = reader.closure_cache().digest_hits();
+        let mut warm_bytes = std::vec::Vec::new();
+        let warm_t0 = std::time::Instant::now();
+        let warm_ok = bstd::procs::hermetic::feed_nix_runtime_closure_with(&reader, &cx, target_str, alloc, &mut |chunk| {
+            warm_bytes.extend_from_slice(chunk);
+        })
+        .expect("warm cache-hit walk");
+        let warm_elapsed = warm_t0.elapsed();
+        assert!(warm_ok);
+        assert_eq!(cold_bytes, warm_bytes, "warm cache hit must be 100% bit-for-bit identical to cold miss");
+        assert!(
+            reader.closure_cache().digest_hits() > hits_before_second,
+            "warm walk must record digest cache hits on aged system libraries"
+        );
+        assert_eq!(
+            reader.closure_cache().digest_misses(),
+            misses_after_first,
+            "warm walk over unchanged aged libraries must incur zero new digest misses"
+        );
+
+        let cold_sid = HermeticClangProbe::strategy_id_for_clang(&cx, host, target_str, alloc).expect("cold sid");
+        let warm_sid = HermeticClangProbe::strategy_id_for_clang_with(&reader, &cx, host, target_str, alloc).expect("warm sid");
+        assert_eq!(cold_sid, warm_sid, "strategy_id must be bit-for-bit identical on cold miss vs warm hit");
+
+        // 32-thread concurrent burst over one shared RootReader.
+        let conc_t0 = std::time::Instant::now();
+        let handles: std::vec::Vec<_> = (0..32)
+            .map(|_| {
+                let r = blaze_own::Share::share(&reader);
+                let io_c = blaze_own::Share::share(&io);
+                let path = target_str.to_owned();
+                let want = cold_bytes.clone();
+                std::thread::spawn(move || {
+                    let a = blaze_own::testing::heap().alloc();
+                    let tcx = io_c.cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME).expect("tcx");
+                    for _ in 0..3 {
+                        let mut got = std::vec::Vec::new();
+                        let ok = bstd::procs::hermetic::feed_nix_runtime_closure_with(&r, &tcx, &path, a, &mut |c| {
+                            got.extend_from_slice(c);
+                        })
+                        .expect("concurrent walk");
+                        assert!(ok);
+                        assert_eq!(got, want);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("concurrent worker");
+        }
+        let conc_elapsed = conc_t0.elapsed();
+        std::println!(
+            "c-probe closure ({}): cold={cold_elapsed:?}, first={first_elapsed:?}, warm={warm_elapsed:?}, 32x3_concurrent={conc_elapsed:?}, digest_hits={}, elf_hits={}",
+            if is_clang { "clang-23" } else { "test-exe" },
+            reader.closure_cache().digest_hits(),
+            reader.closure_cache().elf_hits(),
+        );
+
+        // 2. Synthetic ELF64 executable + temp DT_RUNPATH shared library: prove same-size in-place
+        //    mutation, size-changing mutation, and atomic rename replacement all change the digest.
+        let e_machine: u16 = if cfg!(target_arch = "aarch64") { 183 } else { 62 };
+        let build_so = |payload: &[u8]| -> std::vec::Vec<u8> {
+            let mut buf = std::vec![0u8; 128];
+            buf[0..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+            buf[6] = 1;
+            buf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+            buf[18..20].copy_from_slice(&e_machine.to_le_bytes());
+            buf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+            buf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+            buf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum = 1 (PT_LOAD)
+            buf[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            buf[72..80].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+            buf[80..88].copy_from_slice(&0u64.to_le_bytes()); // p_vaddr
+            buf[96..104].copy_from_slice(&(128u64 + payload.len() as u64).to_le_bytes()); // p_filesz
+            buf.extend_from_slice(payload);
+            buf
+        };
+        let host_interp: &[u8] = if cfg!(target_arch = "aarch64") {
+            b"/lib/ld-linux-aarch64.so.1"
+        } else {
+            b"/lib64/ld-linux-x86-64.so.2"
+        };
+        let tmp_dir = std::env::temp_dir().join(format!("blaze-cprobe-mut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp_dir");
+        let tmp_dir_bytes = tmp_dir.to_str().expect("utf8 tmp_dir").as_bytes();
+
+        let build_exe = || -> std::vec::Vec<u8> {
+            let interp_off = 256u64;
+            let dyn_off = 512u64;
+            let strtab_off = 768u64;
+            let soname = b"libblaze_mut_test.so\0";
+            let mut strtab = std::vec::Vec::new();
+            strtab.push(0); // off 0: ""
+            let needed_str_off = strtab.len() as u64;
+            strtab.extend_from_slice(soname);
+            let runpath_str_off = strtab.len() as u64;
+            strtab.extend_from_slice(tmp_dir_bytes);
+            strtab.push(0);
+
+            let total_size = (strtab_off as usize) + strtab.len() + 16;
+            let mut buf = std::vec![0u8; total_size];
+            buf[0..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+            buf[6] = 1;
+            buf[16..18].copy_from_slice(&3u16.to_le_bytes());
+            buf[18..20].copy_from_slice(&e_machine.to_le_bytes());
+            buf[32..40].copy_from_slice(&64u64.to_le_bytes());
+            buf[54..56].copy_from_slice(&56u16.to_le_bytes());
+            buf[56..58].copy_from_slice(&3u16.to_le_bytes()); // PT_LOAD, PT_INTERP, PT_DYNAMIC
+            // PT_LOAD covering whole file
+            let p0 = 64;
+            buf[p0..p0 + 4].copy_from_slice(&1u32.to_le_bytes());
+            buf[p0 + 8..p0 + 16].copy_from_slice(&0u64.to_le_bytes());
+            buf[p0 + 16..p0 + 24].copy_from_slice(&0u64.to_le_bytes());
+            buf[p0 + 32..p0 + 40].copy_from_slice(&(total_size as u64).to_le_bytes());
+            // PT_INTERP
+            let p1 = 64 + 56;
+            buf[p1..p1 + 4].copy_from_slice(&3u32.to_le_bytes());
+            buf[p1 + 8..p1 + 16].copy_from_slice(&interp_off.to_le_bytes());
+            buf[p1 + 32..p1 + 40].copy_from_slice(&((host_interp.len() + 1) as u64).to_le_bytes());
+            // PT_DYNAMIC (4 entries * 16 = 64 bytes)
+            let p2 = 64 + 112;
+            buf[p2..p2 + 4].copy_from_slice(&2u32.to_le_bytes());
+            buf[p2 + 8..p2 + 16].copy_from_slice(&dyn_off.to_le_bytes());
+            buf[p2 + 32..p2 + 40].copy_from_slice(&64u64.to_le_bytes());
+            // Interp bytes
+            let ioff = interp_off as usize;
+            buf[ioff..ioff + host_interp.len()].copy_from_slice(host_interp);
+            buf[ioff + host_interp.len()] = 0;
+            // Dynamic entries: DT_STRTAB(5), DT_NEEDED(1), DT_RUNPATH(29), DT_NULL(0)
+            let doff = dyn_off as usize;
+            let entries: [(u64, u64); 4] = [
+                (5, strtab_off),
+                (1, needed_str_off),
+                (29, runpath_str_off),
+                (0, 0),
+            ];
+            for (i, (tag, val)) in entries.into_iter().enumerate() {
+                buf[doff + i * 16..doff + i * 16 + 8].copy_from_slice(&tag.to_le_bytes());
+                buf[doff + i * 16 + 8..doff + i * 16 + 16].copy_from_slice(&val.to_le_bytes());
+            }
+            let soff = strtab_off as usize;
+            buf[soff..soff + strtab.len()].copy_from_slice(&strtab);
+            buf
+        };
+
+        let exe_path = tmp_dir.join("probe_bin");
+        let so_path = tmp_dir.join("libblaze_mut_test.so");
+        std::fs::write(&exe_path, build_exe()).expect("write probe_bin");
+        std::fs::write(&so_path, build_so(b"PAYLOAD_AAAA")).expect("write so A");
+
+        let hash_closure = |r: &bstd::procs::hermetic::RootReader| -> [u8; 32] {
+            let mut h = blaze_sha256::Sha256::new();
+            let ok = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+                r,
+                &cx,
+                exe_path.to_str().expect("utf8 exe"),
+                alloc,
+                &mut |chunk| { h.update(chunk); },
+            )
+            .expect("synthetic closure walk");
+            assert!(ok);
+            h.finish()
+        };
+
+        let dig_a = hash_closure(&reader);
+        // Same-size in-place write (racy-clean window prevents stale hit!).
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&so_path).expect("open so in-place");
+            f.write_all(&build_so(b"PAYLOAD_BBBB")).expect("overwrite same-size in-place");
+        }
+        let dig_b = hash_closure(&reader);
+        assert_ne!(dig_a, dig_b, "same-size in-place mutation of shared library must invalidate closure digest");
+
+        // Size-changing in-place write.
+        std::fs::write(&so_path, build_so(b"PAYLOAD_CCCCCCCC")).expect("write so C");
+        let dig_c = hash_closure(&reader);
+        assert_ne!(dig_b, dig_c, "size-changing mutation of shared library must invalidate closure digest");
+
+        // Atomic rename replacement (new inode).
+        let so_tmp = tmp_dir.join("libblaze_mut_test.so.new");
+        std::fs::write(&so_tmp, build_so(b"PAYLOAD_DDDDDDDD")).expect("write so D");
+        std::fs::rename(&so_tmp, &so_path).expect("atomic rename so");
+        let dig_d = hash_closure(&reader);
+        assert_ne!(dig_c, dig_d, "atomic rename replacement of shared library must invalidate closure digest");
+
+        // Fresh cold RootReader must agree bit-for-bit with dig_d.
+        let fresh_reader = bstd::procs::hermetic::RootReader::new(&cx).expect("fresh reader");
+        assert_eq!(dig_d, hash_closure(&fresh_reader), "cold reader must match warm reader after mutation");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

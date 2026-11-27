@@ -924,6 +924,123 @@ struct CompiledWasm64 {
     macros: std::vec::Vec<Exported>,
 }
 
+struct TcUnit<'a> {
+    name: &'a str,
+    edition: Edition,
+    root: &'a str,
+    prefix: &'a str,
+    features: &'a [&'a str],
+    raw_deps: &'a [(&'a str, usize)],
+    pack: PackView<'a>,
+    key: CrateItemKey,
+    role: Role,
+    proc_macro: bool,
+}
+
+struct TcPackTexts<'a, 'u> {
+    units: &'u [TcUnit<'a>],
+    arena: &'a Arena,
+}
+
+impl<'a> SourceTexts<'a> for TcPackTexts<'a, '_> {
+    fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
+        let u = self.units.get(krate)?;
+        let rel = path.strip_prefix(u.prefix)?;
+        let entry = u.pack.find_entry(rel)?;
+        let local = self.arena.local();
+        let bytes: &'a [u8] = match entry.read_in(&local).ok()? {
+            FileBytes::Borrowed(bytes) => bytes,
+            FileBytes::Owned(bytes) => local.alloc_slice_copy(bytes.as_slice()),
+        };
+        core::str::from_utf8(bytes).ok()
+    }
+}
+
+/// Scans `core` and `std` closures of the `wasm64-blaze-wasip1` toolchain units under `tc_cfg`
+/// using `blaze_scope::lib_features::LibFeatures` (mirroring `blaze_world::script_setting::scan_phases`)
+/// so `#![feature(..)]` probes such as `rustix`'s `#![feature(wasi_ext)]` are answered cleanly from
+/// the pinned toolchain's own stability attributes.
+fn scan_wasm64_feature_rows<'a>(
+    triple: &str,
+    tc_units: &[TcUnit<'a>],
+    tc_at: &[usize],
+    tc_cfg: &[(&str, Option<&str>)],
+    arena: &'a Arena,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, blaze_build_script::probe::Row>, blaze_own::AString<'a>> {
+    use blaze_build_script::probe_ask::{Needs, feature_rows};
+    use blaze_scope::lib_features::{LibFeatures, LibFeaturesOpts};
+
+    let texts = TcPackTexts { units: tc_units, arena };
+    let mut features = LibFeatures::new(LibFeaturesOpts { alloc });
+    let mut seen: AVec<'a, bool> = OwnVec::new_in(alloc);
+    seen.resize(tc_units.len(), false);
+    let mut rows: AVec<'a, blaze_build_script::probe::Row> = OwnVec::new_in(alloc);
+
+    for (needs, role) in [(Needs::Core, Role::Core), (Needs::Std, Role::Std)] {
+        let Some(root_idx) = tc_units
+            .iter()
+            .position(|u| u.role == role)
+            .or_else(|| tc_units.iter().position(|u| u.name == needs.krate()))
+        else {
+            continue;
+        };
+        let mut stack: AVec<'a, usize> = OwnVec::new_in(alloc);
+        let mut phase_crates: AVec<'a, usize> = OwnVec::new_in(alloc);
+        stack.push(root_idx);
+        while let Some(at) = stack.pop() {
+            let Some(slot) = seen.get_mut(at) else {
+                continue;
+            };
+            if core::mem::replace(slot, true) {
+                continue;
+            }
+            phase_crates.push(at);
+            if let Some(unit) = tc_units.get(at) {
+                for &(_, raw_dep) in unit.raw_deps {
+                    if let Some(&mapped) = tc_at.get(raw_dep)
+                        && mapped != usize::MAX
+                    {
+                        stack.push(mapped);
+                    }
+                }
+            }
+        }
+        for &at in phase_crates.iter() {
+            let Some(unit) = tc_units.get(at) else {
+                continue;
+            };
+            let staged = texts
+                .read(at, unit.root)
+                .is_some_and(|text| text.contains("staged_api"));
+            if !staged {
+                continue;
+            }
+            let mut atoms: AVec<'a, (&str, Option<&str>)> =
+                OwnVec::with_capacity_in(tc_cfg.len() + unit.features.len(), alloc);
+            atoms.extend_from_slice(tc_cfg);
+            for &feat in unit.features {
+                atoms.push(("feature", Some(feat)));
+            }
+            let cfg = blaze_scope::task::Cfg::from_atoms(atoms.as_slice(), alloc);
+            if let Err(why) = features.scan(&texts, at, unit.root, &cfg) {
+                let mut msg = blaze_own::String::new_in(alloc);
+                let _ = write!(msg, "scan library features of `{}` for {triple}: {why}", unit.name);
+                return Err(msg);
+            }
+        }
+        let listed = features.listed(alloc);
+        rows.extend_from_slice(&feature_rows(
+            triple,
+            needs,
+            listed.declared.as_slice(),
+            listed.mentioned.as_slice(),
+            alloc,
+        ));
+    }
+    Ok(rows)
+}
+
 /// Runs a dependency crate's build script on `wasm64-blaze-wasip1` so crates like `proc-macro2`
 /// under `serde_derive` receive their exact `rustc-cfg` atoms and `OUT_DIR` files during compilation.
 #[expect(clippy::too_many_arguments, reason = "dependency build-script execution on wasm64")]
@@ -937,6 +1054,7 @@ fn run_dep_build_script(
     bs_id: UnitId,
     tc_cfg: &[(std::string::String, Option<std::string::String>)],
     tc_names: &[std::string::String],
+    tc_feature_rows: &[blaze_build_script::probe::Row],
     depth: u8,
 ) -> Result<std::vec::Vec<u8>, SelfCompileError> {
     // Ensure the build script's own wasm64 module exists first.
@@ -1000,6 +1118,7 @@ fn run_dep_build_script(
     let shipped = tc_names.iter().map(|s| s.as_str());
     let rows = blaze_world::script_setting::pinned_table(WASM64_TARGET, shipped, alloc);
     let mut table: std::vec::Vec<blaze_build_script::probe::Row> = rows.as_slice().to_vec();
+    table.extend_from_slice(tc_feature_rows);
     table.sort_unstable_by_key(|r| r.key);
     let files_digest = members
         .iter()
@@ -1269,19 +1388,6 @@ fn compile_unit_in<'a>(
         .map(|(n, v)| (n.to_owned(), v.map(str::to_owned)))
         .collect();
 
-    struct TcUnit<'a> {
-        name: &'a str,
-        edition: Edition,
-        root: &'a str,
-        prefix: &'a str,
-        features: &'a [&'a str],
-        raw_deps: std::vec::Vec<(&'a str, usize)>,
-        pack: PackView<'a>,
-        key: CrateItemKey,
-        role: Role,
-        proc_macro: bool,
-    }
-
     let mut tc_at = std::vec![usize::MAX; all_tc.len()];
     let mut tc_units: std::vec::Vec<TcUnit<'_>> = std::vec::Vec::new();
     let mut tc_names: std::vec::Vec<std::string::String> = std::vec::Vec::new();
@@ -1317,17 +1423,22 @@ fn compile_unit_in<'a>(
         let key = CrateItemKey(ContentId::of("blaze wasm64 tc unit", &key_bytes));
         tc_at[u] = tc_units.len();
         tc_names.push(krate.lib.to_owned());
+        let raw_deps: &[(&str, usize)] = if is_pm {
+            &[]
+        } else {
+            let mut rdeps: OwnVec<(&str, usize), Bump<'_>> = OwnVec::new_in(bump);
+            for (n, d) in row.deps() {
+                rdeps.push((&*bump.alloc_str(n), usize::try_from(d).unwrap_or(usize::MAX)));
+            }
+            rdeps.into_bump_slice()
+        };
         tc_units.push(TcUnit {
             name: bump.alloc_str(krate.lib),
             edition: ed,
             root,
             prefix,
             features: feats.into_bump_slice(),
-            raw_deps: if is_pm {
-                std::vec::Vec::new()
-            } else {
-                row.deps().map(|(n, d)| (&*bump.alloc_str(n), d as usize)).collect()
-            },
+            raw_deps,
             pack,
             key,
             role: krate.role,
@@ -1336,8 +1447,22 @@ fn compile_unit_in<'a>(
     }
 
     // 2. Run build scripts for crates in `unit_order` on `wasm64-blaze-wasip1` (e.g., `proc-macro2`
-    //    under `serde_derive`, or `rustversion`'s own `build.rs` when compiling `rustversion`) so
+    //    under `serde_derive`, `rustix` under `raft-proto`, or `rustversion`'s own `build.rs`) so
     //    their `rustc-cfg` atoms and `OUT_DIR` are joined into each CrateInput.
+    let needs_dep_scripts = unit_order.iter().any(|&uid| {
+        !(uid == root_unit && mode == CompileMode::BuildScript)
+            && graph.units.get(uid.index()).and_then(|u| u.build_script).is_some()
+    });
+    let tc_feature_rows = if needs_dep_scripts {
+        let mut cfg_refs: AVec<'_, (&str, Option<&str>)> = OwnVec::with_capacity_in(tc_cfg_owned.len(), alloc);
+        for (n, v) in &tc_cfg_owned {
+            cfg_refs.push((n.as_str(), v.as_deref()));
+        }
+        scan_wasm64_feature_rows(WASM64_TARGET, &tc_units, &tc_at, cfg_refs.as_slice(), arena, alloc)
+            .map_err(|e| SelfCompileError::Failed(e.as_str().into()))?
+    } else {
+        OwnVec::new_in(alloc)
+    };
     let mut dep_script_bytes: HashMap<UnitId, &[u8]> = HashMap::new();
     for &uid in unit_order {
         if uid == root_unit && mode == CompileMode::BuildScript {
@@ -1354,6 +1479,7 @@ fn compile_unit_in<'a>(
                 bs_id,
                 &tc_cfg_owned,
                 &tc_names,
+                tc_feature_rows.as_slice(),
                 depth,
             )?;
             let slice: &[u8] = bump.alloc_slice_copy(&encoded);
@@ -1588,7 +1714,7 @@ fn compile_unit_in<'a>(
         cfg.sort_unstable();
         cfg.dedup();
         let mut deps: OwnVec<(&str, usize), Bump<'_>> = OwnVec::with_capacity_in(u.raw_deps.len(), bump);
-        for &(name, raw_d) in &u.raw_deps {
+        for &(name, raw_d) in u.raw_deps {
             let mapped = tc_at[raw_d];
             if mapped == usize::MAX {
                 return Err(SelfCompileError::Failed(std::format!(
@@ -2287,4 +2413,212 @@ fn publish_sysroot_crate(
         let _ = std::fs::remove_dir_all(&stage);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod wasm64_probe_table_tests {
+    use blaze_build_script::probe::Table;
+    use blaze_build_script::probe_ask::{Ask, By, Rejection, Verdict, answer, classify};
+    use blaze_fetch::PackView;
+    use blaze_mem::{Arena, Frame, Tag};
+    use blaze_own::Erased;
+    use blaze_surface::Edition;
+    use blaze_toolchain::{Role, ToolchainView};
+
+    use super::{TcUnit, WASM64_TARGET, scan_wasm64_feature_rows};
+
+    #[test]
+    fn wasm64_dep_probe_table_answers_rustix_wasi_ext_and_rejects_unknown_feature() {
+        let frame = Frame::with_reserve(16 << 20, Tag::Other).expect("frame");
+        let erased = Erased::new(&frame);
+        let alloc = erased.handle();
+        let arena = Arena::new(Tag::Other);
+
+        // Synthetic staged `core` and WASI `std` packs declaring `wasi_ext` under `target_os = "wasi"`.
+        let core_src = b"#![no_std]\n#![feature(staged_api)]\n#![stable(feature = \"rust1\", since = \"1.0.0\")]\n";
+        let std_src = concat!(
+            "#![no_std]\n",
+            "#![feature(staged_api)]\n",
+            "#![stable(feature = \"rust1\", since = \"1.0.0\")]\n",
+            "#[cfg(all(target_family = \"wasm\", target_os = \"wasi\", target_env = \"p1\"))]\n",
+            "#[unstable(feature = \"wasi_ext\", issue = \"71213\")]\n",
+            "pub mod wasi_fs {}\n",
+        )
+        .as_bytes();
+
+        let pack_of = |files: &[(&str, &[u8])]| -> std::vec::Vec<u8> {
+            let limits = blaze_fetch::pack::Limits { most_files: 64, most_bytes: 1 << 20, most_path: 256 };
+            let mut builder = blaze_fetch::pack::Builder::new(
+                blaze_fetch::pack::Kind::Tree,
+                [7; 32],
+                limits,
+                0,
+                alloc,
+            )
+            .expect("pack builder");
+            for &(p, b) in files {
+                builder.file(p, blaze_fetch::Mode::File, b).expect("pack file");
+            }
+            builder.finish().expect("pack finish").to_vec()
+        };
+        let core_bytes = pack_of(&[("src/lib.rs", core_src)]);
+        let std_bytes = pack_of(&[("src/lib.rs", std_src)]);
+        let core_pack = PackView::open_verified(&core_bytes).expect("core pack");
+        let std_pack = PackView::open_verified(&std_bytes).expect("std pack");
+
+        let tc_units = std::vec![
+            TcUnit {
+                name: "core",
+                edition: Edition::E2024,
+                root: "/toolchain/0/src/lib.rs",
+                prefix: "/toolchain/0/",
+                features: &[],
+                raw_deps: &[],
+                pack: core_pack,
+                key: blaze_id::CrateItemKey(blaze_id::ContentId([1; 32])),
+                role: Role::Core,
+                proc_macro: false,
+            },
+            TcUnit {
+                name: "std",
+                edition: Edition::E2024,
+                root: "/toolchain/1/src/lib.rs",
+                prefix: "/toolchain/1/",
+                features: &[],
+                raw_deps: &[("core", 0)],
+                pack: std_pack,
+                key: blaze_id::CrateItemKey(blaze_id::ContentId([2; 32])),
+                role: Role::Std,
+                proc_macro: false,
+            },
+        ];
+        let tc_at = [0usize, 1usize];
+        let tc_cfg: [(&str, Option<&str>); 3] = [
+            ("target_family", Some("wasm")),
+            ("target_os", Some("wasi")),
+            ("target_env", Some("p1")),
+        ];
+
+        let feat_rows = scan_wasm64_feature_rows(WASM64_TARGET, &tc_units, &tc_at, &tc_cfg, &arena, alloc)
+            .expect("scan wasm64 feature rows");
+        let mut table: std::vec::Vec<_> =
+            blaze_world::script_setting::pinned_table(WASM64_TARGET, ["core", "std"].into_iter(), alloc)
+                .as_slice()
+                .to_vec();
+        table.extend_from_slice(feat_rows.as_slice());
+        table.sort_unstable_by_key(|r| r.key);
+
+        let args = ["--crate-type=rlib", "--emit=metadata", "--target", WASM64_TARGET, "-o", "-", "-"];
+        let Ask::Compile(compile) = classify(&args, alloc).expect("classify rustix probe") else {
+            panic!("expected Compile ask");
+        };
+        let rustix_snippet = b"#![allow(stable_features)]\n#![feature(wasi_ext)]\n";
+        let got = answer(&compile, crate::graph::TRIPLE, rustix_snippet, &Table { rows: &table });
+        assert_eq!(got.target, WASM64_TARGET);
+        assert_eq!(got.verdict, Verdict::Accepted(By::Decided), "rustix wasi_ext probe must be accepted on wasm64-blaze-wasip1");
+
+        // Negative control: unknown library feature must be rejected with E0635.
+        let bad_snippet = b"#![allow(stable_features)]\n#![feature(totally_unknown_wasi_feat)]\n";
+        let bad = answer(&compile, crate::graph::TRIPLE, bad_snippet, &Table { rows: &table });
+        assert_eq!(
+            bad.verdict,
+            Verdict::Rejected(Rejection::UnknownFeature { at: 38, len: 25 }),
+            "unknown feature on wasm64-blaze-wasip1 must be refused E0635"
+        );
+
+        // If the host's pinned toolchain shelf is installed under `$HOME/.blaze/v2/toolchain`,
+        // ALSO verify against the real pinned `wasm64-blaze-wasip1` `core`/`std` packs!
+        if let Ok(home) = std::env::var("HOME") {
+            let shelf_path = std::path::PathBuf::from(home).join(".blaze/v2/toolchain");
+            let tc_id = blaze_toolchain::PINNED;
+            if shelf_path.join(std::format!("{tc_id}")).is_file() {
+                let mut shelf = blaze_ladder::crates::DirShelf::new(shelf_path.to_string_lossy().into_owned());
+                let mf = blaze_toolchain::shelf::open_manifest(&mut shelf, tc_id).expect("real manifest");
+                let view = ToolchainView::open(mf.as_ref(), tc_id).expect("real view");
+                let sys = blaze_toolchain::sysroot(&view, WASM64_TARGET, false).expect("real sysroot");
+                let all: std::vec::Vec<_> = view.units(WASM64_TARGET).expect("real units").collect();
+                let mut keep = std::vec![false; all.len()];
+                let mut todo = std::vec![sys.core.0 as usize, sys.alloc.0 as usize, sys.std.0 as usize];
+                while let Some(u) = todo.pop() {
+                    if keep[u] { continue; }
+                    keep[u] = true;
+                    todo.extend(all[u].deps().map(|(_, d)| d as usize));
+                }
+                let real_cfg: std::vec::Vec<_> = view
+                    .cfg(WASM64_TARGET)
+                    .expect("real cfg")
+                    .map(|(n, v)| (n.to_owned(), v.map(str::to_owned)))
+                    .collect();
+                let mut real_at = std::vec![usize::MAX; all.len()];
+                let mut real_units = std::vec::Vec::new();
+                let mut real_names = std::vec::Vec::new();
+                let bump = erased.bump();
+                for (u, row) in all.iter().enumerate() {
+                    if !keep[u] || row.kind != blaze_toolchain::UnitKind::Lib || row.for_host {
+                        continue;
+                    }
+                    let krate = view.krate(row.krate);
+                    let sf = blaze_toolchain::shelf::open_pack(&mut shelf, tc_id, &krate).expect("real pack");
+                    let held: &blaze_ladder::crates::ShelfFile =
+                        blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(sf, &frame));
+                    let pack = PackView::open_verified(held.as_ref()).expect("verified real pack");
+                    let prefix = bump.alloc_str(&std::format!("/toolchain/{u}/"));
+                    let root_str = if krate.dir.is_empty() || row.root.starts_with(krate.dir) {
+                        std::format!("{prefix}{}", row.root)
+                    } else {
+                        std::format!("{prefix}{}/{}", krate.dir, row.root)
+                    };
+                    let mut feats: blaze_own::Vec<&str, _> = blaze_own::Vec::new_in(bump);
+                    for f in row.features() {
+                        feats.push(bump.alloc_str(f));
+                    }
+                    real_at[u] = real_units.len();
+                    real_names.push(krate.lib.to_owned());
+                    let mut rdeps: blaze_own::Vec<(&str, usize), _> = blaze_own::Vec::new_in(bump);
+                    for (n, d) in row.deps() {
+                        rdeps.push((&*bump.alloc_str(n), d as usize));
+                    }
+                    real_units.push(TcUnit {
+                        name: bump.alloc_str(krate.lib),
+                        edition: Edition::E2024,
+                        root: bump.alloc_str(&root_str),
+                        prefix,
+                        features: feats.into_bump_slice(),
+                        raw_deps: rdeps.into_bump_slice(),
+                        pack,
+                        key: blaze_id::CrateItemKey(blaze_id::ContentId([0; 32])),
+                        role: krate.role,
+                        proc_macro: false,
+                    });
+                }
+                let mut real_cfg_refs: blaze_own::Vec<(&str, Option<&str>), _> = blaze_own::Vec::new_in(alloc);
+                for (n, v) in &real_cfg {
+                    real_cfg_refs.push((n.as_str(), v.as_deref()));
+                }
+                let real_feat = scan_wasm64_feature_rows(WASM64_TARGET, &real_units, &real_at, real_cfg_refs.as_slice(), &arena, alloc)
+                    .expect("scan real wasm64 toolchain");
+                let mut real_table: std::vec::Vec<_> = blaze_world::script_setting::pinned_table(
+                    WASM64_TARGET,
+                    real_names.iter().map(std::string::String::as_str),
+                    alloc,
+                )
+                .as_slice()
+                .to_vec();
+                real_table.extend_from_slice(real_feat.as_slice());
+                real_table.sort_unstable_by_key(|r| r.key);
+                let real_got = answer(&compile, crate::graph::TRIPLE, rustix_snippet, &Table { rows: &real_table });
+                assert_eq!(
+                    real_got.verdict,
+                    Verdict::Accepted(By::Decided),
+                    "real pinned wasm64-blaze-wasip1 toolchain must accept rustix's wasi_ext probe"
+                );
+                let real_bad = answer(&compile, crate::graph::TRIPLE, bad_snippet, &Table { rows: &real_table });
+                assert_eq!(
+                    real_bad.verdict,
+                    Verdict::Rejected(Rejection::UnknownFeature { at: 38, len: 25 }),
+                    "real pinned wasm64-blaze-wasip1 toolchain must reject unknown feature with E0635"
+                );
+            }
+        }
+    }
 }
