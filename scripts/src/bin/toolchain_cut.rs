@@ -38,7 +38,7 @@ use std::time::Instant;
 use blaze_fetch::pack::{Builder, Kind, Limits as PackLimits};
 use blaze_fetch::tree::{self, Entry as TreeEntry};
 use blaze_fetch::unpack::{self, Limits as UnpackLimits};
-use blaze_fetch::{Blake3, Mode, PackView};
+use blaze_fetch::{Blake3, Mode, PackView, SourceId};
 use blaze_manifest::layout::{Entry, Layout, Need, Pass as LayoutPass, Units};
 use blaze_manifest::lock::{Checksum, Lock, LockId, LockSource};
 use blaze_own::{Alloc, Vec as AVec};
@@ -55,6 +55,14 @@ struct Args {
     tree: String,
     targets: Vec<String>,
     registry: String,
+    /// Optional path to blaze's fetched source packs (`$HOME/.blaze/v2/sources`). When present,
+    /// workspace registry crates already stored there are verified with `PackView::open_source`
+    /// and reused without `.crate` archives.
+    sources: String,
+    /// When `true`, download any missing workspace registry `.crate` directly from
+    /// `https://static.crates.io/crates/<name>/<name>-<version>.crate` into `registry`, verifying
+    /// its SHA-256 against `Cargo.lock` before use (zero cargo required).
+    fetch: bool,
     shelf: String,
     write_pin: bool,
     check: bool,
@@ -65,12 +73,15 @@ struct Args {
 }
 
 impl Input for Args {
-    const FIELDS: &'static [&'static str] = &["tree", "targets", "registry", "shelf", "write_pin", "check", "macro_side", "cfront"];
+    const FIELDS: &'static [&'static str] =
+        &["tree", "targets", "registry", "sources", "fetch", "shelf", "write_pin", "check", "macro_side", "cfront"];
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         Ok(Args {
             tree: f.str("tree", None)?,
             targets: f.strs_required("targets")?,
-            registry: f.str("registry", None)?,
+            registry: f.str("registry", Some(""))?,
+            sources: f.str("sources", Some(""))?,
+            fetch: f.bool("fetch", Some(false))?,
             shelf: f.str("shelf", None)?,
             write_pin: f.bool("write_pin", Some(false))?,
             check: f.bool("check", Some(false))?,
@@ -78,6 +89,13 @@ impl Input for Args {
             cfront: f.str("cfront", Some(""))?,
         })
     }
+}
+
+/// Where workspace registry crates come from while resolving `blaze-std`.
+struct RegistrySource<'a> {
+    registry: Option<&'a Path>,
+    sources: Option<&'a Path>,
+    fetch: bool,
 }
 
 fn fail(message: &str) -> ! {
@@ -254,9 +272,36 @@ fn side(origin: Origin, dir: &Path, alloc: Alloc<'static>) -> Side {
     Side { origin, dir: dir.to_path_buf(), lock, units, packs: BTreeMap::new(), folders: BTreeMap::new() }
 }
 
+/// Downloads `<name>-<version>.crate` from static.crates.io into `registry`, verifies its
+/// SHA-256 against `sha256` before renaming into place, and returns the verified bytes.
+fn fetch_crate(what: &str, name: &str, version: &str, sha256: [u8; 32], registry: &Path) -> Vec<u8> {
+    std::fs::create_dir_all(registry).unwrap_or_else(|e| fail(&format!("{what}: {}: {e}", registry.display())));
+    let file = registry.join(format!("{name}-{version}.crate"));
+    let temporary = registry.join(format!(".{name}-{version}.crate.{}", std::process::id()));
+    let url = format!("https://static.crates.io/crates/{name}/{name}-{version}.crate");
+    let status = std::process::Command::new("curl")
+        .args(["--proto", "=https", "--tlsv1.2", "-fsSL", "--retry", "3", "--max-time", "60", "-o"])
+        .arg(&temporary)
+        .arg(&url)
+        .status()
+        .unwrap_or_else(|e| fail(&format!("{what}: running curl for {url}: {e}")));
+    if !status.success() {
+        let _ = std::fs::remove_file(&temporary);
+        fail(&format!("{what}: curl {url} exited with {status}"));
+    }
+    let archive = std::fs::read(&temporary).unwrap_or_else(|e| fail(&format!("{what}: {}: {e}", temporary.display())));
+    let found = blaze_fetch::Digest::of(blaze_fetch::Algo::Sha256, &archive);
+    if found.bytes() != sha256 {
+        let _ = std::fs::remove_file(&temporary);
+        fail(&format!("{what}: {url} is not the `.crate` the lock pins (its SHA-256 is {})", found.hex()));
+    }
+    std::fs::rename(&temporary, &file).unwrap_or_else(|e| fail(&format!("{what}: {}: {e}", file.display())));
+    archive
+}
+
 /// The package a need names: a vendored copy under `library/vendor`, or a registry crate's
-/// pack made from the `.crate` the lock pins.
-fn answer(side: &mut Side, id: LockId, registry: &Path, alloc: Alloc<'static>) -> Package<'static> {
+/// pack made from the `.crate` the lock pins (or read directly from blaze's verified source packs).
+fn answer(side: &mut Side, id: LockId, source: &RegistrySource<'_>, alloc: Alloc<'static>) -> Package<'static> {
     let p = side.lock.package(id);
     let (name, version) = (p.name.as_str(), p.version.to_string());
     let what = format!("{name} {version} ({})", side.dir.join("Cargo.lock").display());
@@ -269,16 +314,36 @@ fn answer(side: &mut Side, id: LockId, registry: &Path, alloc: Alloc<'static>) -
         (LockSource::Registry { .. }, Origin::Workspace) => {
             let Checksum::Sha256(hex) = &p.checksum else { fail(&format!("{what}: the lock has no checksum")) };
             let Some(sha256) = parse_hex(hex.as_str().as_bytes()) else { fail(&format!("{what}: a checksum that is not 64 hex digits")) };
-            let file = registry.join(format!("{name}-{version}.crate"));
-            let archive = std::fs::read(&file).unwrap_or_else(|e| fail(&format!("{what}: {}: {e}", file.display())));
-            let found = blaze_fetch::Digest::of(blaze_fetch::Algo::Sha256, &archive);
-            if found.bytes() != sha256 {
-                fail(&format!("{what}: {} is not the `.crate` the lock pins (its SHA-256 is {})", file.display(), found.hex()));
-            }
-            let (pack, _) = unpack::crate_record(name, &version, sha256, &archive, &UnpackLimits::REAL, alloc)
-                .unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e))));
-            let pack: &'static [u8] = pack.leak_static();
-            let view = PackView::open_verified(pack).unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e))));
+            let source_id = SourceId::Crate { name, version: &version, sha256 };
+            let (pack, view): (&'static [u8], PackView<'static>) = if let Some(sources) = source.sources
+                && let Ok(bytes) = std::fs::read(sources.join(source_id.key().to_string()))
+            {
+                let pack: &'static [u8] = bytes.leak();
+                let view = PackView::open_source(&source_id, pack)
+                    .unwrap_or_else(|e| fail(&format!("{what}: source pack in {}: {}", sources.display(), blaze_text::Shown(&e))));
+                (pack, view)
+            } else {
+                let Some(registry) = source.registry else {
+                    fail(&format!("{what}: not found in `sources` and `registry` was not provided"));
+                };
+                let file = registry.join(format!("{name}-{version}.crate"));
+                let archive = match std::fs::read(&file) {
+                    Ok(bytes) => {
+                        let found = blaze_fetch::Digest::of(blaze_fetch::Algo::Sha256, &bytes);
+                        if found.bytes() != sha256 {
+                            fail(&format!("{what}: {} is not the `.crate` the lock pins (its SHA-256 is {})", file.display(), found.hex()));
+                        }
+                        bytes
+                    }
+                    Err(_) if source.fetch => fetch_crate(&what, name, &version, sha256, registry),
+                    Err(e) => fail(&format!("{what}: {}: {e}", file.display())),
+                };
+                let (pack, _) = unpack::crate_record(name, &version, sha256, &archive, &UnpackLimits::REAL, alloc)
+                    .unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e))));
+                let pack: &'static [u8] = pack.leak_static();
+                let view = PackView::open_verified(pack).unwrap_or_else(|e| fail(&format!("{what}: {}", blaze_text::Shown(&e))));
+                (pack, view)
+            };
             let units = layout(&Files::Pack(view), "", alloc).unwrap_or_else(|e| fail(&format!("{what}: {e}")));
             side.packs.insert(id, pack);
             member_named(&units, name, alloc).unwrap_or_else(|| fail(&format!("{what}: its `.crate` holds no package `{name}`")))
@@ -354,7 +419,7 @@ const SYSROOT_FEATURES: &[&str] = &["backtrace"];
 
 /// `root`'s unit graph on `side` for `target`, with `features` asked of it besides its
 /// default ones: what the sysroot's part from that tree is.
-fn resolve(side: &mut Side, root: &str, features: &[&str], target: &'static TargetDesc<'static>, registry: &Path, alloc: Alloc<'static>) -> UnitGraph<'static> {
+fn resolve(side: &mut Side, root: &str, features: &[&str], target: &'static TargetDesc<'static>, source: &RegistrySource<'_>, alloc: Alloc<'static>) -> UnitGraph<'static> {
     let written = side.units.resolver.as_ref().map(|(r, _)| r.as_str());
     let resolver = Resolver::of(written, side.units.root_edition).unwrap_or_else(|_| fail(&format!("{}: an unknown resolver {written:?}", side.dir.display())));
     let lock = side.lock;
@@ -390,7 +455,7 @@ fn resolve(side: &mut Side, root: &str, features: &[&str], target: &'static Targ
             }
             Pass::Need(needs) => {
                 for id in needs.iter() {
-                    let package = answer(side, *id, registry, alloc);
+                    let package = answer(side, *id, source, alloc);
                     res.package(*id, Some(package)).unwrap_or_else(|e| fail(&format!("{}: {e}", side.dir.display())));
                 }
             }
@@ -712,7 +777,13 @@ fn main() {
     let alloc: Alloc<'static> = erased.handle();
     let started = Instant::now();
     let tree = PathBuf::from(&args.tree);
-    let registry = PathBuf::from(&args.registry);
+    let registry_buf = (!args.registry.is_empty()).then(|| PathBuf::from(&args.registry));
+    let sources_buf = (!args.sources.is_empty()).then(|| PathBuf::from(&args.sources));
+    let source = RegistrySource {
+        registry: registry_buf.as_deref(),
+        sources: sources_buf.as_deref(),
+        fetch: args.fetch,
+    };
     let mut library = side(Origin::Library, &tree.join("library"), alloc);
     let mut workspace = side(Origin::Workspace, &tree, alloc);
 
@@ -728,8 +799,8 @@ fn main() {
         let (desc, atoms) = target_desc(&tree, triple, alloc);
         target_cfgs.push(atoms);
         let target: &'static TargetDesc<'static> = Box::leak(Box::new(desc));
-        let lib_graph = resolve(&mut library, "sysroot", SYSROOT_FEATURES, target, &registry, alloc);
-        let ws_graph = resolve(&mut workspace, "blaze-std", &[], target, &registry, alloc);
+        let lib_graph = resolve(&mut library, "sysroot", SYSROOT_FEATURES, target, &source, alloc);
+        let ws_graph = resolve(&mut workspace, "blaze-std", &[], target, &source, alloc);
         let units = cut_target(&[(Origin::Library, &lib_graph, &library), (Origin::Workspace, &ws_graph, &workspace)], &mut facts);
         cut.push((triple.to_string(), units));
     }
@@ -953,7 +1024,8 @@ mod tests {
         let (desc, _) = target_desc(tree, triple, alloc);
         let target: &'static TargetDesc<'static> = Box::leak(Box::new(desc));
         // The library side reads its registry crates from `library/vendor`, never the registry.
-        let graph = resolve(&mut library, "sysroot", features, target, Path::new("/registry-unused"), alloc);
+        let unused = RegistrySource { registry: None, sources: None, fetch: false };
+        let graph = resolve(&mut library, "sysroot", features, target, &unused, alloc);
         let std = graph
             .units
             .iter()
