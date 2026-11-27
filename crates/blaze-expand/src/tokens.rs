@@ -536,6 +536,7 @@ impl<'a> TokenStream<'a> {
             site: hygiene.site,
             transparency: hygiene.transparency,
             edition: innermost.edition,
+            local_inner: hygiene.local_inner,
         })
     }
 
