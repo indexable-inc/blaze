@@ -34,11 +34,11 @@ environment variables. An existing script moves to this when next changed.
 
 ## docs-stay-small (rule 49)
 
-The plan is one page (`docs/v2/plan.md`), with the ledger, the bounds and one spec per design that
-is not yet built. Write no lane notes, pass reports, status files or indexes of indexes: what was
-done is the commit and the pull request. A design that changes edits its spec in place; a spec whose
-design is built is deleted or becomes a current doc. Delete a doc that is no longer true or needed
-in the same change; git keeps it.
+The plan is one page (`docs/v2/plan.md`), with the decisions (`docs/v2/plan/decisions.json`), the
+bounds and one spec per design that is not yet built. Write no lane notes, pass reports, status
+files or indexes of indexes: what was done is the commit and the pull request. A design that changes
+edits its spec in place; a spec whose design is built is deleted or becomes a current doc. Delete a
+doc that is no longer true or needed in the same change; git keeps it.
 
 See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 

@@ -1,6 +1,6 @@
 ---
 status: current
-summary: "blaze's HTTP/3 and WebTransport stack (blaze-http `h3`): a sans-IO core over quinn-proto and rustls (static-only QPACK, SETTINGS, extended CONNECT, WebTransport streams and datagrams, plain GET/HEAD requests with tickets and 0-RTT) and one driver on blaze-core's effects. Built, not wired: its users (the explorer's server in ix-prof, blaze-remote's HTTP/3 bucket) have no caller outside tests. Covers its users, the contracts, the browser's requirements, the losing designs, cost and tests."
+summary: "blaze's HTTP/3 and WebTransport stack (blaze-http `h3`): a sans-IO core over quinn-proto and rustls (static-only QPACK, SETTINGS, extended CONNECT, WebTransport streams and datagrams, plain GET/HEAD requests with tickets and 0-RTT) and one driver on blaze-core's effects. Built, not wired: its one user, blaze-remote's HTTP/3 bucket, has no caller outside tests (the explorer it was written for went with ix-prof on 2026-11-27). Covers its users, the contracts, the browser's requirements, the losing designs, cost and tests."
 ---
 # HTTP/3 and WebTransport, sans-IO
 
@@ -11,25 +11,16 @@ back bytes, events and deadlines. One thin driver per IO backend does the IO.
 
 ## 1. What blaze uses QUIC for
 
-One thing: the explorer. ix-prof's `explore` serves an HTTP/3 WebTransport endpoint on `127.0.0.1`,
-and the page `https://ix.dev/explore` connects back to it from the browser
-(docs/v2/plan/design/explore-generic.md). The users are:
+Plain requests: blaze-remote's HTTP/3 bucket (section 8) reads public objects with the core's
+client side. The core was first written for the profile explorer, a WebTransport server on
+`127.0.0.1` that the page `https://ix.dev/explore` connected back to from the browser (with a
+self-signed ECDSA P-256 certificate, valid 13 days, that the page pinned by its SHA-256,
+`serverCertificateHashes`); the explorer went with ix-prof on 2026-11-27 (end-state.md D178),
+and the server side, the WebTransport sessions and what the browser requires (section 4) are
+kept in the core with its own tests and no user.
 
-- `crates/ix-prof/src/explore/server.rs`: the explorer's server. It binds UDP on `127.0.0.1:0`,
-  refuses a CONNECT whose path is not `/explore/v1` (404) or whose Origin is not allowed (403),
-  answers one JSON request per bidirectional stream, opens one unidirectional stream for the
-  live feed, closes a session with code 1 after `bad_token`, swaps its certificate every 12
-  days on the same socket, and closes every session with code 0 when it stops.
-- `crates/ix-prof/src/explore/cert.rs`: the self-signed ECDSA P-256 certificate, valid 13 days,
-  that the page pins by its SHA-256 (`serverCertificateHashes`).
-
-So blaze is the server. The explorer's own test plays the browser (and, like the browser,
-checks the certificate by hash, P-256 and a validity of at most 14 days); blaze-remote's
-bucket is the one other client (section 8).
-
-Built, not wired: no crate turns on ix-prof's `explore` feature, `bstd::quic` (which re-exports
-the core) has no user, and blaze-remote's `H3Bucket` is made only by its tests, so the HTTP/3
-path runs in tests alone.
+Built, not wired: `bstd::quic` (which re-exports the core) has no user, and blaze-remote's
+`H3Bucket` is made only by its tests, so the HTTP/3 path runs in tests alone.
 
 ## 2. The design
 
@@ -57,7 +48,7 @@ path runs in tests alone.
 - **One driver on blaze-core's effects** (`blaze_http::h3::driver`) owns the UDP socket (batched `Effect::SendTo` and
   `Effect::RecvFrom`) and the one timer, and drives the core; it runs on io_uring, kqueue or
   the simulation. On top of it sits a small async surface (sessions, streams, datagrams) that
-  the explorer uses, as `Handle::ask -> Answer` is for HTTP/1.
+  the explorer used, as `Handle::ask -> Answer` is for HTTP/1.
 - **No quinn, quinn-udp, wtransport or wtransport-proto in the graph.** `vendor/quinn-proto` is
   the one copy, kept by `tools/vendor/sync.py` (with `ra-ap-rustc_pattern_analysis`).
 
@@ -175,8 +166,7 @@ target of the explorer and is not sent.
 
 ## 5. Cost
 
-Nothing here is hot. One page or two per explorer, a 250 ms live feed of tens of KB a frame, a
-few requests a second. The core copies each received stream piece once (quinn-proto's `Bytes`
+Nothing here is hot: a few requests a second. The core copies each received stream piece once (quinn-proto's `Bytes`
 into the event) and each sent piece once (into quinn-proto's buffer). AES-GCM through rustls is
 gigabytes a second; loopback adds tens of microseconds.
 
@@ -195,12 +185,8 @@ verifier, a minimal DER reader for its checks) and `driver.rs`.
   failing at exactly `SETTINGS_WAIT`. The QPACK, Huffman, varint, frame and error-code
   functions have unit tests with RFC vectors. The outcomes are deterministic; the bytes are
   not, because TLS and quinn-proto draw randomness (keys, connection IDs).
-- **The explorer's tests** (`crates/ix-prof/src/explore/tests.rs`) run the client over real UDP
-  on loopback: path and origin refusals, `unauthenticated` before `hello`, `hello`, `views` as
-  IPC, `unknown_op`, a live frame's layout, `bad_token` closing only its own session, and the
-  dev origin.
-- **The browser**, by hand: the real page on ix.dev in Chrome and Firefox. This is the one check
-  no test here can make.
+- **The browser**, by hand: a real page in Chrome and Firefox. This is the one check no test
+  here can make; it has had no page to run since the explorer was deleted (2026-11-27).
 
 ## 8. Requests and the remote cache
 

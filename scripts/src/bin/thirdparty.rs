@@ -1233,7 +1233,11 @@ fn problems(now: &Census, rows: &BTreeMap<String, Row>, base_rows: Option<&BTree
             let was = base.get(name).copied().unwrap_or([0; 3]);
             for col in Column::ALL {
                 let (now, then) = (n[col.index()], was[col.index()]);
-                if now > then {
+                // `dev` counts the packages only tests name. A package a deleted crate named in its
+                // normal dependencies and a test still names moves from `direct` to `dev`: nothing
+                // was added, so `dev` may rise by what `direct` fell.
+                let moved = col == Column::Dev && now + n[Column::Direct.index()] <= then + was[Column::Direct.index()];
+                if now > then && !moved {
                     out.push(format!("{LIST}: the row `{name}`'s `{}` is {now} and was {then} at the base: the list only shrinks ({RULE})", col.name()));
                 }
             }
@@ -1748,6 +1752,21 @@ fn selftest() {
     lower.insert("a".to_owned(), [3, 1, 7]);
     let said = problems(&now, &rows, Some(&lower), None);
     expect(said.len() == 1 && said[0].contains("the row `a`'s `direct` is 4 and was 3 at the base"), &format!("a row raised: {said:?}"));
+    // A package that moved from `direct` to `dev` (its last normal user deleted) raises nothing;
+    // planted: the same rise in `dev` with `direct` where it was is refused.
+    let mut moved = rows.clone();
+    let [direct, dev, closure] = rows["a"];
+    moved.insert("a".to_owned(), [direct + 1, dev.saturating_sub(1), closure]);
+    if dev > 0 {
+        let said = problems(&now, &rows, Some(&moved), None);
+        expect(said.is_empty(), &format!("a package moved from direct to dev: {said:?}"));
+    }
+    let mut grew = rows.clone();
+    grew.insert("a".to_owned(), [direct, dev.saturating_sub(1), closure]);
+    if dev > 0 {
+        let said = problems(&now, &rows, Some(&grew), None);
+        expect(said.len() == 1 && said[0].contains("the row `a`'s `dev`"), &format!("dev raised with direct unchanged: {said:?}"));
+    }
     let mut no_t = rows.clone();
     no_t.remove("t");
     let said = problems(&now, &rows, Some(&no_t), None);

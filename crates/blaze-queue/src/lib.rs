@@ -26,7 +26,7 @@
 //! callers of this wave only, on the `Global` instantiation, and are deprecated: their
 //! replacement is the `new_in` form. Their callers (2026-11-20): blaze-core chan.rs, cgroup.rs
 //! and host.rs; blaze-graph par.rs, arena.rs and pump/table.rs; blaze-memo image.rs;
-//! blaze-profile facts.rs; blaze-launch-rt table.rs; ix-prof alloc.rs and explore/server.rs.
+//! blaze-launch-rt table.rs.
 //!
 //! Under `--cfg blaze_check` the atomics are the model checker's and every slot's value is a
 //! tracked place, so a race on it, or a read of it after its block is freed, is a finding;

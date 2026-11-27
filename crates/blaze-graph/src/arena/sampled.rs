@@ -1,6 +1,6 @@
 //! The sampled blocks still held: what the global heap keeps, by call site.
 //!
-//! The heap sampler's ring (`blaze_profile::heap`) says what was allocated, which is the churn.
+//! The heap sampler's ring says what was allocated, which is the churn.
 //! What a build's memory is made of is the other number: the blocks nobody freed. A cold build
 //! of blaze held 13 GiB of codegen's heap with one task running (2026-11-11, lane mem-1111),
 //! and no row said which call sites' blocks they were. So each sampled block is also kept

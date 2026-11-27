@@ -1,6 +1,6 @@
 """lean_differential.py: the Lean model of a function, compiled, against the function blaze built,
 on drawn inputs (docs/v2/plan/design/formal-verification.md, "How the translator is checked";
-objective V5's second half). A proof is about the model; this is what ties the model to the code.
+the second half of the first proof). A proof is about the model; this is what ties the model to the code.
 
 The function is `blaze_graph::ledger::fnv1a_from` (crates/blaze-graph/src/ledger.rs), the first
 with a proof (crates/blaze-graph/lean/BlazeGraph/Ledger.lean). Its model is the checked-in module

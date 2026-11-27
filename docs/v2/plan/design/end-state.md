@@ -104,7 +104,7 @@ build no table. Every read goes through one recording host.
 - **Lints and tests are kinds.** One lint task per body (D135): every selected lint in one walk
   over the body's typed record, dispatched by node kind, keyed by the body and the selected lints'
   code ids (lints-stage.md). A test's result is keyed by [test.md](test.md)'s rule, the one
-  `blaze test` runs; `crates/blaze-test-reach` is built, not wired.
+  `blaze test` runs.
 - **Shared work, never a per-worker cache** (not built). Trait goals in canonical form and generic
   instantiations are request-wide records made once through claims; any hit appends the reads of
   what it returned to the reader's read list, and an audit mode re-makes every hit and compares;
@@ -442,7 +442,7 @@ by nothing reached. 55 crates no binary reaches are out of this work.
 - C5 THE MACHINE. Logic that waits, interleaves or speaks a protocol is
   `struct M { state: State, .. }` with `State` an enum and no flags beside it;
   `new(MOpts)`, `step(&mut self, now, event) -> Result<(), E>`, `next_effect(&mut self)`,
-  `next_deadline(&self)`, `state(&self)` (the form of blaze-stage's machine.rs). A codec is
+  `next_deadline(&self)`, `state(&self)`. A codec is
   `feed(bytes) -> Progress` and `finish()`. A driver is thin straight-line code: it owns the OS
   handles, turns effects into calls and completions into events, and decides nothing.
 - C6 TESTS. A planted bug is a `P: Planted` parameter with `NoPlant` in shipped code
@@ -652,8 +652,26 @@ counter of its own only for a domain fact (bodies checked, records read), throug
 of the worker (D171), and never re-measures what bstd measures.
 - Deletes: the command's hand-kept phase and stage timing (phases.rs marks, engine_times.rs's
   tables and timeline, the per-stage `used` plumbing), as each is shown equal to the default.
-- The profile crate (reached by no binary today) becomes a reader of the `Report`'s encoding or
-  goes; there is one telemetry core.
+- There is one telemetry core. The profile crate, which no binary reached, went on 2026-11-27
+  (D216) with its Parquet history, flight recorder, watchdog, `blaze debug sql` over DuckDB,
+  `BLAZE_PROFILE`, the query engine over it (blaze-rel), its benches (blaze-bench) and the
+  any-program profiler under it (ix-prof, and its explorer server and `blaze run --prof` design).
+- **Built (2026-11-27).** The `Report`, its cells, sinks, chain and sampler are
+  crates/blaze-std/src/telemetry.rs and telemetry/; `blaze` runs at `Spans` under `--stats`
+  (printed to stderr) and at `Totals` otherwise. A command's own profile, each phase's tasks
+  planned and entered, wasted entries and why each task was entered, is `.blaze/v2/profile.txt`
+  (crates/blaze-cli/src/phases.rs, print.rs; the `debugging` skill reads it).
+- **Spans and events are blaze-trace's** (crates/blaze-trace). A site is static data the macro
+  makes where it is written (name, target, level, file, line, field names) with one state word;
+  a span's edges and an event are fixed 32-byte entries in the calling thread's ring, timed by
+  the CPU's counter, with no `dyn` call, allocation or lock; a `Sink` is the other reader. The
+  process's profile ring is one of the statics C3 allows. The macros keep the call shape the
+  crates wrote (`info_span!`, `warn!`, `field::Empty` then `record`), and a site nobody records
+  costs one relaxed load and a branch. The `tracing` crate is gone from blaze's code (left:
+  blaze-proc-macro's `runtime` feature, and blaze-trace's `examples/cost.rs` comparison); the
+  vendored crates that used it (quinn-proto, ra-ap-rustc_pattern_analysis) carry a
+  `0001-no-tracing` patch that tools/vendor/sync.py replays on each bump
+  (vendor/<crate>/PATCHES.md).
 - **The sampler is part of it** (the owner, 2026-11-20 19:31: "ideally ... have some kind of
   sampler or something that you can figure out hot spots ... by default"). Counters say how much
   a span used; only a sampler says WHERE in the code. The runtime owns one: a sampler thread
@@ -739,7 +757,7 @@ our crates, and each brings a closure:
 | ring | blaze-remote | 45 | the remote is built, off unless chosen; `ring` stays under its `sign` feature and leaves the `blaze` binary |
 | stacker | stdx | 37 | stdx is deleted (D172); deep recursion is a frame with a stated bound |
 | url, serde_json, imbl, rustc-stable-hash | blaze-manifest, blaze-resolve, blaze-source | 36, 15, 10, 1 | the cargo layer is parked (D172); manifests are read by blaze-toml and typed paths |
-| windows-sys | blaze-core, blaze-mem, blaze-check, blaze-profile (blaze-graph named it unused) | 10 | blaze-sys declares the Windows imports itself (`windows/`, `raw-dylib`, no import library), the seam that keeps Windows's place while it is out of scope (sys.md "Windows") |
+| windows-sys | blaze-core, blaze-mem, blaze-check (blaze-graph named it unused) | 10 | blaze-sys declares the Windows imports itself (`windows/`, `raw-dylib`, no import library), the seam that keeps Windows's place while it is out of scope (sys.md "Windows") |
 | serde | nine crates | 7 | records are blaze-format and CBOR; the derives go with blaze-serde |
 | libc | nine crates | 1 | blaze-sys is the one home of kernel calls (D170) |
 | tracing | blaze-proc-macro | 4 | spans are bstd's (D178) |

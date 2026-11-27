@@ -1,4 +1,4 @@
-"""nostd.py: the check of ledger row S4 ("bstd is `#![no_std]` with its own sys and runtime; no
+"""nostd.py: the check of the rule ("bstd is `#![no_std]` with its own sys and runtime; no
 blaze crate links Rust's std"), and its progress meter (docs/v2/plan/design/sys.md, "Migration").
 
     uv run --frozen python harness/v2/nostd.py '{"command": "check"}'
@@ -34,7 +34,7 @@ text (`libc::`, `std::fs`, a `std::{.. fs ..}` group), outside comments and outs
 to the end of its file):
 tests are built on std's harness and are not what a blaze binary links. The lint that
 refuses the same uses by name resolution is the `ambient` effect (std.md, S2), with blaze-sys
-the one trusted crate; this script is the meter and the ledger's check.
+the one trusted crate; this script is the meter and the gate's check.
 """
 
 import re

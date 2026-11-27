@@ -13,7 +13,6 @@ blaze-ask	37
 blaze-audit	23
 blaze-base-tools	9
 blaze-base64	24
-blaze-bench	7
 blaze-blake3	413
 blaze-borrow	6
 blaze-bstd-convert	109
@@ -62,7 +61,6 @@ blaze-flow-lower	230
 blaze-fmt	352
 blaze-format	24
 blaze-format-core	103
-blaze-format-tiers	44
 blaze-fuzz	11
 blaze-git	606
 blaze-git-fetch	71
@@ -91,7 +89,6 @@ blaze-lint-defs	109
 blaze-lir	1414
 blaze-lower	323
 blaze-macro-run	4
-blaze-malloc	65
 blaze-manifest	150
 blaze-math	42
 blaze-mem	102
@@ -102,7 +99,6 @@ blaze-meter	45
 blaze-native	100
 blaze-new	1
 blaze-own	196
-blaze-pack	20
 blaze-parquet	114
 blaze-pbr	76
 blaze-pg	10
@@ -111,7 +107,6 @@ blaze-pins	1
 blaze-preview	30
 blaze-proc-macro	505
 blaze-producers	25
-blaze-profile	737
 blaze-protocol	134
 blaze-queue	9
 blaze-radix	49
@@ -139,7 +134,6 @@ blaze-spawn	9
 blaze-sqlite	1
 blaze-squeeze	112
 blaze-ssh	14
-blaze-stage	39
 blaze-std	634
 blaze-store-check	9
 blaze-surface	203
@@ -148,7 +142,6 @@ blaze-sys	38
 blaze-sysmon	93
 blaze-tar	28
 blaze-term-api	29
-blaze-test-reach	93
 blaze-text	172
 blaze-text-size	7
 blaze-tier	121
@@ -169,13 +162,11 @@ blaze-vt	263
 blaze-wasi	10
 blaze-watch	120
 blaze-world	343
-blaze-world-api	13
 const-ast	65
 edition	1
 gpu	64
 gpu-macros	63
 intern	41
-ix-prof	87
 parser	363
 paths	9
 rustc_abi	109

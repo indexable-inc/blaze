@@ -23,7 +23,7 @@
 //! be long gone, so such a hold is an upper bound. A writer waiting behind readers has no
 //! holder stamp (shared holders are not stamped), so the wait-for graph draws no edge for it.
 //!
-//! The probe is the process's ([`install`], which blaze-profile calls when it starts) or the
+//! The probe is the process's ([`install`], which a recorder calls when it starts) or the
 //! lock's own ([`Lock::probed`], for a simulation). [`Lock::enqueue`] is the slow path split in
 //! two halves that never block, so a deterministic simulation drives the same recording code a
 //! real wait runs.
@@ -134,8 +134,7 @@ pub struct LockWait {
     pub holder: Option<Held>,
 }
 
-/// Where locks record their waits: the profiler (blaze-profile's `locks::Recorder`) or a
-/// simulation. Every method is called only on a slow path, never while an uncontended lock is
+/// Where locks record their waits: a profiler the process installs, or a simulation. Every method is called only on a slow path, never while an uncontended lock is
 /// taken or let go.
 pub trait Probe: Sync {
     /// Now, in nanoseconds on the probe's clock (the injected clock: the profiler's monotonic

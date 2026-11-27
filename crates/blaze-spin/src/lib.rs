@@ -135,7 +135,7 @@ impl SpinWait {
     ///
     /// Deprecated: reads the clock itself (rule 75); use [`SpinWait::within_on`] with the
     /// caller's clock. Goes with its last caller (blaze-core's uring and kqueue tests,
-    /// blaze-inproc's and blaze-malloc's tests).
+    /// blaze-inproc's tests).
     #[allow(
         clippy::disallowed_methods,
         reason = "a test's or a tool's limit on the wall clock, which no core reads; deprecated"

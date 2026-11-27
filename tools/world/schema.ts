@@ -1,6 +1,5 @@
 // The world interface's schema, version 1 (docs/v2/plan/design/world.md), as the JSON rendering
-// has it: the same types as crates/blaze-world-api, field for field. The code tables below are
-// index = code on the wire, in the order crates/blaze-world-api/src/codes.rs gives them.
+// has it. The code tables below are index = code on the wire.
 
 export const VERSION = 1;
 
@@ -148,7 +147,7 @@ export type Response =
 export const REPLIES = ["world", "refused", "text", "listing", "checked", "changes", "committed", "moved", "explained"] as const;
 export type Reply = (typeof REPLIES)[number];
 
-/** The bounds a decode holds to, as crates/blaze-world-api's `Limits`. */
+/** The bounds a decode holds to (docs/v2/plan/design/world.md, "Limits"). */
 export type Limits = {
   mostBytes: number;
   mostText: number;

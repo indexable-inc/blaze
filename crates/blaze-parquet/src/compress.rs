@@ -1,6 +1,6 @@
 //! Page compression, one of the codecs every Parquet reader knows: none, LZ4_RAW ([`crate::lz4`],
-//! blaze-parquet's own) and ZSTD (the store's zstd, the workspace's `zstd` crate over the vendored zstd-sys, C zstd 1.5.7, as `blaze-cas` and
-//! blaze-format-tiers reach it, so the tree holds one zstd). Which a file takes is the crate
+//! blaze-parquet's own) and ZSTD (the store's zstd, the workspace's `zstd` crate over the vendored zstd-sys, C zstd 1.5.7, as `blaze-cas`
+//! reaches it, so the tree holds one zstd). Which a file takes is the crate
 //! doc's table.
 
 use core::alloc::Allocator;

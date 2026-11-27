@@ -155,12 +155,12 @@ statically is a bug to fix at the language/stdlib layer (`guard-the-cause`). The
 whole tree: a design that says "this would use X, but X is not in the tree" is not finished. The
 missing piece (a language or reflection feature, an intrinsic, a bstd module, a SIMD primitive, a
 harness check, a debugging command) is part of the work: specify it, build it in its right home and
-use it, in the same lane or one started at once, with a ledger row so it is tracked. An interim form
-is allowed only while the piece is being built: it is marked at the spot (`// when <piece> lands:
-<what changes>`), listed in the lane's report and its ledger row, and removed when the piece lands.
-Never leave the weaker design standing with a note that the tree lacked something (a scalar loop
-where the design is vectorized, a hand-written impl where reflection should derive it, a guessed
-number where a measurement tool should exist). If the piece is large, say so
+use it, in the same lane or one started at once, with a decision row so it is tracked. An interim
+form is allowed only while the piece is being built: it is marked at the spot (`// when <piece>
+lands: <what changes>`), listed in the lane's report and its decision row, and removed when the
+piece lands. Never leave the weaker design standing with a note that the tree lacked something (a
+scalar loop where the design is vectorized, a hand-written impl where reflection should derive it, a
+guessed number where a measurement tool should exist). If the piece is large, say so
 (`flag-jank-or-monumentous-in-all-caps`) and start it; do not quietly scope it out.
 
 See [docs/v2/plan/design/edition.md](../../../docs/v2/plan/design/edition.md).

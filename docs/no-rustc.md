@@ -47,7 +47,7 @@ A blaze extension is not a rustc run: code that opts into one need not build und
 ## The plan
 
 The steps, by the letter code and docs cite them with (issues #81 to #93). Whether each has
-landed in full has no check yet (objective C5, `docs/v2/plan/objectives.md`); what the counter
+landed in full has no check yet; what the counter
 below still finds is the list after it.
 
 | Step | What it removed |

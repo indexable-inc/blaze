@@ -1,5 +1,5 @@
-"""mir_semantics.py: the Lean semantics of MIR held to the tree (objectives V6 and V8;
-docs/v2/plan/design/formal-verification.md, "The semantics of MIR").
+"""mir_semantics.py: the Lean semantics of MIR held to the tree (the differential harness
+and the proved transformations; docs/v2/plan/design/formal-verification.md, "The semantics of MIR").
 
     uv run --frozen python harness/v2/mir_semantics.py differential '{"blaze": "target/release/blaze"}'
     uv run --frozen python harness/v2/mir_semantics.py validate '{"blaze": "target/release/blaze"}'
@@ -29,7 +29,7 @@ The input is one JSON object (inline, a file's path, or `-`):
     fuel      the steps (blocks run) the Lean semantics gives each call (100000)
     work      where the corpus is written and built; empty for a new directory under the system's
               temporary directory, removed at the end
-    out       where the result is written (report.py's shape), for the ledger (scripts/src/bin/ledger.rs)
+    out       where the result is written (report.py's shape), when given
 
 A program is a crate with `pub fn entry(..) -> T` over integers and one `pub fn case_N() -> T`
 per call, which calls `entry` with that call's arguments. The Lean side runs `entry` with the
@@ -293,7 +293,7 @@ def run(argv: list[str], cwd: Path, stdin: str = "", env: dict[str, str] | None 
 
 
 def result(it: Input, name: str, wrong: list[str]) -> None:
-    """Prints the verdict, writes it where the ledger reads it, and exits 1 when anything is wrong."""
+    """Prints the verdict, writes it to `out` when given, and exits 1 when anything is wrong."""
     if it.out:
         detail = wrong[0].splitlines()[0] if wrong else ""
         Path(it.out).write_text(json.dumps(

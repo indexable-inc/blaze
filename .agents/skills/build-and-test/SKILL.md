@@ -127,20 +127,18 @@ running for it (a build's helper, by pid), and its merged branch.
 
 ## ledger-decides (rule 46)
 
-The ledger is `docs/v2/plan/objectives.json`, one row per objective: the outcome, the check that
-decides it as a command, its paths, its status (`docs/v2/plan/objectives.md` is its generated
-table). `scripts/src/bin/ledger.rs` (`blaze run -q -p scripts --bin ledger -- '<json>'`) picks work
-that does not collide (`pick`), runs a row's check and writes its status with the commit (`run`),
-and regenerates the table (`write`); never type a status by hand, except `blocked` with why. Before
-starting a row, run its check on main. A row with no check gets one written first, as part of the
-work. Done means the check passes on a named commit and has joined the gate or the release train, so
-it cannot regress silently. A row that fails twice records what blocks it and stops.
+Decisions are rows in `docs/v2/plan/decisions.json`. A task is a named piece of one decision, or of
+one design doc's unbuilt part, with its outcome and the check that decides it written as a command.
+Before starting a piece, run its check on main's exact tree. A piece with no check gets one written
+first, as part of the work. Done means the check passes on a named commit and has joined the gate or
+the release train, so it cannot regress silently; nobody types "done" for code nobody ran. A piece
+that fails twice records what blocks it and stops.
 
 See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 
 ## every-agent-has-a-task (rule 47)
 
-Start an agent only with a task: an objective's id from the ledger, or a named piece of one, with
+Start an agent only with a task: a decision row's id, or a named piece of a decision or design, with
 its outcome and its check in one line each, the paths it may touch and what done prints. A sub-agent
 takes its parent's task unless given its own. The agent app's sidebar lists tasks with their agents
 under them, so name the task for a person reading that list: what is being done, not who does it.
@@ -180,13 +178,13 @@ time plus half. Set it where the command runs: the Bash tool's `timeout`, `timeo
 `timeout` of `harness/v2/ran.py`'s `Command` in a harness, and a deadline on each step of a job, not
 one for the whole job. On expiry, before the kill, take the status: a stack sample of the process
 still running (`sample <pid>` on macOS, `gdb -p <pid> -batch -ex 'thread apply all bt'` on Linux)
-and the flight recording the watchdog names (`bounded-progress`); the report quotes that line. A
-timeout is a finding: a hang in blaze is a bug to report with that line and file (an `agents/kb/`
-entry via `scripts/src/bin/kb.rs` at least), and the fix is in blaze. Never wait a hang out, never
-rerun with a longer limit hoping it passes (`no-fallback`), and never let a script sleep and poll
-with no bound. A wait of more than a minute (a build, a long job, a pull request's checks) runs in
-the background with a notification when it ends; the main agent never sits in a foreground wait
-while lanes and jobs need it.
+and the profile path the watchdog names (`bounded-progress`); the report quotes that line. A timeout
+is a finding: a hang in blaze is a bug to report with that line and file (an `agents/kb/` entry via
+`scripts/src/bin/kb.rs` at least), and the fix is in blaze. Never wait a hang out, never rerun with
+a longer limit hoping it passes (`no-fallback`), and never let a script sleep and poll with no
+bound. A wait of more than a minute (a build, a long job, a pull request's checks) runs in the
+background with a notification when it ends; the main agent never sits in a foreground wait while
+lanes and jobs need it.
 
 ## act-on-snapshots (rule 80)
 

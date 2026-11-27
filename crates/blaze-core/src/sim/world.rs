@@ -1,4 +1,4 @@
-//! The simulation held to the disk world ([`crate::world::disk`]): objective V14's refinement
+//! The simulation held to the disk world ([`crate::world::disk`]): the refinement
 //! test of [`Sim`]'s file system.
 //!
 //! A run draws file effects over four names (appends, writes at an offset and from memory,

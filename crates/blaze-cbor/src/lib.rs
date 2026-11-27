@@ -30,8 +30,7 @@
 //! pieces. A streaming decoder would keep a partial head and a partial string beside the stack
 //! and answer `Progress::NeedMore` at a cut; it is not written until a caller needs it.
 //!
-//! Moved here from blaze-pack's `cbor` and blaze-watch's copy of it (rule 30): blaze-pack
-//! re-exports this crate under its old path; blaze-watch names it as its `cbor`.
+//! Moved here from blaze-watch's `cbor` (rule 30); blaze-watch names it as its `cbor`.
 
 #![no_std]
 #![feature(allocator_api, register_tool, custom_inner_attributes)]

@@ -1,6 +1,6 @@
 //! Sizes and speeds of the profile's tables in each encoding and codec, on real profile files:
-//! `BLAZE_PARQUET_MEASURE` names a directory of them (`<n>-<id>.<table>.parquet`, as
-//! blaze-profile writes its history). Ignored unless asked for (`--ignored --nocapture`), on a
+//! `BLAZE_PARQUET_MEASURE` names a directory of them (`<n>-<id>.<table>.parquet`, as the
+//! profile crate, deleted 2026-11-27, wrote its history). Ignored unless asked for (`--ignored --nocapture`), on a
 //! release build: it prints the crate doc's table.
 
 #![feature(allocator_api)]

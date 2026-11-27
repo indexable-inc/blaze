@@ -23,8 +23,7 @@ std = ["blaze-format-core/alloc"]
 
 [dependencies]
 # The records, views and writer; this crate re-exports them at their old paths. Nothing here may
-# bring a third-party package: compression by tier, which needs zstd, is blaze-format-tiers
-# (split out 2026-11-15).
+# bring a third-party package.
 blaze-format-core.workspace = true
 # By path, not `.workspace`: the workspace entry turns on blaze-ids' adapter feature (serde),
 # which a member's entry cannot turn off.

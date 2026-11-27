@@ -269,8 +269,8 @@ pub mod sampled;
 /// How many bytes a thread allocates between two heap samples: each sample stands for this
 /// many (a block past it, for as many times it as it spans), so the bytes allocated at a call
 /// site are its samples' weights summed, within a sample's. 4 MiB: a build that churns a GiB a
-/// second takes 256 samples a second, a walk of about 100 system calls each
-/// (`blaze_profile::heap`), and the profile's ring holds half a minute of them.
+/// second takes 256 samples a second, a walk of about 100 system calls each, and a ring of
+/// the profiler's holds half a minute of them.
 pub const SAMPLE_EVERY: i64 = 4 << 20;
 
 /// One allocation the heap sampler is handed ([`sample_heap_with`]).
@@ -294,7 +294,7 @@ static HEAP_SAMPLER: OnceLock<fn(HeapSampled)> = OnceLock::new();
 /// Every [`SAMPLE_EVERY`] bytes a thread allocates through [`Counting`], `sampler` is handed
 /// the allocation that crossed it, on the allocating thread, inside the allocator: it must not
 /// lock, and what it allocates is neither sampled nor sent back to it (the profiler walks the
-/// thread's frame pointers into a ring of its own, `blaze_profile::heap`). The first call wins.
+/// thread's frame pointers into a ring of its own). The first call wins.
 pub fn sample_heap_with(sampler: fn(HeapSampled)) {
     _ = HEAP_SAMPLER.set(sampler);
 }

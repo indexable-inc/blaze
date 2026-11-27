@@ -175,7 +175,7 @@ const NOT_RESERVED_IN_QUERIES: [Keyword; 7] = [
 pub(crate) enum Grammar {
     /// The typed subset (sql.md): no comment, no `::`, no `@name`.
     Subset,
-    /// The query grammar (query.md): comments are space, `::` is a token, `@name` names a
+    /// The query grammar ([`crate::query`]): comments are space, `::` is a token, `@name` names a
     /// table's files, and the words of [`NOT_RESERVED_IN_QUERIES`] are names.
     Query,
 }

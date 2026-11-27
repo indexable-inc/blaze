@@ -282,7 +282,7 @@ What is about building Rust (the cargo graph, the store, codegen) stays out.
 | `report` | the `Report`: what a program says to a person or an agent, as data | `blaze-report` |
 | `quic` | QUIC as a sans-IO core: datagrams and time in, datagrams and stream events out; the driver is a `Net` datagram socket and the `Clock` | `blaze-http`'s QUIC core ([http3-sans-io](http3-sans-io.md)) |
 | `http` | sans-IO HTTP/1.1 over a `Conn`, and HTTP/3 and WebTransport over `quic` | `blaze-http` |
-| `trace` | spans and events through `Cx` | `blaze-trace` (no-tracing) |
+| `trace` | spans and events through `Cx` | `blaze-trace` (end-state D178) |
 | `gpu` | the device behind the `Gpu` capability: buffers, launches, render targets | new, with [gpu](../../../future/gpu/plan.md) |
 | `video`, `image` | codecs as sans-IO cores; image decode and encode as functions | `harness-video`'s encoder, moved; `png` |
 | `test` | the simulation, property tests, the model checker for lock-free code, allocation counting | `blaze_core::sim`, `blaze-sim`, `blaze-check`, `blaze-alloc-count` |
@@ -1423,11 +1423,10 @@ not yet run under blaze-check's interleavings.
 
 ## Tracing
 
-The recorder is the one [no-tracing](no-tracing.md) specifies (`blaze-trace`: per-thread rings,
-fixed-layout rows, fields as words, no formatting on the hot path) feeding the profile history
-([profiling](../../../profiling.md), [ix-prof-format](../../../ix-prof-format.md)). bstd does not
-add a second one. It changes where the span lives, what is recorded without being asked, and how
-a site is described. Where this section and no-tracing differ, this section is the newer.
+The recorder is `blaze-trace` (per-thread rings, fixed-layout rows, fields as words, no
+formatting on the hot path; [end-state](end-state.md), D178), and what a run keeps of it is
+bstd's telemetry report (D178). bstd does not add a second one. It changes where the span lives,
+what is recorded without being asked, and how a site is described.
 
 - **The span is in `Cx`.** `let cx = cx.span(FETCH, &url);` returns a child `Cx`; the span ends
   when it drops; everything called with it is inside. A spawned task's `cx` comes from its scope,
@@ -1444,11 +1443,9 @@ a site is described. Where this section and no-tracing differ, this section is t
 - **A site is described at compile time.** blaze is the compiler and the linker, so each span and
   event site gets its id and a static schema (name, field names and types, file and line) in a
   table beside the binary. Nothing about a site is formatted, hashed or registered at run time.
-  (no-tracing rejected link-time ids because a distributed slice was the only way; it is not.)
 - **An event is fixed bytes**: site id, timestamp, task id, span id, raw field bytes, copied into
   the worker's ring. No formatting, allocation, lock, system call or write to another thread's
-  memory. A drainer moves full chunks out; decoding happens offline against the schema table,
-  straight into the history's typed columns.
+  memory. A drainer moves full chunks out; decoding happens offline against the schema table.
 - **Field encoders come from reflection** ([comptime](comptime.md)), not a macro and not `Debug`.
   A field whose type has no encoder is an error at the site, naming the type; there is no
   format-as-text path.
@@ -1673,7 +1670,7 @@ here with the commit and the machine's load when one has.
 
 ### Contracts
 
-bstd's public functions carry `requires` and `ensures` (ledger V3). While rustc also builds bstd
+bstd's public functions carry `requires` and `ensures`. While rustc also builds bstd
 ("Two builders") they are nightly's `#[core::contracts::ensures(..)]`, which both builders read
 and run under `cfg(contract_checks)`; the native clause syntax ([contracts](contracts.md);
 `#![feature(blaze_verify)]`), checked by default in the dev and test profiles and the form the

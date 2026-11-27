@@ -323,22 +323,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-bench"
-version = "0.0.0"
-dependencies = [
- "blaze-cas",
- "blaze-core",
- "blaze-format",
- "blaze-ids",
- "blaze-mem",
- "blaze-memo",
- "blaze-own",
- "blaze-profile",
- "blaze-rng",
- "blaze-trace",
-]
-
-[[package]]
 name = "blaze-bitflags"
 version = "0.0.0"
 dependencies = [
@@ -1114,16 +1098,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-format-tiers"
-version = "0.0.0"
-dependencies = [
- "blaze-format",
- "blaze-ids",
- "blaze-v2-proof",
- "zstd",
-]
-
-[[package]]
 name = "blaze-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -1554,17 +1528,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-malloc"
-version = "0.0.0"
-dependencies = [
- "blaze-check",
- "blaze-mem",
- "blaze-rng",
- "blaze-sim",
- "blaze-spin",
-]
-
-[[package]]
 name = "blaze-manifest"
 version = "0.0.0"
 dependencies = [
@@ -1689,14 +1652,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-pack"
-version = "0.0.0"
-dependencies = [
- "blaze-cbor",
- "blaze-report",
-]
-
-[[package]]
 name = "blaze-parquet"
 version = "0.0.0"
 dependencies = [
@@ -1802,34 +1757,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-profile"
-version = "0.0.0"
-dependencies = [
- "blaze-arrow-ipc",
- "blaze-columns",
- "blaze-core",
- "blaze-graph",
- "blaze-hash",
- "blaze-ids",
- "blaze-kit",
- "blaze-mem",
- "blaze-own",
- "blaze-parquet",
- "blaze-queue",
- "blaze-report",
- "blaze-sim",
- "blaze-sys",
- "blaze-trace",
- "blaze-v2-proof",
- "ix-prof",
- "libc",
- "serde",
- "serde_derive",
- "serde_json",
- "stdx",
-]
-
-[[package]]
 name = "blaze-protocol"
 version = "0.0.0"
 dependencies = [
@@ -1902,19 +1829,6 @@ dependencies = [
  "blaze-ids",
  "blaze-own",
  "blaze-rng",
-]
-
-[[package]]
-name = "blaze-rel"
-version = "0.0.0"
-dependencies = [
- "blaze-columns",
- "blaze-data",
- "blaze-hash",
- "blaze-own",
- "blaze-profile",
- "blaze-sim",
- "blaze-sql",
 ]
 
 [[package]]
@@ -2246,19 +2160,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blaze-stage"
-version = "0.0.0"
-dependencies = [
- "blaze-engine",
- "blaze-id",
- "blaze-ids",
- "blaze-int",
- "blaze-mem",
- "blaze-own",
- "blaze-sim",
-]
-
-[[package]]
 name = "blaze-std"
 version = "0.0.0"
 dependencies = [
@@ -2392,15 +2293,6 @@ dependencies = [
  "blaze-data",
  "blaze-json",
  "blaze-own",
-]
-
-[[package]]
-name = "blaze-test-reach"
-version = "0.0.0"
-dependencies = [
- "blaze-blake3",
- "blaze-own",
- "blaze-sim",
 ]
 
 [[package]]
@@ -2626,19 +2518,6 @@ dependencies = [
  "blaze-unit-graph",
  "blaze-world",
  "edition",
-]
-
-[[package]]
-name = "blaze-world-api"
-version = "0.0.0"
-dependencies = [
- "blaze-cbor",
- "blaze-data",
- "blaze-id",
- "blaze-json",
- "blaze-mem",
- "blaze-own",
- "blaze-sim",
 ]
 
 [[package]]
@@ -3472,35 +3351,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "ix-prof"
-version = "0.0.0"
-dependencies = [
- "addr2line",
- "blake3",
- "blaze-arrow-ipc",
- "blaze-base64",
- "blaze-columns",
- "blaze-core",
- "blaze-deflate",
- "blaze-http",
- "blaze-inproc-rt",
- "blaze-own",
- "blaze-queue",
- "blaze-script",
- "blaze-sha256",
- "blaze-sim",
- "blaze-sys",
- "blaze-trace",
- "gimli",
- "libc",
- "object 0.40.0",
- "rcgen",
- "rustc-demangle",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "jobserver"

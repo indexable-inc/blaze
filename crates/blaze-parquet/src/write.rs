@@ -50,8 +50,7 @@ pub enum Encoding {
 /// How a file is cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
-    /// The most rows of a row group (DuckDB's own default, 122 880, is what blaze-profile
-    /// gives).
+    /// The most rows of a row group (DuckDB's own default is 122 880).
     pub row_group_rows: usize,
     /// About the most bytes of values a page holds: a page ends at the first row that reaches
     /// it.

@@ -709,29 +709,28 @@ pub fn classify_domain(hint: &str) -> &'static str {
         "blaze-ctx" | "blaze-data" | "blaze-cbor" | "blaze-json" | "blaze-tab" | "blaze-toml" | "blaze-base64"
         | "blaze-parquet" | "blaze-arrow-ipc" | "blaze-squeeze" | "blaze-deflate" | "blaze-zstd" | "blaze-tar"
         | "blaze-semver" | "blaze-text" | "blaze-text-size" | "blaze-tokens" => return "data-and-formats",
-        "blaze-cas" | "blaze-keyed" | "blaze-format" | "blaze-format-core" | "blaze-format-tiers" | "blaze-record"
-        | "blaze-remote" | "blaze-fetch" | "blaze-cert" | "blaze-store-check" | "blaze-reclaim" | "blaze-pack"
-        | "blaze-roots" | "blaze-facts" | "blaze-memo" | "blaze-memo-macros" | "blaze-id" | "blaze-ids"
-        | "blaze-world" | "blaze-world-api" | "blaze-unit-graph" | "blaze-units" | "blaze-manifest" | "blaze-pins"
-        | "blaze-toolchain" | "blaze-audit" | "blaze-resolve" | "blaze-source" | "blaze-stage" | "blaze-new"
-        | "blaze-producers" | "blaze-build-script" => return "storage-and-cache",
-        "blaze-std" | "blaze-own" | "blaze-mem" | "blaze-malloc" | "blaze-columns" | "blaze-kit" | "blaze-swiss"
+        "blaze-cas" | "blaze-keyed" | "blaze-format" | "blaze-format-core" | "blaze-record" | "blaze-remote"
+        | "blaze-fetch" | "blaze-cert" | "blaze-store-check" | "blaze-reclaim" | "blaze-roots" | "blaze-facts"
+        | "blaze-memo" | "blaze-memo-macros" | "blaze-id" | "blaze-ids" | "blaze-world" | "blaze-unit-graph"
+        | "blaze-units" | "blaze-manifest" | "blaze-pins" | "blaze-toolchain" | "blaze-audit" | "blaze-resolve"
+        | "blaze-source" | "blaze-new" | "blaze-producers" | "blaze-build-script" => return "storage-and-cache",
+        "blaze-std" | "blaze-own" | "blaze-mem" | "blaze-columns" | "blaze-kit" | "blaze-swiss"
         | "blaze-hash" | "blaze-hashcons" | "blaze-radix" | "blaze-sort" | "blaze-memchr" | "blaze-int"
         | "blaze-bitflags" | "blaze-bytes" | "blaze-blake3" | "blaze-sha256" | "blaze-ed25519" | "blaze-rng"
         | "blaze-unicode" | "blaze-spin" | "blaze-queue" | "blaze-sys" | "blaze-apple-sdk" | "blaze-bstd-convert"
         | "blaze-cast" | "blaze-cond" | "blaze-algebra" | "blaze-math" | "blaze-dbsp" | "blaze-glob" | "blaze-phf"
         | "paths" | "stdx" => return "std-and-memory",
         "blaze-http" | "blaze-h1" | "blaze-h2" | "blaze-url" | "blaze-git" | "blaze-git-fetch" | "blaze-sql"
-        | "blaze-rel" | "blaze-sqlite" | "blaze-pg" | "blaze-protocol" => return "network-and-db",
+        | "blaze-sqlite" | "blaze-pg" | "blaze-protocol" => return "network-and-db",
         "blaze-ecs" | "blaze-ecs-wasm" | "blaze-ui" | "blaze-ui-wasm" | "blaze-site" | "blaze-site-wasm"
         | "blaze-vt" | "blaze-screen" | "blaze-cad" | "blaze-cad-cloth" | "blaze-cad-field" | "blaze-cad-mesh"
         | "blaze-cad-out" | "blaze-cad-picture" | "blaze-pbr" | "gpu" | "gpu-macros" | "harness" => {
             return "ui-cad-and-site";
         }
-        "blaze-lint" | "blaze-lint-defs" | "blaze-fmt" | "blaze-sim" | "blaze-check" | "blaze-fuzz" | "blaze-bench"
-        | "blaze-profile" | "blaze-trace" | "blaze-meter" | "blaze-watch" | "blaze-alloc-count" | "blaze-report"
-        | "blaze-ask" | "blaze-answer" | "blaze-script" | "blaze-real" | "blaze-test-reach" | "blaze-v2-proof"
-        | "blaze-base-tools" | "ix-prof" | "test-utils" => return "lint-test-and-obs",
+        "blaze-lint" | "blaze-lint-defs" | "blaze-fmt" | "blaze-sim" | "blaze-check" | "blaze-fuzz"
+        | "blaze-trace" | "blaze-meter" | "blaze-watch" | "blaze-alloc-count" | "blaze-report"
+        | "blaze-ask" | "blaze-answer" | "blaze-script" | "blaze-real" | "blaze-v2-proof"
+        | "blaze-base-tools" | "test-utils" => return "lint-test-and-obs",
         _ => {}
     }
 

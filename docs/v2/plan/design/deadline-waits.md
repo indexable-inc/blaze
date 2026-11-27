@@ -48,8 +48,8 @@ restarts on every retry, and signals sent at blaze's own threads.
      drops and kernel sampling needs `perf_event_paranoid` 1 or lower; the sampler must run at
      2 (the common default), so the span says where it blocked (the raw-block gate decides by
      span ancestry) and macOS keeps its blocked stack. A preemption counts as on the CPU
-     (runnable), as macOS's `TH_STATE_RUNNING` does. The perf ring reader is
-     `crates/ix-prof/src/perf.rs`, shared with ix-prof's sampler, so blaze has one perf reader.
+     (runnable), as macOS's `TH_STATE_RUNNING` does. The one perf ring reader
+     was ix-prof's `perf.rs`, deleted on 2026-11-27; blaze has none now.
    - Span and fiber attribution: perf's samples arrive after the fact, so a sample matched to
      the flight rows reads span 0. Each flight ring has a **context log**: a fixed ring of `(ticks, span, job, fiber)` entries its thread
      writes at every change of its innermost span and every fiber switch (enter, exit,
@@ -134,8 +134,10 @@ direct calls.
   (`wait/macos.rs`).
 - The `.clippy.toml` bans on `poll`, `ppoll`, `select`, `pselect`, `epoll_wait`, `epoll_pwait`,
   `kevent`, `kevent64`, `nanosleep`, `clock_nanosleep` and `std::thread::park*`.
-- The perf sampler with the context log (`crates/blaze-profile/src/sampler/linux.rs` on
-  `ix_prof::perf`); no signal sampler exists.
+- The sampler is bstd's (`crates/blaze-std/src/telemetry/sampler.rs`): on Linux a
+  `timer_create(CLOCK_THREAD_CPUTIME_ID)` `SIGPROF` per worker, which interrupts the worker it
+  samples, unlike the perf sampler with the context log this page specifies; that perf sampler
+  was blaze-profile's and went with it on 2026-11-27 (end-state.md D178).
 
 ## Not built
 

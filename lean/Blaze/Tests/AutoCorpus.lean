@@ -29,7 +29,7 @@ import BlazeModel.closures.sums_two
 import Blaze.VecAuto
 
 /-!
-The measure of `blaze_auto` (objective V13): theorems the tree proves by hand, stated again from
+The measure of `blaze_auto`: theorems the tree proves by hand, stated again from
 their generated statements and closed by `blaze_auto` alone (no list, nothing opened, no hand
 lemma). The hand proofs are not imported. Each line says what closed it, or, for an omitted
 `example`, what goal was left.

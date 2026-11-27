@@ -9,7 +9,7 @@
 //!                                                      the front matter, and take the files that
 //!                                                      are gone out of tools/python-allowed.txt
 //!     blaze run -q -p scripts --bin docs -- python '{"left": 0}'   at most `left` Python files
-//!                                                      remain (ledger D43)
+//!                                                      remain
 //!     blaze run -q -p scripts --bin docs -- selftest
 //!
 //! Each docs/**/*.md but docs/README.md (generated) and docs/upstream/ (others' text, as fetched)

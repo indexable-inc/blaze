@@ -1,6 +1,6 @@
 // Lesson: blaze's attribute extensions, all behind `#![register_tool(blaze)]`: linear types (`#[blaze::linear]`,
 // checked on MIR by crates/hir-ty-linear; docs/v2/plan/design/linear.md), effects (`#[blaze::may(..)]`,
-// crates/blaze-lints/src/blaze/may.rs; effects.md; ledger E11) and purity (`#[blaze::pure]`, crates/hir-ty/src/facts.rs).
+// crates/blaze-lints/src/blaze/may.rs; effects.md) and purity (`#[blaze::pure]`, crates/hir-ty/src/facts.rs).
 // Designs are `status: plan`; say so.
 site {
   learn {

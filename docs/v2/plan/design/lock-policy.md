@@ -220,8 +220,7 @@ given.
 | `memo.ids`, `memo.alone.held`, `memo.arena.drops` | memo ids; a single-flight's held set; deferred drops | ids: CLAIMED; held: CLAIMED; drops: GATHERED |
 | `h3.tickets`, `http.mailbox.latch` | TLS session tickets; one reply handed over | tickets: Lock (tried GATHERED: a ticket taken by one connection must leave every worker's view; small and rare); mailbox: PUBLISHED |
 | `world.checkout.files`, `scope` `tables`/`made` (`RwLock`) | a checkout's files; the resolver's tables | checkout: GATHERED; resolver tables: CLAIMED, each table PUBLISHED |
-| `stdx.assert.sites`, `profile.hot.marks`, `profile.history.drained` | assertion sites seen; hot-path marks; drained history | GATHERED |
-| blaze-profile's unrecorded locks (`profile.flight.*`, `profile.postmortem.*`, `profile.sampler.*`), ix-prof's (`ixprof.*`, `ix_prof.layer.extra`) | the recorder's rings, owners, samples, postmortem state; ix-prof's session, symbols, maps | rings, samples, owners: GATHERED (a ring per worker, D179's sampler); `*.failed`, `*.stopped`, `recovering`, `kept`, `recovered`, `reader`: PUBLISHED; symbol and image tables: CLAIMED; ix-prof's session and HTTP gate: Lock (tried PUBLISHED: started and stopped by the user while the sampler runs) |
+| `stdx.assert.sites` | assertion sites seen | GATHERED |
 
 ### Corrections to D179's last paragraph, from reading the code
 

@@ -1,7 +1,8 @@
 //! A minimal Parquet writer and reader (https://parquet.apache.org/docs/file-format/), in place
-//! of the parquet and arrow crates (docs/v2/plan/third-party.md, "The profile's file", option 2):
-//! what blaze-profile writes its history in, so every query of the debugging skill runs on the
-//! files as before (`read_parquet(..., union_by_name = true)`).
+//! of the parquet and arrow crates (docs/v2/plan/third-party.md). It was the format of the
+//! profile crate's history, deleted with that crate on 2026-11-27 (end-state.md D178); its one
+//! user left is blaze-squeeze's tests, and DuckDB still reads its files
+//! (`read_parquet(..., union_by_name = true)`).
 //!
 //! # What is written ([`Writer`])
 //!

@@ -5,7 +5,6 @@
 # "write"}`), checked in CI.
 # crate	functions
 bgit	8
-blaze-bench	1
 blaze-blake3	2
 blaze-bstd-convert	5
 blaze-build-script	3
@@ -34,7 +33,6 @@ blaze-parquet	1
 blaze-proc-macro	1
 blaze-protocol	1
 blaze-real	2
-blaze-rel	15
 blaze-report	1
 blaze-script	8
 blaze-sh	19
@@ -42,7 +40,6 @@ blaze-sql	4
 blaze-squeeze	1
 blaze-std	5
 gpu	5
-ix-prof	2
 parser	5
 stdx	4
 test-utils	1

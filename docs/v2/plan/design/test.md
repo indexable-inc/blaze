@@ -323,8 +323,9 @@ protocol to the parent; better: a crash fails one test, and results are kept.
     source. After 16 and the store lane.
 18. The test build as a view of its crate (D152, above): one crate key, cfg as a read, the
     overlay. D191's full view is built (blaze-drive view.rs); the one crate key is not.
-19. `crates/blaze-test-reach` (a result valid by its reach, as a sans-IO core): built, not wired;
-    no crate depends on it.
+19. A result valid by its reach, as a sans-IO core: not built. A crate of it was written and
+    never wired, and was deleted on 2026-11-27
+    (`git show 50dac12595:crates/blaze-test-reach/src/lib.rs`).
 
 ## End state: property, differential and end-to-end tests (architect, 2026-11-16)
 
@@ -601,8 +602,7 @@ Built: 1 (blaze-sim board.rs), 3 (blaze-run property.rs), 4 (tapes.rs), 6 (oscal
 ### H. What blaze's own suite changes now
 
 - Refinement tests become `differ`: blaze-memo tests/resident.rs (memo `Resident` against
-  blaze-keyed's reference), blaze-keyed's `resident_refines_records_only`, blaze-pack's model
-  oracle (tests/model.rs), and each rule-78 seam gets its `Seam` mark so `SeamUntested` lists
+  blaze-keyed's reference), blaze-keyed's `resident_refines_records_only`, and each rule-78 seam gets its `Seam` mark so `SeamUntested` lists
   the rest.
 - The body referee of bottom.md 16 (the old driver against blaze-typeck) is a `differ` over
   sampled bodies, with its approved differences in code, not in prose.

@@ -1,8 +1,7 @@
 //! What a thread blocks on, said: every blocking wait of a pool thread goes through [`wait`]
 //! (or [`Flights`](crate::pump::Flights) for a key), which opens a span `wait` whose `awaits`
 //! names it and whose [`Owner`] says who ends it: the job running it, or what stands in a job's
-//! place (never nothing). A block that does not leaves its time unaccounted for, and the
-//! profile's gate on raw blocks (docs/profiling.md) fails on it.
+//! place (never nothing). A block that does not leaves its time unaccounted for.
 
 use std::fmt::Write as _;
 
@@ -54,8 +53,7 @@ impl WaitOn<'_> {
     }
 }
 
-/// The variant of a [`WaitOn`], what a profiler groups the time of waits by (blaze-profile's
-/// latency sketch of each).
+/// The variant of a [`WaitOn`], what a profiler groups the time of waits by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WaitKind {
     Key,
@@ -146,8 +144,8 @@ impl Owner {
     }
 }
 
-/// The variant of an [`Owner`]: what a wait's row says of who ends it (blaze-profile's
-/// `spans.owned_by`), `job` exactly when its `owner` names one.
+/// The variant of an [`Owner`]: what a wait's row says of who ends it, `job` exactly when its
+/// `owner` names one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum OwnedBy {
     Job,
@@ -263,8 +261,7 @@ mod tests {
     }
 
     /// A wait given a job names it; one given none says who ends a wait of its kind, each kind
-    /// another, and only a key's says "not said". (The invariant that every `wait` row says who
-    /// ends it is blaze-profile's, where the rows are: `every_wait_row_says_who_ends_it_...`.)
+    /// another, and only a key's says "not said".
     #[test]
     fn every_kind_of_wait_has_an_owner_to_say() {
         for kind in WaitKind::ALL {

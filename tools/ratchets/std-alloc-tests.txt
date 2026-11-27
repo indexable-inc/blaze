@@ -16,7 +16,6 @@ blaze-ask	5	0	0	5	0	0	0	0	0	0
 blaze-audit	3	0	0	21	0	0	0	0	0	0
 blaze-base-tools	4	0	0	0	0	0	0	0	0	0
 blaze-base64	3	0	0	1	0	0	0	0	0	0
-blaze-bench	8	4	1	28	0	1	1	0	0	0
 blaze-bitflags	2	0	0	3	0	0	0	0	0	0
 blaze-blake3	11	5	0	44	0	0	0	0	0	0
 blaze-body	6	0	0	4	0	0	0	0	0	0
@@ -71,7 +70,6 @@ blaze-flow-lower	301	0	0	90	2	0	0	0	0	0
 blaze-fmt	5	1	0	16	2	0	0	0	0	0
 blaze-format	6	0	0	46	0	0	0	0	0	0
 blaze-format-core	15	0	0	45	0	0	0	0	0	0
-blaze-format-tiers	1	0	0	20	0	0	0	0	0	0
 blaze-git	14	0	0	14	0	0	0	0	0	0
 blaze-git-fetch	2	0	0	16	0	0	0	0	0	0
 blaze-git-meta	1	0	0	0	0	0	0	0	0	0
@@ -100,7 +98,6 @@ blaze-lint-defs	12	0	0	34	0	0	0	0	0	1
 blaze-lir	22	0	3	105	0	0	0	0	0	0
 blaze-lower	175	2	0	163	0	0	4	0	0	0
 blaze-macro-run	2	0	0	3	0	0	0	0	0	0
-blaze-malloc	9	7	5	41	0	4	12	0	0	1
 blaze-manifest	98	6	0	164	43	0	0	0	0	0
 blaze-math	1	0	0	0	0	0	0	0	0	0
 blaze-mem	69	3	6	202	3	3	40	0	0	0
@@ -109,7 +106,6 @@ blaze-memo	25	7	2	198	0	0	3	0	0	1
 blaze-meter	12	0	0	4	0	0	2	0	0	0
 blaze-native	10	3	0	6	0	0	0	0	0	0
 blaze-own	50	0	6	168	0	0	9	0	0	0
-blaze-pack	3	0	0	39	0	0	0	0	0	0
 blaze-parquet	49	2	2	40	26	1	0	3	0	0
 blaze-pbr	1	0	0	0	0	0	0	0	0	0
 blaze-pg	9	0	2	140	0	0	0	0	0	0
@@ -117,13 +113,11 @@ blaze-phf	5	0	0	9	0	0	0	0	0	1
 blaze-preview	3	0	0	2	0	0	0	0	0	0
 blaze-proc-macro	476	3	0	325	272	5	6	17	0	1
 blaze-producers	8	0	0	0	0	0	0	0	0	0
-blaze-profile	197	0	0	443	19	35	47	15	0	3
 blaze-protocol	23	0	0	116	10	0	0	0	0	2
 blaze-queue	3	0	0	26	0	0	4	0	0	0
 blaze-radix	10	0	0	30	0	0	1	0	0	0
 blaze-reclaim	6	1	0	41	0	6	12	0	0	0
 blaze-record	2	0	1	21	0	0	0	0	0	0
-blaze-rel	7	0	0	11	0	0	0	0	0	0
 blaze-remote	53	1	1	122	9	3	1	0	1	0
 blaze-report	10	3	0	70	3	0	0	2	0	0
 blaze-resolve	21	5	0	93	2	1	0	1	0	0
@@ -144,11 +138,10 @@ blaze-solve	3	0	0	2	0	0	0	1	0	0
 blaze-sort	4	0	0	16	0	0	0	0	0	0
 blaze-source	4	0	0	4	0	0	1	0	0	0
 blaze-spawn	5	0	0	2	0	0	0	0	0	0
-blaze-sql	20	0	3	66	0	0	2	0	0	0
+blaze-sql	16	0	2	63	0	0	2	0	0	0
 blaze-sqlite	6	0	0	117	0	0	0	0	0	0
 blaze-squeeze	5	0	0	12	0	0	0	0	0	0
 blaze-ssh	5	0	0	4	0	0	0	0	0	0
-blaze-stage	30	0	0	1	0	0	0	0	0	0
 blaze-std	266	4	59	672	48	37	19	5	0	0
 blaze-store-check	0	0	0	10	0	0	0	0	0	0
 blaze-surface	6	0	0	17	0	0	0	0	0	0
@@ -157,7 +150,6 @@ blaze-sys	100	0	0	24	29	3	7	0	0	0
 blaze-sysmon	1	0	0	0	0	0	0	0	0	0
 blaze-tar	4	0	0	14	0	0	0	0	0	0
 blaze-term-api	5	0	0	1	0	0	0	0	0	0
-blaze-test-reach	9	0	0	6	0	0	0	0	0	0
 blaze-text	2	0	0	0	0	0	0	0	0	0
 blaze-tier	7	1	0	5	0	0	0	0	0	0
 blaze-tiling	1	0	0	0	0	0	0	0	0	0
@@ -177,12 +169,10 @@ blaze-vt	135	0	0	97	0	0	0	0	0	0
 blaze-wasi	0	0	0	4	0	0	0	0	0	0
 blaze-watch	36	0	0	29	0	1	0	0	0	0
 blaze-world	53	0	0	11	5	0	0	0	0	0
-blaze-world-api	1	0	0	0	0	0	0	0	0	0
 const-ast	12	0	0	41	7	0	0	1	0	1
 edition	2	0	0	0	0	0	0	0	0	0
 gpu	2	0	0	4	0	0	0	0	0	0
 intern	27	0	0	74	0	0	12	0	0	4
-ix-prof	90	0	0	80	34	8	1	0	0	0
 parser	38	1	0	154	5	2	3	1	0	0
 rustc_abi	3	0	0	0	0	0	0	0	0	0
 rustc_lexer	2	0	0	2	0	0	0	0	0	0

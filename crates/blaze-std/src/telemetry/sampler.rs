@@ -34,8 +34,9 @@
 //!   never fires on a parked thread, so no tick is spent on one; and the handler runs on the
 //!   worker itself, so its span mark and ring are its own, read with no cross-thread race. The
 //!   other choice, `perf_event_open(PERF_COUNT_SW_CPU_CLOCK, PERF_SAMPLE_CALLCHAIN)` with a
-//!   mapped ring per worker (blaze-profile's `linux.rs` does this), takes kernel callchains and
-//!   costs no signal, and is the one to add where perf is allowed and signals are not wanted.
+//!   mapped ring per worker (the profile crate's `linux.rs`, deleted 2026-11-27, did this),
+//!   takes kernel callchains and costs no signal, and is the one to add where perf is allowed
+//!   and signals are not wanted.
 //!   The cost of signals: an interrupted system call that cannot restart returns `EINTR`
 //!   (`SA_RESTART` restarts the rest), which `blaze_core::wait::until` already retries as a
 //!   spurious wake.

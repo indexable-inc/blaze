@@ -1,6 +1,6 @@
 /-!
 Algebraic foundations of Blaze's canonical type sets and structural error/value unions
-(`docs/v2/plan/design/error-sets.md`, ledger row `E3`).
+(`docs/v2/plan/design/error-sets.md`).
 
 Erased type keys are modeled as natural numbers (`TypeKey := Nat`). A `TypeSet` keeps its keys
 in strictly ascending order (sorted and deduplicated), guaranteeing that:

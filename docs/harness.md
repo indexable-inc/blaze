@@ -42,8 +42,8 @@ again, and a change to one is a change to what blaze expects.
 
 ### Timing
 
-Nothing here gates; a build's profile answers why a build was slow
-([profiling.md](profiling.md)). `counters.py` is how every harness counts instructions and cycles
+Nothing here gates; a build's profile answers why a build was slow (`.blaze/v2/profile.txt`,
+`--stats`). `counters.py` is how every harness counts instructions and cycles
 (Linux's `perf_event_open`, macOS's `proc_pid_rusage`), null with the reason where it cannot.
 `memory.py` is how every harness measures memory: `memory.run` runs a command and returns its
 time with the exact peak of its largest process (`wait4`) and the peak of its whole tree
@@ -85,7 +85,7 @@ job of the gate runs on Linux AArch64 on an ix runner ([ix runners](#ix-runners)
 | Workflow | Event | What runs |
 |---|---|---|
 | `blaze.yaml` (`changes`) | pull request, merge-queue entry, push to main | a path filter in the job's shell: whether the change touches a file the `cargo` job reads (below) |
-| `blaze.yaml` (`scripts`) | every change | `scripts/src/bin/gate.rs` over every row of `tools/gate.txt` (as `just lint`), no Python: the agent rules, the docs, `rustcsites`, the ledger, `changed`, the invariants, the Lean sources, the lint table, the hash domains, and the ratchets of `tools/ratchets` and of persisted layouts |
+| `blaze.yaml` (`scripts`) | every change | `scripts/src/bin/gate.rs` over every row of `tools/gate.txt` (as `just lint`), no Python: the agent rules, the docs, `rustcsites`, `changed`, the invariants, the Lean sources, the lint table, the hash domains, and the ratchets of `tools/ratchets` and of persisted layouts |
 | `blaze.yaml` (`lean`) | every change | the Lean proofs (`scripts/src/bin/lean_gate.rs`, [v2/plan/proofs.md](v2/plan/proofs.md)): `lake build` of `lean/` and `lean/analysis` with the pinned Lean, no `sorry`, and each theorem of `lean/theorems.json` held to Lean's three axioms by `#print axioms` |
 | `blaze.yaml` (`workflows`) | every change | actionlint over `.github/workflows` (below) |
 | `blaze.yaml` (`cargo`) | a change of code | on a 64-vCPU ix runner, with cargo and the pinned nightly (`pins/toolchain`): the toolchain shelf cut (`toolchain_cut`), `cargo check --locked --workspace --exclude blaze-std --all-targets`, the tests (`scripts/src/bin/ci_test.rs`), then blaze-sys's imports per target (`sys_imports`) |

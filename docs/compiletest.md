@@ -30,7 +30,7 @@ drive v1's commands (`blaze status`, `stop`, `sandbox`), which v2 lacks.
 | `tests/rustdoc*` | no | rustdoc's HTML and JSON; blaze has no doc command. |
 | `tests/ui-fulldeps` | no | Tests of rustc's own crates as libraries (`rustc_private`). |
 | `tests/debuginfo` | later | A debugger over blaze's debug info is what users do, and the expectations are values printed by gdb and lldb, not rustc's output. It needs: gdb and lldb on the runner, the `gdb-command`/`gdb-check` and `lldb-*` directives, `-g` builds run under the debugger in the sandbox, and rustc's pretty printers (`src/etc`) or blaze's own. Nothing covers it today. |
-| `library/coretests`, `alloctests`, std's own tests | not yet | Not compiletest, but the same kind of evidence, and nothing runs them: no harness, workflow or ledger row builds them. They need `blaze test` of a package that is part of the standard library's own workspace. |
+| `library/coretests`, `alloctests`, std's own tests | not yet | Not compiletest, but the same kind of evidence, and nothing runs them: no harness or workflow builds them. They need `blaze test` of a package that is part of the standard library's own workspace. |
 
 ## What a test asks, and what is held
 
@@ -69,6 +69,3 @@ it has no blaze meaning yet (`unsupported`, naming the directive or flag). One i
 A test is `pass`, `fail` (a short cause shared by every test that fails the same way, and its
 first difference), `panic` (blaze's own, or blaze ended by a signal), `timeout`,
 `unsupported` or `ignored`.
-
-The ledger rows are U1 (ui), U2 (incremental), U3 (crashes) and U4 (the standard library's own
-tests) in `docs/v2/plan/objectives.json`.

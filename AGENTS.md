@@ -102,7 +102,7 @@ point at the rule that took them in. Edit `scripts/src/bin/rules.rs` and run `wr
 
 ### Docs and scripts (skill `docs-and-scripts`)
 - **41. docs-say-what-they-are**: Names & front matter state exact role/action (current|plan|record|superseded); no vague nouns.
-- **49. docs-stay-small**: The plan, the ledger, the bounds and one spec per unbuilt design; delete what stops being true.
+- **49. docs-stay-small**: The plan, the decisions, the bounds and one spec per unbuilt design; delete what stops being true.
 
 ## Code Review Rules
 

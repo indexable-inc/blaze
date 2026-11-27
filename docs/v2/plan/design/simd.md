@@ -130,6 +130,6 @@ reductions to extract-and-fold; N above 4 is a typed error naming the kernel.
 Built: `native_lanes!` (library/core/src/blaze_simd.rs); `target_features::multiversion` (levels,
 `Plan`, `select`, `key`; called by its tests alone). Not built on the item layer: the gate and the
 attribute read (both refused by the catch-all, [extensions](extensions.md) row D), the clones,
-cells, dispatcher and initializer. Tests: the ledger's row E13 names them, and the two still to
+cells, dispatcher and initializer. Tests: the two still to
 write with the clones (the instances and sets a function compiles to; each clone giving the
 baseline's bits).

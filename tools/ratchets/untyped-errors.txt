@@ -6,7 +6,6 @@
 # scripts/src/bin/untyped.rs (`{"command": "write"}`), checked in CI.
 # crate	string	str	boxed	anyhow	aliases
 blaze-audit	4	0	0	0	0
-blaze-bench	0	0	0	0	1
 blaze-build-script	0	1	0	0	0
 blaze-cas	1	2	0	0	0
 blaze-cbor	0	1	0	0	0
@@ -25,9 +24,7 @@ blaze-lint-defs	3	0	0	0	0
 blaze-lir	0	15	0	0	1
 blaze-lower	0	1	0	0	0
 blaze-manifest	2	1	0	0	0
-blaze-pack	5	0	0	0	0
 blaze-proc-macro	7	4	0	0	1
-blaze-profile	62	2	0	0	1
 blaze-protocol	1	0	0	0	0
 blaze-remote	25	3	0	0	0
 blaze-scope	0	1	0	0	0
@@ -49,5 +46,4 @@ harness/harness-native-render	39	2	0	0	1
 harness/harness-native-ui-inline	4	0	0	0	0
 harness/harness-native-ui-timeline	2	0	0	0	0
 harness/harness-video	13	0	0	0	1
-ix-prof	45	0	0	0	0
 rustc_abi	1	0	0	0	0

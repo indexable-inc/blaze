@@ -4,7 +4,6 @@
 bgit 36
 blaze-audit 73
 blaze-base-tools 12
-blaze-bench 9
 blaze-body-build 2
 blaze-bstd-convert 45
 blaze-build 14
@@ -44,7 +43,6 @@ blaze-lint-defs 9
 blaze-lir 11
 blaze-lower 18
 blaze-macro-run 6
-blaze-malloc 1
 blaze-manifest 267
 blaze-memo 1
 blaze-memo-macros 6
@@ -56,8 +54,6 @@ blaze-parquet 5
 blaze-pg 4
 blaze-proc-macro 116
 blaze-producers 7
-blaze-profile 80
-blaze-rel 11
 blaze-report 29
 blaze-resolve 125
 blaze-run 2
@@ -84,11 +80,9 @@ blaze-typeck 42
 blaze-unit-graph 20
 blaze-wasi 1
 blaze-world 51
-blaze-world-api 2
 edition 2
 gpu 1
 gpu-macros 5
-ix-prof 15
 parser 12
 rustc_abi 9
 stdx 4

@@ -5,7 +5,7 @@ import BlazeMir.arith.add_one
 
 /-!
 `arith::add_one`: the functional model (`BlazeModel.arith.add_one`) agrees with the semantics of
-the function's MIR (`BlazeMir.arith.add_one`), for every argument: objective V7
+the function's MIR (`BlazeMir.arith.add_one`), for every argument
 (docs/v2/plan/design/formal-verification.md). `mir_walk` (`Blaze.Mir.Walk`) runs the one block
 up to the checked addition, whose outcome it cannot decide for an `x` it does not know; the
 model is that same addition, so a case on its result closes both sides at once. No state
