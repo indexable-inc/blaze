@@ -3357,6 +3357,8 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
     }
     let mut walk: AVec<'a, tc::PTy> = AVec::new_in(alloc);
     let mut found: AVec<'a, u128> = AVec::new_in(alloc);
+    let mut traits_found: AVec<'a, u128> = AVec::new_in(alloc);
+    let mut traits_seen: AVec<'a, u128> = AVec::new_in(alloc);
     while let Some(k) = todo.pop() {
         let key = tc::ItemKey(k);
         let mut unmade = AdtUnmade::NoRow;
@@ -3371,6 +3373,7 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
             }
         }
         found.clear();
+        traits_found.clear();
         {
             let Some(row) = BodyHeadFacts::new(&*r.store, r.names).adt(key) else {
                 if let Ok(at) = seen.binary_search_by_key(&k, |&(s, _)| s) {
@@ -3395,8 +3398,12 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
                     }
                     budget -= 1;
                     let Ok(node) = tys.node(t) else { continue };
-                    if let tc::PNode::Adt(a, _) = node {
-                        found.push(a.0);
+                    match node {
+                        tc::PNode::Adt(a, _) => found.push(a.0),
+                        tc::PNode::ExTrait(tr, _) | tc::PNode::ExProj { trait_: tr, .. } | tc::PNode::Alias { trait_: tr, .. } => {
+                            traits_found.push(tr.0);
+                        }
+                        _ => {}
                     }
                     // A type the walk cannot read is the lay's refusal, by name, below.
                     if let Ok((list, last)) = children(tys, t, node) {
@@ -3405,6 +3412,17 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
                             walk.push(c);
                         }
                     }
+                }
+            }
+        }
+        for &tr in traits_found.iter() {
+            if let Err(at) = traits_seen.binary_search(&tr) {
+                traits_seen.insert(at, tr);
+                let tr_key = tc::ItemKey(tr);
+                if !r.store.maps.trait_lifetimes.contains_key(&tr_key)
+                    && let Some(lib) = r.keys.library_in(r.names, tr_key)
+                {
+                    let _ = ensure_why(r, Want::Head(lib));
                 }
             }
         }

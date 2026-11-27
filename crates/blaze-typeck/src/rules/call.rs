@@ -65,7 +65,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// resolved (writeback/selected_rows.rs); where the caller's own where-clause may answer a
     /// ground row instead of an impl is decided there too. A clause whose written arguments
     /// hold a projection is not noted ([`crate::selected::holds_alias`]).
-    fn record_lifetime_impls(&mut self, call: ExprId, item: ItemKey, args: TyList, first: usize) -> Result<(), Stop> {
+    pub(crate) fn record_lifetime_impls(&mut self, call: ExprId, item: ItemKey, args: TyList, first: usize) -> Result<(), Stop> {
         let preds = self.reads.predicates(item)?;
         for &clause in preds.clauses {
             let (trait_, name, formal) = match clause {
