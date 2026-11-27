@@ -3611,7 +3611,7 @@ fn open_stretch_records<'n>(
                 packages.push(one.package);
                 world_ats.push(one.world_at);
             }
-            crate::front_load::CratesFrom::ByNeed { own: scope.own.records, rest: scope.rest, records: scope.records }
+            crate::front_load::CratesFrom::ByNeed { own: scope.own.records, own_world_at: scope.own.world_at, rest: scope.rest, records: scope.records }
         }
     };
     let crate_names: &'n [&'n str] = crate_names.into_bump_slice();
@@ -3756,11 +3756,13 @@ impl crate::front_load::OpenByNeed for LazyScopeRecords<'_> {
     fn pack_file_items<'s>(
         &'s self,
         world_at: usize,
+        nfiles: usize,
         file: u32,
         edition: blaze_surface::Edition,
         text: &'s str,
+        verify_digest: bool,
     ) -> Option<Result<blaze_scope::items_record::CurrentFile<'s>, blaze_scope::items_record::ItemsRecordError>> {
-        self.inner.pack_file_items(world_at, file, edition, text)
+        self.inner.pack_file_items(world_at, nfiles, file, edition, text, verify_digest)
     }
 }
 

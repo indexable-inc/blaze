@@ -245,7 +245,7 @@ pub(crate) fn names_records_envs<'n>(
                 crate_names.push(one.name);
                 packages.push(one.package);
             }
-            crate::front_load::CratesFrom::ByNeed { own: scope.own.records, rest: scope.rest, records: scope.records }
+            crate::front_load::CratesFrom::ByNeed { own: scope.own.records, own_world_at: scope.own.world_at, rest: scope.rest, records: scope.records }
         }
     };
     let (crate_names, packages): (&'n [&'n str], &'n [&'n str]) = (crate_names.into_bump_slice(), packages.into_bump_slice());
