@@ -11,7 +11,7 @@ blaze-build-script 30
 blaze-cas 55
 blaze-cc 6
 blaze-cert 1
-blaze-cli 138
+blaze-cli 140
 blaze-code 11
 blaze-columns 1
 blaze-consteval 2
@@ -38,7 +38,7 @@ blaze-manifest 2
 blaze-mem 1
 blaze-native 5
 blaze-new 1
-blaze-proc-macro 24
+blaze-proc-macro 25
 blaze-profile 5
 blaze-resolve 1
 blaze-scope 5

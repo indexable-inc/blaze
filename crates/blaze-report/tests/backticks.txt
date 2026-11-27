@@ -12,7 +12,7 @@ blaze-build-script 36
 blaze-c 6
 blaze-cas 9
 blaze-check 4
-blaze-cli 362
+blaze-cli 366
 blaze-cli-spec 9
 blaze-code 1
 blaze-comptime-sys 2

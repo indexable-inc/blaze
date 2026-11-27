@@ -42,7 +42,7 @@ blaze-cbor	3	0	0	0	0	0	1	0	0	0
 blaze-cc	6	0	0	1	0	0	0	0	0	0
 blaze-cert	7	0	0	2	0	0	0	0	0	2
 blaze-check	7	0	0	31	0	0	48	0	0	0
-blaze-cli	1335	31	3	771	301	96	3	12	0	3
+blaze-cli	1335	31	3	771	300	96	3	12	0	3
 blaze-cli-spec	1	0	0	0	0	0	0	0	0	0
 blaze-code	1	0	0	1	0	0	0	0	0	0
 blaze-columns	27	0	0	35	0	0	0	0	0	0
@@ -90,7 +90,7 @@ blaze-int	4	0	0	1	0	0	0	0	0	0
 blaze-json	3	0	0	0	0	0	1	0	0	0
 blaze-keyed	6	0	1	124	0	0	0	0	0	0
 blaze-kit	2	0	0	0	0	0	0	0	0	0
-blaze-ladder	784	289	0	2392	62	55	12	262	0	98
+blaze-ladder	785	288	0	2392	62	55	12	262	0	98
 blaze-launch	19	0	0	158	0	0	0	0	0	1
 blaze-launch-rt	118	2	0	101	8	7	19	1	0	0
 blaze-launcher	20	1	0	17	8	0	0	1	0	0
