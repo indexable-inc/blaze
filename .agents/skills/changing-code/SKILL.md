@@ -9,24 +9,7 @@ description: "How a change that spans the tree is made: a type before a lint bef
 
 ## fix-through-blaze-lints (rule 13)
 
-Reach for astlog first for any change of many sites, and for the question before it. astlog
-(tools/astlog) is a Datalog over syntax trees: a rules file under tools/astlog/rules/ matches Rust
-code patterns with captures and joins them by tree position, by value or recursively. Its joins with
-what the front end knows (types, resolution) went with the old front end on 2026-11-15 and come back
-on the new item layer. Before a refactor, a query lists every site the change must touch, the hard
-ones included, so they are known up front and not found by breaking the build; then the same file's
-`(rewrite ..)` actions make the edit (the diff read), and the file is checked in so the change can
-be run again and reviewed against intent. Do not write a one-off script that loops over compile
-errors, and do not hand a mechanical change of many sites to lanes to make by hand: write the rule.
-Where blaze cannot yet check a crate, say so, fix that, and use the compiler's error list for that
-crate meanwhile. A change that moves a type, path, API or idiom across the code and must keep
-holding afterward is a ban with a `replacement` in `.clippy.toml` (mirrored in the hot crates'
-`clippy.toml`), which clippy's `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce
-by name resolution (imports, renames, globs, re-exports), never by text, so the rule keeps holding
-after the port. blaze's own lints, with fixes, are rebuilt on the new item layer
-(docs/v2/plan/design/bottom.md). A shape that is syntax only goes through astlog or `ast-grep`,
-scoped and checked by a build afterward; never `sed`, `rg` replace or a script that rewrites Rust as
-text (`edit-rust-by-syntax`).
+Merged into rule 72, `edit-rust-by-syntax` (`changing-code` skill).
 
 ## whole-ports (rule 24)
 
@@ -37,15 +20,7 @@ then hand the batch over. A half-ported tree blocks every lane's run.
 
 ## best-long-term-design (rule 28)
 
-Build only what you are proud of, on the first iteration too: the first version of a design is
-already the one you would defend, never a placeholder to improve later; then iterate. Always pursue
-and present the longest-term best solution by default (assume infinite time, even if
-out-of-distribution), not the least work: own the layer or port rustc's rule properly, show unitless
-proportional effort bars (`[████████░░]`) when comparing options, and spend the effort on proving it
-right: real crates' own test suites passing under blaze, property tests and deterministic simulation
-of blaze's own invariants (`testing` skill), and fuzzing of parsers of hostile bytes.
-
-See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#what-a-change-needs).
+Merged into rule 62, `sota-first` (`changing-code` skill).
 
 ## spec-then-build (rule 29)
 
@@ -68,7 +43,7 @@ Each concept has one type, one rule and one place it is computed: two types for 
 do the same job (two schedulers, two evaluators, two tiers for one level) are a bug. Whenever you
 spot duplicated logic or patterns across the repo that can be generalized into a shared crate,
 ALWAYS immediately spawn a subagent to extract and generalize it into one shared crate, sweep all
-callers, ban the removed duplicates with a `replacement` (`fix-through-blaze-lints`), and
+callers, ban the removed duplicates with a `replacement` (`edit-rust-by-syntax`), and
 land/admin-merge it cleanly (`agents-are-a-cost`) — never leave duplicates behind or merely file an
 issue. For CLI binaries, `bstd::cli` (`CommandSpec`, nested subcommands, aliases, typo hints, ANSI
 `--help`) is the in-house `clap` replacement — never hand-roll `env::args` loops, hand-duplicate
@@ -78,18 +53,21 @@ help strings, or depend on `clap`/proc macros; for `blaze` itself and `blaze-she
 ## guard-the-cause (rule 54)
 
 Bad code is a symptom. Whenever you find a problem (jank, a subpar design, a bug that sat unseen, a
-wait nobody named, a second way to do one thing, an agent mistake), generalize it before patching:
-find at least 3 similar cases across the codebase or system, extract the shared root cause, name
-that problem class, and fix the entire category from first principles (then proactively sweep all
-remaining instances and merge the fix in — never stop at patching the one instance or at a
-write-up). Ask why it was written that way and why nothing caught it: a missing type/invariant, a
-missing lint, a harness that was broken or bypassed, a rule that did not say, a skill that told
-nobody how, an interface that made the wrong thing the easy thing, a measurement nobody ran. Remove
-that cause in the same change or the next: a blaze lint with a fix that finds every other instance
-(`fix-through-blaze-lints`), a check that joins the gate, a rule or skill instruction that says what
-to do instead, or a change to the interface so the mistake cannot be expressed. The fix is not done
-until the guard exists and has been run over the whole tree. Do it proactively: you do not wait to
-be asked, and you say in your report what the cause was and what now guards it. A guard that only
+wait nobody named, a second way to do one thing, an agent mistake) or feel unease (a workaround that
+had to be written, a result explained by inspection where a check should explain it, a step that
+only works when done carefully, a number that surprised you, code tied to other code by convention),
+generalize it before patching: find at least 3 similar cases across the codebase or system, extract
+the shared root cause, name that problem class, and fix the entire category from first principles
+(then proactively sweep all remaining instances and merge the fix in — never stop at patching the
+one instance or at a write-up). Ask why it was written that way and why nothing caught it: a missing
+type/invariant, a missing lint, a harness that was broken or bypassed, a rule that did not say, a
+skill that told nobody how, an interface that made the wrong thing the easy thing, a measurement
+nobody ran. Remove that cause in the same change or the next: a blaze lint with a fix that finds
+every other instance (`type-then-lint-then-rule`), a change to the language that removes the mistake
+(`own-the-language`), a check that joins the gate, a rule or skill instruction that says what to do
+instead, or a change to the interface so the mistake cannot be expressed. The fix is not done until
+the guard exists and has been run over the whole tree. Do it proactively: you do not wait to be
+asked, and you say in your report what the cause was and what now guards it. A guard that only
 describes the one instance you found is not one; state the general rule it enforces. Do it for small
 things as much as large: a command that needed a flag you forgot, a test that passed while running
 nothing, a number that had to be retracted, a file that two lanes both edited. The method is five
@@ -99,9 +77,11 @@ the design rather than an event (`the test filter matched nothing` is an event; 
 zero checks reports success` is a property). Then name the class (every instance that property
 allows, not the one you met), and choose the strongest prevention you can build, in the order
 `type-then-lint-then-rule` gives. Then solve it: build the prevention in the same change or the
-next, run it over the whole tree, and land it; do not stop at the write-up. Record the root cause
-and class in `agents/kb/` via `scripts/src/bin/kb.rs` (`facts.jsonl` for code-anchored gotchas/facts
-or `dead_ends.jsonl` for tried-and-reverted approaches), so the next agent sees the class, not the
+next, run it over the whole tree, and land it; do not stop at the write-up. The size of the right
+fix is not a reason to prefer the wrong one: if it is large, say so
+(`flag-jank-or-monumentous-in-all-caps`) and start it. Record the root cause and class in
+`agents/kb/` via `scripts/src/bin/kb.rs` (`facts.jsonl` for code-anchored gotchas/facts or
+`dead_ends.jsonl` for tried-and-reverted approaches), so the next agent sees the class, not the
 anecdote. When several entries share a class, that class is the work: one architectural change, not
 one patch per entry.
 
@@ -109,47 +89,66 @@ See [docs/contributing.md#what-a-change-needs](../../../docs/contributing.md#wha
 
 ## build-the-missing-piece (rule 58)
 
-A design that says "this would use X, but X is not in the tree" is not finished. The missing piece
-(a language or reflection feature, an intrinsic, a bstd module, a SIMD primitive, a harness check, a
-debugging command) is part of the work: specify it, build it in its right home, and use it, in the
-same lane or one started at once, with a ledger row so it is tracked. An interim form is allowed
-only while the piece is being built: it is marked at the spot (`// when <piece> lands: <what
-changes>`), listed in the lane's report and its ledger row, and removed when the piece lands. What
-is never acceptable is the weaker design left standing with a note that the tree lacked something: a
-scalar loop where the design is vectorized, a hand-written impl where reflection should derive it, a
-guessed number where a measurement tool should exist. If the piece is large, say so and start it; do
-not quietly scope it out. This is `own-the-language` for the whole tree, and `guard-the-cause` for
-capabilities: the cause of a weak design is a missing piece, so add the piece.
+Merged into rule 55, `own-the-language` (`compiler-correctness` skill).
 
 ## unease-is-work (rule 59)
 
-Unease is a finding, not a mood: a workaround that had to be written, a result explained by
-inspection where a check should explain it, a tool that could be misused the same way again, a step
-that only works when done carefully, a number that surprised you, code tied to other code by
-convention. Do not note it and move on, and do not patch the instance. Ask why it is that way until
-the answer is a cause that can be removed (a missing type, a missing check, an API that allows the
-mistake, a representation that hides the fact, a language that cannot state the invariant), and
-remove it there: redesign the piece, add the guard (`guard-the-cause`), build what is missing
-(`build-the-missing-piece`), or change the language: add a feature, change one, or delete one that
-invites the mistake (`own-the-language`). The size of the right fix is not a reason to prefer the
-wrong one (`best-long-term-design`); if it is large, say so, start it, and give it a ledger row. Say
-in the change what the unease was and what cause was removed, so the next reader does not rediscover
-it.
+Merged into rule 54, `guard-the-cause` (`changing-code` skill).
 
 ## sota-first (rule 62)
 
-When something is behind the state of the art, do not improve it a notch at a time. Work out what
-the best known design is (read the competitor's code, the literature, the profile), decide the end
-state, and build that end state directly: split it into its independent pieces and run them at once
-in parallel lanes (`agents-are-a-cost`), merge them into one tree, verify, measure. An intermediate
-version is built only where the end state cannot be reached without it or where it is itself the
-measurement that decides the design; it is never the plan. Incremental polishing of a design that is
-known to be the wrong shape is waste: replace the shape. Then prove the result where it counts, in
-this order: the real target projects build and pass their own tests under blaze (tempoxyz/tempo and
-paradigmxyz/reth first, `verify-on-real-projects`), and the head-to-head against the best competitor
-on the same machine is won on every row (`incremental-first` says which rows come first). A change
-is not finished at "the micro-benchmark improved"; it is finished when the real targets work and the
+Pursue the longest-term best design by default, not the least work (assume infinite time, even if
+out of distribution): own the layer or port the language's rule properly, and show unitless
+proportional effort bars (`[████████░░]`) when comparing options. Build only what you are proud of,
+on the first iteration too: the first version of a design is already the one you would defend, never
+a placeholder; then iterate. When something is behind the state of the art, do not improve it a
+notch at a time. (1) Aim at the floor from the start; missing it is allowed, aiming lower is not.
+The floor is what an oracle that already knows exactly which results changed would do: redo those
+and the direct readers of each changed value (a reader must rerun to learn whether its own value
+changed), plus unavoidable I/O (a process start, a socket round trip, the bytes of the result). The
+bar is bookkeeping of at most max(10% of that work, a few milliseconds). Before building, write the
+floor for each operation the design serves (no-op, comment edit, body edit, interface edit under
+many dependents, restart, idle memory, peak memory, bytes on disk) and the design's cost beside it
+as a formula in the things that grow (entries, reads, files, dependents); reject a cost that grows
+with what is reachable where the floor grows with what changed; count constants too (a check that
+costs microseconds where a mark costs nanoseconds is off by a hundred); where two measures trade,
+pick the point and say which pays; say plainly what no design reaches (direct readers rerun; every
+instantiation of an edited generic is recompiled; a restart on Linux stats every file). After
+building, every edit-loop measurement reports results changed, direct readers rerun, everything else
+touched, and the ratio of the last to the first two; a ratio over 1.1 is a defect with an owner. The
+compiler's own throughput (type checking, codegen) has no theoretical floor and is compared with the
+best existing tools instead. (2) Work out the best known design (read the competitor's code, the
+literature, the profile) and write the end state before more code: one short spec that starts from
+what the thing must do, states the invariant, covers the whole path the symptom runs through and not
+only the component the last bug was in, and says how the best existing systems solve it (name the
+file); someone outside the work reviews it and its cost table before the build. Then build that end
+state directly: split it into its independent pieces and run them at once in parallel lanes
+(`agents-are-a-cost`), merge them into one tree, verify, measure. An intermediate version is built
+only where the end state cannot be reached without it or where it is itself the measurement that
+decides the design; it is never the plan. Delete what the end state replaces in the same piece of
+work: a new mechanism beside the old ones (a fourth validity check, a third store for one thing, a
+second way a crate is loaded), or a switch between the old path and the new one kept longer than the
+build of the new one, fails this rule. (3) Stop on the second fix. A sequence of correct local fixes
+can stay inside a wrong design for weeks. Count fixes by mechanism and by symptom, not by cause: the
+second fix in one week to one mechanism (the memory gate, admission, a validity check, a loader) or
+for one symptom (a no-op that walks, memory that grows, a restart that recomputes, a cache that
+misses) stops all work on it, yours and every lane's, before that second fix lands. The stop ends
+only with an outside verdict: someone outside the work (a fresh agent given the code and the best
+competing system's source but not your reasoning, or a person) says whether the mechanism should
+exist at all; one that should not is deleted with what made it needed, not fixed. Other signs to
+stop on: a fast path that is an exception to a slower default and must survive a list of conditions;
+a list of special cases that keeps growing; a second mechanism added to cover the first one's gap; a
+fix whose explanation was a guess; work described as written and not compiled for more than one
+round. The speed of the next fix is never a reason to keep the design. (4) Prove the result where it
+counts, judged by end-to-end measurements on a quiet machine before and after: the real target
+projects build and pass their own tests under blaze (tempoxyz/tempo and paradigmxyz/reth first,
+`verify-on-real-projects`), blaze's own invariants are tested and simulated (`testing` skill),
+parsers of hostile bytes are fuzzed, and the head-to-head against the best competitor on the same
+machine is won on every row (`incremental-first` says which rows come first). A change is not
+finished at "the micro-benchmark improved"; it is finished when the real targets work and the
 comparison is won, or when what still blocks that is written down with its evidence.
+
+See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
 
 ## agents-json (rule 63)
 
@@ -175,67 +174,37 @@ KB entry; when several entries share a failure class, fix the class architectura
 
 ## end-state-not-hill-climb (rule 66)
 
-A sequence of correct local fixes can stay inside a wrong design for weeks, because each fix has a
-real cause and a real measurement and so looks like progress. Guard against it. (1) Count fixes by
-mechanism and by symptom, not by cause: the second fix in one week to one mechanism (the memory
-gate, admission, a validity check, a loader) or for one symptom (a no-op that walks, memory that
-grows, a restart that recomputes, a cache that misses) stops all work on it, yours and every lane's,
-before that second fix lands. (2) The stop ends only with an outside verdict: someone outside the
-work (a fresh agent given the code and the best competing system's source but not your reasoning, or
-a person) reads both and says whether the mechanism should exist at all; the question is not how to
-fix it. A mechanism that should not exist is deleted with what made it needed, not fixed. (3) Write
-the end state before more code: one short spec that starts from what the thing must do, states the
-invariant, and says how the best existing systems solve it (read their source; name the file); the
-spec covers the whole path the symptom runs through, not the component the last bug was in, and has
-the same outside review before building; a frame you have held for days is not checked by you. (4)
-Build the end state directly and delete what it replaces in the same piece of work: a new mechanism
-beside the old ones (a fourth validity check, a third store for one thing, a second way a crate is
-loaded) is a failure of this rule, and so is a switch that selects between the old path and the new
-one for longer than the build of the new one. (5) Judge by end-to-end measurements on the real
-targets, taken on a quiet machine, before and after; a day of work with no end-to-end number is a
-day off course. The signs to stop on: a fast path that is an exception to a slower default and must
-survive a list of conditions; a list of special cases that keeps growing; a second mechanism added
-to cover the first one's gap; a fix whose explanation was a guess; work described as written and not
-compiled for more than one round. The speed of the next fix is never a reason to keep the design.
-
-See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
+Merged into rule 62, `sota-first` (`changing-code` skill).
 
 ## within-ten-percent-of-the-floor (rule 67)
 
-Aim at the floor from the start: the first design is drawn against it, never a design to be tuned
-toward it later. Missing it is allowed; aiming lower is not. Build something you are proud of on the
-first try, then iterate (`best-long-term-design`). The floor is what an oracle that already knows
-exactly which results changed would do: redo those and the direct readers of each changed value (a
-reader must rerun to learn whether its own value changed), plus unavoidable I/O (a process start, a
-socket round trip, the bytes of the result). The bar is bookkeeping of at most max(10% of that work,
-a few milliseconds); under a few milliseconds a percentage means nothing. Before building: (1) write
-the floor for each operation the design serves (no-op, comment edit, body edit, interface edit under
-many dependents, restart, idle memory, peak memory, bytes on disk) and the design's cost beside it
-as a formula in the things that grow (entries, reads, files, dependents), and reject a cost that
-grows with what is reachable where the floor grows with what changed; (2) count constants too: a
-check that costs microseconds where a mark costs nanoseconds is off by a hundred before any
-asymptotics; (3) where two measures trade (an index that buys time for memory or disk; small when
-idle against instant after idle), pick the point and say which measure pays; (4) say plainly what no
-design reaches (direct readers rerun; every instantiation of an edited generic is recompiled; a
-restart on Linux stats every file) so nobody designs around it. After building: every edit-loop
-measurement reports results changed, direct readers rerun, everything else touched, and the ratio of
-the last to the first two; a ratio over 1.1 is a defect with an owner. The compiler's own throughput
-(type checking, LLVM) has no theoretical best and is compared with the best existing tools instead.
-An outside review of the cost table comes before the build (end-state-not-hill-climb).
-
-See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-is-run).
+Merged into rule 62, `sota-first` (`changing-code` skill).
 
 ## edit-rust-by-syntax (rule 72)
 
 Every change to a `.rs` file goes through the agent's edit tools (Edit, or Write after a Read) or a
-tool that parses Rust: an astlog rules file for a change of many sites (`fix-through-blaze-lints`),
-and `ast-grep` (`ast-grep run --lang rust --pattern '<pattern>' --rewrite '<rewrite>' <paths>`) for
-a syntax-only shape across many files, scoped to the paths named, with the diff read afterward.
-Never `cat <<EOF > x.rs`, `sed -i`, `perl -pi`, `awk`, `rg --replace` written back, or a Python,
-TypeScript or shell script that writes Rust as strings: they write what the quoting made of the
-text, miss what the pattern did not foresee, and leave nothing a reviewer can check against intent.
-A checked-in generator of Rust (a build script, a script that writes a table) is code itself,
-reviewed as code, and exempt. A lane brief says this in one line.
+tool that parses Rust: an astlog rules file for a change of many sites (below), and `ast-grep`
+(`ast-grep run --lang rust --pattern '<pattern>' --rewrite '<rewrite>' <paths>`) for a syntax-only
+shape across many files, scoped to the paths named, with the diff read afterward. Never `cat <<EOF >
+x.rs`, `sed -i`, `perl -pi`, `awk`, `rg --replace` written back, or a Python, TypeScript or shell
+script that writes Rust as strings: they write what the quoting made of the text, miss what the
+pattern did not foresee, and leave nothing a reviewer can check against intent. A checked-in
+generator of Rust (a build script, a script that writes a table) is code itself, reviewed as code,
+and exempt. A lane brief says this in one line. Reach for astlog first for any change of many sites,
+and for the question before it. astlog (tools/astlog) is a Datalog over syntax trees: a rules file
+under tools/astlog/rules/ matches Rust code patterns with captures and joins them by tree position,
+by value or recursively; its joins with what the front end knows (types, resolution) come back on
+the new item layer. Before a refactor, a query lists every site the change must touch, the hard ones
+included, so they are known up front and not found by breaking the build; then the same file's
+`(rewrite ..)` actions make the edit (the diff read), and the file is checked in so the change can
+be run again and reviewed against intent. Do not write a one-off script that loops over compile
+errors, and do not hand a mechanical change of many sites to lanes to make by hand: write the rule.
+Where blaze cannot yet check a crate, say so, fix that, and use the compiler's error list for that
+crate meanwhile. A change that moves a type, path, API or idiom across the code and must keep
+holding afterward is a ban with a `replacement` in `.clippy.toml` (mirrored in the hot crates'
+`clippy.toml`), enforced by name resolution (imports, renames, globs, re-exports), never by text, so
+the rule keeps holding after the port; blaze's own lints, with fixes, are rebuilt on the new item
+layer (docs/v2/plan/design/bottom.md).
 
 ## type-then-lint-then-rule (rule 73)
 
@@ -243,33 +212,34 @@ When a mistake can happen again (yours, a lane's, one in the tree), build the st
 you can, in this order. (1) A type or a signature that cannot express the mistake: an allocator
 parameter with no default, a position type that is item-relative, a lock that cannot be made without
 a name, a key type built only from all its inputs, one home for the concept, a tool whose only mode
-is the right one. (2) Where no type can hold it, make it loud: the wrong thing fails at once, naming
-itself. (3) A lint with a MachineApplicable fix (`fix-through-blaze-lints`), deny by default and run
-over the whole tree in the same change; or a gate check or a simulation invariant where a lint
-cannot see the mistake. (4) Only last, a line in scripts/src/bin/rules.rs, a skill or a how-to: a
-rule relies on its reader, so it is the weakest guard. Design every API so the obvious call is the
-correct one: the safe form is the short one, and the risky form is longer and named for its risk.
-Before adding a lint, list the lints that already cover the same mistake (`.clippy.toml`'s bans,
-clippy's own lints) and extend the one that covers it, or say in the change why none does.
+is the right one. Embrace the newtype: when a number, a string or a `bool` means something (an id,
+an index into one table, a byte offset, a line, a length, a count, a tick, a size in bytes, a
+percentage, a name of one kind), wrap it, even for one use, and when in doubt, wrap; it costs
+nothing at run time. A key, a digest or an id is its own type per kind (a digest per record kind, a
+dense id per table), never raw bytes, a `u64` or a `usize`; a length, an offset or a count has
+checked arithmetic; item-relative and absolute positions are two types (`item-relative-positions`);
+a state is an enum or a typestate, not a flag beside the data; a unit (bytes, pages, nanoseconds) is
+in the type. A value that must be handed over or consumed (a lease, a reservation, a write to commit
+or abort) is linear (`#[blaze::linear]`): dropping it is an error. What was checked is a proof type
+only its checker can make (`verify-once`). At function and capability boundaries, a bare `bool` flag
+is a two-variant enum or a `#[blaze::args]` options struct (`options-struct`), adjacent parameters
+of one primitive type are avoided (`blaze::bool_param`, `blaze::swappable_parameters`,
+`blaze::primitive_meaning`), a result is a named struct, never an anonymous tuple like `(Option<T>,
+bool)` or `Option<(A, B, C)>` (`blaze::anon_tuple_return`), and capabilities narrow monotonically
+(`Dir<ReadOnly, Flat>`, `Leaf`, `Budget`). Where the language cannot state the type, extend the
+language (`own-the-language`). (2) Where no type can hold it, make it loud: the wrong thing fails at
+once, naming itself. (3) A lint with a MachineApplicable fix, or a `.clippy.toml` ban with a
+`replacement` (`edit-rust-by-syntax`), deny by default and run over the whole tree in the same
+change; or a gate check or a simulation invariant where a lint cannot see the mistake. (4) Only
+last, a line in scripts/src/bin/rules.rs, a skill or a how-to: a rule relies on its reader, so it is
+the weakest guard. Design every API so the obvious call is the correct one: the safe form is the
+short one, and the risky form is longer and named for its risk. Before adding a lint, list the lints
+that already cover the same mistake (`.clippy.toml`'s bans, clippy's own lints) and extend the one
+that covers it, or say in the change why none does.
 
 ## correct-by-construction (rule 76)
 
-What `type-then-lint-then-rule` means by a type, for any code here: a value that carries an
-obligation, a proof or a meaning is a type that states it, so the wrong program does not compile.
-Embrace the newtype: when a number, a string or a `bool` means something (an id, an index into one
-table, a byte offset, a line, a length, a count, a tick, a size in bytes, a percentage, a name of
-one kind), wrap it, even for one use, and when in doubt, wrap; a function that takes two bare
-integers will one day be called with them swapped. A newtype costs nothing at run time and a model
-writes its conversions for free. A value that must be handed over or consumed (a lease, a
-reservation, a write to commit or abort) is linear (`#[blaze::linear]`): dropping it is an error.
-What was checked is a proof type only its checker can make (`verify-once`). A key, a digest or an id
-is its own type (a digest per record kind, a dense id per table), never raw bytes, a `u64` or a
-`usize`, so two kinds cannot be mixed and a key cannot be built from part of its inputs. A length,
-an offset or a count is a newtype with checked arithmetic, and item-relative and absolute positions
-are two types (`item-relative-positions`). A state is an enum or a typestate, not a flag beside the
-data, and a unit (bytes, pages, nanoseconds) is in the type. How: before writing a function that
-takes a bare integer, bytes or a bool, ask what the value means and what must be true of it, and
-make that the type; where the language cannot state it, extend the language (`own-the-language`).
+Merged into rule 73, `type-then-lint-then-rule` (`changing-code` skill).
 
 ## strategy-is-a-type-parameter (rule 78)
 
@@ -291,9 +261,9 @@ traits and sans-IO state machines the rest is written against (`blaze-keyed` for
 compiling, with a simulation that drives it and an oracle. Other builders then write against it,
 each in new crates beside the old code (`agents-are-a-cost`, `fan-out-write-only`), never by editing
 the old code in place; the old code is switched off and deleted as soon as its replacement passes
-(`end-state-not-hill-climb`), in the same piece of work. The interface crate changes only by whole
-ports (`whole-ports`). How: before splitting work across lanes, land the interface crate on the
-green head; every brief names it and the crate the lane owns.
+(`sota-first`), in the same piece of work. The interface crate changes only by whole ports
+(`whole-ports`). How: before splitting work across lanes, land the interface crate on the green
+head; every brief names it and the crate the lane owns.
 
 ## options-struct (rule 83)
 
@@ -306,41 +276,35 @@ a grant), every strategy (the hasher, an ordering) and any input with no value t
 everywhere. An input that changes what the reader should expect of cost or behaviour is written too,
 even when its usual value is nothing: a table's `capacity: Option<usize>` has no default, and most
 calls say `capacity: None`. A field WITH a default (`pub shards: usize = 64`: nightly's
-`default_field_values`, named in the crate's features while cargo builds blaze and on unasked in a
-blaze edition) is only a tunable almost no caller should think about, its default safe and stated in
-its doc. The call names what it sets and takes any such rest by `..`: `Map::new(MapOpts { hasher:
-FixedState, alloc: frame, capacity: None })`. An options struct is a call's named arguments and
-nothing else: it is marked `#[blaze::args]`, and a value of it is only ever written as a struct
-literal directly in the call that takes it, never bound by a `let`, kept in a `const` or `static`,
-held in a field or returned from a helper (lint `args-inline`), so every choice is read at the call.
-The same holds for a function with a flag, an optional input, two parameters of one type or more
-than three parameters: it takes one struct of named fields. A conversion from one value (`from`,
-`as_*`) and a hot leaf with one or two distinct inputs stay positional. Length at the call is not a
-cost: models write and read this code, and a name at the use is where a mistake is seen. bstd's API
-follows this wherever a thing is made, and blaze's own crates use it (`blaze-uses-its-extensions`).
-blaze builds it: a struct expression with `..` and no base takes each unset field's default, a
-constant of the field's type.
+`default_field_values`, named in the crate's features, and on unasked in a blaze edition) is only a
+tunable almost no caller should think about, its default safe and stated in its doc. The call names
+what it sets and takes any such rest by `..`: `Map::new(MapOpts { hasher: FixedState, alloc: frame,
+capacity: None })`. An options struct is a call's named arguments and nothing else: it is marked
+`#[blaze::args]`, and a value of it is only ever written as a struct literal directly in the call
+that takes it, never bound by a `let`, kept in a `const` or `static`, held in a field or returned
+from a helper (lint `args-inline`), so every choice is read at the call. The same holds for a
+function with a flag, an optional input, two parameters of one type or more than three parameters:
+it takes one struct of named fields. A conversion from one value (`from`, `as_*`) and a hot leaf
+with one or two distinct inputs stay positional. Length at the call is not a cost: models write and
+read this code, and a name at the use is where a mistake is seen. bstd's API follows this wherever a
+thing is made, and blaze's own crates use it (`blaze-uses-its-extensions`). blaze builds it: a
+struct expression with `..` and no base takes each unset field's default, a constant of the field's
+type.
 
 ## newtypes-and-named-returns (rule 85)
 
-At function and capability boundaries, name the meaning in the type: wrap unit- or ID-bearing
-numbers in zero-cost newtypes, replace bare `bool` flags with two-variant enums or `#[blaze::args]`
-options structs, avoid adjacent identical primitive parameters (`blaze::bool_param`,
-`blaze::swappable_parameters`, `blaze::primitive_meaning`), and return a named struct instead of an
-anonymous stateful tuple like `(Option<T>, bool)` or `Option<(A, B, C)>`
-(`blaze::anon_tuple_return`). Narrow capabilities monotonically at boundaries (`Dir<ReadOnly,
-Flat>`, `Leaf`, `Budget`).
-
-See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
+Merged into rule 73, `type-then-lint-then-rule` (`changing-code` skill).
 
 ## flag-jank-or-monumentous-in-all-caps (rule 89)
 
-Never quietly slip in a hacky workaround, partial stopgap, or silently sink into a monumental
-multi-day architectural undertaking without telling the user clearly. If you cannot solve something
-the proper way (you are considering a jank workaround just to get it working) OR you discover the
-proper fix is a monumental task whose scope the user may not yet realize, STOP AND WRITE IT IN ALL
-CAPS clearly explaining: (1) WHAT IS JANK OR MONUMENTAL, (2) WHY THE PROPER WAY IS HUGE OR BLOCKED,
-and (3) THE EXACT OPTIONS BEFORE PROCEEDING OR MERGING.
+Never quietly slip in a hacky workaround or partial stopgap, or silently sink into a monumental
+multi-day undertaking. If you cannot solve something the proper way (you are considering a jank
+workaround just to get it working) OR you find the proper fix is a monumental task whose scope the
+user may not yet realize, WRITE IT IN ALL CAPS: (1) WHAT IS JANK OR MONUMENTAL, (2) WHY THE PROPER
+WAY IS HUGE OR BLOCKED, and (3) THE OPTIONS. Then carry on with the long-term design (`sota-first`,
+`own-the-language`) without waiting for an answer; an interim form is marked and listed as
+`own-the-language` says. Stop and wait only when the next step cannot be undone (deleting data, a
+published interface, a change of direction).
 
 ## narrow-collection-views (rule 91)
 

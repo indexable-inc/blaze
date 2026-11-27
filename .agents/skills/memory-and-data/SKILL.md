@@ -41,18 +41,19 @@ See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
 
 Nothing of the machine is in what is kept or shared: no absolute path, host name, user, time,
 address or thread order in a key, a record or an output. Two builders of one key, on any machine,
-produce byte-identical values: that is what lets a record be fetched from the shared cache instead
-of made, so it is a protocol requirement, and the CI push refuses a key whose bytes differ from the
-bucket's. How: make a path relative to its root (the workspace, the toolchain, the registry archive)
-before it enters a key; fill a time or an absolute position in only when printed; order by
-construction, never by arrival. No output (an object, a diagnostic's order, a store key, a profile
-row's identity) depends on hash-map iteration order, thread timing, addresses or the wall clock.
-Hashers have fixed seeds, except a table whose keys an attacker may pick (names, paths, literals),
-which is keyed by a `blaze_hash::SipKey`: random when nothing persists its layout and nothing output
-depends on where a key lands, or `blaze_ids::index_key` of its content when an image lays it out; a
-hot one may instead be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run
-no honest keys make, then a random `SipKey` for good. Anything iterated into output is sorted or
-ordered by construction; a test builds twice and compares bytes.
+produce byte-identical values: that is what lets the machine's store keep one copy for every
+checkout, and a remote cache, where one is chosen, serve a record instead of making it, so it is a
+protocol requirement, and a push refuses a key whose bytes differ from what the cache holds. How:
+make a path relative to its root (the workspace, the toolchain, the registry archive) before it
+enters a key; fill a time or an absolute position in only when printed; order by construction, never
+by arrival. No output (an object, a diagnostic's order, a store key, a profile row's identity)
+depends on hash-map iteration order, thread timing, addresses or the wall clock. Hashers have fixed
+seeds, except a table whose keys an attacker may pick (names, paths, literals), which is keyed by a
+`blaze_hash::SipKey`: random when nothing persists its layout and nothing output depends on where a
+key lands, or `blaze_ids::index_key` of its content when an image lays it out; a hot one may instead
+be adaptive (`blaze_hash::adaptive`): the fixed hash until a lookup walks a run no honest keys make,
+then a random `SipKey` for good. Anything iterated into output is sorted or ordered by construction;
+a test builds twice and compares bytes.
 
 ## one-memory-measure (rule 50)
 
@@ -67,9 +68,9 @@ a gate, gives memory back on a ladder, or releases the front end at a threshold.
 did this (admission and its giveback, the machine ledger, wound-wait, blaze-mem's gate and budget,
 the engine's heap per tag and its malloc override) was deleted with the daemon on 2026-11-15, but
 for blaze-graph's `admission`, which is to go: never bring it back, and a change that seems to need
-it is a sign the structure it compensates for should go (`end-state-not-hill-climb`). Live bytes per
-tag say who holds memory; the gap between footprint and live is memory freed but kept and is a bug
-to find an owner for, never a number to tune a threshold around.
+it is a sign the structure it compensates for should go (`sota-first`). Live bytes per tag say who
+holds memory; the gap between footprint and live is memory freed but kept and is a bug to find an
+owner for, never a number to tune a threshold around.
 
 See [.agents/skills/memory-and-data/SKILL.md#the-model](../../../.agents/skills/memory-and-data/SKILL.md#the-model).
 
@@ -143,22 +144,21 @@ racy-stamp rule decides the edge case); with a watcher journal, only the paths t
 looked at. (6) A put of bytes the store already holds writes nothing, and nothing syncs on the edit
 path. The counters that show it are checks per kind per request; a second check of one thing in one
 snapshot is a bug the simulation's oracle catches. This is `type-then-lint-then-rule` applied to
-verification: the type makes the second check impossible to write.
+verification: the type makes the second check impossible to write. The same holds for all work: it
+is done once, or not at all. Never compute at request time what a key computed before the work can
+skip (`granular-caching`): an equal key is a hit, with no other check. Never rebuild what a record
+already holds (`outputs-are-records`), never hold in memory what a fresh process could rebuild from
+records (`no-state-between-requests`), and never write what the store already holds. How: for each
+step on a hot path, ask what makes it necessary on this request; if the answer is "it might have
+changed", find the key, stamp or proof that says whether it did and skip on that. Count checks and
+recomputes per kind per request in the profile; a second of one thing in one snapshot is an
+invariant the simulation's oracle checks.
 
 See [docs/v2/plan/design/bottom.md](../../../docs/v2/plan/design/bottom.md).
 
 ## work-once (rule 77)
 
-Work is done once, or not at all. Never compute at request time what a key computed before the work
-can skip (`granular-caching`): an equal key is a hit, with no other check. Never verify twice
-(`verify-once`): a check returns a proof and later code takes it, and a proof or an unchanged parent
-covers everything under it. Never rebuild what a record already holds (`outputs-are-records`): a
-result is filed once and read in place. Never hold in memory what a fresh process could rebuild from
-records (`no-state-between-requests`), and never write what the store already holds: an identical
-put writes nothing. How: for each step on a hot path, ask what makes it necessary on this request;
-if the answer is "it might have changed", find the key, stamp or proof that says whether it did and
-skip on that. Count checks and recomputes per kind per request in the profile; a second of one thing
-in one snapshot is an invariant the simulation's oracle checks.
+Merged into rule 74, `verify-once` (`compiler-correctness` skill).
 
 ## pgo-by-default (rule 86)
 

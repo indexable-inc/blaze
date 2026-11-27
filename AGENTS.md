@@ -5,12 +5,12 @@ Vertically integrated Rust stack (language, comptime reflection, pinned std, bst
 JIT/PGO/AOT, builder, linter, runtime & unikernel VMs) targeting edit-to-result speed and
 hardware-floor execution on 128-core servers and Apple Silicon Macs via one code path.
 
-- **Tradeoff order:** incremental + lints > remote cache > memory > cold compile > non-blocking GC >
-  disk.
+- **Tradeoff order:** incremental + lints > memory > cold compile > non-blocking GC > disk. The
+  remote cache is supported, not ranked.
 - **Architecture ([bottom.md](docs/v2/plan/design/bottom.md)):** item-grained content-addressed
   records written once and read in place (page cache only); stateless commands with optional expiry
   helper; forward wake without an in-memory dep graph; JIT-on-call + persisted PGO (`build`
-  default); precomputed R2 `std` records; no migrations on home upgrade.
+  default); fetched `std` records off unless chosen; no migrations on home upgrade.
 - **Scope:** Cargo workspaces (`reth`, `tempo`, `blaze`); macOS/Linux arm64 & bare-metal/unikernel
   VMs; `check`, `build`, `run`, `test`; EVERY internal crate `#![no_std]` on `bstd`/`blaze-own`
   explicit `Alloc` & sans-IO (`bstd::cli` for CLI binaries). **Not now:** `blaze
@@ -35,15 +35,15 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
   reflection for blaze/bstd code (zero proc-macros); (2) Tier 1, built: proc-macros & pure-Rust
   `build.rs` as `wasm64` (`memory64`) modules off `blaze-lir` + `blaze-export/src/wasm64.rs`, run
   in-process and sandboxed in Wasmtime (target: exact `blaze-comptime` read-tracing, cross-OS
-  R2-shared `.wasm`); (3) Tier 2 host spawns & C-linking native tools (`clang`/`cc`/`cmake`) routed
+  identical `.wasm`); (3) Tier 2 host spawns & C-linking native tools (`clang`/`cc`/`cmake`) routed
   through blaze's own hypervisor micro-VM sandbox (hardware isolation, hermetic FS, deterministic
   prefix-maps). 🚀
 
 ## Core Rules
 
-39 always-on principles below; all 92 rules with full detail live in each heading's skill
-(`.agents/skills/<skill>/SKILL.md`). Numbers are stable ids. Edit `scripts/src/bin/rules.rs` and run
-`write`.
+39 always-on principles below; all 79 rules with full detail live in each heading's skill
+(`.agents/skills/<skill>/SKILL.md`). Numbers are stable ids: they run to 92, and 13 merged numbers
+point at the rule that took them in. Edit `scripts/src/bin/rules.rs` and run `write`.
 
 ### Memory and data (skill `memory-and-data`)
 - **11. bump-allocate**: Use `bstd`/`blaze-own`; name the `Alloc` (a frame, the `Heap` grant); never `std`/`alloc`/`.leak()`.
@@ -55,7 +55,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 - **4. superset-of-rust**: Every program nightly accepts builds and runs correctly; only rustc soundness holes are refused.
 - **9. sandbox-everything**: Build scripts and proc macros run sandboxed; fail if no sandbox can be made.
 - **21. keys-cover-every-input**: Item-grained, item-relative, deterministic keys cover every input; `TwoValues` is a key bug.
-- **55. own-the-language**: Never work around Rust/std/bstd gaps: extend language, comptime, std or bstd and delete jank.
+- **55. own-the-language**: Never work around a missing piece (language, std, bstd, a tool): build it, use it, delete the jank.
 - **74. verify-once**: A check happens once and returns a proof type that later code takes; nothing is verified twice.
 - **90. alarm-on-any-compile-failure**: 🚨🚨🚨 If ANY repo fails to compile or leaves items unchecked, plaster 🚨🚨🚨 over your reply.
 
@@ -72,7 +72,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 
 ### Speed and tracing (skill `perf-and-tracing`)
 - **16. slow-is-p0-traced**: Anything slow/large is P0 until traced; quote before/after in per-core units naming core count.
-- **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, remote, memory, cold, cleanup, disk.
+- **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, memory, cold, non-blocking GC, disk.
 - **88. sharpen-your-tools**: Invest early in tools, symbols, IR dumps and harnesses that cut iteration time 10x.
 
 ### Evidence and debugging (skill `debugging`)
@@ -86,13 +86,13 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 - **62. sota-first**: Build the SOTA end state within 10% of the floor directly; build missing pieces; stop on 2nd fix.
 - **72. edit-rust-by-syntax**: Only the edit tools, astlog rules or `ast-grep`; never a heredoc, `sed` or a script.
 - **73. type-then-lint-then-rule**: Prevent mistakes by newtype/proof types first, then lints with fixes; a prompt rule comes last.
-- **89. flag-jank-or-monumentous-in-all-caps**: IF FORCED INTO A JANK WORKAROUND OR A MONUMENTAL TASK, SHOUT IT IN ALL CAPS TO THE USER.
+- **89. flag-jank-or-monumentous-in-all-caps**: IF FORCED INTO JANK OR A MONUMENTAL TASK, SAY SO IN ALL CAPS, THEN KEEP ON THE LONG-TERM DESIGN.
 - **91. narrow-collection-views**: Wrap `&mut Vec<T>` in narrow drain-only/push-only views at API boundaries; never leak raw storage.
 - **92. rename-surprising-methods**: If you mispredict a method's behavior before reading its body, rename it unambiguously immediately.
 
 ### Building, lanes and machines (skill `build-and-test`)
-- **2. blaze-builds-blaze**: Dogfood blaze (check/test/build) for inner loops, never cold cargo; fix any self-hosting gap.
-- **34. work-in-ix-vms**: Build, test and smoke on the Mac, or on `blaze-vm` when it answers; no AWS, no x86 VM.
+- **2. blaze-builds-blaze**: blaze builds, checks and tests blaze and every demo; never cargo or rustc; fix what blaze lacks.
+- **34. work-on-the-mac**: Agent builds, tests, smokes and benches run on the Mac; Linux-only work runs in CI; no VM, no AWS.
 - **48. agents-are-a-cost**: Fan out independent large pieces in parallel on disjoint files without asking; clean up when done.
 - **69. every-command-has-a-timeout**: Put a timeout on every command; verify on real projects first; a hang is a bug to report.
 
