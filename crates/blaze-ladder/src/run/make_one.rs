@@ -4085,6 +4085,57 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
         Some(InstanceShown { item: program.item_shown(item), args })
     }
 
+    /// Fast, zero-leak instance symbol formatter for `blaze build`: decodes `name` into the
+    /// caller's resettable `scratch` allocator (never growing `self.alloc`), caches `ItemKey ->
+    /// path` across monomorphizations in `item_paths`, and returns the formatted symbol name
+    /// allocated in `bump` (or `None` when the maker's program was never constructed or the item
+    /// has no path).
+    pub fn format_instance_symbol<'a>(
+        &self,
+        tabled: ItemKey,
+        name: &[u8],
+        item_paths: &mut blaze_hash::Map<ItemKey, Option<&'a str>, blaze_hash::FixedState, Alloc<'_>>,
+        buf: &mut blaze_own::String<Alloc<'_>>,
+        scratch: Alloc<'_>,
+        bump: blaze_own::Bump<'a>,
+    ) -> Option<&'a str> {
+        let program = self.program()?;
+        let mut ground = PortableTys::new_in(scratch);
+        let (item, args_str) = match decode_instance(name, &mut ground, scratch) {
+            Ok((item, args)) => {
+                let view = ground.view();
+                if let Some(test) = blaze_build::test_report_shim_of(Instance { item, args }, view) {
+                    let path = *item_paths.entry(test).or_insert_with(|| {
+                        program.item_shown(test).path().map(|p| &*bump.alloc_str(p))
+                    });
+                    return path;
+                }
+                let args_str = match view.list(args) {
+                    Ok([]) => None,
+                    _ => Some(crate::callee_shown::args_shown(view, args, &|k| program.item_named(k))),
+                };
+                (item, args_str)
+            }
+            Err(_) => (tabled, None),
+        };
+        let path = (*item_paths.entry(item).or_insert_with(|| {
+            program.item_shown(item).path().map(|p| &*bump.alloc_str(p))
+        }))?;
+        let Some(args) = args_str.as_deref().filter(|s| !s.is_empty()) else {
+            return Some(path);
+        };
+        buf.clear();
+        buf.push_str(path);
+        if let Some(inner) = args.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            buf.push('<');
+            buf.push_str(inner);
+            buf.push('>');
+        } else {
+            buf.push_str(args);
+        }
+        Some(bump.alloc_str(buf.as_str()))
+    }
+
     /// Byte `site` of item `item`'s text (a code record's trap row, item-relative) for a
     /// person: its file, line and column today (lazy fill.rs `site_shown`). `None` before a
     /// make built the program, or when the item's text is in no file. Read only on a crash's

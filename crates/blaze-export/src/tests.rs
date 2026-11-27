@@ -1789,3 +1789,294 @@ fn macho_refuses_out_of_range_chained_import_index() {
     assert_eq!(chain_err.len, 1);
     assert_eq!(chain_err.at, Some(0x4000));
 }
+
+/// Real multi-threaded [`crate::ExportRunner`] backed by `std::thread::scope` for verifying
+/// byte-for-byte determinism across worker counts and measuring multi-core scaling.
+struct ThreadExportRunner {
+    workers: usize,
+    began: std::time::Instant,
+}
+
+impl ThreadExportRunner {
+    fn new(workers: usize) -> Self {
+        Self { workers: workers.max(1), began: std::time::Instant::now() }
+    }
+}
+
+impl crate::ExportRunner for ThreadExportRunner {
+    fn for_each_chunk_mut<T: Send, F>(&self, out: &mut [T], min_chunk: usize, f: F)
+    where
+        F: Fn(usize, &mut [T]) + Sync,
+    {
+        let min_chunk = min_chunk.max(1);
+        if self.workers <= 1 || out.len() <= min_chunk {
+            if !out.is_empty() {
+                f(0, out);
+            }
+            return;
+        }
+        let max_chunks = (out.len() / min_chunk).max(1);
+        let num_chunks = self.workers.min(max_chunks);
+        let chunk_len = out.len().div_ceil(num_chunks);
+        let f_ref = &f;
+        std::thread::scope(|s| {
+            let mut rest = out;
+            let mut start = 0usize;
+            while !rest.is_empty() {
+                let take = chunk_len.min(rest.len());
+                let (head, tail) = rest.split_at_mut(take);
+                let chunk_start = start;
+                s.spawn(move || f_ref(chunk_start, head));
+                start += take;
+                rest = tail;
+            }
+        });
+    }
+
+    fn map_splits_mut<T: Send, R: Send, F>(
+        &self,
+        buf: &mut [T],
+        splits: &[usize],
+        results: &mut [Option<R>],
+        f: F,
+    ) where
+        F: Fn(usize, &mut [T]) -> R + Sync,
+    {
+        let num_parts = splits.len().saturating_sub(1);
+        if self.workers <= 1 || num_parts <= 1 {
+            crate::SequentialExportRunner.map_splits_mut(buf, splits, results, f);
+            return;
+        }
+        let num_workers = self.workers.min(num_parts);
+        let parts_per_worker = num_parts.div_ceil(num_workers);
+        let f_ref = &f;
+        std::thread::scope(|s| {
+            let mut rest_buf = buf;
+            let mut rest_res = results;
+            let mut w_start = 0usize;
+            while w_start < num_parts {
+                let w_end = (w_start + parts_per_worker).min(num_parts);
+                let byte_len = splits[w_end] - splits[w_start];
+                let res_len = w_end - w_start;
+                let (buf_head, buf_tail) = rest_buf.split_at_mut(byte_len);
+                let (res_head, res_tail) = rest_res.split_at_mut(res_len);
+                let part_splits = &splits[w_start..=w_end];
+                let base_part = w_start;
+                s.spawn(move || {
+                    let mut cur_buf = buf_head;
+                    let mut prev = part_splits[0];
+                    for (local_i, &end) in part_splits.iter().skip(1).enumerate() {
+                        let (part_slice, tail) = cur_buf.split_at_mut(end - prev);
+                        res_head[local_i] = Some(f_ref(base_part + local_i, part_slice));
+                        cur_buf = tail;
+                        prev = end;
+                    }
+                });
+                rest_buf = buf_tail;
+                rest_res = res_tail;
+                w_start = w_end;
+            }
+        });
+    }
+
+    fn now_ns(&self) -> u64 {
+        u64::try_from(self.began.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+fn make_synthetic_export_records(
+    num_fns: usize,
+    nops_per_fn: usize,
+    alloc: Alloc<'static>,
+) -> (std::vec::Vec<(Symbol, AVec<'static, u8>)>, std::vec::Vec<(Symbol, std::string::String)>) {
+    let mut records = std::vec::Vec::with_capacity(num_fns);
+    let mut names = std::vec::Vec::with_capacity(num_fns);
+    let syms: std::vec::Vec<Symbol> = (0..num_fns)
+        .map(|i| {
+            if i == 0 {
+                sym("main")
+            } else {
+                let name = std::format!("crate_bench::mod_{}::func_{i}", i % 32);
+                Symbol::of_name(&name)
+            }
+        })
+        .collect();
+    for i in 0..num_fns {
+        let mut r = CodeRecord::new_in(alloc);
+        r.code.extend_from_slice(&STP.to_le_bytes());
+        r.code.extend_from_slice(&MOV_FP.to_le_bytes());
+        // Direct call to next function in ring (relocation + BL relaxation) and outside import on fn 0.
+        let callee_sym = syms[(i + 1) % num_fns];
+        let call_at = u32::try_from(r.code.len()).unwrap();
+        let t_callee = r.target(Target { space: Space::Func, symbol: callee_sym });
+        r.code.extend_from_slice(&ADRP_X16.to_le_bytes());
+        r.code.extend_from_slice(&LDR_X16.to_le_bytes());
+        r.code.extend_from_slice(&BLR_X16.to_le_bytes());
+        r.sites.push(Site { at: call_at, kind: SiteKind::Call, target: t_callee, addend: 0 });
+        if i == 0 {
+            let exit_at = u32::try_from(r.code.len()).unwrap();
+            let t_exit = r.outside("exit");
+            r.code.extend_from_slice(&ADRP_X16.to_le_bytes());
+            r.code.extend_from_slice(&LDR_X16.to_le_bytes());
+            r.code.extend_from_slice(&BLR_X16.to_le_bytes());
+            r.sites.push(Site { at: exit_at, kind: SiteKind::Call, target: t_exit, addend: 0 });
+        }
+        // Make every 8th pair share identical code to exercise parallel BLAKE3 folding too!
+        let unique_imm = if i % 8 == 7 { i - 1 } else { i };
+        let movz = 0x5280_0000u32 | ((u32::try_from(unique_imm & 0xFFFF).unwrap()) << 5);
+        r.code.extend_from_slice(&movz.to_le_bytes());
+        for _ in 0..nops_per_fn {
+            r.code.extend_from_slice(&NOP.to_le_bytes());
+        }
+        r.code.extend_from_slice(&LDP.to_le_bytes());
+        r.code.extend_from_slice(&RET.to_le_bytes());
+        let mut encoded = Vec::new_in(alloc);
+        let sealed = r.seal().expect("synthetic record seals");
+        sealed.encode(&mut encoded);
+        records.push((syms[i], encoded));
+        names.push((syms[i], std::format!("bench::m{}::fn_{i}", i % 32)));
+    }
+    (records, names)
+}
+
+#[test]
+fn export_par_bit_identical_across_worker_counts_macho_and_elf() {
+    let alloc = Alloc::global();
+    // 400 functions × ~12 KiB (~4.8 MiB text) crosses multiple 2 MiB parallel reloc partitions,
+    // parallel BLAKE3 fold chunks, parallel Mach-O/ELF __text writes, and >1,200 4 KiB sign pages!
+    let (records, owned_names) = make_synthetic_export_records(400, 3000, alloc);
+    let funcs: std::vec::Vec<Function<'_>> = records
+        .iter()
+        .map(|(s, bytes)| Function {
+            symbol: *s,
+            record: CodeView::read(bytes.as_slice()).expect("valid view"),
+            tier: Tier::Fast,
+        })
+        .collect();
+    let sym_names: std::vec::Vec<(Symbol, &str)> = owned_names
+        .iter()
+        .map(|(s, name)| (*s, name.as_str()))
+        .collect();
+    let prog = ProgramIn {
+        name: "par_det_test",
+        functions: &funcs,
+        data: &[],
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Abort,
+        personality: None,
+        tls: None,
+        profile: None,
+        natives: None,
+        exports: &[],
+        symbol_names: &sym_names,
+    };
+
+    for platform in [Platform::MacosArm64, Platform::LinuxArm64] {
+        let mut seq_out = Vec::new_in(alloc);
+        let (seq_exp, _) = crate::export_par(&prog, platform, &mut seq_out, alloc, &crate::SequentialExportRunner)
+            .expect("sequential export_par must succeed");
+        match platform {
+            Platform::MacosArm64 => {
+                check::macho(&seq_out).expect("sequential Mach-O must validate");
+            }
+            Platform::LinuxArm64 => {
+                check::elf(&seq_out).expect("sequential ELF must validate");
+            }
+            Platform::Wasm64 => unreachable!(),
+        }
+        for workers in [2usize, 4, 8] {
+            let runner = ThreadExportRunner::new(workers);
+            let mut par_out = Vec::new_in(alloc);
+            let (par_exp, times) = crate::export_par(&prog, platform, &mut par_out, alloc, &runner)
+                .expect("parallel export_par must succeed");
+            assert_eq!(
+                par_exp, seq_exp,
+                "{platform:?} Exported metadata mismatch at {workers} workers"
+            );
+            assert_eq!(
+                par_out.as_slice(),
+                seq_out.as_slice(),
+                "{platform:?} output bytes differ between 1 and {workers} workers (Rule 25!)"
+            );
+            assert!(
+                times.fold_ns + times.reloc_ns + times.write_ns + times.sign_ns > 0,
+                "expected non-zero sub-phase timings"
+            );
+        }
+    }
+}
+
+/// Scaling benchmark measuring `blaze_export::export_par` on a realistic 64 MiB / 8,000-function
+/// Mach-O ARM64 binary across 1 vs 8 vs 16 threads (Rule 16 & Rule 84: quotes concurrency count
+/// and per-core throughput). Run with:
+/// `cargo +nightly-2026-10-27 test --release -p blaze-export --lib export_par_scaling_benchmark -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn export_par_scaling_benchmark() {
+    let alloc = Alloc::global();
+    // 8,000 functions × ~8 KiB = ~64 MiB Mach-O binary (~16,400 4 KiB sign pages, 32 reloc splits).
+    let num_fns = 8_000usize;
+    let (records, owned_names) = make_synthetic_export_records(num_fns, 2040, alloc);
+    let funcs: std::vec::Vec<Function<'_>> = records
+        .iter()
+        .map(|(s, bytes)| Function {
+            symbol: *s,
+            record: CodeView::read(bytes.as_slice()).expect("valid view"),
+            tier: Tier::Fast,
+        })
+        .collect();
+    let sym_names: std::vec::Vec<(Symbol, &str)> = owned_names
+        .iter()
+        .map(|(s, name)| (*s, name.as_str()))
+        .collect();
+    let prog = ProgramIn {
+        name: "bench_64m",
+        functions: &funcs,
+        data: &[],
+        entry: Entry::CMain { main: sym("main") },
+        panic: Panic::Abort,
+        personality: None,
+        tls: None,
+        profile: None,
+        natives: None,
+        exports: &[],
+        symbol_names: &sym_names,
+    };
+
+    let mut baseline_bytes: Option<AVec<'static, u8>> = None;
+    let mut seq_ms = 0.0f64;
+    for workers in [1usize, 4, 8, 16] {
+        let runner = ThreadExportRunner::new(workers);
+        let mut out = Vec::new_in(alloc);
+        let t0 = std::time::Instant::now();
+        let (exp, times) = crate::export_par(&prog, Platform::MacosArm64, &mut out, alloc, &runner)
+            .expect("export_par succeeds");
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let mb = (exp.len as f64) / (1024.0 * 1024.0);
+        let mb_per_s_total = mb / (elapsed_ms / 1000.0);
+        let mb_per_s_per_core = mb_per_s_total / (workers as f64);
+        if workers == 1 {
+            seq_ms = elapsed_ms;
+            baseline_bytes = Some(out);
+        } else {
+            assert_eq!(
+                out.as_slice(),
+                baseline_bytes.as_ref().unwrap().as_slice(),
+                "bit-identical mismatch at {workers} workers"
+            );
+        }
+        let speedup = seq_ms / elapsed_ms;
+        std::eprintln!(
+            "export_par ({num_fns} fns, {mb:.1} MiB) workers={workers:>2}: wall={elapsed_ms:6.1}ms ({speedup:4.2}x) | {mb_per_s_total:7.1} MB/s ({mb_per_s_per_core:6.1} MB/s/core) | eh_room={:.1}ms order={:.1}ms fold={:.1}ms reloc={:.1}ms fixups={:.1}ms eh={:.1}ms write={:.1}ms uuid={:.1}ms sign={:.1}ms",
+            times.eh_room_ns as f64 / 1e6,
+            times.order_ns as f64 / 1e6,
+            times.fold_ns as f64 / 1e6,
+            times.reloc_ns as f64 / 1e6,
+            times.fixups_ns as f64 / 1e6,
+            times.eh_sections_ns as f64 / 1e6,
+            times.write_ns as f64 / 1e6,
+            times.uuid_ns as f64 / 1e6,
+            times.sign_ns as f64 / 1e6,
+        );
+    }
+}

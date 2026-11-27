@@ -18,6 +18,8 @@ doctest = false
 blaze-code.workspace = true
 # `Vec` and `Alloc`: every table in the allocator the caller names.
 blaze-own.workspace = true
+# O(1) symbol, data, and import index tables (`FixedState` SwissTable, `#![no_std]`).
+blaze-hash.workspace = true
 # The domain-separated BLAKE3 `Hasher`: fold digests, the file's identity (`LC_UUID`, build id).
 # By path, as blaze-code takes it: the workspace entry turns on its `serde` adapter.
 blaze-ids.workspace = true
@@ -39,8 +41,6 @@ blaze-own = { workspace = true, features = ["std", "testing"] }
 blaze-lir = { workspace = true, features = ["eval"] }
 # The example's entry frame and each test's top frame: memory from the OS, handed down.
 blaze-mem.workspace = true
-# tests/native_run.rs: `FixedState`, the seed blaze-native's `resolve::plan` takes.
-blaze-hash.workspace = true
 # tests/native_run.rs: `toolchain::clang_pin` over `blaze_pins::CLANG_JSON`, the one home of the
 # pinned clang's digest (the shelf folder's name).
 blaze-build-script.workspace = true

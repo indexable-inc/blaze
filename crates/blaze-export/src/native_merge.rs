@@ -829,6 +829,7 @@ mod tests {
             fixups: Vec::new_in(a),
             entry: START,
             placed: homes,
+            placed_member: Vec::new_in(a),
             tables_room: 0x8000 - START,
             mod_init_at: None,
             has_tls: false,

@@ -239,6 +239,63 @@ impl<A: Allocator + Copy> PgoSiteTable<A> {
         PgoSiteTable::new_in(&raw_sites, &raw_bodies, 1, alloc)
     }
 
+    /// Parallel [`Self::estimate_static`]: computes per-body summaries and call-site weights
+    /// across `runner` and merges deterministically into a byte-identical [`PgoSiteTable`] (Rule 25).
+    pub fn estimate_static_par<R: crate::lto::LtoRunner>(
+        module: &[ModuleBody<blaze_own::SharedAlloc<'static>>],
+        alloc: blaze_own::SharedAlloc<'static>,
+        runner: &R,
+    ) -> Result<PgoSiteTable<blaze_own::SharedAlloc<'static>>, crate::simplify::SimplifyError> {
+        let per_body = runner.par_map(module.len(), alloc, |idx, scratch| {
+            let mb = &module[idx];
+            let view = mb.func.view();
+            let summary = FnSummary::compute(view, &scratch);
+            let is_cold = summary.is_cold;
+            let body_w = if is_cold {
+                0
+            } else if summary.has_loops {
+                100
+            } else {
+                10
+            };
+            let body_entry = BodyWeight { body: mb.id, weight: body_w };
+            let mut sites = OwnVec::new_in(alloc);
+            let blocks = view.blocks();
+            for b in 0..blocks {
+                let block = Block(b as u32);
+                let kind = view.block_kind(block);
+                let site_w = if is_cold || kind != BlockKind::Normal {
+                    0
+                } else if summary.has_loops {
+                    100
+                } else {
+                    10
+                };
+                for at in view.block(block) {
+                    if view.op(at) == Op::Call {
+                        sites.push(SiteEntry {
+                            caller: mb.id,
+                            site_inst: at as u32,
+                            weight: site_w,
+                        });
+                    }
+                }
+            }
+            (body_entry, sites)
+        })?;
+        let mut total_sites = 0usize;
+        for (_, sites) in per_body.iter() {
+            total_sites = total_sites.saturating_add(sites.len());
+        }
+        let mut raw_sites = OwnVec::with_capacity_in(total_sites, alloc);
+        let mut raw_bodies = OwnVec::with_capacity_in(module.len(), alloc);
+        for (body_entry, sites) in per_body {
+            raw_bodies.push(body_entry);
+            raw_sites.extend_from_slice(sites.as_slice());
+        }
+        Ok(PgoSiteTable::new_in(&raw_sites, &raw_bodies, 1, alloc))
+    }
+
     /// Cross-run exponential moving decay merge: `new_w = old_w * decay_num / decay_den + fresh_w`.
     /// Entries whose combined weight decays to `0` are dropped, keeping the persisted table compact.
     pub fn merge_decayed(
