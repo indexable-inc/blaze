@@ -391,7 +391,7 @@ impl core::fmt::Debug for Script {
 
 /// The digest of a reply (code, stdout, stderr), for a fact's read.
 pub(crate) fn reply_digest(code: i32, stdout: &[u8], stderr: &[u8]) -> ContentId {
-    let mut hash = blaze_ids::Hasher::new("blaze build-script spawn reply 1");
+    let mut hash = blaze_ids::Hasher::new(blaze_build_script::c_tasks_probe::REPLY_DOMAIN);
     hash.update(&code.to_le_bytes());
     for part in [stdout, stderr] {
         hash.update(&(part.len() as u32).to_le_bytes()).update(part);

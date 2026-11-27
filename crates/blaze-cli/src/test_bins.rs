@@ -77,7 +77,7 @@ const HANDSHAKE_LEN: usize = 12;
 /// In-binary self-describing stub slot layout (must match `blaze-launcher/src/main.rs`).
 const STUB_SLOT_SIZE: usize = 16 * 1024;
 const STUB_SLOT_HEADER: usize = 36;
-const STUB_SLOT_MAGIC: &[u8; 16] = b"BLAZE_STUB_SLOT1";
+const STUB_SLOT_MAGIC: &[u8; 16] = b"BZSTUB_SLOT_0001";
 const STUB_SLOT_UNPATCHED: &[u8; 16] = b"UNPATCHED_CFG_01";
 const STUB_SLOT_PATCHED: &[u8; 16] = b"PATCHED_STUB_001";
 

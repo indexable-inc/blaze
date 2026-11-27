@@ -13,10 +13,10 @@ path = "src/lib.rs"
 doctest = false
 
 [dependencies]
-blaze-own = { path = "../blaze-own" }
+blaze-own.workspace = true
 
 [dev-dependencies]
-blaze-own = { path = "../blaze-own", features = ["testing"] }
+blaze-own = { workspace = true, features = ["testing"] }
 
 [lints]
 workspace = true

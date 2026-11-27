@@ -21,7 +21,7 @@ fn linear_work(n: usize, planted_quadratic: bool) -> WorkSample {
     WorkSample::new(steps, (n as u64) * 16)
 }
 
-/// Linear work passes `O(N)` scaling.
+/// The invariant: linear work satisfies `O(N)` scaling on both time and space axes.
 #[test]
 fn linear_passes_on() {
     let cfg = ScalingCheck::new(64, 256);

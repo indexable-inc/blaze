@@ -103,7 +103,7 @@ fn hex_path(hex: &str) -> Option<PathBuf> {
 /// ad-hoc page re-hashing touches at most 4 code pages).
 const STUB_SLOT_SIZE: usize = 16 * 1024;
 const STUB_SLOT_HEADER: usize = 36; // 16-byte magic + 16-byte state tag + 4-byte LE length
-const STUB_SLOT_MAGIC: &[u8; 16] = b"BLAZE_STUB_SLOT1";
+const STUB_SLOT_MAGIC: &[u8; 16] = b"BZSTUB_SLOT_0001";
 const STUB_SLOT_PATCHED: &[u8; 16] = b"PATCHED_STUB_001";
 
 #[repr(C)]
@@ -126,7 +126,7 @@ pub static EMBEDDED_STUB_SLOT: EmbeddedStubSlot = EmbeddedStubSlot(core::cell::U
     // (including the trailing 0u32 length) once in `blaze-launcher`, replaces the tag with
     // `STUB_SLOT_PATCHED`, and writes the length + UTF-8 config payload so stubs stay runnable
     // even if copied to another path without an adjacent `.blaze-program` file.
-    header: *b"BLAZE_STUB_SLOT1UNPATCHED_CFG_01",
+    header: *b"BZSTUB_SLOT_0001UNPATCHED_CFG_01",
     rest: [0u8; STUB_SLOT_SIZE - 32],
 }));
 

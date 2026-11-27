@@ -112,6 +112,9 @@ built (edition.md, "Why it also gives a REPL").
   it lands; never blocks a keystroke.
 - **Drawing.** blaze-ui's Rust-authored shaders (`ui_sdf_*`, `ui_glyph_*`, emitted as MSL), the
   glyph atlas rasterised by CoreText (a BZG1/Slug path later, when blaze has a font encoder).
+- **Terminal API.** `blaze-shell` runs a Unix-domain socket server (`term_server.rs`) for live
+  session control and exports `BLAZE_TERM_SOCK` (the socket path) and `BLAZE_TERM_API` (protocol
+  version) to child shells; `BLAZE_TERM_STORE` overrides the terminal state store directory.
 
 ## Lanes
 

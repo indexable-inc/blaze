@@ -83,10 +83,10 @@ fn block_layout<T>(cap: usize) -> Option<(Layout, usize)> {
 /// # Invariants
 ///
 /// - When `header().cap == 0`, `ptr` points to [`EMPTY_HEADER`] (`len == 0`) and nothing is
-///   allocated; [`EMPTY_HEADER`] is never mutated.
+///   allocated; [`EMPTY_HEADER`] is never mutated. Evidence: [`tests::empty_thin_vec_does_zero_allocations`].
 /// - When `header().cap > 0`, `ptr` points to a mutable heap block allocated by `alloc` with
 ///   `block_layout::<T>(cap)`, with full-block provenance; `len <= cap`, and the first `len`
-///   slots starting at `data_offset::<T>()` hold initialized `T` values.
+///   slots starting at `data_offset::<T>()` hold initialized `T` values. Evidence: [`tests::size_and_niche`].
 pub struct ThinVec<T, A: Allocator> {
     ptr: NonNull<u8>,
     alloc: A,

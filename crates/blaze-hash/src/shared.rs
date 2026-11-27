@@ -1248,14 +1248,14 @@ impl<K: Eq + Send + Sync + 'static, S: KeyHash<K>, A: Allocator + Clone + Send +
 mod cap_tests {
     use core::mem::offset_of;
 
-    use blaze_own::Alloc;
+    use blaze_own::SharedAlloc;
 
     use super::{APPROX_FLUSH_USIZE, Map, MapOpts, SHARDS, Set, SetOpts, Shard, tests::TestLock};
     use crate::FixedState;
 
     #[test]
     fn shard_isolates_table_len_and_writer_on_distinct_128b_lines() {
-        type S = Shard<u64, u64, Alloc<'static>, TestLock>;
+        type S = Shard<u64, u64, SharedAlloc<'static>, TestLock>;
         assert_eq!(align_of::<S>(), 128);
         assert!(offset_of!(S, len) >= 128, "len must be padded away from table");
         assert!(offset_of!(S, writer_line) >= 256, "writer must be padded away from len");
@@ -1265,14 +1265,14 @@ mod cap_tests {
 
     #[test]
     fn fast_cap_check_and_approx_len_track_inserts_removes_retain_and_clear() {
-        let alloc = blaze_own::testing::heap().alloc();
-        let map: Map<u64, u64, FixedState, Alloc<'static>, TestLock> = Map::new(MapOpts {
+        let alloc = blaze_own::testing::heap().shared();
+        let map: Map<u64, u64, FixedState, SharedAlloc<'static>, TestLock> = Map::new(MapOpts {
             name: "test.fast_cap",
             hasher: FixedState,
             alloc,
             capacity: None,
         });
-        let set: Set<u64, FixedState, Alloc<'static>, TestLock> = Set::new(SetOpts {
+        let set: Set<u64, FixedState, SharedAlloc<'static>, TestLock> = Set::new(SetOpts {
             name: "test.fast_cap_set",
             hasher: FixedState,
             alloc,

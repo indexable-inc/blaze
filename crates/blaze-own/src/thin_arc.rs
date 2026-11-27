@@ -115,9 +115,9 @@ fn block_layout<H, T, A>(len: usize) -> Option<(Layout, usize)> {
 /// - For every public constructor of `ThinArc`, `ptr` points to a live block allocated by `alloc`
 ///   with `block_layout::<H, T, A>(len)`, with full-block provenance; its `HeaderPrefix`,
 ///   `alloc`, `header`, and `len` trailing `T` values at `data_offset::<H, T, A>()` are
-///   initialized, and `strong` accounts for this handle (or is immortal).
+///   initialized, and `strong` accounts for this handle (or is immortal). Evidence: [`tests::drop_counts_no_leaks_no_double_drops`].
 /// - For the private empty-string sentinel used exclusively by [`ThinStr`], `ptr` points to
-///   [`EMPTY_STR`] (`strong == u32::MAX`, `len == 0`) and only `HeaderPrefix` is ever read.
+///   [`EMPTY_STR`] (`strong == u32::MAX`, `len == 0`) and only `HeaderPrefix` is ever read. Evidence: [`tests::thin_str_roundtrip_eq_hash_and_empty_zero_alloc`].
 pub struct ThinArc<H, T, A: Allocator> {
     ptr: NonNull<u8>,
     _marker: PhantomData<(H, T, A)>,

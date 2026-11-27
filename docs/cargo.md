@@ -1169,8 +1169,7 @@ whichever command started it; to change one there, run `blaze stop` first):
 | Variable | Meaning | Default |
 |---|---|---|
 | `BLAZE_LEAN_PROVER` | the `lean` executable `blaze prove` checks proofs with, an absolute path, of the Lean `lean/lean-toolchain` pins; read by the client and sent with the request ([blaze prove](#blaze-prove)) | unset: `blaze prove` fails unless `--emit` |
-| `BLAZE_HOME` | the daemon's socket and state directory, and blaze's releases and settings; not its toolchains ([Install](#install)) | see there |
-| `BLAZE_TOOLCHAINS` | the directory blaze keeps the Rust it builds with in, shared by every `BLAZE_HOME` ([toolchain.md](toolchain.md)) | `.blaze/toolchains` in the user's home (`HOME`, else the system's record of the user) |
+| `BLAZE_HOME` | the daemon's socket and state directory, and blaze's releases and settings ([Install](#install)) | see there |
 | `BLAZE_RELEASES` | a mirror of blaze's releases ([below](#pinning-a-release-of-blaze)) | `https://blaze-releases.ix.dev` |
 | `BLAZE_CORES` | how many cores blaze's work runs on and at what priority: unset, the machine's less 2 at background priority; `all`, every core at normal priority; `n`, exactly `n` at background priority. A command that sets a value giving another budget or priority than the running daemon's is refused | unset |
 | `BLAZE_EMIT` | LLVM instruction selection: `optimized` or `fast`. It is in no unit's key, so code the store kept under one value is used under the other | `optimized`; `fast` at level 0 |

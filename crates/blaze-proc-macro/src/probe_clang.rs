@@ -42,27 +42,28 @@ use blaze_build_script::c_tasks_probe::{CanonicalProbe, ProbeAnswer, Segment};
 #[cfg(any(target_os = "linux", test))]
 use blaze_build_script::c_tasks_probe::{OUT_DIR, SDKROOT};
 use blaze_build_script::facts;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use blaze_build_script::shelf_pins;
 use blaze_build_script::toolchain;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 use blaze_core::wait::Deadline;
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, Arc as OwnArc, SharedAlloc, String as OwnString, Vec as OwnVec};
 #[cfg(target_os = "linux")]
 use blaze_own::Share as _;
 use blaze_pins::CLANG_JSON;
-#[cfg(target_os = "linux")]
-use blaze_roots::{Digest, Mount, RelPath, Root, RootId, RootKind, Roots, Seen};
 #[cfg(any(target_os = "linux", test))]
-use bstd::procs::hermetic::ClockSpec;
+use blaze_roots::{Digest, Mount, Root, RootId, RootKind, Roots};
+#[cfg(target_os = "linux")]
+use blaze_roots::{RelPath, Seen};
+#[cfg(any(target_os = "linux", test))]
+use bstd::procs::hermetic::{
+    Budget, Capture, ClockSpec, Fault, HermeticOpts, HermeticSpec, HermeticStreams, Level, Program, ReportSpec,
+};
 #[cfg(target_os = "linux")]
 use bstd::procs::{
     Exit,
-    hermetic::{
-        Budget, Capture, Fault, FilesError, FilesOp, Hermetic, HermeticCapOpts, HermeticOpts, HermeticSpec,
-        HermeticStreams, Level, Program, ReportSpec, RootFiles, Stop as HermeticStop,
-    },
+    hermetic::{FilesError, FilesOp, Hermetic, HermeticCapOpts, RootFiles, Stop as HermeticStop},
 };
 
 use crate::record::{DirStore, FilesError as StoreFilesError};
@@ -73,6 +74,10 @@ type SharedStr = OwnString<SharedAlloc<'static>>;
 /// Strategy id for [`HermeticClangProbe`] (hashed into [`ProbeKey`] and `cc-probe` read subjects).
 #[cfg(target_os = "linux")]
 const HERMETIC_STRATEGY_DOMAIN: &str = "blaze-build-script c-probe shelf clang 1";
+
+/// Domain for hashing an SDK root id into [`HermeticClangProbe::sdk_digest`].
+#[cfg(target_os = "linux")]
+const SDK_ROOT_DOMAIN: &str = "blaze c-probe sdk root 1";
 
 /// Maximum captured stdout or stderr bytes for one compiler probe.
 #[cfg(target_os = "linux")]
@@ -489,7 +494,7 @@ impl HermeticClangProbe {
         let work_str = path_utf8(&work_root, alloc)?;
         let (sdk_dir, sdk_digest) = match sdk {
             Some((dir, id)) if !dir.is_empty() => {
-                let dig = ContentId::of("blaze c-probe sdk root 1", id.as_bytes()).0;
+                let dig = ContentId::of(SDK_ROOT_DOMAIN, id.as_bytes()).0;
                 (Some(OwnString::from_str_in(dir, SharedAlloc::global())), Some(dig))
             }
             _ => (None, None),
@@ -540,7 +545,7 @@ impl HermeticClangProbe {
         let (sdk_dir, sdk_digest) = match sdk {
             Some((dir, id)) => {
                 let dir_str = path_utf8(dir, alloc)?;
-                let dig = ContentId::of("blaze c-probe sdk root 1", id.as_bytes()).0;
+                let dig = ContentId::of(SDK_ROOT_DOMAIN, id.as_bytes()).0;
                 (Some(dir_str), Some(dig))
             }
             None => (None, None),
