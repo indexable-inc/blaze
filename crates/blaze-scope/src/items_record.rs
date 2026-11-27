@@ -50,7 +50,7 @@ use core::cell::{Cell, OnceCell, RefCell};
 
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::{ABox, ARc, AVec, Alloc, Box, Bump, Rc};
+use blaze_own::{ABTreeMap, ABox, ARc, AVec, Alloc, Box, Bump, Rc};
 use blaze_surface::{CallShape, Edition, FileItemsView, ImplFlags, ItemDetail, ItemIndex, ItemKind, ProcKind, RecordBytes};
 
 use crate::package_path::{NotPackagePath, PackagePath};
@@ -353,47 +353,43 @@ pub(crate) mod plant {
 /// are written in sorted order, so the order is a function of the solve's answers).
 struct Strings<'b, 's> {
     bytes: RecordBytes<'b>,
-    seen: HashMap<&'s str, (u32, u32), Alloc<'b>>,
-    /// Present string occurrences staged with their first-use sequence number so
-    /// [`Self::materialize`] deduplicates in place, preserves exact first-use order, and sizes
-    /// both `seen` and `bytes` to the exact unique count and exact unique byte length.
-    staged: AVec<'b, (&'s str, usize)>,
+    /// Fixed-node B-tree mapping each unique string to its deterministic first-use `(offset, len)`:
+    /// duplicates allocate 0 bytes and growth never reallocates or abandons a backing array on
+    /// the bump allocator.
+    seen: ABTreeMap<'b, &'s str, (u32, u32)>,
+    total_bytes: usize,
 }
 
 impl<'b, 's> Strings<'b, 's> {
-    fn new_staged(alloc: Alloc<'b>) -> Strings<'b, 's> {
+    fn new(alloc: Alloc<'b>) -> Strings<'b, 's> {
         Strings {
             bytes: RecordBytes::new_in(alloc),
-            seen: HashMap::new_in(alloc),
-            staged: AVec::new_in(alloc),
+            seen: ABTreeMap::new_in(alloc),
+            total_bytes: 0,
         }
     }
 
-    fn plan(&mut self, s: &'s str) {
-        let order = self.staged.len();
-        self.staged.push((s, order));
-    }
-
-    fn materialize(&mut self) -> Result<(), ItemsRecordError> {
-        // Deduplicate by string keeping the smallest first-use `order`, then restore exact
-        // first-use order so `bytes` is bit-for-bit identical while sizing `seen` to exact
-        // `unique_count` (never row count) and `bytes` to exact `total_unique_bytes`.
-        self.staged.sort_unstable_by(|a, b| a.0.cmp(b.0).then_with(|| a.1.cmp(&b.1)));
-        self.staged.dedup_by(|b, a| a.0 == b.0);
-        self.staged.sort_unstable_by_key(|&(_, order)| order);
-        let total_bytes: usize = self.staged.iter().map(|(s, _)| s.len()).sum();
-        let alloc = *self.bytes.allocator();
-        let mut seen = HashMap::with_capacity_in(self.staged.len(), alloc);
-        let mut bytes = RecordBytes::with_capacity_in(total_bytes, alloc);
-        for &(s, _) in self.staged.iter() {
-            let at = (u32_of(bytes.len(), "items strings")?, u32_of(s.len(), "a string")?);
-            bytes.extend_from_slice(s.as_bytes());
-            seen.insert(s, at);
+    fn plan(&mut self, s: &'s str) -> Result<(), ItemsRecordError> {
+        if self.seen.contains_key(s) {
+            return Ok(());
         }
-        self.seen = seen;
-        self.bytes = bytes;
-        self.staged.clear();
+        let at = (u32_of(self.total_bytes, "items strings")?, u32_of(s.len(), "a string")?);
+        self.total_bytes = self.total_bytes.saturating_add(s.len());
+        self.seen.insert(s, at);
         Ok(())
+    }
+
+    fn materialize(&mut self) {
+        let alloc = *self.bytes.allocator();
+        let mut bytes = RecordBytes::with_capacity_in(self.total_bytes, alloc);
+        bytes.resize(self.total_bytes, 0);
+        for (&s, &(at, _)) in self.seen.iter() {
+            let start = usize::try_from(at).unwrap_or(0);
+            if let Some(dst) = bytes.get_mut(start..start.saturating_add(s.len())) {
+                dst.copy_from_slice(s.as_bytes());
+            }
+        }
+        self.bytes = bytes;
     }
 
     fn put(&mut self, s: &'s str) -> Result<(u32, u32), ItemsRecordError> {
@@ -402,6 +398,7 @@ impl<'b, 's> Strings<'b, 's> {
         }
         let at = (u32_of(self.bytes.len(), "items strings")?, u32_of(s.len(), "a string")?);
         self.bytes.extend_from_slice(s.as_bytes());
+        self.total_bytes = self.bytes.len();
         self.seen.insert(s, at);
         Ok(at)
     }
@@ -752,19 +749,19 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     macros.sort_unstable();
     let atoms = names.cfg.atoms();
 
-    let mut strings: Strings<'b, 'n> = Strings::new_staged(alloc);
+    let mut strings: Strings<'b, 'n> = Strings::new(alloc);
     for f in names.files.iter() {
-        strings.plan(f.package.as_str());
-        strings.plan(f.shown);
+        strings.plan(f.package.as_str())?;
+        strings.plan(f.shown)?;
     }
     for m in modules.iter() {
         if let Some(p) = names.path_of(*m) {
-            strings.plan(p);
+            strings.plan(p)?;
         }
     }
     for i in impls.iter() {
-        strings.plan(i.trait_path);
-        strings.plan(i.self_path);
+        strings.plan(i.trait_path)?;
+        strings.plan(i.self_path)?;
     }
     for key in items.iter() {
         if let Some((it, at)) = tables.texts.get(key) {
@@ -775,10 +772,10 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
                 .ok_or(ItemsRecordError::NoOutline { item: *key })?;
             let foreign = foreign_abi(whole, outline, entry, *key, names.key)?;
             if let Some(n) = it.name {
-                strings.plan(n);
+                strings.plan(n)?;
             }
             if let Some(abi) = foreign {
-                strings.plan(abi);
+                strings.plan(abi)?;
             }
         }
     }
@@ -796,31 +793,31 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         };
         for m in list.iter() {
             if let Some(n) = m.name {
-                strings.plan(n);
+                strings.plan(n)?;
             }
         }
     }
     for (name, _) in langs.iter() {
-        strings.plan(*name);
+        strings.plan(*name)?;
     }
     for key in macros.iter() {
         if let Some(m) = tables.macros.get(key) {
-            strings.plan(m.name);
+            strings.plan(m.name)?;
             match m.body {
-                MacroBody::BuiltinFn(name) => strings.plan(name),
-                MacroBody::Proc { helpers, .. } | MacroBody::BuiltinDerive { helpers } => strings.plan(helpers),
+                MacroBody::BuiltinFn(name) => strings.plan(name)?,
+                MacroBody::Proc { helpers, .. } | MacroBody::BuiltinDerive { helpers } => strings.plan(helpers)?,
                 MacroBody::Rules(_) | MacroBody::Macro2 { .. } | MacroBody::BuiltinOther(_) => {}
             }
         }
     }
     for (name, value) in atoms.iter() {
-        strings.plan(*name);
+        strings.plan(*name)?;
         if let Some(v) = value {
-            strings.plan(*v);
+            strings.plan(*v)?;
         }
     }
-    strings.plan(names.name);
-    strings.materialize()?;
+    strings.plan(names.name)?;
+    strings.materialize();
 
     // Files, by index; expansions that made a text, by call key. A file row keeps its
     // surface digest and paths. Its whole digest and length are supplied by FileItems when
@@ -3477,11 +3474,11 @@ mod twins {
             let prefix = "long_distinct_string_".repeat(12);
             assert!(prefix.len() > 240);
             let owned_strs: StdVec<std::string::String> = (0..N).map(|i| std::format!("{prefix}{i}")).collect();
-            let mut strings = super::Strings::new_staged(alloc);
+            let mut strings = super::Strings::new(alloc);
             for s in owned_strs.iter() {
-                strings.plan(s.as_str());
+                strings.plan(s.as_str()).expect("plan");
             }
-            strings.materialize().expect("materialize");
+            strings.materialize();
             let bytes_ptr = strings.bytes.as_ptr();
             let bytes_cap = strings.bytes.capacity();
             let abandoned_after_mat = frame.abandoned().bytes;
@@ -3577,23 +3574,23 @@ mod twins {
         use crate::resolve::{CrateInput, SourceTexts, aligned};
         use crate::task::Serial;
 
-        // Direct test: 5,000 occurrences across only 6 unique strings.
+        // Direct test: 50,000 occurrences across only 6 unique strings must use strictly
+        // O(unique) bump bytes (never proportional to 50,000 occurrences) and abandon 0 bytes.
         {
             const UNIQUE: [&str; 6] = ["zeta", "alpha", "build", "set_id", "clone", "default"];
             let frame = blaze_mem::Frame::with_reserve(2 << 20, blaze_mem::Tag::Nameres).expect("frame");
             let erased = blaze_own::Erased::new(&frame);
             let alloc = erased.bump().alloc();
-            let mut strings = super::Strings::new_staged(alloc);
-            for i in 0..5_000usize {
-                strings.plan(UNIQUE[i % UNIQUE.len()]);
+            let mut strings = super::Strings::new(alloc);
+            for i in 0..50_000usize {
+                strings.plan(UNIQUE[i % UNIQUE.len()]).expect("plan");
             }
-            strings.materialize().expect("materialize");
+            strings.materialize();
             assert_eq!(strings.seen.len(), UNIQUE.len());
             assert!(
-                strings.seen.capacity() <= 32,
-                "seen must be sized for unique count ({}), not row count (5000); got capacity {}",
-                UNIQUE.len(),
-                strings.seen.capacity()
+                frame.used() < 4096,
+                "50,000 duplicate occurrences of 6 unique strings must use O(unique) frame bytes (<4 KiB), used {}",
+                frame.used()
             );
             let expected_bytes: std::string::String = UNIQUE.iter().copied().collect();
             assert_eq!(strings.bytes.as_slice(), expected_bytes.as_bytes(), "first-use order must be preserved");

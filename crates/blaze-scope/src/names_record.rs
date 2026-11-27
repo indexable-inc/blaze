@@ -355,68 +355,6 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
         }
     }
 
-    // Serialize each module's scope first (they already live in the bump `alloc`) so `blob` is
-    // allocated once at its exact 16-byte-padded byte length — covering `macro_exports`,
-    // `vis_keys`, and arbitrary-length names/paths/errors with zero reallocation or heuristic gap.
-    let mut written_scopes: AVec<'b, Option<RecordBytes<'b>>> = AVec::with_capacity_in(modules.len(), alloc);
-    let mut blob_len = 0usize;
-    #[cfg(test)]
-    let mut planted_once = false;
-    for m in modules.iter() {
-        match names.done.get(m) {
-            Some(done) => {
-                #[cfg(test)]
-                let bytes = match planted(*m, &done.scope, &mut planted_once) {
-                    Some(changed) => changed.write(alloc),
-                    None => done.scope.write(alloc),
-                };
-                #[cfg(not(test))]
-                let bytes = done.scope.write(alloc);
-                let bytes = bytes.map_err(NamesRecordError::Write)?;
-                blob_len = blob_len.saturating_add(bytes.len().next_multiple_of(ALIGN));
-                written_scopes.push(Some(bytes));
-            }
-            None => written_scopes.push(None),
-        }
-    }
-    let mut rows = RecordBytes::with_capacity_in(modules.len().saturating_mul(ROW), alloc);
-    let mut blob = RecordBytes::with_capacity_in(blob_len, alloc);
-    for ((idx, m), scope_bytes) in modules.iter().enumerate().zip(written_scopes.iter()) {
-        rows.extend_from_slice(&m.0.0);
-        match scope_bytes {
-            Some(bytes) => {
-                rows.extend_from_slice(&u32_of(blob.len(), "names blob")?.to_le_bytes());
-                rows.extend_from_slice(&u32_of(bytes.len(), "a module scope")?.to_le_bytes());
-                blob.extend_from_slice(bytes);
-                pad(&mut blob);
-            }
-            None => {
-                rows.extend_from_slice(&NONE.to_le_bytes());
-                rows.extend_from_slice(&0u32.to_le_bytes());
-            }
-        }
-        match names.chains.get(m) {
-            Some(chain) => {
-                let first = module_chain_at.get(idx).copied().unwrap_or(NONE);
-                rows.extend_from_slice(&first.to_le_bytes());
-                let len = u16::try_from(chain.len()).map_err(|_| NamesRecordError::TooBig { what: "a module chain" })?;
-                rows.extend_from_slice(&len.to_le_bytes());
-            }
-            None => {
-                rows.extend_from_slice(&NONE.to_le_bytes());
-                rows.extend_from_slice(&0u16.to_le_bytes());
-            }
-        }
-        let mut flags = 0u16;
-        if names.info(*m).is_some_and(|i| i.no_implicit_prelude) {
-            flags |= NO_IMPLICIT_PRELUDE;
-        }
-        if names.anonymous(*m) {
-            flags |= ANONYMOUS;
-        }
-        rows.extend_from_slice(&flags.to_le_bytes());
-    }
-
     let mut owners = AVec::from_iter_in(names.tables.enums.keys().copied(), alloc);
     owners.sort_unstable();
     let mut total_variants = 0usize;
@@ -448,18 +386,101 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
     pad(&mut enum_rows);
     pad(&mut strings);
     let root = names.crate_root.write(alloc).map_err(NamesRecordError::Write)?;
+    let failed = failed_section(names, alloc)?;
 
+    // Compute exact section offsets and total blob capacity via zero-allocation
+    // `ScopeBuilder::encoded_len()`, then stream every module scope directly into `out` reusing a
+    // single `scope_buf` (1× peak memory instead of retaining all scopes + separate `blob` + `out`).
     let rows_at = HEADER;
-    let chains_at = rows_at + rows.len();
+    let rows_len = modules.len().saturating_mul(ROW);
+    let chains_at = rows_at + rows_len;
     let enums_at = chains_at + chains.len();
     let variants_at = enums_at + enum_rows.len();
     let strings_at = variants_at + variant_rows.len();
     let root_at = strings_at + strings.len();
     let blob_at = (root_at + root.len()).next_multiple_of(ALIGN);
-    let failed = failed_section(names, alloc)?;
-    let failed_at = (blob_at + blob.len()).next_multiple_of(ALIGN);
-    let mut out = RecordBytes::with_capacity_in(failed_at + failed.len(), alloc);
-    out.extend_from_slice(&MAGIC);
+
+    let mut blob_cap = 0usize;
+    let mut max_scope_len = 0usize;
+    for m in modules.iter() {
+        if let Some(done) = names.done.get(m) {
+            let scope_len = done.scope.encoded_len();
+            // In tests, `Plant::FlipVis` may turn a public binding restricted (+1 vis_key = 32 B).
+            #[cfg(test)]
+            let scope_len = scope_len.saturating_add(32);
+            max_scope_len = max_scope_len.max(scope_len);
+            blob_cap = blob_cap.saturating_add(scope_len.next_multiple_of(ALIGN));
+        }
+    }
+
+    let out_cap = blob_at
+        .saturating_add(blob_cap)
+        .saturating_add(ALIGN)
+        .saturating_add(failed.len());
+    let mut out = RecordBytes::with_capacity_in(out_cap, alloc);
+    out.resize(HEADER + rows_len, 0);
+    out.extend_from_slice(&chains);
+    out.extend_from_slice(&enum_rows);
+    out.extend_from_slice(&variant_rows);
+    out.extend_from_slice(&strings);
+    out.extend_from_slice(&root);
+    pad(&mut out);
+    debug_assert_eq!(out.len(), blob_at);
+
+    let mut scope_buf = RecordBytes::with_capacity_in(max_scope_len, alloc);
+    #[cfg(test)]
+    let mut planted_once = false;
+    for (idx, m) in modules.iter().enumerate() {
+        let (scope_off, scope_len) = match names.done.get(m) {
+            Some(done) => {
+                let off = out.len().saturating_sub(blob_at);
+                #[cfg(test)]
+                let written = match planted(*m, &done.scope, &mut planted_once) {
+                    Some(changed) => changed.write_into(&mut scope_buf, &mut out, alloc),
+                    None => done.scope.write_into(&mut scope_buf, &mut out, alloc),
+                };
+                #[cfg(not(test))]
+                let written = done.scope.write_into(&mut scope_buf, &mut out, alloc);
+                let written = written.map_err(NamesRecordError::Write)?;
+                pad(&mut out);
+                (u32_of(off, "names blob")?, u32_of(written, "a module scope")?)
+            }
+            None => (NONE, 0u32),
+        };
+        let (chain_first, chain_len) = match names.chains.get(m) {
+            Some(chain) => {
+                let first = module_chain_at.get(idx).copied().unwrap_or(NONE);
+                let len = u16::try_from(chain.len()).map_err(|_| NamesRecordError::TooBig { what: "a module chain" })?;
+                (first, len)
+            }
+            None => (NONE, 0u16),
+        };
+        let mut flags = 0u16;
+        if names.info(*m).is_some_and(|i| i.no_implicit_prelude) {
+            flags |= NO_IMPLICIT_PRELUDE;
+        }
+        if names.anonymous(*m) {
+            flags |= ANONYMOUS;
+        }
+        let mut row = [0u8; ROW];
+        row[0..32].copy_from_slice(&m.0.0);
+        row[32..36].copy_from_slice(&scope_off.to_le_bytes());
+        row[36..40].copy_from_slice(&scope_len.to_le_bytes());
+        row[40..44].copy_from_slice(&chain_first.to_le_bytes());
+        row[44..46].copy_from_slice(&chain_len.to_le_bytes());
+        row[46..48].copy_from_slice(&flags.to_le_bytes());
+        let row_start = rows_at.saturating_add(idx.saturating_mul(ROW));
+        if let Some(dst) = out.get_mut(row_start..row_start.saturating_add(ROW)) {
+            dst.copy_from_slice(&row);
+        }
+    }
+    let blob_len = out.len().saturating_sub(blob_at);
+    pad(&mut out);
+    let failed_at = out.len();
+    out.extend_from_slice(&failed);
+
+    let mut head = [0u8; HEADER];
+    head[0..4].copy_from_slice(&MAGIC);
     let fields = [
         (VERSION as usize, "version"),
         (modules.len(), "names modules"),
@@ -473,27 +494,25 @@ pub fn encode<'b>(names: &CrateNames<'_>, alloc: Alloc<'b>) -> Result<RecordByte
         (root_at, "names offsets"),
         (root.len(), "the crate root"),
         (blob_at, "names offsets"),
-        (blob.len(), "names blob"),
+        (blob_len, "names blob"),
         (failed_at, "names offsets"),
         (failed.len(), "names failed calls"),
     ];
-    for (n, what) in fields {
-        out.extend_from_slice(&u32_of(n, what)?.to_le_bytes());
+    for (i, (n, what)) in fields.into_iter().enumerate() {
+        let pos = 4usize.saturating_add(i.saturating_mul(4));
+        if let Some(dst) = head.get_mut(pos..pos.saturating_add(4)) {
+            dst.copy_from_slice(&u32_of(n, what)?.to_le_bytes());
+        }
     }
-    out.resize(HEADER - 64, 0);
-    out.extend_from_slice(&names.key.0.0);
-    out.extend_from_slice(&names.root.0.0);
-    out.extend_from_slice(&rows);
-    out.extend_from_slice(&chains);
-    out.extend_from_slice(&enum_rows);
-    out.extend_from_slice(&variant_rows);
-    out.extend_from_slice(&strings);
-    out.extend_from_slice(&root);
-    pad(&mut out);
-    out.extend_from_slice(&blob);
-    pad(&mut out);
-    debug_assert_eq!(out.len(), failed_at);
-    out.extend_from_slice(&failed);
+    if let Some(dst) = head.get_mut(HEADER - 64..HEADER - 32) {
+        dst.copy_from_slice(&names.key.0.0);
+    }
+    if let Some(dst) = head.get_mut(HEADER - 32..HEADER) {
+        dst.copy_from_slice(&names.root.0.0);
+    }
+    if let Some(dst) = out.get_mut(..HEADER) {
+        dst.copy_from_slice(&head);
+    }
     Ok(out)
 }
 
