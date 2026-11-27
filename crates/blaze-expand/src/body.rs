@@ -202,7 +202,7 @@ pub fn body_words<'a>(stream: &TokenStream<'_>, this: ContentId, alloc: Alloc<'a
                 end: crate::tokens::index(at + if quote { 2 } else { 1 }),
                 hygiene: local_hygiene(stream, ctx, this),
                 parent_hygiene: template_parent_hygiene(stream, ctx, this),
-                mark: stream.non_transparent_mark(ctx).map(TextMark::of),
+                mark: stream.text_mark(ctx),
                 space_before: !glued,
             });
         }

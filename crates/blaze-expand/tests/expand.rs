@@ -2066,8 +2066,20 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
         site: DefSite { krate: krate_a, module: None },
         local_inner: false,
     };
+    let transparent_2024 = Mark {
+        of: MarkOf::Outer(ContentId([11; 32])),
+        transparency: Transparency::Transparent,
+        edition: Edition::E2024,
+        site: DefSite { krate: krate_a, module: None },
+    };
     let semi_b = Mark {
         of: MarkOf::Outer(ContentId([21; 32])),
+        transparency: Transparency::SemiOpaque,
+        edition: Edition::E2024,
+        site: DefSite { krate: krate_b, module: None },
+    };
+    let semi_b_2021 = Mark {
+        of: MarkOf::Outer(ContentId([22; 32])),
         transparency: Transparency::SemiOpaque,
         edition: Edition::E2021,
         site: DefSite { krate: krate_b, module: None },
@@ -2076,7 +2088,7 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
     let opaque_c = Mark {
         of: MarkOf::Outer(ContentId([31; 32])),
         transparency: Transparency::Opaque,
-        edition: Edition::E2021,
+        edition: Edition::E2024,
         site: DefSite { krate: krate_c, module: None },
         local_inner: false,
     };
@@ -2085,32 +2097,406 @@ fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque()
     let root = Ctx::root(Edition::E2021);
     let only_transparent = stream.context(CtxNode { parent: root, mark: transparent_a }).expect("ctx");
     let semi_ctx = stream.context(CtxNode { parent: root, mark: semi_b }).expect("ctx");
+    let semi_2021_ctx = stream.context(CtxNode { parent: root, mark: semi_b_2021 }).expect("ctx");
     let opaque_ctx = stream.context(CtxNode { parent: root, mark: opaque_c }).expect("ctx");
     let transparent_over_semi = stream.context(CtxNode { parent: semi_ctx, mark: transparent_a }).expect("ctx");
+    let transparent_2024_over_semi_2021 = stream.context(CtxNode { parent: semi_2021_ctx, mark: transparent_2024 }).expect("ctx");
     let transparent_over_opaque = stream.context(CtxNode { parent: opaque_ctx, mark: transparent_a }).expect("ctx");
 
+    use blaze_expand::origin_column::TextMark;
     assert_eq!(stream.non_transparent_mark(root), None);
+    assert_eq!(stream.text_mark(root), None);
     assert_eq!(stream.node(only_transparent).map(|n| n.mark), Some(transparent_a));
     assert_eq!(stream.hygiene(only_transparent).mark, None);
     assert_eq!(stream.non_transparent_mark(only_transparent), None);
+    assert_eq!(stream.text_mark(only_transparent), Some(TextMark::of(transparent_a)));
     assert_eq!(stream.non_transparent_mark(semi_ctx), Some(semi_b));
+    assert_eq!(stream.text_mark(semi_ctx), Some(TextMark::of(semi_b)));
     assert_eq!(stream.non_transparent_mark(opaque_ctx), Some(opaque_c));
+    assert_eq!(stream.text_mark(opaque_ctx), Some(TextMark::of(opaque_c)));
     assert_eq!(stream.node(transparent_over_semi).map(|n| n.mark), Some(transparent_a));
     assert_eq!(stream.hygiene(transparent_over_semi).mark, Some(semi_b));
     assert_eq!(stream.non_transparent_mark(transparent_over_semi), Some(semi_b));
+    // Nested E2021 Transparent over E2024 SemiOpaque keeps SemiOpaque hygiene + E2021 edition.
+    assert_eq!(
+        stream.text_mark(transparent_over_semi),
+        Some(TextMark { site: semi_b.site, transparency: Transparency::SemiOpaque, edition: Edition::E2021 })
+    );
+    // Reverse nesting: E2024 Transparent over E2021 SemiOpaque keeps SemiOpaque hygiene + E2024 edition.
+    assert_eq!(
+        stream.text_mark(transparent_2024_over_semi_2021),
+        Some(TextMark { site: semi_b_2021.site, transparency: Transparency::SemiOpaque, edition: Edition::E2024 })
+    );
+    // `TextMark::local_hygiene()` depends only on `(site, transparency)`, not `edition`.
+    assert_eq!(
+        TextMark::of(semi_b).local_hygiene(),
+        stream.text_mark(transparent_over_semi).expect("mark").local_hygiene(),
+    );
     assert_eq!(stream.node(transparent_over_opaque).map(|n| n.mark), Some(transparent_a));
     assert_eq!(stream.hygiene(transparent_over_opaque).mark, Some(opaque_c));
     assert_eq!(stream.non_transparent_mark(transparent_over_opaque), Some(opaque_c));
+    assert_eq!(
+        stream.text_mark(transparent_over_opaque),
+        Some(TextMark { site: opaque_c.site, transparency: Transparency::Opaque, edition: Edition::E2021 })
+    );
 
-    // `body_words` also skips `Transparent` marks when computing `BodyWord::mark`.
+    // `body_words` uses `text_mark`: preserves innermost `Transparent` edition while keeping
+    // enclosing non-transparent hygiene (`site`, `transparency`) and local hygiene.
     stream.ident("$crate", only_transparent).expect("push");
     stream.ident("$crate", transparent_over_semi).expect("push");
+    stream.ident("$crate", transparent_2024_over_semi_2021).expect("push");
     stream.ident("$crate", transparent_over_opaque).expect("push");
     let body = body_words(&stream, ContentId([99; 32]), alloc);
-    assert_eq!(body.words.len(), 3);
-    assert_eq!(body.words[0].mark, None);
-    assert_eq!(body.words[1].mark.map(|m| (m.site.krate, m.transparency)), Some((krate_b, Transparency::SemiOpaque)));
-    assert_eq!(body.words[2].mark.map(|m| (m.site.krate, m.transparency)), Some((krate_c, Transparency::Opaque)));
+    assert_eq!(body.words.len(), 4);
+    assert_eq!(body.words[0].hygiene, 0);
+    assert_eq!(body.words[0].mark, Some(TextMark::of(transparent_a)));
+    assert_eq!(
+        body.words[1].mark.map(|m| (m.site.krate, m.transparency, m.edition)),
+        Some((krate_b, Transparency::SemiOpaque, Edition::E2021))
+    );
+    assert_eq!(
+        body.words[2].mark.map(|m| (m.site.krate, m.transparency, m.edition)),
+        Some((krate_b, Transparency::SemiOpaque, Edition::E2024))
+    );
+    assert_eq!(
+        body.words[3].mark.map(|m| (m.site.krate, m.transparency, m.edition)),
+        Some((krate_c, Transparency::Opaque, Edition::E2021))
+    );
+}
+
+#[test]
+fn include_text_mark_and_body_words_preserve_caller_edition() {
+    use blaze_expand::{CtxNode, Mark, Transparency, body_words, origin_column::TextMark};
+    let alloc = Alloc::global();
+    let cx = TestCx {
+        files: &[("inc.rs", b"match self { Self::A(ref mut x) => *x }")],
+        ..TestCx::new()
+    };
+
+    // 1. E2024 `include!` invoked from E2021 caller -> `text_mark` and `body_words` carry `None`
+    //    (falling back to caller E2021, never the built-in macro's E2024).
+    let def_2024 = MacroDefinition::builtin_fn(
+        BuiltinFn::Include,
+        DefAt { edition: Edition::E2024, ..at(0xC0) },
+        alloc,
+    );
+    let input_2021 = lex("\"inc.rs\"", Edition::E2021, alloc).expect("lex");
+    let call_2021 = Call::fn_like(
+        &input_2021,
+        CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: Ctx::root(Edition::E2021) },
+    );
+    let exp_2021 = done(expand(&def_2024, &call_2021, &cx, alloc));
+    assert!(exp_2021.diagnostics.is_empty(), "{:?}", exp_2021.diagnostics);
+    for i in 0..exp_2021.tokens.len() {
+        assert_eq!(exp_2021.text_mark(i), None, "E2024 include! in E2021 caller must leave text_mark None");
+        assert_eq!(exp_2021.hygiene(i).edition, Edition::E2021);
+    }
+    let bw_2021 = body_words(&exp_2021.tokens, ContentId([1; 32]), alloc);
+    assert!(bw_2021.words.iter().all(|w| w.mark.is_none()));
+
+    // 2. E2021 `include!` invoked from E2024 caller -> `text_mark` and `body_words` carry `None`
+    //    (falling back to caller E2024, never the built-in macro's E2021).
+    let def_2021 = MacroDefinition::builtin_fn(
+        BuiltinFn::Include,
+        DefAt { edition: Edition::E2021, ..at(0xC1) },
+        alloc,
+    );
+    let input_2024 = lex("\"inc.rs\"", Edition::E2024, alloc).expect("lex");
+    let call_2024 = Call::fn_like(
+        &input_2024,
+        CallSite { edition: Edition::E2024, panic_edition: Edition::E2024, ctx: Ctx::root(Edition::E2024) },
+    );
+    let exp_2024 = done(expand(&def_2021, &call_2024, &cx, alloc));
+    assert!(exp_2024.diagnostics.is_empty(), "{:?}", exp_2024.diagnostics);
+    for i in 0..exp_2024.tokens.len() {
+        assert_eq!(exp_2024.text_mark(i), None, "E2021 include! in E2024 caller must leave text_mark None");
+        assert_eq!(exp_2024.hygiene(i).edition, Edition::E2024);
+    }
+    let bw_2024 = body_words(&exp_2024.tokens, ContentId([2; 32]), alloc);
+    assert!(bw_2024.words.iter().all(|w| w.mark.is_none()));
+
+    // 3. `include!` invoked from a `Transparent(E2021)` proc-macro context over `Ctx::root(E2024)`
+    //    walks past the transparent mark so included file tokens keep caller E2024 (`None`),
+    //    not the proc-macro's E2021.
+    let mut trans_input = TokenStream::new_in(alloc);
+    let proc_mark = Mark {
+        of: MarkOf::Outer(ContentId([0xD0; 32])),
+        transparency: Transparency::Transparent,
+        edition: Edition::E2021,
+        site: DefSite { krate: CrateItemKey(ContentId([0xD1; 32])), module: None },
+    };
+    let trans_ctx = trans_input
+        .context(CtxNode { parent: Ctx::root(Edition::E2024), mark: proc_mark })
+        .expect("trans ctx");
+    trans_input
+        .push(TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone }, "inc.rs", trans_ctx)
+        .expect("push");
+    let trans_call = Call::fn_like(
+        &trans_input,
+        CallSite { edition: Edition::E2024, panic_edition: Edition::E2024, ctx: trans_ctx },
+    );
+    let exp_trans = done(expand(&def_2021, &trans_call, &cx, alloc));
+    assert!(exp_trans.diagnostics.is_empty(), "{:?}", exp_trans.diagnostics);
+    for i in 0..exp_trans.tokens.len() {
+        assert_eq!(exp_trans.text_mark(i), None, "include! inside Transparent proc-macro must inherit caller root E2024");
+        assert_eq!(exp_trans.hygiene(i).edition, Edition::E2024);
+    }
+
+    // 4. `include!` invoked from `Transparent(E2024)` over `SemiOpaque(E2021)` preserves the
+    //    enclosing `SemiOpaque(E2021)` mark and strips the transparent layer.
+    let mut layered_input = TokenStream::new_in(alloc);
+    let semi_mark = Mark {
+        of: MarkOf::Outer(ContentId([0xE0; 32])),
+        transparency: Transparency::SemiOpaque,
+        edition: Edition::E2021,
+        site: DefSite { krate: CrateItemKey(ContentId([0xE1; 32])), module: None },
+    };
+    let trans_2024_mark = Mark {
+        of: MarkOf::Outer(ContentId([0xE2; 32])),
+        transparency: Transparency::Transparent,
+        edition: Edition::E2024,
+        site: DefSite { krate: CrateItemKey(ContentId([0xE3; 32])), module: None },
+    };
+    let semi_ctx = layered_input
+        .context(CtxNode { parent: Ctx::root(Edition::E2018), mark: semi_mark })
+        .expect("semi ctx");
+    let layered_ctx = layered_input
+        .context(CtxNode { parent: semi_ctx, mark: trans_2024_mark })
+        .expect("layered ctx");
+    layered_input
+        .push(TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone }, "inc.rs", layered_ctx)
+        .expect("push");
+    let layered_call = Call::fn_like(
+        &layered_input,
+        CallSite { edition: Edition::E2018, panic_edition: Edition::E2018, ctx: layered_ctx },
+    );
+    let exp_layered = done(expand(&def_2024, &layered_call, &cx, alloc));
+    assert!(exp_layered.diagnostics.is_empty(), "{:?}", exp_layered.diagnostics);
+    for i in 0..exp_layered.tokens.len() {
+        assert_eq!(exp_layered.text_mark(i), Some(TextMark::of(semi_mark)));
+    }
+}
+
+#[test]
+fn lex_marked_preserves_transparent_edition_without_folding_dollar_crate() {
+    use blaze_expand::{Transparency, origin_column::TextMark};
+    let alloc = Alloc::global();
+    let site = DefSite { krate: CrateItemKey(ContentId([41; 32])), module: None };
+    let transparent_2021 = TextMark { site, transparency: Transparency::Transparent, edition: Edition::E2021 };
+    let semi_2021 = TextMark { site, transparency: Transparency::SemiOpaque, edition: Edition::E2021 };
+
+    let text = "$crate::Foo";
+    // Transparent mark: `$` and `crate` remain two tokens (same as unmarked), while preserving
+    // the transparent mark's edition via `text_mark`.
+    let ts_trans = blaze_expand::lex_marked(text, Edition::E2024, &|_| Some(transparent_2021), alloc).expect("lex transparent");
+    assert_eq!(ts_trans.len(), 5, "transparent `$crate::Foo` stays `$`, `crate`, `:`, `:`, `Foo`");
+    assert!(matches!(ts_trans.tokens()[0].kind, TokenKind::Punct { char: '$', .. }));
+    assert_eq!(ts_trans.text_at(1), "crate");
+    assert_eq!(ts_trans.text_mark(ts_trans.tokens()[0].ctx), Some(transparent_2021));
+    assert_eq!(ts_trans.non_transparent_mark(ts_trans.tokens()[0].ctx), None);
+
+    // Control: SemiOpaque mark folds `$` + `crate` into one `$crate` identifier.
+    let ts_semi = blaze_expand::lex_marked(text, Edition::E2024, &|_| Some(semi_2021), alloc).expect("lex semi");
+    assert_eq!(ts_semi.len(), 4, "semi-opaque `$crate::Foo` folds to `$crate`, `:`, `:`, `Foo`");
+    assert_eq!(ts_semi.text_at(0), "$crate");
+    assert_eq!(ts_semi.text_mark(ts_semi.tokens()[0].ctx), Some(semi_2021));
+}
+
+#[test]
+fn nested_transparent_proc_macro_over_semi_opaque_call_site_preserves_innermost_edition() {
+    use blaze_expand::{
+        CtxNode, HostAsk, HostError, HostWhy, Mark, ProcCall, ProcKind, Produced, Reads, Transparency,
+        body_words, origin_column::TextMark,
+    };
+    use blaze_own::AVec;
+
+    struct EmitRefMut(Edition);
+    impl ExpandCx for EmitRefMut {
+        fn cfg(&self, _: &TokenStream<'_>) -> Result<bool, HostError> {
+            Err(HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })
+        }
+        fn env(&self, _: &str) -> Result<Option<&str>, HostError> {
+            Err(HostError { ask: HostAsk::Env, why: HostWhy::Refused })
+        }
+        fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Include, why: HostWhy::Refused })
+        }
+        fn place(&self, _: PlaceOf) -> Result<Place<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused })
+        }
+        fn run_proc_macro<'a>(&self, _: &MacroDefinition<'_>, _: ProcCall<'_>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {
+            let tokens = lex("ref mut arg", self.0, alloc).expect("lex");
+            let mut origins = AVec::new_in(alloc);
+            origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(Transparency::Transparent)));
+            Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+        }
+    }
+
+    let alloc = Alloc::global();
+    let rules_2024_krate = CrateItemKey(ContentId([0x41; 32]));
+    let rules_2021_krate = CrateItemKey(ContentId([0x42; 32]));
+    let proc_2021_krate = CrateItemKey(ContentId([0x43; 32]));
+    let proc_2024_krate = CrateItemKey(ContentId([0x44; 32]));
+
+    // Direction 1: E2021 transparent proc-macro invoked from E2024 SemiOpaque `macro_rules!` ctx.
+    let proc_2021 = MacroDefinition::proc_macro(
+        proc_2021_krate,
+        ProcKind::FnLike,
+        "emit",
+        &[],
+        DefAt { edition: Edition::E2021, site: DefSite { krate: proc_2021_krate, module: None }, ..at(0x43) },
+        alloc,
+    )
+    .expect("proc_2021");
+    let mut input_2024 = TokenStream::new_in(alloc);
+    let semi_2024 = Mark {
+        of: MarkOf::Outer(ContentId([0x51; 32])),
+        transparency: Transparency::SemiOpaque,
+        edition: Edition::E2024,
+        site: DefSite { krate: rules_2024_krate, module: None },
+    };
+    let semi_2024_ctx = input_2024
+        .context(CtxNode { parent: Ctx::root(Edition::E2024), mark: semi_2024 })
+        .expect("ctx");
+    let call_1 = Call::fn_like(&input_2024, CallSite { edition: Edition::E2024, panic_edition: Edition::E2024, ctx: semi_2024_ctx });
+    let exp_1 = done(expand(&proc_2021, &call_1, &EmitRefMut(Edition::E2021), alloc));
+    assert!(exp_1.diagnostics.is_empty(), "{:?}", exp_1.diagnostics);
+    let want_1 = TextMark { site: semi_2024.site, transparency: Transparency::SemiOpaque, edition: Edition::E2021 };
+    for i in 0..exp_1.tokens.len() {
+        assert_eq!(exp_1.text_mark(i), Some(want_1));
+        assert_eq!(exp_1.non_transparent_mark(i), Some(semi_2024));
+    }
+    let bw_1 = body_words(&exp_1.tokens, ContentId([0x61; 32]), alloc);
+    assert!(bw_1.words.iter().all(|w| w.mark == Some(want_1) && w.hygiene != 0));
+
+    // Direction 2: E2024 transparent proc-macro invoked from E2021 SemiOpaque `macro_rules!` ctx.
+    let proc_2024 = MacroDefinition::proc_macro(
+        proc_2024_krate,
+        ProcKind::FnLike,
+        "emit",
+        &[],
+        DefAt { edition: Edition::E2024, site: DefSite { krate: proc_2024_krate, module: None }, ..at(0x44) },
+        alloc,
+    )
+    .expect("proc_2024");
+    let mut input_2021 = TokenStream::new_in(alloc);
+    let semi_2021 = Mark {
+        of: MarkOf::Outer(ContentId([0x52; 32])),
+        transparency: Transparency::SemiOpaque,
+        edition: Edition::E2021,
+        site: DefSite { krate: rules_2021_krate, module: None },
+    };
+    let semi_2021_ctx = input_2021
+        .context(CtxNode { parent: Ctx::root(Edition::E2021), mark: semi_2021 })
+        .expect("ctx");
+    let call_2 = Call::fn_like(&input_2021, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: semi_2021_ctx });
+    let exp_2 = done(expand(&proc_2024, &call_2, &EmitRefMut(Edition::E2024), alloc));
+    assert!(exp_2.diagnostics.is_empty(), "{:?}", exp_2.diagnostics);
+    let want_2 = TextMark { site: semi_2021.site, transparency: Transparency::SemiOpaque, edition: Edition::E2024 };
+    for i in 0..exp_2.tokens.len() {
+        assert_eq!(exp_2.text_mark(i), Some(want_2));
+        assert_eq!(exp_2.non_transparent_mark(i), Some(semi_2021));
+    }
+    let bw_2 = body_words(&exp_2.tokens, ContentId([0x62; 32]), alloc);
+    assert!(bw_2.words.iter().all(|w| w.mark == Some(want_2) && w.hygiene != 0));
+}
+
+#[test]
+fn transparent_edition_drives_parser_words_keyword_classification() {
+    use blaze_expand::{
+        HostAsk, HostError, HostWhy, ProcCall, ProcKind, Produced, Reads, Transparency, body_words,
+    };
+    use blaze_own::AVec;
+    use parser::SyntaxKind;
+
+    struct EmitText(Edition, &'static str);
+    impl ExpandCx for EmitText {
+        fn cfg(&self, _: &TokenStream<'_>) -> Result<bool, HostError> {
+            Err(HostError { ask: HostAsk::Cfg, why: HostWhy::Refused })
+        }
+        fn env(&self, _: &str) -> Result<Option<&str>, HostError> {
+            Err(HostError { ask: HostAsk::Env, why: HostWhy::Refused })
+        }
+        fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Include, why: HostWhy::Refused })
+        }
+        fn place(&self, _: PlaceOf) -> Result<Place<'_>, HostError> {
+            Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused })
+        }
+        fn run_proc_macro<'a>(&self, _: &MacroDefinition<'_>, _: ProcCall<'_>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {
+            let tokens = lex(self.1, self.0, alloc).expect("lex");
+            let mut origins = AVec::new_in(alloc);
+            origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(Transparency::Transparent)));
+            Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+        }
+    }
+
+    let alloc = Alloc::global();
+    let empty_2024 = TokenStream::new_in(alloc);
+    let call_2024 = Call::fn_like(&empty_2024, CallSite { edition: Edition::E2024, panic_edition: Edition::E2024, ctx: Ctx::root(Edition::E2024) });
+    let empty_2015 = TokenStream::new_in(alloc);
+    let call_2015 = Call::fn_like(&empty_2015, CallSite { edition: Edition::E2015, panic_edition: Edition::E2015, ctx: Ctx::root(Edition::E2015) });
+
+    // 1. E2015 transparent proc-macro emitting `async try gen` into an E2024 caller:
+    //    `ParserWords` classifies all three as `IDENT` (not edition-2018/2024 keywords).
+    let proc_2015 = MacroDefinition::proc_macro(
+        CrateItemKey(ContentId([0x71; 32])),
+        ProcKind::FnLike,
+        "emit",
+        &[],
+        DefAt { edition: Edition::E2015, ..at(0x71) },
+        alloc,
+    )
+    .expect("proc_2015");
+    let exp_2015 = done(expand(&proc_2015, &call_2024, &EmitText(Edition::E2015, "async try gen"), alloc));
+    let bw_2015 = body_words(&exp_2015.tokens, ContentId([0x81; 32]), alloc);
+    let toks_2015 = parser::Tokens::new(&bw_2015.parser.words, true);
+    assert_eq!(exp_2015.tokens.edition_of(exp_2015.tokens.tokens()[0].ctx), Edition::E2015);
+    assert_eq!((toks_2015.kind(0), toks_2015.kind(1), toks_2015.kind(2)), (SyntaxKind::IDENT, SyntaxKind::IDENT, SyntaxKind::IDENT));
+
+    // 2. E2021 transparent proc-macro emitting `async gen` into an E2024 caller:
+    //    `async` is `ASYNC_KW` (E2021) and `gen` is `IDENT` (not E2024 `GEN_KW`).
+    let proc_2021 = MacroDefinition::proc_macro(
+        CrateItemKey(ContentId([0x72; 32])),
+        ProcKind::FnLike,
+        "emit",
+        &[],
+        DefAt { edition: Edition::E2021, ..at(0x72) },
+        alloc,
+    )
+    .expect("proc_2021");
+    let exp_2021 = done(expand(&proc_2021, &call_2024, &EmitText(Edition::E2021, "async gen"), alloc));
+    let bw_2021 = body_words(&exp_2021.tokens, ContentId([0x82; 32]), alloc);
+    let toks_2021 = parser::Tokens::new(&bw_2021.parser.words, true);
+    assert_eq!((toks_2021.kind(0), toks_2021.kind(1)), (SyntaxKind::ASYNC_KW, SyntaxKind::IDENT));
+
+    // 3. Negative control: E2024 transparent proc-macro emitting `async try gen` into E2015 caller:
+    //    `ParserWords` classifies all three as keywords (`ASYNC_KW`, `TRY_KW`, `GEN_KW`).
+    let proc_2024 = MacroDefinition::proc_macro(
+        CrateItemKey(ContentId([0x73; 32])),
+        ProcKind::FnLike,
+        "emit",
+        &[],
+        DefAt { edition: Edition::E2024, ..at(0x73) },
+        alloc,
+    )
+    .expect("proc_2024");
+    let exp_2024 = done(expand(&proc_2024, &call_2015, &EmitText(Edition::E2024, "async try gen"), alloc));
+    let bw_2024 = body_words(&exp_2024.tokens, ContentId([0x83; 32]), alloc);
+    let toks_2024 = parser::Tokens::new(&bw_2024.parser.words, true);
+    assert_eq!((toks_2024.kind(0), toks_2024.kind(1), toks_2024.kind(2)), (SyntaxKind::ASYNC_KW, SyntaxKind::TRY_KW, SyntaxKind::GEN_KW));
+
+    // 4. Negative control (`include!`): `include!` defined in E2015 invoked from an E2021 caller
+    //    parses `async try` under the caller's E2021 (`ASYNC_KW`, `TRY_KW`), NOT `include!`'s E2015.
+    let cx = TestCx { files: &[("kw.rs", b"async try")], ..TestCx::new() };
+    let inc_2015 = MacroDefinition::builtin_fn(BuiltinFn::Include, DefAt { edition: Edition::E2015, ..at(0x74) }, alloc);
+    let inc_in = lex("\"kw.rs\"", Edition::E2021, alloc).expect("lex");
+    let inc_call = Call::fn_like(&inc_in, CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: Ctx::root(Edition::E2021) });
+    let inc_exp = done(expand(&inc_2015, &inc_call, &cx, alloc));
+    assert!(inc_exp.diagnostics.is_empty(), "{:?}", inc_exp.diagnostics);
+    let bw_inc = body_words(&inc_exp.tokens, ContentId([0x84; 32]), alloc);
+    let toks_inc = parser::Tokens::new(&bw_inc.parser.words, true);
+    assert_eq!((toks_inc.kind(0), toks_inc.kind(1)), (SyntaxKind::ASYNC_KW, SyntaxKind::TRY_KW));
 }
 
 #[test]

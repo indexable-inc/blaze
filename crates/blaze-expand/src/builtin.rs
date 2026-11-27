@@ -657,7 +657,14 @@ fn included_tokens(
         }
         Err(crate::error::LexError::Stream(error)) => return Err(error.into()),
     };
-    let ctx = out.exp.tokens.import_ctx(out.call.input(), out.call.site.ctx)?;
+    let mut site_ctx = out.call.site.ctx;
+    while let Some(node) = out.call.input().node(site_ctx) {
+        if node.mark.transparency != Transparency::Transparent {
+            break;
+        }
+        site_ctx = node.parent;
+    }
+    let ctx = out.exp.tokens.import_ctx(out.call.input(), site_ctx)?;
     for (at, token) in tokens.tokens().iter().enumerate() {
         out.push_whole_ctx(
             token.kind,
