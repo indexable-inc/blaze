@@ -282,80 +282,370 @@ pub fn check_filter_assoc(mut f: FilterWrap<U8Iter, Owned>) -> MyOpt<u8> {
     assert!(error_lines(&said).is_empty(), "expected 0 errors (codes={codes:?}, notes={notes:?}):\n{said}");
 }
 
-/// Blocker C6 (`sqlx-core/src/migrate/source.rs` `ResolveError`): thiserror's comptime patch must
-/// unwrap `Option<E>` `#[source]` / implicit `source` fields via `Option::as_ref` before unsizing
-/// `&E as &(dyn Error + 'static)` (for both structs and enums), never casting `&Option<E>` directly
-/// (which front2 rejects with E0605 `NonPrimitiveCast`).
+/// Blocker C6 (`sqlx-core/src/migrate/source.rs` `ResolveError`) + all `thiserror_impl`
+/// `Option<E>` source/from/transparent/ref/qualified-path/macro/const-generic shapes: runs the
+/// real `blaze_proc_macro::comptime_patch::try_expand` output through Blaze's own front2
+/// typechecker and borrow checker (no `rustc`), asserting 0 errors and complete checking, plus a
+/// negative control confirming the old `&Option<E> as &(dyn Error + 'static)` triggers E0605.
 #[test]
 fn thiserror_option_source_unwraps_instead_of_casting_option() {
-    const CLEAN: &str = r#"
-#[lang = "sized"]
-pub trait Sized {}
-#[lang = "unsize"]
-pub trait Unsize<T: ?Sized> {}
-#[lang = "coerce_unsized"]
-pub trait CoerceUnsized<T: ?Sized> {}
-impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b T {}
+    use blaze_expand::{Delim, Edition, LitKind, ProcCall, ProcKind, Spacing, TokenKind, TokenStream, lex};
+    use blaze_proc_macro::comptime_patch::{PatchResult, try_expand};
 
-pub trait Error {
-    fn source(&self) -> Opt<&(dyn Error + 'static)> { Opt::None }
-}
-pub enum Opt<T> {
-    None,
-    Some(T),
-}
-impl<T> Opt<T> {
-    pub fn as_ref(&self) -> Opt<&T> {
-        match self {
-            Opt::Some(x) => Opt::Some(x),
-            Opt::None => Opt::None,
-        }
-    }
-}
-pub struct IoErr;
-impl Error for IoErr {}
-
-pub struct ResolveError {
-    pub code: u8,
-    pub source: Opt<IoErr>,
-}
-impl Error for ResolveError {
-    fn source(&self) -> Opt<&(dyn Error + 'static)> {
-        match (&self.source).as_ref() {
-            Opt::Some(__e) => Opt::Some(__e as &(dyn Error + 'static)),
-            Opt::None => Opt::None,
-        }
-    }
-}
-
-pub enum OptEnumErr {
-    Named { code: u8, cause: Opt<IoErr> },
-    Tuple(Opt<IoErr>),
-    Plain,
-}
-impl Error for OptEnumErr {
-    fn source(&self) -> Opt<&(dyn Error + 'static)> {
-        match self {
-            OptEnumErr::Named { code: __f0, cause: __f1 } => {
-                let _ = __f0;
-                match __f1.as_ref() {
-                    Opt::Some(__e) => Opt::Some(__e as &(dyn Error + 'static)),
-                    Opt::None => Opt::None,
+    fn render_stream(stream: &TokenStream<'_>) -> std::string::String {
+        let tokens = stream.tokens();
+        let mut out = std::string::String::new();
+        let mut prev_joint = false;
+        for (i, tok) in tokens.iter().enumerate() {
+            match tok.kind {
+                TokenKind::Open(d) => {
+                    if !out.is_empty() && !prev_joint && !out.ends_with(['(', '[', '{', '<', ':']) {
+                        out.push(' ');
+                    }
+                    out.push(match d {
+                        Delim::Paren => '(',
+                        Delim::Bracket => '[',
+                        Delim::Brace => '{',
+                        Delim::Invisible => ' ',
+                    });
+                    prev_joint = true;
+                }
+                TokenKind::Close(d) => {
+                    out.push(match d {
+                        Delim::Paren => ')',
+                        Delim::Bracket => ']',
+                        Delim::Brace => '}',
+                        Delim::Invisible => ' ',
+                    });
+                    prev_joint = false;
+                }
+                TokenKind::Punct { char: c, spacing } => {
+                    if !out.is_empty()
+                        && !prev_joint
+                        && ((c == ':' && out.ends_with(':'))
+                            || (!matches!(c, ',' | ';' | ':' | '.' | '>' | '!' | '?')
+                                && !out.ends_with(['(', '[', '{', ':', '\'', '<', '&', '#'])))
+                    {
+                        out.push(' ');
+                    }
+                    out.push(c);
+                    prev_joint = spacing == Spacing::Joint || matches!(c, '\'' | '#');
+                }
+                TokenKind::Ident { .. } => {
+                    if !out.is_empty()
+                        && !prev_joint
+                        && !out.ends_with(['(', '[', '{', '<', '\'', '.', '&', '#'])
+                        && !out.ends_with("::")
+                    {
+                        out.push(' ');
+                    }
+                    out.push_str(stream.text_at(i));
+                    prev_joint = false;
+                }
+                TokenKind::Literal { kind, suffix_len, .. } => {
+                    if !out.is_empty()
+                        && !prev_joint
+                        && !out.ends_with(['(', '[', '{', '<', ':', '\'', '.', '&', '#'])
+                    {
+                        out.push(' ');
+                    }
+                    let text = stream.text_at(i);
+                    let split = text.len().saturating_sub(suffix_len as usize);
+                    let (inside, suffix) = text.split_at(split);
+                    match kind {
+                        LitKind::Str => {
+                            out.push('"');
+                            out.push_str(inside);
+                            out.push('"');
+                            out.push_str(suffix);
+                        }
+                        LitKind::Char => {
+                            out.push('\'');
+                            out.push_str(inside);
+                            out.push('\'');
+                            out.push_str(suffix);
+                        }
+                        _ => out.push_str(text),
+                    }
+                    prev_joint = false;
                 }
             }
-            OptEnumErr::Tuple(__f0) => match __f0.as_ref() {
-                Opt::Some(__e) => Opt::Some(__e as &(dyn Error + 'static)),
-                Opt::None => Opt::None,
-            },
-            OptEnumErr::Plain => Opt::None,
         }
+        out
     }
-}
-"#;
-    let (said, codes, notes) = check_text(CLEAN);
+
+    let heap = blaze_own::testing::heap();
+    let alloc = heap.alloc();
+    let expand = |src: &str| -> std::string::String {
+        let stream = lex(src, Edition::E2021, alloc).expect("lex derive input");
+        let call = ProcCall {
+            kind: ProcKind::Derive,
+            input: &stream,
+            attr_args: None,
+            file: Ok("/workspace/src/lib.rs"),
+        };
+        let PatchResult::Expanded(prod) =
+            try_expand("thiserror_impl", ProcKind::Derive, "Error", &call, Edition::E2021, alloc)
+        else {
+            panic!("expected comptime patch expansion for:\n{src}");
+        };
+        render_stream(&prod.tokens)
+            .replace("::core::fmt::", " crate::mini_core::fmt::")
+            .replace("::core::error::", " crate::mini_core::error::")
+            .replace("::core::option::", " crate::mini_core::option::")
+            .replace("::core::convert::", " crate::mini_core::convert::")
+            .replace("::core::write!", " crate::mini_write!")
+    };
+
+    let resolve_impl = expand(r#"#[error("{code}")] pub struct ResolveError { pub code: u8, #[source] pub source: Option<IoErr> }"#);
+    let implicit_impl = expand(r#"#[error("implicit")] pub struct ImplicitOptErr { pub source: Option<IoErr> }"#);
+    let tuple_impl = expand(r#"#[error("tuple")] pub struct TupleOptErr(#[source] pub Option<IoErr>);"#);
+    let enum_impl = expand(r#"
+        pub enum OptEnumErr {
+            #[error("named {code}")]
+            Named { code: u8, #[source] cause: Option<IoErr> },
+            #[error("implicit")]
+            Implicit { source: Option<IoErr> },
+            #[error("tuple")]
+            Tuple(#[source] Option<IoErr>),
+            #[error("plain")]
+            Plain,
+        }
+    "#);
+    let from_named_impl = expand(r#"#[error("from named")] pub struct FromOptNamed { #[from] pub source: Option<IoErr> }"#);
+    let from_tuple_impl = expand(r#"#[error("from tuple")] pub struct FromOptTuple(#[from] pub Option<IoErr>);"#);
+    let from_enum_impl = expand(r#"
+        pub enum FromOptEnum {
+            #[error("io")]
+            Io { #[from] source: Option<IoErr> },
+            #[error("fmt")]
+            Fmt(#[from] Option<FmtErr>),
+        }
+    "#);
+    let ref_impl = expand(r#"#[error("ref")] pub struct RefSourceErr { #[source] pub source: &'static IoErr }"#);
+    let opt_ref_impl = expand(r#"#[error("opt ref")] pub struct OptRefSourceErr { #[source] pub source: Option<&'static IoErr> }"#);
+    let from_opt_ref_impl = expand(r#"#[error("from opt ref")] pub struct FromOptRefErr { #[from] pub source: Option<&'static IoErr> }"#);
+    let custom_opt_impl = expand(r#"#[error("custom")] pub struct CustomOptErr { #[source] pub source: Option<super::IoErr> }"#);
+    let custom_opt_enum_impl = expand(r#"pub enum CustomOptEnum { #[error("custom")] Wrapped(#[source] Option<super::IoErr>) }"#);
+    let trans_custom_impl = expand(r#"#[error(transparent)] pub struct TransCustomOpt(pub Option<super::IoErr>);"#);
+    let nested_custom_impl = expand(r#"#[error("nested")] pub struct NestedCustomOpt { #[source] pub source: super::Option<Option<super::IoErr>> }"#);
+    let qpath_impl = expand(r#"#[error("qpath")] pub struct QPathOptErr { #[source] pub source: <Provider as Factory>::Option<super::IoErr> }"#);
+    let lit_qpath_impl = expand(r#"#[error("lit qpath")] pub struct LitQPathOptErr { #[source] pub source: <LitProvider<'>'> as Factory>::Option<super::IoErr> }"#);
+    let unicode_impl = expand(r#"#[error("unicode")] pub struct UnicodeOptErr { #[source] pub source: módulo::Option<IoErr> }"#);
+    let braced_macro_impl = expand(r#"#[error("macro")] pub struct BracedMacroOptErr { #[source] pub source: Option<error_ty! { super::IoErr, () }> }"#);
+    let const_opt_impl = expand(r#"#[error("const opt")] pub struct ConstOptErr { #[from] pub source: Option<3> }"#);
+
+    let clean = format!(
+        r#"
+#[lang = "sized"]
+pub trait Sized {{}}
+#[lang = "unsize"]
+pub trait Unsize<T: ?Sized> {{}}
+#[lang = "coerce_unsized"]
+pub trait CoerceUnsized<T: ?Sized> {{}}
+impl<'a, 'b: 'a, T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<&'a U> for &'b T {{}}
+
+#[macro_export]
+macro_rules! mini_write {{
+    ($f:expr, $lit:literal $(, $arg:expr)*) => {{{{
+        let _ = ($f, $lit $(, &$arg)*);
+        crate::mini_core::fmt::Result::Ok(())
+    }}}};
+}}
+
+pub mod mini_core {{
+    pub mod option {{
+        pub enum Option<T> {{
+            None,
+            Some(T),
+        }}
+        impl<T> Option<T> {{
+            pub fn as_ref(&self) -> Option<&T> {{
+                match self {{
+                    Option::Some(x) => Option::Some(x),
+                    Option::None => Option::None,
+                }}
+            }}
+        }}
+    }}
+    pub mod fmt {{
+        pub struct Formatter<'a> {{
+            pub dummy: &'a u8,
+        }}
+        pub enum Result {{
+            Ok(()),
+            Err,
+        }}
+        impl<'a> Formatter<'a> {{
+            pub fn write_str(&mut self, _s: &str) -> Result {{ Result::Ok(()) }}
+        }}
+        pub trait Display {{
+            fn fmt(&self, f: &mut Formatter<'_>) -> Result;
+        }}
+    }}
+    pub mod convert {{
+        use crate::Sized;
+        pub trait From<T>: Sized {{
+            fn from(value: T) -> Self;
+        }}
+    }}
+    pub mod error {{
+        use crate::Sized;
+        use super::option::Option;
+        pub trait Error {{
+            fn source(&self) -> Option<&(dyn Error + 'static)> {{ Option::None }}
+        }}
+        impl<T: Error + ?Sized> Error for &T {{
+            fn source(&self) -> Option<&(dyn Error + 'static)> {{ (**self).source() }}
+        }}
+    }}
+}}
+
+pub use crate::mini_core::option::Option;
+
+pub struct IoErr;
+impl crate::mini_core::fmt::Display for IoErr {{
+    fn fmt(&self, _f: &mut crate::mini_core::fmt::Formatter<'_>) -> crate::mini_core::fmt::Result {{
+        crate::mini_core::fmt::Result::Ok(())
+    }}
+}}
+impl crate::mini_core::error::Error for IoErr {{}}
+
+pub struct FmtErr;
+impl crate::mini_core::fmt::Display for FmtErr {{
+    fn fmt(&self, _f: &mut crate::mini_core::fmt::Formatter<'_>) -> crate::mini_core::fmt::Result {{
+        crate::mini_core::fmt::Result::Ok(())
+    }}
+}}
+impl crate::mini_core::error::Error for FmtErr {{}}
+
+pub struct ResolveError {{ pub code: u8, pub source: Option<IoErr> }}
+{resolve_impl}
+
+pub struct ImplicitOptErr {{ pub source: Option<IoErr> }}
+{implicit_impl}
+
+pub struct TupleOptErr(pub Option<IoErr>);
+{tuple_impl}
+
+pub enum OptEnumErr {{
+    Named {{ code: u8, cause: Option<IoErr> }},
+    Implicit {{ source: Option<IoErr> }},
+    Tuple(Option<IoErr>),
+    Plain,
+}}
+{enum_impl}
+
+pub struct FromOptNamed {{ pub source: Option<IoErr> }}
+{from_named_impl}
+
+pub struct FromOptTuple(pub Option<IoErr>);
+{from_tuple_impl}
+
+pub enum FromOptEnum {{
+    Io {{ source: Option<IoErr> }},
+    Fmt(Option<FmtErr>),
+}}
+{from_enum_impl}
+
+pub struct RefSourceErr {{ pub source: &'static IoErr }}
+{ref_impl}
+
+pub struct OptRefSourceErr {{ pub source: Option<&'static IoErr> }}
+{opt_ref_impl}
+
+pub struct FromOptRefErr {{ pub source: Option<&'static IoErr> }}
+{from_opt_ref_impl}
+
+pub mod módulo {{
+    pub use crate::mini_core::option::Option;
+}}
+pub struct UnicodeOptErr {{ pub source: módulo::Option<IoErr> }}
+{unicode_impl}
+
+pub mod custom_opt {{
+    pub struct Option<T>(pub crate::mini_core::option::Option<T>);
+    impl<T> Option<T> {{
+        pub fn as_ref(&self) -> crate::mini_core::option::Option<&T> {{ self.0.as_ref() }}
+    }}
+    impl<T: crate::mini_core::fmt::Display> crate::mini_core::fmt::Display for Option<T> {{
+        fn fmt(&self, f: &mut crate::mini_core::fmt::Formatter<'_>) -> crate::mini_core::fmt::Result {{
+            match &self.0 {{
+                crate::mini_core::option::Option::Some(v) => crate::mini_core::fmt::Display::fmt(v, f),
+                crate::mini_core::option::Option::None => f.write_str("none"),
+            }}
+        }}
+    }}
+    impl<T: crate::mini_core::error::Error + 'static> crate::mini_core::error::Error for Option<T> {{
+        fn source(&self) -> crate::mini_core::option::Option<&(dyn crate::mini_core::error::Error + 'static)> {{
+            match self.0.as_ref() {{
+                crate::mini_core::option::Option::Some(e) => crate::mini_core::option::Option::Some(e as &(dyn crate::mini_core::error::Error + 'static)),
+                crate::mini_core::option::Option::None => crate::mini_core::option::Option::None,
+            }}
+        }}
+    }}
+    pub struct CustomOptErr {{ pub source: Option<super::IoErr> }}
+    {custom_opt_impl}
+    pub enum CustomOptEnum {{ Wrapped(Option<super::IoErr>) }}
+    {custom_opt_enum_impl}
+    pub struct TransCustomOpt(pub Option<super::IoErr>);
+    {trans_custom_impl}
+    pub struct NestedCustomOpt {{ pub source: super::Option<Option<super::IoErr>> }}
+    {nested_custom_impl}
+}}
+
+pub mod qpath_and_macro {{
+    use crate::mini_core::option::Option;
+    pub trait Factory {{
+        type Option<T>;
+    }}
+    pub struct Provider;
+    impl Factory for Provider {{
+        type Option<T> = Option<T>;
+    }}
+    pub struct LitProvider<const C: char>;
+    impl Factory for LitProvider<'>'> {{
+        type Option<T> = Option<T>;
+    }}
+    pub struct QPathOptErr {{ pub source: <Provider as Factory>::Option<super::IoErr> }}
+    {qpath_impl}
+    pub struct LitQPathOptErr {{ pub source: <LitProvider<'>'> as Factory>::Option<super::IoErr> }}
+    {lit_qpath_impl}
+    macro_rules! error_ty {{
+        ($t:ty, $_ignored:ty) => {{ $t }};
+    }}
+    pub struct BracedMacroOptErr {{ pub source: Option<error_ty! {{ super::IoErr, () }}> }}
+    {braced_macro_impl}
+}}
+
+pub mod const_opt {{
+    pub struct Option<const N: usize>;
+    impl<const N: usize> crate::mini_core::fmt::Display for Option<N> {{
+        fn fmt(&self, f: &mut crate::mini_core::fmt::Formatter<'_>) -> crate::mini_core::fmt::Result {{ f.write_str("const-opt") }}
+    }}
+    impl<const N: usize> crate::mini_core::error::Error for Option<N> {{}}
+    pub struct ConstOptErr {{ pub source: Option<3> }}
+    {const_opt_impl}
+}}
+
+pub fn exercise(leaf: &'static IoErr) {{
+    use crate::mini_core::convert::From as _;
+    use crate::mini_core::error::Error as _;
+    let _ = FromOptNamed::from(IoErr).source();
+    let _ = FromOptTuple::from(IoErr).source();
+    let _ = FromOptEnum::from(IoErr).source();
+    let _ = FromOptEnum::from(FmtErr).source();
+    let _ = RefSourceErr {{ source: leaf }}.source();
+    let _ = OptRefSourceErr {{ source: Option::Some(leaf) }}.source();
+    let _ = FromOptRefErr::from(leaf).source();
+    let _ = const_opt::ConstOptErr::from(const_opt::Option::<3>).source();
+}}
+"#
+    );
+    let (said, codes, notes) = check_text(&clean);
     assert!(
         error_lines(&said).is_empty() && !said.contains("NOT checked"),
-        "expected 0 errors and complete typecheck for unwrapped Option<E> source (codes={codes:?}, notes={notes:?}):\n{said}"
+        "expected 0 errors and complete front2 check for all comptime-expanded thiserror Option shapes (codes={codes:?}, notes={notes:?}):\n{said}\n--- SOURCE ---\n{clean}"
     );
 
     // Negative control: casting `&Opt<IoErr>` directly to `&(dyn Error + 'static)` fails E0605.
