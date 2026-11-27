@@ -4,9 +4,12 @@
 //!   - [`serve_http`]: Smart HTTP/1.1 server speaking Git Protocol v2 (`upload-pack`) and v1
 //!     (`receive-pack`). Compatible directly with `git clone`, `git fetch`, `git push`, `git ls-remote`.
 //!   - [`serve_stdio`]: Bidirectional stdio transport (`upload-pack` v2 or `receive-pack` v1).
-//! - **Client**:
-//!   - [`http_ls_remote`], [`http_clone`], [`http_fetch`], [`http_push`]: Smart HTTP/1.1 client
-//!     talking to `bgit serve --http` or any standard Git Smart HTTP server!
+//! - **Client (Fastest GitHub & Git wire transports)**:
+//!   - **HTTPS / TLS 1.3 + HTTP/2 (`blaze-h2`, ALPN `h2`) + persistent Keep-Alive** speaking Git
+//!     Protocol v2 (`Git-Protocol: version=2`, `thin-pack`, `ofs-delta`, `--depth`, `--filter=blob:none`).
+//!   - **Native SSH (`git@github.com:org/repo.git` & `ssh://...`)** speaking Git Protocol v2
+//!     (`GIT_PROTOCOL=version=2`) over a single persistent stdio session.
+//!   - **Plain HTTP/1.1** (`http://...`) for local `bgit serve --http` / LAN servers.
 
 use std::{
     io::{self, Read as _, Write},
@@ -18,14 +21,17 @@ use blaze_git::{
     pack_write::PackWriteOpts,
     storage::{ObjectStore, RefStore, RefTarget, RefUpdate, ZERO_OID},
     wire::{
-        HttpParse, ReceivePackServer, Transport, UploadPackServer, WireClient, WireLimits,
-        handle_smart_http, parse_http_request,
+        HttpParse, ReceivePackServer, RemoteRef, Transport, UploadPackServer, WireClient,
+        WireLimits, handle_smart_http, parse_http_request,
     },
 };
 use blaze_git_fetch::{Kind as ObjectKind, Oid, store::Commit};
-use blaze_own::{Alloc, String as OwnString, Vec as OwnVec};
+use blaze_own::{AVec, Alloc, String as OwnString, Vec as OwnVec};
 
-use crate::disk::{BgitDiskStore, materialize_tree, open_or_infect};
+use crate::{
+    disk::{BgitDiskStore, materialize_tree, open_or_infect},
+    remote_transport::{RemoteUrl, SmartHttpSession, SshSession, parse_remote_url},
+};
 
 /// Serves `repo_root` (`.bgit`, auto-infecting `.git` if needed) over Git Smart HTTP on `bind_addr`.
 pub(crate) fn serve_http<'a>(bind_addr: &str, repo_root: &Path, alloc: Alloc<'a>) -> io::Result<()> {
@@ -68,7 +74,7 @@ fn handle_http_conn<'a>(
                 buf.extend_from_slice(&chunk[..n]);
             }
             Err(e) => {
-                let msg = format!("HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\nConnection: close\r\n\r\nbad request\n");
+                let msg = "HTTP/1.1 400 Bad Request\r\nContent-Length: 12\r\nConnection: close\r\n\r\nbad request\n";
                 let _ = stream.write_all(msg.as_bytes());
                 return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{e}")));
             }
@@ -223,166 +229,178 @@ fn read_pkt_request(r: &mut impl io::Read) -> io::Result<Option<Vec<u8>>> {
 }
 
 // ---------------------------------------------------------------------------
-// Smart HTTP/1.1 Client
+// Unified Protocol v2 Client (`https://` HTTP/2+TLS1.3, `http://`, `ssh://`/`git@`)
 // ---------------------------------------------------------------------------
 
-struct ParsedHttpUrl<'u> {
-    host_port: &'u str,
-    base_path: &'u str,
+/// Options for shallow (`--depth N`) and partial (`--filter=blob:none`) Git Protocol v2 fetches.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct FetchParams<'f> {
+    pub depth: Option<u32>,
+    pub filter: Option<&'f str>,
 }
 
-fn parse_http_url(url: &str) -> io::Result<ParsedHttpUrl<'_>> {
-    let rest = url.strip_prefix("http://").ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("only http:// URLs are supported directly by bgit client (got {url})"),
-        )
-    })?;
-    let (host_port, base_path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], rest[idx..].trim_end_matches('/')),
-        None => (rest, ""),
-    };
-    Ok(ParsedHttpUrl { host_port, base_path })
+enum UploadPackClient {
+    Http(SmartHttpSession),
+    Ssh(SshSession),
 }
 
-fn http_exchange(
-    host_port: &str,
-    method: &str,
-    path_and_query: &str,
-    content_type: Option<&str>,
-    git_v2: bool,
-    body: &[u8],
-) -> io::Result<Vec<u8>> {
-    let mut stream = TcpStream::connect(host_port)?;
-    let mut req = Vec::with_capacity(256 + body.len());
-    write!(req, "{method} {path_and_query} HTTP/1.1\r\nHost: {host_port}\r\nUser-Agent: blaze-git/1\r\nConnection: close\r\n")?;
-    if git_v2 {
-        req.extend_from_slice(b"Git-Protocol: version=2\r\n");
+impl UploadPackClient {
+    fn open(url: &str) -> io::Result<Self> {
+        match parse_remote_url(url)? {
+            RemoteUrl::Http(target) => {
+                let mut sess = SmartHttpSession::new(target);
+                let advert = sess.exchange(
+                    "GET",
+                    "/info/refs?service=git-upload-pack",
+                    None,
+                    true,
+                    b"",
+                )?;
+                blaze_git_fetch::check_advertisement(&advert).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("bad v2 advert: {e:?}"))
+                })?;
+                Ok(UploadPackClient::Http(sess))
+            }
+            RemoteUrl::Ssh(target) => {
+                let mut ssh = SshSession::connect(&target, "git-upload-pack", true)?;
+                let advert = ssh.read_pkt_until_flush()?;
+                blaze_git_fetch::check_advertisement(&advert).map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("bad ssh v2 advert: {e:?}"))
+                })?;
+                Ok(UploadPackClient::Ssh(ssh))
+            }
+        }
     }
-    if let Some(ct) = content_type {
-        write!(req, "Content-Type: {ct}\r\n")?;
-    }
-    if !body.is_empty() || method == "POST" {
-        write!(req, "Content-Length: {}\r\n", body.len())?;
-    }
-    req.extend_from_slice(b"\r\n");
-    req.extend_from_slice(body);
-    stream.write_all(&req)?;
-    stream.flush()?;
 
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
-    let hdr_end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed HTTP response"))?;
-    let head = core::str::from_utf8(&raw[..hdr_end])
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-utf8 HTTP response head"))?;
-    let status_line = head.lines().next().unwrap_or("");
-    if !status_line.contains(" 200 ") {
-        return Err(io::Error::other(format!("HTTP server returned: {status_line}")));
+    fn proto_label(&self) -> &'static str {
+        match self {
+            UploadPackClient::Http(s) => s.proto_label(),
+            UploadPackClient::Ssh(_) => "ssh+git-v2",
+        }
     }
-    let is_chunked = head
-        .lines()
-        .any(|l| l.to_ascii_lowercase().starts_with("transfer-encoding:") && l.to_ascii_lowercase().contains("chunked"));
-    let body_raw = &raw[hdr_end + 4..];
-    if !is_chunked {
-        return Ok(body_raw.to_vec());
-    }
-    // Decode chunked HTTP response body.
-    let mut decoded = Vec::new();
-    let mut pos = 0usize;
-    while pos < body_raw.len() {
-        let Some(crlf) = body_raw[pos..].windows(2).position(|w| w == b"\r\n") else {
-            break;
+
+    fn ls_refs<'a>(&mut self, prefixes: &[&str], alloc: Alloc<'a>) -> io::Result<AVec<'a, RemoteRef<'a>>> {
+        let mut req = OwnVec::new_in(alloc);
+        WireClient::encode_ls_refs(prefixes, &mut req)
+            .map_err(|e| io::Error::other(format!("{e}")))?;
+        let resp = match self {
+            UploadPackClient::Http(sess) => sess.exchange(
+                "POST",
+                "/git-upload-pack",
+                Some("application/x-git-upload-pack-request"),
+                true,
+                &req,
+            )?,
+            UploadPackClient::Ssh(ssh) => {
+                ssh.write_all(&req)?;
+                ssh.read_pkt_until_flush()?
+            }
         };
-        let len_s = core::str::from_utf8(&body_raw[pos..pos + crlf])
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk len"))?;
-        let n = usize::from_str_radix(len_s.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad chunk hex"))?;
-        pos += crlf + 2;
-        if n == 0 {
-            break;
-        }
-        if pos + n > body_raw.len() {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "truncated chunk"));
-        }
-        decoded.extend_from_slice(&body_raw[pos..pos + n]);
-        pos += n + 2;
+        WireClient::parse_ls_refs(&resp, alloc)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("ls-refs parse: {e}")))
     }
-    Ok(decoded)
+
+    fn fetch_into_store<'a>(
+        &mut self,
+        wants: &[Oid],
+        haves: &[Oid],
+        params: FetchParams<'_>,
+        store: &mut BgitDiskStore<'a>,
+        alloc: Alloc<'a>,
+    ) -> io::Result<u32> {
+        if wants.is_empty() {
+            return Ok(0);
+        }
+        let mut fetch_req = OwnVec::new_in(alloc);
+        // Use `thin-pack` when we already have base objects (`!haves.is_empty()`), or always on
+        // remote fetches? `unpack_pack_into_store` resolves OFS/REF deltas against `store`, so
+        // `thin-pack` works whenever `haves` exist in `store`!
+        let thin_pack = !haves.is_empty();
+        WireClient::encode_fetch_with_opts(
+            wants,
+            haves,
+            params.depth,
+            params.filter,
+            thin_pack,
+            &mut fetch_req,
+        )
+        .map_err(|e| io::Error::other(format!("{e}")))?;
+        let resp = match self {
+            UploadPackClient::Http(sess) => sess.exchange(
+                "POST",
+                "/git-upload-pack",
+                Some("application/x-git-upload-pack-request"),
+                true,
+                &fetch_req,
+            )?,
+            UploadPackClient::Ssh(ssh) => {
+                ssh.write_all(&fetch_req)?;
+                ssh.read_pkt_until_flush()?
+            }
+        };
+        let stats = WireClient::parse_fetch_and_unpack(&resp, store, WireLimits::SHIPPED, alloc)
+            .map_err(|e| io::Error::other(format!("fetch unpack: {e}")))?;
+        Ok(stats.objects_unpacked)
+    }
+
+    fn close(self) -> io::Result<()> {
+        match self {
+            UploadPackClient::Http(_) => Ok(()),
+            UploadPackClient::Ssh(ssh) => ssh.finish(true),
+        }
+    }
 }
 
-/// Lists remote refs over Git Protocol v2 Smart HTTP.
-pub(crate) fn http_ls_remote<'a>(
+/// Lists remote refs over Git Protocol v2 (`https://` HTTP/2+TLS1.3, `http://`, `ssh://`/`git@`).
+pub(crate) fn remote_ls_remote<'a>(
     url: &str,
     alloc: Alloc<'a>,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    let parsed = parse_http_url(url)?;
-    let info_path = format!("{}/info/refs?service=git-upload-pack", parsed.base_path);
-    let advert = http_exchange(parsed.host_port, "GET", &info_path, None, true, b"")?;
-    blaze_git_fetch::check_advertisement(&advert)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad v2 advert: {e:?}")))?;
-
-    let mut req = OwnVec::new_in(alloc);
-    WireClient::encode_ls_refs(&[], &mut req).map_err(|e| io::Error::other(format!("{e}")))?;
-    let up_path = format!("{}/git-upload-pack", parsed.base_path);
-    let resp = http_exchange(
-        parsed.host_port,
-        "POST",
-        &up_path,
-        Some("application/x-git-upload-pack-request"),
-        true,
-        &req,
-    )?;
-    let refs = WireClient::parse_ls_refs(&resp, alloc)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
-    for r in refs {
+    let mut client = UploadPackClient::open(url)?;
+    let refs = client.ls_refs(&[], alloc)?;
+    for r in &refs {
         match r.oid {
             Some(oid) => writeln!(out, "{oid}\t{}", r.name.as_str())?,
             None => writeln!(out, "unborn\t{}", r.name.as_str())?,
         }
     }
-    Ok(())
+    client.close()
 }
 
-/// Clones a remote Git repository over Smart HTTP v2 directly into a native `.bgit` store
-/// (and optionally checks out the working tree; pass `checkout = false` for lazy `--vfs` clones).
-pub(crate) fn http_clone<'a>(
+/// Clones a remote Git repository via Protocol v2 (HTTP/2+TLS 1.3 or SSH) into a native `.bgit`
+/// store (and optionally checks out the working tree; pass `checkout = false` for lazy `--vfs`).
+pub(crate) fn remote_clone<'a>(
     url: &str,
     dest_dir: &Path,
     checkout: bool,
+    params: FetchParams<'_>,
     alloc: Alloc<'a>,
     out: &mut dyn Write,
 ) -> io::Result<()> {
-    let parsed = parse_http_url(url)?;
-    let info_path = format!("{}/info/refs?service=git-upload-pack", parsed.base_path);
-    let advert = http_exchange(parsed.host_port, "GET", &info_path, None, true, b"")?;
-    blaze_git_fetch::check_advertisement(&advert)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad v2 advert: {e:?}")))?;
-
-    let mut ls_req = OwnVec::new_in(alloc);
-    WireClient::encode_ls_refs(&[], &mut ls_req).map_err(|e| io::Error::other(format!("{e}")))?;
-    let up_path = format!("{}/git-upload-pack", parsed.base_path);
-    let ls_resp = http_exchange(
-        parsed.host_port,
-        "POST",
-        &up_path,
-        Some("application/x-git-upload-pack-request"),
-        true,
-        &ls_req,
-    )?;
-    let remote_refs = WireClient::parse_ls_refs(&ls_resp, alloc)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+    let mut client = UploadPackClient::open(url)?;
+    let proto = client.proto_label();
+    // On shallow/filtered clones from huge GitHub repos, prefer fetching `HEAD` + `refs/heads/` + `refs/tags/`
+    // (avoiding thousands of GitHub `refs/pull/*` refs that bloat clones 10x!).
+    let prefixes: &[&str] = if params.depth.is_some() || params.filter.is_some() {
+        &["HEAD", "refs/heads/", "refs/tags/"]
+    } else {
+        &[]
+    };
+    let remote_refs = client.ls_refs(prefixes, alloc)?;
 
     let mut wants = OwnVec::new_in(alloc);
     let mut head_sym: Option<String> = None;
     let mut head_oid: Option<Oid> = None;
     for r in &remote_refs {
-        if r.name.as_str() == "HEAD" {
+        let name = r.name.as_str();
+        if name == "HEAD" {
             head_oid = r.oid;
             head_sym = r.symref_target.as_ref().map(|s| s.as_str().to_string());
+        }
+        // Skip GitHub's internal `refs/pull/*` refs on clone (matching `git clone`!).
+        if name.starts_with("refs/pull/") {
+            continue;
         }
         if let Some(oid) = r.oid
             && !wants.iter().any(|w| *w == oid)
@@ -392,38 +410,28 @@ pub(crate) fn http_clone<'a>(
     }
 
     let mut store = BgitDiskStore::init(dest_dir, alloc)?;
-    let mut unpacked_count = 0u32;
-    if !wants.is_empty() {
-        let mut fetch_req = OwnVec::new_in(alloc);
-        WireClient::encode_fetch(&wants, &[], None, &mut fetch_req)
-            .map_err(|e| io::Error::other(format!("{e}")))?;
-        let fetch_resp = http_exchange(
-            parsed.host_port,
-            "POST",
-            &up_path,
-            Some("application/x-git-upload-pack-request"),
-            true,
-            &fetch_req,
-        )?;
-        let stats = WireClient::parse_fetch_and_unpack(
-            &fetch_resp,
-            &mut store,
-            WireLimits::SHIPPED,
-            alloc,
-        )
-        .map_err(|e| io::Error::other(format!("fetch unpack: {e}")))?;
-        unpacked_count = stats.objects_unpacked;
-    }
+    let unpacked_count = client.fetch_into_store(&wants, &[], params, &mut store, alloc)?;
+    client.close()?;
 
-    // Apply refs & HEAD locally.
+    // Apply local branch/tag refs & HEAD, plus `refs/remotes/origin/*` tracking refs!
     let mut updates = OwnVec::new_in(alloc);
     for r in &remote_refs {
-        if r.name.as_str() == "HEAD" {
+        let name = r.name.as_str();
+        if name == "HEAD" || name.starts_with("refs/pull/") {
             continue;
         }
-        if let Some(oid) = r.oid {
+        let Some(oid) = r.oid else {
+            continue;
+        };
+        updates.push(RefUpdate {
+            name: OwnString::from_str_in(name, alloc),
+            old: None,
+            new: oid,
+        });
+        if let Some(branch) = name.strip_prefix("refs/heads/") {
+            let remote_ref = format!("refs/remotes/origin/{branch}");
             updates.push(RefUpdate {
-                name: OwnString::from_str_in(r.name.as_str(), alloc),
+                name: OwnString::from_str_in(&remote_ref, alloc),
                 old: None,
                 new: oid,
             });
@@ -443,9 +451,10 @@ pub(crate) fn http_clone<'a>(
     }
     store.flush()?;
 
-    // Materialize HEAD commit tree into `dest_dir` unless `--vfs` lazy checkout was requested.
+    // Materialize HEAD commit tree & populate `.bgit/index` unless `--vfs` or `--filter=blob:none`.
     let mut checked_out = 0u32;
-    if checkout && let Some(tip) = head_oid {
+    let is_blobless = params.filter.is_some_and(|f| f.contains("blob:none"));
+    if checkout && !is_blobless && let Some(tip) = head_oid {
         let mut buf = OwnVec::new_in(alloc);
         if store
             .read_object(&tip, &mut buf)
@@ -454,55 +463,45 @@ pub(crate) fn http_clone<'a>(
             && let Ok(c) = Commit::parse(&buf)
         {
             checked_out = materialize_tree(&store, c.tree, dest_dir, alloc)?;
+            if let Ok(flat) = crate::index_io::flatten_tree(&store, c.tree, alloc) {
+                let idx = crate::index_io::index_from_flat_tree(dest_dir, &flat);
+                let _ = crate::index_io::write_index(dest_dir, &idx);
+            }
         }
     }
 
-    writeln!(
-        out,
-        "cloned {} into {} (objects={}, refs={}, files={})",
-        url,
-        dest_dir.display(),
-        unpacked_count,
-        remote_refs.len(),
-        checked_out
-    )?;
-    // Record `origin` URL in `.bgit/config` so subsequent `bgit fetch` / `bgit pull` / `bgit push`
-    // work out of the box with no arguments.
+    // Record `origin` URL in `.bgit/config` so `bgit fetch` / `bgit pull` / `bgit push` work immediately.
     let cfg_path = crate::index_io::GitConfig::config_path_for(dest_dir);
     let mut cfg = crate::index_io::GitConfig::load_file(&cfg_path);
     let _ = cfg.set("remote.origin.url", url);
     let _ = cfg.save_file(&cfg_path);
+
+    writeln!(
+        out,
+        "cloned {} into {} (proto={}, objects={}, refs={}, files={})",
+        url,
+        dest_dir.display(),
+        proto,
+        unpacked_count,
+        remote_refs.len(),
+        checked_out
+    )?;
     Ok(())
 }
 
-/// Fetches refs and missing objects from a remote Git Smart HTTP server into `repo_root`,
-/// updating `refs/remotes/<remote_name>/*` (and mirroring objects/refs to `.git` if present).
-pub(crate) fn http_fetch<'a>(
+/// Fetches refs and missing objects over Protocol v2 (HTTP/2+TLS 1.3 or SSH) into `repo_root`,
+/// updating `refs/remotes/<remote_name>/*` and mirroring to sibling `.git` if present.
+pub(crate) fn remote_fetch<'a>(
     url: &str,
     remote_name: &str,
     repo_root: &Path,
+    params: FetchParams<'_>,
     alloc: Alloc<'a>,
     out: &mut dyn Write,
 ) -> io::Result<u32> {
-    let parsed = parse_http_url(url)?;
-    let info_path = format!("{}/info/refs?service=git-upload-pack", parsed.base_path);
-    let advert = http_exchange(parsed.host_port, "GET", &info_path, None, true, b"")?;
-    blaze_git_fetch::check_advertisement(&advert)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad v2 advert: {e:?}")))?;
-
-    let mut ls_req = OwnVec::new_in(alloc);
-    WireClient::encode_ls_refs(&[], &mut ls_req).map_err(|e| io::Error::other(format!("{e}")))?;
-    let up_path = format!("{}/git-upload-pack", parsed.base_path);
-    let ls_resp = http_exchange(
-        parsed.host_port,
-        "POST",
-        &up_path,
-        Some("application/x-git-upload-pack-request"),
-        true,
-        &ls_req,
-    )?;
-    let remote_refs = WireClient::parse_ls_refs(&ls_resp, alloc)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+    let mut client = UploadPackClient::open(url)?;
+    let proto = client.proto_label();
+    let remote_refs = client.ls_refs(&["refs/heads/", "refs/tags/"], alloc)?;
 
     let mut store = open_or_infect(repo_root, alloc)?;
     let mut wants = OwnVec::new_in(alloc);
@@ -510,7 +509,7 @@ pub(crate) fn http_fetch<'a>(
 
     let mut local_refs = OwnVec::new_in(alloc);
     store
-        .list_refs("", alloc, &mut local_refs)
+        .list_refs("refs/", alloc, &mut local_refs)
         .map_err(|e| io::Error::other(format!("{e}")))?;
     for lr in &local_refs {
         if let RefTarget::Direct(o) = lr.target
@@ -529,28 +528,8 @@ pub(crate) fn http_fetch<'a>(
         }
     }
 
-    let mut unpacked_count = 0u32;
-    if !wants.is_empty() {
-        let mut fetch_req = OwnVec::new_in(alloc);
-        WireClient::encode_fetch(&wants, &haves, None, &mut fetch_req)
-            .map_err(|e| io::Error::other(format!("{e}")))?;
-        let fetch_resp = http_exchange(
-            parsed.host_port,
-            "POST",
-            &up_path,
-            Some("application/x-git-upload-pack-request"),
-            true,
-            &fetch_req,
-        )?;
-        let stats = WireClient::parse_fetch_and_unpack(
-            &fetch_resp,
-            &mut store,
-            WireLimits::SHIPPED,
-            alloc,
-        )
-        .map_err(|e| io::Error::other(format!("fetch unpack: {e}")))?;
-        unpacked_count = stats.objects_unpacked;
-    }
+    let unpacked_count = client.fetch_into_store(&wants, &haves, params, &mut store, alloc)?;
+    client.close()?;
 
     let mut updates = OwnVec::new_in(alloc);
     let mut mirrored: Vec<(String, Oid)> = Vec::new();
@@ -584,14 +563,14 @@ pub(crate) fn http_fetch<'a>(
 
     writeln!(
         out,
-        "From {url}\n * fetched {unpacked_count} object(s), updated {} ref(s)",
+        "From {url} (proto={proto})\n * fetched {unpacked_count} object(s), updated {} ref(s)",
         mirrored.len()
     )?;
     Ok(unpacked_count)
 }
 
-/// Pushes a local ref from `repo_root` to a remote Git Smart HTTP server (`git-receive-pack`).
-pub(crate) fn http_push<'a>(
+/// Pushes a local ref from `repo_root` to a remote over HTTP/2+TLS 1.3, HTTP/1.1, or SSH (`git-receive-pack`).
+pub(crate) fn remote_push<'a>(
     url: &str,
     repo_root: &Path,
     ref_name: &str,
@@ -609,55 +588,116 @@ pub(crate) fn http_push<'a>(
         .map_err(|e| io::Error::other(format!("{e}")))?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("local ref `{full_ref}` not found")))?;
 
-    let parsed = parse_http_url(url)?;
-    let info_path = format!("{}/info/refs?service=git-receive-pack", parsed.base_path);
-    let advert_bytes = http_exchange(parsed.host_port, "GET", &info_path, None, false, b"")?;
-    let advert = WireClient::parse_receive_pack_advert(&advert_bytes, alloc)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+    match parse_remote_url(url)? {
+        RemoteUrl::Http(target) => {
+            let mut sess = SmartHttpSession::new(target);
+            let advert_bytes = sess.exchange(
+                "GET",
+                "/info/refs?service=git-receive-pack",
+                None,
+                false,
+                b"",
+            )?;
+            let advert = WireClient::parse_receive_pack_advert(&advert_bytes, alloc)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
 
-    let remote_old = advert
-        .refs
-        .iter()
-        .find(|r| r.name.as_str() == full_ref)
-        .and_then(|r| r.oid)
-        .unwrap_or(ZERO_OID);
+            let remote_old = advert
+                .refs
+                .iter()
+                .find(|r| r.name.as_str() == full_ref)
+                .and_then(|r| r.oid)
+                .unwrap_or(ZERO_OID);
+            if remote_old == local_oid {
+                writeln!(out, "Everything up-to-date ({full_ref} @ {local_oid})")?;
+                return Ok(());
+            }
 
-    if remote_old == local_oid {
-        writeln!(out, "Everything up-to-date ({full_ref} @ {local_oid})")?;
-        return Ok(());
+            let updates = [RefUpdate {
+                name: OwnString::from_str_in(&full_ref, alloc),
+                old: Some(remote_old),
+                new: local_oid,
+            }];
+            let mut push_req = OwnVec::new_in(alloc);
+            WireClient::encode_push_request(
+                &store,
+                &advert,
+                &updates,
+                true,
+                WireLimits::SHIPPED,
+                PackWriteOpts::FAST,
+                alloc,
+                &mut push_req,
+            )
+            .map_err(|e| io::Error::other(format!("encode push: {e}")))?;
+
+            let push_resp = sess.exchange(
+                "POST",
+                "/git-receive-pack",
+                Some("application/x-git-receive-pack-request"),
+                false,
+                &push_req,
+            )?;
+            report_push_result(&push_resp, advert.sideband_64k, remote_old, local_oid, alloc, out)
+        }
+        RemoteUrl::Ssh(target) => {
+            let mut ssh = SshSession::connect(&target, "git-receive-pack", false)?;
+            let advert_bytes = ssh.read_pkt_until_flush()?;
+            let advert = WireClient::parse_receive_pack_advert(&advert_bytes, alloc)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
+
+            let remote_old = advert
+                .refs
+                .iter()
+                .find(|r| r.name.as_str() == full_ref)
+                .and_then(|r| r.oid)
+                .unwrap_or(ZERO_OID);
+            if remote_old == local_oid {
+                ssh.finish(true)?;
+                writeln!(out, "Everything up-to-date ({full_ref} @ {local_oid})")?;
+                return Ok(());
+            }
+
+            let updates = [RefUpdate {
+                name: OwnString::from_str_in(&full_ref, alloc),
+                old: Some(remote_old),
+                new: local_oid,
+            }];
+            let mut push_req = OwnVec::new_in(alloc);
+            WireClient::encode_push_request(
+                &store,
+                &advert,
+                &updates,
+                true,
+                WireLimits::SHIPPED,
+                PackWriteOpts::FAST,
+                alloc,
+                &mut push_req,
+            )
+            .map_err(|e| io::Error::other(format!("encode push: {e}")))?;
+
+            ssh.write_all(&push_req)?;
+            let push_resp = ssh.read_to_end()?;
+            ssh.finish(false)?;
+            report_push_result(&push_resp, advert.sideband_64k, remote_old, local_oid, alloc, out)
+        }
     }
+}
 
-    let updates = [RefUpdate {
-        name: OwnString::from_str_in(&full_ref, alloc),
-        old: Some(remote_old),
-        new: local_oid,
-    }];
-    let mut push_req = OwnVec::new_in(alloc);
-    WireClient::encode_push_request(
-        &store,
-        &advert,
-        &updates,
-        true,
-        WireLimits::SHIPPED,
-        PackWriteOpts::FAST,
-        alloc,
-        &mut push_req,
-    )
-    .map_err(|e| io::Error::other(format!("encode push: {e}")))?;
-
-    let rp_path = format!("{}/git-receive-pack", parsed.base_path);
-    let push_resp = http_exchange(
-        parsed.host_port,
-        "POST",
-        &rp_path,
-        Some("application/x-git-receive-pack-request"),
-        false,
-        &push_req,
-    )?;
-    let report = WireClient::parse_push_response(&push_resp, advert.sideband_64k, alloc)
+fn report_push_result<'a>(
+    push_resp: &[u8],
+    sideband_64k: bool,
+    remote_old: Oid,
+    local_oid: Oid,
+    alloc: Alloc<'a>,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    let report = WireClient::parse_push_response(push_resp, sideband_64k, alloc)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?;
     if !report.unpack_ok {
-        return Err(io::Error::other(format!("remote unpack failed: {}", report.unpack_message.as_str())));
+        return Err(io::Error::other(format!(
+            "remote unpack failed: {}",
+            report.unpack_message.as_str()
+        )));
     }
     for r in &report.refs {
         if r.ok {

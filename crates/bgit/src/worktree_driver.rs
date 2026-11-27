@@ -1089,17 +1089,17 @@ pub(crate) fn refresh_bgit_if_git_refs_newer<'a>(
     force_refresh: bool,
     alloc: Alloc<'a>,
 ) -> io::Result<()> {
-    let dot_git = repo_dir.join(".git");
-    if !dot_git.is_dir() {
+    let Some(common_git) = resolve_common_git_dir(repo_dir) else {
         return Ok(());
-    }
+    };
     let should_refresh = if force_refresh {
         true
     } else {
         let bgref = repo_dir.join(".bgit/refs.bgref");
         let bg_mtime = fs::metadata(&bgref).and_then(|m| m.modified()).ok();
-        let git_latest = newest_git_ref_mtime(&dot_git);
-        matches!((bg_mtime, git_latest), (Some(bm), Some(gm)) if gm >= bm)
+        let wt_git = crate::disk::locate_git_dir(repo_dir).ok();
+        let git_latest = newest_git_ref_mtime(wt_git.as_deref().unwrap_or(&common_git), &common_git);
+        matches!((bg_mtime, git_latest), (Some(bm), Some(gm)) if gm > bm)
     };
     if should_refresh {
         let _ = infect_repo_on_disk(repo_dir, SlabCompression::AutoZstd, alloc)?;
@@ -1107,27 +1107,41 @@ pub(crate) fn refresh_bgit_if_git_refs_newer<'a>(
     Ok(())
 }
 
-fn newest_git_ref_mtime(git_dir: &Path) -> Option<SystemTime> {
+/// O(1) freshness check: stats `HEAD`, `logs/HEAD`, `packed-refs`, the active HEAD branch ref,
+/// and top-level `refs/*` directories (Git atomic lock+rename always bumps parent dir mtime,
+/// avoiding O(N_refs) recursive stat walks on 5,000+-branch monorepos!).
+fn newest_git_ref_mtime(wt_git_dir: &Path, common_git_dir: &Path) -> Option<SystemTime> {
     let mut newest: Option<SystemTime> = None;
     let mut bump = |p: &Path| {
         if let Ok(t) = fs::metadata(p).and_then(|m| m.modified()) {
             newest = Some(newest.map_or(t, |cur| cur.max(t)));
         }
     };
-    bump(&git_dir.join("HEAD"));
-    bump(&git_dir.join("packed-refs"));
-    let mut stack = vec![git_dir.join("refs")];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&dir) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else {
-                bump(&p);
+    let head_path = wt_git_dir.join("HEAD");
+    bump(&head_path);
+    bump(&wt_git_dir.join("logs/HEAD"));
+    bump(&common_git_dir.join("packed-refs"));
+    bump(&common_git_dir.join("refs"));
+    bump(&common_git_dir.join("refs/heads"));
+    bump(&common_git_dir.join("refs/tags"));
+    bump(&common_git_dir.join("refs/remotes"));
+    // Also check active symbolic HEAD target ref file (e.g. `refs/heads/feat/foo` inside nested dir).
+    if let Ok(raw) = fs::read_to_string(&head_path)
+        && let Some(sym) = raw.trim().strip_prefix("ref:")
+    {
+        let sym = sym.trim();
+        if !sym.contains("..") {
+            let ref_p = common_git_dir.join(sym);
+            bump(&ref_p);
+            if let Some(parent) = ref_p.parent() {
+                bump(parent);
             }
+        }
+    }
+    // Check immediate remote subdirs (`refs/remotes/origin`, `refs/remotes/upstream`, …).
+    if let Ok(rd) = fs::read_dir(common_git_dir.join("refs/remotes")) {
+        for e in rd.flatten().take(32) {
+            bump(&e.path());
         }
     }
     newest

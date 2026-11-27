@@ -1163,3 +1163,119 @@ pub(crate) fn union_paths<'a>(
     }
     set
 }
+
+/// Checks whether a working-tree file matches its Git index stat-cache entry without reading disk bytes.
+pub(crate) fn index_entry_stat_clean(repo_root: &Path, e: &WritableIndexEntry) -> bool {
+    let Ok(meta) = fs::symlink_metadata(repo_root.join(&e.path)) else {
+        return false;
+    };
+    let is_link = meta.file_type().is_symlink();
+    let mode_ok = if is_link {
+        e.mode == 0o120000
+    } else if meta.is_file() {
+        let exec = meta.permissions().mode() & 0o111 != 0;
+        (exec && e.mode == 0o100755) || (!exec && e.mode == 0o100644)
+    } else {
+        false
+    };
+    if !mode_ok {
+        return false;
+    }
+    (meta.mtime() as u32) == e.mtime_sec
+        && (meta.mtime_nsec() as u32) == e.mtime_nsec
+        && (meta.len() as u32) == e.file_size
+        && (e.ino == 0 || (meta.ino() as u32) == e.ino)
+}
+
+/// O(changed) recursive tree diff: skips any subtree whose OID is identical on both sides!
+/// Returns sorted `(repo_rel_path, old_entry, new_entry)` only for files that actually changed.
+pub(crate) fn diff_trees_changed<'a, S: ObjectStore<'a> + ?Sized>(
+    store: &S,
+    old_tree: Option<Oid>,
+    new_tree: Option<Oid>,
+    alloc: Alloc<'a>,
+) -> io::Result<Vec<(String, Option<(u32, Oid)>, Option<(u32, Oid)>)>> {
+    let mut out = Vec::new();
+    diff_trees_rec(store, old_tree, new_tree, "", alloc, &mut out)?;
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+fn read_tree_children<'a, S: ObjectStore<'a> + ?Sized>(
+    store: &S,
+    tree_oid: Option<Oid>,
+    alloc: Alloc<'a>,
+) -> io::Result<BTreeMap<String, (u32, Oid)>> {
+    let Some(oid) = tree_oid else {
+        return Ok(BTreeMap::new());
+    };
+    let mut buf = OwnVec::new_in(alloc);
+    let kind = store
+        .read_object(&oid, &mut buf)
+        .map_err(|e| io::Error::other(format!("{e}")))?;
+    if kind != Some(ObjectKind::Tree) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("object {oid} is not a tree"),
+        ));
+    }
+    let bytes = buf.as_slice().to_vec();
+    let mut iter = TreeIter::new(oid, &bytes);
+    let mut map = BTreeMap::new();
+    while let Some(entry) = iter
+        .next_entry()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e}")))?
+    {
+        if let Ok(name) = core::str::from_utf8(entry.name) {
+            map.insert(name.to_owned(), (entry.mode, entry.oid));
+        }
+    }
+    Ok(map)
+}
+
+fn diff_trees_rec<'a, S: ObjectStore<'a> + ?Sized>(
+    store: &S,
+    old_tree: Option<Oid>,
+    new_tree: Option<Oid>,
+    prefix: &str,
+    alloc: Alloc<'a>,
+    out: &mut Vec<(String, Option<(u32, Oid)>, Option<(u32, Oid)>)>,
+) -> io::Result<()> {
+    if old_tree == new_tree {
+        return Ok(());
+    }
+    let old_map = read_tree_children(store, old_tree, alloc)?;
+    let new_map = read_tree_children(store, new_tree, alloc)?;
+
+    for name in union_paths(&old_map, &new_map) {
+        let a = old_map.get(name).copied();
+        let b = new_map.get(name).copied();
+        if a == b {
+            continue;
+        }
+        let path = if prefix.is_empty() { name.to_owned() } else { format!("{prefix}/{name}") };
+        let a_dir = a.is_some_and(|(m, _)| m == 0o040000);
+        let b_dir = b.is_some_and(|(m, _)| m == 0o040000);
+        match (a_dir, b_dir) {
+            (true, true) => {
+                diff_trees_rec(store, a.map(|(_, o)| o), b.map(|(_, o)| o), &path, alloc, out)?;
+            }
+            (true, false) => {
+                diff_trees_rec(store, a.map(|(_, o)| o), None, &path, alloc, out)?;
+                if b.is_some() {
+                    out.push((path, None, b));
+                }
+            }
+            (false, true) => {
+                if a.is_some() {
+                    out.push((path.clone(), a, None));
+                }
+                diff_trees_rec(store, None, b.map(|(_, o)| o), &path, alloc, out)?;
+            }
+            (false, false) => {
+                out.push((path, a, b));
+            }
+        }
+    }
+    Ok(())
+}

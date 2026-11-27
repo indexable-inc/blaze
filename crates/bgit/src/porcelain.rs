@@ -28,12 +28,14 @@ use crate::{
     find_repo_root,
     index_io::{
         GitConfig, WritableIndexEntry, build_tree_from_index, build_tree_from_map,
-        checkout_tree_to_worktree, diff_line_stats, flatten_tree, format_unified_diff,
-        index_from_flat_tree, load_index, make_signature, path_matches_filters, prune_empty_parents,
-        read_commit_tree, read_worktree_blob, resolve_identity, stat_to_index_entry,
-        to_repo_relative, union_paths, walk_working_tree, write_blob_to_worktree, write_index,
+        checkout_tree_to_worktree, diff_line_stats, diff_trees_changed, flatten_tree,
+        format_unified_diff, index_entry_stat_clean, index_from_flat_tree, load_index,
+        make_signature, path_matches_filters, prune_empty_parents, read_commit_tree,
+        read_worktree_blob, resolve_identity, stat_to_index_entry, to_repo_relative, union_paths,
+        walk_working_tree, write_blob_to_worktree, write_index,
     },
-    net_driver::http_fetch,
+    net_driver::{FetchParams, remote_fetch},
+    remote_transport::looks_like_remote_url,
     worktree_driver::{on_branch_merged, refresh_bgit_if_git_refs_newer},
 };
 
@@ -853,13 +855,9 @@ pub(crate) fn cmd_commit<'a>(
         "detached HEAD".to_owned()
     };
 
-    // Compute compact diffstat for commit summary.
-    let old_flat = match prev_tree_oid {
-        Some(t) => flatten_tree(&store, t, alloc)?,
-        None => BTreeMap::new(),
-    };
-    let new_flat = flatten_tree(&store, tree_oid, alloc)?;
-    let (files_changed, ins, del) = summarize_tree_diff(&store, &old_flat, &new_flat, alloc)?;
+    // Compute O(changed) diffstat via subtree-skipping tree diff!
+    let changed = diff_trees_changed(&store, prev_tree_oid, Some(tree_oid), alloc)?;
+    let (files_changed, ins, del) = summarize_changed_entries(&store, &changed, alloc)?;
 
     let subject = msg.lines().next().unwrap_or("");
     let root_tag = if parents.is_empty() { " (root-commit)" } else { "" };
@@ -886,24 +884,16 @@ pub(crate) fn cmd_commit<'a>(
     Ok(())
 }
 
-fn summarize_tree_diff<'a>(
+fn summarize_changed_entries<'a>(
     store: &BgitDiskStore<'a>,
-    old_flat: &BTreeMap<String, (u32, Oid)>,
-    new_flat: &BTreeMap<String, (u32, Oid)>,
+    changed: &[(String, Option<(u32, Oid)>, Option<(u32, Oid)>)],
     alloc: Alloc<'a>,
 ) -> io::Result<(usize, usize, usize)> {
-    let mut changed = 0usize;
     let mut total_ins = 0usize;
     let mut total_del = 0usize;
-    for path in union_paths(old_flat, new_flat) {
-        let a = old_flat.get(path);
-        let b = new_flat.get(path);
-        if a == b {
-            continue;
-        }
-        changed += 1;
-        let old_b = a.and_then(|&(_, oid)| read_blob_bytes(store, oid, alloc).ok());
-        let new_b = b.and_then(|&(_, oid)| read_blob_bytes(store, oid, alloc).ok());
+    for (_, a, b) in changed {
+        let old_b = a.and_then(|(_, oid)| read_blob_bytes(store, oid, alloc).ok());
+        let new_b = b.and_then(|(_, oid)| read_blob_bytes(store, oid, alloc).ok());
         let (ins, del) = diff_line_stats(
             old_b.as_deref().unwrap_or(b""),
             new_b.as_deref().unwrap_or(b""),
@@ -911,12 +901,115 @@ fn summarize_tree_diff<'a>(
         total_ins += ins;
         total_del += del;
     }
-    Ok((changed, total_ins, total_del))
+    Ok((changed.len(), total_ins, total_del))
 }
 
 // ============================================================================
 // 5. `bgit diff` & 6. `bgit show`
 // ============================================================================
+
+/// Scans `index` entries against the working tree IN PARALLEL across CPU cores using the index
+/// stat cache (`mtime`, `size`, `ino`, `mode`), skipping stat-clean files with zero file reads!
+fn collect_dirty_worktree_entries<'a>(
+    repo_root: &Path,
+    index: &'a BTreeMap<String, WritableIndexEntry>,
+    filters: &[String],
+) -> Vec<(&'a WritableIndexEntry, Option<Vec<u8>>)> {
+    let candidates: Vec<&WritableIndexEntry> = index
+        .values()
+        .filter(|e| path_matches_filters(&e.path, filters))
+        .collect();
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    if candidates.len() < 128 || workers <= 1 {
+        let mut dirty = Vec::new();
+        for e in candidates {
+            if let Some(d) = check_worktree_entry_dirty(repo_root, e) {
+                dirty.push((e, d));
+            }
+        }
+        return dirty;
+    }
+    let chunk_sz = candidates.len().div_ceil(workers);
+    let chunks: Vec<&[&WritableIndexEntry]> = candidates.chunks(chunk_sz).collect();
+    let mut out = Vec::new();
+    std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            handles.push(s.spawn(move || {
+                let mut local = Vec::new();
+                for &e in chunk {
+                    if let Some(d) = check_worktree_entry_dirty(repo_root, e) {
+                        local.push((e, d));
+                    }
+                }
+                local
+            }));
+        }
+        for h in handles {
+            out.extend(h.join().expect("diff stat worker"));
+        }
+    });
+    out
+}
+
+/// Returns `None` if working-tree file is identical to index entry `e`, or `Some(Option<bytes>)`
+/// (`Some(None)` = deleted, `Some(Some(bytes))` = modified).
+fn check_worktree_entry_dirty(
+    repo_root: &Path,
+    e: &WritableIndexEntry,
+) -> Option<Option<Vec<u8>>> {
+    if index_entry_stat_clean(repo_root, e) {
+        return None;
+    }
+    let full = repo_root.join(&e.path);
+    if !full.exists() && !full.is_symlink() {
+        return Some(None);
+    }
+    let Ok((_, bytes)) = read_worktree_blob(&full) else {
+        return Some(None);
+    };
+    if Oid::of(ObjectKind::Blob, &bytes) == e.oid {
+        return None;
+    }
+    Some(Some(bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_diff_entry(
+    path: &str,
+    old_bytes: Option<&[u8]>,
+    new_bytes: Option<&[u8]>,
+    name_only: bool,
+    name_status: bool,
+    stat_only: bool,
+    use_color: bool,
+    stat_rows: &mut Vec<(String, usize, usize)>,
+    out: &mut dyn Write,
+) -> io::Result<()> {
+    if old_bytes == new_bytes {
+        return Ok(());
+    }
+    if name_only {
+        writeln!(out, "{path}")?;
+    } else if name_status {
+        let status = match (old_bytes, new_bytes) {
+            (None, Some(_)) => "A",
+            (Some(_), None) => "D",
+            _ => "M",
+        };
+        writeln!(out, "{status}\t{path}")?;
+    } else if stat_only {
+        let (ins, del) = diff_line_stats(old_bytes.unwrap_or(b""), new_bytes.unwrap_or(b""));
+        stat_rows.push((path.to_owned(), ins, del));
+    } else {
+        let patch = format_unified_diff(path, old_bytes, new_bytes, use_color);
+        write!(out, "{patch}")?;
+    }
+    Ok(())
+}
 
 pub(crate) fn cmd_diff<'a>(
     matches: &Matches<'_, Alloc<'a>>,
@@ -947,13 +1040,44 @@ pub(crate) fn cmd_diff<'a>(
         }
     }
 
-    enum Side {
-        Tree(BTreeMap<String, (u32, Oid)>),
-        Index(BTreeMap<String, WritableIndexEntry>),
-        Worktree(BTreeMap<String, WritableIndexEntry>),
+    let mut stat_rows: Vec<(String, usize, usize)> = Vec::new();
+
+    // Fast path 1: Working tree vs Index (`bgit diff` with no revs and not `--staged`).
+    // Uses parallel stat-cache check across cores — skips clean files with ZERO blob/file reads!
+    if revs.is_empty() && !staged {
+        let idx = load_index(&repo_root, alloc)?;
+        let dirty = collect_dirty_worktree_entries(&repo_root, &idx, &filters);
+        for (entry, new_opt) in dirty {
+            let old_opt = if name_only || name_status {
+                Some(Vec::new())
+            } else {
+                read_blob_bytes(&store, entry.oid, alloc).ok()
+            };
+            let new_ref = if (name_only || name_status) && new_opt.is_some() {
+                Some(b"x".as_slice())
+            } else {
+                new_opt.as_deref()
+            };
+            emit_diff_entry(
+                &entry.path,
+                old_opt.as_deref(),
+                new_ref,
+                name_only,
+                name_status,
+                stat_only,
+                use_color,
+                &mut stat_rows,
+                io.out,
+            )?;
+        }
+        if stat_only && !stat_rows.is_empty() {
+            write_diffstat(&stat_rows, use_color, io.out)?;
+        }
+        return Ok(());
     }
 
-    let (left, right) = if let Some(first) = revs.first()
+    // Fast path 2: Tree vs Tree (`A..B`, `A...B`, `A B`) via O(changed) subtree-skipping walk!
+    let tree_pair: Option<(Oid, Oid)> = if let Some(first) = revs.first()
         && first.contains("...")
     {
         let (a_s, b_s) = first.split_once("...").expect("checked");
@@ -969,9 +1093,7 @@ pub(crate) fn cmd_diff<'a>(
         let bases = find_merge_bases(&store, cg.as_ref(), a_oid, b_oid, MergeLimits::SHIPPED, alloc)
             .map_err(|e| io::Error::other(format!("{e}")))?;
         let base_oid = bases.first().copied().unwrap_or(a_oid);
-        let lt = flatten_tree(&store, read_commit_tree(&store, base_oid, alloc)?, alloc)?;
-        let rt = flatten_tree(&store, read_commit_tree(&store, b_oid, alloc)?, alloc)?;
-        (Side::Tree(lt), Side::Tree(rt))
+        Some((read_commit_tree(&store, base_oid, alloc)?, read_commit_tree(&store, b_oid, alloc)?))
     } else if let Some(first) = revs.first()
         && first.contains("..")
     {
@@ -984,9 +1106,7 @@ pub(crate) fn cmd_diff<'a>(
             .resolve_commit(if b_s.is_empty() { "HEAD" } else { b_s })
             .map_err(|e| io::Error::other(format!("{e}")))?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown rev `{b_s}`")))?;
-        let lt = flatten_tree(&store, read_commit_tree(&store, a_oid, alloc)?, alloc)?;
-        let rt = flatten_tree(&store, read_commit_tree(&store, b_oid, alloc)?, alloc)?;
-        (Side::Tree(lt), Side::Tree(rt))
+        Some((read_commit_tree(&store, a_oid, alloc)?, read_commit_tree(&store, b_oid, alloc)?))
     } else if revs.len() == 2 {
         let a_oid = store
             .resolve_commit(&revs[0])
@@ -996,85 +1116,129 @@ pub(crate) fn cmd_diff<'a>(
             .resolve_commit(&revs[1])
             .map_err(|e| io::Error::other(format!("{e}")))?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown rev `{}`", revs[1])))?;
-        let lt = flatten_tree(&store, read_commit_tree(&store, a_oid, alloc)?, alloc)?;
-        let rt = flatten_tree(&store, read_commit_tree(&store, b_oid, alloc)?, alloc)?;
-        (Side::Tree(lt), Side::Tree(rt))
-    } else if revs.len() == 1 {
-        let a_oid = store
-            .resolve_commit(&revs[0])
-            .map_err(|e| io::Error::other(format!("{e}")))?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown rev `{}`", revs[0])))?;
-        let lt = flatten_tree(&store, read_commit_tree(&store, a_oid, alloc)?, alloc)?;
-        let idx = load_index(&repo_root, alloc)?;
-        if staged {
-            (Side::Tree(lt), Side::Index(idx))
-        } else {
-            (Side::Tree(lt), Side::Worktree(idx))
-        }
-    } else if staged {
-        let lt = head_flat_tree(&store, alloc)?;
-        let idx = load_index(&repo_root, alloc)?;
-        (Side::Tree(lt), Side::Index(idx))
+        Some((read_commit_tree(&store, a_oid, alloc)?, read_commit_tree(&store, b_oid, alloc)?))
     } else {
-        let idx = load_index(&repo_root, alloc)?;
-        (Side::Index(idx.clone()), Side::Worktree(idx))
+        None
     };
 
-    let mut paths: BTreeSet<String> = BTreeSet::new();
-    match &left {
-        Side::Tree(m) => paths.extend(m.keys().cloned()),
-        Side::Index(m) | Side::Worktree(m) => paths.extend(m.keys().cloned()),
-    }
-    match &right {
-        Side::Tree(m) => paths.extend(m.keys().cloned()),
-        Side::Index(m) | Side::Worktree(m) => paths.extend(m.keys().cloned()),
-    }
-
-    let mut stat_rows: Vec<(String, usize, usize)> = Vec::new();
-    for path in paths {
-        if !path_matches_filters(&path, &filters) {
-            continue;
-        }
-        let old_bytes: Option<Vec<u8>> = match &left {
-            Side::Tree(m) => m.get(&path).and_then(|&(_, o)| read_blob_bytes(&store, o, alloc).ok()),
-            Side::Index(m) | Side::Worktree(m) => {
-                m.get(&path).and_then(|e| read_blob_bytes(&store, e.oid, alloc).ok())
+    if let Some((lt, rt)) = tree_pair {
+        for (path, a, b) in diff_trees_changed(&store, Some(lt), Some(rt), alloc)? {
+            if !path_matches_filters(&path, &filters) {
+                continue;
             }
-        };
-        let new_bytes: Option<Vec<u8>> = match &right {
-            Side::Tree(m) => m.get(&path).and_then(|&(_, o)| read_blob_bytes(&store, o, alloc).ok()),
-            Side::Index(m) => m.get(&path).and_then(|e| read_blob_bytes(&store, e.oid, alloc).ok()),
-            Side::Worktree(_) => {
-                let full = repo_root.join(&path);
-                if full.exists() || full.is_symlink() {
-                    read_worktree_blob(&full).ok().map(|(_, b)| b)
-                } else {
-                    None
-                }
-            }
-        };
-
-        if old_bytes == new_bytes {
-            continue;
-        }
-        if name_only {
-            writeln!(io.out, "{path}")?;
-        } else if name_status {
-            let status = match (&old_bytes, &new_bytes) {
-                (None, Some(_)) => "A",
-                (Some(_), None) => "D",
-                _ => "M",
+            let old_b = if name_only || name_status {
+                a.map(|_| Vec::new())
+            } else {
+                a.and_then(|(_, o)| read_blob_bytes(&store, o, alloc).ok())
             };
-            writeln!(io.out, "{status}\t{path}")?;
-        } else if stat_only {
-            let (ins, del) = diff_line_stats(
-                old_bytes.as_deref().unwrap_or(b""),
-                new_bytes.as_deref().unwrap_or(b""),
-            );
-            stat_rows.push((path, ins, del));
+            let new_b = if name_only || name_status {
+                b.map(|_| vec![1u8])
+            } else {
+                b.and_then(|(_, o)| read_blob_bytes(&store, o, alloc).ok())
+            };
+            emit_diff_entry(
+                &path,
+                old_b.as_deref(),
+                new_b.as_deref(),
+                name_only,
+                name_status,
+                stat_only,
+                use_color,
+                &mut stat_rows,
+                io.out,
+            )?;
+        }
+        if stat_only && !stat_rows.is_empty() {
+            write_diffstat(&stat_rows, use_color, io.out)?;
+        }
+        return Ok(());
+    }
+
+    // Remaining modes: Tree vs Index (`--staged` or `<rev> --staged`) or Tree vs Worktree (`<rev>`).
+    let left_tree = if let Some(rev) = revs.first() {
+        let oid = store
+            .resolve_commit(rev)
+            .map_err(|e| io::Error::other(format!("{e}")))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("unknown rev `{rev}`")))?;
+        flatten_tree(&store, read_commit_tree(&store, oid, alloc)?, alloc)?
+    } else {
+        head_flat_tree(&store, alloc)?
+    };
+    let idx = load_index(&repo_root, alloc)?;
+
+    let mut paths: BTreeSet<&str> = BTreeSet::new();
+    for k in left_tree.keys() {
+        paths.insert(k.as_str());
+    }
+    for k in idx.keys() {
+        paths.insert(k.as_str());
+    }
+
+    for path in paths {
+        if !path_matches_filters(path, &filters) {
+            continue;
+        }
+        let left_oid = left_tree.get(path).map(|&(_, o)| o);
+        let idx_entry = idx.get(path);
+
+        if staged {
+            let right_oid = idx_entry.map(|e| e.oid);
+            // OID short-circuit: skip identical blobs with ZERO decompression!
+            if left_oid == right_oid {
+                continue;
+            }
+            let old_b = if name_only || name_status {
+                left_oid.map(|_| Vec::new())
+            } else {
+                left_oid.and_then(|o| read_blob_bytes(&store, o, alloc).ok())
+            };
+            let new_b = if name_only || name_status {
+                right_oid.map(|_| vec![1u8])
+            } else {
+                right_oid.and_then(|o| read_blob_bytes(&store, o, alloc).ok())
+            };
+            emit_diff_entry(
+                path,
+                old_b.as_deref(),
+                new_b.as_deref(),
+                name_only,
+                name_status,
+                stat_only,
+                use_color,
+                &mut stat_rows,
+                io.out,
+            )?;
         } else {
-            let patch = format_unified_diff(&path, old_bytes.as_deref(), new_bytes.as_deref(), use_color);
-            write!(io.out, "{patch}")?;
+            // Tree vs Worktree: if index matches left_tree AND disk is stat-clean, skip with ZERO reads!
+            if let Some(e) = idx_entry
+                && Some(e.oid) == left_oid
+                && index_entry_stat_clean(&repo_root, e)
+            {
+                continue;
+            }
+            let full = repo_root.join(path);
+            let new_bytes = if full.exists() || full.is_symlink() {
+                read_worktree_blob(&full).ok().map(|(_, b)| b)
+            } else {
+                None
+            };
+            if let (Some(lo), Some(nb)) = (left_oid, &new_bytes)
+                && Oid::of(ObjectKind::Blob, nb) == lo
+            {
+                continue;
+            }
+            let old_b = left_oid.and_then(|o| read_blob_bytes(&store, o, alloc).ok());
+            emit_diff_entry(
+                path,
+                old_b.as_deref(),
+                new_bytes.as_deref(),
+                name_only,
+                name_status,
+                stat_only,
+                use_color,
+                &mut stat_rows,
+                io.out,
+            )?;
         }
     }
 
@@ -1201,36 +1365,31 @@ pub(crate) fn cmd_show<'a>(
                 writeln!(io.out)?;
             }
 
-            let parent_flat = match parsed.parents().next() {
-                Some(p) => flatten_tree(&store, read_commit_tree(&store, p, alloc)?, alloc)?,
-                None => BTreeMap::new(),
+            let parent_tree = match parsed.parents().next() {
+                Some(p) => Some(read_commit_tree(&store, p, alloc)?),
+                None => None,
             };
-            let cur_flat = flatten_tree(&store, parsed.tree, alloc)?;
+            let changed = diff_trees_changed(&store, parent_tree, Some(parsed.tree), alloc)?;
 
             let mut stat_rows = Vec::new();
-            for path in union_paths(&parent_flat, &cur_flat) {
-                let a = parent_flat.get(path);
-                let b = cur_flat.get(path);
-                if a == b {
-                    continue;
-                }
+            for (path, a, b) in changed {
                 if name_only {
                     writeln!(io.out, "{path}")?;
                     continue;
                 }
-                let old_b = a.and_then(|&(_, o)| read_blob_bytes(&store, o, alloc).ok());
-                let new_b = b.and_then(|&(_, o)| read_blob_bytes(&store, o, alloc).ok());
+                let old_b = a.and_then(|(_, o)| read_blob_bytes(&store, o, alloc).ok());
+                let new_b = b.and_then(|(_, o)| read_blob_bytes(&store, o, alloc).ok());
                 if stat_only {
                     let (ins, del) = diff_line_stats(
                         old_b.as_deref().unwrap_or(b""),
                         new_b.as_deref().unwrap_or(b""),
                     );
-                    stat_rows.push((path.to_owned(), ins, del));
+                    stat_rows.push((path, ins, del));
                 } else {
                     write!(
                         io.out,
                         "{}",
-                        format_unified_diff(path, old_b.as_deref(), new_b.as_deref(), use_color)
+                        format_unified_diff(&path, old_b.as_deref(), new_b.as_deref(), use_color)
                     )?;
                 }
             }
@@ -2307,11 +2466,16 @@ pub(crate) fn cmd_fetch<'a>(
     io: &mut IoStreams<'_>,
 ) -> io::Result<()> {
     let remote_name = matches.positional(0).unwrap_or("origin");
+    let depth = matches
+        .opt_parse::<u32>("depth")
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e}")))?;
+    let filter = matches.opt("filter");
+    let params = FetchParams { depth, filter };
     let repo_root = find_repo_root(cwd).ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "not a git or bgit repository")
     })?;
     let cfg = GitConfig::load_merged(&repo_root);
-    let url = if remote_name.starts_with("http://") {
+    let url = if looks_like_remote_url(remote_name) {
         remote_name.to_owned()
     } else {
         cfg.get(&format!("remote.{remote_name}.url"))
@@ -2323,7 +2487,7 @@ pub(crate) fn cmd_fetch<'a>(
             })?
             .to_owned()
     };
-    let _ = http_fetch(&url, remote_name, &repo_root, alloc, io.out)?;
+    let _ = remote_fetch(&url, remote_name, &repo_root, params, alloc, io.out)?;
     Ok(())
 }
 
@@ -2348,7 +2512,7 @@ pub(crate) fn cmd_pull<'a>(
             )
         })?
         .to_owned();
-    let _ = http_fetch(&url, remote_name, &repo_root, alloc, io.out)?;
+    let _ = remote_fetch(&url, remote_name, &repo_root, FetchParams::default(), alloc, io.out)?;
 
     let mut store = open_or_infect(&repo_root, alloc)?;
     let branch = explicit_branch
