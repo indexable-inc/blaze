@@ -33,7 +33,9 @@ mod fix;
 mod front_load;
 mod gc;
 mod home;
+mod jit_exec;
 mod job_texts;
+mod launcher_stub;
 mod lints;
 mod macro_files;
 mod macros;
@@ -52,6 +54,7 @@ mod scripts;
 mod sdk;
 mod not_checked;
 mod peer;
+mod pgo_store;
 mod phases;
 mod print;
 mod producers;
@@ -430,10 +433,14 @@ struct Flags<'a> {
     open: blaze_run::viewer::OpenExplore,
     /// `-q` / `--quiet`: suppress `blaze run`'s persistent status lines and live TUI on stderr.
     quiet: bool,
-    /// `-o <path>` / `--output <path>`: where `blaze build` writes the standalone executable.
+    /// `-o <path>` / `--output <path>`: where `blaze build` writes the executable.
     output: Option<&'a str>,
     /// `--target <triple>`: target backend for `blaze build` (`native` or `wasm64`).
     target: Option<&'a str>,
+    /// `--release` / `-r`: build a standalone AOT PGO-optimized release binary (`blaze build`).
+    release: bool,
+    /// `--standalone`: build a standalone AOT binary instead of a JIT-on-call executable (`blaze build`).
+    standalone: bool,
     /// `--names-oracle`: `check` decides every crate's names twice and compares them (D158 step
     /// 1, engine_names.rs `NamesOracle`).
     names_oracle: engine_names::NamesOracle,
@@ -468,6 +475,8 @@ impl<'a> Flags<'a> {
             quiet: false,
             output: None,
             target: None,
+            release: false,
+            standalone: false,
             names_oracle: engine_names::NamesOracle::Off,
             driver: engine_ready_edit::Driver::Auto,
             block_scopes: blaze_scope::surface::BlockScopes::Modules,
@@ -598,6 +607,12 @@ pub(crate) fn parse_flags_in<'a>(args: &'a Args, frame: &Frame, mut package: imp
     if parsed.has("quiet") {
         flags.quiet = true;
     }
+    if parsed.has("release") {
+        flags.release = true;
+    }
+    if parsed.has("standalone") {
+        flags.standalone = true;
+    }
     if parsed.has("names-oracle") {
         flags.names_oracle = engine_names::NamesOracle::On;
     }
@@ -692,9 +707,9 @@ fn run(cx: &Cx, io: Io, heap: bstd::mem::Heap) -> Result<Status, Error> {
     // immediately so nothing below `run` ever holds the whole world (D104).
     drop(io);
     phases.mark("output handles");
-    // `run` and `test` start a program: every error of theirs is returned before it starts
+    // `run`, `test`, and `jit-exec` start a program: every error of theirs is returned before it starts
     // (the in-process run returns the program's status as `Ok`), so it is blaze's own.
-    let starts_a_program = matches!(args.get(1), Some("run" | "test"));
+    let starts_a_program = matches!(args.get(1), Some("run" | "test" | "jit-exec"));
     // A failure of `check` or `explain` is printed in one place, bstd's exit path (`error: `
     // and its message), with status 1.
     // (A `Ran` holding `RunError::Trapped` was matched here: no constructor ever made one, as
@@ -797,6 +812,8 @@ fn command(
         // Hidden: the checkout's journal helper, run by hand until a command starts one
         // (journal_ask.rs `HelperStart`): one stream held open, asks answered on its socket.
         "journal-helper" => journal_helper::run(cx, fs, &clock, host, rng, env, args, out),
+        // Hidden: executes a self-describing JIT-on-call binary produced by default `blaze build`.
+        "jit-exec" => jit_exec::command(cx, args, fs, env, host, &clock, rng, out, err, phases, heap),
         "toolchain" => {
             let tc = include_str!("../../../pins/toolchain").trim();
             out.line(cx, format_args!("Rust {tc}"))?;

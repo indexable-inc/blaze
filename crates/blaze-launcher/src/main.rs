@@ -72,6 +72,13 @@ enum Sidecar {
         entry: OsString,
         native: Option<OsString>,
     },
+    /// `mode=jit-exec` self-describing executable produced by default `blaze build`: re-execs
+    /// `blaze jit-exec --exe <self> --arg0 <argv[0]> --manifest <hex> -- <user args...>`, which
+    /// opens the pinned CAS build directly and spawns `<self>` with `BLAZE_LAUNCH_FD=3`.
+    JitExec {
+        blaze: PathBuf,
+        raw_manifest: String,
+    },
 }
 
 /// Decodes an even-length hex string into a `PathBuf` using a stack buffer (used for `store_hex=`
@@ -130,6 +137,17 @@ pub static EMBEDDED_STUB_SLOT: EmbeddedStubSlot = EmbeddedStubSlot(core::cell::U
     rest: [0u8; STUB_SLOT_SIZE - 32],
 }));
 
+/// Returns `true` when this binary carries a patched `EMBEDDED_STUB_SLOT` (a `CARGO_BIN_EXE_*`
+/// stub or default `blaze build` JIT executable), so user flags like `--viewer` are forwarded to
+/// the program instead of intercepted by `blaze-launcher`'s own helper flags.
+fn has_patched_stub_slot() -> bool {
+    let ptr: *const StubSlotBytes = core::hint::black_box(EMBEDDED_STUB_SLOT.0.get().cast_const());
+    // SAFETY: `EMBEDDED_STUB_SLOT` is a `'static`, 4096-byte aligned `StubSlotBytes` of
+    // `STUB_SLOT_SIZE` bytes, never mutated at runtime.
+    let slot: &[u8] = unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), STUB_SLOT_SIZE) };
+    slot.get(..16) == Some(STUB_SLOT_MAGIC.as_slice()) && slot.get(16..32) == Some(STUB_SLOT_PATCHED.as_slice())
+}
+
 /// Reads the stub's embedded configuration slot when patched by `blaze test`, otherwise reads the
 /// adjacent `<exe>.blaze-program` sidecar (`name=value` per line).
 fn sidecar(exe: &Path) -> Result<Sidecar, String> {
@@ -179,6 +197,13 @@ fn sidecar(exe: &Path) -> Result<Sidecar, String> {
     let field = |name: &str| {
         line(name).ok_or_else(|| format!("the sidecar {label} has no `{name}`: run the program with `blaze run`"))
     };
+    if line("mode") == Some("jit-exec") {
+        let blaze_hex = line("blaze_hex")
+            .ok_or_else(|| format!("the JIT executable {label} has no `blaze_hex`: rebuild with `blaze build`"))?;
+        let blaze = hex_path(blaze_hex)
+            .ok_or_else(|| format!("the JIT executable {label} has malformed `blaze_hex`: rebuild with `blaze build`"))?;
+        return Ok(Sidecar::JitExec { blaze, raw_manifest: text.to_owned() });
+    }
     let socket = PathBuf::from(field("socket")?);
     if line("mode") == Some("run") {
         let bin_raw = field("bin")?;
@@ -244,6 +269,60 @@ fn hex32(hex: &str) -> Option<[u8; 32]> {
 /// at the path while the program runs, and the file this process maps is then one the system
 /// no longer names.
 static STARTED_FROM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Boots a self-describing JIT-on-call executable produced by default `blaze build`: replaces this
+/// process image with `blaze jit-exec --exe <self> --arg0 <argv[0]> --manifest <hex> -- <args...>`,
+/// preserving PID, environment, working directory, stdio, and process group. `blaze jit-exec` opens
+/// the pinned CAS answer and spawns `<self>` with `BLAZE_LAUNCH_FD=3`.
+fn exec_jit_built(blaze: &Path, exe: &Path, raw_manifest: &str) -> ! {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut manifest_hex = Vec::with_capacity(raw_manifest.len() * 2);
+    for &b in raw_manifest.as_bytes() {
+        manifest_hex.push(HEX[usize::from(b >> 4)]);
+        manifest_hex.push(HEX[usize::from(b & 0x0f)]);
+    }
+    let to_cstr = |label: &str, bytes: Vec<u8>| -> CString {
+        CString::new(bytes).unwrap_or_else(|_| {
+            stop(CANNOT_RUN, &format!("{} cannot boot JIT executable: {label} contains a NUL byte", exe.display()))
+        })
+    };
+    let blaze_c = to_cstr("blaze path", blaze.as_os_str().as_bytes().to_vec());
+    let exe_c = to_cstr("executable path", exe.as_os_str().as_bytes().to_vec());
+    let mut raw_args = std::env::args_os();
+    let arg0_bytes = raw_args
+        .next()
+        .map_or_else(|| exe.as_os_str().as_bytes().to_vec(), |a| a.into_vec());
+    let arg0_c = to_cstr("argv[0]", arg0_bytes);
+    let manifest_c = to_cstr("manifest", manifest_hex);
+
+    let mut args: Vec<CString> = Vec::new();
+    args.push(blaze_c.clone());
+    args.push(CString::new("jit-exec").expect("static"));
+    args.push(CString::new("--exe").expect("static"));
+    args.push(exe_c);
+    args.push(CString::new("--arg0").expect("static"));
+    args.push(arg0_c);
+    args.push(CString::new("--manifest").expect("static"));
+    args.push(manifest_c);
+    args.push(CString::new("--").expect("static"));
+    for (idx, arg) in raw_args.enumerate() {
+        args.push(to_cstr(&format!("argument {}", idx + 1), arg.into_vec()));
+    }
+    let mut argv: Vec<*const c_char> = args.iter().map(|s| s.as_ptr()).collect();
+    argv.push(core::ptr::null());
+    // SAFETY: `blaze_c` and every element of `argv` are valid NUL-terminated C strings alive across
+    // the call, and `argv` is NULL-terminated. The process environment is inherited unchanged.
+    unsafe { libc::execv(blaze_c.as_ptr(), argv.as_ptr()) };
+    let failed = std::io::Error::last_os_error();
+    stop(
+        CANNOT_RUN,
+        &format!(
+            "{} is a blaze JIT executable and could not start `{}`: {failed}. Rebuild with `blaze build` or `blaze build --standalone`",
+            exe.display(),
+            blaze.display()
+        ),
+    )
+}
 
 /// Starts the program again in place: the file at the path this process was started from,
 /// with this process's arguments and environment. It does not return: where the program
@@ -820,7 +899,9 @@ fn main() {
     if let Some(fd) = std::env::var_os("BLAZE_LAUNCH_FD") {
         run_mode(fd, os, shared);
     }
-    if let Some(first) = std::env::args().nth(1) {
+    if !has_patched_stub_slot()
+        && let Some(first) = std::env::args().nth(1)
+    {
         if first == "--viewer" {
             run_viewer_daemon();
         } else if first == "--open-explore" {
@@ -839,6 +920,9 @@ fn main() {
     };
     let (socket_path, program) = match side {
         Sidecar::Daemon { socket, program } => (socket, program),
+        Sidecar::JitExec { blaze, raw_manifest } => {
+            exec_jit_built(&blaze, &exe, &raw_manifest);
+        }
         Sidecar::Run { socket, bin, owner: (owner_suite, owner_row), store, entry, native } => {
             use blaze_launch_rt::run_mode::{self, Dlsym, End, EntryForm, Folder, Handed, LauncherOwn, STOPPED, Start};
 

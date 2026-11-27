@@ -77,6 +77,8 @@ pub(crate) fn run<'h>(
     // The request's certificate and the start list's name (start_list.rs): own_process.rs reads
     // and writes the list under them.
     today: crate::start_list::Today,
+    // Optional overrides (`blaze jit-exec` launcher/arg0/store_home + PGO pointer key).
+    overrides: crate::own_process::OwnOverrides<'_>,
     // The names records the roots and the maker read, opened on the first need of them, and
     // the body ids (run_ids.rs) made on the first function stepped: main.rs's, each called at
     // most once (run_parent.rs `CommandFront`).
@@ -116,7 +118,7 @@ pub(crate) fn run<'h>(
     // The make watch's clock starts here, at the command's edge (rule 75).
     let make_watch = crate::run_parent::command_make_watch();
     let front = crate::run_parent::CommandFront::new(names, ids, typed, builder, heap.alloc(), roots.handle(), watch, exports, make_watch);
-    crate::own_process::run_own(&cx, launch, package, builder, front, native, lent, today, counted, frame).map_err(move |error| CliError::OwnProcess(blaze_own::Box::new_in(error, heap.alloc())))
+    crate::own_process::run_own(&cx, launch, package, builder, front, native, lent, today, overrides, counted, frame).map_err(move |error| CliError::OwnProcess(blaze_own::Box::new_in(error, heap.alloc())))
 }
 
 /// The exit status of `blaze run` and `blaze test` for every failure before the program starts

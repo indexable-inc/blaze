@@ -225,6 +225,14 @@ pub(crate) fn keep_program<D: Driver>(lent: &Lent<D, StoreAlloc>, today: &start_
     Ok((Rooted::new(at), kept))
 }
 
+/// Renews an existing program root's lease in O(1) without overwriting or unrooting any of its
+/// existing keys (used by default JIT `blaze build` to keep `blaze run`'s JIT code/start-list
+/// root alive without replacing it).
+pub(crate) fn renew_program<D: Driver>(lent: &Lent<D, StoreAlloc>, name: &start_list::ListName) {
+    let root = RootName::program(name);
+    let _ = lent.renew_root(root.as_str(), ROOT_LIFE_NS);
+}
+
 /// Pins a test suite's kept incremental state (pointer, state record, head, postings, result
 /// records) under `test.<id>` for [`ROOT_LIFE_NS`].
 pub(crate) fn keep_test_suite<D: Driver>(lent: &Lent<D, StoreAlloc>, suite: &blaze_ids::ContentId, keys: &[CasKey]) -> Result<Rooted<TestSuite>, RootError> {

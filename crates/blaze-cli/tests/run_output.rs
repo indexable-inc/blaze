@@ -194,14 +194,25 @@ fn export_no_core_c_main_runs_standalone() {
     copy_file(&ladder.join("src/main.rs"), &dir.join("src/main.rs"));
 
     let mut cmd = blaze_cmd(&dir, &home);
-    cmd.args(["build", "-o", "out/hello-standalone"]);
-    let built = run_with_deadline(cmd, "blaze build 3-hello", secs(120));
+    cmd.args(["build", "--release", "-o", "out/hello-standalone"]);
+    let built = run_with_deadline(cmd, "blaze build --release 3-hello", secs(120));
     assert_eq!(built.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&built.stdout), utf8(&built.stderr));
     assert!(utf8(&built.stdout).contains("built out/hello-standalone"), "unexpected summary: {}", utf8(&built.stdout));
 
+    // Also test `--standalone` alias and prove both run after the CAS store is removed.
+    let mut cmd2 = blaze_cmd(&dir, &home);
+    cmd2.args(["build", "--standalone", "-o", "out/hello-standalone-flag"]);
+    let built2 = run_with_deadline(cmd2, "blaze build --standalone 3-hello", secs(120));
+    assert_eq!(built2.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&built2.stdout), utf8(&built2.stderr));
+
+    let _ = std::fs::remove_dir_all(home.join(".blaze/v2/store"));
     let ran = run_standalone(&dir.join("out/hello-standalone"), "run hello-standalone");
     assert_eq!(ran.status.code(), Some(0), "stderr: {}", utf8(&ran.stderr));
     assert_eq!(utf8(&ran.stdout), "hello\n");
+
+    let ran2 = run_standalone(&dir.join("out/hello-standalone-flag"), "run hello-standalone-flag");
+    assert_eq!(ran2.status.code(), Some(0), "stderr: {}", utf8(&ran2.stderr));
+    assert_eq!(utf8(&ran2.stdout), "hello\n");
     cleanup(&base);
 }
 
@@ -217,8 +228,8 @@ fn export_std_rust_binary_runs_standalone() {
     );
 
     let mut cmd = blaze_cmd(&dir, &home);
-    cmd.arg("build");
-    let built = run_with_deadline(cmd, "blaze build hello-std", secs(240));
+    cmd.args(["build", "--release"]);
+    let built = run_with_deadline(cmd, "blaze build --release hello-std", secs(240));
     assert_eq!(built.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&built.stdout), utf8(&built.stderr));
 
     let ran = run_standalone(&dir.join("hello-std"), "run hello-std");
@@ -321,8 +332,8 @@ fn main() -> ExitCode {
 
     let out_bin = base.join("tls-standalone");
     let mut cmd = blaze_cmd(&dir, &home);
-    cmd.args(["build", "-o"]).arg(&out_bin);
-    let built = run_with_deadline(cmd, "blaze build tls-app", secs(240));
+    cmd.args(["build", "--standalone", "-o"]).arg(&out_bin);
+    let built = run_with_deadline(cmd, "blaze build --standalone tls-app", secs(240));
     assert_eq!(built.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&built.stdout), utf8(&built.stderr));
     assert!(utf8(&built.stdout).contains("tls"), "expected TLS count in summary: {}", utf8(&built.stdout));
 
@@ -349,13 +360,109 @@ fn export_workspace_selects_package_bin_output_and_stats() {
 
     let out_bin = base.join("out-dir/second-bin");
     let mut cmd = blaze_cmd(&base, &home);
-    cmd.args(["build", "ws", "-p", "alpha", "--bin", "second", "-o"]).arg(&out_bin).args(["--workers", "2", "--stats"]);
-    let built = run_with_deadline(cmd, "blaze build ws -p alpha --bin second", secs(240));
+    cmd.args(["build", "--release", "ws", "-p", "alpha", "--bin", "second", "-o"]).arg(&out_bin).args(["--workers", "2", "--stats"]);
+    let built = run_with_deadline(cmd, "blaze build --release ws -p alpha --bin second", secs(240));
     assert_eq!(built.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&built.stdout), utf8(&built.stderr));
     assert!(utf8(&built.stderr).contains("build stats:"), "expected --stats line on stderr: {}", utf8(&built.stderr));
 
     let ran = run_standalone(&out_bin, "run second-bin");
     assert_eq!(ran.status.code(), Some(0), "stderr: {}", utf8(&ran.stderr));
     assert_eq!(utf8(&ran.stdout), "from-second\n");
+    cleanup(&base);
+}
+
+#[test]
+fn build_default_jit_runs_forwards_argv_exit_code_current_exe_and_rebuilds_on_edit() {
+    let base = fresh_home("build_default_jit", true);
+    let home = base.join("home");
+    let dir = base.join("checkouts/jit-app");
+    write_file(&dir.join("Cargo.toml"), "[package]\nname = \"jit-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_file(
+        &dir.join("src/main.rs"),
+        r#"use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    println!("jit v1 args={:?} exe_ok={}", &args[1..], exe.ends_with("/jit-app-out"));
+    ExitCode::from(42)
+}
+"#,
+    );
+
+    let out_bin = base.join("out/jit-app-out");
+    let mut cmd = blaze_cmd(&dir, &home);
+    cmd.args(["build", "-o"]).arg(&out_bin).arg("--stats");
+    let built = run_with_deadline(cmd, "default blaze build cold", secs(180));
+    assert_eq!(built.status.code(), Some(0), "stdout: {}\nstderr: {}", utf8(&built.stdout), utf8(&built.stderr));
+    assert!(utf8(&built.stdout).contains("jit-on-call"), "expected jit-on-call summary: {}", utf8(&built.stdout));
+    assert!(utf8(&built.stderr).contains("mode=jit-on-call"), "expected jit stats: {}", utf8(&built.stderr));
+
+    // No-op rebuild hits fast path without rewriting the launcher binary.
+    let mut noop = blaze_cmd(&dir, &home);
+    noop.args(["build", "-o"]).arg(&out_bin);
+    let noop_out = run_with_deadline(noop, "default blaze build no-op", secs(60));
+    assert_eq!(noop_out.status.code(), Some(0), "stderr: {}", utf8(&noop_out.stderr));
+    assert!(utf8(&noop_out.stdout).contains("unchanged"), "expected unchanged summary: {}", utf8(&noop_out.stdout));
+
+    // Direct execution forwards argv (including `--viewer`, which blaze-launcher must not hijack),
+    // sets current_exe() to the built binary, keeps stderr clean, and returns exit code 42.
+    let mut run1 = Command::new(&out_bin);
+    run1.args(["--viewer", "alpha", "beta"]);
+    let ran1 = run_with_deadline(run1, "run jit-app-out cold JIT", secs(120));
+    assert_eq!(ran1.status.code(), Some(42), "stderr: {}", utf8(&ran1.stderr));
+    assert_eq!(utf8(&ran1.stdout), "jit v1 args=[\"--viewer\", \"alpha\", \"beta\"] exe_ok=true\n");
+    assert_eq!(utf8(&ran1.stderr), "", "expected clean stderr from JIT-built binary");
+
+    // Second execution with completely cleared environment (`env_clear()`) still runs from the
+    // embedded store home + SDK root and warm start-list.
+    let mut run2 = Command::new(&out_bin);
+    run2.env_clear().args(["--open-explore", "gamma"]);
+    let ran2 = run_with_deadline(run2, "run jit-app-out warm env_clear", secs(60));
+    assert_eq!(ran2.status.code(), Some(42), "stderr: {}", utf8(&ran2.stderr));
+    assert_eq!(utf8(&ran2.stdout), "jit v1 args=[\"--open-explore\", \"gamma\"] exe_ok=true\n");
+    assert_eq!(utf8(&ran2.stderr), "", "expected clean stderr on env_clear warm run");
+
+    // 1-line body edit: rebuild updates the embedded manifest cert and re-running prints v2.
+    write_file(
+        &dir.join("src/main.rs"),
+        r#"use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    println!("jit v2 args={:?} exe_ok={}", &args[1..], exe.ends_with("/jit-app-out"));
+    ExitCode::from(17)
+}
+"#,
+    );
+    let mut rebuild = blaze_cmd(&dir, &home);
+    rebuild.args(["build", "-o"]).arg(&out_bin);
+    let rebuilt = run_with_deadline(rebuild, "default blaze build after 1-line edit", secs(60));
+    assert_eq!(rebuilt.status.code(), Some(0), "stderr: {}", utf8(&rebuilt.stderr));
+    assert!(!utf8(&rebuilt.stdout).contains("unchanged"), "edited build must update manifest: {}", utf8(&rebuilt.stdout));
+
+    let mut run3 = Command::new(&out_bin);
+    run3.arg("edited");
+    let ran3 = run_with_deadline(run3, "run jit-app-out after edit", secs(120));
+    assert_eq!(ran3.status.code(), Some(17), "stderr: {}", utf8(&ran3.stderr));
+    assert_eq!(utf8(&ran3.stdout), "jit v2 args=[\"edited\"] exe_ok=true\n");
+    cleanup(&base);
+}
+
+#[test]
+fn build_default_jit_refuses_compile_error_without_emitting_binary() {
+    let base = fresh_home("build_default_jit_err", true);
+    let home = base.join("home");
+    let dir = base.join("checkouts/broken-app");
+    write_file(&dir.join("Cargo.toml"), "[package]\nname = \"broken-app\"\nversion = \"0.1.0\"\nedition = \"2024\"\n");
+    write_file(&dir.join("src/main.rs"), "fn main() { let x: u32 = \"not a number\"; println!(\"{x}\"); }\n");
+
+    let out_bin = base.join("out/broken-app");
+    let mut cmd = blaze_cmd(&dir, &home);
+    cmd.args(["build", "-o"]).arg(&out_bin);
+    let built = run_with_deadline(cmd, "default blaze build on type error", secs(120));
+    assert_ne!(built.status.code(), Some(0), "compile error must fail blaze build");
+    assert!(!out_bin.exists(), "compile error must not emit an executable at {}", out_bin.display());
     cleanup(&base);
 }

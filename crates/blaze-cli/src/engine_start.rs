@@ -35,10 +35,10 @@ use crate::phases::Phases;
 use crate::run_ids::{RunIds, RunIdsError};
 use crate::{CliError, program, run_names, run_package};
 
-/// The start list's shape for `run` of the program at `root` (start_list.rs `ListName::of`): the
-/// command and the program's crate root, never the checkout, so two worktrees of one program
-/// share one list.
-const RUN_SHAPE: &str = "blaze run: the start list of a program 1";
+/// The start list's shape for `run` and default JIT `build` of the program at `root`
+/// (start_list.rs `ListName::of`): the command and the program's crate root, never the checkout,
+/// so two worktrees of one program share one list.
+pub(crate) const RUN_SHAPE: &str = "blaze run: the start list of a program 1";
 
 /// The start's profile beside the check's (print.rs `PROFILE`, which the check wrote): the
 /// command's phases with the run's lines (`run  start list: placed ..`, phases.rs), written after
@@ -1011,7 +1011,7 @@ fn script_has_deferred_c<D: blaze_core::Driver>(
 /// suites (`send: None`): hits in O(closure) using only `list` and `standing.names` (zero
 /// `CrateScope` or `Script` store reads, zero segment mmaps). Any native-code suite (`send: Some`)
 /// or missing input falls through directly to `engine_native::image_for`.
-fn native_image_for_cached<'r>(
+pub(crate) fn native_image_for_cached<'r>(
     cx: &Cx,
     standing: &mut Standing<'r, '_>,
     list: &blaze_world::crate_list::CrateList<'_>,
@@ -1109,12 +1109,39 @@ pub(crate) fn start_facts<'f>(
 /// builds what it calls and refuses a called body whose check does not run (D151).
 pub(crate) fn run_program(
     cx: &Cx,
-    mut standing: Standing<'_, '_>,
+    standing: Standing<'_, '_>,
     picked: &run_package::Program<'_>,
     launch: &program::Launch<'_>,
     phases: &mut Phases,
     watch: &dyn blaze_screen::Watch,
     status_out: &crate::run_line::RunStatusOut<'_, '_>,
+) -> Result<Status, CliError> {
+    run_program_with(cx, standing, picked, launch, crate::own_process::OwnOverrides::default(), phases, watch, Some(status_out))
+}
+
+/// Executes a JIT-on-call binary built by default `blaze build` (`blaze jit-exec`): shares the
+/// exact lazy JIT + start-list + persisted-PGO runner with `blaze run` without status lines.
+pub(crate) fn run_jit_built(
+    cx: &Cx,
+    standing: Standing<'_, '_>,
+    picked: &run_package::Program<'_>,
+    launch: &program::Launch<'_>,
+    overrides: crate::own_process::OwnOverrides<'_>,
+    phases: &mut Phases,
+) -> Result<Status, CliError> {
+    run_program_with(cx, standing, picked, launch, overrides, phases, &blaze_screen::Unwatched, None)
+}
+
+#[expect(clippy::too_many_arguments, reason = "shared JIT program runner for `blaze run` and `blaze jit-exec`")]
+fn run_program_with(
+    cx: &Cx,
+    mut standing: Standing<'_, '_>,
+    picked: &run_package::Program<'_>,
+    launch: &program::Launch<'_>,
+    mut overrides: crate::own_process::OwnOverrides<'_>,
+    phases: &mut Phases,
+    watch: &dyn blaze_screen::Watch,
+    status_out: Option<&crate::run_line::RunStatusOut<'_, '_>>,
 ) -> Result<Status, CliError> {
     let (frame, heap) = (standing.frame, standing.heap);
     let erased = blaze_own::Erased::new(frame);
@@ -1158,6 +1185,11 @@ pub(crate) fn run_program(
         name: crate::start_list::ListName::of(&shape),
         tables: [blaze_cas::Key(crate::run_ids::table_key(cert, standing.toolchain, &standing.tools).0), blaze_cas::Key(native.key.0)],
     };
+    if overrides.pgo_key.is_none() {
+        let workspace_id = workspace_anchor_id(list, alloc);
+        let pgo_shape = crate::engine_export::build_program_shape(picked, workspace_id, list.key(at));
+        overrides.pgo_key = Some(crate::pgo_store::pgo_ptr_key(pgo_shape));
+    }
     // The units' record: the entry's crate list, as the effect's `units` key was.
     let units = (standing.names)(blaze_drive::Name::units()).ok_or(CliError::Start(StartError::NoUnits))?.at;
     let producer = standing.producers.get::<blaze_ids::producer::CodeBuilder>();
@@ -1179,8 +1211,10 @@ pub(crate) fn run_program(
             .map_err(|error| crate::run_parent::ParentError::Names { shown: std::boxed::Box::from(bstd::mem::format_in!(frame, "{error}").as_str()) })
     };
     let mut ids = || made.take().ok_or_else(|| crate::run_parent::ParentError::BodyIds { shown: std::boxed::Box::from("the body ids were asked a second time (run_parent.rs `CommandFront` asks once)") });
-    status_out.set_launch(picked.package, picked.bin, launch.args);
-    let ran = program::run(cx, root, launch, picked, units, native.send, producer, lent, today, &mut names, &mut ids, typed, &mut phases.code_records, watch, heap, frame);
+    if let Some(status_out) = status_out {
+        status_out.set_launch(picked.package, picked.bin, launch.args);
+    }
+    let ran = program::run(cx, root, launch, picked, units, native.send, producer, lent, today, overrides, &mut names, &mut ids, typed, &mut phases.code_records, watch, heap, frame);
     drop(names);
     read.add_by_need(scope_records.counts());
     end_procs(cx, &maker, standing.err, "run")?;

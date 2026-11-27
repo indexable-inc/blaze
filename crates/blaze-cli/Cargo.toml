@@ -76,6 +76,8 @@ blaze-meter.workspace = true
 # `blaze run`'s program after its check: the walking skeleton's straight line, lower to call
 # (tests/ladder/README.md).
 blaze-ladder.workspace = true
+# Persisted cross-run `BPG1` PGO profiles (`pgo_store.rs`, shared by JIT runs and `--release` AOT).
+blaze-lir.workspace = true
 # `blaze build` (engine_export.rs): standalone native AArch64 executable writer (Mach-O on macOS,
 # ELF PIE on Linux), pure `#![no_std]` with zero third-party deps.
 blaze-export.workspace = true

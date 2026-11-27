@@ -93,17 +93,23 @@ const EXPORT_PROCS_WAIT: core::time::Duration = core::time::Duration::from_secs(
 const EXPORT_RECV_SLICE: core::time::Duration = core::time::Duration::from_millis(2);
 const EXPORT_END_WAIT: core::time::Duration = core::time::Duration::from_secs(300);
 
-/// Program root shape domain for `blaze build` (`start_list::ListName::of` -> `RootName::program`),
-/// distinct from `engine_start.rs`'s `RUN_SHAPE` so `blaze build`'s release-profile code root
-/// and `blaze run`'s dev-profile code + start-list root never overwrite or unroot each other.
+/// Program root shape domain for `blaze build --release` / `--standalone`
+/// (`start_list::ListName::of` -> `RootName::program`), distinct from `engine_start.rs`'s
+/// `RUN_SHAPE` so `blaze build`'s release-profile code root and `blaze run`'s dev-profile code +
+/// start-list root never overwrite or unroot each other.
 const BUILD_SHAPE: &str = "blaze build: the code of a program 1";
+
+/// Disjoint program root shape domain for default JIT-on-call `blaze build`'s minimal boot tables
+/// (`RunIds`, `NativeImage`, `BPG1` PGO), so default `blaze build` never overwrites or unroots
+/// either `RUN_SHAPE`'s JIT code/start-list root or `BUILD_SHAPE`'s AOT release code root.
+const JIT_BUILD_SHAPE: &str = "blaze build: jit boot tables 1";
 
 /// Computes the checkout-independent program root shape for `blaze build` (`RootName::program`).
 /// Distinct from `engine_start.rs`'s `RUN_SHAPE`, and includes `(workspace, program_crate,
 /// package, bin, root)` without any checkout path so two unrelated workspaces with the same
 /// package/bin/root stay disjoint while two worktrees of the same repository share one root
 /// (rules 25, 30, 36).
-fn build_program_shape(
+pub(crate) fn build_program_shape(
     picked: &run_package::Program<'_>,
     workspace: Option<blaze_ids::ContentId>,
     program_crate: blaze_id::CrateItemKey,
@@ -288,6 +294,12 @@ pub enum ExportCliError {
     Export(ExportError),
     /// Whole-program `wasm64` (`memory64`) compilation failed.
     Wasm64 { shown: AString<'static> },
+    /// Decoding or validating a `mode=jit-exec` manifest failed.
+    JitManifest { shown: AString<'static> },
+    /// Preparing or patching the JIT-on-call launcher executable failed.
+    JitLauncher { shown: AString<'static> },
+    /// Reading or persisting the cross-run `BPG1` PGO profile failed.
+    Pgo { shown: AString<'static> },
     /// Persisting the closing program or toolchain store root failed (Rule 3: never silently drop roots).
     KeepRoots { class: &'static str, shown: AString<'static> },
     /// Invalid output path supplied via `-o` / `--output`.
@@ -339,6 +351,9 @@ impl fmt::Display for ExportCliError {
             ExportCliError::Materialize { symbol, shown } => write!(f, "blaze build: materializing position-free record {}: {} (engine_export.rs)", Hex(symbol), shown.as_str()),
             ExportCliError::Export(error) => write!(f, "blaze build: {error}"),
             ExportCliError::Wasm64 { shown } => write!(f, "blaze build --target wasm64: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::JitManifest { shown } => write!(f, "blaze jit-exec: manifest: {} (jit_exec.rs)", shown.as_str()),
+            ExportCliError::JitLauncher { shown } => write!(f, "blaze build: jit launcher: {} (engine_export.rs)", shown.as_str()),
+            ExportCliError::Pgo { shown } => write!(f, "blaze build: {} (pgo_store.rs)", shown.as_str()),
             ExportCliError::KeepRoots { class, shown } => write!(f, "blaze build: keeping {class} root failed: {} (engine_export.rs)", shown.as_str()),
             ExportCliError::BadOutputPath { path, why } => write!(f, "blaze build: invalid output path `{}`: {why} (engine_export.rs)", path.as_str()),
             ExportCliError::OutputHome(error) => write!(f, "blaze build: output directory: {error} (engine_export.rs)"),
@@ -426,6 +441,10 @@ fn owned_fmt(args: fmt::Arguments<'_>, frame: &Frame, alloc: Alloc<'static>) -> 
     owned_str(formatted.as_str(), alloc)
 }
 
+pub(crate) fn owned_fmt_err(args: fmt::Arguments<'_>, frame: &Frame, alloc: Alloc<'static>) -> AString<'static> {
+    owned_fmt(args, frame, alloc)
+}
+
 fn box_err(error: ExportCliError, heap: &'static blaze_own::Heap) -> CliError {
     CliError::Export(Box::new_in(error, heap.alloc()))
 }
@@ -476,7 +495,27 @@ fn parse_build_target(flag: Option<&str>) -> Result<BuildTarget, CliError> {
     }
 }
 
-/// Top-level `blaze export` command entry point, dispatched from `main.rs`.
+/// Build output mode selected for `blaze build`:
+/// - Default native build: fast JIT-on-call + persisted PGO launcher binary (no whole-program walk/LTO/link).
+/// - `--release` / `--standalone` native build: full standalone AOT Mach-O/ELF export with LTO + persisted PGO.
+/// - `--target wasm64`: whole-program `wasm64` (`memory64`) module export.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BuildMode {
+    JitOnCall,
+    StandaloneAot,
+    Wasm64,
+}
+
+/// Sans-IO build mode selector (Rule 14).
+const fn select_build_mode(target: BuildTarget, release: bool, standalone: bool) -> BuildMode {
+    match target {
+        BuildTarget::Wasm64 => BuildMode::Wasm64,
+        BuildTarget::Native if release || standalone => BuildMode::StandaloneAot,
+        BuildTarget::Native => BuildMode::JitOnCall,
+    }
+}
+
+/// Top-level `blaze build` command entry point, dispatched from `main.rs`.
 #[expect(clippy::too_many_arguments, reason = "top-level command entry: each argument one capability extracted at main")]
 pub(crate) fn command(
     cx: &Cx,
@@ -496,6 +535,7 @@ pub(crate) fn command(
     let flags = crate::parse_flags(args, |name| packages.push(name))?;
     check_export_flags(&flags)?;
     let target = parse_build_target(flags.target)?;
+    let mode = select_build_mode(target, flags.release, flags.standalone);
     let select = run_package::Select { test_packages: packages.as_slice(), ..flags.select };
     let started_ns = phases.now();
     let stats = flags.stats;
@@ -512,11 +552,26 @@ pub(crate) fn command(
                 Some(picked) => picked,
                 None => run_package::pick(cx, root, select, frame)?,
             };
-            let summary = export_program(cx, standing, &picked, fs, output_flag, target, started_ns, stats, phases, watch)?;
-            write_start_profile(cx, root, phases, frame)?;
-            let wall_ns = phases.since(started_ns);
-            print_summary(cx, &summary, wall_ns, stats, out, err, frame)?;
-            Ok(Status::OK)
+            match mode {
+                BuildMode::JitOnCall => {
+                    if standing.errors > 0 {
+                        write_start_profile(cx, root, phases, frame)?;
+                        return Ok(standing.status);
+                    }
+                    let summary = build_jit_program(cx, standing, &picked, fs, host, output_flag, phases, watch)?;
+                    write_start_profile(cx, root, phases, frame)?;
+                    let wall_ns = phases.since(started_ns);
+                    print_jit_summary(cx, &summary, wall_ns, stats, out, err)?;
+                    Ok(Status::OK)
+                }
+                BuildMode::StandaloneAot | BuildMode::Wasm64 => {
+                    let summary = export_program(cx, standing, &picked, fs, output_flag, target, started_ns, stats, phases, watch)?;
+                    write_start_profile(cx, root, phases, frame)?;
+                    let wall_ns = phases.since(started_ns);
+                    print_summary(cx, &summary, wall_ns, stats, out, err, frame)?;
+                    Ok(Status::OK)
+                }
+            }
         })
     });
     lined.map_err(CliError::RunLine)?
@@ -2285,6 +2340,256 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
     run_res
 }
 
+/// Summary metrics collected during one default JIT-on-call `blaze build`.
+struct JitBuildSummary<'f> {
+    output: &'f str,
+    bytes: u64,
+    unchanged: bool,
+    has_pgo: bool,
+    body_ids_ns: u64,
+    emit_ns: u64,
+}
+
+/// Default `blaze build` (JIT-on-call + persisted PGO): checks the workspace, resolves minimal
+/// `RunIds` + cached `NativeImage` + PGO key, preserves existing start-list/code roots, and emits
+/// a tiny directly-executable self-describing `blaze-launcher` binary pinned to `standing.root`
+/// (zero whole-program reachability walk, zero whole-program LTO, zero 500 MB static link).
+#[expect(clippy::too_many_arguments, reason = "JIT build entry: each argument one capability or selected option")]
+fn build_jit_program<'f>(
+    cx: &Cx,
+    mut standing: Standing<'f, '_>,
+    picked: &run_package::Program<'f>,
+    fs: &Fs,
+    host: &bstd::host::Host,
+    output_flag: Option<&str>,
+    phases: &mut Phases,
+    watch: &dyn blaze_screen::Watch,
+) -> Result<JitBuildSummary<'f>, CliError> {
+    let (frame, heap) = (standing.frame, standing.heap);
+    let erased = Erased::new(frame);
+    let bump = erased.bump();
+    let alloc = bump.alloc();
+    let output_path: &'f str = match output_flag {
+        Some(path) => frame.alloc_str(path),
+        None => picked.bin,
+    };
+
+    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::Crates));
+    let mut read = EngineRecords::new(heap.alloc());
+    let seen = TreesSeen::default();
+    let root = standing.checkout;
+    let mut facts = start_facts(&standing, fs, phases, crate::lints::Lints::NONE);
+    let answered = run_names::FromEngine { graph: standing.graph, names: standing.names };
+    let at = run_names::program_row(cx, root, &answered, &mut *standing.store, &mut facts, picked.root, heap, frame)
+        .map_err(CliError::RunNames)?;
+    let owner = run_names::Owner::At(at);
+    let found = run_names::found_answered(cx, &answered, owner, &mut *standing.store, &mut facts.bodies, &mut read, heap, frame)
+        .map_err(CliError::RunNames)?;
+    let program_found = found.program().ok_or(CliError::Start(StartError::NoProgram))?;
+    let list = found.list().ok_or(CliError::Start(StartError::NoProgram))?;
+    let closure = program_found.closure_in(alloc);
+    let native = crate::engine_start::native_image_for_cached(cx, &mut standing, list, &closure, true, watch, frame)
+        .map_err(|error| CliError::Start(StartError::Native { shown: bstd::mem::format_in!(frame, "{error}").as_str().into() }))?;
+
+    watch.see(blaze_screen::Step::Began(blaze_screen::Stage::BodyIds));
+    let asked = crate::run_ids::Asked::default();
+    let began_ids = phases.now();
+    let ids = body_ids(cx, &mut standing, list, &asked, bump)?;
+    let ids_ns = phases.since(began_ids);
+    let ids_line = ids.line(&asked, ids_ns);
+
+    let cert = crate::engine_start::body_ids_cert(standing.root, standing.scope);
+    let run_shape = blaze_ids::ContentId::of(crate::engine_start::RUN_SHAPE, picked.root.as_bytes());
+    let run_list_name = crate::start_list::ListName::of(&run_shape);
+    let ids_table = blaze_cas::Key(crate::run_ids::table_key(cert, standing.toolchain, &standing.tools).0);
+    let workspace_id = crate::engine_start::workspace_anchor_id(list, alloc);
+    let build_shape = build_program_shape(picked, workspace_id, list.key(at));
+    let jit_boot_shape = blaze_ids::ContentId::of(JIT_BUILD_SHAPE, &build_shape.0);
+    let jit_today = crate::start_list::Today {
+        certificate: crate::start_list::Certificate::of_answer(&standing),
+        name: crate::start_list::ListName::of(&jit_boot_shape),
+        tables: [ids_table, blaze_cas::Key(native.key.0)],
+    };
+    let pgo_key = crate::pgo_store::pgo_ptr_key(build_shape);
+
+    let lent = standing.lent;
+    let mut extra_keys: AVec<'_, blaze_cas::Key> = Vec::new_in(alloc);
+    let has_pgo = match crate::pgo_store::load_pgo(lent, &pgo_key) {
+        Ok(Some((pgo_rec_key, _))) => {
+            extra_keys.push(pgo_key);
+            extra_keys.push(pgo_rec_key);
+            true
+        }
+        Ok(None) => false,
+        Err(why) => {
+            return Err(box_err(
+                ExportCliError::Pgo { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            ));
+        }
+    };
+    // Root JIT boot tables (`ids_table`, `native.key`, `pgo`) under `JIT_BUILD_SHAPE`, and renew
+    // `RUN_SHAPE` + `toolchain` in O(1) without overwriting or unrooting `blaze run` / `jit-exec`'s
+    // JIT code/start-list root or `--release`'s AOT code root.
+    crate::store::roots::keep_program(lent, &jit_today, None, extra_keys.as_slice()).map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "jit program", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+    crate::store::roots::renew_program(lent, &run_list_name);
+    crate::store::roots::keep_toolchain(lent, standing.toolchain, &[], &[]).map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots { class: "toolchain", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+
+    let emit_began = phases.now();
+    let scope_kind = match standing.scope {
+        crate::engine_check::CheckScope::Whole => crate::launcher_stub::JitScopeKind::Whole,
+        crate::engine_check::CheckScope::Bin { .. } => crate::launcher_stub::JitScopeKind::Bin,
+        crate::engine_check::CheckScope::Test { .. } => {
+            return Err(box_err(
+                ExportCliError::JitLauncher { shown: owned_str("unexpected test scope in `blaze build`", heap.alloc()) },
+                heap,
+            ));
+        }
+    };
+    let blaze_exe = host.exe().map_err(|why| {
+        box_err(
+            ExportCliError::JitLauncher { shown: owned_fmt(format_args!("current blaze executable path unavailable: {why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+    let launcher_path = crate::own_process::launcher_beside(&blaze_exe, frame).map_err(|why| {
+        box_err(
+            ExportCliError::JitLauncher { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+            heap,
+        )
+    })?;
+    let checkout_abs = standing.place.served.root_text().ok_or_else(|| {
+        box_err(
+            ExportCliError::JitLauncher { shown: owned_str("checkout absolute path is unavailable for JIT executable", heap.alloc()) },
+            heap,
+        )
+    })?;
+    let store_home = standing.place.home.ok_or_else(|| {
+        box_err(
+            ExportCliError::JitLauncher { shown: owned_str("HOME is unset; JIT executable requires a store home path", heap.alloc()) },
+            heap,
+        )
+    })?;
+
+    let mut launcher_bytes = crate::launcher_stub::read_file_bytes(launcher_path.as_str(), alloc).map_err(|why| {
+        box_err(
+            ExportCliError::JitLauncher {
+                shown: owned_fmt(format_args!("reading `{}` failed: {why}", launcher_path.as_str()), frame, heap.alloc()),
+            },
+            heap,
+        )
+    })?;
+    let launcher_digest = blaze_ids::ContentId::of("blaze-cli jit launcher binary 1", launcher_bytes.as_slice()).0;
+
+    let manifest = crate::launcher_stub::JitBuildManifest {
+        blaze: String::from_str_in(&blaze_exe, alloc),
+        checkout: String::from_str_in(checkout_abs, alloc),
+        store_home: String::from_str_in(store_home, alloc),
+        cargo_home: standing.place.cargo_home.map(|c| String::from_str_in(c, alloc)),
+        sdk_root: standing.place.sdk.ok().map(|sdk| String::from_str_in(sdk.folder(), alloc)),
+        cert: standing.root.0,
+        package: String::from_str_in(picked.package, alloc),
+        bin: String::from_str_in(picked.bin, alloc),
+        manifest: String::from_str_in(picked.manifest, alloc),
+        root: String::from_str_in(picked.root, alloc),
+        edition: String::from_str_in(picked.edition, alloc),
+        scope_kind,
+        toolchain: standing.toolchain.0,
+        pgo_key: pgo_key.0.0,
+        launcher_digest,
+    };
+    let mut manifest_text = String::new_in(alloc);
+    manifest.encode(&mut manifest_text);
+
+    let (bytes_written, unchanged) = if !cx.is_simulated()
+        && let Ok(existing) = crate::launcher_stub::read_file_bytes(output_path, alloc)
+        && crate::launcher_stub::read_patched_slot(existing.as_slice()) == Some(manifest_text.as_bytes())
+    {
+        (existing.len() as u64, true)
+    } else {
+        let slot_offset = crate::launcher_stub::find_stub_slot(launcher_bytes.as_slice()).map_err(|why| {
+            box_err(
+                ExportCliError::JitLauncher {
+                    shown: owned_fmt(format_args!("locating EMBEDDED_STUB_SLOT in `{}`: {why}", launcher_path.as_str()), frame, heap.alloc()),
+                },
+                heap,
+            )
+        })?;
+        crate::launcher_stub::patch_stub_slot(launcher_bytes.as_mut_slice(), slot_offset, manifest_text.as_bytes()).map_err(|why| {
+            box_err(
+                ExportCliError::JitLauncher { shown: owned_fmt(format_args!("patching EMBEDDED_STUB_SLOT: {why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+        #[cfg(target_os = "macos")]
+        crate::launcher_stub::resign_macho_after_patch(&mut launcher_bytes, slot_offset, crate::launcher_stub::STUB_SLOT_SIZE).map_err(|why| {
+            box_err(
+                ExportCliError::JitLauncher { shown: owned_fmt(format_args!("Mach-O ad-hoc re-sign failed: {why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+        write_executable(cx, fs, output_path, launcher_bytes.as_slice(), heap)?;
+        (launcher_bytes.len() as u64, false)
+    };
+    let emit_ns = phases.since(emit_began);
+    let ids_line = crate::run_ids::IdsLine { read: asked.bodies(), folded: asked.reads(), ..ids_line };
+    phases.run_names = Some(run_names::NamesRead::of(read.counts(), &seen).with_ids(ids_line));
+    if let Some(why) = seen.refused() {
+        return Err(CliError::RunNames(run_names::RunNamesError::Trees { why }));
+    }
+
+    Ok(JitBuildSummary {
+        output: output_path,
+        bytes: bytes_written,
+        unchanged,
+        has_pgo,
+        body_ids_ns: ids_ns,
+        emit_ns,
+    })
+}
+
+/// Prints the concise one-line summary for a default JIT-on-call `blaze build`.
+fn print_jit_summary(
+    cx: &Cx,
+    summary: &JitBuildSummary<'_>,
+    wall_ns: u64,
+    stats: bool,
+    out: &Out,
+    err: &Out,
+) -> Result<(), CliError> {
+    let wall_ms = wall_ns / 1_000_000;
+    if summary.unchanged {
+        out.line(cx, format_args!("built {} (jit-on-call, unchanged, {} bytes, {} ms)", summary.output, summary.bytes, wall_ms))?;
+    } else {
+        out.line(cx, format_args!("built {} (jit-on-call, {} bytes, {} ms)", summary.output, summary.bytes, wall_ms))?;
+    }
+    if stats {
+        err.line(
+            cx,
+            format_args!(
+                "build stats: mode=jit-on-call unchanged={} pgo={} bytes={} body_ids={}ms emit={}ms wall={}ms",
+                summary.unchanged,
+                summary.has_pgo,
+                summary.bytes,
+                summary.body_ids_ns / 1_000_000,
+                summary.emit_ns / 1_000_000,
+                wall_ms,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
 /// Core whole-program reachability closure + `blaze_export::export` (or `wasm64`) + atomic write.
 #[expect(clippy::too_many_arguments, reason = "build pipeline entry: each argument one handle or selected option")]
 fn export_program<'f>(
@@ -2442,6 +2747,26 @@ fn export_program<'f>(
     let mut outcomes: AVec<'_, RowOutcome<'_>> = Vec::new_in(alloc);
     let mut dep_typed_program: AVec<'_, blaze_cas::Key> = Vec::new_in(alloc);
     let mut dep_typed_toolchain: AVec<'_, blaze_cas::Key> = Vec::new_in(alloc);
+    // Load any cross-run persisted `BPG1` PGO profile recorded by prior JIT runs (`blaze run` or
+    // default JIT `blaze build` executables) under the checkout-path-free `build_shape` key, and
+    // keep both pointer and record rooted across `--release` / `--standalone` builds.
+    let pgo_ptr_key = crate::pgo_store::pgo_ptr_key(build_shape);
+    let persisted_pgo: Option<AVec<'_, u8>> = match crate::pgo_store::load_pgo(lent, &pgo_ptr_key) {
+        Ok(Some((pgo_rec_key, pgo_bytes))) => {
+            dep_typed_program.push(pgo_ptr_key);
+            dep_typed_program.push(pgo_rec_key);
+            let mut copied = Vec::with_capacity_in(pgo_bytes.len(), alloc);
+            copied.extend_from_slice(pgo_bytes);
+            Some(copied)
+        }
+        Ok(None) => None,
+        Err(why) => {
+            return Err(box_err(
+                ExportCliError::Pgo { shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            ));
+        }
+    };
     let (mut compiled, mut cached, mut unkeyed, mut stubs) = (0usize, 0usize, 0usize, 0usize);
     let root_count = roots.len();
     let export_workers = usize::try_from(standing.workers.get().min(cx.workers()).saturating_sub(1))
@@ -2657,7 +2982,8 @@ fn export_program<'f>(
             lto_seeds.push(row);
         }
     }
-    let lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
+    let mut lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
+    lto_opts.pgo_bytes = persisted_pgo.as_deref();
     let lto_runner = CliLtoRunner { cx, workers: standing.workers };
     let lto_out = {
         let _lto_span = cx.span("export: workspace LTO");
@@ -3469,6 +3795,17 @@ mod tests {
     use bstd::mem::Frame;
 
     use super::*;
+
+    #[test]
+    fn select_build_mode_picks_jit_by_default_and_aot_for_release_standalone_or_wasm64() {
+        assert_eq!(select_build_mode(BuildTarget::Native, false, false), BuildMode::JitOnCall);
+        assert_eq!(select_build_mode(BuildTarget::Native, true, false), BuildMode::StandaloneAot);
+        assert_eq!(select_build_mode(BuildTarget::Native, false, true), BuildMode::StandaloneAot);
+        assert_eq!(select_build_mode(BuildTarget::Native, true, true), BuildMode::StandaloneAot);
+        assert_eq!(select_build_mode(BuildTarget::Wasm64, false, false), BuildMode::Wasm64);
+        assert_eq!(select_build_mode(BuildTarget::Wasm64, true, false), BuildMode::Wasm64);
+        assert_eq!(select_build_mode(BuildTarget::Wasm64, false, true), BuildMode::Wasm64);
+    }
 
     #[test]
     fn parse_output_target_handles_relative_and_absolute_paths() {

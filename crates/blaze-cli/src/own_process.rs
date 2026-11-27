@@ -183,6 +183,21 @@ pub(crate) fn launcher_beside<'f>(exe: &str, frame: &'f Frame) -> Result<bstd::m
     Ok(bstd::mem::format_in!(frame, "{folder}/{LAUNCHER}"))
 }
 
+/// Optional overrides used when `blaze jit-exec` boots a built JIT-on-call executable directly:
+/// - `launcher`: spawn the built executable itself (`./out`) with `BLAZE_LAUNCH_FD=3` so
+///   `std::env::current_exe()` inside the program resolves to `./out` rather than `blaze-launcher`;
+/// - `arg0`: forward the caller's exact `argv[0]`;
+/// - `store_home`: locate `.blaze/v2/run/records` and `.blaze/v2/runs` even when the caller cleared
+///   `HOME` via `env_clear()`, without injecting `HOME` into the child process's environment;
+/// - `pgo_key`: CAS pointer key for persisting the program's cross-run `BPG1` PGO profile on exit.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OwnOverrides<'a> {
+    pub(crate) launcher: Option<&'a str>,
+    pub(crate) arg0: Option<&'a str>,
+    pub(crate) store_home: Option<&'a str>,
+    pub(crate) pgo_key: Option<blaze_cas::Key>,
+}
+
 /// Runs the root package `package` in a process of its own under the lazy parent: the
 /// program's status. See the module's doc. `builder` is what its records are made for
 /// (run_parent.rs `builder_for`: the edition, the profile's overflow checks and panic strategy,
@@ -207,6 +222,7 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     native: Option<crate::engine_native::NativeSend<'_>>,
     lent: &crate::store::CommandLent,
     today: start_list::Today,
+    overrides: OwnOverrides<'_>,
     // The run's closing count, for the profile's `run` line on every run (phases.rs): set once
     // the program's loop ends, whether it ended well or not.
     counted: &mut Option<crate::run_parent::RunTally>,
@@ -216,12 +232,17 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     let fs = launch.fs;
     let host = launch.host;
     let err = launch.err;
-    // 1. The records folder, under the home the command was started with (rule 75: read here,
-    // at the edge, from the command's own environment), and the lazy parent: nothing built.
+    // 1. The records folder, under the home the command was started with (or the built JIT
+    // executable's embedded store home when `HOME` was cleared), and the lazy parent: nothing built.
     // The folder is the launcher's `BLAZE_LAUNCH_STORE` either way (the program's native
     // library is a file there, engine_native.rs).
-    let home_name = VarName::new("HOME").map_err(|_| OwnError::Parent(ParentError::NoHome))?;
-    let home = env.get(&home_name).ok().flatten().ok_or(OwnError::Parent(ParentError::NoHome))?;
+    let home: &str = match overrides.store_home {
+        Some(h) => h,
+        None => {
+            let home_name = VarName::new("HOME").map_err(|_| OwnError::Parent(ParentError::NoHome))?;
+            env.get(&home_name).ok().flatten().ok_or(OwnError::Parent(ParentError::NoHome))?
+        }
+    };
     let records = Path::new(RECORDS).map_err(|why| OwnError::Parent(ParentError::Path(why)))?;
     let folder = fs.home(cx, home, &records).map_err(|why| OwnError::Parent(ParentError::Home(why)))?;
     let erased = blaze_own::Erased::new(frame);
@@ -271,9 +292,17 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     let head = run_parent::ahead_of(rows, &mut lazy, &mut needs, &mut placed, &mut ahead).map_err(OwnError::Parent)?;
     let line = head.line;
     let entry = bstd::mem::format_in!(frame, "{line}");
-    // 3. The launcher.
+    // 3. The launcher (either the built JIT executable itself, or `blaze-launcher` beside `blaze`).
     let exe = host.exe().map_err(OwnError::Missing)?;
-    let launcher = launcher_beside(&exe, frame)?;
+    let default_launcher = match overrides.launcher {
+        Some(_) => None,
+        None => Some(launcher_beside(&exe, frame)?),
+    };
+    let launcher_path: &str = match (overrides.launcher, default_launcher.as_ref()) {
+        (Some(path), _) => path,
+        (None, Some(path)) => path.as_str(),
+        (None, None) => unreachable!(),
+    };
     // 4. Its environment: the command's own, then the run mode's.
     let mut granted = [0u8; MOST_BYTES];
     let mut vars: Vec<(&str, &str), &Frame> = Vec::new_in(frame);
@@ -335,9 +364,9 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     };
     explore_env(launch.open, telemetry, &mut vars)?;
     let spawner = host.spawner().map_err(OwnError::Missing)?;
-    // The program's command line, for every entry form: its name first (`arg0`, the binary
-    // target's), then the words after `--`.
-    let started = run_loop::Launch { launcher: launcher.as_str(), arg0: package, args: launch.args, env: &vars, dir: WORKING_DIR };
+    // The program's command line, for every entry form: its name first (`arg0`), then the args.
+    let arg0 = overrides.arg0.unwrap_or(package);
+    let started = run_loop::Launch { launcher: launcher_path, arg0, args: launch.args, env: &vars, dir: WORKING_DIR };
     // 5. The loop, in the span that names its one exempt wait; today's list placed first.
     let ran = {
         let cx = cx.span(PROGRAM_SPAN);
@@ -435,13 +464,16 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     });
     // The walk is over: what the code store served and made is final (the program root's half).
     drop(lazy);
-    let walked = codes.reached();
+    if let Err(why) = codes.ensure_persisted() {
+        err.line(cx, format_args!("blaze run: refreshing persisted code entries before rooting failed: {why}")).map_err(OwnError::Out)?;
+    }
+    let mut walked = codes.reached();
     let toolchain_made = codes.toolchain_made();
     let ran = ran.map_err(|error| match error {
         LoopError::Start(error) => OwnError::NotStarted {
-            launcher: std::boxed::Box::from(launcher.as_str()),
+            launcher: std::boxed::Box::from(launcher_path),
             exe: std::boxed::Box::from(&*exe),
-            there: beside(cx, &fs, launcher.as_str(), frame),
+            there: beside(cx, &fs, launcher_path, frame),
             error,
         },
         other => OwnError::Loop(other),
@@ -452,6 +484,24 @@ pub(crate) fn run_own<'h, F: Front<Maker = crate::run_parent::RunMaker<'h>>>(
     // A clean run stays quiet on stderr so its output is the program's alone (`run_output.rs`);
     // the profile always records `{tally}`.
     let _ = tally;
+    // Persist cross-run `BPG1` PGO profile from the functions observed executing during this run,
+    // rooting both the pointer and the record under the program's CAS root for `blaze build --release`.
+    if let Some(pgo_key) = overrides.pgo_key {
+        let mut executed = Vec::new_in(alloc);
+        for group in needs.first().groups() {
+            executed.push(group.code.symbol.0);
+        }
+        match crate::pgo_store::record_jit_pgo(lent, &pgo_key, executed.as_slice(), alloc) {
+            Ok(Some((ptr_key, rec_key))) => {
+                walked.push(ptr_key);
+                walked.push(rec_key);
+            }
+            Ok(None) => {}
+            Err(why) => {
+                err.line(cx, format_args!("blaze run: the program ended with {}, and its PGO profile was not kept: {why}", ran.status)).map_err(OwnError::Out)?;
+            }
+        }
+    }
     // This run's first answers, the next start's list, under today's certificate.
     let mut bytes = blaze_own::Vec::new_in(alloc);
     let wrote = needs

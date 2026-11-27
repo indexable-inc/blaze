@@ -2167,6 +2167,210 @@ pub(crate) fn check_for_ci<R>(
     )
 }
 
+/// Opens an absolute directory path through `bstd::fs::Fs::home` without ambient `std::fs`.
+fn open_abs_dir(cx: &Cx, fs: &bstd::fs::Fs, abs: &str) -> Result<Dir<ReadWrite>, CliError> {
+    let trimmed = abs.trim_end_matches('/');
+    let Some((parent, leaf)) = trimmed.rsplit_once('/') else {
+        return Err(CliError::Text { what: "pinned JIT checkout path is not absolute" });
+    };
+    let parent = if parent.is_empty() { "/" } else { parent };
+    if leaf.is_empty() || leaf == "." || leaf == ".." {
+        return Err(CliError::Text { what: "pinned JIT checkout path has invalid final segment" });
+    }
+    let rel = Path::new(leaf)?;
+    fs.home(cx, parent, &rel).map_err(|why| {
+        CliError::Store(crate::store::StoreFailure::Home(why))
+    })
+}
+
+/// Opens a pinned engine answer `Standing` directly from `cert` (`standing.root`) in `store_home`
+/// for `blaze jit-exec` — ZERO workspace stat sweep, ZERO file hashing, and ZERO re-checking.
+/// Commits the store cleanly after `start` returns (including updated `start_list`, compiled
+/// `CodeRecord`s, and persisted `BPG1` PGO profile).
+#[expect(clippy::too_many_arguments, reason = "pinned JIT execution edge: each argument one capability or manifest field")]
+pub(crate) fn open_pinned_standing<R>(
+    cx: &Cx,
+    fs: &bstd::fs::Fs,
+    env: Option<&bstd::env::Env>,
+    host: &bstd::host::Host,
+    rng: &mut bstd::rng::Rng,
+    err: &Out,
+    phases: &mut Phases,
+    heap: &'static blaze_own::Heap,
+    checkout_abs: &str,
+    store_home: &str,
+    manifest_cargo_home: Option<&str>,
+    manifest_sdk_root: Option<&str>,
+    cert: blaze_ids::ContentId,
+    toolchain: blaze_toolchain::ToolchainId,
+    scope: CheckScope<'_>,
+    picked: crate::run_package::Program<'_>,
+    start: impl for<'r, 'm> FnOnce(Standing<'r, 'm>, &mut Phases, &mut bstd::rng::Rng) -> Result<R, CliError>,
+) -> Result<R, CliError> {
+    let request = request_frame()?;
+    let frame = &request;
+    let var = |name: &str| -> Option<&str> {
+        let env = env?;
+        let key = VarName::new(name).ok()?;
+        env.get(&key).ok().flatten()
+    };
+    let root = open_abs_dir(cx, fs, checkout_abs)?;
+    let cores = u32::try_from(host.cores().get()).unwrap_or(u32::MAX);
+    let workers = NonZeroU32::new(cores).unwrap_or(NonZeroU32::MIN);
+    let producers = crate::producers::table(host.build_id()?.as_bytes());
+    let cargo_home_buf = match (var("CARGO_HOME"), manifest_cargo_home) {
+        (Some(c), _) => Some(bstd::mem::format_in!(frame, "{c}")),
+        (None, Some(c)) => Some(bstd::mem::format_in!(frame, "{c}")),
+        (None, None) => Some(bstd::mem::format_in!(frame, "{}/.cargo", store_home.trim_end_matches('/'))),
+    };
+    let exe_dir = match std::env::current_exe() {
+        Err(error) => Err(crate::fetch::ExeDirWhy::Unknown { kind: error.kind() }),
+        Ok(exe) => match exe.parent().and_then(|dir| dir.to_str()) {
+            Some(dir) => Ok(bstd::mem::format_in!(frame, "{dir}")),
+            None => Err(crate::fetch::ExeDirWhy::NotUtf8),
+        },
+    };
+    let lazy_sdk = LazySdk {
+        fs,
+        sdkroot: var("SDKROOT").or(manifest_sdk_root),
+        xcrun_env: crate::sdk::XcrunEnv {
+            path: var("PATH"),
+            developer_dir: var("DEVELOPER_DIR"),
+            home: var("HOME").or(Some(store_home)),
+            toolchains: var("TOOLCHAINS"),
+        },
+        frame,
+        resolved: core::cell::OnceCell::new(),
+    };
+    let sdk = Err(blaze_apple_sdk::SdkRefused::Neither { xcrun: blaze_apple_sdk::XcrunFailed::NotMacos });
+    let served = crate::engine_script_reads::Served::at_edge(cx.is_simulated(), checkout_abs, frame)
+        .map_err(EngineCheckError::ServedRoot)?;
+    let target_rustflags_var = blaze_manifest::rustflags::target_variable(crate::graph::TRIPLE, heap.alloc());
+    let max_store_bytes = crate::gc::budget_from_env(env)?;
+    let place = Place {
+        checkout: served.root_text().unwrap_or(checkout_abs),
+        served,
+        cert_file: var("SSL_CERT_FILE"),
+        cert_dir: var("SSL_CERT_DIR"),
+        rustflags: blaze_manifest::rustflags::RustflagsEnv {
+            encoded: var("CARGO_ENCODED_RUSTFLAGS"),
+            plain: var("RUSTFLAGS"),
+            build: var("CARGO_BUILD_RUSTFLAGS"),
+            target: var(target_rustflags_var.as_str()),
+        },
+        home: Some(store_home),
+        max_store_bytes,
+        cargo_home: cargo_home_buf.as_ref().map(|c| c.as_str()),
+        start: served.root_text().or(Some(checkout_abs)),
+        sdk,
+        exe_dir: exe_dir.as_ref().map(|dir| dir.as_str()).map_err(|why| *why),
+        lan_peer: crate::fetch::LanPeerConfig::from_env(var("BLAZE_NO_LAN_PEER")),
+    };
+    let opened = crate::store::open_for_command(
+        cx,
+        fs,
+        host,
+        rng,
+        Some(store_home),
+        max_store_bytes,
+        &root,
+        place.checkout,
+        phases.clock(),
+        err,
+        heap,
+    )?;
+    let erased = blaze_own::Erased::new(frame);
+    let mut store = crate::store::CommandStore::new(cx, &opened.lent, false, opened.open_ns, None, phases.clock().clone(), err, erased.handle())?;
+    let request_mem = crate::engine_phase_mem::RequestMem::new()?;
+    let alloc = request_mem.shared();
+    let stood_root = match crate::engine_answer::open_root(cx, &mut store, blaze_drive::Key(cert), alloc)? {
+        Ok(stood_root) => stood_root,
+        Err(why) => return Err(EngineCheckError::StartNoAnswer { why: Some(why) }.into()),
+    };
+    let snapshot = store.snapshot_in(alloc)?;
+    let headers = blaze_engine::pages::Headers::Absent { since: blaze_engine::Gen(0) };
+    let stored = crate::engine_answer::Stored::new(&stood_root, &snapshot, &headers, blaze_engine::pages::Check::Store, alloc);
+    let rows = stored.answer();
+    let refused: core::cell::Cell<Option<(Name, &'static str)>> = core::cell::Cell::new(None);
+    let input = |name: Name| -> Option<blaze_drive::Input> {
+        let records: &dyn crate::engine_run_answer::Records = &stored;
+        let at = match records.record(name) {
+            Ok(at) => at?,
+            Err(why) => {
+                refused.set(Some((name, why)));
+                return None;
+            }
+        };
+        match rows.row_facts(name) {
+            Ok(Some(row)) if !row.failed => Some(blaze_drive::Input { name, at, out: row.out }),
+            Ok(_) => None,
+            Err(_) => {
+                refused.set(Some((name, "a page of the pinned JIT answer is refused")));
+                None
+            }
+        }
+    };
+    let Some(graph) = input(Name::unit_graph()) else {
+        if let Some((name, why)) = refused.get() {
+            return Err(EngineCheckError::StartPage { name, why }.into());
+        }
+        return Err(EngineCheckError::StartNoGraph.into());
+    };
+    if let Some((name, why)) = refused.get() {
+        return Err(EngineCheckError::StartPage { name, why }.into());
+    }
+    let sdk_resolver = |cx: &Cx, home_dir: Option<&Dir<ReadWrite>>, wall_ns: u64| {
+        lazy_sdk.resolve_on_demand(cx, home_dir, wall_ns)
+    };
+    let standing = Standing {
+        root: cert,
+        store: &mut store,
+        lent: &opened.lent,
+        rows: &rows,
+        records: &stored,
+        graph,
+        names: &input,
+        errors: 0,
+        status: Status::OK,
+        checkout: &root,
+        place,
+        toolchain,
+        tools: crate::home::tools(&producers, crate::lints::Lints::NONE.rules),
+        producers: &producers,
+        workers,
+        err,
+        heap,
+        frame,
+        native: crate::engine_native::NativeAsk { producer: producers.get::<blaze_ids::producer::Whole>(), home: place.home, words: frame, fs: fs.clone() },
+        member: "",
+        scope,
+        picked: Some(picked),
+        test_packages: None,
+        sdk_resolver: &sdk_resolver,
+        home_dir: Some(opened.home.dir()),
+    };
+    let started = start(standing, phases, rng);
+    if let Some((name, why)) = refused.get() {
+        return Err(EngineCheckError::StartPage { name, why }.into());
+    }
+    let started = started?;
+    crate::store::Store::after_answer(&mut store, cx, &mut blaze_drive::profile::Profile::default())?;
+    drop(rows);
+    drop(stored);
+    drop(snapshot);
+    drop(store);
+    crate::store::after_answer_printed_with(
+        cx,
+        opened.lent,
+        &opened.home,
+        false,
+        crate::store::StoreTeardown::ForgetForExit,
+        phases.clock(),
+        err,
+    )?;
+    Ok(started)
+}
+
 /// Verifies that `path`'s `LeafKind::Manifest` row in `leaves` is present, settled, and matches
 /// today's on-disk `stat` stamp (1 syscall, 0 directory listings).
 fn manifest_stamp_matches(
