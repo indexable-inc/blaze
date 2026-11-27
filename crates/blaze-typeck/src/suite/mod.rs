@@ -103,6 +103,7 @@ mod pattern_types;
 mod pin_unsize;
 mod pin_unsize_interior;
 mod projection_unsize;
+mod infer_to_dyn_unsize;
 mod struct_tail_unsize;
 mod self_impl_args;
 mod self_paths;

@@ -85,6 +85,11 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let after = self.checked.adjusts.column::<2>()[self.adjust_rows(e).start + n];
         let gb = self.ground_ty(before).map_err(|error| Self::ty_err(e, error))?;
         let ga = self.ground_ty(after).map_err(|error| Self::ty_err(e, error))?;
+        // A deferred `Unsize` / `CoerceUnsized` whose source variable resolved to the target
+        // object itself (`&dyn Tr -> &dyn Tr`, `Box<dyn Tr> -> Box<dyn Tr>`) is a no-op.
+        if gb == ga {
+            return Ok(());
+        }
         let v = self.pop()?;
         let (rb, ra) = (self.repr_at(e, before)?, self.repr_at(e, after)?);
         let dst = self.temp(ra);
