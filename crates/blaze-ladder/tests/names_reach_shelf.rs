@@ -1,4 +1,4 @@
-//! How much of each dependency a real program's NAMES reach (engine.md piece E13, D134: lazy
+//! How much of each dependency a real program's NAMES reach (end-state.md D157, D134: lazy
 //! names of dependencies; rule 16, measured before it is built): a `std` program's graph on the
 //! real toolchain shelf, solved once with every crate's groups asked for
 //! (tests/names_groups_shelf.rs), then, from the group records ALONE, the closure of what the

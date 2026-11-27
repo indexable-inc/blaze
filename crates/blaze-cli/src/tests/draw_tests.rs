@@ -41,8 +41,8 @@ fn broken() -> Io {
 /// What that work takes in all is many times the scratch: the 400 outlines alone are about
 /// 8 MiB (20 KiB each), and the 4,000 drawings more than 256 KiB. Before `Scratch` each FINDING
 /// kept its file's outline and four copies of its text in the command's frame (blaze's own
-/// 3,487 findings filled a 64 MiB frame and the command panicked while printing: drive.md,
-/// runner 13). So this passes only while a file's work is freed a file and a drawing's a
+/// 3,487 findings filled a 64 MiB frame and the command panicked while printing).
+/// So this passes only while a file's work is freed a file and a drawing's a
 /// finding. Run once with each reset removed (2026-11-16); the test then fails with:
 /// `one.reset()` out of print.rs `file_findings`: `the request answers: Draw(Stopped { doing:
 /// "drawing", path: "src/a7/m16.rs", cut: false, file: 0, one: 262132, limit: 262144 })`;

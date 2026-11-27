@@ -65,7 +65,7 @@ pub trait Par {
         let _ = (def, input);
     }
 
-    /// D116's equality check (drive.md "Names at module grain"): a clock in nanoseconds asks
+    /// D116's equality check (end-state.md D158): a clock in nanoseconds asks
     /// each crate's solve to decide every cell again on demand over its frozen tables and
     /// compare. The library holds no clock: `None` by default, and the check does not run.
     fn decide_check(&self) -> Option<&dyn Fn() -> u64> {

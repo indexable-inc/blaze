@@ -1,4 +1,4 @@
-//! Typed, borrowed views of a parse's tree (frontend.md item 16): what replaces `ast` and the
+//! Typed, borrowed views of a parse's tree (bottom.md): what replaces `ast` and the
 //! `SyntaxNode` handles. A view is the tree it is in and an element's number there, `Copy`,
 //! `Send` and `Sync`; nothing is counted, cloned or allocated to make, move or walk one. A view
 //! lives as long as the borrow of the [`Parse`] (or [`FlatTree`]) it is a view of; what must

@@ -1,7 +1,7 @@
 //! The checker at scale: every body of real crates through the ladder's front end
 //! (crates/blaze-ladder/src/front.rs: outline, `lower_signature`, `lower_body`, `to_typeck`, its
 //! names and its `World`) and blaze-typeck's `check_logged`, with what stops each body, by
-//! cause, and what each check costs (typeck.md, "Checker at scale (2026-11-16)").
+//! cause, and what each check costs.
 //!
 //! `check <crate dir>...`: each crate is one program of `src/**/*.rs`, rooted at `src/lib.rs`
 //! (or `src/main.rs`). The front end stops a program at its first refusal, so the harness

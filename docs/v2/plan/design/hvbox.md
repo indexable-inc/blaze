@@ -11,7 +11,7 @@ test before anything rests on them.
 
 ## Why
 
-blaze's macOS path for native build scripts (`blaze-proc-macro/src/native_sandbox.rs`,
+blaze's macOS path for native build scripts (`blaze-std/src/procs/hermetic/seatbelt.rs`,
 `sandbox-exec` with a deny-default profile) gets a bare `EPERM` from the kernel and records no
 reads. A layer that every call passes through can name each refused path and its rule, and
 record every read, miss, listing and environment read, which is what a step's result is keyed

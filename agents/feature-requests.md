@@ -33,10 +33,10 @@ Format for new entries:
 
 ### 2026-11-26 — `blaze-ctx` hierarchical summary tree + `blaze-tab` output + `agents/` annoyance indexing
 
-- **Area**: `blaze-ctx` (planned), `crates/blaze-tab`, `agents/annoyances/`, `agents/howto/`
+- **Area**: `crates/blaze-ctx`, `crates/blaze-tab`, `agents/kb/`, `agents/howto/`
 - **Kind**: `tooling`
-- **Friction / Bug**: Agents spend multiple search/read turns reconstructing crate boundaries, module maps, and prior pitfalls spread across 190+ crates and 580+ `agents/annoyances/*.json` files, often missing relevant annoyances or burning context on verbose JSON/grep output.
-- **Request**: Ship `blaze-ctx` to maintain an item-/crate-grain hierarchical summary tree emitted in compact `blaze-tab` format and automatically surface matching `agents/howto/` and `agents/annoyances/` rows for any queried crate or path.
+- **Friction / Bug**: Agents spend multiple search/read turns reconstructing crate boundaries, module maps, and prior pitfalls spread across 190+ crates and the `agents/kb/` tables, often missing relevant annoyances or burning context on verbose JSON/grep output.
+- **Request**: Make `blaze-ctx` maintain an item-/crate-grain hierarchical summary tree emitted in compact `blaze-tab` format and automatically surface matching `agents/howto/` and `agents/kb/` rows for any queried crate or path.
 
 ### 2026-11-26 — Fail fast on sandbox-blocked shell execution
 
@@ -65,3 +65,24 @@ Format for new entries:
 - **Kind**: `tooling` + `strictness/lint`
 - **Friction / Bug**: `ByKind` currently reads persisted `Typed` body records only for workspace member crates and falls back to `BodySource::Run` re-typechecking for `Toolchain` (`core`/`alloc`/`std`) and `Dependency` crates during `engine_export.rs` and `blaze run`/`test`, burning redundant CPU time on every export/codegen cold miss.
 - **Request**: Persist item-grained `Typed` body records for `Toolchain` and `Dependency` crates (shared via R2 for pinned `std`/crates.io) so `engine_export.rs` reads all reachable bodies via `BodySource::Read` and eliminates `BodySource::Run` re-typechecking entirely.
+
+### 2026-11-27 — A doc claim of "built" is checked against a caller
+
+- **Area**: `scripts/src/bin/docs.rs`, `docs/`
+- **Kind**: `tooling` + `strictness/lint`
+- **Friction / Bug**: A docs audit found about forty `current` or `plan` docs calling a design "built" whose crate was deleted or whose only callers are tests (`blaze-stage`, `blaze-malloc`, `blaze-test-reach`, `blaze-store-check`, `blaze-world-api`, `blaze-format-tiers`, `blaze-rel`, `blaze-profile` from the `blaze` binary, blaze-http's `h3` wire, `blaze_run::{heat, registry, tier}`); the docs check holds paths, not reachability.
+- **Request**: A gate check that fails for a workspace crate no binary reaches (with a dated allowlist), and for a `current` doc naming such a crate without the words "built, not wired"; delete or wire each crate on the list.
+
+### 2026-11-27 — Code that contradicts a stated rule, found while auditing docs
+
+- **Area**: `crates/blaze-build/src/walk/tail_call.rs`, `crates/blaze-proc-macro/src/native_bridge.rs`, `crates/blaze-proc-macro/src/module.rs`, `crates/blaze-graph/src/sched/fiber.rs`, `crates/blaze-typeck`, `flake.nix`
+- **Kind**: `strictness/lint`
+- **Friction / Bug**: (1) `tail_call.rs:5` falls back to a call and a return for an ineligible `become` (rule 3; backend-next.md point 9 says refuse by name). (2) `native_bridge.rs:85-106` finds a proc-macro server through `rustc --print sysroot` (rules 1 and 3). (3) Compiled proc-macro and build-script modules are keyed per crate by SHA-256 (caches.md `compiled-modules`), not per item on `blaze_ids`. (4) Fiber code remains although D157/D161 decide no fibers. (5) blaze-typeck restarts from the top on `Need`; D161 decides park and resume. (6) `flake.nix` calls `.github/scripts/build_release.py`, which is not in the tree; `site/install.sh` and `harness/smoke/smoke.json` name a `blaze-engine` binary no crate builds. (7) Twelve code comments name the store folder `f5s3`; it is `f6s3`.
+- **Request**: Fix each at its cause; for (1) and (2) a lint that refuses a second route (`rustcsites` already counts (2)'s kind and should fail on it).
+
+### 2026-11-27 — Deleting a doc that code cites
+
+- **Area**: `scripts/src/bin/docs.rs`
+- **Kind**: `tooling`
+- **Friction / Bug**: 154 comments and `clippy.toml` reasons cited one design doc by path and section title, so merging that doc meant editing about 290 files; cited section titles and decision ids are not checked at all, so a comment can cite a heading that was cut.
+- **Request**: `docs check` also resolves a cited heading or `D<n>` id after a doc path in code comments, and code cites a decision id (stable) in preference to a doc section.

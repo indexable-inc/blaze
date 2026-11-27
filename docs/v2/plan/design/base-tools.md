@@ -55,8 +55,9 @@ the OS.
 
 ## Order of work
 
-1. The reader: `pins/base-tools.json`, the shelf folder, `PATH`, the profile, the key. With a
-   fake set in tests.
+1. Built: the reader, in `crates/blaze-base-tools` (`pins/base-tools.json`, the set, `PATH`, the
+   profile lines, the key part), read by `crates/blaze-proc-macro/src/spawn_route.rs`. Each
+   platform's digest is still `PENDING`, and `pins/clang.json` `host_tools` still serves.
 2. The archive for `aarch64-apple-darwin`, then Linux arm64.
 3. Switch the process-tree runner and the native script modules to it; delete `host_tools`
    and its readers; ban the name.

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze owns its test engine. A test case is a function of one tape of labelled, bounded choices in which 0 is always the calm choice; `crates/blaze-sim` draws the tape from a seed, shrinks a failing tape to the fewest and smallest choices that still fail, prints it and replays it exactly, and holds the pieces every simulation re-implemented by hand (in-flight answers delivered by choice, planted-bug controls, reach points). Hegel and `vendor/hegeltest` go; `blaze_core::sim::Sim`, the fresh core's simulation and `blaze-check`'s random schedules come to draw from the same tape.
+summary: blaze owns its test engine. A test case is a function of one tape of labelled, bounded choices in which 0 is always the calm choice; `crates/blaze-sim` draws the tape from a seed, shrinks a failing tape to the fewest and smallest choices that still fail, prints it and replays it exactly, and holds the pieces every simulation re-implemented by hand (in-flight answers delivered by choice, planted-bug controls, reach points). Built and in every crate's tests; `blaze_core::sim::Sim`'s own generator and `blaze-check`'s random schedules are still to draw from the same tape. A model is held to the real service by one conformance suite.
 date: 2026-11-13
 ---
 # One tape: blaze's own test engine and simulation kit
@@ -8,24 +8,6 @@ date: 2026-11-13
 Decided by Andrew, 2026-11-13 (decision D37): the simulated machine stays in blaze, and blaze
 stops depending on Hegel. This page is the design; `crates/blaze-sim` is its interface crate
 (rule interfaces-first), and row V12 of the ledger tracks it.
-
-## What was wrong
-
-Measured on main at e6635c9ba7:
-
-- **A schedule is one opaque number.** Every simulation draws a `u64` from Hegel and seeds a
-  `SplitMix64` with it (`crates/blaze-keyed/src/tests.rs`, every `Sim::new(tc.draw(..), ..)`).
-  Hegel shrinks the operations and never the delivery order, the kill point or which write tore,
-  so a failure prints a minimal plan under an arbitrary schedule.
-- **Three machines that do not meet.** `blaze_core::sim::Sim` has a disk, crashes and faults on
-  one thread; `crates/blaze-check` interleaves atomics and locks with no disk; the fresh core's
-  crates each carry a hand-rolled loop. Eleven more `struct Sim` exist beside those.
-- **The scaffolding is copied.** 18 `trait Draw`, 21 `fn control(`, 92 `enum Plant`, 53
-  `fn drain(`, 5 identical `Broke`, 527 `the_oracle_catches_*` each with its own seed loop.
-- **Two runners.** `blaze_core::sim::seeds` sweeps fixed seeds and cannot shrink; a Hegel test
-  shrinks and draws fresh seeds each run, so a green run is not green again (annoyance A11).
-- **A vendored engine nobody controls.** `vendor/hegeltest` is a native engine pinned 13 commits
-  behind its fork; bstd cannot depend on it (bstd-sim-test.md, "Lost alternative").
 
 ## The design
 
@@ -105,16 +87,13 @@ facade), on a native engine bstd cannot depend on, and on code blaze does not ow
 
 ## Order
 
-1. **The interface crate** (done, on main in #2124): `crates/blaze-sim` with tape, engine,
-   driver, kit and its own proof.
-2. **Ports** (done): every crate's tests call `blaze_sim::check` and `blaze_sim::control`. The
-   fresh core's crates (blaze-keyed, -findings, -expansion, -program, -mutants, -remote, -memo)
-   draw their simulations' schedules from the tape; a test on `Sim` draws its seed from the tape
-   as `"sim seed"`. `vendor/hegeltest` is deleted.
-3. **Next**: `Sim`'s own generator becomes the tape (its `Rng` is the tape, `Sim::new` takes
+Built: `crates/blaze-sim` (tape, engine, driver, kit, its own proof); every crate's tests call
+`blaze_sim::check`; the fresh core's simulations draw their schedules from the tape.
+
+1. **Next**: `Sim`'s own generator becomes the tape (its `Rng` is the tape, `Sim::new` takes
    one, `seeds` becomes a client of the engine), so its latencies, delivery order, tears and
    failures are shrunk with the plan.
-4. **After**: `blaze-check`'s random and PCT schedules draw from the tape (one case then
+2. **After**: `blaze-check`'s random and PCT schedules draw from the tape (one case then
    interleaves threads and crashes a disk); `Sim`'s disk takes the three-layer crash model
    (writes durable only through a sync, directory entries only through their directory's);
    several processes and two versions on one disk; plants passed in as a type parameter, so no
@@ -130,12 +109,6 @@ body with a known least failing tape ends on exactly that tape; one configuratio
 verdict, twice, byte for byte; a body that reads something outside its tape is reported as
 that; a check that drew nothing, discarded everything or missed a reach point fails by name;
 `Flight` delivers oldest first when calm and reaches every order when seeded.
-
-## What the first night found
-
-On fixed seeds, the store's ported tests found two bugs that were on main: a batch read handed
-one file's bytes to its neighbour, and a derive chain two deep left its lower base in `placed/`.
-Both were fixed, each with its case pinned, in the same change.
 
 ## A model is held against what it models
 

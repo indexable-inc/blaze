@@ -1,44 +1,43 @@
 ---
-status: plan
-summary: blaze's QUIC and WebTransport stack becomes sans-IO cores with thin drivers, on rustls. quinn-proto stays as the QUIC core; a new HTTP/3 + WebTransport core in blaze-http (static-only QPACK, SETTINGS, extended CONNECT, WebTransport streams and datagrams) drives it; one driver on blaze-core's effects (io_uring, kqueue or the simulation; no tokio) owns the UDP socket and the timer behind the same driver contract as HTTP/1. quinn, quinn-udp, wtransport and wtransport-proto leave the graph. Covers what blaze uses QUIC for, the contracts, the browser's requirements, the losing designs, migration and tests.
-date: 2026-11-04
+status: current
+summary: "blaze's HTTP/3 and WebTransport stack (blaze-http `h3`): a sans-IO core over quinn-proto and rustls (static-only QPACK, SETTINGS, extended CONNECT, WebTransport streams and datagrams, plain GET/HEAD requests with tickets and 0-RTT) and one driver on blaze-core's effects. Built, not wired: its users (the explorer's server in ix-prof, blaze-remote's HTTP/3 bucket) have no caller outside tests. Covers its users, the contracts, the browser's requirements, the losing designs, cost and tests."
 ---
 # HTTP/3 and WebTransport, sans-IO
 
-The owner has decided: blaze's QUIC and WebTransport stack follows rule 14 (sans-io-cores), as
-the HTTP/1.1 client already does (`crates/blaze-http`). Protocol
+blaze's QUIC and WebTransport stack follows rule 14 (sans-io-cores), as
+the HTTP/1.1 client does (`crates/blaze-http`). Protocol
 logic lives in synchronous state machines that take bytes, completions and the time, and hand
 back bytes, events and deadlines. One thin driver per IO backend does the IO.
 
 ## 1. What blaze uses QUIC for
 
-One thing: `blaze explore`. The daemon serves an HTTP/3 WebTransport endpoint on `127.0.0.1`,
+One thing: the explorer. ix-prof's `explore` serves an HTTP/3 WebTransport endpoint on `127.0.0.1`,
 and the page `https://ix.dev/explore` connects back to it from the browser
-(docs/v2/plan/design/explore.md). The users are:
+(docs/v2/plan/design/explore-generic.md). The users are:
 
-- `crates/blaze-explore/src/server.rs`: the explorer's server. It binds UDP on `127.0.0.1:0`,
+- `crates/ix-prof/src/explore/server.rs`: the explorer's server. It binds UDP on `127.0.0.1:0`,
   refuses a CONNECT whose path is not `/explore/v1` (404) or whose Origin is not allowed (403),
   answers one JSON request per bidirectional stream, opens one unidirectional stream for the
   live feed, closes a session with code 1 after `bad_token`, swaps its certificate every 12
   days on the same socket, and closes every session with code 0 when it stops.
-- `crates/blaze-explore/src/cert.rs`: the self-signed ECDSA P-256 certificate, valid 13 days,
+- `crates/ix-prof/src/explore/cert.rs`: the self-signed ECDSA P-256 certificate, valid 13 days,
   that the page pins by its SHA-256 (`serverCertificateHashes`).
-- `crates/blaze-explore/src/bin/blaze-explore-probe.rs`: an echo server (bidirectional,
-  unidirectional, datagrams) with the same certificate, for checking a browser by hand.
-- `crates/blaze-cargo/src/serve/observe.rs`: starts and stops the explorer through
-  `blaze_explore::{start, Config, Explorer}`; it never names the transport.
 
-So blaze is the server. The only client is the explorer's own test, which plays the browser
-(and, like the browser, checks the certificate by hash, P-256 and a validity of at most 14
-days). No other part of blaze speaks QUIC, and none should until it needs to.
+So blaze is the server. The explorer's own test plays the browser (and, like the browser,
+checks the certificate by hash, P-256 and a validity of at most 14 days); blaze-remote's
+bucket is the one other client (section 8).
 
-## 2. The decision
+Built, not wired: no crate turns on ix-prof's `explore` feature, `bstd::quic` (which re-exports
+the core) has no user, and blaze-remote's `H3Bucket` is made only by its tests, so the HTTP/3
+path runs in tests alone.
 
-- **quinn-proto stays the QUIC core.** It is already sans-IO: `Endpoint::handle` takes a
+## 2. The design
+
+- **quinn-proto is the QUIC core.** It is sans-IO: `Endpoint::handle` takes a
   datagram, `Connection::poll_transmit` hands one back, `poll_timeout` is a deadline, and TLS is
-  rustls's (`crypto::rustls`, on ring). It stays vendored without `tracing`
+  rustls's (`crypto::rustls`, on ring). It is vendored without `tracing`
   (`vendor/quinn-proto`, `tools/vendor/sync.py`).
-- **A new HTTP/3 + WebTransport core in blaze-http** (`blaze_http::h3`), on top of quinn-proto:
+- **An HTTP/3 + WebTransport core in blaze-http** (`blaze_http::h3`), on top of quinn-proto:
   - QPACK with the static table only. Both sides advertise `SETTINGS_QPACK_MAX_TABLE_CAPACITY
     = 0` and `SETTINGS_QPACK_BLOCKED_STREAMS = 0`, so no peer may reference a dynamic table. A
     field section that does is refused (`QPACK_DECOMPRESSION_FAILED`), never guessed at.
@@ -55,14 +54,12 @@ days). No other part of blaze speaks QUIC, and none should until it needs to.
     unknown capsules skipped.
   - Error codes mapped between WebTransport's 32-bit space and HTTP/3's
     (`0x52e4a40fa8db + n + n / 0x1e`), as the draft says.
-- **One driver on blaze-core's effects** (`blaze_http::h3::driver`; the tokio driver it
-  replaced was deleted 2026-11-13) owns the UDP socket (batched `Effect::SendTo` and
+- **One driver on blaze-core's effects** (`blaze_http::h3::driver`) owns the UDP socket (batched `Effect::SendTo` and
   `Effect::RecvFrom`) and the one timer, and drives the core; it runs on io_uring, kqueue or
   the simulation. On top of it sits a small async surface (sessions, streams, datagrams) that
-  the explorer and the probe use, as `Handle::ask -> Answer` is for HTTP/1.
-- **quinn, quinn-udp, wtransport and wtransport-proto leave the graph.** Their vendor copies,
-  patch series and `[patch]` entries are deleted. `vendor/quinn-proto` is the one copy left,
-  and `tools/vendor/sync.py` keeps working for it (and for `ra-ap-rustc_pattern_analysis`).
+  the explorer uses, as `Handle::ask -> Answer` is for HTTP/1.
+- **No quinn, quinn-udp, wtransport or wtransport-proto in the graph.** `vendor/quinn-proto` is
+  the one copy, kept by `tools/vendor/sync.py` (with `ra-ap-rustc_pattern_analysis`).
 
 ### The losing alternatives
 
@@ -120,8 +117,7 @@ the dynamic table, ..."`. How a session ended is `h3::Closed`: `Refused { status
 
 ### The driver
 
-It was first a tokio task and is now `blaze_http::h3::driver`, on blaze-core's effects (the
-tokio one was deleted 2026-11-13); the loop is the same. One owner holds the core, the UDP
+`blaze_http::h3::driver`, on blaze-core's effects. One owner holds the core, the UDP
 socket and one timer. It loops: advance the clock,
 send every transmit, hand every event to its asker, then wait on the socket, the inbox of asks
 and the next deadline, whichever is first. Askers hold handles (`Request`, `Session`,
@@ -130,8 +126,7 @@ their own. Dropping a `RecvStream` stops it, dropping a `SendStream` finishes it
 a `Request` unanswered refuses it with 500. The io_uring, kqueue and simulated hosts run the
 same loop against the same core.
 
-The driver's waits open no span yet: blaze-trace is not in the graph
-(docs/v2/plan/design/no-tracing.md). Each is bounded by a core deadline or by the asker's own
+Each of the driver's waits is named and bounded by a core deadline or by the asker's own
 (the explorer's `REQUEST_WAIT`).
 
 ## 4. What the browser requires
@@ -176,37 +171,18 @@ Also required, and done:
   avoids.
 
 Firefox speaks the same drafts. Safari ships the later `SETTINGS_WT_MAX_SESSIONS`; it is not a
-target of `blaze explore` and is not sent (a later change adds it with the draft-13 rules).
-
-The browser check is manual and required before this lands for users: `blaze-explore-probe`
-against `https://ix.dev/explore/probe` in Chrome and Firefox, then `blaze explore` end to end
-(section 7).
+target of the explorer and is not sent.
 
 ## 5. Cost
 
-Nothing here is hot. One page or two per daemon, a 250 ms live feed of tens of KB a frame, a
+Nothing here is hot. One page or two per explorer, a 250 ms live feed of tens of KB a frame, a
 few requests a second. The core copies each received stream piece once (quinn-proto's `Bytes`
 into the event) and each sent piece once (into quinn-proto's buffer). AES-GCM through rustls is
 gigabytes a second; loopback adds tens of microseconds.
 
-## 6. Migration
-
-One change, whole port (rule 23):
-
-1. `crates/blaze-http/src/h3/`: the core (`endpoint.rs`), `qpack.rs`, `huffman.rs`,
-   `frame.rs`, `varint.rs`, `config.rs` (rustls and quinn-proto configs, the certificate pin
-   verifier, a minimal DER reader for its checks) and `driver.rs` (on blaze-core's effects).
-2. blaze-explore's `server.rs`, `cert.rs` and the probe move onto `blaze_http::h3`. Their public
-   surface stays (`start`, `Config`, `Explorer`, `StartError`, the constants, `Cert`); the one
-   type that changes is `StartError::Config`, which carries `blaze_http::h3::Error` instead of
-   wtransport's, and `Cert::identity` returns `blaze_http::h3::Identity`.
-3. Root `Cargo.toml`: drop `wtransport` from `[workspace.dependencies]`; drop `quinn` and
-   `wtransport` from `[patch.crates-io]` and `exclude`; add `quinn-proto` (no default
-   features, `rustls-ring`) and `bytes` to `[workspace.dependencies]`. Delete `vendor/quinn` and
-   `vendor/wtransport`. `tools/vendor/sync.py` takes `quinn-proto` and
-   `ra-ap-rustc_pattern_analysis` only.
-4. The lock loses quinn, quinn-udp, wtransport, wtransport-proto and what only they used; the
-   handoff lists it.
+The files: `crates/blaze-http/src/h3/` holds the core (`endpoint.rs`), `qpack.rs`, `huffman.rs`,
+`frame.rs`, `varint.rs`, `config.rs` (rustls and quinn-proto configs, the certificate pin
+verifier, a minimal DER reader for its checks) and `driver.rs`.
 
 ## 7. How it is proven
 
@@ -219,13 +195,12 @@ One change, whole port (rule 23):
   failing at exactly `SETTINGS_WAIT`. The QPACK, Huffman, varint, frame and error-code
   functions have unit tests with RFC vectors. The outcomes are deterministic; the bytes are
   not, because TLS and quinn-proto draw randomness (keys, connection IDs).
-- **The explorer's tests** (`crates/blaze-explore/src/server.rs`) keep every case and move onto
-  the new client over real UDP on loopback: path and origin refusals, `unauthenticated` before
-  `hello`, `hello`, `views` as IPC, `unknown_op`, a live frame's layout, `bad_token`
-  closing only its own session, and the dev origin.
-- **The browser**, by hand: the probe page in Chrome and Firefox (bidirectional echo,
-  unidirectional echo, datagrams), then `blaze explore` with the real page on ix.dev. This is
-  the one check no test here can make.
+- **The explorer's tests** (`crates/ix-prof/src/explore/tests.rs`) run the client over real UDP
+  on loopback: path and origin refusals, `unauthenticated` before `hello`, `hello`, `views` as
+  IPC, `unknown_op`, a live frame's layout, `bad_token` closing only its own session, and the
+  dev origin.
+- **The browser**, by hand: the real page on ix.dev in Chrome and Firefox. This is the one check
+  no test here can make.
 
 ## 8. Requests and the remote cache
 

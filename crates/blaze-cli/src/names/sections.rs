@@ -1,4 +1,4 @@
-//! The form of a `CrateScope` record's payload (drive.md, "End state", piece 3, NAMES AND ITEMS
+//! The form of a `CrateScope` record's payload (end-state.md D157, NAMES AND ITEMS
 //! FILED): one head, then eight sections, each found by its place in the head.
 //!
 //! - `exports`: the exports record, what a dependent reads and keys on (the task's out is its
@@ -21,8 +21,8 @@
 //!   from the names this job already holds (rule 77). The record lists it as the crate's
 //!   `Links` part, located by the table's digest, so the program's native image reads a table,
 //!   not the whole scope. EMPTY only in a failed crate's record.
-//! - `cells`: the crate's cell table ([`blaze_scope::names_cells::crate_table`], drive.md
-//!   "Names at module grain" point 3): sorted (cell, digest) rows over the names and items
+//! - `cells`: the crate's cell table ([`blaze_scope::names_cells::crate_table`], end-state.md
+//!   D158): sorted (cell, digest) rows over the names and items
 //!   records, what a body or head that read the crate BY CELL is checked against, by
 //!   [`cell_of`], the kind's part lookup the drive is given. EMPTY in a failed crate's record
 //!   (every cell then reads absent).

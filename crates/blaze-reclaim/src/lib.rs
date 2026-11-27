@@ -1,4 +1,4 @@
-//! Memory reclamation at task boundaries (docs/v2/plan/design/concurrency.md "Memory").
+//! Memory reclamation at task boundaries (docs/v2/plan/design/end-state.md, D179).
 //!
 //! A shared table is read with plain loads and changed by publishing a new value with one
 //! release store. The value it replaced may still be read by a task that loaded it before the

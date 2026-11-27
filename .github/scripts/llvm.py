@@ -271,8 +271,8 @@ MERGED = "LLVMBlaze"
 async def manifest(prefix, exe):
     """What a build that links this prefix needs to know of it, as data in `blaze-llvm.json`, so
     that building blaze runs no `llvm-config`: the archive for another platform is then linked
-    from any host (vendor/llvm-sys/pin.rs reads it; docs/v2/plan/design/toolchain-c.md, "Cross
-    compilation"). Asked of the `llvm-config` just built, on the machine that built it, once.
+    from any host (vendor/llvm-sys/pin.rs reads it; docs/v2/plan/design/c.md, "The toolchain
+    side (D174)"). Asked of the `llvm-config` just built, on the machine that built it, once.
 
     The static libraries are merged into one, lib/libLLVMBlaze.a (LLVMBlaze.lib), and the
     components are removed: `libs` is then one name and the link needs no order. One static

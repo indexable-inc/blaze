@@ -1,4 +1,4 @@
-//! Names on demand ACROSS crates (engine.md piece E13, D134: lazy over what is not yours). The
+//! Names on demand ACROSS crates (end-state.md D158, D134: lazy over what is not yours). The
 //! root crates (yours) are solved whole; every other crate is a [`LazyDep`]: its groups are
 //! solved only as a path walks into them, by the in-crate driver ([`super::demand`]) over the
 //! one-group solve, never the crate whole.

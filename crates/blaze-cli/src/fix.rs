@@ -419,8 +419,7 @@ pub(crate) fn apply<'f, 's, W: Writer>(cx: &Cx, root: &Dir<ReadWrite>, writer: &
     Ok(Ok(Applied { fixed, files }))
 }
 
-/// THE CHECKER'S FIX, ready for the day types are wired (typeck.md, "Fixes ranked by what is
-/// left"): one body's `Checked::suggests`, its item's text and place, made into findings with
+/// THE CHECKER'S FIX, ready for the day types are wired (blaze-typeck rules/suggest.rs): one body's `Checked::suggests`, its item's text and place, made into findings with
 /// their ids and fixes. Each hole is an E0425 at a one-segment value name; `suggest::pick`
 /// chooses from the record and the item's text; the fix's two item-relative ranges become one
 /// file edit (the hole replaced by the item's own bytes of the chosen name). `type_words` prints

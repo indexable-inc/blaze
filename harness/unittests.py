@@ -25,7 +25,7 @@ tests on, on the tree to land, and commit the list:
     python3 harness/unittests.py '{"record": true}'
 
 `"reached": true` adds `--reached`: the daemon runs only the tests the change can have reached
-and reports a kept pass as cached (docs/cargo.md, "Which tests run"); the tests it leaves out are
+and reports a kept pass as cached (docs/v2/plan/design/test.md); the tests it leaves out are
 counted as unchecked. Not what the gate runs: it is here for a run that has to be shorter.
 
 `"build": true` is CI's build job: `blaze build` of the same packages with the same profile and

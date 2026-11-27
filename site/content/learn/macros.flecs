@@ -1,6 +1,6 @@
 // Lesson 3: proc macros. A proc macro is a program that runs during the build; a native one can read anything, so its
 // output can't be kept. blaze builds each to WebAssembly and runs it seeing only its own package (read-only) and
-// cargo's variables, with a clock at zero and fixed randomness (docs/cargo.md, "Proc macros run as WebAssembly").
+// cargo's variables, with a clock at zero and fixed randomness (docs/v2/plan/design/proc-macros.md).
 site {
   learn {
     macros : Page {

@@ -1,4 +1,4 @@
-//! The one spin of blaze's waits (docs/v2/plan/design/concurrency.md): a wait for a step another
+//! The one spin of blaze's waits (docs/v2/plan/design/end-state.md, D179): a wait for a step another
 //! running thread is in the middle of (a slot it is writing, a list it is walking) spins a few
 //! rounds, doubling, then yields its thread each round. A wait for anything longer is the
 //! scheduler's (`blaze_graph::sched::wait` on a key, a counter or a job) or a lock's, which park.

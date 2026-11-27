@@ -1,5 +1,5 @@
 //! Memory an asker owns that effects read into and write from: [`crate::Effect::ReadInto`] and
-//! [`crate::Effect::WriteFrom`] (docs/v2/plan/design/store-pool.md, "The effect").
+//! [`crate::Effect::WriteFrom`].
 //!
 //! An asker registers a region of its memory once ([`Spans::register`]), and names a part of it
 //! in an effect as a [`Span`]: data, not a pointer, so an [`crate::Effect`] stays `Clone + Eq +

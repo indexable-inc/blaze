@@ -6,9 +6,7 @@ date: 2026-11-13
 # `blaze audit` and strong source pins
 
 Objective SEC1. The code is in `crates/blaze-audit`, which is sans-IO: it parses, matches
-and decides. The drivers live in `crates/blaze-cargo/src/cli/audit.rs` (the command),
-`crates/blaze-units/src/load/source.rs` (the load's refusal) and
-`crates/blaze-cargo/src/serve/fetch/git.rs` (the fetcher's verification).
+and decides. It is built, not wired: no command, load or fetcher calls it.
 
 ## Threat model
 
@@ -36,8 +34,7 @@ an advisory's affected functions is not checked, only listed.
 
 ## `blaze.lock`
 
-The pins go in the one file that holds every pin that is not a crate (docs/cargo.md, Lock
-files). Two tables are added:
+The pins go in the one file that holds every pin that is not a crate (docs/v2/plan/design/lock-policy.md). Two tables are added:
 
 ```toml
 [git."https://github.com/o/r"]
@@ -53,22 +50,20 @@ url = "https://github.com/rustsec/advisory-db"
 - A digest is `blake3:`, `sha256:` or `sha512:`. `md5` and `sha1` are refused by name.
 - Pins are recorded only by `blaze audit pin`. `blaze lock` carries them through unchanged.
 
-**The tree digest.** It is the `blaze tree 2` listing of blaze-fetch: one line per file, sorted
-by path bytes, `<file|exec|link> <BLAKE3> <len> <path>`. A symlink's bytes are its target.
+**The tree digest.** It is the `blaze tree 3` listing of blaze-fetch: one line per file, sorted
+by path bytes, `<file|exec|link|submodule> <BLAKE3> <len> <path>`. A symlink's bytes are its target.
 Nothing in `.git` is listed, and neither are `.cargo-ok` or `.blaze-ok` at the root. The
 digest is the pin's algorithm over the listing.
 
-## Where the pin is checked
+## Where the pin is checked (not built)
 
-- **Load** (`Sources::git_package`). A git package whose `(url, commit)` has no pin is refused
-  before its checkout is read or fetched. The error is rule `weak_source_pin` and names the
-  package, url, commit and `blaze audit pin`. The pin travels in `FetchKind::Git { commit,
-  tree }` and `PackagePlan::tree`.
-- **Fetch** (`git::checkout`). The fetched tree is hashed and compared with the pin before
+- **Load** (blaze-unit-graph's sources). A git package whose `(url, commit)` has no pin is
+  refused before its checkout is read or fetched, naming the package, url, commit and
+  `blaze audit pin`. The pin travels with the package's fetch plan.
+- **Fetch** (blaze-git-fetch). The fetched tree is hashed and compared with the pin before
   anything is mounted. A mismatch names both digests.
-- **Sealing** (`sealed::pin`). A git package is sealed only with a tree digest. Its pin hashes
-  the commit and the tree together, so `.git/HEAD`, which is outside the digest, is still
-  covered.
+- **The record.** A git package's record holds its tree digest; its pin hashes the commit and
+  the tree together, so `.git/HEAD`, which is outside the digest, is still covered.
 - **`blaze audit`** hashes each checkout it finds on disk and compares it with its pin.
 
 ## The audit
@@ -101,6 +96,8 @@ digest is the pin's algorithm over the listing.
 
 ## Commands and output
 
+None of these is a command of blaze yet.
+
 - **`blaze audit [--json] [--today YYYY-MM-DD]`** runs the check. It exits nonzero on any
   error. `--today` fixes the date acceptances expire against, so a report can be reproduced
   byte for byte. The JSON has `version: 1`, with these fields: `today`, `ok`, `errors`,
@@ -113,9 +110,9 @@ digest is the pin's algorithm over the listing.
     review the diff.
   - `[git]` ends up exactly the lock's git sources. A commit whose recorded tree differs from
     the fresh one is refused, not overwritten.
-- **`blaze audit fetch`** is the database fetch, as a machine (`Effect`/`Event`). Its driver
-  answers `Refused::NotWired` until the git and HTTP drivers land. Until then, clone the
-  database by hand and pin it.
+- **`blaze audit fetch`** is the database fetch, as a machine (`Effect`/`Event`,
+  blaze-audit fetch.rs). It stops with `Refused::NotWired` until the git and HTTP drivers
+  land; meanwhile the database is cloned by hand and pinned.
 
 ## What is still open
 

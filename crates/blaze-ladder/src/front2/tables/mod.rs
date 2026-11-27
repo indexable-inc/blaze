@@ -1,4 +1,4 @@
-//! The engine's tables as a task reads them (docs/v2/plan/design/engine.md, E2, E2a and E5): a
+//! The engine's tables as a task reads them (docs/v2/plan/design/end-state.md, D157): a
 //! `Copy`, read-only view over every crate's records ([`view::Tables`]), a per-task recorder
 //! of each cell a task read ([`recorder::Recorder`]), the body task over them (task.rs), and
 //! the frozen heads ([`head`]: one item's heads as a position-independent record with its own

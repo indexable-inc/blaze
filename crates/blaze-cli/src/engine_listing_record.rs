@@ -1,4 +1,4 @@
-//! A CRATE'S HEAD LISTING AS RECORDS (engine.md "An edit costs what it moved", D149 piece I2;
+//! A CRATE'S HEAD LISTING AS RECORDS (end-state.md D168, D149 piece I2;
 //! rule 51: what outlives a task is a record; rule 77: never rebuild what a record holds; rule
 //! 21: its key covers every input).
 //!

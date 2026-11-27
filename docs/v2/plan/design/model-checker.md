@@ -1,7 +1,6 @@
 ---
-status: plan
-summary: lane safety's model checker for lock-free code (crate blaze-check): shim atomics, locks and threads as coroutines on one OS thread, loom's bounded DPOR over interleavings, every value a load may read under C11, and a model test per lock-free structure against a sequential model.
-date: 2026-10-29
+status: current
+summary: blaze's model checker for lock-free code (crates/blaze-check): std-shaped shims for atomics, locks, threads and cells, model threads as coroutines on one OS thread, loom's bounded DPOR over interleavings, every value a load may read under C11, a byte-exact race and use-after-free check for raw buffers, and happens-before linearizability against a sequential model.
 ---
 # Model checking lock-free code
 
@@ -12,14 +11,12 @@ seed and the schedule, which replay the failing execution exactly.
 
 ## Where it lives
 
-`crates/blaze-check/` (new; agent `safety-model`), a leaf that depends on no workspace crate:
-only `rustc-hash`, `libc` on Unix (coroutine stacks) and `windows-sys` on Windows (fibers).
-Its seeded generator is a copy of `blaze_core::sim::Rng`'s SplitMix64 (a seed means the same in
-both), not a dependency: `blaze-core` now uses `blaze-ids`, which has model tests, so a
-dependency on it would be a cycle. It cannot be a module of `blaze-graph`, as first planned:
-blaze-graph depends on `blaze-reclaim`, so a `blaze-reclaim` → `blaze-graph` dependency, even
-under a `cfg`, is a cycle cargo refuses (resolution is platform-independent). Every crate with
-lock-free code can depend on a leaf; nothing may be added to `blaze-check`'s dependencies.
+`crates/blaze-check/`, a near-leaf: it depends only on `blaze-rng` (blaze's one SplitMix64, so a
+seed means the same in every crate), `blaze-sys` and `libc` on Unix (coroutine stacks), all
+leaves. It cannot depend on `blaze-core` (which uses `blaze-ids`, which has model tests) or live
+in `blaze-graph` (which depends on `blaze-reclaim`, which has model tests): either is a cycle,
+since dependency resolution ignores `cfg`. Every crate with lock-free code can depend on a leaf;
+nothing may be added to `blaze-check`'s dependencies.
 
 ## The switch
 
@@ -194,23 +191,17 @@ does), where loom, whose `new` isn't `const`, checks a first read racing with it
 
 ## Model tests
 
-Each lock-free structure gets a test that runs its operations from 2 or 3 threads under
-`model`, records each operation's call and result, and checks the outcome against a sequential
-model of the structure: some order of the operations that keeps every return-happens-before-call
-order of the run (a linearization) gives the same results on the sequential model. The checker is
-`blaze_check::linear` (Wing and Gong's search with Lowe's memo of (operations done, state)
-pairs, as porcupine and lincheck keep) so each test is the structure, its sequential model and
-a few calls. safety-model's children (`safety-model-{format,db,store,graph}`) write them: in
-the crate where its owners are done, as a request to them where not.
+A lock-free structure's model test runs its operations from 2 or 3 threads under `model` and
+checks each execution's outcome. `blaze_check::linear` (Wing and Gong's search with Lowe's memo
+of (operations done, state) pairs, as porcupine and lincheck keep) checks a run against a
+sequential model. It is built, not wired: only blaze-check's own tests use it so far.
 
-| crate | structure | owner |
-|---|---|---|
-| `blaze-ids` | `Sharded` interner (shard tables, chunk slots) | format |
-| `intern` | `arena.rs`'s sharded table | format |
-| `blaze-query` | the revision `generation` counter and the shards | db |
-| `blaze-cas` | `table::Table` (levels, slots, flag bits), `segment.rs` chunks, `flags::Bits` | concurrency (store) |
-| `blaze-graph` | `pool.rs` (job lists, idle bits, sleepers), `pump.rs` (published waits, flights), `arena.rs` totals | core |
-| `blaze-reclaim` | slots, `enter`/`Guard`, `Grace`, `Limbo` | concurrency |
-
-The tests and switches for crates whose owners are still at work are requests in
-`fed1eb428d:docs/v2/requests/<owner>.md`, ready to paste.
+| crate | model tests |
+|---|---|
+| `blaze-std` | `src/task/{ring,deque,idle,help,claim}.rs` |
+| `blaze-ids` | the `Sharded` interner (`src/lib.rs`) |
+| `intern` | `src/{intern,arena,intern_slice}.rs`, `src/table/model.rs` |
+| `blaze-graph` | `src/pump/model.rs` |
+| `blaze-own` | `src/segs.rs` |
+| `blaze-swiss` | `src/lib.rs` |
+| `blaze-launch-rt` | `src/stub_wait_model.rs`, `src/sample/ring_wait.rs` |

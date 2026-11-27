@@ -1,4 +1,4 @@
-//! An edit's names, by group (engine.md piece E4, the incremental half): after an edit, a
+//! An edit's names, by group (end-state.md D158, the incremental half): after an edit, a
 //! crate's names are brought up to date by re-solving ONLY the groups whose inputs moved, every
 //! other group kept as its record, the result byte-equal to a fresh whole-crate solve of the
 //! edited text (tests/names_groups_edit.rs is the proof).

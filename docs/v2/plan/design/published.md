@@ -113,9 +113,5 @@ signature is deterministic Ed25519. The directory writer then writes every objec
 
 ## 6. Not in this piece
 
-- The walk of the roots in blaze-cli (store/roots.rs) feeding `lay_out`, and the directory writer.
 - The reader as a namespace of the command's store (store/plain_place.rs; lane RG1 is in that file).
-- Turning `prefix_most` on in blaze-cli's reader (store.rs, `Limits::DEFAULT` there): its HTTP
-  origin takes only a 206 of exactly the range asked (blaze-h1 `Response::ranged`), so an over-asked
-  prefix needs a 206 that ends at the object's end to be taken first.
-- HTTP, code records, CI's job file, where the signing keys come from.
+- Code records, CI's job file, where the signing keys come from (`trust::PUBLISHED_KEYS` is empty).

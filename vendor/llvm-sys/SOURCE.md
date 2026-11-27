@@ -29,7 +29,7 @@ Changes, each marked `blaze:` in build.rs:
    declarations only, and every call is made behind a safe wrapper in hir-ty-codegen's `llvm`.
 6. `pin.rs`, included by build.rs and run before anything else there, links only the LLVM
    `pins/llvm.json` pins: `LLVM_SYS_231_PREFIX`, which blaze sets for each run
-   of the script to the release for that run's `TARGET` (a pinned native input, docs/cargo.md),
+   of the script to the release for that run's `TARGET` (a pinned native input, docs/contributing.md, "LLVM"),
    so a host and a target copy each get their own, must name a prefix whose
    `blaze-llvm.json` (written by `.github/scripts/llvm.py build`) has the pinned commit and
    version and whose `llvm-config --version` says that version. Anything else (the variable

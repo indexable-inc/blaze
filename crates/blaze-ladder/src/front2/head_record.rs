@@ -1,4 +1,4 @@
-//! A head record (drive.md, "End state: the whole pipeline on the command", piece 10): ONE
+//! A head record (end-state.md D157): ONE
 //! lowered head of the store ([`super::heads::Store`]) as bytes, written once and read back
 //! into a caller's type table, so a head can be a record keyed by its item and compared by its
 //! out digest ([`digest`]) instead of being rebuilt in memory on every command.

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze-sql, typed SQL with no injection. A query is a const string checked at compile time against a schema made of Rust structs; its parameters are named (`$name`), bound by a record, and its row type is computed (`type_of!`). One sans-IO checker (parse, infer, render) in `crates/blaze-sql`, drivers for C SQLite (`crates/blaze-sqlite`) and Postgres (`crates/blaze-pg`, a sans-IO wire protocol). The checker and the drivers are being written; the typed surface waits on three language pieces, each a ledger row.
+summary: blaze-sql, typed SQL with no injection. A query is a const string checked at compile time against a schema made of Rust structs; its parameters are named (`$name`), bound by a record, and its row type is computed (`type_of!`). One sans-IO checker (parse, infer, render) in `crates/blaze-sql`, drivers for C SQLite (`crates/blaze-sqlite`) and Postgres (`crates/blaze-pg`, a sans-IO wire protocol). The checker and the drivers are built (the drivers not wired: nothing outside their tests calls them); the typed surface waits on its language pieces, each a ledger row.
 date: 2026-11-13
 ---
 # blaze-sql: typed SQL
@@ -55,6 +55,7 @@ Three layers, one home each.
    `net` later. A driver prepares a checked statement once per connection, compares the engine's
    own description with ours, and stops on a difference with an error naming the statement and
    the column or parameter: the checker's inference is never trusted, and nothing is coerced.
+   Both drivers are built, not wired: only their own tests call them.
 3. **The typed surface**, an edition package over 1 and 2: `Db<SCHEMA>`,
    `query::<"..">(params)`, `Col<T>`. It needs the language rows below and is not written until
    they land; nothing weaker stands in for it.
@@ -173,8 +174,8 @@ let rows = db.run(query(template!("select name from person where {recent} order 
 
 | Row | Piece | State |
 |---|---|---|
-| Q5 | `&'static str` as a const generic argument, end to end | hir-ty refuses it without the feature; not checked with it |
-| Q6 | `field_of!(T, f)` in type position | not parsed (docs/const.md) |
+| Q5 | `&'static str` as a const generic argument, end to end | not yet shown on the item layer |
+| Q6 | `field_of!(T, f)` in type position | not parsed (docs/v2/plan/design/consteval.md) |
 | Q7 | `type_of!(desc)`: a type from const code (comptime phase 3) | design only |
 | Q8 | `template!`: a literal with holes as constant text and a record of captures | designed here |
 | Q9 | fragments: relation, condition, ordering and expression holes | designed here |

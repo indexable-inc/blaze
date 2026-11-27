@@ -1,5 +1,5 @@
 //! A body waits for and reads only its file's owners' scopes (drive.md, "A body's owners, and
-//! what it waits for", ruled 20:07 to 20:31): never every member's. A child of main.rs's tests:
+//! what it waits for"): never every member's. A child of main.rs's tests:
 //! its helpers are theirs. Ported to the engine's check on 2026-11-19 (the old checker's
 //! `BodyCheck` made counts and file jobs became the engine's `Bodies` stage entries).
 

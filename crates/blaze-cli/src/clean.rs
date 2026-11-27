@@ -1,4 +1,4 @@
-//! `blaze clean [dir] [--store]` (engine.md E12: a user is never stuck on the store).
+//! `blaze clean [dir] [--store]` (end-state.md D157: a user is never stuck on the store).
 //!
 //! With no flag it removes the checkout's own state, `<dir>/.blaze/v2`, and the home's stores of
 //! OTHER FORMS (D160: `<HOME>/.blaze/v2/store/f<N>s<M>` of forms not this blaze's, and the

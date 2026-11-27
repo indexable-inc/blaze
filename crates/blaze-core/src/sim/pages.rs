@@ -1,6 +1,6 @@
 //! A deterministic simulation test of a page store on reads into and writes from memory
-//! ([`Effect::ReadInto`], [`Effect::WriteFrom`]): the shape the store's pool takes
-//! (docs/v2/plan/design/store-pool.md, section 7), cut down to what proves the simulation's new
+//! ([`Effect::ReadInto`], [`Effect::WriteFrom`]): the shape the store's pool takes,
+//! cut down to what proves the simulation's new
 //! semantics catch the pool's bugs, and the scaffolding the pool's own DST grows from.
 //!
 //! The core ([`Pages`], sans-IO): pages of one file, each with a slot in a registered region at

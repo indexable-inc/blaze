@@ -1,4 +1,4 @@
-//! The memo the front end's queries run on (docs/v2/plan/design/target.md, "In memory"): one
+//! The memo the front end's queries run on (docs/v2/plan/design/bottom.md): one
 //! snapshot's answers, a table per arena, with no dependency tracking.
 //!
 //! A [`Memo`] is one snapshot: its inputs never change while it lives, and there are no

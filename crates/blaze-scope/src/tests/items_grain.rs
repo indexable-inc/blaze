@@ -1,5 +1,4 @@
-//! The items record at item grain ([`crate::items_record::grain`]; drive.md, "End state",
-//! piece 4): an edit to one item's text voids that item's row alone. A crate of one file with
+//! The items record at item grain ([`crate::items_record::grain`]; end-state.md D157): an edit to one item's text voids that item's row alone. A crate of one file with
 //! `fn f(a: u8) -> u8 { a }` and `fn g() -> u8 { 1 }` is solved once and its record written;
 //! then the file is read back as four texts:
 //!

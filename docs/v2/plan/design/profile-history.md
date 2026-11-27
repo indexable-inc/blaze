@@ -6,7 +6,7 @@ date: 2026-10-31
 # The history
 
 The flight recorder is the one buffer; the history is the reader that keeps it. DuckDB and
-DataFusion are never linked into blaze. blaze writes Parquet with the pure-Rust `parquet` crate,
+DataFusion are never linked into blaze. blaze writes Parquet with its own `blaze-parquet`,
 and `blaze debug sql` runs the DuckDB CLI that `nix run .#duckdb` pins (nixpkgs' `duckdb` 1.5.5,
 rev `d8cdaa33`, built with its in-tree extensions, parquet among them, so nothing is loaded or
 downloaded at query time).
@@ -111,10 +111,10 @@ view's arguments as JSON Schema (`views::args_schema`).
 `sql::run(&Query { duckdb, history, sql })` runs the following steps:
 1. It checks that `duckdb` is an absolute path to a file. It is never looked up on `PATH`.
 2. It writes a script: `SET autoinstall_known_extensions = false`, the prelude, then
-   `COPY (<sql>) TO '<scratch>/answer.parquet' (FORMAT parquet, COMPRESSION zstd)`.
+   `COPY (<sql>) TO '<scratch>/answer.parquet' (FORMAT parquet, COMPRESSION uncompressed)`.
 3. It runs `duckdb -batch -bail -init <empty file>` with the script on stdin. The empty init
    file keeps `~/.duckdbrc` out of it.
-4. It reads the answer back with the `parquet` crate as Arrow `RecordBatch`es.
+4. It reads the answer back with `blaze-parquet` as `columns::Batch`es.
 
 DuckDB's CLI has no Arrow IPC output without an extension, so the answer goes through a Parquet
 file. If DuckDB refuses the query, the result is `SqlError::Duckdb` with DuckDB's own message,

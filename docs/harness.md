@@ -30,7 +30,7 @@ host need the pinned nightly (`pins/toolchain`).
 | Script | What it checks |
 |---|---|
 | `answers.py --write` | Not a check: writes what the pinned rustc answers to the questions blaze answers in its place (`-vV`, `--print cfg`, cargo's probe of file names, `target-spec-json`) into `pins/answers/rustc.json`, after a toolchain bump, on each CI host ([no-rustc.md](no-rustc.md), step B) |
-| `toolchain_pins.py` | That the sha256 and size of each file of blaze's own Rust (`pins/rust.txt`) are what the release's manifest at static.rust-lang.org says, for every host blaze ships for; `'{"write": true}'` regenerates them when blaze moves to another release ([cargo.md](cargo.md)). Needs the network |
+| `toolchain_pins.py` | That the sha256 and size of each file of blaze's own Rust (`pins/rust.txt`) are what the release's manifest at static.rust-lang.org says, for every host blaze ships for; `'{"write": true}'` regenerates them when blaze moves to another release. Needs the network |
 | `nightly_features.py '{"dry_run": true}'` | Not a check: keeps the GitHub issue tree of the pinned nightly's unstable features (#967), so every `#![feature(..)]` blaze has to accept is tracked. Each language feature of rustc_feature's `unstable.rs` at library/UPSTREAM's commit is an issue labelled `nightly-feature` under a group of at most 100 sub-issues; the library features (the `#[unstable]` and `#[rustc_const_unstable]` attributes of the sysroot crates in library/) are one issue, #969, for what blaze has to do for all of them (`'{"library": true}'` makes one each). A rerun creates only what is missing (by a hidden marker in each body), links what is not under its group, and comments on and closes the issue of a feature stabilized or removed since. `'{}'` makes the changes, paced under GitHub's limits. Needs `gh` |
 
 ### Reading the workspace as cargo does
@@ -89,50 +89,43 @@ Start from the script's last lines; the stepwise ones take `--only TEXT`, `--fro
 
 For wrong generated code:
 
-1. `blaze codegen-inputs --format=json` lists each instance the last build made with its code
-   hash, and `blaze trace --out PATH` writes every result of the last build with its edges, as
-   CBOR. (v1's `--report`, `--deny` and `--isolate`, which listed, left to rustc and split out
-   functions, are gone with its crate-at-a-time entry.)
-2. Reproduce against a unit test in `crates/blaze-body`, `crates/blaze-build`, or `crates/blaze-emit` to inspect the lowered body or LIR.
-3. Reduce it to a test ([Adding a test](#adding-a-test)), and fix it there.
+1. Reproduce against a unit test in `crates/blaze-body`, `crates/blaze-build`, or `crates/blaze-emit` to inspect the lowered body or LIR.
+2. Reduce it to a test ([Adding a test](#adding-a-test)), and fix it there.
 
 For a CI failure, the last line of the harness step lists which scripts failed.
 
 ## CI
 
-CI is one merge gate, `blaze.yaml`, that takes minutes, and three workflows of their own. Every
+CI is one merge gate, `blaze.yaml`, that takes minutes, and four workflows of their own. Every
 job of the gate runs on Linux AArch64 on an ix runner ([ix runners](#ix-runners)).
 
 | Workflow | Event | What runs |
 |---|---|---|
-| `blaze.yaml` (`changes`) | pull request, merge-queue entry, push to main | `scripts/src/bin/gate_changes.rs`: whether the change touches a file the `cargo` job reads (below) |
-| `blaze.yaml` (`scripts`) | every change | ruff and pyright over the Python workspace, `harness/imports.py`, the selftests of `harness/failures.py` and `harness/v2/ran.py`, `harness/library.py check`, the agent rules (`scripts/src/bin/rules.rs`), the Rust scripts of `scripts/src/bin` (the docs, `rustcsites`, the ledger, `changed`, the invariants, the lint table, the hash domains, and the ratchets of `tools/ratchets` and of persisted layouts), and `harness/v2/lean_gate.py`'s checks that need no Lean |
-| `blaze.yaml` (`lean`) | every change | the Lean proofs (`harness/v2/lean_gate.py`, [v2/plan/proofs.md](v2/plan/proofs.md)): `lake build` of `lean/` and `lean/analysis` with the pinned Lean, no `sorry`, and each theorem of `lean/theorems.json` held to Lean's three axioms by `#print axioms` |
+| `blaze.yaml` (`changes`) | pull request, merge-queue entry, push to main | a path filter in the job's shell: whether the change touches a file the `cargo` job reads (below) |
+| `blaze.yaml` (`scripts`) | every change | `scripts/src/bin/gate.rs` over every row of `tools/gate.txt` (as `just lint`), no Python: the agent rules, the docs, `rustcsites`, the ledger, `changed`, the invariants, the Lean sources, the lint table, the hash domains, and the ratchets of `tools/ratchets` and of persisted layouts |
+| `blaze.yaml` (`lean`) | every change | the Lean proofs (`scripts/src/bin/lean_gate.rs`, [v2/plan/proofs.md](v2/plan/proofs.md)): `lake build` of `lean/` and `lean/analysis` with the pinned Lean, no `sorry`, and each theorem of `lean/theorems.json` held to Lean's three axioms by `#print axioms` |
 | `blaze.yaml` (`workflows`) | every change | actionlint over `.github/workflows` (below) |
-| `blaze.yaml` (`cargo`) | a change of code | on a 64-vCPU ix runner, with cargo and the pinned nightly (`pins/toolchain`): `cargo check --locked --workspace --exclude blaze-std --all-targets`, then `cargo test --locked --workspace --exclude blaze-std --no-fail-fast` |
+| `blaze.yaml` (`cargo`) | a change of code | on a 64-vCPU ix runner, with cargo and the pinned nightly (`pins/toolchain`): the toolchain shelf cut (`toolchain_cut`), `cargo check --locked --workspace --exclude blaze-std --all-targets`, the tests (`scripts/src/bin/ci_test.rs`), then blaze-sys's imports per target (`sys_imports`) |
 | `blaze.yaml` (`ci`) | always | whether every job the tier expected ran and succeeded: the one check the branch rules require |
 | `fmt.yaml` | push to main | `blaze fmt --all` with the release `.github/blaze-version` names, and a commit `fmt` when it changed a file |
 | `llvm.yaml` | a change of its recipe, by hand | the pinned LLVM (`pins/llvm.json`) built for each target by `.github/scripts/llvm.py` on hosted runners, and put into R2 (`.github/scripts/r2.py`) |
+| `release.yaml` | a `v0.*` tag, by hand | `blaze` built per target and published to R2 (`blaze-releases`) and GitHub Releases |
 | `site.yaml` | a change of the site, by hand | builds and checks `site/`; a push to main deploys it |
 
 The `cargo` job runs only for a change that touches a file it reads; any other change runs the
-rest alone. `scripts/src/bin/gate_changes.rs` (the `changes` job) names those files, and why
-each: the crates (`crates/`, with their test data), the vendored crates (`vendor/`), astlog
-(`tools/astlog/`), `Cargo.toml`, `Cargo.lock`, `.cargo/`, `.rustfmt.toml` and `.clippy.toml`,
-the pinned nightly (`pins/toolchain`), `blaze.yaml` and the actions it uses (`toolchain`,
-`rustup`, `script`, `blaze`), the release of blaze that builds the scripts
-(`.github/blaze-version`), and `scripts/`; on a push to main, the smoke corpus too
-(`harness/smoke.py`, `harness/smoke/`). It names what is code rather than what is not, so a
-new directory of documents, benches or harnesses runs no build; a list of files that cannot be
-had (a run by hand, a comparison of 300 files or more, GitHub refusing) counts as code. When
-the `cargo` job starts reading a new file, add it there.
+rest alone. The `changes` job's filter in `blaze.yaml` names those files: `crates/`, `vendor/`,
+`library/`, `pins/`, `scripts/`, `tools/astlog/`, `.cargo/`, `.github/`, `Cargo.toml`,
+`Cargo.lock`, `.rustfmt.toml` and `.clippy.toml`. It names what is code rather than what is not,
+so a new directory of documents, benches or harnesses runs no build; a change with no base (a run
+by hand) or whose file list GitHub refuses counts as code. When the `cargo` job starts reading a
+new file, add it there.
 
-Every job that runs a script (`changes` and `scripts`) takes the built
-scripts from `.github/actions/script`: binaries the release builds, kept in the Actions cache
-under a key of every input of their build (`key.sh` says why it covers them all). A hit runs no
-blaze and takes seconds, so `changes` checks out only what the key reads; a miss checks out the
-rest, installs the release, builds `-p scripts --bins` and saves them. `local.sh CACHE` runs the
-same steps outside Actions, with a directory for the cache.
+Every job that runs a script (`scripts`, `lean` and `cargo`) takes the built
+scripts from `.github/actions/script`: binaries kept in the Actions cache under a key of every
+input of their build (`key.sh` says why it covers them all). A hit builds nothing and takes
+seconds; a miss builds `cargo build --locked -p scripts --bins` with the pinned nightly
+(`build.sh`) and saves them. `local.sh CACHE` runs the same steps outside Actions, with a
+directory for the cache.
 
 A change reaches main through a **pull request** alone
 ([contributing.md](contributing.md#landing-a-change)), merged once `ci` passes on it: a change
@@ -142,9 +135,8 @@ No check refuses a pull request for its formatting: `fmt.yaml` formats main afte
 commits the result as `fmt`. Run `blaze fmt --all` before pushing all the same, so that the
 diff of a pull request is its change.
 
-`harness/imports.py` has every script of the harness imported, so one that only a person runs
-can't break unnoticed: a script does nothing when imported (its work is under `if
-__name__ == "__main__":`). `scripts/src/bin/rustcsites.rs` fails when blaze's code gains a place that
+`harness/imports.py` imports every script of the harness: a script does nothing when imported
+(its work is under `if __name__ == "__main__":`). `scripts/src/bin/rustcsites.rs` fails when blaze's code gains a place that
 starts rustc, rustdoc or cargo ([no-rustc.md](no-rustc.md)).
 
 actionlint (the release binary, pinned by its sha256 in `blaze.yaml`'s `workflows` job) checks
@@ -154,8 +146,7 @@ and pyflakes passes are off; `.github/actionlint.yaml` lists what it ignores, ea
 
 The repository's Python is one uv workspace (`pyproject.toml`, `uv.lock`, Python 3.13 from
 `.python-version`; shared helpers such as `tools/typed-input` are its members). Its scripts run
-with `uv run --frozen`, and the gate runs ruff and pyright over the ones the workspace lists
-(`pyproject.toml`'s `include`); an older script moves in when it is next changed. `harness/imports.py` runs in the workspace's Python too.
+with `uv run --frozen`; the gate runs no Python.
 
 ### ix runners
 
@@ -168,7 +159,7 @@ architecture it has no node for, and an `x64` job then waits a day), so every Li
 **TODO(x86-64): blaze's x86-64 tests are missing.** No job runs blaze's tests on Linux x86-64
 until ix has x86-64 capacity.
 
-- The `cargo` job runs on `[ix, arm64, ix-cpu-64, blaze-cargo]`: 64 vCPUs, and memory that
+- The `cargo` job runs on `[ix, arm64, ix-cpu-64, blaze]`: 64 vCPUs, and memory that
   grows on demand up to 256 GiB, where a hosted runner has 4 vCPUs and 16 GB.
 - The small jobs (`changes`, `scripts`, `lean`, `workflows`, `ci`, llvm.yaml's `publish`) run on
   `[ix, arm64]`, ix's default size.
@@ -192,12 +183,11 @@ since a fork's pull request restores the same snapshots. A pull request from a f
 once a maintainer approves it: the repository's fork pull request policy is
 `all_external_contributors`, and no workflow uses `pull_request_target`.
 
-What stays on GitHub's hosted runners, and why: llvm.yaml's builds. Its macOS build is of what
+What stays on GitHub's hosted runners, and why: llvm.yaml's builds, and release.yaml's builds and publish. Its macOS build is of what
 users run on a Mac, and its Linux builds run on hosted Ubuntu 22.04 so that what links them asks
 for an old glibc; the ix image's glibc is 2.39. Windows, which ix does not serve, is hosted too.
 **TODO(sysroot)**: blaze has no `--sysroot`; it finds crt objects and libc through
-`$CC_<triple> -print-search-dirs`, and the sysroot archives of
-[toolchain-c.md](v2/plan/design/toolchain-c.md) are not built. A driver given one
+`$CC_<triple> -print-search-dirs`, and no sysroot archives are built. A driver given one
 (`CC_aarch64_unknown_linux_gnu="gcc --sysroot=<glibc 2.34 tree>"`) finds the old glibc's files,
 but blaze-link then takes the ELF interpreter from inside that tree, as libc's directory is not
 an FHS one (`crates/blaze-native`), so the binaries would not run elsewhere.
@@ -205,9 +195,8 @@ Once blaze links against an old glibc sysroot, these move to ix.
 
 ### Concurrency, the check and the ruleset
 
-On a pull request a newer push cancels the gate's run before it. Every push to main runs the gate to the end in a concurrency group of its own: with one group for
-main, a merge every few minutes replaced each waiting run with the next, and 7 of 10 runs on
-main were cancelled.
+On a pull request a newer push cancels the gate's run before it. Pushes to main share one
+concurrency group (`blaze-refs/heads/main`) that never cancels the run in progress.
 
 `ci` is the gate's job that says whether everything that ran passed, and it is the one check
 the branch rules require. A job that is renamed or split does not change it. It is red when a
@@ -241,14 +230,14 @@ partial run never reads as clean. `harness/unittests.py` calls it on its log, wi
 the workspace asked for; a lane runs it on the crates it touched before saying a failure was
 there before:
 
-    uv run --frozen harness/failures.py '{"run": {"packages": ["hir-def", "hir-ty-mir"]}}'
+    uv run --frozen harness/failures.py '{"run": {"packages": ["blaze-cas", "blaze-remote"]}}'
     uv run --frozen harness/failures.py '{"results": ["test.log"], "profile": "dev", "os": "macos"}'
 
 The list is written from a run, never by hand: `python3 harness/unittests.py '{"record": true}'`
 runs every test and writes the list again, sorted, each new entry with the first line of its
 failure as its cause and `only` the OS it ran on; the entries of other OSes are kept, and an
 entry that was there keeps its cause. Run it once on each OS the gate tests on (Linux and
-macOS), on the tree to land. `harness/failures.py selftest` (CI's `scripts` job) holds the
+macOS), on the tree to land. `harness/failures.py selftest` holds the
 checked-in list to the form the recorder writes.
 
 A failure joins the list only with an owner and a cause, in the change that explains it.

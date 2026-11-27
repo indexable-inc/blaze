@@ -1,6 +1,6 @@
 ---
 name: debugging
-description: "How to find out why a blaze build did what it did from its profile parquet. Covers where the files are, the tables (spans, provenance, key_parts, misses, task spans), how to run DuckDB (`blaze debug sql`, `blaze explain`, `BLAZE_DUCKDB`; the commands are parked with blaze-cargo's CLI), and ready queries for top time by span, what reran and why, diffing two runs' keys, memory by task and a cycle that won't settle. Also the method: reproduce, capture, query, claim a cause, remove it and watch the effect go. Adding spans and making a speed claim are `perf-and-tracing`; how memory is meant to be held is `memory-and-data`. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before writing a query over the profile, and before making a claim about why a build did something."
+description: "How to find out why a blaze run did what it did from what it records: `.blaze/v2/profile.txt` (each phase's tasks planned and entered, wasted entries, why tasks were entered), `.blaze/v2/start.txt`, `--stats`, `--status-every` and the signal status, `blaze why <file[::item]>` and `blaze explain <status>`. Also the method: reproduce, capture, claim a cause, remove it and watch the effect go. Adding spans and making a speed claim are `perf-and-tracing`; how memory is meant to be held is `memory-and-data`. Load before debugging a slow, rerunning, memory-hungry or non-converging build, before reading the profile, and before making a claim about why a build did something."
 ---
 
 # Debugging blaze from its profile
@@ -9,14 +9,13 @@ description: "How to find out why a blaze build did what it did from its profile
 
 ## ask-the-profile-first (rule 17)
 
-Every build already records its footprint and live bytes, each task's peak memory, its spans, its
-waits and what it reran and why, in `<BLAZE_HOME>/v2/profile/*.parquet` (every command writes it; a
-path that writes none is unfinished: `slow-is-p0-traced`). A why question (slow, rerunning,
-memory-hungry, idle workers, hung) starts with `blaze explain footprint_per_build`, `memory` or
-`worker_states`, `blaze why`, or a `blaze debug sql` query on the home that showed it (these
-commands are parked with blaze-cargo's CLI; until the new command line has them, DuckDB over the
-parquet files), and quotes the rows. A guess or a fresh experiment comes only after the rows can't
-answer, and then the gap gets a span or counter.
+Every check already records each phase's tasks planned and entered, its wasted entries and why tasks
+were entered, in `.blaze/v2/profile.txt` in the checkout; `blaze run` writes its start to
+`.blaze/v2/start.txt`, and `--stats` prints one line at exit (a path that records nothing is
+unfinished: `slow-is-p0-traced`). A why question (slow, rerunning, memory-hungry, idle workers,
+hung) starts with those lines, `blaze why <file[::item]>`, `blaze explain <status>` or a stack
+sample of the hang, and quotes them. A guess or a fresh experiment comes only after the lines can't
+answer, and then the gap gets a counter or a line in the profile.
 
 ## claims-from-evidence (rule 61)
 
@@ -68,395 +67,57 @@ cause.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 
-Every `blaze serve` daemon keeps a profile history: Parquet files that say what each build
-ran, why, for how long and with how much memory. The target design (2026-11-13) has no daemon:
-each command's process writes the same history to its home before it exits. Below, what is
-marked "deleted by the target" stays documented as long as its table or view exists; do not
-build new work on it. Answer "why" questions from those rows, not
-from reading code and guessing. The schema is defined once, in
-`crates/blaze-profile/src/schema.rs`, and documented column by column in `docs/profiling.md`.
-This skill says how to read it and how to turn a reading into a proved cause.
+A run keeps no history and has no query language over what it did: each command writes text
+files in the checkout, and a why question is answered from those, the command's own lines and a
+stack sample. Speed work also follows `perf-and-tracing` (a span names the time before the
+fix); this skill is the method behind it, for reruns, memory and hangs too.
 
-Speed work also follows the `perf-and-tracing` rule (a span names the time before the fix).
-This skill is the general method behind it, for reruns, memory and cycles too.
+## What a run records
 
-## The first three commands
+- **`.blaze/v2/profile.txt`** in the checkout: the check's profile, rewritten by each check,
+  never synced, removed by `blaze clean`. Each phase's tasks planned and entered; each stage's
+  entries and how many came out with the same bytes again (a wasted entry); the finish's settle
+  counts; the index's bytes an edge against its floor; the top groups of why tasks were entered
+  (stage, cause, the moved cell's task) with the tasks each entered; the command's phases
+  (`profile_text` in `crates/blaze-cli/src/engine_check.rs`).
+- **`.blaze/v2/start.txt`**: `blaze run`'s start, its phases with the run's lines, written
+  whether the start ended well or not (`crates/blaze-cli/src/engine_start.rs`).
+- **`--stats`** (check, build, run, test): one line on stderr at exit with the tasks entered of
+  those planned, the records put, the pages written, whether the certificate stood, the ms in
+  main and the profile's path (`stats_line`).
+- **`--status-every <secs>`** (check): one status line each interval. SIGINFO (Ctrl-T on macOS)
+  or SIGUSR1 writes the status and the check goes on. SIGTERM or SIGINT stops it: where it
+  stood goes to stderr and the profile, and the status is 128 plus the signal's number. Workers
+  that reach no scheduling point within the stop bound are named and the process ends
+  (`crates/blaze-cli/src/engine_status.rs`).
+- **`blaze why <file>`** or **`blaze why <file>::<item>`**: why that file's outline or that
+  item's body was last entered, one line a step back to the edit: new, its key moved, a read
+  that moved (the cell, its task, the digests), owed, or made inline. It writes nothing
+  (`crates/blaze-cli/src/engine_why.rs`).
+- **`blaze explain <status>`**: what an exit status means; `blaze explain` alone lists all. 3
+  and 4 are not passes: a stage did not run whole, or items were not checked, each named in the
+  closing lines.
+- **A hang**: take a stack sample (`sample <pid>` on macOS) before the kill and quote it.
 
-Before any query, on the daemon that showed it:
-
-1. `blaze explain problems`: what blaze itself said was wrong, newest build first, each thing
-   once with how often: every WARN and ERROR event (each line the daemon writes to its log is
-   one), panics, fatal signals, blaze bugs, builds that failed. A build whose daemon said its
-   results were not kept, or that a job panicked, or that its loop stalled, is explained here
-   and nowhere cheaper. `build=N` for one build.
-2. `blaze slow [--build N]`: the build's problems again, then where its time went (findings
-   ranked by what fixing each would save; `not_kept` and `unfinished` first), then each stretch
-   of the critical path of 20 ms or more under no span with its thread, the spans around it
-   and the stacks sampled in it (`gaps`), then what the profile could not see.
-3. `blaze why [ITEM]`: the build's problems again, then what it computed again and why. A
-   reason says what was recorded; where it says "not recorded" it names the command that reads
-   what is left.
-
-Each of the three also carries the build's account (`accounts`, docs/profiling.md): `blaze
-slow` prints it in a line under the problems with each warning it names, and an alarm is a
-WARN event, so `problems` and `why` list it. An account line that says `the history holds
-none` means the build's end never reached the history: read `blaze daemon status` (its
-`history:` line says what the history's thread dropped or panicked on) before trusting any
-empty table of that build.
-
-Then the rows. `blaze debug schema [TABLE]` lists the tables and views, or a table's columns
-with their meaning; `blaze debug sql "DESCRIBE spans"` and `"SHOW TABLES"` answer the same. Never
-guess a column: a query DuckDB refuses for one is answered with the table's real columns.
-
-## Before trusting a measurement
-
-- **The binary.** `blaze --version` prints `binary: <BLAKE3>`; `builds.blaze` is the BLAKE3 of
-  the blaze that ran each build. A stage that failed to build leaves the old binary in place:
-  compare the two before reading a number. A daemon of another binary answering `status`,
-  `debug`, `explain`, `why` or `slow` says so in one warning line: read it.
-- **The tree.** `builds.tree` is the digest of the tree a build ended on; quote it with the
-  number (rule `measure-the-exact-tree`).
-- **The build succeeded.** `builds.outcome` is `ok`, and its exit code is the build's own, not
-  a helper's (`cp`, `tee`, a pipe's last command). A build after a failed one says "the last
-  build ... failed ...: this build first does the work that one left" and has an `unfinished`
-  finding: its time is not an edit's.
-- **The daemon is the one you think.** One `BLAZE_HOME` per experiment; `blaze status` names
-  the daemon's pid and build. Build numbers are per home.
-- **Compare from the second edit on.** The first build after a cold one lets go of every
-  body's results and makes the edited crate's again once.
-- **No problems.** `blaze explain problems` says nothing was wrong in the builds you compare
-  (it names the builds it read; a build that is not in the history is an error), or you say
-  what it lists.
-
-`blaze debug edits KIND [--file F] [--fn NAME] [--runs N] [--json]` does all of this for an
-edit loop (no-op, comment, body, signature, add-item, dep-body): it applies the edit, builds
-with this very executable, repeats, and prints per run the wall time, the daemon's time, the
-timeline, the bounded counters and the problems, with the binary and the tree; it fails
-rather than time a build that failed or that another binary answered, and leaves the file as
-it found it. Use it in place of a shell loop.
+Before trusting a measurement: the exit status is the command's own, not a pipe's last command;
+the binary is the one you built; the tree is named (`measure-the-exact-tree`); a status of 3 or
+4 is an incomplete check, never a check's time.
 
 ## The method
 
-1. **Reproduce.** Find the smallest build that shows it: one edit, one command, one daemon.
-   Write down the tree it ran on (commit and dirty diff; `builds.tree` and `builds.blaze` record
-   it) so the claim names an exact tree (rule `measure-the-exact-tree`).
-2. **Capture.** Run it under a daemon that keeps a history (any `blaze serve`). Use a fresh
-   `BLAZE_HOME` per experiment so the build numbers are yours: `BLAZE_HOME=$(mktemp -d) blaze
-   build`. Run the cold build, then the edit, then the warm build. Each build is a `build_id`.
-3. **Query.** Start from counts (`query_counts`, `time_by_span_name`), then go to rows
-   (`provenance`, `key_parts`, `spans`). Always filter by `build_id`.
-4. **Claim.** State one cause and one effect in numbers taken from the rows: "`infer_query` ran
-   4 120 times in build 3 because `FileText.text`(/src/lib.rs) changed, 3 900 of them through
-   `item_tree`".
-5. **Remove the cause and watch the effect go** (rule `test-the-cause`). Revert the edit, pin the
+1. **Reproduce.** Find the smallest run that shows it: one edit, one command, one checkout.
+   Write down the tree it ran on (commit and dirty diff) so the claim names an exact tree.
+2. **Capture.** Run the cold run, then the edit, then the warm run, each with `--stats` and its
+   exit status. Copy `.blaze/v2/profile.txt` aside after each: the next check rewrites it. The
+   store is the home's (`$HOME/.blaze/v2/store`): a fresh `HOME`, or `blaze clean --store`, for
+   a cold run.
+3. **Claim.** State one cause and one effect in numbers taken from those lines: "the warm check
+   entered 4 120 tasks, 3 900 of them because the cell of `src/lib.rs` moved", with `blaze why`
+   on one of them.
+4. **Remove the cause and watch the effect go** (rule `test-the-cause`). Revert the edit, pin the
    input, or drop the untracked read; rerun the same steps on the same tree and quote the same
-   query before and after. If the effect stays, the claim was wrong. Say so and go back to 3.
+   lines before and after. If the effect stays, the claim was wrong. Say so and go back to 2.
 
-Never report a cause you have not removed. Never report a speedup that has no before and
-after from the same query.
-
-## Where the files are
-
-- The history directory is `<state>/profile`. `<state>` is `$BLAZE_HOME/v2` when `BLAZE_HOME`
-  is set, else `$XDG_CACHE_HOME/blaze/v2`, else `~/.cache/blaze/v2`.
-- Each flush writes `<build>-<seq>.<table>.parquet` per table, and merges fold them into
-  `<build>-<first>-<last>-<level>.<table>.parquet`. `manifest.json` lists the files that are
-  the history, by table. A file on disk it does not list (a merge's retired input, held for a
-  reader's pin) is not part of it: a glob over the directory can read rows twice. Every
-  directory also holds an empty `schema.<table>.parquet` of each table, which has every column.
-- `owner.lock` names the daemon that writes there.
-- Files carry `blaze.schema` in their Arrow metadata. Schema 4 added `provenance` rows,
-  `key_parts` and the `query_counts.ran_*` causes, and schema 5 `event_fields`. Older files read
-  them as null.
-
-## Running DuckDB
-
-No setup is needed. `blaze explain memory` needs no DuckDB at all: it reads the Parquet itself
-and aggregates in Rust (`blaze_profile::memory`, held to each `memory_*` view's SQL by a test).
-The commands that run SQL (`blaze slow`, the problems `blaze why` adds, `blaze explain <view>`,
-`blaze debug sql`) find DuckDB in this order, never on `PATH` (blaze never links it):
-
-1. `BLAZE_DUCKDB`, an absolute path to a DuckDB 1.5.5 CLI (`nix develop` sets it). Set wrong
-   (relative, empty, missing), it is that command's error, naming the variable, the path and
-   `unset BLAZE_DUCKDB`; nothing else is tried.
-2. Unset: the DuckDB blaze pins (1.5.5, by SHA-256 per host in `DUCKDB_PINS`,
-   blaze-cargo's `serve/observe.rs`, deleted with the daemon), fetched once through the store with a
-   line saying so and laid out at `<state>/duckdb/1.5.5-<sha16>/duckdb`
-   (`crates/blaze-cargo/src/cli/duckdb.rs`). A failed fetch names the URL and the file.
-
-A bad `BLAZE_DUCKDB` never stops a daemon or a build: no daemon start reads it, and it is not
-a daemon setting, so a client whose value differs from the daemon's is not refused. To run
-DuckDB by hand, set `BLAZE_DUCKDB` to the laid-out path.
-
-- `blaze debug sql "<query>"` runs one query over the history with every table and view of
-  `crates/blaze-profile/sql/views.sql` defined. `--json` prints rows as JSON for a script or a
-  CI gate. It asks the daemon to flush first, so it sees every row recorded before it asked.
-- `blaze explain <view> [name=value ...] [--json]` runs a named query from
-  `crates/blaze-profile/sql/examples.sql`. With no arguments it lists them. Each view whose
-  arguments all have defaults is also a DuckDB view of that name inside `blaze debug sql`, for
-  the last build: `blaze debug sql "SELECT * FROM what_reran"`.
-- `blaze slow [--build N]` is the one-screen answer to "what made it slow". `blaze why [ITEM]`
-  says what the daemon computed again and why, item by item.
-- `blaze debug schema [TABLE] [--json]` prints the schema this blaze reads, with no DuckDB and
-  no daemon. `blaze debug syscalls [--loop | --thread NAME] [--unit TEXT] [--over MS]` prints
-  what a build's threads blocked in (the `syscalls` view). `blaze explain script UNIT` prints a
-  build script's last run: what it read, what could not be traced and which process did it,
-  the programs it started, its exit and time. `blaze doctor` checks the persisted state when a
-  daemon will not start or panics on an id, and prints the command that sets it aside.
-- For files outside a daemon (a CI artifact, another machine's home), call DuckDB directly on
-  the files the manifest lists, never a glob: `files=$(jq -r '.tables.provenance // {} | keys |
-  map("<dir>/" + .) | tojson' <dir>/manifest.json)`, then `$BLAZE_DUCKDB -c "SELECT ... FROM
-  read_parquet($files, union_by_name = true)"`. A glob is right only for a copy of the
-  directory with no retired files (the manifest's `retired` list empty).
-
-## The tables that answer "why"
-
-- `spans` has one row per span. `name` is the span kind (`unit bodies`, `macro expand`, `wait`,
-  `task`, ...), and `function`, `crate`, `unit` and the typed columns say of what. A `task` span
-  is one daemon plane task: `function` is its kind (`unit bodies (infer)`), plus `node`,
-  `granted_bytes` (what memory admission granted, the predicted peak), `passed` (how many times
-  another task started while its grant did not fit) and `peak_bytes` (the most it held). An
-  `admission` span is the same task's wait from ready to start, with `awaits` saying what held
-  it back: `memory`, `a work thread`, `an io thread` or `nothing` (null: it never started).
-- `query_counts` has one row per query function per build, written always. `executed` and
-  `verified` are runs and rows proved unchanged without running. `ran_new`, `ran_changed`,
-  `ran_untracked`, `ran_cycle` and `evicted_asked` are the runs by cause and add up to
-  `executed`; a mismatch is a bug in the engine. `written` is input writes, `reran` is runs
-  in a view the row already ran in, and `reads_*` are read volume.
-- `provenance` is the query engine's run log. It has one row per run that was not a first run,
-  plus one row for each run's first untracked read. Columns: `query_key` (the query and its
-  key as the key's `Debug` shows it, `` `infer_query`(DefWithBodyId(..)) ``), `kind`, `outcome`
-  (`ran` or `untracked read`), `cause` (`changed`, `evicted`, `untracked`, `cycle`), `view`,
-  `cause_key` (the read that changed: `` `FileText.text`(/src/lib.rs) `` for a file, another
-  input's field by id, or another memo's `query_key`), `cause_kind` (`input`, `tracked`,
-  `interned`, `function`) and `what` (the `Untracked { what }` name). Names are made only as
-  the build ends, with its database, so logging stays cheap. It is written while the
-  daemon keeps a history. Its first 2^19 rows between two builds are kept whole; past them
-  one run in 64 is kept as a sample (`weight` 64, so weigh a count by `sum(weight)`), with a
-  `warn` event saying the numbers, and the counts still hold every run exactly.
-- `misses` has one row per unit, build-script run or codegen template that a build computed
-  again, with the reason in words (`cause`, `what`, `was`, `now`, `since`). `blaze why` reads
-  these rows.
-- `key_parts` has one row per part of each miss's key: `step`, `item`, `key` (hex), `part`,
-  `hash` (hex), `names` and `beyond`. Diff two builds with it, or two homes.
-- `counters` holds time series: `live bytes`, `footprint bytes`, `pool queued`, and others.
-
-## Ready queries
-
-Each query below is a named view (`blaze explain <name>`) unless it says otherwise. Defaults:
-`build` is the last build, `limit` is 20.
-
-**One build at a glance** (the queries written by hand most often, 2026-11-10):
-- `blaze explain timeline [min_ms=1]`: the build as rows in the order things began: `at_ms`,
-  `ms`, `cpu_ms`, `thread`, `depth`, `name`, `what`. A hole between rows of one thread and
-  depth is time under no span of that size.
-- `blaze explain long_spans [min_ms=20]`: the longest spans, with their own CPU: long with
-  little CPU and not a `wait` is blocked in something no span names.
-- `blaze explain waits_by_reason`: `wait` and `admission` spans by what they waited for.
-- `blaze explain wait_owner [min_ms=20]`: the long waits, each with who ends it (`owned_by`,
-  `owner`) and what that owner's job did meanwhile (`owner_did`: `query verify`, a query's run).
-- `blaze explain counts_by_cause`: `query_counts` with the cause columns, the most run first.
-  An edit's build runs a handful.
-- `blaze explain writes`: the inputs the build wrote, and for each the fields reruns name as
-  their cause (which file, which crate, which module's scope) with how many memos reran.
-- `blaze explain scripts`: the build scripts that ran, with why each was not reused.
-- `blaze explain pool`: the store's buffer pool's and the worker pool's counters over the build
-  (the buffer pool's are deleted by the target, with the pool: `outputs-are-records`).
-- `blaze explain kept`: what the build kept or lost as it ended and after its answer.
-- `blaze explain syscalls thread=loop`: what the loop thread blocked in.
-- `blaze explain account`: the build's account in one row: what it saw change (`written`,
-  by who writes that kind of input), what it did (`executed` by cause, `steps` by kind, each
-  step once under where its chain of reasons ends), what does not add up (`unbalanced`,
-  `ran_uncaused`, `by_unexplained`: each must be 0), the proportions (`rows_per_write`,
-  `steps_per_change`), the alarms it names, and what the profile lost (`uncovered_ms`,
-  `history_dropped`, the recorder's `spans_lost`). Start here for "did this build do more
-  than its change asked for"; `blaze explain unaccounted` lists the builds that alarm.
-- `blaze explain edit_work`: what each stage of the build visited, asked of or made again
-  (`engine memos`, `changed set`, `body check`, `codegen walk`, `dependency image keys`,
-  `link`), a row a counter. After a one-function body edit every `total` is a small constant
-  whatever the workspace's size, but `link`'s `symbols` and `patchable` and the walk's
-  `copied`; a `whole` that is not 0 says a stage visited everything, and the stage's span
-  says why. It errors on a build that counted nothing.
-- A span's fields that have no column are in `spans.fields` as `key=value` text:
-  `WHERE fields LIKE '%why=memory%'`.
-
-**Top time by span.** `blaze explain time_by_span_name build=N` gives time per span kind.
-`blaze explain slowest_queries` lists the slowest query spans. For own CPU time by function:
-
-```sql
-SELECT name, function, count(*) AS spans, round(sum(self_cpu_ns) / 1e6, 1) AS self_cpu_ms
-FROM spans WHERE build_id = 3
-GROUP BY name, function ORDER BY self_cpu_ms DESC LIMIT 20
-```
-
-**What reran and why.**
-- `blaze explain memo_hit_rate_per_query_kind build=N` gives, per query, how many runs were
-  verified and how many ran, broken down by cause. Start here.
-- `blaze explain what_reran build=N` lists each memo that ran again, with its cause and the read
-  that changed.
-- `blaze explain why_reran build=N` follows each rerun's `cause_key` through the memos that
-  changed to the root (an input field, an untracked read, a cycle). It counts how many memos
-  each root made run again, so the top row is usually the answer.
-- `blaze explain untracked_reads build=N` lists the untracked reads by name. Each memo that made
-  one reruns in every view, so a name here with many memos is a missing tracked input.
-- To find what made one memo run, walk the chain by hand:
-
-```sql
-WITH RECURSIVE chain AS (
-    SELECT query_key, cause, cause_key, cause_kind, 0 AS depth
-    FROM provenance WHERE build_id = 3 AND query_key LIKE '`infer_query`(%my_fn%'
-    UNION ALL
-    SELECT p.query_key, p.cause, p.cause_key, p.cause_kind, chain.depth + 1
-    FROM chain JOIN provenance p ON p.build_id = 3 AND p.query_key = chain.cause_key
-    WHERE chain.cause_kind = 'function' AND chain.depth < 64
-)
-SELECT DISTINCT * FROM chain ORDER BY depth
-```
-
-- Units and build scripts: `blaze why`, or `SELECT step, item, cause, what FROM misses WHERE
-  build_id = 3 AND cause <> 'first'`.
-
-**Diffing two runs' keys.**
-- `blaze explain key_part_diff after=M before=N` lists, for each thing build M computed again,
-  each key part whose hash differs from the last build at or before N that computed it too.
-- No rows while `misses` still says it missed means the key was the same. Look at `beyond`
-  (process variables, traced reads) and at `misses.cause`.
-- Across two homes, for example a cache miss on CI that you don't see locally:
-
-```sql
-WITH a AS (SELECT * FROM read_parquet('/tmp/home-a/v2/profile/*.key_parts.parquet', union_by_name = true) WHERE build_id = 2),
-     b AS (SELECT * FROM read_parquet('/tmp/home-b/v2/profile/*.key_parts.parquet', union_by_name = true) WHERE build_id = 2)
-SELECT coalesce(a.item, b.item) AS item, coalesce(a.part, b.part) AS part, a.hash AS a_hash, b.hash AS b_hash
-FROM a FULL JOIN b ON a.step = b.step AND a.item = b.item AND a.part IS NOT DISTINCT FROM b.part
-WHERE a.hash IS DISTINCT FROM b.hash ORDER BY item, part
-```
-
-  Run it with `$BLAZE_DUCKDB -c "..."`, on copies whose manifests retire nothing (else list the
-  files from `manifest.json` as above). Build numbers differ across homes, so pick each side's
-  build first.
-
-**Memory by task.**
-- `blaze explain memory [N]` (with no N: the last build that has memory rows, said when that
-  is not the last build; a build named that has none is an error, never empty tables)
-  is the one-screen answer to "who owned the memory": the timeline per
-  minute (footprint, live heap, blaze-mem, kept), the tasks with the largest peaks with crate,
-  unit and global-heap churn (`heap_allocated_bytes` against `peak_bytes`), the breakdown by tag
-  at the footprint's peak (the `tag ... bytes: <tag>` counters), and the call sites that
-  allocated the most (`alloc_samples`, one sample per 4 MiB a thread allocates). Each part is
-  also a view of its own: `memory_timeline`, `memory_peak_tasks`, `memory_at_peak`,
-  `memory_sites`. Counters carry the build under way as `build_id`.
-- `blaze explain task_memory build=N` and `task_grants` (deleted by the target with admission:
-  `one-memory-measure`; the peaks stay) show, per task kind, the memory granted against the peak
-  held, how many tasks went over their grant and how many stayed under half of it. A kind that
-  is often over its grant has a forecast that is too low.
-- `blaze explain task_grants build=N` lists each task whose grant missed its peak (over, or
-  under half), worst first, with its crate and unit.
-- The whole-process line is the `live bytes` and `footprint bytes` counters
-  (`blaze explain footprint_per_build`).
-- Single tasks: `SELECT function, node, granted_bytes, peak_bytes FROM spans WHERE build_id = 3
-  AND name = 'task' ORDER BY peak_bytes DESC NULLS LAST LIMIT 20`.
-
-**Admission waits** (deleted by the target with admission; `wait` spans stay).
-- `blaze explain admission_waits build=N` gives, per task kind and what held it back (memory,
-  a work or io thread, nothing), how many tasks waited, their whole and longest wait from ready
-  to start, and how often memory passed them over.
-- The longest single waits: `SELECT function, node, awaits, round(dur_ns / 1e6, 1) AS ms,
-  passed FROM spans WHERE build_id = 3 AND name = 'admission' ORDER BY dur_ns DESC LIMIT 20`.
-- Threads blocked inside tasks are `wait` spans: `SELECT awaits, waits_on, count(*),
-  round(sum(dur_ns) / 1e6, 1) AS ms FROM spans WHERE build_id = 3 AND name = 'wait' GROUP BY
-  ALL ORDER BY ms DESC`.
-- `blaze explain uncovered_time` and `worker_states` say whether workers were idle while tasks
-  waited.
-
-**A cycle that won't settle.**
-- `blaze explain cycle_reruns build=N` lists the memos that ran for a cycle, with their runs and
-  views. One memo with many runs in one view is a cycle iterating.
-- `SELECT kind, ran_cycle, executed FROM query_counts WHERE build_id = 3 AND ran_cycle > 0`
-  gives the count per query.
-- If the build never ends, `open` holds the spans every thread was inside at the last flush,
-  and `blaze slow` reports a build whose daemon died.
-
-## A daemon that hangs, stalls or dies
-
-A hang is a bug the watchdog must report (`bounded-progress`); one you found by hand is also a
-watchdog bug. What follows is for the daemon while it exists.
-
-- **While it lives:** `blaze debug inspect` prints one line of JSON from a thread and socket
-  of the daemon's own, so it answers when every worker is busy and when the loop is stuck:
-  `{"pid":..,"turn":{"turned":0,..},"tasks":[{"kind":..,"state":"running","awaits":..,"for_ms":..}],
-  "memory":{"footprint":..,"ceiling":..,"limit":..,"admission":"near"},"longest":[{"on":"key
-  infer(..)","who":"blaze-work-3","kind":"span","for_ms":41000}],"threads":[..],"job_waits":"..",
-  "lock_waits":[..]}`. Read `longest` first, then `turn.turned` (0: the loop does not turn),
-  then `job_waits` for jobs parked on fibers (they are on no thread). `--record` also writes a
-  flight recording and names it in `recorded`.
-- **After it went:** the command it hung up on names `its flight recording`:
-  `<state>/flightrec/<pid>-<unix ms>.cbor`, written on a panic outside a job, at the memory
-  ceiling, and on a stall of a build, the loop or a stop. `blaze debug inspect --read FILE`
-  prints why, what the daemon said and every thread's open spans; `--trace OUT` writes the
-  recorder's last two minutes as a Chrome trace. A fatal signal leaves no recording: read
-  `blaze explain problems` and `blaze slow`, which take its rows from `flight-<pid>.map`.
-
-## Fixing the compiler without compiling the world again
-
-Everything stored is keyed by the code identity of what made it: `codegen` (every template),
-`front_end` (images, check outcomes, bodies, goals, expansions) and `record` (unit records, with
-the other two). Each is a hash of whole packages, worked out by blaze-engine's build script
-under cargo and under blaze alike, so a fix to one front-end file misses every image and record,
-and a cargo-built blaze has other identities than a blaze-built one of the same tree.
-
-- `blaze debug toolchain` prints one line of JSON with no daemon: `built` (this blaze's three),
-  `keyed` (what it keys by), `assumed`, and `as`, the value to give another blaze:
-  `{"as":"codegen=<hex>,front_end=<hex>,record=<hex>","assumed":false,"built":{...},"keyed":{...}}`.
-- `BLAZE_DEV_TOOLCHAIN_AS=<as>` in the environment of the rebuilt blaze (and so of the daemon
-  it starts) keys as that blaze did, part by part; a part left out keeps this blaze's own, so
-  what that part's code makes is made again. After a fix to the front end, assume `codegen`
-  alone: every template is reused, every image, check and record is made again, and nothing
-  stale is served. Assume a part whose code you changed only when you know which stored
-  values the change touched, and say so with the number.
-- It is loud and bounded: every build and check starts with one `warning:` naming what is
-  assumed; `--release`, `-r`, a `--profile` other than `dev` or `test`, `bench` and `--goal max`
-  are refused naming the argument; the store check (`BLAZE_VERIFY_STORE`) runs at a rate of at
-  least 0.05, so a stale template is an error naming the function. A command whose value
-  differs from its daemon's is refused naming both (`blaze stop`, then run it again).
-- Never quote a measurement from a build under it as a build's time: `blaze explain problems`
-  lists the warning.
-
-There is no `blaze debug evict` yet: the store never deletes or replaces a value (a second
-value under a key is a refusal), the daemon's database has no reverse edges, and unit records
-do not name the keys they were made from, so the dependents of an entry cannot be found.
-A stored value the fixed code would make otherwise is reached today only by leaving its part
-out of `BLAZE_DEV_TOOLCHAIN_AS`.
-
-## Limits to keep in mind
-
-- **An empty table is not "nothing happened".** The history can lose rows, and says so in
-  three places: `blaze daemon status` (`history:`: a flush or a turn of its thread that
-  panicked, rows dropped by table), the build's account (`accounts.history_dropped`), and
-  WARN events (`the flight recorder lost rows`, `the profile history halved a batch`). Check
-  them before reading no `misses` as "nothing was computed again".
-- **Who wrote an input is told by its kind**, not by the code that wrote it
-  (`account::Writer::of_input`): `written_derived` is blaze's own publications, the others
-  come from outside. Which setter call wrote it is not recorded; `blaze explain writes`
-  names the fields reruns followed.
-- **The account's engine sum is reported, not asserted**: the counters are taken while the
-  engine's threads may still count (from the code; whether a take ever lands between a
-  run's two counts is not measured), so read a small `ran_uncaused` on a build that
-  overlapped another as a lead, and one on a build alone as a bug.
-
-- A key's name is its `Debug` with each id the front end can name followed by its name
-  (`Crate(Id(21548) = serde v1.0.219 (lib))`, `FunctionId(Id(77) = serde::de::value::f)`), and
-  an input's row is named where a namer knows it (a file by its path, a crate, a module's
-  scope by its path). An id with no name after it is one no namer knows
-  (`hir_def::span_names::name_row` is where to add it); never guess what it is. Ids differ
-  across daemons: compare by name, or through `key_parts` and `misses`.
-- The counts are process-wide (two overlapping builds share them); the run log is the front
-  end's own.
-- The history holds 4 GiB. Past it the oldest builds go whole, never one that is running nor
-  the newest; each time a WARN event says the files, rows, bytes and builds
-  (`blaze explain problems`), and another says rows the rings wrote over before a flush read
-  them. A build with fewer rows than it should have and neither event is a bug in the history:
-  read `manifest.json`'s `builds` of each file before any other guess.
-- `admission` says memory only when the task was passed over for it; a wait behind another
-  task's starvation hold reads as a thread.
-- The `queries` view joins `provenance` on a span's `function`. That is a display name, so the
-  join finds nothing. Read `provenance` directly.
+Never report a cause you have not removed. Never report a speedup that has no before and after
+from the same lines of the same files. Where the profile cannot answer, give the gap a counter
+or a line in the profile (`slow-is-p0-traced`).

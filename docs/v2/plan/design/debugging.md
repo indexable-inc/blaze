@@ -159,7 +159,7 @@ as its view opens ("the last build of /w (build 41, `build`) failed with 212 of 
 not built ...: this build first does the work that one left, so its time is not a no-op's"),
 its misses take one row of step `work the last build left unfinished`, which `blaze why` says
 before every other group and `blaze slow` ranks first (finding `unfinished`). Spec:
-[why.md](why.md).
+`crates/blaze-cli/src/engine_why.rs`.
 
 ## e. Which process did it (built on Linux: f87fe256af, 3f58c4890b)
 
@@ -186,7 +186,7 @@ no daemon, prints the command that sets the state aside whole, and deletes nothi
 Each reason says what was recorded; where the record cannot tell two things apart it says
 both and that which is not recorded; where the record is gone it says why and the command
 that reads what is left (`blaze explain key_part_diff after=N before=M`). Spec:
-[why.md](why.md).
+`crates/blaze-cli/src/engine_why.rs`.
 
 ## l. A hung user-code run says what each process is blocked in (built on Linux: 3d43868436)
 

@@ -1,4 +1,4 @@
-//! ONE TYPED STAGE PROTOCOL for the check engine (docs/v2/plan/design/stage.md; lane ST1,
+//! ONE TYPED STAGE PROTOCOL for the check engine (docs/v2/plan/design/end-state.md D157; lane ST1,
 //! 2026-11-18).
 //!
 //! The fault class (rule 54): the engine's seven stages (Units, Scripts, Outlines, Names, Heads,

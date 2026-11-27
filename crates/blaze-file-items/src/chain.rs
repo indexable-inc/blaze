@@ -1,6 +1,5 @@
 //! An item's chain: where it is in its text by names, the one identity of an item that no edit
-//! elsewhere in the file moves (rule 71; drive.md, "End state: the whole pipeline on the
-//! command", the gap row "One body identity" and piece 5).
+//! elsewhere in the file moves (rule 71; end-state.md D157).
 //!
 //! ONE HOME (rule 30). Three places walked this chain: blaze-scope's items record
 //! (`items_record::grain::item_chain`, 32 bytes, which now calls [`item_chain`]), the command's

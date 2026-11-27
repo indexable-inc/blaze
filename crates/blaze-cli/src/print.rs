@@ -1,4 +1,4 @@
-//! Findings placed when printed (drive.md, "Printing"; rule 71): a finding holds its item's
+//! Findings placed when printed (drive.md; rule 71): a finding holds its item's
 //! start and an item-relative range; its frame (or line) is drawn here by blaze-report, from the
 //! file's text, and nowhere else. And the profile (rule 17): written to `.blaze/v2/profile.txt`
 //! on every command, its summary line on stderr under `--stats`.
@@ -237,7 +237,7 @@ fn counted<'f>(wanted: &Wanted<'f>, finding: &Print<'_>, no_text: blaze_ids::Con
 /// can list is bounded by the count of its findings (a [`Listed`], its words and a path a
 /// file), never by the sizes of their files or frames. (Before: each finding kept four copies
 /// of its file and two outlines in the command's frame, and blaze's own 3,487 findings filled
-/// its 64 MiB: drive.md, runner 13.)
+/// its 64 MiB: drive.md.)
 pub struct Scratch {
     file: Frame,
     one: Frame,

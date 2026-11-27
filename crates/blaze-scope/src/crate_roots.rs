@@ -1,5 +1,5 @@
 //! A path's crate root in an expansion's ITEM text, by its first segment's MARK (drive.md, "A
-//! token keeps its mark", ruled 21:27; piece token-mark-2). No spelled token: the text writes the
+//! token keeps its mark"; piece token-mark-2). No spelled token: the text writes the
 //! keyword `crate` where the expansion had another crate's `$crate`, and that token's row in the
 //! text's origin column (blaze-expand origin_column.rs) carries the mark it resolves by.
 //!

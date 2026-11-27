@@ -1,4 +1,4 @@
-//! The last answer's record (drive.md ruling 3): the drive's last-answer pointer and the leaf
+//! The last answer's record (drive.md): the drive's last-answer pointer and the leaf
 //! table in one record, named by the checkout's root for one (tool, request shape) in the one
 //! store (store.rs `last_root`), sealed by a header that holds the body's length and a check
 //! over the length and the body. (Before: a pointer file under `.blaze/v2/at`, an old form

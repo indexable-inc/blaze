@@ -1,4 +1,4 @@
-//! blaze's lints, rebuilt for the item layer (docs/v2/plan/design/lint.md).
+//! blaze's lints, rebuilt for the item layer (docs/v2/plan/design/lints-stage.md).
 //!
 //! A rule is a pure function of one item: the item's own bytes (its text, with its child items'
 //! ranges left out as holes) and the [`Scope`] its parent's text gives it. Every enabled rule
@@ -1427,7 +1427,7 @@ impl Levels {
 }
 
 /// The step of AGENTS.md's adoption ladder a project is on: which of these rules it gets, and at
-/// which level (docs/v2/plan/design/lint.md, "Which rules a project gets"). A project that names
+/// which level (docs/v2/plan/design/lints-stage.md, "Which rules a project gets"). A project that names
 /// none is on [`Step::Rust`]: every rule here is one of blaze's house rules, which a plain Rust
 /// project did not choose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

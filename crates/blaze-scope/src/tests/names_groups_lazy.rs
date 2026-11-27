@@ -1,4 +1,4 @@
-//! Names on demand (cells/lazy.rs, engine.md piece E13): a crate of 500 modules of which 3 are
+//! Names on demand (cells/lazy.rs, end-state.md D158): a crate of 500 modules of which 3 are
 //! asked. The driver over the real one-group solve (cells/edit.rs `OneGroup` over the crate
 //! solve with its members named) solves exactly the groups of the closure of the asked
 //! modules' reads, as the whole solve's records predict it (followed from the asked modules'

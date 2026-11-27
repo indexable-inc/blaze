@@ -1,4 +1,4 @@
-//! E3, the impl tables (docs/v2/plan/design/engine.md, D131): each crate's impls filed ONCE,
+//! E3, the impl tables (docs/v2/plan/design/end-state.md, D157, D131): each crate's impls filed ONCE,
 //! by a pure function of its impl rows and the names, into blaze-surface's records (the
 //! buckets, the directory and `NoImplsOf`), and read through blaze-impls' lookups. They replace
 //! the per-job [`Buckets`] filing and the items record's bucket section, which go when the
@@ -74,7 +74,7 @@ pub struct ImplTables<'a> {
     /// The crates whose items the rows were resolved to (each trait's, each nominal self
     /// type's), sorted: what of the names the filing's answers name. A path walked through
     /// another crate's re-export reads that crate's names too, which only the names' cell
-    /// reads will list (engine.md E4); until then a reader that must be sound takes the
+    /// reads will list (end-state.md D158); until then a reader that must be sound takes the
     /// crate's dependencies' names records as the reads.
     pub named: AVec<'a, CrateItemKey>,
     pub counts: FileCounts,
@@ -741,7 +741,7 @@ fn prefix_range(prefix: &[u32; 257], byte: u8, len: usize) -> core::ops::Range<u
 }
 
 /// Every crate's impl tables of one request, made ONCE by the Heads stage's tasks and read in
-/// place by every body on every worker (engine.md, "The design" 1): each record's bytes held in
+/// place by every body on every worker (end-state.md D157): each record's bytes held in
 /// `Global`, because a task's `Alloc` is not `Sync`; immutable once the stage has put them, so
 /// `Sync` by its fields. A reader reads it through a [`TableSet::lent`], which notes its reads.
 pub struct ImplShelf {

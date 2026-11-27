@@ -1,4 +1,4 @@
-//! The `Scripts` stage of `blaze engine-check` (engine.md E6, piece "scripts"): every build
+//! The `Scripts` stage of `blaze engine-check` (end-state.md D157): every build
 //! script's run and every module lookup as an engine task, entered once, before the names that
 //! read it. Names tasks with no script producer may run ahead of this stage.
 //!

@@ -1,4 +1,4 @@
-//! blaze v2's data format (docs/v2/plan/design/data.md section 5): **the bytes in memory are the
+//! blaze v2's data format (docs/v2/plan/design/bottom.md section 13): **the bytes in memory are the
 //! bytes on disk**.
 //!
 //! The format itself (records, their views, [`Writer`], [`record!`]) is blaze-format-core's,

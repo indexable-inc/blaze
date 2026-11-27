@@ -14,12 +14,8 @@ index-write check, the refresh inside head writes, the 80-day location expiry, a
 rules (API.md "Index", `tools/bench/remote-cache/index-v1.tsv`). One deviation: the refresh rewrites each
 old object onto its own name through the R2 binding (a streamed get and put, R2 checking the MD5 or
 SHA-256), not S3 `CopyObject`, since no R2 S3 credential is readable to the Worker; measured live, a
-rewrite moves the upload date. The client speaks v0: `BLAZE_REMOTE=blaze+https://<gateway>/t/<tenant>/v3`
-with `BLAZE_REMOTE_TOKEN` pushes and pulls today's packs through the gateway
-([#525](https://github.com/indexable-inc/blaze/pull/525), `tools/bench/remote-cache/e2e-client.tsv`), and
-`.github/actions/blaze-remote` is CI's step for it (pull on every run, push from main after the
-tests), which goes into the merge gate once the gate builds with blaze and a release contains the
-client. The client's use of `/has`, `/get`, `/put` and the index needs #283. On blaze's own store
+rewrite moves the upload date. No client in the tree speaks to the gateway (What exists today,
+below). On blaze's own store
 (`tools/bench/remote-cache/selfbuild.tsv`, ix arm64 VM in us-west-2), a pull of 121 packs, 237.8 MB, took
 8.6 s (26.5 MiB/s), against 51 to 55 s for cargo's no-edit build with main's target dir. The build
 from a warm store is not measured yet: a cold `blaze build -p blaze-engine` of blaze needs more than
@@ -40,9 +36,7 @@ shared remote CI fills, and rules out sccache. ("Packs", the last section, is wh
 any crate, from a bucket, a directory or a peer; it uses BLAKE3 and no gateway, and says why.)
 This file is the design of that shared remote:
 how CI on main fills it, how CI on every branch and any user reads it, and how nobody else can
-put code in it. It builds on [cache.md](cache.md) (the store and today's remote), on
-[ci-runner.md](v2/plan.md) (test results keyed by content) and on [cargo.md](cargo.md) (the
-sandbox and `BLAZE_TESTS=affected`).
+put code in it. It builds on [ci-runner.md](v2/plan.md) (test results keyed by content).
 
 ## Short version
 
@@ -83,7 +77,7 @@ sandbox and `BLAZE_TESTS=affected`).
   the io_uring driver, with TLS and HTTP/1.1 in sans-IO code above them. The gateway's logic is
   one crate run by the Worker (workers-rs) and by a native server for tests and self-hosting.
 - **One hash, SHA-256**, for the CAS, because the Worker checks every upload with the runtime's
-  native SHA-256 and every neighbour (the store, Cargo.lock, OCI, Nix) already names bytes by it.
+  native SHA-256 and every neighbour (Cargo.lock, OCI, Nix) already names bytes by it.
   #283's VFS hashes with BLAKE3; the doc proposes it move to SHA-256 while nothing persists its
   hashes, so a VFS file node's name is its CAS name ([Hash](#hash-sha-256)).
 - **Chunking** with VectorCDC (the SIMD form of AE, a hashless content-defined chunker) for large
@@ -126,7 +120,7 @@ Non-goals:
   nothing to execute remotely. REAPI stays an edge adapter
   ([#226](https://github.com/indexable-inc/blaze/issues/226)).
 - Writes to the shared tier from anyone but CI on main: no pull request, no fork, no user.
-- A rust-analyzer analysis cache. The analysis is rebuilt at load, as today ([cache.md](cache.md)).
+- A rust-analyzer analysis cache.
 - Keeping every main commit forever. What main has not used for a month or three expires.
 - Sharing between different codegen versions or toolchains. A different version is a different
   key, by design.
@@ -135,26 +129,17 @@ Non-goals:
 
 ## What exists today
 
-From [cache.md](cache.md) and `crates/blaze-cargo/src/remote.rs` (**read**):
+From `crates/blaze-remote/src/lib.rs` (**read**):
 
-- The remote is a directory, `s3://` (the AWS SDK) or a read-only `https://` address. It holds
-  `packs/<sha256>.pack` (or `.pack.zst`), `keys/<sha256>` (the keys in one pack),
-  `manifests/<project>` (one line per pack) and `units/`, `deps/` for cargo's dependency builds.
-- A pack is named by the SHA-256 of its bytes and checked after the fetch. The manifest is the one
-  mutable object; it is signed with Ed25519 when `BLAZE_REMOTE_SIGN` is set, carries a turn
-  number that only goes up, and a machine refuses a turn lower than one it took (`signed.rs`).
-- A daemon with `BLAZE_REMOTE` pulls before its first build (all packs, or with
-  `BLAZE_REMOTE_LAZY` only the key lists and then a pack when a key in it is first asked for),
-  and pushes every five minutes and when it ends (`keeper.rs`).
-- A fetch that fails its hash is thrown away, reported, and the functions are compiled again.
-- Real S3 was never run: everything was measured against MinIO and SeaweedFS over loopback.
-- No workflow in `.github/workflows` sets `BLAZE_REMOTE` (**read**). CI fills no remote today.
-
-The identity every store key is hashed with is `Identity(FORMAT, build, toolchain)`
-(`crates/blaze-store/src/lib.rs`, **read**). `build` is a hash of every source file of the
-workspace (`crates/blaze-engine/build.rs`), or the executable's bytes for a blaze built elsewhere. So
-any commit that touches a crate of blaze, a doc-comment fix in the CLI included, gives a new
-identity and an empty cache.
+- The remote is a bucket spoken to as S3 directly; there is no gateway client. Its objects are
+  plain-store segments byte for byte, each with a signed 200-byte statement, index shards, a
+  signed root per namespace and toolchain (`<ns>/t/<tc>/roots/<name>`, replaced by
+  compare-and-swap), bundles naming the segments to fetch before a first build, and key lists
+  signed by an anchor key (`trust.rs`).
+- Every name is BLAKE3: store keys (`blaze_cas::Key`) and segment digests alike.
+- blaze dispatches none of `blaze-remote`'s `cache` commands (`cmd.rs`). The CLI's one publishing
+  command is `blaze store publish <folder> --signer <key file>`, signed toolchain records to a
+  folder.
 
 ## Prior art
 
@@ -176,14 +161,14 @@ no rolling hash at all, and the paper reports that its SIMD approach did not spe
 
 ### Function keys
 
-The key of a function is what [cache.md](cache.md) describes (backend, optimisation level,
-target, debug info, overflow checks, the stable name with generic arguments and crate), and the
-identity it is hashed with becomes:
+The key of a function covers the backend, optimisation level, target, debug info, overflow
+checks and the stable name with generic arguments and crate, and the identity it is hashed with
+becomes:
 
     Identity = SHA-256(STORE_FORMAT, CODEGEN, toolchain commit)
 
-with no `build` field. `CODEGEN` is a number in a new crate, `crates/blaze-semver` (its only
-content), and there is one such number per kind of entry:
+with no `build` field. `CODEGEN` is a number in a crate of its own (not `crates/blaze-semver`,
+which is a SemVer parser), and there is one such number per kind of entry:
 
 | constant | covers | bump when |
 |---|---|---|
@@ -240,14 +225,14 @@ linked into one program. So the version is checked, not trusted.
   ([ci-runner.md](v2/plan.md)). CI on main writes a `flake` entry under
   the same key when a rerun disagrees, so every client knows the test is main's bug and not the
   pull request's. The seed is a hash of the key, so a rerun sees the same randomness.
-- **Proc-macro expansions and build-script runs**, as cache.md keys them, under `EXPAND` and
+- **Proc-macro expansions and build-script runs**, under `EXPAND` and
   `SCRIPT`.
 - **Build scripts and proc macros, built and run.** Two steps too, as tests are: a first key
   of what the build or run is declared to be made of (its rust-project description and the
   toolchain; for a run, the build of its script, its arguments and the environment it was
   given, without the checkout's paths), whose slots hold the sets of files it was seen
   reading, and a second key of those files' digests, which holds the executable or library,
-  or what the run printed and left in `OUT_DIR` ([cargo.md](cargo.md#build-scripts-and-proc-macros-run-in-a-sandbox)).
+  or what the run printed and left in `OUT_DIR`.
   They are ordinary store entries, so push, pull and the gateway carry them unchanged. A run
   outside the sandbox is never kept, so never pushed.
 
@@ -580,8 +565,8 @@ change is lost, nothing else.
 
 ## Hash: SHA-256
 
-Two hashes are in play. The store and today's remote name everything by SHA-256
-([cache.md](cache.md)). The VFS of [#283](https://github.com/indexable-inc/blaze/pull/283)
+Two hashes are in play. The store and `crates/blaze-remote` name everything by BLAKE3
+(`blaze_cas::Key`). The VFS of [#283](https://github.com/indexable-inc/blaze/pull/283)
 (`crates/blaze-vfs` on `blaze-next` `5c5299f`) names a file node by `blake3::hash` of its bytes and
 a directory node by BLAKE3 keyed with `derive_key("blaze vfs directory v1")` (**read**,
 `blaze-vfs/src/lib.rs`). The CAS needs one name per blob. **It is SHA-256**, for two reasons, the
@@ -602,7 +587,7 @@ second of which decides it:
    checks the pack's own name, not the blobs'. This reason is real but not large: it saves part of
    the Worker's CPU and keeps the check in Cloudflare's code. The second decides it.
 2. **Identity across systems.** SHA-256 is the name everything blaze touches already uses for the
-   same bytes: the store and today's remote, Cargo.lock's `checksum` of every crates.io `.crate` (so
+   same bytes: Cargo.lock's `checksum` of every crates.io `.crate` (so
    a public dependency blob can be asked for by the checksum in the lock file, with nothing hashed
    first), OCI, Nix and REAPI's default digest. The only BLAKE3 name is the VFS's, and it has not
    shipped: the journal does write hashes (a directory record names its children by hash, a head
@@ -633,8 +618,7 @@ That is the fallback, not the proposal; it is an [open question](#open-questions
 | Apple M4 Pro, CommonCrypto | 3.28 GiB/s | **reported**, [notonbluray](https://notonbluray.com/blog/benchmarking-aes-256-sha256-and-crc-64-on-apple-silicon/) |
 
 Against the network: 16 streams from R2 deliver about 225 MB/s of compressed bytes, which
-decompress to about five times that, 1.1 GB/s (compiled code compresses to about a fifth,
-[cache.md](cache.md)). Hashing 1.1 GB/s takes half a core with SHA-NI. A GitHub runner has four.
+decompress to about five times that, 1.1 GB/s (compiled code compresses to about a fifth). Hashing 1.1 GB/s takes half a core with SHA-NI. A GitHub runner has four.
 BLAKE3 with AVX-512 and many threads would save part of that half core (**reported**), not
 enough to pay for the two points above. The Rust crate is `sha2` 0.11, which picks SHA-NI or the
 ARMv8 extensions at run time (**reported**,
@@ -703,7 +687,7 @@ per head. `ed25519-dalek` does the checks (2.2 in the workspace today).
   the Worker's secrets and deletes them from the repository before any workflow uses the cache.
   The job that signs and uploads is a separate job from the build: it receives the
   build's new blobs and entries as an artifact, so build scripts, proc macros and tests (which run
-  sandboxed in the build job, [cargo.md](cargo.md#sandboxed-tests)) never run in a
+  sandboxed in the build job) never run in a
   process that can read the key.
 
 ### Rotation and revocation
@@ -756,7 +740,7 @@ per head. `ed25519-dalek` does the checks (2.2 in the workspace today).
   build (above), and a second CI job on another runner compiles a random sample of the new entries
   of each push and compares them with what is signed (this needs per-function determinism, which
   the golden check enforces). A mismatch fails main and revokes nothing automatically.
-- Users' assumption, as today ([cache.md](cache.md#trust-and-signing)): two builds of blaze with
+- Users' assumption: two builds of blaze with
   the same versions compile the same key to equivalent code.
 
 ### Private tiers are tenants
@@ -1099,8 +1083,7 @@ Drivers, and what each is for:
   rates and crashes; the test that a seed replays is the existing one's shape.
 - **`Uring`**: the bulk `/get` reads and the pack appends on one ring, behind a measurement in
   slice 8 showing it beats `Threads` on a GitHub runner. The daemon is not inside the test
-  sandbox, whose seccomp filter refuses `io_uring_setup`
-  ([cargo.md](cargo.md#sandboxed-tests)), so nothing stops it there.
+  sandbox, whose seccomp filter refuses `io_uring_setup`, so nothing stops it there.
 - **HTTP/3** to the gateway's domain, as `quiche` over `SendTo`/`RecvFrom` on any of the three.
   Real work (connection migration, pacing timers through `Timer`); worth it only if slice 8 shows
   it helps on lossy or long links (users far from a Cloudflare location), since a datacenter
@@ -1219,12 +1202,10 @@ first rule would expire what a head names.
 
 ## Packs: record sets fetched by content, from any source (2026-11-12)
 
-Lane packs-1112. Built, not yet compiled or run: `crates/blaze-pack` (the sans-IO cores and
-their simulations), `crates/blaze-cargo/src/serve/packs.rs` with `packs/stored.rs`,
-`packs/daemon.rs` and `packs/endpoint.rs` (the drivers), `crates/blaze-cargo/src/cli/store.rs`
-(the commands), the miss hook in `serve/unit/compile.rs` (`names`, `filed_under`, `found`,
-`pack_keys`). What is not built is
-listed at the end. Nothing is uploaded anywhere by any of it.
+Built, not wired: `crates/blaze-pack` (the sans-IO cores and their simulations); no crate
+depends on it. Not built: the drivers, the `blaze store export|import|install` commands and the
+miss hook this section describes (`serve/...`, `cli/store.rs` below name that design, not files).
+Nothing is uploaded anywhere by any of it.
 
 This section replaces the one that stood here, and differs from the rest of this document in
 three places, on purpose:
@@ -1435,12 +1416,8 @@ every step; import then collect-everything then 0 missing (control: no pin); pat
 names and oversized lengths; two sources, one lying; failing and stalling sources; misses;
 heads and statements under trusted and untrusted keys; an endpoint that answers only
 requests a listed key signed; batched statements; the span index and its bounds.
-`blaze-cargo` `serve/packs/tests.rs`: the same through real stores on disk (round trip,
-identical bytes twice, a flipped byte in a raw and in a compressed body, a signed head) and,
-on the simulation with the real collector, import then collect-everything (control: no pin).
-`blaze-engine` revision case `an_exported_pack_imported_into_an_empty_home_makes_no_unit`
-(step `packed NAME`): `max_units = 0`. Not tested: the endpoint's state machine and the
-daemon-side command runner against a driver (their decisions are the cores', tested there).
+Not tested: the endpoint's state machine and the daemon-side command runner against a driver
+(their decisions are the cores', tested there).
 
 **Not built.** A selection by package closure or by one named build without a home of its
 own (when it is built, a crate's front-end keys come from `serve::collect::front_keys` and
@@ -1454,28 +1431,6 @@ deadline and a span, not `blaze_core::wait`'s; a source's notice goes to the bui
 next, which with two builds at once may not be the one that met it; first use on Windows;
 a kept-set setting; mDNS and TLS between peers (out until the owner asks).
 
-**What stops a pack from being used on another machine today** (measured 2026-11-12, hello-world,
-ix arm64: a first run in an empty home 13.1 s; with another home's whole store copied in, built
-by the same binary, 13.0 s: nothing was reused). The key parts that carry a machine or project
-path, from a read of the code on `origin/main` and `origin/newproj-1111`:
-
-| Part | Where | State |
-|---|---|---|
-| A std unit's outputs, `OUT_DIR` and plan environment under `<machine>/std/<makers>/<placement>` | `crates/blaze-units/src/load/units.rs` (`rebase`), `crates/blaze-cargo/src/serve.rs` (`machine`) | open: key on the virtual `/@blaze-std-out`, rebase when outputs are written |
-| The same `OUT_DIR` in `Crate::content`, so in every crate identity above a std crate with a build script | `crates/base-db/src/input.rs` | open, same fix |
-| `run_env`: `CARGO=<blaze's path>` and the library path under the machine directory, for every unit | `crates/blaze-cargo/src/serve/unit/compile.rs`, `unit/artifact.rs` | open: out of the key for units that run nothing, or written against roots |
-| `proc_macro_cwd` of std members: the asking workspace's root | `crates/blaze-lower/src/crates.rs`, `crates/hir-def/src/deps/key.rs` | fixed on `origin/newproj-1111` (4e433c727b) |
-| The diagnostics' width, colour and short form in unit keys | `compile.rs` (`RecordInputs::key`) | open (lane diagkey-1111, agents.json A34) |
-| `RUSTFLAGS` text in `StdKey` and `UnitPlan` (may hold `-L` paths) | `crates/blaze-units/src/query.rs` | open; correct to key on, paths in it need roots |
-| A workspace member's package id, source path, `CARGO_MANIFEST_DIR`, outputs under `<root>/build/<id>`, registry sources under `<home>/sources` (bstd is such a member) | `crates/blaze-units/src/load/plan/*` | open: workspace members have no root rewriting; dependency images refuse local crates |
-| A linked output's record names its output and native-input paths (values, not key parts) | `compile.rs` (`linked_key`) | open: an importer rebases them |
-
-`Code`, `Debug`, dependency images, check outcomes and the library copy are keyed with no path
-(`hir-ty-identity`'s code id, `hir-def/src/deps/key.rs`'s markers, the virtual
-`/rustc/<commit>/library`). The store already reads read-only layers behind its own directory
-(`blaze_cas::Config::layers`); the daemon configures none. An imported pack is best kept as a
-layer: read in place, verified on every read, removed as one directory.
-
 ## Environment variables
 
 In CI and headless environments, `crates/blaze-remote` reads bucket, credential, and signing settings from the environment (refusing any setting given both in a config file and in the environment):
@@ -1487,6 +1442,6 @@ In CI and headless environments, `crates/blaze-remote` reads bucket, credential,
 - `BLAZE_CACHE_ACCESS_KEY_ID` / `BLAZE_CACHE_SECRET_ACCESS_KEY`: S3/R2 write credentials (`remote-credentials.json`).
 - `BLAZE_CACHE_SIGNING_SEED`: hex Ed25519 signing seed for publishing cache heads.
 - `BLAZE_CACHE_KEY_LIST`: path to the signed key list paired with `BLAZE_CACHE_SIGNING_SEED`.
-- `BLAZE_CACHE_ANCHOR_SEED`: hex Ed25519 anchor seed used by `blaze cache keys` commands to sign key lists and print public anchor keys.
+- `BLAZE_CACHE_ANCHOR_SEED`: hex Ed25519 anchor seed used by `crates/blaze-remote`'s `cache keys` commands (`cmd.rs`, which the `blaze` CLI does not dispatch) to sign key lists and print public anchor keys.
 
 

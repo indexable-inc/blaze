@@ -1,6 +1,6 @@
 //! Where blaze keeps what is no checkout's own: one root for the daemon's state (`v2/`) and
 //! every workspace's build directory (`build/`), so that a build writes nothing into the
-//! checkout (docs/cargo.md, "Where a build writes").
+//! checkout (docs/usage.md).
 //!
 //! The root is `$BLAZE_HOME`, else `blaze` in `$XDG_CACHE_HOME`, else `.cache/blaze` in the
 //! user's home (`blaze_core::home`: `HOME`, else the system's record of the user). A workspace

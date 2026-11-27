@@ -1,5 +1,5 @@
-//! Names per group (engine.md "Tables": `Names` per module, a glob or macro cycle one `Group`;
-//! piece E4): what a crate's cold solve WRITES, one record per strongly connected component of
+//! Names per group (end-state.md D158: `Names` per module, a glob or macro cycle one `Group`):
+//! what a crate's cold solve WRITES, one record per strongly connected component of
 //! the modules' reads as the solve found them. The solve stays one pass per crate (the cell
 //! worklist with its Tarjan condensation); the groups are its output, recorded, so the next
 //! request's plan names groups from the last answer and a re-solve confirms or re-cuts them.

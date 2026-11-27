@@ -126,7 +126,7 @@ fn the_answer_as_plan_equals_a_full_plan_for_every_edit_shape() {
                 assert!(plan(&built).stood, "{shape:?}: no layout row moved, so the sweep's proof is handed\n{built_profile}");
                 assert_eq!(built.1.units, Units { read_back: 1, discovered: 0, fetches_run: 0 }, "{shape:?}: read back\n{built_lines}");
                 // Under the proof no source is statted beside its reader (rule 74); the names are
-                // read from the crate list: no world made, no graph decoded (engine.md item 2's
+                // read from the crate list: no world made, no graph decoded (end-state.md D157's
                 // floor; the world is made by need by a names or script task, not by the plan).
                 assert_eq!(plan(&built).sources_statted, 0, "{shape:?}: no stat under the proof: {}", plan(&built));
                 assert_eq!((plan(&built).worlds_built, plan(&built).graph_decodes), (0, 0), "{shape:?}: no world, no decode: {}", plan(&built));

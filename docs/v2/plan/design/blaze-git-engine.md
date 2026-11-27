@@ -62,12 +62,12 @@ All objects keep their exact Git SHA-1 OID (`Oid::of(kind, body)`), so wire comp
    - Parses `<old-oid> <new-oid> <ref>` commands + incoming PACK v2 (including thin packs resolved against `ObjectStore`), verifies every object's SHA-1, applies atomic CAS ref updates, responds with `unpack ok` + `ok`/`ng` lines.
 3. **`WireClient`**:
    - Full Protocol v2 `ls-refs` + `fetch` (clone, incremental `have`, shallow `deepen`) and v1 `receive-pack` push client (computes missing object closure, encodes PACK v2 with `OFS_DELTA`, parses `report-status`).
-4. **`SmartHttpRouter`**:
+4. **`SmartHttpServer`**:
    - Sans-IO HTTP/1.1 parser (including `Transfer-Encoding: chunked` and `Git-Protocol: version=2`) serving all four Git Smart HTTP endpoints (`GET/POST info/refs`, `git-upload-pack`, `git-receive-pack`).
 
 ## Proof & Testing (`testing` skill)
 
-1. **Codec & Storage DST (`blaze_sim::check`)**: round-trip random object graphs through `BGOB`/`BGIX`/`BGRF`/`CGPH`, bit-flip corruption detection, and planted-bug controls (`SkipSlabCrcCheck`, `SkipOidVerify`).
-2. **ORT 3-Way Merge DST (`blaze_sim::check`)**: commutativity of clean merges, fast-forward/up-to-date, O(changed) subtree skip invariant, conflict markers, D/F conflicts, criss-cross merge-base, and planted-bug controls (`SkipThreeWayConflictCheck`, `IgnoreSubtreeDiff`).
-3. **Wire Protocol & Pack DST (`blaze_sim::check`)**: full client <-> server round-trips (`ls-refs`, clone, incremental fetch, shallow deepen, push create/update/delete, atomic CAS refusal, thin-pack `REF_DELTA`, Smart HTTP chunked requests) with planted-bug controls (`SkipPackChecksum`, `SkipCasOldOidCheck`).
+1. **Codec & Storage DST (`blaze_sim::check`)**: round-trip random object graphs through `BGOB`/`BGIX`/`BGRF`/`CGPH`, bit-flip corruption detection, and planted-bug controls (`SkipSlabCrcCheck`, `SkipPackOidVerify`).
+2. **ORT 3-Way Merge DST (`blaze_sim::check`)**: commutativity of clean merges, fast-forward/up-to-date, O(changed) subtree skip invariant, conflict markers, D/F conflicts, criss-cross merge-base, and planted-bug control (`SkipThreeWayConflict`).
+3. **Wire Protocol & Pack DST (`blaze_sim::check`)**: full client <-> server round-trips (`ls-refs`, clone, incremental fetch, shallow deepen, push create/update/delete, atomic CAS refusal, thin-pack `REF_DELTA`, Smart HTTP chunked requests) with planted-bug controls (`CorruptPackTrailer`, `SkipCasOldOidCheck`).
 4. **Real `git` Interop & macOS Benchmark**: spawn `bgit serve --http` on an infected repository and run real `git clone`, `git fetch`, `git commit`, `git push` against it; run `bgit infect` and benchmark against `git` on macOS.

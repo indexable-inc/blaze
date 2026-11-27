@@ -1,4 +1,4 @@
-//! The journal's checkpoint (engine.md D150 item 1, the spec under it): the places a
+//! The journal's checkpoint (end-state.md D157): the places a
 //! certificate replayed the system's journal of changes to, kept beside the stored answer so
 //! the next command replays only what was appended since the last command, not since the last
 //! command that STORED an answer.
@@ -69,7 +69,7 @@ const HEADER: usize = 4 + 32 + 4;
 /// no-op after a no-op then replays from the last one's place, a no-op after an edit from the
 /// edit's (its stored pointer's places). The threshold was 65,536 until 2026-11-20, set before
 /// any measurement, so a no-op loop replayed every ID since the last stored answer until the
-/// suffix passed 65,536 system-wide IDs; on tempo (utilization.md U9) 99,681 of 99,681 IDs in
+/// suffix passed 65,536 system-wide IDs; on tempo 99,681 of 99,681 IDs in
 /// 139 ms, and from 5,364,028 IDs 1.73 s (tools-1119/s/tempo-score.noop.profile.txt): fseventsd
 /// reads its store from the place, about 0.3 microseconds a system-wide ID above a fixed cost.
 /// A write costs one small record and one root, in the commit the certificate makes anyway to

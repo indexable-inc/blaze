@@ -1,5 +1,4 @@
-//! Constants in types through front2 with the real core (front2/const_open.rs; typeck.md,
-//! "Constants in types: three states"): the four faces measured on the walk of the hello world
+//! Constants in types through front2 with the real core (front2/const_open.rs): the four faces measured on the walk of the hello world
 //! (port27/front2/list-AG.txt: `check gap: FnHead` 255, `lower: Convert` an array repeat
 //! length 44, `check gap: BodyConst` 23, the byteorder impl's refused header 21).
 //!

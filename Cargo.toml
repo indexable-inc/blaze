@@ -57,17 +57,17 @@ resolver = "2"
 
 [workspace.metadata.blaze]
 # `sandboxed-tests` sandboxes every member's tests on macOS, where tests are sandboxed only on
-# an opt-in (docs/cargo.md, "Sandboxed tests"), and on the stage 0 at `version` below, which
+# an opt-in (docs/v2/plan/design/test.md), and on the stage 0 at `version` below, which
 # predates sandboxed tests by default. On Linux a blaze since notes that it does nothing there.
 experimental = ["sandboxed-tests"]
 version = "0.20261105.4"
 # A build may not change Cargo.lock or blaze.lock, here as under CI: `blaze lock` changes them,
-# saying what moved (docs/cargo.md, "Lock files").
+# saying what moved (docs/v2/plan/design/lock-policy.md).
 lock = "required"
 # Every internal workspace member must use `bstd` (`edition = "blaze-2026.11"`), never Rust's `std`.
 std = "bstd"
 
-# The pinned LLVM (docs/cargo.md, "Pinned native inputs"): blaze fetches the release
+# The pinned LLVM (docs/contributing.md, "LLVM"): blaze fetches the release
 # pins/llvm.json names for the target, checks its sha256, unpacks it read-only
 # under its home and sets LLVM_SYS_231_PREFIX to it for these build scripts, over any value the
 # shell has. llvm-sys's (vendor/llvm-sys/pin.rs) links it; blaze-stencil's makes its stencils with
@@ -411,7 +411,7 @@ blaze-html = { path = "crates/blaze-html" }
 # blaze's sans-IO HTTP/1.1 and HTTP/3 cores and their drivers on blaze-core's effects.
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids", features = ["serde"] }
-# An item's portable identity: its key, the `Portable` bound and the tables that outlive a snapshot (docs/v2/plan/design/identity.md).
+# An item's portable identity: its key, the `Portable` bound and the tables that outlive a snapshot (docs/v2/plan/design/bottom.md, section 3 "Identity and keys").
 blaze-id = { path = "crates/blaze-id" }
 blaze-impls = { path = "crates/blaze-impls" } # The impl index, lang items and crate graph records (docs/v2/plan/design/bottom.md).
 blaze-expand = { path = "crates/blaze-expand" }
@@ -486,7 +486,7 @@ blaze-std = { path = "crates/blaze-std" }
 blaze-store-check = { path = "crates/blaze-store-check" }
 blaze-phf = { path = "crates/blaze-phf", version = "0.0.0" }
 blaze-unicode = { path = "crates/blaze-unicode" }
-# fastcompile (docs/v2/plan/design/compile-time.md)
+# fastcompile (docs/v2/plan/design/end-state.md, D175)
 blaze-hashcons = { path = "crates/blaze-hashcons" }
 blaze-inproc = { path = "crates/blaze-inproc" }
 blaze-launch = { path = "crates/blaze-launch" }
@@ -609,7 +609,7 @@ cranelift-reader = "=0.137.1"
 wasmtime = { version = "=50.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
 # `vendor/llvm-sys` by the patch above.
 llvm-sys = "231"
-# The stackful fibers blaze-graph's scheduler parks a waiting job on (docs/v2/plan/design/fibers.md, Phase 2).
+# The stackful fibers blaze-graph's scheduler parks a waiting job on.
 corosensei = "0.3.4"
 crossbeam-deque = "0.8.8"
 base64 = "0.23"

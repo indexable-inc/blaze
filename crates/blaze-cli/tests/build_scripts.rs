@@ -258,7 +258,7 @@ fn engine_phases(dir: &Path) -> Vec<(String, u32, u32, u32)> {
     phases
 }
 
-/// The `Scripts` stage of `engine-check` (engine.md E6): the member's script runs as one
+/// The `Scripts` stage of `engine-check` (end-state.md D157): the member's script runs as one
 /// `Script` task after its module's lookup, its crate's names read the run, and `engine-check`
 /// lists what `check` lists: nothing for `made()` (the script's cfg reached `#[cfg(from_script)]`).
 /// Every phase entered each task it planned, once. Prints "engine scripts: <phases>". CONTROL:

@@ -27,7 +27,7 @@ required-features = ["sandbox"]
 [dependencies]
 # The request machine, its records and keys, the line table and the profile.
 blaze-drive.workspace = true
-# The execution engine (engine.md, D131): `blaze engine-check` drives a request through it
+# The execution engine (docs/v2/plan/design/end-state.md D157, D131): `blaze engine-check` drives a request through it
 # (engine_check.rs, engine_pool.rs, engine_tasks.rs) beside the old machine until the switch.
 blaze-engine.workspace = true
 # The answer's stored form read in place (engine_answer_rows.rs), beside the page form until

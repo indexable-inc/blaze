@@ -1,4 +1,4 @@
-//! Names per group (cells/groups.rs, engine.md piece E4): a crate's cold solve writes one record
+//! Names per group (cells/groups.rs, end-state.md D158): a crate's cold solve writes one record
 //! per strongly connected component of its modules' reads.
 //!
 //! The oracle (rule 21, the key covers the record), from the records alone: over every pair of

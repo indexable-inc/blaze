@@ -1,4 +1,4 @@
-//! THE COST OF ONE BODY ON THE NEW PATH (rule 16; engine.md "Floors": about 1 ms of CPU a
+//! THE COST OF ONE BODY ON THE NEW PATH (rule 16; end-state.md D168: about 1 ms of CPU a
 //! body). The real 78-crate fixture (std, alloc, core, bstd, serde, ..: `Inputs` over the
 //! toolchain) is solved and written as records; every crate's impl tables are written (lane
 //! BK); then every body of the program's crate is checked, single-threaded:
@@ -6,7 +6,7 @@
 //! 1. TODAY'S PATH: one `ProjectWorld::from_records` for all bodies (`check_borrows`), its
 //!    store, index and impl buckets shared from body to body;
 //! 2. THE TASK: `tables::task::check_body` over the read-only view with the impl tables, a
-//!    fresh world per body (engine.md E5), measured by part with the meter (tables/cost.rs).
+//!    fresh world per body (end-state.md D157), measured by part with the meter (tables/cost.rs).
 //!
 //! It prints, per body and in sum, the microseconds and heap bytes of each part, the heads and
 //! impl questions counted, the solver's frames, and how many of the task's bodies read a whole

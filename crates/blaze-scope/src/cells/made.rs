@@ -1,4 +1,4 @@
-//! A module's names at module grain (drive.md "Names at module grain", D116 points 1 and 4),
+//! A module's names at module grain (end-state.md D158, D116 points 1 and 4),
 //! from what the cell core loaded and decided: its two tables of LINKS (blaze-surface
 //! `LinksBuilder`) and its `Imports` (`ImportsBuilder`).
 //!

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: A producer's identity (decision D105) is a digest handed down from the entry in one table, never a version string a person bumps. Subject keys say what is asked; the producer enters where a result is cached (the drive's task key, the kept-expansion key, the code key), taken as an argument. Piece 1 derives every row from the binary's build id; piece 2 from the source of the crates each producer is made of, found from the manifests at build time; when blaze builds blaze, from the producer function's code identity by reflection. A ratchet counts typed-in producer strings and only falls.
+summary: A producer's identity (decision D105) is a digest handed down from the entry in one table, never a version string a person bumps. Subject keys say what is asked; the producer enters where a result is cached (the drive's task key, the kept-expansion key, the code key), taken as an argument. Piece 1 derives a row from the binary's build id; piece 2 from the source of the crates its producer is made of, found from the manifests at build time (built for the code builder's row; the other rows wait for their producing functions to leave blaze-cli); when blaze builds blaze, from the producer function's code identity by reflection. A ratchet counts typed-in producer strings and only falls.
 date: 2026-11-16
 ---
 # Producer identity
@@ -8,20 +8,15 @@ date: 2026-11-16
 Decision D105. Rules 21 (keys cover every input), 52 (cache by code identity, nothing
 invalidates by hand), 75 (nothing ambient), 73 (a type, then a lint, then a rule).
 
-**2026-11-17: piece 2 is undone; every row is the binary's id again.** A `blaze check` stopped
-with two values under one key: two builds of blaze, with equal Names-row sources and other code
-elsewhere, wrote different `CrateScope` bytes under one key. Every producing function is in
-blaze-cli (work.rs, names/scope.rs, macros.rs, body_types.rs, program.rs), whose rows held its
-own files alone (`producer-own`) while its code called crates in no row (blaze-ladder's
-`native_links::table_digest` is in the `CrateScope` record; body_types.rs maps verdicts through
-blaze-lint) and its features (`sandbox`) change what the producers make. The source closure of
-the crate that holds the function is the binary, and only the binary's linker id also holds its
-features and profile, so the entry keys every row by it (blaze-cli `src/producers.rs`, the table
-in `home.rs` `row_of`); `of_sources`, `Sources` and the entry's build step are gone, and
-blaze-producers refuses `producer-own` by name. A row takes a source digest again only when its
-producing function moves into a crate that names the row, whose closure is then what it runs
-(blaze-producers' `a_row_covers_every_crate_its_producer_calls`). The text below is the piece 2
-design as it was.
+**Where it stands.** `Row::CodeBuilder` is keyed by the source of its closure (piece 2:
+`crates/blaze-cli/build.rs` over blaze-producers writes `CODE_BUILDER_SOURCE`, and
+`crates/blaze-cli/src/producers.rs` makes the table with `Producers::of_build_with_sources`); the
+closure leaves out blaze-export and blaze-cli's command and export glue. Every other row is the
+binary's linker id (piece 1) until its producing function moves out of blaze-cli: a row that
+held blaze-cli's own files alone (`producer-own`) let two builds of blaze write different
+`CrateScope` bytes under one key, because the function called crates in no row and the binary's
+features change what it makes. blaze-producers refuses `producer-own` by name, and a row takes a
+source digest only when its producing function is in a crate that names the row.
 
 ## The problem
 
@@ -71,8 +66,8 @@ the one home (rule 30).
   (rule 76).
 - `Producers`: the table, one `ContentId` per row. Made ONCE, in the entry (`blaze-cli`
   `main.rs`, beside `Host::build_id`), and handed down; no `static`, no global, no default.
-  Constructors: `of_build(build_id)` (piece 1), `of_sources(build_id, &Sources)` (piece 2),
-  `for_tests(seed)` and `planted_for_tests(row, seed)` (tests only: a fixed table, and one row
+  Constructors: `of_build(build_id)` (piece 1), `of_build_with_sources(build_id, &[(Row,
+  digest)])` (piece 2, never for `Whole`), `for_tests(seed)` and `planted_for_tests(row, seed)` (tests only: a fixed table, and one row
   moved for the causal test).
 
 ## Piece 1: correct at once
@@ -108,46 +103,29 @@ elsewhere:
 producer = ["expander"]
 ```
 
-`producer-own = [..]` adds a crate's own files without its closure: every kind's task runner is
-in the entry today (work.rs, names.rs, macros.rs, body_types.rs), so every row holds blaze-cli's
-own files until the runners move into their producers' crates (remote-read.md piece 6). Roots
-on 2026-11-16: blaze-expand and blaze-proc-macro (`expander`: an expansion runs a macro's wasm
-there), blaze-lower (`lowering`), blaze-ladder (`body-checker`, `code-builder`), blaze-scope and
-blaze-world (`names`), blaze-drive (every row: it writes every record's envelope and read list),
-blaze-cli (`producer-own`, every row). A row with no root, or a name that is no row (or
-`whole`), is a typed refusal of the build. The build setting that changes what code computes
-(debug assertions, with overflow checks beside it under the workspace's profiles) is mixed into
-every row at the entry (blaze-cli `src/producers.rs`).
+Roots: blaze-expand and blaze-proc-macro (`expander`), blaze-lower (`lowering`), blaze-ladder
+(`body-checker`, `code-builder`), blaze-scope and blaze-world (`names`), and blaze-drive (every
+row: it writes every record's envelope and read list). A row with no root, or a name that is no
+row (or `whole`), is a typed refusal of the build. The build settings that change what code
+computes (the target, debug assertions) are mixed into the row.
 
 This doc and remote-read.md's "End state: what a record's key says about its producer" are one
 concept: its world (a) stage ids (pieces 2 to 4: a script, a stamp crate, a build entry) are
 this build step and table; its piece 1 (producers in the drive) is "The drive" below.
 
-**How it is computed.** A build script of the entry crate (crates/blaze-cli/build.rs calls
-crates/blaze-cli/build/producers.rs, a thin driver over the sans-IO core in the new crate
-`blaze-producers`, a build-dependency of blaze-cli alone): it finds the workspace root (the
-nearest `Cargo.toml` above with `[workspace]`), reads every member's manifest, follows `path`
-and `workspace = true` dependencies through `[workspace.dependencies]`, and digests each row:
-for each crate in the closure, sorted by directory, every file under its directory except its
-top-level `tests/`, `benches/`, `examples/` and `target/` and any name starting with `.` (a
-`.DS_Store` is the machine's), sorted by relative path, each as (path relative to the workspace
-root, length, bytes); then the `[workspace.dependencies]` entries the closure names (each value
-whole, so a header-form entry counts), `[workspace.package] edition`, the lock rows (name,
-version, source, checksum) of every outside crate reached and, transitively, of theirs, and the
-files under `pins/`. A lock row with no source is a path crate (a `[patch]` under vendor/, which the
-walk reads like a path dependency): it joins the closure and is digested by its files. An
-`optional = true` dependency the lock lacks is one no feature turned on: not built, not an input.
-A name a closure reaches that the lock lacks (the lock and the sources of different moments, as
-a snapshot mix builds) refuses that row alone: the step warns naming the crate and the row,
-writes it `None`, and the entry keys it by the binary's build id (piece 1's key: made again by
-every rebuilt blaze, never read stale); the other rows stand. Only the disk failing under the
-step stops the build; nothing in it panics. Nothing of the machine (rule 25). The core is a state machine (`Walk`: it asks
-for a file or a listing by workspace-relative path, the driver answers), tested on an in-memory
-tree. It writes `$OUT_DIR/producer_sources.rs` (a `Sources` value of row names and digests,
-rewritten only when its bytes change) and `cargo::rerun-if-changed` for the root manifest, the
-lock, the pins folder, every crate manifest it read, and each top-level entry (`src`,
-`build.rs`, ...) of each crate in a closure, never their `tests/`. The entry includes it
-(blaze-cli `src/producers.rs`) and calls `Producers::of_sources(build_id, &SOURCES)`.
+**How it is computed.** blaze-cli's build script, a thin driver over the sans-IO core in
+blaze-producers (a build-dependency of blaze-cli alone; its `Walk` asks for a file or a listing
+by workspace-relative path and the driver answers, tested on an in-memory tree). It finds the
+workspace root, reads every member's manifest, follows `path` and `workspace = true`
+dependencies, and digests the row: for each crate in the closure, sorted by directory, every file
+under it except its top-level `tests/`, `benches/`, `examples/` and `target/` and any name
+starting with `.`, sorted by relative path, each as (path, length, bytes); then the
+`[workspace.dependencies]` entries the closure names, `[workspace.package] edition`, the lock
+rows (name, version, source, checksum) of every outside crate reached, and the files under
+`pins/`. A lock row with no source is a path crate (a `[patch]` under vendor/) and is digested by
+its files; an `optional = true` dependency the lock lacks is not built and not an input. A
+failure stops the build, naming what. Nothing of the machine (rule 25). It writes
+`$OUT_DIR/code_builder_producer.rs` and `cargo::rerun-if-changed` for what it read.
 
 **How often it reruns.** Every crate in a closure is already a dependency of blaze-cli, so an
 edit to its source recompiles blaze-cli anyway; the step adds a recompile only for a non-Rust
@@ -176,11 +154,11 @@ certificate and the walk keep the whole tool: they speak for the whole command.
 
 ## When blaze builds blaze
 
-The row becomes the code identity of the producer's entry function by reflection (rule 56;
-code-identity.md, "Code that reads its own identity": `fn_info(f).code_id` is a constant):
+The row becomes the code identity of the producer's entry function by reflection (rule 56:
+`fn_info(f).code_id` is a constant):
 `Producers::of_code(&[(Row, ContentId)])`, the ids made in the entry by
 `fn_info(blaze_expand::expand).code_id` and its siblings. The seam is the one call in
-blaze-cli `src/producers.rs` that makes the table: the build script's `SOURCES` go and that call
+blaze-cli `src/producers.rs` that makes the table: the build script's digest goes and that call
 changes, nothing else. That is finer than crate grain (a function's identity is its callees'
 Merkle graph), and the over-approximations above go.
 

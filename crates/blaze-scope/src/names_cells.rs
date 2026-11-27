@@ -1,4 +1,4 @@
-//! A crate's names read BY CELL (drive.md, "Names at module grain" point 3, READS ARE PER CELL;
+//! A crate's names read BY CELL (end-state.md D158, READS ARE PER CELL;
 //! lane CELL, 2026-11-17). Until the module-grain kinds replace it (point 7), a body or head
 //! reads its crate's `CrateScope` record, and read WHOLE it is dirtied by every change of the
 //! crate's names: one private fn added made every `Signature` and `BodyCheck` of the crate again
@@ -1059,7 +1059,7 @@ pub fn seen_in(table: &[u8], key: [u8; 16]) -> Result<Option<ContentId>, CellsEr
 }
 
 /// Where a walk through [`Logged`] puts each cell it consults: the names half of a task's
-/// recorder (engine.md E2: one per-task recorder of every read, names, heads and impls, over
+/// recorder (end-state.md D157: one per-task recorder of every read, names, heads and impls, over
 /// read-only tables). [`Log`] is the plain one. A recorder over shared tables is per task and
 /// the tables hold no per-task cache, so what it is handed is a function of the task's questions
 /// alone, never of which task asked first (reads.rs's "what is not listed").

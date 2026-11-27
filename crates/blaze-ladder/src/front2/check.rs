@@ -229,7 +229,7 @@ fn signature_misses<'r, 'n, S: NamesSource<'n>>(r: &'r Records<'_, 'n, S>, owner
 }
 
 /// The body `owner` finished with the findings `diags`: each filed where its tokens came from,
-/// before it leaves the task that made it (drive.md, ruled 20:57), in `alloc` (the store's).
+/// before it leaves the task that made it (drive.md), in `alloc` (the store's).
 pub(super) fn said<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>, owner: ItemKey, diags: Vec<(tc::DiagCode, tc::Range, Box<str>), Global>, alloc: blaze_own::Alloc<'_>) -> CheckFail {
     let lib = r.keys.library_in(r.names, owner);
     // A member of a trait or an impl has no library key (keys.rs `library_in`): it is placed by

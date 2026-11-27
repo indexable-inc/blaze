@@ -97,4 +97,4 @@ The outline's CRLF class is in `crates/parser`'s `lexed_str`; it goes to the CRL
 
 Per rule under `strict`: format-macro 1,705, clones 1,624, stops 1,509, ambient 1,022, allocs 680,
 casts 295, unsafe-comment 37, untyped 28, recursion 20. Why the default is `rust`:
-docs/v2/plan/design/lint.md, "Which rules a project gets".
+docs/v2/plan/design/lints-stage.md, "Which rules a project gets".

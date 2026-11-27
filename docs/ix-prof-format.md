@@ -1,23 +1,25 @@
 ---
 status: plan
-summary: The ix-prof profile format and interfaces. Covers the .ixprof container (canonical JSON manifest, Arrow IPC tables, blake3 id), the tables, symbols, pprof and Chrome exports, the /debug/pprof endpoints, the live stream with cursors, gaps and drop counts, and the design for profiling any blaze-built program with no code changes.
+summary: The ix-prof profile format and interfaces. Covers the .ixprof container (canonical JSON manifest, Arrow IPC tables, blake3 id), the tables, symbols, pprof and Chrome exports, the /debug/pprof endpoints and the live stream with cursors, gaps and drop counts (built in crates/ix-prof, not wired into any binary), and the unbuilt design for profiling any blaze-built program with no code changes (`blaze run --prof`).
 date: 2026-11-02
 ---
 # ixprof: the profile format and API (v1)
 
 ## 0. The headline: profile any program blaze builds, with no code changes
 
-`blaze run --prof`, `blaze test --prof` and `blaze bench --prof` profile the program blaze
-built: CPU samples, a span per function call, allocations by stack and every blocking wait
-named, with no `tracing` in the program. Manual `tracing` spans (section 8) are an optional
-extra that adds names to the same timeline. (Flag name: cargo's `--profile <name>` already
-means the build profile and blaze keeps cargo's flags, so the switch is `--prof[=open]`;
-`BLAZE_PROF=1` is the env form. Decision for Andrew; the rest of this page says `--prof`.)
+`blaze run --prof` and `blaze test --prof` profile the program blaze built: CPU samples, a
+span per function call, allocations by stack and every blocking wait named, with no spans
+written in the program. Manual `blaze_trace` spans (section 8) are an optional extra that
+adds names to the same timeline. (Open: the flag's name. cargo's `--profile <name>` already
+means the build profile and blaze keeps cargo's flags, so the switch is `--prof[=open]`; the
+rest of this page says `--prof`.)
 
-Everything here is opt-in through blaze's own codegen and its own std build: a program built
-without `--prof` is byte-for-byte what it is today and behaves as under rustc
-(superset-of-rust). Status of each piece is marked in its heading:
-**implemented** = in `crates/ix-prof` now; **designed** = only this page.
+Everything here is opt-in through blaze's own back end (crates/blaze-lir) and its own std
+build: a program built without `--prof` is unchanged, byte for byte, and behaves as under
+rustc (superset-of-rust). Status of each piece is marked in its heading:
+**implemented** = in `crates/ix-prof` now (built, not wired: no binary links ix-prof except
+through crates/blaze-profile, which no binary reaches); **designed** = only this page. No
+`--prof` flag exists yet.
 
 ### 0.1 Sampling (no code change) -- the runtime is implemented, the link-in is designed
 
@@ -30,29 +32,20 @@ without `--prof` is byte-for-byte what it is today and behaves as under rustc
   (`on_cpu = false`). Where neither works (perf refused, x86_64 macOS) `start` returns an
   error naming why; a SIGPROF/`setitimer` sampler with a signal-safe frame-pointer walk is the
   next driver for those (designed).
-- Frame pointers. Today: blaze keeps them only on request. `Toolchain.frame_pointers`
-  (`crates/blaze-codegen/src/settings.rs:56`, set from `-C force-frame-pointers` in
-  `v2/toolchain.rs:236`) drives `backend::FRAME_POINTERS`
-  (`crates/hir-ty-codegen/backend.rs:78`), which sets Cranelift-IR `preserve_frame_pointers`
-  for the stencil path (`target.rs:514`) and LLVM's `"frame-pointer"="all"`
-  (`llvm/lower.rs:571`). Stencil glue already builds a Cranelift-shaped frame (`rbp`/`x29`,
-  `blaze-stencil/src/arch/{x64,aarch64}/frame.rs`). Hook: `--prof` sets
-  `frame_pointers = true` for every crate including std (std is built by blaze from
-  `library/`, so std frames unwind too). On aarch64 Apple targets the ABI keeps frame pointers
-  always, so there the cost is already paid.
+- Frame pointers. Hook (designed): `--prof` makes the back end keep frame pointers in every
+  function of every crate, std included (std is built by blaze from `library/`, so std frames
+  unwind too). On aarch64 Apple targets the ABI keeps frame pointers always, so there the cost
+  is already paid.
 - Cost (the number): no measurement exists in the repo yet. Published measurements of
   `-fno-omit-frame-pointer` on x86_64 (Fedora 38's distro-wide change, Ubuntu 24.04, Brendan
   Gregg) put it at about 1% on average, 0-2% for most programs, up to ~10% for a few
   register-starved hot loops (CPython's interpreter loop); aarch64 Apple: 0 extra. Plan: make
-  frame pointers always-on once `blaze bench` over the bench corpus shows the x86_64 cost
-  below 1% (the measurement and its tree go in docs/profiling.md); until then they are on
-  under `--prof` only.
-- Line info: both backends write DWARF 4 line tables per function
-  (`crates/hir-ty-codegen/debuginfo.rs`, fed1eb428d:docs/reports/DEBUGINFO.md; stencils record
-  `(offset, srcloc)` → `LineRow`). `--prof` forces at least `debug = "line-tables-only"`, so
-  `blaze pprof list` has lines. The symbolizer (implemented, `ix_prof::symbols`) reads the
-  executable's symbol table and DWARF (`addr2line` over `gimli`), inline chains included.
-- Link-in (designed): with `--prof`, blaze adds `ix-prof` (feature `runtime`) to the link of
+  frame pointers always-on once a measurement over the bench corpus shows the x86_64 cost
+  below 1%; until then they are on under `--prof` only.
+- Line info (designed): `--prof` forces at least `debug = "line-tables-only"`, so `report::list`
+  has lines. The symbolizer (implemented, `ix_prof::symbols`) reads the executable's symbol
+  table and DWARF (`addr2line` over `gimli`), inline chains included.
+- Link-in (designed): with `--prof`, blaze adds `ix-prof` (feature `sampler`) to the link of
   the final binary and an init-array entry (`.init_array` / `__DATA,__mod_init_func`) that
   calls `ix_prof::start_from_env()` before `main`; blaze sets `IX_PROF`/`IX_PROF_HTTP` for the
   child (section 9). This alone gives a working pprof.
@@ -61,28 +54,21 @@ without `--prof` is byte-for-byte what it is today and behaves as under rustc
 
 Two mechanisms, by build kind:
 
-- **Live (dev) builds already call through a jump table** (`crates/blaze-live`, every
-  replaceable function goes through a slot `blaze-link` emits, `write.rs:670`; switching is one
-  atomic store, `slots.rs`). Turning profiling on for function `f` = store into `f`'s slot the
-  address of a thunk that records enter (fn id, time), calls the old target, records exit. No
-  sled, no extra cost off beyond the indirection those builds already have. Thunks are made by
-  the daemon like any patch (`blaze-live/src/patch.rs` `Code`), selected by size
-  (`--prof=fns:>64` = functions whose code is over 64 bytes) or by path pattern.
-- **Release / non-live builds get sleds**: at entry, after the frame is set up, one patchable
-  nop (x86_64 `0f 1f 44 00 00`, 5 bytes = room for `call rel32`; aarch64 one `nop`, room for
-  `bl` to a per-module trampoline island within ±128 MiB) and the same before each `ret`.
-  LLVM path: LLVM's own XRay (`"function-instrument"="xray-always"` /
-  `"xray-instruction-threshold"="N"` beside `frame-pointer` in `llvm/lower.rs:571`) on ELF;
-  on Mach-O, where LLVM's XRay is not supported, `"patchable-function-entry"="1"` plus exit
-  handling by return-address hijack (the entry hook swaps the return address for a
-  trampoline and keeps the real one on a per-thread shadow stack, as uftrace does). Stencil
-  path: the sled is a glue piece emitted in the prologue/epilogue glue
-  (`blaze-stencil/src/arch/*/glue.rs`). Every sled is listed in a section `ix_prof_sleds`
+- **Builds whose calls go through a slot** (JIT-on-call): turning profiling on for function
+  `f` = store into `f`'s slot the address of a thunk that records enter (fn id, time), calls
+  the old target, records exit. No sled, no extra cost off beyond the indirection those builds
+  already have. Thunks are selected by size (`--prof=fns:>64` = functions whose code is over 64
+  bytes) or by path pattern.
+- **Other builds get sleds**: at entry, after the frame is set up, one patchable nop (x86_64
+  `0f 1f 44 00 00`, 5 bytes = room for `call rel32`; aarch64 one `nop`, room for `bl` to a
+  per-module trampoline island within ±128 MiB) and the same before each `ret`, emitted by the
+  back end's prologue and epilogue. Where a return cannot carry a sled, exit is handled by
+  return-address hijack (the entry hook swaps the return address for a trampoline and keeps
+  the real one on a per-thread shadow stack, as uftrace does). Every sled is listed in a section `ix_prof_sleds`
   (fn address, sled offsets, kind, code size, name string), which the runtime patches with
   `mach_vm_protect`/`mprotect` + write + icache flush, all threads running (a 5-byte nop is
   replaced by a single aligned store; the sled is 8-aligned so no thread sees a torn
-  instruction). `docs/support.md:344` refuses rustc's user-facing `patchable-function-entry`
-  attribute; this is blaze's own, under `--prof` only, so programs without it are unchanged.
+  instruction). This is blaze's own, under `--prof` only, so programs without it are unchanged.
 - Cost off: one nop per call and per return in `--prof` builds; nothing in other builds.
 - Output: `kind = "fn"` spans in the same `spans` table (`name` = the demangled path, `file`
   /`line` = the definition), plus per-function `calls` counts; the same stream (6a).
@@ -92,16 +78,14 @@ Two mechanisms, by build kind:
 - Implemented: `ix_prof::alloc::Counting<A>` wraps any `GlobalAlloc`: per-thread byte and
   count counters (feed `spans.alloc_bytes`), Poisson-sampled stacks (Go's 512 KiB mean) with
   a fixed table of sampled live blocks, so `allocs` has alloc vs live by stack.
-- Hook (designed): blaze already generates the allocator shim
-  (`crates/hir-ty-codegen/v2/allocator.rs`, `ALLOCATOR_ENTRIES` in `mod.rs:2003` mapping
-  `__rust_alloc*` to `__blaze_global_alloc*`). Under `--prof` the shim's four entries call
-  `ix_prof::alloc::{alloc, dealloc, realloc, alloc_zeroed}` with the program's allocator (its
-  `#[global_allocator]` or std's `System`) as the inner one, so no program change.
+- Hook (designed): under `--prof` the four `__rust_alloc*` entries of the allocator shim blaze
+  generates go through `Counting` (four free entry functions, not yet in ix-prof) with the
+  program's allocator (its `#[global_allocator]` or std's `System`) as the inner one, so no
+  program change.
 
 ### 0.4 Waits named for free -- designed
 
-blaze builds the real std from its own copy (`library/`, `crates/blaze-cargo/src/toolchain/library.rs`,
-docs/toolchain.md). Under `--prof` it builds a second flavor of that std with
+blaze builds the real std from its own copy (`library/`, docs/toolchain.md). Under `--prof` it builds a second flavor of that std with
 `cfg(blaze_prof)` (its own `DIGEST`, so the store keys differ), where each blocking point
 calls two hooks that std declares and `ix-prof` defines:
 
@@ -127,9 +111,8 @@ rustc's). The wait becomes a `spans` row with `wait` = kind, `wait_on` =
 `"std::sync::Mutex<my::Cache> @ 0x7f..  (src/cache.rs:41)"`, and the owner where std knows it
 (a futex mutex does not; `JoinHandle` knows the thread).
 
-Async: the `Future::poll` of each `async fn`/block is a coroutine instance blaze compiles
-(`crates/hir-ty-codegen/mod.rs:693`, MIR from `hir-ty/src/providers.rs:261`, suspension
-points from `hir-ty/src/mir/held.rs`). Under `--prof` the poll body is wrapped: enter a span
+Async: the `Future::poll` of each `async fn`/block is a coroutine instance blaze compiles.
+Under `--prof` the poll body is wrapped: enter a span
 `poll <fn path>` with `task` = the pinned future's address and, on `Pending`, the await
 point's source location (the resume state's span) recorded as `wait = "await"`, `wait_on` =
 that location. A task's lane in the explorer is its address from first poll to `Ready` or
@@ -138,23 +121,20 @@ drop.
 ### 0.5 Attaching to a binary already built -- designed
 
 A `--prof` build carries the sleds and the runtime but does not start it unless asked:
-`IX_PROF=<dir>` / `IX_PROF_HTTP=<addr>` start it at the init-array hook. For a live (dev)
-build without `--prof`, `BLAZE_PROF=1` makes the blaze-live runtime ask the daemon for the
-profiler as a patch (thunks in the jump table + the sampler loaded as patch code), so a
-running dev program can be profiled without a rebuild. A release binary built without
-`--prof` has no sleds; only the sampler can attach (by `LD_PRELOAD`/`DYLD_INSERT_LIBRARIES`
-of the `ix-prof` cdylib, which starts at its constructor).
+`IX_PROF=<dir>` / `IX_PROF_HTTP=<addr>` start it at the init-array hook. A binary built
+without `--prof` has no sleds; only the sampler can attach (by
+`LD_PRELOAD`/`DYLD_INSERT_LIBRARIES` of an `ix-prof` cdylib, which starts at its constructor;
+ix-prof has no cdylib target yet).
 
 ### 0.6 One stream
 
 All of the above lands in the same tables (spans with `kind` fn/span/wait/poll, cpu_samples,
-allocs) and the same live stream (6a), which `blaze run/test/bench --prof` expose and the
-explorer reads.
+allocs) and the same live stream (6a), which `blaze run/test --prof` expose and the explorer
+reads.
 
-
-Lane: v2-pprof (2026-11-01). Owner of the format: the `ix-prof` crate
-(`crates/ix-prof`, `src/format.rs` is the code form of this page). The ix.dev explorer is one
-reader; `blaze pprof` is another; `go tool pprof`, speedscope and Perfetto read the exports.
+The code form of this page is `crates/ix-prof` (`src/ixprof.rs` the container, `src/profile.rs`
+the tables). The ix.dev explorer is one reader; `go tool pprof`, speedscope and Perfetto read the
+exports.
 
 Any change that changes a column's meaning or removes one bumps `format_version`; adding a
 nullable column at the end of a table, or a new table, does not.
@@ -262,7 +242,7 @@ stay below 2^53, so a JavaScript reader may hold them as numbers; a span is name
 | column | type | null | meaning |
 |---|---|---|---|
 | process | u32 | | pid |
-| process_name | dict | | the program, or a role (`blaze serve`, a build script's crate) |
+| process_name | dict | | the program, or a role (a build script's crate) |
 | thread | u64 | | OS thread id |
 | thread_name | dict | yes | the thread's name |
 | cpu_ns | u64 | yes | the thread's total CPU time over the profile, when known |
@@ -388,19 +368,19 @@ inline chain), demangles with `rustc-demangle` (`{:#}`, no hash), and records `m
 the binary or in the object files the debug map names; when neither is there, `file`/`line` are
 null and `function` comes from the symbol table.
 
-`meta.symbolized = false` means the writer only had addresses: `function` is `0x<addr>`, and
-`blaze pprof` symbolizes later from the module path / build id if it can find the binary
-(`--symbols <dir>`).
+`meta.symbolized = false` means the writer only had addresses: `function` is `0x<addr>`, and a
+reader symbolizes later from the module path / build id if it can find the binary (designed).
 
-`blaze pprof list <regex>` reads `file` and `start_line`/`line` and prints the source with each
-line's flat and cumulative weight; it looks the file up as recorded, then under `--source <dir>`.
+`report::list(view, ty, regex, source_root)` reads `file` and `start_line`/`line` and prints the
+source with each line's flat and cumulative weight; it looks the file up as recorded, then under
+`source_root`.
 
 ## 5. Exports
 
 ### 5.1 pprof (`profile.proto`, gzip, `.pb.gz`)
 
-`blaze pprof [--kind cpu|heap|spans|waits] in.ixprof export --pprof out.pb.gz`, and the
-HTTP endpoints, write the standard `perftools.profiles.Profile`:
+`View::of(&profile, kind).to_pprof()` (kind cpu, heap, spans or waits), which the HTTP endpoints
+call, writes the standard `perftools.profiles.Profile`:
 
 | kind | sample_type(s) | stack | period |
 |---|---|---|---|
@@ -418,13 +398,13 @@ per (name, system_name, file, start_line). Labels: `thread` (string, the thread 
 `duration_nanos` = end - start. Strings deduplicated in first-use order; the output is
 deterministic too.
 
-Import: `blaze pprof` also reads `.pb.gz`/`.pb` pprof files (from Go, pprof-rs,
+Import: `View::from_pprof` reads `.pb.gz`/`.pb` pprof files (from Go, pprof-rs,
 rust-jemalloc-pprof, parca) into the same model (every sample type kept as a weight), so the
-verbs and `diff` work on them.
+reports and `diff` work on them.
 
 ### 5.2 Chrome trace / Perfetto (`.json`)
 
-`export --chrome`: spans as `"ph":"X"` complete events (`pid`=process, `tid`=thread,
+`chrome::to_chrome`: spans as `"ph":"X"` complete events (`pid`=process, `tid`=thread,
 `ts`/`dur` in microseconds since `start_ns`, `args` = fields + self_cpu_ns), waits with
 `"cat":"wait"`, counters as `"ph":"C"`, CPU samples as instant events (`"ph":"i"`, `"s":"t"`, cat `cpu`/`off-cpu`, name =
 leaf function) on their thread, thread and process names as `"ph":"M"`.
@@ -464,11 +444,10 @@ user namespace), nor `user_id=0` with `default_permissions` on a type that is no
 store (`fuse.sshfs`, `fuse.s3fs`, `fuse.rclone`, `fuse.gcsfuse`, `fuse.goofys`, `fuse.juicefs`,
 `fuse.davfs`), nor type `virtiofs`; never changing its mode or ACL. On macOS, once the owner
 check passes, it calls `fchown(fd, geteuid(), -1)` on the directory and refuses on error, which
-turns a directory stored as uid 99 (shown as owned by whoever asks) into this user's own. Clients (`blaze pprof
---dir`, `--token-file`) apply the same directory rule, read only this user's own regular 0600
-file with no ACL, of at most 64 bytes (never through a link, never a FIFO), require a loopback
-IP address and port (for `--token-file`, the source URL's), and send the token only to that
-address. A client sends it as
+turns a directory stored as uid 99 (shown as owned by whoever asks) into this user's own. A client (`endpoint::read`,
+`endpoint::read_token_file`; built, not wired) applies the same directory rule, reads only this user's own regular 0600
+file with no ACL, of at most 64 bytes (never through a link, never a FIFO), and requires a
+loopback IP address and port (`endpoint::loopback`) to send the token to. A client sends it as
 `Authorization: Bearer <token>`; a browser, which cannot set the header on the explorer's
 fetches, as `token=<token>` in the query. A token on a command line is readable by every local
 user (`ps`), so non-browser clients read it from `http.endpoint`. The server
@@ -501,9 +480,8 @@ and answer the Private Network Access preflight
 (`Access-Control-Allow-Private-Network: true`), so ix.dev/explore can fetch from
 `http://127.0.0.1:<port>`.
 
-`go tool pprof` cannot send the header, so a Go user fetches with `blaze pprof --dir <IX_PROF>
-'profile?seconds=10' export --pprof cpu.pb.gz` and opens the file; `go tool pprof
-'…&token=<token>'` works but puts the token on its command line. A browser client that adds
+`go tool pprof` cannot send the header; `go tool pprof '…&token=<token>'` works but puts the
+token on its command line, so fetch with `curl` and the header and open the file. A browser client that adds
 parameters (the explorer's `cursor=` on reconnect) keeps `token=`.
 
 Window snapshot (what the live view asks for when it zooms or opens late): 
@@ -515,8 +493,8 @@ already evicted. (`/debug/pprof/spans|waits` take `seconds` as the window; `sinc
 
 ## 6a. Live: the streaming endpoint (`GET /debug/pprof/live`)
 
-The one live stream of a running program. `blaze run --profile` and `blaze test --profile`
-expose exactly this endpoint (section 9); the explorer's live view reads it with `fetch()` and
+The one live stream of a running program. `blaze run --prof` and `blaze test --prof` are to
+expose exactly this endpoint (section 9, designed); the explorer's live view reads it with `fetch()` and
 a `ReadableStream` reader (no WebSocket, no WebTransport needed; works through the same CORS
 and Private Network Access headers as section 6).
 
@@ -590,7 +568,7 @@ so the live view can backfill a zoomed range or a gap from the retention ring.
 
 ## 7. The explorer's entry points
 
-- `blaze pprof <file|url> --http [addr]` serves `GET /profile.ixprof` (an .ixprof input),
+- A file server (designed, not built): serves `GET /profile.ixprof` (an .ixprof input),
   `GET /profile.pb.gz` (the cpu view, or the pprof input) and `GET /profile.chrome.json` on
   loopback (CORS and the Host check as above, and a new token per run that every request must
   carry, `token=` or `Authorization: Bearer`), then opens
@@ -598,13 +576,15 @@ so the live view can backfill a zoomed range or a gap from the retention ring.
   through a 0600 page in a new 0700 temporary directory, checked by the same rule as
   `http.endpoint`'s (the browser's command line holds the page's path, not the token).
   The explorer fetches that URL, parses the container (2) and draws it.
-- The explorer may also accept a dropped/picked `.ixprof` file, and a URL to a live
-  `/debug/pprof/ixprof?seconds=N` endpoint.
-- The explorer's WebTransport feed from a blaze daemon (`blaze-explore`) is unchanged; a
-  daemon's span/sample history can be pulled as an `.ixprof` with
-  `blaze debug profile --ixprof out.ixprof` (designed, not built: blaze-profile's export).
+- The explorer also reads `live=` (6a, with `cursor=` on reconnect), a picked or dropped
+  `.ixprof`/`.ixprof.zst` (`open`) and `base=<url>` for a diff. It ignores a table it does not
+  know, refuses `format_version` != 1 and a container version != 1 by name, checks each
+  section's `rows` (not its blake3), and requires the live answer's content type
+  `application/vnd.ix.prof-stream`.
+- `ix_prof::explore` (feature `explore`) serves the explorer over WebTransport for any program
+  with an `explore::Source`; built, not wired.
 
-What the explorer is expected to draw from these tables (the `blaze pprof` verbs compute the
+What the explorer is expected to draw from these tables (`ix_prof::report` computes the
 same, so their numbers agree): flame graph / icicle of `cpu_samples` by stack (filter by
 thread, span, time range); top functions flat and cum; the span timeline per thread (lanes),
 with waits in a distinct style and `wait_on`/`wait_owner` on hover; span self-time tree; heap
@@ -623,7 +603,7 @@ fn main() {
     // when the guard drops. Unset: returns a no-op guard, costs a branch per span.
     let _prof = ix_prof::start_from_env().expect("ix-prof");
     // or: ix_prof::start(ix_prof::Config { dir: Some(dir), cpu_hz: Some(99), ..Default::default() })?
-    tracing_subscriber::registry().with(ix_prof::layer()).init();
+    _ = blaze_trace::install(ix_prof::layer());
     // ...
 }
 ```
@@ -639,57 +619,27 @@ Profile` and `take_live() -> LiveDelta`; `Profile::to_ixprof()`, `Profile::from_
 `chrome::to_chrome(&Profile)`, and the reports in `ix_prof::report`. The drivers (the sampler thread, the tracing layer, the allocator, the
 HTTP server, the file writer) only feed it.
 
-## 9. `blaze run --profile` / `blaze test --profile`
+## 9. `blaze run --prof` / `blaze test --prof` (designed, not built)
 
 blaze links `ix-prof` into the program it builds (the opt-in extension; a program that does not
 ask is unchanged), starts it before `main` and serves section 6 + 6a on a loopback port:
 
 - blaze sets `IX_PROF_HTTP=127.0.0.1:0` (any free port) and `IX_PROF=<target>/profile/<run>`;
   the program's ix-prof writes the chosen address and the token to `<IX_PROF>/http.endpoint`
-  (mode 0600; section 6), and to stderr only where that file is. blaze reads it, with the
-  same checks as `blaze pprof --dir`, and prints
+  (mode 0600; section 6), and to stderr only where that file is. blaze reads it, with
+  `endpoint::read`'s checks, and prints
   `https://ix.dev/explore#live=<url-encoded http://127.0.0.1:PORT/debug/pprof/live?token=TOKEN>`
-  (and opens it with `--profile=open`). The stream URL, token and all, is in the fragment,
+  (and opens it with `--prof=open`). The stream URL, token and all, is in the fragment,
   which the browser never sends to ix.dev's servers or CDN; and blaze opens it through a 0600
-  page, as `blaze pprof --http` does (section 7), never with the link on a command line.
+  page, as section 7's file server does, never with the link on a command line.
 - At exit the program writes `<IX_PROF>/<program>-<pid>-<session>.ixprof` (the session id of
   6a, so a later run with the same pid never replaces it; the whole run, from the
   retention ring plus what was aggregated) and the stream sends END.
-- `blaze test --profile`: one stream per test process; each test runs inside a span named
+- `blaze test --prof`: one stream per test process; each test runs inside a span named
   `test` with field `name = <test path>`, so the live view lanes and the file both group by test.
 - The explorer's live URL parameter is `#live=<stream url>`; the file one is `profile=<url>`
-  (`#profile=` when the URL carries a token, as `blaze pprof --http`'s does). Both are read
+  (`#profile=` when the URL carries a token, as section 7's file server does). Both are read
   from the fragment, so a token in them never leaves the browser.
 
-## Notes from the explorer lane (v2-explore-general, 2026-11-02)
-
-Appended by the explorer lane; the format owner decides. Handoff: /tmp/blaze-lanes/v2-explore-general.md.
-
-What the ix.dev explorer reads, as written (indexable-inc/ix, branch `explore-general`,
-`packages/web/src/lib/explore/profile/`): `?profile=<url>` (section 7), `?live=<url>` (6a, with
-`cursor=` on reconnect), `?open` (a picked or dropped `.ixprof`/`.ixprof.zst`), and
-`?base=<url>` for a diff. It reads every table of section 3 plus `open_spans`, ignores a table
-it does not know (1 says new tables keep the version), refuses `format_version` != 1 and a
-container version != 1 by name, and checks each section's `rows` (not its blake3: the page has
-no blake3). It requires the live answer's content type to be `application/vnd.ix.prof-stream`.
-
-Asks, in order of weight:
-
-1. **Check `Host` on every HTTP endpoint** (6, 6a and `blaze pprof --http`): answer 403 unless
-   it is `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>`. Without it a page anywhere can
-   read the profile through DNS rebinding (its own origin, so CORS never applies), and the
-   endpoints carry no token. The explorer's WebTransport path has a token and a pinned
-   certificate for this reason; the HTTP endpoints have only loopback binding, which rebinding
-   gets around.
-2. **Ids that fit a double**: the page reads int64/u64 as JS numbers (as the rest of the
-   explorer does). Say in 3 that `span_id` and `thread` stay below 2^53, or the page has to read
-   them as BigInt.
-3. **6a BATCH for `open_spans`** with zero rows: say it is still sent when the open set empties,
-   so the page clears it (the daemon's feed does this with an `open` frame of `rows: 0`).
-4. `alloc_events` and `counters` per tick are read; `allocs` (the aggregate) in a live stream is
-   read as append-only rows. If the live stream sends `allocs` as a full replacement per tick,
-   say so and the page will replace instead of append.
-
-Unverified on the page side: that Safari lets an https page `fetch()` `http://127.0.0.1`
-(Chrome and Firefox treat loopback as potentially trustworthy; Chrome asks the Local Network
-Access permission first).
+Open: whether Safari lets an https page `fetch()` `http://127.0.0.1` (Chrome and Firefox treat
+loopback as potentially trustworthy; Chrome asks the Local Network Access permission first).

@@ -1,4 +1,4 @@
-//! A finding inside an expansion is filed where its tokens came from (drive.md, ruled 20:57).
+//! A finding inside an expansion is filed where its tokens came from (drive.md).
 //!
 //! The task that MAKES a finding in expanded text maps its range before filing it (here: the
 //! check loop, check.rs `check_rounds_as`, for each diagnostic): through the expansion's origin

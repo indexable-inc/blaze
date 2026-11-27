@@ -1,6 +1,6 @@
 ---
 name: memory-and-data
-description: "How blaze holds memory and keeps what it computes: no allocation where none is needed, and a named allocator where one is (a task's frame, reset per item in a long task; `Global` named in code); footprint as the one measure reported and the kernel's limit as the one ceiling, with nothing admitting or throttling by memory; outputs as blaze-format records written once to the store, small ones read with pread into the task's frame and large plain arrays mapped read-only, the kernel's page cache the only cache; no state between requests that is not a record; persistence from one generic impl over `inline for`; bytes verified once per boot or fetch, never on each read; and caches keyed by code identity. Load before allocating, adding a query result or anything persisted or kept between requests, touching blaze-mem, blaze-format, the store, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
+description: "How blaze holds memory and keeps what it computes: no allocation where none is needed, and a named allocator where one is (a task's frame, reset per item in a long task; the `Heap` grant `main` passes down); footprint as the one measure reported and the kernel's limit as the one ceiling, with nothing admitting or throttling by memory; outputs as blaze-format records written once to the store, small ones read with pread into the task's frame and large plain arrays mapped read-only, the kernel's page cache the only cache; no state between requests that is not a record; persistence from one generic impl over `inline for`; bytes verified once per boot or fetch, never on each read; and caches keyed by code identity. Load before allocating, adding a query result or anything persisted or kept between requests, touching blaze-mem, blaze-format, the store, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
 ---
 
 # Memory and durable data
@@ -10,31 +10,30 @@ description: "How blaze holds memory and keeps what it computes: no allocation w
 ## bump-allocate (rule 11)
 
 EVERY crate in blaze (compiler, runtime, tooling, shell, UI, config, parsers — not only compiler
-internals) MUST be `#![no_std]` on `bstd` and `blaze-own` (`AVec`, `AString`, `Vec::new_in(alloc)`,
-`String::new_in(alloc)`, `blaze_hash::{HashMap, HashSet}`), with `#![deny(blaze::std_use)]`,
-`#![deny(blaze::implicit_allocator)]`, and `#![blaze::sans_io]` on every library core; only the
-thinnest OS/GPU host driver boundary touches OS APIs, and even there collections still prefer
-`bstd`/`blaze-own`. First, don't allocate where a borrow, a fixed buffer or the caller's buffer
-does: borrow instead of `to_owned`, `clone` or `to_vec`; write into the caller's buffer with
-`blaze_mem::format_into!` or `write!` instead of `format!` or `to_string`; use an array for a small
-`vec![..]`; pass an iterator on instead of `collect()`. Where an allocation is needed, allocate by
-lifetime and name the allocator: a collection that lives within one task (a query run, a codegen
-unit, a maintainer pass) uses `Vec::new_in(frame)` / `Box::new_in(.., frame)` from
-`blaze_mem::frame::current`, the request's lifetime uses the request's allocator, what outlives the
-request is a record and not heap (`outputs-are-records`), and the global heap is named `Global`
-where it is used (`Vec::new_in(Global)`, `Box::new_in(x, Global)`). Never expose or call general
-`.leak()`: to freeze bump-allocated storage into an arena-lifetime slice or reference, require
-`BumpAlloc` (`&Frame`, `ArenaLocal`, `&Inline`, `Bump<'a>`) and call `.into_bump_slice()`,
-`.into_bump_str()`, `Box::into_bump_ref()`, or `frame.alloc_str()` / `frame.alloc_slice_copy()`.
-Only intentional process-lifetime `'static` values may use `ProgramArena`, `Root::leak`, or
-`leak_static` (checked by `blaze::heap_leak`). An allocator is never implied (`std::vec::Vec::new`,
-`vec![]`, `collect`, `Box::new`, `String::from`, `format!`, `to_string`, `to_owned`, `to_vec`, a
-`clone` of an owning value), and no comment stands in for one: `// alloc: <why>` keeps nothing, and
-an item that must keep an implied allocator says why with `#[expect(blaze::implicit_allocator,
-reason = "..")]`. `blaze::implicit_allocator` enforces this, with a fix to the explicit `Global`
-form, and `blaze::hot_alloc` for what a call reaches; `scripts/src/bin/allocs.rs` holds each crate's
-`// alloc:` lines left to convert, its `expect`s and its lines naming `Global` to a list that only
-shrinks.
+internals) MUST be `#![no_std]` on `bstd` and `blaze-own` (`AVec`, `AString`, `blaze_hash::{HashMap,
+HashSet}`, each made with its allocator named as `options-struct` says), with
+`#![deny(blaze::std_use)]`, `#![deny(blaze::implicit_allocator)]`, and `#![blaze::sans_io]` on every
+library core; only the thinnest OS/GPU host driver boundary touches OS APIs, and even there
+collections still prefer `bstd`/`blaze-own`. First, don't allocate where a borrow, a fixed buffer or
+the caller's buffer does: borrow instead of `to_owned`, `clone` or `to_vec`; write into the caller's
+buffer with `blaze_mem::format_into!` or `write!` instead of `format!` or `to_string`; use an array
+for a small `vec![..]`; pass an iterator on instead of `collect()`. Where an allocation is needed,
+allocate by lifetime and name the allocator: a collection that lives within one task (a query run, a
+codegen unit, a maintainer pass) uses the frame from `blaze_mem::frame::current`, the request's
+lifetime uses the request's allocator, what outlives the request is a record and not heap
+(`outputs-are-records`), and no global allocator is reachable: the process heap is the `Heap` grant
+`main` names and passes down (D173). Never expose or call general `.leak()`: to freeze
+bump-allocated storage into an arena-lifetime slice or reference, require `BumpAlloc` (`&Frame`,
+`ArenaLocal`, `&Inline`, `Bump<'a>`) and call `.into_bump_slice()`, `.into_bump_str()`,
+`Box::into_bump_ref()`, or `frame.alloc_str()` / `frame.alloc_slice_copy()`. Only intentional
+process-lifetime `'static` values may use `ProgramArena`, `Root::leak`, or `leak_static` (checked by
+`blaze::heap_leak`). An allocator is never implied (`std::vec::Vec::new`, `vec![]`, `collect`,
+`Box::new`, `String::from`, `format!`, `to_string`, `to_owned`, `to_vec`, a `clone` of an owning
+value), and no comment stands in for one: `// alloc: <why>` keeps nothing, and an item that must
+keep an implied allocator says why with `#[expect(blaze::implicit_allocator, reason = "..")]`.
+`blaze::implicit_allocator` enforces this, and `blaze::hot_alloc` for what a call reaches;
+`scripts/src/bin/allocs.rs` holds each crate's `// alloc:` lines left to convert, its `expect`s and
+its lines naming `Global` to a list that only shrinks.
 
 See [docs/v2/plan/design/memory.md](../../../docs/v2/plan/design/memory.md).
 
@@ -72,7 +71,7 @@ it is a sign the structure it compensates for should go (`end-state-not-hill-cli
 tag say who holds memory; the gap between footprint and live is memory freed but kept and is a bug
 to find an owner for, never a number to tune a threshold around.
 
-See [docs/memory-footprint.md](../../../docs/memory-footprint.md).
+See [.agents/skills/memory-and-data/SKILL.md#the-model](../../../.agents/skills/memory-and-data/SKILL.md#the-model).
 
 ## outputs-are-records (rule 51)
 
@@ -96,12 +95,11 @@ See [crates/blaze-format/src/lib.rs](../../../crates/blaze-format/src/lib.rs).
 
 A cache of what a function returns is keyed by that function's behaviour identity,
 `fn_info(&f).code_id` (a Merkle hash of its code and everything it reaches; const eval does not
-answer `fn_info` yet, docs/const.md, so today the same identity is `hir_ty_identity::code_id`, which
-`crates/hir-ty-codegen/fncache.rs` hands to `#[blaze::cache]`), together with its arguments, so an
-edit to the function or anything it calls makes new keys and old entries are never read again;
-garbage collection drops them later. Nothing invalidates entries by hand, compares timestamps or
-keeps a dependency list beside the key. A function the identity walk cannot follow (a `dyn` it
-cannot see through, a body that does not lower) is an error naming it, never a cache keyed on less.
+answer `fn_info` yet), together with its arguments, so an edit to the function or anything it calls
+makes new keys and old entries are never read again; garbage collection drops them later. Nothing
+invalidates entries by hand, compares timestamps or keeps a dependency list beside the key. A
+function the identity walk cannot follow (a `dyn` it cannot see through, a body that does not lower)
+is an error naming it, never a cache keyed on less.
 
 See [docs/v2/plan/design/comptime.md](../../../docs/v2/plan/design/comptime.md).
 
@@ -147,7 +145,7 @@ path. The counters that show it are checks per kind per request; a second check 
 snapshot is a bug the simulation's oracle catches. This is `type-then-lint-then-rule` applied to
 verification: the type makes the second check impossible to write.
 
-See [docs/v2/plan/design/target.md](../../../docs/v2/plan/design/target.md).
+See [docs/v2/plan/design/bottom.md](../../../docs/v2/plan/design/bottom.md).
 
 ## work-once (rule 77)
 
@@ -188,11 +186,12 @@ Every byte has an owner chosen by how long it lives, and what outlives a task is
 | A large plain array (a crate surface's tables, a file image, object code) | while mapped | a read-only mapping of the store file; the kernel's page cache holds it |
 | A task's output: a body's results, an instance's code, object code | past the task | a blaze-format record written once to the store |
 | Names, types, paths | the process | the interner's tables (`u32` IDs) |
-| Small, long-lived, rare | the process | the global heap, named where it is used: `Vec::new_in(Global)` |
+| Small, long-lived, rare | the process | the process heap `main` is granted and passes down (D173) |
 | Constant text | the program | a `&'static str` (`concat!`, const_format), not `format!` into a `String` |
 
 Nothing lives between requests but records (`no-state-between-requests`): a command's process
-exits, and `watch` holds only what a restart could rebuild from records.
+exits, and an optional helper between commands holds only what a restart could rebuild from
+records; nothing depends on it for correctness.
 
 Why the gap between footprint and live happens: memory goes back to the kernel a page at a time,
 and a page goes back only when every block on it is free. When a big task's scratch shares pages
@@ -213,7 +212,7 @@ crate version, a sorted index, payloads mapped).
 
 - Where memory went in a build: the `debugging` skill (counters, task peaks, the breakdown by tag).
 - `blaze::implicit_allocator` refuses any allocation whose allocator is not named in the code,
-  with a fix to the explicit `Global` form; no comment keeps one. It judges the call site, not the
+  and `Global` named directly; no comment keeps one. It judges the call site, not the
   bytes, and cannot see vendored code: a task's global-heap bytes, per tag and task, are the
   counting allocator's.
 - A new persisted type: a round-trip test (the `testing` skill), and `Persist` from the generic
@@ -224,11 +223,7 @@ crate version, a sorted index, payloads mapped).
 - Kept: blaze-mem's frames (`frame.rs`); blaze-format (`Persist`, records read in place); `for
   const` and `for<F: Field<T>>` bounds (blaze_comptime phase 2); const heap (`const_allocate`,
   `const_make_global`) in the const evaluator; tags for reporting only.
-- Deleted with the daemon and blaze-engine (2026-11-15): mimalloc with a heap per tag, the C
-  malloc override and the daemon image; blaze-mem's gate and budget, the machine ledger and
-  wound-wait before it. Still to delete (accepted audit, 2026-11-13): blaze-graph's `admission`;
-  the store's buffer pool, collector and tenants in blaze-cas, and blaze-gc. Do not extend any of
-  these (`one-memory-measure`).
+- Still to delete: blaze-graph's `admission`. Do not extend it (`one-memory-measure`).
 - Planned: frame markers per item in long tasks; the generic `Persist` over `for const`; the
   store in the target's form (small records by pread, plain arrays mapped, pruning at start by
   roots under a byte cap); per-instance code records; `fn_info(&f).code_id` answered by const

@@ -1,7 +1,7 @@
 //! The root heap: the one allocator a program's entry, or a test, MAKES at its top from the
 //! operating system's pages and hands down (decision D102, rule 75 "nothing ambient";
-//! docs/v2/plan/design/no-global-heap.md, "the world's region: one blaze_mem region made by rt at
-//! entry from the page source"). Every [`Alloc`] and [`SharedAlloc`] it gives is borrowed from it
+//! docs/v2/plan/design/end-state.md D173: the world's region, one blaze_mem region made by rt at
+//! entry from the page source). Every [`Alloc`] and [`SharedAlloc`] it gives is borrowed from it
 //! ([`Root::alloc`], [`Root::shared`]), so nothing allocates without having been handed one, and
 //! nothing it made outlives it: dropping the root gives every page back to the kernel.
 //!

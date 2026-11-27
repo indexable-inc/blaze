@@ -111,7 +111,7 @@ pub enum TyView {
     Infer(Var),
     Error,
     // Const terms: a handle is any generic argument, so an array length or a const generic
-    // argument is a `Ty` handle whose view is one of these (typeck.md, "Const generics").
+    // argument is a `Ty` handle whose view is one of these.
     /// A value of a const generic: its type (an integer, `char` or `bool`) and its bits,
     /// little-endian as consteval writes them.
     ConstValue { ty: Ty, bits: u128 },

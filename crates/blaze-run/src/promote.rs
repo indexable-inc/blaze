@@ -13,7 +13,7 @@
 //! **The hot region.** The optimizing tier ([`crate::tier::Tier`]) makes each hot slot's record;
 //! each record made is [`Promote::ready`]. [`Promote::place`] then lays the ready batch out in the
 //! hot region, a range of the code area of its own, in the order the sampled call edges give
-//! (code-layout.md's C3, as blaze-link's layout.rs does it for a whole link: densest first, a
+//! (sota-a64-architecture.md's code layout, as blaze-link's layout.rs does it for a whole link: densest first, a
 //! function joins its heaviest caller's cluster unless that call is no more than a tenth of its own
 //! weight, the cluster would pass the maximum, or the merge would leave the cluster under an eighth
 //! of its caller cluster's density; clusters densest first; every tie by slot). Each
@@ -57,7 +57,7 @@ pub struct Config {
     pub hot_bytes: u64,
     /// Each record's alignment in it: a power of two.
     pub align: u64,
-    /// The most bytes one cluster of callers and callees may hold (code-layout.md: 1 MiB).
+    /// The most bytes one cluster of callers and callees may hold (sota-a64-architecture.md: 1 MiB).
     pub max_cluster: u64,
 }
 

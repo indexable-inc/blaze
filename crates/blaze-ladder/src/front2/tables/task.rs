@@ -1,4 +1,4 @@
-//! THE BODY TASK (engine.md, E2/E5): [`check_body`] checks one body over the read-only view
+//! THE BODY TASK (end-state.md D157): [`check_body`] checks one body over the read-only view
 //! ([`Tables`]) and answers the engine's [`Done`]: what it found, the cells it read with the
 //! digest each held, what it offers readers, and the records it made inline ([`Made`]). It is
 //! a function of `(tables, task, frame, make)` alone, callable from any worker.

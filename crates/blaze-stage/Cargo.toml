@@ -1,6 +1,6 @@
 [package]
 name = "blaze-stage"
-description = "One typed stage protocol for the check engine (docs/v2/plan/design/stage.md): a stage says how its tasks are planned, what one task does and what its record is; a sans-IO driver alone owns the pool's schedule, each task's frame, the phase's arena, the commit, the merge in task order, stop, status, the profile's rows and how a failure reaches the tasks that wait on it"
+description = "One typed stage protocol for the check engine (docs/v2/plan/design/end-state.md, D157): a stage says how its tasks are planned, what one task does and what its record is; a sans-IO driver alone owns the pool's schedule, each task's frame, the phase's arena, the commit, the merge in task order, stop, status, the profile's rows and how a failure reaches the tasks that wait on it"
 publish = false
 
 version.workspace = true

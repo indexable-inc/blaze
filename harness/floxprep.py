@@ -18,7 +18,7 @@ x86-64 Linux build gives rustc's linker. It returns the checkout and that enviro
 
 The checkout is changed in one way: the build scripts of `factory-api-v1` and `catalog-api-v1`
 write their OpenAPI clients into their own `src/client.rs`, which a sandboxed script may not, so
-the workspace's manifest takes them out of the sandbox as docs/cargo.md says a user does
+the workspace's manifest takes them out of the sandbox as a user may do
 (`unsandboxed-build-scripts`).
 The flake is read at the checkout's commit, so that change is not part of what Nix evaluates.
 """

@@ -1,5 +1,5 @@
-//! The names and items records filed in a crate's `CrateScope` record (drive.md, "End state",
-//! piece 3, NAMES AND ITEMS FILED). A child of main.rs's tests: its helpers are theirs.
+//! The names and items records filed in a crate's `CrateScope` record (end-state.md D157,
+//! NAMES AND ITEMS FILED). A child of main.rs's tests: its helpers are theirs.
 
 use blaze_scope::items_record::{LoadItems, RecordItems};
 use blaze_scope::names::{Written, path};

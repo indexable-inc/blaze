@@ -116,13 +116,12 @@ bytes for text, dictionary keys and values) with an optional validity bitmap, an
 min/max/null-count statistics. `MemTable` is the in-memory one the tests use; the blaze-parquet
 reader and blaze's records implement the same trait.
 
-Call sites that switch, each by replacing a DuckDB spawn with `run` over the history's tables:
-`blaze-cargo/src/cli/observe.rs` (`run`, `rows_json`, `print`/`table`/`json`: `blaze debug sql`,
-`blaze explain`), `blaze-profile/src/sql.rs` (`run`, `run_with`, `run_all`, deleted after),
+`crates/blaze-rel` is built, not wired: no crate depends on it, and blaze-profile still spawns
+DuckDB. Call sites that switch, each by replacing a DuckDB spawn with `run` over the history's tables:
+`blaze-profile/src/sql.rs` (`run`, `run_with`, `run_all`, deleted after),
 `gate.rs` (5 calls), `locks.rs:392`, `diff.rs:204`, `time/load.rs` (2), `slow/load.rs:216`,
 `memory/tests.rs:278`, and `views.rs` (`render` binds arguments as literals today; with the
-engine they bind as parameters and `$no_build`'s `error()` stays). DuckDB's pin and fetch
-(`cli/duckdb.rs`, `DUCKDB_PINS`) go last.
+engine they bind as parameters and `$no_build`'s `error()` stays).
 
 ## Census of the workload
 

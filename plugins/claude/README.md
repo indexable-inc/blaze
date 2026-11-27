@@ -30,7 +30,7 @@ Both hooks run `blaze agents hook claude` (crates/blaze-cargo/src/cli/agents.rs)
 Without the plugin, `blaze agents install claude` writes the same hooks into
 `.claude/settings.json` (or `~/.claude/settings.json` with `--user`), with a block in `CLAUDE.md`
 that says to build with blaze; `--strict` makes the `Bash` hook refuse cargo and rustc. Use one or
-the other, not both: each runs the check. docs/agents.md says all of it.
+the other, not both: each runs the check.
 
 ## Turn it off
 

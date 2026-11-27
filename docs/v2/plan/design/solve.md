@@ -1,21 +1,18 @@
 ---
-status: plan
-summary: blaze's own trait solver, crates/blaze-solve, written from scratch with Rust's semantics as the pinned nightly's next-generation solver implements them (vendor/rustc_next_trait_solver is the reference, ported rule by rule), and a data-oriented engine built for speed: goals, obligations and candidates as fixed-size records in columns, an explicit stack in place of recursion, the reference's search graph for cycles, wake lists for stalled obligations, a ground fast path through canonical bytes and marker bits, a SIMD fingerprint prefilter over impl buckets, and solved goals as records valid by their read lists.
-date: 2026-11-15
+status: current
+summary: blaze's trait solver, crates/blaze-solve, called by blaze-typeck: Rust's semantics as the pinned nightly's next-generation solver implements them (vendor/rustc_next_trait_solver is the reference, ported rule by rule), on a data-oriented engine: goals, obligations and candidates as fixed-size rows in columns, an explicit stack in place of recursion, the reference's search graph for cycles, wake lists for stalled obligations, a ground fast path through canonical bytes and marker bits, a SIMD fingerprint prefilter over impl buckets, ground goals shared across a request's bodies, and what is not ported.
 ---
-# The trait solver, from scratch
+# The trait solver
 
-The owner, 2026-11-15: "can we just full send our own trait solver ... doing it from scratch in
-one pass with LLM will be better; it having issues is OK! it just needs to be SOTA and super
-performant", and "we love SIMD". This replaces bottom.md section 13's row "the trait solver ...
-is NOT rewritten from a blank page" (that row is to be edited by its owner). Semantics are not
+crates/blaze-solve is blaze's trait solver, written from scratch. Semantics are not
 open: they are the pinned nightly's next solver, `vendor/rustc_next_trait_solver` and
 `vendor/rustc_type_ir`, and every rule's doc comment names the reference file and function it
 ports. Only the representation and the engineering are new.
 
 ## The seams
 
-- **Types** (`blaze_solve::Tys`, src/tys.rs): what blaze-ty implements: one level of a term
+- **Types** (`blaze_solve::Tys`, src/tys.rs): what blaze-typeck's `Terms` implements over
+  blaze-ty's arena (crates/blaze-typeck/src/infer/terms.rs): one level of a term
   (`kind`), its `flags` and `markers` columns, interning (`mk`, `mk_list`), fresh variables,
   `shallow_resolve`, `unify` (with `Relate::Lazy` a non-rigid alias met on one side is handed
   back as a deferred pair: the solver emits `Projection { alias, term: fresh }` and relates
@@ -24,8 +21,8 @@ ports. Only the representation and the engineering are new.
   everything does, as canonical/mod.rs `ResponseRelating` applies responses), snapshots
   with an undo log, and the binding log the wake lists read. Terms are one arena: types,
   regions and consts are `Ty(u32)` handles of one `TyKind` (src/term.rs), so generic argument
-  lists are plain `List`s of handles. Until blaze-ty lands, `Ty`, `List`, `TyKind`, `Flags` and
-  `Markers` are defined here; when it lands they move there and this crate imports them. The
+  lists are plain `List`s of handles. `Ty`, `List`, `TyKind`, `Flags` and `Markers` are defined
+  here (src/term.rs) and again in blaze-ty; `Terms` bridges the two. The
   tests' arena (src/testing/tys.rs) is the second implementation and the model of the trait.
 - **Facts** (`blaze_solve::Facts`, src/facts.rs): the world: trait definitions, the impls of a
   trait for a self shape (with their fingerprint columns), impl headers, ADT definitions, fn
@@ -33,10 +30,12 @@ ports. Only the representation and the engineering are new.
   crate makes (blaze-typeck's pattern), so every read goes through the recorder. Answers carry
   their types in a portable table (`Portable`: nodes are `TyKind`s whose handles index the
   answer's own nodes and lists, generic parameters by index) and a content `digest`.
-- **The driver's side** (`Solver`, src/fulfill.rs): what blaze-ty's `TypeCtx` calls:
-  `assume`, `register`, `select_where_possible`, `select_all`, `next_error`, `evaluate` (for
-  `may_hold` inside the caller's snapshot), `normalize`, and `pending` (for `closure_hint`).
-  blaze-ty owns the snapshot that wraps them; the solver owns everything inside a goal.
+  blaze-typeck's `FactCache` implements it (crates/blaze-typeck/src/infer/facts.rs), filled
+  only through typeck's `Reads`, so a body's read list holds what its goals read.
+- **The driver's side**: `Solver` (src/eval.rs: `env`, `evaluate`, `why_no`, `why_maybe`) and
+  `Fulfill` (src/fulfill.rs: `register`, `select`, `pending`), held by blaze-typeck's inference
+  context (crates/blaze-typeck/src/infer/mod.rs). The caller owns the snapshot that wraps them;
+  the solver owns everything inside a goal.
 
 ## Goals (`Pred`, src/term.rs)
 
@@ -50,7 +49,7 @@ non-rigid one emits a `Projection` goal, so this solver has none either (2026-11
 | `Projection { alias, term }` | `<..>::A == term` (`ClauseKind::Projection`); also what relating a non-rigid alias emits, with a fresh `term` | project_goals/mod.rs; rustc_type_ir relate/solver_relating.rs |
 | `NormalizesTo { alias, term }` | the solver-internal step: the alias's value, term unconstrained (`PredicateKind::NormalizesTo`) | normalizes_to.rs |
 | `TypeOutlives`, `RegionOutlives` | hold here; regions are erased, so the borrow checker takes outlives obligations from the fulfillment loop, not from responses (see Not ported) | solve/mod.rs `compute_type_outlives_goal` |
-| `WellFormed(term)` | the term's WF obligations (helper 2 / later) | solve/mod.rs `compute_well_formed_goal` |
+| `WellFormed(term)` | the term's WF obligations | solve/mod.rs `compute_well_formed_goal` |
 | `ConstEvaluatable(ct)` | stalls while the const has variables, else holds | solve/mod.rs |
 | `Subtype`, `Coerce` | stall while either side is an unresolved variable, else relate | solve/mod.rs `compute_subtype_goal` |
 | `DynCompatible(trait_)` | the trait's flag, read from its definition | solve/mod.rs |
@@ -122,15 +121,15 @@ builtin) never merge unless the trait is `#[marker]`: ambiguity. `try_merge_cand
 always-applicable candidate (yes, identity, no constraints) wins; equal responses merge, an `or`
 of region constraints keeps the one with none; otherwise `bail_with_ambiguity`.
 
-Who writes what: the core (this lane) writes param-env and impl candidates, merging, the engine,
-the fulfillment loop, canonical forms, the caches and the prefilter; helper 1 writes builtins and
-structural auto traits (src/builtin.rs, src/structural.rs: Sized and MetaSized, Copy/Clone for
-built-in shapes, the Fn family for closures, fn items and pointers, Tuple, Pointee,
-DiscriminantKind, Destruct, auto traits with coinduction and `disqualify_auto_trait_candidate_due_to_possible_impl`,
-`dyn Trait` with its elaborated supertraits, unsizing); helper 2 writes aliases (src/alias.rs:
-normalizes-to and projection goals (rigid and non-rigid aliases as the reference's `IsRigid`), candidates from impls, param env and alias bounds, opaque
-types, associated consts); helper 3 writes coherence (src/coherence.rs: overlap of two impl
-headers with the intercrate mode and the orphan check).
+Where each rule lives: param-env and impl candidates and merging in src/assembly.rs and
+src/trait_goals.rs; builtins and structural auto traits in src/builtin.rs and src/structural.rs
+(Sized and MetaSized, Copy/Clone for built-in shapes, the Fn family for closures, fn items and
+pointers, Tuple, Pointee, DiscriminantKind, Destruct, auto traits with coinduction and
+`disqualify_auto_trait_candidate_due_to_possible_impl`, `dyn Trait` with its elaborated
+supertraits, unsizing); the `AsyncFn` family in src/async_fn.rs; aliases in src/alias.rs
+(normalizes-to and projection goals, rigid and non-rigid aliases as the reference's `IsRigid`,
+candidates from impls, param env and alias bounds, opaque types, associated consts); coherence
+in src/coherence.rs (overlap of two impl headers with the intercrate mode and the orphan check).
 
 Two typed seams carry what the reference keeps in side channels. A normalization asks how its
 trait goal was proven through a `via_only` nested goal: its response is not applied, and the
@@ -162,7 +161,7 @@ rounds times pending. `examples/cost.rs` measures both on 10,000 obligations.
 
 **(c) The ground fast path.** A goal whose terms have no inference variable (one load of the
 flags per argument) skips the canonicalizer's variable map: its canonical words are its
-encoding, hashed and looked up in the task cache, then the shared records, before anything
+encoding, hashed and looked up in the task cache, then the request's goal table (e), before anything
 else. Marker answers live in the type's `markers` byte (known and holds, for `Sized`, `Copy`,
 `Send` and `Sync`), set from a solved ground goal in an env without global where-clauses; a
 goal on a known type is then one bit test. Inside a frame a hit also appends the reads of the
@@ -183,37 +182,16 @@ when every visited position's byte equals the goal's or is 0. A scalar path give
 and a property test holds them equal. Only survivors are instantiated and unified. A collision
 of two heads in one byte only lets a candidate through to unification: never a wrong rejection.
 Floor: (non-wildcard positions) x ceil(n / 16) vector compares; at n = 1,024 and two positions,
-128 compares where a scan touches 1,024 headers. The columns belong in the bucket record
-(written once by the index builder through `prefilter::fingerprint`, read in place); until
-blaze-impls writes them, the `Facts` implementation builds them per bucket.
+128 compares where a scan touches 1,024 headers. blaze-impls' bucket records do not hold the
+columns; the `Facts` implementation builds them per bucket through `prefilter::fingerprint`.
 
-**(d') Next: a discrimination tree (planned, not built).** The fingerprint is exact only to
-depth 2 and four arguments. The end state is the theorem provers' index (Lean 4's instance
-index, E and Vampire): impl headers flattened in pre-order over (constructor, arity) symbols
-into a trie, with impl parameters as `*`. It is built once per (trait, crate) as a sealed flat
-record in blaze-impls' index (node arrays in deterministic order, read in place). The walk
-lives here in `prefilter.rs`, because what counts as a wildcard is solver semantics: inference
-variables and non-rigid aliases in the goal match any subtree. Floor: one node step per goal
-symbol on each surviving path, with no unification attempt for headers that cannot unify.
-Before it is built, cost.rs reports candidates left and ns per lookup for both filters on
-`core`'s impls (6,170). This crate's world has no real `core`, so the comparison waits for
-blaze-impls' records.
-
-**(e) Results are records (rule 77).** A solved canonical goal is stored with its response and
-its **read list**: every `Facts` question its subtree asked, with the answer's digest, negative
-answers included (an empty impl set for a shape is a read of that bucket, as blaze-impls' `NoImplsOf`
-and directory reads are), plus the reads of every cached result it used. The **key** is the
-canonical input's words: a format version, the typing mode, the goal's full structure (defs by
-their 128-bit keys, parameters by index, placeholders by universe and index, `'static`, every
-other region a canonical variable), the param env's predicates canonicalized with the same
-variable numbering, and the canonical variables' kinds and universes, in order of first
-occurrence (rule 25). Nothing of the world is in the key; what the world said is the read list
-(rule 21: two answers under one key differ only if a read differs, and then the record is not
-valid). Results that met an overflow, or that depend on a cycle head on the stack, are never
-written. The tool's version and the recursion limit are the driver's namespace of the store.
-Valid by its read list, a record is shared across bodies, crates, builds and machines: the
-driver's `Records` reads the store (lock-free, read in place) and answers only records whose
-reads stand; new ones go out through `Solver::new_records` for the driver to write once.
+**(e) Ground goals shared across a request (src/share.rs).** A goal finished with no cycle
+head below it and no canonical variable, placeholder, closure or coroutine in its input is
+solved once a request: its key (`GoalKey`) is the digest of the solver's code id, the recursion
+limit, the typing mode, the canonical words of its parameter environment and its canonical
+predicate, with the words kept beside the digest so two goals under one digest are refused
+(`ShareRefused::Collision`). The table is the caller's (`GoalShare`), handed in through the
+fact source; this crate stays sans-IO. Results that met an overflow are never shared.
 
 **(f) Pure, re-entered, never blocking.** Every outside fact is a `Facts` call that answers or
 says `Missing`; `Missing` unwinds the stack (rolling back every snapshot) and the call returns
@@ -221,36 +199,8 @@ says `Missing`; `Missing` unwinds the stack (rolling back every snapshot) and th
 Completed, cycle-free subgoals stay in the task cache, so re-entry resumes in effect where it
 stopped. Every read goes through the recorder.
 
-**Goal tasks.** A goal that misses a fact and holds none of the asking body's inference
-variables (after resolving them; parameters and placeholders are fine) has a canonical key by
-(e) that names nothing of the body. It becomes its own job: the body records the goal as a
-need of kind `Goal(key)` instead of the fact the goal stopped on, and stops; the goal task
-evaluates the canonical goal alone, re-entering only itself once per link of a chain of missing
-facts, and writes its response as a record (e). The body re-enters once, when the goal record
-is there, and reads it as a cached result. What blaze-drive needs for a `Goal` kind: a job keyed
-by the canonical words (the record key of (e)), its input the words themselves (no body), its
-own read list and `Need`s scheduled as any job's, its output the response record; a body job
-waits on it as on any record; two bodies asking one goal share one job by key. The solver's
-side: `Facts` is asked with a flag saying whether the current goal stack is ground (the bottom
-goal's canonical input holds no inference variable of the body), and blaze-typeck's ask log
-marks such asks (`ground_goal`) so the measurement under `KindWithGoals` counts them.
-
-**Async: `Send` of a callee's future.** Sending a future across threads raises
-`<F as Send>` on an async fn's return type, an opaque whose hidden type is the callee body's
-generator; proving it needs the callee's checked body (its hidden type and its captures' types)
-and so on down the call chain. These obligations are solved at the end of the asking body,
-where a restart costs the whole body. Once the callee's type is named (`Opaque(def, args)` with
-args free of the body's inference variables, which by the end of the body they are), the goal
-`Opaque(def, args): Send` is ground: it becomes a goal task as above. The task asks
-`Opaque(def)` (a body record) and recurses into the callee's own `Send` goals as further goal
-tasks, each re-entering only itself; auto-trait goals are coinductive, so a recursive call chain
-is a cycle the task's search handles, not a deadlock. The asking body waits once, for the top
-goal's record. The rule that keeps it so: the end sequence registers every such goal before
-selecting, and the solver turns each ground `Opaque` miss into a `Goal` need without
-unwinding the others, so all of a body's async `Send` goals become tasks in one round.
-
-**(g) Nothing shared on the solving path.** Each task has its own arena, pools and task cache;
-the shared record cache is immutable while tasks run and read without a lock. Floor: no atomic
+**(g) Nothing else shared on the solving path.** Each task has its own arena, pools and task
+cache; the request's goal table (e) is the one shared structure. Floor: no atomic
 and no lock per goal.
 
 ## Test language (src/testing/)
@@ -281,24 +231,10 @@ wildcard must fail the prefilter's property against the truth, at every alignmen
 and rescan are tested equal on the staggered load (`testing/stagger.rs`), which
 `examples/cost.rs` also times.
 
-Measured 2026-11-15 (Mac, release, `cost_report` through lanecheck): cold 91k ground and 98k
+Measured 2026-11-15 (Mac, release, `examples/cost.rs`): cold 91k ground and 98k
 generic goals/s, warm (canonical cache) 7.5M and 7.9M; fulfillment of 10,000 obligations in
 100 waves, wake lists 2.1 ms and 20,199 evaluations against rescan's 40.5 ms and 510,180
 (25x); prefilter scalar/simd 7.3/8.0 ns at 8 impls, 40/16 ns at 64, 678/297 ns at 1,024.
-
-## What blaze-ty and blaze-typeck change
-
-- blaze-ty implements `Tys` (it owns `Ty`, `List`, `TyKind`, `Flags`, `Markers`; the
-  canonical word format is this crate's, `canon.rs`, because it is the record key), keeps a
-  binding log beside its undo log, hands back non-rigid alias pairs from `unify` (`Relate::Lazy`)
-  instead of failing, relates aliases by structure under `Relate::Structural`, and keeps the
-  reference's `IsRigid` bit on every alias (`TyKind::Alias(Rigid, ..)`) with the
-  `HAS_NON_RIGID_ALIAS` flag.
-- blaze-ty's `TypeCtx` forwards `assume`, `register`, `select_*`, `next_error`, `may_hold`,
-  `normalize` and `closure_hint` to `Solver`, and implements `Facts` over typeck's `Reads`,
-  so a body's read list holds what its goals read.
-- typeck's `Goal` grows to `Pred` (outlives, well-formed, subtype, coerce, host effects) and its
-  `Question` gains `TraitDef`, `AdtDef`, `AssocItem` and `ImplsOf` with fingerprint columns.
 
 ## Ported from memory, not with the reference open
 
@@ -307,7 +243,7 @@ The search graph's provisional-cache validity rule and fixpoint comparison (read
 lattice's overflow `suggest_increasing_limit` merge; the components rule for type outlives
 (not ported: an outlives goal is recorded whole). Each such function says so in its doc.
 
-## Not ported yet (by reference file)
+## Not ported (by reference file)
 
 - `canonical/canonicalizer.rs`: universe compression; placeholders are canonicalized literally.
 - `placeholder.rs`, leak check: higher-ranked bounds over regions instantiate their binder with
@@ -316,7 +252,8 @@ lattice's overflow `suggest_increasing_limit` merge; the components rule for typ
 - `solve/eval_ctxt/solver_region_constraints.rs`: region equality from unification is not
   recorded; only outlives goals are.
 - `solve/inspect/`: proof trees.
-- `solve/project_goals/opaque_types.rs` defining uses beyond recording hidden types (helper 2).
-- `solve/reflect.rs`, `solve/error_union.rs` (blaze's extensions in the fork), coroutines,
-  async closures, `Future`, `Iterator` for gen blocks, `TransmuteFrom`, `BikeshedGuaranteedNoDrop`.
-- `normalize.rs` (deep normalization for writeback): blaze-ty walks and calls `normalize`.
+- `solve/project_goals/opaque_types.rs` defining uses beyond recording hidden types.
+- `solve/reflect.rs`, `solve/error_union.rs` (blaze's extensions in the fork), coroutines and
+  coroutine closures (`Future`, `Iterator` for gen blocks, `Coroutine`), `TransmuteFrom`,
+  `BikeshedGuaranteedNoDrop` (src/builtin.rs's module doc keeps the list).
+- `normalize.rs` (deep normalization for writeback): the caller walks and calls `normalize`.

@@ -121,7 +121,7 @@ pub struct Task<'a> {
     pub inputs: Vec<Input, Alloc<'a>>,
     /// What it needed that settled with no record: each's task failed this command (rule 20),
     /// sorted. A task tells "not asked yet" from "asked and failed" by it, so it never asks
-    /// again for what failed (drive.md, "Owed, step 1").
+    /// again for what failed (drive.md).
     pub failed: Vec<Name, Alloc<'a>>,
     /// A `Group`'s members.
     pub members: Vec<Name, Alloc<'a>>,

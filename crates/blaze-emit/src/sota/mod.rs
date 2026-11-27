@@ -1,5 +1,5 @@
 //! Experimental Non-LLVM SOTA Optimizing Tier (`TierName::Sota`,
-//! `docs/v2/plan/design/sota-tier.md`).
+//! `docs/v2/plan/design/sota-a64-architecture.md`).
 //!
 //! Default optimizing tier on AArch64 (`blaze_tier::optimizing_tier`):
 //! 1. **Fixed-point LIR mid-end (`blaze_lir::egraph::sota_optimize_fixpoint`)**: SROA +

@@ -588,7 +588,7 @@ fn mount_setattr_ro(which: &'static str, path: &CStr, recursive: bool) -> Result
 
 /// Host temporary/runtime directories masked with fresh empty read-only `tmpfs` mounts so host
 /// pathname UNIX sockets (e.g. `/run/user/$UID/*`, `/tmp/*`) and stale host scratch files are
-/// invisible inside the test sandbox (`docs/cargo.md:423-425`).
+/// invisible inside the test sandbox (docs/v2/plan/design/test.md).
 const MASKED_DIRS: [(&CStr, &[u8]); 4] = [
     (c"/run", b"/run/"),
     (c"/var/tmp", b"/var/tmp/"),

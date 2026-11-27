@@ -5,7 +5,7 @@ over them (`SyntaxNode`, `SyntaxToken`). Every parse makes a flat tree, and noth
 edit makes a new tree. The crate began as rowan 0.17.0; only its cursor API remains.
 
 A flat tree is every node and token in preorder, packed to the budgets of
-docs/v2/plan/design/data.md, a token 4 bytes and a node 8. Each element has one `u32` holding its kind,
+docs/v2/plan/design/bottom.md section 13, a token 4 bytes and a node 8. Each element has one `u32` holding its kind,
 whether it is a node, token or lazy node, and either a token's length and how far back its parent
 is, or a node's subtree size. Values too large for the word are in small sorted side tables. A
 node's parent is in a column of nodes only, found by its rank (a bit per element and a count per

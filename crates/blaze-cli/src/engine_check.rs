@@ -1,4 +1,4 @@
-//! `blaze engine-check [dir] [--stats] [--workers N]` (engine.md E6): `check` driven through the
+//! `blaze engine-check [dir] [--stats] [--workers N]` (end-state.md D157): `check` driven through the
 //! execution engine (crates/blaze-engine) beside the old machine, until the switch makes it
 //! `check` itself and this word goes.
 //!
@@ -60,7 +60,7 @@ pub enum EngineCheckError {
     /// A part listed a file with no path beside it in its record.
     NoPath { name: Name },
     /// A wrapped function answered `Need`: `task` reads `read`, which its plan did not hand it.
-    /// The planner's bug, never a second entry (engine.md, "a task in the plan is entered once").
+    /// The planner's bug, never a second entry (end-state.md D157: a task in the plan is entered once).
     Unseen { task: Name, read: Name },
     /// [`EngineCheckError::Unseen`] of a file a crate's names task read (an `include!`, a
     /// `mod`'s file, a data file) that the file walk did not outline: named by the crate and the
@@ -329,7 +329,7 @@ pub(crate) fn run(
     }
 }
 
-/// `blaze why <file or file::item>` (engine.md E11), in the checkout blaze stands in: why its
+/// `blaze why <file or file::item>` (engine_why.rs), in the checkout blaze stands in: why its
 /// task was entered, step by step back to the edit (engine_why.rs).
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one specific capability")]
 pub(crate) fn why(

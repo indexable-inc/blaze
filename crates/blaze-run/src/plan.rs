@@ -52,7 +52,7 @@ pub struct Asked<'r> {
     pub bench: bool,
 }
 
-/// Why a run's pass is not kept (test-selection.md, section 2), each by name.
+/// Why a run's pass is not kept (test.md, "Not kept, refused, own"), each by name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NotKept {
     /// It read the real clock.

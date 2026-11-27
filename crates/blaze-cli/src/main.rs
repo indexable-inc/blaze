@@ -1360,7 +1360,7 @@ mod tests {
         };
         let name = if tape.coin("f or g") { "f" } else { "g" };
         let text_of = |files: &std::vec::Vec<(&'static str, std::string::String)>, path: &str| files.iter().find(|(p, _)| *p == path).map(|(_, t)| t.clone());
-        // Debt: a module at both places is kept out (drive.md, RUNNER 8: the home and a fresh
+        // Debt: a module at both places is kept out (drive.md: the home and a fresh
         // home answer it differently, tape '0 1 0 2' before this guard).
         match tape.below(8, "an edit") {
             0 => {

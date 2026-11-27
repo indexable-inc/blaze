@@ -36,7 +36,7 @@ pub enum Kind {
     Code = 11,
     /// A test's result, whose read list is the code identities its run entered.
     Test = 12,
-    /// One crate's scope (drive.md, "SPEC, the NAMES step"): every public path to its item ids,
+    /// One crate's scope (drive.md): every public path to its item ids,
     /// as blaze-world's names library makes it. Its source is the crate's identity
     /// (blaze-world's `UnitInput::key`); it reads its files' `Surface`s, its dependencies'
     /// `CrateScope`s and the `MacroModule`s of the proc-macro crates it calls.
@@ -67,14 +67,14 @@ pub enum Kind {
     /// `Links` and its `Script`; valid by that read list, so a repeat finds it by key and links
     /// nothing.
     Native = 19,
-    /// What the command GIVES the machine (drive.md, RUNNER 19 ruling (2)): a file's content
+    /// What the command GIVES the machine (drive.md): a file's content
     /// read by path ([`content_of`]) or a fact of the command ([`fact_of`]). Never a task or a
     /// record: its job is answered before the store, from the ask's facts, today's sweep or the
     /// bytes a task read this command. Its readers are kept by its watch row, whose `out` is
     /// what it was when the answer was written, so a later command dirties them only when it
     /// moved.
     Given = 20,
-    /// One lint unit's findings (docs/v2/plan/design/lint.md): a file's root, its top-level
+    /// One lint unit's findings (docs/v2/plan/design/lints-stage.md): a file's root, its top-level
     /// items left out as holes, or one item of its outline, its children left out. A part of
     /// its file's `FileItems` record, keyed before the work by the unit's own bytes and holes,
     /// the scope its parent's text gives it, and the rule set's id (in its kind's tool); it reads

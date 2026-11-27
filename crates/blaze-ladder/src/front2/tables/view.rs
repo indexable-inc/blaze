@@ -1,4 +1,4 @@
-//! THE READ-ONLY VIEW a task's checker asks (engine.md, E2): [`Tables`], `Copy`, answering
+//! THE READ-ONLY VIEW a task's checker asks (end-state.md D157): [`Tables`], `Copy`, answering
 //! [`NamesSource`] (and [`BodySource`]) from each crate's records ([`source::Records`]), each
 //! answer's cells put in the task's recorder ([`ReadSink`]) as it is asked.
 //!

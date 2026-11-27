@@ -23,7 +23,7 @@ Prior art, one lesson each:
 ## 1. The gate
 
 `#![blaze::simd]` on a crate root turns on the library features `portable_simd` and `blaze_simd`
-for that crate, where `#![feature]` is read (`hir_def::nameres::facts::collect::crate_data`), so
+for that crate, where `#![feature]` is read (`crates/blaze-surface/src/lang_features.rs`), so
 every stability check reads them as if written by hand. Nothing else changes. The edition turns
 it on: one more bit of the edition branch's `edition::Extensions` (not on main). A crate that
 does not opt in sees today's behaviour exactly: E0658 on each `core::simd` path unless it
@@ -51,8 +51,8 @@ Not working yet: `native_lanes!(T)` of a generic `T` in a const argument
 (`generic_const_exprs`); write the function over `const N: usize`.
 
 **Nothing else.** Construction and indexing exist (`from_array`, `splat`, `Index`); no literal
-syntax. Scalar loops are LLVM's vectorizer in release builds (the dev tier's stencils do not
-vectorize), and `blaze::vecreport` ([vecreport](vecreport.md)) says why a loop stayed scalar.
+syntax. Scalar loops are the optimizing tier's vectorizer (crates/blaze-lir/src/simplify/vectorize.rs;
+the dev tier's stencils do not vectorize), and `blaze::vecreport` ([vecreport](vecreport.md)) says why a loop stayed scalar.
 
 **Gaps found and left out.** (a) A width per clone: a type cannot differ between clones, so
 `native_lanes!` in a clone is still the unit's. The primitive that closes it is a clone
@@ -80,8 +80,8 @@ unknown name, an empty level, two levels of one set and more than eight are type
 
 **Clones.** The function is checked and lowered to MIR once, as written (its body is baseline
 code: a `core::arch` call still needs `unsafe`). A clone is that MIR compiled with its level's
-set, through what gives a `#[target_feature]` function its set today (`hir-ty-codegen` v2's
-`features`), so LLVM inlines baseline callees into it. A generic function has clones per
+set, through what gives a `#[target_feature]` function its set, so baseline callees inline
+into it. A generic function has clones per
 instance; a trait method may carry the attribute (a `dyn` call reaches the dispatcher);
 closures inherit the clone's set; `const` evaluation runs the one MIR. A call from a clone to
 another multiversioned function goes straight to that function's `Plan::select` for its set.
@@ -92,9 +92,8 @@ what the function's name, pointers to it and vtable entries are. One initializer
 placed as the dev runtime's start hook is, asks std's detection once (`std_detect`, behind
 `is_x86_feature_detected!`) and stores in each cell `Plan::select`'s clone: the last declared
 whose added features are all present. No call tests a feature; a call before the initializer
-runs the baseline, always sound. One mechanism for every output: blaze-link has no ifunc
-(`elf/read.rs` refuses one), only an incremental image has a jump table, and an `Abs64` cell
-links everywhere. No std means no detection: a typed error. Open: cells after a live patch.
+runs the baseline, always sound. One mechanism for every output: ifunc is ELF's alone, and an
+`Abs64` cell links everywhere. No std means no detection: a typed error. Open: cells after a live patch.
 
 **The invariant (soundness).** A clone runs only on a CPU that has every feature of its set.
 A clone has no name and no address a program can take; it is entered only through the cell,
@@ -106,8 +105,7 @@ where calling a `#[target_feature]` function is not.
 operations do not depend on the feature set, LLVM does not contract `a * b + c` because `fma`
 is on, and `cfg!` is the unit's in every clone. `fast_math`-style attributes are refused here.
 
-**Keys.** A clone's code identity includes its feature set (v2's `shape.rs` hashes an
-instance's feature names) and a plan refuses two levels of one set, so two clones never share
+**Keys.** A clone's code identity includes its feature set and a plan refuses two levels of one set, so two clones never share
 one. The dispatch table is keyed by `Plan::key` (the arch, the unit's set, each level's name
 and set, in order). An edit recompiles each clone of the edited function.
 
@@ -127,13 +125,11 @@ to `OpTypeVector`, lane-wise intrinsics to the vector forms of the scalar opcode
 reductions to extract-and-fold; N above 4 is a typed error naming the kernel.
 `#[blaze::multiversion]` on a kernel is refused: a device has one level.
 
-## Built in slice 1, and what is not
+## What is built
 
-Built: the gate; `native_lanes!`; `target_features::multiversion` (levels, `Plan`, `select`,
-`key`); the attribute read in the front end (`AttrFlags::multiversion_levels`,
-`hir_ty::multiversion_plan`) and checked in codegen. Not built: the clones, cells, dispatcher
-and initializer. Until they are, a multiversioned function whose plan has a clone stops the
-build in codegen with an error naming it and its levels (`no-fallback`); a plan with no clone
-compiles as the function itself. Tests: the ledger's row E13 names them, and the two still to
+Built: `native_lanes!` (library/core/src/blaze_simd.rs); `target_features::multiversion` (levels,
+`Plan`, `select`, `key`; called by its tests alone). Not built on the item layer: the gate and the
+attribute read (both refused by the catch-all, [extensions](extensions.md) row D), the clones,
+cells, dispatcher and initializer. Tests: the ledger's row E13 names them, and the two still to
 write with the clones (the instances and sets a function compiles to; each clone giving the
 baseline's bits).

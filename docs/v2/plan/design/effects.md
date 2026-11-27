@@ -41,7 +41,7 @@ assembly, a function pointer taken as a parameter, a call of an unlisted method 
 `#[blaze::expect(panic, alloc, block, diverge)]`, "anything", admits it, or a callee taken at
 its word (`trusted`, below). `pure` needs no word either: see "Purity" below.
 
-They are checked on the one walk that `#[blaze::pure]` uses ([pure-fns.md](pure-fns.md)): one
+They are checked on the one walk that `#[blaze::pure]` uses ([Purity](#purity)): one
 memoized summary per monomorphized instance, carrying an `EffectSet` (one bit per kind of
 effect, `hir_ty_pure::effects::Rule`) with a witness of each. Each word has an `EffectDef`
 (`effect_attrs::of_word`: `NOPANIC`, `NOALLOC`, `NONBLOCKING`, `TERMINATES`), a mask over those
@@ -171,15 +171,75 @@ a function without an attribute builds byte for byte as before, and so does one 
 
 ## Purity
 
-`#[blaze::pure]` is not a word of the list and keeps working as it does
-([pure-fns.md](pure-fns.md)): it is what a cache of a function's results keys on. It is
-derivable: `hir_ty_pure::derived_pure(db, func)` is the attribute's own check (the walk, and
-the scan of the parameters for state behind shared references and code the check can't see)
-asked of a function nobody marked, true where it passes with no call left to an instance. So a
-function with no effect of the world and the purity conditions is pure whether or not the word
-is written, and what keys on the attribute may key on the derived answer where it holds. This
-slice adds the query; no consumer is switched to it yet, and the attribute stays the way to
-make purity a promise the lint holds.
+`#[blaze::pure]` promises that, given equal arguments, a function returns an equal result and
+changes nothing but what its arguments reach, through every call it can make. It is not a word of
+the `expect` list: it is the empty list plus the conditions below, and it is what a cache of a
+function's results keys on. The deny-by-default lint `blaze::pure` holds it. Not built on the item
+layer: the attribute is known (blaze-surface tool_attrs.rs, `Stage::Effects`) and the fixture is
+crates/blaze-real/extensions/a_pure.rs; no check runs. It is one memoized summary per
+monomorphized instance, bottom-up and closed-world, on the same walk as the effect words.
+
+**The attribute.** On a function, a method, a foreign function or a trait (on a trait, every
+method of every impl is checked as if marked). `(trusted = "why")` is believed, not checked: its
+body is not walked, but the closures and function items it is given are, with their drop glue;
+the reason is listed beside the proof, sorted by path, and a trusted foreign function's entry
+carries the symbol it links, whose library's hash enters the entry's identity. Anything else is
+refused naming the text. No code key reads the attribute: a function without it builds byte for
+byte as before.
+
+**Allowed:** allocating and freeing (recorded, not refused, while nothing observes the address);
+panic and overflow (the job fails, nothing is kept); diverging (`through_never`: under a callee
+returning `!` no kind counts for purity); mutating memory it owns or was given `&mut`, `Cell`,
+`RefCell` and atomics on that memory included; formatting, hashing with a fixed seed and sorting;
+foreign functions known to be deterministic (the allocator shims, `memcpy memmove memset memcmp
+bcmp strlen`, libm, LLVM intrinsics other than the machine-state ones); trusted functions
+(`blaze_graph::par`'s ordered combinators are meant to carry `trusted = "results come back in item
+order"`; the closure given them is walked).
+
+**Refused**, each with its rule:
+
+| rule | what |
+|---|---|
+| `Io` | files, the network, stdio (`println!`, `dbg!`), processes |
+| `Env` | `std::env::{var, vars, args, current_dir, current_exe, home_dir, temp_dir, set_var, remove_var, set_current_dir}`, `process::id`, `thread::available_parallelism` |
+| `Clock` | `Instant::now`, `SystemTime::now` |
+| `Thread` | `thread::{spawn, scope, sleep, park, yield_now, current, panicking}`, `Builder::spawn`, `JoinHandle::join` |
+| `MutableState` | `static mut`, a static that is not `Freeze`, a thread-local |
+| `Address` | observing an address (below) |
+| `Random` | `RandomState::new` and its `Default`, so std's `HashMap::new()` |
+| `Foreign` | a foreign function or static not trusted and not deterministic, inline assembly, volatile memory, the machine-state intrinsics; `std::sync` locks, `Condvar` and channels end here |
+| `Unchecked` | what the walk can't follow: a body that does not lower, an `async` closure, a `dyn*`, a code pointer made of bytes, an instance past the depth bound |
+
+The root's own parameters are scanned: a shared reference to a type that is not `Freeze` is
+`MutableState`; a raw pointer outside a toolchain type, a function pointer, a `dyn` of an
+untrusted trait and a union of a non-toolchain crate are `Unchecked` (take a type parameter
+instead); a type parameter left in a generic check is open, and each instance decides.
+
+A refusal names the pure function, the shortest chain of calls to the operation with each step's
+file and line, and the rule: "`kernel::compute` is `#[blaze::pure]`, but reads the environment:
+`kernel::compute` (src/lib.rs:17) → `kernel::middle` (src/lib.rs:13) → `kernel::deeper`
+(src/lib.rs:2), which calls `std::env::var`; a pure function reads the outside world only through
+its arguments".
+
+**Observing an address** counts as `Address`: a number cast to a pointer, a pointer formatted
+(`{:p}`), hashed or ordered through `PartialOrd`/`Ord`, in every crate; and in a workspace crate's
+body only, a pointer cast or transmuted to a number, `addr`, `expose_provenance`, `align_offset`,
+`is_aligned(_to)`, `<[T]>::align_to(_mut)`, the built-in `<`, `<=`, `>`, `>=` on raw pointers,
+and any comparison of function pointers. Not counted: raw-pointer equality (`ptr::eq`,
+`Arc::ptr_eq`) and `offset_from`; the known gap is a dangling pointer compared with a fresh
+allocation.
+
+**Facts for every function**, from the same walk, attribute or not: level 1, memory effects
+(`reads`, `writes`, `returns` on `None < Direct < Args < Any`, plus `allocates`, `unwinds`,
+`diverges`; trust marks not believed; a body that does not settle within `4 * (locals + 2)` rounds
+is unknown), and level 2, full purity. A pass that changes a caller's code because of them puts
+`(callee instance identity, memory bits)` or `(callee instance identity, 1)` into the caller's
+code key (rule 21).
+
+**`#[blaze::cache]`** asks this check plus its own argument rule (what a key can serialize) and
+keeps only the cache. Still to decide on the item layer: the `RandomState` exemption inside std's
+maps and their in-order rows conditioned on the hasher; refusing `Rc`/`Arc`/`Weak` counts only when
+a root argument holds one; marking `blaze_graph::par`'s ordered combinators trusted.
 
 ## `diverge`: what "returns" means, and which loops end
 

@@ -39,7 +39,7 @@
 //!
 //! The store's buffer pool reads and gives back pages of one sparse [`Region`] by ranges
 //! ([`Region::reuse`], [`Region::evict`]), counted to [`Tag::Pool`], and copies bytes the evictor
-//! may drop meanwhile through [`racy`]'s atomic copies (docs/v2/plan/design/store-pool.md).
+//! may drop meanwhile through [`racy`]'s atomic copies.
 //!
 //! Unsafe code is confined to [`os`] (the kernel's virtual memory), [`racy`], the few lines in each
 //! allocator that turn a committed address into a typed place; every block says which

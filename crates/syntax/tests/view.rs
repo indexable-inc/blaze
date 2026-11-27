@@ -1,4 +1,4 @@
-//! The views (`syntax::view`) against the handles they replace (frontend.md item 16), on every
+//! The views (`syntax::view`) against the handles they replace (bottom.md), on every
 //! parser fixture and on real files, full parses and outlines: the same elements in the same
 //! order with the same kind, range, text, index and neighbours, the same answers to the
 //! position searches, and every typed accessor the same (`accessors.rs`, generated). Then the

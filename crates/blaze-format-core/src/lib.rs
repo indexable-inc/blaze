@@ -1,4 +1,4 @@
-//! blaze v2's data format (docs/v2/plan/design/data.md section 5): **the bytes in memory are the
+//! blaze v2's data format (docs/v2/plan/design/bottom.md section 13): **the bytes in memory are the
 //! bytes on disk**. This crate is the part that defines and reads records, on `core` alone;
 //! blaze-format adds the tiers, the cursor and the codecs, and re-exports all of this at the
 //! paths it always had.
@@ -719,7 +719,7 @@ fn verify(buffer: &[u8], key: ContentId) -> Result<(), FormatError> {
 }
 
 record! {
-    /// A span in a span side table (docs/v2/plan/design/data.md section 5, "Spans"): the anchor
+    /// A span in a span side table (docs/v2/plan/design/bottom.md section 13): the anchor
     /// is the content ID of the item the span is relative to, `index` its place in that item's
     /// table. Never hashed into code: a formatting edit changes the table, not the code that
     /// names it.

@@ -1,4 +1,4 @@
-//! The `Heads` stage of `blaze engine-check` (engine.md E6): each crate's impl tables made ONCE
+//! The `Heads` stage of `blaze engine-check` (end-state.md D157): each crate's impl tables made ONCE
 //! a request as its own task, and shared read-only by every body.
 //!
 //! THE PLAN, from text: one `ImplBucket` task a crate of the names world, named
@@ -40,7 +40,7 @@
 //! moves when the reason does; the row counts one finding a failed head, and its reason is a
 //! head note (engine_head_notes.rs) a body that read it quotes. A task that cannot run its heads
 //! at all (its crate's records, a cap) is a failed row, named by its file. A dependency's head is
-//! read as its crate's names record whole (engine.md point 3). The freeze has a constant
+//! read as its crate's names record whole (end-state.md D157). The freeze has a constant
 //! evaluator, and a head that evaluated reads what the evaluation read (engine_head_consts.rs).
 //!
 //! ONE FREEZE A UNIT (lane RU1): a member crate is checked as several units (its lib, its test
@@ -1544,7 +1544,7 @@ pub(crate) fn no_units_out(name: Name) -> ContentId {
 /// crate's item keys are of the unit that holds it: `b`'s view of `a` (a dependency's unit) keys
 /// `a::one` apart from `a`'s own check scope, where its head task runs, so a cell by key was one
 /// no task defines (lane EY, the callers test). `part`: `WHOLE`, the whole head, the only part
-/// today, hashed in so a head can be split later (engine.md "ASPECTS"). Two heads of one entry
+/// today, hashed in so a head can be split later (end-state.md D157). Two heads of one entry
 /// under one cell are refused, both named ([`heads_of`]). The cell is injective over one
 /// entry's heads because an entry is ONE item of its text: its own head, or an impl fn's, or
 /// an `extern` block's foreign items (one namespace's names, distinct). That rests on each

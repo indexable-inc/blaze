@@ -1,6 +1,6 @@
 ---
 name: perf-and-tracing
-description: "How a slow thing is found and fixed: a span names every stretch of worker time, `self_cpu_ns` is filled, the profile parquet answers which item took the time, and a speed PR quotes before and after from the spans. Querying the profile to find out why a build did what it did is the `debugging` skill. Load before investigating anything slow, adding tracing, or making a speed claim."
+description: "How a slow thing is found and fixed: a span names every stretch of worker time, `self_cpu_ns` is filled, the profile (`.blaze/v2/profile.txt`) and a stack sample answer which item took the time, and a speed PR quotes before and after from the spans. Querying the profile to find out why a build did what it did is the `debugging` skill. Load before investigating anything slow, adding tracing, or making a speed claim."
 ---
 
 # Performance and tracing
@@ -98,7 +98,7 @@ Before writing or optimizing any hot kernel (codecs, parsers, hashers, scanners,
    - out-of-line `bl _memcpy` / `bl Vec::try_push` calls inside the inner loop,
    - loop-invariant pointer/limit stack spills (`ldr ..., [sp, #...]`),
    - redundant slice bounds checks inside `while pos <= len.saturating_sub(K)`.
-4. **Profile before tuning**: run `sample` (or `blaze` profile parquet) to confirm the true
+4. **Profile before tuning**: run `sample` (or read `.blaze/v2/profile.txt`) to confirm the true
    top-of-stack bottleneck before changing algorithms, and benchmark back-to-back with the C
    reference in the same host load window.
 

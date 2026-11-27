@@ -1,5 +1,5 @@
 //! An expansion text's origins (drive.md, "A finding inside an expansion is reported where its
-//! tokens came from", ruled 20:57): kept beside the text in its record, written once when the
+//! tokens came from"): kept beside the text in its record, written once when the
 //! text is made, read in place by the task that makes a finding in the text.
 //!
 //! Two parts. The CALL: the text it is written in ([`At`]: a file, or the expansion of another

@@ -1,4 +1,4 @@
-//! Names at module grain (docs/v2/plan/design/drive.md, "Names at module grain", D116): a
+//! Names at module grain (docs/v2/plan/design/end-state.md D158; D116): a
 //! module's tables as records of LINKS, and its `Imports`, each read one CELL at a time.
 //!
 //! # `ModuleLinks`: a module's two tables

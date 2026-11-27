@@ -8,7 +8,7 @@
 //! Each value has its own history, checked against a sequential set of that one value: the
 //! table is linearizable value by value, not across values. Two values may sit in different
 //! shards, each published with a release store and read with acquire loads
-//! (docs/v2/plan/design/concurrency.md), so a thread that interns 1 and then misses 2 while
+//! (docs/v2/plan/design/end-state.md D179), so a thread that interns 1 and then misses 2 while
 //! another interns 2 and then misses 1 is a run the memory model allows (store buffering) and
 //! no one order of the four explains. No caller can tell: a thread that has not synchronized
 //! with an intern has no "before" to miss it in, and one that has finds it. One history over

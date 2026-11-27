@@ -9,7 +9,7 @@
 //! - The answer is [`Outputs`]: the instructions, the files of `OUT_DIR` and the C requests
 //!   deferred. A failed run gives a [`ScriptError`] naming the package.
 //! - Nothing is kept here: the only cache of a run is the command's `Script` task record
-//!   (decision D115, docs/v2/plan/design/drive.md, "Two rulings (19:48)"), whose read list the
+//!   (decision D115, docs/v2/plan/design/drive.md), whose read list the
 //!   task makes from [`ScriptRun::reads`].
 //!
 //! The compiled-for-host module is `<store>/build-script/compiled/<key>/code`.

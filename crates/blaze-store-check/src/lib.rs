@@ -1,5 +1,5 @@
 //! The store check: `BLAZE_VERIFY_STORE=<rate>` recomputes that fraction of store hits and
-//! compares the bytes (docs/v2/plan/design/verify.md).
+//! compares the bytes.
 //!
 //! A store hit is a value the build took instead of computing it. Under the check a sampled
 //! hit is computed again from its inputs, never from the store or a memo, and the two byte

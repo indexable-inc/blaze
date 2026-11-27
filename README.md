@@ -49,8 +49,8 @@ blaze build   # like cargo build
 ```
 
 The first build loads your project and compiles every crate of it, with no cargo build and no
-rustc. Then change a function and build again: blaze's daemon, still running, builds only what
-the edit changed. blaze answers `build`, `check`, `run`, `test` and `bench`; other cargo
+rustc. Then change a function and build again: blaze builds only what
+the edit changed. blaze answers `build`, `check`, `run` and `test`; other cargo
 commands are not blaze's yet.
 
 ## How fast
@@ -59,7 +59,7 @@ These numbers are blaze v1's; v2 has not been measured yet.
 
 - Edits rebuild <!-- benchheadline:start -->**10× faster** on macOS arm64, **24× faster** on Linux aarch64 and **11× faster** on Linux x86-64<!-- benchheadline:end --> than with `cargo build`, on average over real projects.
 - **About 20 ms** from saving a file to a running program using the new code, with
-  [live edits](docs/usage.md#change-a-running-program).
+  live edits.
 
 <!-- benchpick:start -->
 | Edit one function, then build (Linux x86-64) | `cargo build` | `blaze build` |
@@ -84,8 +84,8 @@ Not drawn until there are two runs on one machine: macOS arm64 instructions per 
 
 ## How it works
 
-blaze's daemon keeps your project compiled in memory, with no cargo or rustc under it. After an
-edit it compiles only the functions you changed and links the program again with its own linker.
+blaze keeps what it compiled as records written once and read in place, with no cargo or rustc
+under it and no daemon. After an edit it compiles only the functions you changed and links the program again with its own linker.
 [More](docs/v2/plan.md).
 
 ## Good to know
@@ -105,10 +105,9 @@ All the details: [what works and what doesn't yet](docs/usage.md#what-works-and-
 ## Learn more
 
 - [Install](docs/install.md): requirements, crates.io, Nix
-- [Using blaze](docs/usage.md): day to day, rebuild on save, making plain `cargo build` use blaze
+- [Using blaze](docs/usage.md): day to day, making plain `cargo build` use blaze
 - [Benchmarks](docs/benchmarks.md): every number, how it's measured, and on what machines
 - [How it works](docs/v2/plan.md): the plan of blaze v2, and a map of its crates
-- [Cargo compatibility](docs/cargo.md): every command, flag and setting
 - [CI runner](docs/v2/plan.md) and [roadmap](docs/v2/plan.md): where blaze is going
 - [Contributing](docs/contributing.md)
 
@@ -146,10 +145,8 @@ How to build blaze from a checkout, run its tests and send a change:
 
 blaze stands on the shoulders of giants. Thank you to the people who built:
 
-- [rust-analyzer](https://github.com/rust-lang/rust-analyzer), whose analysis and MIR blaze compiles from
-- [Cranelift](https://cranelift.dev) (Bytecode Alliance), the fast code generator
-- [LLVM](https://llvm.org) and [inkwell](https://github.com/TheDan64/inkwell), for the optimised tiers
-- [salsa](https://github.com/salsa-rs/salsa), the incremental engine underneath
+- [rust-analyzer](https://github.com/rust-lang/rust-analyzer), whose parser and syntax tree blaze reads Rust with
+- [Wasmtime](https://wasmtime.dev) and [Cranelift](https://cranelift.dev) (Bytecode Alliance), which run proc macros and build scripts
 - [object](https://github.com/gimli-rs/object), for reading and writing executables
 - [Rust](https://github.com/rust-lang/rust) and its compiler crates
 - [rustd](https://github.com/DioxusLabs/rustd) (DioxusLabs), whose code blaze includes

@@ -46,7 +46,7 @@ pub struct Launch<'a> {
 /// (`Gate::Beside`), before the walk has opened a file, so the walk's rows are
 /// not there yet on a first run. Only `src/` is listed, never the checkout: a `target/` of a
 /// million entries beside it costs nothing (it filled the command's frame when the whole
-/// checkout was listed). Owed (drive.md, "RUNNER 11"): the runner walks forward from the
+/// checkout was listed). Owed (drive.md): the runner walks forward from the
 /// program's root (run_package.rs `Program::root`) through a loader, so a file no `mod` reaches
 /// is never read.
 ///

@@ -217,8 +217,8 @@ A get that misses the project's store (`<checkout>/.blaze/v2/packs`) goes down o
 link the same pack store or an `Origin`, and stops at the first that holds the key:
 1. **The machine store**, `<home>/.blaze/v2/shared/`: a pack store like the project's (one pack a
    command, named by its digest, published unsynced, read whole once per boot). It holds only
-   records this machine computed whose key holds nothing of a project: by target.md
-   "Namespaces", a record is public when its name and every name it reads are a toolchain
+   records this machine computed whose key holds nothing of a project: by bottom.md
+   section 10, a record is public when its name and every name it reads are a toolchain
    crate's (a registry archive known by its checksum is next). Today that is the `CrateScope`
    records of core, alloc, std, bstd and their dependencies. A put of a public record goes
    here, every other put to the project's store (superseded: "Shared across worktrees"). Two builds racing write equal bytes under one
@@ -345,11 +345,11 @@ until that folder moves to the home. The leaf table and the profile stay files o
 checkout. Private code is as private as before: both stores are under the user's home, on this
 machine; another user on a shared machine has another home and another store, and no write
 reaches the network. What an origin may serve is a separate, narrower rule: it is sealed from
-`v2/shared` alone (the public names of target.md, "Namespaces"); `v2/own` is never sealed, so
+`v2/shared` alone (the public names of bottom.md, section 10); `v2/own` is never sealed, so
 the seam is a folder, not a filter a sealer could forget. Disk: `v2/own` now grows with every
 checkout's records (each edit adds packs; equal keys are written once). Nothing collects packs
 today: a store merges past 8 packs (`PackStore::merge`), dropping only duplicate keys. Owed,
-per target.md "cleanup by generation and last use, no lock": each command appends its read
+per bottom.md section 10, cleanup by generation and last use, no lock: each command appends its read
 keys' pack numbers to a last-use log beside the packs; a collector run after the answer
 (never waited on) rewrites the coldest packs without the records no command read in N days,
 under a byte cap. One project's answer can no longer be its own root set: many checkouts read
@@ -521,9 +521,6 @@ now `RangeStatus { status: 404 }`. `HttpOrigin` (store.rs) is on bstd's `Http`
 ## Not built
 
 - **Cache writes.** Only CI writes an origin, through `publish`. Nothing here uploads.
-- **An HTTP origin through blaze-h1.** `Origin` is the seam. Its replies arrive out of order, so
-  `poll` and `replied` already work without `fetch`'s one-at-a-time loop.
-- **Peers.**
 - **Chunking large records.** A record past `record_most` (64 MiB) is a typed miss.
 - **Compressed payloads.** columns.md, "Cold and moving bytes, measured", found two good options:
   - solid zstd blocks of about 64 KiB, which cut small records 2.3 to 3.4 times;
@@ -603,7 +600,7 @@ release, and the shared cache would hold one copy of the toolchain per release (
 (estimate), and a check at start compares to the disk now, not to what was compiled.
 
 **(b) When blaze builds blaze.** `stage(kind)` is `core::reflect::fn_info(root).code_id`, the
-behaviour identity (code-identity.md) of one root function per kind that calls both the stage's
+behaviour identity (bottom.md section 3) of one root function per kind that calls both the stage's
 run and its record's decoder; `drive` the same over the envelope and read-list writers. The
 compiler computes it while compiling the binary, so it describes exactly the code linked, at
 function grain: a bstd edit moves only stages that reach the changed functions. Two
@@ -716,7 +713,7 @@ names and scopes across its rebuilds) and across builders of one commit; the flo
 | 9 | per-record last use | none (this doc, "Shared across worktrees": owed) | `used` log |
 | 10 | collection by producer, use and cap | compact.rs `compaction` (pack count, duplicate share); store.rs `merge` drops only duplicates | collector, helper, DST |
 | 11 | records equal across hosts, checked | not found by search | CI comparison of public records |
-| 12 | code ids on the new layer (world b) | code-identity.md's `fn_info(f).code_id` is the old layer's (hir-ty-identity) | port when blaze builds blaze |
+| 12 | code ids on the new layer (world b) | bottom.md section 3's `fn_info(f).code_id` is the old layer's (hir-ty-identity) | port when blaze builds blaze |
 
 ### 6. Pieces (one writer each, none compiles)
 

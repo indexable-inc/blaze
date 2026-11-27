@@ -782,7 +782,7 @@ since the release before and the title of each change merged since.
   An expansion that asked the compiler anything, or failed, is not kept. Function-like macros
   are kept with `RA_JIT_PROC_MACRO_CACHE=all`, a macro is left out by name with
   `RA_JIT_PROC_MACRO_CACHE_SKIP`, and `RA_JIT_PROC_MACRO_CACHE=check` expands anyway and
-  reports any that differ ([docs/cache.md](cache.md), `harness/expansions.py`). On a
+  reports any that differ (docs/cache.md, `harness/expansions.py`). On a
   warm start helix's 1455 kept expansions take resolve from 6.0 to 4.3 s and the time to
   ready from 9.6 to 8.0 s, nushell's 1588 from 5.8 to 4.5 s and from 10.1 to 8.8 s (Linux
   x86-64, 16 cores of an otherwise idle host, medians of four runs each); cold starts
@@ -901,7 +901,7 @@ since the release before and the title of each change merged since.
   1541 of 1581 of rustc's own borrow-check tests that it can run, and none on any of the 246
   rustc accepts, scored by `harness/borrowck_ui.py`, and finds nothing in ripgrep, fd, bat,
   hyperfine, just, axum, nushell, delta, eza, tokei, starship and cargo. Its errors, and rustc's
-  `unused_mut` warning, are rust-analyzer diagnostics and `ra-jit borrowck` prints them ([docs/borrowck.md](borrowck.md)).
+  `unused_mut` warning, are rust-analyzer diagnostics and `ra-jit borrowck` prints them (docs/borrowck.md).
 - Item well-formedness, the crate `hir-ty-wfcheck` next to the borrow checker: rustc's E0309
   and E0310 outside function bodies, for struct, enum and union fields (`&'static T` without
   `T: 'static`), a trait impl's associated types, an impl of a trait bounded by `'static`,

@@ -1,4 +1,4 @@
-//! D116's first step (drive.md "Names at module grain"): the cell core decides ONE cell on
+//! D116's first step (end-state.md D158): the cell core decides ONE cell on
 //! demand. [`Decider::decide`] runs only what the cell reads: its module's explicit entry, the
 //! named imports binding its name and the module's glob links, and through them the cells of
 //! other modules, never every item of the crate to a quiet point.

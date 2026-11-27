@@ -1,5 +1,4 @@
-//! The round trip every column encoding must make exactly (docs/v2/plan/design/data.md,
-//! "Compression follows the columns"): hot fixed-width, warm frame-of-reference bit-packing,
+//! The round trip every column encoding must make exactly (docs/v2/plan/design/columns.md): hot fixed-width, warm frame-of-reference bit-packing,
 //! cold run-length, delta and dictionary codecs. [`round_trips`] runs an encoder and decoder
 //! over [`shapes`], the columns those encodings are chosen for and their edges, and names the
 //! first that does not come back as it went in; [`reads_in_place`] checks the tiers read

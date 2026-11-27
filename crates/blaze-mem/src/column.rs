@@ -1,6 +1,6 @@
 //! [`Column<T>`]: an append-only column any number of threads push to at once, over a
-//! reserved region (docs/v2/plan/design/concurrency.md "Tables are append-only", "Values are
-//! immutable once published"). The column for interners and shared tables: a push claims an
+//! reserved region (docs/v2/plan/design/end-state.md D179: tables are append-only, values are
+//! immutable once published). The column for interners and shared tables: a push claims an
 //! index with one `fetch_add`, writes the value in place and publishes it with one release
 //! store of its ready byte; a read is a bounds check against the committed length and one
 //! acquire load of the ready byte, and writes nothing.

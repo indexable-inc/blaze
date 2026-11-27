@@ -1,4 +1,4 @@
-//! Integers of any width (`#![blaze::arbitrary_ints]`, docs/const.md#integers-of-any-width):
+//! Integers of any width (`#![blaze::arbitrary_ints]`, docs/v2/plan/design/arbitrary-ints.md):
 //! arithmetic, overflow, shifts and casts of `u3` and `i7`, compiled and in const eval. Each
 //! line says `ok` when the compiled result is the one the profile gives (dev has overflow
 //! checks, so an overflow panics naming the operation and the type; release wraps at the
