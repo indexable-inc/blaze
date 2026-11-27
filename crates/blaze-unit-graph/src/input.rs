@@ -71,6 +71,13 @@ pub enum DepSource<'a> {
     /// By `path`: locked with the source of the package that names it (no source for a
     /// workspace's, the git repository's for a package in one).
     Path,
+    /// By `path`, to a directory that is absolute or leaves the folder the layout reads the
+    /// workspace under (blaze-manifest `Source::Outside`): `path` as the manifest writes it
+    /// (manifest text, so nothing of the machine is added). The layout read nothing there, so
+    /// no member or path package answers the lock entry it names; reaching it is
+    /// [`crate::UnitError::PathOutsideAnchor`], naming the package, the dependency and this
+    /// path, never a lookup that cannot succeed. It locks as [`DepSource::Path`] does.
+    OutsideAnchor { path: Text<'a> },
     /// From a registry, with its requirement (`None`: `*`).
     Registry { req: Option<Text<'a>> },
     Git { url: Text<'a> },
@@ -189,7 +196,8 @@ impl<'a> Package<'a> {
                 wanted.push(own(feature));
             }
             let source = match &dep.source {
-                Source::Member(_) | Source::Path(_) | Source::Outside(_) => DepSource::Path,
+                Source::Member(_) | Source::Path(_) => DepSource::Path,
+                Source::Outside(path) => DepSource::OutsideAnchor { path: own(path) },
                 Source::Registry { req, .. } => DepSource::Registry { req: req.as_ref().map(|r| own(r)) },
                 Source::Git { url, .. } => DepSource::Git { url: own(url) },
             };

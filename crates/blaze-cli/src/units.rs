@@ -1175,7 +1175,7 @@ mod tests {
     /// `[patch.crates-io]` and transitive path dependencies outside `[workspace.members]` are
     /// tracked as layout leaves (so editing them moves `units_source`), skipped cleanly when
     /// absent from `Cargo.lock`, classified as `PathKind::External`, and resolve `UnitGraph`
-    /// without hitting `PathOutsideWorkspace`.
+    /// without hitting `PathNotLaidOut`.
     #[test]
     fn patch_and_transitive_path_packages_track_leaves_and_resolve_unit_graph() {
         const ROOT_TOML: &str = "\

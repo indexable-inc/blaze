@@ -362,6 +362,11 @@ pub enum UnitError<'a> {
     Platform { package: Text<'a>, platform: Text<'a>, error: blaze_cond::ParseError },
     /// A root was not answered with its facts.
     RootUnanswered { root: LockId },
+    /// A dependency the graph reaches is by `path` to a directory outside the folder the
+    /// layout reads the workspace under (`path` as `package`'s manifest writes it,
+    /// [`DepSource::OutsideAnchor`]), and nothing answered the lock entry it names: the
+    /// layout found that package nowhere it can read.
+    PathOutsideAnchor { package: Text<'a>, dep: Text<'a>, path: Text<'a> },
 }
 
 impl fmt::Display for UnitError<'_> {
@@ -376,7 +381,13 @@ impl fmt::Display for UnitError<'_> {
             UnitError::AmbiguousLock { package, dep } => write!(f, "`{package}`'s dependency `{dep}` fits two packages of Cargo.lock"),
             UnitError::Requirement { package, dep, req } => write!(f, "`{package}`'s dependency `{dep}`: requirement `{req}` does not parse"),
             UnitError::Platform { package, platform, error } => write!(f, "`{package}`: platform `cfg({platform})`: {error}"),
-            UnitError::RootUnanswered { root } => write!(f, "the root package {} was not answered with its manifest", root.0),        }
+            UnitError::RootUnanswered { root } => write!(f, "the root package {} was not answered with its manifest", root.0),
+            UnitError::PathOutsideAnchor { package, dep, path } => write!(
+                f,
+                "`{package}`'s dependency `{dep}` is `path = \"{path}\"`, which leaves the folder blaze reads the workspace under (its root's folder), \
+                 so no manifest of it was read: a path package outside the workspace's folder is not read yet (agents/feature-requests.md, 2026-11-27)"
+            ),
+        }
     }
 }
 

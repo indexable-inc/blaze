@@ -53,10 +53,18 @@ machine fetched, `open_source` for others (rule 75). Each record is mapped and o
   the commit for its `package.name` and version. Two directories holding it is
   `TwoInCommit`.
 - A missing record is `NotFetched`, naming the package and the key. A source the lock cannot
-  verify is `NotFetchable`. A path package that is not a member is `PathOutsideWorkspace`.
-  Nothing is read from cargo's caches.
+  verify is `NotFetchable`. Nothing is read from cargo's caches.
 
-Members are read from the checkout by the caller and handed in with `member`.
+Path packages are never asked of the store: where one is, is its manifests' to say (cargo's
+rule: the `path` of the dependency line naming it, from that manifest's folder). The layout
+(blaze-manifest `Units::members` and `Units::path_packages`) is their one home: it reads them
+from the members' manifests and on through each path package's own, anchor-relative like the
+members, and the caller hands them in with `member` and `package`. A reached `path` dependency
+the layout could not read, one leaving the folder it reads under (`DepSource::OutsideAnchor`),
+is the resolution's `PathOutsideAnchor`, naming the package, the key and the path as written;
+a path entry asked of the store anyway is `PathNotLaidOut`. Not built yet: an anchor above
+the workspace's root (the checkout `Dir` is the root's folder today), so a workspace such as
+`crates/blaze-shell`, whose path dependencies are `../x`, is refused.
 
 ## The record
 

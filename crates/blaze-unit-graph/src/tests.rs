@@ -1473,6 +1473,110 @@ version = \"0.1.0\"
     assert!(partial.missing().contains(&foo1_id), "missing should include foo 1.0.0: {:?}", partial.missing());
 }
 
+/// A reached `path` dependency the layout could not read (blaze-manifest `Source::Outside`:
+/// crates/blaze-shell's `bgit = { path = "../bgit" }` with the anchor at its own folder) is
+/// [`UnitError::PathOutsideAnchor`] on the first pass, naming the package, the key and the path
+/// as written; it is never a `Need` for the store, which cannot answer a path entry. Prints
+/// the error. CONTROL: the same line once the layout found the package (an anchor above both)
+/// and answered it with `Resolution::package` resolves, and a `[target.'cfg(windows)']` line of
+/// the same kind on macOS is not reached and refuses nothing.
+#[test]
+fn a_path_dependency_outside_the_anchor_is_named_when_reached() {
+    let lock_text = "\
+version = 4
+
+[[package]]
+name = \"bgit\"
+version = \"0.0.0\"
+
+[[package]]
+name = \"shell\"
+version = \"0.0.0\"
+dependencies = [
+ \"bgit\",
+ \"winonly\",
+]
+
+[[package]]
+name = \"winonly\"
+version = \"0.0.0\"
+";
+    let lock = Lock::read(lock_text.as_bytes(), a()).expect("lock");
+    let shell_id = lock.named("shell").next().expect("shell");
+    let bgit_id = lock.named("bgit").next().expect("bgit");
+    let pkg = |name: &str, deps: StdVec<Dep<'static>>| -> Package<'static> {
+        let mut d = Vec::new_in(a());
+        for dep in deps {
+            d.push(dep);
+        }
+        Package {
+            name: t(name),
+            edition: PackageEdition { syntax: Edition::Edition2021, blaze: None },
+            lib: Some(Lib { crate_name: t(name), root: t("src/lib.rs"), proc_macro: false }),
+            bins: Vec::new_in(a()),
+            extras: Vec::new_in(a()),
+            build: None,
+            links: None,
+            features: Vec::new_in(a()),
+            deps: d,
+            meta: crate::PackageMeta::unstated(a()),
+            patched_from: Vec::new_in(a()),
+        }
+    };
+    let line = |key: &str, platform: Option<&str>, source: DepSource<'static>| Dep {
+        key: t(key),
+        package: t(key),
+        kind: DepKind::Normal,
+        platform: platform.map(|p| Platform::parse(p, a())),
+        optional: false,
+        default_features: true,
+        features: Vec::new_in(a()),
+        source,
+    };
+    let shell = |bgit: DepSource<'static>| {
+        pkg(
+            "shell",
+            vec![line("bgit", None, bgit), line("winonly", Some("cfg(windows)"), DepSource::OutsideAnchor { path: t("../winonly") })],
+        )
+    };
+    let target = mac();
+    let ask = || {
+        let mut roots = Vec::new_in(a());
+        roots.push(shell_id);
+        Ask { roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false }
+    };
+
+    let asked = ask();
+    let mut res = Resolution::new(&lock, &target, &target, &asked, Resolver::V2, a());
+    res.member(shell_id, shell(DepSource::OutsideAnchor { path: t("../bgit") })).expect("member shell");
+    let error = match res.pass() {
+        Err(error) => error,
+        Ok(Pass::Need(ids)) => panic!("asked the store for {} package(s): a path entry it cannot answer", ids.len()),
+        Ok(Pass::Done(_) | Pass::Partial(_)) => panic!("a graph without the unread path package"),
+    };
+    std::println!("{error}");
+    match &error {
+        UnitError::PathOutsideAnchor { package, dep, path } => {
+            assert_eq!((package.as_str(), dep.as_str(), path.as_str()), ("shell", "bgit", "../bgit"));
+        }
+        other => panic!("expected PathOutsideAnchor, got {other}"),
+    }
+
+    // CONTROL: the layout found bgit (Source::Path) and answered it.
+    let asked = ask();
+    let mut res = Resolution::new(&lock, &target, &target, &asked, Resolver::V2, a());
+    res.member(shell_id, shell(DepSource::Path)).expect("member shell");
+    res.package(bgit_id, Some(pkg("bgit", vec![]))).expect("path package bgit");
+    let graph = match res.pass().expect("pass") {
+        Pass::Done(graph) => graph,
+        Pass::Need(ids) => panic!("asked for {} package(s) with every reached package answered", ids.len()),
+        Pass::Partial(_) => panic!("partial with every reached package answered"),
+    };
+    let names: StdVec<&str> = graph.units.iter().map(|u| u.name.as_str()).collect();
+    assert!(names.contains(&"bgit"), "bgit is a unit: {names:?}");
+    assert!(!names.contains(&"winonly"), "a cfg(windows) line was reached on macOS: {names:?}");
+}
+
 #[test]
 fn disambiguates_same_name_git_deps_patched_to_different_paths() {
     const LOCK: &str = r#"version = 4
