@@ -898,8 +898,9 @@ fn wasm64_importing(body: &[u8], extra: &[(&str, &str, u8)]) -> blaze_own::AVec<
     let own = (base.len() + extra.len()) as u8;
     // `_initialize` (type 2), `blaze_proc_macro_alloc` (type 3), `blaze_proc_macro_expand` (type 1)
     section(3, &[3, 2, 3, 1], &mut out);
-    // memory64: flags = 0x04, min = 1 page (64 KiB)
-    section(5, &[1, 0x04, 1], &mut out);
+    // memory64: flags = 0x04, min = 3 pages (192 KiB) so multi-page decommit spans host pages
+    // even on 16 KiB / 64 KiB hosts.
+    section(5, &[1, 0x04, 3], &mut out);
     // Global 0: `decls` (immutable i64 = 0)
     section(6, &[1, I64, 0, 0x42, 0, op::END], &mut out);
     s.clear();
@@ -936,13 +937,17 @@ fn wasm64_importing(body: &[u8], extra: &[(&str, &str, u8)]) -> blaze_own::AVec<
         s.extend_from_slice(&f);
     }
     section(10, &s, &mut out);
-    // Data segments: empty stream at 16, paths at 64/96/160, non-zero scratch at 128.
-    let data: [(i64, &[u8]); 5] = [
+    // Data segments: empty stream at 16, paths at 64/96/160, non-zero scratch at 128 and across
+    // pages 1..3 (64 KiB .. 192 KiB) for multi-page decommit verification.
+    let data: [(i64, &[u8]); 8] = [
         (16, b"\x00\x01"),
         (64, b"/package/keep-dir"),
         (96, b"/package/keep-file"),
         (128, b"DEADBEEF"),
         (160, b"/package/new-dir"),
+        (65536 - 8, b"KEEPHEAD"),
+        (65536, b"PAGEZERO"),
+        (131072, b"KEEPFOOT"),
     ];
     s.clear();
     s.push(data.len() as u8);
@@ -1020,7 +1025,7 @@ fn a_wasm64_module_importing_blaze_seed_loads_and_refuses_mutations() {
     // abi_version() == VERSION
     body.extend(op::call(1));
     assert_i32(&mut body, version);
-    // Verify [128..136] is non-zero before decommit, then zero after decommit(128, 8).
+    // Verify [128..136] is non-zero before decommit, then zero after sub-page decommit(128, 8).
     body.extend(op::i64(128));
     body.extend([0x29, 0x00, 0x00]); // i64.load align=0 offset=0
     body.push(0x50); // i64.eqz
@@ -1037,6 +1042,33 @@ fn a_wasm64_module_importing_blaze_seed_loads_and_refuses_mutations() {
     body.extend(op::IF);
     body.push(op::UNREACHABLE);
     body.push(op::END);
+    // Verify multi-page decommit(65536, 65536) discards the middle Wasm page (reads zero after)
+    // while leaving adjacent sentinels at 65536 - 8 ("KEEPHEAD") and 131072 ("KEEPFOOT") intact.
+    body.extend(op::i64(65536));
+    body.extend([0x29, 0x00, 0x00]);
+    body.push(0x50); // i64.eqz -> must be non-zero before decommit
+    body.extend(op::IF);
+    body.push(op::UNREACHABLE);
+    body.push(op::END);
+    body.extend(op::i64(65536));
+    body.extend(op::i64(65536));
+    body.extend(op::call(2)); // decommit(65536, 65536)
+    body.extend(op::i64(65536));
+    body.extend([0x29, 0x00, 0x00]);
+    body.extend(op::i64(0));
+    body.push(0x52); // i64.ne -> must read zero after decommit
+    body.extend(op::IF);
+    body.push(op::UNREACHABLE);
+    body.push(op::END);
+    // Sentinels immediately before and after the decommitted page must still be non-zero.
+    for sentinel in [65536 - 8, 131072] {
+        body.extend(op::i64(sentinel));
+        body.extend([0x29, 0x00, 0x00]);
+        body.push(0x50); // i64.eqz
+        body.extend(op::IF);
+        body.push(op::UNREACHABLE);
+        body.push(op::END);
+    }
     // create_dir("/package/new-dir") -> EPERM
     body.extend(op::i64(160));
     body.extend(op::i64(16));
@@ -1109,9 +1141,9 @@ fn a_wasm64_module_importing_blaze_seed_loads_and_refuses_mutations() {
     let twin = run_in("seed-twin", &expect_ok, &extra, &pkg_dir);
     assert!(twin.as_ref().is_err_and(|e| e.starts_with("call: ")), "expecting 0 from remove_dir must trap: {twin:?}");
 
-    // 4. `decommit` out-of-bounds traps with OutsideMemory.
+    // 4. `decommit` out-of-bounds traps with OutsideMemory (memory is 3 pages = 0x30000 bytes).
     let mut oob = Vec::new();
-    oob.extend(op::i64(0x10000));
+    oob.extend(op::i64(0x30000));
     oob.extend(op::i64(16));
     oob.extend(op::call(2));
     let oob_res = run_in("seed-decommit-oob", &oob, &extra, &pkg_dir);
@@ -1120,6 +1152,53 @@ fn a_wasm64_module_importing_blaze_seed_loads_and_refuses_mutations() {
     // 5. Control (rule 23): seed-only fibers remain unlinked and fail at load naming the import.
     let fiber = run_in("seed-fiber-unknown", &[], &[(seed, "fiber_suspend", 2)], &pkg_dir);
     assert!(fiber.as_ref().is_err_and(|e| e.starts_with("load: ") && e.contains("fiber_suspend")), "{fiber:?}");
+}
+
+/// Proves [`crate::host::decommit_guest_range`] actually returns whole host pages to the OS
+/// (not zero-filling in place), zeroes unaligned head/tail fragments, and leaves adjacent bytes
+/// outside the range untouched.
+#[test]
+#[allow(unsafe_code)]
+fn decommit_guest_range_discards_whole_pages_and_zeroes_edges() {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` reads an immutable kernel constant.
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).expect("page size");
+    let total = page * 4;
+    // SAFETY: anonymous private mapping owned exclusively by this test and unmapped below.
+    let raw = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            total,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(raw, libc::MAP_FAILED, "mmap failed: {}", std::io::Error::last_os_error());
+    // SAFETY: `raw` is a valid readable/writable mapping of `total` bytes.
+    let buf = unsafe { std::slice::from_raw_parts_mut(raw.cast::<u8>(), total) };
+    buf.fill(0xA5);
+
+    // Span unaligned head (last 17 bytes of page 0), whole pages 1 and 2, and unaligned tail (first 23 bytes of page 3).
+    let start = page - 17;
+    let end = page * 3 + 23;
+    crate::host::decommit_guest_range(&mut buf[start..end]).expect("decommit succeeds");
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut vec = [0u8; 2];
+        // SAFETY: `raw.add(page)` is page-aligned for 2 pages inside our live mapping.
+        let rc = unsafe { libc::mincore(raw.cast::<u8>().add(page).cast(), page * 2, vec.as_mut_ptr()) };
+        assert_eq!(rc, 0, "mincore failed: {}", std::io::Error::last_os_error());
+        assert_eq!(vec, [0, 0], "decommitted interior pages must not remain resident");
+    }
+
+    assert!(buf[..start].iter().all(|&b| b == 0xA5), "bytes before range must remain untouched");
+    assert!(buf[start..end].iter().all(|&b| b == 0), "decommitted range must read as zeros");
+    assert!(buf[end..].iter().all(|&b| b == 0xA5), "bytes after range must remain untouched");
+
+    // SAFETY: unmaps the exact mapping created above.
+    assert_eq!(unsafe { libc::munmap(raw, total) }, 0);
 }
 
 /// A module that traps (`unreachable`) is a typed failure naming the crate and the macro, and,
