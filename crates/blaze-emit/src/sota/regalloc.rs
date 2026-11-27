@@ -1917,9 +1917,41 @@ pub(crate) fn allocate_with_ipra_and_order<A: Allocator + Copy>(
     layout: Option<&super::layout::BlockLayout<'_>>,
     alloc: A,
 ) -> Result<Allocation<A>, RegAllocError> {
+    allocate_with_ipra_and_order_profile(
+        view,
+        skip_alloc,
+        alias_of,
+        tail_calls,
+        max_spill_slots,
+        os,
+        call_clobbers,
+        scratch_order,
+        layout,
+        false,
+        alloc,
+    )
+}
+
+/// Like [`allocate_with_ipra_and_order`], with explicit `fast_mode` selecting the `O(N log K)`
+/// RPO linear-scan allocator directly (skipping the exact-CFG interference bitmatrix) for
+/// [`super::EmitProfile::Fast`] cold compilation.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn allocate_with_ipra_and_order_profile<A: Allocator + Copy>(
+    view: &View<'_>,
+    skip_alloc: &[bool],
+    alias_of: &[u32],
+    tail_calls: &[bool],
+    max_spill_slots: u32,
+    os: crate::Os,
+    call_clobbers: impl Fn(usize) -> CallClobbers,
+    scratch_order: Option<&ScratchOrder>,
+    layout: Option<&super::layout::BlockLayout<'_>>,
+    fast_mode: bool,
+    alloc: A,
+) -> Result<Allocation<A>, RegAllocError> {
     let caller_gpr_order = build_caller_gpr_order(scratch_order);
     let caller_fp_order = build_caller_fp_order(scratch_order);
-    if fits_exact_cfg(view, skip_alloc, alloc) {
+    if !fast_mode && fits_exact_cfg(view, skip_alloc, alloc) {
         allocate_exact_cfg(
             view,
             skip_alloc,

@@ -162,6 +162,77 @@ pub(crate) fn compute_block_layout<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Blo
     compute_block_layout_with_pgo(view, None, alloc)
 }
 
+/// Fast `O(V + E)` RPO-only basic-block layout for [`super::EmitProfile::Fast`] cold compilation:
+/// skips instruction body scanning, backward natural-loop BFS, Wu–Larus frequency solving, and
+/// Ext-TSP chain merging while preserving entry block `0` first and exact block coverage.
+pub(crate) fn compute_fast_block_layout<'a>(view: &View<'_>, alloc: Alloc<'a>) -> BlockLayout<'a> {
+    let blocks = view.blocks();
+    if blocks == 0 {
+        let mut edge_off = Vec::with_capacity_in(1, alloc);
+        edge_off.push(0);
+        return BlockLayout {
+            order: Vec::new_in(alloc),
+            loop_depth: Vec::new_in(alloc),
+            is_loop_hdr: Vec::new_in(alloc),
+            is_cold: Vec::new_in(alloc),
+            is_terminal_exit: Vec::new_in(alloc),
+            block_freq: Vec::new_in(alloc),
+            edge_off,
+            edge_dst: Vec::new_in(alloc),
+            edge_weight: Vec::new_in(alloc),
+        };
+    }
+
+    let mut dfs_state: Vec<u8, Alloc<'a>> = Vec::from_elem_in(0, blocks, alloc);
+    let mut order: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    let mut dfs_stack: Vec<usize, Alloc<'a>> = Vec::with_capacity_in(blocks.min(1024), alloc);
+    dfs_stack.push(0);
+    while let Some(b) = dfs_stack.pop() {
+        let st = at_u8(&dfs_state, b);
+        if st == 0 {
+            set_at(&mut dfs_state, b, 1);
+            dfs_stack.push(b);
+            for_each_succ(view, b, |t| {
+                if at_u8(&dfs_state, t) == 0 {
+                    dfs_stack.push(t);
+                }
+            });
+        } else if st == 1 {
+            set_at(&mut dfs_state, b, 2);
+            order.push(b);
+        }
+    }
+    order.reverse();
+    for b in 0..blocks {
+        if at_u8(&dfs_state, b) != 2 {
+            order.push(b);
+        }
+    }
+
+    let mut is_cold: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(blocks, alloc);
+    for b in 0..blocks {
+        let kind = view.block_kind(Block(u32_of(b)));
+        let top = view.op(view.terminator(Block(u32_of(b))));
+        let cold = b != 0
+            && (kind == BlockKind::Cold
+                || kind.is_landing()
+                || matches!(top, Op::Trap | Op::Unreachable | Op::Resume));
+        is_cold.push(cold);
+    }
+
+    BlockLayout {
+        order,
+        loop_depth: Vec::from_elem_in(0, blocks, alloc),
+        is_loop_hdr: Vec::from_elem_in(false, blocks, alloc),
+        is_cold,
+        is_terminal_exit: Vec::from_elem_in(false, blocks, alloc),
+        block_freq: Vec::new_in(alloc),
+        edge_off: Vec::from_elem_in(0, blocks + 1, alloc),
+        edge_dst: Vec::new_in(alloc),
+        edge_weight: Vec::new_in(alloc),
+    }
+}
+
 /// Computes the unified `BlockFreq` + Newell–Pupyrev `Ext-TSP` basic-block layout with optional
 /// PGO branch weights `branch_weights(src_block, then_target_block) -> Option<(taken, not_taken)>`.
 pub(crate) fn compute_block_layout_with_pgo<'a>(

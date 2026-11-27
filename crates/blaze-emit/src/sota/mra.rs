@@ -198,6 +198,12 @@ pub struct MRaOpts<'a> {
     pub call_clobbers: &'a [(u32, CallClobbers)],
     /// Base byte offset from `SP` where spill slots begin (16-byte aligned).
     pub spill_base_off: u32,
+    /// Fast single-pass linear-scan mode for [`super::EmitProfile::Fast`] cold compilation:
+    /// skips cold-exit splitting, CSR copy-edge graph construction, multi-hop hint propagation,
+    /// `fixed_want` lookahead, and `pending_res` reservations, using an `O(1)` bitmask scan over
+    /// convex-hull intervals while preserving exact liveness, ABI, IPRA `CallClobbers`, and
+    /// `ParallelCopy` lowering.
+    pub fast_mode: bool,
 }
 
 impl Default for MRaOpts<'_> {
@@ -208,6 +214,7 @@ impl Default for MRaOpts<'_> {
             block_weights: &[],
             call_clobbers: &[],
             spill_base_off: 0,
+            fast_mode: false,
         }
     }
 }
@@ -3056,7 +3063,7 @@ pub fn allocate_mfunc<'a>(
         }
     }
 
-    let has_hot_cold_weights = !opts.block_weights.is_empty() && {
+    let has_hot_cold_weights = !opts.fast_mode && !opts.block_weights.is_empty() && {
         let mut saw_hot = false;
         let mut saw_cold = false;
         for &blk in func.block_order.iter() {
@@ -3110,8 +3117,11 @@ pub fn allocate_mfunc<'a>(
         vreg_range_heads.push(NONE_U32);
     }
     let mut vreg_range_nodes: Vec<RangeNode, Alloc<'a>> = Vec::with_capacity_in(n_vregs * 2, alloc);
-    let mut raw_copy_edges: Vec<(u32, u32, u64), Alloc<'a>> =
-        Vec::with_capacity_in(func.copy_pairs.len().saturating_add(16), alloc);
+    let mut raw_copy_edges: Vec<(u32, u32, u64), Alloc<'a>> = if opts.fast_mode {
+        Vec::new_in(alloc)
+    } else {
+        Vec::with_capacity_in(func.copy_pairs.len().saturating_add(16), alloc)
+    };
 
     // Single reverse pass over `block_order` constructs exact multi-range intervals with holes.
     for &blk in func.block_order.iter().rev() {
@@ -3220,38 +3230,42 @@ pub fn allocate_mfunc<'a>(
             });
 
             // 4. Coalescing hints from `Mov`, `FpAlu::Mov`, `VecAlu::Mov`, and `ParallelCopy`.
-            collect_copy_hints(
-                op,
-                &func.copy_pairs,
-                eff_w,
-                is_backedge,
-                &mut vreg_meta,
-                &mut raw_copy_edges,
-            );
+            if !opts.fast_mode {
+                collect_copy_hints(
+                    op,
+                    &func.copy_pairs,
+                    eff_w,
+                    is_backedge,
+                    &mut vreg_meta,
+                    &mut raw_copy_edges,
+                );
+            }
         }
     }
 
     // Soft coalescing hint for single-use narrow-masked entry parameters (`raw -> and/ubfm -> dst`)
     // so sub-32-bit entry args (`u8`/`u16`) stay in their incoming ABI register instead of
     // dirtying a scratch register.
-    for (vi, &meta) in vreg_meta.iter().enumerate() {
-        if meta.def_count == 1 && meta.def_inst != NONE_U32 && meta.def_block != NONE_U32 {
-            let di = to_idx(meta.def_inst);
-            if let Some(
-                &MOp::LogicalImm { dst: MReg::V(vd), rn: MReg::V(vs), .. }
-                | &MOp::Ubfm { dst: MReg::V(vd), rn: MReg::V(vs), .. },
-            ) = func.ops.get(di)
-                && to_idx(vd.0) == vi
-                && vd != vs
-            {
-                let si = to_idx(vs.0);
-                if let Some(&smeta) = vreg_meta.get(si)
-                    && smeta.use_count == 1
-                    && smeta.fixed_hint_reg != NO_REG
-                    && smeta.bank == meta.bank
+    if !opts.fast_mode {
+        for (vi, &meta) in vreg_meta.iter().enumerate() {
+            if meta.def_count == 1 && meta.def_inst != NONE_U32 && meta.def_block != NONE_U32 {
+                let di = to_idx(meta.def_inst);
+                if let Some(
+                    &MOp::LogicalImm { dst: MReg::V(vd), rn: MReg::V(vs), .. }
+                    | &MOp::Ubfm { dst: MReg::V(vd), rn: MReg::V(vs), .. },
+                ) = func.ops.get(di)
+                    && to_idx(vd.0) == vi
+                    && vd != vs
                 {
-                    let w = block_eff_weight(opts.block_weights, MBlock(meta.def_block));
-                    raw_copy_edges.push((vd.0, vs.0, w));
+                    let si = to_idx(vs.0);
+                    if let Some(&smeta) = vreg_meta.get(si)
+                        && smeta.use_count == 1
+                        && smeta.fixed_hint_reg != NO_REG
+                        && smeta.bank == meta.bank
+                    {
+                        let w = block_eff_weight(opts.block_weights, MBlock(meta.def_block));
+                        raw_copy_edges.push((vd.0, vs.0, w));
+                    }
                 }
             }
         }
@@ -3473,6 +3487,9 @@ pub fn allocate_mfunc<'a>(
     // -------------------------------------------------------------------------
     // Phase 4: CSR Coalescing Graph, Multi-Hop Hint Propagation, & Linear Scan
     // -------------------------------------------------------------------------
+    if opts.fast_mode {
+        allocate_linear_scan_fast(&vreg_meta, max_half_pt, &pools, &mut alloc_loc, &mut spills, alloc)?;
+    } else {
     // Build deduplicated, non-overlapping CSR coalescing adjacency list (top `MAX_COPY_EDGES_PER_VREG`
     // partners per `VReg` sorted by descending weight).
     let mut write_e = 0usize;
@@ -4254,6 +4271,7 @@ pub fn allocate_mfunc<'a>(
             slice_set(&mut alloc_loc, vi, AllocLoc::Spill { off, size: sz });
         }
     }
+    }
 
     // Tally final per-`VReg` allocation stats accurately (after any retroactive evictions).
     for (vi, &loc) in alloc_loc.iter().enumerate() {
@@ -4420,6 +4438,180 @@ pub fn allocate_mfunc<'a>(
         spill_bytes,
         stats,
     })
+}
+
+/// Fast single-pass `O(N + V)` bitmask linear-scan register allocator for [`super::EmitProfile::Fast`].
+///
+/// Uses convex-hull intervals `[first_start, last_end]` (a sound superset of multi-range liveness)
+/// so register availability is a single `u64` bitmask test with zero CSR copy-edge graphs, zero
+/// multi-hop hint propagation, zero `fixed_want` lookahead, and zero `pending_res` scans.
+fn allocate_linear_scan_fast<'a>(
+    vreg_meta: &[VRegMeta],
+    max_half_pt: usize,
+    pools: &RegPools,
+    alloc_loc: &mut [AllocLoc],
+    spills: &mut SpillSlots,
+    alloc: Alloc<'a>,
+) -> Result<(), MRaError> {
+    let mut bucket_counts: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(max_half_pt, alloc);
+    for _ in 0..max_half_pt {
+        bucket_counts.push(0);
+    }
+    let mut active_vreg_count = 0usize;
+    for meta in vreg_meta.iter() {
+        if meta.range_len > 0 {
+            let b = to_idx(meta.first_start).min(max_half_pt - 1);
+            if let Some(slot) = bucket_counts.get_mut(b) {
+                *slot = slot.saturating_add(1);
+            }
+            active_vreg_count += 1;
+        }
+    }
+    let mut prefix: u32 = 0;
+    for slot in bucket_counts.iter_mut() {
+        let c = *slot;
+        *slot = prefix;
+        prefix = prefix.saturating_add(c);
+    }
+    let mut sorted_vregs: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(active_vreg_count, alloc);
+    for _ in 0..active_vreg_count {
+        sorted_vregs.push(0);
+    }
+    for (vi, meta) in vreg_meta.iter().enumerate() {
+        if meta.range_len > 0 {
+            let b = to_idx(meta.first_start).min(max_half_pt - 1);
+            let pos = to_idx(slice_at(&bucket_counts, b, u32::MAX));
+            if let Some(slot) = bucket_counts.get_mut(b) {
+                *slot = slot.saturating_add(1);
+            }
+            slice_set(&mut sorted_vregs, pos, u32_of(vi).unwrap_or(0));
+        }
+    }
+
+    let mut active_vreg = [NONE_U32; 64];
+    let mut busy_mask: u64 = 0;
+
+    for &v_u32 in sorted_vregs.iter() {
+        let vi = to_idx(v_u32);
+        let Some(&meta) = vreg_meta.get(vi) else {
+            continue;
+        };
+        let cur_start = meta.first_start;
+
+        // Expire intervals whose convex hull ended strictly before `cur_start`.
+        let mut bm = busy_mask;
+        while bm != 0 {
+            let bit = to_idx(bm.trailing_zeros());
+            bm &= bm - 1;
+            let av = slice_at(&active_vreg, bit, NONE_U32);
+            if av != NONE_U32 && vreg_meta.get(to_idx(av)).is_some_and(|m| m.last_end < cur_start) {
+                slice_set(&mut active_vreg, bit, NONE_U32);
+                busy_mask &= !(1u64 << bit);
+            }
+        }
+
+        let bank_bit_base: u8 = match meta.bank {
+            RegBank::Gpr => 0,
+            RegBank::Fp => 32,
+        };
+        let unavailable = busy_mask | meta.forbidden_phys.0;
+
+        let mut chosen_hw: Option<u8> = None;
+        for &hw in pools.scratch_slice(meta.bank) {
+            let full_bit = bank_bit_base.saturating_add(hw);
+            if full_bit < 64 && (unavailable & (1u64 << full_bit)) == 0 {
+                chosen_hw = Some(hw);
+                break;
+            }
+        }
+        if chosen_hw.is_none() {
+            for &hw in pools.callee_slice(meta.bank) {
+                let full_bit = bank_bit_base.saturating_add(hw);
+                if full_bit < 64 && (unavailable & (1u64 << full_bit)) == 0 {
+                    chosen_hw = Some(hw);
+                    break;
+                }
+            }
+        }
+
+        if let Some(hw) = chosen_hw {
+            let full_bit = usize::from(bank_bit_base.saturating_add(hw));
+            let preg = match meta.bank {
+                RegBank::Gpr => PReg::Gpr(hw),
+                RegBank::Fp => PReg::V(hw),
+            };
+            slice_set(alloc_loc, vi, AllocLoc::Reg(preg));
+            slice_set(&mut active_vreg, full_bit, v_u32);
+            busy_mask |= 1u64 << full_bit;
+            continue;
+        }
+
+        // All allocatable non-forbidden registers in this bank are occupied.
+        if meta.is_remat {
+            slice_set(alloc_loc, vi, AllocLoc::Remat { def_inst: meta.def_inst });
+            continue;
+        }
+
+        // Poletto–Sarkar farthest-end eviction (preferring rematerializable occupants first).
+        let mut best_hw: Option<u8> = None;
+        let mut best_is_remat = false;
+        let mut best_end = meta.last_end;
+
+        let mut scan_evict = |pool: &[u8]| {
+            for &hw in pool {
+                let full_bit = bank_bit_base.saturating_add(hw);
+                if full_bit >= 64 || meta.forbidden_phys.contains(Reg(full_bit)) {
+                    continue;
+                }
+                let av = slice_at(&active_vreg, usize::from(full_bit), NONE_U32);
+                if av == NONE_U32 {
+                    continue;
+                }
+                let Some(&am) = vreg_meta.get(to_idx(av)) else {
+                    continue;
+                };
+                if am.is_remat {
+                    if !best_is_remat || am.last_end > best_end {
+                        best_is_remat = true;
+                        best_end = am.last_end;
+                        best_hw = Some(hw);
+                    }
+                } else if !best_is_remat && am.last_end > best_end {
+                    best_end = am.last_end;
+                    best_hw = Some(hw);
+                }
+            }
+        };
+        scan_evict(pools.scratch_slice(meta.bank));
+        scan_evict(pools.callee_slice(meta.bank));
+
+        if let Some(evict_hw) = best_hw {
+            let full_bit = usize::from(bank_bit_base.saturating_add(evict_hw));
+            let av = slice_at(&active_vreg, full_bit, NONE_U32);
+            if let Some(&am) = vreg_meta.get(to_idx(av)) {
+                if am.is_remat {
+                    slice_set(alloc_loc, to_idx(av), AllocLoc::Remat { def_inst: am.def_inst });
+                } else {
+                    let sz = am.spill_mem_size();
+                    let off = spills.alloc_slot(sz)?;
+                    slice_set(alloc_loc, to_idx(av), AllocLoc::Spill { off, size: sz });
+                }
+            }
+            let preg = match meta.bank {
+                RegBank::Gpr => PReg::Gpr(evict_hw),
+                RegBank::Fp => PReg::V(evict_hw),
+            };
+            slice_set(alloc_loc, vi, AllocLoc::Reg(preg));
+            slice_set(&mut active_vreg, full_bit, v_u32);
+            busy_mask |= 1u64 << full_bit;
+        } else {
+            let sz = meta.spill_mem_size();
+            let off = spills.alloc_slot(sz)?;
+            slice_set(alloc_loc, vi, AllocLoc::Spill { off, size: sz });
+        }
+    }
+
+    Ok(())
 }
 
 /// Records coalescing edges and physical-register hints from copy-like instructions (`Mov`,

@@ -214,11 +214,12 @@ pub mod table_gen;
 mod tier;
 pub use blaze_tier::Machine;
 pub use sota::{
-    CallMode, CompiledModuleFn, InternalFastRole, ModuleFn, ScratchOrder, Sota, SotaModuleOpts,
-    SotaModuleOut, SotaRecordAbiOpts,
+    CallMode, CompiledModuleFn, EmitProfile, InternalFastRole, ModuleFn, ScratchOrder, Sota,
+    SotaModuleOpts, SotaModuleOut, SotaRecordAbiOpts,
     abi::{AbiFnInput, CallConvKind, ModuleAbiPlan, ZeroAbiOpts, ZeroAbiStats, plan_module_abi},
     can_use_internal_fast_a64, compile_module_a64, emit_sota_record_for_machine,
     emit_sota_record_for_machine_with_abi, emit_sota_record_measured,
+    emit_sota_record_with_profile,
 };
 pub use tier::Reference;
 pub use asm::AsmToken;
