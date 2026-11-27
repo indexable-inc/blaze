@@ -8,9 +8,8 @@
 
 use super::*;
 
-use crate::front2::check::eval_len;
 use crate::front2::program::head_abi::{BuildAbi, head_abi};
-use crate::front2::heads::{HeadError, Want};
+use crate::front2::heads::Want;
 use crate::front2::keys::Origin;
 use crate::front2::lower_made::{LowerTarget, lower_made};
 use crate::run::make_one::LoweringCounts;
@@ -166,6 +165,7 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         }
         self.async_rows(&made)?;
         self.closure_rows(checked)?;
+        self.deref_and_index_rows(&made, checked)?;
         self.fmt_rows(&made, fmt_owner, function)?;
         // Again after the callees' and async items' heads: their types name ADTs too (the
         // rounds over the store's table pick them up; nothing missing is nothing made).
@@ -398,25 +398,25 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
     }
 
     /// `want` made, each constant its head names evaluated as met (at most `MOST_ADT_LENS`),
-    /// as make_from's ADT rounds do. `asker` names the step of this file that asked (rule
-    /// 19): a refusal says who asked which want for which item.
+    /// via the ONE shared [`crate::front2::program::ensure_want`]. `asker` names the step of this
+    /// file that asked (rule 19): a refusal says who asked which want for which item.
     fn make_want(&mut self, want: Want, item: ItemKey, asker: &'static str) -> Result<(), LazyRefusal> {
-        let mut lens = 0;
-        loop {
-            let names = self.front.names;
-            match self.store.ensure(names, &mut self.front.keys, want) {
-                Err(HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
-                    lens += 1;
-                    let mut r = self.records(true);
-                    if let Err(e) = eval_len(&mut r, c) {
-                        return Err(LazyRefusal::Head { item: self.refused_shown(item), why: format!("{asker} asked {want:?}: the constant {c:x} its head names: {e:?}").into_boxed_str() });
-                    }
-                }
-                Err(e) => {
-                    let shown = crate::front2::item_shown::head_error_shown(names, &e);
-                    return Err(LazyRefusal::Head { item: self.refused_shown(item), why: format!("{asker} (lazy/fill.rs) asked {want:?}: {shown}").into_boxed_str() });
-                }
-                Ok(()) => return Ok(()),
+        let made = {
+            let mut r = self.records(true);
+            crate::front2::program::ensure_want(&mut r, want)
+        };
+        match made {
+            Ok(()) => Ok(()),
+            Err(crate::front2::program::WantError::Const { key: c, error: e }) => {
+                let mut why = blaze_own::String::new_in(self.alloc);
+                let _ = core::fmt::write(&mut why, format_args!("{asker} asked {want:?}: the constant {c:x} its head names: {e:?}"));
+                Err(LazyRefusal::Head { item: self.refused_shown(item), why: why.as_str().into() })
+            }
+            Err(crate::front2::program::WantError::Head(e)) => {
+                let shown = crate::front2::item_shown::head_error_shown(self.front.names, &e);
+                let mut why = blaze_own::String::new_in(self.alloc);
+                let _ = core::fmt::write(&mut why, format_args!("{asker} (lazy/fill.rs) asked {want:?}: {shown}"));
+                Err(LazyRefusal::Head { item: self.refused_shown(item), why: why.as_str().into() })
             }
         }
     }
@@ -867,6 +867,45 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
             let want = Want::Members(lib);
             if !self.store.made(want) {
                 self.make_want(want, checker_of(lib), "closure_rows (Fn/FnMut/FnOnce trait members)")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ensures the `Deref`, `DerefMut`, `Index`, and `IndexMut` lang-trait member heads and rows
+    /// are filed upfront whenever `checked` / `made` performs overloaded deref adjustments or
+    /// index expressions (which the builder calls via `Adts::deref_fn` / `Adts::index_fn` without
+    /// them appearing in `checked.callees`), so cold cached-`Typed` runs always have their ABI.
+    fn deref_and_index_rows(&mut self, made: &crate::front2::body::Body<'_>, checked: &Checked<'static>) -> Result<(), LazyRefusal> {
+        let mut need_deref = false;
+        let mut need_deref_mut = false;
+        for adj in checked.adjusts.column::<1>() {
+            match adj {
+                tc::AdjustKind::Deref { overloaded: Some(tc::Mutbl::Not) } => need_deref = true,
+                tc::AdjustKind::Deref { overloaded: Some(tc::Mutbl::Mut) } => need_deref_mut = true,
+                _ => {}
+            }
+        }
+        let need_index_mut = !checked.index_mut.is_empty();
+        let need_index = made.typeck.exprs.iter().any(|e| matches!(e, tc::Expr::Index { .. }));
+        for (needed, lang_name, method_name) in [
+            (need_deref, "deref", "deref"),
+            (need_deref_mut, "deref_mut", "deref_mut"),
+            (need_index, "index", "index"),
+            (need_index_mut, "index_mut", "index_mut"),
+        ] {
+            if !needed {
+                continue;
+            }
+            let Some(lib) = self.front.index.lang(lang_name) else { continue };
+            let want = Want::Members(lib);
+            if !self.store.made(want) {
+                self.make_want(want, checker_of(lib), "deref_and_index_rows (Deref/Index trait members)")?;
+            }
+            if let Some(k) = self.front.keys.filed_member(checker_of(lib), MemberKind::Fn, method_name)
+                && self.store.fns.contains_key(&k)
+            {
+                self.row(k, true)?;
             }
         }
         Ok(())

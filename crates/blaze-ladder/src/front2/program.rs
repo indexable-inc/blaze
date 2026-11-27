@@ -548,38 +548,38 @@ fn dyn_principals<'v>(views: impl Iterator<Item = PTys<'v>>) -> Vec<ItemKey, Glo
 }
 
 /// Each trait of `asked` not yet in `tables`, with every supertrait under it, made into
-/// Why ensuring a trait's head or members for [`object_tables`] failed.
-enum TraitWantError {
+/// Why ensuring a head [`super::heads::Want`] failed.
+pub(super) enum WantError {
     Const { key: LibKey, error: super::consts::ConstFail },
     Head(super::heads::HeadError),
 }
 
-impl core::fmt::Display for TraitWantError {
+impl core::fmt::Display for WantError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            TraitWantError::Const { key, error } => write!(f, "the constant {key:x} its head names: {error:?}"),
-            TraitWantError::Head(e) => write!(f, "{e:?}"),
+            WantError::Const { key, error } => write!(f, "the constant {key:x} its head names: {error:?}"),
+            WantError::Head(e) => write!(f, "{e:?}"),
         }
     }
 }
 
-/// Ensures a trait head or member table (`Want::Head` or `Want::Members`), evaluating any
-/// constants its signature types name (`Why::NeedConst`, e.g. array lengths or const generic
-/// arguments in method signatures such as `BlobStore::get_cells`) up to [`MOST_ADT_LENS`] times.
-fn ensure_trait_want<'n, S: super::source::NamesSource<'n>>(
+/// Ensures `want` in `r.store`, evaluating any constants its signature types name
+/// (`Why::NeedConst`, e.g. array lengths or const generic arguments) up to [`MOST_ADT_LENS`]
+/// times: the ONE shared want-ensuring loop across object tables, lazy head loading, and statics.
+pub(super) fn ensure_want<'n, S: super::source::NamesSource<'n>>(
     r: &mut Records<'_, 'n, S>,
     want: super::heads::Want,
-) -> Result<(), TraitWantError> {
+) -> Result<(), WantError> {
     let mut lens = 0;
     loop {
         match r.store.ensure(r.names, r.keys, want) {
             Err(super::heads::HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
                 lens += 1;
                 if let Err(error) = super::check::eval_len(r, c) {
-                    return Err(TraitWantError::Const { key: c, error });
+                    return Err(WantError::Const { key: c, error });
                 }
             }
-            Err(e) => return Err(TraitWantError::Head(e)),
+            Err(e) => return Err(WantError::Head(e)),
             Ok(()) => return Ok(()),
         }
     }
@@ -606,8 +606,16 @@ fn object_tables<'n, S: super::source::NamesSource<'n>>(
                 return Err(String::from("more traits under its objects than the most one program's objects reach"));
             }
             let lib = r.keys.library_in(r.names, k).ok_or_else(|| String::from("no library key"))?;
-            ensure_trait_want(r, super::heads::Want::Head(lib)).map_err(|e| format!("its head: {e}"))?;
-            ensure_trait_want(r, super::heads::Want::Members(lib)).map_err(|e| format!("its members: {e}"))?;
+            if let Err(e) = ensure_want(r, super::heads::Want::Head(lib)) {
+                let mut s = blaze_own::String::new_in(r.store.work_alloc());
+                let _ = core::fmt::write(&mut s, format_args!("its head: {e}"));
+                return Err(s.as_str().into());
+            }
+            if let Err(e) = ensure_want(r, super::heads::Want::Members(lib)) {
+                let mut s = blaze_own::String::new_in(r.store.work_alloc());
+                let _ = core::fmt::write(&mut s, format_args!("its members: {e}"));
+                return Err(s.as_str().into());
+            }
             let head = r.store.maps.traits.get(&lib).ok_or_else(|| String::from("made, but no head filed under its key"))?;
             let supers_written = r.store.maps.supers.get(&lib).ok_or_else(|| String::from("made, but no supertraits filed under its key"))?;
             let view = r.store.tys.view();
