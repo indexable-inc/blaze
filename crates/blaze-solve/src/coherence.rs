@@ -193,6 +193,8 @@ fn orphan_walk_inner<T: Tys, F: Facts, L: Log + ?Sized>(
             TyKind::ReStatic
             | TyKind::ReParam(_)
             | TyKind::ReErased
+            | TyKind::ReBound(..)
+            | TyKind::RePlaceholder(..)
             | TyKind::ConstValue(..)
             | TyKind::ConstParam(_)
             | TyKind::Infer(Var { kind: VarKind::Region | VarKind::Const, .. })

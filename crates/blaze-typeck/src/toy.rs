@@ -169,7 +169,7 @@ impl World for ToyWorld {
 
     fn predicates(&self, _: Seal, item: ItemKey) -> Fetch<Predicates<'_>> {
         self.held(Question::Predicates(item))?;
-        Ok(Predicates { clauses: &[] as &[PClause], types: PTys::EMPTY })
+        Ok(Predicates { clauses: &[] as &[PClause], types: PTys::EMPTY, regions: None })
     }
 
     fn adt(&self, _: Seal, item: ItemKey) -> Fetch<Option<Adt<'_>>> {

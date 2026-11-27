@@ -455,6 +455,10 @@ pub enum TyKind {
     ReStatic,
     ReParam(u32),
     ReErased,
+    /// A region bound by an enclosing `for<..>` binder: De Bruijn index, var.
+    ReBound(u32, u32),
+    /// A universally quantified region from a `for<..>` goal: universe, index.
+    RePlaceholder(u32, u32),
     // Consts.
     /// A value of a const generic: its type and its bits, little-endian as consteval writes them.
     ConstValue(ValTy, u128),
@@ -824,6 +828,8 @@ pub fn shape_of_kind(k: TyKind) -> Option<Shape> {
         | TyKind::ReStatic
         | TyKind::ReParam(_)
         | TyKind::ReErased
+        | TyKind::ReBound(..)
+        | TyKind::RePlaceholder(..)
         | TyKind::ConstValue(..)
         | TyKind::ConstParam(_)
         | TyKind::ExTrait(..)
@@ -836,7 +842,12 @@ pub fn shape_of_kind(k: TyKind) -> Option<Shape> {
 pub fn is_region(k: TyKind) -> bool {
     matches!(
         k,
-        TyKind::ReStatic | TyKind::ReParam(_) | TyKind::ReErased | TyKind::Infer(Var { kind: VarKind::Region, .. })
+        TyKind::ReStatic
+            | TyKind::ReParam(_)
+            | TyKind::ReErased
+            | TyKind::ReBound(..)
+            | TyKind::RePlaceholder(..)
+            | TyKind::Infer(Var { kind: VarKind::Region, .. })
     )
 }
 
@@ -892,6 +903,8 @@ pub fn children(k: TyKind) -> Children {
         | TyKind::ReStatic
         | TyKind::ReParam(_)
         | TyKind::ReErased
+        | TyKind::ReBound(..)
+        | TyKind::RePlaceholder(..)
         | TyKind::ConstValue(..)
         | TyKind::ConstParam(_)
         | TyKind::ExAuto(_) => Children::None,

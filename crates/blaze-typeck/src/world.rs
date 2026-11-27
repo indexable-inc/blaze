@@ -355,6 +355,7 @@ pub use blaze_solve::facts::ConstHolds;
 pub struct Predicates<'w> {
     pub clauses: &'w [PClause],
     pub types: PTys<'w>,
+    pub regions: Option<&'w dyn crate::region_facts::HeadRegionRead>,
 }
 
 /// What kind of ADT.
@@ -421,6 +422,8 @@ pub struct ImplHeader<'w> {
     /// keeps an auto trait from being proven by the type's parts. `#[rustc_reservation_impl]`
     /// is a reservation. The solver's own type: one home for the concept.
     pub polarity: ImplPolarity,
+    /// Optional head region columns (`'static` / higher-ranked binders) for trait selection.
+    pub regions: Option<&'w dyn crate::region_facts::HeadRegionRead>,
 }
 
 pub use blaze_solve::facts::ImplPolarity;
@@ -1119,7 +1122,7 @@ impl<T> Holed for &[T] {
 
 impl Holed for Predicates<'_> {
     fn hole() -> Self {
-        Predicates { clauses: &[], types: PTys::EMPTY }
+        Predicates { clauses: &[], types: PTys::EMPTY, regions: None }
     }
 }
 
@@ -1462,6 +1465,41 @@ impl Tabled for FnSig<'_> {
     }
 }
 
+fn hash_pred_regions(regions: Option<&dyn crate::region_facts::HeadRegionRead>, h: &mut StableHasher) {
+    let Some(hr) = regions else { return };
+    let n = hr.clause_count();
+    let mut any = false;
+    for i in 0..n {
+        if let Some((_, binders, col)) = hr.clause(i)
+            && (binders > 0 || col.as_slice().contains(&Region::Static))
+        {
+            any = true;
+            break;
+        }
+    }
+    if any {
+        h.tag(1);
+        for i in 0..n {
+            if let Some((nth, binders, col)) = hr.clause(i)
+                && (binders > 0 || col.as_slice().contains(&Region::Static))
+            {
+                h.u32(nth);
+                h.u32(binders);
+                for &r in col.as_slice() {
+                    match r {
+                        Region::Static => h.tag(1),
+                        Region::Late { binder: 0, var } if binders > 0 => {
+                            h.tag(2);
+                            h.u32(var);
+                        }
+                        _ => h.tag(0),
+                    }
+                }
+            }
+        }
+    }
+}
+
 impl Tabled for Predicates<'_> {
     fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
         clause_roots(self.clauses, roots);
@@ -1469,6 +1507,7 @@ impl Tabled for Predicates<'_> {
     }
     fn hash_shape(&self, h: &mut StableHasher) {
         clauses_shape(self.clauses, h);
+        hash_pred_regions(self.regions, h);
     }
 }
 
@@ -1507,6 +1546,24 @@ impl Tabled for ImplHeader<'_> {
             ImplPolarity::Negative => 1,
             ImplPolarity::Reservation => 2,
         });
+        if let Some(hr) = self.regions
+            && let Some((self_col, trait_col)) = hr.impl_header()
+        {
+            let has_static = self_col.as_slice().contains(&Region::Static)
+                || trait_col.is_some_and(|c| c.as_slice().contains(&Region::Static));
+            if has_static {
+                h.tag(1);
+                for &r in self_col.as_slice() {
+                    h.tag(u8::from(r == Region::Static));
+                }
+                if let Some(tc) = trait_col {
+                    h.tag(2);
+                    for &r in tc.as_slice() {
+                        h.tag(u8::from(r == Region::Static));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2317,6 +2374,39 @@ impl ContentHash for Predicates<'_> {
     fn hash_into(&self, h: &mut StableHasher) {
         self.clauses.hash_into(h);
         self.types.hash_into(h);
+        if let Some(hr) = self.regions {
+            let n = hr.clause_count();
+            let mut any = false;
+            for i in 0..n {
+                if let Some((_, binders, col)) = hr.clause(i)
+                    && (binders > 0 || col.as_slice().contains(&Region::Static))
+                {
+                    any = true;
+                    break;
+                }
+            }
+            if any {
+                h.tag(1);
+                for i in 0..n {
+                    if let Some((nth, binders, col)) = hr.clause(i)
+                        && (binders > 0 || col.as_slice().contains(&Region::Static))
+                    {
+                        h.u32(nth);
+                        h.u32(binders);
+                        for &r in col.as_slice() {
+                            match r {
+                                Region::Static => h.tag(1),
+                                Region::Late { binder: 0, var } if binders > 0 => {
+                                    h.tag(2);
+                                    h.u32(var);
+                                }
+                                _ => h.tag(0),
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2388,6 +2478,24 @@ impl ContentHash for ImplHeader<'_> {
             ImplPolarity::Negative => 1,
             ImplPolarity::Reservation => 2,
         });
+        if let Some(hr) = self.regions
+            && let Some((self_col, trait_col)) = hr.impl_header()
+        {
+            let has_static = self_col.as_slice().contains(&Region::Static)
+                || trait_col.is_some_and(|c| c.as_slice().contains(&Region::Static));
+            if has_static {
+                h.tag(1);
+                for &r in self_col.as_slice() {
+                    h.tag(u8::from(r == Region::Static));
+                }
+                if let Some(tc) = trait_col {
+                    h.tag(2);
+                    for &r in tc.as_slice() {
+                        h.tag(u8::from(r == Region::Static));
+                    }
+                }
+            }
+        }
     }
 }
 

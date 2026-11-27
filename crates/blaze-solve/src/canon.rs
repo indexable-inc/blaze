@@ -64,6 +64,8 @@ const T_COROUTINE: u32 = 33;
 const T_PAT: u32 = 34;
 const T_RECORD: u32 = 35;
 const T_UNION: u32 = 36;
+const T_RE_BOUND: u32 = 37;
+const T_RE_PLACEHOLDER: u32 = 38;
 
 // Predicate tags.
 const P_TRAIT: u32 = 64;
@@ -397,6 +399,16 @@ fn emit<T: Tys>(tys: &T, out: &mut Vec<u32, Alloc<'_>>, k: TyKind) {
         TyKind::Error => out.push(header(T_ERROR, 0)),
         TyKind::ReStatic => out.push(header(T_RE_STATIC, 0)),
         TyKind::ReParam(_) | TyKind::ReErased => out.push(header(T_RE_ERASED, 0)),
+        TyKind::ReBound(d, i) => {
+            out.push(header(T_RE_BOUND, 0));
+            out.push(d);
+            out.push(i);
+        }
+        TyKind::RePlaceholder(u, i) => {
+            out.push(header(T_RE_PLACEHOLDER, 0));
+            out.push(u);
+            out.push(i);
+        }
         TyKind::ConstValue(t, v) => {
             out.push(header(T_CONST, 0));
             out.push(t.code());
@@ -651,6 +663,16 @@ impl<'a> Decode<'a> {
                 T_ERROR => TyKind::Error,
                 T_RE_STATIC => TyKind::ReStatic,
                 T_RE_ERASED => TyKind::ReErased,
+                T_RE_BOUND => {
+                    need(2)?;
+                    i += 2;
+                    TyKind::ReBound(w[at + 1], w[at + 2])
+                }
+                T_RE_PLACEHOLDER => {
+                    need(2)?;
+                    i += 2;
+                    TyKind::RePlaceholder(w[at + 1], w[at + 2])
+                }
                 T_CONST => {
                     need(1)?;
                     // An enum's definition: four words between the code and the bits.

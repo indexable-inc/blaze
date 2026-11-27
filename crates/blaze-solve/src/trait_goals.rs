@@ -296,7 +296,8 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, impl_: Def) -> Result<
     }
     for (i, &w) in h.where_clauses.iter().enumerate() {
         let p = cx.import_pred(h.portable, w, args)?;
-        cx.add_from(GoalSource::ImplWhereBound, p, crate::why_no::Reach::Clause(i as u32));
+        let bound = h.where_clause_bounds.get(i).copied().unwrap_or(0);
+        cx.add_bound_from(GoalSource::ImplWhereBound, p, bound, crate::why_no::Reach::Clause(i as u32));
     }
     Ok(Step::Done(max))
 }

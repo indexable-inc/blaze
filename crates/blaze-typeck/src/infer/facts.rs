@@ -33,6 +33,8 @@ use crate::error::{CheckError, Malformed, Stop};
 use crate::hash::{ContentHash, StableHasher};
 use crate::ids::{FloatTy, IntTy, ItemKey, LangItem, Mutbl, Name, UintTy};
 use crate::portable::{PNode, PTy, PTys};
+use crate::region_facts::HeadRegionRead;
+use crate::regions::{Arity, MOST_REGION_STEPS, Region, region_arity};
 use crate::world::{AdtKind, PClause, Question, Reads, Shape, World};
 
 mod item_bounds;
@@ -112,6 +114,7 @@ struct ImplRow {
     trait_: SDef,
     args: SList,
     wheres: Span,
+    where_bounds: Span,
     assoc: Span,
     por: Por,
     digest: u64,
@@ -182,6 +185,7 @@ struct RoundSnap {
     nodes: usize,
     lists: usize,
     preds: usize,
+    where_bounds: usize,
     assoc_tys: usize,
     impl_assoc: usize,
     fields: usize,
@@ -243,6 +247,7 @@ pub struct FactCache<'a> {
     nodes: Vec<K, Alloc<'a>>,
     lists: Vec<STy, Alloc<'a>>,
     preds: Vec<Pred, Alloc<'a>>,
+    where_bounds: Vec<u32, Alloc<'a>>,
     assoc_tys: Vec<AssocTy, Alloc<'a>>,
     impl_assoc: Vec<ImplAssoc, Alloc<'a>>,
     fields: Vec<STy, Alloc<'a>>,
@@ -607,6 +612,7 @@ impl<'a> FactCache<'a> {
             nodes: Vec::new_in(alloc),
             lists: Vec::new_in(alloc),
             preds: Vec::new_in(alloc),
+            where_bounds: Vec::new_in(alloc),
             assoc_tys: Vec::new_in(alloc),
             impl_assoc: Vec::new_in(alloc),
             fields: Vec::new_in(alloc),
@@ -695,6 +701,7 @@ impl<'a> FactCache<'a> {
             nodes: self.nodes.len(),
             lists: self.lists.len(),
             preds: self.preds.len(),
+            where_bounds: self.where_bounds.len(),
             assoc_tys: self.assoc_tys.len(),
             impl_assoc: self.impl_assoc.len(),
             fields: self.fields.len(),
@@ -724,6 +731,7 @@ impl<'a> FactCache<'a> {
             self.nodes.truncate(self.round_snap.nodes);
             self.lists.truncate(self.round_snap.lists);
             self.preds.truncate(self.round_snap.preds);
+            self.where_bounds.truncate(self.round_snap.where_bounds);
             self.assoc_tys.truncate(self.round_snap.assoc_tys);
             self.impl_assoc.truncate(self.round_snap.impl_assoc);
             self.fields.truncate(self.round_snap.fields);
@@ -1254,6 +1262,373 @@ impl<'a> FactCache<'a> {
         Ok(())
     }
 
+    /// Whether a slot slice carries any region the trait solver distinguishes from erased
+    /// (`'static`, or a clause-bound `for<'a>` lifetime).
+    fn has_solver_region(slots: &[Region], binders: u32) -> bool {
+        slots.iter().any(|&r| {
+            r == Region::Static || (binders > 0 && matches!(r, Region::Late { binder: 0, var } if var < binders))
+        })
+    }
+
+    /// Converts one region slot to a solver region term at binder depth `depth`.
+    fn region_term(&mut self, r: Region, binders: u32, depth: u32, used_bound: &mut bool) -> STy {
+        match r {
+            Region::Static => {
+                let s = STy(self.nodes.len() as u32);
+                self.nodes.push(K::ReStatic);
+                s
+            }
+            Region::Late { binder: 0, var } if binders > 0 && var < binders => {
+                *used_bound = true;
+                let s = STy(self.nodes.len() as u32);
+                self.nodes.push(K::ReBound(depth, var));
+                s
+            }
+            _ => self.erased(),
+        }
+    }
+
+    /// Converts `root` with its pre-order region column `slots`, preserving `'static` and
+    /// `for<'a>` (`Late { binder: 0, var }`) on `Ref` and `Dynamic` nodes. Falls back to
+    /// `self.ty(c, root)` if no solver-relevant region appears or the column cannot be walked.
+    fn ty_with_regions(
+        &mut self,
+        c: Conv<'_>,
+        root: PTy,
+        slots: &[Region],
+        arity: &dyn Arity,
+        binders: u32,
+        used_bound: &mut bool,
+    ) -> Result<STy, Stop> {
+        if !Self::has_solver_region(slots, binders) {
+            return self.ty(c, root);
+        }
+        let mut pos = 0usize;
+        let mut budget = MOST_REGION_STEPS;
+        let mut local_bound = false;
+        if let Some(s) = self.ty_regions_rec(c, root, slots, &mut pos, arity, binders, 0, &mut budget, &mut local_bound)?
+            && pos == slots.len()
+        {
+            *used_bound |= local_bound;
+            return Ok(s);
+        }
+        self.ty(c, root)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ty_regions_rec(
+        &mut self,
+        c: Conv<'_>,
+        t: PTy,
+        slots: &[Region],
+        pos: &mut usize,
+        arity: &dyn Arity,
+        binders: u32,
+        depth: u32,
+        budget: &mut u32,
+        used_bound: &mut bool,
+    ) -> Result<Option<STy>, Stop> {
+        if *budget == 0 || depth > 128 {
+            return Ok(None);
+        }
+        *budget -= 1;
+        let node = c.t.node(t).map_err(Stop::from)?;
+        let Ok(own) = region_arity(t, node, arity) else {
+            return Ok(None);
+        };
+        let own_len = own as usize;
+        let Some(own_slots) = slots.get(*pos..pos.saturating_add(own_len)) else {
+            return Ok(None);
+        };
+        *pos += own_len;
+
+        let k = match node {
+            PNode::Ref(m, p) => {
+                let Some(&r) = own_slots.first() else { return Ok(None) };
+                let r = self.region_term(r, binders, depth, used_bound);
+                let Some(p) = self.ty_regions_rec(c, p, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Ref(r, p, mutbl(m))
+            }
+            PNode::Dynamic(l) => {
+                let Some(&r) = own_slots.first() else { return Ok(None) };
+                let r = self.region_term(r, binders, depth, used_bound);
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Dynamic(l, r)
+            }
+            PNode::Ptr(m, p) => {
+                let Some(p) = self.ty_regions_rec(c, p, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::RawPtr(p, mutbl(m))
+            }
+            PNode::Slice(e) => {
+                let Some(e) = self.ty_regions_rec(c, e, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Slice(e)
+            }
+            PNode::Array(e, n) => {
+                let Some(e) = self.ty_regions_rec(c, e, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                let n = self.ty(c, n)?;
+                K::Array(e, n)
+            }
+            PNode::Pat(b, l) => {
+                let Some(b) = self.ty_regions_rec(c, b, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                let l = self.list(c, l)?;
+                K::Pat(b, l)
+            }
+            PNode::Tuple(l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Tuple(l)
+            }
+            PNode::Record(schema, l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Record(schema.0, l)
+            }
+            PNode::Union(l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Union(l)
+            }
+            PNode::Adt(k, l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Adt(SDef(k.0), l)
+            }
+            PNode::FnDef(k, l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::FnDef(SDef(k.0), l)
+            }
+            PNode::FnPtr(l, h) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::FnPtr(l, h)
+            }
+            PNode::Alias { trait_, name, args } => {
+                let d = assoc_def(trait_, name);
+                if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
+                    self.round_inner_names.push(d);
+                }
+                let Some(args) = self.ty_regions_list(c, args, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Alias(Rigid::No, SAlias::Projection, SDef(d), args)
+            }
+            PNode::Opaque(k, l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::Alias(Rigid::No, SAlias::Opaque, SDef(k.0), l)
+            }
+            PNode::ExTrait(k, l) => {
+                let Some(l) = self.ty_regions_list(c, l, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::ExTrait(SDef(k.0), l)
+            }
+            PNode::ExProj { trait_, name, args, term } => {
+                let d = assoc_def(trait_, name);
+                if self.names.insert(d, (trait_, name)).is_none() && self.reuse_mode && is_inner_def(trait_.0) {
+                    self.round_inner_names.push(d);
+                }
+                let Some(args) = self.ty_regions_list(c, args, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                let Some(term) = self.ty_regions_rec(c, term, slots, pos, arity, binders, depth + 1, budget, used_bound)? else {
+                    return Ok(None);
+                };
+                K::ExProj(SDef(d), args, term)
+            }
+            PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Str
+            | PNode::Never
+            | PNode::Param(_)
+            | PNode::ConstParam(_)
+            | PNode::ConstValue { .. }
+            | PNode::Error
+            | PNode::ExAuto(_)
+            | PNode::Foreign(_) => return Ok(Some(self.ty(c, t)?)),
+            PNode::Closure { .. } | PNode::Future(..) | PNode::Coroutine { .. } | PNode::Infer => {
+                return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(c.q)).into());
+            }
+        };
+        let s = STy(self.nodes.len() as u32);
+        self.nodes.push(k);
+        Ok(Some(s))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ty_regions_list(
+        &mut self,
+        c: Conv<'_>,
+        l: crate::ids::List,
+        slots: &[Region],
+        pos: &mut usize,
+        arity: &dyn Arity,
+        binders: u32,
+        child_depth: u32,
+        budget: &mut u32,
+        used_bound: &mut bool,
+    ) -> Result<Option<SList>, Stop> {
+        let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(l.len as usize, self.alloc);
+        for i in l.range() {
+            let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+            let Some(st) = self.ty_regions_rec(c, p, slots, pos, arity, binders, child_depth, budget, used_bound)? else {
+                return Ok(None);
+            };
+            terms.push(st);
+        }
+        let start = self.lists.len() as u32;
+        self.lists.extend_from_slice(&terms);
+        Ok(Some(SList { start, len: l.len }))
+    }
+
+    /// Converts impl where-clauses with their optional `HeadRegionRead`, recording higher-ranked
+    /// binder counts into `self.where_bounds` when any clause emits `ReBound`.
+    fn clauses_with_regions(
+        &mut self,
+        cs: &[PClause],
+        regions: Option<&dyn HeadRegionRead>,
+        c: Conv<'_>,
+    ) -> Result<Span, Stop> {
+        let Some(hr) = regions else {
+            self.clauses(cs, c)?;
+            return Ok(Span::default());
+        };
+        let n_reg = hr.clause_count();
+        let mut any_interesting = false;
+        for i in 0..n_reg {
+            if let Some((_, binders, col)) = hr.clause(i)
+                && Self::has_solver_region(col.as_slice(), binders)
+            {
+                any_interesting = true;
+                break;
+            }
+        }
+        if !any_interesting {
+            self.clauses(cs, c)?;
+            return Ok(Span::default());
+        }
+        let arity = hr.arity();
+        let bounds_start = self.where_bounds.len();
+        let mut any_bound = false;
+        let mut reg_idx = 0usize;
+        for (nth, cl) in cs.iter().enumerate() {
+            let nth32 = nth as u32;
+            while reg_idx < n_reg {
+                match hr.clause(reg_idx) {
+                    Some((r_nth, _, _)) if r_nth < nth32 => reg_idx += 1,
+                    _ => break,
+                }
+            }
+            let clause_reg = match hr.clause(reg_idx) {
+                Some((r_nth, binders, col)) if r_nth == nth32 => Some((binders, col)),
+                _ => None,
+            };
+            let mut used_bound = false;
+            let mut bound = 0u32;
+            let p = match *cl {
+                PClause::Trait { trait_, args } => {
+                    let sargs = match clause_reg {
+                        Some((binders, col)) if Self::has_solver_region(col.as_slice(), binders) => {
+                            let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(args.len as usize, self.alloc);
+                            for (k, i) in args.range().enumerate() {
+                                let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+                                let st = match col.child(k as u32) {
+                                    Some(sl) => self.ty_with_regions(c, p, sl, arity, binders, &mut used_bound)?,
+                                    None => self.ty(c, p)?,
+                                };
+                                terms.push(st);
+                            }
+                            if used_bound {
+                                bound = binders;
+                                any_bound = true;
+                            }
+                            let start = self.lists.len() as u32;
+                            self.lists.extend_from_slice(&terms);
+                            SList { start, len: args.len }
+                        }
+                        _ => self.list(c, args)?,
+                    };
+                    Pred::Trait { trait_: SDef(trait_.0), args: sargs, polarity: Polarity::Positive }
+                }
+                PClause::Projection { trait_, args, name, term } => {
+                    let d = assoc_def(trait_, name);
+                    self.record_name(d, trait_, name);
+                    let (sargs, sterm) = match clause_reg {
+                        Some((binders, col)) if Self::has_solver_region(col.as_slice(), binders) => {
+                            let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(args.len as usize, self.alloc);
+                            for (k, i) in args.range().enumerate() {
+                                let p = c.t.list_slot(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+                                let st = match col.child(k as u32) {
+                                    Some(sl) => self.ty_with_regions(c, p, sl, arity, binders, &mut used_bound)?,
+                                    None => self.ty(c, p)?,
+                                };
+                                terms.push(st);
+                            }
+                            let sterm = match col.child(args.len) {
+                                Some(sl) => self.ty_with_regions(c, term, sl, arity, binders, &mut used_bound)?,
+                                None => self.ty(c, term)?,
+                            };
+                            if used_bound {
+                                bound = binders;
+                                any_bound = true;
+                            }
+                            let start = self.lists.len() as u32;
+                            self.lists.extend_from_slice(&terms);
+                            (SList { start, len: args.len }, sterm)
+                        }
+                        _ => (self.list(c, args)?, self.ty(c, term)?),
+                    };
+                    let alias = self.nodes.len() as u32;
+                    self.nodes.push(K::Alias(Rigid::No, SAlias::Projection, SDef(d), sargs));
+                    Pred::Projection { alias: STy(alias), term: sterm }
+                }
+                PClause::Const { cond, args } => {
+                    #[cfg(test)]
+                    if self.drop_const_clauses {
+                        continue;
+                    }
+                    Pred::ConstHolds { cond: SDef(cond.0), args: self.list(c, args)? }
+                }
+                PClause::ForFields { container, trait_, args } => Pred::ForFields {
+                    container: self.ty(c, container)?,
+                    trait_: SDef(trait_.0),
+                    args_after_self: self.list(c, args)?,
+                },
+                PClause::TypeOutlives { .. } | PClause::RegionOutlives { .. } => continue,
+            };
+            self.preds.push(p);
+            self.where_bounds.push(bound);
+        }
+        if !any_bound {
+            self.where_bounds.truncate(bounds_start);
+            return Ok(Span::default());
+        }
+        Ok(Span::of(&self.where_bounds, bounds_start))
+    }
+
     /// An answer's portable table is the call's whole converted table (its handles are
     /// absolute): every node an answer reaches was converted into it, once per call.
     fn start(&self) -> Por {
@@ -1495,13 +1870,25 @@ impl<'a> FactCache<'a> {
         }
         let por = self.start();
         let c = self.table(q, h.types);
-        // The trait's arguments, self first: a list of its own.
-        let self_ty = self.ty(c, h.self_ty)?;
+        // The trait's arguments, self first: a list of its own. Preserve `'static` slots from the
+        // impl's head regions so `impl From<&'static str> for T` never satisfies `for<'s> From<&'s str>`.
+        let hdr_regions = h.regions.and_then(|hr| hr.impl_header().map(|cols| (hr.arity(), cols)));
+        let mut dummy_bound = false;
+        let self_ty = match hdr_regions {
+            Some((arity, (self_col, _))) => {
+                self.ty_with_regions(c, h.self_ty, self_col.as_slice(), arity, 0, &mut dummy_bound)?
+            }
+            None => self.ty(c, h.self_ty)?,
+        };
         let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(h.trait_args.list().len as usize + 1, self.alloc);
         terms.push(self_ty);
-        for i in h.trait_args.list().range() {
+        for (idx, i) in h.trait_args.list().range().enumerate() {
             let p = h.types.list_slot(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
-            terms.push(self.ty(c, p)?);
+            let st = match hdr_regions.and_then(|(arity, (_, tc))| tc.and_then(|tc| tc.child(idx as u32 + 1)).map(|sl| (arity, sl))) {
+                Some((arity, sl)) => self.ty_with_regions(c, p, sl, arity, 0, &mut dummy_bound)?,
+                None => self.ty(c, p)?,
+            };
+            terms.push(st);
         }
         let args = SList { start: self.lists.len() as u32, len: terms.len() as u32 };
         self.lists.extend_from_slice(&terms);
@@ -1521,7 +1908,7 @@ impl<'a> FactCache<'a> {
         let assoc = Span::of(&self.impl_assoc, assoc);
         let wcc = self.table(Question::Predicates(k), wc.types);
         let wheres = self.preds.len();
-        self.clauses(wc.clauses, wcc)?;
+        let where_bounds = self.clauses_with_regions(wc.clauses, wc.regions, wcc)?;
         let wheres = Span::of(&self.preds, wheres);
         for c in wc.clauses {
             if let PClause::Const { cond, .. } = *c {
@@ -1539,6 +1926,7 @@ impl<'a> FactCache<'a> {
             trait_: SDef(trait_.0),
             args,
             wheres,
+            where_bounds,
             assoc,
             por: self.end(por),
             digest: digest("blaze-typeck impl", &reads.digest(q)?) ^ digest("blaze-typeck impl where", &reads.digest(Question::Predicates(k))?),
@@ -2215,6 +2603,7 @@ impl Facts for FactCache<'_> {
             trait_: r.trait_,
             args: r.args,
             where_clauses: r.wheres.get(&self.preds),
+            where_clause_bounds: r.where_bounds.get(&self.where_bounds),
             assoc: r.assoc.get(&self.impl_assoc),
             portable: self.portable(r.por),
             digest: r.digest,

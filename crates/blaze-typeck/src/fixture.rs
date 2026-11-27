@@ -983,7 +983,7 @@ impl World for Fx {
         } else {
             &[]
         };
-        Ok(Predicates { clauses, types: self.t.view() })
+        Ok(Predicates { clauses, types: self.t.view(), regions: None })
     }
 
     fn adt(&self, _: Seal, item: ItemKey) -> Fetch<Option<Adt<'_>>> {
@@ -1012,6 +1012,7 @@ impl World for Fx {
                     assoc_types: &i.assoc,
                     types: self.t.view(),
                     polarity: i.polarity,
+                    regions: None,
                 }))
     }
 
