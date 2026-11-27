@@ -31,7 +31,7 @@ use super::borrows_unmade::AdtUnmade;
 
 /// The version of the facts' form and rules: in every domain below, so a change of either
 /// moves every digest.
-pub const ADT_FACTS_VERSION: u32 = 2;
+pub const ADT_FACTS_VERSION: u32 = 3;
 
 /// The `detail` of a `BorrowAdt` read row that says an ADT's head was read by the group
 /// computation (detail 0 is borrow_reads.rs `adt_read`'s).
@@ -40,9 +40,9 @@ pub const ADT_FACTS_DETAIL: u64 = 7;
 /// The most ADTs one table is computed over (rule 18): more is a typed refusal of the rest.
 pub const MOST_ADTS: usize = 1 << 14;
 
-const INPUT_DOMAIN: &str = "blaze-ladder front2 adt facts input v2";
-const GROUP_DOMAIN: &str = "blaze-ladder front2 adt facts group v2";
-const RESULT_DOMAIN: &str = "blaze-ladder front2 adt facts result v2";
+const INPUT_DOMAIN: &str = "blaze-ladder front2 adt facts input v3";
+const GROUP_DOMAIN: &str = "blaze-ladder front2 adt facts group v3";
+const RESULT_DOMAIN: &str = "blaze-ladder front2 adt facts result v3";
 
 /// Why an ADT has no facts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -3378,8 +3378,10 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
                 }
                 continue;
             };
-            // A lang ADT's variances are fixed: its fields are not read.
-            if lang_of(key) != AdtLang::Plain {
+            // A lang ADT's variances are fixed, and a 0-parameter ADT has empty variances
+            // and can induce no outlives requirement on any caller parameter: neither walks
+            // its fields.
+            if lang_of(key) != AdtLang::Plain || (row.lifetimes == 0 && row.generics == 0) {
                 continue;
             }
             let tys = r.store.tys.view();
@@ -3432,7 +3434,7 @@ fn adt_facts_of<'n, 'a, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>, roots: &
         };
         let lang = lang_of(key);
         input.adt(k, lang, row.lifetimes, row.generics);
-        if lang != AdtLang::Plain {
+        if lang != AdtLang::Plain || (row.lifetimes == 0 && row.generics == 0) {
             continue;
         }
         for (vi, v) in row.variants.iter().enumerate() {
