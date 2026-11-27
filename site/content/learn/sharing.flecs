@@ -1,5 +1,5 @@
-// Lesson 5: sharing work. The local store (docs/gc.md, "The store and the budget"); the remote, its push/pull and its
-// signing (docs/remote-cache.md, an option off unless chosen). CI doesn't fill a shared cache yet, and remote execution
+// Lesson 5: sharing work. The local store (docs/gc.md, "The store and the budget"); reading from a named origin and its
+// signing (docs/remote-cache.md, an option off unless chosen; no command pushes or pulls). CI doesn't fill a shared cache yet, and remote execution
 // is neither built nor planned.
 site {
   learn {
@@ -31,13 +31,13 @@ site {
       }
 
       Step shared("A shared store") {
-        P where("A store can also live somewhere else: a shared folder, an S3 bucket or blaze's cache server. Pushing sends your entries there; pulling brings other people's back.")
-        Figure flow(piece: "share", label: "Your laptop builds and pushes to a shared store; a teammate's build of the same code finds the work there instead of compiling it.")
-        Dim auto("With `BLAZE_REMOTE` set, blaze pulls when it starts and pushes as it goes; no build waits on the network.")
+        P where("A build can also read from somewhere else: a folder or an address you name with `--origin`, checked against the key you name with `--origin-key`. Today an origin carries the standard library's records (`blaze store publish` writes them); no command pushes your own work to one yet.")
+        Figure flow(piece: "share", label: "A shared store feeds builds on several machines; a build of the same code finds the work there instead of compiling it.")
+        Dim auto("It is off unless you name an origin: without `--origin`, blaze reads nothing but your own store.")
       }
 
       Step teammate("A teammate's store") {
-        Quiz q(prompt: "A teammate pushed their work. You pull, then build the same commit with the same blaze. What happens?") {
+        Quiz q(prompt: "Records a teammate's machine built are in an origin you name. You build the same commit with the same blaze. What happens?") {
           Choice everything("blaze compiles everything again, because it was built on another machine.", "The machine isn't part of the key: the same blaze, target and source give the same key, and the same result.")
           Choice edits("You also get their uncommitted edits.", "Keys come from inputs. Different source gives different keys, so their edits never match your code.")
           Choice reuse("Their compiled functions come from the store, and only what's missing is compiled.", "Their results have the same keys as yours would, so they fit.") {
@@ -60,7 +60,8 @@ site {
       Step today("Which works today?") {
         Quiz q(prompt: "Which of these can blaze do today?") {
           Choice farm("Run your test suite on a farm of other machines.", "That's remote execution, which isn't built.")
-          Choice push("Push compiled work to a shared store, and pull it back.", "Push and pull work today, to a shared folder, an S3 bucket or blaze's cache server.") {
+          Choice push("Push your compiled work to a shared store for your team.", "Not yet: no command pushes your own work.")
+          Choice origin("Read records from a folder or address you name with `--origin`.", "Right: it works today, checked against the key you name, and off unless you name one.") {
             Right
           }
         }

@@ -1,4 +1,4 @@
-// blaze-gateway: the only holder of the R2 binding to blaze-cache (docs/remote-cache.md, "The gateway").
+// blaze-gateway: the only holder of the R2 binding to blaze-cache (docs/remote-cache.md).
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "blaze-gateway",

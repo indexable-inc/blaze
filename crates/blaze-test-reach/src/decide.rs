@@ -1,5 +1,5 @@
 //! Whether a test's result may be reused, and the decision to reuse or rerun it
-//! (tests-stage.md, "Reuse" and "Determinism, and what is never reused"), as pure functions.
+//! (test.md, piece 19), as pure functions.
 //!
 //! - [`Reusable::of`]: from the grants the test's sandbox was given. A test granted the clock,
 //!   the network or the OS's randomness is never reused, by name: its reach cannot say what it

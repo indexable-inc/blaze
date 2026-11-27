@@ -572,7 +572,8 @@ form change moves the producer. The `FORMATS` chain in home.rs `tool` goes.
 **(a) Before the new layer has code ids.** `stage(kind)` is a digest of source text, computed
 before the build by a build-time script (tools/stage-ids, piece 2), never by blaze at run time:
 over the closure of the kind's root packages (normal and build dependencies, every platform, from
-the lock and manifests by blaze-unit-graph), each workspace or
+the lock and manifests; blaze-unit-graph resolves such a closure, sans-IO, one target and host
+per call, but no command hands it to a script: not built), each workspace or
 vendored package by every regular file under its directory sorted by relative path (target/
 and nested packages excluded), each registry package by (name, version, source, checksum), plus
 the toolchain pin. `drive` is the same over blaze-drive. The ids reach
@@ -600,7 +601,7 @@ release, and the shared cache would hold one copy of the toolchain per release (
 **Hashing blaze's sources in const eval or at start:** tens of MB per build or per command
 (estimate), and a check at start compares to the disk now, not to what was compiled.
 
-**(b) With code ids on the new layer.** `stage(kind)` is `core::reflect::fn_info(root).code_id`, the
+**(b) With `fn_info` code ids on the new layer.** `stage(kind)` is `core::reflect::fn_info(root).code_id`, the
 behaviour identity (bottom.md section 3) of one root function per kind that calls both the stage's
 run and its record's decoder; `drive` the same over the envelope and read-list writers. The
 compiler computes it while compiling the binary, so it describes exactly the code linked, at
@@ -714,7 +715,7 @@ names and scopes across its rebuilds) and across builders of one commit; the flo
 | 9 | per-record last use | none (this doc, "Shared across worktrees": owed) | `used` log |
 | 10 | collection by producer, use and cap | compact.rs `compaction` (pack count, duplicate share); store.rs `merge` drops only duplicates | collector, helper, DST |
 | 11 | records equal across hosts, checked | not found by search | CI comparison of public records |
-| 12 | code ids on the new layer (world b) | bottom.md section 3's `fn_info(f).code_id` is the old layer's (hir-ty-identity) | port to the new layer |
+| 12 | code ids on the new layer (world b) | the new layer has an item's code id (blaze-facts `Fact::CodeId`); `fn_info(f).code_id` in code is comptime phase 2, behind `#![feature(blaze_comptime)]`, not complete (blaze-lint-defs ready.rs) | `fn_info` finished |
 
 ### 6. Pieces (one writer each, none compiles)
 
@@ -765,7 +766,7 @@ names and scopes across its rebuilds) and across builders of one commit; the flo
     store::collect_tests::a_collection_crashed_anywhere_keeps_live_records ... ok`, and one
     `the_collect_oracle_catches_<plant> ... ok` line for each of the three planted bugs. Not: the
     drive.
-11. **WORLD (b)** (when the new layer has code ids). A root per kind, its
+11. **WORLD (b)** (when `fn_info` gives code ids on the new layer). A root per kind, its
     `fn_info(root).code_id` into `Producers`; delete 2 to 4. Test: each root's id equal for the
     three targets, and an edit of one reached function moves exactly its stages.
 

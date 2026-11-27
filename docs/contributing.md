@@ -72,7 +72,7 @@ commit like any other file. A plain clone builds:
 
     git clone https://github.com/indexable-inc/blaze && cd blaze
     sh site/install.sh --version "$(cat .github/blaze-version)"   # the stage-0 blaze
-    blaze build --release --locked -p blaze-cli
+    blaze build --release -p blaze-cli
 
 `crates/rustc_abi` is rustc's `rustc_abi` at the pinned nightly's commit, patched in for
 crates.io's `ra-ap-rustc_abi`, the same way. The fork repositories
@@ -91,8 +91,10 @@ growing one of these.
 
 A new crate allocates as little as it can and names every allocator from its first line
 (rule `bump-allocate`): it borrows or writes into the caller's buffer where that does, and a
-function that must allocate is handed the allocator (`Vec::new_in(frame)`,
-`Box::new_in(value, alloc)`, a `&Frame` or an `A: Allocator`). No comment keeps an implied
+function that must allocate is handed the allocator (a `&Frame` or an `A: Allocator`) and names
+it where it makes a value: a collection by `new_in` (`AVec::new_in(frame)`: its one choice is
+the allocator, D172), any other type in its one `T::new(TOpts { alloc, .. })` (rule
+`options-struct`). No comment keeps an implied
 allocator from `blaze::implicit_allocator`. The gate holds a new crate there: a crate with no row
 in `tools/ratchets/alloc-sites.txt` is held to no `// alloc:` line and no `expect`
 of the lint outside tests (and, once no `// alloc:` line is left anywhere, no line naming
@@ -194,8 +196,9 @@ installs the nightly with rustup. Each step names itself when it fails.
 
 What it leaves to a person, and prints at the end:
 
-1. `python3 harness/answers.py --write` on x86-64 Linux, AArch64 Linux and arm64 macOS, since
-   the target specs depend on the host rustc was built for; then
+1. `python3 harness/answers.py --write` on the Mac, where agent work runs. The target specs
+   depend on the host rustc was built for, and no CI job runs the script, so the Linux hosts'
+   answers are not refreshed by anything yet; then
    `uv run --frozen python tools/cpus.py '{"write": true}'` for the CPU table
    (`crates/target-features/src/cpus/table.rs`); commit both.
 2. `blaze build -p blaze-cli --release`, fixing what the new `rustc_abi` and standard library
@@ -229,7 +232,8 @@ match by the whole version line.
    a fix. Find what the case is an instance of.
 
 Style follows rust-analyzer's guide
-([style.md](https://github.com/rust-lang/rust-analyzer/blob/master/docs/book/src/contributing/style.md)): `blaze fmt`, no new
+([style.md](https://github.com/rust-lang/rust-analyzer/blob/master/docs/book/src/contributing/style.md)): formatting by
+`fmt.yaml` after the merge, no new
 dependencies without a reason, small focused changes. Comments say what the code is for and
 why, not what was changed. Messages printed to the user say what happened and what blaze
 did about it in one line.
@@ -256,10 +260,11 @@ records, how to read it and the method.
   change through is not the harnesses passing on it.
 - blaze builds blaze, never cargo or rustc: with the release `.github/blaze-version` names as
   stage 0 (`sh site/install.sh --version "$(cat .github/blaze-version)"`, as
-  `.github/actions/blaze` installs it), `blaze build --release --locked -p blaze-cli`.
-- `blaze fmt --all` (nothing checks it, and `fmt.yaml` formats main after the merge, but a
-  pull request's diff should be its change), and
-  `blaze test --release --locked -p blaze-engine -p parser -p syntax` from the root (or
+  `.github/actions/blaze` installs it), `blaze build --release -p blaze-cli`.
+- Formatting: `fmt.yaml` runs the pinned release's `blaze fmt --all` on main after each merge and
+  commits what it changes; the CLI built from this tree has no `fmt` command yet
+  (`crates/blaze-fmt` is a library nothing calls), so nothing formats a pull request before it.
+- `blaze test -p blaze-engine -p parser -p syntax` from the root (or
   `python3 harness/unittests.py`: every test of the workspace, with the failures it expects).
   A test that fails is new unless `harness/known-failures.toml` lists it:
   `uv run --frozen harness/failures.py '{"run": {"packages": [...]}}'` runs the
@@ -282,7 +287,11 @@ its crate) arrives an hour in, with the next one an hour after.
 packages that depend on them, each after what it needs, so the first error is the earliest
 cause.
 
-    blaze check $(blaze run -q -p scripts --bin changed -- '{"base": "origin/main", "print": "args"}') --lib --tests
+    blaze check
+    blaze test $(blaze run -q -p scripts --bin changed -- '{"base": "origin/main", "print": "args"}')
+
+`blaze check` takes a directory, not `-p` (checking only the named packages is not in the CLI
+yet); `blaze test` takes the `-p` list.
 
 - The session that integrates agents' work (rule fan-out-write-only) runs that on the Mac
   after each commit it takes, with `"base"` the commit before, in parallel with the build:
@@ -290,7 +299,8 @@ cause.
   back to the agent that wrote the code while it still has it in mind. `"dependents": false`
   checks the touched packages alone, for a first answer; the dependents follow.
 - A change to a file every package's check reads (the root manifest, the lock file,
-  `.clippy.toml`, the pinned toolchain) is the workspace's: the script prints `--workspace`.
+  `.clippy.toml`, the pinned toolchain) is the workspace's: the script prints `--workspace`,
+  which `blaze test` does not take; run `blaze test` alone then.
 - The gate's workspace check does the same first, so a pull request's first compile error
   comes in minutes ([harness.md](harness.md#ci)).
 

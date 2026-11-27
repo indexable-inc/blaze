@@ -64,7 +64,6 @@ under it and no daemon. After an edit it compiles only the functions you changed
   (today the nightly of that date), whatever the project pins; stable code and
   `#![feature(...)]` code build. Your toolchain and CI stay the final word
   ([why](docs/toolchain.md)).
-- **It trades memory for speed:** a few GB for a small project.
 - **It's young.** Keep `cargo check` or your CI as the final word, and
   [tell us](https://github.com/indexable-inc/blaze/issues) when something differs from cargo.
 
@@ -98,7 +97,7 @@ with the ones new since your last visit marked. For release news: Watch → Cust
 
 ## Using blaze at work?
 
-We're working with a few teams on fast Rust CI and remote builds, built on blaze. If your team
+We're working with a few teams on fast Rust CI, built on blaze. If your team
 waits on Rust builds, tell us what slows you down: [andrew@ix.dev](mailto:andrew@ix.dev). Teams
 we work with get early access and a direct say in what we build next.
 

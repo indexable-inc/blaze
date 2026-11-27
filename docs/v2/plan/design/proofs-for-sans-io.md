@@ -59,8 +59,8 @@ input". The function is the same. So:
 - The invariant's words stay where they are today, on the item that states it:
   `/// The invariant (proved: <proof file>): ...` on the theorem function.
 - The whole-run form (`fn run(ops: Vec<Op>, answers: Vec<Answer>) -> bool`, asserting `wf`
-  after each step) is the same statement as a property test. It is what Hegel runs before a
-  proof is tried, so nobody proves a false statement; it is not what is proved.
+  after each step) is the same statement as a property test. It runs as a blaze-sim test
+  (`blaze_sim::check` over a tape of choices, `crates/blaze-sim`) before a proof is tried, so nobody proves a false statement; it is not what is proved.
 
 ### 2. Worlds
 
@@ -100,7 +100,7 @@ answer the world refuses, is none of the theorem's. For every list is every run.
 `wait/retry.rs`, `a_wait_ends_by_its_deadline`, the whole retry loop of every blocking wait
 against `Blocking`, proved 2026-11-14 by one induction on the loop's fuel over an invariant
 that ties the retry's last reading to the world's clock; its simulation test and that
-test's simulated kernel are not in the tree: owed (rule 43). How-to: `agents/howto/H-prove-a-loop-against-a-world.json`.
+test's simulated kernel are not in the tree: owed (rule 43).
 
 **A crash is stated by its witness.** `Disk::allows(cut)` takes how much of each file was
 kept (`Kept`: the changes kept whole, what landed of the next, whether an unsynced write or
@@ -408,10 +408,9 @@ A model names its thread's program points (built 2026-11-14): the code after the
 operation of `f` is the definition `f.at_n`, and inside its k-th loop `f.loop_k.at_n`, with
 the loop itself a parameter; a tail two branches share is one definition, and a loop is
 written once. A proof states its points as these names and does not copy the model's
-continuations (the park's proof was ported to them; agents/annoyances/proofs-1113-11.json).
+continuations (the park's proof was ported to them).
 
-Next: a multi-cell structure against the weak world (above). How-to:
-`agents/howto/H-prove-two-threads.json`.
+Next: a multi-cell structure against the weak world (above).
 
 **A clock for the threads world** (built and its theorems proved 2026-11-14; it is what the
 park's simulation test stated and `no_unpark_is_lost` does not: that a park ends by its

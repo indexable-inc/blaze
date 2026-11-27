@@ -1730,6 +1730,14 @@
    "recommended": "Read an earlier row with this list; D201 to D213 name what they reverse themselves.",
    "why": "A reader of an earlier row had no way to find the row that reversed it.",
    "state": "recorded 2026-11-27"
+  },
+  {
+   "id": "D215",
+   "date": "2026-11-27",
+   "decision": "Compile-time code (proc macros and pure-Rust build scripts) runs as wasm64 (memory64) modules that blaze compiles itself off blaze-lir, run in-process and sandboxed under Wasmtime; native tools a build step spawns (clang, cc, cmake) go to blaze's hypervisor micro-VM sandbox. This reverses the part of D175 and D193 that says Wasmtime and the wasm std go.",
+   "recommended": "AGENTS.md's Endgame (2026-11-26) is the statement; crates/blaze-cli/src/wasm64_compile.rs compiles the modules on a store miss and blaze-proc-macro runs them under Wasmtime.",
+   "why": "The tree does this today: proc macros and pure-Rust build scripts self-compile to wasm64 with no rustc, and the Endgame keeps Wasmtime as their sandboxed runtime.",
+   "state": "decided by the owner 2026-11-26 (AGENTS.md Endgame); recorded 2026-11-27"
   }
  ]
 }

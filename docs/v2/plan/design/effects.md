@@ -282,11 +282,11 @@ algorithm. The first, sound from the MIR alone:
   `loop { .. break .. }`, iterator adaptors, and every loop inside std that these rules do not
   cover. A callee proven by hand is marked `#[blaze::expect(.., trusted = "why")]`.
 - A **`decreases` clause** proved by the verifier lane ([contracts.md](contracts.md)) is the
-  general answer: a measure that falls on every turn. It is one more `Bounding`, tried on a
+  general answer: a measure that falls on every turn. It is one more bounding rule, tried on a
   component after these; the algorithm and its test do not change.
 
 **Recursion and the fixpoint.** A cycle of instances is a cycle of the summary query, which
-starts from `Summary::recursive()`: the summary whose only kind is `Recursion`. Every member of
+starts from the summary whose only kind is `Recursion`. Every member of
 the cycle reads it, of itself or through the others, so at the fixpoint each member and each
 caller has `Recursion` through a call site. Every other kind's witness has a depth (the fewest
 calls to where it is done) that grows by one per call; around a cycle that would grow each
@@ -296,7 +296,7 @@ instance is one already in the chain (and after 64 steps at most), saying it is 
 
 ## What each old attribute refuses
 
-The kinds (`Rule`) the walk gives each site, and which effect refuses which (`diverge`'s
+The kinds the walk gives each site, and which effect refuses which (`diverge`'s
 kinds are above):
 
 | kind | where the walk finds it | nopanic | noalloc | nonblocking |
@@ -328,17 +328,15 @@ non-blocking; code that must not even take malloc's lock is `noalloc`).
 
 ### Which MIR, which profile
 
-The walk reads the monomorphized runtime MIR (`monomorphized_runtime_mir_body`: after drop
-elaboration, before optimization). Its optional overflow `Assert`s are built per the crate the
-body is written in (`transform::asserts`): a body of a crate built with `overflow-checks` has
-them and they run, so they are `Rule::Panic` like a bounds check; a body of a crate built
-without (std, a release profile) has none. The one case the body's crate doesn't decide is a
-body that inherits the setting from the crate it is compiled in
+The walk reads the monomorphized runtime MIR (after drop elaboration, before optimization). Its
+optional overflow `Assert`s are built per the crate the body is written in: a body of a crate
+built with `overflow-checks` has them and they run, so they are `Panic` like a bounds check; a
+body of a crate built without (std, a release profile) has none. The one case the body's crate
+doesn't decide is a body that inherits the setting from the crate it is compiled in
 (`#[rustc_inherit_overflow_checks]`: `u32::pow`, `<u32 as Add>::add` called from generic code):
-its checks are `Rule::Overflow`, and `nopanic` takes the profile of the marked function's crate
-(`hir_ty_mir::mir::overflow::crate_checks_overflow`) for them: with overflow checks (a dev
-profile, or `overflow-checks = true`) it is `NOPANIC` and they are refused; without (release) it
-is `NOPANIC_NO_OVERFLOW_CHECKS` and they pass. A lang crate's setting is `None` and is never
+its checks are `Overflow`, and `nopanic` takes the profile of the marked function's crate for
+them: with overflow checks (a dev profile, or `overflow-checks = true`) they are refused;
+without (release) they pass. A lang crate's setting is `None` and is never
 guessed: a marked function in one is a finding saying so. The same marked function can pass in
 release and be refused in dev; the lint says which profile it checked. Known approximation: an
 inherited body reached through a dependency whose `[profile.*.package]` overflow setting differs
@@ -346,7 +344,7 @@ from the marked crate's is judged by the marked crate's setting (cargo's default
 for every crate alike).
 
 Constant-folded asserts are fine: the runtime MIR is not folded, so the check folds the one shape
-that matters itself (`assert_rule`): an `Assert` whose condition is a constant, or a local the
+that matters itself: an `Assert` whose condition is a constant, or a local the
 block last assigns a comparison of two constant unsigned integers (what `arr[2]` on a `[T; 4]`
 lowers to), is dropped when the constant holds. Any other `Assert` stays a refusal naming its
 line.
@@ -369,8 +367,7 @@ caller's). No data flow is needed: `Global` is a type argument of every collecti
 
 ### The blocking set, as data
 
-`effect_attrs::ROWS` (functions by path, resolved once per crate through its def map) and
-`effect_attrs::FOREIGN` (foreign functions by link symbol):
+Two tables: functions by path, resolved once per crate, and foreign functions by link symbol:
 
 - std: `thread::{sleep, sleep_ms, sleep_until, park, park_timeout, park_timeout_ms}`,
   `JoinHandle::join`, `sync::{Mutex::lock, RwLock::{read, write}, Condvar::wait*, Barrier::wait,
@@ -398,8 +395,8 @@ caller's). No data flow is needed: `Global` is a type argument of every collecti
 is O_NONBLOCK, set in Poller::new")]`. A `try_lock`, `try_recv` or `try_send` is not in the
 table and is walked like any function: its body does not wait.
 
-`check_rows_resolved(db, krate)` names every row of a crate's table that resolves to nothing; a
-test over the pinned std, core and alloc holds the table to the toolchain, as `models` does.
+A check names every row of a crate's table that resolves to nothing; a test over the pinned
+std, core and alloc holds the table to the toolchain.
 
 ## Where blaze uses them
 
@@ -413,12 +410,6 @@ crates come under the gate):
   They allocate (their queues grow), so not `noalloc`.
 - `blaze_graph::sched::cores::first_from`: `#[blaze::noalloc]`, `#[blaze::nonblocking]`. The
   bitmap scan under every steal and wake.
-- `hir_def::nameres::facts::graph::ImportGraph::from_edges`: `#[blaze::noalloc]`. The import
-  graph of every expansion round, built in the query's frame.
-
-Not marked: `pool.rs`'s injector takes a `parking_lot` lock (`Inject::push`, `pop`,
-`steal_into`), so a worker's search is not `nonblocking` and is not marked; the query loops
-that use a frame also call the database, which allocates its memos from the global heap.
 
 ## Tests
 
@@ -434,12 +425,12 @@ and respelled, the rewrite of the old spellings, and a crate that declares nothi
 that a function's signature and flags other than the effect bits are the same with the attributes
 and without, so an unmarked crate builds byte for byte the same.
 
-Two invariants are stated and tested with blaze-sim, each with planted-bug controls:
+Two invariants are to be stated and tested with blaze-sim, each with planted-bug controls:
 
-- `loops.rs`: a control flow graph the analysis accepts has no infinite path. Random small
+- The loop analysis: a control flow graph it accepts has no infinite path. Random small
   graphs with random bounding facts, model-checked by brute force. Controls: a self-loop not
   seen as a cycle; a bounding block taken off a component its exit stays in.
-- `expect.rs`: the checker accepts exactly when every function's inferred effects are within
+- The allowance check: it accepts exactly when every function's inferred effects are within
   its allowed set, where allowed sets flow as specified, and every word of an own list held
   exact is an effect the function has. Random call graphs, effect sources and declarations
   against a reference model. Controls: an impl allowed more than its trait; a module's default
@@ -452,17 +443,16 @@ on its secret inputs: no branch, index or variable-time instruction on a secret.
 not a call-graph effect: whether a `SwitchInt` or an index is refused depends on whether its
 operand is tainted by a secret, which this walk does not track. How it sits on the seam:
 
-- The attribute and its `trusted` door are the same: a bit in `AttrFlags`, `effect_attr`, an
-  `EffectDef` in `EFFECTS`, a lint by the same `EFFECTS`-generic loop, and the same `Refusal`
-  with its chain and `said()`. Secrets are named by a second attribute on parameters and fields
+- The attribute and its `trusted` door are the effect words': one more word with its mask, a
+  lint by the same loop, and the same refusal with its chain. Secrets are named by a second attribute on parameters and fields
   (`#[blaze::secret]`).
-- The kinds are new `Rule`s (`SecretBranch`, `SecretIndex`, `SecretDivide`, `VariableTime`),
-  but the summary that gives them is not the walk's `EffectSet`: it is a per-instance taint
+- The kinds are new (`SecretBranch`, `SecretIndex`, `SecretDivide`, `VariableTime`), but the
+  summary that gives them is not the walk's set of kinds: it is a per-instance taint
   summary, which arguments' secrecy flows to which results and which of them reach a branch,
   an index, a division or a call of a variable-time intrinsic. A summary per instance, memoized
   the same way, composed at each call site by substituting the callee's parameter taints. A
   call's summary is a function of argument taints, not a set, so it is its own query beside
-  `instance_effects`, keyed the same (`(krate, body, args)`), and reuses the walk's resolution of
+  the effect summary, keyed the same (the instance), and reuses the walk's resolution of
   each call site (dispatch, drop glue, closures) rather than walking again.
 - It is checked on the optimized MIR the code generator lowers, never on the runtime MIR: a
   branch the optimizer turns into a `select`, or one it makes from a `select`, changes the
@@ -477,10 +467,7 @@ operand is tainted by a secret, which this walk does not track. How it sits on t
   check, though it runs once per field.
 - Every call through a function pointer or an unlisted `dyn` needs `diverge`, whether or not
   its targets could reach the caller: no whole-program graph of indirect calls is built.
-- A malformed `#![blaze::expect(..)]` on a module is read as the words before its error and is
-  not reported itself; a function's is.
 - The edition gate is `#![blaze::effects]` until `edition = "blaze-2026.11"` exists.
-- No consumer keys on `derived_pure` yet.
 - The blocking set is rows of the toolchain and five registry crates; any other crate's blocking
   wrapper over a foreign call is found through the foreign table (its `read`, `futex`), so the
   table is complete through its foreign leaves, but the message names the leaf.

@@ -1,7 +1,6 @@
 # blaze-gateway
 
-The Cloudflare Worker in front of the `blaze-cache` R2 bucket ([docs/remote-cache.md](../../docs/remote-cache.md),
-"The gateway"). v0 serves today's remote layout per tenant: [API-v0.md](API-v0.md). The blob
+The Cloudflare Worker in front of the `blaze-cache` R2 bucket ([docs/remote-cache.md](../../docs/remote-cache.md)). v0 serves today's remote layout per tenant: [API-v0.md](API-v0.md). The blob
 store beside it (`/has`, `/get`, `/blob`, `/put`, slice 3's server side) and the signed index
 (`/t/<tenant>/trust`, `heads`, `head/<name>`, `seg`, slice 4's): [API.md](API.md).
 

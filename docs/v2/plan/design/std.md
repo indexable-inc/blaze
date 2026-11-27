@@ -1665,8 +1665,8 @@ map 1) and never within the room; a content map equals the distinct values by id
 inserts and removes; a claimed id that is not the value's is refused and stores nothing; keys
 picked to collide under a known hasher spread under a key.
 
-Cost rows are printed by `blaze test --release -p blaze-hash --lib collections_cost -- --ignored
---nocapture` (insert, hash and lookup, and iteration of a million `u32` ids for `IndexMap`, the
+Cost rows are printed by `blaze test -p blaze-hash -- collections_cost --ignored --nocapture`
+(a release-optimized `blaze test` is not in the CLI yet) (insert, hash and lookup, and iteration of a million `u32` ids for `IndexMap`, the
 `indexmap` crate and `HashMap`; lookup of a million 32-byte hashes for `ByHash` and
 `HashMap<[u8; 32]>`). Not measured yet: no run of it has printed (2026-11-12); the numbers go
 here with the commit and the machine's load when one has.

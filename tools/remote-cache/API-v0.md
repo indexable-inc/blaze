@@ -1,4 +1,4 @@
-# blaze-gateway API v0 (slice 1 of docs/remote-cache.md)
+# blaze-gateway API v0 (docs/remote-cache.md)
 
 The contract between blaze v1's `Place::Gateway` client (`crates/blaze-cargo/src/remote/gateway.rs`,
 deleted from the tree on 2026-10-30; the pinned v1 release in `.github/blaze-version` still uses it in

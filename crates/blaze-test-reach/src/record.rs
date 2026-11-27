@@ -1,4 +1,4 @@
-//! A test's result record (tests-stage.md, "Its record"). All integers little-endian; equal values
+//! A test's result record (this file is its layout's one home). All integers little-endian; equal values
 //! encode to equal bytes (rule 25).
 //!
 //! | at | bytes | what |
