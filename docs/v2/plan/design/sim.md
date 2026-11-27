@@ -7,7 +7,7 @@ date: 2026-11-13
 
 Decided by Andrew, 2026-11-13 (decision D37): the simulated machine stays in blaze, and blaze
 stops depending on Hegel. This page is the design; `crates/blaze-sim` is its interface crate
-(rule interfaces-first), and row V12 of the ledger tracks it.
+(rule interfaces-first).
 
 ## The design
 

@@ -2,8 +2,8 @@ import Blaze.Mir.Opt.SlotExecFar
 import Blaze.Mir.Opt.RemoveOverwritten
 
 /-!
-A list of replaced slots, and a statement through it: global dead-store elimination (ledger
-V11), piece (b), first part.
+A list of replaced slots, and a statement through it: global dead-store elimination,
+piece (b), first part.
 
 The two programs' states differ in the slots of dead locals, of the running frame and of the
 frames under it. `puts st reps` is `st` with each slot of `reps` replaced, an entry being a

@@ -183,10 +183,6 @@
       "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
     },
     {
-      "path": "crates/blaze-bench",
-      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
-    },
-    {
       "path": "crates/blaze-build-script",
       "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
     },
@@ -287,10 +283,6 @@
       "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
     },
     {
-      "path": "crates/blaze-profile",
-      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
-    },
-    {
       "path": "crates/blaze-protocol",
       "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
     },
@@ -356,10 +348,6 @@
     },
     {
       "path": "crates/intern",
-      "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
-    },
-    {
-      "path": "crates/ix-prof",
       "why": "S3: the crate moves onto bstd's capabilities, then names no banned path"
     },
     {

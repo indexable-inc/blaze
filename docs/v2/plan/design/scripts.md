@@ -41,7 +41,7 @@ tree that does not compile must still be checked, landed on and released from. S
 Plain Rust on `std` plus `crates/blaze-script`, as ordinary binaries of one workspace package,
 `scripts/` (`scripts/src/bin/<name>.rs`, one self-contained file a script), run as
 
-    blaze run -p scripts --bin ledger -- '{"command": "check"}'
+    blaze run -p scripts --bin docs -- check
 
 Stage 0 builds that today. `blaze-script` is small and has what the Python uses (imports
 counted over 192 files on 2026-11-11): the typed input (`typed_input`, 80 files),
@@ -61,8 +61,8 @@ time, N jobs at once (`concurrent`, 13), and the table and report printer (`repo
     [package.metadata.blaze]
     experimental = ["capabilities"]
     ---
-    /// Checks the ledger's rows and writes its table.
-    struct Input { /** check, write, pick or run */ command: Command }
+    /// Checks every doc's front matter and writes the index.
+    struct Input { /** check or write */ command: Command }
 
     fn main(cx: &Cx, out: Out, checkout: Dir<ReadWrite>, input: Input) -> Result<(), Error> { .. }
 
@@ -80,14 +80,14 @@ time, N jobs at once (`concurrent`, 13), and the table and report printer (`repo
   build directory and lock under blaze's home, keyed by the file's path; the unit keyed as any
   unit is, by the file's content and its dependency set, so a second run is a no-op build and
   an exec.
-- **Where scripts live.** `scripts/`, one file each, for what a workflow, the ledger or a
+- **Where scripts live.** `scripts/`, one file each, for what a workflow, the gate or a
   person runs; a generator stays beside the file it generates. Shared code is the helper crate,
   a path dependency: no `sys.path`.
 - **Fast start.** The budget: a warm script starts within 5 ms of the program's own start, and
   cold is one compile of the file against dependencies already built. Today a no-op `blaze
-  build` is 38 to 136 ms, of which the daemon's answer is 0.1 to 0.4 ms (ledger T5): the rest is
+  build` is 38 to 136 ms, of which the daemon's answer is 0.1 to 0.4 ms: the rest is
   the `blaze` process. What takes it away is specified in docs/v2/plan/design/build-scripts.md by the edit-speed lane
-  (the command asks the daemon before it sets anything up; build on save; ledger T5, D34, D35)
+  (the command asks the daemon before it sets anything up; build on save; D34, D35)
   and docs/client.md (`blaze-fast`), and is not repeated here: `blaze run script.rs` is the
   same no-op lane followed by an exec of the kept executable, with no second process between.
   With no daemon running the command starts one, as every build does, and the first script pays
@@ -115,9 +115,9 @@ time, N jobs at once (`concurrent`, 13), and the table and report printer (`repo
 
 - **The typed input.** `bstd::input`: the script's entry parses its one argument (a JSON value
   inline, the path of a file, or `-`) into `main`'s third parameter and refuses what
-  `typed_input` refuses, in its words, naming the field: `ledger: no field rot (the fields are
-  command, count, ids, root)`, `ledger: field command is required`, `ledger: command is one of
-  "check", "write", not "chek"`, exit status 1. `selftest` as the one argument runs the
+  `typed_input` refuses, in its words, naming the field: `lean_gate: no field rot (the fields
+  are command, lake, out, packages, root)`, `lean_gate: field command is required`, `lean_gate:
+  command is one of "check", "sources", "write", not "chek"`, exit status 1. `selftest` as the one argument runs the
   script's `fn selftest(cx, io)`, as now. `--help` prints the struct's and each field's doc
   comment with its type and default. The decoder and the help are derived from the struct by
   reflection, no derive macro: reflection phase 2 (the field loop of `blaze_comptime`,
@@ -126,9 +126,9 @@ time, N jobs at once (`concurrent`, 13), and the table and report printer (`repo
   is tier 0's: a hand-written `Input::parse` over `blaze_script::input`'s field reader, which
   gives the same errors.
 
-Tier 1 waits on, each in a release: single-file scripts; bstd with a native `Io` (ledger S1,
-S4) and the missing pieces above; reflection phase 2 with `bstd::data`; the edition's
-`fn main(cx, io)` entry (S5). A tier 0 script moves by the lints that move blaze's own crates
+Tier 1 waits on, each in a release: single-file scripts; bstd with a native `Io` and
+the missing pieces above; reflection phase 2 with `bstd::data`; the edition's
+`fn main(cx, io)` entry. A tier 0 script moves by the lints that move blaze's own crates
 (`blaze::std_use`'s renames, `blaze check --fix`), not by hand.
 
 ### The engine and the report (harness/v2's shared modules)
@@ -159,8 +159,8 @@ meaning and every message its words, so a harness ports line by line.
 - **Byte compatibility while Python harnesses remain.** The result file is the same JSON:
   `dumps_indent(1)` with the same keys in the same order (`script`, `engine` as `asdict` writes
   it, `host`, `commit`, `started`, `ended`, `outcomes`, `counts` in first-seen order, `extra`),
-  a float written as `repr` writes it and `round(x, n)` done as Python does. So `proof.py` and
-  the ledger read a Rust harness's result as they read a Python one, and `SCRIPT` stays
+  a float written as `repr` writes it and `round(x, n)` done as Python does. So `proof.py`
+  reads a Rust harness's result as it reads a Python one, and `SCRIPT` stays
   `<name>.py` until the last reader moves. The printed lines (`PASS       name  k=v  detail`,
   the closing count line) are the same, and so is the exit status. What cannot be the same is
   listed in a port's parity row: random temporary names, timings, and the
@@ -171,7 +171,7 @@ meaning and every message its words, so a harness ports line by line.
 
 Nothing is ported one for one that can be deleted instead. Sizes are from 2026-11-11.
 
-1. **Checkers** (13 files, 4,841 lines): `tools/docs.py`, harness/v2's `ledger`, `invariants`,
+1. **Checkers** (13 files, 4,841 lines): `tools/docs.py`, harness/v2's `ledger` (deleted since), `invariants`,
    `guards`, `changed`, `diff_rules`, `lean_gate`, then `tools/v2/domains.py`,
    `harness/rustcsites.py`, `harness/failures.py`, `harness/imports.py`,
    `.github/scripts/gate_changes.py`, with `typed_input` itself. Pure functions over files; they
@@ -188,7 +188,7 @@ Nothing is ported one for one that can be deleted instead. Sizes are from 2026-1
    a release has proved the tiers on everything before them.
 
 A port keeps the Python's interface exactly (the one argument, `selftest`, the text printed,
-the exit status), so a workflow or a ledger check changes only its command. Ports land in
+the exit status), so a workflow or a gate row changes only its command. Ports land in
 pairs: the Rust script beside the Python, then, once both were run on the same inputs and
 agreed byte for byte, the switch that deletes the Python and its line of `tools/python-allowed.txt`.
 
@@ -196,7 +196,7 @@ agreed byte for byte, the switch that deletes the Python and its line of `tools/
 file. The `docs` script's `check` (`blaze run -q -p scripts --bin docs -- check`, on the pinned
 release), which every gate runs, fails for a `.py` file that is not on it (write it in Rust)
 and for a line whose file is gone (its `write` takes it out, and never adds one), so the list
-only shrinks. Ledger row D43 is met when `... --bin docs -- python '{"left": 0}'` passes: the
+only shrinks. Python is gone when `... --bin docs -- python '{"left": 0}'` passes: the
 list is empty and no `.py` file is tracked; then the check holds that there is no `.py` file at
 all.
 
@@ -207,7 +207,7 @@ refusals word for word, JSON written as `json.dumps` writes it, a program run wi
 captured) and the package `scripts/`, both checked by stage 0 (`blaze check -p blaze-script -p
 scripts`, `blaze test -p blaze-script`, on 0.20261105.4).
 
-A ported script is switched to (its workflow step, ledger check and docs changed, the Python and
+A ported script is switched to (its workflow step, gate row and docs changed, the Python and
 its line of `tools/python-allowed.txt` deleted) only after both were run on the same tree and
 agreed. `R` is `blaze run -p scripts --bin`; every command runs at the root of one checkout with
 stage 0; "equal" is standard output, standard error and the exit status, byte for byte, unless
@@ -217,13 +217,13 @@ the row says otherwise. `state`: `written` (the Rust is in the tree, not yet com
 | script | state | Python | Rust | must be equal |
 |---|---|---|---|---|
 | lean_gate | written | `uv run --frozen python harness/v2/lean_gate.py selftest` | `R lean_gate -- selftest` | output (`lean_gate.py selftest: ok`), status 0 |
-| lean_gate | written | `... lean_gate.py '{"command": "sources"}'`, and with `"out": "/tmp/lg-py.json"` | `R lean_gate -- <the same>` with `"out": "/tmp/lg-rs.json"` | clean tree: `lean_gate.py: ok: sources hold`, status 0, the two out files the same bytes. Planted one at a time: `sorry` in a proof of `lean/`; `-- sorry` (passes); a theorem of lean/theorems.json renamed; one listed twice; its `row` set to `V99`; an `allow` entry whose file does not say its word; lean/analysis/lean-toolchain changed; `rev` in lean/analysis/lakefile.toml changed; the manifest deleted; docs/v2/plan/proofs.md edited: the same lines, status 1, and the out files the same bytes |
+| lean_gate | written | `... lean_gate.py '{"command": "sources"}'`, and with `"out": "/tmp/lg-py.json"` | `R lean_gate -- <the same>` with `"out": "/tmp/lg-rs.json"` | clean tree: `lean_gate.py: ok: sources hold`, status 0, the two out files the same bytes. Planted one at a time: `sorry` in a proof of `lean/`; `-- sorry` (passes); a theorem of lean/theorems.json renamed; one listed twice; an `allow` entry whose file does not say its word; lean/analysis/lean-toolchain changed; `rev` in lean/analysis/lakefile.toml changed; the manifest deleted; docs/v2/plan/proofs.md edited: the same lines, status 1, and the out files the same bytes |
 | lean_gate | written | `... lean_gate.py '{"command": "write"}'` | `R lean_gate -- '{"command": "write"}'` | `git status --short` empty after each on a clean tree; with a theorem's `says` changed, proofs.md the same bytes from both |
 | lean_gate | written | `... lean_gate.py '{"command": "check", "out": "/tmp/lg-py.json"}'` (needs the pinned Lean under `~/.elan`) | `R lean_gate -- <the same>` with `/tmp/lg-rs.json` | the same `lake` commands in the same directories (the lines `lean_gate.py: \`<args>\` in <dir>: exit <n>, <s> s` but their seconds), the same table, final line and status; the out files the same bytes. `{"command": "check", "lake": "lake"}`: `mir_semantics.py: \`lake\` is \`lake\`: ...`, status 1, from both |
 | nostd | written | `uv run --frozen python harness/v2/nostd.py selftest` | `R nostd -- selftest` | output (`nostd.py selftest: ok`), status 0 |
 | nostd | written | `... nostd.py '{"command": "check"}'`, `"progress"`, `"list"`, and `"list"` with `"root": "."` | `R nostd -- <the same>` | output and status on a clean tree. Then with ban lists of the wrong shape (`banned` missing, `sys` a string) and one listing a path twice and a path that names nothing (`check`, `progress`); then planted together, a crate `crates/blaze-core-x` (after `blaze-core` by parts, before it by text) with a `std::{fs, time::Instant, net}` group, a CRLF file with a byte that is not UTF-8, a test module, a `tests/` file, `extern crate std` with `libc::`, and `extern crate std` under its `target/`: the same lines and status for `check`, `progress`, `list`. `{}`, `{"command": "lst"}`, `"bans": 3`, an unknown field, `[]`, no argument, two arguments: the same lines, status 1. A ban list that is not there: status 1 from both, the Python's a traceback |
 
-Switched (the Python deleted, its callers on the Rust): docs, ledger, invariants, changed,
+Switched (the Python deleted, its callers on the Rust): docs, invariants, changed,
 gate_changes, domains, rustcsites.
 
 Known differences, on purpose: the words of a JSON syntax error are serde_json's, and a TOML

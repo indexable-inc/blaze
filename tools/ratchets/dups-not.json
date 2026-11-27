@@ -110,12 +110,6 @@
       "reason": "Rust forbids macro-expanded #[macro_export] macros from being called via crate::name! inside the defining crate"
     },
     {
-      "id": "512e78eb8f48",
-      "a": "crates/blaze-profile/src/stack.rs::fn::frame_pointer",
-      "b": "crates/blaze-trace/src/record.rs::fn::counter",
-      "reason": "counter reads hardware cycle counter (cntvct_el0/rdtsc) while frame_pointer reads x29/rbp"
-    },
-    {
       "id": "515d4f214e03",
       "a": "crates/blaze-trace/src/macros.rs::macro::debug",
       "b": "crates/blaze-trace/src/macros.rs::macro::debug_span",

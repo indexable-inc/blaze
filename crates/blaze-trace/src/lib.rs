@@ -1,7 +1,7 @@
-//! blaze's spans and events: the one home of tracing in blaze (docs/v2/plan/design/no-tracing.md,
-//! docs/v2/plan/third-party.md's `tracing` row). The `tracing` and `tracing-subscriber` crates
-//! are gone; every crate writes these macros and the flight recorder (blaze-profile's
-//! `Recorder`) is the sink that keeps what they say.
+//! blaze's spans and events: the one home of tracing in blaze (docs/v2/plan/design/end-state.md,
+//! D178; docs/v2/plan/third-party.md's `tracing` row). The `tracing` and `tracing-subscriber`
+//! crates are gone; every crate writes these macros, and a sink the program's entry installs
+//! keeps what they say.
 //!
 //! - A site is static data, made by the macro where it is written: its name, target, level,
 //!   file, line and field names ([`Metadata`]), and one state word ([`Site`]): its id in the
@@ -11,9 +11,8 @@
 //!   too), timed by the CPU's counter. No `dyn` call, no allocation, no lock, no formatting but
 //!   of text fields; the reader formats, later.
 //! - **A sink** ([`Sink`]) is the other consumer: a span or an event handed to it as it happens,
-//!   its fields' values borrowed ([`Value`]). It is how blaze-profile's flight recorder and the
-//!   tests read spans until the flight recorder drains the rings; a site the rings record does
-//!   not go to a sink.
+//!   its fields' values borrowed ([`Value`]). It is how a recorder and the tests read spans; a
+//!   site the rings record does not go to a sink.
 //! - The macros have the call shape crates already wrote (`info_span!(target: "blaze", "name",
 //!   krate = %k, unit)`, `warn!(%dir, "text {x}")`, `field::Empty` then `span.record(..)`), so
 //!   moving a crate here changes its import and nothing else.

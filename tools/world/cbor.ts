@@ -4,8 +4,7 @@
 // head is in its shortest form and every length definite; every length is checked against its
 // limit and against the bytes left before anything is sized by it. No dependency.
 //
-// The same encoding as crates/blaze-world-api (enc.rs, dec.rs); tools/world/vectors.json holds
-// the two to the same bytes.
+// tools/world/vectors.json holds the encoding to its bytes.
 
 import {
   CALLS,
@@ -956,7 +955,7 @@ export function decodeResponse(bytes: Uint8Array, limits: Limits): Response {
 
 /**
  * Where the first CBOR item of `bytes` ends, or `null` while it is not whole: what a reader of a
- * connection waits on, as crates/blaze-world-api's `Session` scans. Indefinite lengths, tags,
+ * connection waits on. Indefinite lengths, tags,
  * floats and simple values other than false and true are refused here, before any decode.
  */
 export function itemEnd(bytes: Uint8Array, limits: Limits): number | null {

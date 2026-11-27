@@ -20,7 +20,7 @@ When performance tradeoffs compete in Blaze, decisions follow one fixed order ac
 The remote cache is supported and is not in the order: nothing is designed around it or traded
 against these.
 
-Selective incremental testing (`blaze-test-reach` `BTI1` zero-reindex SoA impact store) rides
+Selective incremental testing rides
 the same content-addressed discipline: only tests whose transitive read set intersects the
 edited item digests rerun.
 

@@ -34,9 +34,9 @@ safe zstd for cold and moving bytes is `crates/blaze-zstd` (decoder and encoder)
   place); blaze-kit `codec.rs` keeps LEB128 and its delta (streams, not random access). The
   bit-packing here is `enc::bits`; the varint and zigzag stay in blaze-kit.
 
-- blaze-format-tiers (the record format's warm tier: frame of reference in SIMD-BP128's interleaved
-  blocks of 128) is a second encoding of the same concept, built, not wired; the block here is
-  1,024 values in horizontal order (`enc::bits::BLOCK`). One of the two crates goes.
+- The record format's warm tier (frame of reference in SIMD-BP128's interleaved blocks of 128),
+  a second encoding of the same concept, was never wired and was deleted on 2026-11-27; the block
+  here is 1,024 values in horizontal order (`enc::bits::BLOCK`).
 
 ## Where block compression still belongs
 

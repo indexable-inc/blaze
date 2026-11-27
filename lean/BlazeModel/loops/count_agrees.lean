@@ -5,7 +5,7 @@ import BlazeMir.loops.count
 
 /-!
 `loops::count`: the functional model (`BlazeModel.loops.count`) agrees with the semantics of the
-function's MIR (`BlazeMir.loops.count`), for every argument: objective V7
+function's MIR (`BlazeMir.loops.count`), for every argument
 (docs/v2/plan/design/formal-verification.md). `mir_walk` (`Blaze.Mir.Walk`) runs a turn of the
 loop (two blocks) and the way out (three), with the comparison and the increment passed in;
 `run_loop` does the rest. No state between two blocks is written down: a change of the

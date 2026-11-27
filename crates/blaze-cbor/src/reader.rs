@@ -1,5 +1,5 @@
 //! The field reader: records are arrays in a fixed field order, read one call a field, each
-//! length capped by its caller (moved from blaze-watch's `cbor`, blaze-pack's before it).
+//! length capped by its caller (moved from blaze-watch's `cbor`).
 //!
 //! It takes nothing on trust: a head that is not the shortest, a length past what is left of
 //! the input or past the field's own cap, a type other than the one asked for and bytes after

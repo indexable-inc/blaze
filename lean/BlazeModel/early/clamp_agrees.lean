@@ -5,7 +5,7 @@ import BlazeMir.early.clamp
 
 /-!
 `early::clamp`: the functional model (`BlazeModel.early.clamp`) agrees with the semantics of the
-function's MIR (`BlazeMir.early.clamp`), for every argument: objective V7
+function's MIR (`BlazeMir.early.clamp`), for every argument
 (docs/v2/plan/design/formal-verification.md). A case on `x > limit`, then `mir_walk`
 (`Blaze.Mir.Walk`) runs the body down the branch taken: three blocks when `x > limit` (the
 early return goes through the return block), two otherwise. No state between two blocks is

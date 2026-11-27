@@ -3,8 +3,8 @@ import Blaze.Mir.Opt.Skel
 import Blaze.Mir.Opt.Merge
 
 /-!
-Operands, places and control through a list of replaced slots: global dead-store elimination
-(ledger V11), piece (d), first and second parts.
+Operands, places and control through a list of replaced slots: global dead-store elimination,
+piece (d), first and second parts.
 
 `Opt/Puts.lean` carries a statement through `puts st reps`. A terminator evaluates operands
 and a place, and then jumps, calls or returns. Here, first: an operand, a list of operands

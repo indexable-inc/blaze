@@ -1,5 +1,5 @@
 //! base64 (RFC 4648, sections 4 and 5), in place of the `base64` crate (docs/v2/plan/third-party.md:
-//! blaze-http's proxy credentials, blaze-pg's SCRAM, blaze-profile's history manifest).
+//! blaze-http's proxy credentials, blaze-pg's SCRAM).
 //!
 //! An [`Engine`] is an alphabet and a padding rule: [`STANDARD`], [`STANDARD_NO_PAD`],
 //! [`URL_SAFE`] and [`URL_SAFE_NO_PAD`] are the four RFC 4648 names. Encoding writes into the

@@ -4,7 +4,8 @@
 //! same two entries into the same rings.
 //!
 //! `cargo run --release -p blaze-trace --example cost`. `tracing` is a dev-dependency of this
-//! crate only for this comparison; it goes once the numbers are in docs/profiling.md.
+//! crate only for this comparison; it goes once the numbers are in docs/v2/plan/design/end-state.md
+//! (D178).
 //!
 //! The rings are blaze_trace's: per thread, 32-byte slots (stamp, site and depth, tick, span),
 //! overwrite-oldest with an exact lost count, the tick read from the CPU counter in user space

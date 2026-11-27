@@ -21,7 +21,7 @@
 //! no model of the kernel written a second time in Lean. The simulation:
 //! [`Sim`](crate::sim::Sim) is held to each world by a refinement test (`sim/world.rs`), so a
 //! simulation test and a proof are about the same kernel. And a real driver: what it was
-//! observed to do is an answer the world allows (objective V4).
+//! observed to do is an answer the world allows.
 //!
 //! The worlds are written in the subset `hir-ty-lean` translates today (structs, enums, `Vec`,
 //! index loops; no closures, iterators or generics), so a proof against one waits for nothing.

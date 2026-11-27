@@ -19,9 +19,6 @@ docs selftest | 120 | - | "$BLAZE_SCRIPTS/docs" selftest
 docs | 300 | - | "$BLAZE_SCRIPTS/docs" check
 # No new place in blaze's code starts rustc, rustdoc or cargo (docs/no-rustc.md).
 rustc sites | 300 | - | "$BLAZE_SCRIPTS/rustcsites"
-# The objectives ledger's rows are well formed and its table is current.
-ledger selftest | 120 | - | "$BLAZE_SCRIPTS/ledger" selftest
-ledger | 120 | - | "$BLAZE_SCRIPTS/ledger" '{"command": "check"}'
 # Which packages a change touches.
 changed selftest | 120 | - | "$BLAZE_SCRIPTS/changed" selftest
 # Every stated invariant has a control beside it, and docs/v2/plan/invariants.md lists them.

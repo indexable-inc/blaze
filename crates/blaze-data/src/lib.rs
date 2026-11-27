@@ -1,7 +1,7 @@
 //! The one format-neutral value: what blaze's formats read into and write from.
 //!
 //! A [`Value`] is not JSON, CBOR or TOML: each format is a reader and a writer over it
-//! (`blaze-json`, `blaze-toml`, and blaze-pack's deterministic CBOR for the agent API, rule 33).
+//! (`blaze-json`, `blaze-toml`, and blaze-cbor's deterministic CBOR for the agent API, rule 33).
 //! It holds what all three can say, and each writer refuses, by a typed error naming the path,
 //! what its format cannot (JSON has no bytes and no non-finite float, TOML no null):
 //!

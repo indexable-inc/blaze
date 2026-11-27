@@ -67,8 +67,8 @@
 //!    bounds them and closes the ones it lets go.
 //! 7. **Waits.** Sleep until the socket is readable or writable, an ask comes, or
 //!    [`Connection::next_deadline`], whichever is first. Every query ends by its deadline, so
-//!    no wait of an asker's is open. The waits open no span yet: when `blaze-trace` lands
-//!    (docs/v2/plan/design/no-tracing.md) the driver opens one per wait, named by the server
+//!    no wait of an asker's is open. The waits open no span yet: with `blaze-trace`
+//!    (docs/v2/plan/design/end-state.md, D178) the driver opens one per wait, named by the server
 //!    and the query (every-wait-says-what).
 //!
 //! # Not here

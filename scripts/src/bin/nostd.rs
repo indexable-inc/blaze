@@ -1,4 +1,4 @@
-//! nostd: the check of ledger row S4 and its progress meter. The port of `harness/v2/nostd.py`,
+//! nostd: the check that bstd and blaze link no Rust std, and its progress meter. The port of `harness/v2/nostd.py`,
 //! deleted once both were run on the same tree and agreed (docs/v2/plan/design/scripts.md,
 //! "Ports and their parity"). `DOC` below is what its usage error prints.
 //!
@@ -10,7 +10,7 @@
 //! traceback; both exit 1.
 
 /// What the usage error prints: harness/v2/nostd.py's docstring, with this script's commands.
-const DOC: &str = r#"nostd.py: the check of ledger row S4 ("bstd is `#![no_std]` with its own sys and runtime; no
+const DOC: &str = r#"nostd.py: the check of the rule ("bstd is `#![no_std]` with its own sys and runtime; no
 blaze crate links Rust's std"), and its progress meter (docs/v2/plan/design/sys.md, "Migration").
 
     blaze run -q -p scripts --bin nostd -- '{"command": "check"}'
@@ -46,7 +46,7 @@ text (`libc::`, `std::fs`, a `std::{.. fs ..}` group), outside comments and outs
 to the end of its file):
 tests are built on std's harness and are not what a blaze binary links. The lint that
 refuses the same uses by name resolution is the `ambient` effect (std.md, S2), with blaze-sys
-the one trusted crate; this script is the meter and the ledger's check.
+the one trusted crate; this script is the meter and the gate's check.
 "#;
 
 use std::{

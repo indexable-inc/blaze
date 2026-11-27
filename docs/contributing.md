@@ -29,9 +29,8 @@ one level down:
     vendor/                   third-party crates blaze patches or builds as dependencies
     harness/                  the test harnesses and their fixtures
     tools/                    what builds, releases and measures blaze: nix/ (the flake's unit graphs), pgo/
-                              (the pinned PGO profiles), bench/remote-cache/ (the cache gateway's
-                              measurements), remote-cache/ (the cache gateway Worker), typed-input/ (the Python
-                              workspace's shared helper), v2/ (the lanes' scripts and queue)
+                              (the pinned PGO profiles), typed-input/ (the Python workspace's shared
+                              helper), v2/ (the lanes' scripts and queue)
     docs/                     these documents; docs/future/ the plans for work not started,
                               fed1eb428d:docs/reports/ working reports, docs/v2/ the v2 plan and the lanes'
                               requests
@@ -344,8 +343,8 @@ regenerates the index.
 Several lanes, people or agents, change blaze at once. A lane shares `git`'s metadata and
 main with all the others, so:
 
-- **Work comes from the ledger.** A lane is one task: an objective of
-  [v2/plan/objectives.md](v2/plan/objectives.md), done when its check passes. How a session
+- **Work comes from decisions and designs.** A lane is one task: a named piece of a row of
+  [v2/plan/decisions.json](v2/plan/decisions.json) or of a design, done when its check passes. How a session
   picks, briefs, integrates and lands is [the plan's loop](v2/plan.md#how-the-work-is-run).
 - **Work runs on the Mac**: builds, tests, smokes and benches, at most three heavy builds at
   once; no VM and no AWS host. Linux-only work runs in CI. Where neither can do something, stop

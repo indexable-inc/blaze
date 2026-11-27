@@ -18,10 +18,10 @@ own crates first and for anyone's after, and adds what was missing to act on it.
   and never deletes it.
 - **Where a proof stops short:**
   - *The world is a model.* A proof is about a core against a model of the kernel. Each world
-    model keeps one conformance test against each real driver (objective V4): every behaviour
+    model keeps one conformance test against each real driver: every behaviour
     the real kernel shows must be one the model allows. One test per model, not per invariant.
   - *The model is of the MIR, not the binary.* Until the translator's output is proved equal to
-    the MIR it came from (V7) and the lowering below MIR is validated (V9), every translated
+    the MIR it came from and the lowering below MIR is validated, every translated
     function is run on drawn inputs both as its executable Lean model and as built code, and
     the results compared (section 6). That run is generated; nobody writes it.
   - *Code outside the subset* (section 3) has no proof until the subset reaches it.
@@ -68,7 +68,7 @@ A world is what a core's effects go to. Each is a small, pure Rust type in
 `crates/blaze-core/src/world/`: its state, one function per completion that gives the state
 after it, and a predicate (`allows`) wherever the kernel has a choice. The relation is the
 predicate, so nothing has to show that a script of choices reaches every allowed answer, and
-conformance with a real driver is `allows(observed)` (objective V4).
+conformance with a real driver is `allows(observed)`.
 
 - `clock::Clock` (built 2026-11-14): monotonic time; the next reading is never earlier, and a
   timer is told fired at a reading not before its deadline. Its theorem
@@ -267,7 +267,7 @@ statement it was checked against. The models hir-ty-lean generated stay checked 
 
 ### 6. Evidence that the model is the code
 
-Until the translation is proved (V7): every translated function is run two ways on the same
+Until the translation is proved: every translated function is run two ways on the same
 drawn arguments, as the executable Lean model and as built code, and the whole results are
 compared (harness/v2/lean_differential.py does this for one function today). Running only the
 built theorem function would test the code and say nothing of the model.
@@ -461,7 +461,7 @@ deadline, and promptly after its wake).
   modules) builds from nothing in 9 s with Lean 4.20.0.
 - **Writing.** The one proof in the tree is 597 hand-written lines for a 9-line function, 445
   of them the link from model to MIR. So proofs are written by agents, the model-to-MIR link
-  is generated or it does not scale (V7), and automation is tried first.
+  is generated or it does not scale, and automation is tried first.
 - **Keeping.** A change to proved code that changes its model fails the gate until the proof
   is repaired. That is the price of the proof; it is paid by an agent run on the failing
   goals.
@@ -493,8 +493,8 @@ deadline, and promptly after its wake).
 
 ## Checks
 
-Ledger rows V13 to V17 (objectives.json): the first proved invariant with its test deleted;
-the worlds with `Sim` held to them; the subset's coverage of sans-IO functions as a number;
+What decides that this design is built: the first proved invariant (its simulation test kept,
+D206); the worlds with `Sim` held to them; the subset's coverage of sans-IO functions as a number;
 the count of invariants at `proved`; atomics.
 
 The models under `lean/BlazeModel/blaze_core` are what the proofs in the tree were checked

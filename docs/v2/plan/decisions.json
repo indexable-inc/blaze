@@ -1738,6 +1738,30 @@
    "recommended": "AGENTS.md's Endgame (2026-11-26) is the statement; crates/blaze-cli/src/wasm64_compile.rs compiles the modules on a store miss and blaze-proc-macro runs them under Wasmtime.",
    "why": "The tree does this today: proc macros and pure-Rust build scripts self-compile to wasm64 with no rustc, and the Endgame keeps Wasmtime as their sandboxed runtime.",
    "state": "decided by the owner 2026-11-26 (AGENTS.md Endgame); recorded 2026-11-27"
+  },
+  {
+   "id": "D216",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: the profile crate and the Parquet profile are deleted, with what rested on them: crates/blaze-profile (its Parquet history, flight recorder, watchdog, `blaze debug sql` over DuckDB and `BLAZE_PROFILE`), crates/ix-prof (the any-program profiler and its explorer server), crates/blaze-rel (the query engine over the history) and crates/blaze-bench (its benches); docs/profiling.md, ix-prof.md, ix-prof-format.md and, under docs/v2/plan/design, no-tracing.md, perf-history.md, profile-history.md, profile-names.md, query.md, debugging.md and explore-generic.md; .github/scripts/explore_page.py, harness/profile_fixtures.py and blaze-sql's test that read the profile's SQL. There is one telemetry core: bstd's (end-state.md D178), with blaze-trace for spans and events and `.blaze/v2/profile.txt` as a command's profile.",
+   "recommended": "What of the deleted docs still describes the tree (blaze-trace, the vendored crates' 0001-no-tracing patches, bstd telemetry) is in end-state.md under D178; comments and docs that cited the deleted crates or docs point there or drop the clause; the smoke harness prints a failed step's `.blaze/v2/profile.txt` in place of a `blaze debug sql` query.",
+   "why": "No binary reached the profile crate or any of the four; they held a second telemetry core beside bstd's, a command (`blaze debug sql`) the CLI no longer has, and docs that described them as built.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D217",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: the objectives ledger is deleted (docs/v2/plan/objectives.json, objectives.md, scripts/src/bin/ledger.rs and its two gate rows). A decision is a row of decisions.json; a task is a named piece of a decision or of a design's unbuilt part, done when its check passes on a named commit. lean_gate no longer checks a theorem's `row` against the ledger; `row` stays only as the heading proofs.md groups it under.",
+   "recommended": "docs/v2/plan.md's 'How the work is run' states the loop without a ledger (measure on the exact tree, brief, lanes write in one directory, the coordinator builds once, land through a pull request, record the decision); rules 46, 49 and every-agent-has-a-task name decisions instead of the ledger.",
+   "why": "All 151 rows were unset, 138 had no check, nothing in CI ran `ledger run`, and work was already picked from decision rows.",
+   "state": "decided by the owner 2026-11-27"
+  },
+  {
+   "id": "D218",
+   "date": "2026-11-27",
+   "decision": "The owner's decision: workspace crates that no binary reaches and that are not a library offered to users of bstd are deleted, not kept as built-and-not-wired: blaze-stage, blaze-malloc, blaze-format-tiers, blaze-world-api, blaze-test-reach and blaze-pack, with the tools/remote-cache gateway Worker and its measurements in tools/bench/remote-cache, and docs/v2/plan/design/malloc.md. blaze-core's iocp.rs stays: blaze-core's Native type and fs re-exports name it on Windows. tools/world/ (the world schema's TypeScript client and golden vectors) stays. This changes D209's 'crates/blaze-test-reach is built and not wired': it is deleted.",
+   "recommended": "Each deleted crate is in git at 50dac12595; a doc that cited one says what is true now and points there. Other unreached members are listed for a decision of their own, not deleted.",
+   "why": "An audit found these crates built and called by nothing: they cost ratchet rows, docs that called them built, and readers' time, and no command used them.",
+   "state": "decided by the owner 2026-11-27"
   }
  ]
 }

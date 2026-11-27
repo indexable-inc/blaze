@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze-sql, typed SQL with no injection. A query is a const string checked at compile time against a schema made of Rust structs; its parameters are named (`$name`), bound by a record, and its row type is computed (`type_of!`). One sans-IO checker (parse, infer, render) in `crates/blaze-sql`, drivers for C SQLite (`crates/blaze-sqlite`) and Postgres (`crates/blaze-pg`, a sans-IO wire protocol). The checker and the drivers are built (the drivers not wired: nothing outside their tests calls them); the typed surface waits on its language pieces, each a ledger row.
+summary: blaze-sql, typed SQL with no injection. A query is a const string checked at compile time against a schema made of Rust structs; its parameters are named (`$name`), bound by a record, and its row type is computed (`type_of!`). One sans-IO checker (parse, infer, render) in `crates/blaze-sql`, drivers for C SQLite (`crates/blaze-sqlite`) and Postgres (`crates/blaze-pg`, a sans-IO wire protocol). The checker and the drivers are built (the drivers not wired: nothing outside their tests calls them); the typed surface waits on its language pieces.
 date: 2026-11-13
 ---
 # blaze-sql: typed SQL

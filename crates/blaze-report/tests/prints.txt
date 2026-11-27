@@ -4,7 +4,6 @@
 bgit 6
 blaze-alloc-count 1
 blaze-answer 6
-blaze-bench 4
 blaze-bstd-convert 31
 blaze-build 15
 blaze-build-script 30
@@ -39,13 +38,11 @@ blaze-mem 1
 blaze-native 5
 blaze-new 1
 blaze-proc-macro 25
-blaze-profile 5
 blaze-resolve 1
 blaze-scope 5
 blaze-script 8
 blaze-shell 16
 blaze-sim 6
-blaze-stage 3
 blaze-surface 2
 blaze-sys 18
 blaze-tier 9
@@ -53,7 +50,6 @@ blaze-toolchain 5
 blaze-typeck 20
 blaze-watch 1
 blaze-world 18
-ix-prof 11
 stdx 4
 syntax 3
 test-utils 11

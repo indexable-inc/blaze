@@ -8,8 +8,7 @@ date: 2026-11-09
 The app in `crates/harness/` lists agents: a tree of sessions named after processes. A person
 running twenty agents wants to know what is being done, what is stuck and what needs them. None of
 that is on screen today: there is no task, no "waiting on you" state, no step, no cost and no
-branch. This is the design that puts them there. Objectives A1 to A5 of
-[objectives.md](../objectives.md).
+branch. This is the design that puts them there.
 
 ## The model
 
@@ -19,7 +18,7 @@ It is an object in the daemon beside sessions, kept in the same SQLite table (`o
 
 | field | meaning |
 |---|---|
-| `id`, `title` | the title is what the sidebar shows; an objective id leads it when there is one |
+| `id`, `title` | the title is what the sidebar shows; a decision id leads it when there is one |
 | `outcome`, `check` | one line each: what done is, and what decides it |
 | `state` | `running`, `needs you`, `blocked`, `done`, `failed`, `dropped` |
 | `steps` | a short ordered list, each `todo`, `doing` or `done`; the agent keeps it current |

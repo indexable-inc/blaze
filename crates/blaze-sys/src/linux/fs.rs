@@ -235,8 +235,8 @@ pub fn write(fd: Fd, bytes: &[u8]) -> Result<usize, Errno> {
 
 /// `write` of `len` bytes from the address `at`, which need not be readable: the kernel
 /// copies from it and answers [`Errno::Fault`] where it is not mapped readable. The probe of
-/// a stack walker (blaze-profile's `stack::probe`, into a pipe it drains), which asks the
-/// kernel whether a frame address may be read before reading it. Safe: no byte of this
+/// a stack walker (into a pipe it drains), which asks the kernel whether a frame address may
+/// be read before reading it. Safe: no byte of this
 /// process is read or written by user code, and the kernel's copy is not a Rust access.
 /// replaces libc::write (with an address that may be unreadable, a probe: blaze_sys::linux::write_from_address(fd, at, len); EFAULT is Err(Errno::Fault))
 #[blaze::noalloc]

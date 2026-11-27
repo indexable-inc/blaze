@@ -2,7 +2,7 @@ import Blaze.Mir.Run
 
 /-!
 One lemma per construct: what a statement, an rvalue or an operand does, from what its parts
-do. A proof that a function's MIR runs to what its functional model gives (objective V7) is
+do. A proof that a function's MIR runs to what its functional model gives is
 these lemmas applied along the body, block by block; the first is
 crates/blaze-graph/lean/BlazeGraph/LedgerMir.lean. Each hypothesis is an equation of the
 semantics, closed by `rfl` where the state is known and by a fact about the data where it is

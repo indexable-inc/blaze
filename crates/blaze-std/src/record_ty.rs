@@ -1,5 +1,5 @@
 //! Zero-cost, `#![forbid(unsafe_code)]` Structural Records & Named Arguments with Defaults
-//! (`bstd::record_ty`, `docs/v2/plan/design/records.md`, edition change 4 / objective E5).
+//! (`bstd::record_ty`, `docs/v2/plan/design/records.md`, edition change 4).
 //!
 //! # Two-Tier Design
 //! 1. **Compiler-native records (`#![blaze::records]`)**: backed by `blaze_ty::record_ty` and

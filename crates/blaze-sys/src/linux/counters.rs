@@ -117,7 +117,6 @@ pub fn perf_counters_open() -> Result<PerfCounters, Errno> {
 /// reads `size` bytes and zero-extends the rest; [`perf_event_open`] writes `size` itself
 /// (this struct's). Unions and bit fields are kept as the kernel's words: the
 /// bit fields are [`PerfEventAttr::flags`] ([`PerfAttrFlags::bits`]).
-/// replaces ix_prof::perf::Attr (a private copy; the libc crate has no perf_event_attr)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(C)]
 pub struct PerfEventAttr {
@@ -214,7 +213,6 @@ const _: () = {
 flag_set! {
     /// `perf_event_attr`'s bit fields (linux/perf_event.h), as [`PerfEventAttr::flags`] holds
     /// them.
-    /// replaces ix_prof::perf's private EXCLUDE_KERNEL, EXCLUDE_HV, FREQ, SAMPLE_ID_ALL, EXCLUDE_CALLCHAIN_KERNEL, USE_CLOCKID, CONTEXT_SWITCH (the libc crate has none)
     PerfAttrFlags: u64 {
         /// `disabled`: off until enabled.
         DISABLED = 1 << 0;
@@ -255,7 +253,6 @@ flag_set! {
 
 flag_set! {
     /// `perf_event_open`'s flags (`PERF_FLAG_*`).
-    /// replaces ix_prof::perf's private PERF_FLAG_FD_CLOEXEC (the libc crate has none)
     PerfOpenFlags: usize {
         /// `PERF_FLAG_FD_NO_GROUP`.
         FD_NO_GROUP = 1 << 0;
@@ -325,7 +322,7 @@ mod perf_event_open_tests {
     use super::{PerfAttrFlags, PerfEventAttr, PerfOpenFlags, perf_event_open};
     use crate::Errno;
 
-    /// A user-only task clock of this thread, the event ix-prof's sampler opens: a descriptor,
+    /// A user-only task clock of this thread, the event a perf sampler opens: a descriptor,
     /// or one of the refusals a kernel or container gives, never another error.
     #[test]
     fn a_task_clock_opens_or_is_refused() {

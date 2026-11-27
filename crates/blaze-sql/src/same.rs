@@ -304,7 +304,6 @@ fn expr<A: Allocator, B: Allocator>(a: &Expr<'_, A>, b: &Expr<'_, B>, depth: u32
         }
         // The subset's comparison: a query-grammar form is never the same as anything, itself
         // included, so no subset rule (`group by` cover, `distinct` order) ever matches one.
-        // blaze-rel compares its bound plan expressions instead.
         ExprKind::Analytic(_) => false,
     }
 }

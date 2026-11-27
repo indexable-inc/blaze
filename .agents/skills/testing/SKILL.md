@@ -269,13 +269,13 @@ disk).
 A DST is fast enough for the merge gate at its default case count, and runs long with
 `BLAZE_SIM_SEEDS`.
 
-### Worked example: blaze-profile's history
+### Worked example: the profile's history (deleted 2026-11-27)
 
-blaze-profile keeps a history on disk (docs/profiling.md): `manifest.json`, rewritten to a hidden
-name and renamed over the last under `manifest.lock`, is the one commit point of a flush, a
-merge and a retire (`crates/blaze-profile/src/history/manifest.rs`, `retire.rs`, `pin.rs`); and
-the flight recorder's postmortem rings are mmapped, so a crashed daemon's last events survive
-(`crates/blaze-profile/src/flight/postmortem.rs`). On 2026-11-04 a code review of this code, which
+The profile crate (deleted on 2026-11-27 with the rest of the profile, end-state.md D178) kept a
+history on disk: `manifest.json`, rewritten to a hidden name and renamed over the last under
+`manifest.lock`, was the one commit point of a flush, a merge and a retire; and the flight
+recorder's postmortem rings were mmapped, so a crashed daemon's last events survived. The code is
+gone; the lesson stands. On 2026-11-04 a code review of this code, which
 had landed with tests, found eight bug classes. None of its tests could have caught them, and
 each maps to a DST capability that does:
 
@@ -290,17 +290,17 @@ each maps to a DST capability that does:
 | A lost `flushed` update when a ring moves between two atomics: a writer's store lands between the mover's load and its store | A switch point at every atomic operation (`blaze-check`), plus what a crash keeps of a mapped ring (not modelled yet) |
 | Recovery holds `manifest.lock` while it walks the directory, so a daemon that starts during it blocks | Multi-process restart on the virtual clock with a bounded-progress oracle: the second daemon's first answer arrives within its bound (`hold_lists`/`slow_writes` today; a second process once the disk holds several) |
 
-Since 2026-11-04 the writer is a sans-IO core (`crates/blaze-profile/src/history/files.rs`,
-marked `#![blaze::sans_io]`; `manifest.rs`, `retire.rs`, `compact.rs` and `merge.rs` too) driven
-by `history/drive.rs`, and its DST is `history/files/tests.rs`: it draws flushes, build ends
+From 2026-11-04 the writer was a sans-IO core (`history/files.rs`, marked
+`#![blaze::sans_io]`; `manifest.rs`, `retire.rs`, `compact.rs` and `merge.rs` too) driven by
+`history/drive.rs`, and its DST was `history/files/tests.rs`: it drew flushes, build ends
 (merges), crashes at a completion count and reopens (recovery), with swarm faults
-(`fail_one_in`, `fill` for ENOSPC, `fail_syncs`, a held `manifest.lock`), and its oracle is that
+(`fail_one_in`, `fill` for ENOSPC, `fail_syncs`, a held `manifest.lock`), and its oracle was that
 after any crash and reopen the rows in listed files plus the rows recovered equal the rows
 recorded, each once, no listed file is missing or torn, and the history always opens. Its
-planted bugs (`files::Plant`) are the first two rows of the table: no sync before a rename, and
+planted bugs (`files::Plant`) were the first two rows of the table: no sync before a rename, and
 a flush's consumption marked after its commit.
 
-The full DST for it draws records, flushes, merges, retires, pins, reads and restarts, crashes at any
+The full DST for such a writer draws records, flushes, merges, retires, pins, reads and restarts, crashes at any
 point, and checks: every row recorded and flushed appears exactly once; no file a live pin's
 generation lists is deleted; a reader opened after any crash sees only listed files; a restart
 reaches its first answer within its bound. Each row of the table is a planted bug it must catch.

@@ -45,7 +45,6 @@ is; "measure" rows name the measurement that decides them, below the tables.
 | `Durable::Yes` is `F_FULLFSYNC` (std's `sync_all`): the file, then its directory after the rename (`crates/blaze-core/src/fs.rs`); `Effect::Sync` (`crates/blaze-core/src/threads.rs`) | `F_BARRIERFSYNC` for the file's sync inside `write_atomically`, the directory's staying `F_FULLFSYNC` | Half the drive-cache flushes of a durable write: the barrier orders the bytes before the rename, and the directory's full flush that follows puts both on the media | Durability code: needs its design and a DST first (rule `dst-not-review`); barrier support is the drive's | Measure (M4). `Effect::Sync` and a rename's directory sync stay `F_FULLFSYNC` |
 | `Durable::Started` (`Effect::WriteBack`) is `fsync` (`crates/blaze-core/src/fs.rs`) | the same | Bytes to the drive, no cache flush: what a cheap clone needs | none | In use |
 | Large aligned writes, and files opened to bypass the cache, set `F_NOCACHE` (`crates/blaze-core/src/fs.rs`) | `F_RDADVISE` / `F_RDAHEAD` for sequential reads | Records are read in place (small ones by `pread`, large arrays mapped read-only), so read-ahead is the page cache's | none | Keep; measure (M5) only if a cold pack read shows in spans |
-| The flight recorder's post-mortem file is `F_PREALLOCATE`d (`crates/blaze-profile/src/flight/postmortem.rs`) | the same; `F_PUNCHHOLE` to give ranges back | Packs are immutable and removed whole; nothing punches holes | none | In use; `F_PUNCHHOLE` not used |
 | Watches are by path (FSEvents); the journal resumes by event ID | `openbyid_np`, `fsctl`, `F_GETPATH`, `searchfs` | File IDs survive renames, but FSEvents already names what moved; `searchfs` is not on APFS's fast path | `openbyid_np` needs the volume's ID and is refused in the sandbox | Not used |
 
 ## Watching
@@ -88,8 +87,8 @@ is; "measure" rows name the measurement that decides them, below the tables.
 
 | Today | Better call | Buys | Risk | Decision |
 |---|---|---|---|---|
-| The sampler stops each thread (`thread_suspend`, `thread_get_state`, `thread_resume`; `crates/blaze-profile/src/sampler/macos.rs`) | kperf, `kdebug_trace` | Kernel-side sampling | kperf and ktrace need root | In use; kperf not used |
-| A span's CPU is `clock_gettime(CLOCK_THREAD_CPUTIME_ID)` (`crates/blaze-profile/src/lib.rs`) | `thread_selfcounts` (private) | Instructions and cycles a span beside its time | Private, its struct versioned | Measure (M8) |
+| The sampler stops each thread (`thread_suspend`, `thread_get_state`, `thread_resume`; `crates/blaze-std/src/telemetry/sampler/mac.rs`) | kperf, `kdebug_trace` | Kernel-side sampling | kperf and ktrace need root | In use; kperf not used |
+| A span's readings at `Level::Detail` are one `thread_info` a snapshot (`crates/blaze-std/src/telemetry.rs`) | `thread_selfcounts` (private) | Instructions and cycles a span beside its time | Private, its struct versioned | Measure (M8) |
 | Monotonic time is std's `Instant` (`mach_absolute_time` underneath) | `mach_continuous_time` | Counts sleep; a build's deadlines should not | none | Keep |
 | Workers run at `user-initiated`, or `default` when lowered (`crates/blaze-graph/src/pool.rs`, `worker_qos`) | `pthread_set_qos_class_self_np` to `utility` or `background` around an idle-class job | Idle work on efficiency cores | A parked job resumes on any worker, so the class must be set and restored per job; `utility` starved on a loaded host | Measure (M9) |
 | Nothing reads the CPU number | `pthread_cpu_number_np` | Nothing blaze keys on | none | Not used |

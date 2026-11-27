@@ -2,7 +2,7 @@ import Blaze.Mir.Opt.SlotExec
 
 /-!
 A statement does the same whatever a slot of another frame holds: global dead-store
-elimination (ledger V11), piece (a).
+elimination, piece (a).
 
 `Opt/SlotExec.lean` is about a slot of the running frame, which a statement must not mention.
 A slot of a frame that is not running needs no such condition: every place of a statement is

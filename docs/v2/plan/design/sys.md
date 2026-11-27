@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: The bottom of bstd (ledger row S4). One crate, blaze-sys, is the only home of system calls (Linux by raw call with no libc, macOS through libSystem, Windows through ntdll and kernel32; all three modules exist, Windows's keeping the seam's place while Windows is out of scope); the runtime pieces Rust's std provided each get an owner in `bstd::rt` (not built: bstd's rt.rs still takes them from std); blaze-core moves onto blaze-sys call by call behind a ban list, harness/v2/nostd.json, that is the progress meter; wave 4 puts the users' std on blaze-sys.
+summary: The bottom of bstd. One crate, blaze-sys, is the only home of system calls (Linux by raw call with no libc, macOS through libSystem, Windows through ntdll and kernel32; all three modules exist, Windows's keeping the seam's place while Windows is out of scope); the runtime pieces Rust's std provided each get an owner in `bstd::rt` (not built: bstd's rt.rs still takes them from std); blaze-core moves onto blaze-sys call by call behind a ban list, harness/v2/nostd.json, that is the progress meter; wave 4 puts the users' std on blaze-sys.
 date: 2026-11-10
 ---
 # blaze-sys and the runtime under bstd
@@ -137,7 +137,7 @@ What a Windows build would lack, by reading the tree on 2026-11-20 (none of it r
 - Third-party build scripts. blake3, psm, stacker and zstd-sys want a C compiler for msvc, so a
   Windows check from a Mac stops at them and cannot reach any crate above them. Those packages
   are on D180's list; until they are gone the Windows check covers blaze-sys, blaze-mem,
-  blaze-core, blaze-check, blaze-profile, blaze-graph and blaze-inproc-rt only.
+  blaze-core, blaze-check, blaze-graph and blaze-inproc-rt only.
 - The toolchain shelf. The pinned nightly's answers are recorded for `x86_64-pc-windows-msvc`
   and `aarch64-pc-windows-msvc` (blaze-toolchain `side.rs`), but no shelf entry, linker or CRT
   is fetched for a Windows host.
@@ -163,9 +163,9 @@ blaze-core's drivers move call by call from `libc` and `std::fs` to blaze-sys be
 boundaries they have, so the tree compiles at every save point (rule whole-ports). The ban:
 `libc::`, `std::fs`, `std::net`, `std::thread`, `std::process` and `std::time::{Instant,
 SystemTime}` are named only in blaze-sys. `harness/v2/nostd.json` lists every file (blaze-core,
-bstd) or crate (the rest, S3) that still names one, with why, and `harness/v2/nostd.py` holds
+bstd) or crate (the rest) that still names one, with why, and `harness/v2/nostd.py` holds
 the list to the tree: `progress` fails when an unlisted file names a banned path or a listed one
-no longer does; `check`, S4's ledger check, passes only when the list is empty, every crate is
+no longer does; `check` passes only when the list is empty, every crate is
 `#![no_std]`, none says `extern crate std`, and the lock file's closure is blaze's crates and
 packages known to be `#![no_std]`. The list is the progress meter.
 
@@ -273,7 +273,7 @@ for blaze's own helper binaries (static, own entry: the runtime pieces of "Runti
 Every Linux wrapper has a real-kernel test with `libc`'s same call as the oracle where one
 exists (`crates/blaze-sys/src/linux/tests.rs`), including a child by `clone3` reaped by `waitid`
 and `io_uring_setup` under a seccomp filter giving the typed `ENOSYS`, with its control. The
-shared script every driver must end as the simulation does (ledger V4) gains a cut, a ranged
+shared script every driver must end as the simulation does gains a cut, a ranged
 read, a sync and an append, and two planted bugs are caught:
 `the_oracle_catches_a_short_write_not_continued`,
 `the_oracle_catches_an_errno_mapped_to_the_wrong_error`.

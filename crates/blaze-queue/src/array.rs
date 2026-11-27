@@ -79,7 +79,7 @@ impl<T> ArrayQueue<T, Global> {
     ///
     /// Deprecated: the global heap is an ambient allocator (D170 C1). Use
     /// [`ArrayQueue::new_in`] with the caller's allocator. Kept for this wave's callers alone
-    /// (blaze-core cgroup.rs and chan.rs, ix-prof alloc.rs).
+    /// (blaze-core cgroup.rs and chan.rs).
     ///
     /// # Panics
     ///

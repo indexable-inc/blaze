@@ -25,7 +25,7 @@
 //! once and carried out, and a statement's names live as long as the statement.
 //!
 //! The waits here are SQLite's own file IO and locks, inside its calls (`sqlite3_step` above
-//! all); they open no span yet. When `blaze-trace` lands (docs/v2/plan/design/no-tracing.md),
+//! all); they open no span yet. With `blaze-trace` (docs/v2/plan/design/end-state.md, D178),
 //! each step and prepare opens one named by the statement's text (every-wait-says-what). How a
 //! fiber runs a blocking call into C SQLite is bstd's rule for blocking calls, not decided here.
 //!

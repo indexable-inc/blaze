@@ -51,9 +51,6 @@ the segments a first build needs; key lists signed by an anchor key. The layout,
 and the trust chain are `crates/blaze-remote/src/lib.rs`'s doc. `cmd` holds `blaze cache push |
 pull | status | keys`, but blaze-cli dispatches none of them, so no command reaches this path.
 
-Also in the tree and called by nothing: `crates/blaze-pack` (transfer packs) and `tools/remote-cache`
-(a Cloudflare Worker gateway; no client in the tree speaks to it).
-
 ## Settings
 
 The bucket path's settings (`crates/blaze-remote/src/settings.rs`), read once at the entry point:
@@ -75,5 +72,7 @@ The bucket path's settings (`crates/blaze-remote/src/settings.rs`), read once at
 Secrets are held as `Secret`, shown as `<redacted>`; an error about one names the setting, never
 its value.
 
-The gateway's design and the packs' (the sections `tools/remote-cache` and `crates/blaze-pack`
-cite) are in git: `git show f602cdc99f:docs/remote-cache.md`.
+The transfer packs and the Cloudflare Worker gateway, which nothing called, were deleted on
+2026-11-27; their design is in git (`git show f602cdc99f:docs/remote-cache.md`), and so is their
+code (`git show 50dac12595:crates/blaze-pack/src/lib.rs`,
+`git show 50dac12595:tools/remote-cache/README.md`).

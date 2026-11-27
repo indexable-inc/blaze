@@ -1,4 +1,4 @@
-//! The query grammar (docs/v2/plan/design/query.md): statements of [`crate::query`], parsed by
+//! The query grammar: statements of [`crate::query`], parsed by
 //! the subset's [`Parser`] with its lexer in [`Grammar::Query`]. Expressions are the subset's,
 //! through the same precedence climbing; the forms only this grammar has (subqueries, `exists`,
 //! `filter`, `over`, `::`, `@table`, `is [not] distinct from`) come in through

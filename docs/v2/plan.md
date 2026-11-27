@@ -1,16 +1,16 @@
 ---
 status: plan
-summary: The plan for blaze, whole, on one page. The goal, the rules, the one design every part shares, the targets, and how the work is run; the ledger of objectives is plan/objectives.md.
+summary: The plan for blaze, whole, on one page. The goal, the rules, the one design every part shares, the targets, and how the work is run; decisions are the rows of plan/decisions.json.
 date: 2026-11-26
 ---
 # blaze: the plan
 
 blaze is the Rust build system and compiler for coding agents: an edit comes back as running code
 and a structured result in tens of milliseconds, from records every checkout on the machine
-shares; a command answers and exits ([bottom](plan/design/bottom.md)). This page is the whole plan. Three more things hold the rest:
+shares; a command answers and exits ([bottom](plan/design/bottom.md)). This page is the whole plan. Four more things hold the rest:
 
-- **[plan/objectives.md](plan/objectives.md)**: every objective, the check that decides it, and
-  where it stands. Work is picked from there and nowhere else.
+- **[plan/decisions.json](plan/decisions.json)**: every decision, one row each, with what was
+  recommended, why, and where it stands. Work is picked from its rows and the specs below.
 - **[plan/bounds.md](plan/bounds.md)**: the speed-of-light bounds a program measures.
 - **[plan/invariants.md](plan/invariants.md)**: every invariant the code states, with its check.
 - **`plan/design/`**: one spec per design that is not fully built and needs more than a paragraph
@@ -154,11 +154,9 @@ Spec: [structured-output](plan/design/structured-output.md).
 
 ### 10. One span stream
 
-Every stretch of worker time and every wait is a span in one recorder (blaze's own, not
-`tracing`). The stream is kept as Parquet history, and every reader reads that one stream.
-Specs: [profiling](../profiling.md), [ix-prof-format](../ix-prof-format.md),
-[no-tracing](plan/design/no-tracing.md), [profile-history](plan/design/profile-history.md),
-[http3-sans-io](plan/design/http3-sans-io.md), [perf-history](plan/design/perf-history.md).
+Every stretch of worker time and every wait is a span in one recorder (blaze-trace, blaze's own,
+not `tracing`), and what a run keeps is bstd's one telemetry report, which every reader reads.
+Spec: [end-state](plan/design/end-state.md), D178.
 
 ### 11. Proof by check, not by review
 
@@ -253,40 +251,28 @@ The old way (70 agent windows, lanes that owned paths, request files between the
 compiled until every lane said done) produced code nobody had run and notes nobody could read.
 This replaces it.
 
-**The ledger decides.** The ledger is data, `plan/objectives.json`: one row per objective, with
-the outcome, the check that decides it as a command, the paths it touches, what it needs first,
-and its status. `scripts/src/bin/ledger.rs` runs a row's check and writes the status with the commit
-(`run`), says what to work on next without two tasks colliding (`pick`), and writes the table
-people read, [objectives.md](plan/objectives.md) (`write`). Nobody types "done" and nobody argues
-it. An objective without a check says which one is missing, and writing it is the first part of
-the work; until then the row cannot be met.
+**Decisions are rows.** Each decision is a row of [decisions.json](plan/decisions.json): what was
+decided, what was recommended, why, and where it stands. A later row that reverses an earlier one
+says so.
 
-**Every agent has one task.** A task is an objective id, or a named piece of one. An agent with no
-task is not started; a task says its outcome and its check in one line each. The agent app's
-sidebar lists tasks with their agents under them, so a person reads what is being done, not which
-processes exist ([tasks](plan/design/tasks.md)).
+**Every agent has one task.** A task is a named piece of a decision or of a design's unbuilt part,
+with its outcome and the check that decides it, each in one line, the paths it may touch and what
+"done" prints. An agent with no task is not started. The agent app's sidebar lists tasks with their
+agents under them ([tasks](plan/design/tasks.md)).
 
 **The loop**, run by one coordinator (the main agent of a session):
 
-1. **Measure.** `ledger` `run` on main's exact tree, for the rows about to be worked on. Never
-   start from a status someone remembered.
-2. **Pick.** `ledger` `pick` gives rows that are ready and whose paths do not overlap, in the
-   ledger's order; take fewer when one is large.
-3. **Brief.** Each task gets the objective's row, the section of this page and the spec it
-   belongs to, the paths it may touch, and what "done" prints. A row that needs a design gets
-   its spec written first, by the same task that then builds it.
-4. **Write.** Workers only write and commit, all in one directory (no worktree per lane). They
-   build and run nothing. Use a worker only when the piece is independent and large enough to pay for its
-   context; the coordinator does small pieces itself.
-5. **Integrate once.** The coordinator builds the one tree once, on the Mac, and admits what
-   passes: one `blaze check` and one `blaze test`, then each row's check.
-6. **Land** what passes, one pull request per objective, through `land.py`. What fails goes back
-   to its worker once with the check's output; a second failure is written into the row as what
-   blocks it, and the task stops.
-7. **Ratchet.** The release train runs every met row again (`run` with `only: "met"`) and fails
-   when one is no longer met, so nothing regresses silently. Then go to 1.
+1. **Measure** on main's exact tree: run the task's check before starting, never trust a
+   remembered status. A task with no check gets one written first.
+2. **Brief** each task with its decision or spec, the paths it may touch and what "done" prints.
+3. **Write.** Workers only write and commit, all in one directory (no worktree per lane), and
+   build and run nothing; the coordinator does small pieces itself.
+4. **Build once.** The coordinator builds the one tree once, on the Mac, and admits what passes:
+   one `blaze check`, one `blaze test`, then each task's check. What fails goes back to its worker
+   once with the output; a second failure is recorded as what blocks it, and the task stops.
+5. **Land** what passes through a pull request (`land.py`), and record the decision as a row.
 
-**Docs stay small.** This page, the ledger, the bounds and one spec per unbuilt design. No lane
+**Docs stay small.** This page, the decisions, the bounds and one spec per unbuilt design. No lane
 notes, no pass reports, no indexes of indexes: what was done is the pull request and the commit; a
 measurement worth keeping is a `record` under `fed1eb428d:docs/reports/`. A design that changes edits its
 spec in place. When a section here stops being true, fix it in the same change.

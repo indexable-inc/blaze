@@ -74,7 +74,6 @@ blaze-flow-lower	0	0	8
 blaze-fmt	4	0	90
 blaze-format	0	0	8
 blaze-format-core	0	0	8
-blaze-format-tiers	1	0	40
 blaze-fuzz	0	0	8
 blaze-git	0	0	1
 blaze-git-fetch	0	0	1
@@ -104,7 +103,6 @@ blaze-lint-defs	0	0	8
 blaze-lir	0	0	8
 blaze-lower	0	0	86
 blaze-macro-run	0	0	41
-blaze-malloc	0	0	1
 blaze-manifest	3	0	86
 blaze-math	0	0	1
 blaze-mem	1	0	1
@@ -113,20 +111,17 @@ blaze-memo-macros	3	0	5
 blaze-native	0	0	8
 blaze-new	1	0	87
 blaze-own	0	0	1
-blaze-pack	0	0	62
 blaze-parquet	1	0	36
 blaze-pbr	0	0	1
 blaze-pg	1	0	1
 blaze-preview	0	0	1
 blaze-proc-macro	3	0	228
 blaze-producers	0	0	8
-blaze-profile	4	0	151
 blaze-protocol	1	1	8
 blaze-queue	0	0	1
 blaze-real	0	0	1
 blaze-reclaim	0	0	1
 blaze-record	0	0	8
-blaze-rel	0	0	1
 blaze-remote	1	0	66
 blaze-report	2	0	62
 blaze-resolve	3	1	80
@@ -149,7 +144,6 @@ blaze-spin	0	0	1
 blaze-sqlite	1	0	34
 blaze-squeeze	1	0	40
 blaze-ssh	0	0	1
-blaze-stage	0	0	86
 blaze-std	4	0	109
 blaze-store-check	0	0	8
 blaze-surface	0	0	8
@@ -159,7 +153,6 @@ blaze-sysmon	0	0	1
 blaze-tab	0	0	1
 blaze-tar	0	1	1
 blaze-term-api	0	0	1
-blaze-test-reach	0	0	1
 blaze-text	0	0	1
 blaze-tier	0	0	8
 blaze-tiling	0	0	1
@@ -179,11 +172,9 @@ blaze-vt	0	0	1
 blaze-wasi	1	0	124
 blaze-watch	0	0	1
 blaze-world	0	0	228
-blaze-world-api	0	0	8
 blaze-zstd	0	0	1
 edit-applier	0	0	37
 intern	0	0	8
-ix-prof	9	0	110
 parser	0	0	41
 rustc_abi	2	0	9
 scripts	1	0	86

@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Error sets (edition change 2, ledger row E3). A function's error type is the exact set of failures it may return, written `A | B` under `#![blaze::error_unions]`. `?` widens a member or a smaller set into a larger one, a set the body's failures do not fit is an error naming the call, the member and the set, a `match` covers every member, `Result<T, _>` infers the set, and the set costs what the hand-written enum costs. Built on the new layer: the type, widening, parsing, matching and inferred sets. Left: the diagnostic's words, the bstd port (its signature list is here) and a member order that survives a rename.
+summary: Error sets (edition change 2). A function's error type is the exact set of failures it may return, written `A | B` under `#![blaze::error_unions]`. `?` widens a member or a smaller set into a larger one, a set the body's failures do not fit is an error naming the call, the member and the set, a `match` covers every member, `Result<T, _>` infers the set, and the set costs what the hand-written enum costs. Built on the new layer: the type, widening, parsing, matching and inferred sets. Left: the diagnostic's words, the bstd port (its signature list is here) and a member order that survives a rename.
 date: 2026-11-12
 ---
 # Error sets
@@ -142,8 +142,8 @@ members, with a `From` impl per member.
 | adding a member | the signature's type changed: its direct readers rerun | the same; other members' variants may move, in code that reruns anyway | not measured |
 
 What no design here reaches: a rename or a move of a member's item changes its identity, so
-the sets that hold it may be reordered and their users recompiled (ledger T4 does not hold for
-a member). Ordering by an identity that survives a rename is the way out and is not built.
+the sets that hold it may be reordered and their users recompiled (for a member, a rename or a
+move is not free). Ordering by an identity that survives a rename is the way out and is not built.
 
 Losing alternatives, each in a line:
 

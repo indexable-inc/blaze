@@ -14,7 +14,7 @@
 
 #![blaze::sans_io]
 
-/// The query grammar's statements and forms (query.md), as more methods of [`Parser`].
+/// The query grammar's statements and forms ([`crate::query`]), as more methods of [`Parser`].
 mod script;
 
 pub use self::script::{parse_query, parse_script};

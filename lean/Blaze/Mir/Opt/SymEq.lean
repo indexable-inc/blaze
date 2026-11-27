@@ -18,7 +18,7 @@ by `symEq`: the script is the block map, symbolic equality the rest.
 
 What it accepts beyond the script validator: a pass that rewrites operands inside a block
 and keeps every store (copy and constant propagation of uses). It does not accept a store or
-a local removed: there the states differ across steps (ledger V11).
+a local removed: there the states differ across steps (global dead-store elimination).
 -/
 
 namespace Blaze.Mir

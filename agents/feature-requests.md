@@ -93,3 +93,31 @@ Format for new entries:
 - **Kind**: `strictness/lint` + `tooling`
 - **Friction / Bug**: The smoke gives each project a fresh `BLAZE_HOME` but passes the machine's `HOME`; the release blaze wrote `~/.blaze/v2/{runs,journal,test}` during the run. A second smoke of the same hello-world code on the same Mac then printed `ran 0: 0 passed ... 1 reused from kept results` (cold step 0.5 s instead of 3 to 4 s) and the harness, which rightly demands one executed test, gave `verdict FAILED` for a tree whose only change was Markdown.
 - **Request**: One `Home` value names every place (D162): with `BLAZE_HOME` set nothing is read or written under `HOME`; the smoke asserts its `BLAZE_HOME` is the only directory the run touched.
+
+### 2026-11-27 — `blaze run` cannot start the gate's own scripts
+
+- **Area**: `crates/blaze-cli` (`run`, `check`), `scripts`, `syntax`, `tools/astlog/*`
+- **Kind**: `tooling`
+- **Friction / Bug**: `blaze run -q -p scripts --bin docs -- check` with the release blaze of 2026-11-27 exits 125 after 38 s without starting the program. `blaze check` on the same tree reports 218 errors (mostly `std-not-bstd` on `scripts`, `syntax` and `tools/astlog/*`), 1,438 items unchecked, and 8 heads failing on `icu_properties` paths. So the gate's scripts can only be built with cargo, against rule 2 (blaze builds blaze).
+- **Request**: `blaze run` of a workspace binary whose crates are on the `std-not-bstd` ratchet runs it (the ratchet is a lint, not a refusal to build), the `icu_properties` heads resolve, and the gate runs its scripts through `blaze run`.
+
+### 2026-11-27 — The site's Flecs build fails on `const-macro-trees.flecs`
+
+- **Area**: `site/content/updates/const-macro-trees.flecs`, `flecs-doc.wasm`
+- **Kind**: `tooling` + `diagnostic`
+- **Friction / Bug**: The site does not build: `flecs-doc.wasm` fails at line 9 (`(Requires, site.updates."const-macros")`) and again at line 19 of that file.
+- **Request**: Fix the reference (or the quoted-name lookup it trips), and run the site build in CI on every change to `site/content/`, with an error that names the entity that does not resolve.
+
+### 2026-11-27 — Deleting a crate or a doc leaves rows and citations nothing checks
+
+- **Area**: `tools/ratchets/*.txt`, `scripts/layouts.txt`, `harness/v2/nostd.json`, `crates/blaze-report/tests/{prints,backticks}.txt`, `tools/ratchets/dups-not.json`, the hot crates' `clippy.toml` bans, `crates/blaze-ctx/src/tree.rs`, `docs/v2/plan/design/caches.md`, `agents/kb/facts.jsonl`, `record` docs, code comments
+- **Kind**: `tooling` + `strictness/lint`
+- **Friction / Bug**: Deleting ten crates (D216, D218) meant hand-editing about twenty per-crate tables, a `match` of crate names in blaze-ctx, caches.md's domain lists (a domain string, `=blaze-bench-protocol`, only the deleted crate wrote), clippy bans on `blaze_profile::` paths, and about fifty comments citing deleted crates, paths (`crates/blaze-profile/src/schema.rs`) or docs (`no-tracing.md`, `profiling.md`). Nothing fails for a row or a citation of a path that no longer exists, so every missed one stays: `agents/kb/facts.jsonl` facts anchored on deleted files, and `record` docs (`docs/support.md`) linking to deleted docs.
+- **Request**: Every per-crate table fails on a row whose crate directory does not exist (and its `write` drops it); blaze-ctx derives its crate grouping from data, not a Rust `match`; one "names a tracked path" check covers comments, `clippy.toml` reasons, kb facts and every doc status including `record`; and a `git rm -r crates/<x>` helper lists what still names it.
+
+### 2026-11-27 — A test that reads another crate's files, and a script that calls a command the CLI does not have
+
+- **Area**: `crates/blaze-sql/src/tests/query.rs` (deleted), `scripts/src/bin/smoke.rs`, `crates/blaze-script/src/engine.rs`
+- **Kind**: `strictness/lint`
+- **Friction / Bug**: blaze-sql's test did `include_str!("../../../blaze-profile/sql/views.sql")`, so a crate's tests depended on another crate's files with no dependency edge to say so; the graph showed blaze-profile with no users while one existed. The smoke harness diagnosed a failed step with `blaze debug sql`, a command the CLI no longer has, so its diagnosis always failed; blaze-script's list of expected commands still names `debug sql` and `daemon`.
+- **Request**: A lint refuses `include_str!`/`include_bytes!` of a path outside the crate's own directory; a script's `blaze` subcommands are checked against blaze-cli's one command table at build time.

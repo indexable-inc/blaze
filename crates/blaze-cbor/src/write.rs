@@ -1,4 +1,4 @@
-//! Heads appended in their shortest form (moved from blaze-pack's and blaze-watch's `cbor`).
+//! Heads appended in their shortest form (moved from blaze-watch's `cbor`).
 
 use core::alloc::Allocator;
 
