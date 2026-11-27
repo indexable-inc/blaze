@@ -411,7 +411,7 @@ dependencies = [\"cc\"]
         let files = blaze_proc_macro::script_unit::script_files_digest(&ws, "build.rs").expect("sha3-asm files digest");
         std::fs::write(
             module.join("identity"),
-            format!("name sha3-asm\nversion 0.1.0\nfeatures \nfiles {files}\ntarget aarch64-apple-darwin\n"),
+            format!("{}\nname sha3-asm\nversion 0.1.0\nfeatures \nfiles {files}\ntarget aarch64-apple-darwin\n", blaze_proc_macro::script_unit::MODULE_HEADER),
         )
         .unwrap();
         let program = module.join("script.bin");

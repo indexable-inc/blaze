@@ -389,10 +389,9 @@ pub fn records_named(store: &Path, name: &str, version: &str) -> Result<Vec<(Pat
 /// (scripts proc_macro_modules build_scripts.rs `library`), the same digest of the same file.
 const SHIM: &[u8] = include_bytes!("../guest/script_process.rs");
 
-/// Current build-script wasm module identity header (`blaze build-script module 4`): bumped when
-/// build-script compilation semantics change (e.g., implicit sysroot rules for blaze-edition
-/// build scripts) so stale cached wasm modules are never reused and never collide as `Ambiguous`
-/// with newly compiled ones.
+/// Current build-script module identity header (`blaze build-script module 4`): bumped when
+/// build-script compilation semantics or record format change so stale cached records (wasm or
+/// native) are never reused and never collide as `Ambiguous` with newly compiled ones.
 pub const MODULE_HEADER: &str = "blaze build-script module 4";
 
 /// The identity line a wasm module must carry to be run by this host: `shim <sha256 hex>`.
@@ -400,8 +399,8 @@ pub fn shim_line() -> String {
     format!("shim {}", crate::module::sha256_hex(SHIM))
 }
 
-/// The record whose identity names `name`, `version`, `features` and, for `host`, `target
-/// <host>`; for `None`, one whose header is [`MODULE_HEADER`], with no `target` line and this
+/// The record whose header is [`MODULE_HEADER`] and whose identity names `name`, `version`,
+/// `features` and, for `host`, `target <host>`; for `None`, one with no `target` line and this
 /// host's [`shim_line`] (a wasm module). Two such records are a typed refusal, never the first in
 /// the listing's order.
 fn module_where(
@@ -421,17 +420,15 @@ fn module_where(
     let deps_line = deps.map(|hex| format!("deps {hex}"));
     let shim = shim_line();
     let mut fits = records(store)?.into_iter().filter(|(_, identity)| {
-        // A wasm module answers only with the current module header and shim this host speaks to:
-        // one built with an older header or shim is not this ask's record, so a stale module is a
-        // named miss (`NoModule`, whose words show the differing line), never a run with stale
-        // semantics, and never a second record beside its rebuild (`Ambiguous`).
+        // Every build-script record (wasm or native) must carry the current `MODULE_HEADER`, and
+        // a wasm module must also carry the shim this host speaks to: one built with an older
+        // header or shim is not this ask's record, so a stale record is a named miss (`NoModule`,
+        // whose words show the differing line), never a run with stale semantics, and never a
+        // second record beside its rebuild (`Ambiguous`).
+        let header_fits = identity.lines().next() == Some(MODULE_HEADER);
         let runner_fits = match &target {
             Some(want) => identity.lines().any(|l| l == want),
-            None => {
-                identity.lines().next() == Some(MODULE_HEADER)
-                    && !identity.lines().any(|l| l.starts_with("target "))
-                    && identity.lines().any(|l| l == shim)
-            }
+            None => !identity.lines().any(|l| l.starts_with("target ")) && identity.lines().any(|l| l == shim),
         };
         let files_fits = match &files_line {
             Some(want) => identity.lines().any(|l| l == want),
@@ -441,7 +438,7 @@ fn module_where(
             Some(want) => identity.lines().any(|l| l == want),
             None => !identity.lines().any(|l| l.starts_with("deps ")),
         };
-        runner_fits && files_fits && deps_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
+        header_fits && runner_fits && files_fits && deps_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
     });
     let Some((first, _)) = fits.next() else { return Ok(None) };
     match fits.next() {
@@ -979,6 +976,37 @@ mod tests {
         )
         .expect("write v4 identity");
         let hit = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup v4");
+        assert_eq!(hit, Some(v4_dir));
+
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn native_lookup_requires_current_module_header_and_ignores_stale_v3() {
+        let store = std::env::temp_dir().join(format!("blaze-script-unit-native-header-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let host = "aarch64-apple-darwin";
+        let v3_dir = store.join("build-script/modules/stale-native-v3");
+        std::fs::create_dir_all(&v3_dir).expect("create native v3 dir");
+        std::fs::write(
+            v3_dir.join("identity"),
+            format!("blaze build-script module 3\nname libproc\nversion 0.14.11\nfeatures \ntarget {host}\nbuilder bootstrap\n"),
+        )
+        .expect("write native v3 identity");
+
+        // Stale v3 native record is not matched.
+        let miss = super::module_of_native(&store, "libproc", "0.14.11", &[], host).expect("lookup native v3");
+        assert_eq!(miss, None, "stale v3 native module must not match MODULE_HEADER ({})", super::MODULE_HEADER);
+
+        // Fresh v4 native record coexisting beside stale v3 matches uniquely (never Ambiguous).
+        let v4_dir = store.join("build-script/modules/fresh-native-v4");
+        std::fs::create_dir_all(&v4_dir).expect("create native v4 dir");
+        std::fs::write(
+            v4_dir.join("identity"),
+            format!("{}\nname libproc\nversion 0.14.11\nfeatures \ntarget {host}\nbuilder bootstrap\n", super::MODULE_HEADER),
+        )
+        .expect("write native v4 identity");
+        let hit = super::module_of_native(&store, "libproc", "0.14.11", &[], host).expect("lookup native v4");
         assert_eq!(hit, Some(v4_dir));
 
         let _ = std::fs::remove_dir_all(&store);

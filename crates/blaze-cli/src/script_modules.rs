@@ -216,9 +216,10 @@ pub(crate) fn run<'b>(
 }
 
 /// The identity lines a lookup asks a record for (what `script_unit::module_where` matches):
-/// name, version, the sorted features, optional `files` and `deps` digests, and for a native run
-/// `target <host>`; for a wasm run, the process shim this binary answers (`script_unit::shim_line`),
-/// so a module built with another is named by its `shim` line.
+/// the current module header (`script_unit::MODULE_HEADER`), name, version, the sorted features,
+/// optional `files` and `deps` digests, and for a native run `target <host>`; for a wasm run,
+/// the process shim this binary answers (`script_unit::shim_line`), so a module built with
+/// another header or shim is named by that line.
 pub(crate) fn asked_lines(
     ran_as: RanAs,
     package: &str,
@@ -231,6 +232,7 @@ pub(crate) fn asked_lines(
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
     let mut lines = std::vec![std::format!("name {package}"), std::format!("version {version}"), std::format!("features {}", sorted.join(","))];
+    lines.push(blaze_proc_macro::script_unit::MODULE_HEADER.to_owned());
     if let Some(hex) = files {
         lines.push(std::format!("files {hex}"));
     }
@@ -239,10 +241,7 @@ pub(crate) fn asked_lines(
     }
     match ran_as {
         RanAs::Native => lines.push(std::format!("target {host}")),
-        RanAs::Wasm => {
-            lines.push(blaze_proc_macro::script_unit::MODULE_HEADER.to_owned());
-            lines.push(blaze_proc_macro::script_unit::shim_line());
-        }
+        RanAs::Wasm => lines.push(blaze_proc_macro::script_unit::shim_line()),
     }
     lines
 }
@@ -276,6 +275,9 @@ mod tests {
         let host = "aarch64-apple-darwin";
         let native = asked_lines(RanAs::Native, "libproc", "0.14.11", &[], host, None, None);
         assert_eq!(differing(&native, RanAs::Native, &libproc).count(), 0);
+        let stale_native_v3 = "blaze build-script module 3\nname libproc\nversion 0.14.11\nfeatures \ntoolchain nightly-2026-10-27\ntarget aarch64-apple-darwin\nbuilder bootstrap\n";
+        let said_native_v3: std::vec::Vec<_> = differing(&native, RanAs::Native, stale_native_v3).collect();
+        assert_eq!(said_native_v3, [std::format!("blaze build-script module 3 (asked: {header})")]);
         let shim = blaze_proc_macro::script_unit::shim_line();
         let wasm = asked_lines(RanAs::Wasm, "libproc", "0.14.11", &[], host, None, None);
         let said: std::vec::Vec<_> = differing(&wasm, RanAs::Wasm, &libproc).collect();
