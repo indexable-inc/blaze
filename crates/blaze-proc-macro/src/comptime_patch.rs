@@ -2434,21 +2434,34 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                 let has_source_attr = f.attrs.iter().any(|a| a.path == "source");
                 let is_implicit_source = matches!(f.name.as_deref(), Some("source" | "r#source"));
                 if is_from {
-                    if v.fields.len() != 1 || option_inner_type(&f.ty).is_some() || explicit_source.is_some() {
+                    if v.fields.len() != 1 || explicit_source.is_some() {
                         return None;
                     }
-                    let ctor = match v.shape {
-                        FieldsShape::Named => {
-                            format!("{name} {{ {}: __source }}", f.name.as_deref()?)
+                    let (from_ty, source_expr) = match option_inner_type(&f.ty) {
+                        Some(inner) => {
+                            if inner.starts_with('&') || option_inner_type(inner).is_some() {
+                                return None;
+                            }
+                            (inner, "::core::option::Option::Some(__source)")
                         }
-                        FieldsShape::Tuple => format!("{name}(__source)"),
-                        FieldsShape::Unit => return None,
+                        None => (f.ty.as_str(), "__source"),
                     };
-                    let _ = writeln!(
-                        from_impls,
-                        "#[automatically_derived] impl{impl_g} ::core::convert::From<{}> for {name}{ty_g}{where_c} {{ fn from(__source: {}) -> Self {{ {ctor} }} }}",
-                        f.ty, f.ty
-                    );
+                    match v.shape {
+                        FieldsShape::Named => {
+                            let fname = f.name.as_deref()?;
+                            let _ = writeln!(
+                                from_impls,
+                                "#[automatically_derived] impl{impl_g} ::core::convert::From<{from_ty}> for {name}{ty_g}{where_c} {{ fn from(__source: {from_ty}) -> Self {{ {name} {{ {fname}: {source_expr} }} }} }}",
+                            );
+                        }
+                        FieldsShape::Tuple => {
+                            let _ = writeln!(
+                                from_impls,
+                                "#[automatically_derived] impl{impl_g} ::core::convert::From<{from_ty}> for {name}{ty_g}{where_c} {{ fn from(__source: {from_ty}) -> Self {{ {name}({source_expr}) }} }}",
+                            );
+                        }
+                        FieldsShape::Unit => return None,
+                    }
                     explicit_source = Some((i, f));
                 } else if has_source_attr {
                     if explicit_source.is_some() {
@@ -2528,21 +2541,34 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                     let has_source_attr = f.attrs.iter().any(|a| a.path == "source");
                     let is_implicit_source = matches!(f.name.as_deref(), Some("source" | "r#source"));
                     if is_from {
-                        if v.fields.len() != 1 || option_inner_type(&f.ty).is_some() || explicit_source.is_some() {
+                        if v.fields.len() != 1 || explicit_source.is_some() {
                             return None;
                         }
-                        let ctor = match v.shape {
-                            FieldsShape::Named => {
-                                format!("{name}::{vname} {{ {}: __source }}", f.name.as_deref()?)
+                        let (from_ty, source_expr) = match option_inner_type(&f.ty) {
+                            Some(inner) => {
+                                if inner.starts_with('&') || option_inner_type(inner).is_some() {
+                                    return None;
+                                }
+                                (inner, "::core::option::Option::Some(__source)")
                             }
-                            FieldsShape::Tuple => format!("{name}::{vname}(__source)"),
-                            FieldsShape::Unit => return None,
+                            None => (f.ty.as_str(), "__source"),
                         };
-                        let _ = writeln!(
-                            from_impls,
-                            "#[automatically_derived] impl{impl_g} ::core::convert::From<{}> for {name}{ty_g}{where_c} {{ fn from(__source: {}) -> Self {{ {ctor} }} }}",
-                            f.ty, f.ty
-                        );
+                        match v.shape {
+                            FieldsShape::Named => {
+                                let fname = f.name.as_deref()?;
+                                let _ = writeln!(
+                                    from_impls,
+                                    "#[automatically_derived] impl{impl_g} ::core::convert::From<{from_ty}> for {name}{ty_g}{where_c} {{ fn from(__source: {from_ty}) -> Self {{ {name}::{vname} {{ {fname}: {source_expr} }} }} }}",
+                                );
+                            }
+                            FieldsShape::Tuple => {
+                                let _ = writeln!(
+                                    from_impls,
+                                    "#[automatically_derived] impl{impl_g} ::core::convert::From<{from_ty}> for {name}{ty_g}{where_c} {{ fn from(__source: {from_ty}) -> Self {{ {name}::{vname}({source_expr}) }} }}",
+                                );
+                            }
+                            FieldsShape::Unit => return None,
+                        }
                         explicit_source = Some((i, f));
                     } else if has_source_attr {
                         if explicit_source.is_some() {
@@ -3564,18 +3590,70 @@ mod tests {
         assert_eq!(option_inner_type("Option <A, B>"), None);
         assert_eq!(option_inner_type("fn() -> Option <io::Error>"), None);
 
-        // 7. Fallbacks to real `thiserror-impl`:
+        // 7. `#[from] Option<E>` expands directly (wrapping `Some(__source)` in `From<E>`
+        //    and unwrapping `Option::as_ref` in `Error::source`) for structs and enums.
+        let from_opt_named = r#"
+            #[derive(Debug)]
+            #[error("from named")]
+            pub struct FromOptNamed {
+                #[from]
+                source: Option<std::io::Error>,
+            }
+        "#;
+        let exp_from_named = expand_code("thiserror_impl", ProcKind::Derive, "Error", from_opt_named)
+            .expect("struct #[from] Option<E> expands");
+        assert!(
+            exp_from_named.contains("::core::convert::From <std::io::Error> for FromOptNamed")
+                && exp_from_named.contains("FromOptNamed {source: ::core::option::Option::Some(__source)}")
+                && exp_from_named.contains("match ::core::option::Option::as_ref(&self.source)"),
+            "struct #[from] Option<E> must impl From<E> wrapping Some and unwrap source():\n{exp_from_named}"
+        );
+
+        let from_opt_tuple = r#"
+            #[derive(Debug)]
+            #[error("from tuple")]
+            pub struct FromOptTuple(#[from] core::option::Option<std::io::Error>);
+        "#;
+        let exp_from_tuple = expand_code("thiserror_impl", ProcKind::Derive, "Error", from_opt_tuple)
+            .expect("tuple struct #[from] Option<E> expands");
+        assert!(
+            exp_from_tuple.contains("::core::convert::From <std::io::Error> for FromOptTuple")
+                && exp_from_tuple.contains("FromOptTuple(::core::option::Option::Some(__source))")
+                && exp_from_tuple.contains("match ::core::option::Option::as_ref(&self.0)"),
+            "tuple struct #[from] Option<E> must impl From<E> wrapping Some and unwrap source():\n{exp_from_tuple}"
+        );
+
+        let from_opt_enum = r#"
+            #[derive(Debug)]
+            pub enum FromOptEnum {
+                #[error("io")]
+                Io { #[from] source: Option<std::io::Error> },
+                #[error("fmt")]
+                Fmt(#[from] std::option::Option<std::fmt::Error>),
+            }
+        "#;
+        let exp_from_enum = expand_code("thiserror_impl", ProcKind::Derive, "Error", from_opt_enum)
+            .expect("enum #[from] Option<E> expands");
+        assert!(
+            exp_from_enum.contains("::core::convert::From <std::io::Error> for FromOptEnum")
+                && exp_from_enum.contains("FromOptEnum::Io {source: ::core::option::Option::Some(__source)}")
+                && exp_from_enum.contains("::core::convert::From <std::fmt::Error> for FromOptEnum")
+                && exp_from_enum.contains("FromOptEnum::Fmt(::core::option::Option::Some(__source))")
+                && exp_from_enum.contains("match ::core::option::Option::as_ref(__f0)"),
+            "enum #[from] Option<E> must impl From<E> wrapping Some and unwrap source():\n{exp_from_enum}"
+        );
+
+        // 8. Fallbacks to real `thiserror-impl`:
         //    - `Option<Box<dyn Error>>`
-        //    - `#[from] Option<E>` (struct & enum)
         //    - `#[error(transparent)]` wrapping `Option<E>`
-        //    - `Option<&'static E>` and nested `Option<Option<E>>`
+        //    - `Option<&'static E>` and nested `Option<Option<E>>` (for both `#[source]` and `#[from]`)
         let fallbacks = [
             r#"#[derive(Debug)] #[error("dyn")] pub struct DynOpt { #[source] source: Option<Box<dyn std::error::Error + Send + Sync>> }"#,
-            r#"#[derive(Debug)] #[error("from")] pub struct FromOpt { #[from] source: Option<std::io::Error> }"#,
-            r#"#[derive(Debug)] pub enum EnumFromOpt { #[error("from")] Io(#[from] Option<std::io::Error>) }"#,
             r#"#[derive(Debug)] #[error(transparent)] pub struct TransOpt(Option<std::io::Error>);"#,
             r#"#[derive(Debug)] #[error("ref")] pub struct RefOpt { #[source] source: Option<&'static std::io::Error> }"#,
+            r#"#[derive(Debug)] #[error("ref from")] pub struct RefFromOpt { #[from] source: Option<&'static std::io::Error> }"#,
             r#"#[derive(Debug)] #[error("nested")] pub struct NestedOpt { #[source] source: Option<Option<std::io::Error>> }"#,
+            r#"#[derive(Debug)] #[error("nested from")] pub struct NestedFromOpt { #[from] source: Option<Option<std::io::Error>> }"#,
         ];
         for src in fallbacks {
             assert!(
@@ -3682,6 +3760,51 @@ mod tests {
             }
         "#;
         let opt_enum_impl = expand_raw("thiserror_impl", ProcKind::Derive, "Error", opt_enum_annotated);
+
+        let from_opt_named_def = r#"
+            #[derive(Debug)]
+            pub struct FromOptNamed {
+                source: Option<std::io::Error>,
+            }
+        "#;
+        let from_opt_named_annotated = r#"
+            #[derive(Debug)]
+            #[error("from opt named")]
+            pub struct FromOptNamed {
+                #[from]
+                source: Option<std::io::Error>,
+            }
+        "#;
+        let from_opt_named_impl = expand_raw("thiserror_impl", ProcKind::Derive, "Error", from_opt_named_annotated);
+
+        let from_opt_tuple_def = r#"
+            #[derive(Debug)]
+            pub struct FromOptTuple(core::option::Option<std::io::Error>);
+        "#;
+        let from_opt_tuple_annotated = r#"
+            #[derive(Debug)]
+            #[error("from opt tuple")]
+            pub struct FromOptTuple(#[from] core::option::Option<std::io::Error>);
+        "#;
+        let from_opt_tuple_impl = expand_raw("thiserror_impl", ProcKind::Derive, "Error", from_opt_tuple_annotated);
+
+        let from_opt_enum_def = r#"
+            #[derive(Debug)]
+            pub enum FromOptEnum {
+                Io { source: Option<std::io::Error> },
+                Fmt(std::option::Option<std::fmt::Error>),
+            }
+        "#;
+        let from_opt_enum_annotated = r#"
+            #[derive(Debug)]
+            pub enum FromOptEnum {
+                #[error("from io")]
+                Io { #[from] source: Option<std::io::Error> },
+                #[error("from fmt")]
+                Fmt(#[from] std::option::Option<std::fmt::Error>),
+            }
+        "#;
+        let from_opt_enum_impl = expand_raw("thiserror_impl", ProcKind::Derive, "Error", from_opt_enum_annotated);
 
         let strum_def = "pub enum Kind { FastPath, SlowFallback }";
         let strum_annotated = r#"
@@ -3874,6 +3997,12 @@ mod mini_serde {{
 {implicit_opt_impl}
 {opt_enum_def}
 {opt_enum_impl}
+{from_opt_named_def}
+{from_opt_named_impl}
+{from_opt_tuple_def}
+{from_opt_tuple_impl}
+{from_opt_enum_def}
+{from_opt_enum_impl}
 {strum_def}
 {strum_as_ref}
 {strum_into_str}
@@ -3937,6 +4066,29 @@ fn main() {{
         Some("tup-err")
     );
     assert!(std::error::Error::source(&OptEnumErr::Plain).is_none());
+
+    let fn_some: FromOptNamed = std::io::Error::new(std::io::ErrorKind::Other, "from-named").into();
+    assert_eq!(
+        std::error::Error::source(&fn_some).map(|s| s.to_string()).as_deref(),
+        Some("from-named")
+    );
+    assert!(std::error::Error::source(&FromOptNamed {{ source: None }}).is_none());
+
+    let ft_some: FromOptTuple = std::io::Error::new(std::io::ErrorKind::Other, "from-tuple").into();
+    assert_eq!(
+        std::error::Error::source(&ft_some).map(|s| s.to_string()).as_deref(),
+        Some("from-tuple")
+    );
+    assert!(std::error::Error::source(&FromOptTuple(None)).is_none());
+
+    let fe_io: FromOptEnum = std::io::Error::new(std::io::ErrorKind::Other, "from-enum-io").into();
+    assert_eq!(
+        std::error::Error::source(&fe_io).map(|s| s.to_string()).as_deref(),
+        Some("from-enum-io")
+    );
+    let fe_fmt: FromOptEnum = std::fmt::Error.into();
+    assert!(std::error::Error::source(&fe_fmt).is_some());
+    assert!(std::error::Error::source(&FromOptEnum::Io {{ source: None }}).is_none());
 
     let k = Kind::FastPath;
     assert_eq!(k.as_ref(), "fast-path");
