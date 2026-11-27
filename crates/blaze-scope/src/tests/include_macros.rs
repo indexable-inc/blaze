@@ -108,3 +108,49 @@ fn an_include_in_an_included_file_reads_relative_to_it() {
     let user = errors(&names, USER_CRATE);
     assert!(user.is_empty(), "user: `data::m!()`, `flat::m!()` and the glob's `m!()` resolve: {user:?}\nnotes: {:?}", names.notes(USER_CRATE));
 }
+
+/// Regression for target-lexicon 0.13.5 `build.rs`: a foreign crate (`core_stub`) defines
+/// `#[rustc_builtin_macro] include!`, and a crate writes `mod triple { core_stub::include!("src/triple.rs"); }`
+/// where `src/triple.rs` defines BOTH `pub struct Triple;` AND a `#[macro_export] macro_rules! triple`
+/// referencing `$crate::Triple`. Because `include!` emits tokens with `Transparency::Transparent`,
+/// `$crate` inside the included `macro_rules!` belongs to the calling crate (`Here`), NOT `core_stub`
+/// — so expansion must NOT fail with `ForeignDollarCrate { macro_name: "include", krate: core_stub }`.
+#[test]
+fn foreign_include_of_macro_rules_with_dollar_crate_resolves_sibling_items() {
+    static LEXICON_TEXTS: Texts = Texts(&[
+        &[(
+            "/core_stub/src/lib.rs",
+            "#![no_core]\n#[macro_export]\n#[rustc_builtin_macro]\nmacro_rules! include { () => {} }\n",
+        )],
+        &[
+            (
+                "/lexicon/build.rs",
+                "#![no_core]\nmod triple {\n    core_stub::include!(\"src/triple.rs\");\n}\nuse self::triple::Triple;\npub type HostTriple = Triple;\n",
+            ),
+            (
+                "/lexicon/src/triple.rs",
+                "pub struct Triple;\n#[macro_export]\nmacro_rules! triple {\n    ($s:tt) => {\n        <$crate::Triple>::parse($s)\n    };\n}\n",
+            ),
+        ],
+    ]);
+    let mut core_stub = input("core_stub", "/core_stub/src/lib.rs", &[]);
+    core_stub.shown_from = "/core_stub/";
+    let mut lexicon = input("lexicon", "/lexicon/build.rs", &[("core_stub", 0)]);
+    lexicon.shown_from = "/lexicon/";
+    lexicon.edition = blaze_surface::Edition::E2018;
+    let crates = [core_stub, lexicon];
+    let names = resolve_crates(&crates, Sysroot::default(), &LEXICON_TEXTS, &Serial, super::SyncFrame::leaked())
+        .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let notes = format!("{:?}", names.notes(1));
+    assert!(names.notes(1).is_empty(), "no ForeignDollarCrate or expand note: {notes}");
+    let errs = errors(&names, 1);
+    assert!(errs.is_empty(), "`use self::triple::Triple;` must resolve: {errs:?}\nnotes: {notes}");
+    let segments: &[&str] = &["Triple"];
+    assert!(
+        names
+            .item_at(names.root(1), Namespace::Types, Written { kind: PathKind::Plain, segments }, blaze_own::testing::heap().alloc())
+            .is_ok(),
+        "`Triple` imported at root via `use self::triple::Triple;`"
+    );
+    assert!(binds(&names, 1, "triple"), "`#[macro_export] macro_rules! triple` exported at root");
+}
