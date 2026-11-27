@@ -199,4 +199,21 @@ fn deprecated_safe_2024_follows_call_expr_edition_and_unsafe_fn_lint() {
     let (diags_21, findings_21) = call_free(&w, w.owner_unsafe, "dep_safe", Edition::E2021, None, false);
     assert!(diags_21.is_empty());
     assert!(findings_21.is_empty());
+
+    // Inside an Edition 2024 `unsafe fn`, a pre-2024 macro calling a `deprecated_safe_2024` fn
+    // outside an `unsafe {}` block emits `DeprecatedSafe2024` (matching rustc_mir_build).
+    let (diags_u24_m21, findings_u24_m21) = call_free(&w, w.owner_unsafe, "dep_safe", Edition::E2024, Some(Edition::E2021), false);
+    assert!(diags_u24_m21.is_empty(), "2021 macro in 2024 unsafe fn must not emit E0133: {diags_u24_m21:?}");
+    assert!(
+        matches!(findings_u24_m21.as_slice(), [TypedFinding::DeprecatedSafe2024 { callee, .. }] if *callee == w.dep_safe),
+        "2021 macro in 2024 unsafe fn must emit DeprecatedSafe2024: {findings_u24_m21:?}"
+    );
+    // Inside `unsafe {}` block in that same 2024 `unsafe fn`: silent.
+    let (diags_u24_blk, findings_u24_blk) = call_free(&w, w.owner_unsafe, "dep_safe", Edition::E2024, Some(Edition::E2021), true);
+    assert!(diags_u24_blk.is_empty());
+    assert!(findings_u24_blk.is_empty());
+    // Control: a plain `unsafe fn` from a 2021 macro in a 2024 `unsafe fn` emits `UnsafeOpInUnsafeFn`.
+    let (diags_u24_plain, findings_u24_plain) = call_free(&w, w.owner_unsafe, "plain_unsafe", Edition::E2024, Some(Edition::E2021), false);
+    assert!(diags_u24_plain.is_empty());
+    assert!(matches!(findings_u24_plain.as_slice(), [TypedFinding::UnsafeOpInUnsafeFn { .. }]));
 }

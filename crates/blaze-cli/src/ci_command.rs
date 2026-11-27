@@ -365,8 +365,6 @@ fn collect_check_items<'f>(
             },
             None => None,
         };
-        let marks = text_opt.map_or(blaze_lint::RootMarks::NONE, |t| crate::lints::marks_of(t, t));
-
         for &idx in run {
             let Some(l) = shown.listed.get(idx) else {
                 continue;
@@ -374,7 +372,10 @@ fn collect_check_items<'f>(
             if l.area == Area::Cli && l.rule == crate::work::NOT_RUN {
                 continue;
             }
-            let lint_level = crate::lints::rule_of(l.rule).map(|_| crate::lints::level_in(shown.lints, marks, l.rule));
+            let lint_level = crate::lints::rule_of(l.rule).map(|_| {
+                let marks = text_opt.map_or(blaze_lint::RootMarks::NONE, |t| crate::lints::marks_at(t, t, l.start));
+                crate::lints::level_in(shown.lints, marks, l.rule)
+            });
             if lint_level == Some(blaze_lint::Level::Off) {
                 continue;
             }

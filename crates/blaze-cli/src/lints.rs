@@ -96,6 +96,17 @@ pub(crate) fn marks_of(crate_root_text: &str, text: &str) -> RootMarks {
     RootMarks::read(crate_root_text).join(RootMarks::read(text))
 }
 
+/// The effective lint marks at byte offset `at` inside `text` (joining the crate root's
+/// file-top attributes with `text`'s file-top and enclosing item/module/block/statement lint
+/// attributes).
+pub(crate) fn marks_at(crate_root_text: &str, text: &str, at: u32) -> RootMarks {
+    let offset = usize::try_from(at).unwrap_or(text.len());
+    if core::ptr::eq(crate_root_text, text) {
+        return RootMarks::read_at(text, offset);
+    }
+    RootMarks::read(crate_root_text).join(RootMarks::read_at(text, offset))
+}
+
 /// Why the root manifest's lints could not be read: each names the key (rule 19).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StepError {

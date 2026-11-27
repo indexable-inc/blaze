@@ -1732,6 +1732,51 @@ fn engine_check_deprecated_safe_2024_lint_levels() {
     let (_, warns_allow, errs_allow, out_allow) = run_case(25, "#![deny(rust_2024_compatibility)]\n#![allow(deprecated_safe_2024)]\n");
     assert!(warns_allow.is_empty(), "allow must suppress warning:\n{out_allow}");
     assert!(errs_allow.is_empty(), "allow must suppress error:\n{out_allow}");
+
+    // 6. `#![warn(deprecated_safe_2024)]` + `#![deny(warnings)]` -> error; `+ #![allow(warnings)]` -> silent.
+    let (_, warns_dw, errs_dw, out_dw) = run_case(26, "#![warn(deprecated_safe_2024)]\n#![deny(warnings)]\n");
+    assert_eq!(errs_dw.len(), 1, "warn + deny(warnings) must produce 1 error:\n{out_dw}");
+    assert!(errs_dw[0].contains("deprecated-safe-2024"), "error names lint:\n{out_dw}");
+    assert!(warns_dw.is_empty(), "deny(warnings) must upgrade warning to error:\n{out_dw}");
+
+    let (_, warns_aw, errs_aw, out_aw) = run_case(27, "#![warn(deprecated_safe_2024)]\n#![allow(warnings)]\n");
+    assert!(warns_aw.is_empty(), "allow(warnings) must suppress warning:\n{out_aw}");
+    assert!(errs_aw.is_empty(), "allow(warnings) must suppress error:\n{out_aw}");
+
+    // 7. Item-scoped `#[deny]` under default `Allow`, item-scoped `#[allow]` under crate `#![deny]`,
+    //    and `#![forbid(warnings)]` non-downgrade under inner `#[allow(warnings)]`.
+    let run_raw = |seed: u64, lib_rs: &str| {
+        let io = Io::simulated(SimWorld::new(seed, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST_2021);
+        write(&io, "src/lib.rs", lib_rs);
+        let (_, lines, _) = said(&io, false);
+        let rendered = lines.join("\n");
+        (warning_lines(&rendered), error_lines(&rendered), rendered)
+    };
+
+    let (w, e, out) = run_raw(
+        28,
+        "#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\n#[deny(deprecated_safe_2024)]\npub fn denied_fn() { set_var_like(); }\npub fn clean_fn() { set_var_like(); }\n",
+    );
+    assert_eq!(e.len(), 1, "item-level deny must reject only denied_fn:\n{out}");
+    assert!(e[0].contains("src/lib.rs:5:") && e[0].contains("deprecated-safe-2024"), "error at line 5:\n{out}");
+    assert!(w.is_empty(), "clean_fn stays silent:\n{out}");
+
+    let (w, e, out) = run_raw(
+        29,
+        "#![deny(deprecated_safe_2024)]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\n#[allow(deprecated_safe_2024)]\npub fn allowed_fn() { set_var_like(); }\npub fn denied_fn() { set_var_like(); }\n",
+    );
+    assert_eq!(e.len(), 1, "item-level allow must suppress allowed_fn under crate deny:\n{out}");
+    assert!(e[0].contains("src/lib.rs:7:") && e[0].contains("deprecated-safe-2024"), "error at line 7:\n{out}");
+    assert!(w.is_empty(), "no warnings:\n{out}");
+
+    let (w, e, out) = run_raw(
+        30,
+        "#![forbid(warnings)]\n#![warn(deprecated_safe_2024)]\n#![feature(rustc_attrs)]\n#[rustc_deprecated_safe_2024(audit_that = \"single-threaded\")]\npub unsafe fn set_var_like() {}\n#[allow(warnings)]\npub fn still_forbidden() { set_var_like(); }\n",
+    );
+    assert_eq!(e.len(), 1, "forbid(warnings) must not be downgraded by inner allow(warnings):\n{out}");
+    assert!(e[0].contains("deprecated-safe-2024"), "error names lint:\n{out}");
+    assert!(w.is_empty(), "no warnings:\n{out}");
 }
 
 /// A workspace of one member, `app`, under the `suggest` step, its module `a` holding `f`, which

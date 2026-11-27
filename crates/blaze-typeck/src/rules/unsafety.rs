@@ -288,10 +288,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             if self.body.expr_edition(e) < Edition::E2024 {
                 let attrs = self.reads.attrs(k)?;
                 if attrs.0 & TypeAttrs::DEPRECATED_SAFE_2024 != 0 {
-                    if ctx == Ctx::Safe {
-                        let at = self.range_of(At::Expr(e));
-                        self.typed_findings.push(TypedFinding::DeprecatedSafe2024 { callee: k, at });
-                    }
+                    // Emit `deprecated_safe_2024` both in safe contexts and in edition 2024+
+                    // `unsafe fn` bodies (where `files` is true because `unsafe_op_in_unsafe_fn`
+                    // applies; pre-2024 `unsafe fn` bodies and `unsafe {}` blocks returned early).
+                    let at = self.range_of(At::Expr(e));
+                    self.typed_findings.push(TypedFinding::DeprecatedSafe2024 { callee: k, at });
                     attrs
                 } else {
                     self.refuse(ctx, At::Expr(e), UnsafeOp::Call(Some(k)));

@@ -801,10 +801,13 @@ fn finding_about<'f>(cx: &Cx, l: &Listed<'f>, text: &[u8], file: Option<&str>, s
     // A lint finding: the level the step's levels give its rule, now (rule 81). Advice is a
     // warning, and no step's is an error today (main.rs `every_rule`); an `Off` rule is not
     // drawn or counted.
-    // The file's own marks (its `#![deny(blaze::..)]`), as its units were linted with. A lint
-    // finding's file is UTF-8 (engine_lints.rs refuses any other), so a text that is not has none.
-    let marks = core::str::from_utf8(text).map_or(blaze_lint::RootMarks::NONE, |text| crate::lints::marks_of(text, text));
-    let lint = crate::lints::rule_of(l.rule).map(|_| crate::lints::level_in(shown.lints, marks, l.rule));
+    // The file's own marks (including enclosing item/module/block lint attributes at `l.start`),
+    // read only when the finding is a lint rule. A lint finding's file is UTF-8 (engine_lints.rs
+    // refuses any other), so a text that is not has none.
+    let lint = crate::lints::rule_of(l.rule).map(|_| {
+        let marks = core::str::from_utf8(text).map_or(blaze_lint::RootMarks::NONE, |text| crate::lints::marks_at(text, text, l.start));
+        crate::lints::level_in(shown.lints, marks, l.rule)
+    });
     if lint == Some(blaze_lint::Level::Off) {
         return Ok(());
     }

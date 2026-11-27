@@ -922,6 +922,122 @@ fn deprecated_safe_2024_lint_levels_and_groups() {
     assert_eq!(foreign.levels(Step::Rust.levels()).of(rule), Level::Off);
 }
 
+#[test]
+fn read_at_lexical_scopes_and_warnings_meta_lint() {
+    let rule = Rule::DeprecatedSafe2024;
+    let level_at = |src: &str, needle: &str| {
+        let at = src.find(needle).unwrap_or_else(|| panic!("missing `{needle}` in:\n{src}"));
+        RootMarks::read_at(src, at).levels(Step::Rust.levels()).of(rule)
+    };
+
+    // 1. Item-scoped `#[deny]` under default `Allow`, not leaking to sibling item.
+    let item_deny = r#"
+#[deny(deprecated_safe_2024)]
+pub fn denied<A, B>() where A: Copy, B: Copy {
+    call_denied();
+}
+pub fn clean() {
+    call_clean();
+}
+"#;
+    assert_eq!(level_at(item_deny, "call_denied"), Level::Error);
+    assert_eq!(level_at(item_deny, "call_clean"), Level::Off);
+
+    // 2. Item-scoped `#[allow]` and `#[expect]` under crate `#![deny]`, plus inner `#![allow]`.
+    let item_allow = r#"
+#![deny(deprecated_safe_2024)]
+#[allow(deprecated_safe_2024)]
+pub fn allowed() {
+    call_allowed();
+}
+#[expect(deprecated_safe_2024)]
+pub fn expected() {
+    call_expected();
+}
+pub fn inner_allowed() {
+    #![allow(deprecated_safe_2024)]
+    call_inner();
+}
+pub fn still_denied() {
+    call_denied();
+}
+"#;
+    assert_eq!(level_at(item_allow, "call_allowed"), Level::Off);
+    assert_eq!(level_at(item_allow, "call_expected"), Level::Off);
+    assert_eq!(level_at(item_allow, "call_inner"), Level::Off);
+    assert_eq!(level_at(item_allow, "call_denied"), Level::Error);
+
+    // 3. Module, block, statement, if/else, and comma-separated arg scopes.
+    let nested = r#"
+#[deny(deprecated_safe_2024)]
+mod m {
+    pub fn in_mod() {
+        call_in_mod();
+        #[allow(deprecated_safe_2024)]
+        {
+            call_in_block();
+        }
+        call_after_block();
+        #[allow(deprecated_safe_2024)]
+        call_stmt_allowed();
+        call_after_stmt();
+        #[allow(deprecated_safe_2024)]
+        if true {
+            call_if_then();
+        } else {
+            call_if_else();
+        }
+        call_after_if();
+        pair(#[allow(deprecated_safe_2024)] call_arg1(), call_arg2());
+    }
+}
+pub fn outside_mod() {
+    call_outside();
+}
+"#;
+    assert_eq!(level_at(nested, "call_in_mod"), Level::Error);
+    assert_eq!(level_at(nested, "call_in_block"), Level::Off);
+    assert_eq!(level_at(nested, "call_after_block"), Level::Error);
+    assert_eq!(level_at(nested, "call_stmt_allowed"), Level::Off);
+    assert_eq!(level_at(nested, "call_after_stmt"), Level::Error);
+    assert_eq!(level_at(nested, "call_if_then"), Level::Off);
+    assert_eq!(level_at(nested, "call_if_else"), Level::Off);
+    assert_eq!(level_at(nested, "call_after_if"), Level::Error);
+    assert_eq!(level_at(nested, "call_arg1"), Level::Off);
+    assert_eq!(level_at(nested, "call_arg2"), Level::Error);
+    assert_eq!(level_at(nested, "call_outside"), Level::Off);
+
+    // 4. Crate `#![forbid]` cannot be downgraded by inner `#[allow]`.
+    let forbid_src = "#![forbid(deprecated_safe_2024)]\n#[allow(deprecated_safe_2024)]\npub fn f() { call_f(); }\n";
+    assert_eq!(level_at(forbid_src, "call_f"), Level::Error);
+
+    // 5. `warnings` meta-lint: affects `Warn`-resolved lints only, honoring `forbid`.
+    assert_eq!(RootMarks::read("#![deny(warnings)]\n").levels(Step::Rust.levels()).of(rule), Level::Off);
+    assert_eq!(RootMarks::read("#![warn(deprecated_safe_2024)]\n#![deny(warnings)]\n").levels(Step::Rust.levels()).of(rule), Level::Error);
+    assert_eq!(RootMarks::read("#![deny(warnings)]\n#![warn(deprecated_safe_2024)]\n").levels(Step::Rust.levels()).of(rule), Level::Error);
+    assert_eq!(RootMarks::read("#![warn(deprecated_safe_2024)]\n#![allow(warnings)]\n").levels(Step::Rust.levels()).of(rule), Level::Off);
+    assert_eq!(RootMarks::read("#![allow(warnings)]\n#![warn(deprecated_safe_2024)]\n").levels(Step::Rust.levels()).of(rule), Level::Off);
+    assert_eq!(RootMarks::read("#![deny(deprecated_safe_2024)]\n#![allow(warnings)]\n").levels(Step::Rust.levels()).of(rule), Level::Error);
+
+    let warn_deny_override = r#"
+#![deny(warnings)]
+#![warn(deprecated_safe_2024)]
+#[allow(warnings)]
+pub fn ok() { call_ok(); }
+pub fn err() { call_err(); }
+"#;
+    assert_eq!(level_at(warn_deny_override, "call_ok"), Level::Off);
+    assert_eq!(level_at(warn_deny_override, "call_err"), Level::Error);
+
+    let warn_forbid = r#"
+#![forbid(warnings)]
+#![warn(deprecated_safe_2024)]
+#[allow(warnings)]
+pub fn still_err() { call_err(); }
+"#;
+    assert_eq!(level_at(warn_forbid, "call_err"), Level::Error);
+}
+
 /// Expected: "test tests::lock_without_reason ... ok".
 #[test]
 fn lock_without_reason() {
