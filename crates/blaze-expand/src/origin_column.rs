@@ -320,7 +320,9 @@ impl<'a> OriginColumn<'a> {
 
     /// The identity column of a text that IS a call's input as written: `places` are its tokens'
     /// bytes ([`input_places`], token `i` at entry `i`), every row `TextOrigin::Input` of its
-    /// token with no mark. The lexer gives several tokens ONE place (blaze-expand tokens.rs
+    /// token with the mark `mark_at(start)` returns (for a kept item written by a parent macro
+    /// expansion, the parent column's mark at that token's offset; `|_| None` for a file-written
+    /// item). The lexer gives several tokens ONE place (blaze-expand tokens.rs
     /// `place_new`): a doc comment's `# [ doc = ".." ]` stand at the comment's bytes, a
     /// lifetime's `'` and name at the lifetime's, the groups one closer closes at that closer,
     /// the groups a text leaves open at its end. Such a run is one row, the run's FIRST token's
@@ -328,7 +330,11 @@ impl<'a> OriginColumn<'a> {
     /// the same bytes). So the column is sorted and each place once by construction, for any
     /// text the lexer reads (tempo census g051231: 70 rows "row 1 (0..39) is out of order after
     /// one ending at 39", a kept item `/// doc` + `#[derive(..)] #[serde(..)] enum CallKind`).
-    pub fn input_identity(places: &[(u32, u32)], alloc: Alloc<'a>) -> Result<OriginColumn<'a>, ColumnError> {
+    pub fn input_identity(
+        places: &[(u32, u32)],
+        mut mark_at: impl FnMut(u32) -> Option<TextMark>,
+        alloc: Alloc<'a>,
+    ) -> Result<OriginColumn<'a>, ColumnError> {
         let mut column = OriginColumn::new_in(alloc);
         let mut previous: Option<(u32, u32)> = None;
         for (i, &(start, end)) in places.iter().enumerate() {
@@ -336,7 +342,7 @@ impl<'a> OriginColumn<'a> {
                 continue;
             }
             previous = Some((start, end));
-            column.push(start as usize, end as usize, TextOrigin::Input(place32(i)?), None)?;
+            column.push(start as usize, end as usize, TextOrigin::Input(place32(i)?), mark_at(start))?;
         }
         Ok(column)
     }

@@ -181,3 +181,168 @@ fn token_mark_heads() {
     assert!(failed.is_empty(), "heads that did not say what they must: {failed:?} (said: {said:?})");
     println!("front2_token_mark_heads: {}", said.join("; "));
 }
+
+/// End-to-end head freezing for Fix 1B (`keep_item` preserving parent `OriginColumn` `TextMark`s):
+/// - Positive 1 (`NodeId`): cross-crate `macro_rules!` emitting `#[derive(macros::Show)]
+///   #[show(rename = "n")] pub struct NodeId($crate::nonmax::NonMaxU32);` freezes cleanly with zero
+///   type misses (the exact `oxc_syntax::node::NodeId` / `oxc_index::define_index_type!` shape).
+/// - Positive 2 (`NestedId`): multi-stage `KEEP_ITEM` (`#[derive(macros::Show)] #[show(a)]
+///   #[derive(macros::Tag)] #[tag(b)] pub struct NestedId($crate::nonmax::NonMaxU32);`) freezes
+///   cleanly with zero type misses.
+/// - Negative control (`PlainId`): cross-crate `macro_rules!` emitting plain
+///   `crate::nonmax::NonMaxU32` (NOT `$crate`) resolves `crate` in the caller crate (which has no
+///   `nonmax`), so its head fails with unresolved type misses.
+#[test]
+fn kept_item_head_preserves_dollar_crate_and_plain_crate_control() {
+    use blaze_expand::{HostAsk, HostError, HostWhy, MacroDefinition, ProcCall, ProcKind, Produced, Reads, TokenOrigin, Transparency, lex};
+    use blaze_own::{AVec, Alloc};
+    use blaze_surface::Edition;
+
+    const MACROS_PATH: &str = "/macros/src/lib.rs";
+    const MACROS_SRC: &str = "#![feature(no_core)]
+#![no_core]
+#[proc_macro_derive(Show, attributes(show))]
+pub fn show(item: TokenStream) -> TokenStream { item }
+#[proc_macro_derive(Tag, attributes(tag))]
+pub fn tag(item: TokenStream) -> TokenStream { item }
+";
+    const DEP_KEPT_SRC: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+#[lang = \"sized\"]
+pub trait Sized {}
+pub mod nonmax {
+    pub struct NonMaxU32(pub u32);
+}
+#[macro_export]
+macro_rules! define_index {
+    ($name:ident) => {
+        #[derive(macros::Show)]
+        #[show(rename = \"idx\")]
+        pub struct $name(#[show(skip)] $crate::nonmax::NonMaxU32);
+    };
+}
+#[macro_export]
+macro_rules! define_nested_index {
+    ($name:ident) => {
+        #[derive(macros::Show)]
+        #[show(a)]
+        #[derive(macros::Tag)]
+        #[tag(b)]
+        pub struct $name($crate::nonmax::NonMaxU32);
+    };
+}
+#[macro_export]
+macro_rules! define_plain_crate {
+    ($name:ident) => {
+        #[derive(macros::Show)]
+        #[show(rename = \"plain\")]
+        pub struct $name(crate::nonmax::NonMaxU32);
+    };
+}
+";
+    const ROOT_KEPT_SRC: &str = "#![feature(no_core)]
+#![no_core]
+#![no_main]
+dep::define_index!(NodeId);
+dep::define_nested_index!(NestedId);
+dep::define_plain_crate!(PlainId);
+";
+
+    struct KeptFiles;
+    impl<'t> SourceTexts<'t> for KeptFiles {
+        fn read(&self, krate: usize, path: &str) -> Option<&'t str> {
+            match (krate, path) {
+                (0, ROOT_PATH) => Some(ROOT_KEPT_SRC),
+                (1, DEP_PATH) => Some(DEP_KEPT_SRC),
+                (2, MACROS_PATH) => Some(MACROS_SRC),
+                _ => None,
+            }
+        }
+        fn proc_macro_key(&self, krate: usize) -> Option<CrateItemKey> {
+            (krate == 2).then_some(CrateItemKey(ContentId([31; 32])))
+        }
+        fn run_proc_macro<'b>(&self, _: usize, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'b>) -> Result<Produced<'b>, HostError> {
+            let refused = HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused };
+            let text = match (call.kind, def.proc_name()) {
+                (ProcKind::Derive, Some("Show" | "Tag")) => "",
+                _ => return Err(refused),
+            };
+            let tokens = lex(text, Edition::E2024, alloc).map_err(|_| refused)?;
+            let mut origins = AVec::new_in(alloc);
+            origins.extend(tokens.tokens().iter().map(|_| TokenOrigin::Made(Transparency::Transparent)));
+            Ok(Produced { tokens, origins, reads: Reads::new_in(alloc), diagnostics: AVec::new_in(alloc), text: AVec::new_in(alloc) })
+        }
+    }
+
+    let tc = Toolchain::none(blaze_own::Alloc::global());
+    let cfg = tc.program_cfg(blaze_build::Panic::Unwind);
+    let rust = PackageEdition { syntax: edition::Edition::Edition2024, blaze: None };
+    let lib = implicit(rust, &blaze_unit_graph::UnitKind::Lib);
+    let pm = implicit(rust, &blaze_unit_graph::UnitKind::ProcMacro);
+    let root_deps: [(&str, usize); 2] = [("dep", 1), ("macros", 2)];
+    let dep_deps: [(&str, usize); 1] = [("macros", 2)];
+    let crates = [
+        CrateInput {
+            name: "marks",
+            key: CrateItemKey(ContentId::of("front2_token_mark_heads kept program", b"marks")),
+            edition: syntax_of(rust),
+            implicit: lib,
+            root: ROOT_PATH,
+            shown_from: "/marks/",
+            features: &[],
+            deps: &root_deps,
+            cfg: &cfg,
+            script: None,
+        },
+        CrateInput {
+            name: "dep",
+            key: CrateItemKey(ContentId::of("front2_token_mark_heads kept dep", b"dep")),
+            edition: syntax_of(rust),
+            implicit: lib,
+            root: DEP_PATH,
+            shown_from: "/dep/",
+            features: &[],
+            deps: &dep_deps,
+            cfg: &cfg,
+            script: None,
+        },
+        CrateInput {
+            name: "macros",
+            key: CrateItemKey(ContentId::of("front2_token_mark_heads kept macros", b"macros")),
+            edition: syntax_of(rust),
+            implicit: pm,
+            root: MACROS_PATH,
+            shown_from: "/macros/",
+            features: &[],
+            deps: &[],
+            cfg: &cfg,
+            script: None,
+        },
+    ];
+    let names = resolve_crates(&crates, Sysroot::default(), &KeptFiles, &Serial, blaze_own::testing::bump())
+        .unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: ROOT_KEPT_SRC }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+    let mut front = Front2::new(&names, &frame, &sources, blaze_own::Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, blaze_own::Alloc::global());
+
+    let is_struct = |d: ItemDetail| matches!(d, ItemDetail::Struct);
+    for (name, must_resolve) in [("NodeId", true), ("NestedId", true), ("PlainId", false)] {
+        let keys = items_of(&names, Some(name), is_struct);
+        let [key] = keys.as_slice() else {
+            panic!("{name}: expected 1 struct, got {keys:?}");
+        };
+        let res = store.ensure(&names, &mut front.keys, Want::Adt(*key));
+        let misses = store.type_misses.get(&checker_of(*key)).map_or(&[][..], |m| &m[..]);
+        if must_resolve {
+            assert!(res.is_ok(), "{name}: expected clean ADT head, got {res:?}");
+            assert!(misses.is_empty(), "{name}: expected zero type misses, got {misses:?}");
+        } else {
+            let failed_resolve = matches!(res, Err(HeadError::Item(_, Why::Resolve(..)))) || !misses.is_empty();
+            assert!(
+                failed_resolve,
+                "{name} (negative control): plain `crate::nonmax::NonMaxU32` must NOT resolve in `dep`, got res={res:?}, misses={misses:?}"
+            );
+        }
+    }
+}
