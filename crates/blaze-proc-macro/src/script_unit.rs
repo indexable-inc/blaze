@@ -671,7 +671,9 @@ pub fn outputs_viewing_on<'a>(
     }
     match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
         Runner::Wasm => {
-            let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
+            let file_area = setting.store.join(blaze_build_script::outputs::FILE_AREA);
+            let viewed = dep_mount::view_with_area(&tree, Some(&file_area), producers, deps, alloc)
+                .map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
             let seen: Vec<DepMetadata<'_>> =
                 deps.iter().zip(viewed.values.iter()).map(|(dep, value)| DepMetadata { links: dep.links, key: dep.key, value: value.as_str() }).collect();
             let prepared = prepare_viewing_on(runtime, setting, graph, script, side_cfg, tree, root, &seen, viewed.views, alloc)?;

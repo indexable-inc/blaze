@@ -175,6 +175,9 @@ pub struct DepViews {
     mounts: Vec<Mounted>,
     /// `None` when nothing is mounted.
     content: Option<ContentId>,
+    /// Home build-script file area (`<store>/build-script/files`) for serving `Served::Stored`
+    /// `OUT_DIR` files read-only to dependent wasm64 build scripts.
+    file_area: Option<std::path::PathBuf>,
 }
 
 impl DepViews {
@@ -281,16 +284,36 @@ pub struct Viewed<'a> {
 /// makes the mounts the plan names; `reader` is the tree the reading script is served. The
 /// wasm sight of [`resolve`].
 pub fn view<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMetadata<'_>], alloc: Alloc<'a>) -> Result<Viewed<'a>, DepViewError> {
-    view_inner(reader, producers, deps, false, alloc)
+    view_inner(reader, None, producers, deps, false, alloc)
+}
+
+/// Like [`view`], but permits producers whose `OUT_DIR` files are stored in the home's
+/// content-addressed file area (`file_area`, `<store>/build-script/files/<sha256>`), serving
+/// them read-only to dependent wasm64 build scripts.
+pub fn view_with_area<'a>(
+    reader: &Tree,
+    file_area: Option<&std::path::Path>,
+    producers: &[(&str, &DepProducer)],
+    deps: &[DepMetadata<'_>],
+    alloc: Alloc<'a>,
+) -> Result<Viewed<'a>, DepViewError> {
+    view_inner(reader, file_area, producers, deps, file_area.is_some(), alloc)
 }
 
 /// Like [`view`], but permits native producers whose `OUT_DIR` files are stored in the
 /// home's content-addressed file area (keyed by `(name, sha256)`).
 pub fn view_with_stored<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMetadata<'_>], alloc: Alloc<'a>) -> Result<Viewed<'a>, DepViewError> {
-    view_inner(reader, producers, deps, true, alloc)
+    view_inner(reader, None, producers, deps, true, alloc)
 }
 
-fn view_inner<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[DepMetadata<'_>], allow_stored: bool, alloc: Alloc<'a>) -> Result<Viewed<'a>, DepViewError> {
+fn view_inner<'a>(
+    reader: &Tree,
+    file_area: Option<&std::path::Path>,
+    producers: &[(&str, &DepProducer)],
+    deps: &[DepMetadata<'_>],
+    allow_stored: bool,
+    alloc: Alloc<'a>,
+) -> Result<Viewed<'a>, DepViewError> {
     let resolved = resolve(Sight::Wasm, producers, deps, alloc)?;
     let mut mounts: Vec<Mounted> = Vec::new();
     for &(mount, producer) in resolved.serve.iter() {
@@ -300,7 +323,7 @@ fn view_inner<'a>(reader: &Tree, producers: &[(&str, &DepProducer)], deps: &[Dep
     // One mount serves every pair under it (two pairs under one `OUT_DIR`, say).
     mounts.dedup_by(|a, b| a.parts == b.parts);
     let content = (!mounts.is_empty()).then(|| content_id(&mounts));
-    Ok(Viewed { values: resolved.values, views: DepViews { mounts, content } })
+    Ok(Viewed { values: resolved.values, views: DepViews { mounts, content, file_area: file_area.map(std::path::Path::to_path_buf) } })
 }
 
 /// A reader's `links` values resolved for a run of one [`Sight`], and the trees they are under.
@@ -450,7 +473,9 @@ impl ScriptSandbox {
         let script = Arc::clone(&self.script);
         let (files, subs) = match &script.deps.mounts[mount].served {
             Served::Keyed { files, submodules } => (files, Some(submodules)),
-            Served::Stored { inline, .. } => (inline, None),
+            Served::Stored { inline, stored } => {
+                return self.dep_stored_node(mount, inline, stored, script.deps.file_area.as_deref(), &rel);
+            }
             Served::ReaderTree => {
                 let found = match script.tree.node(&rel) {
                     Ok(found) => found.map(owned),
@@ -466,6 +491,64 @@ impl ScriptSandbox {
             Ok(found) => Ok(found.map(owned)),
             Err(why) => Err(self.refuse(Refusal::Path(why.to_string()))),
         }
+    }
+
+    fn dep_stored_node(
+        &mut self,
+        mount: usize,
+        inline: &[(String, Vec<u8>)],
+        stored: &[(String, [u8; 32])],
+        file_area: Option<&std::path::Path>,
+        rel: &str,
+    ) -> Result<Option<Node<'static>>, Stop> {
+        if !rel.is_empty() {
+            if let Ok(i) = inline.binary_search_by(|(p, _)| p.as_str().cmp(rel)) {
+                return Ok(Some(Node::File(std::borrow::Cow::Owned(inline[i].1.clone()))));
+            }
+            if let Ok(i) = stored.binary_search_by(|(p, _)| p.as_str().cmp(rel)) {
+                let Some(area) = file_area else {
+                    let links = &self.script.deps.mounts[mount].links;
+                    return Err(self.refuse(Refusal::Path(format!(
+                        "a `links = \"{links}\"` OUT_DIR stored file `{rel}` was read with no file area configured"
+                    ))));
+                };
+                let mut hex = String::with_capacity(64);
+                for byte in stored[i].1 {
+                    use core::fmt::Write as _;
+                    let _ = write!(hex, "{byte:02x}");
+                }
+                let path = area.join(&hex);
+                let bytes = match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        let links = &self.script.deps.mounts[mount].links;
+                        return Err(self.refuse(Refusal::Path(format!(
+                            "reading `links = \"{links}\"` stored OUT_DIR file `{rel}` ({}): {err}",
+                            path.display()
+                        ))));
+                    }
+                };
+                return Ok(Some(Node::File(std::borrow::Cow::Owned(bytes))));
+            }
+        }
+        let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };
+        let mut entries: Vec<(Vec<u8>, Filetype)> = Vec::new();
+        for path in inline.iter().map(|(p, _)| p.as_str()).chain(stored.iter().map(|(p, _)| p.as_str())) {
+            let Some(rest) = path.strip_prefix(prefix.as_str()) else { continue };
+            if rest.is_empty() {
+                continue;
+            }
+            match rest.split_once('/') {
+                Some((dir, _)) => entries.push((dir.as_bytes().to_vec(), Filetype::Directory)),
+                None => entries.push((rest.as_bytes().to_vec(), Filetype::RegularFile)),
+            }
+        }
+        if rel.is_empty() || !entries.is_empty() {
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            entries.dedup_by(|a, b| a.0 == b.0);
+            return Ok(Some(Node::Folder(entries)));
+        }
+        Ok(None)
     }
 
     /// `path_open` under a mount: read-only; `path` is the whole path, for a folder's entries.
@@ -769,5 +852,47 @@ mod tests {
             view(&reader_tree, &[("b", &b)], &unrelated, alloc).map(|_| ()),
             Err(DepViewError::Outside { links: "b".to_owned(), key: "include".to_owned(), path: "/target/debug/build/other-4444444444444444/out/include".to_owned() })
         );
+    }
+
+    #[test]
+    fn wasm_dep_mount_with_file_area_serves_inline_and_stored_out_dir_files() {
+        const OUT: &str = "/target/debug/build/zstd-sys-1111111111111111/out";
+        let alloc = blaze_own::testing::heap().alloc();
+        let area = std::env::temp_dir().join(format!("blaze-dep-mount-stored-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&area);
+        std::fs::create_dir_all(&area).expect("create file area");
+
+        let obj_bytes = b"\x7fELF-fake-object";
+        let sha = blaze_sha256::digest(obj_bytes);
+        let mut hex = String::with_capacity(64);
+        for b in sha {
+            use core::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        std::fs::write(area.join(&hex), obj_bytes).expect("write stored file");
+
+        let producer = DepProducer {
+            tree: Tree::Mem { files: files(&[]), submodules: Arc::from([]), git: None },
+            root: ScriptRoot::package(),
+            out_dir: OUT.to_owned(),
+            out: files(&[("include/zstd.h", b"#define ZSTD 1\n")]),
+            stored: Arc::new(vec!["lib/libzstd.a".to_owned()]),
+            stored_files: Arc::new(vec![("lib/libzstd.a".to_owned(), sha)]),
+            upstream: Arc::new(Vec::new()),
+        };
+        let deps = [DepMetadata { links: "zstd", key: "include", value: &format!("{OUT}/include") }];
+        let reader_tree = Tree::Mem { files: files(&[]), submodules: Arc::from([]), git: None };
+
+        // Without file area (`view`), stored OUT_DIR files remain refused.
+        assert!(matches!(view(&reader_tree, &[("zstd", &producer)], &deps, alloc), Err(DepViewError::StoredOut { .. })));
+
+        // With file area (`view_with_area`), both inline headers and stored archives are served read-only.
+        let viewed = view_with_area(&reader_tree, Some(&area), &[("zstd", &producer)], &deps, alloc).expect("view_with_area");
+        let env = vec![("DEP_ZSTD_INCLUDE".to_owned(), format!("{OUT}/include"))];
+        let mut sandbox = ScriptSandbox::new(reader(viewed.views, &env));
+        assert_eq!(read_whole(&mut sandbox, &format!("{OUT}/include/zstd.h")), Ok(b"#define ZSTD 1\n".to_vec()));
+        assert_eq!(read_whole(&mut sandbox, &format!("{OUT}/lib/libzstd.a")), Ok(obj_bytes.to_vec()));
+
+        let _ = std::fs::remove_dir_all(&area);
     }
 }
