@@ -1229,3 +1229,33 @@ fn record_type_spread_lowers_cleanly() {
         dump_of(&generic)
     );
 }
+
+/// Outer attributes attached to a literal expression (such as `zstd-sys`'s
+/// `#[cfg(feature = "zdict_builder")] "zstd/lib/dictBuilder"` inside an array) must not be
+/// included in `expr_range(e)`: every literal reader takes the token's text at that range.
+#[test]
+fn attributed_literal_expr_range_excludes_outer_attrs() {
+    let text = r#"fn compile_zstd() {
+    let _ = &[
+        "zstd/lib/common",
+        #[cfg(unix)]
+        "zstd/lib/dictBuilder",
+        #[cfg(windows)]
+        "zstd/lib/legacy",
+    ];
+    let _ = #[allow(dead_code)] 42u32;
+}"#;
+    let lowered = body(text);
+    let v = lowered.view();
+    assert!(v.unhandled.is_empty(), "unhandled:\n{}", dump_of(&lowered));
+    assert!(v.diags.is_empty(), "diags:\n{}", dump_of(&lowered));
+    let mut lits = StdVec::new();
+    for i in 0..v.exprs.len() as u32 {
+        let id = ExprId(i);
+        if matches!(v.expr(id), Ok(Expr::Lit(_))) {
+            let r = v.expr_range(id).expect("literal range");
+            lits.push(v.text_at(r).expect("literal text"));
+        }
+    }
+    assert_eq!(lits, vec!["\"zstd/lib/common\"", "\"zstd/lib/dictBuilder\"", "42u32"]);
+}

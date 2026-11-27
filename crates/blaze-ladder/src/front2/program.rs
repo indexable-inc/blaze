@@ -1763,7 +1763,7 @@ fn literals(body: &Body<'_>, path: &str) -> Result<Literals, Front2Refusal> {
             }
             // `c".."` / `cr".."`: the bytes without the nul the builder adds (its `byte_str`).
             tc::Lit::CStr => {
-                let bytes = text.strip_prefix('c').and_then(string_bytes).ok_or_else(|| refuse("this escape in a C string literal"))?;
+                let bytes = string_bytes(text).ok_or_else(|| refuse("this escape in a C string literal"))?;
                 out.strings.push((id, bytes.into_boxed_slice()));
             }
             tc::Lit::Int(_) | tc::Lit::Char => out.ints.push((id, int_value(text).ok_or_else(|| refuse("this integer or char literal"))?)),

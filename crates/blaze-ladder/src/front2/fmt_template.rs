@@ -269,8 +269,12 @@ fn push_text(src: &str, raw: bool, out: &mut String) -> Option<()> {
         rest = &rest[if doubled { 2 } else { c.len_utf8() }..];
     }
     if raw {
-        out.push_str(&braces);
-        return Some(());
+        let mut ok = true;
+        parser::unescape::check_raw_str(&braces, |_, unit| match unit {
+            Ok(c) => out.push(c),
+            Err(_) => ok = false,
+        });
+        return ok.then_some(());
     }
     braces.push('"');
     let bytes = string_bytes(&braces)?;

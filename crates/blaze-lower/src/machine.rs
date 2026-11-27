@@ -2916,22 +2916,24 @@ impl<'t, 'c, 'a, 's> Machine<'t, 'c, 'a, 's> {
         let t = self.kid(f, 0, |v| matches!(v, V::Tok(_)));
         self.done(f);
         let lit = t.and_then(|t| match t.v {
-            V::Tok(kind) => lit::lit_of(kind, t.range.of(self.text())),
+            V::Tok(kind) => lit::lit_of(kind, t.range.of(self.text())).map(|l| (l, t.range)),
             _ => None,
         });
         let in_pat = self.parent_kind() == Some(LITERAL_PAT);
         match (lit, in_pat) {
-            (Some(l), true) => {
+            (Some((l, tr)), true) => {
                 let (k, a, b) = l.encode();
                 let mut node = Node::of(0);
                 node.flags = k;
                 node.a = a;
                 node.b = b;
-                self.push_node(V::Lit, node, r);
+                self.push_node(V::Lit, node, tr);
             }
-            (Some(l), false) => {
-                let e = self.put_expr(Expr::Lit(l), r);
-                self.push(V::Expr, e.0, r);
+            (Some((l, tr)), false) => {
+                // `r` includes any outer attributes on the expression (e.g. `#[cfg(..)] "s"`),
+                // while every literal reader takes the token's text at `expr_range(e)`.
+                let e = self.put_expr(Expr::Lit(l), tr);
+                self.push(V::Expr, e.0, tr);
             }
             (None, _) => {
                 self.unhandled(LITERAL, r, Why::Kind);
