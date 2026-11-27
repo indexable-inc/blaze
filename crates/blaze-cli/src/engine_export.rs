@@ -3387,7 +3387,8 @@ fn export_program<'f>(
     let lto_hot_symbols = lto_out.hot_symbols;
     let lto_profile_digest = lto_out.profile_digest;
     let lto_hot = lto_hot_symbols.len();
-    let mut extra_roots: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> = Vec::new_in(heap.shared());
+    let mut extra_roots: Vec<(Option<usize>, ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> =
+        Vec::new_in(heap.shared());
     for body in lto_out.bodies {
         if let Some(slot) = outcomes.get_mut(body.row) {
             *slot = RowOutcome::Lto {
@@ -3395,12 +3396,35 @@ fn export_program<'f>(
                 vtable_data: body.vtable_data,
             };
         }
-        for decl in body.extra_declared {
-            extra_roots.push(decl);
+        for (tabled, name_bytes) in body.extra_declared {
+            extra_roots.push((None, tabled, name_bytes));
         }
     }
-    for (tabled, name_bytes) in extra_roots {
-        walk.root::<RunError>((tabled, name_bytes.as_slice()), MOST_WALKED).map_err(|why| {
+    for (declarer_row, tabled, name_bytes) in lto_out.extra_walk_instances {
+        extra_roots.push((Some(declarer_row), tabled, name_bytes));
+    }
+    for (declarer_row, tabled, name_bytes) in extra_roots {
+        let reached = match declarer_row {
+            Some(parent) => walk.root_from::<RunError>(parent, (tabled, name_bytes.as_slice()), MOST_WALKED),
+            None => walk.root::<RunError>((tabled, name_bytes.as_slice()), MOST_WALKED),
+        };
+        reached.map_err(|why| {
+            box_err(
+                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+    }
+    for item in lto_out.extra_walk_statics {
+        walk.root_static::<RunError>(item, MOST_WALKED).map_err(|why| {
+            box_err(
+                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+    }
+    for item in lto_out.extra_walk_tls {
+        walk.root_thread_local::<RunError>(item, MOST_WALKED).map_err(|why| {
             box_err(
                 ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
                 heap,
@@ -3412,11 +3436,14 @@ fn export_program<'f>(
         next_row += 1;
         let tabled = walk.tabled(row);
         let symbol = walk.symbol(row);
+        let kind = walk.kind(row);
         let proof = ids.runnable(tabled).map_err(|why| {
             let krate = crate_of_item(list, tabled, heap.alloc());
             box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
         })?;
-        match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
+        let enclosers = crate::test_drive::suite_cache::local_enclosers_of(&walk, row, tabled);
+        let mut verify_maker = LazyVerifyMaker { maker: &mut maker, shared: &shared_front, enclosers: &enclosers, ids: &ids, verified: &mut verified, prepared: false };
+        match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut verify_maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
             Ok(one) => match one.stepped {
                 Stepped::Found(key) => {
                     cached += 1;
@@ -3424,6 +3451,7 @@ fn export_program<'f>(
                 }
                 Stepped::Made(key) => {
                     compiled += 1;
+                    verified.record_made(symbol, tabled, walk.name(row), scratch.made(), key, &ids, &builder, alloc);
                     if let Some(top) = top_stats.as_mut()
                         && let Some(sizes) = maker.take_last_make()
                     {
@@ -3443,6 +3471,12 @@ fn export_program<'f>(
                     outcomes.push(RowOutcome::Unkeyed(copied));
                 }
             },
+            Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
+                let msg = bstd::mem::format_in!(frame, "blaze build: called unbuilt function: {why}");
+                let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
+                stubs += 1;
+                outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
+            }
             Err(why) => {
                 return Err(box_err(
                     ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
