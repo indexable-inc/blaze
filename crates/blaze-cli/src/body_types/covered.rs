@@ -318,10 +318,12 @@ pub(crate) fn written_path<'n>(
 /// With no crate key there is no stop list: [`in_blocks`] is then refused (`NoCrateKey`), and
 /// every entry with it (engine_bodies.rs `groups`), so no body is checked twice.
 pub(crate) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n>, listed: &[Listed<'n>], alloc: Alloc<'n>) -> AVec<'n, WrittenBy<'n>> {
-    let blocks = match NamesSource::crate_key(records, 0) {
+    let crate_key = NamesSource::crate_key(records, 0);
+    let blocks = match crate_key {
         Some(krate) => block_stops(records, krate, listed, alloc),
         None => AVec::new_in(alloc),
     };
+    let harness_call = crate_key.map(blaze_scope::task::proc_macro_harness_call);
     let stop = |at: ItemKey| blocks.binary_search_by(|b| b.0.cmp(&at)).is_ok();
     let mut calls: AVec<'n, (ItemKey, Listed<'n>)> = AVec::new_in(alloc);
     for l in listed.iter().filter(|l| l.entry.is_none()) {
@@ -331,6 +333,13 @@ pub(crate) fn written_by<'n>(records: &'n Records<'n>, texts: &ExpansionTexts<'n
         // call's task, which passed clean with nothing checked; its check now reads the text
         // and is refused naming the record.
         if let Some(At::Expansion(call)) = body_text_at(records, l.body) {
+            // The compiler-synthesized `#[rustc_proc_macro_decls] pub static _DECLS` harness
+            // (blaze-scope resolve.rs `proc_macro_harness_call`) is not written by any user macro
+            // call and has no source file entry; each exported `#[proc_macro*]` fn it references
+            // is checked by its own body task.
+            if harness_call == Some(call) {
+                continue;
+            }
             calls.push((call, *l));
         }
     }
