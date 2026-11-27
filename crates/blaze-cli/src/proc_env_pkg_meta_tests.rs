@@ -78,18 +78,22 @@ fn a_macro_reads_cargo_pkg_authors_as_env_does_and_an_unknown_name_is_refused_by
     assert_eq!(sandbox.var("CARGO_PRIMARY_PACKAGE"), Ok(Some(String::from("1"))), "a member's crate");
     // A name cargo never sets is unset, not refused: no ambient environment (rule 75).
     assert_eq!(sandbox.var("NOT_A_CARGO_VAR"), Ok(None));
-    // A name cargo sets whose value this build does not know is refused by name.
+    // Integration test/bench gets the deterministic guest scratch dir.
     let mut test = Sandbox::new(Arc::new(unit_package(&xtask(WRITTEN, true), member()).unwrap_or_else(|e| panic!("{e:?}"))));
+    assert_eq!(test.var("CARGO_TARGET_TMPDIR"), Ok(Some(String::from("/target/tmp"))));
+    // A name cargo sets whose value this build does not know is refused by name.
+    let unjoined = CrateEnv::of(EnvFacts { build_script: true, script: None, ..env.facts() }, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("{e}"));
+    let mut unjoined_box = Sandbox::new(Arc::new(unit_package(&unjoined, member()).unwrap_or_else(|e| panic!("{e:?}"))));
     assert_eq!(
-        test.var("CARGO_TARGET_TMPDIR"),
-        Err(EnvRefused { name: String::from("CARGO_TARGET_TMPDIR"), krate: Some(String::from("tempo_xtask")) })
+        unjoined_box.var("OUT_DIR"),
+        Err(EnvRefused { name: String::from("OUT_DIR"), krate: Some(String::from("tempo_xtask")) })
     );
     // CONTROL: the graph carrying no metadata leaves the old refusal in place, named.
     let unknown = CrateEnv::of(EnvFacts { meta: None, ..env.facts() }, blaze_own::testing::heap().alloc()).unwrap_or_else(|e| panic!("{e}"));
     let mut old = Sandbox::new(Arc::new(unit_package(&unknown, member()).unwrap_or_else(|e| panic!("{e:?}"))));
     assert_eq!(old.var("CARGO_PKG_AUTHORS"), Err(EnvRefused { name: String::from("CARGO_PKG_AUTHORS"), krate: Some(String::from("tempo_xtask")) }));
     println!(
-        "CARGO_PKG_AUTHORS=`{}` in crate `tempo_xtask`; NOT_A_CARGO_VAR unset; CARGO_TARGET_TMPDIR refused by name",
+        "CARGO_PKG_AUTHORS=`{}` in crate `tempo_xtask`; NOT_A_CARGO_VAR unset; OUT_DIR refused by name",
         authors.ok().flatten().unwrap_or_default()
     );
 }
