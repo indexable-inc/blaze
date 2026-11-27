@@ -299,7 +299,7 @@ fn decide<'a, 's, W: World>(
                     }
                     let storage = row.unproved_storage(goal, body, types, exact, &mut cx, reads, FulfillErrorKind::Ambiguous)?;
                     let unavailable = match storage {
-                        Some((_, field)) => unavailable_witness(field, row.diag.at, body, types, exact, reads, true, alloc)?,
+                        Some((_, field)) => unavailable_witness(field, row.diag.at, body, types, exact, reads, true, false, alloc)?,
                         None => row.unavailable_goal_witness(body, types, exact, reads, true, alloc)?,
                     };
                     if let Some(why) = unavailable {
@@ -342,7 +342,7 @@ fn decide<'a, 's, W: World>(
                 Some((block, field)) => {
                     // The blamed value may be another fn's future read as its superset
                     // (`Exact::coroutine_of`): its `No` does not say what the state stores.
-                    if let Some(why) = unavailable_witness(field, row.diag.at, body, types, exact, reads, false, alloc)? {
+                    if let Some(why) = unavailable_witness(field, row.diag.at, body, types, exact, reads, false, false, alloc)? {
                         return Err(why);
                     }
                     Some((block, field))
@@ -374,7 +374,49 @@ fn decide<'a, 's, W: World>(
             out.push(diag);
         }
     }
+    drop_implied_projections(&mut out, fields, record)?;
     Ok(out)
+}
+
+/// Drop any replayed `Unsatisfied` projection finding whose owning trait goal also failed as
+/// `Unsatisfied` at the same site with the same arguments, matching
+/// `Machine::drop_projections_of_unmet_traits`.
+fn drop_implied_projections(
+    out: &mut Vec<Diag, Alloc<'_>>,
+    fields: &mut Vec<(Diag, ExprId, PTy), Alloc<'_>>,
+    record: PTys<'_>,
+) -> Result<(), StalledError> {
+    let mut i = 0;
+    while let Some(&d) = out.get(i) {
+        let mut implied = false;
+        if let (
+            DiagCode::Unsatisfied,
+            Some(Because::Unmet { goal: UnmetGoal::Projection { trait_, args, .. }, .. }),
+        ) = (d.code, d.because)
+        {
+            let proj_args = record.list(args)?;
+            for o in out.iter() {
+                if let (
+                    DiagCode::Unsatisfied,
+                    Some(Because::Unmet { goal: UnmetGoal::Trait { trait_: t2, args: a2 }, .. }),
+                ) = (o.code, o.because)
+                    && o.at == d.at
+                    && t2 == trait_
+                    && record.list(a2)? == proj_args
+                {
+                    implied = true;
+                    break;
+                }
+            }
+        }
+        if implied {
+            let _ = out.remove_shift(i);
+            fields.retain(|(f, _, _)| *f != d);
+        } else {
+            i += 1;
+        }
+    }
+    Ok(())
 }
 
 impl Stalled {
@@ -407,15 +449,17 @@ impl Stalled {
             }
             _ => (None, Some(self.ty)),
         };
+        let is_auto = reads.trait_def(self.trait_)?.is_some_and(|d| d.flags.0 & crate::world::TraitFlags::AUTO != 0);
+        let follow_sigs = !is_auto;
         if let Some(args) = args {
             for &ty in types.list(args)? {
-                if let Some(why) = unavailable_witness(ty, self.diag.at, body, types, exact, reads, ambiguous, alloc)? {
+                if let Some(why) = unavailable_witness(ty, self.diag.at, body, types, exact, reads, ambiguous, follow_sigs, alloc)? {
                     return Ok(Some(why));
                 }
             }
         }
         if let Some(ty) = extra
-            && let Some(why) = unavailable_witness(ty, self.diag.at, body, types, exact, reads, ambiguous, alloc)?
+            && let Some(why) = unavailable_witness(ty, self.diag.at, body, types, exact, reads, ambiguous, follow_sigs, alloc)?
         {
             return Ok(Some(why));
         }
@@ -445,7 +489,7 @@ impl Stalled {
                 !cx.may_hold(goal, reads)?
             };
             if matches && (kind != FulfillErrorKind::Unsatisfied
-                || unavailable_witness(field, self.diag.at, body, types, exact, reads, false, cx.alloc())?.is_none())
+                || unavailable_witness(field, self.diag.at, body, types, exact, reads, false, false, cx.alloc())?.is_none())
             {
                 return Ok(Some((block, field)));
             }
@@ -639,15 +683,24 @@ fn projection_found<W: World>(
                     };
                     let inner = probe.0.resolve(inner)?;
                     if inner == t {
-                        let rigid_param = if probe.0.list_len(aa) > 0 {
+                        if !probe.0.may_hold(Goal::Trait { trait_: at, args: aa }, reads)? {
+                            return Ok(None);
+                        }
+                        // An opaque whose own item bounds declare `<Opaque as at>::an = ...` only
+                        // falls back to rigid when that defining bound failed to evaluate (e.g. an
+                        // inner `!Send` bound). Any other unchanged alias whose trait goal holds
+                        // (including composite self types like `<&T as Ext>::Out` from an owner
+                        // where-clause) is genuinely rigid and can definitively mismatch (E0271).
+                        if probe.0.list_len(aa) > 0 {
                             let head = probe.0.list_get(aa, 0);
                             let head = probe.0.shallow_resolve(head);
-                            matches!(probe.0.view(head), TyView::Param(_))
-                        } else {
-                            false
-                        };
-                        if !rigid_param || !probe.0.may_hold(Goal::Trait { trait_: at, args: aa }, reads)? {
-                            return Ok(None);
+                            if let TyView::Opaque(k, _) = probe.0.view(head)
+                                && reads.predicates(k)?.clauses.iter().any(|c| {
+                                    matches!(c, PClause::Projection { trait_, name, .. } if *trait_ == at && *name == an)
+                                })
+                            {
+                                return Ok(None);
+                            }
                         }
                         continue;
                     }
@@ -725,10 +778,13 @@ fn local_closure_row(body: &BodyView<'_>, checked: &Checked<'_>, ordinal: u32) -
 /// caused a false `No` (structural auto traits answer `Ambiguous` for unrevealed opaques, and
 /// non-auto traits/projections ignore hidden types in analysis mode), so only its arguments
 /// and any already-revealed superset hidden types are checked.
+/// When `follow_sigs` is true (a non-auto trait or projection goal), function signatures
+/// (`FnPtr`, `FnDef`, and closure signatures) are also walked because impls can match on their
+/// parameter or return types; for auto traits only stored fields and captures matter.
 #[allow(clippy::too_many_arguments)]
 fn unavailable_witness<W: World>(
     ty: PTy, at: crate::ids::Range, body: &BodyView<'_>, types: PTys<'_>, exact: LocalWitnesses<'_, '_>,
-    reads: &mut Reads<'_, '_, W>, ambiguous: bool, alloc: Alloc<'_>,
+    reads: &mut Reads<'_, '_, W>, ambiguous: bool, follow_sigs: bool, alloc: Alloc<'_>,
 ) -> Result<Option<StalledError>, StalledError> {
     let mut work = Vec::new_in(alloc);
     let mut seen = blaze_hash::HashSet::new_in(alloc);
@@ -781,7 +837,9 @@ fn unavailable_witness<W: World>(
             PNode::Closure { owner, ordinal, args } => {
                 if owner == body.owner {
                     if let Some(row) = local_closure_row(body, exact.checked, ordinal) {
-                        if let Some(&sig) = exact.checked.closures.column::<2>().get(row) {
+                        if follow_sigs
+                            && let Some(&sig) = exact.checked.closures.column::<2>().get(row)
+                        {
                             if let PNode::FnPtr(io, _) = types.node(sig)? {
                                 work.extend_from_slice(types.list(io)?);
                             } else {
@@ -794,9 +852,18 @@ fn unavailable_witness<W: World>(
                     }
                 } else if let Some((f, env)) = reads.closure(owner, ordinal)? {
                     use crate::rules::async_fn::{SupersetFrom, superset_record};
-                    if let Some((item, first)) = superset_record(reads, SupersetFrom::Type(f.sig, f.types), alloc)? {
-                        let gap = crate::rules::async_fn::EXTERNAL_WITNESS_GAP;
-                        return Ok(Some(StalledError::Check(CheckError::ForeignWitness { gap, item, ordinal: Some(first), at })));
+                    if follow_sigs {
+                        if let PNode::FnPtr(io, _) = f.types.node(f.sig)? {
+                            for &part in f.types.list(io)? {
+                                if let Some((item, first)) = superset_record(reads, SupersetFrom::Type(part, f.types), alloc)? {
+                                    let gap = crate::rules::async_fn::EXTERNAL_WITNESS_GAP;
+                                    return Ok(Some(StalledError::Check(CheckError::ForeignWitness { gap, item, ordinal: Some(first), at })));
+                                }
+                            }
+                        } else if let Some((item, first)) = superset_record(reads, SupersetFrom::Type(f.sig, f.types), alloc)? {
+                            let gap = crate::rules::async_fn::EXTERNAL_WITNESS_GAP;
+                            return Ok(Some(StalledError::Check(CheckError::ForeignWitness { gap, item, ordinal: Some(first), at })));
+                        }
                     }
                     if let Some(env) = env
                         && let Some((item, first)) = superset_record(reads, SupersetFrom::Type(env, f.types), alloc)?
@@ -807,14 +874,21 @@ fn unavailable_witness<W: World>(
                 }
                 work.extend_from_slice(types.list(args)?);
             }
-            PNode::Future(e, output, stored) => {
-                match exact.interior(e, stored, at) {
-                    Ok(interior) => work.push(interior),
-                    Err(why) => return Ok(Some(why)),
+            PNode::Future(e, _, stored) => match exact.interior(e, stored, at) {
+                Ok(interior) => work.push(interior),
+                Err(why) => return Ok(Some(why)),
+            },
+            PNode::FnPtr(io, _) => {
+                if follow_sigs {
+                    work.extend_from_slice(types.list(io)?);
                 }
-                work.push(output);
             }
-            PNode::FnDef(..) | PNode::FnPtr(..) | PNode::Dynamic(_) => {}
+            PNode::FnDef(_, args) => {
+                if follow_sigs {
+                    work.extend_from_slice(types.list(args)?);
+                }
+            }
+            PNode::Dynamic(_) => {}
             n => crate::machine::children(n, types, &mut work)?,
         }
     }

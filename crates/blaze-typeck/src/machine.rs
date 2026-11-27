@@ -1561,7 +1561,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                             crate::stalled::Interior::Defer => {
                                 let (PendingGoal::Trait { trait_, args } | PendingGoal::Projection { trait_, args, .. }) = goal;
                                 let ty = self.ty.list_get(args, 0);
-                                let diag = PendingDiag::unmet(DiagCode::Unsatisfied, at, Some(ty), goal, None);
+                                let site = match err.obligation.cause {
+                                    Cause::Clause { expr, nth } => self.clause_at(expr, nth)?,
+                                    cause => At::of(cause),
+                                };
+                                let diag = PendingDiag::unmet(DiagCode::Unsatisfied, site, Some(ty), goal, None);
                                 self.stalled.push(crate::stalled::PendingStalled { trait_, ty, diag });
                                 continue;
                             }
