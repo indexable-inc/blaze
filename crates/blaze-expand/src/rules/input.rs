@@ -379,9 +379,11 @@ impl<'c, 'f> View<'c, 'f> {
                         cursor.bump_or_end(self);
                     }
                 }
-                Step::FloatSplit { .. } => {
+                Step::FloatSplit { ends_in_dot } => {
                     cursor.skip_invisible(self);
                     cursor.bump_or_end(self);
+                    let exits = if ends_in_dot { 1 } else { 2 };
+                    depth = depth.saturating_sub(exits);
                 }
                 Step::Error { msg } => {
                     if error.is_none() {
