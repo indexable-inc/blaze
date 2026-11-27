@@ -264,8 +264,9 @@ pub fn emit_mfunc_ssa_a64<'a>(
         (mopt_pre, msched_pre)
     };
 
-    // 6. Rebind per-call IPRA CallClobbers to post-mopt/msched MFunc instruction indices.
-    let mfunc_call_clobbers = bind_call_clobbers(&sel.mfunc, &sel.call_clobbers_seq, alloc)?;
+    // 6. Extract per-call IPRA CallClobbers from attached `MNoteKind::CallClobbers` notes
+    //    (invariant across pre-RA `mopt` block relocations/pruning and `msched` reordering).
+    let mfunc_call_clobbers = bind_call_clobbers(&sel.mfunc, alloc)?;
 
     // 7. Linear-time SSA register allocation (fast single-pass bitmask scan in fast cold mode;
     // remat, cold-exit split, coalescing, IPRA, X29 leaf, ParallelCopy in full SOTA mode).
@@ -2065,7 +2066,6 @@ struct SelectOut<'a> {
     trap_kinds: Vec<(TrapKind, Option<u32>, Held), Alloc<'a>>,
     unwind_entries: Vec<Option<(MBlock, blaze_code::unwind::Action)>, Alloc<'a>>,
     block_weights: Vec<u32, Alloc<'a>>,
-    call_clobbers_seq: Vec<CallClobbers, Alloc<'a>>,
     incoming_stack_params: Vec<IncomingStackParam, Alloc<'a>>,
     spill_base_off: u32,
     most_slot_align: u32,
@@ -2090,7 +2090,6 @@ struct Selector<'a, 'v> {
     unreach_ord: Vec<u32, Alloc<'a>>,
     sole_switch_default: Vec<u32, Alloc<'a>>,
     block_weights: Vec<u32, Alloc<'a>>,
-    call_clobbers_seq: Vec<CallClobbers, Alloc<'a>>,
     incoming_stack_params: Vec<IncomingStackParam, Alloc<'a>>,
     /// Per LIR block: entry `MBlock`.
     mblock_of_lir: Vec<MBlock, Alloc<'a>>,
@@ -3125,12 +3124,12 @@ impl<'a, 'v> Selector<'a, 'v> {
     }
 
     /// Emits a direct call sequence (`DirectBl` or `GotSlot`) to `target_id` with `clobbers`,
-    /// returning the emitted call (`Bl` / `Blr`) instruction for side-band note attachment.
+    /// attaching `MNoteKind::CallClobbers` directly to the emitted `Bl` / `Blr` instruction so
+    /// pre-RA `mopt` block relocations and `msched` can never desynchronize IPRA clobbers.
     fn emit_direct_call_site(&mut self, target_id: u32, clobbers: CallClobbers) -> MInst {
         self.has_calls = true;
         self.live_cmp = None;
-        self.call_clobbers_seq.push(clobbers);
-        match self.opts.call_mode {
+        let call_mi = match self.opts.call_mode {
             CallMode::DirectBl => {
                 let bl = self.push_op(MOp::Bl, MInstFlags::CALL.union(MInstFlags::PINNED));
                 self.mfunc.attach_note(
@@ -3178,7 +3177,9 @@ impl<'a, 'v> Selector<'a, 'v> {
                     MInstFlags::CALL.union(MInstFlags::PINNED),
                 )
             }
-        }
+        };
+        self.mfunc.attach_note(call_mi, MNoteKind::CallClobbers { mask: clobbers.clobbered.0 });
+        call_mi
     }
 
     /// Emits a C runtime call (`memcpy` / `memmove` / `memset`) taking pre-lowered `(X0, X1, X2)`.
@@ -8977,11 +8978,15 @@ impl<'a, 'v> Selector<'a, 'v> {
         } else if let Some(callee_reg) = indirect_reg {
             self.has_calls = true;
             self.live_cmp = None;
-            self.call_clobbers_seq.push(CallClobbers::C_ABI_ARM64);
-            self.push_op(
+            let blr = self.push_op(
                 MOp::Blr { target: callee_reg },
                 MInstFlags::CALL.union(MInstFlags::PINNED),
-            )
+            );
+            self.mfunc.attach_note(
+                blr,
+                MNoteKind::CallClobbers { mask: CallClobbers::C_ABI_ARM64.clobbered.0 },
+            );
+            blr
         } else {
             return Err(refuse(Some(inst), "missing call target"));
         };
@@ -10371,7 +10376,6 @@ fn select_mfunc_ssa<'a>(
         unreach_ord,
         sole_switch_default: crate::pass::frame::sole_switch_defaults(*view, alloc),
         block_weights: Vec::with_capacity_in(n_blocks * 2, alloc),
-        call_clobbers_seq: Vec::new_in(alloc),
         incoming_stack_params: Vec::new_in(alloc),
         mblock_of_lir: Vec::with_capacity_in(n_blocks, alloc),
         is_cleanup_block,
@@ -10612,7 +10616,6 @@ fn select_mfunc_ssa<'a>(
         trap_kinds: sel.trap_kinds,
         unwind_entries: sel.unwind_entries,
         block_weights: sel.block_weights,
-        call_clobbers_seq: sel.call_clobbers_seq,
         incoming_stack_params: sel.incoming_stack_params,
         spill_base_off,
         most_slot_align,
@@ -10782,30 +10785,44 @@ fn add_unwind_cfg_edges<'a>(
 
 fn bind_call_clobbers<'a>(
     func: &MFunc<'_>,
-    call_clobbers_seq: &[CallClobbers],
     alloc: Alloc<'a>,
 ) -> Result<Vec<(u32, CallClobbers), Alloc<'a>>, TierError> {
-    let mut bound: Vec<(u32, CallClobbers), Alloc<'a>> =
-        Vec::with_capacity_in(call_clobbers_seq.len(), alloc);
-    let mut seq_idx = 0usize;
+    let mut bound: Vec<(u32, CallClobbers), Alloc<'a>> = Vec::new_in(alloc);
+    let n_notes = func.notes.len();
     for &blk in func.block_order.iter() {
         let range = func.block_inst_range(blk);
         for i in range {
             let is_call = func.flags.get(i).is_some_and(|fl| fl.contains(MInstFlags::CALL))
                 || func.ops.get(i).is_some_and(|op| matches!(op, MOp::Bl | MOp::Blr { .. }));
             if is_call {
-                let mut clob = call_clobbers_seq
-                    .get(seq_idx)
-                    .copied()
-                    .unwrap_or(CallClobbers::C_ABI_ARM64);
+                let mut found_mask: Option<u64> = None;
+                let mut cur_note = func.note_idx.get(i).copied().unwrap_or(NO_NOTE);
+                let mut steps = 0usize;
+                while cur_note != NO_NOTE && steps < n_notes {
+                    let Some(&note) = func.notes.get(to_idx(cur_note)) else {
+                        break;
+                    };
+                    if let MNoteKind::CallClobbers { mask } = note.kind {
+                        found_mask = Some(mask);
+                        break;
+                    }
+                    cur_note = note.next;
+                    steps += 1;
+                }
+                let Some(mask) = found_mask else {
+                    return Err(TierError::Refused {
+                        tier: TIER,
+                        inst: None,
+                        what: "misel call instruction missing MNoteKind::CallClobbers note",
+                    });
+                };
                 // Always reserve X16/X17 (linker veneers / GotSlot scratch) and X30 (LR).
-                clob.clobbered = RegSet(
-                    clob.clobbered.0 | (1u64 << 16) | (1u64 << 17) | (1u64 << 30),
-                );
+                let clob = CallClobbers {
+                    clobbered: RegSet(mask | (1u64 << 16) | (1u64 << 17) | (1u64 << 30)),
+                };
                 let idx_u32 = u32_of(i)
                     .ok_or(TierError::TooLarge { tier: TIER, what: "instruction count" })?;
                 bound.push((idx_u32, clob));
-                seq_idx += 1;
             }
         }
     }
@@ -16283,6 +16300,245 @@ mod tests {
                 }
                 assert_eq!(&out[12..16], &[input[1], input[0], input[3], input[2]], "rev64.4s");
             }
+        }
+    }
+
+    #[test]
+    fn misel_ipra_call_clobbers_survive_pre_ra_mopt_block_relocation() {
+        use blaze_code::record::{Symbol, Target};
+        use blaze_tier::{CallClobbers, RegSet};
+
+        let alloc = test_alloc();
+        const SYM_CLOB: Symbol = Symbol([0x11; 32]);
+        const SYM_CLEAN: Symbol = Symbol([0x22; 32]);
+
+        struct TwoCalleeNames;
+        impl Names for TwoCalleeNames {
+            fn name(&self, of: Outside) -> Option<Named<'_>> {
+                match of {
+                    Outside::Func(0) => Some(Named::Symbol(SYM_CLOB)),
+                    Outside::Func(1) => Some(Named::Symbol(SYM_CLEAN)),
+                    _ => None,
+                }
+            }
+
+            fn routines(&self) -> RoutinePlaces {
+                RoutinePlaces::NONE
+            }
+        }
+
+        // Caller `(sel: i64, x: i64) -> i64`:
+        // - `b_join(arg)` is a normal block placed before cold `b_cold_short` in initial layout.
+        //   It keeps `saved = x + 0x1234` live across `call callee_clobbers_all(arg)` (full C ABI).
+        // - `b_cold_short` is a cold short block (`<= 6` insts) that calls `callee_leaf_clean(x)`
+        //   (narrow IPRA clobbers: only `x0`) and jumps directly to `b_join(v)`.
+        // Pre-RA `mopt` Pass 4d relocates `b_cold_short` immediately before `b_join` in
+        // `func.block_order`, swapping the two calls' order in `block_order`!
+        // With `MNoteKind::CallClobbers` attached per-instruction, `callee_clobbers_all` keeps
+        // its full `C_ABI_ARM64` clobbers so `saved` is allocated to a callee-saved register.
+        let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+        let caller_sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        let callee_sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+        b.set_signature(caller_sig);
+        let ref_clob = b.reference(RefKind::Func, 0);
+        let ref_clean = b.reference(RefKind::Func, 1);
+
+        let b_entry = b.create_block(BlockKind::Normal);
+        let b_a = b.create_block(BlockKind::Normal);
+        let b_ret_a = b.create_block(BlockKind::Normal);
+        let b_b = b.create_block(BlockKind::Normal);
+        let b_ret_b = b.create_block(BlockKind::Normal);
+        let b_join = b.create_block(BlockKind::Normal);
+        let b_cold_short = b.create_block(BlockKind::Cold);
+
+        b.begin(b_entry);
+        let sel = b.param(Ty::I64);
+        let x = b.param(Ty::I64);
+        let k0 = b.iconst(Ty::I64, 0);
+        let k1 = b.iconst(Ty::I64, 1);
+        let k2 = b.iconst(Ty::I64, 2);
+        let k_off = b.iconst(Ty::I64, 0x1234);
+        let c0 = b.icmp(IntCond::Eq, sel, k0);
+        b.br(Flags::NONE, c0, (b_a, &[]), (b_b, &[]));
+
+        b.begin(b_a);
+        let c1 = b.icmp(IntCond::Eq, sel, k1);
+        b.br(Flags::NONE, c1, (b_ret_a, &[]), (b_join, &[x]));
+
+        b.begin(b_ret_a);
+        b.ret(&[x]);
+
+        b.begin(b_b);
+        let c2 = b.icmp(IntCond::Eq, sel, k2);
+        b.br(Flags::NONE, c2, (b_ret_b, &[]), (b_cold_short, &[]));
+
+        b.begin(b_ret_b);
+        b.ret(&[x]);
+
+        b.begin(b_join);
+        let arg = b.param(Ty::I64);
+        let saved = b.binary(Op::Add, Flags::NONE, x, k_off);
+        let call_clob = b.call(Flags::NONE, ref_clob, callee_sig, &[arg]);
+        let ans = b.binary(Op::Add, Flags::NONE, call_clob, saved);
+        b.ret(&[ans]);
+
+        b.begin(b_cold_short);
+        let call_clean = b.call(Flags::NONE, ref_clean, callee_sig, &[x]);
+        b.jump((b_join, &[call_clean]));
+
+        let func = b.finish_checked().expect("ipra reloc caller finish");
+        let verified = verify(func.view()).expect("ipra reloc caller verify");
+
+        // Locate the two LIR call indices and supply distinct IPRA CallClobbers:
+        // - `call_clob` (`Outside::Func(0)`): full C ABI clobbers (`x0..x18`, `v0..v31`).
+        // - `call_clean` (`Outside::Func(1)`): narrow clobbers (only `x0`).
+        let mut call_clob_idx = None;
+        let mut call_clean_idx = None;
+        for i in 0..verified.view().len() {
+            if verified.view().op(i) == Op::Call {
+                let r = verified.view().operands(i).reference();
+                let rec = verified.view().refs[r.index()];
+                if rec.place == 0 {
+                    call_clob_idx = Some(u32::try_from(i).unwrap());
+                } else if rec.place == 1 {
+                    call_clean_idx = Some(u32::try_from(i).unwrap());
+                }
+            }
+        }
+        let call_clob_idx = call_clob_idx.expect("found call_clob");
+        let call_clean_idx = call_clean_idx.expect("found call_clean");
+        let mut clob_table = [
+            (call_clob_idx, CallClobbers::C_ABI_ARM64),
+            (call_clean_idx, CallClobbers { clobbered: RegSet(1u64 << 0) }),
+        ];
+        clob_table.sort_unstable_by_key(|&(idx, _)| idx);
+
+        let mut opts = default_opts();
+        opts.call_clobbers = &clob_table;
+
+        // First verify the test's causal precondition: pre-RA `mopt` Pass 4d actually swaps
+        // `b_cold_short`'s call ahead of `b_join`'s call in `func.block_order`.
+        {
+            let layout = super::compute_block_layout(&verified.view(), alloc);
+            let mut sel_out =
+                super::select_mfunc_ssa(&verified.view(), &TwoCalleeNames, &layout, opts, alloc)
+                    .expect("select_mfunc_ssa must succeed");
+            let collect_call_reloc_targets = |mf: &crate::sota::mfunc::MFunc<'_>| -> [u32; 2] {
+                let mut out = [u32::MAX; 2];
+                let mut n = 0usize;
+                for &blk in mf.block_order.iter() {
+                    for i in mf.block_inst_range(blk) {
+                        if matches!(mf.ops[i], crate::sota::mfunc::MOp::Bl) {
+                            let mut cur = mf.note_idx[i];
+                            while cur != crate::sota::mfunc::NO_NOTE {
+                                let note = mf.notes[usize::try_from(cur).unwrap()];
+                                if let crate::sota::mfunc::MNoteKind::Reloc { target, .. } = note.kind {
+                                    out[n] = target;
+                                    n += 1;
+                                }
+                                cur = note.next;
+                            }
+                        }
+                    }
+                }
+                assert_eq!(n, 2, "expected exactly 2 Bl calls");
+                out
+            };
+            let before = collect_call_reloc_targets(&sel_out.mfunc);
+            let _ = super::optimize_mfunc(&mut sel_out.mfunc, alloc);
+            let after = collect_call_reloc_targets(&sel_out.mfunc);
+            assert_ne!(
+                before, after,
+                "precondition failed: pre-RA mopt Pass 4d must reorder the two call blocks \
+                 (before={before:?}, after={after:?})"
+            );
+        }
+
+        let (caller_emitted, _, _) =
+            emit_mfunc_ssa_a64(verified, &TwoCalleeNames, opts, alloc)
+                .expect("misel must emit IPRA caller cleanly");
+        assert_eq!(caller_emitted.relocs.len(), 2);
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            // Hand-assembled AArch64 callees:
+            // - `callee_clobbers_all`: clobbers ALL caller-saved GPRs x1..x15 with poison and
+            //   returns `x0 + 100`.
+            // - `callee_leaf_clean`: returns `x0 + 7` touching ONLY `x0`.
+            let mut clob_words: Vec<u32, Alloc<'static>> = Vec::new_in(alloc);
+            for r in 1u32..=15u32 {
+                clob_words.push(crate::enc::movz(r, 0xdead, 0));
+            }
+            clob_words.push(crate::enc::add_imm(0, 0, 100, false));
+            clob_words.push(crate::enc::ret());
+
+            let clean_words: [u32; 2] = [
+                crate::enc::add_imm(0, 0, 7, false),
+                crate::enc::ret(),
+            ];
+
+            let clob_off = (caller_emitted.code.len() + 15) & !15;
+            let clean_off = (clob_off + clob_words.len() * 4 + 15) & !15;
+            let total_len = clean_off + clean_words.len() * 4;
+            let mut combined: Vec<u8, Alloc<'static>> = Vec::with_capacity_in(total_len, alloc);
+            for &byte in caller_emitted.code.iter() {
+                combined.push(byte);
+            }
+            while combined.len() < clob_off {
+                combined.push(0);
+            }
+            for &w in clob_words.iter() {
+                for &b in &w.to_le_bytes() {
+                    combined.push(b);
+                }
+            }
+            while combined.len() < clean_off {
+                combined.push(0);
+            }
+            for &w in clean_words.iter() {
+                for &b in &w.to_le_bytes() {
+                    combined.push(b);
+                }
+            }
+
+            for rel in caller_emitted.relocs.iter() {
+                assert_eq!(rel.kind, RelocKind::Branch26);
+                let target_off = match caller_emitted.targets.get(usize::try_from(rel.target).unwrap()) {
+                    Some(&Target { symbol: SYM_CLOB, .. }) => clob_off,
+                    Some(&Target { symbol: SYM_CLEAN, .. }) => clean_off,
+                    other => panic!("unexpected reloc target: {other:?}"),
+                };
+                let reloc_at = usize::try_from(rel.at).expect("reloc offset fits");
+                let delta_bytes = target_off.checked_sub(reloc_at).expect("callee follows caller");
+                let delta_words = i32::try_from(delta_bytes / 4).expect("Branch26 delta fits");
+                let bl_word = crate::enc::bl(delta_words).to_le_bytes();
+                combined[reloc_at..reloc_at + 4].copy_from_slice(&bl_word);
+            }
+
+            let exec = blaze_inproc::exec::Executable::new(&combined, 0)
+                .expect("W^X exec mapping must succeed");
+            // SAFETY: Valid AAPCS64 caller linked with both callees.
+            let f: extern "C" fn(u64, u64) -> u64 = unsafe { exec.as_fn() };
+            // `sel = 0` takes `b_a -> b_join(x)` directly: calls `callee_clobbers_all(x)` (= x + 100),
+            // then adds `saved = x + 0x1234` => `2*x + 100 + 0x1234`.
+            assert_eq!(
+                f(0, 42),
+                (42 + 100) + (42 + 0x1234),
+                "saved value across callee_clobbers_all was clobbered after Pass 4d block relocation!"
+            );
+            // `sel = 3` takes `b_b -> b_cold_short -> b_join(x + 7)`:
+            // calls `callee_leaf_clean(x)` (= x + 7), then `callee_clobbers_all(x + 7)` (= x + 107),
+            // then adds `saved = x + 0x1234` => `2*x + 107 + 0x1234`.
+            assert_eq!(
+                f(3, 42),
+                (42 + 7 + 100) + (42 + 0x1234),
+                "saved value via cold relocated path was clobbered!"
+            );
         }
     }
 }

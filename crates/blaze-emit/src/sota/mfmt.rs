@@ -634,6 +634,10 @@ fn format_annotations<W: fmt::Write>(
                 write_sep(&mut has_any, out)?;
                 write!(out, "table(#{table_id})")?;
             }
+            MNoteKind::CallClobbers { mask } => {
+                write_sep(&mut has_any, out)?;
+                write!(out, "clobbers({mask:#x})")?;
+            }
         }
         cur = note.next;
     }
