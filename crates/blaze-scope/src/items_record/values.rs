@@ -50,6 +50,44 @@ fn attr_byte(attr: &str) -> Option<u8> {
     ATTRS.iter().position(|a| *a == attr).and_then(|i| u8::try_from(i).ok())
 }
 
+struct ByteCounter(usize);
+
+impl core::fmt::Write for ByteCounter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        self.0 = self.0.saturating_add(s.len());
+        Ok(())
+    }
+}
+
+/// Exact UTF-8 byte length of the value/refusal texts [`append`] writes for `rows`.
+fn text_len(rows: &[ValueRow<'_>]) -> usize {
+    let mut total = 0usize;
+    for row in rows.iter() {
+        match row.value {
+            Ok(value) => total = total.saturating_add(value.len()),
+            Err(refused) => {
+                let mut counter = ByteCounter(0);
+                let _ = write!(counter, "{refused}");
+                total = total.saturating_add(counter.0);
+            }
+        }
+    }
+    total
+}
+
+/// Exact upper bound on the bytes (including 16-byte alignment padding) that [`append`] pushes
+/// onto `out` for `rows`, so callers can pre-size `out` without reallocating on a bump allocator
+/// even for arbitrarily long `link_name`/`export_name` values or refusal messages.
+pub(super) fn encoded_len_bound(rows: &[ValueRow<'_>]) -> usize {
+    if rows.is_empty() {
+        return 0;
+    }
+    super::ALIGN
+        .saturating_add(rows.len().saturating_mul(VALUE_ROW))
+        .saturating_add(TEXT_HEAD)
+        .saturating_add(text_len(rows))
+}
+
 /// Appends the section for `rows` (the solve's, `CrateNames::values`) to `out`, a record whose
 /// header is written, and sets its count and offset in the header. No rows: nothing is written.
 pub(super) fn append(out: &mut RecordBytes<'_>, rows: &[ValueRow<'_>], alloc: Alloc<'_>) -> Result<(), ItemsRecordError> {
@@ -66,7 +104,7 @@ pub(super) fn append(out: &mut RecordBytes<'_>, rows: &[ValueRow<'_>], alloc: Al
     if order.windows(2).any(|pair| (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1)) {
         return Err(ItemsRecordError::Short { what: "the value table (two rows of one item and attribute)", at: 0 });
     }
-    let mut text = AString::new_in(alloc);
+    let mut text = AString::with_capacity_in(text_len(rows), alloc);
     let mut spans: AVec<'_, (u8, u32, u32)> = AVec::with_capacity_in(order.len(), alloc);
     for &(_, _, i) in order.iter() {
         let start = text.len();
@@ -181,5 +219,33 @@ mod tests {
         assert!(out.len() > before.len(), "twin: one row writes the section");
         assert_eq!(le32(&out, 8 + 4 * F_VALUES_COUNT), 1);
         assert_ne!(le32(&out, 8 + 4 * F_VALUES_AT), 0);
+    }
+
+    /// Pre-sizing `out` with `encoded_len_bound` prevents reallocation even for >250-byte
+    /// `export_name`/`link_name` values on a bump allocator where `append` allocates scratch above `out`.
+    #[test]
+    fn long_values_do_not_reallocate_presized_output() {
+        let frame = blaze_mem::Frame::with_reserve(1 << 20, blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.bump().alloc();
+        let long_export = "export_symbol_".repeat(20);
+        let long_link = "link_symbol_".repeat(24);
+        assert!(long_export.len() > 250 && long_link.len() > 250);
+        let rows = [
+            ValueRow { item: ItemKey(blaze_id::ContentId([1; 32])), attr: "export_name", value: Ok(long_export.as_str()), reads: &[] },
+            ValueRow { item: ItemKey(blaze_id::ContentId([2; 32])), attr: "link_name", value: Ok(long_link.as_str()), reads: &[] },
+            ValueRow { item: ItemKey(blaze_id::ContentId([3; 32])), attr: "export_name", value: Ok(long_export.as_str()), reads: &[] },
+        ];
+        let base_len = 8 + 4 * (F_VALUES_AT + 1) + 5; // unaligned tail to exercise pad()
+        let bound = encoded_len_bound(&rows);
+        let mut out: RecordBytes<'_> = RecordBytes::with_capacity_in(base_len + bound, alloc);
+        out.resize(base_len, 0);
+        let ptr_before = out.as_ptr();
+        let cap_before = out.capacity();
+        append(&mut out, &rows, alloc).expect("append long values");
+        assert_eq!(out.as_ptr(), ptr_before, "out must not reallocate when pre-sized with encoded_len_bound");
+        assert_eq!(out.capacity(), cap_before, "out capacity must stay unchanged");
+        assert!(out.len() <= base_len + bound, "encoded bytes must fit within encoded_len_bound");
+        assert_eq!(frame.abandoned().bytes, 0, "no bump bytes abandoned during values::append");
     }
 }

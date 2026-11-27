@@ -1179,13 +1179,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
         })
         .saturating_add(ALIGN)
         .saturating_add(unfiled_impls.saturating_mul(buckets::UNFILED_ROW));
-    let values_cap = if names.values.is_empty() {
-        0
-    } else {
-        ALIGN
-            .saturating_add(names.values.len().saturating_mul(values::VALUE_ROW + 32))
-            .saturating_add(64)
-    };
+    let values_cap = values::encoded_len_bound(&names.values);
     let out_cap = at
         .saturating_add(strings.bytes.len())
         .saturating_add(grain_cap)
@@ -3244,19 +3238,32 @@ mod twins {
         use crate::resolve::{CrateInput, SourceTexts, aligned};
         use crate::task::Serial;
 
-        struct OneFile(&'static str, &'static str);
-        impl<'a> SourceTexts<'a> for OneFile {
+        struct OneFile<'a>(&'a str, &'a str);
+        impl<'a> SourceTexts<'a> for OneFile<'a> {
             fn read(&self, krate: usize, path: &str) -> Option<&'a str> {
                 (krate == 0 && path == self.0).then_some(self.1)
             }
         }
 
         let mut src = std::string::String::with_capacity(256 << 10);
-        src.push_str("#![no_core]\npub trait Op { fn name(&self) -> u32; }\n");
+        src.push_str("#![no_core]\nmacro_rules! sym_name { ($s:literal) => { $s }; }\npub trait Op { fn name(&self) -> u32; }\n");
         const STRUCTS: usize = 300;
         const METHODS: usize = 10;
         const ENUMS: usize = 120;
         const VARIANTS: usize = 6;
+        const LONG_ATTRS: usize = 16;
+        let long_prefix = "very_long_generated_abi_symbol_prefix_".repeat(7);
+        assert!(long_prefix.len() > 240);
+        for i in 0..LONG_ATTRS {
+            let _ = writeln!(src, "#[export_name = sym_name!(\"{long_prefix}exp_{i}\")]\npub extern \"C\" fn exported_{i}() {{}}");
+        }
+        // Also exercise a long (>240-byte) refused attr value so `ByteCounter` in `values::encoded_len_bound` is covered.
+        let _ = writeln!(src, "#[export_name = missing_macro!(\"{long_prefix}refused\")]\npub extern \"C\" fn exported_refused() {{}}");
+        src.push_str("extern \"C\" {\n");
+        for i in 0..LONG_ATTRS {
+            let _ = writeln!(src, "    #[link_name = sym_name!(\"{long_prefix}lnk_{i}\")]\n    fn linked_{i}();");
+        }
+        src.push_str("}\n");
         for i in 0..STRUCTS {
             let _ = writeln!(src, "pub struct S{i}(pub u32);");
             let _ = writeln!(src, "impl S{i} {{");
@@ -3273,8 +3280,7 @@ mod twins {
             }
             src.push_str(" }\n");
         }
-        let leaked_src: &'static str = std::boxed::Box::leak(src.into_boxed_str());
-        let texts: &'static OneFile = std::boxed::Box::leak(std::boxed::Box::new(OneFile("/big/lib.rs", leaked_src)));
+        let texts = OneFile("/big/lib.rs", src.as_str());
         let implicit = Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false };
         let input = CrateInput {
             name: "big_items_crate",
@@ -3291,9 +3297,10 @@ mod twins {
         let solve_frame = blaze_mem::Frame::new(blaze_mem::Tag::Nameres).expect("solve frame");
         let solve_erased = blaze_own::Erased::new(&solve_frame);
         let solve_bump = solve_erased.bump();
-        let (solved, _) = resolve_by_records(&[input], Sysroot::default(), texts, &Serial, &Ready::serial(std::time::Duration::from_secs(60)), solve_bump)
+        let (solved, _) = resolve_by_records(&[input], Sysroot::default(), &texts, &Serial, &Ready::serial(std::time::Duration::from_secs(60)), solve_bump)
             .expect("solve large crate");
         let krate = solved.first().expect("one solved crate").names;
+        assert_eq!(krate.values.len(), LONG_ATTRS * 2 + 1, "all long macro-expanded export_name/link_name attrs recorded");
 
         for include_grain in [false, true] {
             let enc_frame = blaze_mem::Frame::with_reserve(16 << 20, blaze_mem::Tag::Nameres).expect("encode frame");
@@ -3314,6 +3321,17 @@ mod twins {
             assert_eq!(record.impls(), STRUCTS * 2, "impls count");
             assert_eq!(record.owned_members(), STRUCTS * (METHODS + 1) + 1, "owned members count");
             assert_eq!(record.variant_rows(), ENUMS * VARIANTS, "variants count");
+            let mut ok_long = 0usize;
+            let mut err_long = 0usize;
+            for row in krate.values.iter() {
+                match record.attr_value(row.item, row.attr).expect("read attr value").expect("present") {
+                    Ok(s) if s.len() > 240 => ok_long += 1,
+                    Err(w) if w.len() > 240 => err_long += 1,
+                    other => panic!("unexpected attr value round-trip: {other:?}"),
+                }
+            }
+            assert_eq!(ok_long, LONG_ATTRS * 2, "all resolved >240-byte export_name/link_name values must round-trip");
+            assert_eq!(err_long, 1, "refused >240-byte attr value must round-trip");
         }
 
         // Also verify `names_record::encode` keeps bump abandonment low on the same large crate.

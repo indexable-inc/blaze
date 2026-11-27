@@ -597,13 +597,17 @@ fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope:
 
 #[expect(clippy::too_many_arguments, reason = "section encoder inputs, each named")]
 fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, member: bool, has_surface: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, metered: &metered::Metered<'_>, kept: blaze_own::SharedAlloc<'static>, force_par: bool) -> Result<ScopeRecord, Unwritten> {
-    const ALIGN: usize = 16;
-    const PLACES: usize = 16;
     // Match the serial path's `CALL_SCRATCH` ceiling (4 GiB): `Frame::with_reserve` only sets a
     // logical byte limit (zero VA/RSS committed until used, and every chunk/span is trimmed cold
     // back to 0 immediately after copying the section out), so giant generated crates such as
     // `aws_sdk_ec2` never hit an artificial 256 MiB cap in parallel section workers.
-    const WORKER_SCRATCH: usize = scope::CALL_SCRATCH;
+    scope_record_with_scratch(cx, workers, done, crate_name, member, has_surface, waits, metered, kept, force_par, scope::CALL_SCRATCH)
+}
+
+#[expect(clippy::too_many_arguments, reason = "section encoder inputs, each named")]
+fn scope_record_with_scratch<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, member: bool, has_surface: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, metered: &metered::Metered<'_>, kept: blaze_own::SharedAlloc<'static>, force_par: bool, worker_scratch: usize) -> Result<ScopeRecord, Unwritten> {
+    const ALIGN: usize = 16;
+    const PLACES: usize = 16;
     let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
     let par_workers = usize::try_from(workers.get().min(cx.workers())).unwrap_or(1);
     let mut findings = PathFindings::new_in(kept);
@@ -619,7 +623,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
         // copying out), while the calling thread computes `unresolved` findings and Section 5
         // (`expansions` + inner parallel zstd).
         let sec2_job = scope.may_overlap("names: encode section 2 (names)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "names", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -633,7 +637,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
             result
         });
         let sec3_job = scope.may_overlap("names: encode section 3 (items)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "items", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -647,7 +651,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
             result
         });
         let sec4_job = scope.may_overlap("names: encode section 4 (tests)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "tests", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -658,7 +662,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
             result
         });
         let sec6_job = scope.may_overlap("names: encode section 6 (links)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "link table", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -2215,6 +2219,42 @@ mod unresolved_tests {
         )
         .expect("resolve large crate");
         let waits = blaze_scope::waits_on::WaitsOn::of(done.names, &[], bump.alloc());
+
+        // Causal control (rule 23): a tight worker scratch cap below this crate's Section 3
+        // (`items`) bump need fails cleanly via `panics-fail-one-job` (reproducing the former cap
+        // failure), while the raised `CALL_SCRATCH` cap succeeds and matches the serial path.
+        let Ok(tight_err) = crate::work::unwinding(|| {
+            let scratch = Frame::with_reserve(64 << 20, Tag::Expand).expect("scratch");
+            let solve_scratch = Frame::with_reserve(64 << 20, Tag::Nameres).expect("solve scratch");
+            let metered = super::metered::Metered::new(&solve_frame, scratch, solve_scratch, super::metered::CallScratch::Reset);
+            super::scope_record_with_scratch(
+                &cx,
+                core::num::NonZeroU32::new(4).expect("non-zero workers"),
+                &done,
+                input.name,
+                false,
+                false,
+                &waits,
+                &metered,
+                kept_static,
+                true,
+                256 << 10,
+            )
+        }) else {
+            panic!("worker scratch refusal must fail only the worker job, not unwind the caller");
+        };
+        let err = tight_err.err().expect("256 KiB worker scratch must refuse this crate's large section encode");
+        assert!(
+            err.section == "items" || err.section == "names",
+            "expected items or names section refusal under tight worker scratch, got `{}`: {}",
+            err.section,
+            err.why
+        );
+        assert!(
+            err.why.contains("refused") || err.why.contains("panicked"),
+            "expected frame refusal diagnostic, got: {}",
+            err.why
+        );
 
         for has_surface in [false, true] {
             let run_once = |w: u32, force_par: bool| {
