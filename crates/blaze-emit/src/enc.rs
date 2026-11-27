@@ -756,11 +756,6 @@ pub(crate) const fn svc(imm16: u32) -> u32 {
     0xd400_0001 | ((imm16 & 0xffff) << 5)
 }
 
-/// `cset xd, cond`: alias of `csinc xd, xzr, xzr, invert(cond)` (C6.2.72).
-pub(crate) const fn cset(rd: Reg, cond: Cond) -> u32 {
-    0x9a80_0400 | (ZR << 16) | (cond.invert() << 12) | (ZR << 5) | rd
-}
-
 /// True iff `w` is an unconditional AArch64 control-transfer or trap instruction
 /// (`b`, `ret`, `br`, `brk`, or `udf`) that never falls through to the next word.
 pub(crate) const fn is_unconditional_terminator(w: u32) -> bool {
