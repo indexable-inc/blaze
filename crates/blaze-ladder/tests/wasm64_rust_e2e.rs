@@ -439,3 +439,161 @@ fn static_fn_pointer_relocation_and_determinism() {
     // 3 built-in globals ($__stack_pointer, $__heap_base, blaze_ring_abi_version) + dispatch_addr
     assert!(checked.global_count >= 4, "expected exported dispatch_addr global, got {}", checked.global_count);
 }
+
+const EXTERN_WEAK_MISSING_PROGRAM: &str = r#"
+#![no_core]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for i32 {}
+impl Copy for u8 {}
+impl Copy for usize {}
+impl<T> Copy for *const T {}
+
+unsafe extern "C" {
+    #[linkage = "extern_weak"]
+    static MISSING_WEAK_SYM: u8;
+}
+
+static WEAK_HOLDER: *const u8 = unsafe { &MISSING_WEAK_SYM as *const u8 };
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    let direct = unsafe { &MISSING_WEAK_SYM as *const u8 as usize };
+    let via_static = WEAK_HOLDER as usize;
+    if direct == 0 && via_static == 0 { 0 } else { 1 }
+}
+"#;
+
+const EXTERN_STRONG_MISSING_PROGRAM: &str = r#"
+#![no_core]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for i32 {}
+impl Copy for u8 {}
+impl Copy for usize {}
+impl<T> Copy for *const T {}
+
+unsafe extern "C" {
+    static MISSING_STRONG_SYM: u8;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    unsafe { &MISSING_STRONG_SYM as *const u8 as usize as i32 }
+}
+"#;
+
+#[test]
+fn extern_weak_missing_static_resolves_to_zero_while_strong_fails() {
+    let b = builder();
+
+    // Missing `#[linkage = "extern_weak"]` static (both direct and via static datum) compiles
+    // cleanly to a valid Wasm64 module with null address 0.
+    let weak_f = fixture(EXTERN_WEAK_MISSING_PROGRAM);
+    let weak_entry = item_named(&weak_f, ItemKind::Function, "main");
+    let mut weak_store = MemoryStore::new_in(alloc());
+    let mut weak_walk_maker = Maker::new(reader(&weak_f), Some(weak_entry), &b, alloc());
+    let (weak_walk, _) = walk_records(
+        weak_entry,
+        &EveryItem,
+        &mut weak_store,
+        &b,
+        &producer(),
+        &mut weak_walk_maker,
+        alloc(),
+    )
+    .unwrap_or_else(|e| panic!("walk_records failed for extern_weak: {e}"));
+    let weak_main_sym = weak_walk.symbol(0);
+    let weak_opts = Wasm64BuildOpts {
+        module_name: "extern_weak_missing",
+        start_symbol: Some(weak_main_sym),
+        exports: &[(weak_main_sym, "main")],
+        export_globals: &[],
+        include_blaze_host_v1: false,
+        opts: Wasm64Opts::DEFAULT,
+    };
+    let mut weak_maker = Maker::<TestGrant, SecondCheck>::of_start(
+        reader(&weak_f),
+        Some(weak_entry),
+        MakerStart::ByRule,
+        SecondCheck,
+        &b,
+        None,
+        alloc(),
+    );
+    let mut wasm: AVec<'static, u8> = OwnVec::new_in(alloc());
+    let built = compile_walk_to_wasm64(
+        &weak_walk,
+        |_| Some(TestGrant),
+        &mut weak_maker,
+        &weak_opts,
+        default_wasm64_import,
+        &mut wasm,
+        alloc(),
+    )
+    .unwrap_or_else(|e| panic!("compile_walk_to_wasm64 failed for missing extern_weak: {e}"));
+    assert_eq!(built.import_count, 0);
+    let checked = check_wasm64(wasm.as_slice())
+        .unwrap_or_else(|e| panic!("check_wasm64 rejected extern_weak module: {e}"));
+    assert!(checked.memory64);
+    assert_eq!(checked.import_count, 0);
+
+    // Control: missing strong `extern "C"` static still fails with UnresolvedImport.
+    let strong_f = fixture(EXTERN_STRONG_MISSING_PROGRAM);
+    let strong_entry = item_named(&strong_f, ItemKind::Function, "main");
+    let mut strong_store = MemoryStore::new_in(alloc());
+    let mut strong_walk_maker = Maker::new(reader(&strong_f), Some(strong_entry), &b, alloc());
+    let (strong_walk, _) = walk_records(
+        strong_entry,
+        &EveryItem,
+        &mut strong_store,
+        &b,
+        &producer(),
+        &mut strong_walk_maker,
+        alloc(),
+    )
+    .unwrap_or_else(|e| panic!("walk_records failed for extern strong: {e}"));
+    let strong_main_sym = strong_walk.symbol(0);
+    let strong_opts = Wasm64BuildOpts {
+        module_name: "extern_strong_missing",
+        start_symbol: Some(strong_main_sym),
+        exports: &[(strong_main_sym, "main")],
+        export_globals: &[],
+        include_blaze_host_v1: false,
+        opts: Wasm64Opts::DEFAULT,
+    };
+    let mut strong_maker = Maker::<TestGrant, SecondCheck>::of_start(
+        reader(&strong_f),
+        Some(strong_entry),
+        MakerStart::ByRule,
+        SecondCheck,
+        &b,
+        None,
+        alloc(),
+    );
+    let mut strong_wasm: AVec<'static, u8> = OwnVec::new_in(alloc());
+    let err = compile_walk_to_wasm64(
+        &strong_walk,
+        |_| Some(TestGrant),
+        &mut strong_maker,
+        &strong_opts,
+        default_wasm64_import,
+        &mut strong_wasm,
+        alloc(),
+    )
+    .expect_err("missing strong extern static must fail in wasm64");
+    assert!(
+        err.to_string().contains("MISSING_STRONG_SYM"),
+        "expected unresolved error naming MISSING_STRONG_SYM, got: {err}",
+    );
+}

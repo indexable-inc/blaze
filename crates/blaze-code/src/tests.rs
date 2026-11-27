@@ -3,8 +3,8 @@
 
 use blaze_own::{AVec, Alloc, Vec};
 
-use crate::image::{Image, Kind, Member, Write, lay_out};
-use crate::record::{CodeRecord, CodeView, RecordError, Site, SiteKind, Space, Symbol, Target};
+use crate::image::{Image, ImageError, Kind, Member, OutsideWord, Write, lay_out};
+use crate::record::{CodeRecord, CodeView, RecordError, Site, SiteKind, Space, Symbol, Target, Word};
 
 const ADRP_X16: u32 = 0x9000_0010;
 const LDR_X16: u32 = 0xF940_0210;
@@ -177,4 +177,74 @@ fn adrp_refuses_a_page_past_its_field_by_type() {
     }
     assert!(lo12(LDR_X16, pc + 0x18, 3).is_some(), "control: an 8-aligned load offset");
     assert_eq!(lo12(LDR_X16, pc + 0x1C, 3), None, "a load offset the 8-byte scale cannot say");
+}
+
+#[test]
+fn image_append_preserves_weak_outside() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut r = CodeRecord::new_in(alloc);
+    for &inst in &[ADRP_X16, LDR_X16, ADRP_X16, LDR_X16, RET] {
+        r.code.extend_from_slice(&inst.to_le_bytes());
+    }
+    let strong_idx = r.outside("strong_sym");
+    let weak_idx = r.weak_outside("weak_sym");
+    r.sites.push(Site { at: 0, kind: SiteKind::Load, target: strong_idx, addend: 0 });
+    r.sites.push(Site { at: 8, kind: SiteKind::Load, target: weak_idx, addend: 0 });
+    r.relro.extend_from_slice(&[0u8; 8]);
+    r.words.push(Word { at: 0, target: weak_idx, addend: 0 });
+    let mut bytes = Vec::new_in(alloc);
+    r.seal().unwrap().encode(&mut bytes);
+
+    let seg = lay_out(
+        &[Member { symbol: Symbol::of_name("entry"), record: CodeView::read(&bytes).unwrap() }],
+        Kind::Delta,
+        PAGE,
+        alloc,
+    )
+    .unwrap();
+    let base = 0x1_0000_0000u64;
+    let mut image = Image::new(base, PAGE, alloc).unwrap();
+    let appended = image.append(&seg).unwrap();
+
+    let strong_sym = Symbol::of_name("strong_sym");
+    let weak_sym = Symbol::of_name("weak_sym");
+    let strong_entries: Vec<OutsideWord, _> = {
+        let mut v = Vec::new_in(alloc);
+        for &w in appended.outside.iter() {
+            if w.symbol == strong_sym {
+                v.push(w);
+            }
+        }
+        v
+    };
+    let weak_entries: Vec<OutsideWord, _> = {
+        let mut v = Vec::new_in(alloc);
+        for &w in appended.outside.iter() {
+            if w.symbol == weak_sym {
+                v.push(w);
+            }
+        }
+        v
+    };
+    assert_eq!(strong_entries.len(), 1, "expected 1 strong outside word");
+    assert!(!strong_entries[0].weak, "strong Space::Outside must record weak: false");
+    assert_eq!(weak_entries.len(), 2, "expected 2 weak outside words (import slot + relro word)");
+    assert!(weak_entries.iter().all(|w| w.weak), "Space::WeakOutside must record weak: true");
+
+    // Control: nonzero addend on weak outside is still refused.
+    let mut bad = CodeRecord::new_in(alloc);
+    bad.code.extend_from_slice(&RET.to_le_bytes());
+    let w_idx = bad.weak_outside("bad_weak");
+    bad.relro.extend_from_slice(&[0u8; 8]);
+    bad.words.push(Word { at: 0, target: w_idx, addend: 8 });
+    let mut bad_bytes = Vec::new_in(alloc);
+    bad.seal().unwrap().encode(&mut bad_bytes);
+    let bad_seg = lay_out(
+        &[Member { symbol: Symbol::of_name("bad"), record: CodeView::read(&bad_bytes).unwrap() }],
+        Kind::Delta,
+        PAGE,
+        alloc,
+    )
+    .unwrap();
+    assert_eq!(image.append(&bad_seg).err(), Some(ImageError::OutsideAddend { symbol: Symbol::of_name("bad_weak") }));
 }

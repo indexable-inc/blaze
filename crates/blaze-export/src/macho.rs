@@ -302,16 +302,15 @@ pub(crate) struct ChainTooLarge {
 
 /// The chained fixups blob (`dyld_chained_fixups_header`, the starts, the import rows, the
 /// symbol pool), and each slot's encoded `DYLD_CHAINED_PTR_64_OFFSET` value by file offset.
-/// `fixups` are sorted by address, `slot` reads one as (image offset, what it becomes); `import`
-/// gives row `i` of `imports`. Shared by the executable ([`write`]) and the native dylib
+/// `fixups` are sorted by address, `slot` reads one as (image offset, what it becomes); `imports`
+/// holds each import row in order. Shared by the executable ([`write`]) and the native dylib
 /// (`native_dylib.rs`): one encoder of the format.
 pub(crate) fn chained_fixups<'a, 'n, F>(
     fixups: &[F],
     slot: impl Fn(&F) -> (u64, Chain),
     segs: &[ChainSeg],
     rows: ImportRows,
-    imports: usize,
-    import: impl Fn(usize) -> ChainImport<'n>,
+    imports: &[ChainImport<'n>],
     alloc: Alloc<'a>,
 ) -> Result<(AVec<'a, u8>, AVec<'a, (u64, u64)>), ChainTooLarge> {
     let mut slots: AVec<'a, (u64, u64)> = Vec::with_capacity_in(fixups.len(), alloc);
@@ -330,6 +329,9 @@ pub(crate) fn chained_fixups<'a, 'n, F>(
             Chain::Bind { import } => {
                 if import >= 1 << 24 {
                     return Err(ChainTooLarge { what: "a chained bind's 24-bit ordinal", len: u64::from(import), at: Some(at) });
+                }
+                if usize::try_from(import).ok().is_none_or(|idx| idx >= imports.len()) {
+                    return Err(ChainTooLarge { what: "a chained bind's import index", len: u64::from(import), at: Some(at) });
                 }
                 u64::from(import) | (next << 51) | (1 << 63)
             }
@@ -383,8 +385,7 @@ pub(crate) fn chained_fixups<'a, 'n, F>(
     }
     let imports_at = blob.len();
     let mut name_at = 0u64;
-    for i in 0..imports {
-        let row = import(i);
+    for row in imports.iter() {
         match rows {
             ImportRows::Plain => {
                 if name_at >= 1 << 23 {
@@ -411,18 +412,19 @@ pub(crate) fn chained_fixups<'a, 'n, F>(
         name_at += (row.lead.len() + row.name.len() + 1) as u64;
     }
     let symbols_at = blob.len();
-    for i in 0..imports {
-        let row = import(i);
+    for row in imports.iter() {
         blob.extend_from_slice(row.lead);
         blob.extend_from_slice(row.name);
         blob.push(0);
     }
     bytes::pad(&mut blob, 8);
+    let imports_count = u32::try_from(imports.len())
+        .map_err(|_| ChainTooLarge { what: "the chained import count", len: u64::try_from(imports.len()).unwrap_or(u64::MAX), at: None })?;
     bytes::set32(&mut blob, 0, 0); // fixups_version
     bytes::set32(&mut blob, 4, starts_at as u32);
     bytes::set32(&mut blob, 8, imports_at as u32);
     bytes::set32(&mut blob, 12, symbols_at as u32);
-    bytes::set32(&mut blob, 16, imports as u32);
+    bytes::set32(&mut blob, 16, imports_count);
     let format = match rows {
         ImportRows::Plain => DYLD_CHAINED_IMPORT,
         ImportRows::Addend64 => DYLD_CHAINED_IMPORT_ADDEND64,
@@ -459,7 +461,14 @@ fn chained<'a>(laid: &Laid<'_, '_>, native: Option<&Merged<'_, '_>>, segs: &[Seg
             FixTo::Rebase { target } => rebase(target)?,
             FixTo::Bind { import } => match direct(import) {
                 Some(target) => rebase(target)?,
-                None => Chain::Bind { import: row_of[import as usize] },
+                None => {
+                    let row = usize::try_from(import)
+                        .ok()
+                        .and_then(|idx| row_of.get(idx))
+                        .copied()
+                        .ok_or(ExportError::TooLarge { what: "a program import index", len: u64::from(import) })?;
+                    Chain::Bind { import: row }
+                }
             },
         };
         all.push((f.at, to));
@@ -467,19 +476,21 @@ fn chained<'a>(laid: &Laid<'_, '_>, native: Option<&Merged<'_, '_>>, segs: &[Seg
     if let Some(m) = native {
         all.extend_from_slice(&m.fixups);
     }
-    let program = kept.len();
-    let import = |i: usize| match (i.checked_sub(program), native) {
-        (Some(k), Some(m)) => m.imports[k],
-        _ => match kept.get(i).and_then(|&k| usize::try_from(k).ok()).and_then(|k| laid.imports.get(k)) {
-            Some(imp) => ChainImport { lead: b"_", name: imp.name.as_bytes(), ordinal: 1, weak: imp.weak, addend: 0 },
-            None => ChainImport { lead: b"_", name: b"", ordinal: 1, weak: false, addend: 0 },
-        },
-    };
     let (rows, count) = match native {
-        None => (ImportRows::Plain, program),
-        Some(m) => (ImportRows::Addend64, program + m.imports.len()),
+        None => (ImportRows::Plain, kept.len()),
+        Some(m) => (ImportRows::Addend64, kept.len() + m.imports.len()),
     };
-    chained_fixups(&all, |c: &(u64, Chain)| *c, &chain_segs, rows, count, import, alloc)
+    let mut all_imports: AVec<'a, ChainImport<'_>> = Vec::with_capacity_in(count, alloc);
+    for &k in kept.iter() {
+        let Some(imp) = usize::try_from(k).ok().and_then(|idx| laid.imports.get(idx)) else {
+            return Err(ExportError::TooLarge { what: "a program import index", len: u64::from(k) });
+        };
+        all_imports.push(ChainImport { lead: b"_", name: imp.name.as_bytes(), ordinal: 1, weak: imp.weak, addend: 0 });
+    }
+    if let Some(m) = native {
+        all_imports.extend_from_slice(&m.imports);
+    }
+    chained_fixups(&all, |c: &(u64, Chain)| *c, &chain_segs, rows, &all_imports, alloc)
         .map_err(|e| ExportError::TooLarge { what: e.what, len: e.len })
 }
 

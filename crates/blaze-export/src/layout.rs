@@ -1583,14 +1583,30 @@ pub(crate) fn lay_out_with_tls<'a, 'r>(
     }
     let text_end = plan.text_at + text.len() as u64;
 
-    // Every target a placed record names: C names gathered, thread-locals checked for runtime.
+    // Every target a placed record actually references in its sites or relro words: C names
+    // gathered, thread-locals checked for runtime. Unreferenced targets kept by `CodeRecord::seal`
+    // are ignored (matching `optimized.rs`), so dead strong entries cannot override a used weak
+    // reference to the same symbol.
     let mut imports: AVec<'a, Import<'r>> = Vec::new_in(alloc);
     for (pos, &i) in order.iter().enumerate() {
         if rep[pos] as usize != pos {
             continue;
         }
         let m = &members[i as usize];
-        for k in 0..m.record.targets() {
+        let site_targets = (0..m.record.sites())
+            .map(|s| m.record.site(s))
+            .filter(|s| s.kind != SiteKind::Relro)
+            .map(|s| s.target);
+        let word_targets = (0..m.record.words())
+            .map(|w| m.record.word(w).target)
+            .filter(|&target| target != OWN_CODE && target != OWN_RELRO);
+        for target_idx in site_targets.chain(word_targets) {
+            let Ok(k) = usize::try_from(target_idx) else {
+                continue;
+            };
+            if k >= m.record.targets() {
+                continue;
+            }
             let t = m.record.target(k);
             match t.space {
                 Space::Tls => {

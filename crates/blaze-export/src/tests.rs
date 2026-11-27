@@ -1676,3 +1676,110 @@ fn extern_weak_elf_macho_and_strong_overrides_weak() {
     assert_eq!(nlist_strong_only, Some(false));
     assert_eq!(nlist_shared, Some(false));
 }
+
+#[test]
+fn unused_strong_outside_target_does_not_override_weak_import() {
+    let alloc = Alloc::global();
+    // Build a record with a USED `WeakOutside("opt_sym")` load site and an UNUSED strong
+    // `Outside("opt_sym")` target retained in the target table by `CodeRecord::seal`.
+    let make_rec = |use_strong: bool| {
+        let mut r = CodeRecord::new_in(alloc);
+        let code = if use_strong {
+            &[STP, MOV_FP, ADRP_X0, LDR_X0, ADRP_X16, LDR_X16, LDP, RET][..]
+        } else {
+            &[STP, MOV_FP, ADRP_X0, LDR_X0, LDP, RET][..]
+        };
+        for &inst in code {
+            r.code.extend_from_slice(&inst.to_le_bytes());
+        }
+        let weak_idx = r.weak_outside("opt_sym");
+        let strong_idx = r.outside("opt_sym");
+        r.sites.push(Site { at: 8, kind: SiteKind::Load, target: weak_idx, addend: 0 });
+        if use_strong {
+            r.sites.push(Site { at: 16, kind: SiteKind::Load, target: strong_idx, addend: 0 });
+        }
+        let mut out = Vec::new_in(alloc);
+        r.seal().unwrap().encode(&mut out);
+        out
+    };
+
+    let only_weak_used = make_rec(false);
+    let laid_weak = lay_out(
+        &[Member { symbol: sym("main"), record: CodeView::read(&only_weak_used).unwrap(), tier: Some(Tier::Fast) }],
+        &[],
+        sym("main"),
+        None,
+        elf::plan(),
+        0,
+        alloc,
+    )
+    .expect("layout with unused strong target should succeed");
+    assert_eq!(laid_weak.imports.len(), 1);
+    assert_eq!(laid_weak.imports[0].name, "opt_sym");
+    assert!(
+        laid_weak.imports[0].weak,
+        "unused strong target must not override a referenced weak import",
+    );
+
+    // Control: once a site actually references the strong target, strong overrides weak.
+    let both_used = make_rec(true);
+    let laid_strong = lay_out(
+        &[Member { symbol: sym("main"), record: CodeView::read(&both_used).unwrap(), tier: Some(Tier::Fast) }],
+        &[],
+        sym("main"),
+        None,
+        elf::plan(),
+        0,
+        alloc,
+    )
+    .expect("layout with both strong and weak used should succeed");
+    assert_eq!(laid_strong.imports.len(), 1);
+    assert_eq!(laid_strong.imports[0].name, "opt_sym");
+    assert!(!laid_strong.imports[0].weak, "control: referenced strong target must override weak");
+}
+
+#[test]
+fn macho_refuses_out_of_range_chained_import_index() {
+    let alloc = Alloc::global();
+    let (main, second) = tiny();
+    let members = [
+        Member { symbol: sym("main"), record: CodeView::read(&main).unwrap(), tier: Some(Tier::Fast) },
+        Member { symbol: sym("second"), record: CodeView::read(&second).unwrap(), tier: Some(Tier::Fast) },
+    ];
+    let mut laid = lay_out(&members, &[], sym("main"), None, macho::plan(), 0x1000, alloc).unwrap();
+    let eh = crate::eh_out::eh_sections(&laid, &members, None, Platform::MacosArm64, alloc).unwrap();
+    let mut out = Vec::new_in(alloc);
+    // Control: valid laid-out program writes cleanly.
+    macho::write(&laid, &eh, "valid", &[0u8; 32], &mut out, alloc).expect("valid macho write");
+
+    // Corrupt a Bind fixup to point past `laid.imports.len()`.
+    let bind = laid
+        .fixups
+        .iter_mut()
+        .find(|f| matches!(f.to, FixTo::Bind { .. }))
+        .expect("tiny program must have a Bind fixup");
+    bind.to = FixTo::Bind { import: 99 };
+    out.clear();
+    let err = macho::write(&laid, &eh, "invalid", &[0u8; 32], &mut out, alloc)
+        .expect_err("out-of-range Bind import index must fail with typed ExportError");
+    assert!(
+        matches!(err, ExportError::TooLarge { len: 99, .. }),
+        "expected ExportError::TooLarge for index 99, got {err:?}",
+    );
+
+    // Also test `macho::chained_fixups` directly with an out-of-range `Chain::Bind`.
+    let segs = [macho::ChainSeg { vm: 0x4000, vm_size: 0x4000, fixups: true }];
+    let fixups = [(0x4000u64, macho::Chain::Bind { import: 1 })];
+    let imports = [macho::ChainImport { lead: b"_", name: b"exit", ordinal: 1, weak: false, addend: 0 }];
+    let chain_err = macho::chained_fixups(
+        &fixups,
+        |c: &(u64, macho::Chain)| *c,
+        &segs,
+        macho::ImportRows::Plain,
+        &imports,
+        alloc,
+    )
+    .expect_err("chained_fixups must reject out-of-range bind ordinal");
+    assert_eq!(chain_err.len, 1);
+    assert_eq!(chain_err.at, Some(0x4000));
+}

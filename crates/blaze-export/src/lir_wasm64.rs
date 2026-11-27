@@ -49,6 +49,10 @@ pub struct LirWasm64Func<'a> {
     pub view: View<'a>,
 }
 
+/// Sentinel static `place` representing an unresolved `#[linkage = "extern_weak"]` symbol,
+/// which resolves to the null address `0` in `Op::DataAddr`, `DataRec` relocs, and static relocs.
+pub const NULL_STATIC_PLACE: u32 = u32::MAX;
+
 /// Target of an 8-byte relocation inside a [`LirWasm64Static`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LirWasm64RelocTarget {
@@ -715,6 +719,9 @@ impl<'a, 'm> ModuleCtx<'a, 'm> {
     }
 
     fn resolve_static(&self, func: u32, inst: usize, place: u32) -> Result<u64, LirWasm64Error> {
+        if place == NULL_STATIC_PLACE {
+            return Ok(0);
+        }
         for &(p, addr) in self.static_addrs.as_slice() {
             if p == place {
                 return Ok(addr);
@@ -945,6 +952,9 @@ pub fn compile_lir_wasm64<'a>(
     let mut data_bufs: AVec<'a, (u64, AVec<'a, u8>)> = Vec::new_in(alloc);
 
     for st in module.statics {
+        if st.place == NULL_STATIC_PLACE {
+            return Err(LirWasm64Error::Overflow { what: "static place collides with null sentinel" });
+        }
         for &(existing, _) in static_addrs.as_slice() {
             if existing == st.place {
                 return Err(LirWasm64Error::DuplicatePlace { kind: "static", place: st.place });
