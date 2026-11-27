@@ -1222,7 +1222,7 @@ impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
                 return Ok(None);
             }
             let Some(params) = heads.assoc_const_params(owner, name) else {
-                return if heads.trait_supers(owner).is_none() {
+                return if !heads.trait_members_made(owner) {
                     Err(Why::Need(owner))
                 } else {
                     Err(Why::Unsupported("a generic associated type whose declared const parameters are missing", r))

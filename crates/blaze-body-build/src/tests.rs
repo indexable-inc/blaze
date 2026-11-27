@@ -1034,8 +1034,8 @@ fn track_caller_receives_forwards_and_materializes_location() {
             }
         }
         fn location_adt(&self) -> Option<ItemKey> { Some(LOC_ADT) }
-        fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Option<bool> {
-            Some(inst.item == TRACKED_OUTER || inst.item == TRACKED_INNER)
+        fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Result<Option<bool>, blaze_build::BuildError> {
+            Ok(Some(inst.item == TRACKED_OUTER || inst.item == TRACKED_INNER))
         }
         fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
             Ok(blaze_build::CallerSite { file: "test.rs", item, offset: 10 })
@@ -1222,8 +1222,8 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
             })
         }
         fn location_adt(&self) -> Option<ItemKey> { Some(LOC_ADT) }
-        fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Option<bool> {
-            Some(inst.item == TRACKED_FN)
+        fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Result<Option<bool>, blaze_build::BuildError> {
+            Ok(Some(inst.item == TRACKED_FN))
         }
         fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
             Ok(blaze_build::CallerSite { file: "shims.rs", item, offset: 7 })

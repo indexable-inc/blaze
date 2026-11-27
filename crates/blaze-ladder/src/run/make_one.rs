@@ -1941,17 +1941,20 @@ impl<P: FrontEnd> blaze_build::Adts for CachedFront<'_, P> {
     fn abi(&self, item: ItemKey) -> Option<blaze_build::Abi> { self.front.abi(item) }
     fn nounwind(&self, owner: ItemKey) -> Option<bool> { self.front.nounwind(owner) }
     fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs { self.front.fn_attrs(owner) }
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         let item = match self.front.0.resolve(self.front.1, instance.item, instance.args, ground) {
             Ok((resolved, _)) => resolved,
+            Err(e @ blaze_typeck::ResolveError::Missing(_)) => return Err(BuildError::Select(e)),
             Err(_) => instance.item,
         };
         if let Some(&hit) = self.cache.borrow().track_caller.get(&item) {
-            return Some(hit);
+            return Ok(Some(hit));
         }
-        let ans = self.front.0.track_caller(item)?;
+        let Some(ans) = self.front.0.track_caller(item) else {
+            return Ok(None);
+        };
         self.cache.borrow_mut().track_caller.insert(item, ans);
-        Some(ans)
+        Ok(Some(ans))
     }
     fn location_adt(&self) -> Option<ItemKey> { self.front.location_adt() }
     fn caller_site(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> { self.front.caller_site(owner, expr) }

@@ -1082,10 +1082,17 @@ impl Adts for Recorded<'_> {
         self.world.fmt_argument_adt()
     }
 
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         let answer = self.world.track_caller(instance, ground);
         match ground.view().list(instance.args) {
-            Ok(args) => self.log.ask(ReadKind::TrackCaller, instance.item, 0, args, Ok(small(answer))),
+            Ok(args) => {
+                let logged = match &answer {
+                    Ok(v) => Ok(small(*v)),
+                    Err(BuildError::Select(blaze_typeck::ResolveError::Missing(_))) => Err(Stop::Unmade(instance.item)),
+                    Err(_) => Ok(small(None::<bool>)),
+                };
+                self.log.ask(ReadKind::TrackCaller, instance.item, 0, args, logged);
+            }
             Err(_) => self.log.stop(ReadsError::Malformed { kind: ReadKind::TrackCaller, item: instance.item }),
         }
         answer
@@ -1370,7 +1377,7 @@ pub fn verify_today(
                 recorded.nounwind(item);
             }
             ReadKind::TrackCaller => {
-                recorded.track_caller(Instance { item, args: list }, ground);
+                let _ = recorded.track_caller(Instance { item, args: list }, ground);
             }
             ReadKind::Resolve => {
                 let resolved = beyond.resolve(item, list, ground);

@@ -975,9 +975,9 @@ impl Adts for TestAdts<'_> {
         self.world.fns.iter().any(|f| f.key == item).then(|| self.world.c_abi.contains(&item))
     }
 
-    fn track_caller(&self, instance: Instance, _: &mut PortableTys<'_>) -> Option<bool> {
+    fn track_caller(&self, instance: Instance, _: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         let item = instance.item;
-        self.world.fns.iter().any(|f| f.key == item).then(|| self.world.tracked.contains(&item))
+        Ok(self.world.fns.iter().any(|f| f.key == item).then(|| self.world.tracked.contains(&item)))
     }
 
     fn caller_site(&self, _: ItemKey, _: ExprId) -> Result<crate::CallerSite<'_>, crate::SiteGap> {

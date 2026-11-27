@@ -85,21 +85,24 @@ fn the_real_context_refuses_an_unmet_bound() {
 
 /// A construct this build does not take is one refusal naming it, at its place, in the words
 /// a Rust programmer uses, whichever stage refuses it: the construct here passes the front
-/// end and the checker and is refused by the build. It is an or-pattern in a `let` (the
-/// Reference, "let statements": `let PatternNoTopAlt`, so the or-pattern is parenthesized,
-/// "Grouped patterns"; `let (A(x) | B(x)) = e;` is irrefutable), which the build refuses by
-/// name (blaze-build walk.rs, the `let` binder: "a pattern other than a binding, `_`, a tuple,
-/// .."), at the or-pattern inside the parentheses. The plain rendering says it on its line and closes with what this build runs
-/// today. Judge-changed 2026-11-16 (checks integrator, on the coordinator's decision): was
-/// `a_closure_is_a_named_refusal`; the build now builds an unused non-capturing closure, so a
-/// closure is no longer a refused construct. (An `f16` was tried first: the old front end
-/// refuses it as "the type `f16` names nothing" before the build sees it.) Judge-changed again
-/// 2026-11-16 18:2x (run-path integrator B): was `an_underscore_assignment_is_a_named_refusal`;
-/// blaze-build walk/discard.rs builds `_ = e` since the 17:22 snapshot, so it is no longer a
-/// refused construct.
+/// end and the checker and is refused by the build. It is an or-pattern in a function parameter
+/// (the Reference, "Function parameters": `PatternNoTopAlt`, so the or-pattern is parenthesized,
+/// "Grouped patterns"; `fn f((E::A(x) | E::B(x)): E)` is irrefutable), which the build refuses
+/// by name (blaze-build walk.rs, `bind_value`: "a pattern other than a binding, `_`, a tuple,
+/// .."), at the or-pattern inside the parentheses. The plain rendering says it on its line and
+/// closes with what this build runs today. Judge-changed 2026-11-16 (checks integrator, on the
+/// coordinator's decision): was `a_closure_is_a_named_refusal`; the build now builds an unused
+/// non-capturing closure, so a closure is no longer a refused construct. (An `f16` was tried
+/// first: the old front end refuses it as "the type `f16` names nothing" before the build sees
+/// it.) Judge-changed again 2026-11-16 18:2x (run-path integrator B): was
+/// `an_underscore_assignment_is_a_named_refusal`; blaze-build walk/discard.rs builds `_ = e`
+/// since the 17:22 snapshot, so it is no longer a refused construct. Judge-changed 2026-11-27:
+/// `let (E::A(x) | E::B(x)) = e;` is now built by blaze-build walk/matches/irrefutable.rs
+/// (`pat_has_or`), so the same irrefutable or-pattern in a parameter (`bind_param`) exercises
+/// `bind_value`'s refusal.
 #[test]
 fn an_or_pattern_in_a_let_is_a_named_refusal() {
-    let text = "enum E { A(u8), B(u8) }\nfn main() { let (E::A(x) | E::B(x)) = E::A(1); }";
+    let text = "enum E { A(u8), B(u8) }\nfn f((E::A(x) | E::B(x)): E) -> u8 { x }\nfn main() { let _ = f(E::A(1)); }";
     let files = [SourceFile { path: "src/main.rs", text }];
     let all = refusals(&files, "src/main.rs", OverflowChecks::On, Alloc::global());
     assert_eq!(all.len(), 1, "{all:?}");
@@ -108,7 +111,7 @@ fn an_or_pattern_in_a_let_is_a_named_refusal() {
     assert!(r.construct.is_some_and(|c| c.starts_with("a pattern other than a binding, `_`,")), "{r:?}");
     assert!(r.message.ends_with(NOT_YET), "{}", r.message);
     let at = (r.place + r.start) as usize;
-    // The or-pattern inside its grouping parentheses (line 2, column 18).
+    // The or-pattern inside its grouping parentheses (line 2, column 7).
     assert!(text[at..].starts_with("E::A(x) | E::B(x))"), "{r:?}: at `{}`", &text[at..]);
     let column = at - text.find('\n').expect("two lines");
     let shown = crate::run::plain(&files, &all);

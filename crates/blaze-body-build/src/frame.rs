@@ -402,7 +402,7 @@ impl<A: Allocator + Copy> Cx<'_, '_, '_, A> {
         } else {
             let own_args = self.subst.ground.intern_list(self.subst.args).map_err(|_| self.malformed("the ground table is full"))?;
             let own_inst = Instance { item: self.item, args: own_args };
-            match self.adts.track_caller(own_inst, self.subst.ground) {
+            match self.adts.track_caller(own_inst, self.subst.ground).map_err(|e| self.facts(e))? {
                 Some(true) => {
                     if c_variadic {
                         return Err(self.malformed("a C-variadic fn that is `#[track_caller]` (E0737)"));

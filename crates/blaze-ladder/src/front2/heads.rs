@@ -214,6 +214,9 @@ pub struct Maps {
     /// [`Heads::trait_super_projs`]), filed with `supers` and restored from
     /// [`TraitExtra::supertraits`].
     pub super_projs: Rows<LibKey, blaze_own::Vec<super::types::SuperProj, Alloc<'static>>>,
+    /// Traits whose full members (`Want::Members`, Layer 3 — including `assoc_consts`) have been
+    /// filed, distinguishing Layer 2 (`supers_only`) from complete member loading.
+    pub trait_members_made: Rows<LibKey, ()>,
     /// Each type alias's generic count and aliased type ([`Heads::alias`]); `None` where its
     /// head was refused, with the why in `alias_gaps`: an alias no path uses never fails a
     /// check, and one that is used fails only the item that names it.
@@ -306,6 +309,7 @@ impl Maps {
             assoc_consts: Rows::new_in(alloc),
             supers: Rows::new_in(alloc),
             super_projs: Rows::new_in(alloc),
+            trait_members_made: Rows::new_in(alloc),
             aliases: Rows::new_in(alloc),
             alias_defaults: Rows::new_in(alloc),
             alias_slots: Rows::new_in(alloc),
@@ -342,6 +346,7 @@ impl Maps {
             assoc_consts,
             supers,
             super_projs,
+            trait_members_made,
             aliases,
             alias_defaults,
             alias_slots,
@@ -372,6 +377,7 @@ impl Maps {
         assoc_consts.clear();
         supers.clear();
         super_projs.clear();
+        trait_members_made.clear();
         aliases.clear();
         alias_defaults.clear();
         alias_slots.clear();
@@ -589,6 +595,9 @@ impl Heads for Maps {
     }
     fn trait_super_projs(&self, trait_: LibKey) -> Option<&[super::types::SuperProj]> {
         self.super_projs.get(&trait_).map(|s| &s[..])
+    }
+    fn trait_members_made(&self, trait_: LibKey) -> bool {
+        self.trait_members_made.contains_key(&trait_)
     }
     fn trait_has_assoc(&self, trait_: LibKey, name: Name) -> Option<bool> {
         self.traits.get(&trait_).map(|t| t.assoc.contains(&name))
@@ -4701,6 +4710,7 @@ impl<'n> Store<'n> {
                     }
                     if let Some(x) = extra {
                         self.trait_defs.insert(ck, x);
+                        self.maps.trait_members_made.insert(key, ());
                     }
                     if let Some(p) = preds {
                         let p = blaze_own::Box::into_inner(p);
@@ -5703,6 +5713,7 @@ impl<'n> Store<'n> {
             }
         }
         self.trait_defs.insert(ck, TraitExtra { supertraits, assoc, consts });
+        self.maps.trait_members_made.insert(key, ());
         self.preds.insert(ck, preds);
         self.container_life_from_view(names, keys, key, module, v);
         Ok(())
