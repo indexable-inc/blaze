@@ -432,25 +432,159 @@ fn scope_crates_labels<'n>(crates: crate::run_names::ScopeCrates<'_, 'n>, frame:
     }
 }
 
-/// Hash index of `outlined` by physical checkout path in phase memory for O(1) lookup by path.
-fn outlined_by_path<'o, 'p>(outlined: &'o [Outlined<'_>], at_phase: SharedAlloc<'p>) -> blaze_hash::Map<&'o [u8], usize, blaze_hash::FixedState, SharedAlloc<'p>> {
-    let mut index: blaze_hash::Map<&'o [u8], usize, blaze_hash::FixedState, SharedAlloc<'p>> =
-        blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: at_phase, capacity: Some(outlined.len()) });
-    for (at, one) in outlined.iter().enumerate() {
-        if crate::data_include::is_data(one.edition) {
-            continue;
-        }
-        index.entry(one.path.as_slice()).or_insert(at);
-    }
-    index
+/// Hash index of non-data [`Outlined`] entries by physical checkout path in phase memory for O(1)
+/// lookup, preserving every outline slot when a single physical file (such as a shared `mod.rs`)
+/// is planned under multiple slots (`mod rungs;` -> `tests/rungs.rs`, `#[path = "../tests/rungs/mod.rs"]`
+/// -> `tests/rungs/mod.rs`; D191, matching [`crate::engine_body_plan::outline_at_path`]).
+struct OutlinedByPath<'o, 'p> {
+    /// Physical path -> `(head, tail)` indices into `outlined` / `next` (preserving `outlined` order).
+    map: blaze_hash::Map<&'o [u8], (u32, u32), blaze_hash::FixedState, SharedAlloc<'p>>,
+    /// Intrusive next-index chain for paths with >1 non-data outline (`u32::MAX` = end).
+    next: SVec<'p, u32>,
+    /// Sorted `(alias_slot, canonical_slot)` for non-first outlines sharing a physical path with
+    /// an earlier outline in `outlined`. Empty when every physical path has one outline.
+    aliases: SVec<'p, (Name, Name)>,
 }
 
-/// First outline index in `outlined` whose path equals `path`, via [`outlined_by_path`].
-fn find_outlined_index<'q>(
-    by_path: &blaze_hash::Map<&'q [u8], usize, blaze_hash::FixedState, SharedAlloc<'_>>,
-    path: &'q [u8],
-) -> Option<usize> {
-    by_path.get(&path).copied()
+impl<'o, 'p> OutlinedByPath<'o, 'p> {
+    fn build(outlined: &'o [Outlined<'_>], at_phase: SharedAlloc<'p>) -> Self {
+        let mut map: blaze_hash::Map<&'o [u8], (u32, u32), blaze_hash::FixedState, SharedAlloc<'p>> =
+            blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc: at_phase, capacity: Some(outlined.len()) });
+        let mut next: SVec<'p, u32> = SVec::with_capacity_in(outlined.len(), at_phase);
+        next.resize(outlined.len(), u32::MAX);
+        let mut aliases: SVec<'p, (Name, Name)> = SVec::new_in(at_phase);
+        for (at, one) in outlined.iter().enumerate() {
+            if crate::data_include::is_data(one.edition) {
+                continue;
+            }
+            let Ok(at_u32) = u32::try_from(at) else { continue };
+            match map.get_mut(&one.path.as_slice()) {
+                Some((head, tail)) => {
+                    next[*tail as usize] = at_u32;
+                    *tail = at_u32;
+                    if let Some(first) = outlined.get(*head as usize) {
+                        aliases.push((one.name, first.name));
+                    }
+                }
+                None => {
+                    map.insert(one.path.as_slice(), (at_u32, at_u32));
+                }
+            }
+        }
+        aliases.sort_unstable_by_key(|(alias, _)| *alias);
+        Self { map, next, aliases }
+    }
+
+    /// Canonical outline slot for `slot`: the first non-data outline at the same physical path
+    /// (matching [`plan_items`]'s deterministic dedup of `Signature` tasks across module slots).
+    fn canonical_of(&self, slot: Name) -> Name {
+        if self.aliases.is_empty() {
+            return slot;
+        }
+        self.aliases.binary_search_by_key(&slot, |(alias, _)| *alias).ok().map_or(slot, |at| self.aliases[at].1)
+    }
+
+    /// Visits every non-data outline slot sharing the same physical path as `slot`.
+    fn for_each_sibling(&self, outlined: &[Outlined<'_>], slot: Name, mut f: impl FnMut(Name)) {
+        if self.aliases.is_empty() {
+            f(slot);
+            return;
+        }
+        let Ok(at) = outlined.binary_search_by(|one| one.name.cmp(&slot)) else {
+            f(slot);
+            return;
+        };
+        let Some(one) = outlined.get(at) else {
+            f(slot);
+            return;
+        };
+        let Some(&(head, tail)) = self.map.get(&one.path.as_slice()) else {
+            f(slot);
+            return;
+        };
+        if head == tail {
+            f(slot);
+            return;
+        }
+        let mut cur = head;
+        while cur != u32::MAX {
+            let idx = cur as usize;
+            if let Some(sibling) = outlined.get(idx) {
+                f(sibling.name);
+            }
+            cur = self.next.get(idx).copied().unwrap_or(u32::MAX);
+        }
+    }
+
+    /// Whether any non-data outline at `path` satisfies `pred`.
+    fn any_at(&self, path: &[u8], mut pred: impl FnMut(usize) -> bool) -> bool {
+        let Some(&(head, _)) = self.map.get(&path) else { return false };
+        let mut cur = head;
+        while cur != u32::MAX {
+            let idx = cur as usize;
+            if pred(idx) {
+                return true;
+            }
+            cur = self.next.get(idx).copied().unwrap_or(u32::MAX);
+        }
+        false
+    }
+
+    /// The outline index at `path` that `reach` (sorted) reaches, matching
+    /// [`crate::engine_body_plan::outline_at_path`]. Single-outline paths return in O(1) without
+    /// inspecting `reach`. If `reach` names none of the outlines at `path`, tries `preferred`
+    /// (sorted, e.g. entered `task_files` for a macro-expanded `mod`), then falls back to the
+    /// first non-data outline at `path`.
+    fn find_for_reach(&self, outlined: &[Outlined<'_>], path: &[u8], reach: &[Name], preferred: &[Name]) -> Option<usize> {
+        let &(head, tail) = self.map.get(&path)?;
+        let first = head as usize;
+        if head == tail {
+            return Some(first);
+        }
+        let mut cur = head;
+        while cur != u32::MAX {
+            let idx = cur as usize;
+            if let Some(one) = outlined.get(idx)
+                && reach.binary_search(&one.name).is_ok()
+            {
+                return Some(idx);
+            }
+            cur = self.next.get(idx).copied().unwrap_or(u32::MAX);
+        }
+        if !preferred.is_empty() {
+            let mut cur = head;
+            while cur != u32::MAX {
+                let idx = cur as usize;
+                if let Some(one) = outlined.get(idx)
+                    && preferred.binary_search(&one.name).is_ok()
+                {
+                    return Some(idx);
+                }
+                cur = self.next.get(idx).copied().unwrap_or(u32::MAX);
+            }
+        }
+        Some(first)
+    }
+
+    /// Like [`Self::find_for_reach`], computing `member_root`'s static `reached` set lazily via
+    /// [`crate::engine_body_plan::reached`] only when `path` has multiple non-data outlines.
+    fn find_for_member(
+        &self,
+        outlined: &[Outlined<'_>],
+        path: &[u8],
+        member_root: Name,
+        cached_reach: &mut Option<Vec<Name, Alloc<'static>>>,
+        preferred: &[Name],
+        g: Alloc<'static>,
+    ) -> Option<usize> {
+        let &(head, tail) = self.map.get(&path)?;
+        if head == tail {
+            return Some(head as usize);
+        }
+        let reach = cached_reach
+            .get_or_insert_with(|| crate::engine_body_plan::reached(outlined, member_root, g).unwrap_or_else(|_| Vec::new_in(g)));
+        self.find_for_reach(outlined, path, reach.as_slice(), preferred)
+    }
 }
 
 /// Phase-local cache of `(SignatureFile, entries_of)` per outlined file index (`0..outlined.len()`),
@@ -777,7 +911,7 @@ impl HeadsStage {
                 }
             }
         }
-        let mut by_path: Option<blaze_hash::Map<&[u8], usize, blaze_hash::FixedState, SharedAlloc<'p>>> = None;
+        let mut by_path: Option<OutlinedByPath<'_, 'p>> = None;
         let mut subject_entries = SubjectEntries::new(at_phase);
         let mut phase_subjects: SVec<'p, Subject> = SVec::new_in(at_phase);
         let mut loaded_prefixes: SVec<'p, [u8; 8]> = SVec::new_in(at_phase);
@@ -2061,7 +2195,7 @@ pub(crate) fn plan_items<'h>(outlined: &[Outlined<'_>], external: &[Name], alloc
             planned.push(Planned { name: part.name, phase: Phase::new(Stage::Heads, 0), source, file: one.name });
         }
     }
-    planned.sort_unstable_by_key(|one| one.name);
+    planned.sort_unstable_by_key(|one| (one.name, one.file));
     planned.dedup_by_key(|one| one.name);
     planned
 }
@@ -3379,7 +3513,7 @@ fn member_subjects<'r, 'p, 'h>(
     list: &blaze_world::crate_list::CrateList<'static>,
     outlined: &'h [Outlined<'_>],
     jobs: &[Job<'r, 'p>],
-    by_path_slot: &mut Option<blaze_hash::Map<&'h [u8], usize, blaze_hash::FixedState, SharedAlloc<'p>>>,
+    by_path_slot: &mut Option<OutlinedByPath<'h, 'p>>,
     subject_entries: &mut SubjectEntries<'p>,
     subjects: &mut SVec<'p, Subject>,
     loaded_prefixes: &mut SVec<'p, [u8; 8]>,
@@ -3406,7 +3540,7 @@ fn member_subjects<'r, 'p, 'h>(
     if members.is_empty() {
         return Ok(());
     }
-    let by_path = &*by_path_slot.get_or_insert_with(|| outlined_by_path(outlined, at_phase));
+    let by_path = &*by_path_slot.get_or_insert_with(|| OutlinedByPath::build(outlined, at_phase));
     let mut pending: Vec<([u8; 8], u32, usize), &Frame> = Vec::new_in(frame);
     let erased = blaze_own::Erased::new(frame);
     let fa = erased.handle();
@@ -3417,12 +3551,15 @@ fn member_subjects<'r, 'p, 'h>(
         let Ok((_, own_records)) = cache.records_of(read, cx, store, names, list, member, g) else { continue };
         let items = ItemsRecord::from_verified(own_records.items_proof, fa);
         let prefix = list.key(member).prefix();
+        let root = list.root(member);
+        let root_name = Name::file(root.strip_prefix("/0/").unwrap_or(root).as_bytes());
+        let mut cached_reach: Option<Vec<Name, Alloc<'static>>> = None;
         loaded_prefixes.push(prefix);
         for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
             let Ok(Some(row)) = items.file_surface(file) else { continue };
             let Some(path) = row.path.in_package(list.shown_from(member), fa) else { continue };
             let Some(path) = path.strip_prefix("/0/") else { continue };
-            if let Some(idx) = find_outlined_index(by_path, path.as_bytes()) {
+            if let Some(idx) = by_path.find_for_member(outlined, path.as_bytes(), root_name, &mut cached_reach, &[], g) {
                 pending.push((prefix, file, idx));
             }
         }
@@ -3674,7 +3811,7 @@ impl HeadsStage {
         lazy_snap: &'l crate::store::StoreSnapshot,
         heads_lazy: &mut Option<crate::front_load::ScopeRecords<'l>>,
         once: &crate::engine_heads_once::HeadsOnce,
-        by_path_slot: &mut Option<blaze_hash::Map<&'h [u8], usize, blaze_hash::FixedState, SharedAlloc<'p>>>,
+        by_path_slot: &mut Option<OutlinedByPath<'h, 'p>>,
         subject_entries: &mut SubjectEntries<'p>,
         subjects: &mut SVec<'p, Subject>,
         loaded_subjects: &mut SVec<'p, [u8; 8]>,
@@ -3737,11 +3874,16 @@ impl HeadsStage {
         // built up front (with non-member dependencies deferred to [`HeadsScopeRecords`]); other
         // members are touched only if an entered task's file was not held by any reaching member,
         // or if they appear as a member dependency inside an active job's scope.
+        let by_path = &*by_path_slot.get_or_insert_with(|| OutlinedByPath::build(handles.outlined, at_phase));
         let mut task_files: Vec<Name, &Frame> = Vec::with_capacity_in(tasks.len(), frame);
-        task_files.extend(tasks.iter().map(|task| task.planned.file));
+        // A `Signature` task is named by physical file (`SignatureFile`), so if one physical file
+        // is planned under multiple module slots (`tests/rungs.rs` and `tests/rungs/mod.rs`),
+        // every sibling slot reaches the task and must be included in `task_files`.
+        for task in tasks.iter() {
+            by_path.for_each_sibling(handles.outlined, task.planned.file, |slot| task_files.push(slot));
+        }
         task_files.sort_unstable();
         task_files.dedup();
-        let by_path = &*by_path_slot.get_or_insert_with(|| outlined_by_path(handles.outlined, at_phase));
         let mut jobs: SVec<'p, ItemJob<'r, 'p>> = SVec::new_in(at_phase);
         let mut unvisited_members: Vec<usize, &Frame> = Vec::new_in(frame);
         // Built lazily only if a task's file is in no member crate's items record, avoiding
@@ -3890,11 +4032,12 @@ impl HeadsStage {
             let cells = scope_cells(graph.name, &list, member, Some(&scope), at_phase);
             let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(g, format_args!("its crate's {cause}")));
             let items = ItemsRecord::from_verified(scope.own.records.items_proof, fa);
+            let reach = reached_roots.get(reach_idx).map_or(&[][..], |(r, _)| r.as_slice());
             for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
                 let Ok(Some(row)) = items.file_surface(file) else { continue };
                 let Some(path) = row.path.in_package(list.shown_from(member), fa) else { continue };
                 let Some(path) = path.strip_prefix("/0/") else { continue };
-                if let Some(idx) = find_outlined_index(by_path, path.as_bytes()) {
+                if let Some(idx) = by_path.find_for_reach(handles.outlined, path.as_bytes(), reach, &[]) {
                     pending_subjects.push((prefix, file, idx));
                     if let Some(one) = handles.outlined.get(idx) {
                         held_files.push(one.name);
@@ -3929,10 +4072,9 @@ impl HeadsStage {
                     let Ok(Some(row)) = items.file_surface(file) else { continue };
                     let Some(path) = row.path.in_package(list.shown_from(member), fa) else { continue };
                     let Some(path) = path.strip_prefix("/0/") else { continue };
-                    if find_outlined_index(by_path, path.as_bytes())
-                        .and_then(|idx| handles.outlined.get(idx))
-                        .is_some_and(|one| task_files.binary_search(&one.name).is_ok())
-                    {
+                    if by_path.any_at(path.as_bytes(), |idx| {
+                        handles.outlined.get(idx).is_some_and(|one| task_files.binary_search(&one.name).is_ok())
+                    }) {
                         holds_task_file = true;
                         break;
                     }
@@ -3951,11 +4093,14 @@ impl HeadsStage {
                 };
                 let cells = scope_cells(graph.name, &list, member, Some(&scope), at_phase);
                 let cut_words = scope.cut_cause(&list).map(|cause| crate::engine_head_notes::leak(g, format_args!("its crate's {cause}")));
+                let root = list.root(member);
+                let root_name = Name::file(root.strip_prefix("/0/").unwrap_or(root).as_bytes());
+                let mut cached_reach: Option<Vec<Name, Alloc<'static>>> = None;
                 for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
                     let Ok(Some(row)) = items.file_surface(file) else { continue };
                     let Some(path) = row.path.in_package(list.shown_from(member), fa) else { continue };
                     let Some(path) = path.strip_prefix("/0/") else { continue };
-                    if let Some(idx) = find_outlined_index(by_path, path.as_bytes()) {
+                    if let Some(idx) = by_path.find_for_member(handles.outlined, path.as_bytes(), root_name, &mut cached_reach, task_files.as_slice(), g) {
                         pending_subjects.push((prefix, file, idx));
                     }
                 }
@@ -3968,22 +4113,27 @@ impl HeadsStage {
         subjects.sort_unstable();
         subjects.dedup();
         jobs.sort_unstable_by_key(|job| job.prefix);
-        // Each task to EVERY member unit (by prefix) whose files hold its file (lane RU1,
-        // `head_cell`): each freezes the task's heads under its own records, one cell a unit.
+        // Each task to EVERY member unit (by prefix) whose files hold its physical file under any
+        // module slot (lane RU1, `head_cell`): keyed by canonical slot so units reaching the same
+        // physical file via `mod rungs;` (`tests/rungs.rs`) and `#[path = "../tests/rungs/mod.rs"]`
+        // (`tests/rungs/mod.rs`) both freeze the shared `Signature` task under their own unit.
         let mut by_file: SVec<'p, (Name, [u8; 8])> = SVec::with_capacity_in(subjects.len(), at_phase);
-        by_file.extend(subjects.iter().map(|row| (row.slot, row.prefix)));
+        by_file.extend(subjects.iter().map(|row| (by_path.canonical_of(row.slot), row.prefix)));
         by_file.sort_unstable();
         by_file.dedup();
-        // Flat sorted list of ONLY `(file, unit, prefix)` pairs where a unit's cfg-blind walk
-        // reaches `file` yet the unit does not hold it in `by_file`. Empty (zero allocations and
-        // zero per-task lookups) on the common non-cfg-cut path.
+        // Flat sorted list of ONLY `(canonical_file, unit, prefix)` pairs where a unit's cfg-blind
+        // walk reaches any slot of `canonical_file` yet the unit does not hold it in `by_file`.
+        // Empty (zero allocations and zero per-task lookups) on the common non-cfg-cut path.
         let mut unheld_reaching: SVec<'p, (Name, Name, [u8; 8])> = SVec::new_in(at_phase);
         for &(unit, prefix, reach_idx) in walks.iter() {
             let Some((reach, _)) = reached_roots.get(reach_idx) else { continue };
             if task_files.len() <= reach.len() {
                 for &file in task_files.iter() {
-                    if reach.binary_search(&file).is_ok() && by_file.binary_search(&(file, prefix)).is_err() {
-                        unheld_reaching.push((file, unit, prefix));
+                    if reach.binary_search(&file).is_ok() {
+                        let canon = by_path.canonical_of(file);
+                        if by_file.binary_search(&(canon, prefix)).is_err() {
+                            unheld_reaching.push((canon, unit, prefix));
+                        }
                     }
                 }
             } else {
@@ -3993,8 +4143,11 @@ impl HeadsStage {
                         continue;
                     }
                     prev = Some(file);
-                    if task_files.binary_search(&file).is_ok() && by_file.binary_search(&(file, prefix)).is_err() {
-                        unheld_reaching.push((file, unit, prefix));
+                    if task_files.binary_search(&file).is_ok() {
+                        let canon = by_path.canonical_of(file);
+                        if by_file.binary_search(&(canon, prefix)).is_err() {
+                            unheld_reaching.push((canon, unit, prefix));
+                        }
                     }
                 }
             }
@@ -4011,10 +4164,11 @@ impl HeadsStage {
         // and done there (engine_status.rs), as the phase's known count counts it.
         let mut shows: SVec<'p, (Name, [u8; 8])> = SVec::with_capacity_in(tasks.len(), at_phase);
         for task in tasks.iter() {
-            let at = by_file.partition_point(|(file, _)| *file < task.planned.file);
+            let canon = by_path.canonical_of(task.planned.file);
+            let at = by_file.partition_point(|(file, _)| *file < canon);
             holding.clear();
             if let Some(rest) = by_file.get(at..) {
-                holding.extend(rest.iter().take_while(|(file, _)| *file == task.planned.file).filter_map(|(_, prefix)| jobs.binary_search_by_key(prefix, |job| job.prefix).ok()));
+                holding.extend(rest.iter().take_while(|(file, _)| *file == canon).filter_map(|(_, prefix)| jobs.binary_search_by_key(prefix, |job| job.prefix).ok()));
             }
             // The plant (`HeadUnits`): one unit alone, as before the rule.
             match self.freeze {
@@ -4098,9 +4252,9 @@ impl HeadsStage {
                     // The units its file is NOT frozen under though their walk reaches it: their
                     // not-held cells, so one that comes to hold the file moves the row.
                     if !unheld_reaching.is_empty() {
-                        let from = unheld_reaching.partition_point(|(file, _, _)| *file < task.planned.file);
+                        let from = unheld_reaching.partition_point(|(file, _, _)| *file < canon);
                         if let Some(rest) = unheld_reaching.get(from..) {
-                            for &(_, unit, prefix) in rest.iter().take_while(|(file, _, _)| *file == task.planned.file) {
+                            for &(_, unit, prefix) in rest.iter().take_while(|(file, _, _)| *file == canon) {
                                 made.reads.push(crate::engine_body_plan::file_not_held_cell(view, unit, prefix));
                             }
                         }
@@ -4136,11 +4290,14 @@ impl HeadsStage {
                     let Ok((_, own_records)) = cache.records_of(read, cx, store, names, &list, member, g) else { continue };
                     let items = ItemsRecord::from_verified(own_records.items_proof, fa);
                     let prefix = list.key(member).prefix();
+                    let root = list.root(member);
+                    let root_name = Name::file(root.strip_prefix("/0/").unwrap_or(root).as_bytes());
+                    let mut cached_reach: Option<Vec<Name, Alloc<'static>>> = None;
                     for file in 0..u32::try_from(items.files()).unwrap_or(u32::MAX) {
                         let Ok(Some(row)) = items.file_surface(file) else { continue };
                         let Some(path) = row.path.in_package(list.shown_from(member), fa) else { continue };
                         let Some(path) = path.strip_prefix("/0/") else { continue };
-                        if let Some(idx) = find_outlined_index(by_path, path.as_bytes()) {
+                        if let Some(idx) = by_path.find_for_member(handles.outlined, path.as_bytes(), root_name, &mut cached_reach, &[], g) {
                             pending_deps.push((prefix, file, idx));
                         }
                     }
@@ -5412,8 +5569,49 @@ mod nested {
             made: Ok(crate::work::Record::new_in(rust_name, alloc)),
         };
         let outlined = [data_outline, rust_outline];
-        let by_path = outlined_by_path(&outlined, alloc);
-        assert_eq!(find_outlined_index(&by_path, path), Some(1));
+        let by_path = OutlinedByPath::build(&outlined, alloc);
+        assert_eq!(by_path.find_for_reach(&outlined, path, &[], &[]), Some(1));
         assert_eq!(crate::engine_body_plan::outline_at_path(&outlined, path, &[]), Some(1));
+    }
+
+    #[test]
+    fn outlined_by_path_resolves_each_slot_for_shared_mod_rs() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.shared();
+        let path = b"crates/blaze-ladder/tests/rungs/mod.rs";
+        let mod_slot = Name::file(b"crates/blaze-ladder/tests/rungs.rs");
+        let path_slot = Name::file(path);
+        let outline_mod = Outlined {
+            name: mod_slot,
+            path: SVec::from_slice_in(path, alloc),
+            source: ContentId([0u8; 32]),
+            outline_source: ContentId([0u8; 32]),
+            edition: blaze_surface::Edition::E2024.byte(),
+            made: Ok(crate::work::Record::new_in(mod_slot, alloc)),
+        };
+        let outline_path = Outlined {
+            name: path_slot,
+            path: SVec::from_slice_in(path, alloc),
+            source: ContentId([0u8; 32]),
+            outline_source: ContentId([0u8; 32]),
+            edition: blaze_surface::Edition::E2024.byte(),
+            made: Ok(crate::work::Record::new_in(path_slot, alloc)),
+        };
+        let mut outlined = [outline_mod, outline_path];
+        outlined.sort_unstable_by_key(|one| one.name);
+        let first_slot = outlined[0].name;
+        let second_slot = outlined[1].name;
+        let by_path = OutlinedByPath::build(&outlined, alloc);
+        assert_eq!(by_path.find_for_reach(&outlined, path, &[first_slot], &[]), Some(0));
+        assert_eq!(by_path.find_for_reach(&outlined, path, &[second_slot], &[]), Some(1));
+        assert_eq!(by_path.find_for_reach(&outlined, path, &[], &[second_slot]), Some(1));
+        assert_eq!(by_path.find_for_reach(&outlined, path, &[], &[]), Some(0));
+        assert!(by_path.any_at(path, |idx| outlined[idx].name == first_slot));
+        assert!(by_path.any_at(path, |idx| outlined[idx].name == second_slot));
+        assert_eq!(by_path.canonical_of(first_slot), first_slot);
+        assert_eq!(by_path.canonical_of(second_slot), first_slot);
+        let mut siblings = std::vec::Vec::new();
+        by_path.for_each_sibling(&outlined, second_slot, |slot| siblings.push(slot));
+        assert_eq!(siblings, [first_slot, second_slot]);
     }
 }
