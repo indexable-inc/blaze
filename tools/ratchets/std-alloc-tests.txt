@@ -138,7 +138,7 @@ blaze-solve	3	0	0	2	0	0	0	1	0	0
 blaze-sort	4	0	0	16	0	0	0	0	0	0
 blaze-source	4	0	0	4	0	0	1	0	0	0
 blaze-spawn	5	0	0	2	0	0	0	0	0	0
-blaze-sql	20	0	3	66	0	0	2	0	0	0
+blaze-sql	16	0	2	63	0	0	2	0	0	0
 blaze-sqlite	6	0	0	117	0	0	0	0	0	0
 blaze-squeeze	5	0	0	12	0	0	0	0	0	0
 blaze-ssh	5	0	0	4	0	0	0	0	0	0
