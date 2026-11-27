@@ -381,8 +381,9 @@ crates/bgit/src/status_driver.rs	DIRCACHE_MAGIC	none
 crates/bgit/src/status_driver.rs	DIRCACHE_VERSION	none
 crates/blaze-build-script/src/c_tasks_probe.rs	ANSWER_MAGIC	none
 crates/blaze-build-script/src/c_tasks_probe.rs	ANSWER_VERSION	none
-crates/blaze-cli/src/test_bins.rs	MH_MAGIC_64	not persisted: Mach-O 64-bit executable header magic
-crates/blaze-cli/src/test_bins.rs	STUB_SLOT_MAGIC	not persisted: in-binary patched stub header magic matched between blaze-cli and blaze-launcher
+crates/blaze-cli/src/launcher_stub.rs	JIT_MANIFEST_VERSION	not persisted: in-binary patched JIT launcher manifest version matched between blaze-cli and blaze-launcher
+crates/blaze-cli/src/launcher_stub.rs	MH_MAGIC_64	not persisted: Mach-O 64-bit executable header magic
+crates/blaze-cli/src/launcher_stub.rs	STUB_SLOT_MAGIC	not persisted: in-binary patched stub header magic matched between blaze-cli and blaze-launcher
 crates/blaze-ctx/src/tree.rs	SCHEMA_VERSION	none
 crates/blaze-git/src/nfs3.rs	RPC_VERSION	not persisted: RFC 5531 ONC RPC v2 wire protocol version
 crates/blaze-git/src/slab.rs	BGIX_MAGIC	none
