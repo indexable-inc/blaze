@@ -72,6 +72,10 @@ pub enum NeonFn {
     Smaxp,
     /// `sminp`: the signed smaller of each adjacent pair.
     Sminp,
+    /// `sqdmulh`: signed saturating doubling multiply returning high half.
+    Sqdmulh,
+    /// `sqrdmulh`: signed saturating rounding doubling multiply returning high half.
+    Sqrdmulh,
 }
 
 /// The integer vector type an intrinsic is overloaded at: its name's last part.
@@ -103,7 +107,7 @@ pub struct NeonCall {
 /// `tbx1..=tbx4` are at the two shapes the library declares them at; the shifts at every integer
 /// shape; the pairwise maximum and minimum at the six the library declares (no 64-bit lanes: A64
 /// has none).
-const NAMES: [(NeonCall, &str); 56] = [
+const NAMES: [(NeonCall, &str); 64] = [
     (NeonCall { func: NeonFn::Tbl1, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbl1.v8i8"),
     (NeonCall { func: NeonFn::Tbl1, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbl1.v16i8"),
     (NeonCall { func: NeonFn::Tbx1, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbx1.v8i8"),
@@ -160,6 +164,14 @@ const NAMES: [(NeonCall, &str); 56] = [
     (NeonCall { func: NeonFn::Sminp, shape: IntShape::V8I16 }, "llvm.aarch64.neon.sminp.v8i16"),
     (NeonCall { func: NeonFn::Sminp, shape: IntShape::V2I32 }, "llvm.aarch64.neon.sminp.v2i32"),
     (NeonCall { func: NeonFn::Sminp, shape: IntShape::V4I32 }, "llvm.aarch64.neon.sminp.v4i32"),
+    (NeonCall { func: NeonFn::Sqdmulh, shape: IntShape::V4I16 }, "llvm.aarch64.neon.sqdmulh.v4i16"),
+    (NeonCall { func: NeonFn::Sqdmulh, shape: IntShape::V8I16 }, "llvm.aarch64.neon.sqdmulh.v8i16"),
+    (NeonCall { func: NeonFn::Sqdmulh, shape: IntShape::V2I32 }, "llvm.aarch64.neon.sqdmulh.v2i32"),
+    (NeonCall { func: NeonFn::Sqdmulh, shape: IntShape::V4I32 }, "llvm.aarch64.neon.sqdmulh.v4i32"),
+    (NeonCall { func: NeonFn::Sqrdmulh, shape: IntShape::V4I16 }, "llvm.aarch64.neon.sqrdmulh.v4i16"),
+    (NeonCall { func: NeonFn::Sqrdmulh, shape: IntShape::V8I16 }, "llvm.aarch64.neon.sqrdmulh.v8i16"),
+    (NeonCall { func: NeonFn::Sqrdmulh, shape: IntShape::V2I32 }, "llvm.aarch64.neon.sqrdmulh.v2i32"),
+    (NeonCall { func: NeonFn::Sqrdmulh, shape: IntShape::V4I32 }, "llvm.aarch64.neon.sqrdmulh.v4i32"),
 ];
 
 /// Every call of the set, in [`NAMES`]' order.
@@ -282,6 +294,8 @@ pub fn build<A: Allocator + Clone>(b: &mut Builder<A, Full>, call: NeonCall, ops
         (NeonFn::Uminp, &[a, x]) => Some(pairwise(b, call.shape, Op::Umin, a, x)),
         (NeonFn::Smaxp, &[a, x]) => Some(pairwise(b, call.shape, Op::Smax, a, x)),
         (NeonFn::Sminp, &[a, x]) => Some(pairwise(b, call.shape, Op::Smin, a, x)),
+        (NeonFn::Sqdmulh, &[a, x]) => Some(sqdmulh(b, call.shape, false, a, x)),
+        (NeonFn::Sqrdmulh, &[a, x]) => Some(sqdmulh(b, call.shape, true, a, x)),
         _ => None,
     }
 }
@@ -399,4 +413,44 @@ fn shift<A: Allocator + Clone>(b: &mut Builder<A, Full>, shape: IntShape, signed
     // A left shift by the width or more: every bit shifted out.
     let past_left = b.icmp(IntCond::Sge, amount, up_to);
     b.select(Flags::NONE, past_left, zero, kept)
+}
+
+/// `sqdmulh` (`rounding == false`) or `sqrdmulh` (`rounding == true`) for 16-bit and 32-bit
+/// signed lanes (`V4I16`, `V8I16`, `V2I32`, `V4I32`).
+///
+/// Arm A64 semantics: `sat_N(floor((2 * a * b + (rounding ? 2^(N-1) : 0)) / 2^N))`
+/// = `sat_N(floor((a * b + (rounding ? 2^(N-2) : 0)) / 2^(N-1)))`.
+/// Widening `a` and `b` to signed `2N`-bit (`i32` for `i16`, `i64` for `i32`), `a * b` (and
+/// `a * b + 2^(N-2)`) never overflows signed `2N`-bit; after `ashr` by `N - 1`, only
+/// `MIN * MIN` reaches `+2^(N-1)` and is saturated to `iN::MAX` by `smin`.
+fn sqdmulh<A: Allocator + Clone>(
+    b: &mut Builder<A, Full>,
+    shape: IntShape,
+    rounding: bool,
+    a: Value,
+    x: Value,
+) -> Value {
+    let width = shape.width();
+    let wide_elem = match shape.elem() {
+        Scalar::I16 => Scalar::I32,
+        _ => Scalar::I64,
+    };
+    let wide_lane = Ty::scalar(wide_elem);
+    let wide_ty = Ty::vector(wide_elem, shape.lanes()).expect("doubled NEON lane width fits LIR vector");
+    let splat_w = |b: &mut Builder<A, Full>, bits: u128| {
+        let c = b.iconst(wide_lane, bits);
+        b.convert(Op::Splat, Flags::NONE, wide_ty, c)
+    };
+    let sa = b.convert(Op::Sext, Flags::NONE, wide_ty, a);
+    let sx = b.convert(Op::Sext, Flags::NONE, wide_ty, x);
+    let mut prod = b.binary(Op::Mul, Flags::NONE, sa, sx);
+    if rounding {
+        let bias = splat_w(b, 1u128 << (width - 2));
+        prod = b.binary(Op::Add, Flags::NONE, prod, bias);
+    }
+    let sh = splat_w(b, u128::from(width - 1));
+    let shifted = b.binary(Op::Ashr, Flags::NONE, prod, sh);
+    let max_val = splat_w(b, (1u128 << (width - 1)) - 1);
+    let sat = b.binary(Op::Smin, Flags::NONE, shifted, max_val);
+    b.convert(Op::Trunc, Flags::NONE, shape.ty(), sat)
 }

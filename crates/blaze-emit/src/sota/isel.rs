@@ -10219,6 +10219,12 @@ pub(crate) fn emit_sota_a64_with_abi_profile<'a>(
             set_at(&mut align16_blocks, b, true);
         }
         let block_start_words = words.len();
+        // Tracks the word index targeted by any intra-block branch patched to `words.len()`
+        // (`Op::Br` 2-arm skip or `Op::Switch` linear-chain case skip). If control can branch
+        // directly to the end of the block (`== words.len()`), `prev_falls_through` MUST remain
+        // `true` even when `words.last()` is an unconditional `b` from the preceding arm —
+        // otherwise `cold_stubs` flushing before `next_block` would land right on that branch target!
+        let mut intra_block_branch_target_end: usize = usize::MAX;
         set_at(&mut block_word_off, b, block_start_words);
         set_at(&mut emitted_blocks, b, true);
         if view.block_kind(Block(u32_of(b))).is_landing() {
@@ -16826,19 +16832,50 @@ pub(crate) fn emit_sota_a64_with_abi_profile<'a>(
                             patches.push(BranchPatch { word_idx: w_first, kind: PatchKind::B, target_block: first_blk });
 
                             let second_start = words.len();
-                            let delta = i32_of(second_start - skip_first.0);
-                            let skip_word = match skip_first.1 {
-                                PatchKind::BCond(inv) => enc::b_cond(inv, delta),
-                                PatchKind::Cbz { reg: rc, wide } => enc::sf(wide, enc::cbz(rc, delta)),
-                                PatchKind::Cbnz { reg: rc, wide } => enc::sf(wide, enc::cbnz(rc, delta)),
-                                _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected skip_then patch kind" }),
-                            };
-                            set_at(&mut words, skip_first.0, skip_word);
                             emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, second_blk, second_args, second_argc);
-                            if next_block != Some(to_idx(second_blk)) {
-                                let w_second = words.len();
-                                words.push(enc::b(0));
-                                patches.push(BranchPatch { word_idx: w_second, kind: PatchKind::B, target_block: second_blk });
+                            if words.len() == second_start {
+                                // Zero edge moves for `second_blk`: patch `skip_first` directly to
+                                // `second_blk` so it never targets `words.len()` (and needs no
+                                // trailing `b second_blk` even when `second_blk != next_block`).
+                                if far_branches {
+                                    // `far_branches` trampoline cannot overwrite a single word in
+                                    // place; fall back to jumping to `second_start` + trailing `b`.
+                                    let delta = i32_of(second_start - skip_first.0);
+                                    let skip_word = match skip_first.1 {
+                                        PatchKind::BCond(inv) => enc::b_cond(inv, delta),
+                                        PatchKind::Cbz { reg: rc, wide } => enc::sf(wide, enc::cbz(rc, delta)),
+                                        PatchKind::Cbnz { reg: rc, wide } => enc::sf(wide, enc::cbnz(rc, delta)),
+                                        _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected skip_then patch kind" }),
+                                    };
+                                    set_at(&mut words, skip_first.0, skip_word);
+                                    intra_block_branch_target_end = second_start;
+                                    if next_block != Some(to_idx(second_blk)) {
+                                        let w_second = words.len();
+                                        words.push(enc::b(0));
+                                        patches.push(BranchPatch { word_idx: w_second, kind: PatchKind::B, target_block: second_blk });
+                                    }
+                                } else {
+                                    patches.push(BranchPatch {
+                                        word_idx: skip_first.0,
+                                        kind: skip_first.1,
+                                        target_block: second_blk,
+                                    });
+                                }
+                            } else {
+                                let delta = i32_of(second_start - skip_first.0);
+                                let skip_word = match skip_first.1 {
+                                    PatchKind::BCond(inv) => enc::b_cond(inv, delta),
+                                    PatchKind::Cbz { reg: rc, wide } => enc::sf(wide, enc::cbz(rc, delta)),
+                                    PatchKind::Cbnz { reg: rc, wide } => enc::sf(wide, enc::cbnz(rc, delta)),
+                                    _ => return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "unexpected skip_then patch kind" }),
+                                };
+                                set_at(&mut words, skip_first.0, skip_word);
+                                intra_block_branch_target_end = second_start;
+                                if next_block != Some(to_idx(second_blk)) {
+                                    let w_second = words.len();
+                                    words.push(enc::b(0));
+                                    patches.push(BranchPatch { word_idx: w_second, kind: PatchKind::B, target_block: second_blk });
+                                }
                             }
                         }
                     }
@@ -16909,6 +16946,7 @@ pub(crate) fn emit_sota_a64_with_abi_profile<'a>(
                                 emit_branch_patch(&mut words, &mut patches, PatchKind::BCond(Cond::Eq), case_block, far_branches);
                                 let after = words.len();
                                 set_at(&mut words, skip_lo, enc::b_cond(Cond::Ne, i32_of(after - skip_lo)));
+                                intra_block_branch_target_end = after;
                             } else {
                                 let skip_hi = words.len();
                                 words.push(enc::b_cond(Cond::Ne, 0));
@@ -16919,6 +16957,7 @@ pub(crate) fn emit_sota_a64_with_abi_profile<'a>(
                                 let after = words.len();
                                 set_at(&mut words, skip_lo, enc::b_cond(Cond::Ne, i32_of(after - skip_lo)));
                                 set_at(&mut words, skip_hi, enc::b_cond(Cond::Ne, i32_of(after - skip_hi)));
+                                intra_block_branch_target_end = after;
                             }
                         }
                         emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, default_block, at + 3, default_argc);
@@ -17129,6 +17168,7 @@ pub(crate) fn emit_sota_a64_with_abi_profile<'a>(
                             patches.push(BranchPatch { word_idx: w_jump, kind: PatchKind::B, target_block: case_block });
                             let after = words.len();
                             set_at(&mut words, skip_idx, enc::b_cond(Cond::Ne, i32_of(after - skip_idx)));
+                            intra_block_branch_target_end = after;
                         }
                     }
                     emit_edge_moves(&mut words, &mut gpr_moves, &mut fp_moves, &mut const_edge_writes, default_block, at + 3, default_argc);
@@ -17336,7 +17376,9 @@ pub(crate) fn emit_sota_a64_with_abi_profile<'a>(
                 volatile_word_idxs.push(w);
             }
         }
-        prev_falls_through = if words.len() == block_start_words {
+        prev_falls_through = if words.len() == block_start_words
+            || intra_block_branch_target_end == words.len()
+        {
             true
         } else if let Some(&last_w) = words.last() {
             !enc::is_unconditional_terminator(last_w)
@@ -26523,5 +26565,97 @@ mod tests {
             non_sp_words.scan_for(&super::enc::add(super::X17, super::X1, super::X17)).is_some(),
             "non-SP base should still emit shifted add, got {non_sp_words:#x?}"
         );
+    }
+
+    /// Regression for the `median3_rec` miscompilation (`stops` segfault): when a block ends with
+    /// an `Op::Switch` whose last case branches over its own `emit_edge_moves + b case_block` to
+    /// `after == words.len()` and the default arm emits 0 edge moves into `next_block`,
+    /// `words.last()` is an unconditional `b` even though the `b.ne after` falls into `next_block`.
+    /// `prev_falls_through` MUST remain `true` so a pending `cold_stubs` entry targeting an
+    /// already-emitted block (`flushed_already`) is NEVER flushed at `after` and hijacks `b.ne`!
+    #[test]
+    fn switch_case_skip_falling_into_next_block_never_hijacked_by_cold_stub_flush() {
+        let heap = blaze_own::testing::heap();
+        let alloc = heap.alloc();
+
+        let mut b = Builder::<_, Full>::new_in(64, alloc);
+        let sig = b.sig(
+            Conv::C,
+            Variadic::No,
+            &[Param::of(Ty::I64), Param::of(Ty::I64), Param::of(Ty::I64)],
+            &[Param::of(Ty::I64)],
+        );
+        b.set_signature(sig);
+
+        let entry = b.create_block(BlockKind::Normal);
+        let rec = b.create_block(BlockKind::Normal);
+        let join = b.create_block(BlockKind::Normal);
+        let after_sw = b.create_block(BlockKind::Normal);
+
+        // `entry`: if `flag < 64` jump to `join` with modified args (queued as a cold edge stub
+        // while falling through into `rec`!), else fall through to `rec`.
+        b.begin(entry);
+        let flag = b.param(Ty::I64);
+        let x = b.param(Ty::I64);
+        let y = b.param(Ty::I64);
+        let k64 = b.iconst(Ty::I64, 64);
+        let is_small = b.icmp(IntCond::Ult, flag, k64);
+        let k1000 = b.iconst(Ty::I64, 1000);
+        let x_small = b.binary(Op::Add, Flags::NONE, x, k1000);
+        let y_small = b.binary(Op::Add, Flags::NONE, y, k1000);
+        b.br(Flags::NONE, is_small, (join, &[x_small, y_small]), (rec, &[]));
+
+        // `rec`: compute a distinct value and jump to `join`.
+        b.begin(rec);
+        let k7 = b.iconst(Ty::I64, 7);
+        let x_rec = b.binary(Op::Add, Flags::NONE, x, k7);
+        b.jump((join, &[x_rec, y]));
+
+        // `join`: already emitted before `after_sw`! Ends with 1-case `Op::Switch` where case 0
+        // passes `0` to `after_sw` (requires edge move + `b after_sw`), while default passes `px`
+        // (coalesced 0-move fallthrough into `after_sw`!).
+        b.begin(join);
+        let px = b.param(Ty::I64);
+        let py = b.param(Ty::I64);
+        let k0 = b.iconst(Ty::I64, 0);
+        b.switch(py, (after_sw, &[px]), &[(0, (after_sw, &[k0]))]);
+
+        // `after_sw`: returns `v + 1`.
+        b.begin(after_sw);
+        let v = b.param(Ty::I64);
+        let k1 = b.iconst(Ty::I64, 1);
+        let res = b.binary(Op::Add, Flags::NONE, v, k1);
+        b.ret(&[res]);
+
+        let func = b.finish_checked().expect("switch cold-stub LIR finish");
+        let verified = blaze_lir::verify(func.view()).expect("switch cold-stub LIR verify");
+        let (emitted, _clob) = super::emit_sota_a64_with_abi_profile(
+            verified.view(),
+            &NoNames,
+            CallMode::GotSlot,
+            Machine::LSE | Machine::DOTPROD | Machine::CRC32,
+            true,
+            |_| blaze_tier::CallClobbers::C_ABI_ARM64,
+            None,
+            false,
+            false,
+            alloc,
+        )
+        .expect("isel must compile switch + cold stub cleanly");
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let exec = exec_leaf(emitted);
+            // SAFETY: Valid AAPCS64 function matching `(i64, i64, i64) -> i64`.
+            let f: extern "C" fn(i64, i64, i64) -> i64 = unsafe { exec.as_fn() };
+            // `flag = 100 >= 64` -> `rec` (`px = x + 7`), `py = 5 != 0` -> default arm (`px = x + 7`) -> `+ 1` = `x + 8`.
+            // Before the fix, `b.ne` in `join` jumped into `entry -> join`'s flushed cold stub,
+            // looping back to `join` with `x + 1000` (infinite loop / wrong result)!
+            assert_eq!(f(100, 10, 5), 18, "default switch arm must not jump into flushed cold stub");
+            // Case 0 taken -> `0 + 1 = 1`.
+            assert_eq!(f(100, 10, 0), 1, "case 0 switch arm");
+            // Small path (`flag = 10 < 64`) -> `entry -> join` cold stub (`px = 1010, py = 1005 != 0`) -> `1011`.
+            assert_eq!(f(10, 10, 5), 1011, "cold stub path");
+        }
     }
 }
