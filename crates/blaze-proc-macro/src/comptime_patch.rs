@@ -2289,6 +2289,34 @@ fn expand_bytemuck(stream: &TokenStream<'_>, macro_name: &str) -> Option<String>
 // 3. `thiserror_impl` Comptime Patch (`#[derive(Error)]`)
 // =================================================================================================
 
+/// Returns `true` if `inner` (trimmed) starts with unambiguous const-generic or lifetime syntax
+/// (literals, const blocks `{...}`, unary `-`, lifetimes `'a`), matching `syn::GenericArgument`
+/// distinguishing `Type` from `Const`/`Lifetime`.
+fn is_non_type_generic_arg(inner: &str) -> bool {
+    let Some(&first) = inner.as_bytes().first() else {
+        return true;
+    };
+    if matches!(first, b'0'..=b'9' | b'\'' | b'"' | b'{' | b'-') {
+        return true;
+    }
+    if matches!(inner, "true" | "false") {
+        return true;
+    }
+    if inner.starts_with("b'") || inner.starts_with("b\"") || inner.starts_with("c\"") {
+        return true;
+    }
+    let raw_rest = inner
+        .strip_prefix("br")
+        .or_else(|| inner.strip_prefix("cr"))
+        .or_else(|| inner.strip_prefix('r'));
+    if let Some(rest) = raw_rest {
+        if rest.trim_start_matches('#').starts_with('"') {
+            return true;
+        }
+    }
+    false
+}
+
 /// If `ty` is a type path whose last segment is `Option<T>` with a single type argument
 /// (e.g. `Option<io::Error>`, `core::option::Option<E>`, `::std::option::Option<E>`),
 /// return the trimmed inner type `T`.
@@ -2349,9 +2377,10 @@ fn option_inner_type(ty: &str) -> Option<&str> {
         return None;
     }
 
-    // Verify `inner` is a single type argument (no top-level `,` or `=`, not a lifetime `'a`).
+    // Verify `inner` is a single type argument (no top-level `,` or `=`, not a lifetime `'a`
+    // or const-generic expression/literal like `3`, `true`, `b"x"`, `{ 1 + 1 }`).
     let inner = inner.strip_suffix(',').map_or(inner, str::trim);
-    if inner.is_empty() || inner.starts_with('\'') {
+    if is_non_type_generic_arg(inner) {
         return None;
     }
     let mut a = 0usize;
@@ -2439,7 +2468,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                     }
                     let (from_ty, source_expr) = match option_inner_type(&f.ty) {
                         Some(inner) => {
-                            if inner.starts_with('&') || option_inner_type(inner).is_some() {
+                            if option_inner_type(inner).is_some() {
                                 return None;
                             }
                             (inner, "::core::option::Option::Some(__source)")
@@ -2495,7 +2524,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                     FieldsShape::Unit => return None,
                 };
                 if let Some(inner) = option_inner_type(&f.ty) {
-                    if inner.starts_with('&') || option_inner_type(inner).is_some() {
+                    if option_inner_type(inner).is_some() {
                         return None;
                     }
                     let _ = writeln!(
@@ -2503,9 +2532,6 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                         "        match ::core::option::Option::as_ref({acc}) {{ ::core::option::Option::Some(__e) => ::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static)), ::core::option::Option::None => ::core::option::Option::None }}"
                     );
                 } else {
-                    if f.ty.trim_start().starts_with('&') {
-                        return None;
-                    }
                     let _ = writeln!(
                         source_arms,
                         "        ::core::option::Option::Some({acc} as &(dyn ::core::error::Error + 'static))"
@@ -2546,7 +2572,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                         }
                         let (from_ty, source_expr) = match option_inner_type(&f.ty) {
                             Some(inner) => {
-                                if inner.starts_with('&') || option_inner_type(inner).is_some() {
+                                if option_inner_type(inner).is_some() {
                                     return None;
                                 }
                                 (inner, "::core::option::Option::Some(__source)")
@@ -2592,7 +2618,7 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                     );
                 } else if let Some((idx, f)) = source_field {
                     if let Some(inner) = option_inner_type(&f.ty) {
-                        if inner.starts_with('&') || option_inner_type(inner).is_some() {
+                        if option_inner_type(inner).is_some() {
                             return None;
                         }
                         let _ = writeln!(
@@ -2600,9 +2626,6 @@ fn expand_thiserror(stream: &TokenStream<'_>) -> Option<String> {
                             "            {pat} => match ::core::option::Option::as_ref(__f{idx}) {{ ::core::option::Option::Some(__e) => ::core::option::Option::Some(__e as &(dyn ::core::error::Error + 'static)), ::core::option::Option::None => ::core::option::Option::None }},"
                         );
                     } else {
-                        if f.ty.trim_start().starts_with('&') {
-                            return None;
-                        }
                         let _ = writeln!(
                             source_arms,
                             "            {pat} => ::core::option::Option::Some(__f{idx} as &(dyn ::core::error::Error + 'static)),"
@@ -3580,15 +3603,73 @@ mod tests {
             "explicit #[source] must beat later implicit `source` field:\n{exp_prec}"
         );
 
-        // 6. Helper unit checks for non-Option types that mention `Option`.
+        // 6. Helper unit checks for non-Option types and const/lifetime generic args.
         assert_eq!(option_inner_type("Option <io::Error>"), Some("io::Error"));
         assert_eq!(option_inner_type("core::option::Option <Foo <A, B>>"), Some("Foo <A, B>"));
         assert_eq!(option_inner_type("::std::option::Option <E,>"), Some("E"));
+        assert_eq!(option_inner_type("Option <&'static io::Error>"), Some("&'static io::Error"));
+        assert_eq!(option_inner_type("Option <r#Error>"), Some("r#Error"));
         assert_eq!(option_inner_type("Box <Option <io::Error>>"), None);
         assert_eq!(option_inner_type("&Option <io::Error>"), None);
         assert_eq!(option_inner_type("MyOption <io::Error>"), None);
         assert_eq!(option_inner_type("Option <A, B>"), None);
         assert_eq!(option_inner_type("fn() -> Option <io::Error>"), None);
+        assert_eq!(option_inner_type("Option <3>"), None);
+        assert_eq!(option_inner_type("Option <-1>"), None);
+        assert_eq!(option_inner_type("Option <{1 + 1}>"), None);
+        assert_eq!(option_inner_type("Option <true>"), None);
+        assert_eq!(option_inner_type("Option <false>"), None);
+        assert_eq!(option_inner_type("Option <'a>"), None);
+        assert_eq!(option_inner_type("Option <'c'>"), None);
+        assert_eq!(option_inner_type("Option <\"x\">"), None);
+        assert_eq!(option_inner_type("Option <b\"x\">"), None);
+        assert_eq!(option_inner_type("Option <b'x'>"), None);
+        assert_eq!(option_inner_type("Option <c\"x\">"), None);
+        assert_eq!(option_inner_type("Option <r#\"x\"#>"), None);
+
+        // 6b. Custom `struct Option<const N: usize>` used as `#[source]` / `#[from]` must NOT
+        //     be unwrapped as `core::option::Option`.
+        let const_opt_err = r#"
+            #[derive(Debug)]
+            #[error("const opt")]
+            pub struct ConstOptErr {
+                #[from]
+                source: Option<3>,
+            }
+        "#;
+        let exp_const_opt = expand_code("thiserror_impl", ProcKind::Derive, "Error", const_opt_err)
+            .expect("const-generic Option<3> expands as a plain error type");
+        assert!(
+            exp_const_opt.contains("::core::convert::From <Option <3>> for ConstOptErr")
+                && exp_const_opt.contains("::core::option::Option::Some(&self.source as &(dyn ::core::error::Error + 'static))")
+                && !exp_const_opt.contains("Option::as_ref"),
+            "Option<3> must not be unwrapped as core::option::Option:\n{exp_const_opt}"
+        );
+
+        // 6c. Reference-valued sources (`&'static E` and `Option<&'static E>`, `#[source]` & `#[from]`)
+        //     expand directly because `core::error::Error` is implemented for `&T`.
+        let ref_src = r#"#[derive(Debug)] #[error("ref")] pub struct RefSrc { #[source] source: &'static std::io::Error }"#;
+        let exp_ref_src = expand_code("thiserror_impl", ProcKind::Derive, "Error", ref_src)
+            .expect("&'static E source expands directly");
+        assert!(
+            exp_ref_src.contains("::core::option::Option::Some(&self.source as &(dyn ::core::error::Error + 'static))"),
+            "direct &'static E source must cast &self.source:\n{exp_ref_src}"
+        );
+        let opt_ref_src = r#"#[derive(Debug)] #[error("opt ref")] pub struct OptRefSrc { #[source] source: Option<&'static std::io::Error> }"#;
+        let exp_opt_ref = expand_code("thiserror_impl", ProcKind::Derive, "Error", opt_ref_src)
+            .expect("Option<&'static E> source expands directly");
+        assert!(
+            exp_opt_ref.contains("match ::core::option::Option::as_ref(&self.source)"),
+            "Option<&'static E> source must unwrap via Option::as_ref:\n{exp_opt_ref}"
+        );
+        let from_opt_ref = r#"#[derive(Debug)] #[error("from opt ref")] pub struct FromOptRef { #[from] source: Option<&'static std::io::Error> }"#;
+        let exp_from_opt_ref = expand_code("thiserror_impl", ProcKind::Derive, "Error", from_opt_ref)
+            .expect("#[from] Option<&'static E> expands directly");
+        assert!(
+            exp_from_opt_ref.contains("::core::convert::From <&'static std::io::Error> for FromOptRef")
+                && exp_from_opt_ref.contains("match ::core::option::Option::as_ref(&self.source)"),
+            "#[from] Option<&'static E> must impl From<&'static E> and unwrap source():\n{exp_from_opt_ref}"
+        );
 
         // 7. `#[from] Option<E>` expands directly (wrapping `Some(__source)` in `From<E>`
         //    and unwrapping `Option::as_ref` in `Error::source`) for structs and enums.
@@ -3644,14 +3725,13 @@ mod tests {
         );
 
         // 8. Fallbacks to real `thiserror-impl`:
-        //    - `Option<Box<dyn Error>>`
+        //    - `Option<Box<dyn Error>>` / `Option<&'static dyn Error>`
         //    - `#[error(transparent)]` wrapping `Option<E>`
-        //    - `Option<&'static E>` and nested `Option<Option<E>>` (for both `#[source]` and `#[from]`)
+        //    - nested `Option<Option<E>>` (for both `#[source]` and `#[from]`)
         let fallbacks = [
             r#"#[derive(Debug)] #[error("dyn")] pub struct DynOpt { #[source] source: Option<Box<dyn std::error::Error + Send + Sync>> }"#,
+            r#"#[derive(Debug)] #[error("dyn ref")] pub struct DynRefOpt { #[source] source: Option<&'static dyn std::error::Error> }"#,
             r#"#[derive(Debug)] #[error(transparent)] pub struct TransOpt(Option<std::io::Error>);"#,
-            r#"#[derive(Debug)] #[error("ref")] pub struct RefOpt { #[source] source: Option<&'static std::io::Error> }"#,
-            r#"#[derive(Debug)] #[error("ref from")] pub struct RefFromOpt { #[from] source: Option<&'static std::io::Error> }"#,
             r#"#[derive(Debug)] #[error("nested")] pub struct NestedOpt { #[source] source: Option<Option<std::io::Error>> }"#,
             r#"#[derive(Debug)] #[error("nested from")] pub struct NestedFromOpt { #[from] source: Option<Option<std::io::Error>> }"#,
         ];
@@ -3805,6 +3885,51 @@ mod tests {
             }
         "#;
         let from_opt_enum_impl = expand_raw("thiserror_impl", ProcKind::Derive, "Error", from_opt_enum_annotated);
+
+        let ref_source_def = r#"
+            #[derive(Debug)]
+            pub struct LeafErr;
+            impl std::fmt::Display for LeafErr {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("leaf") }
+            }
+            impl std::error::Error for LeafErr {}
+            #[derive(Debug)]
+            pub struct RefSourceErr {
+                source: &'static LeafErr,
+            }
+            #[derive(Debug)]
+            pub struct OptRefSourceErr {
+                source: Option<&'static LeafErr>,
+            }
+            #[derive(Debug)]
+            pub struct FromOptRefErr {
+                source: Option<&'static LeafErr>,
+            }
+        "#;
+        let ref_source_impl = expand_raw(
+            "thiserror_impl",
+            ProcKind::Derive,
+            "Error",
+            r#"#[derive(Debug)] #[error("ref")] pub struct RefSourceErr { #[source] source: &'static LeafErr }"#,
+        );
+        let opt_ref_source_impl = expand_raw(
+            "thiserror_impl",
+            ProcKind::Derive,
+            "Error",
+            r#"#[derive(Debug)] #[error("opt ref")] pub struct OptRefSourceErr { #[source] source: Option<&'static LeafErr> }"#,
+        );
+        let from_opt_ref_impl = expand_raw(
+            "thiserror_impl",
+            ProcKind::Derive,
+            "Error",
+            r#"#[derive(Debug)] #[error("from opt ref")] pub struct FromOptRefErr { #[from] source: Option<&'static LeafErr> }"#,
+        );
+        let const_opt_mod_impl = expand_raw(
+            "thiserror_impl",
+            ProcKind::Derive,
+            "Error",
+            r#"#[derive(Debug)] #[error("const opt")] pub struct ConstOptErr { #[from] source: Option<3> }"#,
+        );
 
         let strum_def = "pub enum Kind { FastPath, SlowFallback }";
         let strum_annotated = r#"
@@ -4003,6 +4128,23 @@ mod mini_serde {{
 {from_opt_tuple_impl}
 {from_opt_enum_def}
 {from_opt_enum_impl}
+{ref_source_def}
+{ref_source_impl}
+{opt_ref_source_impl}
+{from_opt_ref_impl}
+mod const_opt_shadow {{
+    #[derive(Debug)]
+    pub struct Option<const N: usize>;
+    impl<const N: usize> core::fmt::Display for Option<N> {{
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {{ write!(f, "opt-{{N}}") }}
+    }}
+    impl<const N: usize> core::error::Error for Option<N> {{}}
+    #[derive(Debug)]
+    pub struct ConstOptErr {{
+        pub source: Option<3>,
+    }}
+    {const_opt_mod_impl}
+}}
 {strum_def}
 {strum_as_ref}
 {strum_into_str}
@@ -4089,6 +4231,19 @@ fn main() {{
     let fe_fmt: FromOptEnum = std::fmt::Error.into();
     assert!(std::error::Error::source(&fe_fmt).is_some());
     assert!(std::error::Error::source(&FromOptEnum::Io {{ source: None }}).is_none());
+
+    static LEAF: LeafErr = LeafErr;
+    let rs = RefSourceErr {{ source: &LEAF }};
+    assert_eq!(std::error::Error::source(&rs).map(|s| s.to_string()).as_deref(), Some("leaf"));
+    let ors_some = OptRefSourceErr {{ source: Some(&LEAF) }};
+    assert_eq!(std::error::Error::source(&ors_some).map(|s| s.to_string()).as_deref(), Some("leaf"));
+    assert!(std::error::Error::source(&OptRefSourceErr {{ source: None }}).is_none());
+    let for_some: FromOptRefErr = (&LEAF).into();
+    assert_eq!(std::error::Error::source(&for_some).map(|s| s.to_string()).as_deref(), Some("leaf"));
+    assert!(std::error::Error::source(&FromOptRefErr {{ source: None }}).is_none());
+
+    let co: const_opt_shadow::ConstOptErr = const_opt_shadow::Option::<3>.into();
+    assert_eq!(std::error::Error::source(&co).map(|s| s.to_string()).as_deref(), Some("opt-3"));
 
     let k = Kind::FastPath;
     assert_eq!(k.as_ref(), "fast-path");
