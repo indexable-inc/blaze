@@ -30,7 +30,7 @@
 //! each unit's `test` and build script, both the crate list's, which the plan reads whole: an
 //! edit of a `#[cfg]` re-plans its file, and its rows' names move with the units that reach it.
 
-use blaze_drive::{Kind, Locate};
+use blaze_drive::{Kind, Locate, Name};
 use blaze_expand::{Delim, Edition, TokenKind, Tri, cfg_predicate_tri, lex};
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{AVec, Alloc, Vec};
@@ -211,6 +211,37 @@ impl FileCuts<'_> {
     }
 }
 
+/// The cuts of a decoded `FileItemsView`, lexed in `edition`, in `g`: the one home shared by
+/// [`file_cuts`] (planning) and `run_ids` (verifying a missing `BodyCheck` row was plan-time
+/// cfg-cut by every reaching unit; rule 30).
+pub(crate) fn cuts_of_view<'g>(name: Name, view: &FileItemsView<'_>, edition: Edition, g: Alloc<'g>) -> FileCuts<'g> {
+    let own = own_cut(view, None, edition, g);
+    let own_cfg = fold_cfgs(None, view, None);
+    // Each entry's chain, in the file's order: a parent comes before its entries.
+    let mut chain: AVec<'_, (Cut, Option<ContentId>)> = Vec::with_capacity_in(view.len(), g);
+    let mut at: AVec<'g, (u32, Cut)> = Vec::new_in(g);
+    let mut cfgs: AVec<'g, (u32, ContentId)> = Vec::new_in(g);
+    for entry in view.items() {
+        let (above, above_cfg) = entry.parent.and_then(|parent| chain.get(parent.at()).copied()).unwrap_or((own, own_cfg));
+        let cut = above.and(own_cut(view, Some(&entry.item), edition, g));
+        let cfg = fold_cfgs(above_cfg, view, Some(&entry.item));
+        chain.push((cut, cfg));
+        if cut != Cut::HOLDS {
+            at.push((entry.range.start, cut));
+        }
+        if let Some(digest) = cfg {
+            cfgs.push((entry.range.start, digest));
+        }
+    }
+    // Entries are in the file's order, each before those inside it (which start at or after
+    // it) and after its earlier siblings' (which end before it): their starts never go down,
+    // and of one start the deepest is last, as [`FileCuts::of`] reads them. A view that breaks
+    // it is the outline's fault, named (rule 20), never a cut read at the wrong entry.
+    assert!(at.is_sorted_by_key(|one| one.0), "outline {name:?} lists an entry that starts before the one above it (engine_plan_cfg.rs `cuts_of_view`)");
+    assert!(cfgs.is_sorted_by_key(|one| one.0), "outline {name:?} lists a cfg entry that starts before the one above it (engine_plan_cfg.rs `cuts_of_view`)");
+    FileCuts { own, at, cfgs }
+}
+
 /// The cuts of `one`'s outline, in `g`: `None` when its record lists no body and no file (a
 /// data file, a file that did not read: nothing of it is planned or walked). An outline that
 /// lists parts and whose payload is no `FileItems` record is the outline task's fault: a panic
@@ -225,31 +256,7 @@ pub(crate) fn file_cuts<'g>(one: &Outlined<'_>, g: Alloc<'g>) -> Option<FileCuts
     let payload = record.payload_bytes().unwrap_or_else(|why| panic!("outline {:?} lists parts and has no payload: {why} (engine_plan_cfg.rs `file_cuts`)", one.name));
     let view = FileItemsView::read(payload).unwrap_or_else(|why| panic!("outline {:?} lists parts and its payload is no FileItems record: {why:?} (engine_plan_cfg.rs `file_cuts`)", one.name));
     let edition = Edition::from_byte(one.edition).unwrap_or_else(|| panic!("outline {:?} has an edition byte that is no edition (engine_plan_cfg.rs `file_cuts`)", one.name));
-    let own = own_cut(&view, None, edition, g);
-    let own_cfg = fold_cfgs(None, &view, None);
-    // Each entry's chain, in the file's order: a parent comes before its entries.
-    let mut chain: AVec<'_, (Cut, Option<ContentId>)> = Vec::with_capacity_in(view.len(), g);
-    let mut at: AVec<'g, (u32, Cut)> = Vec::new_in(g);
-    let mut cfgs: AVec<'g, (u32, ContentId)> = Vec::new_in(g);
-    for entry in view.items() {
-        let (above, above_cfg) = entry.parent.and_then(|parent| chain.get(parent.at()).copied()).unwrap_or((own, own_cfg));
-        let cut = above.and(own_cut(&view, Some(&entry.item), edition, g));
-        let cfg = fold_cfgs(above_cfg, &view, Some(&entry.item));
-        chain.push((cut, cfg));
-        if cut != Cut::HOLDS {
-            at.push((entry.range.start, cut));
-        }
-        if let Some(digest) = cfg {
-            cfgs.push((entry.range.start, digest));
-        }
-    }
-    // Entries are in the file's order, each before those inside it (which start at or after
-    // it) and after its earlier siblings' (which end before it): their starts never go down,
-    // and of one start the deepest is last, as [`FileCuts::of`] reads them. A view that breaks
-    // it is the outline's fault, named (rule 20), never a cut read at the wrong entry.
-    assert!(at.is_sorted_by_key(|one| one.0), "outline {:?} lists an entry that starts before the one above it (engine_plan_cfg.rs `file_cuts`)", one.name);
-    assert!(cfgs.is_sorted_by_key(|one| one.0), "outline {:?} lists a cfg entry that starts before the one above it (engine_plan_cfg.rs `file_cuts`)", one.name);
-    Some(FileCuts { own, at, cfgs })
+    Some(cuts_of_view(one.name, &view, edition, g))
 }
 
 /// The cut of the body `part` of the outline whose cuts are `cuts` ([`file_cuts`]):
