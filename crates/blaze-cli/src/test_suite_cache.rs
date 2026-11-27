@@ -28,7 +28,8 @@ use blaze_code::record::{Space, Symbol as CodeSymbol};
 use blaze_engine::SVec;
 use blaze_hash::{BuildKeyHasher, FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ladder::body_ids::{
-    Begun, DeclaredList, EntryForm, Form as _, How, Make, Order, Pending, RowKind, Scratch, Stepped, Unkeyed, Walk, instance_key,
+    Begun, BodyIds as _, DeclaredList, EntryForm, Form as _, How, Make, Order, Pending, RowKind, Scratch, Stepped, Unkeyed, Walk, WalkError, each_item,
+    instance_key, is_synthetic_shim_item,
 };
 use blaze_ladder::code_records::statics::{STATIC_ENTRY_MAGIC, StaticEntryView, each_static_named, each_vtable_datum, entry_record};
 use blaze_ladder::code_records::{Builder, CodeKey, CodeStore, EntryView, content_key};
@@ -226,8 +227,34 @@ struct InFlight {
     entry: Option<ItemKey>,
     start: MakerStart,
     enclosers: LocalEnclosers,
-    /// Number of children currently parked on `CodeRelay` for this row.
+    /// Number of children currently parked on `CodeRelay` (`peer: false`) for this row.
     waiters: usize,
+    /// Whether one child in this suite has already switched this row to a suite-private
+    /// (`key: None`) retry after rejecting a cross-suite `CodeRelay` entry.
+    private_active: bool,
+}
+
+/// Verdict of verifying a cross-suite `CodeRelay` entry against this suite's `RunIds` and
+/// `LazyProgram` before accepting it into `SuiteCache`'s `Walk`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CrossSuiteVerdict {
+    /// Another child in this suite already finished or abandoned `(row, epoch)`.
+    AlreadyDone,
+    /// The foreign suite's compiled entry holds under this suite's crates and bindings.
+    Holds,
+    /// The foreign suite's entry does not hold under this suite (e.g. differing
+    /// `#[global_allocator]`, `#[panic_handler]`, or crate set); retry suite-privately.
+    Retry,
+}
+
+/// Action for a child whose cross-suite `CodeRelay` answer did not verify against this suite.
+pub(crate) enum RetryDecision {
+    /// Another child in this suite already finished or abandoned `(row, epoch)`.
+    AlreadyDone,
+    /// Another child in this suite already submitted the suite-private retry for `(row, epoch)`.
+    WaitPeer,
+    /// This child owns the suite-private retry (`CodeRelay::ask(child, None, job)`).
+    Submit(Job<'static>),
 }
 
 /// Payload for submitting a cold row to `CodeRelay` from the child's turn.
@@ -830,6 +857,7 @@ impl<'h> SuiteCache<'h> {
                         .map_err(|why| ParentError::Walk { symbol, why })?
                         .stepped,
                     Codes::Pooled => {
+                        let stale_before = self.walk.counts().stale_reads;
                         match self
                             .walk
                             .begin(row, ids, store, &self.builder, &self.builder.producer, &mut vm, &EntryForm, MOST_WALKED, &mut self.scratch)
@@ -839,13 +867,29 @@ impl<'h> SuiteCache<'h> {
                             Begun::Make(pending) => {
                                 let epoch = self.next_epoch;
                                 self.next_epoch = self.next_epoch.wrapping_add(1).max(1);
-                                let key = pending.key();
+                                // If `HomeCodeStore` already held a stale entry under `pending.key()`
+                                // (e.g. another suite with a different `#[global_allocator]` wrote
+                                // its entry under the same `CodeKey`), bypass `CodeRelay`'s shared
+                                // key immediately so this suite compiles its own entry directly.
+                                let key = if self.walk.counts().stale_reads > stale_before { None } else { pending.key() };
                                 let order = pending.order();
                                 let entry = roots.maker_entry();
                                 let start = roots.maker_start;
                                 self.in_flight.insert(
                                     row,
-                                    InFlight { pending, epoch, key, order, proof, symbol, entry, start, enclosers, waiters: 1 },
+                                    InFlight {
+                                        pending,
+                                        epoch,
+                                        key,
+                                        order,
+                                        proof,
+                                        symbol,
+                                        entry,
+                                        start,
+                                        enclosers,
+                                        waiters: 1,
+                                        private_active: false,
+                                    },
                                 );
                                 return Ok(StepRow::Need(NeedCode::Ask(NeedAsk { row, epoch, symbol, key, order, proof, entry, start, enclosers })));
                             }
@@ -903,6 +947,129 @@ impl<'h> SuiteCache<'h> {
         Job { suite, order: need.order, name, proof: need.proof, entry: need.entry, start: need.start, enclosers: need.enclosers }
     }
 
+    /// Verifies a `CodeRelay` entry produced by another suite before accepting it into this
+    /// suite's `Walk`. Two suites can share a `CodeKey` for a toolchain item while differing in
+    /// global bindings (`#[global_allocator]`, `#[panic_handler]`, `#[rustc_std_internal_symbol]`)
+    /// or dependency features; accepting an unverified cross-suite entry would inject foreign
+    /// items or wrong bindings into this suite's walk.
+    pub(crate) fn verify_cross_suite_in_flight(
+        &mut self,
+        row: usize,
+        epoch: u64,
+        entry: &[u8],
+        ids: &RunIds<'h>,
+        scratch_alloc: Alloc<'_>,
+    ) -> Result<CrossSuiteVerdict, ParentError> {
+        let Some(flight) = self.in_flight.get(&row).filter(|flight| flight.epoch == epoch) else {
+            return Ok(CrossSuiteVerdict::AlreadyDone);
+        };
+        if flight.private_active {
+            return Ok(CrossSuiteVerdict::Retry);
+        }
+        let key = flight.key;
+        let symbol = flight.symbol;
+        let maker_entry = flight.entry;
+        let maker_start = flight.start;
+        let enclosers = flight.enclosers;
+
+        // Fast check: every declared callee (and its name's items), static, and thread-local
+        // must belong to a crate present in this suite's `RunIds`.
+        let mut declared = DeclaredList::new_in(scratch_alloc);
+        if EntryForm.declared(entry, &mut declared).is_err() {
+            return Ok(CrossSuiteVerdict::Retry);
+        }
+        for i in 0..declared.len() {
+            let (callee, callee_name) = declared.row(i);
+            if !is_synthetic_shim_item(callee) && ids.crate_fact(callee).is_none() {
+                return Ok(CrossSuiteVerdict::Retry);
+            }
+            let mut all_present = true;
+            if each_item(callee_name, |item| {
+                if ids.crate_fact(item).is_none() {
+                    all_present = false;
+                }
+            })
+            .is_err()
+                || !all_present
+            {
+                return Ok(CrossSuiteVerdict::Retry);
+            }
+        }
+        if declared.statics().iter().any(|&item| ids.crate_fact(item).is_none())
+            || declared.thread_locals().iter().any(|&item| ids.crate_fact(item).is_none())
+        {
+            return Ok(CrossSuiteVerdict::Retry);
+        }
+
+        let Ok(rows) = EntryForm.reads(entry) else {
+            return Ok(CrossSuiteVerdict::Retry);
+        };
+        if rows == 0 {
+            return Ok(CrossSuiteVerdict::Holds);
+        }
+
+        let tabled = self.walk.tabled(row);
+        let name_slice = self.walk.name(row);
+        let mut vm = LazyVerifyingMaker {
+            names: self.names,
+            builder: &self.builder,
+            typed: self.typed,
+            tables: self.tables,
+            make_watch: self.make_watch,
+            entry: maker_entry,
+            start: maker_start,
+            ids: *ids,
+            enclosers,
+            maker: &mut self.maker,
+            verified_closed: &mut self.verified_closed,
+            verified_workspace: &mut self.verified_workspace,
+            verified_dirty: &mut self.verified_dirty,
+        };
+        // Propagate genuine suite-local maker construction errors, then treat any read-list
+        // mismatch or foreign-crate lookup error during verification as `Retry`.
+        vm.ensure_maker()
+            .map_err(|why| ParentError::Walk { symbol, why: WalkError::Make { tabled, why } })?;
+        let verdict = match key {
+            Some(key) => vm.verify_keyed(key, content_key(entry), tabled, name_slice, entry),
+            None => vm.verify(tabled, name_slice, entry),
+        };
+        Ok(match verdict {
+            Ok(Some(Verdict::Holds)) => CrossSuiteVerdict::Holds,
+            Ok(Some(Verdict::Stale { .. } | Verdict::Needs { .. })) | Ok(None) | Err(_) => CrossSuiteVerdict::Retry,
+        })
+    }
+
+    /// Transitions an in-flight `(row, epoch)` to a suite-private (`key: None`) `CodeRelay` ask
+    /// after a cross-suite answer was rejected or refused. At most one child submits the private
+    /// job (`RetryDecision::Submit`); peers waiting on the same `(row, epoch)` convert to
+    /// `RetryDecision::WaitPeer` and release their `CodeRelay` waiter count.
+    pub(crate) fn begin_suite_private_retry(
+        &mut self,
+        suite: SuiteId,
+        row: usize,
+        epoch: u64,
+        alloc: SharedAlloc<'static>,
+    ) -> RetryDecision {
+        let Some(flight) = self.in_flight.get_mut(&row).filter(|flight| flight.epoch == epoch) else {
+            return RetryDecision::AlreadyDone;
+        };
+        if flight.private_active {
+            flight.waiters = flight.waiters.saturating_sub(1);
+            return RetryDecision::WaitPeer;
+        }
+        flight.private_active = true;
+        flight.key = None;
+        let order = flight.order;
+        let proof = flight.proof;
+        let entry = flight.entry;
+        let start = flight.start;
+        let enclosers = flight.enclosers;
+        let name_slice = self.walk.name(row);
+        let mut name = SVec::with_capacity_in(name_slice.len(), alloc);
+        name.extend_from_slice(name_slice);
+        RetryDecision::Submit(Job { suite, order, name, proof, entry, start, enclosers })
+    }
+
     /// Finishes an in-flight pooled row when a worker returns `entry`: stores into CAS via
     /// `Walk::finish`, records `(instance_key, content_key)` in `self.verified` for `BZTV`, and
     /// retains unkeyed bytes in `self.unkeyed_entries` until `ensure_cached` caches the row.
@@ -926,7 +1093,7 @@ impl<'h> SuiteCache<'h> {
         };
         let one = self
             .walk
-            .finish::<LadderRunError>(flight.pending, entry, store, &EntryForm, MOST_WALKED, &mut self.scratch)
+            .finish::<LadderRunError>(flight.pending, entry, ids, store, &EntryForm, MOST_WALKED, &mut self.scratch)
             .map_err(|why| ParentError::Walk { symbol: flight.symbol, why })?;
         let stepped = one.stepped;
         let span = cx.span(FIRST_CALL_SPAN);
@@ -986,9 +1153,12 @@ impl<'h> SuiteCache<'h> {
 
     /// Releases one child's waiter count on `(row, epoch)` (e.g. on child drop, timeout, or late
     /// wake). Abandons the underlying `Walk` row only when the last waiter leaves.
-    pub(crate) fn release_in_flight(&mut self, row: usize, epoch: u64) {
+    pub(crate) fn release_in_flight(&mut self, row: usize, epoch: u64, private_retry: bool) {
         let drop_it = match self.in_flight.get_mut(&row) {
             Some(flight) if flight.epoch == epoch => {
+                if private_retry {
+                    flight.private_active = false;
+                }
                 flight.waiters = flight.waiters.saturating_sub(1);
                 flight.waiters == 0
             }

@@ -1192,7 +1192,7 @@ impl<'a> Walk<'a> {
             self.how[pending.row()] = How::Waiting;
             return Err(why);
         }
-        let stepped = self.end(pending, made.as_slice(), store, form, most, declared)?;
+        let stepped = self.end(pending, made.as_slice(), ids, store, form, most, declared)?;
         Ok(One { stepped, declared: self.declared(row) })
     }
 
@@ -1229,9 +1229,18 @@ impl<'a> Walk<'a> {
     /// the rows it declares are reached, in its order, with nothing done for them. On an error
     /// the row is [`How::Waiting`] again (a row reached before the error stays reached), as
     /// `one`'s.
-    pub fn finish<'w, E>(&'w mut self, pending: Pending, made: &[u8], store: &mut dyn CodeStore, form: &dyn Form, most: usize, scratch: &mut Scratch<'a>) -> Result<One<'w>, WalkError<E>> {
+    pub fn finish<'w, E>(
+        &'w mut self,
+        pending: Pending,
+        made: &[u8],
+        ids: &dyn BodyIds,
+        store: &mut dyn CodeStore,
+        form: &dyn Form,
+        most: usize,
+        scratch: &mut Scratch<'a>,
+    ) -> Result<One<'w>, WalkError<E>> {
         let row = pending.row();
-        let stepped = self.end(pending, made, store, form, most, &mut scratch.declared)?;
+        let stepped = self.end(pending, made, ids, store, form, most, &mut scratch.declared)?;
         Ok(One { stepped, declared: self.declared(row) })
     }
 
@@ -1362,9 +1371,10 @@ impl<'a> Walk<'a> {
 
     /// [`Walk::finish`]'s work: `made` read for its declared rows, put when keyed, the rows
     /// reached; on an error the row is waiting again.
-    fn end<E>(&mut self, pending: Pending, made: &[u8], store: &mut dyn CodeStore, form: &dyn Form, most: usize, declared: &mut DeclaredList<'a>) -> Result<Stepped, WalkError<E>> {
+    #[allow(clippy::too_many_arguments)]
+    fn end<E>(&mut self, pending: Pending, made: &[u8], ids: &dyn BodyIds, store: &mut dyn CodeStore, form: &dyn Form, most: usize, declared: &mut DeclaredList<'a>) -> Result<Stepped, WalkError<E>> {
         let row = self.begun(&pending)?;
-        let Pending { order, keyed, class, .. } = pending;
+        let Pending { order, keyed, mut class, .. } = pending;
         let tabled = order.tabled;
         declared.clear();
         // Put under its content key, and the instance's key pointed to it: an entry made again
@@ -1374,9 +1384,19 @@ impl<'a> Walk<'a> {
         let done = form
             .declared(made, declared)
             .map_err(|why| WalkError::Entry { tabled, found: false, why })
-            .and_then(|()| match keyed {
-                Ok(key) => store.put(class, content, made).and_then(|()| store.point(class, key, content)).map_err(WalkError::Store),
-                Err(_) => Ok(()),
+            .and_then(|()| {
+                // An instance whose own name is all toolchain items can still declare a program
+                // item (e.g. `alloc::alloc::alloc` calling a crate's `#[global_allocator]`
+                // `__rust_alloc` shim, or `core::panicking` calling a custom `#[panic_handler]`).
+                // Classify such entries as `Program` so they live under the program's root rather
+                // than the toolchain's shared root.
+                if class == CodeClass::Toolchain && !declared_all_toolchain(declared, ids) {
+                    class = CodeClass::Program;
+                }
+                match keyed {
+                    Ok(key) => store.put(class, content, made).and_then(|()| store.point(class, key, content)).map_err(WalkError::Store),
+                    Err(_) => Ok(()),
+                }
             })
             .and_then(|()| {
                 let stepped = match keyed {
@@ -1420,6 +1440,30 @@ impl<'a> Walk<'a> {
         self.how[row] = How::Done(stepped);
         Ok(())
     }
+}
+
+/// Returns `true` iff every declared callee (and its name's items), static, and thread-local in
+/// `declared` belongs to a toolchain crate under `ids`.
+fn declared_all_toolchain(declared: &DeclaredList<'_>, ids: &dyn BodyIds) -> bool {
+    for i in 0..declared.len() {
+        let (callee, callee_name) = declared.row(i);
+        if !is_synthetic_shim_item(callee) && ids.class(callee) != CodeClass::Toolchain {
+            return false;
+        }
+        let mut all_toolchain = true;
+        if each_item(callee_name, |item| {
+            if ids.class(item) != CodeClass::Toolchain {
+                all_toolchain = false;
+            }
+        })
+        .is_err()
+            || !all_toolchain
+        {
+            return false;
+        }
+    }
+    declared.statics().iter().all(|&item| ids.class(item) == CodeClass::Toolchain)
+        && declared.thread_locals().iter().all(|&item| ids.class(item) == CodeClass::Toolchain)
 }
 
 /// Maximum body-local keys and same-crate declarer enclosers tracked for one walked row
@@ -2111,7 +2155,7 @@ mod tests {
                 let again = split.begin(first.row(), &ids, &mut split_store, &builder, &producer, &mut split_model, &Toy, 64, &mut scratch);
                 assert!(matches!(again, Err(WalkError::Making { .. })), "control: a row being made is begun again: {again:?}");
                 while let Some((pending, made)) = wave.pop() {
-                    split.finish::<NameError>(pending, &made, &mut split_store, &Toy, 64, &mut scratch).expect("finished");
+                    split.finish::<NameError>(pending, &made, &ids, &mut split_store, &Toy, 64, &mut scratch).expect("finished");
                 }
             }
 
@@ -2136,7 +2180,7 @@ mod tests {
                 panic!("an empty store found main");
             };
             let before = split.how(0);
-            let refused = split.finish::<NameError>(foreign, &[], &mut split_store, &Toy, 64, &mut scratch).map(|one| one.stepped);
+            let refused = split.finish::<NameError>(foreign, &[], &ids, &mut split_store, &Toy, 64, &mut scratch).map(|one| one.stepped);
             assert!(matches!(refused, Err(WalkError::NotBegun { tabled: ItemKey(MAIN) })), "control: {refused:?}");
             assert_eq!(split.how(0), before);
             printed.push_str(&std::format!("{} {} rows {} makes; ", if recorded { "keyed" } else { "unkeyed" }, split.len(), split_model.calls));
@@ -2300,5 +2344,105 @@ mod tests {
         let Stepped::Made(key) = one.stepped else { panic!("main was not made under a key: {:?}", one.stepped) };
         assert_eq!(keyed_store.get(key).expect("a memory store reads"), Some(scratch.made()));
         assert_eq!(scratch.made(), expected.as_slice());
+    }
+
+    /// A toolchain fn whose compiled entry declares a program item (e.g. `alloc::alloc::alloc`
+    /// calling a workspace crate's `#[global_allocator]` `__rust_alloc` shim) must be stored
+    /// under `CodeClass::Program` rather than `CodeClass::Toolchain`, while a toolchain fn whose
+    /// declared callees are all toolchain items stays `CodeClass::Toolchain`.
+    #[test]
+    fn toolchain_fn_declaring_program_item_is_classified_as_program() {
+        struct RecordingStore<'a> {
+            inner: MemoryStore<'a>,
+            put_classes: std::vec::Vec<(CodeKey, CodeClass)>,
+            point_classes: std::vec::Vec<(CodeKey, CodeClass)>,
+        }
+        impl CodeStore for RecordingStore<'_> {
+            fn get(&self, key: CodeKey) -> Result<Option<&[u8]>, StoreError> {
+                self.inner.get(key)
+            }
+            fn put(&mut self, class: CodeClass, key: CodeKey, entry: &[u8]) -> Result<(), StoreError> {
+                self.put_classes.push((key, class));
+                self.inner.put(class, key, entry)
+            }
+            fn pointed(&self, key: CodeKey) -> Result<Option<CodeKey>, StoreError> {
+                self.inner.pointed(key)
+            }
+            fn point(&mut self, class: CodeClass, key: CodeKey, content: CodeKey) -> Result<(), StoreError> {
+                self.point_classes.push((key, class));
+                self.inner.point(class, key, content)
+            }
+        }
+        struct ClassIds {
+            inner: Ids,
+            toolchain_prefix: u128,
+        }
+        impl BodyIds for ClassIds {
+            fn body_check(&self, item: ItemKey) -> Option<BodyId<'_>> {
+                self.inner.body_check(item)
+            }
+            fn today(&self, fact: &[u8; 32]) -> Option<[u8; 32]> {
+                self.inner.today(fact)
+            }
+            fn crate_fact(&self, item: ItemKey) -> Option<Read> {
+                self.inner.crate_fact(item)
+            }
+            fn class(&self, item: ItemKey) -> CodeClass {
+                if (item.0 >> 8) == self.toolchain_prefix { CodeClass::Toolchain } else { CodeClass::Program }
+            }
+        }
+
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let builder = builder();
+        let producer = model_producer();
+
+        // Case 1: `MAIN` (0xA001) is Toolchain, `HELPER` (0xA002) is Toolchain, `PLAIN` (0xB002)
+        // is Program; `MAIN` declares `PLAIN`, so `MAIN` must be downgraded to `CodeClass::Program`.
+        let ids_mixed = ClassIds { inner: Ids::new([0, 0]), toolchain_prefix: 0xA0 };
+        let mut entry: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(MAIN, None, &mut entry);
+        let mut store = RecordingStore {
+            inner: MemoryStore::new_in(alloc),
+            put_classes: std::vec::Vec::new(),
+            point_classes: std::vec::Vec::new(),
+        };
+        let mut model = Model { alloc, calls: 0 };
+        let mut walk = Walk::new_in(alloc);
+        let mut scratch = Scratch::new_in(alloc);
+        let root = walk.root::<NameError>((ItemKey(MAIN), &entry), 64).expect("main reached");
+        walk.one(root, &ids_mixed, &mut store, &builder, &producer, &mut model, &GRANT, &Toy, 64, &mut scratch)
+            .expect("main made");
+        assert_eq!(store.put_classes.len(), 1);
+        assert_eq!(store.put_classes[0].1, CodeClass::Program, "toolchain fn declaring program callee must be Program");
+        assert_eq!(store.point_classes[0].1, CodeClass::Program, "pointer class must match Program");
+
+        // Control: `PLAIN` (0xB002) and `LEAF` (0xB003) are both Toolchain; `PLAIN` declares only
+        // `LEAF`, so `PLAIN` stays `CodeClass::Toolchain`.
+        let ids_tool = ClassIds { inner: Ids::new([0, 0]), toolchain_prefix: 0xB0 };
+        let mut plain_name: AVec<'_, u8> = Vec::new_in(alloc);
+        name_of(PLAIN, None, &mut plain_name);
+        let mut tool_store = RecordingStore {
+            inner: MemoryStore::new_in(alloc),
+            put_classes: std::vec::Vec::new(),
+            point_classes: std::vec::Vec::new(),
+        };
+        let mut walk_tool = Walk::new_in(alloc);
+        let plain_root = walk_tool.root::<NameError>((ItemKey(PLAIN), &plain_name), 64).expect("plain reached");
+        let Begun::Make(pending) = walk_tool
+            .begin(plain_root, &ids_tool, &mut tool_store, &builder, &producer, &mut model, &Toy, 64, &mut scratch)
+            .expect("plain begun")
+        else {
+            panic!("empty store found plain");
+        };
+        let mut made: AVec<'_, u8> = Vec::new_in(alloc);
+        pending.order().make(&mut model, &GRANT, &plain_name, &mut made).expect("plain made");
+        walk_tool
+            .finish::<NameError>(pending, &made, &ids_tool, &mut tool_store, &Toy, 64, &mut scratch)
+            .expect("plain finished");
+        assert_eq!(tool_store.put_classes.len(), 1);
+        assert_eq!(tool_store.put_classes[0].1, CodeClass::Toolchain, "pure toolchain fn stays Toolchain");
+        assert_eq!(tool_store.point_classes[0].1, CodeClass::Toolchain, "pure toolchain pointer stays Toolchain");
     }
 }

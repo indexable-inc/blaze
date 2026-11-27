@@ -1484,23 +1484,22 @@ impl<'r, 'a, F: Front, D: Folder> Lazy<'r, 'a, F, D> {
     pub(crate) fn made(&mut self, entry: &[u8]) -> Result<(), ParentError> {
         let Asked { pending, symbol, .. } = self.asked.take().ok_or(ParentError::NothingAsked)?;
         let started = self.started.as_mut().ok_or(ParentError::NothingAsked)?;
+        let heavy = started.heavy.as_mut().ok_or(ParentError::NothingAsked)?;
         let row = pending.row();
-        let one = started.walk.finish::<RunError>(pending, entry, &mut *self.store, self.front.form(), MOST_WALKED, &mut started.scratch).map_err(|why| ParentError::Walk { symbol, why })?;
+        let one = started.walk.finish::<RunError>(pending, entry, &heavy.ids, &mut *self.store, self.front.form(), MOST_WALKED, &mut started.scratch).map_err(|why| ParentError::Walk { symbol, why })?;
         let stepped = match one.stepped {
             body_ids::Stepped::Found(key) => Stepped::Found(key),
             body_ids::Stepped::Made(key) => {
-                if let Some(heavy) = started.heavy.as_mut() {
-                    self.front.record_made(
-                        &mut heavy.maker,
-                        &heavy.ids,
-                        CodeSymbol(symbol),
-                        started.walk.tabled(row),
-                        started.walk.name(row),
-                        entry,
-                        key,
-                        &self.builder,
-                    );
-                }
+                self.front.record_made(
+                    &mut heavy.maker,
+                    &heavy.ids,
+                    CodeSymbol(symbol),
+                    started.walk.tabled(row),
+                    started.walk.name(row),
+                    entry,
+                    key,
+                    &self.builder,
+                );
                 Stepped::Made(Made::Put(key))
             }
             body_ids::Stepped::Unkeyed(unkeyed) => Stepped::Made(Made::Unkeyed(unkeyed)),
