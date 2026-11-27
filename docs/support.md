@@ -9,7 +9,7 @@ This is what blaze v1 supported, as of its integration into v2 on 2026-10-30. Mu
 describes v1's machinery: rustc's copy of a refused function, handing a build to cargo, the
 splice, tiers and live edits through `blaze-live`, rustc linking with blaze's objects. v2 builds
 with no rustc and no cargo, and none of these cells has been measured for it; what v2 must reach
-is [v2/plan/goals/targets.md](v2/plan/objectives.md).
+is v2/plan/goals/targets.md.
 
 Every cell here points at a report or a harness run. The harnesses that compared blaze with
 rustc or cargo (the corpus, the breakers, the build-model cases, the fuzzer's differential
@@ -43,7 +43,7 @@ ones on `nightly-2026-05-10`; they are marked where they are used and are not re
 by the move.
 
 `blaze` builds every project with the pinned nightly, whatever toolchain the project names
-([cargo.md](cargo.md)): it ignores rust-toolchain files, rustup's settings, `RUSTUP_TOOLCHAIN`
+(cargo.md): it ignores rust-toolchain files, rustup's settings, `RUSTUP_TOOLCHAIN`
 and `RUSTC`, and runs no rustc to ask what it is. A project that needs another Rust pins
 another blaze ([toolchain.md](toolchain.md)).
 
@@ -138,7 +138,7 @@ By default each crate's MIR gets the passes rustc runs at that crate's level, th
 ported: level 1 (a debug build's) at `-Copt-level=0`, level 2 above it and for the library's
 crates, whose MIR rustc ships optimized. `BLAZE_MIR_OPT` overrides the level for every crate:
 0 runs none, 1 a debug build's passes, 2 those above `-Copt-level=0`
-([mir-passes.md](mir-passes.md#optimizations), research/mir-gap.md).
+(mir-passes.md, "Optimizations", research/mir-gap.md).
 Coroutine bodies are never optimized.
 
 | | 0 | 1 | 2 |
@@ -237,7 +237,7 @@ and a `;` is that expression, as rustc takes the `;`: `bail!(e)` last in a block
 is the crate's own, where rustc's `semicolon_in_expressions_from_macros` is an error. An error
 rust-analyzer does not find is not refused, and a crate blaze compiles without rustc, as it
 does a whole program's, is then built and run.
-Borrow-check errors are the main case: blaze's borrow checker ([borrowck.md](borrowck.md)) refuses what it finds, and it
+Borrow-check errors are the main case: blaze's borrow checker (borrowck.md) refuses what it finds, and it
 finds nothing rustc accepts in rustc's tests or in seven real projects, but it misses about a
 third of the errors rustc gives (67% of rustc's borrow-check tests get rustc's verdict), and
 an edit with one it misses builds and runs. Run `blaze check` or `cargo check` to get

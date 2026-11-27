@@ -150,15 +150,18 @@ impl FnAttrs {
     pub const INLINE_SHIFT: u32 = 3;
     pub const OPT_SIZE: u32 = 1 << 5;
     pub const OPT_NONE: u32 = 1 << 6;
-    pub const ALL: u32 = (1 << 7) - 1;
+    /// `#[unsafe(naked)]`: no compiler-generated prologue, epilogue, or parameter copies.
+    pub const NAKED: u32 = 1 << 7;
+    pub const ALL: u32 = (1 << 8) - 1;
 
     /// The single-bit attributes, by their text names.
-    pub const NAMED: [(u32, &'static str); 5] = [
+    pub const NAMED: [(u32, &'static str); 6] = [
         (FnAttrs::NORETURN, "noreturn"),
         (FnAttrs::NOUNWIND, "nounwind"),
         (FnAttrs::COLD, "cold"),
         (FnAttrs::OPT_SIZE, "optsize"),
         (FnAttrs::OPT_NONE, "optnone"),
+        (FnAttrs::NAKED, "naked"),
     ];
 
     pub const fn inline(self) -> Inline {
@@ -654,8 +657,9 @@ impl AsmRec {
     pub const ATT_SYNTAX: u32 = 1 << 6;
     pub const RAW: u32 = 1 << 7;
     pub const MAY_UNWIND: u32 = 1 << 8;
+    pub const NAKED: u32 = 1 << 9;
 
-    pub const NAMED: [(u32, &'static str); 9] = [
+    pub const NAMED: [(u32, &'static str); 10] = [
         (AsmRec::PURE, "pure"),
         (AsmRec::NOMEM, "nomem"),
         (AsmRec::READONLY, "readonly"),
@@ -665,6 +669,7 @@ impl AsmRec {
         (AsmRec::ATT_SYNTAX, "att_syntax"),
         (AsmRec::RAW, "raw"),
         (AsmRec::MAY_UNWIND, "may_unwind"),
+        (AsmRec::NAKED, "naked"),
     ];
 }
 
@@ -935,7 +940,7 @@ pub(crate) use columns;
 
 columns!(define);
 
-/// The hot bytes per instruction: an op, flags, a type and one word. data.md's budget.
+/// The hot bytes per instruction: an op, flags, a type and one word. bottom.md section 13's budget.
 const _: () = assert!(size_of::<u8>() + size_of::<u8>() + size_of::<u16>() + size_of::<u32>() == 8);
 const _: () = assert!(size_of::<SigRec>() == 12);
 const _: () = assert!(size_of::<ParamRec>() == 8);

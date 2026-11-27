@@ -2,7 +2,7 @@
 //! next revision is built in one arena while readers read the current one from the other.
 //! Publishing flips which is current with one release store; the arena of the revision before
 //! is reused only once no task can still be reading it, which [`blaze_reclaim`] says at task
-//! boundaries (docs/v2/plan/design/concurrency.md "Task boundaries reclaim memory").
+//! boundaries (docs/v2/plan/design/end-state.md D179: task boundaries reclaim memory).
 //!
 //! A revision's value borrows its arena: [`Built::Value<'a>`] may hold `&'a` references into
 //! memory it allocated there. Readers get it for as long as their task's guard, never longer.

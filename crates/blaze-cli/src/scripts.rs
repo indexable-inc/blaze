@@ -298,6 +298,9 @@ pub(crate) struct Scripts<'f> {
     /// The decoded unit graph: either the names world's (`NamesWorld::graph`) or decoded once
     /// into `frame` when no `Names` task ran yet ([`Scripts::open_light`]).
     graph: &'f UnitGraph<'f>,
+    /// Optional decoded `wasm64-blaze-wasip1` host-unit graph carried beside `graph` so
+    /// `script_deps_digest` includes WASI-side unified dependency features (Rule 21).
+    wasm_graph: Option<&'f UnitGraph<'f>>,
     /// Lightweight toolchain + script-cfg world when `Names` has not built the full world yet.
     script_world: Option<&'f blaze_world::ScriptWorld<'f>>,
     /// (subject, script unit, side), sorted: each run a crate of the world reads, by the world's
@@ -455,17 +458,19 @@ impl<'f> Scripts<'f> {
             let _cx = cx.span("scripts: the world's runs by subject");
             names.script_runs(frame)
         };
-        Self::finish_open(cx, env, names.graph(), None, by_subject, graph_record, lock, members, frame)
+        Self::finish_open(cx, env, names.graph(), names.wasm_graph(), None, by_subject, graph_record, lock, members, frame)
     }
 
     /// Lightweight scripts setup when no `Names` task has built the full world yet: decodes the
     /// unit graph and opens only the toolchain shelf (for `ScriptSetup::open_recorded`) and
     /// script-reading crates' `cfg`s, without mapping or laying out any fetched package.
+    #[expect(clippy::too_many_arguments, reason = "lightweight Scripts setup taking graph and optional wasm64 host graph")]
     pub(crate) fn open_light(
         cx: &Cx,
         env: &FetchEnv<'_>,
         names: &crate::names::Names<'f>,
         graph_record: &'f [u8],
+        wasm_graph_record: &'f [u8],
         lock: Option<&'f Lock<'static>>,
         members: Option<&[crate::graph::CheckoutDir]>,
         frame: &'f Frame,
@@ -485,6 +490,14 @@ impl<'f> Scripts<'f> {
         };
         let decoded: &'f blaze_unit_graph::record::Decoded<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(decoded, frame));
         let graph: &'f UnitGraph<'f> = &decoded.graph;
+        let wasm_graph: Option<&'f UnitGraph<'f>> = if wasm_graph_record.is_empty() {
+            None
+        } else {
+            let wd = blaze_unit_graph::record::decode(wasm_graph_record, bump.alloc())
+                .map_err(|e| SetupError::Setting(said(frame, format_args!("wasm64 unit graph decode: {e}"))))?;
+            let wd: &'f blaze_unit_graph::record::Decoded<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(wd, frame));
+            Some(&wd.graph)
+        };
         let mut shelf = {
             let _cx = cx.span("scripts: toolchain shelf opened");
             crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(|e| SetupError::Setting(said(frame, format_args!("toolchain shelf: {e}"))))?
@@ -502,7 +515,7 @@ impl<'f> Scripts<'f> {
         };
         let sw: &'f blaze_world::ScriptWorld<'f> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(sw, frame));
         let by_subject = names.script_runs(frame);
-        Self::finish_open(cx, env, graph, Some(sw), by_subject, graph_record, lock, members, frame)
+        Self::finish_open(cx, env, graph, wasm_graph, Some(sw), by_subject, graph_record, lock, members, frame)
     }
 
     #[expect(clippy::too_many_arguments, reason = "shared Scripts constructor")]
@@ -510,6 +523,7 @@ impl<'f> Scripts<'f> {
         cx: &Cx,
         env: &FetchEnv<'_>,
         graph: &'f UnitGraph<'f>,
+        wasm_graph: Option<&'f UnitGraph<'f>>,
         script_world: Option<&'f blaze_world::ScriptWorld<'f>>,
         by_subject: blaze_own::Vec<(ContentId, UnitId, Side), &'f Frame>,
         graph_record: &'f [u8],
@@ -532,7 +546,7 @@ impl<'f> Scripts<'f> {
         let folder = crate::fetch::sources_native(env, frame).ok_or(SetupError::NoHome)?;
         let dir = SourcesDir { folder: crate::work::held_str(folder.as_str(), frame), frame };
         let sources = StoreSources::new(lock, dir, blaze_fetch::pack::PackView::open_source_put, alloc).map_err(|error| SetupError::Sources(said(frame, format_args!("{error}"))))?;
-        Ok(Scripts { shared: None, graph_record, graph, script_world, by_subject, sources, lock, members, files: std::vec::Vec::new_in(Global), setups_opened: 0 })
+        Ok(Scripts { shared: None, graph_record, graph, wasm_graph, script_world, by_subject, sources, lock, members, files: std::vec::Vec::new_in(Global), setups_opened: 0 })
     }
 
     /// The shared setups opened this command: 1 once a job was made ready to run, else 0.
@@ -863,10 +877,11 @@ pub(crate) fn job<'f: 'j, 'j>(
         };
         // Held in the request's frame: every job of the command decodes it again on its worker.
         let read = crate::work::payload(&cx, store, graph, frame)?;
+        let sections = read.unit_graph(graph.name)?;
         // The world (the crate list's rows, both sides): made once a command, here when no
         // `CrateScope` task made it first, as engine_units.rs does.
         if names.is_none() {
-            match crate::names::world(&cx, root, read.unit_graph(graph.name)?.graph, lock, members, env) {
+            match crate::names::world(&cx, root, sections.graph, sections.wasm_graph, lock, members, env) {
                 Ok(made) => {
                     crate::names::tell_public(store, &made);
                     *names = Some(made);
@@ -875,14 +890,15 @@ pub(crate) fn job<'f: 'j, 'j>(
             }
         }
         if scripts.is_none() {
-            let bytes: &'f [u8] = held_bytes(read.unit_graph(graph.name)?.graph, frame);
+            let bytes: &'f [u8] = held_bytes(sections.graph, frame);
+            let wasm_bytes: &'f [u8] = held_bytes(sections.wasm_graph, frame);
             let Some(listed) = names.as_ref() else { return Err(CliError::Text { what: "the names world, made above, is gone" }) };
             // Avoid building the full 1,200-crate world (mapping all fetched packages) when no
             // `Names` task has needed it yet: `open_light` opens only the toolchain shelf and
             // unit graph for script execution.
             let opened = match listed.made().filter(|made| made.has_open_packs()) {
                 Some(made) => Scripts::open(&cx, env, made, bytes, lock, members, frame),
-                None => Scripts::open_light(&cx, env, listed, bytes, lock, members, frame),
+                None => Scripts::open_light(&cx, env, listed, bytes, wasm_bytes, lock, members, frame),
             };
             match opened {
                 Ok(opened) => *scripts = Some(Ok(opened)),
@@ -988,13 +1004,15 @@ pub(crate) fn job<'f: 'j, 'j>(
         Ok(shared) => shared,
         Err(words) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{words}")), hole: true }),
     };
-    let deps_digest = blaze_proc_macro::script_unit::script_deps_digest(graph, lock, script, |dep_pkg| {
+    let deps_digest = match blaze_proc_macro::script_unit::script_deps_digest(graph, scripts.wasm_graph, lock, script, |dep_pkg| {
         members
             .iter()
             .find(|m| m.id == dep_pkg)
             .and_then(|m| crate::macro_files::package_files_digest_in_dir(&cx, &root.read_only(), m.dir, frame))
-    })
-    .map(|hex| crate::work::held_str(&hex, jobs));
+    }) {
+        Ok(opt) => opt.map(|hex| crate::work::held_str(&hex, jobs)),
+        Err(error) => return Ok(Prepared::Said { what: NOT_SET_UP, words: said(jobs, format_args!("{error}")), hole: true }),
+    };
     Ok(Prepared::Ready(ScriptJob { name: task.name, shared, script, side, cfg, files, producers: producers.into_bump_slice(), checkout: CheckoutReads::Hole, deps_digest }))
 }
 

@@ -1,4 +1,4 @@
-//! Names on demand (engine.md piece E13, D134: lazy over what is not yours): a crate's groups
+//! Names on demand (end-state.md D158, D134: lazy over what is not yours): a crate's groups
 //! solved from the modules ASKED, never the whole crate. Measured first
 //! (blaze-ladder tests/names_reach_shelf.rs, 2026-11-17): a std program's root reaches 66 of
 //! its 77 dependencies' 17,260 groups (536 of 18,373 modules, 2.9%; 8.4% of the record bytes),

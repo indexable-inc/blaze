@@ -32,7 +32,7 @@ fn parse(text: &str) -> Outline<'static> {
 #[test]
 fn an_inner_attribute_the_solver_reads_moves_the_surface() {
     let root = "#![no_core]\n#[x::y]\npub fn uses() {}\nmod other;\n";
-    let moves: [(&str, &str, &str); 4] = [
+    let moves: [(&str, &str, &str); 6] = [
         ("adding `#![register_tool(x)]`", root, "#![no_core]\n#![register_tool(x)]\n#[x::y]\npub fn uses() {}\nmod other;\n"),
         (
             "renaming the registered tool",
@@ -41,6 +41,12 @@ fn an_inner_attribute_the_solver_reads_moves_the_surface() {
         ),
         ("adding `#![no_std]`", "pub fn f() {}\n", "#![no_std]\npub fn f() {}\n"),
         ("a module file's `#![cfg(..)]`", "pub fn f() {}\n", "#![cfg(test)]\npub fn f() {}\n"),
+        ("adding `#![recursion_limit = \"256\"]`", "pub fn f() {}\n", "#![recursion_limit = \"256\"]\npub fn f() {}\n"),
+        (
+            "changing `#![recursion_limit]` value",
+            "#![recursion_limit = \"256\"]\npub fn f() {}\n",
+            "#![recursion_limit = \"512\"]\npub fn f() {}\n",
+        ),
     ];
     let keeps: [(&str, &str, &str); 3] = [
         ("a crate doc comment", "//! one\n#![register_tool(x)]\npub fn f() {}\n", "//! two\n#![register_tool(x)]\npub fn f() {}\n"),

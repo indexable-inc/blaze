@@ -1,5 +1,5 @@
-//! The bucket index of the items record (drive.md, "End state: the whole pipeline on the
-//! command", piece 12; the bullet "An impl bucket is a fact, not a task"): the crate's impls
+//! The bucket index of the items record (end-state.md D157; the bullet
+//! "An impl bucket is a fact, not a task"): the crate's impls
 //! filed by RESOLVED (trait or "inherent", the self type's head), so "which impls of this crate
 //! can answer `T: Trait`" is one binary search over the record's bytes, and a reader that asks
 //! one bucket reads no other impl's row and opens no text.
@@ -44,8 +44,8 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{CrateRootBuilder, DefKind, ItemKind, Namespace, PathKind, RecordBytes, ScopeBuilder};
 
-use super::cols::{BucketCol, BucketColsBuf, OptId, OptInt, encode_opt_id, encode_opt_u64, patch_dir, read_dir};
-use super::{BARE, HAS_TRAIT, ItemsRecord, ItemsRecordError, SelfHead, T_IMPLS, le32, pad, path_and_bare, put32, u32_of};
+use super::cols::{BucketCol, BucketColsBuf, OptId, OptInt, encode_opt_id, encode_opt_u64, id_col_bound, int_col_bound, patch_dir, read_dir};
+use super::{ALIGN, BARE, HAS_TRAIT, ItemsRecord, ItemsRecordError, SelfHead, T_IMPLS, le32, pad, path_and_bare, put32, u32_of};
 use crate::builtin::is_builtin_type;
 use crate::names::{self, PathError, Resolved, Unheld, VariantHit, Why, World, Written, variant_in};
 use crate::resolve::{CrateNames, Names};
@@ -513,11 +513,29 @@ impl<'a> BucketsCols<'a> {
     }
 }
 
+/// Proven worst-case bytes (including 16-byte alignment padding) that [`append`] pushes onto `out`
+/// for `filed` bucket rows and `unfiled` rows.
+pub(super) fn encoded_len_bound(filed: usize, unfiled: usize) -> usize {
+    let filed_bytes = if filed == 0 {
+        0
+    } else {
+        16usize
+            .saturating_add(int_col_bound(filed).saturating_mul(2))
+            .saturating_add(id_col_bound(filed).saturating_mul(2))
+    };
+    ALIGN
+        .saturating_add(filed_bytes)
+        .saturating_add(ALIGN)
+        .saturating_add(unfiled.saturating_mul(UNFILED_ROW))
+}
+
 /// Appends the two tables for `filings` (impl row `i`'s filing at index `i`, the impl table's
 /// order) to `out`, a record whose header is written, and sets their counts and offsets.
 pub(super) fn append(out: &mut RecordBytes<'_>, filings: &[Filing], alloc: Alloc<'_>) -> Result<(), ItemsRecordError> {
-    let mut filed: AVec<'_, (BucketKey, u32)> = AVec::new_in(alloc);
-    let mut not: AVec<'_, (u32, NotFiled)> = AVec::new_in(alloc);
+    let filed_count = filings.iter().filter(|f| matches!(f, Filing::At(_))).count();
+    let unfiled_count = filings.len().saturating_sub(filed_count);
+    let mut filed: AVec<'_, (BucketKey, u32)> = AVec::with_capacity_in(filed_count, alloc);
+    let mut not: AVec<'_, (u32, NotFiled)> = AVec::with_capacity_in(unfiled_count, alloc);
     for (row, filing) in filings.iter().enumerate() {
         let row = u32_of(row, "a crate's impls")?;
         match *filing {
@@ -549,7 +567,7 @@ pub(super) fn append(out: &mut RecordBytes<'_>, filings: &[Filing], alloc: Alloc
             head_key.copy_from_slice(&key.bytes[36..68]);
             buf.push(BucketCol { meta: kind | (head_code << 8) | (arity << 16), trait_key, head_key, impl_row: u64::from(*row) });
         }
-        let mut scratch = AVec::new_in(alloc);
+        let mut scratch = AVec::with_capacity_in(id_col_bound(filed.len()), alloc);
         let l0 = encode_opt_u64(buf.metas(), 0, "the bucket table's meta", alloc, &mut scratch, out)?;
         let l1 = encode_opt_id(buf.trait_keys(), "the bucket table's trait keys", alloc, &mut scratch, out)?;
         let l2 = encode_opt_id(buf.head_keys(), "the bucket table's head keys", alloc, &mut scratch, out)?;
@@ -686,5 +704,42 @@ impl<'a> ItemsRecord<'a> {
             i += 1;
         }
         Ok(ContentId::of(UNFILED_DOMAIN, &bytes))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Many distinct `(trait_key, head_key)` bucket rows represent the worst case for `buckets::append`'s
+    /// two `encode_opt_id` columns. Verify `out` pre-sized with `encoded_len_bound` never reallocates.
+    #[test]
+    fn distinct_filed_impls_do_not_reallocate_output() {
+        const FILED: usize = 1_500;
+        const UNFILED: usize = 50;
+        let frame = blaze_mem::Frame::with_reserve(16 << 20, blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.bump().alloc();
+
+        let mut filings: AVec<'_, Filing> = AVec::with_capacity_in(FILED + UNFILED, alloc);
+        for i in 0..FILED {
+            let tr = ItemKey(ContentId::of("distinct bucket trait", &i.to_le_bytes()));
+            let ty = ItemKey(ContentId::of("distinct bucket head", &i.to_le_bytes()));
+            filings.push(Filing::At(BucketKey::of_trait(tr, Head::Named(ty))));
+        }
+        for _ in 0..UNFILED {
+            filings.push(Filing::Not(NotFiled::SelfOther));
+        }
+
+        let base_len = 8 + 4 * (F_UNFILED_AT + 1) + 7; // unaligned tail to exercise pad()
+        let bound = encoded_len_bound(FILED, UNFILED);
+        let mut out: RecordBytes<'_> = RecordBytes::with_capacity_in(base_len + bound, alloc);
+        out.resize(base_len, 0);
+        let out_ptr = out.as_ptr();
+        let out_cap = out.capacity();
+        append(&mut out, &filings, alloc).expect("append buckets");
+        assert_eq!(out.as_ptr(), out_ptr, "out must not reallocate for distinct bucket keys");
+        assert_eq!(out.capacity(), out_cap, "out capacity must stay unchanged");
+        assert!(out.len() <= base_len + bound, "encoded bytes must fit within encoded_len_bound");
     }
 }

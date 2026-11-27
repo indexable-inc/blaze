@@ -467,6 +467,10 @@ pub enum WrittenRegion {
     /// type argument referencing an elided parameter lifetime: `|r: &Records<'_, '_>|` where
     /// `S = &'n Names<'n>` repeats `'n`'s elided id across multiple slots).
     Elided(u32),
+    /// A type inference placeholder (`_`) written inside a closure parameter annotation
+    /// (e.g. `|v: Value<_>|`): any lifetime introduced by inferring `_` is an existential owner
+    /// region (`SigSlot::Owner`), never a higher-ranked late-bound region.
+    Inferred,
 }
 
 /// One explicit non-elided lifetime written in a closure parameter type annotation, located by

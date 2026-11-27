@@ -750,6 +750,45 @@ pub fn may_declare(text: &str) -> bool {
     may_declare_through(text, &mut |_| true)
 }
 
+/// The slice of `text` strictly after the first top-level `,` (outside balanced `(...)`,
+/// `[...]`, `{...}` groups; string, raw-string, byte-string, char literals and comments are
+/// single lexer tokens), or `None` when there is no top-level `,` and all delimiters balance.
+/// When delimiters remain open at EOF, returns `Some(text)` conservatively so callers never
+/// skip a malformed call that might declare an item.
+pub fn after_first_top_level_comma(text: &str) -> Option<&str> {
+    let mut depth: u32 = 0;
+    let mut at = 0usize;
+    for token in tokenize(text, FrontmatterAllowed::No, Cpu::BASELINE) {
+        let len = usize::try_from(token.len).unwrap_or(0);
+        at = at.saturating_add(len);
+        match token.kind {
+            TokenKind::OpenParen | TokenKind::OpenBracket | TokenKind::OpenBrace => {
+                depth = depth.saturating_add(1);
+            }
+            TokenKind::CloseParen | TokenKind::CloseBracket | TokenKind::CloseBrace => {
+                depth = depth.saturating_sub(1);
+            }
+            TokenKind::Comma if depth == 0 => {
+                return text.get(at..);
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        Some(text)
+    } else {
+        None
+    }
+}
+
+/// Whether the value arguments of a `format_args!` / `format_args_nl!` / `const_format_args!`
+/// call may declare a block-local item or invoke a macro: only tokens after the first top-level
+/// `,` are checked, because the first argument is the format template (which expands to a string
+/// literal and can never declare items or blocks).
+pub fn may_declare_format_args(text: &str) -> bool {
+    after_first_top_level_comma(text).is_some_and(may_declare)
+}
+
 /// The most segments of a `$crate` path [`may_declare_through`] reads after `$crate`; a call
 /// through a longer one is taken to write an item (rule 18: a bound, never a guess of "no").
 const MAX_PATH_SEGMENTS: usize = 16;
@@ -1907,7 +1946,7 @@ fn scan_one<'a>(text: &str, alloc: Alloc<'a>) -> Nested<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{NestedEnd, NestedKind, scan};
+    use super::{NestedEnd, NestedKind, after_first_top_level_comma, may_declare_format_args, scan};
 
     /// (kind, block, text) of each item found.
     fn items(text: &str) -> std::vec::Vec<(NestedKind, u32, &str)> {
@@ -2476,5 +2515,49 @@ fn h() {
         let n = scan(match_call, heap.alloc());
         assert_eq!(n.calls.len(), 1);
         assert_eq!(&match_call[n.calls[0].attrs.start as usize..n.calls[0].attrs.end as usize], "#[cfg(not(feature = \"x\"))]");
+    }
+
+    #[test]
+    fn format_args_comma_split_skips_literals_comments_and_delimiters() {
+        // No top-level comma -> None / false even though the template contains `!`.
+        assert_eq!(after_first_top_level_comma("csi!(\"{};{}H\")"), None);
+        assert!(!may_declare_format_args("csi!(\"{};{}H\")"));
+
+        // Nested commas inside parens/brackets/braces are skipped; trailing plain args do not declare.
+        assert_eq!(after_first_top_level_comma("csi!(\"{};{}H\", 1), a, b"), Some(" a, b"));
+        assert!(!may_declare_format_args("csi!(\"{};{}H\", 1), a, b"));
+        assert_eq!(
+            after_first_top_level_comma("concat!(row_select!(), \" tail\"), X = 1"),
+            Some(" X = 1")
+        );
+        assert!(!may_declare_format_args("concat!(row_select!(), \" tail\"), X = 1"));
+
+        // Commas and delimiters inside string, raw-string, char, byte-string literals and comments
+        // must NOT split the template prematurely.
+        assert_eq!(
+            after_first_top_level_comma(r#"concat!("a, b", "{}"), { struct Local; 1 }"#),
+            Some(" { struct Local; 1 }")
+        );
+        assert!(may_declare_format_args(r#"concat!("a, b", "{}"), { struct Local; 1 }"#));
+        assert_eq!(
+            after_first_top_level_comma("r#\"a, (\"#, { struct Local; 1 }"),
+            Some(" { struct Local; 1 }")
+        );
+        assert!(may_declare_format_args("r#\"a, (\"#, { struct Local; 1 }"));
+        assert_eq!(
+            after_first_top_level_comma("/* , ( */ csi!(\"{}\"), { struct Local; 1 }"),
+            Some(" { struct Local; 1 }")
+        );
+        assert!(may_declare_format_args("/* , ( */ csi!(\"{}\"), { struct Local; 1 }"));
+        assert_eq!(
+            after_first_top_level_comma("// , (\ncsi!(\"{}\"), foo!()"),
+            Some(" foo!()")
+        );
+        assert!(may_declare_format_args("// , (\ncsi!(\"{}\"), foo!()"));
+        assert_eq!(after_first_top_level_comma("',', a"), Some(" a"));
+        assert!(!may_declare_format_args("',', a"));
+
+        // Unbalanced delimiter conservatively checks the whole input.
+        assert!(may_declare_format_args("foo(, { struct Local; 1 }"));
     }
 }

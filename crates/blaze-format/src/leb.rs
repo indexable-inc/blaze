@@ -13,7 +13,7 @@
 //! byte from the clear top bits (`trailing_zeros`) and packs the 7-bit groups by three
 //! shift-and-mask steps (the unrolled form of protobuf's `ReadVarint64` and `varint-simd`, no
 //! BMI2 `pext`, which is slow on AMD before Zen 3). The encode is the same steps backwards and
-//! one 8-byte store. docs/v2/plan/design/data.md gives the bound.
+//! one 8-byte store. docs/v2/plan/design/bottom.md section 13 gives the bound.
 //!
 //! The writers append to `blaze_own::Vec<u8, A>` in the caller's allocator ([`write_u64_in`],
 //! [`write_i64_in`]); the `std` feature keeps the deprecated forms over `std`'s `Vec<u8>` for

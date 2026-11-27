@@ -496,7 +496,7 @@ pub enum Effect {
     },
     /// `into.len` bytes at `at` of `file` read into the registered span `into`
     /// ([`Spans::register`]), with no copy and nothing allocated: the store's pool loading its
-    /// pages (docs/v2/plan/design/store-pool.md). Completes with [`Done::ReadInto`] of how many
+    /// pages. Completes with [`Done::ReadInto`] of how many
     /// were read, fewer than the span only at the end of the file. The span's bytes past them hold
     /// anything: a read around the page cache writes whole blocks, and the simulation scribbles
     /// them; an asker that keeps the span zeroes what it needs zeroed. A `file` that is not there

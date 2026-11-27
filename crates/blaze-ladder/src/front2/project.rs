@@ -453,6 +453,71 @@ impl<'n, S: BodySource<'n>> ProjectWorld<'n, S> {
         index_by_chain(self.front.names, &listed, chain, self.alloc)
     }
 
+    /// Replays `Question::Attrs(item)` against this world's stored heads through
+    /// `blaze_typeck::replay` so the digest matches `Reads::attrs` identically.
+    pub fn attrs_holds(&self, item: blaze_typeck::ItemKey, answer: u64, alloc: Alloc<'_>) -> bool {
+        let mut rows = blaze_own::Soa::with_capacity_in(1, alloc);
+        rows.push((blaze_typeck::Question::Attrs(item), answer));
+        let kept = blaze_typeck::ReadList { rows };
+        let empty_tys = blaze_typeck::PortableTys::new_in(alloc);
+        let view = blaze_typeck::BodyView {
+            owner: item,
+            edition: blaze_typeck::Edition::E2024,
+            params: &[],
+            root: blaze_typeck::ExprId(0),
+            exprs: &[],
+            expr_ranges: &[],
+            pats: &[],
+            pat_ranges: &[],
+            stmts: &[],
+            expr_lists: &[],
+            pat_lists: &[],
+            stmt_lists: &[],
+            arms: &[],
+            field_inits: &[],
+            field_pats: &[],
+            paths: &[],
+            segments: &[],
+            segment_ranges: &[],
+            types: empty_tys.view(),
+            type_lists: &[],
+            type_list_ranges: &[],
+            method_name_ranges: &[],
+            opt_types: &[],
+            fmt_uses: &[],
+            coroutine: None,
+            super_lets: &[],
+            asm_pieces: &[],
+            asm_operands: &[],
+            asm_clobbers: &[],
+            asm_text: "",
+            call_arg_ints: &[],
+            legacy_args: &[],
+            unsafe_blocks: &[],
+            expr_editions: &[],
+            pat_editions: &[],
+            record_expr_schemas: &[],
+            closure_param_regions: &[],
+            loop_marks: &[],
+        };
+        let asked = core::cell::RefCell::new(std::vec::Vec::new_in(std::alloc::Global));
+        let asked_gaps = core::cell::RefCell::new(std::vec::Vec::new_in(std::alloc::Global));
+        matches!(
+            super::world_items::ctor_world(
+                self.front.names,
+                &self.front.keys,
+                &self.front.index,
+                &self.store,
+                self.buckets.as_ref(),
+                item,
+                &asked,
+                &asked_gaps,
+                |world| blaze_typeck::replay(world, &view, &kept, alloc),
+            ),
+            Ok(Ok(blaze_typeck::Replay::Holds))
+        )
+    }
+
     /// Checks one body: lowered, its heads made (an array length's constant evaluated as met),
     /// then checked over the command's records.
     ///

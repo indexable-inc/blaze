@@ -328,6 +328,17 @@ impl Instances {
                 true => AMBIENT,
                 false => m.f,
             };
+            // A provided method of `Clone` (`Clone::clone_from`) has no written impl item for
+            // language-given `Clone` types (tuples, closures, fn items, fn pointers, records,
+            // unions, `AUTO_COPY_PUB` ADTs): walk its default body once when declared so the back
+            // half can compile `*self = source.clone()` even when no written `impl Clone` omits it.
+            if self.declared.contains_key(&m.f)
+                && r.store.fns.get(&m.f).is_some_and(|h| h.has_body)
+                && r.index.lang("clone").is_some_and(|lib| checker_of(lib) == m.trait_)
+            {
+                queue.push((m.f, None));
+                note_edges(&mut census.edges, source, &[(m.f, None)], &[]);
+            }
             for &shape in shapes.iter() {
                 if self.asked.insert((m.f, shape), ()).is_some() {
                     continue;

@@ -62,8 +62,12 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
                     return Err(unsupported(e, "a struct update of a zero-sized struct whose base needs drop"));
                 }
                 self.work.push(Task::PushNone);
-                self.work.push(Task::Discard);
-                self.work.push(Task::Eval(base));
+                if self.is_uncaptured_outer_place(base)? {
+                    self.discard_uncaptured_place_effects(base)?;
+                } else {
+                    self.work.push(Task::Discard);
+                    self.work.push(Task::Eval(base));
+                }
                 for init in inits.iter().rev() {
                     self.work.push(Task::Discard);
                     self.work.push(Task::Eval(init.expr));
@@ -82,7 +86,28 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
                 let at = self.temp(repr);
                 self.write_tag(tag, variant, at);
                 self.work.push(Task::StructBase(e));
-                self.work.push(Task::Place(base));
+                let base_all_written = match self.adjusted_repr(base)? {
+                    Repr::Agg(bl) => {
+                        let bl_ix = usize::try_from(bl).map_err(|_| malformed("a layout index past `usize`"))?;
+                        match self.layouts.get(bl_ix).map(|row| row.shape) {
+                            Some(Shape::Fields { first: bfirst, len: blen }) => {
+                                let bf = usize::try_from(bfirst).map_err(|_| malformed("a field offset past `usize`"))?;
+                                let bl_len = usize::try_from(blen).map_err(|_| malformed("a field count past `usize`"))?;
+                                self.layout_fields
+                                    .get(bf..bf + bl_len)
+                                    .is_some_and(|rows| rows.iter().all(|row| inits.iter().any(|f| f.name == row.0)))
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                };
+                if base_all_written && self.is_uncaptured_outer_place(base)? {
+                    self.work.push(Task::PushNone);
+                    self.discard_uncaptured_place_effects(base)?;
+                } else {
+                    self.work.push(Task::Place(base));
+                }
                 for init in inits.iter().rev() {
                     let row = (first..first + len)
                         .find(|&i| self.layout_fields[i as usize].0 == init.name)
@@ -106,7 +131,6 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
     pub(in crate::walk) fn struct_update_base(&mut self, e: ExprId) -> Result<(), BuildError> {
         let (inits, base) = self.update_parts(e)?;
         let v = self.pop()?;
-        let src = self.place_any(v)?;
         let Some(&V::Place(p, at)) = self.vals.last() else {
             return Err(malformed("a struct update without its place"));
         };
@@ -128,27 +152,38 @@ impl<'x, A: Allocator + Copy> Walk<'x, '_, '_, A> {
         let Shape::Fields { first: bfirst, len: blen } = self.layouts[bl as usize].shape else {
             return Err(malformed("a struct update whose base is not a struct"));
         };
-        for row in bfirst..bfirst + blen {
-            let (name, soff, srepr) = self.layout_fields[row as usize];
-            if inits.iter().any(|f| f.name == name) {
-                continue;
-            }
-            let to = (first..first + len)
-                .find(|&i| self.layout_fields[i as usize].0 == name)
-                .ok_or(malformed("a struct update's base with a field its result lacks"))?;
-            let (_, doff, drepr) = self.layout_fields[to as usize];
-            if srepr != drepr {
-                return Err(malformed("a struct update taking a field held differently in its base and its result"));
-            }
-            let g = self.layout_field_tys[row as usize];
-            if self.needs_drop(g).map_err(|error| Self::ty_err(base, error))? {
-                if srepr == Repr::None {
-                    return Err(unsupported(e, "a struct update taking a zero-sized field that needs drop"));
+        let bf = usize::try_from(bfirst).map_err(|_| malformed("a field offset past `usize`"))?;
+        let bl_len = usize::try_from(blen).map_err(|_| malformed("a field count past `usize`"))?;
+        let any_taken = self
+            .layout_fields
+            .get(bf..bf + bl_len)
+            .ok_or(malformed("a struct update's base fields past `layout_fields`"))?
+            .iter()
+            .any(|row| !inits.iter().any(|f| f.name == row.0));
+        if any_taken {
+            let src = self.place_any(v)?;
+            for row in bfirst..bfirst + blen {
+                let (name, soff, srepr) = self.layout_fields[row as usize];
+                if inits.iter().any(|f| f.name == name) {
+                    continue;
                 }
-                self.take_field(e, base, bl, row, src)?;
+                let to = (first..first + len)
+                    .find(|&i| self.layout_fields[i as usize].0 == name)
+                    .ok_or(malformed("a struct update's base with a field its result lacks"))?;
+                let (_, doff, drepr) = self.layout_fields[to as usize];
+                if srepr != drepr {
+                    return Err(malformed("a struct update taking a field held differently in its base and its result"));
+                }
+                let g = self.layout_field_tys[row as usize];
+                if self.needs_drop(g).map_err(|error| Self::ty_err(base, error))? {
+                    if srepr == Repr::None {
+                        return Err(unsupported(e, "a struct update taking a zero-sized field that needs drop"));
+                    }
+                    self.take_field(e, base, bl, row, src)?;
+                }
+                let v = self.load(srepr, (src.0, src.1 + soff as i32));
+                self.store(v, drepr, (p, at + doff as i32))?;
             }
-            let v = self.load(srepr, (src.0, src.1 + soff as i32));
-            self.store(v, drepr, (p, at + doff as i32))?;
         }
         // Whole now: owned as one value (walk/val_stack.rs).
         self.literal_built(l)

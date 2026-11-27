@@ -1,6 +1,6 @@
 //! The worker pool's interface: what the driver's host gives tasks to.
 //!
-//! The form it promises (target.md, "Processes"): workers started in proportion to queued work
+//! The form it promises (docs/v2/plan/design/end-state.md D161): workers started in proportion to queued work
 //! ([`crate::machine::Machine::workers_for`]), none for a no-op or a one-body edit; a
 //! work-stealing deque per worker; a frame per worker, reset between tasks and never unmapped;
 //! counters per worker, merged when a task ends; nothing shared and mutable touched per item.

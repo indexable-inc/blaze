@@ -50,6 +50,16 @@ pub enum NeonFn {
     Tbx1,
     /// `tbl2`: a lookup across two contiguous 16-byte tables (0 for indices >= 32).
     Tbl2,
+    /// `tbx2`: a lookup across two contiguous 16-byte tables (keeps default for indices >= 32).
+    Tbx2,
+    /// `tbl3`: a lookup across three contiguous 16-byte tables (0 for indices >= 48).
+    Tbl3,
+    /// `tbx3`: a lookup across three contiguous 16-byte tables (keeps default for indices >= 48).
+    Tbx3,
+    /// `tbl4`: a lookup across four contiguous 16-byte tables (0 for indices >= 64).
+    Tbl4,
+    /// `tbx4`: a lookup across four contiguous 16-byte tables (keeps default for indices >= 64).
+    Tbx4,
     /// `ushl`: shift left by a signed amount, right shifts logical.
     Ushl,
     /// `sshl`: shift left by a signed amount, right shifts arithmetic.
@@ -62,6 +72,10 @@ pub enum NeonFn {
     Smaxp,
     /// `sminp`: the signed smaller of each adjacent pair.
     Sminp,
+    /// `sqdmulh`: signed saturating doubling multiply returning high half.
+    Sqdmulh,
+    /// `sqrdmulh`: signed saturating rounding doubling multiply returning high half.
+    Sqrdmulh,
 }
 
 /// The integer vector type an intrinsic is overloaded at: its name's last part.
@@ -89,16 +103,27 @@ pub struct NeonCall {
     shape: IntShape,
 }
 
-/// The set: every call and its link name (one home for the spelling). `tbl1`, `tbx1`, and
-/// `tbl2` are at the two shapes the library declares them at; the shifts at every integer shape;
-/// the pairwise maximum and minimum at the six the library declares (no 64-bit lanes: A64 has none).
-const NAMES: [(NeonCall, &str); 46] = [
+/// The set: every call and its link name (one home for the spelling). `tbl1..=tbl4` and
+/// `tbx1..=tbx4` are at the two shapes the library declares them at; the shifts at every integer
+/// shape; the pairwise maximum and minimum at the six the library declares (no 64-bit lanes: A64
+/// has none).
+const NAMES: [(NeonCall, &str); 64] = [
     (NeonCall { func: NeonFn::Tbl1, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbl1.v8i8"),
     (NeonCall { func: NeonFn::Tbl1, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbl1.v16i8"),
     (NeonCall { func: NeonFn::Tbx1, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbx1.v8i8"),
     (NeonCall { func: NeonFn::Tbx1, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbx1.v16i8"),
     (NeonCall { func: NeonFn::Tbl2, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbl2.v8i8"),
     (NeonCall { func: NeonFn::Tbl2, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbl2.v16i8"),
+    (NeonCall { func: NeonFn::Tbx2, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbx2.v8i8"),
+    (NeonCall { func: NeonFn::Tbx2, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbx2.v16i8"),
+    (NeonCall { func: NeonFn::Tbl3, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbl3.v8i8"),
+    (NeonCall { func: NeonFn::Tbl3, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbl3.v16i8"),
+    (NeonCall { func: NeonFn::Tbx3, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbx3.v8i8"),
+    (NeonCall { func: NeonFn::Tbx3, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbx3.v16i8"),
+    (NeonCall { func: NeonFn::Tbl4, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbl4.v8i8"),
+    (NeonCall { func: NeonFn::Tbl4, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbl4.v16i8"),
+    (NeonCall { func: NeonFn::Tbx4, shape: IntShape::V8I8 }, "llvm.aarch64.neon.tbx4.v8i8"),
+    (NeonCall { func: NeonFn::Tbx4, shape: IntShape::V16I8 }, "llvm.aarch64.neon.tbx4.v16i8"),
     (NeonCall { func: NeonFn::Ushl, shape: IntShape::V8I8 }, "llvm.aarch64.neon.ushl.v8i8"),
     (NeonCall { func: NeonFn::Ushl, shape: IntShape::V16I8 }, "llvm.aarch64.neon.ushl.v16i8"),
     (NeonCall { func: NeonFn::Ushl, shape: IntShape::V4I16 }, "llvm.aarch64.neon.ushl.v4i16"),
@@ -139,6 +164,14 @@ const NAMES: [(NeonCall, &str); 46] = [
     (NeonCall { func: NeonFn::Sminp, shape: IntShape::V8I16 }, "llvm.aarch64.neon.sminp.v8i16"),
     (NeonCall { func: NeonFn::Sminp, shape: IntShape::V2I32 }, "llvm.aarch64.neon.sminp.v2i32"),
     (NeonCall { func: NeonFn::Sminp, shape: IntShape::V4I32 }, "llvm.aarch64.neon.sminp.v4i32"),
+    (NeonCall { func: NeonFn::Sqdmulh, shape: IntShape::V4I16 }, "llvm.aarch64.neon.sqdmulh.v4i16"),
+    (NeonCall { func: NeonFn::Sqdmulh, shape: IntShape::V8I16 }, "llvm.aarch64.neon.sqdmulh.v8i16"),
+    (NeonCall { func: NeonFn::Sqdmulh, shape: IntShape::V2I32 }, "llvm.aarch64.neon.sqdmulh.v2i32"),
+    (NeonCall { func: NeonFn::Sqdmulh, shape: IntShape::V4I32 }, "llvm.aarch64.neon.sqdmulh.v4i32"),
+    (NeonCall { func: NeonFn::Sqrdmulh, shape: IntShape::V4I16 }, "llvm.aarch64.neon.sqrdmulh.v4i16"),
+    (NeonCall { func: NeonFn::Sqrdmulh, shape: IntShape::V8I16 }, "llvm.aarch64.neon.sqrdmulh.v8i16"),
+    (NeonCall { func: NeonFn::Sqrdmulh, shape: IntShape::V2I32 }, "llvm.aarch64.neon.sqrdmulh.v2i32"),
+    (NeonCall { func: NeonFn::Sqrdmulh, shape: IntShape::V4I32 }, "llvm.aarch64.neon.sqrdmulh.v4i32"),
 ];
 
 /// Every call of the set, in [`NAMES`]' order.
@@ -221,6 +254,16 @@ impl NeonCall {
             (NeonFn::Tbx1, V16I8) => &[V16I8, V16I8, V16I8],
             (NeonFn::Tbl2, V8I8) => &[V16I8, V16I8, V8I8],
             (NeonFn::Tbl2, V16I8) => &[V16I8, V16I8, V16I8],
+            (NeonFn::Tbx2, V8I8) => &[V8I8, V16I8, V16I8, V8I8],
+            (NeonFn::Tbx2, V16I8) => &[V16I8, V16I8, V16I8, V16I8],
+            (NeonFn::Tbl3, V8I8) => &[V16I8, V16I8, V16I8, V8I8],
+            (NeonFn::Tbl3, V16I8) => &[V16I8, V16I8, V16I8, V16I8],
+            (NeonFn::Tbx3, V8I8) => &[V8I8, V16I8, V16I8, V16I8, V8I8],
+            (NeonFn::Tbx3, V16I8) => &[V16I8, V16I8, V16I8, V16I8, V16I8],
+            (NeonFn::Tbl4, V8I8) => &[V16I8, V16I8, V16I8, V16I8, V8I8],
+            (NeonFn::Tbl4, V16I8) => &[V16I8, V16I8, V16I8, V16I8, V16I8],
+            (NeonFn::Tbx4, V8I8) => &[V8I8, V16I8, V16I8, V16I8, V16I8, V8I8],
+            (NeonFn::Tbx4, V16I8) => &[V16I8, V16I8, V16I8, V16I8, V16I8, V16I8],
             (_, V8I8) => &[V8I8, V8I8],
             (_, V16I8) => &[V16I8, V16I8],
             (_, V4I16) => &[V4I16, V4I16],
@@ -238,14 +281,21 @@ impl NeonCall {
 pub fn build<A: Allocator + Clone>(b: &mut Builder<A, Full>, call: NeonCall, ops: &[Value]) -> Option<Value> {
     match (call.func, ops) {
         (NeonFn::Tbl1, &[table, index]) => Some(table_lookup(b, call.shape, table, index)),
-        (NeonFn::Tbx1, &[default, table, index]) => Some(table_lookup_ext(b, call.shape, default, table, index)),
-        (NeonFn::Tbl2, &[table0, table1, index]) => Some(table_lookup2(b, call.shape, table0, table1, index)),
+        (NeonFn::Tbx1, &[default, table, index]) => Some(table_lookup_ext_n(b, call.shape, default, &[table], index)),
+        (NeonFn::Tbl2, &[t0, t1, index]) => Some(table_lookup_n(b, call.shape, &[t0, t1], index)),
+        (NeonFn::Tbx2, &[default, t0, t1, index]) => Some(table_lookup_ext_n(b, call.shape, default, &[t0, t1], index)),
+        (NeonFn::Tbl3, &[t0, t1, t2, index]) => Some(table_lookup_n(b, call.shape, &[t0, t1, t2], index)),
+        (NeonFn::Tbx3, &[default, t0, t1, t2, index]) => Some(table_lookup_ext_n(b, call.shape, default, &[t0, t1, t2], index)),
+        (NeonFn::Tbl4, &[t0, t1, t2, t3, index]) => Some(table_lookup_n(b, call.shape, &[t0, t1, t2, t3], index)),
+        (NeonFn::Tbx4, &[default, t0, t1, t2, t3, index]) => Some(table_lookup_ext_n(b, call.shape, default, &[t0, t1, t2, t3], index)),
         (NeonFn::Ushl, &[a, x]) => Some(shift(b, call.shape, false, a, x)),
         (NeonFn::Sshl, &[a, x]) => Some(shift(b, call.shape, true, a, x)),
         (NeonFn::Umaxp, &[a, x]) => Some(pairwise(b, call.shape, Op::Umax, a, x)),
         (NeonFn::Uminp, &[a, x]) => Some(pairwise(b, call.shape, Op::Umin, a, x)),
         (NeonFn::Smaxp, &[a, x]) => Some(pairwise(b, call.shape, Op::Smax, a, x)),
         (NeonFn::Sminp, &[a, x]) => Some(pairwise(b, call.shape, Op::Smin, a, x)),
+        (NeonFn::Sqdmulh, &[a, x]) => Some(sqdmulh(b, call.shape, false, a, x)),
+        (NeonFn::Sqrdmulh, &[a, x]) => Some(sqdmulh(b, call.shape, true, a, x)),
         _ => None,
     }
 }
@@ -289,25 +339,37 @@ fn table_lookup<A: Allocator + Clone>(b: &mut Builder<A, Full>, shape: IntShape,
     }
 }
 
-/// `tbx1`: `default` and `index` of `shape` (`V8I8` or `V16I8`), `table` a `<16 x i8>`.
-/// Lanes whose unsigned index is `< 16` take `table[index]`; out-of-range lanes keep `default`.
-fn table_lookup_ext<A: Allocator + Clone>(b: &mut Builder<A, Full>, shape: IntShape, default: Value, table: Value, index: Value) -> Value {
-    let looked = table_lookup(b, shape, table, index);
-    let sixteen_lane = b.iconst(Ty::I8, 16);
-    let sixteen = b.convert(Op::Splat, Flags::NONE, shape.ty(), sixteen_lane);
-    let in_range = b.icmp(IntCond::Ult, index, sixteen);
-    b.select(Flags::NONE, in_range, looked, default)
+/// `tbl1..=tbl4`: `tables.len()` (`1..=4`) contiguous `<16 x i8>` tables, `index` of `shape`
+/// (`V8I8` or `V16I8`). Because `16 * k <= 48 <= 256 - 16`, for every `u8` index and `k in 0..4`,
+/// `index.wrapping_sub(16 * k) < 16` iff `16 * k <= index < 16 * (k + 1)`, so OR-ing each slice's
+/// `Swizzle` result is bit-exact across all 256 byte indices (yielding 0 for `index >= 16 * N`).
+fn table_lookup_n<A: Allocator + Clone>(b: &mut Builder<A, Full>, shape: IntShape, tables: &[Value], index: Value) -> Value {
+    let mut acc = table_lookup(b, shape, tables[0], index);
+    for (k, &table) in tables.iter().enumerate().skip(1) {
+        let off_lane = b.iconst(Ty::I8, (k * 16) as u128);
+        let off = b.convert(Op::Splat, Flags::NONE, shape.ty(), off_lane);
+        let shifted = b.binary(Op::Sub, Flags::NONE, index, off);
+        let part = table_lookup(b, shape, table, shifted);
+        acc = b.binary(Op::Or, Flags::NONE, acc, part);
+    }
+    acc
 }
 
-/// `tbl2`: two contiguous `<16 x i8>` tables (`table0` for `0..16`, `table1` for `16..32`),
-/// `index` of `shape` (`V8I8` or `V16I8`). Indices `>= 32` yield 0.
-fn table_lookup2<A: Allocator + Clone>(b: &mut Builder<A, Full>, shape: IntShape, table0: Value, table1: Value, index: Value) -> Value {
-    let low = table_lookup(b, shape, table0, index);
-    let sixteen_lane = b.iconst(Ty::I8, 16);
-    let sixteen = b.convert(Op::Splat, Flags::NONE, shape.ty(), sixteen_lane);
-    let shifted = b.binary(Op::Sub, Flags::NONE, index, sixteen);
-    let high = table_lookup(b, shape, table1, shifted);
-    b.binary(Op::Or, Flags::NONE, low, high)
+/// `tbx1..=tbx4`: `default` and `index` of `shape` (`V8I8` or `V16I8`), `tables` (`1..=4`)
+/// contiguous `<16 x i8>` tables. Lanes with unsigned `index < 16 * N` take `tables[index]`;
+/// out-of-range lanes keep `default`.
+fn table_lookup_ext_n<A: Allocator + Clone>(
+    b: &mut Builder<A, Full>,
+    shape: IntShape,
+    default: Value,
+    tables: &[Value],
+    index: Value,
+) -> Value {
+    let looked = table_lookup_n(b, shape, tables, index);
+    let limit_lane = b.iconst(Ty::I8, (tables.len() * 16) as u128);
+    let limit = b.convert(Op::Splat, Flags::NONE, shape.ty(), limit_lane);
+    let in_range = b.icmp(IntCond::Ult, index, limit);
+    b.select(Flags::NONE, in_range, looked, default)
 }
 
 /// `ushl` (`signed` false) or `sshl` (`signed` true) of `a` by `by`, both of `shape`.
@@ -351,4 +413,44 @@ fn shift<A: Allocator + Clone>(b: &mut Builder<A, Full>, shape: IntShape, signed
     // A left shift by the width or more: every bit shifted out.
     let past_left = b.icmp(IntCond::Sge, amount, up_to);
     b.select(Flags::NONE, past_left, zero, kept)
+}
+
+/// `sqdmulh` (`rounding == false`) or `sqrdmulh` (`rounding == true`) for 16-bit and 32-bit
+/// signed lanes (`V4I16`, `V8I16`, `V2I32`, `V4I32`).
+///
+/// Arm A64 semantics: `sat_N(floor((2 * a * b + (rounding ? 2^(N-1) : 0)) / 2^N))`
+/// = `sat_N(floor((a * b + (rounding ? 2^(N-2) : 0)) / 2^(N-1)))`.
+/// Widening `a` and `b` to signed `2N`-bit (`i32` for `i16`, `i64` for `i32`), `a * b` (and
+/// `a * b + 2^(N-2)`) never overflows signed `2N`-bit; after `ashr` by `N - 1`, only
+/// `MIN * MIN` reaches `+2^(N-1)` and is saturated to `iN::MAX` by `smin`.
+fn sqdmulh<A: Allocator + Clone>(
+    b: &mut Builder<A, Full>,
+    shape: IntShape,
+    rounding: bool,
+    a: Value,
+    x: Value,
+) -> Value {
+    let width = shape.width();
+    let wide_elem = match shape.elem() {
+        Scalar::I16 => Scalar::I32,
+        _ => Scalar::I64,
+    };
+    let wide_lane = Ty::scalar(wide_elem);
+    let wide_ty = Ty::vector(wide_elem, shape.lanes()).expect("doubled NEON lane width fits LIR vector");
+    let splat_w = |b: &mut Builder<A, Full>, bits: u128| {
+        let c = b.iconst(wide_lane, bits);
+        b.convert(Op::Splat, Flags::NONE, wide_ty, c)
+    };
+    let sa = b.convert(Op::Sext, Flags::NONE, wide_ty, a);
+    let sx = b.convert(Op::Sext, Flags::NONE, wide_ty, x);
+    let mut prod = b.binary(Op::Mul, Flags::NONE, sa, sx);
+    if rounding {
+        let bias = splat_w(b, 1u128 << (width - 2));
+        prod = b.binary(Op::Add, Flags::NONE, prod, bias);
+    }
+    let sh = splat_w(b, u128::from(width - 1));
+    let shifted = b.binary(Op::Ashr, Flags::NONE, prod, sh);
+    let max_val = splat_w(b, (1u128 << (width - 1)) - 1);
+    let sat = b.binary(Op::Smin, Flags::NONE, shifted, max_val);
+    b.convert(Op::Trunc, Flags::NONE, shape.ty(), sat)
 }

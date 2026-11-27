@@ -117,7 +117,7 @@ impl Region {
     ///
     /// Its owner counts what it uses one of two ways, never both: a prefix ([`Region::ensure`]),
     /// or ranges anywhere in it, each made the process's with [`Region::reuse`] and given back
-    /// with [`Region::evict`] (the store's buffer pool, docs/v2/plan/design/store-pool.md, whose
+    /// with [`Region::evict`] (the store's buffer pool, whose
     /// windows are slots of 1 GiB in a reservation of terabytes). Mixing them panics, naming the
     /// region.
     pub fn reserve_sparse(bytes: usize, tag: Tag) -> Result<Region, MemError> {
@@ -594,8 +594,7 @@ impl Region {
 
     /// Gives the pages of `ranges` (byte offsets, each page-aligned at both ends) of a sparse
     /// region counted by ranges back to the kernel, and says how many bytes went: the store's
-    /// pool evicting a batch of pages no one pins (docs/v2/plan/design/store-pool.md "Giving
-    /// pages back"). The region's tag falls by those bytes now, as the system's own count does:
+    /// pool evicting a batch of pages no one pins. The region's tag falls by those bytes now, as the system's own count does:
     ///
     /// - Linux: `MADV_DONTNEED`, every 256 ranges one `process_madvise` of this process, so a
     ///   batch costs one TLB flush. The pages read zeros when next touched.

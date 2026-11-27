@@ -902,6 +902,31 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: CallRule> Lower<'b, 'c, F, A, R> 
                     }
                 }
             }
+            // When `imp` is the body's own enclosing impl (`is_enclosing`) and every bound impl
+            // parameter is identity (`Param(i)` -> `Param(i)`), any impl lifetime parameter not
+            // written in `Self` or trait arguments (e.g. constrained only by a `where` clause:
+            // `impl<'t, I: Iterator<Item = AnyAttr<'t>>> Iterator for AttrsIter<I>`) is the
+            // body's own `Region::Param(i)`.
+            if outer.is_none()
+                && self.facts.owner_trait_impl(trait_).is_some_and(|oti| oti.is_enclosing && oti.imp == imp)
+                && param_regs.iter().enumerate().all(|(i, r)| match r {
+                    None => true,
+                    Some(Region::Param(p)) => usize::try_from(*p).ok() == Some(i),
+                    Some(_) => false,
+                })
+                && ty_binds.iter().enumerate().all(|(i, b)| match b {
+                    None => true,
+                    Some((t, _, _)) => matches!(heads.node(*t), Ok(PNode::Param(p)) if usize::try_from(p).ok() == Some(i)),
+                })
+            {
+                for (i, slot) in param_regs.iter_mut().enumerate() {
+                    if slot.is_none()
+                        && let Ok(i32) = u32::try_from(i)
+                    {
+                        *slot = Some(Region::Param(i32));
+                    }
+                }
+            }
         }
         Ok(Some((value.ty(), value.as_slice(), ImplBinds { regs, gat_base, tys: ty_binds, ty_slots })))
     }

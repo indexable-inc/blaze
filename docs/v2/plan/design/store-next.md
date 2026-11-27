@@ -1,13 +1,14 @@
 ---
 status: plan
-summary: blaze's plain store against Relax's store, row by row, for the two goals bottom.md puts first after the edit loop (a repeat after a restart that reads few pages; records fetched from a static origin by byte range). What was adopted on 2026-11-15 (the exit tail sealed, no index prefault, a lookup that reads no run ends, the startup image record, the sweep spread over file threads, the machine scan before a shared put), what was left and why, and the pages a cold repeat reads before and after.
+summary: blaze's plain store (crates/blaze-cas/src/plain) against Relax's store, row by row, for a repeat after a restart that reads few pages, and for records fetched from a static origin by byte range (an option, off unless chosen). Where each adopted piece lives (the sealed exit tail and its background pass, the lookup, the startup image, per-worker puts, the machine scan, batches, the per-segment Bloom filter, the D182 block bottom); what was left and why; what is still to build (the scrub in the helper, blaze-run reading the startup image, held descriptors, two writers on one device); the digest decision.
 date: 2026-11-15
 ---
 # The store, next
 
 The store is `crates/blaze-cas/src/plain` (its module doc is the format). The reference is Relax's
-`compiler/src/store.rs` (MIT, read, not run). Goal order, from bottom.md 1: incremental compile
-(after a restart too), then remote records, then memory, cold compile, disk cleanup, disk.
+`compiler/src/store.rs` (MIT, read, not run). Goal order: incremental compile (after a restart
+too) and lints, then memory, cold compile, disk cleanup, disk. Remote records are supported and not
+in the order; fetching them is an option, off unless chosen.
 
 ## Side by side
 
@@ -31,134 +32,49 @@ A repeat with nothing changed, after a reboot, through the certificate (drive.md
 head, the manifest, the certificate's lookup and payload, then the leaf table's stat sweep and the
 slot file. Stats read no store page. Pages are 16 KiB on macOS, 4 KiB on Linux.
 
-| step | today (before 2026-11-15) | after |
-|---|---|---|
-| head | 1 | 1 |
-| manifest (80 bytes a segment row) | 1 | 1 |
-| proving the segments | every byte of every segment of an earlier boot, at the boot's first open | none for sealed segments; the unsealed tail only (empty after an orderly exit) |
-| open's index prefault | every index page of every segment | none |
-| certificate lookup, a segment probed | 2 run ends + 1 or 2 probes | 1 or 2 probes |
-| certificate payload | 1 | 1 |
-| leaf table (whole, rows of path and stamp) | ⌈bytes ÷ 4 KiB⌉: 1 for hello-world, about 40 for reth | same |
-| slot file | 1 | 1 |
-
 The floor is head + manifest + one index page + the payload + the leaf table + the slot: 6 pages
-for hello-world, about 45 for reth. After this change a repeat reads the floor plus 1 or 2 index pages
-for each segment probed before the one that holds the certificate (newest first, at most 16). Today
-it reads every byte of the store once a boot, plus every index page at each cold open. The ratio to
-the floor is 1.0 when the certificate is in the newest segment, and at most about 6 (hello-world) or
-1.7 (reth) when 15 segments are probed first. The remaining gap is the misses in other segments. The
-piece that closes it is a per-segment fuse filter (blaze-ids' `Fuse8`, about 9 bits a key) in the
-manifest row's segment, read with the manifest. That piece is not built (see "Left").
+for hello-world, about 45 for reth (the leaf table is about 40 pages there). A sealed segment is
+proved by its row, so no byte is read to prove it; the open touches no index page; a probed
+segment costs 1 or 2 index pages, and the per-segment Bloom sidecar bound to the segment's digest
+(`crates/blaze-cas/src/plain/bloom.rs`) skips a segment that cannot hold the key. These are counts
+from the code paths, not a measurement. Not built: a test that counts the pages a repeat check
+touches after a restart, on hello-world and reth.
 
-These are counts from the code paths, not a measurement: the driver does not read the certificate
-through the plain store yet (blaze-solo opens the older `blaze_cas::Driven`).
-`a_sealed_tail_survives_any_power_cut_and_is_never_read_to_prove` asserts the proving row: after
-an orderly exit the next boot checks no segment in full.
-`a_lookup_reads_only_the_pages_its_probes_land_on` asserts the lookup row against the old lookup
-as a control.
+## Built (crates/blaze-cas/src/plain)
 
-## Adopted
-
-- **(b) The exit tail, sealed.** Segment row flag 4, `sealed` (store format 4; format 3 is
-  refused by name and rebuilt). `Plain::seal`, through `Driven::seal`, asks one `Effect::Barrier`
-  (`F_BARRIERFSYNC`; Linux `fdatasync`) on each local segment of this boot not yet sealed. A
-  published row gets an `Effect::Sync` instead: a fetched file is a whole-file write, which a crash
-  may undo until a sync covers it. After the barriers comes one flip, `Change::Seal { (id, generation) }`.
-  The flip seals a row only while it is still that row: a file written again gets the row's
-  generation anew and is unsealed. A check at a new boot's open does not seal (only the barrier
-  does), so a segment that only a check proved is checked again at the boot after.
-  `Verified::sealed` is the third and last way a mapped segment becomes readable. A sealed row
-  whose file length differs is lost by name.
-  - **The bound, decided** (2026-11-15, by the coordinator, for the owner to overturn). A sealed
-    segment is not walked before the first answer after a boot; it is walked once a boot in the
-    background. `Plain::scrub_next(budget)` (`Driven::scrub_next`, on a lowered thread) walks the
-    next sealed segment not yet walked this boot, oldest row first, at most `budget` bytes a
-    slice, checking every record's CRC-32C. A whole walk sets the row's boot by a flip (the same
-    record as the open's whole check: "walked this boot" is a row whose boot is this boot's id,
-    a value passed in, rule 75). A rot found is lost by name, out of the lookup at once, and
-    retired by the flip, through the open's own loss path. The next lookup misses, and the
-    record is rebuilt or fetched.
+- **(b) The exit tail, sealed.** Segment row flag `sealed` (store format 4 and later). `Plain::seal`
+  (`Driven::seal`, asked after the answer by crates/blaze-cli/src/gc.rs) puts one `Effect::Barrier`
+  on each local segment of this boot, an `Effect::Sync` on a fetched one, then one flip; a new
+  boot proves a sealed row with no byte read and checks only the unsealed tail.
+  - **The bound, decided** (2026-11-15). A sealed segment is not walked before the first answer
+    after a boot; `Plain::scrub_next(budget)` walks it once a boot in the background, checking
+    every record's CRC-32C, and a rot found is lost by name and retired by the flip. Built, not
+    wired: nothing outside blaze-cas calls `scrub_next` (see "Still to build").
   - **The accepted risk.** A byte that rots in a sealed segment is found within one boot's
     background pass, or by `scrub`. A record read before its segment's pass that boot is
     unchecked, as this boot's own segments are.
-  - **Not taken: a check on first read.** Checking a record's CRC-32C the first time a process
-    hands it out from a sealed segment needs a per-segment bitset that lock-free readers set,
-    costs in proportion to what is read on the answer's path, and reverses decision 18
-    (`Checks::per_read` stays asserted zero). The goal order puts the edit loop after a restart
-    first; the pass costs it nothing.
-- **No index prefault.** `on_map` no longer touches the index; `PlainConfig::page` is gone.
-- **A lookup that reads no run ends.** `format::find` (now `find_by`) interpolates between bounds
-  that start as the whole key space and become each probe's prefix as it narrows. Each guess stays
-  inside the range, and the bound stays `3 + log2 n` probes.
-- **(d) The startup image** (`plain/image.rs`, `StartupImage`, blaze-keyed `ReservedTag::Image`).
-  - Its key is `H("blaze startup image", manifest key)`. Its body lists the (slot, code record
-    key) rows placed before `main`, in placement order: `BLSI`, format 1, the manifest key, then
-    rows of 40 bytes.
-  - `decode_in` refuses another program's or format's bytes by a typed `ImageError`.
-    `read_order` sorts what the store places by segment, then offset, so a cold read is one
-    ascending pass.
-  - It is a hint: every record is still found by its own key.
-- **(e) The sweep on several threads.** `Config::lanes` (the driver's file threads) sizes the stamp
-  batch at `ceil(rows ÷ lanes)` within 64..=4096. Before, every tree under 4096 files was swept by
-  one kqueue file thread.
-- **(f) Sealed sharing.** `PlainConfig::machine` holds needles (the store root by default; the
-  caller adds more with `Driven::machine`).
-  - `Plain::put` into any namespace but local refuses a value that holds a needle, with
-    `PutError::Machine { key, namespace, at, needle }`.
-  - `commit` scans a worker's shared batch the same way. That refusal reaches the caller as
-    `StoreError::Other` naming rule 25, because blaze-keyed has no row for it; a typed
-    `StoreError::Machine` there is the next step, for blaze-keyed's owner.
-- **(g) Puts on every worker** (parallel.md change 4). `PlainStore` gives each worker a lane:
-  one `Held` batch per namespace, behind a lock that only its worker and the commit take.
-  `Store::put` uses the calling thread's lane; `PlainStore::lane` and `put_in` name lanes
-  explicitly. A put reads the mapped segments (lock-free) and its own lane, and nothing else.
-  Before, every put and every miss took the one writer lock. The only shared step is
-  `commit_lanes`. Under the writer lock it swaps each lane's batches out (the lane's lock is
-  held for the swap only) and lays them out as one segment per namespace. It writes and flips
-  them, publishes the table, and only then lets go of the taken batches.
-  - **Visible when.** A worker sees its own put at once. Every other reader sees it once its
-    commit's flip has landed and the table is published, never before. A miss that races the
-    commit's release asks the table again.
-  - **One flight.** The driver's second asker waits on the first asker's task and takes its
-    result in memory. That wait is on the task, not on the flip: a store read by the second
-    asker before the flip misses, so blaze-drive must hand the value over, never re-read it.
-  - **Equal bytes.** The commit lays payloads and index in key order, whatever the put order or
-    lane (`seal_segment` too: one layout). One key in two lanes with equal bytes is laid once;
-    with other bytes it is `TwoValues` (rule 21). Before, the layout followed put order, so two
-    builders could write other bytes (rule 25).
-  - **Crash.** A lane is memory only: puts not committed die with the process, and none was
-    promised. A commit cut before its flip leaves a segment no generation names: the open's
-    orphan pass reports and removes it. A commit cut after its flip leaves a named, unsealed
-    segment: the tail the open walks. No per-worker file exists to be half-written.
-  - **Segments at 128 workers.** Still one per namespace per commit, as parallel.md's
-    state-of-the-art row decides: per-worker files would add 128 probes per lookup after a
-    restart. Compaction and the page counts above are unchanged. The cost is one copy of each
-    payload into the layout (the bytes are written then anyway) and one sort of the commit's
-    entries.
-  - Machine needles: the handle copies them at open and refuses at the put. The commit scans
-    again with the writer's list, which `Driven::machine` may have grown.
-- **(h) What is compressed, by kind (2026-11-15).** The rule: a record read on the edit loop is
-  kept raw and read in place (rule 51); compression is for what no build reads. The plain store
-  compresses nothing. The pack store (format 10):
-  - **Output chunks:** raw. LZ4 is gone (and the crate dependency): a hit decoded each LZ4
-    chunk, then copied it into the whole. Fixture (600 KiB text + 600 KiB noise): 5 copies
-    before, 1 after; 643,274 bytes stored before, 1,229,694 (the bytes) after.
-  - **Runs:** raw, now hot: a build reaching a run's dependents reads them, every process again.
-  - **Debug info:** zstd with a per-kind dictionary from its put: read only on a panic or in a
-    debugger, large and alike.
-  - **Any other kind:** raw; a settle compresses one unread for two periods (zstd, or cold
-    columns through blaze-format-tiers), and the end of the first period that reads it writes it
-    back raw (was two periods running), so a read decodes until then, never on every read.
-    Warm columns are read in place, so they keep the two periods.
-  - A store of format 9 may hold LZ4 chunks: it is refused by name and rebuilt (rule 26).
-
-- **(i) Batches.** `format::find_many` sorts a batch's keys and seeks each from where the last
-  ended: one guess, a gallop to the key, bisection inside its last step. Index pages of a
-  million entries (test `a_batch_touches_the_index_pages_its_keys_live_on`): 64 keys 171 one
-  at a time, 87 batched, floor 63; 4,096 keys 2,776, 2,234, floor 2,186 (1.02). Not built yet:
-  the read-ahead of a batch's ranges (needs a range advice on blaze-core's mapping, another
-  lane's crate), the fuse filter (above), and a cold wall-time run.
+  - **Not taken: a check on first read.** It needs a per-segment bitset that lock-free readers
+    set, costs in proportion to what is read on the answer's path, and reverses decision 18
+    (`Checks::per_read` stays asserted zero).
+- **The open and the lookup.** The open touches no index page; `format::find_by` interpolates
+  between bounds that narrow with each probe and reads no run ends (at most `3 + log2 n` probes);
+  `format::find_many` seeks a sorted batch from where the last key ended.
+- **(d) The startup image** (`plain/image.rs`, `StartupImage`, blaze-keyed `ReservedTag::Image`): the
+  (slot, code record key) rows placed before `main`, in placement order, under
+  `H("blaze startup image", manifest key)`; `read_order` sorts them by segment and offset. A hint:
+  every record is still found by its own key. Built, not wired: blaze-run does not read or write it.
+- **(f) Sealed sharing.** `PlainConfig::machine` holds needles (the store root, plus what the caller
+  adds through `Driven::machine`, which crates/blaze-cli/src/store/plain_place.rs calls). A put or
+  a commit into any namespace but local refuses a value that holds one (`PutError::Machine`).
+- **(g) Puts on every worker** (`PlainStore`, plain/handle.rs). Each worker puts into its own lane;
+  the only shared step is `commit_lanes`, which lays payloads and index in key order whatever the
+  put order (one key with other bytes in two lanes is `TwoValues`, rule 21), writes, flips, then
+  publishes. A worker sees its own put at once, every other reader after the flip. Still one
+  segment per namespace per commit: per-worker files would add a probe per worker per lookup
+  after a restart.
+- **(h) What is compressed.** A record read on the edit loop is kept raw and read in place (rule
+  51); compression is for what no build reads. The plain store compresses nothing.
+- **D182's bottom** (`plain/bottom.rs`): see the last section.
 
 ## Left, and why
 
@@ -168,80 +84,25 @@ as a control.
   entry from 48 to 64 bytes: a third more index pages for every lookup, cold or warm. This
   disagrees with bottom.md 10's wording; the key form satisfies its intent.
 - **(c) Never rename over.** Already true (see the generations row).
-- **A per-segment fuse filter.** The next gap to the floor (above): it needs a manifest format
-  change and a builder in the commit and compaction. Planned, not written here.
 - **Relax's per-crate files, shared lock, whole-index copy.** Each is worse for blaze's goals: a
   copy reads the whole index, and a per-crate file is mutable and cannot be fetched by range as it lies.
 
-## What the callers must do
+## Still to build
 
-blaze-drive (another lane's crate; nothing there edited):
-
-1. After the answer, on a lowered thread: `Driven::seal()`, then `Driven::compact(n)`. Never before
-   the answer, never waited on by it.
-2. In the helper left after the answer (rule 70, with its expiry), at idle IO priority:
-   `Driven::scrub_next(SLICE_BYTES)` until it returns `None` (every sealed segment walked this
-   boot) or the helper expires. A slice with `rot` carries a loss the profile records. The boot
-   id passed as `PlainConfig::boot` is `kern.bootsessionuuid` on macOS and
-   `/proc/sys/kernel/random/boot_id` on Linux, hashed to 64 bits.
-3. Puts from the workers through `PlainStore` (each thread its lane); `commit` once per batch.
-   A one-flight waiter takes the first asker's value in memory, never by a store read.
-4. At open: `Driven::machine(&[checkout, home])` in each spelling the command knows, before any put
-   to a shared namespace.
-5. The certificate: `locate` and one `pread` (`Driven::get_into`), not `get` (which faults the
-   payload's pages on first touch).
-6. Read `report().sealed` and `report().checked` into the profile: segments proved by row and
-   checked whole this open.
-
-blaze-solo: pass `Config::lanes` as the number of file threads the native driver was made with
-(the binary passes 4, as kqueue runs).
-
-blaze-run's `Parent`:
-
-1. At start, get `StartupImage::key_for(manifest)`.
-2. When found, run `read_order` against `locate` and read the records into the code region before
-   the child's first ask. The Welcome's known slots come from the image's rows.
-3. After `main` is reached, put the image of what this run placed under `ReservedTag::Image` and `LOCAL`,
-   when it differs, and commit it with the run's other records after the answer.
-
-## Tests (`crates/blaze-cas/src/plain/tests.rs`)
-
-- `a_sealed_tail_survives_any_power_cut_and_is_never_read_to_prove` (property, on `Sim`).
-  - Two writers commit. One of them seals or runs a compaction slice in alternate rounds, while a
-    reader of boot 1 holds its maps.
-  - Effects fail one in 40, and a power cut lands anywhere, inside the seal's barriers and flip
-    too. Then always a crash and a new boot.
-  - Oracle: the store's oracle (every completed commit reads back or is lost by name). Also: every
-    segment proved by its seal passes `check_segment` on the disk's bytes; the boot-1 reader still
-    reads what it held; and when the boot's last seal survived, the new boot checks nothing in full.
-  - Control `the_oracle_catches_a_seal_before_its_barrier` (`Plant::SealBeforeBarrier`).
-- `the_background_pass_retires_rot_and_resumes_after_a_cut` (property, on `Sim`).
-  - Boot 1 seals one to four segments. One byte of one segment's last record rots. At boot 2 a
-    holder maps a record of that segment, then durable processes walk one record a slice, and a
-    power cut lands anywhere in the pass.
-  - Oracle: no segment is walked again once its walk's flip landed, and none is skipped. The rot
-    is lost by name and no lookup serves it. The holder's bytes stay. The store's oracle holds.
-    Boot 3 has every survivor to walk again.
-  - Control `the_oracle_catches_a_segment_marked_scrubbed_before_its_walk_ends`
-    (`Plant::ScrubMarkedEarly`).
-- `lanes_put_with_no_shared_lock_and_keep_every_flip_s_promise` (property, on `Sim`, durable).
-  - One to eight lanes put their own keys, plus one key all of them put with equal bytes, in an
-    order the seed turns. A reader's lane looks before and after each commit. One power cut
-    lands anywhere in a commit (`Driven::cut_after`), then a new boot.
-  - Oracle: a record whose flip landed reads back after every cut; none is seen by another lane
-    before its flip; each worker sees its own put at once; no segment indexes a key twice.
-  - Control `the_oracle_catches_a_lane_commit_flipped_before_its_bytes_are_durable`
-    (`Plant::FlipBeforeSync`).
-- `two_builders_on_other_lanes_write_equal_segments`: one lane against five, in reversed order,
-  give equal bytes.
-- `a_lookup_reads_only_the_pages_its_probes_land_on`: page counts for a run of 200,000, against the
-  old lookup as the control. `a_lookup_finds_every_key_of_an_uneven_run` (property): clustered
-  prefixes.
-- `a_record_naming_the_machine_never_reaches_a_shared_namespace`, with a store that lists no path
-  as the control.
-- `a_startup_image_round_trips_and_reads_in_place_order`.
-- The format test now also refuses format 3 heads and manifests.
-- blaze-solo: `a_sweep_asks_a_stamp_batch_per_file_thread`.
+- **The background pass in the helper.** In the helper left after the answer (rule 70, with its
+  expiry), at idle IO priority: `Driven::scrub_next(SLICE_BYTES)` until it returns `None` (every
+  sealed segment walked this boot) or the helper expires. A slice with `rot` carries a loss the
+  profile records. The boot id passed as `PlainConfig::boot` is `kern.bootsessionuuid` on macOS
+  and `/proc/sys/kernel/random/boot_id` on Linux, hashed to 64 bits.
+- **blaze-run's `Parent` and the startup image.** At start, get `StartupImage::key_for(manifest)`;
+  when found, run `read_order` against `locate` and read the records into the code region before
+  the child's first ask (the Welcome's known slots come from the image's rows); after `main` is
+  reached, put the image of what this run placed under `ReservedTag::Image` and `LOCAL` when it
+  differs, committed with the run's other records after the answer.
+- **A typed machine refusal at the commit.** The commit's refusal reaches the caller as
+  `StoreError::Other` naming rule 25; a typed `StoreError::Machine` needs a row in blaze-keyed.
+- **The read-ahead of a batch's ranges** (a range advice on blaze-core's mapping) and a cold
+  wall-time run.
 
 ## The digest under every key
 
@@ -249,19 +110,6 @@ Every item, record and segment is named by BLAKE3 of its bytes (`crates/blaze-bl
 `blaze-ids` wraps it). Most items are under 1 KiB, one BLAKE3 chunk, so the tree's lanes never
 engaged on them. On 2026-11-15 the outline of the standard library hashed at 736 MB/s, and the
 digests were 12.59 ms of a 17.78 ms edit to one item of a 10 MB file (blaze-file-items).
-
-### What was fixed in blaze-blake3
-
-- The scalar compression read its message through a permutation applied each round. It now
-  reads from a table of indices, every round written out: 49.4 ns a block from 63.6 ns.
-- One input of a chunk or less is compressed where it lies, with its last block read by
-  overlapping loads. Before, it was copied block by block into a buffer.
-- The lanes were arrays left to the autovectorizer: 756 MB/s at 16 MiB, slower than one block at
-  a time. They are now `core::simd`, eight lanes, with rotations by 8 and 16 done as one byte
-  shuffle. The same code makes 16 lanes on AVX-512 and 8 on AVX2.
-- New: `hash_many`, `keyed_hash_many` and `derive_key_many` hash many independent inputs, one
-  input to a lane. A lane that finishes takes the next input on the next step, so inputs of
-  different lengths need no sorting, no grouping and no buffer.
 
 ### The table
 
@@ -312,8 +160,8 @@ messages of one length together so that their rounds overlap, which is the fair 
   `hash`, `context_key`, `derive_key_with` and `Hasher`; `many.rs` builds `of_many` on
   `blaze_blake3::lanes`). `blaze-cond` (`Hasher::new_derive_key`). The 90 crates that depend on
   `blaze-ids` reach the digest only through `ContentId` and `b3`, so their source would not
-  change. `blaze-launch-host`, `blaze-launch-rt`, `blaze-codegen-code` and `ix-prof` use the
-  official `blake3` crate directly. They are outside item keys.
+  change. Other crates use the official `blake3` crate directly
+  (the workspace's `blake3` dependency).
 - Data: every content ID, key, record and segment name changes. Every home is rebuilt, and the
   shared cache and its precompiled std are filled again.
 - Lost: BLAKE3's modes. `derive_key` gives each kind of ID its own domain, and SHA-256 would need
@@ -339,10 +187,8 @@ Keep BLAKE3 for keys, and batch the digests. The number that decides it: on the 
 lengths, batched BLAKE3 runs at 13.7 M inputs a second against hardware SHA-256's 14.4, a 5%
 gap. SHA-256's best batched row is 1.25x ahead (1 KiB). Its worst is 1.39x behind (64 B). No row
 reaches the 1.5x that would pay for rebuilding every record and losing the modes and the tree.
-The work is in the callers, not here: the outline and `blaze-items` should hash each file's items
-in one `derive_key_many` (or `ContentId::of_many`) call, not one by one. One more step for the
-coordinator: `blaze-ids`' `many.rs` duplicates `hash_many`, with its own grouping by block count
-and its own `padded_words`, and could call `derive_key_many` instead (rule 30). Revisit if a
+blaze-file-items hashes each file's items in one batch (`blaze_blake3::derive_key_many`, crates/blaze-file-items/src/digest.rs).
+Revisit if a
 measurement on x86-64 with SHA-NI and AVX-512, or of SHA-256 run four at a time over unequal
 lengths, moves the mixed-length row by more than 1.5x.
 
@@ -381,7 +227,7 @@ block range it would need three things:
   never rewrites another writer's extent. A writer that died leaves its claim, freed by the
   next open that finds no live holder.
 
-**The descriptors kept for a held name: what removes the opens.** Tonight's profile puts
+**The descriptors kept for a held name: what removes the opens (not built).** The profile above puts
 `__open` and `__open_nocancel` at 9.5% of an edit's CPU.
 
 Where descriptors are kept today: `blaze-core/src/descriptors.rs` (`Descriptors::file`,
@@ -421,7 +267,7 @@ removal: `cleanup` already orders the removal after the flip. `OverBlock` holds 
 device. What it does not save: the opens of source files, which cannot be held. Their cost is
 the stat-then-open of the incremental check, a separate piece.
 
-The exact edits are in blaze-core, not this lane's files:
+The edits, in blaze-core:
 
 - `lib.rs` `Effect`: `Hold`, `Release` and `HoldAccess`; `Done::Held` and `Done::Released`.
 - `descriptors.rs`: a `held` map beside `kept`, with `hold`, `release` and `held(name) ->
@@ -437,21 +283,8 @@ The exact edits are in blaze-core, not this lane's files:
 The store's core then holds and releases these names: `core.rs`, after its map of a segment,
 at open, and before a removal.
 
-Proof: `bottom_tests.rs`. One crash simulation runs over both bottoms with one oracle:
-
-- an acknowledged record reads back with equal bytes;
-- a cut record reads back whole or not at all;
-- a key never put is never found;
-- the head after a cut is one of the last two generations.
-
-A differential check compares the two bottoms without cuts. Three plants are each caught:
-
-- both slots written in one step;
-- an extent freed before the flip is durable;
-- a stored free map trusted at open.
-
-`Limits::SIMULATED` is checked against the drawn cases' high-water marks (D165), which the
-test prints. `Limits::store` is not yet sized from a real store's marks.
+Proof: `crates/blaze-cas/src/plain/bottom_tests.rs`, one crash simulation over both bottoms with
+one oracle and a differential check between them, each with its plants.
 
 The device under it is bstd's block grant (`crates/blaze-std/src/block.rs`): `Block`, `Lba`,
 `Blocks`, aligned buffers and `DeviceFacts`, over `OverFile`, the simulated device

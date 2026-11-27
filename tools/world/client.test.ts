@@ -1,5 +1,4 @@
-// The TypeScript side of the world schema, against the golden vectors crates/blaze-world-api
-// tests too (tools/world/vectors.json): every vector decodes to its JSON and encodes to its bytes;
+// The world schema's client, against the golden vectors (tools/world/vectors.json): every vector decodes to its JSON and encodes to its bytes;
 // the encoding rules and limits are refused by name; and client.ts, over a Unix socket and over
 // HTTP, against an in-process fake server that answers each request's exact bytes from the vectors.
 //

@@ -1,6 +1,6 @@
 [package]
 name = "blaze-memo"
-description = "The session memo the front end's queries run on (docs/v2/plan/design/target.md, design 4): a table per crate arena, inputs fixed for a snapshot, single flight, declared cycles and an opt-in read recorder; no revisions, no edges, no durability"
+description = "The session memo the front end's queries run on (docs/v2/plan/design/bottom.md): a table per crate arena, inputs fixed for a snapshot, single flight, declared cycles and an opt-in read recorder; no revisions, no edges, no durability"
 publish = false
 
 version.workspace = true

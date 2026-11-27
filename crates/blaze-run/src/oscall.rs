@@ -1,5 +1,5 @@
 //! What one operating-system call a test made means for its result (docs/v2/plan/design/test.md,
-//! "End state", piece 11; test-selection.md section 2): an ASK (an outside read, whose identity
+//! "End state", piece 11; "Not kept, refused, own"): an ASK (an outside read, whose identity
 //! is digested now and again before the next run), the test's OWN business (its temporary
 //! folder, its own loopback port, `/dev/null`), NOT KEPT by a named reason (the real clock, a
 //! peer outside the test, code the tracer cannot see, a descriptor it did not see opened), or
@@ -17,9 +17,9 @@
 //! Three rules, each from the design:
 //!
 //! - Randomness (`getrandom`, `/dev/urandom`) is KEPT when the provider answered it
-//!   (test-selection.md section 2): the sandbox answers it from a seed derived from the test's
-//!   base key (the suite's tool, settings and environment, then the test's name; determinism.md
-//!   section B), the same whatever ran before it, so it is an input of the key, not of the world:
+//!   (test.md, "Not kept, refused, own"): the sandbox answers it from a seed derived from the test's
+//!   base key (the suite's tool, settings and environment, then the test's name; end-state.md
+//!   D177), the same whatever ran before it, so it is an input of the key, not of the world:
 //!   [`Rule::Own`]. Randomness the provider did not answer (a source no wrapper binds, such as
 //!   `SecRandomCopyBytes` reached as a foreign call) is not kept, by its own row.
 //! - The monotonic and CPU clocks are the process's own ([`Rule::Own`]: test.md "C. End-to-end
@@ -29,7 +29,7 @@
 //!   `#[bstd::test]` gets the virtual clock and never reaches here.
 //! - A spawned WORKSPACE binary (its `CARGO_BIN_EXE_<n>` launcher stub, [`Site::WorkspaceBinary`])
 //!   is a launched program whose own calls are observed by its own wrappers and join the test's
-//!   asks ([`Rule::Traced`]; test-selection.md section 2, "Child processes: kept when traced").
+//!   asks ([`Rule::Traced`]; test.md, "Not kept, refused, own").
 //!   Any other program stays [`NotKept::Foreign`]. [`classify_with`] takes the workspace
 //!   binaries; [`classify`] knows none.
 
@@ -404,7 +404,7 @@ mod tests {
     use super::{Class, Clock, Kind, Op, RULES, Rule, Site, classify, classify_with, key, key_with, rule};
     use crate::plan::NotKept;
 
-    /// test-selection.md section 2, "Child processes: kept when traced", and test.md "C.
+    /// test.md, "Not kept, refused, own", and test.md "C.
     /// End-to-end tests": a spawn of the launcher stub a `CARGO_BIN_EXE_<n>` names is traced
     /// (its asks join the test's, so the spawn call itself is the test's own); any other program,
     /// and the same program when no binaries are given, stays `NotKept::Foreign`. Planted bug

@@ -1,6 +1,6 @@
 //! [`AppendVec<T>`]: a column one writer appends to while any number of threads read it with
-//! no lock (docs/v2/plan/design/concurrency.md "no lock and no shared write on any read
-//! path"). The writer writes the value in place and publishes the new length with one release
+//! no lock (docs/v2/plan/design/end-state.md D179: no lock and no shared write on any read
+//! path). The writer writes the value in place and publishes the new length with one release
 //! store; a reader loads the length with acquire and indexes from a base that never moves.
 //!
 //! Unlike [`Column`](crate::Column), whose pushers claim indices at once and publish each value

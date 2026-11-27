@@ -96,7 +96,7 @@ pub fn walked() {
 /// blaze: makes the entry of `environ` that starts with `name_eq` (a name and its `=`) be
 /// `entry`, a nul-terminated string that outlives the process's use of its environment.
 /// Whether there was one. Only `sys::provider::spawning` calls it, under a given provider, to
-/// hand each child its own seed (docs/v2/plan/design/determinism.md); the array is the
+/// hand each child its own seed (docs/v2/plan/design/end-state.md, D177); the array is the
 /// process's own, and std's readers hold `ENV_LOCK`.
 pub fn replace_entry(name_eq: &[u8], entry: *const c_char) -> bool {
     let _guard = ENV_LOCK.write().unwrap_or_else(PoisonError::into_inner);

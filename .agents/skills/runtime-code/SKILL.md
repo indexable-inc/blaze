@@ -1,6 +1,6 @@
 ---
 name: runtime-code
-description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, all OS syscalls and kernel FFI in blaze-sys, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a fiber wait. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially OS/syscall FFI, the scheduler, the request loop, a build's helper process, the store or anything concurrent."
+description: "How code inside blaze is written: no fallbacks, the one standard data structure per need (locks, maps, queues, channels, waits), sans-IO cores, all OS syscalls and kernel FFI in blaze-sys, named and bounded waits, hangs turned into typed failures by the watchdog, errors that name the thing, panics that fail one job, nothing thread-bound across a `Need` park. Allocation by lifetime, what is persisted and why no state lives between requests are the `memory-and-data` skill. Load before writing or reviewing Rust in blaze's crates, especially OS/syscall FFI, the scheduler, the request loop, a build's helper process, the store or anything concurrent."
 ---
 
 # Writing blaze's runtime code
@@ -45,14 +45,14 @@ waited behind whom into the profile's `lock_waits` (`blaze debug locks` ranks th
 use instead: arc-swap or RCU for reads, papaya for a map, an atomic for an integer, a channel for a
 queue, an owner for one holder); a shared map is `papaya::HashMap`; a single-owner map or set is
 `blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named as
-`bump-allocate` says: a frame's for a task, `Global` with a reason otherwise), with
-`blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for
-persisted content IDs; parallel same-length columns (struct-of-arrays) are `blaze_own::soa!`
-(`Soa<C, A>`: one allocation, one `len`, one `capacity`, typed column slices), never parallel
-`Vec`/`AVec`s; results of parallel items come back from `blaze_graph::par` in order, never pushed
-into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is
-`crossbeam-channel`; a counter or flag is an atomic. How a thread or fiber waits is
-`deadline-waits`. `BTreeMap` only where iteration order is part of the output.
+`bump-allocate` says), with `blaze_hash::KeyHasher` for keys that are already content hashes and
+`blaze_hash::Blake3Hasher` for persisted content IDs; parallel same-length columns
+(struct-of-arrays) are `blaze_own::soa!` (`Soa<C, A>`: one allocation, one `len`, one `capacity`,
+typed column slices), never parallel `Vec`/`AVec`s; results of parallel items come back from
+`blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is
+`crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag is
+an atomic. How a thread or fiber waits is `bounded-progress`. `BTreeMap` only where iteration order
+is part of the output.
 
 ## sans-io-cores (rule 14)
 
@@ -65,30 +65,30 @@ transcript with no real clock, and a deterministic simulation test drives the co
 cannot be proven. Protocol code is a core too: an HTTP client or server, TLS (through rustls's own
 byte-in/byte-out `Connection`, never `tokio-rustls`), the client's wire protocol to a build's helper
 process, a shared-cache or registry client. Its interface is bytes in, bytes and events out, so any
-IO backend can drive it (tokio today, io_uring on Linux later) by writing one thin driver, with no
-change to the core. A dependency that ties protocol logic to one runtime (hyper's connectors,
-hyper-util, reqwest, tokio-rustls) is replaced by a core and a driver, not wrapped. Persisted state
-is a core too: a writer of files that must survive a crash (a manifest, a journal, a history, a
-store) asks for each write, sync, rename, delete and lock as a blaze-core `Effect` and takes
-`Completion`s, so `Sim` sees every one and can tear what was not synced; its durability is the order
-of the effects it emits, never a direct `fsync`, `F_FULLFSYNC` or `flock`. Each core module carries
-`#![blaze::sans_io]` and `#![deny(blaze::sans_io_core)]`: the lint walks every call the module
-makes, through workspace functions, and refuses the clock, `std::fs`, `std::thread`, `std::net`,
-`std::process`, `std::env`, OS randomness and `libc`/`rustix`/`nix`. What a core needs of its
-process beyond IO (its pid, whether another process lives, symbols to name a stack) comes through a
-trait the driver implements, taken as a type parameter: calls through it are the driver's, not the
-core's. Drivers are separate, unmarked modules, so the exemption is by module, never by an allow on
-a line. A core's errors carry the path the driver will report, and a step that waits on no effect is
-a typed error (`bounded-progress`). There is no part of blaze this does not cover: the request loop
-(one command's process), a build's helper process (no `watch`: nothing builds unless asked), the
-build plan and the scheduler, the file watcher, the store, the linker's writes, the launcher, the
-client, the hub. Logic that does its own IO (reads a file, the clock or the environment, starts a
-thread or a process, opens a socket, sleeps) is not finished work, whoever wrote it and however long
-it has been there. When you meet such code in what you are changing, cut the seam in the same change
-without being asked: the decisions go into a core, the IO into a driver that only performs effects
-and returns completions; when it is too large for the change, record a fact/gotcha in
-`agents/kb/facts.jsonl` via `scripts/src/bin/kb.rs` naming the file and what blocks it, and add a
-ledger row if it needs one. One implementation, the real one: the code that ships is the code the
+IO backend can drive it by writing one thin driver, with no change to the core. A dependency that
+ties protocol logic to one runtime (hyper's connectors, hyper-util, reqwest, tokio-rustls) is
+replaced by a core and a driver, not wrapped. Persisted state is a core too: a writer of files that
+must survive a crash (a manifest, a journal, a history, a store) asks for each write, sync, rename,
+delete and lock as a blaze-core `Effect` and takes `Completion`s, so `Sim` sees every one and can
+tear what was not synced; its durability is the order of the effects it emits, never a direct
+`fsync`, `F_FULLFSYNC` or `flock`. Each core module carries `#![blaze::sans_io]` and
+`#![deny(blaze::sans_io_core)]`: the lint walks every call the module makes, through workspace
+functions, and refuses the clock, `std::fs`, `std::thread`, `std::net`, `std::process`, `std::env`,
+OS randomness and `libc`/`rustix`/`nix`. What a core needs of its process beyond IO (its pid,
+whether another process lives, symbols to name a stack) comes through a trait the driver implements,
+taken as a type parameter: calls through it are the driver's, not the core's. Drivers are separate,
+unmarked modules, so the exemption is by module, never by an allow on a line. A core's errors carry
+the path the driver will report, and a step that waits on no effect is a typed error
+(`bounded-progress`). There is no part of blaze this does not cover: the request loop (one command's
+process), a build's helper process (no `watch`: nothing builds unless asked), the build plan and the
+scheduler, the file watcher, the store, the linker's writes, the launcher, the client, the hub.
+Logic that does its own IO (reads a file, the clock or the environment, starts a thread or a
+process, opens a socket, sleeps) is not finished work, whoever wrote it and however long it has been
+there. When you meet such code in what you are changing, cut the seam in the same change without
+being asked: the decisions go into a core, the IO into a driver that only performs effects and
+returns completions; when it is too large for the change, record a fact/gotcha in
+`agents/kb/facts.jsonl` via `scripts/src/bin/kb.rs` naming the file and what blocks it, and record a
+decision row if it needs one. One implementation, the real one: the code that ships is the code the
 simulation runs. A fake, mock, stub, test double or second model written because the real code could
 not run in a test (a simulated request loop beside the real one, a toy scheduler in a test, a
 hand-written in-memory store with its own logic) is a duplicate (`one-concept-one-home`) that proves
@@ -100,9 +100,7 @@ ban the removed name.
 
 ## every-wait-says-what (rule 15)
 
-A thread or fiber that blocks says what it waits for: the wait opens a span naming the awaited key,
-lock, channel, IO or child, and its owner when known. A wait with no name, and time on a worker
-covered by no span, are bugs; the profile test fails on them.
+Merged into rule 18, `bounded-progress` (`runtime-code` skill).
 
 ## bounded-progress (rule 18)
 
@@ -112,8 +110,8 @@ So anything on the answer path that searches (a solver, a prover, a fixpoint) ch
 that is a function of its input's size, counted in steps and never in time (the result is then the
 same on every machine and run, `deterministic-output`), and ends in a typed outcome when the budget
 runs out; a test holds the work used to that bound and to near-linear growth (work at twice the size
-within a stated factor).Memory is workers times a small frame (`one-memory-measure`); a wait has a
-deadline (`deadline-waits`); a retry, where a protocol allows one at all (`no-fallback`), has a
+within a stated factor). Memory is workers times a small frame (`one-memory-measure`); a wait has a
+deadline and a name (below); a retry, where a protocol allows one at all (`no-fallback`), has a
 count; a table, queue or cache has a cap, with what happens at the cap stated; an agent's command
 has a timeout (`every-command-has-a-timeout`). How: when you add a loop, a collection that grows
 with input, or a wait, write its bound in the same line and a test that reaching it gives the typed
@@ -121,15 +119,35 @@ outcome. Every loop that waits for progress (a solver, a fixpoint, a readiness p
 build's rounds) has a bound (fuel, depth or a deadline from the injected clock) and ends in a typed
 outcome: done, or a failure naming what it was doing, the goal or key, and how far it got. Never an
 open loop whose only exit is success, and never a spin with no cap. What no bound in the code
-catches, the watchdog does (`blaze_profile::stuck`, a sans-IO core): a task that has not moved for
-the bound of what it waits on, a cycle of waits, and a task started again and again for the same
-work with no input changed (`again`). Each is a hang, and a hang is a bug: the watchdog fails the
-build with a typed error that names the task, what it waits on or repeats, how long and how often,
-writes the flight recording and prints its path, so the person sees one line and a file to read,
-never a build that just runs on. A new kind of wait or a new loop over rounds feeds the watchdog in
-the same change, with a test that a planted hang of that kind is reported. A hang found by hand (a
-person or an agent saw it hang) is two bugs: the hang, and the watchdog not catching it; fix both.
-How an agent's own commands are bounded is `every-command-has-a-timeout`.
+catches, the watchdog does (a sans-IO core; the daemon's went with the profile crate on 2026-11-27,
+end-state.md D178, so a new one is owed): a task that has not moved for the bound of what it waits
+on, a cycle of waits, and a task started again and again for the same work with no input changed
+(`again`). Each is a hang, and a hang is a bug: the watchdog fails the build with a typed error that
+names the task, what it waits on or repeats, how long and how often, writes it to the command's
+profile and prints its path, so the person sees one line and a file to read, never a build that just
+runs on. A new kind of wait or a new loop over rounds feeds the watchdog in the same change, with a
+test that a planted hang of that kind is reported. A hang found by hand (a person or an agent saw it
+hang) is two bugs: the hang, and the watchdog not catching it; fix both. How an agent's own commands
+are bounded is `every-command-has-a-timeout`. Every blocking wait names what it waits for: it opens
+a span naming the awaited key, lock, channel, IO or child, and its owner when known; a wait with no
+name, and worker time covered by no span, are bugs the profile test fails on. A thread blocks in the
+kernel only through `blaze_core::wait`, which takes an absolute `Deadline` on the injected clock (a
+driver's `now()`), recomputes the time left from that clock before every system call, treats an
+interrupted (EINTR) or spurious return as a retry, and ends in a typed outcome (`Waited::Ready` or
+`Waited::Deadline`), with fuel for a clock that does not move. `Driver::poll` takes that `Deadline`,
+never a relative timeout, so no layer restarts one. The kernel's waits (`poll`, `ppoll`, `select`,
+`epoll_wait`, `kevent`, `nanosleep`, `usleep`, `sleep`, ...) are banned in `.clippy.toml` outside
+`crates/blaze-core/src/wait*`, each with its `blaze_core::wait` replacement; io_uring waits pass a
+signal mask that blocks every asynchronous signal but the stop signals. Only IO driver threads and
+the pool's idle park block in the kernel: a fiber that waits, with a deadline or without, parks on
+the scheduler (a key, a counter, a job, a timer on the driver's wheel), never a `Condvar`, a channel
+receive, `thread::sleep` or a raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park
+helper. Nothing sends a signal to a pool or driver thread: the sampler reads the kernel's samples
+(Linux `perf_event_open`) or stops the thread (macOS `thread_suspend`). The DST in
+`crates/blaze-core/src/wait/tests.rs` interrupts every wait and checks that it ends by its deadline,
+with a planted relative-timeout retry it must catch.
+
+See [docs/v2/plan/design/deadline-waits.md](../../../docs/v2/plan/design/deadline-waits.md).
 
 ## errors-name-the-thing (rule 19)
 
@@ -154,24 +172,7 @@ read thread-locals in `#[inline(never)]` functions that end before any wait.
 
 ## deadline-waits (rule 44)
 
-A thread blocks in the kernel only through `blaze_core::wait`, which takes an absolute `Deadline` on
-the injected clock (a driver's `now()`), recomputes the time left from that clock before every
-system call, treats an interrupted (EINTR) or spurious return as a retry, and ends in a typed
-outcome (`Waited::Ready` or `Waited::Deadline`), with fuel for a clock that does not move.
-`Driver::poll` takes that `Deadline`, never a relative timeout, so no layer restarts one. The
-kernel's waits (`poll`, `ppoll`, `select`, `epoll_wait`, `kevent`, `nanosleep`, `usleep`, `sleep`,
-`GetQueuedCompletionStatusEx`, ...) are banned in `.clippy.toml` outside
-`crates/blaze-core/src/wait*`, each with its `blaze_core::wait` replacement; io_uring waits pass a
-signal mask that blocks every asynchronous signal but the stop signals. Only IO driver threads and
-the pool's idle park block in the kernel: a fiber that waits, with a deadline or without, parks on
-the scheduler (a key, a counter, a job, a timer on the driver's wheel), never a `Condvar`, a channel
-receive, `thread::sleep` or a raw `spin_loop`; elsewhere a spin is the one bounded spin-then-park
-helper. Nothing sends a signal to a pool or driver thread: the sampler reads the kernel's samples
-(Linux `perf_event_open`) or stops the thread (macOS `thread_suspend`; Windows is out of scope). The
-DST in `crates/blaze-core/src/wait/tests.rs` interrupts every wait and checks that it ends by its
-deadline, with a planted relative-timeout retry it must catch.
-
-See [docs/v2/plan/design/deadline-waits.md](../../../docs/v2/plan/design/deadline-waits.md).
+Merged into rule 18, `bounded-progress` (`runtime-code` skill).
 
 ## macos-private-apis (rule 45)
 
@@ -187,6 +188,37 @@ docs/v2/plan/design/deadline-waits.md.
 
 See [docs/v2/plan/design/deadline-waits.md#macos-private-apis-rule-macos-private-apis](../../../docs/v2/plan/design/deadline-waits.md#macos-private-apis-rule-macos-private-apis).
 
+## type-then-lint-then-rule (rule 73)
+
+When a mistake can happen again (yours, a lane's, one in the tree), build the strongest prevention
+you can, in this order. (1) A type or a signature that cannot express the mistake: an allocator
+parameter with no default, a position type that is item-relative, a lock that cannot be made without
+a name, a key type built only from all its inputs, one home for the concept, a tool whose only mode
+is the right one. Embrace the newtype: when a number, a string or a `bool` means something (an id,
+an index into one table, a byte offset, a line, a length, a count, a tick, a size in bytes, a
+percentage, a name of one kind), wrap it, even for one use, and when in doubt, wrap; it costs
+nothing at run time. A key, a digest or an id is its own type per kind (a digest per record kind, a
+dense id per table), never raw bytes, a `u64` or a `usize`; a length, an offset or a count has
+checked arithmetic; item-relative and absolute positions are two types (`item-relative-positions`);
+a state is an enum or a typestate, not a flag beside the data; a unit (bytes, pages, nanoseconds) is
+in the type. A value that must be handed over or consumed (a lease, a reservation, a write to commit
+or abort) is linear (`#[blaze::linear]`): dropping it is an error. What was checked is a proof type
+only its checker can make (`verify-once`). At function and capability boundaries, a bare `bool` flag
+is a two-variant enum or a `#[blaze::args]` options struct (`options-struct`), adjacent parameters
+of one primitive type are avoided (`blaze::bool_param`, `blaze::swappable_parameters`,
+`blaze::primitive_meaning`), a result is a named struct, never an anonymous tuple like `(Option<T>,
+bool)` or `Option<(A, B, C)>` (`blaze::anon_tuple_return`), and capabilities narrow monotonically
+(`Dir<ReadOnly, Flat>`, `Leaf`, `Budget`). Where the language cannot state the type, extend the
+language (`own-the-language`). (2) Where no type can hold it, make it loud: the wrong thing fails at
+once, naming itself. (3) A lint with a MachineApplicable fix, or a `.clippy.toml` ban with a
+`replacement` (`edit-rust-by-syntax`), deny by default and run over the whole tree in the same
+change; or a gate check or a simulation invariant where a lint cannot see the mistake. (4) Only
+last, a line in scripts/src/bin/rules.rs, a skill or a how-to: a rule relies on its reader, so it is
+the weakest guard. Design every API so the obvious call is the correct one: the safe form is the
+short one, and the risky form is longer and named for its risk. Before adding a lint, list the lints
+that already cover the same mistake (`.clippy.toml`'s bans, clippy's own lints) and extend the one
+that covers it, or say in the change why none does.
+
 ## nothing-ambient (rule 75)
 
 Nothing a computation depends on is ambient. The allocator (`bump-allocate`), the clock (an injected
@@ -200,8 +232,7 @@ named where they are used. A default that hides the choice (`Vec::new`, `Instant
 see it, the simulation cannot replace it, and a key cannot cover it (`keys-cover-every-input`). How:
 take the thing as a parameter or a type parameter; read each ambient source in exactly one driver
 and pass the value on; ban the ambient form in `.clippy.toml` with the explicit replacement
-(`fix-through-blaze-lints`); an item that must keep one says why with `#[expect(.., reason =
-"..")]`.
+(`edit-rust-by-syntax`); an item that must keep one says why with `#[expect(.., reason = "..")]`.
 
 ## options-struct (rule 83)
 
@@ -214,60 +245,50 @@ a grant), every strategy (the hasher, an ordering) and any input with no value t
 everywhere. An input that changes what the reader should expect of cost or behaviour is written too,
 even when its usual value is nothing: a table's `capacity: Option<usize>` has no default, and most
 calls say `capacity: None`. A field WITH a default (`pub shards: usize = 64`: nightly's
-`default_field_values`, named in the crate's features while cargo builds blaze and on unasked in a
-blaze edition) is only a tunable almost no caller should think about, its default safe and stated in
-its doc. The call names what it sets and takes any such rest by `..`: `Map::new(MapOpts { hasher:
-FixedState, alloc: frame, capacity: None })`. An options struct is a call's named arguments and
-nothing else: it is marked `#[blaze::args]`, and a value of it is only ever written as a struct
-literal directly in the call that takes it, never bound by a `let`, kept in a `const` or `static`,
-held in a field or returned from a helper (lint `args-inline`), so every choice is read at the call.
-The same holds for a function with a flag, an optional input, two parameters of one type or more
-than three parameters: it takes one struct of named fields. A conversion from one value (`from`,
-`as_*`) and a hot leaf with one or two distinct inputs stay positional. Length at the call is not a
-cost: models write and read this code, and a name at the use is where a mistake is seen. bstd's API
-follows this wherever a thing is made, and blaze's own crates use it (`blaze-uses-its-extensions`).
-blaze builds it: a struct expression with `..` and no base takes each unset field's default, a
-constant of the field's type.
-
-## newtypes-and-named-returns (rule 85)
-
-At function and capability boundaries, name the meaning in the type: wrap unit- or ID-bearing
-numbers in zero-cost newtypes, replace bare `bool` flags with two-variant enums or `#[blaze::args]`
-options structs, avoid adjacent identical primitive parameters (`blaze::bool_param`,
-`blaze::swappable_parameters`, `blaze::primitive_meaning`), and return a named struct instead of an
-anonymous stateful tuple like `(Option<T>, bool)` or `Option<(A, B, C)>`
-(`blaze::anon_tuple_return`). Narrow capabilities monotonically at boundaries (`Dir<ReadOnly,
-Flat>`, `Leaf`, `Budget`).
-
-See [docs/v2/plan/design/auto-perf.md](../../../docs/v2/plan/design/auto-perf.md).
+`default_field_values`, named in the crate's features, and on unasked in a blaze edition) is only a
+tunable almost no caller should think about, its default safe and stated in its doc. The call names
+what it sets and takes any such rest by `..`: `Map::new(MapOpts { hasher: FixedState, alloc: frame,
+capacity: None })`. An options struct is a call's named arguments and nothing else: it is marked
+`#[blaze::args]`, and a value of it is only ever written as a struct literal directly in the call
+that takes it, never bound by a `let`, kept in a `const` or `static`, held in a field or returned
+from a helper (lint `args-inline`), so every choice is read at the call. The same holds for a
+function with a flag, an optional input, two parameters of one type or more than three parameters:
+it takes one struct of named fields. A conversion from one value (`from`, `as_*`) and a hot leaf
+with one or two distinct inputs stay positional. Length at the call is not a cost: models write and
+read this code, and a name at the use is where a mistake is seen. bstd's API follows this wherever a
+thing is made, and blaze's own crates use it (`blaze-uses-its-extensions`). blaze builds it: a
+struct expression with `..` and no base takes each unset field's default, a constant of the field's
+type.
 
 ## syscalls-in-blaze-sys (rule 87)
 
-`crates/blaze-sys` is the one home for all OS syscalls, Mach/libproc/sysctl/POSIX/Windows kernel
-FFI, and raw kernel struct layouts (`one-concept-one-home`; Linux via raw syscalls with no libc,
-macOS via `libSystem`, Windows via `ntdll`/`kernel32`). Every operation in `blaze-sys` is
-`#![no_std]`, zero-alloc, and typed per operation (`#[blaze::noalloc]`, `#[blaze::nopanic]`,
-returning `Result<T, Errno>`), never a raw passthrough or implicit retry. App, runtime, and driver
-crates MUST NOT declare inline `extern "C"` kernel/libc/libproc/sysctl/Mach/POSIX/Windows bindings
-or duplicate raw OS struct layouts (`#[repr(C)]` `kinfo_proc`, `proc_taskinfo`, `rusage`, `stat`,
-`kevent`, etc.); when a driver needs a syscall or kernel query that `blaze-sys` does not yet expose,
-add the typed operation to `crates/blaze-sys` first (`build-the-missing-piece`). On macOS, any new
-`libSystem` import must also be recorded with its reason in `tools/ratchets/blaze-sys-libsystem.txt`
-(checked by `scripts/src/bin/sys_imports.rs`; private symbols also follow `macos-private-apis`).
-Higher-level OS framework bindings that are not kernel syscalls
-(UI/GPU/AppKit/Metal/IOKit/CoreGraphics) stay in their thin macOS host driver crate rather than
-`blaze-sys`.
+`crates/blaze-sys` is the one home for all OS syscalls, Mach/libproc/sysctl/POSIX kernel FFI, and
+raw kernel struct layouts (`one-concept-one-home`; Linux via raw syscalls with no libc, macOS via
+`libSystem`; Windows is out of scope now, and this seam is where it would go). Every operation in
+`blaze-sys` is `#![no_std]`, zero-alloc, and typed per operation (`#[blaze::noalloc]`,
+`#[blaze::nopanic]`, returning `Result<T, Errno>`), never a raw passthrough or implicit retry. App,
+runtime, and driver crates MUST NOT declare inline `extern "C"`
+kernel/libc/libproc/sysctl/Mach/POSIX bindings or duplicate raw OS struct layouts (`#[repr(C)]`
+`kinfo_proc`, `proc_taskinfo`, `rusage`, `stat`, `kevent`, etc.); when a driver needs a syscall or
+kernel query that `blaze-sys` does not yet expose, add the typed operation to `crates/blaze-sys`
+first (`own-the-language`). On macOS, any new `libSystem` import must also be recorded with its
+reason in `tools/ratchets/blaze-sys-libsystem.txt` (checked by `scripts/src/bin/sys_imports.rs`;
+private symbols also follow `macos-private-apis`). Higher-level OS framework bindings that are not
+kernel syscalls (UI/GPU/AppKit/Metal/IOKit/CoreGraphics) stay in their thin macOS host driver crate
+rather than `blaze-sys`.
 
 See [docs/v2/plan/design/sys.md](../../../docs/v2/plan/design/sys.md).
 
 ## flag-jank-or-monumentous-in-all-caps (rule 89)
 
-Never quietly slip in a hacky workaround, partial stopgap, or silently sink into a monumental
-multi-day architectural undertaking without telling the user clearly. If you cannot solve something
-the proper way (you are considering a jank workaround just to get it working) OR you discover the
-proper fix is a monumental task whose scope the user may not yet realize, STOP AND WRITE IT IN ALL
-CAPS clearly explaining: (1) WHAT IS JANK OR MONUMENTAL, (2) WHY THE PROPER WAY IS HUGE OR BLOCKED,
-and (3) THE EXACT OPTIONS BEFORE PROCEEDING OR MERGING.
+Never quietly slip in a hacky workaround or partial stopgap, or silently sink into a monumental
+multi-day undertaking. If you cannot solve something the proper way (you are considering a jank
+workaround just to get it working) OR you find the proper fix is a monumental task whose scope the
+user may not yet realize, WRITE IT IN ALL CAPS: (1) WHAT IS JANK OR MONUMENTAL, (2) WHY THE PROPER
+WAY IS HUGE OR BLOCKED, and (3) THE OPTIONS. Then carry on with the long-term design (`sota-first`,
+`own-the-language`) without waiting for an answer; an interim form is marked and listed as
+`own-the-language` says. Stop and wait only when the next step cannot be undone (deleting data, a
+published interface, a change of direction).
 
 ## narrow-collection-views (rule 91)
 

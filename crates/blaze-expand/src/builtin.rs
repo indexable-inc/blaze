@@ -631,9 +631,10 @@ fn include(
 }
 
 /// `include!`'s tokens: the file's text without a byte order mark or a `#!` line, lexed in the
-/// call's edition, each token made at the call site ([`Transparency::Transparent`]): rustc
-/// parses the file with its own spans, which no expansion marks, so its names resolve where
-/// the call is.
+/// call's edition, each token placed directly at the call site's context (`out.call.site.ctx`)
+/// without pushing `core::include`'s mark: rustc parses the file with its own spans, which no
+/// `include!` expansion marks, so its names and any `macro_rules! { ... $crate ... }` inside it
+/// resolve where the call is.
 fn included_tokens(
     out: &mut Out<'_, '_>,
     path: &str,
@@ -656,8 +657,14 @@ fn included_tokens(
         }
         Err(crate::error::LexError::Stream(error)) => return Err(error.into()),
     };
-    for token in tokens.tokens() {
-        out.made(token.kind, tokens.text_of(token), Transparency::Transparent)?;
+    let ctx = out.exp.tokens.import_ctx(out.call.input(), out.call.site.ctx)?;
+    for (at, token) in tokens.tokens().iter().enumerate() {
+        out.push_whole_ctx(
+            token.kind,
+            tokens.whole_at(at),
+            TokenOrigin::Made(Transparency::Transparent),
+            ctx,
+        )?;
     }
     Ok(())
 }

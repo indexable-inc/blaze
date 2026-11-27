@@ -215,7 +215,7 @@ Facts are as of 2026-11-15:
 | 7-traits | a trait with two impls, static dispatch, a `Drop` impl and drops in scope order | blaze-ty and blaze-solve in place of `ToyCtx`; trait-method instances; drop elaboration in blaze-build | deletes 3 | **a `TypeCtx` over blaze-ty that implements blaze-solve's `Tys` and `Facts` (solve.md, the wiring section). It does not exist and has no owner: this is the critical path.** |
 | 7b-dyn | a `dyn Trait` call through a reference | vtables as data with relocations; `dyn` in typeck | none | blaze-typeck: `dyn` in `TyView`; blaze-emit: data relocations |
 | 7c-main-io | the owner's hello world with no dependency: his `main` unchanged, bstd's `Cx`, `Io`, `Out`, `Error` and `Result` declared small beside it | enums with payloads and `match` on them; `?` lowered as rustc lowers it (`Try::branch`, `ControlFlow`, `FromResidual::from_residual`, the lang items `core` declares); generic traits, associated types, a default type parameter, supertraits; `From` between errors; an uninhabited residual; `&str` and its length; a `main(cx, io)` entry | none | blaze-typeck: associated types and generic traits through `InferCtx` (the solver lead); the drive lane: nothing |
-| 8-core | `#![no_std]` against the real `core`: `Option`, `match`, a `for` over a range | blaze-lower and blaze-scope over the real `core`; only reached bodies built; the item layer's `World` from records; work as tasks at item grain | deletes 2, 1, 9; narrows 5 | blaze-lower: lang-item paths into `BodyView` (typeck.md, "Owed to blaze-lower", 1); blaze-scope: correct on `core` (bottom.md: 9 syntax errors in `core` not yet read); the item layer: records for signatures, ADTs and impls |
+| 8-core | `#![no_std]` against the real `core`: `Option`, `match`, a `for` over a range | blaze-lower and blaze-scope over the real `core`; only reached bodies built; the item layer's `World` from records; work as tasks at item grain | deletes 2, 1, 9; narrows 5 | blaze-lower: lang-item paths into `BodyView` (typeck.md, "Forms from blaze-lower"); blaze-scope: correct on `core` (bottom.md: 9 syntax errors in `core` not yet read); the item layer: records for signatures, ADTs and impls |
 | 9-statics | a `static`, a `thread_local!`, a `panic!` that aborts with `panic_handler` | statics and TLS in placement (blaze-launch-rt) and blaze-emit; data relocations | none | blaze-launch-rt: static and TLS records |
 | 10-println | `std`, `fn main() { println!("hello") }` | `format_args!`, `alloc` and `std`, `lang_start`, panic=abort first; the program in a child process | deletes 7, 4, 6 | blaze-lower: `FormatArgs` (owed list, 5); blaze-launch / blaze-run: the child and `Loaded` symbol records; the allocator shim |
 
@@ -834,8 +834,7 @@ walked; capped: false)"; names now resolve in ~41 s.
   investigated; passed to the coordinator for the next checker runner (ask main for its id).
   Coming to front2 when that runner wires dyn compatibility: dyn_ty.rs `member()` returns
   `blaze_typeck::dyn_compat::MemberFacts` (facts, not a verdict), `TraitHead.dyn_` becomes
-  `members`, world_items.rs `trait_def` hands them back as known; plan in typeck.md, "Built
-  (2026-11-16, (e) the rule's home only, not wired)", item 5.
+  `members`, world_items.rs `trait_def` hands them back as known.
 
 Twelfth port lane (2026-11-16 06:4x; handing on at the budget).
 - THE MILESTONE WAS FALSE: `check_body` took a finished check with diagnostics as checked. Now
@@ -920,8 +919,7 @@ Fourteenth port lane (2026-11-16; handing on).
   bounds plus `Sized` unless `?Sized`; return position refused by name. Fixture: `apit`/`rpit`
   in tests/front2_dyn.rs. Open: a body's own env has `anon: &[]` (an `impl Trait` param type
   read from the BODY's view would refuse); turbofish fills only declared params: the checker
-  lane recorded it as owed item (6) in typeck.md ("Every finding has a place; paths from
-  primitive types"): `explicit_args` will take the declared count and make the anonymous ones
+  lane recorded it as owed: `explicit_args` will take the declared count and make the anonymous ones
   fresh. OWED BY FRONT2: pass the declared count (`own - anon.len()`) in the fn signature's
   answer once the checker adds the field.
 - Defaulted ADT params (`Vec<u8>` = `Vec<u8, Global>`): `Maps::generics` holds count and
@@ -962,7 +960,7 @@ Fifteenth port lane (2026-11-16; handing on).
   in bstd `Held::new` (`[0; HELD]`), 2 x `Solve(Malformed(Pred))` in derived Clone of bstd
   `Source` (asked to name the predicate). front2's own refusal ranges 0..0 in heads.rs
   (`whole`) should become the member's range.
-- Checker reply (08:0x): its two stops are NOT fixed (first in typeck.md's newest owed list,
+- Checker reply (08:0x): its two stops are NOT fixed (first in the checker's newest owed list,
   for the next checker runner). Landed in front2 by the checker: `FnHead.declared`,
   `declared_count` in `fn_sig`. OWED BY FRONT2: wire `blaze_typeck::dyn_compat::
   item_dyn_findings(world, item, &mut out)` (E0038 for `dyn` in an ADT field or a bodiless
@@ -1422,7 +1420,7 @@ lane; sent to the integration lane a14c41bba58ed36a1 in two batches).
 - LEFT in this lane's files (core): NoCheckerType 22 (`u24`..: the checker has no type),
   return-position `impl Trait` 16 (see above), trait alias in a bound 9 (`T: Thin`: NotAHead),
   `T::X<A>` 2, `Resolve Path` 3. Negative impls (27 core, 12 alloc) stay refused: the checker
-  lane has no polarity (typeck.md item 9). Items-lane rows sent to a47dcd9b01f5eb34d.
+  lane has no polarity. Items-lane rows sent to a47dcd9b01f5eb34d.
 - Body census census-bnd-3 (bstd): "clean 1054 (45.6%)" (was 923); top: 664
   Solve/Malformed/Sort, 112 E0599, 87 E0277 Try, 59 E0277 Clone, 43 E0308. Note: in
   front2_bounds `call_sup` failed with Solve/Malformed/Sort once, in a run where `assoc_bound` was
@@ -1657,8 +1655,7 @@ lane; sent to the integration lane a14c41bba58ed36a1 in two batches).
   rerun tempo to see impl 972b915ddd50's place. (C) the cycle "these items need each other's
   heads" (impl e97737e3dcaa): not looked at.
 - ITEMS INSIDE BODIES (from a61da367157640a67, after I handed on): the 74 E0425 are local
-  fn/const/struct/use items; proof in tests/front2_locals.rs, design in typeck.md "Items
-  inside bodies (2026-11-16)". Changes in this lane's files: world_paths.rs `path` takes the
+  fn/const/struct/use items; proof in tests/front2_locals.rs. Changes in this lane's files: world_paths.rs `path` takes the
   ScopeId (local scope chain before the module), world_items.rs `resolve_path` passes it,
   heads.rs `Store::step` reads a local item's detail/text/module from a local table. The
   blocker is this lane's call: my recommendation (not built) is an arena of lifetime 'n,
@@ -1856,8 +1853,7 @@ The next piece, in order:
 
 Held by the outgoing lane, not written elsewhere:
 - **Front has a second caller:** crates/blaze-real/examples/check.rs (census-and-split lane
-  a5db87ee38951480a) runs the ladder front, `to_typeck` and the check (`check <crate dirs>`;
-  results in typeck.md, "Checker at scale (2026-11-16)"). The port changes `Front::new`'s
+  a5db87ee38951480a) runs the ladder front, `to_typeck` and the check (`check <crate dirs>`;). The port changes `Front::new`'s
   inputs, so port that caller in the same batch (rule 24).
 - **The `Cx` case** (sent to the names lane 03:20): `mixcheck.sh blaze-ladder run names
   /Volumes/Projects/tmp/hello-world`, tree 1577bc4b5f: crate 0 `Implicit{std:

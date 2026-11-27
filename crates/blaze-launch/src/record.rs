@@ -5,7 +5,7 @@
 //! them where an address goes ([`Fixup`]) and what each address is of, by *place*
 //! ([`Place`]): "the function this record names third", never a slot or an address. The
 //! daemon makes it from the stored template of the function at its tier (`code(f, tier 0)`,
-//! docs/v2/plan/design/tiers.md) and the names of what the template refers to; what a place
+//! docs/v2/plan/design/backend-next.md) and the names of what the template refers to; what a place
 //! is in one process (a function's slot, a static's number) comes with the bind
 //! (`wire::Bind::refs`). So one record serves every process that runs the function, and a
 //! callee's body edit changes no caller's record.

@@ -90,6 +90,8 @@ pub struct Fx {
     /// Closures of other bodies (`PNode::Closure`): owner, ordinal, kind and signature (a
     /// `FnPtr` of `t` in the owner's parameters), as the owner's check records them.
     pub closures: Vec<(ItemKey, u32, crate::ty::ClosureKind, PTy)>,
+    /// Optional capture environment of one [`Fx::closures`] row: owner, ordinal and capture tuple.
+    pub closure_capture: Option<(ItemKey, u32, PTy)>,
     /// Opaque types' hidden types, as their defining bodies' records hold them
     /// (`Checked::hidden`): what `opaque_hidden` answers; an opaque without a row is `None`.
     pub hidden: Vec<(ItemKey, PTy)>,
@@ -182,6 +184,7 @@ impl Fx {
             names: Vec::new(),
             opaques: Vec::new(),
             closures: Vec::new(),
+            closure_capture: None,
             hidden: Vec::new(),
             coroutines: Vec::new(),
             provisional_coroutines: Vec::new(),
@@ -1079,6 +1082,10 @@ impl World for Fx {
             types: self.t.view(),
         }))
     }
+    fn closure_with_captures(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<(crate::world::ClosureFacts<'_>, Option<PTy>)>> {
+        let env = self.closure_capture.filter(|r| r.0 == owner && r.1 == ordinal).map(|r| r.2);
+        self.closure(seal, owner, ordinal).map(|row| row.map(|call| (call, env)))
+    }
     fn attrs(&self, _: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
         if let Some(&(_, a)) = self.attrs.iter().find(|(k, _)| *k == item) {
             return Ok(a);
@@ -1531,6 +1538,12 @@ impl Bb {
     pub fn let_(&mut self, pat: PatId, ty: Option<PTy>, init: ExprId) -> StmtId {
         let at = self.stmts.len() as u32;
         self.stmts.push(Stmt::Let { pat, ty, init: Some(init), else_: None });
+        StmtId(at)
+    }
+
+    pub fn let_else(&mut self, pat: PatId, ty: Option<PTy>, init: ExprId, else_: ExprId) -> StmtId {
+        let at = self.stmts.len() as u32;
+        self.stmts.push(Stmt::Let { pat, ty, init: Some(init), else_: Some(else_) });
         StmtId(at)
     }
 

@@ -12,13 +12,15 @@ When performance tradeoffs compete in Blaze, decisions follow one fixed order ac
 
 1. **Incremental compile time** (including huge crates and huge files even after a cold reboot,
    with zero re-indexing and automatic cross-worktree sharing) **=** **Lint speed**
-2. **Remote cache fetch** (R2 / P2P content-addressed records, coalesced HTTP Range fetches)
-3. **Memory footprint** (explicit allocators, SoA columns, frame-reset scratch)
-4. **Cold compile time**
-5. **Non-locking disk GC**
-6. **Disk usage**
+2. **Memory footprint** (explicit allocators, SoA columns, frame-reset scratch)
+3. **Cold compile time**
+4. **Non-blocking disk GC**
+5. **Disk usage**
 
-Selective incremental testing (`blaze-test-reach` `BTI1` zero-reindex SoA impact store) rides
+The remote cache is supported and is not in the order: nothing is designed around it or traded
+against these.
+
+Selective incremental testing rides
 the same content-addressed discipline: only tests whose transitive read set intersects the
 edited item digests rerun.
 
@@ -30,7 +32,7 @@ edited item digests rerun.
 | **Capability OS & Comptime IO** | Capsicum, CloudABI, WASI Preview 2 `Dir`, Zig `@embedFile` | **OS in the types** via monotone zero-cost marker axes: `Dir<P: Rights, S: Scope = Subtree>` (`ReadWrite -> ReadOnly`, `Subtree -> Flat` with `Leaf` single-segment names, plus monotone `Budget` quotas). Comptime runs (`blaze-comptime` + `blaze-roots`) bind every read/stat/list—and every `Seen::Absent` lookup—into the incremental `ReadList` automatically. |
 | **Linting** | Clippy, rust-analyzer diagnostics | **Profile-Guided Linting (PGL)** (`crates/blaze-lint/src/pgo.rs`): weights findings by historical runtime `share_ppm`, auto-promotes hot-path perf findings (`Clones`, `Allocs`, `AmbientHeap`, `AmbientHasher`, `SeqCstUnexplained`, `RawSync`, `BlockingOnPool`) to `Error`, optionally suppresses cold perf noise, and suggests `GenMap`/`SmallVec`/`CachePadded`/`interp_search` directly on hot functions. |
 | **Type discipline** | Manual code review, scattered lints | Zero-extra-pass token rules (`126+ MB/s/core` across all 31 rules): `blaze::bool_param`, `blaze::swappable_parameters`, `blaze::primitive_meaning`, and `blaze::anon_tuple_return` (denying anonymous stateful tuple returns like `(Option<T>, bool)` in favor of named structs). |
-| **PGO + LTO + JIT** | V8 Maglev/TurboFan, Graal/Truffle partial eval, AutoFDO/BOLT/Propeller | **Closed-loop content-addressed PGO** (`crates/blaze-lir/src/{pgo.rs, lto.rs}` + `blaze-inproc`): cold-start static estimator (`estimate_static`) seeds run #1; cross-run exponentially decayed `BPG1` records survive reboots and share across worktrees; bottom-up Tarjan SCC LTO runs `scalar_replace -> propagate -> dead` + PGO-guided `inline_guided` + post-inline SROA/const-fold; `PgoTier` joins JIT code keys for zero-warmup reuse; and **`blaze export` consumes persisted PGO by default**. |
+| **PGO + LTO + JIT** | V8 Maglev/TurboFan, Graal/Truffle partial eval, AutoFDO/BOLT/Propeller | **Closed-loop content-addressed PGO** (`crates/blaze-lir/src/{pgo.rs, lto.rs}` + `blaze-inproc`): cold-start static estimator (`estimate_static`) seeds run #1; cross-run exponentially decayed `BPG1` records survive reboots and share across worktrees; bottom-up Tarjan SCC LTO runs `scalar_replace -> propagate -> dead` + PGO-guided `inline_guided` + post-inline SROA/const-fold; and **`blaze build` consumes persisted PGO by default**. |
 
 ## 1. `bstd` Explicit-Allocator Performance Primitives
 
@@ -81,7 +83,8 @@ ambient `CARGO_MANIFEST_DIR` strings:
 
 ## 3. Profile-Guided Linting (PGL) & Type-Discipline Rules
 
-Located in `crates/blaze-lint/src/{pgo.rs, engine.rs}`:
+Located in `crates/blaze-lint/src/{pgo.rs, engine.rs}`. The PGL functions are built, not wired:
+only blaze-lint's tests call `rank_findings` and `suggest_from_pgo`.
 
 - **PGL ranking & auto-promotion (`rank_findings`)**: maps every finding to its innermost
   enclosing function's historical runtime share (`Heat::{Cold, Warm, Hot, Critical}`), promotes
@@ -98,7 +101,7 @@ Located in `crates/blaze-lint/src/{pgo.rs, engine.rs}`:
   - `blaze::primitive_meaning` (Rule 30): flags bare numeric params whose names carry units or IDs (`_ns`, `_ms`, `_bytes`, `_id`, `timeout`, `port`, `pid`, `fd`).
   - `blaze::anon_tuple_return` (Rule 31): flags anonymous tuple returns carrying unnamed state (`(Option<T>, bool)`, `(T, bool)`, `Option<(A, B, C)>`, `Result<(T, bool), E>`) where a named struct should name each field.
 
-## 4. Closed-Loop Cross-Run PGO -> LIR SCC LTO -> JIT & `blaze export`
+## 4. Closed-Loop Cross-Run PGO -> LIR SCC LTO -> JIT & `blaze build`
 
 Located in `crates/blaze-lir/src/{pgo.rs, lto.rs, summary.rs, inline.rs}`:
 
@@ -113,11 +116,11 @@ Located in `crates/blaze-lir/src/{pgo.rs, lto.rs, summary.rs, inline.rs}`:
    caches `FnSummary` (`const_param_mask`, `sroa_ptr_param_mask`, `summary_hash` for early cutoff),
    runs PGO-guided priority inlining (`inline_guided_with_cache`), and re-runs post-inline SROA +
    constant folding + DCE across inlined boundaries.
-4. **Live JIT tier-up & code reuse (`advise_jit_tier_up`, `PgoTier`)**: prioritizes hot looping
-   bodies (`4x` loop boost) for background Tier-1 compilation and atomic trampoline patching
-   (`blaze-inproc::JitPool::retarget`), while keying compiled code by `(body_digest, PgoTier)` so
-   hot functions are reused directly from disk on the next run.
-5. **`blaze export` default**: native release exports load the persisted `BPG1` PGO record by
+4. **Live JIT tier-up (`advise_jit_tier_up`, `PgoTier`)**: ranks hot looping bodies (`4x` loop
+   boost) for background Tier-1 compilation and atomic trampoline patching
+   (`blaze-inproc::JitPool::retarget`). Built, not wired: nothing outside blaze-lir calls
+   `advise_jit_tier_up`, and `PgoTier` is in no code key.
+5. **`blaze build` default**: native builds (`--release` too) load the persisted `BPG1` PGO record by
    default (falling back to `estimate_static` when absent), automatically applying real workload
    profiles to ahead-of-time builds with zero manual PGO workflow.
 

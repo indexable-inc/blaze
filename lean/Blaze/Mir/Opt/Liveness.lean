@@ -2,8 +2,8 @@ import Blaze.Mir.Opt.Puts
 import Blaze.Mir.Opt.Renumber
 
 /-!
-Liveness as a certificate, and the pass it licenses: global dead-store elimination (ledger
-V11), piece (c).
+Liveness as a certificate, and the pass it licenses: global dead-store elimination,
+piece (c).
 
 A certificate gives, for each function and block, the locals live at each point of the
 block: before each statement, and before the terminator. It is data, as the Rust pass or

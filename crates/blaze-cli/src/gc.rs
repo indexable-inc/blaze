@@ -652,6 +652,9 @@ const RUN_RECORDS_DIR: &str = "v2/run/records";
 const NATIVE_WORK_DIR: &str = "v2/native-work";
 /// Build-script emitted file cache beneath `<HOME>/.blaze`.
 const BUILD_SCRIPT_FILES_DIR: &str = "v2/build-script/files";
+/// Immutable on-disk ELF inode records beneath `<HOME>/.blaze` (swept independently of
+/// `v2/build-script/records` so individual records expire past `CACHE_EXPIRY_NS` and evict LRU).
+const ELF_INODE_RECORDS_DIR: &str = "v2/build-script/records/elf-inodes-v1";
 /// Fetched dependency source records beneath `<HOME>/.blaze`.
 const SOURCES_DIR: &str = "v2/sources";
 /// Compiled Wasmtime proc-macro module cache beneath `<HOME>/.blaze`.
@@ -680,6 +683,7 @@ pub(crate) const NATIVE_WORK_MAX_BYTES: u64 = 2 << 30;
 pub(crate) const RUN_RECORDS_MAX_BYTES: u64 = 2 << 30;
 pub(crate) const SOURCES_MAX_BYTES: u64 = 2 << 30;
 pub(crate) const PROC_MACRO_MAX_BYTES: u64 = 1 << 30;
+pub(crate) const ELF_INODE_RECORDS_MAX_BYTES: u64 = 16 << 20;
 /// Stale age threshold (24 hours) for non-PID scratch directories under `~/.blaze/t/`.
 pub(crate) const SCRATCH_STALE_NS: u64 = 24 * 3600 * 1_000_000_000;
 /// Low-watermark percentage (75%) after an auxiliary LRU sweep (matches store GC watermarks).
@@ -1233,6 +1237,14 @@ fn sweep_aux_inner(
         &mut ctx,
     );
     sweep_expired_dirs_shared_cap(cx, blaze_dir, &[SOURCES_DIR], CACHE_EXPIRY_NS, ctx.sources_cap, &mut ctx);
+    sweep_expired_dirs_shared_cap(
+        cx,
+        blaze_dir,
+        &[ELF_INODE_RECORDS_DIR],
+        CACHE_EXPIRY_NS,
+        ELF_INODE_RECORDS_MAX_BYTES,
+        &mut ctx,
+    );
     for dir in CACHE_EXPIRY_DIRS {
         if ctx.exhausted() {
             break;
@@ -2017,5 +2029,44 @@ mod unified_gc_tests {
         assert_eq!(planted.files, 2, "planted bug control must delete both live-PID scratch dirs");
         assert!(home.dir().stat(&cx, &Path::new("t/bd-1001-0").expect("p")).expect("s").is_none());
         assert!(home.dir().stat(&cx, &Path::new("t/work-1001-1").expect("p")).expect("s").is_none());
+    }
+
+    #[test]
+    fn gc_sweeps_elf_inode_records_on_expiry_and_lru_cap() {
+        assert_eq!(super::ELF_INODE_RECORDS_MAX_BYTES, 16 << 20);
+        let io = Io::simulated(SimWorld::new(91, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("root cx");
+        let fs = io.need_fs().expect("fs");
+        let clock = io.need_clock().expect("clock");
+        let home = Home::of(&cx, &fs, Some("/h")).expect("home");
+        let dir = super::ELF_INODE_RECORDS_DIR;
+        let put = |name: &str, bytes: &[u8]| {
+            let rel = std::format!("{dir}/{name}");
+            home.dir()
+                .publish(&cx, &Path::new(&rel).expect("path"), Content::bytes(bytes), Durable::No)
+                .expect("publish");
+        };
+        put("old-rec", &[1u8; 200]);
+        clock.sleep(&cx, Duration::from_millis(50)).expect("sleep 1");
+        put("mid-rec", &[2u8; 200]);
+        clock.sleep(&cx, Duration::from_millis(50)).expect("sleep 2");
+        put("new-rec", &[3u8; 200]);
+
+        let now_ns = clock.wall().as_ns();
+        let probe = FixedPids(&[]);
+
+        // Direct LRU cap check on `elf-inodes-v1` (cap 400B -> 75% low watermark 300B -> evicts oldest 2).
+        let mut lru_ctx = super::AuxSweepCtx::new(now_ns, AuxLimits::DEFAULT, SOURCES_MAX_BYTES, PROC_MACRO_MAX_BYTES, false, AuxSweepPlant::None);
+        super::sweep_expired_dirs_shared_cap(&cx, home.dir(), &[dir], CACHE_EXPIRY_NS, 400, &mut lru_ctx);
+        assert_eq!(lru_ctx.summary.files, 2, "oldest 2 elf-inodes-v1 records must evict under cap");
+        assert!(home.dir().stat(&cx, &Path::new(&std::format!("{dir}/old-rec")).expect("p")).expect("s").is_none());
+        assert!(home.dir().stat(&cx, &Path::new(&std::format!("{dir}/mid-rec")).expect("p")).expect("s").is_none());
+        assert!(home.dir().stat(&cx, &Path::new(&std::format!("{dir}/new-rec")).expect("p")).expect("s").is_some());
+
+        // Past 14d (`CACHE_EXPIRY_NS`), full `sweep_aux_with` expires the remaining `elf-inodes-v1` record.
+        let after_14d = now_ns.saturating_add(CACHE_EXPIRY_NS).saturating_add(1_000_000_000);
+        let expired = sweep_aux_with(&cx, home.dir(), after_14d, &probe, false, AuxSweepPlant::None);
+        assert!(expired.files >= 1, "remaining expired elf-inodes-v1 record must be swept");
+        assert!(home.dir().stat(&cx, &Path::new(&std::format!("{dir}/new-rec")).expect("p")).expect("s").is_none());
     }
 }

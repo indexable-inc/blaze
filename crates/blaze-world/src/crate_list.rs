@@ -11,7 +11,7 @@
 //! this machine (rules 25, 71). Nothing of a crate's TEXT is here: a fact of a root file is read
 //! from that file's outline record by whoever needs it.
 //!
-//! THE PLANNERS' FACTS (version 6, engine.md item 2: under a standing graph no world is made and
+//! THE PLANNERS' FACTS (version 6, end-state.md D157: under a standing graph no world is made and
 //! no graph decoded): what the names, scripts and units stages plan from, which the world alone
 //! does not know, its maker's answers ([`ListFacts`]): each row's `test` cfg and whether its
 //! records are public (the lock's checksum), each build-script module (placement, subject, the

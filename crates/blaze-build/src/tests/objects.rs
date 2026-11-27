@@ -16,6 +16,7 @@ use crate::vtable::{MethodDispatch, ObjectMethod, ObjectSuper, ObjectTrait};
 use crate::{Abi, Adts, Built, Intrinsic, Subst};
 
 mod boxed_slice;
+mod deref_dyn;
 mod nested_dyn_tail;
 mod nested_unsize;
 mod rust_call;

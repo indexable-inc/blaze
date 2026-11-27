@@ -334,6 +334,7 @@ pub struct HermeticClangProbe {
     io: bstd::io::Io,
     shelf_dir_cap: bstd::fs::Dir<bstd::fs::ReadWrite>,
     work_base_dir: bstd::fs::Dir<bstd::fs::ReadWrite>,
+    elf_record_dir: Option<bstd::fs::Dir<bstd::fs::ReadWrite>>,
     work_rel: SharedStr,
     work_root: SharedStr,
     deadline: Duration,
@@ -373,24 +374,27 @@ impl HermeticClangProbe {
         clang_path: &str,
         alloc: Alloc<'a>,
     ) -> Result<ContentId, AString<'a>> {
-        Self::strategy_id_for_clang_inner(None, cx, host, clang_path, alloc)
+        Self::strategy_id_for_clang_inner(None, None, cx, host, clang_path, alloc)
     }
 
     /// Same as [`Self::strategy_id_for_clang`], reusing a caller-owned
-    /// [`bstd::procs::hermetic::RootReader`] so cancelled/stalled reads never allocate or leak a
-    /// fresh async driver per probe.
+    /// [`bstd::procs::hermetic::RootReader`] and an optional caller-owned
+    /// `bstd::fs::Dir<ReadWrite>` for immutable write-once on-disk ELF inode records (Rule 51:
+    /// zero process-memory cache; relies on the kernel page cache).
     pub fn strategy_id_for_clang_with<'a>(
         reader: &bstd::procs::hermetic::RootReader,
+        record_dir: Option<&bstd::fs::Dir<bstd::fs::ReadWrite>>,
         cx: &bstd::cx::Cx,
         host: &str,
         clang_path: &str,
         alloc: Alloc<'a>,
     ) -> Result<ContentId, AString<'a>> {
-        Self::strategy_id_for_clang_inner(Some(reader), cx, host, clang_path, alloc)
+        Self::strategy_id_for_clang_inner(Some(reader), record_dir, cx, host, clang_path, alloc)
     }
 
     fn strategy_id_for_clang_inner<'a>(
         reader: Option<&bstd::procs::hermetic::RootReader>,
+        record_dir: Option<&bstd::fs::Dir<bstd::fs::ReadWrite>>,
         cx: &bstd::cx::Cx,
         host: &str,
         clang_path: &str,
@@ -399,15 +403,22 @@ impl HermeticClangProbe {
         let base = Self::strategy_id();
         let prog = shelf_pins::shelf_program(CLANG_JSON, host, "clang-23")
             .map_err(|e| own_fmt(format_args!("{e}"), alloc))?;
-        let mut h = blaze_ids::Hasher::new("blaze-build-script c-probe runtime closure 2");
+        let mut h = blaze_ids::Hasher::new("blaze-build-script c-probe runtime closure 3");
         h.id(&base)
             .part(host.as_bytes())
             .part(prog.shelf_path.as_bytes())
             .part(&prog.sha256);
         let engaged = match reader {
-            Some(r) => bstd::procs::hermetic::feed_nix_runtime_closure_with(r, cx, clang_path, alloc, &mut |chunk| {
-                h.update(chunk);
-            }),
+            Some(r) => bstd::procs::hermetic::feed_nix_runtime_closure_with(
+                r,
+                record_dir,
+                cx,
+                clang_path,
+                alloc,
+                &mut |chunk| {
+                    h.update(chunk);
+                },
+            ),
             None => bstd::procs::hermetic::feed_nix_runtime_closure(cx, clang_path, alloc, &mut |chunk| {
                 h.update(chunk);
             }),
@@ -429,23 +440,26 @@ impl HermeticClangProbe {
         host: &str,
         alloc: Alloc<'a>,
     ) -> Result<Option<ContentId>, AString<'a>> {
-        Self::strategy_id_for_home_inner(None, cx, home, host, alloc)
+        Self::strategy_id_for_home_inner(None, None, cx, home, host, alloc)
     }
 
     /// Same as [`Self::strategy_id_for_home`], reusing a caller-owned
-    /// [`bstd::procs::hermetic::RootReader`].
+    /// [`bstd::procs::hermetic::RootReader`] and an optional caller-owned on-disk ELF inode
+    /// record directory.
     pub fn strategy_id_for_home_with<'a>(
         reader: &bstd::procs::hermetic::RootReader,
+        record_dir: Option<&bstd::fs::Dir<bstd::fs::ReadWrite>>,
         cx: &bstd::cx::Cx,
         home: &str,
         host: &str,
         alloc: Alloc<'a>,
     ) -> Result<Option<ContentId>, AString<'a>> {
-        Self::strategy_id_for_home_inner(Some(reader), cx, home, host, alloc)
+        Self::strategy_id_for_home_inner(Some(reader), record_dir, cx, home, host, alloc)
     }
 
     fn strategy_id_for_home_inner<'a>(
         reader: Option<&bstd::procs::hermetic::RootReader>,
+        record_dir: Option<&bstd::fs::Dir<bstd::fs::ReadWrite>>,
         cx: &bstd::cx::Cx,
         home: &str,
         host: &str,
@@ -465,7 +479,7 @@ impl HermeticClangProbe {
         let Some(path_str) = clang_path.to_str() else {
             return Err(own_str("c-probe clang shelf path is not UTF-8", alloc));
         };
-        Self::strategy_id_for_clang_inner(reader, cx, host, path_str, alloc).map(Some)
+        Self::strategy_id_for_clang_inner(reader, record_dir, cx, host, path_str, alloc).map(Some)
     }
 
     /// Opens [`HermeticClangProbe`] for `host` using already-open deadline-aware directory
@@ -473,6 +487,7 @@ impl HermeticClangProbe {
     /// Performs zero synchronous `std::fs` calls and never opens a `NativeWorld` outside a context:
     /// both work-directory creation and `clang-23` inode verification run lazily under the probe
     /// deadline on the first cache miss.
+    #[expect(clippy::too_many_arguments, reason = "command-edge capability bundle passed explicitly without ambient globals")]
     pub fn open_from_shelf<'a>(
         home: &str,
         host: &str,
@@ -480,6 +495,7 @@ impl HermeticClangProbe {
         io: bstd::io::Io,
         shelf_dir_cap: bstd::fs::Dir<bstd::fs::ReadWrite>,
         work_base_dir: bstd::fs::Dir<bstd::fs::ReadWrite>,
+        elf_record_dir: Option<bstd::fs::Dir<bstd::fs::ReadWrite>>,
         work_rel: &str,
         work_root: PathBuf,
         alloc: Alloc<'a>,
@@ -509,6 +525,7 @@ impl HermeticClangProbe {
             io,
             shelf_dir_cap,
             work_base_dir,
+            elf_record_dir,
             work_rel: OwnString::from_str_in(work_rel, SharedAlloc::global()),
             work_root: work_str,
             deadline: PROBE_DEADLINE,
@@ -525,10 +542,12 @@ impl HermeticClangProbe {
     /// Opens [`HermeticClangProbe`] directly from an explicit shelf folder and pre-opened
     /// directory capabilities (for differential tests), performing zero synchronous `std::fs`
     /// calls at setup.
+    #[expect(clippy::too_many_arguments, reason = "explicit capability bundle for differential tests")]
     pub fn from_shelf_dir<'a>(
         io: bstd::io::Io,
         shelf_dir_cap: bstd::fs::Dir<bstd::fs::ReadWrite>,
         work_base_dir: bstd::fs::Dir<bstd::fs::ReadWrite>,
+        elf_record_dir: Option<bstd::fs::Dir<bstd::fs::ReadWrite>>,
         work_rel: &str,
         shelf_dir: &Path,
         host: &str,
@@ -560,6 +579,7 @@ impl HermeticClangProbe {
             io,
             shelf_dir_cap,
             work_base_dir,
+            elf_record_dir,
             work_rel: OwnString::from_str_in(work_rel, SharedAlloc::global()),
             work_root: work_str,
             deadline: PROBE_DEADLINE,
@@ -725,6 +745,9 @@ pub fn open_command_c_probes<'a>(
             return CProbeSetting::Unavailable(OwnArc::from_str_in("invalid c-probe shelf path", shared));
         };
         let shelf_dir_cap = blaze_v2.subdir(&shelf_sub);
+        let elf_record_dir = bstd::path::Path::new(bstd::procs::hermetic::ELF_INODE_RECORD_SUBDIR)
+            .ok()
+            .map(|p| blaze_v2.subdir(&p));
         let work_rel = own_fmt(format_args!("{}/c-probes", crate::native_setting::NATIVE_WORK_DIR), alloc);
         let work_root = Path::new(home).join(crate::native_setting::NATIVE_WORK_DIR).join("c-probes");
         let (hermetic, clang_sha256) = match HermeticClangProbe::open_from_shelf(
@@ -734,6 +757,7 @@ pub fn open_command_c_probes<'a>(
             io,
             shelf_dir_cap,
             home_root,
+            elf_record_dir,
             work_rel.as_str(),
             work_root,
             alloc,
@@ -920,7 +944,14 @@ impl HermeticClangProbe {
 
     fn live_strategy_id<'a>(&self, cx: &bstd::cx::Cx, alloc: Alloc<'a>) -> Result<ContentId, AString<'a>> {
         let reader = self.shared_root_reader(cx, alloc)?;
-        Self::strategy_id_for_clang_with(&reader, cx, self.host.as_str(), self.clang_path.as_str(), alloc)
+        Self::strategy_id_for_clang_with(
+            &reader,
+            self.elf_record_dir.as_ref(),
+            cx,
+            self.host.as_str(),
+            self.clang_path.as_str(),
+            alloc,
+        )
     }
 }
 
@@ -1423,10 +1454,13 @@ mod tests {
         let work = work_parent.join(&work_name);
         let (_, shelf_cap) = crate::record::native_world(&shelf).expect("shelf world");
         let (work_io, work_parent_cap) = crate::record::native_world(&work_parent).expect("work world");
+        let elf_rec_rel = bstd::path::Path::new(&format!("{work_name}/elf-inodes-v1")).expect("elf rec rel");
+        let elf_rec_cap = work_parent_cap.subdir(&elf_rec_rel);
         let answerer = HermeticClangProbe::from_shelf_dir(
             work_io,
             shelf_cap,
             work_parent_cap,
+            Some(elf_rec_cap),
             &work_name,
             &shelf,
             host,
@@ -1992,6 +2026,7 @@ mod tests {
                 io: tmp_io.clone(),
                 shelf_dir_cap: tmp_dir.clone(),
                 work_base_dir: tmp_dir.clone(),
+                elf_record_dir: None,
                 work_rel: OwnString::new_in(super::SharedAlloc::global()),
                 work_root: OwnString::from_str_in(&std::env::temp_dir().to_string_lossy(), super::SharedAlloc::global()),
                 deadline: super::Duration::from_millis(25),
@@ -3192,5 +3227,666 @@ mod tests {
         )
         .expect_err("fact_reply_matches_with_probes must also propagate identity failures");
         assert!(match_err.as_str().contains("simulated nix runtime closure timeout"), "unexpected error: {match_err}");
+    }
+
+    /// Proves that immutable write-once on-disk ELF inode records (Rule 51: zero process-memory
+    /// cache, relying on the kernel page cache):
+    /// 1. Produce 100% bit-for-bit identical closure streams & `strategy_id` on cold (`None`),
+    ///    first-write, and warm-read with a FRESH `RootReader` (proving zero process-local state).
+    /// 2. Safely detect and recover from corrupted, truncated, or oversized on-disk record files.
+    /// 3. Immediately invalidate on same-size in-place mutation, size-changing mutation, and atomic
+    ///    rename replacement of a dependency shared library.
+    /// 4. Scale cleanly across 32 concurrent threads with identical digests.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn elf_inode_records_match_cold_hash_invalidate_on_mutation_and_scale_concurrently() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let rec_root = std::env::temp_dir().join(format!("blaze-cprobe-elfrec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&rec_root);
+        std::fs::create_dir_all(&rec_root).expect("create rec_root");
+        let (io, rec_root_cap) = crate::record::native_world(&rec_root).expect("rec native world");
+        let rec_rel = bstd::path::Path::new(bstd::procs::hermetic::ELF_INODE_RECORD_SUBDIR).expect("rec rel");
+        let rec_dir = rec_root_cap.subdir(&rec_rel);
+        let cx = io.cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME).expect("cx");
+
+        // 1. Real ELF binary (prefer unpacked clang-23 shelf binary if present, else current test exe).
+        let host = if cfg!(target_arch = "aarch64") {
+            "aarch64-unknown-linux-gnu"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        };
+        let mut target_exe = std::env::current_exe().expect("current_exe");
+        let mut is_clang = false;
+        if let Ok(home) = std::env::var("HOME")
+            && let Ok(pin) = clang_pin(CLANG_JSON, host)
+        {
+            let pin_hex = super::hex_bytes(&pin.sha256, alloc);
+            let candidate = Path::new(&home)
+                .join(crate::native_setting::SHELF_DIR)
+                .join(pin_hex.as_str())
+                .join("bin/clang-23");
+            if candidate.is_file() {
+                target_exe = candidate;
+                is_clang = true;
+            }
+        }
+        let target_str = target_exe.to_str().expect("utf8 target exe");
+
+        let mut cold_bytes = std::vec::Vec::new();
+        let cold_t0 = std::time::Instant::now();
+        let cold_ok = bstd::procs::hermetic::feed_nix_runtime_closure(&cx, target_str, alloc, &mut |chunk| {
+            cold_bytes.extend_from_slice(chunk);
+        })
+        .expect("cold closure walk");
+        let cold_elapsed = cold_t0.elapsed();
+        assert!(cold_ok, "expected ELF runtime closure for {target_str}");
+
+        let reader1 = bstd::procs::hermetic::RootReader::new(&cx).expect("root reader 1");
+        let mut first_bytes = std::vec::Vec::new();
+        let first_t0 = std::time::Instant::now();
+        let first_ok = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+            &reader1,
+            Some(&rec_dir),
+            &cx,
+            target_str,
+            alloc,
+            &mut |chunk| {
+                first_bytes.extend_from_slice(chunk);
+            },
+        )
+        .expect("first on-disk record write walk");
+        let first_elapsed = first_t0.elapsed();
+        assert!(first_ok);
+        assert_eq!(cold_bytes, first_bytes, "cold walk and first on-disk record write must feed identical bytes");
+
+        // Verify immutable on-disk records were written into `elf-inodes-v1`.
+        let on_disk_dir = rec_root.join(bstd::procs::hermetic::ELF_INODE_RECORD_SUBDIR);
+        let written_files: std::vec::Vec<_> = std::fs::read_dir(&on_disk_dir)
+            .expect("read elf-inodes-v1 dir")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+        assert!(
+            written_files.len() >= 2,
+            "expected >= 2 persisted ELF inode records on disk, found {}",
+            written_files.len()
+        );
+        for f in &written_files {
+            let meta = std::fs::metadata(f).expect("record metadata");
+            assert!(
+                meta.len() <= bstd::procs::hermetic::MAX_INODE_RECORD_BYTES as u64,
+                "record {} exceeds MAX_INODE_RECORD_BYTES",
+                f.display()
+            );
+        }
+
+        // Warm walk using a BRAND NEW RootReader (proves zero process-memory state is needed!).
+        let reader2 = bstd::procs::hermetic::RootReader::new(&cx).expect("fresh root reader 2");
+        let mut warm_bytes = std::vec::Vec::new();
+        let warm_t0 = std::time::Instant::now();
+        let warm_ok = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+            &reader2,
+            Some(&rec_dir),
+            &cx,
+            target_str,
+            alloc,
+            &mut |chunk| {
+                warm_bytes.extend_from_slice(chunk);
+            },
+        )
+        .expect("warm page-cache walk");
+        let warm_elapsed = warm_t0.elapsed();
+        assert!(warm_ok);
+        assert_eq!(cold_bytes, warm_bytes, "warm page-cache hit must be 100% bit-for-bit identical to cold miss");
+
+        let cold_sid = HermeticClangProbe::strategy_id_for_clang(&cx, host, target_str, alloc).expect("cold sid");
+        let warm_sid = HermeticClangProbe::strategy_id_for_clang_with(
+            &reader2,
+            Some(&rec_dir),
+            &cx,
+            host,
+            target_str,
+            alloc,
+        )
+        .expect("warm sid");
+        assert_eq!(cold_sid, warm_sid, "strategy_id must be bit-for-bit identical on cold miss vs warm hit");
+
+        // Corrupt on-disk records (bit flip, truncation, oversized) MUST fail loudly with typed
+        // EBADMSG (`code: 74`) instead of silently falling back to live hashing (AGENTS.md Rule 3).
+        let orig0 = std::fs::read(&written_files[0]).expect("read record 0");
+        let mut corrupted = orig0.clone();
+        let mid = corrupted.len() / 2;
+        corrupted[mid] ^= 0xff;
+        std::fs::write(&written_files[0], &corrupted).expect("corrupt record 0");
+        let err_flip = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+            &reader2,
+            Some(&rec_dir),
+            &cx,
+            target_str,
+            alloc,
+            &mut |_| {},
+        )
+        .expect_err("bit-flipped on-disk record must fail loudly with EBADMSG");
+        assert!(
+            matches!(err_flip, bstd::procs::hermetic::Fault::Host { code: 74, call } if call.contains("corrupt")),
+            "expected EBADMSG corruption error on bit-flip, got {err_flip:?}"
+        );
+        std::fs::write(&written_files[0], b"BZELFIN1").expect("truncate record 0");
+        let err_trunc = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+            &reader2,
+            Some(&rec_dir),
+            &cx,
+            target_str,
+            alloc,
+            &mut |_| {},
+        )
+        .expect_err("truncated on-disk record must fail loudly with EBADMSG");
+        assert!(
+            matches!(err_trunc, bstd::procs::hermetic::Fault::Host { code: 74, call } if call.contains("corrupt")),
+            "expected EBADMSG corruption error on truncation, got {err_trunc:?}"
+        );
+        std::fs::write(
+            &written_files[0],
+            std::vec![0u8; bstd::procs::hermetic::MAX_INODE_RECORD_BYTES + 16],
+        )
+        .expect("oversize record 0");
+        let err_big = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+            &reader2,
+            Some(&rec_dir),
+            &cx,
+            target_str,
+            alloc,
+            &mut |_| {},
+        )
+        .expect_err("oversized on-disk record must fail loudly with EBADMSG");
+        assert!(
+            matches!(err_big, bstd::procs::hermetic::Fault::Host { code: 74, call } if call.contains("corrupt")),
+            "expected EBADMSG corruption error on oversized record, got {err_big:?}"
+        );
+        // Removing the corrupted file cleanly recomputes & republishes the exact same bytes.
+        std::fs::remove_file(&written_files[0]).expect("remove corrupt record 0");
+        let mut recovered_bytes = std::vec::Vec::new();
+        let rec_ok = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+            &reader2,
+            Some(&rec_dir),
+            &cx,
+            target_str,
+            alloc,
+            &mut |chunk| {
+                recovered_bytes.extend_from_slice(chunk);
+            },
+        )
+        .expect("clean recompute after removing corrupt record");
+        assert!(rec_ok);
+        assert_eq!(cold_bytes, recovered_bytes, "recomputed closure after removing corrupt record must match cold");
+
+        // 32-thread concurrent burst over on-disk records via the kernel page cache.
+        let conc_t0 = std::time::Instant::now();
+        let handles: std::vec::Vec<_> = (0..32)
+            .map(|_| {
+                let r = blaze_own::Share::share(&reader2);
+                let io_c = blaze_own::Share::share(&io);
+                let d_c = blaze_own::Share::share(&rec_dir);
+                let path = target_str.to_owned();
+                let want = cold_bytes.clone();
+                std::thread::spawn(move || {
+                    let a = blaze_own::testing::heap().alloc();
+                    let tcx = io_c.cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME).expect("tcx");
+                    for _ in 0..3 {
+                        let mut got = std::vec::Vec::new();
+                        let ok = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+                            &r,
+                            Some(&d_c),
+                            &tcx,
+                            &path,
+                            a,
+                            &mut |c| {
+                                got.extend_from_slice(c);
+                            },
+                        )
+                        .expect("concurrent walk");
+                        assert!(ok);
+                        assert_eq!(got, want);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("concurrent worker");
+        }
+        let conc_elapsed = conc_t0.elapsed();
+        std::println!(
+            "c-probe closure ({}): cold={cold_elapsed:?}, first_disk={first_elapsed:?}, warm_page_cache={warm_elapsed:?}, 32x3_concurrent={conc_elapsed:?}, on_disk_records={}",
+            if is_clang { "clang-23" } else { "test-exe" },
+            written_files.len(),
+        );
+
+        // 2. Synthetic ELF64 executable + temp DT_RUNPATH shared library: prove same-size in-place
+        //    mutation, size-changing mutation, and atomic rename replacement all change the digest.
+        let e_machine: u16 = if cfg!(target_arch = "aarch64") { 183 } else { 62 };
+        let build_so = |payload: &[u8]| -> std::vec::Vec<u8> {
+            let mut buf = std::vec![0u8; 128];
+            buf[0..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+            buf[6] = 1;
+            buf[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
+            buf[18..20].copy_from_slice(&e_machine.to_le_bytes());
+            buf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+            buf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+            buf[56..58].copy_from_slice(&1u16.to_le_bytes()); // e_phnum = 1 (PT_LOAD)
+            buf[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
+            buf[72..80].copy_from_slice(&0u64.to_le_bytes()); // p_offset
+            buf[80..88].copy_from_slice(&0u64.to_le_bytes()); // p_vaddr
+            buf[96..104].copy_from_slice(&(128u64 + payload.len() as u64).to_le_bytes()); // p_filesz
+            buf.extend_from_slice(payload);
+            buf
+        };
+        let host_interp: &[u8] = if cfg!(target_arch = "aarch64") {
+            b"/lib/ld-linux-aarch64.so.1"
+        } else {
+            b"/lib64/ld-linux-x86-64.so.2"
+        };
+        let tmp_dir = std::env::temp_dir().join(format!("blaze-cprobe-mut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).expect("create tmp_dir");
+        let tmp_dir_bytes = tmp_dir.to_str().expect("utf8 tmp_dir").as_bytes();
+
+        let build_exe = || -> std::vec::Vec<u8> {
+            let interp_off = 256u64;
+            let dyn_off = 512u64;
+            let strtab_off = 768u64;
+            let soname = b"libblaze_mut_test.so\0";
+            let mut strtab = std::vec::Vec::new();
+            strtab.push(0); // off 0: ""
+            let needed_str_off = strtab.len() as u64;
+            strtab.extend_from_slice(soname);
+            let runpath_str_off = strtab.len() as u64;
+            strtab.extend_from_slice(tmp_dir_bytes);
+            strtab.push(0);
+
+            let total_size = (strtab_off as usize) + strtab.len() + 16;
+            let mut buf = std::vec![0u8; total_size];
+            buf[0..6].copy_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1]);
+            buf[6] = 1;
+            buf[16..18].copy_from_slice(&3u16.to_le_bytes());
+            buf[18..20].copy_from_slice(&e_machine.to_le_bytes());
+            buf[32..40].copy_from_slice(&64u64.to_le_bytes());
+            buf[54..56].copy_from_slice(&56u16.to_le_bytes());
+            buf[56..58].copy_from_slice(&3u16.to_le_bytes()); // PT_LOAD, PT_INTERP, PT_DYNAMIC
+            let p0 = 64;
+            buf[p0..p0 + 4].copy_from_slice(&1u32.to_le_bytes());
+            buf[p0 + 8..p0 + 16].copy_from_slice(&0u64.to_le_bytes());
+            buf[p0 + 16..p0 + 24].copy_from_slice(&0u64.to_le_bytes());
+            buf[p0 + 32..p0 + 40].copy_from_slice(&(total_size as u64).to_le_bytes());
+            let p1 = 64 + 56;
+            buf[p1..p1 + 4].copy_from_slice(&3u32.to_le_bytes());
+            buf[p1 + 8..p1 + 16].copy_from_slice(&interp_off.to_le_bytes());
+            buf[p1 + 32..p1 + 40].copy_from_slice(&((host_interp.len() + 1) as u64).to_le_bytes());
+            let p2 = 64 + 112;
+            buf[p2..p2 + 4].copy_from_slice(&2u32.to_le_bytes());
+            buf[p2 + 8..p2 + 16].copy_from_slice(&dyn_off.to_le_bytes());
+            buf[p2 + 32..p2 + 40].copy_from_slice(&64u64.to_le_bytes());
+            let ioff = interp_off as usize;
+            buf[ioff..ioff + host_interp.len()].copy_from_slice(host_interp);
+            buf[ioff + host_interp.len()] = 0;
+            let doff = dyn_off as usize;
+            let entries: [(u64, u64); 4] = [
+                (5, strtab_off),
+                (1, needed_str_off),
+                (29, runpath_str_off),
+                (0, 0),
+            ];
+            for (i, (tag, val)) in entries.into_iter().enumerate() {
+                buf[doff + i * 16..doff + i * 16 + 8].copy_from_slice(&tag.to_le_bytes());
+                buf[doff + i * 16 + 8..doff + i * 16 + 16].copy_from_slice(&val.to_le_bytes());
+            }
+            let soff = strtab_off as usize;
+            buf[soff..soff + strtab.len()].copy_from_slice(&strtab);
+            buf
+        };
+
+        let exe_path = tmp_dir.join("probe_bin");
+        let so_path = tmp_dir.join("libblaze_mut_test.so");
+        std::fs::write(&exe_path, build_exe()).expect("write probe_bin");
+        std::fs::write(&so_path, build_so(b"PAYLOAD_AAAA")).expect("write so A");
+
+        let hash_closure = |r: &bstd::procs::hermetic::RootReader, d: Option<&bstd::fs::Dir<bstd::fs::ReadWrite>>| -> [u8; 32] {
+            let mut h = blaze_sha256::Sha256::new();
+            let ok = bstd::procs::hermetic::feed_nix_runtime_closure_with(
+                r,
+                d,
+                &cx,
+                exe_path.to_str().expect("utf8 exe"),
+                alloc,
+                &mut |chunk| { h.update(chunk); },
+            )
+            .expect("synthetic closure walk");
+            assert!(ok);
+            h.finish()
+        };
+
+        let dig_a = hash_closure(&reader2, Some(&rec_dir));
+        // Same-size in-place write (racy-clean window prevents stale hit!).
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().write(true).open(&so_path).expect("open so in-place");
+            f.write_all(&build_so(b"PAYLOAD_BBBB")).expect("overwrite same-size in-place");
+        }
+        let dig_b = hash_closure(&reader2, Some(&rec_dir));
+        assert_ne!(dig_a, dig_b, "same-size in-place mutation of shared library must invalidate closure digest");
+
+        // Size-changing in-place write.
+        std::fs::write(&so_path, build_so(b"PAYLOAD_CCCCCCCC")).expect("write so C");
+        let dig_c = hash_closure(&reader2, Some(&rec_dir));
+        assert_ne!(dig_b, dig_c, "size-changing mutation of shared library must invalidate closure digest");
+
+        // Atomic rename replacement (new inode).
+        let so_tmp = tmp_dir.join("libblaze_mut_test.so.new");
+        std::fs::write(&so_tmp, build_so(b"PAYLOAD_DDDDDDDD")).expect("write so D");
+        std::fs::rename(&so_tmp, &so_path).expect("atomic rename so");
+        let dig_d = hash_closure(&reader2, Some(&rec_dir));
+        assert_ne!(dig_c, dig_d, "atomic rename replacement of shared library must invalidate closure digest");
+
+        // Fresh cold RootReader without record_dir must agree bit-for-bit with dig_d.
+        let fresh_reader = bstd::procs::hermetic::RootReader::new(&cx).expect("fresh reader");
+        assert_eq!(dig_d, hash_closure(&fresh_reader, None), "cold reader must match on-disk record reader after mutation");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let _ = std::fs::remove_dir_all(&rec_root);
+    }
+
+    /// Real `bstd::test::seeded` (`blaze_core::sim::Sim`) DST driving the ACTUAL production
+    /// `DirInodeRecordIo` publisher across power cuts, write/sync/rename faults, and two racing
+    /// independent peer worlds sharing the simulated disk (AGENTS.md Rules 23, 43 & 51).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn elf_inode_dir_sim_program(
+        io: &bstd::io::Io,
+        plant: bstd::procs::hermetic::InodeRecordPlant,
+    ) -> Result<(), bstd::procs::hermetic::Fault> {
+        use bstd::procs::hermetic::{
+            DirInodeRecordIo, ELF_INODE_RECORD_SUBDIR, Fault, InodeRecord, InodeStamp,
+            lookup_inode_record, publish_inode_record,
+        };
+        const NOW_SEC: i64 = 1_700_000_100;
+        const KEYS: usize = 8;
+        let make_rec = |idx: usize| -> InodeRecord {
+            let st = InodeStamp {
+                dev: 42,
+                ino: 2000 + u64::try_from(idx).unwrap_or(0),
+                mode: 0o100_644,
+                size: 4096 + i64::try_from(idx).unwrap_or(0) * 512,
+                mtime_sec: NOW_SEC - 3600 - i64::try_from(idx).unwrap_or(0) * 10,
+                mtime_nsec: 123_456,
+                ctime_sec: NOW_SEC - 3600 - i64::try_from(idx).unwrap_or(0) * 10,
+                ctime_nsec: 123_456,
+            };
+            let shared = super::SharedAlloc::global();
+            let mut interp = blaze_own::Vec::new_in(shared);
+            interp.extend_from_slice(b"/lib/ld-linux-aarch64.so.1");
+            let mut runpath = blaze_own::Vec::new_in(shared);
+            runpath.extend_from_slice(b"/nix/store/demo-clang-closure/lib");
+            // Span > 1 KiB (multiple simulated disk sectors) so unsynced/direct writes tear on power cuts.
+            let mut needed = blaze_own::Vec::new_in(shared);
+            for j in 0..48usize {
+                let s = std::format!("libprobe_sim_{idx}_{j:02}.so.1\0");
+                needed.extend_from_slice(s.as_bytes());
+            }
+            let tag = u8::try_from((idx * 19 + 3) & 0xff).unwrap_or(1);
+            InodeRecord {
+                stamp: st,
+                digest: Some((u64::try_from(st.size).unwrap_or(0), [tag; 32])),
+                e_machine: 183,
+                has_dyn: true,
+                interp,
+                runpath: Some(runpath),
+                rpath: None,
+                needed_blob: needed,
+            }
+        };
+
+        let root = io.need_fs().map_err(|_| Fault::Host { call: "sim fs", code: 5 })?.root();
+        let sub_path = bstd::path::Path::new(ELF_INODE_RECORD_SUBDIR)
+            .map_err(|_| Fault::Host { call: "sub path", code: 22 })?;
+        let rec_dir = root.subdir(&sub_path);
+        let cx = io
+            .cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME)
+            .map_err(|_| Fault::Host { call: "sim cx", code: 110 })?;
+        let dir_io = DirInodeRecordIo::new(&rec_dir, &cx);
+
+        // Post-crash oracle: after ANY power cut or I/O failure, every key must read back either
+        // Absent (`Ok(None)`) or the exact oracle record — NEVER a torn/corrupt record (`code: 74`).
+        for k in 0..KEYS {
+            let want = make_rec(k);
+            match lookup_inode_record(&dir_io, want.stamp, NOW_SEC, true, plant) {
+                Ok(None) => {}
+                Ok(Some(got)) => {
+                    assert_eq!(got, want, "elf inode sim oracle: key {k} survived crash with mismatched record");
+                }
+                Err(Fault::Host { code: 74, call }) => {
+                    panic!("elf inode sim oracle: key {k} left torn/corrupt after power cut ({call})");
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        // Two independent racing peer worlds sharing the simulated disk.
+        let peer_a = io
+            .peer_world_for_test(Some(0x1111_aaaa_0000_0001))
+            .ok_or(Fault::Host { call: "peer a", code: 5 })?;
+        let peer_b = io
+            .peer_world_for_test(Some(0x2222_bbbb_0000_0002))
+            .ok_or(Fault::Host { call: "peer b", code: 5 })?;
+        let cx_a = peer_a
+            .cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME)
+            .map_err(|_| Fault::Host { call: "cx a", code: 110 })?;
+        let cx_b = peer_b
+            .cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME)
+            .map_err(|_| Fault::Host { call: "cx b", code: 110 })?;
+        let dir_a = peer_a.need_fs().map_err(|_| Fault::Host { call: "fs a", code: 5 })?.root().subdir(&sub_path);
+        let dir_b = peer_b.need_fs().map_err(|_| Fault::Host { call: "fs b", code: 5 })?.root().subdir(&sub_path);
+        let io_a = DirInodeRecordIo::new(&dir_a, &cx_a);
+        let io_b = DirInodeRecordIo::new(&dir_b, &cx_b);
+
+        for k in 0..KEYS {
+            let want = make_rec(k);
+            if k % 2 == 0 {
+                let _ = publish_inode_record(&io_a, &want, NOW_SEC, plant)?;
+                let _ = publish_inode_record(&io_b, &want, NOW_SEC, plant)?;
+            } else {
+                let _ = publish_inode_record(&io_b, &want, NOW_SEC, plant)?;
+                let _ = publish_inode_record(&io_a, &want, NOW_SEC, plant)?;
+            }
+            let got_a = lookup_inode_record(&io_a, want.stamp, NOW_SEC, true, plant)?;
+            let got_b = lookup_inode_record(&io_b, want.stamp, NOW_SEC, true, plant)?;
+            assert_eq!(got_a.as_ref(), Some(&want), "elf inode sim oracle: peer A mismatch on key {k}");
+            assert_eq!(got_b.as_ref(), Some(&want), "elf inode sim oracle: peer B mismatch on key {k}");
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn elf_inode_record_dst_survives_sim_crashes_and_concurrent_peers() {
+        match bstd::test::seeded(
+            "blaze-proc-macro",
+            module_path!(),
+            "elf_inode_dir_crash",
+            bstd::test::Seeds::DEFAULT.from(0, 200),
+            bstd::test::Given::NOTHING,
+            |_: &bstd::cx::Cx, io: bstd::io::Io| {
+                elf_inode_dir_sim_program(&io, bstd::procs::hermetic::InodeRecordPlant::None)
+                    .map_err(|e| std::format!("{e:?}"))
+            },
+        ) {
+            Ok(passed) => {
+                assert!(passed.counts.cuts > 50, "too few power cuts: {:?}", passed.counts);
+                assert!(passed.counts.failures > 50, "too few failures: {:?}", passed.counts);
+            }
+            Err(failed) => panic!("{failed}"),
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn elf_inode_record_dst_catches_all_four_planted_bugs() {
+        use bstd::procs::hermetic::{
+            DirInodeRecordIo, ELF_INODE_RECORD_SUBDIR, Fault, InodeRecord, InodeRecordPlant,
+            InodeStamp, MAX_INODE_RECORD_BYTES, RecordCorrupt, decode_record_with_parser,
+            encode_record, encode_record_with_parser, lookup_inode_record, publish_inode_record,
+            publish_inode_record_capped,
+        };
+
+        // 1. Planted DirectWrite caught by `bstd::test::seeded` power cuts on production DirInodeRecordIo!
+        match bstd::test::seeded(
+            "blaze-proc-macro",
+            module_path!(),
+            "elf_inode_dir_direct_write_plant",
+            bstd::test::Seeds::DEFAULT.from(0, 100),
+            bstd::test::Given::NOTHING,
+            |_: &bstd::cx::Cx, io: bstd::io::Io| {
+                elf_inode_dir_sim_program(&io, InodeRecordPlant::DirectWrite)
+                    .map_err(|e| std::format!("{e:?}"))
+            },
+        ) {
+            Ok(passed) => panic!("planted DirectWrite was not caught in {} starts", passed.starts),
+            Err(failed) => {
+                let said = std::format!("{failed}");
+                assert!(
+                    said.contains("elf inode sim oracle"),
+                    "planted DirectWrite failed for unexpected reason: {said}"
+                );
+            }
+        }
+
+        // 2. Parser-identity rollover + production `DirInodeRecordIo` under `Io::sim` +
+        //    `Sim::short_reads` + bounded cap + corruption reporting + 3 remaining planted bugs.
+        let run_validation = |plant: InodeRecordPlant| -> Result<(), std::string::String> {
+            const NOW_SEC: i64 = 1_700_000_100;
+            let make_rec = |idx: u64| -> InodeRecord {
+                let st = InodeStamp {
+                    dev: 9,
+                    ino: 5000 + idx,
+                    mode: 0o100_644,
+                    size: 4096 + i64::try_from(idx).unwrap_or(0) * 64,
+                    mtime_sec: NOW_SEC - 3600,
+                    mtime_nsec: 1,
+                    ctime_sec: NOW_SEC - 3600,
+                    ctime_nsec: 1,
+                };
+                let shared = super::SharedAlloc::global();
+                let mut interp = blaze_own::Vec::new_in(shared);
+                interp.extend_from_slice(b"/lib/ld-linux-aarch64.so.1");
+                let mut needed = blaze_own::Vec::new_in(shared);
+                for j in 0..32u32 {
+                    let s = std::format!("libsim_{idx}_{j:02}.so.1\0");
+                    needed.extend_from_slice(s.as_bytes());
+                }
+                InodeRecord {
+                    stamp: st,
+                    digest: Some((u64::try_from(st.size).unwrap_or(0), [u8::try_from(idx & 0xff).unwrap_or(1); 32])),
+                    e_machine: 183,
+                    has_dyn: true,
+                    interp,
+                    runpath: None,
+                    rpath: None,
+                    needed_blob: needed,
+                }
+            };
+
+            let rec0 = make_rec(1);
+            let rec1 = make_rec(2);
+            // Parser-identity rollover check.
+            assert_ne!(
+                rec0.stamp.record_key_hex_with_parser(&[0xaa; 32]),
+                rec0.stamp.record_key_hex_with_parser(&[0xbb; 32]),
+                "parser identity change must roll inode record key"
+            );
+            let enc_a = encode_record_with_parser(&rec0, &[0xaa; 32]).ok_or("enc_a")?;
+            if plant != InodeRecordPlant::SkipChecksum {
+                assert_eq!(
+                    decode_record_with_parser(enc_a.as_slice(), rec0.stamp, &[0xbb; 32], plant),
+                    Err(RecordCorrupt::BadChecksum)
+                );
+            }
+
+            let io = bstd::io::Io::sim(77);
+            let root = io.need_fs().map_err(|_| "no fs")?.root();
+            let sub = bstd::path::Path::new(ELF_INODE_RECORD_SUBDIR).map_err(|_| "sub")?;
+            let rec_dir = root.subdir(&sub);
+            let cx = io.cx(super::Duration::from_secs(30), bstd::mem::TASK_FRAME).map_err(|_| "cx")?;
+            let dir_io = DirInodeRecordIo::new(&rec_dir, &cx);
+
+            publish_inode_record(&dir_io, &rec0, NOW_SEC, plant).map_err(|e| std::format!("pub0: {e:?}"))?;
+            let short_dir = blaze_core::FileName::new(ELF_INODE_RECORD_SUBDIR).ok_or("short dir")?;
+            io.with_sim(|sim| sim.short_reads(short_dir, 1)).ok_or("expected sim")?;
+            let got = lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant)
+                .map_err(|e| std::format!("short read: {e:?}"))?;
+            if got.as_ref() != Some(&rec0) {
+                return Err("short-read oracle: truncated record under Sim::short_reads".into());
+            }
+
+            let k0_buf = rec0.stamp.record_key_hex();
+            let k0_str = std::str::from_utf8(&k0_buf).unwrap();
+            let k0 = bstd::path::Path::new(k0_str).map_err(|_| "k0")?;
+
+            // Bit-flip -> EBADMSG (catches SkipChecksum).
+            let mut flipped = encode_record(&rec0).ok_or("enc0")?.as_slice().to_vec();
+            flipped[85] ^= 0x5a;
+            rec_dir.publish(&cx, &k0, bstd::fs::Content::bytes(&flipped), bstd::fs::Durable::No).map_err(|_| "flip")?;
+            match lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant) {
+                Err(Fault::Host { code: 74, .. }) => {}
+                other => return Err(std::format!("corrupt checksum oracle: got {other:?}")),
+            }
+
+            // Wrong-stamp valid record under k0 -> EBADMSG (catches SkipStampCheck).
+            let raw1 = encode_record(&rec1).ok_or("enc1")?;
+            rec_dir.publish(&cx, &k0, bstd::fs::Content::bytes(raw1.as_slice()), bstd::fs::Durable::No).map_err(|_| "swap")?;
+            match lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant) {
+                Err(Fault::Host { code: 74, .. }) => {}
+                other => return Err(std::format!("wrong-stamp oracle: got {other:?}")),
+            }
+
+            // Oversized -> EBADMSG.
+            rec_dir
+                .publish(&cx, &k0, bstd::fs::Content::bytes(&std::vec![0u8; MAX_INODE_RECORD_BYTES + 1]), bstd::fs::Durable::No)
+                .map_err(|_| "big")?;
+            match lookup_inode_record(&dir_io, rec0.stamp, NOW_SEC, true, plant) {
+                Err(Fault::Host { code: 74, .. }) => {}
+                other => return Err(std::format!("oversized oracle: got {other:?}")),
+            }
+            rec_dir.remove(&cx, &k0, bstd::fs::Durable::No).map_err(|_| "rm")?;
+
+            // Racy-clean guard (catches SkipRacyClean).
+            let racy_st = InodeStamp { ctime_sec: NOW_SEC - 1, ..rec1.stamp };
+            let racy_rec = InodeRecord { stamp: racy_st, ..make_rec(3) };
+            if publish_inode_record(&dir_io, &racy_rec, NOW_SEC, plant).map_err(|e| std::format!("racy: {e:?}"))? {
+                return Err("racy-clean oracle: published record within 2s window".into());
+            }
+
+            // Bounded cap eviction (`max_entries = 4` across 10 distinct stamps).
+            let clock = io.need_clock().map_err(|_| "clock")?;
+            for i in 10..20u64 {
+                let rec = make_rec(i);
+                let _ = publish_inode_record_capped(&dir_io, &rec, NOW_SEC, 4, plant)
+                    .map_err(|e| std::format!("cap {i}: {e:?}"))?;
+                let _ = clock.sleep(&cx, super::Duration::from_millis(5));
+            }
+            let entries = rec_dir.own_entries(&cx).map_err(|_| "entries")?;
+            let count = (0..entries.len())
+                .filter(|&i| entries.kind(i) == bstd::fs::EntryKind::File && !entries.name(i).ends_with(".bstd-new"))
+                .count();
+            if count > 4 {
+                return Err(std::format!("bounded cap oracle: expected <= 4 files, found {count}"));
+            }
+            Ok(())
+        };
+
+        run_validation(InodeRecordPlant::None).expect("clean validation sim must pass");
+        let e_ck = run_validation(InodeRecordPlant::SkipChecksum).expect_err("must catch SkipChecksum");
+        assert!(e_ck.contains("corrupt checksum oracle"), "unexpected: {e_ck}");
+        let e_rc = run_validation(InodeRecordPlant::SkipRacyClean).expect_err("must catch SkipRacyClean");
+        assert!(e_rc.contains("racy-clean oracle"), "unexpected: {e_rc}");
+        let e_st = run_validation(InodeRecordPlant::SkipStampCheck).expect_err("must catch SkipStampCheck");
+        assert!(e_st.contains("wrong-stamp oracle"), "unexpected: {e_st}");
     }
 }

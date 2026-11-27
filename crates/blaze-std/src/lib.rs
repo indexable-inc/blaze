@@ -152,7 +152,7 @@
 )]
 #![register_tool(blaze)]
 
-// Contracts (ledger V3; docs/v2/plan/design/contracts.md): bstd's functions state what they
+// Contracts (docs/v2/plan/design/contracts.md): bstd's functions state what they
 // promise as nightly's `#[core::contracts::ensures(..)]`, which rustc and blaze both read (blaze
 // lowers it as the pinned nightly does: contracts.md, part 0), and which both run under
 // `cfg(contract_checks)` (`-Zcontract-checks`). The native `requires`/`ensures` clauses

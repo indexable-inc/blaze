@@ -187,45 +187,157 @@ pub fn module_of_native_files(store: &Path, name: &str, version: &str, features:
     Ok(None)
 }
 
+/// Failure allocating the scratch frame needed to walk a build script's dependency closure
+/// (`script_deps_digest`). Never falls back to a weaker digest (rule 3, rule 21).
+#[derive(Debug)]
+pub struct DepsDigestError(pub bstd::mem::MemError);
+
+impl core::fmt::Display for DepsDigestError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "allocating build-script dependency-digest scratch frame: {:?}", self.0)
+    }
+}
+
+impl core::error::Error for DepsDigestError {}
+
 /// Canonical SHA-256 digest of a build-script unit's transitive `UnitKind::Lib | UnitKind::ProcMacro`
-/// build-dependencies (rule 21: covers version, kind, sorted features, and source pin — registry
-/// checksum, git commit, or path package `files_digest`). Returns `None` when the build script
-/// has no build-dependencies.
+/// build-dependencies (resolved against `wasm_graph` when present, so every WASI-side unified
+/// dependency feature enters the module key) AND the script package's transitive `Cargo.lock`
+/// dependency closure (rule 21: covers version, kind, sorted features, and source pin — registry
+/// checksum, git commit, or path package `files_digest`). Returns `Ok(None)` when the build
+/// script has no build-dependencies and no lock dependencies.
 pub fn script_deps_digest(
     graph: &UnitGraph<'_>,
+    wasm_graph: Option<&UnitGraph<'_>>,
     lock: &blaze_manifest::lock::Lock<'_>,
     script: UnitId,
-    mut path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<String>,
-) -> Option<String> {
-    use blaze_manifest::lock::{Checksum, LockSource};
-    let mut visited = vec![false; graph.units.len()];
-    let mut stack: Vec<UnitId> = Vec::new();
-    let Some(root) = graph.units.get(script.index()) else { return None };
-    visited[script.index()] = true;
-    for dep in root.deps.iter() {
-        let idx = dep.unit.index();
-        if let Some(du) = graph.units.get(idx)
-            && matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro)
-            && !visited[idx]
-        {
-            visited[idx] = true;
-            stack.push(dep.unit);
+    mut path_files: impl FnMut(blaze_manifest::lock::LockId) -> Option<String>,) -> Result<Option<String>, DepsDigestError> {
+    use blaze_manifest::lock::{Checksum, LockId, LockSource};
+    use core::fmt::Write as _;
+    let Some(root) = graph.units.get(script.index()) else { return Ok(None) };
+    let frame = bstd::mem::Frame::new(bstd::mem::Tag::Other).map_err(DepsDigestError)?;
+
+    // When the resolved `wasm64-blaze-wasip1` host-unit graph is available, walk its closure for
+    // `script` so every WASI-only dependency and workspace-unified WASI feature set enters the
+    // digest (rule 21).
+    let (active_graph, active_root) = match wasm_graph {
+        Some(wg) => {
+            let want_side = graph.host_unit_side(script);
+            let mut want_feats = blaze_own::Vec::with_capacity_in(root.features.len(), &frame);
+            for f in root.features.iter() {
+                want_feats.push(f.as_str());
+            }
+            want_feats.sort_unstable();
+            want_feats.dedup();
+            let feats_match = |u: &Unit<'_>| -> bool {
+                let mut got = blaze_own::Vec::with_capacity_in(u.features.len(), &frame);
+                for f in u.features.iter() {
+                    got.push(f.as_str());
+                }
+                got.sort_unstable();
+                got.dedup();
+                got.as_slice() == want_feats.as_slice()
+            };
+            let found = wg
+                .units
+                .iter()
+                .enumerate()
+                .find_map(|(i, u)| {
+                    let uid = UnitId(u32::try_from(i).ok()?);
+                    (u.package == root.package
+                        && u.kind == UnitKind::BuildScript
+                        && wg.host_unit_side(uid) == want_side
+                        && feats_match(u))
+                    .then_some(uid)
+                })
+                .or_else(|| {
+                    wg.units.iter().enumerate().find_map(|(i, u)| {
+                        let uid = UnitId(u32::try_from(i).ok()?);
+                        (u.package == root.package && u.kind == UnitKind::BuildScript && feats_match(u)).then_some(uid)
+                    })
+                })
+                .or_else(|| {
+                    wg.units.iter().enumerate().find_map(|(i, u)| {
+                        let uid = UnitId(u32::try_from(i).ok()?);
+                        (u.package == root.package && u.kind == UnitKind::BuildScript).then_some(uid)
+                    })
+                });
+            match found {
+                Some(uid) => (wg, uid),
+                None => (graph, script),
+            }
         }
+        None => (graph, script),
+    };
+
+    let mut visited = blaze_own::Vec::with_capacity_in(active_graph.units.len(), &frame);
+    visited.resize(active_graph.units.len(), false);
+    let mut stack = blaze_own::Vec::<UnitId, _>::new_in(&frame);
+    if let Some(slot) = visited.get_mut(active_root.index()) {
+        *slot = true;
     }
-    let mut lines: Vec<String> = Vec::new();
-    while let Some(uid) = stack.pop() {
-        let u = &graph.units[uid.index()];
-        for dep in u.deps.iter() {
+    if let Some(active_root_unit) = active_graph.units.get(active_root.index()) {
+        for dep in active_root_unit.deps.iter() {
             let idx = dep.unit.index();
-            if let Some(du) = graph.units.get(idx)
-                && matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro)
-                && !visited[idx]
+            if active_graph
+                .units
+                .get(idx)
+                .is_some_and(|du| matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro))
+                && let Some(slot) = visited.get_mut(idx)
+                && !*slot
             {
-                visited[idx] = true;
+                *slot = true;
                 stack.push(dep.unit);
             }
         }
-        let mut feats: Vec<&str> = u.features.iter().map(|f| f.as_str()).collect();
+    }
+
+    let mut lock_seen = blaze_own::Vec::with_capacity_in(lock.packages.len(), &frame);
+    lock_seen.resize(lock.packages.len(), false);
+    let mut lock_stack = blaze_own::Vec::<LockId, _>::new_in(&frame);
+    // Seed the lock walk from the build-script package's own `Cargo.lock` dependencies so
+    // direct target-specific WASI-only build-dependencies (absent from the host `UnitGraph`,
+    // whether alongside host-active deps or as the script's only build-dep) still enter the
+    // module cache key (rule 21). Mark `root.package` seen so the script package itself is
+    // covered by `files_digest`, not hashed as one of its own dependencies.
+    if let Some(slot) = lock_seen.get_mut(root.package.index()) {
+        *slot = true;
+    }
+    for &child in lock.package(root.package).deps.iter() {
+        if let Some(slot) = lock_seen.get_mut(child.index())
+            && !*slot
+        {
+            *slot = true;
+            lock_stack.push(child);
+        }
+    }
+
+    let mut lines = blaze_own::Vec::<blaze_own::String<&bstd::mem::Frame>, _>::new_in(&frame);
+    while let Some(uid) = stack.pop() {
+        let Some(u) = active_graph.units.get(uid.index()) else { continue };
+        for dep in u.deps.iter() {
+            let idx = dep.unit.index();
+            if active_graph
+                .units
+                .get(idx)
+                .is_some_and(|du| matches!(du.kind, UnitKind::Lib | UnitKind::ProcMacro))
+                && let Some(slot) = visited.get_mut(idx)
+                && !*slot
+            {
+                *slot = true;
+                stack.push(dep.unit);
+            }
+        }
+        if let Some(slot) = lock_seen.get_mut(u.package.index())
+            && !*slot
+        {
+            *slot = true;
+            lock_stack.push(u.package);
+        }
+        let mut feats = blaze_own::Vec::with_capacity_in(u.features.len(), &frame);
+        for f in u.features.iter() {
+            feats.push(f.as_str());
+        }
         feats.sort_unstable();
         feats.dedup();
         let kind_word = match u.kind {
@@ -233,23 +345,88 @@ pub fn script_deps_digest(
             _ => "lib",
         };
         let pkg = lock.package(u.package);
-        let pin = match (&pkg.checksum, &pkg.source) {
-            (Checksum::Sha256(sum), _) => format!("checksum:{}", sum.as_str()),
+        let mut row = blaze_own::String::new_in(&frame);
+        let _ = write!(row, "{} {} {} ", u.name.as_str(), u.version.as_str(), kind_word);
+        for (i, f) in feats.iter().enumerate() {
+            if i > 0 {
+                row.push(',');
+            }
+            row.push_str(f);
+        }
+        row.push(' ');
+        match (&pkg.checksum, &pkg.source) {
+            (Checksum::Sha256(sum), _) => {
+                let _ = write!(row, "checksum:{} {}", sum.as_str(), pkg.source_text.as_str());
+            }
             (Checksum::Absent, LockSource::Path) => match path_files(u.package) {
-                Some(hex) => format!("files:{hex}"),
-                None => String::from("path:unpinned"),
+                Some(hex) => {
+                    let _ = write!(row, "files:{hex}");
+                }
+                None => row.push_str("path:unpinned"),
             },
-            (Checksum::Absent, LockSource::Git { commit, .. }) => format!("git:{}", commit.as_str()),
-            (Checksum::Absent, LockSource::Registry { .. }) => format!("source:{}", pkg.source_text.as_str()),
-        };
-        lines.push(format!("{} {} {} {} {}", u.name.as_str(), u.version.as_str(), kind_word, feats.join(","), pin));
+            (Checksum::Absent, LockSource::Git { commit, .. }) => {
+                let _ = write!(row, "git:{} {}", commit.as_str(), pkg.source_text.as_str());
+            }
+            (Checksum::Absent, LockSource::Registry { .. }) => {
+                let _ = write!(row, "source:{}", pkg.source_text.as_str());
+            }
+        }
+        lines.push(row);
     }
-    if lines.is_empty() {
-        return None;
+
+    let mut lock_lines = blaze_own::Vec::<blaze_own::String<&bstd::mem::Frame>, _>::new_in(&frame);
+    while let Some(pkg_id) = lock_stack.pop() {
+        let pkg = lock.package(pkg_id);
+        for &child in pkg.deps.iter() {
+            if let Some(slot) = lock_seen.get_mut(child.index())
+                && !*slot
+            {
+                *slot = true;
+                lock_stack.push(child);
+            }
+        }
+        let mut row = blaze_own::String::new_in(&frame);
+        let _ = write!(row, "lock {} {} ", pkg.name.as_str(), pkg.version);
+        match (&pkg.checksum, &pkg.source) {
+            (Checksum::Sha256(sum), _) => {
+                let _ = write!(row, "checksum:{}", sum.as_str());
+            }
+            (Checksum::Absent, LockSource::Path) => match path_files(pkg_id) {
+                Some(hex) => {
+                    let _ = write!(row, "files:{hex}");
+                }
+                None => row.push_str("path:unpinned"),
+            },
+            (Checksum::Absent, LockSource::Git { commit, .. }) => {
+                let _ = write!(row, "git:{}", commit.as_str());
+            }
+            (Checksum::Absent, LockSource::Registry { .. }) => {
+                let _ = write!(row, "source:{}", pkg.source_text.as_str());
+            }
+        }
+        lock_lines.push(row);
     }
-    lines.sort_unstable();
-    lines.dedup();
-    Some(crate::module::sha256_hex(lines.join("\n").as_bytes()))
+    if lines.is_empty() && lock_lines.is_empty() {
+        return Ok(None);
+    }
+    lines.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    lines.dedup_by(|a, b| a.as_str() == b.as_str());
+    lock_lines.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+    lock_lines.dedup_by(|a, b| a.as_str() == b.as_str());
+    let mut joined = blaze_own::String::new_in(&frame);
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 {
+            joined.push('\n');
+        }
+        joined.push_str(l.as_str());
+    }
+    for l in lock_lines.iter() {
+        if !joined.is_empty() {
+            joined.push('\n');
+        }
+        joined.push_str(l.as_str());
+    }
+    Ok(Some(crate::module::sha256_hex(joined.as_str().as_bytes())))
 }
 
 /// Relative paths under a package directory that contribute to a workspace-member or path
@@ -389,14 +566,34 @@ pub fn records_named(store: &Path, name: &str, version: &str) -> Result<Vec<(Pat
 /// (scripts proc_macro_modules build_scripts.rs `library`), the same digest of the same file.
 const SHIM: &[u8] = include_bytes!("../guest/script_process.rs");
 
+/// Current wasm64 build-script module identity header (`blaze build-script module wasm64 7`):
+/// target-bearing so on-demand `wasm64-blaze-wasip1` self-compiled modules never collide with
+/// `wasm32-wasip1` bootstrap records (`blaze build-script module wasm32 5`) or stale pre-v7
+/// modules. v7 invalidates pre-fix wasm64 modules compiled before `blaze-build` `ScopeEnd` /
+/// `TempScopeEnd` adjusted-repr settling (fat pointers truncated from 16B to 8B before drops).
+pub const WASM_MODULE_HEADER: &str = "blaze build-script module wasm64 7";
+
+/// Current native host build-script module identity header (`blaze build-script module 3`): kept
+/// at v3 so existing Tier-2 native host records remain usable without re-bootstrapping while
+/// still selecting one version cleanly (no `Ambiguous` collisions).
+pub const NATIVE_MODULE_HEADER: &str = "blaze build-script module 3";
+
+/// Native host build-script module identity header written by the native bootstrap builder
+/// (`blaze build-script module native 1`, D69). Accepted by native lookups alongside
+/// [`NATIVE_MODULE_HEADER`] so pre-built Tier-2 native host binaries (`reth-mdbx-sys`,
+/// `sha3-asm`, `libproc`, `librocksdb-sys`, etc.) resolve cleanly without re-bootstrapping.
+pub const NATIVE_BOOTSTRAP_HEADER: &str = "blaze build-script module native 1";
+
 /// The identity line a wasm module must carry to be run by this host: `shim <sha256 hex>`.
 pub fn shim_line() -> String {
     format!("shim {}", crate::module::sha256_hex(SHIM))
 }
 
-/// The record whose identity names `name`, `version`, `features` and, for `host`, `target
-/// <host>`; for `None`, one with no `target` line and this host's [`shim_line`] (a wasm module).
-/// Two such records are a typed refusal, never the first in the listing's order.
+/// The record whose header matches [`NATIVE_MODULE_HEADER`] (for `host: Some`) or
+/// [`WASM_MODULE_HEADER`] (for `host: None`), and whose identity names `name`, `version`,
+/// `features` and, for `host`, `target <host>`; for `None`, one with no `target` line and this
+/// host's [`shim_line`] (a wasm module). Two such records are a typed refusal, never the first in
+/// the listing's order.
 fn module_where(
     store: &Path,
     name: &str,
@@ -410,14 +607,21 @@ fn module_where(
     sorted.sort_unstable();
     let lines = [format!("name {name}"), format!("version {version}"), format!("features {}", sorted.join(","))];
     let target = host.map(|host| format!("target {host}"));
+    let expected_header = if target.is_some() { NATIVE_MODULE_HEADER } else { WASM_MODULE_HEADER };
     let files_line = files.map(|hex| format!("files {hex}"));
     let deps_line = deps.map(|hex| format!("deps {hex}"));
     let shim = shim_line();
     let mut fits = records(store)?.into_iter().filter(|(_, identity)| {
-        // A wasm module answers only with the shim this host speaks to: one built with another
-        // is not this ask's record, so a stale module is a named miss (`NoModule`, whose words
-        // show the differing `shim` line), never a run that misreads a reply, and never a second
-        // record beside its rebuild (`Ambiguous`).
+        // Every build-script record must carry the expected header for its runner (`WASM_MODULE_HEADER`
+        // for wasm, `NATIVE_MODULE_HEADER` or `NATIVE_BOOTSTRAP_HEADER` for native), and a wasm
+        // module must also carry the shim this host speaks to: one built with another header or
+        // shim is not this ask's record, so stale records never match and never collide as `Ambiguous`.
+        let first_line = identity.lines().next();
+        let header_fits = if target.is_some() {
+            first_line == Some(NATIVE_MODULE_HEADER) || first_line == Some(NATIVE_BOOTSTRAP_HEADER)
+        } else {
+            first_line == Some(expected_header)
+        };
         let runner_fits = match &target {
             Some(want) => identity.lines().any(|l| l == want),
             None => !identity.lines().any(|l| l.starts_with("target ")) && identity.lines().any(|l| l == shim),
@@ -430,7 +634,7 @@ fn module_where(
             Some(want) => identity.lines().any(|l| l == want),
             None => !identity.lines().any(|l| l.starts_with("deps ")),
         };
-        runner_fits && files_fits && deps_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
+        header_fits && runner_fits && files_fits && deps_fits && lines.iter().all(|want| identity.lines().any(|l| l == want))
     });
     let Some((first, _)) = fits.next() else { return Ok(None) };
     match fits.next() {
@@ -646,7 +850,9 @@ pub fn outputs_viewing_on<'a>(
     }
     match crate::native_unit::placed_in_store(setting.store, graph, script, setting.mode, setting.host, alloc) {
         Runner::Wasm => {
-            let viewed = dep_mount::view(&tree, producers, deps, alloc).map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
+            let file_area = setting.store.join(blaze_build_script::outputs::FILE_AREA);
+            let viewed = dep_mount::view_with_area(&tree, Some(&file_area), producers, deps, alloc)
+                .map_err(|why| UnitScriptError::DepView { package: package(unit), why })?;
             let seen: Vec<DepMetadata<'_>> =
                 deps.iter().zip(viewed.values.iter()).map(|(dep, value)| DepMetadata { links: dep.links, key: dep.key, value: value.as_str() }).collect();
             let prepared = prepare_viewing_on(runtime, setting, graph, script, side_cfg, tree, root, &seen, viewed.views, alloc)?;
@@ -940,5 +1146,429 @@ mod tests {
         // A cycle is refused, never run in some order.
         let cycle = [vec![UnitId(3)], vec![UnitId(1)], vec![]];
         assert!(order_after(&items, &cycle).is_err());
+    }
+
+    #[test]
+    fn wasm_lookup_requires_current_module_header_and_ignores_stale_v3() {
+        let store = std::env::temp_dir().join(format!("blaze-script-unit-header-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let shim = super::shim_line();
+        let v3_dir = store.join("build-script/modules/stale-v3");
+        std::fs::create_dir_all(&v3_dir).expect("create v3 dir");
+        std::fs::write(
+            v3_dir.join("identity"),
+            format!("blaze build-script module 3\nname demo\nversion 0.1.0\nfeatures \n{shim}\nbuilder blaze-wasm64\n"),
+        )
+        .expect("write v3 identity");
+
+        // Stale v3, v4, v5, and wasm32-bootstrap v5 modules are not returned (forces recompile with current semantics).
+        for (dir_name, stale_header) in [
+            ("stale-v3", "blaze build-script module 3"),
+            ("stale-v4", "blaze build-script module 4"),
+            ("stale-v5", "blaze build-script module 5"),
+            ("stale-wasm32-v5", "blaze build-script module wasm32 5"),
+            ("stale-wasm64-v6", "blaze build-script module wasm64 6"),
+        ] {
+            let stale_dir = store.join(format!("build-script/modules/{dir_name}"));
+            std::fs::create_dir_all(&stale_dir).expect("create stale dir");
+            std::fs::write(
+                stale_dir.join("identity"),
+                format!("{stale_header}\nname demo\nversion 0.1.0\nfeatures \n{shim}\nbuilder blaze-wasm64\n"),
+            )
+            .expect("write stale identity");
+        }
+        let miss = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup stale");
+        assert_eq!(miss, None, "stale/wasm32 modules must not match WASM_MODULE_HEADER ({})", super::WASM_MODULE_HEADER);
+
+        // Current wasm64 v7 module placed alongside stale/wasm32 modules matches uniquely (never Ambiguous).
+        let fresh_dir = store.join("build-script/modules/fresh-wasm64-v7");
+        std::fs::create_dir_all(&fresh_dir).expect("create fresh dir");
+        std::fs::write(
+            fresh_dir.join("identity"),
+            format!("{}\nname demo\nversion 0.1.0\nfeatures \n{shim}\nbuilder blaze-wasm64\n", super::WASM_MODULE_HEADER),
+        )
+        .expect("write fresh identity");
+        let hit = super::module_of_files_and_deps(&store, "demo", "0.1.0", &[], None, None).expect("lookup v7");
+        assert_eq!(hit, Some(fresh_dir));
+
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn native_lookup_keeps_v3_usable_and_ignores_non_v3() {
+        let store = std::env::temp_dir().join(format!("blaze-script-unit-native-header-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let host = "aarch64-apple-darwin";
+        let other_dir = store.join("build-script/modules/non-v3-native");
+        std::fs::create_dir_all(&other_dir).expect("create non-v3 native dir");
+        std::fs::write(
+            other_dir.join("identity"),
+            format!("blaze build-script module 2\nname libproc\nversion 0.14.11\nfeatures \ntarget {host}\nbuilder bootstrap\n"),
+        )
+        .expect("write non-v3 native identity");
+
+        // Non-v3 native record is ignored.
+        let miss = super::module_of_native(&store, "libproc", "0.14.11", &[], host).expect("lookup non-v3 native");
+        assert_eq!(miss, None, "non-v3 native module must not match NATIVE_MODULE_HEADER ({})", super::NATIVE_MODULE_HEADER);
+
+        // Existing v3 native record coexisting beside non-v3 matches uniquely (no re-bootstrap, never Ambiguous).
+        let v3_dir = store.join("build-script/modules/existing-native-v3");
+        std::fs::create_dir_all(&v3_dir).expect("create native v3 dir");
+        std::fs::write(
+            v3_dir.join("identity"),
+            format!("{}\nname libproc\nversion 0.14.11\nfeatures \ntarget {host}\nbuilder bootstrap\n", super::NATIVE_MODULE_HEADER),
+        )
+        .expect("write native v3 identity");
+        let hit = super::module_of_native(&store, "libproc", "0.14.11", &[], host).expect("lookup native v3");
+        assert_eq!(hit, Some(v3_dir));
+
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn native_lookup_accepts_native_1_bootstrap_header() {
+        let store = std::env::temp_dir().join(format!("blaze-script-unit-native1-header-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store);
+        let host = "aarch64-apple-darwin";
+        let native1_dir = store.join("build-script/modules/existing-native-1");
+        std::fs::create_dir_all(&native1_dir).expect("create native 1 dir");
+        std::fs::write(
+            native1_dir.join("identity"),
+            format!("{}\nname reth-mdbx-sys\nversion 2.11.0\nfeatures \ntarget {host}\n", super::NATIVE_BOOTSTRAP_HEADER),
+        )
+        .expect("write native 1 identity");
+        let hit = super::module_of_native_files(&store, "reth-mdbx-sys", "2.11.0", &[], host, None).expect("lookup native 1");
+        assert_eq!(hit, Some(native1_dir));
+
+        let _ = std::fs::remove_dir_all(&store);
+    }
+
+    #[test]
+    fn script_deps_digest_covers_wasm64_only_lock_closure_deps() {
+        use blaze_manifest::lock::{Lock, LockId};
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let mk_lock = |errno_sum: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"rustix\"]\n\n\
+                 [[package]]\nname = \"rustix\"\nversion = \"1.1.4\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\ndependencies = [\"errno\"]\n\n\
+                 [[package]]\nname = \"errno\"\nversion = \"0.3.14\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{errno_sum}\"\n"
+            )
+        };
+        let lock_a_text = mk_lock("1111111111111111111111111111111111111111111111111111111111111111");
+        let lock_b_text = mk_lock("2222222222222222222222222222222222222222222222222222222222222222");
+        let lock_a = Lock::read(lock_a_text.as_bytes(), alloc).expect("lock_a");
+        let lock_b = Lock::read(lock_b_text.as_bytes(), alloc).expect("lock_b");
+
+        // Host Linux UnitGraph has app(BuildScript) -> rustix(Lib), with NO `errno` unit!
+        let mut bs_deps = OwnVec::new_in(alloc);
+        bs_deps.push(UnitDep { name: Text::from_str_in("rustix", alloc), unit: UnitId(1) });
+        let mut units = OwnVec::new_in(alloc);
+        units.push(Unit {
+            package: LockId(0),
+            name: Text::from_str_in("app", alloc),
+            version: Text::from_str_in("0.1.0", alloc),
+            kind: UnitKind::BuildScript,
+            for_host: true,
+            edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+            crate_name: Text::from_str_in("build_script_build", alloc),
+            root: Text::from_str_in("build.rs", alloc),
+            features: OwnVec::new_in(alloc),
+            cfg: OwnVec::new_in(alloc),
+            deps: bs_deps,
+            build_script: None,
+            links: None,
+        });
+        units.push(Unit {
+            package: LockId(1),
+            name: Text::from_str_in("rustix", alloc),
+            version: Text::from_str_in("1.1.4", alloc),
+            kind: UnitKind::Lib,
+            for_host: true,
+            edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+            crate_name: Text::from_str_in("rustix", alloc),
+            root: Text::from_str_in("src/lib.rs", alloc),
+            features: OwnVec::new_in(alloc),
+            cfg: OwnVec::new_in(alloc),
+            deps: OwnVec::new_in(alloc),
+            build_script: None,
+            links: None,
+        });
+        let graph = UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+
+        let d1 = super::script_deps_digest(&graph, None, &lock_a, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("digest a");
+        let d2 = super::script_deps_digest(&graph, None, &lock_b, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("digest b");
+        assert_ne!(d1, d2, "script_deps_digest must change when a wasm64-only transitive locked dep (`errno`) changes");
+    }
+
+    #[test]
+    fn script_deps_digest_covers_direct_wasi_only_build_dep_even_when_host_deps_empty() {
+        use blaze_manifest::lock::{Lock, LockId};
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Case A: `app`'s ONLY build-dep is a WASI-only dep `wasi_only`, so host `Unit.deps` is EMPTY!
+        let mk_lock_only = |wasi_sum: &str| {
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"wasi_only\"]\n\n\
+                 [[package]]\nname = \"wasi_only\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"{wasi_sum}\"\n"
+            )
+        };
+        let lock_only_a_txt = mk_lock_only("1111111111111111111111111111111111111111111111111111111111111111");
+        let lock_only_b_txt = mk_lock_only("2222222222222222222222222222222222222222222222222222222222222222");
+        let lock_only_a = Lock::read(lock_only_a_txt.as_bytes(), alloc).expect("lock_only_a");
+        let lock_only_b = Lock::read(lock_only_b_txt.as_bytes(), alloc).expect("lock_only_b");
+
+        let mut units_empty = OwnVec::new_in(alloc);
+        units_empty.push(Unit {
+            package: LockId(0),
+            name: Text::from_str_in("app", alloc),
+            version: Text::from_str_in("0.1.0", alloc),
+            kind: UnitKind::BuildScript,
+            for_host: true,
+            edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+            crate_name: Text::from_str_in("build_script_build", alloc),
+            root: Text::from_str_in("build.rs", alloc),
+            features: OwnVec::new_in(alloc),
+            cfg: OwnVec::new_in(alloc),
+            deps: OwnVec::new_in(alloc),
+            build_script: None,
+            links: None,
+        });
+        let graph_empty = UnitGraph { units: units_empty, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+        let only_a = super::script_deps_digest(&graph_empty, None, &lock_only_a, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("must return Some even when host Unit.deps is empty");
+        let only_b = super::script_deps_digest(&graph_empty, None, &lock_only_b, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("must return Some for lock b");
+        assert_ne!(only_a, only_b, "digest must change when the sole WASI-only direct build-dep changes");
+
+        // Control: when `app` truly has NO lock deps at all, still returns `Ok(None)`.
+        let lock_none = Lock::read(b"version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n", alloc).expect("lock_none");
+        assert_eq!(super::script_deps_digest(&graph_empty, None, &lock_none, UnitId(0), |_| None).expect("frame ok"), None);
+
+        // Case B: `app` has a host-active build-dep `host_dep` AND a sibling WASI-only direct path build-dep `wasi_path`.
+        let lock_sib_txt = "version = 4\n\n\
+            [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"host_dep\", \"wasi_path\"]\n\n\
+            [[package]]\nname = \"host_dep\"\nversion = \"0.1.0\"\n\n\
+            [[package]]\nname = \"wasi_path\"\nversion = \"0.1.0\"\n";
+        let lock_sib = Lock::read(lock_sib_txt.as_bytes(), alloc).expect("lock_sib");
+        let mut bs_deps = OwnVec::new_in(alloc);
+        bs_deps.push(UnitDep { name: Text::from_str_in("host_dep", alloc), unit: UnitId(1) });
+        let mut units_sib = OwnVec::new_in(alloc);
+        units_sib.push(Unit {
+            package: LockId(0),
+            name: Text::from_str_in("app", alloc),
+            version: Text::from_str_in("0.1.0", alloc),
+            kind: UnitKind::BuildScript,
+            for_host: true,
+            edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+            crate_name: Text::from_str_in("build_script_build", alloc),
+            root: Text::from_str_in("build.rs", alloc),
+            features: OwnVec::new_in(alloc),
+            cfg: OwnVec::new_in(alloc),
+            deps: bs_deps,
+            build_script: None,
+            links: None,
+        });
+        units_sib.push(Unit {
+            package: LockId(1),
+            name: Text::from_str_in("host_dep", alloc),
+            version: Text::from_str_in("0.1.0", alloc),
+            kind: UnitKind::Lib,
+            for_host: true,
+            edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+            crate_name: Text::from_str_in("host_dep", alloc),
+            root: Text::from_str_in("src/lib.rs", alloc),
+            features: OwnVec::new_in(alloc),
+            cfg: OwnVec::new_in(alloc),
+            deps: OwnVec::new_in(alloc),
+            build_script: None,
+            links: None,
+        });
+        let graph_sib = UnitGraph { units: units_sib, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) };
+        let sib_a = super::script_deps_digest(&graph_sib, None, &lock_sib, UnitId(0), |id| match id {
+            LockId(1) => Some(String::from("host-v1")),
+            LockId(2) => Some(String::from("wasi-v1")),
+            _ => None,
+        })
+        .expect("frame ok")
+        .expect("sib a");
+        let sib_b = super::script_deps_digest(&graph_sib, None, &lock_sib, UnitId(0), |id| match id {
+            LockId(1) => Some(String::from("host-v1")),
+            LockId(2) => Some(String::from("wasi-v2")),
+            _ => None,
+        })
+        .expect("frame ok")
+        .expect("sib b");
+        assert_ne!(sib_a, sib_b, "digest must change when a sibling direct WASI-only path build-dep changes");
+
+        // Case C: when `wasm_graph` toggles a WASI-only dep feature (e.g. unified from a sibling),
+        // `script_deps_digest` changes even when host `UnitGraph` and `Cargo.lock` are identical!
+        let mk_wg = |wasi_feats: &[&str]| {
+            let mut wg_bs_deps = OwnVec::new_in(alloc);
+            wg_bs_deps.push(UnitDep { name: Text::from_str_in("wasi_only", alloc), unit: UnitId(1) });
+            let mut wf = OwnVec::new_in(alloc);
+            for f in wasi_feats {
+                wf.push(Text::from_str_in(f, alloc));
+            }
+            let mut u = OwnVec::new_in(alloc);
+            u.push(Unit {
+                package: LockId(0),
+                name: Text::from_str_in("app", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::BuildScript,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("build_script_build", alloc),
+                root: Text::from_str_in("build.rs", alloc),
+                features: OwnVec::new_in(alloc),
+                cfg: OwnVec::new_in(alloc),
+                deps: wg_bs_deps,
+                build_script: None,
+                links: None,
+            });
+            u.push(Unit {
+                package: LockId(1),
+                name: Text::from_str_in("wasi_only", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::Lib,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("wasi_only", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: wf,
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            UnitGraph { units: u, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) }
+        };
+        let wg_on = mk_wg(&["extra_wasi"]);
+        let wg_off = mk_wg(&[]);
+        let feat_on = super::script_deps_digest(&graph_empty, Some(&wg_on), &lock_only_a, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("feat_on");
+        let feat_off = super::script_deps_digest(&graph_empty, Some(&wg_off), &lock_only_a, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("feat_off");
+        assert_ne!(feat_on, feat_off, "script_deps_digest must change when a WASI-only dep feature toggles in wasm_graph");
+    }
+
+    #[test]
+    fn script_deps_digest_distinguishes_same_name_version_different_source_feature_swap() {
+        use blaze_manifest::lock::{Lock, LockId};
+        use blaze_own::Vec as OwnVec;
+        use blaze_unit_graph::{Resolver, Text, Unit, UnitDep, UnitGraph, UnitKind};
+        let alloc = blaze_own::testing::heap().alloc();
+
+        let lock_text = "version = 4\n\n\
+            [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \"dup 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)\",\n \"dup 0.1.0 (git+https://example.com/dup.git#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)\",\n]\n\n\
+            [[package]]\nname = \"dup\"\nversion = \"0.1.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\nchecksum = \"1111111111111111111111111111111111111111111111111111111111111111\"\n\n\
+            [[package]]\nname = \"dup\"\nversion = \"0.1.0\"\nsource = \"git+https://example.com/dup.git#aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n";
+        let lock = Lock::read(lock_text.as_bytes(), alloc).expect("lock");
+
+        let mk_graph = |feats_reg: &[&str], feats_git: &[&str]| {
+            let mut bs_deps = OwnVec::new_in(alloc);
+            bs_deps.push(UnitDep { name: Text::from_str_in("dup_reg", alloc), unit: UnitId(1) });
+            bs_deps.push(UnitDep { name: Text::from_str_in("dup_git", alloc), unit: UnitId(2) });
+            let mk_feats = |fs: &[&str]| {
+                let mut v = OwnVec::new_in(alloc);
+                for f in fs {
+                    v.push(Text::from_str_in(f, alloc));
+                }
+                v
+            };
+            let mut units = OwnVec::new_in(alloc);
+            units.push(Unit {
+                package: LockId(0),
+                name: Text::from_str_in("app", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::BuildScript,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("build_script_build", alloc),
+                root: Text::from_str_in("build.rs", alloc),
+                features: OwnVec::new_in(alloc),
+                cfg: OwnVec::new_in(alloc),
+                deps: bs_deps,
+                build_script: None,
+                links: None,
+            });
+            units.push(Unit {
+                package: LockId(1),
+                name: Text::from_str_in("dup", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::Lib,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("dup", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: mk_feats(feats_reg),
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            units.push(Unit {
+                package: LockId(2),
+                name: Text::from_str_in("dup", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::Lib,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("dup", alloc),
+                root: Text::from_str_in("src/lib.rs", alloc),
+                features: mk_feats(feats_git),
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) }
+        };
+
+        let host_empty = {
+            let mut units = OwnVec::new_in(alloc);
+            units.push(Unit {
+                package: LockId(0),
+                name: Text::from_str_in("app", alloc),
+                version: Text::from_str_in("0.1.0", alloc),
+                kind: UnitKind::BuildScript,
+                for_host: true,
+                edition: edition::PackageEdition::of_manifest("2021").expect("2021"),
+                crate_name: Text::from_str_in("build_script_build", alloc),
+                root: Text::from_str_in("build.rs", alloc),
+                features: OwnVec::new_in(alloc),
+                cfg: OwnVec::new_in(alloc),
+                deps: OwnVec::new_in(alloc),
+                build_script: None,
+                links: None,
+            });
+            UnitGraph { units, resolver: Resolver::V2, meta: OwnVec::new_in(alloc), left_out: OwnVec::new_in(alloc) }
+        };
+        let wg_ab = mk_graph(&["feat_a"], &["feat_b"]);
+        let wg_ba = mk_graph(&["feat_b"], &["feat_a"]);
+        let d_ab = super::script_deps_digest(&host_empty, Some(&wg_ab), &lock, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("d_ab");
+        let d_ba = super::script_deps_digest(&host_empty, Some(&wg_ba), &lock, UnitId(0), |_| None)
+            .expect("frame ok")
+            .expect("d_ba");
+        assert_ne!(
+            d_ab, d_ba,
+            "swapping features A and B between two same-name/version packages from different sources must change script_deps_digest"
+        );
     }
 }

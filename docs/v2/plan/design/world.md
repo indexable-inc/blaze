@@ -1,14 +1,15 @@
 ---
 status: plan
-summary: "The world interface, W0: a world is a value (a tree digest), and seven calls (open, patch, read, check, diff, commit, explain) on it, one request and one response a connection, in one versioned schema of deterministic CBOR, the same bytes over a Unix socket or HTTP POST. The schema lives in crates/blaze-world-api, a TypeScript client in tools/world/, golden vectors both test; W1-W3 and the helper fill the calls in behind it."
+summary: "The world interface, W0: a world is a value (a tree digest), and seven calls (open, patch, read, check, diff, commit, explain) on it, one request and one response a connection, in one versioned schema of deterministic CBOR, the same bytes over a Unix socket or HTTP POST. The schema and a TypeScript client are in tools/world/, with golden vectors; the Rust schema crate, which nothing called, was deleted on 2026-11-27; W1-W3 and the helper fill the calls in behind it."
 date: 2026-11-17
 ---
 # The world interface (W0)
 
 An agent edits, checks and commits a program through seven calls on worlds. W0 is the schema and
-a client; nothing answers yet. Rust: `crates/blaze-world-api` (types, encode, decode, the JSON
-rendering, a sans-IO `Session` for one connection). TypeScript: `tools/world/` (`schema.ts`,
-`cbor.ts`, `client.ts`). Golden vectors: `tools/world/vectors.json`, tested by both.
+a client; nothing answers yet. TypeScript: `tools/world/` (`schema.ts`, `cbor.ts`, `client.ts`).
+Golden vectors: `tools/world/vectors.json`. The Rust schema crate (types, encode, decode, the
+JSON rendering, a sans-IO `Session` for one connection) was called by nothing and was deleted on
+2026-11-27; it is in git (`git show 50dac12595:crates/blaze-world-api/src/lib.rs`).
 
 ## Decisions
 
@@ -93,7 +94,7 @@ Record keys:
 
 ## Limits
 
-Checked before allocation, the same on both sides (`Limits::DEFAULT`, `DEFAULT_LIMITS`): a
+Checked before allocation (`DEFAULT_LIMITS` in tools/world/schema.ts): a
 message at most 64 MiB (`too_large`, also refused at a string head that claims more); a text at
 most 16 MiB and a path, name or code at most 4096 bytes (`too_long`); at most 4096 edits (a patch
 or a fix) and 65536 entries of any other list (`too_many`); 16 entries in a map; depth 8

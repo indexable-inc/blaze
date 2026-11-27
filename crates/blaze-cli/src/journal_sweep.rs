@@ -1,5 +1,5 @@
-//! The sweep's change detection from the system's journal of changes (plan row S1, engine.md
-//! D150 item 3): a repeat request costs the changes, not the checkout, with no process alive in
+//! The sweep's change detection from the system's journal of changes (plan row S1, end-state.md
+//! D157): a repeat request costs the changes, not the checkout, with no process alive in
 //! between (rule 70).
 //!
 //! **The rule.** Each request, BEFORE any file of the checkout is read, replays the journal of

@@ -595,6 +595,9 @@ impl<F: Facts> Facts for WithRegions<'_, F> {
     fn deref_impl(&self, adt: ItemKey) -> Option<ItemKey> {
         self.base.deref_impl(adt)
     }
+    fn owner_trait_impl(&self, trait_: ItemKey) -> Option<crate::OwnerTraitImpl> {
+        self.base.owner_trait_impl(trait_)
+    }
     fn is_zero_slot_builtin_assoc(&self, trait_: ItemKey, name: Name) -> bool {
         self.base.is_zero_slot_builtin_assoc(trait_, name)
     }

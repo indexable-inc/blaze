@@ -18,7 +18,7 @@
 //!   every wait span the lock opened is closed.
 //!
 //! The planted bug ([`Plant::HotLock`]) has the turn loop read through the hot lock, as the
-//! daemon's turn loop read `blaze_profile::flight::intern` on 2026-11-05;
+//! daemon's turn loop read the profile recorder's intern table on 2026-11-05;
 //! [`the_oracle_catches_a_hot_lock_on_the_turn_loop`] must find a case it breaks. The fixed
 //! design ([`Plant::None`]) publishes the state through an atomic the turn loop loads, never
 //! touching the lock, and must pass every case.

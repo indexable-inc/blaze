@@ -211,86 +211,7 @@ impl Make for LazyVerifyingMaker<'_, '_> {
     }
 }
 
-/// Bounded inline chain of body-local keys (`LibKey::INNER` set — either the row's tabled item or
-/// local items referenced in its generic arguments) and their same-crate declarer `ItemKey`s
-/// (outermost first), so any `CodePool` worker (or partial-warm serial run) can file local fns
-/// (e.g. `const_eval_select!` -> `is_null::runtime`, or `thread_local!` closures) in O(1).
-pub(crate) const MAX_LOCAL_ENCLOSERS: usize = 8;
-
-#[derive(Clone, Copy)]
-pub(crate) struct LocalEnclosers {
-    pub locals: [ItemKey; MAX_LOCAL_ENCLOSERS],
-    pub locals_len: usize,
-    pub items: [ItemKey; MAX_LOCAL_ENCLOSERS],
-    pub len: usize,
-}
-
-impl Default for LocalEnclosers {
-    fn default() -> Self {
-        Self {
-            locals: [ItemKey(0); MAX_LOCAL_ENCLOSERS],
-            locals_len: 0,
-            items: [ItemKey(0); MAX_LOCAL_ENCLOSERS],
-            len: 0,
-        }
-    }
-}
-
-impl LocalEnclosers {
-    pub(crate) fn locals(&self) -> &[ItemKey] {
-        self.locals.get(..self.locals_len).unwrap_or(&[])
-    }
-
-    pub(crate) fn enclosers(&self) -> &[ItemKey] {
-        self.items.get(..self.len).unwrap_or(&[])
-    }
-}
-
-/// Collects any body-local keys (`LibKey::INNER` set) in `key` or the encoded generic
-/// arguments of `row`, together with their outermost-first same-crate declarer chain from
-/// `Walk::declarer` (fast-path returns empty in ~20 ns when no key is local).
-pub(crate) fn local_enclosers_of(walk: &Walk<'_>, row: usize, key: ItemKey) -> LocalEnclosers {
-    let mut out = LocalEnclosers::default();
-    let mut push_local = |k: ItemKey| {
-        if blaze_ladder::front2::program::lazy::typed::is_local(k)
-            && !out.locals().contains(&k)
-            && let Some(slot) = out.locals.get_mut(out.locals_len)
-        {
-            *slot = k;
-            out.locals_len += 1;
-        }
-    };
-    push_local(key);
-    let name = walk.name(row);
-    if !name.is_empty() {
-        let _ = blaze_ladder::body_ids::each_item(name, |k| push_local(k));
-    }
-    if out.locals_len == 0 {
-        return out;
-    }
-    let mut cur = row;
-    let mut hops = 0usize;
-    while let Some(parent) = walk.declarer(cur) {
-        hops += 1;
-        if hops > MAX_LOCAL_ENCLOSERS * 2 || out.len >= MAX_LOCAL_ENCLOSERS {
-            break;
-        }
-        let tabled = walk.tabled(parent);
-        let prefix = tabled.0 >> 64;
-        if out.locals().iter().any(|l| (l.0 >> 64) == prefix && *l != tabled)
-            && !out.enclosers().contains(&tabled)
-            && let Some(slot) = out.items.get_mut(out.len)
-        {
-            *slot = tabled;
-            out.len += 1;
-        }
-        cur = parent;
-    }
-    if let Some(slice) = out.items.get_mut(..out.len) {
-        slice.reverse();
-    }
-    out
-}
+pub(crate) use blaze_ladder::body_ids::{LocalEnclosers, local_enclosers_of};
 
 /// In-flight pooled build for one `Walk` row currently in `How::Making`.
 struct InFlight {
@@ -379,6 +300,14 @@ pub(crate) struct SuiteCache<'h> {
     verified_closed: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_workspace: Set<([u8; 32], [u8; 32]), FixedState, Alloc<'static>>,
     verified_dirty: bool,
+    /// Non-toolchain CAS keys reached or written via `HomeCodeStore` during this command so
+    /// `TestCache::commit` pins special non-pointer entries (`getter`/`ender`/personality/datums)
+    /// alongside verified `(code_key, content_key)` pairs under `test.<suite_id>`.
+    code_keys: Set<[u8; 32], FixedState, Alloc<'static>>,
+    /// Toolchain-class CAS keys written via `HomeCodeStore` during this command so
+    /// `TestCache::commit` roots them under `tool.<toolchain_id>` (`roots::keep_toolchain`).
+    toolchain_keys: Set<[u8; 32], FixedState, Alloc<'static>>,
+    code_keys_dirty: bool,
     pubs: Map<[u8; 32], CachedPub, BuildKeyHasher, Alloc<'static>>,
     datums: Map<[u8; 32], CachedDatum, BuildKeyHasher, Alloc<'static>>,
     by_record: Map<[u8; 32], CachedRecord, BuildKeyHasher, Alloc<'static>>,
@@ -412,6 +341,9 @@ impl<'h> SuiteCache<'h> {
             verified_closed: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
             verified_workspace: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
             verified_dirty: false,
+            code_keys: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
+            toolchain_keys: Set::new(SetOpts { hasher: FixedState, alloc: tables, capacity: None }),
+            code_keys_dirty: false,
             pubs: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
             datums: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
             by_record: Map::new(MapOpts { hasher: BuildKeyHasher::default(), alloc: tables, capacity: None }),
@@ -441,6 +373,35 @@ impl<'h> SuiteCache<'h> {
 
     pub(crate) fn verified_workspace_pairs(&self) -> impl Iterator<Item = ([u8; 32], [u8; 32])> + '_ {
         self.verified_workspace.iter().copied()
+    }
+
+    pub(crate) fn toolchain(&self) -> blaze_toolchain::ToolchainId {
+        self.builder.toolchain
+    }
+
+    pub(crate) fn record_code_keys(&mut self, reached: &[blaze_cas::Key], toolchain_made: &[blaze_cas::Key]) {
+        for key in reached {
+            if self.code_keys.insert(key.0.0) {
+                self.code_keys_dirty = true;
+            }
+        }
+        for key in toolchain_made {
+            if self.toolchain_keys.insert(key.0.0) {
+                self.code_keys_dirty = true;
+            }
+        }
+    }
+
+    pub(crate) fn code_keys_dirty(&self) -> bool {
+        self.code_keys_dirty
+    }
+
+    pub(crate) fn reached_code_keys(&self) -> impl Iterator<Item = blaze_cas::Key> + '_ {
+        self.code_keys.iter().map(|&raw| blaze_cas::Key(blaze_ids::ContentId(raw)))
+    }
+
+    pub(crate) fn toolchain_code_keys(&self) -> impl Iterator<Item = blaze_cas::Key> + '_ {
+        self.toolchain_keys.iter().map(|&raw| blaze_cas::Key(blaze_ids::ContentId(raw)))
     }
 
     fn record_verified_entry(&mut self, pair: ([u8; 32], [u8; 32]), tabled: ItemKey, name: &[u8], entry: &[u8], ids: &RunIds<'_>) {

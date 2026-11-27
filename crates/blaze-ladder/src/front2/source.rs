@@ -196,6 +196,9 @@ pub trait NamesSource<'n>: Copy {
 
     /// Question 2: the traits method resolution may use in `module`, sorted.
     fn traits_in_scope<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError>;
+    /// The traits exported by `module` for a block's glob import `use module::*;` (without
+    /// `module`'s crate's implicit standard prelude).
+    fn traits_exported<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError>;
 
     /// Question 3: an enum's variants, in declaration order, as the source holds them: read in
     /// place, never copied per question ([`VariantRows`]).
@@ -319,6 +322,12 @@ pub trait NamesSource<'n>: Copy {
     /// Required of every source, no default: a wrapper that did not forward it would answer "no
     /// row" for every item, and every call value would be refused.
     fn attr_value(self, key: ItemKey, attr: &'static str) -> Option<Option<RowValue<'n>>>;
+
+    /// Question 10e: whether item `key` (in `module`) sits inside a `#![blaze::sans_io]` crate,
+    /// module file, or inline `mod { #![blaze::sans_io] ... }` block. Over records this reads
+    /// [`ItemIdentity::sans_io`] (or [`ModuleRow::sans_io`] for body-local items) through
+    /// `NameCell::Item`, never `NameCell::Whole { section: Items }`.
+    fn in_sans_io_scope(self, key: ItemKey, module: ItemKey) -> bool;
 
     /// Question 11, the kind: what an item's outline entry is, without its detail's data.
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind>;
@@ -587,6 +596,10 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         Names::traits_in_scope(self, module, alloc)
     }
 
+    fn traits_exported<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        Names::traits_exported(self, module, alloc)
+    }
+
     fn variants(self, owner: ItemKey) -> Option<VariantRows<'n>> {
         let c: &'n blaze_scope::resolve::CrateNames<'n> = self.krate(Names::crate_of(self, owner)?);
         c.tables.enums.get(&owner).map(|vs| VariantRows::Solved(&vs[..]))
@@ -703,6 +716,16 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         // the very rows its items record's value table is written from.
         let krate: &'n blaze_scope::resolve::CrateNames<'n> = self.crates().get(Names::crate_of(self, key)?).copied()?;
         Some(blaze_scope::attr_values::row(&krate.values, key, attr).map(|row| row.answer()))
+    }
+
+    fn in_sans_io_scope(self, key: ItemKey, module: ItemKey) -> bool {
+        let Some(krate_idx) = Names::crate_of(self, key).or_else(|| Names::crate_of(self, module)) else {
+            return false;
+        };
+        let Some(krate) = self.crates().get(krate_idx).copied() else {
+            return false;
+        };
+        blaze_scope::items_record::item_in_sans_io_scope(krate, key, module)
     }
 
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind> {
@@ -1460,6 +1483,12 @@ impl<'n> Records<'n> {
         names::traits_in_scope::<&'n str, _>(&logged, module, alloc)
     }
 
+    /// [`NamesSource::traits_exported`] with every cell consulted put in `sink`.
+    pub fn traits_exported_logged<'b>(&'n self, sink: &dyn blaze_scope::names_cells::CellSink, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        let logged = blaze_scope::names_cells::Logged { world: &self.paths, log: sink };
+        names::traits_exported::<&'n str, _>(&logged, module, alloc)
+    }
+
     /// What was opened and decoded so far.
     pub fn opened(&self) -> Opened {
         Opened { names: self.paths.decoded(), items: self.items.decoded(), origins: self.origins_opened.get() }
@@ -1750,7 +1779,12 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
     /// wrote from the same `RootAttrs`.
     fn root_attrs(self, krate: usize) -> Option<blaze_scope::graph::RootAttrs> {
         let head = self.names_of(krate)?.crate_root().head();
-        Some(blaze_scope::graph::RootAttrs { no_std: head.no_std, no_core: head.no_core, arbitrary_ints: head.arbitrary_ints })
+        Some(blaze_scope::graph::RootAttrs {
+            no_std: head.no_std,
+            no_core: head.no_core,
+            arbitrary_ints: head.arbitrary_ints,
+            recursion_limit: head.recursion_limit,
+        })
     }
 
     fn has_feature(self, krate: usize, name: &str) -> Option<bool> {
@@ -1825,6 +1859,10 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
 
     fn traits_in_scope<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
         names::traits_in_scope::<&'n str, _>(&self.paths, module, alloc)
+    }
+
+    fn traits_exported<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        names::traits_exported::<&'n str, _>(&self.paths, module, alloc)
     }
 
     fn variants(self, owner: ItemKey) -> Option<VariantRows<'n>> {
@@ -2133,6 +2171,18 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
         // No record: the loader filed `NoRecord` the one time it was asked.
         let record = self.items_of(krate)?;
         Some(self.read(krate, record.attr_value(key, attr))?.map(|answer| answer.map_err(RowRefusal::Recorded)))
+    }
+
+    fn in_sans_io_scope(self, key: ItemKey, module: ItemKey) -> bool {
+        if let Some(krate) = self.items.crate_of(key)
+            && let Some(record) = self.items_of(krate)
+            && let Some(Some(row)) = self.read(krate, record.identity(key))
+        {
+            return row.sans_io;
+        }
+        let Some(krate) = self.items.crate_of(module) else { return false };
+        let Some(record) = self.items_of(krate) else { return false };
+        self.read(krate, record.module(module)).flatten().is_some_and(|m| m.sans_io)
     }
 
     fn kind_of_item(self, key: ItemKey) -> Option<ItemKind> {

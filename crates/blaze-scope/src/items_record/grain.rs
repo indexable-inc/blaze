@@ -23,7 +23,7 @@ pub struct ItemPieces {
 /// disambiguator and, for an entry with no name (an impl, a `use`, a macro call), its head, so
 /// two unnamed siblings never share a chain. A walk up the parents, no recursion.
 ///
-/// The chain's one home is `blaze_file_items::item_chain` (drive.md's piece 5): this is a call
+/// The chain's one home is `blaze_file_items::item_chain`: this is a call
 /// to it, the bytes and the domain as they were.
 pub fn item_chain(outline: &Outline<'_>, item: &Item, text: &str) -> ContentId {
     blaze_file_items::item_chain(outline, item, text)
@@ -39,7 +39,11 @@ pub fn pieces_of(outline: &Outline<'_>, item: &Item, text: &str) -> ItemPieces {
 pub(super) fn append(out: &mut RecordBytes<'_>, names: &CrateNames<'_>, items: &[ItemKey]) -> Result<(), ItemsRecordError> {
     pad(out);
     let at = u32_of(out.len(), "the item grain section")?;
-    let mut expansion_hashes = RecordBytes::new_in(*out.allocator());
+    let expansion_count = items
+        .iter()
+        .filter(|key| matches!(names.tables.texts.get(*key), Some((_, At::Expansion(_)))))
+        .count();
+    let mut expansion_hashes = RecordBytes::with_capacity_in(expansion_count.saturating_mul(32), *out.allocator());
     for key in items {
         let (it, place) = names.tables.texts.get(key).ok_or(ItemsRecordError::NoOutline { item: *key })?;
         let (text, outline) = names.outline_at(*place).ok_or(ItemsRecordError::NoOutline { item: *key })?;
@@ -62,6 +66,30 @@ pub(super) fn append(out: &mut RecordBytes<'_>, names: &CrateNames<'_>, items: &
 }
 
 impl<'a> ItemsRecord<'a> {
+    /// Item row `i`'s chain, read directly from the grain section without opening its source file.
+    pub fn chain_at(&self, i: usize) -> Result<ContentId, ItemsRecordError> {
+        let short = ItemsRecordError::Short { what: "an item grain row", at: i };
+        if i >= self.counts[T_ITEMS] {
+            return Err(short);
+        }
+        let base = self.field(F_GRAIN_AT) as usize;
+        if base == 0 {
+            return Err(short);
+        }
+        let Some(r) = i.checked_mul(GRAIN_ROW).and_then(|o| base.checked_add(o)).filter(|r| r.checked_add(GRAIN_ROW).is_some_and(|end| end <= self.bytes.len())) else {
+            return Err(short);
+        };
+        Ok(id_at(self.bytes, r))
+    }
+
+    /// The item `key`'s chain; `Ok(None)` when the crate has no item with text under that key.
+    pub fn chain(&self, key: ItemKey) -> Result<Option<ContentId>, ItemsRecordError> {
+        match self.find(T_ITEMS, key) {
+            Some(i) => self.chain_at(i).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Item row `i`'s pieces, as the solve saw them.
     pub fn pieces_at(&self, i: usize) -> Result<ItemPieces, ItemsRecordError> {
         let short = ItemsRecordError::Short { what: "an item grain row", at: i };

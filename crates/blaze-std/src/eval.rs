@@ -59,7 +59,7 @@
 //! shared state written on every call, where `Nested` is a value on the caller's stack.
 //!
 //! **Why `&mut Nested`, and not `&Eval`.** A memo point is checked `#[blaze::pure]`, and that
-//! check scans the point's own parameter types (docs/v2/plan/design/pure-fns.md): state with
+//! check scans the point's own parameter types (docs/v2/plan/design/effects.md): state with
 //! interior mutability behind a shared reference is refused, as another thread could change it
 //! during the call. An evaluator that remembers is such state. What the check lets through is
 //! the kernel's door: a `&mut dyn` of a trait marked `#[blaze::pure(trusted = "..")]`. `Nested`

@@ -114,8 +114,9 @@ pub(super) struct Root {
     owner: Owner,
     mask: Option<SlotId>,
     g: PTy,
-    /// A scrutinee that is a field of its owning local (`Owner::Local`; `match self.failed`):
-    /// the steps to it start every moved part's path (field_scrutinee.rs).
+    /// A scrutinee that is a field of its owning local (`Owner::Local`; `match self.failed`) or
+    /// reached through `Box` dereferences from a held temporary (`Owner::Temp`; `if let Pat(x)
+    /// = *make_box()`): the steps to it start every moved part's path (field_scrutinee.rs).
     field: Option<ExprId>,
 }
 
@@ -276,9 +277,15 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             self.moves.roots.push(Root { m, expr: e, owner: Owner::Local(x), mask: None, g, field: Some(scrutinee) });
             return Ok(None);
         }
-        // A place behind a pointer, matched in place: no one here owns it, nothing is held,
-        // and a by-value binding of a part that needs drop is refused (`move_out`).
+        // A place behind a pointer, matched in place: either a temporary's `Box` contents (or a
+        // field of them, e.g. `if let Pat(x) = *make_box()`, `match (*make_box()).f { .. }`),
+        // which the spilled temporary owns ([expr.move.movable-place]), or a place behind a
+        // non-`Box` pointer no one here owns (a by-value binding of a part that needs drop is
+        // refused by `move_out`).
         if self.scrutinee_in_place(scrutinee)? {
+            if let Some(mask) = self.owned_temp_box_scrutinee(scrutinee)? {
+                self.moves.roots.push(Root { m, expr: e, owner: Owner::Temp, mask, g, field: Some(scrutinee) });
+            }
             return Ok(None);
         }
         let (V::Place(p, off), Repr::Agg(_)) = (s, srepr) else {
@@ -292,6 +299,79 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         self.scope_pats[held] = Held::Moved { at: (p, off), g, mask: slot };
         self.moves.roots.push(Root { m, expr: e, owner: Owner::Temp, mask: Some(slot), g, field: None });
         Ok(Some((p, off, g)))
+    }
+
+    /// `own_scrutinee`, for an in-place scrutinee reached through `Box` dereferences (and
+    /// fields) from a temporary (`*make_box()`, `(*make_box()).f`, `**make_nested()`,
+    /// `*(make_struct().bx)`): locates the temporary's `Held` entry via `temp_spills`,
+    /// upgrades `Held::Rest` to `Held::Moved` with a partial-move word, and returns
+    /// `Ok(Some(Some(mask)))`. Returns `Ok(Some(None))` when a container on the prefix
+    /// implements `Drop` (deferred to `move_out` so ref-only arms succeed and by-value moves
+    /// report E0509) or when unreachable / the temporary needs no drop. Returns `Ok(None)` when
+    /// `scrutinee` is not a temporary `Box` path (behind `&T`, a raw pointer, or a non-`Box`
+    /// `Deref`).
+    fn owned_temp_box_scrutinee(&mut self, scrutinee: ExprId) -> Result<Option<Option<SlotId>>, BuildError> {
+        if !self.adjust_rows(scrutinee).is_empty() {
+            return Ok(None);
+        }
+        let mark = self.moves.steps.len();
+        let Some((base, _, _, drops, _, has_box)) = self.temp_path_steps(scrutinee, 0)? else {
+            return Ok(None);
+        };
+        self.moves.steps.truncate(mark);
+        if !has_box {
+            return Ok(None);
+        }
+        if drops {
+            return Ok(Some(None));
+        }
+        let held_at = self.moves.temp_spills.iter().rev().find(|&&(b, _)| b == base).map(|&(_, spilled)| spilled);
+        let found = held_at.and_then(|held_at| {
+            self.scope_pats
+                .iter()
+                .rposition(|h| matches!(*h, Held::Rest { at: a, variant: None, .. } | Held::Moved { at: a, .. } if a == held_at))
+                .map(|i| (i, held_at))
+        });
+        let Some((i, held_at)) = found else {
+            let t = self.expr_ty(base)?;
+            let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
+            if !self.live || !self.needs_drop(g).map_err(|error| Self::ty_err(base, error))? {
+                return Ok(Some(None));
+            }
+            return Ok(None);
+        };
+        let existing = *self.scope_pats.get(i).ok_or(malformed("temporary `Box` scrutinee scope entry past scope_pats"))?;
+        let mask = match existing {
+            Held::Moved { mask, .. } => mask,
+            _ => {
+                let t = self.expr_ty(base)?;
+                let g = self.ground_ty(t).map_err(|error| Self::ty_err(base, error))?;
+                let slot = self.new_temp_mask(held_at, base);
+                let entry = self.scope_pats.get_mut(i).ok_or(malformed("temporary `Box` scrutinee scope entry past scope_pats"))?;
+                *entry = Held::Moved { at: held_at, g, mask: slot };
+                slot
+            }
+        };
+        Ok(Some(Some(mask)))
+    }
+
+    /// `move_out`, for a match whose scrutinee `scrutinee` is reached through `Box` dereferences
+    /// (and fields) from a temporary (`Owner::Temp`, `Root::field = Some(scrutinee)`): appends
+    /// the steps from the temporary to `scrutinee` root first (`temp_path_steps`), so the
+    /// pattern's path (`move_path`, appended next) continues it into one part's path.
+    fn temp_scrutinee_prefix(&mut self, scrutinee: ExprId, mask: Option<SlotId>, p: PatId) -> Result<(Option<SlotId>, u32, u32), BuildError> {
+        let Some((_, start, len, drops, _, true)) = self.temp_path_steps(scrutinee, 0)? else {
+            return Err(malformed("a temporary `Box` scrutinee without its path steps"));
+        };
+        if drops {
+            let keep = usize::try_from(start).map_err(|_| malformed("move step offset past usize"))?;
+            self.moves.steps.truncate(keep);
+            return Err(BuildError::UnsupportedPat {
+                pat: p,
+                what: "a move out of a field of a type that implements `Drop` (E0509)",
+            });
+        }
+        Ok((mask, start, len))
     }
 
     /// A parameter whose pattern leaves a part that needs drop unbound (walk/matches/irrefutable.rs
@@ -393,21 +473,26 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     }
 
     /// Binding `p` (of type `g`, needing drop) binds its part by value: the part moves out of
-    /// the scrutinee, its bit cleared. Outside a match that owns its scrutinee (an `if let`,
-    /// a `let`-`else`) refused by name. `alt`: `p` is an or-alternative's, bound on that
-    /// alternative's own pass, so its effect is a store on that path (a bit cleared), never a
-    /// fact of the walk (a whole local's move, `moved`, is path-blind: refused there).
+    /// the scrutinee, its bit cleared. Outside a match that owns its scrutinee, refused by name.
+    /// `alt`: `p` is an or-alternative's, bound on that alternative's own pass, so its effect is
+    /// a store on that path (a field bit cleared, or the whole local's runtime drop flag cleared
+    /// via `set_flag`), never a path-blind walk state mutation (`self.init` / `self.definitely_uninit`).
     pub(super) fn move_out(&mut self, p: PatId, g: PTy, alt: bool) -> Result<(), BuildError> {
         let Some(cx) = self.moves.cx else { return Err(BuildError::UnsupportedPat { pat: p, what: MOVE_OUT }) };
         // A guarded arm's move is held until its guard passed (`Pending`).
         if self.repr(g).map_err(|error| Self::pat_ty_err(p, error))? == Repr::None {
             return Err(BuildError::UnsupportedPat { pat: p, what: "a move out of a zero-sized part that needs drop" });
         }
-        // A field scrutinee of its owning local (`match self.failed`): the steps from the local
-        // to it first, the pattern's path after them, one part's path in the local's word.
-        let prefix = match cx.root.field {
-            Some(s) => Some(self.field_scrutinee_prefix(s, p)?),
-            None => None,
+        // A field scrutinee of its owning local (`match self.failed`) or a temporary `Box` path
+        // (`if let Pat(x) = *make_box()`): the steps from the owner to it first, the pattern's
+        // path after them, one part's path in the owner's word.
+        let prefix = match (cx.root.owner, cx.root.field) {
+            (Owner::Local(_), Some(s)) => {
+                let (mask, start, len) = self.field_scrutinee_prefix(s, p)?;
+                Some((Some(mask), start, len))
+            }
+            (Owner::Temp, Some(s)) => Some(self.temp_scrutinee_prefix(s, cx.root.mask, p)?),
+            _ => None,
         };
         let (start, len) = match self.move_path(cx.pat, cx.root.g, p) {
             Ok(path) => path,
@@ -423,13 +508,29 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             None => (start, len),
         };
         let mask = match (cx.root.owner, prefix) {
-            // The local's word (`scan_field_scrutinee` gave it): `field_path` found it.
-            (_, Some((mask, _, _))) => mask,
+            // The local's or temporary's word (`field_path` or `owned_temp_box_scrutinee` found it).
+            (_, Some((Some(mask), _, _))) => mask,
+            // Dead code or a non-dropping temporary (`ManuallyDrop`): nothing is held to drop.
+            (Owner::Temp, Some((None, pstart, _))) => {
+                let keep = usize::try_from(pstart).map_err(|_| malformed("move step offset past usize"))?;
+                self.moves.steps.truncate(keep);
+                return Ok(());
+            }
             (Owner::Local(x), None) if len == 0 => {
                 // The whole local moves (its flag, set by `scan_flags`).
                 self.moves.steps.truncate(start as usize);
                 if alt {
-                    return Err(BuildError::UnsupportedPat { pat: p, what: "a by-value binding of a whole local scrutinee inside an or-pattern" });
+                    if cx.guarded {
+                        return Err(BuildError::UnsupportedPat {
+                            pat: p,
+                            what: "a by-value binding of a part that needs drop in an or-pattern of a guarded arm",
+                        });
+                    }
+                    if !self.has_drop_flag(x) {
+                        return Err(malformed("a whole local moved inside an or-pattern without a drop flag (`scan_flags`)"));
+                    }
+                    self.set_flag(x, false);
+                    return Ok(());
                 }
                 return self.arm_effect(Pending::Moved { expr: cx.root.expr, x }, cx.guarded);
             }
@@ -437,7 +538,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 .field_mask(x)
                 .ok_or(malformed("a match by tests moving out of a local without field flags (`scan_flags`)"))?,
             (Owner::Temp, None) => cx.root.mask.ok_or(malformed("a temporary scrutinee without its word"))?,
-            (Owner::None, None) => return Err(malformed("a part moved out of a scrutinee no one owns")),
+            (Owner::None, None) | (_, Some((None, _, _))) => return Err(malformed("a part moved out of a scrutinee no one owns")),
         };
         // A direct variant field `(v, j)` of a local enum already has its bit in `0..base`
         // (`field_bit`), which both `drop_owned` (on earlier whole-local assignments in a loop)
@@ -1413,6 +1514,30 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(())
     }
 
+    /// Whether pattern `p` binds the whole matched value by value — directly (`x` / `x @ sub`)
+    /// or at the top level of any alternative of a (possibly nested) or-pattern
+    /// (`x @ A(_) | x @ B(_)`).
+    pub(in crate::walk) fn binds_whole_by_value(&self, p: PatId) -> Result<bool, BuildError> {
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
+        todo.push(p);
+        while let Some(q) = todo.pop() {
+            match self.pat(q)? {
+                Pat::Bind { ann, sub, .. } => {
+                    if ann.by_ref.is_none() {
+                        return Ok(true);
+                    }
+                    todo.extend(sub);
+                }
+                Pat::Or { alts } => {
+                    let subs = self.body.pat_lists.get(alts.range()).ok_or(malformed("an or-pattern past `pat_lists`"))?;
+                    todo.extend_from_slice(subs);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether some binding strictly inside pattern `p` binds by value (`scan_flags`: a
     /// `match` on a local with such an arm may move a part out, so the local gets field
     /// flags).
@@ -1425,12 +1550,16 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 if !root && ann.by_ref.is_none() {
                     return Ok(true);
                 }
-                todo.extend(sub.map(|s| (s, false)));
+                todo.extend(sub.map(|s| (s, root)));
                 continue;
             }
             match pat {
                 Pat::Ref { inner, .. } => todo.push((inner, false)),
-                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                Pat::Or { alts } => {
+                    let subs = self.body.pat_lists.get(alts.range()).ok_or(malformed("an or-pattern past `pat_lists`"))?;
+                    todo.extend(subs.iter().map(|&s| (s, root)));
+                }
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => {
                     let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
                     todo.extend(subs.iter().map(|&s| (s, false)));
                 }
@@ -1456,10 +1585,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Ok(());
         }
         let Some(x) = self.local_of(scrutinee)? else { return Ok(()) };
-        let whole = matches!(self.body.pats.get(pat.ix()), Some(Pat::Bind { ann, .. }) if ann.by_ref.is_none());
-        if whole {
+        if self.binds_whole_by_value(pat)? {
             *self.needs_flag.get_mut(x.ix()).ok_or(malformed("a local past `pats`"))? = true;
-        } else if self.moves_deep(pat)? {
+        }
+        if self.moves_deep(pat)? {
             *self.partial.get_mut(x.ix()).ok_or(malformed("a local past `pats`"))? = true;
         }
         Ok(())

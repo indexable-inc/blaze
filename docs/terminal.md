@@ -1,13 +1,14 @@
 ---
 status: current
-summary: What `blaze build`, `run`, `check` and `test` show: on a terminal a region redrawn while a build runs and at most one line when it ends, off one stable `blaze:` lines; and the one sans-IO core (blaze-screen) that makes both from the build's events.
+summary: What blaze shows while it works: the run line blaze-cli draws while `run` works, and the region and stable `blaze:` lines the sans-IO core blaze-screen makes from a build's events (built, not wired).
 ---
 # What a build shows
 
 A build's progress is not kept. While it runs, a terminal shows a region that is redrawn; when
 it ends the region is erased and at most one line stays, then the program runs on a clean
 terminal. Diagnostics, failures and warnings of wasted work stay. A pipe gets lines that stay
-and no escape byte.
+and no escape byte. The region and the `blaze:` lines are built in blaze-screen, not wired:
+blaze-cli draws only the run line ([While `run` works](#while-run-works)).
 
 ## On a terminal
 
@@ -16,9 +17,9 @@ and no escape byte.
 | `run` or `test` that built nothing | nothing: the program's output, the tests' summary |
 | `build` or `check` that built nothing | `up to date · 21ms → /home/me/.cache/…/debug/hello` (dim; the program's path, cut in its middle) |
 | an edit | `✓ hello::add recompiled in 0.70s · src/main.rs changed · tier 0` |
-| a larger build | `✓ built 81 units, 4 cached in 45.8s · tier 0 · 3 warnings · blaze slow says why`, and `hint: 2 warnings have a fix: blaze check --fix` when some do |
-| a failure | the diagnostics, then `✗ run failed in 0.14s · 1 error in hello (bin) · blaze explain hello` |
-| tests | each failure as it happens (name, executable, its last 40 lines of output), then `✗ 8 of 9 ran: 1 failed · 7 passed · 1 ignored · 0 filtered · 3 binaries · 31.8s` (how many of the tests selected ran comes first and is always said; `filtered` is what the filter left out) and `rerun: blaze test -p calc --lib`; a run that ran none is refused, naming its filter ([cargo.md](cargo.md#a-run-that-ran-no-test-is-refused)) |
+| a larger build | `✓ built 81 units, 4 cached in 45.8s · tier 0 · 3 warnings`, and `hint: 2 warnings have a fix: blaze check --fix` when some do |
+| a failure | the diagnostics, then `✗ run failed in 0.14s · 1 error in hello (bin)` |
+| tests | each failure as it happens (name, executable, its last 40 lines of output), then `✗ 8 of 9 ran: 1 failed · 7 passed · 1 ignored · 0 filtered · 3 binaries · 31.8s` (how many of the tests selected ran comes first and is always said; `filtered` is what the filter left out) and `rerun: blaze test -p calc`; a run that ran none is refused, naming its filter |
 
 While a build runs (ripgrep from an empty store, 80 by 24; `tests/golden/` in blaze-screen has
 every size):
@@ -39,10 +40,8 @@ every size):
   tasks wait on it. With room: the wait it is in (`waits on ...`), and the function it is
   inside once that has lasted 2 s or the build is a handful of tasks (12). A path is cut in
   its middle and a macro's nesting said once: `libc::…::<impl#0 in macro>::default`.
-- **Why something waits**, only while it does, a row each above the status row: every core
-  busy with tasks ready, memory holding tasks back, the daemon's pause of the whole build
-  (` ◦ paused: daemon at 7.6 of 81.5 GiB, waiting on 1 task: calc 0.1.0 lib (host)`). No
-  memory or core count otherwise.
+- **Why something waits**, only while it does, a row above the status row: every core busy
+  with tasks ready. No core count otherwise.
 - **The status row**: the phase, done of total, how many run, the time; what the build waits
   on when no unit runs (a download, its plan); `⚠ nothing finished for 12.0s` in place of the
   bar once nothing has settled for 10 s.
@@ -60,10 +59,6 @@ every size):
   [The palette](#rich-text-and-the-palette) picks the values.
 - **Motion**: a frame when an event changed what is shown, and once a second for the timers.
   No spinner.
-
-Tried on recorded builds and not kept: a dependency tree (nom's) took 56 rows for ripgrep's 12
-units under way, most of them `waits` rows repeated under each parent; a lane a worker took 30
-rows, 20 of them `(no task) llvm compile` a few milliseconds old. The frontier above took 8.
 
 What the terminal offers beyond text, each detected (`blaze_report::terminal`) and never
 written to a pipe: its own progress report (OSC 9;4: Ghostty 1.2, WezTerm, Windows Terminal,
@@ -97,8 +92,7 @@ pipe) code and commands get their backticks back; JSON carries the spans with th
 and blaze's reports are this type. What is not yet: the messages that still format an
 interpolation between backticks by hand, 5,129 in 99 crates as merged on 2026-11-12
 (`crates/blaze-report/tests/backticks.txt`, a crate a row; its test holds each crate to its
-number, which only goes down), a diagnostic of code among them (`blaze_diagnostics::Diag`'s
-message is a string).
+number, which only goes down).
 
 Code names what a colour means (`blaze_report::palette::Token`: success, failure, warning,
 running, waiting, cached, code, command, path, number, dim, emphasis), never a colour. The
@@ -169,21 +163,21 @@ and are not repeated. The footer starts on a line of its own when the program ma
 the cursor mid-line (a mark and a line of blanks first, as a shell does before its prompt). A
 pipe gets nothing added. Built: the event, the footer and its tests. Not built: today `run`
 becomes the program (`exec`), so nobody waits for it and no `Ran` is ever sent; the launcher
-(or `cli/run.rs` and the thin `blaze`) has to start it as a child, wait with `wait4` (macOS:
+(or blaze-cli's `run`) has to start it as a child, wait with `wait4` (macOS:
 `proc_pid_rusage` for the footprint), restore the terminal modes it saved, exit with the
 program's code (128 plus the signal's number for a signal) and send the event; `--stats` and
 the setting are theirs to read.
 
 ## Off a terminal
 
-A pipe, a file, CI, `TERM=dumb`, `BLAZE_UI=plain`, `--message-format json`. An agent needs to
+A pipe, a file, CI, `TERM=dumb`, `BLAZE_UI=plain`. An agent needs to
 know that the command is alive, each failure with its place, whether its edit was taken, and
 what to run next, in few lines. stderr gets, each a whole line:
 
 ```text
 blaze: progress phase=compiling done=144/147 running=1 elapsed_ms=10556 longest="codegen hello 0.1.0 bin hello (host)" for_ms=4001
 blaze: ok built=1 cached=31 warnings=0 elapsed_ms=703 tier="tier 0 · 0% optimized" cause="src/main.rs changed" recompiled=hello::add program=/w/target/debug/hello
-blaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=15 unit="hello (bin)" next="blaze explain hello"
+blaze: failed errors=1 warnings=0 unbuilt=0 elapsed_ms=15 unit="hello (bin)"
 ```
 
 A warning of a package that is not the checkout's own (a registry or git package, a path
@@ -213,18 +207,13 @@ blaze: tests ok selected=9 ran=8 passed=8 failed=0 ignored=1 measured=0 filtered
 
 blaze-screen is the core (`#![blaze::sans_io]`, `no_std`): `Screen::take(Event)`,
 `advance_clock(ms)`, `frame() -> Option<Frame>`, `next_deadline()`. An `Event` is the build's
-model as the daemon says it (`blaze_protocol::now::Now`), a unit started, lines that stay
-(a diagnostic drawn for this client, `serve/unit/drawn.rs`), what the build waits on, the
-build's end (`Built`) and its why, a test's start and end, the terminal resized, or `Clear`
-(what follows owns the terminal). A `Frame` is data: rows to erase, lines appended, the
-region, each span with its role and its link, the progress report. `encode` is the only place
-a frame becomes bytes, for one terminal's capabilities. Nothing of the terminal reaches the
-daemon beyond what a diagnostic is drawn with, which no key holds.
+model (`blaze_protocol::now::Now`), a unit started, lines that stay (a drawn diagnostic), what
+the build waits on, the build's end (`Built`) and its why, a test's start and end, the terminal
+resized, or `Clear` (what follows owns the terminal). A `Frame` is data: rows to erase, lines
+appended, the region, each span with its role and its link, the progress report. `encode` is
+the only place a frame becomes bytes, for one terminal's capabilities. Nothing of the terminal
+reaches a key.
 
-The driver is in `crates/blaze-screen` and `crates/blaze-cli/src/print.rs`: it reads the clock and the size, writes
-the bytes, and on a terminal runs on a thread of its own so timers turn while the daemon says
-nothing. `Printer::clear` is the one call for "the build is over": it returns once nothing
-live is on the terminal. While a region is up the terminal does not echo typed keys (they
-would land in it); a drop, a panic's unwind and an interrupt put the terminal back. The
-thin `blaze` shows a no-op answer through the same core. `BLAZE_UI_TRANSCRIPT=<file>` records
-the events, one a line as JSON; the tests replay such transcripts into a reference terminal.
+blaze-cli drives only the run line (`Watch`, `Step`; run_line.rs); no command of it drives
+`Screen`'s region yet. The tests replay recorded transcripts (`tests/transcripts`, one event a
+line as JSON) into a reference terminal.

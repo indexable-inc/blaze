@@ -1,4 +1,4 @@
-//! Records by key (drive.md, "The system side", "Store"; "D114 rulings", "The store under the
+//! Records by key (drive.md, "The system side", "Store"; "The store under the
 //! command"): ONE store a user, blaze-cas's plain store at `<home>/.blaze/`
 //! [`plain_place::STORE_DIR`] (`v2/store/f5s3`: its forms name its folder, D160), read and
 //! written by every checkout and worktree, records read IN PLACE ([`plain_place`]). A get is
@@ -403,6 +403,8 @@ pub struct StoreKept {
     pub copy_bytes: u64,
     /// Bytes of those copies alive now (outside a mapping).
     pub held_bytes: u64,
+    /// Shared arenas pinned past commit because a lending `get` set `shared_lent`.
+    pub kept_arenas: usize,
 }
 
 /// blaze's folder in the user's home, made by the first file made in it.
@@ -411,11 +413,11 @@ pub(crate) const HOME_FOLDER: &str = ".blaze";
 /// The stand-in's folders under blaze's folder in the home: an old home when either is there.
 pub(crate) const OLD_HOME: [&str; 2] = ["v2/shared", "v2/own"];
 /// The stand-in's forms under a checkout: its packs folder and its `last` pointer file (the
-/// last answer and leaf table are now a root of the one store, drive.md ruling 3).
+/// last answer and leaf table are now a root of the one store, drive.md).
 /// Named from clean.rs's one list of a checkout's entries, so `blaze clean` removes them.
 pub(crate) const OLD_CHECKOUT: [&str; 2] = [crate::clean::CheckoutEntry::Packs.path(), crate::clean::CheckoutEntry::At.path()];
 /// The roots that say the old forms were looked for: the home's once, each checkout's once
-/// (its name ends in the digest of the checkout's path, drive.md ruling 3).
+/// (its name ends in the digest of the checkout's path, drive.md).
 const OLD_HOME_LOOKED: &str = "blaze.old-home-looked";
 const OLD_CHECKOUT_LOOKED: &str = "blaze.old-packs-looked.";
 
@@ -809,7 +811,7 @@ impl Home {
     }
 
     /// The command's store, opened lazily on the world's driver lent to [`plain_place::STORE_DIR`]
-    /// (one driver a process, drive.md ruling 5): nothing is mapped until a get probes.
+    /// (one driver a process, drive.md): nothing is mapped until a get probes.
     pub fn open_store(&self, settings: &Settings, facts: Facts, alloc: StoreAlloc) -> Result<Lent<bstd::io::LentDriver, StoreAlloc>, CliError> {
         let driver = self.dir.lend(&Path::new(plain_place::STORE_DIR)?);
         let dir = driver.dir().share();
@@ -924,7 +926,7 @@ pub fn old_home<D: Driver>(cx: &Cx, home: &Home, root: &Dir<ReadWrite>, checkout
     Ok(found)
 }
 
-/// Where records go (drive.md ruling 2): the one seam where the choice is made (rule 78). The
+/// Where records go (drive.md): the one seam where the choice is made (rule 78). The
 /// command's is [`ToolchainCrates`].
 pub trait Sharing {
     /// The crates whose records hold nothing of a project, by their `CrateScope` subjects.
@@ -938,7 +940,7 @@ pub trait Sharing {
 /// A drive record's names are all public when its name and every name it reads are on a
 /// POSITIVE LIST BY SUBJECT (main's ruling, D115): `add_public` takes `CrateScope` subjects and
 /// `Script` subjects; the cli adds a script's subject only when its crate is public (the
-/// toolchain's, a checksummed registry archive's: target.md, "Namespaces") AND it is placed on
+/// toolchain's, a checksummed registry archive's: bottom.md section 10, namespaces) AND it is placed on
 /// the wasm path, so a native script, and every record reading it, stays LOCAL (forgetting one
 /// makes it local: the safe direction). Sharing never reads how a script ran. A `Fetch` record
 /// stands for the home's sources folder (fetch.rs `SOURCES`): this machine's, never public
@@ -1475,7 +1477,12 @@ impl<'m, D: Driver, S: Sharing> Store<'m> for CommandStore<'m, '_, D, S> {
     fn kept(&self) -> StoreKept {
         let lent = self.place.counts().lent;
         // A commit frees each arena chunk no get lent from (blaze-cas plain/lent.rs).
-        StoreKept { copies: lent.copied, copy_bytes: lent.arena_bytes, held_bytes: lent.held_bytes }
+        StoreKept {
+            copies: lent.copied,
+            copy_bytes: lent.arena_bytes,
+            held_bytes: lent.held_bytes,
+            kept_arenas: self.place.kept_arenas(),
+        }
     }
 
     fn get(&mut self, cx: &Cx, key: Key) -> Result<Option<Held<'m>>, CliError> {

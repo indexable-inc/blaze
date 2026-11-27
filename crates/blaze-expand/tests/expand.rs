@@ -1532,9 +1532,12 @@ fn a_macro_definition_reads_back_from_its_records() {
     let derive =
         MacroDefinition::proc_macro(krate, ProcKind::Derive, "Serialize", &["serde", "allow"], at(9), blaze_own::testing::heap().alloc())
             .expect("names fit");
+    let foreign = CrateItemKey(ContentId([42; 32]));
     let defs = [
         rules("($x:expr) => { $x + 1 }", 1),
+        rules("() => { $crate::Item }", 1).with_dollar_crate(Some(foreign)),
         MacroDefinition::macro2(Some(tokens("$x:expr")), tokens("$x * 2"), at(2)),
+        MacroDefinition::macro2(None, tokens("() => { $crate::Item }"), at(2)).with_dollar_crate(Some(foreign)),
         builtin(BuiltinFn::Concat),
         MacroDefinition::builtin_derive(BuiltinDerive::Clone, at(1), blaze_own::testing::heap().alloc()),
         derive,
@@ -1545,19 +1548,27 @@ fn a_macro_definition_reads_back_from_its_records() {
         let records = def.write(item, name, None, blaze_own::testing::heap().alloc()).expect("a small definition");
         let read = read_back(def, &records).expect("the records are one definition");
         assert_eq!(read.content(), def.content());
-        assert_eq!((read.kind(), read.at(), read.transparency()), (def.kind(), def.at(), def.transparency()));
+        assert_eq!(
+            (read.kind(), read.at(), read.dollar_crate(), read.transparency()),
+            (def.kind(), def.at(), def.dollar_crate(), def.transparency())
+        );
         assert!(read.helpers().eq(def.helpers()) && read.proc_name() == def.proc_name());
         // Written again, the records are the same bytes (rule 25).
         let again = read.write(item, name, None, blaze_own::testing::heap().alloc()).expect("a small definition");
         assert_eq!(again.def[..], records.def[..]);
     }
+    // Control: a `dollar_crate` override produces a distinct `MacroContent` hash from `None`.
+    let plain_dollar = rules("() => { $crate::Item }", 1);
+    assert_ne!(plain_dollar.content(), defs[1].content());
+    assert_eq!(plain_dollar.dollar_crate(), None);
+    assert_eq!(defs[1].dollar_crate(), Some(foreign));
     // Control: a body record of another stream is refused by its digest, never read as the body.
     let mut records = defs[0].write(item, "m", None, blaze_own::testing::heap().alloc()).expect("a small definition");
     let other = tokens("() => {}").write_record(blaze_own::testing::heap().alloc());
     records.body = Some((stream_record_id(&other), other));
     assert!(matches!(read_back(&defs[0], &records), Err(DefinitionError::Mismatch { .. })));
     // A proc macro written under a name that is not its export name is refused.
-    let renamed = defs[4].write(item, "Deserialize", None, blaze_own::testing::heap().alloc());
+    let renamed = defs[6].write(item, "Deserialize", None, blaze_own::testing::heap().alloc());
     assert!(matches!(renamed.err(), Some(BuildError::Disagrees { .. })));
 }
 
@@ -1976,4 +1987,123 @@ fn direct_and_input_forwarded_stringify_spacing_matches_rustc() {
         let got = stringify_stream(&forwarded.tokens, &cx);
         assert_eq!(got, expected, "id_tt!({src}) -> stringify!");
     }
+}
+
+#[test]
+fn include_tokens_carry_call_site_ctx_without_core_mark() {
+    use blaze_expand::{CtxNode, Mark, Transparency};
+
+    let core_krate = CrateItemKey(ContentId([1; 32]));
+    let caller_krate = CrateItemKey(ContentId([2; 32]));
+    let include_def = MacroDefinition::builtin_fn(
+        BuiltinFn::Include,
+        DefAt {
+            site: DefSite { krate: core_krate, module: None },
+            edition: Edition::E2021,
+            export: Export::Exported,
+            local_inner: LocalInner::No,
+            transparency: None,
+        },
+        blaze_own::testing::heap().alloc(),
+    );
+    let cx = TestCx {
+        files: &[(
+            "src/triple.rs",
+            b"pub struct Triple;\n#[macro_export]\nmacro_rules! triple { ($s:tt) => { $crate::Triple }; }\n",
+        )],
+        ..TestCx::new()
+    };
+
+    // Direct call from crate B at root context: included tokens carry no mark at all (never `core`).
+    let input = tokens("\"src/triple.rs\"");
+    let exp = done(expand(&include_def, &Call::fn_like(&input, site()), &cx, blaze_own::testing::heap().alloc()));
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert!(exp.tokens.contexts().is_empty(), "include! must not push core::include's mark");
+    assert!(exp.origins.iter().all(|it| *it == TokenOrigin::Made(Transparency::Transparent)));
+    for i in 0..exp.tokens.len() {
+        assert_eq!(exp.hygiene(i).mark, None, "token {i} (`{}`) carries no mark", exp.tokens.text_at(i));
+        assert_eq!(exp.non_transparent_mark(i), None);
+    }
+
+    // Nested call where the `include!` call site itself carries crate B's `SemiOpaque` mark:
+    // included tokens inherit the call site's context (crate B), never `core`.
+    let alloc = blaze_own::testing::heap().alloc();
+    let mut marked_input = lex("\"src/triple.rs\"", Edition::E2021, alloc).expect("lexes");
+    let caller_mark = Mark {
+        of: MarkOf::Outer(ContentId([9; 32])),
+        transparency: Transparency::SemiOpaque,
+        edition: Edition::E2021,
+        site: DefSite { krate: caller_krate, module: None },
+    };
+    let call_ctx = marked_input
+        .context(CtxNode { parent: Ctx::root(Edition::E2021), mark: caller_mark })
+        .expect("context");
+    let nested_site = CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: call_ctx };
+    let nested_exp = done(expand(&include_def, &Call::fn_like(&marked_input, nested_site), &cx, alloc));
+    assert!(nested_exp.diagnostics.is_empty(), "{:?}", nested_exp.diagnostics);
+    for i in 0..nested_exp.tokens.len() {
+        assert_eq!(nested_exp.hygiene(i).mark, Some(caller_mark));
+        assert_eq!(nested_exp.non_transparent_mark(i), Some(caller_mark));
+        assert_ne!(nested_exp.non_transparent_mark(i).map(|m| m.site.krate), Some(core_krate));
+    }
+}
+
+#[test]
+fn non_transparent_mark_skips_transparent_and_preserves_semi_opaque_and_opaque() {
+    use blaze_expand::{CtxNode, Mark, Transparency, body_words};
+
+    let alloc = blaze_own::testing::heap().alloc();
+    let krate_a = CrateItemKey(ContentId([10; 32]));
+    let krate_b = CrateItemKey(ContentId([20; 32]));
+    let krate_c = CrateItemKey(ContentId([30; 32]));
+
+    let transparent_a = Mark {
+        of: MarkOf::This,
+        transparency: Transparency::Transparent,
+        edition: Edition::E2021,
+        site: DefSite { krate: krate_a, module: None },
+    };
+    let semi_b = Mark {
+        of: MarkOf::Outer(ContentId([21; 32])),
+        transparency: Transparency::SemiOpaque,
+        edition: Edition::E2021,
+        site: DefSite { krate: krate_b, module: None },
+    };
+    let opaque_c = Mark {
+        of: MarkOf::Outer(ContentId([31; 32])),
+        transparency: Transparency::Opaque,
+        edition: Edition::E2021,
+        site: DefSite { krate: krate_c, module: None },
+    };
+
+    let mut stream = TokenStream::new_in(alloc);
+    let root = Ctx::root(Edition::E2021);
+    let only_transparent = stream.context(CtxNode { parent: root, mark: transparent_a }).expect("ctx");
+    let semi_ctx = stream.context(CtxNode { parent: root, mark: semi_b }).expect("ctx");
+    let opaque_ctx = stream.context(CtxNode { parent: root, mark: opaque_c }).expect("ctx");
+    let transparent_over_semi = stream.context(CtxNode { parent: semi_ctx, mark: transparent_a }).expect("ctx");
+    let transparent_over_opaque = stream.context(CtxNode { parent: opaque_ctx, mark: transparent_a }).expect("ctx");
+
+    assert_eq!(stream.non_transparent_mark(root), None);
+    assert_eq!(stream.node(only_transparent).map(|n| n.mark), Some(transparent_a));
+    assert_eq!(stream.hygiene(only_transparent).mark, None);
+    assert_eq!(stream.non_transparent_mark(only_transparent), None);
+    assert_eq!(stream.non_transparent_mark(semi_ctx), Some(semi_b));
+    assert_eq!(stream.non_transparent_mark(opaque_ctx), Some(opaque_c));
+    assert_eq!(stream.node(transparent_over_semi).map(|n| n.mark), Some(transparent_a));
+    assert_eq!(stream.hygiene(transparent_over_semi).mark, Some(semi_b));
+    assert_eq!(stream.non_transparent_mark(transparent_over_semi), Some(semi_b));
+    assert_eq!(stream.node(transparent_over_opaque).map(|n| n.mark), Some(transparent_a));
+    assert_eq!(stream.hygiene(transparent_over_opaque).mark, Some(opaque_c));
+    assert_eq!(stream.non_transparent_mark(transparent_over_opaque), Some(opaque_c));
+
+    // `body_words` also skips `Transparent` marks when computing `BodyWord::mark`.
+    stream.ident("$crate", only_transparent).expect("push");
+    stream.ident("$crate", transparent_over_semi).expect("push");
+    stream.ident("$crate", transparent_over_opaque).expect("push");
+    let body = body_words(&stream, ContentId([99; 32]), alloc);
+    assert_eq!(body.words.len(), 3);
+    assert_eq!(body.words[0].mark, None);
+    assert_eq!(body.words[1].mark.map(|m| (m.site.krate, m.transparency)), Some((krate_b, Transparency::SemiOpaque)));
+    assert_eq!(body.words[2].mark.map(|m| (m.site.krate, m.transparency)), Some((krate_c, Transparency::Opaque)));
 }

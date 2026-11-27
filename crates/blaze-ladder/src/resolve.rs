@@ -165,6 +165,28 @@ impl<'n, S: NamesSource<'n>> Paths<S> {
         Ok(Target { key: found.def.key, kind: self.kind_of(found.def)?, consumed })
     }
 
+    /// Whether `segments` resolves as a whole in `ns` alone, without falling back to the other
+    /// namespace (used to tell whether a block `use` binds a value or only a type/module).
+    pub fn resolves_exact(&self, module: ItemKey, dollar: Option<CrateItemKey>, abs: bool, segments: &[&str], ns: Ns) -> bool {
+        let krate = match dollar {
+            Some(k) => k,
+            None => match self.krate_key(module) {
+                Ok(k) => k,
+                Err(_) => return false,
+            },
+        };
+        let (mut kind, skip) = to_path_head(abs, segments, None, krate);
+        if let (Some(k), false, Some(&"crate")) = (dollar, abs, segments.first()) {
+            kind = blaze_surface::PathKind::DollarCrate(k);
+        }
+        let w = Written { kind, segments: &segments[skip..] };
+        let space = match ns {
+            Ns::Type => Namespace::Types,
+            Ns::Value => Namespace::Values,
+        };
+        matches!(self.names.walk(module, space, w), Ok(f) if f.consumed == w.segments.len())
+    }
+
     /// The finer kind of a definition the library returned.
     pub fn kind_of(&self, def: Def) -> Result<Kind, ResolveError> {
         match def.kind {

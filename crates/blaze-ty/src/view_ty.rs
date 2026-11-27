@@ -1,5 +1,4 @@
-//! First-class View Types & Partial-Borrow Algebra for Blaze (`docs/v2/plan/design/edition.md` §3,
-//! objective E4).
+//! First-class View Types & Partial-Borrow Algebra for Blaze (`docs/v2/plan/design/edition.md` §3).
 //!
 //! # Semantics
 //! A **view type** restricts a reference to a named subset of a struct's fields with per-field
@@ -684,7 +683,7 @@ pub fn infer_and_check_methods<'a>(
 }
 
 // =================================================================================================
-// Tests (Objective E4 Acceptance & Refusal Fixtures)
+// Tests (View Type Acceptance & Refusal Fixtures)
 // =================================================================================================
 
 #[cfg(test)]

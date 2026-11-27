@@ -223,7 +223,7 @@ The same run: 66 of 66 flag steps the same as cargo on a generated workspace, an
 daemon lifecycle checks.
 
 Not in the table: in ten runs of just, two had one difference each that is not explained
-(see [cargo.md](cargo.md), "Known problems").
+(see cargo.md, "Known problems").
 
 ### Agent-style edit runs (`agents.py`)
 
@@ -358,7 +358,7 @@ quoted.
 
 ## 11. Real projects
 
-The newest measurement is in [benchmarks.md](benchmarks.md): `harness/bench.py` on ten
+The newest measurement is in benchmarks.md: `harness/bench.py` on ten
 projects (ripgrep to bevy, and zed), cold builds with an empty and a warm store, six kinds of
 edit, the test suites, the fastest cargo setups (mold, wild, `-Zthreads=8`, cg_clif, `cargo
 check`) and subsecond's hot-patching, every sample kept, and the history the site charts at
@@ -451,7 +451,7 @@ worker logs, empty store against warm store:
 | nushell | 4.6 s | 26.1 s | 21.4 s | 124,846 of 159,036 | 1.0 s |
 
 The store holds compiled functions, not rust-analyzer's analysis, so a warm store still
-pays for loading and type-checking every function (see [cache.md](cache.md)). The rest of
+pays for loading and type-checking every function (see cache.md). The rest of
 "ready" minus "command returns" (about 3 s on ripgrep and 7 s on nushell) is starting the
 daemon and worker and waiting for the background check.
 

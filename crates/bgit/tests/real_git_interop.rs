@@ -787,8 +787,8 @@ fn fsmonitor_o_dirty_status_diff_and_structured_queries() {
     assert!(branches.iter().any(|b| b.name == "main" && b.is_current && b.subject == "init"));
     assert!(branches.iter().any(|b| b.name == "dev" && !b.is_current && b.subject == "init"));
 
-    // Start in-process FSEvents monitor (`blaze_core::Native` `Effect::Journal` + `Effect::Flush`).
-    assert!(bgit::ensure_fsmonitor_watching(&repo), "expected FSEvents monitor to start");
+    // Start in-process kernel journal monitor (`blaze_core::Native` `Effect::Journal` + `Effect::Flush`).
+    assert!(bgit::ensure_fsmonitor_watching(&repo), "expected kernel fsmonitor to start");
 
     // 1. Prime baselines (clean).
     let st1 = bgit::run_bgit_in_process(&["status", "--porcelain"], &repo, false, alloc);

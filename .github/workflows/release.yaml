@@ -1,6 +1,7 @@
 name: release
 
-# Builds and publishes `blaze` (`blaze-cli`) for macOS ARM64, Linux x86-64, and Linux ARM64.
+# Builds and publishes `blaze` (`blaze-cli`) and `blaze-launcher` for macOS ARM64, Linux x86-64,
+# and Linux ARM64 using pinned v2 `blaze` (zero cargo, zero rustc).
 # Uploads all release assets + SHA256SUMS + B3SUMS + library archive to Cloudflare R2
 # (`blaze-releases`, served at https://blaze-releases.ix.dev) and GitHub Releases, and updates
 # the `canary` (and optionally `stable`) channel pointers.
@@ -28,8 +29,6 @@ permissions:
 
 env:
   BLAZE_CORES: all
-  CARGO_TERM_COLOR: always
-  CARGO_NET_RETRY: 10
 
 jobs:
   prepare:
@@ -90,26 +89,34 @@ jobs:
       BLAZE_RELEASE: ${{ needs.prepare.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install pinned blaze release
-        run: |
-          bin="${CARGO_HOME:-$HOME/.cargo}/bin"
-          export PATH="$bin:$PATH"
-          echo "$bin" >> "$GITHUB_PATH"
-          sh site/install.sh --version "$(cat .github/blaze-cli-version)" --no-toolchain --verbose
-          blaze --version
-          blaze warm-toolchain
-      - name: Export release blaze binary
+      - uses: ./.github/actions/blaze
+        with:
+          require-launcher: "false"
+      - name: Build release blaze and blaze-launcher binaries
         env:
           MACOSX_DEPLOYMENT_TARGET: "13.0"
         run: |
+          set -euo pipefail
           mkdir -p target/release
-          blaze export . -p blaze-cli --bin blaze -o target/release/blaze
+          run_bounded() {
+            local secs=$1; shift
+            if command -v timeout >/dev/null 2>&1; then
+              timeout -k 30 "$secs" "$@"
+            elif command -v gtimeout >/dev/null 2>&1; then
+              gtimeout -k 30 "$secs" "$@"
+            else
+              "$@"
+            fi
+          }
+          run_bounded 1800 blaze build --release -p blaze-cli --bin blaze -o target/release/blaze
+          run_bounded 1800 blaze build --release -p blaze-launcher --bin blaze-launcher -o target/release/blaze-launcher
       - name: Archive and checksum
         run: |
           mkdir -p "$NAME"
           cp LICENSE-APACHE LICENSE-MIT README.md "$NAME/"
           cp target/release/blaze "$NAME/blaze"
-          chmod 755 "$NAME/blaze"
+          cp target/release/blaze-launcher "$NAME/blaze-launcher"
+          chmod 755 "$NAME/blaze" "$NAME/blaze-launcher"
           "$NAME/blaze" --version
           "$NAME/blaze" toolchain
           command -v xz >/dev/null || brew install xz

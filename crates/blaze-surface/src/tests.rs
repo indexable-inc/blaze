@@ -291,6 +291,7 @@ fn a_macro_def_reads_back_with_its_helpers_in_order() {
         place: Some(Place::File { file: file(2), index: ItemIndex(3) }),
         kind: MacroKind::ProcMacro { krate, kind: ProcKind::Derive },
         site: DefSite { krate, module: None },
+        dollar_crate: None,
         edition: Edition::E2021,
         exported: false,
         local_inner: false,
@@ -313,5 +314,12 @@ fn a_macro_def_reads_back_with_its_helpers_in_order() {
     };
     let buffer = Aligned::copy_from(&MacroDef::new_in(builtin, blaze_own::testing::heap().alloc()).finish().expect("small"));
     assert_eq!(MacroDefView::read(&buffer).expect("a written record").head(), builtin);
+    let foreign = MacroDefHead {
+        kind: MacroKind::Rules,
+        dollar_crate: Some(CrateItemKey(ContentId([11; 32]))),
+        ..head
+    };
+    let buffer = Aligned::copy_from(&MacroDef::new_in(foreign, blaze_own::testing::heap().alloc()).finish().expect("small"));
+    assert_eq!(MacroDefView::read(&buffer).expect("a written record").head(), foreign);
 }
 

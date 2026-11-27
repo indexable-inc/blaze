@@ -336,10 +336,10 @@ pub(crate) fn held_refused<'f>(name: Name) -> Did<'f> {
 /// place where it is: the graph's record is handed to its task's record on the heap (graph.rs
 /// `hand_graph`), so the list and trailer are appended there, never to an empty built payload
 /// beside it. Returns the record's out.
-pub(crate) fn seal_graph<A: Allocator + Copy>(record: &mut Record<A>, list: &[u8]) -> ContentId {
+pub(crate) fn seal_graph<A: Allocator + Copy>(record: &mut Record<A>, list: &[u8], wasm_graph: &[u8]) -> ContentId {
     match &mut record.handed {
-        Handed::Kept(payload) => crate::graph_payload::seal(payload, list),
-        Handed::None => crate::graph_payload::seal(&mut record.payload, list),
+        Handed::Kept(payload) => crate::graph_payload::seal(payload, list, wasm_graph),
+        Handed::None => crate::graph_payload::seal(&mut record.payload, list, wasm_graph),
         // Every caller seals the record it has just made, before its put; a released record
         // sealed would be an out over no payload. A panic fails its one job (rule 20), never a
         // quiet seal.
@@ -661,7 +661,7 @@ pub(crate) fn failed_notes(failed: &Failures<'_>, lines: &Frame, each: &mut dyn 
 /// a full frame through `handle_alloc_error`, which aborts the process by default: the whole
 /// command, not the one task. The hook makes that refusal a panic like bstd's, so a task's
 /// `catch_unwind` fails it alone. It is the process's one hook, set once, before the first
-/// task; nothing else in blaze sets it (owed: drive.md, "For a successor").
+/// task; nothing else in blaze sets it (owed: drive.md).
 fn unwind_refusals() {
     static UNWIND_REFUSALS: std::sync::Once = std::sync::Once::new();
     UNWIND_REFUSALS.call_once(|| {
@@ -886,7 +886,7 @@ pub(crate) fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, 
                 paths.push((name, at, path_bytes.len() as u32, false));
             }
             // The file's surface, its own part: what name resolution reads of it, never a body
-            // (drive.md, "SPEC, the NAMES step"). A body edit leaves its source, so it stands.
+            // (drive.md). A body edit leaves its source, so it stands.
             // Name resolution records physical file paths. Its read of this slot's surface
             // must move when the same text is found at the other module path.
             let file = crate::signature::SignatureFile::new(path.as_bytes());

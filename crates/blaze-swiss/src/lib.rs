@@ -1,5 +1,4 @@
-//! The SwissTable group probe every interner's table shares (docs/v2/plan/design/data.md,
-//! "interner and memo lookups"): `intern`'s arena store and mapped index, and the query engine's
+//! The SwissTable group probe every interner's table shares (docs/v2/plan/design/bottom.md section 13): `intern`'s arena store and mapped index, and the query engine's
 //! interned key map. `blaze-mem` re-exports it as `blaze_mem::swiss` and `intern` as
 //! `intern::swiss`; it is a crate of its own with no dependencies, so `blaze-ids`, at the bottom
 //! of the tree, reaches it without `blaze-mem`'s allocators, channels and system calls

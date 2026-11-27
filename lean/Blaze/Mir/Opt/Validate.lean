@@ -4,7 +4,7 @@ import Blaze.Mir.Opt.RemoveNops
 import Blaze.Mir.Opt.ConstFold
 
 /-!
-A translation validator proved sound once (objective V8's second half; Pnueli, Siegel and
+A translation validator proved sound once (Pnueli, Siegel and
 Singerman's translation validation, with Alive2's lesson that the checker is the small
 thing to trust, here proved).
 

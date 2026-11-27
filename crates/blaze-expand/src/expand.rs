@@ -248,6 +248,37 @@ impl<'a> Out<'_, 'a> {
         Ok(ctx)
     }
 
+    /// Context for an explicit `$crate` token transcribed from `origin` (`token-mark-3`):
+    /// 1. When the token in `def.body()`/`def.params()` already carries a non-transparent mark
+    ///    from an enclosing expansion (e.g. `blaze-lower` `LocalForm::RulesExpanded`), keeps that
+    ///    context without pushing this inner macro's mark on top.
+    /// 2. Otherwise, when `def.dollar_crate()` overrides `def.site().krate` (a generated macro
+    ///    lowered from text), stamps `def.dollar_crate_mark(...)` so `$crate` names the foreign
+    ///    crate while non-`$crate` tokens (including `local_inner_macros` bare calls) keep
+    ///    `def.site().krate`.
+    /// 3. Otherwise returns `Ok(None)` so the caller uses [`Out::ctx_for`].
+    pub(crate) fn dollar_crate_ctx(&mut self, origin: TokenOrigin) -> Result<Option<Ctx>, ExpandError> {
+        let (src, at) = match origin {
+            TokenOrigin::Def(at) => (self.def.body(), at),
+            TokenOrigin::Params(at) => match self.def.params() {
+                Some(params) => (params, at),
+                None => return Err(ExpandError::ForeignOrigin { origin }),
+            },
+            _ => return Ok(None),
+        };
+        let idx = usize::try_from(at).map_err(|_| ExpandError::ForeignOrigin { origin })?;
+        let token = src.tokens().get(idx).ok_or(ExpandError::ForeignOrigin { origin })?;
+        if src.non_transparent_mark(token.ctx).is_some() {
+            return Ok(Some(self.exp.tokens.import_ctx(src, token.ctx)?));
+        }
+        if self.def.dollar_crate().is_some() {
+            let parent = self.exp.tokens.import_ctx(src, token.ctx)?;
+            let mark = self.def.dollar_crate_mark(self.def.transparency());
+            return Ok(Some(self.exp.tokens.context(CtxNode { parent, mark })?));
+        }
+        Ok(None)
+    }
+
     /// A token the expansion makes.
     pub(crate) fn made(
         &mut self,

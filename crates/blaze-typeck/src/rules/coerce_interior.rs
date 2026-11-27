@@ -70,27 +70,36 @@ impl crate::stalled::Stalled {
         src: &mut S,
         types: PTys<'_>,
     ) -> Result<Goal, S::Error> {
-        let args = match self.diag.because {
+        match self.diag.because {
             Some(Because::Unmet { goal: UnmetGoal::Trait { trait_, args }, .. })
                 if trait_ == self.trait_ && types.list(args)?.first() == Some(&self.ty) =>
             {
-                import_list(cx, src, types, args, &[], 0)?
+                let args = import_list(cx, src, types, args, &[], 0)?;
+                Ok(Goal::Trait { trait_: self.trait_, args })
+            }
+            Some(Because::Unmet { goal: UnmetGoal::Projection { trait_, args, name, term }, leaf: None })
+                if trait_ == self.trait_ && types.list(args)?.first() == Some(&self.ty) =>
+            {
+                let args = import_list(cx, src, types, args, &[], 0)?;
+                let term = import(cx, src, types, term, &[], 0)?;
+                Ok(Goal::Projection { trait_: self.trait_, args, name, term })
             }
             Some(Because::Unmet { leaf: Some(UnmetGoal::Trait { trait_, args }), .. })
                 if trait_ == self.trait_ && types.list(args)?.first() == Some(&self.ty) =>
             {
-                import_list(cx, src, types, args, &[], 0)?
+                let args = import_list(cx, src, types, args, &[], 0)?;
+                Ok(Goal::Trait { trait_: self.trait_, args })
             }
             Some(Because::False(_) | Because::Error(_) | Because::Generic(_)) => {
                 // Only unary auto goals keep a where-const reason in the stalled row.
                 let ty = import(cx, src, types, self.ty, &[], 0)?;
-                cx.mk_list(&[ty])?
+                let args = cx.mk_list(&[ty])?;
+                Ok(Goal::Trait { trait_: self.trait_, args })
             }
-            _ => return Err(CheckError::Malformed(crate::error::Malformed::StalledGoal {
+            _ => Err(CheckError::Malformed(crate::error::Malformed::StalledGoal {
                 trait_: self.trait_, at: self.diag.at,
             }).into()),
-        };
-        Ok(Goal::Trait { trait_: self.trait_, args })
+        }
     }
 }
 

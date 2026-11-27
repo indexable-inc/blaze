@@ -219,7 +219,7 @@ def overlay(tree):
         open(os.path.join(tree, "bun-exe", name), "w").write(text)
     edit(os.path.join(tree, "Cargo.toml"), '  "src/bunfig",\n', '  "src/bunfig",\n  "bun-exe",\n')
     # A sandboxed build script is given only what cargo documents, what it says it reads and
-    # what the root manifest names (docs/cargo.md): bun_core's reads BUN_CODEGEN_DIR without
+    # what the root manifest names: bun_core's reads BUN_CODEGEN_DIR without
     # saying so, and bun-exe's needs BUN_NATIVE_LINK_ARGS on its first run.
     manifest = os.path.join(tree, "Cargo.toml")
     if SANDBOX_ENV not in open(manifest).read():

@@ -571,6 +571,13 @@ pub(crate) fn write_records_opt<'a, 'b>(
             }
             exports_scopes.push(Some(exports.write(alloc)?));
         }
+        for (def, m) in names.tables.macros.iter() {
+            if let Some(dc) = m.dollar_crate
+                && named.contains_key(def)
+            {
+                add_reach(ItemKey(dc.0), &mut exports_reach);
+            }
+        }
         let exports = write_part(names, &modules, &exports_scopes, &exports_reach, &|k| named.contains_key(k), alloc)?;
         return Ok(Records { exports, inner: RecordBytes::new_in(alloc) });
     }
@@ -612,6 +619,15 @@ pub(crate) fn write_records_opt<'a, 'b>(
             }
             exports_scopes.push(None);
             inner_scopes.push(Some(scope.write(alloc)?));
+        }
+    }
+    for (def, m) in names.tables.macros.iter() {
+        if let Some(dc) = m.dollar_crate {
+            if named.contains_key(def) {
+                add_reach(ItemKey(dc.0), &mut exports_reach);
+            } else {
+                add_reach(ItemKey(dc.0), &mut inner_reach);
+            }
         }
     }
     let exports = write_part(names, &modules, &exports_scopes, &exports_reach, &|k| named.contains_key(k), alloc)?;
@@ -843,8 +859,7 @@ impl Ready<'static> {
 /// only records: its direct dependencies' and the sysroot crates before it in the graph's order
 /// (it waits for those), then what each `Need` names. One [`Prepares`] for the whole call: a
 /// macro defined in one crate and called in fifty is prepared once. A measurement and the
-/// proof's other side, not the driver: the driver keys, stores and schedules (drive.md, "SPEC,
-/// the NAMES step"). The answer is by crate index; `needs` counts the re-entries a `Need` made.
+/// proof's other side, not the driver: the driver keys, stores and schedules (drive.md). The answer is by crate index; `needs` counts the re-entries a `Need` made.
 /// `alloc` is taken from every worker at once: it must be a heap any thread may use (as
 /// `par`'s threads already require).
 pub fn resolve_by_records<'a, S: SourceTexts<'a>, P: Par>(

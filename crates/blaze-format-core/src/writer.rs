@@ -324,8 +324,8 @@ impl<A: Allocator> core::fmt::Debug for AlignedIn<A> {
 
 /// DEPRECATED: [`AlignedIn`] on the global heap, for the callers that held one before the
 /// allocator was named (D170 C1): about a hundred calls in blaze-keyed, blaze-expand,
-/// blaze-surface, blaze-impls, blaze-scope, blaze-file-items, blaze-run, blaze-lir,
-/// blaze-hashcons and blaze-format-tiers, each moved to [`AlignedIn::copy_from`] with its own
+/// blaze-surface, blaze-impls, blaze-scope, blaze-file-items, blaze-run, blaze-lir and
+/// blaze-hashcons, each moved to [`AlignedIn::copy_from`] with its own
 /// allocator by its crate's conversion. No new caller may use it.
 #[cfg(feature = "alloc")]
 #[derive(Clone)]

@@ -248,7 +248,6 @@ pub enum ClockId {
     /// (include/linux/posix-timers.h). What glibc's `pthread_getcpuclockid` returns for that
     /// thread's handle.
     /// replaces libc::pthread_getcpuclockid (Linux, by tid: blaze_sys::linux::ClockId::ThreadCpuOf(tid))
-    /// replaces blaze_profile::sampler::linux's hand-made `(!tid << 3) | 6` clock id
     ThreadCpuOf(i32),
 }
 

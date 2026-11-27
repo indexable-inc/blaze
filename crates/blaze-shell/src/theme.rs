@@ -1,12 +1,13 @@
-//! Design tokens matching `ix.dev/blaze` (`site/styles/tokens.css`).
+//! Design tokens matched to the owner's Ghostty theme (`~/.config/ghostty/themes/custom-dark`).
 //!
-//! Warm neutral charcoal grayscale ladder (`--g-0`..`--g-13`), monochrome-first
-//! typography (`--ink-1`..`--ink-4`), and colour reserved strictly for meaning:
-//! `--fire` (`#e0461a`), `--ok` (`#4cc27a`), `--danger` (`#ff7168`), and the
-//! validated chart/icon series (`--series-1..3`).
+//! Neutral grey ladder rebased on Ghostty's `background = #1e1e1e` (surfaces a few steps above
+//! it, `LINE` equal to `split-divider-color = #2a2a2a`), ink stepping down from Ghostty's
+//! `foreground = #d4d4d4`, and colour reserved for meaning, taken from the Ghostty 16-colour
+//! palette ([`ANSI_16`]) wherever one fits. `--fire` (`#e0461a`) stays the brand accent.
 
 use blaze_sh::Value;
 use blaze_sh::lex::HighlightKind;
+use blaze_vt::color::{Colors, DEFAULT_PALETTE, DynamicPalette, DynamicRgb, Rgb as VtRgb};
 
 /// Convert 8-bit RGB + alpha (`0.0..=1.0`) into `[f32; 4]`.
 #[inline]
@@ -20,63 +21,127 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> [f32; 4] {
     rgba(r, g, b, 1.0)
 }
 
+/// `c` with its alpha replaced by `a`.
+#[inline]
+pub const fn with_alpha(c: [f32; 4], a: f32) -> [f32; 4] {
+    [c[0], c[1], c[2], a]
+}
+
+/// Opaque `[f32; 4]` of a terminal [`VtRgb`].
+#[inline]
+pub const fn vt(c: VtRgb) -> [f32; 4] {
+    rgb(c.r, c.g, c.b)
+}
+
 // =============================================================================
-// Exact `ix.dev/blaze` grayscale ladder (`site/styles/tokens.css`)
+// Ghostty terminal colours (`custom-dark`): the one home for them
 // =============================================================================
 
-/// `--bg` (`--g-1`): `#101011`
-pub const BG_CANVAS: [f32; 4] = rgb(0x10, 0x10, 0x11);
-pub const BG_CANVAS_RGB: [f32; 3] = [0x10 as f32 / 255.0, 0x10 as f32 / 255.0, 0x11 as f32 / 255.0];
+const fn vrgb(r: u8, g: u8, b: u8) -> VtRgb {
+    VtRgb { r, g, b }
+}
 
-/// Seamless top bar (`--bg`).
-pub const BG_TOPBAR: [f32; 4] = rgb(0x10, 0x10, 0x11);
-/// `--bg-2` (`--g-2`): `#141415` — recessed command box & terminal well (like `$ curl ... | sh`).
-pub const BG_SURFACE: [f32; 4] = rgb(0x14, 0x14, 0x15);
-/// `--bg-3` (`--g-3`): `#19191a` — inline file/folder/code chips (like `target/`, `build.rs`).
-pub const BG_CHIP: [f32; 4] = rgb(0x19, 0x19, 0x1a);
-/// `--bg-4` (`--g-4`): `#1f1f20` — subtle button & progress track fill.
-pub const BG_TRACK: [f32; 4] = rgb(0x1f, 0x1f, 0x20);
-/// Floating popup surface `#161617`.
-pub const BG_POPUP: [f32; 4] = rgb(0x16, 0x16, 0x17);
-/// Selection / hover highlight (`--s-tint`).
-pub const BG_SELECTED: [f32; 4] = rgba(0xeb, 0xea, 0xe6, 0.06);
-pub const BG_SELECTION: [f32; 4] = rgba(0xeb, 0xea, 0xe6, 0.14);
+/// Ghostty `background`: `#1e1e1e`.
+pub const TERM_BG: VtRgb = vrgb(0x1e, 0x1e, 0x1e);
+/// Ghostty `foreground`: `#d4d4d4`.
+pub const TERM_FG: VtRgb = vrgb(0xd4, 0xd4, 0xd4);
+/// Ghostty `cursor-color`: `#f5e0dc`.
+pub const TERM_CURSOR: VtRgb = vrgb(0xf5, 0xe0, 0xdc);
+/// The composer's caret: Ghostty `cursor-color` `#f5e0dc`.
+pub const CURSOR: [f32; 4] = vt(TERM_CURSOR);
+/// Text under a block caret: Ghostty `cursor-text` `#1e1e1e`.
+pub const CURSOR_TEXT: [f32; 4] = vt(TERM_BG);
 
-/// `--line` (`--g-5`): `#28282a`
-pub const LINE: [f32; 4] = rgb(0x28, 0x28, 0x2a);
-/// Subtle separator between blocks (`#1c1c1e`).
-pub const LINE_FAINT: [f32; 4] = rgb(0x1c, 0x1c, 0x1e);
-/// `--line-2` (`--g-6`): `#333335`
-pub const LINE_STRONG: [f32; 4] = rgb(0x33, 0x33, 0x35);
+/// Ghostty `palette = 0..15`.
+pub const ANSI_16: [VtRgb; 16] = [
+    vrgb(0x00, 0x00, 0x00),
+    vrgb(0xf3, 0x8b, 0xa8),
+    vrgb(0xa6, 0xe3, 0xa1),
+    vrgb(0xf9, 0xe2, 0xaf),
+    vrgb(0x89, 0xb4, 0xfa),
+    vrgb(0xcb, 0xa6, 0xf7),
+    vrgb(0x94, 0xe2, 0xd5),
+    vrgb(0xe0, 0xd8, 0xc0),
+    vrgb(0x58, 0x5b, 0x70),
+    vrgb(0xf3, 0x8b, 0xa8),
+    vrgb(0xa6, 0xe3, 0xa1),
+    vrgb(0xf9, 0xe2, 0xaf),
+    vrgb(0x89, 0xb4, 0xfa),
+    vrgb(0xcb, 0xa6, 0xf7),
+    vrgb(0x94, 0xe2, 0xd5),
+    vrgb(0xfa, 0xf0, 0xc8),
+];
+
+/// Give a terminal the Ghostty defaults: background, foreground, cursor and the 16 named
+/// palette colours (the 256-colour cube and grey ramp stay xterm's). Call once on a fresh
+/// terminal, before any OSC can override them.
+pub fn apply_terminal_colors(colors: &mut Colors) {
+    let mut palette = DEFAULT_PALETTE;
+    palette[..16].copy_from_slice(&ANSI_16);
+    colors.palette = DynamicPalette::new(palette);
+    colors.background = DynamicRgb::new(TERM_BG);
+    colors.foreground = DynamicRgb::new(TERM_FG);
+    colors.cursor = DynamicRgb::new(TERM_CURSOR);
+}
+
+// =============================================================================
+// Neutral grey ladder over Ghostty's `#1e1e1e`
+// =============================================================================
+
+/// Canvas: Ghostty `background` `#1e1e1e`.
+pub const BG_CANVAS: [f32; 4] = vt(TERM_BG);
+pub const BG_CANVAS_RGB: [f32; 3] = [BG_CANVAS[0], BG_CANVAS[1], BG_CANVAS[2]];
+
+/// Seamless top bar (the canvas, `#1e1e1e`).
+pub const BG_TOPBAR: [f32; 4] = BG_CANVAS;
+/// `#232323` — recessed command box & terminal well (like `$ curl ... | sh`).
+pub const BG_SURFACE: [f32; 4] = rgb(0x23, 0x23, 0x23);
+/// `#282828` — inline file/folder/code chips (like `target/`, `build.rs`).
+pub const BG_CHIP: [f32; 4] = rgb(0x28, 0x28, 0x28);
+/// `#2e2e2e` — subtle button & progress track fill.
+pub const BG_TRACK: [f32; 4] = rgb(0x2e, 0x2e, 0x2e);
+/// Floating popup surface `#252525`.
+pub const BG_POPUP: [f32; 4] = rgb(0x25, 0x25, 0x25);
+/// Hover / visual-mode highlight: a faint wash of Ghostty `foreground`.
+pub const BG_SELECTED: [f32; 4] = rgba(0xd4, 0xd4, 0xd4, 0.06);
+/// Text selection: Ghostty `selection-background` `#313244` (drawn under the text).
+pub const BG_SELECTION: [f32; 4] = rgb(0x31, 0x32, 0x44);
+
+/// Ghostty `split-divider-color`: `#2a2a2a`.
+pub const LINE: [f32; 4] = rgb(0x2a, 0x2a, 0x2a);
+/// Subtle separator between blocks (`#252525`).
+pub const LINE_FAINT: [f32; 4] = rgb(0x25, 0x25, 0x25);
+/// Stronger rule (`#363636`).
+pub const LINE_STRONG: [f32; 4] = rgb(0x36, 0x36, 0x36);
 
 /// Soft drop shadow for floating popups only.
 pub const SHADOW_SOFT: [f32; 4] = rgba(0x00, 0x00, 0x00, 0.55);
 
 // =============================================================================
-// Exact `ix.dev/blaze` warm-stone ink ladder
+// Neutral ink ladder down from Ghostty's `foreground`
 // =============================================================================
 
-/// `--ink-1` (`--g-13`): `#ebeae6` — warm paper-white primary ink.
-pub const INK_1: [f32; 4] = rgb(0xeb, 0xea, 0xe6);
-/// `--ink-2` (`--g-11`): `#b3b2af` — secondary body & values.
-pub const INK_2: [f32; 4] = rgb(0xb3, 0xb2, 0xaf);
-/// `--ink-3`: `#878684` — headers, flags, timestamps, keys.
-pub const INK_3: [f32; 4] = rgb(0x87, 0x86, 0x84);
-/// `--ink-4` (`--g-8`): `#57575a` — `$`, `#`, dim metadata.
-pub const INK_4: [f32; 4] = rgb(0x57, 0x57, 0x5a);
+/// Primary ink: Ghostty `foreground` `#d4d4d4`.
+pub const INK_1: [f32; 4] = vt(TERM_FG);
+/// `#a8a8a8` — secondary body & values.
+pub const INK_2: [f32; 4] = rgb(0xa8, 0xa8, 0xa8);
+/// `#858585` — headers, flags, timestamps, keys.
+pub const INK_3: [f32; 4] = rgb(0x85, 0x85, 0x85);
+/// `#5a5a5a` — `$`, `#`, dim metadata.
+pub const INK_4: [f32; 4] = rgb(0x5a, 0x5a, 0x5a);
 
 // =============================================================================
-// Semantic colours only (`site/styles/tokens.css`)
+// Semantic colours only (Ghostty palette where one fits)
 // =============================================================================
 
 /// `--fire`: `#e0461a` — the brand's fire: the one accent for what matters now.
 pub const FIRE: [f32; 4] = rgb(0xe0, 0x46, 0x1a);
 pub const FIRE_FAINT: [f32; 4] = rgba(0xe0, 0x46, 0x1a, 0.14);
-/// `--ok`: `#4cc27a`
-pub const OK: [f32; 4] = rgb(0x4c, 0xc2, 0x7a);
-/// `--danger`: `#ff7168`
-pub const DANGER: [f32; 4] = rgb(0xff, 0x71, 0x68);
-pub const DANGER_FAINT: [f32; 4] = rgba(0xff, 0x71, 0x68, 0.06);
+/// Ghostty green (`palette = 2`): `#a6e3a1`.
+pub const OK: [f32; 4] = vt(ANSI_16[2]);
+/// Ghostty red (`palette = 1`): `#f38ba8`.
+pub const DANGER: [f32; 4] = vt(ANSI_16[1]);
+pub const DANGER_FAINT: [f32; 4] = rgba(0xf3, 0x8b, 0xa8, 0.06);
 
 /// `--series-1`: `#d95926` (Rust / crate icon)
 pub const SERIES_ORANGE: [f32; 4] = rgb(0xd9, 0x59, 0x26);
@@ -85,33 +150,33 @@ pub const SERIES_BLUE: [f32; 4] = rgb(0x39, 0x87, 0xe5);
 /// `--series-3`: `#199e70` (Config / duration accent)
 pub const SERIES_AQUA: [f32; 4] = rgb(0x19, 0x9e, 0x70);
 
-// Starship prompt semantic accents (clean pastel-vivid on warm `#101011` charcoal).
-/// Starship directory accent (crisp cyan-teal).
-pub const PROMPT_DIR: [f32; 4] = rgb(0x6e, 0xd8, 0xce);
-/// Starship git branch accent (soft violet-lavender).
-pub const PROMPT_BRANCH: [f32; 4] = rgb(0xc7, 0x9b, 0xf2);
-/// Starship git status `[?!+⇡]` badge accent (soft coral-rose).
-pub const PROMPT_STATUS: [f32; 4] = rgb(0xf2, 0x7d, 0x9a);
-/// Starship `❯` ok prompt accent (mint green).
-pub const PROMPT_OK: [f32; 4] = rgb(0x7a, 0xd8, 0x96);
-/// Starship sparkle / indicator accent (soft sky-periwinkle).
-pub const PROMPT_SPARK: [f32; 4] = rgb(0x74, 0xb0, 0xf7);
+// Starship prompt accents, from the Ghostty palette over the `#1e1e1e` canvas.
+/// Directory: Ghostty cyan (`palette = 6`) `#94e2d5`.
+pub const PROMPT_DIR: [f32; 4] = vt(ANSI_16[6]);
+/// Git branch: Ghostty magenta (`palette = 5`) `#cba6f7`.
+pub const PROMPT_BRANCH: [f32; 4] = vt(ANSI_16[5]);
+/// Git status `[?!+⇡]`: Ghostty red (`palette = 1`) `#f38ba8`.
+pub const PROMPT_STATUS: [f32; 4] = vt(ANSI_16[1]);
+/// `❯` after a success: Ghostty green (`palette = 2`) `#a6e3a1`.
+pub const PROMPT_OK: [f32; 4] = vt(ANSI_16[2]);
+/// Sparkle / indicator: Ghostty blue (`palette = 4`) `#89b4fa`.
+pub const PROMPT_SPARK: [f32; 4] = vt(ANSI_16[4]);
 /// Fish-style inline ghost autosuggestion text.
-pub const GHOST_INK: [f32; 4] = rgb(0x56, 0x56, 0x5c);
-/// Completion & history matched-character highlight (IntelliJ New UI signature vivid blue).
-pub const MATCH_HIGHLIGHT: [f32; 4] = rgb(0x58, 0x9d, 0xf6);
+pub const GHOST_INK: [f32; 4] = rgb(0x5a, 0x5a, 0x5a);
+/// Completion & history matched-character highlight: Ghostty blue `#89b4fa`.
+pub const MATCH_HIGHLIGHT: [f32; 4] = vt(ANSI_16[4]);
 /// IntelliJ New UI dark-blue selected completion row fill.
 pub const COMPLETION_SEL_BG: [f32; 4] = rgb(0x27, 0x3b, 0x5c);
 
 // Semantic command-position syntax colors (distinct builtin vs external binary vs abbreviation).
-/// Builtin / `blaze-sh` native command (`ls`, `open`, `where`, `sort-by`): crisp sky-blue.
-pub const CMD_BUILTIN: [f32; 4] = rgb(0x5c, 0xb8, 0xff);
-/// External `$PATH` binary (`fd`, `rg`, `claude`, `git`, `vim`): warm IntelliJ method-gold.
-pub const CMD_EXTERNAL: [f32; 4] = rgb(0xe5, 0xc0, 0x7b);
-/// Command-position abbreviation (`cl`, `gs`, `ll`, `bc`): vivid IntelliJ lavender.
-pub const CMD_ABBREV: [f32; 4] = rgb(0xc6, 0x78, 0xdd);
-/// Unresolved/unknown command token: soft coral red.
-pub const CMD_UNKNOWN: [f32; 4] = rgb(0xe0, 0x6c, 0x75);
+/// Builtin / `blaze-sh` native command (`ls`, `open`, `where`, `sort-by`): Ghostty blue `#89b4fa`.
+pub const CMD_BUILTIN: [f32; 4] = vt(ANSI_16[4]);
+/// External `$PATH` binary (`fd`, `rg`, `claude`, `git`, `vim`): Ghostty yellow `#f9e2af`.
+pub const CMD_EXTERNAL: [f32; 4] = vt(ANSI_16[3]);
+/// Command-position abbreviation (`cl`, `gs`, `ll`, `bc`): Ghostty magenta `#cba6f7`.
+pub const CMD_ABBREV: [f32; 4] = vt(ANSI_16[5]);
+/// Unresolved/unknown command token: Ghostty red `#f38ba8`.
+pub const CMD_UNKNOWN: [f32; 4] = vt(ANSI_16[1]);
 
 /// IntelliJ New UI Dark inspired syntax highlighting:
 /// builtins in sky-blue, external `$PATH` commands in warm gold, abbreviations in lavender,
@@ -134,7 +199,7 @@ pub fn highlight_color(kind: HighlightKind) -> [f32; 4] {
     }
 }
 
-/// Restrained `ix.dev/blaze` semantic color for structured [`Value`] cells.
+/// Restrained semantic color for structured [`Value`] cells.
 pub fn value_color(val: &Value<'_>) -> [f32; 4] {
     match val {
         Value::Nothing => INK_4,

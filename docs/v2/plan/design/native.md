@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Native code in a blaze program (C, C++ and assembly from -sys crates); an inventory of tempo's lock, native objects as records made behind an abstract ToolRun effect, and blaze's own in-process loader that places one native image from a pure load plan (crates/blaze-native-load), binding TLS, unwind, initializers and system libraries.
+summary: Native code in a blaze program (C, C++ and assembly from -sys crates); an inventory of tempo's lock, native objects as records made behind an abstract ToolRun effect, one image per links component built when its first symbol is bound, and blaze's own in-process loader that places an image from a pure load plan, binding TLS, unwind, initializers and system libraries. The readers, resolver and layout are built (crates/blaze-native); the plan, the binding and the driver are not.
 date: 2026-11-18
 ---
 # Native code: records, one image, our own loader
@@ -17,7 +17,7 @@ task". What exists in the tree today:
 | Unwind rows, the BNL2 descriptor, install names | `crates/blaze-native/src/{unwind,descriptor,libraries}.rs` |
 | The image written as a dylib or .so | `crates/blaze-export/src/native_{dylib,so,merge}.rs` |
 | `dlopen` of that file in the launcher | `crates/blaze-launch-rt/src/native_lib.rs` |
-| **The load plan and its binding (this doc's new piece)** | `crates/blaze-native-load/` |
+| **The load plan and its binding (this doc's new piece)** | not in the tree |
 
 ## Inventory: tempo's Cargo.lock
 
@@ -96,8 +96,10 @@ tracy), and a malloc that replaces the system's (jemalloc).
 
 ## Decisions
 
-1. **One native image per program, from blaze-native.** The readers, resolver and layout that
-   exist stay the one home (rule 30); nothing here parses or relocates a second time.
+1. **One native image per links component, from blaze-native, built when its first symbol is
+   bound** (D193 (4)): a test program does not build its whole closure's C, and the start image
+   holds no deferred C. The readers, resolver and layout that exist stay the one home (rule 30);
+   nothing here parses or relocates a second time.
 2. **A native object is a record, made behind an abstract `ToolRun` effect.**
 3. **blaze loads the image itself, in process, from a pure load plan;** dyld and ld.so are asked
    only for system libraries, by install name and symbol name.
@@ -122,18 +124,20 @@ rebuilds one object (rule 65). An archive is never a record: the resolver reads 
 crate's native output is its list of object records.
 
 The effect is abstract: a core asks for `ToolRun { tool, argv, inputs, outputs }` and is answered
-with output bytes or a typed refusal. Three executors can answer it:
+with output bytes or a typed refusal. The C compiler is the one pinned C toolchain, run natively
+and never as wasm (D174); every other tool a step runs comes from the pinned base tool set,
+named by digest (D192). Two executors can answer it:
 
 | Executor | Runs | Cost | Cannot do |
 | --- | --- | --- | --- |
-| hvbox (hvbox.md, D92) | the real clang, ld, make, cmake as macOS guests with every syscall answered | near native | nothing on the owner's Mac until he says (it panicked the kernel); not built for Linux |
-| clang compiled to wasm, run in Wasmtime | the C, C++ and assembly front ends and the arm64 back end | about 2x to 4x a native clang per translation unit (Cranelift-compiled module, no LTO of the host); one load of a ~60 MB module per helper | no `configure` and `make` (jemalloc), no perl (ring and sha3-asm's perlasm: their published .S is used instead), no nasm (x86 only), no cmake (aws-lc's cmake is replaced by its source list, as NATIVE.md W3 says) |
-| a published record | nothing: the record is fetched by key from the shared cache, filled by CI | a fetch | anything not on the published list; a private patch to a -sys crate builds locally |
+| hvbox (hvbox.md, D92), through its synthetic root (`/tools`, `/package`, `/out`, `/sdk`) | the pinned clang and ld, and the base set's sh, make, cmake and perl, as guests with every syscall answered | near native | nothing on the owner's Mac until he says (it panicked the kernel); not built for Linux; Seatbelt (`Level::Inputs`) serves until then |
+| a published record (an option, off unless chosen) | nothing: the record is fetched by key from the shared cache, filled by CI | a fetch | anything not on the published list; a private patch to a -sys crate builds locally |
 
 The published list starts with every native crate of the inventory's table (they are popular and
-their keys are stable), so a cold tempo build compiles no C at all.
+their keys are stable). Without fetching, a new checkout finds each object a build on the
+machine already made in the machine's own store.
 
-### 3. The loader
+### 3. The loader (not built)
 
 The image is laid by `blaze_native::layout::lay` as today. Then, instead of writing a dylib
 and calling `dlopen`:
@@ -145,7 +149,7 @@ and calling `dlopen`:
   keyed by the image, and its bytes are deterministic (`LoadPlan::encode`).
 - `blaze_native_load::bind::bind(&plan, &site)` answers every store at a base, given what the
   driver found: each import's address, the Rust words' entry thunks and the TLS helpers.
-- The driver (the launcher; not written) runs the eight steps bind.rs lists.
+- The driver (the launcher; not written) runs the binding's steps.
 
 Why not `dlopen` of a written file:
 
@@ -230,11 +234,11 @@ registration runs as one of its initializers.
 
 | Item | Home |
 | --- | --- |
-| Parse with bounds checks | `blaze_native::{macho, elf, ar}` (existing); planted lies in `blaze-native-load/tests/macho_lies.rs` |
+| Parse with bounds checks | `blaze_native::{macho, elf, ar}` (existing) |
 | Lay out | `blaze_native::layout::lay` (existing) |
 | Resolve | `blaze_native::resolve::plan` (existing) |
-| Relocate | `blaze_native::layout` writes (existing, private); `blaze_native_load::a64` reads back |
-| The plan | `blaze_native_load::plan` |
-| The binding | `blaze_native_load::bind` |
+| Relocate | `blaze_native::layout` writes (existing, private) |
+| The plan | not in the tree |
+| The binding | not in the tree |
 | The driver (map, protect, TLS, unwind, inits) | the launcher: not written |
 | The `ToolRun` effect and object records | not written |

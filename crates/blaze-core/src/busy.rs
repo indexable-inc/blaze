@@ -1,7 +1,7 @@
 //! When an exec that met `ETXTBSY` is made again: the file was just written, and a process
 //! forked before its writer closed it still holds a copy of that descriptor until its own exec,
 //! which is microseconds. Every spawn of blaze's that can meet it waits by this schedule: the
-//! drivers' (`process`), `blaze debug sql`'s DuckDB, and blaze's sandbox launcher's exec of the
+//! drivers' (`process`) and blaze's sandbox launcher's exec of the
 //! program. The same exec of the same file each time, never another path or a copy; past
 //! [`MOST_NS`] it fails, naming the file and the error.
 //!

@@ -21,7 +21,7 @@ use crate::{
 pub(crate) fn assembled(dialect: Dialect, text: &str) -> Result<Vec<u32>, crate::asm::AsmError> {
     let heap = blaze_own::testing::heap();
     let mut code = Vec::new();
-    let mut reader = Assembler::new(dialect, &mut code, heap.alloc());
+    let mut reader = Assembler::new(dialect, &mut code, &[], heap.alloc());
     reader.feed(text.as_bytes())?;
     reader.finish()?;
     assert_eq!(code.len() % 4, 0, "A64 instructions are whole words");
@@ -198,4 +198,62 @@ fn barrier_returns_input_unchanged() {
         }
     }
     println!("asm::barrier: template bytes 0 (floor 0) for each of 5 forms; x returned unchanged");
+}
+
+/// A `#[unsafe(naked)]` function (`FnAttrs::NAKED`) emits ONLY its `naked_asm!` instructions
+/// (no prologue, no epilogue, no unwind frame) and binds `bl {sym}` to a `SiteKind::Call` site
+/// in record form.
+#[test]
+fn naked_fn_emits_bare_instructions_and_sym_call_site() {
+    use blaze_code::record::{SiteKind, Symbol};
+    use blaze_lir::{
+        Builder, Full,
+        builder::Variadic,
+        func::{AsmRec, BlockKind, Conv, FnAttrs, RefKind},
+    };
+    use crate::{Named, Names, Outside, emit_record};
+
+    struct OneFn;
+    impl Names for OneFn {
+        fn name(&self, of: Outside) -> Option<Named<'_>> {
+            match of {
+                Outside::Func(0) => Some(Named::Symbol(Symbol([0x11; 32]))),
+                _ => None,
+            }
+        }
+    }
+
+    let heap = blaze_own::testing::heap();
+    let mut b = Builder::<_, Full>::new_in(64, heap.alloc());
+    b.set_attrs(FnAttrs(FnAttrs::NAKED));
+    let sig = b.sig(Conv::C, Variadic::No, &[], &[]);
+    b.set_signature(sig);
+    let callee = b.reference(RefKind::Func, 0);
+    let op = AsmOperand { kind: AsmOperandKind::Sym, reg: "", reg_kind: RegKind::Class, aux: callee.0 };
+    let asm_id = b.asm_block(
+        &[
+            AsmPiece::Text("stp x29, x30, [sp, #-16]!\nmov x29, sp\nbl "),
+            AsmPiece::Operand { index: 0, modifier: None },
+            AsmPiece::Text("\ncbz x0, 2f\nstr x0, [sp, #8]\n2:\nldp x29, x30, [sp], #16\nret"),
+        ],
+        &[op],
+        AsmRec::NAKED | AsmRec::NORETURN,
+        "",
+    );
+    let entry = b.create_block(BlockKind::Normal);
+    b.begin(entry);
+    b.asm(asm_id, Ty::NONE, &[]);
+    b.unreachable();
+    let verified = b.finish_verified().expect("naked LIR verifies");
+    let (record, _called) = emit_record(verified.verified(), &OneFn, &blaze_tier::RoutinePlaces::NONE, ISA, heap.alloc())
+        .expect("naked fn emits record");
+    // 2 words before bl + 3 words for bl site (adrp+ldr+blr) + 4 words after = 9 words = 36 bytes.
+    assert_eq!(record.code.len(), 36, "bare naked instructions only (no prologue/epilogue/brk)");
+    assert_eq!(record.sites.len(), 1, "one call site for `bl {{sym}}`");
+    assert_eq!(record.sites[0].at, 8, "call site starts right after `stp` + `mov`");
+    assert_eq!(record.sites[0].kind, SiteKind::Call);
+    assert_eq!(record.frame, 0, "naked fn has no unwind frame word");
+    // Verify `cbz x0, 2f` at offset 20 jumps forward 8 bytes (+2 words, over `str` to `ldp`).
+    let cbz = u32::from_le_bytes(record.code[20..24].try_into().unwrap());
+    assert_eq!(cbz, 0xb400_0040, "cbz x0, .+8");
 }

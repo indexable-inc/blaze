@@ -21,11 +21,12 @@
 //! - enum rows, 40 bytes, strictly increasing by owner: owner, first variant u32, count u32;
 //! - variant rows, 48 bytes, the names record's form (one reader for both,
 //!   [`crate::names_record::Variants`]): key, name at u32 and length u32, record u8, 7 zeros;
-//! - macro rows, 96 bytes, strictly increasing by definition: definition, module, name at u32
+//! - macro rows, 128 bytes, strictly increasing by definition: definition, module, name at u32
 //!   and length u32, the body's first and second texts (at u32, length u32; (0, 0) unused),
 //!   export u8, local-inner u8, body tag u8 (0 `macro_rules!`, 1 a 2.0 `macro`, 2 a builtin
 //!   function, 3 a builtin attribute, 4 a proc macro, 5 a builtin derive), extra u8 (a 2.0
-//!   macro's has-params, a call shape, a proc-macro kind; else 0), 4 zeros;
+//!   macro's has-params, a call shape, a proc-macro kind; else 0), has-dollar-crate u8 (0 or 1),
+//!   3 zeros, dollar-crate 32 bytes (zeros without);
 //! - the strings: the name, variant names and macro texts, each range checked UTF-8 once;
 //! - the blob: each module's blaze-surface `ModuleScope` record.
 //!
@@ -68,7 +69,13 @@ pub(crate) const MAGIC: [u8; 4] = *b"BZCS";
 // 5: read in place (2026-11-21): a fixed header of section offsets, fixed-width sorted rows and
 // one strings section in place of the length-prefixed stream; a version-4 record is refused
 // (`NotThisRecord`), so every home solves each crate once more and writes this form.
-pub(crate) const VERSION: u32 = 5;
+// 6: macro rows keep `dollar_crate` (token-mark-3: `has_dollar_crate` u8 + 32-byte `CrateItemKey`,
+// `MACRO_ROW` = 128 bytes); a version-5 record is refused (`NotThisRecord`).
+// 7: `MacroShapes` bit 3 marks Macros 2.0 (`pub macro`) definitions (excluded from the
+// `#[macro_use]` prelude); a version-6 record is refused (`NotThisRecord`).
+// 8: crate-level `#![recursion_limit = "N"]` raises macro expansion depth past 128; a version-7
+// record is refused (`NotThisRecord`).
+pub(crate) const VERSION: u32 = 8;
 pub(crate) const ALIGN: usize = 16;
 /// The errored flag of an error crate's record (crate_scope.rs `error_record`); 0 in any other.
 pub(crate) const ERRORED: u8 = 1;
@@ -86,7 +93,7 @@ const SECTIONS_AT: usize = 116;
 const MODULE_ROW: usize = 48;
 const ENUM_ROW: usize = 40;
 const VARIANT_ROW: usize = VARIANT_ROW_WIDTH;
-const MACRO_ROW: usize = 96;
+const MACRO_ROW: usize = 128;
 
 const REACHES: usize = 0;
 const MODULES: usize = 1;
@@ -262,7 +269,8 @@ pub(crate) fn write<'b>(parts: &Parts<'_>, alloc: Alloc<'b>) -> Result<RecordByt
         for w in [name.0, name.1, a.0, a.1, b.0, b.1] {
             macro_rows.extend_from_slice(&w.to_le_bytes());
         }
-        macro_rows.extend_from_slice(&[u8::from(m.export), u8::from(m.local_inner), tag, extra, 0, 0, 0, 0]);
+        macro_rows.extend_from_slice(&[u8::from(m.export), u8::from(m.local_inner), tag, extra, u8::from(m.dollar_crate.is_some()), 0, 0, 0]);
+        macro_rows.extend_from_slice(&m.dollar_crate.map_or([0; KEY], |k| k.0.0));
     }
 
     let sections: [(&[u8], usize); 8] = [
@@ -573,7 +581,11 @@ fn check(bytes: &[u8], holds: Holds) -> Result<Head, RecordRead> {
                 return Err(RecordRead::BadByte { at: field, what: "unused macro text range" });
             }
         }
-        zeros(bytes, row + 92..row + MACRO_ROW, "macro row pad")?;
+        let has_dollar_crate = flag(bytes, row + 92, "macro has-dollar-crate flag")?;
+        zeros(bytes, row + 93..row + 96, "macro row pad")?;
+        if !has_dollar_crate {
+            zeros(bytes, row + 96..row + MACRO_ROW, "unused macro dollar-crate")?;
+        }
     }
     if strings_end.get() != strings_len {
         return Err(RecordRead::Layout { table: "strings", next: "blob", at: field_of(STRINGS) });
@@ -939,7 +951,19 @@ impl<'a> DepRecord<'a> {
             5 => MacroBody::BuiltinDerive { helpers: range(row + 72)? },
             _ => return None,
         };
-        Some(MacroSrc { name: range(row + 64)?, body, module: key_at(bytes, row + 32), export: bytes[row + 88] != 0, local_inner: bytes[row + 89] != 0 })
+        let dollar_crate = match bytes[row + 92] {
+            0 => None,
+            1 => Some(CrateItemKey(key_at(bytes, row + 96).0)),
+            _ => return None,
+        };
+        Some(MacroSrc {
+            name: range(row + 64)?,
+            body,
+            module: key_at(bytes, row + 32),
+            export: bytes[row + 88] != 0,
+            local_inner: bytes[row + 89] != 0,
+            dollar_crate,
+        })
     }
 
     /// Every module the record holds, by key, in the stored (key) order.

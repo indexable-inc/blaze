@@ -27,7 +27,7 @@ use blaze_build::drop_facts::needs_drop;
 use blaze_build::intrinsics::{Call, IntrinsicCx, Out, Site, Which, lir, read_discriminant, resize_in};
 use blaze_build::layout::{DynChain, Fields, LayoutCx, LayoutError, LayoutId, Layouts, Tail, Variants, mask};
 use blaze_build::vtable::VtableRef;
-use blaze_build::{Abi, Adts, Built, CallerSite, FnTrait, Instance, Panic, Subst, abi, ground};
+use blaze_build::{Abi, Adts, Built, FnTrait, Instance, Panic, Subst, abi, ground};
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
 use blaze_lir::func::{BlockKind, Conv, Ext, RefId, RefKind, SigId, SlotId, SlotKind};
 use blaze_lir::{Builder, Flags, Full, IntCond, Op, Ty, Value};
@@ -509,14 +509,19 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
     /// Materializes a `&'static Location<'static>` for `site_item`'s definition site when `callee`
     /// is `#[track_caller]`.
     fn def_site_caller_arg(&mut self, callee: Instance, site_item: ItemKey) -> Result<Option<Value>, BuildError> {
-        if self.adts.track_caller(callee, self.subst.ground) != Some(true) {
+        if self.adts.track_caller(callee, self.subst.ground).map_err(|e| BuildError::Facts { stmt: None, error: e })? != Some(true) {
             return Ok(None);
         }
+        self.def_site_location(site_item).map(Some)
+    }
+
+    /// Materializes a `&'static Location<'static>` for `site_item`'s definition site.
+    fn def_site_location(&mut self, site_item: ItemKey) -> Result<Value, BuildError> {
         let loc_adt = self.adts.location_adt().ok_or(self.malformed("`#[track_caller]` shim without `panic_location` lang item"))?;
         let loc_ty = self.subst.ground.intern(PNode::Adt(loc_adt, List::EMPTY)).map_err(|_| self.malformed("the ground table is full"))?;
         let ret = self.subst.ground.intern(PNode::Ref(Mutbl::Not, loc_ty)).map_err(|_| self.malformed("the ground table is full"))?;
         let def = self.adts.def_site(site_item).map_err(|_| self.malformed("`#[track_caller]` shim without `def_site`"))?;
-        let here = Site::Here(CallerSite { file: def.file, item: site_item, offset: def.offset });
+        let here = Site::Here(def);
         let call = Call { which: Which::CallerLocation, generics: &[], args: &[], ret, site: Some((here, loc_ty)) };
         let adts = self.adts;
         let needs_drop_cb = |_: PTy| false;
@@ -533,7 +538,7 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
         }
         .map_err(|_| self.malformed("failed to materialize `Location` in shim"))?;
         match out {
-            Out::Scalar(v) => Ok(Some(v)),
+            Out::Scalar(v) => Ok(v),
             _ => Err(self.malformed("a `Location` row whose address is not one pointer")),
         }
     }
@@ -938,15 +943,37 @@ impl<'a, 'g, 't, A: Allocator + Copy> ShimCx<'a, 'g, 't, A> {
     fn emit_one_step(&mut self, step: DropStep, unwinding: bool) -> Result<Option<blaze_lir::Block>, BuildError> {
         match step {
             DropStep::DropImpl { instance, p, meta, may_unwind } => {
+                let loc = if self
+                    .adts
+                    .track_caller(instance, self.subst.ground)
+                    .map_err(|e| BuildError::Facts { stmt: None, error: e })?
+                    == Some(true)
+                {
+                    let site_item = self
+                        .adts
+                        .lang_fn("drop_in_place")
+                        .ok_or(self.malformed("program declares no `drop_in_place` lang fn for `#[track_caller]` `Drop::drop` caller site"))?;
+                    Some(self.def_site_location(site_item)?)
+                } else {
+                    None
+                };
                 let r = self.func_ref(instance);
-                match meta {
-                    None => {
+                match (meta, loc) {
+                    (None, None) => {
                         let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
                         self.emit_void_call(ShimTarget::Direct(r), sig, &[p], may_unwind, unwinding)
                     }
-                    Some((m, mty)) => {
+                    (None, Some(loc)) => {
+                        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(Ty::PTR)], &[]);
+                        self.emit_void_call(ShimTarget::Direct(r), sig, &[p, loc], may_unwind, unwinding)
+                    }
+                    (Some((m, mty)), None) => {
                         let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(mty)], &[]);
                         self.emit_void_call(ShimTarget::Direct(r), sig, &[p, m], may_unwind, unwinding)
+                    }
+                    (Some((m, mty)), Some(loc)) => {
+                        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR), Param::of(mty), Param::of(Ty::PTR)], &[]);
+                        self.emit_void_call(ShimTarget::Direct(r), sig, &[p, m, loc], may_unwind, unwinding)
                     }
                 }
             }

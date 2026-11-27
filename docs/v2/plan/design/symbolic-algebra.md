@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: "blaze-algebra (`bstd::algebra`): zero-dependency, `#![no_std]`, `#![blaze::sans_io]` symbolic algebra, memoized DAG symbolic differentiation, bounded e-graph equality saturation, symbolic equation solving, and `const fn` comptime expression graphs — plus the two compiler seams (`expr_of` / `splice!`) connecting pure Rust functions to comptime symbolic transforms."
+summary: "blaze-algebra (`bstd::algebra`), built: a `no_std` sans-IO symbolic algebra library (hash-consed expression DAG, forward, reverse and second-order differentiation, bounded e-graph simplification, equation and linear-system solving, exact polynomials, `const fn` expression graphs and a CSE Rust emitter), and blaze-body-flow's algebra module, which lifts a verified pure body into the DAG, transforms it and splices a verified body back: built, not wired (called only from tests). Not built: the `expr_of` / `splice!` seams that let a `#[blaze::pure]` function reach the transform."
 date: 2026-11-22
 ---
 # Symbolic Algebra & Differentiation (`bstd::algebra`)
@@ -104,28 +104,16 @@ re-exported as `bstd::algebra`), backed by two small compiler seams when lifting
      instructions with zero call overhead, enabling full `blaze-body` → `blaze-body-flow::algebra` →
      `blaze-body-build` → `blaze-lir::eval` compilation and execution.
 
-## Proof
-- `blaze-algebra` (`15 passed, 0 failed`, 0 `.clone()` calls): `blaze-sim` property tests over
-  random DAGs (`diff`, `grad_reverse`, e-graph `simplify` vs `eval_dual`) and random exact
-  polynomials (`(p*r)/r == (p,0)`, Euclidean GCD divisibility, `Poly::diff == Dual tangent`),
-  with 5 planted-bug controls (`WrongSinDeriv`, `WrongQuotientSign`, `WrongReverseAdjointAccum`,
-  `WrongGcdRemainder`, `WrongPolyDiffCoeff`) proved caught by the oracle, plus `Op::Select`
-  (`relu`/`max`/`min`/`clamp` + `const fn`), `Op::Fma` + `CostModel::CpuFma`,
-  `RewriteMode::IeeeExact` vs `FastMath`, `blaze_math::Interval` dead-branch pruning, `jvp`/`hvp`/
-  `active_vars` sparsity vs full Hessian, custom `PatNode`/`RewriteRule`, `STANDARD_REWRITE_RULES`
-  + `DERIV_RULES` + byte-for-byte zero-drift verification of `lean/analysis/BlazeDiff/Generated.lean`,
-  symbolic linear system solving, and exact Newton-Raphson.
-- `blaze-body-flow::algebra` (`13 passed, 0 failed`, 0 `.clone()` calls) & `blaze-body-build` (`7 passed,
-  0 failed`, 0 `.clone()` calls): full real-compiler pipeline `blaze-typeck::check` →
-  `blaze-body-lower::lower` → `blaze_body::verify` → `run_body_transform_with_helpers` (inlining
-  pure helper `spring(x, y)` into `loss(x, y)`, differentiating w.r.t. `x`, and fusing via
-  `CostModel::CpuFma`) → `blaze_body_build::build` → verified LIR containing native hardware
-  `Op::Fma`/`Op::Sqrt`/`Op::Fabs` with zero `Op::Call` instructions → `blaze_lir::eval::run_in`
-  execution, plus modular `CalleeBodyResolver` value-and-gradient + `InlineDepthLimit` refusal,
-  unrolled 3-element dot-product loop `[f64; 3]`, interval branch pruning (7+ blocks collapsed to
-  1), HVP, exact polynomial collapsing to 2 MIR rows, cyclic refusal, and 32 `blaze-sim` random
-  MIR bodies with planted-bug control `SpliceOriginalInsteadOfDeriv`.
-- E-graph equivalence & cost-reduction property tests (`eval(orig) ≈ eval(simplified)` and
-  `cost(simplified) <= cost(original)`).
-- Symbolic solver substitution tests (`eval(lhs, x = root) ≈ eval(rhs, x = root)`).
-- Compile-time `const` symbolic differentiation & simplification tests evaluated by `rustc`/`blaze`.
+## Not wired, not built
+
+blaze-body-flow's algebra module (`run_body_transform` and the bodies around it) is built, not
+wired: no compiler pass calls it. Not built: the two seams that reach it from user code, `expr_of`
+(a `#[blaze::pure]` function's verified body as an expression graph) and `splice!` (the transformed
+body in place of a call). docs/future/autodiff.md is the wider plan they serve.
+
+## Tests
+
+crates/blaze-algebra/src/tests.rs (blaze-sim properties over random DAGs and exact polynomials,
+with planted-bug controls, and the check that `lean/analysis/BlazeDiff/Generated.lean` matches the
+rule tables byte for byte) and crates/blaze-body-flow/src/algebra/tests.rs (typeck, lower, verify,
+transform, build to LIR and `blaze_lir::eval`, with a planted-bug control).

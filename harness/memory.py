@@ -2,7 +2,7 @@
 
 The one helper the benchmarks measure memory with (bench.py and the rest); a
 harness that measures memory imports this rather than reading /proc or `ps` itself. What it
-measures, and how far off it can be, is docs/benchmarks.md, "Memory and disk". In short:
+measures, and how far off it can be:
 
 - `run` starts a command and waits for it with `wait4`. The kernel keeps the peak resident
   set of every process of the command's tree it waited for, and hands back the largest one

@@ -6,7 +6,7 @@ use blaze_manifest::layout::{DepKind, ExtraKind};
 use blaze_manifest::lock::{Lock, LockId, LockSource};
 use blaze_own::{AVec, Alloc, BTreeMap, String, Vec};
 
-use crate::input::{Ask, Bin, CfgAtom, DepSource, FeatureValue, Lib, Package, Resolver, TargetDesc};
+use crate::input::{Ask, Bin, CfgAtom, DepSource, FeatureValue, HostFeatureSide, HostUnitAsk, HostUnitKind, Lib, Package, Resolver, TargetDesc};
 use crate::extra::{Extra, has_test_cfg};
 use crate::{LeftOut, LeftOutKind, Pass, PartialGraph, Plant, Text, Unit, UnitDep, UnitError, UnitGraph, UnitId, UnitKind};
 
@@ -119,13 +119,18 @@ fn own<'a>(s: &str, alloc: Alloc<'a>) -> Text<'a> {
     String::from_str_in(s, alloc)
 }
 
+enum Mode<'l, 'a> {
+    Workspace(&'l Ask<'a>),
+    HostUnits(AVec<'a, HostUnitAsk<'a>>),
+}
+
 /// The sans-IO request: the lock, the platforms and the ask; packages answered as asked.
 pub struct Resolution<'l, 'a> {
     alloc: Alloc<'a>,
     lock: &'l Lock<'a>,
     target: &'l TargetDesc<'a>,
     host: &'l TargetDesc<'a>,
-    ask: &'l Ask<'a>,
+    mode: Mode<'l, 'a>,
     resolver: Resolver,
     members: AVec<'a, bool>,
     answers: AVec<'a, Answer<'a>>,
@@ -139,6 +144,30 @@ pub struct Resolution<'l, 'a> {
 
 impl<'l, 'a> Resolution<'l, 'a> {
     pub fn new(lock: &'l Lock<'a>, target: &'l TargetDesc<'a>, host: &'l TargetDesc<'a>, ask: &'l Ask<'a>, resolver: Resolver, alloc: Alloc<'a>) -> Resolution<'l, 'a> {
+        Self::with_mode(lock, target, host, Mode::Workspace(ask), resolver, alloc)
+    }
+
+    /// Resolves one or more host-executed units (`BuildScript` and/or `ProcMacro`) and their
+    /// transitive dependencies for a specific execution `platform` (such as `wasm64-blaze-wasip1`),
+    /// evaluating every `[target.'cfg(...)'.dependencies]` predicate strictly against `platform`.
+    pub fn for_host_units(
+        lock: &'l Lock<'a>,
+        platform: &'l TargetDesc<'a>,
+        roots: AVec<'a, HostUnitAsk<'a>>,
+        resolver: Resolver,
+        alloc: Alloc<'a>,
+    ) -> Resolution<'l, 'a> {
+        Self::with_mode(lock, platform, platform, Mode::HostUnits(roots), resolver, alloc)
+    }
+
+    fn with_mode(
+        lock: &'l Lock<'a>,
+        target: &'l TargetDesc<'a>,
+        host: &'l TargetDesc<'a>,
+        mode: Mode<'l, 'a>,
+        resolver: Resolver,
+        alloc: Alloc<'a>,
+    ) -> Resolution<'l, 'a> {
         let n = lock.packages.len();
         let mut members = Vec::with_capacity_in(n, alloc);
         members.resize(n, false);
@@ -150,7 +179,22 @@ impl<'l, 'a> Resolution<'l, 'a> {
             holds.push(Vec::new_in(alloc));
             cached_locked.push(Vec::new_in(alloc));
         }
-        Resolution { alloc, lock, target, host, ask, resolver, members, answers, holds, cached_locked, plant: Plant::None }
+        Resolution { alloc, lock, target, host, mode, resolver, members, answers, holds, cached_locked, plant: Plant::None }
+    }
+
+    /// Moves all already-answered packages out of `self` into `dst`, avoiding re-parsing
+    /// manifests or cloning `Package` trees when following a workspace resolution with a
+    /// `for_host_units` pass over the same lock.
+    pub fn move_packages_into(&mut self, dst: &mut Resolution<'_, 'a>) -> Result<(), UnitError<'a>> {
+        for (idx, slot) in self.answers.iter_mut().enumerate() {
+            let Ok(id) = u32::try_from(idx) else { continue };
+            match core::mem::replace(slot, Answer::Pending) {
+                Answer::Pending => {}
+                Answer::Unavailable => dst.package(LockId(id), None)?,
+                Answer::Read(package) => dst.package(LockId(id), Some(package))?,
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -238,7 +282,12 @@ impl<'l, 'a> Resolution<'l, 'a> {
     }
 
     /// The side a node of `side` keeps its features under: one namespace under resolver 1.
+    /// In `Mode::HostUnits`, `Side::Target` is reserved for `BuildScript`-only root seeds and
+    /// `Side::Host` for `ProcMacro` roots and transitive dependencies, so sides stay distinct.
     fn fside(&self, side: Side) -> Side {
+        if matches!(self.mode, Mode::HostUnits(_)) {
+            return side;
+        }
         match self.decouple() {
             true => side,
             false => Side::Target,
@@ -260,10 +309,28 @@ impl<'l, 'a> Resolution<'l, 'a> {
     /// Whether dependency entry `e` of `id` takes part from a node of `side`.
     fn passes(&self, id: LockId, package: &Package<'_>, side: Side, e: usize) -> bool {
         let dep = &package.deps[e];
+        let ask = match &self.mode {
+            Mode::Workspace(ask) => ask,
+            Mode::HostUnits(_) => {
+                let kind_ok = match side {
+                    Side::Target => dep.kind == DepKind::Build,
+                    Side::Host => dep.kind == DepKind::Normal || (dep.kind == DepKind::Build && package.build.is_some()),
+                };
+                if !kind_ok {
+                    return false;
+                }
+                if !self.decouple() {
+                    // Resolver 1: a target-specific dependency's features count on every target
+                    // during feature unification, while `units()` still emits only WASI-active edges.
+                    return true;
+                }
+                return self.holds.get(id.index()).and_then(|h| h.get(e)).is_some_and(|&(_, on_host)| on_host);
+            }
+        };
         if dep.kind == DepKind::Dev {
             // Dev-dependencies are a workspace member's only (a published package's are not
             // in the lock), and take part when tests are built; resolver 1 always unifies them.
-            let wanted = (self.ask.tests || self.resolver == Resolver::V1 || self.plant == Plant::DevLeaks) && self.plant != Plant::DevIgnored;
+            let wanted = (ask.tests || self.resolver == Resolver::V1 || self.plant == Plant::DevLeaks) && self.plant != Plant::DevIgnored;
             if !self.members[id.index()] || !wanted {
                 return false;
             }
@@ -359,6 +426,9 @@ impl<'l, 'a> Resolution<'l, 'a> {
 
     /// The side the package an entry names is on, from a node of `side`.
     fn child_side(&self, side: Side, kind: DepKind, child: &Package<'_>) -> Side {
+        if matches!(self.mode, Mode::HostUnits(_)) {
+            return Side::Host;
+        }
         match self.decouple() && (kind == DepKind::Build || child.is_proc_macro()) {
             true => Side::Host,
             false => side,
@@ -394,9 +464,28 @@ impl<'l, 'a> Resolution<'l, 'a> {
         Ok(st)
     }
 
-    /// The roots' features, from the command line's flags.
+    /// The roots' features, from the command line's flags (or explicit host-unit feature sets).
     fn seed<'s>(&'s self, st: &mut State<'s, 'a>) -> Result<(), UnitError<'a>> {
-        let ask = self.ask;
+        let ask = match &self.mode {
+            Mode::Workspace(ask) => ask,
+            Mode::HostUnits(host_roots) => {
+                for root in host_roots.iter() {
+                    if self.facts(root.package, &mut st.needs).is_none() {
+                        continue;
+                    }
+                    let side = match root.side {
+                        HostFeatureSide::Target => Side::Target,
+                        HostFeatureSide::Host => Side::Host,
+                    };
+                    let n = node(root.package, side);
+                    for feature in root.features.iter() {
+                        st.work.push(Work::Value(n, V::Feature(feature.as_str()), "host unit features"));
+                    }
+                    st.work.push(Work::Visit(n));
+                }
+                return Ok(());
+            }
+        };
         let mut roots: AVec<'_, (LockId, &'s Package<'a>)> = Vec::new_in(self.alloc);
         for &root in ask.roots.iter() {
             match &self.answers[root.index()] {
@@ -640,69 +729,104 @@ impl<'l, 'a> Resolution<'l, 'a> {
             tmp.push(Tmp { target, deps: Vec::new_in(alloc), build_script: None });
             at
         };
-        for &root in self.ask.roots.iter() {
-            let Answer::Read(package) = &self.answers[root.index()] else { return Err(UnitError::RootUnanswered { root }) };
-            if let Some(lib) = &package.lib {
-                match lib.proc_macro {
-                    true => add(root, Target::ProcMacro(lib), Side::Host, self.fside(Side::Host), &mut keys, &mut index, &mut tmp),
-                    false => add(root, Target::Lib(lib), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp),
-                };
-                if self.ask.tests {
-                    // A proc-macro library's test harness is that library's target compiled as a
-                    // test, so it is built for the host and resolves its dependencies' features
-                    // on the host's side, as the proc macro does (cargo: a target that is for the
-                    // host, a proc macro's, is compiled for the host whatever `--target` says, and
-                    // its features are the host dependency's). On the target side it took the
-                    // target's unified features: tempo's `tempo-precompiles-macros` harness then
-                    // reached `alloy-primitives` with the node's `asm-keccak`, and the macro side
-                    // was asked to run sha3-asm's native build script (check-g044908).
-                    match lib.proc_macro {
-                        true => add(root, Target::TestLib(lib), Side::Host, self.fside(Side::Host), &mut keys, &mut index, &mut tmp),
-                        false => add(root, Target::TestLib(lib), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp),
+        match &self.mode {
+            Mode::HostUnits(host_roots) => {
+                for root in host_roots.iter() {
+                    let package = match self.answers.get(root.package.index()) {
+                        Some(Answer::Read(package)) => package,
+                        Some(Answer::Unavailable) | None => {
+                            unavailable.push(root.package);
+                            continue;
+                        }
+                        Some(Answer::Pending) => {
+                            needs.push(root.package);
+                            continue;
+                        }
                     };
-                }
-            }
-            // A target whose `required-features` are not all on is skipped (the Cargo Book,
-            // "Cargo Targets", "The `required-features` field": "If any of the required
-            // features are not enabled, the target will be skipped."), and said: a
-            // [`LeftOut`] naming it and what is off (rule 3). Checked anyway, tempo's
-            // `tempo-localnet` (`required-features = ["localnet"]`, `localnet = ["dep:nix"]`)
-            // was three false "cannot find `nix`"; turso's bench `logical_log_serialization`
-            // (`bench`) and example `sync_example` (`sync`) were checked without their
-            // features (c1814).
-            let mut skipped = |kind: LeftOutKind, name: &Text<'a>, off: AVec<'a, Text<'a>>| {
-                left_out.push(LeftOut { package: root, package_name: package.name.clone(), kind, name: name.clone(), off });
-            };
-            for i in 0..package.bins.len() as u32 {
-                // Its test unit goes with it.
-                let bin = &package.bins[i as usize];
-                let off = self.required_off(st, root, package, LeftOutKind::Bin, bin.name.as_str(), &bin.required_features)?;
-                if !off.is_empty() {
-                    skipped(LeftOutKind::Bin, &bin.name, off);
-                    continue;
-                }
-                add(root, Target::Bin(i, bin), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
-                if self.ask.tests {
-                    add(root, Target::TestBin(i, bin), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
-                }
-            }
-            // Integration tests, examples and benches: by the same switch as the library's
-            // test unit (test.md, "The other targets").
-            // Roots only: a dependency's layout lists none of these (the layout reads them only
-            // with `with_test_targets`, for the workspace the user builds).
-            if self.ask.tests {
-                for (i, extra) in package.extras.iter().enumerate() {
-                    let kind = match extra.kind {
-                        ExtraKind::Test => LeftOutKind::Test,
-                        ExtraKind::Example => LeftOutKind::Example,
-                        ExtraKind::Bench => LeftOutKind::Bench,
+                    let fside = match root.side {
+                        HostFeatureSide::Target => Side::Target,
+                        HostFeatureSide::Host => Side::Host,
                     };
-                    let off = self.required_off(st, root, package, kind, extra.name.as_str(), &extra.required_features)?;
-                    if !off.is_empty() {
-                        skipped(kind, &extra.name, off);
-                        continue;
+                    match root.kind {
+                        HostUnitKind::BuildScript => {
+                            if let Some(script) = &package.build {
+                                add(root.package, Target::BuildScript(script), Side::Host, fside, &mut keys, &mut index, &mut tmp);
+                            }
+                        }
+                        HostUnitKind::ProcMacro => {
+                            if let Some(lib) = &package.lib {
+                                add(root.package, Target::ProcMacro(lib), Side::Host, fside, &mut keys, &mut index, &mut tmp);
+                            }
+                        }
                     }
-                    add(root, Target::Extra(i as u32, extra), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
+                }
+            }
+            Mode::Workspace(ask) => {
+                for &root in ask.roots.iter() {
+                    let Answer::Read(package) = &self.answers[root.index()] else { return Err(UnitError::RootUnanswered { root }) };
+                    if let Some(lib) = &package.lib {
+                        match lib.proc_macro {
+                            true => add(root, Target::ProcMacro(lib), Side::Host, self.fside(Side::Host), &mut keys, &mut index, &mut tmp),
+                            false => add(root, Target::Lib(lib), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp),
+                        };
+                        if ask.tests {
+                            // A proc-macro library's test harness is that library's target compiled as a
+                            // test, so it is built for the host and resolves its dependencies' features
+                            // on the host's side, as the proc macro does (cargo: a target that is for the
+                            // host, a proc macro's, is compiled for the host whatever `--target` says, and
+                            // its features are the host dependency's). On the target side it took the
+                            // target's unified features: tempo's `tempo-precompiles-macros` harness then
+                            // reached `alloy-primitives` with the node's `asm-keccak`, and the macro side
+                            // was asked to run sha3-asm's native build script (check-g044908).
+                            match lib.proc_macro {
+                                true => add(root, Target::TestLib(lib), Side::Host, self.fside(Side::Host), &mut keys, &mut index, &mut tmp),
+                                false => add(root, Target::TestLib(lib), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp),
+                            };
+                        }
+                    }
+                    // A target whose `required-features` are not all on is skipped (the Cargo Book,
+                    // "Cargo Targets", "The `required-features` field": "If any of the required
+                    // features are not enabled, the target will be skipped."), and said: a
+                    // [`LeftOut`] naming it and what is off (rule 3). Checked anyway, tempo's
+                    // `tempo-localnet` (`required-features = ["localnet"]`, `localnet = ["dep:nix"]`)
+                    // was three false "cannot find `nix`"; turso's bench `logical_log_serialization`
+                    // (`bench`) and example `sync_example` (`sync`) were checked without their
+                    // features (c1814).
+                    let mut skipped = |kind: LeftOutKind, name: &Text<'a>, off: AVec<'a, Text<'a>>| {
+                        left_out.push(LeftOut { package: root, package_name: package.name.clone(), kind, name: name.clone(), off });
+                    };
+                    for i in 0..package.bins.len() as u32 {
+                        // Its test unit goes with it.
+                        let bin = &package.bins[i as usize];
+                        let off = self.required_off(st, root, package, LeftOutKind::Bin, bin.name.as_str(), &bin.required_features)?;
+                        if !off.is_empty() {
+                            skipped(LeftOutKind::Bin, &bin.name, off);
+                            continue;
+                        }
+                        add(root, Target::Bin(i, bin), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
+                        if ask.tests {
+                            add(root, Target::TestBin(i, bin), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
+                        }
+                    }
+                    // Integration tests, examples and benches: by the same switch as the library's
+                    // test unit (test.md, "The other targets").
+                    // Roots only: a dependency's layout lists none of these (the layout reads them only
+                    // with `with_test_targets`, for the workspace the user builds).
+                    if ask.tests {
+                        for (i, extra) in package.extras.iter().enumerate() {
+                            let kind = match extra.kind {
+                                ExtraKind::Test => LeftOutKind::Test,
+                                ExtraKind::Example => LeftOutKind::Example,
+                                ExtraKind::Bench => LeftOutKind::Bench,
+                            };
+                            let off = self.required_off(st, root, package, kind, extra.name.as_str(), &extra.required_features)?;
+                            if !off.is_empty() {
+                                skipped(kind, &extra.name, off);
+                                continue;
+                            }
+                            add(root, Target::Extra(i as u32, extra), Side::Target, Side::Target, &mut keys, &mut index, &mut tmp);
+                        }
+                    }
                 }
             }
         }

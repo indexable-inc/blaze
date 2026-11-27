@@ -1,4 +1,4 @@
-//! Lints in `blaze check` (docs/v2/plan/design/lint.md; key.rs `Kind::Lint`). A file's lint
+//! Lints in `blaze check` (docs/v2/plan/design/lints-stage.md; key.rs `Kind::Lint`). A file's lint
 //! units are blaze-lint's ([`blaze_lint::Units`]): unit 0 the file, its top-level items left out
 //! as holes; unit `i + 1` the outline's entry `i`, its children left out. Each is a `Lint` part
 //! of its file's `FileItems` record ([`parts_in`]), named by its file and its entry's chain

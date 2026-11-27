@@ -1,32 +1,30 @@
 ---
 status: plan
-summary: Lean proofs take the place of deterministic-simulation tests for sans-IO Rust. A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its statement is that it returns `true` for every argument, and returns. A state machine is proved by three of them over a well-formedness predicate written in Rust (it holds at the start, each step keeps it, it implies the property), and one Lean lemma gives every run. Worlds (clock, file system with crashes, locks, later atomics) are Rust predicates saying which answers the kernel may give; a theorem takes the answers as arguments. `blaze prove` emits the models, checks the proofs with the pinned Lean and reports open goals; agents write the proofs. Built so far (2026-11-13): the attribute; methods, integer and Option primitives and theorem statements in the translator; `Blaze.Machine`; `blaze_auto`; the plan of a proof check; `blaze prove` on the first driver (no sandbox yet); and the first proofs of blaze's own code, blaze-core's ETXTBSY retry schedule (two theorems, one sampled test deleted). No world model, no state machine and no simulation test yet. Reviewed from outside the work on 2026-11-13 (its changes are in).
+summary: Lean proofs for sans-IO Rust, extra evidence on top of its deterministic-simulation tests, never in their place (rule 43). A theorem is an ordinary Rust function marked `#[blaze::theorem]` that returns `bool`; its statement is that it returns `true` for every argument, and returns. A state machine is proved by three of them over a well-formedness predicate written in Rust (it holds at the start, each step keeps it, it implies the property), and one Lean lemma gives every run. Worlds (clock, file system with crashes, locks, later atomics) are Rust predicates saying which answers the kernel may give; a theorem takes the answers as arguments. The translator that emitted the models from the Rust (hir-ty-lean) and `blaze prove` are not in the tree: the models it generated stay checked in under lean/BlazeModel, the pinned Lean checks them and their proofs (scripts/src/bin/lean_gate.rs), and agents write the proofs.
 date: 2026-11-13
 ---
-# Proofs in place of simulation tests
+# Proofs beside simulation tests
 
 [formal-verification.md](formal-verification.md) is the verifier: blaze's MIR to Lean, the
-semantics of MIR, the trusted base. This doc is the part that makes it the way sans-IO code is
-shown correct, for blaze's own crates first and for anyone's after. It changes one decision of
-that doc and adds what was missing to act on it.
+semantics of MIR, the trusted base. This doc is the part that proves sans-IO code, for blaze's
+own crates first and for anyone's after, and adds what was missing to act on it.
 
 ## The decision
 
-Andrew, 2026-11-13: "can we make a system so that we can remove these DST stuff and formally
-verify? ... this should be useable by anyone instead of doing dst :) for anything sans io rust".
-
-- **A proved invariant has no simulation test.** Once Lean has checked an invariant's proof in
-  the gate, the deterministic-simulation test that stood for it is deleted. This reverses
-  "DST stays the requirement" of formal-verification.md for code in the provable subset.
-- **What a proof does not replace**, and what stands there instead:
+- **A proof is extra evidence; the simulation test stays.** Concurrent, durable,
+  crash-recovering, billing and deleting code is proven by a deterministic simulation test
+  (rule 43, "DST stays the requirement" of formal-verification.md). A Lean proof checked in the
+  gate is added on top of it, says "for every input" where the test says "for the inputs drawn",
+  and never deletes it.
+- **Where a proof stops short:**
   - *The world is a model.* A proof is about a core against a model of the kernel. Each world
-    model keeps one conformance test against each real driver (objective V4): every behaviour
+    model keeps one conformance test against each real driver: every behaviour
     the real kernel shows must be one the model allows. One test per model, not per invariant.
   - *The model is of the MIR, not the binary.* Until the translator's output is proved equal to
-    the MIR it came from (V7) and the lowering below MIR is validated (V9), every translated
+    the MIR it came from and the lowering below MIR is validated, every translated
     function is run on drawn inputs both as its executable Lean model and as built code, and
     the results compared (section 6). That run is generated; nobody writes it.
-  - *Code outside the subset* (section 3) keeps its simulation test until the subset reaches it.
+  - *Code outside the subset* (section 3) has no proof until the subset reaches it.
 
 ## The idea
 
@@ -34,10 +32,10 @@ A property test says "for the inputs I drew, this returned true". A theorem says
 input". The function is the same. So:
 
 - **A theorem is a function.** `#[blaze::theorem] fn name(args..) -> bool` is ordinary Rust;
-  cargo compiles it as written. Its statement, generated in Lean from its model: for all
+  it compiles as written. Its statement, generated in Lean from its model: for all
   arguments it returns `true`. Returns: not a panic, and not a loop that never ends (there is
   fuel with which the model gives `ok true`). A test fails a hang by its timeout; a statement
-  that let a hang pass would prove less than the test it replaces. A precondition is an early
+  that let a hang pass would prove less than the test beside it. A precondition is an early
   `return true`.
 - **A state machine is proved a step at a time.** The core's author writes
   `fn wf(&self) -> bool` (what always holds of the state) and three theorems:
@@ -50,8 +48,8 @@ input". The function is the same. So:
   argument and constrains with the world's `allows` (section 2). "For all allowed answers" is
   every schedule, fault and crash.
 - **No new specification language.** Contracts (`requires`, `ensures`) stay for what one call
-  promises. A theorem function needs no clause grammar, so blaze's own crates carry theorems
-  while cargo still builds them (`blaze-builds-blaze`).
+  promises. A theorem function needs no clause grammar, so any crate carries theorems as plain
+  Rust.
 
 ## Pieces
 
@@ -61,8 +59,8 @@ input". The function is the same. So:
 - The invariant's words stay where they are today, on the item that states it:
   `/// The invariant (proved: <proof file>): ...` on the theorem function.
 - The whole-run form (`fn run(ops: Vec<Op>, answers: Vec<Answer>) -> bool`, asserting `wf`
-  after each step) is the same statement as a property test. It is what Hegel runs before a
-  proof is tried, so nobody proves a false statement; it is not what is proved.
+  after each step) is the same statement as a property test. It runs as a blaze-sim test
+  (`blaze_sim::check` over a tape of choices, `crates/blaze-sim`) before a proof is tried, so nobody proves a false statement; it is not what is proved.
 
 ### 2. Worlds
 
@@ -70,7 +68,7 @@ A world is what a core's effects go to. Each is a small, pure Rust type in
 `crates/blaze-core/src/world/`: its state, one function per completion that gives the state
 after it, and a predicate (`allows`) wherever the kernel has a choice. The relation is the
 predicate, so nothing has to show that a script of choices reaches every allowed answer, and
-conformance with a real driver is `allows(observed)` (objective V4).
+conformance with a real driver is `allows(observed)`.
 
 - `clock::Clock` (built 2026-11-14): monotonic time; the next reading is never earlier, and a
   timer is told fired at a reading not before its deadline. Its theorem
@@ -102,7 +100,7 @@ answer the world refuses, is none of the theorem's. For every list is every run.
 `wait/retry.rs`, `a_wait_ends_by_its_deadline`, the whole retry loop of every blocking wait
 against `Blocking`, proved 2026-11-14 by one induction on the loop's fuel over an invariant
 that ties the retry's last reading to the world's clock; its simulation test and that
-test's simulated kernel are deleted. How-to: `agents/howto/H-prove-a-loop-against-a-world.json`.
+test's simulated kernel are not in the tree: owed (rule 43).
 
 **A crash is stated by its witness.** `Disk::allows(cut)` takes how much of each file was
 kept (`Kept`: the changes kept whole, what landed of the next, whether an unsynced write or
@@ -161,13 +159,14 @@ over the run.
 
 ### 3. The translator's subset
 
-`hir-ty-lean` v0 took free, non-generic functions over integers, slices, structs and enums.
-The subset grows by steps, each a refusal removed and held by golden tests:
+The translator is not in the tree. hir-ty-lean, part of the old front end, took free,
+non-generic functions over integers, slices, structs and enums. Its subset, to be built again
+on the new layer, grows by steps, each a refusal removed and held by golden tests:
 
 | Step | Construct | How |
 |---|---|---|
 | 0 | opaque items: a type or function the property never looks inside (`io::Error`, `PathBuf`, `format!`'s result, a third-party type) | declared in Lean with no definition; a theorem holds for every meaning of it |
-| a | methods, associated functions, `self` in any form (built 2026-11-13) | the same translation, named `Type.method`; each type in a module of its own |
+| a | methods, associated functions, `self` in any form | the same translation, named `Type.method`; each type in a module of its own |
 | b | generic functions and types, trait bounds, derived impls, `?` | one module per instance; a bound is resolved to its impl at the instance |
 | c | closures, and std's safe combinators (`Option::map`, `is_some_and`, ..) | a closure is a Lean function over its captures; a combinator is translated from `library/` where its source is safe |
 | d | `Vec`, `VecDeque`, `BTreeMap`, `String`, `Duration`, `Box` and blaze's own containers | a table from Rust path to Lean model (`Blaze.Std.*`); an entry is trusted until the deep embedding proves it, and what a model assumes of a type (a lawful `Ord` for a map's key) is an obligation on that type, not an assumption |
@@ -175,8 +174,7 @@ The subset grows by steps, each a refusal removed and held by golden tests:
 | f | `&mut` inside a value or returned | backward functions, as Aeneas |
 | g | recursion | fuel, as loops |
 
-- **Generics are translated by instance** (step b; methods of non-generic trait impls built
-  2026-11-14, the rest designed here). A theorem function is closed, so everything it reaches
+- **Generics are translated by instance** (step b). A theorem function is closed, so everything it reaches
   is reached at concrete type arguments, as in codegen:
   - An *instance* is a function with every generic argument concrete. A body is translated
     at an instance: each type in it is substituted before it is modelled, each callee's
@@ -221,7 +219,7 @@ The subset grows by steps, each a refusal removed and held by golden tests:
   (`blaze_auto`: unfold the model, `mvcgen`, then `grind` and `omega`) before a proof file is
   asked for. What it closes needs no proof file.
 
-### 5. The command
+### 5. The command (not built)
 
 `blaze prove [-p crate]` (formal-verification.md's open question 2, decided: its own command):
 
@@ -264,12 +262,12 @@ and line; like `Open`, it makes the command fail.
 
 Generated models are build outputs, keyed by the function's code identity
 (`outputs-are-records`); the tree holds the proofs and, per theorem, the hash of the
-statement it was checked against. The models of hir-ty-lean's own fixtures stay checked in
-under `lean/BlazeModel/`: they are that crate's golden tests.
+statement it was checked against. The models hir-ty-lean generated stay checked in under
+`lean/BlazeModel/`, fixed until a translator emits them again.
 
 ### 6. Evidence that the model is the code
 
-Until the translation is proved (V7): every translated function is run two ways on the same
+Until the translation is proved: every translated function is run two ways on the same
 drawn arguments, as the executable Lean model and as built code, and the whole results are
 compared (harness/v2/lean_differential.py does this for one function today). Running only the
 built theorem function would test the code and say nothing of the model.
@@ -355,7 +353,7 @@ stated in by the runner it calls (decision D46, below).
   panic that names the rule; each word holds its newest message's value after every step.
   It is held to the Lean world by that world's 48 litmus runs restated in Rust with the same
   schedules and the same answers.
-- The translator (built 2026-11-14): a call of `two_weak` is `Threads.two_of`, as `two`'s
+- The translator (not in the tree; its rule): a call of `two_weak` is `Threads.two_of`, as `two`'s
   is; each function carries whether it reaches `two` and whether it reaches `two_weak`,
   through its callees and closures; a theorem that reaches `two_weak` has its statement over
   `.valueWeak`, and one that reaches both is refused by name. `Prog.valueAny` is gone.
@@ -395,9 +393,9 @@ for the unpark and 21 reachable states (`lean/Blaze/Tests/ThreadsParkProof.lean`
 
 Built 2026-11-14, all of it: both worlds; the method; the Rust `two` with scheduled atomics
 behind the facade `blaze_core::atomic` (`crates/blaze-core/src/world/threads.rs`); the
-translator (a function that reaches an atomic operation, `two`, `wait` or `wake`, or a
-function that does, is emitted as a `Threads.Prog`, and a shared theorem's statement is that
-its program's value is `ok true`); and the first proof of real lock-free code,
+translator's rule, for when one is in the tree again (a function that reaches an atomic
+operation, `two`, `wait` or `wake`, or a function that does, is emitted as a `Threads.Prog`, and
+a shared theorem's statement is that its program's value is `ok true`); and the first proof of real lock-free code,
 `no_unpark_is_lost` (`wait/parking.rs`, `BlazeCore/Wait/Parking.lean`): the real `park` and
 `unpark` as two threads, every schedule, every choice of the kernel's, the retry's count and
 the error path of a clock that stands still: 8 kinds of park point, 3 of the unpark, 26
@@ -410,10 +408,9 @@ A model names its thread's program points (built 2026-11-14): the code after the
 operation of `f` is the definition `f.at_n`, and inside its k-th loop `f.loop_k.at_n`, with
 the loop itself a parameter; a tail two branches share is one definition, and a loop is
 written once. A proof states its points as these names and does not copy the model's
-continuations (the park's proof was ported to them; agents/annoyances/proofs-1113-11.json).
+continuations (the park's proof was ported to them).
 
-Next: a multi-cell structure against the weak world (above). How-to:
-`agents/howto/H-prove-two-threads.json`.
+Next: a multi-cell structure against the weak world (above).
 
 **A clock for the threads world** (built and its theorems proved 2026-11-14; it is what the
 park's simulation test stated and `no_unpark_is_lost` does not: that a park ends by its
@@ -440,7 +437,7 @@ deadline, and promptly after its wake).
 - Built as the first slice was: the Lean world (`Op.clock`, `Op.now`, `Op.wait_until` in
   `lean/Blaze/Threads.lean`) and its examples by evaluation (`lean/Blaze/Tests/ThreadsClock.lean`);
   the Rust `two` to match (`threads::{clock, now, time, wait_until}`, a reading in whole
-  nanoseconds, exact); their entries in the translator's table; the statements
+  nanoseconds, exact); the statements
   (`a_park_keeps_its_deadline` for (1) and (2), `a_park_left_alone_returns_or_sleeps` for (3),
   in `wait/parking.rs`), run on drawn schedules and readings with a planted kernel for each
   (one that says a deadline early, one whose wait has no deadline, one that never sleeps).
@@ -452,9 +449,9 @@ deadline, and promptly after its wake).
   lemma for `now` whatever the script holds.
 - One clause of the simulation test was in no theorem: that a token waiting as the park
   begins is taken, and that a park with no token and no unpark never says `Ready`. It is
-  `a_park_is_ready_exactly_for_a_token` (`BlazeCore/Wait/ParkingToken.lean`). With it the
-  park's simulation test through the core is deleted; the direct driver's test of the same
-  plans stays, as that driver's test.
+  `a_park_is_ready_exactly_for_a_token` (`BlazeCore/Wait/ParkingToken.lean`). The park's
+  simulation test through the core is not in the tree: owed (rule 43); the direct driver's test
+  of the same plans stands.
 
 ## Costs
 
@@ -464,17 +461,16 @@ deadline, and promptly after its wake).
   modules) builds from nothing in 9 s with Lean 4.20.0.
 - **Writing.** The one proof in the tree is 597 hand-written lines for a 9-line function, 445
   of them the link from model to MIR. So proofs are written by agents, the model-to-MIR link
-  is generated or it does not scale (V7), and automation is tried first.
+  is generated or it does not scale, and automation is tried first.
 - **Keeping.** A change to proved code that changes its model fails the gate until the proof
-  is repaired. That is the price of deleting the test; it is paid by an agent run on the
-  failing goals.
+  is repaired. That is the price of the proof; it is paid by an agent run on the failing
+  goals.
 
 ## What this does not reach
 
-- What a simulation test also covered by running: the drivers, the lowering below MIR, a
-  hang in real code. The conformance tests, section 6 and the statement's "returns" stand
-  for these; where they do not, the simulation test stays and the invariant is not marked
-  proved.
+- What a simulation test covers by running: the drivers, the lowering below MIR, a hang in
+  real code. The conformance tests, section 6 and the statement's "returns" reach part of
+  these; the simulation test covers them all.
 
 - A property of the real kernel, real hardware timing, or another program's format has no
   statement to prove. It keeps a test.
@@ -485,8 +481,7 @@ deadline, and promptly after its wake).
 ## Order of work
 
 1. The pipeline on real functions of blaze (done 2026-11-13 for
-   `blaze_core::busy`: two theorems proved, one sampled test deleted; held by the lake gate
-   and a golden test until `blaze prove`'s driver is the gate).
+   `blaze_core::busy`: two theorems proved, held by the lake gate; its sampled test is owed).
 2. Opaque items, methods and `Duration`: the wait's retry step (`Retry::left`, `Retry::after`
    in `blaze_core::wait::retry`) against a clock world. Its loop `drive` (a closure and a
    trait bound) follows with steps b and c; until then the DST stays.
@@ -498,12 +493,11 @@ deadline, and promptly after its wake).
 
 ## Checks
 
-Ledger rows V13 to V17 (objectives.json): the first proved invariant with its test deleted;
-the worlds with `Sim` held to them; the subset's coverage of sans-IO functions as a number;
+What decides that this design is built: the first proved invariant (its simulation test kept,
+D206); the worlds with `Sim` held to them; the subset's coverage of sans-IO functions as a number;
 the count of invariants at `proved`; atomics.
 
 The models under `lean/BlazeModel/blaze_core` are what the proofs in the tree were checked
-against, so they must be what `blaze prove` emits from the source today:
+against. With no translator in the tree, nothing holds them to the source today;
 `harness/v2/lean_gate.py '{"command": "models", "emitted": "<target>/lean/lib"}'` compares
-every model a run emitted with the checked-in one, byte for byte. It needs a built blaze and
-is run by hand after `blaze prove -p blaze-core` until the release train runs it.
+emitted models with the checked-in ones, byte for byte, once something emits them.

@@ -116,20 +116,25 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(())
     }
 
-    /// Binds `pat` at `v`, the place of its `let`'s initializer (built by `Task::Place`): each
-    /// `ref` binding the address of its part, each other binding a copy of a `Copy` part; the
-    /// place is not the binder's own, so nothing in it moves or is dropped here.
-    pub(in crate::walk) fn bind_let_place(&mut self, pat: PatId, v: V) -> Result<(), BuildError> {
+    /// Binds `pat` at `v`, the place of its `let`'s initializer `init` (built by `Task::Place`):
+    /// each `ref` binding the address of its part, each other binding a copy of a `Copy` part;
+    /// the place is not the binder's own, so nothing in it moves or is dropped here.
+    pub(in crate::walk) fn bind_let_place(&mut self, pat: PatId, init: ExprId, v: V) -> Result<(), BuildError> {
         self.refuse_drop_by_value_in_ref_let(pat)?;
-        let t = *self.checked.pat_ty.get(pat.ix()).ok_or(malformed("a pattern without a type in the record"))?;
-        let g = self.ground_ty(t).map_err(|error| Self::pat_ty_err(pat, error))?;
+        // Use the initializer's own adjusted type, not `checked.pat_ty[pat]`: for a non-reference
+        // pattern over a reference (`let Method { ref name, ref args } = self;` with `self: &Method`),
+        // `blaze-typeck` records `pat_ty` at the already-peeled type (`Method`), which would skip
+        // `peel`'s dereference and project fields off `self`'s stack slot (`&&Method`) instead of
+        // `*self`.
+        let t = self.adjusted_ty(init)?;
+        let g = self.ground_ty(t).map_err(|error| Self::ty_err(init, error))?;
         let at = match v {
             // An unsized place (`*s`, `s: &str`) is the wide pointer's memory, as matches.rs
             // `tested_place` takes it.
             V::Place(p, off) | V::Unsized(p, off) => (p, off),
             _ => return Err(malformed("a `let` initializer built as a place left a value")),
         };
-        self.bind_pattern_at(pat, At { at, g, by_ref: false, copy: false }, false)
+        self.bind_pattern_at(pat, At { at, g, by_ref: false, copy: false, no_read: false }, false)
     }
 
     /// Binds `pat` (which contains a `ref` / `ref mut` binding) to `v`, the evaluated value of
@@ -166,6 +171,6 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 .map_err(|_| malformed("a drop depth past `usize`"))?;
             self.insert_held(pos, scope, depth, Held::Temp { at, l, flag: None });
         }
-        self.bind_pattern_at(pat, At { at, g, by_ref: false, copy: false }, false)
+        self.bind_pattern_at(pat, At { at, g, by_ref: false, copy: false, no_read: false }, false)
     }
 }

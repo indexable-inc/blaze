@@ -1,4 +1,4 @@
-//! A head record (drive.md, "End state: the whole pipeline on the command", piece 10): ONE
+//! A head record (end-state.md D157): ONE
 //! lowered head of the store ([`super::heads::Store`]) as bytes, written once and read back
 //! into a caller's type table, so a head can be a record keyed by its item and compared by its
 //! out digest ([`digest`]) instead of being rebuilt in memory on every command.
@@ -204,7 +204,8 @@ const MAGIC: [u8; 4] = *b"BZHD";
 /// 42: `FnHead::cost` carries opt-in `#[blaze::cost(..)]` complexity contracts.
 /// 43: `AdtRow` carries `capability` (`#[blaze::capability]`) and `sans_io` (`#![blaze::sans_io]`
 /// scope) flags after `args`.
-pub const VERSION: u32 = 43;
+/// 44: `FnQualifiers` bit 7 carries `#[rustc_deprecated_safe_2024]` (`TypeAttrs::DEPRECATED_SAFE_2024`).
+pub const VERSION: u32 = 44;
 /// The digest domains: the record's out digest, a fn text's check, the regions digest.
 const DIGEST_DOMAIN: &str = "blaze.head-record.v1";
 const TEXT_DOMAIN: &str = "blaze.head-record.text.v1";

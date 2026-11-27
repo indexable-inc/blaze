@@ -1,4 +1,4 @@
-//! Head records (front2/head_record.rs; docs/v2/plan/design/drive.md, "End state", piece 10):
+//! Head records (front2/head_record.rs; docs/v2/plan/design/end-state.md, D157):
 //! every head the store makes for a small crate, and for every rung's crate, is encoded,
 //! decoded and compared equal to the one lowered, then encoded again byte for byte. Needs the
 //! installed toolchain under `$HOME/.blaze/v2/toolchain`, as tests/front2_region_rules.rs does.

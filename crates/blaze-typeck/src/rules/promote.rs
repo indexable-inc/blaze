@@ -106,9 +106,28 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     Expr::Ref { mutbl: Mutbl::Not, operand } => {
                         if self.promotable_value(operand, &has_deref)? {
                             found.push(x);
+                        } else {
+                            let mut inner = operand;
+                            while let Expr::Paren(p) = self.body.expr(inner)? {
+                                inner = p;
+                            }
+                            if let Expr::Index { base, .. } = self.body.expr(inner)?
+                                && self.promotable_index_base(inner, base, &first_adjust, &has_deref)?
+                            {
+                                found.push(inner);
+                            }
                         }
                     }
                     Expr::Ref { mutbl: Mutbl::Mut, .. } => {}
+                    Expr::Index { base, .. } => {
+                        if matches!(
+                            first_adjust.get(x.ix()).copied().flatten(),
+                            Some(AdjustKind::Borrow { mutbl: Mutbl::Not, raw: false, .. })
+                        ) && self.promotable_index_base(x, base, &first_adjust, &has_deref)?
+                        {
+                            found.push(x);
+                        }
+                    }
                     _ => {
                         if matches!(
                             first_adjust.get(x.ix()).copied().flatten(),
@@ -132,6 +151,34 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         found.dedup();
         self.promoted.extend_from_slice(&found);
         Ok(())
+    }
+
+    /// Whether shared index `idx_expr` (`&base[idx]` or shared autoref `base[idx].m()`) has a
+    /// promotable rvalue `base` whose value can live in a `'static` slot (e.g. `&[("/b", B)][..]`).
+    fn promotable_index_base(
+        &mut self,
+        idx_expr: ExprId,
+        base: ExprId,
+        first_adjust: &[Option<AdjustKind>],
+        has_deref: &[bool],
+    ) -> Result<bool, Stop> {
+        if self.index_mut.contains(&idx_expr) {
+            return Ok(false);
+        }
+        if matches!(
+            first_adjust.get(idx_expr.ix()).copied().flatten(),
+            Some(AdjustKind::Borrow { mutbl: Mutbl::Mut, .. })
+        ) {
+            return Ok(false);
+        }
+        let Some(&bt) = self.expr_ty.get(base.ix()) else {
+            return Ok(false);
+        };
+        let bt = self.ty.resolve(bt)?;
+        if matches!(self.view(bt), TyView::Ref(..) | TyView::Ptr(..) | TyView::Slice(_) | TyView::Str) {
+            return Ok(false);
+        }
+        self.promotable_value(base, has_deref)
     }
 
     /// What value path or ctor `x` resolved to, if the walk recorded it.
@@ -176,7 +223,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         return Ok(false);
                     }
                 }
-                Expr::Paren(i) => work.push(i),
+                Expr::Paren(i) | Expr::Ref { mutbl: Mutbl::Not, operand: i } => work.push(i),
                 Expr::Path(_) => match self.promote_def(x) {
                     Some(Def::Fn(_)) | Some(Def::Ctor { kind: CtorKind::Tuple, .. }) => {}
                     Some(Def::Const(_)) => {
@@ -226,6 +273,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 Expr::Tuple { elems } | Expr::Array { elems } => work.extend_from_slice(self.body.expr_list(elems)?),
                 Expr::Repeat { elem, .. } => work.push(elem),
+                Expr::Closure { is_async: false, .. } => {
+                    // A non-capturing closure is a zero-sized `Copy + Freeze + !Drop` value:
+                    // `&|x| ...` (including unsizing to `&'static dyn Fn(...)`) promotes to `'static`.
+                    if self.captures.iter().any(|&(c, _, _)| c == x) {
+                        return Ok(false);
+                    }
+                }
                 Expr::Struct { fields, base: crate::body::StructBase::None, .. } => {
                     let Some(freeze_tr) = freeze else {
                         return Ok(false);

@@ -43,7 +43,7 @@ it.
 | 3 | **View types.** `fn old_keys(&self.{lru})` says which fields a method borrows. | structs split to please the borrow checker | here | medium |
 | 4 | **Records and named arguments.** `{ a: T, b: U }` is a type, equal to any record with the same fields; fields may have defaults. | builders, options structs, one-off structs | [records](records.md) | medium |
 | 5 | **Capabilities as parameters.** With [bstd](std.md), a function touches only what it is handed, so one with no `Fs` or `Dir` parameter cannot reach the disk. (A `with` clause to pass them by name is deferred.) | ambient files, clock, network, allocator | [std](std.md) | large |
-| 6 | **Effects are what a function is expected to do.** `#[blaze::expect(panic, alloc, block, diverge)]` lists a function's effects exactly: an unlisted one is checked absent, and a word of its own list is checked present; a module's `#![blaze::expect(..)]` is the default of the functions in it; pure is derived; ambient, unsafe and may-suspend follow the same form; a function that takes a closure does what the closure does. | `async`/`await`, and the async, const and `try_` twins of every API | [effects](effects.md), [pure-fns](pure-fns.md), [may-suspend](may-suspend.md) | medium |
+| 6 | **Effects are what a function is expected to do.** `#[blaze::expect(panic, alloc, block, diverge)]` lists a function's effects exactly: an unlisted one is checked absent, and a word of its own list is checked present; a module's `#![blaze::expect(..)]` is the default of the functions in it; pure is derived; ambient, unsafe and may-suspend follow the same form; a function that takes a closure does what the closure does. | `async`/`await`, and the async, const and `try_` twins of every API | [effects](effects.md), [extensions](extensions.md) 6.3 | medium |
 | 7 | **Values that must be used up.** A `#[blaze::linear]` value cannot be dropped; every path hands it to a function that takes it by value. | forgotten commits, drop bombs | [linear](linear.md) | medium |
 | 8 | **Contracts and pattern types.** `requires` and `ensures` on a function; `usize is 1..` puts a range in the type, and `Conn is Conn::Open { .. }` a variant. | preconditions in doc comments, restated checks, `unreachable!()` after a match already made | [contracts](contracts.md), here | medium |
 | 9 | **Compile-time reflection.** `for const f in fields_of::<T>()` in ordinary typed code. | most derive proc macros | [comptime](comptime.md) | large |
@@ -57,7 +57,7 @@ features some of them are written with):
 | gate | what | spec |
 |---|---|---|
 | `#![feature(blaze_comptime)]`: `where const { COND }` | a where predicate that is a `bool` constant over the generic parameters; a blanket impl gated on it derives a trait from a type's shape | [ownership](ownership.md) |
-| `#![feature(blaze_const_exprs)]` | const generic arguments and array lengths that are expressions over generic parameters, unified by value or by a normal form (ledger E16) | [ownership](ownership.md) |
+| `#![feature(blaze_const_exprs)]` | const generic arguments and array lengths that are expressions over generic parameters, unified by value or by a normal form | [ownership](ownership.md) |
 | `#[blaze::holds]` | a type that holds its type arguments where no field shows it, so a handle over a linear value is linear (part of change 7) | [linear](linear.md), rule 7 |
 | `#![feature(blaze_implied_bounds)]` | the bounds a struct, enum, union or trait declares hold in every function, impl and trait whose header names it, unwritten | [implied bounds](implied-bounds.md) |
 | `#![feature(blaze_anon_params)]` | a `_` type argument in a function's parameter types or an impl's header is a parameter of its own, bounded by its position (`fn len<T>(v: &Vec<T, _>)`); turns on implied bounds | [implied bounds](implied-bounds.md) |
@@ -167,7 +167,7 @@ Each is a hard error in the edition and a lint (below) in any crate before it.
 |---|---|
 | lossy `as` casts (truncating, sign-changing, float to int, pointer to int) | `From`, `TryFrom`, the named methods (`wrapping_`, `cast_signed`), `ptr::addr` |
 | integer arithmetic whose overflow is the profile's (`+ - * << >>`, unary `-`) where blaze can't show it fits | `checked_*`, `wrapping_*`, `saturating_*`, `overflowing_*`, or a check that bounds it ([explicit-overflow](explicit-overflow.md)) |
-| `async` and `await` | fibers and the inferred may-suspend effect |
+| `async` and `await` | the inferred may-suspend effect |
 | the ambient file, clock, network, environment, process and thread APIs | capabilities of [bstd](std.md) |
 | the global allocator | an allocator the code was handed |
 | global mutable state: `static mut`, a `static` with interior mutability, thread-locals | a value someone owns and passes, or a context |
@@ -187,10 +187,10 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 
 | lint | flags | fix |
 |---|---|---|
-| `blaze::lossy_as` | an `as` cast that can lose value or sign, or goes between pointer and integer | `T::from(x)` when lossless; else suggests `try_from` or the named method |
+| `blaze::as_cast` | every `as` cast | `T::from(x)` when lossless; else the named widening, truncation, sign change, rounding or pointer method |
 | `blaze::implicit_overflow` | integer `+ - * << >>`, unary `-`, compound forms and value-losing casts the prover can't show fit; `strict_*`, `pow`, `abs`, `sum` | `checked_*` with `?` and `try_from` in an `Option` function, `try_from(x)?` where the error takes `TryFromIntError` |
 | `blaze::global_state` | a `static mut`, a `static` whose type has interior mutability (an atomic, a lock, a cell), a `thread_local!` | none: says where the state is used, so its owner can be chosen |
-| `blaze::async_fn` | `async fn`, `async` blocks, `.await` | none until fibers are the runtime of the crate |
+| `blaze::async_fn` | `async fn`, `async` blocks, `.await` | none until the inferred may-suspend effect is the runtime of the crate |
 | `blaze::ambient` | reaching ambient IO (the effect of [std](std.md)) | none: names the capability to take |
 | `blaze::global_alloc` | allocating from the global heap | `new_in(..)` when an allocator is in scope |
 | `blaze::untrusted_unsafe` | `unsafe` outside the trusted list | none |
@@ -226,7 +226,7 @@ the replacement is planned. `proc_macro_fn_like` warns now (`const fn` is Rust's
 `crates/blaze-lint-defs/src/ready.rs`. A use of another crate's macro is not linted:
 `derivable_by_reflection` is the lint for a derive on a type, once reflection covers it.
 
-The first three need nothing new and are built first. `lossy_as` is one lint with one message in
+The first three need nothing new and are built first. `as_cast` is one lint with one message in
 place of clippy's five cast lints, which stay available by their own names.
 
 ## Order of work
@@ -235,7 +235,7 @@ Payoff per unit of compiler work, and what leans on what.
 
 | step | what | needs |
 |---|---|---|
-| E1 | The lint group with `lossy_as`, `global_state`, `async_fn`; turned on in blaze's own crates one at a time | nothing |
+| E1 | The lint group with `as_cast`, `global_state`, `async_fn`; turned on in blaze's own crates one at a time | nothing |
 | E2 | Handles (change 1) and `handle_clone` | nothing |
 | E3 | Error unions (change 2) and `error_wrapper` | nothing |
 | E4 | View types (change 3) | nothing |
@@ -243,7 +243,7 @@ Payoff per unit of compiler work, and what leans on what.
 | E5b | `&uniq` (change 10) and `mut_ref` with its fix; blaze's own crates rewritten by the fix | nothing |
 | E5c | Pattern types over enum variants, with narrowing in `match` and `if let` (change 8) | nothing |
 | E6 | Capabilities as parameters (change 5): blaze's crates on bstd; the `with` clause deferred | S1 to S3 of [std](std.md) |
-| E7 | Effects inferred and declared at the border; closures pass their effects through; `async` removed for crates on fibers (change 6) | E6 |
+| E7 | Effects inferred and declared at the border; closures pass their effects through; `async` removed for crates on the may-suspend effect (change 6) | E6 |
 | E8 | Linear values, contracts and pattern types, reflection (changes 7 to 9), each finishing its own spec | their specs |
 | E14 | Early drop (change 11) and `unused_guard` | nothing |
 | E9 | `edition = "blaze-2026.11"`: everything above on, everything removed an error, `blaze fix --edition` | E1 to E8, S5 |

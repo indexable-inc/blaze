@@ -328,6 +328,10 @@ struct CachedIndex {
 struct RepoMonitor {
     root: PathBuf,
     driver: Native,
+    /// When the kernel driver only journals named subdirectories (Linux io_uring / Windows IOCP),
+    /// the driver is rooted at `root.parent()` and watches `DirName::Named(leaf)`, so incoming
+    /// journal event paths are prefixed with `leaf/` and stripped back to repo-relative paths.
+    watch_leaf: Option<blaze_core::FileName>,
     next_tag: u64,
     alive: bool,
     last_used: Instant,
@@ -335,6 +339,39 @@ struct RepoMonitor {
     cached_index: Option<CachedIndex>,
     diff_baseline: Option<DiffBaseline>,
     status_baseline: Option<StatusBaseline>,
+}
+
+/// Resolves `(driver_root, watch_dir, watch_leaf)` for kernel drivers that only journal named
+/// subdirectories (Linux io_uring / Windows IOCP).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn named_watch_target(root: &Path) -> io::Result<(&Path, DirName, Option<blaze_core::FileName>)> {
+    let parent = root.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "cannot watch filesystem root")
+    })?;
+    let leaf_str = root.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "repository directory name is not valid UTF-8")
+    })?;
+    let dir_name = blaze_core::FileName::new(leaf_str).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repository directory name is not a valid FileName",
+        )
+    })?;
+    let watch_leaf = blaze_core::FileName::new(leaf_str).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "repository directory name is not a valid FileName",
+        )
+    })?;
+    Ok((parent, DirName::Named(dir_name), Some(watch_leaf)))
+}
+
+/// Strips the watched-directory prefix when watching `DirName::Named(leaf)` under `root.parent()`.
+fn strip_watch_leaf<'a>(path: &'a str, leaf: Option<&blaze_core::FileName>) -> Option<&'a str> {
+    match leaf {
+        Some(leaf) => path.strip_prefix(leaf.as_str())?.strip_prefix('/'),
+        None => Some(path),
+    }
 }
 
 impl Drop for RepoMonitor {
@@ -352,9 +389,15 @@ impl Drop for RepoMonitor {
 
 impl RepoMonitor {
     fn start(root: PathBuf) -> io::Result<Self> {
-        let mut driver = blaze_core::native(&root, 1)?;
+        #[cfg(target_os = "macos")]
+        let (driver_root, watch_dir, watch_leaf) = (root.as_path(), DirName::Root, None);
+
+        #[cfg(not(target_os = "macos"))]
+        let (driver_root, watch_dir, watch_leaf) = named_watch_target(&root)?;
+
+        let mut driver = blaze_core::native(driver_root, 1)?;
         let mut effects =
-            vec![Effect::Journal { dir: DirName::Root, since: Cursor::None, tag: WATCH_TAG }];
+            vec![Effect::Journal { dir: watch_dir, since: Cursor::None, tag: WATCH_TAG }];
         driver.submit(&mut effects);
 
         let deadline = Deadline::at(driver.now() + START_TIMEOUT);
@@ -389,6 +432,7 @@ impl RepoMonitor {
         Ok(Self {
             root,
             driver,
+            watch_leaf,
             next_tag: 2,
             alive: true,
             last_used: Instant::now(),
@@ -495,7 +539,9 @@ impl RepoMonitor {
         self.generation = self.generation.wrapping_add(1);
 
         for f in &batch.files {
-            let rel = f.as_str();
+            let Some(rel) = strip_watch_leaf(f.as_str(), self.watch_leaf.as_ref()) else {
+                continue;
+            };
             // Ignore `.bgit/` internal slabs/refs/cookies so our own reads/writes never thrash.
             if rel == ".bgit" || rel.starts_with(".bgit/") {
                 continue;
@@ -900,4 +946,26 @@ pub(crate) fn record_status_baseline(
         pending_paths: concurrent_pending,
         needs_full: false,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_core::{DirName, FileName};
+
+    use super::{Path, named_watch_target, strip_watch_leaf};
+
+    #[test]
+    fn named_watch_target_and_strip_normalize_linux_events() {
+        let (parent, dir, leaf) = named_watch_target(Path::new("/tmp/ws/repo")).unwrap();
+        assert_eq!(parent, Path::new("/tmp/ws"));
+        assert_eq!(dir, DirName::Named(FileName::new("repo").unwrap()));
+        let leaf = leaf.as_ref();
+        assert_eq!(strip_watch_leaf("a.txt", None), Some("a.txt"));
+        assert_eq!(strip_watch_leaf("repo/a.txt", leaf), Some("a.txt"));
+        assert_eq!(strip_watch_leaf("repo/sub/b.rs", leaf), Some("sub/b.rs"));
+        assert_eq!(strip_watch_leaf("repo/.bgit/refs.bgref", leaf), Some(".bgit/refs.bgref"));
+        assert_eq!(strip_watch_leaf("repo", leaf), None);
+        assert_eq!(strip_watch_leaf("other/a.txt", leaf), None);
+        assert!(named_watch_target(Path::new("/")).is_err());
+    }
 }

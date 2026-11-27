@@ -6,7 +6,7 @@ import Blaze.Mir.Opt.ConstFold
 import Blaze.Mir.Opt.RemoveDead
 
 /-!
-A translation validator that takes a witness (objective V8's second half; Pnueli, Siegel and
+A translation validator that takes a witness (Pnueli, Siegel and
 Singerman's translation validation, with the witness as in Necula's and Rinard's).
 
 The witness is a script: the proved rewrites, in order, that take the program before a pass

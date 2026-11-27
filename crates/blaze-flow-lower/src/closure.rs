@@ -833,6 +833,29 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             SigFrom::Written | SigFrom::Inferred => (None, None),
         };
         let mut owner = 0u32;
+        if from == SigFrom::FnPtr
+            && ins.is_none()
+            && outs.is_none()
+            && nin == 1
+            && nout > 0
+            && ck
+                .closures
+                .column::<0>()
+                .get(row)
+                .copied()
+                .is_some_and(|ce| self.local_closure_fn_ptr_elided(ce))
+        {
+            // A closure coerced to an elided `fn(&T) -> &U` parameter of a local closure
+            // (`let count = |pick: fn(&Tally) -> &AtomicU64| ..; count(|t| &t.field)`): Rust's
+            // lifetime elision binds the single elided input lifetime and every elided output
+            // lifetime to the same `for<'a>` late-bound region.
+            let tied = SigSlot::Late(Some((u32::MAX, 0)));
+            out.push(tied);
+            for _ in 0..nout {
+                out.push(tied);
+            }
+            return Ok(());
+        }
         let mut pairs: Vec<(PTy, PTy), A> = Vec::new_in(self.alloc);
         match ins {
             Some((s, declared_tuple, declared_list)) => {
@@ -884,6 +907,83 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             }
         }
         Ok(())
+    }
+
+    /// Whether `ce` (a closure with `SigFrom::FnPtr`) is passed directly as an argument to a
+    /// local closure whose corresponding parameter has a written `fn(...) -> ...` annotation with
+    /// no explicit free (`'static` or named enclosing) lifetimes in `closure_param_regions`.
+    fn local_closure_fn_ptr_elided(&self, ce: ExprId) -> bool {
+        use blaze_typeck::{Pat, Stmt};
+        let unwrap_parens = |mut cur: ExprId| -> ExprId {
+            for _ in 0..16 {
+                match self.body.exprs.get(cur.ix()) {
+                    Some(&Expr::Paren(inner)) => cur = inner,
+                    _ => break,
+                }
+            }
+            cur
+        };
+        for expr in self.body.exprs.iter() {
+            let Expr::Call { callee, args } = *expr else { continue };
+            let Some(es) = self.body.expr_lists.get(args.range()) else { continue };
+            let Some(arg_i) = es.iter().position(|&a| unwrap_parens(a) == ce) else { continue };
+            let Some(&Expr::Local(pat)) = self.body.exprs.get(unwrap_parens(callee).ix()) else { continue };
+            for stmt in self.body.stmts.iter() {
+                let Stmt::Let { pat: let_pat, init: Some(init), .. } = *stmt else { continue };
+                let matched = match self.body.pats.get(let_pat.ix()) {
+                    Some(Pat::Bind { .. }) => let_pat == pat,
+                    _ => false,
+                };
+                if !matched {
+                    continue;
+                }
+                let init = unwrap_parens(init);
+                let Some(Expr::Closure { param_tys, .. }) = self.body.exprs.get(init.ix()) else { continue };
+                let Some(written) = self.body.opt_types.get(param_tys.range()) else { continue };
+                if written.get(arg_i).and_then(|o| *o).is_none() {
+                    continue;
+                }
+                let p_idx = to_u32(arg_i);
+                let has_explicit = self
+                    .body
+                    .closure_param_regions
+                    .iter()
+                    .any(|r| r.closure == init && r.param == p_idx && matches!(r.kind, blaze_typeck::WrittenRegion::Static | blaze_typeck::WrittenRegion::Named));
+                if !has_explicit {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether declared type `root` in `heads` contains any `Param`, `Alias`, or `Opaque` node
+    /// whose declared region slot count may differ from the substituted actual type's position
+    /// count (so two differences could cancel out and make `s.len() == n` despite shifted slots).
+    fn declared_has_subst_node(&self, root: PTy, heads: &blaze_borrow::Columns<'_>, e: ExprId) -> bool {
+        use blaze_borrow::RegionTypes;
+        let mut stack: Vec<PTy, A> = Vec::new_in(self.alloc);
+        stack.push(root);
+        let mut steps = 0u32;
+        while let Some(cur) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return true;
+            }
+            match self.head_node(cur, e) {
+                Ok(PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..)) => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+            if let Ok(kids) = heads.kids(cur) {
+                for ci in 0..kids.len() {
+                    if let Some(child) = kids.get(ci) {
+                        stack.push(child);
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Resolves the expecting `fn(...) -> ...` pointer type and its region column for a closure
@@ -1322,7 +1422,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             let written = ce.and_then(|c| self.body.closure_param_region(c, param, path, own));
             match written {
                 Some(blaze_typeck::WrittenRegion::Static) => out.push(SigSlot::Static),
-                Some(blaze_typeck::WrittenRegion::Named) => {
+                Some(blaze_typeck::WrittenRegion::Named | blaze_typeck::WrittenRegion::Inferred) => {
                     out.push(SigSlot::Owner(*owner));
                     *owner += 1;
                 }
@@ -1348,6 +1448,18 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                 push_default(self.npos(t, e)?, owner, out);
                 continue;
             };
+            // A written `_` placeholder at `p` (e.g. `|v: Value<_>|`): every lifetime introduced
+            // by inferring `_` is an existential owner region, never a late-bound call region.
+            if ce.and_then(|c| self.body.closure_param_region(c, param, p, 0))
+                == Some(blaze_typeck::WrittenRegion::Inferred)
+            {
+                let n = self.npos(t, e)?;
+                for _ in 0..n {
+                    out.push(SigSlot::Owner(*owner));
+                    *owner += 1;
+                }
+                continue;
+            }
             match self.node(t, e)? {
                 PNode::Ref(_, inner) => {
                     push_written(p, 0, owner, out);
@@ -1456,11 +1568,14 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
             }
             return Ok(());
         }
-        if to_u32(s.len()) != n {
+        let needs_typed = to_u32(s.len()) != n || (!pairs.is_empty() && pairs.iter().any(|&(d, _)| self.declared_has_subst_node(d, heads, e)));
+        if needs_typed {
             // The counts part where a type parameter or a projection of the clause stands for
             // a type with positions (`P: FnMut(&Self::Item) -> bool` with `Item = (&'a A, &'b
-            // B)`: one slot, three positions). Laid by walking the declared part beside the
-            // closure's own; never guessed.
+            // B)`: one slot, three positions; or `(&P::Cx, View<'_, 'a, L>)` where `<P as
+            // Pool<'a>>::Cx = ()` drops 1 slot while `L = &ScaleLast` adds 1 position so total
+            // `s.len() == n` despite shifted slots). Laid by walking the declared part beside
+            // the closure's own; never guessed.
             return self.lay_sig_typed(s, n, part, outer_binder, static_as_static, pairs, heads, owner, out, e);
         }
         for &r in s {
@@ -1565,7 +1680,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Copy, R: crate::one_call::CallRule> Lower<
                     stack.push((di, ai));
                 }
                 (PNode::Ptr(dm, di), PNode::Ptr(am, ai)) if dm == am => stack.push((di, ai)),
-                (PNode::Slice(di), PNode::Slice(ai)) | (PNode::Array(di, _), PNode::Array(ai, _)) => stack.push((di, ai)),
+                (PNode::Slice(di), PNode::Slice(ai)) | (PNode::Array(di, _), PNode::Array(ai, _)) | (PNode::Pat(di, _), PNode::Pat(ai, _)) => {
+                    stack.push((di, ai));
+                }
+                (PNode::FnPtr(..), PNode::FnPtr(..)) => {
+                    let Ok(c) = heads.count(d) else { return self.refuse(unaligned(ClosureSigWhy::ColumnUnread), e) };
+                    let an = self.npos(a, e)?;
+                    if to_usize(an) != c.len() {
+                        return self.refuse(unaligned(ClosureSigWhy::CountsDiffer), e);
+                    }
+                    for _ in 0..c.len() {
+                        if !take(&mut at, &mut *owner, &mut *out) {
+                            return self.refuse(unaligned(ClosureSigWhy::SlotsShort), e);
+                        }
+                    }
+                }
                 (PNode::Tuple(_), PNode::Tuple(al))
                 | (PNode::Record(..), PNode::Record(_, al))
                 | (PNode::Union(_), PNode::Union(al))

@@ -1,4 +1,4 @@
-//! Part reads (drive.md, "D114 rulings", "Part reads"): a read is (name, part, digest), the part
+//! Part reads (drive.md, "Part reads"): a read is (name, part, digest), the part
 //! `Whole` or one CELL of the record, a 128-bit key the record's kind gives meaning to. A kind
 //! that has cells gives one pure function over its record's payload, [`CellOf`]: a search in the
 //! mapped bytes, answering the cell's digest or [`Seen::Absent`]. A reader's entry is valid when

@@ -308,6 +308,11 @@ pub trait Heads {
     /// The trait's supertrait associated-type equalities on `Self` (`: Sup<Item = T>`),
     /// filed with its members alongside [`Heads::trait_supers`].
     fn trait_super_projs(&self, trait_: LibKey) -> Option<&[SuperProj]>;
+    /// Whether the trait's full members (`Want::Members`, Layer 3 — not merely Layer 2
+    /// `supers_only`) have been filed, including `assoc_const_params`.
+    fn trait_members_made(&self, trait_: LibKey) -> bool {
+        self.trait_supers(trait_).is_some()
+    }
     /// Whether the trait is an `auto trait` (from its own head).
     fn trait_auto(&self, trait_: LibKey) -> Option<bool>;
     /// Whether the trait declares a `Self: 'static` bound (e.g. `core::any::Any`).

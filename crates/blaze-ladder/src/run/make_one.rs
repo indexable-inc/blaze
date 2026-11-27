@@ -141,10 +141,19 @@ impl<A: core::alloc::Allocator> BuiltLir<A> {
     }
 }
 
+/// Optional side-car `BLZLIR02` capture during `BuildSink::Entry` so cold `--release` walks
+/// cache pre-LTO LIR across all parallel workers without lowering MIR -> LIR a second time.
+struct EntryLirCapture<'e> {
+    machine: blaze_tier::Machine,
+    shared: blaze_own::SharedAlloc<'static>,
+    out: &'e mut Option<blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>>,
+}
+
 /// Destination for one built instance inside [`build_one`]: either emit an encoded `CodeStore`
-/// entry, or hand back the verified LIR and resolved reference tables for whole-program LTO.
+/// entry (optionally also capturing encoded `BLZLIR02` bytes for release LTO), or hand back the
+/// verified LIR and resolved reference tables directly.
 enum BuildSink<'e, 'a, A: core::alloc::Allocator = Alloc<'a>> {
-    Entry(&'e mut AVec<'a, u8>),
+    Entry { entry: &'e mut AVec<'a, u8>, lir_capture: Option<EntryLirCapture<'e>> },
     Lir { alloc: A, out: &'e mut Option<BuiltLir<A>>, declared: Option<&'e mut crate::body_ids::DeclaredList<'a>> },
 }
 
@@ -659,6 +668,19 @@ impl QueryCache {
     }
 }
 
+/// Recorded first refusal of `ensure_one` for a key so a speculative failure (`compute_poly_summary`,
+/// `verify_instance`) or repeated demand never calls `check_one` a second time (AGENTS.md: no
+/// retries; propagate the original refusal).
+enum FailedEnsure {
+    /// Original typed refusal captured from a speculative `try_ensure`, ready to be returned
+    /// verbatim on the first non-speculative `ensure`.
+    Pending(RunError),
+    /// Original refusal already returned to a non-speculative caller; its rendered message and
+    /// scope are retained so any further demand on a shared `MakerState` still reports the
+    /// original failure without re-invoking `check_one`.
+    Reported(blaze_own::AString<'static>, crate::scope::Scope),
+}
+
 /// Cross-instance state of a [`MakerState`], kept disjoint from [`MakerState::fn_frame`] so
 /// per-function scratch borrowed from `fn_frame` never conflicts with `&mut MakerCore` methods
 /// (`ensure`, `pull_constants`, etc.) while the borrow checker statically guarantees nothing
@@ -666,6 +688,8 @@ impl QueryCache {
 struct MakerCore {
     /// Each fn key asked of `check_one`: the fn's index, `None` when it had no body.
     asked: blaze_hash::Map<ItemKey, Option<usize>, blaze_hash::FixedState, Alloc<'static>>,
+    /// First refusal of `ensure_one` per failing key, never retried.
+    failed: blaze_hash::Map<ItemKey, FailedEnsure, blaze_hash::FixedState, Alloc<'static>>,
     /// Fn `i`'s checked body, `None` until asked (or with none): what [`Bodies`] reads.
     checked: AVec<'static, Option<Checked<'static>>>,
     tables: Option<Tables>,
@@ -702,6 +726,8 @@ struct RefGaps<'f> {
     first_ask: Option<RunError>,
     missing_objects: AVec<'f, (ItemKey, RunError)>,
     untabled: AVec<'f, (ItemKey, RunError)>,
+    /// Unchecked opaque/closure/coroutine owners discovered while resolving Phase 2 refs/vtables.
+    unchecked_owners: AVec<'f, (Option<ItemKey>, ItemKey, RunError)>,
     /// Generic callees needing a propagated polymorphization summary (`compute_poly_summary`).
     need_poly: AVec<'f, ItemKey>,
 }
@@ -712,6 +738,7 @@ impl<'f> RefGaps<'f> {
             first_ask: None,
             missing_objects: AVec::new_in(alloc),
             untabled: AVec::new_in(alloc),
+            unchecked_owners: AVec::new_in(alloc),
             need_poly: AVec::new_in(alloc),
         }
     }
@@ -720,6 +747,7 @@ impl<'f> RefGaps<'f> {
         self.first_ask.is_none()
             && self.missing_objects.is_empty()
             && self.untabled.is_empty()
+            && self.unchecked_owners.is_empty()
             && self.need_poly.is_empty()
     }
 }
@@ -821,6 +849,7 @@ impl MakerState {
         };
         let core = MakerCore {
             asked: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
+            failed: blaze_hash::Map::new(blaze_hash::MapOpts { hasher: blaze_hash::FixedState, alloc, capacity: None }),
             checked: blaze_own::Vec::new_in(alloc),
             tables: Some(tables),
             work,
@@ -965,7 +994,7 @@ impl MakerCore {
         let view = done.types.view();
         for n in view.nodes() {
             let owner = match *n {
-                blaze_typeck::PNode::Closure { owner, .. } => owner,
+                blaze_typeck::PNode::Closure { owner, .. } | blaze_typeck::PNode::Coroutine { owner, .. } => owner,
                 // The fn that defines it (an alias's is its `#[define_opaque]` fn); an alias
                 // whose definer is not found is left to the build, which refuses it by name
                 // (front2/coroutines.rs `opaque_hidden`).
@@ -981,11 +1010,70 @@ impl MakerCore {
         }
     }
 
-    /// [`MakerState::ensure`] of one key, owners not followed.
-    fn ensure_one<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
-        if let Some(&at) = self.asked.get(&key) {
-            return Ok(at);
+    /// Speculative [`Self::ensure`] used where a refusal must not immediately fail the root
+    /// caller (`compute_poly_summary`, `verify_instance`). Records the first refusal under the
+    /// failing key so any subsequent non-speculative [`Self::ensure`] replays that exact refusal
+    /// without calling `check_one` a second time.
+    fn try_ensure<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount, scratch: Alloc<'_>) -> Result<Option<usize>, ()> {
+        /// The most closure owners one ensure follows (rule 18).
+        const MOST_OWNERS: usize = 4096;
+        let first = self.try_ensure_one(program, typing, key, checks)?;
+        let mut todo: AVec<'_, ItemKey> = blaze_own::Vec::new_in(scratch);
+        self.owners_named(&*program, key, &mut todo);
+        let mut steps = 0;
+        while let Some(owner) = todo.pop() {
+            if self.asked.contains_key(&owner) {
+                continue;
+            }
+            steps += 1;
+            if steps > MOST_OWNERS {
+                self.failed.insert(
+                    owner,
+                    FailedEnsure::Pending(RunError::OneBody {
+                        key,
+                        why: "more closure owners named than the most one ensure follows",
+                    }),
+                );
+                return Err(());
+            }
+            self.try_ensure_one(program, typing, owner, checks)?;
+            self.owners_named(&*program, owner, &mut todo);
         }
+        Ok(first)
+    }
+
+    fn record_reported_failure(&mut self, key: ItemKey, err: &RunError) {
+        let mut msg = blaze_own::String::new_in(self.work.alloc);
+        let _ = core::fmt::write(&mut msg, format_args!("{err}"));
+        self.failed.insert(key, FailedEnsure::Reported(msg, err.scope()));
+    }
+
+    fn take_prior_failure(&mut self, key: ItemKey) -> Option<RunError> {
+        let entry = self.failed.get_mut(&key)?;
+        match entry {
+            FailedEnsure::Pending(_) => {
+                let mut msg = blaze_own::String::new_in(self.work.alloc);
+                let mut scope = crate::scope::Scope::One;
+                if let FailedEnsure::Pending(err) = entry {
+                    let _ = core::fmt::write(&mut msg, format_args!("{err}"));
+                    scope = err.scope();
+                }
+                match core::mem::replace(entry, FailedEnsure::Reported(msg, scope)) {
+                    FailedEnsure::Pending(err) => Some(err),
+                    FailedEnsure::Reported(..) => None,
+                }
+            }
+            FailedEnsure::Reported(msg, scope) => Some(RunError::PriorEnsureFailure {
+                key,
+                first: msg.as_str().into(),
+                scope: *scope,
+            }),
+        }
+    }
+
+    /// Runs the one-shot `ensure_one` body for `key`, assuming `key` is neither in `self.asked`
+    /// nor in `self.failed`.
+    fn ensure_one_fresh<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
         // A ctor has no body to check: its row is made, and its instance built as a fn
         // ([`build_one`]'s ctor arm).
         // The trait's `Clone::clone` has no body either: the one instance tabled at it is a
@@ -1018,6 +1106,44 @@ impl MakerCore {
         };
         self.asked.insert(key, at);
         Ok(at)
+    }
+
+    /// [`MakerState::ensure`] of one key, owners not followed.
+    ///
+    /// Never calls `check_one` twice for the same key: if an earlier speculative `try_ensure`
+    /// refused `key`, replays that original refusal directly instead of retrying.
+    fn ensure_one<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, RunError> {
+        if let Some(&at) = self.asked.get(&key) {
+            return Ok(at);
+        }
+        if let Some(err) = self.take_prior_failure(key) {
+            return Err(err);
+        }
+        match self.ensure_one_fresh(program, typing, key, checks) {
+            Ok(at) => Ok(at),
+            Err(err) => {
+                self.record_reported_failure(key, &err);
+                Err(err)
+            }
+        }
+    }
+
+    /// Speculative [`Self::ensure_one`]: records the first refusal in `self.failed` and returns
+    /// `Err(())` without propagating it immediately or retrying on subsequent calls.
+    fn try_ensure_one<P: FrontEnd, T: Typing<P>>(&mut self, program: &mut P, typing: &mut T, key: ItemKey, checks: &mut CheckCount) -> Result<Option<usize>, ()> {
+        if let Some(&at) = self.asked.get(&key) {
+            return Ok(at);
+        }
+        if self.failed.contains_key(&key) {
+            return Err(());
+        }
+        match self.ensure_one_fresh(program, typing, key, checks) {
+            Ok(at) => Ok(at),
+            Err(err) => {
+                self.failed.insert(key, FailedEnsure::Pending(err));
+                Err(())
+            }
+        }
     }
 
     /// Stores `done` at row `i` and refreshes the closure and coroutine tables if the body
@@ -1137,7 +1263,27 @@ pub fn make_instance<P: FrontEnd, T: Typing<P>>(
     state.core.work.times = MakeTimes::default();
     state.core.work.last_make = None;
     state.core.work.last_make_reportable = false;
-    make_instance_timed(program, typing, state, checks, tabled, name, entry)?;
+    make_instance_timed(program, typing, state, checks, tabled, name, entry, None)?;
+    finish_make_timing(&mut state.core, made_from);
+    Ok(())
+}
+
+fn make_instance_capturing<P: FrontEnd, T: Typing<P>>(
+    program: &mut P,
+    typing: &mut T,
+    state: &mut MakerState,
+    checks: &mut CheckCount,
+    tabled: ItemKey,
+    name: &[u8],
+    entry: &mut AVec<'_, u8>,
+    lir_capture: Option<EntryLirCapture<'_>>,
+) -> Result<(), RunError> {
+    use blaze_core::wait::Clock as _;
+    let made_from = state.core.work.clock.map(|c| c.now());
+    state.core.work.times = MakeTimes::default();
+    state.core.work.last_make = None;
+    state.core.work.last_make_reportable = false;
+    make_instance_timed(program, typing, state, checks, tabled, name, entry, lir_capture)?;
     finish_make_timing(&mut state.core, made_from);
     Ok(())
 }
@@ -1170,12 +1316,13 @@ fn make_instance_timed<'a, P: FrontEnd, T: Typing<P>>(
     tabled: ItemKey,
     name: &[u8],
     entry: &mut AVec<'a, u8>,
+    lir_capture: Option<EntryLirCapture<'_>>,
 ) -> Result<(), RunError> {
     let MakerState { core, fn_frame } = state;
     let fn_guard = ResetOnDrop(fn_frame);
     let fn_erased = blaze_own::Erased::new(&*fn_guard.0);
     let fn_alloc = fn_erased.handle();
-    let mut sink = BuildSink::<Alloc<'a>>::Entry(entry);
+    let mut sink = BuildSink::<Alloc<'a>>::Entry { entry, lir_capture };
     run_instance_loop(program, typing, core, fn_alloc, checks, tabled, name, &mut sink)
 }
 
@@ -1298,16 +1445,13 @@ fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocato
                     return Err(unchecked_owner(&*program, build_i, owner));
                 }
             }
-            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner }, .. })
+            Err(e)
                 if pull_owners < MOST_HELD_COROUTINES
-                    && (opaque == owner
-                        || match core.asked.get(&owner) {
-                            None => true,
-                            Some(entry) => entry.is_none() && program.fn_index(owner).is_none(),
-                        }) =>
+                    && let Some((opaque, owner)) = unchecked_owner_of(&e)
+                    && owner_needs_check(&*program, core, opaque, owner) =>
             {
                 pull_owners += 1;
-                ensure_opaque_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
+                ensure_unchecked_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
             }
             Err(e) if asks_again(&e) && pulled.allow(&e) => {
                 if !program.make_asked(build_i)? {
@@ -1365,16 +1509,13 @@ fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocato
                                     return Err(unchecked_owner(&*program, build_i, co_owner));
                                 }
                             }
-                            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner: op_owner }, .. })
+                            Err(e)
                                 if pull_owners < MOST_HELD_COROUTINES
-                                    && (opaque == op_owner
-                                        || match core.asked.get(&op_owner) {
-                                            None => true,
-                                            Some(entry) => entry.is_none() && program.fn_index(op_owner).is_none(),
-                                        }) =>
+                                    && let Some((opaque, op_owner)) = unchecked_owner_of(&e)
+                                    && owner_needs_check(&*program, core, opaque, op_owner) =>
                             {
                                 pull_owners += 1;
-                                ensure_opaque_owner(program, typing, core, checks, build_i, opaque, op_owner, fn_alloc)?;
+                                ensure_unchecked_owner(program, typing, core, checks, build_i, opaque, op_owner, fn_alloc)?;
                             }
                             Err(e) if asks_again(&e) && owner_pulled.allow(&e) => {
                                 if !program.make_asked(owner_i)? {
@@ -1392,16 +1533,13 @@ fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocato
                 }
                 return Err(e);
             }
-            Err(RunError::Build { error: BuildError::OpaqueOwnerUnchecked { opaque, owner }, .. })
+            Err(e)
                 if owners < MOST_HELD_COROUTINES
-                    && (opaque == owner
-                        || match core.asked.get(&owner) {
-                            None => true,
-                            Some(entry) => entry.is_none() && program.fn_index(owner).is_none(),
-                        }) =>
+                    && let Some((opaque, owner)) = unchecked_owner_of(&e)
+                    && owner_needs_check(&*program, core, opaque, owner) =>
             {
                 owners += 1;
-                ensure_opaque_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
+                ensure_unchecked_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
             }
             Err(e) if let Some(t) = object_missing(&e) && asked.allow(&e) => {
                 if program.object_table(t)? {
@@ -1472,6 +1610,16 @@ fn run_instance_loop<'a, 'f, P: FrontEnd, T: Typing<P>, A: core::alloc::Allocato
                             core.ensure(program, typing, key, checks, fn_alloc)?;
                             made_any = true;
                         }
+                    }
+                }
+                if !gaps.unchecked_owners.is_empty() {
+                    for (opaque, owner, refusal) in gaps.unchecked_owners {
+                        if owners >= MOST_HELD_COROUTINES || !owner_needs_check(&*program, core, opaque, owner) {
+                            return Err(refusal);
+                        }
+                        owners += 1;
+                        ensure_unchecked_owner(program, typing, core, checks, build_i, opaque, owner, fn_alloc)?;
+                        made_any = true;
                     }
                 }
                 if !gaps.need_poly.is_empty() {
@@ -1678,23 +1826,62 @@ struct Held<'a> {
     missing_opaques: AVec<'a, ItemKey>,
 }
 
-/// Handles `BuildError::OpaqueOwnerUnchecked { opaque, owner }`: when `opaque == owner` and
-/// `program.opaque_of(opaque)` is still `None`, loads the opaque's defining head (and RPITIT
-/// default twin row if applicable) via `FrontEnd::opaque_head`; otherwise ensures `owner`'s
-/// checked body (or head-only row for trait methods without a body).
+/// Unchecked defining/owning fn reported by a [`BuildError`] (opaque type, closure, or coroutine).
+/// Returns `(Some(opaque), owner)` for `OpaqueOwnerUnchecked` and `(None, owner)` for closures/coroutines.
+fn build_error_unchecked_owner(error: &BuildError) -> Option<(Option<ItemKey>, ItemKey)> {
+    match *error {
+        BuildError::OpaqueOwnerUnchecked { opaque, owner } => Some((Some(opaque), owner)),
+        BuildError::ClosureOwnerUnchecked { owner, .. } | BuildError::CoroutineOwnerUnchecked { owner, .. } => Some((None, owner)),
+        _ => None,
+    }
+}
+
+/// Unchecked defining/owning fn reported by a layout [`blaze_build::layout::Refusal`].
+fn layout_refusal_unchecked_owner(why: &blaze_build::layout::Refusal) -> Option<(Option<ItemKey>, ItemKey)> {
+    use blaze_build::layout::Refusal;
+    match why {
+        Refusal::NoClosure { owner, .. } | Refusal::NoCoroutine { owner, .. } => Some((None, *owner)),
+        Refusal::Ground(error) | Refusal::FieldGround { error, .. } => build_error_unchecked_owner(error),
+        _ => None,
+    }
+}
+
+/// Unchecked defining/owning fn carried by a [`RunError`] (build, vtable layout, or vtable build).
+fn unchecked_owner_of(e: &RunError) -> Option<(Option<ItemKey>, ItemKey)> {
+    match e {
+        RunError::Build { error, .. } => build_error_unchecked_owner(error),
+        RunError::Vtable { why: VtableFail::Build(error), .. } => build_error_unchecked_owner(error),
+        RunError::Vtable { why: VtableFail::Layout(error), .. } => layout_refusal_unchecked_owner(&error.why),
+        _ => None,
+    }
+}
+
+/// Whether checking `owner` (or loading `opaque`'s head when `opaque == Some(owner)`) can make progress.
+fn owner_needs_check<P: FrontEnd>(program: &P, core: &MakerCore, opaque: Option<ItemKey>, owner: ItemKey) -> bool {
+    opaque == Some(owner)
+        || match core.asked.get(&owner) {
+            None => true,
+            Some(entry) => entry.is_none() && program.fn_index(owner).is_none(),
+        }
+}
+
+/// Handles `OpaqueOwnerUnchecked`, `ClosureOwnerUnchecked`, and `CoroutineOwnerUnchecked`: when
+/// `opaque == Some(owner)` and `program.opaque_of(owner)` is still `None`, loads the opaque's
+/// defining head (and RPITIT default twin row if applicable) via `FrontEnd::opaque_head`;
+/// otherwise ensures `owner`'s checked body (or head-only row for trait methods without a body).
 #[allow(clippy::too_many_arguments)]
-fn ensure_opaque_owner<P: FrontEnd, T: Typing<P>>(
+fn ensure_unchecked_owner<P: FrontEnd, T: Typing<P>>(
     program: &mut P,
     typing: &mut T,
     core: &mut MakerCore,
     checks: &mut CheckCount,
     build_i: usize,
-    opaque: ItemKey,
+    opaque: Option<ItemKey>,
     owner: ItemKey,
     scratch: Alloc<'_>,
 ) -> Result<(), RunError> {
-    if opaque == owner && program.opaque_of(opaque).is_none() {
-        if !program.opaque_head(opaque)? {
+    if opaque == Some(owner) && program.opaque_of(owner).is_none() {
+        if !program.opaque_head(owner)? {
             let error = BuildError::UnsupportedSig { what: "an `impl Trait` type no fn head of the program made (the seam's `opaque_of`)" };
             return Err(RunError::Build { function: program.function(build_i).named(), error, range: None });
         }
@@ -1941,17 +2128,20 @@ impl<P: FrontEnd> blaze_build::Adts for CachedFront<'_, P> {
     fn abi(&self, item: ItemKey) -> Option<blaze_build::Abi> { self.front.abi(item) }
     fn nounwind(&self, owner: ItemKey) -> Option<bool> { self.front.nounwind(owner) }
     fn fn_attrs(&self, owner: ItemKey) -> blaze_lir::func::FnAttrs { self.front.fn_attrs(owner) }
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         let item = match self.front.0.resolve(self.front.1, instance.item, instance.args, ground) {
             Ok((resolved, _)) => resolved,
+            Err(e @ blaze_typeck::ResolveError::Missing(_)) => return Err(BuildError::Select(e)),
             Err(_) => instance.item,
         };
         if let Some(&hit) = self.cache.borrow().track_caller.get(&item) {
-            return Some(hit);
+            return Ok(Some(hit));
         }
-        let ans = self.front.0.track_caller(item)?;
+        let Some(ans) = self.front.0.track_caller(item) else {
+            return Ok(None);
+        };
         self.cache.borrow_mut().track_caller.insert(item, ans);
-        Some(ans)
+        Ok(Some(ans))
     }
     fn location_adt(&self) -> Option<ItemKey> { self.front.location_adt() }
     fn caller_site(&self, owner: ItemKey, expr: blaze_typeck::ExprId) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> { self.front.caller_site(owner, expr) }
@@ -2126,6 +2316,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     // The coroutines whose states the rows read: laid again below, as the build's lay laid
     // them, before any row is asked.
     let mut roots: AVec<'_, blaze_build::CoroutineOf> = blaze_own::Vec::new_in(fn_alloc);
+    let mut track_tys: AVec<'_, PTy> = blaze_own::Vec::new_in(fn_alloc);
     core.work.needs.clear();
     for row in view.reads() {
         let (bytes, _) = row.map_err(|e| refused(&*program, CodeRecordError::Entry(e)))?;
@@ -2175,11 +2366,19 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 }
                 continue;
             }
+            ReadKind::TrackCaller => {
+                if program.head_row(item).is_err() {
+                    return Ok(stale);
+                }
+                if let Ok(args) = core.work.ground.view().list(list) {
+                    track_tys.extend_from_slice(args);
+                }
+                continue;
+            }
             // Each answered from the fn's row (lazy front_end.rs: tabled rows only): its row
             // made from its head; the row's answer decides whether it holds.
             ReadKind::Abi
             | ReadKind::Nounwind
-            | ReadKind::TrackCaller
             | ReadKind::CVariadic
             | ReadKind::LegacyConstGenerics
             | ReadKind::ForeignFn
@@ -2235,7 +2434,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
     // An opaque type's hidden type is its defining fn's check's (coroutines.rs `opaque_hidden`);
     // a required trait fn's RPITIT has no body and needs only its signature row (`head_row`).
     for &owner in owners.iter() {
-        match core.ensure(program, typing, owner, checks, fn_alloc) {
+        match core.try_ensure(program, typing, owner, checks, fn_alloc) {
             Ok(Some(_)) => {}
             Ok(None) => {
                 let Ok(Some(row)) = program.head_row(owner) else {
@@ -2245,7 +2444,42 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                     *entry = Some(row);
                 }
             }
-            Err(_) => return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner }),
+            Err(()) => return Ok(Verdict::Stale { kind: ReadKind::OpaqueHidden, item: owner }),
+        }
+    }
+    // Ensure opaque definers, closure owners, object tables, and fn heads referenced in any
+    // `TrackCaller` read-list instance arguments so `resolve` inside `track_caller` sees the same
+    // concrete impl / hidden type during `verify_today` as during build (e.g. a trait method
+    // called on an `impl Trait` opaque whose definer has not been checked yet on walk 2).
+    if !track_tys.is_empty() {
+        track_tys.sort_unstable();
+        track_tys.dedup();
+        if let Ok(Held { owners: track_owners, items: track_items, objects: track_objects, missing_opaques }) =
+            held_owners_slice(&*program, core.work.ground.view(), &track_tys, None, tabled, fn_alloc)
+        {
+            for &opaque in missing_opaques.iter() {
+                if matches!(program.opaque_head(opaque), Ok(true))
+                    && let Some(Ok(owner)) = program.opaque_definer(opaque)
+                    && core.try_ensure(program, typing, owner, checks, fn_alloc).is_err()
+                {
+                    return Ok(Verdict::Stale { kind: ReadKind::TrackCaller, item: tabled });
+                }
+            }
+            for &object in track_objects.iter() {
+                if program.object_table(object).is_err() {
+                    return Ok(Verdict::Stale { kind: ReadKind::TrackCaller, item: tabled });
+                }
+            }
+            for &item in track_items.iter() {
+                if program.head_row(item).is_err() {
+                    return Ok(Verdict::Stale { kind: ReadKind::TrackCaller, item: tabled });
+                }
+            }
+            for &owner in track_owners.iter() {
+                if core.try_ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                    return Ok(Verdict::Stale { kind: ReadKind::TrackCaller, item: tabled });
+                }
+            }
         }
     }
     // Also include any coroutine held by value in the constant needs' arguments (e.g.
@@ -2269,7 +2503,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 if matches!(program.opaque_head(opaque), Ok(true))
                     && let Some(Ok(owner)) = program.opaque_definer(opaque)
                 {
-                    if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                    if core.try_ensure(program, typing, owner, checks, fn_alloc).is_err() {
                         return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
                     }
                 }
@@ -2285,7 +2519,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 }
             }
             for &owner in need_owners.iter() {
-                if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                if core.try_ensure(program, typing, owner, checks, fn_alloc).is_err() {
                     return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
                 }
             }
@@ -2310,9 +2544,13 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                     }
                     break;
                 }
-                Err(BuildError::OpaqueOwnerUnchecked { owner, .. }) if rounds < crate::front2::check::MOST_ROUNDS => {
+                Err(
+                    BuildError::OpaqueOwnerUnchecked { owner, .. }
+                    | BuildError::ClosureOwnerUnchecked { owner, .. }
+                    | BuildError::CoroutineOwnerUnchecked { owner, .. },
+                ) if rounds < crate::front2::check::MOST_ROUNDS => {
                     rounds += 1;
-                    if core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                    if core.try_ensure(program, typing, owner, checks, fn_alloc).is_err() {
                         return Ok(Verdict::Stale { kind: ReadKind::Const, item: tabled });
                     }
                 }
@@ -2350,7 +2588,7 @@ pub fn verify_instance<'n, T: Typing<RecordsProgram<'n>>>(
                 break;
             }
             Ok(super::lay_states::Relaid::Unchecked(owner)) => {
-                if lays > MOST_HELD_COROUTINES || core.ensure(program, typing, owner, checks, fn_alloc).is_err() {
+                if lays > MOST_HELD_COROUTINES || core.try_ensure(program, typing, owner, checks, fn_alloc).is_err() {
                     return Ok(stale);
                 }
             }
@@ -2720,6 +2958,11 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
                     gaps.missing_objects.push((t, e));
                 }
             }
+            Err(e) if let Some((opaque, owner)) = unchecked_owner_of(&e) => {
+                if !gaps.unchecked_owners.iter().any(|&(op, ow, _)| op == opaque && ow == owner) {
+                    gaps.unchecked_owners.push((opaque, owner, e));
+                }
+            }
             Err(e) => return Err(e),
         }
     }
@@ -2749,6 +2992,11 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
             Err(e) if let Some(t) = object_missing(&e) => {
                 if !gaps.missing_objects.iter().any(|(k, _)| *k == t) {
                     gaps.missing_objects.push((t, e));
+                }
+            }
+            Err(e) if let Some((opaque, owner)) = unchecked_owner_of(&e) => {
+                if !gaps.unchecked_owners.iter().any(|&(op, ow, _)| op == opaque && ow == owner) {
+                    gaps.unchecked_owners.push((opaque, owner, e));
                 }
             }
             Err(e) => return Err(e),
@@ -2781,6 +3029,61 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
     }
     // Absorb Phase 2's clean read log into `work.reads` (which applies `work.reads.plant`).
     work.reads.absorb(&work.ref_reads);
+    let build_owned_lir = |out_alloc: blaze_own::SharedAlloc<'static>| -> Result<BuiltLir<blaze_own::SharedAlloc<'static>>, RunError> {
+        let mut c_text: blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::new_in(out_alloc);
+        let mut push_c = |s: &str| -> Result<(u32, u32), RunError> {
+            let start = u32::try_from(c_text.len()).map_err(|_| RunError::CodeRecord {
+                function: name(),
+                error: CodeRecordError::Seal(blaze_code::record::RecordError::TooLarge { what: "LTO C symbol table" }),
+            })?;
+            let len = u32::try_from(s.len()).map_err(|_| RunError::CodeRecord {
+                function: name(),
+                error: CodeRecordError::Seal(blaze_code::record::RecordError::TooLarge { what: "LTO C symbol name" }),
+            })?;
+            c_text.extend_from_slice(s.as_bytes());
+            Ok((start, len))
+        };
+        let mut lir_funcs: blaze_own::Vec<BuiltCallee, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(funcs.len(), out_alloc);
+        for &callee in funcs.iter() {
+            match callee {
+                Callee::Symbol(s) => lir_funcs.push(BuiltCallee::Symbol(s)),
+                Callee::C(cname) => {
+                    let (start, len) = push_c(cname)?;
+                    lir_funcs.push(BuiltCallee::C { start, len });
+                }
+            }
+        }
+        let mut lir_c_statics: blaze_own::Vec<BuiltForeignStatic, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(c_statics.len(), out_alloc);
+        for cs in c_statics.iter() {
+            let (start, len) = push_c(cs.name)?;
+            lir_c_statics.push(BuiltForeignStatic { item: cs.item, start, len, weak: cs.weak });
+        }
+        let mut lir_statics: blaze_own::Vec<ItemKey, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(built.statics.len(), out_alloc);
+        lir_statics.extend_from_slice(built.statics);
+        let mut lir_vtables: blaze_own::Vec<blaze_code::record::Symbol, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(vtables.len(), out_alloc);
+        lir_vtables.extend_from_slice(vtables.as_slice());
+        let mut lir_vtable_data: blaze_own::Vec<(blaze_code::record::Symbol, blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>), blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(vtable_data.len(), out_alloc);
+        for (vsym, bytes) in vtable_data.iter() {
+            let mut copied: blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(bytes.len(), out_alloc);
+            copied.extend_from_slice(bytes.as_slice());
+            lir_vtable_data.push((*vsym, copied));
+        }
+        let mut lir_tls: blaze_own::Vec<ItemKey, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(built.thread_locals.len(), out_alloc);
+        lir_tls.extend_from_slice(built.thread_locals);
+        let mut lir_traps: blaze_own::Vec<blaze_code::record::TrapSource, blaze_own::SharedAlloc<'static>> = blaze_own::Vec::with_capacity_in(built.traps.len(), out_alloc);
+        lir_traps.extend_from_slice(built.traps);
+        Ok(BuiltLir {
+            func: built.func.view().to_func_in(out_alloc),
+            funcs: lir_funcs,
+            statics: lir_statics,
+            c_statics: lir_c_statics,
+            vtables: lir_vtables,
+            vtable_data: lir_vtable_data,
+            tls: lir_tls,
+            traps: lir_traps,
+            c_text,
+        })
+    };
     match sink {
         BuildSink::Lir { alloc, out, declared } => {
             let out_alloc = *alloc;
@@ -2849,8 +3152,33 @@ fn resolve_and_emit_phase<'a, 'f, P: FrontEnd, A: core::alloc::Allocator + Copy>
             let _ = built_slot.take();
             return Ok(Phase2::Done);
         }
-        BuildSink::Entry(entry) => {
+        BuildSink::Entry { entry, lir_capture } => {
             use blaze_core::wait::Clock as _;
+            // Capture pre-LTO `BLZLIR02` BEFORE `bound.bind(&mut funcs)` appends soft-float
+            // routines, producing byte-identical bytes to `build_lir_with_reach_in` (Rule 25).
+            if let Some(cap) = lir_capture.as_mut() {
+                let attrs = built.func.view().head.attrs;
+                let is_noreturn = (attrs & blaze_lir::func::FnAttrs::NORETURN) != 0;
+                if !is_noreturn
+                    && let Ok(mut owned) = build_owned_lir(cap.shared)
+                {
+                    let mut decl_rows: blaze_own::Vec<(ItemKey, blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>), blaze_own::SharedAlloc<'static>> =
+                        blaze_own::Vec::with_capacity_in(reach.rows.len(), cap.shared);
+                    for n in 0..reach.rows.len() {
+                        let (decl_tabled, decl_name) = reach.row(n);
+                        let mut copied = blaze_own::Vec::with_capacity_in(decl_name.len(), cap.shared);
+                        copied.extend_from_slice(decl_name);
+                        decl_rows.push((decl_tabled, copied));
+                    }
+                    *cap.out = export_lto::prepare_and_encode_built_lir(
+                        &mut owned,
+                        decl_rows.as_slice(),
+                        cap.machine,
+                        fn_alloc,
+                        cap.shared,
+                    );
+                }
+            }
             let routines = if func_needs_soft_float(&built.func.view()) {
                 let bound = get_or_init_routines(&work.routines, program, &work.ground, work.alloc).map_err(|_| RunError::OneBody {
                     key: instance.item,
@@ -3052,23 +3380,31 @@ fn name_ref<'p, 'f, P: FrontEnd>(
     // Known by its ADT's head (`ctor_of`), whether or not a row tables it yet: a lazy front end
     // tables a body's CALLEES, and a ctor used as a value (`let p: fn(..) -> S = S`) is none.
     let is_ctor = program.ctor_of(called.item).is_some();
-    let selected = match is_ctor {
+    let is_lang_clone_from = crate::clone_shim::language_clone_from_unconditional(program, called, ground).is_some();
+    let selected = match is_ctor || is_lang_clone_from {
         true => Ok((called.item, called.args)),
         false => asking.resolve(called, ground, alloc),
     };
     let (item, resolved) = match selected {
         Ok(r) => r,
-        Err(blaze_typeck::ResolveError::NoImpl { trait_, .. }) => match crate::clone_shim::language_clone_adt(program, i, called, trait_, ground) {
-            Ok(Some(crate::clone_shim::LanguageClone { clone, .. })) => {
+        Err(blaze_typeck::ResolveError::NoImpl { trait_, .. }) => {
+            if let Some(crate::clone_shim::LanguageClone { clone, .. }) = crate::clone_shim::language_clone_adt(program, i, called, trait_, ground)
+                .map_err(|error| resolve_refusal(program, adts, ground, name(), called, error))?
+            {
                 let Some(c) = program.fn_index(clone) else {
                     let refusal = callee_refusal(program, name(), at, called, crate::callee_shown::CalleeGap::NotTabled, ground.view());
                     return Ok(Named1::Untabled(clone, refusal));
                 };
                 return reach.declare(program.function(c).key, called, ground, alloc).map(Named1::Instance).map_err(|e| named(e, called, &*ground));
             }
-            Ok(None) => return Err(resolve_refusal(program, adts, ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: called.item })),
-            Err(error) => return Err(resolve_refusal(program, adts, ground, name(), called, error)),
-        },
+            if let Some(clone_from) = crate::clone_shim::language_clone_from_adt(program, i, called, trait_, ground)
+                .map_err(|error| resolve_refusal(program, adts, ground, name(), called, error))?
+            {
+                (clone_from, called.args)
+            } else {
+                return Err(resolve_refusal(program, adts, ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: called.item }));
+            }
+        }
         Err(error) => return Err(resolve_refusal(program, adts, ground, name(), called, error)),
     };
     let callee = Instance { item, args: resolved };
@@ -3239,12 +3575,13 @@ fn compute_poly_summary<P: FrontEnd, T: Typing<P>>(
         if Some(key) == drop_in_place || program.ctor_of(key).is_some() || program.intrinsic(key).is_some() {
             continue;
         }
-        let row = match core.ensure(program, typing, key, checks, fn_alloc) {
+        let row = match core.try_ensure(program, typing, key, checks, fn_alloc) {
             Ok(Some(c)) => c,
             Ok(None) => continue,
-            Err(_) => {
+            Err(()) => {
                 // Uncheckable callee (e.g. cold lib error or workspace check error): keep concrete
-                // here so the root caller still compiles and `Walk` handles the callee's own error.
+                // here so the root caller still compiles and `Walk` replays the callee's recorded
+                // first refusal if reachable.
                 had_ensure_err = true;
                 continue;
             }
@@ -3938,6 +4275,13 @@ pub struct Maker<'n, G: Grant = Fixture, T: Typing<RecordsProgram<'n>> = SecondC
     /// How its builds record their read lists ([`Maker::plant_reads`]): `ReadPlant::None` but
     /// in the planted control.
     plant: ReadPlant,
+    /// Optional side-car `BLZLIR02` capture target for cold `--release` export walks.
+    lto_lir_capture: Option<(blaze_tier::Machine, blaze_own::SharedAlloc<'static>)>,
+    /// Most recently captured encoded `BLZLIR02` payload from [`Self::make_over`].
+    captured_lir: Option<blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>>,
+    /// Cached `compiler_builtins` soft-float routine bindings usable even before `self.made` is
+    /// constructed (e.g. warm export LTO runs with 100% `HomeCodeStore` hits).
+    routines: core::cell::OnceCell<crate::front2::builtins_shim::Bound>,
 }
 
 impl<'n> Maker<'n, Fixture, SecondCheck> {
@@ -4070,7 +4414,21 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
             checks: CheckCount::default(),
             watch,
             plant: ReadPlant::None,
+            lto_lir_capture: None,
+            captured_lir: None,
+            routines: core::cell::OnceCell::new(),
         }
+    }
+
+    /// Enables side-car `BLZLIR02` capture during `Order::make` for cold `--release` export walks
+    /// so subsequent whole-program export LTO avoids re-lowering MIR -> LIR.
+    pub fn enable_lto_lir_capture(&mut self, machine: blaze_tier::Machine, shared: blaze_own::SharedAlloc<'static>) {
+        self.lto_lir_capture = Some((machine, shared));
+    }
+
+    /// Takes the most recently captured `BLZLIR02` bytes produced during `Order::make`, if any.
+    pub fn take_captured_lir(&mut self) -> Option<blaze_own::Vec<u8, blaze_own::SharedAlloc<'static>>> {
+        self.captured_lir.take()
     }
 
     /// The read-list tests' planted bug (code_reads.rs `ReadPlant`, rule 23): every later build
@@ -4219,11 +4577,17 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
 
     /// The program made on the first call, then the one instance.
     fn make_over(&mut self, tabled: ItemKey, name: &[u8], entry: &mut AVec<'_, u8>) -> Result<(), RunError> {
+        self.captured_lir = None;
         self.construct(tabled)?;
         let Some((program, state)) = self.made.as_mut() else {
             return Err(RunError::OneBody { key: tabled, why: "the maker's program was not made (make_one.rs `Maker::make`)" });
         };
-        make_instance(program, &mut self.typing, state, &mut self.checks, tabled, name, entry)?;
+        let lir_capture = self.lto_lir_capture.map(|(machine, shared)| EntryLirCapture {
+            machine,
+            shared,
+            out: &mut self.captured_lir,
+        });
+        make_instance_capturing(program, &mut self.typing, state, &mut self.checks, tabled, name, entry, lir_capture)?;
         if let (Some(watch), Some(sizes)) = (self.watch, state.report_if_large_or_slow()) {
             (watch.report)(sizes);
         }
@@ -4297,15 +4661,24 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
 
     /// Initializes the `compiler_builtins` soft-float routine table once on the calling thread and
     /// returns a `Copy + Send + Sync` [`BoundRef`] for parallel export LTO workers.
+    ///
+    /// Resolves directly from `self.names.records` + `self.names.lang_crates` even when
+    /// `self.made` is still `None` (warm builds with 100% `HomeCodeStore` hits) so `BLZOLT01`
+    /// Merkle keys are identical across cold and warm runs and `f128` legalization works on
+    /// partial rebuilds without constructing `RecordsProgram`.
     pub fn prepare_routines(&self) -> Result<Option<crate::front2::builtins_shim::BoundRef<'_>>, CodeRecordError> {
-        match self.made.as_ref() {
-            Some((program, state)) => {
-                let bound = get_or_init_routines(&state.core.work.routines, program, &state.core.work.ground, state.core.work.alloc)
-                    .map_err(CodeRecordError::Symbol)?;
-                Ok(Some(bound.as_ref()))
-            }
-            None => Ok(None),
+        if let Some(bound) = self.routines.get() {
+            return Ok(Some(bound.as_ref()));
         }
+        let found = match self.made.as_ref() {
+            Some((program, _)) => program.soft_float_routines(self.alloc),
+            None => crate::front2::builtins_shim::find(self.names.records, self.names.lang_crates, self.alloc),
+        };
+        let ground = PortableTys::new_in(self.alloc);
+        let bound = crate::front2::builtins_shim::Bound::new(found, &ground, self.alloc)
+            .map_err(CodeRecordError::Symbol)?;
+        let _ = self.routines.set(bound);
+        Ok(self.routines.get().map(crate::front2::builtins_shim::Bound::as_ref))
     }
 
     /// Binds compiler_builtins soft-float routines onto `funcs` (after all original + LTO-imported
@@ -4447,6 +4820,14 @@ impl<'n, G: Grant, T: Typing<RecordsProgram<'n>>> Maker<'n, G, T> {
                             continue;
                         }
                         return Err(e);
+                    }
+                    Err(e)
+                        if owners < MOST_HELD_COROUTINES
+                            && let Some((opaque, owner)) = unchecked_owner_of(&e)
+                            && owner_needs_check(&*program, core, opaque, owner) =>
+                    {
+                        owners += 1;
+                        ensure_unchecked_owner(program, &mut self.typing, core, &mut self.checks, 0, opaque, owner, fn_alloc)?;
                     }
                     Err(e) => return Err(e),
                     Ok(()) if !untabled.is_empty() => {
@@ -4801,5 +5182,113 @@ mod ask_progress_tests {
 
         let half = make_binary(Ty::F16, Op::Fadd);
         assert!(func_needs_soft_float(&half.view()), "f16 arithmetic must trigger lazy compiler_builtins lookup");
+    }
+
+    #[test]
+    fn speculative_ensure_records_and_replays_first_refusal_without_retry() {
+        use super::{CheckCount, MakerState, Typing, TypingCounts};
+        use crate::crates::{Inputs, Toolchain};
+        use crate::front2::keys::checker_of;
+        use crate::front2::program::Front2Refusal;
+        use crate::front2::program::lazy::{LazyProgram, LazyRefusal};
+        use crate::refusal::SourceFile;
+        use crate::run::OverflowChecks;
+        use crate::seam::FrontEnd;
+        use blaze_emit::{Isa, Os};
+        use blaze_scope::names::{self, Written};
+        use blaze_surface::{Namespace, PathKind};
+        use blaze_typeck::Checked;
+
+        const SRC: &str = "#![feature(no_core, lang_items)]
+#![no_core]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+const BAD: i32 = 1 / 0;
+
+fn bad_fn() -> i32 {
+    BAD
+}
+
+fn main() -> i32 {
+    0
+}
+";
+        struct CountingTyping {
+            check_one_calls: usize,
+        }
+        impl<P: FrontEnd> Typing<P> for CountingTyping {
+            fn check_one(&mut self, program: &mut P, key: ItemKey) -> Result<Option<(usize, Checked<'static>)>, RunError> {
+                self.check_one_calls += 1;
+                program.check_one(key)
+            }
+            fn counts(&self) -> Option<TypingCounts> {
+                None
+            }
+        }
+
+        let alloc = blaze_own::testing::heap().alloc();
+        let files = [SourceFile { path: "src/main.rs", text: SRC }];
+        let tc = Toolchain::none(alloc);
+        let new = crate::run::NewFront { package: "ladder", edition: "2024", shelf: None, overflow: OverflowChecks::On };
+        let texts = crate::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
+            .unwrap_or_else(|e| panic!("texts: {e}"));
+        let user = texts.user();
+        let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("inputs: {e}"));
+        let crates = inputs.crates();
+        let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
+        let value_key = |name: &'static str| {
+            let segments: &[&str] = &[name];
+            let written = Written { kind: PathKind::Plain, segments };
+            let found = names::path(&names, names.root(0), Namespace::Values, written, alloc).unwrap_or_else(|e| panic!("`{name}`: {e:?}"));
+            checker_of(found.whole(1).unwrap_or_else(|| panic!("`{name}` whole")).key)
+        };
+        let main_key = value_key("main");
+        let bad_key = value_key("bad_fn");
+
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+        let mut lazy = LazyProgram::new(&names, &frame, &files, Some(main_key), alloc).unwrap_or_else(|e| panic!("lazy: {e}"));
+        let mut state = MakerState::new(
+            &lazy,
+            main_key,
+            Isa { lse: true, os: Os::MacOs },
+            OverflowChecks::Off,
+            blaze_build::UbChecks::Off,
+            blaze_build::Panic::Unwind,
+            alloc,
+        )
+        .unwrap_or_else(|e| panic!("maker state: {e}"));
+        let mut typing = CountingTyping { check_one_calls: 0 };
+        let mut checks = CheckCount::default();
+
+        // 1. Speculative `try_ensure` invokes `check_one` once, records the refusal, and does not propagate it.
+        assert!(state.core.try_ensure(&mut lazy, &mut typing, bad_key, &mut checks, alloc).is_err());
+        assert_eq!(typing.check_one_calls, 1, "first speculative ensure calls check_one once");
+
+        // 2. A second speculative `try_ensure` short-circuits with zero retry.
+        assert!(state.core.try_ensure(&mut lazy, &mut typing, bad_key, &mut checks, alloc).is_err());
+        assert_eq!(typing.check_one_calls, 1, "second speculative ensure must not retry check_one");
+
+        // 3. First non-speculative `ensure` replays the exact original typed refusal with zero retry.
+        let first_err = state.ensure(&mut lazy, &mut typing, bad_key, &mut checks).expect_err("non-speculative ensure must replay recorded refusal");
+        assert_eq!(typing.check_one_calls, 1, "non-speculative ensure must not call check_one a second time");
+        assert!(
+            matches!(first_err, RunError::Front2(Front2Refusal::Lazy(LazyRefusal::Const { .. }))),
+            "expected original LazyRefusal::Const, got: {first_err}"
+        );
+        let first_shown = std::format!("{first_err}");
+
+        // 4. Any further non-speculative `ensure` on a shared MakerState still replays the original refusal with zero retry.
+        let second_err = state.ensure(&mut lazy, &mut typing, bad_key, &mut checks).expect_err("repeated ensure must still fail");
+        assert_eq!(typing.check_one_calls, 1, "repeated ensure must never retry check_one");
+        assert!(
+            matches!(second_err, RunError::PriorEnsureFailure { key, .. } if key == bad_key),
+            "expected PriorEnsureFailure, got: {second_err}"
+        );
+        assert_eq!(std::format!("{second_err}"), first_shown, "replayed message must preserve the original refusal verbatim");
     }
 }

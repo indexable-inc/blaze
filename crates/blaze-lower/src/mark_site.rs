@@ -141,7 +141,7 @@ pub fn site_of(mark: Option<TextMark>, first: &str, absolute: bool, call: ItemKe
     // A body has no unmarked `$crate` (blaze-expand marks every token it writes); a crate root
     // is read by blaze-scope's one resolver (token-mark-2): `$crate`, and a `crate` an
     // expansion's item text wrote for another crate's `$crate` (opaque, `root_mark`).
-    if !absolute && first == "$crate" && mark.is_none() {
+    if !absolute && first == "$crate" && mark.is_none_or(|m| m.transparency == Transparency::Transparent) {
         return Err(SiteRefused::UnmarkedDollarCrate);
     }
     let dollar_crate = match absolute {

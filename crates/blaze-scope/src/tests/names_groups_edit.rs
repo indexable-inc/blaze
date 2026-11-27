@@ -1,4 +1,4 @@
-//! An edit's names by group (cells/edit.rs, engine.md piece E4's incremental half): the driver
+//! An edit's names by group (cells/edit.rs, end-state.md D158's incremental half): the driver
 //! enters only the groups whose inputs moved, from the records alone, and its records are
 //! byte-equal to a fresh whole-crate solve of the edited text.
 //!

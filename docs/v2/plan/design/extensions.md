@@ -1,5 +1,5 @@
 ---
-status: current
+status: plan
 summary: The ledger of blaze's language extensions on the new item layer. 61 features from three sources (docs, the old front end's code, blaze's own uses), each probed through the new layer's stages on 2026-11-16 (crates/blaze-real/examples/extensions.rs, one fixture each); what blaze's code uses, where the old layer built it, what the new layer does today, the item-grain design and its floor, a proposed better form, and the port order. Replaces the 2026-11-10 page on extension crates (blaze-ext), whose crates were deleted in 8e87a017ff.
 date: 2026-11-16
 ---
@@ -16,11 +16,11 @@ crates/blaze-real/extensions` (the probe) and `examplerun.sh blaze-real extensio
   (the nearest, about 40% of the list, and stale: its `#[blaze::may]`, `negative_effect` and
   `unmarked_*` rows describe blaze-lints, deleted 2026-11-15). language.md is Rust 1.80..1.100, no
   extension. This page was the blaze-ext design. 51 `#[blaze::..]` names appear in docs/.
-- **(b) Code.** 50 `blaze::` attribute names in `.rs` files; hir-def's `AttrFlags` reads 31
-  (crates/hir-def/src/attrs.rs), crate attributes the rest (nameres/crate_attrs.rs). Five gates
+- **(b) Code.** 50 `blaze::` attribute names in `.rs` files; the old front end's `AttrFlags`
+  read 31, crate attributes the rest. Five gates
   (`blaze_comptime`, `_verify`, `_implied_bounds`, `_anon_params`, `_const_exprs`,
   crates/intern/src/symbol/symbols.rs:742). The old parser takes three syntax sets behind crate
-  bits (crates/edition/src/lib.rs:47: `UNIQ`, `ERROR_UNIONS`, `RECORDS`) and seven forms with no
+  bits (crates/edition/src/lib.rs: `UNIQ`, `ERROR_UNIONS`, `RECORDS`) and seven forms with no
   bit: `for const`, `x.[f]`, `const static {}`, `where const {}`, `T is PAT`, `&self.{a}` views,
   `requires`/`ensures`/`decreases`/`recommends` (parser/src/grammar/*.rs). Analyses: hir-ty-pure
   (25k lines: effects, purity, program lifetime, roles, locks, refined), -linear (2.6k), -suspend,
@@ -60,7 +60,7 @@ for blaze-scope). Verdicts, counted from the run:
 | ladder: ``"this attribute is not supported by this build of blaze yet"`` (a catch-all for any unknown attribute, not the feature's rule) | 28 | every item attribute: noalloc, nonblocking, nopanic, expect, may, answers_request, bounded_turn, lock_checked, linear, consumes, holds, may_suspend, invariant, program_lifetime, renders_positions, sealed, norefcount, pairs_with, checkfree, drop, early drop, bits, reflect, specialization, theorem, contract_test, multiversion, differentiable |
 | **passes every stage with its violation: nothing reads it** | 7 | `sans_io` (module), `capabilities`, `effects`, `canonical_cbor`, `policy` (field), `implicit_overflow`, **`where const { false }`** (the impl holds anyway: a soundness hole for blaze-std's `Acyclic`; closed 2026-11-16: `{ false }` refused, `{ small::<T>() }` accepted, see the row below) |
 | passes, accepted | 6 | control, `trust`, `edition`, `loop_match`, `views` (parsed with no bit; nothing checks the view), `where const { true }` |
-| outline | 3 | error unions ``"expected a block"``, records ``"expected type, found `{`"``, uniq ``"expected `,`"``: the outline parses with `Extensions::NONE` (blaze-file-items/src/lib.rs:184) |
+| outline | 3 | error unions ``"expected a block"``, records ``"expected type, found `{`"``, uniq ``"expected `,`"``. Fixed after the probe: the outline reads the three crate bits (`detect_blaze_extensions`, crates/blaze-file-items/src/lib.rs), and error unions are lowered and type-checked (error-sets.md) |
 | bodies | 4 | `const static` ``to_typeck: a const block``; `become` ``to_typeck: `become` ``; `blaze::unreachable!`, `native_lanes!` ``lower_body: a macro call, not expanded`` |
 | check | 8 | `for const`, `x.[f]` ``"`sum`: 5 type errors, the first UnresolvedPath"``; verify clauses ``"`next`: 1 type errors, the first Mismatch"``; implied bounds ``NoMethod``; anon params ``AnnotationsNeeded``; `u7` ``"the type `u7` names nothing"``; pattern types ``"a pattern type `T is ..` is not supported"``; const exprs ``"a const generic parameter is not supported"`` |
 | ladder, other | 5 | `type_of!` (a macro in a type), handles (`#[lang = "blaze_handle"]`), `pure`, `memo`, `cache` (``"a `static` item is not supported"``, a ladder limit before the feature) |
@@ -91,9 +91,9 @@ coordinator.
 | feature (written) | uses | spec; old | kind | today | better form (proposal) | lane |
 |---|---|---|---|---|---|---|
 | `#[blaze::noalloc]`, `nonblocking`, `nopanic` | 542, 520, 400 / 566, 545, 422 | effects.md; hir-ty-pure effect_attrs.rs | A | ladder catch-all | one effect row: `#[blaze::expect(..)]` lists what a fn does; these three become its absence. Fix: `blaze::negative_effect` writes the inferred list (1462 lines change) | L |
-| `#[blaze::pure]`, `memo`, `cache` | 260, 0, 0 / 311, 19, 9 | pure-fns.md; hir-ty-pure, hir-ty-codegen/fncache.rs | A, D | catch-all; `static` first | `pure` = the empty row plus "reads no global"; `memo` and `cache` merge into one library over `fn_info`/`code_id` (reflection) | L, V |
+| `#[blaze::pure]`, `memo`, `cache` | 260, 0, 0 / 311, 19, 9 | effects.md; hir-ty-pure, hir-ty-codegen/fncache.rs | A, D | catch-all; `static` first | `pure` = the empty row plus "reads no global"; `memo` and `cache` merge into one library over `fn_info`/`code_id` (reflection) | L, V |
 | `expect`, `may`, `#![blaze::effects]` | 0, 0, 0 / 58, 5, 7 | effects.md; hir-ty-pure | A | catch-all; gate passes with violation | as it was: `expect` is the one spelling; `may` stays refused by path | L |
-| `answers_request`, `bounded_turn`, `lock_checked`, `may_suspend` | 0 each / 8, 10, 2, 19 | effect-summary.md, may-suspend.md; hir-ty-pure roles.rs, locks.rs; hir-ty-suspend | A | catch-all | effect words in the same row: `sync`, `unbounded`, `locks`, `suspend` | L |
+| `answers_request`, `bounded_turn`, `lock_checked`, `may_suspend` | 0 each / 8, 10, 2, 19 | effect-summary.md; hir-ty-pure roles.rs, locks.rs; hir-ty-suspend | A | catch-all | effect words in the same row: `sync`, `unbounded`, `locks`, `suspend` | L |
 | `#[blaze::sans_io]`, `#![blaze::capabilities]` | 262 (+92 lint levels), 0 / 294, 24 | std.md; blaze-lints (deleted) | A | **violation passes** | the module default of the row without `io`: `#![blaze::expect(..)]` on the module; fix: rewrite the mark | L |
 | `#[blaze::renders_positions]` | 43 (+8 levels) / 52 | rule 71; blaze-lints (deleted) | A | catch-all | an effect word `positions`; fix: rename | L |
 | `#[blaze::linear]`, `consumes`, `holds` | 17, 32, 2 / 182, 60, 11 | linear.md; hir-ty-linear | A | catch-all | as it was for `linear`, `consumes` (explicit end points); `holds` derived from a `PhantomData<T>` field by reflection (fix: add the field, 2 sites) | K |
@@ -115,7 +115,7 @@ coordinator.
 | `type_of!(desc)` | 0 / 44 | type-of.md | B | macro in a type refused | as it was | V |
 | `T is PAT` (`pattern_types`) | 0 / 49 | edition.md change 8; hir-ty pat | B | check: unsupported | as it was | K |
 | `u1..u128` (`arbitrary_ints`), `#[blaze::bits]` | 1, 0 / 46, 87 | arbitrary-ints.md, bits.md; hir-ty arbitrary_ints.rs, bits.rs | B | `"the type u7 names nothing"`; catch-all | `uN` stays primitive; `bits` a library type computing its layout by reflection | K, B |
-| `A \| B` (`error_unions`), records, `&uniq` | 0 / 50, 72, 27 | error-sets.md, records.md, edition.md | B | **outline refuses** | as they were; the bits go in the outline's key | E |
+| `A \| B` (`error_unions`), records, `&uniq` | 0 / 50, 72, 27 | error-sets.md, records.md, edition.md | B | outline reads the bits; error unions checked | as they were; the bits go in the outline's key | E |
 | views `&self.{a}` | 0 / 25 | edition.md change 3 | B | parsed, nothing checks it | spelled under a crate bit like the others | E, K |
 | `#![blaze::specialization]`, `specialization_trait` | 0 / 15, 11 | specialization.md; hir-ty-specialization | B | catch-all | as it was | S |
 | `blaze_implied_bounds`, `blaze_anon_params` | 0 / 18, 17 | implied-bounds.md; hir-ty implied.rs | B | check: `NoMethod`, `AnnotationsNeeded` | one gate (anon params already turns on implied bounds), on in the blaze edition | S |
@@ -123,7 +123,7 @@ coordinator.
 | `#[blaze::multiversion]`, `#![blaze::simd]` | 0 / 21, 1 | simd.md; hir-ty-codegen | D | catch-all; `native_lanes!` unexpanded | as it was | B |
 | `#[blaze::differentiable]` | 0 / 9 | docs/future/autodiff.md | D | catch-all | parked: a library over body reflection | none |
 | `#![blaze::edition = ".."]` | 0 / 3 | edition.md | B | passes, unread | manifest only (`edition = "blaze-2026.11"`) | E |
-| `loop_match`, `become` (nightly) | 0, 0 | loop-match.md, tail-calls.md | B | passes; `to_typeck: become` | not extensions: Rust parity | K |
+| `loop_match`, `become` (nightly) | 0, 0 | loop-match.md, backend-next.md | B | passes; `to_typeck: become` | not extensions: Rust parity | K |
 | extension crates (blaze-ext) | 0 | this page before; deleted | A | gone | comptime over reflected bodies (the old page's own further direction) | none |
 
 ## 4. The design on the item layer, by kind
@@ -158,7 +158,7 @@ Floor after a one-line edit: the evaluations whose read list holds the edited it
 
 **C: proofs.** `theorem` and verify clauses: a Lean term per function from its lowered body, keyed
 by the body's digest and its callees' terms; the proof result is a record, so an unchanged body is
-never re-proved. Contract tests: a generated test keyed like any test (test-selection.md).
+never re-proved. Contract tests: a generated test keyed like any test (test.md).
 
 **D: code generation.** `multiversion` and `simd`: one code record per level, keyed with the level;
 `memo`/`cache`: a library over `code_id` (no compiler work beyond reflection).
@@ -199,9 +199,11 @@ since a lot of people will use bstd"):** the cut list below is accepted as writt
 fix that deletes the attribute: `noalloc`, `nonblocking`, `sans_io`, `capabilities`, the `effects`
 gate, `pure`, the role words, `may_suspend`, `renders_positions`, `holds`, `program_lifetime`,
 `canonical_cbor`; replaced by a library: lock order (`RankedLock`), the narrowed capability,
-`policy` as a mark. Kept: `nopanic` with `diverge` as one two-bit summary per function (the only
-propagation that stays), `linear` and `consumes` checked in one body, `trust` moved to the
-manifest, `theorem`. The earlier decision of one effect row spelled `expect(..)` is withdrawn. The
+`policy` as a mark. Kept: the effect set function types carry, four words (`panic`, `alloc`,
+`block`, `diverge`) spelled `expect(..)`: `EffectSet` in crates/blaze-ty/src/effect_ty.rs, packed
+into `FnHeader`, with the exact-list check (`check_exact_effects`), fn-pointer subtyping
+(`fn_ptr_coerces`) and effect polymorphism (`EffectRow`), built and called only by blaze-ty's
+tests; `linear` and `consumes` checked in one body, `trust` moved to the manifest, `theorem`. The
 three holes the audit found become edition rules, each checked per item with no call graph: no
 global heap under the blaze edition (allocation only through an allocator value), no mutable
 statics, no lock guard or non-`Send` value live across a wait. They are owed, behind tempo: until
@@ -250,14 +252,13 @@ is not in the signature and not local.
 | canonical_cbor | 1 | 0 | 0 | 1: blaze-report |
 
 What blocks a move: **no blaze crate is on the edition** (only harness/v2/smoke/edition and
-harness/v2/versus/bstd-hello are), because cargo builds blaze (D25) and refuses the edition key;
-three crates name bstd as a dependency. bstd itself is trusted code (261 lines naming `unsafe`):
+harness/v2/versus/bstd-hello are); three crates name bstd as a dependency. bstd itself is trusted code (261 lines naming `unsafe`):
 the capability argument binds its *callers*, not its own bodies, so its 988 marks assert facts
 about a trusted implementation that its signatures already give its callers coarsely
 (`Cx::deadline(&self)` takes `&Cx`, so by signature it "may wait"). blaze-sys is below bstd (the
 syscall layer, `core` only): its noalloc is true by construction (it links no `alloc`), its
 nopanic is a real claim. blaze-sim, -graph, -kernel are std test or old-layer crates; -pg, -sql,
--sqlite are `no_std` + alloc libraries that could take bstd's allocator types after D25 ends.
+-sqlite are `no_std` + alloc libraries that could take bstd's allocator types.
 
 ### 6.3 The cut list (proposals; default remove)
 
@@ -271,8 +272,8 @@ nopanic is a real claim. blaze-sim, -graph, -kernel are std test or old-layer cr
 | lock_checked, lock order | LIBRARY | `RankedLock<T, R>` | 0 | delete |
 | may_suspend, guard across a wait | DERIVE + KEEP local | "takes `&Cx`" is the suspend fact; one body check: guard or non-`Send` value live across such a call | 0 | delete |
 | renders_positions | DELETE | item-relative ranges by type | 43 (old front end, gone at the switch) | delete |
-| expect, may | KEEP `expect` for two words only; `may` refused | | 0 | |
-| nopanic, `diverge` | KEEP, propagated | the only two not local and not in the signature: one 2-bit summary per function (crate blaze-effects) | 400 | `nopanic` becomes `expect(diverge)`-style rows later |
+| expect, may | KEEP `expect` with its four words (blaze-ty `EffectSet`); `may` refused | | 0 | |
+| nopanic | RESPELL | an `expect(..)` list without `panic`; `panic` and `diverge` are the two words that need the callees (propagation) | 400 | rewrite as `expect(..)` |
 | linear, consumes | KEEP local | callee signatures + one body (ownership lane) | 17, 32 | none |
 | holds, program_lifetime | DERIVE | reflection (`PhantomData<T>`, no `Drop`, no parameter) | 2, 0 | delete |
 | policy | LIBRARY | a mark read by a library lint | 9 | respell |
@@ -281,9 +282,9 @@ nopanic is a real claim. blaze-sim, -graph, -kernel are std test or old-layer cr
 | theorem, contracts | KEEP | proofs | 16 | none |
 | B, C, D rows (syntax, traits, comptime, codegen) | unaffected | not effects | | |
 
-**Code not on bstd** (every blaze crate while D25 holds, and Rust-edition crates): a DELETE or
+**Code not on bstd** (every blaze crate not yet on the edition, and Rust-edition crates): a DELETE or
 DERIVE attribute there is inert (accepted, recorded, unchecked); the fix that removes it runs when
 the crate moves onto the edition. No interim check. blaze's own crates lose nothing they have:
 nothing has checked these words since blaze-lints and hir-ty-pure's lints were deleted
-(8e87a017ff); they lose the general effect machine that would have checked 2,000 marks, and keep
-only `nopanic`/`diverge` checked, until each crate moves.
+(8e87a017ff). The four-word effect set exists in function types (blaze-ty `effect_ty.rs`); no
+walk checks a body's effects on the item layer yet.

@@ -1,25 +1,23 @@
 ---
 status: current
-summary: Releases: the release pipeline was deleted on 2026-11-15; what is left is the R2 layout, the smoke corpus and installing a release.
+summary: Releases: what release.yaml builds and publishes, the R2 layout, the smoke corpus and installing a channel.
 ---
 # Releases
 
-The release pipeline (cutting canaries, promotion to stable, yanking and the version a release
-build carries) was deleted on 2026-11-15 with blaze-engine, and returns with the new command
-line. It stays in git history. What is left is below: where the bytes are, the smoke corpus,
-and installing a release that was already published.
+`.github/workflows/release.yaml`, on a `v0.*` tag or by hand, builds `blaze` (blaze-cli) for
+macOS ARM64, Linux x86-64 and Linux ARM64 with the stage 0 `.github/blaze-cli-version` names,
+publishes it to R2 and GitHub, and moves `canary` and `stable` to it (`stable` optional by
+hand). There is no yanking and no promotion apart from a release.
 
 ## Where the bytes are
 
-Everything blaze downloads from blaze's own releases comes from one place, the R2 bucket
+Everything fetched from blaze's own releases comes from one place, the R2 bucket
 `blaze-releases` at its custom domain `https://blaze-releases.ix.dev`, served from Cloudflare's
-edge: a pinned release's archive and sums, the channels'
-pointers, the standard library's source (`crates/blaze-toolchain`), install.sh's
-download (CI's stage 0 too, `.github/actions/blaze`) and the pinned LLVM
-(`pins/llvm.json`'s `release`, which blaze's native inputs and `llvm.py fetch`
-read). GitHub's release CDN ran at 0.3 to 0.55 MB/s per download from a
+edge: a release's archive and sums, the channels' pointers, the standard library's source
+archive, install.sh's download (CI's stage 0 too, `.github/actions/blaze`) and the pinned LLVM
+(`pins/llvm.json`'s `release`, which `llvm.py fetch` reads). The v2 binary fetches none of it. GitHub's release CDN ran at 0.3 to 0.55 MB/s per download from a
 developer's Mac on 2026-11-05, minutes for a 155 MB archive. GitHub is no fallback: a key R2
-lacks is an error naming it (`BLAZE_RELEASES` names another place laid out the same). Every
+lacks is an error naming it (install.sh's `BLAZE_RELEASES` names another place laid out the same). Every
 byte is still checked against its pinned hash before use (the release's `SHA256SUMS` and
 `B3SUMS`, the library's digest, the pin's sha256), so the bucket and the edge are trusted for
 availability, not for content.
@@ -50,9 +48,9 @@ is put there the same way.
 ## The smoke corpus
 
 `harness/smoke/` holds small programs that must build and run correctly with `blaze run` and
-`blaze test`, in dev and `--release`, each with the output it must print, and the projects
-(`smoke.json`). `harness/smoke.py` runs them against a blaze (its input's `blaze`, or `blaze` on
-PATH for an installed release).
+`blaze test`, each with the output it must print, and the projects (`smoke.json`).
+`harness/smoke.py` runs them against a blaze (its input's `blaze`, or `blaze` on PATH for an
+installed release), in dev and with `--release`, which v2's `run` and `test` do not take.
 
 - **std** (no dependencies):
   `HashMap` insert and iterate, `thread::spawn` + `join`, `thread_local!`, `Mutex`/`OnceLock`/
@@ -69,7 +67,8 @@ PATH for an installed release).
   equals what the program computes at run time, and prints the values. `expected.txt` has the
   same values computed independently (Python's `hashlib` and `tomllib`, and the same
   arithmetic).
-- **projects** (real repositories at pinned commits): ripgrep and blaze itself.
+- **projects** (real repositories at pinned commits): ripgrep and blaze itself (whose entry
+  names `--bin blaze-engine`, which no crate has).
 - **apps** (large applications at pinned commits, with the system libraries each builds with
   in its entry): cargo 0.92.0 (which says `cargo 1.91.0`), zed v1.24.4 (a window it does not open: `--help`; its tests are
   those of the crates below gpui, since the whole suite with both builds is longer than a
@@ -97,6 +96,4 @@ curl -fsSL https://ix.dev/blaze | sh -s -- --channel canary  # the newest releas
 curl -fsSL https://ix.dev/blaze | sh -s -- --version 0.20261028.0
 ```
 
-`BLAZE_CHANNEL=canary` is the same as `--channel canary`; `--version` wins over a channel. A
-workspace's pin, `[workspace.metadata.blaze] version`, takes a version or `"stable"` /
-`"canary"` too.
+`BLAZE_CHANNEL=canary` is the same as `--channel canary`; `--version` wins over a channel.

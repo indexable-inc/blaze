@@ -1,5 +1,5 @@
 //! SOTA Non-LLVM Acyclic E-Graph (`aegraph`) Optimizer & Chordal-SSA Register Planner
-//! (`docs/v2/plan/design/sota-tier.md`).
+//! (`docs/v2/plan/design/sota-a64-architecture.md`).
 //!
 //! Combines **Dominator-Scoped Hash-Consed GVN**, **Commutative Canonicalization**, **Algebraic
 //! Equivalence Rewrites**, **Exact Constant Folding**, and **Chordal-SSA Register Pressure

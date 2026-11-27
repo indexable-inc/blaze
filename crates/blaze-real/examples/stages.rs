@@ -1015,7 +1015,7 @@ fn main() {
     skipped.print("not expanded here", 10);
 
     // f: token lints.
-    println!("f. token lints (every rule, as a measurement; a plain project's default set is in lint.md)");
+    println!("f. token lints (every rule, as a measurement; a plain project's default set is in lints-stage.md)");
     let scopes: Vec<Scope> = files.iter().map(|f| file_scope(&f.rel)).collect();
     let lint_one = |at: usize, rules: &RuleSet, tally: Option<&std::sync::Mutex<BTreeMap<(Rule, &'static str), usize>>>| -> usize {
         let alloc = Alloc::global();

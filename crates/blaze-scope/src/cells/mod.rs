@@ -33,7 +33,7 @@ mod deps;
 mod early;
 // E4's incremental half: an edit re-solves the groups whose inputs moved, from the records.
 mod edit;
-// E4: what the cold solve writes, one record per group of modules (engine.md "Tables").
+// E4: what the cold solve writes, one record per group of modules (end-state.md D158).
 mod groups;
 // E13: a crate's groups solved on demand from the modules asked, never the whole crate.
 mod lazy;
@@ -774,8 +774,11 @@ enum From {
     Own,
     /// An item or `mod` the expansion at this fragment wrote.
     Wrote(FragId),
-    /// A glob import.
+    /// A glob import (at least one non-lexical glob contributed, or the module has no lexical glob).
     Glob,
+    /// A block module's globs where no non-lexical glob contributed the name: reached solely via
+    /// the synthetic lexical `use super::*;` ([`Cells::lexical_glob`]).
+    LexicalGlob,
 }
 
 /// The outer scopes a plain first segment reaches (R6, R8), read at load.
@@ -837,6 +840,8 @@ pub(crate) struct Cells<'a, N> {
     /// The root's `#![blaze::arbitrary_ints]`: `u24`, `i80` are builtin types in this crate's
     /// language prelude (docs/v2/plan/design/arbitrary-ints.md, "The opt-in").
     arbitrary_ints: bool,
+    /// The crate's effective macro expansion recursion limit (`#![recursion_limit = "N"]`).
+    recursion_limit: u32,
     /// The item each call is written on (`MacroCallDecl::item`), by call: a derive's helper
     /// scope is its item's ([`Cells::derive_helper`]).
     call_on: ABTreeMap<'a, ItemId, u32>,
@@ -1206,7 +1211,7 @@ impl<'a, N: crate::Name> WeakCache<'a, N> {
 
 /// Reusable per-solver scratch buffers kept across evaluations and quiet points.
 struct SolverScratch<'a, N> {
-    edges: AVec<'a, (ModId, Visibility)>,
+    edges: AVec<'a, (ModId, Visibility, bool)>,
     quiet: QuietScratch<'a>,
     fixpoint: Guess<'a>,
     stall: StallScratch<'a, N>,
@@ -1359,6 +1364,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             tools: AVec::new_in(alloc),
             builtin_attrs: AVec::new_in(alloc),
             arbitrary_ints: false,
+            recursion_limit: u32::from(crate::RECURSION_LIMIT),
             call_on: ABTreeMap::new_in(alloc),
             harness_calls: ABTreeSet::new_in(alloc),
             derives_on: ABTreeMap::new_in(alloc),
@@ -1406,6 +1412,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 cells.tools.extend(r.tools.iter().copied());
                 cells.builtin_attrs.extend(r.builtin_attrs.iter().copied());
                 cells.arbitrary_ints = r.head.arbitrary_ints;
+                cells.recursion_limit = r.head.recursion_limit;
             })
             .map_err(|error| CellError::Facts { module: root, error })?;
         Ok(cells)
@@ -1855,13 +1862,13 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 self.add_explicit(root, Namespace::Macros, r.name, (def, Visibility::Public, Origin::MacroExport, fid))?;
             }
         }
-        // The fragment's expansion depth: a call written at rustc's default `recursion_limit`
-        // or deeper is an error, not a call (the old core's `CallState::TooDeep`).
-        let depth = match up {
+        // The fragment's expansion depth: a call written at the crate's effective
+        // `recursion_limit` or deeper is an error, not a call (the old core's `CallState::TooDeep`).
+        let depth: u32 = match up {
             Some((u, _)) => self.depth(u).saturating_add(1),
             None => 0,
         };
-        let deep = depth >= crate::RECURSION_LIMIT && self.plant != CellPlant::NoRecursionLimit;
+        let deep = depth >= self.recursion_limit && self.plant != CellPlant::NoRecursionLimit;
         for c in d.calls.iter() {
             // A tool attribute (Reference `attributes.tool`: "The tool attributes are ..
             // `rustfmt` and `clippy`", and `register_tool`'s): inert, no call. The first segment
@@ -2561,30 +2568,35 @@ impl<'a, N: crate::Name> Cells<'a, N> {
 
     /// `c`'s value, a `Globs` cell: what `m`'s glob imports bring (see [`Cells::cell_value`]).
     fn globs_value(&mut self, c: CellId, guess: Option<&Guess<'a>>, skip: Skip) -> Step<Value> {
-        let Cell { module: m, ns, name, .. } = self.cells[c as usize];
-        {
-            {
-                if self.modules[m as usize].globs_pending > 0 && guess.is_none() {
-                    if skip != Skip::No {
-                        // A call's view waits on one pending glob, which wakes it.
-                        for &g in self.modules[m as usize].glob_items.iter() {
-                            if self.items[g as usize].outcome.is_none() {
-                                return Step::Wait(Node::Item(g));
-                            }
-                        }
-                    }
-                    // Woken again when a glob of the module is decided.
-                    return Step::Wait(Node::Cell(c));
-                }
-                // The glob edges by use index: the resolved ones, and under a guess the group's
-                // pending globs as guessed (one at the bottom brings nothing yet).
-                let mut edges = core::mem::replace(&mut self.scratch.edges, AVec::new_in(self.alloc));
-                edges.clear();
-                let res = self.globs_value_with(c, m, ns, name, guess, skip, &mut edges);
-                self.scratch.edges = edges;
-                res
-            }
+        match self.globs_value_from(c, guess, skip) {
+            Step::Done((v, _)) => Step::Done(v),
+            Step::Wait(n) => Step::Wait(n),
         }
+    }
+
+    /// [`Cells::globs_value`] together with whether `m` is a block module with a lexical glob
+    /// ([`Cells::lexical_glob`]) and no non-lexical glob of `m` contributed `name` in `ns`.
+    fn globs_value_from(&mut self, c: CellId, guess: Option<&Guess<'a>>, skip: Skip) -> Step<(Value, bool)> {
+        let Cell { module: m, ns, name, .. } = self.cells[c as usize];
+        if self.modules[m as usize].globs_pending > 0 && guess.is_none() {
+            if skip != Skip::No {
+                // A call's view waits on one pending glob, which wakes it.
+                for &g in self.modules[m as usize].glob_items.iter() {
+                    if self.items[g as usize].outcome.is_none() {
+                        return Step::Wait(Node::Item(g));
+                    }
+                }
+            }
+            // Woken again when a glob of the module is decided.
+            return Step::Wait(Node::Cell(c));
+        }
+        // The glob edges by use index: the resolved ones, and under a guess the group's
+        // pending globs as guessed (one at the bottom brings nothing yet).
+        let mut edges = core::mem::replace(&mut self.scratch.edges, AVec::new_in(self.alloc));
+        edges.clear();
+        let res = self.globs_value_with(c, m, ns, name, guess, skip, &mut edges);
+        self.scratch.edges = edges;
+        res
     }
 
     fn globs_value_with(
@@ -2595,8 +2607,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         name: N,
         guess: Option<&Guess<'a>>,
         skip: Skip,
-        edges: &mut AVec<'a, (ModId, Visibility)>,
-    ) -> Step<Value> {
+        edges: &mut AVec<'a, (ModId, Visibility, bool)>,
+    ) -> Step<(Value, bool)> {
+                let has_lexical = self.anonymous(m) && self.modules[m as usize].glob_items.iter().any(|&g| self.lexical_glob(g));
                 {
                     let module = &self.modules[m as usize];
                     let (mut r, mut p) = (module.edges.iter().peekable(), module.glob_items.iter().peekable());
@@ -2606,8 +2619,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         match (next_r, next_p) {
                             (None, None) => break,
                             (Some(k), q) if q.is_none_or(|q| k < q) => {
-                                if let Some((_, &x)) = r.next() {
-                                    edges.push(x);
+                                if let Some((&idx, &x)) = r.next() {
+                                    edges.push((x.0, x.1, has_lexical && idx == 0));
                                 }
                             }
                             _ => {
@@ -2623,7 +2636,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                                                 Some(c) if self.plant != CellPlant::EnumGlobNotClamped => self.narrower(it.vis, c, m),
                                                 _ => it.vis,
                                             };
-                                            edges.push((s, vis));
+                                            edges.push((s, vis, has_lexical && it.index == 0));
                                         }
                                     }
                                     Some(Some(_)) => {}
@@ -2640,7 +2653,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 // Every source cell is made first, so the quiet point sees each input of this
                 // cell (one left unmade would hide a source from a cycle's fixed point).
                 let mut waits_on = None;
-                for &(src, _) in edges.iter() {
+                for &(src, _, _) in edges.iter() {
                     let s = self.cell(src, ns, name, Layer::Full);
                     if waits_on.is_none() && self.current(s, guess).is_none() {
                         waits_on = Some(s);
@@ -2652,17 +2665,28 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 let mut acc: Option<Value> = None;
                 // A glob of the module whose path stage 1 does not follow brings what is unknown:
                 // decided so, or (a member of the group) guessed so, as its edge is read above.
-                let mut outside = self.modules[m as usize].glob_items.iter().any(|&g| {
-                    let o = self.items[g as usize].outcome.or_else(|| guess.and_then(|gs| gs.items.get(&g).copied().flatten()));
-                    o == Some(Outcome::Outside) && !(ns == Namespace::Macros && self.items[g as usize].of_enum)
-                });
-                for &(src, evis) in edges.iter() {
+                let mut outside = false;
+                let mut non_lexical = false;
+                for &g in self.modules[m as usize].glob_items.iter() {
+                    let it = &self.items[g as usize];
+                    let o = it.outcome.or_else(|| guess.and_then(|gs| gs.items.get(&g).copied().flatten()));
+                    if o == Some(Outcome::Outside) && !(ns == Namespace::Macros && it.of_enum) {
+                        outside = true;
+                        if !(has_lexical && it.index == 0) {
+                            non_lexical = true;
+                        }
+                    }
+                }
+                for &(src, evis, is_lex) in edges.iter() {
                     let s = self.cell(src, ns, name, Layer::Full);
                     let v = self.current(s, guess).unwrap_or(Value::NotFound);
                     let (def, vis, amb) = match v {
                         Value::NotFound => continue,
                         Value::Outside => {
                             outside = true;
+                            if !is_lex {
+                                non_lexical = true;
+                            }
                             continue;
                         }
                         Value::Found(d, v) => (d, v, false),
@@ -2670,6 +2694,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     };
                     if !self.visible(vis, m) && self.plant != CellPlant::GlobLeaksPrivate {
                         continue;
+                    }
+                    if !is_lex {
+                        non_lexical = true;
                     }
                     let vis = self.narrower(evis, vis, m);
                     if self.plant == CellPlant::FirstGlobWins && acc.is_some() {
@@ -2698,7 +2725,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         return Step::Wait(Node::Item(j));
                     }
                 }
-                Step::Done(acc.unwrap_or(if outside { Value::Outside } else { Value::NotFound }))
+                Step::Done((acc.unwrap_or(if outside { Value::Outside } else { Value::NotFound }), has_lexical && !non_lexical))
     }
 
     /// A cell's value: decided, or a member's guess (the bottom is not found); `None` while it is
@@ -3185,8 +3212,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         {
             return Step::Done((v, From::Glob));
         }
-        match self.cell_value(g, guess, skip) {
-            Step::Done(v) => Step::Done((v, From::Glob)),
+        match self.globs_value_from(g, guess, skip) {
+            Step::Done((v, true)) => Step::Done((v, From::LexicalGlob)),
+            Step::Done((v, false)) => Step::Done((v, From::Glob)),
             Step::Wait(n) => Step::Wait(n),
         }
     }
@@ -3326,7 +3354,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
         if ns == Namespace::Macros && self.outer.macro_use {
             // The `#[macro_use]` prelude: the macros each such crate's root exports, the first
-            // crate's that has the name (Reference `names.preludes.macro_use`).
+            // crate's that has the name (Reference `names.preludes.macro_use`). Macros 2.0
+            // (`pub macro`) are scoped like normal items and never enter this prelude.
+            let in_macro_use = |v: Value| match v {
+                Value::Found(d, Visibility::Public) | Value::Ambiguous(d, Visibility::Public) => {
+                    matches!(d.kind, DefKind::Macro(s) if s.in_macro_use_prelude())
+                }
+                _ => false,
+            };
             let mut unknown = false;
             for k in 0..self.macro_use.len() {
                 let Some(r) = self.module_at(self.macro_use[k]) else {
@@ -3334,7 +3369,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     continue;
                 };
                 match self.read(r, ns, name, Layer::Full, guess) {
-                    Read::Ready(v @ (Value::Found(_, Visibility::Public) | Value::Ambiguous(_, Visibility::Public))) if !wrong(v) => return Step::Done(Some(v)),
+                    Read::Ready(v) if in_macro_use(v) && !wrong(v) => return Step::Done(Some(v)),
                     Read::Ready(Value::Outside) => unknown = true,
                     Read::Ready(_) => {}
                     Read::Wait(c) => return Step::Wait(Node::Cell(c)),
@@ -3463,26 +3498,27 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 Step::Done(x) => x,
                 Step::Wait(n) => return Step::Wait(n),
             };
-            // A block's module whose only glob is its lexical one ([`Cells::lexical_glob`]) and that
-            // binds `name` itself nowhere: its candidate is the scope around the block's, not a
-            // glob's. The Reference, `names.scopes.block` / "Statements", "Item declarations": a
-            // block's names are its own item declarations, and a name it lacks is looked up in the
-            // scope around it, lexically; that walk is no glob import, so the glob-vs-outer rule
+            // A block's module that binds `name` nowhere itself and whose non-lexical globs do not
+            // contribute `name`: its candidate came solely from its lexical glob
+            // ([`Cells::lexical_glob`]), i.e. the scope around the block, not a user glob. The
+            // Reference, `names.scopes.block` / "Statements", "Item declarations": a block's names
+            // are its own item declarations, and a name it lacks is looked up in the scope around
+            // it, lexically; that walk is no glob import, so the glob-vs-outer rule
             // (`names.resolution.expansion.imports.ambiguity.glob-vs-outer`) is the enclosing
             // module's to apply, against its own kind of binding. (`use dep::emits_impl as format;
-            // fn g() { format!(); }`: the module's named import shadows the `#[macro_use]`
-            // prelude's `format`; taken as a glob's candidate it was GlobVsOuter, the call failed
-            // and its impl was never written.) A block with a glob of its own keeps the glob
-            // reading: its candidates and the outer ones are then really a glob's and the outer's.
-            if from == From::Glob
+            // fn g() { use MyEnum::*; format!(); }`: the module's named import shadows the
+            // `#[macro_use]` prelude's `format`, even when the block also has an unrelated glob.)
+            // When a non-lexical glob of the block does contribute `name`, `from` stays `From::Glob`
+            // so real glob-vs-outer ambiguity is still reported.
+            if from == From::LexicalGlob
                 && self.anonymous(m)
                 && self.plant != CellPlant::LexicalGlobIsAGlob
-                && self.modules[m as usize].glob_items.iter().all(|&g| self.lexical_glob(g))
                 && let Some(p) = self.modules[m as usize].parent
             {
                 m = p;
                 continue;
             }
+            let from = if from == From::LexicalGlob { From::Glob } else { from };
             break (inner, from);
         };
         if inner == Value::Outside {

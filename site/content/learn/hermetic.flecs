@@ -1,6 +1,6 @@
 // Lesson 4: hermetic builds. A build should depend only on its declared inputs (source, Cargo.lock, blaze's pinned
-// toolchain); a compiled function is kept under a key hashed from what changes its machine code (docs/cache.md, "What
-// is stored"). Build scripts and proc macros run in a sandbox today; tests (opt-in) and Windows are still to close.
+// toolchain); a compiled function is kept under a key hashed from what changes its machine code (docs/v2/plan/design/bottom.md,
+// section 3 "Identity and keys"). Build scripts and proc macros run in a sandbox today; tests (opt-in) and Windows are still to close.
 site {
   learn {
     hermetic : Page {

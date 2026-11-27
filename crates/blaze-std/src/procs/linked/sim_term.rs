@@ -132,7 +132,7 @@ impl RunChild for &mut TermChild<'_> {
         self.inner.now()
     }
 
-    fn recv_message<A: Allocator>(&mut self, into: &mut Vec<u8, A>, most: u32, deadline: Deadline) -> Result<Message, RunError> {
+    fn recv_message<A: Allocator>(&mut self, into: &mut blaze_own::Vec<u8, A>, most: u32, deadline: Deadline) -> Result<Message, RunError> {
         if self.ended.is_some() {
             return self.closed(into);
         }

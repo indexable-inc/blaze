@@ -1,4 +1,4 @@
-//! READ LISTS AS FACTS (drive.md, "End state: the whole pipeline on the command", piece 8):
+//! READ LISTS AS FACTS (end-state.md D157):
 //! every body's verdict holds the facts its check asked of the world, each with the digest of
 //! the answer it got, sorted by fact (front2 reads.rs).
 //!

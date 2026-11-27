@@ -79,7 +79,7 @@ pub struct Now {
     /// running`), as `blaze_core::lock::stall::Stall::line` says it. Its loop watchdog
     /// (`serve::stop`) checks each look once a wait passes its threshold; `None` for none.
     pub stall: Option<String>,
-    /// The tasks of this build the daemon's task watchdog (`blaze_profile::stuck`) found
+    /// The tasks of this build the daemon's task watchdog found
     /// stuck, each failed with a typed error: what each does, waits on and who holds that. A
     /// view says them first. Empty while nothing is stuck.
     #[serde(default)]

@@ -2,7 +2,7 @@ import Blaze.Mir.Opt.Liveness
 import Blaze.Mir.Opt.PutsTerm
 
 /-!
-Global dead-store elimination refines the program: ledger V11, pieces (d3) and (e).
+Global dead-store elimination refines the program: pieces (d3) and (e).
 
 The relation (`Rel`). The source's state is the target's with a list of slots replaced
 (`puts t reps`), and of the target's state: the borrow invariant holds (`Borrows`); the

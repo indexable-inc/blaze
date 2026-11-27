@@ -18,7 +18,7 @@
 //! netted, per account ([`Spent`]) and per tag (`blaze_mem::tag::heap_churned`), and every
 //! [`SAMPLE_EVERY`] bytes a thread allocates it hands one allocation to the heap sampler
 //! ([`sample_heap_with`]: the profiler walks its stack), so what churns the global heap has an
-//! answer by task, by tag and by call site (docs/memory-footprint.md, step 1).
+//! answer by task, by tag and by call site (.agents/skills/memory-and-data/SKILL.md).
 
 use std::{
     cell::Cell,
@@ -269,8 +269,8 @@ pub mod sampled;
 /// How many bytes a thread allocates between two heap samples: each sample stands for this
 /// many (a block past it, for as many times it as it spans), so the bytes allocated at a call
 /// site are its samples' weights summed, within a sample's. 4 MiB: a build that churns a GiB a
-/// second takes 256 samples a second, a walk of about 100 system calls each
-/// (`blaze_profile::heap`), and the profile's ring holds half a minute of them.
+/// second takes 256 samples a second, a walk of about 100 system calls each, and a ring of
+/// the profiler's holds half a minute of them.
 pub const SAMPLE_EVERY: i64 = 4 << 20;
 
 /// One allocation the heap sampler is handed ([`sample_heap_with`]).
@@ -294,7 +294,7 @@ static HEAP_SAMPLER: OnceLock<fn(HeapSampled)> = OnceLock::new();
 /// Every [`SAMPLE_EVERY`] bytes a thread allocates through [`Counting`], `sampler` is handed
 /// the allocation that crossed it, on the allocating thread, inside the allocator: it must not
 /// lock, and what it allocates is neither sampled nor sent back to it (the profiler walks the
-/// thread's frame pointers into a ring of its own, `blaze_profile::heap`). The first call wins.
+/// thread's frame pointers into a ring of its own). The first call wins.
 pub fn sample_heap_with(sampler: fn(HeapSampled)) {
     _ = HEAP_SAMPLER.set(sampler);
 }
@@ -817,7 +817,7 @@ fn spent_of(account: Account) -> Spent {
 /// it held at once, and its churn, what it allocated and what it freed in all, on its own job
 /// and every job of its pool scopes. A task whose `allocated` is far past its `peak` churns
 /// the heap: it frees and allocates again what it could have kept in its frame, and the pages
-/// that churn leaves are what the allocator keeps (docs/memory-footprint.md, cause 2).
+/// that churn leaves are what the allocator keeps (.agents/skills/memory-and-data/SKILL.md).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Spent {
     pub peak: u64,
@@ -1140,8 +1140,8 @@ mod tests {
     const MB: usize = 1 << 20;
 
     /// An account's churn is every byte its work allocated and freed, never netted: a task
-    /// that frees and allocates again churns far past its peak (docs/memory-footprint.md,
-    /// cause 2), and its peak alone would not say so.
+    /// that frees and allocates again churns far past its peak (.agents/skills/memory-and-data/SKILL.md),
+    /// and its peak alone would not say so.
     #[test]
     fn an_accounts_churn_is_what_its_work_allocated_and_freed_in_all() {
         let ((), spent) = measured(|| {

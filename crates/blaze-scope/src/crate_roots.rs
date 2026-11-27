@@ -1,5 +1,5 @@
 //! A path's crate root in an expansion's ITEM text, by its first segment's MARK (drive.md, "A
-//! token keeps its mark", ruled 21:27; piece token-mark-2). No spelled token: the text writes the
+//! token keeps its mark"; piece token-mark-2). No spelled token: the text writes the
 //! keyword `crate` where the expansion had another crate's `$crate`, and that token's row in the
 //! text's origin column (blaze-expand origin_column.rs) carries the mark it resolves by.
 //!
@@ -43,6 +43,8 @@ mod tests {
         let rules = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::SemiOpaque, edition: Edition::E2021 };
         let transparent = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::Transparent, edition: Edition::E2024 };
         assert_eq!(root_by_mark("$crate", Some(rules)), Root::Crate(dep));
+        let transparent = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::Transparent, edition: Edition::E2021 };
+        assert_eq!(root_by_mark("$crate", Some(transparent)), Root::Here);
         assert_eq!(root_by_mark("crate", Some(rules)), Root::Here);
         assert_eq!(root_by_mark("crate", Some(root_mark(dep, Edition::E2021))), Root::Crate(dep));
         assert_eq!(root_by_mark("$crate", Some(transparent)), Root::Here);
@@ -90,16 +92,15 @@ pub fn root_by_mark(first: &str, mark: Option<TextMark>) -> Root {
     }
 }
 
-/// A macro definition an expansion writes holds the `$crate` of ANOTHER crate than the one
-/// expanding (crate `k`'s macro, called in crate `here`, writes `macro_rules! b { .. $crate .. }`):
-/// the definition is lowered from text and defined in `here`, so its `$crate` would name `here`.
-/// Refused by name, never written another way: carrying the mark into the written definition
-/// (its `MacroSrc` keeping the crate its `$crate` names, in the two names records and the asked
-/// digest) is the named next piece (token-mark-3). The Reference, "Macros By Example",
-/// "Hygiene": `$crate` names the crate that defines the macro the token came from.
+/// A single macro definition an expansion writes holds `$crate` tokens from TWO DIFFERENT crates
+/// (e.g. one `$crate` from crate `A` and another from crate `B` or from the expanding crate
+/// `here`): a `MacroSrc` carries at most one uniform `dollar_crate` (token-mark-3), so a
+/// definition mixing crates cannot be represented without silently mis-attributing one of them
+/// and is refused by name. The Reference, "Macros By Example", "Hygiene": `$crate` names the
+/// crate that defines the macro the token came from.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ForeignDollarCrate {
-    /// The crate the `$crate` names.
+    /// A foreign crate whose `$crate` conflicts with another crate's `$crate` in the same definition.
     pub krate: CrateItemKey,
 }
 
@@ -147,6 +148,63 @@ impl<'t> TextMarks<'t> {
             }
         }
         Ok(None)
+    }
+
+    /// The uniform foreign crate that every `$crate` token across `slices` (each a slice of
+    /// `self.text`, e.g. a `macro_rules!` body or a 2.0 `macro`'s params and body) names, relative
+    /// to `here` (the crate lowering the definition; token-mark-3):
+    /// - `Ok(None)`: no `$crate` token in `slices`, or every one names `here`;
+    /// - `Ok(Some(k))`: every `$crate` token in `slices` names the same foreign crate `k != here`;
+    /// - `Err(ForeignDollarCrate { krate })`: `slices` mix `$crate` tokens naming two different
+    ///   crates (refused rather than silently mis-attributing either).
+    pub fn dollar_crate_in(&self, slices: &[&str], here: CrateItemKey) -> Result<Option<CrateItemKey>, ForeignDollarCrate> {
+        let mut seen: Option<CrateItemKey> = None;
+        for &slice in slices {
+            if !slice.contains("$crate") {
+                continue;
+            }
+            let Some(from) = crate::expansion_origins::offset_in(self.text, slice) else {
+                continue;
+            };
+            let len = u32::try_from(slice.len()).unwrap_or(u32::MAX);
+            let end = from.saturating_add(len);
+            let (mut lo, mut hi) = (0usize, self.column.len());
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.column.row(mid).start < from {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            let mut i = lo;
+            while i < self.column.len() {
+                let row = self.column.row(i);
+                if row.start >= end {
+                    break;
+                }
+                if row.end <= end {
+                    let s = usize::try_from(row.start).unwrap_or(usize::MAX);
+                    let e = usize::try_from(row.end).unwrap_or(usize::MAX);
+                    if self.text.get(s..e) == Some("$crate") {
+                        let krate = match root_by_mark("$crate", row.mark) {
+                            Root::Crate(k) => k,
+                            Root::Here | Root::NotARoot => here,
+                        };
+                        match seen {
+                            None => seen = Some(krate),
+                            Some(prev) if prev != krate => {
+                                let foreign = if krate == here { prev } else { krate };
+                                return Err(ForeignDollarCrate { krate: foreign });
+                            }
+                            Some(_) => {}
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+        Ok(seen.filter(|&k| k != here))
     }
 }
 

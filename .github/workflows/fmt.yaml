@@ -29,7 +29,7 @@ permissions:
   contents: read
 
 env:
-  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  # blaze's whole machine: no one sits at a CI runner.
   BLAZE_CORES: all
 
 jobs:

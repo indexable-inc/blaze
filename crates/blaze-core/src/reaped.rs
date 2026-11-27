@@ -1,5 +1,5 @@
 //! What each child process cost, said once it is reaped: the one place a profiler learns of
-//! every child a driver started (`blaze_profile`'s `processes` table).
+//! every child a driver started.
 //!
 //! A spawner names what it asks for with [`label`], keyed by its spawn effect's [`Tag`], before
 //! it hands the effect to its driver; the driver's reap ([`crate::process`]) takes the label

@@ -211,8 +211,7 @@ origin itself, which could load other code. That is the same trust pairing alrea
   - have its threads emit into `ring::Emitter`;
   - move its 88-byte `Entry` and `Toggle` wire forms into one zero-dependency home both crates
     take (`run_wire` restates them, held by a layout test).
-- **CBOR**: one zero-dependency home. `cbor` copies blaze-pack's, because blaze-pack links serde
-  through blaze-report (rule 30).
+- **CBOR**: one zero-dependency home, blaze-cbor; `cbor` re-exports it.
 - **bstd / the driver**:
   - a Unix socket created 0600 in a 0700 directory, with a peer uid check;
   - a loopback TCP listener;

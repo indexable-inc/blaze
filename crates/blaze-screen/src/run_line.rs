@@ -800,21 +800,24 @@ impl StatusVerb {
         }
     }
 
-    /// Semantic palette token for this verb (`Running` cyan for in-progress work, `Success`
-    /// green for completion and launch).
+    /// Semantic palette token for this verb (`Success` green for all five Cargo-style verbs,
+    /// matching Cargo's `HEADER` style: `Checking`, `Compiling`, `Linking`, `Finished`,
+    /// `Running`).
     pub const fn token(self) -> blaze_report::palette::Token {
         match self {
-            StatusVerb::Checking | StatusVerb::Compiling | StatusVerb::Linking => {
-                blaze_report::palette::Token::Running
-            }
-            StatusVerb::Finished | StatusVerb::Running => blaze_report::palette::Token::Success,
+            StatusVerb::Checking
+            | StatusVerb::Compiling
+            | StatusVerb::Linking
+            | StatusVerb::Finished
+            | StatusVerb::Running => blaze_report::palette::Token::Success,
         }
     }
 }
 
 /// Formats one Cargo-style persistent status line onto `out`: right-aligned 12-column verb
-/// (bold palette color when `terminal` enables color, plain otherwise), one space, `detail`,
-/// and a trailing newline.
+/// (standard ANSI 16 bold green `\x1b[1;32m` when `terminal` enables color so it matches
+/// Cargo's `HEADER` style and follows the user's terminal theme, plain otherwise), one space,
+/// `detail`, and a trailing newline.
 pub fn write_status_line(
     out: &mut dyn fmt::Write,
     terminal: &blaze_report::terminal::Terminal,
@@ -825,7 +828,13 @@ pub fn write_status_line(
     for _ in 0..STATUS_VERB_WIDTH.saturating_sub(word.len()) {
         out.write_char(' ')?;
     }
-    match terminal.sgr(verb.token()) {
+    // Cargo styles status verbs with standard ANSI 16 bold green (`\x1b[1;32m`), never hardcoded
+    // truecolor RGB, so the green follows the user's terminal color scheme.
+    let depth = match terminal.depth() {
+        blaze_report::palette::Depth::None => blaze_report::palette::Depth::None,
+        _ => blaze_report::palette::Depth::Ansi16,
+    };
+    match blaze_report::palette::sgr(verb.token(), depth, terminal.ground) {
         "" => out.write_str(word)?,
         code if code.starts_with("1;") => write!(out, "\x1b[{code}m{word}\x1b[0m")?,
         code => write!(out, "\x1b[1;{code}m{word}\x1b[0m")?,
@@ -1332,6 +1341,11 @@ mod tests {
             colors: blaze_report::palette::Depth::Ansi16,
             ..Terminal::PIPE
         };
+        let truecolor = Terminal {
+            caps: blaze_report::Caps { color: true, links: false, width: Some(80) },
+            colors: blaze_report::palette::Depth::True,
+            ..Terminal::PIPE
+        };
 
         let mut buf = LineBuf::<256>::new();
         write_status_line(&mut buf, &plain, StatusVerb::Checking, format_args!("hello")).expect("fits");
@@ -1360,18 +1374,29 @@ mod tests {
         write_status_line(&mut buf, &plain, StatusVerb::Running, format_args!("{}", cmd.as_str())).expect("fits");
         assert_eq!(buf.as_str(), "     Running `hello --port 8080 \"two words\" \"\"`\n");
 
-        // Colored ANSI16 output uses bold cyan for Checking and bold green for Finished/Running.
-        buf.clear();
-        write_status_line(&mut buf, &ansi16, StatusVerb::Checking, format_args!("hello")).expect("fits");
-        assert_eq!(buf.as_str(), "    \x1b[1;36mChecking\x1b[0m hello\n");
+        // Colored output (both ANSI 16 and truecolor terminals) always emits Cargo's standard
+        // ANSI 16 bold green (`\x1b[1;32m`) for every status verb so it matches the terminal theme.
+        for terminal in [&ansi16, &truecolor] {
+            buf.clear();
+            write_status_line(&mut buf, terminal, StatusVerb::Checking, format_args!("hello")).expect("fits");
+            assert_eq!(buf.as_str(), "    \x1b[1;32mChecking\x1b[0m hello\n");
 
-        buf.clear();
-        write_status_line(&mut buf, &ansi16, StatusVerb::Finished, format_args!("hello in 0.14s")).expect("fits");
-        assert_eq!(buf.as_str(), "    \x1b[1;32mFinished\x1b[0m hello in 0.14s\n");
+            buf.clear();
+            write_status_line(&mut buf, terminal, StatusVerb::Compiling, format_args!("hello")).expect("fits");
+            assert_eq!(buf.as_str(), "   \x1b[1;32mCompiling\x1b[0m hello\n");
 
-        buf.clear();
-        write_status_line(&mut buf, &ansi16, StatusVerb::Running, format_args!("`hello`")).expect("fits");
-        assert_eq!(buf.as_str(), "     \x1b[1;32mRunning\x1b[0m `hello`\n");
+            buf.clear();
+            write_status_line(&mut buf, terminal, StatusVerb::Linking, format_args!("hello")).expect("fits");
+            assert_eq!(buf.as_str(), "     \x1b[1;32mLinking\x1b[0m hello\n");
+
+            buf.clear();
+            write_status_line(&mut buf, terminal, StatusVerb::Finished, format_args!("hello in 0.14s")).expect("fits");
+            assert_eq!(buf.as_str(), "    \x1b[1;32mFinished\x1b[0m hello in 0.14s\n");
+
+            buf.clear();
+            write_status_line(&mut buf, terminal, StatusVerb::Running, format_args!("`hello`")).expect("fits");
+            assert_eq!(buf.as_str(), "     \x1b[1;32mRunning\x1b[0m `hello`\n");
+        }
 
         // Long durations format with minutes and hundredths.
         dur.clear();

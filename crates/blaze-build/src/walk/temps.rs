@@ -389,7 +389,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
         *s = OPENED;
         self.open_temps(e.0);
-        self.work.push(Task::TempScopeEnd(e));
+        self.work.push(Task::TempScopeEnd { anchor: e, value: e });
         self.work.push(Task::Eval(e));
         Ok(true)
     }
@@ -415,16 +415,17 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(())
     }
 
-    /// `Task::TempScopeEnd(e)`: temporary scope `e`'s value is made; its temporaries dropped
-    /// under it (an aggregate place copied out first, as it may be in one of them).
-    pub(super) fn temp_close(&mut self, e: ExprId) -> Result<(), BuildError> {
-        if self.temp_scopes.last().map(|&(a, _)| a) != Some(e.0) {
+    /// `Task::TempScopeEnd { anchor, value }`: temporary scope `anchor`'s region is done and
+    /// `value`'s adjusted value is on top; its temporaries are dropped under it (an aggregate place
+    /// copied out first, as it may be in one of them).
+    pub(super) fn temp_close(&mut self, anchor: ExprId, value: ExprId) -> Result<(), BuildError> {
+        if self.temp_scopes.last().map(|&(a, _)| a) != Some(anchor.0) {
             return Err(malformed("a temporary scope's end out of order"));
         }
         let mark = *self.temp_marks.last().ok_or(malformed("a temporary scope's end out of order"))? as usize;
         if self.scope_pats.len() > mark {
             let v = self.pop()?;
-            let repr = self.adjusted_repr(e)?;
+            let repr = self.adjusted_repr(value)?;
             let v = self.settle(v, repr, mark)?;
             self.push_val(v, None);
         }
@@ -815,12 +816,12 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                     }
                 }
                 Task::LetLink { expr, .. } => todo_expr.push(expr),
-                Task::LetElse(s) => {
+                Task::LetElse(s, _) => {
                     if let Some(Stmt::Let { else_: Some(els), .. }) = self.body.stmts.get(s.ix()).copied() {
                         todo_expr.push(els);
                     }
                 }
-                Task::Match(e) => {
+                Task::Match(e, _) => {
                     if let Some(Expr::Match { arms, .. }) = self.body.exprs.get(e.ix()).copied()
                         && let Some(list) = self.body.arms.get(arms.range())
                     {

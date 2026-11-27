@@ -1,6 +1,6 @@
 //! Copies over memory that another thread, or the kernel, may change while the copy runs: the
-//! store's buffer pool reads a page optimistically (docs/v2/plan/design/store-pool.md "Optimistic"
-//! reads) while the evictor may give it back (`MADV_DONTNEED`, `MADV_FREE_REUSABLE`) and a loader
+//! store's buffer pool reads a page optimistically
+//! while the evictor may give it back (`MADV_DONTNEED`, `MADV_FREE_REUSABLE`) and a loader
 //! may read a file into it again. A plain `&[u8]` read there would be a data race, which Rust
 //! leaves undefined; every access here is a relaxed atomic, a word at a time where the address is
 //! aligned to one and a byte at a time at the ends, so the copy is defined and only its bytes may

@@ -24,10 +24,9 @@ build byte for byte, and a budget for a fresh process to first answer. A file th
 of blaze can find (in the state directory, in a home, in `/tmp`) also has a test that a file of its
 previous layout is handled: an old home after an upgrade is detected, reported by name and rebuilt,
 and nothing is migrated (scope decision D36); a file outside a home is refused by name with what to
-do, or left alone under a name that carries its layout; docs/cargo.md, "Files that outlive a
-version", lists each with its test. A restore that silently starts empty is a failure blaze reports,
-naming why. A format that is written while blaze runs and read after a crash also gets a DST
-(`dst-not-review`) that crashes it at every point and checks the restore.
+do, or left alone under a name that carries its layout. A restore that silently starts empty is a
+failure blaze reports, naming why. A format that is written while blaze runs and read after a crash
+also gets a DST (`dst-not-review`) that crashes it at every point and checks the restore.
 
 ## dst-not-review (rule 43)
 
@@ -40,7 +39,27 @@ effects; `blaze-check` where two threads' atomics must interleave), and checks a
 the invariant ("every row recorded appears exactly once after any crash"), with planted-bug controls
 the oracle must catch and a failing tape that replays. A code review is not evidence that such code
 is right: it finds candidates, and each one it finds becomes a case the DST must catch before the
-fix lands. A change to such code without a DST that covers it is unfinished, whoever reviewed it.
+fix lands. A Lean proof or a model check is evidence on top of the DST, never in place of it. A
+change to such code without a DST that covers it is unfinished, whoever reviewed or proved it. The
+same simulation is the default for any behaviour over time (an edit after a build, a restart, a
+crash, two requests at once, a file replaced under a watcher, a cache hit after a key change, a
+retry, a timeout): write the test against the sans-IO core driven by `blaze_core::sim::Sim` (virtual
+clock, a simulated filesystem and network that can be slow, fail, tear or reorder, crashes at any
+step), not against a spawned blaze process, real files, real sleeps or real threads. Such a test is
+declarative (the steps and what must hold after each), runs under many seeds, and prints the seed
+and the step on failure so it replays exactly. For incremental behaviour the shape is the revision
+test: a small project and a sequence of source revisions with state kept between them, asserting
+after each what was redone, what was reused, and that the result equals a clean build of that
+revision byte for byte. Reach for a real process only for what a kernel alone can show (the order
+file events really arrive in, executing a built program, signals, code signing, a real socket), keep
+those tests few, and say in each which fact needed the real thing. Code that cannot run under the
+simulation (it starts threads, opens sockets, reads the clock, spawns a process or touches the
+filesystem directly) breaks `sans-io-cores`: cut the seam as part of the change, or record exactly
+what blocks it and where, and never paper over it with a slower, flakier end-to-end test. A bug
+found by hand or in production gets a simulated reproduction before its fix, minimized to the
+smallest revision sequence or transcript that shows it. Prefer a property over examples, a reference
+model over assertions about internals, and comparison with a clean build over expected output typed
+by hand.
 
 ## invariants-are-stated (rule 53)
 
@@ -53,12 +72,13 @@ and compares. Each needs a control in the same file, a test named `the_oracle_ca
 bug>`. The statement then climbs a ladder without being rewritten: tested (a property test),
 simulated (the deterministic simulation with faults and crashes), model-checked (every interleaving
 to a bound), proved (Lean, from the same contract and model; say it as `/// The invariant (proved:
-<proof file>):`). Durable, concurrent and crash-recovering code is at least simulated; prove the
-sans-IO cores and what must never be wrong; a disagreement between two levels is a bug in one of
-them. `scripts/src/bin/invariants.rs` (`blaze run -q -p scripts --bin invariants -- '<json>'`)
-collects every statement with its level into `docs/v2/plan/invariants.md` (`write`) and fails the
-gate (`check`) when one has no control, names a missing proof, or the list is stale. Before changing
-or regenerating code, read the invariants its crate states: they are what the new code is judged
+<proof file>):`). Durable, concurrent and crash-recovering code is at least simulated, and a proof
+above that adds to the simulation, never replaces it (`dst-not-review`); prove the sans-IO cores and
+what must never be wrong; a disagreement between two levels is a bug in one of them.
+`scripts/src/bin/invariants.rs` (`blaze run -q -p scripts --bin invariants -- '<json>'`) collects
+every statement with its level into `docs/v2/plan/invariants.md` (`write`) and fails the gate
+(`check`) when one has no control, names a missing proof, or the list is stale. Before changing or
+regenerating code, read the invariants its crate states: they are what the new code is judged
 against. A promise in a doc comment is either derived (an effect attribute the build checks) or a `#
 Guarantees` / `# Invariants` item ending in ``Evidence: [`test`]``, ``Evidence: Lean `Name` `` or
 `Unverified: why`; never prose alone. The `claims` lints refuse a doc the effect walk refutes, a
@@ -73,10 +93,10 @@ blaze is to be a compiler whose correctness is proved, not only tested. The orde
 practice: (1) one specification of what MIR does, written in Lean as an executable semantics (an
 interpreter over a deep embedding of MIR), held to the tree by running it against blaze's MIR
 evaluator and blaze-built code on generated programs; it is the one meaning every proof refers to
-(`one-concept-one-home`); (2) user code is proved against it: the functional models `hir-ty-lean`
-emits are derived from, and proved or checked equal to, the semantics of the body they model, so a
-proof is about what blaze compiles and not a hand-written copy; (3) each MIR transformation is
-correct against it: a small pass by a Lean theorem that its output refines its input, a large one by
+(`one-concept-one-home`); (2) user code is proved against it: the functional models blaze emits are
+derived from, and proved or checked equal to, the semantics of the body they model, so a proof is
+about what blaze compiles and not a hand-written copy; (3) each MIR transformation is correct
+against it: a small pass by a Lean theorem that its output refines its input, a large one by
 translation validation (a checker, itself proved sound, that accepts each run's before and after),
 run in the gate on real crates; (4) then lowering to LIR and to machine code against machine models,
 the front end's rules, and the driver's state machines by refinement from their reference models
@@ -90,27 +110,7 @@ See [docs/v2/plan/design/formal-verification.md](../../../docs/v2/plan/design/fo
 
 ## simulate-first (rule 64)
 
-Default to the simulation. When you test behaviour over time (an edit after a build, a restart, a
-crash, two requests at once, a file replaced under a watcher, a cache hit after a key change, a
-retry, a timeout), write the test against the sans-IO core driven by `blaze_core::sim::Sim` (virtual
-clock, simulated filesystem and network that can be slow, fail, tear or reorder, crashes at any
-step), not against a spawned blaze process, real files, real sleeps or real threads. Such a test is
-declarative (the steps and what must hold after each), runs under many seeds, prints the seed and
-the step on failure so it replays exactly, checks an oracle that states the invariant, and has a
-planted bug the oracle catches (`dst-not-review`). For incremental behaviour the shape is the
-revision test: a small project and a sequence of source revisions with state kept between them,
-asserting after each what was redone, what was reused, and that the result equals a clean build of
-that revision byte for byte. Reach for a real process only for what a kernel alone can show (the
-order file events really arrive in, executing a built program, signals, code signing, a real
-socket), keep those tests few, and say in each which fact needed the real thing. When the code you
-need to test cannot run under the simulation (it starts threads, opens sockets, reads the clock,
-spawns a process or touches the filesystem directly), that is the finding: it breaks
-`sans-io-cores`; cut the seam (a core with an injected effect interface and a thin driver) as part
-of the change, or record exactly what blocks it and where, and do not paper over it with a slower,
-flakier end-to-end test. A bug found by hand or in production gets a simulated reproduction before
-its fix, minimized to the smallest revision sequence or transcript that shows it. Prefer a property
-over examples, a reference model over assertions about internals, and comparison with a clean build
-over expected output typed by hand.
+Merged into rule 43, `dst-not-review` (`testing` skill).
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 
@@ -127,16 +127,17 @@ Write few tests, each where it pays:
   deletion, a key's coverage, a codec): a unit or property test beside the code. If the
   signature is still moving, don't write one yet; prove it end to end and come back.
 - **Concurrent, durable, crash-recovering, billing or data-deleting code**: a deterministic
-  simulation test (DST), below. This is the requirement of `dst-not-review`, not an option.
+  simulation test (DST), below. This is the requirement of `dst-not-review`, not an option. A
+  Lean proof is extra evidence on top of the DST and never replaces it.
 - **A bug found in a real crate**: that crate's own tests under `blaze test`
-  (`verify-on-real-projects`); a daemon bug: a step in the edit harness
+  (`verify-on-real-projects`); an edit-loop bug: a step in the edit harness
   ([docs/harness.md](../../../docs/harness.md#adding-a-test)).
 - **A slow or flaky reproduction**: shrink it (blaze-sim's shrinker, treereduce, `git bisect`) into a
   test that runs in seconds, named for the property it breaks. That one is always allowed.
-- **Parsers of hostile bytes**: fuzzing (`crates/blaze-fuzz`, `fuzz/`).
+- **Parsers of hostile bytes**: fuzzing (`crates/blaze-fuzz`).
 
-No big suites, no tests of code whose shape is still changing, no red/green ritual on a dev
-host: push and let CI and the harnesses catch breakage.
+No big suites, no tests of code whose shape is still changing, no red/green ritual on the
+Mac: push and let CI and the harnesses catch breakage.
 
 ## Property tests and simulations: `blaze-sim`
 
@@ -201,9 +202,9 @@ fails, and replays it exactly.
   block changed on disk under what was synced). `crates/blaze-core/src/sim/pages.rs` is the
   worked example: a pool-shaped page store, its oracle, five planted bugs and seed replay.
 
-Examples: `crates/blaze-cas/src/tests/model_check.rs` (the store's operation sequence and the
-`Sim` seed are drawn, and the store is checked against a `BTreeMap`) and the crash tests in
-`crates/blaze-cas/src/tests.rs`; `crates/blaze-graph/src/sched/tests.rs` for the scheduler core.
+Examples: `crates/blaze-cas/src/plain/tests.rs` (the plain store under `Sim`: two writers, power
+cuts at any completion, failed effects, a reader after); `crates/blaze-graph/src/sched/tests.rs`
+for the scheduler core.
 
 Its limits: its own choices (latency, delivery order, what a crash tears) hang off one seed the
 test draws, so a failure's plan is shrunk and its schedule is not, until `Sim` takes the tape;
@@ -245,10 +246,10 @@ disk).
    - the fault classes to turn on, as a swarm: each run draws a subset (sync failures, short
      writes, latency, ENOSPC, lost watch changes) so a rare class is not drowned by a common one;
    - the crash points (after which op, or after how many completions);
-   - the schedule: which actor (thread, process, the daemon or a reader) takes its next step;
+   - the schedule: which actor (thread, process or a reader) takes its next step;
    - the `Sim` seed (`tape.next_u64("sim seed")`), until `Sim` takes the tape itself.
 3. **Run it in the simulation**: drive the core with the `Sim` driver, crash it, reopen it (the
-   restart runs recovery exactly as the daemon would), and keep going.
+   restart runs recovery exactly as a real start would), and keep going.
 4. **Check an oracle that states the invariant**, against a plain model kept beside the run, at
    every step and after every crash: "every row recorded and flushed appears exactly once after
    any crash", "a reader never sees a file the manifest does not list", "no byte is deleted while
@@ -265,16 +266,16 @@ disk).
    in the run reads real time, real threads or hash order (`deterministic-output`); a case that
    does is reported as not a function of its tape.
 
-A DST is fast enough for the merge gate at its default case count, and runs long
-(`BLAZE_SIM_SEEDS`) in the release train.
+A DST is fast enough for the merge gate at its default case count, and runs long with
+`BLAZE_SIM_SEEDS`.
 
-### Worked example: blaze-profile's history
+### Worked example: the profile's history (deleted 2026-11-27)
 
-blaze-profile keeps a history on disk (docs/profiling.md): `manifest.json`, rewritten to a hidden
-name and renamed over the last under `manifest.lock`, is the one commit point of a flush, a
-merge and a retire (`crates/blaze-profile/src/history/manifest.rs`, `retire.rs`, `pin.rs`); and
-the flight recorder's postmortem rings are mmapped, so a crashed daemon's last events survive
-(`crates/blaze-profile/src/flight/postmortem.rs`). On 2026-11-04 a code review of this code, which
+The profile crate (deleted on 2026-11-27 with the rest of the profile, end-state.md D178) kept a
+history on disk: `manifest.json`, rewritten to a hidden name and renamed over the last under
+`manifest.lock`, was the one commit point of a flush, a merge and a retire; and the flight
+recorder's postmortem rings were mmapped, so a crashed daemon's last events survived. The code is
+gone; the lesson stands. On 2026-11-04 a code review of this code, which
 had landed with tests, found eight bug classes. None of its tests could have caught them, and
 each maps to a DST capability that does:
 
@@ -289,17 +290,17 @@ each maps to a DST capability that does:
 | A lost `flushed` update when a ring moves between two atomics: a writer's store lands between the mover's load and its store | A switch point at every atomic operation (`blaze-check`), plus what a crash keeps of a mapped ring (not modelled yet) |
 | Recovery holds `manifest.lock` while it walks the directory, so a daemon that starts during it blocks | Multi-process restart on the virtual clock with a bounded-progress oracle: the second daemon's first answer arrives within its bound (`hold_lists`/`slow_writes` today; a second process once the disk holds several) |
 
-Since 2026-11-04 the writer is a sans-IO core (`crates/blaze-profile/src/history/files.rs`,
-marked `#![blaze::sans_io]`; `manifest.rs`, `retire.rs`, `compact.rs` and `merge.rs` too) driven
-by `history/drive.rs`, and its DST is `history/files/tests.rs`: it draws flushes, build ends
+From 2026-11-04 the writer was a sans-IO core (`history/files.rs`, marked
+`#![blaze::sans_io]`; `manifest.rs`, `retire.rs`, `compact.rs` and `merge.rs` too) driven by
+`history/drive.rs`, and its DST was `history/files/tests.rs`: it drew flushes, build ends
 (merges), crashes at a completion count and reopens (recovery), with swarm faults
-(`fail_one_in`, `fill` for ENOSPC, `fail_syncs`, a held `manifest.lock`), and its oracle is that
+(`fail_one_in`, `fill` for ENOSPC, `fail_syncs`, a held `manifest.lock`), and its oracle was that
 after any crash and reopen the rows in listed files plus the rows recovered equal the rows
 recorded, each once, no listed file is missing or torn, and the history always opens. Its
-planted bugs (`files::Plant`) are the first two rows of the table: no sync before a rename, and
+planted bugs (`files::Plant`) were the first two rows of the table: no sync before a rename, and
 a flush's consumption marked after its commit.
 
-The full DST for it draws records, flushes, merges, retires, pins, reads and restarts, crashes at any
+The full DST for such a writer draws records, flushes, merges, retires, pins, reads and restarts, crashes at any
 point, and checks: every row recorded and flushed appears exactly once; no file a live pin's
 generation lists is deleted; a reader opened after any crash sees only listed files; a restart
 reaches its first answer within its bound. Each row of the table is a planted bug it must catch.
@@ -313,7 +314,7 @@ seccomp filter, marked as the sandbox launcher marks one, with a bound: list the
 tests cover every public wait of `blaze_core::wait`, blaze-graph's `pool.rs` the workers' park), and
 match on `Ended`, where a wait that does not end is `Ended::Hung` naming the case, never a hung
 test. Its control is the same case not marked, which has to fail naming `io_uring_setup`. Linux
-only: macOS's sandbox filters no system call by number and has one wait driver.
+only, so it runs in CI: macOS's sandbox filters no system call by number and has one wait driver.
 
 ## Persisted state and causes
 

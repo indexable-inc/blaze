@@ -320,12 +320,10 @@ impl Renderer {
         att.setTexture(Some(&drawable.texture()));
         att.setLoadAction(MTLLoadAction::Clear);
         att.setStoreAction(MTLStoreAction::Store);
-        att.setClearColor(MTLClearColor {
-            red: f64::from(frame.clear[0]),
-            green: f64::from(frame.clear[1]),
-            blue: f64::from(frame.clear[2]),
-            alpha: 1.0,
-        });
+        // The window is see-through: what the scene leaves undrawn (the sidebar's backdrop and
+        // the margin around the content card) stays transparent so the blur behind shows. The
+        // blend writes premultiplied alpha, which CoreAnimation composites as-is.
+        att.setClearColor(MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0 });
         let Some(cb) = self.queue.commandBuffer() else {
             return;
         };

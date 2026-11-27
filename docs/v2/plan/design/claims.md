@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: A promise in a doc comment is derived by the compiler, checked by an attribute, or points at what proves it; never only asserted. The one written form (`# Guarantees` / `# Invariants` items ending in `Evidence:` or `Unverified:`), the six lints that enforce it in crates/blaze-lints (`claims/`), and the ledger in scripts/src/bin/invariants.rs that lists every claim with its evidence and level and that the gate holds.
+summary: A promise in a doc comment is derived by the compiler, checked by an attribute, or points at what proves it; never only asserted. The one written form (`# Guarantees` / `# Invariants` items ending in `Evidence:` or `Unverified:`), the six lints that would enforce it (declared in blaze-lint-defs, not built), and the ledger in scripts/src/bin/invariants.rs (built) that lists every claim with its evidence and level and that the gate holds.
 date: 2026-11-13
 ---
 # Claims
@@ -27,8 +27,8 @@ and a doc the facts refute, are findings.
 
 ## Why this syntax
 
-- A rustdoc section with intra-doc links is plain Rust: rustc ignores it, so it holds while
-  cargo builds blaze (rule 6 forbids a `cfg` guard, and a new attribute would need one); rustdoc
+- A rustdoc section with intra-doc links is plain Rust: rustc ignores it, so it holds under
+  any Rust toolchain (rule 6 forbids a `cfg` guard, and a new attribute would need one); rustdoc
   renders it and checks the links; an agent reads the promise and its proof where the item is.
 - It extends the `/// The invariant:` statements the ledger already reads, with one marker
   each: one spelling (`Tested by`, `Proof:`, lowercase `evidence:` are findings, with a fix).
@@ -36,7 +36,9 @@ and a doc the facts refute, are findings.
   cannot drift from the evidence.
 - `# Safety` stays the caller's obligation (a precondition; its checked home is `requires`).
 
-## The lints (crates/blaze-lints/src/blaze/claims/)
+## The lints (declared in crates/blaze-lint-defs/src/lints.rs, not built)
+
+The six names are registered at `allow`; no checker implements them yet.
 
 | lint | blaze's level | fix |
 | --- | --- | --- |
@@ -76,25 +78,14 @@ simulation), and reach the item: a call of the function, or a value of the type,
 calls into the crate's own code. Which part of a result the test observes is the
 test-observation lane's analysis; when it lands, a claim about a result asks it.
 
-**Lanes.** Hidden control flow owns `doc_names_nothing` (a backticked path that names nothing);
-it skips the text after `Evidence:`, which is this lane's. The suggestions lane
-(crates/blaze-findings) owns `could_be_pure` and its kin, the same attributes for a function
-whose doc says nothing; these fire only where prose says it.
+`doc_names_nothing` (a backticked path that names nothing) skips the text after `Evidence:`,
+which these lints check.
 
-## The ledger (scripts/src/bin/invariants.rs)
+## The ledger (built)
 
-Input, one JSON value: `{"command": "check" | "write" | "claims", "root": ".", "base": "HEAD"}`.
-`write` regenerates docs/v2/plan/invariants.md, now with a Claims section: one row per claim
-(id `crate::item#n`, how it is held, level, the claim, its evidence) and totals by crate and
-level. `claims` prints the same rows as JSON. Kinds read: the statements, `# Guarantees` and
-`# Invariants` items, effect attributes (checked, or trusted and counted unverified with its
-reason), `.spec.proof` theorems of lean/theorems.json (a contract, proved), and `# Safety`
-sections (obligation). Level: a Lean name found in theorems.json is `proved`; a test pointer
-takes its test file's level as the statements' (`tested`, `simulated`, `model-checked`).
-
-`check` (the gate): the file is current; every evidence pointer is found (a test function of
-that name in the crate's files, or a theorem name); against `base`'s committed ledger, no
-crate's unverified count grows and no claim's level goes down.
+scripts/src/bin/invariants.rs (`check`, `write`, `claims`) reads every claim with its evidence and
+level into the Claims section of docs/v2/plan/invariants.md, and its `check` holds the gate: every
+pointer found, no crate's unverified count up, no claim's level down.
 
 ## Floor
 

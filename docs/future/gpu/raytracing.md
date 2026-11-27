@@ -6,8 +6,10 @@ date: 2026-11-02
 # Ray tracing
 
 This builds on [plan.md](plan.md): the same `#[gpu::kernel]`, the same one-session compile, the
-same `Device` backends. The first piece is being built: an opaque-only inline query on Metal
-(`Tlas::trace` and `Tlas::occluded`), in [shaders.md](shaders.md#compute-kernels-and-inline-ray-query-phase-3b).
+same `Device` backends. Built: `crates/gpu/src/ray.rs` runs `Tlas::trace`, `Tlas::occluded`
+and the iterative `RayQuery` on the CPU, over slice-backed acceleration structures; the MSL
+emitter (`crates/gpu/src/emit.rs`) includes `<metal_raytracing>` for a kernel that takes a
+`Tlas`. No device runs a query yet.
 
 ## What each API offers
 
@@ -65,7 +67,7 @@ How each backend lowers it:
   somewhere slower.
 - **The CPU** uses Embree's query API, or a BVH blaze owns, under the same loop.
 
-### As built first: opaque queries through naga
+### First: opaque queries through naga
 
 The backend is shaders.md's (MIR to naga IR, then naga's MSL writer, which writes Metal's
 `intersection_query`), not SPIR-V or SPIRV-Cross, so the Metal row above comes before the Vulkan
@@ -84,7 +86,7 @@ query commits) picks `None` or `Some` in Rust.
 `Hit` is a plain Rust struct of the committed intersection's fields (`t`, `instance_index`,
 `instance_custom_index`, `geometry_index`, `primitive_index`, `barycentrics`, `front_face`); the
 object-to-world matrices are left out until a user needs them. `RayQuery::new` and `proceed` with
-`Candidate` arms (above) come next, for alpha-tested and procedural geometry.
+`Candidate` arms (above), for alpha-tested and procedural geometry, run on the CPU only.
 
 ## Pipeline second
 

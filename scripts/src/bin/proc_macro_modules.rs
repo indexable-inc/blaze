@@ -1789,11 +1789,10 @@ impl Plan<'_> {
         features.sort();
         features.dedup();
         let identity = format!(
-            // The same text as crates/blaze-proc-macro/src/module.rs `identity` (form 4: the
-            // profile is an input; this builder sets `debug-assertions = true` for the macro
-            // crate and its dependencies, `false` for std's own crates ([`STD_RELEASE`]), and
-            // `-Zub-checks=no` for every crate, below).
-            "blaze proc-macro module 4\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
+            // Distinct target-bearing header for `wasm32-wasip1` bootstrap records so they never
+            // share a write-once key with on-demand `wasm64-blaze-wasip1` self-compiled modules
+            // (`blaze proc-macro module wasm64 9` in `crates/blaze-proc-macro/src/module.rs`).
+            "blaze proc-macro module wasm32 7\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\ntarget {}\nshim {}\nprofile debug-assertions std-release ub-checks-off\nbuilder bootstrap\n",
             wanted.name,
             wanted.version,
             origin.identity_line(),

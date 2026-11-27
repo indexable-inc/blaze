@@ -90,7 +90,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                         def: hit.def,
                         vis: hit.vis,
                         origin: hit.origin,
-                        expansion: hit.expansion,
+                        expansion: u16::try_from(hit.expansion).unwrap_or(u16::MAX),
                         state: hit.state,
                     },
                 }),
@@ -481,12 +481,13 @@ impl<'a, N: Name> Resolver<'a, N> {
                 Some(c) => Visibility::narrower(g.vis, c, importer),
                 None => g.vis,
             };
+            let g_expansion = u16::try_from(g.expansion).unwrap_or(u16::MAX);
             match out.iter_mut().find(|e| e.source.key == def.key) {
                 Some(e) => {
                     e.vis = Visibility::wider(e.vis, vis, importer);
-                    e.expansion = e.expansion.min(g.expansion);
+                    e.expansion = e.expansion.min(g_expansion);
                 }
-                None => out.push(GlobEdge { source: def, vis, expansion: g.expansion }),
+                None => out.push(GlobEdge { source: def, vis, expansion: g_expansion }),
             }
         }
         out.sort_unstable_by_key(|e| e.source.key);
@@ -561,7 +562,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             };
             *idx = slot_idx + 1;
             match slot {
-                Slot::Rules { name, def, shapes, .. } => out.push(TextualDef { name, def, expansion: f.expansion, shapes }),
+                Slot::Rules { name, def, shapes, .. } => out.push(TextualDef { name, def, expansion: u16::try_from(f.expansion).unwrap_or(u16::MAX), shapes }),
                 Slot::Call(c) => {
                     if let CallState::Expanded { frag: inner, .. } = self.calls[c as usize].state {
                         stack.push((inner, 0));

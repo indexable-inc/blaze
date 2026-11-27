@@ -572,6 +572,14 @@ impl<'s, 'a> Cfg<'s, 'a> {
                 "no_implicit_prelude" => attrs.no_implicit_prelude = true,
                 "no_std" => attrs.no_std = true,
                 "no_core" => attrs.no_core = true,
+                "recursion_limit" => {
+                    let parsed = parse_recursion_limit(content);
+                    match (attrs.recursion_limit, parsed) {
+                        (None, res) => attrs.recursion_limit = Some(res),
+                        (Some(Ok(_)), Err(err)) => attrs.recursion_limit = Some(Err(err)),
+                        _ => {}
+                    }
+                }
                 "feature" => {
                     for feature in SplitTop::new(args(content)) {
                         let feature = feature.trim();
@@ -805,6 +813,8 @@ pub struct Attrs<'t, 'a> {
     pub no_core: bool,
     /// `#![blaze::arbitrary_ints]` (docs/v2/plan/design/arbitrary-ints.md).
     pub arbitrary_ints: bool,
+    /// `#![recursion_limit = "N"]`: `Ok(limit)` when valid, `Err(content)` when malformed.
+    pub recursion_limit: Option<Result<u32, &'t str>>,
     pub tools: AVec<'a, &'t str>,
     /// `#![feature(a, b)]`'s names, as written (a crate root's: the crate root record's
     /// `features`, which a gate of the crate's code reads).
@@ -916,6 +926,7 @@ impl<'a> Attrs<'_, 'a> {
             no_std: false,
             no_core: false,
             arbitrary_ints: false,
+            recursion_limit: None,
             tools: AVec::new_in(alloc),
             features: AVec::new_in(alloc),
             others: AVec::new_in(alloc),
@@ -926,6 +937,44 @@ impl<'a> Attrs<'_, 'a> {
             proc_macro: None,
         }
     }
+}
+
+/// Parses `#![recursion_limit = "N"]` using Rust literal tokenization and escape decoding
+/// (allowing comments around `=`, string escapes like `"\x32\x35\x36"`, raw strings like
+/// `r#"256"#`, and one optional leading `+` as `usize::from_str` accepts), preserving the
+/// requested limit (up to `u32::MAX`) and returning `Err(content)` when the attribute or its
+/// decoded value is malformed or overflows `usize`.
+fn parse_recursion_limit<'t>(content: &'t str) -> Result<u32, &'t str> {
+    let trimmed = skip_attr_trivia(content);
+    let attr = head(trimmed);
+    let Some(rest) = trimmed.get(attr.len()..) else { return Err(content) };
+    let mut saw_any = false;
+    let mut has_digits = false;
+    let mut valid = true;
+    let mut value: usize = 0;
+    let decoded = blaze_expand::decode_name_value_str(rest, |ch| {
+        if !valid {
+            return;
+        }
+        if !saw_any && ch == '+' {
+            saw_any = true;
+            return;
+        }
+        saw_any = true;
+        let Some(digit) = ch.to_digit(10).and_then(|d| usize::try_from(d).ok()) else {
+            valid = false;
+            return;
+        };
+        has_digits = true;
+        match value.checked_mul(10).and_then(|v| v.checked_add(digit)) {
+            Some(next) => value = next,
+            None => valid = false,
+        }
+    });
+    if !decoded || !valid || !has_digits {
+        return Err(content);
+    }
+    Ok(u32::try_from(value).unwrap_or(u32::MAX))
 }
 
 /// An attribute the lowering never takes for an item's attribute macro by its name alone: a
@@ -1867,6 +1916,10 @@ pub struct MacroSrc<'t> {
     pub module: ItemKey,
     pub export: bool,
     pub local_inner: bool,
+    /// When an expansion of ANOTHER crate wrote this macro definition and every `$crate` in its
+    /// body names that crate (`token-mark-3`), that crate's key; `None` when every `$crate` names
+    /// the crate defining this macro (or the body has none).
+    pub dollar_crate: Option<CrateItemKey>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1883,7 +1936,7 @@ pub struct CallSrc<'t> {
     /// file, or the file an `include!` read on the way ([`Fragment::written`]). Where an
     /// `include!` call reads from (core `macros/mod.rs`: "relative to the current file").
     pub written: &'t str,
-    pub depth: u16,
+    pub depth: u32,
     /// An attribute call no attribute in the text names ([`IMPLICIT_MAIN`], D104): it stands
     /// outermost, and its item is the whole input (blaze-expand `ItemAttrs::implicit_call`).
     pub implicit: bool,
@@ -1923,12 +1976,47 @@ const HARNESS_HEAD: &str =
 /// One entry's path up to its constructor.
 const HARNESS_CLIENT: &str = "::proc_macro::bridge::client::Client::";
 
+/// One `#[proc_macro]`, `#[proc_macro_attribute]`, or `#[proc_macro_derive(..)]` function
+/// declared in a proc-macro crate's root module (either directly in `lib.rs` or via a
+/// root-level macro expansion such as `derive_more-impl`'s `create_derive!`). Used to build
+/// both the crate's `_DECLS` harness static and the wasm64 module's `macros` export manifest
+/// in identical order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcHarnessEntry<'a> {
+    pub kind: ProcKind,
+    pub macro_name: &'a str,
+    pub helpers: &'a str,
+    pub fn_name: &'a str,
+}
+
+/// The key of the synthetic harness call whose expansion defines crate `krate`'s `_DECLS` static.
+pub fn proc_macro_harness_call(krate: CrateItemKey) -> ItemKey {
+    key_of(krate, root_key(krate), HARNESS_TAG, HARNESS_PATH, 0)
+}
+
+/// Formats the `#[rustc_proc_macro_decls] pub static _DECLS` text for `entries` in order.
+pub fn proc_macro_harness_text<'a>(entries: &[ProcHarnessEntry<'a>], bump: Bump<'a>) -> &'a str {
+    let mut text = BString::new_in(bump);
+    text.push_str(HARNESS_HEAD);
+    for entry in entries {
+        text.push_str(HARNESS_CLIENT);
+        text.push_str(match entry.kind {
+            ProcKind::Derive | ProcKind::FnLike => "expand1(crate::",
+            ProcKind::Attr => "expand2(crate::",
+        });
+        text.push_str(entry.fn_name);
+        text.push_str("), ");
+    }
+    text.push_str("];\n");
+    text.into_bump_str()
+}
+
 /// The key of crate `krate`'s `_DECLS` static (D175): the static's key in the harness call's
 /// expansion, the call being the root's one entry of its tag. A function of the crate's key
 /// alone (rule 71): what a code-record program names it by (blaze-ladder front2
 /// `proc_macro_decls`). Only a proc-macro crate (`Implicit::proc_macro`) has the item.
 pub fn proc_macro_decls_key(krate: CrateItemKey) -> ItemKey {
-    let call = key_of(krate, root_key(krate), HARNESS_TAG, HARNESS_PATH, 0);
+    let call = proc_macro_harness_call(krate);
     key_of(krate, call, kind_tag(ItemKind::Static), PROC_MACRO_DECLS, 0)
 }
 
@@ -1996,7 +2084,7 @@ pub struct BodySrc<'t> {
     /// inline `mod` inside the body's blocks resolves from, matching `Made::dir`.
     pub included_dir: Option<&'t str>,
     /// How many expansions (and bodies) deep its text is.
-    pub depth: u16,
+    pub depth: u32,
     /// Where it is written: the fragment (its owner's key: the module's own text, or a call's
     /// expansion) and the last ordered entry's place before it there (`0`: none). A block's
     /// module reads the textual scope from this place on outward (Reference
@@ -2024,7 +2112,7 @@ impl<'t> BodySrc<'t> {
         text: &'t str,
         loc: Loc,
         written: &'t str,
-        depth: u16,
+        depth: u32,
         place: (ItemKey, u32),
         marks: Option<crate::crate_roots::TextMarks<'t>>,
         tokens: FragmentTokens<'_, 't>,
@@ -2130,6 +2218,8 @@ pub enum LowerNoteKind<'t> {
     /// A `#[lang = ..]` or `#[path = ..]` whose macro-call value does not read to a string
     /// (`include_str!`, `env!`, a macro only resolution can tell): no lang row, no path.
     AttrValueRefused(AttrValueRefusal<'t>),
+    /// A generated macro definition mixes `$crate` tokens from two different crates (token-mark-3).
+    MixedDollarCrate,
 }
 
 impl fmt::Display for LowerNoteKind<'_> {
@@ -2148,6 +2238,7 @@ impl fmt::Display for LowerNoteKind<'_> {
             LowerNoteKind::ItemNotRead => f.write_str("an item the outline could not read"),
             LowerNoteKind::UnhandledItem { syntax } => write!(f, "unhandled item form: {:?}", syntax_kind(*syntax)),
             LowerNoteKind::AttrValueRefused(refusal) => write!(f, "{refusal}"),
+            LowerNoteKind::MixedDollarCrate => f.write_str("macro definition mixes `$crate` from different crates"),
         }
     }
 }
@@ -2192,6 +2283,8 @@ pub struct Lowered<'t, 'a, 's> {
     pub notes: AVec<'s, LowerNote<'t>>,
     /// The `link_name`/`export_name` values written as macro calls, each at its item's place.
     pub values: AVec<'s, crate::attr_values::ValueSite<'t>>,
+    /// Root-level `#[proc_macro*]` functions lowered in this fragment (when `LowerCx::harness` is true).
+    pub proc_harness: AVec<'s, ProcHarnessEntry<'t>>,
 }
 
 impl Lowered<'_, '_, '_> {
@@ -2314,7 +2407,7 @@ pub struct Fragment<'c, 't> {
     pub items: Option<ItemIndex>,
     pub at: Where,
     /// How many expansions deep it is.
-    pub depth: u16,
+    pub depth: u32,
     /// A module the walk did not see (a macro wrote it or its parent): its `mod` items are
     /// made, not looked up in the tree.
     pub made: bool,
@@ -2361,11 +2454,10 @@ pub fn lower_in_out<'p: 't, 't, 'o, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<
         && fragment.depth == 0
         && matches!(fragment.at, Where::File(_))
         && !exports_entry(cx.cfg, fragment.outline, fragment.text, scratch);
-    let harness = cx.harness && fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) && fragment.members_of.is_none();
+    let harness = cx.harness && fragment.items.is_none() && fragment.members_of.is_none();
     let mut low = Lower {
         entry,
         harness,
-        harnessed: AVec::new_in(scratch),
         krate: cx.krate,
         tools: cx.tools,
         edition: cx.edition,
@@ -2409,6 +2501,7 @@ pub fn lower_in_out<'p: 't, 't, 'o, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<
             ctors: AVec::new_in(out_alloc),
             notes: AVec::new_in(out_alloc),
             values: AVec::new_in(out_alloc),
+            proc_harness: AVec::new_in(out_alloc),
         },
     };
     // The entries left to lower, each a run of siblings (`at..end`): an extern block's items
@@ -2423,9 +2516,6 @@ pub fn lower_in_out<'p: 't, 't, 'o, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<
     // keeps no module file whose `#![cfg]` is false, so this is the crate root's: the crate
     // exists and is empty (a proc-macro crate's harness lists nothing).
     if fragment.items.is_none() && fragment.depth == 0 && matches!(fragment.at, Where::File(_)) && !file_attrs(low.cfg, outline, low.text, scratch).cfg_ok {
-        if low.harness {
-            low.proc_macro_harness();
-        }
         return low.out;
     }
     // A macro crate's module list: the root's fragment declares each macro it names.
@@ -2449,9 +2539,6 @@ pub fn lower_in_out<'p: 't, 't, 'o, 's, 'a: 't, W: Walked + ?Sized>(cx: LowerCx<
             runs.push(children_run(outline, Some(idx)));
         }
     }
-    if low.harness {
-        low.proc_macro_harness();
-    }
     low.out
 }
 
@@ -2466,11 +2553,8 @@ fn children_run(outline: &Outline<'_>, parent: Option<ItemIndex>) -> (usize, usi
 struct Lower<'c, 'o, 's, 't, 'a, W: ?Sized> {
     /// [`LowerCx::entry`], and the file exports no entry of its own.
     entry: bool,
-    /// [`LowerCx::harness`], and this is the root file's own fragment.
+    /// [`LowerCx::harness`], and this fragment is the root module or a root-level expansion.
     harness: bool,
-    /// Under `harness`: each `#[proc_macro*]` fn at the root, in declaration order, its kind
-    /// and its name as written (a raw `r#name` kept raw): the harness's list.
-    harnessed: AVec<'s, (ProcKind, &'t str)>,
     krate: CrateItemKey,
     /// [`LowerCx::tools`].
     tools: &'c [&'c str],
@@ -2484,7 +2568,7 @@ struct Lower<'c, 'o, 's, 't, 'a, W: ?Sized> {
     at: Where,
     /// [`Fragment::written`].
     written: &'t str,
-    depth: u16,
+    depth: u32,
     made: bool,
     /// [`Fragment::kept`].
     kept: Option<u32>,
@@ -2651,63 +2735,8 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
         };
         let key = self.key(self.owner, "proc_macro", name);
         self.declare(name, Namespace::Macros, key, DefKind::Macro(shape), WrittenVis::Pub);
-        let src = MacroSrc { name, body: MacroBody::Proc { kind: proc.kind, helpers: proc.helpers }, module: self.module, export: true, local_inner: false };
+        let src = MacroSrc { name, body: MacroBody::Proc { kind: proc.kind, helpers: proc.helpers }, module: self.module, export: true, local_inner: false, dollar_crate: None };
         self.out.macros.push((key, src));
-    }
-
-    /// D175: the proc-macro crate's harness, as rustc's (compiler/rustc_builtin_macros
-    /// proc_macro_harness.rs at the pinned nightly) writes it: ONE static listing the crate's
-    /// macros in declaration order, each the pinned `proc_macro::bridge::client::Client` of its
-    /// fn (library/proc_macro/src/bridge/client.rs: `Client::expand1` for a derive and a
-    /// function-like macro, `Client::expand2` for an attribute macro, whose fn takes two
-    /// streams). The macro's name and a derive's helpers are not in it (the pinned bridge
-    /// keeps them out of `Client`); they are the crate's `ProcExport`s, in the same order.
-    ///
-    /// It is sent as a call with no macro ([`CallRole::ProcMacroHarness`]): the cells answer
-    /// it at once and resolve.rs `keep_item` lowers its input, the static's text, as its
-    /// expansion, declaring no name (rustc's `_DECLS` is def-site). So the static is an
-    /// ordinary item of an expansion: a text, a key ([`proc_macro_decls_key`]), a head and a
-    /// body checked and evaluated as any static's, named by key from a code-record program.
-    /// Its key is a function of the crate alone (rule 71); its content, this text, is a
-    /// function of the root's declarations alone, made here, before any work (rule 65).
-    fn proc_macro_harness(&mut self) {
-        let mut text = BString::new_in(self.bump);
-        text.push_str(HARNESS_HEAD);
-        for &(kind, function) in self.harnessed.iter() {
-            text.push_str(HARNESS_CLIENT);
-            text.push_str(match kind {
-                ProcKind::Derive | ProcKind::FnLike => "expand1(crate::",
-                ProcKind::Attr => "expand2(crate::",
-            });
-            text.push_str(function);
-            text.push_str("), ");
-        }
-        text.push_str("];\n");
-        let input: &'t str = text.into_bump_str();
-        let call = self.key(self.owner, HARNESS_TAG, HARNESS_PATH);
-        let Some(parsed) = parse_path(HARNESS_PATH, self.krate, self.alloc) else {
-            self.note(LowerNoteKind::MacroCallPathNotRead, 0, HARNESS_PATH);
-            return;
-        };
-        let pos = self.next_pos();
-        self.out.decls.calls.push(MacroCallDecl { call, path: parsed, kind: CallShape::Attr, pos, item: None, role: CallRole::ProcMacroHarness });
-        let src = CallSrc {
-            module: self.module,
-            owner: None,
-            name: HARNESS_PATH,
-            input,
-            kind: CallShape::Attr,
-            loc: self.loc(0),
-            written: self.written,
-            depth: self.depth,
-            implicit: false,
-            // No written text holds it: its expansion keeps no column (resolve.rs `KeepAs`).
-            place: None,
-            tokens: crate::nested_input::CallTokens::Text,
-            answered: 0,
-            on: None,
-        };
-        self.out.calls.push((call, src));
     }
 
     /// Lowers one entry; true when its children are to be lowered next, in its place (an
@@ -2854,15 +2883,21 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     if let Some(proc) = attrs.proc_macro.filter(|_| from_text) {
                         self.proc_macro(ProcExport { kind: proc.kind, name: proc.derive.unwrap_or(name), helpers: proc.helpers });
                     }
-                    // The harness's list (D175): read from the text in both `ProcDecls` modes,
-                    // as rustc's collector reads the root's `#[proc_macro*]` fns in order.
+                    // The harness's list (D175): read from the text in both `ProcDecls` modes
+                    // (both directly in `lib.rs` and from root-level macro expansions), as rustc's
+                    // collector reads the root's `#[proc_macro*]` fns after expansion.
                     if self.harness
                         && item.parent.is_none()
                         && matches!(item.detail, ItemDetail::Fn { .. })
                         && let Some(proc) = attrs.proc_macro
                         && let Some(written) = item.name.map(|r| item.text(text, r))
                     {
-                        self.harnessed.push((proc.kind, written));
+                        self.out.proc_harness.push(ProcHarnessEntry {
+                            kind: proc.kind,
+                            macro_name: proc.derive.unwrap_or(name),
+                            helpers: proc.helpers,
+                            fn_name: written,
+                        });
                     }
                     self.declare(name, Namespace::Values, key, DefKind::Other, vis);
                 }
@@ -3006,12 +3041,25 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     self.note(LowerNoteKind::MacroRulesWithoutBody, at, name);
                     return false;
                 };
+                let dollar_crate = if attrs.builtin {
+                    None
+                } else if let Some(marks) = self.marks {
+                    match marks.dollar_crate_in(&[body], self.krate) {
+                        Ok(dc) => dc,
+                        Err(_) => {
+                            self.note(LowerNoteKind::MixedDollarCrate, at, name);
+                            return false;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let pos = self.next_pos();
                 let export = exported || attrs.macro_export;
                 let shapes = if attrs.builtin { MacroShapes::FN_LIKE } else { rules_shapes(body, self.edition, self.scratch) };
                 self.out.decls.macro_rules.push(MacroRulesDecl { name, def: key, pos, export, shapes });
                 let body = if attrs.builtin { MacroBody::BuiltinFn(attrs.builtin_name.unwrap_or(name)) } else { MacroBody::Rules(body) };
-                let src = MacroSrc { name, body, module: self.module, export, local_inner: attrs.local_inner };
+                let src = MacroSrc { name, body, module: self.module, export, local_inner: attrs.local_inner, dollar_crate };
                 self.out.macros.push((key, src));
             }
             ItemDetail::MacroDef => {
@@ -3020,14 +3068,14 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     self.note(LowerNoteKind::MacroWithoutBody, at, name);
                     return false;
                 };
-                let (shape, body) = if attrs.builtin {
+                let (shape, body, dollar_crate) = if attrs.builtin {
                     let which = attrs.builtin_name.unwrap_or(name);
                     if BuiltinDerive::ALL.into_iter().any(|it| it.name() == which) {
-                        (MacroShapes::DERIVE, MacroBody::BuiltinDerive { helpers: attrs.builtin_helpers })
+                        (MacroShapes::DERIVE, MacroBody::BuiltinDerive { helpers: attrs.builtin_helpers }, None)
                     } else if BuiltinAttr::ALL.into_iter().any(|it| it.name() == which) {
-                        (MacroShapes::ATTR, MacroBody::BuiltinOther(CallShape::Attr))
+                        (MacroShapes::ATTR, MacroBody::BuiltinOther(CallShape::Attr), None)
                     } else {
-                        (MacroShapes::FN_LIKE, MacroBody::BuiltinFn(which))
+                        (MacroShapes::FN_LIKE, MacroBody::BuiltinFn(which), None)
                     }
                 } else {
                     let params = item.name.map(|r| {
@@ -3036,15 +3084,27 @@ impl<'o, 's, 't, 'a: 't, W: Walked + ?Sized> Lower<'_, 'o, 's, 't, 'a, W> {
                     });
                     let params = params.filter(|it| it.starts_with('(')).map(inside);
                     let body = inside(item.text(text, body_range));
+                    let dollar_crate = if let Some(marks) = self.marks {
+                        let slices = [params.unwrap_or(""), body];
+                        match marks.dollar_crate_in(&slices, self.krate) {
+                            Ok(dc) => dc,
+                            Err(_) => {
+                                self.note(LowerNoteKind::MixedDollarCrate, at, name);
+                                return false;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     // `macro m(..) {..}` is one function-like rule; `macro m {..}` has arms.
                     let shapes = match params {
                         Some(_) => MacroShapes::FN_LIKE,
                         None => rules_shapes(body, self.edition, self.scratch),
                     };
-                    (shapes, MacroBody::Macro2 { params, body })
+                    (shapes, MacroBody::Macro2 { params, body }, dollar_crate)
                 };
-                self.declare(name, Namespace::Macros, key, DefKind::Macro(shape), vis);
-                let src = MacroSrc { name, body, module: self.module, export: false, local_inner: false };
+                self.declare(name, Namespace::Macros, key, DefKind::Macro(shape.as_macro2()), vis);
+                let src = MacroSrc { name, body, module: self.module, export: false, local_inner: false, dollar_crate };
                 self.out.macros.push((key, src));
             }
             ItemDetail::MacroCall { .. } => self.fn_like_call(idx, item, key, None),
@@ -3366,6 +3426,7 @@ pub fn crate_root<'t, 'a>(
         no_std: attrs.no_std,
         no_core: attrs.no_core,
         arbitrary_ints: attrs.arbitrary_ints,
+        recursion_limit: attrs.recursion_limit.and_then(Result::ok).unwrap_or(u32::from(crate::RECURSION_LIMIT)),
         prelude,
     };
     let mut cr = CrateRootBuilder::new_in(head, alloc);

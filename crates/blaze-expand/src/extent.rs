@@ -401,10 +401,22 @@ impl<'s, 'a> Words<'s, 'a> {
                     leaf(&mut nodes, parent, kind, word, n_input_tokens as usize);
                     word += n_input_tokens as usize;
                 }
-                Step::FloatSplit { .. } => {
+                Step::FloatSplit { ends_in_dot } => {
                     let parent = open.last().copied().unwrap_or(ROOT);
                     leaf(&mut nodes, parent, SyntaxKind::FLOAT_NUMBER, word, 1);
                     word += 1;
+                    // `parser::Output` tombstones one `Event::Finish` after `FloatSplitHack` and
+                    // expects the consumer to close the open `FIELD_EXPR` node(s) (1 when
+                    // `ends_in_dot`, 2 otherwise — see `parser::shortcuts::do_float_split`).
+                    let exits = if ends_in_dot { 1 } else { 2 };
+                    for _ in 0..exits {
+                        let Some(node) = open.pop() else {
+                            return Err(ExtentError { what: prefix.extent(), why: ExtentWhy::Refused, token: index(self.token_at(word)) });
+                        };
+                        let past = index(nodes.len());
+                        let node = &mut nodes[node as usize];
+                        (node.end, node.past) = (index(word), past);
+                    }
                 }
                 Step::Error { .. } => {
                     let what = open.iter().rev().find_map(|&n| Extent::of(nodes[n as usize].kind)).unwrap_or(prefix.extent());

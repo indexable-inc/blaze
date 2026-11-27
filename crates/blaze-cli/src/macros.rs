@@ -33,7 +33,25 @@ use crate::store::Store;
 use crate::work::{Did, Made, held_str};
 
 const SUBJECT_DOMAIN: &str = "blaze-cli macro crate 1";
-const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 1";
+// "2": proc-macro module identity bumped to form 5 (`blaze proc-macro module 5`), invalidating
+// cached `MacroModule` task records that pointed at pre-v5 proc-macro modules.
+// "3": proc-macro module identity bumped to form 6 (`blaze proc-macro module 6`) after
+// post-expansion proc-macro `_DECLS` and `macros` export synthesis (#2746), invalidating
+// cached `MacroModule` task records that pointed at pre-v6 proc-macro modules.
+// "4": proc-macro module identity bumped to form 7 (`blaze proc-macro module 7`) after
+// `blaze-build` `bind_let_place` peeled-reference deref fix, invalidating cached
+// `MacroModule` task records that pointed at stale form-6 proc-macro modules.
+// "5": proc-macro module identity bumped to form 8 (`blaze proc-macro module 8`:
+// wasm64-blaze-wasip1 target-specific dependency resolution), invalidating cached
+// `MacroModule` task records that pointed at pre-v8 proc-macro modules.
+// "6": `MacroModule` source mixes in per-closure `macro_files::closure_digest`
+// (`part_source_with_files`) so patched path deps reached by registry/git proc-macros
+// invalidate only affected `MacroModule` tasks without polluting `units_source` with unrelated
+// runtime patches.
+// "7": proc-macro module identity bumped to form 9 (`blaze proc-macro module wasm64 9`) after
+// `blaze-build` `ScopeEnd`/`TempScopeEnd` adjusted-repr fix, invalidating cached `MacroModule`
+// task records that pointed at pre-v9 wasm64 proc-macro modules.
+const SOURCE_DOMAIN: &str = "blaze-cli macro crate source 7";
 const OUT_DOMAIN: &str = "blaze-cli macro module out 1";
 /// The rule a refusal of this task names.
 const RULE: &str = "macros.rs";
@@ -132,6 +150,17 @@ pub(crate) fn parts_of_subjects<A: core::alloc::Allocator>(graph_source: Content
     parts
 }
 
+/// The `MacroModule` task source for `subject` over `graph_source` and `macro_files_digest`
+/// (`macro_files::rows_digest`): covers both the unit graph and the post-graph `MacroFiles`
+/// rows of `[patch.*]` path deps reached by actual proc-macro crates (rules 21 and 60).
+pub(crate) fn part_source_with_files(graph_source: ContentId, macro_files_digest: ContentId, subject: ContentId) -> ContentId {
+    let mut source = [0u8; 96];
+    source[..32].copy_from_slice(&graph_source.0);
+    source[32..64].copy_from_slice(&macro_files_digest.0);
+    source[64..].copy_from_slice(&subject.0);
+    ContentId::of(SOURCE_DOMAIN, &source)
+}
+
 /// Why the macro crates of a command could not be listed.
 #[derive(Debug)]
 pub enum MacrosError {
@@ -153,18 +182,28 @@ impl core::fmt::Display for MacrosError {
     }
 }
 
-/// Every macro crate of the graph `graph_record` with its identity, over `lock`, the module
-/// store `modules` (its git folders) and `place` (a member's folder). The decoded graph is the
-/// task's scratch, made over `scratch`.
-fn list(graph_record: &[u8], lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>, scratch: Alloc<'_>) -> Result<MacroCrates, MacrosError> {
-    let decoded = blaze_unit_graph::record::decode(graph_record, scratch).map_err(MacrosError::Graph)?;
+/// Every macro crate of the graph `sections` with its identity, over `lock`, the module
+/// store `modules` (its git folders) and `place` (a member's folder). When `sections.wasm_graph`
+/// is present, folds each proc-macro's resolved `wasm64-blaze-wasip1` dependency closure features
+/// into its module identity (rule 21). The decoded graph is the task's scratch, made over `scratch`.
+pub(crate) fn list(sections: crate::graph_payload::Sections<'_>, lock: &crate::fetch::Lockfile<'_>, modules: &std::path::Path, place: &Place<'_, '_>, scratch: Alloc<'_>) -> Result<MacroCrates, MacrosError> {
+    let decoded = blaze_unit_graph::record::decode(sections.graph, scratch).map_err(MacrosError::Graph)?;
+    let wasm_decoded = if sections.wasm_graph.is_empty() {
+        None
+    } else {
+        Some(blaze_unit_graph::record::decode(sections.wasm_graph, scratch).map_err(MacrosError::Graph)?)
+    };
     let locked = LockedPackages::of(lock.lock);
     let folders = git_folders(modules).map_err(MacrosError::Procs)?;
     let mut crates = std::vec::Vec::new_in(Global);
     for unit in decoded.graph.units.iter().filter(|unit| matches!(unit.kind, UnitKind::ProcMacro)) {
         // A member macro crate's identity is its files' digest, read from its folder; a path
         // package that is no member has no folder here and is named as not identified.
-        let identity = identify(lock.lock, &locked, &folders, unit, |id| Ok(place.member_files(id))).map_err(MacrosError::Procs)?;
+        let identity = identify(lock.lock, &locked, &folders, &decoded.graph, unit, |id| Ok(place.member_files(id))).map_err(MacrosError::Procs)?;
+        let identity = match (&wasm_decoded, identity) {
+            (Some(wg), Ok(id)) => Ok(id.with_wasm_features(lock.lock, &wg.graph, unit.package, |dep_id| place.member_files(dep_id), scratch)),
+            (_, other) => other,
+        };
         crates.push((subject(unit), identity));
     }
     crates.sort_unstable_by_key(|(subject, _)| *subject);
@@ -177,7 +216,7 @@ pub(crate) fn run<'b>(
     cx: &Cx,
     store: &mut dyn Store<'_>,
     lock: Option<&crate::fetch::Lockfile<'_>>,
-    crates: &mut Option<MacroCrates>,
+    crates: &mut Option<std::sync::Arc<MacroCrates>>,
     place: Place<'_, '_>,
     compile: Option<crate::wasm64_compile::CompileInputs<'_>>,
     task: &Task<'_>,
@@ -201,11 +240,11 @@ pub(crate) fn run<'b>(
         // The task's frame carries no header: erased here, for this task's scratch.
         let scratch = blaze_own::Erased::new(frame);
         let listed = match lock {
-            Some(lock) => list(read.unit_graph(graph.name)?.graph, lock, &modules, &place, scratch.handle()),
+            Some(lock) => list(read.unit_graph(graph.name)?, lock, &modules, &place, scratch.handle()),
             None => Err(MacrosError::NoLock),
         };
         match listed {
-            Ok(listed) => *crates = Some(listed),
+            Ok(listed) => *crates = Some(std::sync::Arc::new(listed)),
             Err(error) => {
                 let words = bstd::mem::format_in!(held, "the proc-macro crates of the graph could not be listed: {error}");
                 return Ok(Did::Hole(refused("the macro crates could not be listed"), held_str(words.as_str(), held)));

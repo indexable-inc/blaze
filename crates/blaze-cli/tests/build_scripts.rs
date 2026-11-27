@@ -130,7 +130,11 @@ fn put_module(home: &Path, app_dir: &Path) {
     // A wasm module names the process shim it was built with and (for path packages) its
     // `files <sha256>` digest (rule 21); the host runs only its own.
     let files = blaze_proc_macro::script_unit::script_files_digest(app_dir, "build.rs").expect("script files digest");
-    let identity = format!("name app\nversion 0.1.0\nfeatures \nfiles {files}\n{}\n", blaze_proc_macro::script_unit::shim_line());
+    let identity = format!(
+        "{}\nname app\nversion 0.1.0\nfeatures \nfiles {files}\n{}\n",
+        blaze_proc_macro::script_unit::WASM_MODULE_HEADER,
+        blaze_proc_macro::script_unit::shim_line()
+    );
     std::fs::write(record.join("identity"), identity).expect("the module's identity");
     let bytes = module(LINE);
     // The record's digest (script_modules.rs reads it as the lookup's out): the module's SHA-256.
@@ -254,7 +258,7 @@ fn engine_phases(dir: &Path) -> Vec<(String, u32, u32, u32)> {
     phases
 }
 
-/// The `Scripts` stage of `engine-check` (engine.md E6): the member's script runs as one
+/// The `Scripts` stage of `engine-check` (end-state.md D157): the member's script runs as one
 /// `Script` task after its module's lookup, its crate's names read the run, and `engine-check`
 /// lists what `check` lists: nothing for `made()` (the script's cfg reached `#[cfg(from_script)]`).
 /// Every phase entered each task it planned, once. Prints "engine scripts: <phases>". CONTROL:
@@ -407,7 +411,7 @@ dependencies = [\"cc\"]
         let files = blaze_proc_macro::script_unit::script_files_digest(&ws, "build.rs").expect("sha3-asm files digest");
         std::fs::write(
             module.join("identity"),
-            format!("name sha3-asm\nversion 0.1.0\nfeatures \nfiles {files}\ntarget aarch64-apple-darwin\n"),
+            format!("{}\nname sha3-asm\nversion 0.1.0\nfeatures \nfiles {files}\ntarget aarch64-apple-darwin\n", blaze_proc_macro::script_unit::NATIVE_MODULE_HEADER),
         )
         .unwrap();
         let program = module.join("script.bin");

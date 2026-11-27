@@ -54,6 +54,7 @@ fn resolve_fn_item<'g, P: FrontEnd>(
 ) -> Result<(blaze_typeck::ItemKey, blaze_typeck::List), ResolveError> {
     if program.ctor_of(target.item).is_some()
         || crate::clone_shim::language_clone_unconditional(program, target, ground).is_some()
+        || crate::clone_shim::language_clone_from_unconditional(program, target, ground).is_some()
         || crate::clone_shim::language_from(program, target, ground).is_some()
         || crate::clone_shim::language_fn_ptr(program, target, ground).is_some()
     {
@@ -61,10 +62,15 @@ fn resolve_fn_item<'g, P: FrontEnd>(
     }
     match resolve(target.item, target.args, ground) {
         Ok(resolved) => Ok(resolved),
-        Err(ResolveError::NoImpl { trait_, .. }) => match crate::clone_shim::language_clone_adt(program, caller, target, trait_, ground)? {
-            Some(_) => Ok((target.item, target.args)),
-            None => Err(ResolveError::NoImpl { trait_, item: target.item }),
-        },
+        Err(ResolveError::NoImpl { trait_, .. }) => {
+            if crate::clone_shim::language_clone_adt(program, caller, target, trait_, ground)?.is_some()
+                || crate::clone_shim::language_clone_from_adt(program, caller, target, trait_, ground)?.is_some()
+            {
+                Ok((target.item, target.args))
+            } else {
+                Err(ResolveError::NoImpl { trait_, item: target.item })
+            }
+        }
         Err(error) => Err(error),
     }
 }

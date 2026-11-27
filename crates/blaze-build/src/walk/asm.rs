@@ -400,7 +400,13 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if labels.is_empty() {
             let v = self.b.asm(id, ty, &inputs);
             if noreturn {
-                self.unreachable_of(TrapKind::NoreturnAsm, Some(e));
+                if options & AsmRec::NAKED != 0 {
+                    // A `#[unsafe(naked)]` function's body ends inside the assembly itself
+                    // (`ret` / `br`); never attach a `TrapSource` for the trailing LIR terminator.
+                    self.b.unreachable();
+                } else {
+                    self.unreachable_of(TrapKind::NoreturnAsm, Some(e));
+                }
                 self.dead_block();
             } else {
                 self.asm_stores(v, single, &stores)?;

@@ -21,7 +21,7 @@
 //! steps 4 to 7). [`par`] is the parallel loops of every crate, on the same pool: blaze has no
 //! other.
 //!
-//! [`sched`] is the scheduler the pool and the pump are to become (docs/v2/plan/design/fibers.md):
+//! [`sched`] is the scheduler the pool and the pump are to become (docs/v2/plan/design/parallel.md):
 //! a state machine with no thread, clock or sleep, in which a waiting job holds no thread.
 //!
 //! Unsafe code is in [`exec`]'s slot table, [`pool`]'s jobs and queues, [`par`]'s item

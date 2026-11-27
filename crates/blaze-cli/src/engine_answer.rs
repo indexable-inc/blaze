@@ -1,4 +1,4 @@
-//! `engine-check`'s stored answer (engine.md E6, the incremental half): the engine's answer and
+//! `engine-check`'s stored answer (end-state.md D157, the incremental half): the engine's answer and
 //! causes as pages (blaze-engine pages.rs), the leaf table of what the request read (sweep.rs
 //! `Leaves`), and a sealed pointer naming both (seal.rs), under one root of the store per
 //! checkout ([`root_name`]).
@@ -1064,14 +1064,20 @@ impl<'a> Stored<'a> {
             let asked = shard.entries.lock();
             kept = kept.saturating_add(asked.len());
             for &(name, ask) in asked.iter() {
-                if let Some(slot) = by.asks.get_mut(name.kind.index()) {
-                    *slot += 1;
-                }
                 if let Some(slot) = by.by_purpose.get_mut(ask.purpose()) {
                     *slot += 1;
                 }
-                if let Some(slot) = by.kind_purpose.get_mut(name.kind.index()).and_then(|row| row.get_mut(ask.purpose())) {
-                    *slot += 1;
+                // `Ask::Witness` passes a synthetic page coordinate (`pages::page_witness`, fabricated
+                // under `Kind::Units`) to address a partitioned page slot in `0..(1 << bits)`, never a
+                // real task row: count it in `by_purpose` / `purpose_distinct` only so per-kind row
+                // counts reflect actual stored rows asked rather than BER6 page-directory growth.
+                if ask != blaze_engine::Ask::Witness {
+                    if let Some(slot) = by.asks.get_mut(name.kind.index()) {
+                        *slot += 1;
+                    }
+                    if let Some(slot) = by.kind_purpose.get_mut(name.kind.index()).and_then(|row| row.get_mut(ask.purpose())) {
+                        *slot += 1;
+                    }
                 }
                 let _ = sorted.try_push((name, ask));
             }
@@ -1081,14 +1087,14 @@ impl<'a> Stored<'a> {
         let mut last_name = None;
         let mut last_read = None;
         for &(name, ask) in sorted.iter() {
-            if last_name != Some(name) {
+            if ask != blaze_engine::Ask::Witness && last_name != Some(name) {
                 by.distinct[name.kind.index()] += 1;
+                last_name = Some(name);
             }
             if last_read != Some((name, ask)) {
                 by.purpose_distinct[ask.purpose()] += 1;
+                last_read = Some((name, ask));
             }
-            last_name = Some(name);
-            last_read = Some((name, ask));
         }
         by
     }

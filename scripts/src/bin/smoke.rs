@@ -16,7 +16,7 @@
 //! child process run with an environment built from nothing, under a deadline at which its
 //! whole process group is killed (`blaze_script::child`): a hang ends as `TIMEOUT`, never as a
 //! hang of this script. A step that fails is reported with what makes it debuggable without a
-//! rerun (its output's tail, the daemon's `serve.log`, the slowest spans of the last build), and
+//! rerun (its output's tail, the daemon's `serve.log`, the tail of its `.blaze/v2/profile.txt`), and
 //! the steps after it run only where they still mean something; nothing is retried.
 
 #![feature(allocator_api)]
@@ -100,9 +100,6 @@ const FIXTURE_FILES: [&str; 3] = ["Cargo.toml", "Cargo.lock", "blaze.lock"];
 const COLD: Duration = Duration::from_secs(180);
 /// The ceiling for each subsequent run, check or test of the fixture.
 const WARM: Duration = Duration::from_secs(60);
-/// `blaze debug sql`'s deadline when a step failed: a query of one build's spans answers in
-/// well under a second; past 20 s the blaze under test is not answering, which is said.
-const DIAGNOSE: Duration = Duration::from_secs(20);
 /// Each `git` call's deadline: reading HEAD's tree, the diff and the untracked files of a
 /// checkout takes well under a second; 60 s is a ceiling for "something is wrong".
 const GIT: Duration = Duration::from_secs(60);
@@ -111,9 +108,6 @@ const TAIL: usize = 40;
 /// The bytes read at a time when hashing a file: the binary is hundreds of MiB, streamed
 /// through one fixed buffer on the stack.
 const HASH_CHUNK: usize = 64 * 1024;
-/// The slowest spans of the last build, printed when a step failed.
-const SPANS_SQL: &str = "SELECT name, count(*) n, round(sum(dur_ns)/1e6) ms, round(max(dur_ns)/1e6) max_ms FROM spans \
-     WHERE build_id = (SELECT max(build_id) FROM spans) GROUP BY ALL ORDER BY max_ms DESC LIMIT 12";
 
 /// One step of a project's smoke, in [`STEPS`]' order.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -658,7 +652,7 @@ impl Smoke {
     }
 
     /// What makes a failed step debuggable without a rerun, on standard error: the tails of
-    /// its output and of the daemon's log, and the slowest spans of the last build.
+    /// its output, of the daemon's log, and of the command's profile (`.blaze/v2/profile.txt`).
     fn diagnose(&self, project: &str, step: Step, dir: &Path, home: &Path) {
         let log = self.log(project, step.word());
         for ext in ["err", "out"] {
@@ -671,18 +665,9 @@ impl Smoke {
             eprintln!("{SCRIPT}: {project} {}: the last {TAIL} lines of {}:", step.word(), serve.display());
             print_tail(&serve);
         }
-        let spans = self.log(project, &format!("{}-spans", step.word()));
-        match child::run_logged(&self.argv(&["debug", "sql", SPANS_SQL]), dir, &self.env(home), &spans, DIAGNOSE) {
-            Err(why) => eprintln!("{SCRIPT}: `blaze debug sql` could not run: {why}"),
-            Ok(Ended::TimedOut { after }) => {
-                eprintln!("{SCRIPT}: `blaze debug sql` did not answer within {} s (its output: {})", after.as_secs(), spans.display());
-            }
-            Ok(Ended::Exited(ran)) => {
-                eprintln!("{SCRIPT}: the slowest spans of the last build (`blaze debug sql`, exit {}):", ran.status);
-                print_tail(&spans.with_extension("out"));
-                print_tail(&spans.with_extension("err"));
-            }
-        }
+        let profile = dir.join(".blaze").join("v2").join("profile.txt");
+        eprintln!("{SCRIPT}: {project} {}: the last {TAIL} lines of {}:", step.word(), profile.display());
+        print_tail(&profile);
     }
 
     /// The six steps of `project`, each one's line pushed to `lines` and each failure's

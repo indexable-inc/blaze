@@ -6,7 +6,7 @@ use crate::hash::{ContentHash, StableHasher};
 /// A fn pointer's ABI and safety: the solver's type, one home for both type forms.
 pub use blaze_solve::{Abi, FnPtrHeader, Safety};
 
-/// An item's portable identity (docs/v2/plan/design/identity.md). Becomes `blaze_id::ItemKey`
+/// An item's portable identity (docs/v2/plan/design/bottom.md, section 3 "Identity and keys"). Becomes `blaze_id::ItemKey`
 /// when blaze-id is at zero third-party crates; until then a 128-bit content id the caller
 /// computes from the key's parts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -393,8 +393,8 @@ impl LangItem {
     /// `#[lang = "future_output"] type Output;` in `Future`, `#[lang = "discriminant_type"] type
     /// Discriminant` in `DiscriminantKind`, `#[lang = "metadata_type"] type Metadata` in
     /// `Pointee`). The solver names an associated type by `assoc_def(trait, name)`, so these are
-    /// answered from the trait, never by the item's own key (typeck.md, "Closures against `Fn`
-    /// bounds").
+    /// answered from the trait, never by the item's own key (typeck.md, "A closure's
+    /// identity").
     pub fn assoc_type(self) -> Option<(LangItem, &'static str)> {
         match self {
             LangItem::FnOnceOutput => Some((LangItem::FnOnce, "Output")),

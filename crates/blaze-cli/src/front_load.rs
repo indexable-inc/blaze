@@ -1,5 +1,4 @@
-//! The front end's [`Load`] over the store (drive.md, "End state: the whole pipeline on the
-//! command", piece 6, STORE LOAD).
+//! The front end's [`Load`] over the store (end-state.md D157, STORE LOAD).
 //!
 //! front2 checks a body over `Records` (front2 source.rs), which asks a [`Load`] for a crate's
 //! names section, its items section and the texts their rows point into, each the first time
@@ -929,15 +928,24 @@ impl<'n> Load<'n> for StoreLoad<'n> {
             }
             return CurrentFile::from_text(index, text, edition, bump).map(Some);
         };
-        // A physical x/mod.rs can be a literal file or the module slot x.rs.
+        // A physical x/mod.rs can be a literal file or the module slot x.rs. Ignore DATA_FILE
+        // outlines (e.g. `include_str!("../src/foo/mod.rs")`) when looking up a Rust module's
+        // outline, and prefer the slot matching the crate's edition.
         let locate = |slot: Name| outlines.binary_search_by_key(&slot, |one| one.name).ok()
-            .and_then(|i| outlines.get(i)).filter(|one| one.path.as_slice() == real.as_bytes());
-        let one = locate(Name::file(real.as_bytes())).or_else(|| {
+            .and_then(|i| outlines.get(i))
+            .filter(|one| one.path.as_slice() == real.as_bytes() && !crate::data_include::is_data(one.edition));
+        let mod_slot = || {
             let stem = real.strip_suffix("/mod.rs")?;
             let mut slot = AVec::from_slice_in(stem.as_bytes(), self.alloc);
             slot.extend_from_slice(b".rs");
             locate(Name::file(&slot))
-        }).ok_or(ItemsRecordError::FileItemsUnavailable { file: index, what: "the checkout path has no planned file outline" })?;
+        };
+        let literal = locate(Name::file(real.as_bytes()));
+        let one = literal.filter(|o| o.edition == edition.byte())
+            .or_else(|| mod_slot().filter(|o| o.edition == edition.byte()))
+            .or(literal)
+            .or_else(mod_slot)
+            .ok_or(ItemsRecordError::FileItemsUnavailable { file: index, what: "the checkout path has no planned file outline" })?;
         if one.edition != edition.byte() {
             return Err(ItemsRecordError::FileItemsUnavailable { file: index, what: "the planned outline has a different edition" });
         }

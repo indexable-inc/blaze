@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: blaze's own standard library, written from scratch on core and alloc. No ambient authority (main names each capability it uses and every function touches only what it is handed), sans-IO underneath (one Io over io_uring, kqueue, IOCP and the simulation), and every blaze crate moves onto it.
+summary: blaze's own standard library, written from scratch on core alone (`no_std` without `alloc`; no global allocator is reachable, D173). No ambient authority (main names each capability it uses and every function touches only what it is handed), sans-IO underneath (one Io over io_uring, kqueue, IOCP and the simulation), records read in place with the page cache as the only cache, and every blaze crate moves onto it. Built so far: blaze-core's drivers and bstd's S1 interface; the efficiency pieces, the file model and the rest are marked built or to build where they are described.
 date: 2026-11-10
 ---
 # bstd: blaze's standard library
@@ -10,14 +10,16 @@ start a thread, and nothing in its signature says so. It also bakes in choices b
 replaced: its own locks, its own hasher, a global allocator, blocking calls with no deadline, and
 no way to run a program under a simulated world.
 
-`bstd` is blaze's own standard library. It is written from scratch on `core` and `alloc` and does
-not use Rust's `std`. Three properties define it:
+`bstd` is blaze's own standard library. It is written from scratch on `core` alone: `no_std`
+without `alloc`, so no global allocator is reachable and every heap is one the code was handed
+(D173). It does not use Rust's `std`. Three properties define it:
 
 1. **Capabilities.** `main` names each capability it uses as a parameter (`out: Out`,
    `data: Dir<ReadOnly>`, `api: Net`, ...); a whole `Io` cannot be asked for (D104). A function
    can touch only what it is handed, so its signature is the complete list of what it can do.
 2. **Sans-IO.** Every operation is an effect handed to one driver. The same `Io` runs on
-   io_uring, kqueue, IOCP and the deterministic simulation, and code above it cannot tell which.
+   io_uring, kqueue and the deterministic simulation (Windows's IOCP later), and code above it
+   cannot tell which.
 3. **Explicit context and memory.** Every task has a `Cx` that says how long it may run, whether
    it was cancelled, what span it is and where its scratch memory comes from. Nothing allocates
    from a hidden global heap: memory comes from an allocator the code was handed. The same
@@ -48,10 +50,9 @@ fn charge(cx: &Cx, key: &StripeKey, api: &Net, cfg: &Dir<ReadOnly>) -> Result<()
 }
 ```
 
-## End state: efficiency (architect, 2026-11-16)
+## End state: efficiency
 
-What each operation should cost, and its floor. What it costs today, with evidence, is in
-"Gap" below. "(verify)" marks a platform fact no test here has shown yet (rule 45).
+What each operation should cost, and its floor; "Pieces" below says which are built. "(verify)" marks a platform fact no test here has shown yet (rule 45).
 
 **(a) Files.** The seam stays: ops out, events in ("The boundary" stands). What costs is the
 queue, the world's lock (taken four to six times a call; held across the driver's blocking
@@ -79,11 +80,10 @@ on the backend (about 1 ns).
   history is lost). Linux keeps no journal for a process that exits, so there the repeat is
   one `STATX` batch, unless a helper with an expiry keeps an inotify journal. Its absence, or
   `IN_Q_OVERFLOW`, means a full sweep.
-- Map or read: a pack is mapped read-only once per process and never unmapped in the run (no
-  TLB shootdown across 128 cores), and its records are read in place once it is verified. A
-  file read once is `pread` into the task's frame. The line: map what a process reads many
-  times, or plain arrays over about 64 KiB. This replaces S1f's "no `mmap`" for packs (a
-  decision).
+- Map or read: records are written once and read in place. A small one is `pread` into the
+  task's frame; a large plain array (over about 64 KiB) is mapped read-only (`Dir::map_read`,
+  `crates/blaze-std/src/fs/map_read.rs`) and never unmapped in the run (no TLB shootdown across
+  128 cores). The page cache is the only cache: bstd keeps no buffer pool of its own (D117).
 
 **(b) Memory.** Frames stand (memory.md "Allocators by lifetime"; a bump is 2 ns, the top
 block grows in place). A table that grows while other things are allocated after it gets a
@@ -107,14 +107,12 @@ no XXH3 beside it. Many small inputs go side by side (`hash_many`: 8 lanes at th
 on AVX-512; the outline uses it). A parent's digest takes its children's digests, and an
 unchanged stamp means the file is not read, so no byte is hashed twice.
 
-**(e) The record store.** A put is O(1): the row is appended, sorted once at seal, and found
-meanwhile through a hash map. The maker writes its record into a per-worker segment that never
-moves, and the pack is written by gathered writes. Items that are many make one record a
-crate, not a file an item. Packs are mapped (a), and the index is a column of keys searched in
-place. A pack is verified once per boot ("Verify once" stands, store.rs `read_pack`). Nothing
-is synced on the command path, and a torn pack is never trusted (footer digest plus boot
-record stand). One store serves a user's worktrees (store.rs `OWN` stands). Outputs are placed
-by `clonefile` or `FICLONE`; ext4 has no clone, so there it is `copy_file_range` (store.md
+**(e) The record store** is the plain store (`crates/blaze-cas/src/plain`, [store-next](store-next.md)).
+A put is O(1): each worker puts into its own lane, and one commit lays them in key order. Items
+that are many make one record a crate, not a file an item. Records are read in place (a), and
+the index is a column of keys searched in place. A segment is verified once per boot. Nothing
+is synced on the command path, and a torn segment is never trusted. Outputs are placed
+by `clonefile` or `FICLONE`; ext4 has no clone, so there it is `copy_file_range` (bottom.md section 10
 "Store" stands). Large records stay readable in place: a text table with u32 ids per record,
 u8 kind columns, item-relative u32 spans. zstd is used only for cold records fetched over the
 network, since it forces a copy.
@@ -122,80 +120,46 @@ network, since it forces a copy.
 | System | What blaze matches, or does better by design |
 |---|---|
 | io_uring (TigerBeetle, glommio, Seastar) | a ring per core, fixed files, linked ops; blaze also stats a column in one op |
-| LMDB, git packs; Cap'n Proto, rkyv | immutable sorted packs, mapped and read in place; verified once, with a proof |
+| LMDB, git packs; Cap'n Proto, rkyv | immutable sorted segments, read in place (small by `pread`, large mapped); verified once, with a proof |
 | bumpalo, Zig `MultiArrayList`, mimalloc; rayon, Chase-Lev, Tokio | frames, `Soa`, a heap per tag, a growing table that never copies; the joiner helps |
 | BLAKE3 `hash_many`, Swiss, F14; Bazel, Buck2, Nix; APFS clones | digests of digests; keys at item grain; outputs cloned |
 
 Floor (estimate, rule 67): a repeat with nothing changed is two `pread`s, a journal query and
-mapped packs: under 5 ms on tempo (27.9 to 37 ms today) and under 10 ms on blaze (120 ms).
+mapped packs: under 10 ms on tempo (D168; 27.9 to 37 ms today) and on blaze (120 ms). A one-body
+edit on tempo: a floor of about 30 ms with a live helper, about 130 ms with none (D168), a budget
+of 100 ms (D188).
 
-### Gap (tree of 2026-11-16, by search)
+### Pieces
 
-| End state needs | Today, with evidence | Cost | Missing |
-|---|---|---|---|
-| A put in O(1) | sorted `index.insert` (blaze-cli store.rs `PackStore::put`) | 2.44 s, 114,429 puts | append, then sort at seal |
-| The joiner helps, in completion order | `Pool::wait` helps only `Here::Worker` (task/threads.rs) | 48.2 s on the main thread, pool parked | piece 1 |
-| A growing table that never copies | frames grow only the top block (blaze-mem frame.rs `grow`, `grow_top`) | 45.8 MB and 4.17 MB abandoned | piece 2 (written, uncompiled) |
-| No whole-depth listing | `Dir::list` (bstd fs.rs); callers blaze-cli program.rs `run`, bstd kv.rs, blobs.rs | 64 MiB overflow in 4 to 21 s | callers moved to `entries`, then a ban |
-| A read list stamped in one effect | `Follow::follow` makes one `Dir::stat` a path (blaze-cli sweep.rs) | tempo 8.8 ms (11.9 on 18 workers) | `Dir::looks` (written, uncompiled); the sweep's switch |
-| IO in parallel | `Io::poll` holds the world's lock across the driver's blocking poll (bstd io.rs) | is the 8.8 against 11.9 ms above | inline blocking calls (macOS), a ring per worker (Linux) |
-| A clock read without the lock | `Io::now` locks the world (bstd io.rs) | not measured: 10^6 `Clock::now` on 1 and 18 threads | the native clock held outside the lock |
-| A source read in one trip | `Dir::read_all` = `found` (a stat) + `ReadAll` (std's read by path; core threads.rs `run_kept`) | not measured: 2,000 `read_all`s against `openat`+`pread` | `Dir::read_sized`: one `Read` of len+1 |
-| A record read without an effect | `get_into` = `read_at` = `Effect::Read` (open by path, `pread`, Vec, copy; core fs.rs `read`) | not measured: the profile's count of gets times their ns | packs mapped once; the index read in place |
-| The pack index read in place | `read_pack` parses every row into a Vec at each open (store.rs) | not measured: open time against row count | binary search over the mapped key column |
-| Writes that borrow | `append_bytes` calls `bytes.to_vec()` (bstd fs.rs) | not measured: bytes copied a command | an op body borrowed until its completion (the `Pending` form) |
-| A repeat that stats nothing | no journal on the command path (`Effect::Journal` exists, used only by blaze-vfs) | part of the 27.9 to 120 ms repeat | the sweep asks FSEvents since its stored id |
-| Outline digests at the floor | digest.rs batches already | 74 ms against 25 ms | the profile's split |
-| Compact expansions | 22 columns, about 400 B each, a call | 321 MB, 128,546 calls | per-record text tables, u8 kinds |
+Built:
+1. The pool's join: a joiner that is not a worker runs injected tasks of its class, and a batch
+   join merges by index (`crates/blaze-std/src/task/help.rs`, `Pool::lend`).
+2. The frame's growing table (`crates/blaze-mem/src/frame/table.rs`, `crates/blaze-mem/src/frame/grow.rs`).
+3. Puts in O(1): the plain store's lanes (e).
+4. `Dir::looks`: a read list stamped in one `Effect::Stamp` (`crates/blaze-std/src/fs/looks.rs`); the
+   sweep proves by looks (`crates/blaze-cli/src/sweep.rs`).
+5. `Dir::read_sized`: one `Read` of len+1, a file that grew refused by name
+   (`crates/blaze-std/src/fs/read_sized.rs`).
+6. `Io::now` reads the native clock beside the world's lock (bstd io.rs).
+7. Inline blocking file calls: `perform_now` (`crates/blaze-core/src/threads/inline.rs`).
+8. Records read in place and the index searched in place: the plain store (e).
+11. Writes that borrow: the `Pending` form (`File::write_from`).
+15. The pool as one batch: a joiner outside the pool takes a seat and steals; a ring per scope
+    replaces the count's sweep (`crates/blaze-std/src/task/seat.rs`, `crates/blaze-std/src/task/ring.rs`).
 
-### Pieces, in build order (one writer each; A = can be written at the same time as the others marked A)
-
-1. **A. The pool's join** (writer ab1a42b2898694bd9, written, uncompiled: task/help.rs,
-   `Pool::lend`, `Tally::joins`). A non-worker joiner runs injected tasks of its class. A batch
-   join reads a count of ended tasks and merges by index. Saves up to the 48.2 s of in-order
-   join. Test: `a_batch_join_merged_by_key_gives_equal_bytes_in_any_schedule`, with its plant.
-2. **A. The frame's growing table** (writer a18ba224587a1dab7, written, uncompiled:
-   blaze-mem frame/table.rs, frame/grow.rs). Saves the 45.8 MB and the 4.17 MB. Test: 10^6
-   interleaved pushes, 0 copies, within 1.25x. Left: the profile's row (DRIVER), and on macOS
-   reserving in 4 GiB segments.
-3. **A. `PackStore::put` in O(1)** (writer a5aadb06ee11bb5be). Saves the 2.44 s. Test: the
-   bytes moved by 200,000 puts are linear; the pack's bytes are unchanged.
-4. **A. `Dir::looks`** (this architect, written: bstd fs/looks.rs, tests/looks.rs). Then the
-   sweep uses it (DRIVER: sweep.rs `Follow::follow`). Saves tempo's 8.8 ms, down to about 1 ms
-   (0.77 us a name; tempo's path count is to be printed). Test: one effect, each look the same
-   as its stat.
-5. **A. `Dir::read_sized(cx, path, len, into)`.** One `Read` of len+1, no stat before it; a file
-   that grew is refused by name. Saves one trip and three calls a file read. Test: the effect
-   count, and a file that grew between its stamp and its read.
-6. **A. `Io::now` without the lock.** The native clock is held beside the lock; the simulation
-   keeps its virtual clock under it. Test: the simulated clock still advances only by
-   `idle_until`, and the native reads need no lock (counted).
-7. **Inline blocking file calls** (blaze-core kqueue.rs, bstd io.rs `call`), after 6: a native
-   `perform_now(effect) -> Option<Done>` for blocking calls, asked before `submit`. Test: the
-   drivers' equality tests, and the sweep on 1 and 18 workers (18 must not be slower).
-8. **Packs mapped once, the index in place** (store.rs), after 3: `get_into` reads from the
-   map. Test: the `StorePlant` simulations, and 0 effects a get.
-9. **A. `Dir::list` gone**: kv.rs and blobs.rs move to `entries` with a work list, program.rs
-   follows the loader; then a `.clippy.toml` ban. Test: kv's simulation tests unchanged.
-10. **The journal on a repeat** (sweep.rs, macOS), after 4: `Effect::Journal` since the stored
-    cursor, and every distrust condition above falls back to the full `looks`. Test: the
-    simulation drops a planted event, and the repeat must still see the change.
-11. **A. Writes that borrow** (bstd fs.rs `append_bytes`, `write_at`): the `Pending` form. Test:
-    the copy count is 0.
+To build:
+9. **`Dir::list` gone**: blobs.rs (through kv.rs `list`) and the other callers move to `entries`
+   with a work list; then a `.clippy.toml` ban. Test: kv's simulation tests unchanged.
+10. **The journal on a repeat** (sweep.rs, macOS): `Effect::Journal` since the stored cursor, and
+    every distrust condition in (a) is a full `looks`. Test: the simulation drops a planted
+    event, and the repeat must still see the change.
 12. **Paths as ids** (cross-crate, one batch): `FileName` out of the hot effects.
-13. **Compact expansions** (EXPANSION lane): text tables and u8 kinds.
-14. **The outline's digest split** (OUTLINE lane): profile first.
-15. **The pool as one batch** (task/threads.rs, after 1). A joiner adopts a worker identity so
-    it can steal. A ring per scope replaces the count's sweep, behind `Joining`. `current`
-    becomes an `AtomicPtr`, and the pinned queue is checked through an atomic count. Test: the
-    pool's interleaving model, plus a planted lost wake.
+13. **Compact expansions**: per-record text tables and u8 kinds (today 22 columns of about 400 B
+    a call: 321 MB over 128,546 calls).
+14. **The outline's digest split**: profile first (74 ms against a 25 ms floor).
 
-Decisions wanted:
-- core's `Stamp` gains `dev` (40 to 48 bytes; one blaze-core batch), so that a look equals a
-  stat in full. Recommended: yes.
-- packs are mapped (replacing S1f's "no `mmap`" for packs). Recommended: yes.
-- on Linux, a helper with an expiry keeps the journal. Recommended: later, after piece 4
-  on io_uring.
+Open: on Linux, a helper with an expiry keeps the journal. Recommended: later, after piece 4
+on io_uring.
 
 ## The one rule
 
@@ -227,7 +191,7 @@ learned). How it is applied:
   `copy_to`; `Published::how`; `Pushed::{Held, Wrote}`.
 - **A copy is named one** (`copy_to`, `copy_of`, `to_owned_in(alloc)`), and what does not copy
   is `as_*` or a view. What allocates takes the allocator or returns a type that names it
-  (`Vec<T, &Frame>`, `Bytes<'a>`, `Pinned`).
+  (`Vec<T, &Frame>`, `Bytes<'a>`).
 - **All or an error is named `_all`** (`send_all`, `write_all`); what may do less returns how
   much. Nothing truncates, saturates or answers a question that was not asked: a call that
   cannot answer returns why (`Result`), or `None` only where "nothing there" is the whole
@@ -251,15 +215,15 @@ Each layer uses only the ones below it.
 |---|---|---|
 | 4 | `bstd::{fs, net, env, clock, rng, task, process, out}` | the capability types people use |
 | 3 | `bstd::io` | `Io`: one handle to the process's driver; turns a call into an effect and parks the caller until its completion |
-| 2 | `bstd::driver` | `Effect`, `Completion`, `Driver`, and the drivers: `Uring`, `Kqueue`, `Iocp`, `Sim` (today's `blaze-core`) |
+| 2 | `bstd::driver` | `Effect`, `Completion`, `Driver`, and the drivers: `Uring`, `Kqueue`, `Sim` (today's `blaze-core`); Windows's later |
 | 1 | `bstd::sys` | raw system calls per target, the only home of `unsafe`; Linux by syscall number with no libc, macOS through libSystem, Windows through ntdll and kernel32 ([sys](sys.md); today the crate `crates/blaze-sys`) |
-| 0 | `core`, `alloc` | the language's own libraries, unchanged |
+| 0 | `core` | the language's own library, unchanged; no `alloc` (D173) |
 
 ## Two builders
 
-While blaze cannot build itself (its item layer is being rebuilt: [bottom](bottom.md)), cargo
-with the pinned nightly builds bstd, and blaze must still read the same source. So bstd is plain
-Rust that both compile, plus what needs blaze's extensions under `cfg(blaze)`, the cfg blaze sets
+blaze builds, checks and tests bstd. CI's `cargo check` and `cargo test` steps still compile
+the crates above it with rustc (still run through cargo; a gap). So bstd is plain Rust that
+both compile, plus what needs blaze's extensions under `cfg(blaze)`, the cfg blaze sets
 for every crate it compiles (Andrew, 2026-11-15: a simplified bstd rustc can use, and blaze's
 bstd that plus the custom parts). Each use of an extension takes the first of:
 
@@ -286,8 +250,8 @@ Until blaze sets `cfg(blaze)` it compiles the plain forms, which it accepts as a
 | linear types (`Scope`, `Pending`, `File`, `Conn`, ...) | the types and their abandonment path in `Drop`, `#[must_use]` | leaving one unfinished is a compile error under blaze only |
 | features `blaze_comptime`, `blaze_const_exprs`, `blaze_verify` | — | `cfg_attr(blaze, feature(..))` |
 
-**What a new crate may depend on today**: bstd by its plain form, `core`, `alloc` (until bstd's own
-collections replace it), and blaze's piece crates bstd re-exports. Not Rust's `std` (only
+**What a new crate may depend on today**: bstd by its plain form, `core` (no `alloc`, D173),
+and blaze's piece crates bstd re-exports. Not Rust's `std` (only
 `bstd::rt` names it, the driver boundary), and no extension outside a form both builders read.
 
 ## What is in it
@@ -318,7 +282,7 @@ What is about building Rust (the cargo graph, the store, codegen) stays out.
 | `report` | the `Report`: what a program says to a person or an agent, as data | `blaze-report` |
 | `quic` | QUIC as a sans-IO core: datagrams and time in, datagrams and stream events out; the driver is a `Net` datagram socket and the `Clock` | `blaze-http`'s QUIC core ([http3-sans-io](http3-sans-io.md)) |
 | `http` | sans-IO HTTP/1.1 over a `Conn`, and HTTP/3 and WebTransport over `quic` | `blaze-http` |
-| `trace` | spans and events through `Cx` | `blaze-trace` (no-tracing) |
+| `trace` | spans and events through `Cx` | `blaze-trace` (end-state D178) |
 | `gpu` | the device behind the `Gpu` capability: buffers, launches, render targets | new, with [gpu](../../../future/gpu/plan.md) |
 | `video`, `image` | codecs as sans-IO cores; image decode and encode as functions | `harness-video`'s encoder, moved; `png` |
 | `test` | the simulation, property tests, the model checker for lock-free code, allocation counting | `blaze_core::sim`, `blaze-sim`, `blaze-check`, `blaze-alloc-count` |
@@ -383,7 +347,7 @@ simulation, picked when the `Io` is made. `Io::sim(seed)` gives a whole simulate
 in-memory file tree, a virtual clock, a seeded generator, scripted peers, injected failures and
 crashes), so any program on bstd is a deterministic simulation test with no mocking.
 
-Calls read as blocking code and never block a thread. A call pushes an effect, the calling fiber
+Calls read as blocking code and never block a thread. A call pushes an effect, the calling task
 parks on the scheduler, and the completion resumes it. There is no `async`, no function colour
 and no second copy of each API.
 
@@ -397,7 +361,7 @@ writes **ops** (open, read, send, connect, set a timer); the host answers with *
 (opened, data, sent, accepted, a datagram, the timer fired). Both are fixed-layout records in two
 rings, exchanged in batches, each op carrying a token its event returns. Nothing else crosses.
 
-The io_uring driver, the kqueue and IOCP drivers, the simulation and a wasm host are all hosts of
+The io_uring and kqueue drivers (a Windows one later), the simulation and a wasm host are all hosts of
 this one boundary, which is why a program cannot tell them apart. It is `blaze-core`'s
 `Effect`/`Completion` made flat, and the shape wasm-host's guest ABI already proved at speed
 (`ix-abi`, `ix-worker`). Taken from there:
@@ -571,7 +535,7 @@ The one thing left ambient is a panic, which is the language's, and it fails its
 
 ### What replaces a thread-local
 
-A thread-local is the wrong tool on fibers anyway: a task can resume on another thread after any
+A thread-local is the wrong tool for a task's state anyway: built by blaze, a task can resume on another thread after any
 wait (rule `no-wait-across-thread-locals`). Each thing people use one for has an owner here:
 
 | used for | instead |
@@ -639,8 +603,7 @@ The protocol logic is the sans-IO core in every case; a provider is only its dri
 ## Tasks and waiting
 
 There is no `async` and no `.await` in a capabilities crate. A function that waits is an ordinary
-function. ([may-suspend](may-suspend.md) is the analysis underneath.)
-
+function.
 - **One wait.** `Cx` has the single wait primitive: wait for this, until the deadline, with a
   typed outcome (`Ready`, `Stopped::Deadline`, `Stopped::Cancelled`). Locks, channels, sleeps and
   every IO call are built on it, which is why each takes a `Cx`. Nothing can wait for ever (rules
@@ -682,7 +645,6 @@ layout they compile under: same outputs, same order of cancellation, drops and p
 |---|---|---|
 | `Inline` | run to completion at `spawn` | nothing else runs; no runtime at all |
 | `Threads` | a job on a worker of a thread-per-core pool, stolen only before it starts | blocks the worker's thread |
-| `Fibers` | its own stack (the scheduler of section 6) | switches stacks |
 | `Frames` | a bump slab holding the frames of its functions that can wait, each made on call and freed on return; code that cannot wait runs on the worker's stack | returns to the scheduler |
 
 `Frames` is the long-term one: no stack per task, and recursion and `dyn` calls work because the
@@ -697,7 +659,7 @@ under any layout.
 task may be placed on any worker (`Scope::may_overlap` and every `par` chunk); once it has started it
 resumes from each wait on that worker and OS thread, so a value that is not `Send` (an `Rc`, a
 `LocalLock`, a guard) held across a wait is still on the thread that made it. That is the
-contract of the plain form, the one rustc builds: a fiber or frames scheduler must put a parked
+contract of the plain form, the one rustc builds: a frames scheduler must put a parked
 task back where it ran, and a debug build checks it at every resume (`Cx`'s `resumed`, a panic
 naming the task). `tests/placement.rs` proves it on the simulation, with a planted resume that
 moves the task. Built by blaze the contract is wider: a value that is not `Send` live across a
@@ -874,7 +836,7 @@ name with the task it runs (`Hung`), and the program exits failed.
 - May-suspend is inferred exactly, from the wait primitive; "takes a `Cx`" is only the usual
   sign, since a value can hold its capability out of sight. The `#[blaze::may_suspend]` mark on
   `dyn` methods and function-pointer fields is also the calling-convention fact `Frames` needs.
-- What `Frames` cannot do is an error with the call path, never a quiet switch to a fiber (rule
+- What `Frames` cannot do is an error with the call path, never a quiet switch to another layout (rule
   `no-fallback`): for one, a foreign (C) frame live across a wait.
 - `must_overlap` under a layout with one worker (`Inline`) is an error; until blaze checks it,
   it is the run-time `NoParallelism`, returned before the task runs.
@@ -887,7 +849,7 @@ name with the task it runs (`Hung`), and the program exits failed.
 ### Proof
 
 Deterministic simulation tests of the scheduler, scopes and cancellation with an oracle and a
-planted bug; a differential test that runs the same programs under `Fibers` and `Frames` and
+planted bug; a differential test that runs the same programs under `Threads` and `Frames` and
 compares outputs and the order of cancellations, drops and panics; and a UI test for each error
 above.
 
@@ -961,370 +923,33 @@ substitute:
 | `Durable::Started` | built: the change is made, then `Effect::WriteBack` (all-1110's effect: `sync_file_range` on Linux, `fsync` without `F_FULLFSYNC` on Apple's) is handed over and not waited for; a name change also begins its directory's `Effect::SyncDir` | nothing; `F_BARRIERFSYNC` on macOS comes with blaze-sys's macOS layer |
 | a name made durable after a remove, a create or `sync_names` on a real disk | built: `Effect::SyncDir` (`fsync` of the directory), waited for, the driver's root included (`DirName::Root`); refused on Windows, naming it | the Windows call |
 | an unsynced rename or publish that costs no sync on a real disk | built: an `_unsynced` call renames by `Effect::RenameUnsynced`; only a `_synced` one by the syncing `Effect::Rename`. The unsynced rename takes the caller's `Unsynced`, the synced one gives the proof `sync_names` takes; `tests/syncs.rs` asserts each call's effects, with a plant for each mistake | |
-| a read that does not copy | `Done::Read` hands back a buffer the driver made, copied into the caller's `Bytes` | the page pool (`file.pin`, S1f) |
+| a read that does not copy | `Done::Read` hands back a buffer the driver made, copied into the caller's `Bytes` | a small read `pread` into the caller's frame; a large plain array is mapped instead (`Dir::map_read`) |
 | a write that does not copy | each write's bytes are copied once into the effect, which owns them | registered buffers (`WriteFrom`), with S4 |
 
-**Folders above the start folder** (decided 2026-11-16; a command finds its workspace's manifest
-above the folder it was started in). `fs.ancestors(cx)` yields a `Dir<ReadOnly>` per folder
-above the start, nearest first, ending at the granted top: the filesystem's root for a command,
-the run spec's directory itself (so none) for a launched program unless its grant names more
-levels. An ancestor is named relative to the start, by leading `..` steps alone (`..`,
-`../..`), and its files beneath it the same way (`../Cargo.toml`): the driver's root stays the
-start folder, so no absolute path enters a name or a key, and the kernel walks no more of a path
-than before. The depth is read through the driver once, at the first call (the start's own
-names in each ancestor, one `getcwd`), never at start. A name that walks back down into the start
-(`../proj/x` for `x`) is refused, so one file has one name; the ancestors are read-only.
-Built: blaze-core's `Above` (made only by `Ancestors::above` on the driver's answer to
-`Effect::Ancestors`, taken only by the reading `Effect::Above`) and bstd's `fs.ancestors(cx)`,
-an `Ancestor` with `stat`, `read_all` and `list` and nothing that writes.
+**Folders above the start folder.** Built (`crates/blaze-std/src/fs/ancestors.rs`, blaze-core's
+`Above`): `fs.ancestors(cx)` yields a read-only `Dir` per folder above the start, nearest first,
+ending at the granted top (the filesystem's root for a command; none for a launched program
+unless its grant names more levels). An ancestor is named by leading `..` steps alone, so no
+absolute path enters a name or a key; a name that walks back down into the start is refused.
 
-**One level of a folder is columns** (built 2026-11-16). `Effect::Entries` completes with
-`Done::Entries(Box<Listing>)` (blaze-core `listing.rs`): the leaf names in one byte buffer with
-`u32` ends (blaze-own's `SortedTexts`), and beside them a `Stamp` column and a `Kind` column
-(file, dir, link, other, gone, unknown). It is sorted by the names' bytes, whatever order the
-kernel gave (rule 25), so `find(leaf)` and `find_file(dir/leaf)` are binary searches and two
-drivers give equal listings. Every driver builds it through one `ListingBuilder`: getattrlistbulk
-on macOS (`fs/bulk.rs`), `read_dir` plus `statx` elsewhere, WASI, IOCP, and the simulation's
-journal. The rule for what is not a name: `.` and `..` are skipped; an empty name, or one holding
-`/` or NUL, is `ListingError::NotAName`; bytes that are not UTF-8 (Linux allows them) fail the
-whole listing with `NotUtf8`, naming the folder and the name escaped, since blaze's names are
-text; a name twice is `Twice`. The caps are 2^20 entries and 64 MiB of names, each refused by
-a typed error naming the folder (`TooManyEntries`, `TooManyNameBytes`); memory comes by
-`try_reserve`, refused as `OutOfMemory`. No adapter rebuilds the old pairs: blaze-vfs (`watch.rs`,
-which now finds a relisted file by binary search instead of a hash map), blaze-solo, blaze-cas
-`peers.rs` and blaze-storemodel read the columns. bstd's `Dir::entries(cx, path) ->
-Result<Option<Entries>, FsError>` is the one-level listing for programs: `None` for a folder
-not there, `NotADirectory` for a file, then by index `name(i)`, `kind(i)`, `len_of(i)`,
-`path(i)`, `find(name)` and `iter()`. The recursive `Effect::List` (`Done::Listed`, pairs of
-name and `Meta`) is unchanged; its callers are blaze-cas `lib.rs` and `plain/core.rs`,
-blaze-certify `kept.rs`, blaze-profile `history/files.rs`, blaze-storemodel and bstd `fs.rs`.
-Cost, measured by `fs/bulk.rs`'s ignored `listing_cost`: see the table under "For a successor".
+**One level of a folder is columns.** Built: `Effect::Entries` completes with a `Listing`
+sorted by the names' bytes (`crates/blaze-core/src/listing.rs`: the names in one buffer with `u32`
+ends, a `Stamp` and a `Kind` column), made by every driver through one `ListingBuilder`; a name
+that is not one, not UTF-8 or there twice is a typed error naming the folder, as are the caps
+(2^20 entries, 64 MiB of names). bstd's `Dir::entries` and `Dir::own_entries` read it. At 10,000
+entries on APFS it is 1.13x one getattrlistbulk pass (`crates/blaze-core/src/fs/bulk.rs`'s
+`listing_cost`). The recursive `Effect::List` stays.
 
-A known gap, not closed by this: **a link inside the root is followed out of it.** The native
-drivers open a `FileName` as the root's path joined with the name, through calls that follow
-symbolic links at every component but the last (the last too, except where an effect says
-`O_NOFOLLOW`), and Linux's `openat(AT_FDCWD, ..)` has no `RESOLVE_BENEATH`. So `FileName`
-keeps `..` out of the text, but a link in the tree (`src -> /etc`) still reaches outside the
-root. Closing it: on Linux, `openat2` with `RESOLVE_BENEATH` (and `RESOLVE_NO_MAGICLINKS`)
-from the root's descriptor for every open, `statx` and directory read; on macOS, which has no
-`openat2`, `openat` from the root's descriptor with `O_RESOLVE_BENEATH` (0x1000, in this SDK's
-`sys/fcntl.h`, with `AT_RESOLVE_BENEATH` for the `*at` calls), or `O_NOFOLLOW_ANY` (0x20000000)
-where no link at all is wanted; both are in the macOS 27 SDK.
+**Names stay beneath the root.** Built (`crates/blaze-core/src/fs/beneath.rs`): every driver
+resolves a name from its root's descriptor and refuses one whose resolution leaves the root
+(`openat2` with `RESOLVE_BENEATH` on Linux, `openat` with `O_NOFOLLOW` a component at a time
+elsewhere). A link that stays beneath the root resolves; nothing follows one out.
 
-**The disk model's gap (closed 2026-11-16 by the strict name rule; see the second hand-off's
-item 3 below; kept as its history).** The simulation (blaze-core's `Sim`, and the model it refines,
-`blaze_core::world::disk`) ties a rename's durability to the renamed file, not to its
-directory. Two ways:
-- **Stricter than a disk:** `Effect::SyncDir` makes nothing durable in it, so an unsynced
-  rename whose directory was synced afterwards can still be undone by a crash. A real disk keeps
-  it. `sim.rs`'s `a_rename_kept_by_its_directorys_sync_survives_a_crash` fails on purpose
-  (`should_panic`) until this is fixed. This side hides no loss, but it fails correct code.
-- **Looser than a disk:** a file sync that leaves no change unsynced clears the file's undo
-  (`File::sync`: "nothing is left to undo"), so a crash keeps the rename. On a real disk that
-  needs the directory's sync. This side can hide a bug: rename unsynced, sync the file, never
-  sync the directory. The simulation passes it; a crash on APFS or XFS can put the old file
-  back. The first side even pushes code toward this, since the file sync is what makes the
-  simulation keep the rename.
-
-The proved statement that rests on the loose rule is
-`blaze_core.world.disk.a_crash_keeps_a_synced_file` (`crates/blaze-core/lean/BlazeCore/World/Disk.lean`).
-Closing the gap means moving the undo from the file to its directory: the directory's sync
-clears it, and the file's sync does not. That restates this theorem and
-`a_synced_append_survives_a_crash`. The Lean sources are unchanged until then.
-
-**For a successor** (2026-11-16, the bstd-items lane, handing off three items the coordinator
-set in this order):
-
-1. **The listing as columns.** Done (2026-11-16, see "One level of a folder is columns"; no
-   `pairs` adapter was kept, by the coordinator's brief). Measured on APFS, macOS arm64, best
-   of 100 interleaved runs, `listing_cost`:
-
-   | entries | floor: one getattrlistbulk pass | columns | old pairs |
-   |---|---|---|---|
-   | 1,000 | 380 µs, 1 allocation | 442 µs (1.16x), 35 allocations, 58 KB kept | 470 µs, 1,010 allocations |
-   | 10,000 | 7.53 ms, 1 allocation | 8.48 ms (1.13x), 47 allocations, 580 KB kept | 8.39 ms, 10,014 allocations |
-
-   What stays above the floor: the growth of the two columns (no size is known before the
-   pass; `ATTR_DIR_ENTRYCOUNT` of the folder would give one) and the sort's copy, since APFS
-   does not return names in byte order. Item as first written:
-   - Replace `Done::Entries(Vec<(FileName, Stamp)>)`, the one-level listing, with a sorted `Listing`. It holds:
-     - `names: Vec<u8>`, all the names in one buffer;
-     - `ends: Vec<u32>`, the offset where each name ends;
-     - parallel `stamps` and `kinds` columns.
-   - Keep the old pairs only as an adapter (`Listing::pairs`). Leave the recursive `Effect::List` as it is, and list its callers: blaze-cas `lib.rs` and `plain/core.rs`, blaze-certify `kept.rs`, blaze-profile `history/files.rs`, blaze-storemodel, and bstd `fs.rs`.
-   - Port every `Entries` consumer in one batch:
-     - blaze-vfs `watch.rs` and `watch/reference.rs`;
-     - blaze-solo `run.rs`;
-     - blaze-cas `peers.rs`;
-     - blaze-storemodel `fs.rs`;
-     - blaze-core: sim, `journal.rs`, and the drivers `fs/bulk.rs` (getattrlistbulk), `fs/wasi.rs` and the statx path.
-   - Count the allocations of a listing of 1,000 entries before and after.
-   - Then build bstd's `Dir::entries(&self, cx, path, frame) -> Result<Option<Vec<(Path, Meta), &Frame>>, FsError>`: one level, `None` when the folder is absent, sorted by name. When it lands, tell the driver lane (agent a11fa75d6a6d4471e).
-   - `FileName` stays unchanged: 1313 mentions in 141 files across 17 crates, 256 fields typed `FileName`, 168 collections of it.
-2. **Make the disk model strict** (see "The disk model's gap" above).
-   - A create, rename or unlink is durable only once its directory is synced. A file's sync makes its bytes durable, never its name. `SyncDir` makes the names in that directory durable.
-   - In code: the undo moves from `File` to its directory, in `blaze_core::world::disk` and in `Sim`'s `SimFile::undo` and `flushed`, where a file sync clears the undo today. The `SyncDir` arm in `Sim::complete` and in `world/asks.rs` then clears the undos of names in that directory.
-   - Say which call the macOS driver makes for a file sync and a directory sync (F_FULLFSYNC), and that the model matches it.
-   - `a_rename_kept_by_its_directorys_sync_survives_a_crash` then loses its `should_panic`.
-   - Run every test that crashes the simulated disk: blaze-core, blaze-std, blaze-cas, blaze-drive's seal and `last`, the store, blaze-remote. Classify each new failure:
-     - a real missing directory sync in the code under test: send the tape to that crate's lane;
-     - a test that leaned on the loose rule: fix the test.
-     Never weaken the model to make a test pass.
-   - Report how `blaze_core.world.disk.a_crash_keeps_a_synced_file` must change (its file must also have had its name synced) and which proofs use it. Find them with `rg a_crash_keeps_a_synced_file crates/blaze-core/lean lean`. Edit the Lean only where the proofs build here.
-3. **Close the symlink gap above.**
-   - Every open, stat, list and rename target under a `Dir`, and under the driver's root, resolves beneath its root:
-     - macOS: `O_RESOLVE_BENEATH` and `AT_RESOLVE_BENEATH`, from this SDK's `sys/fcntl.h`;
-     - Linux: `openat2` with `RESOLVE_BENEATH`.
-   - Probe once at start, with a real escaping link in a scratch folder, that the kernel honours the flag.
-   - Where a host has neither, stop with a typed error naming what is missing. Never fall back to following links.
-   - A link that stays beneath the root keeps working. One that leaves is a typed refusal naming the path and the link.
-   - The simulation gets links under the same rule in `SimWorld`. Add a property test (no sequence of names, links and renames reaches outside the root) and a planted bug (the flag left off one call) that the test catches.
-   - Measure 1,000 opens with the flag and 1,000 without.
-
-State at hand-off: items 5, 7 and 8 are accepted. Their code is in the tree and passes: blaze-std "241 passed, 0 failed". None of the three items above is started.
-
-**For a successor (2026-11-16, second hand-off, the bstd and effect-layer lane)**
-
-1. **Listing a folder as columns: done and accepted.** On top of that, `Effect::Entries { dir }` now takes a `DirName`, and `DirName::Root` lists the driver's root. This is built in every driver, the simulation and blaze-storemodel. `Dir::own_entries(cx)` lists a `Dir` itself, whether it is the root or a named folder. `Entries::folder()` returns `Option<&Path>`. The every-driver test lists the root. Results: blaze-core 365 passed, blaze-std 252, blaze-vfs 138. The driver lane (agent af4ff0d27ddf27bfd) uses `own_entries` for its sweep's root.
-
-2. **The two blaze-cas controls bite again.** Both had been failing since at least 2026-11-14 (the notes' port27 list). In both cases the test had gone blind; the simulation was not at fault.
-   - `layers::the_oracle_catches_a_record_visible_before_its_outputs`: the outputs were put while the record's commit was still in flight. The store's commit takes puts made during it, so the record and its outputs became durable together. Fix: a `LayerOp::Settle` after the record's flush.
-   - `place_crash::the_oracle_catches_a_derived_file_accepted_as_a_crash_left_it`: the test's reopen set `store.plant` only after `drive` had already run the open's sweep of `placed/`. That sweep removed the torn `.derived` file before the plant could keep it. The crash did tear the file: in 94 of 192 runs it was left torn. Fix: set the plant before the open is driven.
-   - The cause was tested both ways for each fix: without it, every seed missed; with it, the control is caught.
-   - blaze-cas now: 397 passed, 3 failed. The three failures are the ones that have failed on main since 11-14: `a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename`, `a_damaged_value_in_another_writers_store_is_never_served` and `a_flipped_byte_of_a_value_is_never_served`.
-
-3. **The strict name rule: in the tree (2026-11-16) and accepted.** blaze-core: 380 passed, and
-   the one failure was a test pinning the old sweep chunk, now fixed. Three sim tests leaned on
-   the loose rule (their files' names were never synced). They were fixed by making each file and
-   syncing its directory first; the model was not weakened. The Lean proofs over the disk world
-   are owed (decision D55; storemodel.md, "The disk world's proofs under the strict rule"). The
-   native calls the model matches:
-   - macOS: a file's sync is `F_FULLFSYNC` (`File::sync_all`), and a directory's sync opens the
-     directory and does `F_FULLFSYNC` on it;
-   - Linux: `fsync` of the file, and `fsync` of the directory's descriptor.
-   Miri: the strict rule is safe Rust in the simulation and the world model (`ready for Miri:
-   blaze-core sim::`). No Miri run covers the native drivers' unsafe calls (kqueue, io_uring,
-   `boot::system`'s sysctl). What covers them is the every-driver equality tests in `tests.rs`,
-   which run each driver against the simulation on a real disk. The history of the design
-   follows:
-   - **The rule:** a name (create, rename, unlink) is durable only once its directory is synced. A file's sync covers its bytes, never its name.
-     A directory made or removed is a create or unlink of a name of its PARENT's, durable only once the parent is synced; a directory's own sync covers the names in it, never its own (2026-11-16: `Sim` journals `MadeDir`/`RemovedDir`, `sim/host/dir_names.rs`; before, a made directory survived every crash, looser than a disk).
-   - **What is in the tree:** `world/disk.rs` keeps a log of names (`Named { Put, Gone, Moved }`)
-     that `sync_names()` clears, and a crash is `Cuts { files, undone }`, undone entries closed
-     forward (undoing one undoes every later entry that shares a name) and undone newest first.
-     `world/asks.rs` and `sim.rs` follow it: SyncDir clears its directory's entries, and a synced
-     Write or Rename syncs its directory. `Plant::FileSyncKeepsName` brings the loose rule back as
-     the control.
-   - **Other crash suites under the strict rule:** blaze-std's `tests::syncs` oracle expected a
-     `SyncDir` after a synced rename. Under the rule, the rename syncs its directories, so the
-     oracle was fixed to the contract (a test leaning on the loose rule). The other suites'
-     results are in the lane's reports.
-   - **Lean:**
-     - The statement change: `blaze_core.world.disk.a_crash_keeps_a_synced_file` gains a premise, "the file's name is not in the unsynced name log": `disk.named(file) = false`. Its `cut` becomes a `Crash`.
-     - Proofs that use it: `lean/BlazeCore/World/DiskCrash.lean` (~1089), which is named in `Disk.lean:170`, and row V14 of `lean/theorems.json` (line 112).
-     - A new control theorem: `a_synced_file_whose_name_was_not_synced_may_be_gone`.
-     - Regenerate the model with hir-ty-lean's `blaze_cores_world_models_are_its_sources` under `UPDATE_EXPECT`. Do not hand-edit the proofs; they are built where Lean exists.
-
-4. **Links beneath the root: the spec (2026-11-16), being built by the effect-layer lane.**
-   - **One seam:** every driver holds its root as a directory descriptor, opened once. Every
-     name under it is resolved relative to that descriptor with the kernel's beneath rule:
-     - macOS: `openat(.., O_RESOLVE_BENEATH)`, `fstatat`/`unlinkat`/`linkat`/`mkdirat` with
-       `AT_RESOLVE_BENEATH`, and `renameatx_np(.., RENAME_RESOLVE_BENEATH)`;
-     - Linux: `openat2` with `RESOLVE_BENEATH`, and `IORING_OP_OPENAT2` on the ring, with an
-       `O_PATH` descriptor of the parent for the calls that take no `how`;
-     - Windows: refused by name until there is a design (reparse points).
-     The threads driver's `at(root, name, ..)` (39 call sites) becomes `beneath(root_fd, name,
-     ..)`, and a path joined to the root is used nowhere else.
-   - **Probe:** once per driver, at its making. Put a link to `/` in a scratch directory under
-     the root, open through it with the flag, and require `EXDEV` on Linux or the documented
-     refusal on macOS. A kernel that follows the link, or does not know the flag (`EINVAL`), is a
-     typed `NoBeneath { call, why }` the driver's maker returns. There is no fallback.
-   - **Refusal:** a name whose resolution leaves the root completes `Done::Failed` naming the
-     name and that it escaped through a link. A link that stays beneath the root resolves.
-   - **The simulation:** `Sim` gets links whose targets are names, resolved under the same rule.
-     The property test: no sequence of makes, links and renames lets a later effect read or write
-     outside the root. The planted bug: one effect's resolution follows links freely, and the
-     property test must catch it.
-   - **Cost:** 1,000 opens with and without the flag, by an example under examplerun.sh.
-   - **Order:** after the `Effect::Roots` wiring (item 6 below).
-
-6. **For a successor (2026-11-16, third hand-off, the effect-layer lane at about 70% of its context).**
-   - **Done, checked and accepted:**
-     - the strict name rule (item 3);
-     - the Boot fact: `blaze_core::Boot` and `NoBoot`, `Driver::boot()`, and bstd's `Io::boot()`;
-     - `Effect::Stamp` as the batched stat: `STAMP_MOST` with a typed refusal, and `SWEEP_CHUNK`
-       256. Measured at 544 µs for 870 rows, 1.09x the 0.5 ms floor (examples/stat_cost.rs).
-     - The Lean debt is written down: decision D55, and storemodel.md's "The disk world's proofs
-       under the strict rule".
-     - blaze-std's `tests::syncs` oracle is fixed to the strict contract: a synced rename syncs
-       its directories, so no `SyncDir` follows it.
-   - **`Effect::Roots`: written, not in the tree.** It was reverted after other lanes' checks met
-     the tree between two of its saves. Every file is kept whole at
-     /Volumes/Projects/blaze-int-1112-notes/port27/roots-wip/: the files under `crates/`, and
-     blaze-std's io, disk, net and layers.
-     - What it does:
-       - `Effect::Roots { cert_file, cert_dir }` takes `Option<String>`, so the `#![no_std]` bstd
-         can name it. It completes `Done::Roots(Box<Roots<Global>>)` or `Done::Untrusted`.
-       - A Unix driver runs it on a host thread named `blaze-host-roots`. Windows and WASI refuse
-         it by name.
-       - In the simulation, `Sim::roots` sets the roots and `Sim::roots_read` counts the reads.
-       - `blaze_core::trust` loses its cfg gate, and blaze-base64 moves to the ordinary
-         dependencies. Only `trust::system` stays per OS.
-       - bstd gains `Net::roots(cx, env)` and `RootsError`. It does not cache: the client keeps
-         the answer.
-       - The test is `roots_are_the_worlds_and_each_ask_is_counted` in blaze-core's tests.rs.
-     - To put it back:
-       1. Check that the live files still equal `refs/green/blaze-core` and `refs/green/blaze-std`.
-       2. If they do, copy every kept file into the tree in one step, then run
-          `lanecheck.sh blaze-core` at once, and blaze-std after it.
-       3. If another lane changed a file since, port the hunks into it by hand, then save every
-          file back to back.
-   - **Crash suites under the strict rule (2026-11-16):**
-     - blaze-std: 249 passed, 1 failed. The failure was
-       `explicit::no_unsynced_call_waits_for_the_device_and_each_synced_one_does`: the syncing
-       rename's name sync was not counted as a wait. `sync_names` now counts it
-       (`io.names_synced()`), and `tests::` gives 244 passed, 0 failed.
-     - blaze-http: 30 passed, 0 failed.
-     - blaze-cas: 381 passed, 19 failed. Three of these failed before the rule. The 16 new ones
-       are all `plain::tests` crash and oracle tests, likely the plain store's missing directory
-       syncs. Not classified yet.
-     - blaze-vfs: 135 passed, 3 failed: `image::tests::a_stop_at_any_step_of_moving_onto_an_image_loads_what_was_durable`,
-       `tests::stamps::stamps_survive_a_crash_with_the_bytes_they_vouch_for` and
-       `tests::the_journal_survives_crashes_and_failures`. Not classified yet.
-     - blaze-profile: 267 passed, 3 failed. These are flight-span and account tests, not crash
-       tests.
-     - blaze-certify is no package in this tree.
-     - Not run: blaze-drive, blaze-storemodel, blaze-remote, blaze-fetch, blaze-pack,
-       blaze-image, blaze-solo and blaze-cargo.
-   - **Lean models: not regenerated.** `hir-ty-lean` is in the workspace's `exclude` list, so
-     `mixcheck.sh hir-ty-lean` "did not match any packages". Regenerating needs it built some
-     other way, which is main's call. The DiskCrash proof is owed (D55). The `lean` job turns
-     red by name and blocks merges, and it never skips.
-   - **Not started:** links beneath the root (item 4); the store model's blind control, and why
-     the store model's suite takes more than 900 s, with a bounded run in its place.
-
-8. **Built (2026-11-16, fifth lane): the crash tears by sectors.** The world's `Torn` is now
-   `Nothing | Sectors { upto, len, landed }` (world/disk.rs; `File::after`, `mixed`); the
-   simulation draws that same value in `crash_cut` (per file in name order: `kept`, then `upto`
-   only where changes are unsynced; after the barriers: the length (longer, shorter or any
-   between, one in three each), then all sectors landed (one in three) or each on its own) and
-   applies it with the world's `mixed`. Grain: `SECTOR` (512), not 4096: finer, every 4096-grain
-   outcome is one at 512, and one constant. Results: blaze-core "382 passed, 0 failed" (the
-   refinement, the reserve's `a_crash_at_any_point_leaves_no_record_or_the_whole_one` and its
-   plant among them); bstd `tests::` "244 passed, 0 failed"; blaze-cli `store::tests` "10 passed,
-   0 failed" with both plants un-ignored (were "8 passed, 2 failed"). Oracles that assumed a
-   prefix were fixed (not code): sim.rs `a_write_at_an_offset_is_durable_after_its_sync_on_every_seed`,
-   bstd tests/crash.rs and tests/durable.rs (through `blaze_core::sim::appended_and_torn`).
-   The prefix theorem is replaced (D55, storemodel.md "The crash tears by sectors"); Lean owed.
-   The roots test's count is now the value's (`Roots::reads`). blaze-storemodel does not use
-   blaze-core's disk (its own `CrashFs`, still prefix-only: its own debt); its full suite times
-   out at 900 s, so run it with a filter. Still open from item 7: plain/core.rs's `SyncDir` fix.
-
-7. **For a successor (2026-11-16, fourth hand-off, at the budget).**
-   - **`Effect::Roots` is in the tree.** The kept files were copied in one step. Two holes
-     were fixed at once: `trust::Roots` now has a hand-written `PartialEq`/`Eq` (a derive asked
-     for `A: PartialEq`, which `Global` lacks), and bstd's `pending.rs` has the arms
-     `Done::Roots`/`Done::Untrusted`. blaze-storemodel's fs.rs refuses `Effect::Roots` by name.
-     The checks: blaze-core, blaze-std, blaze-http, blaze-fetch and blaze-storemodel each "check
-     ok (all targets)". blaze-cli is unverified: blaze-consteval (`Lit::CStr`, not this lane's)
-     does not compile under it. `lanecheck.sh blaze-core test roots` failed one test:
-     `trust::tests::this_macs_store_gives_roots_and_is_read_only_when_asked` asserts "left: 2,
-     right: 1" on the process-wide `macos::reads()` counter. The likely cause, not yet shown by
-     a run, is that the new roots test read the system store in parallel with it. The fix to
-     make: count reads per call (return the count from the read) or serialize the two tests.
-     Never loosen the `+ 1` check. blaze-std was red for about 20 minutes between the copy and the
-     pending.rs fix. The WIP had missed that file, and the checks after blaze-core had not been
-     run back to back with it. blaze-cli's check, the roots test and the message to the driver's
-     lane were in flight at hand-off: run `lanecheck.sh blaze-cli` and `lanecheck.sh blaze-core
-     test roots`, then tell the driver's lane (OWNERS.md), in one message, that the client can
-     take its roots through `Net::roots`.
-   - **FIRST, owed (the coordinator's order): the crash is too kind to unsynced data.** The
-     pack store's plants were un-ignored. Neither was caught: "the planted VerifySkipped was not
-     caught in 5560 starts", and the same for SelfVouching. A cut tears only the NEXT change, and
-     an append only to a prefix (`Op::torn`; the world's `Torn::Prefix`), so a cut pack always
-     loses its footer and the open refuses it before verifying. POSIX leaves unsynced data after
-     a crash unspecified (`fsync`, `write`: no ordering or atomicity promise without a sync).
-     ALICE (Pillai et al., OSDI 2014) observed real file systems reorder and drop unsynced
-     block writes, and ext4 `data=writeback` and XFS leave zero-filled blocks under a grown
-     size. Both plants are re-ignored with that reason. The design to build:
-     - Grain: the 4096-byte block (`SECTOR`), the device and page-cache unit that writeback
-       flushes as a whole.
-     - A `Cut` keeps `kept` (the changes whole, in order, as now) and draws `upto` in
-       `kept..=ops.len()`.
-     - In `crash_with`: let `old` be the file after `sync(kept)`, and `new` be `old` with ops
-       `kept..upto` applied.
-     - The length is drawn between `old.len()` and `new.len()`.
-     - Each block where they differ is, on its own, `new` or `old`, or zeros where the block
-       starts at or past `old.len()` (newly allocated). Synced bytes never change.
-     - Barriers: a file's reach is `upto`, not `kept + 1`. When a barrier raises `kept`, set
-       `upto = upto.max(kept)`; do not clear it.
-     - What the change must reach beyond sim.rs, in one save: the disk world's `Kept`/`Torn`
-       (world/disk.rs: `fits`, `reach`, `keeps`, `crash`), the refinement's `kept()`
-       (sim/world.rs:540), asks.rs:835/861, and the Lean statement
-       `a_crash_cuts_an_appended_file_to_a_prefix`, which becomes false as stated. Its
-       replacement is "synced bytes and synced length survive". Record it with D55.
-     - Then un-ignore the two plants in crates/blaze-cli/src/store.rs and quote the lines.
-       Rerun blaze-core's and bstd's crash suites and classify each new failure (code or
-       oracle), with no oracle weakened.
-     - It was not started: it is a change to the spec the proofs state, too large to write
-       whole and check at once at the end of this budget.
-   - **The new path's crash suites under the strict rule (each line quoted from a run):**
-     blaze-drive "36 passed, 0 failed", blaze-fetch "12 passed", blaze-git-fetch "12 passed",
-     blaze-build-script "36 passed", blaze-toolchain "5 passed", blaze-remote (bare) "6 passed",
-     and blaze-proc-macro "48 passed". The proc-macro run was through mixcheck, because
-     blaze-scope's resolve.rs did not compile. None of these crash suites runs on blaze-core's
-     simulated disk, so the rule changes none of them. The pack store's suite (blaze-cli
-     store::tests) gives "8 passed, 2 failed" with the plants un-ignored: the failures are the
-     two plants above.
-   - **Where each crate's on-disk state is written, and on which simulation (for main):**
-
-     | Crate: state | Writes through the effect layer? | Crash test runs on | Never read torn? |
-     |---|---|---|---|
-     | **blaze-proc-macro: expansion records (`record::DirStore`, used on the binary's path by blaze-world's `ProcMacros`)** | **no: ambient `std::fs::write` + `rename`, no sync** | **none** | **no: no whole-record digest; a torn note can decode as other tokens** |
-     | blaze-proc-macro: compiled modules + seals (host.rs `write_renamed`) | no: ambient std::fs | none | yes: the seal's digest is checked on every read; a mismatch is removed and rebuilt |
-     | blaze-cli: the pack store, boot record, `last` | yes (bstd `publish`, `Durable::No` by decision) | blaze-core's disk | yes in design, unproven: the model cannot tear a pack's middle |
-     | blaze-fetch / blaze-git-fetch: source records | yes (`blaze_core::reserve`: synced rename) | its own machine model (a BTreeMap store, crash at an effect: no tearing); the reserve's crash proof is on blaze-core's disk | yes |
-     | blaze-build-script: script records | through proc-macro's script.rs: ambient `std::fs::rename` (script.rs:376) | none on a disk | not checked |
-     | blaze-toolchain: the shelf | read-only on the binary's path; written by the `blaze-toolchain` bin (ambient std::fs) | none | yes: BLAKE3 checked against the name |
-     | blaze-remote: local write-through | in-memory model in read/tests.rs | its own model | per its oracle |
-     | blaze-world: names records | not found written by the driver in this tree | none | n/a |
-     | blaze-storemodel | models the OLD `blaze_cas::Store` on its own `CrashFs` (ALICE: prefix plus last torn; POSIX entries as an option): no middle tear | its own | finding 2 (POSIX entries) stays ignored |
-   - **Step 3 (old layer), from searches:** blaze-vfs and blaze-profile are used by neither
-     blaze-remote nor blaze-storemodel: old layer; deleted at the switch; they fail 3 tests
-     each under the strict rule (vfs: three crash tests; profile: not crash tests): not fixed.
-     blaze-remote's binary shape uses only blaze-cas `plain`'s pure format code (`Namespace`,
-     `seal_segment`, `check_segment`, `find_many`). Only `cmd` (feature `sign`: the pusher and
-     `blaze cache`) opens the disk store `plain::Driven`.
-     - The 16 `plain::tests` failures are, by reading, a CODE fault: plain/core.rs makes its
-       head, segments and manifest logs by `WriteAt`/`Truncate`, syncs each file, and never
-       emits `SyncDir`, so under the strict rule a head can name a segment whose name a cut
-       lost.
-     - The fix: in durable mode, one `SyncDir` of `cfg.dir` after `LOG_SYNC`, before
-       `write_slot`. It covers every new segment and the log, since all are in one directory.
-       Add one more after the head's first sync (`HEAD_MAKE` index 1).
-     - The cost: one directory fsync per flip, plus one at the store's birth.
-     - Not yet applied or run.
-   - **Lean models, for main (do not build here):** `blaze_cores_world_models_are_its_sources`
-     (crates/hir-ty-lean/src/tests.rs:1797) writes `lean/BlazeModel/blaze_core/world/{clock,
-     disk}/…` when `UPDATE_EXPECT=1`.
-     - hir-ty-lean and its deps hir-ty, hir-ty-borrowck and hir-ty-mir (dev) are all in the
-       root Cargo.toml's `exclude`, and their manifests inherit `workspace = true`. So
-       `--manifest-path crates/hir-ty-lean/Cargo.toml` cannot load them: an excluded package
-       finds no workspace to inherit from.
-     - The way: on a Lean host, in a scratch worktree, delete those four lines from `exclude`
-       (`members` is `crates/*`, so they become members). Then run
-       `UPDATE_EXPECT=1 cargo test -p hir-ty-lean blaze_cores_world_models_are_its_sources`.
-       Add the asks world's `a_synced_append_survives_a_crash` to that test's list first
-       (storemodel.md). Then build the proofs with `lake build` under
-       crates/blaze-core/lean.
-     - Unverified: whether hir-ty still compiles after the old layers' deletion (8e87a017ff).
-       If it does not, the generator has to move off hir-ty first.
-
-5. **What other lanes need from the effect layer:**
-   - The fetch area (now `main`'s; lane aee48fa9980e2272a is retired) is adding `Effect::Reserve { key, room }` to blaze-core, in every driver and the simulation: a large record written into a mapped file, visible only on finish. Its crash proof depends on the strict name rule, because finish ends in a directory sync.
-   - Agreed with that lane:
-     - the mapping's bytes fold into `SimFile` as ordinary ops (`push_op`), so the crash cut tears them, with no second durability path;
-     - finish uses a synced `Rename` alone, or `RenameUnsynced` plus `SyncDir`, never both.
+**A name is durable once its directory is synced.** A create, rename or unlink survives a crash
+only after its directory's sync; a file's sync covers its bytes, never its name. On macOS a
+file's sync and a directory's are `F_FULLFSYNC`; on Linux `fsync` of the file and of the
+directory's descriptor. The simulation and the disk world (`blaze_core::world::disk`) hold the
+same rule, and a crash tears unsynced bytes by sector (`Torn::Sectors`).
 
 With records, `publish(path, content, { durable: Durable::No, .. })`; `durable` stays a field
 with no default.
@@ -1409,7 +1034,7 @@ works and simply runs it.
   |---|---|
   | `Eval::direct()` | calls the body; with this one the marks compile to plain calls |
   | `Eval::memo(mem)` | remembers results in a cache of the memory budget |
-  | `Eval::stored(mem, store)` | the above, kept in the store and the remote cache: the engine blaze builds with ([kernel](kernel.md)) |
+  | `Eval::stored(mem, store)` | the above, kept in the store and the remote cache: the engine blaze builds with ([end-state.md](end-state.md), D157, D159) |
   | `Eval::handler(h)` | yours |
 
 - **A handler sees every point and can wrap another evaluator**, so behaviours stack: record
@@ -1438,7 +1063,7 @@ types, each with exactly the spec that is valid for it and the operations it rea
 
 | type | made with | the program is | besides running, it can |
 |---|---|---|---|
-| `OsSandbox` | `Dir`s at chosen paths, an `Env`, a net policy, limits | a host process behind the OS's sandbox (Landlock, seccomp and namespaces; a sandbox profile on macOS; AppContainer on Windows) | signal a process, see its resource use |
+| `OsSandbox` | `Dir`s at chosen paths, an `Env`, a net policy, limits | a host process behind the OS's sandbox (Landlock, seccomp and namespaces; a sandbox profile on macOS; AppContainer on Windows, later) | signal a process, see its resource use |
 | `Vm` | an image or a view of the file tree, cores and memory from the host's menu, a lifetime, a net policy | a guest in a micro VM | stop, resume, snapshot, fork |
 | `WasmSandbox` | a module, `Dir`s as preopens, an `Env`, fuel and memory limits | a WASI module in the runtime | call an export, meter fuel |
 
@@ -1474,8 +1099,8 @@ fn compile(cx: &Cx, run: &Runner) -> Result<(), Error> {
   per kind of work and runs many commands in it. It ends with its scope, like a task.
 - **Every run is recorded.** The sandbox traces what the program read and wrote, so a run is a
   function of its command, its spec and the content it read. That is a cache key: the same
-  command over the same inputs is a store hit ([caching](caching.md)), which is how blaze already
-  treats build scripts. A `Vm` over a view of the Merkle tree ([vfs](vfs.md)) gives its output as
+  command over the same inputs is a store hit ([caches](caches.md)), which is how blaze already
+  treats build scripts. A `Vm` over a view of the Merkle tree gives its output as
   the difference between two roots.
 - **A bstd program inside one** gets its grants made from the spec: its `main` is handed the
   ones it names and no others. Any other program sees an ordinary system that happens to contain
@@ -1564,7 +1189,7 @@ on every target.**
 **Sound is in.** `io.audio()` gives `AudioOut` and, separately, `AudioIn`: a microphone is as
 sensitive as the file system, so listening is its own capability, narrowed to a device.
 
-- A device is a provider (CoreAudio, PipeWire or ALSA, WASAPI, the browser's in a wasm host;
+- A device is a provider (CoreAudio, PipeWire or ALSA, WASAPI later, the browser's in a wasm host;
   silence, a buffer or a file in the simulation), one type each for input and output.
 - The stream is pulled by the device. The callback that fills or reads a buffer must be
   `nonblocking` and `noalloc`, checked, since the audio thread may never wait; it talks to the
@@ -1798,11 +1423,10 @@ not yet run under blaze-check's interleavings.
 
 ## Tracing
 
-The recorder is the one [no-tracing](no-tracing.md) specifies (`blaze-trace`: per-thread rings,
-fixed-layout rows, fields as words, no formatting on the hot path) feeding the profile history
-([profiling](../../../profiling.md), [ix-prof-format](../../../ix-prof-format.md)). bstd does not
-add a second one. It changes where the span lives, what is recorded without being asked, and how
-a site is described. Where this section and no-tracing differ, this section is the newer.
+The recorder is `blaze-trace` (per-thread rings, fixed-layout rows, fields as words, no
+formatting on the hot path; [end-state](end-state.md), D178), and what a run keeps of it is
+bstd's telemetry report (D178). bstd does not add a second one. It changes where the span lives,
+what is recorded without being asked, and how a site is described.
 
 - **The span is in `Cx`.** `let cx = cx.span(FETCH, &url);` returns a child `Cx`; the span ends
   when it drops; everything called with it is inside. A spawned task's `cx` comes from its scope,
@@ -1814,16 +1438,14 @@ a site is described. Where this section and no-tracing differ, this section is t
     not running (queue delay);
   - wake edges, which task woke which. A lock is built on the wait and records its holder, so a
     slow wait reads "lock L, held by task N in span S";
-  - the task's logical stack for the sampler: the slab's frame chain under `Frames`, the fiber's
-    stack under `Fibers`.
+  - the task's logical stack for the sampler: the slab's frame chain under `Frames`, the worker's
+    stack under `Threads`.
 - **A site is described at compile time.** blaze is the compiler and the linker, so each span and
   event site gets its id and a static schema (name, field names and types, file and line) in a
   table beside the binary. Nothing about a site is formatted, hashed or registered at run time.
-  (no-tracing rejected link-time ids because a distributed slice was the only way; it is not.)
 - **An event is fixed bytes**: site id, timestamp, task id, span id, raw field bytes, copied into
   the worker's ring. No formatting, allocation, lock, system call or write to another thread's
-  memory. A drainer moves full chunks out; decoding happens offline against the schema table,
-  straight into the history's typed columns.
+  memory. A drainer moves full chunks out; decoding happens offline against the schema table.
 - **Field encoders come from reflection** ([comptime](comptime.md)), not a macro and not `Debug`.
   A field whose type has no encoder is an error at the site, naming the type; there is no
   format-as-text path.
@@ -1942,8 +1564,9 @@ task with `Stopped::OutOfMemory { arena, asked }` through the same path as a pan
 `panics-fail-one-job`); the process and the other tasks go on. Code that wants to handle it itself
 uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
 
-Until S4's runtime ([sys](sys.md), "Runtime"), `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
-it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.
+No global allocator is reachable from a blaze crate: none links `alloc` (D173). The one
+`#[global_allocator]` static is the binary's foreign heap, for third-party code compiled in,
+counted by the meter as its own line.
 
 ### One handle, not a type parameter
 
@@ -2039,26 +1662,15 @@ map 1) and never within the room; a content map equals the distinct values by id
 inserts and removes; a claimed id that is not the value's is refused and stores nothing; keys
 picked to collide under a known hasher spread under a key.
 
-Cost rows are printed by `cargo test --release -p blaze-hash --lib collections_cost -- --ignored
---nocapture` (insert, hash and lookup, and iteration of a million `u32` ids for `IndexMap`, the
+Cost rows are printed by `blaze test -p blaze-hash -- collections_cost --ignored --nocapture`
+(a release-optimized `blaze test` is not in the CLI yet) (insert, hash and lookup, and iteration of a million `u32` ids for `IndexMap`, the
 `indexmap` crate and `HashMap`; lookup of a million 32-byte hashes for `ByHash` and
 `HashMap<[u8; 32]>`). Not measured yet: no run of it has printed (2026-11-12); the numbers go
 here with the commit and the machine's load when one has.
 
-Moving blaze's own code off the `indexmap` crate: nothing has moved yet, and `.clippy.toml` does
-not ban it yet. Its uses are 53 files of 14 crates, nearly all through `base_db::FxIndexMap` and
-`FxIndexSet` (hir-def 18 files, hir-ty 9, blaze-diagnostics 6, blaze-lints 5, base-db 4, ix-prof
-and blaze-engine 2, and one each in span, hir-ty-charon, hir-lint-levels, hir-expand, blaze-query,
-blaze-profile, blaze-explore-core). What a move has to settle first, since these are the front
-end's own tables: equality (`indexmap`'s ignores order, `OrderMap`'s does not, and `FileSet` and
-query values derive `PartialEq` over one); the entry API and serde, which `OrderMap` does not
-have yet; and `blaze_query`'s `container_values!` for it. The ban goes in with the port of
-`base_db`'s two aliases, as one batch (rule whole-ports), with its baseline. Decision D25 is not
-what holds it: `blaze-hash` builds under cargo.
-
 ### Contracts
 
-bstd's public functions carry `requires` and `ensures` (ledger V3). While rustc also builds bstd
+bstd's public functions carry `requires` and `ensures`. While rustc also builds bstd
 ("Two builders") they are nightly's `#[core::contracts::ensures(..)]`, which both builders read
 and run under `cfg(contract_checks)`; the native clause syntax ([contracts](contracts.md);
 `#![feature(blaze_verify)]`), checked by default in the dev and test profiles and the form the
@@ -2078,35 +1690,19 @@ which no test of the lowering shows it takes: `Kv::get` after `put_synced` reads
 id; `Budget::left` is at most the limit; `Clock::after(wait)` is `now + wait`; a `_synced` call
 leaves `device_waits` higher and an `_unsynced` one does not.
 
-What the generator (`#[blaze::contract_test]`) needs before these are run as property tests: it
+What the contract-test generator (a mode of `blaze test`, contracts.md) needs before these are run as property tests: it
 refuses methods and associated functions (bstd has almost nothing else), so it needs a receiver
 (drawn, or built by a constructor the type names); a `&Cx` and capabilities, made from
 `Io::sim(seed)` with the seed drawn; `&mut` arguments (`Bytes`); and a `Debug` bound it can do
-without for capabilities. The crate-wide `#![blaze::contract_tests]` is also not built.
+without for capabilities.
 
-### The page pool: one home for bytes that come from outside
+### Bytes that come from outside
 
-The store's buffer pool (`docs/v2/plan/design/store-pool.md`) is not a store feature. It is how bstd
-holds any bytes that came from a file, a socket or a device, and it moves into `bstd::mem::pool`
-with the store as its first user. There is no `mmap` in bstd.
-
-- **One reserved range, pages loaded by explicit reads** on the driver, in parallel, with a
-  state word per page. A miss is an op with a deadline, never a page fault that stalls a worker.
-- **`file.pin(cx, range)` gives `Pinned`**, which derefs to `&[u8]`: the bytes of the file in
-  place, held for as long as the pin lives. This is what `mmap` was used for, with the pool
-  choosing what stays in memory and blaze choosing what to prefetch.
-- **Records are read in place from pinned pages** (`bstd::record`: bytes in memory are the bytes
-  on disk), so loading a result decodes nothing and copies nothing.
-- **Receives land in pool pages.** The buffers a driver lends with an event (the boundary's
-  "events lend their bytes") are pool pages, so network data, file data and what the program
-  keeps of them are one kind of memory with one owner and one count.
-- **On unified memory a pool page can be a GPU buffer** (page-aligned, shared), so disk to pool to
-  device is no copy at all.
-- **It is the `Cache` of `Mem`.** Pool pages are the cheapest thing to drop (one read brings them
-  back), so the one evictor takes them first, and the pool grows only into room the budget has.
-- **The pool's logic is a sans-IO core**: its inputs are requests and completions, its outputs
-  are reads, advice to the OS and wake-ups. The simulation runs it with failed reads, short
-  reads and crashes like everything else.
+Records are written once and read in place: a small one by `pread` into the task's frame, a
+large plain array mapped read-only (`Dir::map_read`) and never unmapped in the run. Records are
+`bstd::record` bytes (bytes in memory are the bytes on disk), so loading a result decodes
+nothing. The kernel's page cache is the only cache: bstd keeps no buffer pool of its own (D117),
+and the evictor of `Mem` holds no file pages.
 
 `Mem` itself is a capability whose system calls (reserve, commit, give back) are ops on the
 boundary, so a simulated `Io` can refuse memory, count it and fail it at a chosen point.
@@ -2115,8 +1711,8 @@ Strings are UTF-8; a path is bytes on Unix and WTF-8 on Windows behind one `Path
 
 ## The checks
 
-Two effects join the existing MIR walk (`crates/hir-ty-pure`, with pure, nopanic, noalloc and
-nonblocking; [effects](effects.md)):
+These join the effect walk, beside its four effects (panic, alloc, block, diverge: the function
+type's `EffectSet`, blaze-ty effect_ty.rs; [effects](effects.md)):
 
 - **`ambient`**: reaches a system call, or Rust `std`'s file, environment, network, clock, random,
   process or thread API, outside the trusted list.
@@ -2125,10 +1721,11 @@ nonblocking; [effects](effects.md)):
 - **`global_state`**: reads or writes a `static` with interior mutability, a `static mut` or a
   thread-local.
 
-Effect attributes on bstd itself. This branch has `#[blaze::pure]`, `nopanic`, `noalloc` and
-`nonblocking` ([effects](effects.md)); bstd marks with those where the mark holds and is
-checked, and the positive form being built (`#[blaze::expect(block, alloc, ..)]`) replaces
-each with the exact list of what a function does, so "only `_synced` and `flush` may block"
+Effect attributes on bstd itself. The effect set is four, `panic`, `alloc`, `block` and
+`diverge`, carried in function types (blaze-ty effect_ty.rs) and written
+`#[blaze::expect(..)]`, the exact list of what a function does ([effects](effects.md)). bstd's
+`#[blaze::pure]`, `nopanic`, `noalloc` and `nonblocking` marks say an effect's absence the old
+way (`blaze::negative_effect` respells them), so "only `_synced` and `flush` may block"
 becomes `expect(block)` on those and its absence everywhere else. Marked today: `Cx::{deadline, name,
 cancelled, check}`, `Budget`'s counting, `Instant::{since_start, since}`, `Durable::unsynced`,
 `How::says`, `Buffered::held`. Not marked, and why: every call that reaches the driver takes
@@ -2140,13 +1737,13 @@ Lints the second rule implies:
 
 | lint | refuses | exists |
 |---|---|---|
-| `blaze::nopanic`, `noalloc`, `nonblocking` | a marked function that reaches the effect | yes |
+| `blaze::undeclared_effect`, `unfulfilled_effect` (the four effects against `#[blaze::expect(..)]`); `blaze::nopanic`, `noalloc`, `nonblocking` | a function that reaches an effect its list or mark does not allow; a listed effect it is proved not to have | registered (blaze-lint-defs lints.rs); the walk that runs them is not on the new layer |
 | `blaze::linear` (the borrow check's `LINEAR`) | a `File<ReadWrite>`, `Buffered`, `Pending`, `Scope`, `Conn` left unfinished | yes |
 | `blaze::implicit_policy` | a public bstd function that reaches a cost its signature does not carry (below) | no: specified here. Not built with `default_policy` because the lints read no effect summary yet (`instance_effects` is the MIR walk's, with no query the lint pass can ask per function), and the `Sync` and `Write` kinds are not rows of `effect_attrs::ROWS` |
-| `blaze::default_policy` | `impl Default`, `#[derive(Default)]`, or a `new()` with no arguments, for a type with a field marked `#[blaze::policy]` (a cost or a guarantee) | yes: `crates/blaze-lints/src/blaze/default_policy.rs`, on in bstd; `Limits`, `SimWorld::limits`, `Wire` and `MemoLimit` are marked |
+| `blaze::default_policy` | `impl Default`, `#[derive(Default)]`, or a `new()` with no arguments, for a type with a field marked `#[blaze::policy]` (a cost or a guarantee) | no: not on the item layer (`crates/blaze-lint` has no such lint); `Limits`, `SimWorld::limits`, `Wire` and `MemoLimit` are marked |
 | `.clippy.toml` bans of the removed names (`Dir::write`, `File::sync`, `File::replace`, `Conn::send`, `End::write`) | a use of one, by resolution | no: the names are gone from bstd, so the ban is for crates that move onto it (S3) |
 | `Flat` (`where const { is_flat::<T>() }`; plain: the `const` assertion in `chan::bounded`) | a flat channel of a type with an address or drop glue in it, naming the field path built by blaze | yes: the walk's answers in `src/tests/flat.rs`; the refused channel, by an address and by drop glue, is compiled by `tests/refusals.rs` |
-| compile-fail fixtures for bstd | `written.clone_to(..)`; a `Buffered` dropped; a write through a handle narrowed to read-only; a call of a removed name (`Dir::write`) | yes: `bstd_the_wrong_call_does_not_compile` in `crates/blaze-engine/tests/repro.rs` runs `blaze check` on each file of `crates/blaze-engine/tests/repro/bstd_the_wrong_call_does_not_compile/wrong`, beside a control that checks |
+| compile-fail fixtures for bstd | `written.clone_to(..)`; a `Buffered` dropped; a write through a handle narrowed to read-only; a call of a removed name (`Dir::write`) | no: the fixtures are not on the item layer |
 
 **`blaze::implicit_policy`**, for crates on the trusted list that are libraries (bstd first).
 For each `pub` function and method, read the effect summary the walk already makes
@@ -2189,8 +1786,7 @@ edition = "blaze-2026.11"
 One spelling. A key cargo could read (`[package.metadata.blaze]`) lost: a package of the
 edition is not a cargo package (its `std` is bstd and its `main` takes parameters), so cargo
 stopping at the edition key, naming it, is the true error, and one that parsed would only fail
-later and worse. blaze's own crates stay on `edition = "2024"` while cargo builds blaze
-(decision D25) and use bstd as a dependency by name. `edition.workspace = true` inherits it.
+later and worse. blaze's own crates are on `edition = "2024"` (decision D25) and use bstd as a dependency by name. `edition.workspace = true` inherits it.
 
 To the front end the manifest value is two things (`edition::BlazeEdition`, the one home of
 every spelling): the Rust edition it fixes (2024, for the parser, name resolution and every
@@ -2228,7 +1824,7 @@ a `core::fmt::Write` for `write!`/`writeln!` and keeps the first error, which `f
 cannot carry. bstd holds nothing between calls: a call of up to `out::HELD` (1024) bytes is
 one write, with the operating system when it returns, so a crash leaves on screen every line
 whose call returned. The price is one system call a line, which is what Rust's line-buffered
-`println!` pays too (measured: see the lane's report); a program that wants fewer builds its
+`println!` pays too; a program that wants fewer builds its
 text in an allocator and writes once.
 
 **Memory under the edition.** The prelude has `Vec` and `Box` (alloc's types, for
@@ -2284,7 +1880,7 @@ gives and the manifest line; a diagnostic like any other (stored in the crate's 
 `compiler-message` in JSON, allowed or denied in the workspace's lint table or by flag). It
 warns by default from the same day `blaze new` defaults to the edition
 (`ready::EDITION_SHIPS`): until a package of the edition builds wherever blaze runs, telling
-people to move would be a nag. blaze's own workspace allows it while cargo builds blaze (D25).
+people to move would be a nag. blaze's own workspace allows it (D25).
 
 Deferred, a row each below: tests (S5b), the sandbox derived from `main` (S5c), bstd shipped
 with blaze (S5d), `Out` on the driver (S5e), build scripts and proc macros (S5f), the global
@@ -2303,11 +1899,11 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 | S1c | Tracing on bstd: the span in `Cx` and the scheduler's own events first; then the compile-time site table and the ring; then reflection encoders and redaction; disabled-site patching and keep-or-drop last | the emit budget holds; the ring's simulation test and the round trip pass |
 | S1d | The facade: bstd re-exports the crates of "What is in it", the interner and helper crates are merged, and the piece crates' names are banned outside bstd | `blaze check` with the bans on; no blaze crate outside bstd names a piece crate |
 | S1e | `bstd::image` (PNG), `bstd::video` (the encoder core, the muxer, the VideoToolbox provider moved out of `harness-video`, which then uses bstd's), and `Gpu` as a capability with the CPU provider and offscreen targets | a round trip of an image; a clip encoded from fixed frames is byte-identical twice; `harness-video` builds on it |
-| S1f | The page pool moves from `blaze-cas` to `bstd::mem::pool`; `file.pin`, pooled receive buffers, records read in place; no `mmap` anywhere in bstd | the pool's simulation test still passes from its new home; the store builds on it |
+| S1f | Records read in place: small by `pread` into the task's frame, large plain arrays mapped read-only (`Dir::map_read`); no buffer pool in bstd (D117) | a store get copies nothing beyond its one `pread`; the store builds on it |
 | S1g | `bstd::audio`: `AudioOut`, `AudioIn`, PCM buffers, the mixer and resampler as cores, the simulation's provider and one native one; the audio track in the muxer; the types of the device capabilities | a simulated run's samples equal a model's; the callback's effects are refused when it waits or allocates |
-| S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Fibers` passes |
+| S3b | The `Frames` layout: the calling convention, the slab, unwinding, and the profiler and backtraces walking the frame chain | the differential test against `Threads` passes |
 | S4 | The bottom ([sys](sys.md)): `bstd::sys` and `bstd::rt`, `blaze-core`'s drivers move in as `bstd::driver`, and bstd is `#![no_std]`. Slice 1 is written: `crates/blaze-sys` for Linux, the first file effects on it, bstd `#![no_std]` with one std module (`rt.rs`) | the ban list (`harness/v2/nostd.json`) is empty and no blaze crate links Rust's `std` (`harness/v2/nostd.py`); C1 still passes |
-| S5 | The edition, slice 1 ("The blaze edition: opting in"): `edition = "blaze-2026.11"` makes `std` name bstd and its prelude the crate's, `main` takes the roots the runtime makes (`entry-takes-roots`), `bstd::entry::run` makes them, `Out` is standard output, `blaze new` writes it where bstd is named, and `blaze::not_latest_edition` | built: a new-edition hello world builds, prints its line through `Out` and exits 0, and one returning `Err` prints the error and exits 1; the same program on Rust 2024 is unchanged; each direction of the boundary links; a bad `main` gets the named error (`crates/blaze-engine/tests/repro.rs`, `the_blaze_edition_*`) |
+| S5 | The edition, slice 1 ("The blaze edition: opting in"): `edition = "blaze-2026.11"` makes `std` name bstd and its prelude the crate's, `main` takes the roots the runtime makes (`entry-takes-roots`), `bstd::entry::run` makes them, `Out` is standard output, `blaze new` writes it where bstd is named, and `blaze::not_latest_edition` | built: a new-edition hello world builds, prints its line through `Out` and exits 0, and one returning `Err` prints the error and exits 1; the same program on Rust 2024 is unchanged; each direction of the boundary links; a bad `main` gets the named error (`crates/blaze-unit-graph/src/implicit.rs`, `the_blaze_edition_names_bstd_std_and_rust_std_nothing`, for the naming) |
 | S5b | Tests of the edition: a `#[test]` takes the roots `main` may, handed `Io::sim(seed)`; `#[test(native)]` the real one; a harness that names no Rust `std` | `blaze test` of an edition package runs its tests on the simulation and prints the seed of a failure; today it stops naming this row |
 | S5c | The OS sandbox of a program derived from what `main` hands out | a program of the edition that never opens the network cannot, checked by the sandbox |
 | S5d | bstd ships with blaze and is given to every crate of the edition as `std` is given (`attach_std`), so the manifest's `bstd` line goes; `blaze_new::BSTD_SHIPS` and `ready::EDITION_SHIPS` turn on | `blaze new` then `blaze run` prints its line on a machine with no checkout of blaze; the release's install check uses it |
@@ -2323,7 +1919,7 @@ S1 and S2 do not depend on each other. S3 is the long one: about 270 files name 
 each use of an item of Rust's `std` that bstd replaces, by what the use resolves to, once per
 item per function, and names what is written instead from one table of rows (ambient
 authority, hidden cost, global-heap allocation, renamed) that is revised as bstd's API
-settles. `harness/v2/std_uses.py` runs it over the workspace and writes, per crate, the
+settles. A script (not built) runs it over the workspace and writes, per crate, the
 findings by kind and item, how many have a fix, and the number of functions whose signature
 changes, with the crates in layers: a layer depends on no findings of its own, so it is one
 batch, leaves first. S3 is met when that script reports no finding and every crate has the
@@ -2344,7 +1940,7 @@ with its path, or put on the trusted list with a reason.
   the driver either way.
 - **`Io` is a concrete value**, as Zig's `std.Io` is passed explicitly, without Zig's vtable in
   every signature and without a generic.
-- **No `async`.** One kind of function; fibers first, task frames after.
+- **No `async`, no fibers.** One kind of function; a waiting task's frames live in its slab (`Frames`).
 - **The layout is a build setting**, not a type parameter.
 - **Context is a parameter**, as Go's `context` and Zig's allocator are, never a thread-local: a
   thread-local context is ambient authority over time and memory.
@@ -2480,8 +2076,7 @@ Three tools, chosen per case:
   the pinned compiler (crates/blaze-std/src/own/raw.rs).
 
 Each path is tested equal to the general form on random input, and timed against it in its
-crate's cost example. State as of 2026-11-15, from reading the five crates; "who" is the lane
-that owns the crate.
+crate's cost example. "who" is the crate that owns the work.
 
 | operation | where | there now | missing | unobservable because | who |
 |---|---|---|---|---|---|
@@ -2599,25 +2194,6 @@ contracts (blaze-std; see its row), fn_delegation (blaze-fmt).
 | `read_buf`, `core_io_borrowed_buf` (`Read::read_buf` into a `BorrowedBuf` of `Vec::spare_capacity_mut`) | plain unstable | reading into capacity without zeroing it first | the store's record reads into a frame | use now where the caller sizes the buffer itself; `read_to_end` already reads unzeroed | 64 MB from the page cache: 2.73 ms, `read_to_end` 2.80 (1.022), zero then `read_exact` 3.04 (1.112) (read_buf.rs) |
 
 No probe panicked the compiler; no `rustc-ice-*.txt` was left.
-
-### Flags for building blaze itself
-
-The coordinator runs these on the whole tree; each names what to measure.
-
-- `-Zthreads=N`, the parallel front end: a cold `cargo check` of the workspace at N = 1, 8 and
-  the core count, wall time and peak memory; worth it if the critical-path crates (blaze-own,
-  blaze-hash, the front end) check faster without memory passing the ceiling.
-- `-Zcodegen-backend=cranelift` for test builds: `cargo test --no-run` time against LLVM at
-  `opt-level=0`, and that every test still passes; the tests' own run time is the cost.
-- cargo's checksum freshness (`-Zchecksum-freshness`): the incremental rebuild after a
-  `touch` with no content change, which mtimes rebuild and checksums do not; measure the no-op
-  build time.
-- `-Zprint-type-sizes`: one pass over the tree, sorted by size, the types above 64 bytes that
-  are held per item; each fat type found is a cost example's row.
-- `-Zrandomize-layout` in test builds: any test that starts failing relied on a layout no type
-  promised; the count of failures is the measure.
-- Miri's many-seeds mode (`-Zmiri-many-seeds`): the crates with `unsafe` (blaze-own,
-  blaze-kit, blaze-swiss) under 64 seeds; the measure is seeds that fail.
 
 ### Round 2 (2026-11-16)
 

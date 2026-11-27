@@ -73,9 +73,9 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let temps = self.if_let_open(e, cond, links.len())?;
         self.work.push(Task::IfThen { expr: e, else_, else_block, join, res });
         if temps {
-            self.work.push(Task::TempScopeEnd(cond));
+            self.work.push(Task::TempScopeEnd { anchor: cond, value: then });
         }
-        self.work.push(Task::ScopeEnd(then));
+        self.work.push(Task::ScopeEnd { expr: then, adjusted: true });
         self.work.push(Task::Eval(then));
         self.push_links(&links, else_block)
     }
@@ -102,8 +102,18 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     fn push_links(&mut self, links: &[ExprId], fail: Block) -> Result<(), BuildError> {
         for &x in links.iter().rev() {
             match self.expr(x)? {
-                Expr::Let { init, .. } => {
-                    self.work.push(Task::LetLink { expr: x, fail });
+                Expr::Let { pat, init } => {
+                    if self.is_uncaptured_outer_place(init)? {
+                        let t = self.adjusted_ty(init)?;
+                        let g = self.ground_ty(t).map_err(|error| Self::ty_err(init, error))?;
+                        if self.pat_does_not_read(pat, g)? {
+                            self.work.push(Task::LetLink { expr: x, fail, no_read: true });
+                            self.work.push(Task::PushNone);
+                            self.discard_uncaptured_place_effects(init)?;
+                            continue;
+                        }
+                    }
+                    self.work.push(Task::LetLink { expr: x, fail, no_read: false });
                     self.push_scrutinee(init)?;
                 }
                 _ => {
@@ -117,23 +127,26 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// Match arm guard `g` holding a `let` (an `if let` guard, core's `dec2flt`: `None if let
     /// Some(value) = parse_inf_nan(s, negative) => return Ok(value),`; or a chain with `&&`),
-    /// then the arm's `body`; every failed link to `next`, the next arm's block. The Reference,
-    /// "Match guards": the guard "may be ... a chain of conditions" whose `let` bindings are in
-    /// scope in the arm's body, and when it is false (a `let` fails) "control moves on to the
-    /// next arm". Built as an `if let` condition's links (`push_links`) in a region of its own
-    /// (lets/scope.rs) opened inside the arm's drop scope: a failed link drops what the region
-    /// holds then (`link_fail`), the matched path drops it after the body (a `Task::ScopeEnd`
-    /// of the body, which settles the body's value), before the arm's own bindings. A scrutinee temporary that needs drop is refused by name
-    /// (lets/scope.rs `let_anchor`: its temporary scope is not built for a guard).
-    pub(super) fn let_guard(&mut self, g: ExprId, body: ExprId, next: Block) -> Result<(), BuildError> {
+    /// then the arm's `body`; every failed link to `fail` (the next arm's block, or an or-pattern
+    /// arm's alternative dispatch block from `guard_alts_fail`). The Reference, "Match guards":
+    /// the guard "may be ... a chain of conditions" whose `let` bindings are in scope in the
+    /// arm's body, and when it is false (a `let` fails) "control moves on to the next arm" (or
+    /// next or-pattern alternative). Built as an `if let` condition's links (`push_links`) in a
+    /// region of its own (lets/scope.rs `if_let_open`) opened inside the arm's drop scope: a
+    /// failed link drops what the region holds then (`link_fail`), while the matched path applies
+    /// the arm's deferred moves (`Task::ArmMoves { from }`), evaluates `body`, drops the guard's
+    /// bindings and scrutinee temporaries (`Task::ScopeEnd(body)` + `Task::TempScopeEnd(g)`), and
+    /// then drops the arm's own bindings.
+    pub(super) fn let_guard(&mut self, g: ExprId, body: ExprId, fail: Block, from: u32) -> Result<(), BuildError> {
         let links = self.links_of(g)?;
-        if links.len() > 1 && !self.if_let_2024() {
-            return Err(unsupported(g, "a `let` chain before edition 2024 (chains are an edition-2024 form)"));
+        let temps = self.if_let_open(g, g, links.len())?;
+        if temps {
+            self.work.push(Task::TempScopeEnd { anchor: g, value: body });
         }
-        self.scope_marks.push(self.scope_pats.len() as u32);
-        self.work.push(Task::ScopeEnd(body));
+        self.work.push(Task::ScopeEnd { expr: body, adjusted: true });
         self.work.push(Task::Eval(body));
-        self.push_links(&links, next)
+        self.work.push(Task::ArmMoves { from });
+        self.push_links(&links, fail)
     }
 
     /// A `let`'s scrutinee as walk.rs's `match` pushes one: a local that needs drop is a
@@ -169,10 +182,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// `Task::LetLink`: `let` expression `l`'s scrutinee on top; its tests, a failure to
     /// `fail`; its bindings in the block where it matched, for the later links and the body.
-    pub(super) fn let_link(&mut self, l: ExprId, fail: Block) -> Result<(), BuildError> {
+    pub(super) fn let_link(&mut self, l: ExprId, fail: Block, no_read: bool) -> Result<(), BuildError> {
         let Expr::Let { pat, init } = self.expr(l)? else { return Err(malformed("a `let` link's task on another expression")) };
         let s = self.pop()?;
-        let srepr = if matches!(s, V::Unsized(..)) { Repr::None } else { self.adjusted_repr(init)? };
+        let srepr = if no_read || matches!(s, V::Unsized(..)) { Repr::None } else { self.adjusted_repr(init)? };
         // Owned as a `match`'s scrutinee (`owned_place`, as `let_else_test`): a place is tested
         // where it is (a local by its own scope, a place behind a pointer by no one here); a
         // temporary that needs drop joins the condition's region (`hold_temp`, anchored by
@@ -181,7 +194,11 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         // moves its part out by the local's field flags (`if let Some(frame) = frame`; walk.rs
         // `scan_flags` gave them, walk/moves.rs `scan_local_scrutinee`), as a `match` arm does.
         let m = self.matches.len() as u32;
-        let at = self.owned_place(m, init, init, s, srepr)?;
+        let at = if no_read {
+            self.no_read_at(init)?
+        } else {
+            self.owned_place(m, init, init, s, srepr)?
+        };
         // A non-dropping temporary slot made for the scrutinee (not held in `scope_pats` and not
         // a local): must end on the miss path and (unless `pat` borrows from it via `ref`) after
         // bindings on the match path so it cannot falsely stay live across a later `.await`.
@@ -235,14 +252,26 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
 
     /// `let P = init else { .. };` (statement `s`): its scrutinee, then `Task::LetElse`.
     pub(super) fn let_else(&mut self, s: StmtId, init: ExprId) -> Result<(), BuildError> {
-        self.work.push(Task::LetElse(s));
+        let stmt = self.body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past `stmts`"))?;
+        if let Stmt::Let { pat, .. } = stmt
+            && self.is_uncaptured_outer_place(init)?
+        {
+            let t = self.adjusted_ty(init)?;
+            let g = self.ground_ty(t).map_err(|error| Self::ty_err(init, error))?;
+            if self.pat_does_not_read(pat, g)? {
+                self.work.push(Task::LetElse(s, true));
+                self.work.push(Task::PushNone);
+                return self.discard_uncaptured_place_effects(init);
+            }
+        }
+        self.work.push(Task::LetElse(s, false));
         self.push_scrutinee(init)
     }
 
     /// `Task::LetElse`: statement `s`'s scrutinee on top. The tests; on a match the bindings,
     /// then on to a block the rest of the enclosing block continues in; on a failure the
     /// `else` block, which diverges (`Task::LetElseEnd`).
-    pub(super) fn let_else_test(&mut self, s: StmtId) -> Result<(), BuildError> {
+    pub(super) fn let_else_test(&mut self, s: StmtId, no_read: bool) -> Result<(), BuildError> {
         let stmt = self.body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past `stmts`"))?;
         let Stmt::Let { pat, init: Some(init), else_: Some(els), .. } = stmt else {
             return Err(malformed("a `let`-`else` task on another statement"));
@@ -252,13 +281,17 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(malformed("a drop scope left open inside a `let`-`else` initializer"));
         }
         let v = self.pop()?;
-        let srepr = if matches!(v, V::Unsized(..)) { Repr::None } else { self.adjusted_repr(init)? };
+        let srepr = if no_read || matches!(v, V::Unsized(..)) { Repr::None } else { self.adjusted_repr(init)? };
         // The scrutinee is owned like a match's (`owned_place`): a temporary that needs drop
         // joins the statement's temporaries with a word, and a binding by value moves its part
         // out of it. A local scrutinee keeps the place it has; a binding by value moves its
         // part out by the local's field flags (walk/moves.rs `scan_local_scrutinee`).
         let m = self.matches.len() as u32;
-        let at = self.owned_place(m, init, init, v, srepr)?;
+        let at = if no_read {
+            self.no_read_at(init)?
+        } else {
+            self.owned_place(m, init, init, v, srepr)?
+        };
         let scrut_slot = self.whole_slot(at.at).filter(|&slot| self.is_temp_slot(slot) && !self.slot_held(slot) && !self.slot_is_local(slot));
         let pass = self.create();
         let fail = self.create();

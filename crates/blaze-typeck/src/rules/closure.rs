@@ -88,12 +88,14 @@ fn sig_from_causes(inputs: Cause, output: Option<Cause>) -> SigFrom {
     }
 }
 
-/// An expected closure signature: the inputs, the output if known, and where it came from.
+/// An expected closure signature: the inputs, the output if known, where it came from, and
+/// any callable kind hinted by an enclosing trait bound.
 #[derive(Clone, Copy)]
 struct Expected {
     inputs: TyList,
     output: Option<Ty>,
     from: SigFrom,
+    kind: Option<crate::ty::ClosureKind>,
 }
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
@@ -106,7 +108,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             // is not the closure's: a closure is a safe Rust fn).
             TyView::FnPtr(l, _) => {
                 let (inputs, output) = self.fn_ptr_sig(l)?;
-                Ok(Some(Expected { inputs, output: Some(output), from: SigFrom::FnPtr }))
+                Ok(Some(Expected { inputs, output: Some(output), from: SigFrom::FnPtr, kind: None }))
             }
             TyView::Infer(Var { kind: VarKind::Ty, .. }) => {
                 let (Some(fn_), Some(fn_mut), Some(fn_once)) =
@@ -114,10 +116,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 else {
                     return Ok(None);
                 };
-                Ok(self.ty.closure_hint(t, [fn_, fn_mut, fn_once], Name::of("Output"))?.map(|((inputs, ic), out)| Expected {
+                Ok(self.ty.closure_hint(t, [fn_, fn_mut, fn_once], Name::of("Output"))?.map(|((inputs, ic, kind), out)| Expected {
                     inputs,
                     output: out.map(|(o, _)| o),
                     from: sig_from_causes(ic, out.map(|(_, oc)| oc)),
+                    kind: Some(kind),
                 }))
             }
             // rustc `deduce_closure_signature` on `ty::Dynamic`: a closure expected as
@@ -129,7 +132,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 else {
                     return Ok(None);
                 };
-                Ok(self.object_closure_sig(rows, [fn_, fn_mut, fn_once], fn_once).map(|(inputs, output)| Expected { inputs, output, from: SigFrom::Object }))
+                Ok(self.object_closure_sig(rows, [fn_, fn_mut, fn_once], fn_once).map(|(inputs, output, kind)| Expected {
+                    inputs,
+                    output,
+                    from: SigFrom::Object,
+                    kind,
+                }))
             }
             _ => Ok(None),
         }
@@ -148,10 +156,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mutable = self.lang(LangItem::AsyncFnMut)?;
         // Absent lang items cannot have a matching obligation. Include the
         // available members even in a world declaring just AsyncFnOnce.
-        Ok(self.ty.closure_hint(t, [shared.unwrap_or(once), mutable.unwrap_or(once), once], Name::of("Output"))?.map(|((inputs, ic), out)| Expected {
-            inputs,
-            output: out.map(|(o, _)| o),
-            from: sig_from_causes(ic, out.map(|(_, oc)| oc)),
+        Ok(self.ty.closure_hint(t, [shared.unwrap_or(once), mutable.unwrap_or(once), once], Name::of("Output"))?.map(|((inputs, ic, raw_kind), out)| {
+            let kind = match raw_kind {
+                crate::ty::ClosureKind::Fn if shared.is_some() => crate::ty::ClosureKind::Fn,
+                crate::ty::ClosureKind::FnMut if mutable.is_some() => crate::ty::ClosureKind::FnMut,
+                _ => crate::ty::ClosureKind::FnOnce,
+            };
+            Expected {
+                inputs,
+                output: out.map(|(o, _)| o),
+                from: sig_from_causes(ic, out.map(|(_, oc)| oc)),
+                kind: Some(kind),
+            }
         }))
     }
 
@@ -173,9 +189,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// gives the inputs `Args` (a tuple) and the output `R`. With no such row, an `Fn*`
     /// principal's `Args` gives the inputs alone, as a variable's pending `Fn*` goal does
     /// (`closure_hint`). `None` when no row names an `Fn*` trait at a tuple.
-    fn object_closure_sig(&mut self, rows: TyList, fn_traits: [ItemKey; 3], fn_once: ItemKey) -> Option<(TyList, Option<Ty>)> {
+    fn object_closure_sig(&mut self, rows: TyList, fn_traits: [ItemKey; 3], fn_once: ItemKey) -> Option<(TyList, Option<Ty>, Option<crate::ty::ClosureKind>)> {
         let output_name = Name::of("Output");
-        let mut from_principal = None;
+        let mut from_principal: Option<(TyList, Option<crate::ty::ClosureKind>)> = None;
+        let mut from_proj: Option<(TyList, Ty)> = None;
         // Bounded by the object's rows.
         for i in 0..self.ty.list_len(rows) {
             let row = self.ty.list_get(rows, i);
@@ -185,19 +202,29 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 {
                     let args = self.ty.shallow_resolve(self.ty.list_get(args_term, 0));
                     if let TyView::Tuple(inputs) = self.view(args) {
-                        return Some((inputs, Some(self.ty.list_get(args_term, 1))));
+                        from_proj = Some((inputs, self.ty.list_get(args_term, 1)));
                     }
                 }
                 TyView::ExTrait(k, args) if fn_traits.contains(&k) && self.ty.list_len(args) == 1 => {
                     let a = self.ty.shallow_resolve(self.ty.list_get(args, 0));
                     if let TyView::Tuple(inputs) = self.view(a) {
-                        from_principal = Some((inputs, None));
+                        let kind = if k == fn_traits[0] {
+                            Some(crate::ty::ClosureKind::Fn)
+                        } else if k == fn_traits[1] {
+                            Some(crate::ty::ClosureKind::FnMut)
+                        } else {
+                            Some(crate::ty::ClosureKind::FnOnce)
+                        };
+                        from_principal = Some((inputs, kind));
                     }
                 }
                 _ => {}
             }
         }
-        from_principal
+        if let Some((inputs, out)) = from_proj {
+            return Some((inputs, Some(out), from_principal.and_then(|(_, k)| k)));
+        }
+        from_principal.map(|(inputs, kind)| (inputs, None, kind))
     }
 
     /// `f.t` is the closure's type, `f.u` its output, `f.a` its return site, `f.b` the
@@ -234,6 +261,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }),
             };
             let sig_from = self.sig_from(expected, param_tys, pats.len(), ret)?;
+            let expected_kind = expected.and_then(|x| x.kind);
             let expected = expected.map(|x| (x.inputs, x.output));
             let mut inputs = self.closure_inputs(e, pats, param_tys, expected)?;
             // A sized rvalue hint (an async block's destination output: rules/coroutine.rs) is
@@ -267,7 +295,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             f.b = u32::from(self.diverges);
             self.ret_sites.push(f.a);
             self.async_sites.push(false);
-            self.closures.push(PendingClosure { expr: e, sig_from });
+            self.closures.push(PendingClosure { expr: e, sig_from, expected_kind });
             f.l = match hinted_output {
                 Some(hint) => self.mk_list(&[hint])?,
                 None => self.common.empty,
@@ -345,6 +373,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             None => self.deduce_sig(f.expect)?,
             Some(_) => None,
         };
+        let expected_kind = async_expected.or(call_expected).and_then(|x| x.kind);
         let sig_from = self.sig_from(async_expected.or(call_expected), param_tys, pats.len(), ret)?;
         let async_expected = async_expected.map(|x| (x.inputs, x.output));
         let call_expected = call_expected.map(|x| (x.inputs, x.output));
@@ -368,7 +397,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         f.a = self.new_coerce_many(body_out)?;
         f.b = u32::from(self.diverges);
         self.ret_sites.push(f.a);
-        self.closures.push(PendingClosure { expr: e, sig_from });
+        self.closures.push(PendingClosure { expr: e, sig_from, expected_kind });
         self.resume(f, 1)?;
         self.push_expr(body, Expectation::HasType(body_out), Then::CoerceMany(f.a))?;
         for (i, &p) in pats.iter().enumerate().rev() {

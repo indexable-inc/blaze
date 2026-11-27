@@ -801,7 +801,7 @@ impl PartialOrd for Edge {
 const MOST_WALKED: usize = 1 << 22;
 
 /// One unit of the checkout as the walk asks its rows (D191): its crate root's `FileItems`
-/// name, its view (blaze-drive view.rs `ViewKey::of_unit` of its crate key: the one spelling)
+/// name, its view (engine_body_plan.rs `unit_view`: the one spelling)
 /// and its crate key's prefix, which every key its checks cover begins with. Ordered by root,
 /// so the units of one root (a library and its test build) are one run.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -2152,6 +2152,31 @@ pub(crate) struct RunIds<'a> {
 }
 
 impl<'a> RunIds<'a> {
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests() -> RunIds<'static> {
+        struct EmptySlots;
+        static EMPTY_SLOTS: EmptySlots = EmptySlots;
+        impl ProofSlotLookup for EmptySlots {
+            fn slot_for_check(&self, _check: Name) -> &Slot { unreachable!("empty_for_tests has no checks") }
+            fn slot_for_fact(&self, _bodies: &[u8], _fact: &[u8; 32]) -> Option<&Slot> { None }
+            fn checked_count(&self) -> usize { 0 }
+            fn all_materialized(&self) -> bool { true }
+        }
+        RunIds {
+            toolchain: blaze_toolchain::PINNED,
+            toolchain_read: Read { fact: [0; 32], digest: [0; 32] },
+            producers: ContentId([0; 32]),
+            crates: &[],
+            grains: &[],
+            bodies: &[],
+            verdicts: &[],
+            edges: &[],
+            today: &[],
+            slots: &EMPTY_SLOTS,
+            from: None,
+        }
+    }
+
     /// The body ids of a command: `toolchain` the cut it opened, `crates` the `UnitGraph`
     /// record's crate list, `tools` its kinds' tools (home.rs `tools`), `workspace` the bodies
     /// of the checkout and `edges` the tree they were found by ([`workspace_of`]'s), and `answer`
@@ -3248,7 +3273,7 @@ mod delta_tests {
     fn unit_root(byte: u8, root: Name, is_test: bool) -> UnitRoot {
         UnitRoot {
             root,
-            view: ViewKey::of_member(&[byte], b"pkg", is_test),
+            view: ViewKey::of_member(blaze_drive::view::MemberView::simple(&[byte], b"pkg", is_test)),
             prefix: CrateItemKey(ContentId([byte; 32])).prefix(),
         }
     }

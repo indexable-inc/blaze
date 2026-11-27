@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: "The implicit state machines found on blaze's live path (165, by six read-only audits on 2026-11-20), the eight forms that encode a state in a type, and the 36 that can give a wrong answer, lose data or hang, in the order they are built."
+summary: "The implicit state machines found on blaze's live path (165, by six read-only audits on 2026-11-20), the eight forms that encode a state in a type, and the 33 of them still open that can give a wrong answer, lose data or hang, in the order they are built."
 date: 2026-11-20
 ---
 # States in types (D154)
@@ -67,8 +67,6 @@ The command (S2):
 12. A pool slot taken and released by convention: a linear `SlotLease`.
 
 Run, test and start (S3):
-13. A body stepped with no proof it may run (an unknown crate prefix, a row placed from the
-    start list): `Checked::runs(self) -> Result<Runnable, NotRunnable>`; the walk takes `Runnable`.
 14. `Certificate(pub [u8; 32])`: private, made only from the checked root.
 15. The parent's message order is checked by the child: `RunWriter<Opened>` to `<Native>` to
     `<Serving>`; only `Serving` publishes.
@@ -82,7 +80,6 @@ Store, core and std (S4):
     only `Mapped` lent for the store's life.
 20. A failed journal cut is swallowed and issued again without a count: a bounded try, then a
     typed stop.
-21. A written segment reaches the flip without its sync: `Synced<Writing>`.
 22. A watcher's read committed under its first stamp: `Read::verify(after) -> Verified<Look>`.
 23. A panic in a commit loses the lane's batches: a guard whose drop gives them back.
 24. A claim never published hangs its waiters: a linear `Claim` and `Woken`.
@@ -114,8 +111,6 @@ Names, macros and units (S6):
 34. A crate with a build script resolved without its script's cfgs: `UnjoinedInput` becomes a
     `CrateInput` only through `joined(unjoined, ScriptRead)`, and making `ScriptRead` records
     the read.
-35. A unit graph with missing manifests answers `Done`: `Pass::Partial(missing)`, which has no
-    `units()`.
 36. An expansion's reads pushed by hand at each builtin: a `Recorder` that is the only host.
 
 The P1 and P2 findings (129: a panic or a "cannot happen" error; clarity) are in the reports.
@@ -124,21 +119,20 @@ Each P1 that is S-size is taken with the P0 in its file.
 ## Lints, before types where a lint exists (rule 73)
 
 `blaze::held_across_wait`, `blaze::thread_local_in_waiting_fn` and `blaze::lock_across_wait`
-exist and are set to `Allow` (blaze-lint-defs lints.rs:58, :202, :299): they are turned on,
+exist and are set to `Allow` (blaze-lint-defs lints.rs:58, :212, :319): they are turned on,
 their findings fixed. New lints with fixes: an error variant used as "cannot happen" (`Unseen`,
 35 sites in blaze-cli) outside its documented arm; `.expect("checked ..")` on bytes a proof type
 exists for; a `pub` field on a type this document lists.
 
 ## Order
 
-1. Done by hand as found: the manifest read before the journal (9, 2026-11-20).
-2. The S-size P0s, one writer a file group, with the next wave: 7, 8, 10, 12, 14, 16, 20, 21, 23,
-   24, 28, 29, 32, 35, 36, and the three lints.
-3. The M-size P0s, each a whole port of its callers (rule 24), simulated where the tree has a
-   simulation of it (1 to 5 in blaze-engine's and blaze-answer's; 19, 21, 22, 26 in
-   blaze-cas's and blaze-core's): 1, 2, 3, 4, 5, 6, 9, 11, 13, 17, 18, 19, 22, 26, 27, 31, 34.
-4. The L-size: 30 (with D152's key change, which touches the same nodes), 15, 25, 33.
-5. The second audit: blaze-typeck, blaze-flow, blaze-flow-lower, blaze-lower, blaze-body, the
+1. The S-size P0s, one writer a file group, with the next wave: 7, 8, 10, 12, 14, 16, 20, 23,
+   24, 28, 29, 32, 36, and the three lints.
+2. The M-size P0s, each a whole port of its callers (rule 24), simulated where the tree has a
+   simulation of it (1 to 5 in blaze-engine's and blaze-answer's; 19, 22, 26 in
+   blaze-cas's and blaze-core's): 1, 2, 3, 4, 5, 6, 9, 11, 17, 18, 19, 22, 26, 27, 31, 34.
+3. The L-size: 30 (with D152's key change, which touches the same nodes), 15, 25, 33.
+4. The second audit: blaze-typeck, blaze-flow, blaze-flow-lower, blaze-lower, blaze-body, the
    builder.
 
 Judge of each: the illegal state named in its report no longer compiles (a `compile_fail` test

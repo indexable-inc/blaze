@@ -246,16 +246,21 @@ pub enum LocalForm<'s> {
 }
 
 /// What a body macro call expanded to, as the expander writes it: the expansion's words
-/// ([`blaze_expand::body_words`]) and the key of the call it expanded, which joins the body
-/// record's read list.
+/// ([`blaze_expand::body_words`]), the key of the call it expanded (which joins the body
+/// record's read list), and whether the expanded macro is defined in another crate (non-local).
 pub struct BodyOut<'a> {
     pub key: ContentId,
     pub words: blaze_expand::BodyWords<'a>,
+    /// Whether the macro that produced this expansion is defined in a crate other than the
+    /// body's own crate: rustc warns (`semicolon_in_expressions_from_non_local_macros`) on a
+    /// single trailing `;` in expression position from another crate's macro, while denying
+    /// (`semicolon_in_expressions_from_macros`) one from the crate's own (docs/support.md).
+    pub non_local: bool,
 }
 
 impl<'a> BodyOut<'a> {
     pub fn new_in(alloc: Alloc<'a>) -> BodyOut<'a> {
-        BodyOut { key: ContentId([0; 32]), words: blaze_expand::BodyWords::new_in(alloc) }
+        BodyOut { key: ContentId([0; 32]), words: blaze_expand::BodyWords::new_in(alloc), non_local: false }
     }
 }
 
@@ -547,7 +552,7 @@ impl<'a> ExpansionWords<'a> {
 fn first_word_mark(stream: &TokenStream<'_>, from: usize) -> Option<crate::mark_site::TextMark> {
     let tokens = stream.tokens();
     let at = (from..tokens.len()).find(|&i| matches!(tokens[i].kind, blaze_expand::TokenKind::Ident { .. }))?;
-    stream.hygiene(tokens[at].ctx).mark.map(crate::mark_site::TextMark::of)
+    tokens.get(at).and_then(|t| stream.non_transparent_mark(t.ctx)).map(crate::mark_site::TextMark::of)
 }
 
 /// The marks of the item's derive paths, in the order blaze-expand's `ItemAttrs::derives` lists

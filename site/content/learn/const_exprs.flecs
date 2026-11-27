@@ -1,5 +1,5 @@
 // Lesson: generic const expressions, blaze's own gate `blaze_const_exprs` (crates/hir-def/src/unstable_features.rs;
-// tests in crates/hir-ty-mir/src/tests/where_const.rs; ledger row E16). Not rustc's `generic_const_exprs`: concrete
+// tests in crates/hir-ty-mir/src/tests/where_const.rs). Not rustc's `generic_const_exprs`: concrete
 // arguments are compared by evaluating them, generic ones by a normal form over + - * and literals; nothing is solved
 // for. `where const { .. }` bounds are in docs/v2/plan/design/comptime.md.
 site {

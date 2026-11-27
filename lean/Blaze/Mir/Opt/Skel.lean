@@ -7,7 +7,7 @@ return target (`State.skel`), which a statement, an operand, a place and a write
 they were. The lemmas are those of `Opt/Ctl.lean`, for the whole frame with its locals
 emptied in place of the function, block and return target.
 
-Global dead-store elimination (ledger V11) relates two states with the same frames and
+Global dead-store elimination relates two states with the same frames and
 different slots; what it says of a frame (where it resumes, where its call writes) is said of
 this.
 -/

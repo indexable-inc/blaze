@@ -74,7 +74,7 @@ pub(crate) struct DefEntry {
     pub(crate) def: Def,
     pub(crate) vis: Visibility,
     pub(crate) origin: Origin,
-    pub(crate) expansion: u16,
+    pub(crate) expansion: u32,
     pub(crate) frag: u32,
     /// Its presence condition: a `blaze-cond` decision-diagram id, 0 for always. Reserved:
     /// cfg is evaluated under one configuration today, so every entry is 0.
@@ -83,7 +83,7 @@ pub(crate) struct DefEntry {
 
 /// The module's own text, or one call's expansion.
 pub(crate) struct Fragment<'a, N> {
-    pub(crate) expansion: u16,
+    pub(crate) expansion: u32,
     /// The call it is the expansion of, for a lookup that runs off the fragment's start.
     pub(crate) parent: Option<At>,
     pub(crate) slots: AVec<'a, Slot<N>>,
@@ -130,7 +130,7 @@ pub(crate) struct Hit {
     pub(crate) def: Def,
     pub(crate) vis: Visibility,
     pub(crate) origin: Origin,
-    pub(crate) expansion: u16,
+    pub(crate) expansion: u32,
     /// The fragment of this machine it was written in; `None` for a binding of another
     /// module or a prelude (which rustc's expansion order puts at the root).
     pub(crate) frag: Option<u32>,
@@ -206,7 +206,7 @@ pub(crate) struct Import<'a, N> {
     pub(crate) bound: Option<N>,
     pub(crate) types_only: bool,
     pub(crate) vis: Visibility,
-    pub(crate) expansion: u16,
+    pub(crate) expansion: u32,
     pub(crate) at: At,
     pub(crate) ns: [NsRes; 3],
     pub(crate) failed: Option<(u32, Unresolved)>,
@@ -249,7 +249,7 @@ pub(crate) struct Glob<'a, N> {
     pub(crate) site: UseSite,
     pub(crate) path: Path<'a, N>,
     pub(crate) vis: Visibility,
-    pub(crate) expansion: u16,
+    pub(crate) expansion: u32,
     pub(crate) at: At,
     pub(crate) source: Source,
     pub(crate) first: Option<Def>,
@@ -633,6 +633,8 @@ pub struct Resolver<'a, N> {
     pub(crate) prelude: Option<ItemKey>,
     /// The crate root's `#![blaze::arbitrary_ints]`: `u24`, `i80` are builtin types here.
     pub(crate) arbitrary_ints: bool,
+    /// The crate's effective macro expansion recursion limit (`#![recursion_limit = "N"]`).
+    pub(crate) recursion_limit: u32,
     pub(crate) tools: AVec<'a, N>,
     /// Sorted.
     pub(crate) builtin_attrs: AVec<'a, N>,
@@ -715,6 +717,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             macro_use,
             prelude: cr.head.prelude,
             arbitrary_ints: cr.head.arbitrary_ints,
+            recursion_limit: cr.head.recursion_limit,
             tools,
             builtin_attrs,
             frags: Vec::new_in(alloc),
@@ -853,12 +856,18 @@ impl<'a, N: Name> Resolver<'a, N> {
         resolved
     }
 
+    /// Maximum expansions this module may take in: at least [`MAX_EXPANSIONS`], scaled up to
+    /// accommodate the crate's accepted `#![recursion_limit]`.
+    pub(crate) fn expansion_budget(&self) -> usize {
+        MAX_EXPANSIONS.max(usize::try_from(self.recursion_limit).unwrap_or(usize::MAX))
+    }
+
     /// Adds one fragment (the module's text or a call's expansion), returning its index.
     pub(crate) fn add_fragment(
         &mut self,
         decls: &DeclsBuilder<'_, N>,
         call: Option<ItemKey>,
-        expansion: u16,
+        expansion: u32,
         parent: Option<At>,
     ) -> Result<u32, ResolveError> {
         let module = self.module;
@@ -968,12 +977,12 @@ impl<'a, N: Name> Resolver<'a, N> {
         for mr in decls.macro_rules.iter() {
             ordered.push((mr.pos, Slot::Rules { name: mr.name, def: mr.def, export: mr.export, shapes: mr.shapes }));
             if mr.export && expansion > 0 {
-                exports.push(TextualDef { name: mr.name, def: mr.def, expansion, shapes: mr.shapes });
+                exports.push(TextualDef { name: mr.name, def: mr.def, expansion: u16::try_from(expansion).unwrap_or(u16::MAX), shapes: mr.shapes });
             }
         }
         for c in decls.calls.iter() {
             let i = count(self.calls.len(), module)?;
-            let state = if expansion >= RECURSION_LIMIT {
+            let state = if expansion >= self.recursion_limit {
                 CallState::TooDeep
             } else {
                 self.unexpanded += 1;

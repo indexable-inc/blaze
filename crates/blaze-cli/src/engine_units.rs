@@ -1,4 +1,4 @@
-//! The `Units` stage of `blaze engine-check` (engine.md E6, second step): the records every later
+//! The `Units` stage of `blaze engine-check` (end-state.md D157): the records every later
 //! task's plan is made from, found forward before the first phase as the files are
 //! (engine_check.rs `plan`), each published by its task, entered once.
 //!
@@ -44,7 +44,7 @@
 //! profile's `plan:` line counts the rows read, the sources statted, the bytes written, the worlds
 //! built, the graph decodes and the fetched records mapped (floors 0 for the stats, bytes, worlds
 //! and decodes under the proof; the world and the decode are 1 until the world is read in place
-//! from the stored crate list, engine.md item 2).
+//! from the stored crate list, end-state.md D157).
 //!
 //! Anything else is a full discover, and the profile's phase line names why ([`UnitsCause`]). A
 //! stored record that cannot be read back is a typed refusal ([`BackRefused`]), never a quiet
@@ -265,7 +265,7 @@ pub(crate) struct PlanRows {
     /// Whether the sweep's [`Stood`] was handed to the stage.
     pub(crate) stood: bool,
     /// The names worlds made by the stage (names.rs `world`; floor 0 under a [`Stood`] once the
-    /// world is read in place from the stored crate list, engine.md item 2), and the graph
+    /// world is read in place from the stored crate list, end-state.md D157), and the graph
     /// decodes they made (floor 0 likewise).
     pub(crate) worlds_built: u32,
     pub(crate) graph_decodes: u32,
@@ -282,7 +282,7 @@ pub(crate) struct PlanRows {
 
 impl PlanRows {
     /// What making `names`' world did, counted into the line: nothing when the names were read
-    /// from the list and no world was made (its floor, engine.md item 2).
+    /// from the list and no world was made (its floor, end-state.md D157).
     fn world(&mut self, names: &Names<'_>) {
         let Some(made) = names.made() else { return };
         let opened = made.opened();
@@ -469,10 +469,15 @@ impl<'f> Discovered<'f> {
     }
 }
 
-impl Discovered<'_> {
+impl<'f> Discovered<'f> {
     /// The record of `name`, if it was made.
-    pub(crate) fn get(&self, name: Name) -> Option<&Published<'_>> {
-        self.published.binary_search_by(|one| one.name.cmp(&name)).ok().map(|at| &self.published[at])
+    pub(crate) fn get(&self, name: Name) -> Option<&Published<'f>> {
+        self.published.binary_search_by(|one| one.name.cmp(&name)).ok().and_then(|at| self.published.get(at))
+    }
+
+    /// Mutable reference to the record of `name`, if it was made.
+    pub(crate) fn get_mut(&mut self, name: Name) -> Option<&mut Published<'f>> {
+        self.published.binary_search_by(|one| one.name.cmp(&name)).ok().and_then(|at| self.published.get_mut(at))
     }
 
     /// How the Units task `name`'s result stands: owed to the next command when it failed for a
@@ -732,7 +737,7 @@ fn read_back<'f>(
         return Ok(Err(UnitsCause::World));
     }
     // The names from the crate list the record was sealed with (crate_list.rs version 6), read
-    // in place: no world made, no graph section decoded (engine.md item 2). The world is made by
+    // in place: no world made, no graph section decoded (end-state.md D157). The world is made by
     // need, from this record by its key, when a names, script or proc-macro task runs (names.rs
     // `made_or_make`). A list of an old home (version 5) is refused by its version and the graph
     // discovered in full (D160).
@@ -972,6 +977,7 @@ pub(crate) fn discover<'f>(
                         &cx,
                         root,
                         record.payload_bytes()?,
+                        graph.wasm_record_bytes(),
                         Some(lockfile.lock),
                         Some(graph.member_dirs()),
                         graph.mapped_slice(),
@@ -980,13 +986,13 @@ pub(crate) fn discover<'f>(
                     )
                 };
                 // The record sealed with the crate list as work.rs's arm seals it: its readers
-                // (a `Script` job, a macro module's lookup) open its two sections
+                // (a `Script` job, a macro module's lookup) open its sections
                 // (graph_payload.rs); unsealed, they were refused "no trailer mark". Version 6
                 // (crate_list.rs), written with the world (names.rs `world`): the planners' facts
                 // too, so a later request plans from the list alone.
                 match world {
                     Ok(made) => {
-                        record.out = crate::work::seal_graph(&mut record, sealed(made.list_bytes(), frame));
+                        record.out = crate::work::seal_graph(&mut record, sealed(made.list_bytes(), frame), graph.wasm_record_bytes());
                         crate::names::tell_public(store, &made);
                         names = Some(made);
                         Ok(record)
@@ -999,7 +1005,7 @@ pub(crate) fn discover<'f>(
                     Err(error) => {
                         let words = bstd::mem::format_in!(frame, "names not resolved: {error}");
                         record.find(crate::fetch::SOURCE_REFUSED, (0, 0), &[words.as_str()]);
-                        record.out = crate::work::seal_graph(&mut record, &[]);
+                        record.out = crate::work::seal_graph(&mut record, &[], graph.wasm_record_bytes());
                         Ok(record)
                     }
                 }

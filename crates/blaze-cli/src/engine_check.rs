@@ -1,4 +1,4 @@
-//! `blaze engine-check [dir] [--stats] [--workers N]` (engine.md E6): `check` driven through the
+//! `blaze engine-check [dir] [--stats] [--workers N]` (end-state.md D157): `check` driven through the
 //! execution engine (crates/blaze-engine) beside the old machine, until the switch makes it
 //! `check` itself and this word goes.
 //!
@@ -60,7 +60,7 @@ pub enum EngineCheckError {
     /// A part listed a file with no path beside it in its record.
     NoPath { name: Name },
     /// A wrapped function answered `Need`: `task` reads `read`, which its plan did not hand it.
-    /// The planner's bug, never a second entry (engine.md, "a task in the plan is entered once").
+    /// The planner's bug, never a second entry (end-state.md D157: a task in the plan is entered once).
     Unseen { task: Name, read: Name },
     /// [`EngineCheckError::Unseen`] of a file a crate's names task read (an `include!`, a
     /// `mod`'s file, a data file) that the file walk did not outline: named by the crate and the
@@ -329,7 +329,7 @@ pub(crate) fn run(
     }
 }
 
-/// `blaze why <file or file::item>` (engine.md E11), in the checkout blaze stands in: why its
+/// `blaze why <file or file::item>` (engine_why.rs), in the checkout blaze stands in: why its
 /// task was entered, step by step back to the edit (engine_why.rs).
 #[expect(clippy::too_many_arguments, reason = "the command's edge: each argument one specific capability")]
 pub(crate) fn why(
@@ -4286,9 +4286,10 @@ fn checking<'f, 's: 'f>(
                 // of the checkout's `.cargo/config.toml` reaches every unit's cfg.
                 let target = crate::graph::target_of(cx, &env, &laid_here.rustflags, program, &blaze_unit_graph::UnitKind::Lib, frame)?;
                 let host = crate::graph::target_of(cx, &env, &laid_here.rustflags, program, &blaze_unit_graph::UnitKind::BuildScript, frame)?;
+                let wasm_host = crate::graph::wasm_host_of(cx, &env, frame)?;
                 // PHASE-MEM-DEBT(Units): the unit graph on the process heap (graph.rs `Graph::of`,
                 // `heap: &'static Heap`): the request's; the graph is a record (`discover` puts it).
-                laid_here.graph = Some(crate::graph::Graph::of(parts, lockfile, units, target, host, true, heap, frame));
+                laid_here.graph = Some(crate::graph::Graph::of(parts, lockfile, units, target, host, wasm_host, true, heap, frame));
             }
             phases.mark_cx(cx, "plan (the graph's inputs: the profile's panic, the target's and the host's cfg)", frame);
             let mut discovered = {
@@ -4296,6 +4297,52 @@ fn checking<'f, 's: 'f>(
                 let back = crate::engine_units::Back::new(&answer_units);
                 crate::engine_units::discover(cx, root, &mut store, &mut laid_here, units, tools, &back, stood, &env, board, frame)?
             };
+            // After `UnitGraph` resolves, we know the exact set of `UnitKind::ProcMacro` crates
+            // (including registry/git proc-macros). Emit post-graph `MacroFiles` sweep rows ONLY
+            // for checkout path packages reached in `Cargo.lock` from those actual proc-macro
+            // roots (tagged `POST_GRAPH_MACRO` so edits preserve `Stood` graph read-back), and
+            // mix each proc-macro's own closure digest into its `MacroModule` task source
+            // (rules 21 & 60).
+            let closure_digests = if let (Some(lockfile), Some(members), Some(world)) = (
+                laid_here.lock.as_ref(),
+                crate::names::member_dirs(Some(&laid_here)),
+                discovered.names.as_ref(),
+            ) {
+                use blaze_world::crate_list::CrateGraph as _;
+                let list = world.list();
+                let proc_macros = (0..list.len())
+                    .filter(|&at| list.proc_macro(at))
+                    .map(|at| (list.package(at), list.version(at)));
+                let standing = (discovered.cause == crate::engine_units::UnitsCause::ReadBack)
+                    .then_some(followed_kept.as_ref())
+                    .flatten();
+                Some(crate::units::emit_proc_macro_lock_files(
+                    cx, root, &stamps, proc_macros, lockfile.lock, members, standing, &mut rows, frame,
+                )?)
+            } else {
+                None
+            };
+            if let Some(closure_digests) = closure_digests
+                && let Some(graph_pub) = discovered.get_mut(Name::unit_graph())
+                && let Ok(record) = &mut graph_pub.made
+            {
+                let graph_source = graph_pub.source;
+                for part in record.parts.iter_mut() {
+                    if part.name.kind == Kind::MacroModule {
+                        let closure_digest = closure_digests
+                            .binary_search_by_key(&part.name.subject, |(subject, _)| *subject)
+                            .ok()
+                            .and_then(|at| closure_digests.get(at))
+                            .map(|(_, digest)| *digest)
+                            .unwrap_or_else(crate::macro_files::empty_closure_digest);
+                        part.locate = blaze_drive::Locate::Source(crate::macros::part_source_with_files(
+                            graph_source,
+                            closure_digest,
+                            part.name.subject,
+                        ));
+                    }
+                }
+            }
             phases.mark_cx(cx, discovered.cause.phase(), frame);
             let kept = Kept { slots: &today_slots, answer: &start, records: &records, stored: stored.as_ref(), tools: &tools, read: core::sync::atomic::AtomicU32::new(0) };
             let mut found_last: SVec<'_, (Name, blaze_engine::pages::FilePlace)> = SVec::new_in(alloc);

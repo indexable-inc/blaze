@@ -1,6 +1,6 @@
 [package]
 name = "blaze-lint"
-description = "blaze's lints at item grain: each rule a pure function of one item's text, all rules run in one pass over its tokens, findings with item-relative ranges, template messages and fixes, no level (docs/v2/plan/design/lint.md)"
+description = "blaze's lints at item grain: each rule a pure function of one item's text, all rules run in one pass over its tokens, findings with item-relative ranges, template messages and fixes, no level (docs/v2/plan/design/lints-stage.md)"
 publish = false
 
 version.workspace = true

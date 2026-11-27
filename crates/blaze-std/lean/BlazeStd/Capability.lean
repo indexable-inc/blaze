@@ -1,5 +1,5 @@
 /-!
-Capability monotonicity and bounded-channel invariants for `blaze-std` (`bstd`, ledger row `S1`):
+Capability monotonicity and bounded-channel invariants for `blaze-std` (`bstd`):
 - `bstd::fs::Dir<P, Scope>` (`Scope := Subtree | Flat | Leaf`): narrowing a directory capability
   never grants access to paths previously disallowed, and `Flat` rejects nested paths.
 - `bstd::sync::Chan`: bounded FIFO channel push/pop preserve the fixed capacity bound and

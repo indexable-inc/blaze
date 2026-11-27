@@ -99,6 +99,11 @@ impl<'k> Effects<'k> {
             // D189: "A proc macro is `emits_surface`"; what it binds is not known either.
             MacroBody::BuiltinDerive { .. } | MacroBody::BuiltinOther(_) | MacroBody::Proc { .. } => return (MacroEffect::ANY, false),
         };
+        if mac.dollar_crate.is_some() {
+            // `$crate` in this macro names another crate than `def`'s owner: conservatively treat
+            // its effect as `ANY` rather than walking `$crate` in the wrong crate's root.
+            return (MacroEffect::ANY, false);
+        }
         let Some(root) = names.root_of(def) else { return (MacroEffect::ANY, false) };
         self.walk(names, def, root, texts, open)
     }
@@ -197,7 +202,7 @@ mod tests {
     }
 
     fn rules(name: &'static str, text: &'static str) -> MacroSrc<'static> {
-        MacroSrc { name, body: MacroBody::Rules(text), module: key("dep"), export: true, local_inner: false }
+        MacroSrc { name, body: MacroBody::Rules(text), module: key("dep"), export: true, local_inner: false, dollar_crate: None }
     }
 
     /// The `dep` crate: `format!`-shaped (one `$crate` call of `inner!`, an expression),
@@ -219,7 +224,7 @@ mod tests {
         def("writes", rules("writes", "() => { { impl $crate::Marker for u8 {} 0 } }"), export, "writes");
         def("binds", rules("binds", "() => { macro_rules! local { () => {} } }"), root, "binds");
         def("again", rules("again", "(@ $($a:tt)*) => { 0 }; ($($a:tt)*) => { $crate::again!(@ $($a)*) }"), root, "again");
-        let derived = MacroSrc { name: "derived", body: MacroBody::Proc { kind: blaze_surface::ProcKind::FnLike, helpers: "" }, module: root, export: true, local_inner: false };
+        let derived = MacroSrc { name: "derived", body: MacroBody::Proc { kind: blaze_surface::ProcKind::FnLike, helpers: "" }, module: root, export: true, local_inner: false, dollar_crate: None };
         def("derived", derived, root, "derived");
         names.push((root, Namespace::Types, "__export", export));
         Lists { names, defs, reads: core::cell::Cell::new(0) }

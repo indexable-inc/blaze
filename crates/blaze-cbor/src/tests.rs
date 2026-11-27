@@ -255,7 +255,7 @@ fn deep_nesting_reads_writes_and_drops_in_a_small_stack() {
     });
 }
 
-/// The field reader blaze-pack's and blaze-watch's records are read with, as it was moved.
+/// The field reader blaze-watch's records are read with, as it was moved.
 #[test]
 fn the_field_reader_reads_records() {
     let frame = Frame::with_reserve(4usize << 30, Tag::Codegen).expect("reserve");

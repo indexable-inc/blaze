@@ -203,7 +203,7 @@ pub fn on(workers: &dyn Workers) -> Radix<'_> {
 ///
 /// Deprecated, as each free sort here is: sorts with [`Radix::AMBIENT`]'s hook; use
 /// `radix::on(workers).sort(..)` or `Radix::SERIAL.sort(..)`. The free sorts go with their last
-/// callers (blaze-v2-proof, blaze-format-tiers, blaze-resolve, blaze-core's uring, blaze-manifest,
+/// callers (blaze-v2-proof, blaze-resolve, blaze-core's uring, blaze-manifest,
 /// syntax-tree, blaze-ids, blaze-graph, syntax; listed in wave-1124-sansio, W1 group a's report).
 pub fn sort<K: Key>(keys: &mut [K]) {
     Radix::AMBIENT.sort(keys);

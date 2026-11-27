@@ -205,6 +205,16 @@ No compiler's source or output is a source; every test expectation below is stat
   (a flag on the place row, next leg).
 - Async bodies are checked before the coroutine transform, as plain bodies with `yield` as a
   `Call`; loans live across a yield are a finding of the coroutine layer.
+- **Accepting more than rustc, opt-in (not built).** Five rustc UI tests are rejected by the
+  Polonius alpha and accepted by datalog Polonius: `nll/polonius/iterating-updating-cursor-issue-57165.rs`,
+  `-63908.rs`, `-108704.rs` (a linked-list cursor with a conditional reborrow),
+  `nll/polonius/flow-sensitive-invariance.rs` (an invariant value returned on two branches as two
+  lifetimes) and `nll/issue-46589.rs` (`*x = match (*x).get() { Some(s) => s, None => (*x).new() }`).
+  A crate that opts in would have them accepted, and its checker accepts a superset of the default
+  checker's set, never less: every body the default accepts, it accepts, and where the default
+  reports errors its errors are a subset of them. With no opt-in, a body is judged exactly as rustc
+  judges it (rule 4). Open: whether tier two's rules as stated already accept these five, and if
+  they do, which tier keeps the default verdict equal to rustc's. The five tests are fixtures either way.
 
 ## 10. The lowering (crates/blaze-flow-lower)
 
@@ -277,37 +287,8 @@ Named questions (their answers' shapes):
   checker (moved twice, moved once, move while borrowed, move after last use). Each has a control
   with a planted bug (`AllCopy`, `NoRelate`) that hides the finding, and each prints the findings
   it gets. Both crates use blaze-own (no `alloc`).
-- The census (crates/blaze-ladder/tests/flow_census.rs; first run, flow-census-1.txt in
-  port27/flow-1116), whose head line reads: "bstd: clean bodies 2116; lowered 1247; refused 869;
-  tier one accepts 924; tier two accepts 9; findings 1323 (in 314 bodies)". Per lowered body in a
-  debug build: lowering 57.7 µs, move check 118.8 µs, tier one 151.6 µs. Tier two takes 46.4 ms
-  per body sent (323 sent): it is dense and is the floor's problem.
-  Refusals by form: CallWritesLifetimes 377 (H1), UnknownAdt 322, Closure 130,
-  ElisionAmbiguous 32, OrPatternBinding 3, PeelUnderAdtField 3, StructUpdate 2. Findings: 1180
-  UnprovenOutlives and 143 Invalidated. No move findings.
-
-## Census 1, by class
-
-From flow-census-1.txt (port27/flow-1116): 1323 findings in 314 bodies, every one a false
-positive. Classes by the text at the finding; "cause" is read from the lowering's code, and where
-it says "supposed" no flow was printed to confirm it. Sources: the Reference says what a
-signature means ("Lifetime elision", "Lifetime bounds", "Subtyping and variance"); what a body
-may do with those lifetimes is RFC 2094 and Polonius as sections 3 to 5 state them: the design
-is the source there, not the Reference.
-
-| Class | Count | Example (body: the finding's words) | Cause | State |
-|---|---|---|---|---|
-| A tuple of two parameters | 874 | derived `eq`: UnprovenOutlives 50..66 `( self , other )` | INPUT: `aggregate` made every position of a tuple's operands equal through one origin, so `(self, other)` related the two parameters' lifetimes. Right: `(a, b): (A, B)` relates nothing between `A` and `B` (the Reference, "Subtyping and variance": a tuple is covariant in each field) | fixed: each element is related to its own field (`relate_at`) |
-| A call with two reference arguments | 100 | derived `eq`: UnprovenOutlives 63..187 `$crate::cmp::PartialEq::eq(a_self, a_other)` | INPUT: a call of unknown or generic signature made every position of its operands equal. Right: a reference passed by value is covariant in its own lifetime (RFC 2094, "Subtyping") | fixed: `unify_call` lets a reference operand's first position only flow in |
-| `Self` returned by a `&self` method | 64 | derived `clone`: UnprovenOutlives 41..51 `{ * self }` | INPUT: `return_place` gave every position of the output the receiver's lifetime; the Reference's elision assigns it to ELIDED output lifetimes only, and `Self`'s are the impl's | fixed when the lifetime part is read: `Self`'s positions are `Region::SelfTy` |
-| Other returns, struct literals, `x.clone()` | 142 | `<impl Written>::of`: UnprovenOutlives 68..141 `File { io: io.clone(), name, .. }`; `<impl Cx>::io`: 133..160 `{ &self.world }` | INPUT (supposed): the same three causes through a struct literal (related as a call of unknown signature) and through returns of bodies whose signature writes lifetimes | census 2 decides |
-| A live loan invalidated in a derived body | 131 | derived `fmt`: Invalidated 279..751 `{ let mut ra_expand_builder = ..` ; derived `eq`: 172..442 | INPUT (supposed): `b.field(..)` with `b: DebugStruct<'_, '_>` and no signature: the receiver's loan flowed through the call's one origin into `b`'s own lifetime position, live while `b` is | fixed only where the callee's lifetime part is read (the loan then flows to the result alone); else open |
-| A live loan invalidated elsewhere | 12 | `<impl Entered>::enter`: Invalidated 259..275 `CURRENT.set(run)`; `<impl Run>::current`: 263..276 `CURRENT.get()` | not read; `CURRENT` is a thread-local or a static: supposed a borrow of a static taken as a local's | open |
-
-Refusals (869): CallWritesLifetimes 377 (now lowered when the callee's lifetime part is read),
-UnknownAdt 322 (the census now asks the store for each ADT before lowering), Closure 130,
-ElisionAmbiguous 32 (the same as the first), OrPatternBinding 3, PeelUnderAdtField 3,
-StructUpdate 2.
+- The census over bstd's bodies: crates/blaze-ladder/tests/flow_census.rs. Tier two is dense
+  (tens of ms a body sent, debug build): the floor's problem.
 
 ## What the signature must say (H1)
 
@@ -330,15 +311,13 @@ declared bounds, and per field its regions in the ADT's own parameters (so a str
 field projection relate each field exactly). Per impl head: the regions of its self type, so
 `Self` in a method is its impl's lifetimes and not a separate region.
 
-Until the heads carry it, the census reads it from the fn's own TEXT (`sig::read_signature`: a
-stand-in, said so in its doc). It refuses by name what it cannot line up and never guesses. Its
-known gaps, each of which can only refuse a correct body, never accept a wrong one: `Self` is a
-region apart from the impl's named lifetimes (`impl<'a> T<'a> { fn f(&self, x: &'a u8) -> ..`
-sees `Self`'s lifetime and `'a` as unrelated); the impl's declared bounds are not read; an ADT
-written with two different lifetimes is refused (`TwoLifetimesOneOrigin`); a type alias with
-positions is refused (`Unaligned`).
+The head lowering produces this once, as region columns beside the erased types
+(crates/blaze-typeck/src/regions.rs, region_facts.rs); nothing reads a signature's text for
+lifetimes (`read_signature` is banned: crates/blaze-flow-lower/src/text_reader_ban_tests.rs).
+Regions moving into the types themselves, and the one call rule, are end-state.md D156; the
+old call paths are frozen (D190).
 
-## The signature in the flow (leg 2; written, see BUILD-STATUS.md for what compiled)
+## The signature in the flow
 
 - Own signature (`Lower::signature`): one placeholder per region; each position of each parameter
   and of the return place takes its region's placeholder. Known among them, and nothing else:
@@ -347,14 +326,11 @@ positions is refused (`Unaligned`).
   is well formed). The check then refuses any `subset` between two placeholders outside the
   closure of these (section 4's `subset_errors`), and any loan of a local that reaches a
   placeholder (placeholders are live everywhere, so it is live at the local's `StorageDead`).
-- A call (`call_by_signature`): the callee's regions get fresh origins per call (`'static` is the
-  body's); operands flow into their parameter's regions and the output's regions into the
-  destination (a reference's first position one way, the rest both ways); the callee's declared
-  and implied bounds are added as subsets. A callee whose lifetime part is not read keeps the
-  older paths (elision by `CalleeFacts`, refusal when it writes lifetimes, one origin for all
-  when its head is unknown or its generic arguments carry origins).
-- Elided `&self` calls also flow every other position of the receiver into the output (before,
-  `self.items.iter()` on `&'a Vec<&'b T>` left `'b` unrelated to the result: a missed error).
+- A call: the callee's regions get fresh origins per call (`'static` is the body's); operands
+  flow into their parameter's regions and the output's regions into the destination; the
+  callee's declared and implied bounds are added as subsets. The one call rule is D156.
+- Elided `&self` calls also flow every other position of the receiver into the output
+  (`self.items.iter()` on `&'a Vec<&'b T>` relates `'b` to the result).
 - Fixtures: crates/blaze-flow/src/tests.rs `signature_*` (ten, by hand-built flows: accept by
   the same lifetime, elision, a declared bound, an implied bound, `&self`, a reborrow through
   `&mut`; refuse the other argument's lifetime, a local's reference, the implied bound reversed;
@@ -362,137 +338,8 @@ positions is refused (`Unaligned`).
   (nine through the real type checker: the reader's rules, each fix with the nearest wrong
   program, controls `NoKnown`, `TupleUnified`, `HubBothWays`).
 
-## Census 3 (12:44, tree 11d224a93a, through mixcheck; census 2 never ran)
+## Open
 
-"bstd: clean bodies 2223; lowered 1756; refused 467; tier one accepts 1427; tier two accepts 126;
-findings 536 (in 206 bodies)" (was: lowered 1247, refused 869, findings 1323 in 314). Signatures:
-own lifetime part read in 1702 bodies; 3265 calls related through the callee's; texts not read:
-ElisionUndecided 52, Unaligned 7, Token 5. Refused: Closure 198, CallWritesLifetimes 189,
-ElisionAmbiguous 30, UnknownAdt 25, PeelUnderAdtField 9, StructUpdate 6, TypeNode 6,
-OrPatternBinding 4. Findings: 309 UnprovenOutlives, 224 Invalidated, 3 moves. The goal (under
-100) is NOT met. By method, none of them diagnosed from a printed flow yet:
-
-- Invalidated in `fmt` 84 (derived, and hand-written `write!(f, ..)`): the `format_args!` path
-  (`aggregate` with `fmt`, now related by `unify_call`) and `f.debug_struct(..)` builders.
-- UnprovenOutlives 68 and Invalidated 66 in derived `eq`, at a `$crate::..` path call inside the
-  match: 12 + 12 more in `cmp` and `partial_cmp`. Supposed: bindings under a peeled reference
-  pattern have inexact places, so `unify_call`'s one-way rule does not apply to them.
-- UnprovenOutlives in `fmt` 40, `new` 32, `clone` 28, `only` 15: struct literals with a field
-  from a parameter (`File { io: io.clone(), name, .. }`, `Given { cx, .. }`) and `x.clone()`:
-  a struct literal is still a call of unknown signature (needs H1's ADT part).
-- `CURRENT.get()` / `CURRENT.set(..)` (a thread-local static): Invalidated, about 8.
-- Three MOVE findings, new because their bodies are newly lowered: `Shares::split` (UseOfMoved
-  at a struct literal), `Shares::whole` (MoveOut(Deref) at `*unsafe { Box::from_raw(..) }`: a
-  `Box` deref lowered as `Deref`, not `DerefBox`), `Pool::run_now` (UseOfMoved at
-  `(head.release)(job.0)`).
-
-## Lifetimes are produced once and carried beside the types (D148, the coordinator's design, 2026-11-19)
-
-MEASURED (tempo, 16,556 bodies): 1,895 bodies are not borrow-checked; about 1,400 of them because
-the flow REBUILDS lifetimes from source text in its own readers (crates/blaze-flow-lower sig.rs and
-sig/*, front2 lifetimes.rs, borrows.rs's per-body loop: about 6,000 lines) and lines them up with
-the erased types by position. Two counters differed by design (`SigPositionsUnaligned`, 382
-bodies); each lifetime-carrying feature had its own reader and its own refusal class. Rule 66's
-outside review (2026-11-19) and three failed rounds on one conversion say: rebuild.
-
-THE RULE: a declared type's lifetimes are produced ONCE, by the head lowering, in the same walk
-that interns the erased type, as a REGION COLUMN: one slot per region position of the type, in the
-type's own pre-order. Types stay erased (interning, keys and the trait solver do not change). The
-definer stores the columns in its head record; every reader takes them from there. Nothing reads a
-signature's text for lifetimes again. Body types carry no column: a body's regions are inferred by
-the flow, which gives every position a fresh origin, as now.
-
-One home (rule 30), built: crates/blaze-typeck/src/regions.rs (`Region { Static, Param(u32),
-Late { binder, var } }`, `region_arity`, `slots`, `each_slot_node`, `RegionCol::lay`, `Numbering`,
-`LifetimeParams`). `Param(i)` numbers the container's lifetimes, then the item's own in DECLARATION
-order, then one per elided input lifetime; never by first appearance. Elision (the Reference's three
-rules), the trait-object default and early/late-bound are decided once, by the definer; E0106 is a
-head error.
-
-THE CONTRACT every piece writes against (crates/blaze-typeck/src/region_facts.rs, piece L2 makes
-the file exactly so; pieces written before it exists use these names):
-
-```rust
-/// What one head's lowering produced (pieces L1a, L1b fill it; L2 stores it).
-pub struct HeadRegions<A: Allocator> {
-    pub params: LifetimeParams<A>,
-    /// A fn: laid over `FnPtr(inputs.., output)`; `child(k)` is input k, the last child the output.
-    pub sig: Option<RegionCol<A>>,
-    /// An async fn's WRITTEN return type (the future's output).
-    pub written_output: Option<RegionCol<A>>,
-    /// One per where-clause or bound, in the head's clause order (`nth`).
-    pub clauses: Vec<ClauseRegions<A>, A>,
-    pub outlives: Vec<Outlives, A>,
-    /// An ADT: (variant, field, the field type's column).
-    pub fields: Vec<(u32, u32, RegionCol<A>), A>,
-    /// An impl: its self type's column and its trait reference's.
-    pub impl_header: Option<(RegionCol<A>, Option<RegionCol<A>>)>,
-    /// An opaque type: how many lifetimes it captures (edition rules and `use<..>` applied).
-    pub opaque_captures: Option<u32>,
-}
-pub struct ClauseRegions<A: Allocator> { pub nth: u32, pub binders: u32, pub col: RegionCol<A> }
-pub enum Outlives { Type { clause: u32, region: Region }, Region { long: Region, short: Region } }
-
-/// What a reader asks (the flow lowering's `Facts` supplies it from head records).
-pub trait RegionFacts {
-    fn sig(&self, item: ItemKey) -> Result<SigRegions<'_>, RegionsUnread>;
-    fn clauses(&self, item: ItemKey) -> Result<&[ClauseView<'_>], RegionsUnread>;
-    fn outlives(&self, item: ItemKey) -> Result<&[Outlives], RegionsUnread>;
-    fn field(&self, adt: ItemKey, variant: u32, field: u32) -> Result<ColView<'_>, RegionsUnread>;
-    fn impl_header(&self, impl_: ItemKey) -> Result<(ColView<'_>, Option<ColView<'_>>), RegionsUnread>;
-    fn opaque_captures(&self, opaque: ItemKey) -> Result<u32, RegionsUnread>;
-    fn lifetime_params(&self, item: ItemKey) -> Result<ParamsView<'_>, RegionsUnread>;
-}
-pub struct SigRegions<'a> { pub params: ParamsView<'a>, pub col: ColView<'a>, pub written_output: Option<ColView<'a>> }
-/// Why a head's regions were not read: the item named, the cause typed (rule 19); never a guess.
-pub struct RegionsUnread { pub item: ItemKey, pub why: UnreadWhy }
-pub enum UnreadWhy { NoHead, HeadRefused, RecordForm { found: u32 } }
-```
-
-`ColView` and `ParamsView` are borrowed reads of a stored `RegionCol` and `LifetimeParams` (slots by
-index, `own()`, `child(k)`; count, `is_late(i)`, outlives pairs): the same reads the owned types give.
-
-At a call the flow maps each callee `Param(i)` to one fresh origin a call and each `Late` to one a
-call a variable; type-parameter positions come from the call's erased argument types counted by
-`region_arity` (the one counter; `npos` is it). A closure's signature regions come from the clause
-that expected it: the checker records WHERE the expectation came from (`SigFrom::Clause { expr, nth }`,
-`Written`, `Inferred`; `Object` and `FnPtr` refused by name at first), never a copy; `Late` slots are
-universal origins of the closure body, the others are the OWNER's origins and their relations
-become owner constraints. A by-reference capture's loan lives as long as the closure value
-(`let read = || value; value = 1; read();` is E0506: unreported today, the first control of piece L5).
-
-Pieces, written at once against the contract (one writer each, files disjoint):
-- **L1a** the fn-signature producer: front2 types.rs (`RegionSink` beside each intern), heads.rs.
-- **L1b** clauses, ADT fields, impl headers, opaque captures: front2 preds.rs, typeck world.rs
-  (`PClause::TypeOutlives`, `RegionOutlives`), a new front2 heads_regions.rs.
-- **L2** region_facts.rs and the head record, VERSION 22: front2 head_record.rs; restore equals fresh.
-- **L3** the fn consumer: front2 borrows.rs, flow-lower lib.rs `signature()`, sig.rs reduced to views.
-- **L4** the clause consumer: front2 call_generics.rs, borrows_ties.rs; flow-lower trait_ties.rs,
-  generic_call.rs, param_outlives.rs.
-- **L5** closures: typeck rules/closure.rs, infer/mod.rs `closure_hint`, columns.rs; flow-lower
-  closure.rs; front2 borrows_nested.rs.
-- **L6** (after the build) deletions: sig/{alias,impl_life,outlives,value}.rs, lifetimes.rs,
-  borrow_sig_world.rs, sig_impl.rs, async_output.rs, and a ban on `read_signature`.
-First controls, each piece: `fn f<'a, 'b>(y: &'b u8, x: &'a u8) -> &'a u8` called so that confusing
-'a and 'b accepts a dangling borrow is E0597; `fn g<T: 'static>(t: T)` given `&local` is refused.
-NOT of this family (other work): a future's auto traits from another fn's witness, hidden-type
-questions, unnormalised projections (about 220 bodies), a mod in a macro-written block.
-
-## For a successor
-
-- Read BUILD-STATUS.md for the last lines of blaze-flow, blaze-flow-lower and the census; the
-  census output is port27/flow-1116/flow-census-2.txt. Compare its head line with "findings 1323
-  (in 314 bodies)" and its new line "signatures: ..", which says how many signature texts were
-  not read and why: the largest refusal there is the next thing to teach `read_signature`, or
-  the first thing H1 replaces.
-- Invalidated in derived `fmt` and `eq` (131): print one flow (`Flow::print`) and confirm or
-  drop the supposed cause in the table above before changing anything.
-- A struct literal is related as a call of unknown signature: exact per field needs the ADT part
-  of H1.
-- The implied-bound fixture through the type checker needs a deref expression in the fixture
-  body builder (`Bb`); only the hand-built flow covers it today.
-- Refusals next: Closure 130 (captures as an `Aggregate` of borrows and moves, section 1), then
-  whatever census 2 lists first.
 - T1 and T2 (section 10) are unanswered.
 - Tier one cannot accept a MUTABLE reborrow returned into a placeholder (`fn h<'a>(x: &'a mut
   (u8, u8)) -> &'a mut u8 { &mut x.0 }`): the loan is live everywhere, so its own issuing borrow
@@ -501,27 +348,5 @@ questions, unnormalised projections (about 220 bodies), a mod in a macro-written
   accessor goes to tier two, which costs 46 ms a body today: the dense tier two is the floor's
   problem, and this is its first common customer. Excusing a loan's own statement in tier one is
   NOT sound (in a loop the earlier iteration's loan is live there).
-- The hole "an unknown callee cannot say `'static`" is CLOSED (leg 3): a call whose head is
-  unknown, with an argument or result that carries a lifetime, is refused (`Form::CalleeUnknown`);
-  a call through a value is related by the value's own signature, read from the written type of
-  the body's parameter it is (`sig/value.rs`, `read_callable_param`: fn pointers, `dyn Fn`,
-  `impl Fn`, `F: Fn(..)`; every region but `'static` fresh per call, `'static` the body's), else
-  refused (`Form::CalleeValueUnknown`). Still to do there: the census's facts must answer
-  `Facts::own_text`; a callable that names the enclosing fn's lifetime, or is a field or a
-  local, is refused until T3 exists.
-- STILL OPEN, the same hole in other clothes: (1) a struct literal or ctor whose field type
-  writes `'static` (`struct K { r: &'static u8 }`, `K { r: &local }`) is related through one
-  origin and accepted: needs the ADT part of H1, or a refusal until then; (2) a known head that
-  writes no lifetime but whose bounds imply one (`T: Any`) called with generic arguments that
-  carry origins keeps the one origin.
-- The 131 "invalidated in a derived `fmt`": cause confirmed by putting it back
-  (`Plant::UnknownUnified`, fixture `a_builder_chain_keeps_each_loan_in_its_result`): the one
-  origin of an unknown-head call carried the receiver's loan into the receiver's own lifetime
-  position. Such calls are now by signature (accepted) or refused; none is related that way.
-- Closures: a closure expression is lowered as the borrows and moves of its captures
-  (`closure_value`; its type's positions are its captures'), and a call of it borrows the
-  closure value by its kind. Its BODY is not lowered, so the form stays refused unless the
-  caller says it checks closure bodies (`Facts::closure_bodies_checked`, default false). NEXT:
-  lower each closure body as its own flow (captured locals as inputs: by value like a
-  parameter, by reference never dropped there), then answer `true` in the census. A closure
-  call whose arguments or result carry a lifetime is refused (`CalleeValueUnknown`).
+- A call whose callee's regions are not read is refused by name (`RegionsUnread`), never related
+  through one origin; D156's one call rule is where every call is related.

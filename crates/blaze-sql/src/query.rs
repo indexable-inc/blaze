@@ -1,6 +1,6 @@
-//! The query grammar's tree (docs/v2/plan/design/query.md): what [`crate::parse::parse_script`]
-//! and [`crate::parse::parse_query`] make for blaze-rel, the profile's query engine. It is the
-//! analytic SQL the profile's views are written in (DuckDB's dialect, as far as they use it):
+//! The query grammar's tree: what [`crate::parse::parse_script`] and
+//! [`crate::parse::parse_query`] make. It is the analytic SQL the deleted build profile's views
+//! were written in (DuckDB's dialect, as far as they used it), and has no user now:
 //! `with [recursive]`, set operations, derived tables, every join form they use, `filter`,
 //! windows, `qualify`, `group by all`, subqueries and `::`.
 //!

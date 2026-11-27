@@ -130,7 +130,7 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
         let mut at_module = site.module;
         let mut local_type = None;
         let (found, via_glob) = match super::scope_table::value_prefix(
-            &self.resolver(), &self.store.locals, self.owner, self.module, Some(scope.0), first, written.len() == 1, mark, self.store.work_alloc(),
+            &self.resolver(), &self.store.locals, self.owner, self.module, Some(scope.0), first, written.len() == 1, ns, mark, self.store.work_alloc(),
         ) {
             Ok(prefix) => prefix,
             Err(gap) => return self.gap(Gap::Local(gap)),
@@ -270,6 +270,30 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
             Err(ResolveError::Path(e)) => {
                 if let Some(i) = shadowed_ty_param {
                     return Ok(Ok(PathRes { def: Def::TyParam(i), consumed: 1 }));
+                }
+                // A single-segment value path that skipped a block type-only `use` (e.g.
+                // `use foo::bar::{self}; bar()`) and found no value outward still reports the
+                // type-only `use` as `NotAValue` rather than an unresolved name.
+                if segments.len() == 1
+                    && ns == Ns::Value
+                    && via_use.is_none()
+                    && via_glob.is_none()
+                    && local_type.is_none()
+                    && let Some(row) = self.store.locals.find(self.owner, Some(scope.0), first, LocalNs::Value)
+                    && row.kind == LocalKind::Use
+                {
+                    let mut use_module = self.module;
+                    if let Some(&head) = row.path.first()
+                        && !row.abs
+                        && let Some(item) = self.store.locals.find(self.owner, Some(row.scope), head, LocalNs::Type).filter(|r| r.kind.in_block_module())
+                        && let Some(m) = item.module
+                    {
+                        use_module = m;
+                    }
+                    let use_dollar = if row.abs { None } else { super::glob_uses::dollar_of(row.path.first().copied(), row.first_mark) };
+                    if let Ok(t) = self.resolver().path_with(use_module, use_dollar, row.abs, row.path, Ns::Type) {
+                        return Ok(Err(PathMiss::At { segment: 0, after: None, why: MissWhy::NotAValue(checker_of(t.key)) }));
+                    }
                 }
                 // rustc_resolve late.rs `resolve_qpath`: a path of two or more segments that
                 // fails, whose first segment is a builtin type's name, is that builtin type
@@ -504,7 +528,7 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
                 return Ok(None);
             }
             if !matches!(super::scope_table::value_prefix(
-                &self.builder.resolver, self.locals, self.owner, self.env.module, Some(scope.0), first, texts.len() == 1, view.mark_of_path(p)?, tys.alloc(),
+                &self.builder.resolver, self.locals, self.owner, self.env.module, Some(scope.0), first, texts.len() == 1, Ns::Value, view.mark_of_path(p)?, tys.alloc(),
             ), Ok((None, None))) {
                 return Ok(None);
             }
@@ -559,14 +583,43 @@ impl<'n, H: super::types::Heads, S: super::source::NamesSource<'n>> AliasPaths<'
             return Ok(None);
         }
         let own = written.get(at as usize).copied().unwrap_or(&[]);
-        let args = if own.is_empty() {
+        let consts = super::types::Heads::const_params(self.builder.heads, target.key).ok_or(Why::Need(target.key))?;
+        let mut stamped = OwnVec::new_in(alloc);
+        let own_in: &[PTy] = if own.is_empty() || consts.is_empty() {
+            own
+        } else {
+            stamped.reserve(own.len());
+            for (idx, &a) in own.iter().enumerate() {
+                let mut a = a;
+                if let Some(&(_, want_ty)) = consts.iter().find(|&&(ci, _)| usize::try_from(ci).ok() == Some(idx))
+                    && let Some(&PNode::ConstValue { ty, bits }) = tys.view().get(a)
+                    && matches!(tys.view().get(ty), Some(PNode::Infer))
+                {
+                    a = super::types::intern(tys, PNode::ConstValue { ty: want_ty, bits })?;
+                }
+                stamped.push(a);
+            }
+            &stamped
+        };
+        let mut args = if own_in.is_empty() {
             let hole = super::types::intern(tys, PNode::Infer)?;
             let mut holes = OwnVec::with_capacity_in(generics as usize, alloc);
             holes.resize(generics as usize, hole);
             holes
         } else {
-            super::types::with_defaults(tys, own, generics, super::types::Heads::alias_defaults(self.builder.heads, target.key), shown, r)?
+            super::types::with_defaults(tys, own_in, generics, super::types::Heads::alias_defaults(self.builder.heads, target.key), shown, r)?
         };
+        if !consts.is_empty() {
+            for &(ci, want_ty) in consts {
+                if let Ok(idx) = usize::try_from(ci)
+                    && let Some(slot) = args.get_mut(idx)
+                    && let Some(&PNode::ConstValue { ty, bits }) = tys.view().get(*slot)
+                    && matches!(tys.view().get(ty), Some(PNode::Infer))
+                {
+                    *slot = super::types::intern(tys, PNode::ConstValue { ty: want_ty, bits })?;
+                }
+            }
+        }
         for a in of {
             out(super::types::subst(tys, a, &args)?);
         }

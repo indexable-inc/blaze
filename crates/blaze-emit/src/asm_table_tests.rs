@@ -139,6 +139,9 @@ fn rows_match_the_a64_layouts() {
         ("shrn v0.8b, v1.8h, 8",    0b0_0_0_011110_0001_000_1000_0_1_00001_00000),
         ("shrn v1.4h, v2.4s, #16",  0b0_0_0_011110_0010_000_1000_0_1_00010_00001),
         ("shrn v1.2s, v2.2d, #1",   0b0_0_0_011110_0111_111_1000_0_1_00010_00001),
+        // Cache maintenance (`sys #3, c7, c11/c5, #1, Xt`).
+        ("dc cvau, x0",             0xd50b_7b20),
+        ("ic ivau, x7",             0xd50b_7527),
     ];
     for &(statement, expected) in rows {
         let got = word(statement).unwrap_or_else(|e| panic!("{statement:?} refused: {e:?}"));
@@ -179,7 +182,8 @@ fn refusals_name_the_token() {
         ("csel x0, x1, x2, al", "a condition outside `eq`..`le` (`al` and `nv` are not taken)", "al"),
         ("pacib x0, xzr", "`xzr` as `pacib`'s modifier (31 is `sp` there; the zero modifier is `pacizb`)", "xzr"),
         ("dsb foo", "a barrier option `dmb` and `dsb` have not", "foo"),
-        ("bl foo", "a mnemonic the baseline tier's assembler has no row for", "bl"),
+        ("bl foo", "expected a decimal local label followed by `b` or `f`", "foo"),
+        ("svc #0", "a mnemonic the baseline tier's assembler has no row for", "svc"),
     ];
     for &(statement, why, token) in cases {
         match word(statement) {
@@ -193,4 +197,32 @@ fn refusals_name_the_token() {
         }
     }
     println!("asm::table refusals: {}, each naming its token", cases.len());
+}
+
+/// Pair/single load-store, `ret`, `blr`, `mov #imm`, and register `add`/`sub` forms used by
+/// `blaze-launch-rt` and `blaze-ladder` `naked_asm!` trampolines assemble to their exact A64 words.
+#[test]
+fn naked_trampoline_instructions_encode() {
+    let cases: &[(&str, u32)] = &[
+        ("stp x29, x30, [sp, #-224]!", 0xa9b2_7bfd),
+        ("ldp x29, x30, [sp], #224", 0xa8ce_7bfd),
+        ("stp x0, x1, [sp, #16]", 0xa901_07e0),
+        ("ldp x0, x1, [sp, #16]", 0xa941_07e0),
+        ("stp q0, q1, [sp, #96]", 0xad03_07e0),
+        ("ldp q6, q7, [sp, #192]", 0xad46_1fe6),
+        ("stp d8, d9, [x3, #104]", 0x6d06_a468),
+        ("ldp d8, d9, [x0, #104]", 0x6d46_a408),
+        ("str x8, [sp, #80]", 0xf900_2be8),
+        ("ldr x8, [sp, #80]", 0xf940_2be8),
+        ("ldr x16, [x17]", 0xf940_0230),
+        ("ldr x16, [x16, #16]", 0xf940_0a10),
+        ("mov x1, #0", 0xd280_0001),
+        ("mov x1, #1", 0xd280_0021),
+        ("sub x0, x0, x1", 0xcb01_0000),
+        ("blr x9", 0xd63f_0120),
+        ("ret", 0xd65f_03c0),
+    ];
+    for &(statement, expected) in cases {
+        assert_eq!(word(statement), Ok(expected), "{statement:?}");
+    }
 }

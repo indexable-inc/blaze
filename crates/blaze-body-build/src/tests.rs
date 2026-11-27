@@ -1034,8 +1034,8 @@ fn track_caller_receives_forwards_and_materializes_location() {
             }
         }
         fn location_adt(&self) -> Option<ItemKey> { Some(LOC_ADT) }
-        fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Option<bool> {
-            Some(inst.item == TRACKED_OUTER || inst.item == TRACKED_INNER)
+        fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Result<Option<bool>, blaze_build::BuildError> {
+            Ok(Some(inst.item == TRACKED_OUTER || inst.item == TRACKED_INNER))
         }
         fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
             Ok(blaze_build::CallerSite { file: "test.rs", item, offset: 10 })
@@ -1167,6 +1167,9 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         closure_sig: PTy,
         closure_env: PTy,
         panic: Panic,
+        tracked_drop: bool,
+        has_drop_in_place: bool,
+        def_site_item_override: Option<ItemKey>,
     }
 
     impl LayoutFacts for ShimWorld {
@@ -1203,7 +1206,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         fn abi(&self, _: ItemKey) -> Option<Abi> { Some(Abi::Rust) }
         fn lang_fn(&self, name: &str) -> Option<ItemKey> {
             match name {
-                "drop_in_place" => Some(DROP_IN_PLACE),
+                "drop_in_place" => self.has_drop_in_place.then_some(DROP_IN_PLACE),
                 "panic_cannot_unwind" => Some(PANIC_CANT_UNWIND),
                 _ => None,
             }
@@ -1222,11 +1225,11 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
             })
         }
         fn location_adt(&self) -> Option<ItemKey> { Some(LOC_ADT) }
-        fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Option<bool> {
-            Some(inst.item == TRACKED_FN)
+        fn track_caller(&self, inst: blaze_build::Instance, _: &mut PortableTys<'_>) -> Result<Option<bool>, blaze_build::BuildError> {
+            Ok(Some(inst.item == TRACKED_FN || (self.tracked_drop && inst.item == DROP_IMPL_FN)))
         }
         fn def_site(&self, item: ItemKey) -> Result<blaze_build::CallerSite<'_>, blaze_build::SiteGap> {
-            Ok(blaze_build::CallerSite { file: "shims.rs", item, offset: 7 })
+            Ok(blaze_build::CallerSite { file: "shims.rs", item: self.def_site_item_override.unwrap_or(item), offset: 7 })
         }
     }
 
@@ -1242,7 +1245,7 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
     let cenv_list = at.intern_list(&[drop_adt_t]).unwrap();
     let closure_env = at.intern(PNode::Tuple(cenv_list)).unwrap();
 
-    let w_unwind = ShimWorld {
+    let mut w_unwind = ShimWorld {
         adt_tys: at,
         drop_fields: [Field { name: Name::of("x"), ty: u32_t }],
         drop_variants: [Variant { key: ADT_DROP, name: Name::of("Droppable"), fields: List { start: 0, len: 1 }, ctor: CtorKind::Braces }],
@@ -1264,6 +1267,9 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
         closure_sig,
         closure_env,
         panic: Panic::Unwind,
+        tracked_drop: false,
+        has_drop_in_place: true,
+        def_site_item_override: None,
     };
 
     // 1. `build_drop_glue`: struct with two droppable fields (unwind ladder), enum, slice, and plain ZST/Copy.
@@ -1281,6 +1287,43 @@ fn synthetic_drop_glue_and_shims_build_and_verify() {
 
         let b_drop = build_drop_glue(&mut Subst { args: &[g_drop], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
         assert!(b_drop.refs.iter().any(|r| r.item == DROP_IMPL_FN), "ADT_DROP glue must call Drop::drop");
+
+        w_unwind.tracked_drop = true;
+        let b_tracked_drop = build_drop_glue(&mut Subst { args: &[g_drop], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        assert!(b_tracked_drop.refs.iter().any(|r| r.item == DROP_IMPL_FN), "tracked ADT_DROP glue must call Drop::drop");
+        let lir_tracked_drop = printed(&b_tracked_drop);
+        assert!(
+            !b_tracked_drop.func.view().datas.is_empty() && lir_tracked_drop.contains("(ptr, ptr)"),
+            "tracked Drop::drop glue must materialize Location and pass (ptr, ptr):\n{lir_tracked_drop}"
+        );
+
+        w_unwind.has_drop_in_place = false;
+        let Err(missing_dip_err) = build_drop_glue(&mut Subst { args: &[g_drop], ground: &mut g, scratch: heap() }, &w_unwind, heap()) else {
+            panic!("tracked Drop::drop glue without `drop_in_place` lang fn must fail instead of falling back");
+        };
+        assert!(
+            format!("{missing_dip_err}").contains("drop_in_place"),
+            "missing drop_in_place error should name `drop_in_place`: {missing_dip_err}"
+        );
+        w_unwind.has_drop_in_place = true;
+
+        // Macro-defined `drop_in_place`: `Adts::def_site` may return an expansion anchor whose
+        // `item != drop_in_place`; `def_site_location` must preserve `def.item` unchanged.
+        const MACRO_ANCHOR: ItemKey = ItemKey(0x70ff);
+        w_unwind.def_site_item_override = Some(MACRO_ANCHOR);
+        let b_macro_drop = build_drop_glue(&mut Subst { args: &[g_drop], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
+        let mview = b_macro_drop.func.view();
+        let mut found_positions = 0usize;
+        for d in (0..mview.datas.len() as u32).map(blaze_lir::func::DataId) {
+            for pos in mview.data_positions_of(d) {
+                assert_eq!(pos.item_key(), MACRO_ANCHOR.0, "PositionFix must preserve CallerSite::item from Adts::def_site");
+                assert_eq!(pos.site, 7);
+                found_positions += 1;
+            }
+        }
+        assert_eq!(found_positions, 2, "expected line and col PositionFixes for macro-anchored drop_in_place");
+        w_unwind.def_site_item_override = None;
+        w_unwind.tracked_drop = false;
 
         let b_wrap = build_drop_glue(&mut Subst { args: &[g_wrap], ground: &mut g, scratch: heap() }, &w_unwind, heap()).unwrap();
         let lir_wrap = printed(&b_wrap);

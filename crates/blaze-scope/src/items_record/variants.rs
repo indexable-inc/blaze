@@ -20,14 +20,27 @@ use blaze_id::{ContentId, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_surface::RecordBytes;
 
-use super::cols::{OptId, OptInt, VariantCol, VariantColsBuf, encode_opt_id, encode_opt_u64, patch_dir, read_dir};
-use super::{ItemsRecord, ItemsRecordError, key_at, pad, put32, u32_of};
+use super::cols::{OptId, OptInt, VariantCol, VariantColsBuf, encode_opt_id, encode_opt_u64, id_col_bound, int_col_bound, patch_dir, read_dir};
+use super::{ALIGN, ItemsRecord, ItemsRecordError, key_at, pad, put32, u32_of};
 use crate::task::Variant;
 
 /// The header field holding how many rows the section has.
 pub(crate) const F_VARIANTS_COUNT: usize = 29;
 /// The header field holding the section's offset.
 pub(crate) const F_VARIANTS_AT: usize = 30;
+
+/// Proven worst-case bytes (including 16-byte alignment padding) that [`append`] pushes onto `out`
+/// for `total_variants` enum variants.
+pub(super) fn encoded_len_bound(total_variants: usize) -> usize {
+    if total_variants == 0 {
+        return ALIGN;
+    }
+    ALIGN
+        .saturating_add(8)
+        .saturating_add(total_variants.saturating_mul(32))
+        .saturating_add(id_col_bound(total_variants))
+        .saturating_add(int_col_bound(total_variants))
+}
 
 /// Columnar variant table opened once in [`ItemsRecord::open`]: sorted 32-byte variant keys for
 /// direct binary search, deduplicated enum keys (`IdView`), and bit-packed declaration indices.
@@ -62,7 +75,8 @@ impl<'a> VariantsCols<'a> {
 /// is not read: the rows are sorted here) to `out`, a record whose header is written, and sets
 /// its count and offset in the header.
 pub(super) fn append<'a>(out: &mut RecordBytes<'_>, enums: &HashMap<ItemKey, AVec<'a, Variant<&'a str>>, Alloc<'a>>, alloc: Alloc<'_>) -> Result<(), ItemsRecordError> {
-    let mut rows: AVec<'_, (ItemKey, ItemKey, u32)> = AVec::new_in(alloc);
+    let total_variants: usize = enums.values().map(|v| v.len()).sum();
+    let mut rows: AVec<'_, (ItemKey, ItemKey, u32)> = AVec::with_capacity_in(total_variants, alloc);
     for (owner, variants) in enums.iter() {
         for (index, v) in variants.iter().enumerate() {
             rows.push((v.key, *owner, u32_of(index, "an enum's variants")?));
@@ -81,7 +95,7 @@ pub(super) fn append<'a>(out: &mut RecordBytes<'_>, enums: &HashMap<ItemKey, AVe
             out.extend_from_slice(&variant.0.0);
             buf.push(VariantCol { owner: owner.0.0, index: u64::from(*index) });
         }
-        let mut scratch = AVec::new_in(alloc);
+        let mut scratch = AVec::with_capacity_in(id_col_bound(rows.len()), alloc);
         let enum_len = encode_opt_id(buf.owners(), "the variant table's enum keys", alloc, &mut scratch, out)?;
         let idx_len = encode_opt_u64(buf.indices(), 0, "the variant table's indices", alloc, &mut scratch, out)?;
         patch_dir(out, dir_at, [enum_len, idx_len]);
@@ -138,5 +152,57 @@ impl<'a> ItemsRecord<'a> {
         let owner = ItemKey(ContentId(*self.variants.enum_keys.get(lo)));
         let index = self.variants.indices.get_u32(lo);
         Ok(Some((owner, index)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Many distinct 1-variant enums represent the worst case for `encode_opt_id` (every owner key
+    /// is distinct, writing ~32+ bytes/row into the ID table plus codes and headers). Verify both
+    /// `scratch` (`id_col_bound`) and `out` (`encoded_len_bound`) never reallocate on a bump frame.
+    #[test]
+    fn distinct_single_variant_enums_do_not_reallocate_output_or_scratch() {
+        const COUNT: usize = 2_000;
+        let frame = blaze_mem::Frame::with_reserve(16 << 20, blaze_mem::Tag::Nameres).expect("frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.bump().alloc();
+
+        // Direct check on `id_col_bound` + `encode_opt_id` scratch capacity.
+        let mut distinct_ids: AVec<'_, [u8; 32]> = AVec::with_capacity_in(COUNT, alloc);
+        for i in 0..COUNT {
+            distinct_ids.push(ContentId::of("distinct enum owner", &i.to_le_bytes()).0);
+        }
+        let mut scratch: AVec<'_, u8> = AVec::with_capacity_in(id_col_bound(COUNT), alloc);
+        let scratch_ptr = scratch.as_ptr();
+        let scratch_cap = scratch.capacity();
+        let mut col_out: RecordBytes<'_> = RecordBytes::with_capacity_in(id_col_bound(COUNT), alloc);
+        let col_ptr = col_out.as_ptr();
+        let written = encode_opt_id(&distinct_ids, "distinct owners", alloc, &mut scratch, &mut col_out).expect("encode_opt_id");
+        assert_eq!(scratch.as_ptr(), scratch_ptr, "scratch must not reallocate for distinct IDs");
+        assert_eq!(scratch.capacity(), scratch_cap, "scratch capacity must not grow");
+        assert_eq!(col_out.as_ptr(), col_ptr, "column output must not reallocate");
+        assert!(usize::try_from(written).expect("fits") <= id_col_bound(COUNT), "written bytes must stay within id_col_bound");
+
+        // Full `variants::append` check on 2,000 distinct 1-variant enums.
+        let mut enums: HashMap<ItemKey, AVec<'_, Variant<&'_ str>>, Alloc<'_>> = HashMap::with_capacity_in(COUNT, alloc);
+        for i in 0..COUNT {
+            let owner = ItemKey(ContentId::of("single-variant enum owner", &i.to_le_bytes()));
+            let var_key = ItemKey(ContentId::of("single-variant key", &i.to_le_bytes()));
+            let mut list = AVec::with_capacity_in(1, alloc);
+            list.push(Variant { key: var_key, name: "Only", record: false });
+            enums.insert(owner, list);
+        }
+        let base_len = 8 + 4 * (F_VARIANTS_AT + 1) + 3; // unaligned tail to exercise pad()
+        let bound = encoded_len_bound(COUNT);
+        let mut out: RecordBytes<'_> = RecordBytes::with_capacity_in(base_len + bound, alloc);
+        out.resize(base_len, 0);
+        let out_ptr = out.as_ptr();
+        let out_cap = out.capacity();
+        append(&mut out, &enums, alloc).expect("append variants");
+        assert_eq!(out.as_ptr(), out_ptr, "out must not reallocate for distinct 1-variant enums");
+        assert_eq!(out.capacity(), out_cap, "out capacity must stay unchanged");
+        assert!(out.len() <= base_len + bound, "encoded bytes must fit within encoded_len_bound");
     }
 }

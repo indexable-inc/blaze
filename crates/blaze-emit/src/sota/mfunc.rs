@@ -576,6 +576,8 @@ pub enum VecAluOp {
     Addv,
     /// `addp dd, vn.2d`.
     AddpD,
+    /// `addp vd.T, vn.T, vm.T` (vector pairwise integer add).
+    Addp,
     /// `faddp sd/dd, vn.2s/2d`.
     FaddpScalar,
     /// `faddp vd.4s/2d, vn.4s/2d, vm.4s/2d`.
@@ -586,6 +588,8 @@ pub enum VecAluOp {
     UmovLane { lane: u8 },
     /// `ext vd.16b, vn.16b, vm.16b, #imm4`.
     Ext { imm4: u8 },
+    /// `tbl vd.16b, {vn.16b}, vm.16b` (16-byte single-table permute; indices >= 16 yield 0).
+    Tbl1,
 }
 
 /// Typed AArch64 machine instruction enum.
@@ -2049,7 +2053,7 @@ fn verify_vec_alu(
             verify_reg(func, inst, dst, OperandRole::Vec128)?;
             verify_reg(func, inst, rn, OperandRole::Vec128)?;
         }
-        VecAluOp::And | VecAluOp::Orr | VecAluOp::Eor | VecAluOp::Bsl | VecAluOp::Bit | VecAluOp::Bif => {
+        VecAluOp::And | VecAluOp::Orr | VecAluOp::Eor | VecAluOp::Bsl | VecAluOp::Bit | VecAluOp::Bif | VecAluOp::Tbl1 => {
             verify_reg(func, inst, dst, OperandRole::Vec128)?;
             verify_reg(func, inst, rn, OperandRole::Vec128)?;
             let Some(m) = rm else {
@@ -2059,6 +2063,7 @@ fn verify_vec_alu(
         }
         VecAluOp::Add
         | VecAluOp::Sub
+        | VecAluOp::Addp
         | VecAluOp::Sqadd
         | VecAluOp::Uqadd
         | VecAluOp::Sqsub
@@ -3130,6 +3135,10 @@ fn encode_vec_alu(
         VecAluOp::DupElem0 => Ok(enc::dup_elem0_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?)),
         VecAluOp::Addv => Ok(enc::addv_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?)),
         VecAluOp::AddpD => Ok(enc::addp_d(req_vec(inst, dst)?, req_vec(inst, rn)?)),
+        VecAluOp::Addp => {
+            let m = req_vec(inst, rm.ok_or(MEncodeError::InvalidOperand { inst })?)?;
+            Ok(enc::addp_v(sz, req_vec(inst, dst)?, req_vec(inst, rn)?, m))
+        }
         VecAluOp::FaddpScalar => Ok(enc::faddp_scalar(double, req_vec(inst, dst)?, req_vec(inst, rn)?)),
         VecAluOp::FaddpV => {
             let m = req_vec(inst, rm.ok_or(MEncodeError::InvalidOperand { inst })?)?;
@@ -3142,6 +3151,10 @@ fn encode_vec_alu(
         VecAluOp::Ext { imm4 } => {
             let m = req_vec(inst, rm.ok_or(MEncodeError::InvalidOperand { inst })?)?;
             Ok(enc::ext_v(req_vec(inst, dst)?, req_vec(inst, rn)?, m, u8_to_u32(imm4)))
+        }
+        VecAluOp::Tbl1 => {
+            let m = req_vec(inst, rm.ok_or(MEncodeError::InvalidOperand { inst })?)?;
+            Ok(enc::tbl1_v(req_vec(inst, dst)?, req_vec(inst, rn)?, m))
         }
     }
 }

@@ -7,7 +7,7 @@ import BlazeGraph.Ledger
 /-!
 `blaze_graph::ledger::fnv1a_from`: the functional model the proofs are about agrees with the
 semantics of the function's MIR (docs/v2/plan/design/formal-verification.md, "The chain for
-`fnv1a_from`"; objective V7).
+`fnv1a_from`").
 
 The MIR is `blaze_graph.ledger.fnv1a_from.mir`, the body the encoder writes
 (lean/BlazeMir/blaze_graph/ledger/fnv1a_from.lean, held to the encoder by a golden test). The
@@ -194,7 +194,7 @@ theorem fnv1a_from_any_fuel (fuel : Nat) (hash : U64) (bytes : Slice U8) :
     rw [enough] at same
     exact Or.inr same
 
-/-- The chain's link (objective V7): the functional model of `fnv1a_from`
+/-- The chain's link: the functional model of `fnv1a_from`
 (`blaze_graph.ledger.fnv1a_from`, with fuel for every byte) and the semantics of its MIR
 (with `4 * len + 5` steps or more) give the same outcome, for every seed and every slice. -/
 theorem fnv1a_from_model_agrees (hash : U64) (bytes : Slice U8) (extra : Nat) :

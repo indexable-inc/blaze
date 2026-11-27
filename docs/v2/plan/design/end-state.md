@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: "The end state the audits of 2026-11-20 agree on, as three switches to complete and the layers each deletes: regions inside types with one call rule (D156), one driver whose tasks are kinds (D157), names at module grain under one crate key with cfg read (D158). The order, the oracles and the rule that a piece is not done while the old path exists."
+summary: "The end state the audits of 2026-11-20 agree on, as three switches to complete and the layers each deletes: regions inside types with one call rule (D156), one driver whose tasks are kinds (D157), names at module grain under one crate key with cfg read (D158). Also what a request plans and what is lazy (under D157), and how compile-time code runs: blaze's own wasm64 modules under Wasmtime, native tools in the micro-VM (D175). The order, the oracles and the rule that a piece is not done while the old path exists."
 date: 2026-11-20
 ---
 # The end state: the switches to complete (D156 to D159)
@@ -73,6 +73,51 @@ build no table. Every read goes through one recording host.
   body-id table, `kept_beside`, the lines record as a second form, the page form of the answer,
   `work::Record`. The audit's estimate: 40 to 50% of blaze-cli's 30,170 engine lines.
 - Utilization (D153) follows from it: U1, U3, U5, U8 are this design's properties.
+
+### What a request plans, and what is lazy (D131 to D135)
+
+- **Tables.** Every fact more than one task reads is an immutable record read in place by all
+  workers: an outline per file; names per module (a glob or macro cycle one group); a head per
+  item; impl tables per (crate, bucket) and `NoImplsOf` per crate (blaze-surface, blaze-impls);
+  lang items; a body record (findings, the typed result, the cells it read). A task's private
+  state is its own frame.
+- **The plan is made from text.** The unit graph and the outlines name every names, head and impl
+  task and its key before any runs. Build scripts and macro modules run first, in the unit graph's
+  order; a crate's names are rounds to a fixed point: solve the modules, expand the calls that
+  resolved, outline what they made, plan the next round, until no call is left.
+- **Your code first.** Bodies are independent, so their order is a choice: the files changed most
+  recently first, then the member the command stands in, then the rest; findings print as they
+  land, sorted within what has landed.
+- **Lazy over what is not yours** (D134). Your crates are checked whole. A dependency's name is
+  resolved when a path walks to it (blaze-scope `cells/lazy_deps.rs`), its head when a body reads
+  it, its bodies never. A crate that could hold an impl a goal of yours needs (the orphan rule
+  names them) has its item-level macros expanded and its impl headers resolved, once a machine.
+- **Aspects** (not built). A reader depends on the aspect it read: a fn's parameter and return
+  types, bounds, lifetimes; an ADT's existence and generics, fields, layout; a constant's type,
+  value; a trait's head, member list, each member's signature; an impl's header, members. Each is
+  a part of the item's cell with its own digest, so a field added to a struct enters no body that
+  only names the type.
+- **Merges in bulk**, sorted by key (rule 25): puts to the store, rows to the answer table; a
+  constant per merge plus a sort, never a step per task.
+- **An edit.** The sweep gives the changed files, their outlines the changed cells, the reverse
+  index by cell the readers. A reader whose cells did not move is not entered.
+- **Lints and tests are kinds.** One lint task per body (D135): every selected lint in one walk
+  over the body's typed record, dispatched by node kind, keyed by the body and the selected lints'
+  code ids (lints-stage.md). A test's result is keyed by [test.md](test.md)'s rule, the one
+  `blaze test` runs.
+- **Shared work, never a per-worker cache** (not built). Trait goals in canonical form and generic
+  instantiations are request-wide records made once through claims; any hit appends the reads of
+  what it returned to the reader's read list, and an audit mode re-makes every hit and compares;
+  an impl added enters only the bodies whose recorded trait questions it can answer; facts of the
+  toolchain and of registry packages are settled once per (toolchain, lock entry) and checked by
+  one digest.
+- **Published records (D132): built, off unless chosen.** A new checkout is served by the
+  machine's own content-deduplicated store. When chosen: optimized code of std and popular crates
+  from R2 (dear to compute, small to ship); names records only by byte range, the pages a check
+  touches (remote-read.md); never a whole pack of names (about 160 MB for a 6 s compute).
+- **Cold floor.** tempo on an 18-core Mac: under 10 seconds (the owner, 2026-11-17). About 1 ms of
+  CPU a body; a stage whose CPU per body passes 1 ms names where it goes before anything else is
+  built on it.
 
 ## D158. Names at module grain; one crate key; cfg is read
 
@@ -174,9 +219,22 @@ work kept. A cycle is a typed error naming the items.
 - Oracle: the same findings and the same record bytes as the restart path on every fixture and on
   tempo; the solver's "restarted goals" counter goes from 74% of calls to 0.
 
+**Head making, the rest of the wait** (front2 heads.rs, check.rs). A head's making still restarts
+in two places: a need in the head store re-runs the builder from the top, and each
+`Why::NeedConst(c)` in check.rs drops the whole fill and runs it again. To finish:
+1. A cursor per builder (ADT head and body, trait head and members, impl, member fn, fn head,
+   alias, trait alias): indices into the lowering and ids of rows already filed, no borrowed
+   view. Each loop starts at the cursor, so a resume skips what is filed; the meter is the time
+   stopped per head, down to the cost of the one row that stopped.
+2. `NeedConst` becomes a yield. The evaluator is a second maker that parks the frame; the make
+   loop and its cap go, and so do the rounds that restart on a world miss (`MOST_ROUNDS`).
+3. The store moves onto blaze-ask's `Asker` (`crates/blaze-ask`): the store's own stack and its
+   made-probe go, and a published need that is still not found is the asker's `AskError`. The
+   asker's depth bound is measured first (tempo's deepest head chain): it gates this step.
+
 ## D162. A key is subject, producer and schema; a place is named once
 
-A record's key is `Key::of(schema, producer, inputs)` (blaze-cas, written and unused today), where
+A record's key is `Key::of(schema, producer, inputs)` (blaze-cas), where
 `schema` is the digest blaze-format-core derives from the record's type by reflection and
 `producer` is the binary's id now and the producing function's code identity later. An old form is
 a miss; nothing refuses a form. Hand-written numbers stay only for formats blaze does not own
@@ -384,7 +442,7 @@ by nothing reached. 55 crates no binary reaches are out of this work.
 - C5 THE MACHINE. Logic that waits, interleaves or speaks a protocol is
   `struct M { state: State, .. }` with `State` an enum and no flags beside it;
   `new(MOpts)`, `step(&mut self, now, event) -> Result<(), E>`, `next_effect(&mut self)`,
-  `next_deadline(&self)`, `state(&self)` (the form of blaze-stage's machine.rs). A codec is
+  `next_deadline(&self)`, `state(&self)`. A codec is
   `feed(bytes) -> Progress` and `finish()`. A driver is thin straight-line code: it owns the OS
   handles, turns effects into calls and completions into events, and decides nothing.
 - C6 TESTS. A planted bug is a `P: Planted` parameter with `NoPlant` in shipped code
@@ -396,9 +454,9 @@ by nothing reached. 55 crates no binary reaches are out of this work.
   (`sans_io_core`, `std_use`, `implicit_allocator`, `process_static`) are implemented and the
   ratchets run in the test round and CI before any crate is called done (T0).
 
-**Decided with it.** Wasmtime stays, behind a thin driver (rule 10 names it). The Windows driver
-and its package go (Windows is out of scope). `Alloc::global()` and `SharedAlloc::global()` go
-everywhere. CPU feature detection goes through blaze-sys. Tools that never ship in the binary
+**Decided with it.** Wasmtime stays, behind a thin driver (rule 10 names it). Windows is out of
+scope now; blaze-sys's `windows/` seam keeps a place for it. `Alloc::global()` and
+`SharedAlloc::global()` go everywhere. CPU feature detection goes through blaze-sys. Tools that never ship in the binary
 (the model checker, the allocation counter, the derive macro) are exempt from C1. Vendored
 cryptography and QUIC are not touched without the owner's word. Code the end state deletes is
 not converted first; its replacement is written to these conventions from the start.
@@ -418,8 +476,7 @@ serve loop for run and test, a status machine, `main` taking its grants).
 The owner, 2026-11-20 18:47, on a per-worker context: "YES add that ... should it kinda be like
 an ECS too (so people can add arbitrary things)". Today a worker's state hides in thread-locals:
 blaze-mem's frame stack and tag counts, the trace ring's per-thread half, the meter's counters,
-test plants (85 `thread_local!` in the reached tree). A fiber that parks and resumes on another
-thread reads the wrong one, a simulation cannot give each simulated worker its own, and nothing
+test plants (85 `thread_local!` in the reached tree). A simulation cannot give each simulated worker its own, and nothing
 in a signature says the state exists.
 
 `Workers` is built once, in `main`, by the pool's options. It has the few fields bstd itself
@@ -435,8 +492,7 @@ entity; there are no archetypes, queries, names or `TypeId` lookups.
   named, as it names its grants.
 - A core never sees `Workers`. Its driver takes the cell and hands the core `&mut T` (C3).
 - The cell is reached only inside `cx.on_worker(|w| ..)`, a closure that cannot wait, so nothing
-  of a worker is held across a wait (rule 27) by construction, and a fiber that moves threads
-  gets the worker it is on when it next asks.
+  of a worker is held across a wait (rule 27) by construction.
 - A simulation builds `Workers` for its simulated workers; a test builds one.
 - Deletes, as each moves: blaze-mem's thread-local frame stack and tag counts, the meter's
   thread-local counters, the plants' thread-locals. The trace ring below bstd stays the one
@@ -458,8 +514,8 @@ nothing to remember.
   user; libc calls move behind blaze-sys; objc2 moves out of bstd into the application crate
   that needs it.
 - CODE NOTHING REACHED CALLS: what is plainly dead is deleted (stdx, `Screen`, the legacy
-  `Report`, blaze-protocol's `follow.rs` and its serde CBOR, `HashCons`, blaze-remote's bucket
-  code, blaze-launch-rt's daemon path). What is a capability blaze will want again (the
+  `Report`, blaze-protocol's `follow.rs` and its serde CBOR, `HashCons`, blaze-launch-rt's
+  daemon path). What is a capability blaze will want again (the
   manifest's cargo layer, blaze-resolve, blaze-source: making and updating a lock file) leaves
   the workspace and is recorded in parked.md with what would wire it, on these conventions.
 - ONE HTTP CLIENT: bstd's, as a sans-IO machine over the one `Effect` boundary; blaze-http keeps
@@ -494,38 +550,23 @@ as its own line, it has a cap, and the gate proves no blaze crate links `alloc`.
 third-party package goes, the static goes. The gate and the lint read one table of the statics
 C3 allows (the foreign heap, the profile ring, the signal handler).
 
-## D175. WebAssembly is a bridge; compile-time code runs as blaze's own code (2026-11-20)
+## D175. Compile-time code is blaze's own wasm64 modules under Wasmtime; native tools go to the micro-VM
 
-The owner, 2026-11-20 19:01: "do we even want/need web assembly ... long term that stuff should
-be comptime stuff and it is kinda just a for now thing". Agreed, and recorded so nothing new is
-built on the bridge.
-
-What wasm does today (rule 10): a proc macro or build script is arbitrary user code that runs
-while compiling, so it is compiled to `wasm32-wasip1` and run in Wasmtime, which gives a sandbox
-(no ambient files, network or clock), the same result on every host, and memory isolation. What
-it costs: Wasmtime is the one third-party runtime left in the binary; a second target, a second
-standard-library build and a WASI layer exist only for it; and compile-time code runs through a
-second execution path beside the one blaze is built around.
-
-THE END STATE. Compile-time code is ordinary code run by blaze itself: compiled by blaze's own
-back end to code records and run by blaze's own launcher in its own process, as any program is.
-What makes it safe is what makes blaze's own code safe: nothing ambient. Its standard library's
-system layer is calls to blaze that hold only the grants the compile gave it (the tokens in, the
-tokens out, the files its package declared), so there is no file, clock, environment or network
-to reach; the operating system's process sandbox is the second wall; fuel and a deadline bound
-it (rule 18). A proc macro is then one comptime function from tokens to tokens, and a build
-script one from a request to directives; an existing crate's macro runs unchanged, because the
-library under it is the one that changed.
-- Deletes at the switch: Wasmtime and its two crates, the wasm target and its standard-library
-  build, blaze-wasi, wasi-libc in the shelf, the proc-macro host's WASI view.
-- Oracle before the switch: each of tempo's macro expansions and build-script outputs is
-  byte-equal run both ways; a macro that reads what it was not granted is refused by name on the
-  native path as it is on the wasm one.
-- What is given up, stated: one expansion record valid on every architecture by construction
-  (native runs can differ across architectures in floating-point edge cases); the record's key
-  therefore names the architecture until a test shows the outputs equal.
-- Until then: wasm stays for proc macros and build scripts, nothing new is added to it, and the
-  C compiler never goes through it (D174).
+The one statement of how compile-time code runs (AGENTS.md, 2026-11-26, which revises this row
+and D193 (1)). blaze compiles proc-macro crates and pure-Rust build scripts itself, off
+`blaze-lir`, to wasm64 (memory64) modules (blaze-export `lir_wasm64.rs`, `wasm64.rs`) and runs
+them in-process under Wasmtime, sandboxed (blaze-proc-macro `wasm64_runtime.rs`: no ambient
+files, network or clock; fuel and bounded memory, rule 18). 64-bit pointers match the host's
+layout, so there is no wasi-libc, wasm linker or register allocator, and a module is the same
+on every host. An existing crate's macro runs unchanged: its `proc_macro` library is blaze's.
+Native tools and C-linking build scripts (`cc`, `clang`, `cmake`) are the remaining gap: they
+go to blaze's hypervisor micro-VM sandbox (D177's `Level::Execution`), which is not run without
+the owner's word. blaze's own code needs no macro: `#[comptime]` reflection (Tier 0).
+- Deletes: the interim module builder (`scripts/src/bin/proc_macro_modules.rs`), its
+  `wasm32-wasip1` modules and standard-library build, and the WASI layer it needs.
+- Oracle: each of tempo's macro expansions and build-script outputs is byte-equal to the
+  interim builder's; a macro that reads what it was not granted is refused by name.
+- The C compiler never goes through wasm (D174).
 
 ## D177. One way to run a program hermetically, in bstd (2026-11-20)
 
@@ -535,7 +576,7 @@ things exist and none is the whole: bstd's `Spawner::start` and `start_served`
 (procs/linked/run.rs: a child with typed streams, a channel, a typed end, never outliving its
 parent, and a simulated stand-in: the lifecycle, with no confinement and no account of what the
 child read); the WebAssembly sandbox for compile-time code (confinement and a read list, for
-wasm only, a bridge: D175); and the hypervisor sandbox (full determinism for native tools; not
+wasm only: D175); and the hypervisor sandbox (full determinism for native tools; not
 run without the owner's word). Four users need the same thing: the C compiler (D174),
 compile-time code (D175), a build script's native tools, and sandboxed tests.
 
@@ -549,8 +590,8 @@ must not be mistaken for the other:
   (Seatbelt on macOS, Landlock and seccomp on Linux), and what it read is reported. Its output
   is a function of its inputs IF the program is: right for a pinned tool of blaze's own.
 - `Level::Execution`: the run itself is determined (scheduling, time, addresses): for arbitrary
-  programs. Its backends are a program built by blaze and run on blaze's own launcher against a
-  system layer that is calls to the host (D175), and the hypervisor sandbox where it is allowed.
+  programs. Its backends are a program built by blaze whose system layer is calls to the host
+  (D175's wasm64 modules), and the hypervisor sandbox where it is allowed.
 A level no backend on this machine can give is a typed refusal naming the level and the program
 (rule 9), never a weaker run. The simulated world implements the same call, so code that runs a
 tool is tested without one.
@@ -564,6 +605,19 @@ a refused step exits the child, and the parent returns a typed error naming the 
 `sandbox-exec`: no `posix_spawn` attribute applies a Seatbelt profile. (2) `Hermetic` is a grant
 kind (`hermetic: Hermetic`), still made from a `Spawner` and a `Clock`. (3) Giving up the user
 and network namespaces is accepted: the seccomp filter refuses `socket` and Landlock the files.
+
+- **The seed and the wall clock reach std through its provider.** A process started with
+  `__BLAZE_PROVIDER=1:<seed, 64 hex digits>:<wall>` in its environment gets `RandomState`'s keys,
+  `fill_bytes` and (when `<wall>` is a time) `SystemTime::now` as functions of the seed alone,
+  read from `environ` before `main`, each child given its own derived seed; with no variable std
+  is the nightly's, byte for byte (`library/std/src/sys/provider/`). This is how `HermeticSpec`'s
+  `clock` and `seed` reach a program on Rust's std. Built in library/std, not wired: nothing in
+  crates/ sets the variable. A build script's or proc macro's wall clock is the build's
+  `SOURCE_DATE_EPOCH` when set, recorded as a read; `Instant` is always real.
+- **The twice-run check** (not built): on request, each hermetic run is made twice with equal
+  inputs in fresh roots and the outputs compared byte for byte (exit, streams, every output file);
+  a difference is an error naming the program and the first differing file, so a nondeterministic
+  tool is found and named, never hidden by the store.
 
 ## D178. Telemetry is a property of bstd, not of each crate (2026-11-20)
 
@@ -598,8 +652,26 @@ counter of its own only for a domain fact (bodies checked, records read), throug
 of the worker (D171), and never re-measures what bstd measures.
 - Deletes: the command's hand-kept phase and stage timing (phases.rs marks, engine_times.rs's
   tables and timeline, the per-stage `used` plumbing), as each is shown equal to the default.
-- The profile crate (reached by no binary today) becomes a reader of the `Report`'s encoding or
-  goes; there is one telemetry core.
+- There is one telemetry core. The profile crate, which no binary reached, went on 2026-11-27
+  (D216) with its Parquet history, flight recorder, watchdog, `blaze debug sql` over DuckDB,
+  `BLAZE_PROFILE`, the query engine over it (blaze-rel), its benches (blaze-bench) and the
+  any-program profiler under it (ix-prof, and its explorer server and `blaze run --prof` design).
+- **Built (2026-11-27).** The `Report`, its cells, sinks, chain and sampler are
+  crates/blaze-std/src/telemetry.rs and telemetry/; `blaze` runs at `Spans` under `--stats`
+  (printed to stderr) and at `Totals` otherwise. A command's own profile, each phase's tasks
+  planned and entered, wasted entries and why each task was entered, is `.blaze/v2/profile.txt`
+  (crates/blaze-cli/src/phases.rs, print.rs; the `debugging` skill reads it).
+- **Spans and events are blaze-trace's** (crates/blaze-trace). A site is static data the macro
+  makes where it is written (name, target, level, file, line, field names) with one state word;
+  a span's edges and an event are fixed 32-byte entries in the calling thread's ring, timed by
+  the CPU's counter, with no `dyn` call, allocation or lock; a `Sink` is the other reader. The
+  process's profile ring is one of the statics C3 allows. The macros keep the call shape the
+  crates wrote (`info_span!`, `warn!`, `field::Empty` then `record`), and a site nobody records
+  costs one relaxed load and a branch. The `tracing` crate is gone from blaze's code (left:
+  blaze-proc-macro's `runtime` feature, and blaze-trace's `examples/cost.rs` comparison); the
+  vendored crates that used it (quinn-proto, ra-ap-rustc_pattern_analysis) carry a
+  `0001-no-tracing` patch that tools/vendor/sync.py replays on each bump
+  (vendor/<crate>/PATCHES.md).
 - **The sampler is part of it** (the owner, 2026-11-20 19:31: "ideally ... have some kind of
   sampler or something that you can figure out hot spots ... by default"). Counters say how much
   a span used; only a sampler says WHERE in the code. The runtime owns one: a sampler thread
@@ -660,6 +732,14 @@ through CLAIMED. Interners: CLAIMED (a value is interned once, by whoever meets 
 meter, the trace and telemetry: GATHERED. The proc-macro host's condition variable and threads:
 a machine fed by events (D170), which is GATHERED with one owner.
 
+**Between processes.** No build lock: any number of commands run at once against one store
+(cargo makes a second build wait, "Blocking waiting for file lock"). Each output is committed by
+an atomic rename or by the head's flip (D159), so a second command never waits for a first.
+
+**Proof.** Warm no-op and hot-read throughput is measured on 1, 16, 64 and every core and must
+scale near-linearly. A run under `perf c2c` must show no shared cache line written on the read
+path.
+
 ## D180. No package from a registry: fifteen names to zero, the rest pinned in the tree meanwhile (2026-11-20)
 
 The owner, 2026-11-20 19:40: "can we try to vendor all of our crates (no crates from crates.io)
@@ -671,13 +751,13 @@ our crates, and each brings a closure:
 
 | named directly | by | closure | how it goes |
 |---|---|---|---|
-| wasmtime | blaze-proc-macro, blaze-wasi | 115 | D175: compile-time code runs natively; deleted at the switch |
+| wasmtime | blaze-proc-macro, blaze-wasi | 115 | stays: it runs blaze's wasm64 modules (D175); blaze-wasi goes with the interim builder |
 | sonic-rs | blaze-report | 62 | the legacy report goes; JSON out by blaze's own writer |
 | quinn-proto, rustls, bytes | blaze-http | 62, 51, 1 | LAST: blaze's own TLS 1.3 and HTTP client; until then vendored and pinned (they are vendored today) |
-| ring | blaze-remote | 45 | the remote bucket is parked (goal revision 2026-11-17): the crate leaves the binary |
+| ring | blaze-remote | 45 | the remote is built, off unless chosen; `ring` stays under its `sign` feature and leaves the `blaze` binary |
 | stacker | stdx | 37 | stdx is deleted (D172); deep recursion is a frame with a stated bound |
 | url, serde_json, imbl, rustc-stable-hash | blaze-manifest, blaze-resolve, blaze-source | 36, 15, 10, 1 | the cargo layer is parked (D172); manifests are read by blaze-toml and typed paths |
-| windows-sys | blaze-core, blaze-mem, blaze-check, blaze-profile (blaze-graph named it unused) | 10 | blaze-sys declares the Windows imports itself (`windows/`, `raw-dylib`, no import library); the driver stays (corrected 2026-11-20: Windows is not deleted, see sys.md "Windows") |
+| windows-sys | blaze-core, blaze-mem, blaze-check (blaze-graph named it unused) | 10 | blaze-sys declares the Windows imports itself (`windows/`, `raw-dylib`, no import library), the seam that keeps Windows's place while it is out of scope (sys.md "Windows") |
 | serde | nine crates | 7 | records are blaze-format and CBOR; the derives go with blaze-serde |
 | libc | nine crates | 1 | blaze-sys is the one home of kernel calls (D170) |
 | tracing | blaze-proc-macro | 4 | spans are bstd's (D178) |
@@ -686,13 +766,13 @@ our crates, and each brings a closure:
   names of third-party packages in our manifests (15), and the same two for the whole graph with
   test edges (274 packages). Each only falls; a new name is refused.
 - **Order**: what is already decided and blocked on nothing but the tree compiling (windows-sys,
-  libc, tracing, stacker with stdx, ring with the remote crate, the cargo layer's four, sonic-rs,
-  serde), then wasmtime at D175's switch, then TLS.
+  libc, tracing, stacker with stdx, ring out of the binary, the cargo layer's four, sonic-rs,
+  serde), then TLS.
 - **Meanwhile nothing is fetched to build blaze**: when the count has fallen to what is truly
   left (the TLS and QUIC closure), that remainder is placed in `vendor/` pinned by digest and the
   workspace builds with the registry replaced by it, so a build of blaze needs no network and no
   registry. Copying all 205 into the tree today would add tens of megabytes of code that the same
-  month deletes (wasmtime's 115 first); the lock file already pins every package by checksum
+  month deletes; the lock file already pins every package by checksum
   until then.
 - **Test-only packages** (the official blake3 crate a cost example compares against, and the
   like) are named in one list with the reason each is there; a comparison that has done its job
@@ -951,10 +1031,10 @@ no unit conversion bug inside a program; units exist only at the edges, in named
 and accessors (`Length::mm(2.0)`, `.as_mm()`), and in printing, which picks the unit for people.
 - **Const generics, later.** The general form is one type `Quantity<const D: Dim, K>` whose
   products compute the dimension in the type. That needs arithmetic on const generics, which the
-  pinned nightly has only as an incomplete feature; while cargo also builds blaze, the crate is a
-  closed table of named quantities and their products, written so each name is an alias that the
-  general form can stand behind without changing a caller. When blaze builds blaze, the table
-  becomes the general type (rule 55: own the language).
+  pinned nightly has only as an incomplete feature; so the crate is a closed table of named
+  quantities and their products, written so each name is an alias that the general form can stand
+  behind without changing a caller. When blaze's front end has the arithmetic, the table becomes
+  the general type (rule 55: own the language).
 - **Users from the first day**: the CAD crates (lengths, angles, masses, D183), and the meter
   and telemetry (`Nanos` by kind, `Bytes` by kind, counts by what is counted, D178), whose
   printed lines then cannot put CPU seconds under a wall-time heading.
@@ -1150,6 +1230,30 @@ Nov 13:26, then 11,055, now 6,162, with a cause that did not exist before. Nobod
 6. **The history is read by a tool every time**: every scoreboard ends with its numbers against
    the best on record and the word REGRESSED where it is worse (done: `tempo-history.py`; tonight
    it prints eleven). A regression is then seen in the run that makes it.
+7. **The poles are profiled, then cut.** On tempo's cold check the slowest single tasks are a
+   build script (`librocksdb_sys`, 50.8 s) and proc-macro calls of 9 to 28 s
+   (`storable_arrays!`, `sol!`). Each is P0 until its span tree says where the time goes (rule
+   16): for the script, what it runs (a C++ compile is done once per machine by the shared
+   store); for a macro, whether it is the module's compile, its execution, or the tokens crossing.
+8. **The answer is stored as it is made.** Storing the 2.82 GB answer in one pass after Bodies
+   took the footprint from 10.7 GB to 32.9 GB, the whole peak of the command. Each stage's rows go
+   to their pages when the stage merges, written by the workers, and leave memory then. The
+   read-edge index is written in the same pass (82 bytes an edge is the floor; 21.5 M edges on
+   tempo). Judge: no "answer stored" phase over 1 s.
+9. **A worker writes its own record.** The coordinator's `put` between stages cost Names 19.8 s
+   and Heads 3.6 s. The record's key and bytes are the worker's and the store's put is by
+   content, so the worker puts and the merge files the key. Judge: put on the coordinator under
+   1% of the stage.
+10. **A script that reads git facts does not gate the bodies.** Build scripts whose reads move
+    with the working tree are entered on every edit and run before Bodies, though a body waits
+    only on what it reads. With the ready driver (item 2) they run beside it.
+11. **The edit's Bodies stage is sampled before it is designed.** The stage costs about 20 times
+    the body's own check. The rows name suspects, not causes: a body with no macro asks 1,107
+    expansion texts, 150 member rows are read to list one file, the names records of 1,204 crates
+    are opened. The floor is the body's own reads.
+12. **The other floors.** Cold wall = max(longest chain of dependent tasks, CPU / workers) plus a
+    tail under 2 s. No-op: the certificate read and the journal's new ids, under 30 ms. Memory on
+    an edit: under 100 MB.
 
 ## D189. The outsider's verdict on block modules: rebuild; block scopes are the body's own (2026-11-21)
 
@@ -1261,14 +1365,10 @@ errors; 215 of 454 swept tests; `run` stops in C) and the first three on turso (
 errors). Nothing above is withdrawn. These six follow from what stopped the runs, and each names
 what it deletes.
 
-1. COMPILE-TIME CODE RUNS AS BLAZE'S OWN CODE, NOW (D175 moves from "end state" to "next").
-   Evidence: on turso the interim module builder (cargo and rustc to wasm, rule 1's largest open
-   bug) failed 10 of 148 modules with four tool bugs, its keys hold the whole lock so two
-   projects share almost nothing (5 of 148 reused from tempo), and bindgen scripts cannot be wasm
-   at all. `blaze test` already runs std code natively from code records. A proc-macro crate is a
-   program; its `proc_macro` library is blaze's (tokens in, tokens out, spans as item-relative
-   values); a build script is a program whose system layer is the grants of D177. Deletes: the
-   interim builder, the module stores, Wasmtime, blaze-wasi, the wasm standard library.
+1. COMPILE-TIME CODE IS BLAZE'S OWN, NOW (D175, which states how). Evidence: on turso the interim
+   module builder (cargo and rustc to wasm, rule 1's largest open bug) failed 10 of 148 modules
+   with four tool bugs, its keys hold the whole lock so two projects share almost nothing (5 of
+   148 reused from tempo), and bindgen scripts cannot be wasm at all: they are native tools.
 2. A PROBE IS ANSWERED BY THE THING IT ASKS ABOUT. A build script that runs `rustc` on a snippet
    is asking blaze: the snippet is checked by blaze's front end for the asked target and the
    answer is a record keyed by the snippet (autocfg, rustix, proc-macro2, thiserror). A script

@@ -100,17 +100,13 @@ needs no `#![feature]` and gets no feature-gate warning.
 
 Neither selection nor codegen is new:
 
-- The solver prefers a specializing candidate (`next_solver/infer/select.rs`, through
-  `specializes`).
-- An item is looked up on the nearest ancestor that defines it
-  (`method_resolution::lookup_impl_assoc_item_for_trait_ref` → `specialized_ancestor`, rustc's
-  `leaf_def`).
-- `inline.rs` leaves a `default fn` with unsettled arguments alone.
+- The solver prefers a specializing candidate (`crates/blaze-solve/src/assembly.rs`,
+  `filter_specialized_impls`, through `Facts::specializes`).
+- An item is looked up on the nearest ancestor that defines it (rustc's `leaf_def`).
+- A `default fn` with unsettled arguments is not inlined.
 
 The extension only widens `may_specialize` to the `Blaze` mode, so a `#![blaze::specialization]`
 crate goes through the same path as a `min_specialization` one.
-`hir-ty-mir`'s `blaze_specialization_calls_the_specialized_impl` evaluates such a program.
-The `Specializes` fact in blaze-items hashes the mode in place of the two feature bits.
 
 A program with neither the attribute nor a feature gets the same mode (`Off`) and the same
 `may_specialize` (false) as before, so its selection, MIR and objects don't change. The
@@ -119,12 +115,10 @@ which it can only do by using the extension.
 
 ## Where it lives
 
-- `crates/hir-ty-specialization` holds the checker (semantics-in-front-end, a crate of its
-  own). `check_impl(db, impl)` is a plain function that `hir`'s `collect_impl` calls for each
-  impl.
-- hir-def has the attribute flags and the trait flags `SPECIALIZATION_ALWAYS_APPLICABLE`,
-  `SPECIALIZATION_UNSAFE_MARKER` and `BLAZE_SPECIALIZATION_TRAIT`.
-- hir-ty has the mode.
+- Selection: blaze-solve (above).
+- The checker, the attribute and trait flags (`SPECIALIZATION_ALWAYS_APPLICABLE`,
+  `SPECIALIZATION_UNSAFE_MARKER`, `BLAZE_SPECIALIZATION_TRAIT`) and the mode are not on the item
+  layer yet: the attribute meets the catch-all ([extensions](extensions.md), row S).
 
 ## Prior art
 

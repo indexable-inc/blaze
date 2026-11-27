@@ -9,7 +9,7 @@
 //! "Scopes", item scopes: "The name of an item declared directly in a block is in scope for the
 //! entire block", before its declaration too, and shadows the outer names of its namespace.
 //!
-//! What is here (docs/v2/plan/design/typeck.md, "Items inside bodies"; decision D62):
+//! What is here (decision D62):
 //! - THE TEXT. A body's lowering is dropped with its `Body`; a local item's head borrows its
 //!   text for `'n` like any item's. So when a body that holds local items is lowered, its rows
 //!   are KEPT in the command's frame (made by the caller of `Front2::new`): a row's text is a
@@ -159,7 +159,7 @@ impl LocalKind {
     /// The gap's words for a struct, enum, union or alias whose block has no module in the
     /// names library: one a macro call in the body wrote (the scan of the body's text does
     /// not see it), or one in the body of an item that is itself local to a body (that item
-    /// has front2's derived key, not the library's: typeck.md, "Impls inside blocks", owed).
+    /// has front2's derived key, not the library's; owed).
     pub fn unplaced(self) -> &'static str {
         match self {
             LocalKind::Struct => "a struct in a block that a macro call wrote or that is in a local item's body",
@@ -853,6 +853,11 @@ impl<'n> Locals<'n> {
     /// block's items, then each enclosing block's (innermost first); where the body is itself
     /// a local item's, then the blocks around its declaration. `None`: the module's names.
     pub fn find(&self, owner: ItemKey, scope: Option<u32>, name: &str, ns: LocalNs) -> Option<Row<'n>> {
+        self.find_matching(owner, scope, name, ns, |_| true)
+    }
+
+    /// Like [`Self::find`], returning the innermost matching row for which `accept` returns `true`.
+    pub fn find_matching(&self, owner: ItemKey, scope: Option<u32>, name: &str, ns: LocalNs, mut accept: impl FnMut(&Row<'n>) -> bool) -> Option<Row<'n>> {
         let mut body = owner;
         let mut at = scope;
         // Each step out leaves a local item's body or a body's anonymous constant: at most as
@@ -863,7 +868,12 @@ impl<'n> Locals<'n> {
                 // A chain is at most as long as the body's blocks.
                 for _ in 0..=b.parents.len() {
                     let Some(here) = s else { break };
-                    let wanted = |r: &&Row<'n>| r.scope == here && r.name == name && if ns == LocalNs::Value { r.kind.in_values() } else { r.kind.in_types() };
+                    let wanted = |r: &&Row<'n>| {
+                        r.scope == here
+                            && r.name == name
+                            && if ns == LocalNs::Value { r.kind.in_values() } else { r.kind.in_types() }
+                            && accept(r)
+                    };
                     if let Some(r) = b.rows.iter().find(wanted) {
                         return Some(*r);
                     }

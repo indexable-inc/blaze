@@ -1,26 +1,27 @@
 ---
 status: plan
-summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is written in crates/hir-ty-lean with the first proof in the tree; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. For sans-IO code a proof takes the place of the simulation test (decision D38, proofs-for-sans-io.md); what is not proved keeps its simulation test. A second package, lean/analysis, proves blaze-diff's derivative rules and fast_math rewrites over the reals with Mathlib, from the rule table the Rust differentiator runs.
+summary: The verifier: blaze translates its own borrow-checked MIR to Lean 4 and the pinned Lean checks proofs of specs written once in blaze's extensions. v0 (safe Rust by functional translation) is not built on the new layer: its goldens (lean/BlazeModel) and first proof are in the tree, its translator is not; built: the theorem gate (lean/theorems.json, lean_gate), the no_std Lean kernel checker in blaze-cert and #[blaze::theorem] proofs; lean/Blaze/Mir is the executable Lean semantics of MIR for a first subset that models, passes and the evaluator are held to, with its trusted base listed; the Verus tier was retired on 2026-11-10. Planned: v1 unsafe and interior mutability in an Iris-style logic, v2 atomics (SC, then RC11), v3 crashes on files and mmap (Perennial-style, sharing the DST's kernel model), v4 compiler correctness. A proof is extra evidence on top of the simulation test and never replaces it (rule 43; proofs-for-sans-io.md). A second package, lean/analysis, proves blaze-diff's derivative rules and fast_math rewrites over the reals with Mathlib, from the rule table the Rust differentiator runs.
 date: 2026-11-10
 ---
 # Formal verification: blaze's MIR to Lean
 
 This is the plan for proofs in blaze. blaze translates its own MIR to Lean 4, and a Lean
-program logic proves the specs. v0 is written ("v0 as built" below); the later phases are plan. Other docs own the parts this one builds on, and it links
-to them rather than repeating them:
+program logic proves the specs. Built and in the tree: the Lean library and MIR semantics
+(`lean/Blaze`), the theorem gate (`lean/theorems.json`, `scripts/src/bin/lean_gate.rs`), a
+`no_std` Lean kernel checker (`crates/blaze-cert/src/lean_kernel.rs`) and `#[blaze::theorem]`
+proofs over sans-IO cores (proofs-for-sans-io.md). The translator from blaze's bodies to Lean is
+not built on the new layer ("v0 as built" below); the later phases are plan. Other docs own the
+parts this one builds on, and it links to them rather than repeating them:
 
 - **The spec form**: the native clause grammar (`requires`, `ensures`, `invariant`,
-  `decreases`, a named return) and `VerifyRefused`, which lane verus built and
-  [verus.md](verus.md) records. The interface `proved(..)` is `crates/hir-ty-lean`'s since
-  2026-11-10.
+  `decreases`, a named return) and `VerifyRefused`, which [verus.md](verus.md) records.
 - **Checked, generated, used contracts**: [contracts.md](contracts.md).
-- **Purity and effects**: [pure-fns.md](pure-fns.md) and [effects.md](effects.md).
+- **Purity and effects**: [effects.md](effects.md).
 - **How unsafe code is checked today**: [unsafe.md](unsafe.md), with the shared-memory rules in
-  [concurrency.md](concurrency.md).
+  [end-state.md](end-state.md).
 - **Testing, including DST**: the
   [testing skill](../../../../.agents/skills/testing/SKILL.md).
-- **The store and incremental checks**: [verify.md](verify.md). Despite its name, that doc is
-  not about program proofs.
+- **The store and incremental checks**: [bottom.md](bottom.md).
 
 ## Decisions (2026-11-04; the Verus tier retired 2026-11-10)
 
@@ -59,12 +60,10 @@ to them rather than repeating them:
 
 ### DST on everything, proofs on small stable cores
 
-Changed on 2026-11-13 (decision D40, [proofs-for-sans-io.md](proofs-for-sans-io.md)): for
-sans-IO code the translator reads, a proof Lean has checked in the gate takes the place of
-the simulation test, which is deleted; that doc says what stands for what a proof does not
-cover (a conformance test per world model, and each translated function run as its Lean model
-and as built code). The first two points below are as they were decided on 2026-11-04 and
-hold for code that is not proved.
+A proof Lean has checked in the gate is extra evidence on top of the simulation test and never
+replaces it (rule 43; D40, [proofs-for-sans-io.md](proofs-for-sans-io.md), which adds for
+sans-IO code the translator reads a conformance test per world model and each translated
+function run as its Lean model and as built code).
 
 - **DST stays the requirement.** The testing skill's `dst-not-review` rule holds for all
   concurrent, durable, crash-recovering, billing and data-deleting code, proved or not. A
@@ -79,7 +78,7 @@ hold for code that is not proved.
   1. **DST traces checked against the model.** The sim's trace of effects and crash states
      is replayed through the Lean model, compiled to an executable, which must allow every
      state the sim produced.
-  2. **Real-kernel replay.** Crash tests run on real Linux and macOS in ix VMs, cutting
+  2. **Real-kernel replay.** Crash tests run on real macOS (the Mac) and Linux (in CI), cutting
      power at the block layer (for example with dm-log-writes). Every state observed after
      the crash must be one the model allows.
 
@@ -111,11 +110,10 @@ proves every clause it proved: two provers are two trust bases and two lowerings
 - **Deleted:** `crates/hir-ty-verus` (the VIR lowering and the Z3 driver), `vendor/verus`,
   `tools/v2/verus_strip.py`, the pinned Z3 and `BLAZE_Z3`. `.clippy.toml` bans the removed
   names with their replacements. [verus.md](verus.md) is the record.
-- **One home for specs.** The clauses are in the Rust source; hir-def lowers them to clause
-  groups (`ExpressionStore::spec_clauses`); `crates/hir-ty-lean` states them in Lean
-  (`spec.rs`) and owns `proved(..)`, `Clause` and `ProofKey`; `crates/hir-ty-contracts` reads
-  the groups for the facts the optimizer may use and asks `proved` through the prover it is
-  given.
+- **One home for specs.** The clauses are in the Rust source; the front end lowers them to
+  clause groups; the translator states them in Lean and owns `proved(..)`, `Clause` and
+  `ProofKey`; the optimizer reads the groups for the facts it may use (facts.md) and asks
+  `proved`. None of this is built on the new layer.
 - **What lost its prover.** Each is reported "not proved", with why, and never passed:
   - an `ensures` with no proof file: Z3 proved linear arithmetic over integers and booleans
     from the clause and the body alone; Lean checks a proof someone wrote and searches for
@@ -135,7 +133,7 @@ proves every clause it proved: two provers are two trust bases and two lowerings
    Charon makes LLBC from ULLBC ([Charon](https://arxiv.org/abs/2410.18042)). It also folds
    checked arithmetic and bounds assertions back into single operations. Every back end below
    reads this one query.
-2. **Spec lowering.** The clause groups (hir-def's), which MIR building drops, are
+2. **Spec lowering.** The clause groups, which body lowering drops, are
    lowered from typed HIR into Lean terms: `int`/`nat` for spec arithmetic, `forall`,
    `==>`, `old`, and `spec fn`.
 3. **Lean emission.** One Lean module per item instance, so a module's imports are exactly
@@ -163,7 +161,7 @@ proves every clause it proved: two provers are two trust bases and two lowerings
 ### Incremental keys (`keys-cover-every-input`)
 
 - **The translation key** for an item instance covers:
-  - its behaviour identity ([code-identity.md](code-identity.md));
+  - its behaviour identity ([bottom.md](bottom.md), section 3);
   - the translator's version;
   - the profile's `overflow-checks` and panic strategy;
   - the target's pointer width and endianness;
@@ -254,8 +252,8 @@ used, `sort_unstable_by_key`, and `chunk_by`.
   path it stands for, and a blaze-sim differential test compares the Lean model, compiled, with
   the real std function that blaze built, on drawn inputs.
 
-**Refused.** Each names the item, the rule and the construct (`hir_ty_lean::NotTranslated`
-today; the `VerifyRefused` diagnostic once `blaze check --verify` reports it).
+**Refused.** Each names the item, the rule and the construct (the `VerifyRefused`
+diagnostic).
 
 | Rule | What it covers |
 |---|---|
@@ -304,9 +302,11 @@ transitive walk, so a refusal names the shortest call chain to the construct.
 - blaze's code generator, which turns the same MIR into machine code. v4 shrinks this, but
   until then the proof is about the program's MIR semantics, not the binary.
 
-**First target: `compact::plan` preserves rows.** `crates/blaze-profile/src/history/compact.rs`
-is already a pure function of file names with no IO, and it uses only slices, `Vec`, sorting,
-`chunk_by`, and `Vec::remove`. The lemma, stated as an `ensures` on `plan`, says:
+**First target: `compact::plan` preserves rows.** Its code, the profile history's compaction
+planner, was deleted with the profile crate on 2026-11-27 (end-state.md D178), so a new first
+target of the same shape is owed. It was a pure function of file names with no IO, and it used
+only slices, `Vec`, sorting, `chunk_by`, and `Vec::remove`. The lemma, stated as an `ensures` on
+`plan`, said:
 - every input index is in at most one merge;
 - each merge's inputs share one (build, table);
 - each merge's output covers exactly the union of its inputs' `first..=last`, at a level above
@@ -341,17 +341,15 @@ Second targets:
 
 ## v0 as built (2026-11-10)
 
-`crates/hir-ty-lean` (the translator and the driver), `lean/` (the library and the checked-in
-models) and `crates/blaze-graph/lean/` (the first proof). On 2026-11-10 `lake build` of
-`lean/` passed with Lean 4.20.0 and the crate's library compiled under `blaze check`; its
-tests have not run, so the checked-in models are predictions of what the translator emits.
-Where the plan above left a choice, this is the choice.
+The translator is not built on the new layer: its crate went with the old front end, and nothing translates the new layer's bodies to Lean. What is in the tree: `lean/Blaze`
+(the library), the golden models in `lean/BlazeModel` (what the old translator emitted, byte for
+byte), the first proof in `crates/blaze-graph/lean/`, the pinned Lean in `lean/lean-toolchain`
+(4.35.0), `harness/v2/lean_differential.py`, and `lake build` in `lean/` checking all of it
+without blaze in the loop. A rebuilt translator makes the choices below, which the goldens hold.
 
-**Structured MIR** (`structured.rs`, `body.rs`; `hir_ty_lean::structured(db, func)`).
-- Over built MIR (`mir_body`), after type checking and borrow checking accept the function.
-  It is in its own crate and not in hir-ty-mir: it is a reading of MIR for back ends, not a
-  pass, and hir-ty-mir need not build it. It is computed from memoized queries and is not yet
-  a memoized query itself.
+**Structured MIR.**
+- Over the checked body, after type checking and borrow checking accept the function: a
+  reading of the body for back ends, not a pass.
 - Control flow is reconstructed by Ramsey's algorithm ("Beyond Relooper") over the dominator
   tree: `Branch`, `Loop`, `Block`, `Break`, `Continue`, `Return`. The code a loop exits to is
   put after the loop. An irreducible graph is refused, naming the edge; nothing is duplicated.
@@ -362,9 +360,9 @@ Where the plan above left a choice, this is the choice.
   `Len`, `Lt`, `Assert` before an index) are folded back to the same.
 - A `&mut` temporary assigned once is replaced by the place it borrows.
 - Its refinement test lowers random structured programs to graphs, reconstructs them and runs
-  all three (`structured_code_runs_as_its_graph`, with two planted bugs).
+  all three, with two planted bugs.
 
-**The translation** (`translate.rs`).
+**The translation.**
 - Integers are `Blaze.Scalar ty`: an `Int` with its range, as in Aeneas's first Lean library,
   so `omega` proves arithmetic facts for signed and unsigned alike and nothing trusts native
   evaluation. `usize` is 64 bits; v0 translates for 64-bit little-endian targets.
@@ -399,22 +397,21 @@ chosen at run time, slice patterns, unsizing and pointer casts, recursion, tail 
 arm. `unsafe` blocks are refused through what they do (a raw pointer, a static, an extern
 call), not yet by themselves.
 
-**Specs** (`spec.rs`). `requires` and `ensures` (with a named return) over literals,
+**Specs.** `requires` and `ensures` (with a named return) over literals,
 parameters, the result, `!`, `-`, `+ - *`, comparisons, `&&`, `||`, a field and a slice's
 `len()`. Integers are their `.val : Int`. `forall`, `==>`, `old` and `spec fn` are not in the
 grammar on main; a loop's `invariant` is not lowered (a Lean proof brings its induction);
 `decreases`, `recommends` and a loop's `ensures` are refused by name.
 
-**Emission** (`hir_ty_lean::emit`). One module per function, `BlazeModel.<krate>.<path>`:
+**Emission.** One module per function, `BlazeModel.<krate>.<path>`:
 its types, its loops, the model, and `def <fn>.spec.statement : Prop`: for all arguments (and
 all fuel) under the `requires`, the model does not fail and its result meets the `ensures`;
 out of fuel is allowed, so a function with a loop gets partial correctness.
 
 **Where things live.**
 - The library: `lean/Blaze` (`Result`, `Scalar`, `Slice`, `Std`), core Lean only, no Mathlib.
-  It is built into blaze (`hir_ty_lean::LIBRARY`), so a proof key covers its text. It is
-  blaze's own, written for this translation, not a fork of Aeneas's library.
-- Generated modules: a directory blaze owns (`Config::out`), never the source tree. The
+  It is built into blaze, so a proof key covers its text. It is blaze's own, written for this translation, not a fork of Aeneas's library.
+- Generated modules: a directory blaze owns, never the source tree. The
   copies under `lean/BlazeModel` are test expectations: the golden tests hold each to what
   the translator emits, byte for byte, so `lake build` in `lean/` type-checks the
   translator's output and the proofs over it without blaze in the loop.
@@ -426,17 +423,16 @@ out of fuel is allowed, so a function with a loop gets partial correctness.
   `theorem <fn>.spec : <fn>.spec.statement := <fn>.spec.proof`, which fails to elaborate, naming
   the theorem, when the proof is of anything else.
 
-**The check** (`hir_ty_lean::check`, `proved`). The pinned Lean is 4.35.0
-(`lean/lean-toolchain`), named by `BLAZE_LEAN_PROVER` (an absolute path to `lean`; no `PATH`,
-no elan; `BLAZE_LEAN` was taken by the code generator), and refused when `--version` says
-another. Proved means Lean accepts the check module and `#print axioms` lists only `propext`,
+**The check.** The pinned Lean is 4.35.0 (`lean/lean-toolchain`), named by
+`BLAZE_LEAN_PROVER` (an absolute path to `lean`; no `PATH`, no elan), and refused when
+`--version` says another. Proved means Lean accepts the check module and `#print axioms` lists only `propext`,
 `Classical.choice` and `Quot.sound`: a `sorry` (`sorryAx`) and native evaluation
 (`Lean.ofReduceBool`) are refused by name. The proof key covers the Lean version, the
 translator's version, the allowed axioms, the library, every model the proof can see, the
-check module and the proof file. Lean is not yet run in blaze's sandbox, verdicts are not yet
-persisted, and `blaze check --verify` does not exist: the entry is the function.
+check module and the proof file. Lean is not run in blaze's sandbox, verdicts are not
+persisted, and `blaze check --verify` does not exist.
 
-**The first proof** (objective V5). `blaze_graph::ledger::fnv1a_from`, the checksum of the
+**The first proof.** `blaze_graph::ledger::fnv1a_from`, the checksum of the
 memory ledger's file. blaze's own crates do not turn `blaze_verify` on yet, so its `ensures`
 is on a test fixture that reads the function's text from the tree. The proof file
 `crates/blaze-graph/lean/BlazeGraph/Ledger.lean` states and proves: the loop never fails (no
@@ -445,37 +441,34 @@ the bytes, it returns with more fuel than bytes, and the generated statement fol
 test `fnv1a_from_is_the_fold_of_its_bytes` states the invariant as proved.
 `harness/v2/lean_differential.py` runs the compiled model against the function blaze built.
 
-**How to run it.** The Rust tests: `blaze test -p hir-ty-lean` (one needs
-`BLAZE_LEAN_PROVER`, and `mir_semantics_corpus` is run by `harness/v2/mir_semantics.py`). The Lean: `lake build` in `lean/` with the pinned toolchain builds the
-library, every golden model and the proofs. After a deliberate change to the translator,
-`UPDATE_EXPECT=1` rewrites the goldens, and `lake build` must pass again.
-
 ## The semantics of MIR (2026-11-10)
 
 Rule `verified-compiler` needs one thing every proof and every pass is held to: what a MIR
 body means. It is `lean/Blaze/Mir`, a deep embedding of blaze's MIR with an executable
 semantics, for a first subset. `lake build` of `lean/` passes with Lean 4.20.0 up to commit cc0f8f3ee7 (2026-11-11), and
 the gate (below) holds every theorem of `lean/theorems.json`; what was written after a
-checked commit says so where it is described. The Rust tests of `crates/hir-ty-lean` have
-not run, so every embedded body is a prediction of the encoder's output. Objectives V6, V7 and V8 decide it.
+checked commit says so where it is described. The encoder that wrote the embedded bodies went
+with the old front end, so they are goldens with no producer until it is rebuilt. Three pieces below decide it: the differential harness, a model tied to
+the semantics, and the first proved transformations.
 
 **Prior art, and the one lesson taken from each.**
 - [MiniRust](https://github.com/minirust/minirust): a specification of Rust's operational
   semantics is best written as an interpreter, so it can be run against the implementation.
-  `step` and `run` are total Lean functions, and V6 runs them against the evaluator.
+  `step` and `run` are total Lean functions, and the differential harness runs them against the evaluator.
 - [a-mir-formality](https://github.com/rust-lang/a-mir-formality): a formal model stays true
   only while it is tested against the compiler it models. The embedded bodies are goldens of
-  the encoder, and the differential harness is in the ledger.
+  the encoder, and the differential harness (below) runs them against the compiler.
 - [CompCert](https://compcert.org/): a pass is proved by a forward simulation, and
   correctness is stated as "every behaviour of the target is a behaviour of the source".
   `Outcome.Refines` is that statement; `run_mapBlocks` is the simulation for block-local
   passes.
 - Translation validation (Pnueli, Siegel, Singerman 1998; Necula 2000) and
   [Alive2](https://github.com/AliveToolkit/alive2): a pass too large to prove is checked on
-  each run, by a checker that is itself small. V8's second half does this.
+  each run, by a checker that is itself small. The translation validator of the proved
+  transformations (below) does this.
 - [Aeneas](https://github.com/AeneasVerif/aeneas): the functional translation is trusted
   there (its ICFP 2024 proof is of the symbolic semantics against a borrow checker, not of the
-  emitted model). V7 proves each emitted model against the semantics instead.
+  emitted model). Here each emitted model is proved against the semantics instead.
 - [CakeML](https://cakeml.org/) and [seL4](https://sel4.systems/): a verified stack is a
   chain of refinements, each between two stated semantics, and what is not in the chain is
   listed. "The trusted base" below is that list.
@@ -526,7 +519,7 @@ and no axiom.
 - **Against `Blaze.Result`.** `Result` is `Outcome` without `undefined`:
   `Outcome.ofResult` maps `ok`, `fail`, `div` to `ok`, `panic`, `diverge`, and
   `Outcome.toResult?` is its inverse, `none` exactly on `undefined`. The functional models
-  assume a borrow-checked safe program has no undefined behaviour; a V7 theorem discharges
+  assume a borrow-checked safe program has no undefined behaviour; a theorem tying a model to the semantics discharges
   the assumption for its function, because it shows the run is an `ofResult`. Two differences
   to know: the models read MIR's `Unreachable` as `fail unreachable`, the semantics as
   undefined; a model counts loop turns as fuel, the semantics counts blocks.
@@ -542,18 +535,17 @@ and no axiom.
   `State.read_write_other` (a write at a place leaves the read of every place in another
   slot as it was); two places in one slot are not covered.
 
-**V6: the differential harness.** `harness/v2/mir_semantics.py differential` draws programs
+**The differential harness.** `harness/v2/mir_semantics.py differential` draws programs
 (arithmetic with overflow, a struct through a `&mut` parameter, an enum built and matched, a
 loop, an array index, an explicit panic with an early return and a division, shifts) and gets
-three answers per call: the Lean semantics on the body `hir_ty_lean::embed_mir` writes
-(`crates/hir-ty-lean/src/body/embed.rs`), blaze's MIR evaluator (`interpret_mir`), and the
-executable blaze builds. They must agree on the value or the kind of panic. The program is
+three answers per call: the Lean semantics on the body the encoder writes (not built on the
+new layer), blaze's evaluator, and the executable blaze builds. They must agree on the value or the kind of panic. The program is
 Lean source, the encoder's one output: the runner (`Blaze/Mir/Runner.lean`) has the programs
 compiled in and reads calls, so no second form of a body is parsed. The Rust half is the
 test `mir_semantics_corpus`, the smallest hook that reaches the encoder and the evaluator
 from a script; there is no `blaze debug` command for either.
 
-**V7: a model is tied to the semantics.** The chain for `fnv1a_from`:
+**A model is tied to the semantics.** The chain for `fnv1a_from`:
 
 ```text
 MIR of crates/blaze-graph/src/ledger.rs
@@ -590,7 +582,7 @@ was not taken: a model is a Lean function, not data, so the checker would need a
 embedding of the model language and its own semantics, and the evaluation of a loop's
 agreement does not terminate by `rfl`. `native_decide` is not allowed either way.
 
-**V8: the first proved transformations** (`Blaze/Mir/Opt`). A pass is a Lean function on
+**The first proved transformations** (`Blaze/Mir/Opt`). A pass is a Lean function on
 programs; it is the specification of the Rust pass of the same name.
 - **Refinement.** `Outcome.Refines target source`: the source is undefined, or the two are
   equal. Behaviours of the target are behaviours of the source.
@@ -721,7 +713,7 @@ programs; it is the specification of the Rust pass of the same name.
     pointers into frame 0 only, where the start state holds the invariant.
   - **Liveness across blocks is the next entry**, `removeDead`: this pass needs none. No
     `BlazeValidated` pair for DSE yet.
-- **Global dead-store elimination (ledger V11): proved for `removeDead`.** One relation serves
+- **Global dead-store elimination: proved for `removeDead`.** One relation serves
   the Rust `DeadStoreElimination`, the deleting half of `CopyProp` (a use rewritten is
   `symEq`; the copy left unused is a dead store) and of `SimplifyLocals` (which also
   renumbers locals: a rename of locals, a commutation family like `Opt/Rename.lean`'s, not
@@ -897,7 +889,7 @@ programs; it is the specification of the Rust pass of the same name.
   on the scalar, move-free subset (blocks outside it must be equal). It does not accept a
   store or a local removed (the deleting half of the Rust `CopyProp`, `SimplifyLocals`):
   there the two programs' states differ on a dead local across steps, which is the relation
-  `removeDead_refines` is proved with (ledger V11, above). The inliner needs a relation between one frame and two; loop transforms need a
+  `removeDead_refines` is proved with (above). The inliner needs a relation between one frame and two; loop transforms need a
   witness that is not per block.
 - **The Rust passes are held to them by translation validation.** The test
   `the_passes_are_their_lean_specifications` and `mir_semantics.py validate` run each pass
@@ -908,7 +900,7 @@ programs; it is the specification of the Rust pass of the same name.
   assigned a constant; there `after ≠ spec before` and the build says so.
 **The gate holds the proofs** (`harness/v2/lean_gate.py`; written 2026-11-10, its first run
 in CI pending). What is claimed proved is one list, `lean/theorems.json` (each theorem's name,
-module, what it says and its ledger row), and [proofs.md](../proofs.md) is generated from it
+module, what it says and the group proofs.md lists it under), and [proofs.md](../proofs.md) is generated from it
 with each statement as its module states it. The `lean` job of `blaze.yaml` runs the gate's
 `check` on every change, with the Lean `lean/lean-toolchain` pins:
 - `lake build` of `lean/` and of `lean/analysis` (after `lake exe cache get`), and neither log
@@ -928,40 +920,34 @@ statement is printed in proofs.md so a reader can.
 
 **The trusted base** (what a `(proved: ..)` of rule 57 rests on, beyond what is proved):
 - Lean's kernel, and the axioms `propext`, `Classical.choice`, `Quot.sound`.
-- That `lean/Blaze/Mir` is what Rust means, on the subset. Reduced by V6's three-way run.
+- That `lean/Blaze/Mir` is what Rust means, on the subset. Reduced by the differential harness's three-way run.
 - The encoder (`body/embed.rs`): the blocks it keeps, false edges as `goto`, the intrinsics.
-  Reduced by V6 and by the golden tests.
+  Reduced by the differential harness and by the golden tests.
 - The memory model's coverage: what it cannot express, above.
 - `Blaze.Scalar` and the intrinsics as the meaning of core's integer operations.
-- The functional translation, for every model without a V7 theorem (all but `fnv1a_from`;
+- The functional translation, for every model without a theorem tying it to the semantics (all but `fnv1a_from`;
   `add_one`, `clamp` and `count` leave the list when Lean has checked their proofs).
 - blaze's front end up to MIR: parsing, name resolution, type and borrow checking, MIR
   building. A proof is about the MIR blaze built.
-- Runtime lowering (`crates/hir-ty-mir/src/mir/transform`: `AddAsserts`, `ElaborateDrops`,
-  cleanup, upvars, packed drops) and every MIR pass without a proof or a validation
-  (`crates/hir-ty-mir/src/mir/optimize`): `CleanupPostBorrowck`, `SimplifyCfg`, `HeapToStack`,
-  `BoxInPlace`, `CheckAlignment`, `CheckNull`, `CheckEnums`, `LowerSliceLenCalls`,
-  `InstSimplify`, `Devirtualize`, `Inline`, `RemoveUnneededDrops`, `UnreachablePropagation`,
-  `SimplifyLocals`, `DeadStoreElimination`, `SingleUseConsts`, `RemoveNoopLandingPads`,
-  `CopyProp`, `CriticalCallEdges`, `Specialize`, monomorphization, and
-  `SimplifyConstCondition` where it does more than its specification.
-- MIR to Cranelift IR lowering in `crates/hir-ty-codegen` (today's path), with layout, ABI
-  and unwinding.
-- Below it: the stencils, LLVM, the linker, the loader and live patching, the OS, hardware.
+- Runtime lowering (drop elaboration, asserts, cleanup, upvars, packed drops), every pass
+  without a proof or a validation, and monomorphization.
+- The lowering to LIR (crates/blaze-lir) and from LIR to machine code, with layout, ABI and
+  unwinding.
+- Below it: the linker, the loader, the OS, hardware.
 - For the derivative theorems, what ["Derivatives"](#derivatives-2026-11-10) lists: Mathlib,
   the rule generator, the link from the Lean differentiator to the Rust one, and floats.
 
 ## Two semantics, one lowering
 
 MIR's semantics, above, is the specification of Rust programs: typed, with places, panics
-and undefined behaviour. LIR ([lir.md](lir.md), `crates/blaze-lir`, ledger L1) will get its
+and undefined behaviour. LIR ([lir.md](lir.md), `crates/blaze-lir`) will get its
 own, lower semantics: SSA with block parameters, machine types, bytes and pointers with
 provenance, no Rust types. It is not written now: LIR has no producer yet (code generation
 still builds Cranelift IR from MIR), and a specification nothing runs against rots.
 
-The chain, once L1 is built:
+The chain, once code generation takes LIR:
 1. **MIR to LIR is the one large lowering** (layout, ABI, drop elaboration, unwinding). It is
-   held by translation validation per function, against both semantics (ledger V9).
+   held by translation validation per function, against both semantics.
 2. **LIR passes** are proved or validated against LIR's semantics, as MIR passes are here.
 3. **LIR to machine code** (the stencils, LLVM) stays in the trusted base.
 
@@ -974,7 +960,7 @@ relation can be written: values carry no layout, and nothing in the semantics re
 
 `crates/blaze-diff` takes symbolic derivatives by a table of rules and simplifies them by a
 table of rewrites ([autodiff.md](../../../future/autodiff.md)). Both tables are proved, over
-the reals, in a second Lake package, `lean/analysis`. Objective V10 is the row.
+the reals, in a second Lake package, `lean/analysis`.
 
 **What Lean has checked and what nothing has compiled.** `lake build` of `lean/analysis`
 passes with Lean 4.20.0 at commit a36c7907ae: every theorem below is checked by Lean (their
@@ -1137,7 +1123,7 @@ module is blaze's own code.
 anything that depends on layout beyond what the layout query proves (until v4).
 
 **Trust base:** v0's, plus the MIR semantics in Lean and its memory model, held to the MIR
-evaluator and to built code by V6's differential runs.
+evaluator and to built code by the differential harness's runs.
 
 **First target:** the bump arena behind `Vec::new_in(frame)` (`bump-allocate`). Every block it
 hands out is in bounds, aligned, and disjoint from every other live block, and a reset frees
@@ -1165,8 +1151,9 @@ lifetime-logic port is a separate effort of similar size.
   race in `Arc`), and [Cosmo](https://dl.acm.org/doi/10.1145/3408978) for views as an
   abstract type.
 
-**First target: the flight recorder's ring move** (`crates/blaze-profile/src/flight.rs`,
-`move_store` and `flushed`).
+**First target: the flight recorder's ring move** (`move_store` and `flushed`; deleted with
+the profile crate on 2026-11-27, end-state.md D178, so the protocol below stands as the shape a
+new first target needs).
 - **The invariant:** a store's `flushed` is never below a value that a `flushed()` call has
   published for that ring.
 - **The bug it catches:** the 2026-11-04 bug breaks it. `copy_to` reads the old store's
@@ -1209,8 +1196,9 @@ effects, so the model's effects are the core's effects.
 - **The property:** every row that was recorded and flushed appears exactly once after any
   crash.
 - **What the proof covers:** the commit protocol (manifest rename under `manifest.lock`,
-  retire, pin) and the postmortem ring's `flushed` mark, together
-  (`crates/blaze-profile/src/history/`, `flight/postmortem.rs`).
+  retire, pin) and the postmortem ring's `flushed` mark, together (the profile crate's
+  `history/` and `flight/postmortem.rs`, deleted on 2026-11-27 with the profile, end-state.md
+  D178; the next durable writer takes its place as the target).
 - **The crash classes it must rule out**, from the 2026-11-04 review and the testing skill's
   table:
   - no fsync before the manifest rename;
@@ -1235,7 +1223,7 @@ reused directly.
   is the only defence.
 - Perennial's Lean port is young.
 
-**CI:** as in v0, plus a real-kernel replay job in ix VMs on the release train.
+**CI:** as in v0, plus a real-kernel Linux replay job on the release train.
 
 ## v4: compiler correctness
 
@@ -1245,9 +1233,9 @@ order:
 1. **Layout and ABI.** A Lean spec of the pinned nightly's layout rules for `repr(Rust)`, `C`,
    `transparent` and niche filling, and a proof that blaze's layout query implements it.
    Every rule in the spec is cited to the rustc source at the pinned commit.
-2. **Const eval.** blaze's MIR evaluator refines the MIR semantics (V6 tests it today).
+2. **Const eval.** blaze's MIR evaluator refines the MIR semantics (the differential harness tests it today).
 3. **The translator itself.** Each emitted model is proved against the MIR semantics
-   (objective V7, "The semantics of MIR"); a proof of the translator once and for all would
+   ("The semantics of MIR"); a proof of the translator once and for all would
    replace the per-model proofs.
 4. **Trait resolution.** Coherence, and determinism of selection. Full equivalence with
    rustc's solver is out of scope, because the solver itself is still changing upstream.

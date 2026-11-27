@@ -5,10 +5,9 @@
 //! the same API, its plant on the `Planted` seam (`pop_planted`, `blaze_own::Heap4Plant`) instead
 //! of this crate's thread-local switch. This copy stays until its users move, then becomes
 //! `pub use blaze_own::Heap4;` and the file goes. Its users: blaze-protocol src/events.rs (12,
-//! 159, 170), blaze-graph src/plane.rs (66, 849, 862), blaze-profile src/time/sim.rs (23, 408,
-//! 430), and this crate's examples/heaps.rs and src/tests/heaps.rs. Each changes its import
-//! from `blaze_kit::Heap4` to `blaze_own::Heap4`, and the three that write `Global` take the
-//! caller's allocator instead.
+//! 159, 170), blaze-graph src/plane.rs (66, 849, 862), and this crate's examples/heaps.rs and
+//! src/tests/heaps.rs. Each changes its import from `blaze_kit::Heap4` to `blaze_own::Heap4`,
+//! and the ones that write `Global` take the caller's allocator instead.
 //!
 //! The children of slot `i` are `4i + 1 ..= 4i + 4`, so the tree is half as deep as a binary
 //! heap's and the four children of a slot are adjacent: for an 8- or 16-byte `T` they share one

@@ -214,6 +214,9 @@ pub struct Maps {
     /// [`Heads::trait_super_projs`]), filed with `supers` and restored from
     /// [`TraitExtra::supertraits`].
     pub super_projs: Rows<LibKey, blaze_own::Vec<super::types::SuperProj, Alloc<'static>>>,
+    /// Traits whose full members (`Want::Members`, Layer 3 — including `assoc_consts`) have been
+    /// filed, distinguishing Layer 2 (`supers_only`) from complete member loading.
+    pub trait_members_made: Rows<LibKey, ()>,
     /// Each type alias's generic count and aliased type ([`Heads::alias`]); `None` where its
     /// head was refused, with the why in `alias_gaps`: an alias no path uses never fails a
     /// check, and one that is used fails only the item that names it.
@@ -306,6 +309,7 @@ impl Maps {
             assoc_consts: Rows::new_in(alloc),
             supers: Rows::new_in(alloc),
             super_projs: Rows::new_in(alloc),
+            trait_members_made: Rows::new_in(alloc),
             aliases: Rows::new_in(alloc),
             alias_defaults: Rows::new_in(alloc),
             alias_slots: Rows::new_in(alloc),
@@ -342,6 +346,7 @@ impl Maps {
             assoc_consts,
             supers,
             super_projs,
+            trait_members_made,
             aliases,
             alias_defaults,
             alias_slots,
@@ -372,6 +377,7 @@ impl Maps {
         assoc_consts.clear();
         supers.clear();
         super_projs.clear();
+        trait_members_made.clear();
         aliases.clear();
         alias_defaults.clear();
         alias_slots.clear();
@@ -589,6 +595,9 @@ impl Heads for Maps {
     }
     fn trait_super_projs(&self, trait_: LibKey) -> Option<&[super::types::SuperProj]> {
         self.super_projs.get(&trait_).map(|s| &s[..])
+    }
+    fn trait_members_made(&self, trait_: LibKey) -> bool {
+        self.trait_members_made.contains_key(&trait_)
     }
     fn trait_has_assoc(&self, trait_: LibKey, name: Name) -> Option<bool> {
         self.traits.get(&trait_).map(|t| t.assoc.contains(&name))
@@ -956,205 +965,6 @@ fn is_sans_io_attr(path: &str) -> bool {
     path.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "sans_io")
 }
 
-/// Skips leading whitespace, `//` line comments, and nested `/* ... */` block comments.
-fn skip_ws_and_comments(mut s: &str) -> &str {
-    loop {
-        let trimmed = s.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("//") {
-            match rest.find('\n') {
-                Some(nl) => s = &rest[nl + 1..],
-                None => return "",
-            }
-            continue;
-        }
-        if let Some(mut rest) = trimmed.strip_prefix("/*") {
-            let mut depth = 1usize;
-            while depth > 0 {
-                let open = rest.find("/*");
-                let close = rest.find("*/");
-                match (open, close) {
-                    (_, None) => return "",
-                    (Some(o), Some(c)) if o < c => {
-                        depth += 1;
-                        rest = &rest[o + 2..];
-                    }
-                    (_, Some(c)) => {
-                        depth -= 1;
-                        rest = &rest[c + 2..];
-                    }
-                }
-            }
-            s = rest;
-            continue;
-        }
-        return trimmed;
-    }
-}
-
-/// Scans past a balanced `[` ... `]` attribute body (starting just after `[`), returning
-/// `(inner_text, rest_after_close_bracket)`.
-fn scan_attr_bracket(s: &str) -> Option<(&str, &str)> {
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
-    let mut depth = 1usize;
-    let mut in_str = false;
-    let mut escape = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str {
-            if escape {
-                escape = false;
-            } else if b == b'\\' {
-                escape = true;
-            } else if b == b'"' {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((&s[..i], &s[i + 1..]));
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Returns `true` iff `text`'s leading inner attributes (`#![...]`) include `#![blaze::sans_io]`.
-fn has_leading_inner_sans_io(mut text: &str) -> bool {
-    for _ in 0..256 {
-        text = skip_ws_and_comments(text);
-        let Some(after_hash) = text.strip_prefix('#') else { return false };
-        let after_hash = skip_ws_and_comments(after_hash);
-        let Some(after_bang) = after_hash.strip_prefix('!') else { return false };
-        let after_bang = skip_ws_and_comments(after_bang);
-        let Some(after_open) = after_bang.strip_prefix('[') else { return false };
-        let Some((inner, rest)) = scan_attr_bracket(after_open) else { return false };
-        if is_sans_io_attr(inner.trim()) {
-            return true;
-        }
-        text = rest;
-    }
-    false
-}
-
-/// Scans `text[..target_offset]` with a tiny stack of enclosing `{` offsets (skipping comments,
-/// strings, and char literals) and returns `true` iff any enclosing `{ ... }` block starts with
-/// `#![blaze::sans_io]` (e.g. `mod core_mod { #![blaze::sans_io] ... }`).
-fn enclosing_block_has_sans_io(text: &str, target_offset: usize) -> bool {
-    let limit = target_offset.min(text.len());
-    let bytes = text.as_bytes();
-    let mut stack = [0usize; 64];
-    let mut depth = 0usize;
-    let mut i = 0usize;
-    while i < limit {
-        let b = bytes[i];
-        // Line comment `// ...`
-        if b == b'/' && i + 1 < limit && bytes[i + 1] == b'/' {
-            i += 2;
-            while i < limit && bytes[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // Nested block comment `/* ... */`
-        if b == b'/' && i + 1 < limit && bytes[i + 1] == b'*' {
-            i += 2;
-            let mut cdepth = 1usize;
-            while i < limit && cdepth > 0 {
-                if bytes[i] == b'/' && i + 1 < limit && bytes[i + 1] == b'*' {
-                    cdepth += 1;
-                    i += 2;
-                } else if bytes[i] == b'*' && i + 1 < limit && bytes[i + 1] == b'/' {
-                    cdepth -= 1;
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        // String literal `"..."`
-        if b == b'"' {
-            i += 1;
-            while i < limit {
-                if bytes[i] == b'\\' {
-                    i += 2;
-                } else if bytes[i] == b'"' {
-                    i += 1;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-        // Char literal `'x'` / `'\''` (distinguished from lifetime `'a` by closing `'`).
-        if b == b'\'' {
-            if i + 2 < limit && bytes[i + 1] == b'\\' {
-                if i + 3 < limit && bytes[i + 3] == b'\'' {
-                    i += 4;
-                    continue;
-                }
-            } else if i + 2 < limit && bytes[i + 2] == b'\'' {
-                i += 3;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        if b == b'{' {
-            if depth < stack.len() {
-                stack[depth] = i;
-            }
-            depth += 1;
-        } else if b == b'}' && depth > 0 {
-            depth -= 1;
-        }
-        i += 1;
-    }
-    let kept = depth.min(stack.len());
-    for &brace in &stack[..kept] {
-        if let Some(after) = text.get(brace + 1..)
-            && has_leading_inner_sans_io(after)
-        {
-            return true;
-        }
-    }
-    false
-}
-
-/// Returns `true` iff `key` is defined inside a `#![blaze::sans_io]` crate, module file, or
-/// inline `mod { #![blaze::sans_io] ... }` block.
-fn is_in_sans_io_scope<'n, S: NamesSource<'n>>(names: S, key: LibKey, module: LibKey) -> bool {
-    let Some(krate) = names.crate_of(key).or_else(|| names.crate_of(module)) else {
-        return false;
-    };
-    // 1. Crate root file (`file 0`) carries `#![blaze::sans_io]`.
-    if let Some(root_text) = names.file_text(krate, 0)
-        && has_leading_inner_sans_io(root_text)
-    {
-        return true;
-    }
-    // 2. Item's own file carries `#![blaze::sans_io]` or an enclosing inline `mod { #![blaze::sans_io] ... }`.
-    if let Some((blaze_scope::resolve::At::File(file), start)) = names.item_start(key)
-        && let Some(text) = names.file_text(krate, file)
-    {
-        if (file != 0 && has_leading_inner_sans_io(text)) || enclosing_block_has_sans_io(text, start as usize) {
-            return true;
-        }
-    }
-    false
-}
-
 /// An enum's discriminant type (the Reference, "Enumerations", "Discriminants": "Under the
 /// default representation, the discriminant is interpreted as an `isize` value"; a primitive
 /// representation `#[repr(u8)]` makes it that integer type), as the checker's `DiscrRepr`.
@@ -1289,6 +1099,7 @@ impl FnQualifiers {
     const INTERNAL_SYMBOL: u8 = 1 << 1;
     const RENAMED_INTERNAL: u8 = 1 << 3;
     const WRITES_LIFETIMES: u8 = 1 << 6;
+    const DEPRECATED_SAFE_2024: u8 = 1 << 7;
 
     fn of_flags(flags: u32) -> Self {
         Self(u8::from(flags & sig::CONST != 0))
@@ -1310,12 +1121,13 @@ impl FnQualifiers {
     }
 
     fn attribute(&mut self, path: &str) {
-        use super::fn_attrs::{COMPTIME, INTRINSIC, PROMOTABLE, TARGET_FEATURE};
+        use super::fn_attrs::{COMPTIME, DEPRECATED_SAFE_2024, INTRINSIC, PROMOTABLE, TARGET_FEATURE};
         self.0 |= match path {
             PROMOTABLE => tc::TypeAttrs::PROMOTABLE as u8,
             INTRINSIC => tc::TypeAttrs::INTRINSIC as u8,
             TARGET_FEATURE => tc::TypeAttrs::TARGET_FEATURE as u8,
             COMPTIME => Self::CONST.0,
+            DEPRECATED_SAFE_2024 => Self::DEPRECATED_SAFE_2024,
             super::internal_symbol::ATTR => Self::INTERNAL_SYMBOL,
             _ => 0,
         };
@@ -1330,7 +1142,7 @@ impl FnQualifiers {
     }
 
     pub(super) fn from_byte(byte: u8) -> Option<Self> {
-        let allowed = Self::CONST.0 | Self::ATTRS as u8 | Self::INTERNAL_SYMBOL | Self::RENAMED_INTERNAL | Self::WRITES_LIFETIMES;
+        let allowed = Self::CONST.0 | Self::ATTRS as u8 | Self::INTERNAL_SYMBOL | Self::RENAMED_INTERNAL | Self::WRITES_LIFETIMES | Self::DEPRECATED_SAFE_2024;
         let valid_rename = byte & Self::RENAMED_INTERNAL == 0 || byte & Self::INTERNAL_SYMBOL != 0;
         (byte & !allowed == 0 && valid_rename).then_some(Self(byte))
     }
@@ -1340,7 +1152,11 @@ impl FnQualifiers {
     }
 
     pub fn typing(self) -> tc::TypeAttrs {
-        tc::TypeAttrs(u32::from(self.0) & Self::ATTRS)
+        let mut bits = u32::from(self.0) & Self::ATTRS;
+        if self.0 & Self::DEPRECATED_SAFE_2024 != 0 {
+            bits |= tc::TypeAttrs::DEPRECATED_SAFE_2024;
+        }
+        tc::TypeAttrs(bits)
     }
 
     pub fn internal_symbol(self) -> bool {
@@ -2974,7 +2790,7 @@ enum Step {
     First(Want),
 }
 
-/// A want parked on [`Store::ensure_seeded`]'s stack (typeck.md "Head making waits"): the want
+/// A want parked on [`Store::ensure_seeded`]'s stack (end-state.md D161): the want
 /// and, once a step reached its text, that text's lowering, kept until the want is made.
 pub(super) struct HeadFrame<'n> {
     want: Want,
@@ -4701,6 +4517,7 @@ impl<'n> Store<'n> {
                     }
                     if let Some(x) = extra {
                         self.trait_defs.insert(ck, x);
+                        self.maps.trait_members_made.insert(key, ());
                     }
                     if let Some(p) = preds {
                         let p = blaze_own::Box::into_inner(p);
@@ -5703,6 +5520,7 @@ impl<'n> Store<'n> {
             }
         }
         self.trait_defs.insert(ck, TraitExtra { supertraits, assoc, consts });
+        self.maps.trait_members_made.insert(key, ());
         self.preds.insert(ck, preds);
         self.container_life_from_view(names, keys, key, module, v);
         Ok(())
@@ -5958,7 +5776,7 @@ impl<'n> Store<'n> {
             capability |= is_capability_attr(path);
             sans_io |= is_sans_io_attr(path);
         }
-        sans_io |= is_in_sans_io_scope(names, key, module);
+        sans_io |= names.in_sans_io_scope(key, module);
         let discrs = discriminants(&b, &mut self.tys, &env, v, repr, &written)?;
         self.register_record_defaults(names, keys, key, &env, marks, v)?;
         let (lifetimes, field_region_at, field_region_list) = super::borrows::freeze_field_regions(names, keys, self, ck, v, kind, &fields, self.tys.alloc())?;

@@ -497,3 +497,251 @@ pub extern \"C-unwind\" fn main() -> i32 {{
     assert_eq!(status, 0, "expected all 9 ReifyShim checks to pass, got failure code {status}");
     println!("TRACK CALLER REIFY: all 9 cases (free, generic agg, inherent, trait, HOF, Option::map, Result::map_err, const, static) passed whole + lazy");
 }
+
+const TRACKED_DROP_PRELUDE: &str = "#![feature(no_core, lang_items, intrinsics, rustc_attrs)]
+#![no_core]
+#![no_main]
+#![allow(internal_features)]
+
+#[lang = \"pointee_sized\"]
+trait PointeeSized {}
+
+#[lang = \"meta_sized\"]
+trait MetaSized: PointeeSized {}
+
+#[lang = \"sized\"]
+trait Sized: MetaSized {}
+
+#[lang = \"legacy_receiver\"]
+trait LegacyReceiver: PointeeSized {}
+
+impl<T: PointeeSized> LegacyReceiver for &T {}
+impl<T: PointeeSized> LegacyReceiver for &mut T {}
+impl<T: PointeeSized> LegacyReceiver for MyBox<T> {}
+
+#[lang = \"copy\"]
+trait Copy {}
+
+impl Copy for bool {}
+impl Copy for u8 {}
+impl Copy for u32 {}
+impl Copy for u64 {}
+impl Copy for i32 {}
+impl Copy for usize {}
+impl<T: PointeeSized> Copy for &T {}
+impl<T: PointeeSized> Copy for *const T {}
+impl<T: PointeeSized> Copy for *mut T {}
+
+#[lang = \"drop\"]
+trait Drop {
+    fn drop(&mut self);
+}
+
+#[lang = \"drop_in_place\"]
+unsafe fn drop_in_place<T: PointeeSized>(_to_drop: *mut T) {}
+
+#[lang = \"panic_cannot_unwind\"]
+fn panic_cannot_unwind() -> ! {
+    loop {}
+}
+
+#[lang = \"unsize\"]
+trait Unsize<T: PointeeSized>: PointeeSized {}
+
+#[lang = \"coerce_unsized\"]
+trait CoerceUnsized<T: PointeeSized> {}
+
+impl<'a, 'b: 'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a U> for &'b T {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<&'a mut U> for &'a mut T {}
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> CoerceUnsized<MyBox<U>> for MyBox<T> {}
+
+#[lang = \"panic_location\"]
+struct Location<'a> {
+    file: &'a str,
+    line: u32,
+    col: u32,
+}
+
+#[rustc_intrinsic]
+const fn caller_location() -> &'static Location<'static>;
+
+#[rustc_intrinsic]
+const fn size_of<T>() -> usize;
+
+#[rustc_intrinsic]
+unsafe fn write_via_move<T>(dst: *mut T, value: T);
+
+fn str_eq(a: &str, b: &str) -> bool {
+    let a = a as *const str as *const u8;
+    let b = b as *const str as *const u8;
+    let mut i: usize = 0;
+    while i < 11 {
+        unsafe {
+            if *((a as usize + i) as *const u8) != *((b as usize + i) as *const u8) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    true
+}
+
+static mut ARENA: [u64; 64] = [0; 64];
+static mut NEXT_SLOT: usize = 0;
+static mut DROP_COUNT: u32 = 0;
+static mut DROP_SUM: u32 = 0;
+static mut LAST_LINE: u32 = 0;
+static mut LAST_COL: u32 = 0;
+static mut FILE_OK: bool = true;
+
+#[lang = \"owned_box\"]
+struct MyBox<T: PointeeSized>(*mut T);
+
+impl<T> MyBox<T> {
+    fn new(v: T) -> MyBox<T> {
+        let sz = size_of::<T>();
+        unsafe {
+            let words = (sz + 7) >> 3;
+            let base = &raw mut ARENA as usize;
+            let slot = (base + NEXT_SLOT * 8) as *mut T;
+            NEXT_SLOT = NEXT_SLOT + words;
+            write_via_move(slot, v);
+            MyBox(slot)
+        }
+    }
+}
+
+impl<T: PointeeSized> Drop for MyBox<T> {
+    fn drop(&mut self) {}
+}
+
+trait Marker {}
+
+struct Guard {
+    id: u32,
+}
+
+impl Marker for Guard {}
+
+impl Drop for Guard {
+    #[track_caller]
+    fn drop(&mut self) {
+        let loc = caller_location();
+        unsafe {
+            DROP_COUNT = DROP_COUNT + 1;
+            DROP_SUM = DROP_SUM + self.id;
+            LAST_LINE = loc.line;
+            LAST_COL = loc.col;
+            if loc.line == 0 || !str_eq(loc.file, \"src/main.rs\") {
+                FILE_OK = false;
+            }
+        }
+    }
+}
+
+enum MyOption<T> {
+    Some(T),
+    None,
+}
+
+struct Wrapper {
+    inner: Guard,
+}
+
+#[track_caller]
+fn drop_inside_tracked_fn() {
+    let _g = Guard { id: 2 };
+}
+";
+
+/// End-to-end native execution + lazy record-walk test covering `#[track_caller] fn drop(&mut self)`
+/// called through `drop_glue` across direct scope exit, a `#[track_caller]` caller, `Option<T>`,
+/// `struct Wrapper(T)`, `[T; 2]`, `Box<T>`, and `Box<dyn Trait>`. Verifies that `Location::caller()`
+/// receives a valid `&'static Location<'static>` pointing to `drop_in_place`'s definition site
+/// (`line > 0`, non-empty matching `.file()`).
+#[test]
+fn tracked_drop_impl_in_drop_glue_reports_valid_location() {
+    let (dip_line, dip_col) = line_col_of(TRACKED_DROP_PRELUDE, "unsafe fn drop_in_place<");
+
+    let program = format!(
+        "{TRACKED_DROP_PRELUDE}
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    // 1. Direct scope drop in an untracked fn
+    {{
+        let _g = Guard {{ id: 1 }};
+    }}
+    unsafe {{
+        if DROP_COUNT != 1 || LAST_LINE != {dip_line} || LAST_COL != {dip_col} || !FILE_OK {{
+            return 1;
+        }}
+    }}
+
+    // 2. Direct scope drop inside a `#[track_caller]` fn
+    drop_inside_tracked_fn();
+    unsafe {{
+        if DROP_COUNT != 2 || LAST_LINE != {dip_line} || LAST_COL != {dip_col} || !FILE_OK {{
+            return 2;
+        }}
+    }}
+
+    // 3. Indirect drop via `Option<Guard>`
+    {{
+        let _opt = MyOption::Some(Guard {{ id: 4 }});
+    }}
+    unsafe {{
+        if DROP_COUNT != 3 || LAST_LINE != {dip_line} || LAST_COL != {dip_col} || !FILE_OK {{
+            return 3;
+        }}
+    }}
+
+    // 4. Indirect drop via `struct Wrapper`
+    {{
+        let _w = Wrapper {{ inner: Guard {{ id: 8 }} }};
+    }}
+    unsafe {{
+        if DROP_COUNT != 4 || LAST_LINE != {dip_line} || LAST_COL != {dip_col} || !FILE_OK {{
+            return 4;
+        }}
+    }}
+
+    // 5. Indirect drop via `[Guard; 2]`
+    {{
+        let _arr = [Guard {{ id: 16 }}, Guard {{ id: 32 }}];
+    }}
+    unsafe {{
+        if DROP_COUNT != 6 || LAST_LINE != {dip_line} || LAST_COL != {dip_col} || !FILE_OK {{
+            return 5;
+        }}
+    }}
+
+    // 6. Indirect drop via `MyBox<Guard>`
+    {{
+        let _b = MyBox::new(Guard {{ id: 64 }});
+    }}
+    unsafe {{
+        if DROP_COUNT != 7 || LAST_LINE != {dip_line} || LAST_COL != {dip_col} || !FILE_OK {{
+            return 6;
+        }}
+    }}
+
+    // 7. Indirect drop via `MyBox<dyn Marker>` (vtable word 0 -> drop_in_place::<Guard>)
+    {{
+        let _d: MyBox<dyn Marker> = MyBox::new(Guard {{ id: 128 }});
+    }}
+    unsafe {{
+        if DROP_COUNT != 8 || DROP_SUM != 255 || LAST_LINE != {dip_line} || LAST_COL != {dip_col} || !FILE_OK {{
+            return 7;
+        }}
+    }}
+
+    0
+}}
+"
+    );
+
+    walk_lazy_twice(&program);
+    let status = run_status(&program);
+    assert_eq!(status, 0, "expected all 7 tracked Drop::drop glue checks to pass, got failure code {status}");
+    println!("TRACK CALLER DROP GLUE: all 7 cases (direct, tracked caller, Option, struct, array, Box, dyn Trait) passed whole + lazy");
+}

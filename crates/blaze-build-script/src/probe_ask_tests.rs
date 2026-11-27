@@ -270,7 +270,23 @@ fn probe_ask_features_are_answered_from_the_language_list_and_the_library_listin
     assert_eq!(unknown.verdict, Verdict::Rejected(Rejection::UnknownFeature { at: 23, len: 15 }));
     let mentioned = answered(RUSTIX, "#![feature(in_macro_only)]\n", &wasm, alloc.clone());
     assert_eq!(mentioned.verdict, Verdict::Unanswered(Open::Feature { at: 11 }));
-    let unlisted = answered(&lib, RUSTIX_FEATURE, &bare, alloc);
+    let unlisted = answered(&lib, RUSTIX_FEATURE, &bare, alloc.clone());
     assert_eq!(unlisted.verdict, Verdict::Unanswered(Open::Features(Needs::Std)));
+
+    // wasm64-blaze-wasip1 (self-compiled dep build scripts such as rustix 0.38.44 under raft-proto):
+    // when the target's std library-feature listing declares `wasi_ext`, rustix's exact probe line
+    // is answered cleanly, while an unknown feature targeting wasm64-blaze-wasip1 is refused E0635.
+    const WASM64: &str = "wasm64-blaze-wasip1";
+    const RUSTIX_WASM64: &[&str] = &["--crate-type=rlib", "--emit=metadata", "--target", WASM64, "-o", "-", "-"];
+    let wasm64 = listed_table(WASM64, &["alloc_ffi", "core_c_str", "rust1", "wasi_ext"], &[], alloc.clone());
+    let wasm64_ok = answered(RUSTIX_WASM64, RUSTIX_FEATURE, &wasm64, alloc.clone());
+    assert_eq!(wasm64_ok.verdict, Verdict::Accepted(By::Decided), "rustix's wasi_ext probe for wasm64-blaze-wasip1");
+    assert_eq!(wasm64_ok.target, WASM64);
+    let wasm64_unknown = answered(RUSTIX_WASM64, "#![allow(stable_features)]\n#![feature(no_such_wasi_feature)]\n", &wasm64, alloc);
+    assert_eq!(
+        wasm64_unknown.verdict,
+        Verdict::Rejected(Rejection::UnknownFeature { at: 38, len: 20 }),
+        "unknown feature on wasm64-blaze-wasip1 must be refused E0635"
+    );
     println!("probe_ask: four feature kinds answered");
 }

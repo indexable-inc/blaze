@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: "#[blaze::linear]: a type whose values may not be dropped implicitly, checked on built MIR with the borrow check; generic code admits one only through a `#[blaze::linear]` type parameter, `Option` and `Result` do, and an error exit abandons a value through its type's `Drop`."
+summary: "#[blaze::linear]: a type whose values may not be dropped implicitly, to be checked with the borrow check (not built on the new layer); generic code admits one only through a `#[blaze::linear]` type parameter, `Option` and `Result` do, and an error exit abandons a value through its type's `Drop`."
 date: 2026-11-02
 ---
 # Lane linear: `#[blaze::linear]`
@@ -71,28 +71,12 @@ exits of a body are looked for only once one of its locals holds one.
 
 ## Where it lives
 
-Rule 26 (semantics in the front end) puts the check in the front end, in its own crate:
-
-- `crates/hir-ty-linear`: the check. `check_body(db, body, kind, out)` runs on one built MIR body.
-- `crates/hir-ty-mir/src/mir/transform/drop_states.rs`:
-  `drop_states(db, body, root, abandoned_at, abandons)`. It reuses drop elaboration's move paths
-  and maybe-init/maybe-uninit analysis (`MoveData::gather_rooted`), rooted at the locals a
-  predicate picks rather than at those with drop glue. It hands back each `Drop` with what each
-  move path below the dropped place may hold there. At each location of `abandoned_at` (rule
-  6's error exits) the locals `abandons` picks are taken as moved out, an effect only this
-  analysis has (`Effects::add`): drop elaboration's own run is untouched.
-- `library/core/src/{option,result}.rs` and `crates/test-utils/src/minicore.rs` (the tests'
-  core): the marks of rule 4.
-- `crates/hir-def`: `AttrFlags::LINEAR`, `AttrFlags::CONSUMES` and `AttrFlags::HOLDS`, and the
-  inert `blaze::linear` / `blaze::consumes` / `blaze::holds` names in `attr_resolution.rs`.
-- `crates/hir-ty-borrowck`: `check_owner` calls `check_body` for each body it checks: the owner's,
-  closures, coroutines and inline consts. It reports the results as `BorrowckDiagnostic`s with code
-  `LINEAR`. This gives three things:
-  - A linear error refuses the item exactly as a borrow error does (`gate::checked`).
-  - The verdict filed in the item store covers the check. The attribute queries the check makes
-    are among the reads `body_store::capture` records, and the store key includes the front end's
-    build ID.
-  - hir reports the errors with the borrow checker's.
+Not built on the new layer. blaze-surface knows the names (`crates/blaze-surface/src/tool_attrs.rs`:
+`linear`, `consumes`, `holds`), and `library/core/src/{option,result}.rs` carry the marks of rule 4;
+no check reads them. The check belongs with the borrow check (rule 26, semantics in the front
+end): it runs on each checked body (the owner's, closures, coroutines and inline consts), a
+linear error refuses the item exactly as a borrow error does, and its reads are in the body's
+read list. The fixture `crates/blaze-real/extensions/a_linear.rs` expects a refusal.
 
 ## The rules
 
@@ -274,21 +258,10 @@ and fed1eb428d:docs/research (nothing about linear types there).
 
 ## Applied in blaze
 
-`hir_ty_borrowck::gate::Pending` is `#[blaze::linear]`, and `Pending::finish` is
-`#[blaze::consumes]`. A live patch that drops its `Pending` without finishing it never decides
-whether the patch is rolled back. Until now only `#[must_use]` guarded this, which says nothing
-once the value is bound to a variable.
-
-Owed values, a value that must be handed over (the bug class of `store()` dropping
-`body_puts` on an early return, after which every build reading that session failed):
-
-- `blaze-cargo` `serve::owed_puts::OwedPuts`, store puts owed to the loop: linear with no
-  `Drop`, so no exit abandons it, a `?` included; `hand_on` and `discard` consume it.
-- `hir_ty::body_store::entries::Claim`, the runs a keep claimed: linear with its `Drop` as the
-  abandonment path (an error exit gives the runs back); `kept` and `give_back` consume it.
-
-Both are checked by this check, not by a lint: a linear type is semantics, enforced where the
-borrow check is, with no `#[expect]` to silence it.
+Owed values, a value that must be handed over (the bug class of a store put dropped on an early
+return, after which every build reading that session failed), are marked `#[blaze::linear]` in
+blaze's crates, and will be checked by this check, not by a lint: a linear type is semantics,
+enforced where the borrow check is, with no `#[expect]` to silence it.
 
 ## Not checked yet (follow-ups)
 
@@ -306,11 +279,4 @@ borrow check is, with no `#[expect]` to silence it.
   field).
 - An impl that only binds associated types, with no fn, is not checked. The impl-binding check
   runs at the impl's first fn body.
-- Bodies that `check_owner` does not reach:
-  - `BLAZE_BORROWCK=off`;
-  - bodies with type errors;
-  - bodies refused for `DropInConst`;
-  - statics' and consts' own bodies, which are checked only when borrowck runs on them.
 - No published `blaze::consume` crate yet. Define the two-line `consume` above.
-- The tests in `crates/hir-ty-linear/src/tests.rs` have been type-checked but not run; the
-  ones for rules 4's `Option`/`Result` items and rule 6 were written without a build.

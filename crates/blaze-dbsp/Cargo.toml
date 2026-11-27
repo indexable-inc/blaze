@@ -1,6 +1,6 @@
 [package]
 name = "blaze-dbsp"
-description = "blaze v2's delta engine: Z-sets, sequence diffs, read indexes, arrangements, DRed closures, worklists and slice hashes for the views the write side maintains (docs/v2/plan/design/dbsp.md)"
+description = "blaze v2's delta engine: Z-sets, sequence diffs, read indexes, arrangements, DRed closures, worklists and slice hashes for the views the write side maintains"
 publish = false
 
 version.workspace = true

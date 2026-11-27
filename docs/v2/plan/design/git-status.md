@@ -41,7 +41,7 @@ One call produces a typed `PromptStatus`:
 - **Chosen: Batched sans-IO state machine (`StatusMachine`) + thin `bstd::git` driver.**
   The core (`crates/blaze-git`, `#![no_std]`, `#![blaze::sans_io]`, `#![forbid(unsafe_code)]`) owns
   all git format parsing, ignore matching, cache-tree diffing, commit-graph traversal, and
-  stat/racy-git comparison. It emits batched `Want` requests (`ReadFiles`, `MapFiles`, `ListDirs`,
+  stat/racy-git comparison. It emits batched `Want` requests (`ReadFiles`, `ReadWithStat`, `ListDirs`,
   `StatPaths`, `ReadLinks`, `ReadRanges`) and consumes `Got` replies. The `bstd::git` driver
   executes batches using `bstd::fs::Dir::read_all_many`, `Dir::map_read`, `Dir::entries`
   (`getattrlistbulk` on macOS, `statx` on Linux, `Sim` in DST), `Dir::facts_of`, `Dir::read_link`,

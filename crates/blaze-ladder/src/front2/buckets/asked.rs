@@ -1,5 +1,5 @@
-//! Impl questions answered BY BUCKET over records (drive.md, "End state: the whole pipeline on
-//! the command", piece 12; the bullet "An impl bucket is a fact, not a task").
+//! Impl questions answered BY BUCKET over records (end-state.md D157; the bullet
+//! "An impl bucket is a fact, not a task").
 //!
 //! [`Buckets::admit`] files EVERY impl of each crate a question's home admits: one question
 //! costs in proportion to those crates (measured 2026-11-16, front2_records, 70 crates: `bool:

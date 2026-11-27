@@ -9,7 +9,7 @@
 //! bytes, and includes every placement read in the observations to seal. Stage coverage,
 //! elapsed time, entered count and the unchecked-items trailer come from the live caller.
 //!
-//! What `engine-check` printed, kept as one record (engine.md E6, the incremental half): each
+//! What `engine-check` printed, kept as one record (end-state.md D157, the incremental half): each
 //! task's findings and notes as the printer takes them, in a block per task, sorted by name.
 //!
 //! A request prints the WHOLE answer through one printer ([`print_all`]): the blocks of the tasks
@@ -1675,7 +1675,7 @@ impl print::RenderOutput for ListingOutput<'_, '_> {
     }
 }
 
-/// THE RENDERED ANSWER, form BER3 (engine.md D149, piece I3): stdout as the last request
+/// THE RENDERED ANSWER, form BER3 (D149, piece I3): stdout as the last request
 /// printed it, in rows whose concatenation is stdout's order, so the certificate writes the
 /// whole stream with one write and skips the index in one slice operation.
 ///
@@ -2749,7 +2749,7 @@ mod replay_tests;
 #[path = "tests/engine_lines_replay_tests.rs"]
 mod lines_replay_tests;
 
-/// A FILE'S RENDERED LINES (engine.md D149, piece I3): on an edit, a file whose text and
+/// A FILE'S RENDERED LINES (D149, piece I3): on an edit, a file whose text and
 /// findings stand is written out from its stored section and not read; a file whose text moved
 /// is drawn alone. What is right is a fresh check's output in a new home (rule 26): the same
 /// stdout bytes, the same counts, the same stored record.

@@ -1,4 +1,4 @@
-//! The `Bodies` stage of `blaze engine-check` (engine.md E5/E6, "The design" 4): every body of
+//! The `Bodies` stage of `blaze engine-check` (end-state.md D157): every body of
 //! the workspace's files type-checked and borrow-checked as ITS OWN engine task, entered once, on
 //! the pool, by `check_body_reads` (front2 tables/task.rs) over the read-only view.
 //!
@@ -3433,7 +3433,7 @@ fn outline_exists(outlines: &[Outlined<'_>], real: &str, alloc: blaze_own::Alloc
             .binary_search_by_key(&slot, |one| one.name)
             .ok()
             .and_then(|i| outlines.get(i))
-            .is_some_and(|one| one.path.as_slice() == real.as_bytes())
+            .is_some_and(|one| one.path.as_slice() == real.as_bytes() && !crate::data_include::is_data(one.edition))
     };
     if locate(Name::file(real.as_bytes())) {
         return true;
@@ -4842,7 +4842,7 @@ impl<'f> BodiesStage<'f> {
         self.outside.finish();
         // The reach is the request's: every later Bodies phase names its rows from it too.
         self.reach = reach;
-        // 3. Your code first is the next piece (engine.md 4); today: by member, file, name.
+        // 3. Your code first is the next piece (end-state.md D157); today: by member, file, name.
         ones.sort_unstable_by_key(|one| (one.group, one.file, one.task.planned.name));
         let ones: &'f [One<'f>] = ones.into_bump_slice();
         if let Some(found) = found.as_mut() {

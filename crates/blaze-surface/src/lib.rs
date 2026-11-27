@@ -86,7 +86,7 @@ pub use crate::crate_graph::{
     CrateFlags, CrateGraphView, CrateIndex, CrateInput, DepEdge, DepInput, EdgeFlags,
     GRAPH_SCHEMA, GraphError, MAX_CRATES, MAX_EXTERN_NAME, Members, build_crate_graph,
 };
-pub use crate::crate_root::{CrateRootBuilder, CrateRootHead, CrateRootView, Dep};
+pub use crate::crate_root::{CrateRootBuilder, CrateRootHead, CrateRootView, DEFAULT_RECURSION_LIMIT, Dep};
 pub use crate::error::{BuildError, NotBuilt, SurfaceError};
 pub use crate::file_items::{
     Attr, AttrKind, AttrSpan, ChildItems, ErrorOrigin, FileItem, FileItems, FileItemsView, Item,

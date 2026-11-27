@@ -60,7 +60,7 @@ impl<K: Portable + Eq + Hash, V, A: Allocator + Clone> Carried<K, V, A> {
     }
 
     /// The entries, in no order a caller may rely on: an output or a key made from them sorts
-    /// them by key first (docs/v2/plan/design/identity.md, point 5).
+    /// them by key first (docs/v2/plan/design/bottom.md section 3).
     pub fn iter(&self) -> hash_map::Iter<'_, K, V> {
         self.map.iter()
     }

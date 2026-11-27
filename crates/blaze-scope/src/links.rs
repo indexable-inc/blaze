@@ -1,4 +1,4 @@
-//! Names at module grain (docs/v2/plan/design/drive.md, "Names at module grain", D116): the
+//! Names at module grain (docs/v2/plan/design/end-state.md D158, D116): the
 //! records a crate's names are made of once nothing of one module is copied into another, and
 //! the reads that walk their links one cell at a time.
 //!

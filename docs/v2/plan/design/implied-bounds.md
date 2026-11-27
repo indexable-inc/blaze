@@ -107,23 +107,10 @@ anonymous parameter is an ordinary parameter, with its bounds proved at each use
   `Sized`, as `C<T>` already required.
 - `_` in a function's parameter types or an impl's header is no longer E0121.
 - The lint `blaze::implied_bound_written` reports a bound written again that the header
-  implies (docs/lints.md).
+  implies (`crates/blaze-lint-defs/src/lints.rs`).
 
 ## Built in
 
-- `hir-def`: the gates (`unstable_features.rs`, `UnstableFeatures::implied_bounds`);
-  `TypeParamProvenance::Anonymous` (`hir/generics.rs`, persisted in
-  `deps/signatures/codes.rs`); a `_` lowered as a parameter (`expr_store/lower.rs`
-  `lower_type_ref`'s `InferType` arm, `lower_impl`; `expr_store/lower/generics.rs`
-  `ImplTraitLowering::anonymous`, `ImplHeader`, `collect_impl_header`).
-- `hir-ty`: `lower/implied.rs` (the rule; `shorthand_bounds`, the header read as written for
-  the short form); `lower.rs` `lower_generic_predicates_with` (the clauses added after the
-  written ones), `resolve_type_param_assoc_type_shorthand_in` (implied bounds after written),
-  `declared_trait_predicates`, `PredicateSource::Implied`, `written_implied_predicates`;
-  `lower/path.rs`
-  `type_looks_like_const` (a `_` where a const goes stays E0121).
-- `hir`: `bound_source` (an implied predicate points at its declaration),
-  `GenericDef::written_implied_bounds`.
-- `blaze-diagnostics`: `lower/infer_vars_not_allowed.rs` `anon_params_note`.
-- `blaze-lints`: `blaze/implied_bound_written.rs`.
 - `library/core/src/blaze.rs`: `ImpliedBounds`, `AnonParams`, which carry the feature names.
+- `crates/blaze-lint-defs/src/lints.rs`: the lint's name and level; no rule implements it.
+- Fixtures: `crates/blaze-real/extensions/b_implied_bounds.rs`, `b_anon_params.rs`.

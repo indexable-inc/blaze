@@ -34,12 +34,14 @@ mod blocks;
 mod block_cfg;
 mod crate_cfg_off;
 mod macro_blocks;
+mod macro_gen_dollar_crate;
 mod entry;
 mod failed_call;
 mod failed_record;
 mod implicit_main;
 mod main_call;
 mod include_data;
+mod include_hygiene;
 mod include_macros;
 mod include_nested_mods;
 mod include_roots;
@@ -85,6 +87,7 @@ pub(crate) use oracle::{B, Imp, reference_imports, reference_world};
 mod per_crate;
 mod pkg_meta_env;
 mod prelude_records;
+mod recursion_limit;
 mod super_in_block;
 mod written_module;
 mod proc_left_package;
@@ -288,6 +291,7 @@ impl World {
             no_std: false,
             no_core: false,
             arbitrary_ints: false,
+            recursion_limit: u32::from(crate::RECURSION_LIMIT),
             prelude: None,
         };
         let mut cr = CrateRootBuilder::new_in(head, Alloc::global());

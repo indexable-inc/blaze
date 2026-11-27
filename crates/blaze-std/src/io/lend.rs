@@ -1,5 +1,5 @@
-//! A driver lent over the world's own backend (drive.md, "D114 rulings", "The store under the
-//! command", ruling 5: one driver a process). A state machine written over
+//! A driver lent over the world's own backend (drive.md, "The store under the
+//! command": one driver a process). A state machine written over
 //! [`blaze_core::Driver`] (blaze-cas's plain store, `Driven<D>`) runs on the command's world
 //! through it, with no second native driver made.
 //!

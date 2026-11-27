@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: C in blaze without a build script. One pinned C toolchain shipped as records and run natively as blaze's own hermetic tool; a header is imported by a built-in macro whose expansion is a record of Rust declarations keyed by the headers it read; C sources are units compiled per file, lazily, to code records; existing crates' `cc` and `bindgen` calls are answered by the same machinery.
+summary: C in blaze without a build script. One pinned C toolchain shipped as records and run natively as blaze's own hermetic tool; a header is imported by a built-in macro whose expansion is a record of Rust declarations keyed by the headers it read; C sources are units compiled per file, lazily, to code records; existing crates' `cc` and `bindgen` calls are answered by the same machinery. Built, not wired: the declaration model and seam (crates/blaze-c) and the clang helper and its driver (crates/blaze-cc); the macro in expansion, C units and the existing-crate answers are not built.
 date: 2026-11-20
 ---
 # C in blaze
@@ -25,7 +25,7 @@ the machine's compiler. Rules 9 and 25 ask for the opposite.
 ## The four parts
 
 **1. One C toolchain, pinned and shipped; the compiler runs natively, as blaze's own tool.**
-toolchain-c.md already decides the toolchain: clang, lld, compiler-rt, libc++ and libc stubs
+The toolchain is decided below ("What the pinned toolchain holds"): clang, lld, compiler-rt, libc++ and libc stubs
 built from blaze's pinned LLVM, nothing from the machine. The compiler is NOT user code: it is a
 pinned tool of blaze's, like the LLVM blaze already links, and the C it compiles is data, not a
 program blaze runs. So it needs no sandbox of the kind rule 9 asks for build scripts and proc
@@ -35,9 +35,7 @@ in its output, and blaze learns every file it read. It runs in its own process (
 fails one task: rule 20), from the shelf, with its file access held to those roots by the
 operating system and its reads reported back; the read list is checked against the roots, so a
 read outside them is a refusal naming the file. No WebAssembly build of the compiler exists or
-is wanted (first written here with one, and corrected the same day: the owner, 2026-11-20 19:01,
-"web assembly clang? huh and why we need that"; a sandbox for a trusted tool was the rule
-misapplied).
+is wanted (the owner, 2026-11-20 19:01: "web assembly clang? huh and why we need that").
 
 **2. A header is imported by a macro; the result is a record.**
 
@@ -171,24 +169,12 @@ SQLITE_VERSION`, `fn PyArray_NDIM`, `macro slot PyArray_Type`, `macro addr Py_No
 least count of functions and constants, and for a compile rung (zstd's `entropy_common.c`,
 zlib's `adler32.c`, sqlite3.c) a Mach-O with `MH_SUBSECTIONS_VIA_SYMBOLS` or an ELF with
 `.text.` sections. Rungs written: zstd, zlib, lz4, sqlite, rocksdb `c.h`, blst, aws-lc `sha.h`,
-c-kzg, cpython, numpy. None has run: the helper is not built.
+c-kzg, cpython, numpy. None has run: the helper is not built (pins/cfront.json `targets` is
+empty until the llvm workflow builds it).
 
-**C4 measured (2026-11-20, a grep census, not the import):**
-
-| | numpy 2.5.5 (`_core/include/numpy`) | CPython 3.13 (`Include`) |
-|---|---|---|
-| headers | 26 | 264 |
-| object-like `#define` (all / a numeric literal) | 1429 / 212 | 2618 / 1583 |
-| function-like `#define` | 241 | 1042 |
-| of those: `##` / `do {` (statements) | 9 / 13 | 19 / 16 |
-| of those: one call of another name (alias) | 68 | 322 |
-| of those: a wrapper of a same-named function (`#define Py_INCREF(op) Py_INCREF(_PyObject_CAST(op))`) | 0 | 60 |
-| `static inline` functions | 151 (161 with `NPY_FINLINE`) | 1002 (1010) |
-| table slots through a pointer (`PyArray_API[n]`, `PyUFunc_API[n]`) | 303 + 44 | 0 |
-
-`PyArray_NDIM` and `PyArray_DATA` are static inline (ndarraytypes.h:1594, 1600); `Py_INCREF` is
-a static inline (object.h:794) behind a same-named macro; `PyArray_API` is `static void **` in
-the header (__multiarray_api.h:644), `extern` under `PY_ARRAY_UNIQUE_SYMBOL`.
+C4's headers by a grep census: CPython 3.13 has 1042 function-like macros and 1002 `static
+inline` functions, numpy 151 and 303 + 44 table slots (`PyArray_API[n]`, `PyUFunc_API[n]`);
+`PyArray_NDIM`, `PyArray_DATA` and `Py_INCREF` (behind a same-named macro) are static inline.
 
 The two C4 designs:
 - **(A) A static inline is a function compiled by clang itself.** The dump gives it as a `fn`
@@ -213,40 +199,18 @@ The two C4 designs:
 - Two front ends that disagree on a header: the differential test fails; neither is preferred.
 
 ## Order
-1. `crates/blaze-c`: the declaration model, its record, its rendering to Rust, the import's key
-   and read list, the `CFrontEnd` seam, the macro's grammar: sans-IO, on D170's conventions,
-   proven with a model front end. No toolchain needed.
-2. The toolchain side: what of toolchain-c.md is built; the driver that runs the pinned clang
-   natively in its own process over the roots blaze gives it and collects its reads; the first
-   real `CFrontEnd`.
+1. Built: the declaration model, its record and rendering, the import's key and read list, the
+   `CFrontEnd` seam and the macro's grammar, sans-IO, in `crates/blaze-c`.
+2. Built, not wired: the toolchain side in `crates/blaze-cc` (the helper in `helper/`, the wire
+   in `wire.rs` version 2, the machine in `job.rs`, `ClangFrontEnd` in `front.rs`), pinned by
+   `pins/cfront.json`. No crate outside blaze-c and blaze-cc depends on them.
 3. The built-in macro wired into expansion; the first real import (tempo's rocksdb `c.h`),
    compared with what bindgen writes for the same header.
 4. Units as tasks and code records; the symbol index; `run` on a C function.
 5. The C mode and the `bindgen` stand-in for existing crates; tempo's six crates with no build
    script run for C.
 
-## The toolchain side (Order step 2; D174)
-
-### What exists (2026-11-20, read in this tree)
-| What | Where | State |
-|---|---|---|
-| The LLVM blaze links: fork, 23.1.4 | pins/llvm.json; .github/scripts/llvm.py `COMPONENTS` (line 70) | Builds clang, lld, llvm-ar, libclang into blaze's archive; no clang static libraries or headers in it |
-| The C toolchain build scripts run with | pins/clang.json | The LLVM project's own 23.1.4 release, macOS and Linux arm64, by sha256; sysroots unpinned (null) |
-| The clang shelf | `<home>/.blaze/v2/toolchain/clang/<sha256>/`; blaze-build-script toolchain.rs `SHELF_MEMBERS` (201) | Unpacked release; the `clang.cfg` files `SHELF_MEMBERS` names are written by no code found |
-| The env a C compile gets | toolchain.rs `c_env` (234), `depfile_reads` (276) | `CC`/`CXX`/`AR` and flags for a build script's `cc` crate; the reads are what clang's depfile says |
-| C tools a script may start | blaze-build-script probe.rs `C_TOOLS` (53); native.rs `TOOLCHAIN_CLASS` (23) | A script whose closure holds bindgen, cc, clang-sys, cmake or pkg-config runs natively in Seatbelt |
-| How a spawn of cc is routed | blaze-proc-macro spawn_route.rs `route` (152); key.rs `CMode` (29) | Per name: run under the grant, or refused |
-| Crates native in every mode | toolchain.rs `NATIVE_EVERY_MODE` (356) | libproc, librocksdb-sys, reth-mdbx-sys, sha3-asm |
-| A served child | blaze-std procs/linked/run.rs `Spawner::start_served` | A child with a message channel on fd 3, a deadline on every wait; no sandbox field |
-| OS confinement | blaze-core lib.rs `Confine` (162) | A trait with no shipped implementation |
-| A checked-in source correction | blaze-fetch correct.rs, applied in blaze-world list.rs (188) | D58: the precedent for the table in "Existing crates" below |
-| The cut | scripts/src/bin/toolchain_cut.rs `place` | Cuts the Rust shelf; now also places blaze-cfront (`cfront`) |
-
-The 24 s: tempo-deps profile (port27, engine-g004958) line 168, `24439.3 ms librocksdb_sys`.
-librocksdb-sys is in `NATIVE_EVERY_MODE`, so a check runs its whole script: by its source, the
-`cc` compile of rocksdb's about 330 C++ files, then bindgen. libproc's script, bindgen alone,
-is about 0.3 s. So the 24 s is most likely the C++ compile, which a check never needs; this is
-read from the profile's one row and the script, not measured by span.
+## The toolchain side (D174)
 
 ### The decision: a helper linked to clang, not the clang binary
 blaze runs the pinned clang natively, in its own process, as **blaze-cfront**: a small C++
@@ -273,8 +237,47 @@ one header. And its roots can be held only by the OS sandbox. The helper's maint
 one file against clang's Driver, FileSystem and RecursiveASTVisitor APIs, which move little
 between majors; blaze moves its LLVM pin rarely and on purpose.
 
+### What the pinned toolchain holds (not built)
+
+One archive per host, built from the one LLVM commit pins/llvm.json names and fetched by sha256 (today
+pins/clang.json pins the LLVM project's own 23.1.4 release instead):
+
+- `clang` with its resource headers and a config per supported target that sets the sysroot, the
+  resource directory, the C++ library, `lld` and compiler-rt, so `clang --target=T` searches nothing on
+  the machine;
+- `llvm-ar` (and `llvm-ranlib`, `llvm-nm`, `llvm-objcopy`, `llvm-strip` as links) and `lld` (`ld.lld`,
+  `ld64.lld`, `lld-link`) for the links C build systems make on their own (CMake's `try_compile`,
+  autoconf's checks); lld never links what blaze builds;
+- compiler-rt per target: builtins, `crtbegin`/`crtend`, and the sanitizer runtimes, matching the LLVM
+  that generated the instrumentation;
+- libc++, libc++abi and libunwind, static, per target.
+
+The C library side is one archive per target, fetched when a build first targets it: Linux glibc
+headers for every supported version, the UAPI headers, the start objects, and an abilist from which
+the stubs for the version a build asks are made; Windows GNU: mingw-w64's headers and import
+libraries. macOS and Windows MSVC get no archive: their SDKs are the vendor's, found without `xcrun`
+or `vswhere`, their digest and the deployment target in the target key, fetched or used only after the
+user accepts the license.
+
+The opt-out, for a `-sys` crate that must build with another compiler (a GCC-only extension, the
+platform's libstdc++ ABI): `[workspace.metadata.blaze.c] system-cc = ["<package>", ...]` in the root
+manifest. Each named package's step gets `CC`/`CXX`/`AR`/`CFLAGS`/`CXXFLAGS`/`CXXSTDLIB`/`SDKROOT` as
+the environment has them, and those values and each compiler they resolve to (path, sha256 of the
+binary, its `--version`) are in the key of the step and of everything that links the package.
+
+Errors (rule 3), each naming the piece, what was looked for and the command or setting that gets
+blaze's: the archive missing or its sha256 wrong (never a clang, `cc` or `ld` on `PATH`); a target's
+sysroot missing; a glibc symbol newer than the chosen version (the symbol, the version that has it,
+the setting); no macOS SDK or one below the floor; MSVC libraries not fetched or the license not
+accepted; a `system-cc` compiler that cannot be resolved.
+
+Risks: a C dependency that today builds with GCC or Apple clang and links libstdc++ may need
+`system-cc` (the cost is a manifest line, never a wrong build); the glibc default (2.28) may refuse a
+crate that links a newer symbol until the workspace raises it; the macOS SDK stays a machine input,
+keyed by digest, so two Xcode versions build different bytes.
+
 ### Hermetic by construction
-- **Roots** (crates/blaze-roots, used directly; the interim copy is gone): `Roots::new` over the
+- **Roots** (crates/blaze-roots): `Roots::new` over the
   clang tree (resource headers, libc++ headers) and the sysroot tree (`Tree` roots), the package
   with its declared globs (`Package`), one output (`Output`, never read). `Mounts` spells each as
   a guest path, `/<mount>/<relative path>`; `resolve` drops `.`, takes `..` by the text alone
@@ -290,8 +293,7 @@ between majors; blaze moves its LLVM pin rarely and on purpose.
   binary), `-no-canonical-prefixes`, the target and `-isysroot /sdk` or `--sysroot=/sdk`,
   `-fdebug-compilation-dir=/package` and the coverage twin, `-gno-record-gcc-switches`, no
   colour, `-fmessage-length=0`, `-fno-crash-diagnostics` (no reproducer written to a temporary
-  folder), `-ffunction-sections -fdata-sections -fno-common -fPIC` (checked in flags.rs at
-  lines 209-216; on Mach-O clang sets `MH_SUBSECTIONS_VIA_SYMBOLS` itself, which the ladder's
+  folder), `-ffunction-sections -fdata-sections -fno-common -fPIC` (checked in flags.rs; on Mach-O clang sets `MH_SUBSECTIONS_VIA_SYMBOLS` itself, which the ladder's
   compile rungs assert in the object's header). `__DATE__`, `__TIME__` and `__TIMESTAMP__` are
   fixed by `-D` (flags.rs `FIXED`); there is no clock.
 - **The OS hold, before the first message** (helper/main.cpp `confine`): macOS, `sandbox_init`
@@ -311,7 +313,7 @@ between majors; blaze moves its LLVM pin rarely and on purpose.
 Each message is a 4-byte length, then the body, on the served channel (fd 3). From the helper:
 `Hello{version, confinement}`, `Look{id, op: stat|read|list, guest path}`, `Out{object|decls,
 bytes}` (pieces of at most 1 MiB), `Done{errors}`, `Diagnostic{level, clang's id, offset, guest
-path, message}` (one row each; version 1 sent diagnostics as text). From blaze: `Job{mode:
+path, message}` (one row each). From blaze: `Job{mode:
 decls|compile, args}`, `Answer{id, missing | file{size, bytes when read} | dir | listing{sorted
 names, a directory's with `/`} | not a file}`. A listing's digest is of what was sent, each name
 admitted by its root; a read that meets a directory is a directory seen (clang opens a header

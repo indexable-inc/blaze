@@ -32,7 +32,10 @@ use blaze_hash::{FixedState, Map, MapOpts, Set, SetOpts};
 use blaze_ladder::body_ids::{self, BodyIds as _, RowKind, Scratch, Stepped, Walk};
 use blaze_ladder::code_records::{CodeKey, entry_of, statics};
 use blaze_ladder::front2::program::lazy::{SharedLazyFront, SharedLazyFrontHandle, SharedLazyFrontStats};
-use blaze_ladder::run::make_one::export_lto::{ExportLtoCache, ExportLtoMachine, ExportLtoTimes, built_lir_cache_key};
+use blaze_ladder::run::make_one::export_lto::{
+    ExportLirBuilder, ExportLtoCache, ExportLtoMachine, ExportLtoTimes, LtoRowResult,
+    built_lir_cache_key, decode_lto_scc_header, optimize_export_all_par_cached,
+};
 use blaze_ladder::run::make_one::{MOST_WALKED, Maker, RecordsProgram, Typing, TypingCounts};
 use blaze_ladder::run::special::{EntryForm, Roots, Special, make_special, run_roots};
 use blaze_ladder::run::RunError;
@@ -843,6 +846,9 @@ enum RowOutcome<'a> {
         record: Vec<u8, SharedAlloc<'static>>,
         vtable_data: Vec<(CodeSymbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
     },
+    /// Whole-program cross-function LTO-optimized `BLZOLT01` record persisted in `Namespace::LOCAL`
+    /// and read zero-copy from `lent` at assemble time (Rule 51).
+    LtoCached(blaze_cas::Key),
     /// A non-root library/cold function that `blaze-build` cannot lower to LIR yet: replaced by a
     /// deterministic trap stub (`write(2, msg, len); _exit(125); brk #0`) that reports the exact
     /// refusal if ever called at runtime (same contract as `blaze-ladder/src/run.rs` `Stubs`).
@@ -1434,7 +1440,8 @@ struct HomeLtoCache<'m, 'w, 'o, 'i, 'p, 'f, D: blaze_core::Driver> {
     began: bstd::clock::Instant,
     frame: &'f Frame,
     heap: &'static blaze_own::Heap,
-    touched: core::cell::RefCell<std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>>,
+    touched_program: core::cell::RefCell<std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>>,
+    touched_toolchain: core::cell::RefCell<std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>>,
     io_error: core::cell::RefCell<Option<AString<'static>>>,
 }
 
@@ -1461,7 +1468,8 @@ impl<'m, 'w, 'o, 'i, 'p, 'f, D: blaze_core::Driver> HomeLtoCache<'m, 'w, 'o, 'i,
             began,
             frame,
             heap,
-            touched: core::cell::RefCell::new(std::vec::Vec::new_in(*lent.alloc())),
+            touched_program: core::cell::RefCell::new(std::vec::Vec::new_in(*lent.alloc())),
+            touched_toolchain: core::cell::RefCell::new(std::vec::Vec::new_in(*lent.alloc())),
             io_error: core::cell::RefCell::new(None),
         }
     }
@@ -1470,8 +1478,21 @@ impl<'m, 'w, 'o, 'i, 'p, 'f, D: blaze_core::Driver> HomeLtoCache<'m, 'w, 'o, 'i,
         self.io_error.borrow_mut().take()
     }
 
-    fn into_touched_keys(self) -> std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc> {
-        self.touched.into_inner()
+    fn into_touched_keys(
+        self,
+    ) -> (
+        std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>,
+        std::vec::Vec<blaze_cas::Key, crate::store::plain_place::StoreAlloc>,
+    ) {
+        (self.touched_program.into_inner(), self.touched_toolchain.into_inner())
+    }
+
+    fn record_touched(&self, is_toolchain: bool, cas_key: blaze_cas::Key) {
+        if is_toolchain {
+            self.touched_toolchain.borrow_mut().push(cas_key);
+        } else {
+            self.touched_program.borrow_mut().push(cas_key);
+        }
     }
 }
 
@@ -1514,7 +1535,7 @@ impl<D: blaze_core::Driver> ExportLtoCache for HomeLtoCache<'_, '_, '_, '_, '_, 
                     ));
                     return None;
                 }
-                self.touched.borrow_mut().push(cas_key);
+                self.touched_program.borrow_mut().push(cas_key);
                 let mut out: Vec<u8, SharedAlloc<'static>> = Vec::with_capacity_in(rec.bytes.len(), alloc);
                 out.extend_from_slice(rec.bytes);
                 Some(out)
@@ -1531,7 +1552,41 @@ impl<D: blaze_core::Driver> ExportLtoCache for HomeLtoCache<'_, '_, '_, '_, '_, 
         }
     }
 
+    fn get_slice_with(&self, key: [u8; 32], on_hit: &mut dyn FnMut(&[u8])) -> Option<bool> {
+        if self.io_error.borrow().is_some() {
+            return Some(false);
+        }
+        let cas_key = blaze_cas::Key(blaze_ids::ContentId(key));
+        match self.lent.get(&cas_key) {
+            Ok(Some(rec)) => {
+                if !blaze_keyed::kind::ReservedTag::Code.is(rec.tag) {
+                    *self.io_error.borrow_mut() = Some(owned_fmt(
+                        format_args!("local LTO cache key {} has unexpected tag {:?}", Hex(&key), rec.tag),
+                        self.frame,
+                        self.heap.alloc(),
+                    ));
+                    return Some(false);
+                }
+                on_hit(rec.bytes);
+                Some(true)
+            }
+            Ok(None) => Some(false),
+            Err(why) => {
+                *self.io_error.borrow_mut() = Some(owned_fmt(
+                    format_args!("reading local LTO cache key {}: {why}", Hex(&key)),
+                    self.frame,
+                    self.heap.alloc(),
+                ));
+                Some(false)
+            }
+        }
+    }
+
     fn put(&self, key: [u8; 32], bytes: &[u8]) {
+        self.put_with_class(false, key, bytes);
+    }
+
+    fn put_with_class(&self, is_toolchain: bool, key: [u8; 32], bytes: &[u8]) {
         if self.io_error.borrow().is_some() {
             return;
         }
@@ -1553,7 +1608,7 @@ impl<D: blaze_core::Driver> ExportLtoCache for HomeLtoCache<'_, '_, '_, '_, '_, 
             bytes,
         ) {
             Ok(_) => {
-                self.touched.borrow_mut().push(cas_key);
+                self.record_touched(is_toolchain, cas_key);
             }
             Err(why) => {
                 *self.io_error.borrow_mut() = Some(owned_fmt(
@@ -1565,8 +1620,372 @@ impl<D: blaze_core::Driver> ExportLtoCache for HomeLtoCache<'_, '_, '_, '_, '_, 
         }
     }
 
+    fn touch_with_class(&self, is_toolchain: bool, key: [u8; 32]) {
+        self.record_touched(is_toolchain, blaze_cas::Key(blaze_ids::ContentId(key)));
+    }
+
     fn now_ns(&self) -> u64 {
         self.phases.since(self.began)
+    }
+}
+
+/// Parallel epoch-resetting batch `BuiltLir` builder for whole-program export LTO (used when
+/// `HomeCodeStore` hit during `walk` but `BLZLIR02` missed in `Namespace::LOCAL`).
+struct CliExportLirBuilder<'c, 'f, 'p, 'n, 'w, 'i, 'b> {
+    cx: &'c Cx,
+    clock: &'c bstd::clock::Clock,
+    root: &'c bstd::fs::Dir<bstd::fs::ReadWrite>,
+    crates: run_names::RunCrates<'f>,
+    sync_typed: crate::engine_body_record::SyncTypedFrom<'f>,
+    shared_front: &'c SharedLazyFrontHandle,
+    procs: &'c dyn crate::job_texts::ProcsByNeed<'p>,
+    ids: &'i crate::run_ids::RunIds<'i>,
+    builder: &'b blaze_ladder::code_records::Builder,
+    maker_entry: Option<ItemKey>,
+    maker_start: blaze_ladder::run::special::MakerStart,
+    worker_count: usize,
+    walk: &'w Walk<'w>,
+    maker: &'c mut Maker<'n, crate::run_ids::Runnable, SharedExportTyping<crate::engine_body_record::StoreTyped<'n>>>,
+    heap: &'static blaze_own::Heap,
+}
+
+impl ExportLirBuilder for CliExportLirBuilder<'_, '_, '_, '_, '_, '_, '_> {
+    fn build_lir_batch(
+        &mut self,
+        rows: &[usize],
+        machine: ExportLtoMachine,
+        shared: SharedAlloc<'static>,
+        alloc: Alloc<'_>,
+    ) -> Result<
+        Vec<
+            (
+                blaze_ladder::run::make_one::BuiltLir<SharedAlloc<'static>>,
+                Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
+            ),
+            SharedAlloc<'static>,
+        >,
+        blaze_ladder::run::make_one::export_lto::ExportLtoError,
+    > {
+        use blaze_ladder::run::make_one::export_lto::{ExportLtoError, MakerLirBuilder};
+
+        if rows.len() <= 16 || self.worker_count <= 1 {
+            let ids = self.ids;
+            let mut seq = MakerLirBuilder::new(self.walk, self.maker, |tabled| ids.runnable(tabled).ok());
+            return seq.build_lir_batch(rows, machine, shared, alloc);
+        }
+
+        // Pre-validate runnable proofs and group jobs by `tabled` so workers reuse warm
+        // per-`tabled` TypeckBody caches across monomorphizations.
+        struct LirJob {
+            pos: usize,
+            row: usize,
+            tabled: ItemKey,
+            symbol: CodeSymbol,
+            proof: crate::run_ids::Runnable,
+            name: Vec<u8, SharedAlloc<'static>>,
+            enclosers: crate::test_drive::suite_cache::LocalEnclosers,
+        }
+        let mut jobs: Vec<LirJob, SharedAlloc<'static>> = Vec::with_capacity_in(rows.len(), shared);
+        for (pos, &row) in rows.iter().enumerate() {
+            let tabled = self.walk.tabled(row);
+            let symbol = self.walk.symbol(row);
+            let Some(proof) = self.ids.runnable(tabled).ok() else {
+                return Err(ExportLtoError::NotRunnable { symbol: symbol.0, tabled });
+            };
+            let mut name = Vec::with_capacity_in(self.walk.name(row).len(), shared);
+            name.extend_from_slice(self.walk.name(row));
+            let enclosers = crate::test_drive::suite_cache::local_enclosers_of(self.walk, row, tabled);
+            jobs.push(LirJob { pos, row, tabled, symbol, proof, name, enclosers });
+        }
+        jobs.sort_unstable_by_key(|j| (j.tabled, j.pos));
+
+        let active_workers = self.worker_count.min(jobs.len());
+        let worker_nz = core::num::NonZeroUsize::new(active_workers).expect("non-zero worker count");
+        let procs_asked = bstd::sync::chan::owned::<usize, _>("blaze build: LTO LIR procs asks", worker_nz, shared);
+        let mut procs_answers: Vec<bstd::sync::chan::OwnedChan<ExportProcsAnswer, SharedAlloc<'static>>, SharedAlloc<'static>> =
+            Vec::with_capacity_in(active_workers, shared);
+        for _ in 0..active_workers {
+            procs_answers.push(bstd::sync::chan::owned(
+                "blaze build: LTO LIR procs answer",
+                core::num::NonZeroUsize::MIN,
+                shared,
+            ));
+        }
+
+        enum WorkerLirErr {
+            Verify { symbol: [u8; 32], error: blaze_lir::VerifyError },
+            BuildFailedRow(usize),
+        }
+
+        type WorkerLirItem = Result<
+            (
+                usize,
+                blaze_ladder::run::make_one::BuiltLir<SharedAlloc<'static>>,
+                Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
+            ),
+            WorkerLirErr,
+        >;
+
+        let jobs_slice = jobs.as_slice();
+        let next = bstd::sync::CachePadded::new(core::sync::atomic::AtomicUsize::new(0));
+        let next_ref = &next;
+        let done_workers = core::sync::atomic::AtomicUsize::new(0);
+        let done_ref = &done_workers;
+        let root = self.root;
+        let clock = self.clock;
+        let crates = self.crates;
+        let sync_typed = self.sync_typed;
+        let shared_front = self.shared_front;
+        let builder = self.builder;
+        let maker_entry = self.maker_entry;
+        let maker_start = self.maker_start;
+        let heap = self.heap;
+        let asked_ref = &procs_asked;
+        let answers_slice = procs_answers.as_slice();
+
+        let scope = self.cx.scope();
+        let mut handles = Vec::with_capacity_in(active_workers, shared);
+        for worker_id in 0..active_workers {
+            let answer_ref = &answers_slice[worker_id];
+            handles.push(scope.may_overlap(
+                "export: LTO LIR worker",
+                EXPORT_WORKER_SCRATCH,
+                move |wcx: &Cx| -> Result<Vec<WorkerLirItem, SharedAlloc<'static>>, core::convert::Infallible> {
+                    let mut local: Vec<WorkerLirItem, SharedAlloc<'static>> = Vec::new_in(shared);
+                    let Ok(mut worker_frame) = Frame::new(bstd::mem::Tag::Other) else {
+                        done_ref.fetch_add(1, core::sync::atomic::Ordering::Release);
+                        return Ok(local);
+                    };
+                    let mut reset_at = EXPORT_WORKER_FRAME_HEADROOM;
+                    let mut carry: Option<usize> = None;
+
+                    'epoch: loop {
+                        worker_frame.reset();
+                        worker_frame.trim(EXPORT_WORKER_FRAME_KEEP);
+                        let seen: &TreesSeen = worker_frame.alloc(TreesSeen::default());
+                        let worker_procs = ExportWorkerProcs {
+                            worker: worker_id,
+                            cx: wcx,
+                            clock,
+                            frame: &worker_frame,
+                            procs_asked: asked_ref,
+                            procs_answer: answer_ref,
+                            got: core::cell::OnceCell::new(),
+                        };
+                        let names = match run_names::names_in(
+                            wcx,
+                            root,
+                            crates,
+                            crate::job_texts::Procs::ByNeed(&worker_procs),
+                            seen,
+                            &worker_frame,
+                        ) {
+                            Ok(n) => n,
+                            Err(_) => break 'epoch,
+                        };
+                        let reader = sync_typed.reader_persisting(wcx, crates.snapshot(), heap.alloc(), shared);
+                        let mut maker: Maker<'_, crate::run_ids::Runnable, SharedExportTyping<_>> = Maker::of_start(
+                            names,
+                            maker_entry,
+                            maker_start,
+                            SharedExportTyping::new(reader, shared_front, heap.alloc()),
+                            builder,
+                            Some(crate::run_parent::command_make_watch()),
+                            heap.alloc(),
+                        );
+                        let mut makes = 0usize;
+                        let mut scratch_frame = match Frame::with_reserve(16 << 20, bstd::mem::Tag::Other) {
+                            Ok(f) => f,
+                            Err(_) => break 'epoch,
+                        };
+
+                        loop {
+                            let (j_start, j_end) = if let Some(idx) = carry.take() {
+                                (idx, idx + 1)
+                            } else {
+                                let Some(range) = steal_next_batch(next_ref, 4, jobs_slice.len()) else {
+                                    break 'epoch;
+                                };
+                                range
+                            };
+                            let mut epoch_reset = false;
+                            for j_idx in j_start..j_end {
+                                let job = &jobs_slice[j_idx];
+                                scratch_frame.reset();
+                                let sc_erased = Erased::new(&scratch_frame);
+                                let sc_alloc = sc_erased.handle();
+                                if let Some(prog) = maker.program() {
+                                    prog.attach_shared(shared_front);
+                                }
+                                if !job.enclosers.locals().is_empty() {
+                                    maker.prepare_local(job.enclosers.locals(), job.enclosers.enclosers());
+                                }
+                                if let Some(prog) = maker.program() {
+                                    prog.attach_shared(shared_front);
+                                }
+                                let mut lto_decl = blaze_ladder::body_ids::DeclaredList::new_in(sc_alloc);
+                                let built_res = maker.build_lir_with_reach_in(
+                                    &job.proof,
+                                    job.tabled,
+                                    job.name.as_slice(),
+                                    Some(&mut lto_decl),
+                                    shared,
+                                );
+                                match built_res {
+                                    Ok(mut built) => {
+                                        makes = makes.saturating_add(1);
+                                        if makes == 1 {
+                                            let used = worker_frame.used();
+                                            reset_at = used
+                                                .saturating_add(EXPORT_WORKER_FRAME_HEADROOM)
+                                                .min(EXPORT_WORKER_FRAME_HARD_RESET_AT);
+                                        }
+                                        let mut declared: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> =
+                                            Vec::with_capacity_in(lto_decl.len(), shared);
+                                        for di in 0..lto_decl.len() {
+                                            let (dt, dn) = lto_decl.row(di);
+                                            let mut copied = Vec::with_capacity_in(dn.len(), shared);
+                                            copied.extend_from_slice(dn);
+                                            declared.push((dt, copied));
+                                        }
+                                        if let Some(_) = blaze_ladder::run::make_one::export_lto::prepare_built_lir_in_place(
+                                            &mut built,
+                                            machine,
+                                            sc_alloc,
+                                        )
+                                        .err()
+                                        {
+                                            // Fall through to verify error below.
+                                        }
+                                        if let Err(err) = blaze_lir::verify(built.func.view()) {
+                                            local.push(Err(WorkerLirErr::Verify {
+                                                symbol: job.symbol.0,
+                                                error: err,
+                                            }));
+                                        } else {
+                                            local.push(Ok((job.pos, built, declared)));
+                                        }
+                                    }
+                                    Err(_) => {
+                                        local.push(Err(WorkerLirErr::BuildFailedRow(job.row)));
+                                    }
+                                }
+                                let (live_bodies, store_tys) =
+                                    maker.program().map_or((0, 0), |p| p.worker_epoch_load());
+                                if worker_frame.used() >= reset_at
+                                    || live_bodies >= EXPORT_WORKER_MAX_LIVE_BODIES
+                                    || store_tys >= EXPORT_WORKER_MAX_STORE_TYS
+                                {
+                                    if j_idx + 1 < j_end {
+                                        // Leave remaining items of the 4-batch for next epoch via carry loop?
+                                        // Actually finish this tiny <=4 batch, then reset!
+                                    }
+                                    epoch_reset = true;
+                                }
+                            }
+                            if epoch_reset {
+                                continue 'epoch;
+                            }
+                        }
+                    }
+                    done_ref.fetch_add(1, core::sync::atomic::Ordering::Release);
+                    Ok(local)
+                },
+            ));
+        }
+
+        // Serve any proc-macro runner requests while workers run.
+        while done_workers.load(core::sync::atomic::Ordering::Acquire) < active_workers {
+            while let Ok(worker_id) = procs_asked.try_recv() {
+                let answer: ExportProcsAnswer =
+                    self.procs.procs().map_err(|why| export_err_string(format_args!("{why}"), shared));
+                if let Some(ch) = procs_answers.get(worker_id) {
+                    let by = self.cx.until(bstd::Deadline::after(self.clock.now().since_start(), EXPORT_HAND_WAIT));
+                    let _ = ch.send(&by, answer);
+                }
+            }
+            std::thread::yield_now();
+        }
+        // Drain any trailing proc request before joining.
+        while let Ok(worker_id) = procs_asked.try_recv() {
+            let answer: ExportProcsAnswer =
+                self.procs.procs().map_err(|why| export_err_string(format_args!("{why}"), shared));
+            if let Some(ch) = procs_answers.get(worker_id) {
+                let by = self.cx.until(bstd::Deadline::after(self.clock.now().since_start(), EXPORT_HAND_WAIT));
+                let _ = ch.send(&by, answer);
+            }
+        }
+
+        let mut slots: Vec<
+            Option<(
+                blaze_ladder::run::make_one::BuiltLir<SharedAlloc<'static>>,
+                Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
+            )>,
+            SharedAlloc<'static>,
+        > = Vec::with_capacity_in(rows.len(), shared);
+        for _ in 0..rows.len() {
+            slots.push(None);
+        }
+        let mut first_err: Option<WorkerLirErr> = None;
+        for handle in handles {
+            if let Ok(part) = handle.join(self.cx) {
+                for item in part {
+                    match item {
+                        Ok((pos, built, declared)) => {
+                            if let Some(slot) = slots.get_mut(pos) {
+                                *slot = Some((built, declared));
+                            }
+                        }
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = scope.join(self.cx);
+        if let Some(err) = first_err {
+            return match err {
+                WorkerLirErr::Verify { symbol, error } => Err(ExportLtoError::Verify { symbol, error }),
+                WorkerLirErr::BuildFailedRow(bad_row) => {
+                    // Replay the single failing row on the coordinator maker to return the exact
+                    // structured `RunError` without sending non-`Send` errors across threads.
+                    let mut seq = blaze_ladder::run::make_one::export_lto::MakerLirBuilder::new(
+                        self.walk,
+                        self.maker,
+                        |tabled| self.ids.runnable(tabled).ok(),
+                    );
+                    let _ = seq.build_lir_batch(&[bad_row], machine, shared, alloc)?;
+                    Err(ExportLtoError::BadRef {
+                        symbol: self.walk.symbol(bad_row).0,
+                        what: "parallel LTO LIR build failed on worker but succeeded on coordinator",
+                        ref_id: u32::try_from(bad_row).unwrap_or(u32::MAX),
+                    })
+                }
+            };
+        }
+
+        let mut out = Vec::with_capacity_in(rows.len(), shared);
+        for (pos, slot) in slots.into_iter().enumerate() {
+            let Some(pair) = slot else {
+                let row = rows[pos];
+                return Err(ExportLtoError::BadRef {
+                    symbol: self.walk.symbol(row).0,
+                    what: "parallel LTO LIR worker missed row",
+                    ref_id: u32::try_from(pos).unwrap_or(u32::MAX),
+                });
+            };
+            out.push(pair);
+        }
+        Ok(out)
+    }
+
+    fn prepare_routines(
+        &self,
+    ) -> Result<Option<blaze_ladder::front2::builtins_shim::BoundRef<'_>>, blaze_ladder::code_records::CodeRecordError> {
+        self.maker.prepare_routines()
     }
 }
 
@@ -1588,6 +2007,7 @@ struct ExportDone {
     row: usize,
     result: Result<Vec<u8, SharedAlloc<'static>>, ExportWorkerErr>,
     typed: Option<crate::engine_body_record::WorkerTypedBatch>,
+    lir_bytes: Option<Vec<u8, SharedAlloc<'static>>>,
 }
 
 type ExportProcsAnswer = Result<&'static crate::proc_runner::ProcRunner<'static>, String<SharedAlloc<'static>>>;
@@ -2014,6 +2434,7 @@ fn run_export_worker_epoch<'f>(
     carry: &mut Option<ExportJob>,
     reset_at: &mut usize,
     mut worker_top: Option<&mut CompileTopStats>,
+    lto_lir_machine: Option<ExportLtoMachine>,
     heap: &'static blaze_own::Heap,
 ) -> ExportEpochEnd {
     let shared = heap.shared();
@@ -2032,7 +2453,7 @@ fn run_export_worker_epoch<'f>(
         Err(why) => {
             if let Some(job) = carry.take() {
                 let msg = export_err_string(format_args!("export worker names init failed: {why}"), shared);
-                let _ = done.send(cx, ExportDone { worker, row: job.row, result: Err(ExportWorkerErr::Fatal(msg)), typed: None });
+                let _ = done.send(cx, ExportDone { worker, row: job.row, result: Err(ExportWorkerErr::Fatal(msg)), typed: None, lir_bytes: None });
             }
             return ExportEpochEnd::Done;
         }
@@ -2047,6 +2468,9 @@ fn run_export_worker_epoch<'f>(
         Some(crate::run_parent::command_make_watch()),
         heap.alloc(),
     );
+    if let Some(machine) = lto_lir_machine {
+        maker.enable_lto_lir_capture(machine, shared);
+    }
     let mut scratch: AVec<'_, u8> = Vec::new_in(heap.alloc());
     let mut makes = 0usize;
 
@@ -2111,9 +2535,10 @@ fn run_export_worker_epoch<'f>(
             }
         };
         let typed = maker.typing().kept.take_pending();
+        let lir_bytes = if result.is_ok() { maker.take_captured_lir() } else { None };
         let by = cx.until(bstd::Deadline::after(clock.now().since_start(), EXPORT_HAND_WAIT));
         let sending = by.span("blaze build: send compiled entry");
-        if done.send(&sending, ExportDone { worker, row: job.row, result, typed }).is_err() {
+        if done.send(&sending, ExportDone { worker, row: job.row, result, typed, lir_bytes }).is_err() {
             return ExportEpochEnd::Done;
         }
         let (live_bodies, store_tys) = maker.program().map_or((0, 0), |p| p.worker_epoch_load());
@@ -2159,6 +2584,7 @@ fn run_export_code_worker(
     procs_asked: &bstd::sync::chan::OwnedChan<usize, SharedAlloc<'static>>,
     procs_answer: &bstd::sync::chan::OwnedChan<ExportProcsAnswer, SharedAlloc<'static>>,
     collect_stats: bool,
+    lto_lir_machine: Option<ExportLtoMachine>,
     heap: &'static blaze_own::Heap,
 ) -> Option<CompileTopStats> {
     let mut worker_top = collect_stats.then(|| CompileTopStats::new_in(heap.shared()));
@@ -2190,12 +2616,80 @@ fn run_export_code_worker(
             &mut carry,
             &mut reset_at,
             worker_top.as_mut(),
+            lto_lir_machine,
             heap,
         ) {
             ExportEpochEnd::Done => return worker_top,
             ExportEpochEnd::Reset(next) => carry = next,
         }
     }
+}
+
+/// Persists a walk-captured `BLZLIR02` payload into `Namespace::LOCAL` under its input-complete
+/// `built_lir_cache_key` and registers the key under the appropriate GC root (program vs toolchain).
+#[expect(clippy::too_many_arguments, reason = "persists walk-captured BLZLIR02 payload into Namespace::LOCAL with exact root class")]
+fn persist_walk_built_lir<'a, D: blaze_core::Driver>(
+    lent: &blaze_cas::plain::Lent<D, crate::store::plain_place::StoreAlloc>,
+    walk: &Walk<'_>,
+    row: usize,
+    content_key: CodeKey,
+    lir_bytes: &[u8],
+    ids: &crate::run_ids::RunIds<'_>,
+    machine: ExportLtoMachine,
+    producer_digest: [u8; 32],
+    dep_typed_program: &mut AVec<'a, blaze_cas::Key>,
+    dep_typed_toolchain: &mut AVec<'a, blaze_cas::Key>,
+    frame: &Frame,
+    heap: &'static blaze_own::Heap,
+) -> Result<(), CliError> {
+    let tabled = walk.tabled(row);
+    let Some(body) = ids.body_check(tabled) else {
+        return Ok(());
+    };
+    if body.reads.is_empty() {
+        return Ok(());
+    }
+    let key = built_lir_cache_key(
+        producer_digest,
+        machine,
+        walk.symbol(row),
+        content_key.0.0,
+        body.key.0,
+        body.reads,
+    );
+    let cas_key = blaze_cas::Key(blaze_ids::ContentId(key));
+    if lent.uncommitted_bytes() > crate::store::plain_place::COMMIT_BYTES {
+        lent.commit().map_err(|why| {
+            box_err(
+                ExportCliError::KeepRoots {
+                    class: "walk LTO LIR cache",
+                    shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()),
+                },
+                heap,
+            )
+        })?;
+    }
+    lent.put(
+        &cas_key,
+        blaze_cas::plain::Namespace::LOCAL,
+        blaze_keyed::kind::ReservedTag::Code.tag(),
+        lir_bytes,
+    )
+    .map_err(|why| {
+        box_err(
+            ExportCliError::KeepRoots {
+                class: "walk LTO LIR cache",
+                shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()),
+            },
+            heap,
+        )
+    })?;
+    if ids.grain(tabled) == Some(crate::run_ids::Grain::Toolchain) {
+        dep_typed_toolchain.push(cas_key);
+    } else {
+        dep_typed_program.push(cas_key);
+    }
+    Ok(())
 }
 
 /// Finishes walking the remaining rows of `walk` (`*next_row..`) using `worker_count` parallel
@@ -2231,6 +2725,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
     unkeyed: &mut usize,
     stubs: &mut usize,
     mut top_stats: Option<&mut CompileTopStats>,
+    lto_lir_capture: Option<(ExportLtoMachine, [u8; 32])>,
     frame: &'f Frame,
     alloc: Alloc<'a>,
     heap: &'static blaze_own::Heap,
@@ -2238,6 +2733,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
     use bstd::sync::chan::owned;
     use core::num::NonZeroUsize;
 
+    let lto_lir_machine = lto_lir_capture.map(|(m, _)| m);
     let collect_stats = top_stats.is_some();
     let shared = heap.shared();
     let start_row = *next_row;
@@ -2279,6 +2775,7 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
                 asked_ref,
                 answer_ref,
                 collect_stats,
+                lto_lir_machine,
                 heap,
             );
             Ok::<Option<CompileTopStats>, core::convert::Infallible>(worker_top)
@@ -2448,6 +2945,22 @@ fn walk_remaining_parallel<'a, 'f, 'p, 'n, D: blaze_core::Driver>(
                         Stepped::Made(key) => {
                             *compiled += 1;
                             verified.record_made(symbol, walk.tabled(row), walk.name(row), entry_bytes.as_slice(), key, ids, builder, alloc);
+                            if let (Some((machine, producer_digest)), Some(lir)) = (lto_lir_capture, done.lir_bytes.as_deref()) {
+                                persist_walk_built_lir(
+                                    lent,
+                                    walk,
+                                    row,
+                                    key,
+                                    lir,
+                                    ids,
+                                    machine,
+                                    producer_digest,
+                                    dep_typed_program,
+                                    dep_typed_toolchain,
+                                    frame,
+                                    heap,
+                                )?;
+                            }
                             RowOutcome::Keyed(key)
                         }
                         Stepped::Unkeyed(_) => {
@@ -3114,6 +3627,22 @@ fn export_program<'f>(
         .unwrap_or(0)
         .min(MAX_EXPORT_WORKERS);
 
+    let mut lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
+    let lto_producer_digest = blaze_ladder::code_records::code_key(
+        &blaze_ladder::code_records::KeyParts {
+            symbol: CodeSymbol([0u8; 32]),
+            body: blaze_ids::ContentId([0u8; 32]),
+            ground: blaze_ids::ContentId([0u8; 32]),
+        },
+        &builder,
+    )
+    .0
+    .0;
+    let walk_lto_capture = (target == BuildTarget::Native).then_some((lto_opts.machine, lto_producer_digest));
+    if let Some((machine, _)) = walk_lto_capture {
+        maker.enable_lto_lir_capture(machine, heap.shared());
+    }
+
     let mut top_stats = stats.then(|| CompileTopStats::new_in(heap.shared()));
     let front_ns = phases.since(started_at);
     let walk_began = phases.now();
@@ -3153,6 +3682,7 @@ fn export_program<'f>(
                     &mut unkeyed,
                     &mut stubs,
                     top_stats.as_mut(),
+                    walk_lto_capture,
                     frame,
                     alloc,
                     heap,
@@ -3179,6 +3709,22 @@ fn export_program<'f>(
                     Stepped::Made(key) => {
                         compiled += 1;
                         verified.record_made(symbol, tabled, walk.name(row), scratch.made(), key, &ids, &builder, alloc);
+                        if let (Some((machine, producer_digest)), Some(lir)) = (walk_lto_capture, maker.take_captured_lir()) {
+                            persist_walk_built_lir(
+                                lent,
+                                &walk,
+                                row,
+                                key,
+                                lir.as_slice(),
+                                &ids,
+                                machine,
+                                producer_digest,
+                                &mut dep_typed_program,
+                                &mut dep_typed_toolchain,
+                                frame,
+                                heap,
+                            )?;
+                        }
                         if let Some(top) = top_stats.as_mut()
                             && let Some(sizes) = maker.take_last_make()
                         {
@@ -3319,32 +3865,32 @@ fn export_program<'f>(
         });
     }
 
-    // Whole-program demand-driven cross-function LIR inlining + host-ISA SOTA emission over
-    // workspace functions and their non-cold reachable callees (cached in `Namespace::LOCAL`
-    // under host+producer+input-complete keys, never written into portable `HomeCodeStore`).
+    // Whole-program all-crate bottom-up content-addressed ThinLTO + host-ISA SOTA emission across
+    // `Workspace`, `Locked` third-party dependencies, and `Toolchain` (`core`/`alloc`/`std`)
+    // (cached in `Namespace::LOCAL` under Merkle SCC keys `BLZOLT01`, never polluting portable
+    // `HomeCodeStore`).
     let lto_began = phases.now();
-    let mut lto_seeds: AVec<'_, usize> = Vec::new_in(alloc);
+    let mut eligible_rows: AVec<'_, usize> = Vec::with_capacity_in(outcomes.len(), alloc);
+    let mut row_code_records: AVec<'_, Option<&'_ [u8]>> = Vec::with_capacity_in(outcomes.len(), alloc);
     for (row, outcome) in outcomes.iter().enumerate() {
-        if walk.kind(row) == RowKind::Instance
-            && !matches!(outcome, RowOutcome::UnbuiltStub(_))
-            && ids.grain(walk.tabled(row)) == Some(crate::run_ids::Grain::Workspace)
-        {
-            lto_seeds.push(row);
-        }
+        let rec_slice = if walk.kind(row) == RowKind::Instance && !matches!(outcome, RowOutcome::UnbuiltStub(_)) {
+            eligible_rows.push(row);
+            match outcome {
+                RowOutcome::Keyed(key) => entry_of(&codes, *key)
+                    .ok()
+                    .flatten()
+                    .and_then(|e| statics::entry_record(e).ok()),
+                RowOutcome::Unkeyed(bytes) => statics::entry_record(bytes.as_slice()).ok(),
+                RowOutcome::Lto { record, .. } => Some(record.as_slice()),
+                RowOutcome::LtoCached(_) | RowOutcome::UnbuiltStub(_) => None,
+            }
+        } else {
+            None
+        };
+        row_code_records.push(rec_slice);
     }
-    let mut lto_opts = blaze_ladder::run::make_one::export_lto::ExportLtoOpts::for_export(isa);
     lto_opts.pgo_bytes = persisted_pgo.as_deref();
     let lto_runner = CliLtoRunner { cx, workers: standing.workers };
-    let lto_producer_digest = blaze_ladder::code_records::code_key(
-        &blaze_ladder::code_records::KeyParts {
-            symbol: CodeSymbol([0u8; 32]),
-            body: blaze_ids::ContentId([0u8; 32]),
-            ground: blaze_ids::ContentId([0u8; 32]),
-        },
-        &builder,
-    )
-    .0
-    .0;
     let lto_cache = HomeLtoCache::new(
         lent,
         &walk,
@@ -3357,16 +3903,36 @@ fn export_program<'f>(
         heap,
     );
     let lto_out = {
-        let _lto_span = cx.span("export: workspace LTO");
-        blaze_ladder::run::make_one::export_lto::optimize_export_workspace_par_cached(
+        let _lto_span = cx.span("export: all-crate LTO");
+        let sync_typed = crate::engine_body_record::SyncTypedFrom { records: standing.records(), ids: ids.lookup() };
+        let mut lir_builder = CliExportLirBuilder {
+            cx,
+            clock: &env.clock,
+            root,
+            crates,
+            sync_typed,
+            shared_front: &shared_front,
+            procs: &maker_procs,
+            ids: &ids,
+            builder: &builder,
+            maker_entry,
+            maker_start: roots.maker_start,
+            worker_count: export_workers,
+            walk: &walk,
+            maker: &mut maker,
+            heap,
+        };
+        let row_recs_slice = row_code_records.as_slice();
+        optimize_export_all_par_cached(
             &walk,
-            lto_seeds.as_slice(),
-            |row| walk.kind(row) == RowKind::Instance && !matches!(outcomes.get(row), Some(RowOutcome::UnbuiltStub(_))),
-            |tabled| ids.runnable(tabled).ok(),
-            &mut maker,
+            eligible_rows.as_slice(),
+            |row| ids.grain(walk.tabled(row)) == Some(crate::run_ids::Grain::Workspace),
+            |row| ids.grain(walk.tabled(row)) == Some(crate::run_ids::Grain::Toolchain),
+            |row| row_recs_slice.get(row).copied().flatten(),
+            &mut lir_builder,
             lto_opts,
             heap.shared(),
-            alloc,
+            heap.alloc(),
             &lto_runner,
             &lto_cache,
         )
@@ -3377,30 +3943,65 @@ fn export_program<'f>(
             )
         })?
     };
+    drop(row_code_records);
     if let Some(cache_err) = lto_cache.take_error() {
         return Err(box_err(ExportCliError::Lto { shown: cache_err }, heap));
     }
-    let lto_touched_keys = lto_cache.into_touched_keys();
+    let (lto_touched_keys, lto_touched_toolchain) = lto_cache.into_touched_keys();
+    dep_typed_toolchain.extend_from_slice(lto_touched_toolchain.as_slice());
     let lto_times = lto_out.times;
-    let lto_bodies = lto_out.bodies.len();
+    let lto_bodies = lto_out.optimized_bodies;
     let lto_inlined = lto_out.total_inlined;
     let lto_hot_symbols = lto_out.hot_symbols;
     let lto_profile_digest = lto_out.profile_digest;
     let lto_hot = lto_hot_symbols.len();
-    let mut extra_roots: Vec<(ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> = Vec::new_in(heap.shared());
-    for body in lto_out.bodies {
-        if let Some(slot) = outcomes.get_mut(body.row) {
-            *slot = RowOutcome::Lto {
-                record: body.record,
-                vtable_data: body.vtable_data,
-            };
-        }
-        for decl in body.extra_declared {
-            extra_roots.push(decl);
+    let mut extra_roots: Vec<(Option<usize>, ItemKey, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>> =
+        Vec::new_in(heap.shared());
+    for row_res in lto_out.rows {
+        match row_res {
+            LtoRowResult::Cached { row, cache_key, .. } => {
+                if let Some(slot) = outcomes.get_mut(row) {
+                    *slot = RowOutcome::LtoCached(blaze_cas::Key(blaze_ids::ContentId(cache_key)));
+                }
+            }
+            LtoRowResult::Inline(body) => {
+                if let Some(slot) = outcomes.get_mut(body.row) {
+                    *slot = RowOutcome::Lto {
+                        record: body.record,
+                        vtable_data: body.vtable_data,
+                    };
+                }
+                for (tabled, name_bytes) in body.extra_declared {
+                    extra_roots.push((None, tabled, name_bytes));
+                }
+            }
         }
     }
-    for (tabled, name_bytes) in extra_roots {
-        walk.root::<RunError>((tabled, name_bytes.as_slice()), MOST_WALKED).map_err(|why| {
+    for (declarer_row, tabled, name_bytes) in lto_out.extra_walk_instances {
+        extra_roots.push((Some(declarer_row), tabled, name_bytes));
+    }
+    for (declarer_row, tabled, name_bytes) in extra_roots {
+        let reached = match declarer_row {
+            Some(parent) => walk.root_from::<RunError>(parent, (tabled, name_bytes.as_slice()), MOST_WALKED),
+            None => walk.root::<RunError>((tabled, name_bytes.as_slice()), MOST_WALKED),
+        };
+        reached.map_err(|why| {
+            box_err(
+                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+    }
+    for item in lto_out.extra_walk_statics {
+        walk.root_static::<RunError>(item, MOST_WALKED).map_err(|why| {
+            box_err(
+                ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
+                heap,
+            )
+        })?;
+    }
+    for item in lto_out.extra_walk_tls {
+        walk.root_thread_local::<RunError>(item, MOST_WALKED).map_err(|why| {
             box_err(
                 ExportCliError::Walk { symbol: roots.entry.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
                 heap,
@@ -3412,11 +4013,14 @@ fn export_program<'f>(
         next_row += 1;
         let tabled = walk.tabled(row);
         let symbol = walk.symbol(row);
+        let kind = walk.kind(row);
         let proof = ids.runnable(tabled).map_err(|why| {
             let krate = crate_of_item(list, tabled, heap.alloc());
             box_err(ExportCliError::NotChecked { krate, function: tabled, symbol: symbol.0, row, reached: walk.len(), compiled, cached, why }, heap)
         })?;
-        match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
+        let enclosers = crate::test_drive::suite_cache::local_enclosers_of(&walk, row, tabled);
+        let mut verify_maker = LazyVerifyMaker { maker: &mut maker, shared: &shared_front, enclosers: &enclosers, ids: &ids, verified: &mut verified, prepared: false };
+        match walk.one(row, &ids, &mut codes, &builder, &builder.producer, &mut verify_maker, &proof, &body_ids::EntryForm, MOST_WALKED, &mut scratch) {
             Ok(one) => match one.stepped {
                 Stepped::Found(key) => {
                     cached += 1;
@@ -3424,6 +4028,7 @@ fn export_program<'f>(
                 }
                 Stepped::Made(key) => {
                     compiled += 1;
+                    verified.record_made(symbol, tabled, walk.name(row), scratch.made(), key, &ids, &builder, alloc);
                     if let Some(top) = top_stats.as_mut()
                         && let Some(sizes) = maker.take_last_make()
                     {
@@ -3443,6 +4048,12 @@ fn export_program<'f>(
                     outcomes.push(RowOutcome::Unkeyed(copied));
                 }
             },
+            Err(why) if row >= root_count && kind == RowKind::Instance && why.scope() == blaze_ladder::scope::Scope::One => {
+                let msg = bstd::mem::format_in!(frame, "blaze build: called unbuilt function: {why}");
+                let stub_bytes = make_unbuilt_stub_record(symbol, msg.as_str(), frame, alloc, heap).map_err(|e| box_err(e, heap))?;
+                stubs += 1;
+                outcomes.push(RowOutcome::UnbuiltStub(stub_bytes));
+            }
             Err(why) => {
                 return Err(box_err(
                     ExportCliError::Walk { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) },
@@ -3484,6 +4095,15 @@ fn export_program<'f>(
                 RowOutcome::Unkeyed(bytes) => statics::entry_record(bytes.as_slice())
                     .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?,
                 RowOutcome::Lto { record, .. } => record.as_slice(),
+                RowOutcome::LtoCached(cas_key) => {
+                    let rec = lent
+                        .get(cas_key)
+                        .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
+                        .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: symbol.0 }, heap))?;
+                    let hdr = decode_lto_scc_header(rec.bytes)
+                        .ok_or_else(|| box_err(ExportCliError::Decode { symbol: symbol.0, what: "BLZOLT01 header", shown: owned_str("corrupt BLZOLT01 record", heap.alloc()) }, heap))?;
+                    hdr.record
+                }
                 RowOutcome::UnbuiltStub(bytes) => bytes.as_slice(),
             };
             let view = CodeView::read(rec_bytes)
@@ -3517,7 +4137,7 @@ fn export_program<'f>(
     // Commit and root any extra LTO-discovered, local LTO cache, or TLS special records BEFORE
     // `ProgramIn` borrows `&codes` and BEFORE `blaze_export::export_par()` runs, so a linker error
     // never discards them.
-    if lent.needs_commit() || tls_keys.is_some() || !lto_touched_keys.is_empty() {
+    if lent.needs_commit() || tls_keys.is_some() || !lto_touched_keys.is_empty() || !lto_touched_toolchain.is_empty() {
         checkpoint_export_roots(
             lent,
             &today,
@@ -3569,6 +4189,39 @@ fn export_program<'f>(
             );
             symbol_names.push((symbol, sym_name));
         }
+        if let RowOutcome::LtoCached(cas_key) = outcome {
+            let rec = lent
+                .get(cas_key)
+                .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
+                .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: symbol.0 }, heap))?;
+            let hdr = decode_lto_scc_header(rec.bytes)
+                .ok_or_else(|| box_err(ExportCliError::Decode { symbol: symbol.0, what: "BLZOLT01 header", shown: owned_str("corrupt BLZOLT01 record", heap.alloc()) }, heap))?;
+            let raw_view = CodeView::read(hdr.record)
+                .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "LTO code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
+            let view = materialize_positionless(
+                symbol,
+                raw_view,
+                |item, site| names.records.source_position(item, site, alloc),
+                frame,
+                export_bump,
+                heap,
+            )
+            .map_err(|e| box_err(e, heap))?;
+            functions.push(Function { symbol, record: view, tier: Tier::Optimized });
+            hdr.each_vtable(|vtable_sym, datum_bytes| {
+                push_datum(
+                    &mut data,
+                    &mut seen_data,
+                    &mut tls_count,
+                    Target { space: Space::Vtable, symbol: vtable_sym },
+                    datum_bytes,
+                    frame,
+                    export_bump,
+                    heap,
+                )
+            })?;
+            continue;
+        }
         if let RowOutcome::Lto { record, vtable_data } = outcome {
             let raw_view = CodeView::read(record.as_slice())
                 .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "LTO code record", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;
@@ -3607,7 +4260,7 @@ fn export_program<'f>(
                 .map_err(|why| box_err(ExportCliError::Store { symbol: symbol.0, shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?
                 .ok_or_else(|| box_err(ExportCliError::MissingEntry { symbol: symbol.0 }, heap))?,
             RowOutcome::Unkeyed(bytes) => bytes.as_slice(),
-            RowOutcome::Lto { .. } | RowOutcome::UnbuiltStub(_) => continue,
+            RowOutcome::Lto { .. } | RowOutcome::LtoCached(_) | RowOutcome::UnbuiltStub(_) => continue,
         };
         let rec_bytes = statics::entry_record(entry_bytes)
             .map_err(|why| box_err(ExportCliError::Decode { symbol: symbol.0, what: "code entry", shown: owned_fmt(format_args!("{why}"), frame, heap.alloc()) }, heap))?;

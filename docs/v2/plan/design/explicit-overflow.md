@@ -34,9 +34,10 @@ the prover does not follow, so it is always refused.
 
 ## Design
 
-One query, `hir_ty_pure::reach::overflow_of_body(def)`, runs the reach prover (the abstract
-interpretation over runtime MIR behind `blaze::unreachable!()`) in a separate overflow mode.
-It covers the body and each closure's body.
+Not built on the new layer: only the lint's name and level exist (crates/blaze-lint-defs
+`lints.rs`), and the probe fixture `crates/blaze-real/extensions/a_implicit_overflow.rs` passes
+with its violation. One query per body runs the reach prover (the abstract interpretation behind
+`blaze::unreachable!()`) in a separate overflow mode. It covers the body and each closure's body.
 
 - **Assume-fits semantics.** An operation that is not shown to fit is recorded, and from then
   on it is taken to fit: a fresh value equal to the exact result. The optional overflow
@@ -85,14 +86,15 @@ The lint is in `blaze::edition` and allowed by default. In this workspace's ratc
 
 ## Tests
 
-- `crates/blaze-lints/src/blaze/implicit_overflow_tests.rs`: each operator and cast is found
-  when unbounded and accepted when guarded; each explicit form is accepted; `strict_add`,
-  `pow` and `abs` are found; macro arguments and closures are covered; the `--fix` output is
-  checked. Every case runs under both profiles, and the results must match.
-- `crates/hir-ty-pure/src/tests/reach_oracle.rs`: a blaze-sim oracle. If an operation is shown to
-  fit, a run with overflow checks must not panic, and the proof must be the same in both
-  profiles. A control plants a prover that takes every `+` to fit (`PLANT_ADD_ALWAYS_FITS`),
-  and the oracle catches it.
+To write with the lint (none exist on the new layer):
+
+- Each operator and cast is found when unbounded and accepted when guarded; each explicit form
+  is accepted; `strict_add`, `pow` and `abs` are found; macro arguments and closures are
+  covered; the `--fix` output is checked. Every case runs under both profiles, and the results
+  must match.
+- A blaze-sim oracle: if an operation is shown to fit, a run with overflow checks must not
+  panic, and the proof must be the same in both profiles. A control plants a prover that takes
+  every `+` to fit, and the oracle catches it.
 
 ## Not done
 

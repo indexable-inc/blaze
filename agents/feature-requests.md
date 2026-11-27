@@ -33,10 +33,10 @@ Format for new entries:
 
 ### 2026-11-26 — `blaze-ctx` hierarchical summary tree + `blaze-tab` output + `agents/` annoyance indexing
 
-- **Area**: `blaze-ctx` (planned), `crates/blaze-tab`, `agents/annoyances/`, `agents/howto/`
+- **Area**: `crates/blaze-ctx`, `crates/blaze-tab`, `agents/kb/`, `agents/howto/`
 - **Kind**: `tooling`
-- **Friction / Bug**: Agents spend multiple search/read turns reconstructing crate boundaries, module maps, and prior pitfalls spread across 190+ crates and 580+ `agents/annoyances/*.json` files, often missing relevant annoyances or burning context on verbose JSON/grep output.
-- **Request**: Ship `blaze-ctx` to maintain an item-/crate-grain hierarchical summary tree emitted in compact `blaze-tab` format and automatically surface matching `agents/howto/` and `agents/annoyances/` rows for any queried crate or path.
+- **Friction / Bug**: Agents spend multiple search/read turns reconstructing crate boundaries, module maps, and prior pitfalls spread across 190+ crates and the `agents/kb/` tables, often missing relevant annoyances or burning context on verbose JSON/grep output.
+- **Request**: Make `blaze-ctx` maintain an item-/crate-grain hierarchical summary tree emitted in compact `blaze-tab` format and automatically surface matching `agents/howto/` and `agents/kb/` rows for any queried crate or path.
 
 ### 2026-11-26 — Fail fast on sandbox-blocked shell execution
 
@@ -65,3 +65,59 @@ Format for new entries:
 - **Kind**: `tooling` + `strictness/lint`
 - **Friction / Bug**: `ByKind` currently reads persisted `Typed` body records only for workspace member crates and falls back to `BodySource::Run` re-typechecking for `Toolchain` (`core`/`alloc`/`std`) and `Dependency` crates during `engine_export.rs` and `blaze run`/`test`, burning redundant CPU time on every export/codegen cold miss.
 - **Request**: Persist item-grained `Typed` body records for `Toolchain` and `Dependency` crates (shared via R2 for pinned `std`/crates.io) so `engine_export.rs` reads all reachable bodies via `BodySource::Read` and eliminates `BodySource::Run` re-typechecking entirely.
+
+### 2026-11-27 — A doc claim of "built" is checked against a caller
+
+- **Area**: `scripts/src/bin/docs.rs`, `docs/`
+- **Kind**: `tooling` + `strictness/lint`
+- **Friction / Bug**: A docs audit found about forty `current` or `plan` docs calling a design "built" whose crate was deleted or whose only callers are tests (`blaze-stage`, `blaze-malloc`, `blaze-test-reach`, `blaze-store-check`, `blaze-world-api`, `blaze-format-tiers`, `blaze-rel`, `blaze-profile` from the `blaze` binary, blaze-http's `h3` wire, `blaze_run::{heat, registry, tier}`); the docs check holds paths, not reachability.
+- **Request**: A gate check that fails for a workspace crate no binary reaches (with a dated allowlist), and for a `current` doc naming such a crate without the words "built, not wired"; delete or wire each crate on the list.
+
+### 2026-11-27 — Code that contradicts a stated rule, found while auditing docs
+
+- **Area**: `crates/blaze-build/src/walk/tail_call.rs`, `crates/blaze-proc-macro/src/native_bridge.rs`, `crates/blaze-proc-macro/src/module.rs`, `crates/blaze-graph/src/sched/fiber.rs`, `crates/blaze-typeck`, `flake.nix`
+- **Kind**: `strictness/lint`
+- **Friction / Bug**: (1) `tail_call.rs:5` falls back to a call and a return for an ineligible `become` (rule 3; backend-next.md point 9 says refuse by name). (2) `native_bridge.rs:85-106` finds a proc-macro server through `rustc --print sysroot` (rules 1 and 3). (3) Compiled proc-macro and build-script modules are keyed per crate by SHA-256 (caches.md `compiled-modules`), not per item on `blaze_ids`. (4) Fiber code remains although D157/D161 decide no fibers. (5) blaze-typeck restarts from the top on `Need`; D161 decides park and resume. (6) `flake.nix` calls `.github/scripts/build_release.py`, which is not in the tree; `site/install.sh` and `harness/smoke/smoke.json` name a `blaze-engine` binary no crate builds. (7) Twelve code comments name the store folder `f5s3`; it is `f6s3`.
+- **Request**: Fix each at its cause; for (1) and (2) a lint that refuses a second route (`rustcsites` already counts (2)'s kind and should fail on it).
+
+### 2026-11-27 — Deleting a doc that code cites
+
+- **Area**: `scripts/src/bin/docs.rs`
+- **Kind**: `tooling`
+- **Friction / Bug**: 154 comments and `clippy.toml` reasons cited one design doc by path and section title, so merging that doc meant editing about 290 files; cited section titles and decision ids are not checked at all, so a comment can cite a heading that was cut.
+- **Request**: `docs check` also resolves a cited heading or `D<n>` id after a doc path in code comments, and code cites a decision id (stable) in preference to a doc section.
+
+### 2026-11-27 — `BLAZE_HOME` does not hold all of a run's state, so a second smoke on one machine fails
+
+- **Area**: `crates/blaze-cli` (`store::open_for_command` and callers reading `HOME`), `scripts/src/bin/smoke.rs`
+- **Kind**: `strictness/lint` + `tooling`
+- **Friction / Bug**: The smoke gives each project a fresh `BLAZE_HOME` but passes the machine's `HOME`; the release blaze wrote `~/.blaze/v2/{runs,journal,test}` during the run. A second smoke of the same hello-world code on the same Mac then printed `ran 0: 0 passed ... 1 reused from kept results` (cold step 0.5 s instead of 3 to 4 s) and the harness, which rightly demands one executed test, gave `verdict FAILED` for a tree whose only change was Markdown.
+- **Request**: One `Home` value names every place (D162): with `BLAZE_HOME` set nothing is read or written under `HOME`; the smoke asserts its `BLAZE_HOME` is the only directory the run touched.
+
+### 2026-11-27 — `blaze run` cannot start the gate's own scripts
+
+- **Area**: `crates/blaze-cli` (`run`, `check`), `scripts`, `syntax`, `tools/astlog/*`
+- **Kind**: `tooling`
+- **Friction / Bug**: `blaze run -q -p scripts --bin docs -- check` with the release blaze of 2026-11-27 exits 125 after 38 s without starting the program. `blaze check` on the same tree reports 218 errors (mostly `std-not-bstd` on `scripts`, `syntax` and `tools/astlog/*`), 1,438 items unchecked, and 8 heads failing on `icu_properties` paths. So the gate's scripts can only be built with cargo, against rule 2 (blaze builds blaze).
+- **Request**: `blaze run` of a workspace binary whose crates are on the `std-not-bstd` ratchet runs it (the ratchet is a lint, not a refusal to build), the `icu_properties` heads resolve, and the gate runs its scripts through `blaze run`.
+
+### 2026-11-27 — The site's Flecs build fails on `const-macro-trees.flecs`
+
+- **Area**: `site/content/updates/const-macro-trees.flecs`, `flecs-doc.wasm`
+- **Kind**: `tooling` + `diagnostic`
+- **Friction / Bug**: The site does not build: `flecs-doc.wasm` fails at line 9 (`(Requires, site.updates."const-macros")`) and again at line 19 of that file.
+- **Request**: Fix the reference (or the quoted-name lookup it trips), and run the site build in CI on every change to `site/content/`, with an error that names the entity that does not resolve.
+
+### 2026-11-27 — Deleting a crate or a doc leaves rows and citations nothing checks
+
+- **Area**: `tools/ratchets/*.txt`, `scripts/layouts.txt`, `harness/v2/nostd.json`, `crates/blaze-report/tests/{prints,backticks}.txt`, `tools/ratchets/dups-not.json`, the hot crates' `clippy.toml` bans, `crates/blaze-ctx/src/tree.rs`, `docs/v2/plan/design/caches.md`, `agents/kb/facts.jsonl`, `record` docs, code comments
+- **Kind**: `tooling` + `strictness/lint`
+- **Friction / Bug**: Deleting ten crates (D216, D218) meant hand-editing about twenty per-crate tables, a `match` of crate names in blaze-ctx, caches.md's domain lists (a domain string, `=blaze-bench-protocol`, only the deleted crate wrote), clippy bans on `blaze_profile::` paths, and about fifty comments citing deleted crates, paths (`crates/blaze-profile/src/schema.rs`) or docs (`no-tracing.md`, `profiling.md`). Nothing fails for a row or a citation of a path that no longer exists, so every missed one stays: `agents/kb/facts.jsonl` facts anchored on deleted files, and `record` docs (`docs/support.md`) linking to deleted docs.
+- **Request**: Every per-crate table fails on a row whose crate directory does not exist (and its `write` drops it); blaze-ctx derives its crate grouping from data, not a Rust `match`; one "names a tracked path" check covers comments, `clippy.toml` reasons, kb facts and every doc status including `record`; and a `git rm -r crates/<x>` helper lists what still names it.
+
+### 2026-11-27 — A test that reads another crate's files, and a script that calls a command the CLI does not have
+
+- **Area**: `crates/blaze-sql/src/tests/query.rs` (deleted), `scripts/src/bin/smoke.rs`, `crates/blaze-script/src/engine.rs`
+- **Kind**: `strictness/lint`
+- **Friction / Bug**: blaze-sql's test did `include_str!("../../../blaze-profile/sql/views.sql")`, so a crate's tests depended on another crate's files with no dependency edge to say so; the graph showed blaze-profile with no users while one existed. The smoke harness diagnosed a failed step with `blaze debug sql`, a command the CLI no longer has, so its diagnosis always failed; blaze-script's list of expected commands still names `debug sql` and `daemon`.
+- **Request**: A lint refuses `include_str!`/`include_bytes!` of a path outside the crate's own directory; a script's `blaze` subcommands are checked against blaze-cli's one command table at build time.

@@ -141,8 +141,7 @@ code can't express is two things, and the compiler adds only those:
 2. **The intrinsics.** Derivatives, sampling, `discard`, and later barriers and subgroup ops, are
    functions in `gpu::intrinsic` with a host body (the CPU meaning, or a panic naming the
    intrinsic where the host has none, like a derivative outside a quad). The device backend lowers
-   each of them by its path, from one table in the backend crate, as hir-ty-codegen answers
-   `__blaze_cache_code` by name today. Once plan.md's `core::arch::gpu` exists they move there,
+   each of them by its path, from one table in the backend crate. Once plan.md's `core::arch::gpu` exists they move there,
    and the table follows.
 
 Nothing in the front end knows a shader stage. The entry's stage and interface are data the backend
@@ -193,9 +192,7 @@ dominator tree, giving nested labelled blocks and loops, then a pass that lowers
 more than one level into a flag and single-level `break`/`continue`, the only exits naga has. An
 irreducible graph is an error naming the function and the edge, never a dispatch loop: a
 `loop { switch next { .. } }` would put every block in non-uniform control flow, which naga's
-uniformity analysis refuses wherever a derivative or a sample sits, and which GPUs run badly. The
-wasm backend's dispatcher (`crates/hir-ty-codegen/wasm.rs`) is the losing design here for that
-reason.
+uniformity analysis refuses wherever a derivative or a sample sits, and which GPUs run badly.
 
 The rest of the lowering, MIR to naga:
 
@@ -214,8 +211,7 @@ The rest of the lowering, MIR to naga:
   naga struct with the layout `core::mem` gives it; a uniform's layout is checked against the
   target's rules (Metal's `float3` is 16 bytes, which is why every field in the harness shaders is
   a `Vec4`) and a mismatch is an error naming the field.
-- Every call reachable from an entry is inlined into it (phase 2's decision; see "Phase 2 as
-  built"): each callee's monomorphized MIR, chosen by the code generator's own dispatch, is a
+- Every call reachable from an entry is inlined into it: each callee's monomorphized MIR, chosen by the code generator's own dispatch, is a
   fresh frame of one flat graph. A panic at any depth is then one branch to the end of the
   invocation, a reference never crosses a naga call, and resources stay globals. Recursion is
   refused. Whether big helpers should become naga functions again is a size question for later,
@@ -226,11 +222,10 @@ The rest of the lowering, MIR to naga:
   map takes the slots from `EntryDesc`.
 
 **Where it lives** (`semantics-in-front-end`): the structurizer, the MIR to naga lowering and the
-naga calls are codegen, in a new crate, `crates/blaze-shader`, next to hir-ty-codegen and outside
-the front end. It reads MIR, layouts and const values through the same queries hir-ty-codegen
-uses. The front end gains nothing for phase 1. If the uniformity check is later wanted before
-codegen (to report it as a diagnostic on the Rust source in the editor), it moves into a
-`hir-ty-*` query crate then.
+naga calls are codegen, in a crate of their own outside the front end, reading MIR, layouts and
+const values as the code generator does. The front end gains nothing for phase 1. If the
+uniformity check is later wanted before codegen (to report it as a diagnostic on the Rust source
+in the editor), it moves into the front end then.
 
 plan.md's targets table changes accordingly: Metal (MSL), Vulkan (SPIR-V) and WebGPU (WGSL) all go
 MIR, naga IR, naga's writer, for kernels too, and SPIRV-Cross leaves the plan. CUDA stays MIR, LLVM
@@ -266,122 +261,17 @@ device-only build of a shader crate**, the way proc macros are built for wasm.
 - A build script never runs blaze or a shader compiler for this: build scripts run sandboxed, and
   a compiler inside one is a second build graph blaze can't see or key.
 
-## Phase 2 as built
+## What is built
 
-What `crates/blaze-shader` does now, and the choices it made where the plan above was open.
+There is no MIR-to-naga device build. What exists:
 
-- **Pipeline.** `device::device_msl(db, krate)` reads `GPU_ENTRIES` by const evaluation
-  (`entries.rs`), lowers each entry into one naga module (`lower.rs`), validates the module with
-  `ValidationFlags::all()`, and writes MSL 2.4 with naga's writer. Every refusal in every entry
-  comes back at once, each naming the entry, the function, the construct and the rule
-  (`refuse.rs`).
-- **One home for each decision** (`mirrors-derive-or-check`):
-  - bodies come from `dispatch::body_of`;
-  - callees come from `dispatch::call`, the code generator's dispatch;
-  - layouts come from `layout_of_ty`: a struct's members sit at the front end's offsets, an array
-    has its stride, and a uniform's size and a storage stride are checked against the descriptor;
-  - enum discriminants come from `const_eval_discriminant`, and constant bytes are decoded with
-    `detect_variant_from_bytes`;
-  - which functions panic comes from `hir_ty_pure::models`;
-  - slots come from the `EntryDesc`s, and the storage sizes buffer from `gpu::sizes_slot`.
-
-  The intrinsics table (`intrinsics.rs`) is the one place that lowers anything by name: the gpu
-  crate's vectors, textures and device functions; core's intrinsics; and std's libm calls
-  (`atan2f` and kin), so std's own `f32` bodies are still what is lowered.
-- **Runtime MIR, not codegen's optimized MIR.** The lowering reads the same monomorphized bodies
-  the code generator starts from. naga and Metal optimize after.
-- **References are places, not values.** A reference or raw pointer local is bound once, as the
-  graph is built, to a symbolic place: a local, a resource or a place of no size, plus field steps
-  and index steps (an index is snapshotted where the reference is taken). Pointer casts that keep
-  the pointee keep the place, and `&[T; N]` to `&[T]` records `N`. A reference that names
-  different places on different paths is refused.
-- **Panics.**
-  - Blocks from which every path ends in a panic, `unreachable` or an abort are pruned, and edges
-    into them, like a failed `assert`, go to the end of the invocation.
-  - A fragment is discarded; a vertex returns zeroed varyings at clip position (2, 2, 2, 1).
-  - `ub_checks()` is false, and the branch it guards is pruned before the graph is walked, so
-    core's precondition checks (`const_eval_select`, pointer arithmetic) are never lowered.
-- **Enums** (needed by `for` loops, through `Option`) lower as values: a naga struct holding the
-  discriminant then every variant's fields, a layout of the device's own. A uniform or storage
-  type holding an enum is refused, since the host would write other bytes.
-- **The device target.**
-  - The device build is a target of its own, `naga-unknown-unknown`: `target_arch = "naga"`,
-    32-bit `usize`, little endian, `panic = "abort"`, data layout `e-m:e-p:32:32-i64:64-n32-S128`.
-  - The toolchain's core and std are built for it like wasm32-unknown-unknown's (std's
-    unsupported platform layer), so a shader can call std's `f32` methods.
-  - A triple, not only a build kind, because core's MIR depends on pointer width and endianness,
-    and those are target properties. A shader crate may `cfg(target_arch = "naga")`, which it
-    should rarely need.
-- **The output.** The dependent crate gets `BLAZE_GPU_MSL_<CRATE>`: the crate's name upper-cased
-  with `-` as `_`, holding the path of the crate's one MSL source. Its key is the crate's code, the
-  device target, naga's pinned version and the writer's options (`keys-cover-every-input`).
-- **The Metal step.**
-  - No build step runs `xcrun`, and nothing leaves the sandbox. The host compiles the MSL at
-    start with `newLibraryWithSource:options:error:` and `MTLMathMode::Fast`.
-  - A `.metallib` step, if a span on the start-up compile ever asks for one, runs only in the
-    daemon, outside the sandbox, as an explicit opt-in step. It is keyed by the MSL's bytes, the
-    output of `xcrun metal --version` and the flags, and stops with an error when Xcode's Metal
-    toolchain is missing.
-- **Left for phase 3**, and what phase 3 did of it (next section): the target spec,
-  `artifact = "gpu"` and the env var; the mascot's switch; an end-to-end test. Still left:
-  uniformity diagnostics on the Rust source; vector fast paths, so `gpu::vec` operators lower as
-  one naga vector op rather than per component (correct through their Rust bodies now);
-  derived-impl methods (`Callee::Derived`, e.g. a derived `PartialEq` call), slices of a local
-  array passed through `Index`, `dyn`, closures.
-
-## Phase 3 as built
-
-How `artifact = "gpu"` goes through the build, crate by crate, as the daemon runs it.
-
-- **The manifest** (blaze-manifest `dependency.rs`). `artifact = "gpu"` is a kind of blaze's own:
-  it takes no other kind and no `target`, it needs no `-Z bindeps`, and it is refused as a
-  build dependency, naming the dependency. `lib = true` keeps the ordinary library edge beside
-  it.
-- **The unit graph** (blaze-units `graph.rs`). A fourth kind, `Kind::Gpu`, builds for
-  `GPU_DEVICE` (`naga-unknown-unknown`, `Request::gpu`). The dependency becomes one `Build` unit
-  for the device, under every goal, on an edge marked `gpu` (`UnitDep::gpu`). The device unit
-  depends on the device's own `core`, std and `gpu` crate. With `--target naga-unknown-unknown`
-  the gpu kind is the target kind. A proc macro, or a graph with no device platform, refuses the
-  dependency, naming both crates.
-- **The plan** (`load/plan.rs`). Device units abort on panic, and the device's std is planned
-  with no rustflags. The device unit's plan names `<deps>/<crate><extra-filename>.msl`
-  (`UnitPlan::gpu_msl`, also among its outputs). Each dependent's compile gets
-  `BLAZE_GPU_MSL_<CRATE>` naming that file (`CompileEnv::gpu_msls`). The record key covers it all:
-  - the plan, whole: the device target, the path, the profile;
-  - the shader crate's sources, through its own unit;
-  - naga =30.0.1 and the writer's options (`MSL_VERSION`, no fake bindings): these are code of
-    blaze-shader, which is in blaze-cargo's record code identity (`blaze_codegen_code::RECORD_ROOTS`,
-    with no cut).
-- **The front end** (blaze-lower). The gpu edge gives the dependent no extern crate.
-  `Lowered::gpu_msl(unit, bytes)` sets the device unit's MSL as the bytes of that file, through
-  `base_db::Db::set_included_file`. So the host's `include_str!(env!("BLAZE_GPU_MSL_<CRATE>"))`
-  reads what the device build wrote, before and whatever placement puts on disk. A record that
-  read the file is filed by those bytes (`Files::included_by`).
-- **The daemon** (blaze-cargo). A device unit (`Unit::for_device`) builds no native code, and is
-  linked under every goal (`checks_only` is false, and check and build share its record key), so a
-  checked host reads the MSL that a built one does. Its link (`compile::assemble`) does two things:
-  - writes the crate record;
-  - at `gpu_msl`, writes `blaze_shader::device::device_msl` of its crate. A refusal fails the
-    unit, naming every construct, and nothing else is tried.
-
-  `Compiled::gpu_msl`, made or read back from a kept record, goes to the job's `Writer::gpu_msl`.
-  That is applied in the runs' batch and counted as a run (`graph::flag::GPU_MSL`), so the
-  dependents wait for it as they wait for a build script's run.
-- **Tests.**
-  - blaze-units `load/tests.rs`: the plan of a gpu dependency (one device unit, abort, the MSL
-    among its outputs, the env var on the host, the edges with and without `lib = true`) and what
-    it refuses.
-  - blaze-cargo `serve/unit/tests/gpu.rs`, the end-to-end test, on a shader crate and a host over
-    minicore: the host waits on the MSL; the MSL is naga-validated and the same bytes from two
-    front ends (rule 25); the host's `include_bytes!` reads exactly those bytes once applied, and
-    an edit's after; a unit that writes no MSL is refused, naming it.
-- **Not wired yet.**
-  - `blaze metadata --unit-graph` refuses a gpu dependency (no `Request::gpu`).
-  - Feature resolution does not resolve features for the device kind on its own, so a dependency
-    only under `cfg(target_arch = "naga")` gets the host's features.
-  - The device build lowers every entry of `GPU_ENTRIES`, so a crate with Slang still in `SLANG`
-    must lower all of its entries before any of its MSL is written. For harness-native-shaders that
-    includes the 14 harness entries.
+- `crates/gpu-macros/src/ir.rs` lowers the bodies of `#[gpu::vertex(ir)]`, `#[gpu::fragment(ir)]`,
+  `#[gpu::helper]` and `#[derive(gpu::ShaderStruct)]` to `gpu::emit` IR as the macros expand.
+- `crates/gpu/src/emit.rs` writes that IR as MSL 2.4 (`emit_msl`) and WGSL (`emit_wgsl`,
+  `emit_wgsl_pipeline`).
+- blaze-manifest's `dependency.rs` accepts and checks `artifact = "gpu"`. Nothing in `crates/`
+  sets `BLAZE_GPU_MSL_<CRATE>`.
+- The harness still draws with `shaders/harness.slang` and `shaders/mascot.slang`.
 
 ## Compute kernels and inline ray query (phase 3b)
 
@@ -493,90 +383,17 @@ One shader at a time, each on its own switch, with no fallback between them:
    (`HARNESS_NATIVE_GALLERY=genui`, `HARNESS_NATIVE_GENUI=<tree.json>`), under Reduce Motion
    (`HARNESS_NATIVE_SHOT_REDUCE_MOTION`) so his pose is the same in both: the shot's clock is the
    wall clock, so a fixed `HARNESS_NATIVE_SHOT_SECS` alone leaves his breath where the frames fell.
-   Both shots and the trees are kept with the comparison (`measure-the-exact-tree`). The commands
-   are in [Verifying the port](#verifying-the-port).
+   Both shots and the trees are kept with the comparison (`measure-the-exact-tree`).
 5. **Delete.** When the last shader leaves `SLANG`, build.rs, the slangc lookup and the MSL parser
    go, and so does the Slang dependency.
-
-## Verifying the port
-
-The mascot's comparison, as commands. The Slang side is the tree just before the switch (the commit
-that deletes `shaders/mascot.slang`), with Kip's Reduce Motion fix applied, since that tree
-predates it. The Rust side is the tree after the switch. Both build with blaze (rule 2), and both
-run harness.slang through build.rs as before, so only the mascot's shaders differ. The `blaze` on
-`PATH` is one built from a tree with this phase in it: the Rust side's manifest needs
-`artifact = "gpu"`. The same binary builds both sides.
-
-```sh
-rust=/Volumes/Projects/blaze-rust-shaders-p3-1109   # the Rust mascot's tree
-slang=/Volumes/Projects/blaze-kip-slang             # the Slang mascot's, made here
-out=/Volumes/Projects/kip-shots/$(date +%Y%m%d-%H%M%S)
-switch=$(git -C "$rust" log -1 --format=%H --diff-filter=D -- crates/harness/harness-native-render/shaders/mascot.slang)
-git -C "$rust" worktree add --detach "$slang" "$switch^"
-# Kip's Reduce Motion fix and the shot's switch for it, onto the Slang tree: neither file is touched
-# by the switch, so their diff from its parent is the fix alone.
-git -C "$rust" diff "$switch^" HEAD -- crates/harness/harness-native-render/src/kips.rs \
-    crates/harness/harness-native/src/shot.rs | git -C "$slang" apply
-mkdir -p "$out"
-for tree in "$slang" "$rust"; do
-    side=$([ "$tree" = "$slang" ] && echo slang || echo rust)
-    git -C "$tree" rev-parse HEAD > "$out/$side.commit"
-    git -C "$tree" diff HEAD > "$out/$side.diff"     # the Slang tree's applied fix; empty for Rust
-    blaze build --release --manifest-path "$tree/crates/harness/Cargo.toml" -p harness-native
-done
-printf '{"type":"Kip","props":{"mood":"idle","size":160},"children":[]}' > "$out/kip.json"
-for tree in "$slang" "$rust"; do
-    side=$([ "$tree" = "$slang" ] && echo slang || echo rust)
-    for look in dark light; do
-        HARNESS_NATIVE_GALLERY=genui HARNESS_NATIVE_GENUI="$out/kip.json" \
-        HARNESS_NATIVE_SHOT_REDUCE_MOTION=1 HARNESS_NATIVE_SHOT_SECS=0.8 HARNESS_NATIVE_SHOT_BACKING=2 \
-        HARNESS_NATIVE_APPEARANCE=$look \
-        HARNESS_NATIVE_SHOT_PFM="$out/$side-$look.pfm" HARNESS_NATIVE_SHOT="$out/$side-$look.png" \
-            "$tree/crates/harness/target/release/harness-native"
-    done
-done
-for look in dark light; do
-    python3 -I "$rust/harness/pfmdiff.py" "{\"before\":\"$out/slang-$look.pfm\",\"after\":\"$out/rust-$look.pfm\"}"
-done
-```
-
-What the commands hold fixed, and why:
-
-- **The pose.** Under Reduce Motion Kip rests still, so every mood shows the same rest pose, and
-  only a blink moves him. The first blink comes no sooner than `kip_blink_min` (2.4 s, kip.flecs)
-  after he is first painted, so a shot at 0.8 s has none. The pointer is not over him, so he looks
-  straight ahead. A shot without Reduce Motion is not comparable pixel by pixel: the shot's clock
-  is the wall clock, so breath and glances land where the frames fell.
-- **The two appearances.** Dark and light give the shadow another colour (`look.shadow.at(dark)`),
-  and the premultiplied picture another backdrop to blend over, so both are drawn.
-- **The bound: 1/1024 of white on the PFM's largest absolute difference** (pfmdiff.py's default).
-  - Both sides compile under fast math: Slang's MSL by `xcrun metal -ffast-math`, the Rust side's
-    by `newLibraryWithSource` with `MTLMathMode::Fast`. Fast math lets a compiler reassociate,
-    fuse multiply-adds and approximate `pow`, `exp` and `sqrt`, so two sources of the same
-    arithmetic differ in their last bits, and an `fwidth`-smoothed edge can turn that into a few
-    units in the last place across a pixel.
-  - Compiler noise sits far below 1/1024, and a real difference sits above it. 1/1024 is a quarter
-    of one 8-bit sRGB step (1/255), so any change a PNG can show fails: a wrong constant, a swapped
-    operand, a slot bound to the wrong buffer, a dropped `discard`.
-  - The PFM is compared, not the PNG, because the PNG clips past white and rounds to 8 bits, and
-    either can hide a difference.
-- **What is kept.** `$out` holds both trees' commits and the Slang tree's applied diff, the tree
-  JSON, and both sides' PNGs and PFMs. A failure is a pixel list (position, channel, both values)
-  in pfmdiff's output. Remove the Slang worktree after (`git -C "$rust" worktree remove "$slang"`).
-
-The animated moods are a look, not a bound. For each of `idle thinking working happy confused
-sleeping wave`, take a shot without `HARNESS_NATIVE_SHOT_REDUCE_MOTION`, put the two sides next to
-each other, and check that nothing is wrong in shape, colour or outline. Any difference past
-breath and timing is a bug to trace with the bounded shot above.
 
 ## Phases
 
 1. **The vocabulary and the ports.** The `gpu` crate (types, traits, `layout`, the math, the
    intrinsics' host bodies), `gpu-macros` (`vertex`, `fragment`, `Varyings`, `Pod`, `entries!`),
    `harness-native-shaders` with mascot.slang ported, its CPU tests and its layout tests against
-   the host. The structurizer in `blaze-shader`, with a blaze-sim test that runs random reducible
-   graphs and their structured form under the same branch choices and compares the blocks they
-   visit. (This lane.)
+   the host. The structurizer, with a blaze-sim test that runs random reducible graphs and their
+   structured form under the same branch choices and compares the blocks they visit.
 2. **MIR to naga for the mascot.** The lowering for what mascot.slang uses (scalars, vectors,
    structs, arrays, uniform and storage buffers, a texture and a sampler, `fwidth`, `pow`, `if`),
    the device build kind and `artifact = "gpu"`, MSL out. Kip's pass loads it; shots match; mascot
@@ -610,8 +427,8 @@ breath and timing is a bug to trace with the bounded shot above.
   one with an error; if that ever fires on real code, node splitting is the fix.
 - naga's version is a key input of every device artifact. Pin it in the workspace and bump it
   deliberately, like the toolchain.
-- ~~Does blaze's device build need its own target triple?~~ Decided in phase 2: yes,
-  `naga-unknown-unknown` (see "Phase 2 as built").
+- Does blaze's device build need its own target triple (`naga-unknown-unknown`: core's MIR
+  depends on pointer width and endianness)?
 
 ## Prior art
 

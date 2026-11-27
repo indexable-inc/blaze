@@ -1,5 +1,4 @@
-//! Async blocks, and the interior of every future a body makes (typeck.md, "Async: decided by
-//! lane 2"). The rules are the Reference's ("Async blocks", "Await expressions", "Closure
+//! Async blocks, and the interior of every future a body makes (typeck.md, "Witness records"). The rules are the Reference's ("Async blocks", "Await expressions", "Closure
 //! expressions"); rustc's `check_expr_closure` for a coroutine and its upvar and interior
 //! analyses only say what the rules are.
 //!

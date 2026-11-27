@@ -1,12 +1,11 @@
 ---
 status: plan
-summary: "Plan row X4: an item's keys from its normalised tokens, not its bytes, so re-formatting a file or editing a plain comment enters no task. The token digest's exact encoding, the token-relative place every record keeps instead of a byte range, the line-map cell that layout readers read explicitly, the table of twelve edits, and the census of every place where text bytes feed a key today. The core is written (crates/parser/src/token_key.rs); the switch of the call sites is one later batch."
+summary: "Plan row X4: an item's keys from its normalised tokens, not its bytes, so re-formatting a file or editing a plain comment enters no task. Built for item keys: blaze-file-items feeds every outline entry's `hash` and `signature_hash` by its tokens (`parser::token_key::joined`), except an item that calls a macro or carries a non-inert attribute, which is still fed by its bytes; stored places are `TokenPlace`. The line-map and adjacency cells are built, not wired. Here: the token digest's encoding, the token-relative place, the two layout cells, the table of twelve edits, and what the digest must not merge."
 date: 2026-11-17
 ---
 # Token keys (plan row X4)
 
-The check: tasks entered after formatting a whole crate: 0. Today an item's keys hash its text's bytes
-(the census below), so `rustfmt` re-enters every item it touches.
+The check: tasks entered after formatting a whole crate: 0.
 
 ## Decisions
 
@@ -33,7 +32,9 @@ The check: tasks entered after formatting a whole crate: 0. Today an item's keys
   adjacency": one bit per token, whether trivia separates it from the next; a line break where a space was
   moves the line map and not the adjacency. A reader of an ABSOLUTE line (`line!()`, a line table) also
   reads the item's start line, a place cell of the next piece; `file!()` reads the file's path. Formatting
-  then re-enters exactly the tasks that read layout. Wiring readers is the next piece.
+  then re-enters exactly the tasks that read layout. The readers are not wired: until they are, an item
+whose own tokens call a macro or carry a non-inert attribute is fed by its bytes (blaze-file-items
+digest.rs `ByTokens`, `ItemFlags::MACRO_CALL`).
 
 ## Where it lives
 
@@ -41,7 +42,10 @@ The check: tasks entered after formatting a whole crate: 0. Today an item's keys
 (blaze-lex is rustc_lexer's raw, edition-free tokens, `no_std`, and sees no hasher) and already depends on
 blaze-ids. One lex into the thread's scratch columns and one pass; nothing allocated. `token_digest(text,
 edition) -> Result<ContentId, TokenKeyError>` (the one error: a text over `u32::MAX` bytes), `line_map_digest`
-and `adjacency_digest` likewise, and `TokenPlace::{to_bytes, from_bytes}`. A doc comment's kind is the
+and `adjacency_digest` likewise (built, not wired: no caller), and `TokenPlace::{to_bytes, from_bytes}`.
+The item keys use the same rule without the whole-text digest: blaze-file-items `Item::hash` and
+`signature_hash` are a Merkle step over each run of tokens between child entries, a token joined as
+`token_key::joined` says (blaze-file-items lib.rs); records keep `TokenPlace` (blaze-cli engine_lines.rs). A doc comment's kind is the
 lexer's `INNER_DOC_COMMENT`/`OUTER_DOC_COMMENT`; a `COMMENT` is also read by rustc_lexer's doc rule.
 
 ## The encoding
@@ -100,44 +104,11 @@ rustc's: no rule-4 bug found on these paths. The lexemes keep the `\r`, so CRLF 
 comment over-moves the token digest (sound, not minimal); hashing such lexemes through `without_break_crs`
 would make CRLF move nothing, a later refinement.
 
-## The census: text bytes that feed a key or a cell today
+## What stays bytes
 
-"Switch" is what the batch does: token = `token_digest`; lines = also read `line_map_digest`; place =
-store `TokenPlace`.
-
-| # | Where | What it keys | Switch |
-|---|---|---|---|
-| 1 | blaze-scope/src/names_cells.rs:160 `span_text` | `Item(key)` cell: an item's and an impl header's text | token |
-| 2 | blaze-scope/src/names_cells.rs:204 | a module row's head text | token |
-| 3 | blaze-scope/src/asked.rs:294 `macro_digest` | a `macro_rules!`/macro 2.0 body | token + lines (its spacing becomes the expansion's `is_joined`) |
-| 4 | blaze-scope/src/expansion_records.rs:139 `key_of` | an expansion record's own bytes | stays bytes (a record's content address) |
-| 5 | blaze-file-items/src/digest.rs:271 `entry_digests` (runs at :428) | every outline entry's `hash` and `signature_hash` | token (runs of tokens, children by digest) |
-| 6 | blaze-file-items/src/digest.rs:205 `key_batch`, `By::Head` | an unnamed item's (impl's) IDENTITY: digest of its head's bytes | token |
-| 7 | blaze-file-items/src/split.rs:39 `part_digest` | a top-level part's outline | stays bytes (the outline holds byte ranges; cheap to redo) |
-| 8 | blaze-file-items/src/names_digest.rs:119 `file_names_digest` | a file's inner attributes | token |
-| 9 | blaze-file-items/src/names_digest.rs:159 `message` | an entry's name, `pub(in path)`, attributes | token |
-| 10 | blaze-lower/src/lib.rs:642 `signature_key` | a signature record | token |
-| 11 | blaze-lower/src/lib.rs:650 `body_key` | a body record | token; its `Span`s place; line-reading bodies lines |
-| 12 | blaze-lower/src/lib.rs:656 `anon_const_key` | an anonymous constant: its byte start and text | token; start as place |
-| 13 | blaze-cli/src/signature.rs:262 `tokens` | `unencoded` heads: lexemes only | DONE in this piece: was lexemes only (`1 >> 2` and `1 > > 2` shared it); now `token_digest`, domain `"blaze-cli signature tokens 2"` |
-| 14 | blaze-cli/src/signature.rs:226 `signature_source` | a `Signature` task's source | follows 5 |
-| 15 | blaze-cli/src/body_types.rs:108 `body_source` | a `BodyCheck` task's source | follows 5 |
-| 16 | blaze-cli/src/engine_heads.rs:418 | a head task's source (head + body text digests) | follows 5 and 14 |
-| 17 | blaze-cli/src/lints.rs:210 `unit_source` | a lint unit: its bytes and hole offsets | token + lines + a comments cell: the `// SAFETY:` rule (blaze-lint/src/engine.rs:1363) reads PLAIN comments and the line above the item |
-| 18 | blaze-cli/src/fix.rs:51 `Id::of` | a finding's shown id: item bytes, byte range | token + place (an id must survive a re-format) |
-| 19 | blaze-cli/src/sweep.rs:288 | a file's change digest | stays bytes: the sweep notices any byte change cheaply; a file whose items' token digests are equal then enters no task |
-| 20 | blaze-cli/src/work.rs:1916, 1923, 1935 `place: item.range.start` | a FileItems answer row's start in the file (blaze-drive/src/answers.rs:54) | stays bytes (in a record keyed by the file's bytes; never in a source) |
-| 21 | blaze-drive/src/record.rs:74 `Finding { start, end }` | a stored finding's item-relative bytes | place |
-| 22 | blaze-lint/src/lib.rs:69 `Span` | a lint finding's range | place |
-| 23 | blaze-cli/src/units.rs:470 `Record::find` `at: (u32, u32)` | a unit record's finding | place |
-| 24 | blaze-body/src/body.rs:100 `Span { lo, hi }` | a statement's item-relative bytes in a body record | place (line tables: lines) |
-| 25 | blaze-scope/src/items_record.rs:997 `TextSpan` | where an item's text is in its file | stays bytes (a file's record, checked against its digest) |
-| 26 | blaze-ladder/src/front2/body_left.rs:29 `BodyPlace` | an item's first byte in its file, for printing | stays (print only; must never enter a key) |
-| 27 | blaze-proc-macro/src/server.rs:586 `Span::line`/`column`/`byte_range` | refused today | lines + the start-line cell when answered |
-| 28 | blaze-tokens/src/view.rs:486 `Tokens::digest` | an expansion's tokens | stays (above) |
-
-Names hashed as their text (blaze-file-items/src/chain.rs:48, blaze-cli/src/signature.rs:236, the cell keys
-in blaze-scope/src/cell_key.rs) are one token each and stay. Twenty-eight rows; twenty-one switch, seven stay.
+A file's change digest (blaze-cli sweep.rs: any byte change is noticed cheaply; a file whose items'
+token digests are equal then enters no task), a record's content address, an expansion's tokens
+(blaze-tokens `Tokens::digest`), and where an item's text is in its file (print only, never in a key).
 
 ## Rule 21: what the token digest must not merge
 

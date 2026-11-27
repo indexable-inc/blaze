@@ -712,7 +712,7 @@ fn an_old_crate_list_is_refused_by_name() {
     // Version 4: each crate's row carries its package's metadata variables (lane RE3).
     // Version 5: each crate's row carries its package's version, for diagnostics.
     // Version 6: rows in the world's order with a by-key table, the test and public flags and
-    // the planners' tables (engine.md item 2): a version-5 list is refused, never read (D160).
+    // the planners' tables (end-state.md D157): a version-5 list is refused, never read (D160).
     // Version 7: each tree row carries its pack kind.
     // Version 8: each row carries its package binaries (`CARGO_BIN_EXE_<name>`).
     assert_eq!(VERSION, 8);

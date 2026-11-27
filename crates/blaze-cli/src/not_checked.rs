@@ -1,4 +1,4 @@
-//! What was not checked, named by cause at crate grain (drive.md D115 ruling (6), the
+//! What was not checked, named by cause at crate grain (drive.md, the
 //! coordinator's wording of 2026-11-16 21:1x): one line a cause,
 //!
 //! "not checked because <cause> failed: crate `a`, crate `b`, .. (and N more), and M other task(s)"

@@ -136,6 +136,10 @@ pub enum RunError {
     /// `why` names the cause (a front end that checks only the whole program, a fn with no
     /// checked body, the maker's own state).
     OneBody { key: ItemKey, why: &'static str },
+    /// A repeated non-speculative `ensure` of fn `key` whose first refusal was already returned
+    /// earlier on the same [`crate::run::make_one::MakerState`]: replays the rendered original
+    /// refusal without calling `check_one` a second time.
+    PriorEnsureFailure { key: ItemKey, first: Box<str>, scope: crate::scope::Scope },
     /// Static `static_`'s value has no run record (code_records.rs `statics`; run.md, "Statics
     /// in the run"): `error` names what of it is refused.
     StaticRecord { static_: Box<str>, error: crate::code_records::statics::StaticRecordError },
@@ -276,6 +280,7 @@ impl core::fmt::Display for RunError {
             RunError::Place(error) => write!(f, "{error}"),
             RunError::NoMain => write!(f, "the crate root has no `main`"),
             RunError::OneBody { key, why } => write!(f, "fn {:#x}: {why} (D106: the record walk makes one instance at a time)", key.0),
+            RunError::PriorEnsureFailure { first, .. } => f.write_str(first),
             RunError::StaticRecord { static_, error } => write!(f, "the static `{static_}`: {error}"),
             RunError::Lang(l) => write!(f, "the lang item {:?}: {} (rule no-fallback: no build without it)", l.item, l.why),
             RunError::MainShape { main, what } => write!(f, "`{main}`: {what}"),
@@ -398,6 +403,7 @@ impl RunError {
             | RunError::OverflowDisagrees { .. }
             | RunError::NoMain
             | RunError::OneBody { .. }
+            | RunError::PriorEnsureFailure { .. }
             | RunError::StaticRecord { .. }
             | RunError::Lang(_)
             | RunError::Statics { .. }
@@ -1177,12 +1183,15 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// The front end resolves the function's own or inherited caller-tracking attribute.
     /// Trait methods are resolved to their concrete impl item first so an impl-only
     /// `#[track_caller]` (such as `Result::from_residual`) matches between caller and callee.
-    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Option<bool> {
+    /// A lazy `ResolveError::Missing` is propagated as `BuildError::Select` so `make_asked` fills
+    /// the missing impl bucket instead of falling back to the trait method (Rule 3).
+    fn track_caller(&self, instance: Instance, ground: &mut PortableTys<'_>) -> Result<Option<bool>, BuildError> {
         let item = match self.0.resolve(self.1, instance.item, instance.args, ground) {
             Ok((resolved, _)) => resolved,
+            Err(e @ blaze_typeck::ResolveError::Missing(_)) => return Err(BuildError::Select(e)),
             Err(_) => instance.item,
         };
-        self.0.track_caller(item)
+        Ok(self.0.track_caller(item))
     }
 
     /// The library's `#[lang = "panic_location"]` struct (core/src/panic/location.rs).
@@ -3289,7 +3298,8 @@ fn build_from<P: FrontEnd>(
             // itself, and nothing is selected, so a caller with no body of its own (the `Fn*`
             // shim of a ctor's fn item, tabled at the ctor's bodiless row) asks no world.
             let is_ctor = program.fn_index(called.item).is_some_and(|c| program.function(c).kind == FnKind::Ctor);
-            let selected = match is_ctor {
+            let is_lang_clone_from = crate::clone_shim::language_clone_from_unconditional(program, called, &ground).is_some();
+            let selected = match is_ctor || is_lang_clone_from {
                 true => Ok((called.item, called.args)),
                 false => program.resolve(world_of, called.item, called.args, &mut ground),
             };
@@ -3342,17 +3352,35 @@ fn build_from<P: FrontEnd>(
                             }
                             continue;
                         }
-                        None => {
-                            let refusal = resolve_refusal(program, &adts, &ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: err_item });
-                            match unresolved(&mut survey, &mut reached, called, i, refusal)? {
-                                Some(slot) => {
-                                    via.push(Via::Slot);
-                                    targets.push(Target::Slot(slot));
+                        None => match crate::clone_shim::language_clone_from_adt(program, world_of, called, trait_, &mut ground) {
+                            Ok(Some(clone_from)) => (clone_from, called.args),
+                            Ok(None) => {
+                                let refusal = resolve_refusal(program, &adts, &ground, name(), called, blaze_typeck::ResolveError::NoImpl { trait_, item: err_item });
+                                match unresolved(&mut survey, &mut reached, called, i, refusal)? {
+                                    Some(slot) => {
+                                        via.push(Via::Slot);
+                                        targets.push(Target::Slot(slot));
+                                    }
+                                    None => broken = true,
                                 }
-                                None => broken = true,
+                                continue;
                             }
-                            continue;
-                        }
+                            Err(blaze_typeck::ResolveError::Missing(_)) if may_ask => {
+                                ask_again = true;
+                                break;
+                            }
+                            Err(error) => {
+                                let refusal = resolve_refusal(program, &adts, &ground, name(), called, error);
+                                match unresolved(&mut survey, &mut reached, called, i, refusal)? {
+                                    Some(slot) => {
+                                        via.push(Via::Slot);
+                                        targets.push(Target::Slot(slot));
+                                    }
+                                    None => broken = true,
+                                }
+                                continue;
+                            }
+                        },
                     }
                 }
                 Err(error) => {

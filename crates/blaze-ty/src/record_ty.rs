@@ -1,7 +1,7 @@
 //! Canonical Structural Record Types & Named-Argument Defaults (`blaze-ty::record_ty`).
 //!
 //! First-class compiler representation for Blaze structural records (`#![blaze::records]`,
-//! `docs/v2/plan/design/records.md`, edition change 4 / objective E5):
+//! `docs/v2/plan/design/records.md`, edition change 4):
 //!
 //! ```ignore
 //! fn obj_row(ui: &uniq UiWorld, p: { name: &str, depth: u32 = 0, open: bool = false })

@@ -111,7 +111,7 @@ pub enum TyView {
     Infer(Var),
     Error,
     // Const terms: a handle is any generic argument, so an array length or a const generic
-    // argument is a `Ty` handle whose view is one of these (typeck.md, "Const generics").
+    // argument is a `Ty` handle whose view is one of these.
     /// A value of a const generic: its type (an integer, `char` or `bool`) and its bits,
     /// little-endian as consteval writes them.
     ConstValue { ty: Ty, bits: u128 },
@@ -367,7 +367,7 @@ pub trait TypeCtx {
     /// variable in each), each with the cause of the obligation it came from (where the
     /// expectation came from: D148, `columns::SigFrom`). `None` when no such obligation is
     /// pending.
-    fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Result<Option<((TyList, Cause), Option<(Ty, Cause)>)>, CheckError>;
+    fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Result<Option<((TyList, Cause, ClosureKind), Option<(Ty, Cause)>)>, CheckError>;
 
     /// Supply the inferred call kind and the stored capture types. A missing tuple
     /// means the binding rows did not establish the precise captured places.

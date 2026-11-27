@@ -1,5 +1,5 @@
 //! An expansion text's origins (drive.md, "A finding inside an expansion is reported where its
-//! tokens came from", ruled 20:57): kept beside the text in its record, written once when the
+//! tokens came from"): kept beside the text in its record, written once when the
 //! text is made, read in place by the task that makes a finding in the text.
 //!
 //! Two parts. The CALL: the text it is written in ([`At`]: a file, or the expansion of another
@@ -191,9 +191,10 @@ pub fn column_of<'a>(
         let root = roots.next_if(|(at, _)| *at as usize == place).map(|(_, krate)| *krate);
         let origin = origins.get(token).copied().ok_or(OriginsError::Places { call, tokens: count(origins.len()), places: count(places.len()) })?;
         // A root row is only placed for a marked `$crate` (the renderer's `dollar` is that mark's
-        // crate): its edition is that mark's.
+        // crate): its edition is that mark's. When `$` came from an unmarked caller token (`$d:tt`)
+        // paired with a marked `crate` token at `token + 1`, read `edition` from `token + 1`.
         let mark = match root {
-            Some(krate) => marks(token).map(|m| crate::crate_roots::root_mark(krate, m.edition)),
+            Some(krate) => marks(token).or_else(|| marks(token + 1)).map(|m| crate::crate_roots::root_mark(krate, m.edition)),
             None => marks(token),
         };
         column

@@ -1031,6 +1031,15 @@ impl Conv<'_, '_, '_, '_, '_> {
                         }
                     }
                 }
+                TypeRef::Infer => {
+                    self.out.closure_param_regions.push(tc::ClosureParamRegion {
+                        closure,
+                        param,
+                        path,
+                        own: 0,
+                        kind: tc::WrittenRegion::Inferred,
+                    });
+                }
                 _ => {}
             }
         }
@@ -1248,10 +1257,10 @@ impl Conv<'_, '_, '_, '_, '_> {
             if !anchors {
                 return self.refuse("a qualified path (`<T as Tr>::x`) naming a struct", r);
             }
-            // `<T as Tr>::x`, or `<T as Tr>::Assoc::x` through the trait's associated type.
-            let most = if s.trait_.is_some() { 2 } else { 1 };
-            if after.is_empty() || after.len() > most {
-                return self.refuse("a qualified path with more than one segment after `<T>`, or more than two after `<T as Tr>`", r);
+            // `<T>::x`, `<T>::Assoc::x`, `<T as Tr>::x`, or `<T as Tr>::Assoc::x` through an
+            // associated type (e.g. Cranelift's `<M>::I::rc_for_type`).
+            if after.is_empty() || after.len() > 2 {
+                return self.refuse("a qualified path with more than two segments after `<T>` or `<T as Tr>`", r);
             }
             let Some(t) = s.ty else { return self.refuse("a path anchor with no type", r) };
             let ty = self.ty(t)?;

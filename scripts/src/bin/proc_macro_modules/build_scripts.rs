@@ -455,14 +455,15 @@ impl Plan<'_> {
         })?;
         features.sort();
         features.dedup();
-        // A wasm module's identity is unchanged (its records stand); a native one names the
-        // host target, the linking clang and the SDK instead of the shim and the patches.
-        let runner = match native {
-            None => format!("shim {shim_digest}\npatches {rt_digest}\n"),
-            Some(native) => native.identity()?,
+        // Distinct target-bearing header for `wasm32-wasip1` bootstrap records so they never
+        // collide with on-demand `wasm64-blaze-wasip1` self-compiled modules
+        // (`blaze build-script module wasm64 7` in `crates/blaze-proc-macro/src/script_unit.rs`).
+        let (header, runner) = match native {
+            None => ("blaze build-script module wasm32 5", format!("shim {shim_digest}\npatches {rt_digest}\n")),
+            Some(native) => ("blaze build-script module 3", native.identity()?),
         };
         let identity = format!(
-            "blaze build-script module 3\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\n{runner}builder bootstrap\n",
+            "{header}\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\n{runner}builder bootstrap\n",
             wanted.name,
             wanted.version,
             origin.identity_line(),

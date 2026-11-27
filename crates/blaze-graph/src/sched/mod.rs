@@ -1,4 +1,4 @@
-//! The scheduler as a state machine that does no IO (docs/v2/plan/design/fibers.md): it reads no
+//! The scheduler as a state machine that does no IO (docs/v2/plan/design/parallel.md): it reads no
 //! clock, starts no thread and never sleeps. A driver tells it what happened ([`Sched::spawn`],
 //! [`Sched::suspended`], [`Sched::done`], [`Sched::key_done`], [`Sched::yielded`],
 //! [`Sched::core_idle`], [`Sched::advance_clock`]) and does what it decides
@@ -280,7 +280,7 @@ pub enum StopReason {
     /// The pool's drop waited `waited_ns` with jobs parked and none ending, the bound of its
     /// stop ([`crate::pool::Pool::stop`]): what is still parked fails, so the stop ends.
     Bound { waited_ns: u64 },
-    /// The daemon's task watchdog (`blaze_profile::stuck`) found the job parked and still for
+    /// The daemon's task watchdog found the job parked and still for
     /// `still_ns`, past the bound of its wait, and the wait's end nowhere in sight: it fails,
     /// alone, so its build ends with the error and every other job goes on.
     Stuck { still_ns: u64 },

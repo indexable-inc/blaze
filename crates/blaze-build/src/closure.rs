@@ -95,7 +95,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(TyErr::Malformed("a closure's parts asked of another type"));
         };
         let facts = self.adts.facts();
-        let c = facts.closure(owner, ordinal).ok_or(TyErr::Unsupported("a closure whose facts the world did not answer"))?;
+        let c = facts.closure(owner, ordinal).ok_or(TyErr::Other(BuildError::ClosureOwnerUnchecked { owner, ordinal }))?;
         let mut a: Vec<PTy, A> = Vec::new_in(self.alloc);
         a.extend_from_slice(self.ground.view().list(args).map_err(|_| TyErr::Malformed("a list past the ground table"))?);
         let sig = crate::instance::ground(c.types, c.sig, &a, self.ground, self.scratch, facts).map_err(TyErr::Other)?;
@@ -343,6 +343,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if which > parts.kind {
             return self.run_entry(closure, g, parts, which);
         }
+        self.mark_owner_bound(closure)?;
         let (tuple, output) = self.args_tuple(closure, parts.sig)?;
         let PNode::Tuple(l) = self.ground_node(tuple).map_err(|error| Self::ty_err(closure, error))? else {
             return Err(malformed("a closure's arguments not a tuple"));

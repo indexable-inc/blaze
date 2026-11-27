@@ -2495,11 +2495,11 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
         Ok(())
     }
 
-    fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Result<Option<((TyList, crate::ty::Cause), Option<(Ty, crate::ty::Cause)>)>, CheckError> {
+    fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Result<Option<((TyList, crate::ty::Cause, crate::ty::ClosureKind), Option<(Ty, crate::ty::Cause)>)>, CheckError> {
         let v = self.shallow_resolve(var);
         let v_is_infer = matches!(self.view(v), TyView::Infer(_));
         let epoch = self.obs_rollback_epoch;
-        let mut best: Option<(usize, TyList, crate::ty::Cause)> = None;
+        let mut best: Option<(usize, TyList, crate::ty::Cause, crate::ty::ClosureKind)> = None;
         for (ti, &want_trait) in fn_traits.iter().enumerate() {
             if fn_traits[..ti].contains(&want_trait) {
                 continue;
@@ -2521,7 +2521,7 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
             let mut prefix_dead = v_is_infer;
             for pos in start..len {
                 let i = self.obs_2arg_by_trait[&want_trait].indices[pos] as usize;
-                if let Some((best_i, _, _)) = best
+                if let Some((best_i, _, _, _)) = best
                     && i >= best_i
                 {
                     break;
@@ -2548,7 +2548,12 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
                     if let TyView::Tuple(l) = self.view(tuple) {
                         // Where the expectation came from (D148): the obligation's cause, a
                         // clause of a use (`Cause::Clause`) when a declared bound filed it.
-                        best = Some((i, l, self.obs[i].cause));
+                        let kind = match ti {
+                            0 => crate::ty::ClosureKind::Fn,
+                            1 => crate::ty::ClosureKind::FnMut,
+                            _ => crate::ty::ClosureKind::FnOnce,
+                        };
+                        best = Some((i, l, self.obs[i].cause, kind));
                         break;
                     }
                 }
@@ -2559,7 +2564,7 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
                 entry.first_active = new_active;
             }
         }
-        let Some((_, inputs, cause)) = best else { return Ok(None) };
+        let Some((_, inputs, cause, kind)) = best else { return Ok(None) };
         // Output belongs to the Once supertrait at these same arguments. Another bound on
         // this variable may project a different Output, and may precede the callable bound:
         // a projection whose `Args` cannot equal the inputs is another bound's. "Can equal",
@@ -2604,12 +2609,12 @@ impl<'a, 'f> TypeCtx for InferCtxIn<'a, 'f> {
                     };
                     if same {
                         let ob_cause = self.obs[i].cause;
-                        return Ok(Some(((inputs, cause), Some((term, ob_cause)))));
+                        return Ok(Some(((inputs, cause, kind), Some((term, ob_cause)))));
                     }
                 }
             }
         }
-        Ok(Some(((inputs, cause), None)))
+        Ok(Some(((inputs, cause, kind), None)))
     }
 
     fn closure_used_only_once(

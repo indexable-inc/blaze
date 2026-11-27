@@ -147,18 +147,27 @@ fn wasm(body: &[u8]) -> Vec<u8> {
 /// i32` (`path_unlink_file`'s type): the first is function 3 ([`FIRST_EXTRA`]), and the
 /// module's own functions come after them.
 fn wasm_importing(body: &[u8], extra: &[&str]) -> Vec<u8> {
+    let typed: Vec<(&str, &str, u8)> = extra.iter().map(|field| ("wasi_snapshot_preview1", *field, 5)).collect();
+    wasm_importing_typed(body, &typed)
+}
+
+/// [`wasm`] with arbitrary extra imports `(module, field, type_index)` (types: 0 `(i32, i32) -> ()`,
+/// 4 `(i32) -> i32`, 5 `(i32, i32, i32) -> i32`, 6 `(i32, i32) -> i32`, 7 `(i32) -> ()`).
+fn wasm_importing_typed(body: &[u8], extra: &[(&str, &str, u8)]) -> Vec<u8> {
     const I32: u8 = 0x7f;
     const I64: u8 = 0x7e;
     let mut out = b"\0asm\x01\0\0\0".to_vec();
     // Types: 0 output (i32 i32), 1 env_var and expand (i32 x4) -> i32, 2 path_open,
-    // 3 () -> (), 4 (i32) -> i32, 5 (i32 x3) -> i32.
-    let types: [(&[u8], &[u8]); 6] = [
+    // 3 () -> (), 4 (i32) -> i32, 5 (i32 x3) -> i32, 6 (i32, i32) -> i32, 7 (i32) -> ().
+    let types: [(&[u8], &[u8]); 8] = [
         (&[I32, I32], &[]),
         (&[I32, I32, I32, I32], &[I32]),
         (&[I32, I32, I32, I32, I32, I64, I64, I32, I32], &[I32]),
         (&[], &[]),
         (&[I32], &[I32]),
         (&[I32, I32, I32], &[I32]),
+        (&[I32, I32], &[I32]),
+        (&[I32], &[]),
     ];
     let mut s = vec![types.len() as u8];
     for (params, results) in types {
@@ -171,7 +180,7 @@ fn wasm_importing(body: &[u8], extra: &[&str]) -> Vec<u8> {
     section(1, &s, &mut out);
     let imports = [("blaze_proc_macro", "output", 0), ("blaze_proc_macro", "env_var", 1), ("wasi_snapshot_preview1", "path_open", 2)];
     let mut s = vec![(imports.len() + extra.len()) as u8];
-    for (module, field, ty) in imports.into_iter().chain(extra.iter().map(|field| ("wasi_snapshot_preview1", *field, 5))) {
+    for (module, field, ty) in imports.into_iter().chain(extra.iter().copied()) {
         name(module, &mut s);
         name(field, &mut s);
         s.extend_from_slice(&[0x00, ty]);
@@ -747,6 +756,48 @@ fn a_module_importing_path_unlink_file_loads_and_a_call_answers_eperm() {
     assert!(twin.as_ref().is_err_and(|e| e.starts_with("call: ")), "a call checked against success must trap: {twin:?}");
     let control = expand_importing("unlink-unknown", &[], &["path_unlink_files"]);
     assert!(control.as_ref().is_err_and(|e| e.starts_with("load: ") && e.contains("path_unlink_files")), "{control:?}");
+}
+
+/// Reduced from commonware-macros-impl / jsonrpsee-proc-macros: proc-macros sharing
+/// `wasm64-blaze-wasip1`'s `std::process` link `blaze_build_script[_64]::{found,spawn,reply}`.
+/// The module loads; calling `found` answers `0` (`NotFound`), and calling `spawn` stops.
+#[test]
+fn a_module_importing_build_script_process_loads_and_refuses_spawn() {
+    let runtime = Runtime::new(blaze_own::testing::heap()).expect("the runtime");
+    let extra = [
+        ("blaze_build_script", "found", 6),
+        ("blaze_build_script", "spawn", 6),
+        ("blaze_build_script", "reply", 7),
+    ];
+    let run = |name: &str, body: &[u8]| -> Result<(), String> {
+        let module = module_in(&folder(name), wasm_importing_typed(body, &extra), 1);
+        let loaded = runtime.load(&module).map_err(|e| format!("load: {e}"))?;
+        let input = lex("struct A;", EDITION, Alloc::global()).expect("the input lexes");
+        let call = ProcCall { kind: ProcKind::FnLike, input: &input, attr_args: None, file: Ok(CALL_FILE_SHOWN) };
+        runtime
+            .expand(&loaded, &module.macros[0], &call, EDITION, package(&folder(&format!("{name}-pkg")), &[]), Limits::STANDARD, Alloc::global())
+            .map(drop)
+            .map_err(|e| format!("call: {e}"))
+    };
+    // Linked, never called.
+    assert_eq!(run("bs-linked", &[]), Ok(()));
+    // `found(32, 3)` must return 0 (trap if non-zero).
+    let mut call_found = Vec::new();
+    call_found.extend(op::i32(32));
+    call_found.extend(op::i32(3));
+    call_found.extend(op::call(FIRST_EXTRA));
+    call_found.extend(op::IF);
+    call_found.push(op::UNREACHABLE);
+    call_found.push(op::END);
+    assert_eq!(run("bs-found", &call_found), Ok(()));
+    // `spawn(32, 3)` must be refused.
+    let mut call_spawn = Vec::new();
+    call_spawn.extend(op::i32(32));
+    call_spawn.extend(op::i32(3));
+    call_spawn.extend(op::call(FIRST_EXTRA + 1));
+    call_spawn.push(0x1a); // drop
+    let spawned = run("bs-spawn", &call_spawn);
+    assert!(spawned.as_ref().is_err_and(|e| e.contains("spawn subprocesses")), "{spawned:?}");
 }
 
 /// A module that traps (`unreachable`) is a typed failure naming the crate and the macro, and,

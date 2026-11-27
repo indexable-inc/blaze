@@ -1,7 +1,7 @@
 ---
 status: plan
-summary: Every speed-of-light bound blaze is held to, one machine-read block each; harness/v2/bounds.py reads this file and budgets.py measures it.
-date: 2026-11-09
+summary: Every speed-of-light bound blaze is held to, one machine-read block each, read by harness/v2/bounds.py; no program measures the two kept today, so neither is held yet.
+date: 2026-11-26
 ---
 # Bounds
 
@@ -11,12 +11,14 @@ budget is the bound × 1.1 (a rate: ÷ 1.1). More than 10% off is a bug
 ([plan.md](../plan.md#rules)).
 
 A bound counts only when a program measures it. Each is one `bound` block here, with the
-arithmetic in the sentence above it; `harness/v2/bounds.py` reads the blocks and
-`harness/v2/budgets.py` (budget `bounds`) runs each program until the answer is settled. Prose
+arithmetic in the sentence above it; `harness/v2/bounds.py` reads the blocks. Prose
 bounds nobody can run are not kept: to hold a component to its bound, add its block and the
 program that prints the number (the block's fields are in `harness/v2/bounds.py`).
 
 ## proof
+
+Not measured: `blaze-v2-proof` is a library with no program, so the two bounds below are not held
+until a program prints them.
 
 First difference of two 512 MiB files on 16 cores: 1.07 GB read at 400 GB/s is 2.7 ms, plus
 0.25 ms of page faults, 2.9 ms.

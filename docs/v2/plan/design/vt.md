@@ -1,13 +1,13 @@
 ---
 status: plan
-summary: "`crates/blaze-vt` (`bstd::vt`): a terminal emulator core in Rust, sans-IO, `no_std`, on bstd's owning types, that accepts every sequence, mode and protocol ghostty's terminal core does (vt-inventory.md, 433 rows) and encodes keys, mouse, focus and paste as ghostty does. Bytes in; a screen, replies and effects out as data. For the native shell app's full-screen programs (vim, htop, less) and anything else that hosts a PTY."
+summary: "`crates/blaze-vt`: a terminal emulator core in Rust, sans-IO, `no_std`, on bstd's owning types, that accepts every sequence, mode and protocol ghostty's terminal core does (vt-inventory.md, 433 rows) and encodes keys, mouse, focus and paste as ghostty does. Bytes in; a screen, replies and effects out as data. For the native shell app's full-screen programs (vim, htop, less) and anything else that hosts a PTY. Built: every module below, used by blaze-shell; not built: the `bstd::vt` re-export, the per-row coverage test, the fuzz-corpus replay and the floor benchmark."
 date: 2026-11-24
 ---
 # vt: a terminal core in Rust, on bstd
 
 Why: the native shell (nushell's engine in a blaze-ui window, not a terminal) still runs programs
 that drive a terminal. harness does that through libghostty-vt (zig, C ABI, `harness-vt`); blaze's
-own code takes no third-party or C code (AGENTS.md, scope). This is that piece, owned.
+own code takes no third-party or C code (end-state.md D180). This is that piece, owned.
 
 **The bar.** Everything ghostty's terminal core accepts, this accepts with the same effect, and
 everything ghostty deliberately refuses is refused the same way, unless a row below says
@@ -36,9 +36,10 @@ KeyEvent / MouseEvent / Paste / Focus ──► input::encode(&Modes) ──► 
   (scrollback bytes, OSC capture, image storage 320 MB as ghostty's app, title stack). A refusal
   is a typed `Refused` naming the cap, never a silent drop, except where ghostty drops by design
   (inventory rows say which), and those are counted in `Stats` so a test can see them.
-- **Re-export**: `bstd::vt`, as `bstd::ecs` is blaze-ecs.
+- **Re-export**: `bstd::vt`, as `bstd::ecs` is blaze-ecs. Not built: blaze-std does not depend on
+  blaze-vt.
 
-## Modules (one lane each, disjoint files)
+## Modules
 
 | module | what | inventory § |
 |---|---|---|
@@ -83,9 +84,9 @@ layout or schema updates without persisting `PageList`, `StyleSet`, or `ExtTable
 
 ## Tests (rules 53, 64, 23)
 
-- **The inventory as tests.** `tests/inventory.rs` holds one case per inventory row: bytes in,
+- **The inventory as tests.** `src/inventory_tests.rs` holds one case per inventory row: bytes in,
   expected screen text, cursor, style of named cells, replies and effects. A row without a case
-  is a failing test (`every_row_has_a_case`), so coverage is counted from the doc.
+  is a failing test (`every_row_has_a_case`, not built), so coverage is counted from the doc.
 - **ghostty's own tests, ported as data.** Terminal.zig (392), Screen.zig (203), PageList.zig
   (258), stream.zig (44), stream_terminal.zig (69), sgr.zig, osc parsers, key_encode.zig (90),
   mouse_encode.zig (23): each ported as `(name, bytes, expect)` with its ghostty name, so a
@@ -97,13 +98,14 @@ layout or schema updates without persisting `PageList`, `StyleSet`, or `ExtTable
   scrollback after each step. Planted-bug controls (rule 78 seam, `VtPlant`): pending wrap
   cleared on the wrong ops, a reflow that drops a soft-wrapped row's tail, a style id freed
   while a cell still names it, a page boundary off by one. Each must fail the check.
-- **Fuzz corpus.** ghostty's `test/fuzz-libghostty/corpus/` replayed: no panic, every cap held.
+- **Fuzz corpus** (not built). ghostty's `test/fuzz-libghostty/corpus/` replayed: no panic, every
+  cap held.
 
 ## Floor (rule 67)
 
 ghostty is the floor. Throughput of `feed` on ASCII-heavy output (`cat` of a large file), on
 dense SGR (htop), and on scrolling (`yes`), in MB/s/core on the Mac and on Linux arm64, against
-libghostty-vt built ReleaseFast on the same machine and the same bytes. The target is within 10%.
+libghostty-vt built ReleaseFast on the same machine and the same bytes. The target is within 10%; it is not measured.
 The parser's ground path is where it is won: one pass over a run of printable ASCII writing cells
 directly, no per-byte dispatch.
 

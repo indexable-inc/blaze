@@ -31,6 +31,12 @@ All four V3 architectural pillars are built, wired end-to-end, and verified on A
    - `extern "C"`, `#[no_mangle]`, address-taken, and unwinding callees remain strictly `CAbi`.
    - `BPG1`/`BPG2` branch entropy drives `ifconv` and Ext-TSP hot/cold layout.
 
+## The LIR Mid-End and the Tier
+
+- **Mid-end (`crates/blaze-lir/src/simplify/egraph.rs`)**: `sota_optimize_fixpoint` repeats loop analysis, a PGO × loop-depth × register-headroom inliner, the dominator-scoped acyclic e-graph (`aegraph_optimize`: GVN, commutative canonicalization, algebraic identities, constant folding, `materialize_strength_reduction`, `hoist_loop_invariants`) and a chordal-SSA pressure estimate until a fixed point; `crates/blaze-emit/src/sota/mod.rs` runs it before `misel`. `plan_ssa_regalloc` and `plan_opportunistic_inlining` are built, not wired (tests alone call them; the allocator is `mra.rs`).
+- **Cross-function (`crates/blaze-lir/src/lto.rs`, `pgo.rs`, `summary.rs`)**: bottom-up Tarjan SCC inlining, decayed `BPG1` profiles, and PGO-guided speculative devirtualization of `CallIndirect` (`simplify/devirt.rs`, called from `lto.rs`).
+- **Tier (`TierName::Sota`, `crates/blaze-tier/src/seam.rs`)**: `blaze_tier::optimizing_tier` (`route.rs`) picks `Sota` on AArch64 and x86-64 unless a function has `asm!`, target intrinsics or non-base features. Run-time tier-up from `Fast` stencils to `Sota` is not built: `optimizing_tier` is called by tests alone, and the `JitPool` tier-up trampolines (`crates/blaze-inproc/src/exec.rs`) have no caller outside blaze-inproc.
+
 ## Verified Results (Apple M5 Max, 1 P-Core, `MB/s/core`)
 
 - **Correctness**: 256/256 `blaze-emit` `sota::` tests + `blaze-lir` `simplify::` + `blaze-int` + `blaze-zstd` tests; **0** legacy `isel.rs` fallbacks across all of `blaze-zstd` (`99.81%` V3 pure-SSA coverage binary-wide); 100% byte-identical output (`cmp`) to `rustc` on 1× `corpus.rs` (`4,847,844 B`); bit-exact RFC 8878 `zstd -tq` on 4× (`19,391,376 B`).

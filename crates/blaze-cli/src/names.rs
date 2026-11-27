@@ -1,5 +1,5 @@
 //! The `CrateScope` task: one crate's names resolved from its dependencies' records
-//! (docs/v2/plan/design/drive.md, the NAMES step, "HANDED ON 07:xx").
+//! (docs/v2/plan/design/drive.md).
 //!
 //! The world (blaze-world: every crate's `CrateInput`, its key and where its files are) is
 //! made once a command from the `UnitGraph` record, the lock, the pinned toolchain on the
@@ -169,7 +169,7 @@ impl core::fmt::Display for NamesError {
 }
 
 /// What a request's names world was made by need for ([`Names::made_or_make`]): each its own
-/// span, so the profile says when the world was made and why (rule 15; engine.md item 2).
+/// span, so the profile says when the world was made and why (rule 15; end-state.md D157).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum NeededBy {
     /// A `CrateScope` task entered (engine_names.rs).
@@ -597,9 +597,17 @@ fn scope_record<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope:
 
 #[expect(clippy::too_many_arguments, reason = "section encoder inputs, each named")]
 fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, member: bool, has_surface: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, metered: &metered::Metered<'_>, kept: blaze_own::SharedAlloc<'static>, force_par: bool) -> Result<ScopeRecord, Unwritten> {
+    // Match the serial path's `CALL_SCRATCH` ceiling (4 GiB): `Frame::with_reserve` only sets a
+    // logical byte limit (zero VA/RSS committed until used, and every chunk/span is trimmed cold
+    // back to 0 immediately after copying the section out), so giant generated crates such as
+    // `aws_sdk_ec2` never hit an artificial 256 MiB cap in parallel section workers.
+    scope_record_with_scratch(cx, workers, done, crate_name, member, has_surface, waits, metered, kept, force_par, scope::CALL_SCRATCH)
+}
+
+#[expect(clippy::too_many_arguments, reason = "section encoder inputs, each named")]
+fn scope_record_with_scratch<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_scope::crate_scope::CrateScope<'a>, crate_name: &str, member: bool, has_surface: bool, waits: &blaze_scope::waits_on::WaitsOn<'_, 'a>, metered: &metered::Metered<'_>, kept: blaze_own::SharedAlloc<'static>, force_par: bool, worker_scratch: usize) -> Result<ScopeRecord, Unwritten> {
     const ALIGN: usize = 16;
     const PLACES: usize = 16;
-    const WORKER_SCRATCH: usize = 256 << 20;
     let unwritten = |section: &'static str, why: std::string::String| Unwritten { crate_name: crate_name.into(), section, why };
     let par_workers = usize::try_from(workers.get().min(cx.workers())).unwrap_or(1);
     let mut findings = PathFindings::new_in(kept);
@@ -615,7 +623,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
         // copying out), while the calling thread computes `unresolved` findings and Section 5
         // (`expansions` + inner parallel zstd).
         let sec2_job = scope.may_overlap("names: encode section 2 (names)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "names", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -629,7 +637,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
             result
         });
         let sec3_job = scope.may_overlap("names: encode section 3 (items)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "items", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -643,7 +651,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
             result
         });
         let sec4_job = scope.may_overlap("names: encode section 4 (tests)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "tests", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -654,7 +662,7 @@ fn scope_record_mode<'a>(cx: &Cx, workers: core::num::NonZeroU32, done: &blaze_s
             result
         });
         let sec6_job = scope.may_overlap("names: encode section 6 (links)", 64 << 10, move |_| {
-            let mut local = Frame::with_reserve(WORKER_SCRATCH, blaze_mem::Tag::Nameres)
+            let mut local = Frame::with_reserve(worker_scratch, blaze_mem::Tag::Nameres)
                 .map_err(|error| Unwritten { crate_name: crate_name.into(), section: "link table", why: blaze_own::format_in!(kept, "scratch frame: {error:?}").as_str().into() })?;
             let result = {
                 let erased = blaze_own::Erased::new(&local);
@@ -1066,7 +1074,7 @@ pub(crate) fn place_pieces(message: &[u8]) -> Result<(Option<(&str, u64, blaze_s
     Ok((Some((path, chain, edition)), words))
 }
 
-/// The names step's state for a command (engine.md item 2): the crate list it plans from, read
+/// The names step's state for a command (end-state.md D157): the crate list it plans from, read
 /// in place (blaze-world crate_list.rs version 6), each crate by subject, what the tasks made (a
 /// task that asks for its files' `Surface`s answers from here when entered again), and the world
 /// the list stands for, made only when a task needs it ([`Names::made_or_make`]). Every planner
@@ -1081,8 +1089,8 @@ pub struct Names<'f> {
     /// (subject, crate index), sorted.
     by_subject: blaze_own::Vec<(ContentId, usize), Alloc<'static>>,
     made: std::vec::Vec<(ContentId, Resolved), Global>,
-    /// The subjects of the crates whose records may hold nothing of a project (target.md,
-    /// "Namespaces"): the toolchain's, and a registry archive's known by its lock checksum
+    /// The subjects of the crates whose records may hold nothing of a project (bottom.md
+    /// section 10, namespaces): the toolchain's, and a registry archive's known by its lock checksum
     /// (the list's `PUBLIC` flag); then each run of such a crate placed on the wasm path.
     /// Whether a record is public also needs every name it reads public: the store's check.
     public: blaze_own::Vec<ContentId, Alloc<'static>>,
@@ -1159,6 +1167,10 @@ pub(crate) struct NamesWorld<'f> {
     /// The unit graph the world was made from (leaked with it): a proc-macro crate's unit, whose
     /// module identity the runner keys it by (proc_runner.rs).
     graph: &'static blaze_unit_graph::UnitGraph<'static>,
+    /// Optional resolved `wasm64-blaze-wasip1` host-unit graph carried alongside `graph` in the
+    /// `UnitGraph` record payload, used by `proc_runner::make` and `script_deps_digest` so
+    /// WASI-side unified dependency features enter module identities (Rule 21, Rule 30).
+    wasm_graph: Option<&'static blaze_unit_graph::UnitGraph<'static>>,
     /// Where the world placed each locked package (proc_callers.rs): populated on the eager
     /// discovery path (`make_world`), empty on the lazy standing-list path (`make_world_from_list`).
     placed: &'static [(LockId, blaze_world::Place<'static>)],
@@ -1200,6 +1212,11 @@ impl<'f> NamesWorld<'f> {
     /// The unit graph the world was made from.
     pub(crate) fn graph(&self) -> &'static blaze_unit_graph::UnitGraph<'static> {
         self.graph
+    }
+
+    /// Optional resolved `wasm64-blaze-wasip1` host-unit graph carried beside `graph`.
+    pub(crate) fn wasm_graph(&self) -> Option<&'static blaze_unit_graph::UnitGraph<'static>> {
+        self.wasm_graph
     }
 
     /// What making the world did: its graph decodes, fetched records mapped and packages placed.
@@ -1257,7 +1274,7 @@ impl<'f> NamesWorld<'f> {
 impl<'f> Names<'f> {
     /// The names read from the crate list `list` (its bytes held to the command's end), the
     /// world made by need from `maker`'s record ([`Names::made_or_make`]). No world is made and
-    /// no graph decoded here: O(crates), the list's rows read in place (engine.md item 2).
+    /// no graph decoded here: O(crates), the list's rows read in place (end-state.md D157).
     pub(crate) fn of_list(list_bytes: &'static [u8], maker: Option<Maker<'f>>, heap: Alloc<'static>) -> Result<Names<'f>, NamesError> {
         let list = CrateList::open(list_bytes).map_err(NamesError::List)?;
         let n = list.len();
@@ -1363,7 +1380,7 @@ impl<'f> Names<'f> {
         if view.out != maker.out {
             return refused(WorldWhy::Back(crate::engine_units::BackRefused::Out { key: maker.record }));
         }
-        let made = match make_world(&cx, root, sections.graph, maker.lock, maker.members, &[], &[], env, Some(self.list)) {
+        let made = match make_world(&cx, root, sections.graph, sections.wasm_graph, maker.lock, maker.members, &[], &[], env, Some(self.list)) {
             Ok(made) => made,
             Err(why) => return refused(WorldWhy::Make(why)),
         };
@@ -1572,7 +1589,7 @@ impl Names<'_> {
 /// The crate list's planners' facts (blaze-world crate_list.rs version 6), answered from the
 /// world and the graph it was made from, by the one maker of the list ([`world`]): what the
 /// names, scripts and units stages then plan from with no world made and no graph decoded
-/// (engine.md item 2). [`Names::list_differences`] holds the list's answers equal to these.
+/// (end-state.md D157). [`Names::list_differences`] holds the list's answers equal to these.
 impl blaze_world::crate_list::ListFacts for NamesWorld<'_> {
     fn script(&self, at: usize) -> Option<[u8; 33]> {
         self.script_name_of(at)
@@ -1636,11 +1653,12 @@ pub(crate) fn world<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     graph_record: &[u8],
+    wasm_graph_record: &[u8],
     lock: Option<&'f Lock<'static>>,
     members: Option<&[crate::graph::CheckoutDir]>,
     env: &FetchEnv<'_>,
 ) -> Result<Names<'f>, NamesError> {
-    world_with_mapped(cx, root, graph_record, lock, members, &[], &[], env)
+    world_with_mapped(cx, root, graph_record, wasm_graph_record, lock, members, &[], &[], env)
 }
 
 /// As [`world`], reusing fetched source records already mapped during unit-graph discovery
@@ -1651,6 +1669,7 @@ pub(crate) fn world_with_mapped<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     graph_record: &[u8],
+    wasm_graph_record: &[u8],
     lock: Option<&'f Lock<'static>>,
     members: Option<&[crate::graph::CheckoutDir]>,
     pre_mapped: &[(ContentId, &'static [u8])],
@@ -1662,7 +1681,7 @@ pub(crate) fn world_with_mapped<'f>(
     let heap: Alloc<'static> = env.heap.alloc();
     let mut dirs: blaze_own::Vec<blaze_world::CheckoutPath<'_>, Alloc<'static>> = blaze_own::Vec::with_capacity_in(members.len(), heap);
     dirs.extend(members.iter().map(|entry| blaze_world::CheckoutPath { id: entry.id, dir: entry.dir.as_str(), kind: entry.kind }));
-    let made = make_world(cx, root, graph_record, lock, &dirs, pre_mapped, pre_dirs, env, None)?;
+    let made = make_world(cx, root, graph_record, wasm_graph_record, lock, &dirs, pre_mapped, pre_dirs, env, None)?;
     let list: &'static [u8] = {
         let _cx = cx.span("names: the crate list written");
         blaze_world::crate_list::encode_with(&made.world, &made, heap).map_err(NamesError::List)?.leak_static()
@@ -1709,6 +1728,7 @@ fn make_world<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     graph_record: &[u8],
+    wasm_graph_record: &[u8],
     lock_whole: &'f Lock<'static>,
     members: &[blaze_world::CheckoutPath<'_>],
     pre_mapped: &[(ContentId, &'static [u8])],
@@ -1729,6 +1749,13 @@ fn make_world<'f>(
     };
     let decoded: &'static blaze_unit_graph::record::Decoded<'static> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(decoded, frame));
     let graph = &decoded.graph;
+    let wasm_graph: Option<&'static blaze_unit_graph::UnitGraph<'static>> = if wasm_graph_record.is_empty() {
+        None
+    } else {
+        let wd = blaze_unit_graph::record::decode(wasm_graph_record, frame_alloc).map_err(NamesError::Graph)?;
+        let wd: &'static blaze_unit_graph::record::Decoded<'static> = blaze_own::Box::into_bump_ref(blaze_own::Box::new_in(wd, frame));
+        Some(&wd.graph)
+    };
     let cx: &'static Cx = std::boxed::Box::leak(std::boxed::Box::new(cx.until(cx.deadline())));
     let mut shelf = {
         let _cx = cx.span("names: the toolchain's shelf opened");
@@ -1837,16 +1864,18 @@ fn make_world<'f>(
             .iter()
             .find(|p| p.id == script.package)
             .and_then(|p| crate::macro_files::script_files_digest_in_dir(cx, &reader.root, p.dir, script.root.as_str(), frame));
-        let deps = blaze_proc_macro::script_unit::script_deps_digest(graph, lock, script_id, |dep_pkg| {
-            paths
+        let deps = blaze_proc_macro::script_unit::script_deps_digest(graph, wasm_graph, lock, script_id, |dep_pkg| {
+            members
                 .iter()
                 .find(|p| p.id == dep_pkg)
                 .and_then(|p| crate::macro_files::package_files_digest_in_dir(cx, &reader.root, p.dir, frame))
-        });
+        })
+        .map_err(|_| NamesError::Frame)?;
         let subject = crate::script_modules::subject(ran_as, script.name.as_str(), script.version.as_str(), &features, files.as_deref(), deps.as_deref());
         script_modules.push(crate::script_modules::ScriptModule {
             subject,
             crate_at: at,
+            script_unit: script_id,
             ran_as,
             package: script.name.as_str(),
             version: script.version.as_str(),
@@ -1867,7 +1896,7 @@ fn make_world<'f>(
     // Decommit any over-committed span tail pages past the cursor in `NAMES_FRAME` while keeping
     // all live world allocations intact for the remainder of the command.
     frame.trim_tail();
-    Ok(NamesWorld { world, crate_public, heap, scripts, script_roots, script_modules, graph, placed, lazy_trees, frame, opened })
+    Ok(NamesWorld { world, crate_public, heap, scripts, script_roots, script_modules, graph, wasm_graph, placed, lazy_trees, frame, opened })
 }
 
 /// Each crate (by world index, in order) made from a unit with a build script, with that
@@ -1907,7 +1936,7 @@ pub(crate) fn tell_public(store: &mut dyn Store<'_>, names: &Names<'_>) {
 }
 
 /// The `CrateScope` parts the graph's record names: one per crate of the world, by subject,
-/// its source the same key's digest. Owed (drive.md, RUNNER 16): every part runs, so a
+/// its source the same key's digest. Owed (drive.md): every part runs, so a
 /// `#![no_core]` workspace still resolves all 15 toolchain crates cold; a `Need` locates its
 /// name among its home's parts, so a toolchain crate cannot simply be left out here: the
 /// drive needs a part that is located but run only when wanted.
@@ -2138,6 +2167,141 @@ mod unresolved_tests {
         for ((pk, pb), (sk, sb)) in parallel.expansions.records.iter().zip(serial.expansions.records.iter()) {
             assert_eq!(pk, sk, "expansion record key order must match");
             assert_eq!(pb.as_slice(), sb.as_slice(), "expansion record bytes must match");
+        }
+    }
+
+    #[test]
+    fn large_crate_parallel_scope_record_matches_serial() {
+        use core::fmt::Write as _;
+        use blaze_id::CrateItemKey;
+        use blaze_mem::{Frame, Tag};
+        use blaze_own::Erased;
+        use blaze_scope::crate_scope::resolve_crate_verified_with;
+        use blaze_scope::graph::Sysroot;
+        use blaze_scope::prepares::Prepares;
+        use blaze_scope::resolve::{CrateInput, ResolveOpts, SourceTexts};
+        use blaze_scope::task::Serial;
+        use blaze_surface::Edition;
+        use blaze_unit_graph::{Implicit, Prelude, StdIs};
+
+        struct OwnedSources<'a>(&'a [(&'a str, &'a str)]);
+
+        impl<'a> SourceTexts<'a> for OwnedSources<'a> {
+            fn read(&self, _krate: usize, path: &str) -> Option<&'a str> {
+                self.0.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)
+            }
+        }
+
+        let mut lib = std::string::String::with_capacity(128 << 10);
+        lib.push_str("#![no_core]\npub trait Builder { fn build(self) -> u32; }\n");
+        for i in 0..200usize {
+            let _ = writeln!(lib, "pub struct Op{i}(pub u32);");
+            let _ = writeln!(lib, "impl Op{i} {{");
+            for m in 0..8usize {
+                let _ = writeln!(lib, "    pub fn set_{m}(self, v: u32) -> Self {{ Self(v) }}");
+            }
+            lib.push_str("}\n");
+            let _ = writeln!(lib, "impl Builder for Op{i} {{ fn build(self) -> u32 {{ self.0 }} }}");
+        }
+        for e in 0..60usize {
+            let _ = writeln!(lib, "pub enum Mode{e} {{ A, B, C, D }}");
+        }
+        let files = [("/pkg/src/lib.rs", lib.as_str())];
+        let sources = OwnedSources(&files);
+        let input = CrateInput {
+            name: "large_par_scope_demo",
+            key: CrateItemKey(super::ContentId::of("large scope_record par test", b"demo")),
+            edition: Edition::E2021,
+            implicit: Implicit { std: StdIs::Rust, prelude: Prelude::Rust(edition::Edition::Edition2021), proc_macro: false, entry: false },
+            root: "/pkg/src/lib.rs",
+            shown_from: "/pkg",
+            features: &[],
+            deps: &[],
+            cfg: &[],
+            script: None,
+        };
+        let kept_static = blaze_own::testing::heap().shared();
+        let io = bstd::io::Io::simulated(bstd::io::SimWorld::new(79, bstd::io::Limits::USUAL));
+        let cx = io.cx(bstd::test::BUDGET, 4 << 20).expect("root context");
+        let solve_frame = Frame::new(Tag::Nameres).expect("solve frame");
+        let erased = Erased::new(&solve_frame);
+        let bump = erased.bump();
+        let prepares = Prepares::new_in(bump);
+        let done = resolve_crate_verified_with(
+            &input,
+            &[],
+            Sysroot::default(),
+            &sources,
+            0,
+            &Serial,
+            prepares,
+            ResolveOpts { write_inner: false, ..ResolveOpts::default() },
+            bump,
+        )
+        .expect("resolve large crate");
+        let waits = blaze_scope::waits_on::WaitsOn::of(done.names, &[], bump.alloc());
+
+        // Causal control (rule 23): a tight worker scratch cap below this crate's Section 3
+        // (`items`) bump need fails cleanly via `panics-fail-one-job` (reproducing the former cap
+        // failure), while the raised `CALL_SCRATCH` cap succeeds and matches the serial path.
+        let Ok(tight_err) = crate::work::unwinding(|| {
+            let scratch = Frame::with_reserve(64 << 20, Tag::Expand).expect("scratch");
+            let solve_scratch = Frame::with_reserve(64 << 20, Tag::Nameres).expect("solve scratch");
+            let metered = super::metered::Metered::new(&solve_frame, scratch, solve_scratch, super::metered::CallScratch::Reset);
+            super::scope_record_with_scratch(
+                &cx,
+                core::num::NonZeroU32::new(4).expect("non-zero workers"),
+                &done,
+                input.name,
+                false,
+                false,
+                &waits,
+                &metered,
+                kept_static,
+                true,
+                256 << 10,
+            )
+        }) else {
+            panic!("worker scratch refusal must fail only the worker job, not unwind the caller");
+        };
+        let err = tight_err.err().expect("256 KiB worker scratch must refuse this crate's large section encode");
+        assert!(
+            err.section == "items" || err.section == "names",
+            "expected items or names section refusal under tight worker scratch, got `{}`: {}",
+            err.section,
+            err.why
+        );
+        assert!(
+            err.why.contains("refused") || err.why.contains("panicked"),
+            "expected frame refusal diagnostic, got: {}",
+            err.why
+        );
+
+        for has_surface in [false, true] {
+            let run_once = |w: u32, force_par: bool| {
+                let scratch = Frame::with_reserve(64 << 20, Tag::Expand).expect("scratch");
+                let solve_scratch = Frame::with_reserve(64 << 20, Tag::Nameres).expect("solve scratch");
+                let metered = super::metered::Metered::new(&solve_frame, scratch, solve_scratch, super::metered::CallScratch::Reset);
+                super::scope_record_mode(
+                    &cx,
+                    core::num::NonZeroU32::new(w).expect("non-zero workers"),
+                    &done,
+                    input.name,
+                    has_surface,
+                    has_surface,
+                    &waits,
+                    &metered,
+                    kept_static,
+                    force_par,
+                )
+                .expect("scope_record")
+            };
+            let serial = run_once(1, false);
+            let parallel = run_once(4, true);
+            assert_eq!(parallel.payload.as_slice(), serial.payload.as_slice(), "has_surface={has_surface}: payload mismatch");
+            assert_eq!(parallel.names_out, serial.names_out, "has_surface={has_surface}: names_out mismatch");
+            assert_eq!(parallel.items_out, serial.items_out, "has_surface={has_surface}: items_out mismatch");
+            assert_eq!(parallel.expansions_out, serial.expansions_out, "has_surface={has_surface}: expansions_out mismatch");
         }
     }
 }

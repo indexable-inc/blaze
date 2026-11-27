@@ -119,14 +119,27 @@ impl Sysroot {
 /// [`MAX_GRAPH_CRATES`] or more crates, so no crate's index is this.
 const ABSENT: ToolchainUnit = ToolchainUnit(u32::MAX);
 
-/// The crate attributes of a root that change what is injected.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+/// The crate attributes of a root that change what is injected or how the crate expands.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RootAttrs {
     pub no_std: bool,
     pub no_core: bool,
     /// `#![blaze::arbitrary_ints]`: injects nothing; kept on the root's head, where the
     /// builtin types are looked up ([`crate::builtin_type_in`]).
     pub arbitrary_ints: bool,
+    /// Effective `#![recursion_limit = "N"]` (default [`crate::RECURSION_LIMIT`]).
+    pub recursion_limit: u32,
+}
+
+impl Default for RootAttrs {
+    fn default() -> Self {
+        Self {
+            no_std: false,
+            no_core: false,
+            arbitrary_ints: false,
+            recursion_limit: u32::from(crate::RECURSION_LIMIT),
+        }
+    }
 }
 
 /// The standard prelude a crate's modules import: a module of `krate`, by the path of module

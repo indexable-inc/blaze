@@ -1,6 +1,5 @@
 //! Each async block's STATE RECIPE, made WITH its owner body's check (ASYNC.md P8, option (b),
-//! main's rulings of 2026-11-16): a fact the body makes (drive.md, "D114 rulings", "Facts a body
-//! makes" (i): what leaks of a hidden type, for code its layout), read by whoever lays the state
+//! main's rulings of 2026-11-16): a fact the body makes (drive.md: what leaks of a hidden type, for code its layout), read by whoever lays the state
 //! out (run/lay_states.rs). One home: the recipe is blaze-flow-lower `state_recipe` of the
 //! block's own flow (`lower_async`), the flow the borrow check lowers too.
 //!

@@ -120,7 +120,7 @@ impl<'b, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> {
                     r,
                 )),
             },
-            None if self.heads.trait_supers(owner).is_none() => Err(Why::Need(owner)),
+            None if !self.heads.trait_members_made(owner) => Err(Why::Need(owner)),
             None => Err(Why::Unsupported(
                 "a constant argument of a generic associated type whose const parameters are not on record (its head is refused, or the bound is inside its own trait's members)",
                 r,

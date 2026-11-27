@@ -1,4 +1,4 @@
-//! The engine's pool on bstd's workers (engine.md E6, `blaze engine-check`): a phase's tasks cut
+//! The engine's pool on bstd's workers (end-state.md D157, `blaze engine-check`): a phase's tasks cut
 //! into chunks by a [`Schedule`], claimed in order from one shared cursor by claimers that each
 //! run as a task of one bstd scope and each own one buffer; after the phase the buffers' results
 //! are put back in task order ([`in_chunk_order`]), so the merge reads the same list whichever

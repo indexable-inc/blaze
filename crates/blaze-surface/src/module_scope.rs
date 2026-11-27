@@ -17,9 +17,9 @@
 //! builders of one module write equal bytes whatever their order.
 
 use core::fmt;
-use core::mem::offset_of;
+use core::mem::{align_of, offset_of, size_of};
 
-use blaze_format::{FormatError, Record, Slice, Writer, WriterOpts};
+use blaze_format::{ALIGN, FormatError, HEADER_LEN, Record, Slice, Writer};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_own::{AVec, Alloc, Vec};
 
@@ -584,6 +584,99 @@ pub fn textual_digest<N: AsRef<str>>(defs: &[TextualDef<N>], alloc: Alloc<'_>) -
 }
 
 impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
+    /// Serialized byte length of [`Self::write`] with zero heap allocation (exact for up to 64
+    /// distinct restricted visibility targets; a proven upper bound above 64).
+    pub fn encoded_len(&self) -> usize {
+        fn push_col<T>(pos: usize, len: usize) -> usize {
+            if len == 0 {
+                return pos;
+            }
+            pos.next_multiple_of(align_of::<T>())
+                .saturating_add(len.saturating_mul(size_of::<T>()))
+        }
+        let mut str_bytes = 0usize;
+        for e in self.bindings.iter() {
+            str_bytes = str_bytes.saturating_add(e.name.as_ref().len());
+        }
+        let mut path_rows = 0usize;
+        let mut path_segments = 0usize;
+        for error in self.errors.iter() {
+            let name_len = match error {
+                ScopeError::ExternCrate { name }
+                | ScopeError::Duplicate { name, .. }
+                | ScopeError::WiderReexport { name, .. }
+                | ScopeError::Ambiguous { name, .. }
+                | ScopeError::Inconsistent { name, .. }
+                | ScopeError::Refused { name, .. } => name.as_ref().len(),
+                ScopeError::Import { .. }
+                | ScopeError::Macro { .. }
+                | ScopeError::RestrictedNotAncestor { .. }
+                | ScopeError::RecursionLimit { .. } => 0,
+            };
+            str_bytes = str_bytes.saturating_add(name_len);
+            if let Some(path) = error.path() {
+                path_rows = path_rows.saturating_add(1);
+                path_segments = path_segments.saturating_add(path.segments.len());
+                for seg in path.segments.iter() {
+                    str_bytes = str_bytes.saturating_add(seg.as_ref().len());
+                }
+            }
+        }
+        for d in self.textual.iter() {
+            str_bytes = str_bytes.saturating_add(d.name.as_ref().len());
+        }
+        for d in self.macro_exports.iter() {
+            str_bytes = str_bytes.saturating_add(d.name.as_ref().len());
+        }
+        let mut seen_vis = [ZERO; 64];
+        let mut vis_len = 0usize;
+        let mut extra_vis = 0usize;
+        let mut count_vis = |vis: Visibility| {
+            let (tag, key) = vis.to_record();
+            if tag == VisibilityTag::Public && key == ZERO {
+                return;
+            }
+            if let Some(prefix) = seen_vis.get(..vis_len)
+                && prefix.contains(&key)
+            {
+                return;
+            }
+            if let Some(slot) = seen_vis.get_mut(vis_len) {
+                *slot = key;
+                vis_len = vis_len.saturating_add(1);
+            } else {
+                extra_vis = extra_vis.saturating_add(1);
+            }
+        };
+        for e in self.bindings.iter() {
+            count_vis(e.binding.vis);
+        }
+        for g in self.globs.iter() {
+            count_vis(g.vis);
+        }
+        for t in self.traits.iter() {
+            count_vis(t.vis);
+        }
+        let vis_keys_bound = vis_len.saturating_add(extra_vis);
+
+        let mut pos = HEADER_LEN;
+        pos = push_col::<u8>(pos, str_bytes);
+        pos = push_col::<BindingRow>(pos, self.bindings.len());
+        pos = push_col::<GlobRow>(pos, self.globs.len());
+        pos = push_col::<ErrorRow>(pos, self.errors.len());
+        pos = push_col::<TextualRow>(pos, self.textual.len());
+        pos = push_col::<MarkRow>(pos, self.marks.len());
+        pos = push_col::<TraitRow>(pos, self.traits.len());
+        pos = push_col::<TextualRow>(pos, self.macro_exports.len());
+        pos = push_col::<PathRow>(pos, path_rows);
+        pos = push_col::<Text>(pos, path_segments);
+        pos = push_col::<ContentId>(pos, vis_keys_bound);
+        pos = pos
+            .next_multiple_of(align_of::<ModuleScopeRoot>())
+            .saturating_add(size_of::<ModuleScopeRoot>());
+        pos.next_multiple_of(ALIGN)
+    }
+
     /// The [`ModuleScope`] record of this scope, in `alloc`. The bindings are sorted by
     /// namespace and name and the marks by child, so the order they are in moves no byte; two
     /// bindings of one slot are refused.
@@ -591,8 +684,38 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
         self.write_sorted(true, alloc)
     }
 
+    /// Writes this scope reusing `scratch` as the `blaze_format::Writer` buffer (zero buffer
+    /// reallocation once `scratch` holds the largest scope) and appends the finished record bytes
+    /// directly onto `out`, returning the number of bytes appended.
+    pub fn write_into<'b>(
+        &self,
+        scratch: &mut RecordBytes<'b>,
+        out: &mut RecordBytes<'_>,
+        alloc: Alloc<'b>,
+    ) -> Result<usize, BuildError> {
+        self.write_sorted_into(true, scratch, out, alloc)
+    }
+
     /// [`ScopeBuilder::write`], with the planted bug of the order test: `sort` off.
     pub(crate) fn write_sorted<'b>(&self, sort: bool, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, BuildError> {
+        let mut buf = RecordBytes::with_capacity_in(self.encoded_len().max(HEADER_LEN), alloc);
+        self.write_sorted_with_buffer(sort, &mut buf, alloc)?;
+        Ok(buf)
+    }
+
+    fn write_sorted_into<'b>(
+        &self,
+        sort: bool,
+        scratch: &mut RecordBytes<'b>,
+        out: &mut RecordBytes<'_>,
+        alloc: Alloc<'b>,
+    ) -> Result<usize, BuildError> {
+        self.write_sorted_with_buffer(sort, scratch, alloc)?;
+        out.extend_from_slice(scratch);
+        Ok(scratch.len())
+    }
+
+    fn write_sorted_with_buffer<'b>(&self, sort: bool, buf: &mut RecordBytes<'b>, alloc: Alloc<'b>) -> Result<(), BuildError> {
         let mut strings = Strings::new_in(alloc);
         let mut paths = PathTable::new_in(alloc);
         let mut vis_keys: Vec<ContentId, Alloc<'b>> = Vec::new_in(alloc);
@@ -686,7 +809,8 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
             });
         }
 
-        let mut out = Writer::new(WriterOpts { schema: <ModuleScopeRoot as Record>::SCHEMA, alloc: alloc, capacity: None });
+        let taken = core::mem::replace(buf, RecordBytes::new_in(alloc));
+        let mut out = Writer::with_buffer(<ModuleScopeRoot as Record>::SCHEMA, taken);
         let text = Column::push(&mut out, strings.bytes());
         let bindings = Column::push(&mut out, &rows);
         let globs = Column::push(&mut out, &globs);
@@ -698,7 +822,7 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
         let path_rows = Column::push(&mut out, &paths.rows);
         let segments = Column::push(&mut out, &paths.segments);
         let vis_keys = Column::push(&mut out, &vis_keys);
-        Ok(finish_with(out, |at| ModuleScopeRoot {
+        *buf = finish_with(out, |at| ModuleScopeRoot {
             module: self.module.0,
             bindings: bindings.slice(at, offset_of!(ModuleScopeRoot, bindings)),
             globs: globs.slice(at, offset_of!(ModuleScopeRoot, globs)),
@@ -711,7 +835,8 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
             segments: segments.slice(at, offset_of!(ModuleScopeRoot, segments)),
             strings: text.slice(at, offset_of!(ModuleScopeRoot, strings)),
             vis_keys: vis_keys.slice(at, offset_of!(ModuleScopeRoot, vis_keys)),
-        }))
+        });
+        Ok(())
     }
 }
 
@@ -1081,5 +1206,68 @@ mod prefix_probe {
             }
             Ok(())
         });
+    }
+
+    #[test]
+    fn encoded_len_and_write_into_match_write_byte_for_byte() {
+        use super::{
+            AVec, Binding, BindingState, ContentId, Def, DefKind, GlobEdge, ItemKey, MacroShapes,
+            Namespace, Origin, Path, RecordBytes, ScopeBuilder, ScopeEntry, ScopeError, TextualDef,
+            Unresolved, UseSite, Visibility,
+        };
+        let heap = blaze_own::testing::heap().alloc();
+        let mut builder = ScopeBuilder::<&str>::new_in(ItemKey(ContentId([3; 32])), heap);
+        let vis_mod = ItemKey(ContentId([7; 32]));
+        builder.bindings.push(ScopeEntry {
+            ns: Namespace::Types,
+            name: "VeryLongBindingNameForEncodedLenCheck",
+            binding: Binding {
+                def: Def { key: ItemKey(ContentId([1; 32])), kind: DefKind::Other },
+                vis: Visibility::Restricted(vis_mod),
+                origin: Origin::Declared,
+                expansion: 0,
+                state: BindingState::Determined,
+            },
+        });
+        builder.macro_exports.push(TextualDef {
+            name: "exported_macro_with_long_identifier_name",
+            def: ItemKey(ContentId([2; 32])),
+            expansion: 0,
+            shapes: MacroShapes::FN_LIKE,
+        });
+        builder.textual.push(TextualDef {
+            name: "local_macro",
+            def: ItemKey(ContentId([4; 32])),
+            expansion: 0,
+            shapes: MacroShapes::FN_LIKE,
+        });
+        builder.globs.push(GlobEdge {
+            source: Def { key: ItemKey(ContentId([5; 32])), kind: DefKind::Module },
+            vis: Visibility::Restricted(vis_mod),
+            expansion: 0,
+        });
+        let mut segs = AVec::new_in(heap);
+        segs.push("missing_mod");
+        segs.push("missing_item");
+        builder.errors.push(ScopeError::Import {
+            site: UseSite { expansion: None, index: 0 },
+            path: Path { kind: crate::path::PathKind::Plain, segments: segs },
+            segment: 1,
+            why: Unresolved::NotFound,
+        });
+        builder.errors.push(ScopeError::ExternCrate { name: "absent_extern_crate" });
+
+        let expected = builder.write(heap).expect("write");
+        assert_eq!(builder.encoded_len(), expected.len(), "encoded_len must match exact serialized length");
+
+        let mut scratch = RecordBytes::with_capacity_in(builder.encoded_len(), heap);
+        let scratch_ptr = scratch.as_ptr();
+        let mut dst = RecordBytes::with_capacity_in(builder.encoded_len(), heap);
+        let dst_ptr = dst.as_ptr();
+        let written = builder.write_into(&mut scratch, &mut dst, heap).expect("write_into");
+        assert_eq!(written, expected.len());
+        assert_eq!(dst.as_slice(), expected.as_slice(), "write_into must be byte-identical to write");
+        assert_eq!(scratch.as_ptr(), scratch_ptr, "scratch must not reallocate");
+        assert_eq!(dst.as_ptr(), dst_ptr, "pre-sized dst must not reallocate");
     }
 }

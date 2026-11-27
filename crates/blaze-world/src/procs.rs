@@ -73,6 +73,23 @@ impl MacroIdentity {
         };
         f(&CrateId { name: &self.package, version: &self.version, source, deps: &self.deps, features: &features })
     }
+
+    /// Folds the resolved `wasm64-blaze-wasip1` dependency closure's unified features (bound to
+    /// each package's source pin) into this identity's `deps` digest so enabling, removing, or
+    /// swapping features across dependencies (including same-name/same-version packages from
+    /// different sources) invalidates the proc-macro module key (rule 21).
+    pub fn with_wasm_features<D: AsRef<str>, A: core::alloc::Allocator + Copy>(
+        mut self,
+        lock: &Lock<'_>,
+        wasm_graph: &blaze_unit_graph::UnitGraph<'_>,
+        package: LockId,
+        path_files: impl FnMut(LockId) -> Option<D>,
+        alloc: A,
+    ) -> Self {
+        let folded = blaze_proc_macro::module::deps_with_wasm_features(&self.deps, lock, wasm_graph, package, &self.features, path_files, alloc);
+        self.deps = folded.as_str().to_string();
+        self
+    }
 }
 
 /// The git folders the store's modules were built from, by `name version`: read from the
@@ -113,6 +130,7 @@ pub fn identify<D: AsRef<str>>(
     lock: &Lock<'_>,
     locked: &LockedPackages<'_, '_>,
     git_folders: &BTreeMap<String, String>,
+    graph: &blaze_unit_graph::UnitGraph<'_>,
     unit: &Unit<'_>,
     mut path_files: impl FnMut(LockId) -> Result<Option<D>, ProcsError>,
 ) -> Result<Result<MacroIdentity, Unidentified>, ProcsError> {
@@ -139,12 +157,64 @@ pub fn identify<D: AsRef<str>>(
             }
         },
     };
-    let deps = match locked.closure_with(package, version, &mut path_files)? {
+    let unit_deps = unit_dep_packages(graph, unit);
+    let has_path = matches!(locked_package.source, LockSource::Path)
+        || unit_deps.iter().any(|&dep| matches!(lock.package(dep).source, LockSource::Path));
+    let deps_res = if has_path {
+        // Cargo.lock mixes workspace members' `dev-dependencies` and inactive optional/target
+        // dependencies into `[[package]].dependencies`; walk only the UnitGraph's compiled
+        // normal/build dependency closure so uncompiled dev-deps do not poison the key or fail
+        // with `ClosureError::Unpinned`.
+        locked.closure_of_packages(unit.package, unit_deps, &mut path_files)?
+    } else {
+        locked.closure_with(package, version, &mut path_files)?
+    };
+    let deps = match deps_res {
         Ok(deps) => deps,
         Err(error) => return Ok(Err(Unidentified::Closure(error))),
     };
     let features = unit.features.iter().map(|f| f.as_str().to_string()).collect();
     Ok(Ok(MacroIdentity { package: package.to_string(), version: version.to_string(), source, deps, features }))
+}
+
+/// Every `LockId` transitively depended on by `unit` in `graph` (normal deps and build scripts).
+fn unit_dep_packages(graph: &blaze_unit_graph::UnitGraph<'_>, unit: &Unit<'_>) -> Vec<LockId> {
+    let mut seen_units = std::vec![false; graph.units.len()];
+    let mut stack = Vec::new();
+    for dep in unit.deps.iter() {
+        let idx = dep.unit.index();
+        if idx < seen_units.len() && !seen_units[idx] {
+            seen_units[idx] = true;
+            stack.push(dep.unit);
+        }
+    }
+    if let Some(bs) = unit.build_script {
+        let idx = bs.index();
+        if idx < seen_units.len() && !seen_units[idx] {
+            seen_units[idx] = true;
+            stack.push(bs);
+        }
+    }
+    let mut packages = Vec::new();
+    while let Some(uid) = stack.pop() {
+        let u = &graph.units[uid.index()];
+        packages.push(u.package);
+        for dep in u.deps.iter() {
+            let idx = dep.unit.index();
+            if idx < seen_units.len() && !seen_units[idx] {
+                seen_units[idx] = true;
+                stack.push(dep.unit);
+            }
+        }
+        if let Some(bs) = u.build_script {
+            let idx = bs.index();
+            if idx < seen_units.len() && !seen_units[idx] {
+                seen_units[idx] = true;
+                stack.push(bs);
+            }
+        }
+    }
+    packages
 }
 
 /// A macro crate the hook could not register: its macros' calls are refused, one finding per
@@ -194,6 +264,7 @@ pub fn register_macro_crates<'u>(
     procs: &mut ProcMacros<'_>,
     modules: &Path,
     lock: &Lock<'_>,
+    graph: &blaze_unit_graph::UnitGraph<'_>,
     crates: impl IntoIterator<Item = (usize, &'u Unit<'u>)>,
     path_dir: impl Fn(LockId) -> Option<PathBuf>,
 ) -> Result<Registered, ProcsError> {
@@ -209,7 +280,7 @@ pub fn register_macro_crates<'u>(
                 Ok(Some(blaze_proc_macro::module::files_digest(&mut listed)))
             }
         };
-        let identity = match identify(lock, &locked, &git_folders, unit, path_files)? {
+        let identity = match identify(lock, &locked, &git_folders, graph, unit, path_files)? {
             Ok(identity) => identity,
             Err(why) => {
                 made.unregistered.push((index, Unregistered::Unidentified(why)));

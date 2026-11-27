@@ -35,7 +35,7 @@
 //! runs is let finish, and it finishes failed. A plane lives as long as the daemon: a request
 //! [`Plane::release`]d gives its nodes' room back once it finishes.
 //!
-//! **Layout** (docs/v2/plan/design/data.md). Nodes, tasks and requests are slots into columns
+//! **Layout** (docs/v2/plan/design/bottom.md section 13, "Layout: columns"). Nodes, tasks and requests are slots into columns
 //! reserved up front ([`RegionVec`], tagged [`MemTag::Plane`]), a hot row of what scheduling
 //! reads (64 bytes a node, 32 a task) beside colder ones. Which slots are live is a
 //! [`Slab`] of each (docs/v2/plan/design/memory.md, "Generational handles"): a slot freed is

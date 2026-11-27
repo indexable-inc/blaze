@@ -677,8 +677,8 @@ struct Retired {
 }
 
 /// Objects of one pool that were unlinked while readers may still hold them, each kept in its
-/// slot until its grace has passed (docs/v2/plan/design/concurrency.md "Task boundaries
-/// reclaim memory"), then dropped and its slot returned through the limbo's own cache. For
+/// slot until its grace has passed (docs/v2/plan/design/end-state.md D179: task boundaries
+/// reclaim memory), then dropped and its slot returned through the limbo's own cache. For
 /// one owner (a writer of the table they were unlinked from).
 ///
 /// Graces are held in start order, so the passed ones are a prefix and [`Limbo::collect`]

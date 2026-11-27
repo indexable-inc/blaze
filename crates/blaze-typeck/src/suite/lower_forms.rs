@@ -1,4 +1,4 @@
-//! Bodies in the forms blaze-lower makes (typeck.md, "Owed to blaze-lower"), checked by
+//! Bodies in the forms blaze-lower makes (typeck.md, "Forms from blaze-lower"), checked by
 //! `InferCtx`, each with the expected type of every expression and binding and the rule it
 //! follows. The world is the ladder's rung 7c ([`crate::fixture::rung_7c`]).
 //!
@@ -474,7 +474,7 @@ fn question_mark_with_no_from_impl_is_e0277() {
         .collect();
     // The goal entire, and the leaf a person can fix: the impl's where-clause `Error:
     // From<Other>` (the Reference, "Implementations": an impl applies only where its
-    // where-clauses hold; blaze names the leaf, typeck.md "The whole failed goal").
+    // where-clauses hold; blaze names the leaf).
     let want = "E0277 Some(\"Result<u8, Error>: FromResidual<Result<Infallible, Other>> because Error: From<Other>\") Some(\"Result<u8, Error>\")";
     assert_eq!(got, [want], "{:?}", c.diags);
 }
@@ -536,8 +536,7 @@ fn a_projection_that_cannot_hold_names_the_projection_and_its_term() {
     assert_eq!((shown(c.diags[0].expected), shown(c.diags[0].found)), (Some("u8".into()), Some("u16".into())), "{:?}", c.diags);
 }
 
-/// A lang item the world cannot answer is the one finding naming it (typeck.md, "`?` on the
-/// ladder"): with `ControlFlow::Continue` unanswered, `x?` reports `MissingLangItem` naming
+/// A lang item the world cannot answer is the one finding naming it: with `ControlFlow::Continue` unanswered, `x?` reports `MissingLangItem` naming
 /// `Continue`, never an E0425 without a name.
 #[test]
 fn question_mark_without_continue_names_the_lang_item() {

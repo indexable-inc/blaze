@@ -1,17 +1,17 @@
 ---
 status: plan
-summary: lock policy (lane lock-policy, 2026-11-04, approved by Andrew) - and, since 2026-11-20, when an in-memory Lock earns its place (D179's exception, its lock record, the lint and ratchet, every lock in shipped code and its shape) - CI refuses any change to the lock files, naming each move, why and the fix; locally a build writes them but never silently; `blaze.lock` beside `Cargo.lock` pins the blaze release and its nightly, the index's newest publish time and every pinned native input's digests; `lock = required` refuses locally too and blaze's tree sets it; what is built and what is left.
+summary: "Two kinds of lock. Lock files (not built): CI refuses any change to them, naming each move, why and the fix; locally a build writes them but never silently; `blaze.lock` beside `Cargo.lock` pins the blaze release and its nightly, the index's newest publish time and every pinned native input's digests; `lock = required` refuses locally too. In-memory locks (D179, built): when a `Lock` earns its place, the `#[blaze::lock_exception]` attribute, the lint and the ratchet, the contention record and its `locks:` section, and what every lock in shipped code becomes."
 date: 2026-11-04
 ---
 # Lock policy
 
-Lane lock-policy, 2026-11-04. The design Andrew approved that day, and what this lane built of
-it. The user-facing description is docs/cargo.md, "Lock files"; this file says why and what is
-left.
+The lock-file design Andrew approved on 2026-11-04 is not built: blaze reads `Cargo.lock`
+(`crates/blaze-manifest/src/lock.rs`) but writes neither it nor `blaze.lock`, has no `blaze lock`,
+and nothing reads `lock = "required"` (root `Cargo.toml` sets it). The design follows.
 
-The last section, "A lock earns its place" (2026-11-20, D179), is about the other kind of lock:
-the in-memory `Lock` and `ReadLock` of blaze-core, when one is allowed, how its waits are
-recorded, and what each one in shipped code should become.
+The last section, "A lock earns its place" (D179), is about the other kind of lock: the
+in-memory `Lock` and `ReadLock` of blaze-core, when one is allowed, how its waits are recorded,
+and what each one in shipped code should become.
 
 ## The rules
 
@@ -30,7 +30,7 @@ recorded, and what each one in shipped code should become.
 4. **Opt-in strict mode:** `[workspace.metadata.blaze] lock = "required"` refuses locally too.
    blaze's root `Cargo.toml` sets it.
 
-The decision (`crates/blaze-units/src/lock.rs`, `policy`), first row that applies:
+The decision, first row that applies:
 
 | Asked | A change to a lock file |
 |---|---|
@@ -61,7 +61,7 @@ The format (version 1; unknown keys and other versions are errors naming the fil
 guessed at):
 
     # blaze.lock: what blaze builds this workspace with besides the crates in Cargo.lock.
-    # blaze writes it (`blaze lock`); commit it. docs/cargo.md, "Lock files".
+    # blaze writes it (`blaze lock`); commit it.
     version = 1
 
     [blaze]
@@ -90,8 +90,7 @@ What each entry means, and the choices made:
   running blaze. Any other blaze (a dev build of the tree, another release under
   `--ignore-pin`) keeps the entry that is there, or writes none; an entry that names a
   release other than the pin is the refusal case, an error naming both and the fix (run
-  `blaze lock` with the pinned release). `is_version` is the one rule for a release's
-  version, shared with the launcher's pin (`blaze_units::lock::is_version`).
+  `blaze lock` with the pinned release).
 - **`[index] newest`** is the newest sparse-index `pubtime` among the packages the resolve took
   from an index. The load is a pure function of its inputs and owns no clock
   (`sans-io-cores`), so it cannot know when the index was fetched; the newest publish time it
@@ -101,48 +100,12 @@ What each entry means, and the choices made:
   names, not only what this build needs, so the lock does not depend on the host or the
   packages built.
 
-## Built (this lane)
+## Open
 
-- `crates/blaze-units/src/lock.rs`: the policy (with `BLAZE_LOCK`, `env_writes`), `blaze.lock`'s
-  model, render and parse, the move lines with their reasons (`moves`, `pin_moves`), `decide`,
-  `identity` (which blaze to record), `is_version`, and `after_resolve`, the one function every
-  resolve that may write lock files calls: the daemon's load and blaze-metadata's commands
-  (`metadata`, `remove`, `vendor`, `tree`). Its two tests: the decision table (with the
-  identity rows), and `blaze.lock` round-tripping byte for byte.
-- `crates/blaze-units/src/load/resolve.rs`: calls `after_resolve` through the load's snapshot; a
-  refusal is the load's error.
-- `crates/blaze-resolve/src/lockfile.rs`: `lockfile_change`, the text without the policy;
-  `lockfile_to_write` and its `Locked` are gone, banned in `.clippy.toml`.
-- `crates/blaze-metadata/src/lib.rs`: `Asked::lock` carries the same inputs as a build;
-  `relock` and `vendored` lost their own `locked` flag.
-- `crates/blaze-engine/src/pin.rs` and the update commands: the launcher's version rule is
-  `blaze_units::lock::is_version`; the engine's copy is gone.
-- `crates/blaze-units/src/load/native.rs`: `locked_pins`; reading a pin now checks every
-  target's name and digest, not only the host's.
-- `crates/blaze-units/src/load/invocation.rs`: `--no-locked`, `CI`/`TF_BUILD` (read apart from
-  the variables cargo reads, since cargo's `CI` changes `incremental`), `BLAZE_LOCK`, the
-  running release (`BuildConfig::blaze`).
-- `crates/blaze-api`: `Request::Lock` and `Work::Lock` (schema 39); `crates/blaze-cargo`'s job
-  writes the lock files and ends the job after the load, so `blaze lock` resolves, writes and
-  stops, checking nothing.
-- Harnesses: `BLAZE_LOCK=write` where children start (`harness/ci.py` `run_one`,
-  `harness/smoke.py`, `harness/blaze_cli.py`, `harness/live_e2e.py`, `harness/live_latency.py`,
-  `tools/pgo/pgo.py`, `.github/scripts/publish_crates.py`, the install and promote workflows,
-  `crates/blaze-engine/tests/repro.rs`); builds of committed workspaces keep `--locked`.
-- Root `Cargo.toml`: `lock = "required"`; `blaze.lock` with the LLVM pin, in the format `render`
-  writes. `blaze lock && git diff --exit-code Cargo.lock blaze.lock` in the tree checks it.
-
-## Left
-
-- **The launcher does not honour `blaze.lock`** beyond a version pin, which it already runs. A
-  channel-pinned or unpinned workspace records no release and runs whatever it gets; recording
-  and running one for a channel is a launcher change, not a lock one.
 - **Index fetch time.** "index as of" is the newest publish time used, not when the index was
   read. Recording the fetch time needs the sources layer to hand the load a timestamp as an
-  input, keyed, which it does not.
-- **blaze's tree at the next pin bump.** `blaze.lock` holds no `[blaze]` yet: the pinned
-  0.20261030.1 predates this policy and dev builds record none. The first pin bump must run
-  `blaze lock` with the new release and commit `blaze.lock`, or that release refuses the tree.
+  input, keyed.
+- **A channel-pinned or unpinned workspace** records no release and runs whatever it gets.
 
 ## A lock earns its place
 
@@ -164,7 +127,7 @@ waiter's arrival, or from its acquire when it had waited itself, then "whole"). 
 thread's lock table (`blaze_meter::Locks`, 16 rows and an "other" row, nothing lost), which
 `Meter::now` and so every task's `Used` reads; the same number adds `LockWaits` and
 `LockWaitNs`, so the two always reconcile (`Used::locks_reconcile`). A lock wait blocks its
-thread (a fiber never parks inside one, rule 27), so the thread is the worker the task is on
+thread (no task parks inside one), so the thread is the worker the task is on
 for the whole wait: the thread's table is the worker's, with no parameter on any acquire.
 
 The uncontended path is unchanged: a take is the raw lock's compare-and-swap and the owner
@@ -205,7 +168,7 @@ writer: Lock::new("store.plain.writer", driven),
 `tried` is `"published"`, `"gathered"` or `"claimed"` (the shape it was tried as); `why` is
 the reason that shape failed, a sentence, never empty.
 
-The lint, for the blaze-lint writer (rule `lock-without-reason`): in shipped code (not under
+The lint (blaze-lint's `lock-without-reason`): in shipped code (not under
 `#[cfg(test)]`, not in `tests/`, `benches/` or `examples/`), a call of `blaze_core::lock::Lock::new`,
 `Lock::unrecorded`, `Lock::probed`, `ReadLock::new`, `ReadLock::unrecorded`, bstd's
 `sync::Lock::new`, `RwLock::new` or `RankedLock::new`, or a `SharedMap::new_in` (its shard
@@ -216,9 +179,15 @@ its first argument when that is a string literal. A constructor that forwards a 
 (bstd's `Lock::new`, `Once`, `Flight`, `Chan`, `Swap`, `RankedLock`) carries the attribute
 once, at its own body, and its callers then need none for that type.
 
-The ratchet, for the gate tool's writer: a column `locks_constructed` per crate, the count of
+The ratchet (`scripts/src/bin/ambient/sansio.rs`): a column `locks_constructed` per crate, the count of
 those calls in shipped code by the same rule as the lint, and `locks_without_reason` beside it.
 `locks_constructed` may only fall; `locks_without_reason` falls to 0 and is then held there.
+
+The hold-time lint `blaze::lock_held_across_slow` (not built; its name is registered in
+blaze-lint-defs): a `blaze_core::lock` guard, or a raw one, live across IO (`std::fs`,
+`std::net`, `std::process`, `std::io::{Read, Write}`, blaze-core effects submitted and awaited)
+or across a call that allocates, is a finding. `blaze::held_across_wait` covers a guard held
+across a wait.
 
 ### Every lock in shipped code, and what it becomes
 
@@ -251,8 +220,7 @@ given.
 | `memo.ids`, `memo.alone.held`, `memo.arena.drops` | memo ids; a single-flight's held set; deferred drops | ids: CLAIMED; held: CLAIMED; drops: GATHERED |
 | `h3.tickets`, `http.mailbox.latch` | TLS session tickets; one reply handed over | tickets: Lock (tried GATHERED: a ticket taken by one connection must leave every worker's view; small and rare); mailbox: PUBLISHED |
 | `world.checkout.files`, `scope` `tables`/`made` (`RwLock`) | a checkout's files; the resolver's tables | checkout: GATHERED; resolver tables: CLAIMED, each table PUBLISHED |
-| `stdx.assert.sites`, `profile.hot.marks`, `profile.history.drained` | assertion sites seen; hot-path marks; drained history | GATHERED |
-| blaze-profile's unrecorded locks (`profile.flight.*`, `profile.postmortem.*`, `profile.sampler.*`), ix-prof's (`ixprof.*`, `ix_prof.layer.extra`) | the recorder's rings, owners, samples, postmortem state; ix-prof's session, symbols, maps | rings, samples, owners: GATHERED (a ring per worker, D179's sampler); `*.failed`, `*.stopped`, `recovering`, `kept`, `recovered`, `reader`: PUBLISHED; symbol and image tables: CLAIMED; ix-prof's session and HTTP gate: Lock (tried PUBLISHED: started and stopped by the user while the sampler runs) |
+| `stdx.assert.sites` | assertion sites seen | GATHERED |
 
 ### Corrections to D179's last paragraph, from reading the code
 

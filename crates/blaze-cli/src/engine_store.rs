@@ -1,4 +1,4 @@
-//! The puts of `blaze engine-check` (engine.md E6; "The design" 5): after each phase's merge,
+//! The puts of `blaze engine-check` (end-state.md D157): after each phase's merge,
 //! the records its tasks made go to the store in bulk, sorted by key (rule 25), so the next
 //! phase's tasks read them through the store as the old functions expect (`work::payload`).
 //!
@@ -250,6 +250,8 @@ pub(crate) struct RecordLine {
     /// Payload bytes of this stage's own results still held in its heap or frames after the merge
     /// (excluding the store's shared arena under `Visibility::InArena`).
     pub(crate) results_held: u64,
+    /// Shared arenas pinned past commit (`Lent::kept_arenas`) at the end of this stage.
+    pub(crate) kept_arenas: usize,
     /// Copies of a record's bytes made into this process's memory on the way to the store or
     /// back from it (a joined record, the store's arena), and their bytes.
     pub(crate) copies: u64,
@@ -431,6 +433,7 @@ impl Ledger {
         let results_held = self.results[stage.index()];
         line.results_held = results_held;
         line.held = results_held + store.held_bytes;
+        line.kept_arenas = store.kept_arenas;
         self.seen = store;
         self.memory.merged(stage);
     }

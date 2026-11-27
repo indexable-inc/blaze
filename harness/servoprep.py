@@ -6,7 +6,7 @@
 The checkout is changed in one way: stylo's build script (properties/build.py) writes its
 CSS property documentation into the target directory's `doc/`, outside its OUT_DIR, which a
 sandboxed script may not, so the workspace's manifest takes it out of the sandbox as
-docs/cargo.md says a user does (`unsandboxed-build-scripts`). Its builds need no environment
+a user may do (`unsandboxed-build-scripts`). Its builds need no environment
 of their own.
 """
 import os, sys

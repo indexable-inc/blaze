@@ -1,6 +1,6 @@
 ---
 status: current
-summary: "blaze-shell: blaze's own shell. A nushell-like language (`crates/blaze-sh`, `bstd::sh`: structured values through pipelines, O(1) CoW forkable state, sans-IO, `no_std`, on bstd's owning types) and a native macOS app (`crates/blaze-shell`) that draws values with blaze's own renderer (Metal, blaze-ui's Rust-authored shaders), not a TUI. External programs run on a PTY inside an output block through blaze-vt; full-screen programs take the window. The prompt is Rust in-process and `rust { ... }` / `:rs` cells execute live via `blaze run`."
+summary: "blaze-shell: blaze's own shell. A nushell-like language (`crates/blaze-sh`: structured values through pipelines, O(1) CoW forkable state, sans-IO, `no_std`, on bstd's owning types) and a native macOS app (`crates/blaze-shell`) that draws values with blaze's own renderer (Metal, blaze-ui's Rust-authored shaders), not a TUI. External programs run on a PTY inside an output block through blaze-vt; full-screen programs take the window. The prompt is Rust in-process and `rust { ... }` / `:rs` cells execute live via `blaze run`."
 date: 2026-11-24
 ---
 # sh: blaze's own shell
@@ -23,7 +23,7 @@ keys ─▶ editor (blaze-shell) ─▶ source ─▶ blaze-sh: lex ▸ parse �
 Value ─▶ view (table / record / list / scalar / error / terminal block) ─▶ blaze-ui draw lists ─▶ Metal
 ```
 
-- **`crates/blaze-sh`** (`bstd::sh`, `#![no_std]`, `#![blaze::sans_io]`, `forbid(unsafe_code)`,
+- **`crates/blaze-sh`** (`#![no_std]`, `#![blaze::sans_io]`, `forbid(unsafe_code)`,
   blaze-own allocators). A `Machine` runs one submitted line: `Machine::step() -> Step` returns
   `Step::Done(Value)`, `Step::Need(Request)` (the host answers with `Machine::answer(Answer)`), or
   `Step::Stream(Chunk)` for a pipeline stage that produces incrementally (an external program's
@@ -82,21 +82,15 @@ string passed down a pipeline or bound to a variable is shared, never deep-copie
 
 ## Rust cells
 
-`rust { … }` (or a `:rs` line) is a cell of Rust compiled by the blaze daemon against a session
-crate and loaded into the running app with blaze's live patching (the path harness-native runs
-on, `blaze run -p harness-native`). `$in` arrives as a typed argument (`Value` converts to Rust
-types: a table to a `Vec` of records, a string to a `String`), the cell's result converts back
-to a `Value` and is drawn like any other. Definitions from earlier cells live in the session
-crate, so later cells see them; a fork of the shell state forks the cell list it compiles. It
-needs one thing blaze does not have yet: a daemon entry point that compiles a snippet against a
-live session and hands back a loadable unit. That is written up as its own design before it is
-built (edition.md, "Why it also gives a REPL").
+`rust { … }` (or a `:rs` line) is a cell of Rust run by `blaze run` (blaze-shell rust_cell.rs):
+the app writes one self-contained `.rs` file that re-emits earlier cells' items and binds `$in`
+as JSON; the cell's structured output comes back as a `Value` and is drawn like any other. A fork
+of the shell state forks the cell list (`EngineState::rust_cells`).
 
 ## The app
 
-- **Blocks.** One per submitted line, in `bstd::ecs` (blaze-ecs): `Block { source, prompt, cwd,
-  started, finished, status }` with one of `Value`, `Terminal(blaze_vt::Terminal)` or
-  `Error`. History scrolls; a block's table folds after N rows with a "show all".
+- **Blocks.** One per submitted line (blocks.rs `Block`: source, prompt, the state before and
+  after, timing, exit code). History scrolls; a block's table folds after N rows with a "show all".
 - **Views.** `table`: a header row, columns sized to content (capped), numbers right-aligned,
   sizes and durations formatted, alternate row tint, nested values as `[list 3]`/`{record 2}`
   that expand on click. `record`: key/value two columns. `list` of scalars: one column with
@@ -108,25 +102,13 @@ built (edition.md, "Why it also gives a REPL").
   the lexer.
 - **Prompt.** Computed in Rust before each line: cwd (home as `~`), git branch from
   `.git/HEAD` read directly (no process), duration and status of the last line. Git dirtiness
-  from a background job (gitoxide or a status read on a worker thread), the prompt redrawn when
+  from blaze-git's sans-IO status engine (prompt.rs), the prompt redrawn when
   it lands; never blocks a keystroke.
 - **Drawing.** blaze-ui's Rust-authored shaders (`ui_sdf_*`, `ui_glyph_*`, emitted as MSL), the
   glyph atlas rasterised by CoreText (a BZG1/Slug path later, when blaze has a font encoder).
 - **Terminal API.** `blaze-shell` runs a Unix-domain socket server (`term_server.rs`) for live
   session control and exports `BLAZE_TERM_SOCK` (the socket path) and `BLAZE_TERM_API` (protocol
   version) to child shells; `BLAZE_TERM_STORE` overrides the terminal state store directory.
-
-## Lanes
-
-| lane | files | needs |
-|---|---|---|
-| sh-core | `crates/blaze-sh/src/{value,span,lex,parse,ast,eval,machine,error}.rs` | this doc |
-| sh-builtins | `crates/blaze-sh/src/builtins/*` | sh-core's `Value`, `Machine`, `Request` |
-| app-views | `crates/blaze-shell/src/{view,layout,blocks,editor,prompt}.rs` | `Value` (value.rs, frozen first) |
-| app-host | `crates/blaze-shell/src/{host,pty,main}.rs`: performs requests, runs externals into blaze-vt blocks | `Request`/`Answer` |
-
-`value.rs` and the `Request`/`Answer`/`Step` types are written first and frozen, so the lanes
-build against them in parallel.
 
 ## Tests
 

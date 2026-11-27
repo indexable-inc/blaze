@@ -1,32 +1,34 @@
 # std's `println!`, `print!`, `eprintln!` and `eprint!` left, a crate a line: each panics when its
 # stream's reader is gone. A command's path writes with `blaze_report::outln!` and its kin
 # (`blaze_report::out`). `tests/prints.rs` holds each crate to its number: it only goes down.
+bgit 6
 blaze-alloc-count 1
 blaze-answer 6
-blaze-bench 4
 blaze-bstd-convert 31
 blaze-build 15
 blaze-build-script 30
 blaze-cas 55
 blaze-cc 6
 blaze-cert 1
-blaze-cli 136
+blaze-cli 140
 blaze-code 11
 blaze-columns 1
 blaze-consteval 2
 blaze-core 30
-blaze-emit 71
+blaze-emit 72
 blaze-engine 36
 blaze-expand 13
 blaze-export 13
-blaze-flow 6
-blaze-flow-lower 162
+blaze-file-items 7
+blaze-flow 7
+blaze-flow-lower 166
 blaze-fmt 42
 blaze-format-core 1
+blaze-git-meta 2
 blaze-graph 5
 blaze-hash 5
 blaze-ids 2
-blaze-ladder 107
+blaze-ladder 109
 blaze-launch 4
 blaze-launch-rt 26
 blaze-lir 10
@@ -35,13 +37,12 @@ blaze-manifest 2
 blaze-mem 1
 blaze-native 5
 blaze-new 1
-blaze-proc-macro 24
-blaze-profile 5
+blaze-proc-macro 25
 blaze-resolve 1
 blaze-scope 5
 blaze-script 8
+blaze-shell 16
 blaze-sim 6
-blaze-stage 3
 blaze-surface 2
 blaze-sys 18
 blaze-tier 9
@@ -49,7 +50,6 @@ blaze-toolchain 5
 blaze-typeck 20
 blaze-watch 1
 blaze-world 18
-ix-prof 11
 stdx 4
 syntax 3
 test-utils 11

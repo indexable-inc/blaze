@@ -222,10 +222,20 @@ pub(super) enum Op {
 const _: () = assert!(core::mem::size_of::<Op>() <= 16);
 
 #[derive(Clone, Copy, Debug)]
+pub(super) enum StrKind {
+    /// A thin pointer (`&[u8; N]`).
+    Thin,
+    /// A wide pointer (`&str`, `&[u8]`, `&CStr`): `(ptr, len)`.
+    Wide,
+    /// An array value in memory (`[u8; N]`, `N > 0`).
+    Mem,
+}
+
+#[derive(Clone, Copy, Debug)]
 pub(super) struct StrLit {
     pub(super) at: u32,
     pub(super) len: u32,
-    pub(super) wide: bool,
+    pub(super) kind: StrKind,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -582,6 +592,9 @@ struct Cc<'w, 's> {
     tys: Vec<u32, Alloc<'s>>,
     /// By pattern.
     homes: Vec<Home, Alloc<'s>>,
+    /// Secondary `Pat::Bind` inside a `Pat::Or` -> the first binding of the same name in that
+    /// outermost `Pat::Or` (empty until a `Pat::Or` is met).
+    or_canon: Vec<PatId, Alloc<'s>>,
     /// By pattern: a local whose address is taken, held in memory.
     addressed: &'s [bool],
     /// By register.
@@ -762,6 +775,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 args: args_v,
                 tys: Vec::new_in(self.alloc),
                 homes: Vec::new_in(self.alloc),
+                or_canon: Vec::new_in(self.alloc),
                 addressed: &addressed,
                 kinds: Vec::new_in(self.alloc),
                 tasks: Vec::new_in(self.alloc),
@@ -1527,8 +1541,85 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
         Ok(!matches!(self.repr(t), Ok(Repr::Mem(_)) | Err(_)))
     }
 
+    /// Canonical binding `PatId` for `p`: maps a secondary `Pat::Bind` inside a `Pat::Or`
+    /// to the first binding of the same name within that enclosing outermost `Pat::Or`.
+    fn canon(cc: &Cc<'w, '_>, p: PatId) -> PatId {
+        cc.or_canon.get(p.ix()).copied().unwrap_or(p)
+    }
+
+    /// Maps every secondary `Pat::Bind` inside any `Pat::Or` under `top` to the first binding
+    /// of the same name within its enclosing outermost `Pat::Or` (pre-order, left to right),
+    /// matching Rust's rule that every alternative of an or-pattern binds the same variable.
+    fn record_or_bindings(&self, cc: &mut Cc<'w, '_>, top: PatId) -> R<'a, ()> {
+        let body = cc.typed.body;
+        let mut todo: Vec<PatId, Alloc<'a>> = Vec::new_in(self.alloc);
+        todo.push(top);
+        let push_children = |pat: Pat, out: &mut Vec<PatId, Alloc<'a>>| -> R<'a, ()> {
+            match pat {
+                Pat::Bind { sub: Some(s), .. } => out.push(s),
+                Pat::Ref { inner, .. } => out.push(inner),
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
+                    let ps = body.pat_lists.get(elems.range()).ok_or(malformed("patterns past their column"))?;
+                    for &s in ps.iter().rev() {
+                        out.push(s);
+                    }
+                }
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    let fps = body.field_pats.get(fields.range()).ok_or(malformed("field patterns past their column"))?;
+                    for fp in fps.iter().rev() {
+                        out.push(fp.pat);
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        };
+        let mut steps = 0usize;
+        while let Some(q) = todo.pop() {
+            steps += 1;
+            if steps > body.pats.len() + 1 {
+                return Err(malformed("a cyclic pattern"));
+            }
+            let pat = body.pats.get(q.ix()).copied().ok_or(malformed("a pattern past the body"))?;
+            if matches!(pat, Pat::Or { .. }) {
+                if cc.or_canon.is_empty() {
+                    cc.or_canon.reserve(body.pats.len());
+                    for i in 0..body.pats.len() {
+                        cc.or_canon.push(PatId(u32::try_from(i).map_err(|_| malformed("pattern count past u32"))?));
+                    }
+                }
+                let mut firsts: Vec<(Name, PatId), Alloc<'a>> = Vec::new_in(self.alloc);
+                let mut or_todo: Vec<PatId, Alloc<'a>> = Vec::new_in(self.alloc);
+                or_todo.push(q);
+                let mut or_steps = 0usize;
+                while let Some(oq) = or_todo.pop() {
+                    or_steps += 1;
+                    if or_steps > body.pats.len() + 1 {
+                        return Err(malformed("a cyclic or-pattern"));
+                    }
+                    let opat = body.pats.get(oq.ix()).copied().ok_or(malformed("a pattern past the body"))?;
+                    if let Pat::Bind { name, .. } = opat {
+                        match firsts.iter().find(|&&(n, _)| n == name) {
+                            Some(&(_, first)) => {
+                                if let Some(slot) = cc.or_canon.get_mut(oq.ix()) {
+                                    *slot = first;
+                                }
+                            }
+                            None => firsts.push((name, oq)),
+                        }
+                    }
+                    push_children(opat, &mut or_todo)?;
+                }
+                continue;
+            }
+            push_children(pat, &mut todo)?;
+        }
+        Ok(())
+    }
+
     /// Binding `p`'s home, made when first asked.
     fn home(&mut self, cc: &mut Cc<'w, '_>, code_slots: &mut u32, p: PatId) -> R<'a, Home> {
+        let p = Self::canon(cc, p);
         let h = *cc.homes.get(p.ix()).ok_or(malformed("a pattern past the body"))?;
         if h != Home::None {
             return Ok(h);
@@ -1549,6 +1640,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
 
     /// The place of a memory local, or a restart when it is a register.
     fn local_place<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>, p: PatId) -> R<'a, Reg> {
+        let p = Self::canon(cc, p);
         match self.home(cc, &mut code.slots, p)? {
             Home::Slot(slot) => {
                 let lt = cc.typed.local_ty[p.ix()];
@@ -1613,6 +1705,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
             match cc.typed.body.exprs.get(e.ix())? {
                 Expr::Paren(i) => e = *i,
                 Expr::Local(p) => {
+                    let p = Self::canon(cc, *p);
                     return match cc.homes.get(p.ix())? {
                         Home::Reg(r) => Some(*r),
                         _ => None,
@@ -1673,10 +1766,25 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
             Lit::Char => Val::Int(u64::from(lit::char(src).map_err(Refusal::Literal)?)),
             Lit::Str | Lit::ByteStr(_) => {
                 let bytes = lit::bytes(src, self.alloc).map_err(Refusal::Literal)?;
+                let kind = if matches!(l, Lit::Str) {
+                    StrKind::Wide
+                } else {
+                    match node {
+                        PNode::Ref(_, inner) if matches!(self.node(inner)?, PNode::Slice(_)) => StrKind::Wide,
+                        PNode::Array(..) => {
+                            if bytes.is_empty() {
+                                self.emit(code, cc, Op::ImmZst { dst });
+                                return Ok(dst);
+                            }
+                            StrKind::Mem
+                        }
+                        _ => StrKind::Thin,
+                    }
+                };
                 let at = code.bytes.len() as u32;
                 code.bytes.extend_from_slice(&bytes);
                 let k = code.strs.len() as u32;
-                code.strs.push(StrLit { at, len: bytes.len() as u32, wide: matches!(l, Lit::Str) });
+                code.strs.push(StrLit { at, len: bytes.len() as u32, kind });
                 self.emit(code, cc, Op::Str { dst, k });
                 return Ok(dst);
             }
@@ -1687,7 +1795,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
                 let at = code.bytes.len() as u32;
                 code.bytes.extend_from_slice(&bytes);
                 let k = code.strs.len() as u32;
-                code.strs.push(StrLit { at, len: bytes.len() as u32, wide: true });
+                code.strs.push(StrLit { at, len: bytes.len() as u32, kind: StrKind::Wide });
                 self.emit(code, cc, Op::Str { dst, k });
                 return Ok(dst);
             }
@@ -3069,6 +3177,7 @@ impl<'w, 'l, 'g, 't, 'wk, 'a, W: ConstWorld, L: Layout, K: Allocator + Copy> Mac
     /// bindings; a mismatch jumps to fixup list `fail`. An explicit work list; an or-pattern
     /// tries its alternatives in order, the first that matches binds.
     fn pattern<A: Allocator + Clone>(&mut self, cc: &mut Cc<'w, '_>, code: &mut Code<A>, top: PatId, place: Reg, ty: PTy, fail: u32) -> R<'a, ()> {
+        self.record_or_bindings(cc, top)?;
         let typed = cc.typed;
         let body = typed.body;
         let mut work: Vec<P, Alloc<'a>> = Vec::new_in(self.alloc);

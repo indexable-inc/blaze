@@ -1,7 +1,6 @@
 # The Python files left (docs/v2/plan/design/scripts.md). `blaze run -q -p scripts --bin docs --
 # check` fails for a .py file that is not here; `... --bin docs -- write` takes out the lines whose
 # file is gone and never adds one. A new script is written in Rust.
-.github/scripts/explore_page.py
 .github/scripts/land.py
 .github/scripts/llvm.py
 .github/scripts/r2.py
@@ -14,10 +13,6 @@ docs/brand/fire/gen.py
 docs/brand/fire/icon.py
 harness/answers.py
 harness/appruns.py
-harness/benchcharts.py
-harness/benchhistory.py
-harness/benchplatforms.py
-harness/benchreport.py
 harness/bunprep.py
 harness/counters.py
 harness/failures.py
@@ -26,7 +21,6 @@ harness/imports.py
 harness/library.py
 harness/memory.py
 harness/nightly_features.py
-harness/profile_fixtures.py
 harness/servoprep.py
 harness/smoke.py
 harness/toolchain_bump.py
@@ -50,13 +44,10 @@ site/flecs/build.py
 site/renderer/build.py
 site/renderer/fetch.py
 tools/astlog/scan.py
-tools/bench/remote-cache/cas_v1.py
-tools/bench/remote-cache/gateway_v0.py
 tools/cpus.py
 tools/nix/life_launch.py
 tools/nix/unit_build.py
 tools/nix/unit_graph.py
-tools/remote-cache/smoke.py
 tools/typed-input/src/typed_input/__init__.py
 tools/unicode/casefold.py
 tools/v2/ast_views.py

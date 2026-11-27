@@ -1,4 +1,4 @@
-//! What did not run, grouped by the failure that stopped it (drive.md, D115 ruling (6)).
+//! What did not run, grouped by the failure that stopped it (drive.md, D115).
 //!
 //! A task that failed `Why::Waited { on }` names only the need that stopped it directly. The
 //! answer says what was not checked by CAUSE: each waited task is put under the first task down

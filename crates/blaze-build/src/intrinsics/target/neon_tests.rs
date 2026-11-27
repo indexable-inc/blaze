@@ -125,19 +125,53 @@ fn every_neon_name_round_trips() {
         }
         seen += 1;
     }
-    assert_eq!(seen, 46);
+    assert_eq!(seen, 64);
     let tbl = call("llvm.aarch64.neon.tbl1.v16i8");
     assert_eq!((tbl.func(), tbl.shape()), (NeonFn::Tbl1, IntShape::V16I8));
     let tbx = call("llvm.aarch64.neon.tbx1.v16i8");
     assert_eq!((tbx.func(), tbx.shape()), (NeonFn::Tbx1, IntShape::V16I8));
     let tbl2 = call("llvm.aarch64.neon.tbl2.v16i8");
     assert_eq!((tbl2.func(), tbl2.shape()), (NeonFn::Tbl2, IntShape::V16I8));
+    let tbl3 = call("llvm.aarch64.neon.tbl3.v16i8");
+    assert_eq!((tbl3.func(), tbl3.shape()), (NeonFn::Tbl3, IntShape::V16I8));
+    let tbl4 = call("llvm.aarch64.neon.tbl4.v16i8");
+    assert_eq!((tbl4.func(), tbl4.shape()), (NeonFn::Tbl4, IntShape::V16I8));
+    let tbx4 = call("llvm.aarch64.neon.tbx4.v16i8");
+    assert_eq!((tbx4.func(), tbx4.shape()), (NeonFn::Tbx4, IntShape::V16I8));
     let ushl = call("llvm.aarch64.neon.ushl.v2i64");
     assert_eq!((ushl.func(), ushl.shape(), ushl.shape().lanes(), ushl.shape().width()), (NeonFn::Ushl, IntShape::V2I64, 2, 64));
     let refused = named("llvm.aarch64.neon.tbl1.v4i16").expect_err("tbl1 is declared at v8i8 and v16i8 only");
     assert_eq!(refused.to_string(), "`llvm.aarch64.neon.tbl1.v4i16` is not a target intrinsic blaze knows");
-    assert!(named("llvm.aarch64.neon.tbl3.v16i8").is_err(), "a three-register table is not in the set");
+    assert!(named("llvm.aarch64.neon.tbl5.v16i8").is_err(), "A64 has no five-register table lookup");
     println!("{seen} NEON names, each its own; llvm.aarch64.neon.tbl1.v4i16 refused");
+}
+
+#[test]
+fn tbl3_tbl4_and_tbx2_to_tbx4_lookup_every_slice_and_boundary() {
+    let t0: [u8; 16] = core::array::from_fn(|i| 10 + i as u8);
+    let t1: [u8; 16] = core::array::from_fn(|i| 30 + i as u8);
+    let t2: [u8; 16] = core::array::from_fn(|i| 50 + i as u8);
+    let t3: [u8; 16] = core::array::from_fn(|i| 70 + i as u8);
+    let def: [u8; 16] = [0xAA; 16];
+    let idx: [u8; 16] = [0, 15, 16, 31, 32, 47, 48, 63, 64, 65, 128, 200, 240, 254, 255, 5];
+
+    let got_tbl3 = run_ops(call("llvm.aarch64.neon.tbl3.v16i8"), &[t0, t1, t2, idx]);
+    assert_eq!(got_tbl3, [10, 25, 30, 45, 50, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15]);
+
+    let got_tbl4 = run_ops(call("llvm.aarch64.neon.tbl4.v16i8"), &[t0, t1, t2, t3, idx]);
+    assert_eq!(got_tbl4, [10, 25, 30, 45, 50, 65, 70, 85, 0, 0, 0, 0, 0, 0, 0, 15]);
+
+    let got_tbx2 = run_ops(call("llvm.aarch64.neon.tbx2.v16i8"), &[def, t0, t1, idx]);
+    assert_eq!(got_tbx2, [10, 25, 30, 45, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 15]);
+
+    let got_tbx3 = run_ops(call("llvm.aarch64.neon.tbx3.v16i8"), &[def, t0, t1, t2, idx]);
+    assert_eq!(got_tbx3, [10, 25, 30, 45, 50, 65, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 15]);
+
+    let got_tbx4 = run_ops(call("llvm.aarch64.neon.tbx4.v16i8"), &[def, t0, t1, t2, t3, idx]);
+    assert_eq!(got_tbx4, [10, 25, 30, 45, 50, 65, 70, 85, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 15]);
+
+    let got_tbl4_8 = run_ops(call("llvm.aarch64.neon.tbl4.v8i8"), &[t0, t1, t2, t3, idx]);
+    assert_eq!(got_tbl4_8, [10, 25, 30, 45, 50, 65, 70, 85, 0, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 /// `tbl1` gives 0 for indices 16, 255 and 128 (a build that masks the index to the table, as
@@ -256,4 +290,60 @@ fn table_lookup_ext_and_two_register_table() {
 
     let tbl2_8 = run_ops(call("llvm.aarch64.neon.tbl2.v8i8"), &[table0, table1, index]);
     assert_eq!(tbl2_8, [10, 25, 50, 0, 13, 51, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
+fn sqdmulh_and_sqrdmulh_match_arm_saturation_and_rounding() {
+    let ref_op = |a: i128, b: i128, bits: u32, round: bool| -> i128 {
+        let mut prod = 2 * a * b;
+        if round {
+            prod += 1i128 << (bits - 1);
+        }
+        let shifted = prod.div_euclid(1i128 << bits);
+        let max = (1i128 << (bits - 1)) - 1;
+        let min = -(1i128 << (bits - 1));
+        shifted.clamp(min, max)
+    };
+
+    // 32-bit lanes (`v2i32`, `v4i32`), including `i32::MIN * i32::MIN` saturation and rounding ties.
+    let a32: [i32; 4] = [i32::MIN, i32::MIN, i32::MAX, -1];
+    let b32: [i32; 4] = [i32::MIN, i32::MAX, i32::MAX, 0x4000_0000];
+    let mut a32_b = [0u8; 16];
+    let mut b32_b = [0u8; 16];
+    for i in 0..4 {
+        a32_b[i * 4..i * 4 + 4].copy_from_slice(&a32[i].to_le_bytes());
+        b32_b[i * 4..i * 4 + 4].copy_from_slice(&b32[i].to_le_bytes());
+    }
+    for (prefix, round) in [("sqdmulh", false), ("sqrdmulh", true)] {
+        for (shape, lanes) in [("v2i32", 2usize), ("v4i32", 4usize)] {
+            let name = format!("llvm.aarch64.neon.{prefix}.{shape}");
+            let got = run(call(&name), a32_b, b32_b);
+            for i in 0..lanes {
+                let g = i32::from_le_bytes(got[i * 4..i * 4 + 4].try_into().unwrap());
+                let w = ref_op(i128::from(a32[i]), i128::from(b32[i]), 32, round) as i32;
+                assert_eq!(g, w, "{name} lane {i}");
+            }
+        }
+    }
+
+    // 16-bit lanes (`v4i16`, `v8i16`).
+    let a16: [i16; 8] = [i16::MIN, i16::MIN, i16::MAX, -1, 12345, -23456, 0, 16384];
+    let b16: [i16; 8] = [i16::MIN, i16::MAX, i16::MAX, 16384, -9876, -11111, 32767, 16384];
+    let mut a16_b = [0u8; 16];
+    let mut b16_b = [0u8; 16];
+    for i in 0..8 {
+        a16_b[i * 2..i * 2 + 2].copy_from_slice(&a16[i].to_le_bytes());
+        b16_b[i * 2..i * 2 + 2].copy_from_slice(&b16[i].to_le_bytes());
+    }
+    for (prefix, round) in [("sqdmulh", false), ("sqrdmulh", true)] {
+        for (shape, lanes) in [("v4i16", 4usize), ("v8i16", 8usize)] {
+            let name = format!("llvm.aarch64.neon.{prefix}.{shape}");
+            let got = run(call(&name), a16_b, b16_b);
+            for i in 0..lanes {
+                let g = i16::from_le_bytes(got[i * 2..i * 2 + 2].try_into().unwrap());
+                let w = ref_op(i128::from(a16[i]), i128::from(b16[i]), 16, round) as i16;
+                assert_eq!(g, w, "{name} lane {i}");
+            }
+        }
+    }
 }

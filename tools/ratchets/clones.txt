@@ -33,7 +33,6 @@ blaze-file-items	6
 blaze-flow	12
 blaze-flow-lower	3
 blaze-fmt	72
-blaze-format-tiers	1
 blaze-fuzz	1
 blaze-git-fetch	13
 blaze-glob	19
@@ -62,15 +61,12 @@ blaze-memo-macros	51
 blaze-native	1
 blaze-new	7
 blaze-own	93
-blaze-pack	1
 blaze-pg	2
 blaze-proc-macro	83
 blaze-producers	13
-blaze-profile	118
 blaze-protocol	10
 blaze-radix	5
 blaze-real	46
-blaze-rel	7
 blaze-remote	51
 blaze-report	1
 blaze-resolve	68
@@ -80,7 +76,7 @@ blaze-script	50
 blaze-semver	12
 blaze-sh	22
 blaze-sha256	1
-blaze-shell	308
+blaze-shell	309
 blaze-sim	24
 blaze-solve	24
 blaze-sort	3
@@ -91,7 +87,6 @@ blaze-std	408
 blaze-surface	1
 blaze-swiss	3
 blaze-tar	13
-blaze-test-reach	13
 blaze-toml	19
 blaze-trace	2
 blaze-typeck	20
@@ -122,7 +117,6 @@ harness/harness-native-ui-view	5
 harness/harness-proto	10
 harness/harness-video	1
 harness/harness-vt	6
-ix-prof	70
 parser	14
 rustc_abi	4
 rustc_lexer	3

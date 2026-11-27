@@ -1,4 +1,4 @@
-//! THE READ-ONLY VIEW a task's checker asks (engine.md, E2): [`Tables`], `Copy`, answering
+//! THE READ-ONLY VIEW a task's checker asks (end-state.md D157): [`Tables`], `Copy`, answering
 //! [`NamesSource`] (and [`BodySource`]) from each crate's records ([`source::Records`]), each
 //! answer's cells put in the task's recorder ([`ReadSink`]) as it is asked.
 //!
@@ -300,6 +300,10 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
 
     fn traits_in_scope<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
         self.records.traits_in_scope_logged(&NamesInto(self.reads), module, alloc)
+    }
+
+    fn traits_exported<'b>(self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        self.records.traits_exported_logged(&NamesInto(self.reads), module, alloc)
     }
 
     fn variants(self, owner: ItemKey) -> Option<source::VariantRows<'n>> {
@@ -622,6 +626,18 @@ impl<'n> NamesSource<'n> for Tables<'_, 'n> {
     fn attr_value(self, key: ItemKey, attr: &'static str) -> Option<Option<blaze_scope::attr_values::RowValue<'n>>> {
         self.item(key);
         self.records.attr_value(key, attr)
+    }
+
+    /// The item's `Item` cell (or, for a body-local item with no items row, its enclosing
+    /// module's `Item` cell): `item_digest` covers both `ItemIdentity::sans_io` and
+    /// `ModuleRow::sans_io`, so checking `#![blaze::sans_io]` scope never touches
+    /// `NameCell::Whole { section: Items }`.
+    fn in_sans_io_scope(self, key: ItemKey, module: ItemKey) -> bool {
+        self.item(key);
+        if self.records.kind_of_item(key).is_none() {
+            self.item(module);
+        }
+        self.records.in_sans_io_scope(key, module)
     }
 
     /// The trait's `Members` cell: the member rows hold each associated type's count (D155).

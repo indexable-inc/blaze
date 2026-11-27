@@ -3123,7 +3123,22 @@ impl<'c> Launched<'c, '_, '_> {
                 Err(cause) => return Err(test_parent_error_places(&mut *sc, cause)),
             }
         };
-        let mut codes = HomeCodeStore::new(self.lent);
+        struct FlushCodes<'m, 's, 'h> {
+            codes: HomeCodeStore<'m, bstd::io::LentDriver>,
+            suite_cache: &'s RefCell<suite_cache::SuiteCache<'h>>,
+        }
+        impl Drop for FlushCodes<'_, '_, '_> {
+            fn drop(&mut self) {
+                let _ = self.codes.ensure_persisted();
+                if let Ok(mut sc) = self.suite_cache.try_borrow_mut() {
+                    let reached = self.codes.reached();
+                    let toolchain_made = self.codes.toolchain_made();
+                    sc.record_code_keys(reached.as_slice(), toolchain_made.as_slice());
+                }
+            }
+        }
+        let mut codes_guard = FlushCodes { codes: HomeCodeStore::new(self.lent), suite_cache: self.suite_cache };
+        let codes = &mut codes_guard.codes;
         // Its place in the relay, told its end however the run ends (D194).
         let child = Child(self.child_base + usize::try_from(row).unwrap_or(0));
         let _asking = self.codes.map(|code| Asking { code, child });
@@ -3308,7 +3323,7 @@ impl<'c> Launched<'c, '_, '_> {
         let stderr_pipe = given.stderr.ok_or(OneError::MissingPipe { stream: "stderr" })?;
         let mut pipes = [Some(stdout), Some(stderr_pipe)];
         let mut relay = Relay::new(GRACE);
-        let mut inbox = run_parent::wire_out(alloc);
+        let mut inbox = blaze_own::Vec::new_in(alloc);
         let mut reply = ahead;
         let mut reply_at = 0usize;
         let mut write_since: Option<Duration> = None;
@@ -3364,7 +3379,7 @@ impl<'c> Launched<'c, '_, '_> {
                                 park.epoch,
                                 entry,
                                 self.ids,
-                                &mut codes,
+                                &mut *codes,
                                 cx,
                                 self.watch,
                             ) {
@@ -3516,7 +3531,7 @@ impl<'c> Launched<'c, '_, '_> {
                         test_entry,
                         code_mode,
                         self.ids,
-                        &mut codes,
+                        &mut *codes,
                         cx,
                         self.watch,
                         &mut tally,
@@ -3769,7 +3784,7 @@ impl<'c> Launched<'c, '_, '_> {
         published: usize,
         needs: &Needs<'_>,
         over: &mut Option<bstd::procs::ServedEnd>,
-        inbox: &mut run_parent::WireOut<Alloc<'_>>,
+        inbox: &mut blaze_own::AVec<'_, u8>,
         mut torn: Option<ProcError>,
         frame: &Frame,
         places: &mut P,
@@ -5019,9 +5034,12 @@ fn run_dirty<'a, 'r, 'm, 'h, D: blaze_core::Driver>(
     for (index, sc) in suite_caches.iter().enumerate() {
         let Some(sc) = sc.as_ref() else { continue };
         let sc = sc.borrow();
+        let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
         if sc.verified_dirty() {
-            let suite_id = SuiteId(u32::try_from(index).map_err(|_| DriveError::TooManyRows { count: suites.len() })?);
             cache.record_verified(suite_id, sc.verified_closed_pairs(), sc.verified_workspace_pairs());
+        }
+        if sc.code_keys_dirty() {
+            cache.record_code_keys(suite_id, sc.reached_code_keys(), sc.toolchain_code_keys());
         }
     }
     Ok(status)

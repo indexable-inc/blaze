@@ -1,6 +1,6 @@
 [package]
 name = "blaze-id"
-description = "An item's identity: its portable key, the `Portable` bound that keeps snapshot-local ids out of records and long-lived tables, and the two ways between an id and its key (docs/v2/plan/design/identity.md)"
+description = "An item's identity: its portable key, the `Portable` bound that keeps snapshot-local ids out of records and long-lived tables, and the two ways between an id and its key (docs/v2/plan/design/bottom.md section 3)"
 publish = false
 
 version.workspace = true

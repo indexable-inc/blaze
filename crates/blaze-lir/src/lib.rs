@@ -5,7 +5,7 @@
 //!
 //! # Encoding
 //!
-//! A function ([`Func`]) is columns, Zig's tag plus one word ([docs/v2/plan/design/data.md]):
+//! A function ([`Func`]) is columns, Zig's tag plus one word ([docs/v2/plan/design/bottom.md] section 13):
 //! per instruction an [`Op`] (`ops`, a byte), its [`Flags`] (`flags`, a byte), its result
 //! type ([`Ty`], `tys`, two bytes) and one word (`data`): an operand, an immediate, or where
 //! its operands start in `extra`. Cold per-instruction columns sit apart: the memory-attribute

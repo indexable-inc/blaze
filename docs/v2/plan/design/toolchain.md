@@ -1,7 +1,6 @@
 ---
-status: plan
-summary: How blaze gives every crate its standard libraries with nothing in the manifest. The toolchain is records: one source pack per crate (core, alloc, std and what they are built from, bstd and the crates beneath it) in blaze-fetch's pack form, listed by one manifest record whose digest the binary is built with and the units record's key holds. An installed blaze finds them on a per-user read-only shelf, verified when opened; the implicit dependencies are one rule in blaze-unit-graph; a blaze-edition manifest that still names bstd gets a finding with its fix.
-date: 2026-11-16
+status: current
+summary: How blaze gives every crate its standard libraries with nothing in the manifest. The toolchain is records (crates/blaze-toolchain): one source pack per crate (core, alloc, std and what they are built from, bstd and the crates beneath it) in blaze-fetch's pack form, listed by one manifest record whose id is `crates/blaze-toolchain/PINNED`, cut by scripts/src/bin/toolchain_cut.rs. blaze reads them from a per-user read-only shelf, `<home>/.blaze/v2/toolchain/`, verified when opened (crates/blaze-cli/src/toolchain.rs); the implicit dependencies are one rule, blaze-unit-graph `implicit`; a blaze-edition manifest that still names bstd gets Cli rule 9 with its fix.
 ---
 # The toolchain as records
 
@@ -30,7 +29,8 @@ from is this page; what they are given to is blaze-unit-graph's.
   them (`ToolchainView::cfg`; a reader needs no rustc answers of its own). Its footer is the BLAKE3 of its bytes: the **toolchain
   id**. Two cuts of one tree write equal bytes (rule 25).
 - **Made by a tool** with one typed JSON input (scripts.md, tier 0's input form):
-  `blaze-toolchain {"tree": .., "targets": [..], "registry": .., "shelf": .., "write_pin": true}`
+  `toolchain_cut {"tree": .., "targets": [..], "registry": .., "shelf": .., "write_pin": true}`
+  (scripts/src/bin/toolchain_cut.rs)
   cuts the packs, writes the manifest, places them on the shelf, and writes the id as 64 hex
   digits to `crates/blaze-toolchain/PINNED` (data, not Rust). `"check"` instead recomputes the
   id and fails when `PINNED` differs: the gate's row.
@@ -50,24 +50,21 @@ digest: the manifest and every pack. Read-only to a build. Decided against the o
   is no place for 100 MB of data;
 - *the checkout's store* (`.blaze/v2/records`): one copy per project, not per user;
 - *the shared cache*: no bucket exists, and a private build must work offline. It is designed
-  as a way to fill the shelf, never a build's dependency: `blaze toolchain fetch <id>`, started
+  as an option to fill the shelf, off unless chosen and never a build's dependency: `blaze toolchain fetch <id>`, started
   in the shelf (its start folder, the only place it writes), reads the manifest and each pack by
   digest through blaze-remote's read path, verifies each as `open` does, and publishes it.
 
 The home is a driver fact: `main` reads `HOME` at the edge, beside `PWD`, and the shelf is
-reached through bstd's read-only `Fs::ancestor` (the nearest folder above the start that holds
-it), or under `Fs::root` when the shelf lies beneath the start folder (blaze-cli `toolchain.rs`).
-Above the start it is confined by convention: every read is under the shelf's prefix and every
-name is 64 hex digits. Confining it by type needs a bstd `Ancestor::folder` giving a read-only
-folder handle; that is bstd's lane. Neither the path nor the home enters a
-key or a record. Two blaze versions coexist: two ids, two manifests, shared packs. `~/.blaze`'s
+reached through bstd's home capability, `Fs::home`, as a read-only folder handle on the shelf
+(`crates/blaze-cli/src/toolchain.rs`, `HomeShelf`); every name read is 64 hex digits. Neither the
+path nor the home enters a key or a record. Two blaze versions coexist: two ids, two manifests, shared packs. `~/.blaze`'s
 other folders and `~/.cache/blaze` are the old blaze's and are never read.
 
 **Opening** (`blaze_toolchain::shelf`, sans-IO over a `Shelf` trait the cli implements):
 the manifest by its id, held to 4 MiB before it is read, its footer compared with the pinned
 id; a pack only when a task needs a toolchain crate's text (a miss of its records), its length
 compared with the manifest's before a byte is read, then `PackView::open`. Verified once per
-command that opens it; once per boot is later work (memory-and-data's rule). Absent or other
+command that opens it. Absent or other
 bytes is `ToolchainError` naming the id or the crate, the digest and the folder looked in.
 Never rustup, a path, `RUSTC` or another version (rules 3, 8).
 
@@ -102,11 +99,9 @@ every reader once.
 A blaze-edition member whose `[dependencies]` or `[dev-dependencies]` names `bstd` or the package
 `blaze-std` gets Cli rule 9, `toolchain-crate-named`, an error over the whole line including
 its newline: the line shadows the toolchain's bstd and can silently be another version. Its
-fix deletes the line. The new layer has no `--fix` yet, so the fix is drawn as a preview with
-"by hand for now" and is not counted as fixable. A Rust-edition package that names bstd keeps
+fix deletes the line (crates/blaze-report/src/frame/words.rs). A Rust-edition package that names bstd keeps
 its line.
 
 ## Install
 
-`install-blaze.sh` runs the tool first (it writes `PINNED` and fills the shelf), then builds and
-copies the binary. Nothing else is placed; a removed shelf file is reported by name.
+`toolchain_cut` writes `PINNED` and fills the shelf. A removed shelf file is reported by name.

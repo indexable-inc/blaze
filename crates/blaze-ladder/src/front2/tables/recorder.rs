@@ -1,4 +1,4 @@
-//! The per-task recorder of every read (engine.md, E2): ONE list a task fills while it runs,
+//! The per-task recorder of every read (end-state.md D157): ONE list a task fills while it runs,
 //! of the names cells its walks and rows consulted (lane CELL's [`NameCell`], put through
 //! [`CellSink`]; a crate's lang rows are one, [`NameCell::Lang`]), the heads it read and the impl buckets it read. The
 //! list is sorted and deduplicated ONCE, when the task ends ([`Recorder::finish`], rule 25):

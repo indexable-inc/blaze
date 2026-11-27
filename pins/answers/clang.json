@@ -667,6 +667,192 @@
       }
     },
     {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-Wbad-function-cast",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-Wno-unused-value",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-fvisibility=hidden",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-std=c11",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-Wshadow",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=arm64-apple-macosx",
+        "-mmacosx-version-min=11.0",
+        "-Wall",
+        "-Wextra",
+        "-Wno-incompatible-pointer-types",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "11.0"
+      },
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
       "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
       "program": "cc",
       "args": [
@@ -1356,6 +1542,62 @@
         "-Wall",
         "-Wextra",
         "-std=c11",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wshadow",
+        "-Wno-unused-command-line-argument",
+        "-o",
+        "$OUT0",
+        "-c",
+        "$IN0.c"
+      ],
+      "env": {},
+      "files": {
+        "$IN0.c": "65d2fad425e300ae19bd229a513aa7564086a7f0feb9405f806c70b2366ad59a"
+      },
+      "answer": {
+        "code": 0,
+        "stdout": "",
+        "stderr": ""
+      }
+    },
+    {
+      "clang": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91",
+      "program": "cc",
+      "args": [
+        "-O0",
+        "-ffunction-sections",
+        "-fdata-sections",
+        "-fPIC",
+        "--target=aarch64-unknown-linux-gnu",
+        "-Wall",
+        "-Wextra",
+        "-Wno-incompatible-pointer-types",
         "-Wno-unused-command-line-argument",
         "-o",
         "$OUT0",

@@ -1757,3 +1757,206 @@ pub extern \"C-unwind\" fn main() -> i32 {
         42,
     );
 }
+
+// (i) `Clone::clone_from` on language-given `Clone` types (tuples, closures, fn items, fn
+// pointers): `Clone::clone_from` has a real default body (`*self = source.clone()`) in `core`.
+// Resolving it to the trait's own `clone_from` compiles that body at `[Self]`, whose inner
+// `source.clone()` hits the existing builtin clone shim, while leaving explicit `impl Clone`
+// overrides untouched.
+
+const CLONE_WITH_FROM: &str = "
+#[lang = \"clone\"]
+trait Clone: Sized {
+    fn clone(&self) -> Self;
+    fn clone_from(&mut self, source: &Self) {
+        *self = source.clone();
+    }
+}
+
+impl Clone for u32 {
+    fn clone(&self) -> u32 { *self }
+}
+
+impl Clone for u8 {
+    fn clone(&self) -> u8 { *self }
+}
+";
+
+/// `SpecFill::spec_fill` shape: generic `fill_slice<T: Clone>` calling `el.clone_from(&value)`
+/// on a slice of `(u32, u32)` tuples (`phf_macros 0.14.0`).
+#[test]
+fn clone_from_slice_fill_on_copy_tuples() {
+    row(
+        "clone_from slice fill on copy tuples",
+        &format!(
+            "{CLONE_WITH_FROM}
+#[lang = \"panic_bounds_check\"]
+fn panic_bounds_check(_index: usize, _len: usize) -> ! {{ loop {{}} }}
+
+fn fill_slice<T: Clone>(slice: &mut [T], len: usize, value: T) {{
+    let mut i: usize = 0;
+    while i < len {{
+        slice[i].clone_from(&value);
+        i = i + 1;
+    }}
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let mut arr: [(u32, u32); 3] = [(1, 2), (3, 4), (5, 6)];
+    fill_slice(&mut arr, 3, (10, 4));
+    // 3 * (10 + 4) = 42
+    (arr[0].0 + arr[0].1 + arr[1].0 + arr[1].1 + arr[2].0 + arr[2].1) as i32
+}}
+"
+        ),
+        42,
+    );
+}
+
+/// `Clone::clone_from` on a tuple containing a non-`Copy` `Drop` element: `*self = source.clone()`
+/// must BOTH drop the overwritten old field AND run the field's `Clone::clone`.
+#[test]
+fn clone_from_tuple_with_drop_field() {
+    row(
+        "clone_from tuple with drop field",
+        &format!(
+            "{CLONE_WITH_FROM}
+#[lang = \"drop\"]
+trait Drop {{
+    fn drop(&mut self);
+}}
+
+#[lang = \"drop_in_place\"]
+unsafe fn drop_in_place<T: PointeeSized>(to_drop: *mut T) {{
+    unsafe {{ drop_in_place(to_drop) }}
+}}
+
+static mut DROPPED: u32 = 0;
+
+struct Tracked(u32);
+
+impl Clone for Tracked {{
+    fn clone(&self) -> Tracked {{
+        Tracked(self.0 + 1)
+    }}
+}}
+
+impl Drop for Tracked {{
+    fn drop(&mut self) {{
+        unsafe {{ DROPPED = DROPPED + self.0; }}
+    }}
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let mut dst = (Tracked(10), 1u32);
+    let src = (Tracked(20), 11u32);
+    dst.clone_from(&src);
+    // Old dst.0 (10) was dropped during `*self = source.clone()`; dst is now (Tracked(21), 11).
+    let d = unsafe {{ DROPPED }};
+    // 10 + 21 + 11 = 42
+    (d + dst.0.0 + dst.1) as i32
+}}
+"
+        ),
+        42,
+    );
+}
+
+/// `Clone::clone_from` on a closure, fn pointer, fn item, fn-pointer reification of
+/// `Clone::clone_from::<(u32, u32)>`, and passing `Clone::clone_from` as an `Fn` item.
+#[test]
+fn clone_from_closure_fn_ptr_fn_item_and_reify() {
+    row(
+        "clone_from closure, fn ptr, fn item, and reification",
+        &format!(
+            "{CLONE_WITH_FROM}{COUNT}
+fn read(c: &Count) -> u8 {{ c.0 }}
+
+fn apply_cf<F: Fn(&mut (u32, u32), &(u32, u32))>(f: F, dst: &mut (u32, u32), src: &(u32, u32)) {{
+    f(dst, src);
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    // 1. Closure capturing non-Copy Count
+    let c = Count(5);
+    let mut clo_dst = move || read(&c);
+    let clo_src = Clone::clone(&clo_dst); // Count(6)
+    clo_dst.clone_from(&clo_src);         // Count(7)
+    let v_clo = clo_dst() as u32;         // 7
+
+    // 2. Fn pointer
+    let mut fp_dst: fn(u8) -> u8 = double;
+    let fp_src: fn(u8) -> u8 = triple;
+    fp_dst.clone_from(&fp_src);
+    let v_fp = fp_dst(3) as u32;          // 9
+
+    // 3. Fn item (ZST)
+    let mut fi_dst = add3;
+    let fi_src = add3;
+    fi_dst.clone_from(&fi_src);
+    let v_fi = fi_dst(3) as u32;          // 6
+
+    // 4. Fn-pointer reification of Clone::clone_from::<(u32, u32)>
+    let reified: fn(&mut (u32, u32), &(u32, u32)) = Clone::clone_from;
+    let mut p1 = (0u32, 0u32);
+    let p_src = (4u32, 6u32);
+    reified(&mut p1, &p_src);             // 4 + 6 = 10
+
+    // 5. Fn-item passed to generic Fn caller
+    let mut p2 = (0u32, 0u32);
+    apply_cf(Clone::clone_from, &mut p2, &p_src); // 4 + 6 = 10
+
+    // 7 + 9 + 6 + 10 + 10 = 42
+    (v_clo + v_fp + v_fi + p1.0 + p1.1 + p2.0 + p2.1) as i32
+}}
+"
+        ),
+        42,
+    );
+}
+
+/// Negative / override control: a struct with an explicit `impl Clone` overriding `clone_from`
+/// must still run its custom `clone_from` (directly, through a generic caller, and via
+/// fn-pointer reification), never the default `*self = source.clone()`.
+#[test]
+fn clone_from_explicit_override_wins() {
+    row(
+        "clone_from explicit override wins",
+        &format!(
+            "{CLONE_WITH_FROM}
+struct Over(u32);
+
+impl Clone for Over {{
+    fn clone(&self) -> Over {{
+        Over(self.0 + 1)
+    }}
+    fn clone_from(&mut self, source: &Over) {{
+        self.0 = source.0 + 10;
+    }}
+}}
+
+fn generic_cf<T: Clone>(dst: &mut T, src: &T) {{
+    dst.clone_from(src);
+}}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {{
+    let src = Over(4);
+    let mut a = Over(0);
+    a.clone_from(&src);                                 // 14
+    let mut b = Over(0);
+    generic_cf(&mut b, &src);                           // 14
+    let mut c = Over(0);
+    let f: fn(&mut Over, &Over) = Clone::clone_from;
+    f(&mut c, &src);                                    // 14
+    // 14 + 14 + 14 = 42 (default clone_from would give 5 + 5 + 5 = 15)
+    (a.0 + b.0 + c.0) as i32
+}}
+"
+        ),
+        42,
+    );
+}

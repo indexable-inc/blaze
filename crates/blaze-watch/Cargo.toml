@@ -15,7 +15,7 @@ doctest = false
 
 # Zero third-party crates, and no crate of this workspace that has any: every collection is
 # blaze-own's. The deterministic CBOR is blaze-cbor, named here as `cbor` (its one home,
-# rule 30; blaze-pack takes it from there too).
+# rule 30).
 [dependencies]
 blaze-cbor.workspace = true
 blaze-own.workspace = true

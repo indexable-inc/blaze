@@ -5,7 +5,7 @@ handle `ast` it mirrors (`crates/syntax/src/ast/generated/{nodes,tokens}.rs`): e
 Input: `{"root": "<workspace>"}`, with `"check": true` to write nothing and exit 1 when the views
 on disk differ from what would be written. Refuses (exit 2, naming it) any item of the handle
 files it doesn't know how to mirror, so nothing is dropped. Only while both exist: once the
-handles are deleted (frontend.md item 16), the views are the generated files.
+handles are deleted (bottom.md), the views are the generated files.
 """
 
 import re

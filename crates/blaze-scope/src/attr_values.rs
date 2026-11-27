@@ -319,6 +319,7 @@ impl<'a> ValueWorld<'_, '_, 'a> {
             no_std: false,
             no_core: false,
             arbitrary_ints: false,
+            recursion_limit: u32::from(crate::RECURSION_LIMIT),
             prelude: None,
         };
         ValueRoot::Dep { head, built: self.built, alloc: self.alloc }
@@ -429,7 +430,7 @@ impl<'w, 'a> RootRead<&'a str> for ValueRoot<'w, 'a> {
             ValueRoot::Dep { head, built, alloc } => {
                 let found = dep_lookup(built, head.root_module, Namespace::Macros, name, alloc)?;
                 match found.def.kind {
-                    DefKind::Macro(shapes) => Some((found.def.key, shapes)),
+                    DefKind::Macro(shapes) if shapes.in_macro_use_prelude() => Some((found.def.key, shapes)),
                     _ => None,
                 }
             }
@@ -655,7 +656,7 @@ impl<'q, 'r, 'a, C: ExpandCx> Driver<'q, 'r, 'a, C> {
             segments.push("$crate");
         }
         let abs = is_colons(stream, start);
-        let first = stream.tokens().get(start).and_then(|t| stream.hygiene(t.ctx).mark).map(TextMark::of);
+        let first = stream.tokens().get(start).and_then(|t| stream.non_transparent_mark(t.ctx)).map(TextMark::of);
         let mut i = start;
         while i < end {
             if let Some(n) = dollar_crate(stream, i) {

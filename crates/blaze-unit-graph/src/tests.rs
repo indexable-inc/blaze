@@ -15,8 +15,8 @@ use blaze_own::{Alloc, String, Vec};
 use blaze_sim::{Broke, Config, Tape};
 use edition::{Edition, PackageEdition};
 
-use crate::input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, Lib, Package, Platform, Resolver, TargetDesc};
-use crate::{Extra, LeftOutKind, Pass, Plant, Resolution, UnitError, UnitGraph, UnitKind, record};
+use crate::input::{Ask, Bin, CfgAtom, Dep, DepSource, FeatureDef, FeatureValue, HostFeatureSide, HostUnitAsk, HostUnitKind, Lib, Package, Platform, Resolver, TargetDesc};
+use crate::{Extra, LeftOutKind, Pass, Plant, Resolution, UnitError, UnitGraph, UnitId, UnitKind, record};
 
 /// tempo-primitives and reth-codecs in miniature: dev-dependency unification (src/tests/dev_unify.rs).
 mod dev_unify;
@@ -1604,4 +1604,269 @@ fn record_encode_cfg_is_accepts_valid_and_rejects_mutated() {
     graph.units[0].cfg.pop();
     assert!(record::encode(&graph, &target, &host, a()).is_err(), "missing cfg atom rejected");
     graph.units[0].cfg = saved;
+}
+
+/// Blocker C4 regression: `Resolution::for_host_units` resolves a `BuildScript` against
+/// `wasm64-blaze-wasip1` rather than host Linux, activating `[target.'cfg(target_os = "wasi")'.dependencies]`
+/// (including renamed deps `libc_errno = { package = "errno" }`, weak dep features `libc?/std` and
+/// `libc_errno?/std`, and newly-included dep build scripts like `libc/build.rs`), while excluding
+/// Linux-only deps (`linux-raw-sys`) and normal `[dependencies]` of the root package.
+#[test]
+fn host_units_resolves_wasm64_target_specific_renamed_deps_weak_features_and_dep_build_scripts() {
+    let linux_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::flag("unix", a()));
+        cfg.push(CfgAtom::pair("target_os", "linux", a()));
+        cfg.push(CfgAtom::pair("target_arch", "x86_64", a()));
+        TargetDesc::new("x86_64-unknown-linux-gnu", cfg, a())
+    };
+    let wasi_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_family", "wasm", a()));
+        cfg.push(CfgAtom::pair("target_os", "wasi", a()));
+        cfg.push(CfgAtom::pair("target_env", "p1", a()));
+        cfg.push(CfgAtom::pair("target_arch", "wasm64", a()));
+        TargetDesc::new("wasm64-blaze-wasip1", cfg, a())
+    };
+
+    let ps = vec![
+        // 0: app (has normal dep `normal_only` and build-dep `rustix_like`)
+        pkg("app")
+            .member()
+            .build()
+            .dep(dep("normal_only"))
+            .dep(dep("rustix_like").build()),
+        // 1: normal_only (must NEVER be pulled into app's BuildScript wasm64 resolution)
+        pkg("normal_only"),
+        // 2: rustix_like (on Linux: bitflags + linux_raw_sys, optional libc/libc_errno;
+        //    on WASI: bitflags + non-optional libc + renamed libc_errno -> errno; weak std features)
+        pkg("rustix_like")
+            .build()
+            .feature("default", &["std"])
+            .feature("std", &["bitflags/std", "libc?/std", "libc_errno?/std"])
+            .dep(dep("bitflags").no_default())
+            .dep(dep("linux_raw_sys").on("cfg(target_os = \"linux\")"))
+            .dep(dep("libc").on("cfg(target_os = \"linux\")").optional().no_default())
+            .dep(dep("libc_errno").package("errno").on("cfg(target_os = \"linux\")").optional().no_default())
+            .dep(dep("libc").on("cfg(target_os = \"wasi\")").no_default())
+            .dep(dep("libc_errno").package("errno").on("cfg(target_os = \"wasi\")").no_default()),
+        // 3: bitflags
+        pkg("bitflags").feature("std", &[]),
+        // 4: linux_raw_sys
+        pkg("linux_raw_sys"),
+        // 5: libc (has its own build.rs and `std` feature!)
+        pkg("libc").build().feature("default", &["std"]).feature("std", &[]),
+        // 6: errno (depends on libc on WASI, std enables libc/std)
+        pkg("errno")
+            .feature("default", &["std"])
+            .feature("std", &["libc/std"])
+            .dep(dep("libc").on("cfg(target_os = \"wasi\")").no_default()),
+    ];
+    let text = lock_text(&ps);
+    let lock = Lock::read(text.as_bytes(), a()).expect("lock");
+
+    // 1. Host Linux UnitGraph has ONLY bitflags + linux_raw_sys under rustix_like (NO libc, NO errno).
+    let mut ask_roots = Vec::new_in(a());
+    ask_roots.push(LockId(0));
+    let ask = Ask { roots: ask_roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false };
+    let mut host_res = Resolution::new(&lock, &linux_desc, &linux_desc, &ask, Resolver::V2, a());
+    host_res.member(LockId(0), ps[0].facts()).expect("app");
+    for i in 1..ps.len() {
+        host_res.package(LockId(i as u32), Some(ps[i].facts())).expect("pkg");
+    }
+    let host_graph = match host_res.pass().expect("host pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on host"),
+    };
+    let host_rustix = host_graph
+        .units
+        .iter()
+        .find(|u| u.name.as_str() == "rustix_like" && u.kind == UnitKind::Lib)
+        .expect("host rustix_like");
+    let host_dep_names: std::vec::Vec<&str> = host_rustix.deps.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(host_dep_names, ["bitflags", "linux_raw_sys"]);
+    assert!(!host_graph.units.iter().any(|u| u.name.as_str() == "errno" || u.name.as_str() == "libc"));
+
+    // 2. Host-unit resolution for `wasm64-blaze-wasip1` resolves rustix_like -> (bitflags, libc, libc_errno -> errno),
+    //    propagates `std` via `libc?/std` and `libc_errno?/std`, includes `libc`'s BuildScript,
+    //    and omits `linux_raw_sys` and `normal_only`.
+    let mut wasm_roots = Vec::new_in(a());
+    wasm_roots.push(HostUnitAsk { package: LockId(0), kind: HostUnitKind::BuildScript, side: HostFeatureSide::Target, features: Vec::new_in(a()) });
+    let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V2, a());
+    host_res.move_packages_into(&mut wasm_res).expect("move packages");
+    let wasm_graph = match wasm_res.pass().expect("wasm64 pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on wasm64"),
+    };
+
+    assert!(!wasm_graph.units.iter().any(|u| u.name.as_str() == "normal_only"), "BuildScript must not pull in normal deps");
+    assert!(!wasm_graph.units.iter().any(|u| u.name.as_str() == "linux_raw_sys"), "wasm64 must not pull in Linux-only deps");
+
+    let wasm_rustix = wasm_graph
+        .units
+        .iter()
+        .find(|u| u.name.as_str() == "rustix_like" && u.kind == UnitKind::Lib)
+        .expect("wasm rustix_like");
+    let wasm_dep_names: std::vec::Vec<&str> = wasm_rustix.deps.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(wasm_dep_names, ["bitflags", "libc", "libc_errno"]);
+    assert!(wasm_rustix.build_script.is_some(), "rustix_like build script kept");
+
+    let libc_dep = wasm_rustix.deps.iter().find(|d| d.name.as_str() == "libc").expect("libc dep");
+    let libc_unit = &wasm_graph.units[libc_dep.unit.index()];
+    assert_eq!(libc_unit.name.as_str(), "libc");
+    assert_eq!(libc_unit.features.iter().map(|f| f.as_str()).collect::<std::vec::Vec<_>>(), ["std"]);
+    let libc_bs = libc_unit.build_script.expect("libc must have its own build_script unit");
+    assert_eq!(wasm_graph.units[libc_bs.index()].kind, UnitKind::BuildScript);
+    assert_eq!(wasm_graph.units[libc_bs.index()].name.as_str(), "libc");
+
+    let errno_dep = wasm_rustix.deps.iter().find(|d| d.name.as_str() == "libc_errno").expect("renamed libc_errno dep");
+    let errno_unit = &wasm_graph.units[errno_dep.unit.index()];
+    assert_eq!(errno_unit.name.as_str(), "errno");
+    assert_eq!(errno_unit.features.iter().map(|f| f.as_str()).collect::<std::vec::Vec<_>>(), ["std"]);
+    let errno_deps: std::vec::Vec<&str> = errno_unit.deps.iter().map(|d| d.name.as_str()).collect();
+    assert_eq!(errno_deps, ["libc"]);
+}
+
+/// Under resolver 2/3, a package built for BOTH target (feature `feat_a`) and host (feature
+/// `feat_b`) has two distinct `BuildScript` units with separate feature namespaces.
+/// `Resolution::for_host_units` must preserve `HostFeatureSide::Target` vs `HostFeatureSide::Host`
+/// so `feat_a` and `feat_b` never bleed into each other.
+#[test]
+fn host_units_preserves_target_and_host_build_script_feature_namespaces_distinct() {
+    let linux_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_os", "linux", a()));
+        TargetDesc::new("x86_64-unknown-linux-gnu", cfg, a())
+    };
+    let wasi_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_os", "wasi", a()));
+        TargetDesc::new("wasm64-blaze-wasip1", cfg, a())
+    };
+
+    let ps = vec![
+        // 0: app depends on `shared` normally with `feat_a` AND as a build-dep with `feat_b`.
+        pkg("app")
+            .member()
+            .build()
+            .dep(dep("shared").no_default().features(&["feat_a"]))
+            .dep(dep("shared").build().no_default().features(&["feat_b"])),
+        // 1: shared has its own build.rs and two disjoint features.
+        pkg("shared").build().feature("feat_a", &[]).feature("feat_b", &[]),
+    ];
+    let text = lock_text(&ps);
+    let lock = Lock::read(text.as_bytes(), a()).expect("lock");
+
+    let mut ask_roots = Vec::new_in(a());
+    ask_roots.push(LockId(0));
+    let ask = Ask { roots: ask_roots, features: Vec::new_in(a()), all_features: false, no_default_features: false, tests: false };
+    let mut host_res = Resolution::new(&lock, &linux_desc, &linux_desc, &ask, Resolver::V2, a());
+    host_res.member(LockId(0), ps[0].facts()).expect("app");
+    host_res.package(LockId(1), Some(ps[1].facts())).expect("shared");
+    let host_graph = match host_res.pass().expect("host pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on host"),
+    };
+
+    // Host graph must have two distinct BuildScript units for `shared`: Target(`feat_a`) and Host(`feat_b`).
+    let mut wasm_roots = Vec::new_in(a());
+    for (idx, unit) in host_graph.units.iter().enumerate() {
+        let kind = match unit.kind {
+            UnitKind::BuildScript => HostUnitKind::BuildScript,
+            UnitKind::ProcMacro => HostUnitKind::ProcMacro,
+            _ => continue,
+        };
+        let mut features = Vec::new_in(a());
+        for f in unit.features.iter() {
+            features.push(f.clone());
+        }
+        wasm_roots.push(HostUnitAsk {
+            package: unit.package,
+            kind,
+            side: host_graph.host_unit_side(UnitId(idx as u32)),
+            features,
+        });
+    }
+    let shared_asks: std::vec::Vec<_> = wasm_roots.iter().filter(|r| r.package == LockId(1)).collect();
+    assert_eq!(shared_asks.len(), 2, "host graph must produce 2 distinct BuildScript units for shared");
+
+    let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V2, a());
+    host_res.move_packages_into(&mut wasm_res).expect("move packages");
+    let wasm_graph = match wasm_res.pass().expect("wasm64 pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done on wasm64"),
+    };
+
+    let mut shared_bs_feats: std::vec::Vec<std::vec::Vec<&str>> = wasm_graph
+        .units
+        .iter()
+        .filter(|u| u.name.as_str() == "shared" && u.kind == UnitKind::BuildScript)
+        .map(|u| u.features.iter().map(|f| f.as_str()).collect())
+        .collect();
+    shared_bs_feats.sort();
+    assert_eq!(
+        shared_bs_feats,
+        vec![vec!["feat_a"], vec!["feat_b"]],
+        "target-side and host-side build scripts for `shared` must stay separate with zero feature bleed"
+    );
+}
+
+/// Under resolver 1, target-specific dependency feature requests unify across all targets (even
+/// inactive ones): if `app` requests build-dep `shared` with `feat_a` under `cfg(target_os =
+/// "linux")` and `feat_b` under `cfg(target_os = "wasi")`, `Resolution::for_host_units` on WASI
+/// must keep the unified `["feat_a", "feat_b"]` while omitting inactive Linux-only edges from `deps`.
+#[test]
+fn host_units_resolver_v1_unifies_features_from_inactive_linux_and_active_wasi_build_deps() {
+    let wasi_desc = {
+        let mut cfg = Vec::new_in(a());
+        cfg.push(CfgAtom::pair("target_os", "wasi", a()));
+        TargetDesc::new("wasm64-blaze-wasip1", cfg, a())
+    };
+
+    let ps = vec![
+        // 0: app has normal dep `normal_only` (must NOT be walked) and two platform-specific build-deps.
+        pkg("app")
+            .member()
+            .build()
+            .dep(dep("normal_only"))
+            .dep(dep("shared").build().on("cfg(target_os = \"linux\")").no_default().features(&["feat_a"]))
+            .dep(dep("shared").build().on("cfg(target_os = \"wasi\")").no_default().features(&["feat_b"]))
+            .dep(dep("linux_only").build().on("cfg(target_os = \"linux\")")),
+        // 1: normal_only
+        pkg("normal_only"),
+        // 2: shared
+        pkg("shared").feature("feat_a", &[]).feature("feat_b", &[]),
+        // 3: linux_only (not active on WASI; must NOT appear in emitted WASI units)
+        pkg("linux_only"),
+    ];
+    let text = lock_text(&ps);
+    let lock = Lock::read(text.as_bytes(), a()).expect("lock");
+
+    let mut wasm_roots = Vec::new_in(a());
+    wasm_roots.push(HostUnitAsk {
+        package: LockId(0),
+        kind: HostUnitKind::BuildScript,
+        side: HostFeatureSide::Target,
+        features: Vec::new_in(a()),
+    });
+    let mut wasm_res = Resolution::for_host_units(&lock, &wasi_desc, wasm_roots, Resolver::V1, a());
+    wasm_res.member(LockId(0), ps[0].facts()).expect("app");
+    for i in 1..ps.len() {
+        wasm_res.package(LockId(i as u32), Some(ps[i].facts())).expect("pkg");
+    }
+    let wasm_graph = match wasm_res.pass().expect("wasm64 resolver 1 pass") {
+        Pass::Done(g) => g,
+        _ => panic!("expected Done"),
+    };
+
+    assert!(!wasm_graph.units.iter().any(|u| u.name.as_str() == "normal_only"), "BuildScript must not walk normal deps");
+    assert!(!wasm_graph.units.iter().any(|u| u.name.as_str() == "linux_only"), "inactive Linux-only dep must not emit a WASI unit");
+    let shared_unit = wasm_graph
+        .units
+        .iter()
+        .find(|u| u.name.as_str() == "shared" && u.kind == UnitKind::Lib)
+        .expect("shared lib unit");
+    let mut feats: std::vec::Vec<&str> = shared_unit.features.iter().map(|f| f.as_str()).collect();
+    feats.sort();
+    assert_eq!(feats, ["feat_a", "feat_b"], "resolver 1 must unify inactive Linux `feat_a` with active WASI `feat_b`");
 }

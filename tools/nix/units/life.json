@@ -4284,7 +4284,7 @@
   },
   "blaze-reclaim@0.0.0": {
    "authors": "blaze contributors",
-   "description": "blaze v2's memory reclamation at task boundaries: a value unlinked from a shared table is freed once every thread that could still read it has ended its task (docs/v2/plan/design/concurrency.md)",
+   "description": "blaze v2's memory reclamation at task boundaries: a value unlinked from a shared table is freed once every thread that could still read it has ended its task (docs/v2/plan/design/end-state.md, D179)",
    "homepage": "",
    "license": "MIT OR Apache-2.0",
    "license_file": "",

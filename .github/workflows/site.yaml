@@ -11,7 +11,6 @@ on:
       - "README.md"
       - "site/install.sh"
       - "docs/demo*"
-      - "docs/benchmarks/**"
       - ".github/workflows/site.yaml"
   pull_request:
     paths:
@@ -19,7 +18,6 @@ on:
       - "README.md"
       - "site/install.sh"
       - "docs/demo*"
-      - "docs/benchmarks/**"
       - ".github/workflows/site.yaml"
   workflow_dispatch:
 
@@ -33,7 +31,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
 
 env:
-  # blaze's whole machine: no one sits at a CI runner (docs/cargo.md, "Cores and priority").
+  # blaze's whole machine: no one sits at a CI runner.
   BLAZE_CORES: all
 
 jobs:

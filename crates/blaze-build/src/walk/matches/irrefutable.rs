@@ -81,7 +81,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 at
             }
         };
-        self.bind_pattern_at(root, At { at: place, g, by_ref: false, copy: false }, true)
+        self.bind_pattern_at(root, At { at: place, g, by_ref: false, copy: false, no_read: false }, true)
     }
 
     /// Binds irrefutable pattern `root` at `at`, by a work list. `owned`: the place is the
@@ -396,7 +396,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     pub(in crate::walk) fn bind_param(&mut self, p: PatId, v: V, g: PTy) -> Result<(), BuildError> {
         let has_ref = self.pat_has_ref_bind(p)?;
         let drops = self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))?;
-        let leaves = !matches!(self.pat(p)?, Pat::Bind { .. }) && drops && self.let_leaves_drops(p)?;
+        let leaves = !matches!(self.pat(p)?, Pat::Bind { .. }) && drops && self.let_leaves_drops(p, g)?;
         if !leaves && !has_ref {
             self.bind_value_of(p, v, g)?;
             return self.own_pat(p);
@@ -419,7 +419,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             self.own_param(m, (base, off), g);
             self.move_arm(m, p, false);
         }
-        let bound = self.bind_tested(p, At { at: (base, off), g, by_ref: false, copy: false });
+        let bound = self.bind_tested(p, At { at: (base, off), g, by_ref: false, copy: false, no_read: false });
         if drops {
             self.move_arm_end();
         }
@@ -524,46 +524,114 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         if !self.needs_drop(g).map_err(|error| Self::ty_err(init, error))? {
             return Ok(false);
         }
-        self.let_leaves_drops(pat)
+        self.let_leaves_drops(pat, g)
     }
 
-    /// Whether irrefutable pattern `root` leaves unbound, where its value is owned (not behind
-    /// a reference it follows, explicitly or by the default binding mode), a part that needs
-    /// drop: a `_`, a unit pattern, a `..`'s fields or a field a struct pattern leaves out. A
-    /// binding's subpattern is not looked into: a by-value binding takes the whole part, and
-    /// a `ref` one borrows it (ref_bind.rs builds that `let`).
-    fn let_leaves_drops(&mut self, root: PatId) -> Result<bool, BuildError> {
-        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc);
-        todo.push(root);
-        while let Some(p) = todo.pop() {
+    /// Whether irrefutable pattern `root` over a value of ground type `root_g` leaves unbound,
+    /// where its value is owned (not behind a reference it follows, explicitly or by the default
+    /// binding mode), a part that needs drop: a `_`, a unit pattern, a `..`'s fields or a field a
+    /// struct pattern leaves out. A binding's subpattern is not looked into: a by-value binding
+    /// takes the whole part, and a `ref` one borrows it (ref_bind.rs builds that `let`).
+    /// Carries the unpeeled ground type `g` down from `root_g` (not `checked.pat_ty`, which is
+    /// already peeled on non-reference patterns) so a nested peeled reference (`let (D { .. }, x)
+    /// = (&d, s);`) stops at `PNode::Ref`.
+    fn let_leaves_drops(&mut self, root: PatId, root_g: PTy) -> Result<bool, BuildError> {
+        let mut todo: Vec<(PatId, PTy), A> = Vec::new_in(self.alloc);
+        todo.push((root, root_g));
+        while let Some((p, g)) = todo.pop() {
+            if let PNode::Ref(..) = self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))? {
+                continue;
+            }
+            if !self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))? {
+                continue;
+            }
             let pat = self.pat(p)?;
-            let t = *self.checked.pat_ty.get(p.ix()).ok_or(malformed("a pattern without a type in the record"))?;
-            let g = self.ground_ty(t).map_err(|error| Self::pat_ty_err(p, error))?;
             match pat {
-                Pat::Wild | Pat::Path(_) => {
-                    if self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))? {
-                        return Ok(true);
-                    }
-                }
-                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } => {
-                    if let PNode::Ref(..) = self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))? {
-                        continue;
-                    }
-                    if self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))? && self.left_out_drops(p, g)? {
+                Pat::Wild | Pat::Path(_) => return Ok(true),
+                Pat::Tuple { elems, rest } | Pat::TupleStruct { elems, rest, .. } => {
+                    if self.left_out_drops(p, g)? {
                         return Ok(true);
                     }
                     let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
-                    todo.extend(subs.iter().copied());
-                }
-                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
-                    if let PNode::Ref(..) = self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))? {
+                    if subs.is_empty() {
                         continue;
                     }
-                    if self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))? && self.left_out_drops(p, g)? {
+                    let l = self.layout(g).map_err(|error| Self::pat_ty_err(p, error))?;
+                    let variant = match pat {
+                        Pat::TupleStruct { .. } => {
+                            Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?
+                        }
+                        _ => 0,
+                    };
+                    let (first, len, _) = self.variant_rows(l, variant)?;
+                    let first = usize::try_from(first).map_err(|_| malformed("a variant's first field past `usize`"))?;
+                    let n = usize::try_from(len).map_err(|_| malformed("a variant's field count past `usize`"))?;
+                    let rest = match rest {
+                        Some(r) => Some(usize::try_from(r).map_err(|_| malformed("a tuple pattern's `..` past `usize`"))?),
+                        None => None,
+                    };
+                    for (j, &sub) in subs.iter().enumerate() {
+                        let k = match rest {
+                            Some(r) if j >= r => n.checked_sub(subs.len() - j).ok_or(malformed("a tuple pattern longer than its type"))?,
+                            _ => j,
+                        };
+                        let fg = *self
+                            .layout_field_tys
+                            .get(first + k)
+                            .ok_or(malformed("a tuple or variant pattern's field past `layout_field_tys`"))?;
+                        todo.push((sub, fg));
+                    }
+                }
+                Pat::Slice { elems, rest } => {
+                    let PNode::Array(elem, _) = self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))? else {
+                        continue;
+                    };
+                    let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+                    let rest = match rest {
+                        Some(r) => Some(usize::try_from(r).map_err(|_| malformed("a slice pattern's `..` past `usize`"))?),
+                        None => None,
+                    };
+                    for (j, &sub) in subs.iter().enumerate() {
+                        let sg = match rest {
+                            Some(r) if j == r => self.pat_ground(sub)?,
+                            _ => elem,
+                        };
+                        todo.push((sub, sg));
+                    }
+                }
+                Pat::Struct { fields, .. } | Pat::Record { fields, .. } => {
+                    if self.left_out_drops(p, g)? {
                         return Ok(true);
                     }
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
-                    todo.extend(fps.iter().map(|fp| fp.pat));
+                    if fps.is_empty() {
+                        continue;
+                    }
+                    let l = self.layout(g).map_err(|error| Self::pat_ty_err(p, error))?;
+                    let variant = if matches!(pat, Pat::Record { .. }) {
+                        0
+                    } else {
+                        Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?
+                    };
+                    let (first, len, _) = self.variant_rows(l, variant)?;
+                    let first = usize::try_from(first).map_err(|_| malformed("a variant's first field past `usize`"))?;
+                    let len = usize::try_from(len).map_err(|_| malformed("a variant's field count past `usize`"))?;
+                    let names = self
+                        .layout_fields
+                        .get(first..first + len)
+                        .ok_or(malformed("a variant's fields past `layout_fields`"))?;
+                    let tys = self
+                        .layout_field_tys
+                        .get(first..first + len)
+                        .ok_or(malformed("a variant's field types past `layout_field_tys`"))?;
+                    for fp in fps {
+                        let at = names
+                            .iter()
+                            .position(|row| row.0 == fp.name)
+                            .ok_or(malformed("a struct pattern naming a field its variant lacks"))?;
+                        let fg = *tys.get(at).ok_or(malformed("a struct pattern's field past `layout_field_tys`"))?;
+                        todo.push((fp.pat, fg));
+                    }
                 }
                 // A binding takes or borrows its whole part; `&p` is behind a reference; a
                 // literal, a range or an or-pattern is refused by `bind_pattern_at`'s own arms.

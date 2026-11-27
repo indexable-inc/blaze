@@ -34,11 +34,12 @@ A blaze extension is not a rustc run: code that opts into one need not build und
 
 1. **The standard library is compiled by blaze**, from `library/`, kept in the store per target
    and profile like any other crate. No rlib of a sysroot is read or linked.
-2. **Proc macros are compiled by blaze and run by blaze**, as `wasm32-wasip1` in Wasmtime
-   (`crates/blaze-proc-macro`).
-3. **Build scripts are compiled, linked and run by blaze.** `RUSTC` is answered by blaze while they run
+2. **Proc macros and pure-Rust build scripts are compiled by blaze and run by blaze**, as wasm64
+   (memory64) modules in-process under Wasmtime, sandboxed (`crates/blaze-proc-macro`). Native
+   tools and C-linking build scripts go to the hypervisor micro-VM sandbox, not built yet.
+3. **Build scripts are run by blaze.** `RUSTC` is answered by blaze while they run
    (`crates/blaze-build-script`), so their probes are answered by blaze, from the data
-   `harness/answers.py` writes at a toolchain bump (`crates/blaze-answer`).
+   `harness/answers.py` writes at a toolchain bump (`pins/answers/rustc.json`, read by `crates/blaze-pins`).
 4. **The cold build is entirely blaze's**: no first build by cargo and rustc.
 5. **Tests and doctests are built by blaze**; no rustdoc runs.
 6. **No wrapper and no fallback**: there is no `blaze-rustc`, and no build is handed to cargo.
@@ -46,7 +47,7 @@ A blaze extension is not a rustc run: code that opts into one need not build und
 ## The plan
 
 The steps, by the letter code and docs cite them with (issues #81 to #93). Whether each has
-landed in full has no check yet (objective C5, `docs/v2/plan/objectives.md`); what the counter
+landed in full has no check yet; what the counter
 below still finds is the list after it.
 
 | Step | What it removed |
@@ -67,25 +68,19 @@ below still finds is the list after it.
 
 ## What is left
 
-`scripts/src/bin/rustcsites.rs` (CI's `scripts` job) counts, per file under `crates/`, the places
-that start rustc, rustdoc, cargo or rustup or read which one to start, and holds them to the
-counts it recorded: one more in a file fails, and a place that goes lowers the count
-(`--record`). On 2026-11-10 it counts three places in two files, and none of them starts rustc:
-
-| Place | What it is | Why it is still counted | What removes it |
-|---|---|---|---|
-| `crates/blaze-build-script`, 1 | a test fixture of a script that runs `$RUSTC --version`; the test checks blaze does not elide it | the fixture is an escaped string on one line of code, which the counter reads as code | writing the fixture as a raw string over lines, which the counter knows is data |
-| `crates/blaze-answer`, 2 | a unit test that makes two `Command::new("rustc")` to read their environment (`Vars::Command`) and never spawns them | the counter matches the command's name | naming any other program in the test |
-
-Two more places ask `$RUSTC` and are listed on every run, not counted, because the compiler
-asked is blaze: `crates/blaze-code/src/lib.rs`'s `compiler`, a build script's `-vV` for
-the code identity, under an `// asks blaze:` comment (end state 3).
+`scripts/src/bin/rustcsites.rs` (the gate's `rustc sites` row) counts, per file under `crates/`,
+the places that start rustc, rustdoc, cargo or rustup or read which one to start, and holds them
+to the counts in `harness/norustc/sites.json`: one more in a file fails, and a place that goes
+lowers the count (`--record`). It holds eight places in six files: `crates/blaze-bstd-convert/src/tests.rs`
+2, `crates/blaze-proc-macro/src/` `comptime_patch.rs` 1, `native_bridge.rs` 2 and
+`native_script.rs` 1, `crates/blaze-std/build.rs` 1 and `crates/blaze-std/tests/refusals.rs` 1.
 
 Outside `crates/`, which the counter does not read, cargo or rustc still run in:
 
 | Place | What runs | What removes it |
 |---|---|---|
 | `tools/nix/unit_graph.py` and `tools/nix/unit_build.py` | cargo's unit graph, and one rustc per unit in the flake's per-unit builds | deleting the flake (decided 2026-11-04) |
+| `blaze.yaml`'s `cargo` job, `.github/actions/script/build.sh`, `land.py`'s smoke line | `cargo check`, the unit tests and the scripts' build with the pinned nightly | blaze building, checking and testing blaze there too (a gap) |
 
 The long form of this page (the measurements of October 2026, each step's design and the lanes
 that did them) is in git: `git show 9112d5e40e:docs/no-rustc.md`.

@@ -1,12 +1,11 @@
-//! blaze v2's data format (docs/v2/plan/design/data.md section 5): **the bytes in memory are the
+//! blaze v2's data format (docs/v2/plan/design/bottom.md section 13): **the bytes in memory are the
 //! bytes on disk**.
 //!
 //! The format itself (records, their views, [`Writer`], [`record!`]) is blaze-format-core's,
 //! on `core` alone so a `#![no_std]` crate defines and reads records; this crate re-exports all
 //! of it at the paths it always had, and adds what needs `std`: the [`cursor`], [`hex`] and
-//! [`leb`] codecs, and the span side table ([`Spans`]). It brings no third-party package:
-//! compression by tier, which needs zstd, is blaze-format-tiers (it was `tiers` here until
-//! 2026-11-15). See blaze-format-core's crate docs for the format.
+//! [`leb`] codecs, and the span side table ([`Spans`]). It brings no third-party package. See
+//! blaze-format-core's crate docs for the format.
 //!
 //! Spans are never in a record that is hashed: they sit in a side table ([`Spans`]), and a
 //! record names one by [`SpanRef`].
@@ -55,7 +54,7 @@ pub use blaze_format_core::{
 pub use blaze_format_core::Aligned;
 
 record! {
-    /// A [`Spans`] buffer's root; public for blaze-format-tiers' `spans_columns`.
+    /// A [`Spans`] buffer's root.
     #[derive(Clone, Copy)]
     pub struct SpansRoot: 1 {
         anchor: ContentId,

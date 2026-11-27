@@ -27,7 +27,7 @@
           extensions = [ "rust-src" ];
         };
         # The same nightly with rustc_codegen_cranelift, for the setups bench.py compares with
-        # (`--setups`, docs/benchmarks.md).
+        # (`--setups`).
         nightly = pkgs.rust-bin.nightly.${pin}.default.override {
           extensions = [ "rustc-codegen-cranelift-preview" ];
         };
@@ -65,7 +65,7 @@
           UV_PYTHON = "${pkgs.python313}/bin/python3";
           UV_PYTHON_DOWNLOADS = "never";
         };
-        # What harness/bench.py runs in on the benchmark machine (docs/benchmarks.md): the
+        # What harness/bench.py runs in on the benchmark machine: the
         # pinned toolchain, the LLVM 23 blaze links, and the C side the projects' build
         # scripts use. Nothing here wraps rustc (no sccache) or replaces the default linker:
         # mold and wild are on PATH for the setups that ask for them with `-fuse-ld`. Every
@@ -151,22 +151,20 @@
             runHook postInstall
           '';
         });
-        # `nix run .#duckdb`: the DuckDB `blaze debug sql`, `blaze explain` and the explorer run,
-        # nixpkgs' at the locked rev, parquet built in, so nothing downloads. Pinned: a nixpkgs
-        # bump that changes it stops here, a visible change.
+        # `nix run .#duckdb`: the DuckDB blaze-parquet's cross-check test reads its files with
+        # (crates/blaze-parquet/tests/duckdb.rs), nixpkgs' at the locked rev, parquet built in, so
+        # nothing downloads. Pinned: a nixpkgs bump that changes it stops here, a visible change.
         duckdb =
           assert pkgs.duckdb.version == "1.5.5";
           pkgs.duckdb;
-        # What `nix profile install` puts on PATH: the same binaries, with the toolchain, and
-        # BLAZE_DUCKDB naming that DuckDB (blaze never looks for one on PATH).
+        # What `nix profile install` puts on PATH: the same binaries, with the toolchain.
         daemon = pkgs.runCommand "blaze-${version}" {
           nativeBuildInputs = [ pkgs.makeWrapper ];
           meta.mainProgram = "blaze";
         } ''
           mkdir -p $out/bin
           for bin in ${dist}/bin/*; do
-            makeWrapper $bin $out/bin/$(basename $bin) --prefix PATH : ${rust}/bin \
-              --set BLAZE_DUCKDB ${duckdb}/bin/duckdb
+            makeWrapper $bin $out/bin/$(basename $bin) --prefix PATH : ${rust}/bin
           done
         '';
         # `blaze` with the toolchain and the other programs first on PATH.
@@ -283,8 +281,7 @@
           packages = scripts.packages ++ [ pkgs.rustup llvm ];
           inherit (scripts) UV_PYTHON UV_PYTHON_DOWNLOADS;
           RUSTUP_TOOLCHAIN = pkgs.lib.fileContents ./pins/toolchain;
-          # The pinned DuckDB that `blaze slow`, `blaze debug sql` and `blaze explain` run (blaze
-          # never looks for one on PATH), as the installed `blaze` wrapper sets it.
+          # The pinned DuckDB blaze-parquet's cross-check test runs (it never looks for one on PATH).
           BLAZE_DUCKDB = "${duckdb}/bin/duckdb";
           # As in the bench shell: the wrapper's _FORTIFY_SOURCE fails configure probes at -O0 in
           # the C code of the projects the harnesses build.

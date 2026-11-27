@@ -1,4 +1,4 @@
-//! The `Scripts` stage of `blaze engine-check` (engine.md E6, piece "scripts"): every build
+//! The `Scripts` stage of `blaze engine-check` (end-state.md D157): every build
 //! script's run and every module lookup as an engine task, entered once, before the names that
 //! read it. Names tasks with no script producer may run ahead of this stage.
 //!
@@ -122,22 +122,14 @@ enum ModuleJob<'a> {
         compile: Option<crate::wasm64_compile::CompileInputs<'a>>,
     },
     Proc {
-        crates: Option<crate::macros::MacroCrates>,
+        crates: Option<std::sync::Arc<crate::macros::MacroCrates>>,
         home: Option<&'a str>,
         checkout: &'a str,
         graph: Option<Input>,
-        initial: Option<MacroInputs<'a>>,
         compile: Option<crate::wasm64_compile::CompileInputs<'a>>,
     },
     #[cfg(test)]
     Fixture,
-}
-
-#[derive(Clone, Copy)]
-struct MacroInputs<'a> {
-    graph: &'a [u8],
-    lock: &'a [u8],
-    members: &'a [(blaze_manifest::lock::LockId, &'a str, blaze_world::PathKind, ContentId)],
 }
 
 enum ModuleAnswer {
@@ -147,11 +139,20 @@ enum ModuleAnswer {
 
 enum WorkerOutput {
     Run(crate::scripts::PooledScript),
-    Module(ModuleAnswer, Option<crate::macros::MacroCrates>),
+    Module(ModuleAnswer),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ScriptLane { Native, Other, ProcLookup }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ScriptLane { Native, ProcLookup, Other }
+
+impl ScriptLane {
+    fn can_dispatch(self, native_running: usize, max_native_roots: usize) -> bool {
+        match self {
+            Self::Native => native_running < max_native_roots,
+            Self::ProcLookup | Self::Other => true,
+        }
+    }
+}
 
 /// The one graph record a proc-module lookup was handed. The normal lookup uses
 /// `get_into` when building its identity table. Its table serves all following lookups.
@@ -193,39 +194,19 @@ impl ModuleJob<'_> {
         let alloc = erased.handle();
         let name = task.planned.name;
         let drive = |inputs| drive_task(name, task.key, task.planned.source, inputs, Vec::new_in(alloc), alloc);
-        let (did, crates) = match self {
-            Self::Build { wanted, home, compile } => (
-                crate::script_modules::run(cx, home, wanted, compile, &drive(Vec::new_in(alloc)), frame)?,
-                None,
-            ),
+        let did = match self {
+            Self::Build { wanted, home, compile } => {
+                crate::script_modules::run(cx, home, wanted, compile, &drive(Vec::new_in(alloc)), frame)?
+            }
             #[cfg(test)]
-            Self::Fixture => return Ok(WorkerOutput::Module(ModuleAnswer::Found(name.subject), None)),
-            Self::Proc { mut crates, home, checkout, graph, initial, compile } => {
-                let mut handed = LookupStore { name, graph: initial.zip(graph).map(|(input, graph)| (graph.at, input.graph)) };
+            Self::Fixture => return Ok(WorkerOutput::Module(ModuleAnswer::Found(name.subject))),
+            Self::Proc { mut crates, home, checkout, graph, compile } => {
+                let mut handed = LookupStore { name, graph: None };
                 let mut inputs = Vec::new_in(alloc);
                 inputs.extend(graph);
-                let mut rows = crate::sweep::Rows::new_in(frame);
-                let mut members = Vec::new_in(frame);
-                let lock = match initial {
-                    Some(input) => {
-                        for &(id, dir, kind, digest) in input.members {
-                            members.push(crate::graph::CheckoutDir { id, dir: blaze_unit_graph::Text::from_str_in(dir, heap.alloc()), kind });
-                            rows.push(crate::sweep::LeafKind::MacroFiles, 0, dir, None, digest);
-                        }
-                        match crate::fetch::Lockfile::read(input.lock, heap, frame) {
-                            Ok(lock) => Some(lock),
-                            Err(words) => {
-                                let failed = TaskFailure { name, why: Why::Refused { what: "the macro crates could not be listed", rule: "macros.rs" } };
-                                let said = blaze_own::format_in!(heap.shared(), "the proc-macro crates of the graph could not be listed: {words}");
-                                return Ok(WorkerOutput::Module(ModuleAnswer::Failed(failed, Some(said), true), None));
-                            }
-                        }
-                    }
-                    None => None,
-                };
-                let place = crate::macros::Place { home, checkout, members: Some(&members), rows: &rows };
-                let did = crate::macros::run(cx, &mut handed, lock.as_ref(), &mut crates, place, compile, &drive(inputs), frame, frame)?;
-                (did, crates)
+                let rows = crate::sweep::Rows::new_in(frame);
+                let place = crate::macros::Place { home, checkout, members: None, rows: &rows };
+                crate::macros::run(cx, &mut handed, None, &mut crates, place, compile, &drive(inputs), frame, frame)?
             }
         };
         let answer = match did {
@@ -235,7 +216,7 @@ impl ModuleJob<'_> {
             Did::Hole(failed, words) => ModuleAnswer::Failed(failed, Some(blaze_own::String::from_str_in(words, heap.shared())), true),
             Did::Need(wants) => return Err(EngineCheckError::Unseen { task: name, read: wants.first().map_or(name, |want| want.name) }.into()),
         };
-        Ok(WorkerOutput::Module(answer, crates))
+        Ok(WorkerOutput::Module(answer))
     }
 }
 
@@ -334,11 +315,10 @@ pub(crate) struct ScriptQueue<'s> {
     slots: &'s PoolSlots,
     width: usize,
     native_running: usize,
-    proc_running: bool,
+    proc_running: usize,
     /// Proc-macro `MacroModule` tasks admitted to `Stage::Scripts` that have not yet been filed
     /// in `ScriptsStage::finish` (so `names.mark` has not yet recorded their `out`).
     proc_unfiled: usize,
-    macro_inputs: Option<MacroInputs<'s>>,
     compile_inputs: Option<crate::wasm64_compile::CompileInputs<'s>>,
     order: BTreeMap<(bool, Name), EngineTask, &'s Frame>,
     waiting: BTreeMap<(ScriptLane, bool, Name), EngineTask, &'s Frame>,
@@ -360,7 +340,7 @@ impl<'s> ScriptQueue<'s> {
             scope, jobs, waiter: jobs.alloc(blaze_core::wait::Parker::new()),
             slots: jobs.alloc(PoolSlots { width, used: core::cell::Cell::new(0) }),
             width, native_running: 0,
-            proc_running: false, proc_unfiled: 0, macro_inputs: None, compile_inputs: None,
+            proc_running: 0, proc_unfiled: 0, compile_inputs: None,
             order: BTreeMap::new_in(jobs), waiting: BTreeMap::new_in(jobs), running: BTreeMap::new_in(jobs),
             answered: BTreeMap::new_in(jobs),
             joined_later: Vec::new_in(jobs), clock: &handles.env.clock,
@@ -408,6 +388,7 @@ impl<'s> ScriptQueue<'s> {
         }
         let built = crate::wasm64_compile::CompileInputs {
             graph: sections.graph,
+            wasm_graph: sections.wasm_graph,
             lock: side.lock.text,
             checkout: Some(root),
             members: members.into_bump_slice(),
@@ -426,9 +407,11 @@ impl<'s> ScriptQueue<'s> {
     /// `CrateScope` task invokes `ProcRunner` before a self-compiled proc-macro module is
     /// published to disk and marked on `NamesStage`.
     pub(crate) fn has_pending_proc_macro_module(&self) -> bool {
-        self.proc_unfiled > 0
-            || self.proc_running
-            || self.waiting.keys().any(|(lane, _, _)| *lane == ScriptLane::ProcLookup)
+        proc_macro_modules_pending(self.proc_unfiled, self.proc_running, &self.waiting)
+    }
+
+    fn next_dispatchable(&self, max_native_roots: usize) -> Option<(ScriptLane, bool, Name)> {
+        next_dispatchable_from(&self.waiting, self.native_running, max_native_roots)
     }
 
     /// True when every queued script task is an instantaneously-answered `Given` cell (zero
@@ -458,6 +441,9 @@ impl<'s> ScriptQueue<'s> {
             if let Err(error) = run.handle.join(cx) { failure.get_or_insert(error); }
             // Frame cells have no destructor. Drop an unconsumed worker result on error.
             drop(run.output.lock().take());
+            if run.lane == ScriptLane::ProcLookup {
+                self.proc_running = self.proc_running.saturating_sub(1);
+            }
             self.slots.release();
         }
         for handle in self.joined_later.drain(..) {
@@ -534,8 +520,9 @@ pub(crate) struct ScriptsStage<'f> {
     /// The command's scripts, opened by the first `Script` job (scripts.rs `Scripts::open`);
     /// dropped with the stage, which ends the native runner's jobserver.
     scripts: Option<Result<crate::scripts::Scripts<'f>, &'f str>>,
-    /// The graph's proc-macro crates with their identities, listed by the first lookup.
-    macros: Option<crate::macros::MacroCrates>,
+    /// The graph's proc-macro crates with their identities, listed once before dispatching
+    /// proc-macro lookups so every lookup and wasm64 self-compile runs concurrently.
+    macros: Option<std::sync::Arc<crate::macros::MacroCrates>>,
     /// Each planned task's reads, by name, sorted: what its plan hands it.
     reads: Vec<(Name, Vec<Name, &'f Frame>), &'f Frame>,
     runs: Vec<RunPlan<'f>, &'f Frame>,
@@ -1168,12 +1155,7 @@ impl<'f> ScriptsStage<'f> {
         // workspace build scripts run concurrently in one wave instead of serializing past 3.
         let max_native_roots = queue.width.div_ceil(2).max(4).min(queue.width);
         while queue.slots.free() {
-            let next = queue.waiting.keys().find(|(lane, _, _)| match lane {
-                ScriptLane::Native => queue.native_running < max_native_roots,
-                ScriptLane::ProcLookup => !queue.proc_running,
-                ScriptLane::Other => true,
-            }).copied();
-            let Some((lane, leaf, name)) = next else { break };
+            let Some((lane, leaf, name)) = queue.next_dispatchable(max_native_roots) else { break };
             let task = queue.waiting.remove(&(lane, leaf, name)).expect("the selected script was waiting");
             let began = crate::engine_times::ns(handles.env.clock.now().since_start());
             let prepared = match name.kind {
@@ -1185,7 +1167,7 @@ impl<'f> ScriptsStage<'f> {
                     queue.answered.insert(name, (task, began, began));
                     continue;
                 }
-                Kind::MacroModule => self.prepare_lookup(cx, store, handles, names, task, queue)?,
+                Kind::MacroModule => self.prepare_lookup(cx, store, handles, names, task, queue, frame)?,
                 _ => self.prepare_run(cx, store, handles, names, task, frame, queue.jobs)?,
             };
             match prepared {
@@ -1225,7 +1207,7 @@ impl<'f> ScriptsStage<'f> {
                                 Ok(result) => result?,
                                 Err(work::Panicked) => {
                                     let why = Why::Panicked { used: cx.frame().committed() as u64, limit: crate::scripts::SCRIPT_FRAME as u64 };
-                                    WorkerOutput::Module(ModuleAnswer::Failed(TaskFailure { name, why }, None, false), None)
+                                    WorkerOutput::Module(ModuleAnswer::Failed(TaskFailure { name, why }, None, false))
                                 }
                             },
                             ScriptWork::Script(job) => WorkerOutput::Run(crate::scripts::pooled(cx, &job, clock)),
@@ -1238,7 +1220,7 @@ impl<'f> ScriptsStage<'f> {
                         Ok::<_, CliError>(())
                     });
                     queue.native_running += usize::from(lane == ScriptLane::Native);
-                    if lane == ScriptLane::ProcLookup { queue.proc_running = true; }
+                    queue.proc_running += usize::from(lane == ScriptLane::ProcLookup);
                     queue.running.insert(name, Running { task, drive, finished, output, handle, lane });
                 }
             }
@@ -1285,8 +1267,7 @@ impl<'f> ScriptsStage<'f> {
         let (answer, start, end) = output.lock().take().ok_or(EngineCheckError::MissingEntry { task: name, table: Table::ScriptsOutput, key: name })?;
         let done = match answer {
             WorkerOutput::Run(pooled) => Completed::pooled(drive, pooled, frame)?,
-            WorkerOutput::Module(answer, crates) => {
-                if lane == ScriptLane::ProcLookup { self.macros = crates; }
+            WorkerOutput::Module(answer) => {
                 let did = match answer {
                     ModuleAnswer::Found(out) => {
                         let mut made = work::Made::new_in(name, frame);
@@ -1305,7 +1286,7 @@ impl<'f> ScriptsStage<'f> {
         self.completed.insert(name, done);
         queue.answered.insert(name, (task, start, end));
         queue.native_running -= usize::from(lane == ScriptLane::Native);
-        if lane == ScriptLane::ProcLookup { queue.proc_running = false; }
+        queue.proc_running -= usize::from(lane == ScriptLane::ProcLookup);
         self.dispatch(cx, store, handles, names, queue, frame)
     }
 
@@ -1457,10 +1438,12 @@ impl<'f> ScriptsStage<'f> {
 
     /// Freeze all borrowed inputs before giving the lookup to a worker. Build-script
     /// module metadata already belongs to the plan. Proc-macro lookups share a single
-    /// identity table; the first worker builds it using the same lookup as the legacy path.
+    /// immutable identity table (`Arc<MacroCrates>`) populated once on the coordinator
+    /// so every lookup and wasm64 proc-macro self-compilation runs concurrently.
+    #[expect(clippy::too_many_arguments, reason = "coordinator preparation takes stage, store, handles, names, task, queue, and request frame")]
     fn prepare_lookup<'s>(
         &mut self, cx: &Cx, store: &mut dyn crate::store::Store<'_>, handles: &Handles<'s, 'f>,
-        names: &NamesStage<'f>, task: EngineTask, queue: &mut ScriptQueue<'s>,
+        names: &NamesStage<'f>, task: EngineTask, queue: &mut ScriptQueue<'s>, frame: &'f Frame,
     ) -> Result<Dispatch<'f, 's>, CliError>
     where 'f: 's,
     {
@@ -1479,6 +1462,7 @@ impl<'f> ScriptsStage<'f> {
             };
             let module = made.script_module(name.subject).ok_or(EngineCheckError::MissingEntry { task: name, table: Table::WorldScriptModules, key: name })?;
             let wanted = crate::script_modules::Wanted {
+                script_unit: module.script_unit,
                 ran_as: module.ran_as, package: module.package, version: module.version,
                 features: queue.jobs.alloc_slice_copy(&module.features),
                 files: module.files.as_deref().map(|s| &*queue.jobs.alloc_str(s)),
@@ -1496,28 +1480,26 @@ impl<'f> ScriptsStage<'f> {
             return Ok(Dispatch::Answered(Completed::answer(drive, Did::FailedSaying(failure, "a proc-macro crate's module is looked up by its lock entry, and this command read no lock"))?));
         };
         let graph = drive.inputs.iter().find(|input| input.name == Name::unit_graph()).copied();
-        let initial = if self.macros.is_none() && side.place.home.is_some() {
-            if queue.macro_inputs.is_none() {
-                let graph = graph.ok_or(EngineCheckError::Unseen { task: name, read: Name::unit_graph() })?;
-                let mut bytes = bstd::mem::Bytes::new_in(queue.jobs, "graph record for a proc-macro module worker");
-                if !store.get_into(cx, graph.at, &mut bytes)? {
-                    return Err(CliError::Input { name: graph.name, why: work::InputWhy::Absent });
+        if self.macros.is_none()
+            && let Some(home) = side.place.home
+        {
+            let graph = graph.ok_or(EngineCheckError::Unseen { task: name, read: Name::unit_graph() })?;
+            let scratch = Frame::with_reserve(crate::scripts::SCRIPT_FRAME, bstd::mem::Tag::Other)
+                .map_err(|_| CliError::Text { what: "a proc-macro lookup scratch frame could not be reserved" })?;
+            let read = work::payload(cx, store, &graph, &scratch)?;
+            let modules = std::path::Path::new(home).join(".blaze/v2");
+            let erased = blaze_own::Erased::new(&scratch);
+            match crate::macros::list(read.unit_graph(graph.name)?, &side.lock, &modules, &side.place, erased.handle()) {
+                Ok(listed) => self.macros = Some(std::sync::Arc::new(listed)),
+                Err(error) => {
+                    let failed = TaskFailure { name, why: Why::Refused { what: "the macro crates could not be listed", rule: "macros.rs" } };
+                    let words = bstd::mem::format_in!(frame, "the proc-macro crates of the graph could not be listed: {error}");
+                    return Ok(Dispatch::Answered(Completed::answer(drive, Did::Hole(failed, work::held_str(words.as_str(), frame)))?));
                 }
-                let mut members = Vec::new_in(queue.jobs);
-                for leaf in side.place.rows.of(crate::sweep::LeafKind::MacroFiles).filter(|leaf| !leaf.absent()) {
-                    let path = side.place.rows.path(leaf);
-                    if let Some(entry) = side.place.members.and_then(|all| all.iter().find(|entry| entry.dir.as_str() == path)) {
-                        members.push((entry.id, work::held_str(path, queue.jobs), entry.kind, leaf.id));
-                    }
-                }
-                queue.macro_inputs = Some(MacroInputs { graph: queue.jobs.alloc(bytes).as_slice(), lock: side.lock.text, members: members.into_bump_slice() });
             }
-            queue.macro_inputs
-        } else {
-            None
-        };
+        }
         let compile = queue.ensure_compile_inputs(cx, store, graph_key, handles)?;
-        let lookup = ModuleJob::Proc { crates: self.macros.take(), home: side.place.home, checkout: side.place.checkout, graph, initial, compile };
+        let lookup = ModuleJob::Proc { crates: self.macros.as_ref().map(std::sync::Arc::clone), home: side.place.home, checkout: side.place.checkout, graph, compile };
         Ok(Dispatch::Run(ScriptWork::Module(lookup), drive))
     }
 
@@ -2050,6 +2032,27 @@ impl<'s, 'a: 's> Pipeline<'s, 'a> {
     }
 }
 
+fn proc_macro_modules_pending(
+    proc_unfiled: usize,
+    proc_running: usize,
+    waiting: &BTreeMap<(ScriptLane, bool, Name), EngineTask, &Frame>,
+) -> bool {
+    proc_unfiled > 0
+        || proc_running > 0
+        || waiting.keys().any(|(lane, _, _)| *lane == ScriptLane::ProcLookup)
+}
+
+fn next_dispatchable_from(
+    waiting: &BTreeMap<(ScriptLane, bool, Name), EngineTask, &Frame>,
+    native_running: usize,
+    max_native_roots: usize,
+) -> Option<(ScriptLane, bool, Name)> {
+    waiting
+        .keys()
+        .find(|(lane, _, _)| lane.can_dispatch(native_running, max_native_roots))
+        .copied()
+}
+
 #[cfg(test)]
 mod readiness_tests {
     use super::*;
@@ -2128,5 +2131,56 @@ mod readiness_tests {
         assert!(r.needs_engine_scan());
         assert_eq!(r.ready_pending, 1);
         assert!(r.is_ready(3));
+    }
+
+    #[test]
+    fn proc_lookup_lane_dispatches_concurrently_and_blocks_names_until_settled() {
+        let frame = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).expect("queue test frame");
+        let mut waiting = BTreeMap::new_in(&frame);
+        let mut proc_unfiled = 0usize;
+        let mut proc_running = 0usize;
+
+        for i in 0u8..4 {
+            let id = ContentId::of("proc-lookup-test", &[i]);
+            let name = Name::new(Kind::MacroModule, id);
+            let task = EngineTask {
+                planned: Planned { name, phase: Phase::new(Stage::Scripts, 0), source: id, file: name },
+                key: Key(id),
+            };
+            proc_unfiled += 1;
+            waiting.insert((ScriptLane::ProcLookup, false, name), task);
+        }
+        // Also queue an `Other` build-script task to verify `ProcLookup` schedules ahead of it.
+        let other_id = ContentId::of("proc-lookup-test", &[99]);
+        let other_name = Name::new(Kind::MacroModule, other_id);
+        waiting.insert(
+            (ScriptLane::Other, false, other_name),
+            EngineTask {
+                planned: Planned { name: other_name, phase: Phase::new(Stage::Scripts, 0), source: other_id, file: other_name },
+                key: Key(other_id),
+            },
+        );
+        assert!(proc_macro_modules_pending(proc_unfiled, proc_running, &waiting));
+
+        // All 4 proc-macro lookups must be dispatchable concurrently (never serialized at 1).
+        for dispatched in 1..=4usize {
+            let next = next_dispatchable_from(&waiting, 0, 4).expect("another ProcLookup must be dispatchable concurrently");
+            assert_eq!(next.0, ScriptLane::ProcLookup);
+            waiting.remove(&next);
+            proc_running += 1;
+            assert_eq!(proc_running, dispatched);
+            assert!(proc_macro_modules_pending(proc_unfiled, proc_running, &waiting));
+        }
+
+        // Only the `Other` task remains waiting; `Names` stays blocked while `proc_running > 0` or `proc_unfiled > 0`.
+        assert_eq!(next_dispatchable_from(&waiting, 0, 4).map(|k| k.0), Some(ScriptLane::Other));
+        for _ in 0..4 {
+            proc_running -= 1;
+            assert!(proc_macro_modules_pending(proc_unfiled, proc_running, &waiting));
+        }
+        for remaining in (0..4).rev() {
+            proc_unfiled -= 1;
+            assert_eq!(proc_macro_modules_pending(proc_unfiled, proc_running, &waiting), remaining > 0);
+        }
     }
 }

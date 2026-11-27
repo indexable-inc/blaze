@@ -66,7 +66,7 @@ pub struct LexedStr<'a> {
 /// A packed token: kind and length.
 type Token = u32;
 
-const _: () = assert!(size_of::<Token>() == 4, "a token is 4 bytes (docs/v2/plan/design/data.md)");
+const _: () = assert!(size_of::<Token>() == 4, "a token is 4 bytes (docs/v2/plan/design/bottom.md section 13)");
 
 const KIND_BITS: u32 = 10;
 const KIND_MASK: u32 = (1 << KIND_BITS) - 1;

@@ -26,6 +26,12 @@
 //!   `call_once`): [`crate::Adts::def_site`] of the shim's owner. So
 //!   `Some(()).map(tracked_fn)` reports core's `ops/function.rs` at the `Fn*` method, as rustc's
 //!   build does.
+//! - **A call from drop glue** (walk.rs `call_drop_impl`, `Kind::DropGlue` calling a `#[track_caller]`
+//!   `Drop::drop`): drop glue is never tracked (`Track::No`, matching rustc's
+//!   `requires_caller_location` returning `false` for `InstanceKind::DropGlue`), so its call of
+//!   the tracked `Drop::drop` passes a row of [`crate::Adts::def_site`] of the glue's owner
+//!   (`core::ptr::drop_in_place`, matching rustc's `build_drop_shim` which uses
+//!   `tcx.def_span(drop_in_place)`).
 //! - **A tracked fn taken as a fn pointer**: points to its `ReifyShim`
 //!   ([`crate::build_reify_shim`], named by [`crate::REIFY_SHIM_ITEM`]), which has the plain fn
 //!   pointer signature (no hidden location parameter), materializes a `Location` row for the fn's
@@ -76,12 +82,14 @@ const NO_REIFY_DEF_SITE: &str =
     "a `#[track_caller]` fn taken as a fn pointer: the world does not say where the fn is defined (`Adts::def_site`), the place its reify shim passes";
 const NO_DEF_SITE: &str =
     "a `#[track_caller]` fn called through a `Fn*` shim: the world does not say where the shim's `Fn*` method is defined (`Adts::def_site`), the place the shim passes";
+const NO_DROP_DEF_SITE: &str =
+    "a `#[track_caller]` `Drop::drop` called from drop glue: the world does not say where the caller is defined (`Adts::def_site`), the place the drop call passes";
 const VTABLE: &str =
     "a `#[track_caller]` method called through a trait object: its vtable shim, which passes the method's definition site, is not built yet";
 
 impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// The world's answer for the fn `instance` resolves to.
-    fn tracked(&mut self, instance: Instance) -> Option<bool> {
+    fn tracked(&mut self, instance: Instance) -> Result<Option<bool>, BuildError> {
         let adts = self.adts;
         adts.track_caller(instance, self.ground)
     }
@@ -92,7 +100,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     pub(super) fn own_tracked(&mut self) -> Result<bool, BuildError> {
         let args = self.ground.intern_list(self.args).map_err(|_| malformed("the ground table is full"))?;
         let own = Instance { item: self.body.owner, args };
-        Ok(match self.tracked(own) {
+        Ok(match self.tracked(own)? {
             Some(true) => true,
             Some(false) => {
                 self.track = Track::No;
@@ -108,7 +116,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// The location a call of `callee` at `at` passes, when `callee` is tracked (module doc):
     /// this fn's own, forwarded, or a row of `at`'s place. `None`: not tracked, nothing passed.
     pub(super) fn caller_arg(&mut self, at: Option<ExprId>, callee: Instance) -> Result<Option<Value>, BuildError> {
-        if self.tracked(callee) != Some(true) {
+        if self.tracked(callee)? != Some(true) {
             return Ok(None);
         }
         let refuse = |why| BuildError::TrackCaller { expr: at, item: callee.item, why, gap: None };
@@ -141,16 +149,39 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         self.def_site_caller_arg(callee, callee.item, NO_REIFY_DEF_SITE)
     }
 
+    /// The location a `Drop::drop` call (walk.rs `call_drop_impl`, e.g. `drop_glue` calling a
+    /// `#[track_caller]` `Drop::drop`) passes to `callee`, when `callee` is tracked: forwards `self.track` if the
+    /// current body is itself tracked (e.g. a `Box` freed directly inside a tracked fn), otherwise
+    /// builds a row of the caller's definition site (`Adts::def_site(self.body.owner)` — in
+    /// `drop_glue`, `core::ptr::drop_in_place`, matching rustc's `build_drop_shim` which uses
+    /// `tcx.def_span(drop_in_place)`). `None`: not tracked, nothing passed.
+    pub(super) fn drop_caller_arg(&mut self, callee: Instance) -> Result<Option<Value>, BuildError> {
+        if self.tracked(callee)? != Some(true) {
+            return Ok(None);
+        }
+        match self.track {
+            Track::Passed(v) => Ok(Some(v)),
+            Track::Unsaid => Err(BuildError::TrackCaller { expr: None, item: callee.item, why: UNSAID_CALLER, gap: None }),
+            Track::No => self.def_site_location(callee, self.body.owner, NO_DROP_DEF_SITE).map(Some),
+        }
+    }
+
     /// Shared helper for call shims (`Fn*` shim and `ReifyShim`): if `callee` is tracked, builds a
     /// `Location` data row for `site_item`'s definition site (`Adts::def_site(site_item)`).
     fn def_site_caller_arg(&mut self, callee: Instance, site_item: ItemKey, why: &'static str) -> Result<Option<Value>, BuildError> {
-        if self.tracked(callee) != Some(true) {
+        if self.tracked(callee)? != Some(true) {
             return Ok(None);
         }
+        self.def_site_location(callee, site_item, why).map(Some)
+    }
+
+    /// Builds a `Location` data row for `site_item`'s definition site (`Adts::def_site(site_item)`),
+    /// for a call to tracked `callee`.
+    fn def_site_location(&mut self, callee: Instance, site_item: ItemKey, why: &'static str) -> Result<Value, BuildError> {
         let adts = self.adts;
         let site = adts.def_site(site_item).map_err(|gap| BuildError::TrackCaller { expr: None, item: callee.item, why, gap: Some(gap) })?;
         let (loc_ty, ret) = self.location_tys(None)?;
-        Ok(Some(self.location_row(None, callee.item, Site::Here(site), loc_ty, ret)?))
+        self.location_row(None, callee.item, Site::Here(site), loc_ty, ret)
     }
 
     /// `core::panic::Location` (no arguments: `Location<'static>`) and `&Location`, in the
@@ -267,7 +298,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// The instance whose address represents `instance` as a plain fn pointer: its `ReifyShim`
     /// when `instance` is `#[track_caller]`, else `instance` itself.
     pub(super) fn reify_target(&mut self, instance: Instance) -> Result<Instance, BuildError> {
-        if self.tracked(instance) == Some(true) {
+        if self.tracked(instance)? == Some(true) {
             return crate::reify_shim_instance(instance, self.ground);
         }
         Ok(instance)
@@ -285,7 +316,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
     /// (the attribute on a trait's declaration applies to every impl, so every slot needs the
     /// shim).
     pub(super) fn refuse_tracked_slot(&mut self, e: ExprId, instance: Instance) -> Result<(), BuildError> {
-        if self.tracked(instance) == Some(true) {
+        if self.tracked(instance)? == Some(true) {
             return Err(BuildError::TrackCaller { expr: Some(e), item: instance.item, why: VTABLE, gap: None });
         }
         Ok(())

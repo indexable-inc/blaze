@@ -1,5 +1,5 @@
 //! Profile-Guided Linting (PGL): re-ranks lint findings and emits targeted optimization advice
-//! using historical runtime profile weights (e.g., from `blaze-profile::PgoProfile`).
+//! using historical runtime profile weights.
 //!
 //! Pure, deterministic, `#![no_std]`, zero `unsafe`, explicit-allocator only.
 

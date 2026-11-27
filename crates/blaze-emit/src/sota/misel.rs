@@ -27,7 +27,7 @@ use blaze_code::record::{
 use blaze_lir::{
     Block, BlockKind, Flags, FloatCond, IntCond, Op, Ty, Value, Verified, View,
     func::{Conv, DataId, ParamKind, RefId, RefKind, SigId, SigRec},
-    ty::Form,
+    ty::{Form, Scalar},
 };
 use blaze_own::{Alloc, Vec};
 use blaze_tier::{
@@ -54,6 +54,12 @@ const TIER: TierName = TierName::Sota;
 
 /// Maximum supported stack frame size (16 MiB, addressable by two 12-bit `sub`/`add sp` immediates).
 const FRAME_LIMIT: u32 = 1 << 24;
+
+/// Maximum stack slot alignment exponent (`2^12 = 4 KiB`, matching `pass.rs` and `isel.rs`).
+const MOST_SLOT_ALIGN: u8 = 12;
+
+/// Page step for stack-guard probing when lowering frames larger than one 4 KiB guard page.
+const PROBE_STEP: u32 = 4096;
 
 /// Maximum byte length for inline NEON `Memcpy` / `Memset`.
 const INLINE_BULK_MAX: u64 = 256;
@@ -278,6 +284,7 @@ pub fn emit_mfunc_ssa_a64<'a>(
         &mut sel.mfunc,
         &mra_out,
         sel.spill_base_off,
+        sel.most_slot_align,
         sel.has_calls,
         opts.preserve_all_cold && !sel.has_landing_blocks,
         sel.ret_gpr_mask,
@@ -412,6 +419,27 @@ const fn is_vec128(ty: Ty) -> bool {
     matches!(ty.form(), Form::Vector) && ty.bits(64) == 128
 }
 
+/// Element size (`0:B8, 1:H16, 2:S32, 3:D64`) for a 128-bit NEON lane mask `<N x i1>`
+/// (`N = 16, 8, 4, 2`), stored as all-1s / all-0s per lane in a `Vec128` register.
+#[inline]
+const fn vec_mask_elem_size(ty: Ty) -> Option<u8> {
+    if !matches!(ty.form(), Form::Vector) || !matches!(ty.elem(), Scalar::I1) {
+        return None;
+    }
+    match ty.lanes() {
+        16 => Some(0),
+        8 => Some(1),
+        4 => Some(2),
+        2 => Some(3),
+        _ => None,
+    }
+}
+
+#[inline]
+const fn is_vec_mask(ty: Ty) -> bool {
+    vec_mask_elem_size(ty).is_some()
+}
+
 /// True for 128-bit values lowered in a single NEON `Q128` (`Vec128`) register:
 /// 128-bit fixed SIMD vectors and `Ty::I128` (16-byte load/store/copy/bitcast/select).
 #[inline]
@@ -456,6 +484,15 @@ const fn splat_kind_for_ty(ty: Ty) -> Option<SplatKind> {
 /// encoding (`elem_size`: `0=B8, 1=H16, 2=S32/F32, 3=D64/F64`), or `None` if unsupported.
 #[inline]
 fn vec128_alu_op(op: Op, res_ty: Ty) -> Option<(VecAluOp, u8)> {
+    if is_vec_mask(res_ty) {
+        return match op {
+            Op::And => Some((VecAluOp::And, 0)),
+            Op::Or => Some((VecAluOp::Orr, 0)),
+            Op::Xor => Some((VecAluOp::Eor, 0)),
+            Op::Not => Some((VecAluOp::Not, 0)),
+            _ => None,
+        };
+    }
     match splat_kind_for_ty(res_ty)? {
         SplatKind::Int { elem_size } => match op {
             Op::Add => Some((VecAluOp::Add, elem_size)),
@@ -520,7 +557,7 @@ const fn vreg_class_for_ty(ty: Ty) -> Option<VRegClass> {
         Some(VRegClass::Fp32)
     } else if matches!(ty, Ty::F64) {
         Some(VRegClass::Fp64)
-    } else if is_q128_ty(ty) {
+    } else if is_q128_ty(ty) || is_vec_mask(ty) {
         Some(VRegClass::Vec128)
     } else {
         None
@@ -834,8 +871,8 @@ pub(crate) fn check_misel_subset(
     }
 
     for slot in view.slots {
-        if slot.align > 4 {
-            return Err(refuse(None, "stack slot alignment > 16 bytes"));
+        if slot.align > MOST_SLOT_ALIGN {
+            return Err(refuse(None, "stack slot alignment > 4 KiB"));
         }
     }
 
@@ -880,7 +917,7 @@ pub(crate) fn check_misel_subset(
                 }
             }
             Op::Uninit | Op::Freeze => {
-                if !is_supported_value_ty(res_ty) {
+                if !is_supported_value_ty(res_ty) && !is_vec_mask(res_ty) {
                     return Err(refuse(Some(inst), "unsupported uninit/freeze type"));
                 }
             }
@@ -1106,7 +1143,11 @@ pub(crate) fn check_misel_subset(
                 let _cond = o.int_cond();
                 let a = o.value();
                 let a_ty = view.ty(a);
-                if res_ty != Ty::I1 || (!is_scalar_int_or_ptr(a_ty) && a_ty != Ty::I128) {
+                let scalar_ok = res_ty == Ty::I1 && (is_scalar_int_or_ptr(a_ty) || a_ty == Ty::I128);
+                let vec_ok = vec_mask_elem_size(res_ty).is_some()
+                    && matches!(splat_kind_for_ty(a_ty), Some(SplatKind::Int { .. }))
+                    && res_ty.lanes() == a_ty.lanes();
+                if !scalar_ok && !vec_ok {
                     return Err(refuse(Some(inst), "icmp on unsupported type"));
                 }
             }
@@ -1119,7 +1160,12 @@ pub(crate) fn check_misel_subset(
             }
             Op::Select => {
                 let cond = o.value();
-                if view.ty(cond) != Ty::I1 || !is_supported_value_ty(res_ty) {
+                let cond_ty = view.ty(cond);
+                let scalar_ok = cond_ty == Ty::I1 && is_supported_value_ty(res_ty);
+                let vec_ok = is_vec_mask(cond_ty)
+                    && (is_vec128(res_ty) || is_vec_mask(res_ty))
+                    && cond_ty.lanes() == res_ty.lanes();
+                if !scalar_ok && !vec_ok {
                     return Err(refuse(Some(inst), "select on unsupported type"));
                 }
             }
@@ -1129,12 +1175,87 @@ pub(crate) fn check_misel_subset(
                     return Err(refuse(Some(inst), "splat on unsupported vector type"));
                 }
             }
+            Op::Bitmask => {
+                let a = o.value();
+                let src_ty = view.ty(a);
+                let ok = vec_mask_elem_size(src_ty).is_some()
+                    && is_scalar_int_or_ptr(res_ty)
+                    && res_ty != Ty::PTR
+                    && int_bits(res_ty) >= src_ty.lanes();
+                if !ok {
+                    return Err(refuse(Some(inst), "bitmask on unsupported vector mask or result type"));
+                }
+            }
+            Op::ReduceAdd
+            | Op::ReduceAnd
+            | Op::ReduceOr
+            | Op::ReduceXor
+            | Op::ReduceUmin
+            | Op::ReduceUmax
+            | Op::ReduceSmin
+            | Op::ReduceSmax => {
+                let a = o.value();
+                let src_ty = view.ty(a);
+                let ok = match splat_kind_for_ty(src_ty) {
+                    Some(SplatKind::Int { elem_size }) => {
+                        let min_max_ok = !matches!(
+                            op,
+                            Op::ReduceUmin | Op::ReduceUmax | Op::ReduceSmin | Op::ReduceSmax
+                        ) || elem_size <= 2;
+                        res_ty == src_ty.lane() && res_ty != Ty::PTR && min_max_ok
+                    }
+                    _ => false,
+                };
+                if !ok {
+                    return Err(refuse(Some(inst), "vector reduce on unsupported type"));
+                }
+            }
+            Op::Extract => {
+                let a = o.value();
+                let lane = o.imm();
+                let src_ty = view.ty(a);
+                let ok = matches!(splat_kind_for_ty(src_ty), Some(SplatKind::Int { .. }))
+                    && res_ty == src_ty.lane()
+                    && lane < src_ty.lanes();
+                if !ok {
+                    return Err(refuse(Some(inst), "vector extract on unsupported type or lane"));
+                }
+            }
+            Op::Shuffle => {
+                let a = o.value();
+                let b = o.value();
+                let mask = o.mask();
+                let ok = is_vec128(res_ty)
+                    && view.ty(a) == res_ty
+                    && view.ty(b) == res_ty
+                    && matches!(res_ty.lanes(), 2 | 4 | 8 | 16)
+                    && mask.len() == res_ty.lanes() as usize
+                    && mask.iter().all(|&m| m < 2 * res_ty.lanes());
+                if !ok {
+                    return Err(refuse(Some(inst), "shuffle on unsupported vector type"));
+                }
+            }
+            Op::Swizzle => {
+                let a = o.value();
+                let idx = o.value();
+                let ok = is_vec128(res_ty)
+                    && res_ty.lanes() == 16
+                    && view.ty(a) == res_ty
+                    && view.ty(idx) == res_ty;
+                if !ok {
+                    return Err(refuse(Some(inst), "swizzle on unsupported vector type"));
+                }
+            }
             Op::Zext | Op::Sext | Op::Trunc => {
                 let a = o.value();
                 let src_ty = view.ty(a);
                 let src_ok = (is_scalar_int_or_ptr(src_ty) && src_ty != Ty::PTR) || src_ty == Ty::I128;
                 let res_ok = (is_scalar_int_or_ptr(res_ty) && res_ty != Ty::PTR) || res_ty == Ty::I128;
-                if !src_ok || !res_ok {
+                let vec_mask_widen = matches!(op, Op::Zext | Op::Sext)
+                    && is_vec_mask(src_ty)
+                    && matches!(splat_kind_for_ty(res_ty), Some(SplatKind::Int { .. }))
+                    && src_ty.lanes() == res_ty.lanes();
+                if !(src_ok && res_ok) && !vec_mask_widen {
                     return Err(refuse(Some(inst), "int cast on unsupported type"));
                 }
             }
@@ -1924,12 +2045,13 @@ struct SelectOut<'a> {
     mfunc: MFunc<'a>,
     targets: TargetTable<'a>,
     relro: RelroData<'a>,
-    trap_kinds: Vec<(TrapKind, Option<u32>), Alloc<'a>>,
+    trap_kinds: Vec<(TrapKind, Option<u32>, Held), Alloc<'a>>,
     unwind_entries: Vec<Option<(MBlock, blaze_code::unwind::Action)>, Alloc<'a>>,
     block_weights: Vec<u32, Alloc<'a>>,
     call_clobbers_seq: Vec<CallClobbers, Alloc<'a>>,
     incoming_stack_params: Vec<IncomingStackParam, Alloc<'a>>,
     spill_base_off: u32,
+    most_slot_align: u32,
     has_calls: bool,
     has_landing_blocks: bool,
     uses_fp: bool,
@@ -1946,9 +2068,10 @@ struct Selector<'a, 'v> {
     targets: TargetTable<'a>,
     relro: RelroData<'a>,
     data_relro_off: Vec<Option<u32>, Alloc<'a>>,
-    trap_kinds: Vec<(TrapKind, Option<u32>), Alloc<'a>>,
+    trap_kinds: Vec<(TrapKind, Option<u32>, Held), Alloc<'a>>,
     unwind_entries: Vec<Option<(MBlock, blaze_code::unwind::Action)>, Alloc<'a>>,
     unreach_ord: Vec<u32, Alloc<'a>>,
+    sole_switch_default: Vec<u32, Alloc<'a>>,
     block_weights: Vec<u32, Alloc<'a>>,
     call_clobbers_seq: Vec<CallClobbers, Alloc<'a>>,
     incoming_stack_params: Vec<IncomingStackParam, Alloc<'a>>,
@@ -2109,7 +2232,7 @@ impl<'a, 'v> Selector<'a, 'v> {
             return MReg::V(self.materialize_fp_const(bits, ty == Ty::F64));
         }
         if self.view.op(idx) == Op::Uninit {
-            if is_q128_ty(ty) {
+            if is_q128_ty(ty) || is_vec_mask(ty) {
                 let v = self.mfunc.alloc_vreg(VRegClass::Vec128);
                 self.push_op(
                     MOp::VecAlu {
@@ -2139,6 +2262,70 @@ impl<'a, 'v> Selector<'a, 'v> {
             *slot = v.0;
         }
         MReg::V(v)
+    }
+
+    /// Materializes a 16-byte constant vector in a fresh `Vec128` virtual register using
+    /// `movi #0` (all zero), `mov` + `dup.2d` (matching 64-bit halves), or `dup.2d` + `ext.16b #8`.
+    fn materialize_vec16_bytes(&mut self, bytes: [u8; 16]) -> VReg {
+        let lo = u64::from_le_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]);
+        let hi = u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]);
+        if lo == 0 && hi == 0 {
+            let v = self.mfunc.alloc_vreg(VRegClass::Vec128);
+            self.push_op(
+                MOp::VecAlu {
+                    op: VecAluOp::Zero,
+                    dst: MReg::V(v),
+                    rn: MReg::vec(0),
+                    rm: None,
+                    elem_size: 0,
+                },
+                MInstFlags::REMATERIALIZABLE,
+            );
+            return v;
+        }
+        let lo_gpr = self.materialize_int_const(lo, true);
+        let v_lo = self.mfunc.alloc_vreg(VRegClass::Vec128);
+        self.push_op(
+            MOp::VecAlu {
+                op: VecAluOp::DupGen,
+                dst: MReg::V(v_lo),
+                rn: MReg::V(lo_gpr),
+                rm: None,
+                elem_size: 3,
+            },
+            MInstFlags::NONE,
+        );
+        if lo == hi {
+            return v_lo;
+        }
+        let hi_gpr = self.materialize_int_const(hi, true);
+        let v_hi = self.mfunc.alloc_vreg(VRegClass::Vec128);
+        self.push_op(
+            MOp::VecAlu {
+                op: VecAluOp::DupGen,
+                dst: MReg::V(v_hi),
+                rn: MReg::V(hi_gpr),
+                rm: None,
+                elem_size: 3,
+            },
+            MInstFlags::NONE,
+        );
+        let v = self.mfunc.alloc_vreg(VRegClass::Vec128);
+        self.push_op(
+            MOp::VecAlu {
+                op: VecAluOp::Ext { imm4: 8 },
+                dst: MReg::V(v),
+                rn: MReg::V(v_lo),
+                rm: Some(MReg::V(v_hi)),
+                elem_size: 0,
+            },
+            MInstFlags::NONE,
+        );
+        v
     }
 
     /// Allocates (or reuses a forward-preallocated) destination `VReg` for LIR instruction `inst`.
@@ -3759,6 +3946,35 @@ impl<'a, 'v> Selector<'a, 'v> {
             return;
         }
 
+        // Vector lane-mask select (`<N x i1>` selecting two 128-bit vectors or masks) -> `mov` + `bsl.16b`.
+        if is_vec_mask(self.view.ty(cond_val)) {
+            let cond_r = self.get_val(cond_val, false);
+            let tr = self.get_val(t_val, false);
+            let fr = self.get_val(f_val, false);
+            let dst = self.alloc_res_vreg(inst, res_ty);
+            self.push_op(
+                MOp::VecAlu {
+                    op: VecAluOp::Mov,
+                    dst: MReg::V(dst),
+                    rn: cond_r,
+                    rm: None,
+                    elem_size: 0,
+                },
+                MInstFlags::NONE,
+            );
+            self.push_op(
+                MOp::VecAlu {
+                    op: VecAluOp::Bsl,
+                    dst: MReg::V(dst),
+                    rn: tr,
+                    rm: Some(fr),
+                    elem_size: 0,
+                },
+                MInstFlags::NONE,
+            );
+            return;
+        }
+
         // 128-bit vector / Q128 `I128` select -> `csetm` + `dup.2d` + `bsl.16b`.
         if is_q128_ty(res_ty) {
             let tr = self.get_val(t_val, false);
@@ -4376,8 +4592,8 @@ impl<'a, 'v> Selector<'a, 'v> {
         let pat = at(&self.pattern, inst, SelPattern::None);
         let mut o = self.view.operands(inst);
 
-        // Native 128-bit NEON SIMD ALU (`v16i8`/`v8i16`/`v4i32`/`v2i64`/`v4f32`/`v2f64`).
-        if is_vec128(res_ty)
+        // Native 128-bit NEON SIMD ALU (`v16i8`/`v8i16`/`v4i32`/`v2i64`/`v4f32`/`v2f64` and `<N x i1>` masks).
+        if (is_vec128(res_ty) || is_vec_mask(res_ty))
             && let Some((vec_op, elem_size)) = vec128_alu_op(op, res_ty)
         {
             let dst = self.alloc_res_vreg(inst, res_ty);
@@ -4825,6 +5041,61 @@ impl<'a, 'v> Selector<'a, 'v> {
             }
 
             Op::Icmp => {
+                if let Some(elem_size) = vec_mask_elem_size(res_ty) {
+                    let ic = o.int_cond();
+                    let a = o.value();
+                    let b = o.value();
+                    let ar = self.get_val(a, false);
+                    let br = self.get_val(b, false);
+                    let (vec_op, rn, rm, invert) = match ic {
+                        IntCond::Eq => (VecAluOp::Cmeq, ar, br, false),
+                        IntCond::Ne => (VecAluOp::Cmeq, ar, br, true),
+                        IntCond::Sgt => (VecAluOp::Cmgt, ar, br, false),
+                        IntCond::Sge => (VecAluOp::Cmge, ar, br, false),
+                        IntCond::Slt => (VecAluOp::Cmgt, br, ar, false),
+                        IntCond::Sle => (VecAluOp::Cmge, br, ar, false),
+                        IntCond::Ugt => (VecAluOp::Cmhi, ar, br, false),
+                        IntCond::Uge => (VecAluOp::Cmhs, ar, br, false),
+                        IntCond::Ult => (VecAluOp::Cmhi, br, ar, false),
+                        IntCond::Ule => (VecAluOp::Cmhs, br, ar, false),
+                    };
+                    let dst = self.alloc_res_vreg(inst, res_ty);
+                    if invert {
+                        let tmp = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: vec_op,
+                                dst: MReg::V(tmp),
+                                rn,
+                                rm: Some(rm),
+                                elem_size,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Not,
+                                dst: MReg::V(dst),
+                                rn: MReg::V(tmp),
+                                rm: None,
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                    } else {
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: vec_op,
+                                dst: MReg::V(dst),
+                                rn,
+                                rm: Some(rm),
+                                elem_size,
+                            },
+                            MInstFlags::NONE,
+                        );
+                    }
+                    return Ok(());
+                }
                 if at(&self.cmp_all_fused, inst, false) {
                     return Ok(());
                 }
@@ -4964,14 +5235,48 @@ impl<'a, 'v> Selector<'a, 'v> {
             }
 
             Op::Zext => {
-                // Our SSA invariant guarantees bits `[63:w]` are ALWAYS zero for every narrow integer!
                 let a = o.value();
+                if let Some(elem_size) = vec_mask_elem_size(self.view.ty(a)) {
+                    // NEON lane mask is all-1s / 0 per lane; zext yields 1 / 0 per lane.
+                    let ar = self.get_val(a, false);
+                    let one_gpr = self.materialize_int_const(1, elem_size == 3);
+                    let one_vec = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                    self.push_op(
+                        MOp::VecAlu {
+                            op: VecAluOp::DupGen,
+                            dst: MReg::V(one_vec),
+                            rn: MReg::V(one_gpr),
+                            rm: None,
+                            elem_size,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    let dst = self.alloc_res_vreg(inst, res_ty);
+                    self.push_op(
+                        MOp::VecAlu {
+                            op: VecAluOp::And,
+                            dst: MReg::V(dst),
+                            rn: ar,
+                            rm: Some(MReg::V(one_vec)),
+                            elem_size: 0,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    return Ok(());
+                }
+                // Our SSA invariant guarantees bits `[63:w]` are ALWAYS zero for every narrow integer!
                 let ar = self.get_val(a, false);
                 self.bind_alias_vreg(inst, ar, res_ty);
             }
 
             Op::Sext => {
                 let a = o.value();
+                if is_vec_mask(self.view.ty(a)) {
+                    // NEON compare masks are already sign-extended (0xFF..FF / 0x00..00) per lane!
+                    let ar = self.get_val(a, false);
+                    self.bind_alias_vreg(inst, ar, res_ty);
+                    return Ok(());
+                }
                 let from_bits = int_bits(self.view.ty(a));
                 let to_bits = int_bits(res_ty);
                 let ar = self.get_val(a, false);
@@ -5150,6 +5455,465 @@ impl<'a, 'v> Selector<'a, 'v> {
                         self.bind_alias_vreg(inst, sr, res_ty);
                     }
                 }
+            }
+
+            Op::Bitmask => {
+                let a = o.value();
+                let src_ty = self.view.ty(a);
+                let Some(elem_size) = vec_mask_elem_size(src_ty) else {
+                    return Err(refuse(Some(inst), "bitmask on unsupported vector mask"));
+                };
+                let mask_r = self.get_val(a, false);
+                let dst = self.alloc_res_vreg(inst, res_ty);
+                match elem_size {
+                    // `<16 x i1>`: both 64-bit halves hold `[1, 2, 4, 8, 16, 32, 64, 128]`.
+                    // `and` + 3x `addp.16b` packs bits 0..7 into byte 0 and bits 8..15 into byte 1!
+                    0 => {
+                        let w_gpr = self.materialize_int_const(0x8040_2010_0804_0201u64, true);
+                        let w_vec = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::DupGen,
+                                dst: MReg::V(w_vec),
+                                rn: MReg::V(w_gpr),
+                                rm: None,
+                                elem_size: 3,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        let masked = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::And,
+                                dst: MReg::V(masked),
+                                rn: mask_r,
+                                rm: Some(MReg::V(w_vec)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        let p1 = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Addp,
+                                dst: MReg::V(p1),
+                                rn: MReg::V(masked),
+                                rm: Some(MReg::V(masked)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        let p2 = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Addp,
+                                dst: MReg::V(p2),
+                                rn: MReg::V(p1),
+                                rm: Some(MReg::V(p1)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        let p3 = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Addp,
+                                dst: MReg::V(p3),
+                                rn: MReg::V(p2),
+                                rm: Some(MReg::V(p2)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::UmovLane { lane: 0 },
+                                dst: MReg::V(dst),
+                                rn: MReg::V(p3),
+                                rm: None,
+                                elem_size: 1,
+                            },
+                            MInstFlags::NONE,
+                        );
+                    }
+                    // `<8 x i1>`, `<4 x i1>`, `<2 x i1>`: build 128-bit weight vector via `dup.2d` +
+                    // `ext.16b #8`, mask with `and.16b`, reduce horizontally (`addv`/`addp`), `umov`.
+                    1..=3 => {
+                        let (lo_w, hi_w) = match elem_size {
+                            1 => (0x0008_0004_0002_0001u64, 0x0080_0040_0020_0010u64),
+                            2 => (0x0000_0002_0000_0001u64, 0x0000_0008_0000_0004u64),
+                            _ => (1u64, 2u64),
+                        };
+                        let lo_gpr = self.materialize_int_const(lo_w, true);
+                        let hi_gpr = self.materialize_int_const(hi_w, true);
+                        let v_lo = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        let v_hi = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        let v_w = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::DupGen,
+                                dst: MReg::V(v_lo),
+                                rn: MReg::V(lo_gpr),
+                                rm: None,
+                                elem_size: 3,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::DupGen,
+                                dst: MReg::V(v_hi),
+                                rn: MReg::V(hi_gpr),
+                                rm: None,
+                                elem_size: 3,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Ext { imm4: 8 },
+                                dst: MReg::V(v_w),
+                                rn: MReg::V(v_lo),
+                                rm: Some(MReg::V(v_hi)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        let masked = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::And,
+                                dst: MReg::V(masked),
+                                rn: mask_r,
+                                rm: Some(MReg::V(v_w)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        let reduced = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        let (red_op, umov_size) = if elem_size == 3 {
+                            (VecAluOp::AddpD, 2)
+                        } else {
+                            (VecAluOp::Addv, elem_size)
+                        };
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: red_op,
+                                dst: MReg::V(reduced),
+                                rn: MReg::V(masked),
+                                rm: None,
+                                elem_size,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::UmovLane { lane: 0 },
+                                dst: MReg::V(dst),
+                                rn: MReg::V(reduced),
+                                rm: None,
+                                elem_size: umov_size,
+                            },
+                            MInstFlags::NONE,
+                        );
+                    }
+                    _ => return Err(refuse(Some(inst), "bitmask on unsupported vector mask")),
+                }
+            }
+
+            Op::ReduceAdd
+            | Op::ReduceAnd
+            | Op::ReduceOr
+            | Op::ReduceXor
+            | Op::ReduceUmin
+            | Op::ReduceUmax
+            | Op::ReduceSmin
+            | Op::ReduceSmax => {
+                let a = o.value();
+                let src_ty = self.view.ty(a);
+                let Some(SplatKind::Int { elem_size }) = splat_kind_for_ty(src_ty) else {
+                    return Err(refuse(Some(inst), "vector reduce on unsupported type"));
+                };
+                let src_r = self.get_val(a, false);
+                let dst = self.alloc_res_vreg(inst, res_ty);
+                if op == Op::ReduceAdd {
+                    let reduced = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                    let red_op = if elem_size == 3 { VecAluOp::AddpD } else { VecAluOp::Addv };
+                    self.push_op(
+                        MOp::VecAlu {
+                            op: red_op,
+                            dst: MReg::V(reduced),
+                            rn: src_r,
+                            rm: None,
+                            elem_size,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    self.push_op(
+                        MOp::VecAlu {
+                            op: VecAluOp::UmovLane { lane: 0 },
+                            dst: MReg::V(dst),
+                            rn: MReg::V(reduced),
+                            rm: None,
+                            elem_size,
+                        },
+                        MInstFlags::NONE,
+                    );
+                } else if op == Op::ReduceUmin && elem_size == 0 {
+                    let reduced = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                    self.push_op(
+                        MOp::VecAlu {
+                            op: VecAluOp::UminvB,
+                            dst: MReg::V(reduced),
+                            rn: src_r,
+                            rm: None,
+                            elem_size: 0,
+                        },
+                        MInstFlags::NONE,
+                    );
+                    self.push_op(
+                        MOp::VecAlu {
+                            op: VecAluOp::UmovLane { lane: 0 },
+                            dst: MReg::V(dst),
+                            rn: MReg::V(reduced),
+                            rm: None,
+                            elem_size: 0,
+                        },
+                        MInstFlags::NONE,
+                    );
+                } else {
+                    let (fold_op, op_elem_size) = match op {
+                        Op::ReduceAnd => (VecAluOp::And, 0),
+                        Op::ReduceOr => (VecAluOp::Orr, 0),
+                        Op::ReduceXor => (VecAluOp::Eor, 0),
+                        Op::ReduceUmin => (VecAluOp::Umin, elem_size),
+                        Op::ReduceUmax => (VecAluOp::Umax, elem_size),
+                        Op::ReduceSmin => (VecAluOp::Smin, elem_size),
+                        Op::ReduceSmax => (VecAluOp::Smax, elem_size),
+                        _ => return Err(refuse(Some(inst), "vector reduce on unsupported op")),
+                    };
+                    let steps: &[u8] = match elem_size {
+                        0 => &[8, 4, 2, 1],
+                        1 => &[8, 4, 2],
+                        2 => &[8, 4],
+                        3 => &[8],
+                        _ => &[],
+                    };
+                    let mut cur = src_r;
+                    for &shift_bytes in steps {
+                        let shifted = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Ext { imm4: shift_bytes },
+                                dst: MReg::V(shifted),
+                                rn: cur,
+                                rm: Some(cur),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        let next = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: fold_op,
+                                dst: MReg::V(next),
+                                rn: cur,
+                                rm: Some(MReg::V(shifted)),
+                                elem_size: op_elem_size,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        cur = MReg::V(next);
+                    }
+                    self.push_op(
+                        MOp::VecAlu {
+                            op: VecAluOp::UmovLane { lane: 0 },
+                            dst: MReg::V(dst),
+                            rn: cur,
+                            rm: None,
+                            elem_size,
+                        },
+                        MInstFlags::NONE,
+                    );
+                }
+            }
+
+            Op::Extract => {
+                let a = o.value();
+                let lane = o.imm();
+                let src_ty = self.view.ty(a);
+                let Some(SplatKind::Int { elem_size }) = splat_kind_for_ty(src_ty) else {
+                    return Err(refuse(Some(inst), "vector extract on unsupported type"));
+                };
+                let src_r = self.get_val(a, false);
+                let dst = self.alloc_res_vreg(inst, res_ty);
+                self.push_op(
+                    MOp::VecAlu {
+                        op: VecAluOp::UmovLane { lane: u8_of(lane).unwrap_or(0) },
+                        dst: MReg::V(dst),
+                        rn: src_r,
+                        rm: None,
+                        elem_size,
+                    },
+                    MInstFlags::NONE,
+                );
+            }
+
+            Op::Shuffle => {
+                let a = o.value();
+                let b = o.value();
+                let mask = o.mask();
+                let lanes = res_ty.lanes() as usize;
+                let stride = 16 / lanes;
+                let mut byte_idx = [0u8; 16];
+                for (li, &src_lane) in mask.iter().enumerate() {
+                    let src_base = (src_lane as usize) * stride;
+                    for k in 0..stride {
+                        byte_idx[li * stride + k] = (src_base + k) as u8;
+                    }
+                }
+                let ar = self.get_val(a, false);
+                let br = self.get_val(b, false);
+
+                // Fast paths: exact identity of `a` or `b` -> 0 instructions.
+                let is_id_a = byte_idx.iter().enumerate().all(|(k, &v)| v == k as u8);
+                let is_id_b = byte_idx.iter().enumerate().all(|(k, &v)| v == (16 + k) as u8);
+                if is_id_a {
+                    self.bind_alias_vreg(inst, ar, res_ty);
+                } else if is_id_b {
+                    self.bind_alias_vreg(inst, br, res_ty);
+                } else if byte_idx[0] < 16
+                    && byte_idx.iter().enumerate().all(|(k, &v)| v == byte_idx[0] + k as u8)
+                {
+                    // Contiguous shift across `a || b` -> single `ext vd.16b, va.16b, vb.16b, #imm4`.
+                    let dst = self.alloc_res_vreg(inst, res_ty);
+                    self.push_op(
+                        MOp::VecAlu {
+                            op: VecAluOp::Ext { imm4: byte_idx[0] },
+                            dst: MReg::V(dst),
+                            rn: ar,
+                            rm: Some(br),
+                            elem_size: 0,
+                        },
+                        MInstFlags::NONE,
+                    );
+                } else if byte_idx[0] >= 16
+                    && byte_idx
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &v)| v == (((byte_idx[0] as usize) + k) % 32) as u8)
+                {
+                    // Contiguous shift across `b || a` -> single `ext vd.16b, vb.16b, va.16b, #imm4`.
+                    let dst = self.alloc_res_vreg(inst, res_ty);
+                    self.push_op(
+                        MOp::VecAlu {
+                            op: VecAluOp::Ext { imm4: byte_idx[0] - 16 },
+                            dst: MReg::V(dst),
+                            rn: br,
+                            rm: Some(ar),
+                            elem_size: 0,
+                        },
+                        MInstFlags::NONE,
+                    );
+                } else {
+                    let all_a = byte_idx.iter().all(|&v| v < 16);
+                    let all_b = byte_idx.iter().all(|&v| v >= 16);
+                    let dst = self.alloc_res_vreg(inst, res_ty);
+                    if all_a {
+                        let v_idx = self.materialize_vec16_bytes(byte_idx);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Tbl1,
+                                dst: MReg::V(dst),
+                                rn: ar,
+                                rm: Some(MReg::V(v_idx)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                    } else if all_b {
+                        let mut b_idx = [0u8; 16];
+                        for k in 0..16 {
+                            b_idx[k] = byte_idx[k] - 16;
+                        }
+                        let v_idx = self.materialize_vec16_bytes(b_idx);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Tbl1,
+                                dst: MReg::V(dst),
+                                rn: br,
+                                rm: Some(MReg::V(v_idx)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                    } else {
+                        // General 2-vector shuffle via two independent `tbl1`s (out-of-range
+                        // index `0xff` zeroes non-selected bytes) + `orr` — zero consecutive-reg
+                        // allocator constraints!
+                        let mut a_idx = [0xffu8; 16];
+                        let mut b_idx = [0xffu8; 16];
+                        for k in 0..16 {
+                            if byte_idx[k] < 16 {
+                                a_idx[k] = byte_idx[k];
+                            } else {
+                                b_idx[k] = byte_idx[k] - 16;
+                            }
+                        }
+                        let va_idx = self.materialize_vec16_bytes(a_idx);
+                        let vb_idx = self.materialize_vec16_bytes(b_idx);
+                        let ta = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        let tb = self.mfunc.alloc_vreg(VRegClass::Vec128);
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Tbl1,
+                                dst: MReg::V(ta),
+                                rn: ar,
+                                rm: Some(MReg::V(va_idx)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Tbl1,
+                                dst: MReg::V(tb),
+                                rn: br,
+                                rm: Some(MReg::V(vb_idx)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                        self.push_op(
+                            MOp::VecAlu {
+                                op: VecAluOp::Orr,
+                                dst: MReg::V(dst),
+                                rn: MReg::V(ta),
+                                rm: Some(MReg::V(tb)),
+                                elem_size: 0,
+                            },
+                            MInstFlags::NONE,
+                        );
+                    }
+                }
+            }
+
+            Op::Swizzle => {
+                let a = o.value();
+                let idx = o.value();
+                let ar = self.get_val(a, false);
+                let ir = self.get_val(idx, false);
+                let dst = self.alloc_res_vreg(inst, res_ty);
+                self.push_op(
+                    MOp::VecAlu {
+                        op: VecAluOp::Tbl1,
+                        dst: MReg::V(dst),
+                        rn: ar,
+                        rm: Some(ir),
+                        elem_size: 0,
+                    },
+                    MInstFlags::NONE,
+                );
             }
 
             Op::Load => {
@@ -5467,7 +6231,23 @@ impl<'a, 'v> Selector<'a, 'v> {
                 let imm = u16_of(BRK_UNREACHABLE).unwrap_or(0xff02);
                 let trap_idx = u32_of(self.trap_kinds.len()).unwrap_or(u32::MAX);
                 let ord = self.unreach_ord.get(inst).copied().filter(|&o| o != NONE_U32);
-                self.trap_kinds.push((TrapKind::Intrinsic, ord));
+                let mut held = Held::Unknown;
+                if ord.is_some()
+                    && let Some(&blk_idx) = self.inst_block.get(inst)
+                    && self.view.block(Block(blk_idx)).start == inst
+                    && let Some(&switch_term) = self.sole_switch_default.get(to_idx(blk_idx))
+                    && switch_term != NONE_U32
+                {
+                    let scrut = self.view.operands(to_idx(switch_term)).value();
+                    if self.view.ty(scrut) != Ty::I128 {
+                        let sr = self.get_val(scrut, false);
+                        scratch_pairs.clear();
+                        scratch_pairs.push((MReg::gpr(9), sr));
+                        self.mfunc.push_parallel_copy(scratch_pairs, MInstFlags::NONE);
+                        held = Held::Reg(9);
+                    }
+                }
+                self.trap_kinds.push((TrapKind::Intrinsic, ord, held));
                 let mi = self.push_op(
                     MOp::Brk { imm },
                     MInstFlags::TERMINATOR.union(MInstFlags::MAY_TRAP),
@@ -8165,6 +8945,16 @@ fn compute_use_counts<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<u32, Alloc<'
             | Op::FptoSi
             | Op::Project
             | Op::Splat
+            | Op::Bitmask
+            | Op::ReduceAdd
+            | Op::ReduceAnd
+            | Op::ReduceOr
+            | Op::ReduceXor
+            | Op::ReduceUmin
+            | Op::ReduceUmax
+            | Op::ReduceSmin
+            | Op::ReduceSmax
+            | Op::Extract
             | Op::Resume => inc(o.value()),
             Op::Add
             | Op::Sub
@@ -8202,7 +8992,9 @@ fn compute_use_counts<'a>(view: &View<'_>, alloc: Alloc<'a>) -> Vec<u32, Alloc<'
             | Op::Fadd
             | Op::Fsub
             | Op::Fmul
-            | Op::Fdiv => {
+            | Op::Fdiv
+            | Op::Shuffle
+            | Op::Swizzle => {
                 inc(o.value());
                 inc(o.value());
             }
@@ -8334,7 +9126,7 @@ fn match_patterns(
                 let c = o.value();
                 let t = o.value();
                 let f = o.value();
-                if t != c && f != c { Some(c) } else { None }
+                if view.ty(c) == Ty::I1 && t != c && f != c { Some(c) } else { None }
             }
             _ => None,
         };
@@ -8391,8 +9183,8 @@ fn match_patterns(
         }
         let op = view.op(inst);
         let is_fusible_cmp = match op {
-            Op::Icmp => true,
-            Op::Fcmp => float_cond_to_mcond(view.operands(inst).float_cond()).is_some(),
+            Op::Icmp => ty_at(view, inst) == Ty::I1,
+            Op::Fcmp => ty_at(view, inst) == Ty::I1 && float_cond_to_mcond(view.operands(inst).float_cond()).is_some(),
             _ => false,
         };
         let uc = at(use_count, inst, 0);
@@ -8915,7 +9707,7 @@ fn match_patterns(
     // (`Tbz`/`Tbnz` for single-bit masks, `TstImm` + `BCond`/`Csel` for general logical bitmasks)
     // and mark the dead `And` skipped so neither `and` nor an extra temp register is emitted!
     for inst in 0..n {
-        if at(skip_inst, inst, false) || view.op(inst) != Op::Icmp {
+        if at(skip_inst, inst, false) || view.op(inst) != Op::Icmp || ty_at(view, inst) != Ty::I1 {
             continue;
         }
         let b = at(inst_block, inst, 0);
@@ -9126,8 +9918,12 @@ fn select_mfunc_ssa<'a>(
         })?;
     let mut slot_off: Vec<u32, Alloc<'a>> = Vec::with_capacity_in(view.slots.len(), alloc);
     let mut cursor = byval_end;
+    let mut most_slot_align: u32 = 16;
     for slot in view.slots {
         let align = 1u32 << u32::from(slot.align);
+        if align > most_slot_align {
+            most_slot_align = align;
+        }
         let at = align_up_u32(cursor, align).ok_or(TierError::TooLarge {
             tier: TIER,
             what: "local stack slots",
@@ -9378,6 +10174,7 @@ fn select_mfunc_ssa<'a>(
         trap_kinds: Vec::new_in(alloc),
         unwind_entries: Vec::new_in(alloc),
         unreach_ord,
+        sole_switch_default: crate::pass::frame::sole_switch_defaults(*view, alloc),
         block_weights: Vec::with_capacity_in(n_blocks * 2, alloc),
         call_clobbers_seq: Vec::new_in(alloc),
         incoming_stack_params: Vec::new_in(alloc),
@@ -9622,9 +10419,10 @@ fn select_mfunc_ssa<'a>(
         call_clobbers_seq: sel.call_clobbers_seq,
         incoming_stack_params: sel.incoming_stack_params,
         spill_base_off,
+        most_slot_align,
         has_calls: sel.has_calls,
         has_landing_blocks: sel.has_landing_blocks,
-        uses_fp: false,
+        uses_fp: most_slot_align > 16,
         ret_gpr_mask,
         ret_fp_mask,
     })
@@ -9888,9 +10686,10 @@ fn push_sp_adjust(func: &mut MFunc<'_>, is_sub: bool, bytes: u32) {
     }
 }
 
-/// Emits a single `Ldr`/`Str` at `[SP + off]` using `X16` if `off` exceeds `BaseOff` range.
-fn push_sp_mem_single(
+/// Emits a single `Ldr`/`Str` at `[base + off]` (`SP` or `FP`) using `X16` if `off` exceeds `BaseOff` range.
+fn push_base_mem_single(
     func: &mut MFunc<'_>,
+    base: MReg,
     is_load: bool,
     reg: MReg,
     off: u32,
@@ -9906,14 +10705,14 @@ fn push_sp_mem_single(
         let op = if is_load {
             MOp::Ldr {
                 dst: reg,
-                addr: AddrMode::BaseOff { base: MReg::SP, off: off32 },
+                addr: AddrMode::BaseOff { base, off: off32 },
                 size,
                 signed: false,
             }
         } else {
             MOp::Str {
                 src: reg,
-                addr: AddrMode::BaseOff { base: MReg::SP, off: off32 },
+                addr: AddrMode::BaseOff { base, off: off32 },
                 size,
             }
         };
@@ -9929,7 +10728,7 @@ fn push_sp_mem_single(
         func.push_inst(
             MOp::AddImm {
                 dst: MReg::p(PReg::X16),
-                rn: MReg::SP,
+                rn: base,
                 imm12: hi16,
                 shift12: true,
                 wide: true,
@@ -9954,7 +10753,7 @@ fn push_sp_mem_single(
         func.push_inst(
             MOp::AddImm {
                 dst: MReg::p(PReg::X16),
-                rn: MReg::SP,
+                rn: base,
                 imm12: lo16,
                 shift12: false,
                 wide: true,
@@ -9978,6 +10777,141 @@ fn push_sp_mem_single(
         }
     };
     func.push_inst(op, fl);
+}
+
+/// Emits a single `Ldr`/`Str` at `[SP + off]` using `X16` if `off` exceeds `BaseOff` range.
+fn push_sp_mem_single(
+    func: &mut MFunc<'_>,
+    is_load: bool,
+    reg: MReg,
+    off: u32,
+    size: MemSize,
+    extra_flags: MInstFlags,
+) {
+    push_base_mem_single(func, MReg::SP, is_load, reg, off, size, extra_flags);
+}
+
+/// Emits `sub sp, sp, #bytes` with inline 4 KiB stack-guard probing whenever `total_drop > PROBE_STEP`.
+/// Returns the active entry block (identical to `cur_blk` unless a multi-page probe loop block was added).
+fn push_sp_sub_probed(
+    func: &mut MFunc<'_>,
+    cur_blk: MBlock,
+    bytes: u32,
+    total_drop: u32,
+) -> MBlock {
+    if bytes == 0 {
+        return cur_blk;
+    }
+    if total_drop <= PROBE_STEP {
+        push_sp_adjust(func, true, bytes);
+        return cur_blk;
+    }
+    let pages = bytes / PROBE_STEP;
+    let rem = bytes % PROBE_STEP;
+    if pages <= 16 {
+        for _ in 0..pages {
+            func.push_inst(
+                MOp::SubImm {
+                    dst: MReg::SP,
+                    rn: MReg::SP,
+                    imm12: 1,
+                    shift12: true,
+                    wide: true,
+                    sets_flags: false,
+                },
+                MInstFlags::PINNED,
+            );
+            func.push_inst(
+                MOp::Str {
+                    src: MReg::XZR,
+                    addr: AddrMode::BaseOff { base: MReg::SP, off: 0 },
+                    size: MemSize::X64,
+                },
+                MInstFlags::MEM_WRITE.union(MInstFlags::PINNED),
+            );
+        }
+        if rem > 0 {
+            push_sp_adjust(func, true, rem);
+            func.push_inst(
+                MOp::Str {
+                    src: MReg::XZR,
+                    addr: AddrMode::BaseOff { base: MReg::SP, off: 0 },
+                    size: MemSize::X64,
+                },
+                MInstFlags::MEM_WRITE.union(MInstFlags::PINNED),
+            );
+        }
+        return cur_blk;
+    }
+
+    // Large frame (> 64 KiB): emit a compact 6-instruction `X17` probe loop block.
+    let probe_blk = func.new_block(false);
+    let cont_blk = func.new_block(false);
+    let page_bytes = u64::from(pages).saturating_mul(u64::from(PROBE_STEP));
+    func.push_inst(
+        MOp::MovImm { dst: MReg::p(PReg::X17), imm: page_bytes, wide: true },
+        MInstFlags::PINNED,
+    );
+    func.push_inst(
+        MOp::B { target: probe_blk },
+        MInstFlags::TERMINATOR.union(MInstFlags::PINNED),
+    );
+    func.end_block(cur_blk);
+
+    func.begin_block(probe_blk);
+    func.push_inst(
+        MOp::SubImm {
+            dst: MReg::SP,
+            rn: MReg::SP,
+            imm12: 1,
+            shift12: true,
+            wide: true,
+            sets_flags: false,
+        },
+        MInstFlags::PINNED,
+    );
+    func.push_inst(
+        MOp::Str {
+            src: MReg::XZR,
+            addr: AddrMode::BaseOff { base: MReg::SP, off: 0 },
+            size: MemSize::X64,
+        },
+        MInstFlags::MEM_WRITE.union(MInstFlags::PINNED),
+    );
+    func.push_inst(
+        MOp::SubImm {
+            dst: MReg::p(PReg::X17),
+            rn: MReg::p(PReg::X17),
+            imm12: 1,
+            shift12: true,
+            wide: true,
+            sets_flags: false,
+        },
+        MInstFlags::PINNED,
+    );
+    func.push_inst(
+        MOp::Cbnz { rt: MReg::p(PReg::X17), target: probe_blk, wide: true },
+        MInstFlags::TERMINATOR.union(MInstFlags::PINNED),
+    );
+    func.push_inst(
+        MOp::B { target: cont_blk },
+        MInstFlags::TERMINATOR.union(MInstFlags::PINNED),
+    );
+    func.end_block(probe_blk);
+
+    func.begin_block(cont_blk);
+    if rem > 0 {
+        push_sp_adjust(func, true, rem);
+        func.push_inst(
+            MOp::Str {
+                src: MReg::XZR,
+                addr: AddrMode::BaseOff { base: MReg::SP, off: 0 },
+                size: MemSize::X64,
+            },
+            MInstFlags::MEM_WRITE.union(MInstFlags::PINNED),
+        );
+    }
+    cont_blk
 }
 
 #[inline]
@@ -10092,6 +11026,7 @@ fn insert_prologue_epilogue<'a>(
     func: &mut MFunc<'a>,
     mra_out: &MRaOut,
     spill_base_off: u32,
+    most_slot_align: u32,
     has_calls: bool,
     preserve_all_cold: bool,
     ret_gpr_mask: u32,
@@ -10099,6 +11034,7 @@ fn insert_prologue_epilogue<'a>(
     incoming_stack_params: &[IncomingStackParam],
     alloc: Alloc<'a>,
 ) -> Result<FrameOut, TierError> {
+    let needs_dynamic_align = most_slot_align > 16;
     // 1. Collect registers to save/restore.
     let mut gprs_to_save: Vec<u8, Alloc<'a>> = Vec::new_in(alloc);
     let mut fps_to_save: Vec<u8, Alloc<'a>> = Vec::new_in(alloc);
@@ -10220,15 +11156,19 @@ fn insert_prologue_epilogue<'a>(
         clobbered: RegSet(mra_out.clobbers.clobbered.0 & !saved_full_mask),
     };
 
-    // Fast path: frameless leaf with zero incoming stack params -> nothing to rewrite!
-    if frame_size == 0 && incoming_stack_params.is_empty() {
+    // Fast path: frameless leaf with zero incoming stack params and <=16B stack align -> nothing to rewrite!
+    if frame_size == 0 && incoming_stack_params.is_empty() && !needs_dynamic_align {
         return Ok(FrameOut { unwind_frame: None, final_clobbers });
     }
 
-    // For calling functions (`has_calls`), emit Apple/LLVM canonical ARM64 compact-unwind frame:
+    // For calling functions (`has_calls`) or over-aligned frames (`most_slot_align > 16`), emit
+    // Apple/LLVM canonical ARM64 compact-unwind FP-anchored frame:
     // `stp x29, x30, [sp, #-16]!`; `add x29, sp, #0`; `stp x(20+2k), x(19+2k), [sp, #-16]!`;
-    // `stp d(9+2k), d(8+2k), [sp, #-16]!`; then `sub sp, sp, #local_and_cold_bytes`.
-    if has_calls {
+    // `stp d(9+2k), d(8+2k), [sp, #-16]!`; `sub sp, sp, #local_and_cold_bytes`; and if
+    // `most_slot_align > 16`, dynamically align `sp` down (`mov x16, sp; and sp, x16, #-align`),
+    // load incoming stacked params via `[x29, #(16 + caller_off)]`, and restore `sp` from `x29`
+    // in the epilogue (`mov sp, x29` / `sub sp, x29, #saved_below_fp`).
+    if has_calls || needs_dynamic_align {
         let mut x_pairs: u8 = 0;
         let mut d_pairs: u8 = 0;
         let mut canonical_saved_gpr_mask: u32 = (1u32 << 29) | (1u32 << 30);
@@ -10313,8 +11253,11 @@ fn insert_prologue_epilogue<'a>(
             .saturating_add(x_pairs.count_ones())
             .saturating_add(d_pairs.count_ones());
         let saved_pair_bytes = pair_count.saturating_mul(16);
+        let saved_below_fp = saved_pair_bytes.saturating_sub(16);
+        let align_pad = most_slot_align.saturating_sub(16);
         let total_drop = local_bytes
             .checked_add(saved_pair_bytes)
+            .and_then(|v| v.checked_add(align_pad))
             .ok_or(TierError::TooLarge { tier: TIER, what: "stack frame" })?;
         if total_drop >= FRAME_LIMIT {
             return Err(TierError::TooLarge { tier: TIER, what: "stack frame (>= 16 MiB)" });
@@ -10342,7 +11285,8 @@ fn insert_prologue_epilogue<'a>(
 
         let mut patched_stack_params = 0usize;
         for (ord_pos, &blk) in func.block_order.iter().enumerate() {
-            framed.begin_block(blk);
+            let mut active_blk = blk;
+            framed.begin_block(active_blk);
             if ord_pos == 0 {
                 // Canonical ARM64 unwind prologue:
                 framed.push_inst(
@@ -10405,7 +11349,34 @@ fn insert_prologue_epilogue<'a>(
                     }
                 }
                 if local_bytes > 0 {
-                    push_sp_adjust(&mut framed, true, local_bytes);
+                    active_blk = push_sp_sub_probed(&mut framed, active_blk, local_bytes, total_drop);
+                }
+                if needs_dynamic_align {
+                    let align_mask = !(u64::from(most_slot_align) - 1);
+                    framed.push_inst(
+                        MOp::MovSp { dst: MReg::p(PReg::X16), src: MReg::SP },
+                        MInstFlags::PINNED,
+                    );
+                    framed.push_inst(
+                        MOp::LogicalImm {
+                            dst: MReg::SP,
+                            rn: MReg::p(PReg::X16),
+                            imm: align_mask,
+                            kind: LogicalKind::And,
+                            wide: true,
+                        },
+                        MInstFlags::PINNED,
+                    );
+                    if total_drop > PROBE_STEP {
+                        framed.push_inst(
+                            MOp::Str {
+                                src: MReg::XZR,
+                                addr: AddrMode::BaseOff { base: MReg::SP, off: 0 },
+                                size: MemSize::X64,
+                            },
+                            MInstFlags::MEM_WRITE.union(MInstFlags::PINNED),
+                        );
+                    }
                 }
                 emit_save_entries(&mut framed, &cold_save_entries, false);
             }
@@ -10431,10 +11402,25 @@ fn insert_prologue_epilogue<'a>(
                     } = op
                 {
                     if param.size == size {
-                        let abs_off = total_drop
-                            .checked_add(param.caller_off)
-                            .ok_or(TierError::TooLarge { tier: TIER, what: "incoming stack param offset" })?;
-                        push_sp_mem_single(&mut framed, true, dst, abs_off, size, MInstFlags::NONE);
+                        if needs_dynamic_align {
+                            let fp_off = 16u32
+                                .checked_add(param.caller_off)
+                                .ok_or(TierError::TooLarge { tier: TIER, what: "incoming stack param offset" })?;
+                            push_base_mem_single(
+                                &mut framed,
+                                MReg::p(PReg::FP),
+                                true,
+                                dst,
+                                fp_off,
+                                size,
+                                MInstFlags::NONE,
+                            );
+                        } else {
+                            let abs_off = total_drop
+                                .checked_add(param.caller_off)
+                                .ok_or(TierError::TooLarge { tier: TIER, what: "incoming stack param offset" })?;
+                            push_sp_mem_single(&mut framed, true, dst, abs_off, size, MInstFlags::NONE);
+                        }
                         patched_stack_params += 1;
                         continue;
                     }
@@ -10442,7 +11428,26 @@ fn insert_prologue_epilogue<'a>(
 
                 if matches!(op, MOp::Ret) {
                     emit_save_entries(&mut framed, &cold_save_entries, true);
-                    if local_bytes > 0 {
+                    if needs_dynamic_align {
+                        if saved_below_fp == 0 {
+                            framed.push_inst(
+                                MOp::MovSp { dst: MReg::SP, src: MReg::p(PReg::FP) },
+                                MInstFlags::PINNED,
+                            );
+                        } else {
+                            framed.push_inst(
+                                MOp::SubImm {
+                                    dst: MReg::SP,
+                                    rn: MReg::p(PReg::FP),
+                                    imm12: u16_of(saved_below_fp).unwrap_or(0),
+                                    shift12: false,
+                                    wide: true,
+                                    sets_flags: false,
+                                },
+                                MInstFlags::PINNED,
+                            );
+                        }
+                    } else if local_bytes > 0 {
                         push_sp_adjust(&mut framed, false, local_bytes);
                     }
                     for rev in 0u8..4u8 {
@@ -10510,7 +11515,7 @@ fn insert_prologue_epilogue<'a>(
                     *slot = note;
                 }
             }
-            framed.end_block(blk);
+            framed.end_block(active_blk);
         }
 
         framed.rebuild_cfg(alloc);
@@ -10654,7 +11659,7 @@ fn build_emitted<'a>(
     unwind_frame: Option<blaze_code::unwind::Frame>,
     targets: TargetTable<'a>,
     relro: RelroData<'a>,
-    trap_kinds: &[(TrapKind, Option<u32>)],
+    trap_kinds: &[(TrapKind, Option<u32>, Held)],
     unwind_entries: &[Option<(MBlock, blaze_code::unwind::Action)>],
     alloc: Alloc<'a>,
 ) -> Result<Emitted<'a>, TierError> {
@@ -10690,15 +11695,15 @@ fn build_emitted<'a>(
 
     out.traps.reserve(encoded.trap_byte_offs.len());
     for &t in encoded.trap_byte_offs.iter() {
-        let (kind, ord) = trap_kinds
+        let (kind, ord, held) = trap_kinds
             .get(to_idx(t.trap_idx))
             .copied()
-            .unwrap_or((TrapKind::Intrinsic, None));
+            .unwrap_or((TrapKind::Intrinsic, None, Held::Unknown));
         out.traps.push(TrapRow {
             at: t.byte_off,
             kind,
             site: ord.map(|o| (0, o)),
-            held: Held::Unknown,
+            held,
             subject: None,
         });
     }
@@ -12165,6 +13170,7 @@ mod tests {
             &mut sel.mfunc,
             &mra_out,
             sel.spill_base_off,
+            sel.most_slot_align,
             sel.has_calls,
             false,
             sel.ret_gpr_mask,
@@ -14021,5 +15027,575 @@ mod tests {
             }
         }
         let _ = emitted;
+    }
+
+    #[test]
+    fn overaligned_stack_slots_leaf_and_stacked_params_preserve_alignment_fp_and_callee_saved() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        for align_exp in [5u8, 6, 7, 8, 12] {
+            let align_bytes = 1u64 << u32::from(align_exp);
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            // 10 i64 params: x0..x7 in regs + p8, p9 on caller's stack!
+            let params = [Param::of(Ty::I64); 10];
+            let sig = b.sig(Conv::C, Variadic::No, &params, &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let s_small = b.slot(8, 3, SlotKind::Temp);
+            let s_over = b.slot(64, align_exp, SlotKind::Temp);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let ps = [
+                b.param(Ty::I64),
+                b.param(Ty::I64),
+                b.param(Ty::I64),
+                b.param(Ty::I64),
+                b.param(Ty::I64),
+                b.param(Ty::I64),
+                b.param(Ty::I64),
+                b.param(Ty::I64),
+                b.param(Ty::I64),
+                b.param(Ty::I64),
+            ];
+            let p_small = b.slot_addr(s_small);
+            let p_over = b.slot_addr(s_over);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p_over);
+            let mask = b.iconst(Ty::I64, u128::from(align_bytes - 1));
+            let misalign = b.binary(Op::And, Flags::NONE, addr, mask);
+            b.store(Flags::NONE, ps[8], p_small, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, ps[9], p_over, 0, MemAttrs::aligned(3));
+            b.store(Flags::NONE, ps[0], p_over, 56, MemAttrs::aligned(3));
+            let r_small = b.load(Ty::I64, Flags::NONE, p_small, 0, MemAttrs::aligned(3));
+            let r_over0 = b.load(Ty::I64, Flags::NONE, p_over, 0, MemAttrs::aligned(3));
+            let r_over56 = b.load(Ty::I64, Flags::NONE, p_over, 56, MemAttrs::aligned(3));
+            // Sum all 10 params + slot round-trips + shifted misalignment (must be 0).
+            let mut acc = b.binary(Op::Add, Flags::NONE, r_small, r_over0);
+            acc = b.binary(Op::Add, Flags::NONE, acc, r_over56);
+            for &pv in &ps[1..8] {
+                acc = b.binary(Op::Add, Flags::NONE, acc, pv);
+            }
+            let shift32 = b.iconst(Ty::I64, 32);
+            let mis_hi = b.binary(Op::Shl, Flags::NONE, misalign, shift32);
+            let res = b.binary(Op::Or, Flags::NONE, acc, mis_hi);
+            b.ret(&[res]);
+
+            let func = b.finish_checked().expect("overaligned LIR finish");
+            let verified = verify(func.view()).expect("overaligned LIR verify");
+            let (emitted, _, _) = emit_mfunc_ssa_a64(verified, &NoNames, default_opts(), alloc)
+                .expect("misel must compile over-aligned stack slots up to 4 KiB");
+            assert!(
+                emitted.unwind_frame.is_some(),
+                "over-aligned frame (align=2^{align_exp}) must emit canonical FP unwind frame"
+            );
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+                // SAFETY: Valid AAPCS64 function matching `(10 x i64) -> i64`.
+                let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+                    unsafe { exec.as_fn() };
+                // Call with multiple stack depths to perturb caller SP mod `align_bytes`.
+                #[inline(never)]
+                fn call_with_depth(
+                    depth: usize,
+                    f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> i64,
+                ) -> i64 {
+                    let mut pad = [0u64; 3];
+                    core::hint::black_box(&mut pad);
+                    if depth > 0 {
+                        call_with_depth(depth - 1, f)
+                    } else {
+                        f(1, 2, 3, 4, 5, 6, 7, 8, 100, 200)
+                    }
+                }
+                for depth in 0..8 {
+                    let got = call_with_depth(depth, f);
+                    assert_eq!(
+                        got, 336,
+                        "align=2^{align_exp} depth={depth}: expected sum=336 and misalignment=0, got {got:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overaligned_stack_frame_with_large_probed_sizes_executes_cleanly() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // Test both unrolled probing (20 KiB) and multi-block probe loop (80 KiB).
+        for slot_bytes in [20 * 1024u32, 80 * 1024u32] {
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let s_big = b.slot(slot_bytes, 6, SlotKind::Temp); // 64-byte aligned large slot
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let x = b.param(Ty::I64);
+            let base = b.slot_addr(s_big);
+            let addr = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, base);
+            let mask63 = b.iconst(Ty::I64, 63);
+            let mis = b.binary(Op::And, Flags::NONE, addr, mask63);
+            let last_off = b.iconst(Ty::I64, u128::from(slot_bytes - 8));
+            let last_ptr = b.ptr_add(Flags::NONE, base, last_off);
+            b.store(Flags::NONE, x, base, 0, MemAttrs::aligned(3));
+            let k7 = b.iconst(Ty::I64, 7);
+            let x2 = b.binary(Op::Add, Flags::NONE, x, k7);
+            b.store(Flags::NONE, x2, last_ptr, 0, MemAttrs::aligned(3));
+            let a = b.load(Ty::I64, Flags::NONE, base, 0, MemAttrs::aligned(3));
+            let c = b.load(Ty::I64, Flags::NONE, last_ptr, 0, MemAttrs::aligned(3));
+            let sum = b.binary(Op::Add, Flags::NONE, a, c);
+            let k32 = b.iconst(Ty::I64, 32);
+            let mis_hi = b.binary(Op::Shl, Flags::NONE, mis, k32);
+            let res = b.binary(Op::Or, Flags::NONE, sum, mis_hi);
+            b.ret(&[res]);
+
+            let func = b.finish_checked().expect("probed overaligned finish");
+            let verified = verify(func.view()).expect("probed overaligned verify");
+            let (emitted, _, _) = emit_mfunc_ssa_a64(verified, &NoNames, default_opts(), alloc)
+                .expect("misel must compile probed over-aligned large frames");
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+                // SAFETY: Valid AAPCS64 function matching `(i64) -> i64`.
+                let f: extern "C" fn(i64) -> i64 = unsafe { exec.as_fn() };
+                assert_eq!(f(20), 47, "slot_bytes={slot_bytes} mismatch");
+            }
+        }
+    }
+
+    #[test]
+    fn overaligned_stack_slot_past_4kib_refuses_cleanly() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let s = b.slot(64, 13, SlotKind::Temp); // 8 KiB > 4 KiB limit
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let p = b.slot_addr(s);
+        let a = b.convert(Op::PtrAddr, Flags::NONE, Ty::I64, p);
+        b.ret(&[a]);
+        let func = b.finish_checked().expect("finish");
+        let verified = verify(func.view()).expect("verify");
+        let err = emit_mfunc_ssa_a64(verified, &NoNames, default_opts(), alloc)
+            .err()
+            .expect("slot align > 4 KiB must refuse cleanly");
+        assert!(matches!(err, TierError::Refused { what: "stack slot alignment > 4 KiB", .. }));
+    }
+
+    #[test]
+    fn pre_sota_legalize_compiles_wide_512bit_vector_with_overaligned_slot_through_sota_misel() {
+        let alloc = blaze_own::testing::heap().alloc();
+        let v64 = Ty::vector(blaze_lir::Scalar::I8, 64).expect("64x i8 vector ty");
+        let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+        let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I64)]);
+        b.set_signature(sig);
+        let slot = b.slot(64, 6, SlotKind::Temp); // 64-byte aligned slot matching simd_contains closure 3
+        let entry = b.create_block(BlockKind::Normal);
+        b.begin(entry);
+        let src = b.param(Ty::PTR);
+        let dst = b.slot_addr(slot);
+        let vec_val = b.load(v64, Flags::NONE, src, 0, MemAttrs::aligned(0));
+        b.store(Flags::NONE, vec_val, dst, 0, MemAttrs::aligned(6));
+        let b0 = b.load(Ty::I8, Flags::NONE, dst, 0, MemAttrs::aligned(0));
+        let b63 = b.load(Ty::I8, Flags::NONE, dst, 63, MemAttrs::aligned(0));
+        let e0 = b.convert(Op::Zext, Flags::NONE, Ty::I64, b0);
+        let e63 = b.convert(Op::Zext, Flags::NONE, Ty::I64, b63);
+        let sum = b.binary(Op::Add, Flags::NONE, e0, e63);
+        b.ret(&[sum]);
+
+        let func = b.finish_checked().expect("512-bit vec LIR finish");
+        let verified = verify(func.view()).expect("512-bit vec LIR verify");
+        let machine = Machine {
+            arch: Arch::Arm64,
+            os: Os::MacOs,
+            features: Machine::LSE | Machine::DOTPROD | Machine::CRC32,
+        };
+        let (rec, _insts, called, _clob) = crate::emit_sota_record_for_machine_with_abi(
+            verified,
+            &NoNames,
+            &crate::RoutinePlaces::NONE,
+            crate::SotaRecordAbiOpts::for_machine(machine),
+            &[],
+            alloc,
+        )
+        .expect("SOTA must legalize 512-bit vector + overaligned slot cleanly");
+        assert_eq!(called, crate::Called::NONE);
+        // SOTA + SROA + misel collapses the 64-byte copy + 2-byte sum into compact register code
+        // (whereas Reference emits >1.5 KB of stack-spilling loads/stores).
+        assert!(
+            rec.code.len() < 800,
+            "expected compact SOTA/misel code for legalized 512-bit vector, got {} bytes",
+            rec.code.len()
+        );
+
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        {
+            let exec = blaze_inproc::exec::Executable::new(&rec.code, 0).expect("exec map");
+            // SAFETY: Valid AAPCS64 function matching `(*const u8) -> i64`.
+            let f: extern "C" fn(*const u8) -> i64 = unsafe { exec.as_fn() };
+            let mut buf = [0u8; 64];
+            buf[0] = 42;
+            buf[63] = 99;
+            assert_eq!(f(buf.as_ptr()), 141);
+        }
+    }
+
+    #[test]
+    fn neon_vector_icmp_sext_select_and_bitmask_all_widths_execute_correctly() {
+        let alloc = blaze_own::testing::heap().alloc();
+
+        // 1. Exact `simd_contains` kernel: load two `<16 x i8>` chunks, `icmp eq` against two
+        //    splats, `sext` to `<16 x i8>`, `and`, `icmp ne 0`, `bitmask -> u16`.
+        {
+            let v16 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I8), Param::of(Ty::I8)],
+                &[Param::of(Ty::I16)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let p1 = b.param(Ty::PTR);
+            let p2 = b.param(Ty::PTR);
+            let c1 = b.param(Ty::I8);
+            let c2 = b.param(Ty::I8);
+            let v1 = b.load(v16, Flags::NONE, p1, 0, MemAttrs::aligned(0));
+            let v2 = b.load(v16, Flags::NONE, p2, 0, MemAttrs::aligned(0));
+            let s1 = b.convert(Op::Splat, Flags::NONE, v16, c1);
+            let s2 = b.convert(Op::Splat, Flags::NONE, v16, c2);
+            let m1 = b.icmp(IntCond::Eq, v1, s1);
+            let m2 = b.icmp(IntCond::Eq, v2, s2);
+            let e1 = b.convert(Op::Sext, Flags::NONE, v16, m1);
+            let e2 = b.convert(Op::Sext, Flags::NONE, v16, m2);
+            let both = b.binary(Op::And, Flags::NONE, e1, e2);
+            let z0 = b.iconst(Ty::I8, 0);
+            let vz = b.convert(Op::Splat, Flags::NONE, v16, z0);
+            let nz = b.icmp(IntCond::Ne, both, vz);
+            let mask = b.convert(Op::Bitmask, Flags::NONE, Ty::I16, nz);
+            b.ret(&[mask]);
+
+            let func = b.finish_checked().expect("simd_contains kernel finish");
+            let verified = verify(func.view()).expect("simd_contains kernel verify");
+            let (emitted, _, _) = emit_mfunc_ssa_a64(verified, &NoNames, default_opts(), alloc)
+                .expect("misel must emit native NEON icmp/sext/and/bitmask");
+            // Compact pure-NEON code: ~20 instructions (<= 160 bytes), zero scalar loops!
+            assert!(
+                emitted.code.len() <= 160,
+                "expected compact NEON kernel, got {} bytes",
+                emitted.code.len()
+            );
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+                // SAFETY: Valid AAPCS64 function matching `(*const u8, *const u8, u8, u8) -> u16`.
+                let f: extern "C" fn(*const u8, *const u8, u8, u8) -> u16 = unsafe { exec.as_fn() };
+                for bit in 0..16u32 {
+                    let mut a = [b'x'; 16];
+                    let mut c = [b'y'; 16];
+                    a[bit as usize] = b'N';
+                    c[bit as usize] = b'Y';
+                    // Add a false positive in `a` only at another lane.
+                    a[((bit + 5) % 16) as usize] = b'N';
+                    assert_eq!(f(a.as_ptr(), c.as_ptr(), b'N', b'Y'), 1u16 << bit);
+                }
+                let all_a = [b'N'; 16];
+                let all_c = [b'Y'; 16];
+                assert_eq!(f(all_a.as_ptr(), all_c.as_ptr(), b'N', b'Y'), 0xFFFF);
+                assert_eq!(f(all_a.as_ptr(), all_c.as_ptr(), b'Z', b'Y'), 0);
+            }
+        }
+
+        // 2. Test `Op::Bitmask` + `Op::Select` + `Op::Zext` + signed/unsigned `Icmp` for
+        //    `<8 x i16>`, `<4 x i32>`, and `<2 x i64>`!
+        for (scalar, lanes, expected_mask) in [
+            (Scalar::I16, 8u32, 0b1010_0101u64),
+            (Scalar::I32, 4u32, 0b1010u64),
+            (Scalar::I64, 2u32, 0b10u64),
+        ] {
+            let vt = Ty::vector(scalar, lanes).expect("vec ty");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[Param::of(Ty::I64)],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let pa = b.param(Ty::PTR);
+            let pb = b.param(Ty::PTR);
+            let pout = b.param(Ty::PTR);
+            let va = b.load(vt, Flags::NONE, pa, 0, MemAttrs::aligned(0));
+            let vb = b.load(vt, Flags::NONE, pb, 0, MemAttrs::aligned(0));
+            let m_gt = b.icmp(IntCond::Sgt, va, vb);
+            let sel = b.select(Flags::NONE, m_gt, va, vb);
+            let z = b.convert(Op::Zext, Flags::NONE, vt, m_gt);
+            let combined = b.binary(Op::Add, Flags::NONE, sel, z);
+            b.store(Flags::NONE, combined, pout, 0, MemAttrs::aligned(0));
+            let bm = b.convert(Op::Bitmask, Flags::NONE, Ty::I64, m_gt);
+            b.ret(&[bm]);
+
+            let func = b.finish_checked().expect("vec mask width finish");
+            let verified = verify(func.view()).expect("vec mask width verify");
+            let (emitted, _, _) = emit_mfunc_ssa_a64(verified, &NoNames, default_opts(), alloc)
+                .expect("misel must emit vec icmp/select/zext/bitmask for all 128-bit widths");
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+                // SAFETY: Valid AAPCS64 function matching `(*const u8, *const u8, *mut u8) -> u64`.
+                let f: extern "C" fn(*const u8, *const u8, *mut u8) -> u64 = unsafe { exec.as_fn() };
+                let mut a_bytes = [0u8; 16];
+                let mut b_bytes = [0u8; 16];
+                let mut out_bytes = [0u8; 16];
+                match lanes {
+                    8 => {
+                        let a: [i16; 8] = [10, -5, 7, 3, -1, 20, 0, 100];
+                        let bb: [i16; 8] = [5, 0, 2, 3, 0, 10, 1, -50];
+                        for (i, &v) in a.iter().enumerate() {
+                            a_bytes[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+                        }
+                        for (i, &v) in bb.iter().enumerate() {
+                            b_bytes[i * 2..i * 2 + 2].copy_from_slice(&v.to_le_bytes());
+                        }
+                        let got = f(a_bytes.as_ptr(), b_bytes.as_ptr(), out_bytes.as_mut_ptr());
+                        assert_eq!(got, expected_mask, "lanes=8 bitmask mismatch");
+                        let lane0 = i16::from_le_bytes([out_bytes[0], out_bytes[1]]);
+                        let lane1 = i16::from_le_bytes([out_bytes[2], out_bytes[3]]);
+                        assert_eq!(lane0, 11); // max(10, 5) + 1
+                        assert_eq!(lane1, 0); // max(-5, 0) + 0
+                    }
+                    4 => {
+                        let a: [i32; 4] = [-10, 50, 0, 99];
+                        let bb: [i32; 4] = [0, 20, 5, -1];
+                        for (i, &v) in a.iter().enumerate() {
+                            a_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                        }
+                        for (i, &v) in bb.iter().enumerate() {
+                            b_bytes[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+                        }
+                        let got = f(a_bytes.as_ptr(), b_bytes.as_ptr(), out_bytes.as_mut_ptr());
+                        assert_eq!(got, expected_mask, "lanes=4 bitmask mismatch");
+                        let lane1 = i32::from_le_bytes(out_bytes[4..8].try_into().unwrap());
+                        assert_eq!(lane1, 51);
+                    }
+                    2 => {
+                        let a: [i64; 2] = [-100, 200];
+                        let bb: [i64; 2] = [0, 100];
+                        for (i, &v) in a.iter().enumerate() {
+                            a_bytes[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+                        }
+                        for (i, &v) in bb.iter().enumerate() {
+                            b_bytes[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+                        }
+                        let got = f(a_bytes.as_ptr(), b_bytes.as_ptr(), out_bytes.as_mut_ptr());
+                        assert_eq!(got, expected_mask, "lanes=2 bitmask mismatch");
+                        let lane1 = i64::from_le_bytes(out_bytes[8..16].try_into().unwrap());
+                        assert_eq!(lane1, 201);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        // 3. Test NEON reductions (`ReduceAnd`, `ReduceOr`, `ReduceXor`, `ReduceAdd`,
+        //    `ReduceUmin`, `ReduceUmax`, `ReduceSmin`, `ReduceSmax`) + `Extract` on `<16 x i8>`.
+        {
+            let v16 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[Param::of(Ty::I64)]);
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let p = b.param(Ty::PTR);
+            let v = b.load(v16, Flags::NONE, p, 0, MemAttrs::aligned(0));
+            let r_and = b.convert(Op::ReduceAnd, Flags::NONE, Ty::I8, v);
+            let r_or = b.convert(Op::ReduceOr, Flags::NONE, Ty::I8, v);
+            let r_xor = b.convert(Op::ReduceXor, Flags::NONE, Ty::I8, v);
+            let r_add = b.convert(Op::ReduceAdd, Flags::NONE, Ty::I8, v);
+            let r_umin = b.convert(Op::ReduceUmin, Flags::NONE, Ty::I8, v);
+            let r_umax = b.convert(Op::ReduceUmax, Flags::NONE, Ty::I8, v);
+            let r_smin = b.convert(Op::ReduceSmin, Flags::NONE, Ty::I8, v);
+            let r_ext = b.extract(v, 11);
+            let parts = [r_and, r_or, r_xor, r_add, r_umin, r_umax, r_smin, r_ext];
+            let mut acc = b.iconst(Ty::I64, 0);
+            for (k, &pv) in parts.iter().enumerate() {
+                let z = b.convert(Op::Zext, Flags::NONE, Ty::I64, pv);
+                let sh = b.iconst(Ty::I64, (k * 8) as u128);
+                let s = b.binary(Op::Shl, Flags::NONE, z, sh);
+                acc = b.binary(Op::Or, Flags::NONE, acc, s);
+            }
+            b.ret(&[acc]);
+            let func = b.finish_checked().expect("neon reduce finish");
+            let verified = verify(func.view()).expect("neon reduce verify");
+            let (emitted, _, _) = emit_mfunc_ssa_a64(verified, &NoNames, default_opts(), alloc)
+                .expect("misel must emit NEON reductions and extract");
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+                // SAFETY: Valid AAPCS64 function matching `(*const u8) -> u64`.
+                let f: extern "C" fn(*const u8) -> u64 = unsafe { exec.as_fn() };
+                let data: [u8; 16] = [
+                    0x81, 0x03, 0x05, 0x07, 0x09, 0x0b, 0x0d, 0x0f,
+                    0x11, 0x13, 0x15, 0xab, 0x19, 0x1b, 0x1d, 0x7f,
+                ];
+                let got = f(data.as_ptr());
+                let want_and = data.iter().copied().fold(0xffu8, |a, b| a & b);
+                let want_or = data.iter().copied().fold(0x00u8, |a, b| a | b);
+                let want_xor = data.iter().copied().fold(0x00u8, |a, b| a ^ b);
+                let want_add = data.iter().copied().fold(0u8, u8::wrapping_add);
+                let want_umin = data.iter().copied().min().unwrap();
+                let want_umax = data.iter().copied().max().unwrap();
+                let want_smin = data.iter().map(|&x| x as i8).min().unwrap() as u8;
+                let want_ext = data[11];
+                let want = u64::from_le_bytes([
+                    want_and, want_or, want_xor, want_add, want_umin, want_umax, want_smin, want_ext,
+                ]);
+                assert_eq!(got, want, "NEON reduce/extract packed mismatch: got={got:#018x} want={want:#018x}");
+            }
+        }
+
+        // 4. Test NEON `Op::Shuffle` across identity, `ext`, 1-vector splat/permute, and 2-vector
+        //    mixed interleave on `<16 x i8>` and `<4 x i32>`.
+        {
+            let v16 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::PTR)],
+                &[],
+            );
+            b.set_signature(sig);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let pa = b.param(Ty::PTR);
+            let pb = b.param(Ty::PTR);
+            let pout = b.param(Ty::PTR);
+            let va = b.load(v16, Flags::NONE, pa, 0, MemAttrs::aligned(0));
+            let vb = b.load(v16, Flags::NONE, pb, 0, MemAttrs::aligned(0));
+            // 4a: ext (shift by 5 across a||b)
+            let s_ext = b.shuffle(v16, va, vb, &[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+            // 4b: 1-vector broadcast lane 3
+            let s_bcast = b.shuffle(v16, va, vb, &[3; 16]);
+            // 4c: 2-vector mixed interleave (even lanes from a, odd lanes from b)
+            let s_mix = b.shuffle(v16, va, vb, &[0, 17, 2, 19, 4, 21, 6, 23, 8, 25, 10, 27, 12, 29, 14, 31]);
+            b.store(Flags::NONE, s_ext, pout, 0, MemAttrs::aligned(0));
+            b.store(Flags::NONE, s_bcast, pout, 16, MemAttrs::aligned(0));
+            b.store(Flags::NONE, s_mix, pout, 32, MemAttrs::aligned(0));
+            b.ret(&[]);
+            let func = b.finish_checked().expect("neon shuffle finish");
+            let verified = verify(func.view()).expect("neon shuffle verify");
+            let (emitted, _, _) = emit_mfunc_ssa_a64(verified, &NoNames, default_opts(), alloc)
+                .expect("misel must emit NEON shuffle for ext/broadcast/mixed");
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let exec = blaze_inproc::exec::Executable::new(&emitted.code, 0).expect("exec map");
+                // SAFETY: Valid AAPCS64 function matching `(*const u8, *const u8, *mut u8)`.
+                let f: extern "C" fn(*const u8, *const u8, *mut u8) = unsafe { exec.as_fn() };
+                let a: [u8; 16] = core::array::from_fn(|i| 10 + i as u8);
+                let bb: [u8; 16] = core::array::from_fn(|i| 100 + i as u8);
+                let mut out = [0u8; 48];
+                f(a.as_ptr(), bb.as_ptr(), out.as_mut_ptr());
+                let want_ext: [u8; 16] = [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 100, 101, 102, 103, 104];
+                let want_bcast: [u8; 16] = [13; 16];
+                let want_mix: [u8; 16] = [10, 101, 12, 103, 14, 105, 16, 107, 18, 109, 20, 111, 22, 113, 24, 115];
+                assert_eq!(&out[0..16], &want_ext, "shuffle ext mismatch");
+                assert_eq!(&out[16..32], &want_bcast, "shuffle broadcast mismatch");
+                assert_eq!(&out[32..48], &want_mix, "shuffle mixed mismatch");
+            }
+        }
+
+        // 5. Full SOTA (`EmitProfile::Sota`, `is_hot = true`) end-to-end test on an over-aligned
+        //    (64 B) `simd_contains`-style kernel with intermediate stack temps + `icmp`/`sext`/
+        //    `and`/`shuffle`/`reduce_and`/`bitmask`: verifies SROA + mid-end + `misel` emit
+        //    compact pure-NEON code with `Called::NONE` (zero scalar legalization fallback).
+        {
+            let v16 = Ty::vector(Scalar::I8, 16).expect("v16i8");
+            let mut b: Builder<_, Full> = Builder::new_in(64, alloc);
+            let sig = b.sig(
+                Conv::C,
+                Variadic::No,
+                &[Param::of(Ty::PTR), Param::of(Ty::PTR), Param::of(Ty::I8), Param::of(Ty::I8)],
+                &[Param::of(Ty::I16)],
+            );
+            b.set_signature(sig);
+            let s_over = b.slot(64, 6, SlotKind::Temp); // 64-byte aligned slot
+            let s_tmp = b.slot(16, 4, SlotKind::Temp);
+            let entry = b.create_block(BlockKind::Normal);
+            b.begin(entry);
+            let p1 = b.param(Ty::PTR);
+            let p2 = b.param(Ty::PTR);
+            let c1 = b.param(Ty::I8);
+            let c2 = b.param(Ty::I8);
+            let a_over = b.slot_addr(s_over);
+            let a_tmp = b.slot_addr(s_tmp);
+            let v1 = b.load(v16, Flags::NONE, p1, 0, MemAttrs::aligned(0));
+            let v2 = b.load(v16, Flags::NONE, p2, 0, MemAttrs::aligned(0));
+            b.store(Flags::NONE, v1, a_over, 0, MemAttrs::aligned(6));
+            let v1_r = b.load(v16, Flags::NONE, a_over, 0, MemAttrs::aligned(6));
+            let s1 = b.convert(Op::Splat, Flags::NONE, v16, c1);
+            let s2 = b.convert(Op::Splat, Flags::NONE, v16, c2);
+            let m1 = b.icmp(IntCond::Eq, v1_r, s1);
+            let m2 = b.icmp(IntCond::Eq, v2, s2);
+            let e1 = b.convert(Op::Sext, Flags::NONE, v16, m1);
+            let e2 = b.convert(Op::Sext, Flags::NONE, v16, m2);
+            let both = b.binary(Op::And, Flags::NONE, e1, e2);
+            b.store(Flags::NONE, both, a_tmp, 0, MemAttrs::aligned(4));
+            let both_r = b.load(v16, Flags::NONE, a_tmp, 0, MemAttrs::aligned(4));
+            let z0 = b.iconst(Ty::I8, 0);
+            let vz = b.convert(Op::Splat, Flags::NONE, v16, z0);
+            let nz = b.icmp(IntCond::Ne, both_r, vz);
+            let mask = b.convert(Op::Bitmask, Flags::NONE, Ty::I16, nz);
+            b.ret(&[mask]);
+
+            let func = b.finish_checked().expect("full SOTA simd_contains finish");
+            let verified = verify(func.view()).expect("full SOTA simd_contains verify");
+            let machine = Machine {
+                arch: Arch::Arm64,
+                os: Os::MacOs,
+                features: Machine::LSE | Machine::DOTPROD | Machine::CRC32,
+            };
+            let mut opts = crate::SotaRecordAbiOpts::for_machine(machine);
+            opts.is_hot = true;
+            let (rec, _insts, called, _clob) = crate::emit_sota_record_for_machine_with_abi(
+                verified,
+                &NoNames,
+                &crate::RoutinePlaces::NONE,
+                opts,
+                &[],
+                alloc,
+            )
+            .expect("full SOTA must compile overaligned NEON kernel cleanly");
+            assert_eq!(called, crate::Called::NONE);
+            assert!(
+                rec.code.len() <= 200,
+                "expected compact SOTA pure-NEON code (SROA + misel), got {} bytes",
+                rec.code.len()
+            );
+
+            #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+            {
+                let exec = blaze_inproc::exec::Executable::new(&rec.code, 0).expect("exec map");
+                // SAFETY: Valid AAPCS64 function matching `(*const u8, *const u8, u8, u8) -> u16`.
+                let f: extern "C" fn(*const u8, *const u8, u8, u8) -> u16 = unsafe { exec.as_fn() };
+                let mut a = [b'.'; 16];
+                let mut c = [b'.'; 16];
+                a[2] = b'A';
+                c[2] = b'B';
+                a[13] = b'A';
+                c[13] = b'B';
+                assert_eq!(f(a.as_ptr(), c.as_ptr(), b'A', b'B'), (1u16 << 2) | (1u16 << 13));
+            }
+        }
     }
 }

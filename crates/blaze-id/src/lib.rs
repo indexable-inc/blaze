@@ -1,4 +1,4 @@
-//! An item's identity (docs/v2/plan/design/identity.md).
+//! An item's identity (docs/v2/plan/design/bottom.md section 3).
 //!
 //! An item is named two ways. An interned id (`FunctionId`, `ImplId`, ...) holds a `Gid`: an
 //! arena, its generation and the slot interning happened to reach the item in. It compares in
@@ -36,7 +36,7 @@ pub use crate::carried::Carried;
 
 /// A value that means the same in every process and after any edit elsewhere in the
 /// workspace, so it may be written to a record or key a table that outlives a snapshot
-/// (docs/v2/plan/design/identity.md, point 3).
+/// (docs/v2/plan/design/bottom.md section 3).
 ///
 /// Keys and the plain values a key is made of are `Portable`: content hashes, integers of a
 /// fixed width, text, and arrays, slices, tuples and options of `Portable` values. An interned

@@ -1,4 +1,4 @@
-//! The `Names` stage of `blaze engine-check` (engine.md E6, second step): one `CrateScope` task a
+//! The `Names` stage of `blaze engine-check` (end-state.md D157): one `CrateScope` task a
 //! crate of the names world (members, dependencies, the toolchain shelf's crates), in the phase
 //! `Phase { stage: Names, wave: the crate's depth }`, so a crate is entered after every crate it
 //! reads was merged and put to the store.
@@ -1238,7 +1238,7 @@ fn exports_digest(bytes: &[u8]) -> ContentId {
     ContentId::of(EXPORTS_DOMAIN, bytes)
 }
 
-/// What the crate `name`'s `CrateScope` task defines (engine.md E4): its record's [`WHOLE`]
+/// What the crate `name`'s `CrateScope` task defines (end-state.md D157): its record's [`WHOLE`]
 /// cell, its [`EXPORTS`] cell (what downstream `CrateScope` tasks read), and, for a crate whose
 /// names read a file of the checkout (a `Surface` read: the crates an edit can move), the
 /// [`CELLS`] mark and every row of its payload's cell table (names/sections.rs `cells`,

@@ -36,7 +36,7 @@ use std::sync::{LockResult, Mutex, RwLock};
 use blaze_expand::{
     BuiltinAttr, BuiltinDerive, Call, CallSite, Ctx, DefAt, ItemAttrs, ItemAttrsError, NextAttr, DefSite, Delim, Diagnostic, ExpandCx, ExpandError, Expanded,
     Export, HostAsk, HostError, HostWhy, IncludeAs, Included, LexError, LitKind, LocalInner,
-    MacroDefinition, Place as HostPlace, PlaceOf, ProcCall, Produced, Raw, TokenKind,
+    MacroDefinition, Place as HostPlace, PlaceOf, ProcCall, Produced, Raw, Spacing, TokenKind,
     TokenStream, expand, lex, CallKind, Inside, NestedCall, NestedKind, PathScope, call_key,
 };
 use blaze_file_items::{Outline, outline};
@@ -382,6 +382,9 @@ pub struct Tables<'a> {
     /// The `link_name`/`export_name` values written as macro calls, each at its item's place:
     /// expanded once the names are solved ([`crate::attr_values::value_rows`]).
     pub values: AVec<'a, crate::attr_values::ValueSite<'a>>,
+    /// Root-level `#[proc_macro*]` functions lowered directly or from root macro expansions,
+    /// tagged with their source fragment and ordinal for deterministic harness synthesis.
+    pub proc_harness: AVec<'a, (At, u32, crate::task::ProcHarnessEntry<'a>)>,
 }
 
 impl<'a> Tables<'a> {
@@ -392,6 +395,7 @@ impl<'a> Tables<'a> {
     fn with_by_place_in(alloc: Alloc<'a>, track_by_place: bool) -> Tables<'a> {
         Tables {
             values: AVec::new_in(alloc),
+            proc_harness: AVec::new_in(alloc),
             macros: HashMap::new_in(alloc),
             calls: HashMap::new_in(alloc),
             enums: HashMap::new_in(alloc),
@@ -425,11 +429,14 @@ impl<'a> Tables<'a> {
     /// A fragment's tables (not its declarations, nor the modules it made) added; `owner` is
     /// the fragment's key, `at` the text it is.
     fn add<'s>(&mut self, owner: ItemKey, at: At, part: Lowered<'a, 'a, 's>) -> AVec<'s, LowerNote<'a>> {
-        let Lowered { macros, calls, enums, impls, langs, use_locs, texts, members, ctors, notes, values, .. } = part;
+        let Lowered { macros, calls, enums, impls, langs, use_locs, texts, members, ctors, notes, values, proc_harness, .. } = part;
         for (owner, list) in members {
             self.join_members(owner, list);
         }
         self.values.extend(values);
+        for (ord, entry) in proc_harness.into_iter().enumerate() {
+            self.proc_harness.push((at, ord as u32, entry));
+        }
         self.ctors.extend(ctors.into_iter().map(|k| (k, ())));
         self.macros.extend(macros);
         // The one door a lowered call enters the tables by: its calling text is `at`
@@ -476,12 +483,14 @@ impl<'a> Tables<'a> {
                 }
             }
         }
-        let Tables { macros, calls, enums, impls, langs, use_locs, texts, by_place, track_by_place: _, members, ctors, values } = other;
+        let Tables { macros, calls, enums, impls, langs, use_locs, texts, by_place, track_by_place: _, members, ctors, values, proc_harness } = other;
         if self.track_by_place {
             merge_map(&mut self.by_place, by_place);
         }
         self.values.reserve(values.len());
         self.values.extend(values);
+        self.proc_harness.reserve(proc_harness.len());
+        self.proc_harness.extend(proc_harness);
         if members.len() > self.members.len() {
             let prev = core::mem::replace(&mut self.members, members);
             self.members.reserve(prev.len());
@@ -666,8 +675,8 @@ pub enum ExpandNote<'a> {
     Failed { path: &'a str, implicit: bool, failed: blaze_expand::Failed<'a> },
     /// The expansion does not read as items: the outline's first syntax error.
     NotItems { macro_name: &'a str, message: &'a str },
-    /// The expansion writes a macro definition holding another crate's `$crate`
-    /// ([`crate::crate_roots::ForeignDollarCrate`]): refused until token-mark-3.
+    /// The expansion writes a single macro definition mixing `$crate` tokens from two different
+    /// crates ([`crate::crate_roots::ForeignDollarCrate`]).
     ForeignDollarCrate { macro_name: &'a str, krate: CrateItemKey },
     /// The expansion writes another crate's root and keeps no marks to tell it by
     /// ([`crate::crate_roots::RootsLost`]).
@@ -779,6 +788,9 @@ pub enum NamesError<'a> {
     Cells { krate: &'a str, error: crate::cells::Unwritten },
     /// The module tree record was not written.
     TreeRecord { krate: &'a str, error: crate::tree_record::TreeRecordError },
+    /// The crate root's `#![recursion_limit]` attribute is malformed (not an unsigned decimal
+    /// integer string literal).
+    InvalidRecursionLimit { krate: &'a str, attr: &'a str },
     /// Two items' keys begin with the same 16 bytes (a checker key's, front2 keys.rs
     /// `checker_of`), so [`Names::key_beginning`] could not say which one a checker key names
     /// (rule 21: two values under one key is a refusal; the fix is the key). `first` and
@@ -808,6 +820,9 @@ impl fmt::Display for NamesError<'_> {
             }
             NamesError::Cells { krate, error } => write!(f, "crate `{krate}`: {error}"),
             NamesError::TreeRecord { krate, error } => write!(f, "crate `{krate}`: its module tree record: {error:?}"),
+            NamesError::InvalidRecursionLimit { krate, attr } => {
+                write!(f, "crate `{krate}`: malformed `#![{attr}]`: recursion limit must be an unsigned integer string literal")
+            }
             NamesError::KeyBeginning { first, second } => {
                 write!(f, "items {first:?} and {second:?}: their keys begin with the same 16 bytes, so a checker key cannot name one (rule 21, keys-cover-every-input)")
             }
@@ -862,6 +877,9 @@ pub struct CrateNames<'a> {
     /// Each `link_name`/`export_name` value written as a macro call, expanded at its item's
     /// place: one row per item and attribute, sorted ([`crate::attr_values::row`] reads one).
     pub values: AVec<'a, crate::attr_values::ValueRow<'a>>,
+    /// Ordered `#[proc_macro*]` exports of a proc-macro crate (direct + macro-expanded),
+    /// matching the exact entry order of the synthesized `_DECLS` static.
+    pub proc_exports: AVec<'a, crate::task::ProcHarnessEntry<'a>>,
 }
 
 /// A body whose blocks a crate solve left to the body's own solve (D189 step 4).
@@ -1107,6 +1125,11 @@ impl<'a> Names<'a> {
     /// [`crate::names::traits_in_scope`] over these names.
     pub fn traits_in_scope<'b>(&self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
         crate::names::traits_in_scope::<&'a str, _>(self, module, alloc)
+    }
+
+    /// [`crate::names::traits_exported`] over these names (without `module`'s implicit prelude).
+    pub fn traits_exported<'b>(&self, module: ItemKey, alloc: Alloc<'b>) -> Result<AVec<'b, ItemKey>, PathError> {
+        crate::names::traits_exported::<&'a str, _>(self, module, alloc)
     }
 
     /// A trait's or an impl's members on under its crate's cfg, in declaration order; `None`
@@ -1699,6 +1722,7 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
             built,
             sources,
             listed: listed.is_some(),
+            proc_macro: input.implicit.proc_macro,
             kept,
             // D189's seam: under `Bodies` the crate solve holds every body's blocks for the
             // body's own solve (`crate::body_scope`); no block is a module of the crate.
@@ -1777,6 +1801,70 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
         crate_root_record.extern_prelude.sort_by(|a, b| a.0.cmp(b.0));
         crate_root_record.extern_prelude.dedup_by_key(|it| it.0);
     }
+    // Synthesize the proc-macro crate's `_DECLS` harness static AFTER macro expansion completes
+    // so macro-generated `#[proc_macro*]` exports (e.g. `derive_more-impl`'s `create_derive!`)
+    // appear alongside direct root declarations in deterministic order.
+    let mut proc_exports: AVec<'a, crate::task::ProcHarnessEntry<'a>> = AVec::new_in(alloc);
+    if input.implicit.proc_macro {
+        let mut expanded: AVec<'a, (ItemKey, u32, crate::task::ProcHarnessEntry<'a>)> = AVec::new_in(alloc);
+        {
+            let tables_r = held(run.tables.read(), "tables");
+            for &(at, ord, entry) in tables_r.proc_harness.iter() {
+                match at {
+                    At::File(_) => proc_exports.push(entry),
+                    At::Expansion(call) => expanded.push((call, ord, entry)),
+                }
+            }
+        }
+        expanded.sort_unstable_by_key(|(call, ord, _)| (*call, *ord));
+        proc_exports.extend(expanded.into_iter().map(|(_, _, entry)| entry));
+        let call = crate::task::proc_macro_harness_call(input.key);
+        let root = tree.modules[0].key;
+        let text = crate::task::proc_macro_harness_text(&proc_exports, bump);
+        let origins = Err(crate::expansion_origins::OriginsError::Rewritten { what: "a proc-macro crate's harness (`_DECLS`)" });
+        let made: &'a ExpansionText<'a> = bump.alloc_val(ExpansionText::new(text, outline(text, edition, alloc), origins));
+        if let Some(error) = made.outline.errors().first() {
+            notes.push(NamesNote::Expand {
+                call,
+                at: Some(Loc { file: 0, offset: 0 }),
+                note: ExpandNote::NotItems { macro_name: HARNESS_NAME, message: made.outline.message(error) },
+            });
+        } else {
+            let fragment = Fragment {
+                module: root,
+                owner: call,
+                text,
+                outline: &made.outline,
+                items: None,
+                at: Where::Expansion(Loc { file: 0, offset: 0 }),
+                depth: 1,
+                made: false,
+                members_of: None,
+                written: input.root,
+                kept: None,
+                marks: None,
+                tokens: FragmentTokens::from_option(None),
+            };
+            let out = lower_in(
+                LowerCx {
+                    krate: input.key,
+                    tools: &crate_root_record.tools,
+                    edition,
+                    cfg: &cfg,
+                    walked: &tree,
+                    procs: ProcDecls::Module { here: &[] },
+                    entry: false,
+                    harness: false,
+                    order: sources.attr_order(),
+                },
+                fragment,
+                alloc,
+                bump,
+            );
+            add_lowered(&run, call, At::Expansion(call), out);
+            held(run.expansions.lock(), "expansions").insert(call, Expansion::empty_with(Some(made)));
+        }
+    }
     par.stage(crate::task::Stage::Publish);
     let mut done = core::mem::replace(&mut fill.done, HashMap::new_in(alloc));
     let mut in_made: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::new_in(alloc);
@@ -1840,6 +1928,7 @@ pub(crate) fn resolve_one_with<'a, 'r, 'p: 'a, S: SourceTexts<'a>, P: Par>(
         notes,
         bodies,
         values: AVec::new_in(alloc),
+        proc_exports,
     };
     // The `link_name`/`export_name` values written as macro calls, each expanded at its item's
     // place over the finished names (crate::attr_values), by the host a call there has: its
@@ -2093,6 +2182,7 @@ pub fn solve_held_body_scratch<'a, S: SourceTexts<'a>>(
         built: &built,
         sources,
         listed: input.implicit.proc_macro && sources.proc_exports(source).is_some(),
+        proc_macro: false,
         kept: &kept,
         blocks: BlocksAt::Body,
         made_before: Some(&c.made),
@@ -2263,9 +2353,15 @@ fn walked_files<'a, S: SourceTexts<'a>, P: Par>(
     // module's lowering reads to know an item's taker (names-attr-3).
     let root = set.at(root_file as usize);
     let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
+    let recursion_limit = effective_recursion_limit(input.name, &attrs)?;
     let tools = crate_tools(&attrs, alloc);
     let mut low = lower_modules(input.key, input.implicit.entry, input.implicit.proc_macro, edition, cfg, &tools, &set, &tree, listed, notes, par, opts, None, sources.attr_order(), bump);
-    let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+    let root_attrs = RootAttrs {
+        no_std: attrs.no_std,
+        no_core: attrs.no_core,
+        arbitrary_ints: attrs.arbitrary_ints,
+        recursion_limit,
+    };
     let macro_exports = core::mem::replace(&mut low.macro_exports, AVec::new_in(alloc));
     let root_bytes = root_record_of(graph, input, id, root.id, &attrs, &tree, &mut low, &macro_exports, built, notes, bump)?;
     Ok(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: None })
@@ -2288,7 +2384,13 @@ fn root_record_of<'a>(
     bump: Bump<'a>,
 ) -> Result<&'a [u8], NamesError<'a>> {
     let alloc = bump.alloc();
-    let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+    let recursion_limit = effective_recursion_limit(input.name, attrs)?;
+    let root_attrs = RootAttrs {
+        no_std: attrs.no_std,
+        no_core: attrs.no_core,
+        arbitrary_ints: attrs.arbitrary_ints,
+        recursion_limit,
+    };
     let plan = root_plan(graph, id, root_attrs, built, notes, bump)?;
     // From 2018 the injected item's name is def-site (rustc's `std_inject`: `ident_span = if
     // edition >= Edition2018 { span } else { call_site }`, `span` with the pass's def-site
@@ -2428,7 +2530,11 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
     let (tools, attrs) = if root_member {
         let root = set.at(tree.modules[0].file as usize);
         let attrs = file_attrs(cfg, &root.outline, root.text, alloc);
-        (crate_tools(&attrs, alloc), Some((root.id, attrs)))
+        let recursion_limit = effective_recursion_limit(input.name, &attrs)?;
+        if recursion_limit != record.recursion_limit {
+            return Ok(None);
+        }
+        (crate_tools(&attrs, alloc), Some((root.id, attrs, recursion_limit)))
     } else {
         (AVec::from_slice_in(&record.tools, alloc), None)
     };
@@ -2455,14 +2561,37 @@ fn from_tree_record<'a, S: SourceTexts<'a>, P: Par>(
         notes
     };
     let (root_attrs, root_bytes) = match attrs {
-        None => (RootAttrs { no_std: record.no_std, no_core: record.no_core, arbitrary_ints: record.arbitrary_ints }, stored),
-        Some((root_file, attrs)) => {
+        None => (
+            RootAttrs {
+                no_std: record.no_std,
+                no_core: record.no_core,
+                arbitrary_ints: record.arbitrary_ints,
+                recursion_limit: record.recursion_limit,
+            },
+            stored,
+        ),
+        Some((root_file, attrs, recursion_limit)) => {
             let exports: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::from_iter_in(stored_view.macro_exports(), alloc);
-            let root_attrs = RootAttrs { no_std: attrs.no_std, no_core: attrs.no_core, arbitrary_ints: attrs.arbitrary_ints };
+            let root_attrs = RootAttrs {
+                no_std: attrs.no_std,
+                no_core: attrs.no_core,
+                arbitrary_ints: attrs.arbitrary_ints,
+                recursion_limit,
+            };
             (root_attrs, root_record_of(graph, input, id, root_file, &attrs, &tree, &mut low, &exports, built, notes, bump)?)
         }
     };
     Ok(Some(Prepared { set, tree, low, listed, root_attrs, root_bytes, record: Some((bytes, record)) }))
+}
+
+/// The crate's effective macro expansion recursion limit from its root file's attributes, or a
+/// typed error when `#![recursion_limit]` is malformed.
+fn effective_recursion_limit<'a>(krate: &'a str, attrs: &Attrs<'a, 'a>) -> Result<u32, NamesError<'a>> {
+    match attrs.recursion_limit {
+        None => Ok(u32::from(crate::RECURSION_LIMIT)),
+        Some(Ok(limit)) => Ok(limit),
+        Some(Err(attr)) => Err(NamesError::InvalidRecursionLimit { krate, attr }),
+    }
 }
 
 /// Whether a member's `mod` lines or `#[macro_export]` macros (its record written and read
@@ -2579,6 +2708,7 @@ fn tree_record_of<'a>(
         no_std: root_attrs.no_std,
         no_core: root_attrs.no_core,
         arbitrary_ints: root_attrs.arbitrary_ints,
+        recursion_limit: root_attrs.recursion_limit,
         crate_root,
     };
     record.write(alloc)
@@ -2838,6 +2968,9 @@ struct Base<'r, 'a, S> {
     sources: &'r S,
     /// A macro crate whose module's list declared its macros: an expansion declares none.
     listed: bool,
+    /// True when this crate is a `proc-macro = true` crate whose root-level expansions may
+    /// generate `#[proc_macro*]` functions for the `_DECLS` harness.
+    proc_macro: bool,
     /// The crate's expansions kept between solves ([`crate::expansions`]): asked and told by
     /// [`expand_decls`] alone.
     kept: &'r crate::expansions::KeptExpansions<'r, 'a>,
@@ -3543,7 +3676,7 @@ impl<'r, 'a, 'rp, 'p: 'a, S: SourceTexts<'a>> FillCx<'r, 'a, 'rp, 'p, S> {
                             synthetic_blocks: &synthetic_blocks,
                         };
                         let mut work = |s: Alloc<'_>| {
-                            make_modules(self.base, self.run, src.module, &mods, place, src.depth + 1, &mut bodies, s);
+                            make_modules(self.base, self.run, src.module, &mods, place, src.depth.saturating_add(1), &mut bodies, s);
                         };
                         if (self.scratch)(&mut work) == crate::task::Scratch::Kept {
                             work(home);
@@ -3603,6 +3736,14 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
     let eager_checked_cell: core::cell::RefCell<AVec<'a, &'a str>> = core::cell::RefCell::new(AVec::new_in(par_alloc));
     let refused_env = crate::refused::EnvRefusal::new_in(par_bump);
 
+    let format_args_builtin = matches!(
+        mac.body,
+        MacroBody::BuiltinFn(name)
+            if matches!(
+                BuiltinFn::of_library(name),
+                Some(BuiltinFn::FormatArgs | BuiltinFn::FormatArgsNl | BuiltinFn::ConstFormatArgs)
+            )
+    );
     if src.kind == CallShape::FnLike && in_call.in_block {
         if matches!(mac.body, MacroBody::BuiltinFn(name) if LITERAL_BUILTINS.iter().any(|b| *b == name)) {
             return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: false };
@@ -3618,7 +3759,12 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
             }),
             MacroBody::BuiltinDerive { .. } | MacroBody::BuiltinOther(_) | MacroBody::Proc { .. } => None,
         };
-        if def_may == Some(false) && !blaze_file_items::nested::may_declare(src.input) {
+        let input_may = if format_args_builtin {
+            blaze_file_items::nested::may_declare_format_args(src.input)
+        } else {
+            blaze_file_items::nested::may_declare(src.input)
+        };
+        if def_may == Some(false) && !input_may {
             return ParCallResult::Empty { notes, eager_checked: eager_checked_cell.into_inner(), called_seen: false };
         }
     }
@@ -3764,7 +3910,14 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         local_inner: LocalInner::No,
         transparency: None,
     };
-    let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, keep: par_bump, alloc };
+    let eager = EagerDriver {
+        macro_name: mac.name,
+        def_at: nested_at,
+        shadowed: &shadowed,
+        opaque_template: in_call.in_block && format_args_builtin,
+        keep: par_bump,
+        alloc,
+    };
     let expanded = match base.script {
         Some(out) => {
             let script_host = ScriptCx { inner: par_host, out };
@@ -3832,7 +3985,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
     let rendered = render_with(
         &expansion.tokens,
         Some(here),
-        |at| expansion.hygiene(at).mark.map(|mark| mark.site.krate),
+        |at| expansion.non_transparent_mark(at).map(|mark| mark.site.krate),
         def_crate,
         &mut |token, start, end, root| match (u32::try_from(token), u32::try_from(start), u32::try_from(end), u32::try_from(placed.len())) {
             (Ok(token), Ok(start), Ok(end), Ok(place)) => {
@@ -3881,7 +4034,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         CallShape::FnLike => blaze_expand::origin_column::InputShape::Inside,
         CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
     };
-    let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
+    let mark_of = |at: usize| expansion.non_transparent_mark(at).map(blaze_expand::origin_column::TextMark::of);
     let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
     let (rendered_text, text, made, column, moved_copies, synthetic_blocks): (
         &'a str,
@@ -3971,7 +4124,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
         outline: &made.outline,
         items: None,
         at: Where::Expansion(src.loc),
-        depth: src.depth + 1,
+        depth: src.depth.saturating_add(1),
         made: false,
         members_of: src.owner,
         written: src.written,
@@ -3987,7 +4140,7 @@ fn expand_one_par<'a, 'p: 'a, S: SourceTexts<'a>>(
             walked: base.tree,
             procs: base.expansion_procs(),
             entry: false,
-            harness: false,
+            harness: base.proc_macro && src.module == base.tree.modules[0].key,
             order: attr_order,
         },
         fragment,
@@ -4266,10 +4419,11 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
 /// `fixed_bytes_macros!` writes `address!`, whose body calls `$crate::hex!`; written as
 /// `crate::hex!` a call from another crate would name the caller's `hex`.
 ///
-/// token-mark-2 (drive.md "A token keeps its mark"): no spelled token. Outside a definition a
-/// `$crate` is written as `crate` and placed with its crate (`placed`'s fourth value), whose row
-/// carries [`crate::crate_roots::root_mark`]; inside one it is written `$crate`, which the written
-/// definition reads as the crate expanding (`here`): another crate's is refused
+/// token-mark-2 & token-mark-3 (drive.md "A token keeps its mark"): no spelled token. Outside a
+/// definition a `$crate` is written as `crate` and placed with its crate (`placed`'s fourth
+/// value), whose row carries [`crate::crate_roots::root_mark`]; inside one it is written `$crate`
+/// and also placed with its crate so lowering records a uniform foreign `dollar_crate` on
+/// `MacroSrc`, while a single definition mixing `$crate` from two different crates is refused
 /// ([`crate::crate_roots::ForeignDollarCrate`]).
 ///
 /// A token `def_crate(at)` says begins a single-name call the body of a `local_inner_macros`
@@ -4305,22 +4459,33 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
         }
     }
     // Groups open now; the depth a definition's body opened at while inside one; how far the
-    // tokens read so far are into `macro_rules ! name` (1, 2, 3) or `macro name` (2, 3).
+    // tokens read so far are into `macro_rules ! name` (1, 2, 3) or `macro name` (4, 5).
     let mut depth = 0u32;
     let mut in_def: Option<u32> = None;
     let mut def_head = 0u8;
+    // True while inside a 2.0 `macro name(...) { ... }` parameter list so the immediately
+    // following `{ ... }` body continues the same definition.
+    let mut macro2_params = false;
+    // Uniform `$crate` crate seen so far inside the current `in_def` definition: if two `$crate`
+    // tokens in the same definition name distinct crates, refuse (`ForeignDollarCrate`).
+    let mut def_crate_seen: Option<CrateItemKey> = None;
     // A `$crate` no expansion wrote (tokio's `doc! { macro_rules! try_join { .. $crate .. } }`:
     // in the call's own tokens) names the crate whose text holds it, the one expanding.
-    // Returns the crate a written `crate` stands for (its row's root), `None` for none.
-    let crate_of = |out: &mut AString<'_>, krate: Option<CrateItemKey>, in_def: bool| -> Result<Option<CrateItemKey>, crate::crate_roots::ForeignDollarCrate> {
+    // Returns the crate a written `crate` / `$crate` stands for (its row's root), `None` for none.
+    let crate_of = |out: &mut AString<'_>, krate: Option<CrateItemKey>, in_def: bool, seen: &mut Option<CrateItemKey>| -> Result<Option<CrateItemKey>, crate::crate_roots::ForeignDollarCrate> {
         if in_def {
-            return match krate {
-                Some(k) if here.is_some_and(|h| h != k) => Err(crate::crate_roots::ForeignDollarCrate { krate: k }),
-                _ => {
-                    out.push_str("$crate");
-                    Ok(None)
+            out.push_str("$crate");
+            if let Some(eff) = krate.or(here) {
+                match *seen {
+                    None => *seen = Some(eff),
+                    Some(prev) if prev != eff => {
+                        let foreign = if here == Some(eff) { prev } else { eff };
+                        return Err(crate::crate_roots::ForeignDollarCrate { krate: foreign });
+                    }
+                    Some(_) => {}
                 }
-            };
+            }
+            return Ok(krate);
         }
         out.push_str("crate");
         Ok(krate)
@@ -4355,18 +4520,25 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
         // `local_inner_macros` prefix, which is its own row).
         let mut root: Option<CrateItemKey> = None;
         let mut name_start = start;
-        let named_def = def_head == 3;
+        let named_def = def_head;
         def_head = match (def_head, token.kind) {
             (_, TokenKind::Ident { raw: Raw::No, .. }) if text == "macro_rules" => 1,
-            (_, TokenKind::Ident { raw: Raw::No, .. }) if text == "macro" => 2,
+            (_, TokenKind::Ident { raw: Raw::No, .. }) if text == "macro" => 4,
             (1, TokenKind::Punct { char: '!', .. }) => 2,
             (2, TokenKind::Ident { .. }) => 3,
+            (4, TokenKind::Ident { .. }) => 5,
             _ => 0,
         };
         match token.kind {
-            TokenKind::Open(Delim::Paren | Delim::Brace | Delim::Bracket) => {
-                if named_def && in_def.is_none() {
-                    in_def = Some(depth);
+            TokenKind::Open(delim @ (Delim::Paren | Delim::Brace | Delim::Bracket)) => {
+                if in_def.is_none() {
+                    if named_def == 3 || named_def == 5 {
+                        in_def = Some(depth);
+                        def_crate_seen = None;
+                        macro2_params = named_def == 5 && delim == Delim::Paren;
+                    } else if named_def == 6 && delim == Delim::Brace {
+                        in_def = Some(depth);
+                    }
                 }
                 depth += 1;
             }
@@ -4374,6 +4546,12 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
                 depth = depth.saturating_sub(1);
                 if in_def == Some(depth) {
                     in_def = None;
+                    if macro2_params {
+                        macro2_params = false;
+                        def_head = 6;
+                    } else {
+                        def_crate_seen = None;
+                    }
                 }
             }
             _ => {}
@@ -4381,7 +4559,7 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
         // A `$crate` is one word written as `crate`, two as `$crate` (`$`, `crate`).
         let crate_words = if in_def.is_some() { 2 } else { 1 };
         if def_crate(at) {
-            let prefix = crate_of(&mut out, dollar(at), in_def.is_some())?;
+            let prefix = crate_of(&mut out, dollar(at), in_def.is_some(), &mut def_crate_seen)?;
             if prefix.is_some() {
                 placed(first, start, out.len(), prefix);
             }
@@ -4399,11 +4577,11 @@ pub(crate) fn render_with<'a, W: core::alloc::Allocator>(
                 // The pair's `crate`: the same word(s) as its `$`.
                 note_word(&mut words, Some(word));
                 own = crate_words;
-                root = crate_of(&mut out, dollar(at), in_def.is_some())?;
+                root = crate_of(&mut out, dollar(at), in_def.is_some(), &mut def_crate_seen)?;
             }
             TokenKind::Ident { .. } if text == "$crate" => {
                 own = crate_words;
-                root = crate_of(&mut out, dollar(at), in_def.is_some())?;
+                root = crate_of(&mut out, dollar(at), in_def.is_some(), &mut def_crate_seen)?;
             }
             TokenKind::Ident { raw: Raw::Yes, .. } => {
                 out.push_str("r#");
@@ -4535,9 +4713,18 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     // such a block no ordinal). The body's lowering expands it alone, as before it was listed.
     // A builtin writes no item but `include!`'s file and `global_asm!`; a proc macro's output
     // is not known before it runs, so a proc macro is always expanded.
-    if src.kind == CallShape::FnLike
-        && held(run.made.read(), "made modules").get(&src.module).is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module))
-    {
+    let format_args_builtin = matches!(
+        mac.body,
+        MacroBody::BuiltinFn(name)
+            if matches!(
+                BuiltinFn::of_library(name),
+                Some(BuiltinFn::FormatArgs | BuiltinFn::FormatArgsNl | BuiltinFn::ConstFormatArgs)
+            )
+    );
+    let in_block_module = held(run.made.read(), "made modules")
+        .get(&src.module)
+        .is_some_and(|m| m.info.name.is_some_and(crate::blocks::is_block_module));
+    if src.kind == CallShape::FnLike && in_block_module {
         // A builtin whose output holds no token of its input is a literal, a path to `Option`
         // or nothing (core `macros/mod.rs`: `include_str!` "expands to an expression of type
         // `&'static str`", `concat!` "yields an expression of type `&'static str`", `env!`,
@@ -4573,7 +4760,12 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
             }),
             MacroBody::BuiltinDerive { .. } | MacroBody::BuiltinOther(_) | MacroBody::Proc { .. } => None,
         };
-        if def_may == Some(false) && !blaze_file_items::nested::may_declare(src.input) {
+        let input_may = if format_args_builtin {
+            blaze_file_items::nested::may_declare_format_args(src.input)
+        } else {
+            blaze_file_items::nested::may_declare(src.input)
+        };
+        if def_may == Some(false) && !input_may {
             return Some((DeclsBuilder::new_in(home), None));
         }
     }
@@ -4851,7 +5043,14 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
             || held(run.tables.read(), "tables").macros.values().any(|m| m.name == name && !matches!(m.body, MacroBody::BuiltinFn(b) if b == name))
     };
     let nested_at = DefAt { site: DefSite { krate: def_krate, module: None }, edition: def_edition, export: Export::Exported, local_inner: LocalInner::No, transparency: None };
-    let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, keep: home_bump, alloc };
+    let eager = EagerDriver {
+        macro_name: mac.name,
+        def_at: nested_at,
+        shadowed: &shadowed,
+        opaque_template: in_block_module && format_args_builtin,
+        keep: home_bump,
+        alloc,
+    };
     let run_part = match mac.body {
         MacroBody::Rules(_) | MacroBody::Macro2 { .. } => ExpandPart::RunRules,
         MacroBody::BuiltinFn(_) => ExpandPart::RunBuiltin,
@@ -4922,7 +5121,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     def_crate_starts.extend(expansion.nested.iter().filter(|c| c.scope == PathScope::DefCrate).map(|c| c.path.start));
     def_crate_starts.sort_unstable();
     let def_crate = |at: usize| def_crate_starts.binary_search(&(at as u32)).is_ok();
-    // The column's input indexes are the call's text as written (drive.md, ruled 20:57): a
+    // The column's input indexes are the call's text as written (drive.md): a
     // fn-like call's input is that text; an item macro's is the item its walk made, matched to
     // the written item from its end (blaze-expand `align_suffix`). Lexed as `lexed` lexed it.
     // A call written in an expansion: its input's tokens indexed as written are the words the
@@ -4962,7 +5161,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     let rendered = render_with(
         &expansion.tokens,
         Some(here),
-        |at| expansion.hygiene(at).mark.map(|mark| mark.site.krate),
+        |at| expansion.non_transparent_mark(at).map(|mark| mark.site.krate),
         def_crate,
         &mut |token, start, end, root| match (u32::try_from(token), u32::try_from(start), u32::try_from(end), u32::try_from(placed.len())) {
             (Ok(token), Ok(start), Ok(end), Ok(place)) => {
@@ -5023,7 +5222,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
         CallShape::FnLike => blaze_expand::origin_column::InputShape::Inside,
         CallShape::Attr | CallShape::Derive => blaze_expand::origin_column::InputShape::Whole,
     };
-    let mark_of = |at: usize| expansion.hygiene(at).mark.map(blaze_expand::origin_column::TextMark::of);
+    let mark_of = |at: usize| expansion.non_transparent_mark(at).map(blaze_expand::origin_column::TextMark::of);
     let origin_column = crate::expansion_origins::column_of(call, &placed, &roots, &expansion.origins, input_index, &mark_of, alloc);
     let (rendered_text, text, made, column, moved_copies, synthetic_blocks): (
         &'a str,
@@ -5132,7 +5331,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
         outline: &made.outline,
         items: None,
         at: Where::Expansion(src.loc),
-        depth: src.depth + 1,
+        depth: src.depth.saturating_add(1),
         made: false,
         members_of: src.owner,
         written,
@@ -5141,7 +5340,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
     };
     // The lowering is kept (the call's declarations and modules): output in `home`, scratch in
     // resettable `call_scratch` (`alloc`).
-    let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() }, fragment, alloc, home_bump);
+    let mut out = lower_in(LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: base.proc_macro && src.module == base.tree.modules[0].key, order: base.sources.attr_order() }, fragment, alloc, home_bump);
     // Entered only by a call that makes modules: one that makes none stays in `Lower` for the
     // few moves below (what the part costs is what `make_modules` does: a module's file read,
     // outlined and lowered).
@@ -5178,7 +5377,7 @@ fn expand_call<'a, 'p: 'a, S: SourceTexts<'a>>(
             tokens: FragmentTokens::LazyDeferBody(&get_tokens),
             synthetic_blocks: &synthetic_blocks,
         };
-        make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
+        make_modules(base, run, src.module, &mods, place, src.depth.saturating_add(1), &mut bodies, alloc);
     }
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(home));
     part(ExpandPart::Tables, mac.name, 0);
@@ -5266,7 +5465,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         outline: &made.outline,
         items: None,
         at: Where::Expansion(src.loc),
-        depth: src.depth + 1,
+        depth: src.depth.saturating_add(1),
         made: false,
         members_of: src.owner,
         written: src.written,
@@ -5284,7 +5483,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
         tokens: FragmentTokens::from_option(kept_tokens),
     };
     let mut out = lower_in(
-        LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: false, order: base.sources.attr_order() },
+        LowerCx { krate: base.key, tools: &base.root.tools, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs(), entry: false, harness: base.proc_macro && src.module == base.tree.modules[0].key && keep == KeepAs::Item, order: base.sources.attr_order() },
         fragment,
         alloc,
         bump,
@@ -5294,7 +5493,7 @@ fn keep_item<'a, S: SourceTexts<'a>>(
     let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
     let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: None, written: src.written, marks: None, tokens: FragmentTokens::from_option(kept_tokens), synthetic_blocks: &[] };
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
-    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies, alloc);
+    make_modules(base, run, src.module, &mods, place, src.depth.saturating_add(1), &mut bodies, alloc);
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
     // The harness declares no name: rustc writes `_DECLS` def-site, so no path of the crate
     // reaches it. Its text, key and body are the call's (`add_lowered` below), named by its
@@ -5321,12 +5520,9 @@ enum KeepAs {
 /// What [`ExpandNote`]s and part marks name a proc-macro harness's expansion by.
 const HARNESS_NAME: &str = "proc-macro harness";
 
-/// The most bodies deep (past macro expansions up to [`crate::RECURSION_LIMIT`]) a block's module
-/// is made: `body.depth` accumulates both macro-expansion depth (e.g. `pin_project!` peeling 90+
-/// doc-comment attributes on `tokio::time::Sleep` before emitting `const _: () = { impl Sleep .. }`)
-/// and block-in-block nesting, so a block written at expansion depth `< RECURSION_LIMIT` must still
-/// be allowed to make its block module (rule 18).
-const MAX_BLOCK_DEPTH: u16 = crate::RECURSION_LIMIT + 64;
+/// The most nested lexical block-local item bodies [`make_blocks`] descends into from any
+/// starting body, kept independent of macro expansion depth (rule 18).
+const MAX_BLOCK_DEPTH: u32 = 192;
 
 /// Makes the modules of the blocks of `bodies` that hold an `impl` ([`crate::blocks`]): each
 /// body's text is scanned once by syntax; one that writes an impl in a block gets a fragment
@@ -5347,8 +5543,9 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
 
     let alloc = base.alloc;
     let bump = base.bump;
-    let mut work: AVec<'_, crate::task::BodySrc<'a>> = AVec::from_slice_in(bodies, scratch);
-    while let Some(body) = work.pop() {
+    let mut work: AVec<'_, (crate::task::BodySrc<'a>, u32)> = AVec::with_capacity_in(bodies.len(), scratch);
+    work.extend(bodies.iter().map(|&b| (b, 0u32)));
+    while let Some((body, block_depth)) = work.pop() {
         let nested = blaze_file_items::nested::scan(body.text, scratch);
         // An unbalanced body is the parser's error to report; nothing is read from it.
         // A block is a module when it holds an item that makes one (its head is made in the
@@ -5360,7 +5557,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
         if nested.end != blaze_file_items::nested::NestedEnd::Whole || !nested.writes() {
             continue;
         }
-        if body.depth >= MAX_BLOCK_DEPTH {
+        if block_depth >= MAX_BLOCK_DEPTH {
             run.note(NamesNote::Made { name: crate::blocks::BLOCK_MODULE, at: body.loc, note: MadeNote::TooMany });
             continue;
         }
@@ -5424,7 +5621,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
             outline: &made.outline,
             items: None,
             at: Where::Expansion(body.loc),
-            depth: body.depth + 1,
+            depth: body.depth,
             made: false,
             members_of: None,
             written: body.written,
@@ -5441,7 +5638,10 @@ fn make_blocks<'a, S: SourceTexts<'a>>(
                 places.insert(m.key, body.place);
             }
         }
-        make_modules(base, run, body.module, &mods, place, body.depth + 1, &mut work, scratch);
+        let mut child_bodies: AVec<'_, crate::task::BodySrc<'a>> = AVec::new_in(scratch);
+        make_modules(base, run, body.module, &mods, place, body.depth, &mut child_bodies, scratch);
+        let next_block_depth = block_depth.saturating_add(1);
+        work.extend(child_bodies.into_iter().map(|b| (b, next_block_depth)));
         // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
         out.decls = DeclsBuilder::new_in(alloc);
         add_lowered(run, call, At::Expansion(call), out);
@@ -5466,6 +5666,13 @@ struct EagerDriver<'s, 'a, 'w> {
     /// Where the builtins the nested calls name are defined.
     def_at: DefAt,
     shadowed: &'s dyn Fn(&str) -> bool,
+    /// True for `format_args!` / `format_args_nl!` / `const_format_args!` expanded inside a block
+    /// module: the template argument must expand to a string literal (0 items, 0 blocks) and is
+    /// expanded with full macro resolution during body lowering (`blaze-lower` `ByName::call`), so
+    /// a user `macro_rules!` in the template (`format_args!(csi!("{}"), { struct Local; 1 })`)
+    /// stands in as `""` here while the trailing value arguments are still expanded for their
+    /// block modules.
+    opaque_template: bool,
     /// Where a note's text is kept: the crate's bump arena (a note outlives the call).
     keep: Bump<'a>,
     /// Where the work is done: the call's scratch ([`crate::task::Par::call_scratch`]), or the
@@ -5567,10 +5774,23 @@ impl<'a, 'w> EagerDriver<'_, 'a, 'w> {
                 [name] | ["core" | "std", name] => BuiltinFn::of_library(name),
                 _ => None,
             };
-            let Some(which) = which else { return Err(self.refused(&path, EagerRefusal::NotBuiltin)) };
-            if (self.shadowed)(segments[segments.len() - 1]) {
-                return Err(self.refused(&path, EagerRefusal::Shadowed));
-            }
+            let is_shadowed = which.is_some() && (self.shadowed)(segments[segments.len() - 1]);
+            let which = match (which, is_shadowed) {
+                (Some(which), false) => which,
+                (why_which, _) if self.opaque_template => {
+                    let _ = why_which;
+                    let mut empty = TokenStream::new_in(alloc);
+                    let kind = TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
+                    if empty.push(kind, "", Ctx::root(site.edition)).is_err() {
+                        return Err(self.refused(&path, EagerRefusal::Stream));
+                    }
+                    stack.clear();
+                    root.push(empty);
+                    continue;
+                }
+                (None, _) => return Err(self.refused(&path, EagerRefusal::NotBuiltin)),
+                (Some(_), true) => return Err(self.refused(&path, EagerRefusal::Shadowed)),
+            };
             let inner = call.inner();
             let Ok(args) = input.copy_in(inner.start as usize..inner.end as usize, alloc) else {
                 return Err(self.refused(&path, EagerRefusal::Stream));
@@ -5628,13 +5848,13 @@ fn definition_of_in<'m, 'd>(
     };
     let lexed = |text: &str, what: Lexed| lex(text, edition, alloc).map_err(|error| ExpandNote::Lex { macro_name: mac.name, what, error });
     Ok(match mac.body {
-        MacroBody::Rules(body) => MacroDefinition::rules(lexed(body, Lexed::Body)?, def_at),
+        MacroBody::Rules(body) => MacroDefinition::rules(lexed(body, Lexed::Body)?, def_at).with_dollar_crate(mac.dollar_crate),
         MacroBody::Macro2 { params, body } => {
             let params = match params {
                 Some(p) => Some(lexed(p, Lexed::Parameters)?),
                 None => None,
             };
-            MacroDefinition::macro2(params, lexed(body, Lexed::Body)?, def_at)
+            MacroDefinition::macro2(params, lexed(body, Lexed::Body)?, def_at).with_dollar_crate(mac.dollar_crate)
         }
         MacroBody::BuiltinFn(name) => match BuiltinFn::of_library(name) {
             Some(which) => MacroDefinition::builtin_fn(which, def_at, alloc),
@@ -5760,7 +5980,7 @@ fn make_modules<'c, 'a, S: SourceTexts<'a>>(
     parent: ItemKey,
     mods: &[ModMade<'a>],
     made: Made<'c, 'a>,
-    depth: u16,
+    depth: u32,
     // The bodies lowered in the made modules that may write an impl in a block, added.
     bodies: &mut AVec<'_, crate::task::BodySrc<'a>>,
     scratch: Alloc<'_>,

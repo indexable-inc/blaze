@@ -9,7 +9,6 @@
 bgit	0	0	4	71
 blaze-alloc-count	0	0	0	2
 blaze-audit	0	0	137	27
-blaze-bench	0	0	0	12
 blaze-blake3	0	0	0	8
 blaze-bstd-convert	0	0	0	69
 blaze-build	0	0	14	1
@@ -18,7 +17,7 @@ blaze-bytes	0	0	0	3
 blaze-cad-out	0	0	0	1
 blaze-cas	10	0	43	62
 blaze-check	54	0	0	37
-blaze-cli	1	0	275	119
+blaze-cli	1	0	275	120
 blaze-columns	0	0	0	3
 blaze-cond	0	0	0	2
 blaze-consteval	0	0	0	4
@@ -35,7 +34,6 @@ blaze-file-items	0	0	28	9
 blaze-fmt	17	0	25	251
 blaze-format	3	0	0	4
 blaze-format-core	0	0	5	3
-blaze-format-tiers	16	0	0	24
 blaze-fuzz	0	0	0	4
 blaze-graph	193	0	29	112
 blaze-hash	0	0	6	1
@@ -45,7 +43,7 @@ blaze-ids	22	0	5	15
 blaze-inproc	1	0	0	3
 blaze-keyed	0	0	11	11
 blaze-kit	0	0	0	2
-blaze-ladder	0	0	796	244
+blaze-ladder	0	0	798	244
 blaze-launch	0	0	2	2
 blaze-launch-rt	50	0	1	36
 blaze-launcher	3	0	0	3
@@ -62,9 +60,7 @@ blaze-memo-macros	56	0	5	5
 blaze-native	0	0	5	0
 blaze-new	0	0	13	7
 blaze-own	0	0	51	8
-blaze-pack	41	0	0	36
 blaze-proc-macro	0	0	35	204
-blaze-profile	1068	6	287	393
 blaze-protocol	69	0	4	26
 blaze-queue	0	0	8	0
 blaze-radix	1	0	3	6
@@ -77,7 +73,7 @@ blaze-resolve	5	0	103	64
 blaze-scope	0	0	0	47
 blaze-screen	254	0	0	37
 blaze-script	0	0	6	117
-blaze-shell	0	0	7	239
+blaze-shell	0	0	7	241
 blaze-sim	0	0	39	33
 blaze-solve	0	0	0	16
 blaze-source	2	0	4	8
@@ -126,7 +122,6 @@ harness/harness-vt	0	0	0	10
 harness/vendor/hyperion-ecs	0	0	0	13
 harness/vendor/hyperion-manifest-types	0	0	0	3
 intern	8	0	0	0
-ix-prof	46	0	73	170
 parser	32	0	0	23
 paths	0	0	0	1
 rustc_abi	0	0	0	5

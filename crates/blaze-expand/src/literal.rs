@@ -160,6 +160,63 @@ fn unescape_bytes(body: &str, out: &mut AVec<'_, u8>) -> Result<(), LitError> {
     refused.map_or(Ok(()), Err)
 }
 
+/// Scans `rest` (the text of a name-value attribute after its attribute path, e.g.
+/// `/* note */ = /* reason */ "\x32\x35\x36"`) using Rust's lexer and string unescaper.
+/// Expects optional whitespace/comments, a single `=`, optional whitespace/comments, a single
+/// unsuffixed Rust string literal (`"..."` or `r#"..."#`, NOT byte/c-string/char/int), and
+/// optional trailing whitespace/comments. Feeds each decoded `char` to `push` in order and
+/// returns `true` on success, `false` if the syntax, token kind, suffix, or escape sequence is
+/// invalid.
+pub fn decode_name_value_str(rest: &str, mut push: impl FnMut(char)) -> bool {
+    use rustc_lexer::{FrontmatterAllowed, LiteralKind as L, TokenKind as K};
+    let mut offset = 0usize;
+    let mut saw_eq = false;
+    let mut literal: Option<(bool, &str)> = None;
+    for token in rustc_lexer::tokenize(rest, FrontmatterAllowed::No) {
+        let len = usize::try_from(token.len).unwrap_or(usize::MAX);
+        let Some(end) = offset.checked_add(len) else { return false };
+        let Some(slice) = rest.get(offset..end) else { return false };
+        offset = end;
+        match token.kind {
+            K::Whitespace | K::LineComment { .. } => continue,
+            K::BlockComment { terminated: true, .. } => continue,
+            K::BlockComment { terminated: false, .. } => return false,
+            K::Eq if !saw_eq && literal.is_none() => {
+                saw_eq = true;
+            }
+            K::Literal { kind, suffix_start } if saw_eq && literal.is_none() => {
+                if suffix_start != token.len {
+                    return false;
+                }
+                let (raw, start, tail) = match kind {
+                    L::Str { terminated: true } => (false, 1usize, 1usize),
+                    L::RawStr { n_hashes: Some(n) } => (true, 2 + usize::from(n), 1 + usize::from(n)),
+                    _ => return false,
+                };
+                let Some(body_end) = slice.len().checked_sub(tail) else { return false };
+                let Some(body) = slice.get(start..body_end) else { return false };
+                literal = Some((raw, body));
+            }
+            _ => return false,
+        }
+    }
+    let Some((raw, body)) = literal else { return false };
+    let mut ok = true;
+    if raw {
+        parser::unescape::check_raw_str(body, |_, unit| match unit {
+            Ok(ch) => push(ch),
+            Err(_) => ok = false,
+        });
+    } else {
+        parser::unescape::unescape_str(body, |_, unit| match unit {
+            Ok(ch) => push(ch),
+            Err(error) if error.is_fatal() => ok = false,
+            Err(_) => {}
+        });
+    }
+    ok
+}
+
 /// The value of a string literal (`"…"` or `r#"…"#`), whose tt text is `text`, appended.
 pub(crate) fn string_value(
     kind: LitKind,

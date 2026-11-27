@@ -859,8 +859,8 @@ fn records_answer_what_the_solved_names_answer() {
         std::fs::write(path, lines.join("\n") + "\n").expect("writing FRONT2_RECORDS_OUT");
     }
 
-    // THE ARCHITECT'S TEST (drive.md, "End state: the whole pipeline on the command", piece
-    // 12): "`Display for a::T` opens `core` and `a`". Here `a::T` is `Io` (a nominal type of
+    // THE ARCHITECT'S TEST (end-state.md D157):
+    // "`Display for a::T` opens `core` and `a`". Here `a::T` is `Io` (a nominal type of
     // blaze's own standard library, in the prelude the program's root sees) and the trait is core's
     // `fmt::Display`. The Rust Reference, "Implementations", "Trait implementation coherence",
     // "Orphan rules": "Given `impl<P1..=Pn> Trait<T1..=Tn> for T0`, an `impl` is valid only if

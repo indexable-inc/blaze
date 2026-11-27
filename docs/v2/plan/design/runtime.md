@@ -1,16 +1,13 @@
 ---
 status: plan
-summary: "The runtime's end state and the order of work (the owner, 2026-11-17: \"make a plan for the sota runtime\"). One page over engine.md, the store, names, heads, bodies, lints, tests, run and the remote read: what must hold (incremental after a restart first, with lints as fast; then remote records, memory, cold time, cleanup, disk), the floor of each number beside today's measurement, the ten design points with their evidence from two surveys and one review, the answer's stored form, ten ideas past the surveyed state of the art, and the pieces lanes write, in order."
+summary: "The runtime's end state (the owner, 2026-11-17: \"make a plan for the sota runtime\"), under end-state.md where they differ. One page over the engine (end-state.md D157), the store, names, heads, bodies, lints, tests, run and the remote read: what must hold (incremental after a restart first, with lints as fast; then memory, cold time, cleanup, disk; a remote cache supported and not ranked), the floor of each number, the ten design points with their evidence, the answer's stored form (crates/blaze-answer), the ideas past the surveyed state of the art, and the pieces by the ids code cites."
 date: 2026-11-17
 ---
-# The runtime: the end state and the order of work
+# The runtime: the end state
 
-This page is the plan. engine.md is the detail of the execution engine and stays its home; where target.md,
-bottom.md, drive.md, parallel.md or store.md disagree with this page, this page stands and that part of them is
-due for deletion (rule 49). Every "today" number was measured in a real run on 2026-11-17 on an 18-core Mac.
-The evidence cites two surveys made that day (fast compilers, checkers, linters and build engines; then
-incremental engines in depth) and one review of this plan against them; all are kept with the session's notes,
-outside the tree. Second revision, 18:45: the review's twelve edits are in.
+[end-state.md](end-state.md) (D157) is the detail of the execution engine. [end-state.md](end-state.md) (D156 on)
+is the later plan and stands where the two differ; this page keeps the design points, floors and piece ids
+that code cites.
 
 ## What it must do
 
@@ -18,49 +15,50 @@ The owner, 2026-11-17 18:05, in his order of importance:
 
 1. Incremental compiles are short: on realistic huge Rust monorepos (millions of lines), on enormous crates and
    large files, and after the computer restarted with nothing running. Lints are as fast as the check.
-2. Cached results can come from elsewhere (R2, peers).
-3. Memory use is small.
-4. A cold compile is fast.
-5. Disk cleanup is good and never locks.
-6. Disk use is small.
+2. Memory use is small.
+3. A cold compile is fast.
+4. Disk cleanup is good and never locks.
+5. Disk use is small.
 
-And: a restart re-indexes nothing; a daemon is allowed and not needed; caches are shared across the worktrees of
+A remote cache (R2, peers) is supported and is not in this order: nothing is designed around it or traded
+against these. And: a restart re-indexes nothing; no daemon (a command answers and exits; an optional helper holds nothing
+correctness needs); caches are shared across the worktrees of
 a machine with no setup; best on 128 cores, good on a typical Mac; data-oriented throughout (structures of
 arrays, 32-bit ids, records read in place); tests are incremental.
 
-## Floors, and where each number stands
+## Floors
 
 A floor is what the design permits, stated before the work (rule 67), as a counter the profile prints and a
 test asserts. Where a row is a target and not yet a derived floor it says so.
 
-| What | Floor | Today |
-|---|---|---|
-| Nothing changed, no process alive | change detection plus one certificate read. Change detection is the OS journal read since the stored event on macOS, one batched stat per workspace file on Linux, and nothing statted under a settled class; under 10 ms on the 1,100-crate workspace (823 source files), after a reboot | 0.01 s on a small project; 0.58 s on one crate of 500 modules (the answer read whole 0.26 s); 5.3 s on the 1,100-crate workspace with failures standing (the 500 MB answer read whole 2.5 s, the unit graph rebuilt 1.2 s); 0.09 s on the old engine. The journal sweep is on the tree (one write: 1 of 26 paths statted) |
-| The stored answer | at most 96 B fixed a row, 4 B a read, 24 B a defined cell; a request reads only the pages of the tasks it enters and of the cells that moved | in use: 406 B a row before its first read and 81 B a read (24.5 KB for a 300-read body); read whole. On the tree behind a seam, not yet in use: 96 B fixed and 36 B cold a row, 1.7 to 2.0 B a read, 24 B a define (42 MB for 24,000 rows of 300 reads) |
-| One error | stops only the tasks that read what it broke | one unresolved name stops every crate above it: 13,538 of 16,041 bodies not checked |
-| A comment added | 1 outline, 0 bodies | 1 outline, identical; 0 bodies; 0.04 s on a small project. In the 500-module crate: 1 head and 1 body entered, 0.85 s (the answer read whole is 0.26 s of it). Formatting one file there: 10 heads and 10 bodies (floor 0: keys from tokens) |
-| A warm `run`, nothing changed | the start list replayed: no front end built, every first call answered from the list; under 10 ms for hello world | 10 ms, 41 M instructions, 3.6 MB (80 ms, 1,074 M and 221 MB before the list held statics) |
-| One statement edited, small project | 1 outline, 1 body, its lints, one commit | 0.19 s |
-| One statement edited, 1,100-crate workspace | the same counts; under 50 ms (a target) | not measured; it cannot beat the 5.3 s no-op today |
-| A private fn added | 1 names group (2 where a child module globs its parent), 1 head, 1 body | every body of the crate: 12 of 12 on a small project; 5,552 of 6,111 in one crate of 500 modules (376 s on one worker), each re-entered because it reads its crate's whole names record, and all of them come out identical |
-| A fn's parameter type changed | that fn and exactly its callers | 12 bodies of 12 |
-| `impl From<X> for E` added | the bodies whose trait questions it can answer, by the goal's self and argument shapes | not measured |
-| A generic fn's body edited | instances made: one per shape the next run calls | not measured |
-| A second worktree at the same commit | 0 tasks entered: the answer is found by the tree's digest | not built |
-| An edit in a 400-crate workspace | files read 1; pages written 2 | 1 file read, 1 outline, 1 body, 2 pages |
-| One module edited in a 2,000-module crate | that group's files and solve; whole-to-edit ratio in the hundreds | 17 ms against 173 ms whole: ratio 10 |
-| One item edited in a 100,000-line file | a scan of the file at memory speed and one item's outline | not measured; the outline is made again whole |
-| Cold check, dependencies settled, 18 cores | under 10 s (the owner's target); as a sum: names of your crates, heads, 16,000 bodies at the mean CPU a body with the borrow check in | 215 s, but with 10% of bodies checked: not yet a cold-check number. One crate of 500 modules and 6,051 fns: 379 s on 1 worker, 86 s on 4, 68 s on 16, with half its bodies refused at a head |
-| CPU to check one body | 1 to 3 ms at the mean (from per-line rates of checkers without traits or a borrow check: 11,000 to 40,000 lines a core-second) | 11.5 ms at the median, at 4.43 entries a body (16.65 that morning) |
-| Speedup at N workers | wall x workers / CPU at one worker of at least 0.7, and the coordinator under 5% of wall | 598 CPU-s in 215 s on 16 workers: 2.8 cores busy. On the 500-module crate the coordinator's merge was 72% of one worker's time (each cell's readers kept as a sorted vector; a set since) |
-| Peak memory, cold check | workers x the largest task's working set, plus the plan: about 1.2 GB at 16 workers, whatever the project's size; mapped records are the page cache's | 15.7 GB on the 1,100-crate workspace; 2.2 to 2.7 GB on the 500-module crate |
-| Peak memory, one edit | one task's working set and the pages it reads: under 100 MB (Relax reports 1,087 MB for a warm one-body-edit check) | 640 to 700 MB for a comment, statement or signature edit in the 500-module crate (the answer read whole); 495 MB with nothing changed |
-| Peak memory, first check of a 17-line project | under 100 MB: it reaches 66 name groups | 2.1 GB: 27 dependency crates' names solved whole |
-| A dependency's names a small program needs | the groups it reaches: 66 of 17,260 | all 27 crates whole, about 6 s on a fresh home |
-| Lints | one walk a body; each lint's cost printed | the stage is on the tree (one walk a body, each rule's count and time printed); not yet measured on a real project |
-| Tests after one body edit | the tests whose reach holds that body | spec only (test-selection.md) |
-| First check on a fresh machine | the settled classes read by byte range: bytes, round-trip waves (at most 3, by a prefetch list in the head) and seconds | not built (remote-read.md) |
-| Cleanup | the longest wait of any command on compaction is 0 at 128 workers; disk after 1,000 edits at most twice the live bytes | in the store's simulation: 0 waits on cleanup over 1,000 commands and disk at most twice the live bytes; switched off for the command until the code store's records are reached from roots |
+| What | Floor |
+|---|---|
+| Nothing changed, no process alive | change detection plus one certificate read. Change detection is the OS journal read since the stored event on macOS, one batched stat per workspace file on Linux, and nothing statted under a settled class; under 10 ms on the 1,100-crate workspace (823 source files), after a reboot |
+| The stored answer | at most 96 B fixed a row, 4 B a read, 24 B a defined cell; a request reads only the pages of the tasks it enters and of the cells that moved |
+| One error | stops only the tasks that read what it broke |
+| A comment added | 1 outline, 0 bodies |
+| A warm `run`, nothing changed | the start list replayed: no front end built, every first call answered from the list; under 10 ms for hello world |
+| One statement edited, small project | 1 outline, 1 body, its lints, one commit |
+| One statement edited, 1,100-crate workspace | the same counts; under 50 ms (a target) |
+| A private fn added | 1 names group (2 where a child module globs its parent), 1 head, 1 body |
+| A fn's parameter type changed | that fn and exactly its callers |
+| `impl From<X> for E` added | the bodies whose trait questions it can answer, by the goal's self and argument shapes |
+| A generic fn's body edited | instances made: one per shape the next run calls |
+| A second worktree at the same commit | 0 tasks entered: the answer is found by the tree's digest |
+| An edit in a 400-crate workspace | files read 1; pages written 2 |
+| One module edited in a 2,000-module crate | that group's files and solve; whole-to-edit ratio in the hundreds |
+| One item edited in a 100,000-line file | a scan of the file at memory speed and one item's outline |
+| Cold check, dependencies settled, 18 cores | under 10 s (the owner's target); as a sum: names of your crates, heads, 16,000 bodies at the mean CPU a body with the borrow check in |
+| CPU to check one body | 1 to 3 ms at the mean (from per-line rates of checkers without traits or a borrow check: 11,000 to 40,000 lines a core-second) |
+| Speedup at N workers | wall x workers / CPU at one worker of at least 0.7, and the coordinator under 5% of wall |
+| Peak memory, cold check | workers x the largest task's working set, plus the plan: about 1.2 GB at 16 workers, whatever the project's size; mapped records are the page cache's |
+| Peak memory, one edit | one task's working set and the pages it reads: under 100 MB (Relax reports 1,087 MB for a warm one-body-edit check) |
+| Peak memory, first check of a 17-line project | under 100 MB: it reaches 66 name groups |
+| A dependency's names a small program needs | the groups it reaches: 66 of 17,260 |
+| Lints | one walk a body; each lint's cost printed |
+| Tests after one body edit | the tests whose reach holds that body |
+| First check on a fresh machine, fetching chosen (off unless chosen) | the settled classes read by byte range: bytes, round-trip waves (at most 3, by a prefetch list in the head) and seconds |
+| Cleanup | the longest wait of any command on compaction is 0 at 128 workers; disk after 1,000 edits at most twice the live bytes |
 
 ## The end state
 
@@ -175,7 +173,8 @@ test asserts. Where a row is a target and not yet a derived floor it says so.
    moves little (the Cranelift back end: 5 to 12% end to end on a large Rust project, with a per-function
    cache as its own next goal); Zig's in-place patching reaches 30 to 70 ms rebuilds.
 
-9. **Published records are fetched, yours stay.** What is published is exactly the settled classes; a
+9. **Published records, when chosen, are fetched; yours stay.** Fetching is an option, off unless chosen; without
+   it a new checkout is served by the machine's own content-deduplicated store. What is published is exactly the settled classes; a
    published head carries a prefetch list so a fresh home needs few round trips; a project's records leave
    its machine only when its organisation opts in. A peer is another origin of the same form.
 
@@ -202,8 +201,8 @@ are shared by content.
 - The root and its segments are also put in the shared store under the tree's digest, which is how a second
   worktree at the same commit enters nothing.
 
-It is written interface-first as one small crate with its simulation (rule 79) and replaces the page form
-(406 B a row, 81 B a read, the index rebuilt from every row at each request).
+It is crates/blaze-answer with its simulation; blaze-engine reads through it (overlay.rs). blaze-cli's rows
+form (engine_answer_rows.rs) is built, not wired, until D5.
 
 ## Past the surveyed state of the art
 
@@ -246,48 +245,46 @@ calls. The pieces are W0 to W3 below; W1 is the first, because it needs only wha
 
 ## The work
 
-Pieces are written by lanes that only write (LANES-1810.md in the session's notes); the coordinator compiles
-each piece against the green tree, runs its tests, admits it alone, then makes the real run that judges it
-(rules 35, 82).
+Each piece is admitted on its check, measured in a real run (rules 35, 82).
 
-| Id | Piece | Check | State |
-|---|---|---|---|
-| A8 | An error stops only what reads it; a failure records its reads | the 1,100-crate run: "its crate has no Names task" 0 times; over 15,000 bodies checked; the no-op certified | partly on the tree (error records, failures record their reads, block-module bodies); the 1,100-crate run still refuses most bodies: two build-script modules were missing from the harness's store (built since), and half the bodies of a plain crate are refused at a head task whose reason is not printed (in a lane) |
-| A1 | A body in one round: heads and impl answers on the spot | rounds == 1 on the 58 real bodies, answers and read lists equal | on the tree in the ladder's test (0.98 rounds a body); the engine's bodies stage uses it once A3 lands |
-| A2 | A head task per item; the per-file signature cell goes; the wave rule for heads that read heads | a private fn added enters 1 body; a signature change enters its callers | head tasks per item on the tree; the private fn row fails at scale (every body reads its crate's whole names record): names read at cell grain is in a lane |
-| A3 | A dependency's head frozen once a machine, as a record of its settled class, found through a claim | heads frozen equals distinct heads read; a second request freezes none | written and merged; two tests fail (frozen dependency heads are not put), with its lane |
-| A4 | Trait goals as shared records: one read a hit, the root of a cycle only, a step cap, the audit | goals solved against goals asked; a planted hit without its read is caught | on the tree for the ladder's bodies (the audit on, forward and reversed); the engine passes no table yet |
-| A5 | Head aspects | a field added enters no body that only names the type | after A2 |
-| A6 | Bodies inside a block's module are planned (a derive's impl fns) | the derive fixture's planted error is reported; the 1,100-crate run refuses no derive body | on the tree; the 1,100-crate count is owed |
-| A7 | The engine prints a body's findings as `check` does | "2 errors" where two callers fail | on green 0e495ebbbe |
-| B1 | The module tree as a record; a one-group solve reads one group's files | byte-equal on every fixture; the ratio row above | on green 8a47687182 at ratio 10; the driver's O(groups) work is next |
-| B2 | A dependency's names on demand over the tree record | the std hello world solves about 66 of 17,260 groups, byte-equal | on the tree in the scope crate (enums of unlowered modules from the tree record; the `#[macro_use]` edit bug fixed); the real shelf run and the once-a-request parse of the tree record are owed |
-| B3 | Macro expansions as records by content, out of the names record | the core library's names record under half its 83 MB | the record form is on the tree; names tasks writing it is written and in its third merge round |
-| C1 | No record held in the heap on the write side | "held after the merge: 0" per stage | on green 0253586b90 for names records |
-| C2 | A large record streamed to its place; one flip per request | copies made 0 over 64 KiB; the commit under 10 ms; simulated crashes pass | after C3 |
-| C3 | Readers map: crate records and outlines read in place | bytes of records copied into the heap: 0 | on the tree for the engine's heads and bodies and for `run` (0 bytes copied; a store snapshot for worker threads too); head-task payloads are still copied |
-| C5 | Cleanup under the engine: roots with expiry, the cap, compaction that no command waits on | the cleanup row above | on the tree in the store (leases, the reach sweep folded into the command's own commit, swept records carried forward); off for the command until every record a later command reads is reached from a root (in a lane) |
-| F0 | The answer's stored form, as one crate with its simulation: dense ids, generation validity, signed sorted runs, the root keyed by the tree's digest | one signature edit on the 1,100-crate workspace reads the entered tasks' pages and the moved cells' index runs only; the row sizes above | the crate, its simulation and the seam with both forms behind it are on the tree; the engine reading through the seam is in a lane; not yet in use |
-| D1 | Engine core: ordered reads, changed and still needed, a plan that grows, claims for inline needs, waves inside a stage | the history simulation with a planted bug for each | on the tree |
-| D2 | Units, fetches and the graph read back from rows; `why` reads the edition | the no-op's "plan" phase in ms on the 1,100-crate workspace | on the tree; the 1,100-crate number is owed |
-| D3 | Question cells in the engine; an impl added enters only its askers | an unrelated impl enters 0 bodies | after D1; the cell's type lands with A1 |
-| D4 | Settled classes: nothing under them listed or statted | reads a body row: before and after; a second project on one toolchain reads no dependency read list | with F0 |
-| D6 | The certificate with findings; only moved pages written; exact "owed" | the three-finding fixture certified with 0 pages read | written on the page form and not merged: its certificate with findings and exact "owed" are rebuilt over the rows form at the switch (D5) |
-| S1 | Change detection: the OS journal on macOS, batched stats on Linux, nothing under a settled class | the no-op row after a reboot | the macOS journal sweep is on the tree, simulated (one write: 1 of 26 paths statted); a run on the real journal is owed; Linux is not started |
-| D5 | The switch: `check` is the engine; the old path deleted | answers equal on fixtures, the minis and the 1,100-crate workspace with over 15,000 bodies checked; the no-op no slower than the old path's 0.09 s | after A8, F0, A1, A2, A6, B1 |
-| E1 | Lints stage: one walk a body, over the typed-result record | a body edit reruns that walk only; each lint's cost printed; lint seconds beside check seconds | on the tree |
-| E2 | Tests stage by reach | one body edit reruns only the tests that reach it | the spec and the record's core are in a lane (a test's reach is the code records its process asked for); the stage is wired after D5 |
-| F1 | The std hello world prints through `run` | exit 0 twice | eleven stops fixed (the last: intrinsics with fallback bodies, fn items as closures); the stop now is a foreign fn declared inside a thread-local's expansion (in a lane) |
-| F2 | `run` and the census on the engine | hello world; the census equals the last one | after D5 |
-| G0 | Fixtures and the scaling harness: a 5,000-module crate, a 100,000-line file, a `--workers` sweep | the huge-input rows and the speedup row print | the harness runs (a 500-module crate at 1, 4 and 16 workers, eight edits against their floors); it is not on the tree yet, and the 5,000-module and 100,000-line rows are not run |
-| H0 | The remote contract: the published set is the settled classes; a publish job; a fresh home reads by range from a directory origin | bytes, round-trip waves and seconds for a small project | next (the owner parked the R2 service itself at 11:29; this needs none) |
-| H1 | Code records fetched | a fresh home's first `run` | after F2 |
-| V1 | A body's result as a checkable certificate (X2): validate without inference when a read moved; a fetched certificate needs no trust | validate against infer time on the 58 real bodies; the share of moved-read bodies that still validate | the spec (certificates.md) and a checker for a trait goal's derivation are on the tree, with hand-built derivations; the solver does not emit them yet |
-| K1 | One code record per generic fn at the first tier (X3): size, alignment and trait tables passed in; specialised when hot | code records and build seconds of the 1,100-crate census; its tests' run time | after F2; spec first |
-| W0 | The world interface: the schema (worlds, patches, transactions, answers) and a TypeScript client; the CLI calls it | a script that patches, checks and commits through the client | the spec (world.md), the schema crate and the TypeScript client are on the tree with one set of golden vectors; nothing answers the calls yet |
-| W1 | `check` of a world that differs from disk by a patch (X5): records filled for a tree not yet written | the save after a pre-checked patch enters 0 tasks | after F0 (the tree's digest is the key) |
-| W2 | Transactions from an agent's edit tool, with item keys given by the tool so no file is outlined | an agent edit of one body: files outlined 0 | after W0 |
-| W3 | Commit as projection: the files of a world written from its items | a world patched twice and committed equals the same edits made on disk | after W0 |
+| Id | Piece | Check |
+|---|---|---|
+| A8 | An error stops only what reads it; a failure records its reads | the 1,100-crate run: "its crate has no Names task" 0 times; over 15,000 bodies checked; the no-op certified |
+| A1 | A body in one round: heads and impl answers on the spot | rounds == 1 on the 58 real bodies, answers and read lists equal |
+| A2 | A head task per item; the per-file signature cell goes; the wave rule for heads that read heads | a private fn added enters 1 body; a signature change enters its callers |
+| A3 | A dependency's head frozen once a machine, as a record of its settled class, found through a claim | heads frozen equals distinct heads read; a second request freezes none |
+| A4 | Trait goals as shared records: one read a hit, the root of a cycle only, a step cap, the audit | goals solved against goals asked; a planted hit without its read is caught |
+| A5 | Head aspects | a field added enters no body that only names the type |
+| A6 | Bodies inside a block's module are planned (a derive's impl fns) | the derive fixture's planted error is reported; the 1,100-crate run refuses no derive body |
+| A7 | The engine prints a body's findings as `check` does | "2 errors" where two callers fail |
+| B1 | The module tree as a record; a one-group solve reads one group's files | byte-equal on every fixture; the ratio row above |
+| B2 | A dependency's names on demand over the tree record | the std hello world solves about 66 of 17,260 groups, byte-equal |
+| B3 | Macro expansions as records by content, out of the names record | the core library's names record under half its 83 MB |
+| C1 | No record held in the heap on the write side | "held after the merge: 0" per stage |
+| C2 | A large record streamed to its place; one flip per request | copies made 0 over 64 KiB; the commit under 10 ms; simulated crashes pass |
+| C3 | Readers map: crate records and outlines read in place | bytes of records copied into the heap: 0 |
+| C5 | Cleanup under the engine: roots with expiry, the cap, compaction that no command waits on | the cleanup row above |
+| F0 | The answer's stored form, as one crate with its simulation: dense ids, generation validity, signed sorted runs, the root keyed by the tree's digest | one signature edit on the 1,100-crate workspace reads the entered tasks' pages and the moved cells' index runs only; the row sizes above |
+| D1 | Engine core: ordered reads, changed and still needed, a plan that grows, claims for inline needs, waves inside a stage | the history simulation with a planted bug for each |
+| D2 | Units, fetches and the graph read back from rows; `why` reads the edition | the no-op's "plan" phase in ms on the 1,100-crate workspace |
+| D3 | Question cells in the engine; an impl added enters only its askers | an unrelated impl enters 0 bodies |
+| D4 | Settled classes: nothing under them listed or statted | reads a body row: before and after; a second project on one toolchain reads no dependency read list |
+| D6 | The certificate with findings; only moved pages written; exact "owed" | the three-finding fixture certified with 0 pages read |
+| S1 | Change detection: the OS journal on macOS, batched stats on Linux, nothing under a settled class | the no-op row after a reboot |
+| D5 | The switch: `check` is the engine; the old path deleted | answers equal on fixtures, the minis and the 1,100-crate workspace with over 15,000 bodies checked; the no-op no slower than the old path's 0.09 s |
+| E1 | Lints stage: one walk a body, over the typed-result record | a body edit reruns that walk only; each lint's cost printed; lint seconds beside check seconds |
+| E2 | Tests stage by reach | one body edit reruns only the tests that reach it |
+| F1 | The std hello world prints through `run` | exit 0 twice |
+| F2 | `run` and the census on the engine | hello world; the census equals the last one |
+| G0 | Fixtures and the scaling harness: a 5,000-module crate, a 100,000-line file, a `--workers` sweep | the huge-input rows and the speedup row print |
+| H0 | The remote contract (H0 and H1: an option, off unless chosen): the published set is the settled classes; a publish job; a fresh home reads by range from a directory origin (the owner parked the R2 service itself at 11:29; this needs none) | bytes, round-trip waves and seconds for a small project |
+| H1 | Code records fetched | a fresh home's first `run` |
+| V1 | A body's result as a checkable certificate (X2): validate without inference when a read moved; a fetched certificate needs no trust | validate against infer time on the 58 real bodies; the share of moved-read bodies that still validate |
+| K1 | One code record per generic fn at the first tier (X3): size, alignment and trait tables passed in; specialised when hot | code records and build seconds of the 1,100-crate census; its tests' run time |
+| W0 | The world interface: the schema (worlds, patches, transactions, answers) and a TypeScript client; the CLI calls it | a script that patches, checks and commits through the client |
+| W1 | `check` of a world that differs from disk by a patch (X5): records filled for a tree not yet written | the save after a pre-checked patch enters 0 tasks |
+| W2 | Transactions from an agent's edit tool, with item keys given by the tool so no file is outlined | an agent edit of one body: files outlined 0 |
+| W3 | Commit as projection: the files of a world written from its items | a world patched twice and committed equals the same edits made on disk |
 
 A piece whose real run misses its floor is not followed by a second fix to the same mechanism without an
 outside read of the design (rule 66).

@@ -5,62 +5,57 @@ Vertically integrated Rust stack (language, comptime reflection, pinned std, bst
 JIT/PGO/AOT, builder, linter, runtime & unikernel VMs) targeting edit-to-result speed and
 hardware-floor execution on 128-core servers and Apple Silicon Macs via one code path.
 
-- **Tradeoff order:** incremental + lints > remote cache > memory > cold compile > non-blocking GC >
-  disk.
+- **Tradeoff order:** incremental + lints > memory > cold compile > non-blocking GC > disk. The
+  remote cache is supported, not ranked.
 - **Architecture ([bottom.md](docs/v2/plan/design/bottom.md)):** item-grained content-addressed
   records written once and read in place (page cache only); stateless commands with optional expiry
   helper; forward wake without an in-memory dep graph; JIT-on-call + persisted PGO (`build`
-  default); precomputed R2 `std` records; no migrations on home upgrade.
+  default); fetched `std` records off unless chosen; no migrations on home upgrade.
 - **Scope:** Cargo workspaces (`reth`, `tempo`, `blaze`); macOS/Linux arm64 & bare-metal/unikernel
   VMs; `check`, `build`, `run`, `test`; EVERY internal crate `#![no_std]` on `bstd`/`blaze-own`
   explicit `Alloc` & sans-IO (`bstd::cli` for CLI binaries). **Not now:** `blaze
   watch`/build-on-save, Windows, Buck/Bazel, remote runs.
-- **Autonomy & craft:** Act autonomously on non-controversial improvements — when you spot
-  duplicated logic/patterns that generalize, immediately spawn a subagent to extract a shared crate,
-  sweep all callers, and land it. Pause only on genuinely controversial tradeoffs or irreversible
-  direction changes. Pursue the longest-term best solution by default (assume infinite time, even if
-  OOD), within 10% of the floor on iteration one, then iterate; delete jank. Show unitless
-  proportional effort bars (`[████████░░]`) when comparing options.
+- **Autonomy & craft:** Act autonomously on non-controversial improvements; pause only on genuinely
+  controversial tradeoffs or irreversible direction changes. Pursue the longest-term best solution
+  by default (assume infinite time, even if OOD). Show unitless proportional effort bars
+  (`[████████░░]`) when comparing options.
 - **Workflow & orientation:** Before doing anything wrt Rust/Cargo, read
-  `.agents/skills/must_read_blaze/SKILL.md` (`must_read_blaze`) and log missing features or
-  stricter-is-better catches in `agents/feature-requests.md`. Spawn tasks as subagents by default so
-  the coordinator stays free for incoming tasks. Sandbox blocking shell/tools? Stop immediately, ask
-  the user for full permissions, and wait. After finishing a change, immediately land/merge it (PR +
-  smoke) and fast-forward/update the base branch head you branched off of (never leave finished work
-  sitting unmerged on a stale branch).
+  `.agents/skills/must_read_blaze/SKILL.md` and log missing features or stricter-is-better catches
+  in `agents/feature-requests.md`. Spawn tasks as subagents by default so the coordinator stays free
+  for incoming tasks. Sandbox blocking shell/tools? Stop immediately, ask the user for full
+  permissions, and wait.
 - **Docs & skills:** [docs/contributing.md](docs/contributing.md), [docs/README.md](docs/README.md),
   and `.agents/skills/` (load the relevant skill before domain work, including `authoring-prompts`
   before editing rules/skills/briefs).
-- ✨ **Core gap (build scripts & proc macros):** `MacroModule` (`macros.rs`/`script_modules.rs`) is
-  lookup-only — blaze does not compile `build.rs` or proc-macro crates itself yet (no `blaze-lir →
-  wasm64` emitter wired yet), so any crate missing from
-  `~/.blaze/v2/{proc-macro,build-script}/modules` fails `CrateScope` and blocks downstream crates. ✨
-- 🚀 **Endgame (self-compiled usercode):** Turn `MacroModule` into a real blaze compile task (zero
-  `toolrun.sh`/`rustc`): (1) Tier 0 `#[comptime]` reflection for blaze/bstd code (zero proc-macros);
-  (2) Tier 1 `wasm64` (`memory64`) emitter off `blaze-lir` + `blaze-export/src/wasm64.rs` for all
-  proc-macros & pure-Rust `build.rs` (64-bit pointers match host layout, no
-  `wasi-libc`/`wasm-lld`/regalloc, ~10-50 µs in-process Wasmtime, exact `blaze-comptime`
-  read-tracing, cross-OS R2-shared `.wasm`); (3) Tier 2 host spawns & C-linking native tools
-  (`clang`/`cc`/`cmake`) routed through blaze's own hypervisor micro-VM sandbox (hardware isolation,
-  hermetic FS, deterministic prefix-maps). 🚀
+- ✨ **Core gap (build scripts & proc macros):** `MacroModule` (`macros.rs`/`script_modules.rs`)
+  self-compiles proc-macro crates and pure-Rust `build.rs` on a miss (`blaze-lir → wasm64`,
+  `wasm64_compile.rs`); a Tier-2 (native) build script still fails `CrateScope` and blocks
+  downstream crates. ✨
+- 🚀 **Endgame (self-compiled usercode):** zero `toolrun.sh`/`rustc`: (1) Tier 0 `#[comptime]`
+  reflection for blaze/bstd code (zero proc-macros); (2) Tier 1, built: proc-macros & pure-Rust
+  `build.rs` as `wasm64` (`memory64`) modules off `blaze-lir` + `blaze-export/src/wasm64.rs`, run
+  in-process and sandboxed in Wasmtime (target: exact `blaze-comptime` read-tracing, cross-OS
+  identical `.wasm`); (3) Tier 2 host spawns & C-linking native tools (`clang`/`cc`/`cmake`) routed
+  through blaze's own hypervisor micro-VM sandbox (hardware isolation, hermetic FS, deterministic
+  prefix-maps). 🚀
 
 ## Core Rules
 
-37 always-on principles below; all 90 rules with full detail live in each heading's skill
-(`.agents/skills/<skill>/SKILL.md`). Numbers are stable ids. Edit `scripts/src/bin/rules.rs` and run
-`write`.
+39 always-on principles below; all 79 rules with full detail live in each heading's skill
+(`.agents/skills/<skill>/SKILL.md`). Numbers are stable ids: they run to 92, and 13 merged numbers
+point at the rule that took them in. Edit `scripts/src/bin/rules.rs` and run `write`.
 
 ### Memory and data (skill `memory-and-data`)
-- **11. bump-allocate**: Always use `bstd`/`blaze-own` explicit `Alloc` (`Vec::new_in`); never `std`/`alloc` or `.leak()`.
+- **11. bump-allocate**: Use `bstd`/`blaze-own`; name the `Alloc` (a frame, the `Heap` grant); never `std`/`alloc`/`.leak()`.
 - **50. one-memory-measure**: Footprint is the measure, the kernel's limit the ceiling; nothing admits work by memory.
 - **51. outputs-are-records**: What outlives a task is a record written once, read in place; no cache but the page cache.
 
 ### Correctness (skill `compiler-correctness`)
 - **1. no-rustc**: blaze never runs rustc, rustdoc or a cargo that runs them; each place that still does is a bug.
 - **4. superset-of-rust**: Every program nightly accepts builds and runs correctly; only rustc soundness holes are refused.
-- **9. sandbox-everything**: Build scripts and wasm32-wasip1 proc macros run sandboxed; fail if no sandbox can be made.
+- **9. sandbox-everything**: Build scripts and proc macros run sandboxed; fail if no sandbox can be made.
 - **21. keys-cover-every-input**: Item-grained, item-relative, deterministic keys cover every input; `TwoValues` is a key bug.
-- **55. own-the-language**: Never work around Rust/std/bstd gaps: extend language, comptime, std or bstd and delete jank.
+- **55. own-the-language**: Never work around a missing piece (language, std, bstd, a tool): build it, use it, delete the jank.
 - **74. verify-once**: A check happens once and returns a proof type that later code takes; nothing is verified twice.
 - **90. alarm-on-any-compile-failure**: 🚨🚨🚨 If ANY repo fails to compile or leaves items unchecked, plaster 🚨🚨🚨 over your reply.
 
@@ -77,7 +72,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 
 ### Speed and tracing (skill `perf-and-tracing`)
 - **16. slow-is-p0-traced**: Anything slow/large is P0 until traced; quote before/after in per-core units naming core count.
-- **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, remote, memory, cold, cleanup, disk.
+- **60. incremental-first**: Judge by the edit loop first; trade: incremental and lints, memory, cold, non-blocking GC, disk.
 - **88. sharpen-your-tools**: Invest early in tools, symbols, IR dumps and harnesses that cut iteration time 10x.
 
 ### Evidence and debugging (skill `debugging`)
@@ -91,13 +86,13 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 - **62. sota-first**: Build the SOTA end state within 10% of the floor directly; build missing pieces; stop on 2nd fix.
 - **72. edit-rust-by-syntax**: Only the edit tools, astlog rules or `ast-grep`; never a heredoc, `sed` or a script.
 - **73. type-then-lint-then-rule**: Prevent mistakes by newtype/proof types first, then lints with fixes; a prompt rule comes last.
-- **89. flag-jank-or-monumentous-in-all-caps**: IF FORCED INTO A JANK WORKAROUND OR A MONUMENTAL TASK, SHOUT IT IN ALL CAPS TO THE USER.
+- **89. flag-jank-or-monumentous-in-all-caps**: IF FORCED INTO JANK OR A MONUMENTAL TASK, SAY SO IN ALL CAPS, THEN KEEP ON THE LONG-TERM DESIGN.
 - **91. narrow-collection-views**: Wrap `&mut Vec<T>` in narrow drain-only/push-only views at API boundaries; never leak raw storage.
 - **92. rename-surprising-methods**: If you mispredict a method's behavior before reading its body, rename it unambiguously immediately.
 
 ### Building, lanes and machines (skill `build-and-test`)
-- **2. blaze-builds-blaze**: Dogfood blaze (check/test/build) for inner loops, never cold cargo; fix any self-hosting gap.
-- **34. work-in-ix-vms**: Build, test and smoke on the Mac, or on `blaze-vm` when it answers; no AWS, no x86 VM.
+- **2. blaze-builds-blaze**: blaze builds, checks and tests blaze and every demo; never cargo or rustc; fix what blaze lacks.
+- **34. work-on-the-mac**: Agent builds, tests, smokes and benches run on the Mac; Linux-only work runs in CI; no VM, no AWS.
 - **48. agents-are-a-cost**: Fan out independent large pieces in parallel on disjoint files without asking; clean up when done.
 - **69. every-command-has-a-timeout**: Put a timeout on every command; verify on real projects first; a hang is a bug to report.
 
@@ -107,7 +102,7 @@ hardware-floor execution on 128-core servers and Apple Silicon Macs via one code
 
 ### Docs and scripts (skill `docs-and-scripts`)
 - **41. docs-say-what-they-are**: Names & front matter state exact role/action (current|plan|record|superseded); no vague nouns.
-- **49. docs-stay-small**: The plan, the ledger, the bounds and one spec per unbuilt design; delete what stops being true.
+- **49. docs-stay-small**: The plan, the decisions, the bounds and one spec per unbuilt design; delete what stops being true.
 
 ## Code Review Rules
 

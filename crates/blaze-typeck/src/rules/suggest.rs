@@ -1,5 +1,5 @@
 //! The fix offered for a one-segment value name that does not resolve (E0425): ranked by what is
-//! left wrong after it (typeck.md, "Fixes ranked by what is left (2026-11-16)").
+//! left wrong after it.
 //!
 //! The checker writes the FACTS (this file's [`Suggests`], a side table of `Checked`): for each
 //! hole, the bindings in scope there whose type fits the hole's expected type, each with whether
@@ -18,7 +18,7 @@
 //! and the patterns of the scopes it passes, shadowing checked in a hash set: O(exprs + pats)
 //! per hole, the floor (`steps` counts every step; suite/suggest.rs: 200 locals, 404 steps).
 //!
-//! Not in this leg (typeck.md says how each extends): module items (needs a world question
+//! Not in this leg: module items (needs a world question
 //! listing a scope's value names), paths of more than one segment, type names, methods, fields.
 //! No recursion: every walk is an explicit stack.
 
@@ -153,7 +153,7 @@ struct Rank {
     depth: u32,
 }
 
-/// The one candidate to offer for `hole`, or none (typeck.md, "Fixes ranked by what is left").
+/// The one candidate to offer for `hole`, or none.
 /// (1) type: done by the checker (only fitting candidates are recorded); (2) a candidate nothing
 /// uses ranks first (a name with a leading `_` is unused on purpose and never counts); (3)
 /// spelling: edit distance with transposition, at most `max(len, 3) / 3` for a candidate that (2)

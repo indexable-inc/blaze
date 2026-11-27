@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: Error sets (edition change 2, ledger row E3). A function's error type is the exact set of failures it may return, written `A | B` under `#![blaze::error_unions]`. `?` widens a member or a smaller set into a larger one, a set the body's failures do not fit is an error naming the call, the member and the set, a `match` covers every member, and the set costs what the hand-written enum costs. What is built, its floor, and the list of bstd signatures that move onto it.
+summary: Error sets (edition change 2). A function's error type is the exact set of failures it may return, written `A | B` under `#![blaze::error_unions]`. `?` widens a member or a smaller set into a larger one, a set the body's failures do not fit is an error naming the call, the member and the set, a `match` covers every member, `Result<T, _>` infers the set, and the set costs what the hand-written enum costs. Built on the new layer: the type, widening, parsing, matching and inferred sets. Left: the diagnostic's words, the bstd port (its signature list is here) and a member order that survives a rename.
 date: 2026-11-12
 ---
 # Error sets
@@ -34,19 +34,20 @@ error type, and the type keeps the name error union in the code.
 
 | part | what | where | built |
 |---|---|---|---|
-| the type | `A \| B` is core's `ErrorUnion<(A, B)>`, its members flattened, deduplicated and in one canonical order, so `A \| B`, `B \| A` and `A \| (B \| A)` are one type in every crate | `crates/hir-ty/src/lower/error_union.rs`, `library/core/src/error_union.rs` | E3 part 1 (92ea33709b) |
-| widening | `U: UnionFrom<S>` holds when `S` is a member of `U` or a set of some of its members; only the solver answers it, with the path each value takes; core's `Inject` impls over those paths are the conversion, a blanket `From<S> for U` over both makes `?` widen, and a coercion (`Err(e)`, a return, an argument, a typed `let`) calls `widen` | `vendor/rustc_next_trait_solver/src/solve/error_union.rs`, `crates/hir-ty/src/infer/coerce.rs` | E3 part 2 (eb4c66b4c3) |
-| `Result<T, A \| B>` parses | a set whose first member starts with a name was a syntax error as a generic argument | `crates/parser/src/grammar/generic_args.rs` | this lane |
-| matching | a constructor pattern of a member matches the set by member | `PatAdjust::UnionMember`, `crates/hir-ty/src/error_union.rs` | this lane |
-| the check's words | a `?` whose failure the set lacks is said as that, with the fix | `crates/blaze-diagnostics/src/lower/unimplemented_trait.rs` | this lane |
+| the type | `A \| B` is core's `ErrorUnion<(A, B)>`, its members flattened, deduplicated and in one canonical order, so `A \| B`, `B \| A` and `A \| (B \| A)` are one type in every crate | `crates/blaze-lower/src/form.rs` (`TypeRef::Union`), `library/core/src/error_union.rs` | E3 part 1 (92ea33709b) |
+| widening | `U: UnionFrom<S>` holds when `S` is a member of `U` or a set of some of its members; only the solver answers it, with the path each value takes; core's `Inject` impls over those paths are the conversion, a blanket `From<S> for U` over both makes `?` widen, and a coercion (`Err(e)`, a return, an argument, a typed `let`) calls `widen` | `vendor/rustc_next_trait_solver/src/solve/error_union.rs`, `crates/blaze-typeck/src/machine.rs` | E3 part 2 (eb4c66b4c3) |
+| `Result<T, A \| B>` parses | a set whose first member starts with a name was a syntax error as a generic argument | `crates/parser/src/grammar/generic_args.rs` | built |
+| matching | a constructor pattern of a member matches the set by member | `UnionPat`, `crates/blaze-typeck/src/columns.rs` | built |
+| inferred sets | `Result<T, _>` collects the body's failures into one set; `-> _` holes | `crates/blaze-typeck`, `Store::inferred_error_set` (blaze-ladder `front2/inspect.rs`) | built |
+| the check's words | a `?` whose failure the set lacks is said as that, with the fix | | not on the new layer |
 
 **Library over language** (rule `library-over-language`). The conversions, the delegated traits
 (`Debug`, `Display`, `Error`, `Clone`, `Hash`) and the representation are library code in
 `core::error_union`. The compiler holds three primitives no library can express: the type
 syntax with its canonical order (a library cannot sort types), `UnionFrom` (set membership
 answered from the types alone; as impls it would overlap `impl<T> From<T> for T`), and the
-member pattern below. Members are concrete named types, 2 to 12 of them; a type parameter is
-refused (with two parameters equal, `T | U` would have one member or two).
+member pattern below. A member may be a type parameter (`E | Timeout`): the set is normalized
+and deduplicated at monomorphization (`ParametricUnionTy`, below).
 
 ## The check
 
@@ -92,14 +93,8 @@ peeled first, as for any constructor pattern (`&(A | B)` binds by reference). `x
 `@` names the member's struct or variant by path. Only in a crate with the attribute; a
 pattern of no member is the type mismatch it was.
 
-Inference records one adjustment on the pattern, `PatAdjust::UnionMember`, whose source is the
-set; which member is the pattern's own type (under `x @`, the type of the pattern after it),
-so nothing else is stored (InferenceRecord schema 31). Every reader of pattern adjustments turns it into the pattern it stands for, core's
-`ErrorUnion` struct around the variant of its `Repr` enum that holds the member
-(`hir_ty::error_union`): match checking (so a match is exhaustive exactly when every member is
-covered, a member left out is the witness, written `FsError { .. }` or `Stopped::_`, and a member
-covered twice is unreachable), MIR lowering (a discriminant test, then the variant's field),
-the match tree and closure capture analysis.
+The type checker records the member a pattern matches (blaze-typeck `UnionPat`); a match is
+exhaustive exactly when every member is covered, and a member covered twice is unreachable.
 
 **v2 compiler representation (`blaze-ty::union_ty`, `blaze-typeck`, `blaze-build`, `blaze-lower`, `parser`):**
 - `UNION_TYPE` lowers directly to `TypeRef::Union(List)` in `blaze-lower`, and to first-class
@@ -130,27 +125,25 @@ the match tree and closure capture analysis.
 
 ## Representation and cost
 
-A set is `ErrorUnion<M>`, a struct of one field, core's enum `OfN` with one variant per member
-in canonical order. The order is by each member's identity, a BLAKE3 hash of its crate's
-content ID (the crate's configuration and dependencies, not its source), its module path, its
-name and its arguments: no interned ID, address or map order (rule `deterministic-output`).
+A set is a first-class union type with its own tagged layout (above). Its members are sorted by
+their lifetime-erased identity (blaze-ty `union_ty.rs`): no interned ID, address or map order
+(rule `deterministic-output`).
 
 Floor (rule `within-ten-percent-of-the-floor`): the enum a person writes by hand for the same
 members, with a `From` impl per member.
 
 | operation | floor | a set | measured |
 |---|---|---|---|
-| size and alignment | the hand-written enum's | the same: one enum under a one-field struct | equal for 2 and 3 members, bare and as a `Result`'s error; `Missing \| FsError` is 32 bytes, as is `Result<u8, Missing \| FsError>` (`layout::error_unions`) |
-| a member into a set | write the tag, move the payload | `From::from`, `widen`, `Inject::inject`, each `#[inline]`, around the same construction | not run through codegen in this lane: at a tier that does not inline, three calls on the failure path where the hand-written `From` is one |
-| a set into a larger set | a match on the tag, each arm the line above | the same match, written once in core per arity | as above |
-| a match on a set | a switch on the tag | the same switch | evaluated in MIR at each optimization level (`mir::error_unions`) |
+| size and alignment | the hand-written enum's | a local tag and the aligned payload | not measured |
+| a member into a set | write the tag, move the payload | `From::from`, `widen`, `Inject::inject`, each `#[inline]`, around the same construction | not measured: at a tier that does not inline, three calls on the failure path where the hand-written `From` is one |
+| a set into a larger set | a match on the tag, each arm the line above | the same match | not measured |
+| a match on a set | a switch on the tag | the same switch | not measured |
 | a crate without unions | nothing | one comparison of an item's ID per constructor pattern, one more blanket candidate per `From` goal (refused at its first test), nothing in the parser | not measured |
 | adding a member | the signature's type changed: its direct readers rerun | the same; other members' variants may move, in code that reruns anyway | not measured |
 
 What no design here reaches: a rename or a move of a member's item changes its identity, so
-the sets that hold it may be reordered and their users recompiled (ledger T4 does not hold for
-a member). Ordering by an identity that survives a rename
-([name-free-identity](name-free-identity.md)) is the way out and is not built.
+the sets that hold it may be reordered and their users recompiled (for a member, a rename or a
+move is not free). Ordering by an identity that survives a rename is the way out and is not built.
 
 Losing alternatives, each in a line:
 
@@ -191,8 +184,8 @@ that open the root.
 
 Stay as they are: `Io::need_*` (`Missing`, a set of one), the name types' errors (`PathError`, `UrlError`, `KeyError`, `NameError`,
 `HostPortError`, `VarNameError`, `HeaderError`), `ImageError`, `VideoError`, `MuxError`, and
-`TaskWhy::Failed(String)`: a task's own error `E` as a member needs a set over a type
-parameter, which is refused.
+`TaskWhy::Failed(String)` until the port (a task's own error `E` can be a member: a set over a
+type parameter is built).
 
 What the port decides and a reviewer should check: a `Stopped` no longer carries the file or
 the peer it stopped on (`FsError { op, path, kind: Stopped }` did); its `span` names the wait.
@@ -201,20 +194,10 @@ handles every area's cancellation.
 
 ## Proof
 
-- `crates/hir-ty-mir/src/tests/mir/error_unions.rs` runs programs in the MIR evaluator at each
-  optimization level, on errors shaped as bstd's: `?` widens `Missing` and `FsError` into one
-  set and each failure comes out as its member with its fields; a smaller set widens; an enum
-  member is matched by its variants; members match through a reference, under `@`, in `let`-
-  `else` and `if let`, and in a closure that captures the set.
-- `crates/blaze-diagnostics/src/tests/bodies/error_unions.rs`: the missing member's error, word
-  for word, with its control (the member added, no error); E0004 naming the member.
-- `crates/hir-ty/src/tests/error_unions.rs`: the invariant that a set's members have one order
-  in every crate and every build, with its control (an order by the database's numbering,
-  on which two builds that declare the members in opposite orders disagree); the adjustments
-  inference records; a crate without the attribute.
-- `crates/hir-ty-mir/src/tests/layout/error_unions.rs`: a set's layout is the hand-written
-  enum's, and the same in every order it is written in.
-- `crates/hir-ty-matchck/src/tests.rs`, `a_match_on_an_error_union_is_exhaustive_over_its_members`.
+- `crates/blaze-typeck/src/tests.rs`: `union_injection_coercion_and_rejection`,
+  `union_widening_coercion_and_rejection`, `typed_union_pattern_and_residual_narrowing`,
+  `union_match_exhaustiveness_and_redundant_arms`, `inferred_return_type_holes_and_result_error_union`.
+- `crates/blaze-lower/src/tests.rs`: `error_unions_and_typed_binding_patterns_lower_cleanly`.
 
 Not proven here: a blaze-built program (these run blaze's front end and evaluator under cargo;
 no code was generated), and bstd itself, which the port will be the proof of.

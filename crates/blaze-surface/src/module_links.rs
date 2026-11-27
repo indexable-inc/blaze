@@ -1,4 +1,4 @@
-//! Names at module grain (docs/v2/plan/design/drive.md, "Names at module grain", D116): a
+//! Names at module grain (docs/v2/plan/design/end-state.md D158; D116): a
 //! module's tables as records of LINKS, and its `Imports`, each read one CELL at a time.
 //!
 //! # `ModuleLinks`: a module's two tables
@@ -65,10 +65,12 @@ use crate::path::{PathKind, PathTag};
 pub const LINKS_MAGIC: [u8; 4] = *b"BZML";
 /// 1: the first form (D116 piece (e), 2026-11-17). 2: the `Textual` and `Exported` tables, a
 /// row's text order (bytes 40..44), a `pub(in path)` written as its path (2026-11-17).
-pub const LINKS_FORM: u32 = 2;
+/// 3: `MacroShapes` bit 3 marks Macros 2.0 (`pub macro`) definitions.
+pub const LINKS_FORM: u32 = 3;
 pub const IMPORTS_MAGIC: [u8; 4] = *b"BZMI";
 /// 1: the first form (D116 piece (e), 2026-11-17).
-pub const IMPORTS_FORM: u32 = 1;
+/// 2: `MacroShapes` bit 3 marks Macros 2.0 (`pub macro`) definitions.
+pub const IMPORTS_FORM: u32 = 2;
 
 /// The domain of one `ModuleLinks` row's digest.
 pub const LINK_DOMAIN: &str = "blaze v2 module link 1";

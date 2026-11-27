@@ -1,5 +1,5 @@
 //! Closures, fn items and constructors passed where a generic callee's bound says
-//! `F: FnOnce(Args) -> R` (typeck.md, "Closures against `Fn` bounds"). The pinned library's
+//! `F: FnOnce(Args) -> R` (typeck.md, "A closure's identity"). The pinned library's
 //! declarations (library/core/src/ops/function.rs):
 //!
 //! ```text
@@ -449,4 +449,111 @@ fn a_closure_using_a_capture_by_value_is_fn_only_when_the_capture_is_copy() {
     assert_eq!(apply_case(false, true), std::vec![DiagCode::Unsatisfied], "without it: `|y| widen(x)` is FnOnce");
     assert_eq!(apply_case(false, false), Vec::new(), "control: `|y| widen(y)` captures nothing");
     assert_eq!(apply_case(true, false), Vec::new(), "control with the impl");
+}
+
+/// Calling `Box<Closure>` where the closure received an `FnOnce` or `FnMut` hint from a helper
+/// (`fn_once(move || ...)` / `fn_mut(|| ...)`, as in `blaze-own/src/tests.rs`) skips `Fn` in
+/// `overloaded_call` so it does not prematurely commit the unsettled closure to `Fn`.
+#[test]
+fn boxed_closure_with_fn_once_or_fn_mut_hint_selects_hinted_call_trait() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let copy = fx.tr("Copy", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Copy, copy);
+    let (p0, p1) = (fx.param(0), fx.param(1));
+    let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe, c_variadic: false };
+
+    let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
+    fx.lang(LangItem::FnOnce, fn_once);
+    let out = fx.alias(fn_once, "Output", &[p0, p1]);
+    let call_once = fx.trait_fn(fn_once, "call_once", true, &[p0, p1], out);
+    fx.set_header(call_once, rust_call);
+
+    let sup = fx.bound(fn_once, &[p0, p1]);
+    let fn_mut = fx.tr("FnMut", 2, std::vec![sup], &[]);
+    fx.lang(LangItem::FnMut, fn_mut);
+    let m_self = fx.r(Mutbl::Mut, p0);
+    let call_mut = fx.trait_fn(fn_mut, "call_mut", true, &[m_self, p1], out);
+    fx.set_header(call_mut, rust_call);
+
+    let sup = fx.bound(fn_mut, &[p0, p1]);
+    let fn_ = fx.tr("Fn", 2, std::vec![sup], &[]);
+    fx.lang(LangItem::Fn, fn_);
+    let r_self = fx.r(Mutbl::Not, p0);
+    let call = fx.trait_fn(fn_, "call", true, &[r_self, p1], out);
+    fx.set_header(call, rust_call);
+
+    let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+    let unit = fx.unit();
+    let none = fx.tuple(&[]);
+    let tok = fx.strukt("Tok", 0, &[("v", u8_)]);
+    let tok_ty = fx.adt(tok, &[]);
+    let bx = fx.strukt("Box", 1, &[("v", p0)]);
+    let bx_p0 = fx.adt(bx, &[p0]);
+    fx.func("box_new", 1, &[p0], bx_p0, Vec::new());
+
+    // impl<F: Fn<A>, A> Fn<A> for Box<F>
+    // impl<F: FnMut<A>, A> FnMut<A> for Box<F>
+    // impl<F: FnOnce<A>, A> FnOnce<A> for Box<F> { type Output = F::Output; }
+    let f_out = fx.alias(fn_once, "Output", &[p0, p1]);
+    for tr in [fn_, fn_mut, fn_once] {
+        let w = fx.bound(tr, &[p0, p1]);
+        let assoc: &[(&str, _)] = if tr == fn_once { &[("Output", f_out)] } else { &[] };
+        fx.imp("impl Fn* for Box<F>", 2, bx_p0, Some((tr, &[p1])), assoc, std::vec![w]);
+    }
+    // fn fn_once_id<F: FnOnce() -> u8>(f: F) -> F
+    let b_once = fx.bound(fn_once, &[p0, none]);
+    let r_once = fx.proj(fn_once, &[p0, none], "Output", u8_);
+    fx.func("fn_once_id", 1, &[p0], p0, std::vec![b_once, r_once]);
+    // fn fn_mut_id<F: FnMut() -> ()>(f: F) -> F
+    let b_mut = fx.bound(fn_mut, &[p0, none]);
+    let r_mut = fx.proj(fn_once, &[p0, none], "Output", unit);
+    fx.func("fn_mut_id", 1, &[p0], p0, std::vec![b_mut, r_mut]);
+
+    fx.func("consume", 0, &[tok_ty], u8_, Vec::new());
+    let main_once = fx.func("main_once", 0, &[tok_ty], u8_, Vec::new());
+    let main_mut = fx.func("main_mut", 0, &[u8_], unit, Vec::new());
+    fx.finish();
+
+    // Case 1: `let b = box_new(fn_once_id(|| consume(tok))); b()` -> FnOnce, zero errors.
+    {
+        let mut b = Bb::new();
+        let t = b.param("tok");
+        let consume = b.path(&["consume"]);
+        let lt = b.local(t);
+        let body = b.call(consume, &[lt]);
+        let cl = b.closure(&[], body);
+        let id = b.path(&["fn_once_id"]);
+        let hinted = b.call(id, &[cl]);
+        let bnew = b.path(&["box_new"]);
+        let boxed = b.call(bnew, &[hinted]);
+        let bv = b.bind("b");
+        let s0 = b.let_(bv, None, boxed);
+        let lb = b.local(bv);
+        let res = b.call(lb, &[]);
+        let root = b.block(&[s0], Some(res));
+        assert_eq!(findings(&fx, &b, main_once, root), Vec::new(), "Box<fn_once(move || ..)>() must select FnOnce");
+    }
+
+    // Case 2: `let b = box_new(fn_mut_id(|| { x = 1; })); b()` -> FnMut, zero errors.
+    {
+        let mut b = Bb::new();
+        let x = b.param("x");
+        let lx = b.local(x);
+        let one = b.int(None);
+        let assign = b.e(crate::body::Expr::Assign { lhs: lx, rhs: one });
+        let body = b.block(&[], Some(assign));
+        let cl = b.closure(&[], body);
+        let id = b.path(&["fn_mut_id"]);
+        let hinted = b.call(id, &[cl]);
+        let bnew = b.path(&["box_new"]);
+        let boxed = b.call(bnew, &[hinted]);
+        let bv = b.bind("b");
+        let s0 = b.let_(bv, None, boxed);
+        let lb = b.local(bv);
+        let res = b.call(lb, &[]);
+        let root = b.block(&[s0], Some(res));
+        assert_eq!(findings(&fx, &b, main_mut, root), Vec::new(), "Box<fn_mut(|| x = 1)>() must select FnMut");
+    }
 }

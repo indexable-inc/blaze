@@ -1,4 +1,4 @@
-//! D116's equality harness (drive.md "Names at module grain", point 7): the per-crate scope
+//! D116's equality harness (end-state.md D158): the per-crate scope
 //! stays until names at module grain give equal answers. After one run of the cell core, every
 //! name a module's written scope answers (declared, imported, glob-imported, macro-made, the
 //! root's published `#[macro_export]`s, the textual `macro_rules!` scope) is asked twice:

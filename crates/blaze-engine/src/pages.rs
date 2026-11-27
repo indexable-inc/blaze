@@ -1,4 +1,4 @@
-//! The stored answer (engine.md E6, "the incremental half"): the engine's [`Answer`] and why each
+//! The stored answer (end-state.md D157, the incremental half): the engine's [`Answer`] and why each
 //! of its rows was last entered ([`Kept`]), as content-keyed pages under a root, in the form of
 //! blaze-drive's answer table (answers.rs: pages sized by bytes, [`PAGE_BYTES`] on average, a
 //! name's page its subject's leading bits, [`page_of`]).

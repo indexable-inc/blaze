@@ -1,5 +1,5 @@
 //! blaze: where a process gets its randomness and its wall clock
-//! (docs/v2/plan/design/determinism.md, section A).
+//! (docs/v2/plan/design/end-state.md, D177).
 //!
 //! A process has one provider, chosen once as it starts:
 //!

@@ -1,5 +1,5 @@
 //! The tests' toy world: structs with fields, the owner fn's signature, and answers that can be
-//! perturbed and can be held back (typeck.md, "Testing"). The type context is the real one,
+//! perturbed and can be held back (typeck.md, "Proof"). The type context is the real one,
 //! `InferCtx`; the toy type context was deleted when blaze-ladder switched to it.
 
 use blaze_own::{Alloc, Vec};
