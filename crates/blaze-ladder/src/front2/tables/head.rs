@@ -1145,9 +1145,9 @@ pub(crate) fn transfer_cell_in_process<'n, N: NamesSource<'n>>(
     }
     let needs_members = heads.iter().any(|(_, h)| matches!(&**h, Head::Trait { .. } | Head::Impl { .. }));
     if needs_members {
-        cache.0.with_members(names, cell, |members| file_keys(cell, members, &heads, dst_keys))?;
+        cache.0.with_members(names, cell, |members| file_keys(cell, members, &heads, dst_keys, scratch))?;
     } else {
-        file_keys(cell, &[], &heads, dst_keys)?;
+        file_keys(cell, &[], &heads, dst_keys, scratch)?;
     }
     file_named_items(names, cell, dst, dst_keys, &heads, tys_before)?;
     dst.file_heads(cell, heads.into_iter().map(|(at, h)| (at, blaze_own::Box::into_inner(h))))
@@ -1182,7 +1182,7 @@ pub fn file_frozen<'n, N: NamesSource<'n>>(names: N, cell: Want, frozen: FrozenH
             return Err(e);
         }
     };
-    file_frozen_finish(names, cell, store, keys, &frozen, &members, heads, tys_before)
+    file_frozen_finish(names, cell, store, keys, &frozen, &members, heads, tys_before, scratch)
 }
 
 /// As [`file_frozen`], reusing `cache`'s stretch-scoped sorted container members and verified
@@ -1235,7 +1235,7 @@ fn file_frozen_cached_in<'n, N: NamesSource<'n>>(
                 return Err(e);
             }
         };
-        file_frozen_finish(names, cell, store, keys, &frozen, members, heads, tys_before)
+        file_frozen_finish(names, cell, store, keys, &frozen, members, heads, tys_before, scratch)
     })
 }
 
@@ -1278,7 +1278,7 @@ fn file_frozen_verified<'n, N: NamesSource<'n>>(
             return Err(e);
         }
     };
-    file_frozen_finish(names, cell, store, keys, &frozen, &members, heads, tys_before)
+    file_frozen_finish(names, cell, store, keys, &frozen, &members, heads, tys_before, scratch)
 }
 
 #[inline(never)]
@@ -1292,8 +1292,9 @@ fn file_frozen_finish<'n, N: NamesSource<'n>>(
     members: &[MemberText<'_>],
     heads: AVec<'static, (HeadAt, blaze_own::Box<Head<'n>, Alloc<'static>>)>,
     tys_before: usize,
+    scratch: Alloc<'static>,
 ) -> Result<(), FreezeError> {
-    file_keys(cell, members, &heads, keys)?;
+    file_keys(cell, members, &heads, keys, scratch)?;
     file_named_items(names, cell, store, keys, &heads, tys_before)?;
     // Each head's recorded regions (form 11) against its record: laid exactly when the record
     // holds the section, and none only for a kind that holds none.
@@ -1549,7 +1550,7 @@ fn file_named_items<'n, N: NamesSource<'n>>(
     Ok(())
 }
 
-fn file_keys(cell: Want, members: &[MemberText<'_>], heads: &[(HeadAt, blaze_own::Box<Head<'_>, Alloc<'static>>)], keys: &Keys) -> Result<(), FreezeError> {
+fn file_keys(cell: Want, members: &[MemberText<'_>], heads: &[(HeadAt, blaze_own::Box<Head<'_>, Alloc<'static>>)], keys: &Keys, scratch: Alloc<'static>) -> Result<(), FreezeError> {
     let container = checker_of(cell.key());
     let clash = |error| FreezeError::Head { want: cell, error: HeadError::Key(error) };
     // The cell's own library key (e.g. an impl or trait container whose members are filed
@@ -1558,8 +1559,54 @@ fn file_keys(cell: Want, members: &[MemberText<'_>], heads: &[(HeadAt, blaze_own
     keys.item(cell.key()).map_err(clash)?;
     for (_, head) in heads.iter() {
         match &**head {
-            Head::Adt { row, .. } if row.kind != blaze_typeck::AdtKind::Enum => {
-                keys.member(container, MemberKind::Ctor, "").map_err(clash)?;
+            Head::Adt { row, field_defaults, .. } => {
+                if row.kind != blaze_typeck::AdtKind::Enum {
+                    keys.member(container, MemberKind::Ctor, "").map_err(clash)?;
+                }
+                if !field_defaults.is_empty() && matches!(cell, Want::Adt(_)) {
+                    for (vi, variant) in row.variants.iter().enumerate() {
+                        let Ok(flen) = usize::try_from(variant.fields.len) else {
+                            continue;
+                        };
+                        let Ok(start) = usize::try_from(variant.fields.start) else {
+                            continue;
+                        };
+                        for j in 0..flen {
+                            let Some(fi) = start.checked_add(j) else {
+                                continue;
+                            };
+                            let Some(Some(dk)) = field_defaults.get(fi) else {
+                                continue;
+                            };
+                            let found = heads.iter().find_map(|(_, h)| match &**h {
+                                Head::Fn { key, head, .. } if *key == *dk && head.text_inline => Some(head.text),
+                                _ => None,
+                            });
+                            let Some(decl) = found else {
+                                return Err(FreezeError::Record {
+                                    want: cell,
+                                    at: HeadAt::Fn(*dk),
+                                    error: HeadRecordError::Shape { what: "an ADT field default has no inline fn head in its frozen cell" },
+                                });
+                            };
+                            let Some(label) = crate::front2::heads::field_default_label_from_decl(vi, j, decl, scratch) else {
+                                return Err(FreezeError::Record {
+                                    want: cell,
+                                    at: HeadAt::Fn(*dk),
+                                    error: HeadRecordError::Shape { what: "an ADT field default's inline declaration is malformed" },
+                                });
+                            };
+                            if member_key_of(container, MemberKind::Anon, label.as_str()) != *dk {
+                                return Err(FreezeError::Record {
+                                    want: cell,
+                                    at: HeadAt::Fn(*dk),
+                                    error: HeadRecordError::Shape { what: "an ADT field default key disagrees with its inline declaration" },
+                                });
+                            }
+                            keys.member(container, MemberKind::Anon, label.as_str()).map_err(clash)?;
+                        }
+                    }
+                }
             }
             Head::Trait { head, extra, .. } => {
                 for m in members.iter() {
