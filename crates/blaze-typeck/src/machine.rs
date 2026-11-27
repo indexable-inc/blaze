@@ -1520,40 +1520,51 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                     _ => return Err(self.witness_gap_of(witness, at).into()),
                 }
             }
-            if witness == Witness::Fixed
-                && ambiguity
-                && ambiguous
-                && self.errors == 0
-                && err.because.is_none()
-                && let Some(goal) = match err.obligation.goal {
-                    crate::ty::Goal::Trait { trait_, args } if self.ty.list_len(args) > 0 => {
-                        Some(PendingGoal::Trait { trait_, args })
+            if witness == Witness::Fixed && err.because.is_none() {
+                let maybe_goal = if ambiguity && ambiguous && self.errors == 0 {
+                    match err.obligation.goal {
+                        crate::ty::Goal::Trait { trait_, args } if self.ty.list_len(args) > 0 => {
+                            Some((PendingGoal::Trait { trait_, args }, err.obligation.goal))
+                        }
+                        crate::ty::Goal::Projection { trait_, args, name, term }
+                            if self.ty.list_len(args) > 0 && !matches!(self.view(term), TyView::Infer(_)) =>
+                        {
+                            Some((PendingGoal::Projection { trait_, args, name, term }, err.obligation.goal))
+                        }
+                        _ => None,
                     }
-                    crate::ty::Goal::Projection { trait_, args, name, term }
-                        if self.ty.list_len(args) > 0 && !matches!(self.view(term), TyView::Infer(_)) =>
-                    {
-                        Some(PendingGoal::Projection { trait_, args, name, term })
-                    }
-                    _ => None,
-                }
-            {
-                // Multi-level trait/projection/unsizing chains whose solver ambiguity leaf is
-                // a local async block's still-open interior: defer the whole root goal to flow
-                // (or emit the typed interior gap when not deferring), never E0282/E0283.
-                let mut steps: Vec<crate::diag::PendingWhyStep, Alloc<'a>> = Vec::new_in(self.alloc);
-                if let Some(crate::diag::WhyLeaf::InteriorUnknown {
-                    coroutine: crate::diag::WhyDef::Expr(block),
-                }) = self.ty.why_maybe_chain(err.obligation.goal, &mut steps, &mut self.reads)?
-                    && self.futures.iter().any(|f| f.expr == block && f.witness != crate::CoroutineWitness::Complete)
+                } else if err.kind == crate::ty::FulfillErrorKind::Mismatch
+                    && let crate::ty::Goal::Projection { trait_, args, name, term } = err.obligation.goal
+                    && self.ty.list_len(args) > 0
+                    && !matches!(self.view(term), TyView::Infer(_))
+                    && self.projection_found(trait_, args, name)?.is_none()
                 {
-                    match self.interior {
-                        crate::stalled::Interior::Gap => return Err(self.witness_gap_of(Witness::LocalFlow, at).into()),
-                        crate::stalled::Interior::Defer => {
-                            let (PendingGoal::Trait { trait_, args } | PendingGoal::Projection { trait_, args, .. }) = goal;
-                            let ty = self.ty.list_get(args, 0);
-                            let diag = PendingDiag::unmet(DiagCode::Unsatisfied, at, Some(ty), goal, None);
-                            self.stalled.push(crate::stalled::PendingStalled { trait_, ty, diag });
-                            continue;
+                    // A projection whose term disagreed before its trait/where-clauses could
+                    // decide a local async block's interior: defer to replay so exact interiors
+                    // decide between E0271 (`ProjectionMismatch`) and E0277 (`Unsatisfied`).
+                    Some((PendingGoal::Projection { trait_, args, name, term }, crate::ty::Goal::Trait { trait_, args }))
+                } else {
+                    None
+                };
+                if let Some((goal, ask)) = maybe_goal {
+                    // Multi-level trait/projection/unsizing chains whose solver ambiguity leaf is
+                    // a local async block's still-open interior: defer the whole root goal to flow
+                    // (or emit the typed interior gap when not deferring), never E0282/E0283.
+                    let mut steps: Vec<crate::diag::PendingWhyStep, Alloc<'a>> = Vec::new_in(self.alloc);
+                    if let Some(crate::diag::WhyLeaf::InteriorUnknown {
+                        coroutine: crate::diag::WhyDef::Expr(block),
+                    }) = self.ty.why_maybe_chain(ask, &mut steps, &mut self.reads)?
+                        && self.futures.iter().any(|f| f.expr == block && f.witness != crate::CoroutineWitness::Complete)
+                    {
+                        match self.interior {
+                            crate::stalled::Interior::Gap => return Err(self.witness_gap_of(Witness::LocalFlow, at).into()),
+                            crate::stalled::Interior::Defer => {
+                                let (PendingGoal::Trait { trait_, args } | PendingGoal::Projection { trait_, args, .. }) = goal;
+                                let ty = self.ty.list_get(args, 0);
+                                let diag = PendingDiag::unmet(DiagCode::Unsatisfied, at, Some(ty), goal, None);
+                                self.stalled.push(crate::stalled::PendingStalled { trait_, ty, diag });
+                                continue;
+                            }
                         }
                     }
                 }

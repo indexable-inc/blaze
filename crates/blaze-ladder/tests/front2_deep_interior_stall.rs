@@ -165,6 +165,35 @@ pub async fn case_c_fn_not_send() -> Result<i32, ()> {
     res
 }
 
+// --- Case D: stalled projection that resolves cleanly on exact interior and mismatches term (E0271) ---
+pub trait InnerOut {
+    type Out;
+}
+
+impl<F: Future + Send> InnerOut for F {
+    type Out = u32;
+}
+
+pub trait OuterAssoc {
+    type Assoc;
+}
+
+pub struct AssocWrap<T>(pub T);
+
+impl<T: InnerOut> OuterAssoc for AssocWrap<T> {
+    type Assoc = T::Out;
+}
+
+fn require_u64_assoc<T: OuterAssoc<Assoc = u64>>(_: T) {}
+
+pub fn case_d_projection_mismatch() {
+    require_u64_assoc(AssocWrap(async {
+        let local = Rc::new(1i32);
+        drop(local);
+        yield_once().await;
+    }));
+}
+
 fn main() {}
 "#;
 
@@ -236,4 +265,18 @@ fn case_b_nested_wrapper_trait_positive_and_negative() {
 fn case_c_rpit_projection_positive_and_negative() {
     check_each(&["case_c_ext_ok", "case_c_fn_ok"], &mut assert_clean);
     check_each(&["case_c_ext_not_send", "case_c_fn_not_send"], &mut assert_not_send_error);
+}
+
+#[test]
+fn case_d_stalled_projection_mismatch_emits_e0271() {
+    check_each(&["case_d_projection_mismatch"], &mut |name, v| {
+        assert!(
+            v.gaps.is_empty() && v.refused.is_none(),
+            "`{name}` must report E0271, not a gap or refusal: {v:?}"
+        );
+        assert!(
+            v.diagnostics.iter().any(|d| d.code == "E0271"),
+            "`{name}` must report E0271 (ProjectionMismatch), not E0277: {v:?}"
+        );
+    });
 }

@@ -224,3 +224,304 @@ fn check_keeps_the_gap() {
         got.as_ref().err()
     );
 }
+
+/// Regression (Codex PR #2770 P2 #1): a deep projection obligation that stalls on a local async
+/// block's interior and then selects cleanly on the exact interior but normalizes to a different
+/// type than its required term must emit E0271 (`DiagCode::ProjectionMismatch`) with `found` and
+/// `expected`, rather than collapsing into E0277 (`DiagCode::Unsatisfied`).
+#[test]
+fn stalled_projection_mismatch_emits_e0271_on_exact_replay() {
+    use crate::ids::{Name, UintTy};
+    let alloc = blaze_own::testing::heap().alloc();
+    let (mut fx, it) = world();
+    let (p0, u32_, u64_, unit) = (
+        fx.param(0),
+        fx.ty(PNode::Uint(UintTy::U32)),
+        fx.ty(PNode::Uint(UintTy::U64)),
+        fx.unit(),
+    );
+    let send = fx.key_of("Send");
+    let inner = fx.tr("Inner", 1, Vec::new(), &["Out"]);
+    let is_send = fx.bound(send, &[p0]);
+    fx.imp("impl<F: Send> Inner for F", 1, p0, Some((inner, &[])), &[("Out", u32_)], std::vec![is_send]);
+    let outer = fx.tr("Outer", 1, Vec::new(), &["Assoc"]);
+    let wrap = fx.strukt("Wrap", 1, &[("v", p0)]);
+    let wrap_p0 = fx.adt(wrap, &[p0]);
+    let is_inner = fx.bound(inner, &[p0]);
+    let inner_out = fx.alias(inner, "Out", &[p0]);
+    fx.imp(
+        "impl<T: Inner> Outer for Wrap<T>",
+        1,
+        wrap_p0,
+        Some((outer, &[])),
+        &[("Assoc", inner_out)],
+        std::vec![is_inner],
+    );
+    let wrap_fn = fx.func("wrap", 1, &[p0], wrap_p0, Vec::new());
+    let _ = wrap_fn;
+    let is_outer = fx.bound(outer, &[p0]);
+    let assoc_is_u64 = fx.proj(outer, &[p0], "Assoc", u64_);
+    fx.func("need_u64", 1, &[p0], unit, std::vec![is_outer, assoc_is_u64]);
+    fx.finish();
+
+    let mut b = Bb::new();
+    let body = rc_before_await(&mut b);
+    let block = b.async_block(body, Capture::Ref);
+    let w_callee = b.path(&["wrap"]);
+    let wrapped = b.call(w_callee, &[block]);
+    let callee = b.path(&["need_u64"]);
+    let call = b.call(callee, &[wrapped]);
+    let s = b.semi(call);
+    let root = b.block(&[s], None);
+
+    let mut cx = InferCtx::new_in(alloc);
+    let c = match check_deferring(&b.view(it.c_sync, root), &fx, &mut cx, &Needs::new_in(alloc), alloc) {
+        Ok(crate::Outcome::Done(c)) => c,
+        Ok(crate::Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
+        Err(e) => panic!("check_deferring refused: {e:?}"),
+    };
+    assert!(c.diags.is_empty(), "stalled before replay: {:?}", c.diags);
+    assert!(c.stalled.len() >= 2, "expected Outer trait + Assoc projection stalled: {:?}", c.stalled);
+
+    // Exact interior without Rc: `F: Send` holds, `Outer` holds, and `<Wrap<F> as Outer>::Assoc`
+    // normalizes cleanly to `u32` != `u64` -> E0271 with found=`u32`, expected=`u64`.
+    let mut out = c.types.fork_in(alloc).expect("fork");
+    let none = out.intern_list(&[]).expect("list");
+    let ready = out.intern(PNode::Adt(fx.key_of("Ready"), none)).expect("Ready");
+    let list = out.intern_list(&[ready]).expect("list");
+    let exact_ok = out.intern(PNode::Tuple(list)).expect("tuple");
+    let rc = out.intern(PNode::Adt(fx.key_of("Rc"), none)).expect("Rc");
+    let bad_list = out.intern_list(&[rc, ready]).expect("list");
+    let exact_bad = out.intern(PNode::Tuple(bad_list)).expect("tuple");
+    let view = b.view(it.c_sync, root);
+    let decided = c.decide_stalled_with_storage(&view, &out, &[(block, exact_ok)], &fx, alloc, |_, _, _| {}).expect("decided");
+    assert_eq!(decided.found.len(), 1, "only the projection mismatch should fail: {:?}", decided.found);
+    let d = decided.found[0];
+    assert_eq!(d.code, DiagCode::ProjectionMismatch, "expected E0271, got {d:?}");
+    assert_eq!(d.name, Some(Name::of("Assoc")), "{d:?}");
+    let tys = decided.types.view();
+    assert_eq!(d.found.map(|t| crate::fixture::show(&fx, tys, t)), Some(std::string::String::from("u32")), "{d:?}");
+    assert_eq!(d.expected.map(|t| crate::fixture::show(&fx, tys, t)), Some(std::string::String::from("u64")), "{d:?}");
+
+    // Negative twin: exact interior with Rc -> `F: Send` fails, so projection does NOT normalize
+    // cleanly and stays E0277 (`DiagCode::Unsatisfied`), never E0271.
+    let failed = c.decide_stalled_with_storage(&view, &out, &[(block, exact_bad)], &fx, alloc, |_, _, _| {}).expect("decided");
+    assert!(!failed.found.is_empty(), "non-Send future must fail");
+    assert!(failed.found.iter().all(|f| f.code == DiagCode::Unsatisfied), "non-Send failure must be E0277, not E0271: {:?}", failed.found);
+}
+
+/// Regression (Codex PR #2770 P2 #2): when a stalled multi-argument trait goal fails during
+/// replay because a non-`Self` argument holds a foreign `Superset` coroutine, `decide` must
+/// scan every root goal argument and return `EXTERNAL_WITNESS_GAP` (`CheckError::ForeignWitness`),
+/// never a false E0277.
+#[test]
+fn non_self_foreign_superset_witness_returns_gap_not_e0277() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let (mut fx, it) = world();
+    let (p0, p1, u8_, unit) = (fx.param(0), fx.param(1), fx.u8(), fx.unit());
+    let sized = fx.key_of("Sized");
+    let send = fx.key_of("Send");
+    let rc_t = fx.adt(fx.key_of("Rc"), &[]);
+    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let p0_send = fx.bound(send, &[p0]);
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
+    // `trait Pair<R> { type Out; }` with `impl<R: SendWrap> Pair<R> for u8 { type Out = u8; }`:
+    // `Self` is plain `u8`, while `args[1]` (`R`) carries `(LocalFuture, ForeignFut)`.
+    let pair = fx.tr("Pair", 2, Vec::new(), &["Out"]);
+    let p1_wrap = fx.bound(send_wrap, &[p1]);
+    fx.imp("impl<R: SendWrap> Pair<R> for u8", 2, u8_, Some((pair, &[p1])), &[("Out", u8_)], std::vec![p1_wrap]);
+    let foreign_fn = fx.func("foreign_fn", 0, &[], unit, Vec::new());
+    let foreign_op = fx.opaque_key("ForeignFut");
+    let foreign_op_t = fx.ty(PNode::Opaque(foreign_op, crate::ids::List::EMPTY));
+    let foreign_sized = fx.bound(sized, &[foreign_op_t]);
+    fx.set_opaque_bounds(foreign_op, std::vec![foreign_sized]);
+    fx.func("make_foreign", 0, &[], foreign_op_t, Vec::new());
+    let pair_proj = fx.proj(pair, &[p0, p1], "Out", u8_);
+    fx.func("check_pair", 2, &[p0, p1], unit, std::vec![pair_proj]);
+    fx.finish();
+
+    let mut b = Bb::new();
+    let body = rc_before_await(&mut b);
+    let block = b.async_block(body, Capture::Ref);
+    let mf = b.path(&["make_foreign"]);
+    let foreign_val = b.call(mf, &[]);
+    let both = b.tuple(&[block, foreign_val]);
+    let u8_val = b.int(Some(crate::body::IntSuffix::Uint(crate::ids::UintTy::U8)));
+    let callee = b.path(&["check_pair"]);
+    let call = b.call(callee, &[u8_val, both]);
+    let s = b.semi(call);
+    let root = b.block(&[s], None);
+
+    let mut cx = InferCtx::new_in(alloc);
+    let c = match check_deferring(&b.view(it.c_sync, root), &fx, &mut cx, &Needs::new_in(alloc), alloc) {
+        Ok(crate::Outcome::Done(c)) => c,
+        Ok(crate::Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
+        Err(e) => panic!("check_deferring refused: {e:?}"),
+    };
+    assert!(c.diags.is_empty(), "{:?}", c.diags);
+    assert_eq!(c.stalled.len(), 1, "expected one stalled Pair row: {:?}", c.stalled);
+    assert_eq!(c.types.view().node(c.stalled[0].ty), Ok(PNode::Uint(crate::ids::UintTy::U8)), "Self is u8");
+
+    // Case 2a (opaque in non-Self arg revealed to a Superset foreign coroutine):
+    let cor_t = fx.ty(PNode::Coroutine { owner: foreign_fn, ordinal: 0, args: crate::ids::List::EMPTY });
+    let superset_interior = fx.tuple(&[rc_t]);
+    fx.hidden.push((foreign_op, cor_t));
+    fx.coroutines.push((foreign_fn, 0, unit, superset_interior));
+    fx.provisional_coroutines.push((foreign_fn, 0));
+
+    let mut out = c.types.fork_in(alloc).expect("fork");
+    let none = out.intern_list(&[]).expect("list");
+    let ready = out.intern(PNode::Adt(fx.key_of("Ready"), none)).expect("Ready");
+    let list = out.intern_list(&[ready]).expect("list");
+    let exact_ok = out.intern(PNode::Tuple(list)).expect("tuple");
+    let got = decide_stalled(&b.view(it.c_sync, root), &c, out.view(), &[(block, exact_ok)], &fx, alloc);
+    assert!(
+        matches!(
+            got,
+            Err(StalledError::Check(crate::error::CheckError::ForeignWitness {
+                gap,
+                item,
+                ordinal: Some(0),
+                ..
+            })) if gap == crate::EXTERNAL_WITNESS_GAP && item == foreign_fn
+        ),
+        "expected EXTERNAL_WITNESS_GAP naming foreign_fn #0 (opaque non-Self arg), got {got:?}"
+    );
+
+    // Case 2b (direct foreign Coroutine in non-Self arg whose replay imports Superset `(Rc,)`
+    // and produces a definitive solver `No`): `unavailable_goal_witness` must scan `args[1]`
+    // and return `EXTERNAL_WITNESS_GAP`, never a false E0277.
+    let (mut fx2, it2) = world();
+    let (p0, p1, u8_, unit) = (fx2.param(0), fx2.param(1), fx2.u8(), fx2.unit());
+    let send = fx2.key_of("Send");
+    let rc_t = fx2.adt(fx2.key_of("Rc"), &[]);
+    let ready_t = fx2.adt(fx2.key_of("Ready"), &[]);
+    let send_wrap = fx2.tr("SendWrap", 1, Vec::new(), &[]);
+    let p0_send = fx2.bound(send, &[p0]);
+    fx2.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
+    let pair = fx2.tr("Pair", 2, Vec::new(), &[]);
+    let p1_wrap = fx2.bound(send_wrap, &[p1]);
+    fx2.imp("impl<R: SendWrap> Pair<R> for u8", 2, u8_, Some((pair, &[p1])), &[], std::vec![p1_wrap]);
+    let foreign_fn2 = fx2.func("foreign_fn2", 0, &[], unit, Vec::new());
+    let cor2_t = fx2.ty(PNode::Coroutine { owner: foreign_fn2, ordinal: 0, args: crate::ids::List::EMPTY });
+    let exact_foreign = fx2.tuple(&[ready_t]);
+    let superset_foreign = fx2.tuple(&[rc_t]);
+    fx2.coroutines.push((foreign_fn2, 0, unit, exact_foreign));
+    fx2.func("make_foreign_cor", 0, &[], cor2_t, Vec::new());
+    let pair_bound = fx2.bound(pair, &[p0, p1]);
+    fx2.func("check_pair2", 2, &[p0, p1], unit, std::vec![pair_bound]);
+    fx2.finish();
+
+    let mut b2 = Bb::new();
+    let body2 = rc_before_await(&mut b2);
+    let block2 = b2.async_block(body2, Capture::Ref);
+    let mf2 = b2.path(&["make_foreign_cor"]);
+    let foreign_cor = b2.call(mf2, &[]);
+    let both2 = b2.tuple(&[block2, foreign_cor]);
+    let u8_val2 = b2.int(Some(crate::body::IntSuffix::Uint(crate::ids::UintTy::U8)));
+    let callee2 = b2.path(&["check_pair2"]);
+    let call2 = b2.call(callee2, &[u8_val2, both2]);
+    let s2 = b2.semi(call2);
+    let root2 = b2.block(&[s2], None);
+
+    let mut cx2 = InferCtx::new_in(alloc);
+    let c2 = match check_deferring(&b2.view(it2.c_sync, root2), &fx2, &mut cx2, &Needs::new_in(alloc), alloc) {
+        Ok(crate::Outcome::Done(c)) => c,
+        Ok(crate::Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
+        Err(e) => panic!("check_deferring refused: {e:?}"),
+    };
+    assert!(c2.diags.is_empty(), "{:?}", c2.diags);
+    assert_eq!(c2.stalled.len(), 1, "expected one stalled Pair row: {:?}", c2.stalled);
+    assert_eq!(c2.types.view().node(c2.stalled[0].ty), Ok(PNode::Uint(crate::ids::UintTy::U8)), "Self is u8");
+
+    // Flip `foreign_fn2 #0` to a `Superset` record holding `Rc`: `Exact::coroutine_of` imports
+    // `(Rc,)` so replay returns `Unsatisfied` (`No`), which `unavailable_goal_witness` must
+    // convert to `EXTERNAL_WITNESS_GAP` rather than reporting E0277.
+    fx2.coroutines[0].3 = superset_foreign;
+    fx2.provisional_coroutines.push((foreign_fn2, 0));
+
+    let mut out2 = c2.types.fork_in(alloc).expect("fork");
+    let none2 = out2.intern_list(&[]).expect("list");
+    let ready2 = out2.intern(PNode::Adt(fx2.key_of("Ready"), none2)).expect("Ready");
+    let list2 = out2.intern_list(&[ready2]).expect("list");
+    let exact_ok2 = out2.intern(PNode::Tuple(list2)).expect("tuple");
+    let got2 = decide_stalled(&b2.view(it2.c_sync, root2), &c2, out2.view(), &[(block2, exact_ok2)], &fx2, alloc);
+    assert!(
+        matches!(
+            got2,
+            Err(StalledError::Check(crate::error::CheckError::ForeignWitness {
+                gap,
+                item,
+                ordinal: Some(0),
+                ..
+            })) if gap == crate::EXTERNAL_WITNESS_GAP && item == foreign_fn2
+        ),
+        "expected EXTERNAL_WITNESS_GAP naming foreign_fn2 #0 (direct Superset Coroutine non-Self arg), got {got2:?}"
+    );
+}
+
+/// Regression (Codex PR #2770 P2 #3): an ordinary two-argument trait whose second argument
+/// contains `dyn Send` must NOT run `unsize_storage` on replay failure and misattribute the
+/// failure to a held coroutine field via the `failed_field` callback.
+#[test]
+fn ordinary_two_arg_trait_with_dyn_send_does_not_run_unsize_storage() {
+    let alloc = blaze_own::testing::heap().alloc();
+    let (mut fx, it) = world();
+    let (p0, p1, unit) = (fx.param(0), fx.param(1), fx.unit());
+    let send = fx.key_of("Send");
+    let send_wrap = fx.tr("SendWrap", 1, Vec::new(), &[]);
+    let p0_send = fx.bound(send, &[p0]);
+    fx.imp("impl<T: Send> SendWrap for T", 1, p0, Some((send_wrap, &[])), &[], std::vec![p0_send]);
+    let holder = fx.strukt("Holder", 1, &[("f", p0)]);
+    let holder_p0 = fx.adt(holder, &[p0]);
+    let outer2 = fx.tr("Outer2", 2, Vec::new(), &[]);
+    let p0_wrap = fx.bound(send_wrap, &[p0]);
+    fx.imp("impl<F: SendWrap, T> Outer2<T> for Holder<F>", 2, holder_p0, Some((outer2, &[p1])), &[], std::vec![p0_wrap]);
+    fx.func("hold", 1, &[p0], holder_p0, Vec::new());
+    let ex_send = fx.ty(PNode::ExAuto(send));
+    let dyn_rows = fx.list(&[ex_send]);
+    let dyn_send = fx.ty(PNode::Dynamic(dyn_rows));
+    let ref_dyn_send = fx.ty(PNode::Ref(crate::ids::Mutbl::Not, dyn_send));
+    fx.func("make_dyn_send", 0, &[], ref_dyn_send, Vec::new());
+    let outer2_bound = fx.bound(outer2, &[p0, p1]);
+    fx.func("check_outer2", 2, &[p0, p1], unit, std::vec![outer2_bound]);
+    fx.finish();
+
+    let mut b = Bb::new();
+    let body = rc_across_await(&mut b);
+    let block = b.async_block(body, Capture::Ref);
+    let hold = b.path(&["hold"]);
+    let held = b.call(hold, &[block]);
+    let md = b.path(&["make_dyn_send"]);
+    let dyn_val = b.call(md, &[]);
+    let callee = b.path(&["check_outer2"]);
+    let call = b.call(callee, &[held, dyn_val]);
+    let s = b.semi(call);
+    let root = b.block(&[s], None);
+
+    let mut cx = InferCtx::new_in(alloc);
+    let c = match check_deferring(&b.view(it.c_sync, root), &fx, &mut cx, &Needs::new_in(alloc), alloc) {
+        Ok(crate::Outcome::Done(c)) => c,
+        Ok(crate::Outcome::Need(n)) => panic!("the world missed {:?}", n.questions),
+        Err(e) => panic!("check_deferring refused: {e:?}"),
+    };
+    assert!(c.diags.is_empty(), "{:?}", c.diags);
+    assert_eq!(c.stalled.len(), 1, "expected one stalled Outer2 row: {:?}", c.stalled);
+
+    let mut out = c.types.fork_in(alloc).expect("fork");
+    let none = out.intern_list(&[]).expect("list");
+    let rc = out.intern(PNode::Adt(fx.key_of("Rc"), none)).expect("Rc");
+    let ready = out.intern(PNode::Adt(fx.key_of("Ready"), none)).expect("Ready");
+    let bad_list = out.intern_list(&[rc, ready]).expect("list");
+    let exact_bad = out.intern(PNode::Tuple(bad_list)).expect("tuple");
+    let view = b.view(it.c_sync, root);
+    let mut storage_callbacks = 0usize;
+    let decided = c
+        .decide_stalled_with_storage(&view, &out, &[(block, exact_bad)], &fx, alloc, |_, _, _| {
+            storage_callbacks += 1;
+        })
+        .expect("decided");
+    assert_eq!(decided.found.len(), 1, "{:?}", decided.found);
+    assert_eq!(decided.found[0].code, DiagCode::Unsatisfied);
+    assert_eq!(storage_callbacks, 0, "ordinary 2-arg trait must not trigger unsize_storage");
+}
