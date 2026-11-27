@@ -471,6 +471,12 @@ impl<'n, S: PositionSource<'n>> LazyProgram<'n, S> {
         let (lib, text, in_container, has_body) = (head.lib, head.text, head.container.is_some(), head.has_body);
         let values_at = crate::front2::links::values_key(self.front.names, &self.store, lib);
         let symbols = symbols_of(self.front.names, lib, values_at, text, &path).map_err(&refuse)?;
+        if symbols.extern_weak {
+            return Err(refuse(Front2Refusal::Attrs {
+                function: path.as_str().into(),
+                why: "`#[linkage = \"extern_weak\"]` is only supported on foreign statics".into(),
+            }));
+        }
         let (at, foreign) = self.placed_of(key, lib, &path)?;
         let local = |why: crate::front2::panic_entry::Refused| Front2Refusal::Attrs { function: Box::from(path.as_str()), why: why.form().into() };
         let foreign = foreign.or_else(|| crate::front2::panic_entry::local_abi(&self.store, key));

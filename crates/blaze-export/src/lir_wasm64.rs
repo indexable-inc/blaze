@@ -49,6 +49,10 @@ pub struct LirWasm64Func<'a> {
     pub view: View<'a>,
 }
 
+/// Sentinel static `place` representing an unresolved `#[linkage = "extern_weak"]` symbol,
+/// which resolves to the null address `0` in `Op::DataAddr`, `DataRec` relocs, and static relocs.
+pub const NULL_STATIC_PLACE: u32 = u32::MAX;
+
 /// Target of an 8-byte relocation inside a [`LirWasm64Static`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LirWasm64RelocTarget {
@@ -715,6 +719,9 @@ impl<'a, 'm> ModuleCtx<'a, 'm> {
     }
 
     fn resolve_static(&self, func: u32, inst: usize, place: u32) -> Result<u64, LirWasm64Error> {
+        if place == NULL_STATIC_PLACE {
+            return Ok(0);
+        }
         for &(p, addr) in self.static_addrs.as_slice() {
             if p == place {
                 return Ok(addr);
@@ -945,6 +952,9 @@ pub fn compile_lir_wasm64<'a>(
     let mut data_bufs: AVec<'a, (u64, AVec<'a, u8>)> = Vec::new_in(alloc);
 
     for st in module.statics {
+        if st.place == NULL_STATIC_PLACE {
+            return Err(LirWasm64Error::Overflow { what: "static place collides with null sentinel" });
+        }
         for &(existing, _) in static_addrs.as_slice() {
             if existing == st.place {
                 return Err(LirWasm64Error::DuplicatePlace { kind: "static", place: st.place });
@@ -1139,11 +1149,14 @@ pub fn compile_lir_wasm64<'a>(
         }
     }
 
-    // 4. Pre-scan all `Op::FuncAddr` across functions so `indirect_table` is finalized before
-    //    lowering any `Op::CallIndirect` (deterministic slot ordering).
+    // 4. Pre-scan all `Op::FuncAddr` (and `Op::DataAddr` targeting `RefKind::Func`, e.g. a
+    //    foreign static resolved to a Rust `#[no_mangle]`/`#[export_name]` function) across
+    //    functions so `indirect_table` is finalized before lowering any `Op::CallIndirect`
+    //    (deterministic slot ordering).
     for f in module.funcs {
         for inst in 0..f.view.len() {
-            if f.view.op(inst) == Op::FuncAddr {
+            let op = f.view.op(inst);
+            if op == Op::FuncAddr || op == Op::DataAddr {
                 let ref_id = f.view.operands(inst).reference();
                 if ref_id.index() >= f.view.refs.len() {
                     return Err(LirWasm64Error::UnsupportedRef {
@@ -1154,16 +1167,21 @@ pub fn compile_lir_wasm64<'a>(
                     });
                 }
                 let rec = f.view.reference(ref_id);
-                if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
-                    return Err(LirWasm64Error::UnsupportedRef {
-                        func: f.place,
-                        inst,
-                        kind: rec.kind,
-                        place: rec.place,
-                    });
+                if op == Op::FuncAddr {
+                    if RefKind::from_word(rec.kind) != Some(RefKind::Func) {
+                        return Err(LirWasm64Error::UnsupportedRef {
+                            func: f.place,
+                            inst,
+                            kind: rec.kind,
+                            place: rec.place,
+                        });
+                    }
+                    let wasm_idx = ctx.resolve_func(f.place, inst, rec.place)?;
+                    ctx.intern_indirect_func(wasm_idx);
+                } else if RefKind::from_word(rec.kind) == Some(RefKind::Func) {
+                    let wasm_idx = ctx.resolve_func(f.place, inst, rec.place)?;
+                    ctx.intern_indirect_func(wasm_idx);
                 }
-                let wasm_idx = ctx.resolve_func(f.place, inst, rec.place)?;
-                ctx.intern_indirect_func(wasm_idx);
             }
         }
     }
@@ -2161,6 +2179,10 @@ impl<'a, 'm, 'c, 'v> FuncEmitter<'a, 'm, 'c, 'v> {
                         })?,
                     Some(RefKind::Static | RefKind::Vtable | RefKind::Tls) => {
                         self.ctx.resolve_static(self.place, inst, rec.place)?
+                    }
+                    Some(RefKind::Func) => {
+                        let wasm_idx = self.ctx.resolve_func(self.place, inst, rec.place)?;
+                        u64::from(self.ctx.intern_indirect_func(wasm_idx))
                     }
                     _ => {
                         return Err(LirWasm64Error::UnsupportedRef {

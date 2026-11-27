@@ -55,7 +55,7 @@ impl Memory for FakeMemory {
     fn thunk(&self, slot: SlotId) -> u64 {
         thunk_of(slot)
     }
-    fn outside(&mut self, _record: RecordId, symbol: CodeSymbol, _name: &str) -> Result<Outside, RunModeError> {
+    fn outside(&mut self, _record: RecordId, symbol: CodeSymbol, _name: &str, _weak: bool) -> Result<Outside, RunModeError> {
         Err(RunModeError::NoNativeLibrary { symbol })
     }
     fn reserve(&mut self, _len: usize, _align: usize) -> Result<u64, RunModeError> {
@@ -227,14 +227,18 @@ fn refuses_word_count_mismatch() {
 #[test]
 fn outside_before_native_refused() {
     let symbol = CodeSymbol([0x33; 32]);
-    let before = native_lib::bind::<FakeNatives>(None, LIBRARY, symbol, "write");
+    let before = native_lib::bind::<FakeNatives>(None, LIBRARY, symbol, "write", false);
     assert_eq!(before, Err(RunModeError::NoNativeLibrary { symbol }));
     let mut natives = fake(descriptor(0, 0), &[]);
-    let found = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "write");
+    let found = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "write", false);
     assert_eq!(found, Ok(0x1234_5678));
-    let lacks = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "not_there");
+    let weak_found = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "write", true);
+    assert_eq!(weak_found, Ok(0x1234_5678));
+    let lacks = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "not_there", false);
     assert!(matches!(lacks, Err(RunModeError::Outside { record: LIBRARY, .. })), "the refusal names the record: {lacks:?}");
-    let nul = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "a\0b");
+    let weak_lacks = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "not_there", true);
+    assert_eq!(weak_lacks, Ok(0), "missing weak symbol binds to 0");
+    let nul = native_lib::bind(Some(&mut natives), LIBRARY, symbol, "a\0b", false);
     assert!(matches!(nul, Err(RunModeError::Outside { .. })), "{nul:?}");
     println!("native_lib: NoNativeLibrary before the library; `write` at {:#x} after; a name it lacks is Outside", 0x1234_5678);
 }

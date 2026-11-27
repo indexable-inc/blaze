@@ -149,12 +149,14 @@ fn an_old_form_is_refused_by_both_numbers() {
     let alloc = blaze_own::testing::heap().alloc();
     let mut bytes = bytes_of(record(&[0, 1, 2, 3, 4, 5], alloc), alloc);
     bytes[..8].copy_from_slice(b"bzcode03");
-    assert_eq!(read(&bytes).err(), Some(FormError::OtherForm { found: 3, reads: 8 }));
-    bytes[..8].copy_from_slice(b"bzcode07");
-    assert_eq!(read(&bytes).err(), Some(FormError::OtherForm { found: 7, reads: 8 }));
+    assert_eq!(read(&bytes).err(), Some(FormError::OtherForm { found: 3, reads: 10 }));
+    bytes[..8].copy_from_slice(b"bzcode08");
+    assert_eq!(read(&bytes).err(), Some(FormError::OtherForm { found: 8, reads: 10 }));
+    bytes[..8].copy_from_slice(b"bzcode09");
+    assert_eq!(read(&bytes).err(), Some(FormError::OtherForm { found: 9, reads: 10 }));
     bytes[..8].copy_from_slice(b"notacode");
     assert_eq!(read(&bytes).err(), Some(FormError::Magic));
-    println!("bzcode08: a bzcode03 and a bzcode07 record are refused naming both numbers");
+    println!("bzcode10: a bzcode03, bzcode08 and bzcode09 record are refused naming both numbers");
 }
 
 /// Prints `bzcode03: the seal refuses an unused row and an undeclared target by symbol`. Fails

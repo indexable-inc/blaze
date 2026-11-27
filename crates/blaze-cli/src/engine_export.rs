@@ -825,7 +825,7 @@ fn datum_to_export<'a>(target: Target, view: &DatumView<'a>, bump: Bump<'a>, hea
                 shown: owned_str("word target index exceeds usize", heap.alloc()),
             })?;
             let t = view.target(idx);
-            if t.space == Space::Outside
+            if t.space.is_outside()
                 && let Some(name) = view.name(t.symbol)
                 && !outside.iter().any(|(s, _)| *s == t.symbol)
             {
@@ -915,14 +915,18 @@ fn materialize_positionless<'a>(
 
     for i in 0..view.targets() {
         let t = view.target(i);
-        if t.space == Space::Outside {
+        if t.space.is_outside() {
             let Some(name) = view.name(t.symbol) else {
                 return Err(ExportCliError::Materialize {
                     symbol: symbol.0,
                     shown: owned_fmt(format_args!("missing outside name for {}", t.symbol), frame, heap.alloc()),
                 });
             };
-            rec.outside(name);
+            if t.space == Space::WeakOutside {
+                rec.weak_outside(name);
+            } else {
+                rec.outside(name);
+            }
         } else {
             rec.target(t);
         }

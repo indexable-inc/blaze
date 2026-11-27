@@ -300,15 +300,17 @@ pub fn write<'a, 'b>(image: &Image<'a>, identifier: &str, out: &mut AVec<'_, u8>
         chain_segs.push(ChainSeg { vm: s.vm, vm_size: s.vm_size, fixups: s.fixups });
     }
     chain_segs.push(ChainSeg { vm: vm_end, vm_size: 0, fixups: false }); // __LINKEDIT
-    let import = |i: usize| -> ChainImport<'a> {
-        let (index, addend) = match i.checked_sub(n_imports) {
-            None => (i, 0),
-            Some(k) => (extra[k].0 as usize, extra[k].1),
+    let mut all_imports: AVec<'_, ChainImport<'a>> = Vec::with_capacity_in(n_imports + extra.len(), alloc);
+    for row in image.imports.iter() {
+        all_imports.push(ChainImport { lead: b"", name: row.name, ordinal: FLAT_LOOKUP, weak: row.weak, addend: 0 });
+    }
+    for &(index, addend) in extra.iter() {
+        let Some(row) = usize::try_from(index).ok().and_then(|k| image.imports.get(k)) else {
+            return Err(DylibError::TooLarge { what: "a native import index", len: u64::from(index) });
         };
-        let row = image.imports[index];
-        ChainImport { lead: b"", name: row.name, ordinal: FLAT_LOOKUP, weak: row.weak, addend }
-    };
-    let (blob, slots) = macho::chained_fixups(&chains, |c: &(u64, Chain)| *c, &chain_segs, ImportRows::Addend64, n_imports + extra.len(), import, alloc)
+        all_imports.push(ChainImport { lead: b"", name: row.name, ordinal: FLAT_LOOKUP, weak: row.weak, addend });
+    }
+    let (blob, slots) = macho::chained_fixups(&chains, |c: &(u64, Chain)| *c, &chain_segs, ImportRows::Addend64, &all_imports, alloc)
         .map_err(|e| match e.at {
             Some(at) => DylibError::Slot { what: e.what, value: e.len, at },
             None => DylibError::TooLarge { what: e.what, len: e.len },

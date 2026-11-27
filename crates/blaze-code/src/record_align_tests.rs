@@ -55,6 +55,58 @@ fn sym(n: u8) -> Symbol {
     Symbol([n; 32])
 }
 
+/// `Space::WeakOutside` seals into `bzcode09`, reads back with its name, coexists with a strong
+/// `Space::Outside` target of the same symbol, and refuses a bare `Space::WeakOutside` with no name.
+#[test]
+fn weak_outside_round_trips_and_refuses_missing_name() {
+    use crate::record::{Site, SiteKind, Space};
+    let inline = Inline::<65536>::new();
+    let erased = Erased::new(&inline);
+    let alloc = erased.handle();
+
+    let mut r = CodeRecord::new_in(alloc);
+    for inst in [0x9000_0000u32, 0xF940_0000, 0x9000_0001, 0xF940_0021, 0x9000_0002, 0xF940_0042, RET] {
+        r.code.extend_from_slice(&inst.to_le_bytes());
+    }
+    let w_only = r.weak_outside("posix_spawn_file_actions_addchdir");
+    let w_both = r.weak_outside("shared_sym");
+    let s_both = r.outside("shared_sym");
+    r.sites.push(Site { at: 0, kind: SiteKind::Load, target: w_only, addend: 0 });
+    r.sites.push(Site { at: 8, kind: SiteKind::Load, target: w_both, addend: 0 });
+    r.sites.push(Site { at: 16, kind: SiteKind::Load, target: s_both, addend: 0 });
+    let mut encoded = Vec::new_in(alloc);
+    let Ok(sealed) = r.seal() else { panic!("weak_outside record must seal") };
+    sealed.encode(&mut encoded);
+    assert_eq!(&encoded[..8], b"bzcode09");
+
+    let Ok(view) = CodeView::read(&encoded) else { panic!("bzcode09 record must decode") };
+    assert_eq!(view.targets(), 3, "strong + weak of shared_sym + weak_only");
+    let weak_only_sym = Symbol::of_name("posix_spawn_file_actions_addchdir");
+    let shared_sym = Symbol::of_name("shared_sym");
+    assert_eq!(view.name(weak_only_sym), Some("posix_spawn_file_actions_addchdir"));
+    assert_eq!(view.name(shared_sym), Some("shared_sym"));
+    let mut saw_weak_only = false;
+    let mut saw_weak_shared = false;
+    let mut saw_strong_shared = false;
+    for i in 0..view.targets() {
+        let t = view.target(i);
+        if t == (Target { space: Space::WeakOutside, symbol: weak_only_sym }) {
+            saw_weak_only = true;
+        } else if t == (Target { space: Space::WeakOutside, symbol: shared_sym }) {
+            saw_weak_shared = true;
+        } else if t == (Target { space: Space::Outside, symbol: shared_sym }) {
+            saw_strong_shared = true;
+        }
+    }
+    assert!(saw_weak_only && saw_weak_shared && saw_strong_shared);
+
+    // Control: bare `Space::WeakOutside` target with no name is refused at seal.
+    let mut missing = CodeRecord::new_in(alloc);
+    missing.code.extend_from_slice(&RET.to_le_bytes());
+    missing.target(Target { space: Space::WeakOutside, symbol: weak_only_sym });
+    assert_eq!(missing.seal().err(), Some(RecordError::NameMissing { symbol: weak_only_sym }));
+}
+
 /// Prints: `test record_align_tests::alignments_round_trip_and_older_forms_are_refused ... ok`
 #[test]
 fn alignments_round_trip_and_older_forms_are_refused() {
@@ -63,7 +115,7 @@ fn alignments_round_trip_and_older_forms_are_refused() {
     let alloc = erased.handle();
     let bytes = aligned(6, 6, alloc).expect("seals");
     assert_eq!(&bytes[..8], &MAGIC);
-    assert_eq!(&MAGIC, b"bzcode07");
+    assert_eq!(&MAGIC, b"bzcode09");
     assert_eq!(&bytes[12..16], &[6, 6, 0, 0], "the two alignments where `bzcode05` held a zero `flags`");
     let view = CodeView::read(&bytes).expect("reads back");
     assert_eq!((view.code_align(), view.relro_align()), (6, 6));
@@ -87,6 +139,8 @@ fn alignments_round_trip_and_older_forms_are_refused() {
     assert_eq!(CodeView::read(&older).err(), Some(DecodeError::Older { form: *b"bzcode04" }));
     older[..8].copy_from_slice(b"bzcode06");
     assert_eq!(CodeView::read(&older[..56]).err(), Some(DecodeError::Older { form: *b"bzcode06" }), "even an empty v6 record is identified");
+    older[..8].copy_from_slice(b"bzcode07");
+    assert_eq!(CodeView::read(&older).err(), Some(DecodeError::Older { form: *b"bzcode07" }), "bzcode07 is refused as an older form");
     older[..8].copy_from_slice(b"notacode");
     assert_eq!(CodeView::read(&older).err(), Some(DecodeError::Magic), "bytes of no form of this record");
 

@@ -294,6 +294,15 @@ pub struct Write {
     pub value: u64,
 }
 
+/// One outside word the launcher binds at start with `dlsym`: `symbol` at address `at`.
+/// When `weak` is true (`Space::WeakOutside`), a missing symbol resolves to zero.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct OutsideWord {
+    pub at: u64,
+    pub symbol: Symbol,
+    pub weak: bool,
+}
+
 /// What appending a segment asks of the image's memory.
 pub struct Appended<'a> {
     /// Where the segment's first byte goes: its code at `base`, its import table and relro part
@@ -302,8 +311,8 @@ pub struct Appended<'a> {
     /// Every word to store, sorted by address, each once: the new segment's bound words, and
     /// in earlier segments exactly the words naming a function this segment moved.
     pub writes: AVec<'a, Write>,
-    /// The words the launcher binds at start with `dlsym`, by the name's symbol.
-    pub outside: AVec<'a, (u64, Symbol)>,
+    /// The words the launcher binds at start with `dlsym`, by the name's symbol and linkage.
+    pub outside: AVec<'a, OutsideWord>,
     /// The functions this segment placed that an earlier segment had placed: an edit's bodies.
     pub moved: AVec<'a, Symbol>,
 }
@@ -359,7 +368,7 @@ impl<'a> Image<'a> {
         moved.sort_unstable();
         moved.dedup();
         let mut writes: AVec<'a, Write> = Vec::new_in(alloc);
-        let mut outside: AVec<'a, (u64, Symbol)> = Vec::new_in(alloc);
+        let mut outside: AVec<'a, OutsideWord> = Vec::new_in(alloc);
         // First the earlier words naming a moved function, before this segment's own words are
         // posted, so none is written twice.
         for &symbol in moved.iter() {
@@ -390,12 +399,12 @@ impl<'a> Image<'a> {
     }
 
     /// Binds the word at `at` to `target` plus `addend`, and posts it under the target.
-    fn bind(&mut self, target: Target, at: u64, addend: i64, writes: &mut AVec<'a, Write>, outside: &mut AVec<'a, (u64, Symbol)>) -> Result<(), ImageError> {
-        if target.space == Space::Outside {
+    fn bind(&mut self, target: Target, at: u64, addend: i64, writes: &mut AVec<'a, Write>, outside: &mut AVec<'a, OutsideWord>) -> Result<(), ImageError> {
+        if target.space.is_outside() {
             if addend != 0 {
                 return Err(ImageError::OutsideAddend { symbol: target.symbol });
             }
-            outside.push((at, target.symbol));
+            outside.push(OutsideWord { at, symbol: target.symbol, weak: target.space == Space::WeakOutside });
             return Ok(());
         }
         let Some(home) = self.homes.get(&target).copied() else {

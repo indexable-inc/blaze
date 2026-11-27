@@ -811,7 +811,7 @@ impl<'h> SuiteCache<'h> {
                         match t.space {
                             Space::Func => declares.push(Symbol(t.symbol.0)),
                             Space::Static | Space::Vtable | Space::Tls => named.push(Symbol(t.symbol.0)),
-                            Space::Outside => {}
+                            Space::Outside | Space::WeakOutside => {}
                         }
                     }
                 }

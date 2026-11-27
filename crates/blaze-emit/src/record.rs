@@ -210,7 +210,12 @@ fn target_of(record: &mut CodeRecord<'_>, names: &dyn Names, to: RelocTo, addend
         Some(Named::C(name)) => match space {
             Space::Func | Space::Static if addend == 0 => Ok(record.outside(name)),
             Space::Func | Space::Static => Err(RecordEmitError::CAddend { of, addend }),
-            Space::Vtable | Space::Tls | Space::Outside => Err(RecordEmitError::CName { of }),
+            Space::Vtable | Space::Tls | Space::Outside | Space::WeakOutside => Err(RecordEmitError::CName { of }),
+        },
+        Some(Named::WeakC(name)) => match space {
+            Space::Func | Space::Static if addend == 0 => Ok(record.weak_outside(name)),
+            Space::Func | Space::Static => Err(RecordEmitError::CAddend { of, addend }),
+            Space::Vtable | Space::Tls | Space::Outside | Space::WeakOutside => Err(RecordEmitError::CName { of }),
         },
     }
 }

@@ -656,6 +656,18 @@ fn resolve_x64_outside<'a>(
             out.targets.push(Target { space: Space::Outside, symbol: sym });
             Ok(idx)
         }
+        Some(Named::WeakC(name)) => {
+            if !allow_c_name {
+                return Err(TierError::Refused { tier: TIER, inst: Some(u32_of(inst)), what: "C name for non-func/static" });
+            }
+            let sym = Symbol::of_name(name);
+            let start = u32_of(out.text.len());
+            out.text.extend_from_slice(name.as_bytes());
+            out.names.push((sym, start, u32_of(name.len())));
+            let idx = u32_of(out.targets.len());
+            out.targets.push(Target { space: Space::WeakOutside, symbol: sym });
+            Ok(idx)
+        }
         None => Err(TierError::NoName { tier: TIER, of }),
     }
 }

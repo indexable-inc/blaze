@@ -14,7 +14,7 @@ use blaze_code::record::{Space, Symbol};
 use blaze_export::lir_wasm64::{
     LirWasm64Error, LirWasm64Func, LirWasm64Global, LirWasm64GlobalValue, LirWasm64Import,
     LirWasm64Module, LirWasm64RelocTarget, LirWasm64Static, LirWasm64StaticReloc,
-    compile_lir_wasm64,
+    NULL_STATIC_PLACE, compile_lir_wasm64,
 };
 use blaze_export::wasm64::{
     HOST_IMPORT_COUNT, HOST_IMPORT_SIGS, HOST_MODULE, ValType, Wasm64Error, Wasm64Exported,
@@ -49,6 +49,10 @@ const MAX_COMPOUND_DEPTH: usize = 64;
 /// Reserve gap between defined function places (plus optional synthesized `_start`) and import
 /// places so the two place namespaces stay strictly disjoint.
 const IMPORT_PLACE_RESERVE: usize = 16;
+
+/// Word encoding of `RefKind::Func` in `blaze_lir::func::RefRec::kind`.
+const FUNC_REF_KIND: u32 = 0;
+const _: () = assert!(matches!(RefKind::from_word(FUNC_REF_KIND), Some(RefKind::Func)));
 
 /// Configuration for [`compile_walk_to_wasm64`].
 #[derive(Clone, Copy, Debug)]
@@ -302,15 +306,21 @@ fn unquote_attr_string(raw: &str) -> Option<&str> {
     Some(inner)
 }
 
+struct ForeignStaticInfo<'a> {
+    item: ItemKey,
+    name: blaze_own::String<Alloc<'a>>,
+    weak: bool,
+}
+
 /// Scans all crates in `records` for Rust-defined `#[no_mangle]` / `#[export_name = "..."]`
 /// functions and statics so `extern "C"` calls/statics inside the program (such as `std` calling
 /// `wasi_rt`) resolve internally without external linkers or `wasi-libc`.
 fn collect_rust_c_exports<'a, 'n>(
     records: &'n Records<'n>,
     alloc: Alloc<'a>,
-) -> (AVec<'a, RustCExport<'a>>, AVec<'a, (ItemKey, blaze_own::String<Alloc<'a>>)>) {
+) -> (AVec<'a, RustCExport<'a>>, AVec<'a, ForeignStaticInfo<'a>>) {
     let mut exports: AVec<'a, RustCExport<'a>> = Vec::new_in(alloc);
-    let mut foreign_statics: AVec<'a, (ItemKey, blaze_own::String<Alloc<'a>>)> = Vec::new_in(alloc);
+    let mut foreign_statics: AVec<'a, ForeignStaticInfo<'a>> = Vec::new_in(alloc);
     let crate_count = records.crate_count();
     let mut items_buf: AVec<'a, blaze_id::ItemKey> = Vec::new_in(alloc);
 
@@ -325,15 +335,48 @@ fn collect_rust_c_exports<'a, 'n>(
         });
         for &lib_key in items_buf.iter() {
             // Skip foreign declarations inside `extern { ... }` blocks; we want definitions only.
-            // Record foreign statics (`extern "C" { static FOO: ...; }`) so static-to-static
-            // relocations can alias them to their Rust `#[no_mangle]` definition.
+            // Record foreign statics (`extern "C" { static FOO: ...; }`) with their linkage so
+            // static-to-static relocations can alias them to a Rust `#[no_mangle]` definition or
+            // materialize zero when `#[linkage = "extern_weak"]` is absent.
             if records.extern_abi(lib_key).flatten().is_some() {
                 if matches!(records.kind_of_item(lib_key), Some(ItemKind::Static))
                     && let Some(sym_name) = records.name_of(lib_key)
                 {
-                    let mut owned = blaze_own::String::with_capacity_in(sym_name.len(), alloc);
-                    owned.push_str(sym_name);
-                    foreign_statics.push((checker_of(lib_key), owned));
+                    let mut weak = false;
+                    let mut owned = blaze_own::String::new_in(alloc);
+                    if let Some(item_text) = records.signature_text_of(lib_key)
+                        && (item_text.text.contains("linkage") || item_text.text.contains("link_name"))
+                        && let Ok(sig) = blaze_lower::lower_signature(item_text.text, edition, &mut CrateCfg(atoms), alloc)
+                    {
+                        let v = sig.view();
+                        if let Ok(attrs) = v.rows(v.list(head::ATTRS)) {
+                            for &n in attrs {
+                                let Ok(a) = v.attr(n) else { continue };
+                                let Ok(path) = v.text_at(a.path) else { continue };
+                                let path = path.trim();
+                                if path == "linkage"
+                                    && let Ok(args_text) = v.text_at(a.args)
+                                    && unquote_attr_string(args_text) == Some("extern_weak")
+                                {
+                                    weak = true;
+                                } else if path == "link_name"
+                                    && let Ok(args_text) = v.text_at(a.args)
+                                    && let Some(explicit) = unquote_attr_string(args_text)
+                                {
+                                    owned.clear();
+                                    owned.push_str(explicit);
+                                }
+                            }
+                        }
+                    }
+                    if owned.is_empty() {
+                        owned.push_str(sym_name);
+                    }
+                    foreign_statics.push(ForeignStaticInfo {
+                        item: checker_of(lib_key),
+                        name: owned,
+                        weak,
+                    });
                 }
                 continue;
             }
@@ -1061,13 +1104,13 @@ where
 
                 // Enqueue non-foreign statics and resolve foreign statics defined by Rust crates.
                 for &st_item in built.statics.iter() {
-                    let foreign_name = built.foreign_static_name(st_item).or_else(|| {
+                    let foreign = built.foreign_static(st_item).or_else(|| {
                         foreign_statics
                             .iter()
-                            .find(|(item, _)| *item == st_item)
-                            .map(|(_, n)| n.as_str())
+                            .find(|fs| fs.item == st_item)
+                            .map(|fs| (fs.name.as_str(), fs.weak))
                     });
-                    if let Some(c_name) = foreign_name {
+                    if let Some((c_name, _weak)) = foreign {
                         if let Some(def_item) =
                             find_rust_c_export(rust_exports.as_slice(), c_name, true)
                         {
@@ -1083,6 +1126,19 @@ where
                                 def_item,
                                 def_sym,
                                 &[],
+                                alloc,
+                            );
+                        } else if let Some(fn_item) =
+                            find_rust_c_export(rust_exports.as_slice(), c_name, false)
+                        {
+                            let (fn_sym, fn_name) = encode_no_args_name(fn_item, alloc)?;
+                            enqueue_unique(
+                                &mut queue,
+                                &mut seen_syms,
+                                RowKind::Instance,
+                                fn_item,
+                                fn_sym,
+                                fn_name.as_slice(),
                                 alloc,
                             );
                         }
@@ -1186,12 +1242,11 @@ where
                         shown: "malformed declared fn in static entry",
                     },
                 )?;
+                let mut static_fn_exports: AVec<'a, ItemKey> = Vec::new_in(alloc);
                 entry_view.each_static(|st_item| {
-                    if let Some((_, c_name)) =
-                        foreign_statics.iter().find(|(item, _)| *item == st_item)
-                    {
+                    if let Some(fs) = foreign_statics.iter().find(|fs| fs.item == st_item) {
                         if let Some(def_item) =
-                            find_rust_c_export(rust_exports.as_slice(), c_name.as_str(), true)
+                            find_rust_c_export(rust_exports.as_slice(), fs.name.as_str(), true)
                         {
                             let from_sym = static_symbol(st_item);
                             let def_sym = static_symbol(def_item);
@@ -1207,6 +1262,10 @@ where
                                 &[],
                                 alloc,
                             );
+                        } else if let Some(fn_item) =
+                            find_rust_c_export(rust_exports.as_slice(), fs.name.as_str(), false)
+                        {
+                            static_fn_exports.push(fn_item);
                         }
                         return;
                     }
@@ -1221,6 +1280,18 @@ where
                         alloc,
                     );
                 });
+                for &fn_item in static_fn_exports.iter() {
+                    let (fn_sym, fn_name) = encode_no_args_name(fn_item, alloc)?;
+                    enqueue_unique(
+                        &mut queue,
+                        &mut seen_syms,
+                        RowKind::Instance,
+                        fn_item,
+                        fn_sym,
+                        fn_name.as_slice(),
+                        alloc,
+                    );
+                }
                 // Also resolve any `Space::Outside` relocations pointing to Rust `#[no_mangle]`
                 // definitions (e.g. a static holding a fn ptr to a `wasi_rt` function).
                 let dview = entry_view.datum;
@@ -1230,7 +1301,7 @@ where
                         continue;
                     }
                     let t = dview.target(word.target as usize);
-                    if t.space == Space::Outside
+                    if t.space.is_outside()
                         && let Some(c_name) = dview.name(t.symbol)
                     {
                         if let Some(def_item) =
@@ -1357,7 +1428,7 @@ where
     let import_place_base = u32::try_from(funcs.len().saturating_add(IMPORT_PLACE_RESERVE))
         .map_err(|_| Wasm64BuildError::Export(LirWasm64Error::Overflow { what: "import place base" }))?;
     let mut imports: AVec<'a, OwnedImport<'a>> = Vec::new_in(alloc);
-    let mut new_places: AVec<'a, u32> = Vec::new_in(alloc);
+    let mut new_refs: AVec<'a, (u32, u32)> = Vec::new_in(alloc);
     let mut needs_main_void = false;
     let mut needs_call_ctors = false;
 
@@ -1418,9 +1489,9 @@ where
     }
 
     for f in funcs.iter_mut() {
-        new_places.clear();
+        new_refs.clear();
         let ref_len = f.built.func.refs.len();
-        new_places.reserve(ref_len);
+        new_refs.reserve(ref_len);
         {
             let view = f.built.func.view();
             for (ref_idx, rec) in view.refs.iter().enumerate() {
@@ -1432,8 +1503,8 @@ where
                         place: rec.place,
                     }));
                 };
-                let mapped = match kind {
-                    RefKind::Data => rec.place,
+                let (mapped_kind, mapped_place) = match kind {
+                    RefKind::Data => (rec.kind, rec.place),
                     RefKind::Static => {
                         let Some(&item) = f.built.statics.get(rec.place as usize) else {
                             return Err(Wasm64BuildError::UnresolvedSymbol {
@@ -1441,17 +1512,28 @@ where
                                 symbol: [0u8; 32],
                             });
                         };
-                        let foreign_name = f.built.foreign_static_name(item).or_else(|| {
+                        let foreign = f.built.foreign_static(item).or_else(|| {
                             foreign_statics
                                 .iter()
-                                .find(|(it, _)| *it == item)
-                                .map(|(_, n)| n.as_str())
+                                .find(|fs| fs.item == item)
+                                .map(|fs| (fs.name.as_str(), fs.weak))
                         });
-                        if let Some(c_name) = foreign_name {
+                        if let Some((c_name, weak)) = foreign {
                             if let Some(st_place) =
                                 find_export_place(rust_c_static_to_place.as_slice(), c_name)
                             {
-                                st_place
+                                (rec.kind, st_place)
+                            } else if let Some(fn_place) =
+                                find_export_place(export_name_to_place.as_slice(), c_name)
+                                    .or_else(|| find_export_place(rust_c_fn_to_place.as_slice(), c_name))
+                            {
+                                // Foreign static naming a Rust `#[no_mangle]`/`#[export_name]`
+                                // function: rewrite the ref to `RefKind::Func` so `Op::DataAddr`
+                                // and `DataRec` relocs intern the same non-null table slot as
+                                // static-datum relocations.
+                                (FUNC_REF_KIND, fn_place)
+                            } else if weak {
+                                (rec.kind, NULL_STATIC_PLACE)
                             } else {
                                 return Err(unresolved_import(
                                     c_name,
@@ -1467,7 +1549,7 @@ where
                                     symbol: sym.0,
                                 });
                             };
-                            st_place
+                            (rec.kind, st_place)
                         }
                     }
                     RefKind::Tls => {
@@ -1485,7 +1567,7 @@ where
                                 symbol: sym.0,
                             });
                         };
-                        st_place
+                        (rec.kind, st_place)
                     }
                     RefKind::Vtable => {
                         let Some(&sym) = f.built.vtables.get(rec.place as usize) else {
@@ -1501,9 +1583,10 @@ where
                                 symbol: sym.0,
                             });
                         };
-                        st_place
+                        (rec.kind, st_place)
                     }
-                    RefKind::Func => match f.built.callee_at(rec.place) {
+                    RefKind::Func => {
+                        let fn_place = match f.built.callee_at(rec.place) {
                         Some(Callee::Symbol(sym)) => {
                             let Some(fn_place) = find_place_by_sym(func_by_sym.as_slice(), sym.0)
                             else {
@@ -1595,12 +1678,15 @@ where
                                 symbol: [0u8; 32],
                             });
                         }
-                    },
+                    };
+                        (rec.kind, fn_place)
+                    }
                 };
-                new_places.push(mapped);
+                new_refs.push((mapped_kind, mapped_place));
             }
         }
-        for (dst_rec, &new_place) in f.built.func.refs.iter_mut().zip(new_places.iter()) {
+        for (dst_rec, &(new_kind, new_place)) in f.built.func.refs.iter_mut().zip(new_refs.iter()) {
+            dst_rec.kind = new_kind;
             dst_rec.place = new_place;
         }
     }
@@ -1667,6 +1753,31 @@ where
                         let Some(st_place) =
                             find_static_place(static_datums.as_slice(), target_sym)
                         else {
+                            if t.space == Space::Static
+                                && let Some(fs) = foreign_statics
+                                    .iter()
+                                    .find(|fs| static_symbol(fs.item).0 == target_sym)
+                            {
+                                let reloc_target = if let Some(fn_place) =
+                                    find_export_place(export_name_to_place.as_slice(), fs.name.as_str())
+                                        .or_else(|| find_export_place(rust_c_fn_to_place.as_slice(), fs.name.as_str()))
+                                {
+                                    LirWasm64RelocTarget::Func(fn_place)
+                                } else if fs.weak {
+                                    LirWasm64RelocTarget::Static(NULL_STATIC_PLACE)
+                                } else {
+                                    return Err(Wasm64BuildError::UnresolvedSymbol {
+                                        space,
+                                        symbol: target_sym,
+                                    });
+                                };
+                                relocs.push(LirWasm64StaticReloc {
+                                    offset: word.at,
+                                    target: reloc_target,
+                                    addend: word.addend,
+                                });
+                                continue;
+                            }
                             return Err(Wasm64BuildError::UnresolvedSymbol {
                                 space,
                                 symbol: target_sym,
@@ -1674,7 +1785,7 @@ where
                         };
                         LirWasm64RelocTarget::Static(st_place)
                     }
-                    Space::Outside => {
+                    Space::Outside | Space::WeakOutside => {
                         let c_name = view.name(t.symbol);
                         if let Some(name) = c_name
                             && let Some(fn_place) =
@@ -1687,6 +1798,8 @@ where
                                 find_export_place(rust_c_static_to_place.as_slice(), name)
                         {
                             LirWasm64RelocTarget::Static(st_place)
+                        } else if t.space == Space::WeakOutside {
+                            LirWasm64RelocTarget::Static(NULL_STATIC_PLACE)
                         } else {
                             return Err(unresolved_import_hash(
                                 t.symbol.0,

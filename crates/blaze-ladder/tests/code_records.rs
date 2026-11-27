@@ -212,7 +212,7 @@ fn check_entry(rung: &str, store: &dyn CodeStore, met: &Met, all: &[Met]) -> Res
     for i in 0..record.targets() {
         let target = record.target(i);
         match target.space {
-            Space::Outside => {
+            Space::Outside | Space::WeakOutside => {
                 let name = record.name(target.symbol).ok_or_else(|| format!("{rung}: `{caller}` names an outside symbol {} with no name kept", target.symbol))?;
                 out.c_names.push(name.to_string());
             }

@@ -29,14 +29,15 @@ use blaze_own::{AVec, Alloc, Vec};
 /// table ([`TrapRow`]), `bzcode05` its held values ([`Held`]) and subjects ([`Subject`]),
 /// `bzcode06` the alignment each part asks of its placement ([`CodeRecord::code_align`],
 /// [`CodeRecord::relro_align`]: data aligned past 16, as `vzipq_u8`'s 64-aligned table).
-/// `bzcode07` adds item-relative source positions ([`PositionRow`]). `02`
-/// and `03` are blaze-tier's own forms (record/form.rs), so this form skips them and a record
+/// `bzcode07` adds item-relative source positions ([`PositionRow`]). `bzcode09` adds weak
+/// outside targets ([`Space::WeakOutside`] for `#[linkage = "extern_weak"]`). `02`, `03`, `08`,
+/// and `10` are blaze-tier's own forms (record/form.rs), so this form skips them and a record
 /// of one form is never read as another's. A record of an older form of this one is refused
 /// naming its form ([`DecodeError::Older`]) and rebuilt, never read (rule 26).
-pub const MAGIC: [u8; 8] = *b"bzcode07";
+pub const MAGIC: [u8; 8] = *b"bzcode09";
 
 /// The forms before [`MAGIC`] that were this record's: refused by name, never read.
-const OLDER: [[u8; 8]; 3] = [*b"bzcode04", *b"bzcode05", *b"bzcode06"];
+const OLDER: [[u8; 8]; 4] = [*b"bzcode04", *b"bzcode05", *b"bzcode06", *b"bzcode07"];
 
 /// The least alignment, as log2, of a record's code: 16 bytes, what every placement gives
 /// (image.rs `lay_out`, blaze-launch-rt run_mode.rs) and what a 16-aligned data row of the code
@@ -97,13 +98,21 @@ pub enum Space {
     Tls = 3,
     /// A C library name, bound at start by `dlsym`; the record keeps the name.
     Outside = 4,
+    /// A weak C library name (`#[linkage = "extern_weak"]`), bound at start by `dlsym` or
+    /// resolved to 0 (null) when undefined; the record keeps the name.
+    WeakOutside = 5,
 }
 
 impl Space {
-    const ALL: [Space; 5] = [Space::Func, Space::Static, Space::Vtable, Space::Tls, Space::Outside];
+    const ALL: [Space; 6] = [Space::Func, Space::Static, Space::Vtable, Space::Tls, Space::Outside, Space::WeakOutside];
 
-    fn from_byte(byte: u8) -> Option<Space> {
+    pub fn from_byte(byte: u8) -> Option<Space> {
         Space::ALL.get(usize::from(byte)).copied()
+    }
+
+    /// Whether this target names a C library symbol (strong or weak), whose text the record keeps.
+    pub const fn is_outside(self) -> bool {
+        matches!(self, Space::Outside | Space::WeakOutside)
     }
 }
 
@@ -542,11 +551,21 @@ impl<'a> CodeRecord<'a> {
 
     /// The index of the outside name `name`, kept for the launcher's `dlsym`.
     pub fn outside(&mut self, name: &str) -> u32 {
+        self.outside_in(Space::Outside, name)
+    }
+
+    /// The index of the weak outside name `name` (`#[linkage = "extern_weak"]`), kept for the
+    /// launcher's `dlsym` (resolves to 0 when undefined).
+    pub fn weak_outside(&mut self, name: &str) -> u32 {
+        self.outside_in(Space::WeakOutside, name)
+    }
+
+    fn outside_in(&mut self, space: Space, name: &str) -> u32 {
         let symbol = Symbol::of_name(name);
         let start = self.text.len() as u32;
         self.text.extend_from_slice(name.as_bytes());
         self.names.push((symbol, start, name.len() as u32));
-        self.target(Target { space: Space::Outside, symbol })
+        self.target(Target { space, symbol })
     }
 
     /// The record in its one canonical form: targets sorted and unique (every index renumbered),
@@ -687,8 +706,11 @@ impl<'a> CodeRecord<'a> {
         }
         drop(by_symbol);
         drop(text);
-        // Every outside target has a name; a name no target uses is dropped.
-        kept.retain(|n| sorted.binary_search(&Target { space: Space::Outside, symbol: n.0 }).is_ok());
+        // Every outside target (strong or weak) has a name; a name no target uses is dropped.
+        kept.retain(|n| {
+            sorted.binary_search(&Target { space: Space::Outside, symbol: n.0 }).is_ok()
+                || sorted.binary_search(&Target { space: Space::WeakOutside, symbol: n.0 }).is_ok()
+        });
         let mut packed: AVec<'a, u8> = Vec::new_in(alloc);
         let mut packed_names: AVec<'a, (Symbol, u32, u32)> = Vec::with_capacity_in(kept.len(), alloc);
         for &(symbol, start, len) in kept.iter() {
@@ -697,7 +719,7 @@ impl<'a> CodeRecord<'a> {
             packed_names.push((symbol, at, len));
         }
         for t in sorted.iter() {
-            if t.space == Space::Outside && packed_names.binary_search_by_key(&t.symbol, |n| n.0).is_err() {
+            if t.space.is_outside() && packed_names.binary_search_by_key(&t.symbol, |n| n.0).is_err() {
                 return Err(RecordError::NameMissing { symbol: t.symbol });
             }
         }
@@ -896,10 +918,10 @@ pub enum DecodeError {
 impl fmt::Display for DecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode07` head"),
+            DecodeError::Magic => write!(f, "the bytes are not a code record: no `bzcode09` head"),
             DecodeError::Older { form } => write!(
                 f,
-                "the bytes are a code record of the older form `{}`, which held no source-position table: rebuilt, never read (rule 26)",
+                "the bytes are a code record of the older form `{}` (current is `bzcode09`): rebuilt, never read (rule 26)",
                 core::str::from_utf8(&form).unwrap_or("bzcode0?")
             ),
             DecodeError::Align { part, align } => write!(

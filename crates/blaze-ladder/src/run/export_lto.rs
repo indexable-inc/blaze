@@ -1510,7 +1510,7 @@ struct PreparedBody<'s, 'o, 'm> {
     verified: blaze_lir::Verified<'o>,
     funcs: AVec<'s, Callee<'o>>,
     statics: AVec<'s, ItemKey>,
-    c_statics: AVec<'s, (ItemKey, &'o str)>,
+    c_statics: AVec<'s, crate::code_records::ForeignStatic<'o>>,
     vtables: AVec<'s, Symbol>,
     vtable_data: Vec<(Symbol, Vec<u8, SharedAlloc<'static>>), SharedAlloc<'static>>,
     tls: AVec<'s, ItemKey>,
@@ -2322,16 +2322,16 @@ where
         }
         let mut statics: AVec<'a, ItemKey> = Vec::with_capacity_in(orig.built.statics.len(), alloc);
         statics.extend_from_slice(orig.built.statics.as_slice());
-        let mut c_statics: AVec<'a, (ItemKey, &str)> = Vec::with_capacity_in(orig.built.c_statics.len(), alloc);
-        for &(item, start, len) in orig.built.c_statics.iter() {
-            let Some(cname) = orig.built.c_str(start, len) else {
+        let mut c_statics: AVec<'a, crate::code_records::ForeignStatic<'_>> = Vec::with_capacity_in(orig.built.c_statics.len(), alloc);
+        for cs in orig.built.c_statics.iter() {
+            let Some(cname) = orig.built.c_str(cs.start, cs.len) else {
                 return Err(ExportLtoError::BadRef {
                     symbol: orig.symbol.0,
                     what: "original foreign static name",
                     ref_id: 0,
                 });
             };
-            c_statics.push((item, cname));
+            c_statics.push(crate::code_records::ForeignStatic { item: cs.item, name: cname, weak: cs.weak });
         }
         let mut vtables: AVec<'a, Symbol> = Vec::with_capacity_in(orig.built.vtables.len(), alloc);
         vtables.extend_from_slice(orig.built.vtables.as_slice());
@@ -2401,10 +2401,10 @@ where
                         });
                     };
                     put_at(&mut statics, place, item, orig.symbol.0, "imported static place", imp.caller_ref.0)?;
-                    if let Some(cname) = src_origin.built.foreign_static_name(item)
-                        && !c_statics.iter().any(|(k, _)| *k == item)
+                    if let Some((cname, weak)) = src_origin.built.foreign_static(item)
+                        && !c_statics.iter().any(|cs| cs.item == item)
                     {
-                        c_statics.push((item, cname));
+                        c_statics.push(crate::code_records::ForeignStatic { item, name: cname, weak });
                     }
                 }
                 RefKind::Vtable => {

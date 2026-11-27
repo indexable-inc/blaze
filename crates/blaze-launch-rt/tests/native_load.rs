@@ -79,7 +79,7 @@ impl Memory for SlotsOnly {
     fn thunk(&self, slot: SlotId) -> u64 {
         thunk_of(slot)
     }
-    fn outside(&mut self, _record: RecordId, symbol: CodeSymbol, _name: &str) -> Result<Outside, RunModeError> {
+    fn outside(&mut self, _record: RecordId, symbol: CodeSymbol, _name: &str, _weak: bool) -> Result<Outside, RunModeError> {
         Err(RunModeError::NoNativeLibrary { symbol })
     }
     fn reserve(&mut self, _len: usize, _align: usize) -> Result<u64, RunModeError> {
@@ -277,7 +277,7 @@ fn a_c_function_of_the_loaded_library_returns_its_value() {
     let word = unsafe { ((loaded.base + WORDS_AT) as *const u64).read() };
     let slot = SlotId(1);
     assert_eq!(word, thunk_of(slot), "the Rust word holds the thunk of the slot the parent paired with it");
-    let address = native_lib::bind(Some(&mut natives), LIBRARY, CodeSymbol([0x77; 32]), "c_seven").expect("`c_seven` binds through the handle");
+    let address = native_lib::bind(Some(&mut natives), LIBRARY, CodeSymbol([0x77; 32]), "c_seven", false).expect("`c_seven` binds through the handle");
     // SAFETY: `address` is `_c_seven` in the loaded image (`mov w0, #7; ret`), an
     // `extern "C" fn() -> i32` by its hand-laid code; the image stays mapped (never closed).
     let c_seven: extern "C" fn() -> i32 = unsafe { core::mem::transmute(address as usize) };
@@ -342,7 +342,7 @@ fn run_inits_invokes_initializers_and_refuses_null_cell() {
 #[test]
 fn without_the_library_the_c_name_is_refused_by_name() {
     let symbol = CodeSymbol([0x77; 32]);
-    let refused = native_lib::bind::<DlNatives>(None, LIBRARY, symbol, "c_seven");
+    let refused = native_lib::bind::<DlNatives>(None, LIBRARY, symbol, "c_seven", false);
     assert_eq!(refused, Err(RunModeError::NoNativeLibrary { symbol }));
     println!("native_load: control: no library, `c_seven` is NoNativeLibrary");
 }

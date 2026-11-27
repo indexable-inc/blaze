@@ -110,17 +110,19 @@ impl core::error::Error for StaticRecordError {}
 /// A static's entry from the evaluator's record of its initializer, `value`, and its kind (the
 /// module doc).
 pub fn make_static_entry<'a>(value: &SeamData, kind: StaticItem, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
-    make_static_entry_with_targets(value, kind, |_| Ok(None), |_| Ok(None), &[], &[], alloc)
+    make_static_entry_with_targets(value, kind, |_| Ok(None), |_| Ok(None), |_| None, &[], &[], alloc)
 }
 
-/// A static entry with the function-instance and vtable metadata needed by `DataTarget::Fn` and
-/// `DataTarget::Vtable` words, plus any extra declared instances and vtable datums those vtables carry.
+/// A static entry with the function-instance, vtable, and foreign-static metadata needed by
+/// `DataTarget::Fn`, `DataTarget::Vtable`, and `DataTarget::Static` words, plus any extra declared
+/// instances and vtable datums those vtables carry.
 #[allow(clippy::too_many_arguments)]
-pub fn make_static_entry_with_targets<'a, F, V>(
+pub fn make_static_entry_with_targets<'a, 's, F, V, S>(
     value: &SeamData,
     kind: StaticItem,
     mut fn_target: F,
     mut vtable_target: V,
+    mut foreign_static: S,
     extra_declared: &[Declared<'_>],
     vtables: &[VtableDatum<'_>],
     alloc: Alloc<'a>,
@@ -128,6 +130,7 @@ pub fn make_static_entry_with_targets<'a, F, V>(
 where
     F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
     V: FnMut(VtableKey) -> Result<Option<Symbol>, SymbolError>,
+    S: FnMut(ItemKey) -> Option<(&'s str, bool)>,
 {
     if kind.thread_local {
         return Err(StaticRecordError::ThreadLocal);
@@ -136,7 +139,7 @@ where
         true => Place::Writable,
         false => Place::ReadOnly,
     };
-    datum_entry(value, place, false, &mut fn_target, &mut vtable_target, extra_declared, vtables, alloc)
+    datum_entry(value, place, false, &mut fn_target, &mut vtable_target, &mut foreign_static, extra_declared, vtables, alloc)
 }
 
 /// A `#[thread_local]` static's TEMPLATE entry (run.md, "Statics in the run", step 4): its
@@ -148,17 +151,18 @@ where
 /// a mutable one is refused, and so is a word naming the value's own bytes (each copy would
 /// point at the template, not at itself).
 pub fn make_template_entry<'a>(value: &SeamData, kind: StaticItem, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
-    make_template_entry_with_targets(value, kind, |_| Ok(None), |_| Ok(None), &[], &[], alloc)
+    make_template_entry_with_targets(value, kind, |_| Ok(None), |_| Ok(None), |_| None, &[], &[], alloc)
 }
 
-/// A thread-local template with the function-instance and vtable metadata needed by `DataTarget::Fn`
-/// and `DataTarget::Vtable` words.
+/// A thread-local template with the function-instance, vtable, and foreign-static metadata needed
+/// by `DataTarget::Fn`, `DataTarget::Vtable`, and `DataTarget::Static` words.
 #[allow(clippy::too_many_arguments)]
-pub fn make_template_entry_with_targets<'a, F, V>(
+pub fn make_template_entry_with_targets<'a, 's, F, V, S>(
     value: &SeamData,
     kind: StaticItem,
     mut fn_target: F,
     mut vtable_target: V,
+    mut foreign_static: S,
     extra_declared: &[Declared<'_>],
     vtables: &[VtableDatum<'_>],
     alloc: Alloc<'a>,
@@ -166,6 +170,7 @@ pub fn make_template_entry_with_targets<'a, F, V>(
 where
     F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
     V: FnMut(VtableKey) -> Result<Option<Symbol>, SymbolError>,
+    S: FnMut(ItemKey) -> Option<(&'s str, bool)>,
 {
     if !kind.thread_local {
         return Err(StaticRecordError::NotThreadLocal);
@@ -173,18 +178,19 @@ where
     if let Some(n) = value.allocs.iter().skip(1).position(|a| a.mutable) {
         return Err(StaticRecordError::SharedMutable { alloc: n as u32 + 1 });
     }
-    datum_entry(value, Place::ReadOnly, true, &mut fn_target, &mut vtable_target, extra_declared, vtables, alloc)
+    datum_entry(value, Place::ReadOnly, true, &mut fn_target, &mut vtable_target, &mut foreign_static, extra_declared, vtables, alloc)
 }
 
 /// The entry of `value` as a datum at `place`; `template`: a word naming allocation 0 is refused
 /// ([`StaticRecordError::SelfPointer`]).
 #[allow(clippy::too_many_arguments)]
-fn datum_entry<'a, F, V>(
+fn datum_entry<'a, 's, F, V, S>(
     value: &SeamData,
     place: Place,
     template: bool,
     fn_target: &mut F,
     vtable_target: &mut V,
+    foreign_static: &mut S,
     extra_declared: &[Declared<'_>],
     vtables: &[VtableDatum<'_>],
     alloc: Alloc<'a>,
@@ -192,6 +198,7 @@ fn datum_entry<'a, F, V>(
 where
     F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
     V: FnMut(VtableKey) -> Result<Option<Symbol>, SymbolError>,
+    S: FnMut(ItemKey) -> Option<(&'s str, bool)>,
 {
     let first = value.allocs.first().ok_or(StaticRecordError::Empty)?;
     // Each allocation's offset in the datum, in order, each at its own alignment.
@@ -241,8 +248,13 @@ where
                     (OWN_DATUM, addend.checked_add(start as i64).ok_or(refused)?)
                 }
                 DataTarget::Static(k) => {
-                    statics.push(k);
-                    (d.target(Target { space: Space::Static, symbol: static_symbol(k) }), addend)
+                    if let Some((cname, weak)) = foreign_static(k) {
+                        let target = if weak { d.weak_outside(cname) } else { d.outside(cname) };
+                        (target, addend)
+                    } else {
+                        statics.push(k);
+                        (d.target(Target { space: Space::Static, symbol: static_symbol(k) }), addend)
+                    }
                 }
                 DataTarget::Fn(key) => {
                     let (tabled, name) = fn_target(key)
@@ -536,9 +548,9 @@ mod tests {
                 Ok(Some((item, name)))
             };
             let made = if thread_local {
-                make_template_entry_with_targets(&value, kind, target, |_| Ok(None), &[], &[], alloc)
+                make_template_entry_with_targets(&value, kind, target, |_| Ok(None), |_| None, &[], &[], alloc)
             } else {
-                make_static_entry_with_targets(&value, kind, target, |_| Ok(None), &[], &[], alloc)
+                make_static_entry_with_targets(&value, kind, target, |_| Ok(None), |_| None, &[], &[], alloc)
             }.expect("a fn word has a place in both kinds of datum");
             let view = StaticEntryView::read(&made).expect("the entry reads");
             assert_eq!(view.datum.place(), Place::ReadOnly);
@@ -577,7 +589,7 @@ mod tests {
         fn_name[..16].copy_from_slice(&item.0.to_le_bytes());
         let extra = [super::Declared { tabled: item, name: &fn_name }];
 
-        let made = make_static_entry_with_targets(&value, kind, |_| Ok(None), |asked| Ok((asked == vkey).then_some(vsym)), &extra, &carried, alloc)
+        let made = make_static_entry_with_targets(&value, kind, |_| Ok(None), |asked| Ok((asked == vkey).then_some(vsym)), |_| None, &extra, &carried, alloc)
             .expect("a vtable word builds into a static entry");
         let view = StaticEntryView::read(&made).expect("static entry reads");
         assert_eq!(view.datum.target(0), Target { space: Space::Vtable, symbol: vsym });
@@ -645,5 +657,62 @@ mod tests {
         assert!(second_is_cdef(&fill(3)), "the second string starts three bytes into its static");
         assert!(!second_is_cdef(&fill(4)), "a one-byte displacement must change the string");
         std::println!("nested slices: local +1 and external +3 preserved; external +4 caught");
+    }
+
+    #[test]
+    fn foreign_weak_and_strong_statics_in_datum_and_instance_names() {
+        use blaze_code::record::Symbol;
+        use blaze_emit::{Named, Names, Outside};
+        use crate::code_records::{ForeignStatic, InstanceNames};
+
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+
+        let weak_key = ItemKey(101);
+        let strong_key = ItemKey(102);
+        let rust_key = ItemKey(103);
+
+        // 1. `InstanceNames::name` maps weak foreign statics to `Named::WeakC`, strong to `Named::C`.
+        let statics = [weak_key, strong_key, rust_key];
+        let c_statics = [
+            ForeignStatic { item: weak_key, name: "weak_ext", weak: true },
+            ForeignStatic { item: strong_key, name: "strong_ext", weak: false },
+        ];
+        let names = InstanceNames { funcs: &[], statics: &statics, c_statics: &c_statics, vtables: &[], tls: &[] };
+        assert_eq!(names.name(Outside::Static(0)), Some(Named::WeakC("weak_ext")));
+        assert_eq!(names.name(Outside::Static(1)), Some(Named::C("strong_ext")));
+        assert_eq!(names.name(Outside::Static(2)), Some(Named::Symbol(crate::symbols::static_symbol(rust_key))));
+
+        // 2. `make_static_entry_with_targets` lowers foreign statics into `Space::WeakOutside` /
+        //    `Space::Outside` and omits them from the declared Rust statics list.
+        let value = DataRecord {
+            allocs: vec![DataAlloc {
+                align: 3,
+                mutable: false,
+                bytes: vec![0u8; 16],
+                relocs: vec![
+                    DataReloc { offset: 0, target: DataTarget::Static(weak_key) },
+                    DataReloc { offset: 8, target: DataTarget::Static(strong_key) },
+                ],
+            }],
+        };
+        let kind = StaticItem { thread_local: false, mutable: false, extern_weak: false };
+        let foreign = |k| match k {
+            k if k == weak_key => Some(("weak_ext", true)),
+            k if k == strong_key => Some(("strong_ext", false)),
+            _ => None,
+        };
+        let entry = make_static_entry_with_targets(&value, kind, |_| Ok(None), |_| Ok(None), foreign, &[], &[], alloc)
+            .expect("foreign static pointers in static initializer");
+        let view = StaticEntryView::read(&entry).expect("entry reads");
+        assert_eq!(view.datum.targets(), 2);
+        assert_eq!(view.datum.target(0), Target { space: Space::Outside, symbol: Symbol::of_name("strong_ext") });
+        assert_eq!(view.datum.target(1), Target { space: Space::WeakOutside, symbol: Symbol::of_name("weak_ext") });
+        assert_eq!(view.datum.name(Symbol::of_name("weak_ext")), Some("weak_ext"));
+        assert_eq!(view.datum.name(Symbol::of_name("strong_ext")), Some("strong_ext"));
+        let mut declared_statics = std::vec::Vec::new();
+        view.each_static(|k| declared_statics.push(k));
+        assert!(declared_statics.is_empty(), "foreign statics have no datum to declare");
     }
 }

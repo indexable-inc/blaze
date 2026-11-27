@@ -86,6 +86,12 @@ fn row<'n>(
         return Err(Front2Refusal::NoHead { function: function() });
     };
     let symbols = symbols_of(names, head.lib, crate::front2::links::values_key(names, store, head.lib), head.text, path)?;
+    if symbols.extern_weak {
+        return Err(Front2Refusal::Attrs {
+            function: function(),
+            why: "`#[linkage = \"extern_weak\"]` is only supported on foreign statics".into(),
+        });
+    }
     let (at, foreign) = super::head_abi::placed_fn(names, store, key, head.lib).map_err(|_| Front2Refusal::Unplaced { function: function() })?;
     // A fn an `extern` block in a BODY declares is foreign as a module-level one is: the
     // names library places no local item, so its block's ABI and its declared name are the

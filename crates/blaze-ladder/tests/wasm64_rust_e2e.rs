@@ -439,3 +439,338 @@ fn static_fn_pointer_relocation_and_determinism() {
     // 3 built-in globals ($__stack_pointer, $__heap_base, blaze_ring_abi_version) + dispatch_addr
     assert!(checked.global_count >= 4, "expected exported dispatch_addr global, got {}", checked.global_count);
 }
+
+const EXTERN_WEAK_MISSING_PROGRAM: &str = r#"
+#![no_core]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for i32 {}
+impl Copy for u8 {}
+impl Copy for usize {}
+impl<T> Copy for *const T {}
+
+unsafe extern "C" {
+    #[linkage = "extern_weak"]
+    static MISSING_WEAK_SYM: u8;
+}
+
+static WEAK_HOLDER: *const u8 = unsafe { &MISSING_WEAK_SYM as *const u8 };
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    let direct = unsafe { &MISSING_WEAK_SYM as *const u8 as usize };
+    let via_static = WEAK_HOLDER as usize;
+    if direct == 0 && via_static == 0 { 0 } else { 1 }
+}
+"#;
+
+const EXTERN_STRONG_MISSING_PROGRAM: &str = r#"
+#![no_core]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for i32 {}
+impl Copy for u8 {}
+impl Copy for usize {}
+impl<T> Copy for *const T {}
+
+unsafe extern "C" {
+    static MISSING_STRONG_SYM: u8;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    unsafe { &MISSING_STRONG_SYM as *const u8 as usize as i32 }
+}
+"#;
+
+#[test]
+fn extern_weak_missing_static_resolves_to_zero_while_strong_fails() {
+    let b = builder();
+
+    // Missing `#[linkage = "extern_weak"]` static (both direct and via static datum) compiles
+    // cleanly to a valid Wasm64 module with null address 0.
+    let weak_f = fixture(EXTERN_WEAK_MISSING_PROGRAM);
+    let weak_entry = item_named(&weak_f, ItemKind::Function, "main");
+    let mut weak_store = MemoryStore::new_in(alloc());
+    let mut weak_walk_maker = Maker::new(reader(&weak_f), Some(weak_entry), &b, alloc());
+    let (weak_walk, _) = walk_records(
+        weak_entry,
+        &EveryItem,
+        &mut weak_store,
+        &b,
+        &producer(),
+        &mut weak_walk_maker,
+        alloc(),
+    )
+    .unwrap_or_else(|e| panic!("walk_records failed for extern_weak: {e}"));
+    let weak_main_sym = weak_walk.symbol(0);
+    let weak_opts = Wasm64BuildOpts {
+        module_name: "extern_weak_missing",
+        start_symbol: Some(weak_main_sym),
+        exports: &[(weak_main_sym, "main")],
+        export_globals: &[],
+        include_blaze_host_v1: false,
+        opts: Wasm64Opts::DEFAULT,
+    };
+    let mut weak_maker = Maker::<TestGrant, SecondCheck>::of_start(
+        reader(&weak_f),
+        Some(weak_entry),
+        MakerStart::ByRule,
+        SecondCheck,
+        &b,
+        None,
+        alloc(),
+    );
+    let mut wasm: AVec<'static, u8> = OwnVec::new_in(alloc());
+    let built = compile_walk_to_wasm64(
+        &weak_walk,
+        |_| Some(TestGrant),
+        &mut weak_maker,
+        &weak_opts,
+        default_wasm64_import,
+        &mut wasm,
+        alloc(),
+    )
+    .unwrap_or_else(|e| panic!("compile_walk_to_wasm64 failed for missing extern_weak: {e}"));
+    assert_eq!(built.import_count, 0);
+    let checked = check_wasm64(wasm.as_slice())
+        .unwrap_or_else(|e| panic!("check_wasm64 rejected extern_weak module: {e}"));
+    assert!(checked.memory64);
+    assert_eq!(checked.import_count, 0);
+    assert_eq!(checked.elem_count, 0, "absent weak static must resolve to null, not intern a table entry");
+
+    // Control: missing strong `extern "C"` static still fails with UnresolvedImport.
+    let strong_f = fixture(EXTERN_STRONG_MISSING_PROGRAM);
+    let strong_entry = item_named(&strong_f, ItemKind::Function, "main");
+    let mut strong_store = MemoryStore::new_in(alloc());
+    let mut strong_walk_maker = Maker::new(reader(&strong_f), Some(strong_entry), &b, alloc());
+    let (strong_walk, _) = walk_records(
+        strong_entry,
+        &EveryItem,
+        &mut strong_store,
+        &b,
+        &producer(),
+        &mut strong_walk_maker,
+        alloc(),
+    )
+    .unwrap_or_else(|e| panic!("walk_records failed for extern strong: {e}"));
+    let strong_main_sym = strong_walk.symbol(0);
+    let strong_opts = Wasm64BuildOpts {
+        module_name: "extern_strong_missing",
+        start_symbol: Some(strong_main_sym),
+        exports: &[(strong_main_sym, "main")],
+        export_globals: &[],
+        include_blaze_host_v1: false,
+        opts: Wasm64Opts::DEFAULT,
+    };
+    let mut strong_maker = Maker::<TestGrant, SecondCheck>::of_start(
+        reader(&strong_f),
+        Some(strong_entry),
+        MakerStart::ByRule,
+        SecondCheck,
+        &b,
+        None,
+        alloc(),
+    );
+    let mut strong_wasm: AVec<'static, u8> = OwnVec::new_in(alloc());
+    let err = compile_walk_to_wasm64(
+        &strong_walk,
+        |_| Some(TestGrant),
+        &mut strong_maker,
+        &strong_opts,
+        default_wasm64_import,
+        &mut strong_wasm,
+        alloc(),
+    )
+    .expect_err("missing strong extern static must fail in wasm64");
+    assert!(
+        err.to_string().contains("MISSING_STRONG_SYM"),
+        "expected unresolved error naming MISSING_STRONG_SYM, got: {err}",
+    );
+}
+
+const EXTERN_WEAK_PRESENT_FN_PROGRAM: &str = r#"
+#![no_core]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for i32 {}
+impl Copy for u8 {}
+impl Copy for usize {}
+impl<T> Copy for *const T {}
+
+mod defs {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn present_hook() -> i32 {
+        7
+    }
+
+    #[unsafe(export_name = "aliased_hook")]
+    pub extern "C" fn internal_hook() -> i32 {
+        9
+    }
+}
+
+unsafe extern "C" {
+    #[linkage = "extern_weak"]
+    static present_hook: u8;
+
+    #[linkage = "extern_weak"]
+    static aliased_hook: u8;
+
+    #[linkage = "extern_weak"]
+    static absent_hook: u8;
+}
+
+static PRESENT_HOLDER: *const u8 = unsafe { &present_hook as *const u8 };
+static ALIASED_HOLDER: *const u8 = unsafe { &aliased_hook as *const u8 };
+static ABSENT_HOLDER: *const u8 = unsafe { &absent_hook as *const u8 };
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    let direct_present = unsafe { &present_hook as *const u8 as usize };
+    let direct_aliased = unsafe { &aliased_hook as *const u8 as usize };
+    let direct_absent = unsafe { &absent_hook as *const u8 as usize };
+    let static_present = PRESENT_HOLDER as usize;
+    let static_aliased = ALIASED_HOLDER as usize;
+    let static_absent = ABSENT_HOLDER as usize;
+    if direct_present != 0
+        && direct_present == static_present
+        && direct_aliased != 0
+        && direct_aliased == static_aliased
+        && direct_present != direct_aliased
+        && direct_absent == 0
+        && static_absent == 0
+    {
+        0
+    } else {
+        1
+    }
+}
+"#;
+
+const EXTERN_WEAK_FOREIGN_FN_PROGRAM: &str = r#"
+#![no_core]
+
+#[lang = "sized"]
+trait Sized {}
+
+#[lang = "copy"]
+trait Copy {}
+
+impl Copy for i32 {}
+
+unsafe extern "C" {
+    #[linkage = "extern_weak"]
+    fn forbidden_weak_fn() -> i32;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C-unwind" fn main() -> i32 {
+    unsafe { forbidden_weak_fn() }
+}
+"#;
+
+#[test]
+fn extern_weak_static_resolves_present_rust_fn_export_and_refuses_weak_foreign_fn() {
+    let b = builder();
+
+    // 1. Present Rust `#[no_mangle]` and `#[export_name]` functions referenced via `extern_weak`
+    //    statics (both directly in code and via static datums) resolve to non-null indirect table
+    //    slots, while an absent weak static resolves to null (0).
+    let f = fixture(EXTERN_WEAK_PRESENT_FN_PROGRAM);
+    let entry = item_named(&f, ItemKind::Function, "main");
+    let mut store = MemoryStore::new_in(alloc());
+    let mut walk_maker = Maker::new(reader(&f), Some(entry), &b, alloc());
+    let (walk, _) = walk_records(
+        entry,
+        &EveryItem,
+        &mut store,
+        &b,
+        &producer(),
+        &mut walk_maker,
+        alloc(),
+    )
+    .unwrap_or_else(|e| panic!("walk_records failed for present extern_weak fn: {e}"));
+    let main_sym = walk.symbol(0);
+    let opts = Wasm64BuildOpts {
+        module_name: "extern_weak_present_fn",
+        start_symbol: Some(main_sym),
+        exports: &[(main_sym, "main")],
+        export_globals: &[],
+        include_blaze_host_v1: false,
+        opts: Wasm64Opts::DEFAULT,
+    };
+    let mut wasm_maker = Maker::<TestGrant, SecondCheck>::of_start(
+        reader(&f),
+        Some(entry),
+        MakerStart::ByRule,
+        SecondCheck,
+        &b,
+        None,
+        alloc(),
+    );
+    let mut wasm: AVec<'static, u8> = OwnVec::new_in(alloc());
+    let built = compile_walk_to_wasm64(
+        &walk,
+        |_| Some(TestGrant),
+        &mut wasm_maker,
+        &opts,
+        default_wasm64_import,
+        &mut wasm,
+        alloc(),
+    )
+    .unwrap_or_else(|e| panic!("compile_walk_to_wasm64 failed for present extern_weak fn: {e}"));
+    assert_eq!(built.import_count, 0);
+    assert!(
+        built.func_count >= 4,
+        "expected main, _start, present_hook, and internal_hook, got {}",
+        built.func_count,
+    );
+    let checked = check_wasm64(wasm.as_slice())
+        .unwrap_or_else(|e| panic!("check_wasm64 rejected extern_weak present fn module: {e}"));
+    assert!(checked.memory64);
+    assert_eq!(checked.import_count, 0);
+    assert!(
+        checked.table_size >= 3 && checked.elem_count >= 1,
+        "both present_hook and aliased_hook must intern non-null indirect table slots (got table_size={}, elem_count={})",
+        checked.table_size,
+        checked.elem_count,
+    );
+
+    // 2. `#[linkage = "extern_weak"]` on a foreign function (rather than a foreign static) must
+    //    be refused instead of silently degrading to a strong `Callee::C` import.
+    let bad_f = fixture(EXTERN_WEAK_FOREIGN_FN_PROGRAM);
+    let bad_entry = item_named(&bad_f, ItemKind::Function, "main");
+    let mut bad_store = MemoryStore::new_in(alloc());
+    let mut bad_maker = Maker::new(reader(&bad_f), Some(bad_entry), &b, alloc());
+    let err = walk_records(
+        bad_entry,
+        &EveryItem,
+        &mut bad_store,
+        &b,
+        &producer(),
+        &mut bad_maker,
+        alloc(),
+    )
+    .err()
+    .expect("`#[linkage = \"extern_weak\"]` on a foreign fn must be refused");
+    assert!(
+        err.to_string().contains("extern_weak"),
+        "expected refusal mentioning extern_weak, got: {err}",
+    );
+}

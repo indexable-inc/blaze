@@ -3524,10 +3524,11 @@ fn build_from<P: FrontEnd>(
             // The soft-float routines after the instance's own references, as run/make_one.rs
             // binds them: `make_entry` declares those the emitter says the record calls.
             let routines = bound.bind(&mut funcs).map_err(fail)?;
-            let mut c_statics: Vec<(ItemKey, &str), Global> = Vec::new_in(Global);
+            let mut c_statics: blaze_own::Vec<crate::code_records::ForeignStatic<'_>, _> = blaze_own::Vec::new_in(alloc);
             for &s in built.statics.iter() {
                 if let Some(c) = program.foreign_static(s) {
-                    c_statics.push((s, c));
+                    let weak = program.static_item(s).is_some_and(|st| st.extern_weak);
+                    c_statics.push(crate::code_records::ForeignStatic { item: s, name: c, weak });
                 }
             }
             let names = InstanceNames { funcs: &funcs, statics: &built.statics, c_statics: &c_statics, vtables: &vtables, tls: &built.thread_locals };

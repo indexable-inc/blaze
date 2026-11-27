@@ -275,8 +275,9 @@ pub fn write_native<'a>(
             return Err(ExportError::TooLarge { what: "a program import index", len: u64::from(idx) });
         };
         // `Elf64_Sym`: st_name, st_info, st_other, st_shndx (SHN_UNDEF), st_value, st_size.
+        let info = if import.weak { (STB_WEAK << 4) | STT_NOTYPE } else { GLOBAL_FUNC };
         bytes::u32(&mut meta, u32_of(dynstr.len(), "DT_STRTAB offset")?);
-        bytes::u8(&mut meta, GLOBAL_FUNC);
+        bytes::u8(&mut meta, info);
         bytes::u8(&mut meta, 0);
         bytes::u16(&mut meta, 0);
         bytes::u64(&mut meta, 0);
