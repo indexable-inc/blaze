@@ -745,6 +745,22 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// As `Front2Program::const_at`: the evaluator the program keeps checks any body and makes
     /// any impl row the value needs.
     fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy], build: crate::front2::const_at::BuildFacts<'_>) -> Result<DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
+        // Locate cold constants or cold const-block/promoted owners before evaluating so
+        // `self.front.keys` holds their `Origin` even when the caller was read from a cached
+        // typed record.
+        let _ = self.locate(need.item());
+        if let crate::front2::const_at::ConstNeed::Block { .. } | crate::front2::const_at::ConstNeed::Promoted { .. } = need {
+            let owner = need.item();
+            if !self.store.fns.contains_key(&owner) && !self.store.fn_gaps.contains_key(&owner) {
+                if let Some(want) = crate::front2::heads::member_head_want(self.front.names, &self.front.keys, owner) {
+                    let _ = self.store.ensure(self.front.names, &mut self.front.keys, want);
+                } else if self.front.keys.library_in(self.front.names, owner).is_some()
+                    && let Ok(want) = crate::front2::fill::want_of_key(self.front.names, &self.front.keys, owner)
+                {
+                    let _ = self.store.ensure(self.front.names, &mut self.front.keys, want);
+                }
+            }
+        }
         let prepared = self.prepared;
         let alloc = self.store.tys.alloc();
         let mut records = Records {
