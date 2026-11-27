@@ -498,6 +498,7 @@ impl<'n> NamesSource<'n> for DecodeLangSource<'n> {
     fn expansion_text(self, _krate: usize, _call: ItemKey) -> Option<&'n str> { None }
     fn text_marks(self, _krate: usize, _call: ItemKey) -> Result<Option<blaze_scope::crate_roots::TextMarks<'n>>, super::super::item_site::MarksLost> { Ok(None) }
     fn extern_abi(self, _key: ItemKey) -> Option<Option<&'n str>> { None }
+    fn is_wasm_import(self, _key: ItemKey) -> Option<bool> { None }
     fn attr_value(self, _key: ItemKey, _attr: &'static str) -> Option<Option<blaze_scope::attr_values::RowValue<'n>>> { None }
     fn in_sans_io_scope(self, _key: ItemKey, _module: ItemKey) -> bool { false }
     fn kind_of_item(self, _key: ItemKey) -> Option<ItemKind> { None }

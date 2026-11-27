@@ -755,3 +755,40 @@ fn exports_cell_is_absent_without_exports_and_moves_only_on_exported_fns() {
     let d2 = lookup(WITH_EXPORT_NAME);
     assert!(d2.is_some() && d2 != d1, "changing exported fn to #[export_name] must move Exports cell");
 }
+
+#[test]
+fn wasm_import_module_flag_is_recorded_and_moves_item_cell() {
+    const PLAIN: &str = "#![no_core]\nunsafe extern \"C\" { fn unlink(p: *const u8) -> i32; }\n";
+    const WASM_IMP: &str = "#![no_core]\n#[link(wasm_import_module = \"blaze_seed\")]\nunsafe extern \"C\" { fn unlink(p: *const u8) -> i32; }\n";
+    static T_PLAIN: Texts = Texts(&[&[("/k0/lib.rs", PLAIN)]]);
+    static T_WASM: Texts = Texts(&[&[("/k0/lib.rs", WASM_IMP)]]);
+
+    let g = super::SyncFrame::leaked();
+    let (names_plain, items_plain) = foreign_side(&T_PLAIN);
+    let (names_wasm, items_wasm) = foreign_side(&T_WASM);
+    let rec_plain = super::items_record::one_file(items_plain, PLAIN, g);
+    let rec_wasm = super::items_record::one_file(items_wasm, WASM_IMP, g);
+    let find_unlink = |rec: &ItemsRecord<'static>| {
+        (0..rec.items())
+            .filter_map(|i| rec.item_at(i).ok().flatten())
+            .find(|r| r.name == Some("unlink"))
+            .expect("unlink row")
+    };
+    let row_plain = find_unlink(&rec_plain);
+    let row_wasm = find_unlink(&rec_wasm);
+    assert!(!row_plain.wasm_import, "plain extern must have wasm_import = false");
+    assert!(row_wasm.wasm_import, "#[link(wasm_import_module = ...)] extern must have wasm_import = true");
+
+    let digest = |names: &'static [u8], items_bytes: &'static [u8], text: &'static str, key: ItemKey| -> Option<ContentId> {
+        let items = super::items_record::one_file(items_bytes, text, g);
+        let record = NamesRecord::open(Verified::check(names).expect("names"));
+        let read = move |of: TextOf<'_>| -> Option<&'static str> { matches!(of, TextOf::File { index: 0, .. }).then_some(text) };
+        let wholes = [(Section::Items, items_bytes)];
+        seen_by_record(&record, Some((&items, &read)), &wholes, NameCell::Item { key }).expect("item cell")
+    };
+    assert_ne!(
+        digest(names_plain, items_plain, PLAIN, row_plain.key),
+        digest(names_wasm, items_wasm, WASM_IMP, row_wasm.key),
+        "toggling #[link(wasm_import_module = ...)] must move the item's Item cell"
+    );
+}

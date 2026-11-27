@@ -309,6 +309,11 @@ pub trait NamesSource<'n>: Copy {
     /// records such a key is `None` with a gap naming it in the log.
     fn extern_abi(self, key: ItemKey) -> Option<Option<&'n str>>;
 
+    /// Question 10c2: whether foreign item `key` is declared inside an `extern` block carrying
+    /// `#[link(wasm_import_module = ...)]` (a WebAssembly host import, never a same-program Rust
+    /// export). Covered by `NameCell::Item`.
+    fn is_wasm_import(self, key: ItemKey) -> Option<bool>;
+
     /// Question 10d: the value of `attr` (`link_name` or `export_name`) on item `key` when it is
     /// written as a macro call (ring's `#[link_name = concat!(prefix!(), stringify!(f))]`), as
     /// the item's crate's solve expanded it once at the item (blaze-scope attr_values.rs): over
@@ -714,6 +719,14 @@ impl<'n> NamesSource<'n> for &'n Names<'n> {
         // The one reading of a block's ABI, the items record writer's (`foreign_abi`): an ABI
         // it cannot read is not answered (`None`), as over records the record is not written.
         blaze_scope::items_record::foreign_abi(krate, at, item, key).ok()
+    }
+
+    fn is_wasm_import(self, key: ItemKey) -> Option<bool> {
+        let Some(Place { krate, at, item }) = self.place(key) else { return Some(false) };
+        let krate = *self.crates().get(krate)?;
+        blaze_scope::items_record::foreign_block(krate, at, item, key)
+            .ok()
+            .map(|found| found.is_some_and(|(_, wasm)| wasm))
     }
 
     fn attr_value(self, key: ItemKey, attr: &'static str) -> Option<Option<RowValue<'n>>> {
@@ -2195,6 +2208,12 @@ impl<'n> NamesSource<'n> for &'n Records<'n> {
             ItemKind::Function | ItemKind::Static => self.block_abi(key),
             _ => Some(None),
         }
+    }
+
+    fn is_wasm_import(self, key: ItemKey) -> Option<bool> {
+        let krate = self.items.crate_of(key)?;
+        let record = self.items_of(krate)?;
+        Some(self.read(krate, record.identity(key))?.is_some_and(|row| row.wasm_import))
     }
 
     /// The crate's items record's value table (blaze-scope items_record/values.rs): one binary
