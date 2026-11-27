@@ -426,20 +426,16 @@ fn span_in(base: &str, part: &str) -> Option<(u32, u32)> {
     Some((u32::try_from(start).ok()?, u32::try_from(part.len()).ok()?))
 }
 
-/// The ABI of the `extern` block that declares `entry` of `outline` (the outline of `text`, a
-/// file's or a macro call's expansion's): the block's string unquoted as written, `"C"` for a
-/// bare `extern` (the Reference, [items.extern.abi.default]); `None` when no block declares it
-/// (its parent is no `extern` block, or it has none). The fact of the item the names task
-/// writes into its row ([`ItemRow::foreign`]), so no reader outlines a text again to ask it.
+/// The ABI of the `extern` block that directly encloses `entry` in `outline` (the outline of
+/// `text`, a file's or a macro call's expansion's): the block's string unquoted as written,
+/// `"C"` for a bare `extern` (the Reference, [items.extern.abi.default]); `None` when `entry`'s
+/// direct parent in `outline` is no `extern` block (or it has none).
 ///
 /// The outline's ABI range is the block's `Abi` node, `extern "abi"` (blaze-file-items
 /// walk/rows.rs `(EXTERN_BLOCK, ABI)`), relative to the block's start (rule 71). A range outside
 /// the text is [`ItemsRecordError::Range`]; a written ABI that is not one quoted string (a raw
 /// string, an escape) is [`ItemsRecordError::ForeignAbi`], never read as "C" (rule 3).
-///
-/// The one home of the reading (rule 30): the solved names' `extern_abi` (blaze-ladder
-/// front2/source.rs) calls it on the same outline, so the two sources answer alike.
-pub fn foreign_abi<'t>(text: &'t str, outline: &blaze_file_items::Outline<'_>, entry: &blaze_surface::Item, item: ItemKey, krate: CrateItemKey) -> Result<Option<&'t str>, ItemsRecordError> {
+fn foreign_abi_in_outline<'t>(text: &'t str, outline: &blaze_file_items::Outline<'_>, entry: &blaze_surface::Item, item: ItemKey, krate: CrateItemKey) -> Result<Option<&'t str>, ItemsRecordError> {
     let Some(parent) = entry.parent else { return Ok(None) };
     let block = outline.item(parent);
     let ItemDetail::ExternBlock { abi } = block.detail else { return Ok(None) };
@@ -455,6 +451,49 @@ pub fn foreign_abi<'t>(text: &'t str, outline: &blaze_file_items::Outline<'_>, e
         Some(abi) if !abi.contains(['"', '\\']) => Ok(Some(abi)),
         _ => Err(ItemsRecordError::ForeignAbi { item }),
     }
+}
+
+/// The ABI of the `extern` block that declares `item` (at `at`, outline entry `idx`) in `names`:
+/// the block's string unquoted as written, `"C"` for a bare `extern` (the Reference,
+/// [items.extern.abi.default]); `None` when no `extern` block declares it. The fact of the item
+/// the names task writes into its row ([`ItemRow::foreign`]), so no reader outlines a text again
+/// to ask it.
+///
+/// Checks `entry`'s direct parent in its own outline first, then — when `entry` is a top-level
+/// item of a macro expansion (`entry.parent.is_none()`, `At::Expansion(call)`) — walks out
+/// through enclosing macro calls (`CallSrc::place`) so items emitted by function-like or
+/// attribute macros inside an `extern` block (e.g. `ring`'s `extern "C" { prefixed_item! { ... } }`,
+/// arbitrarily nested) inherit their enclosing block's ABI.
+///
+/// The one home of the reading (rule 30): the solved names' `extern_abi` (blaze-ladder
+/// front2/source.rs) calls it too, so in-memory `Names` and serialized `Records` answer alike.
+pub fn foreign_abi<'t>(names: &CrateNames<'t>, mut at: At, mut idx: ItemIndex, item: ItemKey) -> Result<Option<&'t str>, ItemsRecordError> {
+    // Bounded by expansion count + 1 so even a malformed cycle cannot loop forever (rule 18).
+    for _ in 0..=names.expansions.len() {
+        let (whole, outline) = names.outline_at(at).ok_or(ItemsRecordError::NoOutline { item })?;
+        let entry = usize::try_from(idx.0)
+            .ok()
+            .and_then(|i| outline.items().get(i))
+            .ok_or(ItemsRecordError::NoOutline { item })?;
+        if let Some(abi) = foreign_abi_in_outline(whole, outline, entry, item, names.key)? {
+            return Ok(Some(abi));
+        }
+        if entry.parent.is_some() {
+            return Ok(None);
+        }
+        let At::Expansion(call) = at else {
+            return Ok(None);
+        };
+        let Some(place) = names.tables.calls.get(&call).and_then(|src| src.place) else {
+            return Ok(None);
+        };
+        let Some(parent_at) = place.text else {
+            return Ok(None);
+        };
+        at = parent_at;
+        idx = place.item;
+    }
+    Ok(None)
 }
 
 fn body_holds_items(detail: ItemDetail) -> bool {
@@ -1038,12 +1077,7 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
     }
     for key in items.iter() {
         if let Some((it, at)) = tables.texts.get(key) {
-            let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
-            let entry = usize::try_from(it.item.0)
-                .ok()
-                .and_then(|idx| outline.items().get(idx))
-                .ok_or(ItemsRecordError::NoOutline { item: *key })?;
-            let foreign = foreign_abi(whole, outline, entry, *key, names.key)?;
+            let foreign = foreign_abi(names, *at, it.item, *key)?;
             if let Some(n) = it.name {
                 strings.plan(n)?;
             }
@@ -1259,12 +1293,12 @@ pub fn encode_with_opts<'n, 'b, H: buckets::HeadNames>(names: &'n CrateNames<'_>
             if matches!(at, At::Expansion(_)) {
                 expansion_items = expansion_items.saturating_add(1);
             }
-            let (whole, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
+            let (_, outline) = names.outline_at(*at).ok_or(ItemsRecordError::NoOutline { item: *key })?;
             let entry = outline.items().get(it.item.0 as usize).ok_or(ItemsRecordError::NoOutline { item: *key })?;
             let detail = entry.detail;
             // The block's ABI, a fact of the item, from the outline the solve made of its text
-            // (a file's, or an expansion's: the names task outlines each expansion once).
-            let foreign = foreign_abi(whole, outline, entry, *key, names.key)?;
+            // (and enclosing macro calls when expanded inside an `extern` block).
+            let foreign = foreign_abi(names, *at, it.item, *key)?;
             let (code, start, len) = place(Some(*at), it.text);
             if code < EXPANSION
                 && let Ok(file_idx) = usize::try_from(code)

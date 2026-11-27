@@ -154,6 +154,10 @@ fn naked_asm_with_params_and_sym_checks_builds_and_emits_bare_code() {
                 _ => None,
             }
         }
+
+        fn routines(&self) -> blaze_emit::RoutinePlaces {
+            blaze_emit::RoutinePlaces::NONE
+        }
     }
     let heap = blaze_own::testing::heap();
     let isa = Isa { lse: true, os: if cfg!(target_os = "macos") { Os::MacOs } else { Os::Linux } };

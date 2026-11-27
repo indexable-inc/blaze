@@ -154,12 +154,14 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// with its bindings stored and its number in the word, a chain that fails to the next
     /// one, the last to `next`. Returns the word, where the arm's blocks start in
     /// `arm_blocks` (block `j` there is where a guard that failed after expansion `j` goes
-    /// on) and how many expansions there are, for `guard_alts`.
-    pub(super) fn test_alts(&mut self, root: PatId, at: At, pass: blaze_lir::Block, next: blaze_lir::Block) -> Result<(SlotId, u32, u32), BuildError> {
+    /// on), how many expansions there are, and where each expansion's pending move range starts
+    /// in `moves.alt_ranges`, for `guard_alts` and `Task::ArmMoves`.
+    pub(super) fn test_alts(&mut self, root: PatId, at: At, pass: blaze_lir::Block, next: blaze_lir::Block) -> Result<(SlotId, u32, u32, u32), BuildError> {
         let live = self.live;
         let (size, align) = self.size_align(WORD);
         let word = self.b.slot(size, align, SlotKind::Temp);
         let chains = self.arm_blocks.len() as u32;
+        let ranges_start = self.alt_ranges_mark();
         let mut choice: Vec<Choice, A> = Vec::new_in(self.alloc);
         let mut n = 0u32;
         loop {
@@ -173,7 +175,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             let matched = self.create();
             let following = self.create();
             self.arm_blocks.push(following);
+            let m_start = self.pending_mark();
             self.test_pat_chosen(root, at, matched, following, Some(choice.as_slice()))?;
+            let m_end = self.pending_mark();
+            self.push_alt_range(m_start, m_end);
             self.begin(matched);
             self.live = live;
             let a = self.b.slot_addr(word);
@@ -186,7 +191,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             self.live = live;
             if !Self::advance(&mut choice) {
                 self.jump(next, &[]);
-                return Ok((word, chains, n));
+                return Ok((word, chains, n, ranges_start));
             }
         }
     }

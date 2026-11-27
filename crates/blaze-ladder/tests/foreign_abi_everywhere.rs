@@ -747,3 +747,72 @@ static IN_STATIC: i32 = {
     assert_eq!(status, 3, "the run's status");
     println!("foreign abi every position: {counts}; run status {status}");
 }
+
+/// Position 11: a macro invoked INSIDE an `extern` block (e.g. `ring`'s `prefixed_extern!` ->
+/// `extern "C" { prefixed_item! { fn ...; } }`, plus two-level nested macros inside
+/// `extern "system" { ... }`), including coercing the foreign fn item to an
+/// `unsafe extern "C" fn(...)` field in a `static` initializer (`ring`'s `COMMON_OPS`).
+#[test]
+fn macro_inside_extern_block_inherits_block_abi() {
+    let items = r#"
+macro_rules! prefixed_item {
+    ($item:item) => {
+        $item
+    };
+}
+
+macro_rules! prefixed_extern {
+    (fn $name:ident ( $( $arg:ident : $ty:ty ),* ) -> $ret:ty ;) => {
+        unsafe extern "C" {
+            prefixed_item! {
+                fn $name ( $( $arg : $ty ),* ) -> $ret;
+            }
+        }
+    };
+}
+
+macro_rules! inner_decl {
+    () => {
+        fn labs(x: i64) -> i64;
+        static optind: i32;
+    };
+}
+
+macro_rules! outer_decl {
+    () => {
+        inner_decl!();
+    };
+}
+
+prefixed_extern! {
+    fn abs(x: i32) -> i32;
+}
+
+unsafe extern "system" {
+    outer_decl!();
+}
+
+struct CommonOps {
+    op: unsafe extern "C" fn(i32) -> i32,
+}
+
+static COMMON_OPS: CommonOps = CommonOps { op: abs };
+"#;
+    let body = "let f = COMMON_OPS.op;
+    let r = unsafe { f(-3) };
+    if never() {
+        unsafe {
+            labs(0);
+            let _ = optind;
+        }
+    }";
+    let text = program(items, body, "r");
+    let f = fixture(&text);
+    assert_eq!(abi_of(&f, ItemKind::Function, "abs"), Some(Some("C")), "`abs` from macro inside `extern \"C\"`");
+    assert_eq!(abi_of(&f, ItemKind::Function, "labs"), Some(Some("system")), "`labs` from nested macro inside `extern \"system\"`");
+    assert_eq!(abi_of(&f, ItemKind::Static, "optind"), Some(Some("system")), "`optind` from nested macro inside `extern \"system\"`");
+    let counts = walk(&f, "macro inside extern block");
+    let status = run_whole(&text);
+    assert_eq!(status, 3, "the run's status");
+    println!("macro inside extern block: {counts}; run status {status}");
+}

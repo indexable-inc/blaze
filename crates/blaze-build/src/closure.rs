@@ -486,10 +486,54 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             fields.push(f);
         }
         if which != FnTrait::FnOnce && fields.iter().any(|f| f.how == CaptureKind::ByValue) {
-            return Err(BuildError::Unsupported {
-                expr: closure,
-                what: "an async move closure with by-value captures called by reference (CallRefFuture)",
-            });
+            // An `Fn` async move closure whose by-value captures are drop-free and `Freeze`
+            // (zero `UnsafeCell`, never mutated, never double-dropped — e.g. `wasmtime::new_epoch`'s
+            // `UpdateDeadline` enum) can soundly copy each capture from `&env` into the coroutine
+            // state when the closure environment and coroutine environment hold the same type.
+            let mut copyable_ref_call = parts.kind == FnTrait::Fn;
+            if copyable_ref_call {
+                let co_parts = self.coroutine_parts(output).map_err(err)?;
+                let PNode::Tuple(co_el) = self.ground_node(co_parts.env).map_err(err)? else {
+                    return Err(malformed("a coroutine environment that is not a tuple"));
+                };
+                let PNode::Tuple(cl_el) = self.ground_node(parts.env).map_err(err)? else {
+                    return Err(malformed("a closure environment that is not a tuple"));
+                };
+                let mut co_tys: Vec<PTy, A> = Vec::with_capacity_in(fields.len(), self.alloc);
+                let mut cl_tys: Vec<PTy, A> = Vec::with_capacity_in(fields.len(), self.alloc);
+                let view = self.ground.view();
+                let co_list = view.list(co_el).map_err(|_| malformed("a list past the ground table"))?;
+                let cl_list = view.list(cl_el).map_err(|_| malformed("a list past the ground table"))?;
+                if co_list.len() < fields.len() || cl_list.len() < fields.len() {
+                    copyable_ref_call = false;
+                } else {
+                    co_tys.extend_from_slice(&co_list[..fields.len()]);
+                    cl_tys.extend_from_slice(&cl_list[..fields.len()]);
+                    for j in 0..fields.len() {
+                        if fields[j].how != CaptureKind::ByValue {
+                            continue;
+                        }
+                        let ty = co_tys[j];
+                        if cl_tys[j] != ty || self.needs_drop(ty).map_err(err)? {
+                            copyable_ref_call = false;
+                            break;
+                        }
+                        let adts = self.adts;
+                        let mut cx = LayoutCx { ground: &mut *self.ground, facts: adts.facts(), scratch: self.scratch };
+                        let has_interior_mut = self.ls.interior_mut(ty, &mut cx).map_err(layout_err).map_err(err)?;
+                        if has_interior_mut {
+                            copyable_ref_call = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !copyable_ref_call {
+                return Err(BuildError::Unsupported {
+                    expr: closure,
+                    what: "an async move closure with by-value captures called by reference (CallRefFuture)",
+                });
+            }
         }
         let of = crate::coroutine_of(self.ground.view(), output).ok_or(malformed("an async closure whose output is not a coroutine"))?;
         let shape = self.state_shape(closure, of)?;

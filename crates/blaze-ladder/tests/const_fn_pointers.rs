@@ -692,6 +692,41 @@ pub extern \"C-unwind\" fn main() -> i32 {
     );
 }
 
+/// `core::task::RawWaker::NOOP` shape: a closure coerced to a fn pointer inside a local `const`
+/// inside an associated `const` of an `impl` (`impl RawWaker { const NOOP = { const VTABLE = ... }; }`).
+/// Before fixing `locate.rs::ensure_local_index`, the lazy walk only scanned `ItemKind::Function`
+/// (skipping `Const`/`Static` whose bodies hold items) and failed with `is no fn its records hold`.
+#[test]
+fn a_closure_inside_nested_const_of_assoc_const() {
+    row(
+        "closure inside nested const of assoc const",
+        "
+struct VTable {
+    step: fn(u8) -> u8,
+}
+
+struct Handle {
+    vtable: &'static VTable,
+}
+
+impl Handle {
+    const NOOP: Handle = {
+        const VTABLE: VTable = VTable {
+            step: |x: u8| x + 10,
+        };
+        Handle { vtable: &VTABLE }
+    };
+}
+
+#[unsafe(no_mangle)]
+pub extern \"C-unwind\" fn main() -> i32 {
+    (Handle::NOOP.vtable.step)(5) as i32
+}
+",
+        15,
+    );
+}
+
 /// A SECOND RUN over one store: a fresh process (reader, maker) walks again and makes NO
 /// record, every instance found by key, and the pointer still resolves: `main`'s record
 /// declares the instance the constant points to (run/make_one.rs `name_refs` over

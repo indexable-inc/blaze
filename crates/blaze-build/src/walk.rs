@@ -445,8 +445,8 @@ enum Task {
     /// guard goes on at the alternative after the one that matched, numbered in `word`.
     GuardAlts { word: SlotId, chains: u32, n: u32 },
     /// A guarded arm's guard passed: the moves its bindings held from `from` on are made
-    /// (walk/moves.rs `Pending`).
-    ArmMoves { from: u32 },
+    /// (walk/moves.rs `Pending`); with `alts`, per-expansion moves are dispatched by `alts.word`.
+    ArmMoves { from: u32, alts: Option<moves::AltMoves> },
     ArmEnd { m: u32 },
     MatchEnd,
     Call(ExprId),
@@ -4588,7 +4588,7 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
                 self.du_intersect_open_entries();
                 self.guard_alts(word, chains, n)?;
             }
-            Task::ArmMoves { from } => self.arm_moves(from)?,
+            Task::ArmMoves { from, alts } => self.arm_moves(from, alts)?,
             Task::ArmEnd { m } => {
                 let v = self.pop()?;
                 let st = self.matches[m as usize];
@@ -8170,11 +8170,11 @@ impl<'x, 'c, 't, A: Allocator + Copy> Walk<'x, 'c, 't, A> {
         if let Some(g) = arm.guard
             && self.cond_has_let(g)?
         {
-            return self.let_guard(g, arm.body, next, from);
+            return self.let_guard(g, arm.body, next, from, None);
         }
         self.work.push(Task::Eval(arm.body));
         if let Some(g) = arm.guard {
-            self.work.push(Task::ArmMoves { from });
+            self.work.push(Task::ArmMoves { from, alts: None });
             self.work.push(Task::Guard { m, i });
             self.work.push(Task::Eval(g));
         }

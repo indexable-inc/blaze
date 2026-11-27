@@ -46,6 +46,15 @@ pub enum StaticAt {
     Symbol(Box<str, Global>),
 }
 
+/// What a fn-pointer relocation word inside a placed static image points at.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum StaticFnPlace {
+    /// A compiled program function slot (its thunk address).
+    Slot(u32),
+    /// A foreign (`extern`) C symbol resolved in this process by name.
+    Symbol(Box<str, Global>),
+}
+
 /// One function to place: its code and, by literal place, what each word is filled with.
 pub struct Body {
     pub code: Code<Global>,
@@ -536,7 +545,7 @@ pub fn load_statics(image: &StaticImage<Global>) -> Result<u64, PlaceError> {
 fn write_statics(
     image: &StaticImage<Global>,
     base: u64,
-    fns: &[(InstanceKey, u32)],
+    fns: &[(InstanceKey, StaticFnPlace)],
     static_vtables: &[(VtableKey, u32)],
     vtables: &mut Vtables<'_>,
     place: Place,
@@ -545,16 +554,34 @@ fn write_statics(
     // this image, never freed, and no Rust reference to it is alive (the placed code has not
     // run: the commit comes after this); `fill` writes exactly `image.bytes.len()` of them.
     let out = unsafe { core::slice::from_raw_parts_mut(base as *mut u8, image.bytes.len()) };
+    let mut missing: Option<Box<str, Global>> = None;
     let fn_at = |key: InstanceKey| {
         let at = fns.binary_search_by_key(&key, |f| f.0).ok()?;
-        place.thunk(Slot(fns[at].1))
+        match &fns[at].1 {
+            StaticFnPlace::Slot(slot) => place.thunk(Slot(*slot)),
+            StaticFnPlace::Symbol(name) => match symbol(name) {
+                Some(addr) => Some(addr),
+                None => {
+                    if missing.is_none() {
+                        missing = Some(name.clone());
+                    }
+                    None
+                }
+            },
+        }
     };
     let vtable_at = |key: VtableKey| {
         let at = static_vtables.binary_search_by_key(&key, |v| v.0).ok()?;
         let &(_, slot) = static_vtables.get(at)?;
         vtables.address(slot, place).ok()
     };
-    image.fill(base, out, fn_at, vtable_at).map_err(PlaceError::Statics)
+    match image.fill(base, out, fn_at, vtable_at) {
+        Ok(()) => Ok(()),
+        Err(error) => Err(match missing {
+            Some(name) => PlaceError::NoSymbol { name },
+            None => PlaceError::Statics(error),
+        }),
+    }
 }
 
 
@@ -566,15 +593,15 @@ pub fn record_id(code: &Code<Global>) -> RecordId {
 
 /// Places `bodies`, body `n` in slot `n`, in one edit. `image` is the program's statics and the
 /// memory reserved for them ([`load_statics`]), written here once the slots are declared, each
-/// fn pointer in it the thunk of the slot `static_fns` gives its instance (sorted by key) and
-/// each vtable pointer the table `static_vtables` gives its key (sorted by key);
-/// `tls` is what thread-local words name. `said` is each stub's refusal in words, by stub
-/// number (crate::stub; empty for a program with none).
+/// fn pointer in it the thunk of the slot (or outside symbol address) `static_fns` gives its
+/// instance (sorted by key) and each vtable pointer the table `static_vtables` gives its key
+/// (sorted by key); `tls` is what thread-local words name. `said` is each stub's refusal in
+/// words, by stub number (crate::stub; empty for a program with none).
 pub fn place(
     bodies: &[Body],
     vtables: &[VtableImage],
     image: Option<(&StaticImage<Global>, u64)>,
-    static_fns: &[(InstanceKey, u32)],
+    static_fns: &[(InstanceKey, StaticFnPlace)],
     static_vtables: &[(VtableKey, u32)],
     tls: Option<Tls>,
     said: Box<[Box<str>]>,

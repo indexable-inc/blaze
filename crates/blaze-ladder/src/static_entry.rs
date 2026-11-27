@@ -107,6 +107,14 @@ impl fmt::Display for StaticRecordError {
 
 impl core::error::Error for StaticRecordError {}
 
+/// What a `DataTarget::Fn` word in a static or thread-local template points at.
+pub enum StaticFnTarget<'a, 's> {
+    /// A compiled Rust function instance (placed in `Space::Func` and declared for the walk).
+    Instance { tabled: ItemKey, name: AVec<'a, u8> },
+    /// A foreign (`extern`) C symbol (placed as an outside relocation; never built as a body).
+    Foreign { symbol: &'s str, weak: bool },
+}
+
 /// A static's entry from the evaluator's record of its initializer, `value`, and its kind (the
 /// module doc).
 pub fn make_static_entry<'a>(value: &SeamData, kind: StaticItem, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, StaticRecordError> {
@@ -128,7 +136,7 @@ pub fn make_static_entry_with_targets<'a, 's, F, V, S>(
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, StaticRecordError>
 where
-    F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
+    F: FnMut(InstanceKey) -> Result<Option<StaticFnTarget<'a, 's>>, SymbolError>,
     V: FnMut(VtableKey) -> Result<Option<Symbol>, SymbolError>,
     S: FnMut(ItemKey) -> Option<(&'s str, bool)>,
 {
@@ -168,7 +176,7 @@ pub fn make_template_entry_with_targets<'a, 's, F, V, S>(
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, StaticRecordError>
 where
-    F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
+    F: FnMut(InstanceKey) -> Result<Option<StaticFnTarget<'a, 's>>, SymbolError>,
     V: FnMut(VtableKey) -> Result<Option<Symbol>, SymbolError>,
     S: FnMut(ItemKey) -> Option<(&'s str, bool)>,
 {
@@ -196,7 +204,7 @@ fn datum_entry<'a, 's, F, V, S>(
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, StaticRecordError>
 where
-    F: FnMut(InstanceKey) -> Result<Option<(ItemKey, AVec<'a, u8>)>, SymbolError>,
+    F: FnMut(InstanceKey) -> Result<Option<StaticFnTarget<'a, 's>>, SymbolError>,
     V: FnMut(VtableKey) -> Result<Option<Symbol>, SymbolError>,
     S: FnMut(ItemKey) -> Option<(&'s str, bool)>,
 {
@@ -256,14 +264,20 @@ where
                         (d.target(Target { space: Space::Static, symbol: static_symbol(k) }), addend)
                     }
                 }
-                DataTarget::Fn(key) => {
-                    let (tabled, name) = fn_target(key)
-                        .map_err(|error| StaticRecordError::FnName { alloc: n as u32, at: reloc.offset, error })?
-                        .ok_or(StaticRecordError::Fn { alloc: n as u32, at: reloc.offset })?;
-                    let symbol = fn_symbol_of_name(&name);
-                    declared.push((tabled, name));
-                    (d.target(Target { space: Space::Func, symbol }), addend)
-                }
+                DataTarget::Fn(key) => match fn_target(key)
+                    .map_err(|error| StaticRecordError::FnName { alloc: n as u32, at: reloc.offset, error })?
+                    .ok_or(StaticRecordError::Fn { alloc: n as u32, at: reloc.offset })?
+                {
+                    StaticFnTarget::Instance { tabled, name } => {
+                        let symbol = fn_symbol_of_name(&name);
+                        declared.push((tabled, name));
+                        (d.target(Target { space: Space::Func, symbol }), addend)
+                    }
+                    StaticFnTarget::Foreign { symbol, weak } => {
+                        let target = if weak { d.weak_outside(symbol) } else { d.outside(symbol) };
+                        (target, addend)
+                    }
+                },
                 DataTarget::Vtable(key) => {
                     let alloc_idx = u32::try_from(n).unwrap_or(u32::MAX);
                     let symbol = vtable_target(key)
@@ -467,7 +481,7 @@ mod tests {
     use blaze_code::record::{Space, Target, Word};
     use blaze_typeck::ItemKey;
 
-    use super::{StaticEntryView, StaticRecordError, make_static_entry, make_static_entry_with_targets, make_template_entry, make_template_entry_with_targets};
+    use super::{StaticEntryView, StaticFnTarget, StaticRecordError, make_static_entry, make_static_entry_with_targets, make_template_entry, make_template_entry_with_targets};
 
     /// `#[thread_local] static V: (&str, u32) = ("hi", 7)`'s evaluated value: allocation 0 the
     /// value (a pointer word to allocation 1, its length, the u32), allocation 1 the bytes "hi";
@@ -545,7 +559,7 @@ mod tests {
                 assert_eq!(asked, key);
                 let mut name = blaze_own::Vec::new_in(alloc);
                 name.extend_from_slice(&expected);
-                Ok(Some((item, name)))
+                Ok(Some(StaticFnTarget::Instance { tabled: item, name }))
             };
             let made = if thread_local {
                 make_template_entry_with_targets(&value, kind, target, |_| Ok(None), |_| None, &[], &[], alloc)
@@ -565,6 +579,46 @@ mod tests {
             assert_eq!(declared, [(item, expected.as_slice())]);
         }
         std::println!("a static fn word names Space::Func and declares its instance name");
+    }
+
+    #[test]
+    fn a_foreign_fn_word_names_outside_and_omits_declared() {
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the test's frame");
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+        let key = blaze_build::InstanceKey(blaze_ids::ContentId([9; 32]));
+        let value = value(false, DataTarget::Fn(key));
+        for thread_local in [false, true] {
+            let kind = StaticItem { thread_local, mutable: false, extern_weak: false };
+            let target = |asked| {
+                assert_eq!(asked, key);
+                Ok(Some(StaticFnTarget::Foreign { symbol: "ring_core_0_17_14__p384_elem_mul_mont", weak: false }))
+            };
+            let made = if thread_local {
+                make_template_entry_with_targets(&value, kind, target, |_| Ok(None), |_| None, &[], &[], alloc)
+            } else {
+                make_static_entry_with_targets(&value, kind, target, |_| Ok(None), |_| None, &[], &[], alloc)
+            }
+            .expect("a foreign fn word has a place in both kinds of datum");
+            let view = StaticEntryView::read(&made).expect("the entry reads");
+            assert_eq!(view.datum.place(), Place::ReadOnly);
+            assert_eq!((view.datum.words(), view.datum.targets()), (1, 1));
+            assert_eq!(view.datum.word(0), Word { at: 0, target: 0, addend: 0 });
+            assert_eq!(
+                view.datum.target(0),
+                Target { space: Space::Outside, symbol: blaze_code::record::Symbol::of_name("ring_core_0_17_14__p384_elem_mul_mont") }
+            );
+            let mut declared = 0usize;
+            view.each_declared(
+                |_| {
+                    declared += 1;
+                    Ok::<(), ()>(())
+                },
+                |_| (),
+            )
+            .expect("the declared list reads");
+            assert_eq!(declared, 0, "foreign fn words must not be declared as internal Rust bodies");
+        }
     }
 
     #[test]
