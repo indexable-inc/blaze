@@ -728,7 +728,7 @@ pub fn encode_reftable<'a>(
         kind: ErrorKind::BudgetExceeded,
     })?;
     out.extend_from_slice(BGRF_MAGIC);
-    out.extend_from_slice(&1u32.to_le_bytes());
+    out.extend_from_slice(&2u32.to_le_bytes());
     out.extend_from_slice(&count.to_le_bytes());
 
     match head {
@@ -754,7 +754,14 @@ pub fn encode_reftable<'a>(
         }
     }
 
+    let mut offsets: AVec<'a, u32> = Vec::with_capacity_in(order.len(), alloc);
     for idx in order {
+        let entry_off = u32::try_from(out.len()).map_err(|_| GitError {
+            file: GitFile::RefTable,
+            at: out.len() as u64,
+            kind: ErrorKind::BudgetExceeded,
+        })?;
+        offsets.push(entry_off);
         let r = &refs[idx];
         let name_b = r.name.as_str().as_bytes();
         let name_len = u16::try_from(name_b.len()).map_err(|_| GitError {
@@ -782,34 +789,358 @@ pub fn encode_reftable<'a>(
         }
     }
 
+    // BGRF v2 trailing O(log R) binary-search offset table (`[u32; count]`) right before CRC-32.
+    for off in offsets {
+        out.extend_from_slice(&off.to_le_bytes());
+    }
+
     let crc = crc32(out);
     out.extend_from_slice(&crc.to_le_bytes());
     Ok(())
 }
 
-/// Decoded single-file `BGRF` v1 reftable.
+/// Zero-copy borrowed ref target read directly from an mmap'd `BGRF` reftable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BorrowedRefTarget<'b> {
+    Direct(Oid),
+    Symbolic(&'b str),
+}
+
+/// Zero-copy borrowed ref entry read directly from an mmap'd `BGRF` reftable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BorrowedRefEntry<'b> {
+    pub name: &'b str,
+    pub target: BorrowedRefTarget<'b>,
+    pub peeled: Option<Oid>,
+}
+
+/// Zero-copy view over a `BGRF` v1 or v2 binary reftable.
+///
+/// Opening is strictly O(1) (verifies the 20-byte header and offset-table bounds with zero heap
+/// allocation and zero full-file CRC scan); lookups on v2 are O(log R) binary searches directly
+/// over the mapped bytes!
+#[derive(Clone, Copy, Debug)]
+pub struct RefTableView<'b> {
+    bytes: &'b [u8],
+    version: u32,
+    count: u32,
+    head_kind: u8,
+    head_len: usize,
+    entries_start: usize,
+    entries_end: usize,
+    offsets_start: usize,
+}
+
+impl<'b> RefTableView<'b> {
+    /// Parses header and table bounds in O(1) without scanning all refs or allocating.
+    pub fn parse_fast(bytes: &'b [u8], max_refs: u32) -> Result<RefTableView<'b>, GitError> {
+        if bytes.len() < 24 || &bytes[0..4] != BGRF_MAGIC {
+            return Err(GitError { file: GitFile::RefTable, at: 0, kind: ErrorKind::Malformed });
+        }
+        let version = u32_le(bytes, 4);
+        if version != 1 && version != 2 {
+            return Err(GitError {
+                file: GitFile::RefTable,
+                at: 4,
+                kind: ErrorKind::UnsupportedVersion(version),
+            });
+        }
+        let count = u32_le(bytes, 8);
+        if count > max_refs {
+            return Err(GitError {
+                file: GitFile::RefTable,
+                at: 8,
+                kind: ErrorKind::TooManyEntries { count, most: max_refs },
+            });
+        }
+        let head_kind = bytes[12];
+        let head_len = u32_le(bytes, 16) as usize;
+        let body_end = bytes.len() - 4;
+        let entries_start = 20usize.checked_add(head_len).ok_or(GitError {
+            file: GitFile::RefTable,
+            at: 16,
+            kind: ErrorKind::Malformed,
+        })?;
+        let offset_table_bytes = if version == 2 {
+            (count as usize).checked_mul(4).ok_or(GitError {
+                file: GitFile::RefTable,
+                at: 8,
+                kind: ErrorKind::Malformed,
+            })?
+        } else {
+            0
+        };
+        if entries_start + offset_table_bytes > body_end {
+            return Err(GitError {
+                file: GitFile::RefTable,
+                at: 20,
+                kind: ErrorKind::Malformed,
+            });
+        }
+        let entries_end = body_end - offset_table_bytes;
+        let offsets_start = entries_end;
+        Ok(RefTableView {
+            bytes,
+            version,
+            count,
+            head_kind,
+            head_len,
+            entries_start,
+            entries_end,
+            offsets_start,
+        })
+    }
+
+    /// Number of refs stored in this table.
+    #[inline]
+    pub const fn len(&self) -> u32 {
+        self.count
+    }
+
+    /// Reads `HEAD` directly from the mapped header in O(1).
+    pub fn head(&self) -> Result<Option<BorrowedRefTarget<'b>>, GitError> {
+        let pos = 20usize;
+        match self.head_kind {
+            0 => Ok(None),
+            1 => {
+                if self.head_len != 20 {
+                    return Err(GitError {
+                        file: GitFile::RefTable,
+                        at: pos as u64,
+                        kind: ErrorKind::Malformed,
+                    });
+                }
+                Ok(Some(BorrowedRefTarget::Direct(Oid(
+                    self.bytes[pos..pos + 20].try_into().expect("20 bytes"),
+                ))))
+            }
+            2 => {
+                let s = core::str::from_utf8(&self.bytes[pos..pos + self.head_len]).map_err(|_| {
+                    GitError { file: GitFile::RefTable, at: pos as u64, kind: ErrorKind::Malformed }
+                })?;
+                Ok(Some(BorrowedRefTarget::Symbolic(s)))
+            }
+            _ => Err(GitError { file: GitFile::RefTable, at: 12, kind: ErrorKind::Malformed }),
+        }
+    }
+
+    fn entry_at_offset(&self, pos: usize) -> Result<(BorrowedRefEntry<'b>, usize), GitError> {
+        if pos + 6 > self.entries_end {
+            return Err(GitError {
+                file: GitFile::RefTable,
+                at: pos as u64,
+                kind: ErrorKind::Malformed,
+            });
+        }
+        let name_len = u16::from_le_bytes([self.bytes[pos], self.bytes[pos + 1]]) as usize;
+        let kind_b = self.bytes[pos + 2];
+        let has_peeled = self.bytes[pos + 3];
+        let target_len = u16::from_le_bytes([self.bytes[pos + 4], self.bytes[pos + 5]]) as usize;
+        let mut cur = pos + 6;
+        let extra_peeled = if has_peeled != 0 { 20 } else { 0 };
+        if cur + name_len + target_len + extra_peeled > self.entries_end {
+            return Err(GitError {
+                file: GitFile::RefTable,
+                at: cur as u64,
+                kind: ErrorKind::Malformed,
+            });
+        }
+        let name = core::str::from_utf8(&self.bytes[cur..cur + name_len]).map_err(|_| GitError {
+            file: GitFile::RefTable,
+            at: cur as u64,
+            kind: ErrorKind::Malformed,
+        })?;
+        cur += name_len;
+        let target = match kind_b {
+            1 => {
+                if target_len != 20 {
+                    return Err(GitError {
+                        file: GitFile::RefTable,
+                        at: cur as u64,
+                        kind: ErrorKind::Malformed,
+                    });
+                }
+                BorrowedRefTarget::Direct(Oid(
+                    self.bytes[cur..cur + 20].try_into().expect("20 bytes"),
+                ))
+            }
+            2 => {
+                let s = core::str::from_utf8(&self.bytes[cur..cur + target_len]).map_err(|_| {
+                    GitError { file: GitFile::RefTable, at: cur as u64, kind: ErrorKind::Malformed }
+                })?;
+                BorrowedRefTarget::Symbolic(s)
+            }
+            _ => {
+                return Err(GitError {
+                    file: GitFile::RefTable,
+                    at: (pos + 2) as u64,
+                    kind: ErrorKind::Malformed,
+                });
+            }
+        };
+        cur += target_len;
+        let peeled = if has_peeled != 0 {
+            let p = Oid(self.bytes[cur..cur + 20].try_into().expect("20 bytes"));
+            cur += 20;
+            Some(p)
+        } else {
+            None
+        };
+        Ok((BorrowedRefEntry { name, target, peeled }, cur))
+    }
+
+    #[inline]
+    fn offset_of(&self, idx: u32) -> usize {
+        u32_le(self.bytes, self.offsets_start + (idx as usize) * 4) as usize
+    }
+
+    fn name_at_index(&self, idx: u32) -> Result<&'b str, GitError> {
+        let pos = self.offset_of(idx);
+        if pos + 6 > self.entries_end {
+            return Err(GitError {
+                file: GitFile::RefTable,
+                at: pos as u64,
+                kind: ErrorKind::Malformed,
+            });
+        }
+        let name_len = u16::from_le_bytes([self.bytes[pos], self.bytes[pos + 1]]) as usize;
+        let start = pos + 6;
+        if start + name_len > self.entries_end {
+            return Err(GitError {
+                file: GitFile::RefTable,
+                at: start as u64,
+                kind: ErrorKind::Malformed,
+            });
+        }
+        core::str::from_utf8(&self.bytes[start..start + name_len]).map_err(|_| GitError {
+            file: GitFile::RefTable,
+            at: start as u64,
+            kind: ErrorKind::Malformed,
+        })
+    }
+
+    /// Lower bound index for `key` using the v2 offset table (`O(log R)`).
+    fn lower_bound(&self, key: &str) -> Result<u32, GitError> {
+        let mut lo = 0u32;
+        let mut hi = self.count;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let name = self.name_at_index(mid)?;
+            if name < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(lo)
+    }
+
+    /// Looks up one ref by exact name (`O(log R)` on v2, `O(R)` on v1, zero heap allocations).
+    pub fn get(&self, name: &str) -> Result<Option<BorrowedRefEntry<'b>>, GitError> {
+        if self.version == 2 {
+            let idx = self.lower_bound(name)?;
+            if idx < self.count {
+                let (entry, _) = self.entry_at_offset(self.offset_of(idx))?;
+                if entry.name == name {
+                    return Ok(Some(entry));
+                }
+            }
+            return Ok(None);
+        }
+        let mut pos = self.entries_start;
+        for _ in 0..self.count {
+            let (entry, next) = self.entry_at_offset(pos)?;
+            if entry.name == name {
+                return Ok(Some(entry));
+            }
+            if entry.name > name {
+                break;
+            }
+            pos = next;
+        }
+        Ok(None)
+    }
+
+    /// Resolves `"HEAD"` or any ref name to its final direct [`Oid`] (`O(log R)` on v2, zero allocs).
+    pub fn resolve(&self, name: &str) -> Result<Option<Oid>, GitError> {
+        let mut cur = name;
+        for _ in 0..8 {
+            let target = if cur == "HEAD" {
+                self.head()?
+            } else {
+                self.get(cur)?.map(|e| e.target)
+            };
+            match target {
+                None => return Ok(None),
+                Some(BorrowedRefTarget::Direct(oid)) => return Ok(Some(oid)),
+                Some(BorrowedRefTarget::Symbolic(next)) => cur = next,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Appends all refs starting with `prefix` into `out` (`O(log R + K)` on v2!).
+    pub fn list_prefix<'a>(
+        &self,
+        prefix: &str,
+        alloc: Alloc<'a>,
+        out: &mut AVec<'a, RefEntry<'a>>,
+    ) -> Result<(), GitError> {
+        if self.version == 2 {
+            let mut idx = if prefix.is_empty() { 0 } else { self.lower_bound(prefix)? };
+            while idx < self.count {
+                let (entry, _) = self.entry_at_offset(self.offset_of(idx))?;
+                if !entry.name.starts_with(prefix) {
+                    break;
+                }
+                let target = match entry.target {
+                    BorrowedRefTarget::Direct(o) => RefTarget::Direct(o),
+                    BorrowedRefTarget::Symbolic(s) => RefTarget::Symbolic(String::from_str_in(s, alloc)),
+                };
+                out.push(RefEntry {
+                    name: String::from_str_in(entry.name, alloc),
+                    target,
+                    peeled: entry.peeled,
+                });
+                idx += 1;
+            }
+            return Ok(());
+        }
+        let mut pos = self.entries_start;
+        for _ in 0..self.count {
+            let (entry, next) = self.entry_at_offset(pos)?;
+            if entry.name.starts_with(prefix) {
+                let target = match entry.target {
+                    BorrowedRefTarget::Direct(o) => RefTarget::Direct(o),
+                    BorrowedRefTarget::Symbolic(s) => RefTarget::Symbolic(String::from_str_in(s, alloc)),
+                };
+                out.push(RefEntry {
+                    name: String::from_str_in(entry.name, alloc),
+                    target,
+                    peeled: entry.peeled,
+                });
+            } else if !prefix.is_empty() && entry.name > prefix {
+                break;
+            }
+            pos = next;
+        }
+        Ok(())
+    }
+}
+
+/// Decoded single-file `BGRF` v1/v2 reftable.
 pub struct DecodedRefTable<'a> {
     pub head: Option<RefTarget<'a>>,
     pub refs: AVec<'a, RefEntry<'a>>,
 }
 
-/// Parses and CRC-verifies a `BGRF` v1 binary reftable.
+/// Parses and CRC-verifies a `BGRF` v1 or v2 binary reftable.
 pub fn decode_reftable<'a>(
     bytes: &[u8],
     max_refs: u32,
     alloc: Alloc<'a>,
 ) -> Result<DecodedRefTable<'a>, GitError> {
-    if bytes.len() < 24 || &bytes[0..4] != BGRF_MAGIC {
-        return Err(GitError { file: GitFile::RefTable, at: 0, kind: ErrorKind::Malformed });
-    }
-    let version = u32_le(bytes, 4);
-    if version != 1 {
-        return Err(GitError {
-            file: GitFile::RefTable,
-            at: 4,
-            kind: ErrorKind::UnsupportedVersion(version),
-        });
-    }
+    let view = RefTableView::parse_fast(bytes, max_refs)?;
     let body_end = bytes.len() - 4;
     let want_crc = u32_le(bytes, body_end);
     if crc32(&bytes[..body_end]) != want_crc {
@@ -819,114 +1150,12 @@ pub fn decode_reftable<'a>(
             kind: ErrorKind::ChecksumMismatch,
         });
     }
-    let count = u32_le(bytes, 8);
-    if count > max_refs {
-        return Err(GitError {
-            file: GitFile::RefTable,
-            at: 8,
-            kind: ErrorKind::TooManyEntries { count, most: max_refs },
-        });
-    }
-    let head_kind = bytes[12];
-    let head_len = u32_le(bytes, 16) as usize;
-    let mut pos = 20usize;
-    if pos + head_len > body_end {
-        return Err(GitError { file: GitFile::RefTable, at: pos as u64, kind: ErrorKind::Malformed });
-    }
-    let head = match head_kind {
-        0 => None,
-        1 => {
-            if head_len != 20 {
-                return Err(GitError {
-                    file: GitFile::RefTable,
-                    at: pos as u64,
-                    kind: ErrorKind::Malformed,
-                });
-            }
-            Some(RefTarget::Direct(Oid(bytes[pos..pos + 20].try_into().expect("20 bytes"))))
-        }
-        2 => {
-            let s = core::str::from_utf8(&bytes[pos..pos + head_len]).map_err(|_| GitError {
-                file: GitFile::RefTable,
-                at: pos as u64,
-                kind: ErrorKind::Malformed,
-            })?;
-            Some(RefTarget::Symbolic(String::from_str_in(s, alloc)))
-        }
-        _ => {
-            return Err(GitError { file: GitFile::RefTable, at: 12, kind: ErrorKind::Malformed });
-        }
-    };
-    pos += head_len;
-
-    let mut refs = Vec::with_capacity_in(count as usize, alloc);
-    for _ in 0..count {
-        if pos + 6 > body_end {
-            return Err(GitError {
-                file: GitFile::RefTable,
-                at: pos as u64,
-                kind: ErrorKind::Malformed,
-            });
-        }
-        let name_len = u16::from_le_bytes([bytes[pos], bytes[pos + 1]]) as usize;
-        let kind_b = bytes[pos + 2];
-        let has_peeled = bytes[pos + 3];
-        let target_len = u16::from_le_bytes([bytes[pos + 4], bytes[pos + 5]]) as usize;
-        pos += 6;
-        let extra_peeled = if has_peeled != 0 { 20 } else { 0 };
-        if pos + name_len + target_len + extra_peeled > body_end {
-            return Err(GitError {
-                file: GitFile::RefTable,
-                at: pos as u64,
-                kind: ErrorKind::Malformed,
-            });
-        }
-        let name_s = core::str::from_utf8(&bytes[pos..pos + name_len]).map_err(|_| GitError {
-            file: GitFile::RefTable,
-            at: pos as u64,
-            kind: ErrorKind::Malformed,
-        })?;
-        pos += name_len;
-        let target = match kind_b {
-            1 => {
-                if target_len != 20 {
-                    return Err(GitError {
-                        file: GitFile::RefTable,
-                        at: pos as u64,
-                        kind: ErrorKind::Malformed,
-                    });
-                }
-                RefTarget::Direct(Oid(bytes[pos..pos + 20].try_into().expect("20 bytes")))
-            }
-            2 => {
-                let s = core::str::from_utf8(&bytes[pos..pos + target_len]).map_err(|_| GitError {
-                    file: GitFile::RefTable,
-                    at: pos as u64,
-                    kind: ErrorKind::Malformed,
-                })?;
-                RefTarget::Symbolic(String::from_str_in(s, alloc))
-            }
-            _ => {
-                return Err(GitError {
-                    file: GitFile::RefTable,
-                    at: pos as u64,
-                    kind: ErrorKind::Malformed,
-                });
-            }
-        };
-        pos += target_len;
-        let peeled = if has_peeled != 0 {
-            let p = Oid(bytes[pos..pos + 20].try_into().expect("20 bytes"));
-            pos += 20;
-            Some(p)
-        } else {
-            None
-        };
-        refs.push(RefEntry { name: String::from_str_in(name_s, alloc), target, peeled });
-    }
-    if pos != body_end {
-        return Err(GitError { file: GitFile::RefTable, at: pos as u64, kind: ErrorKind::Malformed });
-    }
+    let head = view.head()?.map(|t| match t {
+        BorrowedRefTarget::Direct(o) => RefTarget::Direct(o),
+        BorrowedRefTarget::Symbolic(s) => RefTarget::Symbolic(String::from_str_in(s, alloc)),
+    });
+    let mut refs = Vec::with_capacity_in(view.len() as usize, alloc);
+    view.list_prefix("", alloc, &mut refs)?;
     Ok(DecodedRefTable { head, refs })
 }
 

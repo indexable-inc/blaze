@@ -626,6 +626,21 @@ fn run_git_status<'a>(
     opts: StatusOpts,
     alloc: Alloc<'a>,
 ) -> io::Result<(PromptStatus<'a>, StatusTiming)> {
+    // O(dirty) fast-path when an in-process FSEvents monitor (`blaze-shell` host) is active!
+    if let Some(wt) = worktree.as_deref()
+        && let Some(cached) = crate::fsmonitor::try_cached_status(
+            wt,
+            &git_dir,
+            &common_dir,
+            bgit_dir.as_deref(),
+            opts,
+            alloc,
+        )
+    {
+        return Ok((cached, StatusTiming::default()));
+    }
+    let scan_start_gen = worktree.as_deref().and_then(crate::fsmonitor::begin_full_scan);
+
     let worktree_io = match &worktree {
         Some(wt) => Some(blaze_core::native(wt, default_io_threads())?),
         None => None,
@@ -645,7 +660,20 @@ fn run_git_status<'a>(
         let step = machine.poll().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         timing.machine_us += m0.elapsed().as_micros() as u64;
         match step {
-            Step::Done(status) => return Ok((status, timing)),
+            Step::Done(status) => {
+                if let Some(wt) = driver.worktree.as_deref() {
+                    crate::fsmonitor::record_status_baseline(
+                        wt,
+                        &driver.git_dir,
+                        &driver.common_dir,
+                        driver.bgit_dir.as_deref(),
+                        opts,
+                        &status,
+                        scan_start_gen,
+                    );
+                }
+                return Ok((status, timing));
+            }
             Step::Need(want) => {
                 timing.rounds += 1;
                 let io0 = Instant::now();

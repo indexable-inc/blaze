@@ -21,13 +21,17 @@ use std::{
 };
 
 use blaze_base64::STANDARD as BASE64_STD;
+use blaze_core::trust::{Places as TrustPlaces, system as load_system_trust_roots};
 use blaze_deflate::{Limits as DeflateLimits, gunzip};
 use blaze_h2::{
     Connection as H2Conn, Event as H2Event, Field as H2Field, Instant as H2Instant,
     Limits as H2Limits, RequestHead as H2RequestHead,
 };
 use blaze_own::{Alloc, Vec as OwnVec};
-use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, pki_types::ServerName};
+use rustls::{
+    ClientConfig, ClientConnection, RootCertStore, StreamOwned,
+    pki_types::{CertificateDer, ServerName},
+};
 
 /// Parsed remote repository URL (`https://`, `http://`, `git@host:path`, `ssh://`, `github:o/r`).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -190,13 +194,23 @@ fn parse_http_target(rest: &str, tls: bool) -> io::Result<HttpTarget> {
 fn tls_client_config() -> io::Result<Arc<ClientConfig>> {
     static CONFIG: OnceLock<Result<Arc<ClientConfig>, String>> = OnceLock::new();
     let res = CONFIG.get_or_init(|| {
+        // Dogfood `blaze_core::trust::system`: zero link-time Security.framework dependency
+        // (`dlopen` only on first HTTPS connect), honors macOS admin/user trust settings and
+        // Linux `SSL_CERT_FILE`/`SSL_CERT_DIR`, never bakes in a static CA list.
+        let cert_file = std::env::var_os("SSL_CERT_FILE");
+        let cert_dir = std::env::var_os("SSL_CERT_DIR");
+        let places = TrustPlaces {
+            cert_file: cert_file.as_deref(),
+            cert_dir: cert_dir.as_deref(),
+        };
+        let trust_roots = load_system_trust_roots(places, Alloc::global())
+            .map_err(|e| format!("blaze_core::trust::system: {e}"))?;
         let mut roots = RootCertStore::empty();
-        let native = rustls_native_certs::load_native_certs();
-        for cert in native.certs {
-            let _ = roots.add(cert);
+        for der in trust_roots.each() {
+            let _ = roots.add(CertificateDer::from_slice(der).into_owned());
         }
         if roots.is_empty() {
-            return Err("no native OS root CA certificates found for TLS".to_owned());
+            return Err("no OS root CA certificates found for TLS".to_owned());
         }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let mut cfg = ClientConfig::builder_with_provider(provider)
