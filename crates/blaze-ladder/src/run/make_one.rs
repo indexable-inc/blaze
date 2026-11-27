@@ -2068,12 +2068,12 @@ impl<P: FrontEnd> reads::Beyond for Today<'_, P> {
         let Some(c) = self.program.fn_index(item) else {
             return Err(ReadsError::Unanswered { kind: ReadKind::PolyBodyText });
         };
-        let f = self.program.function(c);
-        if f.text.is_empty() {
+        let Some(text) = self.program.item_text(c) else {
             return Ok(None);
-        }
+        };
+        let f = self.program.function(c);
         let sig = self.program.sig(c);
-        Ok(Some(crate::front2::poly_canon::poly_body_text_digest(f.text, &sig, f.abi, scratch)))
+        Ok(Some(crate::front2::poly_canon::poly_body_text_digest(text, &sig, f.abi, scratch)))
     }
 }
 
@@ -3192,7 +3192,7 @@ fn compute_poly_summary<P: FrontEnd, T: Typing<P>>(
             }
         };
         let f = program.function(row);
-        if f.body.is_none() || f.text.is_empty() || !matches!(f.kind, FnKind::Free | FnKind::Impl(_)) {
+        if f.body.is_none() || program.item_text(row).is_none() || !matches!(f.kind, FnKind::Free | FnKind::Impl(_)) {
             continue;
         }
         let sig = program.sig(row);
@@ -3607,21 +3607,28 @@ fn canonicalize_callee<'f, P: FrontEnd>(
             for &dep in cached.deps.iter() {
                 if let Some(dep_c) = program.fn_index(dep) {
                     let dep_f = program.function(dep_c);
-                    let digest = if dep_f.text.is_empty() {
-                        None
-                    } else {
-                        let dep_sig = program.sig(dep_c);
-                        Some(poly_body_text_digest(dep_f.text, &dep_sig, dep_f.abi, alloc))
+                    let digest = match program.item_text(dep_c) {
+                        None => None,
+                        Some(text) => {
+                            let dep_sig = program.sig(dep_c);
+                            Some(poly_body_text_digest(text, &dep_sig, dep_f.abi, alloc))
+                        }
                     };
                     asking.log.ask_poly_body_text(dep, digest);
                 }
             }
             let has_drop_trait = program.drop_trait().is_some();
             for &adt_k in cached.adt_deps.iter() {
-                if LayoutFacts::adt(world, adt_k).is_none() {
+                let Some(adt) = LayoutFacts::adt(world, adt_k) else {
                     return Err(RunError::NoAdt { function: name(), adt: adt_k, path: program.item_named(adt_k) });
-                }
+                };
+                // Only ask `world.drop_impl` with `List::EMPTY` for non-generic ADTs: passing
+                // `List::EMPTY` for a generic ADT (`Vec<T, A>`, `Option<T>`, etc.) is ill-typed
+                // and logs an unstable `ReadKind::DropImpl` row that falsely stales warm caches.
+                // Concrete call-site generic arguments already log well-typed `DropImpl` reads via
+                // `poly_arg_info`.
                 if has_drop_trait
+                    && adt.generics == 0
                     && let Ok(adt_ty) = ground.intern(PNode::Adt(adt_k, List::EMPTY))
                 {
                     if let Err(error) = world.drop_impl(adt_ty, ground) {

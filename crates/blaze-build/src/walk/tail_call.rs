@@ -123,13 +123,19 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                         }
                         (false, abi, Some(instance), declared)
                     }
-                    PNode::FnPtr(_, header) => {
+                    PNode::FnPtr(sig_list, header) => {
                         let abi = pointer_abi(header.abi)
                             .ok_or_else(|| unsupported(e, "a fn pointer outside the Rust, rust-call and C-family calling conventions"))?;
                         for &a in written {
                             list.push(a);
                         }
-                        (true, abi, None, None)
+                        let declared = if header.c_variadic {
+                            let len = self.ground.view().list(sig_list).map_err(|_| malformed("a fn pointer past the ground table"))?.len();
+                            Some(len.saturating_sub(1))
+                        } else {
+                            None
+                        };
+                        (true, abi, None, declared)
                     }
                     _ => return Err(malformed("a `become` call task on an unexpected callee")),
                 }

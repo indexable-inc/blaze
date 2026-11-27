@@ -65,7 +65,6 @@
 use core::alloc::Allocator;
 
 use blaze_lir::builder::MemAttrs;
-use blaze_lir::func::SlotKind;
 use blaze_lir::{Flags, Ty, Value};
 use blaze_own::Vec;
 use blaze_typeck::{AdjustKind, Expr, ExprId, LangItem, Mutbl, PNode, PTy, PatId, UnOp};
@@ -154,7 +153,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
     /// All of `e`'s adjustments when they are box dereferences only (their count, 0 for none);
     /// `None` when any other adjustment is among them (a borrow, a reference's dereference, a
     /// coercion): `e` is then no step of a place path.
-    fn box_derefs(&mut self, e: ExprId) -> Result<Option<u32>, BuildError> {
+    pub(super) fn box_derefs(&mut self, e: ExprId) -> Result<Option<u32>, BuildError> {
         let n = self.adjust_rows(e).len();
         Ok(self.box_rows(e, n)?.then_some(n as u32))
     }
@@ -267,7 +266,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             return Err(unsupported(e, "a move out of a field of a type that implements `Drop` (E0509)"));
         }
         let Some(bit) = self.part_bit(mask, start, len, 0, Some(e))? else {
-            return Err(unsupported(e, "a move out of more than 64 parts of one local (its word)"));
+            return Err(unsupported(e, "a move out of more than 256 parts of one local (its bitset)"));
         };
         self.clear_bit(mask, bit);
         let tmp = self.temp(repr);
@@ -275,69 +274,21 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         Ok(V::Place(tmp.0, tmp.1))
     }
 
-    /// `let x = *make();`, `let s = *Box::from_raw(p);`: `move_box_contents` when the box is a
-    /// TEMPORARY (`e`, a value expression whose one adjustment `n == 0` is the box's
-    /// dereference; the contents at `at`, held as `repr`). The Reference,
-    /// [expr.move.movable-place]: "Temporary values" and "The result of dereferencing an
-    /// expression with type `Box<T>` and that can also be moved out of"; "Temporary scopes":
-    /// the box lives to the end of its temporary scope, where it is dropped minus what moved:
-    /// its allocation is freed, its contents are not dropped again. Built as walk/moves.rs
-    /// `move_temp_field` builds a temporary's field: the box's `hold_temp` entry (the whole
-    /// `Held::Rest` that `Task::Spill` made) becomes a `Held::Moved` with a word of its own, all
-    /// held, and the bit of the part `[Deref]` is cleared; the scope's end then drops it by
-    /// `drop_moved`, where `box_node` tests the contents' bit (clear: not dropped) and frees
-    /// the allocation alone (`Do::BoxFree`). The box is found by the pointer to it that
-    /// `box_deref_builtin` recorded for `e` (`Moves::box_self`). Refused by name: a box that is
-    /// a place no local's field flags cover (behind a reference or a pointer: E0507, the
-    /// checker's), a box reached by more than one dereference (`**make()` of a
-    /// `Box<Box<T>>`), and a box held by no entry of its scope (an extended temporary).
+    /// `let x = *make();`, `let x = **make_box_box();`, `let x = *make_outer().bx;`:
+    /// `move_box_contents` when the box is reached from a TEMPORARY.
     fn move_temp_box_contents(&mut self, e: ExprId, n: u32, at: (Value, i32), repr: Repr) -> Result<V, BuildError> {
-        if self.is_place_expr(e)? {
+        let Some((base, start, len, drops, _, _)) = self.temp_path_steps(e, n + 1)? else {
             return Err(unsupported(
                 e,
                 "a move out of a `Box`'s contents whose box is a place no local's field flags cover (behind a reference or a pointer: E0507)",
             ));
+        };
+        if drops {
+            self.moves.steps.truncate(start as usize);
+            return Err(unsupported(e, "a move out of a field of a type that implements `Drop` (E0509)"));
         }
-        if n != 0 {
-            return Err(unsupported(e, "a move out of the contents of a temporary `Box` reached by more than one dereference (`**make()`)"));
-        }
-        if !self.live {
-            // Unreachable code: nothing runs, nothing is held (`Task::Spill` held nothing).
-            let tmp = self.temp(repr);
-            self.store(V::Place(at.0, at.1), repr, tmp)?;
-            return Ok(V::Place(tmp.0, tmp.1));
-        }
-        let p = match self.moves.box_self {
-            Some((b, p)) if b == e => p,
-            _ => return Err(malformed("a move out of a temporary `Box`'s contents with no recorded dereference of the box")),
-        };
-        let found = self
-            .scope_pats
-            .iter()
-            .rposition(|h| matches!(*h, Held::Rest { at: a, variant: None, .. } | Held::Moved { at: a, .. } if a == (p, 0)));
-        let Some(i) = found else {
-            return Err(unsupported(e, "a move out of the contents of a temporary `Box` not held to its scope's end (an extended temporary)"));
-        };
-        let mask = match self.scope_pats[i] {
-            Held::Moved { mask, .. } => mask,
-            _ => {
-                let t = self.expr_ty(e)?;
-                let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
-                let slot = self.new_temp_mask((p, 0), e);
-                self.scope_pats[i] = Held::Moved { at: (p, 0), g, mask: slot };
-                slot
-            }
-        };
-        let start = self.moves.steps.len() as u32;
-        self.moves.steps.push(Step::Deref);
-        let Some(bit) = self.part_bit(mask, start, 1, 0, Some(e))? else {
-            return Err(unsupported(e, "a move out of more than 64 parts of one temporary (its word)"));
-        };
-        self.clear_bit(mask, bit);
-        // Copied out first, as `move_field` does.
-        let tmp = self.temp(repr);
-        self.store(V::Place(at.0, at.1), repr, tmp)?;
-        Ok(V::Place(tmp.0, tmp.1))
+        let held_at = self.moves.temp_spills.iter().rev().find(|&&(b, _)| b == base).map(|&(_, spilled)| spilled);
+        self.move_temp_part(e, base, start, len, held_at, at, repr)
     }
 
     /// By-value dynamic call on `*b` where `b: Box<dyn Tr>` (e.g. `Box<dyn FnOnce>::call_once`'s
@@ -375,7 +326,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
                 return Err(unsupported(e, "a move out of a field of a type that implements `Drop` (E0509)"));
             }
             let Some(bit) = self.part_bit(mask, path_start, path_len, 0, Some(e))? else {
-                return Err(unsupported(e, "a move out of more than 64 parts of one local (its word)"));
+                return Err(unsupported(e, "a move out of more than 256 parts of one local (its bitset)"));
             };
             self.clear_bit(mask, bit);
             return Ok(());
@@ -424,7 +375,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         let start = u32::try_from(self.moves.steps.len()).map_err(|_| malformed("move steps past u32"))?;
         self.moves.steps.push(Step::Deref);
         let Some(bit) = self.part_bit(mask, start, 1, 0, Some(e))? else {
-            return Err(unsupported(e, "a move out of more than 64 parts of one temporary (its word)"));
+            return Err(unsupported(e, "a move out of more than 256 parts of one temporary (its bitset)"));
         };
         self.clear_bit(mask, bit);
         Ok(())

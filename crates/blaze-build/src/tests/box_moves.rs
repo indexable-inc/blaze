@@ -340,6 +340,156 @@ fn a_field_moved_out_of_a_box_drops_the_rest_then_frees() {
     assert_eq!(run(&planted, moved).as_slice(), &[5, 6], "control: the box never freed");
 }
 
+/// Moving a field out of a TEMPORARY `Box<P>` (`let y = (*mk_p(5, 6)).a;` and autoderef
+/// `let y = mk_p(5, 6).a;`), moving all fields out of a local `Box<P>`, and moving a field out of
+/// a nested `Box<Box<P>>` (both local and temporary).
+#[test]
+fn a_field_moved_out_of_a_temporary_or_nested_box_drops_the_rest_then_frees() {
+    let (w, _) = box_world(true);
+
+    // (a) Temporary `Box<P>` via explicit deref: `{ let y = (*mk_p(5, 6)).a; let k = G{9}; }`
+    // Statement 1 drops unmoved `c` (6) and frees the temp box (100); block end drops `k` (9), `y` (5).
+    let temp_explicit = |b: &mut BodyBuf| {
+        let mut stmts: Vec<Stmt, Global> = Vec::new_in(Global);
+        let five = b.int(5, None);
+        let six = b.int(6, None);
+        let call = b.call("mk_p", &[five, six]);
+        let deref = b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: call });
+        let paren = b.e(Expr::Paren(deref));
+        let a = b.field(paren, "a");
+        stmts.push(let_(b, "y", a));
+        let g9 = g_lit(b, 9);
+        stmts.push(let_(b, "k", g9));
+        b.block(&stmts, None)
+    };
+    assert_eq!(run(&w, temp_explicit).as_slice(), &[6, FREED, 9, 5], "(a) (*mk_p(5, 6)).a");
+
+    // (b) Temporary `Box<P>` via autoderef: `{ let y = mk_p(5, 6).a; let k = G{9}; }`
+    let temp_autoderef = |b: &mut BodyBuf| {
+        let mut stmts: Vec<Stmt, Global> = Vec::new_in(Global);
+        let five = b.int(5, None);
+        let six = b.int(6, None);
+        let call = b.call("mk_p", &[five, six]);
+        let a = b.field(call, "a");
+        stmts.push(let_(b, "y", a));
+        let g9 = g_lit(b, 9);
+        stmts.push(let_(b, "k", g9));
+        b.block(&stmts, None)
+    };
+    assert_eq!(run(&w, temp_autoderef).as_slice(), &[6, FREED, 9, 5], "(b) mk_p(5, 6).a");
+
+    // (c) Moving ALL fields out of a local `Box<P>`: `{ let b = mk_p(5, 6); let x = (*b).a; let y = (*b).c; }`
+    let all_fields = |b: &mut BodyBuf| {
+        let mut stmts: Vec<Stmt, Global> = Vec::new_in(Global);
+        let bx = let_mk(b, &mut stmts, "b", "mk_p", &[5, 6]);
+        let s1 = star(b, bx);
+        let p1 = b.e(Expr::Paren(s1));
+        let fa = b.field(p1, "a");
+        stmts.push(let_(b, "x", fa));
+        let s2 = star(b, bx);
+        let p2 = b.e(Expr::Paren(s2));
+        let fc = b.field(p2, "c");
+        stmts.push(let_(b, "y", fc));
+        b.block(&stmts, None)
+    };
+    assert_eq!(run(&w, all_fields).as_slice(), &[6, 5, FREED], "(c) both fields moved out of local Box<P>");
+
+    // Controls on temporary Box field move-out.
+    let mut planted = box_world(true).0;
+    planted.planted = crate::Planted::MovedBoxDroppedWhole;
+    assert_eq!(run(&planted, temp_explicit).as_slice(), &[5, 6, FREED, 9, 5], "control: temp box dropped whole");
+    planted.planted = crate::Planted::MovedBoxNotFreed;
+    assert_eq!(run(&planted, temp_explicit).as_slice(), &[6, 9, 5], "control: temp box never freed");
+
+    // (d) Nested `Box<Box<P>>`: both local `(**bb).a` and temporary `(**mk_bp(5, 6)).a`.
+    // Cell 4 holds a pointer to cell 2 (`P { a: 5, c: 6 }`).
+    extern "C" fn host_mk_bp(out: *mut *mut *mut i32, a: i32, c: i32) {
+        CELLS.with(|cells| unsafe {
+            let p = cells.get().cast::<i32>().add(2);
+            p.write(a);
+            p.add(1).write(c);
+            let slot = cells.get().cast::<*mut i32>().add(2); // bytes 16..24 (cells 4..6)
+            slot.write(p);
+            out.write(slot);
+        });
+    }
+    const MK_BP: ItemKey = ItemKey(36);
+    let (mut nw, _) = box_world(true);
+    let pt = nw.ty(PNode::Adt(P, List::EMPTY));
+    let lp = nw.types.intern_list(&[pt]).expect("intern");
+    let box_p = PNode::Adt(BOX, lp);
+    let bpt = nw.ty(box_p);
+    let lbp = nw.types.intern_list(&[bpt]).expect("intern");
+    let box_box_p = PNode::Adt(BOX, lbp);
+    nw.func(36, "mk_bp", &[I32, I32], box_box_p);
+    let t_param = nw.ty(T);
+    let lt = nw.types.intern_list(&[t_param]).expect("intern");
+    let box_t = PNode::Adt(BOX, lt);
+    nw.deref_generic_impl(1, box_t, T, BOX_DEREF);
+
+    let run_nested = |body: fn(&mut BodyBuf) -> ExprId| -> Vec<i32, Global> {
+        let mut b = BodyBuf::new();
+        let root = body(&mut b);
+        let mut ground = PortableTys::new_in(Alloc::global());
+        let main = build_instance(&nw, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("nested box build: {e}"));
+        let gg = ground.intern(PNode::Adt(ItemKey(9), List::EMPTY)).expect("intern");
+        let pg = ground.intern(PNode::Adt(P, List::EMPTY)).expect("intern");
+        let lp = ground.intern_list(&[pg]).expect("intern");
+        let bp = ground.intern(PNode::Adt(BOX, lp)).expect("intern");
+        let lbp = ground.intern_list(&[bp]).expect("intern");
+        let bbp = ground.intern(PNode::Adt(BOX, lbp)).expect("intern");
+        let glues = [
+            glue(&nw, &mut ground, gg),
+            glue(&nw, &mut ground, pg),
+            glue(&nw, &mut ground, bp),
+            glue(&nw, &mut ground, bbp),
+        ];
+        let mut fns: Vec<(ItemKey, Option<List>, &Built<Global>), Global> = Vec::new_in(Global);
+        for (args, built) in glues.iter() {
+            fns.push((DROP_IN_PLACE, Some(*args), built));
+        }
+        fns.push((MAIN, None, &main));
+        let host = [
+            (G_DROP, host_g_drop as usize as u64),
+            (BOX_DROP, host_box_drop as usize as u64),
+            (MK_BP, host_mk_bp as usize as u64),
+        ];
+        DROPPED.with(|d| d.borrow_mut().clear());
+        run_native_with(&host, &fns);
+        DROPPED.with(|d| d.borrow().clone())
+    };
+
+    // Local `let bb = mk_bp(5, 6); let y = (**bb).a;` -> y(5), c(6), inner free(100), outer free(100).
+    let local_nested = |b: &mut BodyBuf| {
+        let mut stmts: Vec<Stmt, Global> = Vec::new_in(Global);
+        let bb = let_mk(b, &mut stmts, "bb", "mk_bp", &[5, 6]);
+        let s1 = star(b, bb);
+        let s2 = b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: s1 });
+        let p = b.e(Expr::Paren(s2));
+        let fa = b.field(p, "a");
+        stmts.push(let_(b, "y", fa));
+        b.block(&stmts, None)
+    };
+    assert_eq!(run_nested(local_nested).as_slice(), &[5, 6, FREED, FREED], "(d1) local (**bb).a");
+
+    // Temporary `let y = (**mk_bp(5, 6)).a; let k = G{9};` -> c(6), inner free(100), outer free(100), k(9), y(5).
+    let temp_nested = |b: &mut BodyBuf| {
+        let mut stmts: Vec<Stmt, Global> = Vec::new_in(Global);
+        let five = b.int(5, None);
+        let six = b.int(6, None);
+        let call = b.call("mk_bp", &[five, six]);
+        let s1 = b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: call });
+        let s2 = b.e(Expr::Unary { op: blaze_typeck::UnOp::Deref, operand: s1 });
+        let p = b.e(Expr::Paren(s2));
+        let fa = b.field(p, "a");
+        stmts.push(let_(b, "y", fa));
+        let g9 = g_lit(b, 9);
+        stmts.push(let_(b, "k", g9));
+        b.block(&stmts, None)
+    };
+    assert_eq!(run_nested(temp_nested).as_slice(), &[6, FREED, FREED, 9, 5], "(d2) temp (**mk_bp(5, 6)).a");
+}
+
 /// The contents moved out of a TEMPORARY box (`let x = *mk(3);`, bytes' `let shared =
 /// *Box::from_raw(shared);`): the box is freed alone at its statement's end (its temporary
 /// scope), the contents dropped once, by their new owner, at the block's end.

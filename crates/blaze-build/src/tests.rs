@@ -320,6 +320,7 @@ struct TestWorld {
     /// `#[lang = "deref"] trait Deref { type Target; }` (`DEREF`) and its one impl (`DEREF_IMPL`):
     /// `impl Deref for <self> { type Target = <target>; }`, both types of this world's table.
     deref: Option<(PTy, PTy)>,
+    deref_generics: u32,
     /// The trait's associated type, and the impl's `Target`.
     deref_defs: Vec<blaze_typeck::AssocTyDef, Global>,
     deref_assoc: Vec<(Name, PTy), Global>,
@@ -405,6 +406,7 @@ impl TestWorld {
             param_names: Vec::new_in(Global),
             const_fns: Vec::new_in(Global),
             deref: None,
+            deref_generics: 0,
             deref_defs: Vec::new_in(Global),
             deref_assoc: Vec::new_in(Global),
             deref_fn: None,
@@ -451,9 +453,16 @@ impl TestWorld {
 
     /// `impl Deref for <self_> { type Target = <target>; }`, whose `deref` is fn `deref_fn`.
     fn deref_impl(&mut self, self_: PNode, target: PNode, deref_fn: ItemKey) {
+        self.deref_generic_impl(0, self_, target, deref_fn);
+    }
+
+    fn deref_generic_impl(&mut self, generics: u32, self_: PNode, target: PNode, deref_fn: ItemKey) {
         let s = self.ty(self_);
         let t = self.ty(target);
         self.deref = Some((s, t));
+        self.deref_generics = generics;
+        self.deref_defs.clear();
+        self.deref_assoc.clear();
         self.deref_defs.push(blaze_typeck::AssocTyDef { name: Name::of("Target"), item: DEREF_TARGET, default: None });
         self.deref_assoc.push((Name::of("Target"), t));
         self.deref_fn = Some(deref_fn);
@@ -628,14 +637,14 @@ impl World for TestWorld {
         }
         Ok(match (item, self.deref, self.index) {
             (DEREF_IMPL, Some((s, _)), _) => Some(ImplHeader {
-                            generics: 0,
-                            self_ty: s,
-                            trait_: Some(DEREF),
-                            trait_args: blaze_typeck::ArgsAfterSelf::NONE,
-                            assoc_types: &self.deref_assoc,
-                            types: self.types.view(),
-                            polarity: blaze_typeck::ImplPolarity::Positive,
-                        }),
+                generics: self.deref_generics,
+                self_ty: s,
+                trait_: Some(DEREF),
+                trait_args: blaze_typeck::ArgsAfterSelf::NONE,
+                assoc_types: &self.deref_assoc,
+                types: self.types.view(),
+                polarity: blaze_typeck::ImplPolarity::Positive,
+            }),
             (INDEX_IMPL, _, Some((s, after))) => Some(ImplHeader {
                 generics: 0,
                 self_ty: s,
@@ -2552,6 +2561,46 @@ fn a_c_fn_pointer_returns_16_bytes_in_two_registers() {
     assert_eq!(text.lines().filter(|l| l.contains("project")).count(), 2, "{text}");
 }
 
+/// Regression for Bug 1: a C-variadic `extern "C" fn(i32, ...) -> i32` pointer call reads its
+/// signature list from `self.ground.view()`, not `self.types` (`walk.rs` `call`). When `ground`
+/// already holds more lists than the body's `checked.types`, reading `self.types.list(sig_list)`
+/// previously failed with `"a fn pointer past the record's types"`.
+#[test]
+fn a_c_variadic_fn_pointer_reads_signature_from_ground_table() {
+    let mut w = TestWorld::new();
+    let i32_ = w.ty(I32);
+    let sig = w.types.intern_list(&[i32_, i32_]).expect("a list interns");
+    let header = blaze_typeck::FnPtrHeader { abi: blaze_typeck::Abi::C, safety: blaze_typeck::Safety::Unsafe, c_variadic: true };
+    let fp_node = PNode::FnPtr(sig, header);
+    w.func(1, "main", &[fp_node, I32], I32);
+
+    let mut b = BodyBuf::new();
+    let fp = b.bind("fp");
+    let x = b.bind("x");
+    b.params.extend_from_slice(&[fp, x]);
+    let fp_e = b.local(fp);
+    let x_e = b.local(x);
+    let extra = b.int(42, Some(IntSuffix::Int(IntTy::I32)));
+    let args = b.exprs_list(&[x_e, extra]);
+    let root = b.e(Expr::Call { callee: fp_e, args });
+
+    // Pre-populate `ground` with extra lists so the grounded `FnPtr`'s `sig_list` offset is
+    // strictly past `checked.types.lists.len()`.
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let g_i32 = ground.intern(I32).expect("intern i32");
+    for n in 1..=16usize {
+        let mut dummy: Vec<PTy, Global> = Vec::new_in(Global);
+        dummy.resize(n, g_i32);
+        ground.intern_list(&dummy).expect("intern dummy list");
+    }
+
+    let built = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("{e}"));
+    let text = blaze_lir::print(built.func.view());
+    assert!(text.contains("call_indirect"), "{text}");
+    assert!(text.contains("variadic"), "{text}");
+    assert!(has_call_sig(&built, &[Ty::I32], &[Ty::I32]), "{text}");
+}
+
 /// lib.rs, "Fn pointers": `fn id(x: u32) -> u32` reified, `let f: fn(u32) -> u32 = id; f(5)`:
 /// `func_addr` of id's reference, then a `call_indirect` of the Rust signature.
 #[test]
@@ -3768,12 +3817,13 @@ fn a_match_by_value_drops_every_field_once() {
     assert!(failed.is_empty(), "{failed}");
 }
 
-/// The by-value match's two refusals that need their own world. A move out of an enum that
-/// implements `Drop` is E0509, a borrowck error, but no checker on the rebuilt path reports it
-/// (only the old layer's hir-ty-borrowck has it), so the builder's refusal is the stop. A move
-/// of a field past an enum's 64th needs a second field-flag word.
+/// The by-value match's E0509 refusal (`Drop`-impl enum) and wide-enum (>64 fields) partial moves:
+/// a move out of an enum that implements `Drop` is refused by name; an enum variant with >64
+/// fields (e.g. 65) or a multi-variant enum with >64 total fields across variants (like
+/// `blaze_core::Effect`) now builds and drops every remaining field in order via the multi-word
+/// field-flags bitset (256 bits), while a variant moving a field past bit 255 is refused by name.
 #[test]
-fn a_match_by_value_refuses_drop_impl_enums_and_wide_enums() {
+fn a_match_by_value_refuses_drop_impl_enums_and_handles_wide_enums() {
     // `enum E { A(G, G), .. }` with its own `Drop`: `match x { A(a, _) => {}, _ => {} }`.
     let refusal = |w: &mut TestWorld, b: &mut BodyBuf, value: ExprId, pat: PatId, e: PNode| -> String {
         let e_ty = b.types.intern(e).expect("a type interns");
@@ -3802,7 +3852,8 @@ fn a_match_by_value_refuses_drop_impl_enums_and_wide_enums() {
     let e0509 = refusal(&mut w, &mut b, value, pa, e);
     assert!(e0509.contains("a move out of an enum that implements `Drop` (E0509)"), "{e0509}");
 
-    // `enum V { M(G, G, .. 65 of them) }`: `M(_, .., _, g)` moves the 65th.
+    // `enum V { M(G, G, .. 65 of them) }`: `M(_, .., _, g)` moves the 65th (bit 64, word 1),
+    // drops `g` (64) at the arm's end, then drops the remaining 64 fields (0..64) at `x`'s scope end.
     let mut w = TestWorld::new();
     w.func(1, "main", &[], UNIT);
     let g = g_world(&mut w);
@@ -3827,8 +3878,130 @@ fn a_match_by_value_refuses_drop_impl_enums_and_wide_enums() {
     }
     subs.push(b.bind("g"));
     let pm = variant_pat(&mut b, "M", &subs);
-    let wide = refusal(&mut w, &mut b, value, pm, v);
-    assert!(wide.contains("a move out of a field past an enum's 64th"), "{wide}");
+    let v_ty = b.types.intern(v).expect("a type interns");
+    let x = b.bind("x");
+    let w1 = b.pat(Pat::Wild);
+    let (u0, u1) = (b.block(&[], None), b.block(&[], None));
+    let start = b.arms.len() as u32;
+    b.arms.push(Arm { pat: pm, guard: None, body: u0 });
+    b.arms.push(Arm { pat: w1, guard: None, body: u1 });
+    let xe = b.local(x);
+    let m = b.e(Expr::Match { scrutinee: xe, arms: List { start, len: 2 } });
+    let root = b.block(&[Stmt::Let { pat: x, ty: Some(v_ty), init: Some(value), else_: None }, Stmt::Expr { expr: m, semi: true }], None);
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let main = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("65-field enum move failed: {e}"));
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut gb = BodyBuf::new();
+        let gp = gb.bind("to_drop");
+        gb.params.push(gp);
+        let groot = gb.block(&[], None);
+        let view = gb.view(DROP_IN_PLACE, groot);
+        let mut cx = InferCtx::new_in(Alloc::global());
+        let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+            Ok(Outcome::Done(c)) => c,
+            other => panic!("drop_in_place check failed: {:?}", other.err()),
+        };
+        let sig = w.sig(DROP_IN_PLACE).expect("sig");
+        let gg = ground.intern(PNode::Adt(ItemKey(9), List::EMPTY)).expect("intern G");
+        let g_args = ground.intern_list(&[gg]).expect("intern [G]");
+        let mut subst = Subst { args: &[gg], ground: &mut ground, scratch: Alloc::global() };
+        let g_glue = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, Global)
+            .unwrap_or_else(|e| panic!("G glue: {e}"));
+        DROPPED.with(|d| d.borrow_mut().clear());
+        run_native_with(&[(G_DROP, host_g_drop as usize as u64)], &[(DROP_IN_PLACE, Some(g_args), &g_glue), (MAIN, None, &main)]);
+        let seen = DROPPED.with(|d| d.borrow().clone());
+        let mut want: Vec<i32, Global> = Vec::new_in(Global);
+        want.push(64);
+        want.extend(0..64);
+        assert_eq!(seen.as_slice(), want.as_slice(), "65-field enum drops moved 64 first, then remaining 0..64");
+    }
+
+    // Multi-variant wide enum (20 variants × 4 fields = 80 total fields across variants, like
+    // `blaze_core::Effect`): moving out of the last variant builds and runs cleanly.
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], UNIT);
+    let g = g_world(&mut w);
+    let vnames: Vec<String, Global> = {
+        let mut s = Vec::new_in(Global);
+        s.extend((0..20).map(|i| format!("V{i}")));
+        s
+    };
+    let four = [("0", g), ("1", g), ("2", g), ("3", g)];
+    let mut vdefs: Vec<(&str, CtorKind, &[(&str, PNode)]), Global> = Vec::new_in(Global);
+    for vn in vnames.iter() {
+        vdefs.push((vn.as_str(), CtorKind::Tuple, &four));
+    }
+    w.enum_(131, &vdefs);
+    let wide_enum = PNode::Adt(ItemKey(131), List::EMPTY);
+    let mut b = BodyBuf::new();
+    let args = [g_lit(&mut b, 10), g_lit(&mut b, 11), g_lit(&mut b, 12), g_lit(&mut b, 13)];
+    let value = b.call("V19", &args);
+    let (w0, a1, w2, w3) = (b.pat(Pat::Wild), b.bind("a1"), b.pat(Pat::Wild), b.pat(Pat::Wild));
+    let p19 = variant_pat(&mut b, "V19", &[w0, a1, w2, w3]);
+    let we_ty = b.types.intern(wide_enum).expect("intern");
+    let x = b.bind("x");
+    let w_other = b.pat(Pat::Wild);
+    let (u0, u1) = (b.block(&[], None), b.block(&[], None));
+    let start = b.arms.len() as u32;
+    b.arms.push(Arm { pat: p19, guard: None, body: u0 });
+    b.arms.push(Arm { pat: w_other, guard: None, body: u1 });
+    let xe = b.local(x);
+    let m = b.e(Expr::Match { scrutinee: xe, arms: List { start, len: 2 } });
+    let root = b.block(&[Stmt::Let { pat: x, ty: Some(we_ty), init: Some(value), else_: None }, Stmt::Expr { expr: m, semi: true }], None);
+    let mut ground = PortableTys::new_in(Alloc::global());
+    let main = build_instance(&w, &b, MAIN, root, &[], &mut ground).unwrap_or_else(|e| panic!("80-field multi-variant enum failed: {e}"));
+    #[cfg(target_arch = "aarch64")]
+    {
+        let mut gb = BodyBuf::new();
+        let gp = gb.bind("to_drop");
+        gb.params.push(gp);
+        let groot = gb.block(&[], None);
+        let view = gb.view(DROP_IN_PLACE, groot);
+        let mut cx = InferCtx::new_in(Alloc::global());
+        let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+            Ok(Outcome::Done(c)) => c,
+            other => panic!("drop_in_place check failed: {:?}", other.err()),
+        };
+        let sig = w.sig(DROP_IN_PLACE).expect("sig");
+        let gg = ground.intern(PNode::Adt(ItemKey(9), List::EMPTY)).expect("intern G");
+        let g_args = ground.intern_list(&[gg]).expect("intern [G]");
+        let mut subst = Subst { args: &[gg], ground: &mut ground, scratch: Alloc::global() };
+        let g_glue = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, Global)
+            .unwrap_or_else(|e| panic!("G glue: {e}"));
+        DROPPED.with(|d| d.borrow_mut().clear());
+        run_native_with(&[(G_DROP, host_g_drop as usize as u64)], &[(DROP_IN_PLACE, Some(g_args), &g_glue), (MAIN, None, &main)]);
+        let seen = DROPPED.with(|d| d.borrow().clone());
+        assert_eq!(seen.as_slice(), &[11, 10, 12, 13], "20-variant enum drops moved field 11 first, then 10, 12, 13");
+    }
+
+    // Moving a field past bit 255 in one variant is still refused cleanly by name.
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], UNIT);
+    let g = g_world(&mut w);
+    let names: Vec<String, Global> = {
+        let mut v = Vec::new_in(Global);
+        v.extend((0..257).map(|i| i.to_string()));
+        v
+    };
+    let mut fields: Vec<(&str, PNode), Global> = Vec::new_in(Global);
+    fields.extend(names.iter().map(|n| (n.as_str(), g)));
+    w.enum_(132, &[("M", CtorKind::Tuple, &fields)]);
+    let v257 = PNode::Adt(ItemKey(132), List::EMPTY);
+    let mut b = BodyBuf::new();
+    let mut args: Vec<ExprId, Global> = Vec::new_in(Global);
+    for i in 0..257 {
+        args.push(g_lit(&mut b, i));
+    }
+    let value = b.call("M", &args);
+    let mut subs: Vec<PatId, Global> = Vec::new_in(Global);
+    for _ in 0..256 {
+        subs.push(b.pat(Pat::Wild));
+    }
+    subs.push(b.bind("g"));
+    let pm = variant_pat(&mut b, "M", &subs);
+    let wide = refusal(&mut w, &mut b, value, pm, v257);
+    assert!(wide.contains("a move out of a field past an enum variant's 256th"), "{wide}");
 }
 
 /// What the by-value match does not build is refused by name: a move below a field (`W(P(s),

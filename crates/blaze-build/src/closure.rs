@@ -651,7 +651,7 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
             // return (the Reference, "Closure types", "Drop order").
             if self.needs_drop(g).map_err(|error| Self::ty_err(closure, error))? {
                 let l = self.layout(g).map_err(|error| Self::ty_err(closure, error))?;
-                self.scope_pats.push(Held::Rest { at, l, variant: None, moved: 0 });
+                self.scope_pats.push(Held::Rest { at, l, variant: None, moved: crate::walk::moves::FieldBits::EMPTY });
             }
             let a = self.address(at);
             self.push_val(V::Scalar(a), None);

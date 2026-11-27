@@ -195,3 +195,129 @@ fn the_control_a_guard_that_leaves_its_arm_is_caught() {
     assert_ne!(planted, 212_412_212, "the control: a guard that leaves its arm at the first false run went unnoticed");
     assert_eq!(planted, 100_100_121, "the planted walk: runs 1, value 0, runs 1, log 12, runs 1");
 }
+
+/// Regression for Bug 3A (`blaze-cli` `Err(e) if matches!(e.kind, FsKind::NotFound)`):
+/// inside a match guard, `e` is not yet owned (`Pending::Own` runs after the guard passes), so a
+/// nested `match e.kind { NotFound => true, _ => false }` on a field whose type needs drop must
+/// match `e.kind` in place (`scrutinee_in_place`) without trying to move `e.kind` or double-drop
+/// it when the guard fails and falls through to the next arm.
+#[test]
+fn guarded_arm_matches_dropping_field_of_binding_in_place() {
+    let run_case = |is_not_found: bool| -> (u32, Vec<i32, Global>) {
+        let mut w = TestWorld::new();
+        w.func(1, "main", &[], U32);
+        let g = g_world(&mut w);
+        // `enum Kind { NotFound, Driver(G) }` — needs drop via `Driver(G)`.
+        w.enum_(60, &[("NotFound", CtorKind::Unit, &[]), ("Driver", CtorKind::Tuple, &[("0", g)])]);
+        let kind = PNode::Adt(ItemKey(60), List::EMPTY);
+        // `struct ErrVal { path: G, kind: Kind }`.
+        w.strukt(61, "ErrVal", &[("path", g), ("kind", kind)]);
+        let err_val = PNode::Adt(ItemKey(61), List::EMPTY);
+        // `enum Res { Ok, Err(ErrVal) }`.
+        w.enum_(62, &[("Ok", CtorKind::Unit, &[]), ("Err", CtorKind::Tuple, &[("0", err_val)])]);
+        let res_ty = PNode::Adt(ItemKey(62), List::EMPTY);
+
+        let mut b = BodyBuf::new();
+        let kind_expr = if is_not_found {
+            let p = b.path("NotFound");
+            b.e(Expr::Path(p))
+        } else {
+            let g7 = g_lit(&mut b, 7);
+            b.call("Driver", &[g7])
+        };
+        let path_expr = g_lit(&mut b, 5);
+        let err_path = b.path("ErrVal");
+        let fstart = b.field_inits.len() as u32;
+        b.field_inits.push(FieldInit { name: Name::of("path"), expr: path_expr });
+        b.field_inits.push(FieldInit { name: Name::of("kind"), expr: kind_expr });
+        let err_struct = b.e(Expr::Struct { path: err_path, fields: List { start: fstart, len: 2 }, base: blaze_typeck::StructBase::None });
+        let scrut = b.call("Err", &[err_struct]);
+
+        // Arm 1: `Err(e) if match e.kind { NotFound => true, _ => false } => 10`
+        let e1 = plain(&mut b, "e");
+        let pat1 = variant_pat(&mut b, "Err", &[e1]);
+        let e1_ref = b.local(e1);
+        let e1_kind = b.field(e1_ref, "kind");
+        let nf_path = b.path("NotFound");
+        let nf_pat = b.pat(Pat::Path(nf_path));
+        let inner_wild = b.pat(Pat::Wild);
+        let t_lit = b.e(Expr::Lit(Lit::Bool(true)));
+        let f_lit = b.e(Expr::Lit(Lit::Bool(false)));
+        let inner_start = b.arms.len() as u32;
+        b.arms.push(Arm { pat: nf_pat, guard: None, body: t_lit });
+        b.arms.push(Arm { pat: inner_wild, guard: None, body: f_lit });
+        let guard = b.e(Expr::Match { scrutinee: e1_kind, arms: List { start: inner_start, len: 2 } });
+        let body1 = b.int(10, SU32);
+
+        // Arm 2: `Err(e) => 20`
+        let e2 = plain(&mut b, "e");
+        let pat2 = variant_pat(&mut b, "Err", &[e2]);
+        let body2 = b.int(20, SU32);
+
+        // Arm 3: `Ok => 30`
+        let ok_path = b.path("Ok");
+        let pat3 = b.pat(Pat::Path(ok_path));
+        let body3 = b.int(30, SU32);
+
+        let outer_start = b.arms.len() as u32;
+        b.arms.push(Arm { pat: pat1, guard: Some(guard), body: body1 });
+        b.arms.push(Arm { pat: pat2, guard: None, body: body2 });
+        b.arms.push(Arm { pat: pat3, guard: None, body: body3 });
+        let root = b.e(Expr::Match { scrutinee: scrut, arms: List { start: outer_start, len: 3 } });
+
+        let mut ground = PortableTys::new_in(Alloc::global());
+        let main = build_instance(&w, &b, MAIN, root, &[], &mut ground)
+            .unwrap_or_else(|e| panic!("guarded matches!(e.kind, ..) failed: {e}"));
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let glue = |ground: &mut PortableTys<'static>, ty: PTy| -> (List, Built<Global>) {
+                let mut gb = BodyBuf::new();
+                let gp = gb.bind("to_drop");
+                gb.params.push(gp);
+                let groot = gb.block(&[], None);
+                let view = gb.view(DROP_IN_PLACE, groot);
+                let mut cx = InferCtx::new_in(Alloc::global());
+                let checked = match blaze_typeck::check(&view, &w, &mut cx, &Needs::new_in(Alloc::global()), Alloc::global()) {
+                    Ok(Outcome::Done(c)) => c,
+                    other => panic!("drop_in_place check failed: {:?}", other.err()),
+                };
+                let sig = w.sig(DROP_IN_PLACE).expect("sig");
+                let args = ground.intern_list(&[ty]).expect("intern");
+                let mut subst = Subst { args: &[ty], ground: &mut *ground, scratch: Alloc::global() };
+                let built = crate::build_drop_glue(&view, &checked, &sig, &mut subst, &TestAdts { world: &w, body: &gb }, Global)
+                    .unwrap_or_else(|e| panic!("glue: {e}"));
+                (args, built)
+            };
+            let gg = ground.intern(PNode::Adt(ItemKey(9), List::EMPTY)).expect("G");
+            let kg = ground.intern(kind).expect("Kind");
+            let eg = ground.intern(err_val).expect("ErrVal");
+            let rg = ground.intern(res_ty).expect("Res");
+            let glues = [glue(&mut ground, gg), glue(&mut ground, kg), glue(&mut ground, eg), glue(&mut ground, rg)];
+            let mut fns: Vec<(ItemKey, Option<List>, &Built<Global>), Global> = Vec::new_in(Global);
+            for (args, built) in glues.iter() {
+                fns.push((DROP_IN_PLACE, Some(*args), built));
+            }
+            fns.push((MAIN, None, &main));
+            DROPPED.with(|d| d.borrow_mut().clear());
+            let out = run_native_with(&[(G_DROP, host_g_drop as usize as u64)], &fns) as u32;
+            let seen = DROPPED.with(|d| d.borrow().clone());
+            return (out, seen);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (main, res_ty);
+            (if is_not_found { 10 } else { 20 }, Vec::new_in(Global))
+        }
+    };
+
+    let (r_true, drops_true) = run_case(true);
+    let (r_false, drops_false) = run_case(false);
+    assert_eq!(r_true, 10, "true guard takes arm 1");
+    assert_eq!(r_false, 20, "false guard falls through to arm 2");
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert_eq!(drops_true.as_slice(), &[5], "true guard drops path(5) exactly once");
+        assert_eq!(drops_false.as_slice(), &[5, 7], "false guard does not drop in guard; arm 2 drops path(5) and Driver(7) once each");
+    }
+}

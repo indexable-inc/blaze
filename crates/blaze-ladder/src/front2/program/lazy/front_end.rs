@@ -463,12 +463,18 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     /// As `Front2Program::code_of`, its text over the source.
     fn code_of(&self, i: usize) -> ContentId {
         let owner = self.rows.key[i];
+        let text = self.item_text(i);
+        crate::front2::consts::item_code_id(owner, text)
+    }
+
+    fn item_text(&self, i: usize) -> Option<&str> {
+        let owner = self.rows.key[i];
         let text = match (self.store.locals.head(owner), self.front.keys.library_in(self.front.names, owner)) {
             (Some(local), _) => Some(local.text),
             (None, Some(lib)) => self.front.names.text_of(lib).map(|t| t.text),
             (None, None) => self.store.fns.get(&owner).map(|h| h.text),
         };
-        crate::front2::consts::item_code_id(owner, text)
+        text.filter(|t| !t.is_empty())
     }
 
     // (2) The body's world.
