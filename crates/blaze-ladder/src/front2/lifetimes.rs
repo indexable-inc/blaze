@@ -1298,15 +1298,16 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                     }
                     let mut todo: List<lf::TypeId> = Vec::new_in(self.alloc);
                     let plain = self.quiet_path_bound(v, path, &bound, &mut todo, 0)? && self.quiet_all_bound(v, &bound, todo, 0)?;
+                    let root_lts = self.materialize_bare_root_lts(v, path, &bound, found.key, mode, at)?;
                     let r = match p.ctx {
                         Ctx::Ref(r) | Ctx::Adt(AdtParamBound::Unique(r)) => r,
-                        Ctx::Adt(AdtParamBound::None) | Ctx::Other => match self.trait_object_default(v, path, &bound, found.key)? {
+                        Ctx::Adt(AdtParamBound::None) | Ctx::Other => match self.trait_object_default(found.key, &root_lts)? {
                             TraitObjDefault::Resolved(r) => r,
                             TraitObjDefault::Unknown => return Err(LifeRefusal::ObjectDefault { at }),
                         },
                         Ctx::Adt(AdtParamBound::Ambiguous) => return Err(LifeRefusal::ObjectDefault { at }),
                     };
-                    if mode == Elide::Input && !plain && !self.record_bare_object_inputs(v, path, &bound, at)? {
+                    if mode == Elide::Input && !plain && !self.record_bare_object_inputs(v, path, &bound, &root_lts, at)? {
                         self.outside = true;
                     }
                     let idx = usize::try_from(p.base).map_err(|_| unaligned)?;
@@ -1344,18 +1345,23 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
         }
     }
 
-    /// Computes the trait-bound object-lifetime default for bare trait object path `path`
-    /// resolving to `found_key` (the Reference, "Default trait object lifetimes"):
-    /// - if `'static` appears on any lifetime bound of the trait or its supertraits -> `'static`;
-    /// - else if a single distinct lifetime bound appears -> that lifetime;
-    /// - else if no lifetime bounds appear anywhere on the trait or its supertraits -> `'static`;
-    /// - else (multiple distinct bounds, higher-ranked/elided bound, or unreadable/overflowed
-    ///   supertrait graph) -> `TraitObjDefault::Unknown` (caller refuses `ObjectDefault`).
-    fn trait_object_default(&mut self, v: &View<'_>, path: tc::PathIdx, bound: &[u64], found_key: LibKey) -> Result<TraitObjDefault, LifeRefusal> {
-        const MOST_DEFAULT_WALK: usize = 64;
+    /// Materializes the root lifetime arguments of bare trait object path `path` targeting
+    /// `found_key` once so both [`Self::trait_object_default`] and
+    /// [`Self::record_bare_object_inputs`] share the exact same regions (including elided `'_`
+    /// and omitted trait/alias lifetime arguments such as `trait Tr<'a>: 'a {}; fn f(_: *const Tr)`).
+    fn materialize_bare_root_lts(
+        &mut self,
+        v: &View<'_>,
+        path: tc::PathIdx,
+        bound: &[u64],
+        found_key: LibKey,
+        mode: Elide,
+        at: Range,
+    ) -> Result<List<Option<Region>>, LifeRefusal> {
         let alloc = self.alloc;
-        let (_, _, segs, _) = super::types::path_texts_of(v, path, true).map_err(|_| LifeRefusal::Form)?;
+        let (_, _, segs, pat) = super::types::path_texts_of(v, path, true).map_err(|_| LifeRefusal::Form)?;
         let mut root_args: List<Option<Region>> = Vec::new_in(alloc);
+        let parenthesized = segs.last().is_some_and(|s| s.parenthesized);
         if let Some(last) = segs.last()
             && last.has_args
             && !last.parenthesized
@@ -1365,14 +1371,41 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                     if bound.contains(&v.name(nm)?) {
                         root_args.push(None);
                     } else {
-                        root_args.push(self.written(v, nm)?);
+                        let r = self.site_region(v, Some(nm), mode, pat)?;
+                        root_args.push(Some(r));
                     }
                 }
             }
         }
+        if root_args.is_empty()
+            && !parenthesized
+            && let Ok(declared) = self.lifetimes_of(found_key)
+        {
+            for _ in 0..declared {
+                let r = self.elided(mode, at)?;
+                if mode == Elide::Input {
+                    self.record_used(r);
+                }
+                root_args.push(Some(r));
+            }
+        }
+        Ok(root_args)
+    }
+
+    /// Computes the trait-bound object-lifetime default for bare trait object `found_key` with
+    /// already-materialized lifetime arguments `root_args` (the Reference, "Default trait object
+    /// lifetimes"):
+    /// - if `'static` appears on any lifetime bound of the trait or its supertraits -> `'static`;
+    /// - else if a single distinct lifetime bound appears -> that lifetime;
+    /// - else if no lifetime bounds appear anywhere on the trait or its supertraits -> `'static`;
+    /// - else (multiple distinct bounds, higher-ranked/elided bound, or unreadable/overflowed
+    ///   supertrait graph) -> `TraitObjDefault::Unknown` (caller refuses `ObjectDefault`).
+    fn trait_object_default(&mut self, found_key: LibKey, root_args: &[Option<Region>]) -> Result<TraitObjDefault, LifeRefusal> {
+        const MOST_DEFAULT_WALK: usize = 64;
+        let alloc = self.alloc;
         let mut arg_pool: List<Option<Region>> = Vec::new_in(alloc);
         let root_len = u32::try_from(root_args.len()).map_err(|_| LifeRefusal::Bound)?;
-        arg_pool.extend_from_slice(&root_args);
+        arg_pool.extend_from_slice(root_args);
         let mut work: List<(LibKey, u32, u32)> = Vec::new_in(alloc);
         work.push((found_key, 0, root_len));
 
@@ -1556,22 +1589,30 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
     /// input lifetime into `self.used` so output elision still succeeds when all input lifetimes
     /// agree (e.g. `fn f<'a>(x: &'a Tr<'a>) -> &u8`). Returns `Ok(false)` if any form cannot be
     /// walked completely (caller sets `self.outside = true`).
-    fn record_bare_object_inputs(&mut self, v: &View<'_>, path: tc::PathIdx, bound: &[u64], at: Range) -> Result<bool, LifeRefusal> {
+    fn record_bare_object_inputs(
+        &mut self,
+        v: &View<'_>,
+        path: tc::PathIdx,
+        bound: &[u64],
+        root_lts: &[Option<Region>],
+        at: Range,
+    ) -> Result<bool, LifeRefusal> {
         let mut todo: List<(lf::TypeId, bool)> = Vec::new_in(self.alloc);
-        if !self.record_path_inputs(v, path, bound, None, false, at, &mut todo, 0)? {
+        if !self.record_path_inputs(v, path, bound, None, Some(root_lts), false, at, &mut todo, 0)? {
             return Ok(false);
         }
         self.record_all_inputs(v, bound, None, at, todo, 0)
     }
 
     /// Records the lifetimes written or elided on path `p`, pushing its type arguments to `todo`.
-    #[expect(clippy::too_many_arguments, reason = "one path input walk: view, path, bound set, optional alias lifetime map, parenthesized flag, site, worklist, depth")]
+    #[expect(clippy::too_many_arguments, reason = "one path input walk: view, path, bound set, optional alias/root lifetime maps, parenthesized flag, site, worklist, depth")]
     fn record_path_inputs(
         &mut self,
         v: &View<'_>,
         p: tc::PathIdx,
         bound: &[u64],
         alias_map: Option<(&[u64], &[Option<Region>])>,
+        pre_root_lts: Option<&[Option<Region>]>,
         elide_bound: bool,
         at: Range,
         todo: &mut List<(lf::TypeId, bool)>,
@@ -1620,6 +1661,9 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                     }
                     lf::GenericArg::AssocType { args, ty, .. } if v.rows(args)?.is_empty() => todo.push((ty, elide_bound)),
                     lf::GenericArg::Lifetime(nm) => {
+                        if is_last && pre_root_lts.is_some() {
+                            continue;
+                        }
                         let Some(opt_r) = self.record_written_lt(v, nm, bound, alias_map, elide_bound, pat)? else {
                             return Ok(false);
                         };
@@ -1642,12 +1686,13 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
         if usize::try_from(found.consumed).ok() != Some(texts.len()) {
             return Ok(false);
         }
+        let eff_lts: &[Option<Region>] = pre_root_lts.unwrap_or(&last_lts);
         match found.kind {
             Kind::Builtin(_) => Ok(true),
             Kind::Struct | Kind::Enum | Kind::Union | Kind::Trait => {
                 let Ok(declared) = self.lifetimes_of(found.key) else { return Ok(false) };
                 let mut lt_vals: List<Option<Region>> = Vec::with_capacity_in(usize::try_from(declared).unwrap_or(0), self.alloc);
-                if last_lts.is_empty() {
+                if eff_lts.is_empty() {
                     for _ in 0..declared {
                         if elide_bound {
                             lt_vals.push(None);
@@ -1657,14 +1702,14 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                             lt_vals.push(Some(r));
                         }
                     }
-                } else if u32::try_from(last_lts.len()).ok() == Some(declared) {
-                    lt_vals.extend_from_slice(&last_lts);
+                } else if u32::try_from(eff_lts.len()).ok() == Some(declared) {
+                    lt_vals.extend_from_slice(eff_lts);
                 } else {
                     return Ok(false);
                 }
                 self.record_omitted_defaults_inputs(found.key, written_pos_args, &lt_vals, elide_bound, at, depth)
             }
-            Kind::TraitAlias => self.record_trait_alias_inputs(found.key, &last_lts, written_pos_args, elide_bound, at, depth),
+            Kind::TraitAlias => self.record_trait_alias_inputs(found.key, eff_lts, written_pos_args, elide_bound, at, depth),
             _ => Ok(false),
         }
     }
@@ -1894,7 +1939,7 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                     let binder_rows = v.rows(binder)?;
                     let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(false) };
                     if binder_rows.is_empty() {
-                        if !self.record_path_inputs(v, p, bound, alias_map, elide_bound, at, todo, depth)? {
+                        if !self.record_path_inputs(v, p, bound, alias_map, None, elide_bound, at, todo, depth)? {
                             return Ok(false);
                         }
                     } else {
@@ -1906,7 +1951,7 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                             }
                         }
                         let mut sub_todo: List<(lf::TypeId, bool)> = Vec::new_in(self.alloc);
-                        if !self.record_path_inputs(v, p, &nested, alias_map, elide_bound, at, &mut sub_todo, depth)? {
+                        if !self.record_path_inputs(v, p, &nested, alias_map, None, elide_bound, at, &mut sub_todo, depth)? {
                             return Ok(false);
                         }
                         if !self.record_all_inputs(v, &nested, alias_map, at, sub_todo, depth)? {
@@ -1968,7 +2013,7 @@ impl<'c, 'n, S: NamesSource<'n>> Reader<'c, 'n, S> {
                     }
                 }
                 lf::TypeRef::Path(p) => {
-                    if !self.record_path_inputs(v, p, bound, alias_map, elide_bound, at, &mut todo, depth)? {
+                    if !self.record_path_inputs(v, p, bound, alias_map, None, elide_bound, at, &mut todo, depth)? {
                         return Ok(false);
                     }
                 }

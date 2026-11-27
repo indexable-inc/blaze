@@ -1162,7 +1162,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 if usize::try_from(found.consumed).ok() != Some(texts.len()) {
                     return Err(Why::Unsupported("a const argument on an associated item's path", r));
                 }
-                let at = if found.kind == Kind::Trait { index + 1 } else { index };
+                let at = if matches!(found.kind, Kind::Trait | Kind::TraitAlias) { index + 1 } else { index };
                 let consts = self.heads.const_params(found.key).ok_or(Why::Need(found.key))?;
                 match consts.iter().find(|(i, _)| *i == at) {
                     Some(&(_, t)) => Ok(t),
@@ -5809,7 +5809,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 let all_auto = head.traits.iter().all(|&(tk, _)| self.heads.trait_auto(tk) == Some(true));
                 no_projs && all_auto
             };
-            let mut principal_alias: Option<(LibKey, PathIdx, lf::Segment)> = None;
+            let mut principal_alias: Option<(LibKey, PathIdx, lf::Segment, lf::List)> = None;
             let mut has_direct_principal = false;
             let mut extra_obj_lt: Option<Slot> = None;
             let mut extra_obj_written = 0u32;
@@ -5844,6 +5844,12 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                         let Some((bp, bseg)) = super::dyn_ty::dyn_bound(av, lf::Bound::Trait { ty, binder, mods }, r)? else {
                             continue;
                         };
+                        let mut bound_names: blaze_own::Vec<Name, Alloc<'s>> = blaze_own::Vec::new_in(alloc);
+                        for &brow in av.rows(binder)? {
+                            if let lf::GenericParam::Lifetime { name, .. } = lf::GenericParam::decode(brow)? {
+                                bound_names.push(Name(av.name(name)?));
+                            }
+                        }
                         let (babs, btexts, _, br) = path_texts_of(av, bp, true)?;
                         let found = match super::item_site::resolve_written(&self.resolver, marks, alias_text.module, av, bp, babs, &btexts, Ns::Type, br) {
                             Ok(f) if usize::try_from(f.consumed).ok() == Some(btexts.len()) => f,
@@ -5851,9 +5857,6 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                             _ => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::Resolve, r))),
                         };
                         if found.kind == Kind::TraitAlias {
-                            if !av.rows(binder)?.is_empty() {
-                                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
-                            }
                             if is_auto_only_alias(found.key) {
                                 // Collect any lifetime or trait default bound from this pure
                                 // auto-trait alias without refusing multiple nested aliases.
@@ -5867,9 +5870,15 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                                 "_" => s.new_elided(r),
                                                 _ => {
                                                     let name = Name(av.name(nm)?);
-                                                    match lt_names.iter().position(|&x| x == name).and_then(|pos| given_lts.get(pos).copied()) {
-                                                        Some(k) => k,
-                                                        None => return Ok(Err(RegionRefusal::Undeclared { at: r })),
+                                                    if let Some(bpos) = bound_names.iter().position(|&x| x == name) {
+                                                        let Ok(v) = u32::try_from(bpos) else {
+                                                            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::TooMany, r)));
+                                                        };
+                                                        SlotKind::Bound(v)
+                                                    } else if let Some(k) = lt_names.iter().position(|&x| x == name).and_then(|pos| given_lts.get(pos).copied()) {
+                                                        k
+                                                    } else {
+                                                        return Ok(Err(RegionRefusal::Undeclared { at: r }));
                                                     }
                                                 }
                                             };
@@ -5892,7 +5901,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 if principal_alias.is_some() || has_direct_principal {
                                     return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
                                 }
-                                principal_alias = Some((found.key, bp, bseg));
+                                principal_alias = Some((found.key, bp, bseg, binder));
                             }
                         } else if found.kind == Kind::Trait {
                             if self.heads.trait_auto(found.key) != Some(true) {
@@ -5911,9 +5920,15 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                             "_" => s.new_elided(r),
                                             _ => {
                                                 let name = Name(av.name(nm)?);
-                                                match lt_names.iter().position(|&x| x == name).and_then(|pos| given_lts.get(pos).copied()) {
-                                                    Some(k) => k,
-                                                    None => return Ok(Err(RegionRefusal::Undeclared { at: r })),
+                                                if let Some(bpos) = bound_names.iter().position(|&x| x == name) {
+                                                    let Ok(v) = u32::try_from(bpos) else {
+                                                        return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::TooMany, r)));
+                                                    };
+                                                    SlotKind::Bound(v)
+                                                } else if let Some(k) = lt_names.iter().position(|&x| x == name).and_then(|pos| given_lts.get(pos).copied()) {
+                                                    k
+                                                } else {
+                                                    return Ok(Err(RegionRefusal::Undeclared { at: r }));
                                                 }
                                             }
                                         };
@@ -5940,14 +5955,26 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             if extra_obj_written > 1 {
                 return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynLifetimes, r)));
             }
-            if let Some((sub_alias_key, _bp, bseg)) = principal_alias {
-                // Nested trait alias (`trait B<'b> = A<'b> + Auto + 'b;`): substitute lifetime and
-                // type arguments passed to `sub_alias_key`, then recurse.
+            if let Some((sub_alias_key, _bp, bseg, b_binder)) = principal_alias {
+                // Nested trait alias (`trait B<'b> = A<'b> + Auto + 'b;`): substitute lifetime,
+                // type, and const arguments (plus any `for<'a>` binder) passed to `sub_alias_key`,
+                // then recurse.
                 if bseg.parenthesized {
                     return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
                 }
+                let mut b_names: blaze_own::Vec<Name, Alloc<'s>> = blaze_own::Vec::new_in(alloc);
+                for &brow in av.rows(b_binder)? {
+                    if let lf::GenericParam::Lifetime { name, .. } = lf::GenericParam::decode(brow)? {
+                        b_names.push(Name(av.name(name)?));
+                    }
+                }
+                #[derive(Clone, Copy)]
+                enum NestedAliasArg {
+                    Type(lf::TypeId),
+                    Const(lf::ConstIdx),
+                }
                 let mut sub_lts: blaze_own::Vec<SlotKind, Alloc<'s>> = blaze_own::Vec::new_in(alloc);
-                let mut sub_arg_tys: blaze_own::Vec<lf::TypeId, Alloc<'s>> = blaze_own::Vec::new_in(alloc);
+                let mut sub_arg_items: blaze_own::Vec<NestedAliasArg, Alloc<'s>> = blaze_own::Vec::new_in(alloc);
                 if bseg.has_args {
                     for &arow in av.rows(bseg.args)? {
                         match lf::GenericArg::decode(arow)? {
@@ -5958,28 +5985,79 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                     "_" => s.new_elided(r),
                                     _ => {
                                         let name = Name(av.name(nm)?);
-                                        match lt_names.iter().position(|&x| x == name).and_then(|pos| given_lts.get(pos).copied()) {
-                                            Some(k) => k,
-                                            None => return Ok(Err(RegionRefusal::Undeclared { at: r })),
+                                        if let Some(bpos) = b_names.iter().position(|&x| x == name) {
+                                            let Ok(v) = u32::try_from(bpos) else {
+                                                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::TooMany, r)));
+                                            };
+                                            SlotKind::Bound(v)
+                                        } else if let Some(k) = lt_names.iter().position(|&x| x == name).and_then(|pos| given_lts.get(pos).copied()) {
+                                            k
+                                        } else {
+                                            return Ok(Err(RegionRefusal::Undeclared { at: r }));
                                         }
                                     }
                                 };
                                 sub_lts.push(kind);
                             }
-                            lf::GenericArg::Type(t) => sub_arg_tys.push(t),
-                            lf::GenericArg::Const(_) => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r))),
+                            lf::GenericArg::Type(t) => sub_arg_items.push(NestedAliasArg::Type(t)),
+                            lf::GenericArg::Const(c) => sub_arg_items.push(NestedAliasArg::Const(c)),
                             _ => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r))),
                         }
                     }
                 }
-                let mut sub_args: blaze_own::Vec<PTy, Alloc<'s>> = blaze_own::Vec::with_capacity_in(sub_arg_tys.len(), alloc);
+                let sub_cs = self.heads.const_params(sub_alias_key).unwrap_or(&[]);
+                let mut sub_args: blaze_own::Vec<PTy, Alloc<'s>> = blaze_own::Vec::with_capacity_in(sub_arg_items.len(), alloc);
                 let mut sub_pool: blaze_own::Vec<Slot, Alloc<'s>> = blaze_own::Vec::new_in(alloc);
-                let mut sub_index: blaze_own::Vec<(u32, u32, u32), Alloc<'s>> = blaze_own::Vec::with_capacity_in(sub_arg_tys.len(), alloc);
+                let mut sub_index: blaze_own::Vec<(u32, u32, u32), Alloc<'s>> = blaze_own::Vec::with_capacity_in(sub_arg_items.len(), alloc);
                 let mut elided_map: blaze_own::Vec<(u32, SlotKind), Alloc<'s>> = blaze_own::Vec::new_in(alloc);
                 let mut subst_args: blaze_own::Vec<PTy, Alloc<'s>> = blaze_own::Vec::with_capacity_in(all_args.len() + 1, alloc);
                 subst_args.push(intern(tys, PNode::Param(u32::MAX))?);
                 subst_args.extend_from_slice(&all_args);
-                for &at_id in &sub_arg_tys {
+                for (arg_pos, &item) in sub_arg_items.iter().enumerate() {
+                    let sub_const_ty = u32::try_from(arg_pos.saturating_add(1))
+                        .ok()
+                        .and_then(|pi| sub_cs.iter().find(|&&(ci, _)| ci == pi).map(|&(_, ty)| ty));
+                    let at_id = match item {
+                        NestedAliasArg::Const(c) => {
+                            let Some(want_ty) = sub_const_ty else {
+                                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
+                            };
+                            let at = av.const_range(c)?;
+                            let cr = av.site(at)?;
+                            let raw_c = match alias_builder.const_term(tys, &alias_env, av.text_at(at)?, cr, &|_| Ok(want_ty)) {
+                                Ok(t) => t,
+                                Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
+                                Err(_) => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r))),
+                            };
+                            sub_index.push((0, 0, 0));
+                            sub_args.push(subst(tys, raw_c, &subst_args)?);
+                            continue;
+                        }
+                        NestedAliasArg::Type(t) => {
+                            if let Some(nm) = bare_name(av, t)? {
+                                if let Some(&(_, pidx)) = alias_env.params.iter().find(|(n, _)| *n == Name::of(nm))
+                                    && alias_env.consts.iter().any(|&(c, _)| c == pidx)
+                                {
+                                    let raw_c = intern(tys, PNode::Param(pidx))?;
+                                    sub_index.push((0, 0, 0));
+                                    sub_args.push(subst(tys, raw_c, &subst_args)?);
+                                    continue;
+                                }
+                                if let Some(want_ty) = sub_const_ty {
+                                    let cr = av.site(av.type_range(t)?)?;
+                                    let raw_c = match alias_builder.const_term(tys, &alias_env, nm, cr, &|_| Ok(want_ty)) {
+                                        Ok(c) => c,
+                                        Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
+                                        Err(_) => return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r))),
+                                    };
+                                    sub_index.push((0, 0, 0));
+                                    sub_args.push(subst(tys, raw_c, &subst_args)?);
+                                    continue;
+                                }
+                            }
+                            t
+                        }
+                    };
                     let mut tmp_sink = RegionSink::new_in(alloc);
                     tmp_sink.default_depth = s.default_depth + 1;
                     let raw_a = match alias_builder.ty_regions(tys, &alias_env, av, at_id, &mut tmp_sink) {
@@ -6029,13 +6107,20 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                                 let mapped = match dslot.kind {
                                     SlotKind::Static => Slot { kind: SlotKind::Static, counts: dslot.counts },
                                     SlotKind::Named(name, _) => {
-                                        let Some(pos) = lt_names.iter().position(|&n| n == name) else {
-                                            return Ok(Err(RegionRefusal::Undeclared { at: r }));
-                                        };
-                                        let Some(&k) = given_lts.get(pos) else {
-                                            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
-                                        };
-                                        Slot { kind: k, counts: dslot.counts }
+                                        if let Some(bpos) = b_names.iter().position(|&n| n == name) {
+                                            let Ok(v) = u32::try_from(bpos) else {
+                                                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::TooMany, r)));
+                                            };
+                                            Slot { kind: SlotKind::Bound(v), counts: dslot.counts }
+                                        } else {
+                                            let Some(pos) = lt_names.iter().position(|&n| n == name) else {
+                                                return Ok(Err(RegionRefusal::Undeclared { at: r }));
+                                            };
+                                            let Some(&k) = given_lts.get(pos) else {
+                                                return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r)));
+                                            };
+                                            Slot { kind: k, counts: dslot.counts }
+                                        }
                                     }
                                     SlotKind::Late { binder, var } => match usize::try_from(binder).ok().and_then(|bi| binder_at.get(bi)) {
                                         Some(&b) => Slot { kind: SlotKind::Late { binder: b, var }, counts: dslot.counts },
@@ -6103,6 +6188,19 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     Ok(b) => b,
                     Err(why) => return Ok(Err(why)),
                 };
+                if !b_names.is_empty() {
+                    let mut base = 0u32;
+                    for slot in s.scratch.iter() {
+                        if let SlotKind::Late { binder: 0, var } = slot.kind {
+                            base = base.max(var.saturating_add(1));
+                        }
+                    }
+                    for slot in s.scratch.iter_mut() {
+                        if let SlotKind::Bound(var) = slot.kind {
+                            slot.kind = SlotKind::Late { binder: 0, var: base.saturating_add(var) };
+                        }
+                    }
+                }
                 if let Some(first) = s.scratch.first_mut() {
                     if let Some(explicit) = extra_obj_lt {
                         *first = explicit;

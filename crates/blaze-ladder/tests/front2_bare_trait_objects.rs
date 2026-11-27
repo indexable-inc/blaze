@@ -1478,3 +1478,131 @@ fn takes_sub_alias_proj<'a>(_x: &'a SubAlias<'a, A = &'a u8>) {}
         );
     }
 }
+
+/// Round 7 Findings 1, 2, and 3:
+/// 1. Omitted trait lifetimes on bare trait objects (`trait Tr<'a>: 'a {}; fn f(_: *const Tr) {}`,
+///    `fn g(_: *const Tr) -> &u8`, `fn h(_: *const Tr<'_>) -> &u8`) are materialized and shared
+///    before deriving the trait-bound object default so `fn_life` and `store.regions` succeed.
+/// 2. Nested trait aliases propagating const arguments (`trait Gen<const N: usize> {};
+///    trait Inner<const N: usize> = Gen<N>; trait Outer = Inner<3>;
+///    trait OuterParam<const M: usize> = Inner<M>;`) lower and lay cleanly.
+/// 3. Higher-ranked (`for<'a>`) binders on trait-alias bounds (`trait Tr<'a> {};
+///    trait Alias = for<'a> Tr<'a>;` and nested `trait Outer = for<'a> Inner<'a>;` /
+///    `trait OuterRef = for<'a> InnerRef<&'a u8>;`) are carried through alias region layout.
+#[test]
+fn round7_omitted_trait_lt_nested_alias_const_and_alias_hrtb() {
+    const PROG: &str = "#![feature(no_core, lang_items, trait_alias)]
+#![no_core]
+
+#[lang = \"sized\"]
+trait Sized {}
+
+trait Tr<'a>: 'a {}
+trait TrAlias<'a> = Tr<'a> + 'a;
+
+fn takes_ptr_omitted(_p: *const Tr) {}
+fn ptr_omitted_elide(_p: *const Tr) -> &u8 { loop {} }
+fn ptr_anon_elide(_p: *const Tr<'_>) -> &u8 { loop {} }
+fn takes_ptr_alias_omitted(_p: *const TrAlias) {}
+fn ret_ptr_omitted(_x: &u8) -> *const Tr { loop {} }
+
+trait Gen<const N: usize> {}
+trait InnerConst<const N: usize> = Gen<N>;
+trait OuterConst = InnerConst<3>;
+trait OuterConstParam<const M: usize> = InnerConst<M>;
+
+fn takes_outer_const(_x: &OuterConst) {}
+fn takes_outer_const_param(_x: &OuterConstParam<5>) {}
+
+trait TrHrtb<'a> {}
+trait AliasHrtb = for<'a> TrHrtb<'a>;
+trait InnerHrtb<'a> = TrHrtb<'a>;
+trait OuterHrtb = for<'a> InnerHrtb<'a>;
+
+trait TrRef<T> {}
+trait AliasHrtbRef = for<'a> TrRef<&'a u8>;
+trait InnerHrtbRef<T> = TrRef<T>;
+trait OuterHrtbRef = for<'a> InnerHrtbRef<&'a u8>;
+
+fn takes_dyn_hrtb(_x: &(dyn for<'a> TrHrtb<'a>)) {}
+fn takes_alias_hrtb(_x: &AliasHrtb) {}
+fn alias_hrtb_elide(_x: &AliasHrtb) -> &u8 { loop {} }
+fn takes_outer_hrtb(_x: &OuterHrtb) {}
+fn takes_alias_hrtb_ref(_x: &AliasHrtbRef) {}
+fn takes_outer_hrtb_ref(_x: &OuterHrtbRef) {}
+";
+    let files = [SourceFile { path: "src/main.rs", text: PROG }];
+    let tc = Toolchain::none(Alloc::global());
+    let new = NewFront { package: "bare_r7", edition: "2018", shelf: None, overflow: blaze_build::OverflowChecks::On };
+    let texts = blaze_ladder::program_texts::ProgramTexts::new(&files, "src/main.rs", new, &tc, blaze_build::Panic::Unwind)
+        .unwrap_or_else(|e| panic!("ProgramTexts: {e}"));
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("Inputs: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates, blaze_own::testing::bump()).unwrap_or_else(|e| panic!("resolve: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("frame");
+    let mut front = Front2::new(&names, &frame, &files, Alloc::global()).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame, Alloc::global());
+
+    use blaze_typeck::regions::Region as R;
+
+    // Finding 1: omitted / `'_` trait lifetimes on bare trait objects resolve via materialized input region.
+    for (fn_name, expected_life, expected_reg) in [
+        ("takes_ptr_omitted", &[Region::Anon(0)][..], &[R::Param(0), R::Param(0)][..]),
+        ("ptr_omitted_elide", &[Region::Anon(0), Region::Anon(0)][..], &[R::Param(0), R::Param(0)][..]),
+        ("ptr_anon_elide", &[Region::Anon(0), Region::Anon(0)][..], &[R::Param(0), R::Param(0)][..]),
+        ("takes_ptr_alias_omitted", &[Region::Anon(0)][..], &[R::Param(0), R::Param(0)][..]),
+    ] {
+        let k = key_of(&names, Namespace::Values, fn_name);
+        let lib = front.keys.library_in(&names, k).expect("lib key");
+        store.ensure(&names, &mut front.keys, Want::Fn(lib)).unwrap_or_else(|e| panic!("{fn_name}: {e:?}"));
+        let life = store.fn_life(&names, &front.keys, k).unwrap_or_else(|e| panic!("{fn_name} fn_life: {e:?}"));
+        assert_eq!(life.regions.as_slice(), expected_life, "{fn_name} fn_life");
+        let reg = store.regions.made(k).unwrap_or_else(|| panic!("{fn_name} regions unread: {:?}", store.regions.unread(k)));
+        assert_eq!(
+            reg.regions().sig_view().expect("sig").col.child(0).expect("input 0"),
+            expected_reg,
+            "{fn_name} input 0 regions"
+        );
+    }
+    {
+        let k = key_of(&names, Namespace::Values, "ret_ptr_omitted");
+        let lib = front.keys.library_in(&names, k).expect("lib key");
+        store.ensure(&names, &mut front.keys, Want::Fn(lib)).unwrap_or_else(|e| panic!("ret_ptr_omitted: {e:?}"));
+        let life = store.fn_life(&names, &front.keys, k).unwrap_or_else(|e| panic!("ret_ptr_omitted fn_life: {e:?}"));
+        assert_eq!(life.regions.as_slice(), &[Region::Anon(0), Region::Anon(0)], "ret_ptr_omitted fn_life");
+    }
+
+    // Finding 2: nested trait aliases with const arguments (`InnerConst<3>` and `InnerConst<M>`).
+    for fn_name in ["takes_outer_const", "takes_outer_const_param"] {
+        let k = key_of(&names, Namespace::Values, fn_name);
+        let lib = front.keys.library_in(&names, k).expect("lib key");
+        store.ensure(&names, &mut front.keys, Want::Fn(lib)).unwrap_or_else(|e| panic!("{fn_name}: {e:?}"));
+        let reg = store.regions.made(k).unwrap_or_else(|| panic!("{fn_name} regions unread: {:?}", store.regions.unread(k)));
+        assert_eq!(
+            reg.regions().sig_view().expect("sig").col.child(0).expect("input 0"),
+            &[R::Param(0), R::Param(0)],
+            "{fn_name} input 0 regions"
+        );
+    }
+
+    // Finding 3: HRTB binders (`for<'a>`) on direct and nested trait aliases match explicit `dyn for<'a>`.
+    for fn_name in ["takes_dyn_hrtb", "takes_alias_hrtb", "takes_outer_hrtb", "takes_alias_hrtb_ref", "takes_outer_hrtb_ref"] {
+        let k = key_of(&names, Namespace::Values, fn_name);
+        let lib = front.keys.library_in(&names, k).expect("lib key");
+        store.ensure(&names, &mut front.keys, Want::Fn(lib)).unwrap_or_else(|e| panic!("{fn_name}: {e:?}"));
+        let reg = store.regions.made(k).unwrap_or_else(|| panic!("{fn_name} regions unread: {:?}", store.regions.unread(k)));
+        assert_eq!(
+            reg.regions().sig_view().expect("sig").col.child(0).expect("input 0"),
+            &[R::Param(0), R::Param(0), R::Late { binder: 1, var: 0 }],
+            "{fn_name} input 0 regions"
+        );
+    }
+    {
+        let k = key_of(&names, Namespace::Values, "alias_hrtb_elide");
+        let lib = front.keys.library_in(&names, k).expect("lib key");
+        store.ensure(&names, &mut front.keys, Want::Fn(lib)).unwrap_or_else(|e| panic!("alias_hrtb_elide: {e:?}"));
+        let life = store.fn_life(&names, &front.keys, k).unwrap_or_else(|e| panic!("alias_hrtb_elide fn_life: {e:?}"));
+        assert_eq!(life.regions.as_slice(), &[Region::Anon(0), Region::Anon(0), Region::Anon(0)], "alias_hrtb_elide fn_life");
+    }
+}
