@@ -118,15 +118,45 @@ fn world() -> Fx {
     let wide_tree_box_p0 = fx.adt(wide_k, &[deep_marker, box_t]);
     fx.func("wide_box", 1, &[p0], wide_tree_box_p0, Vec::new());
 
+    // Non-DAG-shared 260-deep chain `Nest<Nest<...<T>...>>` plus parameterized DAG tree `PairTree<T>`
+    // to test slice-tail identity & non-identical marker coercions (both within and past 256 nodes).
+    let nest_k = fx.strukt("Nest", 1, &[]);
+    let u8_ = fx.u8();
+    let slice_u8 = fx.ty(PNode::Slice(u8_));
+    let box_slice_u8 = fx.adt(box_k, &[slice_u8]);
+
+    let mut dag_marker_p0 = p0;
+    let mut dag_marker_u32 = u32_;
+    for _ in 0..8 {
+        dag_marker_p0 = fx.adt(pair_k, &[dag_marker_p0, dag_marker_p0]);
+        dag_marker_u32 = fx.adt(pair_k, &[dag_marker_u32, dag_marker_u32]);
+    }
+    let mut chain_p0 = p0;
+    let mut chain_u32 = u32_;
+    for _ in 0..260 {
+        chain_p0 = fx.adt(nest_k, &[chain_p0]);
+        chain_u32 = fx.adt(nest_k, &[chain_u32]);
+    }
+    let wide_deep_slice = fx.adt(wide_k, &[deep_marker, box_slice_u8]);
+    let wide_dag_p0_slice = fx.adt(wide_k, &[dag_marker_p0, box_slice_u8]);
+    let wide_dag_u32_slice = fx.adt(wide_k, &[dag_marker_u32, box_slice_u8]);
+    let wide_chain_p0_slice = fx.adt(wide_k, &[chain_p0, box_slice_u8]);
+    let wide_chain_u32_slice = fx.adt(wide_k, &[chain_u32, box_slice_u8]);
+
+    fx.func("mk_wide_dag_slice", 1, &[], wide_dag_p0_slice, Vec::new());
+    fx.func("mk_wide_chain_slice", 1, &[], wide_chain_p0_slice, Vec::new());
+
     let pin_box_t = fx.adt(pin_k, &[box_t]);
     fx.func("box_new", 1, &[p0], box_t, Vec::new());
+    fx.func("pin_new", 1, &[p0], pin_p, Vec::new());
     fx.func("box_pin", 1, &[p0], pin_box_t, Vec::new());
     let ptr_mut_p0 = fx.ty(PNode::Ptr(Mutbl::Mut, p0));
     fx.func("as_raw_mut", 1, &[m_self], ptr_mut_p0, Vec::new());
 
-    // Reflexive helpers:
+    // Reflexive & nested-unresolved helpers:
     // fn make_ref_fn<T: ?Sized, F: FnOnce(&T) -> ()>(f: F) -> F
     // fn make_box_fn<T: ?Sized, F: FnOnce(Box<T>) -> ()>(f: F) -> F
+    // fn make_pin_fn<P, F: FnOnce(Pin<P>) -> ()>(f: F) -> F
     let args_ref_t = fx.tuple(&[r_self]);
     let f1_ref = fx.bound(fn_once, &[p1, args_ref_t]);
     let f1_ref_out = fx.proj(fn_once, &[p1, args_ref_t], "Output", unit);
@@ -138,6 +168,11 @@ fn world() -> Fx {
     let f1_box_out = fx.proj(fn_once, &[p1, args_box_t], "Output", unit);
     let mbf = fx.func("make_box_fn", 2, &[p1], p1, std::vec![f1_box, f1_box_out]);
     fx.unsized_fn_param(mbf, 0);
+
+    let args_pin_p = fx.tuple(&[pin_p]);
+    let f1_pin = fx.bound(fn_once, &[p1, args_pin_p]);
+    let f1_pin_out = fx.proj(fn_once, &[p1, args_pin_p], "Output", unit);
+    fx.func("make_pin_fn", 2, &[p1], p1, std::vec![f1_pin, f1_pin_out]);
 
     // Result<T, E> with map_err<O, F: FnOnce(E) -> O>(self, op: F) -> Result<T, O>
     let (res_k, _) = fx.enum_("Result", 2, &[("Ok", &[p0]), ("Err", &[p1])]);
@@ -182,6 +217,7 @@ fn world() -> Fx {
     let pin_box_dyn_display = fx.adt(pin_k, &[box_dyn_display]);
     let wide_box_dyn_display = fx.adt(wide_k, &[deep_marker, box_dyn_display]);
     let box_dyn_my_trait = fx.adt(box_k, &[dyn_my_trait]);
+    let pin_box_dyn_my_trait = fx.adt(pin_k, &[box_dyn_my_trait]);
     let wide_box_dyn_my_trait = fx.adt(wide_k, &[deep_marker, box_dyn_my_trait]);
 
     fx.func("takes_dyn_display", 0, &[r_dyn_display], unit, Vec::new());
@@ -191,6 +227,7 @@ fn world() -> Fx {
     fx.func("takes_dyn_my_trait", 0, &[r_dyn_my_trait], unit, Vec::new());
     fx.func("takes_box_dyn_display", 0, &[box_dyn_display], unit, Vec::new());
     fx.func("takes_pin_box_dyn_display", 0, &[pin_box_dyn_display], unit, Vec::new());
+    fx.func("takes_pin_box_dyn_my_trait", 0, &[pin_box_dyn_my_trait], unit, Vec::new());
     fx.func("takes_wide_box_dyn_display", 0, &[wide_box_dyn_display], unit, Vec::new());
     fx.func("takes_box_dyn_my_trait", 0, &[box_dyn_my_trait], unit, Vec::new());
     fx.func("takes_wide_box_dyn_my_trait", 0, &[wide_box_dyn_my_trait], unit, Vec::new());
@@ -214,6 +251,11 @@ fn world() -> Fx {
     }
     fx.func("reflexive_ref_dyn", 0, &[r_dyn_display], unit, Vec::new());
     fx.func("reflexive_box_dyn", 0, &[box_dyn_display], unit, Vec::new());
+    fx.func("pin_infer_to_pin_box_dyn", 0, &[pie], unit, Vec::new());
+    fx.func("pin_infer_to_pin_box_bad_trait", 0, &[pie], unit, Vec::new());
+    fx.func("id_wide_deep_slice", 0, &[wide_deep_slice], wide_deep_slice, Vec::new());
+    fx.func("unify_wide_dag_slice", 0, &[], wide_dag_u32_slice, Vec::new());
+    fx.func("unify_wide_chain_slice", 0, &[], wide_chain_u32_slice, Vec::new());
 
     fx.finish();
     world
@@ -441,4 +483,112 @@ fn walk_cap_exhaustion_is_conservative_for_unresolved_to_dyn() {
         "CONTROL: Wide<Tree, Box<ParseIntError>> -> Wide<Tree, Box<dyn MyTrait>> must fail with E0277, got {:?}",
         c_bad.diags
     );
+}
+
+/// Unresolved source ABOVE a nested `dyn` target (`Pin<?P> -> Pin<Box<dyn Display>>`):
+/// `has_unresolved_to_dyn` must detect that `Box<dyn Display>` reaches `dyn Display` when paired
+/// with unresolved `?P`, so `coerce_unsized_adt` defers `Pin<?P>: CoerceUnsized<Pin<Box<dyn Display>>>`
+/// instead of prematurely equating `?P = Box<dyn Display>` and rejecting `?P = Box<ParseIntError>`.
+#[test]
+fn pin_unresolved_pointer_unsizes_to_pin_box_dyn() {
+    let fx = world();
+
+    // `let f = make_pin_fn(|p| takes_pin_box_dyn_display(p)); f(pin_new(box_new(err)))`
+    {
+        let mut b = Bb::new();
+        let err = b.param("err");
+        let p = b.bind("p");
+        let p_use = b.local(p);
+        let takes = b.path(&["takes_pin_box_dyn_display"]);
+        let body = b.call(takes, &[p_use]);
+        let clo = b.closure(&[p], body);
+        let helper = b.path(&["make_pin_fn"]);
+        let made = b.call(helper, &[clo]);
+        let f_pat = b.bind("f");
+        let s1 = b.let_(f_pat, None, made);
+        let f_use = b.local(f_pat);
+        let err_use = b.local(err);
+        let bn = b.path(&["box_new"]);
+        let boxed = b.call(bn, &[err_use]);
+        let pn = b.path(&["pin_new"]);
+        let pinned = b.call(pn, &[boxed]);
+        let call = b.call(f_use, &[pinned]);
+        let root = b.block(&[s1], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("pin_infer_to_pin_box_dyn"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "Pin<?P> -> Pin<Box<dyn Display>>: {:?}", c.diags);
+        let got = adjusts(&fx, &c, p_use);
+        assert_eq!(got, "unsize -> Pin<Box<dyn Display>>");
+    }
+
+    // Negative control: `?P = Box<ParseIntError>` with `Pin<Box<dyn MyTrait>>` must fail with E0277.
+    {
+        let mut b = Bb::new();
+        let err = b.param("err");
+        let p = b.bind("p");
+        let p_use = b.local(p);
+        let takes = b.path(&["takes_pin_box_dyn_my_trait"]);
+        let body = b.call(takes, &[p_use]);
+        let clo = b.closure(&[p], body);
+        let helper = b.path(&["make_pin_fn"]);
+        let made = b.call(helper, &[clo]);
+        let f_pat = b.bind("f");
+        let s1 = b.let_(f_pat, None, made);
+        let f_use = b.local(f_pat);
+        let err_use = b.local(err);
+        let bn = b.path(&["box_new"]);
+        let boxed = b.call(bn, &[err_use]);
+        let pn = b.path(&["pin_new"]);
+        let pinned = b.call(pn, &[boxed]);
+        let call = b.call(f_use, &[pinned]);
+        let root = b.block(&[s1], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("pin_infer_to_pin_box_bad_trait"), root, Plant::None, InferPlant::None);
+        assert!(
+            c.diags.iter().any(|d| d.code == DiagCode::Unsatisfied),
+            "CONTROL: Pin<Box<ParseIntError>> -> Pin<Box<dyn MyTrait>> must fail with E0277, got {:?}",
+            c.diags
+        );
+    }
+}
+
+/// Identity & unification coercions on large-marker slice-tailed ADTs (`Wide<Marker, Box<[u8]>>`)
+/// must stay clean with no `Unsize` adjustment:
+/// 1. Exact identity `a == b` (`Wide<DeepMarker, Box<[u8]>> -> Wide<DeepMarker, Box<[u8]>>`);
+/// 2. Non-identical DAG-shared marker with inference var (`Wide<PairTree<?0>, Box<[u8]>> -> Wide<PairTree<u32>, Box<[u8]>>`);
+/// 3. Non-identical >256-deep non-DAG-shared chain marker (`Wide<Nest^260<?0>, Box<[u8]>> -> Wide<Nest^260<u32>, Box<[u8]>>`).
+#[test]
+fn identity_and_slice_coercions_with_large_markers_succeed() {
+    let fx = world();
+
+    // 1. Exact identity `a == b`
+    {
+        let mut b = Bb::new();
+        let w = b.param("w");
+        let w_use = b.local(w);
+        let root = b.block(&[], Some(w_use));
+        let c = check_body(&fx, &b, fx.key_of("id_wide_deep_slice"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "id_wide_deep_slice: {:?}", c.diags);
+        assert_eq!(adjusts(&fx, &c, w_use), "");
+    }
+
+    // 2. Non-identical outer DAG marker (`a != b`) unifying `?0 = u32`
+    {
+        let mut b = Bb::new();
+        let mk = b.path(&["mk_wide_dag_slice"]);
+        let call = b.call(mk, &[]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("unify_wide_dag_slice"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "unify_wide_dag_slice: {:?}", c.diags);
+        assert_eq!(adjusts(&fx, &c, call), "");
+    }
+
+    // 3. Non-identical outer >256-deep non-DAG-shared chain marker (`a != b`) unifying `?0 = u32`
+    {
+        let mut b = Bb::new();
+        let mk = b.path(&["mk_wide_chain_slice"]);
+        let call = b.call(mk, &[]);
+        let root = b.block(&[], Some(call));
+        let c = check_body(&fx, &b, fx.key_of("unify_wide_chain_slice"), root, Plant::None, InferPlant::None);
+        assert!(c.diags.is_empty(), "unify_wide_chain_slice: {:?}", c.diags);
+        assert_eq!(adjusts(&fx, &c, call), "");
+    }
 }

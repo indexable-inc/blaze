@@ -312,32 +312,85 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         Ok(unsizing)
     }
 
+    /// Whether `t` reaches a `dyn ..` trait object through ADT arguments, references, and raw
+    /// pointers (BFS bounded by `MAX_NODES`, rule 18, deduplicating DAG-shared nodes). Past the
+    /// bound, returns `true` conservatively so callers do not miss a nested `dyn` target.
+    fn ty_reaches_dyn(&mut self, t: Ty) -> bool {
+        const MAX_NODES: u32 = 256;
+        let mut work = blaze_own::Vec::new_in(self.alloc);
+        let mut visited = blaze_hash::HashSet::new_in(self.alloc);
+        work.push(t);
+        let mut head = 0usize;
+        let mut seen = 0u32;
+        while let Some(&raw) = work.get(head) {
+            head += 1;
+            let x = self.ty.shallow_resolve(raw);
+            if !visited.insert(x) {
+                continue;
+            }
+            seen += 1;
+            if seen > MAX_NODES {
+                return true;
+            }
+            match self.view(x) {
+                TyView::Dynamic(_) => return true,
+                TyView::Adt(_, args) => {
+                    let n = self.ty.list_len(args);
+                    for i in 0..n {
+                        work.push(self.ty.list_get(args, i));
+                    }
+                }
+                TyView::Ref(_, p) | TyView::Ptr(_, p) => work.push(p),
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Whether `a` has an unresolved type variable, unnormalized alias, or opaque type at any
-    /// position where `b` has a trait object `dyn ..`, walking through matching ADTs, references,
-    /// and raw pointers (bounded by `MAX_PAIRS`, rule 18). Past the bound, returns `true`
+    /// position where `b` is (or reaches) a trait object `dyn ..`, walking through matching ADTs,
+    /// references, and raw pointers (BFS bounded by `MAX_PAIRS`, rule 18).
+    ///
+    /// Identical subtrees (`x == y`) are skipped in O(1) and visited `(x, y)` pairs are
+    /// deduplicated so DAG-shared types never inflate the walk count. When `b` reaches no
+    /// `dyn ..` (e.g. slice-only `Box<[u8]>`), returns `false`. Past the bound, returns `true`
     /// conservatively (as `target_reaches_unsized` does) so the site asks the solver rather than
     /// prematurely equating `?E = dyn Tr` via `probe(unify)`.
     fn has_unresolved_to_dyn(&mut self, a: Ty, b: Ty) -> bool {
         const MAX_PAIRS: u32 = 256;
+        let (a, b) = (self.ty.shallow_resolve(a), self.ty.shallow_resolve(b));
+        if a == b || !self.ty_reaches_dyn(b) {
+            return false;
+        }
         let mut work = blaze_own::Vec::new_in(self.alloc);
+        let mut visited = blaze_hash::HashSet::new_in(self.alloc);
         work.push((a, b));
+        let mut head = 0usize;
         let mut seen = 0u32;
-        while let Some((x, y)) = work.pop() {
+        while let Some(&(rx, ry)) = work.get(head) {
+            head += 1;
+            let (x, y) = (self.ty.shallow_resolve(rx), self.ty.shallow_resolve(ry));
+            if x == y || !visited.insert((x, y)) {
+                continue;
+            }
             seen += 1;
             if seen > MAX_PAIRS {
                 return true;
             }
-            let (x, y) = (self.ty.shallow_resolve(x), self.ty.shallow_resolve(y));
             match (self.view(x), self.view(y)) {
                 (
                     TyView::Infer(crate::ty::Var { kind: crate::ty::VarKind::Ty, .. })
                     | TyView::Opaque(..)
                     | TyView::Alias { .. },
-                    TyView::Dynamic(_),
-                ) => return true,
+                    _,
+                ) => {
+                    if self.ty_reaches_dyn(y) {
+                        return true;
+                    }
+                }
                 (TyView::Adt(kx, lx), TyView::Adt(ky, ly)) if kx == ky => {
                     let n = self.ty.list_len(lx).min(self.ty.list_len(ly));
-                    for i in (0..n).rev() {
+                    for i in 0..n {
                         work.push((self.ty.list_get(lx, i), self.ty.list_get(ly, i)));
                     }
                 }
