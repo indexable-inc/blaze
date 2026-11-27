@@ -327,7 +327,7 @@ impl PathAt {
                 _ => break,
             }
         }
-        PathAt { mark: first.and_then(|it| stream.hygiene(tokens[it].ctx).mark).map(crate::mark_site::TextMark::of), written: None, block: None }
+        PathAt { mark: first.and_then(|it| tokens.get(it)).and_then(|t| stream.non_transparent_mark(t.ctx)).map(crate::mark_site::TextMark::of), written: None, block: None }
     }
 
     /// The first word of the path at `start` (a nested call's path) in `stream`: an invisible
@@ -335,7 +335,7 @@ impl PathAt {
     fn of(stream: &TokenStream<'_>, start: u32) -> PathAt {
         let tokens = stream.tokens();
         let first = tokens.iter().skip(start as usize).find(|t| !matches!(t.kind, TokenKind::Open(blaze_expand::Delim::Invisible)));
-        let mark = first.and_then(|t| stream.hygiene(t.ctx).mark);
+        let mark = first.and_then(|t| stream.non_transparent_mark(t.ctx));
         PathAt { mark: mark.map(crate::mark_site::TextMark::of), written: None, block: None }
     }
 }

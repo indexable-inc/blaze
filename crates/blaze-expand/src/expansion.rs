@@ -9,7 +9,7 @@ use blaze_id::{ContentId, Portable};
 use crate::{
     cx::{ExpandCx, HostError, Place, PlaceOf},
     error::{StreamError, Table},
-    tokens::{Edition, Sink, Text, TokenHygiene, TokenStream, Transparency, lex, push_text},
+    tokens::{Edition, Mark, Sink, Text, TokenHygiene, TokenStream, Transparency, lex, push_text},
 };
 
 /// Where a token of an expansion came from: an index into one of the call's or the
@@ -500,6 +500,13 @@ impl<'a> Expansion<'a> {
     /// What resolves the names of token `at`: `$crate`'s crate, def-site and local hygiene.
     pub fn hygiene(&self, at: usize) -> TokenHygiene {
         self.tokens.hygiene(self.tokens.tokens()[at].ctx)
+    }
+
+    /// The innermost non-transparent mark of token `at` ([`TokenStream::non_transparent_mark`]):
+    /// skips [`Transparency::Transparent`] (`call_site`) marks so `$crate` and def-site hygiene
+    /// attribute to the enclosing non-transparent macro, or `None` at the call's crate.
+    pub fn non_transparent_mark(&self, at: usize) -> Option<Mark> {
+        self.tokens.tokens().get(at).and_then(|token| self.tokens.non_transparent_mark(token.ctx))
     }
 
     /// The expansion's canonical bytes: equal expansions, and only they, give equal bytes.

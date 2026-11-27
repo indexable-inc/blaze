@@ -43,6 +43,8 @@ mod tests {
         let rules = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::SemiOpaque, edition: Edition::E2021 };
         let transparent = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::Transparent, edition: Edition::E2024 };
         assert_eq!(root_by_mark("$crate", Some(rules)), Root::Crate(dep));
+        let transparent = TextMark { site: DefSite { krate: dep, module: None }, transparency: Transparency::Transparent, edition: Edition::E2021 };
+        assert_eq!(root_by_mark("$crate", Some(transparent)), Root::Here);
         assert_eq!(root_by_mark("crate", Some(rules)), Root::Here);
         assert_eq!(root_by_mark("crate", Some(root_mark(dep, Edition::E2021))), Root::Crate(dep));
         assert_eq!(root_by_mark("$crate", Some(transparent)), Root::Here);
