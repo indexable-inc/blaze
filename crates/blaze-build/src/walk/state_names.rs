@@ -311,13 +311,33 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
-    /// Names `slot` as the saved temporary of expression `e`: tries `Role::Value` first, then
-    /// `Role::Result` when the flow stores `e`'s value under `Role::Result` (e.g. an `.await`
-    /// result temporary held across a subsequent `.await`, as in `lock().await.next().await`).
+    /// Names `slot` as the saved temporary of expression `e`: tries `Role::Value`, `Role::Result`
+    /// (e.g. an `.await` or overloaded `Deref::deref` result temporary held across a subsequent
+    /// `.await`), and `Role::Borrow` (e.g. a deref-coerced fat reference `&self.vec` -> `&[u8]`
+    /// evaluated as a call argument before a later `.await` argument), requiring the saved field
+    /// to fit `slot`'s size and alignment.
     pub(super) fn name_temp_slot(&mut self, slot: SlotId, e: ExprId) {
-        self.name_slot(slot, Identity::Temp(e, Role::Value));
-        if !self.slot_is_named(slot) {
-            self.name_slot(slot, Identity::Temp(e, Role::Result));
+        let (slot_size, slot_align) = self
+            .b
+            .func()
+            .view()
+            .slots
+            .get(usize::try_from(slot.0).unwrap_or(usize::MAX))
+            .map_or((0, 0), |s| (s.size, s.align));
+        let align_mask = 1u32.checked_shl(u32::from(slot_align)).map_or(0, |a| a.saturating_sub(1));
+        for role in [Role::Value, Role::Result, Role::Borrow] {
+            let id = Identity::Temp(e, role);
+            let fits = self
+                .names
+                .as_ref()
+                .and_then(|n| n.table.get(id))
+                .is_some_and(|row| row.size >= slot_size && (row.offset & align_mask) == 0);
+            if fits {
+                self.name_slot(slot, id);
+                if self.slot_is_named(slot) {
+                    return;
+                }
+            }
         }
     }
 
@@ -334,10 +354,10 @@ impl<A: Allocator + Copy> Walk<'_, '_, '_, A> {
         }
     }
 
-    /// A fresh slot of `temp`, named as the running task's expression's value.
+    /// A fresh slot of `temp`, named as the running task's expression's saved temporary.
     pub(super) fn name_temp(&mut self, slot: SlotId) {
         if let Some(x) = self.names.as_ref().map(|n| n.at) {
-            self.name_slot(slot, Identity::Temp(x, Role::Value));
+            self.name_temp_slot(slot, x);
         }
     }
 
