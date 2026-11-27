@@ -252,7 +252,14 @@ impl<'n> DefinitionSearch<'n, '_> {
         let missing = |what| DefinitionLost::Missing { item: decl.lib, what };
         let krate = self.names.crate_of(decl.container).ok_or(DefinitionLost::NoCrate)?;
         let atoms = self.names.cfg_atoms(krate).ok_or_else(|| missing("the crate's cfg"))?;
-        blaze_lower::lower_signature(text, self.record.edition(), &mut super::heads::CrateCfg(atoms), self.alloc)
+        let context = if decl.member.is_some()
+            && matches!(self.names.detail_of(decl.container), Some(blaze_surface::ItemDetail::Trait))
+        {
+            blaze_lower::ItemContext::Trait
+        } else {
+            blaze_lower::ItemContext::TopLevel
+        };
+        blaze_lower::lower_signature_in_context(text, self.record.edition(), context, &mut super::heads::CrateCfg(atoms), self.alloc)
             .map_err(|_| missing("a readable signature"))
     }
 

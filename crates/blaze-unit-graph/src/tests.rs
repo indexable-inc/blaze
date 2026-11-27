@@ -1554,7 +1554,6 @@ version = \"0.0.0\"
         Ok(Pass::Need(ids)) => panic!("asked the store for {} package(s): a path entry it cannot answer", ids.len()),
         Ok(Pass::Done(_) | Pass::Partial(_)) => panic!("a graph without the unread path package"),
     };
-    std::println!("{error}");
     match &error {
         UnitError::PathOutsideAnchor { package, dep, path } => {
             assert_eq!((package.as_str(), dep.as_str(), path.as_str()), ("shell", "bgit", "../bgit"));

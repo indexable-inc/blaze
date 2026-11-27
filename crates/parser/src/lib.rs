@@ -244,6 +244,13 @@ impl Reparser {
         Reparser(grammar::top_level_item)
     }
 
+    /// One associated item of a `trait` block, parsed as `trait_item_list` parses it (so Rust
+    /// 2015 trait methods may omit parameter names). As [`Reparser::top_level_item`], take the
+    /// item alone with [`Output::into_first_node`].
+    pub fn trait_item() -> Reparser {
+        Reparser(grammar::trait_item)
+    }
+
     /// Re-parse given tokens using this `Reparser`.
     ///
     /// For a block, tokens must start with `{`, end with `}` and form a valid brace

@@ -53,7 +53,7 @@ jobs:
   # All repository gate checks (tools/gate.txt, identical to `just lint`, built by blaze).
   scripts:
     name: gate
-    runs-on: [ix, arm64]
+    runs-on: [ix, arm64, ix-cpu-64, blaze]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

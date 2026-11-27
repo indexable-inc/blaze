@@ -206,6 +206,12 @@ impl Toolchain {
                 todo.extend(all[u].deps().map(|(_, d)| d as usize));
             }
         }
+        let mut cfg: Vec<(String, Option<String>)> = blaze_toolchain::target_cfg(&view, triple)
+            .ok_or(CratesError::NoTarget)?
+            .map(|(n, v)| (n.to_owned(), v.map(str::to_owned)))
+            .collect();
+        cfg.sort_unstable();
+        cfg.dedup();
         let mut at = vec![usize::MAX; all.len()];
         let mut units = Vec::new();
         for (u, row) in all.iter().enumerate() {
@@ -233,7 +239,10 @@ impl Toolchain {
                 // A proc macro's dependencies are the host's, not in this graph.
                 deps: if proc_macro { Vec::new() } else { row.deps().map(|(n, d)| (n.to_owned(), d as usize)).collect() },
                 proc_macro,
-                key: CrateItemKey(ContentId::of("blaze toolchain unit", &unit_key(&krate.pack, row.features()))),
+                key: CrateItemKey(ContentId::of(
+                    "blaze toolchain unit",
+                    &unit_key(&krate.pack, row.features(), cfg.iter().map(|(n, v)| (n.as_str(), v.as_deref()))),
+                )),
                 pack,
                 role: krate.role,
             });
@@ -255,7 +264,6 @@ impl Toolchain {
                 dep.1 = kept;
             }
         }
-        let cfg = view.cfg(triple).ok_or(CratesError::NoTarget)?.map(|(n, v)| (n.to_owned(), v.map(str::to_owned))).collect();
         Ok(Toolchain { units, cfg, arena: Arena::new(Tag::Other) })
     }
 }
@@ -270,11 +278,28 @@ fn target_cfg(alloc: Alloc<'_>) -> Vec<(String, Option<String>)> {
     cfg.atoms().iter().map(|&(n, v)| (n.to_owned(), v.map(str::to_owned))).collect()
 }
 
-/// A unit's key: its crate's pack digest and its features.
-fn unit_key<'f>(pack: &[u8; 32], features: impl Iterator<Item = &'f str>) -> Vec<u8> {
+/// A unit's key: its crate's pack digest, its features, and its sorted effective target cfg
+/// (Rule 21: covers both `ToolchainView::cfg` and `blaze_toolchain::target_extra_cfgs`).
+fn unit_key<'f, 'c>(
+    pack: &[u8; 32],
+    features: impl Iterator<Item = &'f str>,
+    cfg: impl Iterator<Item = (&'c str, Option<&'c str>)>,
+) -> Vec<u8> {
     let mut out = pack.to_vec();
     for f in features {
         out.extend_from_slice(f.as_bytes());
+        out.push(0);
+    }
+    out.push(0xff);
+    for (name, value) in cfg {
+        out.extend_from_slice(name.as_bytes());
+        match value {
+            Some(val) => {
+                out.push(1);
+                out.extend_from_slice(val.as_bytes());
+            }
+            None => out.push(0),
+        }
         out.push(0);
     }
     out
@@ -492,5 +517,53 @@ impl Par for ScratchSerial {
             work(erased.handle());
         });
         Scratch::Reset
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use blaze_toolchain::record::{TargetIn, write};
+    use blaze_toolchain::{ToolchainView, WASM64_TARGET, target_cfg};
+
+    use super::unit_key;
+
+    #[test]
+    fn unit_key_covers_effective_target_cfg_including_wasm64_extra_cfgs() {
+        let pack = [0x42u8; 32];
+        let feats = ["std", "alloc"];
+        let base_cfg = [("panic", Some("abort")), ("target_arch", Some("wasm64")), ("target_os", Some("wasi"))];
+
+        // Synthetic toolchain with identical base cfg atoms for `wasm64-blaze-wasip1` (which
+        // receives `getrandom_backend="custom"` via `target_cfg`) and a non-wasm64 triple (which
+        // does not).
+        let alloc = blaze_own::testing::heap().alloc();
+        let targets = [
+            TargetIn { triple: WASM64_TARGET, units: &[], cfg: &base_cfg },
+            TargetIn { triple: "aarch64-apple-darwin", units: &[], cfg: &base_cfg },
+        ];
+        let bytes = write(&[], &targets, alloc).expect("encode toolchain");
+        let view = ToolchainView::open(bytes.as_slice(), ToolchainView::id_of_bytes(bytes.as_slice())).expect("open view");
+
+        let sorted_cfg = |triple: &str| -> Vec<(&str, Option<&str>)> {
+            let mut v: Vec<_> = target_cfg(&view, triple).expect("target cfg").collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+
+        let wasm_cfg = sorted_cfg(WASM64_TARGET);
+        let other_cfg = sorted_cfg("aarch64-apple-darwin");
+        let wasm_key = unit_key(&pack, feats.iter().copied(), wasm_cfg.iter().copied());
+        let other_key = unit_key(&pack, feats.iter().copied(), other_cfg.iter().copied());
+
+        // Deterministic for identical inputs.
+        assert_eq!(wasm_key, unit_key(&pack, feats.iter().copied(), wasm_cfg.iter().copied()));
+        // Negative control: `wasm64-blaze-wasip1`'s extra target cfg changes the unit key.
+        assert_ne!(wasm_key, other_key, "effective target cfg (getrandom_backend=\"custom\") must enter Toolchain unit_key");
+        // Flag (`None`) vs empty value (`Some("")`) hash distinctly.
+        assert_ne!(
+            unit_key(&pack, feats.iter().copied(), [("getrandom_backend", None)].into_iter()),
+            unit_key(&pack, feats.iter().copied(), [("getrandom_backend", Some(""))].into_iter()),
+        );
     }
 }

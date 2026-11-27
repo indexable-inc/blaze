@@ -123,7 +123,13 @@ fn param<S: Sink>(p: &mut Parser<'_, S>, m: Marker, flavor: Flavor) {
 
         // test trait_fn_unnamed_params 2015
         // trait T { fn f(&self, *const u8, Option<&u8>, x: u8, _: &u8, &u8) -> u8; }
-        Flavor::TraitFn2015 if !is_named_param(p) && !is_ref_mut_named_param(p) => types::type_(p),
+        Flavor::TraitFn2015
+            if !is_named_param(p)
+                && !is_ref_mut_named_param(p)
+                && !p.trait2015_param_is_pattern() =>
+        {
+            types::type_(p)
+        }
 
         // test fn_def_param
         // fn foo(..., (x, y): (i32, i32)) {}

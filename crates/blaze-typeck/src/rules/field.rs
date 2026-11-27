@@ -10,10 +10,15 @@
 //!
 //! An index: base, then index, each with no expectation. At each autoderef step of the base
 //! (then the array's slice), the builtin case first (an array or slice indexed by `usize` or an
-//! integer variable, which becomes `usize`), then `Index` through the solver, its `Output` the
-//! type. None at all is E0608. In a mutable place, the base's overloaded derefs become
-//! `DerefMut` and an overloaded index itself `IndexMut` after the walk (rules/mut_places.rs,
-//! rustc's `convert_place_derefs_to_mutable`; `Checked::index_mut`). Omitted: privacy.
+//! integer variable, which becomes `usize`), then `Index` through the solver at `[step.ty, idx]`,
+//! then overloaded `Index` with index-argument coercion (`try_overloaded_place_op` +
+//! `demand_coerce`: a unique constrained index shape such as `BTreeMap<(u64, u64), u32>`
+//! selecting `Index<&(u64, u64)>` via `Borrow`, or `Index<&str>`, coerces `index` to it, e.g.
+//! `&&(u64, u64) -> &(u64, u64)` or `&String -> &str`) before advancing to the next autoderef
+//! step, its `Output` the type. None at all is E0608. In a mutable place, the base's overloaded
+//! derefs become `DerefMut` and an overloaded index itself `IndexMut` after the walk
+//! (rules/mut_places.rs, rustc's `convert_place_derefs_to_mutable`; `Checked::index_mut`).
+//! Omitted: privacy.
 
 use crate::diag::{About, At, DiagCode};
 use crate::error::{CheckError, Malformed, ParamSite, Stop};
@@ -264,11 +269,10 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                     if let Some(tr) = index_trait {
                         let args = self.mk_list(&[step.ty, idx])?;
                         if self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
-                            self.adjust_autoderef(base, &steps, i);
                             self.register_trait(tr, args, Cause::Expr(e))?;
-                            let out_name = Name::of("Output");
-                            let out = self.project(tr, args, out_name, Cause::Expr(e))?;
-                            self.projected.push((e, tr, Some(out_name), args));
+                            return Ok(Flow::Done(self.finish_overloaded_index(e, base, &steps, i, tr, args)?));
+                        }
+                        if let Some(out) = self.try_coerced_index(e, base, index, &steps, i, tr, idx)? {
                             return Ok(Flow::Done(out));
                         }
                     }
@@ -281,6 +285,79 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                 Ok(Flow::Done(self.common.err))
             }
         }
+    }
+
+    /// Commits an overloaded `Index` match at autoderef step `i` and projects `Index::Output`.
+    fn finish_overloaded_index(
+        &mut self,
+        e: ExprId,
+        base: ExprId,
+        steps: &[crate::machine::Step],
+        i: usize,
+        tr: ItemKey,
+        args: crate::ty::TyList,
+    ) -> Result<Ty, Stop> {
+        self.adjust_autoderef(base, steps, i);
+        let out_name = Name::of("Output");
+        let out = self.project(tr, args, out_name, Cause::Expr(e))?;
+        self.projected.push((e, tr, Some(out_name), args));
+        Ok(out)
+    }
+
+    /// Tries overloaded `Index` at autoderef step `i` with coercion of `index` (`idx`) to the
+    /// index type constrained by `step.ty: Index<?Idx>` (rustc `place_op.rs`
+    /// `try_overloaded_place_op` + `demand_coerce`): e.g. `BTreeMap<(u64, u64), u32>[k]` where
+    /// `k: &&(u64, u64)` (`(u64, u64): Borrow<?Q>` uniquely fixes `?Q = (u64, u64)` and `&&K`
+    /// deref-coerces to `&K`) or `StrMap[&owned_str]` (`&String -> &str`). Rejects and rolls back
+    /// cleanly when `?Idx` remains an unconstrained inference variable (e.g. multiple competing
+    /// `Index` impls on `Vec<T>`/`[T]`), when `idx` does not coerce, or when `Index` cannot hold
+    /// at the coerced type.
+    fn try_coerced_index(
+        &mut self,
+        e: ExprId,
+        base: ExprId,
+        index: ExprId,
+        steps: &[crate::machine::Step],
+        i: usize,
+        tr: ItemKey,
+        idx: Ty,
+    ) -> Result<Option<Ty>, Stop> {
+        let Some(&step) = steps.get(i) else {
+            return Ok(None);
+        };
+        if self.is_err(idx) {
+            return Ok(None);
+        }
+        self.commit_if(|m| {
+            let idx_var = m.fresh()?;
+            let args = m.mk_list(&[step.ty, idx_var])?;
+            if !m.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut m.reads)? {
+                return Ok(None);
+            }
+            m.register_trait(tr, args, Cause::Expr(e))?;
+            m.ty.select_where_possible(&mut m.reads)?;
+            let expected_idx = m.ty.resolve(idx_var)?;
+            if matches!(m.view(expected_idx), TyView::Infer(_)) {
+                return Ok(None);
+            }
+            let expected_idx = if m.ty.ty_flags(expected_idx).has(crate::ty::TyFlags::HAS_ALIAS) {
+                m.try_structurally_resolve(expected_idx)?
+            } else {
+                expected_idx
+            };
+            if matches!(m.view(expected_idx), TyView::Infer(_)) {
+                return Ok(None);
+            }
+            if !m.coerce(Some(index), idx, expected_idx, false)? {
+                return Ok(None);
+            }
+            let final_idx = m.ty.resolve(expected_idx)?;
+            let final_args = m.mk_list(&[step.ty, final_idx])?;
+            if !m.ty.may_hold(Goal::Trait { trait_: tr, args: final_args }, &mut m.reads)? {
+                return Ok(None);
+            }
+            Ok(Some(m.finish_overloaded_index(e, base, steps, i, tr, final_args)?))
+        })
     }
 
     /// `builtin_index`: an array or slice by `usize` or an integer variable.

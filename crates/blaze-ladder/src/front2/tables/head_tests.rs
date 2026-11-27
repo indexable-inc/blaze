@@ -1249,30 +1249,88 @@ pub fn d(v: &V<u8>) -> &u8 { &v.t }
 fn an_adt_with_field_defaults_freezes_and_imports_inline() {
     const APP: &str = "#![feature(default_field_values)]
 pub struct Opts {
+    pub name: u32,
     pub limit: u32 = 42,
+    pub extra: u32 = 7,
 }
+pub const MADE: u32 = {
+    let o = Opts { name: 1, .. };
+    o.name + o.limit + o.extra
+};
 ";
     let (names, sized, frame) = world_of(APP);
     let mut opts = None;
+    let mut made = None;
     NamesSource::each_item(names, APP_AT, &mut |key, _| {
-        if NamesSource::name_of(names, key) == Some("Opts") {
-            opts = Some(key);
+        match NamesSource::name_of(names, key) {
+            Some("Opts") => opts = Some(key),
+            Some("MADE") => made = Some(key),
+            _ => {}
         }
     });
     let opts = opts.expect("`Opts` in fixture");
+    let made = made.expect("`MADE` in fixture");
     let mut maker = Store::new(sized, frame, a());
     let mut maker_keys = Keys::new();
     maker.ensure(names, &mut maker_keys, Want::Adt(opts)).unwrap_or_else(|e| panic!("ensure `Opts`: {e}"));
     let bytes = export(names, &maker_keys, &mut maker, Want::Adt(opts), Plant::None, a()).unwrap_or_else(|e| panic!("export `Opts`: {e}"));
     let frozen = FrozenHead::read(&bytes).unwrap_or_else(|e| panic!("read `Opts`: {e}"));
-    let seeded = Store::new(sized, frame, a());
-    let seeded_keys = Keys::new();
+    let mut seeded = Store::new(sized, frame, a());
+    let mut seeded_keys = Keys::new();
     super::head::file_frozen(names, Want::Adt(opts), frozen, &seeded, &seeded_keys, a()).unwrap_or_else(|e| panic!("file `Opts` with inline default: {e}"));
     let defaults = seeded.field_defaults.get(&checker_of(opts)).expect("field defaults filed");
-    let dk = defaults[0].expect("first field has default key");
-    let head = seeded.fns.get(&dk).expect("synthetic default fn head filed");
+    assert!(defaults[0].is_none(), "first field `name` has no default");
+    let dk1 = defaults[1].expect("second field `limit` has default key");
+    let dk2 = defaults[2].expect("third field `extra` has default key");
+    let head = seeded.fns.get(&dk1).expect("synthetic default fn head filed");
     assert!(head.text_inline, "synthetic field default must keep text_inline");
     assert_eq!(head.text, "const _: u32 = 42;");
+    for dk in [dk1, dk2] {
+        assert!(
+            matches!(seeded_keys.origin(dk), Some(crate::front2::keys::Origin::Member { container, kind: MemberKind::Anon, .. }) if *container == checker_of(opts)),
+            "frozen ADT field default must file its `MemberKind::Anon` origin into `Keys`",
+        );
+    }
+    let bump = frame.alloc(blaze_own::Erased::new(frame)).bump();
+    let prepared = blaze_scope::prepares::Prepares::new_in(bump);
+    let lowered = crate::front2::body::lower_member(names, &prepared, &mut seeded_keys, &mut seeded, dk1)
+        .unwrap_or_else(|e| panic!("lower imported field default body: {e:?}"));
+    assert_eq!(lowered.owner, dk1);
+    let index = crate::front2::index::Index::from_source(names, &[APP_AT, CORE_AT]).unwrap_or_else(|_| panic!("fixture index"));
+    let mut buckets = None;
+    let mut consts = crate::front2::consts::Consts::default();
+    let mut records = crate::front2::check::Records {
+        names,
+        keys: &mut seeded_keys,
+        index: &index,
+        store: &mut seeded,
+        buckets: &mut buckets,
+        order: crate::front2::check::BuildOrder::AsAsked,
+        consts: None,
+    };
+    let val1 = consts.value(&mut records, &prepared, dk1).unwrap_or_else(|e| panic!("const-eval imported field default `limit`: {e}"));
+    assert_eq!(crate::front2::consts::int_of(val1), Some(42));
+    let val2 = consts.value(&mut records, &prepared, dk2).unwrap_or_else(|e| panic!("const-eval imported field default `extra`: {e}"));
+    assert_eq!(crate::front2::consts::int_of(val2), Some(7));
+    // Evaluating a `const` item (`MADE`) whose body uses `Opts { name: 1, .. }` over the
+    // frozen ADT must evaluate both imported field defaults cleanly (the `bgit::cli::BGIT_CLI` path).
+    let made_val = consts.value(&mut records, &prepared, checker_of(made)).unwrap_or_else(|e| panic!("const-eval `MADE` over frozen ADT defaults: {e}"));
+    assert_eq!(crate::front2::consts::int_of(made_val), Some(50));
+
+    // In-process cell transfer (`transfer_cell_in_process`) must also file the anon origins.
+    let transferred = Store::new(sized, frame, a());
+    let transferred_keys = Keys::new();
+    let mut enc = head_record::EncodeScratch::new_in(a());
+    let mut buf = blaze_surface::RecordBytes::new_in(a());
+    let cache = super::head::FrozenImportCache::new(a());
+    super::head::transfer_cell_in_process(names, Want::Adt(opts), &maker, &maker_keys, &transferred, &transferred_keys, &mut enc, &mut buf, &cache, a())
+        .unwrap_or_else(|e| panic!("transfer `Opts` in-process: {e}"));
+    for dk in [dk1, dk2] {
+        assert!(
+            matches!(transferred_keys.origin(dk), Some(crate::front2::keys::Origin::Member { container, kind: MemberKind::Anon, .. }) if *container == checker_of(opts)),
+            "in-process transferred ADT field default must file its `MemberKind::Anon` origin into `Keys`",
+        );
+    }
 }
 
 /// A type alias naming `dyn Tr` whose trait has a method returning that alias (like cranelift's

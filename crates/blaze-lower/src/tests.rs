@@ -1264,3 +1264,89 @@ fn attributed_literal_expr_range_excludes_outer_attrs() {
     }
     assert_eq!(lits, vec!["\"zstd/lib/common\"", "\"zstd/lib/dictBuilder\"", "42u32"]);
 }
+
+/// Rust 2015 anonymous trait method parameters (RFC 1685, e.g. `fxhash 0.2.1`'s
+/// `fn hash_word(&mut self, Self);`) lower cleanly with `ty: Some(..), pat: None` in
+/// `ItemContext::Trait` under `Edition::E2015`, while Rust 2018+ and `ItemContext::TopLevel`
+/// still reject them with `DiagKind::Syntax` and `ty: None`.
+#[test]
+fn rust_2015_trait_anonymous_params_lower_in_trait_context_only() {
+    let alloc = blaze_own::testing::heap().alloc();
+
+    // Positive control: Rust 2015 + ItemContext::Trait on `fxhash` shape.
+    let hw = "fn hash_word(&mut self, Self);";
+    let low = crate::lower_signature_in_context(hw, Edition::E2015, crate::ItemContext::Trait, &mut Unix, alloc)
+        .expect("2015 trait signature lowers");
+    let v = low.view();
+    assert!(v.unhandled.is_empty(), "unhandled:\n{}", dump_of(&low));
+    assert!(v.diags.is_empty(), "diags:\n{}", dump_of(&low));
+    let rows = v.rows(v.list(crate::head::PARAMS)).expect("params");
+    assert_eq!(rows.len(), 2);
+    let p0 = Param::decode(rows[0]).expect("p0");
+    let p1 = Param::decode(rows[1]).expect("p1");
+    assert_eq!(p0.self_kind, SelfKind::Ref(Mutbl::Mut));
+    assert_eq!(p1.self_kind, SelfKind::No);
+    assert!(p1.pat.is_none(), "anonymous param has no pattern");
+    let ty1 = p1.ty.expect("anonymous param has a type");
+    assert_eq!(v.text_at(v.type_range(ty1).expect("ty1 range")).expect("ty1 text").trim(), "Self");
+
+    // Complex anonymous types + pattern parameters in Rust 2015 ItemContext::Trait.
+    let complex = "fn more(&self, &[u8], &mut [u8], Option<fn(i32) -> bool>, (u32, u64), [u8; 4], #[allow(unused)] u32, x: u8, _: &u8);";
+    let clow = crate::lower_signature_in_context(complex, Edition::E2015, crate::ItemContext::Trait, &mut Unix, alloc)
+        .expect("2015 complex trait signature lowers");
+    let cv = clow.view();
+    assert!(cv.unhandled.is_empty(), "unhandled:\n{}", dump_of(&clow));
+    assert!(cv.diags.is_empty(), "diags:\n{}", dump_of(&clow));
+    let crows = cv.rows(cv.list(crate::head::PARAMS)).expect("complex params");
+    assert_eq!(crows.len(), 9);
+    for (i, &row) in crows.iter().enumerate().skip(1) {
+        let p = Param::decode(row).expect("param");
+        assert!(p.ty.is_some(), "param {i} must have a type");
+        if i <= 6 {
+            assert!(p.pat.is_none(), "anonymous param {i} must have pat == None");
+        } else {
+            assert!(p.pat.is_some(), "named param {i} must have pat == Some");
+        }
+    }
+
+    let pats = "fn pats(&self, (a, b): (u32, u64), ref x: u32) {}";
+    let plow = crate::lower_signature_in_context(pats, Edition::E2015, crate::ItemContext::Trait, &mut Unix, alloc)
+        .expect("2015 trait pattern params lower");
+    let pv = plow.view();
+    assert!(pv.diags.is_empty(), "diags:\n{}", dump_of(&plow));
+    let prows = pv.rows(pv.list(crate::head::PARAMS)).expect("pat params");
+    assert_eq!(prows.len(), 3);
+    for &row in &prows[1..] {
+        let p = Param::decode(row).expect("pat param");
+        assert!(p.pat.is_some() && p.ty.is_some(), "pattern param needs both pat and ty");
+    }
+
+    // Negative controls: Rust 2018+ in ItemContext::Trait and Rust 2015 in ItemContext::TopLevel.
+    for (edition, ctx) in [
+        (Edition::E2018, crate::ItemContext::Trait),
+        (Edition::E2021, crate::ItemContext::Trait),
+        (Edition::E2024, crate::ItemContext::Trait),
+        (Edition::E2015, crate::ItemContext::TopLevel),
+    ] {
+        let bad = crate::lower_signature_in_context(hw, edition, ctx, &mut Unix, alloc)
+            .expect("lowering completes with syntax diag");
+        let bv = bad.view();
+        assert!(
+            bv.diags().any(|d| d.is_ok_and(|d| d.kind == DiagKind::Syntax)),
+            "{edition:?} {ctx:?} must emit DiagKind::Syntax",
+        );
+        let brows = bv.rows(bv.list(crate::head::PARAMS)).expect("bad params");
+        let bp1 = Param::decode(brows[1]).expect("bp1");
+        assert!(bp1.ty.is_none(), "{edition:?} {ctx:?} must not parse `Self` as a type");
+    }
+
+    // Key separation (Rule 21): signature_key and body_key distinguish ItemContext.
+    assert_ne!(
+        crate::signature_key(hw, Edition::E2015, false, crate::ItemContext::Trait),
+        crate::signature_key(hw, Edition::E2015, false, crate::ItemContext::TopLevel),
+    );
+    assert_ne!(
+        crate::body_key(pats, Edition::E2015, crate::ItemContext::Trait),
+        crate::body_key(pats, Edition::E2015, crate::ItemContext::TopLevel),
+    );
+}

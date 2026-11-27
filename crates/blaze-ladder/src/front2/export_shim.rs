@@ -57,6 +57,8 @@ pub(crate) fn format_refused<'a>(why: &ExportRefused<'_>, alloc: Alloc<'a>) -> A
 pub struct Declared<'a> {
     pub lib: LibKey,
     pub symbol: AString<'a>,
+    pub params: usize,
+    pub c_variadic: bool,
 }
 
 /// Why a same-program export binding failed.
@@ -187,8 +189,18 @@ pub fn declares<'n, 'a, S: NamesSource<'n>>(
     let Some(raw_name) = raw_name else { return Ok(None) };
     let ident = raw_name.strip_prefix("r#").unwrap_or(raw_name);
     let abi = match local_abi {
-        Some(local) => Some(local),
-        None => names.extern_abi(h.lib).ok_or_else(|| ExportRefused::Unplaced { symbol: own_str(ident, alloc) })?,
+        Some(local) => {
+            if store.locals.foreign(key).is_some_and(|f| f.wasm_import) {
+                return Ok(None);
+            }
+            Some(local)
+        }
+        None => {
+            if names.is_wasm_import(h.lib).unwrap_or(false) {
+                return Ok(None);
+            }
+            names.extern_abi(h.lib).ok_or_else(|| ExportRefused::Unplaced { symbol: own_str(ident, alloc) })?
+        }
     };
     let Some(abi) = abi else { return Ok(None) };
     if abi == super::llvm_intrinsic::ABI {
@@ -207,22 +219,25 @@ pub fn declares<'n, 'a, S: NamesSource<'n>>(
     let attrs_err = || ExportRefused::Attrs { symbol: own_str(ident, alloc) };
     let krate = names.crate_of(h.lib).ok_or_else(attrs_err)?;
     let values_at = super::links::values_key(names, store, h.lib);
+    let params = h.inputs.len();
+    let c_variadic = h.c_variadic;
     match read_decl_attrs(names, krate, values_at, h.text, alloc).map_err(|()| attrs_err())? {
         DeclAttrs::Intrinsic => Ok(None),
-        DeclAttrs::LinkName(symbol) => Ok(Some(Declared { lib: h.lib, symbol })),
-        DeclAttrs::Plain => Ok(Some(Declared { lib: h.lib, symbol: own_str(ident, alloc) })),
+        DeclAttrs::LinkName(symbol) => Ok(Some(Declared { lib: h.lib, symbol, params, c_variadic })),
+        DeclAttrs::Plain => Ok(Some(Declared { lib: h.lib, symbol: own_str(ident, alloc), params, c_variadic })),
     }
 }
 
 /// Checks whether candidate function `key` in `krate` strongly exports `symbol` (i.e. has a body,
-/// is not cfg'd out, is not `#[linkage = "weak"]`, and its effective exported symbol — with
-/// `#[export_name]` taking precedence over `#[no_mangle]` per Reference `[abi.export_name]` —
-/// equals `symbol`).
+/// is not cfg'd out, is not `#[linkage = "weak"]`, matches `sig_shape` when given, and its
+/// effective exported symbol — with `#[export_name]` taking precedence over `#[no_mangle]` per
+/// Reference `[abi.export_name]` — equals `symbol`).
 fn exports_symbol<'n, 'a, S: NamesSource<'n>>(
     names: S,
     krate: usize,
     key: LibKey,
     symbol: &str,
+    sig_shape: Option<(usize, bool)>,
     alloc: Alloc<'a>,
 ) -> Result<bool, ExportRefused<'a>> {
     let unread = || ExportRefused::Unread { symbol: own_str(symbol, alloc), krate };
@@ -237,8 +252,25 @@ fn exports_symbol<'n, 'a, S: NamesSource<'n>>(
     if v.cfg_out() {
         return Ok(false);
     }
-    if v.head.get(head::FLAGS).copied().unwrap_or(0) & blaze_lower::machine::sig::HAS_BODY == 0 {
+    let flags = v.head.get(head::FLAGS).copied().unwrap_or(0);
+    if flags & blaze_lower::machine::sig::HAS_BODY == 0 {
         return Ok(false);
+    }
+    if let Some((want_params, want_variadic)) = sig_shape {
+        let def_variadic = flags & blaze_lower::machine::sig::VARIADIC != 0;
+        if def_variadic != want_variadic {
+            return Ok(false);
+        }
+        let mut def_params = 0usize;
+        for &n in v.rows(v.list(head::PARAMS)).map_err(|_| attrs_err())? {
+            let prm = blaze_lower::Param::decode(n).map_err(|_| attrs_err())?;
+            if !prm.variadic {
+                def_params = def_params.saturating_add(1);
+            }
+        }
+        if def_params != want_params {
+            return Ok(false);
+        }
     }
     let mut no_mangle = false;
     let mut export_name: Option<AString<'a>> = None;
@@ -321,6 +353,7 @@ pub fn definition_in<'n, 'a, S: NamesSource<'n>>(
     names: S,
     crates: &[usize],
     symbol: &str,
+    sig_shape: Option<(usize, bool)>,
     alloc: Alloc<'a>,
 ) -> Result<Option<LibKey>, ExportRefused<'a>> {
     let mut found: Option<LibKey> = None;
@@ -346,7 +379,7 @@ pub fn definition_in<'n, 'a, S: NamesSource<'n>>(
             return Err(unread());
         }
         for &key in candidates.iter() {
-            if !exports_symbol(names, krate, key, symbol, alloc)? {
+            if !exports_symbol(names, krate, key, symbol, sig_shape, alloc)? {
                 continue;
             }
             // Keep the two smallest keys: the refusal names the same pair in any walk order.
@@ -380,10 +413,11 @@ pub fn definition<'n, 'a, S: NamesSource<'n>>(
     names: S,
     roots: &[usize],
     symbol: &str,
+    sig_shape: Option<(usize, bool)>,
     alloc: Alloc<'a>,
 ) -> Result<Option<LibKey>, ExportRefused<'a>> {
     let crates = linked_crates(names, roots, symbol, alloc)?;
-    definition_in(names, crates.as_slice(), symbol, alloc)
+    definition_in(names, crates.as_slice(), symbol, sig_shape, alloc)
 }
 
 /// Resolves a declared foreign fn to its same-program Rust export's checker key, if any.
@@ -394,7 +428,7 @@ pub fn bound<'n, 'a, S: NamesSource<'n>>(
     d: &Declared<'_>,
     alloc: Alloc<'a>,
 ) -> Result<Option<ItemKey>, ExportRefused<'a>> {
-    let Some(lib) = definition(names, roots, d.symbol.as_str(), alloc)? else {
+    let Some(lib) = definition(names, roots, d.symbol.as_str(), Some((d.params, d.c_variadic)), alloc)? else {
         return Ok(None);
     };
     let key = keys.item(lib).map_err(|_| ExportRefused::KeyClash { symbol: own_str(d.symbol.as_str(), alloc) })?;
@@ -409,7 +443,7 @@ pub fn bound_in<'n, 'a, S: NamesSource<'n>>(
     d: &Declared<'_>,
     alloc: Alloc<'a>,
 ) -> Result<Option<ItemKey>, ExportRefused<'a>> {
-    let Some(lib) = definition_in(names, crates, d.symbol.as_str(), alloc)? else {
+    let Some(lib) = definition_in(names, crates, d.symbol.as_str(), Some((d.params, d.c_variadic)), alloc)? else {
         return Ok(None);
     };
     let key = keys.item(lib).map_err(|_| ExportRefused::KeyClash { symbol: own_str(d.symbol.as_str(), alloc) })?;

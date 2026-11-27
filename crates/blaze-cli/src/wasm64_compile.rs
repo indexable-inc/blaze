@@ -60,8 +60,9 @@ use blaze_unit_graph::{
     implicit,
 };
 
-/// The target triple every self-compiled build script and proc-macro targets.
-pub(crate) const WASM64_TARGET: &str = "wasm64-blaze-wasip1";
+/// The target triple every self-compiled build script and proc-macro targets (single source of
+/// truth in `blaze-toolchain`, Rule 30).
+pub(crate) use blaze_toolchain::{WASM64_TARGET, WASM64_TARGET_EXTRA_CFGS};
 
 /// The exported global name holding `&'static [Client]` in self-compiled proc-macro modules.
 const PROC_MACRO_DECLS_GLOBAL: &str = "__rustc_proc_macro_decls_blaze__";
@@ -82,10 +83,20 @@ static STAGE_SEQ: AtomicU64 = AtomicU64::new(0);
 const WASM64_SYSROOT_DIR_DOMAIN: &str = "blaze-cli wasm64 sysroot dir 1";
 
 /// Computes the content-addressed directory name under `<store>/wasm64-sysroot-v2/` covering
-/// `tc_id` and all producer rows that produce or decode sysroot records stored there.
+/// `tc_id`, every producer row that produces or decodes sysroot records stored there, and
+/// [`WASM64_TARGET_EXTRA_CFGS`] (Rule 21).
 fn wasm64_sysroot_dir_name<'a>(
     tc_id: ToolchainId,
     producers: &Producers,
+    alloc: Alloc<'a>,
+) -> blaze_own::AString<'a> {
+    wasm64_sysroot_dir_name_with_cfgs(tc_id, producers, WASM64_TARGET_EXTRA_CFGS, alloc)
+}
+
+fn wasm64_sysroot_dir_name_with_cfgs<'a>(
+    tc_id: ToolchainId,
+    producers: &Producers,
+    extra_cfgs: &[(&str, Option<&str>)],
     alloc: Alloc<'a>,
 ) -> blaze_own::AString<'a> {
     let mut h = blaze_ids::Hasher::new(WASM64_SYSROOT_DIR_DOMAIN);
@@ -95,10 +106,42 @@ fn wasm64_sysroot_dir_name<'a>(
     h.id(producers.get::<blaze_ids::producer::Lowering>().id());
     h.id(producers.get::<blaze_ids::producer::CodeBuilder>().id());
     h.id(producers.get::<blaze_ids::producer::Whole>().id());
+    h.part(&u64::try_from(extra_cfgs.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for &(name, value) in extra_cfgs {
+        h.part(name.as_bytes());
+        match value {
+            Some(val) => {
+                h.part(&[1]);
+                h.part(val.as_bytes());
+            }
+            None => {
+                h.part(&[0]);
+            }
+        }
+    }
     let key = h.finish();
     let hex_buf = hex_bytes_buf(&key.0);
     let hex = core::str::from_utf8(&hex_buf).unwrap_or("");
     bstd::mem::format_in!(alloc, "{tc_id}-{hex}")
+}
+
+/// Appends `extra_cfgs` into a crate-key byte buffer unambiguously (Rule 21).
+fn fold_extra_cfgs_bytes<A: core::alloc::Allocator>(
+    buf: &mut OwnVec<u8, A>,
+    extra_cfgs: &[(&str, Option<&str>)],
+) {
+    buf.push(0xff);
+    for &(name, value) in extra_cfgs {
+        buf.extend_from_slice(name.as_bytes());
+        match value {
+            Some(val) => {
+                buf.push(1);
+                buf.extend_from_slice(val.as_bytes());
+            }
+            None => buf.push(0),
+        }
+        buf.push(0);
+    }
 }
 
 /// Single-flight guard used ONLY when `<store>/wasm64-sysroot-v2/<dir>/` has missing sysroot
@@ -885,11 +928,18 @@ fn ensure_build_script_unit(
     if let Some(hex) = &deps_digest {
         let _ = writeln!(identity, "deps {hex}");
     }
-    let _ = writeln!(
-        identity,
-        "toolchain {id}\nwasm-target {WASM64_TARGET}\n{}\nbuilder blaze-wasm64",
-        script_unit::shim_line()
-    );
+    let _ = writeln!(identity, "toolchain {id}\nwasm-target {WASM64_TARGET}");
+    for &(name, value) in WASM64_TARGET_EXTRA_CFGS {
+        match value {
+            Some(val) => {
+                let _ = writeln!(identity, "wasm-target-cfg {name}=\"{val}\"");
+            }
+            None => {
+                let _ = writeln!(identity, "wasm-target-cfg {name}");
+            }
+        }
+    }
+    let _ = writeln!(identity, "{}\nbuilder blaze-wasm64", script_unit::shim_line());
     let key = sha256_hex(identity.as_bytes());
     let wasm_sha256 = sha256_hex(&wasm);
     publish_build_script_module(store, &key, &identity, &wasm, &wasm_sha256)
@@ -1317,6 +1367,8 @@ fn run_dep_build_script(
             None => CfgAtom::flag(k.as_str(), alloc),
         });
     }
+    side_cfg.sort();
+    side_cfg.dedup();
     let prepared = script_unit::prepare_viewing_on(
         &rt,
         &setting,
@@ -1543,17 +1595,8 @@ fn resolve_wasm64_graph<'r>(
     let manifest_bytes: &'r [u8] = bump.alloc_slice_copy(manifest_file.as_ref());
     let tc_view = ToolchainView::open(manifest_bytes, tc_id)
         .map_err(|e| fail(format_args!("invalid toolchain manifest {tc_id}: {e}")))?;
-    let tc_cfg = tc_view
-        .cfg(WASM64_TARGET)
+    let wasm_desc = blaze_toolchain::target_desc(&tc_view, WASM64_TARGET, alloc)
         .ok_or_else(|| fail(format_args!("toolchain {tc_id} has no cfg for {WASM64_TARGET}")))?;
-    let mut cfg_atoms: AVec<'r, CfgAtom<'r>> = OwnVec::new_in(alloc);
-    for (name, value) in tc_cfg {
-        cfg_atoms.push(match value {
-            Some(val) => CfgAtom::pair(name, val, alloc),
-            None => CfgAtom::flag(name, alloc),
-        });
-    }
-    let wasm_desc = TargetDesc::new(WASM64_TARGET, cfg_atoms, alloc);
 
     // Seed the wasm64 host resolution with ALL `BuildScript` and `ProcMacro` units from
     // `host_graph` (preserving each unit's `HostFeatureSide`, matching `UnitGraphSession` in
@@ -1968,11 +2011,13 @@ fn compile_unit_in<'a>(
     let mut keep_tc = std::vec![false; all_tc.len()];
     mark_wasm64_sysroot(&all_tc, sys, needs_bstd, &mut keep_tc, alloc);
 
-    let tc_cfg_owned: std::vec::Vec<(std::string::String, Option<std::string::String>)> = tc_view
-        .cfg(WASM64_TARGET)
-        .ok_or_else(|| std::format!("toolchain {tc_id} has no cfg for `{WASM64_TARGET}`"))?
-        .map(|(n, v)| (n.to_owned(), v.map(str::to_owned)))
-        .collect();
+    let mut tc_cfg_owned: std::vec::Vec<(std::string::String, Option<std::string::String>)> =
+        blaze_toolchain::target_cfg(&tc_view, WASM64_TARGET)
+            .ok_or_else(|| std::format!("toolchain {tc_id} has no cfg for `{WASM64_TARGET}`"))?
+            .map(|(n, v)| (n.to_owned(), v.map(str::to_owned)))
+            .collect();
+    tc_cfg_owned.sort_unstable();
+    tc_cfg_owned.dedup();
 
     let mut tc_at = std::vec![usize::MAX; all_tc.len()];
     let mut tc_units: std::vec::Vec<TcUnit<'_>> = std::vec::Vec::new();
@@ -2001,12 +2046,14 @@ fn compile_unit_in<'a>(
         for f in row.features() {
             feats.push(bump.alloc_str(f));
         }
-        let mut key_bytes = krate.pack.to_vec();
+        let mut key_bytes: OwnVec<u8, Alloc<'_>> = OwnVec::new_in(alloc);
+        key_bytes.extend_from_slice(&krate.pack);
         for f in row.features() {
             key_bytes.extend_from_slice(f.as_bytes());
             key_bytes.push(0);
         }
-        let key = CrateItemKey(ContentId::of("blaze wasm64 tc unit", &key_bytes));
+        fold_extra_cfgs_bytes(&mut key_bytes, WASM64_TARGET_EXTRA_CFGS);
+        let key = CrateItemKey(ContentId::of("blaze wasm64 tc unit", key_bytes.as_slice()));
         tc_at[u] = tc_units.len();
         tc_names.push(krate.lib.to_owned());
         let raw_deps: &[(&str, usize)] = if is_pm {
@@ -2185,7 +2232,7 @@ fn compile_unit_in<'a>(
         // Workspace-independent deterministic crate key (Rule 25): never hashes host `UnitId(uid.0)`,
         // so compiling the same build script or proc-macro from any workspace emits byte-identical
         // `.wasm` output.
-        let mut key_buf = std::vec::Vec::new();
+        let mut key_buf: OwnVec<u8, Alloc<'_>> = OwnVec::new_in(alloc);
         key_buf.extend_from_slice(u.name.as_str().as_bytes());
         key_buf.push(0);
         key_buf.extend_from_slice(u.version.as_str().as_bytes());
@@ -2203,14 +2250,16 @@ fn compile_unit_in<'a>(
             _ => 8,
         };
         key_buf.push(kind_byte);
-        let mut sorted_feats: std::vec::Vec<&str> = feats_slice.to_vec();
+        let mut sorted_feats: OwnVec<&str, Alloc<'_>> = OwnVec::with_capacity_in(feats_slice.len(), alloc);
+        sorted_feats.extend_from_slice(feats_slice);
         sorted_feats.sort_unstable();
         sorted_feats.dedup();
         for f in sorted_feats {
             key_buf.push(0);
             key_buf.extend_from_slice(f.as_bytes());
         }
-        let crate_key = CrateItemKey(ContentId::of("blaze wasm64 unit 2", &key_buf));
+        fold_extra_cfgs_bytes(&mut key_buf, WASM64_TARGET_EXTRA_CFGS);
+        let crate_key = CrateItemKey(ContentId::of("blaze wasm64 unit 2", key_buf.as_slice()));
 
         let env = CrateEnv::of(
             EnvFacts {
@@ -3190,11 +3239,12 @@ mod wasm64_probe_table_tests {
                     keep[u] = true;
                     todo.extend(all[u].deps().filter_map(|(_, d)| usize::try_from(d).ok()));
                 }
-                let real_cfg: std::vec::Vec<_> = view
-                    .cfg(WASM64_TARGET)
+                let mut real_cfg: std::vec::Vec<_> = blaze_toolchain::target_cfg(&view, WASM64_TARGET)
                     .expect("real cfg")
                     .map(|(n, v)| (n.to_owned(), v.map(str::to_owned)))
                     .collect();
+                real_cfg.sort_unstable();
+                real_cfg.dedup();
                 let mut real_at = std::vec![usize::MAX; all.len()];
                 let mut real_units = std::vec::Vec::new();
                 let mut real_names = std::vec::Vec::new();
@@ -3671,6 +3721,33 @@ mod tests {
                 "moving producer row {row:?} must change wasm64-sysroot-v2 key"
             );
         }
+
+        // Extra target cfgs (`WASM64_TARGET_EXTRA_CFGS`) MUST enter the sysroot directory key
+        // (Rule 21 negative control: removing or changing extra cfgs yields a distinct key).
+        assert_eq!(
+            base_dir,
+            super::wasm64_sysroot_dir_name_with_cfgs(tc_a, &base, super::WASM64_TARGET_EXTRA_CFGS, alloc)
+        );
+        assert_ne!(
+            base_dir,
+            super::wasm64_sysroot_dir_name_with_cfgs(tc_a, &base, &[], alloc),
+            "omitting WASM64_TARGET_EXTRA_CFGS must change wasm64-sysroot-v2 key"
+        );
+        assert_ne!(
+            base_dir,
+            super::wasm64_sysroot_dir_name_with_cfgs(
+                tc_a,
+                &base,
+                &[("getrandom_backend", Some("other"))],
+                alloc,
+            ),
+            "changing extra target cfg value must change wasm64-sysroot-v2 key"
+        );
+        assert_ne!(
+            super::wasm64_sysroot_dir_name_with_cfgs(tc_a, &base, &[("getrandom_backend", None)], alloc),
+            super::wasm64_sysroot_dir_name_with_cfgs(tc_a, &base, &[("getrandom_backend", Some(""))], alloc),
+            "flag vs empty-value extra cfg must hash distinctly"
+        );
     }
 
     #[test]
