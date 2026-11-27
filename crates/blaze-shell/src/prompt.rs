@@ -4,9 +4,7 @@
 //! rebase/merge state, and a single coalesced background status worker.
 
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
-#[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -14,15 +12,11 @@ use std::thread;
 #[cfg(not(unix))]
 use std::time::UNIX_EPOCH;
 
-use blaze_git::machine::{
-    DirListing, FileData, Got, PathScope, ScopedPath, StatEntry, StatusMachine, Step, Want,
-};
 use blaze_git::{
-    ChangeKind, Divergence, FileKind, FileStat, Head, PromptStyle, RepoState, StatusOpts,
-    WorktreeKind, format_status,
+    ChangeKind, Divergence, Head, PromptStyle, RepoState, StatusOpts, WorktreeKind, format_status,
 };
 use blaze_own::planted::NoPlant;
-use blaze_own::{AVec, Alloc, Vec as OwnVec};
+use blaze_own::Alloc;
 
 /// Parsed git HEAD reference for the enclosing repository.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -493,27 +487,22 @@ fn parse_head_contents(contents: &str) -> Option<(String, bool)> {
 // Thin OS driver over `blaze-git`'s sans-IO `StatusMachine`
 // =============================================================================
 
-/// Run `blaze-git`'s full Starship-class sans-IO `StatusMachine` for `cwd`.
-/// Zero subprocesses, supports normal repos & linked worktrees, `.gitignore`, index v2–v4,
-/// `TREE` cache-tree pruning, binary `commit-graph` ahead/behind, and stash counts.
+/// Status of the repo at `cwd` for the prompt and a typed `git status`, through bgit's
+/// watcher-backed snapshot (`bgit::query_status`): both callers pass `StatusOpts::STARSHIP`, so
+/// they share one snapshot, kept current by the prompt's background thread, and a typed
+/// `git status` answers from the watched dirty set instead of scanning the tree again.
 pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
     let head = read_git_head(cwd)?;
     let alloc = Alloc::global();
-    let mut machine = StatusMachine::new(StatusOpts::STARSHIP, head.kind, alloc, NoPlant);
-
-    // Supply user global gitignore (`~/.config/git/ignore`) if present.
-    if let Ok(home) = std::env::var("HOME") {
-        let global_ig = Path::new(&home).join(".config/git/ignore");
-        if let Ok(bytes) = fs::read(&global_ig) {
-            machine.set_global_exclude(&bytes);
+    let status = match bgit::query_status(Path::new(cwd), StatusOpts::STARSHIP, alloc) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("blaze-shell: git status of {cwd} failed: {error}");
+            return None;
         }
-    }
-
-    // Strictly bounded IO rounds (rule `bounded-progress`).
-    const MAX_ROUNDS: usize = 256;
-    for _ in 0..MAX_ROUNDS {
-        match machine.poll() {
-            Ok(Step::Done(status)) => {
+    };
+    {
+            {
                 let (branch, detached) = match &status.head {
                     Head::Branch { name, .. } => (name.as_str().to_owned(), false),
                     Head::Detached { short, .. } => (short.as_str().to_owned(), true),
@@ -640,16 +629,7 @@ pub fn query_blaze_git_status(cwd: &str) -> Option<GitStatusSummary> {
                     behind,
                 });
             }
-            Ok(Step::Need(want)) => {
-                let got = execute_want(&head, want, alloc);
-                if machine.feed(got).is_err() {
-                    return None;
-                }
-            }
-            Err(_) => return None,
-        }
     }
-    None
 }
 
 /// Map a short status tag (`"+"`, `"M"`, `"D"`, `"?"`, `"!"`) to its human-readable status word.
@@ -1244,180 +1224,15 @@ fn read_git_log_commits(work_tree: &Path, rev_range: &str, limit: usize) -> Vec<
         .collect()
 }
 
-fn resolve_scoped(head: &GitHead, sp: &ScopedPath<'_>) -> PathBuf {
-    let base = match sp.scope {
-        PathScope::Worktree => &head.work_tree,
-        PathScope::GitDir => &head.git_dir,
-        PathScope::CommonDir => &head.common_dir,
-    };
-    let rel = sp.path.as_str();
-    if rel.is_empty() {
-        base.clone()
-    } else {
-        base.join(rel)
-    }
-}
 
-fn meta_to_file_stat(meta: &fs::Metadata) -> FileStat {
-    let ft = meta.file_type();
-    let kind = if ft.is_symlink() {
-        FileKind::Symlink
-    } else if ft.is_dir() {
-        FileKind::Dir
-    } else if ft.is_file() {
-        FileKind::File
-    } else {
-        FileKind::Other
-    };
-    #[cfg(unix)]
-    {
-        FileStat {
-            kind,
-            size: meta.len(),
-            mtime_sec: meta.mtime(),
-            mtime_nsec: meta.mtime_nsec().clamp(0, 999_999_999) as u32,
-            ctime_sec: meta.ctime(),
-            ctime_nsec: meta.ctime_nsec().clamp(0, 999_999_999) as u32,
-            ino: meta.ino(),
-            dev: meta.dev(),
-            mode: meta.mode(),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .unwrap_or_default();
-        FileStat {
-            kind,
-            size: meta.len(),
-            mtime_sec: mtime.as_secs() as i64,
-            mtime_nsec: mtime.subsec_nanos(),
-            ctime_sec: mtime.as_secs() as i64,
-            ctime_nsec: mtime.subsec_nanos(),
-            ino: 0,
-            dev: 0,
-            mode: 0o100644,
-        }
-    }
-}
 
-fn stat_path(p: &Path) -> FileStat {
-    match fs::symlink_metadata(p) {
-        Ok(meta) => meta_to_file_stat(&meta),
-        Err(_) => FileStat::GONE,
-    }
-}
 
-fn read_to_avec<'a>(p: &Path, alloc: Alloc<'a>) -> Option<AVec<'a, u8>> {
-    let data = fs::read(p).ok()?;
-    let mut out = OwnVec::with_capacity_in(data.len(), alloc);
-    out.extend_from_slice(&data);
-    Some(out)
-}
 
-fn execute_want<'a>(head: &GitHead, want: Want<'a>, alloc: Alloc<'a>) -> Got<'a> {
-    match want {
-        Want::ReadFiles(paths) => {
-            let mut out = OwnVec::with_capacity_in(paths.len(), alloc);
-            for sp in paths.iter() {
-                let full = resolve_scoped(head, sp);
-                out.push(read_to_avec(&full, alloc));
-            }
-            Got::Files(out)
-        }
-        Want::ReadWithStat(paths) => {
-            let mut out = OwnVec::with_capacity_in(paths.len(), alloc);
-            for sp in paths.iter() {
-                let full = resolve_scoped(head, sp);
-                let stat = fs::symlink_metadata(&full).ok().map(|m| meta_to_file_stat(&m));
-                let bytes = if stat.is_some() { read_to_avec(&full, alloc) } else { None };
-                out.push(FileData { bytes, stat });
-            }
-            Got::FilesWithStat(out)
-        }
-        Want::ListDirs(paths) => {
-            let mut out = OwnVec::with_capacity_in(paths.len(), alloc);
-            for sp in paths.iter() {
-                let full = resolve_scoped(head, sp);
-                let listing = match fs::read_dir(&full) {
-                    Ok(rd) => {
-                        let mut entries: Vec<(String, FileStat)> = Vec::new();
-                        for ent in rd.flatten() {
-                            let name = ent.file_name().to_string_lossy().into_owned();
-                            let ep = full.join(&name);
-                            let st = stat_path(&ep);
-                            if st.kind != FileKind::Gone {
-                                entries.push((name, st));
-                            }
-                        }
-                        // `blaze-git::DirListing` requires entries sorted by name bytes.
-                        entries.sort_unstable_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-                        let name_bytes: usize = entries.iter().map(|(n, _)| n.len()).sum();
-                        let mut dl = DirListing::with_capacity(entries.len(), name_bytes, alloc);
-                        for (name, st) in entries {
-                            dl.push(&name, st);
-                        }
-                        Some(dl)
-                    }
-                    Err(_) => None,
-                };
-                out.push(listing);
-            }
-            Got::Dirs(out)
-        }
-        Want::StatPaths(paths) => {
-            let mut out = OwnVec::with_capacity_in(paths.len(), alloc);
-            for sp in paths.iter() {
-                let full = resolve_scoped(head, sp);
-                out.push(StatEntry { stat: stat_path(&full) });
-            }
-            Got::Stats(out)
-        }
-        Want::ReadLinks(paths) => {
-            let mut out = OwnVec::with_capacity_in(paths.len(), alloc);
-            for sp in paths.iter() {
-                let full = resolve_scoped(head, sp);
-                let bytes = fs::read_link(&full).ok().map(|target| {
-                    let s = target.to_string_lossy();
-                    let mut v = OwnVec::with_capacity_in(s.len(), alloc);
-                    v.extend_from_slice(s.as_bytes());
-                    v
-                });
-                out.push(bytes);
-            }
-            Got::Links(out)
-        }
-        Want::ReadRanges(ranges) => {
-            let mut out = OwnVec::with_capacity_in(ranges.len(), alloc);
-            for rr in ranges.iter() {
-                let sp = ScopedPath::new(rr.scope, rr.path.as_str(), alloc);
-                let full = resolve_scoped(head, &sp);
-                let bytes = (|| -> Option<AVec<'a, u8>> {
-                    let mut f = File::open(&full).ok()?;
-                    f.seek(SeekFrom::Start(rr.offset)).ok()?;
-                    let want_len = (rr.len as usize).min(64 << 20);
-                    let mut buf = vec![0u8; want_len];
-                    let mut read_total = 0usize;
-                    while read_total < want_len {
-                        let n = f.read(&mut buf[read_total..]).ok()?;
-                        if n == 0 {
-                            break;
-                        }
-                        read_total += n;
-                    }
-                    let mut v = OwnVec::with_capacity_in(read_total, alloc);
-                    v.extend_from_slice(&buf[..read_total]);
-                    Some(v)
-                })();
-                out.push(blaze_git::machine::RangeData { bytes });
-            }
-            Got::Ranges(out)
-        }
-    }
-}
+
+
+
+
+
 
 // =============================================================================
 // Single coalesced background status worker
@@ -1471,6 +1286,8 @@ impl GitStatusWorker {
                     };
                     if let Some(cwd) = cwd {
                         let summary = query_blaze_git_status(&cwd);
+                        // Also keeps bgit's watcher-backed snapshot current off the UI thread, so a
+                        // typed `git status` (same opts) answers from it.
                         if let Ok(mut out) = res_bg.lock() {
                             *out = Some((cwd, summary));
                             flag_bg.store(true, Ordering::Release);

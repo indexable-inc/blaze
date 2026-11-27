@@ -655,7 +655,13 @@ pub(crate) fn is_watching(repo_root: &Path) -> bool {
 pub(crate) fn begin_full_scan(repo_root: &Path) -> Option<u64> {
     let watch = get_watch(repo_root)?;
     let mut mon = watch.lock().ok()?;
-    mon.flush().ok()?;
+    // With no baseline yet there is nothing a late event could make stale, so the cookie round
+    // trip (which a just-started stream can take up to FLUSH_TIMEOUT to answer) is skipped: an
+    // event from before the scan heard afterwards only marks its path pending, which costs a
+    // re-stat later, never a wrong answer.
+    if mon.status_baseline.is_some() {
+        mon.flush().ok()?;
+    }
     Some(mon.generation)
 }
 
@@ -824,6 +830,8 @@ pub(crate) fn try_cached_status<'a>(
 ) -> Option<PromptStatus<'a>> {
     let watch = get_watch(repo_root)?;
     let mut mon = watch.lock().ok()?;
+    // No snapshot to answer from: the caller scans fully, so don't wait on the cookie first.
+    mon.status_baseline.as_ref()?;
     mon.flush().ok()?;
 
     let cur_stamp = compute_meta_stamp(git_dir, common_dir, bgit_dir);
@@ -935,16 +943,20 @@ pub(crate) fn record_status_baseline(
     };
     mon.drain_ready();
     let meta_stamp = compute_meta_stamp(git_dir, common_dir, bgit_dir);
-    let concurrent_pending = match (&mon.status_baseline, start_gen) {
-        (Some(prev), Some(g)) if mon.generation != g => prev.pending_paths.clone(),
-        _ => BTreeSet::new(),
+    // Changes heard while the scan ran may be missing from `status`. With an earlier baseline
+    // they were recorded as its pending paths; without one they were heard by nothing, so the
+    // new baseline is not trusted and the next status scans fully.
+    let (concurrent_pending, needs_full) = match (&mon.status_baseline, start_gen) {
+        (Some(prev), Some(g)) if mon.generation != g => (prev.pending_paths.clone(), prev.needs_full),
+        (None, Some(g)) if mon.generation != g => (BTreeSet::new(), true),
+        _ => (BTreeSet::new(), false),
     };
     mon.status_baseline = Some(StatusBaseline {
         meta_stamp,
         opts: StatusOptsKey::from(opts),
         snapshot: CachedPromptStatus::from_status(status),
         pending_paths: concurrent_pending,
-        needs_full: false,
+        needs_full,
     });
 }
 
