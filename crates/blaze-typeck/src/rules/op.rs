@@ -205,8 +205,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             && let Some(name) = binop_method(op, assign)
             && let Some(m) = self.reads.assoc_item(tr, Name::of(name))?
         {
+            let first_row = self.projected.len();
             let args = self.mk_list(&[lhs, rhs])?;
             self.callees.push((e, m.item, args));
+            if !assign && category(op) != Category::Comparison {
+                self.projected.push((e, tr, Some(Name::of("Output")), args));
+            }
+            self.record_lifetime_impls(e, m.item, args, first_row)?;
         }
         Ok(())
     }

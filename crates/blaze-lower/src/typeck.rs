@@ -1716,9 +1716,109 @@ impl Conv<'_, '_, '_, '_, '_> {
         })
     }
 
+    /// Walks a `let` statement's written type annotation `root_ty` alongside its initializer
+    /// expression `root_expr` through transparent containers (`Ref`, `Array`/`Slice`, `Tuple`,
+    /// `Match`, `If`, `Paren`), recording the expected `fn`-pointer type's regions under
+    /// `(closure_expr, u32::MAX)` for every closure leaf.
+    fn record_let_fn_ptr_regions(&mut self, root_ty: TypeId, root_expr: ExprId) -> Result<(), Refused> {
+        let mut stack: [(TypeId, ExprId); 64] = [(root_ty, root_expr); 64];
+        let mut sp = 1usize;
+        let mut steps = 0u32;
+        while let Some(top) = sp.checked_sub(1) {
+            sp = top;
+            steps += 1;
+            if steps > 128 {
+                break;
+            }
+            let Some(&(mut tid, mut eid)) = stack.get(top) else { break };
+            for _ in 0..16 {
+                match self.v.expr(eid)? {
+                    Expr::Paren(inner) => eid = inner,
+                    _ => break,
+                }
+            }
+            match self.v.expr(eid)? {
+                Expr::Closure { .. } => {
+                    let before = self.out.closure_param_regions.len();
+                    let handled = self.types.closure_param_regions(self.v, tid, self.tys, eid, u32::MAX, &mut |r| {
+                        self.out.closure_param_regions.push(r);
+                    });
+                    if !handled {
+                        self.out.closure_param_regions.truncate(before);
+                    }
+                }
+                Expr::Ref { operand, raw: false, .. } => {
+                    if let TypeRef::Ref { inner, .. } = self.v.ty(tid)?
+                        && let Some(slot) = stack.get_mut(sp)
+                    {
+                        *slot = (inner, operand);
+                        sp += 1;
+                    }
+                }
+                Expr::Array { elems } => {
+                    let elem_ty = match self.v.ty(tid)? {
+                        TypeRef::Array { elem, .. } | TypeRef::Slice(elem) => Some(elem),
+                        _ => None,
+                    };
+                    if let Some(et) = elem_ty {
+                        for &id in self.v.ids(elems)? {
+                            if let Some(slot) = stack.get_mut(sp) {
+                                *slot = (et, ExprId(id));
+                                sp += 1;
+                            }
+                        }
+                    }
+                }
+                Expr::Tuple { elems } => {
+                    if let TypeRef::Tuple(t_elems) = self.v.ty(tid)? {
+                        let ts = self.v.ids(t_elems)?;
+                        let es = self.v.ids(elems)?;
+                        if ts.len() == es.len() {
+                            for (&tid_i, &eid_i) in ts.iter().zip(es.iter()) {
+                                if let Some(slot) = stack.get_mut(sp) {
+                                    *slot = (TypeId(tid_i), ExprId(eid_i));
+                                    sp += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                Expr::Match { arms, .. } => {
+                    for &n in self.v.rows(arms)? {
+                        let a = Arm::decode(n)?;
+                        if let Some(slot) = stack.get_mut(sp) {
+                            *slot = (tid, a.body);
+                            sp += 1;
+                        }
+                    }
+                }
+                Expr::If { then, else_, .. } => {
+                    if let Some(slot) = stack.get_mut(sp) {
+                        *slot = (tid, then);
+                        sp += 1;
+                    }
+                    if let Some(el) = else_
+                        && let Some(slot) = stack.get_mut(sp)
+                    {
+                        *slot = (tid, el);
+                        sp += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     fn stmt(&mut self, s: StmtId) -> Result<tc::Stmt, Refused> {
         Ok(match self.v.stmt(s)? {
-            Stmt::Let { pat, ty, init, else_ } => tc::Stmt::Let { pat, ty: self.opt_ty(ty)?, init, else_ },
+            Stmt::Let { pat, ty, init, else_ } => {
+                let lowered_ty = self.opt_ty(ty)?;
+                if let (Some(tid), Some(init_e)) = (ty, init) {
+                    self.record_let_fn_ptr_regions(tid, init_e)?;
+                }
+                tc::Stmt::Let { pat, ty: lowered_ty, init, else_ }
+            }
             Stmt::Expr { expr, semi } => tc::Stmt::Expr { expr, semi },
             Stmt::Item { .. } => tc::Stmt::Item,
         })
@@ -1865,7 +1965,6 @@ pub fn to_typeck<'a>(
     // The same for the legacy arguments' terms (`BodyView::legacy_arg`); one argument is
     // one call's, so no id repeats.
     c.out.legacy_args.sort_unstable_by_key(|&(x, _)| x);
-    c.out.closure_param_regions.sort_unstable();
     for i in 0..view.pats.len() {
         let id = PatId(len(i));
         let ed = view.mark_of_pat(id)?.map_or(body_edition, |m| edition(m.edition));
@@ -1877,6 +1976,7 @@ pub fn to_typeck<'a>(
         let s = c.stmt(StmtId(len(i)))?;
         c.out.stmts.push(s);
     }
+    c.out.closure_param_regions.sort_unstable();
     if !c.out.inline_fors.is_empty() {
         wire_inline_fors(&mut c.out, alloc);
     }

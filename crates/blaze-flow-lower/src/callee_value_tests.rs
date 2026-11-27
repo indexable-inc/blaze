@@ -1629,7 +1629,7 @@ fn closure_dyn_fn_param_elided_wrapper_positive_and_soundness_negatives() {
     let step1 = ClosureParamRegion::push_step(root_path, 0).expect("step1");
     let step2 = ClosureParamRegion::push_step(step1, 0).expect("step2");
 
-    let run_dyn = |conflict_borrow: bool, regions_fn: &dyn Fn(ExprId) -> std::vec::Vec<ClosureParamRegion>| {
+    let run_dyn = |conflict_borrow: bool, regions_fn: &dyn Fn(ExprId) -> [Option<ClosureParamRegion>; 3]| {
         let mut b = Bb::new();
         let ppen = b.bind("pen");
         let pdraw = b.bind("draw");
@@ -1662,7 +1662,11 @@ fn closure_dyn_fn_param_elided_wrapper_positive_and_soundness_negatives() {
         let opt_tys = [Some(rm_pen), Some(ref_dyn)];
         body.types = w.fx.t.view();
         body.opt_types = &opt_tys;
-        let mut written = regions_fn(cl);
+        let raw = regions_fn(cl);
+        let mut written = blaze_own::Vec::new_in(crate::region_fixture::alloc());
+        for entry in raw.into_iter().flatten() {
+            written.push(entry);
+        }
         written.sort_unstable();
         body.closure_param_regions = &written;
         let mut ck = crate::region_fixture::checked(&w.fx, &body);
@@ -1673,9 +1677,10 @@ fn closure_dyn_fn_param_elided_wrapper_positive_and_soundness_negatives() {
 
     // POSITIVE: exact front2 `&dyn Fn(&mut Pen<'_, '_>)` wrapper-only `Elided(0)` pair checks cleanly.
     let ok = run_dyn(false, &|cl| {
-        std::vec![
-            ClosureParamRegion { closure: cl, param: 1, path: root_path, own: 0, kind: WrittenRegion::Elided(0) },
-            ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Elided(0) },
+        [
+            Some(ClosureParamRegion { closure: cl, param: 1, path: root_path, own: 0, kind: WrittenRegion::Elided(0) }),
+            Some(ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Elided(0) }),
+            None,
         ]
     })
     .expect("POSITIVE: `&dyn Fn(&mut Pen<'_, '_>)` with wrapper-only `Elided(0)` must lower cleanly");
@@ -1684,9 +1689,10 @@ fn closure_dyn_fn_param_elided_wrapper_positive_and_soundness_negatives() {
 
     // NEGATIVE 1: active shared borrow across `draw(pen)` is still caught.
     let conflict = run_dyn(true, &|cl| {
-        std::vec![
-            ClosureParamRegion { closure: cl, param: 1, path: root_path, own: 0, kind: WrittenRegion::Elided(0) },
-            ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Elided(0) },
+        [
+            Some(ClosureParamRegion { closure: cl, param: 1, path: root_path, own: 0, kind: WrittenRegion::Elided(0) }),
+            Some(ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Elided(0) }),
+            None,
         ]
     })
     .expect("NEGATIVE 1: conflicting borrow body lowers cleanly");
@@ -1698,7 +1704,7 @@ fn closure_dyn_fn_param_elided_wrapper_positive_and_soundness_negatives() {
 
     // NEGATIVE 2: `WrittenRegion::Named` on wrapper is refused.
     let bad_named = run_dyn(false, &|cl| {
-        std::vec![ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Named }]
+        [Some(ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Named }), None, None]
     });
     assert!(
         matches!(bad_named, Err(Refusal { form: Form::CalleeValueUnknown, .. })),
@@ -1708,10 +1714,10 @@ fn closure_dyn_fn_param_elided_wrapper_positive_and_soundness_negatives() {
 
     // NEGATIVE 3: `WrittenRegion::Elided(0)` reaching inside `dyn Fn` inputs (depth 2 > wrapper depth 1) is refused.
     let bad_deep = run_dyn(false, &|cl| {
-        std::vec![
-            ClosureParamRegion { closure: cl, param: 1, path: root_path, own: 0, kind: WrittenRegion::Elided(0) },
-            ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Elided(0) },
-            ClosureParamRegion { closure: cl, param: 1, path: step2, own: 0, kind: WrittenRegion::Elided(0) },
+        [
+            Some(ClosureParamRegion { closure: cl, param: 1, path: root_path, own: 0, kind: WrittenRegion::Elided(0) }),
+            Some(ClosureParamRegion { closure: cl, param: 1, path: step1, own: 0, kind: WrittenRegion::Elided(0) }),
+            Some(ClosureParamRegion { closure: cl, param: 1, path: step2, own: 0, kind: WrittenRegion::Elided(0) }),
         ]
     });
     assert!(
@@ -1722,7 +1728,7 @@ fn closure_dyn_fn_param_elided_wrapper_positive_and_soundness_negatives() {
 
     // NEGATIVE 4: `WrittenRegion::Elided(0)` at `own > 0` on `dyn` is refused.
     let bad_own = run_dyn(false, &|cl| {
-        std::vec![ClosureParamRegion { closure: cl, param: 1, path: step1, own: 1, kind: WrittenRegion::Elided(0) }]
+        [Some(ClosureParamRegion { closure: cl, param: 1, path: step1, own: 1, kind: WrittenRegion::Elided(0) }), None, None]
     });
     assert!(
         matches!(bad_own, Err(Refusal { form: Form::CalleeValueUnknown, .. })),
@@ -1965,4 +1971,87 @@ fn closure_fn_ptr_param_static_input_positive_and_local_negative() {
         !bad_report.borrows.is_empty(),
         "NEGATIVE: passing local `&s` to `fn(&'static S)` must report a borrow/lifetime error"
     );
+}
+
+/// `fn_ptr_slots_alpha_eq` treats two identical `fn(&mut Fx, &Objs) -> PTy` pointer fields with
+/// distinct binder indices (`binder: 1` vs `binder: 2`) as equivalent, while rejecting mismatched
+/// sharing patterns or `'static` vs `Late`.
+#[test]
+fn fn_ptr_slots_alpha_eq_matches_renamed_binders_only() {
+    let alloc = crate::region_fixture::alloc();
+    let b1 = [
+        crate::Region::Late { binder: 1, var: 0 },
+        crate::Region::Late { binder: 1, var: 1 },
+        crate::Region::Late { binder: 1, var: 0 },
+    ];
+    let b2 = [
+        crate::Region::Late { binder: 2, var: 0 },
+        crate::Region::Late { binder: 2, var: 1 },
+        crate::Region::Late { binder: 2, var: 0 },
+    ];
+    let mismatch_share = [
+        crate::Region::Late { binder: 2, var: 0 },
+        crate::Region::Late { binder: 2, var: 1 },
+        crate::Region::Late { binder: 2, var: 1 },
+    ];
+    let mismatch_static = [
+        crate::Region::Static,
+        crate::Region::Late { binder: 2, var: 1 },
+        crate::Region::Static,
+    ];
+    assert!(crate::fn_ptr_slots_alpha_eq(&b1, &b2, alloc));
+    assert!(!crate::fn_ptr_slots_alpha_eq(&b1, &mismatch_share, alloc));
+    assert!(!crate::fn_ptr_slots_alpha_eq(&b1, &mismatch_static, alloc));
+}
+
+/// `let f: fn(&S) -> &S = |s| s;` vs `let bad: fn(&S) -> &'static S = |s| s;` via
+/// `closure_param_regions` (`param == u32::MAX`) + `AdjustKind::ClosureFnPointer`:
+/// POSITIVE: shared elided `Late(0)` input and output lowers cleanly without `ValueInexact` and
+/// passes borrowck.
+/// NEGATIVE: `Static` output with `Late` input still reports an escaping-borrow error (E0521).
+#[test]
+fn let_fn_ptr_closure_regions_tie_elided_and_reject_static_escape() {
+    use blaze_typeck::{ClosureParamRegion, WrittenRegion};
+    let mut items = None;
+    let w = world_with(|fx, _st, rs, unit| {
+        let fn_list = fx.list(&[rs, rs]);
+        let fn_ptr = fx.ty(PNode::FnPtr(fn_list, FnPtrHeader::RUST));
+        let f = fx.func("f", 0, &[], unit, no_clauses());
+        items = Some((fn_ptr, f));
+    });
+    let (fn_ptr, f) = items.expect("declared");
+    let mut facts = Lane::of(&w);
+    facts.wide.add(f, FnHead { lifetimes: 0, late: &[], outlives: &[], inputs: &[], output: w.unit, slots: &[] });
+
+    let in0 = ClosureParamRegion::push_step(ClosureParamRegion::ROOT, 0).expect("in0");
+    let ret = ClosureParamRegion::push_step(ClosureParamRegion::ROOT, 1).expect("ret");
+
+    let run = |static_ret: bool| {
+        let mut b = Bb::new();
+        let ps = b.bind("s");
+        let ls = b.local(ps);
+        let cl = b.closure(&[ps], ls);
+        let pf = b.bind("fp");
+        let st = b.let_(pf, Some(fn_ptr), cl);
+        let root = b.block(&[st], None);
+        let mut body = b.view(f, root);
+        body.types = w.fx.t.view();
+        let written = if static_ret {
+            [ClosureParamRegion { closure: cl, param: u32::MAX, path: ret, own: 0, kind: WrittenRegion::Static },
+             ClosureParamRegion { closure: cl, param: u32::MAX, path: ret, own: 0, kind: WrittenRegion::Static }]
+        } else {
+            [ClosureParamRegion { closure: cl, param: u32::MAX, path: in0, own: 0, kind: WrittenRegion::Late(0) },
+             ClosureParamRegion { closure: cl, param: u32::MAX, path: ret, own: 0, kind: WrittenRegion::Late(0) }]
+        };
+        body.closure_param_regions = if static_ret { &written[..1] } else { &written };
+        let mut ck = crate::region_fixture::checked(&w.fx, &body);
+        let regions = facts.wide.sigs.decls.lay(w.fx.t.view(), &mut ck.types);
+        let with = crate::region_fixture::WithRegions { base: &facts, regions: &regions };
+        let cf = crate::lower_closure_external(&body, &ck, cl, &with, crate::region_fixture::alloc())?;
+        let report = blaze_flow::check(&cf.lowered.flow, crate::region_fixture::alloc()).expect("flow check");
+        Ok::<_, Refusal>(report.borrows.len() + report.moves.len())
+    };
+
+    assert_eq!(run(false), Ok(0), "POSITIVE: `let f: fn(&S) -> &S = |s| s;` must check clean");
+    assert!(run(true).is_ok_and(|n| n > 0), "NEGATIVE: `let f: fn(&S) -> &'static S = |s| s;` must fail borrowck");
 }

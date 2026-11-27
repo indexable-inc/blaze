@@ -168,6 +168,30 @@ pub(crate) fn all_self_defaults(defaults: &[Option<PTy>], tys: tc::PTys<'_>) -> 
     defaults.iter().all(|d| d.is_some_and(|p| matches!(tys.get(p), Some(PNode::Param(0)))))
 }
 
+/// Records region columns for every `ExProj` clause on `Self` (`Param(0)`) of trait `sub_ck`
+/// into `maps.super_proj_regions`, so `dyn SubTrait<..>` can lay supertrait-materialized
+/// associated-type equalities (`trait IterTrait<'a, T>: Iterator<Item = &'a T>`).
+fn record_super_proj_regions_from_reader(
+    maps: &Maps,
+    regions: &super::head_record::RegionTable,
+    tys: tc::PTys<'_>,
+    sub_ck: ItemKey,
+) {
+    use tc::region_facts::RegionFacts;
+    let reader = regions.reader(maps.alloc);
+    let Ok(clauses) = reader.clauses(sub_ck) else { return };
+    for cv in clauses {
+        if let Ok(PNode::ExProj { trait_: sup_tr, name, args, .. }) = tys.node(cv.col.ty())
+            && let Ok(list) = tys.list(args)
+            && matches!(list.first().and_then(|&t| tys.get(t)), Some(PNode::Param(0)))
+        {
+            let mut copy = blaze_own::Vec::with_capacity_in(cv.col.as_slice().len(), maps.alloc);
+            copy.extend_from_slice(cv.col.as_slice());
+            maps.super_proj_regions.insert((sub_ck, sup_tr, name), copy);
+        }
+    }
+}
+
 /// Supertrait associated-type equalities on `Self` (`<Param(0) as Tr<..>>::Name == Term`)
 /// extracted from a trait's implied supertrait clauses (`TraitExtra::supertraits`).
 fn extract_super_projs<A: core::alloc::Allocator>(
@@ -214,6 +238,10 @@ pub struct Maps {
     /// [`Heads::trait_super_projs`]), filed with `supers` and restored from
     /// [`TraitExtra::supertraits`].
     pub super_projs: Rows<LibKey, blaze_own::Vec<super::types::SuperProj, Alloc<'static>>>,
+    /// Region columns of each trait's supertrait associated-type equalities on `Self`
+    /// (`(sub_trait_key, sup_trait_key, assoc_name)` -> `ExProj` region slice over `sub_trait`'s
+    /// lifetime parameters).
+    pub super_proj_regions: Rows<(ItemKey, ItemKey, Name), blaze_own::Vec<Region, Alloc<'static>>>,
     /// Traits whose full members (`Want::Members`, Layer 3 — including `assoc_consts`) have been
     /// filed, distinguishing Layer 2 (`supers_only`) from complete member loading.
     pub trait_members_made: Rows<LibKey, ()>,
@@ -309,6 +337,7 @@ impl Maps {
             assoc_consts: Rows::new_in(alloc),
             supers: Rows::new_in(alloc),
             super_projs: Rows::new_in(alloc),
+            super_proj_regions: Rows::new_in(alloc),
             trait_members_made: Rows::new_in(alloc),
             aliases: Rows::new_in(alloc),
             alias_defaults: Rows::new_in(alloc),
@@ -346,6 +375,7 @@ impl Maps {
             assoc_consts,
             supers,
             super_projs,
+            super_proj_regions,
             trait_members_made,
             aliases,
             alias_defaults,
@@ -377,6 +407,7 @@ impl Maps {
         assoc_consts.clear();
         supers.clear();
         super_projs.clear();
+        super_proj_regions.clear();
         trait_members_made.clear();
         aliases.clear();
         alias_defaults.clear();
@@ -595,6 +626,9 @@ impl Heads for Maps {
     }
     fn trait_super_projs(&self, trait_: LibKey) -> Option<&[super::types::SuperProj]> {
         self.super_projs.get(&trait_).map(|s| &s[..])
+    }
+    fn trait_super_proj_regions(&self, sub_trait: ItemKey, sup_trait: ItemKey, name: Name) -> Option<&[Region]> {
+        self.super_proj_regions.get(&(sub_trait, sup_trait, name)).map(|s| &s[..])
     }
     fn trait_members_made(&self, trait_: LibKey) -> bool {
         self.trait_members_made.contains_key(&trait_)
@@ -4513,6 +4547,9 @@ impl<'n> Store<'n> {
                             Some(x) => extract_super_projs(self.tys.view(), &x.supertraits, self.maps.alloc),
                             None => blaze_own::Vec::new_in(self.maps.alloc),
                         };
+                        if !super_projs.is_empty() {
+                            record_super_proj_regions_from_reader(&self.maps, &self.regions, self.tys.view(), ck);
+                        }
                         self.maps.super_projs.insert(key, super_projs);
                     }
                     if let Some(x) = extra {
@@ -5276,6 +5313,27 @@ impl<'n> Store<'n> {
         }
         if supers_only {
             let super_projs = extract_super_projs(self.tys.view(), &supertraits, self.maps.alloc);
+            if !super_projs.is_empty() {
+                let arity = HeadsArity { heads: &self.maps, opaques: &[], names };
+                if let Ok(own_bounds) = with_own_param_bounds(&b, &mut self.tys, &self.regions, &arity, &env, v, &preds, &scope, SelfGiven::NONE, Captures::NONE, alloc)
+                    && let Ok(laid) = lay_listed(&b, &mut self.tys, &env, v, (&preds, &[]), SelfGiven { param_bounds: &own_bounds, ..SelfGiven::NONE }, Captures::NONE, alloc)
+                {
+                    let cx = hreg::Cx { v, facts: &arity, written: &laid, scope: &scope, made: &[], alloc };
+                    if let Ok(h) = hreg::clause_regions(&cx, &mut self.tys, &preds, scope.params(), None) {
+                        let view = self.tys.view();
+                        for cv in h.clauses.iter() {
+                            if let Ok(PNode::ExProj { trait_: sup_tr, name, args, .. }) = view.node(cv.col.ty())
+                                && let Ok(list) = view.list(args)
+                                && matches!(list.first().and_then(|&t| view.get(t)), Some(PNode::Param(0)))
+                            {
+                                let mut copy = blaze_own::Vec::with_capacity_in(cv.col.as_slice().len(), self.maps.alloc);
+                                copy.extend_from_slice(cv.col.as_slice());
+                                self.maps.super_proj_regions.insert((ck, sup_tr, name), copy);
+                            }
+                        }
+                    }
+                }
+            }
             self.maps.supers.insert(key, supers);
             self.maps.super_projs.insert(key, super_projs);
             return Ok(());
@@ -5347,6 +5405,9 @@ impl<'n> Store<'n> {
         }
         file_regions(self, ck, trait_regions.0);
         let super_projs = extract_super_projs(self.tys.view(), &supertraits, self.maps.alloc);
+        if !super_projs.is_empty() {
+            record_super_proj_regions_from_reader(&self.maps, &self.regions, self.tys.view(), ck);
+        }
         self.maps.supers.insert(key, supers);
         self.maps.super_projs.insert(key, super_projs);
         let mut assoc = blaze_own::Vec::new_in(alloc);

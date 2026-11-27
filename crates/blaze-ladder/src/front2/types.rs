@@ -308,6 +308,12 @@ pub trait Heads {
     /// The trait's supertrait associated-type equalities on `Self` (`: Sup<Item = T>`),
     /// filed with its members alongside [`Heads::trait_supers`].
     fn trait_super_projs(&self, trait_: LibKey) -> Option<&[SuperProj]>;
+    /// Region slots of a supertrait associated-type equality on `Self` (`<Self as sup_trait>::name = term`)
+    /// declared on `sub_trait`, numbered over `sub_trait`'s own lifetime parameters (`Region::Param(i)`).
+    fn trait_super_proj_regions(&self, sub_trait: ItemKey, sup_trait: ItemKey, name: Name) -> Option<&[Region]> {
+        let _ = (sub_trait, sup_trait, name);
+        None
+    }
     /// Whether the trait's full members (`Want::Members`, Layer 3 — not merely Layer 2
     /// `supers_only`) have been filed, including `assoc_const_params`.
     fn trait_members_made(&self, trait_: LibKey) -> bool {
@@ -4754,6 +4760,35 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
         for k in 0..n {
             kid_slots += s.kid(n, k).map_or(0, |f| f.len);
         }
+        let find_super_proj = |sup_tr: ItemKey, name: Name| -> Option<(&[Region], u32, u32)> {
+            for &rk in resolved_traits.iter() {
+                let sub_ck = self.heads.checker(rk);
+                if let Some(regs) = self.heads.trait_super_proj_regions(sub_ck, sup_tr, name) {
+                    let (lt_start, lt_len) = trait_lts.iter().find(|&&(k, _, _)| k == sub_ck).map_or((0, 0), |&(_, st, ln)| (st, ln));
+                    return Some((regs, lt_start, lt_len));
+                }
+            }
+            None
+        };
+        let push_super_proj_own = |regs: &[Region], cur: &mut usize, lt_start: u32, lt_len: u32, rown: u32, binders: u32, out: &mut blaze_own::Vec<Slot, Alloc<'_>>| -> bool {
+            let Ok(rn) = usize::try_from(rown) else { return false };
+            let Some(end) = cur.checked_add(rn) else { return false };
+            let Some(slice) = regs.get(*cur..end) else { return false };
+            *cur = end;
+            for &reg in slice {
+                let kind = match reg {
+                    Region::Param(i) if i < lt_len => match usize::try_from(lt_start + i).ok().and_then(|idx| lt_pool.get(idx)) {
+                        Some(&sl) => sl.kind,
+                        None => return false,
+                    },
+                    Region::Static => SlotKind::Static,
+                    Region::Late { binder, var } => SlotKind::Late { binder: binder.saturating_add(binders), var },
+                    _ => return false,
+                };
+                out.push(Slot::quiet(kind));
+            }
+            true
+        };
         let binders = if kid_slots == 0 && whole.slots == 1 {
             s.scratch.push(own);
             whole.binders
@@ -4764,10 +4799,26 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 Ok(())
             }));
             let mut binders = 0u32;
-            for (ri, &(_, rn, rown)) in real.iter().enumerate() {
+            let mut active_sp: Option<(&[Region], usize, u32, u32, usize)> = None;
+            for (ri, &(rt, rn, rown)) in real.iter().enumerate() {
+                if active_sp.is_some_and(|(_, _, _, _, end)| ri >= end) {
+                    active_sp = None;
+                }
+                if active_sp.is_none()
+                    && let PNode::ExProj { trait_: sup_tr, name, .. } = rn
+                    && !trait_lts.iter().any(|&(k, _, _)| k == sup_tr)
+                    && let Some((regs, lt_start, lt_len)) = find_super_proj(sup_tr, name)
+                {
+                    let sub_nodes = usize::try_from(soft!(subtree(tys.view(), rt, &arity, alloc)).nodes).unwrap_or(usize::MAX);
+                    active_sp = Some((regs, 0, lt_start, lt_len, ri.saturating_add(sub_nodes)));
+                }
                 if rown > 0 {
                     if ri == 0 && rown == 1 {
                         s.scratch.push(own);
+                    } else if let Some((regs, ref mut cur, lt_start, lt_len, _)) = active_sp {
+                        if !push_super_proj_own(regs, cur, lt_start, lt_len, rown, binders, &mut s.scratch) {
+                            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
+                        }
                     } else if !push_dyn_node_own_slots(rn, rown, &trait_lts, &lt_pool, &mut s.scratch) {
                         return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
                     }
@@ -4803,7 +4854,19 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
             let out_of_step = RegionRefusal::not_laid(NotLaidWhy::OutOfStep, r);
             let mut ri = 0usize;
             let mut binders = 0u32;
-            for (si, &(_, sn, sown)) in seen.iter().enumerate() {
+            let mut active_sp: Option<(&[Region], usize, u32, u32, usize)> = None;
+            for (si, &(st, sn, sown)) in seen.iter().enumerate() {
+                if active_sp.is_some_and(|(_, _, _, _, end)| si >= end) {
+                    active_sp = None;
+                }
+                if active_sp.is_none()
+                    && let PNode::ExProj { trait_: sup_tr, name, .. } = sn
+                    && !trait_lts.iter().any(|&(k, _, _)| k == sup_tr)
+                    && let Some((regs, lt_start, lt_len)) = find_super_proj(sup_tr, name)
+                {
+                    let sub_nodes = usize::try_from(soft!(subtree(tys.view(), st, &arity, alloc)).nodes).unwrap_or(usize::MAX);
+                    active_sp = Some((regs, 0, lt_start, lt_len, si.saturating_add(sub_nodes)));
+                }
                 if let PNode::Param(p) = sn
                     && p >= SHADOW_BASE
                     && ((p - SHADOW_BASE) as usize) < n
@@ -4832,6 +4895,10 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                 if rown > 0 {
                     if si == 0 && rown == 1 {
                         s.scratch.push(own);
+                    } else if let Some((regs, ref mut cur, lt_start, lt_len, _)) = active_sp {
+                        if !push_super_proj_own(regs, cur, lt_start, lt_len, rown, binders, &mut s.scratch) {
+                            return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
+                        }
                     } else if !push_dyn_node_own_slots(rn, rown, &trait_lts, &lt_pool, &mut s.scratch) {
                         return Ok(Err(RegionRefusal::not_laid(NotLaidWhy::DynRegion, r)));
                     }

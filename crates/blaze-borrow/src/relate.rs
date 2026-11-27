@@ -1944,12 +1944,16 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                 if let Some(sig) = sig {
                     // Walk the caller's signature (`FnPtr([inputs.., output])`) to collect RFC 1214
                     // implied bounds `&'rhs T` -> `T: 'rhs` where `T` contains an unselected alias.
+                    let sig_env_mark = self.envs.len();
+                    let sig_seen_mark = self.impl_seen.len();
+                    let sig_budget = self.budget;
                     let mut stack: [Option<(Side<'c>, Option<Reg>)>; 64] = [None; 64];
                     let mut sp = 1usize;
                     if let Some(slot) = stack.get_mut(0) {
                         *slot = Some((Side { ty: sig.ty, slots: Slots::Sig { col: sig.col, env: oenv } }, None));
                     }
                     let mut steps = 0u32;
+                    let mut direct_hit: Option<Reg> = None;
                     while let Some(top_idx) = sp.checked_sub(1) {
                         sp = top_idx;
                         steps += 1;
@@ -1959,14 +1963,26 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                         let Some((s, under)) = stack.get(top_idx).copied().flatten() else { continue };
                         let Ok(n) = self.node(s) else { continue };
                         if matches!(n, PNode::Alias { .. }) {
-                            if let Some(rhs_reg) = under
-                                && self.alias_side_eq(s, cur)
-                            {
-                                if rhs_reg == Reg::Static || rhs_reg == region {
-                                    self.outlives(cur.ty, rhs_reg, region)?;
-                                    return Ok(true);
+                            if let Some(rhs_reg) = under {
+                                if self.alias_side_eq(s, cur) {
+                                    if rhs_reg == Reg::Static || rhs_reg == region {
+                                        direct_hit = Some(rhs_reg);
+                                        break;
+                                    }
+                                    record_rhs(&mut unique_rhs, rhs_reg);
+                                    continue;
                                 }
-                                record_rhs(&mut unique_rhs, rhs_reg);
+                                // RFC 1214 implied bound under `&'rhs <T as Trait>::Assoc`: if the
+                                // projection normalizes (e.g. `<FrameVec<'_, T, I> as Index<Idx>>::Output`
+                                // -> `<Idx as SliceIndex<[T]>>::Output`), the normalized alias/type
+                                // carries the same implied bound `: 'rhs`.
+                                if self.fits(s).is_ok() {
+                                    let (norm, changed) = self.try_normalize_subject_flag(s, 0);
+                                    if changed && let Some(slot) = stack.get_mut(sp) {
+                                        *slot = Some((norm, under));
+                                        sp += 1;
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -2004,6 +2020,13 @@ impl<'w, 'c, A: Allocator + Copy> Walk<'w, 'c, A> {
                                 sp += 1;
                             }
                         }
+                    }
+                    self.impl_seen.truncate(sig_seen_mark);
+                    self.truncate_envs(sig_env_mark);
+                    self.budget = sig_budget;
+                    if let Some(rhs_reg) = direct_hit {
+                        self.outlives(cur.ty, rhs_reg, region)?;
+                        return Ok(true);
                     }
                 }
             }
