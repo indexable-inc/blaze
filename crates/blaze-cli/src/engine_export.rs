@@ -3413,11 +3413,21 @@ fn print_summary(
         format_build_phases_line(&mut phase_line, summary.phase_times, wall_ns, peak_rss_bytes);
         err.line(cx, format_args!("{}", phase_line.as_str()))?;
         let sf = summary.shared_front_stats;
-        if sf.head_hits + sf.head_misses + sf.pure_const_hits + sf.pure_const_misses + sf.typed_hits + sf.typed_misses > 0 {
+        if sf.head_hits
+            + sf.head_misses
+            + sf.pure_const_hits
+            + sf.pure_const_misses
+            + sf.typed_hits
+            + sf.typed_misses
+            + sf.poly_usage_hits
+            + sf.poly_usage_misses
+            + sf.poly_generic_calls
+            > 0
+        {
             err.line(
                 cx,
                 format_args!(
-                    "build shared-front: heads={}/{} (puts={}) const_bits={}/{} pure_consts={}/{} pure_statics={}/{} members={}/{} typed={}/{} (puts={})",
+                    "build shared-front: heads={}/{} (puts={}) const_bits={}/{} pure_consts={}/{} pure_statics={}/{} members={}/{} typed={}/{} (puts={}) poly_usage={}/{} (puts={}) poly_canon={}/{}",
                     sf.head_hits,
                     sf.head_hits + sf.head_misses,
                     sf.head_puts,
@@ -3432,6 +3442,11 @@ fn print_summary(
                     sf.typed_hits,
                     sf.typed_hits + sf.typed_misses,
                     sf.typed_puts,
+                    sf.poly_usage_hits,
+                    sf.poly_usage_hits + sf.poly_usage_misses,
+                    sf.poly_usage_puts,
+                    sf.poly_canonicalized_calls,
+                    sf.poly_generic_calls,
                 ),
             )?;
         }

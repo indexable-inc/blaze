@@ -60,6 +60,8 @@ pub const MAX_PURE_CONSTS: usize = 131_072;
 pub const MAX_PURE_STATICS: usize = 65_536;
 /// Maximum freshly checked dependency/toolchain `Typed` records retained (Rule 18).
 pub const MAX_TYPED_BODIES: usize = 131_072;
+/// Maximum converged polymorphization usage summaries retained across parallel workers (Rule 18).
+pub const MAX_POLY_USAGE: usize = 131_072;
 /// Maximum per-crate member indexes retained (Rule 18).
 pub const MAX_CRATE_MEMBER_INDEXES: usize = 4_096;
 
@@ -95,6 +97,11 @@ pub struct SharedLazyFrontStats {
     pub typed_hits: u64,
     pub typed_misses: u64,
     pub typed_puts: u64,
+    pub poly_usage_hits: u64,
+    pub poly_usage_misses: u64,
+    pub poly_usage_puts: u64,
+    pub poly_generic_calls: u64,
+    pub poly_canonicalized_calls: u64,
 }
 
 struct ShardCounters {
@@ -112,6 +119,11 @@ struct ShardCounters {
     typed_hits: CachePadded<AtomicU64>,
     typed_misses: CachePadded<AtomicU64>,
     typed_puts: CachePadded<AtomicU64>,
+    poly_usage_hits: CachePadded<AtomicU64>,
+    poly_usage_misses: CachePadded<AtomicU64>,
+    poly_usage_puts: CachePadded<AtomicU64>,
+    poly_generic_calls: CachePadded<AtomicU64>,
+    poly_canonicalized_calls: CachePadded<AtomicU64>,
 }
 
 impl ShardCounters {
@@ -131,6 +143,11 @@ impl ShardCounters {
             typed_hits: CachePadded::new(AtomicU64::new(0)),
             typed_misses: CachePadded::new(AtomicU64::new(0)),
             typed_puts: CachePadded::new(AtomicU64::new(0)),
+            poly_usage_hits: CachePadded::new(AtomicU64::new(0)),
+            poly_usage_misses: CachePadded::new(AtomicU64::new(0)),
+            poly_usage_puts: CachePadded::new(AtomicU64::new(0)),
+            poly_generic_calls: CachePadded::new(AtomicU64::new(0)),
+            poly_canonicalized_calls: CachePadded::new(AtomicU64::new(0)),
         }
     }
 
@@ -150,6 +167,11 @@ impl ShardCounters {
             typed_hits: self.typed_hits.0.load(Ordering::Relaxed),
             typed_misses: self.typed_misses.0.load(Ordering::Relaxed),
             typed_puts: self.typed_puts.0.load(Ordering::Relaxed),
+            poly_usage_hits: self.poly_usage_hits.0.load(Ordering::Relaxed),
+            poly_usage_misses: self.poly_usage_misses.0.load(Ordering::Relaxed),
+            poly_usage_puts: self.poly_usage_puts.0.load(Ordering::Relaxed),
+            poly_generic_calls: self.poly_generic_calls.0.load(Ordering::Relaxed),
+            poly_canonicalized_calls: self.poly_canonicalized_calls.0.load(Ordering::Relaxed),
         }
     }
 }
@@ -378,6 +400,19 @@ fn shard_of_item_key(key: ItemKey) -> usize {
     ((lo as usize) ^ ((lo >> 8) as usize) ^ ((lo >> 16) as usize)) & (SHARDS - 1)
 }
 
+/// Immutable converged polymorphization summary shared across parallel workers for one non-local
+/// generic function `ItemKey`.
+pub struct SharedPolyUsage {
+    pub usage: OwnVec<crate::front2::poly_canon::ParamUse, SharedAlloc<'static>>,
+    /// Function items (self + any analyzed transitive callees) whose `ReadKind::PolyBodyText`
+    /// must be logged whenever a caller canonicalizes a call to this function.
+    pub deps: OwnVec<ItemKey, SharedAlloc<'static>>,
+    /// ADTs whose layout/drop summaries contributed to `usage` (so callers log `ReadKind::Adt`
+    /// / `ReadKind::DropImpl` when canonicalizing).
+    pub adt_deps: OwnVec<ItemKey, SharedAlloc<'static>>,
+    pub can_canon: bool,
+}
+
 /// Command-scoped shared immutable/sharded front-end cache shared across all parallel export
 /// workers and across worker epoch resets (module docs).
 pub struct SharedLazyFront {
@@ -387,6 +422,7 @@ pub struct SharedLazyFront {
     pure_consts: ShardedMap<ItemKey, Arc<SharedDataRecord, SharedAlloc<'static>>>,
     pure_statics: ShardedMap<ItemKey, (Arc<SharedDataRecord, SharedAlloc<'static>>, StaticItem)>,
     typed: ShardedMap<ItemKey, SharedBytes>,
+    poly_usage: ShardedMap<ItemKey, Arc<SharedPolyUsage, SharedAlloc<'static>>>,
     crate_members: CachePadded<ReadLock<Map<CrateItemKey, Arc<SharedMemberIndex, SharedAlloc<'static>>, FixedState, SharedAlloc<'static>>>>,
     lang_members: CachePadded<ReadLock<Map<CrateItemKey, Arc<SharedMemberIndex, SharedAlloc<'static>>, FixedState, SharedAlloc<'static>>>>,
     counters: ShardCounters,
@@ -427,6 +463,7 @@ impl SharedLazyFront {
             pure_consts: ShardedMap::new_in("lazy.shared.pure_consts", max_pure_consts, alloc),
             pure_statics: ShardedMap::new_in("lazy.shared.pure_statics", max_pure_statics, alloc),
             typed: ShardedMap::new_in("lazy.shared.typed", max_typed, alloc),
+            poly_usage: ShardedMap::new_in("lazy.shared.poly_usage", MAX_POLY_USAGE, alloc),
             crate_members: CachePadded::new(ReadLock::new(
                 "lazy.shared.crate_members",
                 Map::new(MapOpts { hasher: FixedState, alloc, capacity: None }),
@@ -660,6 +697,59 @@ impl SharedLazyFront {
             self.counters.typed_puts.0.fetch_add(1, Ordering::Relaxed);
         }
         inserted
+    }
+
+    // ---- Shared converged polymorphization parameter-usage summaries ----
+
+    /// Looks up the converged polymorphization summary for non-local generic function `key`.
+    pub fn get_poly_usage(&self, key: ItemKey) -> Option<Arc<SharedPolyUsage, SharedAlloc<'static>>> {
+        if is_body_local(key) {
+            return None;
+        }
+        let found = self.poly_usage.get_cloned(shard_of_item_key(key), &key);
+        if found.is_some() {
+            self.counters.poly_usage_hits.0.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.counters.poly_usage_misses.0.fetch_add(1, Ordering::Relaxed);
+        }
+        found
+    }
+
+    /// Publishes the converged polymorphization summary for non-local generic function `key`.
+    pub fn put_poly_usage(
+        &self,
+        key: ItemKey,
+        usage: &[crate::front2::poly_canon::ParamUse],
+        deps: &[ItemKey],
+        adt_deps: &[ItemKey],
+        can_canon: bool,
+    ) -> bool {
+        if is_body_local(key) {
+            return false;
+        }
+        let alloc = self.alloc;
+        let inserted = self.poly_usage.insert_if_absent(shard_of_item_key(key), key, || {
+            let mut u = OwnVec::with_capacity_in(usage.len(), alloc);
+            u.extend_from_slice(usage);
+            let mut d = OwnVec::with_capacity_in(deps.len(), alloc);
+            d.extend_from_slice(deps);
+            let mut a = OwnVec::with_capacity_in(adt_deps.len(), alloc);
+            a.extend_from_slice(adt_deps);
+            Arc::new_in(SharedPolyUsage { usage: u, deps: d, adt_deps: a, can_canon }, alloc)
+        });
+        if inserted {
+            self.counters.poly_usage_puts.0.fetch_add(1, Ordering::Relaxed);
+        }
+        inserted
+    }
+
+    /// Records one generic call-site canonicalization attempt across parallel workers.
+    #[inline]
+    pub fn record_poly_call(&self, canonicalized: bool) {
+        self.counters.poly_generic_calls.0.fetch_add(1, Ordering::Relaxed);
+        if canonicalized {
+            self.counters.poly_canonicalized_calls.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

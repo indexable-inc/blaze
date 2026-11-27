@@ -857,6 +857,17 @@ pub trait AnalysisFacts {
         let _ = item;
         None
     }
+
+    /// Returns `true` iff `item` is a trait method declaration whose concrete callee depends on
+    /// trait impl selection (forcing `ParamUse::TRAIT_DISPATCH`).
+    ///
+    /// Returning `false` is still sound when trait methods are absent from `analyses` (unanalyzed
+    /// callees conservatively force `UNANALYZED_CALLEE` = `Concrete`), but returning `true` tags
+    /// `TRAIT_DISPATCH` immediately and avoids chasing trait method edges.
+    fn is_trait_method(&self, item: ItemKey) -> bool {
+        let _ = item;
+        false
+    }
 }
 
 /// Empty facts implementation: 100% conservative default (every unknown ADT/intrinsic forces
@@ -2721,6 +2732,1002 @@ pub fn canonical_representative_pty(
     }
 }
 
+/// Canonicalizes a concrete ground instantiation `(item, args)` against `usage` and materializes
+/// canonical ground representative [`PTy`]s in `ground` using [`canonical_representative_pty`].
+///
+/// Returns:
+/// - `Ok(None)` if no argument was canonicalized (or every canonicalized argument had an exotic
+///   [`LayoutShape`] with no built-in ground representative, or every representative already equals
+///   the original `arg.ty`);
+/// - `Ok(Some((canon_tys, rep_list)))` when at least one argument strictly changed to its
+///   canonical ground representative, ready to be encoded as the canonical `Instance { item, args: rep_list }`.
+///
+/// Soundness: preserves every guard of [`canonicalize_args`] and [`canonical_representative_pty`]
+/// (Rule 4 `superset-of-rust`, Rule 21 `keys-cover-every-input`, Rule 25 `deterministic-output`).
+pub fn canonicalize_instance_to_ground<'a>(
+    usage: &[ParamUse],
+    args: &[ArgInfo],
+    ground: &mut PortableTys<'_>,
+    scratch: Alloc<'_>,
+    alloc: Alloc<'a>,
+) -> Result<Option<(AVec<'a, CanonTy>, List)>, PolyError> {
+    let canon = canonicalize_args(usage, args, scratch)?;
+    if !canon.is_changed() {
+        return Ok(None);
+    }
+    let mut reps: AVec<'_, PTy> = Vec::with_capacity_in(args.len(), scratch);
+    let mut out_canon: AVec<'a, CanonTy> = Vec::with_capacity_in(args.len(), alloc);
+    let mut changed_any = false;
+    for (&ct, &orig) in canon.as_slice().iter().zip(args.iter()) {
+        if orig.kind == ParamKind::Const {
+            // Never replace a const generic argument (`PNode::ConstValue`) with a type node.
+            reps.push(orig.ty);
+            out_canon.push(CanonTy::Concrete(orig.ty));
+            continue;
+        }
+        match canonical_representative_pty(ct, ground)? {
+            Some(rep) => {
+                if rep != orig.ty {
+                    changed_any = true;
+                }
+                reps.push(rep);
+                out_canon.push(ct);
+            }
+            None => {
+                // Exotic layout shape (e.g. align > 16 or interior niche): conservatively keep concrete.
+                reps.push(orig.ty);
+                out_canon.push(CanonTy::Concrete(orig.ty));
+            }
+        }
+    }
+    if !changed_any {
+        return Ok(None);
+    }
+    let rep_list = ground.intern_list(reps.as_slice()).map_err(|_| PolyError::TableFull)?;
+    Ok(Some((out_canon, rep_list)))
+}
+
+const POLY_TEXT_DOMAIN: &str = "blaze-ladder poly-canon body text sig 1";
+
+/// Computes a deterministic, trivia-free, table-index-independent [`ContentId`] digest covering a
+/// generic function's item text (without whitespace or comments), its resolved signature
+/// (`FnSig`), and its declared [`Abi`].
+///
+/// Used by `ReadKind::PolyBodyText` (Rule 21 `keys-cover-every-input`) so a caller that emitted a
+/// call to a canonicalized callee verifies in O(|text|) from the callee's head row alone (zero
+/// `check_one` body checks on warm cache hits) and invalidates immediately if the callee's body or
+/// signature changes.
+pub fn poly_body_text_digest(
+    text: &str,
+    sig: &blaze_typeck::FnSig<'_>,
+    abi: blaze_build::Abi,
+    scratch: Alloc<'_>,
+) -> ContentId {
+    use parser::{Edition, LexedStr};
+
+    let mut h = Hasher::new(POLY_TEXT_DOMAIN);
+    let abi_tag: u8 = match abi {
+        blaze_build::Abi::Rust => 0,
+        blaze_build::Abi::C => 1,
+        blaze_build::Abi::RustCall => 2,
+    };
+    h.update(&[abi_tag]);
+    h.update(&sig.parent_count.to_le_bytes());
+    h.update(&sig.own_count.to_le_bytes());
+    h.update(&sig.declared_count.to_le_bytes());
+    h.update(&[u8::from(sig.self_param), sig.header.bits(), u8::from(sig.c_variadic)]);
+    h.update(&(sig.legacy_const_generics.len() as u32).to_le_bytes());
+    for &pos in sig.legacy_const_generics {
+        h.update(&pos.to_le_bytes());
+    }
+    // Digest signature input & output types structurally (table-index-independent, Rule 25).
+    let mut sig_tys: AVec<'_, PTy> = Vec::with_capacity_in(sig.inputs.len() + 1, scratch);
+    sig_tys.extend_from_slice(sig.inputs);
+    sig_tys.push(sig.output);
+    let mut sig_bytes: AVec<'_, u8> = Vec::new_in(scratch);
+    encode_sig_types_structural(sig_tys.as_slice(), sig.types, scratch, &mut sig_bytes);
+    h.part(sig_bytes.as_slice());
+
+    let lexed = LexedStr::new(Edition::Edition2024, text);
+    let mut tokens: u64 = 0;
+    for i in 0..lexed.len() {
+        if !lexed.kind(i).is_trivia() {
+            h.part(lexed.text(i).as_bytes());
+            tokens += 1;
+        }
+    }
+    h.update(&tokens.to_le_bytes());
+    h.finish()
+}
+
+/// Appends a deterministic, table-index-independent structural pre-order encoding of `roots` in
+/// `tys` (including generic `Param`/`ConstParam`/`Alias`/`Opaque` nodes) to `out`.
+fn encode_sig_types_structural(
+    roots: &[PTy],
+    tys: PTys<'_>,
+    scratch: Alloc<'_>,
+    out: &mut AVec<'_, u8>,
+) {
+    out.extend_from_slice(&(roots.len() as u32).to_le_bytes());
+    let mut stack: AVec<'_, PTy> = Vec::with_capacity_in(roots.len(), scratch);
+    for &r in roots.iter().rev() {
+        stack.push(r);
+    }
+    let mut visited: usize = 0;
+    while let Some(ty) = stack.pop() {
+        visited += 1;
+        if visited > MAX_TYPE_WALK_NODES {
+            out.push(0xFF);
+            return;
+        }
+        let Ok(node) = tys.node(ty) else {
+            out.push(0xFE);
+            continue;
+        };
+        match node {
+            PNode::Bool => out.push(0),
+            PNode::Char => out.push(1),
+            PNode::Int(i) => out.extend_from_slice(&[2, i as u8]),
+            PNode::Uint(u) => out.extend_from_slice(&[3, u as u8]),
+            PNode::Float(x) => out.extend_from_slice(&[4, x as u8]),
+            PNode::Str => out.push(5),
+            PNode::Never => out.push(6),
+            PNode::Tuple(l) => {
+                out.push(7);
+                push_sig_list(l, tys, &mut stack, out);
+            }
+            PNode::Ref(m, inner) => {
+                out.extend_from_slice(&[8, m as u8]);
+                stack.push(inner);
+            }
+            PNode::Ptr(m, inner) => {
+                out.extend_from_slice(&[9, m as u8]);
+                stack.push(inner);
+            }
+            PNode::Array(elem, len) => {
+                out.push(10);
+                stack.push(len);
+                stack.push(elem);
+            }
+            PNode::Slice(elem) => {
+                out.push(11);
+                stack.push(elem);
+            }
+            PNode::Adt(k, l) => {
+                out.push(12);
+                out.extend_from_slice(&k.0.to_le_bytes());
+                push_sig_list(l, tys, &mut stack, out);
+            }
+            PNode::FnDef(k, l) => {
+                out.push(13);
+                out.extend_from_slice(&k.0.to_le_bytes());
+                push_sig_list(l, tys, &mut stack, out);
+            }
+            PNode::ConstValue { ty: cty, bits } => {
+                out.push(14);
+                out.extend_from_slice(&bits.to_le_bytes());
+                stack.push(cty);
+            }
+            PNode::Pat(base, l) => {
+                out.push(15);
+                push_sig_list(l, tys, &mut stack, out);
+                stack.push(base);
+            }
+            PNode::Dynamic(l) => {
+                out.push(16);
+                push_sig_list(l, tys, &mut stack, out);
+            }
+            PNode::ExTrait(k, l) => {
+                out.push(17);
+                out.extend_from_slice(&k.0.to_le_bytes());
+                push_sig_list(l, tys, &mut stack, out);
+            }
+            PNode::ExProj { trait_, name, args, term } => {
+                out.push(18);
+                out.extend_from_slice(&trait_.0.to_le_bytes());
+                out.extend_from_slice(&name.0.to_le_bytes());
+                stack.push(term);
+                push_sig_list(args, tys, &mut stack, out);
+            }
+            PNode::ExAuto(k) => {
+                out.push(19);
+                out.extend_from_slice(&k.0.to_le_bytes());
+            }
+            PNode::Closure { owner, ordinal, args } => {
+                out.push(20);
+                out.extend_from_slice(&owner.0.to_le_bytes());
+                out.extend_from_slice(&ordinal.to_le_bytes());
+                push_sig_list(args, tys, &mut stack, out);
+            }
+            PNode::FnPtr(l, header) => {
+                out.extend_from_slice(&[21, header.bits()]);
+                push_sig_list(l, tys, &mut stack, out);
+            }
+            PNode::Future(expr, a, b) => {
+                out.push(22);
+                out.extend_from_slice(&expr.0.to_le_bytes());
+                stack.push(b);
+                stack.push(a);
+            }
+            PNode::Coroutine { owner, ordinal, args } => {
+                out.push(23);
+                out.extend_from_slice(&owner.0.to_le_bytes());
+                out.extend_from_slice(&ordinal.to_le_bytes());
+                push_sig_list(args, tys, &mut stack, out);
+            }
+            PNode::Foreign(k) => {
+                out.push(24);
+                out.extend_from_slice(&k.0.to_le_bytes());
+            }
+            PNode::Record(s, l) => {
+                out.push(25);
+                out.extend_from_slice(&s.0.to_le_bytes());
+                push_sig_list(l, tys, &mut stack, out);
+            }
+            PNode::Union(l) => {
+                out.push(26);
+                push_sig_list(l, tys, &mut stack, out);
+            }
+            PNode::Param(i) => {
+                out.push(27);
+                out.extend_from_slice(&i.to_le_bytes());
+            }
+            PNode::ConstParam(i) => {
+                out.push(28);
+                out.extend_from_slice(&i.to_le_bytes());
+            }
+            PNode::Alias { trait_, name, args } => {
+                out.push(29);
+                out.extend_from_slice(&trait_.0.to_le_bytes());
+                out.extend_from_slice(&name.0.to_le_bytes());
+                push_sig_list(args, tys, &mut stack, out);
+            }
+            PNode::Opaque(k, l) => {
+                out.push(30);
+                out.extend_from_slice(&k.0.to_le_bytes());
+                push_sig_list(l, tys, &mut stack, out);
+            }
+            PNode::Infer => out.push(31),
+            PNode::Error => out.push(32),
+        }
+    }
+}
+
+fn push_sig_list(l: List, tys: PTys<'_>, stack: &mut AVec<'_, PTy>, out: &mut AVec<'_, u8>) {
+    match tys.list(l) {
+        Ok(items) => {
+            out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            for &child in items.iter().rev() {
+                stack.push(child);
+            }
+        }
+        Err(_) => out.extend_from_slice(&u32::MAX.to_le_bytes()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-Function Checked-HIR Body Analysis (`analyze_checked_body`)
+// ---------------------------------------------------------------------------
+
+/// Analyzes a type-checked HIR body (`blaze_typeck::BodyView` + `blaze_typeck::Checked` +
+/// `blaze_typeck::FnSig`), the exact representation lowered by `blaze_build::build`, to compute
+/// local [`ParamUse`] bitflags per generic parameter and collect direct generic call/drop edges
+/// for [`propagate_call_graph`].
+///
+/// Iterative with zero recursion and explicit `Alloc` (Rules 11, 14, 18).
+///
+/// Every soundness invariant of [`analyze_body`] is preserved:
+/// - Non-Rust ABI, C-variadic, legacy const generics, `inline for`, `async fn`, closures,
+///   promoteds, inline `const { .. }` blocks, inline `asm!`, `format_args!`, default field values,
+///   and `impl Trait` opaque definers conservatively mark all generic parameters concrete.
+/// - `Unsize` coercions (`&T -> &dyn Tr`, `&[T; N] -> &[T]`), `ReifyFnPointer`,
+///   `ClosureFnPointer`, overloaded `Deref`, trait method calls, associated type projections,
+///   generic const items, arithmetic/bitwise value ops, and reflection intrinsics (`TypeId::of`,
+///   `type_name`, `blaze_*`) force `CanonLevel::Concrete`.
+/// - Every local, parameter, return type, and expression type is walked for implicit drop glue
+///   (`ParamUse::DROP_GLUE`), so `T: Drop` stays concrete while `!needs_drop` types canonicalize
+///   cleanly and `&T`/`*const T`/`&[T]` stay `OpaquePtr`.
+pub fn analyze_checked_body<'a>(
+    item: ItemKey,
+    sig: &blaze_typeck::FnSig<'_>,
+    abi: blaze_build::Abi,
+    view: &blaze_typeck::BodyView<'_>,
+    checked: &blaze_typeck::Checked<'_>,
+    has_inline_for: bool,
+    facts: &dyn AnalysisFacts,
+    alloc: Alloc<'a>,
+) -> Result<FnAnalysis<'a>, PolyError> {
+    let param_count = sig.parent_count.saturating_add(sig.own_count);
+    if param_count > MAX_GENERIC_PARAMS {
+        return Err(PolyError::TooManyParams { count: param_count });
+    }
+    let mut local_use: AVec<'a, ParamUse> = Vec::with_capacity_in(param_count as usize, alloc);
+    local_use.resize(param_count as usize, ParamUse::NONE);
+    let mut call_edges: AVec<'a, CallEdge> = Vec::new_in(alloc);
+    let mut edge_args: AVec<'a, PTy> = Vec::new_in(alloc);
+
+    if param_count == 0 {
+        return Ok(FnAnalysis { item, param_count, local_use, call_edges, edge_args });
+    }
+
+    // Fast conservative whole-body soundness guards.
+    if abi != blaze_build::Abi::Rust || sig.c_variadic || !sig.legacy_const_generics.is_empty() {
+        for slot in local_use.iter_mut() {
+            *slot |= ParamUse::NON_RUST_ABI;
+        }
+        return Ok(FnAnalysis { item, param_count, local_use, call_edges, edge_args });
+    }
+    if has_inline_for {
+        for slot in local_use.iter_mut() {
+            *slot |= ParamUse::REFLECTION;
+        }
+        return Ok(FnAnalysis { item, param_count, local_use, call_edges, edge_args });
+    }
+    if view.coroutine.is_some()
+        || !checked.closures.is_empty()
+        || !checked.hidden.is_empty()
+        || !checked.awaited.is_empty()
+        || !checked.promoted.is_empty()
+        || !checked.default_fields.is_empty()
+    {
+        for slot in local_use.iter_mut() {
+            *slot |= ParamUse::UNANALYZED_CALLEE;
+        }
+        return Ok(FnAnalysis { item, param_count, local_use, call_edges, edge_args });
+    }
+
+    let mut stack: AVec<'_, (PTy, WalkCtx)> = Vec::new_in(alloc);
+    let checked_tys = checked.types.view();
+
+    // 1. Walk signature inputs & output (in `sig.types`) for layout and implicit drop glue.
+    {
+        let mut sig_cx = CheckedWalkCx {
+            tys: sig.types,
+            facts,
+            local_use: local_use.as_mut_slice(),
+            call_edges: &mut call_edges,
+            edge_args: &mut edge_args,
+            stack: &mut stack,
+            record_edges: false,
+        };
+        for &inp in sig.inputs {
+            sig_cx.walk_ty(inp, WalkCtx::ByValue, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+            sig_cx.walk_drop_ty(inp)?;
+        }
+        sig_cx.walk_ty(sig.output, WalkCtx::ByValue, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+        sig_cx.walk_drop_ty(sig.output)?;
+    }
+
+    let mut cx = CheckedWalkCx {
+        tys: checked_tys,
+        facts,
+        local_use: local_use.as_mut_slice(),
+        call_edges: &mut call_edges,
+        edge_args: &mut edge_args,
+        stack: &mut stack,
+        record_edges: true,
+    };
+
+    // 2. Walk every local binding, pattern, and expression type (layout + implicit drop glue).
+    for &ty in checked.local_ty.iter() {
+        cx.walk_ty(ty, WalkCtx::ByValue, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+        cx.walk_drop_ty(ty)?;
+    }
+    for &ty in checked.pat_ty.iter() {
+        cx.walk_ty(ty, WalkCtx::ByValue, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+        cx.walk_drop_ty(ty)?;
+    }
+    for &ty in checked.expr_ty.iter() {
+        cx.walk_ty(ty, WalkCtx::ByValue, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+        cx.walk_drop_ty(ty)?;
+    }
+
+    // 3. Walk every HIR expression for value ops, casts, indexing, offset_of, const blocks, asm, etc.
+    for (idx, &expr) in view.exprs.iter().enumerate() {
+        let expr_ty = checked.expr_ty.get(idx).copied();
+        match expr {
+            blaze_typeck::Expr::ConstBlock { .. }
+            | blaze_typeck::Expr::Asm { .. }
+            | blaze_typeck::Expr::Closure { .. }
+            | blaze_typeck::Expr::AsyncBlock { .. }
+            | blaze_typeck::Expr::Await(_) => {
+                cx.mark_all_params(ParamUse::UNANALYZED_CALLEE);
+            }
+            blaze_typeck::Expr::FormatArgs { .. } => {
+                cx.mark_all_params(ParamUse::TRAIT_DISPATCH);
+            }
+            blaze_typeck::Expr::Binary { op, lhs, .. } | blaze_typeck::Expr::AssignOp { op, lhs, .. } => {
+                if let Some(&lhs_ty) = checked.expr_ty.get(lhs.ix()) {
+                    let is_ptr_cmp = matches!(
+                        op,
+                        blaze_typeck::BinOp::Eq
+                            | blaze_typeck::BinOp::Ne
+                            | blaze_typeck::BinOp::Lt
+                            | blaze_typeck::BinOp::Le
+                            | blaze_typeck::BinOp::Gt
+                            | blaze_typeck::BinOp::Ge
+                    ) && matches!(checked_tys.node(lhs_ty), Ok(PNode::Ptr(..) | PNode::Ref(..)));
+                    if is_ptr_cmp {
+                        if let Ok(PNode::Ptr(_, pointee) | PNode::Ref(_, pointee)) = checked_tys.node(lhs_ty) {
+                            cx.walk_ty(pointee, WalkCtx::BehindThinPtr, ParamUse::OPAQUE_PTR, ParamUse::VALUE_OP)?;
+                        }
+                    } else {
+                        cx.walk_ty(lhs_ty, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::VALUE_OP)?;
+                    }
+                }
+            }
+            blaze_typeck::Expr::Unary { op, operand } => {
+                if let Some(&op_ty) = checked.expr_ty.get(operand.ix()) {
+                    match op {
+                        blaze_typeck::UnOp::Neg | blaze_typeck::UnOp::Not => {
+                            cx.walk_ty(op_ty, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::VALUE_OP)?;
+                        }
+                        blaze_typeck::UnOp::Deref => {
+                            if !matches!(checked_tys.node(op_ty), Ok(PNode::Ptr(..) | PNode::Ref(..))) {
+                                cx.walk_ty(op_ty, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::TRAIT_DISPATCH)?;
+                            }
+                        }
+                    }
+                }
+            }
+            blaze_typeck::Expr::Cast { operand, .. } => {
+                let src_ty = checked.expr_ty.get(operand.ix()).copied();
+                let is_ptr_or_addr = |t: PTy| {
+                    matches!(
+                        checked_tys.node(t),
+                        Ok(PNode::Ptr(..) | PNode::Ref(..) | PNode::FnPtr(..) | PNode::Uint(UintTy::Usize) | PNode::Int(IntTy::Isize))
+                    )
+                };
+                if let (Some(src), Some(dst)) = (src_ty, expr_ty) {
+                    if is_ptr_or_addr(src) && is_ptr_or_addr(dst) {
+                        cx.walk_ty(src, WalkCtx::ByValue, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+                        cx.walk_ty(dst, WalkCtx::ByValue, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+                    } else {
+                        cx.walk_ty(src, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::VALUE_OP)?;
+                        cx.walk_ty(dst, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::VALUE_OP)?;
+                    }
+                }
+            }
+            blaze_typeck::Expr::Index { base, .. } => {
+                if let Some(&base_ty) = checked.expr_ty.get(base.ix()) {
+                    match checked_tys.node(base_ty) {
+                        Ok(PNode::Slice(elem) | PNode::Array(elem, _)) => {
+                            cx.walk_ty(elem, WalkCtx::ByValue, ParamUse::SIZE_ALIGN, ParamUse::UNANALYZED_CALLEE)?;
+                        }
+                        _ => {
+                            cx.walk_ty(base_ty, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::TRAIT_DISPATCH)?;
+                        }
+                    }
+                }
+            }
+            blaze_typeck::Expr::OffsetOf { .. } => {
+                cx.mark_all_params(ParamUse::UNANALYZED_CALLEE);
+            }
+            blaze_typeck::Expr::Repeat { len, .. } => {
+                if let Ok(PNode::ConstParam(p)) = view.types.node(len) {
+                    cx.mark_param(p, ParamUse::CONST_PARAM)?;
+                } else if !matches!(view.types.node(len), Ok(PNode::ConstValue { .. })) {
+                    cx.mark_all_params(ParamUse::CONST_PARAM);
+                }
+            }
+            blaze_typeck::Expr::Call { callee, .. } => {
+                if let Some(&callee_ty) = checked.expr_ty.get(callee.ix())
+                    && !matches!(checked_tys.node(callee_ty), Ok(PNode::FnDef(..)))
+                {
+                    cx.walk_ty(callee_ty, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+                }
+            }
+            blaze_typeck::Expr::Missing
+            | blaze_typeck::Expr::Lit(_)
+            | blaze_typeck::Expr::Local(_)
+            | blaze_typeck::Expr::Path(_)
+            | blaze_typeck::Expr::Paren(_)
+            | blaze_typeck::Expr::Block { .. }
+            | blaze_typeck::Expr::If { .. }
+            | blaze_typeck::Expr::Let { .. }
+            | blaze_typeck::Expr::Match { .. }
+            | blaze_typeck::Expr::Loop { .. }
+            | blaze_typeck::Expr::Break { .. }
+            | blaze_typeck::Expr::Continue { .. }
+            | blaze_typeck::Expr::Return { .. }
+            | blaze_typeck::Expr::Become { .. }
+            | blaze_typeck::Expr::MethodCall { .. }
+            | blaze_typeck::Expr::Field { .. }
+            | blaze_typeck::Expr::TupleField { .. }
+            | blaze_typeck::Expr::Assign { .. }
+            | blaze_typeck::Expr::Ref { .. }
+            | blaze_typeck::Expr::RawRef { .. }
+            | blaze_typeck::Expr::Tuple { .. }
+            | blaze_typeck::Expr::Array { .. }
+            | blaze_typeck::Expr::Struct { .. }
+            | blaze_typeck::Expr::Record { .. }
+            | blaze_typeck::Expr::Underscore => {}
+        }
+    }
+
+    // 4. Walk adjustments (`Unsize`, overloaded `Deref`, fn-ptr reification, etc.).
+    {
+        let adj_exprs = checked.adjusts.column::<0>();
+        let adj_kinds = checked.adjusts.column::<1>();
+        let adj_tys = checked.adjusts.column::<2>();
+        for row in 0..checked.adjusts.len() {
+            let e = adj_exprs[row];
+            let kind = adj_kinds[row];
+            let dst = adj_tys[row];
+            match kind {
+                blaze_typeck::AdjustKind::Unsize => {
+                    if let Some(&src) = checked.expr_ty.get(e.ix()) {
+                        cx.walk_ty(src, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::UNSIZED_META)?;
+                    }
+                    cx.walk_ty(dst, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::UNSIZED_META)?;
+                }
+                blaze_typeck::AdjustKind::Deref { overloaded: Some(_) } => {
+                    if let Some(&src) = checked.expr_ty.get(e.ix()) {
+                        cx.walk_ty(src, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::TRAIT_DISPATCH)?;
+                    }
+                    cx.walk_ty(dst, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::TRAIT_DISPATCH)?;
+                }
+                blaze_typeck::AdjustKind::ReifyFnPointer | blaze_typeck::AdjustKind::ClosureFnPointer => {
+                    if let Some(&src) = checked.expr_ty.get(e.ix()) {
+                        cx.walk_ty(src, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+                    }
+                    cx.walk_ty(dst, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+                }
+                blaze_typeck::AdjustKind::Deref { overloaded: None } => {
+                    // Builtin `&T -> *const T` / `&mut T -> &T` coercions lower as `Deref(None)`
+                    // immediately followed by `Borrow` on the same expression: a pure pointer
+                    // reinterpretation that never loads `T` by value.
+                    let followed_by_borrow = row + 1 < checked.adjusts.len()
+                        && adj_exprs[row + 1] == e
+                        && matches!(adj_kinds[row + 1], blaze_typeck::AdjustKind::Borrow { .. });
+                    if followed_by_borrow {
+                        cx.walk_ty(dst, WalkCtx::BehindThinPtr, ParamUse::OPAQUE_PTR, ParamUse::UNANALYZED_CALLEE)?;
+                    } else {
+                        cx.walk_ty(dst, WalkCtx::ByValue, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+                    }
+                }
+                blaze_typeck::AdjustKind::NeverToAny
+                | blaze_typeck::AdjustKind::Borrow { .. }
+                | blaze_typeck::AdjustKind::UnsafeFnPointer
+                | blaze_typeck::AdjustKind::MutToConstPointer
+                | blaze_typeck::AdjustKind::UnionInject { .. }
+                | blaze_typeck::AdjustKind::UnionWiden
+                | blaze_typeck::AdjustKind::RecordProject => {
+                    cx.walk_ty(dst, WalkCtx::ByValue, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+                }
+            }
+        }
+    }
+
+    // 5. Walk associated type projections and non-Sized trait obligations (`checked.selected`).
+    for proj in checked.selected.iter() {
+        if proj.name.is_some() || !proj.global_env {
+            cx.walk_list(proj.args, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::TRAIT_DISPATCH)?;
+        }
+    }
+
+    // 6. Walk generic const arguments (`checked.const_args`, `checked.pat_const_args`).
+    for &list in checked.const_args.column::<1>() {
+        cx.walk_list(list, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::TRAIT_DISPATCH)?;
+    }
+    for &list in checked.pat_const_args.column::<1>() {
+        cx.walk_list(list, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::TRAIT_DISPATCH)?;
+    }
+
+    // 7. Walk resolved callees (`checked.callees`): classify intrinsics, flag trait methods,
+    //    record direct generic calls for interprocedural propagation.
+    {
+        let items = checked.callees.column::<1>();
+        let arg_lists = checked.callees.column::<2>();
+        for row in 0..checked.callees.len() {
+            cx.visit_callee_item(items[row], arg_lists[row])?;
+        }
+    }
+
+    Ok(FnAnalysis { item, param_count, local_use, call_edges, edge_args })
+}
+
+struct CheckedWalkCx<'r, 'f, 's, 'e> {
+    tys: PTys<'r>,
+    facts: &'f dyn AnalysisFacts,
+    local_use: &'s mut [ParamUse],
+    call_edges: &'s mut AVec<'e, CallEdge>,
+    edge_args: &'s mut AVec<'e, PTy>,
+    stack: &'s mut AVec<'e, (PTy, WalkCtx)>,
+    record_edges: bool,
+}
+
+impl<'e> CheckedWalkCx<'_, '_, '_, 'e> {
+    fn mark_param(&mut self, index: u32, flag: ParamUse) -> Result<(), PolyError> {
+        let Some(slot) = self.local_use.get_mut(index as usize) else {
+            return Err(PolyError::ParamOutOfRange { index, param_count: self.local_use.len() as u32 });
+        };
+        *slot |= flag;
+        Ok(())
+    }
+
+    fn mark_all_params(&mut self, flag: ParamUse) {
+        for slot in self.local_use.iter_mut() {
+            *slot |= flag;
+        }
+    }
+
+    fn record_edge(&mut self, callee: ItemKey, args: List, is_drop_edge: bool) -> Result<(), PolyError> {
+        let list = self.tys.list(args).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(args)))?;
+        if list.is_empty() {
+            return Ok(());
+        }
+        if !self.record_edges {
+            // Signature-only walk (types from `sig.types`, not `checked.types`): conservatively
+            // mark params concrete rather than mixing `PTys` tables in `edge_args`.
+            for &arg in list {
+                self.walk_ty(arg, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::UNANALYZED_CALLEE)?;
+            }
+            return Ok(());
+        }
+        // Avoid pushing identical duplicate edges from both `expr_ty(FnDef)` and `checked.callees`.
+        for existing in self.call_edges.iter() {
+            if existing.callee == callee
+                && existing.is_drop_edge == is_drop_edge
+                && existing.args_len as usize == list.len()
+                && &self.edge_args[existing.args_start as usize..(existing.args_start + existing.args_len) as usize] == list
+            {
+                return Ok(());
+            }
+        }
+        let start = self.edge_args.len() as u32;
+        self.edge_args.extend_from_slice(list);
+        let len = self.edge_args.len() as u32 - start;
+        self.call_edges.push(CallEdge { callee, args_start: start, args_len: len, is_drop_edge });
+        Ok(())
+    }
+
+    fn visit_callee_item(&mut self, key: ItemKey, args: List) -> Result<(), PolyError> {
+        if let Some(which) = self.facts.intrinsic_which(key) {
+            match IntrinsicClass::of(which) {
+                IntrinsicClass::NoTypeDependence => {
+                    self.walk_list(args, WalkCtx::Phantom, ParamUse::PHANTOM, ParamUse::VALUE_OP)?;
+                }
+                IntrinsicClass::OpaquePtr => {
+                    self.walk_list(args, WalkCtx::BehindThinPtr, ParamUse::OPAQUE_PTR, ParamUse::UNANALYZED_CALLEE)?;
+                }
+                IntrinsicClass::LayoutOnly => {
+                    let layout_flag = match which {
+                        Which::NeedsDrop => ParamUse::DROP_GLUE,
+                        Which::SizeOf | Which::AlignOf | Which::SizeOfVal | Which::AlignOfVal => ParamUse::SIZE_ALIGN,
+                        _ => ParamUse::SIZE_ALIGN | ParamUse::BY_VALUE,
+                    };
+                    self.walk_list(args, WalkCtx::ByValue, layout_flag, ParamUse::UNANALYZED_CALLEE)?;
+                }
+                IntrinsicClass::Reflection => {
+                    self.walk_list(args, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::REFLECTION)?;
+                }
+                IntrinsicClass::ValueOp => {
+                    self.walk_list(args, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::VALUE_OP)?;
+                }
+                IntrinsicClass::UnsizedMeta => {
+                    self.walk_list(args, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::UNSIZED_META)?;
+                }
+            }
+        } else if self.facts.is_trait_method(key) {
+            self.walk_list(args, WalkCtx::Concrete, ParamUse::BY_VALUE, ParamUse::TRAIT_DISPATCH)?;
+        } else {
+            self.record_edge(key, args, false)?;
+        }
+        Ok(())
+    }
+
+    fn walk_list(
+        &mut self,
+        list: List,
+        ctx: WalkCtx,
+        layout_flag: ParamUse,
+        concrete_flag: ParamUse,
+    ) -> Result<(), PolyError> {
+        let items = self.tys.list(list).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(list)))?;
+        for &t in items {
+            self.walk_ty(t, ctx, layout_flag, concrete_flag)?;
+        }
+        Ok(())
+    }
+
+    fn walk_ty(
+        &mut self,
+        root: PTy,
+        root_ctx: WalkCtx,
+        layout_flag: ParamUse,
+        concrete_flag: ParamUse,
+    ) -> Result<(), PolyError> {
+        self.stack.clear();
+        self.stack.push((root, root_ctx));
+        let mut visited: usize = 0;
+        while let Some((ty, ctx)) = self.stack.pop() {
+            visited += 1;
+            if visited > MAX_TYPE_WALK_NODES {
+                return Err(PolyError::TypeWalkCap { cap: MAX_TYPE_WALK_NODES });
+            }
+            let node = self.tys.node(ty).map_err(|_| PolyError::Ty(TyError::NotInRecord(ty)))?;
+            match node {
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Str
+                | PNode::Never
+                | PNode::Foreign(_) => {}
+                PNode::Param(i) => {
+                    let flag = ctx.to_param_use(layout_flag, concrete_flag);
+                    self.mark_param(i, flag)?;
+                }
+                PNode::ConstParam(i) => {
+                    if ctx != WalkCtx::Phantom {
+                        self.mark_param(i, ParamUse::CONST_PARAM)?;
+                    }
+                }
+                PNode::Ref(_, inner) | PNode::Ptr(_, inner) => {
+                    let next_ctx = match ctx {
+                        WalkCtx::Phantom => WalkCtx::Phantom,
+                        WalkCtx::Concrete => WalkCtx::Concrete,
+                        WalkCtx::BehindThinPtr | WalkCtx::ByValue => WalkCtx::BehindThinPtr,
+                    };
+                    let inner_node = self.tys.node(inner).map_err(|_| PolyError::Ty(TyError::NotInRecord(inner)))?;
+                    if let PNode::Slice(elem) = inner_node {
+                        self.stack.push((elem, next_ctx));
+                    } else {
+                        self.stack.push((inner, next_ctx));
+                    }
+                }
+                PNode::Tuple(l) | PNode::Record(_, l) | PNode::Union(l) => {
+                    let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                    for &child in items {
+                        self.stack.push((child, ctx));
+                    }
+                }
+                PNode::Array(elem, len) => {
+                    self.stack.push((elem, ctx));
+                    let len_ctx = if ctx == WalkCtx::Phantom { WalkCtx::Phantom } else { WalkCtx::Concrete };
+                    self.stack.push((len, len_ctx));
+                }
+                PNode::Slice(elem) => self.stack.push((elem, ctx)),
+                PNode::Pat(base, ranges) => {
+                    self.stack.push((base, ctx));
+                    let items = self.tys.list(ranges).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(ranges)))?;
+                    for &r in items {
+                        self.stack.push((r, WalkCtx::Concrete));
+                    }
+                }
+                PNode::ConstValue { ty: cty, .. } => {
+                    let c_ctx = if ctx == WalkCtx::Phantom { WalkCtx::Phantom } else { WalkCtx::Concrete };
+                    self.stack.push((cty, c_ctx));
+                }
+                PNode::FnPtr(l, header) => {
+                    let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                    let next_ctx = if ctx == WalkCtx::Phantom {
+                        WalkCtx::Phantom
+                    } else if header.abi != Abi::Rust || header.c_variadic {
+                        WalkCtx::Concrete
+                    } else {
+                        WalkCtx::ByValue
+                    };
+                    for &child in items {
+                        self.stack.push((child, next_ctx));
+                    }
+                }
+                PNode::Adt(k, l) => {
+                    let args = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                    if ctx == WalkCtx::Phantom || self.facts.phantom_data() == Some(k) {
+                        for &arg in args {
+                            self.stack.push((arg, WalkCtx::Phantom));
+                        }
+                    } else if self.facts.non_null() == Some(k) {
+                        let next_ctx =
+                            if ctx == WalkCtx::Concrete { WalkCtx::Concrete } else { WalkCtx::BehindThinPtr };
+                        for &arg in args {
+                            self.stack.push((arg, next_ctx));
+                        }
+                    } else if let Some((param_uses, _has_drop)) = self.facts.adt_summary(k) {
+                        if param_uses.len() == args.len() {
+                            for (&arg, &pu) in args.iter().zip(param_uses.iter()) {
+                                self.stack.push((arg, combine_adt_ctx(ctx, pu)));
+                            }
+                        } else {
+                            for &arg in args {
+                                self.stack.push((arg, WalkCtx::Concrete));
+                            }
+                        }
+                    } else {
+                        for &arg in args {
+                            self.stack.push((arg, WalkCtx::Concrete));
+                        }
+                    }
+                }
+                PNode::FnDef(k, l) => {
+                    if ctx == WalkCtx::Phantom {
+                        let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                        for &child in items {
+                            self.stack.push((child, WalkCtx::Phantom));
+                        }
+                    } else {
+                        // Save outer stack while classifying callee (visit_callee_item reuses `self.stack`
+                        // only via `walk_list`, so classify intrinsics/trait methods directly on `self.stack`
+                        // to preserve outer traversal!).
+                        let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                        if let Some(which) = self.facts.intrinsic_which(k) {
+                            let child_ctx = match IntrinsicClass::of(which) {
+                                IntrinsicClass::NoTypeDependence => WalkCtx::Phantom,
+                                IntrinsicClass::OpaquePtr => WalkCtx::BehindThinPtr,
+                                IntrinsicClass::LayoutOnly => WalkCtx::ByValue,
+                                IntrinsicClass::Reflection
+                                | IntrinsicClass::ValueOp
+                                | IntrinsicClass::UnsizedMeta => WalkCtx::Concrete,
+                            };
+                            for &child in items {
+                                self.stack.push((child, child_ctx));
+                            }
+                        } else if self.facts.is_trait_method(k) {
+                            for &child in items {
+                                self.stack.push((child, WalkCtx::Concrete));
+                            }
+                        } else if !items.is_empty() {
+                            if self.record_edges {
+                                self.record_edge(k, l, false)?;
+                            } else {
+                                for &child in items {
+                                    self.stack.push((child, WalkCtx::Concrete));
+                                }
+                            }
+                        }
+                    }
+                }
+                PNode::Alias { args: l, .. }
+                | PNode::Opaque(_, l)
+                | PNode::Dynamic(l)
+                | PNode::ExTrait(_, l)
+                | PNode::Closure { args: l, .. }
+                | PNode::Coroutine { args: l, .. } => {
+                    let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                    for &child in items {
+                        self.stack.push((child, WalkCtx::Concrete));
+                    }
+                }
+                PNode::ExProj { args, term, .. } => {
+                    let items = self.tys.list(args).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(args)))?;
+                    for &child in items {
+                        self.stack.push((child, WalkCtx::Concrete));
+                    }
+                    self.stack.push((term, WalkCtx::Concrete));
+                }
+                PNode::Future(_, a, b) => {
+                    self.stack.push((a, WalkCtx::Concrete));
+                    self.stack.push((b, WalkCtx::Concrete));
+                }
+                PNode::ExAuto(_) | PNode::Infer | PNode::Error => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn walk_drop_ty(&mut self, root: PTy) -> Result<(), PolyError> {
+        self.stack.clear();
+        self.stack.push((root, WalkCtx::ByValue));
+        let mut visited: usize = 0;
+        while let Some((ty, ctx)) = self.stack.pop() {
+            visited += 1;
+            if visited > MAX_TYPE_WALK_NODES {
+                return Err(PolyError::TypeWalkCap { cap: MAX_TYPE_WALK_NODES });
+            }
+            let node = self.tys.node(ty).map_err(|_| PolyError::Ty(TyError::NotInRecord(ty)))?;
+            match node {
+                PNode::Bool
+                | PNode::Char
+                | PNode::Int(_)
+                | PNode::Uint(_)
+                | PNode::Float(_)
+                | PNode::Str
+                | PNode::Never
+                | PNode::Foreign(_)
+                | PNode::Ref(..)
+                | PNode::Ptr(..)
+                | PNode::FnDef(..)
+                | PNode::FnPtr(..)
+                | PNode::Union(_)
+                | PNode::ConstValue { .. }
+                | PNode::ExAuto(_) => {}
+                PNode::Param(i) => {
+                    let flag = if ctx == WalkCtx::Concrete {
+                        ParamUse::UNANALYZED_CALLEE | ParamUse::DROP_GLUE
+                    } else {
+                        ParamUse::DROP_GLUE
+                    };
+                    self.mark_param(i, flag)?;
+                }
+                PNode::ConstParam(i) => {
+                    self.mark_param(i, ParamUse::CONST_PARAM)?;
+                }
+                PNode::Tuple(l) | PNode::Record(_, l) => {
+                    let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                    for &child in items {
+                        self.stack.push((child, ctx));
+                    }
+                }
+                PNode::Array(elem, len) => match self.tys.node(len).map_err(|_| PolyError::Ty(TyError::NotInRecord(len)))? {
+                    PNode::ConstValue { bits: 0, .. } => {}
+                    PNode::ConstParam(n) => {
+                        self.mark_param(n, ParamUse::CONST_PARAM)?;
+                        self.stack.push((elem, ctx));
+                    }
+                    _ => self.stack.push((elem, ctx)),
+                },
+                PNode::Slice(elem) | PNode::Pat(elem, _) => self.stack.push((elem, ctx)),
+                PNode::Adt(k, l) => {
+                    if self.facts.phantom_data() == Some(k)
+                        || self.facts.manually_drop() == Some(k)
+                        || self.facts.non_null() == Some(k)
+                    {
+                        continue;
+                    }
+                    let args = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                    if let Some((param_uses, has_drop_impl)) = self.facts.adt_summary(k) {
+                        if has_drop_impl {
+                            if self.record_edges
+                                && let Some(drop_fn) = self.facts.adt_drop_fn(k)
+                            {
+                                self.record_edge(drop_fn, l, true)?;
+                            } else {
+                                for &arg in args {
+                                    self.stack.push((arg, WalkCtx::Concrete));
+                                }
+                            }
+                        }
+                        if param_uses.len() == args.len() {
+                            for (&arg, &pu) in args.iter().zip(param_uses.iter()) {
+                                match pu {
+                                    AdtParamUse::Unused | AdtParamUse::OpaquePtr => {}
+                                    AdtParamUse::ByValue => self.stack.push((arg, ctx)),
+                                    AdtParamUse::Concrete => self.stack.push((arg, WalkCtx::Concrete)),
+                                }
+                            }
+                        } else {
+                            for &arg in args {
+                                self.stack.push((arg, WalkCtx::Concrete));
+                            }
+                        }
+                    } else {
+                        for &arg in args {
+                            self.stack.push((arg, WalkCtx::Concrete));
+                        }
+                    }
+                }
+                PNode::Dynamic(l)
+                | PNode::ExTrait(_, l)
+                | PNode::Alias { args: l, .. }
+                | PNode::Opaque(_, l)
+                | PNode::Closure { args: l, .. }
+                | PNode::Coroutine { args: l, .. } => {
+                    let items = self.tys.list(l).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(l)))?;
+                    for &child in items {
+                        self.stack.push((child, WalkCtx::Concrete));
+                    }
+                }
+                PNode::ExProj { args, term, .. } => {
+                    let items = self.tys.list(args).map_err(|_| PolyError::Ty(TyError::ListNotInRecord(args)))?;
+                    for &child in items {
+                        self.stack.push((child, WalkCtx::Concrete));
+                    }
+                    self.stack.push((term, WalkCtx::Concrete));
+                }
+                PNode::Future(_, a, b) => {
+                    self.stack.push((a, WalkCtx::Concrete));
+                    self.stack.push((b, WalkCtx::Concrete));
+                }
+                PNode::Infer | PNode::Error => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Deduplication Table & Statistics
 // ---------------------------------------------------------------------------
@@ -4434,5 +5441,181 @@ mod tests {
         assert_eq!(canonical_symbol_of_bytes(&out_a), canonical_symbol_of_bytes(&out_b));
         // 41 nodes * ~13 bytes + small header << 1 KiB (vs 2^41 tree nodes!).
         assert!(out_a.len() < 1024, "expected linear shared-forest encoding, got {} bytes", out_a.len());
+    }
+
+    #[test]
+    fn canonicalize_instance_to_ground_refs_and_guards() {
+        let frame = test_frame();
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+
+        let mut g = PortableTys::new_in(alloc);
+        let t_u8 = g.intern(PNode::Uint(UintTy::U8)).unwrap();
+        let t_u32 = g.intern(PNode::Uint(UintTy::U32)).unwrap();
+        let t_u64 = g.intern(PNode::Uint(UintTy::U64)).unwrap();
+        let t_usize = g.intern(PNode::Uint(UintTy::Usize)).unwrap();
+        let ref_u32 = g.intern(PNode::Ref(Mutbl::Not, t_u32)).unwrap();
+        let ref_u64 = g.intern(PNode::Ref(Mutbl::Not, t_u64)).unwrap();
+        let const_7 = g.intern(PNode::ConstValue { ty: t_usize, bits: 7 }).unwrap();
+
+        let layout_use = [ParamUse::BY_VALUE];
+        let opaque_use = [ParamUse::OPAQUE_PTR];
+        let unused_use = [ParamUse::NONE];
+
+        // `&u32` and `&u64` share identical canonical ground representative `&()`.
+        let (c1, l1) = canonicalize_instance_to_ground(
+            &layout_use,
+            &[ArgInfo::sized(ref_u32, LayoutShape::NON_NULL_PTR, false)],
+            &mut g,
+            alloc,
+            alloc,
+        )
+        .unwrap()
+        .expect("&u32 should canonicalize to &()");
+        let (c2, l2) = canonicalize_instance_to_ground(
+            &layout_use,
+            &[ArgInfo::sized(ref_u64, LayoutShape::NON_NULL_PTR, false)],
+            &mut g,
+            alloc,
+            alloc,
+        )
+        .unwrap()
+        .expect("&u64 should canonicalize to &()");
+        assert_eq!(c1.as_slice(), c2.as_slice());
+        assert_eq!(l1, l2);
+
+        // `u32` and `u64` are already canonical representatives (no change, distinct).
+        assert!(
+            canonicalize_instance_to_ground(
+                &layout_use,
+                &[ArgInfo::sized(t_u32, LayoutShape::plain(4, 4, AbiClass::Int32), false)],
+                &mut g,
+                alloc,
+                alloc,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            canonicalize_instance_to_ground(
+                &layout_use,
+                &[ArgInfo::sized(t_u64, LayoutShape::INT64, false)],
+                &mut g,
+                alloc,
+                alloc,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // `Drop` type stays concrete.
+        assert!(
+            canonicalize_instance_to_ground(
+                &layout_use,
+                &[ArgInfo::sized(ref_u32, LayoutShape::NON_NULL_PTR, true)],
+                &mut g,
+                alloc,
+                alloc,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // Exotic alignment (`align = 32`) stays concrete.
+        assert!(
+            canonicalize_instance_to_ground(
+                &layout_use,
+                &[ArgInfo::sized(t_u64, LayoutShape::plain(32, 32, AbiClass::Indirect), false)],
+                &mut g,
+                alloc,
+                alloc,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // Const generic arg is never replaced with a type node even when `Unused`.
+        assert!(
+            canonicalize_instance_to_ground(&unused_use, &[ArgInfo::const_arg(const_7)], &mut g, alloc, alloc)
+                .unwrap()
+                .is_none()
+        );
+
+        // `OpaquePtr` maps both `u8` and `u64` to the single `OpaqueThin` foreign marker.
+        let (_, op1) = canonicalize_instance_to_ground(
+            &opaque_use,
+            &[ArgInfo::sized(t_u8, LayoutShape::plain(1, 1, AbiClass::Int8Zext), false)],
+            &mut g,
+            alloc,
+            alloc,
+        )
+        .unwrap()
+        .expect("u8 behind thin ptr canonicalizes to OpaqueThin");
+        let (_, op2) = canonicalize_instance_to_ground(
+            &opaque_use,
+            &[ArgInfo::sized(t_u64, LayoutShape::INT64, false)],
+            &mut g,
+            alloc,
+            alloc,
+        )
+        .unwrap()
+        .expect("u64 behind thin ptr canonicalizes to OpaqueThin");
+        assert_eq!(op1, op2);
+        let &[rep_ty] = g.view().list(op1).unwrap() else { panic!("single arg") };
+        assert_eq!(g.view().node(rep_ty).unwrap(), PNode::Foreign(OPAQUE_THIN_FOREIGN_KEY));
+    }
+
+    #[test]
+    fn poly_body_text_digest_trivia_free_and_table_independent() {
+        let frame = test_frame();
+        let erased = blaze_own::Erased::new(&frame);
+        let alloc = erased.handle();
+
+        let mut t1 = PortableTys::new_in(alloc);
+        let p0_a = t1.intern(PNode::Param(0)).unwrap();
+        let sig_a = blaze_typeck::FnSig {
+            types: t1.view(),
+            parent_count: 0,
+            own_count: 1,
+            declared_count: 1,
+            self_param: false,
+            inputs: &[p0_a],
+            output: p0_a,
+            header: blaze_typeck::FnPtrHeader::RUST,
+            c_variadic: false,
+            legacy_const_generics: &[],
+        };
+
+        // Second PortableTys with extra noise nodes so Param(0) gets a different PTy index.
+        let mut t2 = PortableTys::new_in(alloc);
+        let _ = t2.intern(PNode::Bool).unwrap();
+        let _ = t2.intern(PNode::Char).unwrap();
+        let p0_b = t2.intern(PNode::Param(0)).unwrap();
+        let u64_b = t2.intern(PNode::Uint(UintTy::U64)).unwrap();
+        assert_ne!(p0_a, p0_b);
+        let sig_b = blaze_typeck::FnSig {
+            types: t2.view(),
+            parent_count: 0,
+            own_count: 1,
+            declared_count: 1,
+            self_param: false,
+            inputs: &[p0_b],
+            output: p0_b,
+            header: blaze_typeck::FnPtrHeader::RUST,
+            c_variadic: false,
+            legacy_const_generics: &[],
+        };
+        let sig_diff = blaze_typeck::FnSig { output: u64_b, ..sig_b };
+
+        let d1 = poly_body_text_digest("fn id<T>(x: T) -> T { x }", &sig_a, blaze_build::Abi::Rust, alloc);
+        let d2 = poly_body_text_digest("fn id<T>(x: T) -> T {\n    // comment!\n    x\n}", &sig_b, blaze_build::Abi::Rust, alloc);
+        let d_body_edit = poly_body_text_digest("fn id<T>(x: T) -> T { let _ = type_name::<T>(); x }", &sig_a, blaze_build::Abi::Rust, alloc);
+        let d_sig_edit = poly_body_text_digest("fn id<T>(x: T) -> T { x }", &sig_diff, blaze_build::Abi::Rust, alloc);
+        let d_abi_edit = poly_body_text_digest("fn id<T>(x: T) -> T { x }", &sig_a, blaze_build::Abi::C, alloc);
+
+        assert_eq!(d1, d2, "trivia & PTy table order must not change digest");
+        assert_ne!(d1, d_body_edit, "body token edit must change digest");
+        assert_ne!(d1, d_sig_edit, "signature type edit must change digest");
+        assert_ne!(d1, d_abi_edit, "ABI edit must change digest");
     }
 }

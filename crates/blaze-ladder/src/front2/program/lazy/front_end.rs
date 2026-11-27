@@ -830,6 +830,14 @@ impl<'n, S: PositionSource<'n>> FrontEnd for LazyProgram<'n, S> {
     fn static_records(&self) -> &[(ItemKey, DataRecord<Global>)] {
         &self.statics.values
     }
+
+    fn shared_front(&self) -> Option<crate::front2::program::lazy::SharedLazyFrontHandle> {
+        self.shared.borrow().clone()
+    }
+
+    fn has_inline_for(&self, i: usize) -> bool {
+        self.live_of(i).is_some_and(|l| !l.made.typeck.inline_fors.is_empty())
+    }
 }
 
 impl<'n, S: NamesSource<'n>> blaze_build::type_name::TypeNames for LazyProgram<'n, S> {

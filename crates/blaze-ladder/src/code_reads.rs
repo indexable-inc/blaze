@@ -116,10 +116,15 @@ pub enum ReadKind {
     CoroutineState = 22,
     /// A coroutine state's tag niche (`LayoutFacts::coroutine_niche`).
     CoroutineNiche = 23,
+    /// A generic callee's trivia-free body text & resolved signature digest
+    /// (`front2::poly_canon::poly_body_text_digest`): recorded ONLY when a caller actually
+    /// canonicalized a call to that callee, so edits to that callee invalidate the caller
+    /// without requiring `check_one` on warm hits (Rule 21).
+    PolyBodyText = 24,
 }
 
 impl ReadKind {
-    const ALL: [ReadKind; 23] = [
+    const ALL: [ReadKind; 24] = [
         ReadKind::Adt,
         ReadKind::Repr,
         ReadKind::Discriminant,
@@ -143,6 +148,7 @@ impl ReadKind {
         ReadKind::Laid,
         ReadKind::CoroutineState,
         ReadKind::CoroutineNiche,
+        ReadKind::PolyBodyText,
     ];
 
     /// The kind whose byte is `byte`.
@@ -175,6 +181,7 @@ impl ReadKind {
             ReadKind::Laid => "a coroutine's full lay",
             ReadKind::CoroutineState => "a coroutine state's shape",
             ReadKind::CoroutineNiche => "a coroutine state's tag niche",
+            ReadKind::PolyBodyText => "a canonicalized generic callee's body text and signature",
         }
     }
 }
@@ -362,6 +369,21 @@ impl ReadLog {
     /// ([`laid_answer`]): the coroutine a part's entry was built into ([`ReadKind::Laid`]).
     pub fn ask_laid(&self, owner: ItemKey, ordinal: u32, args: &[PTy], laid: ContentId) {
         self.ask(ReadKind::Laid, owner, u64::from(ordinal), args, Ok(laid));
+    }
+
+    /// Canonicalized generic callee `item`'s trivia-free body text & resolved signature digest
+    /// (`front2::poly_canon::poly_body_text_digest`, [`ReadKind::PolyBodyText`]).
+    pub fn ask_poly_body_text(&self, item: ItemKey, digest: Option<ContentId>) {
+        let mut h = Hasher::new(ANSWER_DOMAIN);
+        match digest {
+            None => {
+                h.part(&[0]);
+            }
+            Some(id) => {
+                h.part(&[1]).id(&id);
+            }
+        }
+        self.ask(ReadKind::PolyBodyText, item, 0, &[], Ok(h.finish()));
     }
 
     /// Every question `other` logged, logged here as asked (this log's plant applies), and
@@ -1118,6 +1140,12 @@ pub trait Beyond {
     /// out in full again, digested as the build digested it ([`laid_answer`]);
     /// [`ReadsError::Unanswered`] where it was not laid today.
     fn laid(&mut self, owner: ItemKey, ordinal: u32, args: List) -> Result<ContentId, ReadsError>;
+    /// Trivia-free body text & resolved signature digest of canonicalized generic callee `item`
+    /// (`front2::poly_canon::poly_body_text_digest`, verified from `head_row` without `check_one`).
+    fn poly_body_text(&mut self, item: ItemKey, scratch: Alloc<'_>) -> Result<Option<ContentId>, ReadsError> {
+        let _ = (item, scratch);
+        Err(ReadsError::Unanswered { kind: ReadKind::PolyBodyText })
+    }
 }
 
 /// The answers one run found holding, by question (a row's bytes, which hold no table handle),
@@ -1348,6 +1376,17 @@ pub fn verify_today(
                 let resolved = beyond.resolve(item, list, ground);
                 log.ask_resolve(Instance { item, args: list }, resolved, ground.view(), scratch);
             }
+            ReadKind::PolyBodyText => match beyond.poly_body_text(item, scratch) {
+                Ok(digest) => log.ask_poly_body_text(item, digest),
+                Err(ReadsError::Unanswered { .. }) => {
+                    stale(item, &mut out);
+                    if !each {
+                        return Ok(out);
+                    }
+                    continue;
+                }
+                Err(e) => return Err(e),
+            },
         }
         let today = match log.only_answer(kind, item) {
             Ok(today) => today,
